@@ -1,0 +1,6 @@
+apiVersion: v2
+name: pgvector
+description: PostgreSQL with the pgvector extension, optional PgBouncer pooling, and optional HAProxy routing.
+type: application
+version: 0.1.0
+appVersion: "17.0"

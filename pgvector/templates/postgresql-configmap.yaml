@@ -1,0 +1,127 @@
+{{- if .Values.postgresql.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pgvector.fullname" . }}-postgresql-master-config
+  labels:
+    {{- include "pgvector.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql-master-config
+data:
+  postgresql.conf: |
+    listen_addresses = '*'
+    port = 5432
+    max_connections = {{ .Values.postgresql.postgresConfig.max_connections }}
+    shared_buffers = {{ .Values.postgresql.postgresConfig.shared_buffers }}
+    effective_cache_size = {{ .Values.postgresql.postgresConfig.effective_cache_size }}
+    maintenance_work_mem = {{ .Values.postgresql.postgresConfig.maintenance_work_mem }}
+    checkpoint_completion_target = {{ .Values.postgresql.postgresConfig.checkpoint_completion_target }}
+    wal_buffers = {{ .Values.postgresql.postgresConfig.wal_buffers }}
+    default_statistics_target = {{ .Values.postgresql.postgresConfig.default_statistics_target }}
+    wal_level = {{ .Values.postgresql.postgresConfig.wal_level }}
+    max_wal_senders = {{ .Values.postgresql.postgresConfig.max_wal_senders }}
+    wal_keep_size = {{ .Values.postgresql.postgresConfig.wal_keep_size }}
+    hot_standby = {{ .Values.postgresql.postgresConfig.hot_standby }}
+    hot_standby_feedback = {{ .Values.postgresql.postgresConfig.hot_standby_feedback }}
+    random_page_cost = 1.1
+    effective_io_concurrency = 200
+    work_mem = 4MB
+    log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+    log_statement = 'ddl'
+    log_timezone = 'UTC'
+    timezone = 'UTC'
+    datestyle = 'iso, mdy'
+    default_text_search_config = 'pg_catalog.english'
+  pg_hba.conf: |
+    # TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+    # Allow local connections
+    local   all             all                                     trust
+    host    all             all             127.0.0.1/32            trust
+    host    all             all             ::1/128                 trust
+
+    # Allow replication connections from replica pods
+    host    replication     {{ .Values.postgresql.postgresUser }}        10.0.0.0/8              md5
+    host    replication     {{ .Values.postgresql.postgresUser }}        172.16.0.0/12           md5
+    host    replication     {{ .Values.postgresql.postgresUser }}        192.168.0.0/16          md5
+
+    # Allow regular connections from other services
+    host    all             {{ .Values.postgresql.postgresUser }}        10.0.0.0/8              md5
+    host    all             {{ .Values.postgresql.postgresUser }}        172.16.0.0/12           md5
+    host    all             {{ .Values.postgresql.postgresUser }}        192.168.0.0/16          md5
+
+    # Allow connections from localhost and cluster services
+    host    all             all             0.0.0.0/0               md5
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pgvector.fullname" . }}-postgresql-replica-config
+  labels:
+    {{- include "pgvector.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql-replica-config
+data:
+  postgresql.conf: |
+    listen_addresses = '*'
+    port = 5432
+    max_connections = {{ .Values.postgresql.postgresConfig.max_connections }}
+    shared_buffers = {{ .Values.postgresql.postgresConfig.shared_buffers }}
+    effective_cache_size = {{ .Values.postgresql.postgresConfig.effective_cache_size }}
+    maintenance_work_mem = {{ .Values.postgresql.postgresConfig.maintenance_work_mem }}
+    checkpoint_completion_target = {{ .Values.postgresql.postgresConfig.checkpoint_completion_target }}
+    wal_buffers = {{ .Values.postgresql.postgresConfig.wal_buffers }}
+    default_statistics_target = {{ .Values.postgresql.postgresConfig.default_statistics_target }}
+    wal_level = {{ .Values.postgresql.postgresConfig.wal_level }}
+    max_wal_senders = {{ .Values.postgresql.postgresConfig.max_wal_senders }}
+    wal_keep_size = {{ .Values.postgresql.postgresConfig.wal_keep_size }}
+    hot_standby = {{ .Values.postgresql.postgresConfig.hot_standby }}
+    hot_standby_feedback = {{ .Values.postgresql.postgresConfig.hot_standby_feedback }}
+    random_page_cost = 1.1
+    effective_io_concurrency = 200
+    work_mem = 4MB
+    primary_conninfo = 'host={{ include "pgvector.fullname" . }}-postgresql-master.{{ .Release.Namespace }}.svc.cluster.local port=5432 user={{ .Values.postgresql.postgresUser }} password={{ .Values.postgresql.postgresPassword | default (include "pgvector.postgresql.password" .) }}'
+    log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+    log_statement = 'ddl'
+    log_timezone = 'UTC'
+    timezone = 'UTC'
+    datestyle = 'iso, mdy'
+    default_text_search_config = 'pg_catalog.english'
+{{- end }}
+{{- if and .Values.postgresql.enabled .Values.postgresql.pgbouncer.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pgvector.fullname" . }}-pgbouncer-config
+  labels:
+    {{- include "pgvector.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgbouncer-config
+data:
+  pgbouncer.ini: |
+    [databases]
+    {{ .Values.postgresql.postgresDatabase }} = host={{ include "pgvector.fullname" . }}-postgresql-master.{{ .Release.Namespace }}.svc.cluster.local port=5432
+
+    [pgbouncer]
+    listen_addr = 0.0.0.0
+    listen_port = 5432
+    auth_type = md5
+    auth_file = /etc/pgbouncer/userlist.txt
+    pool_mode = {{ .Values.postgresql.pgbouncer.poolMode }}
+    max_client_conn = {{ .Values.postgresql.pgbouncer.maxClientConn }}
+    default_pool_size = {{ .Values.postgresql.pgbouncer.defaultPoolSize }}
+    min_pool_size = {{ .Values.postgresql.pgbouncer.minPoolSize }}
+    max_db_connections = {{ .Values.postgresql.pgbouncer.poolSize }}
+    max_user_connections = {{ .Values.postgresql.pgbouncer.poolSize }}
+    reserve_pool_size = 1
+    reserve_pool_timeout = 5.0
+    server_round_robin = 1
+    ignore_startup_parameters = extra_float_digits
+    log_connections = 1
+    log_disconnections = 1
+    log_pooler_errors = 1
+    stats_period = 60
+    admin_users = {{ .Values.postgresql.postgresUser }}
+  userlist.txt: |
+    "{{ .Values.postgresql.postgresUser }}" "{{ .Values.postgresql.postgresPassword | default (include "pgvector.postgresql.password" .) }}"
+{{- end }}
+
