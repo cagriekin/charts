@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Helm Charts</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        background-color: #0c0c0c;
+        color: #7bf76d;
+        font-family: "Fira Code", "Courier New", monospace;
+        padding: 2rem;
+      }
+
+      main {
+        max-width: 960px;
+        width: 100%;
+        border: 2px solid #1ef077;
+        box-shadow: 0 0 20px #1ef07744;
+        padding: 2.5rem;
+        background: linear-gradient(180deg, #050505, #000);
+      }
+
+      h1,
+      h2 {
+        margin: 0 0 1.5rem;
+        text-transform: uppercase;
+        letter-spacing: 0.2rem;
+      }
+
+      section + section {
+        margin-top: 2.5rem;
+        border-top: 1px dashed #1ef077;
+        padding-top: 2.5rem;
+      }
+
+      p {
+        margin: 0 0 1rem;
+        line-height: 1.6;
+      }
+
+      a {
+        color: #7bf76d;
+        text-decoration: none;
+        border-bottom: 1px dashed #7bf76d;
+      }
+
+      a:hover {
+        color: #ffffff;
+        border-bottom-color: #ffffff;
+      }
+
+      code,
+      pre {
+        background: rgba(30, 240, 119, 0.08);
+        border: 1px solid rgba(30, 240, 119, 0.3);
+        color: #9cff90;
+      }
+
+      pre {
+        padding: 1.25rem;
+        overflow-x: auto;
+        line-height: 1.6;
+      }
+
+      footer {
+        margin-top: 2.5rem;
+        font-size: 0.85rem;
+        opacity: 0.65;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>&gt; Helm Charts</h1>
+      <section>
+        <p>
+          Helm index:
+          <a href="./index.yaml" rel="noopener">https://cagriekin.github.io/charts/index.yaml</a>
+        </p>
+      </section>
+
+      <section>
+        <h2>&gt; add the repo</h2>
+        <pre><code>helm repo add cagriekin https://cagriekin.github.io/charts
+helm repo update
+helm search repo cagriekin
+</code></pre>
+      </section>
+
+      <section>
+        <h2>&gt; install pgvector</h2>
+        <pre><code>helm install pgvector cagriekin/pgvector \
+  --namespace data --create-namespace
+</code></pre>
+        <p>
+          Review the chart documentation in the
+          <code>pgvector/README.md</code> within the source repository for all
+          configurable values.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>
