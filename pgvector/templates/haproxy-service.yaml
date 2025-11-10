@@ -1,0 +1,20 @@
+{{- if and .Values.postgresql.enabled .Values.postgresql.haproxy.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pgvector.fullname" . }}-haproxy
+  labels:
+    {{- include "pgvector.labels" . | nindent 4 }}
+    app.kubernetes.io/component: haproxy
+spec:
+  type: {{ .Values.postgresql.haproxy.service.type }}
+  ports:
+    - name: postgresql
+      port: {{ .Values.postgresql.haproxy.service.port }}
+      targetPort: postgresql
+      protocol: TCP
+  selector:
+    {{- include "pgvector.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: haproxy
+{{- end }}
+

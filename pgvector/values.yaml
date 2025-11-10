@@ -1,0 +1,193 @@
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  create: true
+  rules: []
+
+networkPolicy:
+  enabled: false
+  allowNamespaces: []
+  allowCIDRs: []
+  extraIngress: []
+  extraEgress: []
+
+postgresql:
+  enabled: true
+  image:
+    registry: docker.io
+    repository: pgvector/pgvector
+    tag: "pg18-trixie"
+    pullPolicy: IfNotPresent
+  postgresUser: "postgres"
+  postgresPassword: ""
+  existingSecret: ""
+  postgresDatabase: "postgres"
+  postgresConfig:
+    max_connections: "100"
+    shared_buffers: "256MB"
+    effective_cache_size: "1GB"
+    maintenance_work_mem: "64MB"
+    checkpoint_completion_target: "0.9"
+    wal_buffers: "16MB"
+    default_statistics_target: "100"
+    wal_level: "replica"
+    max_wal_senders: "10"
+    wal_keep_size: "1GB"
+    hot_standby: "on"
+    hot_standby_feedback: "on"
+  master:
+    replicaCount: 1
+    persistence:
+      enabled: true
+      size: "5Gi"
+      storageClass: ""
+      accessModes:
+        - ReadWriteOnce
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+  replica:
+    replicaCount: 2
+    persistence:
+      enabled: true
+      size: "5Gi"
+      storageClass: ""
+      accessModes:
+        - ReadWriteOnce
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+  podAnnotations: {}
+  pgbouncer:
+    enabled: true
+    replicaCount: 1
+    image:
+      registry: docker.io
+      repository: edoburu/pgbouncer
+      tag: "v1.24.1-p1"
+      pullPolicy: IfNotPresent
+    poolMode: "transaction"
+    poolSize: 20
+    minPoolSize: 5
+    maxClientConn: 100
+    defaultPoolSize: 20
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    service:
+      type: ClusterIP
+      port: 5432
+    nodeSelector: {}
+    affinity: {}
+    tolerations: []
+    podAnnotations: {}
+  haproxy:
+    enabled: false
+    replicaCount: 1
+    image:
+      registry: docker.io
+      repository: haproxy
+      tag: "lts-trixie"
+      pullPolicy: IfNotPresent
+    service:
+      type: ClusterIP
+      port: 5432
+    readReplicaRouting:
+      enabled: true
+      replicaPercentage: 100
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    nodeSelector: {}
+    affinity: {}
+    tolerations: []
+    podAnnotations: {}
+
+monitoring:
+  exporter:
+    enabled: false
+    replicaCount: 1
+    image:
+      registry: docker.io
+      repository: prometheuscommunity/postgres-exporter
+      tag: "v0.15.0"
+      pullPolicy: IfNotPresent
+    service:
+      enabled: true
+      type: ClusterIP
+      port: 9187
+      annotations: {}
+    env: []
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    nodeSelector: {}
+    affinity: {}
+    tolerations: []
+    podAnnotations: {}
+    extraLabels: {}
+
+backup:
+  enabled: false
+  schedule: "0 2 * * *"
+  image:
+    registry: docker.io
+    repository: bitnami/postgresql
+    tag: "18.3.0-debian-12-r0"
+    pullPolicy: IfNotPresent
+  retentionDays: 7
+  s3:
+    bucket: ""
+    region: ""
+    prefix: ""
+    endpoint: ""
+    usePathStyle: true
+    existingSecret: ""
+    accessKey: ""
+    secretKey: ""
+  pgDumpFormat: "custom"
+  compress: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  annotations: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+  env: []

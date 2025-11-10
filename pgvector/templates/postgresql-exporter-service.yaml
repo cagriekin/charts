@@ -1,0 +1,24 @@
+{{- if and .Values.postgresql.enabled .Values.monitoring.exporter.enabled .Values.monitoring.exporter.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pgvector.fullname" . }}-postgresql-exporter
+  labels:
+    {{- include "pgvector.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql-exporter
+  {{- with .Values.monitoring.exporter.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.monitoring.exporter.service.type }}
+  ports:
+    - name: metrics
+      port: {{ .Values.monitoring.exporter.service.port }}
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    {{- include "pgvector.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql-exporter
+{{- end }}
+
