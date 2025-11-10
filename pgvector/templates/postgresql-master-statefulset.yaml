@@ -1,0 +1,140 @@
+{{- if .Values.postgresql.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "pgvector.fullname" . }}-postgresql-master
+  labels:
+    {{- include "pgvector.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql-master
+spec:
+  replicas: {{ .Values.postgresql.master.replicaCount | int }}
+  serviceName: {{ include "pgvector.fullname" . }}-postgresql-master
+  selector:
+    matchLabels:
+      {{- include "pgvector.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgresql-master
+  template:
+    metadata:
+      labels:
+        {{- include "pgvector.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: postgresql-master
+      {{- with .Values.postgresql.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "pgvector.serviceAccountName" . }}
+      initContainers:
+        - name: init-postgresql
+          image: {{ .Values.postgresql.image.registry }}/{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              mkdir -p /var/lib/postgresql/data
+
+              if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+                export PGDATA=/var/lib/postgresql/data
+                export POSTGRES_USER={{ .Values.postgresql.postgresUser }}
+                export POSTGRES_PASSWORD={{ .Values.postgresql.postgresPassword | default (include "pgvector.postgresql.password" .) | quote }}
+                export POSTGRES_DB={{ .Values.postgresql.postgresDatabase }}
+                rm -rf /var/lib/postgresql/data/*
+                /usr/local/bin/docker-entrypoint.sh postgres --initialize-only
+              fi
+
+              cat <<'EOF' > /tmp/pg_hba.conf
+              # TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+              local   all             all                                     trust
+              host    all             all             127.0.0.1/32            trust
+              host    all             all             ::1/128                 trust
+
+              host    replication     {{ .Values.postgresql.postgresUser }}        10.0.0.0/8              md5
+              host    replication     {{ .Values.postgresql.postgresUser }}        172.16.0.0/12           md5
+              host    replication     {{ .Values.postgresql.postgresUser }}        192.168.0.0/16          md5
+
+              host    all             {{ .Values.postgresql.postgresUser }}        10.0.0.0/8              md5
+              host    all             {{ .Values.postgresql.postgresUser }}        172.16.0.0/12           md5
+              host    all             {{ .Values.postgresql.postgresUser }}        192.168.0.0/16          md5
+
+              host    all             all             0.0.0.0/0               md5
+              EOF
+
+              cp /tmp/pg_hba.conf /var/lib/postgresql/data/pg_hba.conf
+              chown postgres:postgres /var/lib/postgresql/data/pg_hba.conf
+              chmod 600 /var/lib/postgresql/data/pg_hba.conf
+          volumeMounts:
+            - name: postgresql-data
+              mountPath: /var/lib/postgresql/data
+      containers:
+        - name: postgresql-master
+          image: {{ .Values.postgresql.image.registry }}/{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.postgresql.postgresUser | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.secretName" . }}
+                  key: postgres-password
+            - name: POSTGRES_DB
+              value: {{ .Values.postgresql.postgresDatabase | quote }}
+            - name: PGDATA
+              value: /var/lib/postgresql/data
+          command:
+            - docker-entrypoint.sh
+            - postgres
+            - -c
+            - config_file=/etc/postgresql/postgresql.conf
+          ports:
+            - name: postgresql
+              containerPort: 5432
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.postgresql.master.resources | nindent 12 }}
+          volumeMounts:
+            - name: postgresql-data
+              mountPath: /var/lib/postgresql/data
+            - name: postgresql-config
+              mountPath: /etc/postgresql
+      volumes:
+        - name: postgresql-config
+          configMap:
+            name: {{ include "pgvector.fullname" . }}-postgresql-master-config
+        {{- if not .Values.postgresql.master.persistence.enabled }}
+        - name: postgresql-data
+          emptyDir: {}
+        {{- end }}
+      {{- with .Values.postgresql.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.postgresql.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.postgresql.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.postgresql.master.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: postgresql-data
+      spec:
+        accessModes:
+        {{- range .Values.postgresql.master.persistence.accessModes }}
+          - {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgresql.master.persistence.size | default "1Gi" }}
+        {{- if .Values.postgresql.master.persistence.storageClass }}
+        storageClassName: "{{ .Values.postgresql.master.persistence.storageClass }}"
+        {{- end }}
+  {{- end }}
+{{- end }}
+

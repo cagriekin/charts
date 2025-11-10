@@ -1,0 +1,70 @@
+{{- if and .Values.postgresql.enabled .Values.postgresql.pgbouncer.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pgvector.fullname" . }}-pgbouncer
+  labels:
+    {{- include "pgvector.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgbouncer
+spec:
+  replicas: {{ .Values.postgresql.pgbouncer.replicaCount | int }}
+  selector:
+    matchLabels:
+      {{- include "pgvector.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: pgbouncer
+  template:
+    metadata:
+      labels:
+        {{- include "pgvector.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: pgbouncer
+      {{- with .Values.postgresql.pgbouncer.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "pgvector.serviceAccountName" . }}
+      containers:
+        - name: pgbouncer
+          image: {{ .Values.postgresql.pgbouncer.image.registry }}/{{ .Values.postgresql.pgbouncer.image.repository }}:{{ .Values.postgresql.pgbouncer.image.tag }}
+          imagePullPolicy: {{ .Values.postgresql.pgbouncer.image.pullPolicy }}
+          ports:
+            - name: pgbouncer
+              containerPort: 5432
+              protocol: TCP
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.postgresql.postgresUser | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.secretName" . }}
+                  key: postgres-password
+            - name: POSTGRES_DB
+              value: {{ .Values.postgresql.postgresDatabase | quote }}
+          command:
+            - /bin/sh
+            - -c
+            - exec pgbouncer /etc/pgbouncer/pgbouncer.ini
+          resources:
+            {{- toYaml .Values.postgresql.pgbouncer.resources | nindent 12 }}
+          volumeMounts:
+            - name: pgbouncer-config
+              mountPath: /etc/pgbouncer
+      volumes:
+        - name: pgbouncer-config
+          configMap:
+            name: {{ include "pgvector.fullname" . }}-pgbouncer-config
+      {{- with .Values.postgresql.pgbouncer.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.postgresql.pgbouncer.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.postgresql.pgbouncer.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+

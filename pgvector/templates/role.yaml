@@ -1,0 +1,21 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "pgvector.fullname" . }}
+  labels:
+    {{- include "pgvector.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rbac
+rules:
+{{- if .Values.rbac.rules }}
+{{ toYaml .Values.rbac.rules | nindent 2 }}
+{{- else }}
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch"]
+{{- end }}
+{{- end }}
+
