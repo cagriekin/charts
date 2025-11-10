@@ -21,6 +21,83 @@ helm install my-release ./pgvector --namespace data --create-namespace
 
 Override any value by providing a custom `values.yaml` or with `--set` flags.
 
+## Minimal Configurations
+
+### PostgreSQL Only
+
+Disables PgBouncer, HAProxy, and other optional components while leaving credential generation to the chart.
+
+```yaml
+postgresql:
+  pgbouncer:
+    enabled: false
+  haproxy:
+    enabled: false
+monitoring:
+  exporter:
+    enabled: false
+backup:
+  enabled: false
+```
+
+### PostgreSQL with PgBouncer
+
+Keeps HAProxy disabled so clients connect straight to PgBouncer’s pooled endpoint.
+
+```yaml
+postgresql:
+  pgbouncer:
+    enabled: true
+  haproxy:
+    enabled: false
+```
+
+### PostgreSQL with HAProxy (No PgBouncer)
+
+Routes traffic through HAProxy directly to the primary and replicas.
+
+```yaml
+postgresql:
+  pgbouncer:
+    enabled: false
+  haproxy:
+    enabled: true
+    readReplicaRouting:
+      enabled: true
+      replicaPercentage: 50
+```
+
+### PostgreSQL, PgBouncer, and HAProxy
+
+HAProxy fronts PgBouncer, preserving pooled connections while exposing a stable endpoint.
+
+```yaml
+postgresql:
+  pgbouncer:
+    enabled: true
+  haproxy:
+    enabled: true
+```
+
+### Backups and Monitoring
+
+Enables the Prometheus exporter and scheduled S3 backups using inline credentials. For production, prefer referencing an existing secret with `backup.s3.existingSecret`.
+
+```yaml
+monitoring:
+  exporter:
+    enabled: true
+
+backup:
+  enabled: true
+  schedule: "0 2 * * *"
+  s3:
+    bucket: your-bucket
+    region: us-east-1
+    accessKey: YOUR_ACCESS_KEY
+    secretKey: YOUR_SECRET_KEY
+```
+
 ## Component Interactions
 
 - PgBouncer, when enabled, connects directly to the PostgreSQL primary service.
