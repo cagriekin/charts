@@ -1,0 +1,47 @@
+name: Lint Helm Charts
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - '**/Chart.yaml'
+      - '**/values.yaml'
+      - '**/templates/**'
+      - '.github/workflows/lint.yaml'
+  pull_request:
+    paths:
+      - '**/Chart.yaml'
+      - '**/values.yaml'
+      - '**/templates/**'
+      - '.github/workflows/lint.yaml'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.2
+
+      - name: Lint charts
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          chart_dirs=()
+          for chart_yaml in */Chart.yaml; do
+            chart_dirs+=("$(dirname "$chart_yaml")")
+          done
+          if [ ${#chart_dirs[@]} -eq 0 ]; then
+            echo "No charts found to lint" >&2
+            exit 1
+          fi
+          for chart_dir in "${chart_dirs[@]}"; do
+            echo "Linting ${chart_dir}"
+            helm lint "${chart_dir}"
+          done
+
