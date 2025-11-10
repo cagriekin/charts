@@ -1,0 +1,191 @@
+# PGVector
+
+Standalone Helm chart for deploying PostgreSQL with the pgvector extension. The chart provisions a primary/replica topology, optional PgBouncer connection pooling, and optional HAProxy routing for simplified client access.
+
+## Features
+
+- PostgreSQL master/replica StatefulSets using the `pgvector/pgvector` image
+- Deterministic password generation when no password is supplied
+- Optional PgBouncer deployment and service for connection pooling
+- Optional HAProxy deployment and service that can front either PgBouncer or PostgreSQL directly
+- Optional Prometheus exporter for PostgreSQL metrics
+- Optional NetworkPolicies with configurable ingress and egress rules
+- Optional S3-based backup CronJob with automated retention pruning
+- Secrets populated with ready-to-use connection strings for each endpoint
+
+## Installation
+
+```bash
+helm install my-release ./pgvector --namespace data --create-namespace
+```
+
+Override any value by providing a custom `values.yaml` or with `--set` flags.
+
+## Component Interactions
+
+- PgBouncer, when enabled, connects directly to the PostgreSQL primary service.
+- HAProxy, when enabled alongside PgBouncer, routes traffic to PgBouncer.
+- HAProxy, when enabled without PgBouncer, balances connections across the PostgreSQL master service and optional replica service according to the configured weights.
+
+## Values
+
+### General
+
+| Key | Description | Default |
+| --- | --- | --- |
+| `nameOverride` | Override the generated name | `""` |
+| `fullnameOverride` | Override the fully qualified release name | `""` |
+| `serviceAccount.create` | Create a dedicated service account | `true` |
+| `serviceAccount.name` | Name of the service account to use | `""` |
+| `serviceAccount.annotations` | Extra annotations for the service account | `{}` |
+| `rbac.create` | Create Role and RoleBinding resources | `true` |
+| `rbac.rules` | Custom RBAC rules (overrides defaults when non-empty) | `[]` |
+| `networkPolicy.enabled` | Create NetworkPolicies for chart components | `false` |
+| `networkPolicy.allowNamespaces` | Additional namespaces allowed to access the services | `[]` |
+| `networkPolicy.allowCIDRs` | Additional CIDR blocks allowed to access the services | `[]` |
+| `networkPolicy.extraIngress` | Additional custom ingress rules appended verbatim | `[]` |
+| `networkPolicy.extraEgress` | Additional custom egress rules appended verbatim | `[]` |
+
+### PostgreSQL Core
+
+| Key | Description | Default |
+| --- | --- | --- |
+| `postgresql.enabled` | Deploy PostgreSQL resources | `true` |
+| `postgresql.image.registry` | Container registry for PostgreSQL image | `docker.io` |
+| `postgresql.image.repository` | PostgreSQL image repository | `pgvector/pgvector` |
+| `postgresql.image.tag` | PostgreSQL image tag | `pg18-trixie` |
+| `postgresql.image.pullPolicy` | Image pull policy | `IfNotPresent` |
+| `postgresql.postgresUser` | Database superuser name | `postgres` |
+| `postgresql.postgresPassword` | Database superuser password (auto-generated when empty) | `""` |
+| `postgresql.existingSecret` | Use an existing secret for database credentials (must define `postgres-user`, `postgres-password`, `postgres-database`; `postgres-url` optional) | `""` |
+| `postgresql.postgresDatabase` | Default database name | `postgres` |
+| `postgresql.postgresConfig.max_connections` | Maximum allowed connections | `100` |
+| `postgresql.postgresConfig.shared_buffers` | Shared buffer size | `256MB` |
+| `postgresql.postgresConfig.effective_cache_size` | Effective cache size | `1GB` |
+| `postgresql.postgresConfig.maintenance_work_mem` | Maintenance work memory | `64MB` |
+| `postgresql.postgresConfig.checkpoint_completion_target` | Checkpoint completion target | `0.9` |
+| `postgresql.postgresConfig.wal_buffers` | WAL buffer size | `16MB` |
+| `postgresql.postgresConfig.default_statistics_target` | Statistics target | `100` |
+| `postgresql.postgresConfig.wal_level` | WAL level | `replica` |
+| `postgresql.postgresConfig.max_wal_senders` | Maximum WAL senders | `10` |
+| `postgresql.postgresConfig.wal_keep_size` | WAL keep size | `1GB` |
+| `postgresql.postgresConfig.hot_standby` | Enable hot standby | `on` |
+| `postgresql.postgresConfig.hot_standby_feedback` | Enable hot standby feedback | `on` |
+| `postgresql.master.replicaCount` | Number of primary replicas (typically 1) | `1` |
+| `postgresql.master.persistence.enabled` | Enable persistent volume claims for primary pods | `true` |
+| `postgresql.master.persistence.size` | Persistent volume size for primary | `5Gi` |
+| `postgresql.master.persistence.storageClass` | Storage class for the primary PVC (empty uses default) | `""` |
+| `postgresql.master.persistence.accessModes` | Access modes for the primary PVC | `["ReadWriteOnce"]` |
+| `postgresql.master.resources` | Resource requests and limits for primary | `{cpu: 100m/500m, memory: 512Mi/1Gi}` |
+| `postgresql.replica.replicaCount` | Number of replica pods | `2` |
+| `postgresql.replica.persistence.enabled` | Enable persistent volume claims for replica pods | `true` |
+| `postgresql.replica.persistence.size` | Persistent volume size for replicas | `5Gi` |
+| `postgresql.replica.persistence.storageClass` | Storage class for the replica PVCs (empty uses default) | `""` |
+| `postgresql.replica.persistence.accessModes` | Access modes for the replica PVCs | `["ReadWriteOnce"]` |
+| `postgresql.replica.resources` | Resource requests and limits for replicas | `{cpu: 100m/500m, memory: 512Mi/1Gi}` |
+| `postgresql.nodeSelector` | Node selector for PostgreSQL pods | `{}` |
+| `postgresql.affinity` | Affinity rules for PostgreSQL pods | `{}` |
+| `postgresql.tolerations` | Tolerations for PostgreSQL pods | `[]` |
+| `postgresql.podAnnotations` | Extra annotations for PostgreSQL pods | `{}` |
+
+### PgBouncer
+
+| Key | Description | Default |
+| --- | --- | --- |
+| `postgresql.pgbouncer.enabled` | Deploy PgBouncer | `true` |
+| `postgresql.pgbouncer.replicaCount` | Number of PgBouncer replicas | `1` |
+| `postgresql.pgbouncer.image.registry` | PgBouncer image registry | `docker.io` |
+| `postgresql.pgbouncer.image.repository` | PgBouncer image repository | `edoburu/pgbouncer` |
+| `postgresql.pgbouncer.image.tag` | PgBouncer image tag | `v1.24.1-p1` |
+| `postgresql.pgbouncer.image.pullPolicy` | Image pull policy | `IfNotPresent` |
+| `postgresql.pgbouncer.poolMode` | PgBouncer pooling mode | `transaction` |
+| `postgresql.pgbouncer.poolSize` | Maximum server connections per database | `20` |
+| `postgresql.pgbouncer.minPoolSize` | Minimum connections kept in pool | `5` |
+| `postgresql.pgbouncer.maxClientConn` | Maximum simultaneous client connections | `100` |
+| `postgresql.pgbouncer.defaultPoolSize` | Default pool size per database | `20` |
+| `postgresql.pgbouncer.resources` | Resource requests and limits for PgBouncer | `{cpu: 50m/200m, memory: 64Mi/128Mi}` |
+| `postgresql.pgbouncer.service.type` | Service type for PgBouncer | `ClusterIP` |
+| `postgresql.pgbouncer.service.port` | Service port for PgBouncer | `5432` |
+| `postgresql.pgbouncer.nodeSelector` | Node selector for PgBouncer pods | `{}` |
+| `postgresql.pgbouncer.affinity` | Affinity rules for PgBouncer pods | `{}` |
+| `postgresql.pgbouncer.tolerations` | Tolerations for PgBouncer pods | `[]` |
+| `postgresql.pgbouncer.podAnnotations` | Extra annotations for PgBouncer pods | `{}` |
+
+### HAProxy
+
+| Key | Description | Default |
+| --- | --- | --- |
+| `postgresql.haproxy.enabled` | Deploy HAProxy | `false` |
+| `postgresql.haproxy.replicaCount` | Number of HAProxy replicas | `1` |
+| `postgresql.haproxy.image.registry` | HAProxy image registry | `docker.io` |
+| `postgresql.haproxy.image.repository` | HAProxy image repository | `haproxy` |
+| `postgresql.haproxy.image.tag` | HAProxy image tag | `lts-trixie` |
+| `postgresql.haproxy.image.pullPolicy` | Image pull policy | `IfNotPresent` |
+| `postgresql.haproxy.service.type` | Service type for HAProxy | `ClusterIP` |
+| `postgresql.haproxy.service.port` | Service port exposed by HAProxy | `5432` |
+| `postgresql.haproxy.readReplicaRouting.enabled` | Weight connections toward replicas | `true` |
+| `postgresql.haproxy.readReplicaRouting.replicaPercentage` | Percentage of weight applied to replicas (0-100) | `100` |
+| `postgresql.haproxy.resources` | Resource requests and limits for HAProxy | `{cpu: 100m/500m, memory: 128Mi/256Mi}` |
+| `postgresql.haproxy.nodeSelector` | Node selector for HAProxy pods | `{}` |
+| `postgresql.haproxy.affinity` | Affinity rules for HAProxy pods | `{}` |
+| `postgresql.haproxy.tolerations` | Tolerations for HAProxy pods | `[]` |
+| `postgresql.haproxy.podAnnotations` | Extra annotations for HAProxy pods | `{}` |
+
+### Monitoring
+
+| Key | Description | Default |
+| --- | --- | --- |
+| `monitoring.exporter.enabled` | Deploy the Prometheus PostgreSQL exporter | `false` |
+| `monitoring.exporter.replicaCount` | Number of exporter replicas | `1` |
+| `monitoring.exporter.image.registry` | Exporter image registry | `docker.io` |
+| `monitoring.exporter.image.repository` | Exporter image repository | `prometheuscommunity/postgres-exporter` |
+| `monitoring.exporter.image.tag` | Exporter image tag | `v0.15.0` |
+| `monitoring.exporter.image.pullPolicy` | Exporter image pull policy | `IfNotPresent` |
+| `monitoring.exporter.service.enabled` | Expose exporter via a Kubernetes Service | `true` |
+| `monitoring.exporter.service.type` | Service type for exporter | `ClusterIP` |
+| `monitoring.exporter.service.port` | Metrics port | `9187` |
+| `monitoring.exporter.service.annotations` | Annotations to apply to the Service | `{}` |
+| `monitoring.exporter.env` | Additional environment variables for exporter container | `[]` |
+| `monitoring.exporter.resources` | Resource requests and limits for exporter | `{cpu: 50m/200m, memory: 64Mi/128Mi}` |
+| `monitoring.exporter.nodeSelector` | Node selector for exporter pods | `{}` |
+| `monitoring.exporter.affinity` | Affinity rules for exporter pods | `{}` |
+| `monitoring.exporter.tolerations` | Tolerations for exporter pods | `[]` |
+| `monitoring.exporter.podAnnotations` | Extra annotations for exporter pods | `{}` |
+| `monitoring.exporter.extraLabels` | Extra labels applied to exporter pods and deployment | `{}` |
+
+### Backups
+
+| Key | Description | Default |
+| --- | --- | --- |
+| `backup.enabled` | Enable the S3 backup CronJob | `false` |
+| `backup.schedule` | Cron schedule for backups | `"0 2 * * *"` |
+| `backup.image.registry` | Backup job image registry | `docker.io` |
+| `backup.image.repository` | Backup job image repository | `bitnami/postgresql` |
+| `backup.image.tag` | Backup job image tag | `18.3.0-debian-12-r0` |
+| `backup.image.pullPolicy` | Backup job image pull policy | `IfNotPresent` |
+| `backup.retentionDays` | Number of days to retain backups in S3 (`0` disables pruning) | `7` |
+| `backup.s3.bucket` | Target S3 bucket (required when backups enabled) | `""` |
+| `backup.s3.region` | S3 region (required when backups enabled) | `""` |
+| `backup.s3.prefix` | Optional prefix inside the bucket | `""` |
+| `backup.s3.endpoint` | Custom S3 endpoint (for MinIO/other providers) | `""` |
+| `backup.s3.usePathStyle` | Force path-style addressing for S3 clients | `true` |
+| `backup.s3.existingSecret` | Use an existing secret containing AWS credentials | `""` |
+| `backup.s3.accessKey` | AWS access key (used when existingSecret not set) | `""` |
+| `backup.s3.secretKey` | AWS secret key (used when existingSecret not set) | `""` |
+| `backup.pgDumpFormat` | `pg_dump` format (`custom`, `plain`, etc.) | `"custom"` |
+| `backup.compress` | Compress dumps using gzip | `true` |
+| `backup.resources` | Resource requests and limits for backup container | `{cpu: 100m/500m, memory: 256Mi/512Mi}` |
+| `backup.successfulJobsHistoryLimit` | Successful job history limit | `3` |
+| `backup.failedJobsHistoryLimit` | Failed job history limit | `1` |
+| `backup.annotations` | Annotations for the CronJob | `{}` |
+| `backup.podAnnotations` | Extra annotations for backup pods | `{}` |
+| `backup.nodeSelector` | Node selector for backup pods | `{}` |
+| `backup.affinity` | Affinity rules for backup pods | `{}` |
+| `backup.tolerations` | Tolerations for backup pods | `[]` |
+| `backup.env` | Additional environment variables for backup container | `[]` |
+
+## Notes
+
+Secret `<release-name>-postgresql-secret` (or the secret referenced by `postgresql.existingSecret`) contains the password and connection strings for the direct PostgreSQL, PgBouncer, and HAProxy endpoints. Retrieve them with `kubectl get secret ... -o jsonpath=...`. When `postgresql.existingSecret` is provided, the chart also creates `<release-name>-postgresql-url` containing the constructed `postgres-url` key if one is not already present.
+
+If backups are enabled and `backup.s3.existingSecret` is left empty, the chart creates secret `<release-name>-backup` containing the AWS credentials.
