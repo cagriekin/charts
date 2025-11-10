@@ -36,40 +36,32 @@ spec:
             runAsUser: 999
             runAsGroup: 999
             runAsNonRoot: true
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.postgresql.postgresUser | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.secretName" . }}
+                  key: postgres-password
+            - name: POSTGRES_MASTER_SERVICE
+              value: {{ printf "%s-postgresql-master.%s.svc.cluster.local" (include "pgvector.fullname" .) .Release.Namespace | quote }}
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: PGBACKUP_DESTINATION
+              value: /var/lib/postgresql/data
           command:
             - /bin/sh
             - -c
             - |
               set -e
 
-              mkdir -p /var/lib/postgresql/data
+              cat <<'EOSCRIPT' > /tmp/init-replica.sh
+{{ (.Files.Get "files/init-replica.sh") | indent 14 }}
+              EOSCRIPT
 
-              if [ ! -f /var/lib/postgresql/data/standby.signal ]; then
-                until pg_isready -h {{ include "pgvector.fullname" . }}-postgresql-master.{{ .Release.Namespace }}.svc.cluster.local -p 5432 -U {{ .Values.postgresql.postgresUser }}; do
-                  sleep 2
-                done
-
-                rm -rf /var/lib/postgresql/data/*
-
-                PGPASSWORD={{ .Values.postgresql.postgresPassword | default (include "pgvector.postgresql.password" .) }} pg_basebackup \
-                  -h {{ include "pgvector.fullname" . }}-postgresql-master.{{ .Release.Namespace }}.svc.cluster.local \
-                  -D /var/lib/postgresql/data \
-                  -U {{ .Values.postgresql.postgresUser }} \
-                  -P \
-                  -v \
-                  -R \
-                  -X stream
-
-                cat <<'EOF' > /var/lib/postgresql/data/pg_hba.conf
-                # TYPE  DATABASE        USER            ADDRESS                 METHOD
-
-                local   all             all                                     trust
-                host    all             all             127.0.0.1/32            trust
-                host    all             all             ::1/128                 trust
-                host    replication     {{ .Values.postgresql.postgresUser }}        0.0.0.0/0               md5
-                host    all             {{ .Values.postgresql.postgresUser }}        0.0.0.0/0               md5
-                EOF
-              fi
+              chmod +x /tmp/init-replica.sh
+              /tmp/init-replica.sh
           volumeMounts:
             - name: postgresql-data
               mountPath: /var/lib/postgresql/data
