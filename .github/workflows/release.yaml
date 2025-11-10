@@ -28,6 +28,17 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
 
+      - name: Ensure gh-pages branch exists
+        run: |
+          set -euo pipefail
+          if ! git ls-remote --exit-code --heads origin gh-pages; then
+            git checkout --orphan gh-pages
+            git reset --hard
+            git commit --allow-empty -m "Initialize gh-pages branch"
+            git push origin gh-pages
+            git checkout master
+          fi
+
       - name: Set up Helm
         uses: azure/setup-helm@v4
         with:
@@ -54,7 +65,7 @@ jobs:
         uses: helm/chart-releaser-action@v1.5.0
         env:
           CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CR_SKIP_EXISTING: "true"
         with:
           charts_dir: .
-          skip_existing: true
 
