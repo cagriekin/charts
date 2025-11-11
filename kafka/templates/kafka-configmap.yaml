@@ -1,0 +1,121 @@
+{{- if .Values.kafka.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kafka.fullname" . }}-kafka-controller-config
+  labels:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-controller-config
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    helm.sh/chart: {{ include "kafka.chart" . }}
+data:
+  {{- $authUsername := include "kafka.auth.username" . }}
+  {{- $authPassword := include "kafka.auth.password" . }}
+  kafka_server_jaas.conf: |
+    KafkaServer {
+        org.apache.kafka.common.security.plain.PlainLoginModule required
+        username="{{ $authUsername }}"
+        password="{{ $authPassword }}"
+        user_{{ $authUsername }}="{{ $authPassword }}";
+    };
+  server.properties: |
+    # Kafka controller configuration
+    process.roles=controller
+    node.id=PLACEHOLDER_NODE_ID
+    controller.quorum.voters={{ include "kafka.kafka.controllerQuorumVoters" . }}
+    listeners=CONTROLLER://:9093
+    controller.listener.names=CONTROLLER
+    log.dirs=/tmp/kraft-controller-logs
+    # SASL Authentication configuration
+    sasl.enabled.mechanisms=PLAIN
+    sasl.mechanism.controller.protocol=PLAIN
+    sasl.mechanism.inter.broker.protocol=PLAIN
+    # JAAS configuration file path
+    sasl.jaas.config=/opt/kafka/config/kraft/kafka_server_jaas.conf
+  client.properties: |
+    # Kafka client configuration for SASL authentication
+    security.protocol=SASL_PLAINTEXT
+    sasl.mechanism=PLAIN
+    sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="{{ $authUsername }}" password="{{ $authPassword }}";
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kafka.fullname" . }}-kafka-broker-config
+  labels:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-broker-config
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    helm.sh/chart: {{ include "kafka.chart" . }}
+data:
+  {{- $brokerAuthUsername := include "kafka.auth.username" . }}
+  {{- $brokerAuthPassword := include "kafka.auth.password" . }}
+  kafka_server_jaas.conf: |
+    KafkaServer {
+        org.apache.kafka.common.security.plain.PlainLoginModule required
+        username="{{ $brokerAuthUsername }}"
+        password="{{ $brokerAuthPassword }}"
+        user_{{ $brokerAuthUsername }}="{{ $brokerAuthPassword }}";
+    };
+  server.properties: |
+    # Kafka broker configuration
+    process.roles=broker
+    node.id=PLACEHOLDER_NODE_ID
+    controller.quorum.voters={{ include "kafka.kafka.controllerQuorumVoters" . }}
+    listeners=SASL_PLAINTEXT://:9092
+    listener.security.protocol.map=SASL_PLAINTEXT:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+    controller.listener.names=CONTROLLER
+    advertised.listeners=SASL_PLAINTEXT://PLACEHOLDER_POD_NAME.{{ include "kafka.fullname" . }}-kafka-broker.{{ default "default" .Release.Namespace }}.svc.cluster.local:9092
+    inter.broker.listener.name=SASL_PLAINTEXT
+    num.partitions=3
+    default.replication.factor=1
+    offsets.topic.replication.factor=1
+    transaction.state.log.min.isr=1
+    transaction.state.log.replication.factor=1
+    auto.create.topics.enable={{ .Values.kafka.autoCreateTopicsEnable }}
+    delete.topic.enable={{ .Values.kafka.deleteTopicEnable }}
+    log.dirs=/tmp/kraft-broker-logs
+    # SASL Authentication configuration
+    sasl.enabled.mechanisms=PLAIN
+    sasl.mechanism.controller.protocol=PLAIN
+    sasl.mechanism.inter.broker.protocol=PLAIN
+    # JAAS configuration file path
+    sasl.jaas.config=/opt/kafka/config/kraft/kafka_server_jaas.conf
+  # Separate config for init container storage formatting
+  server-init.properties: |
+    process.roles=broker
+    node.id=PLACEHOLDER_NODE_ID
+    controller.quorum.voters={{ include "kafka.kafka.controllerQuorumVoters" . }}
+    listeners=SASL_PLAINTEXT://:9092
+    listener.security.protocol.map=SASL_PLAINTEXT:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+    controller.listener.names=CONTROLLER
+    inter.broker.listener.name=SASL_PLAINTEXT
+    num.partitions=3
+    default.replication.factor=1
+    offsets.topic.replication.factor=1
+    transaction.state.log.min.isr=1
+    transaction.state.log.replication.factor=1
+    auto.create.topics.enable={{ .Values.kafka.autoCreateTopicsEnable }}
+    delete.topic.enable={{ .Values.kafka.deleteTopicEnable }}
+    log.dirs=/tmp/kraft-broker-logs
+    # SASL Authentication configuration
+    sasl.enabled.mechanisms=PLAIN
+    sasl.mechanism.controller.protocol=PLAIN
+    sasl.mechanism.inter.broker.protocol=PLAIN
+    # JAAS configuration file path
+    sasl.jaas.config=/opt/kafka/config/kraft/kafka_server_jaas.conf
+  client.properties: |
+    # Kafka client configuration for SASL authentication
+    security.protocol=SASL_PLAINTEXT
+    sasl.mechanism=PLAIN
+    sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="{{ $brokerAuthUsername }}" password="{{ $brokerAuthPassword }}";
+  client_jaas.conf: |
+    org.apache.kafka.common.security.plain.PlainLoginModule required
+    username="{{ $brokerAuthUsername }}"
+    password="{{ $brokerAuthPassword }}";
+{{- end }}

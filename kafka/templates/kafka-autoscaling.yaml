@@ -1,0 +1,87 @@
+{{- if and .Values.kafka.enabled .Values.autoscaling.broker.enabled }}
+{{- $cpu := .Values.autoscaling.broker.targetCPUUtilizationPercentage }}
+{{- $memory := .Values.autoscaling.broker.targetMemoryUtilizationPercentage }}
+{{- if not (or $cpu $memory) }}
+{{- fail "autoscaling.broker.enabled requires at least one of targetCPUUtilizationPercentage or targetMemoryUtilizationPercentage to be set" }}
+{{- end }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "kafka.fullname" . }}-kafka-broker
+  labels:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-broker
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    helm.sh/chart: {{ include "kafka.chart" . }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: {{ include "kafka.fullname" . }}-kafka-broker
+  minReplicas: {{ .Values.autoscaling.broker.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.broker.maxReplicas }}
+  metrics:
+    {{- if $cpu }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $cpu }}
+    {{- end }}
+    {{- if $memory }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ $memory }}
+    {{- end }}
+{{- end }}
+
+{{- if and .Values.exporters.kafka.enabled .Values.exporters.kafka.autoscaling.enabled }}
+{{- $exporterCPU := .Values.exporters.kafka.autoscaling.targetCPUUtilizationPercentage }}
+{{- $exporterMemory := .Values.exporters.kafka.autoscaling.targetMemoryUtilizationPercentage }}
+{{- if not (or $exporterCPU $exporterMemory) }}
+{{- fail "exporters.kafka.autoscaling.enabled requires at least one of targetCPUUtilizationPercentage or targetMemoryUtilizationPercentage to be set" }}
+{{- end }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "kafka.fullname" . }}-kafka-exporter
+  labels:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-exporter
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    helm.sh/chart: {{ include "kafka.chart" . }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "kafka.fullname" . }}-kafka-exporter
+  minReplicas: {{ .Values.exporters.kafka.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.exporters.kafka.autoscaling.maxReplicas }}
+  metrics:
+    {{- if $exporterCPU }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $exporterCPU }}
+    {{- end }}
+    {{- if $exporterMemory }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ $exporterMemory }}
+    {{- end }}
+{{- end }}
+

@@ -1,0 +1,26 @@
+{{- if .Values.kafka.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kafka.fullname" . }}-kafka-broker
+  labels:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-broker
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    helm.sh/chart: {{ include "kafka.chart" . }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - port: 9092
+      targetPort: broker
+      protocol: TCP
+      name: broker
+  selector:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-broker
+{{- end }}
+

@@ -4,3 +4,15 @@ description: PostgreSQL with the pgvector extension, optional PgBouncer pooling,
 type: application
 version: 0.2.2
 appVersion: "18.0"
+keywords:
+  - PostgreSQL
+  - pgvector
+  - PgBouncer
+  - HAProxy
+  - Vector Search
+  - Vector Database
+  - Vector Index
+  - Vector Embedding
+  - Vector Similarity
+  - Vector Similarity Search
+  - Vector Similarity Search Engine
