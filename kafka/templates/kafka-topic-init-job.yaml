@@ -6,6 +6,10 @@ kind: Job
 metadata:
   name: {{ $jobName }}
   annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded,BeforeHookCreation
     argocd.argoproj.io/sync-options: Replace=true
   labels:
     app.kubernetes.io/name: {{ include "kafka.name" . }}
@@ -17,9 +21,6 @@ metadata:
     job-name: {{ $jobName }}
 spec:
   ttlSecondsAfterFinished: 300
-  selector:
-    matchLabels:
-      job-name: {{ $jobName }}
   template:
     metadata:
       labels:
