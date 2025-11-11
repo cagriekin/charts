@@ -56,8 +56,9 @@ spec:
               containerPort: 9308
               protocol: TCP
           {{- if .Values.kafka.auth.existingSecret }}
-          {{- $usernameKey := default "username" (dig "existingSecretKeys" "username" .Values.kafka.auth) }}
-          {{- $passwordKey := default "password" (dig "existingSecretKeys" "password" .Values.kafka.auth) }}
+          {{- $keys := .Values.kafka.auth.existingSecretKeys | default dict }}
+          {{- $usernameKey := default "username" (index $keys "username") }}
+          {{- $passwordKey := default "password" (index $keys "password") }}
           env:
             - name: KAFKA_SASL_USERNAME
               valueFrom:
