@@ -36,6 +36,8 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- $brokerLogDir := .Values.kafka.broker.logDir }}
+      {{- $brokerLogDirParent := dir $brokerLogDir }}
       initContainers:
         - name: kafka-init
           image: "{{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}"
@@ -46,9 +48,12 @@ spec:
             - |
               set -e
               # Wait for the data directory to be available
-              while [ ! -d /tmp/kraft-broker-logs ]; do
+              while [ ! -d "{{ $brokerLogDirParent }}" ]; do
                 sleep 1
               done
+
+              LOG_DIR="{{ $brokerLogDir }}"
+              mkdir -p "${LOG_DIR}"
 
               # Calculate node ID from pod ordinal (broker pods start from node ID 2)
               POD_ORDINAL=$(echo $POD_NAME | rev | cut -d'-' -f1 | rev)
@@ -63,7 +68,7 @@ spec:
               sed -i "s/PLACEHOLDER_POD_NAME/$POD_NAME/g" /tmp/kafka-config-init/server-init.properties
 
               # Format storage if not already formatted
-              if [ ! -f /tmp/kraft-broker-logs/meta.properties ]; then
+              if [ ! -f "${LOG_DIR}/meta.properties" ]; then
                 /opt/kafka/bin/kafka-storage.sh format \
                   --config /tmp/kafka-config-init/server-init.properties \
                   --cluster-id {{ include "kafka.kafka.clusterId" . | quote }} \
@@ -94,7 +99,7 @@ spec:
           {{- end }}
           volumeMounts:
             - name: kafka-data
-              mountPath: /tmp/kraft-broker-logs
+              mountPath: "{{ $brokerLogDirParent }}"
             - name: kafka-config
               mountPath: /opt/kafka/config/kraft
             - name: kafka-secret
@@ -168,7 +173,7 @@ spec:
             {{- toYaml .Values.kafka.broker.resources | nindent 12 }}
           volumeMounts:
             - name: kafka-data
-              mountPath: /tmp/kraft-broker-logs
+              mountPath: "{{ $brokerLogDirParent }}"
             - name: kafka-config
               mountPath: /opt/kafka/config/kraft
             - name: kafka-secret
