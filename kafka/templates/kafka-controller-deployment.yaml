@@ -39,6 +39,8 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- $controllerLogDir := .Values.kafka.controller.logDir }}
+      {{- $controllerLogDirParent := dir $controllerLogDir }}
       initContainers:
         - name: kafka-init
           image: "{{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}"
@@ -49,12 +51,15 @@ spec:
             - |
               set -e
               # Wait for the data directory to be available
-              while [ ! -d /tmp/kraft-controller-logs ]; do
+              while [ ! -d "{{ $controllerLogDirParent }}" ]; do
                 sleep 1
               done
 
+              LOG_DIR="{{ $controllerLogDir }}"
+              mkdir -p "${LOG_DIR}"
+
               # Format storage if not already formatted
-              if [ ! -f /tmp/kraft-controller-logs/meta.properties ]; then
+              if [ ! -f "${LOG_DIR}/meta.properties" ]; then
                 # Handle the symlink by copying to a writable location
                 mkdir -p /tmp/kafka-controller-config
                 cp /opt/kafka/config/kraft/server.properties /tmp/kafka-controller-config/
@@ -78,7 +83,7 @@ spec:
           {{- end }}
           volumeMounts:
             - name: kafka-data
-              mountPath: /tmp/kraft-controller-logs
+              mountPath: "{{ $controllerLogDirParent }}"
             - name: kafka-config
               mountPath: /opt/kafka/config/kraft
             - name: kafka-secret
@@ -128,7 +133,7 @@ spec:
             {{- toYaml .Values.kafka.controller.resources | nindent 12 }}
           volumeMounts:
             - name: kafka-data
-              mountPath: /tmp/kraft-controller-logs
+              mountPath: "{{ $controllerLogDirParent }}"
             - name: kafka-config
               mountPath: /opt/kafka/config/kraft
             - name: kafka-secret

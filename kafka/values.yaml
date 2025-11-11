@@ -13,6 +13,7 @@ kafka:
     pullPolicy: IfNotPresent
   controller:
     replicaCount: 1
+    logDir: /var/lib/kafka/data/kraft-controller-logs
     persistence:
       size: 1Gi
       storageClass: ""
@@ -45,6 +46,7 @@ kafka:
       performanceOpts: "-XX:+UseG1GC -XX:MaxGCPauseMillis=200"
   broker:
     replicaCount: 2
+    logDir: /var/lib/kafka/data/kraft-broker-logs
     persistence:
       size: 1Gi
       storageClass: ""
