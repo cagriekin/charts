@@ -55,17 +55,19 @@ spec:
             - name: metrics
               containerPort: 9308
               protocol: TCP
+          {{- $usernameKey := default "username" (dig "existingSecretKeys" "username" .Values.kafka.auth) }}
+          {{- $passwordKey := default "password" (dig "existingSecretKeys" "password" .Values.kafka.auth) }}
           env:
             - name: KAFKA_SASL_USERNAME
               valueFrom:
                 secretKeyRef:
                   name: {{ include "kafka.auth.secretName" . }}
-                  key: {{ include "kafka.auth.usernameKey" . | trim }}
+                  key: {{ $usernameKey }}
             - name: KAFKA_SASL_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "kafka.auth.secretName" . }}
-                  key: {{ include "kafka.auth.passwordKey" . | trim }}
+                  key: {{ $passwordKey }}
           resources:
             {{- toYaml .Values.exporters.kafka.resources | nindent 12 }}
           livenessProbe:
