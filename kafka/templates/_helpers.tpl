@@ -9,11 +9,13 @@ Expand the name of the chart.
 Create a default fully qualified app name.
 */}}
 {{- define "kafka.fullname" -}}
-{{- $override := default "" .Values.fullnameOverride | trim -}}
-{{- if eq $override "" -}}
-{{- fail "fullnameOverride value is required for the kafka chart" -}}
-{{- end -}}
+{{- $override := default "" (.Values.fullnameOverride | trim) -}}
+{{- if ne $override "" -}}
 {{- $override | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := include "kafka.name" . -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
 {{- end }}
 
 {{/*
