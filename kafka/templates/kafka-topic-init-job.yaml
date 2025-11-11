@@ -27,6 +27,28 @@ spec:
         - /bin/bash
         - -c
         - |
+          set -e
+          BOOTSTRAP_SERVER="{{ include "kafka.fullname" . }}-kafka-broker.{{ default "default" .Release.Namespace }}.svc.cluster.local:9092"
+          MAX_ATTEMPTS=${KAFKA_BOOTSTRAP_RETRIES:-30}
+          SLEEP_SECONDS=${KAFKA_BOOTSTRAP_SLEEP:-5}
+
+          echo "Waiting for Kafka bootstrap server ${BOOTSTRAP_SERVER} to become reachable..."
+          ATTEMPT=1
+          until /opt/kafka/bin/kafka-broker-api-versions.sh \
+            --bootstrap-server "${BOOTSTRAP_SERVER}" \
+            --command-config /opt/kafka/config/kraft/client.properties >/dev/null 2>&1; do
+            if [ "${ATTEMPT}" -ge "${MAX_ATTEMPTS}" ]; then
+              echo "Kafka bootstrap server still unreachable after ${ATTEMPT} attempts; giving up." >&2
+              exit 1
+            fi
+
+            echo "Attempt ${ATTEMPT}/${MAX_ATTEMPTS} failed. Broker not ready yet; sleeping ${SLEEP_SECONDS}s..."
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep "${SLEEP_SECONDS}"
+          done
+
+          echo "Kafka bootstrap server reachable."
+
           # Kafka broker should be ready. Creating topics...
           echo "Creating topics..."
           export KAFKA_OPTS="-Djava.security.auth.login.config=/opt/kafka/config/kraft/client_jaas.conf"
@@ -36,7 +58,7 @@ spec:
           echo "Ensuring {{ $topicName }} topic exists..."
           /opt/kafka/bin/kafka-topics.sh \
             --create \
-            --bootstrap-server {{ include "kafka.fullname" $root }}-kafka-broker:9092 \
+            --bootstrap-server ${BOOTSTRAP_SERVER} \
             --command-config /opt/kafka/config/kraft/client.properties \
             --topic {{ $topicName }} \
             --partitions {{ default 1 $topic.partitions }} \
@@ -53,7 +75,7 @@ spec:
           echo "Topics created successfully. Listing all topics:"
           /opt/kafka/bin/kafka-topics.sh \
             --list \
-            --bootstrap-server {{ include "kafka.fullname" . }}-kafka-broker.{{ default "default" .Release.Namespace }}.svc.cluster.local:9092 \
+            --bootstrap-server ${BOOTSTRAP_SERVER} \
             --command-config /opt/kafka/config/kraft/client.properties
       volumes:
       - name: kafka-config
