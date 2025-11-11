@@ -55,6 +55,7 @@ spec:
             - name: metrics
               containerPort: 9308
               protocol: TCP
+          {{- if .Values.kafka.auth.existingSecret }}
           {{- $usernameKey := default "username" (dig "existingSecretKeys" "username" .Values.kafka.auth) }}
           {{- $passwordKey := default "password" (dig "existingSecretKeys" "password" .Values.kafka.auth) }}
           env:
@@ -68,6 +69,15 @@ spec:
                 secretKeyRef:
                   name: {{ include "kafka.auth.secretName" . }}
                   key: {{ $passwordKey }}
+          {{- else }}
+          {{- $exporterUsername := .Values.kafka.auth.username | default "user1" }}
+          {{- $exporterPassword := (.Values.kafka.auth.password | default (include "kafka.kafka.password" .)) | b64dec }}
+          env:
+            - name: KAFKA_SASL_USERNAME
+              value: {{ $exporterUsername | quote }}
+            - name: KAFKA_SASL_PASSWORD
+              value: {{ $exporterPassword | quote }}
+          {{- end }}
           resources:
             {{- toYaml .Values.exporters.kafka.resources | nindent 12 }}
           livenessProbe:
