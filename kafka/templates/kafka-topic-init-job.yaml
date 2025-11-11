@@ -1,0 +1,63 @@
+{{- if .Values.kafka.enabled }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "kafka.fullname" . }}-kafka-topic-init-{{ .Release.Revision }}
+  labels:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-topic-init
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    helm.sh/chart: {{ include "kafka.chart" . }}
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: kafka-topic-init
+        image: {{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}
+        volumeMounts:
+        - name: kafka-config
+          mountPath: /opt/kafka/config/kraft
+        {{- $root := . }}
+        command:
+        - /bin/bash
+        - -c
+        - |
+          # Kafka broker should be ready. Creating topics...
+          echo "Creating topics..."
+          export KAFKA_OPTS="-Djava.security.auth.login.config=/opt/kafka/config/kraft/client_jaas.conf"
+
+          # Ensure configured topics exist
+{{- range $topicName, $topic := $root.Values.kafka.topics }}
+          echo "Ensuring {{ $topicName }} topic exists..."
+          /opt/kafka/bin/kafka-topics.sh \
+            --create \
+            --bootstrap-server {{ include "kafka.fullname" $root }}-kafka-broker:9092 \
+            --command-config /opt/kafka/config/kraft/client.properties \
+            --topic {{ $topicName }} \
+            --partitions {{ default 1 $topic.partitions }} \
+            --replication-factor {{ default 1 $topic.replicationFactor }} \
+            {{- with $topic.config }}
+            {{- range $confKey, $confValue := . }}
+            --config {{ $confKey }}={{ $confValue }} \
+            {{- end }}
+            {{- end }}
+            --if-not-exists
+
+{{- end }}
+
+          echo "Topics created successfully. Listing all topics:"
+          /opt/kafka/bin/kafka-topics.sh \
+            --list \
+            --bootstrap-server {{ include "kafka.fullname" . }}-kafka-broker.{{ default "default" .Release.Namespace }}.svc.cluster.local:9092 \
+            --command-config /opt/kafka/config/kraft/client.properties
+      volumes:
+      - name: kafka-config
+        configMap:
+          name: {{ include "kafka.fullname" . }}-kafka-broker-config
+{{- end }}
+

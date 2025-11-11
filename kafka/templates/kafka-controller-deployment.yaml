@@ -1,0 +1,167 @@
+{{- if .Values.kafka.enabled }}
+{{- if ne (int .Values.kafka.controller.replicaCount) 1 }}
+{{- fail "kafka.controller.replicaCount must be set to 1. Multi-controller KRaft layouts are not yet supported by this chart." }}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "kafka.fullname" . }}-kafka-controller
+  labels:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-controller
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    helm.sh/chart: {{ include "kafka.chart" . }}
+spec:
+  replicas: {{ .Values.kafka.controller.replicaCount }}
+  serviceName: {{ include "kafka.fullname" . }}-kafka-controller
+  updateStrategy:
+    type: OnDelete
+    rollingUpdate: null
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "kafka.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: kafka-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "kafka.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: kafka-controller
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+        app.kubernetes.io/part-of: {{ .Chart.Name }}
+        helm.sh/chart: {{ include "kafka.chart" . }}
+    spec:
+      serviceAccountName: {{ include "kafka.serviceAccountName" . }}
+      {{- with .Values.kafka.controller.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: kafka-init
+          image: "{{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}"
+          imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              # Wait for the data directory to be available
+              while [ ! -d /tmp/kraft-controller-logs ]; do
+                sleep 1
+              done
+
+              # Format storage if not already formatted
+              if [ ! -f /tmp/kraft-controller-logs/meta.properties ]; then
+                # Handle the symlink by copying to a writable location
+                mkdir -p /tmp/kafka-controller-config
+                cp /opt/kafka/config/kraft/server.properties /tmp/kafka-controller-config/
+
+                # Replace PLACEHOLDER_NODE_ID with actual node ID
+                sed -i 's/PLACEHOLDER_NODE_ID/1/g' /tmp/kafka-controller-config/server.properties
+
+                /opt/kafka/bin/kafka-storage.sh format \
+                  --config /tmp/kafka-controller-config/server.properties \
+                  --cluster-id {{ include "kafka.kafka.clusterId" . | quote }} \
+                  --ignore-formatted
+              fi
+          env:
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_OPTS
+              value: "-Djava.security.auth.login.config=/opt/kafka/config/kraft/kafka_server_jaas.conf"
+          {{- with .Values.kafka.controller.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: kafka-data
+              mountPath: /tmp/kraft-controller-logs
+            - name: kafka-config
+              mountPath: /opt/kafka/config/kraft
+            - name: kafka-secret
+              mountPath: /opt/kafka/secrets
+      containers:
+        - name: kafka-controller
+          image: "{{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}"
+          imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              # Controller always uses node ID 1
+              export KAFKA_NODE_ID=1
+
+              # Create writable config directory and copy config file
+              mkdir -p /tmp/kafka-config
+              cp /opt/kafka/config/kraft/server.properties /tmp/kafka-config/
+
+              # Update server.properties with correct node ID
+              sed -i "s/PLACEHOLDER_NODE_ID/1/g" /tmp/kafka-config/server.properties
+
+              # Start Kafka with the modified config
+              exec /opt/kafka/bin/kafka-server-start.sh /tmp/kafka-config/server.properties
+          ports:
+            - name: controller
+              containerPort: 9093
+              protocol: TCP
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: KAFKA_HEAP_OPTS
+              value: {{ .Values.kafka.controller.jvm.heapOpts | quote }}
+            - name: KAFKA_JVM_PERFORMANCE_OPTS
+              value: {{ .Values.kafka.controller.jvm.performanceOpts | quote }}
+            - name: KAFKA_PROCESS_ROLES
+              value: "controller"
+            - name: KAFKA_OPTS
+              value: "-Djava.security.auth.login.config=/opt/kafka/config/kraft/kafka_server_jaas.conf"
+          {{- with .Values.kafka.controller.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.kafka.controller.resources | nindent 12 }}
+          volumeMounts:
+            - name: kafka-data
+              mountPath: /tmp/kraft-controller-logs
+            - name: kafka-config
+              mountPath: /opt/kafka/config/kraft
+            - name: kafka-secret
+              mountPath: /opt/kafka/secrets
+      volumes:
+        - name: kafka-config
+          configMap:
+            name: {{ include "kafka.fullname" . }}-kafka-controller-config
+        - name: kafka-secret
+          secret:
+            secretName: {{ include "kafka.auth.secretName" . }}
+      {{- with .Values.kafka.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.kafka.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.kafka.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: kafka-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.kafka.controller.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.kafka.controller.persistence.size | default "1Gi" }}
+{{- end }}
+
