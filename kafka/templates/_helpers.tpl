@@ -80,10 +80,10 @@ Return the Kafka auth username.
 {{- if and $secret.data (hasKey $secret.data $key) }}
 {{- index $secret.data $key | b64dec -}}
 {{- else }}
-{{- $fallback -}}
+{{- fail (printf "Kafka auth existingSecret %q must contain key %q" .Values.kafka.auth.existingSecret $key) }}
 {{- end }}
 {{- else }}
-{{- $fallback -}}
+{{- fail (printf "Kafka auth existingSecret %q not found in namespace %q" .Values.kafka.auth.existingSecret (default "default" .Release.Namespace)) }}
 {{- end }}
 {{- else }}
 {{- $fallback -}}
@@ -102,10 +102,10 @@ Return the Kafka auth password in plain text.
 {{- if and $secret.data (hasKey $secret.data $key) }}
 {{- index $secret.data $key | b64dec -}}
 {{- else }}
-{{- $fallback | b64dec -}}
+{{- fail (printf "Kafka auth existingSecret %q must contain key %q" .Values.kafka.auth.existingSecret $key) }}
 {{- end }}
 {{- else }}
-{{- $fallback | b64dec -}}
+{{- fail (printf "Kafka auth existingSecret %q not found in namespace %q" .Values.kafka.auth.existingSecret (default "default" .Release.Namespace)) }}
 {{- end }}
 {{- else }}
 {{- $fallback | b64dec -}}
