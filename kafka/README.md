@@ -26,7 +26,7 @@ Key options are summarized below; see `values.yaml` for the complete list.
 | `kafka.broker.persistence.size` | Requested storage capacity for each broker PVC | `1Gi` |
 | `kafka.auth.username` | SASL/PLAIN username for broker and clients | `user1` |
 | `kafka.auth.password` | SASL/PLAIN password (auto-generated when empty) | `""` |
-| `kafka.auth.existingSecret` | Name of an existing secret providing SASL credentials (skips chart-managed secret) | `""` |
+| `kafka.auth.existingSecret` | Name of an existing secret providing SASL credentials (skips chart-managed secret; falls back to inline values when absent) | `""` |
 | `kafka.auth.existingSecretKeys.username` | Key in the existing secret that stores the username | `username` |
 | `kafka.auth.existingSecretKeys.password` | Key in the existing secret that stores the password | `password` |
 | `kafka.autoCreateTopicsEnable` | Allow brokers to auto-create topics | `true` |
@@ -122,7 +122,7 @@ kafka:
 
 1. Set `fullnameOverride` to the release-specific base name; the chart fails fast when it is left empty.
 2. Provision the target namespace with restricted PodSecurity labels (`enforce=restricted`, `audit=restricted`) before installing the chart.
-3. Either leave `kafka.auth.password` empty to let the chart derive a deterministic password, or provide `kafka.auth.password`/`kafka.auth.existingSecret`. When `existingSecret` is supplied, the chart fails fast if the referenced secret or keys are absent.
+3. Either leave `kafka.auth.password` empty to let the chart derive a deterministic password, or provide `kafka.auth.password`/`kafka.auth.existingSecret`. When `existingSecret` is supplied, the template will attempt to read the referenced secret but gracefully falls back to the inline values if it is missing—be sure the secret exists before the pods start.
 4. Confirm storage classes exist for the requested controller and broker `persistence.storageClass` values (or leave empty to use the cluster default).
 5. Override `kafka.topics` with the initial topic catalogue, including metadata to drive the topic-init job and documentation configmap.
 6. Run `helm install` with the desired overrides, then wait for the controller and brokers to become Ready before onboarding producers/consumers.
