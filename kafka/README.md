@@ -17,10 +17,13 @@ Key options are summarized below; see `values.yaml` for the complete list.
 
 | Key | Description | Default |
 | --- | --- | --- |
+| `fullnameOverride` | Base name applied to every rendered resource. REQUIRED and must be unique per namespace. | `""` (chart fails when left empty) |
 | `kafka.controller.replicaCount` | Kafka controller replicas (KRaft mode) | `1` |
 | `kafka.controller.persistence.storageClass` | StorageClass for controller PVC (empty uses cluster default) | `""` |
+| `kafka.controller.persistence.size` | Requested storage capacity for the controller PVC | `1Gi` |
 | `kafka.broker.replicaCount` | Kafka broker replicas | `2` |
 | `kafka.broker.persistence.storageClass` | StorageClass for broker PVCs (empty uses cluster default) | `""` |
+| `kafka.broker.persistence.size` | Requested storage capacity for each broker PVC | `1Gi` |
 | `kafka.auth.username` | SASL/PLAIN username for broker and clients | `user1` |
 | `kafka.auth.password` | SASL/PLAIN password (auto-generated when empty) | `""` |
 | `kafka.auth.existingSecret` | Name of an existing secret providing SASL credentials (skips chart-managed secret) | `""` |
@@ -62,6 +65,7 @@ Deploy with chart-managed credentials and a couple of declarative topics:
 
 ```yaml
 # values-minimal.yaml
+fullnameOverride: platform-kafka
 kafka:
   auth:
     username: my-service
@@ -89,6 +93,7 @@ Deploy pointing at an existing secret that already carries SASL credentials:
 
 ```yaml
 # values-existing-secret.yaml
+fullnameOverride: shared-message-bus
 kafka:
   auth:
     existingSecret: kafka-shared-creds
@@ -115,11 +120,12 @@ kafka:
 
 ### Bootstrap
 
-1. Provision the target namespace with restricted PodSecurity labels (`enforce=restricted`, `audit=restricted`) before installing the chart.
-2. Either leave `kafka.auth.password` empty to let the chart derive a deterministic password, or provide `kafka.auth.password`/`kafka.auth.existingSecret`. When `existingSecret` is supplied, the chart fails fast if the referenced secret or keys are absent.
-3. Confirm storage classes exist for the requested controller and broker `persistence.storageClass` values (or leave empty to use the cluster default).
-4. Override `kafka.topics` with the initial topic catalogue, including metadata to drive the topic-init job and documentation configmap.
-5. Run `helm install` with the desired overrides, then wait for the controller and brokers to become Ready before onboarding producers/consumers.
+1. Set `fullnameOverride` to the release-specific base name; the chart fails fast when it is left empty.
+2. Provision the target namespace with restricted PodSecurity labels (`enforce=restricted`, `audit=restricted`) before installing the chart.
+3. Either leave `kafka.auth.password` empty to let the chart derive a deterministic password, or provide `kafka.auth.password`/`kafka.auth.existingSecret`. When `existingSecret` is supplied, the chart fails fast if the referenced secret or keys are absent.
+4. Confirm storage classes exist for the requested controller and broker `persistence.storageClass` values (or leave empty to use the cluster default).
+5. Override `kafka.topics` with the initial topic catalogue, including metadata to drive the topic-init job and documentation configmap.
+6. Run `helm install` with the desired overrides, then wait for the controller and brokers to become Ready before onboarding producers/consumers.
 
 ### Topic Management
 
@@ -144,5 +150,5 @@ kafka:
 
 | Chart Version | Kafka Version | Kubernetes Versions | Notes |
 | --- | --- | --- | --- |
-| 0.1.1 | 4.1.0 | 1.27 – 1.30 | Validated with restricted PodSecurity admission, requires Helm 3.9+ for `fail` templating |
+| 0.1.2 | 4.1.0 | 1.27 – 1.30 | Validated with restricted PodSecurity admission, requires Helm 3.9+ for `fail` templating |
 
