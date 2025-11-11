@@ -72,19 +72,21 @@ Return the Kafka auth secret name (existing or managed by chart).
 Return the Kafka auth username.
 */}}
 {{- define "kafka.auth.username" -}}
+{{- $fallback := .Values.kafka.auth.username | default "user1" -}}
 {{- if .Values.kafka.auth.existingSecret }}
 {{- $secret := lookup "v1" "Secret" (default "default" .Release.Namespace) .Values.kafka.auth.existingSecret }}
-{{- if not $secret }}
-{{- fail (printf "Kafka auth existingSecret %q not found in namespace %q" .Values.kafka.auth.existingSecret (default "default" .Release.Namespace)) }}
-{{- end }}
-{{- $key := default "username" (dig "existingSecretKeys" "username" .Values.kafka.auth) }}
-{{- $data := index $secret.data $key }}
-{{- if not $data }}
-{{- fail (printf "Kafka auth existingSecret %q must contain key %q" .Values.kafka.auth.existingSecret $key) }}
-{{- end }}
-{{- $data | b64dec -}}
+{{- $key := include "kafka.auth.usernameKey" . | trim }}
+{{- if $secret }}
+{{- if and $secret.data (hasKey $secret.data $key) }}
+{{- index $secret.data $key | b64dec -}}
 {{- else }}
-{{- .Values.kafka.auth.username | default "user1" -}}
+{{- $fallback -}}
+{{- end }}
+{{- else }}
+{{- $fallback -}}
+{{- end }}
+{{- else }}
+{{- $fallback -}}
 {{- end }}
 {{- end }}
 
@@ -92,20 +94,21 @@ Return the Kafka auth username.
 Return the Kafka auth password in plain text.
 */}}
 {{- define "kafka.auth.password" -}}
+{{- $fallback := default (include "kafka.kafka.password" .) .Values.kafka.auth.password -}}
 {{- if .Values.kafka.auth.existingSecret }}
 {{- $secret := lookup "v1" "Secret" (default "default" .Release.Namespace) .Values.kafka.auth.existingSecret }}
-{{- if not $secret }}
-{{- fail (printf "Kafka auth existingSecret %q not found in namespace %q" .Values.kafka.auth.existingSecret (default "default" .Release.Namespace)) }}
-{{- end }}
-{{- $key := default "password" (dig "existingSecretKeys" "password" .Values.kafka.auth) }}
-{{- $data := index $secret.data $key }}
-{{- if not $data }}
-{{- fail (printf "Kafka auth existingSecret %q must contain key %q" .Values.kafka.auth.existingSecret $key) }}
-{{- end }}
-{{- $data | b64dec -}}
+{{- $key := include "kafka.auth.passwordKey" . | trim }}
+{{- if $secret }}
+{{- if and $secret.data (hasKey $secret.data $key) }}
+{{- index $secret.data $key | b64dec -}}
 {{- else }}
-{{- $password := default (include "kafka.kafka.password" .) .Values.kafka.auth.password -}}
-{{- $password | b64dec -}}
+{{- $fallback | b64dec -}}
+{{- end }}
+{{- else }}
+{{- $fallback | b64dec -}}
+{{- end }}
+{{- else }}
+{{- $fallback | b64dec -}}
 {{- end }}
 {{- end }}
 
@@ -113,8 +116,9 @@ Return the Kafka auth password in plain text.
 Return the secret key used for username retrieval.
 */}}
 {{- define "kafka.auth.usernameKey" -}}
-{{- if .Values.kafka.auth.existingSecret }}
-{{- default "username" (dig "existingSecretKeys" "username" .Values.kafka.auth) -}}
+{{- $keys := .Values.kafka.auth.existingSecretKeys -}}
+{{- if and .Values.kafka.auth.existingSecret $keys (hasKey $keys "username") }}
+{{- index $keys "username" -}}
 {{- else }}
 username
 {{- end }}
@@ -124,8 +128,9 @@ username
 Return the secret key used for password retrieval.
 */}}
 {{- define "kafka.auth.passwordKey" -}}
-{{- if .Values.kafka.auth.existingSecret }}
-{{- default "password" (dig "existingSecretKeys" "password" .Values.kafka.auth) -}}
+{{- $keys := .Values.kafka.auth.existingSecretKeys -}}
+{{- if and .Values.kafka.auth.existingSecret $keys (hasKey $keys "password") }}
+{{- index $keys "password" -}}
 {{- else }}
 password
 {{- end }}
