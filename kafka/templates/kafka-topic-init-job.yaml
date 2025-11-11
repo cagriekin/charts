@@ -4,6 +4,8 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: {{ include "kafka.fullname" . }}-kafka-topic-init-{{ .Release.Revision }}
+  annotations:
+    argocd.argoproj.io/sync-options: Replace=true
   labels:
     app.kubernetes.io/name: {{ include "kafka.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
