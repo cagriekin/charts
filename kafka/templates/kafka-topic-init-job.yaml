@@ -15,7 +15,20 @@ metadata:
     helm.sh/chart: {{ include "kafka.chart" . }}
 spec:
   ttlSecondsAfterFinished: 300
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "kafka.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: kafka-topic-init
   template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "kafka.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: kafka-topic-init
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+        app.kubernetes.io/part-of: {{ .Chart.Name }}
+        helm.sh/chart: {{ include "kafka.chart" . }}
     spec:
       restartPolicy: OnFailure
       containers:
