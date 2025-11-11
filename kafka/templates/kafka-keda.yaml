@@ -1,0 +1,28 @@
+{{- if and .Values.kafka.enabled .Values.keda.broker.enabled }}
+{{- if not .Values.keda.broker.triggers }}
+{{- fail "keda.broker.enabled requires at least one trigger definition" }}
+{{- end }}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "kafka.fullname" . }}-kafka-broker
+  labels:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-broker
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    helm.sh/chart: {{ include "kafka.chart" . }}
+spec:
+  pollingInterval: {{ .Values.keda.broker.pollingInterval }}
+  cooldownPeriod: {{ .Values.keda.broker.cooldownPeriod }}
+  minReplicaCount: {{ .Values.keda.broker.minReplicaCount }}
+  maxReplicaCount: {{ .Values.keda.broker.maxReplicaCount }}
+  scaleTargetRef:
+    kind: StatefulSet
+    apiVersion: apps/v1
+    name: {{ include "kafka.fullname" . }}-kafka-broker
+  triggers:
+    {{- toYaml .Values.keda.broker.triggers | nindent 4 }}
+{{- end }}
+

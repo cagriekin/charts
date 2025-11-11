@@ -1,0 +1,53 @@
+{{- if .Values.kafka.enabled }}
+{{- $fullname := include "kafka.fullname" . }}
+{{- $namespace := default "default" .Release.Namespace }}
+
+Kafka cluster {{ $fullname }} is rolling out.
+
+Controller
+----------
+- StatefulSet: {{ $fullname }}-kafka-controller
+- Service: {{ $fullname }}-kafka-controller (port 9093)
+
+Brokers
+-------
+{{- $replicas := int .Values.kafka.broker.replicaCount }}
+{{- range $i, $_ := until $replicas }}
+- {{ $fullname }}-kafka-broker-{{ $i }}.{{ $fullname }}-kafka-broker.{{ $namespace }}.svc.cluster.local:9092
+{{- end }}
+
+Authentication
+--------------
+- SASL/PLAIN credentials stored in secret `{{ include "kafka.auth.secretName" . }}`
+- Client configuration mounted via configmap `{{ $fullname }}-kafka-broker-config`
+
+Topics
+------
+{{- $topics := default (dict) .Values.kafka.topics }}
+{{- if eq (len $topics) 0 }}
+- No declarative topics were provided. Update `kafka.topics` to have the init job reconcile topics.
+{{- else }}
+{{- range $name, $topic := $topics }}
+- {{ $name }} (partitions: {{ default 1 $topic.partitions }}, replication factor: {{ default 1 $topic.replicationFactor }})
+{{- end }}
+{{- end }}
+
+Exporter
+--------
+{{- if .Values.exporters.kafka.enabled }}
+- Metrics endpoint exposed via service `{{ $fullname }}-kafka-exporter` on port 9308.
+{{- else }}
+- Kafka exporter is disabled (`exporters.kafka.enabled=false`).
+{{- end }}
+{{- if and .Values.exporters.kafka.enabled .Values.serviceMonitors.enabled }}
+- ServiceMonitor `{{ $fullname }}-kafka-exporter` created for Prometheus scraping.
+{{- end }}
+
+Next Steps
+----------
+- Wait for `kubectl rollout status statefulset/{{ $fullname }}-kafka-broker` to report success.
+- Distribute the SASL credentials to clients and begin provisioning topics.
+{{- else }}
+Kafka workloads are disabled (`kafka.enabled=false`); no resources were rendered.
+{{- end }}
+

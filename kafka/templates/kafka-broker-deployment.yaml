@@ -1,0 +1,207 @@
+{{- if .Values.kafka.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "kafka.fullname" . }}-kafka-broker
+  labels:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-broker
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    helm.sh/chart: {{ include "kafka.chart" . }}
+spec:
+  replicas: {{ .Values.kafka.broker.replicaCount }}
+  serviceName: {{ include "kafka.fullname" . }}-kafka-broker
+  updateStrategy:
+    type: OnDelete
+    rollingUpdate: null
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "kafka.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: kafka-broker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "kafka.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: kafka-broker
+        app.kubernetes.io/managed-by: {{ .Release.Service }}
+        app.kubernetes.io/part-of: {{ .Chart.Name }}
+        helm.sh/chart: {{ include "kafka.chart" . }}
+    spec:
+      serviceAccountName: {{ include "kafka.serviceAccountName" . }}
+      {{- with .Values.kafka.broker.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: kafka-init
+          image: "{{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}"
+          imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              # Wait for the data directory to be available
+              while [ ! -d /tmp/kraft-broker-logs ]; do
+                sleep 1
+              done
+
+              # Calculate node ID from pod ordinal (broker pods start from node ID 2)
+              POD_ORDINAL=$(echo $POD_NAME | rev | cut -d'-' -f1 | rev)
+              NODE_ID=$((POD_ORDINAL + 2))
+
+              # Create writable config directory and copy init config file for formatting
+              mkdir -p /tmp/kafka-config-init
+              cp /opt/kafka/config/kraft/server-init.properties /tmp/kafka-config-init/
+
+              # Replace PLACEHOLDER_NODE_ID and PLACEHOLDER_POD_NAME with actual values
+              sed -i "s/PLACEHOLDER_NODE_ID/$NODE_ID/g" /tmp/kafka-config-init/server-init.properties
+              sed -i "s/PLACEHOLDER_POD_NAME/$POD_NAME/g" /tmp/kafka-config-init/server-init.properties
+
+              # Format storage if not already formatted
+              if [ ! -f /tmp/kraft-broker-logs/meta.properties ]; then
+                /opt/kafka/bin/kafka-storage.sh format \
+                  --config /tmp/kafka-config-init/server-init.properties \
+                  --cluster-id {{ include "kafka.kafka.clusterId" . | quote }} \
+                  --ignore-formatted
+              fi
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker"
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: {{ .Values.kafka.autoCreateTopicsEnable | quote }}
+            - name: KAFKA_DELETE_TOPIC_ENABLE
+              value: {{ .Values.kafka.deleteTopicEnable | quote }}
+            - name: KAFKA_OPTS
+              value: "-Djava.security.auth.login.config=/opt/kafka/config/kraft/kafka_server_jaas.conf"
+          {{- with .Values.kafka.broker.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: kafka-data
+              mountPath: /tmp/kraft-broker-logs
+            - name: kafka-config
+              mountPath: /opt/kafka/config/kraft
+            - name: kafka-secret
+              mountPath: /opt/kafka/secrets
+      containers:
+        - name: kafka-broker
+          image: "{{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}"
+          imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              # Calculate node ID from pod ordinal (broker pods start from node ID 2)
+              POD_ORDINAL=$(echo $POD_NAME | rev | cut -d'-' -f1 | rev)
+              NODE_ID=$((POD_ORDINAL + 2))
+              export KAFKA_NODE_ID=$NODE_ID
+
+              # Create writable config directory and copy config file
+              mkdir -p /tmp/kafka-config
+              cp /opt/kafka/config/kraft/server.properties /tmp/kafka-config/
+
+              # Update server.properties with correct node ID and pod name
+              sed -i "s/PLACEHOLDER_NODE_ID/$NODE_ID/g" /tmp/kafka-config/server.properties
+              sed -i "s/PLACEHOLDER_POD_NAME/$POD_NAME/g" /tmp/kafka-config/server.properties
+
+              # Start Kafka with the modified config
+              exec /opt/kafka/bin/kafka-server-start.sh /tmp/kafka-config/server.properties
+          ports:
+            - name: broker
+              containerPort: 9092
+              protocol: TCP
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: KAFKA_HEAP_OPTS
+              value: {{ .Values.kafka.broker.jvm.heapOpts | quote }}
+            - name: KAFKA_JVM_PERFORMANCE_OPTS
+              value: {{ .Values.kafka.broker.jvm.performanceOpts | quote }}
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker"
+            - name: KAFKA_NODE_ID
+              value: ""  # Will be set by startup script
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "SASL_PLAINTEXT://$(POD_NAME).{{ include "kafka.fullname" . }}-kafka-broker.{{ default "default" .Release.Namespace }}.svc.cluster.local:9092"
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: {{ .Values.kafka.autoCreateTopicsEnable | quote }}
+            - name: KAFKA_DELETE_TOPIC_ENABLE
+              value: {{ .Values.kafka.deleteTopicEnable | quote }}
+            # SASL Authentication environment variables
+            - name: KAFKA_OPTS
+              value: "-Djava.security.auth.login.config=/opt/kafka/config/kraft/kafka_server_jaas.conf"
+            - name: KAFKA_SASL_ENABLED_MECHANISMS
+              value: "PLAIN"
+            - name: KAFKA_SASL_MECHANISM_CONTROLLER_PROTOCOL
+              value: "PLAIN"
+            - name: KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL
+              value: "PLAIN"
+          {{- with .Values.kafka.broker.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.kafka.broker.resources | nindent 12 }}
+          volumeMounts:
+            - name: kafka-data
+              mountPath: /tmp/kraft-broker-logs
+            - name: kafka-config
+              mountPath: /opt/kafka/config/kraft
+            - name: kafka-secret
+              mountPath: /opt/kafka/secrets
+      volumes:
+        - name: kafka-config
+          configMap:
+            name: {{ include "kafka.fullname" . }}-kafka-broker-config
+        - name: kafka-secret
+          secret:
+            secretName: {{ include "kafka.auth.secretName" . }}
+      {{- with .Values.kafka.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.kafka.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.kafka.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: kafka-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.kafka.broker.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.kafka.broker.persistence.size | default "1Gi" }}
+{{- end }}
+

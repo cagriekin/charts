@@ -1,0 +1,56 @@
+{{- if .Values.kafka.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kafka.fullname" . }}-kafka-topics
+  labels:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-topics
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    helm.sh/chart: {{ include "kafka.chart" . }}
+data:
+  topics.json: |
+{{ toPrettyJson (default (dict) .Values.kafka.topics) | nindent 4 }}
+
+  README.md: |
+    # Kafka Topics Overview
+
+{{- if eq (len (default (dict) .Values.kafka.topics)) 0 }}
+    _No declarative topics defined._
+{{- else }}
+{{- range $topicName, $topic := .Values.kafka.topics }}
+    ## {{ $topicName }}
+    - **Partitions**: {{ default 1 $topic.partitions }}
+    - **Replication Factor**: {{ default 1 $topic.replicationFactor }}
+{{- with $topic.metadata.description }}
+    - **Description**: {{ . }}
+{{- end }}
+{{- with $topic.metadata.producers }}
+    - **Producers**:
+{{- range . }}
+      - {{ . }}
+{{- end }}
+{{- end }}
+{{- with $topic.metadata.consumers }}
+    - **Consumers**:
+{{- range . }}
+      - {{ . }}
+{{- end }}
+{{- end }}
+{{- with $topic.metadata.messageType }}
+    - **Message Type**: {{ . }}
+{{- end }}
+{{- with $topic.metadata.partitioning }}
+    - **Partitioning**: {{ . }}
+{{- end }}
+{{- with $topic.metadata.purpose }}
+    - **Purpose**: {{ . }}
+{{- end }}
+
+{{- end }}
+{{- end }}
+{{- end }}
+
