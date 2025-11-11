@@ -126,7 +126,7 @@ kafka:
 4. Confirm storage classes exist for the requested controller and broker `persistence.storageClass` values (or leave empty to use the cluster default).
 5. Override `kafka.topics` with the initial topic catalogue, including metadata to drive the topic-init job and documentation configmap.
 6. Run `helm install` with the desired overrides, then wait for the controller and brokers to become Ready before onboarding producers/consumers.
-7. The topic init job name carries a content hash and is annotated with `argocd.argoproj.io/sync-options: Replace=true`, so Argo CD (or any GitOps engine) will create a fresh job when the script/image/topics change and avoid immutable selector conflicts.
+7. The topic init job runs as both a Helm hook (`post-install,post-upgrade`) and an Argo CD `PostSync` hook; it keeps a content-hashed name and the controller deletes any previous run before creating a new one, so upgrades always launch a fresh job without immutable selector issues.
 
 ### Topic Management
 
