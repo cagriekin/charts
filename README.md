@@ -5,6 +5,7 @@ This repository houses the Helm charts I rely on across several projects. Each c
 ## Repository Structure
 
 - `pgvector/` – Helm chart for deploying a PostgreSQL cluster with pgvector, pgBouncer, HAProxy, and auxiliary resources.
+- `kafka/` – Helm chart for deploying Apache Kafka using KRaft mode, including controller and broker StatefulSets, SASL authentication, configurable topics, metrics exporter, secrets, and related Kubernetes resources.
 
 ## Usage
 

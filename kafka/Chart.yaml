@@ -1,0 +1,20 @@
+apiVersion: v2
+name: kafka
+description: Apache Kafka deployment for the DamnThing message bus
+type: application
+version: 0.1.1
+appVersion: 4.1.0
+keywords:
+  - Kafka
+  - Streaming
+  - Messaging
+  - Message Bus
+  - Kafka Broker
+  - Kafka Controller
+  - Kafka Exporter
+  - Kafka Topics
+  - Kafka Config
+  - Kafka Secrets
+  - Kafka Service
+  - Kafka Deployment
+  - Kafka StatefulSet

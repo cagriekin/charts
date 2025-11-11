@@ -1,0 +1,171 @@
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+kafka:
+  enabled: true
+  image:
+    registry: docker.io
+    repository: apache/kafka
+    tag: "4.1.0"
+    pullPolicy: IfNotPresent
+  controller:
+    replicaCount: 1
+    persistence:
+      size: 1Gi
+      storageClass: ""
+    resources:
+      requests:
+        cpu: 100m
+        memory: 500Mi
+      limits:
+        cpu: 200m
+        memory: 1Gi
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      readOnlyRootFilesystem: false
+      capabilities:
+        drop:
+          - ALL
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: 0
+    jvm:
+      heapOpts: "-Xms512m -Xmx512m"
+      performanceOpts: "-XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+  broker:
+    replicaCount: 2
+    persistence:
+      size: 1Gi
+      storageClass: ""
+    resources:
+      requests:
+        cpu: 100m
+        memory: 500Mi
+      limits:
+        cpu: 200m
+        memory: 2Gi
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      readOnlyRootFilesystem: false
+      capabilities:
+        drop:
+          - ALL
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: 1
+    jvm:
+      heapOpts: "-Xms1g -Xmx1g"
+      performanceOpts: "-XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+  auth:
+    username: user1
+    password: ""
+    existingSecret: ""
+    existingSecretKeys:
+      username: username
+      password: password
+    sasl:
+      mechanism: PLAIN
+      securityProtocol: SASL_PLAINTEXT
+  autoCreateTopicsEnable: true
+  deleteTopicEnable: true
+  topics: {}
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+
+exporters:
+  kafka:
+    enabled: true
+    image:
+      registry: docker.io
+      repository: danielqsj/kafka-exporter
+      tag: v1.9.0
+      pullPolicy: IfNotPresent
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    nodeSelector: {}
+    affinity: {}
+    tolerations: []
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+          - ALL
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: 0
+    autoscaling:
+      enabled: false
+      minReplicas: 1
+      maxReplicas: 3
+      targetCPUUtilizationPercentage: 75
+      targetMemoryUtilizationPercentage: null
+
+serviceMonitors:
+  enabled: false
+  labels:
+    release: kube-prometheus-stack
+
+autoscaling:
+  broker:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 80
+    targetMemoryUtilizationPercentage: null
+
+keda:
+  broker:
+    enabled: false
+    pollingInterval: 30
+    cooldownPeriod: 300
+    minReplicaCount: 2
+    maxReplicaCount: 6
+    triggers: []
+
+networkPolicy:
+  enabled: true
+  controller:
+    ingress: []
+    egress: []
+  broker:
+    ingress: []
+    egress: []
+  exporter:
+    ingress: []
+    egress: []
+
+

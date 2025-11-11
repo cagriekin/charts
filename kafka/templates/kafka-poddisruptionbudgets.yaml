@@ -1,0 +1,80 @@
+{{- if and .Values.kafka.enabled .Values.kafka.controller.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "kafka.fullname" . }}-kafka-controller
+  labels:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-controller
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    helm.sh/chart: {{ include "kafka.chart" . }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "kafka.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: kafka-controller
+  {{- with .Values.kafka.controller.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ . }}
+  {{- end }}
+  {{- with .Values.kafka.controller.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ . }}
+  {{- end }}
+{{- end }}
+
+{{- if and .Values.kafka.enabled .Values.kafka.broker.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "kafka.fullname" . }}-kafka-broker
+  labels:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-broker
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    helm.sh/chart: {{ include "kafka.chart" . }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "kafka.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: kafka-broker
+  {{- with .Values.kafka.broker.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ . }}
+  {{- end }}
+  {{- with .Values.kafka.broker.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ . }}
+  {{- end }}
+{{- end }}
+
+{{- if and .Values.exporters.kafka.enabled .Values.exporters.kafka.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "kafka.fullname" . }}-kafka-exporter
+  labels:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-exporter
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    helm.sh/chart: {{ include "kafka.chart" . }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "kafka.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: kafka-exporter
+  {{- with .Values.exporters.kafka.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ . }}
+  {{- end }}
+  {{- with .Values.exporters.kafka.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ . }}
+  {{- end }}
+{{- end }}
+
