@@ -161,3 +161,11 @@ Generate deterministic Kafka password when not provided.
 {{- $hash | b64enc -}}
 {{- end }}
 
+{{/*
+Generate a content-based suffix for the Kafka topic init job so updates trigger a new job name.
+*/}}
+{{- define "kafka.topicInit.hash" -}}
+{{- $payload := dict "chartVersion" .Chart.Version "image" (printf "%s/%s:%s" .Values.kafka.image.registry .Values.kafka.image.repository .Values.kafka.image.tag) "topics" .Values.kafka.topics -}}
+{{- toYaml $payload | sha256sum | trunc 10 | trimSuffix "-" -}}
+{{- end }}
+
