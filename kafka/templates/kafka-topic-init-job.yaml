@@ -1,9 +1,10 @@
 {{- if .Values.kafka.enabled }}
+{{- $jobName := printf "%s-kafka-topic-init-%s" (include "kafka.fullname" .) (include "kafka.topicInit.hash" .) | trunc 63 | trimSuffix "-" }}
 ---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "kafka.fullname" . }}-kafka-topic-init-{{ .Release.Revision }}
+  name: {{ $jobName }}
   annotations:
     argocd.argoproj.io/sync-options: Replace=true
   labels:
@@ -13,13 +14,12 @@ metadata:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     app.kubernetes.io/part-of: {{ .Chart.Name }}
     helm.sh/chart: {{ include "kafka.chart" . }}
+    job-name: {{ $jobName }}
 spec:
   ttlSecondsAfterFinished: 300
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "kafka.name" . }}
-      app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/component: kafka-topic-init
+      job-name: {{ $jobName }}
   template:
     metadata:
       labels:
@@ -29,6 +29,7 @@ spec:
         app.kubernetes.io/managed-by: {{ .Release.Service }}
         app.kubernetes.io/part-of: {{ .Chart.Name }}
         helm.sh/chart: {{ include "kafka.chart" . }}
+        job-name: {{ $jobName }}
     spec:
       restartPolicy: OnFailure
       containers:
