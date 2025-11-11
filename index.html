@@ -114,6 +114,18 @@ helm search repo cagriekin
           within the source repository for all configurable values.
         </p>
       </section>
+
+      <section>
+        <h2>&gt; install kafka</h2>
+        <pre><code>helm install kafka cagriekin/kafka \
+  --namespace messaging --create-namespace
+</code></pre>
+        <p>
+          Review the chart documentation in the
+          <a href="https://github.com/cagriekin/charts/blob/master/kafka/README.md" rel="noopener">kafka/README.md</a>
+          within the source repository for configuration guidance and examples.
+        </p>
+      </section>
     </main>
   </body>
 </html>
