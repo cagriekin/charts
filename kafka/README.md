@@ -126,7 +126,7 @@ kafka:
 4. Confirm storage classes exist for the requested controller and broker `persistence.storageClass` values (or leave empty to use the cluster default).
 5. Override `kafka.topics` with the initial topic catalogue, including metadata to drive the topic-init job and documentation configmap.
 6. Run `helm install` with the desired overrides, then wait for the controller and brokers to become Ready before onboarding producers/consumers.
-7. The topic init job is annotated with `argocd.argoproj.io/sync-options: Replace=true` so Argo CD will delete and recreate it on upgrades, avoiding immutable field errors when the pod template changes.
+7. The topic init job is annotated with `argocd.argoproj.io/sync-options: Replace=true` and ships explicit selector/template labels so Argo CD can cleanly delete/recreate it on upgrades, avoiding immutable field errors when the pod template changes.
 
 ### Topic Management
 
