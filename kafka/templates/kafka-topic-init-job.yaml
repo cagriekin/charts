@@ -39,12 +39,36 @@ spec:
         volumeMounts:
         - name: kafka-config
           mountPath: /opt/kafka/config/kraft
+        - name: kafka-secret
+          mountPath: /opt/kafka/secrets
+          readOnly: true
+        - name: kafka-config-runtime
+          mountPath: /tmp/kafka-config
         {{- $root := . }}
         command:
         - /bin/bash
         - -c
         - |
           set -e
+          
+          # Read username and password from mounted secret
+          SECRET_USERNAME_KEY="{{ include "kafka.auth.usernameKey" . | trim }}"
+          SECRET_PASSWORD_KEY="{{ include "kafka.auth.passwordKey" . | trim }}"
+          KAFKA_USERNAME=$$(cat /opt/kafka/secrets/$${SECRET_USERNAME_KEY})
+          KAFKA_PASSWORD=$$(cat /opt/kafka/secrets/$${SECRET_PASSWORD_KEY})
+          
+          # Create writable config directory and copy config files
+          mkdir -p /tmp/kafka-config
+          cp /opt/kafka/config/kraft/client.properties /tmp/kafka-config/
+          cp /opt/kafka/config/kraft/client_jaas.conf.template /tmp/kafka-config/
+          
+          # Replace placeholders in client.properties with actual credentials
+          sed -i "s|PLACEHOLDER_USERNAME|$${KAFKA_USERNAME}|g" /tmp/kafka-config/client.properties
+          sed -i "s|PLACEHOLDER_PASSWORD|$${KAFKA_PASSWORD}|g" /tmp/kafka-config/client.properties
+          
+          # Generate JAAS config from template using actual credentials
+          sed -e "s|PLACEHOLDER_USERNAME|$${KAFKA_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|$${KAFKA_PASSWORD}|g" /opt/kafka/config/kraft/client_jaas.conf.template > /tmp/kafka-config/client_jaas.conf
+          
           BOOTSTRAP_SERVER="{{ include "kafka.fullname" . }}-kafka-broker.{{ default "default" .Release.Namespace }}.svc.cluster.local:9092"
           MAX_ATTEMPTS=${KAFKA_BOOTSTRAP_RETRIES:-30}
           SLEEP_SECONDS=${KAFKA_BOOTSTRAP_SLEEP:-5}
@@ -53,7 +77,7 @@ spec:
           ATTEMPT=1
           until /opt/kafka/bin/kafka-broker-api-versions.sh \
             --bootstrap-server "${BOOTSTRAP_SERVER}" \
-            --command-config /opt/kafka/config/kraft/client.properties >/dev/null 2>&1; do
+            --command-config /tmp/kafka-config/client.properties >/dev/null 2>&1; do
             if [ "${ATTEMPT}" -ge "${MAX_ATTEMPTS}" ]; then
               echo "Kafka bootstrap server still unreachable after ${ATTEMPT} attempts; giving up." >&2
               exit 1
@@ -68,7 +92,7 @@ spec:
 
           # Kafka broker should be ready. Creating topics...
           echo "Creating topics..."
-          export KAFKA_OPTS="-Djava.security.auth.login.config=/opt/kafka/config/kraft/client_jaas.conf"
+          export KAFKA_OPTS="-Djava.security.auth.login.config=/tmp/kafka-config/client_jaas.conf"
 
           # Ensure configured topics exist
 {{- range $topicName, $topic := $root.Values.kafka.topics }}
@@ -76,7 +100,7 @@ spec:
           /opt/kafka/bin/kafka-topics.sh \
             --create \
             --bootstrap-server ${BOOTSTRAP_SERVER} \
-            --command-config /opt/kafka/config/kraft/client.properties \
+            --command-config /tmp/kafka-config/client.properties \
             --topic {{ $topicName }} \
             --partitions {{ default 1 $topic.partitions }} \
             --replication-factor {{ default 1 $topic.replicationFactor }} \
@@ -93,10 +117,15 @@ spec:
           /opt/kafka/bin/kafka-topics.sh \
             --list \
             --bootstrap-server ${BOOTSTRAP_SERVER} \
-            --command-config /opt/kafka/config/kraft/client.properties
+            --command-config /tmp/kafka-config/client.properties
       volumes:
       - name: kafka-config
         configMap:
           name: {{ include "kafka.fullname" . }}-kafka-broker-config
+      - name: kafka-secret
+        secret:
+          secretName: {{ include "kafka.auth.secretName" . }}
+      - name: kafka-config-runtime
+        emptyDir: {}
 {{- end }}
 
