@@ -12,9 +12,8 @@ metadata:
     app.kubernetes.io/part-of: {{ .Chart.Name }}
     helm.sh/chart: {{ include "kafka.chart" . }}
 data:
-  {{- $authUsername := .Values.kafka.auth.username | default "user1" }}
-  {{- $rawControllerPassword := .Values.kafka.auth.password | default (include "kafka.kafka.password" .) }}
-  {{- $authPassword := $rawControllerPassword | b64dec }}
+  {{- $authUsername := include "kafka.auth.username" . }}
+  {{- $authPassword := include "kafka.auth.password" . }}
   kafka_server_jaas.conf: |
     KafkaServer {
         org.apache.kafka.common.security.plain.PlainLoginModule required
@@ -54,9 +53,8 @@ metadata:
     app.kubernetes.io/part-of: {{ .Chart.Name }}
     helm.sh/chart: {{ include "kafka.chart" . }}
 data:
-  {{- $brokerAuthUsername := .Values.kafka.auth.username | default "user1" }}
-  {{- $rawBrokerPassword := .Values.kafka.auth.password | default (include "kafka.kafka.password" .) }}
-  {{- $brokerAuthPassword := $rawBrokerPassword | b64dec }}
+  {{- $brokerAuthUsername := include "kafka.auth.username" . }}
+  {{- $brokerAuthPassword := include "kafka.auth.password" . }}
   kafka_server_jaas.conf: |
     KafkaServer {
         org.apache.kafka.common.security.plain.PlainLoginModule required

@@ -56,28 +56,23 @@ spec:
               containerPort: 9308
               protocol: TCP
           {{- if .Values.kafka.auth.existingSecret }}
-          {{- $keys := .Values.kafka.auth.existingSecretKeys | default dict }}
-          {{- $usernameKey := default "username" (index $keys "username") }}
-          {{- $passwordKey := default "password" (index $keys "password") }}
           env:
             - name: KAFKA_SASL_USERNAME
               valueFrom:
                 secretKeyRef:
                   name: {{ include "kafka.auth.secretName" . }}
-                  key: {{ $usernameKey }}
+                  key: {{ include "kafka.auth.usernameKey" . | trim }}
             - name: KAFKA_SASL_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "kafka.auth.secretName" . }}
-                  key: {{ $passwordKey }}
+                  key: {{ include "kafka.auth.passwordKey" . | trim }}
           {{- else }}
-          {{- $exporterUsername := .Values.kafka.auth.username | default "user1" }}
-          {{- $exporterPassword := (.Values.kafka.auth.password | default (include "kafka.kafka.password" .)) | b64dec }}
           env:
             - name: KAFKA_SASL_USERNAME
-              value: {{ $exporterUsername | quote }}
+              value: {{ include "kafka.auth.username" . | quote }}
             - name: KAFKA_SASL_PASSWORD
-              value: {{ $exporterPassword | quote }}
+              value: {{ include "kafka.auth.password" . | quote }}
           {{- end }}
           resources:
             {{- toYaml .Values.exporters.kafka.resources | nindent 12 }}
