@@ -12,14 +12,13 @@ metadata:
     app.kubernetes.io/part-of: {{ .Chart.Name }}
     helm.sh/chart: {{ include "kafka.chart" . }}
 data:
-  {{- $authUsername := include "kafka.auth.username" . }}
-  {{- $authPassword := include "kafka.auth.password" . }}
-  kafka_server_jaas.conf: |
+  # JAAS config will be generated at runtime from mounted secrets
+  kafka_server_jaas.conf.template: |
     KafkaServer {
         org.apache.kafka.common.security.plain.PlainLoginModule required
-        username="{{ $authUsername }}"
-        password="{{ $authPassword }}"
-        user_{{ $authUsername }}="{{ $authPassword }}";
+        username="PLACEHOLDER_USERNAME"
+        password="PLACEHOLDER_PASSWORD"
+        user_PLACEHOLDER_USERNAME="PLACEHOLDER_PASSWORD";
     };
   server.properties: |
     # Kafka controller configuration
@@ -39,7 +38,8 @@ data:
     # Kafka client configuration for SASL authentication
     security.protocol=SASL_PLAINTEXT
     sasl.mechanism=PLAIN
-    sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="{{ $authUsername }}" password="{{ $authPassword }}";
+    # JAAS config will be generated at runtime from mounted secrets
+    sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="PLACEHOLDER_USERNAME" password="PLACEHOLDER_PASSWORD";
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -53,14 +53,13 @@ metadata:
     app.kubernetes.io/part-of: {{ .Chart.Name }}
     helm.sh/chart: {{ include "kafka.chart" . }}
 data:
-  {{- $brokerAuthUsername := include "kafka.auth.username" . }}
-  {{- $brokerAuthPassword := include "kafka.auth.password" . }}
-  kafka_server_jaas.conf: |
+  # JAAS config will be generated at runtime from mounted secrets
+  kafka_server_jaas.conf.template: |
     KafkaServer {
         org.apache.kafka.common.security.plain.PlainLoginModule required
-        username="{{ $brokerAuthUsername }}"
-        password="{{ $brokerAuthPassword }}"
-        user_{{ $brokerAuthUsername }}="{{ $brokerAuthPassword }}";
+        username="PLACEHOLDER_USERNAME"
+        password="PLACEHOLDER_PASSWORD"
+        user_PLACEHOLDER_USERNAME="PLACEHOLDER_PASSWORD";
     };
   server.properties: |
     # Kafka broker configuration
@@ -113,9 +112,10 @@ data:
     # Kafka client configuration for SASL authentication
     security.protocol=SASL_PLAINTEXT
     sasl.mechanism=PLAIN
-    sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="{{ $brokerAuthUsername }}" password="{{ $brokerAuthPassword }}";
-  client_jaas.conf: |
+    # JAAS config will be generated at runtime from mounted secrets
+    sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="PLACEHOLDER_USERNAME" password="PLACEHOLDER_PASSWORD";
+  client_jaas.conf.template: |
     org.apache.kafka.common.security.plain.PlainLoginModule required
-    username="{{ $brokerAuthUsername }}"
-    password="{{ $brokerAuthPassword }}";
+    username="PLACEHOLDER_USERNAME"
+    password="PLACEHOLDER_PASSWORD";
 {{- end }}

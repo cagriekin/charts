@@ -112,18 +112,28 @@ spec:
             - /bin/bash
             - -c
             - |
+              set -e
               # Calculate node ID from pod ordinal (broker pods start from node ID 2)
-              POD_ORDINAL=$(echo $POD_NAME | rev | cut -d'-' -f1 | rev)
-              NODE_ID=$((POD_ORDINAL + 2))
-              export KAFKA_NODE_ID=$NODE_ID
+              POD_ORDINAL=$$(echo $$POD_NAME | rev | cut -d'-' -f1 | rev)
+              NODE_ID=$$(expr $$POD_ORDINAL + 2)
+              export KAFKA_NODE_ID=$$NODE_ID
 
-              # Create writable config directory and copy config file
+              # Read username and password from mounted secret
+              SECRET_USERNAME_KEY="{{ include "kafka.auth.usernameKey" . | trim }}"
+              SECRET_PASSWORD_KEY="{{ include "kafka.auth.passwordKey" . | trim }}"
+              KAFKA_USERNAME=$$(cat /opt/kafka/secrets/$${SECRET_USERNAME_KEY})
+              KAFKA_PASSWORD=$$(cat /opt/kafka/secrets/$${SECRET_PASSWORD_KEY})
+
+              # Create writable config directory and copy config files
               mkdir -p /tmp/kafka-config
               cp /opt/kafka/config/kraft/server.properties /tmp/kafka-config/
 
+              # Generate JAAS config from template using actual credentials
+              sed -e "s|PLACEHOLDER_USERNAME|$${KAFKA_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|$${KAFKA_PASSWORD}|g" /opt/kafka/config/kraft/kafka_server_jaas.conf.template > /tmp/kafka-config/kafka_server_jaas.conf
+
               # Update server.properties with correct node ID and pod name
-              sed -i "s/PLACEHOLDER_NODE_ID/$NODE_ID/g" /tmp/kafka-config/server.properties
-              sed -i "s/PLACEHOLDER_POD_NAME/$POD_NAME/g" /tmp/kafka-config/server.properties
+              sed -i "s|PLACEHOLDER_NODE_ID|$${NODE_ID}|g" /tmp/kafka-config/server.properties
+              sed -i "s|PLACEHOLDER_POD_NAME|$${POD_NAME}|g" /tmp/kafka-config/server.properties
 
               # Start Kafka with the modified config
               exec /opt/kafka/bin/kafka-server-start.sh /tmp/kafka-config/server.properties
@@ -158,7 +168,7 @@ spec:
               value: {{ .Values.kafka.deleteTopicEnable | quote }}
             # SASL Authentication environment variables
             - name: KAFKA_OPTS
-              value: "-Djava.security.auth.login.config=/opt/kafka/config/kraft/kafka_server_jaas.conf"
+              value: "-Djava.security.auth.login.config=/tmp/kafka-config/kafka_server_jaas.conf"
             - name: KAFKA_SASL_ENABLED_MECHANISMS
               value: "PLAIN"
             - name: KAFKA_SASL_MECHANISM_CONTROLLER_PROTOCOL
