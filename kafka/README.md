@@ -122,7 +122,7 @@ kafka:
 
 1. Set `fullnameOverride` to the release-specific base name; the chart fails fast when it is left empty.
 2. Provision the target namespace with restricted PodSecurity labels (`enforce=restricted`, `audit=restricted`) before installing the chart.
-3. Either leave `kafka.auth.password` empty to let the chart derive a deterministic password, or provide `kafka.auth.password`/`kafka.auth.existingSecret`. When `existingSecret` is supplied, ensure that the referenced secret (and keys) already exists—Helm no longer reads it at template time, so ArgoCD/Helm must create the secret ahead of the Kafka workloads.
+3. Either leave `kafka.auth.password` empty to let the chart derive a deterministic password, or provide `kafka.auth.password`/`kafka.auth.existingSecret`. When `existingSecret` is supplied, the chart attempts to lookup the secret during template rendering. If lookup fails (e.g., due to RBAC restrictions in ArgoCD's repo server), provide `kafka.auth.username` and `kafka.auth.password` explicitly in values as a workaround—these will be used for ConfigMaps while deployments still reference the secret at runtime.
 4. Confirm storage classes exist for the requested controller and broker `persistence.storageClass` values (or leave empty to use the cluster default).
 5. Override `kafka.topics` with the initial topic catalogue, including metadata to drive the topic-init job and documentation configmap.
 6. Run `helm install` with the desired overrides, then wait for the controller and brokers to become Ready before onboarding producers/consumers.
