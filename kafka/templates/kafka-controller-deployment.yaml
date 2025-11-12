@@ -96,12 +96,22 @@ spec:
             - /bin/bash
             - -c
             - |
+              set -e
               # Controller always uses node ID 1
               export KAFKA_NODE_ID=1
 
-              # Create writable config directory and copy config file
+              # Read username and password from mounted secret
+              SECRET_USERNAME_KEY="{{ include "kafka.auth.usernameKey" . | trim }}"
+              SECRET_PASSWORD_KEY="{{ include "kafka.auth.passwordKey" . | trim }}"
+              KAFKA_USERNAME=$$(cat /opt/kafka/secrets/$${SECRET_USERNAME_KEY})
+              KAFKA_PASSWORD=$$(cat /opt/kafka/secrets/$${SECRET_PASSWORD_KEY})
+
+              # Create writable config directory and copy config files
               mkdir -p /tmp/kafka-config
               cp /opt/kafka/config/kraft/server.properties /tmp/kafka-config/
+
+              # Generate JAAS config from template using actual credentials
+              sed -e "s|PLACEHOLDER_USERNAME|$${KAFKA_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|$${KAFKA_PASSWORD}|g" /opt/kafka/config/kraft/kafka_server_jaas.conf.template > /tmp/kafka-config/kafka_server_jaas.conf
 
               # Update server.properties with correct node ID
               sed -i "s/PLACEHOLDER_NODE_ID/1/g" /tmp/kafka-config/server.properties
@@ -124,7 +134,7 @@ spec:
             - name: KAFKA_PROCESS_ROLES
               value: "controller"
             - name: KAFKA_OPTS
-              value: "-Djava.security.auth.login.config=/opt/kafka/config/kraft/kafka_server_jaas.conf"
+              value: "-Djava.security.auth.login.config=/tmp/kafka-config/kafka_server_jaas.conf"
           {{- with .Values.kafka.controller.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
