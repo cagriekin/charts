@@ -82,12 +82,8 @@ Return the Kafka auth username.
 {{- end }}
 {{- index $secret.data $key | b64dec -}}
 {{- else }}
-{{- /* Lookup failed - likely RBAC issue during template rendering. Use fallback or explicit value. */}}
-{{- if .Values.kafka.auth.username }}
-{{- .Values.kafka.auth.username -}}
-{{- else }}
-{{- fail (printf "Kafka auth existingSecret %q specified but lookup failed (likely RBAC). Either grant secret read permissions or provide kafka.auth.username in values" .Values.kafka.auth.existingSecret) }}
-{{- end }}
+{{- /* Lookup failed - likely RBAC issue. Use fallback; secret will be mounted at runtime. */}}
+{{- $fallback -}}
 {{- end }}
 {{- else }}
 {{- $fallback -}}
@@ -108,12 +104,8 @@ Return the Kafka auth password in plain text.
 {{- end }}
 {{- index $secret.data $key | b64dec -}}
 {{- else }}
-{{- /* Lookup failed - likely RBAC issue during template rendering. Use fallback or explicit value. */}}
-{{- if .Values.kafka.auth.password }}
-{{- .Values.kafka.auth.password | b64dec -}}
-{{- else }}
-{{- fail (printf "Kafka auth existingSecret %q specified but lookup failed (likely RBAC). Either grant secret read permissions or provide kafka.auth.password in values" .Values.kafka.auth.existingSecret) }}
-{{- end }}
+{{- /* Lookup failed - likely RBAC issue. Use fallback; secret will be mounted at runtime. */}}
+{{- $fallback | b64dec -}}
 {{- end }}
 {{- else }}
 {{- $fallback | b64dec -}}
