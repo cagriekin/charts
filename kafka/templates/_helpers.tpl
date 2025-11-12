@@ -75,14 +75,20 @@ Return the Kafka auth username.
 {{- $fallback := .Values.kafka.auth.username | default "user1" -}}
 {{- if .Values.kafka.auth.existingSecret }}
 {{- $secret := lookup "v1" "Secret" (default "default" .Release.Namespace) .Values.kafka.auth.existingSecret }}
-{{- if not $secret }}
-{{- fail (printf "Kafka auth existingSecret %q not found in namespace %q" .Values.kafka.auth.existingSecret (default "default" .Release.Namespace)) }}
-{{- end }}
+{{- if $secret }}
 {{- $key := include "kafka.auth.usernameKey" . | trim }}
 {{- if not (hasKey $secret.data $key) }}
 {{- fail (printf "Kafka auth existingSecret %q must contain key %q" .Values.kafka.auth.existingSecret $key) }}
 {{- end }}
 {{- index $secret.data $key | b64dec -}}
+{{- else }}
+{{- /* Lookup failed - likely RBAC issue during template rendering. Use fallback or explicit value. */}}
+{{- if .Values.kafka.auth.username }}
+{{- .Values.kafka.auth.username -}}
+{{- else }}
+{{- fail (printf "Kafka auth existingSecret %q specified but lookup failed (likely RBAC). Either grant secret read permissions or provide kafka.auth.username in values" .Values.kafka.auth.existingSecret) }}
+{{- end }}
+{{- end }}
 {{- else }}
 {{- $fallback -}}
 {{- end }}
@@ -95,14 +101,20 @@ Return the Kafka auth password in plain text.
 {{- $fallback := default (include "kafka.kafka.password" .) .Values.kafka.auth.password -}}
 {{- if .Values.kafka.auth.existingSecret }}
 {{- $secret := lookup "v1" "Secret" (default "default" .Release.Namespace) .Values.kafka.auth.existingSecret }}
-{{- if not $secret }}
-{{- fail (printf "Kafka auth existingSecret %q not found in namespace %q" .Values.kafka.auth.existingSecret (default "default" .Release.Namespace)) }}
-{{- end }}
+{{- if $secret }}
 {{- $key := include "kafka.auth.passwordKey" . | trim }}
 {{- if not (hasKey $secret.data $key) }}
 {{- fail (printf "Kafka auth existingSecret %q must contain key %q" .Values.kafka.auth.existingSecret $key) }}
 {{- end }}
 {{- index $secret.data $key | b64dec -}}
+{{- else }}
+{{- /* Lookup failed - likely RBAC issue during template rendering. Use fallback or explicit value. */}}
+{{- if .Values.kafka.auth.password }}
+{{- .Values.kafka.auth.password | b64dec -}}
+{{- else }}
+{{- fail (printf "Kafka auth existingSecret %q specified but lookup failed (likely RBAC). Either grant secret read permissions or provide kafka.auth.password in values" .Values.kafka.auth.existingSecret) }}
+{{- end }}
+{{- end }}
 {{- else }}
 {{- $fallback | b64dec -}}
 {{- end }}
