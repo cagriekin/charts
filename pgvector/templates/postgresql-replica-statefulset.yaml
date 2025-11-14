@@ -26,16 +26,10 @@ spec:
       serviceAccountName: {{ include "pgvector.serviceAccountName" . }}
       securityContext:
         fsGroup: 999
-        runAsUser: 999
-        runAsGroup: 999
       initContainers:
         - name: init-replica
           image: {{ .Values.postgresql.image.registry }}/{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
-          securityContext:
-            runAsUser: 999
-            runAsGroup: 999
-            runAsNonRoot: true
           env:
             - name: POSTGRES_USER
               value: {{ .Values.postgresql.postgresUser | quote }}

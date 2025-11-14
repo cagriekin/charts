@@ -30,5 +30,8 @@ host    all             all             ::1/128                 trust
 host    replication     ${POSTGRES_USER}        0.0.0.0/0               md5
 host    all             ${POSTGRES_USER}        0.0.0.0/0               md5
 EOPGHBA
+
+  chown -R postgres:postgres "${PGBACKUP_DESTINATION}"
+  chmod 700 "${PGBACKUP_DESTINATION}"
 fi
 
