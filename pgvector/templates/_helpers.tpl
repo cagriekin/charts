@@ -115,7 +115,7 @@ Generate deterministic replication password
 {{- $salt := "Replication password for streaming replication. The path of the righteous man is beset on all sides." -}}
 {{- $input := printf "%s-%s-%s-replication-password" .Release.Name .Chart.Name $salt -}}
 {{- $hash := $input | sha256sum -}}
-{{- $hash | b64enc -}}
+{{- $hash | trunc 32 -}}
 {{- end -}}
 
 {{/*
