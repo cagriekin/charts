@@ -63,7 +63,7 @@ Create the name of the service account
 Generate deterministic PostgreSQL password when not provided
 */}}
 {{- define "pgvector.postgresql.password" -}}
-{{- $salt := "pgvector-postgresql-password-salt" -}}
+{{- $salt := "All that we have is that shout into the wind. How we live. How we go. And how we stand before we fall. Karnus Au Bellona." -}}
 {{- $input := printf "%s-%s-%s" .Release.Name .Chart.Name $salt -}}
 {{- $hash := $input | sha256sum -}}
 {{- $hash | b64enc -}}
@@ -81,67 +81,69 @@ Name of the PostgreSQL secret
 {{- end -}}
 
 {{/*
-Name of the secret providing postgres-url
-*/}}
-{{- define "pgvector.postgresql.urlSecretName" -}}
-{{- if .Values.postgresql.existingSecret }}
-{{- printf "%s-postgresql-url" (include "pgvector.fullname" .) -}}
-{{- else -}}
-{{- include "pgvector.postgresql.secretName" . -}}
-{{- end -}}
-{{- end -}}
-
-{{/*
-Get PostgreSQL password, looking up from secret if existingSecret is set
-Prioritizes secret over values when existingSecret is configured
-*/}}
-{{- define "pgvector.postgresql.resolvedPassword" -}}
-{{- $password := .Values.postgresql.postgresPassword -}}
-{{- if .Values.postgresql.existingSecret }}
-  {{- $secret := (lookup "v1" "Secret" .Release.Namespace .Values.postgresql.existingSecret) -}}
-  {{- if $secret }}
-    {{- if hasKey $secret.data "postgres-password" }}
-      {{- $password = (index $secret.data "postgres-password" | b64dec) -}}
-    {{- else if not $password }}
-      {{- $password = (include "pgvector.postgresql.password" .) -}}
-    {{- end }}
-  {{- else if not $password }}
-    {{- $password = (include "pgvector.postgresql.password" .) -}}
-  {{- end }}
-{{- else }}
-  {{- $password = default (include "pgvector.postgresql.password" .) $password -}}
-{{- end }}
-{{- $password -}}
-{{- end -}}
-
-{{/*
-Computed PostgreSQL connection string
-*/}}
-{{- define "pgvector.postgresql.connectionString" -}}
-{{- $user := .Values.postgresql.postgresUser -}}
-{{- $database := .Values.postgresql.postgresDatabase -}}
-{{- if .Values.postgresql.existingSecret }}
-  {{- $secret := (lookup "v1" "Secret" .Release.Namespace .Values.postgresql.existingSecret) -}}
-  {{- if $secret }}
-    {{- if hasKey $secret.data "postgres-user" }}
-      {{- $user = (index $secret.data "postgres-user" | b64dec) -}}
-    {{- end }}
-    {{- if hasKey $secret.data "postgres-database" }}
-      {{- $database = (index $secret.data "postgres-database" | b64dec) -}}
-    {{- end }}
-  {{- end }}
-{{- end }}
-{{- $user = required "postgresql.postgresUser must be provided (either via values or existing secret key postgres-user)" $user -}}
-{{- $password := include "pgvector.postgresql.resolvedPassword" . -}}
-{{- $database = required "postgresql.postgresDatabase must be provided (either via values or existing secret key postgres-database)" $database -}}
-{{- $host := printf "%s-postgresql-master.%s.svc.cluster.local" (include "pgvector.fullname" .) .Release.Namespace -}}
-{{- printf "postgresql://%s:%s@%s:5432/%s?sslmode=disable" $user $password $host $database -}}
-{{- end -}}
-
-{{/*
 Name of the backup secret
 */}}
 {{- define "pgvector.backup.secretName" -}}
 {{- printf "%s-backup" (include "pgvector.fullname" .) -}}
+{{- end -}}
+
+{{/*
+Get PostgreSQL username from values or default
+*/}}
+{{- define "pgvector.postgresql.username" -}}
+{{- .Values.postgresql.postgresUser | default "postgres" -}}
+{{- end -}}
+
+{{/*
+Get PostgreSQL database from values or default
+*/}}
+{{- define "pgvector.postgresql.database" -}}
+{{- .Values.postgresql.postgresDatabase | default "postgres" -}}
+{{- end -}}
+
+{{/*
+Replication username (hardcoded)
+*/}}
+{{- define "pgvector.postgresql.replicationUser" -}}
+replication
+{{- end -}}
+
+{{/*
+Generate deterministic replication password
+*/}}
+{{- define "pgvector.postgresql.replicationPassword" -}}
+{{- $salt := "Replication password for streaming replication. The path of the righteous man is beset on all sides." -}}
+{{- $input := printf "%s-%s-%s-replication-password" .Release.Name .Chart.Name $salt -}}
+{{- $hash := $input | sha256sum -}}
+{{- $hash | b64enc -}}
+{{- end -}}
+
+{{/*
+Get resolved PostgreSQL password from values or generated
+*/}}
+{{- define "pgvector.postgresql.resolvedPassword" -}}
+{{- if .Values.postgresql.postgresPassword }}
+{{- .Values.postgresql.postgresPassword -}}
+{{- else -}}
+{{- include "pgvector.postgresql.password" . -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Alias for PostgreSQL secret name (for backward compatibility)
+*/}}
+{{- define "pgvector.postgresql.urlSecretName" -}}
+{{- include "pgvector.postgresql.secretName" . -}}
+{{- end -}}
+
+{{/*
+Generate PostgreSQL connection string
+*/}}
+{{- define "pgvector.postgresql.connectionString" -}}
+{{- $user := include "pgvector.postgresql.username" . -}}
+{{- $password := include "pgvector.postgresql.resolvedPassword" . -}}
+{{- $database := include "pgvector.postgresql.database" . -}}
+{{- $host := printf "%s-postgresql-master.%s.svc.cluster.local" (include "pgvector.fullname" .) .Release.Namespace -}}
+{{- printf "postgresql://%s:%s@%s:5432/%s?sslmode=disable" $user $password $host $database -}}
 {{- end -}}
 

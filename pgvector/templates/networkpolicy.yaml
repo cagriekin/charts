@@ -6,7 +6,7 @@
 {{- $extraEgress := default (list) .Values.networkPolicy.extraEgress -}}
 {{- $components := list
   (dict "name" "postgresql-master" "enabled" true "component" "postgresql-master")
-  (dict "name" "postgresql-replica" "enabled" (gt .Values.postgresql.replica.replicaCount 0) "component" "postgresql-replica")
+  (dict "name" "postgresql-replica" "enabled" (gt (int .Values.postgresql.replica.replicaCount) 0) "component" "postgresql-replica")
   (dict "name" "pgbouncer" "enabled" .Values.postgresql.pgbouncer.enabled "component" "pgbouncer")
   (dict "name" "haproxy" "enabled" .Values.postgresql.haproxy.enabled "component" "haproxy")
 -}}
