@@ -79,7 +79,7 @@ data:
     random_page_cost = 1.1
     effective_io_concurrency = 200
     work_mem = 4MB
-    primary_conninfo = 'host={{ include "pgvector.fullname" . }}-postgresql-master.{{ .Release.Namespace }}.svc.cluster.local port=5432 user={{ .Values.postgresql.postgresUser }} password={{ .Values.postgresql.postgresPassword | default (include "pgvector.postgresql.password" .) }}'
+    primary_conninfo = 'host={{ include "pgvector.fullname" . }}-postgresql-master.{{ .Release.Namespace }}.svc.cluster.local port=5432 user={{ .Values.postgresql.postgresUser }} password={{ include "pgvector.postgresql.resolvedPassword" . }}'
     log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
     log_statement = 'ddl'
     log_timezone = 'UTC'
@@ -122,6 +122,6 @@ data:
     stats_period = 60
     admin_users = {{ .Values.postgresql.postgresUser }}
   userlist.txt: |
-    "{{ .Values.postgresql.postgresUser }}" "{{ .Values.postgresql.postgresPassword | default (include "pgvector.postgresql.password" .) }}"
+    "{{ .Values.postgresql.postgresUser }}" "{{ include "pgvector.postgresql.resolvedPassword" . }}"
 {{- end }}
 
