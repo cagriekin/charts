@@ -27,11 +27,80 @@ spec:
         - name: haproxy
           image: {{ .Values.postgresql.haproxy.image.registry }}/{{ .Values.postgresql.haproxy.image.repository }}:{{ .Values.postgresql.haproxy.image.tag }}
           imagePullPolicy: {{ .Values.postgresql.haproxy.image.pullPolicy }}
-          args:
-            - "-f"
-            - /usr/local/etc/haproxy/haproxy.cfg
-            - "-W"
-            - "-db"
+          env:
+            - name: HAPROXY_PORT
+              value: {{ .Values.postgresql.haproxy.service.port | quote }}
+            - name: PGBOUNCER_ENABLED
+              value: {{ .Values.postgresql.pgbouncer.enabled | quote }}
+            - name: PGBOUNCER_SERVICE
+              value: {{ include "pgvector.fullname" . }}-pgbouncer.{{ .Release.Namespace }}.svc.cluster.local
+            - name: PGBOUNCER_PORT
+              value: {{ .Values.postgresql.pgbouncer.service.port | quote }}
+            - name: POSTGRES_MASTER_SERVICE
+              value: {{ include "pgvector.fullname" . }}-postgresql-master.{{ .Release.Namespace }}.svc.cluster.local
+            - name: POSTGRES_MASTER_PORT
+              value: "5432"
+            - name: POSTGRES_REPLICA_SERVICE
+              value: {{ include "pgvector.fullname" . }}-postgresql-replica.{{ .Release.Namespace }}.svc.cluster.local
+            - name: POSTGRES_REPLICA_PORT
+              value: "5432"
+            - name: REPLICA_COUNT
+              value: {{ .Values.postgresql.replica.replicaCount | quote }}
+            - name: READ_REPLICA_ROUTING_ENABLED
+              value: {{ .Values.postgresql.haproxy.readReplicaRouting.enabled | quote }}
+            - name: REPLICA_PERCENTAGE
+              value: {{ .Values.postgresql.haproxy.readReplicaRouting.replicaPercentage | quote }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              mkdir -p /usr/local/etc/haproxy
+              
+              if [ "${PGBOUNCER_ENABLED}" = "true" ]; then
+                BACKEND_SERVERS="server pgbouncer ${PGBOUNCER_SERVICE}:${PGBOUNCER_PORT} check"
+              else
+                MASTER_WEIGHT=$((100 - ${REPLICA_PERCENTAGE:-0}))
+                if [ ${MASTER_WEIGHT} -lt 1 ]; then
+                  MASTER_WEIGHT=1
+                fi
+                REPLICA_WEIGHT=${REPLICA_PERCENTAGE:-0}
+                if [ ${REPLICA_WEIGHT} -lt 0 ]; then
+                  REPLICA_WEIGHT=0
+                fi
+                
+                BACKEND_SERVERS="balance roundrobin"
+                BACKEND_SERVERS="${BACKEND_SERVERS}\n      server master ${POSTGRES_MASTER_SERVICE}:${POSTGRES_MASTER_PORT} weight ${MASTER_WEIGHT} check"
+                
+                if [ "${REPLICA_COUNT}" -gt 0 ] && [ "${READ_REPLICA_ROUTING_ENABLED}" = "true" ]; then
+                  BACKEND_SERVERS="${BACKEND_SERVERS}\n      server replica ${POSTGRES_REPLICA_SERVICE}:${POSTGRES_REPLICA_PORT} weight ${REPLICA_WEIGHT} check"
+                fi
+              fi
+              
+              cat > /usr/local/etc/haproxy/haproxy.cfg <<EOF
+              global
+                maxconn 4096
+              
+              defaults
+                log global
+                mode tcp
+                timeout connect 5s
+                timeout client  60s
+                timeout server  60s
+                option tcplog
+              
+              frontend pgsql
+                bind *:${HAPROXY_PORT}
+                default_backend pgsql_backend
+              
+              backend pgsql_backend
+                mode tcp
+                option tcp-check
+                default-server inter 3s fall 3 rise 2
+              $(echo -e "${BACKEND_SERVERS}")
+              EOF
+              
+              exec haproxy -f /usr/local/etc/haproxy/haproxy.cfg -W -db
           ports:
             - name: postgresql
               containerPort: {{ .Values.postgresql.haproxy.service.port }}
@@ -48,13 +117,6 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.postgresql.haproxy.resources | nindent 12 }}
-          volumeMounts:
-            - name: haproxy-config
-              mountPath: /usr/local/etc/haproxy
-      volumes:
-        - name: haproxy-config
-          configMap:
-            name: {{ include "pgvector.fullname" . }}-haproxy-config
       {{- with .Values.postgresql.haproxy.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

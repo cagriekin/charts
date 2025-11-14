@@ -32,6 +32,11 @@ spec:
               containerPort: 5432
               protocol: TCP
           env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.secretName" . }}
+                  key: postgres-user
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -42,19 +47,60 @@ spec:
                 secretKeyRef:
                   name: {{ include "pgvector.postgresql.secretName" . }}
                   key: postgres-database
+            - name: PGBOUNCER_POOL_MODE
+              value: {{ .Values.postgresql.pgbouncer.poolMode | quote }}
+            - name: PGBOUNCER_MAX_CLIENT_CONN
+              value: {{ .Values.postgresql.pgbouncer.maxClientConn | quote }}
+            - name: PGBOUNCER_DEFAULT_POOL_SIZE
+              value: {{ .Values.postgresql.pgbouncer.defaultPoolSize | quote }}
+            - name: PGBOUNCER_MIN_POOL_SIZE
+              value: {{ .Values.postgresql.pgbouncer.minPoolSize | quote }}
+            - name: PGBOUNCER_POOL_SIZE
+              value: {{ .Values.postgresql.pgbouncer.poolSize | quote }}
+            - name: PGBOUNCER_LISTEN_PORT
+              value: "5432"
+            - name: POSTGRES_MASTER_HOST
+              value: {{ include "pgvector.fullname" . }}-postgresql-master.{{ .Release.Namespace }}.svc.cluster.local
+            - name: POSTGRES_MASTER_PORT
+              value: "5432"
           command:
             - /bin/sh
             - -c
-            - exec pgbouncer /etc/pgbouncer/pgbouncer.ini
+            - |
+              set -e
+              mkdir -p /etc/pgbouncer
+              
+              cat > /etc/pgbouncer/pgbouncer.ini <<EOF
+              [databases]
+              ${POSTGRES_DB} = host=${POSTGRES_MASTER_HOST} port=${POSTGRES_MASTER_PORT}
+              
+              [pgbouncer]
+              listen_addr = 0.0.0.0
+              listen_port = ${PGBOUNCER_LISTEN_PORT}
+              auth_type = md5
+              auth_file = /etc/pgbouncer/userlist.txt
+              pool_mode = ${PGBOUNCER_POOL_MODE}
+              max_client_conn = ${PGBOUNCER_MAX_CLIENT_CONN}
+              default_pool_size = ${PGBOUNCER_DEFAULT_POOL_SIZE}
+              min_pool_size = ${PGBOUNCER_MIN_POOL_SIZE}
+              max_db_connections = ${PGBOUNCER_POOL_SIZE}
+              max_user_connections = ${PGBOUNCER_POOL_SIZE}
+              reserve_pool_size = 1
+              reserve_pool_timeout = 5.0
+              server_round_robin = 1
+              ignore_startup_parameters = extra_float_digits
+              log_connections = 1
+              log_disconnections = 1
+              log_pooler_errors = 1
+              stats_period = 60
+              admin_users = ${POSTGRES_USER}
+              EOF
+              
+              echo "\"${POSTGRES_USER}\" \"${POSTGRES_PASSWORD}\"" > /etc/pgbouncer/userlist.txt
+              
+              exec pgbouncer /etc/pgbouncer/pgbouncer.ini
           resources:
             {{- toYaml .Values.postgresql.pgbouncer.resources | nindent 12 }}
-          volumeMounts:
-            - name: pgbouncer-config
-              mountPath: /etc/pgbouncer
-      volumes:
-        - name: pgbouncer-config
-          configMap:
-            name: {{ include "pgvector.fullname" . }}-pgbouncer-config
       {{- with .Values.postgresql.pgbouncer.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
