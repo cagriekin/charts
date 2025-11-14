@@ -123,10 +123,10 @@ Computed PostgreSQL connection string
 {{- if .Values.postgresql.existingSecret }}
   {{- $secret := (lookup "v1" "Secret" .Release.Namespace .Values.postgresql.existingSecret) -}}
   {{- if $secret }}
-    {{- if and (not $user) (hasKey $secret.data "postgres-user") }}
+    {{- if hasKey $secret.data "postgres-user" }}
       {{- $user = (index $secret.data "postgres-user" | b64dec) -}}
     {{- end }}
-    {{- if and (not $database) (hasKey $secret.data "postgres-database") }}
+    {{- if hasKey $secret.data "postgres-database" }}
       {{- $database = (index $secret.data "postgres-database" | b64dec) -}}
     {{- end }}
   {{- end }}
