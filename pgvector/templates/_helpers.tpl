@@ -92,11 +92,33 @@ Name of the secret providing postgres-url
 {{- end -}}
 
 {{/*
+Get PostgreSQL password, looking up from secret if existingSecret is set
+Prioritizes secret over values when existingSecret is configured
+*/}}
+{{- define "pgvector.postgresql.resolvedPassword" -}}
+{{- $password := .Values.postgresql.postgresPassword -}}
+{{- if .Values.postgresql.existingSecret }}
+  {{- $secret := (lookup "v1" "Secret" .Release.Namespace .Values.postgresql.existingSecret) -}}
+  {{- if $secret }}
+    {{- if hasKey $secret.data "postgres-password" }}
+      {{- $password = (index $secret.data "postgres-password" | b64dec) -}}
+    {{- else if not $password }}
+      {{- $password = (include "pgvector.postgresql.password" .) -}}
+    {{- end }}
+  {{- else if not $password }}
+    {{- $password = (include "pgvector.postgresql.password" .) -}}
+  {{- end }}
+{{- else }}
+  {{- $password = default (include "pgvector.postgresql.password" .) $password -}}
+{{- end }}
+{{- $password -}}
+{{- end -}}
+
+{{/*
 Computed PostgreSQL connection string
 */}}
 {{- define "pgvector.postgresql.connectionString" -}}
 {{- $user := .Values.postgresql.postgresUser -}}
-{{- $password := .Values.postgresql.postgresPassword -}}
 {{- $database := .Values.postgresql.postgresDatabase -}}
 {{- if .Values.postgresql.existingSecret }}
   {{- $secret := (lookup "v1" "Secret" .Release.Namespace .Values.postgresql.existingSecret) -}}
@@ -104,16 +126,13 @@ Computed PostgreSQL connection string
     {{- if and (not $user) (hasKey $secret.data "postgres-user") }}
       {{- $user = (index $secret.data "postgres-user" | b64dec) -}}
     {{- end }}
-    {{- if and (not $password) (hasKey $secret.data "postgres-password") }}
-      {{- $password = (index $secret.data "postgres-password" | b64dec) -}}
-    {{- end }}
     {{- if and (not $database) (hasKey $secret.data "postgres-database") }}
       {{- $database = (index $secret.data "postgres-database" | b64dec) -}}
     {{- end }}
   {{- end }}
 {{- end }}
 {{- $user = required "postgresql.postgresUser must be provided (either via values or existing secret key postgres-user)" $user -}}
-{{- $password = default (include "pgvector.postgresql.password" .) $password -}}
+{{- $password := include "pgvector.postgresql.resolvedPassword" . -}}
 {{- $database = required "postgresql.postgresDatabase must be provided (either via values or existing secret key postgres-database)" $database -}}
 {{- $host := printf "%s-postgresql-master.%s.svc.cluster.local" (include "pgvector.fullname" .) .Release.Namespace -}}
 {{- printf "postgresql://%s:%s@%s:5432/%s?sslmode=disable" $user $password $host $database -}}
