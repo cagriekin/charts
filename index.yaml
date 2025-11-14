@@ -412,6 +412,29 @@ entries:
   pgvector:
   - apiVersion: v2
     appVersion: "18.0"
+    created: "2025-11-14T17:42:24.911012592Z"
+    description: PostgreSQL with the pgvector extension, optional PgBouncer pooling,
+      and optional HAProxy routing.
+    digest: 136cee0ba97cfd782e89622b39a437b49e4d31518b8f5e6a35e8d76666d129e2
+    keywords:
+    - PostgreSQL
+    - pgvector
+    - PgBouncer
+    - HAProxy
+    - Vector Search
+    - Vector Database
+    - Vector Index
+    - Vector Embedding
+    - Vector Similarity
+    - Vector Similarity Search
+    - Vector Similarity Search Engine
+    name: pgvector
+    type: application
+    urls:
+    - https://github.com/cagriekin/charts/releases/download/pgvector-0.2.7/pgvector-0.2.7.tgz
+    version: 0.2.7
+  - apiVersion: v2
+    appVersion: "18.0"
     created: "2025-11-14T17:34:43.282968157Z"
     description: PostgreSQL with the pgvector extension, optional PgBouncer pooling,
       and optional HAProxy routing.
@@ -535,4 +558,4 @@ entries:
     urls:
     - https://github.com/cagriekin/charts/releases/download/pgvector-0.2.0/pgvector-0.2.0.tgz
     version: 0.2.0
-generated: "2025-11-14T17:34:43.28303991Z"
+generated: "2025-11-14T17:42:24.911100706Z"
