@@ -32,11 +32,14 @@ spec:
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
           env:
             - name: POSTGRES_USER
-              value: {{ .Values.postgresql.postgresUser | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  key: postgres-user
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.secretName" . }}
+                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
                   key: postgres-password
             - name: POSTGRES_MASTER_SERVICE
               value: {{ printf "%s-postgresql-master.%s.svc.cluster.local" (include "pgvector.fullname" .) .Release.Namespace | quote }}
@@ -50,12 +53,39 @@ spec:
             - |
               set -e
 
-              cat <<'EOSCRIPT' > /tmp/init-replica.sh
-{{ (.Files.Get "files/init-replica.sh") | indent 14 }}
-              EOSCRIPT
+              mkdir -p "${PGBACKUP_DESTINATION}"
 
-              chmod +x /tmp/init-replica.sh
-              /tmp/init-replica.sh
+              if [ ! -f "${PGBACKUP_DESTINATION}/standby.signal" ]; then
+                until pg_isready -h "${POSTGRES_MASTER_SERVICE}" -p "${POSTGRES_PORT}" -U "${POSTGRES_USER}"; do
+                  sleep 2
+                done
+
+                rm -rf "${PGBACKUP_DESTINATION:?}"/*
+
+                export PGPASSWORD="${POSTGRES_PASSWORD}"
+
+                pg_basebackup \
+                  -h "${POSTGRES_MASTER_SERVICE}" \
+                  -D "${PGBACKUP_DESTINATION}" \
+                  -U "${POSTGRES_USER}" \
+                  -P \
+                  -v \
+                  -R \
+                  -X stream
+
+                cat <<EOPGHBA > "${PGBACKUP_DESTINATION}/pg_hba.conf"
+              # TYPE  DATABASE        USER            ADDRESS                 METHOD
+
+              local   all             all                                     trust
+              host    all             all             127.0.0.1/32            trust
+              host    all             all             ::1/128                 trust
+              host    replication     ${POSTGRES_USER}        0.0.0.0/0               md5
+              host    all             ${POSTGRES_USER}        0.0.0.0/0               md5
+              EOPGHBA
+
+                chown -R postgres:postgres "${PGBACKUP_DESTINATION}"
+                chmod 700 "${PGBACKUP_DESTINATION}"
+              fi
           volumeMounts:
             - name: postgresql-data
               mountPath: /var/lib/postgresql/data
@@ -65,14 +95,20 @@ spec:
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
           env:
             - name: POSTGRES_USER
-              value: {{ .Values.postgresql.postgresUser | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  key: postgres-user
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.secretName" . }}
+                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
                   key: postgres-password
             - name: POSTGRES_DB
-              value: {{ .Values.postgresql.postgresDatabase | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  key: postgres-database
             - name: PGDATA
               value: /var/lib/postgresql/data
           command:
