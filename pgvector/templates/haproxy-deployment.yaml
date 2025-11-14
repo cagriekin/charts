@@ -56,27 +56,7 @@ spec:
             - |
               set -e
               
-              if [ "${PGBOUNCER_ENABLED}" = "true" ]; then
-                BACKEND_SERVERS="server pgbouncer ${PGBOUNCER_SERVICE}:${PGBOUNCER_PORT} check"
-              else
-                MASTER_WEIGHT=$((100 - ${REPLICA_PERCENTAGE:-0}))
-                if [ ${MASTER_WEIGHT} -lt 1 ]; then
-                  MASTER_WEIGHT=1
-                fi
-                REPLICA_WEIGHT=${REPLICA_PERCENTAGE:-0}
-                if [ ${REPLICA_WEIGHT} -lt 0 ]; then
-                  REPLICA_WEIGHT=0
-                fi
-                
-                BACKEND_SERVERS="balance roundrobin"
-                BACKEND_SERVERS="${BACKEND_SERVERS}\n      server master ${POSTGRES_MASTER_SERVICE}:${POSTGRES_MASTER_PORT} weight ${MASTER_WEIGHT} check"
-                
-                if [ "${REPLICA_COUNT}" -gt 0 ] && [ "${READ_REPLICA_ROUTING_ENABLED}" = "true" ]; then
-                  BACKEND_SERVERS="${BACKEND_SERVERS}\n      server replica ${POSTGRES_REPLICA_SERVICE}:${POSTGRES_REPLICA_PORT} weight ${REPLICA_WEIGHT} check"
-                fi
-              fi
-              
-              cat > /tmp/haproxy.cfg <<EOF
+              cat > /tmp/haproxy.cfg <<'EOFCONFIG'
               global
                 maxconn 4096
               
@@ -96,8 +76,27 @@ spec:
                 mode tcp
                 option tcp-check
                 default-server inter 3s fall 3 rise 2
-              $(echo -e "${BACKEND_SERVERS}")
-              EOF
+              EOFCONFIG
+              
+              if [ "${PGBOUNCER_ENABLED}" = "true" ]; then
+                echo "      server pgbouncer ${PGBOUNCER_SERVICE}:${PGBOUNCER_PORT} check" >> /tmp/haproxy.cfg
+              else
+                MASTER_WEIGHT=$((100 - ${REPLICA_PERCENTAGE:-0}))
+                if [ ${MASTER_WEIGHT} -lt 1 ]; then
+                  MASTER_WEIGHT=1
+                fi
+                REPLICA_WEIGHT=${REPLICA_PERCENTAGE:-0}
+                if [ ${REPLICA_WEIGHT} -lt 0 ]; then
+                  REPLICA_WEIGHT=0
+                fi
+                
+                echo "      balance roundrobin" >> /tmp/haproxy.cfg
+                echo "      server master ${POSTGRES_MASTER_SERVICE}:${POSTGRES_MASTER_PORT} weight ${MASTER_WEIGHT} check" >> /tmp/haproxy.cfg
+                
+                if [ "${REPLICA_COUNT}" -gt 0 ] && [ "${READ_REPLICA_ROUTING_ENABLED}" = "true" ]; then
+                  echo "      server replica ${POSTGRES_REPLICA_SERVICE}:${POSTGRES_REPLICA_PORT} weight ${REPLICA_WEIGHT} check" >> /tmp/haproxy.cfg
+                fi
+              fi
               
               exec haproxy -f /tmp/haproxy.cfg -W -db
           ports:
