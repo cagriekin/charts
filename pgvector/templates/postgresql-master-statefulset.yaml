@@ -107,6 +107,16 @@ spec:
                 secretKeyRef:
                   name: {{ $secretName }}
                   key: postgres-database
+            - name: REPLICATION_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.fullname" . }}-postgresql-replication-secret
+                  key: replication-user
+            - name: REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.fullname" . }}-postgresql-replication-secret
+                  key: replication-password
             - name: PGDATA
               value: /var/lib/postgresql/data
           command:
@@ -127,6 +137,8 @@ spec:
                       sleep 1
                     done
                     psql -U "${POSTGRES_USER}" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '${POSTGRES_DB}'" | grep -q 1 || psql -U "${POSTGRES_USER}" -d postgres -c "CREATE DATABASE ${POSTGRES_DB};"
+                    psql -U "${POSTGRES_USER}" -d postgres -tc "SELECT 1 FROM pg_roles WHERE rolname = '${REPLICATION_USER}'" | grep -q 1 || psql -U "${POSTGRES_USER}" -d postgres -c "CREATE USER ${REPLICATION_USER} WITH REPLICATION PASSWORD '${REPLICATION_PASSWORD}';"
+                    psql -U "${POSTGRES_USER}" -d postgres -c "ALTER USER ${REPLICATION_USER} WITH PASSWORD '${REPLICATION_PASSWORD}';"
           ports:
             - name: postgresql
               containerPort: 5432
