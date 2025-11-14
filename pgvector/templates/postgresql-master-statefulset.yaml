@@ -30,14 +30,20 @@ spec:
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
           env:
             - name: POSTGRES_USER
-              value: {{ .Values.postgresql.postgresUser | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  key: postgres-user
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.secretName" . }}
+                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
                   key: postgres-password
             - name: POSTGRES_DB
-              value: {{ .Values.postgresql.postgresDatabase | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  key: postgres-database
           command:
             - /bin/sh
             - -c
@@ -58,13 +64,13 @@ spec:
               host    all             all             127.0.0.1/32            trust
               host    all             all             ::1/128                 trust
 
-              host    replication     {{ .Values.postgresql.postgresUser }}        10.0.0.0/8              md5
-              host    replication     {{ .Values.postgresql.postgresUser }}        172.16.0.0/12           md5
-              host    replication     {{ .Values.postgresql.postgresUser }}        192.168.0.0/16          md5
+              host    replication     $POSTGRES_USER        10.0.0.0/8              md5
+              host    replication     $POSTGRES_USER        172.16.0.0/12           md5
+              host    replication     $POSTGRES_USER        192.168.0.0/16          md5
 
-              host    all             {{ .Values.postgresql.postgresUser }}        10.0.0.0/8              md5
-              host    all             {{ .Values.postgresql.postgresUser }}        172.16.0.0/12           md5
-              host    all             {{ .Values.postgresql.postgresUser }}        192.168.0.0/16          md5
+              host    all             $POSTGRES_USER        10.0.0.0/8              md5
+              host    all             $POSTGRES_USER        172.16.0.0/12           md5
+              host    all             $POSTGRES_USER        192.168.0.0/16          md5
 
               host    all             all             0.0.0.0/0               md5
               EOF
@@ -81,14 +87,20 @@ spec:
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
           env:
             - name: POSTGRES_USER
-              value: {{ .Values.postgresql.postgresUser | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  key: postgres-user
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.secretName" . }}
+                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
                   key: postgres-password
             - name: POSTGRES_DB
-              value: {{ .Values.postgresql.postgresDatabase | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  key: postgres-database
             - name: PGDATA
               value: /var/lib/postgresql/data
           command:
