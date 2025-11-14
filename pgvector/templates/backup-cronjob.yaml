@@ -43,9 +43,15 @@ spec:
                       name: {{ include "pgvector.postgresql.secretName" . }}
                       key: postgres-password
                 - name: PGUSER
-                  value: {{ .Values.postgresql.postgresUser | quote }}
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "pgvector.postgresql.secretName" . }}
+                      key: postgres-user
                 - name: PGDATABASE
-                  value: {{ .Values.postgresql.postgresDatabase | quote }}
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "pgvector.postgresql.secretName" . }}
+                      key: postgres-database
                 - name: PGHOST
                   value: {{ include "pgvector.fullname" . }}-postgresql-master.{{ .Release.Namespace }}.svc.cluster.local
                 - name: PGPORT
@@ -79,7 +85,7 @@ spec:
                 - name: POSTGRES_URL
                   valueFrom:
                     secretKeyRef:
-                      name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                      name: {{ include "pgvector.postgresql.secretName" . }}
                       key: postgres-url
 {{- range .Values.backup.env }}
                 - name: {{ .name }}
