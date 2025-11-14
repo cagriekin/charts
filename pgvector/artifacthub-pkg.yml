@@ -1,0 +1,19 @@
+version: 0.2.3
+name: pgvector
+displayName: PGVector
+createdAt: "2025-11-01T00:00:00Z"
+description: PostgreSQL with the pgvector extension, optional PgBouncer pooling, and optional HAProxy routing.
+homeURL: "https://cagriekin.github.io/charts"
+logoPath: ""
+appVersion: "18.0"
+operator: false
+deprecated: false
+maintainers:
+  - name: Cagri Ekın
+    email: cagriekin@gmail.com
+    url: https://cagriekin.github.io/charts
+links:
+  - name: Source
+    url: https://github.com/cagriekin/charts
+screenshots: []
+changes: []
