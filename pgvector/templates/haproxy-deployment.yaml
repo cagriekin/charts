@@ -55,7 +55,6 @@ spec:
             - -c
             - |
               set -e
-              mkdir -p /usr/local/etc/haproxy
               
               if [ "${PGBOUNCER_ENABLED}" = "true" ]; then
                 BACKEND_SERVERS="server pgbouncer ${PGBOUNCER_SERVICE}:${PGBOUNCER_PORT} check"
@@ -77,7 +76,7 @@ spec:
                 fi
               fi
               
-              cat > /usr/local/etc/haproxy/haproxy.cfg <<EOF
+              cat > /tmp/haproxy.cfg <<EOF
               global
                 maxconn 4096
               
@@ -100,7 +99,7 @@ spec:
               $(echo -e "${BACKEND_SERVERS}")
               EOF
               
-              exec haproxy -f /usr/local/etc/haproxy/haproxy.cfg -W -db
+              exec haproxy -f /tmp/haproxy.cfg -W -db
           ports:
             - name: postgresql
               containerPort: {{ .Values.postgresql.haproxy.service.port }}
