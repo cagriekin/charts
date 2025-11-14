@@ -114,6 +114,19 @@ spec:
             - postgres
             - -c
             - config_file=/etc/postgresql/postgresql.conf
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    set -e
+                    export PGPASSWORD="${POSTGRES_PASSWORD}"
+                    until pg_isready -U "${POSTGRES_USER}" -d postgres; do
+                      sleep 1
+                    done
+                    psql -U "${POSTGRES_USER}" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '${POSTGRES_DB}'" | grep -q 1 || psql -U "${POSTGRES_USER}" -d postgres -c "CREATE DATABASE ${POSTGRES_DB};"
           ports:
             - name: postgresql
               containerPort: 5432
