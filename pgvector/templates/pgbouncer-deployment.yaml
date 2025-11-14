@@ -32,15 +32,16 @@ spec:
               containerPort: 5432
               protocol: TCP
           env:
-            - name: POSTGRES_USER
-              value: {{ .Values.postgresql.postgresUser | quote }}
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "pgvector.postgresql.secretName" . }}
                   key: postgres-password
             - name: POSTGRES_DB
-              value: {{ .Values.postgresql.postgresDatabase | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.secretName" . }}
+                  key: postgres-database
           command:
             - /bin/sh
             - -c

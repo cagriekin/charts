@@ -41,14 +41,14 @@ data:
     host    all             all             ::1/128                 trust
 
     # Allow replication connections from replica pods
-    host    replication     {{ .Values.postgresql.postgresUser }}        10.0.0.0/8              md5
-    host    replication     {{ .Values.postgresql.postgresUser }}        172.16.0.0/12           md5
-    host    replication     {{ .Values.postgresql.postgresUser }}        192.168.0.0/16          md5
+    host    replication     {{ include "pgvector.postgresql.replicationUser" . }}        10.0.0.0/8              md5
+    host    replication     {{ include "pgvector.postgresql.replicationUser" . }}        172.16.0.0/12           md5
+    host    replication     {{ include "pgvector.postgresql.replicationUser" . }}        192.168.0.0/16          md5
 
     # Allow regular connections from other services
-    host    all             {{ .Values.postgresql.postgresUser }}        10.0.0.0/8              md5
-    host    all             {{ .Values.postgresql.postgresUser }}        172.16.0.0/12           md5
-    host    all             {{ .Values.postgresql.postgresUser }}        192.168.0.0/16          md5
+    host    all             {{ include "pgvector.postgresql.username" . }}        10.0.0.0/8              md5
+    host    all             {{ include "pgvector.postgresql.username" . }}        172.16.0.0/12           md5
+    host    all             {{ include "pgvector.postgresql.username" . }}        192.168.0.0/16          md5
 
     # Allow connections from localhost and cluster services
     host    all             all             0.0.0.0/0               md5
@@ -79,7 +79,7 @@ data:
     random_page_cost = 1.1
     effective_io_concurrency = 200
     work_mem = 4MB
-    primary_conninfo = 'host={{ include "pgvector.fullname" . }}-postgresql-master.{{ .Release.Namespace }}.svc.cluster.local port=5432 user={{ .Values.postgresql.postgresUser }} password={{ include "pgvector.postgresql.resolvedPassword" . }}'
+    primary_conninfo = 'host={{ include "pgvector.fullname" . }}-postgresql-master.{{ .Release.Namespace }}.svc.cluster.local port=5432 user={{ include "pgvector.postgresql.replicationUser" . }} password={{ include "pgvector.postgresql.replicationPassword" . }}'
     log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
     log_statement = 'ddl'
     log_timezone = 'UTC'
@@ -99,7 +99,7 @@ metadata:
 data:
   pgbouncer.ini: |
     [databases]
-    {{ .Values.postgresql.postgresDatabase }} = host={{ include "pgvector.fullname" . }}-postgresql-master.{{ .Release.Namespace }}.svc.cluster.local port=5432
+    {{ include "pgvector.postgresql.database" . }} = host={{ include "pgvector.fullname" . }}-postgresql-master.{{ .Release.Namespace }}.svc.cluster.local port=5432
 
     [pgbouncer]
     listen_addr = 0.0.0.0
@@ -120,8 +120,8 @@ data:
     log_disconnections = 1
     log_pooler_errors = 1
     stats_period = 60
-    admin_users = {{ .Values.postgresql.postgresUser }}
+    admin_users = {{ include "pgvector.postgresql.username" . }}
   userlist.txt: |
-    "{{ .Values.postgresql.postgresUser }}" "{{ include "pgvector.postgresql.resolvedPassword" . }}"
+    "{{ include "pgvector.postgresql.username" . }}" "{{ include "pgvector.postgresql.resolvedPassword" . }}"
 {{- end }}
 

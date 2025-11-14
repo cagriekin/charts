@@ -37,7 +37,7 @@ spec:
             - name: DATA_SOURCE_NAME
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  name: {{ include "pgvector.postgresql.secretName" . }}
                   key: postgres-url
             - name: PG_EXPORTER_DISABLE_SETTINGS_METRICS
               value: "true"

@@ -1,4 +1,5 @@
 {{- if and .Values.postgresql.enabled (gt (int .Values.postgresql.replica.replicaCount) 0) }}
+{{- $secretName := include "pgvector.postgresql.secretName" . -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -34,13 +35,23 @@ spec:
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  name: {{ $secretName }}
                   key: postgres-user
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  name: {{ $secretName }}
                   key: postgres-password
+            - name: REPLICATION_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.fullname" . }}-postgresql-replication-secret
+                  key: replication-user
+            - name: REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.fullname" . }}-postgresql-replication-secret
+                  key: replication-password
             - name: POSTGRES_MASTER_SERVICE
               value: {{ printf "%s-postgresql-master.%s.svc.cluster.local" (include "pgvector.fullname" .) .Release.Namespace | quote }}
             - name: POSTGRES_PORT
@@ -56,18 +67,18 @@ spec:
               mkdir -p "${PGBACKUP_DESTINATION}"
 
               if [ ! -f "${PGBACKUP_DESTINATION}/standby.signal" ]; then
-                until pg_isready -h "${POSTGRES_MASTER_SERVICE}" -p "${POSTGRES_PORT}" -U "${POSTGRES_USER}"; do
+                until pg_isready -h "${POSTGRES_MASTER_SERVICE}" -p "${POSTGRES_PORT}" -U "${REPLICATION_USER}"; do
                   sleep 2
                 done
 
                 rm -rf "${PGBACKUP_DESTINATION:?}"/*
 
-                export PGPASSWORD="${POSTGRES_PASSWORD}"
+                export PGPASSWORD="${REPLICATION_PASSWORD}"
 
                 pg_basebackup \
                   -h "${POSTGRES_MASTER_SERVICE}" \
                   -D "${PGBACKUP_DESTINATION}" \
-                  -U "${POSTGRES_USER}" \
+                  -U "${REPLICATION_USER}" \
                   -P \
                   -v \
                   -R \
@@ -79,7 +90,7 @@ spec:
               local   all             all                                     trust
               host    all             all             127.0.0.1/32            trust
               host    all             all             ::1/128                 trust
-              host    replication     ${POSTGRES_USER}        0.0.0.0/0               md5
+              host    replication     ${REPLICATION_USER}        0.0.0.0/0               md5
               host    all             ${POSTGRES_USER}        0.0.0.0/0               md5
               EOPGHBA
 
@@ -97,17 +108,17 @@ spec:
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  name: {{ $secretName }}
                   key: postgres-user
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  name: {{ $secretName }}
                   key: postgres-password
             - name: POSTGRES_DB
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  name: {{ $secretName }}
                   key: postgres-database
             - name: PGDATA
               value: /var/lib/postgresql/data
