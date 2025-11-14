@@ -1,4 +1,5 @@
 {{- if .Values.postgresql.enabled }}
+{{- $secretName := include "pgvector.postgresql.secretName" . -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -32,18 +33,23 @@ spec:
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  name: {{ $secretName }}
                   key: postgres-user
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  name: {{ $secretName }}
                   key: postgres-password
             - name: POSTGRES_DB
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  name: {{ $secretName }}
                   key: postgres-database
+            - name: REPLICATION_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.fullname" . }}-postgresql-replication-secret
+                  key: replication-user
           command:
             - /bin/sh
             - -c
@@ -57,20 +63,20 @@ spec:
                 /usr/local/bin/docker-entrypoint.sh postgres --initialize-only
               fi
 
-              cat <<'EOF' > /tmp/pg_hba.conf
+              cat <<EOF > /tmp/pg_hba.conf
               # TYPE  DATABASE        USER            ADDRESS                 METHOD
 
               local   all             all                                     trust
               host    all             all             127.0.0.1/32            trust
               host    all             all             ::1/128                 trust
 
-              host    replication     $POSTGRES_USER        10.0.0.0/8              md5
-              host    replication     $POSTGRES_USER        172.16.0.0/12           md5
-              host    replication     $POSTGRES_USER        192.168.0.0/16          md5
+              host    replication     ${REPLICATION_USER}        10.0.0.0/8              md5
+              host    replication     ${REPLICATION_USER}        172.16.0.0/12           md5
+              host    replication     ${REPLICATION_USER}        192.168.0.0/16          md5
 
-              host    all             $POSTGRES_USER        10.0.0.0/8              md5
-              host    all             $POSTGRES_USER        172.16.0.0/12           md5
-              host    all             $POSTGRES_USER        192.168.0.0/16          md5
+              host    all             ${POSTGRES_USER}        10.0.0.0/8              md5
+              host    all             ${POSTGRES_USER}        172.16.0.0/12           md5
+              host    all             ${POSTGRES_USER}        192.168.0.0/16          md5
 
               host    all             all             0.0.0.0/0               md5
               EOF
@@ -89,17 +95,17 @@ spec:
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  name: {{ $secretName }}
                   key: postgres-user
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  name: {{ $secretName }}
                   key: postgres-password
             - name: POSTGRES_DB
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "pgvector.postgresql.urlSecretName" . }}
+                  name: {{ $secretName }}
                   key: postgres-database
             - name: PGDATA
               value: /var/lib/postgresql/data
