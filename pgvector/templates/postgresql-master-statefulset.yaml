@@ -139,6 +139,7 @@ spec:
                     psql -U "${POSTGRES_USER}" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '${POSTGRES_DB}'" | grep -q 1 || psql -U "${POSTGRES_USER}" -d postgres -c "CREATE DATABASE ${POSTGRES_DB};"
                     psql -U "${POSTGRES_USER}" -d postgres -tc "SELECT 1 FROM pg_roles WHERE rolname = '${REPLICATION_USER}'" | grep -q 1 || psql -U "${POSTGRES_USER}" -d postgres -c "CREATE USER ${REPLICATION_USER} WITH REPLICATION PASSWORD '${REPLICATION_PASSWORD}';"
                     psql -U "${POSTGRES_USER}" -d postgres -c "ALTER USER ${REPLICATION_USER} WITH PASSWORD '${REPLICATION_PASSWORD}';"
+                    psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "CREATE EXTENSION IF NOT EXISTS vector;"
           ports:
             - name: postgresql
               containerPort: 5432
