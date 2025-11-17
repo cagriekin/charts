@@ -25,6 +25,7 @@ data:
     ## {{ $topicName }}
     - **Partitions**: {{ default 1 $topic.partitions }}
     - **Replication Factor**: {{ default 1 $topic.replicationFactor }}
+{{- if $topic.metadata }}
 {{- with $topic.metadata.description }}
     - **Description**: {{ . }}
 {{- end }}
@@ -49,8 +50,8 @@ data:
 {{- with $topic.metadata.purpose }}
     - **Purpose**: {{ . }}
 {{- end }}
-
-{{- end }}
-{{- end }}
 {{- end }}
 
+{{- end }}
+{{- end }}
+{{- end }}
