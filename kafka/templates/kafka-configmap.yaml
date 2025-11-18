@@ -26,14 +26,9 @@ data:
     node.id=PLACEHOLDER_NODE_ID
     controller.quorum.voters={{ include "kafka.kafka.controllerQuorumVoters" . }}
     listeners=CONTROLLER://:9093
+    listener.security.protocol.map=CONTROLLER:PLAINTEXT
     controller.listener.names=CONTROLLER
     log.dirs={{ .Values.kafka.controller.logDir }}
-    # SASL Authentication configuration
-    sasl.enabled.mechanisms=PLAIN
-    sasl.mechanism.controller.protocol=PLAIN
-    sasl.mechanism.inter.broker.protocol=PLAIN
-    # JAAS configuration file path
-    sasl.jaas.config=/opt/kafka/config/kraft/kafka_server_jaas.conf
   client.properties: |
     # Kafka client configuration for SASL authentication
     security.protocol=SASL_PLAINTEXT
@@ -81,7 +76,6 @@ data:
     log.dirs={{ .Values.kafka.broker.logDir }}
     # SASL Authentication configuration
     sasl.enabled.mechanisms=PLAIN
-    sasl.mechanism.controller.protocol=PLAIN
     sasl.mechanism.inter.broker.protocol=PLAIN
     # JAAS configuration file path
     sasl.jaas.config=/opt/kafka/config/kraft/kafka_server_jaas.conf
@@ -104,7 +98,6 @@ data:
     log.dirs={{ .Values.kafka.broker.logDir }}
     # SASL Authentication configuration
     sasl.enabled.mechanisms=PLAIN
-    sasl.mechanism.controller.protocol=PLAIN
     sasl.mechanism.inter.broker.protocol=PLAIN
     # JAAS configuration file path
     sasl.jaas.config=/opt/kafka/config/kraft/kafka_server_jaas.conf
