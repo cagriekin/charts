@@ -64,7 +64,7 @@ Generate deterministic PostgreSQL password when not provided
 */}}
 {{- define "pgvector.postgresql.password" -}}
 {{- $salt := "All that we have is that shout into the wind. How we live. How we go. And how we stand before we fall. Karnus Au Bellona." -}}
-{{- $input := printf "%s-%s-%s" .Release.Name .Chart.Name $salt -}}
+{{- $input := printf "%s-%s-%s-%s" .Release.Name .Chart.Name .Release.Namespace $salt -}}
 {{- $hash := $input | sha256sum -}}
 {{- $hash | trunc 32 -}}
 {{- end -}}
