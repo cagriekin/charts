@@ -135,7 +135,7 @@ monitoring:
     image:
       registry: docker.io
       repository: prometheuscommunity/postgres-exporter
-      tag: "v0.15.0"
+      tag: "v0.18.1"
       pullPolicy: IfNotPresent
     service:
       enabled: true
