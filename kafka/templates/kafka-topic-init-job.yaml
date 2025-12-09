@@ -123,14 +123,19 @@ spec:
             --topic {{ $topicName }} 2>/dev/null || echo "")
 
           if [ -n "$TOPIC_DESC" ]; then
+            # Debug: show what we got from describe
+            echo "Debug: TOPIC_DESC='$TOPIC_DESC'"
+
             # Extract current partitions count from the topic description
-            # The describe output format is: Topic: topicName PartitionCount: N ReplicationFactor: M
-            CURRENT_PARTITIONS=$(echo "$TOPIC_DESC" | sed -n 's/.*PartitionCount:\([0-9]*\).*/\1/p')
-            CURRENT_REPLICATION=$(echo "$TOPIC_DESC" | sed -n 's/.*ReplicationFactor:\([0-9]*\).*/\1/p')
+            # Parse the describe output which has format like: Topic: name PartitionCount: N ReplicationFactor: M
+            CURRENT_PARTITIONS=$(echo "$TOPIC_DESC" | awk -F'\t' '{for(i=1;i<=NF;i++) if($i ~ /PartitionCount/) {split($i,a,":"); print a[2]}}' | tr -d ' ')
+            CURRENT_REPLICATION=$(echo "$TOPIC_DESC" | awk -F'\t' '{for(i=1;i<=NF;i++) if($i ~ /ReplicationFactor/) {split($i,a,":"); print a[2]}}' | tr -d ' ')
 
             # Set defaults if parsing failed
             CURRENT_PARTITIONS=${CURRENT_PARTITIONS:-0}
             CURRENT_REPLICATION=${CURRENT_REPLICATION:-0}
+
+            echo "Debug: Parsed CURRENT_PARTITIONS='$CURRENT_PARTITIONS', CURRENT_REPLICATION='$CURRENT_REPLICATION'"
 
             ALTER_NEEDED=false
 
