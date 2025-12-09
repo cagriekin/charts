@@ -94,22 +94,70 @@ spec:
           echo "Creating topics..."
           export KAFKA_OPTS="-Djava.security.auth.login.config=/tmp/kafka-config/client_jaas.conf"
 
-          # Ensure configured topics exist
+          # Ensure configured topics exist with correct configuration
 {{- range $topicName, $topic := $root.Values.kafka.topics }}
-          echo "Ensuring {{ $topicName }} topic exists..."
+          echo "Ensuring {{ $topicName }} topic exists with correct configuration..."
+          DESIRED_PARTITIONS={{ default 1 $topic.partitions }}
+          DESIRED_REPLICATION={{ default 1 $topic.replicationFactor }}
+
+          # Try to create topic first (will succeed for new topics, fail silently for existing ones)
           /opt/kafka/bin/kafka-topics.sh \
             --create \
             --bootstrap-server ${BOOTSTRAP_SERVER} \
             --command-config /tmp/kafka-config/client.properties \
             --topic {{ $topicName }} \
-            --partitions {{ default 1 $topic.partitions }} \
-            --replication-factor {{ default 1 $topic.replicationFactor }} \
+            --partitions ${DESIRED_PARTITIONS} \
+            --replication-factor ${DESIRED_REPLICATION} \
             {{- with $topic.config }}
             {{- range $confKey, $confValue := . }}
             --config {{ $confKey }}={{ $confValue }} \
             {{- end }}
             {{- end }}
             --if-not-exists
+
+          # Check current topic configuration
+          TOPIC_DESC=$(timeout 30 /opt/kafka/bin/kafka-topics.sh \
+            --describe \
+            --bootstrap-server ${BOOTSTRAP_SERVER} \
+            --command-config /tmp/kafka-config/client.properties \
+            --topic {{ $topicName }} 2>/dev/null || echo "")
+
+          if [ -n "$TOPIC_DESC" ]; then
+            # Extract current partitions and replication factor
+            CURRENT_PARTITIONS=$(echo "$TOPIC_DESC" | grep -o "PartitionCount:[0-9]*" | cut -d':' -f2)
+            CURRENT_REPLICATION=$(echo "$TOPIC_DESC" | grep -o "ReplicationFactor:[0-9]*" | cut -d':' -f2)
+
+            ALTER_NEEDED=false
+
+            # Check if partitions need to be altered (only increase allowed)
+            if [ "$CURRENT_PARTITIONS" != "$DESIRED_PARTITIONS" ] && [ "$DESIRED_PARTITIONS" -gt "$CURRENT_PARTITIONS" ]; then
+              echo "Topic {{ $topicName }} partitions need to be increased from $CURRENT_PARTITIONS to $DESIRED_PARTITIONS"
+              ALTER_NEEDED=true
+            fi
+
+            # Check if replication factor needs to be altered
+            if [ "$CURRENT_REPLICATION" != "$DESIRED_REPLICATION" ]; then
+              echo "Topic {{ $topicName }} replication factor needs to be changed from $CURRENT_REPLICATION to $DESIRED_REPLICATION"
+              ALTER_NEEDED=true
+            fi
+
+            # Alter topic if needed
+            if [ "$ALTER_NEEDED" = true ]; then
+              echo "Altering topic {{ $topicName }}..."
+              /opt/kafka/bin/kafka-topics.sh \
+                --alter \
+                --bootstrap-server ${BOOTSTRAP_SERVER} \
+                --command-config /tmp/kafka-config/client.properties \
+                --topic {{ $topicName }} \
+                --partitions ${DESIRED_PARTITIONS} \
+                --replication-factor ${DESIRED_REPLICATION}
+              echo "Topic {{ $topicName }} altered successfully"
+            else
+              echo "Topic {{ $topicName }} already has correct configuration"
+            fi
+          else
+            echo "Warning: Could not describe topic {{ $topicName }}, skipping alteration check"
+          fi
 
 {{- end }}
 
