@@ -75,9 +75,9 @@ spec:
 
           echo "Waiting for Kafka bootstrap server ${BOOTSTRAP_SERVER} to become reachable..."
           ATTEMPT=1
-          until /opt/kafka/bin/kafka-broker-api-versions.sh \
+          until echo "Attempt ${ATTEMPT}/${MAX_ATTEMPTS}: Testing connection to ${BOOTSTRAP_SERVER}" && /opt/kafka/bin/kafka-broker-api-versions.sh \
             --bootstrap-server "${BOOTSTRAP_SERVER}" \
-            --command-config /tmp/kafka-config/client.properties >/dev/null 2>&1; do
+            --command-config /tmp/kafka-config/client.properties; do
             if [ "${ATTEMPT}" -ge "${MAX_ATTEMPTS}" ]; then
               echo "Kafka bootstrap server still unreachable after ${ATTEMPT} attempts; giving up." >&2
               exit 1
