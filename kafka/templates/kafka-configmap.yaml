@@ -34,7 +34,7 @@ data:
     security.protocol=SASL_PLAINTEXT
     sasl.mechanism=PLAIN
     # JAAS config will be generated at runtime from mounted secrets
-    sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="PLACEHOLDER_USERNAME" password="PLACEHOLDER_PASSWORD";
+    sasl.jaas.config.PLAIN=org.apache.kafka.common.security.plain.PlainLoginModule required username="PLACEHOLDER_USERNAME" password="PLACEHOLDER_PASSWORD";
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -106,7 +106,7 @@ data:
     security.protocol=SASL_PLAINTEXT
     sasl.mechanism=PLAIN
     # JAAS config will be generated at runtime from mounted secrets
-    sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="PLACEHOLDER_USERNAME" password="PLACEHOLDER_PASSWORD";
+    sasl.jaas.config.PLAIN=org.apache.kafka.common.security.plain.PlainLoginModule required username="PLACEHOLDER_USERNAME" password="PLACEHOLDER_PASSWORD";
   client_jaas.conf.template: |
     org.apache.kafka.common.security.plain.PlainLoginModule required
     username="PLACEHOLDER_USERNAME"
