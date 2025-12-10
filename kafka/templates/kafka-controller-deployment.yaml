@@ -109,6 +109,22 @@ spec:
             - name: controller
               containerPort: 9093
               protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: controller
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: controller
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
           env:
             - name: POD_NAME
               valueFrom:
