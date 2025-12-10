@@ -104,7 +104,9 @@ data:
     security.protocol=SASL_PLAINTEXT
     sasl.mechanism=PLAIN
   client_jaas.conf.template: |
-    org.apache.kafka.common.security.plain.PlainLoginModule required
-    username="PLACEHOLDER_USERNAME"
-    password="PLACEHOLDER_PASSWORD";
+    KafkaClient {
+        org.apache.kafka.common.security.plain.PlainLoginModule required
+        username="PLACEHOLDER_USERNAME"
+        password="PLACEHOLDER_PASSWORD";
+    };
 {{- end }}
