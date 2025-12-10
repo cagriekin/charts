@@ -69,7 +69,11 @@ spec:
           # Generate JAAS config from template using actual credentials
           sed -e "s|PLACEHOLDER_USERNAME|$${KAFKA_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|$${KAFKA_PASSWORD}|g" /opt/kafka/config/kraft/client_jaas.conf.template > /tmp/kafka-config/client_jaas.conf
           
+          {{- if .Values.kafka.bootstrapServer }}
+          BOOTSTRAP_SERVER="{{ .Values.kafka.bootstrapServer }}"
+          {{- else }}
           BOOTSTRAP_SERVER="{{ include "kafka.fullname" . }}-kafka-broker.{{ default "default" .Release.Namespace }}.svc.cluster.local:9092"
+          {{- end }}
           MAX_ATTEMPTS=${KAFKA_BOOTSTRAP_RETRIES:-30}
           SLEEP_SECONDS=${KAFKA_BOOTSTRAP_SLEEP:-5}
 
