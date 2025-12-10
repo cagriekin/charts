@@ -11,6 +11,9 @@ kafka:
     repository: apache/kafka
     tag: "4.1.0"
     pullPolicy: IfNotPresent
+  # External bootstrap server for topic initialization (optional)
+  # If not set, uses the broker service from this chart
+  bootstrapServer: ""
   controller:
     replicaCount: 1
     logDir: /var/lib/kafka/data/kraft-controller-logs
@@ -91,7 +94,20 @@ kafka:
   deleteTopicEnable: true
   topics: {}
   nodeSelector: {}
-  affinity: {}
+  # Pod anti-affinity to spread Kafka brokers across different nodes for HA
+  # This prevents multi-attach volume errors when using ReadWriteOnce storage
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app.kubernetes.io/component
+              operator: In
+              values:
+              - kafka-broker
+          topologyKey: kubernetes.io/hostname
   tolerations: []
 
 exporters:
