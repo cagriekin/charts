@@ -96,10 +96,11 @@ kafka:
   nodeSelector: {}
   # Pod anti-affinity to spread Kafka brokers across different nodes for HA
   # This prevents multi-attach volume errors when using ReadWriteOnce storage
+  # Weight 50 allows some flexibility while preferring distribution
   affinity:
     podAntiAffinity:
       preferredDuringSchedulingIgnoredDuringExecution:
-      - weight: 100
+      - weight: 50
         podAffinityTerm:
           labelSelector:
             matchExpressions:
