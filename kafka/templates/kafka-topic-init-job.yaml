@@ -68,7 +68,7 @@ spec:
           {{- if .Values.kafka.bootstrapServer }}
           BOOTSTRAP_SERVER="{{ .Values.kafka.bootstrapServer }}"
           {{- else }}
-          BOOTSTRAP_SERVER="{{ include "kafka.fullname" . }}-kafka-broker.{{ default "default" .Release.Namespace }}.svc.cluster.local:9092"
+          BOOTSTRAP_SERVER="{{ include "kafka.fullname" . }}-kafka-broker-0.{{ include "kafka.fullname" . }}-kafka-broker.{{ default "default" .Release.Namespace }}.svc.cluster.local:9092"
           {{- end }}
           MAX_ATTEMPTS=${KAFKA_BOOTSTRAP_RETRIES:-30}
           SLEEP_SECONDS=${KAFKA_BOOTSTRAP_SLEEP:-5}
