@@ -3,6 +3,30 @@ entries:
   kafka:
   - apiVersion: v2
     appVersion: 4.1.0
+    created: "2025-12-10T17:30:01.766719388Z"
+    description: Apache Kafka deployment for the DamnThing message bus
+    digest: 94ffc7bace603407c0c43a7f2af17c6413f4756e36897c5cb532f7ed8c2b591d
+    keywords:
+    - Kafka
+    - Streaming
+    - Messaging
+    - Message Bus
+    - Kafka Broker
+    - Kafka Controller
+    - Kafka Exporter
+    - Kafka Topics
+    - Kafka Config
+    - Kafka Secrets
+    - Kafka Service
+    - Kafka Deployment
+    - Kafka StatefulSet
+    name: kafka
+    type: application
+    urls:
+    - https://github.com/cagriekin/charts/releases/download/kafka-0.1.33/kafka-0.1.33.tgz
+    version: 0.1.33
+  - apiVersion: v2
+    appVersion: 4.1.0
     created: "2025-12-10T17:24:08.249344084Z"
     description: Apache Kafka deployment for the DamnThing message bus
     digest: f9bfa9e8d66ab98a1bd6ed89c191fff35ff22790a1e75f1206d47b3eb1241b00
@@ -1214,4 +1238,4 @@ entries:
     urls:
     - https://github.com/cagriekin/charts/releases/download/pgvector-0.2.0/pgvector-0.2.0.tgz
     version: 0.2.0
-generated: "2025-12-10T17:24:08.25075127Z"
+generated: "2025-12-10T17:30:01.767137716Z"
