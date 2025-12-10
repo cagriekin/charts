@@ -64,7 +64,10 @@ spec:
 
           # Generate JAAS config from template using actual credentials
           sed -e "s|PLACEHOLDER_USERNAME|$${KAFKA_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|$${KAFKA_PASSWORD}|g" /opt/kafka/config/kraft/client_jaas.conf.template > /tmp/kafka-config/client_jaas.conf
-          
+
+          # Set JAAS configuration for Kafka client authentication
+          export KAFKA_OPTS="-Djava.security.auth.login.config=/tmp/kafka-config/client_jaas.conf"
+
           {{- if .Values.kafka.bootstrapServer }}
           BOOTSTRAP_SERVER="{{ .Values.kafka.bootstrapServer }}"
           {{- else }}
