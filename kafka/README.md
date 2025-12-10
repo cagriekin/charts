@@ -31,6 +31,7 @@ Key options are summarized below; see `values.yaml` for the complete list.
 | `kafka.auth.existingSecretKeys.password` | Key in the existing secret that stores the password | `password` |
 | `kafka.autoCreateTopicsEnable` | Allow brokers to auto-create topics | `true` |
 | `kafka.deleteTopicEnable` | Allow topic deletion | `true` |
+| `kafka.bootstrapServer` | External Kafka bootstrap server for topic initialization (when deploying against existing cluster) | `""` |
 | `kafka.topics` | Map of topic definitions keyed by topic name (supports `partitions`, `replicationFactor`, optional `config` map, and optional `metadata`) | `{}` |
 | `exporters.kafka.enabled` | Deploy the Kafka metrics exporter | `true` |
 | `serviceMonitors.enabled` | Create a Prometheus ServiceMonitor | `false` |
