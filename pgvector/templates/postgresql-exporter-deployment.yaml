@@ -29,6 +29,10 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "pgvector.serviceAccountName" . }}
+      {{- with .Values.monitoring.exporter.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: postgres-exporter
           image: {{ .Values.monitoring.exporter.image.registry }}/{{ .Values.monitoring.exporter.image.repository }}:{{ .Values.monitoring.exporter.image.tag }}
