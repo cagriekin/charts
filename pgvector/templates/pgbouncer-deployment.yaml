@@ -23,6 +23,10 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "pgvector.serviceAccountName" . }}
+      {{- with .Values.postgresql.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: pgbouncer
           image: {{ .Values.postgresql.pgbouncer.image.registry }}/{{ .Values.postgresql.pgbouncer.image.repository }}:{{ .Values.postgresql.pgbouncer.image.tag }}
