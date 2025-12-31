@@ -19,6 +19,8 @@ networkPolicy:
 
 postgresql:
   enabled: true
+  podDisruptionBudget:
+    enabled: true
   image:
     registry: docker.io
     repository: pgvector/pgvector

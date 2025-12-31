@@ -11,6 +11,7 @@ Standalone Helm chart for deploying PostgreSQL with the pgvector extension. The 
 - Optional Prometheus exporter for PostgreSQL metrics
 - Optional NetworkPolicies with configurable ingress and egress rules
 - Optional S3-based backup CronJob with automated retention pruning
+- Optional Pod Disruption Budgets for high availability during cluster maintenance
 - Secrets populated with ready-to-use connection strings for each endpoint
 
 ## Installation
@@ -154,6 +155,7 @@ backup:
 | `postgresql.master.persistence.storageClass` | Storage class for the primary PVC (empty uses default) | `""` |
 | `postgresql.master.persistence.accessModes` | Access modes for the primary PVC | `["ReadWriteOnce"]` |
 | `postgresql.master.resources` | Resource requests and limits for primary | `{cpu: 100m/500m, memory: 512Mi/1Gi}` |
+| `postgresql.podDisruptionBudget.enabled` | Enable Pod Disruption Budgets for high availability | `true` |
 | `postgresql.replica.replicaCount` | Number of replica pods | `2` |
 | `postgresql.replica.persistence.enabled` | Enable persistent volume claims for replica pods | `true` |
 | `postgresql.replica.persistence.size` | Persistent volume size for replicas | `5Gi` |
