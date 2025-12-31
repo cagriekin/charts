@@ -23,6 +23,10 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "pgvector.serviceAccountName" . }}
+      {{- with .Values.postgresql.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: haproxy
           image: {{ .Values.postgresql.haproxy.image.registry }}/{{ .Values.postgresql.haproxy.image.repository }}:{{ .Values.postgresql.haproxy.image.tag }}

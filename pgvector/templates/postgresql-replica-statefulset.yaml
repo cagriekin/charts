@@ -25,6 +25,10 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "pgvector.serviceAccountName" . }}
+      {{- with .Values.postgresql.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       securityContext:
         fsGroup: 999
       initContainers:

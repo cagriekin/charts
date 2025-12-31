@@ -21,6 +21,7 @@ postgresql:
   enabled: true
   podDisruptionBudget:
     enabled: true
+  imagePullSecrets: []
   image:
     registry: docker.io
     repository: pgvector/pgvector
