@@ -23,7 +23,7 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "pgvector.serviceAccountName" . }}
-      {{- with .Values.postgresql.imagePullSecrets }}
+      {{- with .Values.postgresql.pgbouncer.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}

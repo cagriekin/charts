@@ -133,7 +133,10 @@ backup:
 | `postgresql.image.repository` | PostgreSQL image repository | `pgvector/pgvector` |
 | `postgresql.image.tag` | PostgreSQL image tag | `pg18-trixie` |
 | `postgresql.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `postgresql.imagePullSecrets` | Image pull secrets for all components (PostgreSQL, PgBouncer, HAProxy) | `[]` |
+| `postgresql.imagePullSecrets` | Image pull secrets for PostgreSQL master and replica | `[]` |
+| `postgresql.pgbouncer.imagePullSecrets` | Image pull secrets for PgBouncer | `[]` |
+| `postgresql.haproxy.imagePullSecrets` | Image pull secrets for HAProxy | `[]` |
+| `monitoring.exporter.imagePullSecrets` | Image pull secrets for PostgreSQL exporter | `[]` |
 | `postgresql.postgresUser` | Database superuser name | `postgres` |
 | `postgresql.postgresPassword` | Database superuser password (auto-generated when empty) | `""` |
 | `postgresql.existingSecret` | Use an existing secret for database credentials (must define `postgres-user`, `postgres-password`, `postgres-database`; `postgres-url` optional) | `""` |

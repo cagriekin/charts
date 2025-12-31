@@ -81,6 +81,7 @@ postgresql:
   pgbouncer:
     enabled: true
     replicaCount: 1
+    imagePullSecrets: []
     image:
       registry: docker.io
       repository: edoburu/pgbouncer
@@ -108,6 +109,7 @@ postgresql:
   haproxy:
     enabled: false
     replicaCount: 1
+    imagePullSecrets: []
     image:
       registry: docker.io
       repository: haproxy
@@ -135,6 +137,7 @@ monitoring:
   exporter:
     enabled: false
     replicaCount: 1
+    imagePullSecrets: []
     image:
       registry: docker.io
       repository: prometheuscommunity/postgres-exporter
