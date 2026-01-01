@@ -122,9 +122,6 @@ spec:
               echo "Copying shared library files..."
               cp -rv /usr/lib/postgresql/18/lib/repmgr* /tmp/repmgr-extensions/lib/postgresql/18/lib/ 2>/dev/null || echo "Failed to copy library files"
 
-              # Copy control files if they exist
-              cp -rv /usr/share/postgresql/18/extension/repmgr.control /tmp/repmgr-extensions/share/postgresql/18/extension/ 2>/dev/null || echo "No control file found"
-
               echo "Contents of destination directory:"
               find /tmp/repmgr-extensions -name "*repmgr*" -type f || echo "No repmgr files found in destination"
 
