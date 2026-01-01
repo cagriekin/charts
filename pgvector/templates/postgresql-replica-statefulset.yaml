@@ -108,6 +108,44 @@ spec:
           volumeMounts:
             - name: postgresql-data
               mountPath: /var/lib/postgresql/data
+      containers:
+        - name: postgresql-replica
+          image: {{ .Values.postgresql.image.registry }}/{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: postgres-user
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: postgres-password
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: postgres-database
+            - name: PGDATA
+              value: /var/lib/postgresql/data
+          command:
+            - docker-entrypoint.sh
+            - postgres
+            - -c
+            - config_file=/etc/postgresql/postgresql.conf
+          ports:
+            - name: postgresql
+              containerPort: 5432
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.postgresql.replica.resources | nindent 12 }}
+          volumeMounts:
+            - name: postgresql-data
+              mountPath: /var/lib/postgresql/data
+            - name: postgresql-config
+              mountPath: /etc/postgresql
         {{- if .Values.postgresql.repmgr.enabled }}
         - name: repmgr-init
           image: {{ .Values.postgresql.repmgr.image.registry }}/{{ .Values.postgresql.repmgr.image.repository }}:{{ .Values.postgresql.repmgr.image.tag }}
@@ -148,46 +186,8 @@ spec:
               mountPath: /var/lib/postgresql/data
             - name: repmgr-config
               mountPath: /etc/repmgr
-        {{- end }}
-      containers:
-        - name: postgresql-replica
-          image: {{ .Values.postgresql.image.registry }}/{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}
-          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
-          env:
-            - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $secretName }}
-                  key: postgres-user
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $secretName }}
-                  key: postgres-password
-            - name: POSTGRES_DB
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $secretName }}
-                  key: postgres-database
-            - name: PGDATA
-              value: /var/lib/postgresql/data
-          command:
-            - docker-entrypoint.sh
-            - postgres
-            - -c
-            - config_file=/etc/postgresql/postgresql.conf
-          ports:
-            - name: postgresql
-              containerPort: 5432
-              protocol: TCP
           resources:
-            {{- toYaml .Values.postgresql.replica.resources | nindent 12 }}
-          volumeMounts:
-            - name: postgresql-data
-              mountPath: /var/lib/postgresql/data
-            - name: postgresql-config
-              mountPath: /etc/postgresql
-        {{- if .Values.postgresql.repmgr.enabled }}
+            {{- toYaml .Values.postgresql.repmgr.resources | nindent 12 }}
         - name: repmgrd
           image: {{ .Values.postgresql.repmgr.image.registry }}/{{ .Values.postgresql.repmgr.image.repository }}:{{ .Values.postgresql.repmgr.image.tag }}
           imagePullPolicy: {{ .Values.postgresql.repmgr.image.pullPolicy }}
