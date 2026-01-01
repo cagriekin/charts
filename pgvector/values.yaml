@@ -134,6 +134,7 @@ postgresql:
     podAnnotations: {}
   repmgr:
     enabled: false
+    imagePullSecrets: []
     image:
       registry: docker.io
       repository: cagriekin/repmgr
