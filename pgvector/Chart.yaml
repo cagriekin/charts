@@ -2,7 +2,7 @@ apiVersion: v2
 name: pgvector
 description: PostgreSQL with the pgvector extension, optional PgBouncer pooling, optional HAProxy routing, and optional repmgr automatic failover.
 type: application
-version: 0.2.30
+version: 0.2.31
 appVersion: "18.0"
 keywords:
   - PostgreSQL
