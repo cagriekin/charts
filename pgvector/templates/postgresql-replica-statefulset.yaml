@@ -36,47 +36,6 @@ spec:
       securityContext:
         fsGroup: 999
       initContainers:
-        {{- if .Values.postgresql.repmgr.enabled }}
-        - name: repmgr-init
-          image: {{ .Values.postgresql.repmgr.image.registry }}/{{ .Values.postgresql.repmgr.image.repository }}:{{ .Values.postgresql.repmgr.image.tag }}
-          imagePullPolicy: {{ .Values.postgresql.repmgr.image.pullPolicy }}
-          command:
-            - /bin/bash
-            - -c
-            - |
-              POD_NAME=$(hostname)
-              ORDINAL=$(echo $POD_NAME | sed 's/.*-\([0-9]*\)$/\1/')
-              NODE_ID=$(({{ .Values.postgresql.repmgr.nodeId }} + 1 + ${ORDINAL:-0}))
-              export NODE_ID
-              exec /usr/local/bin/entrypoint.sh init
-          env:
-            - name: NODE_TYPE
-              value: "standby"
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: UPSTREAM_NODE_ID
-              value: {{ .Values.postgresql.repmgr.nodeId | quote }}
-            - name: UPSTREAM_HOST
-              value: {{ printf "%s-postgresql-master.%s.svc.cluster.local" (include "pgvector.fullname" .) .Release.Namespace | quote }}
-            - name: CLUSTER_NAME
-              value: {{ .Values.postgresql.repmgr.clusterName | quote }}
-            - name: REPMGR_DB
-              value: {{ .Values.postgresql.repmgr.db | quote }}
-            - name: REPMGR_USER
-              value: {{ .Values.postgresql.repmgr.user | quote }}
-            - name: REPMGR_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pgvector.postgresql.repmgr.secretName" . }}
-                  key: repmgr-password
-          volumeMounts:
-            - name: postgresql-data
-              mountPath: /var/lib/postgresql/data
-            - name: repmgr-config
-              mountPath: /etc/repmgr
-        {{- end }}
         - name: init-replica
           image: {{ .Values.postgresql.image.registry }}/{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
@@ -149,6 +108,47 @@ spec:
           volumeMounts:
             - name: postgresql-data
               mountPath: /var/lib/postgresql/data
+        {{- if .Values.postgresql.repmgr.enabled }}
+        - name: repmgr-init
+          image: {{ .Values.postgresql.repmgr.image.registry }}/{{ .Values.postgresql.repmgr.image.repository }}:{{ .Values.postgresql.repmgr.image.tag }}
+          imagePullPolicy: {{ .Values.postgresql.repmgr.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              POD_NAME=$(hostname)
+              ORDINAL=$(echo $POD_NAME | sed 's/.*-\([0-9]*\)$/\1/')
+              NODE_ID=$(({{ .Values.postgresql.repmgr.nodeId }} + 1 + ${ORDINAL:-0}))
+              export NODE_ID
+              exec /usr/local/bin/entrypoint.sh init
+          env:
+            - name: NODE_TYPE
+              value: "standby"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: UPSTREAM_NODE_ID
+              value: {{ .Values.postgresql.repmgr.nodeId | quote }}
+            - name: UPSTREAM_HOST
+              value: {{ printf "%s-postgresql-master.%s.svc.cluster.local" (include "pgvector.fullname" .) .Release.Namespace | quote }}
+            - name: CLUSTER_NAME
+              value: {{ .Values.postgresql.repmgr.clusterName | quote }}
+            - name: REPMGR_DB
+              value: {{ .Values.postgresql.repmgr.db | quote }}
+            - name: REPMGR_USER
+              value: {{ .Values.postgresql.repmgr.user | quote }}
+            - name: REPMGR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.repmgr.secretName" . }}
+                  key: repmgr-password
+          volumeMounts:
+            - name: postgresql-data
+              mountPath: /var/lib/postgresql/data
+            - name: repmgr-config
+              mountPath: /etc/repmgr
+        {{- end }}
       containers:
         - name: postgresql-replica
           image: {{ .Values.postgresql.image.registry }}/{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}
