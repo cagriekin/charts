@@ -160,7 +160,7 @@ spec:
             - name: postgresql-config
               mountPath: /etc/postgresql
         {{- if .Values.postgresql.repmgr.enabled }}
-        - name: repmgr-init
+        - name: repmgr
           image: {{ .Values.postgresql.repmgr.image.registry }}/{{ .Values.postgresql.repmgr.image.repository }}:{{ .Values.postgresql.repmgr.image.tag }}
           imagePullPolicy: {{ .Values.postgresql.repmgr.image.pullPolicy }}
           command: ["/usr/local/bin/entrypoint.sh", "init"]
