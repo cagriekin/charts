@@ -95,6 +95,31 @@ spec:
           volumeMounts:
             - name: postgresql-data
               mountPath: /var/lib/postgresql/data
+        {{- if .Values.postgresql.repmgr.enabled }}
+        - name: init-repmgr-extensions
+          image: {{ .Values.postgresql.repmgr.image.registry }}/{{ .Values.postgresql.repmgr.image.repository }}:{{ .Values.postgresql.repmgr.image.tag }}
+          imagePullPolicy: {{ .Values.postgresql.repmgr.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              # Copy repmgr extension files to shared volume
+              mkdir -p /tmp/repmgr-extensions/share/postgresql/18/extension
+              mkdir -p /tmp/repmgr-extensions/lib/postgresql/18/lib
+
+              # Copy extension files
+              cp -r /usr/share/postgresql/18/extension/repmgr* /tmp/repmgr-extensions/share/postgresql/18/extension/ 2>/dev/null || true
+
+              # Copy shared library files
+              cp -r /usr/lib/postgresql/18/lib/repmgr* /tmp/repmgr-extensions/lib/postgresql/18/lib/ 2>/dev/null || true
+
+              # Copy control files if they exist
+              cp -r /usr/share/postgresql/18/extension/repmgr.control /tmp/repmgr-extensions/share/postgresql/18/extension/ 2>/dev/null || true
+          volumeMounts:
+            - name: repmgr-extensions
+              mountPath: /tmp/repmgr-extensions
+        {{- end }}
       containers:
         - name: postgresql-master
           image: {{ .Values.postgresql.image.registry }}/{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}
@@ -148,6 +173,9 @@ spec:
                     psql -U "${POSTGRES_USER}" -d postgres -tc "SELECT 1 FROM pg_roles WHERE rolname = '${REPLICATION_USER}'" | grep -q 1 || psql -U "${POSTGRES_USER}" -d postgres -c "CREATE USER ${REPLICATION_USER} WITH REPLICATION PASSWORD '${REPLICATION_PASSWORD}';"
                     psql -U "${POSTGRES_USER}" -d postgres -c "ALTER USER ${REPLICATION_USER} WITH PASSWORD '${REPLICATION_PASSWORD}';"
                     psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -tc "SELECT 1 FROM pg_available_extensions WHERE name = 'vector'" | grep -q 1 && psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "CREATE EXTENSION IF NOT EXISTS vector;" || true
+                    {{- if .Values.postgresql.repmgr.enabled }}
+                    psql -U "${POSTGRES_USER}" -d "{{ .Values.postgresql.repmgr.db }}" -tc "SELECT 1 FROM pg_available_extensions WHERE name = 'repmgr'" | grep -q 1 && psql -U "${POSTGRES_USER}" -d "{{ .Values.postgresql.repmgr.db }}" -c "CREATE EXTENSION IF NOT EXISTS repmgr;" || true
+                    {{- end }}
           ports:
             - name: postgresql
               containerPort: 5432
@@ -159,6 +187,14 @@ spec:
               mountPath: /var/lib/postgresql/data
             - name: postgresql-config
               mountPath: /etc/postgresql
+            {{- if .Values.postgresql.repmgr.enabled }}
+            - name: repmgr-extensions
+              mountPath: /usr/share/postgresql/18/extension
+              readOnly: true
+            - name: repmgr-extensions
+              mountPath: /usr/lib/postgresql/18/lib
+              readOnly: true
+            {{- end }}
         {{- if .Values.postgresql.repmgr.enabled }}
         - name: repmgr
           image: {{ .Values.postgresql.repmgr.image.registry }}/{{ .Values.postgresql.repmgr.image.repository }}:{{ .Values.postgresql.repmgr.image.tag }}
@@ -267,6 +303,8 @@ spec:
         - name: repmgr-config
           emptyDir: {}
         - name: repmgr-logs
+          emptyDir: {}
+        - name: repmgr-extensions
           emptyDir: {}
         {{- end }}
         {{- if not .Values.postgresql.master.persistence.enabled }}
