@@ -25,9 +25,13 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "pgvector.serviceAccountName" . }}
-      {{- with .Values.postgresql.imagePullSecrets }}
+      {{- $imagePullSecrets := .Values.postgresql.imagePullSecrets | default list }}
+      {{- if and .Values.postgresql.repmgr.enabled .Values.postgresql.repmgr.imagePullSecrets }}
+      {{- $imagePullSecrets = concat $imagePullSecrets .Values.postgresql.repmgr.imagePullSecrets }}
+      {{- end }}
+      {{- if $imagePullSecrets }}
       imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml $imagePullSecrets | nindent 8 }}
       {{- end }}
       securityContext:
         fsGroup: 999
