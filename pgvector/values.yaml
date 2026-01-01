@@ -132,6 +132,35 @@ postgresql:
     affinity: {}
     tolerations: []
     podAnnotations: {}
+  repmgr:
+    enabled: false
+    image:
+      registry: docker.io
+      repository: cagriekin/repmgr
+      tag: "trixie-5.5.0-rc1"
+      pullPolicy: IfNotPresent
+    clusterName: "pgvector-cluster"
+    db: "repmgr"
+    user: "repmgr"
+    password: ""
+    existingSecret: ""
+    nodeId: 1
+    monitoringInterval: 2
+    reconnectAttempts: 6
+    reconnectInterval: 10
+    witness:
+      enabled: false
+      nodeId: 999
+    serviceUpdater:
+      enabled: true
+      monitoringInterval: 30
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 100m
+          memory: 128Mi
 
 monitoring:
   exporter:

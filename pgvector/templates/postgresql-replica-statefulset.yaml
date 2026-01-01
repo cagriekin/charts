@@ -32,6 +32,47 @@ spec:
       securityContext:
         fsGroup: 999
       initContainers:
+        {{- if .Values.postgresql.repmgr.enabled }}
+        - name: repmgr-init
+          image: {{ .Values.postgresql.repmgr.image.registry }}/{{ .Values.postgresql.repmgr.image.repository }}:{{ .Values.postgresql.repmgr.image.tag }}
+          imagePullPolicy: {{ .Values.postgresql.repmgr.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              POD_NAME=$(hostname)
+              ORDINAL=$(echo $POD_NAME | sed 's/.*-\([0-9]*\)$/\1/')
+              NODE_ID=$(({{ .Values.postgresql.repmgr.nodeId }} + 1 + ${ORDINAL:-0}))
+              export NODE_ID
+              exec /usr/local/bin/entrypoint.sh init
+          env:
+            - name: NODE_TYPE
+              value: "standby"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: UPSTREAM_NODE_ID
+              value: {{ .Values.postgresql.repmgr.nodeId | quote }}
+            - name: UPSTREAM_HOST
+              value: {{ printf "%s-postgresql-master.%s.svc.cluster.local" (include "pgvector.fullname" .) .Release.Namespace | quote }}
+            - name: CLUSTER_NAME
+              value: {{ .Values.postgresql.repmgr.clusterName | quote }}
+            - name: REPMGR_DB
+              value: {{ .Values.postgresql.repmgr.db | quote }}
+            - name: REPMGR_USER
+              value: {{ .Values.postgresql.repmgr.user | quote }}
+            - name: REPMGR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.repmgr.secretName" . }}
+                  key: repmgr-password
+          volumeMounts:
+            - name: postgresql-data
+              mountPath: /var/lib/postgresql/data
+            - name: repmgr-config
+              mountPath: /etc/repmgr
+        {{- end }}
         - name: init-replica
           image: {{ .Values.postgresql.image.registry }}/{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
@@ -142,10 +183,75 @@ spec:
               mountPath: /var/lib/postgresql/data
             - name: postgresql-config
               mountPath: /etc/postgresql
+        {{- if .Values.postgresql.repmgr.enabled }}
+        - name: repmgrd
+          image: {{ .Values.postgresql.repmgr.image.registry }}/{{ .Values.postgresql.repmgr.image.repository }}:{{ .Values.postgresql.repmgr.image.tag }}
+          imagePullPolicy: {{ .Values.postgresql.repmgr.image.pullPolicy }}
+          command: ["/usr/local/bin/entrypoint.sh", "repmgrd"]
+          env:
+            - name: REPMGR_DB
+              value: {{ .Values.postgresql.repmgr.db | quote }}
+            - name: REPMGR_USER
+              value: {{ .Values.postgresql.repmgr.user | quote }}
+            - name: REPMGR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.repmgr.secretName" . }}
+                  key: repmgr-password
+          volumeMounts:
+            - name: postgresql-data
+              mountPath: /var/lib/postgresql/data
+            - name: repmgr-config
+              mountPath: /etc/repmgr
+            - name: repmgr-logs
+              mountPath: /var/log/repmgr
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+        {{- if .Values.postgresql.repmgr.serviceUpdater.enabled }}
+        - name: service-updater
+          image: {{ .Values.postgresql.repmgr.image.registry }}/{{ .Values.postgresql.repmgr.image.repository }}:{{ .Values.postgresql.repmgr.image.tag }}
+          imagePullPolicy: {{ .Values.postgresql.repmgr.image.pullPolicy }}
+          command: ["/usr/local/bin/entrypoint.sh", "service-updater"]
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MASTER_SERVICE
+              value: {{ printf "%s-postgresql-master" (include "pgvector.fullname" .) | quote }}
+            - name: REPMGR_DB
+              value: {{ .Values.postgresql.repmgr.db | quote }}
+            - name: REPMGR_USER
+              value: {{ .Values.postgresql.repmgr.user | quote }}
+            - name: REPMGR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pgvector.postgresql.repmgr.secretName" . }}
+                  key: repmgr-password
+            - name: MONITORING_INTERVAL
+              value: {{ .Values.postgresql.repmgr.serviceUpdater.monitoringInterval | quote }}
+          volumeMounts:
+            - name: repmgr-config
+              mountPath: /etc/repmgr
+          resources:
+            {{- toYaml .Values.postgresql.repmgr.serviceUpdater.resources | nindent 12 }}
+        {{- end }}
+        {{- end }}
       volumes:
         - name: postgresql-config
           configMap:
             name: {{ include "pgvector.fullname" . }}-postgresql-replica-config
+        {{- if .Values.postgresql.repmgr.enabled }}
+        - name: repmgr-config
+          emptyDir: {}
+        - name: repmgr-logs
+          emptyDir: {}
+        {{- end }}
         {{- if not .Values.postgresql.replica.persistence.enabled }}
         - name: postgresql-data
           emptyDir: {}
