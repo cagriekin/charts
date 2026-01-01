@@ -12,6 +12,7 @@ Standalone Helm chart for deploying PostgreSQL with the pgvector extension. The 
 - Optional NetworkPolicies with configurable ingress and egress rules
 - Optional S3-based backup CronJob with automated retention pruning
 - Optional Pod Disruption Budgets for high availability during cluster maintenance
+- Optional repmgr (Replication Manager) for automatic failover and replica promotion
 - Secrets populated with ready-to-use connection strings for each endpoint
 
 ## Installation
@@ -214,6 +215,30 @@ backup:
 | `postgresql.haproxy.tolerations` | Tolerations for HAProxy pods | `[]` |
 | `postgresql.haproxy.podAnnotations` | Extra annotations for HAProxy pods | `{}` |
 
+### Repmgr (Automatic Failover)
+
+| Key | Description | Default |
+| --- | --- | --- |
+| `postgresql.repmgr.enabled` | Enable repmgr for automatic failover | `false` |
+| `postgresql.repmgr.image.registry` | Container registry for repmgr image | `docker.io` |
+| `postgresql.repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
+| `postgresql.repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-rc1` |
+| `postgresql.repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
+| `postgresql.repmgr.clusterName` | Name of the repmgr cluster | `pgvector-cluster` |
+| `postgresql.repmgr.db` | Repmgr database name | `repmgr` |
+| `postgresql.repmgr.user` | Repmgr user | `repmgr` |
+| `postgresql.repmgr.password` | Repmgr password (auto-generated when empty) | `""` |
+| `postgresql.repmgr.existingSecret` | Use an existing secret for repmgr credentials (must define `repmgr-password`) | `""` |
+| `postgresql.repmgr.nodeId` | Starting node ID for master | `1` |
+| `postgresql.repmgr.monitoringInterval` | Seconds between repmgrd health checks | `2` |
+| `postgresql.repmgr.reconnectAttempts` | Number of reconnection attempts | `6` |
+| `postgresql.repmgr.reconnectInterval` | Seconds between reconnection attempts | `10` |
+| `postgresql.repmgr.witness.enabled` | Enable witness server for quorum decisions | `false` |
+| `postgresql.repmgr.witness.nodeId` | Node ID for witness server | `999` |
+| `postgresql.repmgr.serviceUpdater.enabled` | Enable Kubernetes service updater sidecar | `true` |
+| `postgresql.repmgr.serviceUpdater.monitoringInterval` | Seconds between service checks | `30` |
+| `postgresql.repmgr.serviceUpdater.resources` | Resource requests and limits for service updater | `{cpu: 50m/100m, memory: 64Mi/128Mi}` |
+
 ### Monitoring
 
 | Key | Description | Default |
@@ -272,3 +297,117 @@ backup:
 Secret `<release-name>-postgresql-secret` (or the secret referenced by `postgresql.existingSecret`) contains the password and connection strings for the direct PostgreSQL, PgBouncer, and HAProxy endpoints. Retrieve them with `kubectl get secret ... -o jsonpath=...`. When `postgresql.existingSecret` is provided, the chart also creates `<release-name>-postgresql-url` containing the constructed `postgres-url` key if one is not already present.
 
 If backups are enabled and `backup.s3.existingSecret` is left empty, the chart creates secret `<release-name>-backup` containing the AWS credentials.
+
+## Repmgr Automatic Failover
+
+repmgr (Replication Manager) provides automatic failover capabilities for PostgreSQL replication clusters. When enabled, repmgr monitors the primary node and automatically promotes a standby replica to primary when failures are detected.
+
+### How It Works
+
+The repmgr implementation uses the `docker.io/cagriekin/repmgr:trixie-5.5.0-rc1` Docker image, which includes PostgreSQL 18 and repmgr 5.5.0-rc1. The system consists of three components:
+
+1. **Init Container**: Registers master and replica nodes with the repmgr cluster during pod initialization
+2. **repmgrd Sidecar**: Runs the repmgr daemon continuously, monitoring cluster health and performing automatic failover
+3. **Service Updater Sidecar**: Updates Kubernetes service selectors when failover occurs, ensuring traffic routes to the new primary
+
+### Enabling Repmgr
+
+```yaml
+postgresql:
+  repmgr:
+    enabled: true
+    clusterName: "my-postgres-cluster"
+    nodeId: 1
+    serviceUpdater:
+      enabled: true
+```
+
+### Witness Server (Recommended for Production)
+
+A witness server provides quorum for failover decisions and helps prevent split-brain scenarios:
+
+```yaml
+postgresql:
+  repmgr:
+    enabled: true
+    witness:
+      enabled: true
+      nodeId: 999
+```
+
+### Failover Process
+
+1. repmgrd daemon detects primary failure through health checks
+2. repmgrd selects the best standby candidate based on replication lag
+3. repmgrd promotes the standby to primary using `repmgr standby promote`
+4. repmgr updates cluster metadata
+5. Service updater sidecar detects the promotion
+6. Service updater patches the master service selector to point to the promoted pod
+7. Remaining replicas automatically reconnect to the new primary via repmgr's follow command
+
+### Checking Cluster Status
+
+```bash
+# View cluster status
+kubectl exec <master-pod-name> -- repmgr cluster show
+
+# Check node status
+kubectl exec <pod-name> -- repmgr node status
+```
+
+### Manual Failover
+
+If needed, you can manually promote a standby:
+
+```bash
+kubectl exec <standby-pod-name> -- repmgr standby promote
+```
+
+### Troubleshooting
+
+**Issue: Repmgr not detecting failures**
+
+- Check repmgrd logs: `kubectl logs <pod-name> -c repmgrd`
+- Verify repmgr configuration: `kubectl exec <pod-name> -- cat /etc/repmgr/repmgr.conf`
+- Ensure PostgreSQL has repmgr extension loaded: Check `shared_preload_libraries` includes `repmgr`
+
+**Issue: Service selector not updating**
+
+- Check service updater logs: `kubectl logs <pod-name> -c service-updater`
+- Verify RBAC permissions: `kubectl get role <release-name>-repmgr-service-updater`
+- Check service updater has access to update services
+
+**Issue: Replicas not following new primary**
+
+- Verify repmgr cluster status shows correct primary
+- Check replica logs for connection errors
+- Ensure `primary_conninfo` is updated (repmgr handles this automatically)
+
+### Recovery Procedures
+
+**Rejoining a failed master:**
+
+After the original master recovers, it can be rejoined as a replica:
+
+```bash
+kubectl exec <old-master-pod> -- repmgr node rejoin
+```
+
+**Resetting cluster state:**
+
+If cluster state becomes inconsistent, you may need to re-register nodes:
+
+```bash
+# On the current primary
+kubectl exec <primary-pod> -- repmgr primary register --force
+
+# On replicas
+kubectl exec <replica-pod> -- repmgr standby register --force
+```
+
+### Limitations
+
+- Node IDs for replicas are currently set to master node ID + 1. For multiple replicas, ensure unique node IDs are configured
+- Service updater requires RBAC permissions to patch services
+- Witness server recommended for production to prevent split-brain scenarios
+- Initial failover may take 10-30 seconds depending on monitoring intervals
