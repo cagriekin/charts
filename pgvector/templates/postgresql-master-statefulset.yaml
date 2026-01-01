@@ -174,7 +174,14 @@ spec:
                     psql -U "${POSTGRES_USER}" -d postgres -c "ALTER USER ${REPLICATION_USER} WITH PASSWORD '${REPLICATION_PASSWORD}';"
                     psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -tc "SELECT 1 FROM pg_available_extensions WHERE name = 'vector'" | grep -q 1 && psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -c "CREATE EXTENSION IF NOT EXISTS vector;" || true
                     {{- if .Values.postgresql.repmgr.enabled }}
-                    psql -U "${POSTGRES_USER}" -d "{{ .Values.postgresql.repmgr.db }}" -tc "SELECT 1 FROM pg_available_extensions WHERE name = 'repmgr'" | grep -q 1 && psql -U "${POSTGRES_USER}" -d "{{ .Values.postgresql.repmgr.db }}" -c "CREATE EXTENSION IF NOT EXISTS repmgr;" || true
+                    echo "Checking for repmgr extension availability..."
+                    if psql -U "${POSTGRES_USER}" -d "{{ .Values.postgresql.repmgr.db }}" -tc "SELECT 1 FROM pg_available_extensions WHERE name = 'repmgr'" | grep -q 1; then
+                      echo "Repmgr extension available, creating..."
+                      psql -U "${POSTGRES_USER}" -d "{{ .Values.postgresql.repmgr.db }}" -c "CREATE EXTENSION IF NOT EXISTS repmgr;" && echo "Repmgr extension created successfully" || echo "Failed to create repmgr extension"
+                    else
+                      echo "Repmgr extension not available in pg_available_extensions"
+                      ls -la /usr/share/postgresql/18/extension/ | grep repmgr || echo "No repmgr files found in extension directory"
+                    fi
                     {{- end }}
           ports:
             - name: postgresql
