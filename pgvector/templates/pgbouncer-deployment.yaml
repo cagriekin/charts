@@ -92,8 +92,7 @@ spec:
               reserve_pool_size = 1
               reserve_pool_timeout = 5.0
               server_round_robin = 1
-              ignore_startup_parameters = extra_float_digits
-              prepared_statements = no
+              ignore_startup_parameters = extra_float_digits,prepare_threshold
               log_connections = 1
               log_disconnections = 1
               log_pooler_errors = 1
