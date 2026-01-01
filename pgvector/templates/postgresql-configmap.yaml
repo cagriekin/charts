@@ -23,6 +23,9 @@ data:
     wal_keep_size = {{ .Values.postgresql.postgresConfig.wal_keep_size }}
     hot_standby = {{ .Values.postgresql.postgresConfig.hot_standby }}
     hot_standby_feedback = {{ .Values.postgresql.postgresConfig.hot_standby_feedback }}
+    {{- if .Values.postgresql.repmgr.enabled }}
+    shared_preload_libraries = 'repmgr'
+    {{- end }}
     random_page_cost = 1.1
     effective_io_concurrency = 200
     work_mem = 4MB
