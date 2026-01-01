@@ -220,6 +220,7 @@ backup:
 | Key | Description | Default |
 | --- | --- | --- |
 | `postgresql.repmgr.enabled` | Enable repmgr for automatic failover | `false` |
+| `postgresql.repmgr.imagePullSecrets` | Image pull secrets for repmgr containers | `[]` |
 | `postgresql.repmgr.image.registry` | Container registry for repmgr image | `docker.io` |
 | `postgresql.repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
 | `postgresql.repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-rc1` |
