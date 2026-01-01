@@ -20,9 +20,13 @@ spec:
         app.kubernetes.io/component: repmgr-witness
     spec:
       serviceAccountName: {{ include "pgvector.serviceAccountName" . }}
-      {{- with .Values.postgresql.imagePullSecrets }}
+      {{- $imagePullSecrets := .Values.postgresql.imagePullSecrets | default list }}
+      {{- if .Values.postgresql.repmgr.imagePullSecrets }}
+      {{- $imagePullSecrets = concat $imagePullSecrets .Values.postgresql.repmgr.imagePullSecrets }}
+      {{- end }}
+      {{- if $imagePullSecrets }}
       imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml $imagePullSecrets | nindent 8 }}
       {{- end }}
       initContainers:
         - name: repmgr-init
