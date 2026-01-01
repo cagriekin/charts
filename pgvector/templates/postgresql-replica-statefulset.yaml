@@ -117,21 +117,30 @@ spec:
             - -c
             - |
               set -e
-              # Copy repmgr extension files to shared volume
-              mkdir -p /tmp/repmgr-extensions/share/postgresql/18/extension
-              mkdir -p /tmp/repmgr-extensions/lib/postgresql/18/lib
+              # Copy repmgr extension files to shared volumes
+              echo "Checking for repmgr files in source locations..."
+              ls -la /usr/share/postgresql/18/extension/ | grep repmgr || echo "No repmgr files in /usr/share/postgresql/18/extension/"
+              ls -la /usr/lib/postgresql/18/lib/ | grep repmgr || echo "No repmgr libs in /usr/lib/postgresql/18/lib/"
 
-              # Copy extension files
-              cp -r /usr/share/postgresql/18/extension/repmgr* /tmp/repmgr-extensions/share/postgresql/18/extension/ 2>/dev/null || true
+              # Copy extension files (volume mounted at /usr/share/postgresql/18/extension)
+              echo "Copying extension files..."
+              cp -rv /usr/share/postgresql/18/extension/repmgr* /tmp/repmgr-extensions/ 2>/dev/null || echo "Failed to copy extension files"
 
-              # Copy shared library files
-              cp -r /usr/lib/postgresql/18/lib/repmgr* /tmp/repmgr-extensions/lib/postgresql/18/lib/ 2>/dev/null || true
+              # Copy shared library files (volume mounted at /usr/lib/postgresql/18/lib)
+              echo "Copying shared library files..."
+              cp -rv /usr/lib/postgresql/18/lib/repmgr* /tmp/repmgr-libs/ 2>/dev/null || echo "Failed to copy library files"
 
-              # Copy control files if they exist
-              cp -r /usr/share/postgresql/18/extension/repmgr.control /tmp/repmgr-extensions/share/postgresql/18/extension/ 2>/dev/null || true
+              echo "Contents of extension volume:"
+              find /tmp/repmgr-extensions -name "*repmgr*" -type f || echo "No repmgr files found in extension volume"
+              echo "Contents of library volume:"
+              find /tmp/repmgr-libs -name "*repmgr*" -type f || echo "No repmgr files found in library volume"
+
+              echo "Repmgr extension file copy completed"
           volumeMounts:
             - name: repmgr-extensions
               mountPath: /tmp/repmgr-extensions
+            - name: repmgr-libs
+              mountPath: /tmp/repmgr-libs
         {{- end }}
       containers:
         - name: postgresql-replica
@@ -175,7 +184,7 @@ spec:
             - name: repmgr-extensions
               mountPath: /usr/share/postgresql/18/extension
               readOnly: true
-            - name: repmgr-extensions
+            - name: repmgr-libs
               mountPath: /usr/lib/postgresql/18/lib
               readOnly: true
             {{- end }}
@@ -299,6 +308,8 @@ spec:
         - name: repmgr-logs
           emptyDir: {}
         - name: repmgr-extensions
+          emptyDir: {}
+        - name: repmgr-libs
           emptyDir: {}
         {{- end }}
         {{- if not .Values.postgresql.replica.persistence.enabled }}
