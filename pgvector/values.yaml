@@ -138,7 +138,7 @@ postgresql:
     image:
       registry: docker.io
       repository: cagriekin/repmgr
-      tag: "trixie-5.5.0-rc2"
+      tag: "trixie-5.5.0-rc3"
       pullPolicy: IfNotPresent
     clusterName: "pgvector-cluster"
     db: "repmgr"

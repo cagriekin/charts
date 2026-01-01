@@ -181,6 +181,16 @@ spec:
                 secretKeyRef:
                   name: {{ include "pgvector.postgresql.repmgr.secretName" . }}
                   key: repmgr-password
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: postgres-user
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: postgres-password
           volumeMounts:
             - name: postgresql-data
               mountPath: /var/lib/postgresql/data
