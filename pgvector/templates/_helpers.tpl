@@ -147,3 +147,23 @@ Generate PostgreSQL connection string
 {{- printf "postgresql://%s:%s@%s:5432/%s?sslmode=disable" $user $password $host $database -}}
 {{- end -}}
 
+{{/*
+Name of the repmgr secret
+*/}}
+{{- define "pgvector.postgresql.repmgr.secretName" -}}
+{{- if .Values.postgresql.repmgr.existingSecret }}
+{{- .Values.postgresql.repmgr.existingSecret -}}
+{{- else -}}
+{{- printf "%s-postgresql-repmgr-secret" (include "pgvector.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Generate deterministic repmgr password when not provided
+*/}}
+{{- define "pgvector.postgresql.repmgr.password" -}}
+{{- $salt := "Repmgr password for PostgreSQL replication management. The path of the righteous man is beset on all sides." -}}
+{{- $input := printf "%s-%s-%s-repmgr-password" .Release.Name .Chart.Name $salt -}}
+{{- $hash := $input | sha256sum -}}
+{{- $hash | trunc 32 -}}
+{{- end -}}
