@@ -9,7 +9,8 @@ metadata:
   labels:
     {{- include "pgvector.labels" . | nindent 4 }}
     app.kubernetes.io/component: backup
-  {{- with .Values.backup.annotations }}
+  {{- $annotations := include "pgvector.annotations" (dict "global" $.Values.annotations "component" .Values.backup.annotations) | fromYaml -}}
+  {{- with $annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
@@ -25,7 +26,8 @@ spec:
           labels:
             {{- include "pgvector.selectorLabels" . | nindent 12 }}
             app.kubernetes.io/component: backup
-          {{- with .Values.backup.podAnnotations }}
+          {{- $annotations := include "pgvector.annotations" (dict "global" $.Values.annotations "component" .Values.backup.podAnnotations) | fromYaml -}}
+          {{- with $annotations }}
           annotations:
             {{- toYaml . | nindent 12 }}
           {{- end }}

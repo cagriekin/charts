@@ -167,3 +167,13 @@ Generate deterministic repmgr password when not provided
 {{- $hash := $input | sha256sum -}}
 {{- $hash | trunc 32 -}}
 {{- end -}}
+
+{{/*
+Merge global annotations with component-specific annotations
+Usage: {{ include "pgvector.annotations" (dict "global" .Values.annotations "component" .Values.someComponent.annotations) }}
+*/}}
+{{- define "pgvector.annotations" -}}
+{{- $global := .global | default dict -}}
+{{- $component := .component | default dict -}}
+{{- merge $global $component | toYaml -}}
+{{- end -}}

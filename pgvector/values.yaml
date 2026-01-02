@@ -1,6 +1,9 @@
 nameOverride: ""
 fullnameOverride: ""
 
+# Global annotations that will be added to all resources
+annotations: {}
+
 serviceAccount:
   create: true
   name: ""
