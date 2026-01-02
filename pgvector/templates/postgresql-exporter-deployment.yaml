@@ -23,7 +23,8 @@ spec:
         {{- range $key, $value := .Values.monitoring.exporter.extraLabels }}
         {{ $key }}: {{ $value | quote }}
         {{- end }}
-      {{- with .Values.monitoring.exporter.podAnnotations }}
+      {{- $annotations := include "pgvector.annotations" (dict "global" $.Values.annotations "component" .Values.monitoring.exporter.podAnnotations) | fromYaml -}}
+      {{- with $annotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
