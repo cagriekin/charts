@@ -19,7 +19,8 @@ spec:
       labels:
         {{- include "pgvector.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: postgresql-replica
-      {{- with .Values.postgresql.podAnnotations }}
+      {{- $annotations := include "pgvector.annotations" (dict "global" $.Values.annotations "component" .Values.postgresql.podAnnotations) | fromYaml -}}
+      {{- with $annotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}

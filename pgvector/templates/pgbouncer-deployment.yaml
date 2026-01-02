@@ -17,7 +17,8 @@ spec:
       labels:
         {{- include "pgvector.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: pgbouncer
-      {{- with .Values.postgresql.pgbouncer.podAnnotations }}
+      {{- $annotations := include "pgvector.annotations" (dict "global" $.Values.annotations "component" .Values.postgresql.pgbouncer.podAnnotations) | fromYaml -}}
+      {{- with $annotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
