@@ -6,7 +6,8 @@ metadata:
   labels:
     {{- include "pgvector.labels" . | nindent 4 }}
     app.kubernetes.io/component: postgresql-exporter
-  {{- with .Values.monitoring.exporter.service.annotations }}
+  {{- $annotations := include "pgvector.annotations" (dict "global" $.Values.annotations "component" .Values.monitoring.exporter.service.annotations) | fromYaml -}}
+  {{- with $annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}

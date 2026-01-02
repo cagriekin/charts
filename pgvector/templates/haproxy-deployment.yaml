@@ -17,7 +17,8 @@ spec:
       labels:
         {{- include "pgvector.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: haproxy
-      {{- with .Values.postgresql.haproxy.podAnnotations }}
+      {{- $annotations := include "pgvector.annotations" (dict "global" $.Values.annotations "component" .Values.postgresql.haproxy.podAnnotations) | fromYaml -}}
+      {{- with $annotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
