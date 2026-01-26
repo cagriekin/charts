@@ -769,6 +769,17 @@ entries:
     urls:
     - https://github.com/cagriekin/charts/releases/download/kafka-0.1.1/kafka-0.1.1.tgz
     version: 0.1.1
+  pg:
+  - apiVersion: v2
+    appVersion: "18.1"
+    created: "2026-01-26T15:39:19.057155968Z"
+    description: PostgreSQL with repmgr replication and optional ProxySQL
+    digest: 42a75ed6d0a6f77fb5321d08d172dab202d71dfb826b6a77b51029e99f4eac7f
+    name: pg
+    type: application
+    urls:
+    - https://github.com/cagriekin/charts/releases/download/pg-0.1.0/pg-0.1.0.tgz
+    version: 0.1.0
   pgvector:
   - apiVersion: v2
     appVersion: "18.0"
@@ -1719,4 +1730,4 @@ entries:
     urls:
     - https://github.com/cagriekin/charts/releases/download/pgvector-0.2.0/pgvector-0.2.0.tgz
     version: 0.2.0
-generated: "2026-01-02T14:57:05.94173439Z"
+generated: "2026-01-26T15:39:19.057357024Z"
