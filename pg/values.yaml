@@ -1,0 +1,122 @@
+postgresql:
+  image:
+    repository: postgres
+    tag: 18.1-trixie
+    pullPolicy: IfNotPresent
+
+  replicaCount: 1
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+  persistence:
+    enabled: true
+    storageClass: ""
+    size: 10Gi
+
+  database: postgres
+  username: postgres
+
+  existingSecret:
+    enabled: false
+    name: ""
+    usernameKey: username
+    passwordKey: password
+    databaseKey: database
+
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+repmgr:
+  image:
+    repository: bitnami/repmgr
+    tag: 5.4.1
+    pullPolicy: IfNotPresent
+
+  enabled: true
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+proxysql:
+  enabled: false
+
+  image:
+    repository: proxysql/proxysql
+    tag: 3.0.5-debian
+    pullPolicy: IfNotPresent
+
+  replicaCount: 1
+
+  threads: 4
+  maxConnections: 2048
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  adminUsername: admin
+  adminPassword: admin
+
+  service:
+    type: ClusterIP
+    port: 6033
+
+prometheusExporter:
+  enabled: false
+
+  image:
+    repository: quay.io/prometheuscommunity/postgres-exporter
+    tag: v0.15.0
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+  service:
+    type: ClusterIP
+    port: 9116
+    annotations: {}
+
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    additionalLabels: {}
+
+service:
+  type: ClusterIP
+  port: 5432
+
+global:
+  annotations: {}

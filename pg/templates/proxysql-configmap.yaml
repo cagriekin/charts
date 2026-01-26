@@ -1,0 +1,90 @@
+{{- if .Values.proxysql.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pg.fullname" . }}-proxysql
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+data:
+  proxysql.cnf: |
+    datadir="/var/lib/proxysql"
+
+    admin_variables=
+    {
+      admin_credentials="{{ .Values.proxysql.adminUsername }}:{{ .Values.proxysql.adminPassword }}"
+      mysql_ifaces="0.0.0.0:6032"
+    }
+
+    pgsql_variables=
+    {
+      threads={{ .Values.proxysql.threads }}
+      max_connections={{ .Values.proxysql.maxConnections }}
+      default_query_delay=0
+      default_query_timeout=36000000
+      poll_timeout=2000
+      interfaces="0.0.0.0:6033"
+      default_schema="information_schema"
+      stacksize=1048576
+      server_version="{{ index (splitList "-" .Values.postgresql.image.tag) 0 }}.0"
+      connect_timeout_server=3000
+      pgsql-monitor_username="repmgr"
+      pgsql-monitor_password=""
+      pgsql-monitor_history=600000
+      pgsql-monitor_connect_interval=60000
+      pgsql-monitor_ping_interval=10000
+      ping_interval_server_msec=120000
+      ping_timeout_server=500
+      commands_stats=true
+      sessions_sort=true
+      connect_retries_on_failure=10
+    }
+
+    pgsql_servers =
+    (
+      {{- range $i := until (int .Values.postgresql.replicaCount) }}
+      {
+        hostname="{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local"
+        port=5432
+        hostgroup_id={{ if eq $i 0 }}0{{ else }}1{{ end }}
+        max_connections=100
+      }{{ if lt $i (sub (int $.Values.postgresql.replicaCount) 1) }},{{ end }}
+      {{- end }}
+    )
+
+    pgsql_users:
+    (
+      {
+        username = "__POSTGRES_USER__"
+        password = "__POSTGRES_PASSWORD__"
+        default_hostgroup = 0
+        max_connections=1000
+        default_schema="__POSTGRES_DB__"
+        active = 1
+      }
+    )
+
+    pgsql_query_rules:
+    (
+      {
+        rule_id=1
+        active=1
+        match_pattern="^SELECT .* FOR UPDATE$"
+        destination_hostgroup=0
+        apply=1
+      },
+      {
+        rule_id=2
+        active=1
+        match_pattern="^SELECT"
+        destination_hostgroup=1
+        apply=1
+      },
+      {
+        rule_id=3
+        active=1
+        match_pattern=".*"
+        destination_hostgroup=0
+        apply=1
+      }
+    )
+{{- end }}
