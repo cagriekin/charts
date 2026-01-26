@@ -1,0 +1,89 @@
+{{- if .Values.prometheusExporter.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pg.fullname" . }}-postgres-exporter
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "pg.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgres-exporter
+  template:
+    metadata:
+      labels:
+        {{- include "pg.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: postgres-exporter
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/prometheus-exporter-configmap.yaml") . | sha256sum }}
+    spec:
+      initContainers:
+        - name: init-config
+          image: busybox:1.35
+          command:
+            - /bin/sh
+            - -c
+            - |
+              cp /config/postgres_exporter.yml /etc/postgres_exporter/postgres_exporter.yml
+              sed -i "s/__POSTGRES_USER__/$POSTGRES_USER/g" /etc/postgres_exporter/postgres_exporter.yml
+              sed -i "s/__POSTGRES_PASSWORD__/$POSTGRES_PASSWORD/g" /etc/postgres_exporter/postgres_exporter.yml
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretUsernameKey" . }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretPasswordKey" . }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: exporter-config
+              mountPath: /etc/postgres_exporter
+      containers:
+        - name: postgres-exporter
+          image: "{{ .Values.prometheusExporter.image.repository }}:{{ .Values.prometheusExporter.image.tag }}"
+          imagePullPolicy: {{ .Values.prometheusExporter.image.pullPolicy }}
+          args:
+            - --config.file=/etc/postgres_exporter/postgres_exporter.yml
+            - --web.listen-address=:9116
+            - --web.telemetry-path=/metrics
+            - --log.level=info
+          ports:
+            - name: metrics
+              containerPort: 9116
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.prometheusExporter.resources | nindent 12 }}
+          volumeMounts:
+            - name: exporter-config
+              mountPath: /etc/postgres_exporter
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "pg.fullname" . }}-postgres-exporter
+        - name: exporter-config
+          emptyDir: {}
+{{- end }}
