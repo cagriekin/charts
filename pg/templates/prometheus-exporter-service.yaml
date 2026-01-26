@@ -1,0 +1,23 @@
+{{- if .Values.prometheusExporter.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pg.fullname" . }}-postgres-exporter
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres-exporter
+  {{- with .Values.prometheusExporter.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.prometheusExporter.service.type }}
+  ports:
+    - name: metrics
+      port: {{ .Values.prometheusExporter.service.port }}
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    {{- include "pg.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres-exporter
+{{- end }}

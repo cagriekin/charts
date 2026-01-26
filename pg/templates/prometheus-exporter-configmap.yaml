@@ -1,0 +1,19 @@
+{{- if .Values.prometheusExporter.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pg.fullname" . }}-postgres-exporter
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres-exporter
+data:
+  postgres_exporter.yml: |
+    auth_modules:
+      postgres:
+        type: userpass
+        userpass:
+          username: __POSTGRES_USER__
+          password: __POSTGRES_PASSWORD__
+        options:
+          sslmode: disable
+{{- end }}
