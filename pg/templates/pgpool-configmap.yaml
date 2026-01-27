@@ -1,0 +1,101 @@
+{{- if .Values.pgpool.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pg.fullname" . }}-pgpool
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+data:
+  pgpool.conf: |
+    listen_addresses = '*'
+    port = 9999
+    socket_dir = '/tmp'
+    pcp_listen_addresses = '*'
+    pcp_port = 9898
+    pcp_socket_dir = '/tmp'
+
+    backend_hostname0 = '{{ include "pg.fullname" . }}-0.{{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local'
+    backend_port0 = 5432
+    backend_weight0 = 1
+    backend_flag0 = 'ALWAYS_PRIMARY'
+    backend_application_name0 = 'primary'
+
+    {{- range $i := until (int .Values.postgresql.replicaCount) }}
+    {{- if gt $i 0 }}
+    backend_hostname{{ $i }} = '{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local'
+    backend_port{{ $i }} = 5432
+    backend_weight{{ $i }} = 1
+    backend_flag{{ $i }} = 'DISALLOW_TO_FAILOVER'
+    backend_application_name{{ $i }} = 'replica{{ $i }}'
+
+    {{- end }}
+    {{- end }}
+
+    enable_pool_hba = on
+    pool_passwd = 'pool_passwd'
+
+    num_init_children = {{ .Values.pgpool.numInitChildren }}
+    max_pool = {{ .Values.pgpool.maxPool }}
+    child_life_time = {{ .Values.pgpool.childLifeTime }}
+    child_max_connections = 0
+    connection_life_time = {{ .Values.pgpool.connectionLifeTime }}
+    client_idle_limit = {{ .Values.pgpool.clientIdleLimit }}
+
+    connection_cache = on
+    load_balance_mode = on
+    ssl = off
+
+    failover_on_backend_error = off
+
+    log_destination = 'stderr'
+    log_line_prefix = '%t: pid %p: '
+    log_connections = {{ if .Values.pgpool.logging.logConnections }}on{{ else }}off{{ end }}
+    log_hostname = off
+    log_statement = {{ if .Values.pgpool.logging.logStatement }}on{{ else }}off{{ end }}
+    log_per_node_statement = {{ if .Values.pgpool.logging.logPerNodeStatement }}on{{ else }}off{{ end }}
+    log_client_messages = off
+    log_standby_delay = 'if_over_threshold'
+
+    syslog_facility = 'LOCAL0'
+    syslog_ident = 'pgpool'
+
+    pid_file_name = '/tmp/pgpool.pid'
+    logdir = '/tmp'
+
+    connection_pool_mode = session
+
+    sr_check_period = 0
+    sr_check_user = '__POSTGRES_USER__'
+    sr_check_password = '__POSTGRES_PASSWORD__'
+    sr_check_database = '__POSTGRES_DB__'
+
+    health_check_period = 10
+    health_check_timeout = 5
+    health_check_user = '__POSTGRES_USER__'
+    health_check_password = '__POSTGRES_PASSWORD__'
+    health_check_database = '__POSTGRES_DB__'
+    health_check_max_retries = 3
+    health_check_retry_delay = 1
+
+    failover_command = ''
+    failback_command = ''
+    fail_over_on_backend_error = off
+
+    recovery_user = '__POSTGRES_USER__'
+    recovery_password = '__POSTGRES_PASSWORD__'
+    recovery_1st_stage_command = ''
+
+    allow_clear_text_frontend_auth = on
+
+  pcp.conf: |
+    {{ .Values.pgpool.adminUsername }}:{{ .Values.pgpool.adminPassword | sha256sum }}
+
+  pool_hba.conf: |
+    local   all         all                               trust
+    host    all         all         127.0.0.1/32          trust
+    host    all         all         ::1/128               trust
+    host    all         all         0.0.0.0/0             scram-sha-256
+
+  pool_passwd: |
+    __POSTGRES_USER__:__POSTGRES_PASSWORD__
+{{- end }}

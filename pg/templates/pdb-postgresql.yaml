@@ -1,0 +1,15 @@
+{{- if .Values.postgresql.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pg.fullname" . }}
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+spec:
+  minAvailable: {{ .Values.postgresql.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "pg.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgresql
+{{- end }}
