@@ -43,6 +43,10 @@ postgresql:
     timeoutSeconds: 5
     failureThreshold: 6
 
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
 repmgr:
   image:
     repository: bitnami/repmgr
@@ -59,18 +63,26 @@ repmgr:
       cpu: 500m
       memory: 512Mi
 
-proxysql:
+pgpool:
   enabled: false
 
   image:
-    repository: proxysql/proxysql
-    tag: 3.0.5-debian
+    repository: cagriekin/pgpool
+    tag: 4.7.0
     pullPolicy: IfNotPresent
 
   replicaCount: 1
 
-  threads: 4
-  maxConnections: 2048
+  numInitChildren: 32
+  maxPool: 4
+  childLifeTime: 300
+  connectionLifeTime: 0
+  clientIdleLimit: 0
+
+  logging:
+    logConnections: false
+    logStatement: false
+    logPerNodeStatement: false
 
   resources:
     requests:
@@ -85,7 +97,11 @@ proxysql:
 
   service:
     type: ClusterIP
-    port: 6033
+    port: 9999
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
 
 prometheusExporter:
   enabled: false

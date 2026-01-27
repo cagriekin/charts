@@ -1,0 +1,22 @@
+{{- if .Values.pgpool.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pg.fullname" . }}-pgpool
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.pgpool.service.type }}
+  ports:
+    - name: pgpool
+      port: {{ .Values.pgpool.service.port }}
+      targetPort: pgpool
+      protocol: TCP
+    - name: pcp
+      port: 9898
+      targetPort: pcp
+      protocol: TCP
+  selector:
+    {{- include "pg.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: pgpool
+{{- end }}
