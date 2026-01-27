@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/component: postgresql
 spec:
   serviceName: {{ include "pg.fullname" . }}-headless
-  replicas: {{ .Values.postgresql.replicaCount }}
+  replicas: {{ max 1 .Values.postgresql.replicaCount }}
   selector:
     matchLabels:
       {{- include "pg.selectorLabels" . | nindent 6 }}
@@ -46,7 +46,7 @@ spec:
             {{- toYaml .Values.postgresql.resources | nindent 12 }}
           volumeMounts:
             - name: data
-              mountPath: /var/lib/postgresql/data
+              mountPath: /var/lib/postgresql
 {{- if not .Values.postgresql.persistence.enabled }}
       volumes:
         - name: data
