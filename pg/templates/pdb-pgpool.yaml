@@ -1,0 +1,15 @@
+{{- if and .Values.pgpool.enabled .Values.pgpool.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pg.fullname" . }}-pgpool
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgpool
+spec:
+  minAvailable: {{ .Values.pgpool.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "pg.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: pgpool
+{{- end }}

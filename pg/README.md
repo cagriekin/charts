@@ -1,12 +1,12 @@
-# PostgreSQL with repmgr and ProxySQL
+# PostgreSQL with repmgr and PGPool-II
 
-PostgreSQL Helm chart with repmgr for replication management and optional ProxySQL for query routing.
+PostgreSQL Helm chart with repmgr for replication management and optional PGPool-II for query routing.
 
 ## Features
 
 - PostgreSQL 18.1 with configurable version
 - Repmgr for automatic failover and replication management
-- Optional ProxySQL for read/write splitting
+- Optional PGPool-II for read/write splitting
 - Support for existing secrets or auto-generated passwords
 - StatefulSet-based deployment with persistent storage
 - Configurable resource limits and probes
@@ -23,12 +23,12 @@ helm install my-postgres ./pg
 helm install my-postgres ./pg --set postgresql.replicaCount=3
 ```
 
-### With ProxySQL Enabled
+### With PGPool-II Enabled
 
 ```bash
 helm install my-postgres ./pg \
   --set postgresql.replicaCount=3 \
-  --set proxysql.enabled=true
+  --set pgpool.enabled=true
 ```
 
 ### With Existing Secret
@@ -91,22 +91,28 @@ helm install my-postgres ./pg \
 | `repmgr.resources.limits.cpu` | CPU limit | `500m` |
 | `repmgr.resources.limits.memory` | Memory limit | `512Mi` |
 
-### ProxySQL Parameters
+### PGPool-II Parameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `proxysql.enabled` | Enable ProxySQL | `false` |
-| `proxysql.image.repository` | ProxySQL image repository | `proxysql/proxysql` |
-| `proxysql.image.tag` | ProxySQL image tag | `3.0.5-debian` |
-| `proxysql.replicaCount` | Number of ProxySQL instances | `1` |
-| `proxysql.threads` | Number of ProxySQL threads | `4` |
-| `proxysql.maxConnections` | Maximum connections | `2048` |
-| `proxysql.service.type` | Service type | `ClusterIP` |
-| `proxysql.service.port` | Service port | `6033` |
-| `proxysql.resources.requests.cpu` | CPU request | `100m` |
-| `proxysql.resources.requests.memory` | Memory request | `128Mi` |
-| `proxysql.resources.limits.cpu` | CPU limit | `500m` |
-| `proxysql.resources.limits.memory` | Memory limit | `512Mi` |
+| `pgpool.enabled` | Enable PGPool-II | `false` |
+| `pgpool.image.repository` | PGPool-II image repository | `cagriekin/pgpool` |
+| `pgpool.image.tag` | PGPool-II image tag | `4.7.0` |
+| `pgpool.replicaCount` | Number of PGPool-II instances | `1` |
+| `pgpool.numInitChildren` | Number of PGPool-II worker processes | `32` |
+| `pgpool.maxPool` | Max cached connections per process | `4` |
+| `pgpool.childLifeTime` | Worker process lifetime in seconds | `300` |
+| `pgpool.connectionLifeTime` | Cached connection lifetime | `0` |
+| `pgpool.clientIdleLimit` | Client idle timeout | `0` |
+| `pgpool.logging.logConnections` | Log client connections | `false` |
+| `pgpool.logging.logStatement` | Log SQL statements | `false` |
+| `pgpool.logging.logPerNodeStatement` | Log backend routing | `false` |
+| `pgpool.service.type` | Service type | `ClusterIP` |
+| `pgpool.service.port` | Service port | `9999` |
+| `pgpool.resources.requests.cpu` | CPU request | `100m` |
+| `pgpool.resources.requests.memory` | Memory request | `128Mi` |
+| `pgpool.resources.limits.cpu` | CPU limit | `500m` |
+| `pgpool.resources.limits.memory` | Memory limit | `512Mi` |
 
 ### Secret Parameters
 
@@ -138,11 +144,11 @@ kubectl port-forward svc/my-postgres 5432:5432
 psql -h localhost -U postgres -d postgres
 ```
 
-### Through ProxySQL
+### Through PGPool-II
 
 ```bash
-kubectl port-forward svc/my-postgres-proxysql 6033:6033
-psql -h localhost -p 6033 -U postgres -d postgres
+kubectl port-forward svc/my-postgres-pgpool 9999:9999
+psql -h localhost -p 9999 -U postgres -d postgres
 ```
 
 ## Replication Management
@@ -153,28 +159,31 @@ Repmgr manages replication automatically. To check cluster status:
 kubectl exec -it my-postgres-0 -- repmgr -f /etc/repmgr/repmgr.conf cluster show
 ```
 
-## ProxySQL Query Routing
+## PGPool-II Connection Pooling and Load Balancing
 
-When ProxySQL is enabled, it routes queries based on patterns using PostgreSQL-specific configuration (pgsql_servers, pgsql_users, pgsql_query_rules):
+When PGPool-II is enabled, it provides connection pooling and load balancing:
 
-Query routing rules (evaluated in order):
-1. **SELECT ... FOR UPDATE**: Routed to primary (hostgroup 0)
-2. **SELECT queries**: Routed to replicas (hostgroup 1)
-3. **All other queries** (catch-all): Routed to primary (hostgroup 0)
+**Load Balancing:**
+- PGPool-II distributes SELECT queries across primary and replica nodes
+- Write operations (INSERT, UPDATE, DELETE, DDL) are automatically routed to the primary
+- Queries within explicit transactions go to the primary to maintain consistency
 
-This ensures:
-- Write operations (INSERT, UPDATE, DELETE, etc.) go to the primary
-- Read-only SELECT queries are distributed to replicas
-- Locking reads go to the primary
-- Any other queries default to the primary
+**Connection Pooling:**
+- Reduces connection overhead by reusing database connections
+- Configurable pool size per worker process
+- Connection lifetime and idle timeout controls
 
-ProxySQL uses PostgreSQL-specific table names and configuration:
-- `pgsql_servers` for backend server configuration
-- `pgsql_users` for user authentication
-- `pgsql_query_rules` for query routing rules
-- `pgsql_variables` for ProxySQL PostgreSQL variables
+**High Availability:**
+- Monitors backend health with periodic health checks
+- Automatically detects streaming replication status
+- Fails over to replicas when primary becomes unavailable
 
-The `server_version` in ProxySQL is automatically set to match the PostgreSQL version from `postgresql.image.tag`. For example, if `postgresql.image.tag` is `18.1-trixie`, ProxySQL will use `server_version="18.1.0"`.
+Configuration options:
+- `num_init_children`: Number of worker processes
+- `max_pool`: Maximum cached connections per process
+- `child_life_time`: Worker process lifetime
+- `connection_life_time`: Connection reuse duration
+- `client_idle_limit`: Client idle timeout
 
 ## Prometheus Exporter
 

@@ -42,6 +42,24 @@ spec:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretDatabaseKey" . }}
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -c
+                  - |
+                    for i in {1..30}; do
+                      if pg_isready -U postgres > /dev/null 2>&1; then
+                        HBA_FILE=$(psql -U postgres -t -c "SHOW hba_file" | xargs)
+                        if ! grep -q "host all all 10.0.0.0/8 trust" "$HBA_FILE"; then
+                          sed -i '/host all all all scram-sha-256/i host all all 10.0.0.0/8 trust' "$HBA_FILE"
+                          psql -U postgres -c "SELECT pg_reload_conf();" > /dev/null 2>&1
+                        fi
+                        break
+                      fi
+                      sleep 1
+                    done
           resources:
             {{- toYaml .Values.postgresql.resources | nindent 12 }}
           volumeMounts:
