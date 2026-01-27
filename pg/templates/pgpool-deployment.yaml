@@ -1,0 +1,103 @@
+{{- if .Values.pgpool.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pg.fullname" . }}-pgpool
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgpool
+spec:
+  replicas: {{ .Values.pgpool.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "pg.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: pgpool
+  template:
+    metadata:
+      labels:
+        {{- include "pg.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: pgpool
+    spec:
+      initContainers:
+        - name: init-config
+          image: busybox:1.35
+          command:
+            - /bin/sh
+            - -c
+            - |
+              cp /config/pgpool.conf /usr/local/etc/pgpool.conf
+              cp /config/pcp.conf /usr/local/etc/pcp.conf
+              cp /config/pool_hba.conf /usr/local/etc/pool_hba.conf
+              cp /config/pool_passwd /usr/local/etc/pool_passwd
+              sed -i "s/__POSTGRES_USER__/$POSTGRES_USER/g" /usr/local/etc/pgpool.conf
+              sed -i "s/__POSTGRES_PASSWORD__/$POSTGRES_PASSWORD/g" /usr/local/etc/pgpool.conf
+              sed -i "s/__POSTGRES_DB__/$POSTGRES_DB/g" /usr/local/etc/pgpool.conf
+              sed -i "s/__POSTGRES_USER__/$POSTGRES_USER/g" /usr/local/etc/pool_passwd
+              sed -i "s/__POSTGRES_PASSWORD__/$POSTGRES_PASSWORD/g" /usr/local/etc/pool_passwd
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretUsernameKey" . }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretPasswordKey" . }}
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretDatabaseKey" . }}
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: pgpool-config
+              mountPath: /usr/local/etc
+      containers:
+        - name: pgpool
+          image: "{{ .Values.pgpool.image.repository }}:{{ .Values.pgpool.image.tag }}"
+          imagePullPolicy: {{ .Values.pgpool.image.pullPolicy }}
+          command:
+            - pgpool
+            - -n
+            - -f
+            - /usr/local/etc/pgpool.conf
+            - -F
+            - /usr/local/etc/pcp.conf
+            - -a
+            - /usr/local/etc/pool_hba.conf
+          ports:
+            - name: pgpool
+              containerPort: 9999
+              protocol: TCP
+            - name: pcp
+              containerPort: 9898
+              protocol: TCP
+          livenessProbe:
+            tcpSocket:
+              port: 9999
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            tcpSocket:
+              port: 9999
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.pgpool.resources | nindent 12 }}
+          volumeMounts:
+            - name: pgpool-config
+              mountPath: /usr/local/etc
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "pg.fullname" . }}-pgpool
+        - name: pgpool-config
+          emptyDir: {}
+{{- end }}
