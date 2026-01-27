@@ -1,414 +1,105 @@
-# PGVector
+# PostgreSQL with pgvector
 
-Standalone Helm chart for deploying PostgreSQL with the pgvector extension. The chart provisions a primary/replica topology, optional PgBouncer connection pooling, and optional HAProxy routing for simplified client access.
+PostgreSQL Helm chart with pgvector extension for vector similarity search and optional PGPool-II for connection pooling.
 
 ## Features
 
-- PostgreSQL master/replica StatefulSets using the `pgvector/pgvector` image
-- Deterministic password generation when no password is supplied
-- Optional PgBouncer deployment and service for connection pooling
-- Optional HAProxy deployment and service that can front either PgBouncer or PostgreSQL directly
-- Optional Prometheus exporter for PostgreSQL metrics
-- Optional NetworkPolicies with configurable ingress and egress rules
-- Optional S3-based backup CronJob with automated retention pruning
-- Optional Pod Disruption Budgets for high availability during cluster maintenance
-- Optional repmgr (Replication Manager) for automatic failover and replica promotion
-- Secrets populated with ready-to-use connection strings for each endpoint
+- PostgreSQL 18.1 with pgvector extension
+- Vector similarity search capabilities
+- Optional PGPool-II for connection pooling and load balancing
+- Support for existing secrets or auto-generated passwords
+- StatefulSet-based deployment with persistent storage
+- Configurable resource limits and probes
+- Optional Prometheus exporter with ServiceMonitor support
 
 ## Installation
 
 ```bash
-helm install my-release ./pgvector --namespace data --create-namespace
+helm install my-pgvector ./pgvector
 ```
 
-Override any value by providing a custom `values.yaml` or with `--set` flags.
+### With Multiple Replicas
 
-## Minimal Configurations
-
-### PostgreSQL Only
-
-Disables PgBouncer, HAProxy, and other optional components while leaving credential generation to the chart.
-
-```yaml
-postgresql:
-  pgbouncer:
-    enabled: false
-  haproxy:
-    enabled: false
-monitoring:
-  exporter:
-    enabled: false
-backup:
-  enabled: false
+```bash
+helm install my-pgvector ./pgvector --set postgresql.replicaCount=3
 ```
 
-### PostgreSQL with PgBouncer
+### With PGPool-II Enabled
 
-Keeps HAProxy disabled so clients connect straight to PgBouncer’s pooled endpoint.
-
-```yaml
-postgresql:
-  pgbouncer:
-    enabled: true
-  haproxy:
-    enabled: false
+```bash
+helm install my-pgvector ./pgvector \
+  --set postgresql.replicaCount=3 \
+  --set pgpool.enabled=true
 ```
 
-### PostgreSQL with HAProxy (No PgBouncer)
+### With Existing Secret
 
-Routes traffic through HAProxy directly to the primary and replicas.
+```bash
+kubectl create secret generic pg-secret \
+  --from-literal=username=myuser \
+  --from-literal=password=mypassword \
+  --from-literal=database=mydb
 
-```yaml
-postgresql:
-  pgbouncer:
-    enabled: false
-  haproxy:
-    enabled: true
-    readReplicaRouting:
-      enabled: true
-      replicaPercentage: 50
+helm install my-pgvector ./pgvector \
+  --set postgresql.existingSecret.enabled=true \
+  --set postgresql.existingSecret.name=pg-secret
 ```
 
-### PostgreSQL, PgBouncer, and HAProxy
+## Using pgvector
 
-HAProxy fronts PgBouncer, preserving pooled connections while exposing a stable endpoint.
+After installation, connect to PostgreSQL and the vector extension will be automatically created:
 
-```yaml
-postgresql:
-  pgbouncer:
-    enabled: true
-  haproxy:
-    enabled: true
+```sql
+-- The extension is already created via CREATE EXTENSION IF NOT EXISTS vector;
+-- You can start using vector types immediately
+
+-- Create a table with vector column
+CREATE TABLE items (
+  id SERIAL PRIMARY KEY,
+  embedding vector(1536)
+);
+
+-- Insert vectors
+INSERT INTO items (embedding) VALUES ('[1,2,3,...]');
+
+-- Find similar vectors
+SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 ```
 
-### Backups and Monitoring
+## Configuration
 
-Enables the Prometheus exporter and scheduled S3 backups using inline credentials. For production, prefer referencing an existing secret with `backup.s3.existingSecret`.
+This chart extends the base PostgreSQL chart. See the [pg chart documentation](../pg/README.md) for full configuration options.
 
-```yaml
-monitoring:
-  exporter:
-    enabled: true
+### Key Parameters
 
-backup:
-  enabled: true
-  schedule: "0 2 * * *"
-  s3:
-    bucket: your-bucket
-    region: us-east-1
-    accessKey: YOUR_ACCESS_KEY
-    secretKey: YOUR_SECRET_KEY
-```
-
-## Component Interactions
-
-- PgBouncer, when enabled, connects directly to the PostgreSQL primary service.
-- HAProxy, when enabled alongside PgBouncer, routes traffic to PgBouncer.
-- HAProxy, when enabled without PgBouncer, balances connections across the PostgreSQL master service and optional replica service according to the configured weights.
-
-## Values
-
-### General
-
-| Key | Description | Default |
-| --- | --- | --- |
-| `nameOverride` | Override the generated name | `""` |
-| `fullnameOverride` | Override the fully qualified release name | `""` |
-| `serviceAccount.create` | Create a dedicated service account | `true` |
-| `serviceAccount.name` | Name of the service account to use | `""` |
-| `serviceAccount.annotations` | Extra annotations for the service account | `{}` |
-| `rbac.create` | Create Role and RoleBinding resources | `true` |
-| `rbac.rules` | Custom RBAC rules (overrides defaults when non-empty) | `[]` |
-| `networkPolicy.enabled` | Create NetworkPolicies for chart components | `false` |
-| `networkPolicy.allowNamespaces` | Additional namespaces allowed to access the services | `[]` |
-| `networkPolicy.allowCIDRs` | Additional CIDR blocks allowed to access the services | `[]` |
-| `networkPolicy.extraIngress` | Additional custom ingress rules appended verbatim | `[]` |
-| `networkPolicy.extraEgress` | Additional custom egress rules appended verbatim | `[]` |
-
-### PostgreSQL Core
-
-| Key | Description | Default |
-| --- | --- | --- |
-| `postgresql.enabled` | Deploy PostgreSQL resources | `true` |
-| `postgresql.image.registry` | Container registry for PostgreSQL image | `docker.io` |
+| Parameter | Description | Default |
+|-----------|-------------|---------|
 | `postgresql.image.repository` | PostgreSQL image repository | `pgvector/pgvector` |
 | `postgresql.image.tag` | PostgreSQL image tag | `pg18-trixie` |
-| `postgresql.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `postgresql.imagePullSecrets` | Image pull secrets for PostgreSQL master and replica | `[]` |
-| `postgresql.pgbouncer.imagePullSecrets` | Image pull secrets for PgBouncer | `[]` |
-| `postgresql.haproxy.imagePullSecrets` | Image pull secrets for HAProxy | `[]` |
-| `monitoring.exporter.imagePullSecrets` | Image pull secrets for PostgreSQL exporter | `[]` |
-| `postgresql.postgresUser` | Database superuser name | `postgres` |
-| `postgresql.postgresPassword` | Database superuser password (auto-generated when empty) | `""` |
-| `postgresql.existingSecret` | Use an existing secret for database credentials (must define `postgres-user`, `postgres-password`, `postgres-database`; `postgres-url` optional) | `""` |
-| `postgresql.postgresDatabase` | Default database name | `postgres` |
-| `postgresql.postgresConfig.max_connections` | Maximum allowed connections | `100` |
-| `postgresql.postgresConfig.shared_buffers` | Shared buffer size | `256MB` |
-| `postgresql.postgresConfig.effective_cache_size` | Effective cache size | `1GB` |
-| `postgresql.postgresConfig.maintenance_work_mem` | Maintenance work memory | `64MB` |
-| `postgresql.postgresConfig.checkpoint_completion_target` | Checkpoint completion target | `0.9` |
-| `postgresql.postgresConfig.wal_buffers` | WAL buffer size | `16MB` |
-| `postgresql.postgresConfig.default_statistics_target` | Statistics target | `100` |
-| `postgresql.postgresConfig.wal_level` | WAL level | `replica` |
-| `postgresql.postgresConfig.max_wal_senders` | Maximum WAL senders | `10` |
-| `postgresql.postgresConfig.wal_keep_size` | WAL keep size | `1GB` |
-| `postgresql.postgresConfig.hot_standby` | Enable hot standby | `on` |
-| `postgresql.postgresConfig.hot_standby_feedback` | Enable hot standby feedback | `on` |
-| `postgresql.master.replicaCount` | Number of primary replicas (typically 1) | `1` |
-| `postgresql.master.persistence.enabled` | Enable persistent volume claims for primary pods | `true` |
-| `postgresql.master.persistence.size` | Persistent volume size for primary | `5Gi` |
-| `postgresql.master.persistence.storageClass` | Storage class for the primary PVC (empty uses default) | `""` |
-| `postgresql.master.persistence.accessModes` | Access modes for the primary PVC | `["ReadWriteOnce"]` |
-| `postgresql.master.resources` | Resource requests and limits for primary | `{cpu: 100m/500m, memory: 512Mi/1Gi}` |
-| `postgresql.podDisruptionBudget.enabled` | Enable Pod Disruption Budgets for high availability | `true` |
-| `postgresql.replica.replicaCount` | Number of replica pods | `2` |
-| `postgresql.replica.persistence.enabled` | Enable persistent volume claims for replica pods | `true` |
-| `postgresql.replica.persistence.size` | Persistent volume size for replicas | `5Gi` |
-| `postgresql.replica.persistence.storageClass` | Storage class for the replica PVCs (empty uses default) | `""` |
-| `postgresql.replica.persistence.accessModes` | Access modes for the replica PVCs | `["ReadWriteOnce"]` |
-| `postgresql.replica.resources` | Resource requests and limits for replicas | `{cpu: 100m/500m, memory: 512Mi/1Gi}` |
-| `postgresql.nodeSelector` | Node selector for PostgreSQL pods | `{}` |
-| `postgresql.affinity` | Affinity rules for PostgreSQL pods | `{}` |
-| `postgresql.tolerations` | Tolerations for PostgreSQL pods | `[]` |
-| `postgresql.podAnnotations` | Extra annotations for PostgreSQL pods | `{}` |
+| `postgresql.pgvector.enabled` | Enable pgvector extension | `true` |
+| `postgresql.replicaCount` | Number of PostgreSQL instances | `1` |
+| `pgpool.enabled` | Enable PGPool-II | `false` |
+| `pgpool.service.port` | PGPool-II service port | `9999` |
 
-### PgBouncer
+For complete configuration options, refer to the values.yaml file or the base pg chart.
 
-| Key | Description | Default |
-| --- | --- | --- |
-| `postgresql.pgbouncer.enabled` | Deploy PgBouncer | `true` |
-| `postgresql.pgbouncer.replicaCount` | Number of PgBouncer replicas | `1` |
-| `postgresql.pgbouncer.image.registry` | PgBouncer image registry | `docker.io` |
-| `postgresql.pgbouncer.image.repository` | PgBouncer image repository | `edoburu/pgbouncer` |
-| `postgresql.pgbouncer.image.tag` | PgBouncer image tag | `v1.24.1-p1` |
-| `postgresql.pgbouncer.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `postgresql.pgbouncer.poolMode` | PgBouncer pooling mode | `transaction` |
-| `postgresql.pgbouncer.poolSize` | Maximum server connections per database | `20` |
-| `postgresql.pgbouncer.minPoolSize` | Minimum connections kept in pool | `5` |
-| `postgresql.pgbouncer.maxClientConn` | Maximum simultaneous client connections | `100` |
-| `postgresql.pgbouncer.defaultPoolSize` | Default pool size per database | `20` |
-| `postgresql.pgbouncer.resources` | Resource requests and limits for PgBouncer | `{cpu: 50m/200m, memory: 64Mi/128Mi}` |
-| `postgresql.pgbouncer.service.type` | Service type for PgBouncer | `ClusterIP` |
-| `postgresql.pgbouncer.service.port` | Service port for PgBouncer | `5432` |
-| `postgresql.pgbouncer.nodeSelector` | Node selector for PgBouncer pods | `{}` |
-| `postgresql.pgbouncer.affinity` | Affinity rules for PgBouncer pods | `{}` |
-| `postgresql.pgbouncer.tolerations` | Tolerations for PgBouncer pods | `[]` |
-| `postgresql.pgbouncer.podAnnotations` | Extra annotations for PgBouncer pods | `{}` |
+## Connecting to PostgreSQL
 
-### HAProxy
-
-| Key | Description | Default |
-| --- | --- | --- |
-| `postgresql.haproxy.enabled` | Deploy HAProxy | `false` |
-| `postgresql.haproxy.replicaCount` | Number of HAProxy replicas | `1` |
-| `postgresql.haproxy.image.registry` | HAProxy image registry | `docker.io` |
-| `postgresql.haproxy.image.repository` | HAProxy image repository | `haproxy` |
-| `postgresql.haproxy.image.tag` | HAProxy image tag | `lts-trixie` |
-| `postgresql.haproxy.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `postgresql.haproxy.service.type` | Service type for HAProxy | `ClusterIP` |
-| `postgresql.haproxy.service.port` | Service port exposed by HAProxy | `5432` |
-| `postgresql.haproxy.readReplicaRouting.enabled` | Weight connections toward replicas | `true` |
-| `postgresql.haproxy.readReplicaRouting.replicaPercentage` | Percentage of weight applied to replicas (0-100) | `100` |
-| `postgresql.haproxy.resources` | Resource requests and limits for HAProxy | `{cpu: 100m/500m, memory: 128Mi/256Mi}` |
-| `postgresql.haproxy.nodeSelector` | Node selector for HAProxy pods | `{}` |
-| `postgresql.haproxy.affinity` | Affinity rules for HAProxy pods | `{}` |
-| `postgresql.haproxy.tolerations` | Tolerations for HAProxy pods | `[]` |
-| `postgresql.haproxy.podAnnotations` | Extra annotations for HAProxy pods | `{}` |
-
-### Repmgr (Automatic Failover)
-
-| Key | Description | Default |
-| --- | --- | --- |
-| `postgresql.repmgr.enabled` | Enable repmgr for automatic failover | `false` |
-| `postgresql.repmgr.imagePullSecrets` | Image pull secrets for repmgr containers | `[]` |
-| `postgresql.repmgr.image.registry` | Container registry for repmgr image | `docker.io` |
-| `postgresql.repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
-| `postgresql.repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-rc1` |
-| `postgresql.repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `postgresql.repmgr.clusterName` | Name of the repmgr cluster | `pgvector-cluster` |
-| `postgresql.repmgr.db` | Repmgr database name | `repmgr` |
-| `postgresql.repmgr.user` | Repmgr user | `repmgr` |
-| `postgresql.repmgr.password` | Repmgr password (auto-generated when empty) | `""` |
-| `postgresql.repmgr.existingSecret` | Use an existing secret for repmgr credentials (must define `repmgr-password`) | `""` |
-| `postgresql.repmgr.nodeId` | Starting node ID for master | `1` |
-| `postgresql.repmgr.monitoringInterval` | Seconds between repmgrd health checks | `2` |
-| `postgresql.repmgr.reconnectAttempts` | Number of reconnection attempts | `6` |
-| `postgresql.repmgr.reconnectInterval` | Seconds between reconnection attempts | `10` |
-| `postgresql.repmgr.witness.enabled` | Enable witness server for quorum decisions | `false` |
-| `postgresql.repmgr.witness.nodeId` | Node ID for witness server | `999` |
-| `postgresql.repmgr.serviceUpdater.enabled` | Enable Kubernetes service updater sidecar | `true` |
-| `postgresql.repmgr.serviceUpdater.monitoringInterval` | Seconds between service checks | `30` |
-| `postgresql.repmgr.serviceUpdater.resources` | Resource requests and limits for service updater | `{cpu: 50m/100m, memory: 64Mi/128Mi}` |
-
-### Monitoring
-
-| Key | Description | Default |
-| --- | --- | --- |
-| `monitoring.exporter.enabled` | Deploy the Prometheus PostgreSQL exporter | `false` |
-| `monitoring.exporter.replicaCount` | Number of exporter replicas | `1` |
-| `monitoring.exporter.image.registry` | Exporter image registry | `docker.io` |
-| `monitoring.exporter.image.repository` | Exporter image repository | `prometheuscommunity/postgres-exporter` |
-| `monitoring.exporter.image.tag` | Exporter image tag | `v0.15.0` |
-| `monitoring.exporter.image.pullPolicy` | Exporter image pull policy | `IfNotPresent` |
-| `monitoring.exporter.service.enabled` | Expose exporter via a Kubernetes Service | `true` |
-| `monitoring.exporter.service.type` | Service type for exporter | `ClusterIP` |
-| `monitoring.exporter.service.port` | Metrics port | `9187` |
-| `monitoring.exporter.service.annotations` | Annotations to apply to the Service | `{}` |
-| `monitoring.exporter.env` | Additional environment variables for exporter container | `[]` |
-| `monitoring.exporter.resources` | Resource requests and limits for exporter | `{cpu: 50m/200m, memory: 64Mi/128Mi}` |
-| `monitoring.exporter.nodeSelector` | Node selector for exporter pods | `{}` |
-| `monitoring.exporter.affinity` | Affinity rules for exporter pods | `{}` |
-| `monitoring.exporter.tolerations` | Tolerations for exporter pods | `[]` |
-| `monitoring.exporter.podAnnotations` | Extra annotations for exporter pods | `{}` |
-| `monitoring.exporter.extraLabels` | Extra labels applied to exporter pods and deployment | `{}` |
-
-### Backups
-
-| Key | Description | Default |
-| --- | --- | --- |
-| `backup.enabled` | Enable the S3 backup CronJob | `false` |
-| `backup.schedule` | Cron schedule for backups | `"0 2 * * *"` |
-| `backup.image.registry` | Backup job image registry | `docker.io` |
-| `backup.image.repository` | Backup job image repository | `bitnami/postgresql` |
-| `backup.image.tag` | Backup job image tag | `18.3.0-debian-12-r0` |
-| `backup.image.pullPolicy` | Backup job image pull policy | `IfNotPresent` |
-| `backup.retentionDays` | Number of days to retain backups in S3 (`0` disables pruning) | `7` |
-| `backup.s3.bucket` | Target S3 bucket (required when backups enabled) | `""` |
-| `backup.s3.region` | S3 region (required when backups enabled) | `""` |
-| `backup.s3.prefix` | Optional prefix inside the bucket | `""` |
-| `backup.s3.endpoint` | Custom S3 endpoint (for MinIO/other providers) | `""` |
-| `backup.s3.usePathStyle` | Force path-style addressing for S3 clients | `true` |
-| `backup.s3.existingSecret` | Use an existing secret containing AWS credentials | `""` |
-| `backup.s3.accessKey` | AWS access key (used when existingSecret not set) | `""` |
-| `backup.s3.secretKey` | AWS secret key (used when existingSecret not set) | `""` |
-| `backup.pgDumpFormat` | `pg_dump` format (`custom`, `plain`, etc.) | `"custom"` |
-| `backup.compress` | Compress dumps using gzip | `true` |
-| `backup.resources` | Resource requests and limits for backup container | `{cpu: 100m/500m, memory: 256Mi/512Mi}` |
-| `backup.successfulJobsHistoryLimit` | Successful job history limit | `3` |
-| `backup.failedJobsHistoryLimit` | Failed job history limit | `1` |
-| `backup.annotations` | Annotations for the CronJob | `{}` |
-| `backup.podAnnotations` | Extra annotations for backup pods | `{}` |
-| `backup.nodeSelector` | Node selector for backup pods | `{}` |
-| `backup.affinity` | Affinity rules for backup pods | `{}` |
-| `backup.tolerations` | Tolerations for backup pods | `[]` |
-| `backup.env` | Additional environment variables for backup container | `[]` |
-
-## Notes
-
-Secret `<release-name>-postgresql-secret` (or the secret referenced by `postgresql.existingSecret`) contains the password and connection strings for the direct PostgreSQL, PgBouncer, and HAProxy endpoints. Retrieve them with `kubectl get secret ... -o jsonpath=...`. When `postgresql.existingSecret` is provided, the chart also creates `<release-name>-postgresql-url` containing the constructed `postgres-url` key if one is not already present.
-
-If backups are enabled and `backup.s3.existingSecret` is left empty, the chart creates secret `<release-name>-backup` containing the AWS credentials.
-
-## Repmgr Automatic Failover
-
-repmgr (Replication Manager) provides automatic failover capabilities for PostgreSQL replication clusters. When enabled, repmgr monitors the primary node and automatically promotes a standby replica to primary when failures are detected.
-
-### How It Works
-
-The repmgr implementation uses the `docker.io/cagriekin/repmgr:trixie-5.5.0-rc1` Docker image, which includes PostgreSQL 18 and repmgr 5.5.0-rc1. The system consists of three components:
-
-1. **Init Container**: Registers master and replica nodes with the repmgr cluster during pod initialization
-2. **repmgrd Sidecar**: Runs the repmgr daemon continuously, monitoring cluster health and performing automatic failover
-3. **Service Updater Sidecar**: Updates Kubernetes service selectors when failover occurs, ensuring traffic routes to the new primary
-
-### Enabling Repmgr
-
-```yaml
-postgresql:
-  repmgr:
-    enabled: true
-    clusterName: "my-postgres-cluster"
-    nodeId: 1
-    serviceUpdater:
-      enabled: true
-```
-
-### Witness Server (Recommended for Production)
-
-A witness server provides quorum for failover decisions and helps prevent split-brain scenarios:
-
-```yaml
-postgresql:
-  repmgr:
-    enabled: true
-    witness:
-      enabled: true
-      nodeId: 999
-```
-
-### Failover Process
-
-1. repmgrd daemon detects primary failure through health checks
-2. repmgrd selects the best standby candidate based on replication lag
-3. repmgrd promotes the standby to primary using `repmgr standby promote`
-4. repmgr updates cluster metadata
-5. Service updater sidecar detects the promotion
-6. Service updater patches the master service selector to point to the promoted pod
-7. Remaining replicas automatically reconnect to the new primary via repmgr's follow command
-
-### Checking Cluster Status
+### Direct Connection
 
 ```bash
-# View cluster status
-kubectl exec <master-pod-name> -- repmgr cluster show
-
-# Check node status
-kubectl exec <pod-name> -- repmgr node status
+kubectl port-forward svc/my-pgvector 5432:5432
+psql -h localhost -U postgres -d postgres
 ```
 
-### Manual Failover
-
-If needed, you can manually promote a standby:
+### Through PGPool-II
 
 ```bash
-kubectl exec <standby-pod-name> -- repmgr standby promote
+kubectl port-forward svc/my-pgvector-pgpool 9999:9999
+psql -h localhost -p 9999 -U postgres -d postgres
 ```
 
-### Troubleshooting
+## pgvector Resources
 
-**Issue: Repmgr not detecting failures**
-
-- Check repmgrd logs: `kubectl logs <pod-name> -c repmgrd`
-- Verify repmgr configuration: `kubectl exec <pod-name> -- cat /etc/repmgr/repmgr.conf`
-- Ensure PostgreSQL has repmgr extension loaded: Check `shared_preload_libraries` includes `repmgr`
-
-**Issue: Service selector not updating**
-
-- Check service updater logs: `kubectl logs <pod-name> -c service-updater`
-- Verify RBAC permissions: `kubectl get role <release-name>-repmgr-service-updater`
-- Check service updater has access to update services
-
-**Issue: Replicas not following new primary**
-
-- Verify repmgr cluster status shows correct primary
-- Check replica logs for connection errors
-- Ensure `primary_conninfo` is updated (repmgr handles this automatically)
-
-### Recovery Procedures
-
-**Rejoining a failed master:**
-
-After the original master recovers, it can be rejoined as a replica:
-
-```bash
-kubectl exec <old-master-pod> -- repmgr node rejoin
-```
-
-**Resetting cluster state:**
-
-If cluster state becomes inconsistent, you may need to re-register nodes:
-
-```bash
-# On the current primary
-kubectl exec <primary-pod> -- repmgr primary register --force
-
-# On replicas
-kubectl exec <replica-pod> -- repmgr standby register --force
-```
-
-### Limitations
-
-- Node IDs for replicas are currently set to master node ID + 1. For multiple replicas, ensure unique node IDs are configured
-- Service updater requires RBAC permissions to patch services
-- Witness server recommended for production to prevent split-brain scenarios
-- Initial failover may take 10-30 seconds depending on monitoring intervals
+- [pgvector GitHub](https://github.com/pgvector/pgvector)
+- [pgvector Documentation](https://github.com/pgvector/pgvector#getting-started)
