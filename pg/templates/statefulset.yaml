@@ -56,6 +56,9 @@ spec:
                           sed -i '/host all all all scram-sha-256/i host all all 10.0.0.0/8 trust' "$HBA_FILE"
                           psql -U postgres -c "SELECT pg_reload_conf();" > /dev/null 2>&1
                         fi
+                        {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
+                        {{ .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 24 }}
+                        {{- end }}
                         break
                       fi
                       sleep 1
