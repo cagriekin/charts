@@ -47,6 +47,10 @@ postgresql:
     enabled: true
     minAvailable: 1
 
+  lifecycle:
+    postStart:
+      additionalCommands: ""
+
 repmgr:
   image:
     repository: bitnami/repmgr
