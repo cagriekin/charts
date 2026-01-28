@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/component: postgresql
 spec:
   serviceName: {{ include "pg.fullname" . }}-headless
-  replicas: {{ max 1 .Values.postgresql.replicaCount }}
+  replicas: {{ add .Values.postgresql.replicaCount 1 }}
   selector:
     matchLabels:
       {{- include "pg.selectorLabels" . | nindent 6 }}
