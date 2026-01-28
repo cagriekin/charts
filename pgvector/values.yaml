@@ -47,8 +47,10 @@ postgresql:
     enabled: true
     minAvailable: 1
 
-  pgvector:
-    enabled: true
+  lifecycle:
+    postStart:
+      additionalCommands: |
+        psql -U postgres -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1
 
 repmgr:
   image:
