@@ -6,6 +6,13 @@ postgresql:
 
   replicaCount: 1
 
+  annotations: {}
+
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+
   resources:
     requests:
       cpu: 100m
