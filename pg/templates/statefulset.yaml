@@ -27,6 +27,8 @@ spec:
               containerPort: 5432
               protocol: TCP
           env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
@@ -67,7 +69,7 @@ spec:
             {{- toYaml .Values.postgresql.resources | nindent 12 }}
           volumeMounts:
             - name: data
-              mountPath: /var/lib/postgresql
+              mountPath: /var/lib/postgresql/data
 {{- if not .Values.postgresql.persistence.enabled }}
       volumes:
         - name: data

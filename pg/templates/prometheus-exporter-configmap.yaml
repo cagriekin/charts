@@ -16,4 +16,9 @@ data:
           password: __POSTGRES_PASSWORD__
         options:
           sslmode: disable
+
+    datasources:
+      - name: primary
+        auth_module: postgres
+        dsn: postgresql://{{ include "pg.fullname" . }}-headless:5432/postgres?sslmode=disable
 {{- end }}
