@@ -5,9 +5,17 @@ metadata:
   labels:
     {{- include "pg.labels" . | nindent 4 }}
     app.kubernetes.io/component: postgresql
+  {{- with .Values.postgresql.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   serviceName: {{ include "pg.fullname" . }}-headless
   replicas: {{ add .Values.postgresql.replicaCount 1 }}
+  {{- with .Values.postgresql.updateStrategy }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "pg.selectorLabels" . | nindent 6 }}
