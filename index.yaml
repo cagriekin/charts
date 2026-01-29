@@ -772,6 +772,16 @@ entries:
   pg:
   - apiVersion: v2
     appVersion: "18.1"
+    created: "2026-01-29T13:49:41.725144417Z"
+    description: PostgreSQL with repmgr replication and optional PGPool-II
+    digest: 8660f47f38f0ec616b93094618d52f418e5c46be53ac9c7ba0f1d2c17013e847
+    name: pg
+    type: application
+    urls:
+    - https://github.com/cagriekin/charts/releases/download/pg-0.2.6/pg-0.2.6.tgz
+    version: 0.2.6
+  - apiVersion: v2
+    appVersion: "18.1"
     created: "2026-01-29T13:27:16.529455118Z"
     description: PostgreSQL with repmgr replication and optional PGPool-II
     digest: c4527960af784750e1d2e7395aeddf0866408aa1bb32eb63a548a1ff5a21ea61
@@ -1838,4 +1848,4 @@ entries:
     urls:
     - https://github.com/cagriekin/charts/releases/download/pgvector-0.2.0/pgvector-0.2.0.tgz
     version: 0.2.0
-generated: "2026-01-29T13:27:16.529654089Z"
+generated: "2026-01-29T13:49:41.725338663Z"
