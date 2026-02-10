@@ -62,11 +62,14 @@ postgresql:
 
 repmgr:
   image:
-    repository: bitnami/repmgr
-    tag: 5.4.1
+    repository: cagriekin/repmgr
+    tag: trixie-5.5.0-rc2
     pullPolicy: IfNotPresent
 
   enabled: true
+
+  username: repmgr
+  database: repmgr
 
   resources:
     requests:
