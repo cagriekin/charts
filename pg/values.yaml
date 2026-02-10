@@ -152,5 +152,25 @@ service:
   type: ClusterIP
   port: 5432
 
+backup:
+  enabled: false
+  schedule: "0 2 * * *"
+  s3:
+    endpoint: ""
+    bucket: ""
+    prefix: "backups"
+  existingSecret:
+    name: ""
+    accessKeyIdKey: access-key-id
+    secretAccessKeyKey: secret-access-key
+  retentionDays: 7
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
 global:
   annotations: {}

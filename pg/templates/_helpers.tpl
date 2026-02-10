@@ -101,3 +101,24 @@ Repmgr password key
 {{- define "pg.secretRepmgrPasswordKey" -}}
 {{- "repmgr-password" }}
 {{- end }}
+
+{{/*
+Backup S3 secret name
+*/}}
+{{- define "pg.backupSecretName" -}}
+{{- .Values.backup.existingSecret.name }}
+{{- end }}
+
+{{/*
+Backup S3 access key ID key
+*/}}
+{{- define "pg.backupAccessKeyIdKey" -}}
+{{- .Values.backup.existingSecret.accessKeyIdKey }}
+{{- end }}
+
+{{/*
+Backup S3 secret access key key
+*/}}
+{{- define "pg.backupSecretAccessKeyKey" -}}
+{{- .Values.backup.existingSecret.secretAccessKeyKey }}
+{{- end }}
