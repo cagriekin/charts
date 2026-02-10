@@ -72,11 +72,11 @@ spec:
                   - -c
                   - |
                     for i in {1..30}; do
-                      if pg_isready -U "$POSTGRES_USER" > /dev/null 2>&1; then
-                        HBA_FILE=$(psql -U "$POSTGRES_USER" -t -c "SHOW hba_file" | xargs)
+                      if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
+                        HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
                         if ! grep -q "host all all 10.0.0.0/8 trust" "$HBA_FILE"; then
                           sed -i '/host all all all scram-sha-256/i host all all 10.0.0.0/8 trust' "$HBA_FILE"
-                          psql -U "$POSTGRES_USER" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
+                          psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
                         fi
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
                         {{ .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 24 }}
