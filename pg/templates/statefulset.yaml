@@ -195,8 +195,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: MASTER_SERVICE
               value: {{ include "pg.fullname" . }}
-            - name: PARTNER_NODES
-              value: "{{- range $i := until (int (add .Values.postgresql.replicaCount 1)) }}{{- if $i }},{{- end }}{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local{{- end }}"
+            - name: HEADLESS_SERVICE
+              value: {{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
             - name: REPMGR_USER
               value: {{ .Values.repmgr.username }}
             - name: REPMGR_PASSWORD
