@@ -18,6 +18,18 @@ spec:
         {{- include "pg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: pgpool
     spec:
+      affinity:
+        {{- if .Values.pgpool.affinity }}
+        {{- toYaml .Values.pgpool.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "pg.selectorLabels" . | nindent 18 }}
+                  app.kubernetes.io/component: pgpool
+              topologyKey: kubernetes.io/hostname
+        {{- end }}
       initContainers:
         - name: init-config
           image: busybox:1.35
