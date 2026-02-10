@@ -50,6 +50,8 @@ postgresql:
     timeoutSeconds: 5
     failureThreshold: 6
 
+  affinity: {}
+
   podDisruptionBudget:
     enabled: true
     minAvailable: 1
@@ -109,6 +111,8 @@ pgpool:
   service:
     type: ClusterIP
     port: 9999
+
+  affinity: {}
 
   podDisruptionBudget:
     enabled: true
