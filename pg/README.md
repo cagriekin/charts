@@ -10,6 +10,7 @@ PostgreSQL Helm chart with repmgr for replication management and optional PGPool
 - Support for existing secrets or auto-generated passwords
 - StatefulSet-based deployment with persistent storage
 - Configurable resource limits and probes
+- Automated S3 backups via CronJob with retention management
 
 ## Installation
 
@@ -243,6 +244,55 @@ scrape_configs:
 | `prometheusExporter.serviceMonitor.enabled` | Create ServiceMonitor | `false` |
 | `prometheusExporter.serviceMonitor.interval` | Scrape interval | `30s` |
 | `prometheusExporter.serviceMonitor.scrapeTimeout` | Scrape timeout | `10s` |
+
+## Backup
+
+Automated database backups can be enabled to run `pg_dump` on a schedule and upload compressed dumps to S3-compatible storage (AWS S3, MinIO, Wasabi, etc.). The backup job connects to the primary via the main service, so it works correctly with repmgr failover.
+
+### Enable Backup
+
+```bash
+kubectl create secret generic s3-backup-creds \
+  --from-literal=access-key-id=YOUR_ACCESS_KEY \
+  --from-literal=secret-access-key=YOUR_SECRET_KEY
+
+helm install my-postgres ./pg \
+  --set backup.enabled=true \
+  --set backup.s3.endpoint=https://minio.example.com \
+  --set backup.s3.bucket=pg-backups \
+  --set backup.existingSecret.name=s3-backup-creds
+```
+
+### Manual Trigger
+
+```bash
+kubectl create job --from=cronjob/my-postgres-backup manual-backup
+```
+
+### Backup Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `backup.enabled` | Enable backup CronJob | `false` |
+| `backup.schedule` | Cron schedule | `0 2 * * *` |
+| `backup.s3.endpoint` | S3-compatible endpoint URL | `""` |
+| `backup.s3.bucket` | S3 bucket name | `""` |
+| `backup.s3.prefix` | Key prefix within bucket | `backups` |
+| `backup.existingSecret.name` | Secret containing S3 credentials | `""` |
+| `backup.existingSecret.accessKeyIdKey` | Key for access key ID in secret | `access-key-id` |
+| `backup.existingSecret.secretAccessKeyKey` | Key for secret access key in secret | `secret-access-key` |
+| `backup.retentionDays` | Days to retain backups before cleanup | `7` |
+| `backup.resources.requests.cpu` | CPU request | `100m` |
+| `backup.resources.requests.memory` | Memory request | `256Mi` |
+| `backup.resources.limits.cpu` | CPU limit | `500m` |
+| `backup.resources.limits.memory` | Memory limit | `512Mi` |
+
+### Restore
+
+```bash
+mc cp s3/pg-backups/backups/backup_20250101_020000.dump /tmp/backup.dump
+pg_restore -h localhost -U postgres -d postgres /tmp/backup.dump
+```
 
 ## Upgrade
 

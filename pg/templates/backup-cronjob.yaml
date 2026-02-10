@@ -1,0 +1,72 @@
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "pg.fullname" . }}-backup
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "pg.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+              imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+              command: ["/bin/bash", "/scripts/backup.sh"]
+              env:
+                - name: POSTGRES_HOST
+                  value: {{ include "pg.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+                - name: POSTGRES_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "pg.secretName" . }}
+                      key: {{ include "pg.secretUsernameKey" . }}
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "pg.secretName" . }}
+                      key: {{ include "pg.secretPasswordKey" . }}
+                - name: POSTGRES_DB
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "pg.secretName" . }}
+                      key: {{ include "pg.secretDatabaseKey" . }}
+                - name: S3_ENDPOINT
+                  value: {{ required "backup.s3.endpoint is required when backup is enabled" .Values.backup.s3.endpoint | quote }}
+                - name: S3_BUCKET
+                  value: {{ required "backup.s3.bucket is required when backup is enabled" .Values.backup.s3.bucket | quote }}
+                - name: S3_PREFIX
+                  value: {{ .Values.backup.s3.prefix | quote }}
+                - name: S3_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ required "backup.existingSecret.name is required when backup is enabled" (include "pg.backupSecretName" .) }}
+                      key: {{ include "pg.backupAccessKeyIdKey" . }}
+                - name: S3_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "pg.backupSecretName" . }}
+                      key: {{ include "pg.backupSecretAccessKeyKey" . }}
+                - name: RETENTION_DAYS
+                  value: {{ .Values.backup.retentionDays | quote }}
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+          volumes:
+            - name: scripts
+              configMap:
+                name: {{ include "pg.fullname" . }}-backup
+                defaultMode: 0755
+{{- end }}
