@@ -26,6 +26,18 @@ spec:
         {{- include "pg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: postgresql
     spec:
+      affinity:
+        {{- if .Values.postgresql.affinity }}
+        {{- toYaml .Values.postgresql.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "pg.selectorLabels" . | nindent 18 }}
+                  app.kubernetes.io/component: postgresql
+              topologyKey: kubernetes.io/hostname
+        {{- end }}
       containers:
         - name: postgresql
           image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
