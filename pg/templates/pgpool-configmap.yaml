@@ -14,13 +14,23 @@ data:
     pcp_port = 9898
     pcp_socket_dir = '/tmp'
 
+{{- if .Values.repmgr.enabled }}
+    {{- range $i := until (int (add .Values.postgresql.replicaCount 1)) }}
+    backend_hostname{{ $i }} = '{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local'
+    backend_port{{ $i }} = 5432
+    backend_weight{{ $i }} = 1
+    backend_flag{{ $i }} = 'ALLOW_TO_FAILOVER'
+    backend_application_name{{ $i }} = 'node{{ $i }}'
+
+    {{- end }}
+{{- else }}
     backend_hostname0 = '{{ include "pg.fullname" . }}-0.{{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local'
     backend_port0 = 5432
     backend_weight0 = 1
     backend_flag0 = 'ALWAYS_PRIMARY'
     backend_application_name0 = 'primary'
 
-    {{- range $i := until (int .Values.postgresql.replicaCount) }}
+    {{- range $i := until (int (add .Values.postgresql.replicaCount 1)) }}
     {{- if gt $i 0 }}
     backend_hostname{{ $i }} = '{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local'
     backend_port{{ $i }} = 5432
@@ -30,6 +40,7 @@ data:
 
     {{- end }}
     {{- end }}
+{{- end }}
 
     enable_pool_hba = on
     pool_passwd = 'pool_passwd'
@@ -45,7 +56,11 @@ data:
     load_balance_mode = on
     ssl = off
 
+{{- if .Values.repmgr.enabled }}
+    failover_on_backend_error = on
+{{- else }}
     failover_on_backend_error = off
+{{- end }}
 
     log_destination = 'stderr'
     log_line_prefix = '%t: pid %p: '
@@ -64,7 +79,11 @@ data:
 
     connection_pool_mode = session
 
+{{- if .Values.repmgr.enabled }}
+    sr_check_period = 10
+{{- else }}
     sr_check_period = 0
+{{- end }}
     sr_check_user = '__POSTGRES_USER__'
     sr_check_password = '__POSTGRES_PASSWORD__'
     sr_check_database = '__POSTGRES_DB__'
@@ -79,7 +98,11 @@ data:
 
     failover_command = ''
     failback_command = ''
+{{- if .Values.repmgr.enabled }}
+    fail_over_on_backend_error = on
+{{- else }}
     fail_over_on_backend_error = off
+{{- end }}
 
     recovery_user = '__POSTGRES_USER__'
     recovery_password = '__POSTGRES_PASSWORD__'
