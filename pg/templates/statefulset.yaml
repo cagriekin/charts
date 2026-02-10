@@ -26,6 +26,10 @@ spec:
         {{- include "pg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: postgresql
     spec:
+      {{- if .Values.repmgr.enabled }}
+      shareProcessNamespace: true
+      serviceAccountName: {{ include "pg.fullname" . }}-repmgr
+      {{- end }}
       affinity:
         {{- if .Values.postgresql.affinity }}
         {{- toYaml .Values.postgresql.affinity | nindent 8 }}
@@ -38,10 +42,57 @@ spec:
                   app.kubernetes.io/component: postgresql
               topologyKey: kubernetes.io/hostname
         {{- end }}
+{{- if .Values.repmgr.enabled }}
+      initContainers:
+        - name: repmgr-init
+          image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
+          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          command: ["/usr/local/bin/entrypoint.sh", "init"]
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretUsernameKey" . }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretPasswordKey" . }}
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretDatabaseKey" . }}
+            - name: REPMGR_USER
+              value: {{ .Values.repmgr.username }}
+            - name: REPMGR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretRepmgrPasswordKey" . }}
+            - name: REPMGR_DB
+              value: {{ .Values.repmgr.database }}
+            - name: HEADLESS_SERVICE
+              value: {{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: repmgr-config
+              mountPath: /etc/repmgr
+{{- end }}
       containers:
         - name: postgresql
+{{- if .Values.repmgr.enabled }}
+          image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
+          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          command: ["/usr/local/bin/entrypoint.sh", "postgres"]
+{{- else }}
           image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+{{- end }}
           ports:
             - name: postgresql
               containerPort: 5432
@@ -64,6 +115,20 @@ spec:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretDatabaseKey" . }}
+{{- if .Values.repmgr.enabled }}
+            - name: REPMGR_USER
+              value: {{ .Values.repmgr.username }}
+            - name: REPMGR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretRepmgrPasswordKey" . }}
+            - name: REPMGR_DB
+              value: {{ .Values.repmgr.database }}
+            - name: HEADLESS_SERVICE
+              value: {{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
+{{- end }}
+{{- if not .Values.repmgr.enabled }}
           lifecycle:
             postStart:
               exec:
@@ -85,15 +150,80 @@ spec:
                       fi
                       sleep 1
                     done
+{{- end }}
           resources:
             {{- toYaml .Values.postgresql.resources | nindent 12 }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-{{- if not .Values.postgresql.persistence.enabled }}
+{{- if .Values.repmgr.enabled }}
+            - name: repmgr-config
+              mountPath: /etc/repmgr
+        - name: repmgrd
+          image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
+          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          command: ["/usr/local/bin/entrypoint.sh", "repmgrd"]
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: REPMGR_USER
+              value: {{ .Values.repmgr.username }}
+            - name: REPMGR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretRepmgrPasswordKey" . }}
+            - name: REPMGR_DB
+              value: {{ .Values.repmgr.database }}
+            - name: HEADLESS_SERVICE
+              value: {{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
+          resources:
+            {{- toYaml .Values.repmgr.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: repmgr-config
+              mountPath: /etc/repmgr
+        - name: service-updater
+          image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
+          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          command: ["/usr/local/bin/entrypoint.sh", "service-updater"]
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MASTER_SERVICE
+              value: {{ include "pg.fullname" . }}
+            - name: PARTNER_NODES
+              value: "{{- range $i := until (int (add .Values.postgresql.replicaCount 1)) }}{{- if $i }},{{- end }}{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local{{- end }}"
+            - name: REPMGR_USER
+              value: {{ .Values.repmgr.username }}
+            - name: REPMGR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretRepmgrPasswordKey" . }}
+            - name: REPMGR_DB
+              value: {{ .Values.repmgr.database }}
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+{{- end }}
+{{- if or .Values.repmgr.enabled (not .Values.postgresql.persistence.enabled) }}
       volumes:
+{{- if .Values.repmgr.enabled }}
+        - name: repmgr-config
+          emptyDir: {}
+{{- end }}
+{{- if not .Values.postgresql.persistence.enabled }}
         - name: data
           emptyDir: {}
+{{- end }}
 {{- end }}
 {{- if .Values.postgresql.persistence.enabled }}
   volumeClaimTemplates:

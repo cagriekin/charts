@@ -94,3 +94,10 @@ PostgreSQL database key
 {{- "database" }}
 {{- end }}
 {{- end }}
+
+{{/*
+Repmgr password key
+*/}}
+{{- define "pg.secretRepmgrPasswordKey" -}}
+{{- "repmgr-password" }}
+{{- end }}
