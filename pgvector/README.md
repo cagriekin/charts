@@ -11,6 +11,7 @@ PostgreSQL Helm chart with pgvector extension for vector similarity search and o
 - StatefulSet-based deployment with persistent storage
 - Configurable resource limits and probes
 - Optional Prometheus exporter with ServiceMonitor support
+- Automated S3 backups via CronJob with retention management
 
 ## Installation
 
@@ -97,6 +98,22 @@ psql -h localhost -U postgres -d postgres
 ```bash
 kubectl port-forward svc/my-pgvector-pgpool 9999:9999
 psql -h localhost -p 9999 -U postgres -d postgres
+```
+
+## Backup
+
+Automated database backups can be enabled to run `pg_dump` on a schedule and upload compressed dumps to S3-compatible storage. See the [pg chart backup documentation](../pg/README.md#backup) for full details.
+
+```bash
+kubectl create secret generic s3-backup-creds \
+  --from-literal=access-key-id=YOUR_ACCESS_KEY \
+  --from-literal=secret-access-key=YOUR_SECRET_KEY
+
+helm install my-pgvector ./pgvector \
+  --set backup.enabled=true \
+  --set backup.s3.endpoint=https://minio.example.com \
+  --set backup.s3.bucket=pgvector-backups \
+  --set backup.existingSecret.name=s3-backup-creds
 ```
 
 ## pgvector Resources
