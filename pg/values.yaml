@@ -35,6 +35,7 @@ postgresql:
     usernameKey: username
     passwordKey: password
     databaseKey: database
+    repmgrPasswordKey: repmgr-password
 
   livenessProbe:
     enabled: true

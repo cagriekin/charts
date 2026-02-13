@@ -38,7 +38,8 @@ helm install my-postgres ./pg \
 kubectl create secret generic pg-secret \
   --from-literal=username=myuser \
   --from-literal=password=mypassword \
-  --from-literal=database=mydb
+  --from-literal=database=mydb \
+  --from-literal=repmgr-password=myrepmgrpassword
 
 helm install my-postgres ./pg \
   --set postgresql.existingSecret.enabled=true \
@@ -51,14 +52,16 @@ Or with custom key names:
 kubectl create secret generic pg-secret \
   --from-literal=user=myuser \
   --from-literal=pass=mypassword \
-  --from-literal=db=mydb
+  --from-literal=db=mydb \
+  --from-literal=repmgr-pass=myrepmgrpassword
 
 helm install my-postgres ./pg \
   --set postgresql.existingSecret.enabled=true \
   --set postgresql.existingSecret.name=pg-secret \
   --set postgresql.existingSecret.usernameKey=user \
   --set postgresql.existingSecret.passwordKey=pass \
-  --set postgresql.existingSecret.databaseKey=db
+  --set postgresql.existingSecret.databaseKey=db \
+  --set postgresql.existingSecret.repmgrPasswordKey=repmgr-pass
 ```
 
 ## Configuration
@@ -124,11 +127,13 @@ helm install my-postgres ./pg \
 | `postgresql.existingSecret.usernameKey` | Username key in secret | `username` |
 | `postgresql.existingSecret.passwordKey` | Password key in secret | `password` |
 | `postgresql.existingSecret.databaseKey` | Database key in secret | `database` |
+| `postgresql.existingSecret.repmgrPasswordKey` | Repmgr password key in secret | `repmgr-password` |
 
 When `postgresql.existingSecret.enabled` is `false`, a secret will be auto-generated with:
 - `username`: Base64 encoded value from `postgresql.username`
 - `password`: Random 32 character alphanumeric string
 - `database`: Base64 encoded value from `postgresql.database`
+- `repmgr-password`: Random 32 character alphanumeric string (when repmgr is enabled)
 
 ### Global Parameters
 
