@@ -53,6 +53,28 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+{{- if and .Values.postgresql.extensions.enabled .Values.repmgr.enabled }}
+        - name: copy-base-ext
+          image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
+          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          command: ['sh', '-c', 'cp /usr/lib/postgresql/18/lib/*.so /ext-lib/ && cp /usr/share/postgresql/18/extension/* /ext-share/']
+          volumeMounts:
+            - name: ext-lib
+              mountPath: /ext-lib
+            - name: ext-share
+              mountPath: /ext-share
+{{- end }}
+{{- if .Values.postgresql.extensions.enabled }}
+        - name: copy-ext
+          image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          command: ['sh', '-c', 'cp /usr/lib/postgresql/18/lib/*.so /ext-lib/ && cp /usr/share/postgresql/18/extension/* /ext-share/']
+          volumeMounts:
+            - name: ext-lib
+              mountPath: /ext-lib
+            - name: ext-share
+              mountPath: /ext-share
+{{- end }}
 {{- if .Values.repmgr.enabled }}
         - name: repmgr-init
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
@@ -166,6 +188,12 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+{{- if .Values.postgresql.extensions.enabled }}
+            - name: ext-lib
+              mountPath: /usr/lib/postgresql/18/lib
+            - name: ext-share
+              mountPath: /usr/share/postgresql/18/extension
+{{- end }}
 {{- if .Values.repmgr.enabled }}
             - name: repmgr-config
               mountPath: /etc/repmgr
@@ -224,8 +252,14 @@ spec:
               cpu: 100m
               memory: 64Mi
 {{- end }}
-{{- if or .Values.repmgr.enabled (not .Values.postgresql.persistence.enabled) }}
+{{- if or .Values.postgresql.extensions.enabled .Values.repmgr.enabled (not .Values.postgresql.persistence.enabled) }}
       volumes:
+{{- if .Values.postgresql.extensions.enabled }}
+        - name: ext-lib
+          emptyDir: {}
+        - name: ext-share
+          emptyDir: {}
+{{- end }}
 {{- if .Values.repmgr.enabled }}
         - name: repmgr-config
           emptyDir: {}
