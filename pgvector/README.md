@@ -39,7 +39,8 @@ helm install my-pgvector ./pgvector \
 kubectl create secret generic pg-secret \
   --from-literal=username=myuser \
   --from-literal=password=mypassword \
-  --from-literal=database=mydb
+  --from-literal=database=mydb \
+  --from-literal=repmgr-password=myrepmgrpassword
 
 helm install my-pgvector ./pgvector \
   --set postgresql.existingSecret.enabled=true \
