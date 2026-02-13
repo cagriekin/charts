@@ -57,6 +57,9 @@ postgresql:
     enabled: true
     minAvailable: 1
 
+  extensions:
+    enabled: true
+
   lifecycle:
     postStart:
       additionalCommands: |
