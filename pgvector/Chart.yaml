@@ -2,7 +2,7 @@ apiVersion: v2
 name: pgvector
 description: PostgreSQL with pgvector extension and optional PGPool-II
 type: application
-version: 0.5.2
+version: 0.5.3
 appVersion: "18.1"
 keywords:
   - PostgreSQL
