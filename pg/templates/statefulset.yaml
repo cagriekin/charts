@@ -26,6 +26,8 @@ spec:
         {{- include "pg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: postgresql
     spec:
+      securityContext:
+        fsGroup: 999
       {{- if .Values.repmgr.enabled }}
       shareProcessNamespace: true
       serviceAccountName: {{ include "pg.fullname" . }}-repmgr
