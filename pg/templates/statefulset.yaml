@@ -44,8 +44,16 @@ spec:
                   app.kubernetes.io/component: postgresql
               topologyKey: kubernetes.io/hostname
         {{- end }}
-{{- if .Values.repmgr.enabled }}
       initContainers:
+        - name: fix-permissions
+          image: busybox:1.37
+          command: ['sh', '-c', 'chown -R 999:999 /var/lib/postgresql/data']
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+{{- if .Values.repmgr.enabled }}
         - name: repmgr-init
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
