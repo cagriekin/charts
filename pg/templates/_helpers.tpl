@@ -99,7 +99,11 @@ PostgreSQL database key
 Repmgr password key
 */}}
 {{- define "pg.secretRepmgrPasswordKey" -}}
+{{- if .Values.postgresql.existingSecret.enabled }}
+{{- .Values.postgresql.existingSecret.repmgrPasswordKey }}
+{{- else }}
 {{- "repmgr-password" }}
+{{- end }}
 {{- end }}
 
 {{/*
