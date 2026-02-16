@@ -772,6 +772,16 @@ entries:
   pg:
   - apiVersion: v2
     appVersion: "18.1"
+    created: "2026-02-16T23:42:28.122332655Z"
+    description: PostgreSQL with repmgr replication and optional PGPool-II
+    digest: 63c67c59b5de0113a389fc734817bb282b3967d2dd8fb8c7f975133ba0425e5d
+    name: pg
+    type: application
+    urls:
+    - https://github.com/cagriekin/charts/releases/download/pg-0.5.0/pg-0.5.0.tgz
+    version: 0.5.0
+  - apiVersion: v2
+    appVersion: "18.1"
     created: "2026-02-13T10:22:57.884594734Z"
     description: PostgreSQL with repmgr replication and optional PGPool-II
     digest: 3004931c0eb29390cdefd7dd441721492ac5fc06c080b4c17385b1f0231950b5
@@ -961,6 +971,22 @@ entries:
     - https://github.com/cagriekin/charts/releases/download/pg-0.1.0/pg-0.1.0.tgz
     version: 0.1.0
   pgvector:
+  - apiVersion: v2
+    appVersion: "18.1"
+    created: "2026-02-16T23:42:28.239229279Z"
+    description: PostgreSQL with pgvector extension and optional PGPool-II
+    digest: a8aa7c4e2d0949ce638d24f8d11254d7594d21bd965b62f6fd7e9f59585beeab
+    keywords:
+    - PostgreSQL
+    - pgvector
+    - PGPool-II
+    - Vector Search
+    - Vector Database
+    name: pgvector
+    type: application
+    urls:
+    - https://github.com/cagriekin/charts/releases/download/pgvector-0.6.0/pgvector-0.6.0.tgz
+    version: 0.6.0
   - apiVersion: v2
     appVersion: "18.1"
     created: "2026-02-13T10:22:58.048117049Z"
@@ -2102,4 +2128,4 @@ entries:
     urls:
     - https://github.com/cagriekin/charts/releases/download/pgvector-0.2.0/pgvector-0.2.0.tgz
     version: 0.2.0
-generated: "2026-02-13T10:22:58.048490265Z"
+generated: "2026-02-16T23:42:28.239603728Z"
