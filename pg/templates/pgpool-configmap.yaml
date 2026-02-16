@@ -56,12 +56,6 @@ data:
     load_balance_mode = on
     ssl = off
 
-{{- if .Values.repmgr.enabled }}
-    failover_on_backend_error = on
-{{- else }}
-    failover_on_backend_error = off
-{{- end }}
-
     log_destination = 'stderr'
     log_line_prefix = '%t: pid %p: '
     log_connections = {{ if .Values.pgpool.logging.logConnections }}on{{ else }}off{{ end }}
@@ -88,18 +82,20 @@ data:
     sr_check_password = '__POSTGRES_PASSWORD__'
     sr_check_database = '__POSTGRES_DB__'
 
-    health_check_period = 10
-    health_check_timeout = 5
+    health_check_period = {{ .Values.pgpool.healthCheck.period }}
+    health_check_timeout = {{ .Values.pgpool.healthCheck.timeout }}
     health_check_user = '__POSTGRES_USER__'
     health_check_password = '__POSTGRES_PASSWORD__'
     health_check_database = '__POSTGRES_DB__'
-    health_check_max_retries = 3
-    health_check_retry_delay = 1
+    health_check_max_retries = {{ .Values.pgpool.healthCheck.maxRetries }}
+    health_check_retry_delay = {{ .Values.pgpool.healthCheck.retryDelay }}
 
     failover_command = ''
     failback_command = ''
 {{- if .Values.repmgr.enabled }}
     fail_over_on_backend_error = on
+    auto_failback = {{ if .Values.pgpool.autoFailback }}on{{ else }}off{{ end }}
+    auto_failback_interval = 30
 {{- else }}
     fail_over_on_backend_error = off
 {{- end }}
