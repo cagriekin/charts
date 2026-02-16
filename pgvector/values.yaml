@@ -100,6 +100,14 @@ pgpool:
   connectionLifeTime: 0
   clientIdleLimit: 0
 
+  healthCheck:
+    period: 10
+    timeout: 5
+    maxRetries: 5
+    retryDelay: 2
+
+  autoFailback: true
+
   logging:
     logConnections: false
     logStatement: false
