@@ -105,6 +105,7 @@ pgpool:
     maxRetries: 5
     retryDelay: 2
 
+  failOverOnBackendError: false
   autoFailback: true
 
   logging:
