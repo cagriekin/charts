@@ -92,12 +92,10 @@ data:
 
     failover_command = ''
     failback_command = ''
+    fail_over_on_backend_error = {{ if .Values.pgpool.failOverOnBackendError }}on{{ else }}off{{ end }}
 {{- if .Values.repmgr.enabled }}
-    fail_over_on_backend_error = on
     auto_failback = {{ if .Values.pgpool.autoFailback }}on{{ else }}off{{ end }}
     auto_failback_interval = 30
-{{- else }}
-    fail_over_on_backend_error = off
 {{- end }}
 
     recovery_user = '__POSTGRES_USER__'
