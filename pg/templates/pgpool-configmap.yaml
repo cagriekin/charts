@@ -73,8 +73,11 @@ data:
 
     connection_pool_mode = session
 
+    backend_clustering_mode = 'streaming_replication'
+
 {{- if .Values.repmgr.enabled }}
     sr_check_period = 10
+    detach_false_primary = on
 {{- else }}
     sr_check_period = 0
 {{- end }}
