@@ -73,6 +73,7 @@ spec:
           imagePullPolicy: {{ .Values.pgpool.image.pullPolicy }}
           command:
             - pgpool
+            - -D
             - -n
             - -f
             - /usr/local/etc/pgpool.conf
