@@ -53,8 +53,13 @@ data:
     client_idle_limit = {{ .Values.pgpool.clientIdleLimit }}
 
     connection_cache = on
+    reset_query_list = '{{ .Values.pgpool.resetQueryList }}'
     load_balance_mode = on
     ssl = off
+
+    pg_keepalives_idle = {{ .Values.pgpool.tcpKeepalive.idle }}
+    pg_keepalives_interval = {{ .Values.pgpool.tcpKeepalive.interval }}
+    pg_keepalives_count = {{ .Values.pgpool.tcpKeepalive.count }}
 
     log_destination = 'stderr'
     log_line_prefix = '%t: pid %p: '

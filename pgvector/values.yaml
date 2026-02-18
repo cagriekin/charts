@@ -100,6 +100,13 @@ pgpool:
   connectionLifeTime: 0
   clientIdleLimit: 0
 
+  resetQueryList: "ABORT; RESET ALL; DEALLOCATE ALL"
+
+  tcpKeepalive:
+    idle: 10
+    interval: 3
+    count: 5
+
   healthCheck:
     period: 10
     timeout: 5
