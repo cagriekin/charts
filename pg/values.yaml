@@ -96,8 +96,8 @@ pgpool:
   numInitChildren: 32
   maxPool: 4
   childLifeTime: 300
-  connectionLifeTime: 0
-  clientIdleLimit: 0
+  connectionLifeTime: 600
+  clientIdleLimit: 300
 
   resetQueryList: "ABORT; RESET ALL; DEALLOCATE ALL"
 
@@ -107,16 +107,16 @@ pgpool:
     count: 5
 
   healthCheck:
-    period: 10
-    timeout: 5
-    maxRetries: 5
-    retryDelay: 2
+    period: 5
+    timeout: 30
+    maxRetries: 3
+    retryDelay: 1
 
   failOverOnBackendError: false
   autoFailback: true
 
   logging:
-    logConnections: false
+    logConnections: true
     logStatement: false
     logPerNodeStatement: false
 
