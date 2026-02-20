@@ -2232,4 +2232,15 @@ entries:
     urls:
     - https://github.com/cagriekin/charts/releases/download/pgvector-0.2.0/pgvector-0.2.0.tgz
     version: 0.2.0
-generated: "2026-02-19T09:58:52.990699089Z"
+  redis:
+  - apiVersion: v2
+    appVersion: "7"
+    created: "2026-02-20T11:59:38.142368946Z"
+    description: Single-instance Redis with AOF persistence
+    digest: b02acc672cdcb0086d9d39965acd9132a1d1207dc0dc5395f87909d15ffe1df3
+    name: redis
+    type: application
+    urls:
+    - https://github.com/cagriekin/charts/releases/download/redis-0.1.0/redis-0.1.0.tgz
+    version: 0.1.0
+generated: "2026-02-20T11:59:38.142730258Z"
