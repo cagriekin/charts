@@ -1,3 +1,6 @@
+nameOverride: ""
+fullnameOverride: ""
+
 postgresql:
   image:
     repository: pgvector/pgvector
