@@ -47,6 +47,10 @@ spec:
                   value: {{ required "backup.s3.bucket is required when backup is enabled" .Values.backup.s3.bucket | quote }}
                 - name: S3_PREFIX
                   value: {{ .Values.backup.s3.prefix | quote }}
+                {{- if .Values.backup.s3.region }}
+                - name: S3_REGION
+                  value: {{ .Values.backup.s3.region | quote }}
+                {{- end }}
                 - name: S3_ACCESS_KEY
                   valueFrom:
                     secretKeyRef:
