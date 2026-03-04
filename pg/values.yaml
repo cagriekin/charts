@@ -182,6 +182,7 @@ backup:
     endpoint: ""
     bucket: ""
     prefix: "backups"
+    region: ""
   existingSecret:
     name: ""
     accessKeyIdKey: access-key-id
