@@ -111,10 +111,10 @@ pgpool:
     count: 5
 
   healthCheck:
-    period: 5
+    period: 10
     timeout: 30
-    maxRetries: 3
-    retryDelay: 1
+    maxRetries: 10
+    retryDelay: 3
 
   failOverOnBackendError: false
   autoFailback: true
