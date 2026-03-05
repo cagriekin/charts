@@ -182,6 +182,21 @@ spec:
                       fi
                       sleep 1
                     done
+{{- else if .Values.postgresql.lifecycle.postStart.additionalCommands }}
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/bash
+                  - -c
+                  - |
+                    for i in {1..30}; do
+                      if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
+                        {{ .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 24 }}
+                        break
+                      fi
+                      sleep 1
+                    done
 {{- end }}
           resources:
             {{- toYaml .Values.postgresql.resources | nindent 12 }}
