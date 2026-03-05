@@ -1033,6 +1033,22 @@ entries:
   pgvector:
   - apiVersion: v2
     appVersion: "18.1"
+    created: "2026-03-05T14:52:45.282825385Z"
+    description: PostgreSQL with pgvector extension and optional PGPool-II
+    digest: 05f8bfbbf629a7e60b5e1eca51a4ce4720739d3e6a87b01a85cd20ee418ef263
+    keywords:
+    - PostgreSQL
+    - pgvector
+    - PGPool-II
+    - Vector Search
+    - Vector Database
+    name: pgvector
+    type: application
+    urls:
+    - https://github.com/cagriekin/charts/releases/download/pgvector-0.6.9/pgvector-0.6.9.tgz
+    version: 0.6.9
+  - apiVersion: v2
+    appVersion: "18.1"
     created: "2026-03-05T14:44:11.546444841Z"
     description: PostgreSQL with pgvector extension and optional PGPool-II
     digest: ef08a83a4003d6edec3c4c7c5ae1eae9be670bb20718caa98633f15e1813257a
@@ -2327,4 +2343,4 @@ entries:
     urls:
     - https://github.com/cagriekin/charts/releases/download/redis-0.1.0/redis-0.1.0.tgz
     version: 0.1.0
-generated: "2026-03-05T14:44:11.546710464Z"
+generated: "2026-03-05T14:52:45.283264617Z"
