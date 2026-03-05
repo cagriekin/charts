@@ -190,7 +190,7 @@ spec:
                   - /bin/bash
                   - -c
                   - |
-                    for i in {1..30}; do
+                    for i in {1..90}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
                         {{ .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 24 }}
                         break
