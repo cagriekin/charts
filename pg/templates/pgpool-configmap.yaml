@@ -19,7 +19,7 @@ data:
     backend_hostname{{ $i }} = '{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local'
     backend_port{{ $i }} = 5432
     backend_weight{{ $i }} = 1
-    backend_flag{{ $i }} = 'ALLOW_TO_FAILOVER'
+    backend_flag{{ $i }} = 'DISALLOW_TO_FAILOVER'
     backend_application_name{{ $i }} = 'node{{ $i }}'
 
     {{- end }}
@@ -82,7 +82,7 @@ data:
 
 {{- if .Values.repmgr.enabled }}
     sr_check_period = 10
-    detach_false_primary = on
+    detach_false_primary = off
 {{- else }}
     sr_check_period = 0
 {{- end }}
