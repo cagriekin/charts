@@ -240,7 +240,7 @@ spec:
         - name: service-updater
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
-          command: ["/usr/local/bin/entrypoint.sh", "service-updater"]
+          command: ["/bin/bash", "/scripts/service-updater.sh"]
           env:
             - name: NAMESPACE
               valueFrom:
@@ -259,6 +259,13 @@ spec:
                   key: {{ include "pg.secretRepmgrPasswordKey" . }}
             - name: REPMGR_DB
               value: {{ .Values.repmgr.database }}
+{{- if .Values.pgpool.enabled }}
+            - name: PGPOOL_DEPLOYMENT
+              value: {{ include "pg.fullname" . }}-pgpool
+{{- end }}
+          volumeMounts:
+            - name: service-updater-script
+              mountPath: /scripts
           resources:
             requests:
               cpu: 10m
@@ -278,6 +285,10 @@ spec:
 {{- if .Values.repmgr.enabled }}
         - name: repmgr-config
           emptyDir: {}
+        - name: service-updater-script
+          configMap:
+            name: {{ include "pg.fullname" . }}-service-updater
+            defaultMode: 0755
 {{- end }}
 {{- if not .Values.postgresql.persistence.enabled }}
         - name: data
