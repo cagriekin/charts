@@ -1,0 +1,119 @@
+{{- if .Values.repmgr.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pg.fullname" . }}-service-updater
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+data:
+  service-updater.sh: |
+    #!/bin/bash
+    set -e
+
+    NAMESPACE=${NAMESPACE:?NAMESPACE is required}
+    MASTER_SERVICE=${MASTER_SERVICE:?MASTER_SERVICE is required}
+    HEADLESS_SERVICE=${HEADLESS_SERVICE:?HEADLESS_SERVICE is required}
+    REPMGR_DB=${REPMGR_DB:-repmgr}
+    REPMGR_USER=${REPMGR_USER:-repmgr}
+    REPMGR_PASSWORD=${REPMGR_PASSWORD:?REPMGR_PASSWORD is required}
+    MONITORING_INTERVAL=${MONITORING_INTERVAL:-30}
+
+    BASE_NAME="${HOSTNAME%-*}"
+
+    echo "Starting service updater"
+    echo "Namespace: ${NAMESPACE}, Service: ${MASTER_SERVICE}"
+
+    if [ -z "$KUBERNETES_SERVICE_HOST" ]; then
+        echo "Not running in Kubernetes, exiting"
+        exit 0
+    fi
+
+    get_current_master() {
+        local max_retries=3
+        local retry_count=0
+
+        while [ $retry_count -lt $max_retries ]; do
+            for i in $(seq 0 9); do
+                node="${BASE_NAME}-${i}.${HEADLESS_SERVICE}"
+                PRIMARY_NODE=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
+                    -t -c "SELECT node_name FROM repmgr.nodes WHERE type = 'primary' AND active = true LIMIT 1;" 2>/dev/null | xargs)
+
+                if [ -n "$PRIMARY_NODE" ]; then
+                    echo "$PRIMARY_NODE"
+                    return 0
+                fi
+            done
+
+            retry_count=$((retry_count + 1))
+            if [ $retry_count -lt $max_retries ]; then
+                sleep 5
+            fi
+        done
+
+        echo ""
+    }
+
+    update_service_selector() {
+        local new_master=$1
+
+        if [ -z "$new_master" ]; then
+            return 1
+        fi
+
+        CURRENT_SELECTOR=$(kubectl get service "${MASTER_SERVICE}" -n "${NAMESPACE}" -o jsonpath='{.spec.selector.statefulset\.kubernetes\.io/pod-name}')
+
+        if [ "$CURRENT_SELECTOR" = "$new_master" ]; then
+            return 0
+        fi
+
+        echo "Updating service selector to: ${new_master}"
+
+        kubectl patch service "${MASTER_SERVICE}" -n "${NAMESPACE}" --type merge -p "{
+            \"spec\": {
+                \"selector\": {
+                    \"statefulset.kubernetes.io/pod-name\": \"${new_master}\"
+                }
+            }
+        }"
+    }
+
+    restart_pgpool() {
+        if [ -z "$PGPOOL_DEPLOYMENT" ]; then
+            return 0
+        fi
+
+        if [ "$CURRENT_MASTER" != "$HOSTNAME" ]; then
+            return 0
+        fi
+
+        echo "Restarting pgpool deployment: ${PGPOOL_DEPLOYMENT}"
+        kubectl rollout restart deployment "${PGPOOL_DEPLOYMENT}" -n "${NAMESPACE}"
+    }
+
+    LAST_MASTER=""
+    CONSECUTIVE_FAILURES=0
+    MAX_CONSECUTIVE_FAILURES=5
+
+    while true; do
+        CURRENT_MASTER=$(get_current_master)
+
+        if [ -n "$CURRENT_MASTER" ] && [ "$CURRENT_MASTER" != "$LAST_MASTER" ]; then
+            echo "Master change: ${LAST_MASTER} -> ${CURRENT_MASTER}"
+            if update_service_selector "$CURRENT_MASTER"; then
+                restart_pgpool
+                LAST_MASTER="$CURRENT_MASTER"
+                CONSECUTIVE_FAILURES=0
+            fi
+        elif [ -z "$CURRENT_MASTER" ]; then
+            CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+            if [ $CONSECUTIVE_FAILURES -ge $MAX_CONSECUTIVE_FAILURES ]; then
+                echo "WARNING: Could not determine master (failed $CONSECUTIVE_FAILURES times)"
+                CONSECUTIVE_FAILURES=0
+            fi
+        else
+            CONSECUTIVE_FAILURES=0
+        fi
+
+        sleep ${MONITORING_INTERVAL}
+    done
+{{- end }}
