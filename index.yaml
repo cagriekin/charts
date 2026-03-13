@@ -772,6 +772,16 @@ entries:
   pg:
   - apiVersion: v2
     appVersion: "18.1"
+    created: "2026-03-13T19:46:32.946736+01:00"
+    description: PostgreSQL with repmgr replication and optional PGPool-II
+    digest: 0afc1b39ba6b9a6233905b678c499b295b141bb824693206ce586cdd249d1047
+    name: pg
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/pg-0.5.13.tgz
+    version: 0.5.13
+  - apiVersion: v2
+    appVersion: "18.1"
     created: "2026-03-13T14:24:00.815325497Z"
     description: PostgreSQL with repmgr replication and optional PGPool-II
     digest: c1473c94339dfc23743a7daf65391d5a82e3462559d049754020dafe9e8bb09c
@@ -2499,4 +2509,4 @@ entries:
     urls:
     - https://github.com/cagriekin/charts/releases/download/redis-0.1.0/redis-0.1.0.tgz
     version: 0.1.0
-generated: "2026-03-13T14:24:00.989221235Z"
+generated: "2026-03-13T19:46:32.944859+01:00"
