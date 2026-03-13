@@ -70,7 +70,7 @@ postgresql:
 repmgr:
   image:
     repository: cagriekin/repmgr
-    tag: trixie-5.5.0-2
+    tag: trixie-5.5.0-3
     pullPolicy: IfNotPresent
 
   enabled: true
@@ -99,7 +99,7 @@ pgpool:
   numInitChildren: 32
   maxPool: 4
   childLifeTime: 300
-  connectionLifeTime: 600
+  connectionLifeTime: 60
   clientIdleLimit: 300
 
   resetQueryList: "ABORT; RESET ALL; DEALLOCATE ALL"

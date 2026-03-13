@@ -262,6 +262,25 @@ spec:
 {{- if .Values.pgpool.enabled }}
             - name: PGPOOL_DEPLOYMENT
               value: {{ include "pg.fullname" . }}-pgpool
+            - name: PGPOOL_SERVICE
+              value: {{ include "pg.fullname" . }}-pgpool.{{ .Release.Namespace }}.svc.cluster.local
+            - name: PGPOOL_PORT
+              value: "{{ .Values.pgpool.service.port }}"
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretUsernameKey" . }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretPasswordKey" . }}
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretDatabaseKey" . }}
 {{- end }}
           volumeMounts:
             - name: service-updater-script
