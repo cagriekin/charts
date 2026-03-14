@@ -87,6 +87,15 @@ repmgr:
       cpu: 500m
       memory: 512Mi
 
+  serviceUpdater:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 500m
+        memory: 128Mi
+
 pgpool:
   enabled: false
 
