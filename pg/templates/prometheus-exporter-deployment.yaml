@@ -55,6 +55,19 @@ spec:
             - --web.listen-address=:9116
             - --web.telemetry-path=/metrics
             - --log.level=info
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretUsernameKey" . }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretPasswordKey" . }}
+            - name: DATA_SOURCE_NAME
+              value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@{{ include "pg.fullname" . }}-headless:5432/postgres?sslmode=disable"
           ports:
             - name: metrics
               containerPort: 9116
