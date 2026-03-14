@@ -17,12 +17,6 @@ spec:
       labels:
         {{- include "pg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: pgpool
-{{- if .Values.pgpool.metrics.enabled }}
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "{{ .Values.pgpool.metrics.port }}"
-        prometheus.io/path: "/metrics"
-{{- end }}
     spec:
       affinity:
         {{- if .Values.pgpool.affinity }}
@@ -94,11 +88,6 @@ spec:
             - name: pcp
               containerPort: 9898
               protocol: TCP
-{{- if .Values.pgpool.metrics.enabled }}
-            - name: metrics
-              containerPort: {{ .Values.pgpool.metrics.port }}
-              protocol: TCP
-{{- end }}
           livenessProbe:
             tcpSocket:
               port: 9999
