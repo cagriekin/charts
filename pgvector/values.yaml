@@ -150,6 +150,20 @@ pgpool:
 
   affinity: {}
 
+  metrics:
+    enabled: false
+    image:
+      repository: pgpool/pgpool2_exporter
+      tag: "1.2.2"
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+
   podDisruptionBudget:
     enabled: true
     minAvailable: 1
