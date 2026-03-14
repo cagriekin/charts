@@ -33,7 +33,7 @@ data:
         local retry_count=0
 
         while [ $retry_count -lt $max_retries ]; do
-            for i in $(seq 0 9); do
+            for i in $(seq 0 {{ .Values.postgresql.replicaCount }}); do
                 node="${BASE_NAME}-${i}.${HEADLESS_SERVICE}"
                 PRIMARY_NODE=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
                     -t -c "SELECT node_name FROM repmgr.nodes WHERE type = 'primary' AND active = true LIMIT 1;" 2>/dev/null | xargs)

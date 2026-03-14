@@ -286,12 +286,7 @@ spec:
             - name: service-updater-script
               mountPath: /scripts
           resources:
-            requests:
-              cpu: {{ .Values.repmgr.serviceUpdater.resources.requests.cpu }}
-              memory: {{ .Values.repmgr.serviceUpdater.resources.requests.memory }}
-            limits:
-              cpu: {{ .Values.repmgr.serviceUpdater.resources.limits.cpu }}
-              memory: {{ .Values.repmgr.serviceUpdater.resources.limits.memory }}
+            {{- toYaml .Values.repmgr.serviceUpdater.resources | nindent 12 }}
 {{- end }}
 {{- if or .Values.postgresql.extensions.enabled .Values.repmgr.enabled (not .Values.postgresql.persistence.enabled) }}
       volumes:
