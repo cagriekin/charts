@@ -162,6 +162,8 @@ prometheusExporter:
     tag: v0.15.0
     pullPolicy: IfNotPresent
 
+  podAnnotations: {}
+
   resources:
     requests:
       cpu: 50m

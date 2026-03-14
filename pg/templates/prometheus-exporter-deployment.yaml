@@ -22,6 +22,9 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9116"
         prometheus.io/path: "/metrics"
+        {{- with .Values.prometheusExporter.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       initContainers:
         - name: init-config
