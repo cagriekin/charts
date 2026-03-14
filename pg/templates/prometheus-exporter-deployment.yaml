@@ -19,6 +19,9 @@ spec:
         app.kubernetes.io/component: postgres-exporter
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/prometheus-exporter-configmap.yaml") . | sha256sum }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9116"
+        prometheus.io/path: "/metrics"
     spec:
       initContainers:
         - name: init-config
