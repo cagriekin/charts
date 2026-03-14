@@ -17,6 +17,12 @@ spec:
       labels:
         {{- include "pg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: pgpool
+{{- if .Values.pgpool.metrics.enabled }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9127"
+        prometheus.io/path: "/metrics"
+{{- end }}
     spec:
       affinity:
         {{- if .Values.pgpool.affinity }}
@@ -107,6 +113,55 @@ spec:
           volumeMounts:
             - name: pgpool-config
               mountPath: /usr/local/etc
+{{- if .Values.pgpool.metrics.enabled }}
+        - name: pgpool-exporter
+          image: "{{ .Values.pgpool.metrics.image.repository }}:{{ .Values.pgpool.metrics.image.tag }}"
+          imagePullPolicy: {{ .Values.pgpool.metrics.image.pullPolicy }}
+          env:
+            - name: POSTGRES_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretUsernameKey" . }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretPasswordKey" . }}
+            - name: POSTGRES_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretDatabaseKey" . }}
+            - name: PGPOOL_SERVICE
+              value: "localhost"
+            - name: PGPOOL_SERVICE_PORT
+              value: "9999"
+            - name: SSLMODE
+              value: "disable"
+          ports:
+            - name: metrics
+              containerPort: 9127
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.pgpool.metrics.resources | nindent 12 }}
+{{- end }}
       volumes:
         - name: config
           configMap:
