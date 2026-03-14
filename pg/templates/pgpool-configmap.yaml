@@ -112,6 +112,11 @@ data:
 
     allow_clear_text_frontend_auth = on
 
+{{- if .Values.pgpool.metrics.enabled }}
+    enable_prometheus = on
+    prometheus_port = {{ .Values.pgpool.metrics.port }}
+{{- end }}
+
   pcp.conf: |
     {{ .Values.pgpool.adminUsername }}:{{ .Values.pgpool.adminPassword | sha256sum }}
 
