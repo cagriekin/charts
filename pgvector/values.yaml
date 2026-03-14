@@ -150,6 +150,10 @@ pgpool:
 
   affinity: {}
 
+  metrics:
+    enabled: false
+    port: 9719
+
   podDisruptionBudget:
     enabled: true
     minAvailable: 1
