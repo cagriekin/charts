@@ -93,7 +93,6 @@ repmgr:
         cpu: 50m
         memory: 64Mi
       limits:
-        cpu: 500m
         memory: 128Mi
 
 pgpool:
