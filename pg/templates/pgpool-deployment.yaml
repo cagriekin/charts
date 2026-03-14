@@ -20,7 +20,7 @@ spec:
 {{- if .Values.pgpool.metrics.enabled }}
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "9127"
+        prometheus.io/port: "9719"
         prometheus.io/path: "/metrics"
 {{- end }}
     spec:
@@ -141,7 +141,7 @@ spec:
               value: "disable"
           ports:
             - name: metrics
-              containerPort: 9127
+              containerPort: 9719
               protocol: TCP
           livenessProbe:
             httpGet:
