@@ -287,11 +287,11 @@ spec:
               mountPath: /scripts
           resources:
             requests:
-              cpu: 10m
-              memory: 32Mi
+              cpu: {{ .Values.repmgr.serviceUpdater.resources.requests.cpu }}
+              memory: {{ .Values.repmgr.serviceUpdater.resources.requests.memory }}
             limits:
-              cpu: 100m
-              memory: 64Mi
+              cpu: {{ .Values.repmgr.serviceUpdater.resources.limits.cpu }}
+              memory: {{ .Values.repmgr.serviceUpdater.resources.limits.memory }}
 {{- end }}
 {{- if or .Values.postgresql.extensions.enabled .Values.repmgr.enabled (not .Values.postgresql.persistence.enabled) }}
       volumes:
