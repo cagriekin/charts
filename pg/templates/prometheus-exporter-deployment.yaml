@@ -72,8 +72,13 @@ spec:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretPasswordKey" . }}
+            - name: POSTGRES_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretDatabaseKey" . }}
             - name: DATA_SOURCE_NAME
-              value: "postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@{{ include "pg.fullname" . }}-headless:5432/postgres?sslmode=disable"
+              value: "{{ range $i := until (int (add .Values.postgresql.replicaCount 1)) }}{{ if $i }},{{ end }}postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless:5432/$(POSTGRES_DATABASE)?sslmode=disable{{ end }}"
           ports:
             - name: metrics
               containerPort: 9116
