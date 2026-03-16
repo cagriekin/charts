@@ -172,7 +172,7 @@ prometheusExporter:
 
   image:
     repository: quay.io/prometheuscommunity/postgres-exporter
-    tag: v0.15.0
+    tag: v0.19.1
     pullPolicy: IfNotPresent
 
   podAnnotations: {}
