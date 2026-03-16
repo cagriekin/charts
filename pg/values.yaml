@@ -107,7 +107,7 @@ pgpool:
   numInitChildren: 32
   maxPool: 4
   childLifeTime: 300
-  connectionLifeTime: 60
+  connectionLifeTime: 600
   clientIdleLimit: 300
 
   resetQueryList: "ABORT; RESET ALL; DEALLOCATE ALL"
