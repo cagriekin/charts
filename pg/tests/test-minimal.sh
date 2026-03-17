@@ -43,10 +43,11 @@ user_exists=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT 1 FROM pg_roles WHERE roln
 assert_eq "user testuser exists" "1" "${user_exists}"
 
 # Test: write and read data
+TEST_VALUE="hello-$(date +%s)"
 pg_exec "${NAMESPACE}" "${POD}" "CREATE TABLE IF NOT EXISTS test_data (id serial PRIMARY KEY, value text)" "testuser" "testdb"
-pg_exec "${NAMESPACE}" "${POD}" "INSERT INTO test_data (value) VALUES ('hello')" "testuser" "testdb"
-read_val=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT value FROM test_data WHERE value='hello'" "testuser" "testdb")
-assert_eq "can write and read data" "hello" "${read_val}"
+pg_exec "${NAMESPACE}" "${POD}" "INSERT INTO test_data (value) VALUES ('${TEST_VALUE}')" "testuser" "testdb"
+read_val=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT value FROM test_data WHERE value='${TEST_VALUE}'" "testuser" "testdb")
+assert_eq "can write and read data" "${TEST_VALUE}" "${read_val}"
 
 # Test: service resolves to the pod
 svc_endpoint=$(kubectl get endpoints -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.subsets[0].addresses[0].targetRef.name}')
