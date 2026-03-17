@@ -8,6 +8,16 @@ on:
       - 'pg/**'
       - '.github/workflows/pg-test.yaml'
 
+env:
+  IMAGES: >-
+    postgres:18.1-trixie
+    cagriekin/repmgr:trixie-5.5.0-4
+    cagriekin/pgpool:4.7.0
+    pgpool/pgpool2_exporter:1.2.2
+    quay.io/prometheuscommunity/postgres-exporter:v0.19.1
+    busybox:1.37
+    busybox:1.35
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -25,6 +35,31 @@ jobs:
         with:
           cluster_name: pg-test
           config: pg/kind-config.yaml
+
+      - name: Cache container images
+        id: image-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/kind-images
+          key: kind-images-${{ hashFiles('pg/values.yaml') }}
+
+      - name: Load cached images into Kind
+        if: steps.image-cache.outputs.cache-hit == 'true'
+        run: |
+          for tarball in /tmp/kind-images/*.tar; do
+            kind load image-archive "$tarball" --name pg-test
+          done
+
+      - name: Pull and cache images
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/kind-images
+          for image in $IMAGES; do
+            docker pull "$image"
+            safe_name=$(echo "$image" | tr '/:' '_')
+            docker save "$image" -o "/tmp/kind-images/${safe_name}.tar"
+            kind load image-archive "/tmp/kind-images/${safe_name}.tar" --name pg-test
+          done
 
       - name: Run template tests
         run: make -C pg test-template
