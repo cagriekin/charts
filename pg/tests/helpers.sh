@@ -49,7 +49,7 @@ assert_contains() {
   local description="$1"
   local haystack="$2"
   local needle="$3"
-  if echo "${haystack}" | grep -q "${needle}"; then
+  if grep -q "${needle}" <<< "${haystack}"; then
     pass "${description}"
   else
     fail "${description}" "output does not contain '${needle}'"
@@ -60,7 +60,7 @@ assert_not_contains() {
   local description="$1"
   local haystack="$2"
   local needle="$3"
-  if echo "${haystack}" | grep -q "${needle}"; then
+  if grep -q "${needle}" <<< "${haystack}"; then
     fail "${description}" "output should not contain '${needle}'"
   else
     pass "${description}"
