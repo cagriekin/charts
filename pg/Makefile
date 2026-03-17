@@ -1,15 +1,16 @@
 CLUSTER_NAME ?= pg-test
 KIND_CONFIG := kind-config.yaml
 TESTS_DIR := tests
+MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-repmgr test-full test-failover test-upgrade \
-        cluster-create cluster-delete cluster-exists clean help
+        test-repmgr-failover cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
 	@echo "  test            - Run all tests (creates cluster, runs tests, deletes cluster)"
 	@echo "  test-template   - Run helm template/lint tests (no cluster needed)"
-	@echo "  test-cluster    - Run all cluster tests (assumes cluster exists)"
+	@echo "  test-cluster    - Run all cluster tests in parallel (assumes cluster exists)"
 	@echo "  test-minimal    - Run minimal install tests"
 	@echo "  test-repmgr     - Run repmgr install tests"
 	@echo "  test-full       - Run full install tests"
@@ -24,7 +25,16 @@ test: cluster-create test-template test-cluster cluster-delete
 test-template:
 	@bash $(TESTS_DIR)/test-template.sh
 
-test-cluster: test-minimal test-repmgr test-failover test-full test-upgrade
+# Run independent suites in parallel with -j
+# test-repmgr-failover is sequential (repmgr then failover)
+# test-minimal, test-repmgr-failover, test-full, test-upgrade run in parallel
+test-cluster: test-minimal test-repmgr-failover test-full test-upgrade
+	@echo "All test suites passed"
+
+# Chain: repmgr install -> failover test (must be sequential)
+test-repmgr-failover: cluster-exists
+	@bash $(TESTS_DIR)/test-repmgr.sh
+	@bash $(TESTS_DIR)/test-failover.sh
 
 cluster-exists:
 	@kind get clusters 2>/dev/null | grep -q "^$(CLUSTER_NAME)$$" || (echo "Cluster '$(CLUSTER_NAME)' not found. Run: make cluster-create" && exit 1)
