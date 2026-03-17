@@ -60,6 +60,10 @@ spec:
         - name: config
           configMap:
             name: {{ include "redis.fullname" . }}
+        {{- if not .Values.redis.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
   {{- if .Values.redis.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:
@@ -73,7 +77,4 @@ spec:
         resources:
           requests:
             storage: {{ .Values.redis.persistence.size }}
-  {{- else }}
-      - name: data
-        emptyDir: {}
   {{- end }}
