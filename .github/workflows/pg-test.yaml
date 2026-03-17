@@ -1,0 +1,42 @@
+name: Test pg chart
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'pg/**'
+      - '.github/workflows/pg-test.yaml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.2
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: pg-test
+          config: pg/kind-config.yaml
+
+      - name: Run template tests
+        run: make -C pg test-template
+
+      - name: Run minimal tests
+        run: make -C pg test-minimal
+
+      - name: Run repmgr and failover tests
+        run: make -C pg test-repmgr-failover
+
+      - name: Run full tests
+        run: make -C pg test-full
+
+      - name: Run upgrade tests
+        run: make -C pg test-upgrade
