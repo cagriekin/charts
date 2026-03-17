@@ -1,0 +1,62 @@
+kafka:
+  enabled: true
+
+  image:
+    repository: apache/kafka
+    tag: 4.1.0
+    pullPolicy: IfNotPresent
+
+  controller:
+    replicaCount: 1
+    persistence:
+      size: 1Gi
+      storageClass: standard
+    resources:
+      requests:
+        cpu: 100m
+        memory: 500Mi
+      limits:
+        cpu: 200m
+        memory: 1Gi
+    podDisruptionBudget:
+      enabled: false
+    jvm:
+      heapOpts: "-Xms256m -Xmx256m"
+      performanceOpts: "-XX:+UseG1GC"
+
+  broker:
+    replicaCount: 1
+    persistence:
+      size: 1Gi
+      storageClass: standard
+    resources:
+      requests:
+        cpu: 100m
+        memory: 500Mi
+      limits:
+        cpu: 200m
+        memory: 1Gi
+    podDisruptionBudget:
+      enabled: false
+    jvm:
+      heapOpts: "-Xms256m -Xmx256m"
+      performanceOpts: "-XX:+UseG1GC"
+
+  auth:
+    username: testuser
+    password: dGVzdHBhc3N3b3Jk
+
+  autoCreateTopicsEnable: true
+  deleteTopicEnable: true
+
+  topics: {}
+
+exporters:
+  kafka:
+    enabled: false
+
+networkPolicy:
+  enabled: false
+
+serviceAccount:
+  create: true
