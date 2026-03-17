@@ -3,13 +3,8 @@ name: Release Helm Charts
 on:
   workflow_dispatch:
   push:
-    branches:
-      - master
-    paths:
-      - '**/Chart.yaml'
-      - '**/values.yaml'
-      - '**/templates/**'
-      - '.github/workflows/release.yaml'
+    tags:
+      - '*'
 
 jobs:
   release:
@@ -36,7 +31,7 @@ jobs:
             git reset --hard
             git commit --allow-empty -m "Initialize gh-pages branch"
             git push origin gh-pages
-            git checkout master
+            git checkout "${GITHUB_REF}"
           fi
 
       - name: Set up Helm
