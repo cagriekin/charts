@@ -53,8 +53,15 @@ assert_eq "pod-0 is primary (not in recovery)" "t" "${is_primary}"
 is_replica=$(pg_exec "${NAMESPACE}" "${POD_REPLICA}" "SELECT pg_is_in_recovery()" "testuser" "testdb")
 assert_eq "pod-1 is replica (in recovery)" "t" "${is_replica}"
 
-# Test: repmgr cluster shows both nodes
-cluster_output=$(pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "SELECT node_name, type, active FROM repmgr.nodes ORDER BY node_id" "repmgr" "repmgr")
+# Test: repmgr cluster shows both nodes (retry -- standby registration may lag pod readiness)
+cluster_output=""
+for i in $(seq 1 12); do
+  cluster_output=$(pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "SELECT node_name, type, active FROM repmgr.nodes ORDER BY node_id" "repmgr" "repmgr")
+  if echo "${cluster_output}" | grep -q "standby"; then
+    break
+  fi
+  sleep 5
+done
 assert_contains "repmgr sees primary node" "${cluster_output}" "primary"
 assert_contains "repmgr sees standby node" "${cluster_output}" "standby"
 
