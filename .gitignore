@@ -1,5 +1,4 @@
 .idea
 *.iml
 test.yaml
-kind-config.yaml
 values-full.yaml
