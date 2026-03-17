@@ -9,7 +9,7 @@ NAMESPACE="${NAMESPACE:-pg-test-repmgr}"
 RELEASE="${RELEASE:-pg-repmgr}"
 FULLNAME=$(resolve_fullname "${RELEASE}" "${CHART_DIR}" "${SCRIPT_DIR}/values-repmgr.yaml")
 
-begin_suite "Failover (kill primary, verify promotion)"
+begin_suite "Failover (delete primary pod, verify promotion)"
 
 POD_PRIMARY="${FULLNAME}-0"
 POD_REPLICA="${FULLNAME}-1"
@@ -19,18 +19,21 @@ is_primary=$(pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "SELECT NOT pg_is_in_recove
 assert_eq "pod-0 starts as primary" "t" "${is_primary}"
 
 # Write data before failover
+FAILOVER_VALUE="before-failover-$(date +%s)"
 pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "CREATE TABLE IF NOT EXISTS failover_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
-pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "INSERT INTO failover_test (value) VALUES ('before-failover')" "testuser" "testdb"
-sleep 2
+pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "INSERT INTO failover_test (value) VALUES ('${FAILOVER_VALUE}')" "testuser" "testdb"
+sleep 3
 
-# Kill the primary postgres process to trigger failover
-echo "  Killing primary postgresql process on ${POD_PRIMARY}..."
-kubectl exec -n "${NAMESPACE}" "${POD_PRIMARY}" -c postgresql -- \
-  bash -c "kill -9 \$(head -1 /var/lib/postgresql/data/pgdata/postmaster.pid)" 2>/dev/null || true
+# Delete the primary pod to simulate a node failure
+# StatefulSet recreates it, but init containers make recovery slow enough
+# for repmgr on the standby to detect the outage and promote
+echo "  Deleting primary pod ${POD_PRIMARY}..."
+kubectl delete pod -n "${NAMESPACE}" "${POD_PRIMARY}" --grace-period=0 --force 2>/dev/null
 
-# Wait for repmgr to detect failure and promote replica
-echo "  Waiting for failover (up to 120s)..."
-failover_timeout=120
+# Wait for repmgr on standby to detect failure and promote
+# repmgr config: reconnect_attempts=3, reconnect_interval=10 -> ~30s detection
+echo "  Waiting for failover (up to 180s)..."
+failover_timeout=180
 failover_elapsed=0
 failover_done=false
 
@@ -47,19 +50,20 @@ done
 
 assert_eq "replica promoted to primary" "true" "${failover_done}"
 
-# Test: data survives failover
 if [[ "${failover_done}" == "true" ]]; then
-  survived_val=$(pg_exec "${NAMESPACE}" "${POD_REPLICA}" "SELECT value FROM failover_test WHERE value='before-failover'" "testuser" "testdb")
-  assert_eq "data survives failover" "before-failover" "${survived_val}"
+  # Test: data survives failover
+  survived_val=$(pg_exec "${NAMESPACE}" "${POD_REPLICA}" "SELECT value FROM failover_test WHERE value='${FAILOVER_VALUE}'" "testuser" "testdb")
+  assert_eq "data survives failover" "${FAILOVER_VALUE}" "${survived_val}"
 
   # Test: can write to new primary
-  pg_exec "${NAMESPACE}" "${POD_REPLICA}" "INSERT INTO failover_test (value) VALUES ('after-failover')" "testuser" "testdb"
-  after_val=$(pg_exec "${NAMESPACE}" "${POD_REPLICA}" "SELECT value FROM failover_test WHERE value='after-failover'" "testuser" "testdb")
-  assert_eq "can write to new primary" "after-failover" "${after_val}"
+  AFTER_VALUE="after-failover-$(date +%s)"
+  pg_exec "${NAMESPACE}" "${POD_REPLICA}" "INSERT INTO failover_test (value) VALUES ('${AFTER_VALUE}')" "testuser" "testdb"
+  after_val=$(pg_exec "${NAMESPACE}" "${POD_REPLICA}" "SELECT value FROM failover_test WHERE value='${AFTER_VALUE}'" "testuser" "testdb")
+  assert_eq "can write to new primary" "${AFTER_VALUE}" "${after_val}"
 
   # Test: service-updater patches service to point to new primary
-  echo "  Waiting for service-updater to patch service (up to 60s)..."
-  svc_timeout=60
+  echo "  Waiting for service-updater to patch service (up to 90s)..."
+  svc_timeout=90
   svc_elapsed=0
   svc_updated=false
 
