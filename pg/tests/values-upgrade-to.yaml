@@ -1,0 +1,162 @@
+postgresql:
+  image:
+    repository: postgres
+    tag: 18.1-trixie
+    pullPolicy: IfNotPresent
+
+  replicaCount: 2
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  persistence:
+    enabled: true
+    storageClass: standard
+    size: 1Gi
+
+  database: testdb
+  username: testuser
+
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+  affinity: {}
+
+  podDisruptionBudget:
+    enabled: false
+
+  lifecycle:
+    postStart:
+      additionalCommands: ""
+
+repmgr:
+  image:
+    repository: cagriekin/repmgr
+    tag: trixie-5.5.0-4
+    pullPolicy: IfNotPresent
+
+  enabled: true
+
+  username: repmgr
+  database: repmgr
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  serviceUpdater:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
+
+pgpool:
+  enabled: true
+
+  image:
+    repository: cagriekin/pgpool
+    tag: 4.7.0
+    pullPolicy: IfNotPresent
+
+  replicaCount: 1
+
+  numInitChildren: 32
+  maxPool: 4
+  childLifeTime: 300
+  connectionLifeTime: 600
+  clientIdleLimit: 300
+
+  resetQueryList: "ABORT; RESET ALL; DEALLOCATE ALL"
+
+  tcpKeepalive:
+    idle: 10
+    interval: 3
+    count: 5
+
+  healthCheck:
+    period: 10
+    timeout: 30
+    maxRetries: 10
+    retryDelay: 3
+
+  failOverOnBackendError: false
+  autoFailback: true
+
+  logging:
+    logConnections: true
+    logStatement: true
+    logPerNodeStatement: true
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  adminUsername: admin
+  adminPassword: admin
+
+  service:
+    type: ClusterIP
+    port: 9999
+
+  metrics:
+    enabled: false
+
+  podDisruptionBudget:
+    enabled: false
+
+prometheusExporter:
+  enabled: true
+
+  image:
+    repository: quay.io/prometheuscommunity/postgres-exporter
+    tag: v0.19.1
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+  service:
+    type: ClusterIP
+    port: 9116
+    annotations: {}
+
+  serviceMonitor:
+    enabled: false
+
+backup:
+  enabled: false
+
+service:
+  type: ClusterIP
+  port: 5432
