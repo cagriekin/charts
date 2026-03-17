@@ -59,13 +59,14 @@ assert_contains "repmgr sees primary node" "${cluster_output}" "primary"
 assert_contains "repmgr sees standby node" "${cluster_output}" "standby"
 
 # Test: replication works - write on primary, read on replica
+REPL_VALUE="replicated-$(date +%s)"
 pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "CREATE TABLE IF NOT EXISTS repl_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
-pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "INSERT INTO repl_test (value) VALUES ('replicated')" "testuser" "testdb"
+pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "INSERT INTO repl_test (value) VALUES ('${REPL_VALUE}')" "testuser" "testdb"
 
 sleep 3
 
-replicated_val=$(pg_exec "${NAMESPACE}" "${POD_REPLICA}" "SELECT value FROM repl_test WHERE value='replicated'" "testuser" "testdb")
-assert_eq "data replicated to standby" "replicated" "${replicated_val}"
+replicated_val=$(pg_exec "${NAMESPACE}" "${POD_REPLICA}" "SELECT value FROM repl_test WHERE value='${REPL_VALUE}'" "testuser" "testdb")
+assert_eq "data replicated to standby" "${REPL_VALUE}" "${replicated_val}"
 
 # Test: replica is read-only
 pg_exec "${NAMESPACE}" "${POD_REPLICA}" "INSERT INTO repl_test (value) VALUES ('should-fail')" "testuser" "testdb" 2>/dev/null && write_succeeded=true || write_succeeded=false

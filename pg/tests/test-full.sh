@@ -40,14 +40,15 @@ for pod in "${POD_1}" "${POD_2}"; do
 done
 
 # Test: replication across all nodes
+REPL_VALUE="full-replicated-$(date +%s)"
 pg_exec "${NAMESPACE}" "${POD_0}" "CREATE TABLE IF NOT EXISTS full_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
-pg_exec "${NAMESPACE}" "${POD_0}" "INSERT INTO full_test (value) VALUES ('full-replicated')" "testuser" "testdb"
+pg_exec "${NAMESPACE}" "${POD_0}" "INSERT INTO full_test (value) VALUES ('${REPL_VALUE}')" "testuser" "testdb"
 
 sleep 3
 
 for pod in "${POD_1}" "${POD_2}"; do
-  val=$(pg_exec "${NAMESPACE}" "${pod}" "SELECT value FROM full_test WHERE value='full-replicated'" "testuser" "testdb")
-  assert_eq "data replicated to ${pod}" "full-replicated" "${val}"
+  val=$(pg_exec "${NAMESPACE}" "${pod}" "SELECT value FROM full_test WHERE value='${REPL_VALUE}'" "testuser" "testdb")
+  assert_eq "data replicated to ${pod}" "${REPL_VALUE}" "${val}"
 done
 
 # Test: repmgr sees all 3 nodes
@@ -76,10 +77,11 @@ pgpool_result=$(kubectl exec -n "${NAMESPACE}" "${POD_0}" -c postgresql -- \
 assert_eq "can query through pgpool" "1" "${pgpool_result}"
 
 # Test: write through pgpool reaches primary
+PGPOOL_VALUE="via-pgpool-$(date +%s)"
 kubectl exec -n "${NAMESPACE}" "${POD_0}" -c postgresql -- \
-  psql -h "${pgpool_svc}" -p 9999 -U testuser -d testdb -c "INSERT INTO full_test (value) VALUES ('via-pgpool')" 2>/dev/null
-pgpool_write_val=$(pg_exec "${NAMESPACE}" "${POD_0}" "SELECT value FROM full_test WHERE value='via-pgpool'" "testuser" "testdb")
-assert_eq "write through pgpool persisted on primary" "via-pgpool" "${pgpool_write_val}"
+  psql -h "${pgpool_svc}" -p 9999 -U testuser -d testdb -c "INSERT INTO full_test (value) VALUES ('${PGPOOL_VALUE}')" 2>/dev/null
+pgpool_write_val=$(pg_exec "${NAMESPACE}" "${POD_0}" "SELECT value FROM full_test WHERE value='${PGPOOL_VALUE}'" "testuser" "testdb")
+assert_eq "write through pgpool persisted on primary" "${PGPOOL_VALUE}" "${pgpool_write_val}"
 
 # Test: pgpool metrics sidecar
 pgpool_containers=$(kubectl get pod -n "${NAMESPACE}" "${pgpool_pod}" -o jsonpath='{.spec.containers[*].name}')
