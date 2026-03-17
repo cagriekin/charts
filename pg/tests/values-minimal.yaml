@@ -1,0 +1,60 @@
+postgresql:
+  image:
+    repository: postgres
+    tag: 18.1-trixie
+    pullPolicy: IfNotPresent
+
+  replicaCount: 0
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  persistence:
+    enabled: false
+
+  database: testdb
+  username: testuser
+
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+  affinity: {}
+
+  podDisruptionBudget:
+    enabled: false
+
+  lifecycle:
+    postStart:
+      additionalCommands: ""
+
+repmgr:
+  enabled: false
+
+pgpool:
+  enabled: false
+
+prometheusExporter:
+  enabled: false
+
+backup:
+  enabled: false
+
+service:
+  type: ClusterIP
+  port: 5432
