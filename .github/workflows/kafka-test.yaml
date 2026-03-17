@@ -1,0 +1,66 @@
+name: Test kafka chart
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'kafka/**'
+      - '.github/workflows/kafka-test.yaml'
+
+env:
+  IMAGES: >-
+    apache/kafka:4.1.0
+    danielqsj/kafka-exporter:v1.9.0
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.2
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: kafka-test
+          config: kafka/kind-config.yaml
+
+      - name: Cache container images
+        id: image-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/kind-images
+          key: kind-images-kafka-${{ hashFiles('kafka/values.yaml') }}
+
+      - name: Load cached images into Kind
+        if: steps.image-cache.outputs.cache-hit == 'true'
+        run: |
+          for tarball in /tmp/kind-images/*.tar; do
+            kind load image-archive "$tarball" --name kafka-test
+          done
+
+      - name: Pull and cache images
+        if: steps.image-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/kind-images
+          for image in $IMAGES; do
+            docker pull "$image"
+            safe_name=$(echo "$image" | tr '/:' '_')
+            docker save "$image" -o "/tmp/kind-images/${safe_name}.tar"
+            kind load image-archive "/tmp/kind-images/${safe_name}.tar" --name kafka-test
+          done
+
+      - name: Run template tests
+        run: make -C kafka test-template
+
+      - name: Run minimal tests
+        run: make -C kafka test-minimal
+
+      - name: Run full tests
+        run: make -C kafka test-full
