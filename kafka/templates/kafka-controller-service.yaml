@@ -12,6 +12,7 @@ metadata:
     helm.sh/chart: {{ include "kafka.chart" . }}
 spec:
   type: ClusterIP
+  clusterIP: None
   ports:
     - port: 9093
       targetPort: controller
@@ -22,4 +23,3 @@ spec:
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: kafka-controller
 {{- end }}
-

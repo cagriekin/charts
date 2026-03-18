@@ -23,12 +23,27 @@ kafka:
     jvm:
       heapOpts: "-Xms256m -Xmx256m"
       performanceOpts: "-XX:+UseG1GC"
+    affinity: {}
 
   broker:
     replicaCount: 2
     persistence:
       size: 1Gi
       storageClass: standard
+    config:
+      numPartitions: 3
+      defaultReplicationFactor: 1
+      minInsyncReplicas: 1
+      offsetsTopicReplicationFactor: 1
+      transactionStateLogReplicationFactor: 1
+      transactionStateLogMinIsr: 1
+      numIoThreads: 4
+      numNetworkThreads: 2
+      numReplicaFetchers: 1
+      logRetentionHours: 168
+      logRetentionBytes: -1
+      logSegmentBytes: 1073741824
+      logCleanupPolicy: delete
     resources:
       requests:
         cpu: 100m
@@ -41,6 +56,7 @@ kafka:
     jvm:
       heapOpts: "-Xms256m -Xmx256m"
       performanceOpts: "-XX:+UseG1GC"
+    affinity: {}
 
   auth:
     username: testuser

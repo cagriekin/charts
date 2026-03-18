@@ -1,0 +1,38 @@
+{{- include "kafka.tls.validate" . -}}
+{{- if and .Values.kafka.enabled .Values.kafka.tls.enabled (not .Values.kafka.tls.existingSecret) }}
+{{- $fullname := include "kafka.fullname" . }}
+{{- $namespace := default "default" .Release.Namespace }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $fullname }}-kafka-tls
+  labels:
+    app.kubernetes.io/name: {{ include "kafka.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: kafka-tls
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ .Chart.Name }}
+    helm.sh/chart: {{ include "kafka.chart" . }}
+spec:
+  secretName: {{ include "kafka.tls.secretName" . }}
+  duration: {{ .Values.kafka.tls.certManager.duration }}
+  renewBefore: {{ .Values.kafka.tls.certManager.renewBefore }}
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  usages:
+    - server auth
+    - client auth
+  dnsNames:
+    - "*.{{ $fullname }}-kafka-controller.{{ $namespace }}.svc.cluster.local"
+    - "*.{{ $fullname }}-kafka-broker.{{ $namespace }}.svc.cluster.local"
+    - "{{ $fullname }}-kafka-controller.{{ $namespace }}.svc.cluster.local"
+    - "{{ $fullname }}-kafka-broker.{{ $namespace }}.svc.cluster.local"
+    {{- range .Values.kafka.tls.certManager.additionalDnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+  issuerRef:
+    name: {{ .Values.kafka.tls.certManager.issuerRef.name }}
+    kind: {{ .Values.kafka.tls.certManager.issuerRef.kind }}
+    group: {{ .Values.kafka.tls.certManager.issuerRef.group }}
+{{- end }}

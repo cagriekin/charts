@@ -23,6 +23,10 @@ spec:
       app.kubernetes.io/component: kafka-broker
   template:
     metadata:
+      {{- with .Values.kafka.broker.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       labels:
         app.kubernetes.io/name: {{ include "kafka.name" . }}
         app.kubernetes.io/instance: {{ .Release.Name }}
@@ -32,13 +36,52 @@ spec:
         helm.sh/chart: {{ include "kafka.chart" . }}
     spec:
       serviceAccountName: {{ include "kafka.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.kafka.broker.terminationGracePeriodSeconds }}
+      {{- with .Values.kafka.broker.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       {{- with .Values.kafka.broker.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- $brokerLogDir := .Values.kafka.broker.logDir }}
       {{- $brokerLogDirParent := dir $brokerLogDir }}
+      {{- $controllerCount := int .Values.kafka.controller.replicaCount }}
       initContainers:
+        {{- if .Values.kafka.tls.enabled }}
+        - name: tls-init
+          image: "{{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}"
+          imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              STORE_PASS="{{ include "kafka.tls.storePassword" . }}"
+
+              openssl pkcs12 -export \
+                -in /opt/kafka/tls-pem/{{ .Values.kafka.tls.certFilename }} \
+                -inkey /opt/kafka/tls-pem/{{ .Values.kafka.tls.keyFilename }} \
+                -out /opt/kafka/tls/keystore.p12 \
+                -password "pass:${STORE_PASS}"
+
+              keytool -importcert \
+                -file /opt/kafka/tls-pem/{{ .Values.kafka.tls.caFilename }} \
+                -keystore /opt/kafka/tls/truststore.p12 \
+                -storetype PKCS12 \
+                -storepass "${STORE_PASS}" \
+                -noprompt -alias ca
+          {{- with .Values.kafka.broker.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: kafka-tls-pem
+              mountPath: /opt/kafka/tls-pem
+              readOnly: true
+            - name: kafka-tls
+              mountPath: /opt/kafka/tls
+        {{- end }}
         - name: kafka-init
           image: "{{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}"
           imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
@@ -47,7 +90,6 @@ spec:
             - -c
             - |
               set -e
-              # Wait for the data directory to be available
               while [ ! -d "{{ $brokerLogDirParent }}" ]; do
                 sleep 1
               done
@@ -55,19 +97,16 @@ spec:
               LOG_DIR="{{ $brokerLogDir }}"
               mkdir -p "${LOG_DIR}"
 
-              # Calculate node ID from pod ordinal (broker pods start from node ID 2)
+              # Broker node IDs start after controller IDs
               POD_ORDINAL=$(echo $POD_NAME | rev | cut -d'-' -f1 | rev)
-              NODE_ID=$((POD_ORDINAL + 2))
+              NODE_ID=$((POD_ORDINAL + {{ $controllerCount }} + 1))
 
-              # Create writable config directory and copy init config file for formatting
               mkdir -p /tmp/kafka-config-init
               cp /opt/kafka/config/kraft/server-init.properties /tmp/kafka-config-init/
 
-              # Replace PLACEHOLDER_NODE_ID and PLACEHOLDER_POD_NAME with actual values
               sed -i "s/PLACEHOLDER_NODE_ID/$NODE_ID/g" /tmp/kafka-config-init/server-init.properties
               sed -i "s/PLACEHOLDER_POD_NAME/$POD_NAME/g" /tmp/kafka-config-init/server-init.properties
 
-              # Format storage if not already formatted
               if [ ! -f "${LOG_DIR}/meta.properties" ]; then
                 /opt/kafka/bin/kafka-storage.sh format \
                   --config /tmp/kafka-config-init/server-init.properties \
@@ -79,20 +118,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: KAFKA_PROCESS_ROLES
-              value: "broker"
-            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
-              value: "1"
-            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
-              value: "1"
-            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
-              value: "1"
-            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
-              value: {{ .Values.kafka.autoCreateTopicsEnable | quote }}
-            - name: KAFKA_DELETE_TOPIC_ENABLE
-              value: {{ .Values.kafka.deleteTopicEnable | quote }}
-            - name: KAFKA_OPTS
-              value: "-Djava.security.auth.login.config=/opt/kafka/config/kraft/kafka_server_jaas.conf"
           {{- with .Values.kafka.broker.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
@@ -113,29 +138,24 @@ spec:
             - -c
             - |
               set -e
-              # Calculate node ID from pod ordinal (broker pods start from node ID 2)
+              # Broker node IDs start after controller IDs
               POD_ORDINAL=$$(echo $$POD_NAME | rev | cut -d'-' -f1 | rev)
-              NODE_ID=$$(expr $$POD_ORDINAL + 2)
+              NODE_ID=$$(expr $$POD_ORDINAL + {{ $controllerCount }} + 1)
               export KAFKA_NODE_ID=$$NODE_ID
 
-              # Read username and password from mounted secret
               SECRET_USERNAME_KEY="{{ include "kafka.auth.usernameKey" . | trim }}"
               SECRET_PASSWORD_KEY="{{ include "kafka.auth.passwordKey" . | trim }}"
               KAFKA_USERNAME=$$(cat /opt/kafka/secrets/$${SECRET_USERNAME_KEY})
               KAFKA_PASSWORD=$$(cat /opt/kafka/secrets/$${SECRET_PASSWORD_KEY})
 
-              # Create writable config directory and copy config files
               mkdir -p /tmp/kafka-config
               cp /opt/kafka/config/kraft/server.properties /tmp/kafka-config/
 
-              # Generate JAAS config from template using actual credentials
               sed -e "s|PLACEHOLDER_USERNAME|$${KAFKA_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|$${KAFKA_PASSWORD}|g" /opt/kafka/config/kraft/kafka_server_jaas.conf.template > /tmp/kafka-config/kafka_server_jaas.conf
 
-              # Update server.properties with correct node ID and pod name
               sed -i "s|PLACEHOLDER_NODE_ID|$${NODE_ID}|g" /tmp/kafka-config/server.properties
               sed -i "s|PLACEHOLDER_POD_NAME|$${POD_NAME}|g" /tmp/kafka-config/server.properties
 
-              # Start Kafka with the modified config
               exec /opt/kafka/bin/kafka-server-start.sh /tmp/kafka-config/server.properties
           ports:
             - name: broker
@@ -166,31 +186,8 @@ spec:
               value: {{ .Values.kafka.broker.jvm.heapOpts | quote }}
             - name: KAFKA_JVM_PERFORMANCE_OPTS
               value: {{ .Values.kafka.broker.jvm.performanceOpts | quote }}
-            - name: KAFKA_PROCESS_ROLES
-              value: "broker"
-            - name: KAFKA_NODE_ID
-              value: ""  # Will be set by startup script
-            - name: KAFKA_ADVERTISED_LISTENERS
-              value: "SASL_PLAINTEXT://$(POD_NAME).{{ include "kafka.fullname" . }}-kafka-broker.{{ default "default" .Release.Namespace }}.svc.cluster.local:9092"
-            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
-              value: "1"
-            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
-              value: "1"
-            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
-              value: "1"
-            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
-              value: {{ .Values.kafka.autoCreateTopicsEnable | quote }}
-            - name: KAFKA_DELETE_TOPIC_ENABLE
-              value: {{ .Values.kafka.deleteTopicEnable | quote }}
-            # SASL Authentication environment variables
             - name: KAFKA_OPTS
               value: "-Djava.security.auth.login.config=/tmp/kafka-config/kafka_server_jaas.conf"
-            - name: KAFKA_SASL_ENABLED_MECHANISMS
-              value: "PLAIN"
-            - name: KAFKA_SASL_MECHANISM_CONTROLLER_PROTOCOL
-              value: "PLAIN"
-            - name: KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL
-              value: "PLAIN"
           {{- with .Values.kafka.broker.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
@@ -204,6 +201,11 @@ spec:
               mountPath: /opt/kafka/config/kraft
             - name: kafka-secret
               mountPath: /opt/kafka/secrets
+            {{- if .Values.kafka.tls.enabled }}
+            - name: kafka-tls
+              mountPath: /opt/kafka/tls
+              readOnly: true
+            {{- end }}
       volumes:
         - name: kafka-config
           configMap:
@@ -211,16 +213,27 @@ spec:
         - name: kafka-secret
           secret:
             secretName: {{ include "kafka.auth.secretName" . }}
-      {{- with .Values.kafka.nodeSelector }}
+        {{- if .Values.kafka.tls.enabled }}
+        - name: kafka-tls-pem
+          secret:
+            secretName: {{ include "kafka.tls.secretName" . }}
+        - name: kafka-tls
+          emptyDir: {}
+        {{- end }}
+      {{- with .Values.kafka.broker.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.kafka.affinity }}
+      {{- with .Values.kafka.broker.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.kafka.tolerations }}
+      {{- with .Values.kafka.broker.tolerations }}
       tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.kafka.broker.topologySpreadConstraints }}
+      topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
   volumeClaimTemplates:
@@ -233,6 +246,5 @@ spec:
         {{- end }}
         resources:
           requests:
-            storage: {{ .Values.kafka.broker.persistence.size | default "1Gi" }}
+            storage: {{ .Values.kafka.broker.persistence.size }}
 {{- end }}
-

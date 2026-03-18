@@ -11,55 +11,37 @@ kafka:
     repository: apache/kafka
     tag: "4.1.0"
     pullPolicy: IfNotPresent
-  # External bootstrap server for topic initialization (optional)
-  # If not set, uses the broker service from this chart
   bootstrapServer: ""
+
+  tls:
+    enabled: false
+    existingSecret: ""
+    certFilename: tls.crt
+    keyFilename: tls.key
+    caFilename: ca.crt
+    certManager:
+      issuerRef:
+        name: ""
+        kind: ClusterIssuer
+        group: cert-manager.io
+      duration: 8760h
+      renewBefore: 720h
+      additionalDnsNames: []
+
   controller:
-    replicaCount: 1
+    replicaCount: 3
     logDir: /var/lib/kafka/data/kraft-controller-logs
+    terminationGracePeriodSeconds: 120
     persistence:
-      size: 1Gi
+      size: 10Gi
       storageClass: ""
     resources:
       requests:
-        cpu: 100m
-        memory: 500Mi
-      limits:
-        cpu: 200m
-        memory: 1Gi
-    podSecurityContext:
-      runAsNonRoot: true
-      runAsUser: 1000
-      runAsGroup: 1000
-      fsGroup: 1000
-      seccompProfile:
-        type: RuntimeDefault
-    containerSecurityContext:
-      allowPrivilegeEscalation: false
-      runAsNonRoot: true
-      readOnlyRootFilesystem: false
-      capabilities:
-        drop:
-          - ALL
-    podDisruptionBudget:
-      enabled: true
-      maxUnavailable: 0
-    jvm:
-      heapOpts: "-Xms512m -Xmx512m"
-      performanceOpts: "-XX:+UseG1GC -XX:MaxGCPauseMillis=200"
-  broker:
-    replicaCount: 2
-    logDir: /var/lib/kafka/data/kraft-broker-logs
-    persistence:
-      size: 1Gi
-      storageClass: ""
-    resources:
-      requests:
-        cpu: 100m
-        memory: 500Mi
-      limits:
-        cpu: 200m
+        cpu: "1"
         memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
     podSecurityContext:
       runAsNonRoot: true
       runAsUser: 1000
@@ -80,6 +62,87 @@ kafka:
     jvm:
       heapOpts: "-Xms1g -Xmx1g"
       performanceOpts: "-XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+    podAnnotations: {}
+    priorityClassName: ""
+    nodeSelector: {}
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/component
+                  operator: In
+                  values:
+                    - kafka-controller
+            topologyKey: kubernetes.io/hostname
+    tolerations: []
+    topologySpreadConstraints: []
+
+  broker:
+    replicaCount: 3
+    logDir: /var/lib/kafka/data/kraft-broker-logs
+    terminationGracePeriodSeconds: 120
+    persistence:
+      size: 100Gi
+      storageClass: ""
+    config:
+      numPartitions: 3
+      defaultReplicationFactor: 3
+      minInsyncReplicas: 2
+      offsetsTopicReplicationFactor: 3
+      transactionStateLogReplicationFactor: 3
+      transactionStateLogMinIsr: 2
+      numIoThreads: 8
+      numNetworkThreads: 3
+      numReplicaFetchers: 1
+      logRetentionHours: 168
+      logRetentionBytes: -1
+      logSegmentBytes: 1073741824
+      logCleanupPolicy: delete
+    extraConfig: {}
+    resources:
+      requests:
+        cpu: "2"
+        memory: 4Gi
+      limits:
+        cpu: "4"
+        memory: 8Gi
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      readOnlyRootFilesystem: false
+      capabilities:
+        drop:
+          - ALL
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: 1
+    jvm:
+      heapOpts: "-Xms4g -Xmx4g"
+      performanceOpts: "-XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:InitiatingHeapOccupancyPercent=35"
+    podAnnotations: {}
+    priorityClassName: ""
+    nodeSelector: {}
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/component
+                  operator: In
+                  values:
+                    - kafka-broker
+            topologyKey: kubernetes.io/hostname
+    tolerations: []
+    topologySpreadConstraints: []
+
   auth:
     username: user1
     password: ""
@@ -90,26 +153,10 @@ kafka:
     sasl:
       mechanism: PLAIN
       securityProtocol: SASL_PLAINTEXT
-  autoCreateTopicsEnable: true
+
+  autoCreateTopicsEnable: false
   deleteTopicEnable: true
   topics: {}
-  nodeSelector: {}
-  # Pod anti-affinity to spread Kafka brokers across different nodes for HA
-  # This prevents multi-attach volume errors when using ReadWriteOnce storage
-  # Weight 50 allows some flexibility while preferring distribution
-  affinity:
-    podAntiAffinity:
-      preferredDuringSchedulingIgnoredDuringExecution:
-      - weight: 50
-        podAffinityTerm:
-          labelSelector:
-            matchExpressions:
-            - key: app.kubernetes.io/component
-              operator: In
-              values:
-              - kafka-broker
-          topologyKey: kubernetes.io/hostname
-  tolerations: []
 
 exporters:
   kafka:
@@ -130,6 +177,8 @@ exporters:
     nodeSelector: {}
     affinity: {}
     tolerations: []
+    podAnnotations: {}
+    priorityClassName: ""
     podSecurityContext:
       runAsNonRoot: true
       runAsUser: 1000
@@ -162,8 +211,8 @@ serviceMonitors:
 autoscaling:
   broker:
     enabled: false
-    minReplicas: 2
-    maxReplicas: 5
+    minReplicas: 3
+    maxReplicas: 10
     targetCPUUtilizationPercentage: 80
     targetMemoryUtilizationPercentage: null
 
@@ -172,8 +221,8 @@ keda:
     enabled: false
     pollingInterval: 30
     cooldownPeriod: 300
-    minReplicaCount: 2
-    maxReplicaCount: 6
+    minReplicaCount: 3
+    maxReplicaCount: 10
     triggers: []
 
 networkPolicy:
@@ -187,5 +236,3 @@ networkPolicy:
   exporter:
     ingress: []
     egress: []
-
-

@@ -1,8 +1,8 @@
 apiVersion: v2
 name: kafka
-description: Apache Kafka with KRaft mode, SASL authentication, and topic management
+description: Apache Kafka with KRaft mode, SASL authentication, TLS encryption, and topic management
 type: application
-version: 0.1.35
+version: 0.2.0
 appVersion: 4.1.0
 keywords:
   - Kafka
