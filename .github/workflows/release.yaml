@@ -64,3 +64,33 @@ jobs:
         with:
           charts_dir: .
 
+      - name: Update GitHub Pages with latest charts
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          repo_url="https://$(echo "$GITHUB_REPOSITORY" | cut -d/ -f1).github.io/$(echo "$GITHUB_REPOSITORY" | cut -d/ -f2)"
+
+          workdir=$(mktemp -d)
+          git checkout gh-pages -- index.yaml 2>/dev/null || true
+
+          for chart_yaml in */Chart.yaml; do
+            chart_dir="$(dirname "$chart_yaml")"
+            echo "Packaging ${chart_dir}"
+            helm package "$chart_dir" --destination "$workdir"
+          done
+
+          if [ -f index.yaml ]; then
+            helm repo index "$workdir" --url "$repo_url" --merge index.yaml
+          else
+            helm repo index "$workdir" --url "$repo_url"
+          fi
+
+          git checkout gh-pages
+          cp "$workdir"/*.tgz . 2>/dev/null || true
+          cp "$workdir"/index.yaml .
+          git add index.yaml *.tgz
+          git commit -m "Update chart packages" || echo "No changes to commit"
+          git push origin gh-pages
+          rm -rf "$workdir"
+
