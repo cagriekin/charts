@@ -57,12 +57,13 @@ spec:
                 --sasl.enabled \
                 --sasl.mechanism=plain \
                 --sasl.username="$KAFKA_SASL_USERNAME" \
-                --sasl.password="$KAFKA_SASL_PASSWORD" \
                 {{- if $.Values.kafka.tls.enabled }}
+                --sasl.password="$KAFKA_SASL_PASSWORD" \
                 --tls.enabled \
-                --tls.ca-file=/opt/kafka/tls-pem/{{ $.Values.kafka.tls.caFilename }} \
+                --tls.ca-file=/opt/kafka/tls-pem/{{ $.Values.kafka.tls.caFilename }}
+                {{- else }}
+                --sasl.password="$KAFKA_SASL_PASSWORD"
                 {{- end }}
-                --log.enable-sarama=false
           ports:
             - name: metrics
               containerPort: 9308
