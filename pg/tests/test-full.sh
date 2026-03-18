@@ -116,15 +116,12 @@ assert_eq "prometheus exporter pod is Running" "Running" "${exporter_phase}"
 exporter_port=$(kubectl get svc -n "${NAMESPACE}" "${FULLNAME}-postgres-exporter" -o jsonpath='{.spec.ports[0].port}')
 assert_eq "exporter service port is 9116" "9116" "${exporter_port}"
 
-# Test: exporter returns metrics
+# Test: exporter returns metrics (use a temp pod to avoid curl dependency)
 exporter_svc="${FULLNAME}-postgres-exporter.${NAMESPACE}.svc.cluster.local"
-metrics_output=$(kubectl exec -n "${NAMESPACE}" "${POD_0}" -c postgresql -- \
-  bash -c "curl -s http://${exporter_svc}:9116/metrics 2>/dev/null | grep -m1 '^pg_'" 2>/dev/null || echo "")
-if [[ -n "${metrics_output}" ]]; then
-  assert_contains "exporter returns pg metrics" "${metrics_output}" "pg_"
-else
-  skip "exporter metrics check (curl not available in pod or no pg_ metrics yet)"
-fi
+metrics_output=$(kubectl run curl-test -n "${NAMESPACE}" --rm -i --restart=Never \
+  --image=busybox:1.37 -- wget -qO- "http://${exporter_svc}:9116/metrics" 2>/dev/null \
+  | grep -m1 '^pg_' || echo "")
+assert_contains "exporter returns pg metrics" "${metrics_output}" "pg_"
 
 end_suite
 print_summary
