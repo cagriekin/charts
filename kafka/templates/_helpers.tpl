@@ -137,11 +137,17 @@ password
 {{- end }}
 
 {{/*
-Generate Kafka controller quorum voters.
+Generate Kafka controller quorum voters string for multi-controller KRaft.
+Format: 1@controller-0.svc:9093,2@controller-1.svc:9093,3@controller-2.svc:9093
 */}}
 {{- define "kafka.kafka.controllerQuorumVoters" -}}
 {{- $fullname := include "kafka.fullname" . -}}
-{{- printf "1@%s-kafka-controller.%s.svc.cluster.local:9093" $fullname (default "default" .Release.Namespace) -}}
+{{- $namespace := default "default" .Release.Namespace -}}
+{{- $replicas := int .Values.kafka.controller.replicaCount -}}
+{{- range $i := until $replicas -}}
+{{- if $i }},{{ end -}}
+{{ add $i 1 }}@{{ $fullname }}-kafka-controller-{{ $i }}.{{ $fullname }}-kafka-controller.{{ $namespace }}.svc.cluster.local:9093
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -169,3 +175,57 @@ Generate a content-based suffix for the Kafka topic init job so updates trigger 
 {{- toYaml $payload | sha256sum | trunc 10 | trimSuffix "-" -}}
 {{- end }}
 
+{{/*
+Generate deterministic TLS PKCS12 store password.
+*/}}
+{{- define "kafka.tls.storePassword" -}}
+{{- printf "%s-tls-store" .Release.Name | sha256sum | trunc 32 -}}
+{{- end }}
+
+{{/*
+Return the TLS secret name. Uses existingSecret if set, otherwise the
+cert-manager-managed secret name.
+When TLS is enabled, exactly one of existingSecret or certManager.issuerRef.name
+must be provided.
+*/}}
+{{- define "kafka.tls.secretName" -}}
+{{- if .Values.kafka.tls.existingSecret -}}
+{{- .Values.kafka.tls.existingSecret -}}
+{{- else -}}
+{{- printf "%s-kafka-tls" (include "kafka.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Validate TLS configuration. Called from the Certificate template so the
+error surfaces during rendering.
+*/}}
+{{- define "kafka.tls.validate" -}}
+{{- if .Values.kafka.tls.enabled -}}
+{{- if and (not .Values.kafka.tls.existingSecret) (not .Values.kafka.tls.certManager.issuerRef.name) -}}
+{{- fail "kafka.tls.enabled requires either kafka.tls.existingSecret or kafka.tls.certManager.issuerRef.name to be set" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Return the broker listener protocol based on TLS setting.
+*/}}
+{{- define "kafka.broker.listenerProtocol" -}}
+{{- if .Values.kafka.tls.enabled -}}
+SASL_SSL
+{{- else -}}
+SASL_PLAINTEXT
+{{- end -}}
+{{- end }}
+
+{{/*
+Return the controller listener security protocol based on TLS setting.
+*/}}
+{{- define "kafka.controller.listenerSecurityProtocol" -}}
+{{- if .Values.kafka.tls.enabled -}}
+SSL
+{{- else -}}
+PLAINTEXT
+{{- end -}}
+{{- end }}

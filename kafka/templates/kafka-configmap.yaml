@@ -1,4 +1,6 @@
 {{- if .Values.kafka.enabled }}
+{{- $brokerProtocol := include "kafka.broker.listenerProtocol" . -}}
+{{- $controllerSecProtocol := include "kafka.controller.listenerSecurityProtocol" . -}}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -12,7 +14,6 @@ metadata:
     app.kubernetes.io/part-of: {{ .Chart.Name }}
     helm.sh/chart: {{ include "kafka.chart" . }}
 data:
-  # JAAS config will be generated at runtime from mounted secrets
   kafka_server_jaas.conf.template: |
     KafkaServer {
         org.apache.kafka.common.security.plain.PlainLoginModule required
@@ -21,18 +22,30 @@ data:
         user_PLACEHOLDER_USERNAME="PLACEHOLDER_PASSWORD";
     };
   server.properties: |
-    # Kafka controller configuration
     process.roles=controller
     node.id=PLACEHOLDER_NODE_ID
     controller.quorum.voters={{ include "kafka.kafka.controllerQuorumVoters" . }}
     listeners=CONTROLLER://:9093
-    listener.security.protocol.map=CONTROLLER:PLAINTEXT
+    listener.security.protocol.map=CONTROLLER:{{ $controllerSecProtocol }}
     controller.listener.names=CONTROLLER
     log.dirs={{ .Values.kafka.controller.logDir }}
+    {{- if .Values.kafka.tls.enabled }}
+    ssl.keystore.type=PKCS12
+    ssl.keystore.location=/opt/kafka/tls/keystore.p12
+    ssl.keystore.password={{ include "kafka.tls.storePassword" . }}
+    ssl.truststore.type=PKCS12
+    ssl.truststore.location=/opt/kafka/tls/truststore.p12
+    ssl.truststore.password={{ include "kafka.tls.storePassword" . }}
+    ssl.endpoint.identification.algorithm=
+    {{- end }}
   client.properties: |
-    # Kafka client configuration for SASL authentication
-    security.protocol=SASL_PLAINTEXT
+    security.protocol={{ $brokerProtocol }}
     sasl.mechanism=PLAIN
+    {{- if .Values.kafka.tls.enabled }}
+    ssl.truststore.type=PKCS12
+    ssl.truststore.location=/opt/kafka/tls/truststore.p12
+    ssl.truststore.password={{ include "kafka.tls.storePassword" . }}
+    {{- end }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -46,7 +59,6 @@ metadata:
     app.kubernetes.io/part-of: {{ .Chart.Name }}
     helm.sh/chart: {{ include "kafka.chart" . }}
 data:
-  # JAAS config will be generated at runtime from mounted secrets
   kafka_server_jaas.conf.template: |
     KafkaServer {
         org.apache.kafka.common.security.plain.PlainLoginModule required
@@ -55,54 +67,72 @@ data:
         user_PLACEHOLDER_USERNAME="PLACEHOLDER_PASSWORD";
     };
   server.properties: |
-    # Kafka broker configuration
     process.roles=broker
     node.id=PLACEHOLDER_NODE_ID
     controller.quorum.voters={{ include "kafka.kafka.controllerQuorumVoters" . }}
-    listeners=SASL_PLAINTEXT://:9092
-    listener.security.protocol.map=SASL_PLAINTEXT:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+    listeners={{ $brokerProtocol }}://:9092
+    listener.security.protocol.map={{ $brokerProtocol }}:{{ $brokerProtocol }},CONTROLLER:{{ $controllerSecProtocol }}
     controller.listener.names=CONTROLLER
-    advertised.listeners=SASL_PLAINTEXT://PLACEHOLDER_POD_NAME.{{ include "kafka.fullname" . }}-kafka-broker.{{ default "default" .Release.Namespace }}.svc.cluster.local:9092
-    inter.broker.listener.name=SASL_PLAINTEXT
-    num.partitions=3
-    default.replication.factor=1
-    offsets.topic.replication.factor=1
-    transaction.state.log.min.isr=1
-    transaction.state.log.replication.factor=1
+    advertised.listeners={{ $brokerProtocol }}://PLACEHOLDER_POD_NAME.{{ include "kafka.fullname" . }}-kafka-broker.{{ default "default" .Release.Namespace }}.svc.cluster.local:9092
+    inter.broker.listener.name={{ $brokerProtocol }}
+    num.partitions={{ .Values.kafka.broker.config.numPartitions }}
+    default.replication.factor={{ .Values.kafka.broker.config.defaultReplicationFactor }}
+    min.insync.replicas={{ .Values.kafka.broker.config.minInsyncReplicas }}
+    offsets.topic.replication.factor={{ .Values.kafka.broker.config.offsetsTopicReplicationFactor }}
+    transaction.state.log.min.isr={{ .Values.kafka.broker.config.transactionStateLogMinIsr }}
+    transaction.state.log.replication.factor={{ .Values.kafka.broker.config.transactionStateLogReplicationFactor }}
+    num.io.threads={{ .Values.kafka.broker.config.numIoThreads }}
+    num.network.threads={{ .Values.kafka.broker.config.numNetworkThreads }}
+    num.replica.fetchers={{ .Values.kafka.broker.config.numReplicaFetchers }}
+    log.retention.hours={{ .Values.kafka.broker.config.logRetentionHours }}
+    log.retention.bytes={{ .Values.kafka.broker.config.logRetentionBytes | int64 }}
+    log.segment.bytes={{ .Values.kafka.broker.config.logSegmentBytes | int64 }}
+    log.cleanup.policy={{ .Values.kafka.broker.config.logCleanupPolicy }}
     auto.create.topics.enable={{ .Values.kafka.autoCreateTopicsEnable }}
     delete.topic.enable={{ .Values.kafka.deleteTopicEnable }}
     log.dirs={{ .Values.kafka.broker.logDir }}
-    # SASL Authentication configuration
     sasl.enabled.mechanisms=PLAIN
     sasl.mechanism.inter.broker.protocol=PLAIN
-    # JAAS configuration file path
     sasl.jaas.config=/opt/kafka/config/kraft/kafka_server_jaas.conf
-  # Separate config for init container storage formatting
+    {{- if .Values.kafka.tls.enabled }}
+    ssl.keystore.type=PKCS12
+    ssl.keystore.location=/opt/kafka/tls/keystore.p12
+    ssl.keystore.password={{ include "kafka.tls.storePassword" . }}
+    ssl.truststore.type=PKCS12
+    ssl.truststore.location=/opt/kafka/tls/truststore.p12
+    ssl.truststore.password={{ include "kafka.tls.storePassword" . }}
+    ssl.endpoint.identification.algorithm=
+    {{- end }}
+    {{- range $key, $value := .Values.kafka.broker.extraConfig }}
+    {{ $key }}={{ $value }}
+    {{- end }}
   server-init.properties: |
     process.roles=broker
     node.id=PLACEHOLDER_NODE_ID
     controller.quorum.voters={{ include "kafka.kafka.controllerQuorumVoters" . }}
-    listeners=SASL_PLAINTEXT://:9092
-    listener.security.protocol.map=SASL_PLAINTEXT:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT
+    listeners={{ $brokerProtocol }}://:9092
+    listener.security.protocol.map={{ $brokerProtocol }}:{{ $brokerProtocol }},CONTROLLER:{{ $controllerSecProtocol }}
     controller.listener.names=CONTROLLER
-    inter.broker.listener.name=SASL_PLAINTEXT
-    num.partitions=3
-    default.replication.factor=1
-    offsets.topic.replication.factor=1
-    transaction.state.log.min.isr=1
-    transaction.state.log.replication.factor=1
+    inter.broker.listener.name={{ $brokerProtocol }}
+    num.partitions={{ .Values.kafka.broker.config.numPartitions }}
+    default.replication.factor={{ .Values.kafka.broker.config.defaultReplicationFactor }}
+    offsets.topic.replication.factor={{ .Values.kafka.broker.config.offsetsTopicReplicationFactor }}
+    transaction.state.log.min.isr={{ .Values.kafka.broker.config.transactionStateLogMinIsr }}
+    transaction.state.log.replication.factor={{ .Values.kafka.broker.config.transactionStateLogReplicationFactor }}
     auto.create.topics.enable={{ .Values.kafka.autoCreateTopicsEnable }}
     delete.topic.enable={{ .Values.kafka.deleteTopicEnable }}
     log.dirs={{ .Values.kafka.broker.logDir }}
-    # SASL Authentication configuration
     sasl.enabled.mechanisms=PLAIN
     sasl.mechanism.inter.broker.protocol=PLAIN
-    # JAAS configuration file path
     sasl.jaas.config=/opt/kafka/config/kraft/kafka_server_jaas.conf
   client.properties: |
-    # Kafka client configuration for SASL authentication
-    security.protocol=SASL_PLAINTEXT
+    security.protocol={{ $brokerProtocol }}
     sasl.mechanism=PLAIN
+    {{- if .Values.kafka.tls.enabled }}
+    ssl.truststore.type=PKCS12
+    ssl.truststore.location=/tmp/kafka-config/truststore.p12
+    ssl.truststore.password={{ include "kafka.tls.storePassword" . }}
+    {{- end }}
   client_jaas.conf.template: |
     KafkaClient {
         org.apache.kafka.common.security.plain.PlainLoginModule required

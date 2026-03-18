@@ -44,29 +44,41 @@ spec:
           readOnly: true
         - name: kafka-config-runtime
           mountPath: /tmp/kafka-config
+        {{- if .Values.kafka.tls.enabled }}
+        - name: kafka-tls-pem
+          mountPath: /opt/kafka/tls-pem
+          readOnly: true
+        {{- end }}
         {{- $root := . }}
         command:
         - /bin/bash
         - -c
         - |
           set -e
-          
-          # Read username and password from mounted secret
+
           SECRET_USERNAME_KEY="{{ include "kafka.auth.usernameKey" . | trim }}"
           SECRET_PASSWORD_KEY="{{ include "kafka.auth.passwordKey" . | trim }}"
           KAFKA_USERNAME=$$(cat /opt/kafka/secrets/$${SECRET_USERNAME_KEY})
           KAFKA_PASSWORD=$$(cat /opt/kafka/secrets/$${SECRET_PASSWORD_KEY})
-          
-          # Create writable config directory and copy config files
+
           mkdir -p /tmp/kafka-config
           cp /opt/kafka/config/kraft/client.properties /tmp/kafka-config/
           cp /opt/kafka/config/kraft/client_jaas.conf.template /tmp/kafka-config/
 
-          # Generate JAAS config from template using actual credentials
           sed -e "s|PLACEHOLDER_USERNAME|$${KAFKA_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|$${KAFKA_PASSWORD}|g" /opt/kafka/config/kraft/client_jaas.conf.template > /tmp/kafka-config/client_jaas.conf
 
-          # Set JAAS configuration for Kafka client authentication
           export KAFKA_OPTS="-Djava.security.auth.login.config=/tmp/kafka-config/client_jaas.conf"
+
+          {{- if .Values.kafka.tls.enabled }}
+          # Build PKCS12 truststore from mounted CA certificate for TLS connections
+          STORE_PASS="{{ include "kafka.tls.storePassword" . }}"
+          keytool -importcert \
+            -file /opt/kafka/tls-pem/{{ .Values.kafka.tls.caFilename }} \
+            -keystore /tmp/kafka-config/truststore.p12 \
+            -storetype PKCS12 \
+            -storepass "$${STORE_PASS}" \
+            -noprompt -alias ca
+          {{- end }}
 
           {{- if .Values.kafka.bootstrapServer }}
           BOOTSTRAP_SERVER="{{ .Values.kafka.bootstrapServer }}"
@@ -93,17 +105,14 @@ spec:
 
           echo "Kafka bootstrap server reachable."
 
-          # Kafka broker should be ready. Creating topics...
           echo "Creating topics..."
           export KAFKA_OPTS="-Djava.security.auth.login.config=/tmp/kafka-config/client_jaas.conf"
 
-          # Ensure configured topics exist with correct configuration
 {{- range $topicName, $topic := $root.Values.kafka.topics }}
           echo "Ensuring {{ $topicName }} topic exists with correct configuration..."
           DESIRED_PARTITIONS={{ default 1 $topic.partitions }}
           DESIRED_REPLICATION={{ default 1 $topic.replicationFactor }}
 
-          # Try to create topic first (will succeed for new topics, fail silently for existing ones)
           /opt/kafka/bin/kafka-topics.sh \
             --create \
             --bootstrap-server ${BOOTSTRAP_SERVER} \
@@ -118,7 +127,6 @@ spec:
             {{- end }}
             --if-not-exists
 
-          # Check current topic configuration
           TOPIC_DESC=$(timeout 30 /opt/kafka/bin/kafka-topics.sh \
             --describe \
             --bootstrap-server ${BOOTSTRAP_SERVER} \
@@ -126,15 +134,11 @@ spec:
             --topic {{ $topicName }} 2>/dev/null || echo "")
 
           if [ -n "$TOPIC_DESC" ]; then
-            # Debug: show what we got from describe
             echo "Debug: TOPIC_DESC='$TOPIC_DESC'"
 
-            # Extract current partitions count from the topic description
-            # Parse the describe output which has format like: Topic: name PartitionCount: N ReplicationFactor: M
             CURRENT_PARTITIONS=$(echo "$TOPIC_DESC" | awk -F'\t' '{for(i=1;i<=NF;i++) if($i ~ /PartitionCount/) {split($i,a,":"); print a[2]}}' | tr -d ' ')
             CURRENT_REPLICATION=$(echo "$TOPIC_DESC" | awk -F'\t' '{for(i=1;i<=NF;i++) if($i ~ /ReplicationFactor/) {split($i,a,":"); print a[2]}}' | tr -d ' ')
 
-            # Set defaults if parsing failed
             CURRENT_PARTITIONS=${CURRENT_PARTITIONS:-0}
             CURRENT_REPLICATION=${CURRENT_REPLICATION:-0}
 
@@ -142,19 +146,16 @@ spec:
 
             ALTER_NEEDED=false
 
-            # Check if partitions need to be altered (only increase allowed)
             if [ "$CURRENT_PARTITIONS" -gt 0 ] && [ "$DESIRED_PARTITIONS" -gt "$CURRENT_PARTITIONS" ]; then
               echo "Topic {{ $topicName }} partitions need to be increased from $CURRENT_PARTITIONS to $DESIRED_PARTITIONS"
               ALTER_NEEDED=true
             fi
 
-            # Check replication factor mismatch (warn only, cannot alter with kafka-topics.sh)
             if [ "$CURRENT_REPLICATION" -gt 0 ] && [ "$CURRENT_REPLICATION" != "$DESIRED_REPLICATION" ]; then
               echo "Warning: Topic {{ $topicName }} has replication factor $CURRENT_REPLICATION, but desired is $DESIRED_REPLICATION."
               echo "Replication factor changes require manual intervention using kafka-reassign-partitions tool."
             fi
 
-            # Alter topic partitions if needed (replication factor cannot be altered with --alter)
             if [ "$ALTER_NEEDED" = true ]; then
               echo "Altering topic {{ $topicName }} partitions..."
               /opt/kafka/bin/kafka-topics.sh \
@@ -187,5 +188,9 @@ spec:
           secretName: {{ include "kafka.auth.secretName" . }}
       - name: kafka-config-runtime
         emptyDir: {}
+      {{- if .Values.kafka.tls.enabled }}
+      - name: kafka-tls-pem
+        secret:
+          secretName: {{ include "kafka.tls.secretName" . }}
+      {{- end }}
 {{- end }}
-
