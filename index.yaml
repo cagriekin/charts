@@ -3,9 +3,9 @@ entries:
   kafka:
   - apiVersion: v2
     appVersion: 4.1.0
-    created: "2026-03-18T13:24:30.222673974Z"
-    description: Apache Kafka deployment for the DamnThing message bus
-    digest: 85bac60fc9e2bfdfee5872393284975f7c5857aa78d4c24bc4c6b29cb52c9793
+    created: "2026-03-18T13:26:49.202666905Z"
+    description: Apache Kafka with KRaft mode, SASL authentication, and topic management
+    digest: 3253a646044a1dfc29acf8cea26bc9f4f819a1ec59c3b858fd225a51c5f9b3a2
     keywords:
     - Kafka
     - Streaming
@@ -28,9 +28,9 @@ entries:
   pg:
   - apiVersion: v2
     appVersion: "18.1"
-    created: "2026-03-18T13:24:30.223779119Z"
+    created: "2026-03-18T13:26:49.203809901Z"
     description: PostgreSQL with repmgr replication and optional PGPool-II
-    digest: e3d549c1f4e6ead5641cbf2b45666a0375dadf7cac9e884ed7af3b01c998fa69
+    digest: b83c106352065841907696fd5cc88cc734aeaa036b9c95a4253073906b3bfacf
     name: pg
     type: application
     urls:
@@ -39,9 +39,9 @@ entries:
   pgvector:
   - apiVersion: v2
     appVersion: "18.1"
-    created: "2026-03-18T13:24:30.224598521Z"
+    created: "2026-03-18T13:26:49.204653327Z"
     description: PostgreSQL with pgvector extension and optional PGPool-II
-    digest: f54fe9bd5eb9146c956de6eeed5a2b3bf51cc17415176180f8368a7b3890a240
+    digest: 5562e5d6a41eb98abd1219705b24e95650d1b79ba5cb9a3f29ea73ae7b3dc1e5
     keywords:
     - PostgreSQL
     - pgvector
@@ -56,12 +56,12 @@ entries:
   redis:
   - apiVersion: v2
     appVersion: "7"
-    created: "2026-03-18T13:24:30.225211075Z"
+    created: "2026-03-18T13:26:49.205100262Z"
     description: Single-instance Redis with AOF persistence
-    digest: a2d1f8dacffb9ecff3518b3fc4552ddd55cd02fd1ad292a6eedf2a1ef0a42954
+    digest: 7a622cb837d66a4b738198d7710e55f899623ae59ca306ba6096b2f9124b5c20
     name: redis
     type: application
     urls:
     - https://cagriekin.github.io/charts/redis-0.1.1.tgz
     version: 0.1.1
-generated: "2026-03-18T13:24:30.221358666Z"
+generated: "2026-03-18T13:26:49.201173093Z"
