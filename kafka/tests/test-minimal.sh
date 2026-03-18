@@ -72,13 +72,15 @@ test_output=$(kubectl exec -n "${NAMESPACE}" "${BROKER}" -- bash -c "
     --command-config /tmp/kafka-config/client.properties 2>/dev/null)
 
   echo \"CONSUMED=\${CONSUMED}\"
-  echo \"TOPICS=\${TOPICS}\"
+  echo \"TOPICS_BEGIN\"
+  echo \"\${TOPICS}\"
+  echo \"TOPICS_END\"
 " 2>/dev/null || echo "")
 
 consumed=$(echo "${test_output}" | grep '^CONSUMED=' | head -1 | cut -d= -f2-)
 assert_eq "can produce and consume message" "${TEST_VALUE}" "${consumed}"
 
-topics_output=$(echo "${test_output}" | grep '^TOPICS=' | head -1 | cut -d= -f2-)
+topics_output=$(echo "${test_output}" | sed -n '/^TOPICS_BEGIN$/,/^TOPICS_END$/p')
 assert_contains "auto-created topic exists" "${topics_output}" "${TEST_TOPIC}"
 
 end_suite
