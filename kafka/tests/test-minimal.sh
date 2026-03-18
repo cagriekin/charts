@@ -21,14 +21,10 @@ helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
 CONTROLLER="${FULLNAME}-kafka-controller-0"
 BROKER="${FULLNAME}-kafka-broker-0"
 
-wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=kafka-controller" 1 300
-wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=kafka-broker" 1 300
-
-# Test: controller is running
+# helm --wait already ensures pods are ready; verify phase directly
 ctrl_phase=$(kubectl get pod -n "${NAMESPACE}" "${CONTROLLER}" -o jsonpath='{.status.phase}')
 assert_eq "controller pod is Running" "Running" "${ctrl_phase}"
 
-# Test: broker is running
 broker_phase=$(kubectl get pod -n "${NAMESPACE}" "${BROKER}" -o jsonpath='{.status.phase}')
 assert_eq "broker pod is Running" "Running" "${broker_phase}"
 
@@ -44,48 +40,45 @@ assert_eq "broker service is headless" "None" "${broker_svc_ip}"
 secret_exists=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-kafka-secret" -o name 2>/dev/null || echo "")
 assert_contains "kafka secret exists" "${secret_exists}" "secret"
 
-# Helper: prepare JAAS config for kafka CLI commands
+# Test: produce, consume, and list topics in a single exec to avoid repeated JVM startup
 BROKER_SVC="${BROKER}.${FULLNAME}-kafka-broker.${NAMESPACE}.svc.cluster.local:9092"
-KAFKA_CLI_SETUP='
-  KAFKA_USERNAME=$(cat /opt/kafka/secrets/username)
-  KAFKA_PASSWORD=$(cat /opt/kafka/secrets/password)
-  mkdir -p /tmp/kafka-config
-  cp /opt/kafka/config/kraft/client.properties /tmp/kafka-config/
-  sed -e "s|PLACEHOLDER_USERNAME|${KAFKA_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|${KAFKA_PASSWORD}|g" \
-    /opt/kafka/config/kraft/client_jaas.conf.template > /tmp/kafka-config/client_jaas.conf
-  export KAFKA_OPTS="-Djava.security.auth.login.config=/tmp/kafka-config/client_jaas.conf"
-'
-
-# Test: produce and consume a message via SASL (unique topic per run)
 TEST_TOPIC="test-$(date +%s)"
 TEST_VALUE="hello-$(date +%s)"
-kubectl exec -n "${NAMESPACE}" "${BROKER}" -- bash -c "
-  ${KAFKA_CLI_SETUP}
+
+test_output=$(kubectl exec -n "${NAMESPACE}" "${BROKER}" -- bash -c "
+  KAFKA_USERNAME=\$(cat /opt/kafka/secrets/username)
+  KAFKA_PASSWORD=\$(cat /opt/kafka/secrets/password)
+  mkdir -p /tmp/kafka-config
+  cp /opt/kafka/config/kraft/client.properties /tmp/kafka-config/
+  sed -e \"s|PLACEHOLDER_USERNAME|\${KAFKA_USERNAME}|g\" -e \"s|PLACEHOLDER_PASSWORD|\${KAFKA_PASSWORD}|g\" \
+    /opt/kafka/config/kraft/client_jaas.conf.template > /tmp/kafka-config/client_jaas.conf
+  export KAFKA_OPTS=\"-Djava.security.auth.login.config=/tmp/kafka-config/client_jaas.conf\"
+
   echo '${TEST_VALUE}' | /opt/kafka/bin/kafka-console-producer.sh \
     --bootstrap-server ${BROKER_SVC} \
     --topic ${TEST_TOPIC} \
-    --producer.config /tmp/kafka-config/client.properties
-" 2>/dev/null
+    --producer.config /tmp/kafka-config/client.properties 2>/dev/null
 
-consumed=$(kubectl exec -n "${NAMESPACE}" "${BROKER}" -- bash -c "
-  ${KAFKA_CLI_SETUP}
-  timeout 60 /opt/kafka/bin/kafka-console-consumer.sh \
+  CONSUMED=\$(timeout 15 /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server ${BROKER_SVC} \
     --topic ${TEST_TOPIC} \
     --from-beginning \
     --max-messages 1 \
-    --consumer.config /tmp/kafka-config/client.properties 2>/dev/null
-" 2>/dev/null || echo "")
-assert_eq "can produce and consume message" "${TEST_VALUE}" "${consumed}"
+    --consumer.config /tmp/kafka-config/client.properties 2>/dev/null)
 
-# Test: list topics
-topics_output=$(kubectl exec -n "${NAMESPACE}" "${BROKER}" -- bash -c "
-  ${KAFKA_CLI_SETUP}
-  /opt/kafka/bin/kafka-topics.sh \
+  TOPICS=\$(/opt/kafka/bin/kafka-topics.sh \
     --bootstrap-server ${BROKER_SVC} \
     --list \
-    --command-config /tmp/kafka-config/client.properties 2>/dev/null
+    --command-config /tmp/kafka-config/client.properties 2>/dev/null)
+
+  echo \"CONSUMED=\${CONSUMED}\"
+  echo \"TOPICS=\${TOPICS}\"
 " 2>/dev/null || echo "")
+
+consumed=$(echo "${test_output}" | grep '^CONSUMED=' | head -1 | cut -d= -f2-)
+assert_eq "can produce and consume message" "${TEST_VALUE}" "${consumed}"
+
+topics_output=$(echo "${test_output}" | grep '^TOPICS=' | head -1 | cut -d= -f2-)
 assert_contains "auto-created topic exists" "${topics_output}" "${TEST_TOPIC}"
 
 end_suite

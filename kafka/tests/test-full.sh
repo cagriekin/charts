@@ -22,10 +22,7 @@ CONTROLLER="${FULLNAME}-kafka-controller-0"
 BROKER_0="${FULLNAME}-kafka-broker-0"
 BROKER_1="${FULLNAME}-kafka-broker-1"
 
-wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=kafka-controller" 1 300
-wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=kafka-broker" 2 300
-
-# Test: all pods running
+# helm --wait already ensures pods are ready; verify phase directly
 ctrl_phase=$(kubectl get pod -n "${NAMESPACE}" "${CONTROLLER}" -o jsonpath='{.status.phase}')
 assert_eq "controller pod is Running" "Running" "${ctrl_phase}"
 
@@ -34,7 +31,7 @@ for pod in "${BROKER_0}" "${BROKER_1}"; do
   assert_eq "${pod} is Running" "Running" "${phase}"
 done
 
-# Helper: prepare JAAS config for kafka CLI commands
+# Wait for declared topics (topic init job runs as post-install/post-upgrade hook)
 BROKER_SVC="${BROKER_0}.${FULLNAME}-kafka-broker.${NAMESPACE}.svc.cluster.local:9092"
 KAFKA_CLI_SETUP='
   KAFKA_USERNAME=$(cat /opt/kafka/secrets/username)
@@ -46,10 +43,9 @@ KAFKA_CLI_SETUP='
   export KAFKA_OPTS="-Djava.security.auth.login.config=/tmp/kafka-config/client_jaas.conf"
 '
 
-# Test: declared topics were created (wait for topic init job which is deleted on success)
 echo "  Waiting for declared topics to appear..."
 topics_output=""
-topic_timeout=120
+topic_timeout=60
 topic_elapsed=0
 while [[ ${topic_elapsed} -lt ${topic_timeout} ]]; do
   topics_output=$(kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
@@ -62,38 +58,44 @@ while [[ ${topic_elapsed} -lt ${topic_timeout} ]]; do
   if grep -q "test-topic-1" <<< "${topics_output}" && grep -q "test-topic-2" <<< "${topics_output}"; then
     break
   fi
-  sleep 5
-  topic_elapsed=$((topic_elapsed + 5))
+  sleep 2
+  topic_elapsed=$((topic_elapsed + 2))
 done
 assert_contains "test-topic-1 exists" "${topics_output}" "test-topic-1"
 assert_contains "test-topic-2 exists" "${topics_output}" "test-topic-2"
 
-# Test: topic partitions correct
-t1_partitions=$(kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
+# Batch topic describe + cross-broker produce/consume + topic list into single execs per broker
+# to minimize JVM startups
+
+# Describe topic and produce from broker-0 in one exec
+CROSS_TOPIC="cross-test-$(date +%s)"
+TEST_VALUE="cross-broker-$(date +%s)"
+
+broker0_output=$(kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
   ${KAFKA_CLI_SETUP}
-  /opt/kafka/bin/kafka-topics.sh \
+
+  T1_DESC=\$(/opt/kafka/bin/kafka-topics.sh \
     --bootstrap-server ${BROKER_SVC} \
     --describe --topic test-topic-1 \
     --command-config /tmp/kafka-config/client.properties 2>/dev/null \
-    | grep 'PartitionCount' | sed 's/.*PartitionCount:[[:space:]]*//' | cut -f1
-" 2>/dev/null || echo "")
-assert_eq "test-topic-1 has 3 partitions" "3" "${t1_partitions}"
+    | grep 'PartitionCount' | sed 's/.*PartitionCount:[[:space:]]*//' | cut -f1)
+  echo \"T1_PARTITIONS=\${T1_DESC}\"
 
-# Test: cross-broker produce/consume (unique topic per run)
-CROSS_TOPIC="cross-test-$(date +%s)"
-TEST_VALUE="cross-broker-$(date +%s)"
-kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
-  ${KAFKA_CLI_SETUP}
   echo '${TEST_VALUE}' | /opt/kafka/bin/kafka-console-producer.sh \
     --bootstrap-server ${BROKER_SVC} \
     --topic ${CROSS_TOPIC} \
-    --producer.config /tmp/kafka-config/client.properties
-" 2>/dev/null
+    --producer.config /tmp/kafka-config/client.properties 2>/dev/null
+  echo 'PRODUCE_DONE=true'
+" 2>/dev/null || echo "")
 
+t1_partitions=$(echo "${broker0_output}" | grep '^T1_PARTITIONS=' | head -1 | cut -d= -f2-)
+assert_eq "test-topic-1 has 3 partitions" "3" "${t1_partitions}"
+
+# Consume from broker-1
 BROKER_1_SVC="${BROKER_1}.${FULLNAME}-kafka-broker.${NAMESPACE}.svc.cluster.local:9092"
 consumed=$(kubectl exec -n "${NAMESPACE}" "${BROKER_1}" -- bash -c "
   ${KAFKA_CLI_SETUP}
-  timeout 60 /opt/kafka/bin/kafka-console-consumer.sh \
+  timeout 15 /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server ${BROKER_1_SVC} \
     --topic ${CROSS_TOPIC} \
     --from-beginning \
@@ -116,11 +118,16 @@ assert_eq "exporter pod is Running" "Running" "${exporter_phase}"
 exporter_port=$(kubectl get svc -n "${NAMESPACE}" "${FULLNAME}-kafka-exporter" -o jsonpath='{.spec.ports[0].port}')
 assert_eq "exporter service port is 9308" "9308" "${exporter_port}"
 
-# Test: exporter returns kafka metrics (use a temp pod since kafka image lacks curl/wget)
-exporter_svc="${FULLNAME}-kafka-exporter.${NAMESPACE}.svc.cluster.local"
-metrics_output=$(kubectl run "metrics-check-$(date +%s)" -n "${NAMESPACE}" --rm -i --restart=Never \
-  --image=busybox:1.37 -- wget -qO- "http://${exporter_svc}:9308/metrics" 2>/dev/null \
-  | grep -m1 '^kafka_' || echo "")
+# Fetch metrics via port-forward instead of spinning up an ephemeral pod
+exporter_svc="${FULLNAME}-kafka-exporter"
+kubectl port-forward -n "${NAMESPACE}" "svc/${exporter_svc}" 19308:9308 &
+PF_PID=$!
+sleep 1
+
+metrics_output=$(wget -qO- "http://127.0.0.1:19308/metrics" 2>/dev/null | grep -m1 '^kafka_' || echo "")
+kill "${PF_PID}" 2>/dev/null || true
+wait "${PF_PID}" 2>/dev/null || true
+
 assert_contains "exporter returns kafka metrics" "${metrics_output}" "kafka_"
 
 end_suite

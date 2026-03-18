@@ -22,7 +22,8 @@ test: cluster-create test-template test-cluster cluster-delete
 test-template:
 	@bash $(TESTS_DIR)/test-template.sh
 
-test-cluster: test-minimal test-full
+test-cluster:
+	@$(MAKE) -j2 test-minimal test-full
 
 cluster-exists:
 	@kind get clusters 2>/dev/null | grep -q "^$(CLUSTER_NAME)$$" || (echo "Cluster '$(CLUSTER_NAME)' not found. Run: make cluster-create" && exit 1)
