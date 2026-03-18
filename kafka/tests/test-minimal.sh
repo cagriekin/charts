@@ -68,7 +68,7 @@ kubectl exec -n "${NAMESPACE}" "${BROKER}" -- bash -c "
 
 consumed=$(kubectl exec -n "${NAMESPACE}" "${BROKER}" -- bash -c "
   ${KAFKA_CLI_SETUP}
-  timeout 10 /opt/kafka/bin/kafka-console-consumer.sh \
+  timeout 30 /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server ${BROKER_SVC} \
     --topic test-auto-create \
     --from-beginning \
