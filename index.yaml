@@ -3,9 +3,9 @@ entries:
   kafka:
   - apiVersion: v2
     appVersion: 4.1.0
-    created: "2026-03-18T13:26:49.202666905Z"
+    created: "2026-03-18T13:30:28.508376249Z"
     description: Apache Kafka with KRaft mode, SASL authentication, and topic management
-    digest: 3253a646044a1dfc29acf8cea26bc9f4f819a1ec59c3b858fd225a51c5f9b3a2
+    digest: 2b3f0e48ccb12370d782b59bbbfa7e3b44536247dc6da17c4b602c179a2923b5
     keywords:
     - Kafka
     - Streaming
@@ -28,9 +28,9 @@ entries:
   pg:
   - apiVersion: v2
     appVersion: "18.1"
-    created: "2026-03-18T13:26:49.203809901Z"
+    created: "2026-03-18T13:30:28.509491443Z"
     description: PostgreSQL with repmgr replication and optional PGPool-II
-    digest: b83c106352065841907696fd5cc88cc734aeaa036b9c95a4253073906b3bfacf
+    digest: e3f708faad2c3f5827c8ff8d922c751aa1f18969f4768882c5ee14bd586d9f9c
     name: pg
     type: application
     urls:
@@ -39,9 +39,9 @@ entries:
   pgvector:
   - apiVersion: v2
     appVersion: "18.1"
-    created: "2026-03-18T13:26:49.204653327Z"
+    created: "2026-03-18T13:30:28.510316548Z"
     description: PostgreSQL with pgvector extension and optional PGPool-II
-    digest: 5562e5d6a41eb98abd1219705b24e95650d1b79ba5cb9a3f29ea73ae7b3dc1e5
+    digest: 5eae96dc7063a1e86f9f8ec2ff174119157c5cec65f2e3580aadc5e221efe396
     keywords:
     - PostgreSQL
     - pgvector
@@ -56,12 +56,12 @@ entries:
   redis:
   - apiVersion: v2
     appVersion: "7"
-    created: "2026-03-18T13:26:49.205100262Z"
+    created: "2026-03-18T13:30:28.510712284Z"
     description: Single-instance Redis with AOF persistence
-    digest: 7a622cb837d66a4b738198d7710e55f899623ae59ca306ba6096b2f9124b5c20
+    digest: 7c18c5b677c1e562cf982bd4d7b497abafc8b26cfa14274b227c87e619b773a4
     name: redis
     type: application
     urls:
     - https://cagriekin.github.io/charts/redis-0.1.1.tgz
     version: 0.1.1
-generated: "2026-03-18T13:26:49.201173093Z"
+generated: "2026-03-18T13:30:28.507075701Z"
