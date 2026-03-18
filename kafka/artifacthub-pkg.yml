@@ -1,8 +1,8 @@
-version: 0.1.20
+version: 0.2.0
 name: kafka
 displayName: Kafka
 createdAt: "2025-11-01T00:00:00Z"
-description: Apache Kafka deployment
+description: Apache Kafka deployment with KRaft mode, SASL authentication, TLS encryption, and topic management
 homeURL: "https://cagriekin.github.io/charts"
 logoPath: ""
 appVersion: "4.1.0"
@@ -17,4 +17,3 @@ links:
     url: https://github.com/cagriekin/charts
 screenshots: []
 changes: []
-

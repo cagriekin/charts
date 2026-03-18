@@ -22,6 +22,10 @@ spec:
       app.kubernetes.io/component: kafka-exporter
   template:
     metadata:
+      {{- with .Values.exporters.kafka.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       labels:
         app.kubernetes.io/name: {{ include "kafka.name" . }}
         app.kubernetes.io/instance: {{ .Release.Name }}
@@ -31,6 +35,9 @@ spec:
         helm.sh/chart: {{ include "kafka.chart" . }}
     spec:
       serviceAccountName: {{ include "kafka.serviceAccountName" . }}
+      {{- with .Values.exporters.kafka.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       {{- with .Values.exporters.kafka.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -50,7 +57,12 @@ spec:
                 --sasl.enabled \
                 --sasl.mechanism=plain \
                 --sasl.username="$KAFKA_SASL_USERNAME" \
-                --sasl.password="$KAFKA_SASL_PASSWORD"
+                --sasl.password="$KAFKA_SASL_PASSWORD" \
+                {{- if $.Values.kafka.tls.enabled }}
+                --tls.enabled \
+                --tls.ca-file=/opt/kafka/tls-pem/{{ $.Values.kafka.tls.caFilename }} \
+                {{- end }}
+                --log.enable-sarama=false
           ports:
             - name: metrics
               containerPort: 9308
@@ -92,6 +104,18 @@ spec:
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- if $.Values.kafka.tls.enabled }}
+          volumeMounts:
+            - name: kafka-tls-pem
+              mountPath: /opt/kafka/tls-pem
+              readOnly: true
+          {{- end }}
+      {{- if $.Values.kafka.tls.enabled }}
+      volumes:
+        - name: kafka-tls-pem
+          secret:
+            secretName: {{ include "kafka.tls.secretName" . }}
+      {{- end }}
       {{- with .Values.exporters.kafka.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -105,4 +129,3 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
 {{- end }}
-

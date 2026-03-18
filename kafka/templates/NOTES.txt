@@ -4,10 +4,12 @@
 
 Kafka cluster {{ $fullname }} is rolling out.
 
-Controller
-----------
-- StatefulSet: {{ $fullname }}-kafka-controller
-- Service: {{ $fullname }}-kafka-controller (port 9093)
+Controllers (KRaft quorum)
+--------------------------
+{{- $controllerReplicas := int .Values.kafka.controller.replicaCount }}
+{{- range $i, $_ := until $controllerReplicas }}
+- {{ $fullname }}-kafka-controller-{{ $i }}.{{ $fullname }}-kafka-controller.{{ $namespace }}.svc.cluster.local:9093
+{{- end }}
 
 Brokers
 -------
@@ -20,6 +22,11 @@ Authentication
 --------------
 - SASL/PLAIN credentials stored in secret `{{ include "kafka.auth.secretName" . }}`
 - Client configuration mounted via configmap `{{ $fullname }}-kafka-broker-config`
+{{- if .Values.kafka.tls.enabled }}
+- TLS encryption enabled (SASL_SSL)
+{{- else }}
+- TLS encryption disabled (SASL_PLAINTEXT)
+{{- end }}
 
 Topics
 ------
@@ -50,4 +57,3 @@ Next Steps
 {{- else }}
 Kafka workloads are disabled (`kafka.enabled=false`); no resources were rendered.
 {{- end }}
-

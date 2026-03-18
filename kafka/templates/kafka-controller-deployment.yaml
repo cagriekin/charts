@@ -1,7 +1,4 @@
 {{- if .Values.kafka.enabled }}
-{{- if ne (int .Values.kafka.controller.replicaCount) 1 }}
-{{- fail "kafka.controller.replicaCount must be set to 1. Multi-controller KRaft layouts are not yet supported by this chart." }}
-{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -26,6 +23,10 @@ spec:
       app.kubernetes.io/component: kafka-controller
   template:
     metadata:
+      {{- with .Values.kafka.controller.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       labels:
         app.kubernetes.io/name: {{ include "kafka.name" . }}
         app.kubernetes.io/instance: {{ .Release.Name }}
@@ -35,6 +36,10 @@ spec:
         helm.sh/chart: {{ include "kafka.chart" . }}
     spec:
       serviceAccountName: {{ include "kafka.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.kafka.controller.terminationGracePeriodSeconds }}
+      {{- with .Values.kafka.controller.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       {{- with .Values.kafka.controller.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -42,6 +47,40 @@ spec:
       {{- $controllerLogDir := .Values.kafka.controller.logDir }}
       {{- $controllerLogDirParent := dir $controllerLogDir }}
       initContainers:
+        {{- if .Values.kafka.tls.enabled }}
+        - name: tls-init
+          image: "{{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}"
+          imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              STORE_PASS="{{ include "kafka.tls.storePassword" . }}"
+
+              openssl pkcs12 -export \
+                -in /opt/kafka/tls-pem/{{ .Values.kafka.tls.certFilename }} \
+                -inkey /opt/kafka/tls-pem/{{ .Values.kafka.tls.keyFilename }} \
+                -out /opt/kafka/tls/keystore.p12 \
+                -password "pass:${STORE_PASS}"
+
+              keytool -importcert \
+                -file /opt/kafka/tls-pem/{{ .Values.kafka.tls.caFilename }} \
+                -keystore /opt/kafka/tls/truststore.p12 \
+                -storetype PKCS12 \
+                -storepass "${STORE_PASS}" \
+                -noprompt -alias ca
+          {{- with .Values.kafka.controller.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: kafka-tls-pem
+              mountPath: /opt/kafka/tls-pem
+              readOnly: true
+            - name: kafka-tls
+              mountPath: /opt/kafka/tls
+        {{- end }}
         - name: kafka-init
           image: "{{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}"
           imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
@@ -50,7 +89,6 @@ spec:
             - -c
             - |
               set -e
-              # Wait for the data directory to be available
               while [ ! -d "{{ $controllerLogDirParent }}" ]; do
                 sleep 1
               done
@@ -58,14 +96,15 @@ spec:
               LOG_DIR="{{ $controllerLogDir }}"
               mkdir -p "${LOG_DIR}"
 
-              # Format storage if not already formatted
+              # Derive node ID from pod ordinal (controller ordinal 0 -> ID 1, etc.)
+              POD_ORDINAL=$(echo $POD_NAME | rev | cut -d'-' -f1 | rev)
+              NODE_ID=$((POD_ORDINAL + 1))
+
               if [ ! -f "${LOG_DIR}/meta.properties" ]; then
-                # Handle the symlink by copying to a writable location
                 mkdir -p /tmp/kafka-controller-config
                 cp /opt/kafka/config/kraft/server.properties /tmp/kafka-controller-config/
 
-                # Replace PLACEHOLDER_NODE_ID with actual node ID
-                sed -i 's/PLACEHOLDER_NODE_ID/1/g' /tmp/kafka-controller-config/server.properties
+                sed -i "s/PLACEHOLDER_NODE_ID/$NODE_ID/g" /tmp/kafka-controller-config/server.properties
 
                 /opt/kafka/bin/kafka-storage.sh format \
                   --config /tmp/kafka-controller-config/server.properties \
@@ -73,8 +112,10 @@ spec:
                   --ignore-formatted
               fi
           env:
-            - name: KAFKA_NODE_ID
-              value: "1"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           {{- with .Values.kafka.controller.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
@@ -93,17 +134,16 @@ spec:
             - -c
             - |
               set -e
-              # Controller always uses node ID 1
-              export KAFKA_NODE_ID=1
+              # Derive node ID from pod ordinal
+              POD_ORDINAL=$$(echo $$POD_NAME | rev | cut -d'-' -f1 | rev)
+              NODE_ID=$$(expr $$POD_ORDINAL + 1)
+              export KAFKA_NODE_ID=$$NODE_ID
 
-              # Create writable config directory and copy config files
               mkdir -p /tmp/kafka-config
               cp /opt/kafka/config/kraft/server.properties /tmp/kafka-config/
 
-              # Update server.properties with correct node ID
-              sed -i "s/PLACEHOLDER_NODE_ID/1/g" /tmp/kafka-config/server.properties
+              sed -i "s/PLACEHOLDER_NODE_ID/$${NODE_ID}/g" /tmp/kafka-config/server.properties
 
-              # Start Kafka with the modified config
               exec /opt/kafka/bin/kafka-server-start.sh /tmp/kafka-config/server.properties
           ports:
             - name: controller
@@ -134,8 +174,6 @@ spec:
               value: {{ .Values.kafka.controller.jvm.heapOpts | quote }}
             - name: KAFKA_JVM_PERFORMANCE_OPTS
               value: {{ .Values.kafka.controller.jvm.performanceOpts | quote }}
-            - name: KAFKA_PROCESS_ROLES
-              value: "controller"
           {{- with .Values.kafka.controller.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
@@ -147,20 +185,36 @@ spec:
               mountPath: "{{ $controllerLogDirParent }}"
             - name: kafka-config
               mountPath: /opt/kafka/config/kraft
+            {{- if .Values.kafka.tls.enabled }}
+            - name: kafka-tls
+              mountPath: /opt/kafka/tls
+              readOnly: true
+            {{- end }}
       volumes:
         - name: kafka-config
           configMap:
             name: {{ include "kafka.fullname" . }}-kafka-controller-config
-      {{- with .Values.kafka.nodeSelector }}
+        {{- if .Values.kafka.tls.enabled }}
+        - name: kafka-tls-pem
+          secret:
+            secretName: {{ include "kafka.tls.secretName" . }}
+        - name: kafka-tls
+          emptyDir: {}
+        {{- end }}
+      {{- with .Values.kafka.controller.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.kafka.affinity }}
+      {{- with .Values.kafka.controller.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.kafka.tolerations }}
+      {{- with .Values.kafka.controller.tolerations }}
       tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.kafka.controller.topologySpreadConstraints }}
+      topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
   volumeClaimTemplates:
@@ -173,6 +227,5 @@ spec:
         {{- end }}
         resources:
           requests:
-            storage: {{ .Values.kafka.controller.persistence.size | default "1Gi" }}
+            storage: {{ .Values.kafka.controller.persistence.size }}
 {{- end }}
-
