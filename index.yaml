@@ -3,9 +3,9 @@ entries:
   kafka:
   - apiVersion: v2
     appVersion: 4.1.0
-    created: "2026-03-18T12:41:55.160202782Z"
+    created: "2026-03-18T13:24:30.222673974Z"
     description: Apache Kafka deployment for the DamnThing message bus
-    digest: 979c16d3e1c2ba7c5013c3c244fee1d6eaaf900d9e4784e82549551573901814
+    digest: 85bac60fc9e2bfdfee5872393284975f7c5857aa78d4c24bc4c6b29cb52c9793
     keywords:
     - Kafka
     - Streaming
@@ -28,9 +28,9 @@ entries:
   pg:
   - apiVersion: v2
     appVersion: "18.1"
-    created: "2026-03-18T12:41:55.161318886Z"
+    created: "2026-03-18T13:24:30.223779119Z"
     description: PostgreSQL with repmgr replication and optional PGPool-II
-    digest: e94adbc99f493f3d3d0160b936d876c51ead771d8852bd0ea7e307673f3721a1
+    digest: e3d549c1f4e6ead5641cbf2b45666a0375dadf7cac9e884ed7af3b01c998fa69
     name: pg
     type: application
     urls:
@@ -39,9 +39,9 @@ entries:
   pgvector:
   - apiVersion: v2
     appVersion: "18.1"
-    created: "2026-03-18T12:41:55.16220399Z"
+    created: "2026-03-18T13:24:30.224598521Z"
     description: PostgreSQL with pgvector extension and optional PGPool-II
-    digest: e32b1c7a50f4bac6504e63db3419e23a9b81251fbacfdb752557a54e93b29609
+    digest: f54fe9bd5eb9146c956de6eeed5a2b3bf51cc17415176180f8368a7b3890a240
     keywords:
     - PostgreSQL
     - pgvector
@@ -56,12 +56,12 @@ entries:
   redis:
   - apiVersion: v2
     appVersion: "7"
-    created: "2026-03-18T12:41:55.162604725Z"
+    created: "2026-03-18T13:24:30.225211075Z"
     description: Single-instance Redis with AOF persistence
-    digest: a1eab51c10c854a834ce0448cd8eca70d3cb8fdd801c0520c3e8b510b43a24d0
+    digest: a2d1f8dacffb9ecff3518b3fc4552ddd55cd02fd1ad292a6eedf2a1ef0a42954
     name: redis
     type: application
     urls:
     - https://cagriekin.github.io/charts/redis-0.1.1.tgz
     version: 0.1.1
-generated: "2026-03-18T12:41:55.158893099Z"
+generated: "2026-03-18T13:24:30.221358666Z"
