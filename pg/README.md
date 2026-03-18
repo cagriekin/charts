@@ -299,6 +299,30 @@ mc cp s3/pg-backups/backups/backup_20250101_020000.dump /tmp/backup.dump
 pg_restore -h localhost -U postgres -d postgres /tmp/backup.dump
 ```
 
+## Testing
+
+Tests require [Kind](https://kind.sigs.k8s.io/) and [Helm](https://helm.sh/) installed locally.
+
+```bash
+# Run everything (creates cluster, runs tests, deletes cluster)
+make test
+
+# Template/lint tests only (no cluster needed)
+make test-template
+
+# Create cluster, then run individual suites
+make cluster-create
+make test-minimal           # standalone postgres, no repmgr
+make test-repmgr            # primary + replica with repmgr
+make test-failover           # kill primary, verify promotion
+make test-full              # repmgr + pgpool + prometheus exporter
+make test-upgrade           # upgrade path with data persistence
+make cluster-delete
+
+# Run cluster tests in parallel
+make -j4 test-cluster
+```
+
 ## Upgrade
 
 ```bash
