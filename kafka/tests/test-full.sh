@@ -116,9 +116,9 @@ assert_eq "exporter pod is Running" "Running" "${exporter_phase}"
 exporter_port=$(kubectl get svc -n "${NAMESPACE}" "${FULLNAME}-kafka-exporter" -o jsonpath='{.spec.ports[0].port}')
 assert_eq "exporter service port is 9308" "9308" "${exporter_port}"
 
-# Test: exporter returns kafka metrics (use a temp pod with curl since kafka image lacks it)
+# Test: exporter returns kafka metrics (use a temp pod since kafka image lacks curl/wget)
 exporter_svc="${FULLNAME}-kafka-exporter.${NAMESPACE}.svc.cluster.local"
-metrics_output=$(kubectl run curl-test -n "${NAMESPACE}" --rm -i --restart=Never \
+metrics_output=$(kubectl run "metrics-check-$(date +%s)" -n "${NAMESPACE}" --rm -i --restart=Never \
   --image=busybox:1.37 -- wget -qO- "http://${exporter_svc}:9308/metrics" 2>/dev/null \
   | grep -m1 '^kafka_' || echo "")
 assert_contains "exporter returns kafka metrics" "${metrics_output}" "kafka_"
