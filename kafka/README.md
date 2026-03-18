@@ -1,6 +1,6 @@
 # Kafka Helm Chart
 
-This chart installs an Apache Kafka KRaft controller, brokers, and supporting components used by DamnThing's message bus.
+This chart installs an Apache Kafka KRaft controller, brokers, and supporting components.
 
 ## Components
 
