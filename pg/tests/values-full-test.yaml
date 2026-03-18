@@ -36,6 +36,10 @@ postgresql:
 
   affinity: {}
 
+  podAnnotations:
+    karpenter.sh/do-not-disrupt: "true"
+    custom-annotation: "pg-value"
+
   podDisruptionBudget:
     enabled: false
 
@@ -135,6 +139,9 @@ pgpool:
       limits:
         cpu: 200m
         memory: 128Mi
+
+  podAnnotations:
+    karpenter.sh/do-not-disrupt: "true"
 
   podDisruptionBudget:
     enabled: false
