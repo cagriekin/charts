@@ -79,13 +79,14 @@ t1_partitions=$(kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
 " 2>/dev/null || echo "")
 assert_eq "test-topic-1 has 3 partitions" "3" "${t1_partitions}"
 
-# Test: cross-broker produce/consume
+# Test: cross-broker produce/consume (unique topic per run)
+CROSS_TOPIC="cross-test-$(date +%s)"
 TEST_VALUE="cross-broker-$(date +%s)"
 kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
   ${KAFKA_CLI_SETUP}
   echo '${TEST_VALUE}' | /opt/kafka/bin/kafka-console-producer.sh \
     --bootstrap-server ${BROKER_SVC} \
-    --topic test-topic-1 \
+    --topic ${CROSS_TOPIC} \
     --producer.config /tmp/kafka-config/client.properties
 " 2>/dev/null
 
@@ -94,7 +95,7 @@ consumed=$(kubectl exec -n "${NAMESPACE}" "${BROKER_1}" -- bash -c "
   ${KAFKA_CLI_SETUP}
   timeout 30 /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server ${BROKER_1_SVC} \
-    --topic test-topic-1 \
+    --topic ${CROSS_TOPIC} \
     --from-beginning \
     --max-messages 1 \
     --consumer.config /tmp/kafka-config/client.properties 2>/dev/null
