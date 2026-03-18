@@ -34,23 +34,6 @@ for pod in "${BROKER_0}" "${BROKER_1}"; do
   assert_eq "${pod} is Running" "Running" "${phase}"
 done
 
-# Test: topic init job completed
-echo "  Waiting for topic init job to complete..."
-job_timeout=120
-job_elapsed=0
-job_done=false
-while [[ ${job_elapsed} -lt ${job_timeout} ]]; do
-  job_status=$(kubectl get jobs -n "${NAMESPACE}" -l "app.kubernetes.io/component=kafka-topic-init" \
-    -o jsonpath='{.items[0].status.succeeded}' 2>/dev/null || echo "")
-  if [[ "${job_status}" == "1" ]]; then
-    job_done=true
-    break
-  fi
-  sleep 5
-  job_elapsed=$((job_elapsed + 5))
-done
-assert_eq "topic init job completed" "true" "${job_done}"
-
 # Helper: prepare JAAS config for kafka CLI commands
 BROKER_SVC="${BROKER_0}.${FULLNAME}-kafka-broker.${NAMESPACE}.svc.cluster.local:9092"
 KAFKA_CLI_SETUP='
@@ -63,14 +46,25 @@ KAFKA_CLI_SETUP='
   export KAFKA_OPTS="-Djava.security.auth.login.config=/tmp/kafka-config/client_jaas.conf"
 '
 
-# Test: declared topics were created
-topics_output=$(kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
-  ${KAFKA_CLI_SETUP}
-  /opt/kafka/bin/kafka-topics.sh \
-    --bootstrap-server ${BROKER_SVC} \
-    --list \
-    --command-config /tmp/kafka-config/client.properties 2>/dev/null
-" 2>/dev/null || echo "")
+# Test: declared topics were created (wait for topic init job which is deleted on success)
+echo "  Waiting for declared topics to appear..."
+topics_output=""
+topic_timeout=120
+topic_elapsed=0
+while [[ ${topic_elapsed} -lt ${topic_timeout} ]]; do
+  topics_output=$(kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
+    ${KAFKA_CLI_SETUP}
+    /opt/kafka/bin/kafka-topics.sh \
+      --bootstrap-server ${BROKER_SVC} \
+      --list \
+      --command-config /tmp/kafka-config/client.properties 2>/dev/null
+  " 2>/dev/null || echo "")
+  if grep -q "test-topic-1" <<< "${topics_output}" && grep -q "test-topic-2" <<< "${topics_output}"; then
+    break
+  fi
+  sleep 5
+  topic_elapsed=$((topic_elapsed + 5))
+done
 assert_contains "test-topic-1 exists" "${topics_output}" "test-topic-1"
 assert_contains "test-topic-2 exists" "${topics_output}" "test-topic-2"
 
