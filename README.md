@@ -38,9 +38,28 @@ helm lint ./kafka
 helm lint ./redis
 ```
 
+## Testing
+
+Each chart has a Kind-based integration test suite. Tests require [Kind](https://kind.sigs.k8s.io/) and [Helm](https://helm.sh/).
+
+```bash
+# Run full test suite for a chart (creates cluster, tests, deletes cluster)
+make -C pg test
+make -C kafka test
+make -C redis test
+
+# Template/lint tests only (no cluster needed)
+make -C pg test-template
+make -C kafka test-template
+make -C redis test-template
+```
+
+See each chart's README for the full list of available test targets.
+
 ## Contributing
 
 1. Make your changes in the appropriate chart directory.
 2. Update chart metadata (`Chart.yaml`) and documentation as needed.
-3. Run `helm lint <chart-folder>` to verify the chart before committing.
+3. Run `make -C <chart-folder> test-template` to verify the chart before committing.
+4. Run `make -C <chart-folder> test` for full integration testing.
 
