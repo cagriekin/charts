@@ -38,6 +38,7 @@ test-repmgr-failover: cluster-exists
 
 cluster-exists:
 	@kind get clusters 2>/dev/null | grep -q "^$(CLUSTER_NAME)$$" || (echo "Cluster '$(CLUSTER_NAME)' not found. Run: make cluster-create" && exit 1)
+	@kubectl config use-context kind-$(CLUSTER_NAME) >/dev/null 2>&1
 
 cluster-create:
 	@if kind get clusters 2>/dev/null | grep -q "^$(CLUSTER_NAME)$$"; then \
