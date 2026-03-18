@@ -56,13 +56,14 @@ KAFKA_CLI_SETUP='
   export KAFKA_OPTS="-Djava.security.auth.login.config=/tmp/kafka-config/client_jaas.conf"
 '
 
-# Test: produce and consume a message via SASL
+# Test: produce and consume a message via SASL (unique topic per run)
+TEST_TOPIC="test-$(date +%s)"
 TEST_VALUE="hello-$(date +%s)"
 kubectl exec -n "${NAMESPACE}" "${BROKER}" -- bash -c "
   ${KAFKA_CLI_SETUP}
   echo '${TEST_VALUE}' | /opt/kafka/bin/kafka-console-producer.sh \
     --bootstrap-server ${BROKER_SVC} \
-    --topic test-auto-create \
+    --topic ${TEST_TOPIC} \
     --producer.config /tmp/kafka-config/client.properties
 " 2>/dev/null
 
@@ -70,7 +71,7 @@ consumed=$(kubectl exec -n "${NAMESPACE}" "${BROKER}" -- bash -c "
   ${KAFKA_CLI_SETUP}
   timeout 30 /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server ${BROKER_SVC} \
-    --topic test-auto-create \
+    --topic ${TEST_TOPIC} \
     --from-beginning \
     --max-messages 1 \
     --consumer.config /tmp/kafka-config/client.properties 2>/dev/null
@@ -85,7 +86,7 @@ topics_output=$(kubectl exec -n "${NAMESPACE}" "${BROKER}" -- bash -c "
     --list \
     --command-config /tmp/kafka-config/client.properties 2>/dev/null
 " 2>/dev/null || echo "")
-assert_contains "auto-created topic exists" "${topics_output}" "test-auto-create"
+assert_contains "auto-created topic exists" "${topics_output}" "${TEST_TOPIC}"
 
 end_suite
 print_summary
