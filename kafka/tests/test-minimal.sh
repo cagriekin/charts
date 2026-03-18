@@ -59,12 +59,13 @@ test_output=$(kubectl exec -n "${NAMESPACE}" "${BROKER}" -- bash -c "
     --topic ${TEST_TOPIC} \
     --producer.config /tmp/kafka-config/client.properties 2>/dev/null
 
-  CONSUMED=\$(timeout 15 /opt/kafka/bin/kafka-console-consumer.sh \
+  timeout 15 /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server ${BROKER_SVC} \
     --topic ${TEST_TOPIC} \
     --from-beginning \
     --max-messages 1 \
-    --consumer.config /tmp/kafka-config/client.properties 2>/dev/null)
+    --consumer.config /tmp/kafka-config/client.properties 2>/dev/null > /tmp/consumed.out || true
+  CONSUMED=\$(cat /tmp/consumed.out)
 
   TOPICS=\$(/opt/kafka/bin/kafka-topics.sh \
     --bootstrap-server ${BROKER_SVC} \

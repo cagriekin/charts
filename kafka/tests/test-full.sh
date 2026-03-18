@@ -95,12 +95,14 @@ assert_eq "test-topic-1 has 3 partitions" "3" "${t1_partitions}"
 BROKER_1_SVC="${BROKER_1}.${FULLNAME}-kafka-broker.${NAMESPACE}.svc.cluster.local:9092"
 consumed=$(kubectl exec -n "${NAMESPACE}" "${BROKER_1}" -- bash -c "
   ${KAFKA_CLI_SETUP}
+  # Write consumed message to a file so timeout exit code does not lose stdout
   timeout 15 /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server ${BROKER_1_SVC} \
     --topic ${CROSS_TOPIC} \
     --from-beginning \
     --max-messages 1 \
-    --consumer.config /tmp/kafka-config/client.properties 2>/dev/null
+    --consumer.config /tmp/kafka-config/client.properties 2>/dev/null > /tmp/consumed.out || true
+  cat /tmp/consumed.out
 " 2>/dev/null || echo "")
 assert_eq "cross-broker produce/consume works" "${TEST_VALUE}" "${consumed}"
 
