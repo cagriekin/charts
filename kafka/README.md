@@ -148,6 +148,24 @@ kafka:
 - Autoscaling template failures during `helm template` or `helm install` usually mean CPU/memory targets were omitted—set at least one threshold for each enabled autoscaler.
 - KEDA scaling requires the CRDs and operator to be present; verify `kubectl get scaledobjects` works cluster-wide before enabling `keda.broker`.
 
+## Testing
+
+Tests require [Kind](https://kind.sigs.k8s.io/) and [Helm](https://helm.sh/) installed locally.
+
+```bash
+# Run everything (creates cluster, runs tests, deletes cluster)
+make test
+
+# Template/lint tests only (no cluster needed)
+make test-template
+
+# Create cluster, then run individual suites
+make cluster-create
+make test-minimal    # 1 controller + 1 broker, produce/consume
+make test-full       # 2 brokers + exporter + declarative topics
+make cluster-delete
+```
+
 ## Compatibility Matrix
 
 | Chart Version | Kafka Version | Kubernetes Versions | Notes |
