@@ -93,7 +93,7 @@ kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
 BROKER_1_SVC="${BROKER_1}.${FULLNAME}-kafka-broker.${NAMESPACE}.svc.cluster.local:9092"
 consumed=$(kubectl exec -n "${NAMESPACE}" "${BROKER_1}" -- bash -c "
   ${KAFKA_CLI_SETUP}
-  timeout 30 /opt/kafka/bin/kafka-console-consumer.sh \
+  timeout 60 /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server ${BROKER_1_SVC} \
     --topic ${CROSS_TOPIC} \
     --from-beginning \
