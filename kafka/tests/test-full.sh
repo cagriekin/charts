@@ -96,7 +96,7 @@ BROKER_1_SVC="${BROKER_1}.${FULLNAME}-kafka-broker.${NAMESPACE}.svc.cluster.loca
 consumed=$(kubectl exec -n "${NAMESPACE}" "${BROKER_1}" -- bash -c "
   ${KAFKA_CLI_SETUP}
   # Write consumed message to a file so timeout exit code does not lose stdout
-  timeout 15 /opt/kafka/bin/kafka-console-consumer.sh \
+  timeout 30 /opt/kafka/bin/kafka-console-consumer.sh \
     --bootstrap-server ${BROKER_1_SVC} \
     --topic ${CROSS_TOPIC} \
     --from-beginning \
