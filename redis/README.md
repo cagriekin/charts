@@ -1,0 +1,84 @@
+# Redis Helm Chart
+
+Single-instance Redis with AOF persistence and optional Prometheus metrics exporter.
+
+## Installation
+
+```bash
+helm install my-redis ./redis
+```
+
+### With Custom Configuration
+
+```bash
+helm install my-redis ./redis \
+  --set redis.config.maxmemory="500mb" \
+  --set redis.config.maxmemory-policy="volatile-lru"
+```
+
+### Without Exporter
+
+```bash
+helm install my-redis ./redis \
+  --set exporter.enabled=false
+```
+
+## Configuration
+
+### Redis Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `redis.image.repository` | Redis image repository | `redis` |
+| `redis.image.tag` | Redis image tag | `7-alpine` |
+| `redis.persistence.enabled` | Enable persistence | `true` |
+| `redis.persistence.storageClass` | Storage class | `""` |
+| `redis.persistence.size` | Storage size | `1Gi` |
+| `redis.config.maxmemory` | Max memory | `200mb` |
+| `redis.config.maxmemory-policy` | Eviction policy | `allkeys-lru` |
+| `redis.resources.requests.cpu` | CPU request | `50m` |
+| `redis.resources.requests.memory` | Memory request | `64Mi` |
+| `redis.resources.limits.cpu` | CPU limit | `200m` |
+| `redis.resources.limits.memory` | Memory limit | `256Mi` |
+
+### Exporter Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `exporter.enabled` | Enable Redis exporter | `true` |
+| `exporter.image.repository` | Exporter image | `oliver006/redis_exporter` |
+| `exporter.image.tag` | Exporter tag | `v1.67.0` |
+| `exporter.service.port` | Exporter port | `9121` |
+| `exporter.serviceMonitor.enabled` | Create ServiceMonitor | `true` |
+| `exporter.serviceMonitor.interval` | Scrape interval | `30s` |
+
+### Service Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `service.type` | Service type | `ClusterIP` |
+| `service.port` | Service port | `6379` |
+
+## Testing
+
+Tests require [Kind](https://kind.sigs.k8s.io/) and [Helm](https://helm.sh/) installed locally.
+
+```bash
+# Run everything (creates cluster, runs tests, deletes cluster)
+make test
+
+# Template/lint tests only (no cluster needed)
+make test-template
+
+# Create cluster, then run individual suites
+make cluster-create
+make test-minimal    # single redis instance, set/get
+make test-full       # redis + exporter + metrics check
+make cluster-delete
+```
+
+## Upgrade
+
+```bash
+helm upgrade my-redis ./redis
+```
