@@ -56,6 +56,8 @@ postgresql:
 
   affinity: {}
 
+  podAnnotations: {}
+
   podDisruptionBudget:
     enabled: true
     minAvailable: 1
@@ -148,6 +150,8 @@ pgpool:
     port: 9999
 
   affinity: {}
+
+  podAnnotations: {}
 
   metrics:
     enabled: false
