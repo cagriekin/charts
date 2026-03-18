@@ -17,12 +17,17 @@ spec:
       labels:
         {{- include "pg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: pgpool
-{{- if .Values.pgpool.metrics.enabled }}
+      {{- if or .Values.pgpool.metrics.enabled .Values.pgpool.podAnnotations }}
       annotations:
+        {{- if .Values.pgpool.metrics.enabled }}
         prometheus.io/scrape: "true"
         prometheus.io/port: "9719"
         prometheus.io/path: "/metrics"
-{{- end }}
+        {{- end }}
+        {{- with .Values.pgpool.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
     spec:
       affinity:
         {{- if .Values.pgpool.affinity }}
