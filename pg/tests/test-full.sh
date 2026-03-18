@@ -118,7 +118,7 @@ assert_eq "exporter service port is 9116" "9116" "${exporter_port}"
 
 # Test: exporter returns metrics (use a temp pod to avoid curl dependency)
 exporter_svc="${FULLNAME}-postgres-exporter.${NAMESPACE}.svc.cluster.local"
-metrics_output=$(kubectl run curl-test -n "${NAMESPACE}" --rm -i --restart=Never \
+metrics_output=$(kubectl run "metrics-check-$(date +%s)" -n "${NAMESPACE}" --rm -i --restart=Never \
   --image=busybox:1.37 -- wget -qO- "http://${exporter_svc}:9116/metrics" 2>/dev/null \
   | grep -m1 '^pg_' || echo "")
 assert_contains "exporter returns pg metrics" "${metrics_output}" "pg_"
