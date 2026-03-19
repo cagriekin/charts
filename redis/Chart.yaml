@@ -4,3 +4,7 @@ description: Single-instance Redis with AOF persistence
 type: application
 version: 0.1.1
 appVersion: "7"
+dependencies:
+  - name: common
+    version: 0.1.0
+    repository: file://../common
