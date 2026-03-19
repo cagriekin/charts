@@ -1,19 +1,11 @@
 {{- if .Values.exporter.enabled }}
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ include "redis.fullname" . }}-exporter
-  labels:
-    {{- include "redis.labels" . | nindent 4 }}
-    app.kubernetes.io/component: redis-exporter
-spec:
-  type: {{ .Values.exporter.service.type }}
-  ports:
-    - name: metrics
-      port: {{ .Values.exporter.service.port }}
-      targetPort: metrics
-      protocol: TCP
-  selector:
-    {{- include "redis.selectorLabels" . | nindent 4 }}
-    app.kubernetes.io/component: redis-exporter
+{{- include "common.exporterService" (dict
+  "ctx"             .
+  "component"       "redis-exporter"
+  "nameSuffix"      "exporter"
+  "labels"          "redis.labels"
+  "selectorLabels"  "redis.selectorLabels"
+  "port"            .Values.exporter.service.port
+  "serviceType"     .Values.exporter.service.type
+) }}
 {{- end }}
