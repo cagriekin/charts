@@ -52,3 +52,81 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end }}
+
+{{/*
+Exporter Service resource.
+Usage:
+  include "common.exporterService" (dict
+    "ctx"             .
+    "component"       "redis-exporter"
+    "labels"          "redis.labels"
+    "selectorLabels"  "redis.selectorLabels"
+    "port"            .Values.exporter.service.port
+    "serviceType"     .Values.exporter.service.type
+    "annotations"     .Values.exporter.service.annotations
+  )
+*/}}
+{{- define "common.exporterService" -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "common.fullname" .ctx }}-{{ .nameSuffix | default .component }}
+  labels:
+    {{- include .labels .ctx | nindent 4 }}
+    app.kubernetes.io/component: {{ .component }}
+  {{- with .annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .serviceType | default "ClusterIP" }}
+  ports:
+    - name: metrics
+      port: {{ .port }}
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    {{- include .selectorLabels .ctx | nindent 4 }}
+    app.kubernetes.io/component: {{ .component }}
+{{- end }}
+
+{{/*
+Exporter Deployment resource.
+Usage:
+  include "common.exporterDeployment" (dict
+    "ctx"             .
+    "component"       "redis-exporter"
+    "labels"          "redis.labels"
+    "selectorLabels"  "redis.selectorLabels"
+    "replicas"        1
+    "podAnnotations"  (dict)
+    "podSpec"         "redis.exporterPodSpec"
+  )
+Optional: "nameSuffix" overrides the resource name suffix (defaults to component).
+*/}}
+{{- define "common.exporterDeployment" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "common.fullname" .ctx }}-{{ .nameSuffix | default .component }}
+  labels:
+    {{- include .labels .ctx | nindent 4 }}
+    app.kubernetes.io/component: {{ .component }}
+spec:
+  replicas: {{ .replicas | default 1 }}
+  selector:
+    matchLabels:
+      {{- include .selectorLabels .ctx | nindent 6 }}
+      app.kubernetes.io/component: {{ .component }}
+  template:
+    metadata:
+      labels:
+        {{- include .selectorLabels .ctx | nindent 8 }}
+        app.kubernetes.io/component: {{ .component }}
+      {{- with .podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- include .podSpec .ctx | nindent 6 }}
+{{- end }}
