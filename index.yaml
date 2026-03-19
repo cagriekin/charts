@@ -3,9 +3,10 @@ entries:
   kafka:
   - apiVersion: v2
     appVersion: 4.1.0
-    created: "2026-03-18T13:30:28.508376249Z"
-    description: Apache Kafka with KRaft mode, SASL authentication, and topic management
-    digest: 2b3f0e48ccb12370d782b59bbbfa7e3b44536247dc6da17c4b602c179a2923b5
+    created: "2026-03-19T08:11:24.491916661Z"
+    description: Apache Kafka with KRaft mode, SASL authentication, TLS encryption,
+      and topic management
+    digest: 423db47e83dd541225981fa40865e6c2d67c602b7cd8148546ae9353688960ef
     keywords:
     - Kafka
     - Streaming
@@ -23,14 +24,14 @@ entries:
     name: kafka
     type: application
     urls:
-    - https://cagriekin.github.io/charts/kafka-0.1.35.tgz
-    version: 0.1.35
+    - https://cagriekin.github.io/charts/kafka-0.2.0.tgz
+    version: 0.2.0
   pg:
   - apiVersion: v2
     appVersion: "18.1"
-    created: "2026-03-18T13:30:28.509491443Z"
+    created: "2026-03-19T08:11:24.493120685Z"
     description: PostgreSQL with repmgr replication and optional PGPool-II
-    digest: e3f708faad2c3f5827c8ff8d922c751aa1f18969f4768882c5ee14bd586d9f9c
+    digest: 46f4a5314029b58fd7c3e7f67bd55b486368ab28fb93626dd2c2c3093f2df7a4
     name: pg
     type: application
     urls:
@@ -39,9 +40,9 @@ entries:
   pgvector:
   - apiVersion: v2
     appVersion: "18.1"
-    created: "2026-03-18T13:30:28.510316548Z"
+    created: "2026-03-19T08:11:24.494022359Z"
     description: PostgreSQL with pgvector extension and optional PGPool-II
-    digest: 5eae96dc7063a1e86f9f8ec2ff174119157c5cec65f2e3580aadc5e221efe396
+    digest: 997a7574ffb11dc4fd7a53bb01b9c113f4ff2e29ddb7dbf4d7e375596be0367c
     keywords:
     - PostgreSQL
     - pgvector
@@ -56,12 +57,12 @@ entries:
   redis:
   - apiVersion: v2
     appVersion: "7"
-    created: "2026-03-18T13:30:28.510712284Z"
+    created: "2026-03-19T08:11:24.494449736Z"
     description: Single-instance Redis with AOF persistence
-    digest: 7c18c5b677c1e562cf982bd4d7b497abafc8b26cfa14274b227c87e619b773a4
+    digest: cc62a0b819fa2d957e0b246e088358da8f21c2d0a5f0b7da20d19060904f43ce
     name: redis
     type: application
     urls:
     - https://cagriekin.github.io/charts/redis-0.1.1.tgz
     version: 0.1.1
-generated: "2026-03-18T13:30:28.507075701Z"
+generated: "2026-03-19T08:11:24.490256206Z"
