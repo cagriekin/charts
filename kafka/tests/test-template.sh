@@ -61,8 +61,8 @@ tls_cm=$(helm template test-kafka "${CHART_DIR}" \
 
 assert_contains "tls-cm: Certificate resource created" "${tls_cm}" "kind: Certificate"
 assert_contains "tls-cm: issuer name set" "${tls_cm}" "name: my-issuer"
-assert_contains "tls-cm: wildcard controller SAN" "${tls_cm}" "*.test-kafka-kafka-kafka-controller"
-assert_contains "tls-cm: wildcard broker SAN" "${tls_cm}" "*.test-kafka-kafka-kafka-broker"
+assert_contains "tls-cm: wildcard controller SAN" "${tls_cm}" "*.test-kafka-kafka-controller"
+assert_contains "tls-cm: wildcard broker SAN" "${tls_cm}" "*.test-kafka-kafka-broker"
 assert_contains "tls-cm: broker listener uses SASL_SSL" "${tls_cm}" "SASL_SSL"
 assert_contains "tls-cm: controller protocol uses SSL" "${tls_cm}" "CONTROLLER:SSL"
 assert_contains "tls-cm: ssl keystore configured" "${tls_cm}" "ssl.keystore.type=PKCS12"

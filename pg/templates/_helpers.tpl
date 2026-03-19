@@ -1,59 +1,26 @@
-{{/*
-Expand the name of the chart.
-*/}}
 {{- define "pg.name" -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- include "common.name" . }}
 {{- end }}
 
-{{/*
-Create a default fully qualified app name.
-*/}}
 {{- define "pg.fullname" -}}
-{{- if .Values.fullnameOverride }}
-{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
-{{- else }}
-{{- $name := default .Chart.Name .Values.nameOverride }}
-{{- if contains $name .Release.Name }}
-{{- .Release.Name | trunc 63 | trimSuffix "-" }}
-{{- else }}
-{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
-{{- end }}
-{{- end }}
+{{- include "common.fullname" . }}
 {{- end }}
 
-{{/*
-Create chart name and version as used by the chart label.
-*/}}
 {{- define "pg.chart" -}}
-{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- include "common.chart" . }}
 {{- end }}
 
-{{/*
-Common labels
-*/}}
 {{- define "pg.labels" -}}
-helm.sh/chart: {{ include "pg.chart" . }}
-{{ include "pg.selectorLabels" . }}
-{{- if .Chart.AppVersion }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-{{- end }}
-app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{ include "common.labels" . }}
 {{- with .Values.global.annotations }}
 {{ toYaml . }}
 {{- end }}
 {{- end }}
 
-{{/*
-Selector labels
-*/}}
 {{- define "pg.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "pg.name" . }}
-app.kubernetes.io/instance: {{ .Release.Name }}
+{{- include "common.selectorLabels" . }}
 {{- end }}
 
-{{/*
-PostgreSQL secret name
-*/}}
 {{- define "pg.secretName" -}}
 {{- if .Values.postgresql.existingSecret.enabled }}
 {{- .Values.postgresql.existingSecret.name }}
@@ -62,9 +29,6 @@ PostgreSQL secret name
 {{- end }}
 {{- end }}
 
-{{/*
-PostgreSQL username key
-*/}}
 {{- define "pg.secretUsernameKey" -}}
 {{- if .Values.postgresql.existingSecret.enabled }}
 {{- .Values.postgresql.existingSecret.usernameKey }}
@@ -73,9 +37,6 @@ PostgreSQL username key
 {{- end }}
 {{- end }}
 
-{{/*
-PostgreSQL password key
-*/}}
 {{- define "pg.secretPasswordKey" -}}
 {{- if .Values.postgresql.existingSecret.enabled }}
 {{- .Values.postgresql.existingSecret.passwordKey }}
@@ -84,9 +45,6 @@ PostgreSQL password key
 {{- end }}
 {{- end }}
 
-{{/*
-PostgreSQL database key
-*/}}
 {{- define "pg.secretDatabaseKey" -}}
 {{- if .Values.postgresql.existingSecret.enabled }}
 {{- .Values.postgresql.existingSecret.databaseKey }}
@@ -95,9 +53,6 @@ PostgreSQL database key
 {{- end }}
 {{- end }}
 
-{{/*
-Repmgr password key
-*/}}
 {{- define "pg.secretRepmgrPasswordKey" -}}
 {{- if .Values.postgresql.existingSecret.enabled }}
 {{- .Values.postgresql.existingSecret.repmgrPasswordKey }}
@@ -106,23 +61,14 @@ Repmgr password key
 {{- end }}
 {{- end }}
 
-{{/*
-Backup S3 secret name
-*/}}
 {{- define "pg.backupSecretName" -}}
 {{- .Values.backup.existingSecret.name }}
 {{- end }}
 
-{{/*
-Backup S3 access key ID key
-*/}}
 {{- define "pg.backupAccessKeyIdKey" -}}
 {{- .Values.backup.existingSecret.accessKeyIdKey }}
 {{- end }}
 
-{{/*
-Backup S3 secret access key key
-*/}}
 {{- define "pg.backupSecretAccessKeyKey" -}}
 {{- .Values.backup.existingSecret.secretAccessKeyKey }}
 {{- end }}

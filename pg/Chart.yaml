@@ -4,3 +4,7 @@ description: PostgreSQL with repmgr replication and optional PGPool-II
 type: application
 version: 0.5.26
 appVersion: "18.1"
+dependencies:
+  - name: common
+    version: 0.1.0
+    repository: file://../common

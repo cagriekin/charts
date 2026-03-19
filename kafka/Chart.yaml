@@ -4,6 +4,10 @@ description: Apache Kafka with KRaft mode, SASL authentication, TLS encryption, 
 type: application
 version: 0.2.0
 appVersion: 4.1.0
+dependencies:
+  - name: common
+    version: 0.1.0
+    repository: file://../common
 keywords:
   - Kafka
   - Streaming

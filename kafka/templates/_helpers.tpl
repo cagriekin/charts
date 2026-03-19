@@ -1,49 +1,22 @@
-{{/*
-Expand the name of the chart.
-*/}}
 {{- define "kafka.name" -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- include "common.name" . }}
 {{- end }}
 
-{{/*
-Create a default fully qualified app name.
-*/}}
 {{- define "kafka.fullname" -}}
-{{- $override := default "" (.Values.fullnameOverride | trim) -}}
-{{- if ne $override "" -}}
-{{- $override | trunc 63 | trimSuffix "-" -}}
-{{- else -}}
-{{- $name := include "kafka.name" . -}}
-{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
+{{- include "common.fullname" . }}
 {{- end }}
 
-{{/*
-Create chart name and version as used by the chart label.
-*/}}
 {{- define "kafka.chart" -}}
-{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- include "common.chart" . }}
 {{- end }}
 
-{{/*
-Common labels
-*/}}
 {{- define "kafka.labels" -}}
-helm.sh/chart: {{ include "kafka.chart" . }}
-{{ include "kafka.selectorLabels" . }}
-{{- if .Chart.AppVersion }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-{{- end }}
-app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{ include "common.labels" . }}
 app.kubernetes.io/part-of: {{ include "kafka.name" . }}
 {{- end }}
 
-{{/*
-Selector labels
-*/}}
 {{- define "kafka.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "kafka.name" . }}
-app.kubernetes.io/instance: {{ .Release.Name }}
+{{- include "common.selectorLabels" . }}
 {{- end }}
 
 {{/*
