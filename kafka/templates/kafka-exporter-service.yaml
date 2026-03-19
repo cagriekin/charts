@@ -1,25 +1,9 @@
 {{- if .Values.exporters.kafka.enabled }}
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ include "kafka.fullname" . }}-kafka-exporter
-  labels:
-    app.kubernetes.io/name: {{ include "kafka.name" . }}
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    app.kubernetes.io/component: kafka-exporter
-    app.kubernetes.io/managed-by: {{ .Release.Service }}
-    app.kubernetes.io/part-of: {{ .Chart.Name }}
-    helm.sh/chart: {{ include "kafka.chart" . }}
-spec:
-  type: ClusterIP
-  ports:
-    - port: 9308
-      targetPort: metrics
-      protocol: TCP
-      name: metrics
-  selector:
-    app.kubernetes.io/name: {{ include "kafka.name" . }}
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    app.kubernetes.io/component: kafka-exporter
+{{- include "common.exporterService" (dict
+  "ctx"             .
+  "component"       "kafka-exporter"
+  "labels"          "kafka.labels"
+  "selectorLabels"  "kafka.selectorLabels"
+  "port"            9308
+) }}
 {{- end }}
-

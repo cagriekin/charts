@@ -19,6 +19,107 @@ app.kubernetes.io/part-of: {{ include "kafka.name" . }}
 {{- include "common.selectorLabels" . }}
 {{- end }}
 
+{{- define "kafka.exporterPodSpec" -}}
+{{- $fullname := include "kafka.fullname" . }}
+{{- $namespace := default "default" .Release.Namespace }}
+{{- $replicas := int .Values.kafka.broker.replicaCount }}
+serviceAccountName: {{ include "kafka.serviceAccountName" . }}
+{{- with .Values.exporters.kafka.priorityClassName }}
+priorityClassName: {{ . | quote }}
+{{- end }}
+{{- with .Values.exporters.kafka.podSecurityContext }}
+securityContext:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+containers:
+  - name: kafka-exporter
+    image: "{{ .Values.exporters.kafka.image.registry }}/{{ .Values.exporters.kafka.image.repository }}:{{ .Values.exporters.kafka.image.tag }}"
+    imagePullPolicy: {{ .Values.exporters.kafka.image.pullPolicy }}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        kafka_exporter \
+          {{- range $i := until $replicas }}
+          --kafka.server={{ $fullname }}-kafka-broker-{{ $i }}.{{ $fullname }}-kafka-broker.{{ $namespace }}.svc.cluster.local:9092 \
+          {{- end }}
+          --sasl.enabled \
+          --sasl.mechanism=plain \
+          --sasl.username="$KAFKA_SASL_USERNAME" \
+          {{- if $.Values.kafka.tls.enabled }}
+          --sasl.password="$KAFKA_SASL_PASSWORD" \
+          --tls.enabled \
+          --tls.ca-file=/opt/kafka/tls-pem/{{ $.Values.kafka.tls.caFilename }}
+          {{- else }}
+          --sasl.password="$KAFKA_SASL_PASSWORD"
+          {{- end }}
+    ports:
+      - name: metrics
+        containerPort: 9308
+        protocol: TCP
+    {{- if .Values.kafka.auth.existingSecret }}
+    env:
+      - name: KAFKA_SASL_USERNAME
+        valueFrom:
+          secretKeyRef:
+            name: {{ include "kafka.auth.secretName" . }}
+            key: {{ include "kafka.auth.usernameKey" . | trim }}
+      - name: KAFKA_SASL_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: {{ include "kafka.auth.secretName" . }}
+            key: {{ include "kafka.auth.passwordKey" . | trim }}
+    {{- else }}
+    env:
+      - name: KAFKA_SASL_USERNAME
+        value: {{ include "kafka.auth.username" . | quote }}
+      - name: KAFKA_SASL_PASSWORD
+        value: {{ include "kafka.auth.password" . | quote }}
+    {{- end }}
+    resources:
+      {{- toYaml .Values.exporters.kafka.resources | nindent 6 }}
+    livenessProbe:
+      httpGet:
+        path: /metrics
+        port: 9308
+      initialDelaySeconds: 30
+      periodSeconds: 10
+    readinessProbe:
+      httpGet:
+        path: /metrics
+        port: 9308
+      initialDelaySeconds: 10
+      periodSeconds: 5
+    {{- with .Values.exporters.kafka.containerSecurityContext }}
+    securityContext:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- if $.Values.kafka.tls.enabled }}
+    volumeMounts:
+      - name: kafka-tls-pem
+        mountPath: /opt/kafka/tls-pem
+        readOnly: true
+    {{- end }}
+{{- if $.Values.kafka.tls.enabled }}
+volumes:
+  - name: kafka-tls-pem
+    secret:
+      secretName: {{ include "kafka.tls.secretName" . }}
+{{- end }}
+{{- with .Values.exporters.kafka.nodeSelector }}
+nodeSelector:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .Values.exporters.kafka.affinity }}
+affinity:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .Values.exporters.kafka.tolerations }}
+tolerations:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
+
 {{/*
 Create the name of the service account to use
 */}}
