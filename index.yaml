@@ -1,9 +1,94 @@
 apiVersion: v1
 entries:
+  kafka:
+  - apiVersion: v2
+    appVersion: 4.1.0
+    created: "2026-03-20T20:04:07.583644+01:00"
+    description: Apache Kafka with KRaft mode, SASL authentication, TLS encryption,
+      and topic management
+    digest: 423db47e83dd541225981fa40865e6c2d67c602b7cd8148546ae9353688960ef
+    keywords:
+    - Kafka
+    - Streaming
+    - Messaging
+    - Message Bus
+    - Kafka Broker
+    - Kafka Controller
+    - Kafka Exporter
+    - Kafka Topics
+    - Kafka Config
+    - Kafka Secrets
+    - Kafka Service
+    - Kafka Deployment
+    - Kafka StatefulSet
+    name: kafka
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/kafka-0.2.0.tgz
+    version: 0.2.0
+  - apiVersion: v2
+    appVersion: 4.1.0
+    created: "2026-03-20T20:04:07.581124+01:00"
+    description: Apache Kafka with KRaft mode, SASL authentication, and topic management
+    digest: 2b3f0e48ccb12370d782b59bbbfa7e3b44536247dc6da17c4b602c179a2923b5
+    keywords:
+    - Kafka
+    - Streaming
+    - Messaging
+    - Message Bus
+    - Kafka Broker
+    - Kafka Controller
+    - Kafka Exporter
+    - Kafka Topics
+    - Kafka Config
+    - Kafka Secrets
+    - Kafka Service
+    - Kafka Deployment
+    - Kafka StatefulSet
+    name: kafka
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/kafka-0.1.35.tgz
+    version: 0.1.35
+  pg:
+  - apiVersion: v2
+    appVersion: "18.1"
+    created: "2026-03-20T20:04:07.58689+01:00"
+    dependencies:
+    - name: common
+      repository: file://../common
+      version: 0.1.0
+    description: PostgreSQL with repmgr replication and optional PGPool-II
+    digest: 6db9094c0f81ef3e216931dabe682525faca4f23acbc97d821f95cf380eca298
+    name: pg
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/pg-0.5.27.tgz
+    version: 0.5.27
+  - apiVersion: v2
+    appVersion: "18.1"
+    created: "2026-03-20T20:04:07.585599+01:00"
+    description: PostgreSQL with repmgr replication and optional PGPool-II
+    digest: 46f4a5314029b58fd7c3e7f67bd55b486368ab28fb93626dd2c2c3093f2df7a4
+    name: pg
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/pg-0.5.26.tgz
+    version: 0.5.26
+  - apiVersion: v2
+    appVersion: "18.1"
+    created: "2026-03-20T20:04:07.584465+01:00"
+    description: PostgreSQL with repmgr replication and optional PGPool-II
+    digest: 0afc1b39ba6b9a6233905b678c499b295b141bb824693206ce586cdd249d1047
+    name: pg
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/pg-0.5.13.tgz
+    version: 0.5.13
   pgvector:
   - apiVersion: v2
     appVersion: "18.1"
-    created: "2026-03-20T19:02:55.422764286Z"
+    created: "2026-03-20T20:04:07.588497+01:00"
     dependencies:
     - name: common
       repository: file://../common
@@ -21,4 +106,31 @@ entries:
     urls:
     - https://cagriekin.github.io/charts/pgvector-0.6.29.tgz
     version: 0.6.29
-generated: "2026-03-20T19:02:55.421535077Z"
+  - apiVersion: v2
+    appVersion: "18.1"
+    created: "2026-03-20T20:04:07.587706+01:00"
+    description: PostgreSQL with pgvector extension and optional PGPool-II
+    digest: 997a7574ffb11dc4fd7a53bb01b9c113f4ff2e29ddb7dbf4d7e375596be0367c
+    keywords:
+    - PostgreSQL
+    - pgvector
+    - PGPool-II
+    - Vector Search
+    - Vector Database
+    name: pgvector
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/pgvector-0.6.28.tgz
+    version: 0.6.28
+  redis:
+  - apiVersion: v2
+    appVersion: "7"
+    created: "2026-03-20T20:04:07.589803+01:00"
+    description: Single-instance Redis with AOF persistence
+    digest: cc62a0b819fa2d957e0b246e088358da8f21c2d0a5f0b7da20d19060904f43ce
+    name: redis
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/redis-0.1.1.tgz
+    version: 0.1.1
+generated: "2026-03-20T20:04:07.579627+01:00"
