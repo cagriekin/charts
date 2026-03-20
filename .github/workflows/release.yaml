@@ -2,9 +2,14 @@ name: Release Helm Charts
 
 on:
   workflow_dispatch:
+    inputs:
+      chart:
+        description: 'Chart directory name to release (e.g. pg, redis, kafka)'
+        required: true
+        type: string
   push:
     tags:
-      - '*'
+      - '*-[0-9]*.[0-9]*.[0-9]*'
 
 jobs:
   release:
@@ -12,10 +17,36 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Determine target chart
+        id: chart
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            chart="${{ inputs.chart }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+            version=$(echo "$tag" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+.*$')
+            chart="${tag%-${version}}"
+          fi
+          if [ -z "$chart" ]; then
+            echo "Failed to determine chart name from tag" >&2
+            exit 1
+          fi
+          echo "name=${chart}" >> "$GITHUB_OUTPUT"
+
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Validate chart exists
+        run: |
+          set -euo pipefail
+          chart="${{ steps.chart.outputs.name }}"
+          if [ ! -f "${chart}/Chart.yaml" ]; then
+            echo "Chart '${chart}' does not contain Chart.yaml" >&2
+            exit 1
+          fi
 
       - name: Configure git author
         run: |
@@ -39,46 +70,39 @@ jobs:
         with:
           version: v3.14.2
 
-      - name: Lint charts
+      - name: Lint chart
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          chart_dirs=()
-          for chart_yaml in */Chart.yaml; do
-            chart_dirs+=("$(dirname "$chart_yaml")")
-          done
-          if [ ${#chart_dirs[@]} -eq 0 ]; then
-            echo "No charts found to lint" >&2
-            exit 1
-          fi
-          for chart_dir in "${chart_dirs[@]}"; do
-            echo "Linting ${chart_dir}"
-            helm lint "${chart_dir}"
-          done
+          helm lint "${{ steps.chart.outputs.name }}"
 
-      - name: Publish chart packages
-        uses: helm/chart-releaser-action@v1.5.0
+      - name: Package and create GitHub release
+        run: |
+          set -euo pipefail
+          chart="${{ steps.chart.outputs.name }}"
+          tag="${GITHUB_REF#refs/tags/}"
+
+          workdir=$(mktemp -d)
+          helm package "${chart}" --destination "$workdir"
+
+          pkg=$(ls "$workdir"/*.tgz)
+          gh release create "$tag" "$pkg" \
+            --title "$tag" \
+            --generate-notes
         env:
-          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CR_SKIP_EXISTING: "true"
-        with:
-          charts_dir: .
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update GitHub Pages with latest charts
+      - name: Update GitHub Pages
         run: |
           set -euo pipefail
-          shopt -s nullglob
 
+          chart="${{ steps.chart.outputs.name }}"
           repo_url="https://$(echo "$GITHUB_REPOSITORY" | cut -d/ -f1).github.io/$(echo "$GITHUB_REPOSITORY" | cut -d/ -f2)"
+          owner=$(echo "$GITHUB_REPOSITORY" | cut -d/ -f1)
 
           workdir=$(mktemp -d)
           git checkout gh-pages -- index.yaml 2>/dev/null || true
 
-          for chart_yaml in */Chart.yaml; do
-            chart_dir="$(dirname "$chart_yaml")"
-            echo "Packaging ${chart_dir}"
-            helm package "$chart_dir" --destination "$workdir"
-          done
+          helm package "${chart}" --destination "$workdir"
 
           if [ -f index.yaml ]; then
             helm repo index "$workdir" --url "$repo_url" --merge index.yaml
@@ -86,8 +110,6 @@ jobs:
             helm repo index "$workdir" --url "$repo_url"
           fi
 
-          # Generate index.html from discovered charts
-          owner=$(echo "$GITHUB_REPOSITORY" | cut -d/ -f1)
           cat > "$workdir/index.html" <<'HEADER'
           <!doctype html>
           <html lang="en">
@@ -165,7 +187,6 @@ jobs:
           cp "$workdir"/index.yaml .
           cp "$workdir"/index.html .
           git add index.yaml index.html *.tgz
-          git commit -m "Update chart packages" || echo "No changes to commit"
+          git commit -m "Update chart packages for ${chart}" || echo "No changes to commit"
           git push origin gh-pages
           rm -rf "$workdir"
-
