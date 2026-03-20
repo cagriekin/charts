@@ -130,5 +130,85 @@ no_annotations=$(helm template test-pg "${CHART_DIR}" \
 
 assert_not_contains "pgpool no-annotations: no annotations block" "${no_annotations}" "annotations:"
 
+# --- PostgreSQL Configuration Tests ---
+
+# Test: helm lint with config values (standalone)
+lint_output=$(helm lint "${CHART_DIR}" -f "${SCRIPT_DIR}/values-config.yaml" 2>&1) && lint_rc=0 || lint_rc=$?
+assert_eq "helm lint with config values passes" "0" "${lint_rc}"
+
+# Test: helm lint with config+repmgr values
+lint_output=$(helm lint "${CHART_DIR}" -f "${SCRIPT_DIR}/values-config-repmgr.yaml" 2>&1) && lint_rc=0 || lint_rc=$?
+assert_eq "helm lint with config+repmgr values passes" "0" "${lint_rc}"
+
+# Render standalone config template
+config_standalone=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-config.yaml" 2>&1)
+
+# Config standalone: ConfigMap is created with custom.conf
+assert_contains "config standalone: postgresql-config configmap created" "${config_standalone}" "test-pg-postgresql-config"
+assert_contains "config standalone: custom.conf present in configmap" "${config_standalone}" "custom.conf"
+assert_contains "config standalone: work_mem in configmap" "${config_standalone}" "work_mem = '64MB'"
+assert_contains "config standalone: maintenance_work_mem in configmap" "${config_standalone}" "maintenance_work_mem = '128MB'"
+assert_contains "config standalone: log_statement in configmap" "${config_standalone}" "log_statement = 'all'"
+
+# Config standalone: setup-config init container present
+assert_contains "config standalone: setup-config init container present" "${config_standalone}" "name: setup-config"
+assert_contains "config standalone: include_dir in setup-config" "${config_standalone}" "include_dir = '/etc/postgresql/conf.d'"
+
+# Config standalone: volume mount present
+assert_contains "config standalone: conf.d volume mount present" "${config_standalone}" "/etc/postgresql/conf.d"
+
+# Config standalone: checksum annotation present
+assert_contains "config standalone: checksum annotation present" "${config_standalone}" "checksum/postgresql-config"
+
+# Config standalone: pgHba entries injected in postStart
+assert_contains "config standalone: pgHba entry in postStart" "${config_standalone}" "host all all 10.244.0.0/16 md5"
+
+# Render repmgr config template
+config_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-config-repmgr.yaml" 2>&1)
+
+# Config repmgr: ConfigMap is created
+assert_contains "config repmgr: postgresql-config configmap created" "${config_repmgr}" "test-pg-postgresql-config"
+assert_contains "config repmgr: work_mem in configmap" "${config_repmgr}" "work_mem = '64MB'"
+
+# Config repmgr: setup-config init container present
+assert_contains "config repmgr: setup-config init container present" "${config_repmgr}" "name: setup-config"
+assert_contains "config repmgr: include_dir in setup-config" "${config_repmgr}" "include_dir = '/etc/postgresql/conf.d'"
+
+# Config repmgr: volume mount present
+assert_contains "config repmgr: conf.d volume mount present" "${config_repmgr}" "/etc/postgresql/conf.d"
+
+# Config repmgr: checksum annotation present
+assert_contains "config repmgr: checksum annotation present" "${config_repmgr}" "checksum/postgresql-config"
+
+# Config repmgr: pgHba entries in postStart
+assert_contains "config repmgr: pgHba entry in postStart" "${config_repmgr}" "host all all 10.244.0.0/16 md5"
+
+# Test: no config resources when configuration is empty (defaults)
+no_config=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-minimal.yaml" 2>&1)
+assert_not_contains "no config: no postgresql-config configmap" "${no_config}" "postgresql-config"
+assert_not_contains "no config: no setup-config init container" "${no_config}" "setup-config"
+assert_not_contains "no config: no checksum annotation" "${no_config}" "checksum/postgresql-config"
+assert_not_contains "no config: no conf.d volume mount" "${no_config}" "/etc/postgresql/conf.d"
+
+# Test: no config resources when repmgr defaults (no configuration set)
+no_config_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" 2>&1)
+assert_not_contains "no config repmgr: no postgresql-config configmap" "${no_config_repmgr}" "postgresql-config"
+assert_not_contains "no config repmgr: no setup-config init container" "${no_config_repmgr}" "setup-config"
+
+# Test: checksum changes when configuration changes
+config_v1=$(helm template test-pg "${CHART_DIR}" \
+  --set 'postgresql.configuration.work_mem=32MB' \
+  --show-only templates/statefulset.yaml 2>&1)
+config_v2=$(helm template test-pg "${CHART_DIR}" \
+  --set 'postgresql.configuration.work_mem=64MB' \
+  --show-only templates/statefulset.yaml 2>&1)
+checksum_v1=$(echo "${config_v1}" | grep "checksum/postgresql-config" | awk '{print $2}')
+checksum_v2=$(echo "${config_v2}" | grep "checksum/postgresql-config" | awk '{print $2}')
+if [[ -n "${checksum_v1}" && -n "${checksum_v2}" && "${checksum_v1}" != "${checksum_v2}" ]]; then
+  pass "config checksum changes when configuration changes"
+else
+  fail "config checksum changes when configuration changes" "v1='${checksum_v1}' v2='${checksum_v2}'"
+fi
+
 end_suite
 print_summary

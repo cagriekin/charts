@@ -25,10 +25,15 @@ spec:
       labels:
         {{- include "pg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: postgresql
-      {{- with .Values.postgresql.podAnnotations }}
+{{- if or .Values.postgresql.configuration .Values.postgresql.podAnnotations }}
       annotations:
+{{- if .Values.postgresql.configuration }}
+        checksum/postgresql-config: {{ include (print $.Template.BasePath "/postgresql-configmap.yaml") . | sha256sum }}
+{{- end }}
+      {{- with .Values.postgresql.podAnnotations }}
         {{- toYaml . | nindent 8 }}
       {{- end }}
+{{- end }}
     spec:
       securityContext:
         fsGroup: 103
@@ -119,6 +124,21 @@ spec:
             - name: repmgr-config
               mountPath: /etc/repmgr
 {{- end }}
+{{- if .Values.postgresql.configuration }}
+        - name: setup-config
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            - |
+              CONF=/var/lib/postgresql/data/pgdata/postgresql.conf
+              if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
+                echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
+              fi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+{{- end }}
       containers:
         - name: postgresql
 {{- if .Values.repmgr.enabled }}
@@ -174,11 +194,22 @@ spec:
                   - |
                     for i in {1..30}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
+                        {{- if .Values.postgresql.configuration }}
+                        CONF="$PGDATA/postgresql.conf"
+                        if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
+                          echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
+                        fi
+                        {{- end }}
                         HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
                         if ! grep -q "host all all 10.0.0.0/8 trust" "$HBA_FILE"; then
                           sed -i '/host all all all scram-sha-256/i host all all 10.0.0.0/8 trust' "$HBA_FILE"
-                          psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
                         fi
+                        {{- range .Values.postgresql.pgHba }}
+                        if ! grep -qF '{{ . }}' "$HBA_FILE"; then
+                          sed -i '/host all all all scram-sha-256/i {{ . }}' "$HBA_FILE"
+                        fi
+                        {{- end }}
+                        psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
                         {{ .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 24 }}
                         {{- end }}
@@ -186,7 +217,7 @@ spec:
                       fi
                       sleep 1
                     done
-{{- else if .Values.postgresql.lifecycle.postStart.additionalCommands }}
+{{- else if or .Values.postgresql.configuration .Values.postgresql.pgHba .Values.postgresql.lifecycle.postStart.additionalCommands }}
           lifecycle:
             postStart:
               exec:
@@ -196,7 +227,26 @@ spec:
                   - |
                     for i in {1..90}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
+                        {{- if .Values.postgresql.configuration }}
+                        CONF="$PGDATA/postgresql.conf"
+                        if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
+                          echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
+                        fi
+                        {{- end }}
+                        {{- if .Values.postgresql.pgHba }}
+                        HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
+                        {{- range .Values.postgresql.pgHba }}
+                        if ! grep -qF '{{ . }}' "$HBA_FILE"; then
+                          sed -i '$ a {{ . }}' "$HBA_FILE"
+                        fi
+                        {{- end }}
+                        {{- end }}
+                        {{- if or .Values.postgresql.configuration .Values.postgresql.pgHba }}
+                        psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
+                        {{- end }}
+                        {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
                         {{ .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 24 }}
+                        {{- end }}
                         break
                       fi
                       sleep 1
@@ -207,6 +257,11 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+{{- if .Values.postgresql.configuration }}
+            - name: postgresql-config
+              mountPath: /etc/postgresql/conf.d
+              readOnly: true
+{{- end }}
 {{- if .Values.postgresql.extensions.enabled }}
             - name: ext-lib
               mountPath: /usr/lib/postgresql/18/lib
@@ -292,8 +347,13 @@ spec:
           resources:
             {{- toYaml .Values.repmgr.serviceUpdater.resources | nindent 12 }}
 {{- end }}
-{{- if or .Values.postgresql.extensions.enabled .Values.repmgr.enabled (not .Values.postgresql.persistence.enabled) }}
+{{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.repmgr.enabled (not .Values.postgresql.persistence.enabled) }}
       volumes:
+{{- if .Values.postgresql.configuration }}
+        - name: postgresql-config
+          configMap:
+            name: {{ include "pg.fullname" . }}-postgresql-config
+{{- end }}
 {{- if .Values.postgresql.extensions.enabled }}
         - name: ext-lib
           emptyDir: {}

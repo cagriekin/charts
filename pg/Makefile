@@ -4,7 +4,7 @@ TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-repmgr test-full test-failover test-upgrade \
-        test-repmgr-failover cluster-create cluster-delete cluster-exists clean help
+        test-repmgr-failover test-config test-config-repmgr cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -16,6 +16,8 @@ help:
 	@echo "  test-full       - Run full install tests"
 	@echo "  test-failover   - Run failover tests (requires test-repmgr first)"
 	@echo "  test-upgrade    - Run upgrade path tests"
+	@echo "  test-config     - Run postgresql configuration tests (standalone)"
+	@echo "  test-config-repmgr - Run postgresql configuration tests (repmgr)"
 	@echo "  cluster-create  - Create Kind cluster"
 	@echo "  cluster-delete  - Delete Kind cluster"
 	@echo "  clean           - Delete cluster and test namespaces"
@@ -28,7 +30,7 @@ test-template:
 # Run independent suites in parallel with -j
 # test-repmgr-failover is sequential (repmgr then failover)
 # test-minimal, test-repmgr-failover, test-full, test-upgrade run in parallel
-test-cluster: test-minimal test-repmgr-failover test-full test-upgrade
+test-cluster: test-minimal test-repmgr-failover test-full test-upgrade test-config test-config-repmgr
 	@echo "All test suites passed"
 
 # Chain: repmgr install -> failover test (must be sequential)
@@ -71,6 +73,12 @@ test-failover: cluster-exists
 
 test-upgrade: cluster-exists
 	@bash $(TESTS_DIR)/test-upgrade.sh
+
+test-config: cluster-exists
+	@bash $(TESTS_DIR)/test-config.sh
+
+test-config-repmgr: cluster-exists
+	@bash $(TESTS_DIR)/test-config-repmgr.sh
 
 clean: cluster-delete
 	@echo "Cleaned up"
