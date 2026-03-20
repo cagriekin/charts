@@ -1,0 +1,14 @@
+{{- if .Values.postgresql.configuration }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pg.fullname" . }}-postgresql-config
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+data:
+  custom.conf: |
+    {{- range $key, $value := .Values.postgresql.configuration }}
+    {{ $key }} = '{{ $value }}'
+    {{- end }}
+{{- end }}
