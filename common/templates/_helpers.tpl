@@ -104,6 +104,106 @@ Usage:
   )
 Optional: "nameSuffix" overrides the resource name suffix (defaults to component).
 */}}
+{{/*
+Exporter ServiceMonitor resource.
+Usage:
+  include "common.exporterServiceMonitor" (dict
+    "ctx"             .
+    "component"       "redis-exporter"
+    "labels"          "redis.labels"
+    "selectorLabels"  "redis.selectorLabels"
+    "additionalLabels" .Values.exporter.serviceMonitor.additionalLabels
+    "interval"        .Values.exporter.serviceMonitor.interval
+    "scrapeTimeout"   .Values.exporter.serviceMonitor.scrapeTimeout
+    "path"            "/metrics"
+  )
+
+For custom endpoints (e.g. multi-replica probing), pass "endpoints" instead of
+interval/scrapeTimeout/path:
+  include "common.exporterServiceMonitor" (dict
+    ...
+    "endpoints"       $customEndpointsList
+  )
+*/}}
+{{- define "common.exporterServiceMonitor" -}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  {{- if hasKey . "nameSuffix" }}
+  {{- if .nameSuffix }}
+  name: {{ include "common.fullname" .ctx }}-{{ .nameSuffix }}
+  {{- else }}
+  name: {{ include "common.fullname" .ctx }}
+  {{- end }}
+  {{- else }}
+  name: {{ include "common.fullname" .ctx }}-{{ .component }}
+  {{- end }}
+  labels:
+    {{- include .labels .ctx | nindent 4 }}
+    app.kubernetes.io/component: {{ .component }}
+    {{- with .additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include .selectorLabels .ctx | nindent 6 }}
+      app.kubernetes.io/component: {{ .component }}
+  {{- if .endpoints }}
+  endpoints:
+    {{- toYaml .endpoints | nindent 4 }}
+  {{- else }}
+  endpoints:
+    - port: metrics
+      interval: {{ .interval }}
+      scrapeTimeout: {{ .scrapeTimeout }}
+      path: {{ .path | default "/metrics" }}
+  {{- end }}
+{{- end }}
+
+{{/*
+PodDisruptionBudget resource.
+Usage:
+  include "common.podDisruptionBudget" (dict
+    "ctx"             .
+    "component"       "postgresql"
+    "labels"          "pg.labels"
+    "selectorLabels"  "pg.selectorLabels"
+    "minAvailable"    .Values.postgresql.podDisruptionBudget.minAvailable
+    "maxUnavailable"  .Values.postgresql.podDisruptionBudget.maxUnavailable
+  )
+Optional: "nameSuffix" overrides the resource name suffix (defaults to component).
+Provide either minAvailable or maxUnavailable (not both).
+*/}}
+{{- define "common.podDisruptionBudget" -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  {{- if hasKey . "nameSuffix" }}
+  {{- if .nameSuffix }}
+  name: {{ include "common.fullname" .ctx }}-{{ .nameSuffix }}
+  {{- else }}
+  name: {{ include "common.fullname" .ctx }}
+  {{- end }}
+  {{- else }}
+  name: {{ include "common.fullname" .ctx }}-{{ .component }}
+  {{- end }}
+  labels:
+    {{- include .labels .ctx | nindent 4 }}
+    app.kubernetes.io/component: {{ .component }}
+spec:
+  selector:
+    matchLabels:
+      {{- include .selectorLabels .ctx | nindent 6 }}
+      app.kubernetes.io/component: {{ .component }}
+  {{- with .minAvailable }}
+  minAvailable: {{ . }}
+  {{- end }}
+  {{- with .maxUnavailable }}
+  maxUnavailable: {{ . }}
+  {{- end }}
+{{- end }}
+
 {{- define "common.exporterDeployment" -}}
 apiVersion: apps/v1
 kind: Deployment
