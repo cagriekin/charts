@@ -1,35 +1,28 @@
 {{- if and .Values.prometheusExporter.enabled .Values.prometheusExporter.serviceMonitor.enabled }}
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: {{ include "pg.fullname" . }}-postgres-exporter
-  labels:
-    {{- include "pg.labels" . | nindent 4 }}
-    app.kubernetes.io/component: postgres-exporter
-    {{- with .Values.prometheusExporter.serviceMonitor.additionalLabels }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
-spec:
-  selector:
-    matchLabels:
-      {{- include "pg.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: postgres-exporter
-  endpoints:
-    {{- range $i := until (int .Values.postgresql.replicaCount) }}
-    - port: metrics
-      interval: {{ $.Values.prometheusExporter.serviceMonitor.interval }}
-      scrapeTimeout: {{ $.Values.prometheusExporter.serviceMonitor.scrapeTimeout }}
-      path: /probe
-      params:
-        auth_module:
-          - postgres
-        target:
-          - {{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local:5432
-      relabelings:
-        - sourceLabels: [__param_target]
-          targetLabel: instance
-        - sourceLabels: []
-          targetLabel: job
-          replacement: {{ include "pg.fullname" $ }}-postgresql
-    {{- end }}
+{{- $endpoints := list }}
+{{- range $i := until (int $.Values.postgresql.replicaCount) }}
+{{- $ep := dict
+  "port" "metrics"
+  "interval" $.Values.prometheusExporter.serviceMonitor.interval
+  "scrapeTimeout" $.Values.prometheusExporter.serviceMonitor.scrapeTimeout
+  "path" "/probe"
+  "params" (dict
+    "auth_module" (list "postgres")
+    "target" (list (printf "%s-%d.%s-headless.%s.svc.cluster.local:5432" (include "pg.fullname" $) $i (include "pg.fullname" $) $.Release.Namespace))
+  )
+  "relabelings" (list
+    (dict "sourceLabels" (list "__param_target") "targetLabel" "instance")
+    (dict "sourceLabels" (list) "targetLabel" "job" "replacement" (printf "%s-postgresql" (include "pg.fullname" $)))
+  )
+}}
+{{- $endpoints = append $endpoints $ep }}
+{{- end }}
+{{- include "common.exporterServiceMonitor" (dict
+  "ctx"             .
+  "component"       "postgres-exporter"
+  "labels"          "pg.labels"
+  "selectorLabels"  "pg.selectorLabels"
+  "additionalLabels" .Values.prometheusExporter.serviceMonitor.additionalLabels
+  "endpoints"       $endpoints
+) }}
 {{- end }}
