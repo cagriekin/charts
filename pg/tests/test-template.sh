@@ -78,6 +78,14 @@ assert_contains "full: statefulset has replicas: 3" "${full}" "replicas: 3"
 # Full: should have pgpool deployment
 assert_contains "full: pgpool deployment present" "${full}" "test-pg-pgpool"
 
+# Full: pgpool should have rolling update strategy with maxUnavailable 0
+assert_contains "full: pgpool has maxUnavailable: 0" "${full}" "maxUnavailable: 0"
+assert_contains "full: pgpool has maxSurge: 1" "${full}" "maxSurge: 1"
+
+# Full: pgpool should have pod anti-affinity by default
+assert_contains "full: pgpool has podAntiAffinity" "${full}" "podAntiAffinity"
+assert_contains "full: pgpool anti-affinity uses hostname topology" "${full}" "topologyKey: kubernetes.io/hostname"
+
 # Full: should have pgpool service
 pgpool_svc=$(echo "${full}" | grep -c "port: 9999" || echo "0")
 assert_gt "full: pgpool service port 9999 present" "${pgpool_svc}" "0"
