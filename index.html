@@ -33,6 +33,18 @@ helm search repo cagriekin
 </code></pre>
       </section>
       <section>
+        <h2>&gt; install common</h2>
+        <pre><code>helm install common cagriekin/common \
+  --namespace default --create-namespace
+</code></pre>
+        <p>Shared helper templates for application charts (v0.1.0)</p>
+        <p>
+          Review the chart documentation in the
+          <a href="https://github.com/cagriekin/charts/blob/master/common/README.md" rel="noopener">common/README.md</a>
+          within the source repository for all configurable values.
+        </p>
+      </section>
+      <section>
         <h2>&gt; install kafka</h2>
         <pre><code>helm install kafka cagriekin/kafka \
   --namespace messaging --create-namespace
@@ -49,7 +61,7 @@ helm search repo cagriekin
         <pre><code>helm install pg cagriekin/pg \
   --namespace data --create-namespace
 </code></pre>
-        <p>PostgreSQL with repmgr replication and optional PGPool-II (v0.5.26)</p>
+        <p>PostgreSQL with repmgr replication and optional PGPool-II (v0.5.27)</p>
         <p>
           Review the chart documentation in the
           <a href="https://github.com/cagriekin/charts/blob/master/pg/README.md" rel="noopener">pg/README.md</a>
@@ -61,7 +73,7 @@ helm search repo cagriekin
         <pre><code>helm install pgvector cagriekin/pgvector \
   --namespace data --create-namespace
 </code></pre>
-        <p>PostgreSQL with pgvector extension and optional PGPool-II (v0.6.28)</p>
+        <p>PostgreSQL with pgvector extension and optional PGPool-II (v0.6.29)</p>
         <p>
           Review the chart documentation in the
           <a href="https://github.com/cagriekin/charts/blob/master/pgvector/README.md" rel="noopener">pgvector/README.md</a>
