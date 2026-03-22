@@ -1,33 +1,39 @@
 # PostgreSQL with repmgr and PGPool-II
 
-PostgreSQL Helm chart with repmgr for replication management and optional PGPool-II for query routing.
+PostgreSQL Helm chart with repmgr for automatic failover and replication management, optional PGPool-II for connection pooling and read/write splitting.
 
 ## Features
 
 - PostgreSQL 18.1 with configurable version
 - Repmgr for automatic failover and replication management
-- Optional PGPool-II for read/write splitting
+- Service-updater sidecar for automatic primary service selector updates after failover
+- Optional PGPool-II for connection pooling and read/write splitting
 - Support for existing secrets or auto-generated passwords
 - StatefulSet-based deployment with persistent storage
-- Configurable resource limits and probes
+- PostgreSQL configuration injection via ConfigMap (postgresql.conf overrides, pg_hba.conf entries)
+- PostStart lifecycle hooks with primary-aware execution in repmgr setups
+- Pod disruption budgets for safe node drains
+- Configurable update strategy, resource limits, probes, and affinity
+- Prometheus exporters for PostgreSQL and PGPool-II metrics with ServiceMonitor support
 - Automated S3 backups via CronJob with retention management
 
 ## Installation
 
 ```bash
-helm install my-postgres ./pg
+helm repo add cagriekin https://cagriekin.github.io/charts
+helm install my-postgres cagriekin/pg
 ```
 
 ### With Read Replicas
 
 ```bash
-helm install my-postgres ./pg --set postgresql.replicaCount=3
+helm install my-postgres cagriekin/pg --set postgresql.replicaCount=3
 ```
 
 ### With PGPool-II Enabled
 
 ```bash
-helm install my-postgres ./pg \
+helm install my-postgres cagriekin/pg \
   --set postgresql.replicaCount=3 \
   --set pgpool.enabled=true
 ```
@@ -41,7 +47,7 @@ kubectl create secret generic pg-secret \
   --from-literal=database=mydb \
   --from-literal=repmgr-password=myrepmgrpassword
 
-helm install my-postgres ./pg \
+helm install my-postgres cagriekin/pg \
   --set postgresql.existingSecret.enabled=true \
   --set postgresql.existingSecret.name=pg-secret
 ```
@@ -55,7 +61,7 @@ kubectl create secret generic pg-secret \
   --from-literal=db=mydb \
   --from-literal=repmgr-pass=myrepmgrpassword
 
-helm install my-postgres ./pg \
+helm install my-postgres cagriekin/pg \
   --set postgresql.existingSecret.enabled=true \
   --set postgresql.existingSecret.name=pg-secret \
   --set postgresql.existingSecret.usernameKey=user \
@@ -72,7 +78,8 @@ helm install my-postgres ./pg \
 |-----------|-------------|---------|
 | `postgresql.image.repository` | PostgreSQL image repository | `postgres` |
 | `postgresql.image.tag` | PostgreSQL image tag | `18.1-trixie` |
-| `postgresql.replicaCount` | Number of PostgreSQL instances | `1` |
+| `postgresql.image.pullPolicy` | Image pull policy | `IfNotPresent` |
+| `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1) | `1` |
 | `postgresql.database` | Database name | `postgres` |
 | `postgresql.username` | Database username | `postgres` |
 | `postgresql.resources.requests.cpu` | CPU request | `100m` |
@@ -82,18 +89,88 @@ helm install my-postgres ./pg \
 | `postgresql.persistence.enabled` | Enable persistence | `true` |
 | `postgresql.persistence.size` | Storage size | `10Gi` |
 | `postgresql.persistence.storageClass` | Storage class | `""` |
+| `postgresql.updateStrategy.type` | StatefulSet update strategy | `RollingUpdate` |
+| `postgresql.updateStrategy.rollingUpdate.partition` | Partition for rolling update | `0` |
+| `postgresql.podAnnotations` | Annotations for PostgreSQL pods | `{}` |
+| `postgresql.affinity` | Affinity rules for PostgreSQL pods | `{}` |
+| `postgresql.annotations` | Additional annotations | `{}` |
+
+### Liveness and Readiness Probes
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `postgresql.livenessProbe.enabled` | Enable liveness probe | `true` |
+| `postgresql.livenessProbe.initialDelaySeconds` | Initial delay | `30` |
+| `postgresql.livenessProbe.periodSeconds` | Check interval | `10` |
+| `postgresql.livenessProbe.timeoutSeconds` | Timeout | `5` |
+| `postgresql.livenessProbe.failureThreshold` | Failure threshold | `6` |
+| `postgresql.readinessProbe.enabled` | Enable readiness probe | `true` |
+| `postgresql.readinessProbe.initialDelaySeconds` | Initial delay | `5` |
+| `postgresql.readinessProbe.periodSeconds` | Check interval | `10` |
+| `postgresql.readinessProbe.timeoutSeconds` | Timeout | `5` |
+| `postgresql.readinessProbe.failureThreshold` | Failure threshold | `6` |
+
+### Pod Disruption Budgets
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `postgresql.podDisruptionBudget.enabled` | Enable PDB for PostgreSQL | `true` |
+| `postgresql.podDisruptionBudget.minAvailable` | Minimum available pods | `1` |
+| `pgpool.podDisruptionBudget.enabled` | Enable PDB for PGPool-II | `true` |
+| `pgpool.podDisruptionBudget.minAvailable` | Minimum available pods | `1` |
+
+### PostgreSQL Configuration
+
+Runtime configuration can be injected without rebuilding images. Settings are written to a ConfigMap, mounted into the pod, and loaded via `include_dir`.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `postgresql.configuration` | Map of postgresql.conf parameters | `{}` |
+| `postgresql.pgHba` | List of pg_hba.conf entries injected via postStart | `[]` |
+| `postgresql.extensions.enabled` | Enable extensions support | `false` |
+| `postgresql.lifecycle.postStart.additionalCommands` | Shell commands to run after PostgreSQL is ready | `""` |
+
+Example:
+
+```yaml
+postgresql:
+  configuration:
+    max_connections: "200"
+    shared_buffers: "1GB"
+    work_mem: "32MB"
+  pgHba:
+    - "host all all 10.244.0.0/16 md5"
+    - "host replication repmgr 10.0.0.0/8 trust"
+  lifecycle:
+    postStart:
+      additionalCommands: |
+        psql -U postgres -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1
+```
+
+When `repmgr.enabled` is true, `additionalCommands` automatically discover the current primary and execute against it, so DDL statements like `CREATE EXTENSION` work correctly regardless of which pod the hook runs on (including standbys after a failover).
 
 ### Repmgr Parameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `repmgr.enabled` | Enable repmgr | `true` |
-| `repmgr.image.repository` | Repmgr image repository | `bitnami/repmgr` |
-| `repmgr.image.tag` | Repmgr image tag | `5.4.1` |
+| `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
+| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-4` |
+| `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
+| `repmgr.username` | Repmgr database user | `repmgr` |
+| `repmgr.database` | Repmgr database name | `repmgr` |
 | `repmgr.resources.requests.cpu` | CPU request | `50m` |
 | `repmgr.resources.requests.memory` | Memory request | `128Mi` |
 | `repmgr.resources.limits.cpu` | CPU limit | `500m` |
 | `repmgr.resources.limits.memory` | Memory limit | `512Mi` |
+| `repmgr.serviceUpdater.resources.requests.cpu` | Service-updater CPU request | `50m` |
+| `repmgr.serviceUpdater.resources.requests.memory` | Service-updater memory request | `64Mi` |
+| `repmgr.serviceUpdater.resources.limits.memory` | Service-updater memory limit | `128Mi` |
+
+When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
+
+- **repmgrd**: monitors replication and triggers automatic failover when the primary becomes unavailable
+- **service-updater**: watches repmgr cluster state and patches the Kubernetes Service selector to point to the current primary, then restarts PGPool-II if enabled
 
 ### PGPool-II Parameters
 
@@ -102,21 +179,58 @@ helm install my-postgres ./pg \
 | `pgpool.enabled` | Enable PGPool-II | `false` |
 | `pgpool.image.repository` | PGPool-II image repository | `cagriekin/pgpool` |
 | `pgpool.image.tag` | PGPool-II image tag | `4.7.0` |
+| `pgpool.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `pgpool.replicaCount` | Number of PGPool-II instances | `1` |
-| `pgpool.numInitChildren` | Number of PGPool-II worker processes | `32` |
+| `pgpool.numInitChildren` | Number of worker processes | `32` |
 | `pgpool.maxPool` | Max cached connections per process | `4` |
 | `pgpool.childLifeTime` | Worker process lifetime in seconds | `300` |
-| `pgpool.connectionLifeTime` | Cached connection lifetime | `0` |
-| `pgpool.clientIdleLimit` | Client idle timeout | `0` |
-| `pgpool.logging.logConnections` | Log client connections | `false` |
-| `pgpool.logging.logStatement` | Log SQL statements | `false` |
-| `pgpool.logging.logPerNodeStatement` | Log backend routing | `false` |
+| `pgpool.connectionLifeTime` | Cached connection lifetime in seconds | `600` |
+| `pgpool.clientIdleLimit` | Client idle timeout in seconds | `300` |
+| `pgpool.resetQueryList` | Queries to run when returning connection to pool | `ABORT; RESET ALL; DEALLOCATE ALL` |
+| `pgpool.failOverOnBackendError` | Trigger failover on backend errors | `false` |
+| `pgpool.autoFailback` | Automatically reattach recovered backends | `true` |
+| `pgpool.adminUsername` | PGPool-II admin user | `admin` |
+| `pgpool.adminPassword` | PGPool-II admin password | `admin` |
 | `pgpool.service.type` | Service type | `ClusterIP` |
 | `pgpool.service.port` | Service port | `9999` |
 | `pgpool.resources.requests.cpu` | CPU request | `100m` |
 | `pgpool.resources.requests.memory` | Memory request | `128Mi` |
 | `pgpool.resources.limits.cpu` | CPU limit | `500m` |
 | `pgpool.resources.limits.memory` | Memory limit | `512Mi` |
+| `pgpool.podAnnotations` | Annotations for PGPool-II pods | `{}` |
+| `pgpool.affinity` | Affinity rules for PGPool-II pods | `{}` |
+| `pgpool.logging.logConnections` | Log client connections | `true` |
+| `pgpool.logging.logStatement` | Log SQL statements | `false` |
+| `pgpool.logging.logPerNodeStatement` | Log backend routing | `false` |
+
+#### TCP Keepalive
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `pgpool.tcpKeepalive.idle` | Seconds before sending keepalive | `10` |
+| `pgpool.tcpKeepalive.interval` | Seconds between keepalive probes | `3` |
+| `pgpool.tcpKeepalive.count` | Failed probes before disconnect | `5` |
+
+#### Health Check
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `pgpool.healthCheck.period` | Health check interval in seconds | `10` |
+| `pgpool.healthCheck.timeout` | Health check timeout in seconds | `30` |
+| `pgpool.healthCheck.maxRetries` | Max retries before marking backend down | `10` |
+| `pgpool.healthCheck.retryDelay` | Seconds between retries | `3` |
+
+#### PGPool-II Metrics Exporter
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `pgpool.metrics.enabled` | Enable pgpool2_exporter sidecar | `false` |
+| `pgpool.metrics.image.repository` | Exporter image | `pgpool/pgpool2_exporter` |
+| `pgpool.metrics.image.tag` | Exporter image tag | `1.2.2` |
+| `pgpool.metrics.resources.requests.cpu` | CPU request | `50m` |
+| `pgpool.metrics.resources.requests.memory` | Memory request | `64Mi` |
+| `pgpool.metrics.resources.limits.cpu` | CPU limit | `200m` |
+| `pgpool.metrics.resources.limits.memory` | Memory limit | `128Mi` |
 
 ### Secret Parameters
 
@@ -135,11 +249,20 @@ When `postgresql.existingSecret.enabled` is `false`, a secret will be auto-gener
 - `database`: Base64 encoded value from `postgresql.database`
 - `repmgr-password`: Random 32 character alphanumeric string (when repmgr is enabled)
 
+### Service Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `service.type` | Primary service type | `ClusterIP` |
+| `service.port` | Primary service port | `5432` |
+| `nameOverride` | Override chart name | `""` |
+| `fullnameOverride` | Override full release name | `""` |
+
 ### Global Parameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `global.annotations` | Global annotations | `{}` |
+| `global.annotations` | Global annotations applied to all resources | `{}` |
 
 ## Connecting to PostgreSQL
 
@@ -184,13 +307,6 @@ When PGPool-II is enabled, it provides connection pooling and load balancing:
 - Automatically detects streaming replication status
 - Fails over to replicas when primary becomes unavailable
 
-Configuration options:
-- `num_init_children`: Number of worker processes
-- `max_pool`: Maximum cached connections per process
-- `child_life_time`: Worker process lifetime
-- `connection_life_time`: Connection reuse duration
-- `client_idle_limit`: Client idle timeout
-
 ## Prometheus Exporter
 
 This chart includes an optional PostgreSQL metrics exporter for Prometheus monitoring. The exporter runs as a single instance and can scrape metrics from all PostgreSQL instances (primary and replicas) using the multi-target pattern.
@@ -198,7 +314,7 @@ This chart includes an optional PostgreSQL metrics exporter for Prometheus monit
 ### Enable Exporter
 
 ```bash
-helm install my-postgres ./pg \
+helm install my-postgres cagriekin/pg \
   --set prometheusExporter.enabled=true \
   --set postgresql.replicaCount=3
 ```
@@ -206,7 +322,7 @@ helm install my-postgres ./pg \
 ### With ServiceMonitor (Prometheus Operator)
 
 ```bash
-helm install my-postgres ./pg \
+helm install my-postgres cagriekin/pg \
   --set prometheusExporter.enabled=true \
   --set prometheusExporter.serviceMonitor.enabled=true \
   --set postgresql.replicaCount=3
@@ -244,11 +360,20 @@ scrape_configs:
 |-----------|-------------|---------|
 | `prometheusExporter.enabled` | Enable Prometheus exporter | `false` |
 | `prometheusExporter.image.repository` | Exporter image repository | `quay.io/prometheuscommunity/postgres-exporter` |
-| `prometheusExporter.image.tag` | Exporter image tag | `v0.15.0` |
+| `prometheusExporter.image.tag` | Exporter image tag | `v0.19.1` |
+| `prometheusExporter.image.pullPolicy` | Image pull policy | `IfNotPresent` |
+| `prometheusExporter.podAnnotations` | Annotations for exporter pods | `{}` |
+| `prometheusExporter.service.type` | Exporter service type | `ClusterIP` |
 | `prometheusExporter.service.port` | Exporter service port | `9116` |
+| `prometheusExporter.service.annotations` | Exporter service annotations | `{}` |
+| `prometheusExporter.resources.requests.cpu` | CPU request | `50m` |
+| `prometheusExporter.resources.requests.memory` | Memory request | `64Mi` |
+| `prometheusExporter.resources.limits.cpu` | CPU limit | `200m` |
+| `prometheusExporter.resources.limits.memory` | Memory limit | `128Mi` |
 | `prometheusExporter.serviceMonitor.enabled` | Create ServiceMonitor | `false` |
 | `prometheusExporter.serviceMonitor.interval` | Scrape interval | `30s` |
 | `prometheusExporter.serviceMonitor.scrapeTimeout` | Scrape timeout | `10s` |
+| `prometheusExporter.serviceMonitor.additionalLabels` | Additional labels on ServiceMonitor | `{}` |
 
 ## Backup
 
@@ -261,7 +386,7 @@ kubectl create secret generic s3-backup-creds \
   --from-literal=access-key-id=YOUR_ACCESS_KEY \
   --from-literal=secret-access-key=YOUR_SECRET_KEY
 
-helm install my-postgres ./pg \
+helm install my-postgres cagriekin/pg \
   --set backup.enabled=true \
   --set backup.s3.endpoint=https://minio.example.com \
   --set backup.s3.bucket=pg-backups \
@@ -326,5 +451,5 @@ make -j4 test-cluster
 ## Upgrade
 
 ```bash
-helm upgrade my-postgres ./pg
+helm upgrade my-postgres cagriekin/pg
 ```
