@@ -11,7 +11,7 @@ on:
 env:
   IMAGES: >-
     postgres:18.1-trixie
-    cagriekin/repmgr:trixie-5.5.0-4
+    cagriekin/repmgr:trixie-5.5.0-5
     cagriekin/pgpool:4.7.0
     pgpool/pgpool2_exporter:1.2.2
     quay.io/prometheuscommunity/postgres-exporter:v0.19.1
