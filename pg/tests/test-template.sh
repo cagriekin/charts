@@ -273,6 +273,52 @@ assert_contains "pgbackrest: S3 key env var" "${pgbackrest_sts}" "PGBACKREST_REP
 assert_contains "pgbackrest: config volume mount" "${pgbackrest_sts}" "pgbackrest-config"
 assert_contains "pgbackrest: scripts volume mount" "${pgbackrest_sts}" "pgbackrest-scripts"
 
+# pgBackRest: configmap retention values
+assert_contains "pgbackrest: retention full in configmap" "${pgbackrest}" "repo1-retention-full=4"
+assert_contains "pgbackrest: retention diff in configmap" "${pgbackrest}" "repo1-retention-diff=14"
+
+# pgBackRest: configmap s3 region and prefix
+assert_contains "pgbackrest: s3 region in configmap" "${pgbackrest}" "repo1-s3-region=eu-central-1"
+assert_contains "pgbackrest: s3 path prefix in configmap" "${pgbackrest}" "/pgbackrest/"
+
+# pgBackRest: schedule env vars on sidecar
+assert_contains "pgbackrest: FULL_SCHEDULE env var" "${pgbackrest_sts}" "FULL_SCHEDULE"
+assert_contains "pgbackrest: DIFF_SCHEDULE env var" "${pgbackrest_sts}" "DIFF_SCHEDULE"
+
+# pgBackRest: S3 secret references on sidecar
+assert_contains "pgbackrest: sidecar S3 key secret ref" "${pgbackrest_sts}" "s3-backup-creds"
+assert_contains "pgbackrest: sidecar S3 key ref key" "${pgbackrest_sts}" "access-key-id"
+assert_contains "pgbackrest: sidecar S3 secret key ref key" "${pgbackrest_sts}" "secret-access-key"
+
+# pgBackRest: resource limits on scheduler sidecar
+pgbackrest_scheduler=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/statefulset.yaml 2>&1 | sed -n '/name: pgbackrest-scheduler/,/^        - name:/p')
+assert_contains "pgbackrest: scheduler cpu limit" "${pgbackrest_scheduler}" "cpu: 1000m"
+assert_contains "pgbackrest: scheduler memory limit" "${pgbackrest_scheduler}" "memory: 1Gi"
+assert_contains "pgbackrest: scheduler cpu request" "${pgbackrest_scheduler}" "cpu: 100m"
+assert_contains "pgbackrest: scheduler memory request" "${pgbackrest_scheduler}" "memory: 256Mi"
+
+# pgBackRest: shared unix socket volume (pg-run emptyDir)
+assert_contains "pgbackrest: pg-run emptyDir volume" "${pgbackrest_sts}" "name: pg-run"
+pgbackrest_pg_container=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/statefulset.yaml 2>&1 | sed -n '/name: postgresql$/,/^        - name:/p')
+assert_contains "pgbackrest: postgresql mounts pg-run" "${pgbackrest_pg_container}" "pg-run"
+assert_contains "pgbackrest: scheduler mounts pg-run" "${pgbackrest_scheduler}" "pg-run"
+
+# pgBackRest: works without repmgr (standalone)
+pgbackrest_standalone=$(helm template test-pg "${CHART_DIR}" \
+  --set pgbackrest.enabled=true \
+  --set pgbackrest.s3.endpoint=https://s3.test \
+  --set pgbackrest.s3.bucket=test \
+  --set pgbackrest.existingSecret.name=test-secret \
+  --set repmgr.enabled=false \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "pgbackrest standalone: scheduler sidecar present" "${pgbackrest_standalone}" "name: pgbackrest-scheduler"
+assert_not_contains "pgbackrest standalone: no repmgrd container" "${pgbackrest_standalone}" "repmgrd"
+
+# pgBackRest: coexists with repmgr
+assert_contains "pgbackrest+repmgr: scheduler present" "${pgbackrest_sts}" "name: pgbackrest-scheduler"
+assert_contains "pgbackrest+repmgr: repmgrd present" "${pgbackrest_sts}" "name: repmgrd"
+assert_contains "pgbackrest+repmgr: service-updater present" "${pgbackrest_sts}" "name: service-updater"
+
 # pgBackRest: not rendered when disabled (default)
 pgbackrest_disabled=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" 2>&1)
 assert_not_contains "pgbackrest disabled: no configmap" "${pgbackrest_disabled}" "pgbackrest"
