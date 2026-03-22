@@ -245,7 +245,18 @@ spec:
                         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
                         {{- end }}
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
-                        {{ .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 24 }}
+                        HEADLESS="{{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local"
+                        PRIMARY_HOST=""
+                        for n in $(seq 0 {{ sub (int .Values.postgresql.replicaCount) 1 }}); do
+                          H="{{ include "pg.fullname" . }}-${n}.${HEADLESS}"
+                          if psql -h "$H" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | grep -q 'f'; then
+                            PRIMARY_HOST="$H"
+                            break
+                          fi
+                        done
+                        if [ -n "$PRIMARY_HOST" ]; then
+                          PGHOST="$PRIMARY_HOST" {{ .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 24 }}
+                        fi
                         {{- end }}
                         break
                       fi
