@@ -218,5 +218,32 @@ else
   fail "config checksum changes when configuration changes" "v1='${checksum_v1}' v2='${checksum_v2}'"
 fi
 
+# --- postStart additionalCommands Tests ---
+
+# Test: repmgr + additionalCommands renders primary discovery logic
+repmgr_addcmd=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set 'postgresql.lifecycle.postStart.additionalCommands=echo test-command' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "repmgr additionalCommands: discovers primary via pg_is_in_recovery" "${repmgr_addcmd}" "pg_is_in_recovery"
+assert_contains "repmgr additionalCommands: sets PGHOST to primary" "${repmgr_addcmd}" "PGHOST"
+assert_contains "repmgr additionalCommands: scans headless service pods" "${repmgr_addcmd}" "headless"
+assert_contains "repmgr additionalCommands: renders the command" "${repmgr_addcmd}" "test-command"
+
+# Test: standalone + additionalCommands runs directly without primary discovery
+standalone_addcmd=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-minimal.yaml" \
+  --set 'postgresql.lifecycle.postStart.additionalCommands=echo test-command' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "standalone additionalCommands: renders the command" "${standalone_addcmd}" "test-command"
+assert_not_contains "standalone additionalCommands: no primary discovery" "${standalone_addcmd}" "pg_is_in_recovery"
+
+# Test: repmgr without additionalCommands does not render primary discovery
+repmgr_no_addcmd=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "repmgr no additionalCommands: no primary discovery" "${repmgr_no_addcmd}" "pg_is_in_recovery"
+assert_not_contains "repmgr no additionalCommands: no PGHOST" "${repmgr_no_addcmd}" "PGHOST"
+
 end_suite
 print_summary
