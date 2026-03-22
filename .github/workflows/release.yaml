@@ -89,9 +89,14 @@ jobs:
           helm package "${chart}" --destination "$workdir"
 
           pkg=$(ls "$workdir"/*.tgz)
-          gh release create "$tag" "$pkg" \
-            --title "$tag" \
-            --generate-notes
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "Release ${tag} already exists, uploading asset"
+            gh release upload "$tag" "$pkg" --clobber
+          else
+            gh release create "$tag" "$pkg" \
+              --title "$tag" \
+              --generate-notes
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -193,5 +198,12 @@ jobs:
           cp "$workdir"/index.html .
           git add index.yaml index.html *.tgz
           git commit -m "Update chart packages for ${chart}" || echo "No changes to commit"
-          git push origin gh-pages
+
+          for attempt in 1 2 3; do
+            if git push origin gh-pages; then
+              break
+            fi
+            echo "Push failed (attempt ${attempt}/3), rebasing and retrying..."
+            git pull origin gh-pages --rebase
+          done
           rm -rf "$workdir"
