@@ -1,0 +1,29 @@
+{{- if .Values.pgbackrest.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pg.fullname" . }}-pgbackrest
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgbackrest
+data:
+  pgbackrest.conf: |
+    [global]
+    repo1-type=s3
+    repo1-s3-endpoint={{ required "pgbackrest.s3.endpoint is required" .Values.pgbackrest.s3.endpoint }}
+    repo1-s3-bucket={{ required "pgbackrest.s3.bucket is required" .Values.pgbackrest.s3.bucket }}
+    repo1-s3-region={{ .Values.pgbackrest.s3.region }}
+    repo1-path=/{{ .Values.pgbackrest.s3.prefix }}/{{ include "pg.fullname" . }}
+    repo1-retention-full={{ .Values.pgbackrest.retention.full }}
+    repo1-retention-diff={{ .Values.pgbackrest.retention.diff }}
+    repo1-cipher-type=none
+    start-fast=y
+    log-level-console=info
+    compress-type=zst
+    process-max=2
+
+    [{{ .Values.pgbackrest.stanza }}]
+    pg1-path=/var/lib/postgresql/data/pgdata
+    pg1-port=5432
+    pg1-socket-path=/var/run/postgresql
+{{- end }}

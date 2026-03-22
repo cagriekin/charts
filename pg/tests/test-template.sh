@@ -245,5 +245,38 @@ repmgr_no_addcmd=$(helm template test-pg "${CHART_DIR}" \
 assert_not_contains "repmgr no additionalCommands: no primary discovery" "${repmgr_no_addcmd}" "pg_is_in_recovery"
 assert_not_contains "repmgr no additionalCommands: no PGHOST" "${repmgr_no_addcmd}" "PGHOST"
 
+# --- pgBackRest Tests ---
+
+# Test: helm lint with pgbackrest values
+lint_output=$(helm lint "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" 2>&1) && lint_rc=0 || lint_rc=$?
+assert_eq "helm lint with pgbackrest values passes" "0" "${lint_rc}"
+
+# Render pgbackrest template
+pgbackrest=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" 2>&1)
+
+# pgBackRest: configmap renders
+assert_contains "pgbackrest: configmap renders" "${pgbackrest}" "test-pg-pgbackrest"
+assert_contains "pgbackrest: configmap has stanza" "${pgbackrest}" "[db]"
+assert_contains "pgbackrest: configmap has s3 endpoint" "${pgbackrest}" "repo1-s3-endpoint=https://s3.amazonaws.com"
+assert_contains "pgbackrest: configmap has s3 bucket" "${pgbackrest}" "repo1-s3-bucket=test-backups"
+
+# pgBackRest: scripts configmap renders
+assert_contains "pgbackrest: scripts configmap renders" "${pgbackrest}" "pgbackrest-scheduler.sh"
+assert_contains "pgbackrest: run script renders" "${pgbackrest}" "pgbackrest-run.sh"
+
+# pgBackRest: scheduler sidecar present in statefulset
+pgbackrest_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/statefulset.yaml 2>&1)
+assert_contains "pgbackrest: scheduler sidecar present" "${pgbackrest_sts}" "name: pgbackrest-scheduler"
+assert_contains "pgbackrest: PGBACKREST_ENABLED env var" "${pgbackrest_sts}" "PGBACKREST_ENABLED"
+assert_contains "pgbackrest: PGBACKREST_STANZA env var" "${pgbackrest_sts}" "PGBACKREST_STANZA"
+assert_contains "pgbackrest: S3 key env var" "${pgbackrest_sts}" "PGBACKREST_REPO1_S3_KEY"
+assert_contains "pgbackrest: config volume mount" "${pgbackrest_sts}" "pgbackrest-config"
+assert_contains "pgbackrest: scripts volume mount" "${pgbackrest_sts}" "pgbackrest-scripts"
+
+# pgBackRest: not rendered when disabled (default)
+pgbackrest_disabled=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" 2>&1)
+assert_not_contains "pgbackrest disabled: no configmap" "${pgbackrest_disabled}" "pgbackrest"
+assert_not_contains "pgbackrest disabled: no scheduler sidecar" "${pgbackrest_disabled}" "pgbackrest-scheduler"
+
 end_suite
 print_summary

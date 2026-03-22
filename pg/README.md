@@ -155,7 +155,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 |-----------|-------------|---------|
 | `repmgr.enabled` | Enable repmgr | `true` |
 | `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
-| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-4` |
+| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-5` |
 | `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `repmgr.username` | Repmgr database user | `repmgr` |
 | `repmgr.database` | Repmgr database name | `repmgr` |
@@ -423,6 +423,91 @@ kubectl create job --from=cronjob/my-postgres-backup manual-backup
 mc cp s3/pg-backups/backups/backup_20250101_020000.dump /tmp/backup.dump
 pg_restore -h localhost -U postgres -d postgres /tmp/backup.dump
 ```
+
+## pgBackRest (PITR)
+
+pgBackRest provides WAL-based incremental backups for point-in-time recovery. When enabled, WAL segments are continuously archived from the primary to S3, and scheduled full/differential backups run automatically. This allows restoring the database to any point in time within the retention window.
+
+Requires `repmgr.enabled: true` (pgBackRest is installed in the repmgr image).
+
+### Enable pgBackRest
+
+```bash
+kubectl create secret generic s3-backup-creds \
+  --from-literal=access-key-id=YOUR_ACCESS_KEY \
+  --from-literal=secret-access-key=YOUR_SECRET_KEY
+
+helm install my-postgres cagriekin/pg \
+  --set pgbackrest.enabled=true \
+  --set pgbackrest.s3.endpoint=https://s3.eu-central-1.amazonaws.com \
+  --set pgbackrest.s3.bucket=pg-backups \
+  --set pgbackrest.s3.region=eu-central-1 \
+  --set pgbackrest.existingSecret.name=s3-backup-creds
+```
+
+### How It Works
+
+- **WAL archiving**: The primary continuously archives WAL segments to S3 via `archive_command`. Standbys do not archive (PostgreSQL default with `archive_mode = on`).
+- **Full backups**: Weekly (default Sunday 1am) via the pgbackrest-scheduler sidecar.
+- **Differential backups**: Daily (default Mon-Sat 1am). Only changed blocks since the last full backup are stored.
+- **Failover**: After repmgr promotes a standby, the new primary starts archiving WAL and running backups automatically.
+
+### pgBackRest Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `pgbackrest.enabled` | Enable pgBackRest | `false` |
+| `pgbackrest.stanza` | pgBackRest stanza name | `db` |
+| `pgbackrest.s3.endpoint` | S3-compatible endpoint URL | `""` |
+| `pgbackrest.s3.bucket` | S3 bucket name | `""` |
+| `pgbackrest.s3.region` | S3 region | `us-east-1` |
+| `pgbackrest.s3.prefix` | Key prefix within bucket | `pgbackrest` |
+| `pgbackrest.existingSecret.name` | Secret containing S3 credentials | `""` |
+| `pgbackrest.existingSecret.accessKeyIdKey` | Key for access key ID in secret | `access-key-id` |
+| `pgbackrest.existingSecret.secretAccessKeyKey` | Key for secret access key in secret | `secret-access-key` |
+| `pgbackrest.retention.full` | Number of full backups to retain | `4` |
+| `pgbackrest.retention.diff` | Number of differential backups to retain | `14` |
+| `pgbackrest.schedule.full` | Cron schedule for full backups | `0 1 * * 0` |
+| `pgbackrest.schedule.diff` | Cron schedule for differential backups | `0 1 * * 1-6` |
+| `pgbackrest.resources.requests.cpu` | Scheduler sidecar CPU request | `100m` |
+| `pgbackrest.resources.requests.memory` | Scheduler sidecar memory request | `256Mi` |
+| `pgbackrest.resources.limits.cpu` | Scheduler sidecar CPU limit | `1000m` |
+| `pgbackrest.resources.limits.memory` | Scheduler sidecar memory limit | `1Gi` |
+
+### Check Backup Status
+
+```bash
+kubectl exec -it my-postgres-0 -- pgbackrest --stanza=db info
+```
+
+### Point-in-Time Recovery
+
+PITR requires manual intervention:
+
+```bash
+# 1. Scale down the StatefulSet
+kubectl scale statefulset my-postgres --replicas=0
+
+# 2. Run a restore pod mounting the data PVC
+kubectl run pg-restore --rm -it \
+  --image=cagriekin/repmgr:trixie-5.5.0-5 \
+  --overrides='{ "spec": { "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-5", "command": ["bash"], "stdin": true, "tty": true, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "value": "YOUR_KEY" }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "value": "YOUR_SECRET" }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-postgres-0" } }] } }'
+
+# 3. Inside the restore pod, run:
+pgbackrest --stanza=db restore \
+  --target="2026-03-22 12:00:00+00" \
+  --target-action=promote \
+  --delta
+
+# 4. Scale back up
+kubectl scale statefulset my-postgres --replicas=2
+```
+
+Repmgr will automatically rebuild standbys from the restored primary.
+
+### Upgrading Existing Clusters
+
+Enabling pgBackRest on an existing cluster sets `archive_mode = on` in postgresql.conf. This change requires a PostgreSQL restart. The pods will restart automatically on the next helm upgrade since the StatefulSet spec changes, but `archive_mode` only takes effect after the restart.
 
 ## Testing
 

@@ -81,7 +81,7 @@ postgresql:
 repmgr:
   image:
     repository: cagriekin/repmgr
-    tag: trixie-5.5.0-4
+    tag: trixie-5.5.0-5
     pullPolicy: IfNotPresent
 
   enabled: true
@@ -231,6 +231,37 @@ backup:
     limits:
       cpu: 500m
       memory: 512Mi
+
+pgbackrest:
+  enabled: false
+  stanza: db
+
+  s3:
+    endpoint: ""
+    bucket: ""
+    region: "us-east-1"
+    prefix: "pgbackrest"
+
+  existingSecret:
+    name: ""
+    accessKeyIdKey: access-key-id
+    secretAccessKeyKey: secret-access-key
+
+  retention:
+    full: 4
+    diff: 14
+
+  schedule:
+    full: "0 1 * * 0"
+    diff: "0 1 * * 1-6"
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
 
 global:
   annotations: {}

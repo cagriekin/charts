@@ -184,6 +184,22 @@ spec:
             - name: HEADLESS_SERVICE
               value: {{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
 {{- end }}
+{{- if .Values.pgbackrest.enabled }}
+            - name: PGBACKREST_ENABLED
+              value: "true"
+            - name: PGBACKREST_STANZA
+              value: {{ .Values.pgbackrest.stanza }}
+            - name: PGBACKREST_REPO1_S3_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "pgbackrest.existingSecret.name is required" .Values.pgbackrest.existingSecret.name }}
+                  key: {{ .Values.pgbackrest.existingSecret.accessKeyIdKey }}
+            - name: PGBACKREST_REPO1_S3_KEY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.pgbackrest.existingSecret.name }}
+                  key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
+{{- end }}
 {{- if not .Values.repmgr.enabled }}
           lifecycle:
             postStart:
@@ -279,6 +295,12 @@ spec:
             - name: ext-share
               mountPath: /usr/share/postgresql/18/extension
 {{- end }}
+{{- if .Values.pgbackrest.enabled }}
+            - name: pgbackrest-config
+              mountPath: /etc/pgbackrest/pgbackrest.conf
+              subPath: pgbackrest.conf
+              readOnly: true
+{{- end }}
 {{- if .Values.repmgr.enabled }}
             - name: repmgr-config
               mountPath: /etc/repmgr
@@ -358,7 +380,41 @@ spec:
           resources:
             {{- toYaml .Values.repmgr.serviceUpdater.resources | nindent 12 }}
 {{- end }}
-{{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.repmgr.enabled (not .Values.postgresql.persistence.enabled) }}
+{{- if .Values.pgbackrest.enabled }}
+        - name: pgbackrest-scheduler
+          image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
+          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          command: ["/bin/bash", "/scripts/pgbackrest-scheduler.sh"]
+          env:
+            - name: PGBACKREST_STANZA
+              value: {{ .Values.pgbackrest.stanza }}
+            - name: FULL_SCHEDULE
+              value: {{ .Values.pgbackrest.schedule.full | quote }}
+            - name: DIFF_SCHEDULE
+              value: {{ .Values.pgbackrest.schedule.diff | quote }}
+            - name: PGBACKREST_REPO1_S3_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.pgbackrest.existingSecret.name }}
+                  key: {{ .Values.pgbackrest.existingSecret.accessKeyIdKey }}
+            - name: PGBACKREST_REPO1_S3_KEY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.pgbackrest.existingSecret.name }}
+                  key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: pgbackrest-config
+              mountPath: /etc/pgbackrest/pgbackrest.conf
+              subPath: pgbackrest.conf
+              readOnly: true
+            - name: pgbackrest-scripts
+              mountPath: /scripts
+          resources:
+            {{- toYaml .Values.pgbackrest.resources | nindent 12 }}
+{{- end }}
+{{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.repmgr.enabled .Values.pgbackrest.enabled (not .Values.postgresql.persistence.enabled) }}
       volumes:
 {{- if .Values.postgresql.configuration }}
         - name: postgresql-config
@@ -377,6 +433,15 @@ spec:
         - name: service-updater-script
           configMap:
             name: {{ include "pg.fullname" . }}-service-updater
+            defaultMode: 0755
+{{- end }}
+{{- if .Values.pgbackrest.enabled }}
+        - name: pgbackrest-config
+          configMap:
+            name: {{ include "pg.fullname" . }}-pgbackrest
+        - name: pgbackrest-scripts
+          configMap:
+            name: {{ include "pg.fullname" . }}-pgbackrest-scripts
             defaultMode: 0755
 {{- end }}
 {{- if not .Values.postgresql.persistence.enabled }}
