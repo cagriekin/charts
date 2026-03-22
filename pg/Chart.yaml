@@ -2,7 +2,7 @@ apiVersion: v2
 name: pg
 description: PostgreSQL with repmgr replication and optional PGPool-II
 type: application
-version: 0.5.29
+version: 0.5.30
 appVersion: "18.1"
 dependencies:
   - name: common
