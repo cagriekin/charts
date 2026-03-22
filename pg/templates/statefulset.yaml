@@ -300,6 +300,8 @@ spec:
               mountPath: /etc/pgbackrest/pgbackrest.conf
               subPath: pgbackrest.conf
               readOnly: true
+            - name: pg-run
+              mountPath: /var/run/postgresql
 {{- end }}
 {{- if .Values.repmgr.enabled }}
             - name: repmgr-config
@@ -405,6 +407,8 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            - name: pg-run
+              mountPath: /var/run/postgresql
             - name: pgbackrest-config
               mountPath: /etc/pgbackrest/pgbackrest.conf
               subPath: pgbackrest.conf
@@ -436,6 +440,8 @@ spec:
             defaultMode: 0755
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
+        - name: pg-run
+          emptyDir: {}
         - name: pgbackrest-config
           configMap:
             name: {{ include "pg.fullname" . }}-pgbackrest

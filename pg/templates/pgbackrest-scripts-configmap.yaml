@@ -40,10 +40,12 @@ data:
     pgbackrest --stanza="${PGBACKREST_STANZA}" stanza-create 2>/dev/null || true
 
     echo "Writing crontab..."
-    cat > /tmp/pgbackrest-crontab << EOF
-    ${FULL_SCHEDULE} /scripts/pgbackrest-run.sh full >> /proc/1/fd/1 2>&1
-    ${DIFF_SCHEDULE} /scripts/pgbackrest-run.sh diff >> /proc/1/fd/1 2>&1
-    EOF
+    env | grep -E '^(PGBACKREST_|PATH=)' > /tmp/pgbackrest-env
+    {
+      while IFS= read -r line; do echo "$line"; done < /tmp/pgbackrest-env
+      echo "${FULL_SCHEDULE} /scripts/pgbackrest-run.sh full >> /proc/1/fd/1 2>&1"
+      echo "${DIFF_SCHEDULE} /scripts/pgbackrest-run.sh diff >> /proc/1/fd/1 2>&1"
+    } > /tmp/pgbackrest-crontab
 
     crontab /tmp/pgbackrest-crontab
     echo "Scheduler started"
