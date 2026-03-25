@@ -141,6 +141,7 @@ pgpool:
     logConnections: true
     logStatement: false
     logPerNodeStatement: false
+    logMinMessages: warning
 
   resources:
     requests:
@@ -161,12 +162,24 @@ pgpool:
 
   podAnnotations: {}
 
+  topologySpreadConstraints: []
+
   metrics:
     enabled: false
     image:
       repository: pgpool/pgpool2_exporter
       tag: "1.2.2"
       pullPolicy: IfNotPresent
+    livenessProbe:
+      initialDelaySeconds: 30
+      periodSeconds: 30
+      timeoutSeconds: 15
+      failureThreshold: 5
+    readinessProbe:
+      initialDelaySeconds: 10
+      periodSeconds: 30
+      timeoutSeconds: 15
+      failureThreshold: 3
     resources:
       requests:
         cpu: 50m

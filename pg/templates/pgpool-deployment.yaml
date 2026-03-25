@@ -34,6 +34,10 @@ spec:
         {{- end }}
       {{- end }}
     spec:
+      {{- if .Values.pgpool.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml .Values.pgpool.topologySpreadConstraints | nindent 8 }}
+      {{- end }}
       affinity:
         {{- if .Values.pgpool.affinity }}
         {{- toYaml .Values.pgpool.affinity | nindent 8 }}
@@ -157,18 +161,18 @@ spec:
             httpGet:
               path: /metrics
               port: metrics
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 3
+            initialDelaySeconds: {{ .Values.pgpool.metrics.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.pgpool.metrics.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.pgpool.metrics.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.pgpool.metrics.livenessProbe.failureThreshold }}
           readinessProbe:
             httpGet:
               path: /metrics
               port: metrics
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 3
+            initialDelaySeconds: {{ .Values.pgpool.metrics.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.pgpool.metrics.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.pgpool.metrics.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.pgpool.metrics.readinessProbe.failureThreshold }}
           resources:
             {{- toYaml .Values.pgpool.metrics.resources | nindent 12 }}
 {{- end }}
