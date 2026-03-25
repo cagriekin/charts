@@ -67,6 +67,7 @@ data:
     log_hostname = off
     log_statement = {{ if .Values.pgpool.logging.logStatement }}on{{ else }}off{{ end }}
     log_per_node_statement = {{ if .Values.pgpool.logging.logPerNodeStatement }}on{{ else }}off{{ end }}
+    log_min_messages = {{ .Values.pgpool.logging.logMinMessages }}
     log_client_messages = off
     log_standby_delay = 'if_over_threshold'
 
