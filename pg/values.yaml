@@ -97,6 +97,8 @@ repmgr:
       cpu: 500m
       memory: 512Mi
 
+  terminationGracePeriodSeconds: 120
+
   serviceUpdater:
     resources:
       requests:

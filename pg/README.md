@@ -159,6 +159,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 | `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `repmgr.username` | Repmgr database user | `repmgr` |
 | `repmgr.database` | Repmgr database name | `repmgr` |
+| `repmgr.terminationGracePeriodSeconds` | Time allowed for graceful shutdown and failover | `120` |
 | `repmgr.resources.requests.cpu` | CPU request | `50m` |
 | `repmgr.resources.requests.memory` | Memory request | `128Mi` |
 | `repmgr.resources.limits.cpu` | CPU limit | `500m` |
@@ -166,6 +167,8 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 | `repmgr.serviceUpdater.resources.requests.cpu` | Service-updater CPU request | `50m` |
 | `repmgr.serviceUpdater.resources.requests.memory` | Service-updater memory request | `64Mi` |
 | `repmgr.serviceUpdater.resources.limits.memory` | Service-updater memory limit | `128Mi` |
+
+When repmgr is enabled, a preStop lifecycle hook performs graceful failover before pod termination. If the pod being terminated is the primary, it promotes the highest-priority standby via `pg_promote()`, waits for the local node to transition to recovery mode, and then runs `pg_ctl stop`. This ensures zero-downtime failover during node drains (e.g., Karpenter node expiration, cluster upgrades). The `terminationGracePeriodSeconds` controls how long Kubernetes waits for this process to complete.
 
 When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 

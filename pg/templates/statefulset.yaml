@@ -35,6 +35,9 @@ spec:
       {{- end }}
 {{- end }}
     spec:
+      {{- if .Values.repmgr.enabled }}
+      terminationGracePeriodSeconds: {{ .Values.repmgr.terminationGracePeriodSeconds | default 120 }}
+      {{- end }}
       securityContext:
         fsGroup: 103
       {{- if .Values.repmgr.enabled }}
@@ -233,8 +236,10 @@ spec:
                       fi
                       sleep 1
                     done
-{{- else if or .Values.postgresql.configuration .Values.postgresql.pgHba .Values.postgresql.lifecycle.postStart.additionalCommands }}
+{{- else }}
           lifecycle:
+{{- include "pg.preStop" . | nindent 12 }}
+{{- if or .Values.postgresql.configuration .Values.postgresql.pgHba .Values.postgresql.lifecycle.postStart.additionalCommands }}
             postStart:
               exec:
                 command:
@@ -278,6 +283,7 @@ spec:
                       fi
                       sleep 1
                     done
+{{- end }}
 {{- end }}
           resources:
             {{- toYaml .Values.postgresql.resources | nindent 12 }}

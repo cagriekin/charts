@@ -242,8 +242,9 @@ assert_not_contains "standalone additionalCommands: no primary discovery" "${sta
 repmgr_no_addcmd=$(helm template test-pg "${CHART_DIR}" \
   -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/statefulset.yaml 2>&1)
-assert_not_contains "repmgr no additionalCommands: no primary discovery" "${repmgr_no_addcmd}" "pg_is_in_recovery"
-assert_not_contains "repmgr no additionalCommands: no PGHOST" "${repmgr_no_addcmd}" "PGHOST"
+repmgr_no_addcmd_poststart=$(echo "${repmgr_no_addcmd}" | sed -n '/postStart:/,/preStop:\|resources:/p')
+assert_not_contains "repmgr no additionalCommands: no primary discovery in postStart" "${repmgr_no_addcmd_poststart:-empty}" "pg_is_in_recovery"
+assert_not_contains "repmgr no additionalCommands: no PGHOST in postStart" "${repmgr_no_addcmd_poststart:-empty}" "PGHOST"
 
 # --- pgBackRest Tests ---
 
