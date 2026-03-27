@@ -246,6 +246,34 @@ repmgr_no_addcmd_poststart=$(echo "${repmgr_no_addcmd}" | sed -n '/postStart:/,/
 assert_not_contains "repmgr no additionalCommands: no primary discovery in postStart" "${repmgr_no_addcmd_poststart:-empty}" "pg_is_in_recovery"
 assert_not_contains "repmgr no additionalCommands: no PGHOST in postStart" "${repmgr_no_addcmd_poststart:-empty}" "PGHOST"
 
+# --- Graceful Shutdown (preStop) Tests ---
+
+# Test: repmgr enabled renders preStop hook
+assert_contains "repmgr: preStop hook present" "${repmgr_no_addcmd}" "preStop:"
+assert_contains "repmgr: preStop queries repmgr role" "${repmgr_no_addcmd}" "repmgr.nodes"
+assert_contains "repmgr: preStop promotes standby" "${repmgr_no_addcmd}" "pg_promote"
+assert_contains "repmgr: preStop runs pg_ctl stop" "${repmgr_no_addcmd}" "pg_ctl stop"
+assert_contains "repmgr: preStop waits for recovery mode" "${repmgr_no_addcmd}" "pg_is_in_recovery"
+assert_contains "repmgr: terminationGracePeriodSeconds present" "${repmgr_no_addcmd}" "terminationGracePeriodSeconds: 120"
+
+# Test: repmgr with configuration renders both preStop and postStart
+repmgr_config=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-config-repmgr.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "repmgr+config: preStop hook present" "${repmgr_config}" "preStop:"
+assert_contains "repmgr+config: postStart hook present" "${repmgr_config}" "postStart:"
+
+# Test: custom terminationGracePeriodSeconds
+repmgr_custom_tgp=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set repmgr.terminationGracePeriodSeconds=300 \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "repmgr: custom terminationGracePeriodSeconds" "${repmgr_custom_tgp}" "terminationGracePeriodSeconds: 300"
+
+# Test: repmgr disabled does not render preStop or terminationGracePeriodSeconds
+assert_not_contains "minimal: no preStop hook" "${minimal}" "preStop:"
+assert_not_contains "minimal: no terminationGracePeriodSeconds" "${minimal}" "terminationGracePeriodSeconds"
+
 # --- pgBackRest Tests ---
 
 # Test: helm lint with pgbackrest values
