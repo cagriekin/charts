@@ -62,6 +62,15 @@ postgresql:
     enabled: true
     minAvailable: 1
 
+  configuration: {}
+    # max_connections: "200"
+    # shared_buffers: "1GB"
+    # work_mem: "32MB"
+
+  pgHba: []
+    # - "host all all 10.0.0.0/8 md5"
+    # - "host replication repmgr 10.0.0.0/8 trust"
+
   extensions:
     enabled: true
 
@@ -73,13 +82,15 @@ postgresql:
 repmgr:
   image:
     repository: cagriekin/repmgr
-    tag: trixie-5.5.0-3
+    tag: trixie-5.5.0-5
     pullPolicy: IfNotPresent
 
   enabled: true
 
   username: repmgr
   database: repmgr
+
+  terminationGracePeriodSeconds: 120
 
   resources:
     requests:
