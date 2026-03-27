@@ -3,13 +3,13 @@ entries:
   pgvector:
   - apiVersion: v2
     appVersion: "18.1"
-    created: "2026-03-25T14:30:50.013806011Z"
+    created: "2026-03-27T10:28:13.488985477Z"
     dependencies:
     - name: common
       repository: file://../common
       version: 0.1.0
     description: PostgreSQL with pgvector extension and optional PGPool-II
-    digest: 7d12301adf45d5889934ffbe6f525cf56acc740820b73e5573cb6964aa3c3158
+    digest: 613d3e2d208a735de2e38aeb1cb7b33ed4b6725d45ee3b82010a4d97712e5923
     keywords:
     - PostgreSQL
     - pgvector
@@ -19,6 +19,6 @@ entries:
     name: pgvector
     type: application
     urls:
-    - https://cagriekin.github.io/charts/pgvector-0.6.34.tgz
-    version: 0.6.34
-generated: "2026-03-25T14:30:50.012315311Z"
+    - https://cagriekin.github.io/charts/pgvector-0.6.35.tgz
+    version: 0.6.35
+generated: "2026-03-27T10:28:13.487521401Z"
