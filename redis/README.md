@@ -30,7 +30,7 @@ helm install my-redis ./redis \
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `redis.image.repository` | Redis image repository | `redis` |
-| `redis.image.tag` | Redis image tag | `7-alpine` |
+| `redis.image.tag` | Redis image tag | `8-trixie` |
 | `redis.persistence.enabled` | Enable persistence | `true` |
 | `redis.persistence.storageClass` | Storage class | `""` |
 | `redis.persistence.size` | Storage size | `1Gi` |
@@ -58,6 +58,12 @@ helm install my-redis ./redis \
 |-----------|-------------|---------|
 | `service.type` | Service type | `ClusterIP` |
 | `service.port` | Service port | `6379` |
+
+### Global Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `global.annotations` | Annotations applied to all resources | `{}` |
 
 ## Testing
 

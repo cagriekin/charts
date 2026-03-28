@@ -36,5 +36,17 @@ else
   fail "full: exporter service port 9121 present" "no match for port 9121"
 fi
 
+assert_contains "full: global annotations on statefulset" "${full}" "test-annotation: test-value"
+
+labels_block=$(echo "${full}" | awk '/^  labels:/{capture=1; next} /^  [a-z]/{capture=0} capture' )
+if echo "${labels_block}" | grep -q "test-annotation"; then
+  fail "full: global annotations not in labels" "test-annotation found inside a labels block"
+else
+  pass "full: global annotations not in labels"
+fi
+
+no_annotations=$(helm template test-redis "${CHART_DIR}" -f "${SCRIPT_DIR}/values-minimal.yaml" 2>&1)
+assert_not_contains "minimal: no annotations block without global annotations" "${no_annotations}" "test-annotation"
+
 end_suite
 print_summary
