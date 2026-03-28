@@ -12,6 +12,9 @@
 
 {{- define "redis.labels" -}}
 {{ include "common.labels" . }}
+{{- end }}
+
+{{- define "redis.globalAnnotations" -}}
 {{- with .Values.global.annotations }}
 {{ toYaml . }}
 {{- end }}
