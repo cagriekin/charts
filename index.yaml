@@ -1,5 +1,35 @@
 apiVersion: v1
 entries:
+  kafka:
+  - apiVersion: v2
+    appVersion: 4.1.0
+    created: "2026-03-28T20:20:24.56808926Z"
+    dependencies:
+    - name: common
+      repository: file://../common
+      version: 0.1.0
+    description: Apache Kafka with KRaft mode, SASL authentication, TLS encryption,
+      and topic management
+    digest: 9a766232104832aac668f8e5d7cc8a11e2d074c55b59761ac8db8962a281db84
+    keywords:
+    - Kafka
+    - Streaming
+    - Messaging
+    - Message Bus
+    - Kafka Broker
+    - Kafka Controller
+    - Kafka Exporter
+    - Kafka Topics
+    - Kafka Config
+    - Kafka Secrets
+    - Kafka Service
+    - Kafka Deployment
+    - Kafka StatefulSet
+    name: kafka
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/kafka-0.2.0.tgz
+    version: 0.2.0
   pg:
   - apiVersion: v2
     appVersion: "18.1"
@@ -30,4 +60,4 @@ entries:
     urls:
     - https://cagriekin.github.io/charts/redis-0.2.0.tgz
     version: 0.2.0
-generated: "2026-03-28T20:20:10.556156312Z"
+generated: "2026-03-28T20:20:24.566478488Z"
