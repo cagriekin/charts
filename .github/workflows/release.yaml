@@ -83,7 +83,12 @@ jobs:
         run: |
           set -euo pipefail
           chart="${{ steps.chart.outputs.name }}"
-          tag="${GITHUB_REF#refs/tags/}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version=$(grep '^version:' "${chart}/Chart.yaml" | awk '{print $2}')
+            tag="${chart}-${version}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
 
           workdir=$(mktemp -d)
           helm package "${chart}" --destination "$workdir"
