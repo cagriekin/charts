@@ -69,6 +69,20 @@ entries:
   redis:
   - apiVersion: v2
     appVersion: "8"
+    created: "2026-03-28T20:36:55.7718593Z"
+    dependencies:
+    - name: common
+      repository: file://../common
+      version: 0.1.0
+    description: Single-instance Redis with AOF persistence
+    digest: 65884b480cf53a4dfa404dcde4e85cb73b997fdd23b1cad918f2febe48df1cd8
+    name: redis
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/redis-0.2.1.tgz
+    version: 0.2.1
+  - apiVersion: v2
+    appVersion: "8"
     created: "2026-03-28T20:15:29.64607981Z"
     dependencies:
     - name: common
@@ -81,4 +95,4 @@ entries:
     urls:
     - https://cagriekin.github.io/charts/redis-0.2.0.tgz
     version: 0.2.0
-generated: "2026-03-28T20:20:54.677551177Z"
+generated: "2026-03-28T20:36:55.771107601Z"
