@@ -109,15 +109,8 @@ jobs:
           owner=$(echo "$GITHUB_REPOSITORY" | cut -d/ -f1)
 
           workdir=$(mktemp -d)
-          git checkout gh-pages -- index.yaml 2>/dev/null || true
 
           helm package "${chart}" --destination "$workdir"
-
-          if [ -f index.yaml ]; then
-            helm repo index "$workdir" --url "$repo_url" --merge index.yaml
-          else
-            helm repo index "$workdir" --url "$repo_url"
-          fi
 
           cat > "$workdir/index.html" <<'HEADER'
           <!doctype html>
@@ -193,6 +186,13 @@ jobs:
 
           git checkout gh-pages
           git pull origin gh-pages --rebase
+
+          if [ -f index.yaml ]; then
+            helm repo index "$workdir" --url "$repo_url" --merge index.yaml
+          else
+            helm repo index "$workdir" --url "$repo_url"
+          fi
+
           cp "$workdir"/*.tgz . 2>/dev/null || true
           cp "$workdir"/index.yaml .
           cp "$workdir"/index.html .
