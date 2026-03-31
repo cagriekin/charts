@@ -73,5 +73,9 @@ jobs:
       - name: Run full tests
         run: make -C pg test-full
 
+      - name: Clean up prior test namespaces
+        run: |
+          kubectl delete namespace pg-test-minimal pg-test-repmgr pg-test-full --ignore-not-found --wait=false
+
       - name: Run upgrade tests
         run: make -C pg test-upgrade
