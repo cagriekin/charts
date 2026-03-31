@@ -1,6 +1,6 @@
 {{- if and .Values.prometheusExporter.enabled .Values.prometheusExporter.serviceMonitor.enabled }}
 {{- $endpoints := list }}
-{{- range $i := until (int $.Values.postgresql.replicaCount) }}
+{{- range $i := until (add (int $.Values.postgresql.replicaCount) 1 | int) }}
 {{- $ep := dict
   "port" "metrics"
   "interval" $.Values.prometheusExporter.serviceMonitor.interval
