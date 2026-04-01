@@ -390,6 +390,17 @@ spec:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretDatabaseKey" . }}
 {{- end }}
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  [ -f /tmp/service-updater-alive ] && [ $(( $(date +%s) - $(cat /tmp/service-updater-alive) )) -lt 120 ]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 5
           lifecycle:
             preStop:
               exec:

@@ -285,10 +285,15 @@ repmgrd_section=$(echo "${repmgr_no_addcmd}" | sed -n '/name: repmgrd/,/name: se
 assert_contains "repmgr: repmgrd has preStop hook" "${repmgrd_section}" "preStop:"
 assert_contains "repmgr: repmgrd preStop runs daemon stop" "${repmgrd_section}" "repmgr daemon stop"
 
-# Test: service-updater sidecar has preStop hook
+# Test: service-updater sidecar has preStop hook and liveness probe
 service_updater_section=$(echo "${repmgr_no_addcmd}" | sed -n '/name: service-updater/,/^      volumes:/p')
 assert_contains "repmgr: service-updater has preStop hook" "${service_updater_section}" "preStop:"
 assert_contains "repmgr: service-updater preStop sleeps" "${service_updater_section}" "sleep 5"
+assert_contains "repmgr: service-updater has livenessProbe" "${service_updater_section}" "livenessProbe:"
+assert_contains "repmgr: service-updater liveness checks heartbeat file" "${service_updater_section}" "service-updater-alive"
+
+# Test: service-updater configmap writes heartbeat file
+assert_contains "repmgr: service-updater script writes heartbeat" "${repmgr_no_addcmd}" "service-updater-alive"
 
 # Test: repmgr disabled does not render preStop or terminationGracePeriodSeconds
 assert_not_contains "minimal: no preStop hook" "${minimal}" "preStop:"
