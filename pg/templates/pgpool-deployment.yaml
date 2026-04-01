@@ -55,6 +55,8 @@ spec:
       initContainers:
         - name: init-config
           image: busybox:1.35
+          securityContext:
+            {{- toYaml .Values.pgpool.containerSecurityContext | nindent 12 }}
           command:
             - /bin/sh
             - -c

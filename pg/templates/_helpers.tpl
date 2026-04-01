@@ -108,6 +108,8 @@ securityContext:
 initContainers:
   - name: init-config
     image: busybox:1.35
+    securityContext:
+      {{- toYaml .Values.prometheusExporter.containerSecurityContext | nindent 6 }}
     command:
       - /bin/sh
       - -c
