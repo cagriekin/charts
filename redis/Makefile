@@ -3,7 +3,7 @@ KIND_CONFIG := kind-config.yaml
 TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
-.PHONY: test test-template test-cluster test-minimal test-full cluster-create cluster-delete cluster-exists clean help
+.PHONY: test test-template test-cluster test-minimal test-full test-persistence cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -12,6 +12,7 @@ help:
 	@echo "  test-cluster    - Run all cluster tests in parallel (assumes cluster exists)"
 	@echo "  test-minimal    - Run minimal install tests"
 	@echo "  test-full       - Run full install tests (with exporter)"
+	@echo "  test-persistence - Run AOF persistence restart tests"
 	@echo "  cluster-create  - Create Kind cluster"
 	@echo "  cluster-delete  - Delete Kind cluster"
 	@echo "  clean           - Delete cluster and test namespaces"
@@ -21,7 +22,7 @@ test: cluster-create test-template test-cluster cluster-delete
 test-template:
 	@bash $(TESTS_DIR)/test-template.sh
 
-test-cluster: test-minimal test-full
+test-cluster: test-minimal test-full test-persistence
 	@echo "All test suites passed"
 
 cluster-exists:
@@ -49,6 +50,9 @@ test-minimal: cluster-exists
 
 test-full: cluster-exists
 	@bash $(TESTS_DIR)/test-full.sh
+
+test-persistence: cluster-exists
+	@bash $(TESTS_DIR)/test-persistence.sh
 
 clean: cluster-delete
 	@echo "Cleaned up"
