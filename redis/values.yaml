@@ -97,6 +97,10 @@ exporter:
     interval: 30s
     scrapeTimeout: 10s
     additionalLabels: {}
+  prometheusRule:
+    enabled: false
+    additionalLabels: {}
+    rules: []
 
 service:
   type: ClusterIP
