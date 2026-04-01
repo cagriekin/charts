@@ -94,6 +94,8 @@ helm install my-postgres cagriekin/pg \
 | `postgresql.podAnnotations` | Annotations for PostgreSQL pods | `{}` |
 | `postgresql.affinity` | Affinity rules for PostgreSQL pods | `{}` |
 | `postgresql.annotations` | Additional annotations | `{}` |
+| `postgresql.podSecurityContext` | Pod-level securityContext for StatefulSet | `{fsGroup: 103, runAsNonRoot: true, seccompProfile.type: RuntimeDefault}` |
+| `postgresql.containerSecurityContext` | Container-level securityContext for all PostgreSQL containers | `{runAsUser: 101, runAsGroup: 103, allowPrivilegeEscalation: false, capabilities.drop: [ALL]}` |
 
 ### Liveness and Readiness Probes
 
