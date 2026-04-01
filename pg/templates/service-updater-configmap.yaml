@@ -124,7 +124,7 @@ data:
         for i in $(seq 0 {{ .Values.postgresql.replicaCount }}); do
             node="${BASE_NAME}-${i}.${HEADLESS_SERVICE}"
             in_recovery=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
-                -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | xargs)
+                -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | xargs) || true
 
             if [ "$in_recovery" = "f" ]; then
                 primary_count=$((primary_count + 1))
