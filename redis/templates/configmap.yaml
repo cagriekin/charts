@@ -11,8 +11,18 @@ metadata:
 data:
   redis.conf: |
     appendonly yes
+    appendfsync {{ .Values.redis.config.appendfsync }}
+    no-appendfsync-on-rewrite {{ index .Values.redis.config "no-appendfsync-on-rewrite" }}
+    auto-aof-rewrite-percentage {{ index .Values.redis.config "auto-aof-rewrite-percentage" }}
+    auto-aof-rewrite-min-size {{ index .Values.redis.config "auto-aof-rewrite-min-size" }}
     maxmemory {{ .Values.redis.config.maxmemory }}
     maxmemory-policy {{ index .Values.redis.config "maxmemory-policy" }}
     tcp-keepalive 60
     timeout 0
+{{- if .Values.redis.config.rdbSnapshots }}
+{{- range .Values.redis.config.rdbSnapshots }}
+    save {{ .seconds }} {{ .changes }}
+{{- end }}
+{{- else }}
     save ""
+{{- end }}

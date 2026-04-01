@@ -59,5 +59,19 @@ assert_contains "full: exporter has allowPrivilegeEscalation false" "${full}" "a
 assert_contains "minimal: preStop SHUTDOWN SAVE" "${minimal}" "SHUTDOWN"
 assert_contains "minimal: terminationGracePeriodSeconds" "${minimal}" "terminationGracePeriodSeconds: 300"
 
+# --- Persistence Tuning Tests ---
+assert_contains "minimal: appendfsync everysec" "${minimal}" "appendfsync everysec"
+assert_contains "minimal: no-appendfsync-on-rewrite yes" "${minimal}" "no-appendfsync-on-rewrite yes"
+assert_contains "minimal: save disabled by default" "${minimal}" 'save ""'
+
+# Test: RDB snapshots render when configured
+rdb_output=$(helm template test-redis "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-minimal.yaml" \
+  --set 'redis.config.rdbSnapshots[0].seconds=3600' \
+  --set 'redis.config.rdbSnapshots[0].changes=1' \
+  --show-only templates/configmap.yaml 2>&1)
+assert_contains "rdb: save renders with snapshots" "${rdb_output}" "save 3600 1"
+assert_not_contains "rdb: save empty not present with snapshots" "${rdb_output}" 'save ""'
+
 end_suite
 print_summary
