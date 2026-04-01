@@ -17,6 +17,20 @@ redis:
     limits:
       cpu: 200m
       memory: 256Mi
+  podSecurityContext:
+    fsGroup: 999
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+  containerSecurityContext:
+    runAsUser: 999
+    runAsGroup: 999
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
   config:
     maxmemory: "200mb"
     maxmemory-policy: "allkeys-lru"
@@ -33,6 +47,18 @@ redis:
 
 exporter:
   enabled: true
+
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
   image:
     repository: oliver006/redis_exporter
     tag: "v1.67.0"

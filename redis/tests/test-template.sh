@@ -48,5 +48,12 @@ fi
 no_annotations=$(helm template test-redis "${CHART_DIR}" -f "${SCRIPT_DIR}/values-minimal.yaml" 2>&1)
 assert_not_contains "minimal: no annotations block without global annotations" "${no_annotations}" "test-annotation"
 
+# --- SecurityContext Tests ---
+assert_contains "minimal: pod has runAsNonRoot" "${minimal}" "runAsNonRoot: true"
+assert_contains "minimal: pod has fsGroup 999" "${minimal}" "fsGroup: 999"
+assert_contains "minimal: container has runAsUser 999" "${minimal}" "runAsUser: 999"
+assert_contains "minimal: container has allowPrivilegeEscalation false" "${minimal}" "allowPrivilegeEscalation: false"
+assert_contains "full: exporter has allowPrivilegeEscalation false" "${full}" "allowPrivilegeEscalation: false"
+
 end_suite
 print_summary
