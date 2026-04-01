@@ -93,6 +93,16 @@ assert_gt "full: pgpool service port 9999 present" "${pgpool_svc}" "0"
 # Full: should have pgpool configmap
 assert_contains "full: pgpool configmap present" "${full}" "pgpool.conf"
 
+# Full: pgpool should disable clear-text frontend auth by default
+assert_contains "full: pgpool disables clear-text auth" "${full}" "allow_clear_text_frontend_auth = off"
+
+# Test: pgpool clear-text auth can be explicitly enabled
+pgpool_cleartext=$(helm template test-pg "${CHART_DIR}" \
+  --set pgpool.enabled=true \
+  --set pgpool.allowClearTextFrontendAuth=true \
+  --show-only templates/pgpool-configmap.yaml 2>&1)
+assert_contains "pgpool clear-text auth: enabled when set to true" "${pgpool_cleartext}" "allow_clear_text_frontend_auth = on"
+
 # Full: should have prometheus exporter deployment
 assert_contains "full: prometheus exporter present" "${full}" "postgres-exporter"
 

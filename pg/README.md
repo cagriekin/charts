@@ -192,6 +192,7 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 | `pgpool.resetQueryList` | Queries to run when returning connection to pool | `ABORT; RESET ALL; DEALLOCATE ALL` |
 | `pgpool.failOverOnBackendError` | Trigger failover on backend errors | `false` |
 | `pgpool.autoFailback` | Automatically reattach recovered backends | `true` |
+| `pgpool.allowClearTextFrontendAuth` | Allow clear-text password authentication from clients | `false` |
 | `pgpool.adminUsername` | PGPool-II admin user | `admin` |
 | `pgpool.adminPassword` | PGPool-II admin password | `admin` |
 | `pgpool.service.type` | Service type | `ClusterIP` |

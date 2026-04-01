@@ -111,7 +111,7 @@ data:
     recovery_password = '__POSTGRES_PASSWORD__'
     recovery_1st_stage_command = ''
 
-    allow_clear_text_frontend_auth = on
+    allow_clear_text_frontend_auth = {{ if .Values.pgpool.allowClearTextFrontendAuth }}on{{ else }}off{{ end }}
 
   pcp.conf: |
     {{ .Values.pgpool.adminUsername }}:{{ .Values.pgpool.adminPassword | sha256sum }}
