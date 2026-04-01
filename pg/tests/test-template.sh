@@ -334,6 +334,15 @@ backup_cronjob=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/backup-cronjob.yaml 2>&1)
 assert_contains "backup: activeDeadlineSeconds present" "${backup_cronjob}" "activeDeadlineSeconds: 3600"
 assert_contains "backup: backoffLimit present" "${backup_cronjob}" "backoffLimit: 1"
+# Test: backup configmap has pg_restore verification
+backup_configmap=$(helm template test-pg "${CHART_DIR}" \
+  --set backup.enabled=true \
+  --set backup.s3.endpoint=https://s3.test \
+  --set backup.s3.bucket=test \
+  --set backup.existingSecret.name=test-secret \
+  --show-only templates/backup-configmap.yaml 2>&1)
+assert_contains "backup: pg_restore verification present" "${backup_configmap}" "pg_restore --list"
+
 assert_contains "backup: pod has runAsNonRoot" "${backup_cronjob}" "runAsNonRoot: true"
 assert_contains "backup: container has allowPrivilegeEscalation false" "${backup_cronjob}" "allowPrivilegeEscalation: false"
 
