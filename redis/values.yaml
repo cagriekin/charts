@@ -102,5 +102,10 @@ service:
   type: ClusterIP
   port: 6379
 
+networkPolicy:
+  enabled: false
+  allowExternal: true
+  extraIngress: []
+
 global:
   annotations: {}
