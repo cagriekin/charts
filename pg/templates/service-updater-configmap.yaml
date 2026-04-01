@@ -99,12 +99,13 @@ data:
             return
         fi
 
+        pgpool_check_rc=0
         PGPASSWORD=${POSTGRES_PASSWORD} timeout 5 psql \
             -h "${PGPOOL_SERVICE}" -p "${PGPOOL_PORT}" \
             -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
-            -t -c "SELECT 1;" > /dev/null 2>&1
+            -t -c "SELECT 1;" > /dev/null 2>&1 || pgpool_check_rc=$?
 
-        if [ $? -ne 0 ]; then
+        if [ $pgpool_check_rc -ne 0 ]; then
             PGPOOL_FAILURES=$((PGPOOL_FAILURES + 1))
             echo "WARNING: pgpool health check failed ($PGPOOL_FAILURES/${MAX_PGPOOL_FAILURES})"
             if [ $PGPOOL_FAILURES -ge $MAX_PGPOOL_FAILURES ]; then
