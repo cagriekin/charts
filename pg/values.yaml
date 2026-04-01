@@ -113,6 +113,9 @@ repmgr:
 
   terminationGracePeriodSeconds: 120
 
+  splitBrainDetection:
+    action: log
+
   serviceUpdater:
     resources:
       requests:

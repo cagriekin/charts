@@ -106,6 +106,9 @@ repmgr:
 
   terminationGracePeriodSeconds: 120
 
+  splitBrainDetection:
+    action: log
+
   resources:
     requests:
       cpu: 50m
