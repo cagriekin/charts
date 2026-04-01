@@ -71,4 +71,8 @@ data:
 
     echo "${BACKUP_TYPE} backup completed"
     pgbackrest --stanza="${PGBACKREST_STANZA}" info
+
+    echo "Verifying backup integrity..."
+    pgbackrest --stanza="${PGBACKREST_STANZA}" verify
+    echo "Backup verification completed"
 {{- end }}

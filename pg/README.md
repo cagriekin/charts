@@ -459,6 +459,7 @@ helm install my-postgres cagriekin/pg \
 - **Full backups**: Weekly (default Sunday 1am) via the pgbackrest-scheduler sidecar.
 - **Differential backups**: Daily (default Mon-Sat 1am). Only changed blocks since the last full backup are stored.
 - **Failover**: After repmgr promotes a standby, the new primary starts archiving WAL and running backups automatically.
+- **Verification**: After each backup, `pgbackrest verify` validates backup integrity and WAL continuity.
 
 ### pgBackRest Parameters
 
