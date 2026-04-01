@@ -172,8 +172,8 @@ When repmgr is enabled, a preStop lifecycle hook performs graceful failover befo
 
 When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 
-- **repmgrd**: monitors replication and triggers automatic failover when the primary becomes unavailable
-- **service-updater**: watches repmgr cluster state and patches the Kubernetes Service selector to point to the current primary, then restarts PGPool-II if enabled
+- **repmgrd**: monitors replication and triggers automatic failover when the primary becomes unavailable. Has a preStop hook that runs `repmgr daemon stop` for clean deregistration.
+- **service-updater**: watches repmgr cluster state and patches the Kubernetes Service selector to point to the current primary, then restarts PGPool-II if enabled. Has a preStop hook that sleeps 5s to allow in-flight patches to complete.
 
 ### PGPool-II Parameters
 

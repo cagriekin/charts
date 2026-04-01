@@ -280,6 +280,16 @@ repmgr_custom_tgp=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "repmgr: custom terminationGracePeriodSeconds" "${repmgr_custom_tgp}" "terminationGracePeriodSeconds: 300"
 
+# Test: repmgrd sidecar has preStop hook
+repmgrd_section=$(echo "${repmgr_no_addcmd}" | sed -n '/name: repmgrd/,/name: service-updater/p')
+assert_contains "repmgr: repmgrd has preStop hook" "${repmgrd_section}" "preStop:"
+assert_contains "repmgr: repmgrd preStop runs daemon stop" "${repmgrd_section}" "repmgr daemon stop"
+
+# Test: service-updater sidecar has preStop hook
+service_updater_section=$(echo "${repmgr_no_addcmd}" | sed -n '/name: service-updater/,/^      volumes:/p')
+assert_contains "repmgr: service-updater has preStop hook" "${service_updater_section}" "preStop:"
+assert_contains "repmgr: service-updater preStop sleeps" "${service_updater_section}" "sleep 5"
+
 # Test: repmgr disabled does not render preStop or terminationGracePeriodSeconds
 assert_not_contains "minimal: no preStop hook" "${minimal}" "preStop:"
 assert_not_contains "minimal: no terminationGracePeriodSeconds" "${minimal}" "terminationGracePeriodSeconds"
