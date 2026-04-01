@@ -30,7 +30,7 @@ helm install my-redis ./redis \
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `redis.image.repository` | Redis image repository | `redis` |
-| `redis.image.tag` | Redis image tag | `8-trixie` |
+| `redis.image.tag` | Redis image tag | `8.6.2-trixie` |
 | `redis.persistence.enabled` | Enable persistence | `true` |
 | `redis.persistence.storageClass` | Storage class | `""` |
 | `redis.persistence.size` | Storage size | `1Gi` |
