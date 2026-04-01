@@ -25,10 +25,14 @@
 {{- end }}
 
 {{- define "redis.exporterPodSpec" -}}
+securityContext:
+  {{- toYaml .Values.exporter.podSecurityContext | nindent 2 }}
 containers:
   - name: redis-exporter
     image: "{{ .Values.exporter.image.repository }}:{{ .Values.exporter.image.tag }}"
     imagePullPolicy: {{ .Values.exporter.image.pullPolicy }}
+    securityContext:
+      {{- toYaml .Values.exporter.containerSecurityContext | nindent 6 }}
     env:
       - name: REDIS_ADDR
         value: "redis://{{ include "redis.fullname" . }}:{{ .Values.service.port }}"

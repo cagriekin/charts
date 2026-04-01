@@ -40,6 +40,8 @@ helm install my-redis ./redis \
 | `redis.resources.requests.memory` | Memory request | `64Mi` |
 | `redis.resources.limits.cpu` | CPU limit | `200m` |
 | `redis.resources.limits.memory` | Memory limit | `256Mi` |
+| `redis.podSecurityContext` | Pod-level securityContext | `{fsGroup: 999, runAsNonRoot: true, seccompProfile.type: RuntimeDefault}` |
+| `redis.containerSecurityContext` | Container-level securityContext | `{runAsUser: 999, runAsGroup: 999, allowPrivilegeEscalation: false, capabilities.drop: [ALL]}` |
 
 ### Exporter Parameters
 
