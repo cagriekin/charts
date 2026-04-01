@@ -415,6 +415,8 @@ kubectl create job --from=cronjob/my-postgres-backup manual-backup
 | `backup.existingSecret.name` | Secret containing S3 credentials | `""` |
 | `backup.existingSecret.accessKeyIdKey` | Key for access key ID in secret | `access-key-id` |
 | `backup.existingSecret.secretAccessKeyKey` | Key for secret access key in secret | `secret-access-key` |
+| `backup.activeDeadlineSeconds` | Job timeout in seconds | `3600` |
+| `backup.backoffLimit` | Number of retries before marking job as failed | `1` |
 | `backup.retentionDays` | Days to retain backups before cleanup | `7` |
 | `backup.resources.requests.cpu` | CPU request | `100m` |
 | `backup.resources.requests.memory` | Memory request | `256Mi` |
