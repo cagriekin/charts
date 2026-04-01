@@ -125,5 +125,17 @@ netpol_no_exporter=$(helm template test-redis "${CHART_DIR}" \
   --show-only templates/networkpolicy.yaml 2>&1)
 assert_not_contains "netpol minimal: no exporter policy" "${netpol_no_exporter}" "redis-exporter"
 
+# --- PrometheusRule Tests ---
+assert_not_contains "default: no PrometheusRule" "${full}" "kind: PrometheusRule"
+
+promrule=$(helm template test-redis "${CHART_DIR}" \
+  --set exporter.enabled=true \
+  --set exporter.prometheusRule.enabled=true \
+  --show-only templates/prometheusrule.yaml 2>&1)
+assert_contains "promrule: renders when enabled" "${promrule}" "kind: PrometheusRule"
+assert_contains "promrule: RedisDown alert" "${promrule}" "RedisDown"
+assert_contains "promrule: RedisMemoryHigh alert" "${promrule}" "RedisMemoryHigh"
+assert_contains "promrule: RedisAOFWriteFailure alert" "${promrule}" "RedisAOFWriteFailure"
+
 end_suite
 print_summary

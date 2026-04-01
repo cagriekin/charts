@@ -75,6 +75,9 @@ helm install my-redis ./redis \
 | `exporter.service.port` | Exporter port | `9121` |
 | `exporter.serviceMonitor.enabled` | Create ServiceMonitor | `true` |
 | `exporter.serviceMonitor.interval` | Scrape interval | `30s` |
+| `exporter.prometheusRule.enabled` | Create PrometheusRule with default alerts | `false` |
+| `exporter.prometheusRule.additionalLabels` | Additional labels for PrometheusRule | `{}` |
+| `exporter.prometheusRule.rules` | Custom alert rules (overrides defaults when non-empty) | `[]` |
 
 ### Service Parameters
 

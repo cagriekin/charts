@@ -1,0 +1,56 @@
+{{- if and .Values.exporter.enabled .Values.exporter.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "redis.fullname" . }}
+  labels:
+    {{- include "redis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+    {{- with .Values.exporter.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: redis.rules
+{{- if .Values.exporter.prometheusRule.rules }}
+      rules:
+        {{- toYaml .Values.exporter.prometheusRule.rules | nindent 8 }}
+{{- else }}
+      rules:
+        - alert: RedisDown
+          expr: redis_up == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Redis instance is down"
+        - alert: RedisMemoryHigh
+          expr: redis_memory_used_bytes / redis_memory_max_bytes * 100 > 90
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Redis memory usage above 90%"
+        - alert: RedisHighClients
+          expr: redis_connected_clients > 100
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Redis connected clients exceeds 100"
+        - alert: RedisAOFWriteFailure
+          expr: redis_aof_last_write_status == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Redis AOF last write failed"
+        - alert: RedisKeyspaceMissRatioHigh
+          expr: rate(redis_keyspace_misses_total[5m]) / (rate(redis_keyspace_hits_total[5m]) + rate(redis_keyspace_misses_total[5m])) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Redis keyspace miss ratio above 50%"
+{{- end }}
+{{- end }}
