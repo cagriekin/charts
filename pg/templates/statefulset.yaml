@@ -330,6 +330,14 @@ spec:
               value: {{ .Values.repmgr.database }}
             - name: HEADLESS_SERVICE
               value: {{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/bash
+                  - -c
+                  - |
+                    repmgr daemon stop 2>/dev/null || true
           resources:
             {{- toYaml .Values.repmgr.resources | nindent 12 }}
           volumeMounts:
@@ -382,6 +390,13 @@ spec:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretDatabaseKey" . }}
 {{- end }}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/bash
+                  - -c
+                  - sleep 5
           volumeMounts:
             - name: service-updater-script
               mountPath: /scripts
