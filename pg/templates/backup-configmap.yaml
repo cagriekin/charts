@@ -42,6 +42,12 @@ data:
     fi
     echo "Upload verified: ${UPLOADED_SIZE} bytes"
 
+    echo "Verifying backup integrity via pg_restore --list..."
+    mc cat "s3/${S3_PATH}" > /tmp/verify_backup.dump
+    pg_restore --list /tmp/verify_backup.dump > /dev/null
+    echo "Backup integrity verified"
+    rm -f /tmp/verify_backup.dump
+
     echo "Running retention cleanup (removing backups older than ${RETENTION_DAYS} days)..."
     mc find "s3/${S3_BUCKET}/${S3_PREFIX}/" --older-than "${RETENTION_DAYS}d" --exec "mc rm {}"
 
