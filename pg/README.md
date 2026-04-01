@@ -559,6 +559,116 @@ make cluster-delete
 make -j4 test-cluster
 ```
 
+## Failover RTO/RPO
+
+### Recovery Time Objective (RTO)
+
+With repmgr enabled, automatic failover completes in approximately 30-60 seconds:
+
+1. **Detection** (~10-30s): repmgrd detects primary unavailability based on `health_check_interval` and `reconnect_attempts` in the repmgr configuration.
+2. **Promotion** (~5-10s): repmgr promotes the highest-priority standby via `pg_promote()`.
+3. **Service update** (~5-15s): service-updater detects the new primary and patches the Kubernetes Service selector. PGPool-II is restarted if enabled.
+
+The `terminationGracePeriodSeconds` (default 120s) controls the maximum time allowed for graceful failover during planned drains (e.g., node upgrades).
+
+### Recovery Point Objective (RPO)
+
+| Backup Method | RPO | Notes |
+|---------------|-----|-------|
+| Streaming replication (async) | Seconds of lag | Default. RPO depends on replication lag. Monitor with `pg_stat_replication`. |
+| Streaming replication (sync) | Zero | Set `synchronous_commit = on` and configure `synchronous_standby_names` in `postgresql.configuration`. Adds write latency. |
+| pgBackRest PITR | Up to last archived WAL segment | Continuous WAL archiving. RPO depends on `archive_timeout` (default 60s). |
+| pg_dump S3 backup | Up to last backup interval | Default daily at 2am. Not suitable for near-zero RPO. |
+
+## Recovery Runbooks
+
+### Primary Failure (Automatic Failover)
+
+No action required if repmgr is enabled. The sequence is:
+1. repmgrd detects primary failure
+2. Standby is promoted automatically
+3. service-updater patches the Kubernetes Service
+4. PGPool-II restarts to pick up the new backend topology
+
+Verify with:
+```bash
+kubectl exec -n <namespace> <pod> -c postgresql -- repmgr cluster show
+```
+
+### Rejoin Failed Primary as Standby
+
+After a failover, the old primary must rejoin as a standby:
+```bash
+kubectl delete pod <old-primary-pod> -n <namespace>
+```
+The StatefulSet recreates the pod, and the repmgr entrypoint automatically registers it as a standby and clones from the new primary.
+
+### Restore from pg_dump Backup
+
+```bash
+mc cp s3/<bucket>/<prefix>/backup_<timestamp>.dump /tmp/backup.dump
+pg_restore -h <host> -U <user> -d <database> --clean --if-exists /tmp/backup.dump
+```
+
+### Point-in-Time Recovery (pgBackRest)
+
+1. Stop the PostgreSQL pod:
+```bash
+kubectl scale statefulset <fullname> -n <namespace> --replicas=0
+```
+
+2. Run PITR restore:
+```bash
+pgbackrest --stanza=db --type=time "--target=2025-01-15 12:00:00" restore
+```
+
+3. Scale back up:
+```bash
+kubectl scale statefulset <fullname> -n <namespace> --replicas=<original-count>
+```
+
+### Split-Brain Recovery
+
+If split-brain is detected (multiple primaries logged by service-updater):
+
+1. Identify which node has the most recent data:
+```bash
+kubectl exec -n <namespace> <pod-0> -c postgresql -- psql -U postgres -c "SELECT pg_current_wal_lsn();"
+kubectl exec -n <namespace> <pod-1> -c postgresql -- psql -U postgres -c "SELECT pg_current_wal_lsn();"
+```
+
+2. Stop the stale primary (lower LSN):
+```bash
+kubectl exec -n <namespace> <stale-pod> -c postgresql -- pg_ctl stop -D /var/lib/postgresql/data/pgdata -m fast
+```
+
+3. Delete the stale pod to let it rejoin as standby:
+```bash
+kubectl delete pod <stale-pod> -n <namespace>
+```
+
+### Complete Cluster Rebuild
+
+As a last resort:
+```bash
+kubectl scale statefulset <fullname> -n <namespace> --replicas=0
+kubectl delete pvc -n <namespace> -l app.kubernetes.io/component=postgresql
+kubectl scale statefulset <fullname> -n <namespace> --replicas=<count>
+```
+Then restore from the latest backup using one of the methods above.
+
+## Troubleshooting
+
+| Symptom | Likely Cause | Resolution |
+|---------|-------------|------------|
+| Replication lag increasing | Slow network or standby under load | Check `pg_stat_replication` on primary. Consider increasing `wal_sender_timeout`. |
+| Failover not triggering | repmgrd not detecting failure | Check repmgrd logs. Verify `health_check_interval` and `reconnect_attempts`. |
+| Service not updating after failover | service-updater stuck or crashed | Check service-updater logs. Liveness probe should restart it if stuck. |
+| PGPool returning errors after failover | PGPool not restarted | service-updater should restart PGPool. Check service-updater logs. Manual restart: `kubectl rollout restart deployment <fullname>-pgpool` |
+| WAL archiving failing (pgBackRest) | S3 credentials or connectivity | Check pgbackrest-scheduler logs. Verify S3 endpoint and credentials. |
+| Backup job hanging | S3 unreachable | `activeDeadlineSeconds` (default 3600s) will terminate the job. Check S3 connectivity. |
+| Split-brain detected in logs | Network partition | Follow the split-brain recovery runbook above. |
+
 ## Upgrade
 
 ```bash
