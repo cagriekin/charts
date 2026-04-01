@@ -62,6 +62,8 @@ helm install my-redis ./redis \
 | `redis.podSecurityContext` | Pod-level securityContext | `{fsGroup: 999, runAsNonRoot: true, seccompProfile.type: RuntimeDefault}` |
 | `redis.containerSecurityContext` | Container-level securityContext | `{runAsUser: 999, runAsGroup: 999, allowPrivilegeEscalation: false, capabilities.drop: [ALL]}` |
 | `redis.terminationGracePeriodSeconds` | Time allowed for graceful shutdown | `300` |
+| `redis.podDisruptionBudget.enabled` | Enable PodDisruptionBudget | `false` |
+| `redis.podDisruptionBudget.minAvailable` | Minimum available pods during disruption | `1` |
 
 ### Exporter Parameters
 

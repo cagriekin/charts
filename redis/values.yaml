@@ -52,6 +52,10 @@ redis:
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 3
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+
   terminationGracePeriodSeconds: 300
 
   readinessProbe:
