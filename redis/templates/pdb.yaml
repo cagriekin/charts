@@ -1,0 +1,10 @@
+{{- if .Values.redis.podDisruptionBudget.enabled }}
+{{- include "common.podDisruptionBudget" (dict
+  "ctx"             .
+  "component"       "redis"
+  "nameSuffix"      ""
+  "labels"          "redis.labels"
+  "selectorLabels"  "redis.selectorLabels"
+  "minAvailable"    .Values.redis.podDisruptionBudget.minAvailable
+) }}
+{{- end }}

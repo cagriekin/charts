@@ -99,5 +99,14 @@ auth_exporter=$(helm template test-redis "${CHART_DIR}" \
   2>&1)
 assert_contains "auth exporter: REDIS_PASSWORD in exporter" "${auth_exporter}" "REDIS_PASSWORD"
 
+# --- PDB Tests ---
+assert_not_contains "default: no PDB" "${minimal}" "PodDisruptionBudget"
+
+pdb_output=$(helm template test-redis "${CHART_DIR}" \
+  --set redis.podDisruptionBudget.enabled=true \
+  --show-only templates/pdb.yaml 2>&1)
+assert_contains "pdb: renders when enabled" "${pdb_output}" "kind: PodDisruptionBudget"
+assert_contains "pdb: minAvailable 1" "${pdb_output}" "minAvailable: 1"
+
 end_suite
 print_summary
