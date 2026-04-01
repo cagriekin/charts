@@ -1,0 +1,42 @@
+postgresql:
+  replicaCount: 0
+  database: testdb
+  username: testuser
+
+  persistence:
+    enabled: false
+
+  podSecurityContext:
+    fsGroup: 103
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+  containerSecurityContext:
+    runAsUser: 101
+    runAsGroup: 103
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
+repmgr:
+  enabled: false
+
+pgpool:
+  enabled: false
+
+backup:
+  enabled: true
+  schedule: "0 2 * * *"
+  s3:
+    endpoint: http://minio.pg-test-backup.svc.cluster.local:9000
+    bucket: pg-backups
+    prefix: backups
+  existingSecret:
+    name: minio-creds
+    accessKeyIdKey: access-key-id
+    secretAccessKeyKey: secret-access-key
+  activeDeadlineSeconds: 300
+  backoffLimit: 1
+  retentionDays: 7
