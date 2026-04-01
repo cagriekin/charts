@@ -24,6 +24,7 @@ spec:
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
+      terminationGracePeriodSeconds: {{ .Values.redis.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.redis.podSecurityContext | nindent 8 }}
       containers:
@@ -57,6 +58,13 @@ spec:
             periodSeconds: {{ .Values.redis.readinessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.redis.readinessProbe.timeoutSeconds }}
             failureThreshold: {{ .Values.redis.readinessProbe.failureThreshold }}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - redis-cli
+                  - SHUTDOWN
+                  - SAVE
           resources:
             {{- toYaml .Values.redis.resources | nindent 12 }}
           volumeMounts:

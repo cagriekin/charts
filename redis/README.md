@@ -42,6 +42,7 @@ helm install my-redis ./redis \
 | `redis.resources.limits.memory` | Memory limit | `256Mi` |
 | `redis.podSecurityContext` | Pod-level securityContext | `{fsGroup: 999, runAsNonRoot: true, seccompProfile.type: RuntimeDefault}` |
 | `redis.containerSecurityContext` | Container-level securityContext | `{runAsUser: 999, runAsGroup: 999, allowPrivilegeEscalation: false, capabilities.drop: [ALL]}` |
+| `redis.terminationGracePeriodSeconds` | Time allowed for graceful shutdown | `300` |
 
 ### Exporter Parameters
 
