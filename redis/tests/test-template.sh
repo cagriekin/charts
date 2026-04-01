@@ -55,5 +55,9 @@ assert_contains "minimal: container has runAsUser 999" "${minimal}" "runAsUser: 
 assert_contains "minimal: container has allowPrivilegeEscalation false" "${minimal}" "allowPrivilegeEscalation: false"
 assert_contains "full: exporter has allowPrivilegeEscalation false" "${full}" "allowPrivilegeEscalation: false"
 
+# --- preStop and terminationGracePeriodSeconds Tests ---
+assert_contains "minimal: preStop SHUTDOWN SAVE" "${minimal}" "SHUTDOWN"
+assert_contains "minimal: terminationGracePeriodSeconds" "${minimal}" "terminationGracePeriodSeconds: 300"
+
 end_suite
 print_summary

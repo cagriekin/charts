@@ -39,6 +39,8 @@ redis:
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 3
+  terminationGracePeriodSeconds: 300
+
   readinessProbe:
     initialDelaySeconds: 5
     periodSeconds: 10
