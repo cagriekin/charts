@@ -159,8 +159,9 @@ assert_contains "repmgr: pod has seccompProfile" "${repmgr}" "type: RuntimeDefau
 assert_contains "repmgr: postgresql has allowPrivilegeEscalation false" "${repmgr}" "allowPrivilegeEscalation: false"
 assert_contains "repmgr: postgresql drops ALL capabilities" "${repmgr}" "drop:"
 
-# Test: fix-permissions init container keeps runAsUser 0 but has allowPrivilegeEscalation false
-fix_perms=$(echo "${repmgr}" | sed -n '/name: fix-permissions/,/name: repmgr-init\|name: copy-base-ext\|name: copy-ext\|name: setup-config\|containers:/p')
+# Test: fix-permissions init container keeps runAsUser 0 but has allowPrivilegeEscalation false (requires persistence)
+default_sts=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1)
+fix_perms=$(echo "${default_sts}" | sed -n '/name: fix-permissions/,/name: repmgr-init\|name: copy-base-ext\|name: copy-ext\|name: setup-config\|containers:/p')
 assert_contains "fix-permissions: runs as root" "${fix_perms}" "runAsUser: 0"
 assert_contains "fix-permissions: has allowPrivilegeEscalation false" "${fix_perms}" "allowPrivilegeEscalation: false"
 

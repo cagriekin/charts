@@ -67,7 +67,8 @@ assert_contains "repmgr sees standby node" "${cluster_output}" "standby"
 
 # Test: replication works - write on primary, read on replica
 REPL_VALUE="replicated-$(date +%s)"
-pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "CREATE TABLE IF NOT EXISTS repl_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
+pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "DROP TABLE IF EXISTS repl_test" "testuser" "testdb"
+pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "CREATE TABLE repl_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
 pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "INSERT INTO repl_test (value) VALUES ('${REPL_VALUE}')" "testuser" "testdb"
 
 sleep 3
