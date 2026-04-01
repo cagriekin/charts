@@ -16,6 +16,9 @@ assert_eq "helm lint with minimal values passes" "0" "${lint_rc}"
 lint_output=$(helm lint "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" 2>&1) && lint_rc=0 || lint_rc=$?
 assert_eq "helm lint with full values passes" "0" "${lint_rc}"
 
+lint_output=$(helm lint "${CHART_DIR}" -f "${SCRIPT_DIR}/values-persistence-test.yaml" 2>&1) && lint_rc=0 || lint_rc=$?
+assert_eq "helm lint with persistence test values passes" "0" "${lint_rc}"
+
 minimal=$(helm template test-redis "${CHART_DIR}" -f "${SCRIPT_DIR}/values-minimal.yaml" 2>&1)
 
 assert_contains "minimal: statefulset has replicas: 1" "${minimal}" "replicas: 1"

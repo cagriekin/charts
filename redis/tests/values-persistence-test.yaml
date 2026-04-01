@@ -1,0 +1,37 @@
+redis:
+  image:
+    repository: redis
+    tag: "8.6.2-trixie"
+    pullPolicy: IfNotPresent
+  persistence:
+    enabled: true
+    size: 1Gi
+  podSecurityContext:
+    fsGroup: 999
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    runAsUser: 999
+    runAsGroup: 999
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+  auth:
+    enabled: false
+    existingSecret:
+      name: ""
+      key: redis-password
+  config:
+    maxmemory: "200mb"
+    maxmemory-policy: "allkeys-lru"
+    appendfsync: "everysec"
+    no-appendfsync-on-rewrite: "yes"
+    auto-aof-rewrite-percentage: "100"
+    auto-aof-rewrite-min-size: "64mb"
+    rdbSnapshots: []
+  terminationGracePeriodSeconds: 300
+
+exporter:
+  enabled: false
