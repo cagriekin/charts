@@ -284,6 +284,30 @@ assert_contains "repmgr: custom terminationGracePeriodSeconds" "${repmgr_custom_
 assert_not_contains "minimal: no preStop hook" "${minimal}" "preStop:"
 assert_not_contains "minimal: no terminationGracePeriodSeconds" "${minimal}" "terminationGracePeriodSeconds"
 
+# --- Backup CronJob Tests ---
+
+# Test: backup cronjob renders with activeDeadlineSeconds and backoffLimit
+backup_cronjob=$(helm template test-pg "${CHART_DIR}" \
+  --set backup.enabled=true \
+  --set backup.s3.endpoint=https://s3.test \
+  --set backup.s3.bucket=test \
+  --set backup.existingSecret.name=test-secret \
+  --show-only templates/backup-cronjob.yaml 2>&1)
+assert_contains "backup: activeDeadlineSeconds present" "${backup_cronjob}" "activeDeadlineSeconds: 3600"
+assert_contains "backup: backoffLimit present" "${backup_cronjob}" "backoffLimit: 1"
+
+# Test: backup cronjob respects custom activeDeadlineSeconds
+backup_custom=$(helm template test-pg "${CHART_DIR}" \
+  --set backup.enabled=true \
+  --set backup.s3.endpoint=https://s3.test \
+  --set backup.s3.bucket=test \
+  --set backup.existingSecret.name=test-secret \
+  --set backup.activeDeadlineSeconds=7200 \
+  --set backup.backoffLimit=3 \
+  --show-only templates/backup-cronjob.yaml 2>&1)
+assert_contains "backup: custom activeDeadlineSeconds" "${backup_custom}" "activeDeadlineSeconds: 7200"
+assert_contains "backup: custom backoffLimit" "${backup_custom}" "backoffLimit: 3"
+
 # --- pgBackRest Tests ---
 
 # Test: helm lint with pgbackrest values

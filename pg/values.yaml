@@ -239,6 +239,8 @@ backup:
     name: ""
     accessKeyIdKey: access-key-id
     secretAccessKeyKey: secret-access-key
+  activeDeadlineSeconds: 3600
+  backoffLimit: 1
   retentionDays: 7
   resources:
     requests:
