@@ -108,5 +108,22 @@ pdb_output=$(helm template test-redis "${CHART_DIR}" \
 assert_contains "pdb: renders when enabled" "${pdb_output}" "kind: PodDisruptionBudget"
 assert_contains "pdb: minAvailable 1" "${pdb_output}" "minAvailable: 1"
 
+# --- NetworkPolicy Tests ---
+assert_not_contains "default: no NetworkPolicy" "${minimal}" "kind: NetworkPolicy"
+
+netpol=$(helm template test-redis "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set networkPolicy.enabled=true \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "netpol: renders when enabled" "${netpol}" "kind: NetworkPolicy"
+assert_contains "netpol: redis port 6379" "${netpol}" "port: 6379"
+assert_contains "netpol: exporter port 9121" "${netpol}" "port: 9121"
+
+netpol_no_exporter=$(helm template test-redis "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-minimal.yaml" \
+  --set networkPolicy.enabled=true \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_not_contains "netpol minimal: no exporter policy" "${netpol_no_exporter}" "redis-exporter"
+
 end_suite
 print_summary

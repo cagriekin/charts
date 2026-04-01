@@ -83,6 +83,14 @@ helm install my-redis ./redis \
 | `service.type` | Service type | `ClusterIP` |
 | `service.port` | Service port | `6379` |
 
+### NetworkPolicy Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `networkPolicy.enabled` | Enable NetworkPolicy resources | `false` |
+| `networkPolicy.allowExternal` | Allow ingress from any pod in namespace | `true` |
+| `networkPolicy.extraIngress` | Additional ingress rules | `[]` |
+
 ### Global Parameters
 
 | Parameter | Description | Default |
