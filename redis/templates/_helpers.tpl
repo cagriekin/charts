@@ -36,6 +36,13 @@ containers:
     env:
       - name: REDIS_ADDR
         value: "redis://{{ include "redis.fullname" . }}:{{ .Values.service.port }}"
+{{- if .Values.redis.auth.enabled }}
+      - name: REDIS_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: {{ .Values.redis.auth.existingSecret.name }}
+            key: {{ .Values.redis.auth.existingSecret.key }}
+{{- end }}
     ports:
       - name: metrics
         containerPort: 9121
