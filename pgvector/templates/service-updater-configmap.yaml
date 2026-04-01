@@ -124,6 +124,7 @@ data:
     MAX_PGPOOL_FAILURES=3
 
     while true; do
+        date +%s > /tmp/service-updater-alive
         CURRENT_MASTER=$(get_current_master)
 
         if [ -n "$CURRENT_MASTER" ] && [ "$CURRENT_MASTER" != "$LAST_MASTER" ]; then
