@@ -36,6 +36,11 @@ helm install my-redis ./redis \
 | `redis.persistence.size` | Storage size | `1Gi` |
 | `redis.config.maxmemory` | Max memory | `200mb` |
 | `redis.config.maxmemory-policy` | Eviction policy | `allkeys-lru` |
+| `redis.config.appendfsync` | AOF sync mode (`always`, `everysec`, `no`) | `everysec` |
+| `redis.config.no-appendfsync-on-rewrite` | Skip fsync during AOF rewrite | `yes` |
+| `redis.config.auto-aof-rewrite-percentage` | Trigger AOF rewrite at this growth percentage | `100` |
+| `redis.config.auto-aof-rewrite-min-size` | Minimum AOF size before rewrite triggers | `64mb` |
+| `redis.config.rdbSnapshots` | Optional RDB snapshot schedule (list of {seconds, changes}) | `[]` |
 | `redis.resources.requests.cpu` | CPU request | `50m` |
 | `redis.resources.requests.memory` | Memory request | `64Mi` |
 | `redis.resources.limits.cpu` | CPU limit | `200m` |
