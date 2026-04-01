@@ -159,6 +159,8 @@ pgpool:
       type: RuntimeDefault
 
   containerSecurityContext:
+    runAsUser: 999
+    runAsGroup: 999
     allowPrivilegeEscalation: false
     capabilities:
       drop:
@@ -232,6 +234,8 @@ prometheusExporter:
       type: RuntimeDefault
 
   containerSecurityContext:
+    runAsUser: 65534
+    runAsGroup: 65534
     allowPrivilegeEscalation: false
     capabilities:
       drop:
