@@ -1,7 +1,7 @@
 redis:
   image:
     repository: redis
-    tag: "8-trixie"
+    tag: "8.6.2-trixie"
     pullPolicy: IfNotPresent
   persistence:
     enabled: false
