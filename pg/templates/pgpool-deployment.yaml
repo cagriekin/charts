@@ -51,9 +51,7 @@ spec:
               topologyKey: kubernetes.io/hostname
         {{- end }}
       securityContext:
-        runAsNonRoot: true
-        seccompProfile:
-          type: RuntimeDefault
+        {{- toYaml .Values.pgpool.podSecurityContext | nindent 8 }}
       initContainers:
         - name: init-config
           image: busybox:1.35
@@ -96,10 +94,7 @@ spec:
           image: "{{ .Values.pgpool.image.repository }}:{{ .Values.pgpool.image.tag }}"
           imagePullPolicy: {{ .Values.pgpool.image.pullPolicy }}
           securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
+            {{- toYaml .Values.pgpool.containerSecurityContext | nindent 12 }}
           command:
             - pgpool
             - -D
@@ -141,10 +136,7 @@ spec:
           image: "{{ .Values.pgpool.metrics.image.repository }}:{{ .Values.pgpool.metrics.image.tag }}"
           imagePullPolicy: {{ .Values.pgpool.metrics.image.pullPolicy }}
           securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
+            {{- toYaml .Values.pgpool.containerSecurityContext | nindent 12 }}
           env:
             - name: POSTGRES_USERNAME
               valueFrom:

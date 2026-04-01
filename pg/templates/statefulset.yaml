@@ -71,6 +71,8 @@ spec:
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
           command: ['sh', '-c', 'cp /usr/lib/postgresql/18/lib/*.so /ext-lib/ && cp /usr/share/postgresql/18/extension/* /ext-share/']
+          securityContext:
+            {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           volumeMounts:
             - name: ext-lib
               mountPath: /ext-lib
@@ -82,6 +84,8 @@ spec:
           image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
           command: ['sh', '-c', 'cp /usr/lib/postgresql/18/lib/*.so /ext-lib/ && cp /usr/share/postgresql/18/extension/* /ext-share/']
+          securityContext:
+            {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           volumeMounts:
             - name: ext-lib
               mountPath: /ext-lib
@@ -93,6 +97,8 @@ spec:
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
           command: ["/usr/local/bin/entrypoint.sh", "init"]
+          securityContext:
+            {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
@@ -131,6 +137,8 @@ spec:
 {{- if .Values.postgresql.configuration }}
         - name: setup-config
           image: busybox:1.37
+          securityContext:
+            {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           command:
             - sh
             - -c

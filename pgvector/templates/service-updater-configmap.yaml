@@ -155,13 +155,24 @@ data:
             done
 
             echo "Fencing: keeping ${best_node} as primary (LSN: ${best_lsn})"
+            local stale_pod=""
             for node in ${primaries}; do
                 if [ "$node" != "$best_node" ]; then
-                    echo "Fencing: shutting down stale primary ${node}"
+                    echo "Fencing: terminating backends on stale primary ${node}"
                     PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
                         -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid();" 2>/dev/null || true
+                    stale_pod=$(echo "${node}" | cut -d'.' -f1)
                 fi
             done
+
+            best_pod=$(echo "${best_node}" | cut -d'.' -f1)
+            echo "Fencing: updating service selector to ${best_pod}"
+            update_service_selector "${best_pod}"
+
+            if [ -n "${stale_pod}" ]; then
+                echo "Fencing: deleting stale primary pod ${stale_pod} to force rejoin as standby"
+                kubectl delete pod "${stale_pod}" -n "${NAMESPACE}" --grace-period=30 2>/dev/null || true
+            fi
         fi
     }
 
@@ -189,6 +200,7 @@ data:
                 echo "WARNING: Could not determine master (failed $CONSECUTIVE_FAILURES times)"
                 CONSECUTIVE_FAILURES=0
             fi
+            detect_split_brain
         else
             CONSECUTIVE_FAILURES=0
             check_pgpool_health
