@@ -2,7 +2,7 @@ apiVersion: v2
 name: redis
 description: Single-instance Redis with AOF persistence
 type: application
-version: 0.3.3
+version: 0.3.4
 appVersion: "8"
 dependencies:
   - name: common

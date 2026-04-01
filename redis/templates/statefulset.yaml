@@ -33,9 +33,22 @@ spec:
           imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.redis.containerSecurityContext | nindent 12 }}
+{{- if .Values.redis.auth.enabled }}
+          command:
+            - sh
+            - -c
+            - redis-server /etc/redis/redis.conf --requirepass "$REDIS_PASSWORD"
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "redis.auth.existingSecret.name is required when auth is enabled" .Values.redis.auth.existingSecret.name }}
+                  key: {{ .Values.redis.auth.existingSecret.key }}
+{{- else }}
           command:
             - redis-server
             - /etc/redis/redis.conf
+{{- end }}
           ports:
             - name: redis
               containerPort: 6379
@@ -43,8 +56,9 @@ spec:
           livenessProbe:
             exec:
               command:
-                - redis-cli
-                - ping
+                - sh
+                - -c
+                - redis-cli {{ if .Values.redis.auth.enabled }}-a "$REDIS_PASSWORD" {{ end }}ping
             initialDelaySeconds: {{ .Values.redis.livenessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.redis.livenessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.redis.livenessProbe.timeoutSeconds }}
@@ -52,8 +66,9 @@ spec:
           readinessProbe:
             exec:
               command:
-                - redis-cli
-                - ping
+                - sh
+                - -c
+                - redis-cli {{ if .Values.redis.auth.enabled }}-a "$REDIS_PASSWORD" {{ end }}ping
             initialDelaySeconds: {{ .Values.redis.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.redis.readinessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.redis.readinessProbe.timeoutSeconds }}
@@ -62,9 +77,9 @@ spec:
             preStop:
               exec:
                 command:
-                  - redis-cli
-                  - SHUTDOWN
-                  - SAVE
+                  - sh
+                  - -c
+                  - redis-cli {{ if .Values.redis.auth.enabled }}-a "$REDIS_PASSWORD" {{ end }}SHUTDOWN SAVE
           resources:
             {{- toYaml .Values.redis.resources | nindent 12 }}
           volumeMounts:

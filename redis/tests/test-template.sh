@@ -73,5 +73,31 @@ rdb_output=$(helm template test-redis "${CHART_DIR}" \
 assert_contains "rdb: save renders with snapshots" "${rdb_output}" "save 3600 1"
 assert_not_contains "rdb: save empty not present with snapshots" "${rdb_output}" 'save ""'
 
+# --- AUTH Tests ---
+
+# Test: auth disabled by default
+assert_not_contains "default: no REDIS_PASSWORD env" "${minimal}" "REDIS_PASSWORD"
+assert_not_contains "default: no requirepass" "${minimal}" "requirepass"
+
+# Test: auth enabled renders correctly
+auth_output=$(helm template test-redis "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-minimal.yaml" \
+  --set redis.auth.enabled=true \
+  --set redis.auth.existingSecret.name=my-secret \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "auth: REDIS_PASSWORD env present" "${auth_output}" "REDIS_PASSWORD"
+assert_contains "auth: secretKeyRef present" "${auth_output}" "secretKeyRef"
+assert_contains "auth: secret name present" "${auth_output}" "my-secret"
+assert_contains "auth: requirepass in command" "${auth_output}" "requirepass"
+assert_contains "auth: probe uses password" "${auth_output}" 'REDIS_PASSWORD.*ping'
+
+# Test: exporter with auth has REDIS_PASSWORD
+auth_exporter=$(helm template test-redis "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set redis.auth.enabled=true \
+  --set redis.auth.existingSecret.name=my-secret \
+  2>&1)
+assert_contains "auth exporter: REDIS_PASSWORD in exporter" "${auth_exporter}" "REDIS_PASSWORD"
+
 end_suite
 print_summary

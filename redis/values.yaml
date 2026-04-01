@@ -31,6 +31,12 @@ redis:
       drop:
         - ALL
 
+  auth:
+    enabled: false
+    existingSecret:
+      name: ""
+      key: redis-password
+
   config:
     maxmemory: "200mb"
     maxmemory-policy: "allkeys-lru"

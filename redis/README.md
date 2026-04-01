@@ -16,6 +16,17 @@ helm install my-redis ./redis \
   --set redis.config.maxmemory-policy="volatile-lru"
 ```
 
+### With Authentication
+
+```bash
+kubectl create secret generic redis-auth \
+  --from-literal=redis-password=mysecretpassword
+
+helm install my-redis ./redis \
+  --set redis.auth.enabled=true \
+  --set redis.auth.existingSecret.name=redis-auth
+```
+
 ### Without Exporter
 
 ```bash
@@ -34,6 +45,9 @@ helm install my-redis ./redis \
 | `redis.persistence.enabled` | Enable persistence | `true` |
 | `redis.persistence.storageClass` | Storage class | `""` |
 | `redis.persistence.size` | Storage size | `1Gi` |
+| `redis.auth.enabled` | Enable Redis authentication | `false` |
+| `redis.auth.existingSecret.name` | Secret containing Redis password | `""` |
+| `redis.auth.existingSecret.key` | Key in secret for password | `redis-password` |
 | `redis.config.maxmemory` | Max memory | `200mb` |
 | `redis.config.maxmemory-policy` | Eviction policy | `allkeys-lru` |
 | `redis.config.appendfsync` | AOF sync mode (`always`, `everysec`, `no`) | `everysec` |
