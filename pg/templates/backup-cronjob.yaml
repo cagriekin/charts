@@ -20,10 +20,19 @@ spec:
             app.kubernetes.io/component: backup
         spec:
           restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
           containers:
             - name: backup
               image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
               imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
               command: ["/bin/bash", "/scripts/backup.sh"]
               env:
                 - name: POSTGRES_HOST

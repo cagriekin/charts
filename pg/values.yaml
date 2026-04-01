@@ -67,6 +67,20 @@ postgresql:
     # shared_buffers: "1GB"
     # work_mem: "32MB"
 
+  podSecurityContext:
+    fsGroup: 103
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+  containerSecurityContext:
+    runAsUser: 101
+    runAsGroup: 103
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
   pgHba: []
     # - "host all all 10.0.0.0/8 md5"
     # - "host replication repmgr 10.0.0.0/8 trust"

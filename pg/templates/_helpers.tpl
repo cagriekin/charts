@@ -103,6 +103,10 @@ preStop:
 {{- end }}
 
 {{- define "pg.exporterPodSpec" -}}
+securityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
 initContainers:
   - name: init-config
     image: busybox:1.35
@@ -133,6 +137,11 @@ containers:
   - name: postgres-exporter
     image: "{{ .Values.prometheusExporter.image.repository }}:{{ .Values.prometheusExporter.image.tag }}"
     imagePullPolicy: {{ .Values.prometheusExporter.image.pullPolicy }}
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+          - ALL
     args:
       - --config.file=/etc/postgres_exporter/postgres_exporter.yml
       - --web.listen-address=:9116

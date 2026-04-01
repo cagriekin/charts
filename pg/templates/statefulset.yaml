@@ -39,7 +39,7 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.repmgr.terminationGracePeriodSeconds | default 120 }}
       {{- end }}
       securityContext:
-        fsGroup: 103
+        {{- toYaml .Values.postgresql.podSecurityContext | nindent 8 }}
       {{- if .Values.repmgr.enabled }}
       shareProcessNamespace: true
       serviceAccountName: {{ include "pg.fullname" . }}-repmgr
@@ -62,6 +62,7 @@ spec:
           command: ['sh', '-c', 'chown -R 101:103 /var/lib/postgresql/data && if [ -d /var/lib/postgresql/data/pgdata ]; then chmod 0700 /var/lib/postgresql/data/pgdata; fi']
           securityContext:
             runAsUser: 0
+            allowPrivilegeEscalation: false
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
@@ -285,6 +286,8 @@ spec:
                     done
 {{- end }}
 {{- end }}
+          securityContext:
+            {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           resources:
             {{- toYaml .Values.postgresql.resources | nindent 12 }}
           volumeMounts:
@@ -316,6 +319,8 @@ spec:
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
           command: ["/usr/local/bin/entrypoint.sh", "repmgrd"]
+          securityContext:
+            {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
@@ -349,6 +354,8 @@ spec:
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
           command: ["/bin/bash", "/scripts/service-updater.sh"]
+          securityContext:
+            {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
             - name: NAMESPACE
               valueFrom:
@@ -419,6 +426,8 @@ spec:
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
           command: ["/bin/bash", "/scripts/pgbackrest-scheduler.sh"]
+          securityContext:
+            {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
             - name: PGBACKREST_STANZA
               value: {{ .Values.pgbackrest.stanza }}

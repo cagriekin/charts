@@ -148,6 +148,28 @@ no_annotations=$(helm template test-pg "${CHART_DIR}" \
 
 assert_not_contains "pgpool no-annotations: no annotations block" "${no_annotations}" "annotations:"
 
+# --- SecurityContext Tests ---
+
+# Test: statefulset pod securityContext
+assert_contains "repmgr: pod has runAsNonRoot" "${repmgr}" "runAsNonRoot: true"
+assert_contains "repmgr: pod has fsGroup" "${repmgr}" "fsGroup: 103"
+assert_contains "repmgr: pod has seccompProfile" "${repmgr}" "type: RuntimeDefault"
+
+# Test: postgresql container securityContext
+assert_contains "repmgr: postgresql has allowPrivilegeEscalation false" "${repmgr}" "allowPrivilegeEscalation: false"
+assert_contains "repmgr: postgresql drops ALL capabilities" "${repmgr}" "drop:"
+
+# Test: fix-permissions init container keeps runAsUser 0 but has allowPrivilegeEscalation false
+fix_perms=$(echo "${repmgr}" | sed -n '/name: fix-permissions/,/name: repmgr-init\|name: copy-base-ext\|name: copy-ext\|name: setup-config\|containers:/p')
+assert_contains "fix-permissions: runs as root" "${fix_perms}" "runAsUser: 0"
+assert_contains "fix-permissions: has allowPrivilegeEscalation false" "${fix_perms}" "allowPrivilegeEscalation: false"
+
+# Test: pgpool deployment has pod securityContext
+assert_contains "full: pgpool has runAsNonRoot" "${full}" "runAsNonRoot: true"
+
+# Test: pgpool container has securityContext
+assert_contains "full: pgpool has allowPrivilegeEscalation false" "${full}" "allowPrivilegeEscalation: false"
+
 # --- PostgreSQL Configuration Tests ---
 
 # Test: helm lint with config values (standalone)
@@ -280,17 +302,19 @@ repmgr_custom_tgp=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "repmgr: custom terminationGracePeriodSeconds" "${repmgr_custom_tgp}" "terminationGracePeriodSeconds: 300"
 
-# Test: repmgrd sidecar has preStop hook
+# Test: repmgrd sidecar has preStop hook and securityContext
 repmgrd_section=$(echo "${repmgr_no_addcmd}" | sed -n '/name: repmgrd/,/name: service-updater/p')
 assert_contains "repmgr: repmgrd has preStop hook" "${repmgrd_section}" "preStop:"
 assert_contains "repmgr: repmgrd preStop runs daemon stop" "${repmgrd_section}" "repmgr daemon stop"
+assert_contains "repmgr: repmgrd has allowPrivilegeEscalation false" "${repmgrd_section}" "allowPrivilegeEscalation: false"
 
-# Test: service-updater sidecar has preStop hook and liveness probe
+# Test: service-updater sidecar has preStop hook, liveness probe, and securityContext
 service_updater_section=$(echo "${repmgr_no_addcmd}" | sed -n '/name: service-updater/,/^      volumes:/p')
 assert_contains "repmgr: service-updater has preStop hook" "${service_updater_section}" "preStop:"
 assert_contains "repmgr: service-updater preStop sleeps" "${service_updater_section}" "sleep 5"
 assert_contains "repmgr: service-updater has livenessProbe" "${service_updater_section}" "livenessProbe:"
 assert_contains "repmgr: service-updater liveness checks heartbeat file" "${service_updater_section}" "service-updater-alive"
+assert_contains "repmgr: service-updater has allowPrivilegeEscalation false" "${service_updater_section}" "allowPrivilegeEscalation: false"
 
 # Test: service-updater configmap writes heartbeat file
 assert_contains "repmgr: service-updater script writes heartbeat" "${repmgr_no_addcmd}" "service-updater-alive"
@@ -310,6 +334,8 @@ backup_cronjob=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/backup-cronjob.yaml 2>&1)
 assert_contains "backup: activeDeadlineSeconds present" "${backup_cronjob}" "activeDeadlineSeconds: 3600"
 assert_contains "backup: backoffLimit present" "${backup_cronjob}" "backoffLimit: 1"
+assert_contains "backup: pod has runAsNonRoot" "${backup_cronjob}" "runAsNonRoot: true"
+assert_contains "backup: container has allowPrivilegeEscalation false" "${backup_cronjob}" "allowPrivilegeEscalation: false"
 
 # Test: backup cronjob respects custom activeDeadlineSeconds
 backup_custom=$(helm template test-pg "${CHART_DIR}" \

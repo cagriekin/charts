@@ -50,6 +50,10 @@ spec:
                   app.kubernetes.io/component: pgpool
               topologyKey: kubernetes.io/hostname
         {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       initContainers:
         - name: init-config
           image: busybox:1.35
@@ -91,6 +95,11 @@ spec:
         - name: pgpool
           image: "{{ .Values.pgpool.image.repository }}:{{ .Values.pgpool.image.tag }}"
           imagePullPolicy: {{ .Values.pgpool.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           command:
             - pgpool
             - -D
@@ -131,6 +140,11 @@ spec:
         - name: pgpool-exporter
           image: "{{ .Values.pgpool.metrics.image.repository }}:{{ .Values.pgpool.metrics.image.tag }}"
           imagePullPolicy: {{ .Values.pgpool.metrics.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           env:
             - name: POSTGRES_USERNAME
               valueFrom:
