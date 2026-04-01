@@ -117,6 +117,54 @@ data:
         fi
     }
 
+    detect_split_brain() {
+        local primaries=""
+        local primary_count=0
+
+        for i in $(seq 0 {{ .Values.postgresql.replicaCount }}); do
+            node="${BASE_NAME}-${i}.${HEADLESS_SERVICE}"
+            in_recovery=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
+                -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | xargs)
+
+            if [ "$in_recovery" = "f" ]; then
+                primary_count=$((primary_count + 1))
+                primaries="${primaries} ${node}"
+            fi
+        done
+
+        if [ $primary_count -le 1 ]; then
+            return 0
+        fi
+
+        echo "CRITICAL: Split-brain detected! ${primary_count} primaries found:${primaries}"
+
+        local split_brain_action="${SPLIT_BRAIN_ACTION:-log}"
+
+        if [ "$split_brain_action" = "fence" ]; then
+            local best_node=""
+            local best_lsn=""
+
+            for node in ${primaries}; do
+                lsn=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
+                    -t -c "SELECT pg_current_wal_lsn();" 2>/dev/null | xargs)
+                echo "  Node ${node} LSN: ${lsn}"
+                if [ -z "$best_lsn" ] || [[ "$lsn" > "$best_lsn" ]]; then
+                    best_lsn="$lsn"
+                    best_node="$node"
+                fi
+            done
+
+            echo "Fencing: keeping ${best_node} as primary (LSN: ${best_lsn})"
+            for node in ${primaries}; do
+                if [ "$node" != "$best_node" ]; then
+                    echo "Fencing: shutting down stale primary ${node}"
+                    PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
+                        -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid();" 2>/dev/null || true
+                fi
+            done
+        fi
+    }
+
     LAST_MASTER=""
     CONSECUTIVE_FAILURES=0
     MAX_CONSECUTIVE_FAILURES=5
@@ -144,6 +192,7 @@ data:
         else
             CONSECUTIVE_FAILURES=0
             check_pgpool_health
+            detect_split_brain
         fi
 
         sleep ${MONITORING_INTERVAL}

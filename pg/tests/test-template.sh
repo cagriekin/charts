@@ -346,6 +346,15 @@ assert_contains "repmgr: service-updater has allowPrivilegeEscalation false" "${
 # Test: service-updater configmap writes heartbeat file
 assert_contains "repmgr: service-updater script writes heartbeat" "${repmgr_no_addcmd}" "service-updater-alive"
 
+# Test: split-brain detection present in service-updater configmap
+assert_contains "repmgr: split-brain detection in service-updater" "${repmgr}" "detect_split_brain"
+
+# Test: SPLIT_BRAIN_ACTION env var in statefulset
+assert_contains "repmgr: SPLIT_BRAIN_ACTION env var in statefulset" "${repmgr_no_addcmd}" "SPLIT_BRAIN_ACTION"
+
+# Test: split-brain detection not present when repmgr disabled
+assert_not_contains "minimal: no split-brain detection" "${minimal}" "detect_split_brain"
+
 # Test: repmgr disabled does not render preStop or terminationGracePeriodSeconds
 assert_not_contains "minimal: no preStop hook" "${minimal}" "preStop:"
 assert_not_contains "minimal: no terminationGracePeriodSeconds" "${minimal}" "terminationGracePeriodSeconds"

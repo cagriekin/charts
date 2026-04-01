@@ -166,6 +166,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 | `repmgr.resources.requests.memory` | Memory request | `128Mi` |
 | `repmgr.resources.limits.cpu` | CPU limit | `500m` |
 | `repmgr.resources.limits.memory` | Memory limit | `512Mi` |
+| `repmgr.splitBrainDetection.action` | Action on split-brain: `log` (alert only) or `fence` (terminate stale primary) | `log` |
 | `repmgr.serviceUpdater.resources.requests.cpu` | Service-updater CPU request | `50m` |
 | `repmgr.serviceUpdater.resources.requests.memory` | Service-updater memory request | `64Mi` |
 | `repmgr.serviceUpdater.resources.limits.memory` | Service-updater memory limit | `128Mi` |
@@ -175,7 +176,9 @@ When repmgr is enabled, a preStop lifecycle hook performs graceful failover befo
 When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 
 - **repmgrd**: monitors replication and triggers automatic failover when the primary becomes unavailable. Has a preStop hook that runs `repmgr daemon stop` for clean deregistration.
-- **service-updater**: watches repmgr cluster state and patches the Kubernetes Service selector to point to the current primary, then restarts PGPool-II if enabled. Has a preStop hook that sleeps 5s to allow in-flight patches to complete. Includes a liveness probe that checks for a heartbeat file updated each loop iteration (fails if no update within 120s).
+- **service-updater**: watches repmgr cluster state and patches the Kubernetes Service selector to point to the current primary, then restarts PGPool-II if enabled. Has a preStop hook that sleeps 5s to allow in-flight patches to complete. Includes a liveness probe that checks for a heartbeat file updated each loop iteration (fails if no update within 120s). Performs split-brain detection each cycle by querying all nodes for `pg_is_in_recovery()` -- if multiple primaries are found, takes the configured action (`log` or `fence`).
+
+**Split-brain detection**: In a 2-node cluster, network partitions can cause both nodes to believe they are the primary. The service-updater detects this by checking all nodes each monitoring cycle. With `action: log` (default), it logs a critical warning. With `action: fence`, it compares WAL LSN positions and terminates connections on the stale primary. For production deployments, use 3+ nodes to reduce split-brain risk.
 
 ### PGPool-II Parameters
 

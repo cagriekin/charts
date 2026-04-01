@@ -374,6 +374,8 @@ spec:
                   key: {{ include "pg.secretRepmgrPasswordKey" . }}
             - name: REPMGR_DB
               value: {{ .Values.repmgr.database }}
+            - name: SPLIT_BRAIN_ACTION
+              value: {{ .Values.repmgr.splitBrainDetection.action }}
 {{- if .Values.pgpool.enabled }}
             - name: PGPOOL_DEPLOYMENT
               value: {{ include "pg.fullname" . }}-pgpool
