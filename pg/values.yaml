@@ -295,5 +295,13 @@ pgbackrest:
       cpu: 1000m
       memory: 1Gi
 
+networkPolicy:
+  enabled: false
+  postgresql:
+    allowExternal: true
+    extraIngress: []
+  pgpool:
+    extraIngress: []
+
 global:
   annotations: {}

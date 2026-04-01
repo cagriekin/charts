@@ -170,6 +170,33 @@ assert_contains "full: pgpool has runAsNonRoot" "${full}" "runAsNonRoot: true"
 # Test: pgpool container has securityContext
 assert_contains "full: pgpool has allowPrivilegeEscalation false" "${full}" "allowPrivilegeEscalation: false"
 
+# --- NetworkPolicy Tests ---
+
+# Test: NetworkPolicy not rendered by default
+assert_not_contains "default: no NetworkPolicy" "${repmgr}" "kind: NetworkPolicy"
+
+# Test: NetworkPolicy renders when enabled
+netpol=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set networkPolicy.enabled=true \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "netpol: postgresql policy rendered" "${netpol}" "test-pg-postgresql"
+assert_contains "netpol: has NetworkPolicy kind" "${netpol}" "kind: NetworkPolicy"
+assert_contains "netpol: postgresql allows port 5432" "${netpol}" "port: 5432"
+assert_contains "netpol: pgpool policy rendered" "${netpol}" "test-pg-pgpool"
+assert_contains "netpol: pgpool allows port 9999" "${netpol}" "port: 9999"
+assert_contains "netpol: exporter policy rendered" "${netpol}" "test-pg-prometheus-exporter"
+assert_contains "netpol: exporter allows port 9116" "${netpol}" "port: 9116"
+
+# Test: NetworkPolicy without pgpool/exporter only renders postgresql policy
+netpol_minimal=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set networkPolicy.enabled=true \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "netpol minimal: postgresql policy rendered" "${netpol_minimal}" "test-pg-postgresql"
+assert_not_contains "netpol minimal: no pgpool policy" "${netpol_minimal}" "test-pg-pgpool"
+assert_not_contains "netpol minimal: no exporter policy" "${netpol_minimal}" "test-pg-prometheus-exporter"
+
 # --- PostgreSQL Configuration Tests ---
 
 # Test: helm lint with config values (standalone)

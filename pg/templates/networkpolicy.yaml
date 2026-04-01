@@ -1,0 +1,146 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pg.fullname" . }}-postgresql
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pg.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgresql
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: 5432
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: postgresql
+{{- if .Values.pgpool.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: pgpool
+{{- end }}
+{{- if .Values.prometheusExporter.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: prometheus-exporter
+{{- end }}
+{{- if .Values.backup.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: backup
+{{- end }}
+{{- if .Values.networkPolicy.postgresql.allowExternal }}
+        - podSelector: {}
+{{- end }}
+{{- with .Values.networkPolicy.postgresql.extraIngress }}
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - ports:
+        - port: 5432
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: postgresql
+    - ports:
+        - port: 443
+          protocol: TCP
+---
+{{- if .Values.pgpool.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pg.fullname" . }}-pgpool
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgpool
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pg.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: pgpool
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: 9999
+          protocol: TCP
+      from:
+        - podSelector: {}
+{{- with .Values.networkPolicy.pgpool.extraIngress }}
+        {{- toYaml . | nindent 8 }}
+{{- end }}
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - ports:
+        - port: 5432
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: postgresql
+{{- end }}
+---
+{{- if .Values.prometheusExporter.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pg.fullname" . }}-prometheus-exporter
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: prometheus-exporter
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pg.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: prometheus-exporter
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: 9116
+          protocol: TCP
+      from:
+        - podSelector: {}
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - ports:
+        - port: 5432
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: postgresql
+{{- end }}
+{{- end }}

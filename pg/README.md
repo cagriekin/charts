@@ -270,6 +270,20 @@ When `postgresql.existingSecret.enabled` is `false`, a secret will be auto-gener
 |-----------|-------------|---------|
 | `global.annotations` | Global annotations applied to all resources | `{}` |
 
+### NetworkPolicy Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `networkPolicy.enabled` | Enable NetworkPolicy resources for pod isolation | `false` |
+| `networkPolicy.postgresql.allowExternal` | Allow ingress to PostgreSQL from any pod in the namespace | `true` |
+| `networkPolicy.postgresql.extraIngress` | Additional ingress rules for PostgreSQL | `[]` |
+| `networkPolicy.pgpool.extraIngress` | Additional ingress rules for PGPool-II | `[]` |
+
+When enabled, NetworkPolicies restrict traffic:
+- **PostgreSQL**: ingress on 5432 from peer pods, PGPool, Prometheus exporter, backup jobs, and optionally all namespace pods. Egress allows DNS, peer replication, and HTTPS (for S3/pgBackRest).
+- **PGPool**: ingress on 9999 from namespace pods. Egress only to PostgreSQL on 5432.
+- **Prometheus exporter**: ingress on 9116 from namespace pods. Egress only to PostgreSQL on 5432.
+
 ## Connecting to PostgreSQL
 
 ### Direct Connection to Primary
