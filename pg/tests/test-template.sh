@@ -432,6 +432,9 @@ assert_contains "pgbackrest+repmgr: scheduler present" "${pgbackrest_sts}" "name
 assert_contains "pgbackrest+repmgr: repmgrd present" "${pgbackrest_sts}" "name: repmgrd"
 assert_contains "pgbackrest+repmgr: service-updater present" "${pgbackrest_sts}" "name: service-updater"
 
+# pgBackRest: verify step after backup
+assert_contains "pgbackrest: verify step in run script" "${pgbackrest}" "pgbackrest.*verify"
+
 # pgBackRest: not rendered when disabled (default)
 pgbackrest_disabled=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" 2>&1)
 assert_not_contains "pgbackrest disabled: no configmap" "${pgbackrest_disabled}" "pgbackrest"
