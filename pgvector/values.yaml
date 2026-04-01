@@ -154,6 +154,17 @@ pgpool:
     maxRetries: 10
     retryDelay: 3
 
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
   failOverOnBackendError: false
   autoFailback: true
   allowClearTextFrontendAuth: false
@@ -215,6 +226,17 @@ pgpool:
 
 prometheusExporter:
   enabled: false
+
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
 
   image:
     repository: quay.io/prometheuscommunity/postgres-exporter

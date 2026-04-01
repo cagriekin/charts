@@ -104,9 +104,7 @@ preStop:
 
 {{- define "pg.exporterPodSpec" -}}
 securityContext:
-  runAsNonRoot: true
-  seccompProfile:
-    type: RuntimeDefault
+  {{- toYaml .Values.prometheusExporter.podSecurityContext | nindent 2 }}
 initContainers:
   - name: init-config
     image: busybox:1.35
@@ -138,10 +136,7 @@ containers:
     image: "{{ .Values.prometheusExporter.image.repository }}:{{ .Values.prometheusExporter.image.tag }}"
     imagePullPolicy: {{ .Values.prometheusExporter.image.pullPolicy }}
     securityContext:
-      allowPrivilegeEscalation: false
-      capabilities:
-        drop:
-          - ALL
+      {{- toYaml .Values.prometheusExporter.containerSecurityContext | nindent 6 }}
     args:
       - --config.file=/etc/postgres_exporter/postgres_exporter.yml
       - --web.listen-address=:9116
