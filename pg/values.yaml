@@ -138,6 +138,7 @@ pgpool:
 
   failOverOnBackendError: false
   autoFailback: true
+  allowClearTextFrontendAuth: false
 
   logging:
     logConnections: true
