@@ -359,6 +359,10 @@ assert_not_contains "minimal: no split-brain detection" "${minimal}" "detect_spl
 assert_not_contains "minimal: no preStop hook" "${minimal}" "preStop:"
 assert_not_contains "minimal: no terminationGracePeriodSeconds" "${minimal}" "terminationGracePeriodSeconds"
 
+# Test: helm lint with backup test values
+lint_output=$(helm lint "${CHART_DIR}" -f "${SCRIPT_DIR}/values-backup-test.yaml" 2>&1) && lint_rc=0 || lint_rc=$?
+assert_eq "helm lint with backup test values passes" "0" "${lint_rc}"
+
 # --- Backup CronJob Tests ---
 
 # Test: backup cronjob renders with activeDeadlineSeconds and backoffLimit
