@@ -13,6 +13,10 @@ begin_suite "Repmgr Install (primary + 1 replica with repmgr)"
 
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
+helm uninstall "${RELEASE}" -n "${NAMESPACE}" 2>/dev/null || true
+kubectl delete pvc -n "${NAMESPACE}" --all --wait=false 2>/dev/null || true
+sleep 3
+
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
   -n "${NAMESPACE}" \
   -f "${SCRIPT_DIR}/values-repmgr.yaml" \
