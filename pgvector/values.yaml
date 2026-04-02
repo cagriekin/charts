@@ -130,7 +130,7 @@ pgpool:
 
   image:
     repository: cagriekin/pgpool
-    tag: 4.7.0
+    tag: 4.7.1
     pullPolicy: IfNotPresent
 
   replicaCount: 1
