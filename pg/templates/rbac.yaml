@@ -15,10 +15,12 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["services"]
+    resourceNames: ["{{ include "pg.fullname" . }}"]
     verbs: ["get", "patch"]
 {{- if .Values.pgpool.enabled }}
   - apiGroups: ["apps"]
     resources: ["deployments"]
+    resourceNames: ["{{ include "pg.fullname" . }}-pgpool"]
     verbs: ["get", "patch"]
 {{- end }}
 ---
