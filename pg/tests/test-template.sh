@@ -63,6 +63,15 @@ assert_contains "repmgr: serviceaccount created" "${repmgr}" "kind: ServiceAccou
 assert_contains "repmgr: role created" "${repmgr}" "kind: Role"
 assert_contains "repmgr: rolebinding created" "${repmgr}" "kind: RoleBinding"
 
+# Repmgr: RBAC role restricts to specific resource names
+repmgr_role=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" --show-only templates/rbac.yaml 2>&1)
+assert_contains "repmgr: role has resourceNames for services" "${repmgr_role}" "resourceNames:"
+assert_contains "repmgr: role restricts service to release name" "${repmgr_role}" "test-pg"
+
+# Full: RBAC role restricts deployment to pgpool resource name
+full_role=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" --show-only templates/rbac.yaml 2>&1)
+assert_contains "full: role has deployment resourceNames" "${full_role}" "test-pg-pgpool"
+
 # Repmgr: should have headless service
 assert_contains "repmgr: headless service present" "${repmgr}" "clusterIP: None"
 
