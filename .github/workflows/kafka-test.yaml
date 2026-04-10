@@ -8,6 +8,9 @@ on:
       - 'kafka/**'
       - '.github/workflows/kafka-test.yaml'
 
+permissions:
+  contents: read
+
 env:
   IMAGES: >-
     apache/kafka:4.1.0
