@@ -8,6 +8,9 @@ on:
       - 'redis/**'
       - '.github/workflows/redis-test.yaml'
 
+permissions:
+  contents: read
+
 env:
   IMAGES: >-
     redis:7-alpine
