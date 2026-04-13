@@ -490,5 +490,74 @@ pgbackrest_disabled=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/val
 assert_not_contains "pgbackrest disabled: no configmap" "${pgbackrest_disabled}" "pgbackrest"
 assert_not_contains "pgbackrest disabled: no scheduler sidecar" "${pgbackrest_disabled}" "pgbackrest-scheduler"
 
+# --- nodeSelector and tolerations Tests ---
+
+# Test: nodeSelector/tolerations not rendered by default on statefulset
+assert_not_contains "default: no nodeSelector on statefulset" "${minimal}" "nodeSelector:"
+assert_not_contains "default: no tolerations on statefulset" "${minimal}" "tolerations:"
+
+# Test: nodeSelector/tolerations not rendered by default on pgpool
+assert_not_contains "default pgpool: no nodeSelector" "${full}" "nodeSelector:"
+assert_not_contains "default pgpool: no tolerations on pgpool" "${full}" "tolerations:"
+
+# Test: postgresql nodeSelector renders on statefulset
+sts_nodeselector=$(helm template test-pg "${CHART_DIR}" \
+  --set 'postgresql.nodeSelector.node\.kubernetes\.io/workload-type=stateful' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "postgresql nodeSelector: renders on statefulset" "${sts_nodeselector}" "node.kubernetes.io/workload-type: stateful"
+
+# Test: postgresql tolerations render on statefulset
+sts_tolerations=$(helm template test-pg "${CHART_DIR}" \
+  --set 'postgresql.tolerations[0].key=workload-type' \
+  --set 'postgresql.tolerations[0].operator=Equal' \
+  --set 'postgresql.tolerations[0].value=stateful' \
+  --set 'postgresql.tolerations[0].effect=NoSchedule' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "postgresql tolerations: key renders" "${sts_tolerations}" "key: workload-type"
+assert_contains "postgresql tolerations: value renders" "${sts_tolerations}" "value: stateful"
+assert_contains "postgresql tolerations: effect renders" "${sts_tolerations}" "effect: NoSchedule"
+
+# Test: pgpool nodeSelector renders on deployment
+pgpool_nodeselector=$(helm template test-pg "${CHART_DIR}" \
+  --set pgpool.enabled=true \
+  --set 'pgpool.nodeSelector.node\.kubernetes\.io/workload-type=stateful' \
+  --show-only templates/pgpool-deployment.yaml 2>&1)
+assert_contains "pgpool nodeSelector: renders on deployment" "${pgpool_nodeselector}" "node.kubernetes.io/workload-type: stateful"
+
+# Test: pgpool tolerations render on deployment
+pgpool_tolerations=$(helm template test-pg "${CHART_DIR}" \
+  --set pgpool.enabled=true \
+  --set 'pgpool.tolerations[0].key=workload-type' \
+  --set 'pgpool.tolerations[0].operator=Equal' \
+  --set 'pgpool.tolerations[0].value=stateful' \
+  --set 'pgpool.tolerations[0].effect=NoSchedule' \
+  --show-only templates/pgpool-deployment.yaml 2>&1)
+assert_contains "pgpool tolerations: key renders" "${pgpool_tolerations}" "key: workload-type"
+assert_contains "pgpool tolerations: value renders" "${pgpool_tolerations}" "value: stateful"
+assert_contains "pgpool tolerations: effect renders" "${pgpool_tolerations}" "effect: NoSchedule"
+
+# Test: nodeSelector coexists with affinity on statefulset
+sts_both=$(helm template test-pg "${CHART_DIR}" \
+  --set 'postgresql.nodeSelector.node\.kubernetes\.io/workload-type=stateful' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "nodeSelector+affinity: nodeSelector present" "${sts_both}" "nodeSelector:"
+assert_contains "nodeSelector+affinity: default anti-affinity still present" "${sts_both}" "podAntiAffinity"
+
+# Test: helm lint passes with nodeSelector and tolerations
+lint_output=$(helm lint "${CHART_DIR}" \
+  --set 'postgresql.nodeSelector.node\.kubernetes\.io/workload-type=stateful' \
+  --set 'postgresql.tolerations[0].key=workload-type' \
+  --set 'postgresql.tolerations[0].operator=Equal' \
+  --set 'postgresql.tolerations[0].value=stateful' \
+  --set 'postgresql.tolerations[0].effect=NoSchedule' \
+  --set pgpool.enabled=true \
+  --set 'pgpool.nodeSelector.node\.kubernetes\.io/workload-type=stateful' \
+  --set 'pgpool.tolerations[0].key=workload-type' \
+  --set 'pgpool.tolerations[0].operator=Equal' \
+  --set 'pgpool.tolerations[0].value=stateful' \
+  --set 'pgpool.tolerations[0].effect=NoSchedule' \
+  2>&1) && lint_rc=0 || lint_rc=$?
+assert_eq "helm lint with nodeSelector and tolerations passes" "0" "${lint_rc}"
+
 end_suite
 print_summary

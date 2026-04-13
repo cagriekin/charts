@@ -56,6 +56,10 @@ postgresql:
 
   affinity: {}
 
+  nodeSelector: {}
+
+  tolerations: []
+
   podAnnotations: {}
 
   podDisruptionBudget:
@@ -193,6 +197,10 @@ pgpool:
     port: 9999
 
   affinity: {}
+
+  nodeSelector: {}
+
+  tolerations: []
 
   podAnnotations: {}
 

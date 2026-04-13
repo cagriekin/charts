@@ -44,6 +44,14 @@ spec:
       shareProcessNamespace: true
       serviceAccountName: {{ include "pg.fullname" . }}-repmgr
       {{- end }}
+      {{- with .Values.postgresql.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.postgresql.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       affinity:
         {{- if .Values.postgresql.affinity }}
         {{- toYaml .Values.postgresql.affinity | nindent 8 }}
