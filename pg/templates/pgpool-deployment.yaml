@@ -38,6 +38,14 @@ spec:
       topologySpreadConstraints:
         {{- toYaml .Values.pgpool.topologySpreadConstraints | nindent 8 }}
       {{- end }}
+      {{- with .Values.pgpool.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.pgpool.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       affinity:
         {{- if .Values.pgpool.affinity }}
         {{- toYaml .Values.pgpool.affinity | nindent 8 }}
