@@ -8,7 +8,12 @@ metadata:
 data:
   service-updater.sh: |
     #!/bin/bash
-    set -e
+    # Intentionally no `set -e`: this sidecar is a long-running monitor whose
+    # correctness depends on explicit per-call retry/tolerance counters
+    # (CONSECUTIVE_FAILURES, PGPOOL_FAILURES). Under `set -e`, a single
+    # transient kubectl/psql failure would kill the script before those
+    # counters could act, turning a momentary blip into a pod restart. Error
+    # handling is done explicitly below.
 
     NAMESPACE=${NAMESPACE:?NAMESPACE is required}
     MASTER_SERVICE=${MASTER_SERVICE:?MASTER_SERVICE is required}
