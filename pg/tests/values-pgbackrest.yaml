@@ -15,7 +15,7 @@ postgresql:
 repmgr:
   image:
     repository: cagriekin/repmgr
-    tag: trixie-5.5.0-5
+    tag: trixie-5.5.0-7
   enabled: true
 
 pgpool:
