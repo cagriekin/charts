@@ -157,7 +157,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 |-----------|-------------|---------|
 | `repmgr.enabled` | Enable repmgr | `true` |
 | `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
-| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-5` |
+| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-7` |
 | `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `repmgr.username` | Repmgr database user | `repmgr` |
 | `repmgr.database` | Repmgr database name | `repmgr` |
@@ -516,8 +516,8 @@ kubectl scale statefulset my-postgres --replicas=0
 
 # 2. Run a restore pod mounting the data PVC
 kubectl run pg-restore --rm -it \
-  --image=cagriekin/repmgr:trixie-5.5.0-5 \
-  --overrides='{ "spec": { "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-5", "command": ["bash"], "stdin": true, "tty": true, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "value": "YOUR_KEY" }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "value": "YOUR_SECRET" }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-postgres-0" } }] } }'
+  --image=cagriekin/repmgr:trixie-5.5.0-7 \
+  --overrides='{ "spec": { "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-7", "command": ["bash"], "stdin": true, "tty": true, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "value": "YOUR_KEY" }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "value": "YOUR_SECRET" }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-postgres-0" } }] } }'
 
 # 3. Inside the restore pod, run:
 pgbackrest --stanza=db restore \
