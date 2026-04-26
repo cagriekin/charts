@@ -239,14 +239,13 @@ spec:
                           echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
                         fi
                         {{- end }}
+                        {{- if .Values.postgresql.pgHba }}
                         HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
-                        if ! grep -q "host all all 10.0.0.0/8 trust" "$HBA_FILE"; then
-                          sed -i '/host all all all scram-sha-256/i host all all 10.0.0.0/8 trust' "$HBA_FILE"
-                        fi
                         {{- range .Values.postgresql.pgHba }}
                         if ! grep -qF '{{ . }}' "$HBA_FILE"; then
                           sed -i '/host all all all scram-sha-256/i {{ . }}' "$HBA_FILE"
                         fi
+                        {{- end }}
                         {{- end }}
                         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}

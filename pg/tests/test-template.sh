@@ -240,6 +240,10 @@ assert_contains "config standalone: checksum annotation present" "${config_stand
 # Config standalone: pgHba entries injected in postStart
 assert_contains "config standalone: pgHba entry in postStart" "${config_standalone}" "host all all 10.244.0.0/16 md5"
 
+# Config standalone: no 10.0.0.0/8 trust line is injected (security: issue #14)
+assert_not_contains "config standalone: no 10.0.0.0/8 trust injection" "${config_standalone}" "10.0.0.0/8 trust"
+assert_not_contains "minimal: no 10.0.0.0/8 trust injection" "${minimal}" "10.0.0.0/8 trust"
+
 # Render repmgr config template
 config_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-config-repmgr.yaml" 2>&1)
 
