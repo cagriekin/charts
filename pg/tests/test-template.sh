@@ -489,6 +489,18 @@ assert_contains "pgbackrest+repmgr: service-updater present" "${pgbackrest_sts}"
 # pgBackRest: verify step after backup
 assert_contains "pgbackrest: verify step in run script" "${pgbackrest}" "pgbackrest.*verify"
 
+# pgBackRest: scheduler must NOT short-circuit on standby at startup.
+# A one-shot role check there leaves the scheduler stuck after a repmgr
+# failover. Role evaluation belongs in the per-fire run script instead.
+assert_not_contains "pgbackrest: scheduler does not sleep on standby" "${pgbackrest}" "sleeping indefinitely"
+assert_not_contains "pgbackrest: scheduler does not exec sleep infinity" "${pgbackrest}" "exec sleep infinity"
+
+# pgBackRest: run script re-checks role on every fire and creates stanza
+# idempotently (covers a pod that was a standby at boot then promoted).
+assert_contains "pgbackrest: run script checks pg_is_in_recovery" "${pgbackrest}" "pg_is_in_recovery"
+assert_contains "pgbackrest: run script ensures stanza exists" "${pgbackrest}" "stanza-create"
+assert_contains "pgbackrest: run script skips when not primary" "${pgbackrest}" "skipping"
+
 # pgBackRest: not rendered when disabled (default)
 pgbackrest_disabled=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" 2>&1)
 assert_not_contains "pgbackrest disabled: no configmap" "${pgbackrest_disabled}" "pgbackrest"
