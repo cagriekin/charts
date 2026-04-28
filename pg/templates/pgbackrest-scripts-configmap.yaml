@@ -11,6 +11,12 @@ data:
     #!/bin/bash
     set -euo pipefail
 
+    # The role check (primary vs standby) is intentionally NOT done here.
+    # repmgr can promote/demote this node at runtime, and a one-shot check at
+    # container start gets stuck on the wrong branch after a failover. Instead,
+    # cron always runs on every pod and pgbackrest-run.sh re-evaluates the role
+    # on each fire, so only the current primary actually backs up.
+
     PGBACKREST_STANZA=${PGBACKREST_STANZA:?PGBACKREST_STANZA is required}
     FULL_SCHEDULE=${FULL_SCHEDULE:?FULL_SCHEDULE is required}
     DIFF_SCHEDULE=${DIFF_SCHEDULE:?DIFF_SCHEDULE is required}
@@ -30,15 +36,6 @@ data:
       sleep 2
     done
 
-    IN_RECOVERY=$(psql -h /var/run/postgresql -U postgres -d postgres -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | xargs)
-    if [ "$IN_RECOVERY" = "t" ]; then
-      echo "This node is a standby, sleeping indefinitely"
-      exec sleep infinity
-    fi
-
-    echo "Running stanza-create..."
-    pgbackrest --stanza="${PGBACKREST_STANZA}" stanza-create 2>/dev/null || true
-
     echo "Writing crontab..."
     env | grep -E '^(PGBACKREST_|PATH=)' > /tmp/pgbackrest-env
     {
@@ -48,7 +45,7 @@ data:
     } > /tmp/pgbackrest-crontab
 
     crontab /tmp/pgbackrest-crontab
-    echo "Scheduler started"
+    echo "Scheduler started (role-aware backups dispatched per cron fire)"
     exec cron -f
 
   pgbackrest-run.sh: |
@@ -60,11 +57,24 @@ data:
 
     export PATH=$PATH:/usr/lib/postgresql/18/bin
 
-    IN_RECOVERY=$(psql -h /var/run/postgresql -U postgres -d postgres -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | xargs)
-    if [ "$IN_RECOVERY" = "t" ]; then
-      echo "Standby node, skipping ${BACKUP_TYPE} backup"
+    if ! pg_isready -h /var/run/postgresql -p 5432 > /dev/null 2>&1; then
+      echo "PostgreSQL not ready locally, skipping ${BACKUP_TYPE} backup"
       exit 0
     fi
+
+    IN_RECOVERY=$(psql -h /var/run/postgresql -U postgres -d postgres -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | xargs)
+    if [ "$IN_RECOVERY" != "f" ]; then
+      # Either standby ("t") or unreadable. Only the primary backs up; the
+      # other pod's cron will short-circuit here.
+      echo "Node is not primary (pg_is_in_recovery=${IN_RECOVERY:-unknown}), skipping ${BACKUP_TYPE} backup"
+      exit 0
+    fi
+
+    # Idempotent. Required here (not just in the scheduler) because this pod
+    # may have been a standby at boot and been promoted afterwards, in which
+    # case the stanza was never created from the current primary.
+    echo "Ensuring stanza exists..."
+    pgbackrest --stanza="${PGBACKREST_STANZA}" stanza-create || true
 
     echo "Starting ${BACKUP_TYPE} backup..."
     pgbackrest --stanza="${PGBACKREST_STANZA}" --type="${BACKUP_TYPE}" backup
