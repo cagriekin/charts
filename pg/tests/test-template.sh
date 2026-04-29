@@ -507,6 +507,21 @@ assert_contains "pgbackrest rbac: RoleBinding renders" "${pgbackrest_rbac}" "kin
 assert_contains "pgbackrest rbac: pods/exec verb create" "${pgbackrest_rbac}" "pods/exec"
 assert_contains "pgbackrest rbac: endpoints get verb" "${pgbackrest_rbac}" "endpoints"
 
+# pgBackRest: enabling pgbackrest must auto-inject WAL archive settings into
+# postgresql.conf. Without these, postgres rejects backups with
+# "archive_mode must be enabled".
+pgbackrest_pgconf=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "pgbackrest: postgresql configmap renders" "${pgbackrest_pgconf}" "test-pg-postgresql-config"
+assert_contains "pgbackrest: archive_mode = on" "${pgbackrest_pgconf}" "archive_mode = on"
+assert_contains "pgbackrest: archive_command uses stanza" "${pgbackrest_pgconf}" "archive_command = 'pgbackrest --stanza=db archive-push %p'"
+assert_contains "pgbackrest: wal_level replica" "${pgbackrest_pgconf}" "wal_level = replica"
+
+# Statefulset must mount the postgresql-config volume even when
+# postgresql.configuration is empty, so the archive snippet is delivered.
+assert_contains "pgbackrest: postgresql-config volume mounted" "${pgbackrest_sts}" "mountPath: /etc/postgresql/conf.d"
+assert_contains "pgbackrest: postgresql-config volume present" "${pgbackrest_sts}" "name: postgresql-config"
+assert_contains "pgbackrest: include_dir wired in postStart" "${pgbackrest_sts}" "include_dir = '/etc/postgresql/conf.d'"
+
 # pgBackRest: not rendered when disabled (default)
 pgbackrest_disabled=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" 2>&1)
 assert_not_contains "pgbackrest disabled: no configmap" "${pgbackrest_disabled}" "pgbackrest"

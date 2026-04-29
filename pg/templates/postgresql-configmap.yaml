@@ -1,4 +1,4 @@
-{{- if .Values.postgresql.configuration }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -7,8 +7,20 @@ metadata:
     {{- include "pg.labels" . | nindent 4 }}
     app.kubernetes.io/component: postgresql
 data:
+{{- if .Values.postgresql.configuration }}
   custom.conf: |
     {{- range $key, $value := .Values.postgresql.configuration }}
     {{ $key }} = '{{ $value }}'
     {{- end }}
+{{- end }}
+{{- if .Values.pgbackrest.enabled }}
+  # Required for pgbackrest WAL archiving. archive_mode is a postmaster
+  # parameter so it only takes effect after a postgres restart, which the
+  # configmap checksum annotation on the StatefulSet triggers.
+  pgbackrest-archive.conf: |
+    archive_mode = on
+    archive_command = 'pgbackrest --stanza={{ .Values.pgbackrest.stanza }} archive-push %p'
+    wal_level = replica
+    max_wal_senders = 10
+{{- end }}
 {{- end }}

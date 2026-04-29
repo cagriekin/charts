@@ -25,9 +25,9 @@ spec:
       labels:
         {{- include "pg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: postgresql
-{{- if or .Values.postgresql.configuration .Values.postgresql.podAnnotations }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.podAnnotations }}
       annotations:
-{{- if .Values.postgresql.configuration }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
         checksum/postgresql-config: {{ include (print $.Template.BasePath "/postgresql-configmap.yaml") . | sha256sum }}
 {{- end }}
       {{- with .Values.postgresql.podAnnotations }}
@@ -145,7 +145,7 @@ spec:
             - name: repmgr-config
               mountPath: /etc/repmgr
 {{- end }}
-{{- if .Values.postgresql.configuration }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
         - name: setup-config
           image: busybox:1.37
           securityContext:
@@ -233,7 +233,7 @@ spec:
                   - |
                     for i in {1..30}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
-                        {{- if .Values.postgresql.configuration }}
+                        {{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
                         CONF="$PGDATA/postgresql.conf"
                         if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
                           echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
@@ -258,7 +258,7 @@ spec:
 {{- else }}
           lifecycle:
 {{- include "pg.preStop" . | nindent 12 }}
-{{- if or .Values.postgresql.configuration .Values.postgresql.pgHba .Values.postgresql.lifecycle.postStart.additionalCommands }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.pgHba .Values.postgresql.lifecycle.postStart.additionalCommands }}
             postStart:
               exec:
                 command:
@@ -267,7 +267,7 @@ spec:
                   - |
                     for i in {1..90}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
-                        {{- if .Values.postgresql.configuration }}
+                        {{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
                         CONF="$PGDATA/postgresql.conf"
                         if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
                           echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
@@ -281,7 +281,7 @@ spec:
                         fi
                         {{- end }}
                         {{- end }}
-                        {{- if or .Values.postgresql.configuration .Values.postgresql.pgHba }}
+                        {{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.pgHba }}
                         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
                         {{- end }}
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
@@ -335,7 +335,7 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-{{- if .Values.postgresql.configuration }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
             - name: postgresql-config
               mountPath: /etc/postgresql/conf.d
               readOnly: true
@@ -504,7 +504,7 @@ spec:
 {{- end }}
 {{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.repmgr.enabled .Values.pgbackrest.enabled (not .Values.postgresql.persistence.enabled) }}
       volumes:
-{{- if .Values.postgresql.configuration }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
         - name: postgresql-config
           configMap:
             name: {{ include "pg.fullname" . }}-postgresql-config
