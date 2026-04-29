@@ -1,0 +1,75 @@
+{{- if .Values.pgbackrest.enabled }}
+{{- $root := . -}}
+{{- range $type, $schedule := dict "full" $root.Values.pgbackrest.schedule.full "diff" $root.Values.pgbackrest.schedule.diff }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "pg.fullname" $root }}-pgbackrest-{{ $type }}
+  labels:
+    {{- include "pg.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: pgbackrest
+    pgbackrest.type: {{ $type }}
+spec:
+  schedule: {{ $schedule | quote }}
+  concurrencyPolicy: {{ $root.Values.pgbackrest.cronjob.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ $root.Values.pgbackrest.cronjob.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ $root.Values.pgbackrest.cronjob.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ $root.Values.pgbackrest.cronjob.backoffLimit }}
+      activeDeadlineSeconds: {{ $root.Values.pgbackrest.cronjob.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "pg.selectorLabels" $root | nindent 12 }}
+            app.kubernetes.io/component: pgbackrest
+            pgbackrest.type: {{ $type }}
+        spec:
+          serviceAccountName: {{ include "pg.fullname" $root }}-pgbackrest
+          restartPolicy: Never
+          containers:
+            - name: pgbackrest
+              image: "{{ $root.Values.pgbackrest.cronjob.image.repository }}:{{ $root.Values.pgbackrest.cronjob.image.tag }}"
+              imagePullPolicy: {{ $root.Values.pgbackrest.cronjob.image.pullPolicy }}
+              command: ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
+              args:
+                - |
+                  PRIMARY=$(kubectl -n "$NAMESPACE" get endpoints "$PRIMARY_SVC" \
+                    -o jsonpath='{.subsets[0].addresses[0].targetRef.name}')
+                  if [ -z "$PRIMARY" ]; then
+                    echo "ERROR: no primary pod found in endpoints/$PRIMARY_SVC" >&2
+                    exit 1
+                  fi
+                  echo "Primary pod resolved to: $PRIMARY"
+
+                  # Idempotent. Required so the first backup after a fresh
+                  # install (or after a failover that promoted a node which
+                  # was a standby at boot) creates the stanza on the actual
+                  # primary.
+                  echo "Ensuring stanza '$STANZA' exists..."
+                  kubectl -n "$NAMESPACE" exec "$PRIMARY" -c pgbackrest -- \
+                    pgbackrest --stanza="$STANZA" stanza-create || true
+
+                  echo "Starting $BACKUP_TYPE backup..."
+                  kubectl -n "$NAMESPACE" exec "$PRIMARY" -c pgbackrest -- \
+                    pgbackrest --stanza="$STANZA" --type="$BACKUP_TYPE" backup
+
+                  echo "$BACKUP_TYPE backup completed. Repository state:"
+                  kubectl -n "$NAMESPACE" exec "$PRIMARY" -c pgbackrest -- \
+                    pgbackrest --stanza="$STANZA" info
+              env:
+                - name: NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: PRIMARY_SVC
+                  value: {{ include "pg.fullname" $root }}
+                - name: STANZA
+                  value: {{ $root.Values.pgbackrest.stanza }}
+                - name: BACKUP_TYPE
+                  value: {{ $type }}
+              resources:
+                {{- toYaml $root.Values.pgbackrest.cronjob.resources | nindent 16 }}
+{{- end }}
+{{- end }}

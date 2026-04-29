@@ -325,6 +325,9 @@ pgbackrest:
     full: "0 1 * * 0"
     diff: "0 1 * * 1-6"
 
+  # Sidecar container: keeps pgbackrest binary, config and credentials available
+  # on every pg pod. CronJobs locate the current primary and `kubectl exec` into
+  # this container to run the backup. The sidecar itself just sleeps.
   resources:
     requests:
       cpu: 100m
@@ -332,6 +335,29 @@ pgbackrest:
     limits:
       cpu: 1000m
       memory: 1Gi
+
+  # CronJob runner: schedules backups via Kubernetes-native CronJobs. Each job
+  # finds the current primary via the headless primary service endpoints
+  # (kept fresh by the service-updater sidecar) and execs into the pgbackrest
+  # sidecar to perform the backup. Failover is handled automatically because
+  # the primary is resolved at job-fire time.
+  cronjob:
+    image:
+      repository: alpine/k8s
+      tag: "1.31.3"
+      pullPolicy: IfNotPresent
+    concurrencyPolicy: Forbid
+    backoffLimit: 0
+    activeDeadlineSeconds: 21600  # 6 hours
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
 
 networkPolicy:
   enabled: false

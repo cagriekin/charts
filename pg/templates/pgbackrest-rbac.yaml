@@ -1,0 +1,48 @@
+{{- if .Values.pgbackrest.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "pg.fullname" . }}-pgbackrest
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgbackrest
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "pg.fullname" . }}-pgbackrest
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgbackrest
+rules:
+  # Resolve the current primary pod via the primary service endpoints.
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    resourceNames: [{{ include "pg.fullname" . | quote }}]
+    verbs: ["get"]
+  # Exec into the pgbackrest sidecar of the primary pod to run the backup.
+  # Restricted to the StatefulSet pods by name pattern is not supported by
+  # RBAC; we limit scope by namespace (Role, not ClusterRole) instead.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "pg.fullname" . }}-pgbackrest
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgbackrest
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pg.fullname" . }}-pgbackrest
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "pg.fullname" . }}-pgbackrest
+{{- end }}

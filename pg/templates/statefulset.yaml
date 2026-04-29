@@ -466,19 +466,20 @@ spec:
             {{- toYaml .Values.repmgr.serviceUpdater.resources | nindent 12 }}
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
-        - name: pgbackrest-scheduler
+        # Idle sidecar: holds the pgbackrest binary, config and S3 credentials
+        # alongside PGDATA on every pg pod. The pgbackrest CronJobs find the
+        # current primary via the primary service endpoints and `kubectl exec`
+        # into this container to perform the actual backup. Scheduling lives
+        # in the CronJobs, not here.
+        - name: pgbackrest
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
-          command: ["/bin/bash", "/scripts/pgbackrest-scheduler.sh"]
+          command: ["/bin/bash", "-c", "exec sleep infinity"]
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
             - name: PGBACKREST_STANZA
               value: {{ .Values.pgbackrest.stanza }}
-            - name: FULL_SCHEDULE
-              value: {{ .Values.pgbackrest.schedule.full | quote }}
-            - name: DIFF_SCHEDULE
-              value: {{ .Values.pgbackrest.schedule.diff | quote }}
             - name: PGBACKREST_REPO1_S3_KEY
               valueFrom:
                 secretKeyRef:
@@ -498,8 +499,6 @@ spec:
               mountPath: /etc/pgbackrest/pgbackrest.conf
               subPath: pgbackrest.conf
               readOnly: true
-            - name: pgbackrest-scripts
-              mountPath: /scripts
           resources:
             {{- toYaml .Values.pgbackrest.resources | nindent 12 }}
 {{- end }}
@@ -530,10 +529,6 @@ spec:
         - name: pgbackrest-config
           configMap:
             name: {{ include "pg.fullname" . }}-pgbackrest
-        - name: pgbackrest-scripts
-          configMap:
-            name: {{ include "pg.fullname" . }}-pgbackrest-scripts
-            defaultMode: 0755
 {{- end }}
 {{- if not .Values.postgresql.persistence.enabled }}
         - name: data
