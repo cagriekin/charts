@@ -427,18 +427,20 @@ assert_contains "pgbackrest: configmap has stanza" "${pgbackrest}" "[db]"
 assert_contains "pgbackrest: configmap has s3 endpoint" "${pgbackrest}" "repo1-s3-endpoint=https://s3.amazonaws.com"
 assert_contains "pgbackrest: configmap has s3 bucket" "${pgbackrest}" "repo1-s3-bucket=test-backups"
 
-# pgBackRest: scripts configmap renders
-assert_contains "pgbackrest: scripts configmap renders" "${pgbackrest}" "pgbackrest-scheduler.sh"
-assert_contains "pgbackrest: run script renders" "${pgbackrest}" "pgbackrest-run.sh"
-
-# pgBackRest: scheduler sidecar present in statefulset
+# pgBackRest: idle sidecar present in statefulset (exec target for CronJobs)
 pgbackrest_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/statefulset.yaml 2>&1)
-assert_contains "pgbackrest: scheduler sidecar present" "${pgbackrest_sts}" "name: pgbackrest-scheduler"
-assert_contains "pgbackrest: PGBACKREST_ENABLED env var" "${pgbackrest_sts}" "PGBACKREST_ENABLED"
+assert_contains "pgbackrest: sidecar present" "${pgbackrest_sts}" "name: pgbackrest"
 assert_contains "pgbackrest: PGBACKREST_STANZA env var" "${pgbackrest_sts}" "PGBACKREST_STANZA"
 assert_contains "pgbackrest: S3 key env var" "${pgbackrest_sts}" "PGBACKREST_REPO1_S3_KEY"
 assert_contains "pgbackrest: config volume mount" "${pgbackrest_sts}" "pgbackrest-config"
-assert_contains "pgbackrest: scripts volume mount" "${pgbackrest_sts}" "pgbackrest-scripts"
+assert_contains "pgbackrest: sidecar runs sleep infinity" "${pgbackrest_sts}" "exec sleep infinity"
+
+# pgBackRest: sidecar must NOT carry per-fire schedule envs (scheduling lives
+# in CronJobs now, not in the sidecar).
+assert_not_contains "pgbackrest: sidecar has no FULL_SCHEDULE env" "${pgbackrest_sts}" "FULL_SCHEDULE"
+assert_not_contains "pgbackrest: sidecar has no DIFF_SCHEDULE env" "${pgbackrest_sts}" "DIFF_SCHEDULE"
+assert_not_contains "pgbackrest: scripts ConfigMap is gone" "${pgbackrest}" "pgbackrest-scheduler.sh"
+assert_not_contains "pgbackrest: scripts volume mount removed" "${pgbackrest_sts}" "pgbackrest-scripts"
 
 # pgBackRest: configmap retention values
 assert_contains "pgbackrest: retention full in configmap" "${pgbackrest}" "repo1-retention-full=4"
@@ -448,27 +450,23 @@ assert_contains "pgbackrest: retention diff in configmap" "${pgbackrest}" "repo1
 assert_contains "pgbackrest: s3 region in configmap" "${pgbackrest}" "repo1-s3-region=eu-central-1"
 assert_contains "pgbackrest: s3 path prefix in configmap" "${pgbackrest}" "/pgbackrest/"
 
-# pgBackRest: schedule env vars on sidecar
-assert_contains "pgbackrest: FULL_SCHEDULE env var" "${pgbackrest_sts}" "FULL_SCHEDULE"
-assert_contains "pgbackrest: DIFF_SCHEDULE env var" "${pgbackrest_sts}" "DIFF_SCHEDULE"
-
 # pgBackRest: S3 secret references on sidecar
 assert_contains "pgbackrest: sidecar S3 key secret ref" "${pgbackrest_sts}" "s3-backup-creds"
 assert_contains "pgbackrest: sidecar S3 key ref key" "${pgbackrest_sts}" "access-key-id"
 assert_contains "pgbackrest: sidecar S3 secret key ref key" "${pgbackrest_sts}" "secret-access-key"
 
-# pgBackRest: resource limits on scheduler sidecar
-pgbackrest_scheduler=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/statefulset.yaml 2>&1 | sed -n '/name: pgbackrest-scheduler/,/^        - name:/p')
-assert_contains "pgbackrest: scheduler cpu limit" "${pgbackrest_scheduler}" "cpu: 1000m"
-assert_contains "pgbackrest: scheduler memory limit" "${pgbackrest_scheduler}" "memory: 1Gi"
-assert_contains "pgbackrest: scheduler cpu request" "${pgbackrest_scheduler}" "cpu: 100m"
-assert_contains "pgbackrest: scheduler memory request" "${pgbackrest_scheduler}" "memory: 256Mi"
+# pgBackRest: resource limits on sidecar
+pgbackrest_sidecar=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/statefulset.yaml 2>&1 | sed -n '/^        - name: pgbackrest$/,/^        - name:/p')
+assert_contains "pgbackrest: sidecar cpu limit" "${pgbackrest_sidecar}" "cpu: 1000m"
+assert_contains "pgbackrest: sidecar memory limit" "${pgbackrest_sidecar}" "memory: 1Gi"
+assert_contains "pgbackrest: sidecar cpu request" "${pgbackrest_sidecar}" "cpu: 100m"
+assert_contains "pgbackrest: sidecar memory request" "${pgbackrest_sidecar}" "memory: 256Mi"
 
 # pgBackRest: shared unix socket volume (pg-run emptyDir)
 assert_contains "pgbackrest: pg-run emptyDir volume" "${pgbackrest_sts}" "name: pg-run"
 pgbackrest_pg_container=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/statefulset.yaml 2>&1 | sed -n '/name: postgresql$/,/^        - name:/p')
 assert_contains "pgbackrest: postgresql mounts pg-run" "${pgbackrest_pg_container}" "pg-run"
-assert_contains "pgbackrest: scheduler mounts pg-run" "${pgbackrest_scheduler}" "pg-run"
+assert_contains "pgbackrest: sidecar mounts pg-run" "${pgbackrest_sidecar}" "pg-run"
 
 # pgBackRest: works without repmgr (standalone)
 pgbackrest_standalone=$(helm template test-pg "${CHART_DIR}" \
@@ -478,33 +476,42 @@ pgbackrest_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set pgbackrest.existingSecret.name=test-secret \
   --set repmgr.enabled=false \
   --show-only templates/statefulset.yaml 2>&1)
-assert_contains "pgbackrest standalone: scheduler sidecar present" "${pgbackrest_standalone}" "name: pgbackrest-scheduler"
+assert_contains "pgbackrest standalone: sidecar present" "${pgbackrest_standalone}" "name: pgbackrest"
 assert_not_contains "pgbackrest standalone: no repmgrd container" "${pgbackrest_standalone}" "repmgrd"
 
 # pgBackRest: coexists with repmgr
-assert_contains "pgbackrest+repmgr: scheduler present" "${pgbackrest_sts}" "name: pgbackrest-scheduler"
+assert_contains "pgbackrest+repmgr: sidecar present" "${pgbackrest_sts}" "name: pgbackrest"
 assert_contains "pgbackrest+repmgr: repmgrd present" "${pgbackrest_sts}" "name: repmgrd"
 assert_contains "pgbackrest+repmgr: service-updater present" "${pgbackrest_sts}" "name: service-updater"
 
-# pgBackRest: verify step after backup
-assert_contains "pgbackrest: verify step in run script" "${pgbackrest}" "pgbackrest.*verify"
+# pgBackRest: CronJobs (one per backup type) drive scheduling.
+pgbackrest_cron=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/pgbackrest-cronjob.yaml 2>&1)
+assert_contains "pgbackrest: full CronJob renders" "${pgbackrest_cron}" "name: test-pg-pgbackrest-full"
+assert_contains "pgbackrest: diff CronJob renders" "${pgbackrest_cron}" "name: test-pg-pgbackrest-diff"
+assert_contains "pgbackrest: CronJob uses kubectl image" "${pgbackrest_cron}" "alpine/k8s"
+assert_contains "pgbackrest: CronJob runs as service account" "${pgbackrest_cron}" "serviceAccountName: test-pg-pgbackrest"
+assert_contains "pgbackrest: CronJob resolves primary via endpoints" "${pgbackrest_cron}" "endpoints"
+assert_contains "pgbackrest: CronJob execs into sidecar" "${pgbackrest_cron}" "exec \"\$PRIMARY\" -c pgbackrest"
+assert_contains "pgbackrest: CronJob ensures stanza" "${pgbackrest_cron}" "stanza-create"
+assert_contains "pgbackrest: CronJob runs backup" "${pgbackrest_cron}" "type=\"\$BACKUP_TYPE\" backup"
+assert_contains "pgbackrest: CronJob concurrency Forbid" "${pgbackrest_cron}" "concurrencyPolicy: Forbid"
+# assert_contains uses `grep` (regex), so escape the cron-spec stars.
+assert_contains "pgbackrest: full CronJob carries full schedule" "${pgbackrest_cron}" 'schedule: "0 1 \* \* 0"'
+assert_contains "pgbackrest: diff CronJob carries diff schedule" "${pgbackrest_cron}" 'schedule: "0 1 \* \* 1-6"'
 
-# pgBackRest: scheduler must NOT short-circuit on standby at startup.
-# A one-shot role check there leaves the scheduler stuck after a repmgr
-# failover. Role evaluation belongs in the per-fire run script instead.
-assert_not_contains "pgbackrest: scheduler does not sleep on standby" "${pgbackrest}" "sleeping indefinitely"
-assert_not_contains "pgbackrest: scheduler does not exec sleep infinity" "${pgbackrest}" "exec sleep infinity"
-
-# pgBackRest: run script re-checks role on every fire and creates stanza
-# idempotently (covers a pod that was a standby at boot then promoted).
-assert_contains "pgbackrest: run script checks pg_is_in_recovery" "${pgbackrest}" "pg_is_in_recovery"
-assert_contains "pgbackrest: run script ensures stanza exists" "${pgbackrest}" "stanza-create"
-assert_contains "pgbackrest: run script skips when not primary" "${pgbackrest}" "skipping"
+# pgBackRest: RBAC for CronJob exec access.
+pgbackrest_rbac=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/pgbackrest-rbac.yaml 2>&1)
+assert_contains "pgbackrest rbac: ServiceAccount renders" "${pgbackrest_rbac}" "kind: ServiceAccount"
+assert_contains "pgbackrest rbac: Role renders" "${pgbackrest_rbac}" "kind: Role"
+assert_contains "pgbackrest rbac: RoleBinding renders" "${pgbackrest_rbac}" "kind: RoleBinding"
+assert_contains "pgbackrest rbac: pods/exec verb create" "${pgbackrest_rbac}" "pods/exec"
+assert_contains "pgbackrest rbac: endpoints get verb" "${pgbackrest_rbac}" "endpoints"
 
 # pgBackRest: not rendered when disabled (default)
 pgbackrest_disabled=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" 2>&1)
 assert_not_contains "pgbackrest disabled: no configmap" "${pgbackrest_disabled}" "pgbackrest"
-assert_not_contains "pgbackrest disabled: no scheduler sidecar" "${pgbackrest_disabled}" "pgbackrest-scheduler"
+assert_not_contains "pgbackrest disabled: no sidecar" "${pgbackrest_disabled}" "name: pgbackrest"
+assert_not_contains "pgbackrest disabled: no CronJob" "${pgbackrest_disabled}" "kind: CronJob"
 
 # --- nodeSelector and tolerations Tests ---
 
