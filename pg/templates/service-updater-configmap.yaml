@@ -192,24 +192,31 @@ data:
         date +%s > /tmp/service-updater-alive
         CURRENT_MASTER=$(get_current_master)
 
-        if [ -n "$CURRENT_MASTER" ] && [ "$CURRENT_MASTER" != "$LAST_MASTER" ]; then
-            echo "Master change: ${LAST_MASTER} -> ${CURRENT_MASTER}"
-            if update_service_selector "$CURRENT_MASTER"; then
+        if [ -n "$CURRENT_MASTER" ]; then
+            # Re-assert the selector on every tick. update_service_selector is
+            # a no-op if the selector already matches; calling it
+            # unconditionally makes the loop self-healing against external
+            # mutations (e.g. ArgoCD re-applying the chart's hardcoded
+            # `pod-name: <fullname>-0` selector after a sync). Without this,
+            # one ArgoCD sync after a failover stranded the primary service
+            # pointing at the wrong pod indefinitely.
+            update_service_selector "$CURRENT_MASTER"
+
+            if [ "$CURRENT_MASTER" != "$LAST_MASTER" ]; then
+                echo "Master change: ${LAST_MASTER} -> ${CURRENT_MASTER}"
                 restart_pgpool
                 LAST_MASTER="$CURRENT_MASTER"
-                CONSECUTIVE_FAILURES=0
                 PGPOOL_FAILURES=0
             fi
-        elif [ -z "$CURRENT_MASTER" ]; then
+            CONSECUTIVE_FAILURES=0
+            check_pgpool_health
+            detect_split_brain
+        else
             CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
             if [ $CONSECUTIVE_FAILURES -ge $MAX_CONSECUTIVE_FAILURES ]; then
                 echo "WARNING: Could not determine master (failed $CONSECUTIVE_FAILURES times)"
                 CONSECUTIVE_FAILURES=0
             fi
-            detect_split_brain
-        else
-            CONSECUTIVE_FAILURES=0
-            check_pgpool_health
             detect_split_brain
         fi
 
