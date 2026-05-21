@@ -95,7 +95,7 @@ postgresql:
   lifecycle:
     postStart:
       additionalCommands: |
-        psql -U postgres -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1
+        psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1
 
 repmgr:
   image:
