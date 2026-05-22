@@ -300,7 +300,7 @@ spec:
                         HBA_SENTINEL="# cagriekin-charts: md5 fallback applied (md5-first)"
                         if [ -n "$HBA_FILE" ] && [ -f "$HBA_FILE" ] && ! grep -qF "$HBA_SENTINEL" "$HBA_FILE"; then
                           HBA_TMP="${HBA_FILE}.cagriekin.tmp"
-                          awk '/^[[:space:]]*host[[:space:]]+(all|replication)[[:space:]]+.*[[:space:]]+scram-sha-256[[:space:]]*$/ { m=$0; sub(/scram-sha-256[[:space:]]*$/, "md5", m); print m } {print}' "$HBA_FILE" > "$HBA_TMP"
+                          awk '/^[[:space:]]*host(ssl|nossl)?[[:space:]]+(all|replication)[[:space:]]+.*[[:space:]]+scram-sha-256[[:space:]]*$/ { m=$0; sub(/scram-sha-256[[:space:]]*$/, "md5", m); print m } {print}' "$HBA_FILE" > "$HBA_TMP"
                           printf '\n%s\n' "$HBA_SENTINEL" >> "$HBA_TMP"
                           cp "$HBA_TMP" "$HBA_FILE"
                           rm -f "$HBA_TMP"
@@ -311,15 +311,7 @@ spec:
                           local target_pass="$2"
                           [ -z "$target_user" ] && return 0
                           [ -z "$target_pass" ] && return 0
-                          local needs_migrate
-                          needs_migrate=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tA \
-                            -v u="$target_user" \
-                            -c "SELECT EXISTS (SELECT 1 FROM pg_authid WHERE rolname = :'u' AND rolpassword LIKE 'md5%');" 2>/dev/null)
-                          if [ "$needs_migrate" = "t" ]; then
-                            psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 \
-                              -v u="$target_user" -v p="$target_pass" \
-                              -c "SET password_encryption='scram-sha-256'; ALTER USER :\"u\" WITH PASSWORD :'p';" >/dev/null 2>&1 || true
-                          fi
+                          psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -v u="$target_user" -v p="$target_pass" --quiet --no-psqlrc -c "DO \$\$ DECLARE v_user TEXT := :'u'; v_pass TEXT := :'p'; BEGIN IF current_setting('server_version_num')::int < 140000 THEN RAISE NOTICE 'Skipping md5->scram migration on PG < 14 (no md5->scram auto-promotion in pg_hba)'; RETURN; END IF; IF EXISTS (SELECT 1 FROM pg_authid WHERE rolname = v_user AND rolpassword LIKE 'md5%') THEN SET LOCAL password_encryption = 'scram-sha-256'; EXECUTE format('ALTER USER %I WITH PASSWORD %L', v_user, v_pass); END IF; END \$\$;" >/dev/null
                         }
                         fix_user_auth "$POSTGRES_USER" "$POSTGRES_PASSWORD"
                         fix_user_auth "$REPMGR_USER" "$REPMGR_PASSWORD"
