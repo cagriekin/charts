@@ -306,22 +306,10 @@ spec:
                           rm -f "$HBA_TMP"
                         fi
                         {{- if .Values.postgresql.migrateLegacyMd5Users }}
-                        # PR #99 (0.6.58) shipped this as a one-liner that interpolated
-                        # :'u' / :'p' directly inside the dollar-quoted DO block. psql
-                        # variable substitution is NOT performed inside dollar-quoted
-                        # constants, so the server saw the literal `:` and rejected the
-                        # statement with `syntax error at or near ":"`. The MD5->SCRAM
-                        # rehash silently never ran. Connectivity kept working only
-                        # because the md5-fallback line written into pg_hba.conf above
-                        # let MD5 hashes continue to authenticate, masking the failure.
-                        #
-                        # Fix: hoist the values into per-session custom GUCs in regular
-                        # SQL (where psql substitution does run), and let the DO block
-                        # read them back via current_setting(). The GUCs live only for
-                        # the lifetime of this psql connection. Password is never
-                        # written to a file. (-v still places it in argv, visible to
-                        # /proc/<pid>/cmdline for in-pod readers — acceptable here
-                        # since pod-level access already grants the secret.)
+                        # `:'u'` / `:'p'` are NOT substituted inside a dollar-quoted
+                        # DO block (psql limitation), so 0.6.58 failed server-side and
+                        # the rehash silently never ran. Hoist values into per-session
+                        # GUCs in regular SQL and read them back via current_setting().
                         fix_user_auth() {
                           local target_user="$1"
                           local target_pass="$2"
@@ -441,23 +429,12 @@ spec:
         - name: repmgrd
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
-          # Chart-side workaround for cagriekin/repmgr <= trixie-5.5.0-7:
-          # the image's repmgrd-entrypoint.sh calls
-          #   `repmgr -f /etc/repmgr/repmgr.conf standby register --force`
-          # WITHOUT --upstream-node-id. On PG18 + repmgr 5.5.0 the row inserted
-          # on the primary's repmgr.nodes ends up with type='' (empty), and the
-          # image's verify-loop ("Primary does not show node N as standby") then
-          # crashes the pod into CrashLoopBackOff.
-          #
-          # We pre-register the standby with an explicit --upstream-node-id
-          # (resolved by polling sibling pods for `type='primary' AND active`)
-          # BEFORE delegating to the image's entrypoint. The image's own
-          # `standby register --force` then becomes an idempotent no-op UPDATE
-          # and its verify-loop passes on the first attempt. Re-registration on
-          # pod restart is safe because --force replaces the row in place.
-          #
-          # Drop this block once the default repmgr.image.tag is bumped to a
-          # release that carries the same fix in the image entrypoint.
+          # Workaround: cagriekin/repmgr <= trixie-5.5.0-7 calls
+          # `standby register --force` without --upstream-node-id, leaving the
+          # row on the primary with type='' on PG18 + repmgr 5.5.0 and crashing
+          # the standby. Pre-register here with an explicit upstream node_id,
+          # then exec the image entrypoint (its own register --force becomes a
+          # no-op UPDATE). Drop once the image ships the fix upstream.
           # Tracking: github.com/cagriekin/repmgr-docker, repmgrd-entrypoint.sh:45.
           command:
             - /bin/bash
@@ -465,38 +442,23 @@ spec:
             - |
               ORDINAL="${HOSTNAME##*-}"
               if [ "$ORDINAL" != "0" ]; then
-                BASE_NAME="${HOSTNAME%-*}"
-                echo "pre-register: waiting for local PostgreSQL..."
-                for i in $(seq 1 120); do
-                  if pg_isready -h 127.0.0.1 -p 5432 > /dev/null 2>&1; then
-                    break
-                  fi
-                  sleep 2
-                done
-                PRIMARY_HOST=""
-                PRIMARY_NODE_ID=""
-                for attempt in $(seq 1 60); do
+                BASE="${HOSTNAME%-*}"
+                for _ in $(seq 1 120); do pg_isready -h 127.0.0.1 > /dev/null 2>&1 && break; sleep 2; done
+                PNID=""
+                for _ in $(seq 1 60); do
                   for i in $(seq 0 9); do
                     [ "$i" = "$ORDINAL" ] && continue
-                    PARTNER="${BASE_NAME}-${i}.${HEADLESS_SERVICE}"
-                    if ! PGPASSWORD="${REPMGR_PASSWORD}" pg_isready -h "$PARTNER" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" > /dev/null 2>&1; then
-                      continue
-                    fi
-                    PNID=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h "$PARTNER" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" -tA -c "SELECT node_id FROM repmgr.nodes WHERE type='primary' AND active=true LIMIT 1;" 2>/dev/null || true)
-                    if [ -n "$PNID" ]; then
-                      PRIMARY_HOST="$PARTNER"
-                      PRIMARY_NODE_ID="$PNID"
-                      break 2
-                    fi
+                    P="${BASE}-${i}.${HEADLESS_SERVICE}"
+                    PGPASSWORD="${REPMGR_PASSWORD}" pg_isready -h "$P" -U "${REPMGR_USER}" -d "${REPMGR_DB}" > /dev/null 2>&1 || continue
+                    PNID=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h "$P" -U "${REPMGR_USER}" -d "${REPMGR_DB}" -tA \
+                      -c "SELECT node_id FROM repmgr.nodes WHERE type='primary' AND active=true LIMIT 1;" 2>/dev/null || true)
+                    [ -n "$PNID" ] && break 2
                   done
                   sleep 2
                 done
-                if [ -n "$PRIMARY_NODE_ID" ]; then
-                  echo "pre-register: standby register --upstream-node-id=${PRIMARY_NODE_ID} (primary=${PRIMARY_HOST})"
-                  repmgr -f /etc/repmgr/repmgr.conf standby register --upstream-node-id="${PRIMARY_NODE_ID}" --force \
-                    || echo "pre-register: standby register returned non-zero; deferring to image entrypoint"
-                else
-                  echo "pre-register: no primary found in repmgr.nodes after 120s; deferring to image entrypoint"
+                if [ -n "$PNID" ]; then
+                  echo "pre-register: standby register --upstream-node-id=${PNID}"
+                  repmgr -f /etc/repmgr/repmgr.conf standby register --upstream-node-id="${PNID}" --force || true
                 fi
               fi
               exec /usr/local/bin/entrypoint.sh repmgrd
