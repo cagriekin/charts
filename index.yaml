@@ -146,6 +146,26 @@ entries:
   pgvector:
   - apiVersion: v2
     appVersion: "18.1"
+    created: "2026-05-22T07:43:42.893618517Z"
+    dependencies:
+    - name: common
+      repository: file://../common
+      version: 0.1.0
+    description: PostgreSQL with pgvector extension and optional PGPool-II
+    digest: 605cbd93dd5f64c570c1fba4745b8d93bb960f188192a73302b7e7567bd81e0e
+    keywords:
+    - PostgreSQL
+    - pgvector
+    - PGPool-II
+    - Vector Search
+    - Vector Database
+    name: pgvector
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/pgvector-0.6.58.tgz
+    version: 0.6.58
+  - apiVersion: v2
+    appVersion: "18.1"
     created: "2026-05-21T14:38:30.333517619Z"
     dependencies:
     - name: common
@@ -367,4 +387,4 @@ entries:
     urls:
     - https://cagriekin.github.io/charts/redis-0.2.0.tgz
     version: 0.2.0
-generated: "2026-05-22T07:04:23.88709464Z"
+generated: "2026-05-22T07:43:42.891689008Z"
