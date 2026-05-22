@@ -11,8 +11,8 @@
     "target" (list (printf "%s-%d.%s-headless.%s.svc.cluster.local:5432" (include "pg.fullname" $) $i (include "pg.fullname" $) $.Release.Namespace))
   )
   "relabelings" (list
-    (dict "sourceLabels" (list "__param_target") "targetLabel" "instance")
-    (dict "sourceLabels" (list) "targetLabel" "job" "replacement" (printf "%s-postgresql" (include "pg.fullname" $)))
+    (dict "action" "replace" "sourceLabels" (list "__param_target") "targetLabel" "instance")
+    (dict "action" "replace" "sourceLabels" (list) "targetLabel" "job" "replacement" (printf "%s-postgresql" (include "pg.fullname" $)))
   )
 }}
 {{- $endpoints = append $endpoints $ep }}
