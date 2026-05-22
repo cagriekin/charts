@@ -33,6 +33,20 @@ entries:
   pg:
   - apiVersion: v2
     appVersion: "18.1"
+    created: "2026-05-22T20:27:19.548083751Z"
+    dependencies:
+    - name: common
+      repository: file://../common
+      version: 0.1.0
+    description: PostgreSQL with repmgr replication and optional PGPool-II
+    digest: 6c468f5286a5a414d20a2e93cad837ebfd889086c87ecaf43b0b522c35448b11
+    name: pg
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/pg-0.5.58.tgz
+    version: 0.5.58
+  - apiVersion: v2
+    appVersion: "18.1"
     created: "2026-05-22T20:08:46.377798942Z"
     dependencies:
     - name: common
@@ -489,4 +503,4 @@ entries:
     urls:
     - https://cagriekin.github.io/charts/redis-0.2.0.tgz
     version: 0.2.0
-generated: "2026-05-22T20:08:46.375501656Z"
+generated: "2026-05-22T20:27:19.545817763Z"
