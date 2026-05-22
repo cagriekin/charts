@@ -1,5 +1,24 @@
 # pgvector chart changelog
 
+## 0.6.62
+
+### Fixed
+
+- 0.6.61 dropped the image entrypoint's `Waiting for local PostgreSQL`
+  and `primary register --force` steps along with the broken standby
+  verify, so primary pods crashed at boot. Restore both in the chart
+  wrapper: wait for local PG via `pg_isready`, then branch on
+  `pg_is_in_recovery()` — `f` runs `primary register --force`, `t`
+  runs the existing standby pre-register block. Standby gate changed
+  from `ORDINAL != 0` to `IN_RECOVERY = t` so a failed-over pod-0
+  rejoining as standby also takes the standby path.
+
+## Migrating from 0.6.61
+
+`helm upgrade my-release cagriekin/pgvector` is the entire migration.
+No PVC recreate, no StatefulSet recreate, no password rotation, no
+forced failover.
+
 ## 0.6.61
 
 ### Fixed

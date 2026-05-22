@@ -454,9 +454,13 @@ spec:
             - -c
             - |
               ORDINAL="${HOSTNAME##*-}"
-              if [ "$ORDINAL" != "0" ]; then
+              for _ in $(seq 1 120); do pg_isready -h 127.0.0.1 > /dev/null 2>&1 && break; sleep 2; done
+              IN_RECOVERY=$(psql -h 127.0.0.1 -U postgres -d postgres -tA -c "SELECT pg_is_in_recovery();" 2>/dev/null || true)
+              if [ "$IN_RECOVERY" = "f" ]; then
+                echo "pre-register: primary register --force"
+                repmgr -f /etc/repmgr/repmgr.conf primary register --force || true
+              elif [ "$IN_RECOVERY" = "t" ]; then
                 BASE="${HOSTNAME%-*}"
-                for _ in $(seq 1 120); do pg_isready -h 127.0.0.1 > /dev/null 2>&1 && break; sleep 2; done
                 PNID=""
                 for _ in $(seq 1 60); do
                   for i in $(seq 0 9); do
