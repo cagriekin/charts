@@ -306,12 +306,54 @@ spec:
                           rm -f "$HBA_TMP"
                         fi
                         {{- if .Values.postgresql.migrateLegacyMd5Users }}
+                        # 0.6.58 used `psql -c "DO \$\$ ... :'u' ... \$\$;"`. Two
+                        # broken assumptions: (a) psql does NOT perform :'var'
+                        # substitution inside `-c` (docs: "no psql-specific
+                        # features"); (b) even if it did, substitution is also
+                        # skipped inside dollar-quoted constants. The server saw
+                        # `:'u'` literal, raised `syntax error at or near ":"`,
+                        # and the rehash silently never ran. Connectivity kept
+                        # working because the md5-fallback line in pg_hba.conf
+                        # masked the failure.
+                        #
+                        # Fix: feed SQL via stdin (psql MainLoop, where :'var'
+                        # IS substituted) and hoist user/pass into per-session
+                        # GUCs read back inside the DO block via current_setting().
+                        # GUC names use `tgt_user`/`tgt_pass` — `user` would
+                        # collide with the SQL reserved keyword.
                         fix_user_auth() {
                           local target_user="$1"
                           local target_pass="$2"
                           [ -z "$target_user" ] && return 0
                           [ -z "$target_pass" ] && return 0
-                          psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -v u="$target_user" -v p="$target_pass" --quiet --no-psqlrc -c "DO \$\$ DECLARE v_user TEXT := :'u'; v_pass TEXT := :'p'; BEGIN IF current_setting('server_version_num')::int < 140000 THEN RAISE NOTICE 'Skipping md5->scram migration on PG < 14 (no md5->scram auto-promotion in pg_hba)'; RETURN; END IF; IF EXISTS (SELECT 1 FROM pg_authid WHERE rolname = v_user AND rolpassword LIKE 'md5%') THEN SET LOCAL password_encryption = 'scram-sha-256'; EXECUTE format('ALTER USER %I WITH PASSWORD %L', v_user, v_pass); END IF; END \$\$;" >/dev/null
+                          local sql="
+                            SET myvars.tgt_user = :'u';
+                            SET myvars.tgt_pass = :'p';
+                            DO \$\$
+                            DECLARE
+                              v_user TEXT := current_setting('myvars.tgt_user');
+                              v_pass TEXT := current_setting('myvars.tgt_pass');
+                            BEGIN
+                              IF current_setting('server_version_num')::int < 140000 THEN
+                                RAISE NOTICE 'Skipping md5->scram migration on PG < 14 (no md5->scram auto-promotion in pg_hba)';
+                                RETURN;
+                              END IF;
+                              IF EXISTS (
+                                SELECT 1 FROM pg_authid
+                                WHERE rolname = v_user AND rolpassword LIKE 'md5%'
+                              ) THEN
+                                SET LOCAL password_encryption = 'scram-sha-256';
+                                EXECUTE format('ALTER USER %I WITH PASSWORD %L', v_user, v_pass);
+                              END IF;
+                            END
+                            \$\$;"
+                          if ! psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+                            -v ON_ERROR_STOP=1 \
+                            -v u="$target_user" \
+                            -v p="$target_pass" \
+                            --no-psqlrc <<<"$sql"; then
+                            echo "fix_user_auth: md5->scram rehash failed for ${target_user} (psql returned non-zero, see error above)" >&2
+                          fi
                         }
                         fix_user_auth "$POSTGRES_USER" "$POSTGRES_PASSWORD"
                         fix_user_auth "$REPMGR_USER" "$REPMGR_PASSWORD"
@@ -400,7 +442,39 @@ spec:
         - name: repmgrd
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
-          command: ["/usr/local/bin/entrypoint.sh", "repmgrd"]
+          # Workaround: cagriekin/repmgr <= trixie-5.5.0-7 calls
+          # `standby register --force` without --upstream-node-id, leaving the
+          # row on the primary with type='' on PG18 + repmgr 5.5.0 and crashing
+          # the standby. Pre-register here with an explicit upstream node_id,
+          # then exec the image entrypoint (its own register --force becomes a
+          # no-op UPDATE). Drop once the image ships the fix upstream.
+          # Tracking: github.com/cagriekin/repmgr-docker, repmgrd-entrypoint.sh:45.
+          command:
+            - /bin/bash
+            - -c
+            - |
+              ORDINAL="${HOSTNAME##*-}"
+              if [ "$ORDINAL" != "0" ]; then
+                BASE="${HOSTNAME%-*}"
+                for _ in $(seq 1 120); do pg_isready -h 127.0.0.1 > /dev/null 2>&1 && break; sleep 2; done
+                PNID=""
+                for _ in $(seq 1 60); do
+                  for i in $(seq 0 9); do
+                    [ "$i" = "$ORDINAL" ] && continue
+                    P="${BASE}-${i}.${HEADLESS_SERVICE}"
+                    PGPASSWORD="${REPMGR_PASSWORD}" pg_isready -h "$P" -U "${REPMGR_USER}" -d "${REPMGR_DB}" > /dev/null 2>&1 || continue
+                    PNID=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h "$P" -U "${REPMGR_USER}" -d "${REPMGR_DB}" -tA \
+                      -c "SELECT node_id FROM repmgr.nodes WHERE type='primary' AND active=true LIMIT 1;" 2>/dev/null || true)
+                    [ -n "$PNID" ] && break 2
+                  done
+                  sleep 2
+                done
+                if [ -n "$PNID" ]; then
+                  echo "pre-register: standby register --upstream-node-id=${PNID}"
+                  repmgr -f /etc/repmgr/repmgr.conf standby register --upstream-node-id="${PNID}" --force || true
+                fi
+              fi
+              exec /usr/local/bin/entrypoint.sh repmgrd
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
