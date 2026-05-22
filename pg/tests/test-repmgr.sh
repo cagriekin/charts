@@ -69,6 +69,20 @@ done
 assert_contains "repmgr sees primary node" "${cluster_output}" "primary"
 assert_contains "repmgr sees standby node" "${cluster_output}" "standby"
 
+# Detailed standby row checks — catch the `type=''` regression observed
+# under PG18 + cagriekin/repmgr:trixie-5.5.0-7 where `standby register`
+# reports success but lands the row with the type column empty, breaking
+# the image's verify-loop. assert_eq against the exact literal also
+# catches NULL (renders as "").
+standby_type=$(pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "SELECT type FROM repmgr.nodes WHERE node_id=1001" "repmgr" "repmgr")
+assert_eq "standby row has type='standby'" "standby" "${standby_type}"
+
+standby_active=$(pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "SELECT active FROM repmgr.nodes WHERE node_id=1001" "repmgr" "repmgr")
+assert_eq "standby row has active=true" "t" "${standby_active}"
+
+standby_upstream=$(pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "SELECT upstream_node_id FROM repmgr.nodes WHERE node_id=1001" "repmgr" "repmgr")
+assert_eq "standby row has upstream_node_id=1000" "1000" "${standby_upstream}"
+
 # Test: replication works - write on primary, read on replica
 REPL_VALUE="replicated-$(date +%s)"
 pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "DROP TABLE IF EXISTS repl_test" "testuser" "testdb"

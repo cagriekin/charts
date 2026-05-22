@@ -1,5 +1,28 @@
 # pgvector chart changelog
 
+## 0.6.60
+
+### Fixed
+
+- Defensive `UPDATE repmgr.nodes SET type='standby' WHERE node_id=<local>
+  AND (type IS NULL OR type='')` after pre-register on the primary.
+  Some PG18 + repmgr image combos report `standby registration complete`
+  but leave the row's `type` empty, breaking the image's verify-loop
+  with `Primary does not show node N as standby (current type: )`.
+  WHERE clause makes the UPDATE a no-op on already-correctly-typed
+  rows.
+- Test: new `pg/tests/test-repmgr-chaos.sh` deletes the standby pod
+  3 times and re-asserts `type='standby'` after each replacement —
+  the post-restart re-occurrence shape that manual SQL fixes cannot
+  cover. Wired into `Makefile` and CI.
+
+## Migrating from 0.6.59
+
+`helm upgrade my-release cagriekin/pgvector` is the entire migration.
+No PVC recreate, no StatefulSet recreate, no password rotation, no
+forced failover. Affected clusters converge `type='standby'` on the
+next standby restart; unaffected clusters see no behaviour change.
+
 ## 0.6.59
 
 ### Fixed
