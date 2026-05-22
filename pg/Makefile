@@ -3,7 +3,7 @@ KIND_CONFIG := kind-config.yaml
 TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
-.PHONY: test test-template test-cluster test-minimal test-repmgr test-full test-failover test-upgrade \
+.PHONY: test test-template test-cluster test-minimal test-repmgr test-repmgr-chaos test-full test-failover test-upgrade \
         test-repmgr-failover test-config test-config-repmgr test-backup-restore cluster-create cluster-delete cluster-exists clean help
 
 help:
@@ -13,6 +13,7 @@ help:
 	@echo "  test-cluster    - Run all cluster tests in parallel (assumes cluster exists)"
 	@echo "  test-minimal    - Run minimal install tests"
 	@echo "  test-repmgr     - Run repmgr install tests"
+	@echo "  test-repmgr-chaos - Run standby pod chaos restart regression test"
 	@echo "  test-full       - Run full install tests"
 	@echo "  test-failover   - Run failover tests (requires test-repmgr first)"
 	@echo "  test-upgrade    - Run upgrade path tests"
@@ -31,7 +32,7 @@ test-template:
 # Run independent suites in parallel with -j
 # test-repmgr-failover is sequential (repmgr then failover)
 # test-minimal, test-repmgr-failover, test-full, test-upgrade run in parallel
-test-cluster: test-minimal test-repmgr-failover test-full test-upgrade test-config test-config-repmgr
+test-cluster: test-minimal test-repmgr-failover test-repmgr-chaos test-full test-upgrade test-config test-config-repmgr
 	@echo "All test suites passed"
 
 # Chain: repmgr install -> failover test (must be sequential)
@@ -65,6 +66,9 @@ test-minimal: cluster-exists
 
 test-repmgr: cluster-exists
 	@bash $(TESTS_DIR)/test-repmgr.sh
+
+test-repmgr-chaos: cluster-exists
+	@bash $(TESTS_DIR)/test-repmgr-chaos.sh
 
 test-full: cluster-exists
 	@bash $(TESTS_DIR)/test-full.sh
