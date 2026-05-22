@@ -131,6 +131,9 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.pgHba` | List of pg_hba.conf entries injected via postStart | `[]` |
 | `postgresql.extensions.enabled` | Enable extensions support | `false` |
 | `postgresql.lifecycle.postStart.additionalCommands` | Shell commands to run after PostgreSQL is ready | `""` |
+| `postgresql.migrateLegacyMd5Users` | Re-hash MD5 user passwords to SCRAM on PG14+ | `true` |
+| `postgresql.nodeSelector` | Node selector for PostgreSQL pods | `{}` |
+| `postgresql.tolerations` | Tolerations for PostgreSQL pods | `[]` |
 
 Example:
 
@@ -186,7 +189,7 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 |-----------|-------------|---------|
 | `pgpool.enabled` | Enable PGPool-II | `false` |
 | `pgpool.image.repository` | PGPool-II image repository | `cagriekin/pgpool` |
-| `pgpool.image.tag` | PGPool-II image tag | `4.7.0` |
+| `pgpool.image.tag` | PGPool-II image tag | `4.7.1` |
 | `pgpool.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `pgpool.replicaCount` | Number of PGPool-II instances | `1` |
 | `pgpool.numInitChildren` | Number of worker processes | `32` |
@@ -206,11 +209,17 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 | `pgpool.resources.requests.memory` | Memory request | `128Mi` |
 | `pgpool.resources.limits.cpu` | CPU limit | `500m` |
 | `pgpool.resources.limits.memory` | Memory limit | `512Mi` |
+| `pgpool.podSecurityContext` | Pod-level securityContext for PGPool-II | `{runAsNonRoot: true, seccompProfile.type: RuntimeDefault}` |
+| `pgpool.containerSecurityContext` | Container-level securityContext for PGPool-II | `{runAsUser: 999, runAsGroup: 999, allowPrivilegeEscalation: false, capabilities.drop: [ALL]}` |
 | `pgpool.podAnnotations` | Annotations for PGPool-II pods | `{}` |
 | `pgpool.affinity` | Affinity rules for PGPool-II pods | `{}` |
+| `pgpool.topologySpreadConstraints` | Topology spread constraints | `[]` |
+| `pgpool.nodeSelector` | Node selector for PGPool-II pods | `{}` |
+| `pgpool.tolerations` | Tolerations for PGPool-II pods | `[]` |
 | `pgpool.logging.logConnections` | Log client connections | `true` |
 | `pgpool.logging.logStatement` | Log SQL statements | `false` |
 | `pgpool.logging.logPerNodeStatement` | Log backend routing | `false` |
+| `pgpool.logging.logMinMessages` | Minimum log message level | `warning` |
 
 #### TCP Keepalive
 
@@ -240,6 +249,14 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 | `pgpool.metrics.resources.requests.memory` | Memory request | `64Mi` |
 | `pgpool.metrics.resources.limits.cpu` | CPU limit | `200m` |
 | `pgpool.metrics.resources.limits.memory` | Memory limit | `128Mi` |
+| `pgpool.metrics.livenessProbe.initialDelaySeconds` | Liveness initial delay | `30` |
+| `pgpool.metrics.livenessProbe.periodSeconds` | Liveness check interval | `30` |
+| `pgpool.metrics.livenessProbe.timeoutSeconds` | Liveness timeout | `15` |
+| `pgpool.metrics.livenessProbe.failureThreshold` | Liveness failure threshold | `5` |
+| `pgpool.metrics.readinessProbe.initialDelaySeconds` | Readiness initial delay | `10` |
+| `pgpool.metrics.readinessProbe.periodSeconds` | Readiness check interval | `30` |
+| `pgpool.metrics.readinessProbe.timeoutSeconds` | Readiness timeout | `15` |
+| `pgpool.metrics.readinessProbe.failureThreshold` | Readiness failure threshold | `3` |
 
 ### Secret Parameters
 
@@ -385,6 +402,8 @@ scrape_configs:
 | `prometheusExporter.image.repository` | Exporter image repository | `quay.io/prometheuscommunity/postgres-exporter` |
 | `prometheusExporter.image.tag` | Exporter image tag | `v0.19.1` |
 | `prometheusExporter.image.pullPolicy` | Image pull policy | `IfNotPresent` |
+| `prometheusExporter.podSecurityContext` | Pod-level securityContext for exporter | `{runAsNonRoot: true, seccompProfile.type: RuntimeDefault}` |
+| `prometheusExporter.containerSecurityContext` | Container-level securityContext for exporter containers | `{runAsUser: 65534, runAsGroup: 65534, allowPrivilegeEscalation: false, capabilities.drop: [ALL]}` |
 | `prometheusExporter.podAnnotations` | Annotations for exporter pods | `{}` |
 | `prometheusExporter.service.type` | Exporter service type | `ClusterIP` |
 | `prometheusExporter.service.port` | Exporter service port | `9116` |
@@ -473,10 +492,10 @@ helm install my-postgres cagriekin/pg \
 ### How It Works
 
 - **WAL archiving**: The primary continuously archives WAL segments to S3 via `archive_command`. Standbys do not archive (PostgreSQL default with `archive_mode = on`).
-- **Full backups**: Weekly (default Sunday 1am) via the pgbackrest-scheduler sidecar.
-- **Differential backups**: Daily (default Mon-Sat 1am). Only changed blocks since the last full backup are stored.
+- **Full backups**: Weekly (default Sunday 1am) via a CronJob that execs into the pgbackrest sidecar on the current primary.
+- **Differential backups**: Daily (default Mon-Sat 1am) via a separate CronJob. Only changed blocks since the last full backup are stored.
 - **Failover**: After repmgr promotes a standby, the new primary starts archiving WAL and running backups automatically.
-- **Verification**: After each backup, `pgbackrest verify` validates backup integrity and WAL continuity.
+- **Verification**: After each backup, `pgbackrest info` confirms the backup was recorded in the repository.
 
 ### pgBackRest Parameters
 
@@ -495,10 +514,21 @@ helm install my-postgres cagriekin/pg \
 | `pgbackrest.retention.diff` | Number of differential backups to retain | `14` |
 | `pgbackrest.schedule.full` | Cron schedule for full backups | `0 1 * * 0` |
 | `pgbackrest.schedule.diff` | Cron schedule for differential backups | `0 1 * * 1-6` |
-| `pgbackrest.resources.requests.cpu` | Scheduler sidecar CPU request | `100m` |
-| `pgbackrest.resources.requests.memory` | Scheduler sidecar memory request | `256Mi` |
-| `pgbackrest.resources.limits.cpu` | Scheduler sidecar CPU limit | `1000m` |
-| `pgbackrest.resources.limits.memory` | Scheduler sidecar memory limit | `1Gi` |
+| `pgbackrest.resources.requests.cpu` | Sidecar CPU request | `100m` |
+| `pgbackrest.resources.requests.memory` | Sidecar memory request | `256Mi` |
+| `pgbackrest.resources.limits.cpu` | Sidecar CPU limit | `1000m` |
+| `pgbackrest.resources.limits.memory` | Sidecar memory limit | `1Gi` |
+| `pgbackrest.cronjob.image.repository` | CronJob image | `alpine/k8s` |
+| `pgbackrest.cronjob.image.tag` | CronJob image tag | `1.31.3` |
+| `pgbackrest.cronjob.concurrencyPolicy` | CronJob concurrency policy | `Forbid` |
+| `pgbackrest.cronjob.backoffLimit` | Job backoff limit | `0` |
+| `pgbackrest.cronjob.activeDeadlineSeconds` | Job timeout | `21600` |
+| `pgbackrest.cronjob.successfulJobsHistoryLimit` | Successful job history limit | `3` |
+| `pgbackrest.cronjob.failedJobsHistoryLimit` | Failed job history limit | `3` |
+| `pgbackrest.cronjob.resources.requests.cpu` | CronJob CPU request | `50m` |
+| `pgbackrest.cronjob.resources.requests.memory` | CronJob memory request | `64Mi` |
+| `pgbackrest.cronjob.resources.limits.cpu` | CronJob CPU limit | `200m` |
+| `pgbackrest.cronjob.resources.limits.memory` | CronJob memory limit | `128Mi` |
 
 ### Check Backup Status
 
