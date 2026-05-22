@@ -24,6 +24,19 @@ spec:
             runAsNonRoot: true
             seccompProfile:
               type: RuntimeDefault
+          initContainers:
+            - name: mc-installer
+              image: "{{ .Values.backup.mc.image.repository }}:{{ .Values.backup.mc.image.tag }}"
+              imagePullPolicy: {{ .Values.backup.mc.image.pullPolicy }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+              command: ["/bin/sh", "-c", "cp /usr/bin/mc /tools/mc && chmod 0755 /tools/mc"]
+              volumeMounts:
+                - name: tools
+                  mountPath: /tools
           containers:
             - name: backup
               image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
@@ -75,9 +88,13 @@ spec:
               volumeMounts:
                 - name: scripts
                   mountPath: /scripts
+                - name: tools
+                  mountPath: /tools
           volumes:
             - name: scripts
               configMap:
                 name: {{ include "pg.fullname" . }}-backup
                 defaultMode: 0755
+            - name: tools
+              emptyDir: {}
 {{- end }}

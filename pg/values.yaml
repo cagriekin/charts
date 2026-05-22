@@ -299,6 +299,11 @@ backup:
     name: ""
     accessKeyIdKey: access-key-id
     secretAccessKeyKey: secret-access-key
+  mc:
+    image:
+      repository: minio/mc
+      tag: RELEASE.2024-11-21T17-21-54Z
+      pullPolicy: IfNotPresent
   activeDeadlineSeconds: 3600
   backoffLimit: 1
   retentionDays: 7
