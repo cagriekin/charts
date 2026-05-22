@@ -1,5 +1,29 @@
 # pgvector chart changelog
 
+## 0.6.61
+
+### Fixed
+
+- Bypass the repmgr image's `repmgrd-entrypoint.sh` and exec `repmgrd`
+  directly from the StatefulSet's repmgrd container command. The image
+  entrypoint re-runs `standby register --force` (which on PG18 +
+  repmgr 5.5.0-7 lands `type=''` again) and then verifies via
+  `psql -h <primary> -U repmgr -d repmgr` without `PGPASSWORD`. Internal
+  cluster traffic hits `scram-sha-256` in pg_hba, the verify query
+  comes back empty, and the loop exits 1 with
+  `Primary does not show node N as standby (current type: )`. The
+  pre-register block in this chart already registers the standby and
+  backfills `type='standby'`, so the image's register+verify is
+  redundant.
+
+## Migrating from 0.6.60
+
+`helm upgrade my-release cagriekin/pgvector` is the entire migration.
+No PVC recreate, no StatefulSet recreate, no password rotation, no
+forced failover. Standby pods that were CrashLooping on repmgrd
+converge on their next restart; unaffected clusters see no behaviour
+change.
+
 ## 0.6.60
 
 ### Fixed
