@@ -258,7 +258,6 @@ spec:
 {{- else }}
           lifecycle:
 {{- include "pg.preStop" . | nindent 12 }}
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.pgHba .Values.postgresql.lifecycle.postStart.additionalCommands }}
             postStart:
               exec:
                 command:
@@ -273,17 +272,52 @@ spec:
                           echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
                         fi
                         {{- end }}
+                        # PG18 + repmgr MD5/SCRAM auth deadlock fix: the cagriekin/repmgr image
+                        # entrypoint creates managed users (pgvector, repmgr) with MD5-hashed
+                        # passwords while only writing `scram-sha-256` rules into pg_hba.conf,
+                        # so every network auth attempt fails with "User <X> does not have a
+                        # valid SCRAM secret" and traps the StatefulSet in CrashLoopBackOff.
+                        # We patch pg_hba.conf to add an `md5` fallback line below every
+                        # `scram-sha-256` line (the md5 method accepts SCRAM-hashed users on
+                        # PG14+ so it's a safe back-compat fallback) and re-hash any managed
+                        # user still on MD5 so we converge on SCRAM. Both steps are idempotent.
+                        # TODO: drop the md5 fallback once the chart's minimum PG is the first
+                        # release without MD5 password storage.
+                        HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tA -c "SHOW hba_file" 2>/dev/null)
+                        HBA_SENTINEL="# cagriekin-charts: md5 fallback applied"
+                        if [ -n "$HBA_FILE" ] && [ -f "$HBA_FILE" ] && ! grep -qF "$HBA_SENTINEL" "$HBA_FILE"; then
+                          HBA_TMP="${HBA_FILE}.cagriekin.tmp"
+                          awk '{print} /^[[:space:]]*host[[:space:]]+(all|replication)[[:space:]]+.*[[:space:]]+scram-sha-256[[:space:]]*$/ { m=$0; sub(/scram-sha-256[[:space:]]*$/, "md5", m); print m }' "$HBA_FILE" > "$HBA_TMP"
+                          printf '\n%s\n' "$HBA_SENTINEL" >> "$HBA_TMP"
+                          cp "$HBA_TMP" "$HBA_FILE"
+                          rm -f "$HBA_TMP"
+                        fi
+                        fix_user_auth() {
+                          local target_user="$1"
+                          local target_pass="$2"
+                          [ -z "$target_user" ] && return 0
+                          [ -z "$target_pass" ] && return 0
+                          local needs_migrate
+                          needs_migrate=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tA \
+                            -v u="$target_user" \
+                            -c "SELECT EXISTS (SELECT 1 FROM pg_authid WHERE rolname = :'u' AND rolpassword LIKE 'md5%');" 2>/dev/null)
+                          if [ "$needs_migrate" = "t" ]; then
+                            psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 \
+                              -v u="$target_user" -v p="$target_pass" \
+                              -c "SET password_encryption='scram-sha-256'; ALTER USER :\"u\" WITH PASSWORD :'p';" >/dev/null 2>&1 || true
+                          fi
+                        }
+                        fix_user_auth "$POSTGRES_USER" "$POSTGRES_PASSWORD"
+                        fix_user_auth "$REPMGR_USER" "$REPMGR_PASSWORD"
                         {{- if .Values.postgresql.pgHba }}
-                        HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
+                        HBA_FILE_USER=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
                         {{- range .Values.postgresql.pgHba }}
-                        if ! grep -qF '{{ . }}' "$HBA_FILE"; then
-                          sed -i '$ a {{ . }}' "$HBA_FILE"
+                        if ! grep -qF '{{ . }}' "$HBA_FILE_USER"; then
+                          sed -i '$ a {{ . }}' "$HBA_FILE_USER"
                         fi
                         {{- end }}
                         {{- end }}
-                        {{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.pgHba }}
                         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
-                        {{- end }}
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
                         HEADLESS="{{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local"
                         PRIMARY_HOST=""
@@ -302,7 +336,6 @@ spec:
                       fi
                       sleep 1
                     done
-{{- end }}
 {{- end }}
 {{- if .Values.postgresql.livenessProbe.enabled }}
           livenessProbe:
