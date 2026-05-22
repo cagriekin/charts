@@ -17,6 +17,9 @@ rules:
     resources: ["services"]
     resourceNames: ["{{ include "pg.fullname" . }}"]
     verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
 {{- if .Values.pgpool.enabled }}
   - apiGroups: ["apps"]
     resources: ["deployments"]
