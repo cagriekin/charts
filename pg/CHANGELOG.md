@@ -4,12 +4,22 @@
 
 ### Fixed
 
-- `fix_user_auth` postStart hook (0.5.54) embedded `:'u'` / `:'p'` inside a
-  dollar-quoted DO block where psql substitution does not run, so the
-  MD5→SCRAM rehash silently failed server-side and never executed. Values
-  now flow through per-session GUCs read via `current_setting()`. PG<14
-  skip, `format('%I/%L')` quoting, and `rolpassword LIKE 'md5%'`
-  idempotency gate preserved.
+- `fix_user_auth` postStart hook (0.5.54) used
+  `psql -c "DO $$ ... :'u' ... $$;"`. `psql -c` does **not** perform
+  `:'var'` substitution — per docs, the command must contain "no
+  psql-specific features". The server received `:'u'` literally and
+  rejected every call with `ERROR: syntax error at or near ":"`; the
+  MD5→SCRAM rehash silently never ran. Connectivity kept working because
+  the md5-fallback line in `pg_hba.conf` accepted the legacy hashes,
+  masking the failure on noisy clusters.
+  Fix: build the SQL into a bash variable and feed it to psql via
+  here-string (`<<<`), which goes through the MainLoop reader where
+  `:'var'` IS substituted. Values flow through per-session GUCs
+  (`myvars.tgt_user` / `myvars.tgt_pass` — `user` would clash with the
+  reserved keyword) read back inside the DO block via `current_setting()`.
+  PG<14 skip, `format('%I/%L')` quoting, idempotent `rolpassword LIKE
+  'md5%'` gate preserved. Failure now logs a loud line to pod stdout
+  instead of being swallowed by `>/dev/null`.
 - Standby `repmgr.nodes` row landed with `type=''` on the primary because
   `cagriekin/repmgr:trixie-5.5.0-7`'s entrypoint runs `repmgr standby
   register --force` without `--upstream-node-id`, crashing the standby

@@ -306,41 +306,54 @@ spec:
                           rm -f "$HBA_TMP"
                         fi
                         {{- if .Values.postgresql.migrateLegacyMd5Users }}
-                        # `:'u'` / `:'p'` are NOT substituted inside a dollar-quoted
-                        # DO block (psql limitation), so 0.6.58 failed server-side and
-                        # the rehash silently never ran. Hoist values into per-session
-                        # GUCs in regular SQL and read them back via current_setting().
+                        # 0.6.58 used `psql -c "DO \$\$ ... :'u' ... \$\$;"`. Two
+                        # broken assumptions: (a) psql does NOT perform :'var'
+                        # substitution inside `-c` (docs: "no psql-specific
+                        # features"); (b) even if it did, substitution is also
+                        # skipped inside dollar-quoted constants. The server saw
+                        # `:'u'` literal, raised `syntax error at or near ":"`,
+                        # and the rehash silently never ran. Connectivity kept
+                        # working because the md5-fallback line in pg_hba.conf
+                        # masked the failure.
+                        #
+                        # Fix: feed SQL via stdin (psql MainLoop, where :'var'
+                        # IS substituted) and hoist user/pass into per-session
+                        # GUCs read back inside the DO block via current_setting().
+                        # GUC names use `tgt_user`/`tgt_pass` — `user` would
+                        # collide with the SQL reserved keyword.
                         fix_user_auth() {
                           local target_user="$1"
                           local target_pass="$2"
                           [ -z "$target_user" ] && return 0
                           [ -z "$target_pass" ] && return 0
-                          psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+                          local sql="
+                            SET myvars.tgt_user = :'u';
+                            SET myvars.tgt_pass = :'p';
+                            DO \$\$
+                            DECLARE
+                              v_user TEXT := current_setting('myvars.tgt_user');
+                              v_pass TEXT := current_setting('myvars.tgt_pass');
+                            BEGIN
+                              IF current_setting('server_version_num')::int < 140000 THEN
+                                RAISE NOTICE 'Skipping md5->scram migration on PG < 14 (no md5->scram auto-promotion in pg_hba)';
+                                RETURN;
+                              END IF;
+                              IF EXISTS (
+                                SELECT 1 FROM pg_authid
+                                WHERE rolname = v_user AND rolpassword LIKE 'md5%'
+                              ) THEN
+                                SET LOCAL password_encryption = 'scram-sha-256';
+                                EXECUTE format('ALTER USER %I WITH PASSWORD %L', v_user, v_pass);
+                              END IF;
+                            END
+                            \$\$;"
+                          if ! psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
                             -v ON_ERROR_STOP=1 \
                             -v u="$target_user" \
                             -v p="$target_pass" \
-                            --quiet --no-psqlrc -c "
-                              SET myvars.user = :'u';
-                              SET myvars.pass = :'p';
-                              DO \$\$
-                              DECLARE
-                                v_user TEXT := current_setting('myvars.user');
-                                v_pass TEXT := current_setting('myvars.pass');
-                              BEGIN
-                                IF current_setting('server_version_num')::int < 140000 THEN
-                                  RAISE NOTICE 'Skipping md5->scram migration on PG < 14 (no md5->scram auto-promotion in pg_hba)';
-                                  RETURN;
-                                END IF;
-                                IF EXISTS (
-                                  SELECT 1 FROM pg_authid
-                                  WHERE rolname = v_user AND rolpassword LIKE 'md5%'
-                                ) THEN
-                                  SET LOCAL password_encryption = 'scram-sha-256';
-                                  EXECUTE format('ALTER USER %I WITH PASSWORD %L', v_user, v_pass);
-                                END IF;
-                              END
-                              \$\$;
-                            " >/dev/null
+                            --no-psqlrc <<<"$sql"; then
+                            echo "fix_user_auth: md5->scram rehash failed for ${target_user} (psql returned non-zero, see error above)" >&2
+                          fi
                         }
                         fix_user_auth "$POSTGRES_USER" "$POSTGRES_PASSWORD"
                         fix_user_auth "$REPMGR_USER" "$REPMGR_PASSWORD"
