@@ -166,13 +166,13 @@ entries:
     version: 0.6.57
   - apiVersion: v2
     appVersion: "18.1"
-    created: "2026-05-17T11:07:46.124900742Z"
+    created: "2026-05-22T07:04:23.888802326Z"
     dependencies:
     - name: common
       repository: file://../common
       version: 0.1.0
     description: PostgreSQL with pgvector extension and optional PGPool-II
-    digest: 6bd3a3c26980418d6453f7a5fb924b902efe6416d04e5090ac02a70a3e19372d
+    digest: 5c3c79d3055401ff694be2a615f18066ee4489a3fde3125326926b2f09285e33
     keywords:
     - PostgreSQL
     - pgvector
@@ -367,4 +367,4 @@ entries:
     urls:
     - https://cagriekin.github.io/charts/redis-0.2.0.tgz
     version: 0.2.0
-generated: "2026-05-21T14:38:30.331777603Z"
+generated: "2026-05-22T07:04:23.88709464Z"
