@@ -4,33 +4,24 @@
 
 ### Fixed
 
-- Defensive backfill for `repmgr.nodes.type` after `standby register`.
-  Some `cagriekin/repmgr:trixie-5.5.0-7` + PG18 combinations report
-  `standby registration complete` but leave the inserted row's `type`
-  column empty on the primary, after which the image's own post-init
-  verify SELECT trips with `Primary does not show node N as standby
-  (current type: )` and CrashLoopBackOffs the standby pod. The
-  `repmgrd` wrapper now follows its pre-register call with
-  `UPDATE repmgr.nodes SET type='standby' WHERE node_id=<local> AND
-  (type IS NULL OR type='')` against the primary. The WHERE clause
-  makes it a no-op on every row that's already correctly typed, so it
-  ships safely to clusters that were never affected.
-- Test suite: `pg/tests/test-repmgr.sh` now asserts
-  `repmgr.nodes.type='standby'`, `active=true`, and
-  `upstream_node_id=1000` for every standby. New
-  `pg/tests/test-repmgr-chaos.sh` deletes the standby pod three times,
-  waits for it to come back Running, and re-asserts the row each time —
-  the regression-trap that catches both the original Bug 2 and any
-  future image-side recurrence.
+- Defensive `UPDATE repmgr.nodes SET type='standby' WHERE node_id=<local>
+  AND (type IS NULL OR type='')` after pre-register on the primary.
+  Some PG18 + repmgr image combos report `standby registration complete`
+  but leave the row's `type` empty, breaking the image's verify-loop
+  with `Primary does not show node N as standby (current type: )`.
+  WHERE clause makes the UPDATE a no-op on already-correctly-typed
+  rows.
+- Test: new `pg/tests/test-repmgr-chaos.sh` deletes the standby pod
+  3 times and re-asserts `type='standby'` after each replacement —
+  the post-restart re-occurrence shape that manual SQL fixes cannot
+  cover. Wired into `Makefile` and CI.
 
 ## Migrating from 0.6.59
 
 `helm upgrade my-release cagriekin/pgvector` is the entire migration.
 No PVC recreate, no StatefulSet recreate, no password rotation, no
-forced failover, no new required `values.yaml` field, no behaviour
-change on clusters that never hit the empty-type bug. On affected
-clusters the next standby pod restart converges
-`repmgr.nodes.type='standby'` automatically.
+forced failover. Affected clusters converge `type='standby'` on the
+next standby restart; unaffected clusters see no behaviour change.
 
 ## 0.6.59
 

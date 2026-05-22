@@ -473,21 +473,14 @@ spec:
                   LOCAL_NID=$((ORDINAL + 1000))
                   echo "pre-register: standby register --upstream-node-id=${PNID}"
                   repmgr -f /etc/repmgr/repmgr.conf standby register --upstream-node-id="${PNID}" --force || true
-                  # Defensive: some cagriekin/repmgr:trixie-5.5.0-7 + PG18
-                  # combinations leave the inserted row's `type` column empty
-                  # after `standby register`, so the image's own post-init
-                  # verify SELECT trips with "Primary does not show node N as
-                  # standby (current type: )". Force-set it on the primary;
-                  # the WHERE clause makes this a no-op on every row that's
-                  # already correctly typed. Drop once the image binds the
-                  # type column explicitly.
+                  # Defensive: some PG18 + repmgr image combos land the row
+                  # with type=''. WHERE clause makes this a no-op on rows
+                  # that are already correctly typed.
                   PGPASSWORD="${REPMGR_PASSWORD}" psql -h "$P" -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
                     -v ON_ERROR_STOP=1 --no-psqlrc -c "
-                      UPDATE repmgr.nodes
-                         SET type = 'standby'
-                       WHERE node_id = ${LOCAL_NID}
-                         AND (type IS NULL OR type = '');
-                    " || echo "pre-register: type-backfill UPDATE returned non-zero (ignored, see error above)" >&2
+                      UPDATE repmgr.nodes SET type='standby'
+                       WHERE node_id=${LOCAL_NID} AND (type IS NULL OR type='');
+                    " || echo "pre-register: type-backfill UPDATE failed (ignored)" >&2
                 fi
               fi
               exec /usr/local/bin/entrypoint.sh repmgrd

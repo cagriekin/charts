@@ -1,14 +1,7 @@
 #!/bin/bash
-# test-repmgr-chaos.sh
-#
 # Regression trap for the PG18 + repmgr "empty type column" bug.
-# Installs a 1 primary + 1 standby repmgr cluster, then deletes the
-# standby pod 3 times and re-asserts that the row in repmgr.nodes still
-# reads `type='standby'` after each replacement. The original bug only
-# surfaced on pod re-creation (the image's `standby register --force`
-# UPDATE re-fired and zeroed the type), so this loop is the one cell
-# that catches both the original Bug 2 and any future image-side
-# recurrence.
+# Installs 1+1 repmgr, deletes the standby pod 3 times, re-asserts
+# repmgr.nodes.type='standby' after each replacement.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
