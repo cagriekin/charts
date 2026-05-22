@@ -277,21 +277,35 @@ spec:
                         # passwords while only writing `scram-sha-256` rules into pg_hba.conf,
                         # so every network auth attempt fails with "User <X> does not have a
                         # valid SCRAM secret" and traps the StatefulSet in CrashLoopBackOff.
-                        # We patch pg_hba.conf to add an `md5` fallback line below every
-                        # `scram-sha-256` line (the md5 method accepts SCRAM-hashed users on
-                        # PG14+ so it's a safe back-compat fallback) and re-hash any managed
-                        # user still on MD5 so we converge on SCRAM. Both steps are idempotent.
-                        # TODO: drop the md5 fallback once the chart's minimum PG is the first
-                        # release without MD5 password storage.
+                        #
+                        # We patch pg_hba.conf to insert an `md5` line ABOVE every existing
+                        # `scram-sha-256` line. pg_hba.conf is matched top-down with no
+                        # fall-through on auth failure, so the md5 rule must come first to
+                        # catch legacy MD5-hashed users (managed and custom, e.g. created via
+                        # additionalCommands). On PG14+ the server auto-promotes md5 method
+                        # to SCRAM when the stored password is SCRAM, so SCRAM-hashed users
+                        # still authenticate via SCRAM wire protocol — same security, more
+                        # compat. Marker comment makes the rewrite idempotent.
+                        #
+                        # Optionally re-hash managed users (POSTGRES_USER, REPMGR_USER) from
+                        # MD5 to SCRAM so we converge on the modern hash. Gated by
+                        # postgresql.migrateLegacyMd5Users (default true). When false, only
+                        # the pg_hba fix runs and existing MD5 hashes are preserved; legacy
+                        # users keep authenticating via the md5 rule above. The migration
+                        # block itself is idempotent (gated on rolpassword LIKE 'md5%').
+                        #
+                        # TODO: drop the md5 line and the migrate flag once the chart's
+                        # minimum PG is the first release without MD5 password storage.
                         HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tA -c "SHOW hba_file" 2>/dev/null)
-                        HBA_SENTINEL="# cagriekin-charts: md5 fallback applied"
+                        HBA_SENTINEL="# cagriekin-charts: md5 fallback applied (md5-first)"
                         if [ -n "$HBA_FILE" ] && [ -f "$HBA_FILE" ] && ! grep -qF "$HBA_SENTINEL" "$HBA_FILE"; then
                           HBA_TMP="${HBA_FILE}.cagriekin.tmp"
-                          awk '{print} /^[[:space:]]*host[[:space:]]+(all|replication)[[:space:]]+.*[[:space:]]+scram-sha-256[[:space:]]*$/ { m=$0; sub(/scram-sha-256[[:space:]]*$/, "md5", m); print m }' "$HBA_FILE" > "$HBA_TMP"
+                          awk '/^[[:space:]]*host[[:space:]]+(all|replication)[[:space:]]+.*[[:space:]]+scram-sha-256[[:space:]]*$/ { m=$0; sub(/scram-sha-256[[:space:]]*$/, "md5", m); print m } {print}' "$HBA_FILE" > "$HBA_TMP"
                           printf '\n%s\n' "$HBA_SENTINEL" >> "$HBA_TMP"
                           cp "$HBA_TMP" "$HBA_FILE"
                           rm -f "$HBA_TMP"
                         fi
+                        {{- if .Values.postgresql.migrateLegacyMd5Users }}
                         fix_user_auth() {
                           local target_user="$1"
                           local target_pass="$2"
@@ -309,6 +323,7 @@ spec:
                         }
                         fix_user_auth "$POSTGRES_USER" "$POSTGRES_PASSWORD"
                         fix_user_auth "$REPMGR_USER" "$REPMGR_PASSWORD"
+                        {{- end }}
                         {{- if .Values.postgresql.pgHba }}
                         HBA_FILE_USER=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
                         {{- range .Values.postgresql.pgHba }}

@@ -89,6 +89,13 @@ postgresql:
     # - "host all all 10.0.0.0/8 md5"
     # - "host replication repmgr 10.0.0.0/8 trust"
 
+  # When repmgr.enabled is true, re-hash any managed user (POSTGRES_USER,
+  # REPMGR_USER) whose stored password is still MD5 to SCRAM at pod startup.
+  # Idempotent (no-op once everyone is SCRAM-hashed). Set to false to keep
+  # existing MD5 hashes; the md5 fallback line that the chart writes into
+  # pg_hba.conf will still let them authenticate. Recommended: true.
+  migrateLegacyMd5Users: true
+
   extensions:
     enabled: false
 
