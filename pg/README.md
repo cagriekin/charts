@@ -70,6 +70,12 @@ helm install my-postgres cagriekin/pg \
   --set postgresql.existingSecret.repmgrPasswordKey=repmgr-pass
 ```
 
+Without an existing secret the chart generates random passwords on install
+and reuses them on subsequent upgrades by looking up the live secret.
+Helm's `lookup` returns nothing under `helm template`/`--dry-run`, so
+rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
+`postgresql.existingSecret` to keep credentials stable.
+
 ## Configuration
 
 ### PostgreSQL Parameters
@@ -453,6 +459,11 @@ kubectl create job --from=cronjob/my-postgres-backup manual-backup
 | `backup.existingSecret.name` | Secret containing S3 credentials | `""` |
 | `backup.existingSecret.accessKeyIdKey` | Key for access key ID in secret | `access-key-id` |
 | `backup.existingSecret.secretAccessKeyKey` | Key for secret access key in secret | `secret-access-key` |
+| `backup.mc.image.repository` | MinIO client image for the mc-installer init container | `minio/mc` |
+| `backup.mc.image.tag` | MinIO client image tag | `RELEASE.2024-11-21T17-21-54Z` |
+| `backup.mc.image.pullPolicy` | MinIO client image pull policy | `IfNotPresent` |
+| `backup.podSecurityContext` | Backup pod security context | `runAsNonRoot: true`, `seccompProfile: RuntimeDefault` |
+| `backup.containerSecurityContext` | Backup container security context | `runAsUser: 999`, `runAsGroup: 999`, no privilege escalation, all capabilities dropped |
 | `backup.activeDeadlineSeconds` | Job timeout in seconds | `3600` |
 | `backup.backoffLimit` | Number of retries before marking job as failed | `1` |
 | `backup.retentionDays` | Days to retain backups before cleanup | `7` |

@@ -1,5 +1,38 @@
 # pg chart changelog
 
+## 0.5.59
+
+### Fixed
+
+- Backup CronJob pods never started: the pod spec set `runAsNonRoot: true`
+  without `runAsUser`, and both the postgres and minio/mc images default
+  to root, so the kubelet rejected container creation with
+  `CreateContainerConfigError` until the job hit `activeDeadlineSeconds`
+  (`DeadlineExceeded`, no logs, no events by morning). Backup pod and
+  container security contexts are now configurable via
+  `backup.podSecurityContext` and `backup.containerSecurityContext`,
+  defaulting to `runAsUser: 999` / `runAsGroup: 999` (the postgres uid in
+  the official image).
+- Wired `test-backup-restore` into the `test-cluster` Make target so the
+  backup path is exercised by the standard test run.
+- Generated secret rotated `password` and `repmgr-password` on every
+  `helm upgrade` (`randAlphaNum` with no reuse), so any upgrade that
+  added a standby deadlocked: the new pod mounted fresh credentials the
+  running cluster did not have and `repmgr-init` looped on
+  `password authentication failed` until the rollout timed out
+  (`test-upgrade` failure, Ready 2/3). The secret template now reuses
+  values from the live secret via `lookup` and only generates passwords
+  that do not exist yet. Note: `lookup` returns nothing under
+  `helm template`/`--dry-run`, so rendering pipelines that never talk to
+  the cluster (e.g. ArgoCD) should keep using
+  `postgresql.existingSecret`.
+
+## Migrating from 0.5.58
+
+`helm upgrade my-release cagriekin/pg` is the entire migration. No PVC
+recreate, no StatefulSet recreate, no password rotation, no forced
+failover.
+
 ## 0.5.58
 
 ### Fixed

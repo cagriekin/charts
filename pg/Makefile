@@ -32,7 +32,7 @@ test-template:
 # Run independent suites in parallel with -j
 # test-repmgr-failover is sequential (repmgr then failover)
 # test-minimal, test-repmgr-failover, test-full, test-upgrade run in parallel
-test-cluster: test-minimal test-repmgr-failover test-repmgr-chaos test-full test-upgrade test-config test-config-repmgr
+test-cluster: test-minimal test-repmgr-failover test-repmgr-chaos test-full test-upgrade test-config test-config-repmgr test-backup-restore
 	@echo "All test suites passed"
 
 # Chain: repmgr install -> failover test (must be sequential)
