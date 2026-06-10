@@ -1,5 +1,23 @@
 # pg chart changelog
 
+## 0.5.60
+
+### Fixed
+
+- Backup against TLS S3 endpoints (real AWS S3) failed with
+  `x509: certificate signed by unknown authority`: the postgres image
+  ships no CA bundle (`/etc/ssl/certs/ca-certificates.crt` absent in
+  `postgres:18.1-trixie`). The 0.5.59 kind test used plain-HTTP MinIO,
+  so the gap only surfaced in production. The mc-installer init
+  container now also copies the mc image's CA bundle into the shared
+  volume and the backup script exports `SSL_CERT_FILE` pointing at it.
+
+## Migrating from 0.5.59
+
+`helm upgrade my-release cagriekin/pg` is the entire migration. No PVC
+recreate, no StatefulSet recreate, no password rotation, no forced
+failover.
+
 ## 0.5.59
 
 ### Fixed
