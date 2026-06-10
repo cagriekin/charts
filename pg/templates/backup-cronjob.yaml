@@ -21,14 +21,17 @@ spec:
         spec:
           restartPolicy: OnFailure
           securityContext:
-            runAsNonRoot: true
-            seccompProfile:
-              type: RuntimeDefault
+            {{- toYaml .Values.backup.podSecurityContext | nindent 12 }}
           initContainers:
             - name: mc-installer
               image: "{{ .Values.backup.mc.image.repository }}:{{ .Values.backup.mc.image.tag }}"
               imagePullPolicy: {{ .Values.backup.mc.image.pullPolicy }}
+              # /usr/bin/mc in the minio/mc image is mode 0711, readable only
+              # by root, so the copy must run as root; the backup container
+              # stays non-root
               securityContext:
+                runAsUser: 0
+                runAsNonRoot: false
                 allowPrivilegeEscalation: false
                 capabilities:
                   drop:
@@ -42,10 +45,7 @@ spec:
               image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
               imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
               securityContext:
-                allowPrivilegeEscalation: false
-                capabilities:
-                  drop:
-                    - ALL
+                {{- toYaml .Values.backup.containerSecurityContext | nindent 16 }}
               command: ["/bin/bash", "/scripts/backup.sh"]
               env:
                 - name: POSTGRES_HOST
