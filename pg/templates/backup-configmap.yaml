@@ -46,6 +46,17 @@ data:
     echo "Backup integrity verified"
     rm -f /tmp/verify_backup.dump
 
+    # Guard against wiping the whole prefix: the dump uploaded above must be
+    # visible as a recent object. If it is not (upload landed elsewhere,
+    # prefix mismatch, clock skew), deletion must not run.
+    echo "Verifying a recent backup exists before retention cleanup..."
+    RECENT_COUNT=$(mc find "s3/${S3_BUCKET}/${S3_PREFIX}/" --newer-than "${RETENTION_DAYS}d" | grep -c . || true)
+    if [ "$RECENT_COUNT" -eq 0 ]; then
+      echo "ERROR: No backup newer than ${RETENTION_DAYS} days found under s3/${S3_BUCKET}/${S3_PREFIX}/ - aborting retention cleanup" >&2
+      exit 1
+    fi
+    echo "Found ${RECENT_COUNT} recent backup(s)"
+
     echo "Running retention cleanup (removing backups older than ${RETENTION_DAYS} days)..."
     mc find "s3/${S3_BUCKET}/${S3_PREFIX}/" --older-than "${RETENTION_DAYS}d" --exec "mc rm {}"
 
