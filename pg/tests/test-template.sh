@@ -1008,5 +1008,30 @@ assert_contains "readonly: updater calls labeling each tick" "${ro_updater}" 'up
 assert_contains "readonly: updater labels with --overwrite for idempotency" "${ro_updater}" 'kubectl label pod "${pod}" -n "${NAMESPACE}" "pg-role=${desired_role}" --overwrite'
 assert_contains "readonly: updater lists pods by chart selector labels" "${ro_updater}" "app.kubernetes.io/instance=test-pg,app.kubernetes.io/component=postgresql"
 
+# --- service-updater Failover Audit Event Tests ---
+
+# Test: service-updater emits a core/v1 PrimaryChanged Event on the Service
+su_audit_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --show-only templates/service-updater-configmap.yaml 2>&1)
+assert_contains "audit event: PrimaryChanged reason present" "${su_audit_cm}" "reason: PrimaryChanged"
+assert_contains "audit event: manifest is core/v1 Event" "${su_audit_cm}" "kind: Event"
+assert_contains "audit event: event regards the primary Service" "${su_audit_cm}" "kind: Service"
+assert_contains "audit event: message carries old and new pod names" "${su_audit_cm}" "message: Primary changed from"
+assert_contains "audit event: event type is Normal" "${su_audit_cm}" "type: Normal"
+assert_contains "audit event: creation failure logged as warning" "${su_audit_cm}" "WARNING: failed to create PrimaryChanged event"
+
+# Test: event emission ordered strictly after the selector patch (patch is
+# correctness, event is observability)
+su_patch_line=$(printf '%s\n' "${su_audit_cm}" | grep -n "kubectl patch service" | head -1 | cut -d: -f1 || true)
+su_event_line=$(printf '%s\n' "${su_audit_cm}" | grep -n 'emit_primary_changed_event "${CURRENT_SELECTOR}"' | head -1 | cut -d: -f1 || true)
+assert_gt "audit event: emission ordered after selector patch" "${su_event_line:-0}" "${su_patch_line:-99999}"
+
+# Test: RBAC role grants create on core events for the audit Event
+su_audit_rbac=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --show-only templates/rbac.yaml 2>&1)
+assert_contains "audit event: rbac role has events resource" "${su_audit_rbac}" 'resources: \["events"\]'
+su_events_rule=$(printf '%s\n' "${su_audit_rbac}" | grep -A 1 'resources: \["events"\]' || true)
+assert_contains "audit event: events rule grants create verb" "${su_events_rule}" 'verbs: \["create"\]'
+
 end_suite
 print_summary
