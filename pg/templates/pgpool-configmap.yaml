@@ -116,9 +116,6 @@ data:
 
     allow_clear_text_frontend_auth = {{ if .Values.pgpool.allowClearTextFrontendAuth }}on{{ else }}off{{ end }}
 
-  pcp.conf: |
-    {{ .Values.pgpool.adminUsername }}:{{ .Values.pgpool.adminPassword | sha256sum }}
-
   pool_hba.conf: |
     local   all         all                               trust
     host    all         all         127.0.0.1/32          trust

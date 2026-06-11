@@ -920,5 +920,63 @@ helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/statefulset.yaml >/dev/null 2>&1 && extpaths_off_rc=0 || extpaths_off_rc=$?
 assert_eq "majorVersion empty: render succeeds with extensions disabled" "0" "${extpaths_off_rc}"
 
+# --- PGPool admin credentials Tests ---
+
+# Test: chart-managed admin Secret renders the values from pgpool.admin
+pcp_secret=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --show-only templates/pgpool-secret.yaml 2>&1)
+assert_contains "pgpool admin: chart-managed secret rendered" "${pcp_secret}" "name: test-pg-pgpool-admin"
+# "admin" base64-encoded
+assert_contains "pgpool admin: secret carries username" "${pcp_secret}" "username: \"YWRtaW4=\""
+assert_contains "pgpool admin: secret carries password" "${pcp_secret}" "password: \"YWRtaW4=\""
+
+# Test: admin Secret is gated on pgpool.enabled
+assert_not_contains "pgpool admin: no admin secret when pgpool disabled" "${minimal}" "pgpool-admin"
+
+# Test: plaintext admin password never lands in a ConfigMap
+pcp_full=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set pgpool.admin.password=pcp-sup3r-secret 2>&1)
+pcp_configmaps=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set pgpool.admin.password=pcp-sup3r-secret \
+  --show-only templates/pgpool-configmap.yaml 2>&1)
+assert_not_contains "pgpool admin: plaintext password absent from pgpool configmap" "${pcp_configmaps}" "pcp-sup3r-secret"
+assert_not_contains "pgpool admin: pcp.conf no longer shipped via configmap" "${pcp_configmaps}" "pcp.conf"
+assert_not_contains "pgpool admin: plaintext password absent from full render" "${pcp_full}" "pcp-sup3r-secret"
+# "pcp-sup3r-secret" base64-encoded
+assert_contains "pgpool admin: full render carries password only base64-encoded" "${pcp_full}" "cGNwLXN1cDNyLXNlY3JldA=="
+
+# Test: deployment wires admin credentials from the chart-managed Secret
+pcp_deploy=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --show-only templates/pgpool-deployment.yaml 2>&1)
+assert_contains "pgpool admin: deployment has PCP_ADMIN_USER env" "${pcp_deploy}" "name: PCP_ADMIN_USER"
+assert_contains "pgpool admin: deployment has PCP_ADMIN_PASSWORD env" "${pcp_deploy}" "name: PCP_ADMIN_PASSWORD"
+pcp_ref_count=$(printf '%s' "${pcp_deploy}" | grep -c "name: test-pg-pgpool-admin" || true)
+assert_eq "pgpool admin: deployment references chart-managed secret twice" "2" "${pcp_ref_count}"
+assert_contains "pgpool admin: init container generates pcp.conf" "${pcp_deploy}" "sha256sum"
+
+# Test: existingSecret mode omits the chart-managed Secret and uses the named one
+pcp_ext=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set pgpool.admin.existingSecret.enabled=true \
+  --set pgpool.admin.existingSecret.name=my-pcp-secret \
+  --set pgpool.admin.existingSecret.usernameKey=pcp-user \
+  --set pgpool.admin.existingSecret.passwordKey=pcp-pass 2>&1)
+assert_not_contains "pgpool admin existingSecret: chart-managed secret omitted" "${pcp_ext}" "test-pg-pgpool-admin"
+assert_contains "pgpool admin existingSecret: named secret referenced" "${pcp_ext}" "name: my-pcp-secret"
+assert_contains "pgpool admin existingSecret: username key referenced" "${pcp_ext}" "key: pcp-user"
+assert_contains "pgpool admin existingSecret: password key referenced" "${pcp_ext}" "key: pcp-pass"
+
+# Test: existingSecret mode without a name fails fast
+pcp_noname=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set pgpool.admin.existingSecret.enabled=true 2>&1) && pcp_noname_rc=0 || pcp_noname_rc=$?
+assert_eq "pgpool admin existingSecret: missing name fails" "1" "${pcp_noname_rc}"
+assert_contains "pgpool admin existingSecret: missing name error names the value" "${pcp_noname}" "pgpool.admin.existingSecret.name is required"
+
+# Test: removed pgpool.adminUsername/adminPassword values fail fast
+pcp_legacy=$(helm template test-pg "${CHART_DIR}" \
+  --set pgpool.enabled=true \
+  --set pgpool.adminPassword=admin 2>&1) && pcp_legacy_rc=0 || pcp_legacy_rc=$?
+assert_eq "pgpool admin: legacy adminPassword fails" "1" "${pcp_legacy_rc}"
+assert_contains "pgpool admin: legacy value error points at pgpool.admin" "${pcp_legacy}" "pgpool.adminUsername and pgpool.adminPassword were removed"
+
 end_suite
 print_summary

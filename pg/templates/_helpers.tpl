@@ -61,6 +61,30 @@
 {{- end }}
 {{- end }}
 
+{{- define "pg.pgpoolAdminSecretName" -}}
+{{- if .Values.pgpool.admin.existingSecret.enabled }}
+{{- required "pgpool.admin.existingSecret.name is required when pgpool.admin.existingSecret.enabled is true" .Values.pgpool.admin.existingSecret.name }}
+{{- else }}
+{{- include "pg.fullname" . }}-pgpool-admin
+{{- end }}
+{{- end }}
+
+{{- define "pg.pgpoolAdminUsernameKey" -}}
+{{- if .Values.pgpool.admin.existingSecret.enabled }}
+{{- .Values.pgpool.admin.existingSecret.usernameKey }}
+{{- else }}
+{{- "username" }}
+{{- end }}
+{{- end }}
+
+{{- define "pg.pgpoolAdminPasswordKey" -}}
+{{- if .Values.pgpool.admin.existingSecret.enabled }}
+{{- .Values.pgpool.admin.existingSecret.passwordKey }}
+{{- else }}
+{{- "password" }}
+{{- end }}
+{{- end }}
+
 {{- define "pg.backupSecretName" -}}
 {{- .Values.backup.existingSecret.name }}
 {{- end }}
