@@ -73,6 +73,23 @@
 {{- .Values.backup.existingSecret.secretAccessKeyKey }}
 {{- end }}
 
+{{/*
+Port implied by an S3 endpoint. Accepts host, host:port, or
+scheme://host[:port]; an explicit port wins, otherwise the scheme
+decides (http 80, anything else 443).
+*/}}
+{{- define "pg.s3EndpointPort" -}}
+{{- $hostport := regexReplaceAll "^[a-zA-Z][a-zA-Z0-9+.-]*://" . "" -}}
+{{- $hostport = splitList "/" $hostport | first -}}
+{{- if regexMatch ":[0-9]+$" $hostport -}}
+{{- splitList ":" $hostport | last -}}
+{{- else if hasPrefix "http://" . -}}
+80
+{{- else -}}
+443
+{{- end -}}
+{{- end }}
+
 {{- define "pg.preStop" -}}
 preStop:
   exec:
