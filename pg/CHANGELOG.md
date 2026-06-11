@@ -1,5 +1,21 @@
 # pg chart changelog
 
+## 0.5.68
+
+### Added
+
+- Per-component `priorityClassName` support (#112):
+  `postgresql.priorityClassName`, `pgpool.priorityClassName`,
+  `prometheusExporter.priorityClassName`, `backup.priorityClassName`
+  and `pgbackrest.cronjob.priorityClassName` (all default `""`), so
+  the database StatefulSet can be scheduled at higher priority than
+  stateless workloads and survive node-pressure evictions.
+
+## Migrating from 0.5.67
+
+`helm upgrade my-release cagriekin/pg` is the entire migration. With
+the default empty values nothing is rendered and no pods roll.
+
 ## 0.5.67
 
 ### Added

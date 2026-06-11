@@ -30,6 +30,9 @@ spec:
           imagePullSecrets:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- with $root.Values.pgbackrest.cronjob.priorityClassName }}
+          priorityClassName: {{ . }}
+          {{- end }}
           serviceAccountName: {{ include "pg.fullname" $root }}-pgbackrest
           restartPolicy: Never
           containers:

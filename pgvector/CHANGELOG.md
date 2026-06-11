@@ -1,5 +1,20 @@
 # pgvector chart changelog
 
+## 0.6.70
+
+### Added
+
+- Per-component `priorityClassName` support (#112, shared templates
+  with the pg chart): `postgresql.priorityClassName`,
+  `pgpool.priorityClassName`, `prometheusExporter.priorityClassName`,
+  `backup.priorityClassName` and
+  `pgbackrest.cronjob.priorityClassName` (all default `""`).
+
+## Migrating from 0.6.69
+
+`helm upgrade my-release cagriekin/pgvector` is the entire migration.
+With the default empty values nothing is rendered and no pods roll.
+
 ## 0.6.69
 
 ### Added
