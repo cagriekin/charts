@@ -63,5 +63,29 @@ assert_eq "work_mem updated to 128MB after upgrade" "128MB" "${work_mem}"
 maint_work_mem=$(pg_exec "${NAMESPACE}" "${POD}" "SHOW maintenance_work_mem" "testuser" "testdb")
 assert_eq "maintenance_work_mem updated to 256MB after upgrade" "256MB" "${maint_work_mem}"
 
+# Test: disabling configuration after enable must not brick restarts (#107).
+# include_dir persists in PGDATA on the PVC; without the cleanup the pod
+# crash-loops on the missing conf.d directory once the mount is removed.
+helm upgrade "${RELEASE}" "${CHART_DIR}" \
+  -n "${NAMESPACE}" \
+  -f "${SCRIPT_DIR}/values-config.yaml" \
+  --set 'postgresql.configuration=null' \
+  --wait --timeout 5m
+
+wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 300
+
+pod_phase=$(kubectl get pod -n "${NAMESPACE}" "${POD}" -o jsonpath='{.status.phase}')
+assert_eq "pod Running after configuration disabled" "Running" "${pod_phase}"
+
+# Exact match: stock initdb postgresql.conf ships a commented
+# "#include_dir = '...'" documentation line that must not count
+include_rc=0
+kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- \
+  grep -q "^include_dir = '/etc/postgresql/conf.d'" /var/lib/postgresql/data/pgdata/postgresql.conf 2>/dev/null || include_rc=$?
+assert_eq "stale include_dir stripped from postgresql.conf" "1" "${include_rc}"
+
+work_mem=$(pg_exec "${NAMESPACE}" "${POD}" "SHOW work_mem" "testuser" "testdb")
+assert_eq "work_mem reverted to default after disable" "4MB" "${work_mem}"
+
 end_suite
 print_summary

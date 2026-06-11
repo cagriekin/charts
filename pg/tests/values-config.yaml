@@ -23,7 +23,9 @@ postgresql:
       memory: 512Mi
 
   persistence:
-    enabled: false
+    enabled: true
+    storageClass: standard
+    size: 1Gi
 
   database: testdb
   username: testuser

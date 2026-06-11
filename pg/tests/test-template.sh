@@ -264,17 +264,23 @@ assert_contains "config repmgr: checksum annotation present" "${config_repmgr}" 
 # Config repmgr: pgHba entries in postStart
 assert_contains "config repmgr: pgHba entry in postStart" "${config_repmgr}" "host all all 10.244.0.0/16 md5"
 
-# Test: no config resources when configuration is empty (defaults)
+# Test: configuration disabled still renders setup-config, which strips a
+# stale include_dir left in PGDATA by a previous enable (#107)
 no_config=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-minimal.yaml" 2>&1)
 assert_not_contains "no config: no postgresql-config configmap" "${no_config}" "postgresql-config"
-assert_not_contains "no config: no setup-config init container" "${no_config}" "setup-config"
+assert_contains "no config: setup-config init container still present" "${no_config}" "name: setup-config"
+assert_contains "no config: setup-config strips stale include_dir" "${no_config}" 'grep -v "include_dir'
+assert_not_contains "no config: setup-config does not append include_dir" "${no_config}" 'echo "include_dir'
 assert_not_contains "no config: no checksum annotation" "${no_config}" "checksum/postgresql-config"
-assert_not_contains "no config: no conf.d volume mount" "${no_config}" "/etc/postgresql/conf.d"
+assert_not_contains "no config: no conf.d volume mount" "${no_config}" "mountPath: /etc/postgresql/conf.d"
 
-# Test: no config resources when repmgr defaults (no configuration set)
+# Test: repmgr defaults (no configuration set) also render the cleanup
 no_config_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" 2>&1)
 assert_not_contains "no config repmgr: no postgresql-config configmap" "${no_config_repmgr}" "postgresql-config"
-assert_not_contains "no config repmgr: no setup-config init container" "${no_config_repmgr}" "setup-config"
+assert_contains "no config repmgr: setup-config strips stale include_dir" "${no_config_repmgr}" 'grep -v "include_dir'
+
+# Test: enabled render appends and never strips
+assert_not_contains "config standalone: no include_dir strip when enabled" "${config_standalone}" 'grep -v "include_dir'
 
 # Test: checksum changes when configuration changes
 config_v1=$(helm template test-pg "${CHART_DIR}" \

@@ -148,7 +148,6 @@ spec:
             - name: repmgr-config
               mountPath: /etc/repmgr
 {{- end }}
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
         - name: setup-config
           image: busybox:1.37
           securityContext:
@@ -158,13 +157,22 @@ spec:
             - -c
             - |
               CONF=/var/lib/postgresql/data/pgdata/postgresql.conf
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
               if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
                 echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
               fi
+{{- else }}
+              # A stale include_dir left in PGDATA while conf.d features
+              # were enabled is fatal at postmaster start once the mount
+              # is gone.
+              if [ -f "$CONF" ] && grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
+                grep -v "include_dir = '/etc/postgresql/conf.d'" "$CONF" > "$CONF.tmp"
+                mv "$CONF.tmp" "$CONF"
+              fi
+{{- end }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-{{- end }}
       containers:
         - name: postgresql
 {{- if .Values.repmgr.enabled }}
