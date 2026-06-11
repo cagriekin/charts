@@ -1,5 +1,28 @@
 # pgvector chart changelog
 
+## 0.6.68
+
+### Fixed
+
+- Credentials containing special characters no longer corrupt pgpool
+  and exporter configuration (#108, shared templates with the pg
+  chart): placeholder substitution is now a byte-safe awk splice with
+  context-appropriate escaping, pgpool check passwords come from a
+  `TEXT`-prefixed pool_passwd instead of pgpool.conf strings, and the
+  exporter DSN is assembled with percent-encoded credentials in an
+  init container instead of raw `$(VAR)` expansion.
+- pgpool probes now run a query through pgpool instead of a TCP
+  connect (#122), so a backends-down wedge fails liveness and
+  self-heals, and the pgpool pod template carries a configmap
+  checksum so config changes roll the pods. See the pg chart 0.5.66
+  notes for details.
+
+## Migrating from 0.6.67
+
+`helm upgrade my-release cagriekin/pgvector` is the entire migration.
+The pgpool and exporter pod templates change, so those deployments
+roll once; the PostgreSQL StatefulSet is untouched.
+
 ## 0.6.67
 
 ### Fixed

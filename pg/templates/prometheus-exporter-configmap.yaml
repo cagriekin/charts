@@ -12,8 +12,8 @@ data:
       postgres:
         type: userpass
         userpass:
-          username: __POSTGRES_USER__
-          password: __POSTGRES_PASSWORD__
+          username: '__POSTGRES_USER__'
+          password: '__POSTGRES_PASSWORD__'
         options:
           sslmode: disable
 {{- end }}

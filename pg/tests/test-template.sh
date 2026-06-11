@@ -122,6 +122,16 @@ assert_gt "full: exporter service port 9116 present" "${exporter_svc}" "0"
 # Full: should have pgpool metrics exporter
 assert_contains "full: pgpool metrics sidecar present" "${full}" "pgpool2_exporter"
 
+# Special-character credential safety (#108): no sed placeholder
+# substitution, byte-safe splice in both init containers, DSN built with
+# percent-encoded credentials in a file instead of a raw env URI
+assert_not_contains "full: no sed placeholder substitution remains" "${full}" 'sed -i "s/__POSTGRES'
+assert_contains "full: init containers use byte-safe splice" "${full}" "function splice"
+assert_contains "full: exporter DSN credentials percent-encoded" "${full}" "od -An -v -tx1"
+assert_contains "full: exporter reads DSN from init-built file" "${full}" 'DATA_SOURCE_NAME="$(cat /etc/postgres_exporter/dsn)"'
+assert_not_contains "full: no raw unencoded DSN env" "${full}" 'postgresql://$(POSTGRES_USER)'
+assert_contains "full: exporter yml placeholders single-quoted" "${full}" "username: '__POSTGRES_USER__'"
+
 # Full: postgresql podAnnotations should be rendered
 assert_contains "full: postgresql pod has karpenter do-not-disrupt annotation" "${full}" "karpenter.sh/do-not-disrupt"
 assert_contains "full: postgresql pod has custom annotation" "${full}" "custom-annotation: pg-value"
@@ -155,7 +165,11 @@ no_annotations=$(helm template test-pg "${CHART_DIR}" \
   --set pgpool.metrics.enabled=false \
   --show-only templates/pgpool-deployment.yaml 2>&1)
 
-assert_not_contains "pgpool no-annotations: no annotations block" "${no_annotations}" "annotations:"
+# The config checksum annotation is unconditional: pgpool.conf and
+# pool_passwd live in an emptyDir written by the init container, so
+# configmap changes only reach pods through a template-hash roll
+assert_contains "pgpool no-annotations: checksum annotation still present" "${no_annotations}" "checksum/pgpool-config"
+assert_not_contains "pgpool no-annotations: no prometheus annotations" "${no_annotations}" "prometheus.io/scrape"
 
 # --- SecurityContext Tests ---
 

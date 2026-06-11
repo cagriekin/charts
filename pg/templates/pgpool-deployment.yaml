@@ -22,8 +22,11 @@ spec:
       labels:
         {{- include "pg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: pgpool
-      {{- if or .Values.pgpool.metrics.enabled .Values.pgpool.podAnnotations }}
       annotations:
+        {{- /* pgpool.conf and pool_passwd are rendered into an emptyDir by
+               the init container, so configmap changes only reach pods
+               through a template-hash roll */}}
+        checksum/pgpool-config: {{ include (print $.Template.BasePath "/pgpool-configmap.yaml") . | sha256sum }}
         {{- if .Values.pgpool.metrics.enabled }}
         prometheus.io/scrape: "true"
         prometheus.io/port: "9719"
@@ -32,7 +35,6 @@ spec:
         {{- with .Values.pgpool.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- end }}
     spec:
       {{- if .Values.pgpool.topologySpreadConstraints }}
       topologySpreadConstraints:
@@ -73,11 +75,36 @@ spec:
               cp /config/pcp.conf /usr/local/etc/pcp.conf
               cp /config/pool_hba.conf /usr/local/etc/pool_hba.conf
               cp /config/pool_passwd /usr/local/etc/pool_passwd
-              sed -i "s/__POSTGRES_USER__/$POSTGRES_USER/g" /usr/local/etc/pgpool.conf
-              sed -i "s/__POSTGRES_PASSWORD__/$POSTGRES_PASSWORD/g" /usr/local/etc/pgpool.conf
-              sed -i "s/__POSTGRES_DB__/$POSTGRES_DB/g" /usr/local/etc/pgpool.conf
-              sed -i "s/__POSTGRES_USER__/$POSTGRES_USER/g" /usr/local/etc/pool_passwd
-              sed -i "s/__POSTGRES_PASSWORD__/$POSTGRES_PASSWORD/g" /usr/local/etc/pool_passwd
+              # Byte-safe placeholder splice: sed replacement corrupts
+              # values containing / & or \, and awk -v assignments eat
+              # backslashes, so values travel via ENVIRON.
+              subst() {
+                awk '
+                  function splice(s, ph, val,   out, i) {
+                    out = ""
+                    while (i = index(s, ph)) { out = out substr(s, 1, i - 1) val; s = substr(s, i + length(ph)) }
+                    return out s
+                  }
+                  { $0 = splice($0, "__POSTGRES_USER__", ENVIRON["SUB_USER"])
+                    $0 = splice($0, "__POSTGRES_PASSWORD__", ENVIRON["SUB_PASS"])
+                    $0 = splice($0, "__POSTGRES_DB__", ENVIRON["SUB_DB"])
+                    print }
+                ' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+              }
+              # pgpool.conf placeholders sit inside single-quoted strings;
+              # its lexer escapes with backslash, not SQL-style doubling:
+              # \ -> \\ first, then ' -> \'
+              SUB_USER=$(printf '%s' "$POSTGRES_USER" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")
+              SUB_PASS=$(printf '%s' "$POSTGRES_PASSWORD" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")
+              SUB_DB=$(printf '%s' "$POSTGRES_DB" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")
+              export SUB_USER SUB_PASS SUB_DB
+              subst /usr/local/etc/pgpool.conf
+              # pool_passwd escapes backslash and the field separator with
+              # backslash: \ -> \\ first, then : -> \:
+              SUB_USER=$(printf '%s' "$POSTGRES_USER" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
+              SUB_PASS=$(printf '%s' "$POSTGRES_PASSWORD" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
+              SUB_DB="$POSTGRES_DB"
+              subst /usr/local/etc/pool_passwd
           env:
             - name: POSTGRES_USER
               valueFrom:
@@ -122,16 +149,39 @@ spec:
             - name: pcp
               containerPort: 9898
               protocol: TCP
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretUsernameKey" . }}
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretDatabaseKey" . }}
+          # Probes query through pgpool: a tcpSocket probe stays green on a
+          # wedged pgpool that accepts TCP but rejects every session with
+          # "all backend nodes are down" (#122). pool_hba trusts 127.0.0.1
+          # on the frontend; the backend side authenticates via pool_passwd.
+          # A failing liveness restarts pgpool with a fresh status file,
+          # which re-runs backend discovery and reattaches recovered nodes.
           livenessProbe:
-            tcpSocket:
-              port: 9999
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - PGCONNECT_TIMEOUT=3 psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -A -c "SELECT 1" > /dev/null
             initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 6
           readinessProbe:
-            tcpSocket:
-              port: 9999
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - PGCONNECT_TIMEOUT=3 psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -A -c "SELECT 1" > /dev/null
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5

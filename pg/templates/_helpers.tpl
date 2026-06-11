@@ -101,36 +101,30 @@ initContainers:
       - /bin/sh
       - -c
       - |
-        cp /config/postgres_exporter.yml /etc/postgres_exporter/postgres_exporter.yml
-        sed -i "s/__POSTGRES_USER__/$POSTGRES_USER/g" /etc/postgres_exporter/postgres_exporter.yml
-        sed -i "s/__POSTGRES_PASSWORD__/$POSTGRES_PASSWORD/g" /etc/postgres_exporter/postgres_exporter.yml
-    env:
-      - name: POSTGRES_USER
-        valueFrom:
-          secretKeyRef:
-            name: {{ include "pg.secretName" . }}
-            key: {{ include "pg.secretUsernameKey" . }}
-      - name: POSTGRES_PASSWORD
-        valueFrom:
-          secretKeyRef:
-            name: {{ include "pg.secretName" . }}
-            key: {{ include "pg.secretPasswordKey" . }}
-    volumeMounts:
-      - name: config
-        mountPath: /config
-      - name: exporter-config
-        mountPath: /etc/postgres_exporter
-containers:
-  - name: postgres-exporter
-    image: "{{ .Values.prometheusExporter.image.repository }}:{{ .Values.prometheusExporter.image.tag }}"
-    imagePullPolicy: {{ .Values.prometheusExporter.image.pullPolicy }}
-    securityContext:
-      {{- toYaml .Values.prometheusExporter.containerSecurityContext | nindent 6 }}
-    args:
-      - --config.file=/etc/postgres_exporter/postgres_exporter.yml
-      - --web.listen-address=:9116
-      - --web.telemetry-path=/metrics
-      - --log.level=info
+        # Placeholders sit inside single-quoted YAML scalars: double any
+        # embedded quote, then splice byte-for-byte (sed replacement
+        # corrupts values containing / & or \).
+        SUB_USER=$(printf '%s' "$POSTGRES_USER" | sed "s/'/''/g")
+        SUB_PASS=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
+        export SUB_USER SUB_PASS
+        awk '
+          function splice(s, ph, val,   out, i) {
+            out = ""
+            while (i = index(s, ph)) { out = out substr(s, 1, i - 1) val; s = substr(s, i + length(ph)) }
+            return out s
+          }
+          { $0 = splice($0, "__POSTGRES_USER__", ENVIRON["SUB_USER"])
+            $0 = splice($0, "__POSTGRES_PASSWORD__", ENVIRON["SUB_PASS"])
+            print }
+        ' /config/postgres_exporter.yml > /etc/postgres_exporter/postgres_exporter.yml
+        # URI userinfo cannot carry @ : / etc. raw and Kubernetes $(VAR)
+        # expansion cannot encode, so the DSN is assembled here with every
+        # credential byte percent-encoded (over-encoding is valid in URIs).
+        enc() { printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n' | sed 's/../%&/g'; }
+        ENC_USER=$(enc "$POSTGRES_USER")
+        ENC_PASS=$(enc "$POSTGRES_PASSWORD")
+        ENC_DB=$(enc "$POSTGRES_DATABASE")
+        printf '%s' "{{ range $i := until (int (add .Values.postgresql.replicaCount 1)) }}{{ if $i }},{{ end }}postgresql://${ENC_USER}:${ENC_PASS}@{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless:5432/${ENC_DB}?sslmode=disable{{ end }}" > /etc/postgres_exporter/dsn
     env:
       - name: POSTGRES_USER
         valueFrom:
@@ -147,8 +141,26 @@ containers:
           secretKeyRef:
             name: {{ include "pg.secretName" . }}
             key: {{ include "pg.secretDatabaseKey" . }}
-      - name: DATA_SOURCE_NAME
-        value: "{{ range $i := until (int (add .Values.postgresql.replicaCount 1)) }}{{ if $i }},{{ end }}postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless:5432/$(POSTGRES_DATABASE)?sslmode=disable{{ end }}"
+    volumeMounts:
+      - name: config
+        mountPath: /config
+      - name: exporter-config
+        mountPath: /etc/postgres_exporter
+containers:
+  - name: postgres-exporter
+    image: "{{ .Values.prometheusExporter.image.repository }}:{{ .Values.prometheusExporter.image.tag }}"
+    imagePullPolicy: {{ .Values.prometheusExporter.image.pullPolicy }}
+    securityContext:
+      {{- toYaml .Values.prometheusExporter.containerSecurityContext | nindent 6 }}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        DATA_SOURCE_NAME="$(cat /etc/postgres_exporter/dsn)" exec /bin/postgres_exporter \
+          --config.file=/etc/postgres_exporter/postgres_exporter.yml \
+          --web.listen-address=:9116 \
+          --web.telemetry-path=/metrics \
+          --log.level=info
     ports:
       - name: metrics
         containerPort: 9116
