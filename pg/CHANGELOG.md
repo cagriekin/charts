@@ -1,5 +1,18 @@
 # pg chart changelog
 
+## 0.5.70
+
+### Added
+
+- Complete Chart.yaml metadata (#114): `home`, `icon`, `sources`,
+  `keywords` and `maintainers`, shown by Artifact Hub and
+  `helm show chart`.
+
+## Migrating from 0.5.69
+
+`helm upgrade my-release cagriekin/pg` is the entire migration.
+Metadata only; no rendered resources change and no pods roll.
+
 ## 0.5.69
 
 ### Fixed

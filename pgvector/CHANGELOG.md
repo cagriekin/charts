@@ -1,5 +1,18 @@
 # pgvector chart changelog
 
+## 0.6.72
+
+### Added
+
+- Complete Chart.yaml metadata (#114): `home`, `icon`, `sources` and
+  `maintainers` alongside the existing `keywords`, shown by Artifact
+  Hub and `helm show chart`.
+
+## Migrating from 0.6.71
+
+`helm upgrade my-release cagriekin/pgvector` is the entire migration.
+Metadata only; no rendered resources change and no pods roll.
+
 ## 0.6.71
 
 ### Fixed
