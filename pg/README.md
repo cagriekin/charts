@@ -85,7 +85,7 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.image.repository` | PostgreSQL image repository | `postgres` |
 | `postgresql.image.tag` | PostgreSQL image tag | `18.1-trixie` |
 | `postgresql.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1) | `1` |
+| `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1); values > 0 require `repmgr.enabled=true` | `1` |
 | `postgresql.database` | Database name | `postgres` |
 | `postgresql.username` | Database username | `postgres` |
 | `postgresql.resources.requests.cpu` | CPU request | `100m` |

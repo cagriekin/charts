@@ -1,5 +1,24 @@
 # pgvector chart changelog
 
+## 0.6.63
+
+### Fixed
+
+- Rendering now fails fast when `repmgr.enabled=false` is combined with
+  `postgresql.replicaCount > 0` (#106, shared template with the pg
+  chart). Without repmgr the extra StatefulSet pods were independent
+  PostgreSQL instances with no replication, silently serving empty or
+  diverged data through PGPool. Standalone mode requires
+  `postgresql.replicaCount=0`.
+
+## Migrating from 0.6.62
+
+`helm upgrade my-release cagriekin/pgvector` is the entire migration
+for repmgr deployments and single-instance standalone deployments.
+Values combining `repmgr.enabled=false` with
+`postgresql.replicaCount > 0` are now rejected at template time; see
+the pg chart 0.5.61 migration notes for recovery guidance.
+
 ## 0.6.62
 
 ### Fixed

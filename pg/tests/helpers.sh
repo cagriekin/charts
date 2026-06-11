@@ -142,8 +142,10 @@ resolve_fullname() {
   if [[ -n "${values_file}" ]]; then
     values_flag="-f ${values_file}"
   fi
+  # awk must consume all input: an early `exit` closes the pipe while helm
+  # is still writing, killing it with SIGPIPE (141) under pipefail
   helm template "${release}" "${chart_dir}" ${values_flag} 2>/dev/null \
-    | awk '/^kind: StatefulSet/{found=1} found && /^  name:/{print $2; exit}'
+    | awk '/^kind: StatefulSet/{found=1} found && !done && /^  name:/{print $2; done=1}'
 }
 
 print_summary() {
