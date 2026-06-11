@@ -1,5 +1,24 @@
 # pg chart changelog
 
+## 0.5.77
+
+### Changed
+
+- PGPool admin (PCP) credentials moved out of the pgpool ConfigMap and
+  into a Secret (#15). `pgpool.admin.username` / `pgpool.admin.password`
+  (defaults `admin`/`admin`) render into a chart-managed Secret, or
+  bring your own via
+  `pgpool.admin.existingSecret.{enabled,name,usernameKey,passwordKey}`.
+  The init container now generates `pcp.conf` from the Secret at pod
+  startup, so the plaintext password no longer lands in a ConfigMap.
+  The old `pgpool.adminUsername` / `pgpool.adminPassword` values were
+  removed and fail rendering when still set, instead of being silently
+  ignored.
+
+## Migrating from 0.5.76
+
+With default values (pgpool.enabled=false) nothing changes and no pods roll. With PGPool enabled, the pgpool Deployment rolls once on upgrade (pcp.conf left the ConfigMap, so the config checksum changes); PostgreSQL pods do not roll. pgpool.adminUsername/pgpool.adminPassword were renamed: anyone setting them must move to pgpool.admin.username/pgpool.admin.password or pgpool.admin.existingSecret — rendering fails fast with a pointer to the new keys until they do. PCP credentials themselves are unchanged for default installs (admin/admin, now stored in a Secret).
+
 ## 0.5.76
 
 ### Changed

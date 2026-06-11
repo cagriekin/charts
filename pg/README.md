@@ -216,8 +216,12 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 | `pgpool.failOverOnBackendError` | Trigger failover on backend errors | `false` |
 | `pgpool.autoFailback` | Automatically reattach recovered backends | `true` |
 | `pgpool.allowClearTextFrontendAuth` | Allow clear-text password authentication from clients | `false` |
-| `pgpool.adminUsername` | PGPool-II admin user | `admin` |
-| `pgpool.adminPassword` | PGPool-II admin password | `admin` |
+| `pgpool.admin.username` | PGPool-II admin (PCP) user, stored in the chart-managed Secret | `admin` |
+| `pgpool.admin.password` | PGPool-II admin (PCP) password, stored in the chart-managed Secret | `admin` |
+| `pgpool.admin.existingSecret.enabled` | Use an existing Secret for the admin credentials instead of the chart-managed one | `false` |
+| `pgpool.admin.existingSecret.name` | Name of the existing Secret (required when enabled) | `""` |
+| `pgpool.admin.existingSecret.usernameKey` | Key in the existing Secret containing the admin username | `username` |
+| `pgpool.admin.existingSecret.passwordKey` | Key in the existing Secret containing the admin password | `password` |
 | `pgpool.service.type` | Service type | `ClusterIP` |
 | `pgpool.service.port` | Service port | `9999` |
 | `pgpool.resources.requests.cpu` | CPU request | `100m` |

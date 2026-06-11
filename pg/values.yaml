@@ -212,8 +212,16 @@ pgpool:
       cpu: 500m
       memory: 512Mi
 
-  adminUsername: admin
-  adminPassword: admin
+  # PCP (pgpool admin) credentials. Rendered into a chart-managed Secret
+  # unless existingSecret.enabled selects a pre-created Secret instead.
+  admin:
+    username: admin
+    password: admin
+    existingSecret:
+      enabled: false
+      name: ""
+      usernameKey: username
+      passwordKey: password
 
   service:
     type: ClusterIP

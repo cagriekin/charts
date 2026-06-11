@@ -1,4 +1,9 @@
 {{- if .Values.pgpool.enabled }}
+{{- /* Removed in favor of pgpool.admin.*; fail instead of silently falling
+       back to the chart defaults when stale values are still set. */}}
+{{- if or (hasKey .Values.pgpool "adminUsername") (hasKey .Values.pgpool "adminPassword") }}
+{{- fail "pgpool.adminUsername and pgpool.adminPassword were removed: set pgpool.admin.username/pgpool.admin.password or bring your own Secret via pgpool.admin.existingSecret" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,6 +32,9 @@ spec:
                the init container, so configmap changes only reach pods
                through a template-hash roll */}}
         checksum/pgpool-config: {{ include (print $.Template.BasePath "/pgpool-configmap.yaml") . | sha256sum }}
+        {{- /* pcp.conf is generated into an emptyDir from the admin Secret,
+               so chart-managed credential changes only apply via a roll */}}
+        checksum/pgpool-admin-secret: {{ include (print $.Template.BasePath "/pgpool-secret.yaml") . | sha256sum }}
         {{- if .Values.pgpool.metrics.enabled }}
         prometheus.io/scrape: "true"
         prometheus.io/port: "9719"
@@ -79,9 +87,11 @@ spec:
             - -c
             - |
               cp /config/pgpool.conf /usr/local/etc/pgpool.conf
-              cp /config/pcp.conf /usr/local/etc/pcp.conf
               cp /config/pool_hba.conf /usr/local/etc/pool_hba.conf
               cp /config/pool_passwd /usr/local/etc/pool_passwd
+              # pcp.conf entries are user:sha256(password); hashing here from
+              # the admin Secret keeps the credentials out of the ConfigMap.
+              printf '%s:%s\n' "$PCP_ADMIN_USER" "$(printf '%s' "$PCP_ADMIN_PASSWORD" | sha256sum | cut -d' ' -f1)" > /usr/local/etc/pcp.conf
               # Byte-safe placeholder splice: sed replacement corrupts
               # values containing / & or \, and awk -v assignments eat
               # backslashes, so values travel via ENVIRON.
@@ -128,6 +138,16 @@ spec:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretDatabaseKey" . }}
+            - name: PCP_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.pgpoolAdminSecretName" . }}
+                  key: {{ include "pg.pgpoolAdminUsernameKey" . }}
+            - name: PCP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.pgpoolAdminSecretName" . }}
+                  key: {{ include "pg.pgpoolAdminPasswordKey" . }}
           volumeMounts:
             - name: config
               mountPath: /config
