@@ -1,5 +1,26 @@
 # pg chart changelog
 
+## 0.5.65
+
+### Fixed
+
+- Disabling `postgresql.configuration` and `pgbackrest` after they had
+  been enabled bricked the cluster on the next pod restart (#107): the
+  `include_dir = '/etc/postgresql/conf.d'` line appended to
+  `postgresql.conf` persists in PGDATA, but the conf.d configmap mount
+  is removed, and PostgreSQL refuses to start on a missing include_dir
+  directory. The setup-config init container now always runs: it
+  appends the line when either feature is enabled and strips a stale
+  line when both are disabled.
+
+## Migrating from 0.5.64
+
+`helm upgrade my-release cagriekin/pg` is the entire migration. The
+StatefulSet pod template changes, so pods roll once. If a cluster is
+already crash-looping from this defect, upgrading to this version
+repairs it: the init container strips the stale line before PostgreSQL
+starts.
+
 ## 0.5.64
 
 ### Fixed

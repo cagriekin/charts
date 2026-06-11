@@ -1,5 +1,22 @@
 # pgvector chart changelog
 
+## 0.6.67
+
+### Fixed
+
+- Disabling `postgresql.configuration` and `pgbackrest` after they had
+  been enabled bricked the cluster on the next pod restart (#107,
+  shared template with the pg chart): the persisted `include_dir` line
+  pointed at the removed conf.d mount. The setup-config init container
+  now always runs and strips the stale line when both features are
+  disabled.
+
+## Migrating from 0.6.66
+
+`helm upgrade my-release cagriekin/pgvector` is the entire migration.
+The StatefulSet pod template changes, so pods roll once. Clusters
+already crash-looping from this defect are repaired by the upgrade.
+
 ## 0.6.66
 
 ### Fixed
