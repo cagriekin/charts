@@ -323,11 +323,13 @@ assert_not_contains "repmgr no additionalCommands: no PGHOST in postStart" "${re
 
 # Test: repmgr enabled renders preStop hook
 assert_contains "repmgr: preStop hook present" "${repmgr_no_addcmd}" "preStop:"
-assert_contains "repmgr: preStop queries repmgr role" "${repmgr_no_addcmd}" "repmgr.nodes"
-assert_contains "repmgr: preStop promotes standby" "${repmgr_no_addcmd}" "pg_promote"
 assert_contains "repmgr: preStop runs pg_ctl stop" "${repmgr_no_addcmd}" "pg_ctl stop"
-assert_contains "repmgr: preStop waits for recovery mode" "${repmgr_no_addcmd}" "pg_is_in_recovery"
 assert_contains "repmgr: terminationGracePeriodSeconds present" "${repmgr_no_addcmd}" "terminationGracePeriodSeconds: 120"
+
+# Test: preStop must not promote out-of-band; a raw pg_promote() bypasses
+# repmgr.nodes metadata and strands every repmgrd on stale state (#102)
+assert_not_contains "repmgr: preStop does not call pg_promote" "${repmgr_no_addcmd}" "pg_promote"
+assert_not_contains "repmgr: preStop does not target a standby" "${repmgr_no_addcmd}" "STANDBY_HOST"
 
 # Test: repmgr with configuration renders both preStop and postStart
 repmgr_config=$(helm template test-pg "${CHART_DIR}" \

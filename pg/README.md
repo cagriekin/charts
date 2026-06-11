@@ -180,7 +180,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 | `repmgr.serviceUpdater.resources.requests.memory` | Service-updater memory request | `64Mi` |
 | `repmgr.serviceUpdater.resources.limits.memory` | Service-updater memory limit | `128Mi` |
 
-When repmgr is enabled, a preStop lifecycle hook performs graceful failover before pod termination. If the pod being terminated is the primary, it promotes the highest-priority standby via `pg_promote()`, waits for the local node to transition to recovery mode, and then runs `pg_ctl stop`. This ensures zero-downtime failover during node drains (e.g., Karpenter node expiration, cluster upgrades). The `terminationGracePeriodSeconds` controls how long Kubernetes waits for this process to complete.
+When repmgr is enabled, a preStop lifecycle hook stops PostgreSQL cleanly (`pg_ctl stop -m fast`) before pod termination. If the terminated pod was the primary, repmgrd on a standby detects the outage and promotes via its `promote_command`, which also updates repmgr metadata; the hook deliberately does not promote out-of-band, since a raw `pg_promote()` would leave repmgr.nodes stale and strand every repmgrd. The `terminationGracePeriodSeconds` controls how long Kubernetes waits for the shutdown to complete.
 
 When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 
@@ -607,7 +607,7 @@ make -j4 test-cluster
 With repmgr enabled, automatic failover completes in approximately 30-60 seconds:
 
 1. **Detection** (~10-30s): repmgrd detects primary unavailability based on `health_check_interval` and `reconnect_attempts` in the repmgr configuration.
-2. **Promotion** (~5-10s): repmgr promotes the highest-priority standby via `pg_promote()`.
+2. **Promotion** (~5-10s): repmgrd promotes the highest-priority standby via its `promote_command` (`repmgr standby promote`).
 3. **Service update** (~5-15s): service-updater detects the new primary and patches the Kubernetes Service selector. PGPool-II is restarted if enabled.
 
 The `terminationGracePeriodSeconds` (default 120s) controls the maximum time allowed for graceful failover during planned drains (e.g., node upgrades).
