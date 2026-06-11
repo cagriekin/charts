@@ -2,15 +2,27 @@ apiVersion: v2
 name: pgvector
 description: PostgreSQL with pgvector extension and optional PGPool-II
 type: application
-version: 0.6.71
+version: 0.6.72
 appVersion: "18.1"
-dependencies:
-  - name: common
-    version: 0.1.0
-    repository: file://../common
+home: https://github.com/cagriekin/charts/tree/master/pgvector
+icon: https://wiki.postgresql.org/images/a/a4/PostgreSQL_logo.3colors.svg
+sources:
+  - https://github.com/cagriekin/charts
+  - https://www.postgresql.org
+  - https://github.com/pgvector/pgvector
+  - https://repmgr.org
+  - https://www.pgpool.net
 keywords:
   - PostgreSQL
   - pgvector
   - PGPool-II
   - Vector Search
   - Vector Database
+maintainers:
+  - name: cagriekin
+    email: cagri.ekin@gmail.com
+    url: https://github.com/cagriekin
+dependencies:
+  - name: common
+    version: 0.1.0
+    repository: file://../common
