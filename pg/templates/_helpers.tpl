@@ -182,6 +182,7 @@ containers:
       - |
         DATA_SOURCE_NAME="$(cat /etc/postgres_exporter/dsn)" exec /bin/postgres_exporter \
           --config.file=/etc/postgres_exporter/postgres_exporter.yml \
+          --extend.query-path=/config/queries.yaml \
           --web.listen-address=:9116 \
           --web.telemetry-path=/metrics \
           --log.level=info
@@ -210,6 +211,10 @@ containers:
     volumeMounts:
       - name: exporter-config
         mountPath: /etc/postgres_exporter
+      # queries.yaml carries no credential placeholders, so it is read
+      # straight from the configmap instead of the init-processed copy
+      - name: config
+        mountPath: /config
 volumes:
   - name: config
     configMap:

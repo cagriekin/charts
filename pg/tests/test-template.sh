@@ -801,5 +801,30 @@ if [ -n "${guard_line}" ] && [ -n "${delete_line}" ] && [ "${guard_line}" -lt "$
 fi
 assert_eq "backup guard: recent-backup check precedes retention deletion" "true" "${guard_before_delete}"
 
+# --- Prometheus exporter replication lag metrics Tests ---
+
+# Test: exporter configmap carries the pg_replication custom query group
+exporter_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --show-only templates/prometheus-exporter-configmap.yaml 2>&1)
+assert_contains "exporter cm: queries.yaml key present" "${exporter_cm}" "queries.yaml: |"
+assert_contains "exporter cm: pg_replication query group present" "${exporter_cm}" "pg_replication:"
+assert_contains "exporter cm: lag_seconds derived from replay timestamp" "${exporter_cm}" "pg_last_xact_replay_timestamp()"
+assert_contains "exporter cm: lag_seconds clamped to zero" "${exporter_cm}" "GREATEST(0, EXTRACT(EPOCH FROM"
+assert_contains "exporter cm: in_recovery gauge present" "${exporter_cm}" "pg_is_in_recovery()::int AS in_recovery"
+assert_contains "exporter cm: receive/replay byte lag NULL-safe on primaries" "${exporter_cm}" "COALESCE(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()), 0)"
+assert_contains "exporter cm: all three metrics declared as gauges" "${exporter_cm}" "receive_replay_lag_bytes:"
+gauge_count=$(printf '%s' "${exporter_cm}" | grep -c 'usage: "GAUGE"' || true)
+assert_eq "exporter cm: three GAUGE metrics in pg_replication" "3" "${gauge_count}"
+
+# Test: exporter container loads the custom queries file from the configmap mount
+assert_contains "exporter: extend.query-path flag wired" "${full}" "extend.query-path=/config/queries.yaml"
+exporter_deploy=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --show-only templates/prometheus-exporter-deployment.yaml 2>&1)
+config_mounts=$(printf '%s' "${exporter_deploy}" | grep -c "mountPath: /config" || true)
+assert_eq "exporter: configmap mounted in init and exporter containers" "2" "${config_mounts}"
+
+# Test: minimal values still render no exporter queries
+assert_not_contains "minimal: no replication query group" "${minimal}" "pg_replication:"
+
 end_suite
 print_summary
