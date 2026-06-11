@@ -671,5 +671,30 @@ lint_output=$(helm lint "${CHART_DIR}" \
   2>&1) && lint_rc=0 || lint_rc=$?
 assert_eq "helm lint with nodeSelector and tolerations passes" "0" "${lint_rc}"
 
+# --- imagePullSecrets Tests ---
+
+# Test: no imagePullSecrets rendered by default
+assert_not_contains "default: no imagePullSecrets in minimal render" "${minimal}" "imagePullSecrets"
+assert_not_contains "default: no imagePullSecrets in full render" "${full}" "imagePullSecrets"
+
+# Test: imagePullSecrets propagates to statefulset, pgpool, exporter and
+# backup cronjob pod templates (one occurrence each)
+ips_full=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set 'imagePullSecrets[0].name=registry-cred' \
+  --set backup.enabled=true \
+  --set backup.s3.endpoint=https://s3.example.com \
+  --set backup.s3.bucket=test-backups \
+  --set backup.existingSecret.name=s3-backup-creds \
+  2>&1)
+ips_count=$(printf '%s' "${ips_full}" | grep -c "name: registry-cred" || true)
+assert_eq "imagePullSecrets: statefulset, pgpool, exporter, backup all carry the secret" "4" "${ips_count}"
+
+# Test: imagePullSecrets propagates to both pgbackrest cronjob pod templates
+ips_pgbackrest=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set 'imagePullSecrets[0].name=registry-cred' \
+  --show-only templates/pgbackrest-cronjob.yaml 2>&1)
+ips_pgb_count=$(printf '%s' "${ips_pgbackrest}" | grep -c "name: registry-cred" || true)
+assert_eq "imagePullSecrets: both pgbackrest cronjobs carry the secret" "2" "${ips_pgb_count}"
+
 end_suite
 print_summary

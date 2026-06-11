@@ -78,6 +78,12 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 
 ## Configuration
 
+### Common Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `imagePullSecrets` | Pull secrets applied to every pod template (StatefulSet, pgpool and exporter Deployments, backup and pgBackRest CronJobs) | `[]` |
+
 ### PostgreSQL Parameters
 
 | Parameter | Description | Default |
