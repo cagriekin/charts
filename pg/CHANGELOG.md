@@ -1,5 +1,29 @@
 # pg chart changelog
 
+## 0.5.61
+
+### Fixed
+
+- Rendering now fails fast when `repmgr.enabled=false` is combined with
+  `postgresql.replicaCount > 0` (#106). The StatefulSet always runs
+  `replicaCount + 1` pods; without repmgr those extra pods were
+  independent PostgreSQL instances with their own PVCs and no
+  replication, while the PGPool config labeled them `replica1..N` under
+  `streaming_replication` clustering -- reads silently hit empty or
+  diverged databases. Standalone mode requires
+  `postgresql.replicaCount=0`.
+
+## Migrating from 0.5.60
+
+`helm upgrade my-release cagriekin/pg` is the entire migration for
+repmgr deployments and single-instance standalone deployments. If your
+values set `repmgr.enabled=false` with `postgresql.replicaCount > 0`,
+the upgrade is rejected at template time: those extra pods were never
+replicas, and any data written to them through PGPool load balancing
+exists only on that pod. Recover that data before switching to
+`repmgr.enabled=true` (which re-clones standbys from the primary) or
+`postgresql.replicaCount=0` (which orphans the extra PVCs).
+
 ## 0.5.60
 
 ### Fixed

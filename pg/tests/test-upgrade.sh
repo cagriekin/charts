@@ -12,6 +12,12 @@ FULLNAME_TO=$(resolve_fullname "${RELEASE}" "${CHART_DIR}" "${SCRIPT_DIR}/values
 
 begin_suite "Upgrade (repmgr 2-node -> 3-node with pgpool + exporter)"
 
+# Start from a clean namespace. Previous runs on a long-lived cluster leave
+# behind a release whose Service selector is owned by the service-updater's
+# kubectl-patch field manager (helm v4 server-side apply conflicts on
+# .spec.selector) and PVCs whose pvc-protection finalizers race a fresh
+# install while the old pods drain.
+kubectl delete namespace "${NAMESPACE}" --ignore-not-found --wait=true --timeout=5m
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
 # Step 1: Install with repmgr (2 replicas, persistence enabled)

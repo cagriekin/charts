@@ -475,6 +475,7 @@ pgbackrest_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set pgbackrest.s3.bucket=test \
   --set pgbackrest.existingSecret.name=test-secret \
   --set repmgr.enabled=false \
+  --set postgresql.replicaCount=0 \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "pgbackrest standalone: sidecar present" "${pgbackrest_standalone}" "name: pgbackrest"
 assert_not_contains "pgbackrest standalone: no repmgrd container" "${pgbackrest_standalone}" "repmgrd"
@@ -527,6 +528,26 @@ pgbackrest_disabled=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/val
 assert_not_contains "pgbackrest disabled: no configmap" "${pgbackrest_disabled}" "pgbackrest"
 assert_not_contains "pgbackrest disabled: no sidecar" "${pgbackrest_disabled}" "name: pgbackrest"
 assert_not_contains "pgbackrest disabled: no CronJob" "${pgbackrest_disabled}" "kind: CronJob"
+
+# --- Standalone replica validation Tests ---
+
+# Test: rendering fails fast when repmgr is disabled with replicaCount > 0
+standalone_replicas=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false \
+  --set postgresql.replicaCount=1 2>&1) && standalone_replicas_rc=0 || standalone_replicas_rc=$?
+assert_eq "standalone replicas: render fails when repmgr disabled with replicaCount > 0" "1" "${standalone_replicas_rc}"
+assert_contains "standalone replicas: error names the constraint" "${standalone_replicas}" "requires repmgr.enabled=true"
+
+# Test: rendering fails with default replicaCount (1) when only repmgr is disabled
+standalone_default=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false 2>&1) && standalone_default_rc=0 || standalone_default_rc=$?
+assert_eq "standalone replicas: render fails with default replicaCount when repmgr disabled" "1" "${standalone_default_rc}"
+
+# Test: standalone with replicaCount=0 still renders
+standalone_ok=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false \
+  --set postgresql.replicaCount=0 2>&1) && standalone_ok_rc=0 || standalone_ok_rc=$?
+assert_eq "standalone replicas: render passes with replicaCount=0" "0" "${standalone_ok_rc}"
 
 # --- nodeSelector and tolerations Tests ---
 
