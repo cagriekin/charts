@@ -1,5 +1,31 @@
 # pgvector chart changelog
 
+## 0.6.71
+
+### Fixed
+
+- NetworkPolicy egress no longer hardcodes port 443 as the only
+  external port (#113). The postgresql policy now also allows 6443
+  (API servers on kubeadm-style clusters, used by the service-updater
+  sidecar and lifecycle-hook kubectl) and, when pgBackRest is enabled,
+  the port derived from `pgbackrest.s3.endpoint` (explicit port wins;
+  otherwise `http://` maps to 80 and anything else to 443). Previously
+  WAL archiving to S3 endpoints on non-443 ports (e.g. MinIO `:9000`)
+  and kubectl against 6443 API servers were silently dropped.
+
+### Added
+
+- `networkPolicy.postgresql.extraEgress` and
+  `networkPolicy.pgpool.extraEgress` (both default `[]`) for
+  additional egress rules, mirroring the existing `extraIngress`.
+
+## Migrating from 0.6.70
+
+`helm upgrade my-release cagriekin/pgvector` is the entire migration.
+No pods roll. With `networkPolicy.enabled=false` (the default) nothing
+changes; with it enabled the postgresql policy additionally allows
+egress to 6443 and the pgBackRest S3 endpoint port.
+
 ## 0.6.70
 
 ### Added

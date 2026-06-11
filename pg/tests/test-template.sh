@@ -221,6 +221,44 @@ assert_contains "netpol minimal: postgresql policy rendered" "${netpol_minimal}"
 assert_not_contains "netpol minimal: no pgpool policy" "${netpol_minimal}" "test-pg-pgpool"
 assert_not_contains "netpol minimal: no exporter policy" "${netpol_minimal}" "test-pg-prometheus-exporter"
 
+# Test: postgresql egress allows API server ports
+assert_contains "netpol: egress allows 443" "${netpol}" "port: 443"
+assert_contains "netpol: egress allows 6443" "${netpol}" "port: 6443"
+
+# Test: egress derives S3 port from pgbackrest endpoint with explicit port
+netpol_pgbackrest=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set networkPolicy.enabled=true \
+  --set pgbackrest.s3.endpoint=http://minio.minio.svc.cluster.local:9000 \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "netpol pgbackrest: egress allows S3 port 9000" "${netpol_pgbackrest}" "port: 9000"
+
+# Test: https endpoint without explicit port adds no duplicate 443
+netpol_pgbackrest_https=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set networkPolicy.enabled=true \
+  --show-only templates/networkpolicy.yaml 2>&1)
+https_443_count=$(printf '%s' "${netpol_pgbackrest_https}" | grep -c "port: 443" || true)
+assert_eq "netpol pgbackrest: https endpoint adds no duplicate 443" "1" "${https_443_count}"
+
+# Test: http endpoint without explicit port maps to 80
+netpol_pgbackrest_http=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set networkPolicy.enabled=true \
+  --set pgbackrest.s3.endpoint=http://minio.svc \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "netpol pgbackrest: http endpoint maps to port 80" "${netpol_pgbackrest_http}" "port: 80"
+
+# Test: extraEgress rules render for postgresql and pgpool
+netpol_extra=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set networkPolicy.enabled=true \
+  --set 'networkPolicy.postgresql.extraEgress[0].ports[0].port=8080' \
+  --set 'networkPolicy.pgpool.extraEgress[0].ports[0].port=8081' \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "netpol extraEgress: postgresql rule rendered" "${netpol_extra}" "port: 8080"
+assert_contains "netpol extraEgress: pgpool rule rendered" "${netpol_extra}" "port: 8081"
+
 # --- PostgreSQL Configuration Tests ---
 
 # Test: helm lint with config values (standalone)

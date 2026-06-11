@@ -383,8 +383,10 @@ networkPolicy:
   postgresql:
     allowExternal: true
     extraIngress: []
+    extraEgress: []
   pgpool:
     extraIngress: []
+    extraEgress: []
 
 global:
   annotations: {}

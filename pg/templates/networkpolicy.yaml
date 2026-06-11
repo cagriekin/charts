@@ -61,9 +61,28 @@ spec:
             matchLabels:
               {{- include "pg.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: postgresql
+{{- /*
+443 covers HTTPS S3 endpoints and cloud API servers; 6443 covers the
+API server on kubeadm-style clusters (service-updater and lifecycle
+hooks run kubectl from these pods). NetworkPolicy matches the backend
+port after service translation, so the in-cluster kubernetes Service
+port 443 is not enough.
+*/}}
     - ports:
         - port: 443
           protocol: TCP
+        - port: 6443
+          protocol: TCP
+{{- if .Values.pgbackrest.enabled }}
+{{- $s3Port := include "pg.s3EndpointPort" .Values.pgbackrest.s3.endpoint | int }}
+{{- if and (ne $s3Port 443) (ne $s3Port 6443) }}
+        - port: {{ $s3Port }}
+          protocol: TCP
+{{- end }}
+{{- end }}
+{{- with .Values.networkPolicy.postgresql.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+{{- end }}
 ---
 {{- if .Values.pgpool.enabled }}
 apiVersion: networking.k8s.io/v1
@@ -104,6 +123,9 @@ spec:
             matchLabels:
               {{- include "pg.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: postgresql
+{{- with .Values.networkPolicy.pgpool.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+{{- end }}
 {{- end }}
 ---
 {{- if .Values.prometheusExporter.enabled }}
