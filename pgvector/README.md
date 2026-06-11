@@ -463,15 +463,14 @@ scrape_configs:
 
 ### Replication Metrics
 
-The exporter ships a custom `pg_replication` query group that is evaluated on every instance (primary and standbys):
+The exporter's built-in replication collector provides `pg_replication_lag_seconds` (seconds since the last replayed transaction on a standby) and `pg_replication_is_replica`. The chart adds a custom `pg_wal_replication` query group evaluated on every instance (primary and standbys):
 
 | Metric | Description |
 |--------|-------------|
-| `pg_replication_lag_seconds` | Seconds since the last replayed transaction on a standby; `0` on the primary |
-| `pg_replication_in_recovery` | `1` when the instance is in recovery (standby), `0` when it is a primary |
-| `pg_replication_receive_replay_lag_bytes` | Bytes of WAL received from the primary but not yet replayed; `0` on the primary |
+| `pg_wal_replication_in_recovery` | `1` when the instance is in recovery (standby), `0` when it is a primary |
+| `pg_wal_replication_receive_replay_lag_bytes` | Bytes of WAL received from the primary but not yet replayed; `0` on the primary |
 
-Alert on `pg_replication_lag_seconds` to catch a standby falling behind, and on `sum(pg_replication_in_recovery == 0) > 1` across the instances of one release to detect split-brain (two primaries). Note that `pg_replication_lag_seconds` also grows on a healthy standby while the primary is idle (no transactions to replay), so combine it with `pg_replication_receive_replay_lag_bytes` when tuning alert thresholds.
+Alert on `pg_replication_lag_seconds` to catch a standby falling behind, and on `sum(pg_wal_replication_in_recovery == 0) > 1` across the instances of one release to detect split-brain (two primaries). Note that `pg_replication_lag_seconds` also grows on a healthy standby while the primary is idle (no transactions to replay), so combine it with `pg_wal_replication_receive_replay_lag_bytes` when tuning alert thresholds.
 
 ### Exporter Parameters
 

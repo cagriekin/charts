@@ -1,5 +1,24 @@
 # pgvector chart changelog
 
+## 0.6.84
+
+### Fixed
+
+- The prometheus exporter `/metrics` endpoint returned HTTP 500 on
+  every scrape in the unpublished 0.6.75-0.6.83 versions: the #22
+  custom query group was named `pg_replication`, colliding with the
+  built-in replication collector's `pg_replication_lag_seconds`
+  (the Prometheus registry rejects two metrics with the same name
+  and different help text, failing the whole scrape). The group is
+  now `pg_wal_replication` and no longer duplicates the built-in
+  lag metric; the 0.6.75 notes were corrected in place.
+
+## Migrating from 0.6.83
+
+`helm upgrade my-release cagriekin/pgvector` is the entire migration.
+With the exporter enabled the configmap change rolls only the
+exporter Deployment; database pods do not roll.
+
 ## 0.6.83
 
 ### Added
@@ -134,16 +153,20 @@ With default values the StatefulSet pod template changes (a new preferred zone a
 
 ### Added
 
-- Replication lag and recovery-state metrics in the prometheus
-  exporter (#22): a `pg_replication` custom query group now exposes
-  `pg_replication_lag_seconds` (seconds since the last replayed
-  transaction, `0` on the primary), `pg_replication_in_recovery`
-  (`pg_is_in_recovery()` as a gauge — summing `in_recovery == 0`
-  across the release's instances detects split-brain) and
-  `pg_replication_receive_replay_lag_bytes` (receive/replay LSN
-  diff, `0` on the primary). The queries run on every instance via
+- Replication recovery-state and WAL-apply metrics in the prometheus
+  exporter (#22): a `pg_wal_replication` custom query group exposes
+  `pg_wal_replication_in_recovery` (`pg_is_in_recovery()` as a gauge
+  — summing `in_recovery == 0` across the release's instances detects
+  split-brain) and `pg_wal_replication_receive_replay_lag_bytes`
+  (receive/replay LSN diff, `0` on the primary), alongside the
+  exporter's built-in `pg_replication_lag_seconds` and
+  `pg_replication_is_replica`. The queries run on every instance via
   the exporter's multi-DSN `/metrics` and the per-pod `/probe`
-  ServiceMonitor targets, so standby lag is directly visible.
+  ServiceMonitor targets, so standby lag is directly visible. The
+  custom group deliberately avoids the `pg_replication` namespace:
+  registering a metric name the built-in replication collector
+  already serves makes the registry reject every scrape with HTTP
+  500.
 
 ## Migrating from 0.6.74
 
