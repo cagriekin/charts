@@ -1,5 +1,23 @@
 # pgvector chart changelog
 
+## 0.6.65
+
+### Fixed
+
+- Primary discovery and repmgrd pre-register fixes shared with the pg
+  chart (#103, #104, #105): the postStart discovery loop now scans all
+  `replicaCount + 1` ordinals instead of stopping one short, repmgrd
+  role detection uses repmgr credentials instead of a hardcoded
+  `psql -U postgres`, the peer scan bound derives from `replicaCount`
+  instead of a hardcoded `seq 0 9`, and the type-backfill node id is
+  read from the generated `repmgr.conf` instead of re-deriving the
+  `ordinal + 1000` convention.
+
+## Migrating from 0.6.64
+
+`helm upgrade my-release cagriekin/pgvector` is the entire migration.
+The StatefulSet pod template changes, so pods roll once.
+
 ## 0.6.64
 
 ### Fixed

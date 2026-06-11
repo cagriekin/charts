@@ -563,6 +563,23 @@ svc_selector_standalone=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/service.yaml 2>&1)
 assert_contains "service selector: pod-0 in standalone mode" "${svc_selector_standalone}" "statefulset.kubernetes.io/pod-name: test-pg-0"
 
+# --- Primary discovery and repmgrd pre-register Tests ---
+
+# The StatefulSet runs replicaCount + 1 pods (ordinals 0..replicaCount), so
+# the postStart discovery loop and the repmgrd peer scan must both reach
+# ordinal replicaCount; replicaCount=2 disambiguates from the old bounds
+discovery_sts=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.replicaCount=2 \
+  --set postgresql.lifecycle.postStart.additionalCommands="echo noop" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "discovery loops: scan ordinals 0..replicaCount" "${discovery_sts}" "seq 0 2"
+assert_not_contains "postStart discovery: off-by-one bound is gone" "${discovery_sts}" "seq 0 1)"
+assert_not_contains "repmgrd peer scan: hardcoded seq 0 9 is gone" "${discovery_sts}" "seq 0 9"
+assert_not_contains "repmgrd role check: hardcoded postgres user is gone" "${discovery_sts}" "psql -h 127.0.0.1 -U postgres"
+assert_contains "repmgrd role check: uses repmgr credentials" "${discovery_sts}" 'psql -h 127.0.0.1 -U "${REPMGR_USER}"'
+assert_contains "repmgrd backfill: node_id read from repmgr.conf" "${discovery_sts}" 'awk -F='
+assert_not_contains "repmgrd backfill: baked-in node-id convention is gone" "${discovery_sts}" 'ORDINAL + 1000'
+
 # --- nodeSelector and tolerations Tests ---
 
 # Test: nodeSelector/tolerations not rendered by default on statefulset
