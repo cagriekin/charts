@@ -763,5 +763,21 @@ prio_pgbackrest=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-
 prio_pgb_count=$(printf '%s' "${prio_pgbackrest}" | grep -c "priorityClassName: pgb-prio" || true)
 assert_eq "priorityClassName: both pgbackrest cronjobs carry pgb-prio" "2" "${prio_pgb_count}"
 
+# --- PostgreSQL Liveness Probe failureThreshold Tests ---
+
+# Test: with default values the postgresql container liveness probe uses
+# failureThreshold 10 while readiness stays at 6
+probes_default=$(helm template test-pg "${CHART_DIR}" \
+  --show-only templates/statefulset.yaml 2>&1)
+# the manifest contains a second livenessProbe (service-updater sidecar);
+# the postgresql container's block renders first, so keep only that one
+pg_liveness=$(printf '%s' "${probes_default}" \
+  | sed -n '/livenessProbe:/,/failureThreshold:/p' \
+  | sed -n '1,/failureThreshold:/p')
+assert_contains "liveness probe: default failureThreshold is 10" "${pg_liveness}" "failureThreshold: 10"
+pg_readiness=$(printf '%s' "${probes_default}" \
+  | sed -n '/readinessProbe:/,/failureThreshold:/p')
+assert_contains "readiness probe: default failureThreshold stays 6" "${pg_readiness}" "failureThreshold: 6"
+
 end_suite
 print_summary

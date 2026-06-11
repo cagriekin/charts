@@ -118,7 +118,7 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.livenessProbe.initialDelaySeconds` | Initial delay | `30` |
 | `postgresql.livenessProbe.periodSeconds` | Check interval | `10` |
 | `postgresql.livenessProbe.timeoutSeconds` | Timeout | `5` |
-| `postgresql.livenessProbe.failureThreshold` | Failure threshold | `6` |
+| `postgresql.livenessProbe.failureThreshold` | Failure threshold | `10` |
 | `postgresql.readinessProbe.enabled` | Enable readiness probe | `true` |
 | `postgresql.readinessProbe.initialDelaySeconds` | Initial delay | `5` |
 | `postgresql.readinessProbe.periodSeconds` | Check interval | `10` |
