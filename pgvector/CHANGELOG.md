@@ -1,5 +1,23 @@
 # pgvector chart changelog
 
+## 0.6.74
+
+### Fixed
+
+- The backup script now verifies at least one backup newer than
+  `RETENTION_DAYS` exists under the S3 prefix before running retention
+  cleanup (#21). Previously `mc find --older-than --exec rm` ran
+  unconditionally, so if uploads had been broken (or landing under a
+  different prefix) for longer than `backup.retentionDays`, cleanup
+  deleted every remaining backup. When no recent backup is visible the
+  job now exits 1 without deleting anything. In the normal flow the
+  just-uploaded dump satisfies the check, so the guard only fires when
+  something is genuinely wrong.
+
+## Migrating from 0.6.73
+
+`helm upgrade my-release cagriekin/pg` is the entire migration. No pods roll with default values; with `backup.enabled=true` only the backup ConfigMap changes, which the next CronJob run picks up. No values changes are required. The backup job now fails (exit 1) instead of deleting when no backup newer than retentionDays is visible under the configured prefix — a condition that previously resulted in silent total deletion.
+
 ## 0.6.73
 
 ### Changed

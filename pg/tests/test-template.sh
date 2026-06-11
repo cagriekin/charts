@@ -779,5 +779,27 @@ pg_readiness=$(printf '%s' "${probes_default}" \
   | sed -n '/readinessProbe:/,/failureThreshold:/p')
 assert_contains "readiness probe: default failureThreshold stays 6" "${pg_readiness}" "failureThreshold: 6"
 
+# --- Backup Retention Guard Tests (issue #21) ---
+
+# Test: backup script verifies a recent backup exists before retention cleanup
+guard_configmap=$(helm template test-pg "${CHART_DIR}" \
+  --set backup.enabled=true \
+  --set backup.s3.endpoint=https://s3.test \
+  --set backup.s3.bucket=test \
+  --set backup.existingSecret.name=test-secret \
+  --show-only templates/backup-configmap.yaml 2>&1)
+assert_contains "backup guard: --newer-than check present" "${guard_configmap}" 'mc find "s3/${S3_BUCKET}/${S3_PREFIX}/" --newer-than "${RETENTION_DAYS}d"'
+assert_contains "backup guard: aborts when no recent backup found" "${guard_configmap}" "aborting retention cleanup"
+assert_contains "backup guard: error message goes to stderr" "${guard_configmap}" 'ERROR: No backup newer than ${RETENTION_DAYS} days'
+
+# Test: the guard runs before the retention deletion in the script
+guard_line=$(printf '%s\n' "${guard_configmap}" | grep -n -- '--newer-than' | head -1 | cut -d: -f1)
+delete_line=$(printf '%s\n' "${guard_configmap}" | grep -n -- '--older-than' | head -1 | cut -d: -f1)
+guard_before_delete="false"
+if [ -n "${guard_line}" ] && [ -n "${delete_line}" ] && [ "${guard_line}" -lt "${delete_line}" ]; then
+  guard_before_delete="true"
+fi
+assert_eq "backup guard: recent-backup check precedes retention deletion" "true" "${guard_before_delete}"
+
 end_suite
 print_summary
