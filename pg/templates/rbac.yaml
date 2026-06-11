@@ -23,6 +23,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "patch", "delete"]
+  # core/v1 Events emitted by service-updater on primary failover.
+  # resourceNames cannot restrict create: the object name is not known at
+  # authorization time.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
 {{- if .Values.pgpool.enabled }}
   - apiGroups: ["apps"]
     resources: ["deployments"]

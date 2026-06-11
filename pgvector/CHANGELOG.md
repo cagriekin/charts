@@ -1,5 +1,23 @@
 # pgvector chart changelog
 
+## 0.6.81
+
+### Added
+
+- The service-updater sidecar now records a core/v1 Kubernetes Event
+  (reason `PrimaryChanged`, type Normal) on the primary Service every
+  time it actually changes the selector to a new primary (#23), with
+  the old and new pod names in the message, so failover history is
+  visible via `kubectl describe service` and `kubectl get events`.
+  The Event is created strictly after a successful selector patch and
+  is best-effort: creation failures are logged as warnings and never
+  fail or delay failover. The repmgr Role additionally grants
+  `create` on core `events`.
+
+## Migrating from 0.6.80
+
+`helm upgrade my-release` is the entire migration. No pods roll with default values: the service-updater ConfigMap is not checksummed into the StatefulSet pod template and the Role is patched in place. Running sidecars keep executing the already-loaded script, so PrimaryChanged events start appearing after each pod's next restart. No new values.
+
 ## 0.6.80
 
 ### Added

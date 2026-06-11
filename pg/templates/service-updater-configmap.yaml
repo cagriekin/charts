@@ -58,6 +58,49 @@ data:
         echo ""
     }
 
+    # Failover audit trail: record a core/v1 Event on the primary Service.
+    # core/v1 is used instead of events.k8s.io/v1 because it is accepted by
+    # every kubectl via `create -f`, while the newer API requires
+    # eventTime/reportingController fields with stricter validation.
+    # Best-effort only: failures are logged as warnings and must never fail
+    # or delay the selector update path.
+    emit_primary_changed_event() {
+        local old_master=$1
+        local new_master=$2
+        local service_uid
+        local event_time
+
+        # uid ties the Event to the live Service object so it shows up in
+        # `kubectl describe service`; an empty uid still yields a valid Event
+        service_uid=$(kubectl get service "${MASTER_SERVICE}" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        event_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+        kubectl create -f - <<EOF
+    apiVersion: v1
+    kind: Event
+    metadata:
+      name: ${MASTER_SERVICE}.primary-changed.$(date +%s).${RANDOM}
+      namespace: ${NAMESPACE}
+    involvedObject:
+      apiVersion: v1
+      kind: Service
+      name: ${MASTER_SERVICE}
+      namespace: ${NAMESPACE}
+      uid: "${service_uid}"
+    reason: PrimaryChanged
+    type: Normal
+    message: Primary changed from ${old_master:-unknown} to ${new_master}
+    source:
+      component: service-updater
+    firstTimestamp: ${event_time}
+    lastTimestamp: ${event_time}
+    count: 1
+    EOF
+        if [ $? -ne 0 ]; then
+            echo "WARNING: failed to create PrimaryChanged event for ${MASTER_SERVICE} (${old_master:-unknown} -> ${new_master})"
+        fi
+    }
+
     update_service_selector() {
         local new_master=$1
 
@@ -73,13 +116,19 @@ data:
 
         echo "Updating service selector to: ${new_master}"
 
-        kubectl patch service "${MASTER_SERVICE}" -n "${NAMESPACE}" --type merge -p "{
+        if ! kubectl patch service "${MASTER_SERVICE}" -n "${NAMESPACE}" --type merge -p "{
             \"spec\": {
                 \"selector\": {
                     \"statefulset.kubernetes.io/pod-name\": \"${new_master}\"
                 }
             }
-        }"
+        }"; then
+            return 1
+        fi
+
+        # Emitted strictly after a successful patch: the patch is
+        # correctness, the Event is observability
+        emit_primary_changed_event "${CURRENT_SELECTOR}" "${new_master}"
     }
 
     update_pod_role_labels() {
