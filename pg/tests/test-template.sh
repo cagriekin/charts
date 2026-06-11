@@ -826,5 +826,34 @@ assert_eq "exporter: configmap mounted in init and exporter containers" "2" "${c
 # Test: minimal values still render no exporter queries
 assert_not_contains "minimal: no replication query group" "${minimal}" "pg_replication:"
 
+# --- Zone-Aware Pod Anti-Affinity Tests ---
+
+# Test: default statefulset affinity keeps the required hostname term and
+# adds a preferred zone term
+sts_zone=$(helm template test-pg "${CHART_DIR}" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "zone affinity: required hostname term present" "${sts_zone}" "topologyKey: kubernetes.io/hostname"
+assert_contains "zone affinity: hostname term is required" "${sts_zone}" "requiredDuringSchedulingIgnoredDuringExecution"
+assert_contains "zone affinity: preferred zone term present" "${sts_zone}" "topologyKey: topology.kubernetes.io/zone"
+assert_contains "zone affinity: zone term is preferred" "${sts_zone}" "preferredDuringSchedulingIgnoredDuringExecution"
+assert_contains "zone affinity: zone term weight is 100" "${sts_zone}" "weight: 100"
+
+# Test: user-supplied postgresql.affinity replaces the default block
+# wholesale (no default hostname or zone terms remain)
+sts_custom_aff=$(helm template test-pg "${CHART_DIR}" \
+  --set 'postgresql.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key=custom-affinity-key' \
+  --set 'postgresql.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator=Exists' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "zone affinity: custom affinity renders" "${sts_custom_aff}" "custom-affinity-key"
+assert_not_contains "zone affinity: custom affinity drops default zone term" "${sts_custom_aff}" "topology.kubernetes.io/zone"
+assert_not_contains "zone affinity: custom affinity drops default hostname term" "${sts_custom_aff}" "topologyKey: kubernetes.io/hostname"
+
+# Test: pgpool default affinity is unchanged (no zone term)
+pgpool_aff=$(helm template test-pg "${CHART_DIR}" \
+  --set pgpool.enabled=true \
+  --show-only templates/pgpool-deployment.yaml 2>&1)
+assert_contains "zone affinity: pgpool keeps hostname anti-affinity" "${pgpool_aff}" "topologyKey: kubernetes.io/hostname"
+assert_not_contains "zone affinity: pgpool has no zone term" "${pgpool_aff}" "topology.kubernetes.io/zone"
+
 end_suite
 print_summary

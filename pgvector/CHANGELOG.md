@@ -1,5 +1,22 @@
 # pgvector chart changelog
 
+## 0.6.76
+
+### Added
+
+- Zone-aware pod anti-affinity on the postgresql StatefulSet (#16). The
+  default affinity block now includes a preferred (soft) podAntiAffinity
+  term on `topology.kubernetes.io/zone` (weight 100) alongside the
+  existing required hostname term, so pods spread across availability
+  zones when possible while hostname spreading stays mandatory.
+  Single-zone clusters are unaffected (the zone rule is best-effort),
+  and a user-supplied `postgresql.affinity` still replaces the default
+  block wholesale.
+
+## Migrating from 0.6.75
+
+With default values the StatefulSet pod template changes (a new preferred zone anti-affinity term), so postgresql pods roll once on upgrade following the chart's update strategy. The new rule is preferred (soft): scheduling behavior only changes on multi-zone clusters where the scheduler will now favor spreading pods across zones; single-zone clusters schedule exactly as before. Releases that set postgresql.affinity are unaffected — their custom affinity still replaces the default block entirely. No values changes or manual action required.
+
 ## 0.6.75
 
 ### Added
