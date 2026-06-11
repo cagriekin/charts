@@ -73,6 +73,16 @@ spec:
                   {{- include "pg.selectorLabels" . | nindent 18 }}
                   app.kubernetes.io/component: postgresql
               topologyKey: kubernetes.io/hostname
+          # Zone spread is preferred (soft) so single-zone clusters still
+          # schedule; the hostname rule above stays hard and dominates.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "pg.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: postgresql
+                topologyKey: topology.kubernetes.io/zone
         {{- end }}
       initContainers:
 {{- if .Values.postgresql.persistence.enabled }}
