@@ -187,6 +187,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 | `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `repmgr.username` | Repmgr database user | `repmgr` |
 | `repmgr.database` | Repmgr database name | `repmgr` |
+| `repmgr.monitoringHistoryDays` | Days of `repmgr.monitoring_history` to retain; pruned daily on the primary via `repmgr cluster cleanup` | `7` |
 | `repmgr.terminationGracePeriodSeconds` | Time allowed for graceful shutdown and failover | `120` |
 | `repmgr.resources.requests.cpu` | CPU request | `50m` |
 | `repmgr.resources.requests.memory` | Memory request | `128Mi` |

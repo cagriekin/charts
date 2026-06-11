@@ -120,6 +120,11 @@ repmgr:
   username: repmgr
   database: repmgr
 
+  # Days of repmgr.monitoring_history to retain. repmgr 5.x has no
+  # conf-based retention, so the repmgrd sidecar prunes the table once
+  # per day on the primary via `repmgr cluster cleanup --keep-history`.
+  monitoringHistoryDays: 7
+
   resources:
     requests:
       cpu: 50m

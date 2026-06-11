@@ -855,5 +855,28 @@ pgpool_aff=$(helm template test-pg "${CHART_DIR}" \
 assert_contains "zone affinity: pgpool keeps hostname anti-affinity" "${pgpool_aff}" "topologyKey: kubernetes.io/hostname"
 assert_not_contains "zone affinity: pgpool has no zone term" "${pgpool_aff}" "topology.kubernetes.io/zone"
 
+# --- repmgr Monitoring History Retention Tests ---
+
+# Test: repmgrd sidecar prunes repmgr.monitoring_history daily on the primary
+mhd_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "repmgr: repmgrd runs cluster cleanup for monitoring history" "${mhd_sts}" 'cluster cleanup --keep-history="${MONITORING_HISTORY_DAYS}"'
+assert_contains "repmgr: cleanup loop gates on pg_is_in_recovery" "${mhd_sts}" 'SELECT pg_is_in_recovery'
+
+# Test: retention defaults to 7 days
+mhd_line=$(printf '%s' "${mhd_sts}" | grep -A1 "name: MONITORING_HISTORY_DAYS" | tail -1)
+assert_contains "repmgr: monitoring history retention defaults to 7 days" "${mhd_line}" 'value: "7"'
+
+# Test: repmgr.monitoringHistoryDays override propagates to the repmgrd env
+mhd_sts_30=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set repmgr.monitoringHistoryDays=30 \
+  --show-only templates/statefulset.yaml 2>&1)
+mhd_line_30=$(printf '%s' "${mhd_sts_30}" | grep -A1 "name: MONITORING_HISTORY_DAYS" | tail -1)
+assert_contains "repmgr: monitoring history retention override renders" "${mhd_line_30}" 'value: "30"'
+
+# Test: minimal (no repmgr) render carries no cleanup loop or retention env
+assert_not_contains "minimal: no monitoring history cleanup" "${minimal}" "cluster cleanup"
+assert_not_contains "minimal: no MONITORING_HISTORY_DAYS env" "${minimal}" "MONITORING_HISTORY_DAYS"
+
 end_suite
 print_summary

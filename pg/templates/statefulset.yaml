@@ -522,6 +522,22 @@ spec:
                   fi
                 fi
               fi
+              # repmgr 5.x has no conf-based retention for monitoring_history
+              # (the image's monitoring_history_keep conf line is ignored as
+              # an unknown parameter), so the table grows forever. Prune it
+              # once per day on the primary via `repmgr cluster cleanup`.
+              # Failures only log a warning: the loop must never take down
+              # repmgrd (pid 1 via the exec below).
+              (
+                while true; do
+                  sleep 86400
+                  IN_RECOVERY=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h 127.0.0.1 -U "${REPMGR_USER}" -d "${REPMGR_DB}" -tA -c "SELECT pg_is_in_recovery();" 2>/dev/null || true)
+                  [ "$IN_RECOVERY" = "f" ] || continue
+                  if ! repmgr -f /etc/repmgr/repmgr.conf cluster cleanup --keep-history="${MONITORING_HISTORY_DAYS}"; then
+                    echo "monitoring-history-cleanup: repmgr cluster cleanup failed, retrying in 24h" >&2
+                  fi
+                done
+              ) &
               exec repmgrd -f /etc/repmgr/repmgr.conf --daemonize=no
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
@@ -539,6 +555,8 @@ spec:
               value: {{ .Values.repmgr.database }}
             - name: HEADLESS_SERVICE
               value: {{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
+            - name: MONITORING_HISTORY_DAYS
+              value: {{ int (required "repmgr.monitoringHistoryDays is required when repmgr.enabled=true" .Values.repmgr.monitoringHistoryDays) | quote }}
           lifecycle:
             preStop:
               exec:
