@@ -820,3 +820,105 @@ Then restore from the latest backup using one of the methods above.
 ```bash
 helm upgrade my-postgres cagriekin/pg
 ```
+
+## Troubleshooting PGPool
+
+### Connectivity: PGPool-II or the Backend?
+
+When clients cannot connect, isolate the failing layer first. Query through PGPool-II:
+
+```bash
+kubectl port-forward svc/my-postgres-pgpool 9999:9999
+psql -h localhost -p 9999 -U postgres -d postgres -c "SELECT 1"
+```
+
+Then bypass PGPool-II and query the primary Service directly:
+
+```bash
+kubectl port-forward svc/my-postgres 5432:5432
+psql -h localhost -p 5432 -U postgres -d postgres -c "SELECT 1"
+```
+
+If only the PGPool-II path fails, check backend status and logs below. If both fail, troubleshoot PostgreSQL itself first (see the recovery runbooks above).
+
+Check that the Services have endpoints (`my-postgres-readonly` exists when repmgr is enabled):
+
+```bash
+kubectl get endpoints my-postgres my-postgres-pgpool my-postgres-readonly
+```
+
+The PGPool-II readiness probe runs `SELECT 1` through port 9999 rather than a TCP check, so PGPool-II pods turn unready and drop out of the Service whenever they cannot serve queries from at least one backend. Empty `my-postgres-pgpool` endpoints therefore usually point at a backend or authentication problem, not at the Service. Restarts of the pgpool Deployment pods have the same root cause: the liveness probe runs the same query and restarts a wedged PGPool-II after about 60 seconds.
+
+If reads through the `my-postgres-readonly` Service do not reach standbys, the problem is the `pg-role` labels rather than PGPool-II: the Service selects `pg-role: standby`, which the service-updater re-applies every cycle, and pods stay absent from its endpoints until labeled (fresh installs, recreated or scaled-up pods).
+
+### Checking Backend Status
+
+`SHOW pool_nodes` through port 9999 reports each backend as PGPool-II sees it. `pool_hba.conf` trusts local connections inside the pod, so no password is needed:
+
+```bash
+kubectl exec -it deploy/my-postgres-pgpool -c pgpool -- \
+  sh -c 'psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SHOW pool_nodes;"'
+```
+
+The PCP admin interface on port 9898 (also exposed on the pgpool Service) provides the same data. It authenticates against `pcp.conf`, which the init container generates from the admin Secret: the chart-managed `my-postgres-pgpool-admin` (keys `username`/`password`, populated from `pgpool.admin.username`/`pgpool.admin.password`), or your own Secret when `pgpool.admin.existingSecret.enabled` is set. Retrieve the password, then run the pcp commands (they prompt for it):
+
+```bash
+kubectl get secret my-postgres-pgpool-admin -o jsonpath='{.data.password}' | base64 -d
+kubectl exec -it deploy/my-postgres-pgpool -c pgpool -- pcp_node_count -h localhost -p 9898 -U admin
+kubectl exec -it deploy/my-postgres-pgpool -c pgpool -- pcp_node_info -h localhost -p 9898 -U admin 0
+```
+
+Changing the chart-managed credentials rolls the Deployment via the Secret checksum annotation; rotating an existing Secret requires `kubectl rollout restart deployment my-postgres-pgpool`, because `pcp.conf` is generated at pod start.
+
+Node IDs follow the StatefulSet ordinals: node 0 is `my-postgres-0`, node 1 is `my-postgres-1`, and so on.
+
+| Column | Meaning |
+|--------|---------|
+| `status` | `up`: attached, receives traffic. `waiting`: attached, no connection established yet. `down`: detached after `pgpool.healthCheck.maxRetries` consecutive health check failures; no traffic is routed to it. |
+| `role` | `primary` or `standby` as detected by the streaming replication check. If this disagrees with `repmgr cluster show`, restart PGPool-II. |
+| `replication_delay` | Standby lag in bytes. |
+| `select_cnt` | SELECT queries routed to the node; confirms load balancing is working. |
+
+A recovered backend is reattached automatically when `pgpool.autoFailback` is `true` (default). Otherwise reattach it with `pcp_attach_node -h localhost -p 9898 -U admin <node-id>` or restart the Deployment.
+
+### Recovering After Failover
+
+With repmgr enabled the chart automates PGPool-II recovery:
+
+1. The service-updater sidecar repoints the primary Service selector to the new primary pod.
+2. On a primary change it runs `kubectl rollout restart deployment my-postgres-pgpool`, so PGPool-II restarts with a fresh backend status file and rediscovers the topology.
+3. The same sidecar probes PGPool-II through its Service every 30 seconds and forces a rollout restart after 3 consecutive failures.
+4. Independently, the PGPool-II liveness probe restarts any instance that cannot serve queries for about 60 seconds.
+
+If clients still reach a stale topology (for example writes failing with read-only errors), apply the manual equivalent:
+
+```bash
+kubectl rollout restart deployment my-postgres-pgpool
+```
+
+Failover history is recorded as Kubernetes Events: on every primary change the service-updater emits a `PrimaryChanged` Event attached to the primary Service, and its container logs on the PostgreSQL pods carry the same transition:
+
+```bash
+kubectl get events --field-selector reason=PrimaryChanged
+kubectl describe service my-postgres
+kubectl logs my-postgres-0 -c service-updater | grep "Master change"
+```
+
+Events are pruned by the cluster's event TTL (one hour by default), so the service-updater logs are the longer-lived record.
+
+### Logs
+
+PGPool-II logs to stderr, so everything is available through the container logs:
+
+```bash
+kubectl logs deploy/my-postgres-pgpool -c pgpool
+```
+
+Verbosity is controlled by the `pgpool.logging.*` values: `logConnections` (default `true`), `logStatement` (log every client query), `logPerNodeStatement` (log which backend each query was routed to), and `logMinMessages` (default `warning`; `debug1` and below add internal detail). Changing them rolls the Deployment automatically via the config checksum annotation.
+
+| Message | Meaning |
+|---------|---------|
+| `failed to connect to PostgreSQL server` / `health check retrying` | A backend is unreachable. The node is marked `down` after `pgpool.healthCheck.maxRetries` retries (default 10, every 3 seconds). |
+| `degenerate backend request ... is canceled because failover is disallowed` | Expected. All backends are flagged `DISALLOW_TO_FAILOVER` (or `ALWAYS_PRIMARY` without repmgr): repmgr owns failover, and the service-updater restarts PGPool-II afterwards instead of letting it detach nodes itself. |
+| `all backend nodes are down` | No backend is reachable and clients are rejected. The liveness probe restarts PGPool-II, which retries discovery; if the message persists, check the PostgreSQL pods. |
+| `authentication failed` / `password mismatch` | Remote clients authenticate with md5 against `pool_passwd`, which contains only the chart's PostgreSQL user. Other database users cannot authenticate through PGPool-II while `pgpool.allowClearTextFrontendAuth` is `false` (default); either connect them directly to PostgreSQL or set it to `true` so PGPool-II can request their password in clear text and forward it to the backend. |

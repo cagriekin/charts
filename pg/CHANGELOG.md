@@ -1,5 +1,21 @@
 # pg chart changelog
 
+## 0.5.81
+
+### Added
+
+- PGPool troubleshooting guide at the end of the README (mirrored in
+  pgvector): isolating connectivity failures between PGPool-II and the
+  backends, checking backend status via `SHOW pool_nodes` and the pcp
+  commands authenticated from the pgpool admin Secret, post-failover
+  recovery including the `PrimaryChanged` Kubernetes Events emitted by
+  the service-updater, readonly Service endpoint checks, and log
+  locations with common messages (#25).
+
+## Migrating from 0.5.80
+
+Documentation only; no rendered resources change and no pods roll.
+
 ## 0.5.80
 
 ### Added
