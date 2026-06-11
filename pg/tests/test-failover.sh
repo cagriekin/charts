@@ -82,10 +82,33 @@ if [[ "${failover_done}" == "true" ]]; then
   done
 
   assert_eq "service updated to point to new primary" "true" "${svc_updated}"
+
+  if [[ "${svc_updated}" == "true" ]]; then
+    # Regression trap for #109: re-rendering the hardcoded pod-0 selector on
+    # upgrade either repointed writes at a standby (helm v3) or failed the
+    # upgrade with a field-manager conflict on .spec.selector (helm v4
+    # server-side apply, since kubectl-patch owns the field after failover).
+    # No --wait: the old primary is still frozen and would never become Ready.
+    echo "  Upgrading release after failover (selector must be preserved)..."
+    upgrade_rc=0
+    helm upgrade "${RELEASE}" "${CHART_DIR}" \
+      -n "${NAMESPACE}" \
+      -f "${SCRIPT_DIR}/values-repmgr.yaml" > /dev/null 2>&1 || upgrade_rc=$?
+    assert_eq "helm upgrade succeeds after failover" "0" "${upgrade_rc}"
+
+    selector_pod=$(kubectl get service -n "${NAMESPACE}" "${FULLNAME}" \
+      -o jsonpath='{.spec.selector.statefulset\.kubernetes\.io/pod-name}')
+    assert_eq "upgrade preserves selector on new primary" "${POD_REPLICA}" "${selector_pod}"
+  else
+    skip "helm upgrade succeeds after failover (service never updated)"
+    skip "upgrade preserves selector on new primary (service never updated)"
+  fi
 else
   skip "data survives failover (failover did not complete)"
   skip "can write to new primary (failover did not complete)"
   skip "service updated to point to new primary (failover did not complete)"
+  skip "helm upgrade succeeds after failover (failover did not complete)"
+  skip "upgrade preserves selector on new primary (failover did not complete)"
 fi
 
 # Unfreeze the old primary after all assertions

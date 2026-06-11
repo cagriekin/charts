@@ -549,6 +549,20 @@ standalone_ok=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.replicaCount=0 2>&1) && standalone_ok_rc=0 || standalone_ok_rc=$?
 assert_eq "standalone replicas: render passes with replicaCount=0" "0" "${standalone_ok_rc}"
 
+# --- Primary Service selector Tests ---
+
+# Test: selector bootstraps to pod-0 when no live Service exists (lookup is
+# empty under helm template; in-cluster preservation is covered by the
+# upgrade-after-failover assertions in test-failover.sh)
+svc_selector=$(helm template test-pg "${CHART_DIR}" --show-only templates/service.yaml 2>&1)
+assert_contains "service selector: bootstraps to pod-0 with repmgr" "${svc_selector}" "statefulset.kubernetes.io/pod-name: test-pg-0"
+
+svc_selector_standalone=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false \
+  --set postgresql.replicaCount=0 \
+  --show-only templates/service.yaml 2>&1)
+assert_contains "service selector: pod-0 in standalone mode" "${svc_selector_standalone}" "statefulset.kubernetes.io/pod-name: test-pg-0"
+
 # --- nodeSelector and tolerations Tests ---
 
 # Test: nodeSelector/tolerations not rendered by default on statefulset

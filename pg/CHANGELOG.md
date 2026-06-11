@@ -1,5 +1,30 @@
 # pg chart changelog
 
+## 0.5.62
+
+### Fixed
+
+- `helm upgrade` no longer repoints the primary Service selector back
+  to pod-0 (#109). The rendered Service now preserves the live
+  `statefulset.kubernetes.io/pod-name` selector via `lookup`, mirroring
+  the secret reuse pattern, falling back to pod-0 only at bootstrap.
+  Previously every upgrade after a failover routed writes at a
+  read-only standby until the service-updater's next tick (up to 30s)
+  -- and with helm v4 (server-side apply) the upgrade failed outright
+  with a field-manager conflict on `.spec.selector`, because the
+  service-updater's `kubectl patch` owns the field once a failover has
+  occurred. Rendering pipelines that never talk to the cluster
+  (`helm template`, ArgoCD) still emit the pod-0 bootstrap selector;
+  the service-updater re-asserts the correct primary on its next tick.
+
+## Migrating from 0.5.61
+
+`helm upgrade my-release cagriekin/pg` is the entire migration. If a
+previous helm v4 upgrade already failed with
+`conflict with "kubectl-patch" using v1: .spec.selector`, this version
+resolves it: the rendered selector now matches the live value, so the
+apply no longer conflicts.
+
 ## 0.5.61
 
 ### Fixed
