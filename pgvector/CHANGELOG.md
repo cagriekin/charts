@@ -1,5 +1,22 @@
 # pgvector chart changelog
 
+## 0.6.77
+
+### Added
+
+- `repmgr.monitoringHistoryDays` (default `7`) bounds the
+  `repmgr.monitoring_history` table (#19). repmgrd runs with
+  `monitoring_history=true` but repmgr 5.x has no conf-based retention
+  (the image's `monitoring_history_keep` line is silently ignored as an
+  unknown parameter), so the table grew forever. The repmgrd sidecar now
+  spawns a resilient background loop that once per day, on the primary
+  only, runs `repmgr cluster cleanup --keep-history=<days>`; cleanup
+  failures log a warning and never take down repmgrd.
+
+## Migrating from 0.6.76
+
+`helm upgrade my-release cagriekin/pg` is the entire migration. With repmgr enabled (the default) the StatefulSet pod template changes (new env var and startup script in the repmgrd sidecar), so the postgresql pods roll once via the normal rolling update; repmgr handles the failover as on any upgrade. The first prune of an existing oversized monitoring_history table happens within 24h of the new pods starting. With repmgr disabled nothing changes and no pods roll.
+
 ## 0.6.76
 
 ### Added
