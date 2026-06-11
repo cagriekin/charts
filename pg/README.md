@@ -381,6 +381,68 @@ When PGPool-II is enabled, it provides connection pooling and load balancing:
 - Automatically detects streaming replication status
 - Fails over to replicas when primary becomes unavailable
 
+## Multi-Zone Deployment
+
+By default the PostgreSQL StatefulSet schedules with a required pod anti-affinity rule on `kubernetes.io/hostname` (one instance per node) and a preferred rule (weight 100) on `topology.kubernetes.io/zone`, so instances spread across zones when zones are available but still schedule on single-zone clusters.
+
+Example values for a three-zone cluster:
+
+```yaml
+postgresql:
+  replicaCount: 2          # 3 instances total: 1 primary + 2 standbys, one per zone
+  persistence:
+    storageClass: zonal-ssd  # use a WaitForFirstConsumer storage class, see below
+
+pgpool:
+  enabled: true
+  replicaCount: 3
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: pg
+          app.kubernetes.io/instance: my-postgres
+          app.kubernetes.io/component: pgpool
+```
+
+The `app.kubernetes.io/instance` label must match the Helm release name.
+
+### Zone Anti-Affinity
+
+The built-in zone rule is preferred, not required: if a zone is down or full, instances still schedule into the remaining zones. To make zone spread mandatory, set `postgresql.affinity`:
+
+```yaml
+postgresql:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: pg
+              app.kubernetes.io/instance: my-postgres
+              app.kubernetes.io/component: postgresql
+          topologyKey: topology.kubernetes.io/zone
+```
+
+Setting `postgresql.affinity` replaces the entire built-in affinity block, including the hostname rule. With a required zone rule that is harmless (distinct zones imply distinct nodes), but any other custom affinity should re-add the hostname rule explicitly. A required zone rule also caps the cluster size: total instances (`replicaCount + 1`) must not exceed the number of zones or the surplus pods stay Pending.
+
+There is no `postgresql.topologySpreadConstraints` value; zone placement of PostgreSQL pods is controlled through affinity only. PGPool-II supports `pgpool.topologySpreadConstraints` (as in the example above) and, like PostgreSQL, has a default hostname anti-affinity that `pgpool.affinity` replaces wholesale.
+
+### Storage Classes
+
+Use a storage class with `volumeBindingMode: WaitForFirstConsumer`. It delays PV provisioning until the pod is scheduled, so each volume is created in the zone the scheduler picked. With `Immediate` binding the PV is provisioned first, in an arbitrary zone, and the pod may become unschedulable when that zone conflicts with the affinity rules.
+
+Cloud block volumes (EBS, GCE PD, Azure Disk) are zonal, which pins each instance to its volume's zone permanently:
+
+- After a zone outage, pods from that zone cannot reschedule elsewhere; availability relies on repmgr promoting a standby in a surviving zone.
+- Deleting a pod never moves it to another zone. To relocate a standby, delete its PVC together with the pod; the recreated pod provisions a new volume in its new zone and re-clones from the primary.
+
+### Routing Reads Across Zones
+
+With repmgr enabled, the `<fullname>-readonly` service (see [Read-Only Connection to Replicas](#read-only-connection-to-replicas)) selects all standby pods, so read traffic is distributed across the standbys in every zone. Cross-zone traffic charges apply unless topology-aware routing is configured cluster-side; the chart does not set topology annotations on the service.
+
 ## Prometheus Exporter
 
 This chart includes an optional PostgreSQL metrics exporter for Prometheus monitoring. The exporter runs as a single instance and can scrape metrics from all PostgreSQL instances (primary and replicas) using the multi-target pattern.

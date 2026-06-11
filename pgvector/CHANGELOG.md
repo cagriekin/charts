@@ -1,5 +1,21 @@
 # pgvector chart changelog
 
+## 0.6.82
+
+### Added
+
+- Multi-Zone Deployment section in the README (#24): the built-in
+  hostname and zone anti-affinity defaults, enforcing a hard zone
+  requirement via `postgresql.affinity` (which replaces the built-in
+  rules wholesale), spreading PGPool-II with
+  `pgpool.topologySpreadConstraints`, `WaitForFirstConsumer` storage
+  classes and the zonal volume pinning trade-off, and routing reads
+  across zones through the `<fullname>-readonly` Service.
+
+## Migrating from 0.6.81
+
+Documentation only; no rendered resources change and no pods roll.
+
 ## 0.6.81
 
 ### Added
