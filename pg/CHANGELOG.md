@@ -1,5 +1,24 @@
 # pg chart changelog
 
+## 0.5.73
+
+### Added
+
+- Replication lag and recovery-state metrics in the prometheus
+  exporter (#22): a `pg_replication` custom query group now exposes
+  `pg_replication_lag_seconds` (seconds since the last replayed
+  transaction, `0` on the primary), `pg_replication_in_recovery`
+  (`pg_is_in_recovery()` as a gauge — summing `in_recovery == 0`
+  across the release's instances detects split-brain) and
+  `pg_replication_receive_replay_lag_bytes` (receive/replay LSN
+  diff, `0` on the primary). The queries run on every instance via
+  the exporter's multi-DSN `/metrics` and the per-pod `/probe`
+  ServiceMonitor targets, so standby lag is directly visible.
+
+## Migrating from 0.5.72
+
+`helm upgrade my-release cagriekin/pg` is the entire migration. With the default `prometheusExporter.enabled=false` nothing is rendered and no pods roll. With the exporter enabled, the configmap change rolls only the exporter Deployment (via its checksum/config annotation); database pods do not roll and no values changes are required — the new metrics appear on the next scrape.
+
 ## 0.5.72
 
 ### Fixed

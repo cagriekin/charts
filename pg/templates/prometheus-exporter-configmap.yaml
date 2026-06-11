@@ -16,4 +16,29 @@ data:
           password: '__POSTGRES_PASSWORD__'
         options:
           sslmode: disable
+  queries.yaml: |
+    pg_replication:
+      # GREATEST ignores NULL, so lag_seconds is 0 on a standby that has not
+      # replayed any transaction yet; the receive/replay LSN functions return
+      # NULL on a primary, COALESCE keeps the metric emitted without errors.
+      query: |
+        SELECT
+          CASE
+            WHEN pg_is_in_recovery()
+            THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp())))
+            ELSE 0
+          END AS lag_seconds,
+          pg_is_in_recovery()::int AS in_recovery,
+          COALESCE(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()), 0) AS receive_replay_lag_bytes
+      master: true
+      metrics:
+        - lag_seconds:
+            usage: "GAUGE"
+            description: "Seconds since the last replayed transaction on a standby; 0 on the primary"
+        - in_recovery:
+            usage: "GAUGE"
+            description: "1 when the instance is in recovery (standby), 0 when it is a primary"
+        - receive_replay_lag_bytes:
+            usage: "GAUGE"
+            description: "Bytes of WAL received from the primary but not yet replayed; 0 on the primary"
 {{- end }}
