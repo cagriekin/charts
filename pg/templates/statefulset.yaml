@@ -373,7 +373,8 @@ spec:
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
                         HEADLESS="{{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local"
                         PRIMARY_HOST=""
-                        for n in $(seq 0 {{ sub (int .Values.postgresql.replicaCount) 1 }}); do
+                        {{- /* StatefulSet runs replicaCount + 1 pods, ordinals 0..replicaCount */}}
+                        for n in $(seq 0 {{ int .Values.postgresql.replicaCount }}); do
                           H="{{ include "pg.fullname" . }}-${n}.${HEADLESS}"
                           if psql -h "$H" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | grep -q 'f'; then
                             PRIMARY_HOST="$H"
@@ -458,7 +459,7 @@ spec:
             - |
               ORDINAL="${HOSTNAME##*-}"
               for _ in $(seq 1 120); do pg_isready -h 127.0.0.1 > /dev/null 2>&1 && break; sleep 2; done
-              IN_RECOVERY=$(psql -h 127.0.0.1 -U postgres -d postgres -tA -c "SELECT pg_is_in_recovery();" 2>/dev/null || true)
+              IN_RECOVERY=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h 127.0.0.1 -U "${REPMGR_USER}" -d "${REPMGR_DB}" -tA -c "SELECT pg_is_in_recovery();" 2>/dev/null || true)
               if [ "$IN_RECOVERY" = "f" ]; then
                 echo "pre-register: primary register --force"
                 repmgr -f /etc/repmgr/repmgr.conf primary register --force || true
@@ -466,7 +467,7 @@ spec:
                 BASE="${HOSTNAME%-*}"
                 PNID=""
                 for _ in $(seq 1 60); do
-                  for i in $(seq 0 9); do
+                  for i in $(seq 0 {{ int .Values.postgresql.replicaCount }}); do
                     [ "$i" = "$ORDINAL" ] && continue
                     P="${BASE}-${i}.${HEADLESS_SERVICE}"
                     PGPASSWORD="${REPMGR_PASSWORD}" pg_isready -h "$P" -U "${REPMGR_USER}" -d "${REPMGR_DB}" > /dev/null 2>&1 || continue
@@ -477,17 +478,23 @@ spec:
                   sleep 2
                 done
                 if [ -n "$PNID" ]; then
-                  LOCAL_NID=$((ORDINAL + 1000))
                   echo "pre-register: standby register --upstream-node-id=${PNID}"
                   repmgr -f /etc/repmgr/repmgr.conf standby register --upstream-node-id="${PNID}" --force || true
-                  # Defensive: some PG18 + repmgr image combos land the row
-                  # with type=''. WHERE clause makes this a no-op on rows
-                  # that are already correctly typed.
-                  PGPASSWORD="${REPMGR_PASSWORD}" psql -h "$P" -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
-                    -v ON_ERROR_STOP=1 --no-psqlrc -c "
-                      UPDATE repmgr.nodes SET type='standby'
-                       WHERE node_id=${LOCAL_NID} AND (type IS NULL OR type='');
-                    " || echo "pre-register: type-backfill UPDATE failed (ignored)" >&2
+                  # Read node_id from the generated repmgr.conf instead of
+                  # re-deriving the image's ordinal+1000 convention here.
+                  LOCAL_NID=$(awk -F= '$1=="node_id"{print $2; exit}' /etc/repmgr/repmgr.conf)
+                  if [ -z "$LOCAL_NID" ]; then
+                    echo "pre-register: no node_id in /etc/repmgr/repmgr.conf, skipping type backfill" >&2
+                  else
+                    # Defensive: some PG18 + repmgr image combos land the row
+                    # with type=''. WHERE clause makes this a no-op on rows
+                    # that are already correctly typed.
+                    PGPASSWORD="${REPMGR_PASSWORD}" psql -h "$P" -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
+                      -v ON_ERROR_STOP=1 --no-psqlrc -c "
+                        UPDATE repmgr.nodes SET type='standby'
+                         WHERE node_id=${LOCAL_NID} AND (type IS NULL OR type='');
+                      " || echo "pre-register: type-backfill UPDATE failed (ignored)" >&2
+                  fi
                 fi
               fi
               exec repmgrd -f /etc/repmgr/repmgr.conf --daemonize=no

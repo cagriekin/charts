@@ -1,5 +1,33 @@
 # pg chart changelog
 
+## 0.5.63
+
+### Fixed
+
+- postStart primary discovery scanned `seq 0 (replicaCount - 1)` while
+  the StatefulSet runs `replicaCount + 1` pods, so
+  `lifecycle.postStart.additionalCommands` was silently skipped
+  whenever the primary was the last ordinal after a failover (#103).
+  The loop now scans ordinals `0..replicaCount`, matching the
+  service-updater.
+- repmgrd pre-register role detection used
+  `psql -h 127.0.0.1 -U postgres -d postgres`, which only worked
+  because the image's initdb happens to create a `postgres` superuser
+  and trust 127.0.0.1; it now uses the repmgr credentials already in
+  the container env (#104).
+- The repmgrd pre-register peer scan iterated a hardcoded `seq 0 9`,
+  breaking primary discovery for clusters with more than 10 pods; the
+  bound now derives from `replicaCount`. The type-backfill node id is
+  read from the generated `/etc/repmgr/repmgr.conf` instead of
+  re-deriving the image's `ordinal + 1000` convention, and the
+  backfill is skipped with an explicit error if `node_id` cannot be
+  parsed (#105).
+
+## Migrating from 0.5.62
+
+`helm upgrade my-release cagriekin/pg` is the entire migration. The
+StatefulSet pod template changes, so pods roll once.
+
 ## 0.5.62
 
 ### Fixed
