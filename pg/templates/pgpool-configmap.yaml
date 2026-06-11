@@ -87,14 +87,17 @@ data:
 {{- else }}
     sr_check_period = 0
 {{- end }}
+    # Check/recovery passwords are deliberately blank: pgpool then reads
+    # them from pool_passwd, which carries raw bytes. Conf-string escaping
+    # of arbitrary existingSecret passwords does not round-trip the lexer.
     sr_check_user = '__POSTGRES_USER__'
-    sr_check_password = '__POSTGRES_PASSWORD__'
+    sr_check_password = ''
     sr_check_database = '__POSTGRES_DB__'
 
     health_check_period = {{ .Values.pgpool.healthCheck.period }}
     health_check_timeout = {{ .Values.pgpool.healthCheck.timeout }}
     health_check_user = '__POSTGRES_USER__'
-    health_check_password = '__POSTGRES_PASSWORD__'
+    health_check_password = ''
     health_check_database = '__POSTGRES_DB__'
     health_check_max_retries = {{ .Values.pgpool.healthCheck.maxRetries }}
     health_check_retry_delay = {{ .Values.pgpool.healthCheck.retryDelay }}
@@ -108,7 +111,7 @@ data:
 {{- end }}
 
     recovery_user = '__POSTGRES_USER__'
-    recovery_password = '__POSTGRES_PASSWORD__'
+    recovery_password = ''
     recovery_1st_stage_command = ''
 
     allow_clear_text_frontend_auth = {{ if .Values.pgpool.allowClearTextFrontendAuth }}on{{ else }}off{{ end }}
@@ -123,5 +126,8 @@ data:
     host    all         all         0.0.0.0/0             md5
 
   pool_passwd: |
-    __POSTGRES_USER__:__POSTGRES_PASSWORD__
+    {{- /* TEXT marks the entry as cleartext: unprefixed entries are taken
+           as md5 hashes, which work against md5 backends by accident but
+           cannot answer scram challenges */}}
+    __POSTGRES_USER__:TEXT__POSTGRES_PASSWORD__
 {{- end }}

@@ -1,5 +1,48 @@
 # pg chart changelog
 
+## 0.5.66
+
+### Fixed
+
+- Credentials containing special characters no longer corrupt pgpool
+  and exporter configuration (#108). Placeholder substitution in the
+  pgpool and exporter init containers used
+  `sed -i "s/__X__/$VALUE/g"`, which corrupts or fails on `/`, `&`
+  and `\`; both now use a byte-safe awk splice with values passed via
+  the environment, plus context-appropriate escaping: backslash
+  escaping for pgpool.conf strings (`\\`, `\'`) and pool_passwd
+  fields (`\\`, `\:`), YAML quote doubling for postgres_exporter.yml.
+  The pgpool check passwords moved out of pgpool.conf entirely: blank
+  values make pgpool read pool_passwd, whose entry is now
+  `TEXT`-prefixed -- unprefixed entries are taken as md5 hashes,
+  which happened to work against md5 backends (repmgr image) but
+  cannot answer the scram challenges of standalone official-image
+  backends. The exporter `DATA_SOURCE_NAME` env built its URI from
+  raw `$(VAR)` expansion, which `@`, `:`, `/`, `?`, `#` or `%` in
+  credentials break; the init container now assembles the DSN with
+  every credential byte percent-encoded and the exporter reads it
+  from a file. Chart-generated passwords are alphanumeric and were
+  unaffected; `existingSecret` passwords are arbitrary and hit all of
+  these paths.
+- pgpool probes now run a query through pgpool instead of a TCP
+  connect (#122). A pgpool that rejects every session with "all
+  backend nodes are down" still accepts TCP, so the old probes kept
+  it Ready and never restarted it -- a permanent wedge reachable on
+  any standalone install whose backend is unready for ~30s at
+  startup (the repmgr flavor was masked by the service-updater
+  restarting pgpool). A failing liveness now restarts pgpool, which
+  rediscovers backends with a fresh status file.
+- The pgpool pod template now carries a checksum of the pgpool
+  configmap: pgpool.conf and pool_passwd are rendered into an
+  emptyDir by the init container, so configmap changes previously
+  never reached running pods.
+
+## Migrating from 0.5.65
+
+`helm upgrade my-release cagriekin/pg` is the entire migration. The
+pgpool and exporter pod templates change, so those deployments roll
+once; the PostgreSQL StatefulSet is untouched.
+
 ## 0.5.65
 
 ### Fixed
