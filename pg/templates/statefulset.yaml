@@ -98,10 +98,11 @@ spec:
               mountPath: /var/lib/postgresql/data
 {{- end }}
 {{- if and .Values.postgresql.extensions.enabled .Values.repmgr.enabled }}
+{{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
         - name: copy-base-ext
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
-          command: ['sh', '-c', 'cp /usr/lib/postgresql/18/lib/*.so /ext-lib/ && cp /usr/share/postgresql/18/extension/* /ext-share/']
+          command: ['sh', '-c', 'cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           volumeMounts:
@@ -111,10 +112,11 @@ spec:
               mountPath: /ext-share
 {{- end }}
 {{- if .Values.postgresql.extensions.enabled }}
+{{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
         - name: copy-ext
           image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
-          command: ['sh', '-c', 'cp /usr/lib/postgresql/18/lib/*.so /ext-lib/ && cp /usr/share/postgresql/18/extension/* /ext-share/']
+          command: ['sh', '-c', 'cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           volumeMounts:
@@ -452,10 +454,11 @@ spec:
               readOnly: true
 {{- end }}
 {{- if .Values.postgresql.extensions.enabled }}
+{{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
             - name: ext-lib
-              mountPath: /usr/lib/postgresql/18/lib
+              mountPath: /usr/lib/postgresql/{{ $pgMajor }}/lib
             - name: ext-share
-              mountPath: /usr/share/postgresql/18/extension
+              mountPath: /usr/share/postgresql/{{ $pgMajor }}/extension
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
             - name: pgbackrest-config

@@ -878,5 +878,47 @@ assert_contains "repmgr: monitoring history retention override renders" "${mhd_l
 assert_not_contains "minimal: no monitoring history cleanup" "${minimal}" "cluster cleanup"
 assert_not_contains "minimal: no MONITORING_HISTORY_DAYS env" "${minimal}" "MONITORING_HISTORY_DAYS"
 
+# --- postgresql.majorVersion Extension Path Tests ---
+
+# Test: default majorVersion (18) renders /18/ extension paths in both init
+# containers and the postgresql container volumeMounts
+extpaths_default=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set postgresql.extensions.enabled=true \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "majorVersion default: ext-lib mountPath uses /usr/lib/postgresql/18/lib" "${extpaths_default}" "mountPath: /usr/lib/postgresql/18/lib"
+assert_contains "majorVersion default: ext-share mountPath uses /usr/share/postgresql/18/extension" "${extpaths_default}" "mountPath: /usr/share/postgresql/18/extension"
+ext_lib_count=$(printf '%s' "${extpaths_default}" | grep -c "/usr/lib/postgresql/18/lib" || true)
+ext_share_count=$(printf '%s' "${extpaths_default}" | grep -c "/usr/share/postgresql/18/extension" || true)
+# copy-base-ext cp + copy-ext cp + postgresql volumeMount = 3 each
+assert_eq "majorVersion default: three /usr/lib/postgresql/18/lib occurrences" "3" "${ext_lib_count}"
+assert_eq "majorVersion default: three /usr/share/postgresql/18/extension occurrences" "3" "${ext_share_count}"
+
+# Test: overriding majorVersion swaps every extension path, leaving no /18/
+extpaths_19=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=19 \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "majorVersion=19: ext-lib mountPath uses /usr/lib/postgresql/19/lib" "${extpaths_19}" "mountPath: /usr/lib/postgresql/19/lib"
+assert_contains "majorVersion=19: ext-share mountPath uses /usr/share/postgresql/19/extension" "${extpaths_19}" "mountPath: /usr/share/postgresql/19/extension"
+ext19_lib_count=$(printf '%s' "${extpaths_19}" | grep -c "/usr/lib/postgresql/19/lib" || true)
+ext19_share_count=$(printf '%s' "${extpaths_19}" | grep -c "/usr/share/postgresql/19/extension" || true)
+assert_eq "majorVersion=19: three /usr/lib/postgresql/19/lib occurrences" "3" "${ext19_lib_count}"
+assert_eq "majorVersion=19: three /usr/share/postgresql/19/extension occurrences" "3" "${ext19_share_count}"
+assert_not_contains "majorVersion=19: no /18/ paths remain in statefulset" "${extpaths_19}" "postgresql/18/"
+
+# Test: empty majorVersion fails fast when extensions are enabled
+extpaths_empty=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion= \
+  --show-only templates/statefulset.yaml 2>&1) && extpaths_empty_rc=0 || extpaths_empty_rc=$?
+assert_eq "majorVersion empty: render fails when extensions enabled" "1" "${extpaths_empty_rc}"
+assert_contains "majorVersion empty: error names postgresql.majorVersion" "${extpaths_empty}" "postgresql.majorVersion is required"
+
+# Test: empty majorVersion is ignored while extensions stay disabled
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set postgresql.majorVersion= \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 && extpaths_off_rc=0 || extpaths_off_rc=$?
+assert_eq "majorVersion empty: render succeeds with extensions disabled" "0" "${extpaths_off_rc}"
+
 end_suite
 print_summary
