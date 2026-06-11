@@ -1,3 +1,20 @@
+{{- $primaryPod := printf "%s-0" (include "pg.fullname" .) }}
+{{- if .Values.repmgr.enabled }}
+{{- /* Preserve the live primary selector across upgrades: the service-updater
+       sidecar repoints pod-name after failover, and re-rendering the
+       hardcoded pod-0 would route writes to a read-only standby until the
+       next updater tick -- and under helm v4 server-side apply fails the
+       upgrade outright with a field-manager conflict on .spec.selector.
+       lookup returns nothing under helm template/--dry-run, where the
+       pod-0 bootstrap default applies (same caveat as secret.yaml). */}}
+{{- $live := lookup "v1" "Service" .Release.Namespace (include "pg.fullname" .) }}
+{{- if $live }}
+{{- $livePod := dig "selector" "statefulset.kubernetes.io/pod-name" "" $live.spec }}
+{{- if $livePod }}
+{{- $primaryPod = $livePod }}
+{{- end }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -14,4 +31,4 @@ spec:
   selector:
     {{- include "pg.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: postgresql
-    statefulset.kubernetes.io/pod-name: {{ include "pg.fullname" . }}-0
+    statefulset.kubernetes.io/pod-name: {{ $primaryPod }}

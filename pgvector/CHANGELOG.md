@@ -1,5 +1,23 @@
 # pgvector chart changelog
 
+## 0.6.64
+
+### Fixed
+
+- `helm upgrade` no longer repoints the primary Service selector back
+  to pod-0 (#109, shared template with the pg chart). The rendered
+  Service preserves the live `statefulset.kubernetes.io/pod-name`
+  selector via `lookup`, falling back to pod-0 only at bootstrap.
+  Previously every upgrade after a failover routed writes at a
+  read-only standby until the service-updater's next tick, and helm v4
+  upgrades failed outright with a field-manager conflict on
+  `.spec.selector`.
+
+## Migrating from 0.6.63
+
+`helm upgrade my-release cagriekin/pgvector` is the entire migration;
+see the pg chart 0.5.62 notes for the helm v4 conflict details.
+
 ## 0.6.63
 
 ### Fixed
