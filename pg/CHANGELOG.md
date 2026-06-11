@@ -1,5 +1,20 @@
 # pg chart changelog
 
+## 0.5.71
+
+### Changed
+
+- Default `postgresql.livenessProbe.failureThreshold` raised from 6
+  to 10 (#20). With the default `periodSeconds: 10` the kubelet now
+  waits 100s of failed `pg_isready` checks before restarting
+  PostgreSQL instead of 60s, so sustained heavy load no longer
+  triggers false liveness restarts. The readiness probe defaults are
+  unchanged.
+
+## Migrating from 0.5.70
+
+With default values the StatefulSet pod template changes (livenessProbe.failureThreshold 6 -> 10), so PostgreSQL pods WILL roll once on upgrade. No action is required; releases that already override postgresql.livenessProbe.failureThreshold in their own values are unaffected and do not roll because of this change.
+
 ## 0.5.70
 
 ### Added
