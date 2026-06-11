@@ -62,6 +62,8 @@ postgresql:
 
   tolerations: []
 
+  priorityClassName: ""
+
   podAnnotations: {}
 
   podDisruptionBudget:
@@ -212,6 +214,8 @@ pgpool:
 
   tolerations: []
 
+  priorityClassName: ""
+
   podAnnotations: {}
 
   topologySpreadConstraints: []
@@ -264,6 +268,8 @@ prometheusExporter:
     repository: quay.io/prometheuscommunity/postgres-exporter
     tag: v0.19.1
     pullPolicy: IfNotPresent
+
+  priorityClassName: ""
 
   podAnnotations: {}
 
@@ -322,6 +328,7 @@ backup:
   activeDeadlineSeconds: 3600
   backoffLimit: 1
   retentionDays: 7
+  priorityClassName: ""
   resources:
     requests:
       cpu: 100m
@@ -379,6 +386,7 @@ pgbackrest:
     activeDeadlineSeconds: 21600  # 6 hours
     successfulJobsHistoryLimit: 3
     failedJobsHistoryLimit: 3
+    priorityClassName: ""
     resources:
       requests:
         cpu: 50m

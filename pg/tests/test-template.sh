@@ -696,5 +696,34 @@ ips_pgbackrest=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-p
 ips_pgb_count=$(printf '%s' "${ips_pgbackrest}" | grep -c "name: registry-cred" || true)
 assert_eq "imagePullSecrets: both pgbackrest cronjobs carry the secret" "2" "${ips_pgb_count}"
 
+# --- priorityClassName Tests ---
+
+# Test: no priorityClassName rendered by default
+assert_not_contains "default: no priorityClassName in minimal render" "${minimal}" "priorityClassName"
+assert_not_contains "default: no priorityClassName in full render" "${full}" "priorityClassName"
+
+# Test: per-component priorityClassName renders on each pod template
+prio=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set postgresql.priorityClassName=db-critical \
+  --set pgpool.priorityClassName=pool-prio \
+  --set prometheusExporter.priorityClassName=exp-prio \
+  --set backup.enabled=true \
+  --set backup.priorityClassName=backup-prio \
+  --set backup.s3.endpoint=https://s3.example.com \
+  --set backup.s3.bucket=test-backups \
+  --set backup.existingSecret.name=s3-backup-creds \
+  2>&1)
+assert_contains "priorityClassName: statefulset carries db-critical" "${prio}" "priorityClassName: db-critical"
+assert_contains "priorityClassName: pgpool carries pool-prio" "${prio}" "priorityClassName: pool-prio"
+assert_contains "priorityClassName: exporter carries exp-prio" "${prio}" "priorityClassName: exp-prio"
+assert_contains "priorityClassName: backup cronjob carries backup-prio" "${prio}" "priorityClassName: backup-prio"
+
+# Test: pgbackrest cronjob priorityClassName renders on both cronjobs
+prio_pgbackrest=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set pgbackrest.cronjob.priorityClassName=pgb-prio \
+  --show-only templates/pgbackrest-cronjob.yaml 2>&1)
+prio_pgb_count=$(printf '%s' "${prio_pgbackrest}" | grep -c "priorityClassName: pgb-prio" || true)
+assert_eq "priorityClassName: both pgbackrest cronjobs carry pgb-prio" "2" "${prio_pgb_count}"
+
 end_suite
 print_summary

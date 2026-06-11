@@ -119,6 +119,7 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 | `postgresql.updateStrategy.type` | StatefulSet update strategy | `RollingUpdate` |
 | `postgresql.updateStrategy.rollingUpdate.partition` | Partition for rolling update | `0` |
 | `postgresql.podAnnotations` | Annotations for PostgreSQL pods | `{}` |
+| `postgresql.priorityClassName` | priorityClassName for PostgreSQL pods | `""` |
 | `postgresql.affinity` | Affinity rules for PostgreSQL pods | `{}` |
 | `postgresql.annotations` | Additional annotations | `{}` |
 
@@ -228,6 +229,7 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 | `pgpool.resources.limits.cpu` | CPU limit | `500m` |
 | `pgpool.resources.limits.memory` | Memory limit | `512Mi` |
 | `pgpool.podAnnotations` | Annotations for PGPool-II pods | `{}` |
+| `pgpool.priorityClassName` | priorityClassName for PGPool-II pods | `""` |
 | `pgpool.affinity` | Affinity rules for PGPool-II pods | `{}` |
 | `pgpool.logging.logConnections` | Log client connections | `true` |
 | `pgpool.logging.logStatement` | Log SQL statements | `false` |
@@ -393,6 +395,7 @@ scrape_configs:
 | `prometheusExporter.image.tag` | Exporter image tag | `v0.19.1` |
 | `prometheusExporter.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `prometheusExporter.podAnnotations` | Annotations for exporter pods | `{}` |
+| `prometheusExporter.priorityClassName` | priorityClassName for exporter pods | `""` |
 | `prometheusExporter.service.type` | Exporter service type | `ClusterIP` |
 | `prometheusExporter.service.port` | Exporter service port | `9116` |
 | `prometheusExporter.service.annotations` | Exporter service annotations | `{}` |
@@ -442,6 +445,7 @@ kubectl create job --from=cronjob/my-pgvector-backup manual-backup
 | `backup.existingSecret.accessKeyIdKey` | Key for access key ID in secret | `access-key-id` |
 | `backup.existingSecret.secretAccessKeyKey` | Key for secret access key in secret | `secret-access-key` |
 | `backup.retentionDays` | Days to retain backups before cleanup | `7` |
+| `backup.priorityClassName` | priorityClassName for backup job pods | `""` |
 | `backup.resources.requests.cpu` | CPU request | `100m` |
 | `backup.resources.requests.memory` | Memory request | `256Mi` |
 | `backup.resources.limits.cpu` | CPU limit | `500m` |

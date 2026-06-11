@@ -94,6 +94,9 @@ preStop:
 imagePullSecrets:
   {{- toYaml . | nindent 2 }}
 {{- end }}
+{{- with .Values.prometheusExporter.priorityClassName }}
+priorityClassName: {{ . }}
+{{- end }}
 securityContext:
   {{- toYaml .Values.prometheusExporter.podSecurityContext | nindent 2 }}
 initContainers:

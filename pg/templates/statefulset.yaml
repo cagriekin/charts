@@ -51,6 +51,9 @@ spec:
       shareProcessNamespace: true
       serviceAccountName: {{ include "pg.fullname" . }}-repmgr
       {{- end }}
+      {{- with .Values.postgresql.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- with .Values.postgresql.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

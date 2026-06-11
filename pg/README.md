@@ -104,6 +104,7 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.updateStrategy.type` | StatefulSet update strategy | `RollingUpdate` |
 | `postgresql.updateStrategy.rollingUpdate.partition` | Partition for rolling update | `0` |
 | `postgresql.podAnnotations` | Annotations for PostgreSQL pods | `{}` |
+| `postgresql.priorityClassName` | priorityClassName for PostgreSQL pods | `""` |
 | `postgresql.affinity` | Affinity rules for PostgreSQL pods | `{}` |
 | `postgresql.annotations` | Additional annotations | `{}` |
 | `postgresql.podSecurityContext` | Pod-level securityContext for StatefulSet | `{fsGroup: 103, runAsNonRoot: true, seccompProfile.type: RuntimeDefault}` |
@@ -224,6 +225,7 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 | `pgpool.podSecurityContext` | Pod-level securityContext for PGPool-II | `{runAsNonRoot: true, seccompProfile.type: RuntimeDefault}` |
 | `pgpool.containerSecurityContext` | Container-level securityContext for PGPool-II | `{runAsUser: 999, runAsGroup: 999, allowPrivilegeEscalation: false, capabilities.drop: [ALL]}` |
 | `pgpool.podAnnotations` | Annotations for PGPool-II pods | `{}` |
+| `pgpool.priorityClassName` | priorityClassName for PGPool-II pods | `""` |
 | `pgpool.affinity` | Affinity rules for PGPool-II pods | `{}` |
 | `pgpool.topologySpreadConstraints` | Topology spread constraints | `[]` |
 | `pgpool.nodeSelector` | Node selector for PGPool-II pods | `{}` |
@@ -417,6 +419,7 @@ scrape_configs:
 | `prometheusExporter.podSecurityContext` | Pod-level securityContext for exporter | `{runAsNonRoot: true, seccompProfile.type: RuntimeDefault}` |
 | `prometheusExporter.containerSecurityContext` | Container-level securityContext for exporter containers | `{runAsUser: 65534, runAsGroup: 65534, allowPrivilegeEscalation: false, capabilities.drop: [ALL]}` |
 | `prometheusExporter.podAnnotations` | Annotations for exporter pods | `{}` |
+| `prometheusExporter.priorityClassName` | priorityClassName for exporter pods | `""` |
 | `prometheusExporter.service.type` | Exporter service type | `ClusterIP` |
 | `prometheusExporter.service.port` | Exporter service port | `9116` |
 | `prometheusExporter.service.annotations` | Exporter service annotations | `{}` |
@@ -473,6 +476,7 @@ kubectl create job --from=cronjob/my-postgres-backup manual-backup
 | `backup.activeDeadlineSeconds` | Job timeout in seconds | `3600` |
 | `backup.backoffLimit` | Number of retries before marking job as failed | `1` |
 | `backup.retentionDays` | Days to retain backups before cleanup | `7` |
+| `backup.priorityClassName` | priorityClassName for backup job pods | `""` |
 | `backup.resources.requests.cpu` | CPU request | `100m` |
 | `backup.resources.requests.memory` | Memory request | `256Mi` |
 | `backup.resources.limits.cpu` | CPU limit | `500m` |
@@ -542,6 +546,7 @@ helm install my-postgres cagriekin/pg \
 | `pgbackrest.cronjob.activeDeadlineSeconds` | Job timeout | `21600` |
 | `pgbackrest.cronjob.successfulJobsHistoryLimit` | Successful job history limit | `3` |
 | `pgbackrest.cronjob.failedJobsHistoryLimit` | Failed job history limit | `3` |
+| `pgbackrest.cronjob.priorityClassName` | priorityClassName for pgBackRest job pods | `""` |
 | `pgbackrest.cronjob.resources.requests.cpu` | CronJob CPU request | `50m` |
 | `pgbackrest.cronjob.resources.requests.memory` | CronJob memory request | `64Mi` |
 | `pgbackrest.cronjob.resources.limits.cpu` | CronJob CPU limit | `200m` |
