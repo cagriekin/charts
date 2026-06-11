@@ -1,5 +1,23 @@
 # pgvector chart changelog
 
+## 0.6.66
+
+### Fixed
+
+- The postgresql preStop hook no longer attempts to promote a standby
+  (#102, shared template with the pg chart); it only stops PostgreSQL
+  cleanly and leaves promotion to repmgrd. The old remote
+  `pg_promote()` never executed (silent auth failure), and making it
+  work bypasses repmgr metadata and crash-loops every repmgrd; see the
+  pg chart 0.5.64 notes.
+
+## Migrating from 0.6.65
+
+`helm upgrade my-release cagriekin/pgvector` is the entire migration.
+The StatefulSet pod template changes, so pods roll once. Primary
+shutdown during the roll is now ~30s faster; failover behavior is
+unchanged because the removed promotion never executed.
+
 ## 0.6.65
 
 ### Fixed

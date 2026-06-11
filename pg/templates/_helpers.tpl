@@ -80,25 +80,12 @@ preStop:
       - /bin/bash
       - -c
       - |
-        ROLE=$(psql -U "$REPMGR_USER" -d "$REPMGR_DB" -t -A -c \
-          "SELECT type FROM repmgr.nodes WHERE active = true AND node_name = '$(hostname)'" 2>/dev/null)
-        if [ "$ROLE" = "primary" ]; then
-          STANDBY_HOST=$(psql -U "$REPMGR_USER" -d "$REPMGR_DB" -t -A -c \
-            "SELECT conninfo FROM repmgr.nodes WHERE type = 'standby' AND active = true ORDER BY priority LIMIT 1" 2>/dev/null \
-            | sed -n 's/.*host=\([^ ]*\).*/\1/p')
-          if [ -n "$STANDBY_HOST" ]; then
-            psql -U "$REPMGR_USER" -d "$REPMGR_DB" -h "$STANDBY_HOST" \
-              -c "SELECT pg_promote()" 2>/dev/null
-            for i in $(seq 1 30); do
-              IS_STANDBY=$(psql -U "$REPMGR_USER" -d "$REPMGR_DB" -t -A -c \
-                "SELECT pg_is_in_recovery()" 2>/dev/null)
-              if [ "$IS_STANDBY" = "t" ]; then
-                break
-              fi
-              sleep 1
-            done
-          fi
-        fi
+        # Stop cleanly and let repmgrd on a standby own the failover:
+        # its promote_command (repmgr standby promote) updates
+        # repmgr.nodes metadata, which a raw SQL-level promotion issued
+        # from this hook cannot do -- the promoted node would keep
+        # type='standby', and every repmgrd then exits on the stale
+        # metadata instead of converging.
         pg_ctl stop -D "$PGDATA" -m fast -w -t 30
 {{- end }}
 

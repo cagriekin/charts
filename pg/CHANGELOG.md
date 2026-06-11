@@ -1,5 +1,32 @@
 # pg chart changelog
 
+## 0.5.64
+
+### Fixed
+
+- The postgresql preStop hook no longer attempts to promote a standby;
+  it now only stops PostgreSQL cleanly and leaves promotion to repmgrd
+  (#102). The old hook's remote `pg_promote()` never actually ran (the
+  image ships no `.pgpass` and pg_hba requires scram/md5 cross-pod, so
+  the unauthenticated call failed silently behind `2>/dev/null`), and
+  its verification loop polled local `pg_is_in_recovery()` -- always
+  `f` on the old primary -- burning the full 30s on every primary
+  shutdown. Repairing the call as #102 originally suggested proved
+  worse than removing it: a raw `pg_promote()` bypasses repmgr.nodes
+  metadata, the promoted node keeps `type='standby'`, and every
+  repmgrd crash-loops on the stale metadata (reproduced in the upgrade
+  test). repmgrd's own `promote_command` (`repmgr standby promote`)
+  updates the metadata correctly and is the only promotion path the
+  cluster has ever actually converged through.
+
+## Migrating from 0.5.63
+
+`helm upgrade my-release cagriekin/pg` is the entire migration. The
+StatefulSet pod template changes, so pods roll once. Primary shutdown
+during the roll is now ~30s faster (no dead verification loop);
+failover behavior is unchanged because the removed promotion never
+executed.
+
 ## 0.5.63
 
 ### Fixed
