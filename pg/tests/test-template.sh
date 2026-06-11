@@ -978,5 +978,35 @@ pcp_legacy=$(helm template test-pg "${CHART_DIR}" \
 assert_eq "pgpool admin: legacy adminPassword fails" "1" "${pcp_legacy_rc}"
 assert_contains "pgpool admin: legacy value error points at pgpool.admin" "${pcp_legacy}" "pgpool.adminUsername and pgpool.adminPassword were removed"
 
+# --- Read-Only Replica Service Tests ---
+
+# Test: readonly service renders with repmgr values and selects the standby
+# role label maintained by the service-updater
+ro_svc=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --show-only templates/service-readonly.yaml 2>&1)
+assert_contains "readonly: service named with -readonly suffix" "${ro_svc}" "name: test-pg-readonly"
+assert_contains "readonly: selector targets standby role" "${ro_svc}" "pg-role: standby"
+assert_contains "readonly: selector keeps postgresql component" "${ro_svc}" "app.kubernetes.io/component: postgresql"
+assert_contains "readonly: service port wired like primary service" "${ro_svc}" "port: 5432"
+assert_contains "readonly: targetPort is postgresql" "${ro_svc}" "targetPort: postgresql"
+assert_not_contains "readonly: selector never pins a pod-name" "${ro_svc}" "statefulset.kubernetes.io/pod-name"
+
+# Test: readonly service is not rendered in standalone (minimal) mode
+assert_not_contains "minimal: no readonly service" "${minimal}" "test-pg-readonly"
+
+# Test: rbac grants pod get/list/patch for role labeling (delete kept for
+# split-brain fencing)
+ro_role=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --show-only templates/rbac.yaml 2>&1)
+assert_contains "readonly: rbac grants pods get/list/patch/delete" "${ro_role}" 'verbs: \["get", "list", "patch", "delete"\]'
+
+# Test: service-updater script carries the convergent labeling logic
+ro_updater=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --show-only templates/service-updater-configmap.yaml 2>&1)
+assert_contains "readonly: updater defines update_pod_role_labels" "${ro_updater}" "update_pod_role_labels() {"
+assert_contains "readonly: updater calls labeling each tick" "${ro_updater}" 'update_pod_role_labels "$CURRENT_MASTER"'
+assert_contains "readonly: updater labels with --overwrite for idempotency" "${ro_updater}" 'kubectl label pod "${pod}" -n "${NAMESPACE}" "pg-role=${desired_role}" --overwrite'
+assert_contains "readonly: updater lists pods by chart selector labels" "${ro_updater}" "app.kubernetes.io/instance=test-pg,app.kubernetes.io/component=postgresql"
+
 end_suite
 print_summary
