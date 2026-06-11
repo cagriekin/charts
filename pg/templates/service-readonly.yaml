@@ -1,0 +1,28 @@
+{{- if .Values.repmgr.enabled }}
+{{- /* Service selectors are equality-only, so "every pod except the primary"
+       cannot be expressed against pod-name. Instead the service-updater
+       sidecar maintains a pg-role label (primary/standby) on all postgresql
+       pods each reconciliation tick, and this Service selects the standby
+       role. Pods carry no pg-role label until the updater applies one (fresh
+       installs, upgrades from older chart versions, scale-ups), so they are
+       simply absent from the endpoints until labeled -- the primary can never
+       be selected by accident. Repmgr-only: standalone installs run a single
+       pod with no standbys. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pg.fullname" . }}-readonly
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: postgresql
+      port: {{ .Values.service.port }}
+      targetPort: postgresql
+      protocol: TCP
+  selector:
+    {{- include "pg.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
+    pg-role: standby
+{{- end }}

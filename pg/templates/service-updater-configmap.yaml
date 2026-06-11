@@ -82,6 +82,41 @@ data:
         }"
     }
 
+    update_pod_role_labels() {
+        local master=$1
+
+        if [ -z "$master" ]; then
+            return 1
+        fi
+
+        # Converge pg-role labels on every tick, not just on master change:
+        # pods recreated by the StatefulSet or added after a scale-up start
+        # without a pg-role label and would otherwise never be picked up by
+        # the readonly Service (which selects pg-role=standby). kubectl label
+        # requires the pods patch verb granted in rbac.yaml.
+        local pod_roles
+        pod_roles=$(kubectl get pods -n "${NAMESPACE}" \
+            -l "app.kubernetes.io/name={{ include "pg.name" . }},app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=postgresql" \
+            -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.labels.pg-role}{"\n"}{end}' 2>/dev/null)
+
+        local pod current_role desired_role
+        while read -r pod current_role; do
+            if [ -z "$pod" ]; then
+                continue
+            fi
+
+            desired_role="standby"
+            if [ "$pod" = "$master" ]; then
+                desired_role="primary"
+            fi
+
+            if [ "$current_role" != "$desired_role" ]; then
+                echo "Labeling pod ${pod} pg-role=${desired_role}"
+                kubectl label pod "${pod}" -n "${NAMESPACE}" "pg-role=${desired_role}" --overwrite
+            fi
+        done <<< "${pod_roles}"
+    }
+
     restart_pgpool() {
         if [ -z "$PGPOOL_DEPLOYMENT" ]; then
             return 0
@@ -201,6 +236,7 @@ data:
             # one ArgoCD sync after a failover stranded the primary service
             # pointing at the wrong pod indefinitely.
             update_service_selector "$CURRENT_MASTER"
+            update_pod_role_labels "$CURRENT_MASTER"
 
             if [ "$CURRENT_MASTER" != "$LAST_MASTER" ]; then
                 echo "Master change: ${LAST_MASTER} -> ${CURRENT_MASTER}"

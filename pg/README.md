@@ -7,6 +7,7 @@ PostgreSQL Helm chart with repmgr for automatic failover and replication managem
 - PostgreSQL 18.1 with configurable version
 - Repmgr for automatic failover and replication management
 - Service-updater sidecar for automatic primary service selector updates after failover
+- Read-only `<fullname>-readonly` service targeting standby pods for read scaling (repmgr mode)
 - Optional PGPool-II for connection pooling and read/write splitting
 - Support for existing secrets or auto-generated passwords
 - StatefulSet-based deployment with persistent storage
@@ -194,7 +195,7 @@ When repmgr is enabled, a preStop lifecycle hook stops PostgreSQL cleanly (`pg_c
 When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 
 - **repmgrd**: monitors replication and triggers automatic failover when the primary becomes unavailable. Has a preStop hook that runs `repmgr daemon stop` for clean deregistration.
-- **service-updater**: watches repmgr cluster state and patches the Kubernetes Service selector to point to the current primary, then restarts PGPool-II if enabled. Has a preStop hook that sleeps 5s to allow in-flight patches to complete. Includes a liveness probe that checks for a heartbeat file updated each loop iteration (fails if no update within 120s). Performs split-brain detection each cycle by querying all nodes for `pg_is_in_recovery()` -- if multiple primaries are found, takes the configured action (`log` or `fence`).
+- **service-updater**: watches repmgr cluster state and patches the Kubernetes Service selector to point to the current primary, then restarts PGPool-II if enabled. Also maintains a `pg-role` label (`primary`/`standby`) on every postgresql pod each cycle, which the `<fullname>-readonly` service selects (`pg-role: standby`) to route read traffic to replicas; pods without the label (fresh, recreated or scaled-up) are excluded until labeled. Has a preStop hook that sleeps 5s to allow in-flight patches to complete. Includes a liveness probe that checks for a heartbeat file updated each loop iteration (fails if no update within 120s). Performs split-brain detection each cycle by querying all nodes for `pg_is_in_recovery()` -- if multiple primaries are found, takes the configured action (`log` or `fence`).
 
 **Split-brain detection**: In a 2-node cluster, network partitions can cause both nodes to believe they are the primary. The service-updater detects this by checking all nodes each monitoring cycle. With `action: log` (default), it logs a critical warning. With `action: fence`, it compares WAL LSN positions and terminates connections on the stale primary. For production deployments, use 3+ nodes to reduce split-brain risk.
 
@@ -299,8 +300,8 @@ When `postgresql.existingSecret.enabled` is `false`, a secret will be auto-gener
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `service.type` | Primary service type | `ClusterIP` |
-| `service.port` | Primary service port | `5432` |
+| `service.type` | Primary and read-only service type | `ClusterIP` |
+| `service.port` | Primary and read-only service port | `5432` |
 | `nameOverride` | Override chart name | `""` |
 | `fullnameOverride` | Override full release name | `""` |
 
@@ -334,6 +335,17 @@ When enabled, NetworkPolicies restrict traffic:
 kubectl port-forward svc/my-postgres 5432:5432
 psql -h localhost -U postgres -d postgres
 ```
+
+### Read-Only Connection to Replicas
+
+When repmgr is enabled, a `<fullname>-readonly` service routes only to standby pods (selected via the `pg-role: standby` label maintained by the service-updater sidecar):
+
+```bash
+kubectl port-forward svc/my-postgres-readonly 5432:5432
+psql -h localhost -U postgres -d postgres
+```
+
+With `postgresql.replicaCount: 0` the service exists but has no endpoints.
 
 ### Through PGPool-II
 

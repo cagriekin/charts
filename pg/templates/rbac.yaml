@@ -17,9 +17,12 @@ rules:
     resources: ["services"]
     resourceNames: ["{{ include "pg.fullname" . }}"]
     verbs: ["get", "patch"]
+  {{- /* delete: split-brain fencing; get/list/patch: pg-role labeling for the
+         readonly Service. resourceNames cannot scope `list`, so the rule
+         stays unscoped. */}}
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["delete"]
+    verbs: ["get", "list", "patch", "delete"]
 {{- if .Values.pgpool.enabled }}
   - apiGroups: ["apps"]
     resources: ["deployments"]
