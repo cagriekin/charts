@@ -9,6 +9,12 @@ postgresql:
     tag: pg18-trixie
     pullPolicy: IfNotPresent
 
+  # PostgreSQL major version shipped in image.tag above. Used to build the
+  # extension paths (/usr/lib/postgresql/<major>/lib and
+  # /usr/share/postgresql/<major>/extension) when extensions.enabled is true.
+  # Keep in sync with image.tag.
+  majorVersion: "18"
+
   replicaCount: 1
 
   annotations: {}

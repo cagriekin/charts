@@ -1,5 +1,22 @@
 # pg chart changelog
 
+## 0.5.76
+
+### Changed
+
+- Extension paths are no longer hardcoded to PostgreSQL 18 (#18). The
+  copy-base-ext/copy-ext init-container `cp` commands and the
+  ext-lib/ext-share volumeMounts now derive
+  `/usr/lib/postgresql/<major>/lib` and
+  `/usr/share/postgresql/<major>/extension` from the new
+  `postgresql.majorVersion` value (default `"18"`), validated via
+  `required` when `postgresql.extensions.enabled=true`. Keep it in
+  sync with `postgresql.image.tag` when running a different major.
+
+## Migrating from 0.5.75
+
+`helm upgrade my-release cagriekin/pg` is the entire migration. With default values nothing rolls: `postgresql.majorVersion` defaults to "18", so every rendered manifest is byte-identical to the previous release (the affected paths only render when `postgresql.extensions.enabled=true`, and even then they resolve to the same /18/ paths). Users running a non-18 image with extensions enabled should set `postgresql.majorVersion` to match their image's major version; leaving it empty now fails the render with a clear error.
+
 ## 0.5.75
 
 ### Added
