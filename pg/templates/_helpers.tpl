@@ -90,6 +90,10 @@ preStop:
 {{- end }}
 
 {{- define "pg.exporterPodSpec" -}}
+{{- with .Values.imagePullSecrets }}
+imagePullSecrets:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
 securityContext:
   {{- toYaml .Values.prometheusExporter.podSecurityContext | nindent 2 }}
 initContainers:

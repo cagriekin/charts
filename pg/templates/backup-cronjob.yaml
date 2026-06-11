@@ -19,6 +19,10 @@ spec:
             {{- include "pg.selectorLabels" . | nindent 12 }}
             app.kubernetes.io/component: backup
         spec:
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           restartPolicy: OnFailure
           securityContext:
             {{- toYaml .Values.backup.podSecurityContext | nindent 12 }}

@@ -93,6 +93,12 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 
 ## Configuration
 
+### Common Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `imagePullSecrets` | Pull secrets applied to every pod template (StatefulSet, pgpool and exporter Deployments, backup and pgBackRest CronJobs) | `[]` |
+
 ### PostgreSQL Parameters
 
 | Parameter | Description | Default |

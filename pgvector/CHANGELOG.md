@@ -1,5 +1,20 @@
 # pgvector chart changelog
 
+## 0.6.69
+
+### Added
+
+- `imagePullSecrets` (top-level value, default `[]`) now propagates to
+  every pod template (#111, shared templates with the pg chart): the
+  PostgreSQL StatefulSet, the pgpool and prometheus exporter
+  Deployments, and the backup and pgBackRest CronJobs.
+
+## Migrating from 0.6.68
+
+`helm upgrade my-release cagriekin/pgvector` is the entire migration.
+With the default `imagePullSecrets: []` nothing is rendered and no
+pods roll.
+
 ## 0.6.68
 
 ### Fixed

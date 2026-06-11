@@ -1,5 +1,21 @@
 # pg chart changelog
 
+## 0.5.67
+
+### Added
+
+- `imagePullSecrets` (top-level value, default `[]`) now propagates to
+  every pod template (#111): the PostgreSQL StatefulSet, the pgpool
+  and prometheus exporter Deployments, and the backup and pgBackRest
+  CronJobs. Previously no pod template carried pull secrets, so none
+  of the chart's images could come from a private registry.
+
+## Migrating from 0.5.66
+
+`helm upgrade my-release cagriekin/pg` is the entire migration. With
+the default `imagePullSecrets: []` nothing is rendered and no pods
+roll.
+
 ## 0.5.66
 
 ### Fixed
