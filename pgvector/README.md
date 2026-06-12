@@ -191,6 +191,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 | `repmgr.database` | Repmgr database name | `repmgr` |
 | `repmgr.monitoringHistoryDays` | Days of `repmgr.monitoring_history` to retain; pruned daily on the primary via `repmgr cluster cleanup` | `7` |
 | `repmgr.terminationGracePeriodSeconds` | Time allowed for graceful shutdown and failover | `120` |
+| `repmgr.stalePrimary.action` | Action when a restarted primary container detects an active peer primary on a newer timeline: `reclone` (delete own pod so repmgr-init re-clones) or `halt` (crash-loop, keep data dir for inspection) | `reclone` |
 | `repmgr.resources.requests.cpu` | CPU request | `50m` |
 | `repmgr.resources.requests.memory` | Memory request | `128Mi` |
 | `repmgr.resources.limits.cpu` | CPU limit | `500m` |

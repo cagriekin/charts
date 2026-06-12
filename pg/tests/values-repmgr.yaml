@@ -14,8 +14,13 @@ postgresql:
       cpu: 500m
       memory: 512Mi
 
+  # The failover and chaos suites exercise data durability across pod
+  # recreation (stale-primary self-delete, standby chaos deletes); without
+  # persistent volumes pod deletion wipes PGDATA and ordinal-0 fresh-boots
+  # instead of re-cloning, so these suites must run like production does.
   persistence:
-    enabled: false
+    enabled: true
+    size: 1Gi
 
   database: testdb
   username: testuser

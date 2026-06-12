@@ -1,5 +1,40 @@
 # pg chart changelog
 
+## 0.5.83
+
+### Fixed
+
+- A crashed primary no longer resurrects as a stale read-write primary
+  when only its container restarts (#123). Re-clone logic lives in the
+  repmgr-init initContainer, which does not re-run on container-only
+  restarts (CrashLoopBackOff, OOM kills), so after a standby promotion
+  the old primary would come back read-write on the stale timeline —
+  a split-brain under default values. The postgresql container start
+  is now wrapped by a guard: before starting read-write with existing
+  data, it scans peers for an active primary on a NEWER timeline
+  (promotion always bumps the timeline, so newer-elsewhere is proof of
+  staleness) and refuses to start. `repmgr.stalePrimary.action`
+  controls recovery: `reclone` (default) deletes the own pod so the
+  existing repmgr-init re-clone and repmgrd re-register pipeline
+  repairs the node; `halt` crash-loops with the data directory left
+  untouched for inspection. pg_rewind-based repair is not possible on
+  these clusters (initdb runs without data checksums or
+  wal_log_hints), so re-clone via pod recreation is the repair path.
+  The guard also refuses to initialize a fresh database when the data
+  directory is empty but a peer is already an active primary
+  (reachable on ordinal 0 without persistent storage, whose init path
+  assumes first-boot), which previously bootstrapped a brand-new
+  divergent primary next to the live cluster. Automatic re-clone of
+  ordinal 0 therefore requires persistent storage; without it the pod
+  halts with a clear error instead of silently splitting the cluster.
+
+## Migrating from 0.5.82
+
+`helm upgrade my-release cagriekin/pg` is the entire migration.
+The StatefulSet pod template changes (wrapped container command), so
+PostgreSQL pods roll once. Behavior changes only in the stale-primary
+scenario, which previously produced a silent split-brain.
+
 ## 0.5.82
 
 ### Fixed

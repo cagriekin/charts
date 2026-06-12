@@ -1035,5 +1035,33 @@ assert_contains "audit event: rbac role has events resource" "${su_audit_rbac}" 
 su_events_rule=$(printf '%s\n' "${su_audit_rbac}" | grep -A 1 'resources: \["events"\]' || true)
 assert_contains "audit event: events rule grants create verb" "${su_events_rule}" 'verbs: \["create"\]'
 
+# --- Stale-Primary Start Guard Tests (issue #123) ---
+
+# Test: repmgr mode wraps the postgresql container start with the guard
+guard_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "stale guard: timeline comparison present" "${guard_sts}" "SELECT timeline_id FROM pg_control_checkpoint();"
+assert_contains "stale guard: refuses read-write start when stale" "${guard_sts}" "refusing to start read-write"
+assert_contains "stale guard: default action recreates the pod" "${guard_sts}" "kubectl delete pod"
+assert_contains "stale guard: still execs the image entrypoint" "${guard_sts}" "exec /usr/local/bin/entrypoint.sh postgres"
+assert_contains "stale guard: peer scan derives from replicaCount" "${guard_sts}" "seq 0 1"
+assert_contains "stale guard: refuses fresh initdb next to a live cluster" "${guard_sts}" "refusing to initialize a fresh, divergent database"
+
+# Test: halt action keeps the data directory and does not self-delete
+guard_halt=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set repmgr.stalePrimary.action=halt \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "stale guard halt: no self-delete" "${guard_halt}" "kubectl delete pod"
+assert_contains "stale guard halt: halt message present" "${guard_halt}" "left untouched for inspection"
+
+# Test: invalid action fails rendering
+guard_invalid_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set repmgr.stalePrimary.action=bogus > /dev/null 2>&1 || guard_invalid_rc=$?
+assert_gt "stale guard: invalid action fails rendering" "${guard_invalid_rc}" "0"
+
+# Test: standalone mode has no guard
+assert_not_contains "stale guard: absent in standalone render" "${minimal}" "refusing to start read-write"
+
 end_suite
 print_summary

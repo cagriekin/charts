@@ -137,6 +137,16 @@ repmgr:
   splitBrainDetection:
     action: log
 
+  # A crashed primary whose container restarts in place (the pod is NOT
+  # recreated, so repmgr-init does not re-run) would resume read-write on a
+  # stale timeline after a standby was promoted. The container start guard
+  # detects an active peer primary on a newer timeline and refuses to start.
+  # reclone: delete the own pod so repmgr-init re-clones from the current
+  # primary (self-healing). halt: crash-loop with the data directory left
+  # untouched for inspection; delete the pod manually to trigger the re-clone.
+  stalePrimary:
+    action: reclone
+
   resources:
     requests:
       cpu: 50m

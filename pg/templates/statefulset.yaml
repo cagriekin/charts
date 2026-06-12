@@ -195,9 +195,81 @@ spec:
       containers:
         - name: postgresql
 {{- if .Values.repmgr.enabled }}
+{{- if not (has .Values.repmgr.stalePrimary.action (list "reclone" "halt")) }}
+{{- fail "repmgr.stalePrimary.action must be one of: reclone, halt" }}
+{{- end }}
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
-          command: ["/usr/local/bin/entrypoint.sh", "postgres"]
+          command:
+            - /bin/bash
+            - -c
+            - |
+              # Container-only restarts do not re-run init containers, so a
+              # crashed primary would otherwise resume read-write on a stale
+              # timeline after a standby was promoted (split-brain, and a
+              # full-cluster restart would then re-clone the newer standby
+              # from it). Before starting read-write, look for an active peer
+              # primary on a NEWER timeline; promotion always bumps the
+              # timeline, so newer-elsewhere is proof this data dir is stale.
+              # Repair is routed through pod recreation: repmgr-init re-clones
+              # and repmgrd re-registers, the same path pod deletion takes.
+              export PGCONNECT_TIMEOUT=5
+              PGDATA="${PGDATA:-/var/lib/postgresql/data/pgdata}"
+              SCAN_REASON=""
+              if [ ! -s "$PGDATA/PG_VERSION" ]; then
+                SCAN_REASON="fresh"
+              elif [ ! -f "$PGDATA/standby.signal" ]; then
+                SCAN_REASON="primary"
+              fi
+              if [ -n "$SCAN_REASON" ]; then
+                ORDINAL="${HOSTNAME##*-}"
+                NEWEST_REMOTE_TLI=0
+                NEWEST_REMOTE_PEER=""
+                for i in $(seq 0 {{ .Values.postgresql.replicaCount }}); do
+                  [ "$i" = "$ORDINAL" ] && continue
+                  PEER="${HOSTNAME%-*}-${i}.${HEADLESS_SERVICE}"
+                  PGPASSWORD="$REPMGR_PASSWORD" pg_isready -t 3 -h "$PEER" -U "$REPMGR_USER" -d "$REPMGR_DB" > /dev/null 2>&1 || continue
+                  IN_RECOVERY=$(PGPASSWORD="$REPMGR_PASSWORD" psql -h "$PEER" -U "$REPMGR_USER" -d "$REPMGR_DB" -tA -c "SELECT pg_is_in_recovery();" 2>/dev/null)
+                  [ "$IN_RECOVERY" = "f" ] || continue
+                  REMOTE_TLI=$(PGPASSWORD="$REPMGR_PASSWORD" psql -h "$PEER" -U "$REPMGR_USER" -d "$REPMGR_DB" -tA -c "SELECT timeline_id FROM pg_control_checkpoint();" 2>/dev/null)
+                  case "$REMOTE_TLI" in (''|*[!0-9]*) continue ;; esac
+                  if [ "$REMOTE_TLI" -gt "$NEWEST_REMOTE_TLI" ]; then
+                    NEWEST_REMOTE_TLI="$REMOTE_TLI"
+                    NEWEST_REMOTE_PEER="$PEER"
+                  fi
+                done
+                if [ "$SCAN_REASON" = "fresh" ]; then
+                  # empty data dir while the cluster already has a primary:
+                  # initdb here would create a brand-new divergent database
+                  # (reachable on ordinal 0 without persistent storage, whose
+                  # init path assumes first-boot when it finds no data)
+                  if [ "$NEWEST_REMOTE_TLI" -gt 0 ]; then
+                    echo "ERROR: data directory is empty but ${NEWEST_REMOTE_PEER} is an active primary; refusing to initialize a fresh, divergent database. This node must be cloned from the cluster (use persistent storage so re-clone can run, or clone manually)" >&2
+                    exit 1
+                  fi
+                else
+                  # the repmgr image keeps pg_controldata in the versioned
+                  # bindir only; locate it by glob so an image PG bump cannot
+                  # silently disable the guard via a dead hardcoded path
+                  PG_CONTROLDATA=$(compgen -G '/usr/lib/postgresql/*/bin/pg_controldata' | head -1)
+                  LOCAL_TLI=$("$PG_CONTROLDATA" -D "$PGDATA" 2>/dev/null | grep "Latest checkpoint's TimeLineID" | awk '{print $NF}')
+                  case "$LOCAL_TLI" in (''|*[!0-9]*) LOCAL_TLI="" ;; esac
+                  if [ -z "$LOCAL_TLI" ] && [ "$NEWEST_REMOTE_TLI" -gt 0 ]; then
+                    echo "WARNING: cannot read the local timeline while ${NEWEST_REMOTE_PEER} reports an active primary; the stale-primary guard cannot compare timelines and postgres will start anyway" >&2
+                  fi
+                  if [ -n "$LOCAL_TLI" ] && [ "$NEWEST_REMOTE_TLI" -gt "$LOCAL_TLI" ]; then
+                    echo "ERROR: stale primary data directory: ${NEWEST_REMOTE_PEER} is an active primary on timeline ${NEWEST_REMOTE_TLI}, local timeline is ${LOCAL_TLI}; refusing to start read-write" >&2
+{{- if eq .Values.repmgr.stalePrimary.action "reclone" }}
+                    echo "stalePrimary.action=reclone: deleting pod ${HOSTNAME} so repmgr-init re-clones this node from the current primary" >&2
+                    kubectl delete pod "$HOSTNAME" --wait=false || echo "WARNING: self-delete failed; pod will crash-loop until deleted manually" >&2
+{{- else }}
+                    echo "stalePrimary.action=halt: data directory left untouched for inspection; delete the pod to trigger a re-clone" >&2
+{{- end }}
+                    exit 1
+                  fi
+                fi
+              fi
+              exec /usr/local/bin/entrypoint.sh postgres
 {{- else }}
           image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}

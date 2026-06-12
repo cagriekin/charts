@@ -22,8 +22,13 @@ postgresql:
       cpu: 500m
       memory: 512Mi
 
+  # Rolling upgrades delete pod-0; repmgrd promotes pod-1 within ~30s, so
+  # without persistent volumes pod-0 returns empty next to a promoted
+  # primary and the stale-primary guard (correctly) refuses the fresh
+  # initdb. Persistent data lets the re-clone pipeline heal the roll.
   persistence:
-    enabled: false
+    enabled: true
+    size: 1Gi
 
   database: testdb
   username: testuser

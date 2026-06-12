@@ -114,5 +114,82 @@ fi
 # Unfreeze the old primary after all assertions
 kubectl exec -n "${NAMESPACE}" "${POD_PRIMARY}" -c repmgrd -- kill -CONT "${PG_PID}" 2>/dev/null || true
 
+# --- Stale-primary start guard (#123) ---
+# At this point the old primary has resumed read-write on the stale timeline
+# and its container has never restarted (the exact #123 state). Kill the
+# postmaster so the kubelet restarts only the postgresql container: the start
+# guard must see pod-1's newer timeline, self-delete the pod, and the
+# recreated pod must re-clone and come back as a standby of the new primary.
+if [[ "${failover_done}" == "true" ]]; then
+  OLD_UID=$(kubectl get pod -n "${NAMESPACE}" "${POD_PRIMARY}" -o jsonpath='{.metadata.uid}')
+  echo "  Killing postmaster on ${POD_PRIMARY} to force a container-only restart..."
+  kubectl exec -n "${NAMESPACE}" "${POD_PRIMARY}" -c repmgrd -- kill -9 "${PG_PID}" 2>/dev/null || true
+
+  echo "  Waiting for the stale-primary guard to recreate ${POD_PRIMARY} (up to 180s)..."
+  recreated=false
+  guard_elapsed=0
+  while [[ ${guard_elapsed} -lt 180 ]]; do
+    NEW_UID=$(kubectl get pod -n "${NAMESPACE}" "${POD_PRIMARY}" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
+    if [[ -n "${NEW_UID}" && "${NEW_UID}" != "${OLD_UID}" ]]; then
+      recreated=true
+      echo "  Pod recreated after ${guard_elapsed}s"
+      break
+    fi
+    sleep 5
+    guard_elapsed=$((guard_elapsed + 5))
+  done
+  assert_eq "stale-primary guard recreates the old primary pod" "true" "${recreated}"
+
+  if [[ "${recreated}" == "true" ]]; then
+    echo "  Waiting for ${POD_PRIMARY} to rejoin as standby (up to 300s)..."
+    rejoined=false
+    rejoin_elapsed=0
+    while [[ ${rejoin_elapsed} -lt 300 ]]; do
+      in_recovery=$(pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")
+      if [[ "${in_recovery}" == "t" ]]; then
+        rejoined=true
+        echo "  Rejoined as standby after ${rejoin_elapsed}s"
+        break
+      fi
+      sleep 10
+      rejoin_elapsed=$((rejoin_elapsed + 10))
+    done
+    assert_eq "old primary rejoins as standby instead of serving read-write" "true" "${rejoined}"
+
+    if [[ "${rejoined}" == "true" ]]; then
+      # the re-clone must carry data written on the new primary AFTER the
+      # failover, proving the stale timeline-1 directory was replaced
+      sleep 5
+      recloned_val=$(pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "SELECT value FROM failover_test WHERE value='${AFTER_VALUE:-}'" "testuser" "testdb" 2>/dev/null || echo "")
+      assert_eq "re-cloned standby has post-failover data" "${AFTER_VALUE:-}" "${recloned_val}"
+
+      streaming=false
+      stream_elapsed=0
+      while [[ ${stream_elapsed} -lt 60 ]]; do
+        new_primary_count=$(pg_exec "${NAMESPACE}" "${POD_REPLICA}" "SELECT count(*) FROM pg_stat_replication" "testuser" "testdb" 2>/dev/null || echo "")
+        if [[ "${new_primary_count}" == "1" ]]; then
+          streaming=true
+          break
+        fi
+        sleep 5
+        stream_elapsed=$((stream_elapsed + 5))
+      done
+      assert_eq "new primary streams to the re-cloned standby" "true" "${streaming}"
+    else
+      skip "re-cloned standby has post-failover data (old primary never rejoined)"
+      skip "new primary streams to the re-cloned standby (old primary never rejoined)"
+    fi
+  else
+    skip "old primary rejoins as standby instead of serving read-write (pod never recreated)"
+    skip "re-cloned standby has post-failover data (pod never recreated)"
+    skip "new primary streams to the re-cloned standby (pod never recreated)"
+  fi
+else
+  skip "stale-primary guard recreates the old primary pod (failover did not complete)"
+  skip "old primary rejoins as standby instead of serving read-write (failover did not complete)"
+  skip "re-cloned standby has post-failover data (failover did not complete)"
+  skip "new primary streams to the re-cloned standby (failover did not complete)"
+fi
+
 end_suite
 print_summary
