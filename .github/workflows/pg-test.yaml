@@ -76,12 +76,30 @@ jobs:
       - name: Run repmgr chaos restart regression test
         run: make -C pg test-repmgr-chaos
 
+      # The full install is the heaviest suite (3 postgres pods + pgpool +
+      # exporter); on 2-CPU runners it times out when the minimal, repmgr and
+      # chaos namespaces are still consuming the node, so free them first and
+      # wait for the deletion to actually release resources.
+      - name: Clean up prior test namespaces
+        run: |
+          kubectl delete namespace pg-test-minimal pg-test-repmgr pg-test-repmgr-chaos \
+            --ignore-not-found --wait=true --timeout=180s \
+            || echo "WARNING: namespace cleanup timed out, continuing"
+
       - name: Run full tests
         run: make -C pg test-full
 
-      - name: Clean up prior test namespaces
+      - name: Clean up full test namespace
         run: |
-          kubectl delete namespace pg-test-minimal pg-test-repmgr pg-test-repmgr-chaos pg-test-full --ignore-not-found --wait=false
+          kubectl delete namespace pg-test-full --ignore-not-found --wait=true --timeout=180s \
+            || echo "WARNING: namespace cleanup timed out, continuing"
 
       - name: Run upgrade tests
         run: make -C pg test-upgrade
+
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide
+          kubectl get events -A --sort-by=.lastTimestamp | tail -50
+          kubectl get pvc -A
