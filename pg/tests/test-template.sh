@@ -1138,5 +1138,25 @@ assert_contains "stale guard: node count is replicaCount + 1" "${nodecount_val}"
 # Test: standalone (non-repmgr) mode uses the postgres image, not the guard
 assert_not_contains "stale guard: standalone has no REPMGR_NODE_COUNT" "${minimal}" "REPMGR_NODE_COUNT"
 
+# --- pgvector parity (#126) ---
+# pgvector/templates/ are symlinks to pg/templates/ but pgvector/values.yaml is
+# an independent copy, so a value the shared template dereferences can be
+# missing in pgvector and silently break rendering. The shared backup-cronjob
+# reads backup.mc.image.* and the backup securityContexts; render the pgvector
+# chart with backups enabled (the case that previously nil-pointered) and
+# confirm both the mc image and a non-null securityContext appear.
+PGVECTOR_DIR="$(cd "${CHART_DIR}/../pgvector" && pwd)"
+pgv_backup_rc=0
+pgv_backup=$(helm template test-pgv "${PGVECTOR_DIR}" \
+  --set backup.enabled=true \
+  --set backup.s3.endpoint=https://s3.example.com \
+  --set backup.s3.bucket=b \
+  --set backup.existingSecret.name=creds \
+  --show-only templates/backup-cronjob.yaml 2>&1) || pgv_backup_rc=$?
+assert_eq "pgvector #126: renders with backup enabled" "0" "${pgv_backup_rc}"
+assert_contains "pgvector #126: backup mc image present" "${pgv_backup}" "minio/mc:"
+assert_contains "pgvector #126: backup container securityContext populated" "${pgv_backup}" "runAsUser: 999"
+assert_not_contains "pgvector #126: no null securityContext" "${pgv_backup}" "securityContext: null"
+
 end_suite
 print_summary
