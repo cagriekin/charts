@@ -599,6 +599,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: MASTER_SERVICE
               value: {{ include "pg.fullname" . }}
+            - name: PRIMARY_MARKER
+              value: {{ include "pg.fullname" . }}-primary
             - name: HEADLESS_SERVICE
               value: {{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
             - name: REPMGR_NODE_COUNT

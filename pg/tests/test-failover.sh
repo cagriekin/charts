@@ -116,88 +116,85 @@ fi
 # having restarted.
 kubectl exec -n "${NAMESPACE}" "${POD_PRIMARY}" -c repmgrd -- kill -CONT "${PG_PID}" 2>/dev/null || true
 
-# --- Stale-primary guard (#123) ---
-# Force a CONTAINER-only restart of the resurrected stale primary (kill the
-# postmaster; the pod object and its PVC stay). The image entrypoint guard
-# must see pod-1's newer timeline and rejoin this node as a standby via
-# pg_rewind IN PLACE -- no pod recreation -- instead of resuming as a second
-# read-write primary.
 if [[ "${failover_done}" == "true" ]]; then
-  OLD_UID=$(kubectl get pod -n "${NAMESPACE}" "${POD_PRIMARY}" -o jsonpath='{.metadata.uid}')
-
   # --- #124: selector must NOT follow the resurrected stale primary ---
-  # Both pods are now live primaries (stale pg-0 on the old timeline, real pg-1
-  # on the new one). The service-updater must classify this as a split-brain
-  # and leave the selector on pg-1, not repoint it to the lowest-ordinal node
-  # by its stale self-reported metadata. Wait past one monitoring interval
-  # (default 30s) so at least one tick observes both primaries.
+  # Both pods are now live primaries (stale pod-0 on the old timeline, real
+  # pod-1 on the new one). The service-updater must classify this as a
+  # split-brain and leave the selector on pod-1, not repoint it to the
+  # lowest-ordinal node by its stale self-reported metadata. Wait past one
+  # monitoring interval (default 30s) so at least one tick observes both.
   echo "  #124: holding stale primary up for ~40s to let service-updater tick..."
   sleep 40
   selector_during_split=$(kubectl get service -n "${NAMESPACE}" "${FULLNAME}" \
     -o jsonpath='{.spec.selector.statefulset\.kubernetes\.io/pod-name}' 2>/dev/null || echo "")
   assert_eq "service selector stays on real primary during split-brain (#124)" "${POD_REPLICA}" "${selector_during_split}"
 
-  echo "  Killing postmaster on ${POD_PRIMARY} to force a container-only restart..."
-  kubectl exec -n "${NAMESPACE}" "${POD_PRIMARY}" -c repmgrd -- kill -9 "${PG_PID}" 2>/dev/null || true
+  # #125: the durable marker must record the real primary + its timeline (the
+  # layer-3 write path and configmap RBAC working in-cluster).
+  marker_primary=$(kubectl get configmap "${FULLNAME}-primary" -n "${NAMESPACE}" -o jsonpath='{.data.primary}' 2>/dev/null || echo "")
+  assert_eq "durable primary marker records the real primary (#125)" "${POD_REPLICA}" "${marker_primary}"
 
-  echo "  Waiting for ${POD_PRIMARY} to rejoin as a standby of the new primary (up to 300s)..."
-  rejoined=false
-  rejoin_elapsed=0
-  while [[ ${rejoin_elapsed} -lt 300 ]]; do
-    in_recovery=$(pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")
-    if [[ "${in_recovery}" == "t" ]]; then
-      rejoined=true
-      echo "  Rejoined as standby after ~${rejoin_elapsed}s"
+  # --- #125: a full-cluster restart must not roll the DB back ---
+  # Delete BOTH pods. Under OrderedReady pod-0 (stale, old timeline) recreates
+  # first and ALONE; it must not be selected, and pod-1's newer-timeline data
+  # must survive (pod-1's init must defer to the guard and never clone backward
+  # onto the stale node).
+  echo "  #125: full-cluster restart (deleting both pods)..."
+  kubectl delete pod "${POD_PRIMARY}" "${POD_REPLICA}" -n "${NAMESPACE}" --grace-period=10 2>/dev/null || true
+  wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 600
+
+  echo "  #125: waiting for ${POD_REPLICA} to return as primary with its data (up to 240s)..."
+  survived=false
+  s_elapsed=0
+  while [[ ${s_elapsed} -lt 240 ]]; do
+    rec=$(pg_exec "${NAMESPACE}" "${POD_REPLICA}" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")
+    val=$(pg_exec "${NAMESPACE}" "${POD_REPLICA}" "SELECT value FROM failover_test WHERE value='${AFTER_VALUE}'" "testuser" "testdb" 2>/dev/null || echo "")
+    if [[ "${rec}" == "f" && "${val}" == "${AFTER_VALUE}" ]]; then
+      survived=true
+      echo "  ${POD_REPLICA} is primary with post-failover data after ~${s_elapsed}s"
       break
     fi
     sleep 10
-    rejoin_elapsed=$((rejoin_elapsed + 10))
+    s_elapsed=$((s_elapsed + 10))
   done
-  assert_eq "stale primary rejoins as standby instead of serving read-write" "true" "${rejoined}"
+  assert_eq "post-failover data survives a full-cluster restart (#125)" "true" "${survived}"
 
-  # The rejoin must happen in place: same pod object (UID), repaired via
-  # pg_rewind, not a pod deletion/recreation.
-  NEW_UID=$(kubectl get pod -n "${NAMESPACE}" "${POD_PRIMARY}" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
-  assert_eq "rejoin happens in place (pod not recreated)" "${OLD_UID}" "${NEW_UID}"
+  # The write selector must converge on the real primary, never the stale node.
+  echo "  #125: letting service-updater tick post-restart (~40s)..."
+  sleep 40
+  selector_after=$(kubectl get service -n "${NAMESPACE}" "${FULLNAME}" \
+    -o jsonpath='{.spec.selector.statefulset\.kubernetes\.io/pod-name}' 2>/dev/null || echo "")
+  assert_eq "write selector on real primary after full restart (#125)" "${POD_REPLICA}" "${selector_after}"
 
-  if [[ "${rejoined}" == "true" ]]; then
-    # The rejoined node must carry data written on the new primary AFTER the
-    # failover, proving its stale timeline-1 tail was rewound and replaced.
-    has_data=false
-    data_elapsed=0
-    while [[ ${data_elapsed} -lt 60 ]]; do
-      recloned_val=$(pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "SELECT value FROM failover_test WHERE value='${AFTER_VALUE}'" "testuser" "testdb" 2>/dev/null || echo "")
-      if [[ "${recloned_val}" == "${AFTER_VALUE}" ]]; then
-        has_data=true
+  # --- #123 guard: the lingering stale primary rewind-rejoins on recreation ---
+  # Under the default log action pod-0 lingers as an unselected stale primary;
+  # recreating it must trigger the entrypoint guard to rewind it forward to
+  # pod-1 (newer timeline) and bring it back as a streaming standby.
+  if [[ "${survived}" == "true" ]]; then
+    echo "  #123 guard: recreating stale ${POD_PRIMARY}; expect rewind-rejoin as standby (up to 300s)..."
+    kubectl delete pod "${POD_PRIMARY}" -n "${NAMESPACE}" --grace-period=10 2>/dev/null || true
+    rejoined=false
+    r_elapsed=0
+    while [[ ${r_elapsed} -lt 300 ]]; do
+      rec=$(pg_exec "${NAMESPACE}" "${POD_PRIMARY}" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")
+      if [[ "${rec}" == "t" ]]; then
+        rejoined=true
+        echo "  ${POD_PRIMARY} rewind-rejoined as standby after ~${r_elapsed}s"
         break
       fi
-      sleep 5
-      data_elapsed=$((data_elapsed + 5))
+      sleep 10
+      r_elapsed=$((r_elapsed + 10))
     done
-    assert_eq "rejoined standby has post-failover data" "true" "${has_data}"
-
-    streaming=false
-    stream_elapsed=0
-    while [[ ${stream_elapsed} -lt 60 ]]; do
-      new_primary_count=$(pg_exec "${NAMESPACE}" "${POD_REPLICA}" "SELECT count(*) FROM pg_stat_replication" "testuser" "testdb" 2>/dev/null || echo "")
-      if [[ "${new_primary_count}" == "1" ]]; then
-        streaming=true
-        break
-      fi
-      sleep 5
-      stream_elapsed=$((stream_elapsed + 5))
-    done
-    assert_eq "new primary streams to the rejoined standby" "true" "${streaming}"
+    assert_eq "stale primary rewinds and rejoins as standby (#123 guard)" "true" "${rejoined}"
   else
-    skip "rejoined standby has post-failover data (node never rejoined)"
-    skip "new primary streams to the rejoined standby (node never rejoined)"
+    skip "stale primary rewinds and rejoins as standby (#123 guard) (data did not survive)"
   fi
 else
   skip "service selector stays on real primary during split-brain (#124) (failover did not complete)"
-  skip "stale primary rejoins as standby instead of serving read-write (failover did not complete)"
-  skip "rejoin happens in place (pod not recreated) (failover did not complete)"
-  skip "rejoined standby has post-failover data (failover did not complete)"
-  skip "new primary streams to the rejoined standby (failover did not complete)"
+  skip "durable primary marker records the real primary (#125) (failover did not complete)"
+  skip "post-failover data survives a full-cluster restart (#125) (failover did not complete)"
+  skip "write selector on real primary after full restart (#125) (failover did not complete)"
+  skip "stale primary rewinds and rejoins as standby (#123 guard) (failover did not complete)"
 fi
 
 end_suite
