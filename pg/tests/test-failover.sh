@@ -124,7 +124,19 @@ kubectl exec -n "${NAMESPACE}" "${POD_PRIMARY}" -c repmgrd -- kill -CONT "${PG_P
 # read-write primary.
 if [[ "${failover_done}" == "true" ]]; then
   OLD_UID=$(kubectl get pod -n "${NAMESPACE}" "${POD_PRIMARY}" -o jsonpath='{.metadata.uid}')
-  sleep 5  # let it actually accept a read-write connection as the stale primary
+
+  # --- #124: selector must NOT follow the resurrected stale primary ---
+  # Both pods are now live primaries (stale pg-0 on the old timeline, real pg-1
+  # on the new one). The service-updater must classify this as a split-brain
+  # and leave the selector on pg-1, not repoint it to the lowest-ordinal node
+  # by its stale self-reported metadata. Wait past one monitoring interval
+  # (default 30s) so at least one tick observes both primaries.
+  echo "  #124: holding stale primary up for ~40s to let service-updater tick..."
+  sleep 40
+  selector_during_split=$(kubectl get service -n "${NAMESPACE}" "${FULLNAME}" \
+    -o jsonpath='{.spec.selector.statefulset\.kubernetes\.io/pod-name}' 2>/dev/null || echo "")
+  assert_eq "service selector stays on real primary during split-brain (#124)" "${POD_REPLICA}" "${selector_during_split}"
+
   echo "  Killing postmaster on ${POD_PRIMARY} to force a container-only restart..."
   kubectl exec -n "${NAMESPACE}" "${POD_PRIMARY}" -c repmgrd -- kill -9 "${PG_PID}" 2>/dev/null || true
 
@@ -181,6 +193,7 @@ if [[ "${failover_done}" == "true" ]]; then
     skip "new primary streams to the rejoined standby (node never rejoined)"
   fi
 else
+  skip "service selector stays on real primary during split-brain (#124) (failover did not complete)"
   skip "stale primary rejoins as standby instead of serving read-write (failover did not complete)"
   skip "rejoin happens in place (pod not recreated) (failover did not complete)"
   skip "rejoined standby has post-failover data (failover did not complete)"
