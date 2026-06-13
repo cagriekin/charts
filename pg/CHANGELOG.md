@@ -1,5 +1,42 @@
 # pg chart changelog
 
+## 0.5.86
+
+### Fixed
+
+- A full-cluster restart after a failover no longer rolls the database
+  back to the failover point and destroys the surviving newer data
+  (#125). Under the default `OrderedReady`, the lowest-ordinal pod is
+  recreated first and alone, so the stale ex-primary (older timeline)
+  came up read-write and the real primary (newer timeline) then
+  re-cloned from it. Three layers fix it:
+  1. The repmgr image (tag `trixie-5.5.0-9`) no longer re-clones a
+     primary-state data directory by ordinal in `init-repmgr.sh`; it
+     defers to the entrypoint guard, which only ever rewinds FORWARD to
+     a newer-timeline peer. This stops the backward clone that destroyed
+     data and makes role follow data state, not pod ordinal.
+  2. A node whose timeline is at least as high as every reachable
+     primary stays a primary instead of cloning down to a stale one.
+  3. The service-updater records the highest-timeline primary in a
+     durable, runtime-owned ConfigMap (`<fullname>-primary`) and refuses
+     to route writes to a lone primary below that highwater -- so the
+     stale pod that boots first under OrderedReady is never selected,
+     while a legitimate new failover (always a higher timeline) is not
+     blocked. The marker is written via kubectl at runtime, not as a
+     helm template, so `helm upgrade` / ArgoCD sync cannot reset it.
+
+## Migrating from 0.5.85
+
+`helm upgrade my-release cagriekin/pg` plus the new image tag
+`cagriekin/repmgr:trixie-5.5.0-9` is the migration; PostgreSQL pods roll
+once (new image, new `PRIMARY_MARKER` env). The repmgr Role gains
+`configmaps` get/create/patch for the marker. Running repmgr on
+`postgresql.persistence.enabled=false` remains unsupported for the
+full-restart case (the data dir must survive). If the recorded
+highest-timeline primary is ever permanently lost, the service-updater
+logs the exact `kubectl delete configmap <fullname>-primary` command to
+accept its data loss and resume.
+
 ## 0.5.85
 
 ### Fixed

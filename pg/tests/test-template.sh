@@ -467,6 +467,26 @@ bash -c '
 assert_eq "su #131: lsn_gt orders unpadded hex LSNs numerically" "0" "${lsn_cmp_rc}"
 rm -f "${SCRIPT_DIR}/.lsn_gt_render.sh" "${SCRIPT_DIR}/.lsn_gt_fn.sh"
 
+# --- Durable primary marker (#125) ---
+# The service-updater records the highest-timeline primary in a ConfigMap so a
+# node booting first under OrderedReady can tell it is stale even when the real
+# primary is not up yet.
+assert_contains "su #125: reads the durable marker" "${su_cm}" "read_marker()"
+assert_contains "su #125: writes the durable marker" "${su_cm}" "write_marker()"
+assert_contains "su #125: refuses a primary below the recorded highwater timeline" "${su_cm}" "below the recorded primary"
+# statefulset passes the marker name to the service-updater container
+sts_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "su #125: PRIMARY_MARKER env propagated" "${sts_repmgr}" "name: PRIMARY_MARKER"
+assert_contains "su #125: marker name is <fullname>-primary" "${sts_repmgr}" "test-pg-primary"
+# rbac grants configmap access for the marker
+rbac_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --show-only templates/rbac.yaml 2>&1)
+assert_contains "su #125: rbac grants configmaps verbs" "${rbac_repmgr}" "configmaps"
+# the marker is runtime-owned (service-updater create/apply), not a helm
+# template, so helm upgrade / ArgoCD sync cannot reset the highwater
+assert_contains "su #125: marker written at runtime via kubectl" "${su_cm}" "kubectl create configmap"
+
 # Test: repmgr disabled does not render preStop or terminationGracePeriodSeconds
 assert_not_contains "minimal: no preStop hook" "${minimal}" "preStop:"
 assert_not_contains "minimal: no terminationGracePeriodSeconds" "${minimal}" "terminationGracePeriodSeconds"

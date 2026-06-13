@@ -29,6 +29,13 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create"]
+  # Durable primary marker (<fullname>-primary): the service-updater records the
+  # highest-timeline primary here so a node booting first under OrderedReady can
+  # tell it is stale (#125). create cannot be resourceName-scoped; the chart only
+  # ever touches the one marker name.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "patch"]
 {{- if .Values.pgpool.enabled }}
   - apiGroups: ["apps"]
     resources: ["deployments"]

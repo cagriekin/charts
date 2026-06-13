@@ -74,6 +74,42 @@ data:
         [ "$al" -gt "$bl" ]
     }
 
+    # Current timeline of a node that is a live primary (in_recovery=f). Read
+    # from the WAL insert position, which reflects a fast promotion immediately.
+    get_node_timeline() {
+        PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "$1" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
+            -tAc "SELECT substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8)::int;" 2>/dev/null
+    }
+
+    # Durable record of the cluster's highest-timeline primary, kept in a
+    # ConfigMap that survives a full-cluster restart (unlike per-pod state) and
+    # is owned at runtime rather than templated, so neither `helm upgrade` nor an
+    # ArgoCD sync can reset it. It lets a node that boots first under OrderedReady
+    # recognize it is stale even when the real primary is not up yet (#125).
+    read_marker() {
+        MARKER_PRIMARY=""
+        MARKER_TL=0
+        [ -z "$PRIMARY_MARKER" ] && return 0
+        local data
+        data=$(kubectl get configmap "${PRIMARY_MARKER}" -n "${NAMESPACE}" \
+            -o jsonpath='{.data.primary}|{.data.timeline}' 2>/dev/null) || return 0
+        MARKER_PRIMARY="${data%%|*}"
+        local t="${data##*|}"
+        case "$t" in ''|*[!0-9]*) MARKER_TL=0 ;; *) MARKER_TL="$t" ;; esac
+    }
+
+    write_marker() {
+        local primary=$1 tl=$2
+        [ -z "$PRIMARY_MARKER" ] && return 0
+        # create-or-update idempotently; no heredoc so the rendered script has no
+        # block-scalar indentation hazards
+        if ! kubectl create configmap "${PRIMARY_MARKER}" -n "${NAMESPACE}" \
+            --from-literal=primary="${primary}" --from-literal=timeline="${tl}" \
+            --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1; then
+            echo "WARNING: failed to update primary marker ${PRIMARY_MARKER} (${primary} timeline ${tl})"
+        fi
+    }
+
     # Failover audit trail: record a core/v1 Event on the primary Service.
     # core/v1 is used instead of events.k8s.io/v1 because it is accepted by
     # every kubectl via `create -f`, while the newer API requires
@@ -294,25 +330,66 @@ data:
 
         if [ "$PRIMARY_COUNT" -eq 1 ]; then
             CURRENT_MASTER=$(echo ${PRIMARY_NODES} | cut -d'.' -f1)
+            current_tl=$(get_node_timeline "${PRIMARY_NODES}")
+            read_marker
 
-            # Re-assert the selector on every tick. update_service_selector is
-            # a no-op if the selector already matches; calling it
-            # unconditionally makes the loop self-healing against external
-            # mutations (e.g. ArgoCD re-applying the chart's hardcoded
-            # `pod-name: <fullname>-0` selector after a sync). Without this,
-            # one ArgoCD sync after a failover stranded the primary service
-            # pointing at the wrong pod indefinitely.
-            update_service_selector "$CURRENT_MASTER"
-            update_pod_role_labels "$CURRENT_MASTER"
+            # Stale-resurrection guard (#125): on a full-cluster restart under
+            # OrderedReady, the lowest-ordinal pod boots first and ALONE, so it
+            # can be the only live primary even though it is stale (a higher
+            # timeline was promoted before the restart). The durable marker
+            # records the highest timeline ever served; refuse to route writes to
+            # a lone primary below it. A legitimate new failover always has a
+            # HIGHER timeline than the marker, so it is never blocked.
+            skip_select=false
+            case "$current_tl" in
+                ''|*[!0-9]*)
+                    if [ "$MARKER_TL" -gt 0 ]; then
+                        echo "WARNING: cannot read timeline of ${CURRENT_MASTER}; keeping current selector this tick"
+                        skip_select=true
+                    fi
+                    ;;
+                *)
+                    if [ "$MARKER_TL" -gt 0 ] && [ "$current_tl" -lt "$MARKER_TL" ]; then
+                        echo "CRITICAL: only live primary ${CURRENT_MASTER} is on timeline ${current_tl}, below the recorded primary ${MARKER_PRIMARY} on timeline ${MARKER_TL}; refusing to route writes to a stale node. If ${MARKER_PRIMARY} is permanently lost, accept its data loss with: kubectl -n ${NAMESPACE} delete configmap ${PRIMARY_MARKER}"
+                        skip_select=true
+                    fi
+                    ;;
+            esac
 
-            if [ "$CURRENT_MASTER" != "$LAST_MASTER" ]; then
-                echo "Master change: ${LAST_MASTER} -> ${CURRENT_MASTER}"
-                restart_pgpool
-                LAST_MASTER="$CURRENT_MASTER"
-                PGPOOL_FAILURES=0
+            if [ "$skip_select" = true ]; then
+                CURRENT_MASTER=""
+            else
+                # Re-assert the selector on every tick. update_service_selector is
+                # a no-op if the selector already matches; calling it
+                # unconditionally makes the loop self-healing against external
+                # mutations (e.g. ArgoCD re-applying the chart's hardcoded
+                # `pod-name: <fullname>-0` selector after a sync). Without this,
+                # one ArgoCD sync after a failover stranded the primary service
+                # pointing at the wrong pod indefinitely.
+                update_service_selector "$CURRENT_MASTER"
+                update_pod_role_labels "$CURRENT_MASTER"
+
+                # Advance the durable highwater marker (monotonic: only reached
+                # when current_tl >= MARKER_TL). Written only on change to avoid
+                # patching the ConfigMap every tick.
+                case "$current_tl" in
+                    ''|*[!0-9]*) ;;
+                    *)
+                        if [ "$CURRENT_MASTER" != "$MARKER_PRIMARY" ] || [ "$current_tl" != "$MARKER_TL" ]; then
+                            write_marker "$CURRENT_MASTER" "$current_tl"
+                        fi
+                        ;;
+                esac
+
+                if [ "$CURRENT_MASTER" != "$LAST_MASTER" ]; then
+                    echo "Master change: ${LAST_MASTER} -> ${CURRENT_MASTER}"
+                    restart_pgpool
+                    LAST_MASTER="$CURRENT_MASTER"
+                    PGPOOL_FAILURES=0
+                fi
+                CONSECUTIVE_FAILURES=0
+                check_pgpool_health
             fi
-            CONSECUTIVE_FAILURES=0
-            check_pgpool_health
         elif [ "$PRIMARY_COUNT" -ge 2 ]; then
             # Two or more live primaries: the cluster state is ambiguous, so do
             # NOT move the selector or relabel pods based on it. The selector
