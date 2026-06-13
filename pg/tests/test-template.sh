@@ -420,14 +420,52 @@ assert_contains "repmgr: service-updater has allowPrivilegeEscalation false" "${
 # Test: service-updater configmap writes heartbeat file
 assert_contains "repmgr: service-updater script writes heartbeat" "${repmgr_no_addcmd}" "service-updater-alive"
 
-# Test: split-brain detection present in service-updater configmap
-assert_contains "repmgr: split-brain detection in service-updater" "${repmgr}" "detect_split_brain"
+# Test: split-brain handling present in service-updater configmap
+assert_contains "repmgr: split-brain handling in service-updater" "${repmgr}" "handle_split_brain"
 
 # Test: SPLIT_BRAIN_ACTION env var in statefulset
 assert_contains "repmgr: SPLIT_BRAIN_ACTION env var in statefulset" "${repmgr_no_addcmd}" "SPLIT_BRAIN_ACTION"
 
-# Test: split-brain detection not present when repmgr disabled
-assert_not_contains "minimal: no split-brain detection" "${minimal}" "detect_split_brain"
+# Test: split-brain handling not present when repmgr disabled
+assert_not_contains "minimal: no split-brain handling" "${minimal}" "handle_split_brain"
+
+# --- Stale-primary selector safety (#124) and LSN fence ordering (#131) ---
+su_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --show-only templates/service-updater-configmap.yaml 2>&1)
+
+# #124: master is determined by actual role (pg_is_in_recovery), not by each
+# node's self-reported repmgr.nodes metadata (which a stale primary forges)
+assert_contains "su #124: classifies primaries by pg_is_in_recovery" "${su_cm}" "SELECT pg_is_in_recovery();"
+assert_not_contains "su #124: no longer trusts repmgr.nodes metadata for master" "${su_cm}" "WHERE type = 'primary' AND active = true"
+# #124: the selector only moves when exactly one primary exists; a split-brain
+# is handled (not used to repoint the selector to the lowest-ordinal node)
+assert_contains "su #124: selector update gated on single primary" "${su_cm}" 'PRIMARY_COUNT" -eq 1'
+assert_contains "su #124: two-or-more primaries routed to split-brain handler" "${su_cm}" 'PRIMARY_COUNT" -ge 2'
+
+# #131: fence picks the survivor by timeline then numeric LSN, not a
+# lexicographic string compare that mis-orders unpadded hex
+assert_not_contains "su #131: no lexicographic LSN string compare" "${su_cm}" '"$lsn" > "$best_lsn"'
+assert_contains "su #131: numeric hex LSN comparison" "${su_cm}" "16#"
+assert_contains "su #131: survivor selection is timeline-first" "${su_cm}" "pg_walfile_name(pg_current_wal_lsn())"
+
+# #131: behavioral unit test of the LSN comparator extracted from the rendered
+# script -- the boundary cases the lexicographic compare got wrong
+printf '%s' "${su_cm}" | python3 -c "import sys,yaml; sys.stdout.write(yaml.safe_load(sys.stdin)['data']['service-updater.sh'])" > "${SCRIPT_DIR}/.lsn_gt_render.sh"
+sed -n '/^lsn_gt() {/,/^}/p' "${SCRIPT_DIR}/.lsn_gt_render.sh" > "${SCRIPT_DIR}/.lsn_gt_fn.sh"
+lsn_cmp_rc=0
+bash -c '
+  source "'"${SCRIPT_DIR}"'/.lsn_gt_fn.sh"
+  # left genuinely ahead -> true; the cases lexicographic compare inverted
+  lsn_gt "10/00000001" "9/2B3C4D50" || exit 1
+  lsn_gt "100/0" "F2/FFFFFFFF" || exit 1
+  lsn_gt "2/3000000" "2/2FFFFFF" || exit 1
+  # behind or equal -> false
+  lsn_gt "9/2B3C4D50" "10/00000001" && exit 1
+  lsn_gt "5/100" "5/100" && exit 1
+  exit 0
+' || lsn_cmp_rc=$?
+assert_eq "su #131: lsn_gt orders unpadded hex LSNs numerically" "0" "${lsn_cmp_rc}"
+rm -f "${SCRIPT_DIR}/.lsn_gt_render.sh" "${SCRIPT_DIR}/.lsn_gt_fn.sh"
 
 # Test: repmgr disabled does not render preStop or terminationGracePeriodSeconds
 assert_not_contains "minimal: no preStop hook" "${minimal}" "preStop:"

@@ -33,29 +33,45 @@ data:
         exit 0
     fi
 
-    get_current_master() {
-        local max_retries=3
-        local retry_count=0
-
-        while [ $retry_count -lt $max_retries ]; do
-            for i in $(seq 0 {{ .Values.postgresql.replicaCount }}); do
-                node="${BASE_NAME}-${i}.${HEADLESS_SERVICE}"
-                PRIMARY_NODE=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
-                    -t -c "SELECT node_name FROM repmgr.nodes WHERE type = 'primary' AND active = true LIMIT 1;" 2>/dev/null | xargs)
-
-                if [ -n "$PRIMARY_NODE" ]; then
-                    echo "$PRIMARY_NODE"
-                    return 0
-                fi
-            done
-
-            retry_count=$((retry_count + 1))
-            if [ $retry_count -lt $max_retries ]; then
-                sleep 5
+    # Classify the cluster by ACTUAL role (pg_is_in_recovery), not by each
+    # node's self-reported repmgr.nodes metadata. A resurrected stale primary
+    # still has metadata claiming type='primary' active=true, so the old
+    # metadata-based, ordinal-first scan would pick it and repoint writes to the
+    # divergent node. pg_is_in_recovery()=f is ground truth: it is a real
+    # read-write primary right now. Sets PRIMARY_NODES (space-separated FQDNs)
+    # and PRIMARY_COUNT. The caller only moves the selector when exactly one
+    # primary exists; two or more is a split-brain handled separately.
+    scan_primaries() {
+        PRIMARY_NODES=""
+        PRIMARY_COUNT=0
+        local i node in_recovery
+        for i in $(seq 0 {{ .Values.postgresql.replicaCount }}); do
+            node="${BASE_NAME}-${i}.${HEADLESS_SERVICE}"
+            in_recovery=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
+                -tAc "SELECT pg_is_in_recovery();" 2>/dev/null)
+            if [ "$in_recovery" = "f" ]; then
+                PRIMARY_COUNT=$((PRIMARY_COUNT + 1))
+                PRIMARY_NODES="${PRIMARY_NODES}${PRIMARY_NODES:+ }${node}"
             fi
         done
+    }
 
-        echo ""
+    # True (0) if LSN $1 is strictly greater than LSN $2. pg_current_wal_lsn()
+    # returns unpadded hex `X/Y`, so a lexicographic `>` is wrong across digit-
+    # width boundaries (9/.. vs 10/.., F/.. vs 100/..); compare the two hex
+    # segments numerically instead. An empty $2 (no candidate yet) loses to any
+    # valid LSN.
+    lsn_gt() {
+        local a="$1" b="$2"
+        [ -z "$b" ] && return 0
+        [ -z "$a" ] && return 1
+        case "$a" in *'/'*) ;; *) return 1 ;; esac
+        case "$b" in *'/'*) ;; *) return 0 ;; esac
+        local ah=$((16#${a%%/*})) al=$((16#${a##*/}))
+        local bh=$((16#${b%%/*})) bl=$((16#${b##*/}))
+        if [ "$ah" -gt "$bh" ]; then return 0; fi
+        if [ "$ah" -lt "$bh" ]; then return 1; fi
+        [ "$al" -gt "$bl" ]
     }
 
     # Failover audit trail: record a core/v1 Event on the primary Service.
@@ -207,63 +223,63 @@ data:
         fi
     }
 
-    detect_split_brain() {
-        local primaries=""
-        local primary_count=0
+    # Called only when scan_primaries found >= 2 live primaries (split-brain).
+    # action=log just warns; action=fence picks a survivor and removes the rest.
+    handle_split_brain() {
+        echo "CRITICAL: Split-brain detected! ${PRIMARY_COUNT} primaries found: ${PRIMARY_NODES}"
 
-        for i in $(seq 0 {{ .Values.postgresql.replicaCount }}); do
-            node="${BASE_NAME}-${i}.${HEADLESS_SERVICE}"
-            in_recovery=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
-                -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | xargs) || true
+        local split_brain_action="${SPLIT_BRAIN_ACTION:-log}"
+        [ "$split_brain_action" = "fence" ] || return 0
 
-            if [ "$in_recovery" = "f" ]; then
-                primary_count=$((primary_count + 1))
-                primaries="${primaries} ${node}"
+        # Survivor = highest timeline, then highest LSN. Timeline MUST dominate:
+        # a stale old primary that kept writing on the old timeline can have a
+        # higher LSN than the legitimately promoted primary on the new timeline,
+        # and keeping the stale node would discard the post-failover history.
+        # Timeline comes from the WAL insert position (immediate after a fast
+        # promotion), not pg_control_checkpoint (which lags minutes under load).
+        local best_node="" best_tl=-1 best_lsn=""
+        local node tl_lsn tl lsn tl_dec
+        for node in ${PRIMARY_NODES}; do
+            tl_lsn=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
+                -tAc "SELECT substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8), pg_current_wal_lsn();" 2>/dev/null)
+            tl="${tl_lsn%%|*}"
+            lsn="${tl_lsn##*|}"
+            case "$tl" in ''|*[!0-9A-Fa-f]*) echo "  ${node}: unreadable timeline, skipping"; continue ;; esac
+            tl_dec=$((16#$tl))
+            echo "  ${node}: timeline ${tl_dec} LSN ${lsn}"
+            if [ "$tl_dec" -gt "$best_tl" ] || { [ "$tl_dec" -eq "$best_tl" ] && lsn_gt "$lsn" "$best_lsn"; }; then
+                best_tl="$tl_dec"
+                best_lsn="$lsn"
+                best_node="$node"
             fi
         done
 
-        if [ $primary_count -le 1 ]; then
+        if [ -z "$best_node" ]; then
+            echo "Fencing: no survivor with a readable timeline/LSN; taking no action this tick"
             return 0
         fi
 
-        echo "CRITICAL: Split-brain detected! ${primary_count} primaries found:${primaries}"
+        local best_pod
+        best_pod=$(echo "${best_node}" | cut -d'.' -f1)
+        echo "Fencing: keeping ${best_pod} as primary (timeline ${best_tl}, LSN ${best_lsn})"
 
-        local split_brain_action="${SPLIT_BRAIN_ACTION:-log}"
+        # Terminate backends on and delete EVERY stale primary (not just the
+        # last one seen), so 3+ way split-brains fully resolve; each deleted pod
+        # rejoins as a standby via the image's pg_rewind stale-primary guard.
+        for node in ${PRIMARY_NODES}; do
+            [ "$node" = "$best_node" ] && continue
+            local stale_pod
+            stale_pod=$(echo "${node}" | cut -d'.' -f1)
+            echo "Fencing: terminating backends on stale primary ${node}"
+            PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
+                -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid();" 2>/dev/null || true
+            echo "Fencing: deleting stale primary pod ${stale_pod} to force rejoin as standby"
+            kubectl delete pod "${stale_pod}" -n "${NAMESPACE}" --grace-period=30 2>/dev/null || true
+        done
 
-        if [ "$split_brain_action" = "fence" ]; then
-            local best_node=""
-            local best_lsn=""
-
-            for node in ${primaries}; do
-                lsn=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
-                    -t -c "SELECT pg_current_wal_lsn();" 2>/dev/null | xargs)
-                echo "  Node ${node} LSN: ${lsn}"
-                if [ -z "$best_lsn" ] || [[ "$lsn" > "$best_lsn" ]]; then
-                    best_lsn="$lsn"
-                    best_node="$node"
-                fi
-            done
-
-            echo "Fencing: keeping ${best_node} as primary (LSN: ${best_lsn})"
-            local stale_pod=""
-            for node in ${primaries}; do
-                if [ "$node" != "$best_node" ]; then
-                    echo "Fencing: terminating backends on stale primary ${node}"
-                    PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
-                        -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid();" 2>/dev/null || true
-                    stale_pod=$(echo "${node}" | cut -d'.' -f1)
-                fi
-            done
-
-            best_pod=$(echo "${best_node}" | cut -d'.' -f1)
-            echo "Fencing: updating service selector to ${best_pod}"
-            update_service_selector "${best_pod}"
-
-            if [ -n "${stale_pod}" ]; then
-                echo "Fencing: deleting stale primary pod ${stale_pod} to force rejoin as standby"
-                kubectl delete pod "${stale_pod}" -n "${NAMESPACE}" --grace-period=30 2>/dev/null || true
-            fi
-        fi
+        echo "Fencing: updating service selector to ${best_pod}"
+        update_service_selector "${best_pod}"
+        update_pod_role_labels "${best_pod}"
     }
 
     LAST_MASTER=""
@@ -274,9 +290,11 @@ data:
 
     while true; do
         date +%s > /tmp/service-updater-alive
-        CURRENT_MASTER=$(get_current_master)
+        scan_primaries
 
-        if [ -n "$CURRENT_MASTER" ]; then
+        if [ "$PRIMARY_COUNT" -eq 1 ]; then
+            CURRENT_MASTER=$(echo ${PRIMARY_NODES} | cut -d'.' -f1)
+
             # Re-assert the selector on every tick. update_service_selector is
             # a no-op if the selector already matches; calling it
             # unconditionally makes the loop self-healing against external
@@ -295,14 +313,24 @@ data:
             fi
             CONSECUTIVE_FAILURES=0
             check_pgpool_health
-            detect_split_brain
+        elif [ "$PRIMARY_COUNT" -ge 2 ]; then
+            # Two or more live primaries: the cluster state is ambiguous, so do
+            # NOT move the selector or relabel pods based on it. The selector
+            # keeps pointing where it was (the legitimate primary, in the common
+            # stale-resurrection case). handle_split_brain resolves it under
+            # action=fence by the timeline/LSN survivor; under log it only warns.
+            CURRENT_MASTER=""
+            handle_split_brain
         else
+            # No primary visible this tick: keep the current selector rather
+            # than thrash it to empty; the next tick re-asserts once a primary
+            # is reachable again.
+            CURRENT_MASTER=""
             CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
             if [ $CONSECUTIVE_FAILURES -ge $MAX_CONSECUTIVE_FAILURES ]; then
-                echo "WARNING: Could not determine master (failed $CONSECUTIVE_FAILURES times)"
+                echo "WARNING: no primary found (failed $CONSECUTIVE_FAILURES times)"
                 CONSECUTIVE_FAILURES=0
             fi
-            detect_split_brain
         fi
 
         sleep ${MONITORING_INTERVAL}

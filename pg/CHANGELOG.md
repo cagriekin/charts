@@ -1,5 +1,39 @@
 # pg chart changelog
 
+## 0.5.85
+
+### Fixed
+
+- The service-updater no longer repoints the write Service to a
+  resurrected stale primary (#124). `get_current_master` trusted each
+  node's self-reported `repmgr.nodes` metadata and returned the first
+  responder in ordinal order, so a stale ex-primary still claiming
+  `type=primary` in its own metadata would win and the selector would
+  flip to it (with the readonly Service then serving the other
+  timeline) -- silent data divergence. Master determination now
+  classifies nodes by actual role (`pg_is_in_recovery()`), and the
+  selector moves only when exactly one live primary exists; two or more
+  is treated as a split-brain and never used to repoint.
+- Split-brain fence now selects the survivor by timeline then numeric
+  LSN, not a lexicographic string compare (#131). `pg_current_wal_lsn()`
+  returns unpadded hex, so `[[ a > b ]]` mis-ordered LSNs across
+  digit-width boundaries (`9/..` vs `10/..`) and could keep the behind
+  node while wiping the ahead one. Timeline now dominates the choice (a
+  stale primary can hold a higher LSN on the old timeline than the
+  promoted primary on the new one), LSN segments are compared with
+  `16#` arithmetic, and every stale primary is fenced and deleted (not
+  just the last one seen) so 3+ way split-brains fully resolve; each
+  deleted pod rejoins as a standby via the image's pg_rewind guard.
+
+## Migrating from 0.5.84
+
+`helm upgrade my-release cagriekin/pg` is the entire migration. No
+pods roll: the service-updater ConfigMap is not checksummed into the
+StatefulSet pod template, so running sidecars pick up the new logic on
+their next restart (or restart the StatefulSet to apply immediately).
+The fixes are behavioral and only change what happens during a
+stale-primary resurrection or a split-brain.
+
 ## 0.5.84
 
 ### Changed
