@@ -467,6 +467,29 @@ bash -c '
 assert_eq "su #131: lsn_gt orders unpadded hex LSNs numerically" "0" "${lsn_cmp_rc}"
 rm -f "${SCRIPT_DIR}/.lsn_gt_render.sh" "${SCRIPT_DIR}/.lsn_gt_fn.sh"
 
+# #168: the WAL-filename timeline is HEXADECIMAL; it must be decoded with 16#,
+# not a SQL ::int cast (which errors at TL 0x0A and is wrong from 0x10). The
+# timeline read must NOT use ::int, and tl_to_int must decode hex correctly.
+assert_not_contains "su #168: timeline not parsed with ::int (hex-as-decimal bug)" "${su_cm}" "from 1 for 8)::int"
+assert_contains "su #168: timeline decoded via tl_to_int helper" "${su_cm}" "tl_to_int"
+# behavioral unit test of the decoder extracted from the rendered script
+printf '%s' "${su_cm}" | python3 -c "import sys,yaml; sys.stdout.write(yaml.safe_load(sys.stdin)['data']['service-updater.sh'])" > "${SCRIPT_DIR}/.tl_render.sh"
+sed -n '/^tl_to_int() {/,/^}/p' "${SCRIPT_DIR}/.tl_render.sh" > "${SCRIPT_DIR}/.tl_fn.sh"
+tl_rc=0
+bash -c '
+  source "'"${SCRIPT_DIR}"'/.tl_fn.sh"
+  [ "$(tl_to_int 00000001)" = "1" ]  || exit 1   # TL 1
+  [ "$(tl_to_int 00000009)" = "9" ]  || exit 1   # TL 9 (last where hex==dec)
+  [ "$(tl_to_int 0000000A)" = "10" ] || exit 1   # TL 10: ::int would ERROR
+  [ "$(tl_to_int 00000010)" = "16" ] || exit 1   # TL 16: ::int would yield 10
+  [ "$(tl_to_int 000000FF)" = "255" ] || exit 1
+  [ -z "$(tl_to_int "")" ]       || exit 1        # empty -> empty
+  [ -z "$(tl_to_int "garbage")" ] || exit 1       # non-hex -> empty
+  exit 0
+' || tl_rc=$?
+assert_eq "su #168: tl_to_int decodes hex timelines (10->10, 16->16, not ::int)" "0" "${tl_rc}"
+rm -f "${SCRIPT_DIR}/.tl_render.sh" "${SCRIPT_DIR}/.tl_fn.sh"
+
 # --- Durable primary marker (#125) ---
 # The service-updater records the highest-timeline primary in a ConfigMap so a
 # node booting first under OrderedReady can tell it is stale even when the real

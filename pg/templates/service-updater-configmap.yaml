@@ -74,11 +74,23 @@ data:
         [ "$al" -gt "$bl" ]
     }
 
+    # Decimal value of an 8-hex-digit WAL-filename timeline. The first 8 chars
+    # of pg_walfile_name(pg_current_wal_lsn()) are the timeline in HEX, so a SQL
+    # `::int` cast is WRONG: it parses decimal, so '0000000A' (TL 10) raises a
+    # syntax error and '00000010' (TL 16) yields 10. Decode the hex here.
+    # Empty/non-hex input yields empty output (caller treats as unreadable).
+    tl_to_int() {
+        case "$1" in ''|*[!0-9A-Fa-f]*) return 0 ;; esac
+        echo $((16#$1))
+    }
+
     # Current timeline of a node that is a live primary (in_recovery=f). Read
     # from the WAL insert position, which reflects a fast promotion immediately.
     get_node_timeline() {
-        PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "$1" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
-            -tAc "SELECT substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8)::int;" 2>/dev/null
+        local hex
+        hex=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "$1" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
+            -tAc "SELECT substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8);" 2>/dev/null)
+        tl_to_int "$hex"
     }
 
     # Durable record of the cluster's highest-timeline primary, kept in a
@@ -280,8 +292,8 @@ data:
                 -tAc "SELECT substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8), pg_current_wal_lsn();" 2>/dev/null)
             tl="${tl_lsn%%|*}"
             lsn="${tl_lsn##*|}"
-            case "$tl" in ''|*[!0-9A-Fa-f]*) echo "  ${node}: unreadable timeline, skipping"; continue ;; esac
-            tl_dec=$((16#$tl))
+            tl_dec=$(tl_to_int "$tl")
+            case "$tl_dec" in '') echo "  ${node}: unreadable timeline, skipping"; continue ;; esac
             echo "  ${node}: timeline ${tl_dec} LSN ${lsn}"
             if [ "$tl_dec" -gt "$best_tl" ] || { [ "$tl_dec" -eq "$best_tl" ] && lsn_gt "$lsn" "$best_lsn"; }; then
                 best_tl="$tl_dec"
