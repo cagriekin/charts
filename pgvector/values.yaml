@@ -327,6 +327,24 @@ backup:
     name: ""
     accessKeyIdKey: access-key-id
     secretAccessKeyKey: secret-access-key
+  mc:
+    image:
+      repository: minio/mc
+      tag: RELEASE.2024-11-21T17-21-54Z
+      pullPolicy: IfNotPresent
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  # 999 is the postgres uid/gid in the official postgres image; the kubelet
+  # rejects root-defaulting images under runAsNonRoot without an explicit uid
+  containerSecurityContext:
+    runAsUser: 999
+    runAsGroup: 999
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
   activeDeadlineSeconds: 3600
   backoffLimit: 1
   retentionDays: 7
