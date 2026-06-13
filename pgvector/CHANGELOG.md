@@ -1,5 +1,24 @@
 # pgvector chart changelog
 
+## 0.6.89
+
+### Fixed
+
+- repmgr image bumped to `trixie-5.5.0-10`: the primary node is now
+  registered with a retry loop (matching the standby path) and the
+  role probe retries until definitive. Previously `repmgrd-entrypoint`
+  ran a single `repmgr primary register` under `set -e`; on a slow or
+  contended host that register could race the postgresql container's
+  init SQL (`CREATE EXTENSION repmgr`, repmgr user) and fail,
+  crash-looping repmgrd into a backoff that outlived the install wait
+  and failed the deploy. No chart behavior change beyond the image tag.
+
+## Migrating from 0.6.88
+
+`helm upgrade my-release cagriekin/pgvector` with image
+`cagriekin/repmgr:trixie-5.5.0-10` is the migration; PostgreSQL pods
+roll once for the new image tag.
+
 ## 0.6.88
 
 ### Fixed
