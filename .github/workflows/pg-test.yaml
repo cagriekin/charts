@@ -14,7 +14,7 @@ on:
 env:
   IMAGES: >-
     postgres:18.1-trixie
-    cagriekin/repmgr:trixie-5.5.0-9
+    cagriekin/repmgr:trixie-5.5.0-10
     cagriekin/pgpool:4.7.1
     pgpool/pgpool2_exporter:1.2.2
     quay.io/prometheuscommunity/postgres-exporter:v0.19.1
@@ -100,6 +100,19 @@ jobs:
       - name: Dump cluster state on failure
         if: failure()
         run: |
-          kubectl get pods -A -o wide
-          kubectl get events -A --sort-by=.lastTimestamp | tail -50
-          kubectl get pvc -A
+          kubectl get pods -A -o wide || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -80 || true
+          kubectl get pvc -A || true
+          # container logs for any non-Ready pod, so startup crash loops
+          # (e.g. a repmgrd register race) are diagnosable from the CI log
+          for ns in pg-test-minimal pg-test-repmgr pg-test-repmgr-chaos pg-test-full pg-test-config-repmgr; do
+            for pod in $(kubectl get pods -n "$ns" -o name 2>/dev/null); do
+              ready=$(kubectl get -n "$ns" "$pod" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+              [ "$ready" = "True" ] && continue
+              echo "===== $ns/$pod (Ready=$ready) ====="
+              for c in postgresql repmgrd service-updater; do
+                echo "--- $c (current) ---"; kubectl logs -n "$ns" "$pod" -c "$c" --tail=40 2>/dev/null || true
+                echo "--- $c (previous) ---"; kubectl logs -n "$ns" "$pod" -c "$c" --previous --tail=40 2>/dev/null || true
+              done
+            done
+          done
