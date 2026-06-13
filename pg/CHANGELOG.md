@@ -1,5 +1,41 @@
 # pg chart changelog
 
+## 0.5.84
+
+### Changed
+
+- The stale-primary protection for issue #123 moved from a chart-side
+  bash wrapper into the repmgr image entrypoint (image tag
+  `trixie-5.5.0-8`), so it runs on every container start, including
+  container-only restarts (CrashLoopBackOff, OOM, liveness kill) that
+  never re-run the init container -- the exact gap that let a crashed
+  primary resume read-write on a stale timeline after a standby was
+  promoted. Detection now reads the peer's timeline from
+  `pg_walfile_name(pg_current_wal_lsn())` (which reflects a fast
+  promotion immediately, unlike `pg_control_checkpoint()` which lags by
+  minutes under load), settles only while no peer is reachable so a
+  healthy primary restart adds no latency, and fails closed when the
+  local timeline is unreadable while a peer is primary. Repair is an
+  in-place `repmgr node rejoin --force-rewind` (pg_rewind works because
+  PostgreSQL 18 initdb enables data checksums by default), falling back
+  to a full re-clone only if rewind fails; a node whose data is empty
+  while the cluster already has a primary refuses to initialize a
+  divergent database. The chart now invokes the image entrypoint
+  directly, passes `REPMGR_NODE_COUNT` so the peer scan matches the
+  cluster size, and the obsolete `repmgr.stalePrimary.action` value
+  was removed.
+
+## Migrating from 0.5.83
+
+`helm upgrade my-release cagriekin/pg` is the entire migration; the
+StatefulSet pod template changes (new image tag, clean entrypoint
+command), so PostgreSQL pods roll once. Running repmgr on
+`postgresql.persistence.enabled=false` (emptyDir) is not recommended:
+a container restart still rejoins correctly, but a pod recreation loses
+the data dir, and if a standby was promoted in the meantime the node
+refuses to initialize rather than fork a divergent cluster -- use
+persistent volumes so pg_rewind/clone can repair it.
+
 ## 0.5.83
 
 ### Fixed

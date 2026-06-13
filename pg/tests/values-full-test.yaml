@@ -14,8 +14,12 @@ postgresql:
       cpu: 500m
       memory: 512Mi
 
+  # repmgr (3 pods) with persistence: a rolling update or chaos delete that
+  # recreates pod-0 empty while a standby is promoted would otherwise hit the
+  # divergent-initdb refusal; persistent volumes let pg_rewind/clone repair it.
   persistence:
-    enabled: false
+    enabled: true
+    size: 1Gi
 
   database: testdb
   username: testuser
@@ -50,7 +54,7 @@ postgresql:
 repmgr:
   image:
     repository: cagriekin/repmgr
-    tag: trixie-5.5.0-7
+    tag: trixie-5.5.0-8
     pullPolicy: IfNotPresent
 
   enabled: true

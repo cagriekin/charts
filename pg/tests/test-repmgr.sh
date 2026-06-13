@@ -70,7 +70,7 @@ assert_contains "repmgr sees primary node" "${cluster_output}" "primary"
 assert_contains "repmgr sees standby node" "${cluster_output}" "standby"
 
 # Detailed standby row checks — catch the `type=''` regression observed
-# under PG18 + cagriekin/repmgr:trixie-5.5.0-7 where `standby register`
+# under PG18 + cagriekin/repmgr:trixie-5.5.0-8 where `standby register`
 # reports success but lands the row with the type column empty, breaking
 # the image's verify-loop. assert_eq against the exact literal also
 # catches NULL (renders as "").

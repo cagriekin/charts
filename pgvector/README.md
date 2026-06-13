@@ -9,6 +9,7 @@ This chart shares all templates with the [pg chart](../pg/) via symlinks. The on
 - PostgreSQL 18.1 with pgvector extension for vector similarity search
 - Repmgr for automatic failover and replication management
 - Service-updater sidecar for automatic primary service selector updates after failover
+- Stale-primary protection: a crashed primary that restarts after a standby was promoted rejoins as a standby (via pg_rewind) instead of resuming read-write on a divergent timeline
 - Read-only `<fullname>-readonly` service targeting standby pods for read scaling (repmgr mode)
 - Optional PGPool-II for connection pooling and read/write splitting
 - Support for existing secrets or auto-generated passwords
@@ -191,7 +192,6 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 | `repmgr.database` | Repmgr database name | `repmgr` |
 | `repmgr.monitoringHistoryDays` | Days of `repmgr.monitoring_history` to retain; pruned daily on the primary via `repmgr cluster cleanup` | `7` |
 | `repmgr.terminationGracePeriodSeconds` | Time allowed for graceful shutdown and failover | `120` |
-| `repmgr.stalePrimary.action` | Action when a restarted primary container detects an active peer primary on a newer timeline: `reclone` (delete own pod so repmgr-init re-clones) or `halt` (crash-loop, keep data dir for inspection) | `reclone` |
 | `repmgr.resources.requests.cpu` | CPU request | `50m` |
 | `repmgr.resources.requests.memory` | Memory request | `128Mi` |
 | `repmgr.resources.limits.cpu` | CPU limit | `500m` |

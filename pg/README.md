@@ -7,6 +7,7 @@ PostgreSQL Helm chart with repmgr for automatic failover and replication managem
 - PostgreSQL 18.1 with configurable version
 - Repmgr for automatic failover and replication management
 - Service-updater sidecar for automatic primary service selector updates after failover
+- Stale-primary protection: a crashed primary that restarts after a standby was promoted rejoins as a standby (via pg_rewind) instead of resuming read-write on a divergent timeline
 - Read-only `<fullname>-readonly` service targeting standby pods for read scaling (repmgr mode)
 - Optional PGPool-II for connection pooling and read/write splitting
 - Support for existing secrets or auto-generated passwords
@@ -186,7 +187,6 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 | `repmgr.resources.limits.cpu` | CPU limit | `500m` |
 | `repmgr.resources.limits.memory` | Memory limit | `512Mi` |
 | `repmgr.splitBrainDetection.action` | Action on split-brain: `log` (alert only) or `fence` (terminate stale primary) | `log` |
-| `repmgr.stalePrimary.action` | Action when a restarted primary container detects an active peer primary on a newer timeline: `reclone` (delete own pod so repmgr-init re-clones) or `halt` (crash-loop, keep data dir for inspection) | `reclone` |
 | `repmgr.serviceUpdater.resources.requests.cpu` | Service-updater CPU request | `50m` |
 | `repmgr.serviceUpdater.resources.requests.memory` | Service-updater memory request | `64Mi` |
 | `repmgr.serviceUpdater.resources.limits.memory` | Service-updater memory limit | `128Mi` |
