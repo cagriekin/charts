@@ -1035,7 +1035,10 @@ assert_contains "pgpool admin: deployment has PCP_ADMIN_USER env" "${pcp_deploy}
 assert_contains "pgpool admin: deployment has PCP_ADMIN_PASSWORD env" "${pcp_deploy}" "name: PCP_ADMIN_PASSWORD"
 pcp_ref_count=$(printf '%s' "${pcp_deploy}" | grep -c "name: test-pg-pgpool-admin" || true)
 assert_eq "pgpool admin: deployment references chart-managed secret twice" "2" "${pcp_ref_count}"
-assert_contains "pgpool admin: init container generates pcp.conf" "${pcp_deploy}" "sha256sum"
+# #130: pcp.conf must be md5(password) -- pgpool PCP auth rejects sha256, which
+# made every pcp_* admin command fail. md5sum of the raw password equals pg_md5.
+assert_contains "pgpool admin: pcp.conf hashed with md5 (#130)" "${pcp_deploy}" "md5sum"
+assert_not_contains "pgpool admin: pcp.conf not hashed with sha256 (#130)" "${pcp_deploy}" "sha256sum"
 
 # Test: existingSecret mode omits the chart-managed Secret and uses the named one
 pcp_ext=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \

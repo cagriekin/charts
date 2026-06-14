@@ -101,6 +101,16 @@ assert_contains "pgpool has metrics sidecar" "${pgpool_containers}" "pgpool-expo
 pcp_port=$(kubectl get svc -n "${NAMESPACE}" "${FULLNAME}-pgpool" -o jsonpath='{.spec.ports[?(@.name=="pcp")].port}')
 assert_eq "pgpool pcp port is 9898" "9898" "${pcp_port}"
 
+# Test: PCP admin auth works end-to-end (#130). pcp.conf must hash the admin
+# password as md5; under the old sha256 every pcp_* command failed auth. Run
+# pcp_node_count inside the pgpool pod with the credentials from the admin
+# Secret and assert it returns the backend count (3) rather than an auth error.
+pcp_user=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-pgpool-admin" -o jsonpath='{.data.username}' | base64 -d)
+pcp_pw=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-pgpool-admin" -o jsonpath='{.data.password}' | base64 -d)
+pcp_count=$(kubectl exec -n "${NAMESPACE}" "${pgpool_pod}" -c pgpool -- \
+  sh -c "PCPPASSWORD='${pcp_pw}' pcp_node_count -h localhost -p 9898 -U '${pcp_user}' -w" 2>/dev/null | tail -1 | tr -d '[:space:]')
+assert_eq "pcp_node_count authenticates and returns backend count (#130)" "3" "${pcp_count}"
+
 # --- Prometheus exporter tests ---
 echo ""
 echo "  -- Prometheus Exporter tests --"
