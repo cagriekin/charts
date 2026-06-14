@@ -507,35 +507,58 @@ bash -c '
 assert_eq "su #168: tl_to_int decodes hex timelines (10->10, 16->16, not ::int)" "0" "${tl_rc}"
 rm -f "${SCRIPT_DIR}/.tl_render.sh" "${SCRIPT_DIR}/.tl_fn.sh"
 
-# --- #169: split-brain log mode still defends the write selector ---
-# Under the default action=log, the split-brain handler must keep re-asserting
-# the write selector toward the last known-good primary so an ArgoCD sync that
-# re-applies the chart's hardcoded pod-0 selector during a split-brain window
-# cannot strand writes -- but only while that primary is still live, and it must
-# never move the selector onto a newly-appeared (possibly stale) primary.
-assert_contains "su #169: log-mode split-brain re-asserts known-good selector" "${su_cm}" "re-asserting write selector to last known-good primary"
-# behavioral unit test of handle_split_brain (log mode) extracted from the script
+# --- #169: split-brain re-asserts the write selector to the highest-TL primary ---
+# Under the default action=log the handler must keep re-asserting the write
+# selector (so an ArgoCD sync re-applying the chart's hardcoded pod-0 selector
+# during a split-brain window cannot strand writes), and it must re-assert
+# toward the HIGHEST-timeline live primary -- the legitimate post-failover node,
+# the same survivor the fence path keeps -- not a stale lower-timeline one.
+assert_contains "su #169: log-mode split-brain re-asserts highest-timeline selector" "${su_cm}" "re-asserting write selector to highest-timeline primary"
+# behavioral unit test of handle_split_brain extracted from the rendered script.
+# timeout is stubbed to run its command; psql returns a per-host timeline|LSN so
+# the real survivor selection (tl_to_int + lsn_gt, also sourced) is exercised.
 printf '%s' "${su_cm}" | python3 -c "import sys,yaml; sys.stdout.write(yaml.safe_load(sys.stdin)['data']['service-updater.sh'])" > "${SCRIPT_DIR}/.sb_render.sh"
-sed -n '/^handle_split_brain() {/,/^}/p' "${SCRIPT_DIR}/.sb_render.sh" > "${SCRIPT_DIR}/.sb_fn.sh"
+sed -n '/^handle_split_brain() {/,/^}/p' "${SCRIPT_DIR}/.sb_render.sh" >  "${SCRIPT_DIR}/.sb_fn.sh"
+sed -n '/^tl_to_int() {/,/^}/p'          "${SCRIPT_DIR}/.sb_render.sh" >> "${SCRIPT_DIR}/.sb_fn.sh"
+sed -n '/^lsn_gt() {/,/^}/p'             "${SCRIPT_DIR}/.sb_render.sh" >> "${SCRIPT_DIR}/.sb_fn.sh"
 sb_rc=0
 bash -c '
   source "'"${SCRIPT_DIR}"'/.sb_fn.sh"
   PRIMARY_COUNT=2
-  # log mode + last known-good primary still live -> re-assert it
+  REPMGR_PASSWORD=x REPMGR_USER=r REPMGR_DB=d NAMESPACE=ns
+  timeout() { shift; "$@"; }            # drop the duration, run the command
+  update_pod_role_labels() { :; }
+  kubectl() { :; }                      # no-op the fence deletion path
+  # pod-1 is on the higher timeline (the legitimate post-failover primary)
+  hi_tl() { local h=""; while [ $# -gt 0 ]; do [ "$1" = "-h" ] && h="$2"; shift; done
+            case "$h" in *-0.*) echo "00000003|3/10";; *-1.*) echo "00000004|4/20";; *) echo "";; esac; }
+
+  # log mode re-asserts toward the highest-TL primary (pod-1), even though the
+  # stale pod-0 is also live and is where LAST_MASTER/the selector points
+  psql() { hi_tl "$@"; }
   SELECTED=""; update_service_selector() { SELECTED="$1"; }
-  SPLIT_BRAIN_ACTION=log LAST_MASTER=test-pg-1 PRIMARY_NODES="test-pg-0.h.ns test-pg-1.h.ns" handle_split_brain >/dev/null 2>&1
+  SPLIT_BRAIN_ACTION=log LAST_MASTER=test-pg-0 PRIMARY_NODES="test-pg-0.h.ns test-pg-1.h.ns" handle_split_brain >/dev/null 2>&1
   [ "$SELECTED" = "test-pg-1" ] || exit 1
-  # log mode + known-good primary no longer among the live primaries -> passive
+
+  # order independence: same winner when pod-1 is listed first
   SELECTED=""; update_service_selector() { SELECTED="$1"; }
-  SPLIT_BRAIN_ACTION=log LAST_MASTER=test-pg-9 PRIMARY_NODES="test-pg-0.h.ns test-pg-1.h.ns" handle_split_brain >/dev/null 2>&1
-  [ -z "$SELECTED" ] || exit 1
-  # log mode + no known-good primary yet -> passive
+  SPLIT_BRAIN_ACTION=log LAST_MASTER="" PRIMARY_NODES="test-pg-1.h.ns test-pg-0.h.ns" handle_split_brain >/dev/null 2>&1
+  [ "$SELECTED" = "test-pg-1" ] || exit 1
+
+  # no readable timeline anywhere -> passive (selector untouched)
+  psql() { echo ""; }
   SELECTED=""; update_service_selector() { SELECTED="$1"; }
-  SPLIT_BRAIN_ACTION=log LAST_MASTER="" PRIMARY_NODES="test-pg-0.h.ns test-pg-1.h.ns" handle_split_brain >/dev/null 2>&1
+  SPLIT_BRAIN_ACTION=log LAST_MASTER=test-pg-0 PRIMARY_NODES="test-pg-0.h.ns test-pg-1.h.ns" handle_split_brain >/dev/null 2>&1
   [ -z "$SELECTED" ] || exit 1
+
+  # fence mode selects the same highest-TL survivor
+  psql() { hi_tl "$@"; }
+  SELECTED=""; update_service_selector() { SELECTED="$1"; }
+  SPLIT_BRAIN_ACTION=fence LAST_MASTER=test-pg-0 PRIMARY_NODES="test-pg-0.h.ns test-pg-1.h.ns" handle_split_brain >/dev/null 2>&1
+  [ "$SELECTED" = "test-pg-1" ] || exit 1
   exit 0
 ' || sb_rc=$?
-assert_eq "su #169: log-mode defends live known-good primary, else passive" "0" "${sb_rc}"
+assert_eq "su #169: split-brain selects highest-TL primary (log re-asserts, fence too)" "0" "${sb_rc}"
 rm -f "${SCRIPT_DIR}/.sb_render.sh" "${SCRIPT_DIR}/.sb_fn.sh"
 
 # --- Durable primary marker (#125) ---
