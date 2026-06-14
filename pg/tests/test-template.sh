@@ -225,6 +225,23 @@ assert_not_contains "netpol minimal: no exporter policy" "${netpol_minimal}" "te
 assert_contains "netpol: egress allows 443" "${netpol}" "port: 443"
 assert_contains "netpol: egress allows 6443" "${netpol}" "port: 6443"
 
+# Test: postgresql egress allows the pgpool backend port (#129). service-updater
+# health-checks pgpool from the pg pods; without an egress rule for 9999 the
+# check times out and perpetually rollout-restarts pgpool. The pgpool policy's
+# ingress also allows 9999, so isolate the postgresql policy's egress block to
+# prove the rule is on the egress side specifically.
+pg_egress=$(printf '%s\n' "${netpol}" | awk '
+  /^---/ { inpg=0; eg=0 }
+  /name: test-pg-postgresql$/ { inpg=1 }
+  inpg && /^  egress:/ { eg=1 }
+  eg && /^---/ { eg=0 }
+  eg { print }
+')
+assert_contains "netpol: postgresql egress allows pgpool port 9999 (#129)" "${pg_egress}" "port: 9999"
+assert_contains "netpol: postgresql egress targets pgpool component (#129)" "${pg_egress}" "app.kubernetes.io/component: pgpool"
+# pgpool disabled -> no pgpool egress rule (the rule is gated on pgpool.enabled)
+assert_not_contains "netpol minimal: no pgpool egress when pgpool disabled (#129)" "${netpol_minimal}" "app.kubernetes.io/component: pgpool"
+
 # Test: egress derives S3 port from pgbackrest endpoint with explicit port
 netpol_pgbackrest=$(helm template test-pg "${CHART_DIR}" \
   -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
