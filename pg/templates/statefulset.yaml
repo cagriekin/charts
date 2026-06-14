@@ -1,6 +1,12 @@
 {{- if and (not .Values.repmgr.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
 {{- fail "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr" }}
 {{- end }}
+{{- if .Values.repmgr.enabled }}
+{{- $repmgrMajor := required "repmgr.image.majorVersion is required (the PostgreSQL major bundled in the repmgr image)" .Values.repmgr.image.majorVersion }}
+{{- if ne (toString .Values.postgresql.majorVersion) (toString $repmgrMajor) }}
+{{- fail (printf "postgresql.majorVersion=%q does not match repmgr.image.majorVersion=%q. In repmgr mode the PostgreSQL server runs from the repmgr image (%s), which bundles only PostgreSQL %s and always runs that server regardless of postgresql.image; a mismatch crash-loops the extension init container or silently runs the wrong major. Set postgresql.majorVersion=%q (with a matching postgresql.image), or point repmgr.image at an image built for PostgreSQL %s and set repmgr.image.majorVersion to match" (toString .Values.postgresql.majorVersion) (toString $repmgrMajor) .Values.repmgr.image.repository (toString $repmgrMajor) (toString $repmgrMajor) (toString .Values.postgresql.majorVersion)) }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
