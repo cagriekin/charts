@@ -102,13 +102,18 @@ pcp_port=$(kubectl get svc -n "${NAMESPACE}" "${FULLNAME}-pgpool" -o jsonpath='{
 assert_eq "pgpool pcp port is 9898" "9898" "${pcp_port}"
 
 # Test: PCP admin auth works end-to-end (#130). pcp.conf must hash the admin
-# password as md5; under the old sha256 every pcp_* command failed auth. Run
-# pcp_node_count inside the pgpool pod with the credentials from the admin
-# Secret and assert it returns the backend count (3) rather than an auth error.
+# password as md5; under the old sha256 every pcp_* command failed auth. pgpool's
+# pcp tools take the password from a .pcppass file (PCPPASSFILE), not PCPPASSWORD,
+# so feed it that way and assert pcp_node_count returns the backend count (3)
+# rather than an auth error. The trailing `|| pcp_count=auth-failed` keeps an auth
+# failure a clean assertion FAIL instead of a set -e abort of the whole suite.
 pcp_user=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-pgpool-admin" -o jsonpath='{.data.username}' | base64 -d)
 pcp_pw=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-pgpool-admin" -o jsonpath='{.data.password}' | base64 -d)
-pcp_count=$(kubectl exec -n "${NAMESPACE}" "${pgpool_pod}" -c pgpool -- \
-  sh -c "PCPPASSWORD='${pcp_pw}' pcp_node_count -h localhost -p 9898 -U '${pcp_user}' -w" 2>/dev/null | tail -1 | tr -d '[:space:]')
+pcp_count=$(kubectl exec -n "${NAMESPACE}" "${pgpool_pod}" -c pgpool -- sh -c "
+  printf '%s\n' 'localhost:9898:${pcp_user}:${pcp_pw}' > /tmp/.pcppass
+  chmod 600 /tmp/.pcppass
+  PCPPASSFILE=/tmp/.pcppass pcp_node_count -h localhost -p 9898 -U '${pcp_user}' -w
+" 2>/dev/null | tail -1 | tr -d '[:space:]') || pcp_count="auth-failed"
 assert_eq "pcp_node_count authenticates and returns backend count (#130)" "3" "${pcp_count}"
 
 # --- Prometheus exporter tests ---
