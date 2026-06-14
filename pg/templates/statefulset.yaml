@@ -250,6 +250,16 @@ spec:
               value: {{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
             - name: REPMGR_NODE_COUNT
               value: {{ add .Values.postgresql.replicaCount 1 | quote }}
+            # Lets the entrypoint stale-primary guard read the durable primary
+            # marker (#125) to tell a first install from a PVC-loss recreate, so
+            # it only settles/retries the empty-data peer scan in the recreate
+            # case and never delays a first install (#170).
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: PRIMARY_MARKER
+              value: {{ include "pg.fullname" . }}-primary
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
             - name: PGBACKREST_ENABLED

@@ -573,6 +573,12 @@ sts_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmg
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "su #125: PRIMARY_MARKER env propagated" "${sts_repmgr}" "name: PRIMARY_MARKER"
 assert_contains "su #125: marker name is <fullname>-primary" "${sts_repmgr}" "test-pg-primary"
+# #170: the entrypoint stale-primary guard (postgresql container) reads the
+# marker to gate its empty-data settle, so the marker env must reach the
+# postgresql container itself -- not just the service-updater sidecar.
+pg_cont=$(printf '%s\n' "${sts_repmgr}" | awk '/^        - name: postgresql$/{f=1; next} f && /^        - name: /{exit} f{print}')
+assert_contains "#170: postgresql container gets PRIMARY_MARKER (guard reads marker)" "${pg_cont}" "name: PRIMARY_MARKER"
+assert_contains "#170: postgresql container gets NAMESPACE" "${pg_cont}" "name: NAMESPACE"
 # rbac grants configmap access for the marker
 rbac_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/rbac.yaml 2>&1)

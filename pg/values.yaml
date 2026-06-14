@@ -118,7 +118,7 @@ postgresql:
 repmgr:
   image:
     repository: cagriekin/repmgr
-    tag: trixie-5.5.0-13
+    tag: trixie-5.5.0-14
     pullPolicy: IfNotPresent
 
   enabled: true
