@@ -276,35 +276,13 @@ data:
     }
 
     # Called only when scan_primaries found >= 2 live primaries (split-brain).
-    # action=log just warns; action=fence picks a survivor and removes the rest.
+    # Both modes pick the survivor (highest timeline, then LSN); action=log
+    # re-asserts the write selector toward it (non-destructive), action=fence
+    # also terminates and deletes the stale primaries.
     handle_split_brain() {
         echo "CRITICAL: Split-brain detected! ${PRIMARY_COUNT} primaries found: ${PRIMARY_NODES}"
 
         local split_brain_action="${SPLIT_BRAIN_ACTION:-log}"
-        if [ "$split_brain_action" != "fence" ]; then
-            # log mode (default): do NOT move the selector onto a newly-appeared
-            # primary -- which of the live primaries is legitimate is ambiguous
-            # without fencing -- but keep defending the last known-good primary
-            # against external mutation. Otherwise an ArgoCD sync that re-applies
-            # the chart's hardcoded pod-0 selector during a split-brain window
-            # strands writes there for as long as the split-brain persists, the
-            # exact failure the every-tick re-assert prevents (#169). Re-assert
-            # only while LAST_MASTER is still one of the live primaries; stay
-            # passive otherwise. update_service_selector is a no-op when the
-            # selector already matches.
-            if [ -n "$LAST_MASTER" ]; then
-                local sb_node sb_pod
-                for sb_node in ${PRIMARY_NODES}; do
-                    sb_pod=$(echo "${sb_node}" | cut -d'.' -f1)
-                    if [ "$sb_pod" = "$LAST_MASTER" ]; then
-                        echo "Split-brain (log): re-asserting write selector to last known-good primary ${LAST_MASTER}"
-                        update_service_selector "$LAST_MASTER"
-                        break
-                    fi
-                done
-            fi
-            return 0
-        fi
 
         # Survivor = highest timeline, then highest LSN. Timeline MUST dominate:
         # a stale old primary that kept writing on the old timeline can have a
@@ -330,12 +308,28 @@ data:
         done
 
         if [ -z "$best_node" ]; then
-            echo "Fencing: no survivor with a readable timeline/LSN; taking no action this tick"
+            echo "Split-brain: no live primary has a readable timeline/LSN; taking no action this tick"
             return 0
         fi
 
         local best_pod
         best_pod=$(echo "${best_node}" | cut -d'.' -f1)
+
+        if [ "$split_brain_action" != "fence" ]; then
+            # log mode (default): do NOT delete the stale primaries, but DO
+            # re-assert the write selector toward the highest-timeline live
+            # primary -- the same survivor the fence path keeps. This restores
+            # the every-tick self-heal against external mutation (an ArgoCD sync
+            # re-applying the chart's hardcoded pod-0 selector would otherwise
+            # strand writes for the whole split-brain window, #169) AND keeps
+            # writes on the legitimate post-failover primary rather than a stale
+            # lower-timeline one. update_service_selector is a no-op when the
+            # selector already matches.
+            echo "Split-brain (log): re-asserting write selector to highest-timeline primary ${best_pod} (timeline ${best_tl}, LSN ${best_lsn})"
+            update_service_selector "${best_pod}"
+            return 0
+        fi
+
         echo "Fencing: keeping ${best_pod} as primary (timeline ${best_tl}, LSN ${best_lsn})"
 
         # Terminate backends on and delete EVERY stale primary (not just the
