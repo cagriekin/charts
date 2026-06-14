@@ -507,6 +507,37 @@ bash -c '
 assert_eq "su #168: tl_to_int decodes hex timelines (10->10, 16->16, not ::int)" "0" "${tl_rc}"
 rm -f "${SCRIPT_DIR}/.tl_render.sh" "${SCRIPT_DIR}/.tl_fn.sh"
 
+# --- #169: split-brain log mode still defends the write selector ---
+# Under the default action=log, the split-brain handler must keep re-asserting
+# the write selector toward the last known-good primary so an ArgoCD sync that
+# re-applies the chart's hardcoded pod-0 selector during a split-brain window
+# cannot strand writes -- but only while that primary is still live, and it must
+# never move the selector onto a newly-appeared (possibly stale) primary.
+assert_contains "su #169: log-mode split-brain re-asserts known-good selector" "${su_cm}" "re-asserting write selector to last known-good primary"
+# behavioral unit test of handle_split_brain (log mode) extracted from the script
+printf '%s' "${su_cm}" | python3 -c "import sys,yaml; sys.stdout.write(yaml.safe_load(sys.stdin)['data']['service-updater.sh'])" > "${SCRIPT_DIR}/.sb_render.sh"
+sed -n '/^handle_split_brain() {/,/^}/p' "${SCRIPT_DIR}/.sb_render.sh" > "${SCRIPT_DIR}/.sb_fn.sh"
+sb_rc=0
+bash -c '
+  source "'"${SCRIPT_DIR}"'/.sb_fn.sh"
+  PRIMARY_COUNT=2
+  # log mode + last known-good primary still live -> re-assert it
+  SELECTED=""; update_service_selector() { SELECTED="$1"; }
+  SPLIT_BRAIN_ACTION=log LAST_MASTER=test-pg-1 PRIMARY_NODES="test-pg-0.h.ns test-pg-1.h.ns" handle_split_brain >/dev/null 2>&1
+  [ "$SELECTED" = "test-pg-1" ] || exit 1
+  # log mode + known-good primary no longer among the live primaries -> passive
+  SELECTED=""; update_service_selector() { SELECTED="$1"; }
+  SPLIT_BRAIN_ACTION=log LAST_MASTER=test-pg-9 PRIMARY_NODES="test-pg-0.h.ns test-pg-1.h.ns" handle_split_brain >/dev/null 2>&1
+  [ -z "$SELECTED" ] || exit 1
+  # log mode + no known-good primary yet -> passive
+  SELECTED=""; update_service_selector() { SELECTED="$1"; }
+  SPLIT_BRAIN_ACTION=log LAST_MASTER="" PRIMARY_NODES="test-pg-0.h.ns test-pg-1.h.ns" handle_split_brain >/dev/null 2>&1
+  [ -z "$SELECTED" ] || exit 1
+  exit 0
+' || sb_rc=$?
+assert_eq "su #169: log-mode defends live known-good primary, else passive" "0" "${sb_rc}"
+rm -f "${SCRIPT_DIR}/.sb_render.sh" "${SCRIPT_DIR}/.sb_fn.sh"
+
 # --- Durable primary marker (#125) ---
 # The service-updater records the highest-timeline primary in a ConfigMap so a
 # node booting first under OrderedReady can tell it is stale even when the real
