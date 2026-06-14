@@ -765,9 +765,29 @@ assert_contains "pgbackrest: postgresql-config volume mounted" "${pgbackrest_sts
 assert_contains "pgbackrest: postgresql-config volume present" "${pgbackrest_sts}" "name: postgresql-config"
 assert_contains "pgbackrest: include_dir wired in postStart" "${pgbackrest_sts}" "include_dir = '/etc/postgresql/conf.d'"
 
-# pgBackRest: not rendered when disabled (default)
+# #132: disabling pgbackrest after it was enabled at install must neutralize the
+# archive settings the repmgr image entrypoint persisted into PGDATA's
+# postgresql.conf. Otherwise archive_mode stays on with a now-failing
+# archive_command (pgbackrest config + S3 creds gone), pg_wal is never recycled,
+# and the data PVC fills until the postmaster PANICs. The strip lives in
+# setup-config and must be independent of the include_dir branch.
+pgbr_disable_setup=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --set pgbackrest.enabled=false --show-only templates/statefulset.yaml 2>&1 | sed -n '/name: setup-config/,/volumeMounts:/p')
+assert_contains "pgbackrest disable: setup-config strips entrypoint archive config (#132)" "${pgbr_disable_setup}" "archive-push %p"
+assert_contains "pgbackrest disable: setup-config neutralizes archive_mode (#132)" "${pgbr_disable_setup}" "grep -v -e '^archive_mode = on"
+# enabled: setup-config must NOT strip the live archive config
+pgbr_enabled_setup=$(printf '%s\n' "${pgbackrest_sts}" | sed -n '/name: setup-config/,/volumeMounts:/p')
+assert_not_contains "pgbackrest enabled: setup-config keeps archive config (#132)" "${pgbr_enabled_setup}" "archive-push %p"
+# disable while postgresql.configuration is still set: include_dir is kept (conf.d
+# still active) AND the archive strip still runs -- the two must be independent
+pgbr_disable_cfg_setup=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --set pgbackrest.enabled=false --set postgresql.configuration.max_connections=200 --show-only templates/statefulset.yaml 2>&1 | sed -n '/name: setup-config/,/volumeMounts:/p')
+assert_contains "pgbackrest disable + config: include_dir kept (#132)" "${pgbr_disable_cfg_setup}" 'echo "include_dir'
+assert_contains "pgbackrest disable + config: archive strip still runs (#132)" "${pgbr_disable_cfg_setup}" "archive-push %p"
+
+# pgBackRest: not rendered when disabled (default). Matches the rendered
+# resource name prefix (test-pg-pgbackrest) rather than the bare "pgbackrest"
+# substring so it targets actual resources, not explanatory comments (#132).
 pgbackrest_disabled=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" 2>&1)
-assert_not_contains "pgbackrest disabled: no configmap" "${pgbackrest_disabled}" "pgbackrest"
+assert_not_contains "pgbackrest disabled: no configmap" "${pgbackrest_disabled}" "test-pg-pgbackrest"
 assert_not_contains "pgbackrest disabled: no sidecar" "${pgbackrest_disabled}" "name: pgbackrest"
 assert_not_contains "pgbackrest disabled: no CronJob" "${pgbackrest_disabled}" "kind: CronJob"
 
