@@ -24,5 +24,6 @@
   "selectorLabels"  "pg.selectorLabels"
   "additionalLabels" .Values.prometheusExporter.serviceMonitor.additionalLabels
   "endpoints"       $endpoints
+  "annotations"     .Values.global.annotations
 ) }}
 {{- end }}

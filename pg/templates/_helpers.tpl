@@ -12,13 +12,25 @@
 
 {{- define "pg.labels" -}}
 {{ include "common.labels" . }}
-{{- with .Values.global.annotations }}
-{{ toYaml . }}
-{{- end }}
 {{- end }}
 
 {{- define "pg.selectorLabels" -}}
 {{- include "common.selectorLabels" . }}
+{{- end }}
+
+{{/*
+Global annotations applied to every resource's metadata. Returns the
+YAML for .Values.global.annotations, or "" when unset. Call sites guard
+with `{{- with (include "pg.annotations" .) }}` so a resource stays
+annotation-free when no global annotations are configured. (Previously
+these were wrongly merged into pg.labels and rendered as metadata.labels,
+which both broke apply for non-label-safe values and hid them from
+annotation consumers -- #128.)
+*/}}
+{{- define "pg.annotations" -}}
+{{- with .Values.global.annotations }}
+{{- toYaml . }}
+{{- end }}
 {{- end }}
 
 {{- define "pg.secretName" -}}

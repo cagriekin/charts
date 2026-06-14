@@ -6,5 +6,6 @@
   "labels"          "pg.labels"
   "selectorLabels"  "pg.selectorLabels"
   "minAvailable"    .Values.postgresql.podDisruptionBudget.minAvailable
+  "annotations"     .Values.global.annotations
 ) }}
 {{- end }}

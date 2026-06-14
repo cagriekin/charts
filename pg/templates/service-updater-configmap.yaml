@@ -5,6 +5,10 @@ metadata:
   name: {{ include "pg.fullname" . }}-service-updater
   labels:
     {{- include "pg.labels" . | nindent 4 }}
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 data:
   service-updater.sh: |
     #!/bin/bash

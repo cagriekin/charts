@@ -1178,5 +1178,39 @@ assert_contains "pgvector #126: backup mc image present" "${pgv_backup}" "minio/
 assert_contains "pgvector #126: backup container securityContext populated" "${pgv_backup}" "runAsUser: 999"
 assert_not_contains "pgvector #126: no null securityContext" "${pgv_backup}" "securityContext: null"
 
+# --- #128: global.annotations render as metadata.annotations, not labels ---
+# global.annotations used to be spliced into pg.labels and rendered under
+# metadata.labels on every resource: non-label-safe values (spaces, URLs, >63
+# chars) broke apply, and annotation consumers never saw them. They must render
+# under metadata.annotations on every resource (including common-lib resources).
+gann=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set prometheusExporter.serviceMonitor.enabled=true \
+  --set backup.enabled=true --set-string backup.existingSecret.name=bk \
+  --set-string backup.s3.endpoint=s3.example.com --set-string backup.s3.bucket=b \
+  --set pgbackrest.enabled=true --set-string pgbackrest.existingSecret.name=pb \
+  --set-string pgbackrest.s3.endpoint=s3.example.com --set-string pgbackrest.s3.bucket=b \
+  --set networkPolicy.enabled=true \
+  --set-string 'global.annotations.example\.com/team=data platform' 2>&1)
+# the value is a valid annotation but an INVALID label (contains a space)
+gann_kinds=$(printf '%s\n' "${gann}" | grep -c '^kind:')
+gann_hits=$(printf '%s\n' "${gann}" | grep -c 'example.com/team')
+assert_eq "global.annotations: present on every rendered resource (#128)" "${gann_kinds}" "${gann_hits}"
+# never under a labels: block (would fail server-side label validation)
+gann_leak=$(printf '%s\n' "${gann}" | awk '/^  labels:/{l=1;next} /^  [a-z]/{l=0} l && /example.com\/team/{c++} END{print c+0}')
+assert_eq "global.annotations: never rendered under labels (#128)" "0" "${gann_leak}"
+# common-lib-rendered resources (PDB, exporter Service/Deployment/ServiceMonitor) carry it too
+assert_contains "global.annotations: reaches common-lib resources (#128)" "${gann}" "example.com/team: data platform"
+# unset -> no stray resource-level annotations block on a resource that has none
+gann_unset=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --show-only templates/service.yaml 2>&1)
+assert_not_contains "global.annotations: unset adds no annotations block (#128)" "${gann_unset}" "annotations:"
+# merge: global + per-component annotations coexist on the StatefulSet
+gann_merge=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set-string 'global.annotations.example\.com/team=data platform' \
+  --set-string 'postgresql.annotations.sts\.local/own=yes' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "global.annotations: merges, global key kept (#128)" "${gann_merge}" "example.com/team: data platform"
+assert_contains "global.annotations: merges, component key kept (#128)" "${gann_merge}" "sts.local/own"
+
 end_suite
 print_summary
