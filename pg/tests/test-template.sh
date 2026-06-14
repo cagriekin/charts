@@ -665,6 +665,16 @@ assert_contains "pgbackrest rbac: Role renders" "${pgbackrest_rbac}" "kind: Role
 assert_contains "pgbackrest rbac: RoleBinding renders" "${pgbackrest_rbac}" "kind: RoleBinding"
 assert_contains "pgbackrest rbac: pods/exec verb create" "${pgbackrest_rbac}" "pods/exec"
 assert_contains "pgbackrest rbac: endpoints get verb" "${pgbackrest_rbac}" "endpoints"
+# #134: pods get and pods/exec create must be scoped by resourceNames to the
+# StatefulSet's deterministic pod names, not left namespace-wide (an unscoped
+# Role lets a leaked SA token exec into every pod in the namespace). All three
+# rules (endpoints, pods, pods/exec) carry resourceNames after the fix.
+pgbackrest_rn_count=$(printf '%s\n' "${pgbackrest_rbac}" | grep -c 'resourceNames:')
+assert_eq "pgbackrest rbac: endpoints+pods+pods/exec all resourceName-scoped (#134)" "3" "${pgbackrest_rn_count}"
+assert_contains "pgbackrest rbac: scoped to pod test-pg-0 (#134)" "${pgbackrest_rbac}" "\"test-pg-0\""
+assert_contains "pgbackrest rbac: scoped to pod test-pg-1 (#134)" "${pgbackrest_rbac}" "\"test-pg-1\""
+pgbackrest_rbac_n=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --set postgresql.replicaCount=2 --show-only templates/pgbackrest-rbac.yaml 2>&1)
+assert_contains "pgbackrest rbac: replicaCount widens scope to test-pg-2 (#134)" "${pgbackrest_rbac_n}" "\"test-pg-2\""
 
 # pgBackRest: enabling pgbackrest must auto-inject WAL archive settings into
 # postgresql.conf. Without these, postgres rejects backups with

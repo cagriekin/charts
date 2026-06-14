@@ -29,13 +29,25 @@ rules:
     resourceNames: [{{ include "pg.fullname" . | quote }}]
     verbs: ["get"]
   # Exec into the pgbackrest sidecar of the primary pod to run the backup.
-  # Restricted to the StatefulSet pods by name pattern is not supported by
-  # RBAC; we limit scope by namespace (Role, not ClusterRole) instead.
+  # kubectl exec GETs the target pod then POSTs to its pods/exec subresource;
+  # the backup only ever targets the resolved primary, which is always one of
+  # the StatefulSet's deterministic pod names (<fullname>-0 .. <fullname>-N).
+  # resourceNames scopes get on pods and create on the pods/exec subresource
+  # (the pod name is in the request path), so a leaked SA token cannot exec into
+  # arbitrary pods in the namespace (#134).
   - apiGroups: [""]
     resources: ["pods"]
+    resourceNames:
+      {{- range $i := until (int (add .Values.postgresql.replicaCount 1)) }}
+      - {{ printf "%s-%d" (include "pg.fullname" $) $i | quote }}
+      {{- end }}
     verbs: ["get"]
   - apiGroups: [""]
     resources: ["pods/exec"]
+    resourceNames:
+      {{- range $i := until (int (add .Values.postgresql.replicaCount 1)) }}
+      - {{ printf "%s-%d" (include "pg.fullname" $) $i | quote }}
+      {{- end }}
     verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
