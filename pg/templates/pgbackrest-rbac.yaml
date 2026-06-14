@@ -6,6 +6,10 @@ metadata:
   labels:
     {{- include "pg.labels" . | nindent 4 }}
     app.kubernetes.io/component: pgbackrest
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -14,6 +18,10 @@ metadata:
   labels:
     {{- include "pg.labels" . | nindent 4 }}
     app.kubernetes.io/component: pgbackrest
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 rules:
   # Resolve the current primary pod via the primary service endpoints.
   - apiGroups: [""]
@@ -37,6 +45,10 @@ metadata:
   labels:
     {{- include "pg.labels" . | nindent 4 }}
     app.kubernetes.io/component: pgbackrest
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 subjects:
   - kind: ServiceAccount
     name: {{ include "pg.fullname" . }}-pgbackrest

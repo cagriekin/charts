@@ -6,6 +6,10 @@ metadata:
   labels:
     {{- include "pg.labels" . | nindent 4 }}
     app.kubernetes.io/component: postgresql
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 spec:
   podSelector:
     matchLabels:
@@ -108,6 +112,10 @@ metadata:
   labels:
     {{- include "pg.labels" . | nindent 4 }}
     app.kubernetes.io/component: pgpool
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 spec:
   podSelector:
     matchLabels:
@@ -152,6 +160,10 @@ metadata:
   labels:
     {{- include "pg.labels" . | nindent 4 }}
     app.kubernetes.io/component: prometheus-exporter
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 spec:
   podSelector:
     matchLabels:

@@ -10,6 +10,10 @@ metadata:
     {{- include "pg.labels" $root | nindent 4 }}
     app.kubernetes.io/component: pgbackrest
     pgbackrest.type: {{ $type }}
+  {{- with (include "pg.annotations" $root) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 spec:
   schedule: {{ $schedule | quote }}
   concurrencyPolicy: {{ $root.Values.pgbackrest.cronjob.concurrencyPolicy }}

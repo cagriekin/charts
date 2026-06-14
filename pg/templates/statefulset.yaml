@@ -8,9 +8,14 @@ metadata:
   labels:
     {{- include "pg.labels" . | nindent 4 }}
     app.kubernetes.io/component: postgresql
-  {{- with .Values.postgresql.annotations }}
+  {{- if or .Values.global.annotations .Values.postgresql.annotations }}
   annotations:
+    {{- with .Values.global.annotations }}
     {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- with .Values.postgresql.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
   {{- end }}
 spec:
   serviceName: {{ include "pg.fullname" . }}-headless

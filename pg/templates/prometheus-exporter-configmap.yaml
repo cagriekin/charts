@@ -6,6 +6,10 @@ metadata:
   labels:
     {{- include "pg.labels" . | nindent 4 }}
     app.kubernetes.io/component: postgres-exporter
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 data:
   postgres_exporter.yml: |
     auth_modules:

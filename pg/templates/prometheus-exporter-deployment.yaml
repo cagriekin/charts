@@ -15,5 +15,6 @@
   "selectorLabels"  "pg.selectorLabels"
   "podAnnotations"  $annotations
   "podSpec"         "pg.exporterPodSpec"
+  "annotations"     .Values.global.annotations
 ) }}
 {{- end }}

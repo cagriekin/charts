@@ -6,6 +6,6 @@
   "selectorLabels"  "pg.selectorLabels"
   "port"            .Values.prometheusExporter.service.port
   "serviceType"     .Values.prometheusExporter.service.type
-  "annotations"     .Values.prometheusExporter.service.annotations
+  "annotations"     (merge (deepCopy .Values.prometheusExporter.service.annotations) .Values.global.annotations)
 ) }}
 {{- end }}

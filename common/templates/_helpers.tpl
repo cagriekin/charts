@@ -144,6 +144,10 @@ metadata:
     {{- with .additionalLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
+  {{- with .annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   selector:
     matchLabels:
@@ -191,6 +195,10 @@ metadata:
   labels:
     {{- include .labels .ctx | nindent 4 }}
     app.kubernetes.io/component: {{ .component }}
+  {{- with .annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   selector:
     matchLabels:
@@ -212,6 +220,10 @@ metadata:
   labels:
     {{- include .labels .ctx | nindent 4 }}
     app.kubernetes.io/component: {{ .component }}
+  {{- with .annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   replicas: {{ .replicas | default 1 }}
   selector:

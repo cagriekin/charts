@@ -4,6 +4,10 @@ metadata:
   name: {{ include "pg.fullname" . }}-headless
   labels:
     {{- include "pg.labels" . | nindent 4 }}
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 spec:
   clusterIP: None
   publishNotReadyAddresses: true

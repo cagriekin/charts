@@ -5,6 +5,10 @@ metadata:
   name: {{ include "pg.fullname" . }}-pgpool
   labels:
     {{- include "pg.labels" . | nindent 4 }}
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 spec:
   type: {{ .Values.pgpool.service.type }}
   ports:

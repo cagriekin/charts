@@ -5,6 +5,10 @@ metadata:
   name: {{ include "pg.fullname" . }}-repmgr
   labels:
     {{- include "pg.labels" . | nindent 4 }}
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -12,6 +16,10 @@ metadata:
   name: {{ include "pg.fullname" . }}-repmgr
   labels:
     {{- include "pg.labels" . | nindent 4 }}
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 rules:
   - apiGroups: [""]
     resources: ["services"]
@@ -49,6 +57,10 @@ metadata:
   name: {{ include "pg.fullname" . }}-repmgr
   labels:
     {{- include "pg.labels" . | nindent 4 }}
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
