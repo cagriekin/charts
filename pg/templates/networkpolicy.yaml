@@ -61,6 +61,22 @@ spec:
             matchLabels:
               {{- include "pg.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: postgresql
+{{- if .Values.pgpool.enabled }}
+{{- /*
+service-updater runs inside the postgresql pods and health-checks pgpool on
+its backend port (9999) every tick; NetworkPolicy matches the post-DNAT pod
+port, so without this egress rule the check times out and perpetually
+rollout-restarts the pgpool Deployment (#129).
+*/}}
+    - ports:
+        - port: {{ .Values.pgpool.service.port }}
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: pgpool
+{{- end }}
 {{- /*
 443 covers HTTPS S3 endpoints and cloud API servers; 6443 covers the
 API server on kubeadm-style clusters (service-updater and lifecycle
