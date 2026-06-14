@@ -196,6 +196,21 @@ spec:
                 mv "$CONF.tmp" "$CONF"
               fi
 {{- end }}
+{{- if not .Values.pgbackrest.enabled }}
+              # pgbackrest disabled: the repmgr image entrypoint persisted
+              # archive_mode=on + a pgbackrest archive_command into PGDATA's
+              # postgresql.conf at initdb (#132). With the pgbackrest config and
+              # S3 credentials now gone, every archive_command fails and WAL is
+              # never recycled -- pg_wal grows until the PVC fills and the
+              # postmaster PANICs. Strip the entrypoint-written archive lines so
+              # archiving reverts to the default (off). Live archive settings,
+              # when enabled, come from the chart-managed conf.d include, never
+              # this base file, so this only ever removes stale, failing config.
+              if [ -f "$CONF" ] && grep -q "archive-push %p" "$CONF"; then
+                grep -v -e '^archive_mode = on$' -e 'archive-push %p' "$CONF" > "$CONF.tmp"
+                mv "$CONF.tmp" "$CONF"
+              fi
+{{- end }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
