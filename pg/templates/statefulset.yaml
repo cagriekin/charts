@@ -424,6 +424,11 @@ spec:
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
                         HEADLESS="{{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local"
                         PRIMARY_HOST=""
+                        # Discovery and the user commands connect over TCP to a remote
+                        # pod; the image's pg_hba requires md5/scram for every
+                        # non-loopback connection, so without PGPASSWORD both the
+                        # discovery psql and the user psql fail auth and silently no-op.
+                        export PGPASSWORD="$POSTGRES_PASSWORD"
                         {{- /* StatefulSet runs replicaCount + 1 pods, ordinals 0..replicaCount */}}
                         for n in $(seq 0 {{ int .Values.postgresql.replicaCount }}); do
                           H="{{ include "pg.fullname" . }}-${n}.${HEADLESS}"
@@ -433,7 +438,11 @@ spec:
                           fi
                         done
                         if [ -n "$PRIMARY_HOST" ]; then
-                          PGHOST="$PRIMARY_HOST" {{ .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 24 }}
+                          # export PGHOST as its own statement: psql reads it only from
+                          # the environment, and a bare `PGHOST=... <cmd>` prefix is
+                          # split onto its own line by nindent, leaving it unexported.
+                          export PGHOST="$PRIMARY_HOST"
+                          {{- .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 26 }}
                         fi
                         {{- end }}
                         break

@@ -378,6 +378,20 @@ assert_contains "repmgr additionalCommands: sets PGHOST to primary" "${repmgr_ad
 assert_contains "repmgr additionalCommands: scans headless service pods" "${repmgr_addcmd}" "headless"
 assert_contains "repmgr additionalCommands: renders the command" "${repmgr_addcmd}" "test-command"
 
+# #127: the discovery psql and the user commands connect over TCP to a remote
+# pod; the image's pg_hba requires md5/scram for every non-loopback connection,
+# so PGPASSWORD must be exported or both fail auth and silently no-op. PGHOST
+# must be exported as its own statement -- a bare `PGHOST=... <cmd>` prefix is
+# split onto its own line by nindent, so the child psql never sees it and runs
+# against the local socket of whatever pod fired the hook.
+assert_contains "repmgr additionalCommands: exports PGPASSWORD for TCP auth (#127)" "${repmgr_addcmd}" 'export PGPASSWORD="\$POSTGRES_PASSWORD"'
+assert_contains "repmgr additionalCommands: exports PGHOST as its own statement (#127)" "${repmgr_addcmd}" 'export PGHOST="\$PRIMARY_HOST"'
+# the PGHOST export must precede the user command (else it runs locally)
+pghost_ln=$(printf '%s\n' "${repmgr_addcmd}" | grep -n 'export PGHOST="\$PRIMARY_HOST"' | awk -F: 'NR==1{print $1}') || pghost_ln=""
+usercmd_ln=$(printf '%s\n' "${repmgr_addcmd}" | grep -n 'echo test-command' | awk -F: 'NR==1{print $1}') || usercmd_ln=""
+if [ -n "${pghost_ln}" ] && [ -n "${usercmd_ln}" ] && [ "${pghost_ln}" -lt "${usercmd_ln}" ]; then ord127=ok; else ord127="pghost=${pghost_ln:-none} usercmd=${usercmd_ln:-none}"; fi
+assert_eq "repmgr additionalCommands: PGHOST export precedes user command (#127)" "ok" "${ord127}"
+
 # Test: standalone + additionalCommands runs directly without primary discovery
 standalone_addcmd=$(helm template test-pg "${CHART_DIR}" \
   -f "${SCRIPT_DIR}/values-minimal.yaml" \
