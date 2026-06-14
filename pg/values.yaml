@@ -120,6 +120,12 @@ repmgr:
     repository: cagriekin/repmgr
     tag: trixie-5.5.0-15
     pullPolicy: IfNotPresent
+    # PostgreSQL major version bundled in the repmgr image. The image ships
+    # exactly one PG major and always runs that server, so in repmgr mode the
+    # cluster runs this version regardless of postgresql.image. The chart fails
+    # at render time unless postgresql.majorVersion matches this. Bump this and
+    # tag together when moving to a repmgr image built for a new PG major.
+    majorVersion: "18"
 
   enabled: true
 

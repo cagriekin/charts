@@ -811,6 +811,38 @@ standalone_ok=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.replicaCount=0 2>&1) && standalone_ok_rc=0 || standalone_ok_rc=$?
 assert_eq "standalone replicas: render passes with replicaCount=0" "0" "${standalone_ok_rc}"
 
+# --- #133: repmgr-mode PostgreSQL major pinning Tests ---
+
+# In repmgr mode the server runs from the repmgr image, which bundles exactly
+# one PG major; postgresql.majorVersion/image.tag overrides cannot change it.
+# The chart must fail fast on a mismatch instead of crash-looping the extension
+# init container (extensions on) or silently running the wrong major (off).
+major_mismatch=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.majorVersion=17 \
+  --set postgresql.image.tag=pg17 2>&1) && major_mismatch_rc=0 || major_mismatch_rc=$?
+assert_eq "major pin: render fails when postgresql.majorVersion != repmgr image major (#133)" "1" "${major_mismatch_rc}"
+assert_contains "major pin: error names both values (#133)" "${major_mismatch}" "does not match repmgr.image.majorVersion"
+
+# default (18 == 18) renders
+major_default=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1) && major_default_rc=0 || major_default_rc=$?
+assert_eq "major pin: default 18==18 renders (#133)" "0" "${major_default_rc}"
+
+# a matched rebump to a hypothetical PG17 repmgr image renders (forward-compatible)
+major_rebump=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.majorVersion=17 \
+  --set repmgr.image.majorVersion=17 \
+  --show-only templates/statefulset.yaml 2>&1) && major_rebump_rc=0 || major_rebump_rc=$?
+assert_eq "major pin: matched repmgr.image.majorVersion rebump renders (#133)" "0" "${major_rebump_rc}"
+
+# the pin only applies in repmgr mode: standalone may run any major
+major_standalone=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false \
+  --set postgresql.replicaCount=0 \
+  --set postgresql.majorVersion=17 \
+  --set postgresql.image.tag=pg17 \
+  --show-only templates/statefulset.yaml 2>&1) && major_standalone_rc=0 || major_standalone_rc=$?
+assert_eq "major pin: standalone is unconstrained by repmgr image major (#133)" "0" "${major_standalone_rc}"
+
 # --- Primary Service selector Tests ---
 
 # Test: selector bootstraps to pod-0 when no live Service exists (lookup is
@@ -1097,10 +1129,13 @@ ext_share_count=$(printf '%s' "${extpaths_default}" | grep -c "/usr/share/postgr
 assert_eq "majorVersion default: three /usr/lib/postgresql/18/lib occurrences" "3" "${ext_lib_count}"
 assert_eq "majorVersion default: three /usr/share/postgresql/18/extension occurrences" "3" "${ext_share_count}"
 
-# Test: overriding majorVersion swaps every extension path, leaving no /18/
+# Test: overriding majorVersion swaps every extension path, leaving no /18/.
+# In repmgr mode the major pin (#133) requires repmgr.image.majorVersion to move
+# in lockstep, so set both to model a repmgr image rebuilt for the new major.
 extpaths_19=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --set postgresql.extensions.enabled=true \
   --set postgresql.majorVersion=19 \
+  --set repmgr.image.majorVersion=19 \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "majorVersion=19: ext-lib mountPath uses /usr/lib/postgresql/19/lib" "${extpaths_19}" "mountPath: /usr/lib/postgresql/19/lib"
 assert_contains "majorVersion=19: ext-share mountPath uses /usr/share/postgresql/19/extension" "${extpaths_19}" "mountPath: /usr/share/postgresql/19/extension"
@@ -1110,16 +1145,23 @@ assert_eq "majorVersion=19: three /usr/lib/postgresql/19/lib occurrences" "3" "$
 assert_eq "majorVersion=19: three /usr/share/postgresql/19/extension occurrences" "3" "${ext19_share_count}"
 assert_not_contains "majorVersion=19: no /18/ paths remain in statefulset" "${extpaths_19}" "postgresql/18/"
 
-# Test: empty majorVersion fails fast when extensions are enabled
-extpaths_empty=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+# Test: empty majorVersion fails fast when extensions are enabled. Run standalone
+# so this exercises the extensions `required` guard; the repmgr-major pin (#133)
+# would otherwise fire first in repmgr mode (covered by the major-pin tests).
+extpaths_empty=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false \
+  --set postgresql.replicaCount=0 \
   --set postgresql.extensions.enabled=true \
   --set postgresql.majorVersion= \
   --show-only templates/statefulset.yaml 2>&1) && extpaths_empty_rc=0 || extpaths_empty_rc=$?
 assert_eq "majorVersion empty: render fails when extensions enabled" "1" "${extpaths_empty_rc}"
 assert_contains "majorVersion empty: error names postgresql.majorVersion" "${extpaths_empty}" "postgresql.majorVersion is required"
 
-# Test: empty majorVersion is ignored while extensions stay disabled
-helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+# Test: empty majorVersion is ignored while extensions stay disabled (standalone;
+# in repmgr mode the major pin requires it to match the repmgr image major)
+helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false \
+  --set postgresql.replicaCount=0 \
   --set postgresql.majorVersion= \
   --show-only templates/statefulset.yaml >/dev/null 2>&1 && extpaths_off_rc=0 || extpaths_off_rc=$?
 assert_eq "majorVersion empty: render succeeds with extensions disabled" "0" "${extpaths_off_rc}"

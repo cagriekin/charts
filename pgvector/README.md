@@ -108,7 +108,7 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 | `postgresql.image.repository` | PostgreSQL image repository | `pgvector/pgvector` |
 | `postgresql.image.tag` | PostgreSQL image tag | `pg18-trixie` |
 | `postgresql.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `postgresql.majorVersion` | PostgreSQL major version in `image.tag`; builds the extension paths (`/usr/lib/postgresql/<major>/lib`, `/usr/share/postgresql/<major>/extension`) when `extensions.enabled=true` | `"18"` |
+| `postgresql.majorVersion` | PostgreSQL major version in `image.tag`; builds the extension paths (`/usr/lib/postgresql/<major>/lib`, `/usr/share/postgresql/<major>/extension`) when `extensions.enabled=true`. In repmgr mode the server runs from the repmgr image and is pinned to `repmgr.image.majorVersion` (currently `18`) regardless of `postgresql.image`; the chart fails to render if the two majors differ. | `"18"` |
 | `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1); values > 0 require `repmgr.enabled=true` | `1` |
 | `postgresql.database` | Database name | `postgres` |
 | `postgresql.username` | Database username | `postgres` |
@@ -188,6 +188,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 | `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
 | `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-7` |
 | `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
+| `repmgr.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Bump with `repmgr.image.tag` when moving to an image built for a new PG major. | `"18"` |
 | `repmgr.username` | Repmgr database user | `repmgr` |
 | `repmgr.database` | Repmgr database name | `repmgr` |
 | `repmgr.monitoringHistoryDays` | Days of `repmgr.monitoring_history` to retain; pruned daily on the primary via `repmgr cluster cleanup` | `7` |
