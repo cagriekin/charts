@@ -593,6 +593,28 @@ assert_contains "su #125: marker name is <fullname>-primary" "${sts_repmgr}" "te
 pg_cont=$(printf '%s\n' "${sts_repmgr}" | awk '/^        - name: postgresql$/{f=1; next} f && /^        - name: /{exit} f{print}')
 assert_contains "#170: postgresql container gets PRIMARY_MARKER (guard reads marker)" "${pg_cont}" "name: PRIMARY_MARKER"
 assert_contains "#170: postgresql container gets NAMESPACE" "${pg_cont}" "name: NAMESPACE"
+
+# --- #172: startupProbe absorbs the stale-primary guard's startup latency ---
+# The guard runs before postgres opens (up to ~147s with the REPMGR_NODE_COUNT
+# fallback) plus crash-recovery WAL replay, which can exceed the ~130s liveness
+# budget and crash-loop the pod. A startupProbe suspends liveness/readiness until
+# the first success, so a slow start is not killed mid-guard.
+assert_contains "#172: postgresql container has a startupProbe" "${pg_cont}" "startupProbe:"
+startup_block=$(printf '%s\n' "${pg_cont}" | awk '/startupProbe:/{f=1; next} f && /Probe:/{exit} f{print}')
+assert_contains "#172: startupProbe probes pg_isready" "${startup_block}" "pg_isready"
+# the startup budget (periodSeconds x failureThreshold) must comfortably cover
+# the worst-case guard latency plus crash recovery
+startup_period=$(printf '%s\n' "${startup_block}" | awk '/periodSeconds:/{print $2; exit}')
+startup_threshold=$(printf '%s\n' "${startup_block}" | awk '/failureThreshold:/{print $2; exit}')
+startup_budget=$(( ${startup_period:-0} * ${startup_threshold:-0} ))
+[ "$startup_budget" -ge 300 ] && budget172=ok || budget172="budget=${startup_budget}s (period=${startup_period:-?} threshold=${startup_threshold:-?})"
+assert_eq "#172: startup budget covers guard + crash-recovery worst case (>=300s)" "ok" "${budget172}"
+# gated on enabled: disabling removes the startupProbe but keeps liveness
+startup_off=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set postgresql.startupProbe.enabled=false --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#172: startupProbe omitted when disabled" "${startup_off}" "startupProbe:"
+assert_contains "#172: livenessProbe still present when startupProbe disabled" "${startup_off}" "livenessProbe:"
+
 # rbac grants configmap access for the marker
 rbac_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/rbac.yaml 2>&1)

@@ -471,6 +471,21 @@ spec:
                       sleep 1
                     done
 {{- end }}
+{{- if .Values.postgresql.startupProbe.enabled }}
+          # Holds off liveness/readiness until postgres first accepts
+          # connections, so the repmgr stale-primary guard's settle loop and
+          # crash-recovery WAL replay cannot be killed mid-startup by the
+          # liveness probe (#172). Steady-state liveness stays tight below.
+          startupProbe:
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            periodSeconds: {{ .Values.postgresql.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.postgresql.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.postgresql.startupProbe.failureThreshold }}
+{{- end }}
 {{- if .Values.postgresql.livenessProbe.enabled }}
           livenessProbe:
             exec:

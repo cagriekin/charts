@@ -62,6 +62,19 @@ postgresql:
     timeoutSeconds: 5
     failureThreshold: 6
 
+  # Suspends the liveness and readiness probes until PostgreSQL first accepts
+  # connections, so a slow start is not killed mid-startup by the liveness
+  # probe: the repmgr stale-primary guard's settle loop runs before postgres
+  # opens (up to ~147s if REPMGR_NODE_COUNT falls back to 10) and crash-recovery
+  # WAL replay can take longer still, both of which can exceed the ~130s
+  # liveness budget. failureThreshold x periodSeconds is the total startup
+  # budget (600s here); keep the steady-state livenessProbe window tight.
+  startupProbe:
+    enabled: true
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 60
+
   affinity: {}
 
   nodeSelector: {}
