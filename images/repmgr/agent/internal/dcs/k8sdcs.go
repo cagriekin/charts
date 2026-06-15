@@ -3,6 +3,7 @@ package dcs
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +22,10 @@ type K8sConfig struct {
 	LeaseDuration time.Duration
 	RenewDeadline time.Duration
 	RetryPeriod   time.Duration
+	// StepDownCooldown is how long a node suppresses re-contention after a
+	// voluntary Release, so a peer wins the freed lease instead of the stepping-down
+	// node immediately re-acquiring it. Defaults to 3*RetryPeriod when zero.
+	StepDownCooldown time.Duration
 }
 
 // K8sDCS implements DCS against a coordination.k8s.io/v1 Lease via client-go
@@ -31,6 +36,10 @@ type K8sDCS struct {
 	client   kubernetes.Interface
 	isLeader atomic.Bool
 	leader   atomic.Value // string
+
+	mu            sync.Mutex
+	stepDown      context.CancelFunc // cancels the current election iteration (set while contending/leading)
+	cooldownUntil time.Time          // suppress re-contention until this time (set by Release)
 }
 
 // NewK8sDCS builds a K8sDCS using the in-cluster config and ServiceAccount.
@@ -94,15 +103,63 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 	}
 
 	for ctx.Err() == nil {
+		// Respect a step-down cooldown so a peer wins a just-released lease before
+		// this node re-contends.
+		k.mu.Lock()
+		until := k.cooldownUntil
+		k.mu.Unlock()
+		if d := time.Until(until); d > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(d):
+			}
+		}
+
+		// A per-iteration context so Release can cancel just this election (releasing
+		// the lease via ReleaseOnCancel) without tearing down the agent.
+		elerCtx, cancel := context.WithCancel(ctx)
+		k.mu.Lock()
+		k.stepDown = cancel
+		k.mu.Unlock()
+
 		le, err := leaderelection.NewLeaderElector(lec)
 		if err != nil {
+			cancel()
 			return // config error (timings invalid); nothing to retry
 		}
-		le.Run(ctx) // blocks: acquire -> lead -> lose, then returns
+		le.Run(elerCtx) // blocks: acquire -> lead -> lose (or Release cancels), then returns
+		cancel()
+		k.mu.Lock()
+		k.stepDown = nil
+		k.mu.Unlock()
 		k.isLeader.Store(false)
+
 		select {
 		case <-ctx.Done():
+			return
 		case <-time.After(k.cfg.RetryPeriod):
 		}
+	}
+}
+
+// Release voluntarily steps down: it cancels the current election so the Lease is
+// released (client-go ReleaseOnCancel), and suppresses re-contention for the
+// step-down cooldown so a peer acquires the freed Lease instead of this node
+// immediately re-winning it. It is non-blocking; OnStoppedLeading (the synchronous
+// demote) runs in the Run goroutine as the election unwinds. Safe to call when not
+// leading (it still arms the cooldown). Used by the self-health and stale-winner
+// step-down paths.
+func (k *K8sDCS) Release() {
+	cd := k.cfg.StepDownCooldown
+	if cd <= 0 {
+		cd = 3 * k.cfg.RetryPeriod
+	}
+	k.mu.Lock()
+	k.cooldownUntil = time.Now().Add(cd)
+	cancel := k.stepDown
+	k.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }

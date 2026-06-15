@@ -294,10 +294,16 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		return a.sup.Start(ctx)
 
 	case reconcile.ReleaseLease:
-		// Step down: demote and let the next leadership cycle re-evaluate (with
-		// Parallel pod management + the marker guard, the legitimate node wins).
-		a.metr.IncDemote()
-		return a.sup.Demote(ctx, false)
+		// Step down: release the Lease so a peer can take over (stale-winner handoff
+		// at cold boot, or self-health failover). Only stop postgres if we were
+		// serving read-write; a standby is already read-only, so releasing the Lease
+		// is enough and we avoid churning its postmaster.
+		a.dcs.Release()
+		if obs.Local.Running && !obs.Local.InRecovery {
+			a.metr.IncDemote()
+			return a.sup.Demote(ctx, false)
+		}
+		return nil
 
 	case reconcile.StartLocal:
 		// Bring an initialized-but-stopped node up in its on-disk role. The decision

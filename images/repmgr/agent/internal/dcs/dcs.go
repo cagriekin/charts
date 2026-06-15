@@ -17,6 +17,11 @@ type DCS interface {
 	IsLeader() bool
 	// Leader returns the last-observed holder identity (for followers), or "".
 	Leader() string
+	// Release voluntarily steps down from leadership (releasing the lock) and
+	// suppresses re-contention briefly so a peer can take over. Non-blocking; a
+	// no-op-safe call when not currently the leader. Backs the self-health and
+	// stale-winner step-down paths.
+	Release()
 }
 
 // Callbacks fire on leadership transitions. OnLost MUST complete its work
