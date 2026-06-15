@@ -387,7 +387,13 @@ spec:
                     done
 {{- else }}
           lifecycle:
+{{- /* In agent mode the agent is PID 1 and owns SIGTERM shutdown (release the
+       Lease, then stop its postgres child). A preStop pg_ctl stop would race the
+       supervisor and stop postgres before the Lease is released, so the
+       repmgrd-tuned preStop is gated to repmgrd mode. */}}
+{{- if eq (include "pg.repmgrdMode" .) "true" }}
 {{- include "pg.preStop" . | nindent 12 }}
+{{- end }}
             postStart:
               exec:
                 command:
