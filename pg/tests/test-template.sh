@@ -862,7 +862,11 @@ pgbackrest_pg_container=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}
 assert_contains "pgbackrest: postgresql mounts pg-run" "${pgbackrest_pg_container}" "pg-run"
 assert_contains "pgbackrest: sidecar mounts pg-run" "${pgbackrest_sidecar}" "pg-run"
 
-# pgBackRest: works without repmgr (standalone)
+# #142: pgbackrest requires repmgr -- the pgbackrest binary and archive_command
+# run in the postgresql container, which is the plain postgres image (no
+# pgbackrest) in standalone mode, so WAL archiving would fail every segment and
+# backups time out. Previously the chart rendered a standalone pgbackrest
+# sidecar that could never archive; it now fails fast at render time.
 pgbackrest_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set pgbackrest.enabled=true \
   --set pgbackrest.s3.endpoint=https://s3.test \
@@ -870,9 +874,9 @@ pgbackrest_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set pgbackrest.existingSecret.name=test-secret \
   --set repmgr.enabled=false \
   --set postgresql.replicaCount=0 \
-  --show-only templates/statefulset.yaml 2>&1)
-assert_contains "pgbackrest standalone: sidecar present" "${pgbackrest_standalone}" "name: pgbackrest"
-assert_not_contains "pgbackrest standalone: no repmgrd container" "${pgbackrest_standalone}" "repmgrd"
+  --show-only templates/statefulset.yaml 2>&1) && pgbr_sa_rc=0 || pgbr_sa_rc=$?
+assert_eq "#142: pgbackrest without repmgr fails fast" "1" "${pgbr_sa_rc}"
+assert_contains "#142: error names the repmgr requirement" "${pgbackrest_standalone}" "pgbackrest.enabled requires repmgr.enabled=true"
 
 # pgBackRest: coexists with repmgr
 assert_contains "pgbackrest+repmgr: sidecar present" "${pgbackrest_sts}" "name: pgbackrest"
