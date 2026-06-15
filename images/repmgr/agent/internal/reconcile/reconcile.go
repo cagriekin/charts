@@ -25,11 +25,12 @@ const (
 	DemoteFence              // read-write without the lease: demote now (soft fence)
 	RejoinForward            // local data behind Target's newer timeline: rewind forward
 	ReleaseLease             // holds lease but must not serve (stale/behind): release + step down
+	StartLocal               // initialized but stopped, and safe to start in its on-disk role
 )
 
 func (a Action) String() string {
 	return [...]string{"NoOp", "Wait", "BootstrapInitdb", "BootstrapClone", "Promote",
-		"StayPrimary", "Follow", "DemoteFence", "RejoinForward", "ReleaseLease"}[a]
+		"StayPrimary", "Follow", "DemoteFence", "RejoinForward", "ReleaseLease", "StartLocal"}[a]
 }
 
 // Decision is the chosen action plus the peer it targets and a human reason for
@@ -126,7 +127,15 @@ func Decide(o Observation) Decision {
 			if newer != nil {
 				return d(RejoinForward, newer.Name, "lease holder has data on an older timeline; rejoin forward before starting (never start stale data read-write)")
 			}
-			return d(Wait, "", "has data but not running; start, then reassess next tick")
+			if !o.Local.InRecovery {
+				// On-disk primary state: starting comes up read-write, so apply the
+				// highwater guard first (#125/#171/#173/#174) -- never start stale data
+				// read-write even as the lease holder.
+				if bad, why := unsafeToServe(o); bad {
+					return d(ReleaseLease, "", "stopped primary-state data must not start read-write: "+why)
+				}
+			}
+			return d(StartLocal, "", "lease holder, initialized but stopped: start (role per on-disk data)")
 		}
 	}
 
@@ -154,8 +163,36 @@ func Decide(o Observation) Decision {
 		if newer != nil {
 			return d(RejoinForward, newer.Name, "has data on an older timeline; rejoin forward, then follow")
 		}
-		return d(Wait, "", "has data, not running; start as a standby")
+		if !o.Local.InRecovery {
+			// On-disk primary state without the lease. Never start read-write -- it
+			// would come up primary, then be fenced next tick (the flap). Rejoin a
+			// same-timeline live primary as a standby if one exists (split-brain
+			// recovery; pg_rewind/reclone handles the divergence), else hold.
+			if p := sameTimelinePrimary(o); p != nil {
+				return d(RejoinForward, p.Name, "stopped primary-state data without the lease; a same-timeline primary exists, rejoin it as a standby")
+			}
+			return d(Wait, "", "stopped primary-state data without the lease and no rejoin target; hold (never start read-write)")
+		}
+		return d(StartLocal, "", "standby-state data, stopped: start as a standby")
 	}
+}
+
+// sameTimelinePrimary returns a reachable live primary on exactly the local
+// timeline, or nil. It is the rejoin target for a stopped primary-state non-holder
+// (a strictly-newer primary is handled earlier by newestPrimaryAbove; a primary on
+// a lower timeline is stale and must never be a rejoin source -- forward-only,
+// invariant 5).
+func sameTimelinePrimary(o Observation) *PeerState {
+	if !o.Local.TimelineOK {
+		return nil
+	}
+	for i := range o.Peers {
+		p := &o.Peers[i]
+		if p.Reachable && p.Role == pg.RolePrimary && p.TimelineOK && p.Timeline == o.Local.Timeline {
+			return p
+		}
+	}
+	return nil
 }
 
 // unsafeToServe ports the evaluate_lone_primary guard (#171/#173/#174): refuse to

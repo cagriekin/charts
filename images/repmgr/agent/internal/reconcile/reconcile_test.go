@@ -20,7 +20,10 @@ func TestDecide(t *testing.T) {
 	localStandby := LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: ls(5, 0x100), LSNOK: true}
 	localPrimary := LocalState{HasData: true, Running: true, InRecovery: false, Timeline: tl(5), TimelineOK: true, LSN: ls(5, 0x100), LSNOK: true}
 	emptyData := LocalState{HasData: false, Running: false}
+	// stopped nodes carry their timeline/role from pg_controldata (see observe());
+	// dataStopped is on-disk primary state, dataStoppedStandby is on-disk standby state.
 	dataStopped := LocalState{HasData: true, Running: false, Timeline: tl(5), TimelineOK: true}
+	dataStoppedStandby := LocalState{HasData: true, Running: false, InRecovery: true, Timeline: tl(5), TimelineOK: true}
 
 	cases := []struct {
 		name       string
@@ -47,6 +50,22 @@ func TestDecide(t *testing.T) {
 		{"not holder + empty + leader primary -> clone from leader", Observation{HoldLease: false, Local: emptyData, LeaderIdentity: "pg-0", Peers: []PeerState{primary("pg-0", 5, 5, 0x100)}}, BootstrapClone, "pg-0"},
 		{"not holder + empty + no primary -> wait", Observation{HoldLease: false, Local: emptyData}, Wait, ""},
 		{"not holder + data stopped + newer primary -> rejoin forward", Observation{HoldLease: false, Local: dataStopped, Peers: []PeerState{primary("pg-1", 6, 6, 0x10)}}, RejoinForward, "pg-1"},
+
+		// --- stopped-node start gating (controldata-driven; the flap fix) ---
+		// Holder, primary-state data stopped, nothing newer, at/above highwater: safe to start.
+		{"holder + primary-state stopped + safe -> start", Observation{HoldLease: true, Local: dataStopped}, StartLocal, ""},
+		// Holder, primary-state data stopped, below the recorded highwater: must not start RW.
+		{"holder + primary-state stopped + below highwater -> release", Observation{HoldLease: true, Local: dataStopped, Marker: MarkerState{Present: true, Timeline: tl(6)}}, ReleaseLease, ""},
+		// Holder, standby-state data stopped: start as a standby (promotes a later tick).
+		{"holder + standby-state stopped -> start", Observation{HoldLease: true, Local: dataStoppedStandby}, StartLocal, ""},
+		// Non-holder, primary-state data stopped, no rejoin target: HOLD (never start RW -> the flap).
+		{"not holder + primary-state stopped + no primary -> hold", Observation{HoldLease: false, Local: dataStopped}, Wait, ""},
+		// Non-holder, primary-state data stopped, a same-timeline primary exists: rejoin it as a standby.
+		{"not holder + primary-state stopped + same-tl primary -> rejoin", Observation{HoldLease: false, Local: dataStopped, Peers: []PeerState{primary("pg-1", 5, 5, 0x200)}}, RejoinForward, "pg-1"},
+		// Non-holder, standby-state data stopped: start as a standby.
+		{"not holder + standby-state stopped -> start", Observation{HoldLease: false, Local: dataStoppedStandby}, StartLocal, ""},
+		// A stale primary on a LOWER timeline is never a rejoin source (forward-only, invariant 5): hold.
+		{"not holder + primary-state stopped + lower-tl primary -> hold", Observation{HoldLease: false, Local: dataStopped, Peers: []PeerState{primary("pg-1", 4, 4, 0x10)}}, Wait, ""},
 	}
 
 	for _, c := range cases {

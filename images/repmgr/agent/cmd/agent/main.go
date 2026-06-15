@@ -31,9 +31,10 @@ import (
 )
 
 const (
-	metricsAddr = ":9200"
-	pgBindir    = "/usr/lib/postgresql/18/bin"
-	repmgrConf  = "/etc/repmgr/repmgr.conf"
+	metricsAddr      = ":9200"
+	pgBindir         = "/usr/lib/postgresql/18/bin"
+	pgControlDataBin = pgBindir + "/pg_controldata"
+	repmgrConf       = "/etc/repmgr/repmgr.conf"
 )
 
 func main() {
@@ -168,9 +169,23 @@ func (a *agent) boot(ctx context.Context) error {
 	if err := a.mech.GenerateConfig(ctx, nid, mechanism.ConfigOpts{Failover: "manual", UseReplicationSlots: true}); err != nil {
 		return err
 	}
-	if process.HasData(a.cfg.PGDATA) {
+	if !process.HasData(a.cfg.PGDATA) {
+		return nil
+	}
+	// Only bring up data that is safe to start regardless of holdership: a
+	// standby-state node comes up in recovery and follows its upstream. Primary-state
+	// data is deferred to the reconcile loop, which starts it (StartLocal) only when
+	// this node holds the lease and passes the highwater guard -- otherwise a fenced
+	// ex-primary would come up read-write before the lease state is known and flap.
+	cd, err := pg.ReadControlData(ctx, pg.OSExec{}, pgControlDataBin, a.cfg.PGDATA)
+	if err != nil {
+		a.log.Warn("boot: read pg_controldata; deferring start to reconcile", "err", err)
+		return nil
+	}
+	if cd.InRecovery {
 		return a.sup.Start(ctx)
 	}
+	a.log.Info("boot: on-disk primary state; deferring start until reconcile confirms holdership + highwater", "state", cd.State)
 	return nil
 }
 
@@ -190,18 +205,31 @@ func (a *agent) tick(ctx context.Context) {
 
 func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	local := a.prober.Probe(ctx, a.selfConn())
+	ls := reconcile.LocalState{
+		HasData:    process.HasData(a.cfg.PGDATA),
+		Running:    local.Reachable,
+		InRecovery: local.Role == pg.RoleStandby,
+		Timeline:   local.Timeline,
+		TimelineOK: local.TimelineOK,
+		LSN:        local.WriteLSN,
+		LSNOK:      local.LSNOK,
+	}
+	// When postgres is not running its timeline/role are unreadable via SQL. Fall
+	// back to pg_controldata so the forward-rejoin and highwater guards still apply
+	// to a stopped node (without this a fenced primary-state node has no timeline,
+	// is started read-write, and immediately fences -- the flap).
+	if !ls.Running && ls.HasData {
+		if cd, err := pg.ReadControlData(ctx, pg.OSExec{}, pgControlDataBin, a.cfg.PGDATA); err != nil {
+			a.log.Warn("read pg_controldata", "err", err)
+		} else {
+			ls.Timeline, ls.TimelineOK = cd.Timeline, cd.TimelineOK
+			ls.InRecovery = cd.InRecovery
+		}
+	}
 	o := reconcile.Observation{
 		HoldLease:      a.dcs.IsLeader(),
 		LeaderIdentity: a.dcs.Leader(),
-		Local: reconcile.LocalState{
-			HasData:    process.HasData(a.cfg.PGDATA),
-			Running:    local.Reachable,
-			InRecovery: local.Role == pg.RoleStandby,
-			Timeline:   local.Timeline,
-			TimelineOK: local.TimelineOK,
-			LSN:        local.WriteLSN,
-			LSNOK:      local.LSNOK,
-		},
+		Local:          ls,
 	}
 	for i := 0; i < a.cfg.NodeCount; i++ {
 		name := a.base + "-" + strconv.Itoa(i)
@@ -271,13 +299,21 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		a.metr.IncDemote()
 		return a.sup.Demote(ctx, false)
 
-	case reconcile.Wait, reconcile.NoOp, reconcile.BootstrapInitdb:
-		// Bring an initialized-but-stopped node up (it will come up as primary or
-		// standby per its data); otherwise inert. (Fresh-node initdb is done by the
-		// entrypoint before the agent starts.)
+	case reconcile.StartLocal:
+		// Bring an initialized-but-stopped node up in its on-disk role. The decision
+		// table only chooses StartLocal when this is safe (holder + highwater-ok for
+		// primary-state data, or any standby-state data); a non-holder's primary-state
+		// data is routed to RejoinForward/Wait instead, never started read-write here.
 		if !obs.Local.Running && obs.Local.HasData {
 			return a.sup.Start(ctx)
 		}
+		return nil
+
+	case reconcile.Wait, reconcile.NoOp, reconcile.BootstrapInitdb:
+		// Inert: never auto-start here. Starting a stopped node is an explicit
+		// StartLocal decision so primary-state data is never brought up read-write
+		// without passing the holdership/highwater guard (fresh-node initdb is done by
+		// the entrypoint before the agent starts).
 		return nil
 	}
 	return nil
