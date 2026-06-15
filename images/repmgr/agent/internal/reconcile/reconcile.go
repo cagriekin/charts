@@ -1,0 +1,265 @@
+// Package reconcile is the agent's brain: a pure function from an Observation of
+// the world to a single Decision. It holds no state and performs no I/O, so it is
+// exhaustively unit-testable and an agent crash mid-action recovers by simply
+// re-observing and re-deciding (the crash-consistency property, Part H3).
+//
+// The Lease is the sole authority for who MAY be primary; these rules add the
+// data-safety gates the Lease cannot express (most-advanced election, forward-only
+// rewind, the stale-winner/highwater guard) so a node never serves or discards
+// committed data incorrectly.
+package reconcile
+
+import "github.com/cagriekin/pg-ha-agent/internal/pg"
+
+// Action is what the agent should do this tick.
+type Action int
+
+const (
+	NoOp              Action = iota
+	Wait                     // observe again; take no destructive action
+	BootstrapInitdb          // empty data + lease + no live primary: initdb as primary
+	BootstrapClone           // empty data + not the chosen primary: clone from Target
+	Promote                  // standby holds lease, caught up & most-advanced: promote
+	StayPrimary              // holds lease, already a current primary: assert routing only
+	Follow                   // not holder, standby: follow Target (the leader)
+	DemoteFence              // read-write without the lease: demote now (soft fence)
+	RejoinForward            // local data behind Target's newer timeline: rewind forward
+	ReleaseLease             // holds lease but must not serve (stale/behind): release + step down
+)
+
+func (a Action) String() string {
+	return [...]string{"NoOp", "Wait", "BootstrapInitdb", "BootstrapClone", "Promote",
+		"StayPrimary", "Follow", "DemoteFence", "RejoinForward", "ReleaseLease"}[a]
+}
+
+// Decision is the chosen action plus the peer it targets and a human reason for
+// the audit trail (Part H6).
+type Decision struct {
+	Action Action
+	Target string
+	Reason string
+}
+
+func d(a Action, target, reason string) Decision { return Decision{Action: a, Target: target, Reason: reason} }
+
+// LocalState is the local node's state. Timeline comes from pg_controldata when the
+// node is not a running primary (so it is meaningful even for a stopped/standby node).
+type LocalState struct {
+	HasData    bool
+	Running    bool
+	InRecovery bool
+	Timeline   pg.Timeline
+	TimelineOK bool
+	LSN        pg.LSN
+	LSNOK      bool
+}
+
+// PeerState is a reachable sibling's observed state (from pg.Probe).
+type PeerState struct {
+	Name       string
+	Reachable  bool
+	Role       pg.Role
+	Timeline   pg.Timeline
+	TimelineOK bool
+	LSN        pg.LSN
+	LSNOK      bool
+}
+
+// MarkerState is the durable highwater marker (<fullname>-primary).
+type MarkerState struct {
+	Present   bool
+	Malformed bool // #174: present but unparseable -> fail closed
+	Timeline  pg.Timeline
+}
+
+// Observation is the full input to a decision.
+type Observation struct {
+	HoldLease      bool
+	Paused         bool   // maintenance mode (Part H1): suspend automatic promote/demote/fence
+	LeaderIdentity string // current lease holder (for followers); "" if unknown
+	Local          LocalState
+	Peers          []PeerState
+	Marker         MarkerState
+}
+
+// Decide maps an Observation to the single action to take.
+func Decide(o Observation) Decision {
+	if o.Paused {
+		return d(NoOp, "", "paused: automatic failover suspended (maintenance mode)")
+	}
+
+	newer := newestPrimaryAbove(o) // reachable live primary on a strictly newer timeline than local
+
+	if o.HoldLease {
+		switch {
+		case !o.Local.HasData && !o.Local.Running:
+			if p := anyReachablePrimary(o.Peers); p != nil {
+				return d(BootstrapClone, p.Name, "hold lease but a live primary exists; clone, never initdb (avoids a divergent cluster)")
+			}
+			if o.Marker.Present || o.Marker.Malformed {
+				return d(Wait, "", "empty data with a marker present; settle before initdb (PVC-loss recreate, #170)")
+			}
+			return d(BootstrapInitdb, "", "empty data, lease holder, fresh install: initdb as primary")
+
+		case o.Local.Running && o.Local.InRecovery:
+			if newer != nil {
+				return d(RejoinForward, newer.Name, "standby holds lease but a peer is on a newer timeline; rejoin forward before promoting")
+			}
+			if bad, why := unsafeToServe(o); bad {
+				return d(ReleaseLease, "", "refuse to promote: "+why)
+			}
+			if t := moreAdvancedPeer(o); t != "" {
+				return d(ReleaseLease, t, "a peer has more WAL on the same timeline; release so the most-advanced node promotes (invariant 8)")
+			}
+			return d(Promote, "", "standby holds lease, caught up and most-advanced: promote")
+
+		case o.Local.Running && !o.Local.InRecovery:
+			if newer != nil {
+				return d(RejoinForward, newer.Name, "primary holds lease but a peer is on a newer timeline (anomaly); demote and rejoin")
+			}
+			if bad, why := unsafeToServe(o); bad {
+				return d(ReleaseLease, "", "primary must not serve: "+why)
+			}
+			return d(StayPrimary, "", "primary holds lease and is current")
+
+		default: // has data, not running
+			return d(Wait, "", "has data but not running; start, then reassess next tick")
+		}
+	}
+
+	// Non-holder.
+	switch {
+	case o.Local.Running && !o.Local.InRecovery:
+		return d(DemoteFence, "", "read-write without the lease; demote now (soft fence)")
+
+	case o.Local.Running && o.Local.InRecovery:
+		if o.LeaderIdentity == "" {
+			return d(Wait, "", "standby but no known leader; keep the current upstream")
+		}
+		return d(Follow, o.LeaderIdentity, "standby; follow the lease holder")
+
+	case !o.Local.HasData && !o.Local.Running:
+		if p := primaryNamed(o, o.LeaderIdentity); p != nil {
+			return d(BootstrapClone, p.Name, "empty data; clone from the lease holder")
+		}
+		if p := anyReachablePrimary(o.Peers); p != nil {
+			return d(BootstrapClone, p.Name, "empty data; clone from the live primary")
+		}
+		return d(Wait, "", "empty data, no reachable primary yet; wait (never initdb as a non-holder)")
+
+	default: // has data, not running
+		if newer != nil {
+			return d(RejoinForward, newer.Name, "has data on an older timeline; rejoin forward, then follow")
+		}
+		return d(Wait, "", "has data, not running; start as a standby")
+	}
+}
+
+// unsafeToServe ports the evaluate_lone_primary guard (#171/#173/#174): refuse to
+// promote/serve when the marker is malformed, the local timeline is unreadable
+// (even with no marker), the local timeline is below the highwater, or a different
+// node shares the marker timeline (equal-timeline split-brain with no LSN to compare).
+func unsafeToServe(o Observation) (bool, string) {
+	if o.Marker.Malformed {
+		return true, "marker malformed (#174)"
+	}
+	if !o.Local.TimelineOK {
+		return true, "local timeline unreadable (#173)"
+	}
+	if o.Marker.Present {
+		if o.Local.Timeline < o.Marker.Timeline {
+			return true, "timeline below recorded highwater (#125)"
+		}
+		if o.Local.Timeline == o.Marker.Timeline {
+			for _, p := range o.Peers {
+				if p.Reachable && p.Role == pg.RolePrimary && p.TimelineOK && p.Timeline == o.Marker.Timeline {
+					return true, "another node shares the marker timeline (#171 equal-timeline split-brain)"
+				}
+			}
+		}
+	}
+	return false, ""
+}
+
+// newestPrimaryAbove returns the reachable live primary on the highest timeline
+// strictly above the local timeline, or nil. Used for forward-only rejoin.
+func newestPrimaryAbove(o Observation) *PeerState {
+	if !o.Local.TimelineOK {
+		return nil
+	}
+	var best *PeerState
+	for i := range o.Peers {
+		p := &o.Peers[i]
+		if !p.Reachable || p.Role != pg.RolePrimary || !p.TimelineOK {
+			continue
+		}
+		if p.Timeline <= o.Local.Timeline {
+			continue
+		}
+		if best == nil || p.Timeline > best.Timeline {
+			best = p
+		}
+	}
+	return best
+}
+
+func anyReachablePrimary(peers []PeerState) *PeerState {
+	for i := range peers {
+		if peers[i].Reachable && peers[i].Role == pg.RolePrimary {
+			return &peers[i]
+		}
+	}
+	return nil
+}
+
+func primaryNamed(o Observation, name string) *PeerState {
+	if name == "" {
+		return nil
+	}
+	for i := range o.Peers {
+		if o.Peers[i].Name == name && o.Peers[i].Reachable && o.Peers[i].Role == pg.RolePrimary {
+			return &o.Peers[i]
+		}
+	}
+	return nil
+}
+
+// moreAdvancedPeer returns the name of a reachable peer strictly ahead of the
+// local node (higher timeline, or same timeline + higher LSN), or "". This is the
+// handoff target when the lease holder is not the most-advanced replica.
+func moreAdvancedPeer(o Observation) string {
+	best := ""
+	var bestTL pg.Timeline
+	var bestLSN pg.LSN
+	for i := range o.Peers {
+		p := &o.Peers[i]
+		if !p.Reachable {
+			continue
+		}
+		if !peerAhead(*p, o.Local) {
+			continue
+		}
+		if best == "" || ahead(p.Timeline, p.TimelineOK, p.LSN, p.LSNOK, bestTL, true, bestLSN, true) {
+			best, bestTL, bestLSN = p.Name, p.Timeline, p.LSN
+		}
+	}
+	return best
+}
+
+func peerAhead(p PeerState, l LocalState) bool {
+	return ahead(p.Timeline, p.TimelineOK, p.LSN, p.LSNOK, l.Timeline, l.TimelineOK, l.LSN, l.LSNOK)
+}
+
+// ahead reports whether (aTL,aLSN) ranks strictly above (bTL,bLSN): timeline
+// dominates, then LSN. Unknown timelines fall through to an LSN comparison.
+func ahead(aTL pg.Timeline, aTLok bool, aLSN pg.LSN, aLSNok bool, bTL pg.Timeline, bTLok bool, bLSN pg.LSN, bLSNok bool) bool {
+	if aTLok && bTLok {
+		if aTL != bTL {
+			return aTL > bTL
+		}
+	}
+	if aLSNok && bLSNok {
+		return aLSN.Greater(bLSN)
+	}
+	return false
+}
