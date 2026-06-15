@@ -1,5 +1,95 @@
 # pgvector chart changelog
 
+## 0.6.90
+
+Bundles the stale-primary/HA hardening, operational fixes, fail-fast
+validation, and RBAC scoping accumulated since 0.6.89. The repmgr image is
+now `trixie-5.5.0-15`.
+
+### Fixed
+
+- WAL-filename timeline is decoded as hexadecimal, not a decimal `::int`
+  cast that errored at timeline `0x0A` and was wrong from `0x10` — this had
+  silently broken the whole stale-primary family past ~10 failovers (#168).
+- Split-brain handling in the default `log` mode re-asserts the write
+  selector toward the highest-timeline primary every tick, restoring the
+  ArgoCD self-heal during a split-brain window (#169).
+- A failed `pg_rewind` rejoin preserves the diverged data (moved aside)
+  before re-cloning, instead of wiping PGDATA ahead of the clone (#175).
+- The empty-data stale-primary guard only settles/retries the peer scan on a
+  PVC-loss recreate (gated on the durable primary marker), adding no latency
+  on a genuine first install; the settle breaks only on a confirmed active
+  primary and the marker lookup is time-bounded (#170).
+- The lone-primary marker guard fails closed: an equal-timeline different-node
+  split-brain is refused rather than overwriting the marker (#171); an
+  unreadable timeline holds the current selector even before the marker
+  exists (#173); a corrupt non-numeric marker timeline is treated as an error,
+  not as "no marker" (#174).
+- Readonly-Service pods are labeled `pg-role=standby` only when actually in
+  recovery; a reachable non-master that is not in recovery (a stale/divergent
+  primary) is labeled `orphan` and kept out of read traffic (#140).
+- `postStart` `additionalCommands` reach the discovered primary in repmgr mode
+  (`PGPASSWORD` exported for the cross-pod connection; `PGHOST` exported as its
+  own statement), fixing the automatic `CREATE EXTENSION vector` and any user
+  DDL that was a silent no-op (#127).
+- Disabling pgbackrest after install neutralizes the persisted `archive_mode` /
+  `archive_command`, preventing a permanently failing `archive_command` from
+  blocking WAL recycling and filling the data PVC (#132).
+- The service-updater seeds `LAST_MASTER` from the live write-Service selector,
+  so it no longer rollout-restarts PGPool (severing pooled connections) on
+  every install/upgrade/sidecar restart with no actual failover (#138).
+- repmgr-mode `postgresql.pgHba` entries are inserted above the image's network
+  catch-all rules (first-match-wins), not appended at EOF where they were
+  unreachable (#144).
+- The PGPool NetworkPolicy opens the metrics scrape port 9719 when
+  `pgpool.metrics.enabled`, and `networkPolicy.*.extraIngress` entries are full
+  ingress rules so they can open ports other than 5432 (#135, #136).
+- `postgresql` egress to PGPool's backend port 9999 is allowed so the
+  service-updater health check no longer perpetually rollout-restarts PGPool
+  (#129).
+- Backups render with `pgbackrest`/scheduled `pg_dump` enabled: the missing
+  `backup.mc` image and the backup container securityContexts no longer produce
+  a nil-pointer at template time (#126).
+
+### Added
+
+- A `startupProbe` on the PostgreSQL container suspends liveness/readiness until
+  PostgreSQL first accepts connections, so the stale-primary guard settle and
+  crash-recovery WAL replay cannot be killed mid-startup into a CrashLoopBackOff
+  (`postgresql.startupProbe.*`, #172, #141).
+- `repmgr.image.majorVersion` declares the PostgreSQL major bundled in the
+  repmgr image; a `postgresql.majorVersion` mismatch now fails at render in
+  repmgr mode rather than crash-looping or silently running the wrong major
+  (#133).
+
+### Security
+
+- The repmgr Role's `pods` `get`/`patch` are scoped to the StatefulSet pod
+  names and `delete` is granted only in fence mode (`list` stays unscoped), so a
+  leaked ServiceAccount token cannot manipulate arbitrary namespace pods (#154).
+- The pgbackrest Role's `pods`/`pods/exec` are scoped to the StatefulSet pod
+  names instead of namespace-wide (#134).
+- `global.annotations` render under `metadata.annotations`, not `labels`, so
+  non-label-safe values no longer break apply and reach annotation consumers
+  (#128).
+
+### Fail-fast validation
+
+- `postgresql.existingSecret.enabled=true` with an empty name fails at render
+  instead of producing an empty `secretKeyRef.name` (#137).
+- `pgbackrest.enabled` with `repmgr.enabled=false` fails at render: the
+  pgbackrest binary and `archive_command` run in the postgresql container, which
+  is the plain postgres image in standalone mode (#142).
+
+## Migrating from 0.6.89
+
+`helm upgrade my-release cagriekin/pgvector` with image
+`cagriekin/repmgr:trixie-5.5.0-15` is the migration; PostgreSQL pods roll once
+for the new image tag, the new `startupProbe`, and the RBAC scoping. Note that
+the new fail-fast guards (#133, #137, #142) reject previously-accepted but
+broken configurations at render time — if an upgrade now fails to template,
+the error message names the offending value.
+
 ## 0.6.89
 
 ### Fixed
