@@ -25,12 +25,29 @@ rules:
     resources: ["services"]
     resourceNames: ["{{ include "pg.fullname" . }}"]
     verbs: ["get", "patch"]
-  {{- /* delete: split-brain fencing; get/list/patch: pg-role labeling for the
-         readonly Service. resourceNames cannot scope `list`, so the rule
-         stays unscoped. */}}
+  {{- /* list cannot be resourceName-scoped (the object name is not known at
+         authorization time); it is read-only enumeration of the pg pods for
+         pg-role labeling. */}}
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "patch", "delete"]
+    verbs: ["list"]
+  {{- /* get/patch (pg-role labeling for the readonly Service) and, only in fence
+         mode, delete (split-brain fencing) are scoped to the chart's own
+         StatefulSet pods <fullname>-0..N, so a leaked SA token cannot patch or
+         delete arbitrary namespace pods. delete is withheld unless
+         splitBrainDetection.action=fence, where it is actually exercised (#154). */}}
+  - apiGroups: [""]
+    resources: ["pods"]
+    resourceNames:
+      {{- range $i := until (int (add .Values.postgresql.replicaCount 1)) }}
+      - {{ printf "%s-%d" (include "pg.fullname" $) $i | quote }}
+      {{- end }}
+    verbs:
+      - "get"
+      - "patch"
+      {{- if eq .Values.repmgr.splitBrainDetection.action "fence" }}
+      - "delete"
+      {{- end }}
   # core/v1 Events emitted by service-updater on primary failover.
   # resourceNames cannot restrict create: the object name is not known at
   # authorization time.
