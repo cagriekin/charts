@@ -763,6 +763,33 @@ seed_absent=$(MASTER_SERVICE=svc NAMESPACE=ns bash -c 'kubectl() { return 1; }; 
 assert_eq "#138: seeds empty when no selector exists yet" "" "${seed_absent}"
 rm -f "${seed_file}"
 
+# #140: a non-master pod may be labeled pg-role=standby (and thus join the
+# readonly Service) only when it is actually in recovery. A reachable non-master
+# that is NOT in recovery is a stale/divergent primary -> pg-role=orphan (kept
+# out of reads); an unreachable pod is left untouched. Extract the function and
+# drive it with stubbed kubectl/psql.
+printf '%s' "${su_cm}" | python3 -c "import sys,yaml;[sys.stdout.write(d['data']['service-updater.sh']) for d in yaml.safe_load_all(sys.stdin) if d and d.get('kind')=='ConfigMap' and 'service-updater.sh' in d.get('data',{})]" > "${SCRIPT_DIR}/.uprl_render.sh"
+sed -n '/^update_pod_role_labels() {/,/^}/p' "${SCRIPT_DIR}/.uprl_render.sh" > "${SCRIPT_DIR}/.uprl_fn.sh"
+uprl_out=$(bash -c '
+  source "'"${SCRIPT_DIR}"'/.uprl_fn.sh"
+  NAMESPACE=ns HEADLESS_SERVICE=hl REPMGR_USER=r REPMGR_PASSWORD=x REPMGR_DB=d
+  timeout() { shift; "$@"; }
+  kubectl() { case "$1" in
+      get)   printf "pg-0 primary\npg-1 orphan\npg-2 standby\npg-3 standby\n" ;;
+      label) echo "label ${3}=${6}" ;;
+    esac ; }
+  psql() { local h=""; while [ $# -gt 0 ]; do [ "$1" = "-h" ] && h="$2"; shift; done
+    case "$h" in *pg-1.*) echo t;; *pg-2.*) echo f;; *pg-3.*) return 1;; esac ; }
+  update_pod_role_labels pg-0
+')
+echo "${uprl_out}" | grep -q "label pg-1=pg-role=standby" && uprl_a=ok || uprl_a=no
+echo "${uprl_out}" | grep -q "label pg-2=pg-role=orphan"  && uprl_b=ok || uprl_b=no
+echo "${uprl_out}" | grep -q "label pg-3="                && uprl_c=no || uprl_c=ok
+assert_eq "#140: in-recovery non-master labeled standby" "ok" "${uprl_a}"
+assert_eq "#140: not-in-recovery non-master labeled orphan (kept out of reads)" "ok" "${uprl_b}"
+assert_eq "#140: unreachable non-master left untouched" "ok" "${uprl_c}"
+rm -f "${SCRIPT_DIR}/.uprl_render.sh" "${SCRIPT_DIR}/.uprl_fn.sh"
+
 # Test: repmgr disabled does not render preStop or terminationGracePeriodSeconds
 assert_not_contains "minimal: no preStop hook" "${minimal}" "preStop:"
 assert_not_contains "minimal: no terminationGracePeriodSeconds" "${minimal}" "terminationGracePeriodSeconds"
