@@ -2,7 +2,7 @@ apiVersion: v2
 name: pg
 description: PostgreSQL with repmgr replication and optional PGPool-II
 type: application
-version: 0.5.88
+version: 0.5.89
 appVersion: "18.1"
 home: https://github.com/cagriekin/charts/tree/master/pg
 icon: https://wiki.postgresql.org/images/a/a4/PostgreSQL_logo.3colors.svg
