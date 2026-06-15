@@ -366,6 +366,33 @@ assert_contains "config repmgr: checksum annotation present" "${config_repmgr}" 
 # Config repmgr: pgHba entries in postStart
 assert_contains "config repmgr: pgHba entry in postStart" "${config_repmgr}" "host all all 10.244.0.0/16 md5"
 
+# #144: in the repmgr branch pg_hba is first-match-wins behind the image's broad
+# 10.0.0.0/8 and 0.0.0.0/0 catch-alls, so user entries appended at EOF could
+# never match. They must be inserted above the first non-loopback host rule.
+hba_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set 'postgresql.pgHba[0]=host replication repmgr 10.0.0.0/8 trust' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#144: repmgr pgHba inserted above network rules (sentinel present)" "${hba_repmgr}" "user pgHba entries (above network auth rules)"
+assert_not_contains "#144: repmgr pgHba no longer appended at EOF" "${hba_repmgr}" "sed -i '\$ a"
+# behavioral: extract the insertion awk from the rendered postStart and run it
+# over a sample pg_hba mirroring the repmgr image's file (post md5-fallback).
+hba_awk_body=$(printf '%s\n' "${hba_repmgr}" | sed -n "/awk -v ins=0/,/HBA_FILE_USER\" > \"/p" | sed '1d;$d')
+hba_bodyfile=$(mktemp); printf '%s\n' "${hba_awk_body}" > "${hba_bodyfile}"
+hba_sample=$(mktemp)
+printf '%s\n' \
+  "local   all all all trust" \
+  "host    all all 127.0.0.1/32 trust" \
+  "host    all all ::1/128 trust" \
+  "host    replication all 10.0.0.0/8 scram-sha-256" \
+  "host    all all 0.0.0.0/0 md5" > "${hba_sample}"
+hba_result=$(awk -v ins=0 -f "${hba_bodyfile}" "${hba_sample}")
+ut_ln=$(printf '%s\n' "${hba_result}" | grep -n "repmgr 10.0.0.0/8 trust" | head -1 | cut -d: -f1)
+lo_ln=$(printf '%s\n' "${hba_result}" | grep -n "::1/128" | head -1 | cut -d: -f1)
+sc_ln=$(printf '%s\n' "${hba_result}" | grep -n "all 10.0.0.0/8 scram-sha-256" | head -1 | cut -d: -f1)
+if [ -n "${ut_ln}" ] && [ -n "${lo_ln}" ] && [ -n "${sc_ln}" ] && [ "${ut_ln}" -gt "${lo_ln}" ] && [ "${ut_ln}" -lt "${sc_ln}" ]; then hba144=ok; else hba144="ut=${ut_ln:-x} lo=${lo_ln:-x} sc=${sc_ln:-x}"; fi
+assert_eq "#144: user pgHba lands below loopback and above network auth rules" "ok" "${hba144}"
+rm -f "${hba_bodyfile}" "${hba_sample}"
+
 # Test: configuration disabled still renders setup-config, which strips a
 # stale include_dir left in PGDATA by a previous enable (#107)
 no_config=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-minimal.yaml" 2>&1)
