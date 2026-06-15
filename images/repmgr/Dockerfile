@@ -1,3 +1,14 @@
+# --- Stage 1: build the Go HA agent (cross-compiled, static, no cgo) ---
+FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS agent-build
+ARG TARGETARCH
+WORKDIR /src/agent
+COPY agent/go.mod agent/go.sum ./
+RUN go mod download
+COPY agent/ ./
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/pg-ha-agent ./cmd/agent
+
+# --- Stage 2: the runtime image (PostgreSQL 18 + repmgr + pgbackrest + agent) ---
 FROM debian:trixie-slim
 
 # Install system dependencies
@@ -50,6 +61,10 @@ RUN chmod +x /usr/local/bin/entrypoint.sh \
     /usr/local/bin/init-repmgr.sh \
     /usr/local/bin/service-updater.sh \
     /usr/local/bin/repmgrd-entrypoint.sh
+
+# Go HA agent binary (used by the entrypoint "agent" failover mode)
+COPY --from=agent-build /out/pg-ha-agent /usr/local/bin/pg-ha-agent
+RUN chmod +x /usr/local/bin/pg-ha-agent
 
 # Set working directory
 WORKDIR /var/lib/postgresql

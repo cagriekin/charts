@@ -24,3 +24,20 @@ jobs:
 
       - name: Run script tests
         run: bash images/repmgr/test/scripts-test.sh
+
+  go-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: vet + test the agent module
+        working-directory: images/repmgr/agent
+        run: |
+          go vet ./...
+          go test ./...

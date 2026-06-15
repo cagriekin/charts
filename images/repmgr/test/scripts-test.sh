@@ -161,6 +161,20 @@ if [ ! -s /tmp/.ssp.sh ]; then bad "extract settle_scan_for_primary from entrypo
   rm -f /tmp/.ssp.sh
 fi
 
+# --- agent failover mode: entrypoint dispatches "agent" -> pg-ha-agent ---
+if grep -qF '"postgres"|"agent")' "${ROOT}/entrypoint.sh" && grep -qF 'exec /usr/local/bin/pg-ha-agent' "${ROOT}/entrypoint.sh"; then
+  ok "entrypoint dispatches agent mode to pg-ha-agent"
+else
+  bad "entrypoint does not dispatch agent mode to pg-ha-agent"
+fi
+
+# --- init-repmgr honors REPMGR_FAILOVER (manual in agent mode) ---
+if grep -qF 'REPMGR_FAILOVER:-automatic' "${ROOT}/init-repmgr.sh"; then
+  ok "init-repmgr.sh honors REPMGR_FAILOVER"
+else
+  bad "init-repmgr.sh does not honor REPMGR_FAILOVER"
+fi
+
 echo "----"
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
 exit "$fail"

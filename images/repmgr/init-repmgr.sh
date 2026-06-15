@@ -36,7 +36,7 @@ data_directory='${PGDATA}'
 pg_bindir='/usr/lib/postgresql/18/bin'
 replication_user='${REPMGR_USER}'
 replication_type='physical'
-failover='automatic'
+failover='${REPMGR_FAILOVER:-automatic}'
 promote_command='repmgr standby promote -f /etc/repmgr/repmgr.conf'
 follow_command='repmgr standby follow -f /etc/repmgr/repmgr.conf --upstream-node-id=%n'
 reconnect_attempts=3
