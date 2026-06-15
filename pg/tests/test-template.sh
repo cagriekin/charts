@@ -746,6 +746,23 @@ bash -c '
 assert_eq "su #171/#173: lone-primary guard fails closed on unverified/split-brain, proceeds on valid failover" "0" "${elp_rc}"
 rm -f "${SCRIPT_DIR}/.su_render.sh" "${SCRIPT_DIR}/.su_fn.sh"
 
+# #138: LAST_MASTER must seed from the live write-Service selector, not "". The
+# sidecar's process state doesn't survive a restart, so an empty seed made the
+# first tick treat the existing primary as a "master change" and spuriously
+# rollout-restart pgpool (severing pooled connections) on every install/upgrade/
+# rolling restart. Seeding from the selector restarts pgpool only on a real
+# transition.
+assert_contains "#138: LAST_MASTER seeded from service selector" "${su_cm}" 'LAST_MASTER=$(kubectl get service'
+assert_not_contains "#138: LAST_MASTER not initialized empty" "${su_cm}" 'LAST_MASTER=""'
+# behavioral: source the extracted seeding line with kubectl stubbed
+seed_line=$(printf '%s\n' "${su_cm}" | grep -m1 'LAST_MASTER=$(kubectl get service' | sed 's/^[[:space:]]*//')
+seed_file=$(mktemp); printf '%s\n' "${seed_line}" > "${seed_file}"
+seed_present=$(MASTER_SERVICE=svc NAMESPACE=ns bash -c 'kubectl() { echo pg-repmgr-1; }; source '"${seed_file}"'; printf "%s" "$LAST_MASTER"')
+assert_eq "#138: seeds to the current selector pod" "pg-repmgr-1" "${seed_present}"
+seed_absent=$(MASTER_SERVICE=svc NAMESPACE=ns bash -c 'kubectl() { return 1; }; source '"${seed_file}"'; printf "%s" "$LAST_MASTER"')
+assert_eq "#138: seeds empty when no selector exists yet" "" "${seed_absent}"
+rm -f "${seed_file}"
+
 # Test: repmgr disabled does not render preStop or terminationGracePeriodSeconds
 assert_not_contains "minimal: no preStop hook" "${minimal}" "preStop:"
 assert_not_contains "minimal: no terminationGracePeriodSeconds" "${minimal}" "terminationGracePeriodSeconds"
