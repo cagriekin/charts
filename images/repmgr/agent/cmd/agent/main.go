@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -69,6 +70,11 @@ type agent struct {
 	prober *pg.Prober
 	metr   *observe.Metrics
 	base   string // StatefulSet name (pod name without the ordinal)
+
+	// opMu serializes all postmaster/mechanism mutations so the reconcile tick and
+	// the OnLost fence callback never drive the supervisor concurrently (single
+	// transition path; also avoids a concurrent-Stop deadlock).
+	opMu sync.Mutex
 }
 
 func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
@@ -116,6 +122,8 @@ func (a *agent) run() {
 			a.metr.SetLeader(false)
 			a.metr.IncFence()
 			a.log.Warn("lost leadership; demoting (fence)")
+			a.opMu.Lock()
+			defer a.opMu.Unlock()
 			dctx, cancel := context.WithTimeout(context.Background(), a.cfg.RenewDeadline)
 			defer cancel()
 			if err := a.sup.Demote(dctx, true); err != nil {
@@ -171,7 +179,10 @@ func (a *agent) tick(ctx context.Context) {
 	obs := a.observe(ctx)
 	dec := reconcile.Decide(obs)
 	observe.Audit(a.log, obs.HoldLease, dec.Action.String(), dec.Target, dec.Reason)
-	if err := a.act(ctx, dec, obs); err != nil {
+	a.opMu.Lock()
+	err := a.act(ctx, dec, obs)
+	a.opMu.Unlock()
+	if err != nil {
 		a.metr.IncReconcileError()
 		a.log.Error("act", "action", dec.Action.String(), "err", err)
 	}
@@ -218,9 +229,8 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.Observation) error {
 	switch dec.Action {
 	case reconcile.Promote:
-		if err := a.sup.Start(ctx); err != nil {
-			return err
-		}
+		// The node is already running as a standby (the reconcile guard); promote
+		// acts on the running postmaster — do NOT Start it (that would error).
 		if err := a.mech.Promote(ctx); err != nil {
 			return err
 		}
