@@ -56,12 +56,13 @@ rules:
     verbs: ["create"]
 {{- if eq (include "pg.agentMode" .) "true" }}
   # Durable primary marker (<fullname>-primary): the agent records the highest
-  # timeline here (#125). In agent mode get/patch are scoped to the one marker
-  # name; create stays unscoped (resourceNames cannot restrict create).
+  # timeline here (#125) via Get -> Create-if-absent -> Update. get/update are
+  # scoped to the one marker name; create stays unscoped (resourceNames cannot
+  # restrict create).
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: ["{{ include "pg.fullname" . }}-primary"]
-    verbs: ["get", "patch"]
+    verbs: ["get", "update"]
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create"]
@@ -84,8 +85,8 @@ rules:
     verbs: ["get", "create", "patch"]
 {{- end }}
 {{- if and .Values.pgpool.enabled (eq (include "pg.repmgrdMode" .) "true") }}
-  # repmgrd mode restarts pgpool on failover; the agent fronts the Services
-  # instead, so this grant is dropped in agent mode.
+  {{- /* repmgrd mode restarts pgpool on failover; the agent fronts the Services
+         instead, so this grant is dropped in agent mode. */}}
   - apiGroups: ["apps"]
     resources: ["deployments"]
     resourceNames: ["{{ include "pg.fullname" . }}-pgpool"]
