@@ -323,9 +323,9 @@ When `postgresql.existingSecret.enabled` is `false`, a secret will be auto-gener
 |-----------|-------------|---------|
 | `networkPolicy.enabled` | Enable NetworkPolicy resources for pod isolation | `false` |
 | `networkPolicy.postgresql.allowExternal` | Allow ingress to PostgreSQL from any pod in the namespace | `true` |
-| `networkPolicy.postgresql.extraIngress` | Additional ingress rules for PostgreSQL | `[]` |
+| `networkPolicy.postgresql.extraIngress` | Additional ingress rules for PostgreSQL (full ingress-rule objects with their own `from`/`ports`, like `extraEgress`; appended at the rules level) | `[]` |
 | `networkPolicy.postgresql.extraEgress` | Additional egress rules for PostgreSQL | `[]` |
-| `networkPolicy.pgpool.extraIngress` | Additional ingress rules for PGPool-II | `[]` |
+| `networkPolicy.pgpool.extraIngress` | Additional ingress rules for PGPool-II (full ingress-rule objects with their own `from`/`ports`) | `[]` |
 | `networkPolicy.pgpool.extraEgress` | Additional egress rules for PGPool-II | `[]` |
 
 When enabled, NetworkPolicies restrict traffic:

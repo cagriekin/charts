@@ -276,6 +276,39 @@ netpol_extra=$(helm template test-pg "${CHART_DIR}" \
 assert_contains "netpol extraEgress: postgresql rule rendered" "${netpol_extra}" "port: 8080"
 assert_contains "netpol extraEgress: pgpool rule rendered" "${netpol_extra}" "port: 8081"
 
+# #135: the pgpool NetworkPolicy must open the metrics scrape port (9719) when
+# pgpool.metrics.enabled, mirroring the scrape annotations the chart emits; else
+# the CNI silently drops all pgpool2_exporter scrapes. 9719 only appears in the
+# netpol render via this rule (the Deployment is a separate template).
+netpol_metrics=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set networkPolicy.enabled=true --set pgpool.metrics.enabled=true \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "#135: pgpool netpol opens metrics port 9719 when metrics enabled" "${netpol_metrics}" "port: 9719"
+netpol_nometrics=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set networkPolicy.enabled=true --set pgpool.metrics.enabled=false \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_not_contains "#135: pgpool netpol omits 9719 when metrics disabled" "${netpol_nometrics}" "port: 9719"
+
+# #136: extraIngress must render as a full ingress rule (its own from+ports) at
+# the rules level so it can open a non-5432 port -- not be spliced into the 5432
+# rule's from: list (which rejected rule-shaped input and limited peers to 5432).
+# Parse the postgresql policy: a correct splice yields 2 ingress rules, one with
+# the extra port; the old from:-nesting yielded a single rule.
+netpol_xi=$(helm template test-pg "${CHART_DIR}" --set networkPolicy.enabled=true \
+  --set 'networkPolicy.postgresql.extraIngress[0].from[0].namespaceSelector.matchLabels.name=monitoring' \
+  --set 'networkPolicy.postgresql.extraIngress[0].ports[0].port=9116' \
+  --show-only templates/networkpolicy.yaml 2>&1)
+xi_shape=$(printf '%s' "${netpol_xi}" | python3 -c "
+import sys,yaml
+for d in yaml.safe_load_all(sys.stdin):
+    if d and d.get('kind')=='NetworkPolicy' and d['metadata']['name'].endswith('-postgresql'):
+        ing=d['spec']['ingress']
+        ports=[p.get('port') for r in ing for p in r.get('ports',[])]
+        print('rules=%d has9116=%s' % (len(ing), 9116 in ports)); break
+")
+assert_contains "#136: postgresql extraIngress renders as its own ingress rule" "${xi_shape}" "rules=2"
+assert_contains "#136: postgresql extraIngress can open a non-5432 port" "${xi_shape}" "has9116=True"
+
 # --- PostgreSQL Configuration Tests ---
 
 # Test: helm lint with config values (standalone)
