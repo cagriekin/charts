@@ -48,6 +48,18 @@ spec:
 {{- if .Values.networkPolicy.postgresql.allowExternal }}
         - podSelector: {}
 {{- end }}
+{{- if eq (include "pg.agentMode" .) "true" }}
+{{- /*
+The agent serves Prometheus metrics + the /healthz/readyz endpoints on 9200 from
+inside the postgresql pods; without this rule the CNI drops every scrape. Mirrors
+the pgpool 9719 / exporter 9116 metrics rules.
+*/}}
+    - ports:
+        - port: 9200
+          protocol: TCP
+      from:
+        - podSelector: {}
+{{- end }}
 {{- /*
 extraIngress entries are full ingress rules (each with its own from/ports),
 spliced at the rules level -- symmetric with extraEgress. Previously they were
