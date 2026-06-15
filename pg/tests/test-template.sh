@@ -753,6 +753,9 @@ agent_rbac=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent
 assert_contains "agent rbac: coordination.k8s.io leases granted" "${agent_rbac}" "coordination.k8s.io"
 assert_contains "agent rbac: lease scoped to <fullname>-leader" "${agent_rbac}" "test-pg-leader"
 assert_contains "agent rbac: configmaps scoped to <fullname>-primary marker" "${agent_rbac}" "test-pg-primary"
+# marker.go does Get -> Create-if-absent -> Update, so the scoped rule must grant
+# update (not patch) or every marker advance would be Forbidden once wired
+assert_contains "agent rbac: marker configmaps grant get+update (marker.go uses Update)" "${agent_rbac}" '"get", "update"'
 assert_not_contains "agent rbac: no pods delete in log mode" "${agent_rbac}" '"delete"'
 # fence mode re-grants pods delete (split-brain safety net)
 agent_rbac_fence=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \

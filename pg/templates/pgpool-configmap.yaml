@@ -127,7 +127,7 @@ data:
     failover_command = ''
     failback_command = ''
     fail_over_on_backend_error = {{ if .Values.pgpool.failOverOnBackendError }}on{{ else }}off{{ end }}
-{{- if .Values.repmgr.enabled }}
+{{- if eq (include "pg.repmgrdMode" .) "true" }}
     auto_failback = {{ if .Values.pgpool.autoFailback }}on{{ else }}off{{ end }}
     auto_failback_interval = 30
 {{- end }}

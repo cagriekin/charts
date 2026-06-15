@@ -78,8 +78,9 @@ spec:
         {{- toYaml .Values.postgresql.podSecurityContext | nindent 8 }}
       {{- if .Values.repmgr.enabled }}
       {{- if eq (include "pg.repmgrdMode" .) "true" }}
-      # repmgrd mode signals postgres cross-container (failover test); the agent is
-      # PID 1 in the postgresql container and owns its child, so it is not needed.
+      {{- /* repmgrd mode signals postgres cross-container (the failover test);
+             the agent is PID 1 in the postgresql container and owns its child,
+             so it is not needed in agent mode. */}}
       shareProcessNamespace: true
       {{- end }}
       serviceAccountName: {{ include "pg.fullname" . }}-repmgr
@@ -569,11 +570,11 @@ spec:
           livenessProbe:
 {{- if eq (include "pg.agentMode" .) "true" }}
             # In agent mode the agent (PID 1) supervises postgres as a child, so
-            # liveness asserts the agent's reconcile/renew loop is alive (its
-            # /healthz fails when the last successful lease renew is older than
-            # RenewDeadline). A wedged agent that still answered 200 would keep a
-            # stale primary read-write; a dead child postgres is the supervisor's
-            # concern, not the kubelet's.
+            # liveness asserts the agent's reconcile loop is alive: /healthz fails
+            # when the loop has not progressed within ~3x the reconcile interval
+            # (it beats every tick, on leader and standby alike). A wedged agent
+            # that still answered 200 would keep a stale primary read-write; a dead
+            # child postgres is the supervisor's concern, not the kubelet's.
             httpGet:
               path: /healthz
               port: agent-metrics
