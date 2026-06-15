@@ -398,7 +398,15 @@ data:
         update_pod_role_labels "${best_pod}"
     }
 
-    LAST_MASTER=""
+    # Seed LAST_MASTER from the live write-Service selector, not "" (#138). The
+    # sidecar's process state does not survive a restart (fresh install, chart
+    # upgrade, rolling restart, or a liveness restart of this sidecar), so an
+    # empty seed made the first tick treat the existing primary as a "master
+    # change" and needlessly rollout-restart pgpool, severing all pooled
+    # connections. Seeding from the current selector means restart_pgpool fires
+    # only on a real selector transition; a failover that happened while the
+    # sidecar was down still differs from the stale selector and restarts.
+    LAST_MASTER=$(kubectl get service "${MASTER_SERVICE}" -n "${NAMESPACE}" -o jsonpath='{.spec.selector.statefulset\.kubernetes\.io/pod-name}' 2>/dev/null || echo "")
     CONSECUTIVE_FAILURES=0
     MAX_CONSECUTIVE_FAILURES=5
     PGPOOL_FAILURES=0
