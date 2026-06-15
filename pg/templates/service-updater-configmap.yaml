@@ -263,15 +263,32 @@ data:
             -l "app.kubernetes.io/name={{ include "pg.name" . }},app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=postgresql" \
             -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.labels.pg-role}{"\n"}{end}' 2>/dev/null)
 
-        local pod current_role desired_role
+        local pod current_role desired_role rec
         while read -r pod current_role; do
             if [ -z "$pod" ]; then
                 continue
             fi
 
-            desired_role="standby"
             if [ "$pod" = "$master" ]; then
                 desired_role="primary"
+            else
+                # A non-master pod may join the readonly Service (pg-role=standby)
+                # ONLY if it is genuinely in recovery. A reachable node that is
+                # NOT in recovery and is not the chosen master is a stale/divergent
+                # primary (a resurrected old primary or a healed-partition loser);
+                # labeling it standby would route reads to a divergent timeline,
+                # returning phantom/missing rows (#140). Mark it orphan to keep it
+                # out of the readonly endpoints. If the node is unreachable we
+                # cannot classify it, so leave its current label untouched -- a
+                # down pod is not in the endpoints anyway and is re-evaluated next
+                # tick (avoids churning a transiently-unreachable healthy standby).
+                rec=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${pod}.${HEADLESS_SERVICE}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
+                    -tAc "SELECT pg_is_in_recovery();" </dev/null 2>/dev/null | tr -d '[:space:]')
+                case "$rec" in
+                    t) desired_role="standby" ;;
+                    f) desired_role="orphan" ;;
+                    *) continue ;;
+                esac
             fi
 
             if [ "$current_role" != "$desired_role" ]; then
