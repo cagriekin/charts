@@ -70,6 +70,7 @@ type agent struct {
 	sup    *process.Supervisor
 	prober *pg.Prober
 	metr   *observe.Metrics
+	health *selfHealthTracker
 	base   string // StatefulSet name (pod name without the ordinal)
 
 	// opMu serializes all postmaster/mechanism mutations so the reconcile tick and
@@ -102,6 +103,9 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 		sup:    process.NewSupervisor(process.NewChildPostmaster(pgBindir+"/postgres", cfg.PGDATA)),
 		prober: pg.NewProber(),
 		metr:   observe.New(),
+		// Self-health grace scales with the lease timing (the cloud preset widens
+		// both), tolerating a transient stall before declaring the primary wedged.
+		health: &selfHealthTracker{grace: cfg.LeaseDuration},
 		base:   baseName(cfg.PodName),
 	}, nil
 }
@@ -251,6 +255,11 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		Malformed: m.Malformed || (m.Present && !m.TimelineOK),
 		Timeline:  pg.Timeline(m.Timeline),
 	}
+	// Self-health (stateful/time-based, so computed here, not in the pure Decide):
+	// a holder whose primary-state postgres has been unreachable past the grace is
+	// stuck (frozen/wedged), which drives a self-health failover.
+	shouldServe := o.HoldLease && o.Local.HasData && !o.Local.InRecovery
+	o.LocalStuck = a.health.stuck(shouldServe, o.Local.Running, time.Now())
 	return o
 }
 
@@ -314,6 +323,16 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			return a.sup.Start(ctx)
 		}
 		return nil
+
+	case reconcile.RestartLocal:
+		// Single-node primary wedged (frozen/hung): no peer to fail over to, so
+		// force-stop in place (Stop escalates to SIGKILL on the timeout if a frozen
+		// postmaster ignores the signal) and start fresh.
+		a.metr.IncDemote()
+		rctx, cancel := context.WithTimeout(ctx, a.cfg.RenewDeadline)
+		_ = a.sup.Stop(rctx, process.Immediate)
+		cancel()
+		return a.sup.Start(ctx)
 
 	case reconcile.Wait, reconcile.NoOp, reconcile.BootstrapInitdb:
 		// Inert: never auto-start here. Starting a stopped node is an explicit
@@ -380,6 +399,38 @@ func (a *agent) startMetrics(ctx context.Context) {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		a.log.Warn("metrics server stopped", "err", err)
 	}
+}
+
+// selfHealthTracker arms a grace timer when a previously-running local primary
+// goes unreachable, so a frozen/wedged postmaster -- which Start cannot recover and
+// the reconcile-loop liveness probe (it checks the loop, not postgres) will not
+// catch -- trips a self-health step-down. Data that has never come up this
+// lifecycle is NOT armed, so a slow legitimate startup (e.g. crash-recovery WAL
+// replay) is never mistaken for a wedged primary.
+type selfHealthTracker struct {
+	grace       time.Duration
+	wasRunning  bool
+	unhealthyAt time.Time
+}
+
+// stuck advances the tracker one tick and reports whether the local primary has
+// been unreachable past the grace. shouldServe is true only for a holder with
+// primary-state data (a node that ought to be a running primary).
+func (h *selfHealthTracker) stuck(shouldServe, running bool, now time.Time) bool {
+	switch {
+	case !shouldServe:
+		h.wasRunning, h.unhealthyAt = false, time.Time{}
+		return false
+	case running:
+		h.wasRunning, h.unhealthyAt = true, time.Time{}
+		return false
+	case !h.wasRunning:
+		return false // never came up this lifecycle: a startup, not a regression
+	}
+	if h.unhealthyAt.IsZero() {
+		h.unhealthyAt = now
+	}
+	return now.Sub(h.unhealthyAt) >= h.grace
 }
 
 // baseName strips the trailing -<ordinal> from a StatefulSet pod name.
