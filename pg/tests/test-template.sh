@@ -725,6 +725,15 @@ assert_contains "agent: LEASE_NAME env present" "${agent_pg_cont}" "name: LEASE_
 assert_contains "agent: lease name is <fullname>-leader" "${agent_pg_cont}" "test-pg-leader"
 assert_contains "agent: POD_NAME env present" "${agent_pg_cont}" "name: POD_NAME"
 assert_contains "agent: DCS_BACKEND env present" "${agent_pg_cont}" "name: DCS_BACKEND"
+# config completeness: the agent's Load() fail-fasts on any missing var, so a
+# dropped env here is a boot crash-loop the other asserts would not catch.
+agent_env_missing=""
+for v in POD_NAME NAMESPACE LEASE_NAME LEASE_DURATION RENEW_DEADLINE RETRY_PERIOD \
+  RECONCILE_INTERVAL HEADLESS_SERVICE REPMGR_NODE_COUNT MASTER_SERVICE PRIMARY_MARKER \
+  POD_SELECTOR REPMGR_USER REPMGR_DB REPMGR_PASSWORD PGDATA DCS_BACKEND SPLIT_BRAIN_ACTION; do
+  grep -q "name: ${v}$" <<< "${agent_pg_cont}" || agent_env_missing="${agent_env_missing} ${v}"
+done
+assert_eq "agent: all required agent env vars present (Load fail-fast)" "" "${agent_env_missing}"
 assert_contains "agent: metrics port 9200 exposed" "${agent_pg_cont}" "containerPort: 9200"
 assert_contains "agent: liveness probes the agent /healthz" "${agent_pg_cont}" "path: /healthz"
 # startupProbe (#172) kept in agent mode
