@@ -58,7 +58,17 @@ func (p *ChildPostmaster) Start(_ context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.cmd != nil {
-		return fmt.Errorf("postmaster already started")
+		// Distinguish a still-running postmaster (Start is then an idempotent no-op,
+		// so a reconcile tick that fires while postgres is mid-startup does not log a
+		// spurious error) from one that has already exited on its own (a crashed
+		// postgres -- clear the stale handle and start fresh, so the next reconcile
+		// tick actually recovers it instead of looping on "already started").
+		select {
+		case <-p.exited:
+			p.cmd, p.exited = nil, nil // exited on its own; fall through to a fresh start
+		default:
+			return nil // still running
+		}
 	}
 	cmd := exec.Command(p.PostgresBin, "-D", p.DataDir)
 	cmd.Stdout = os.Stdout

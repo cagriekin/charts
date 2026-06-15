@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 type fakePostmaster struct {
@@ -42,6 +43,60 @@ func TestDemoteUsesFastWhenGraceful(t *testing.T) {
 	if f.stopMode != Fast {
 		t.Errorf("graceful demote = %v, want Fast", f.stopMode)
 	}
+}
+
+// writeFakePG writes an executable stub at dir/fakepg that runs the given shell body.
+func writeFakePG(t *testing.T, dir, body string) string {
+	t.Helper()
+	bin := filepath.Join(dir, "fakepg")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin
+}
+
+// A reconcile tick can call Start while postgres is mid-startup (not yet accepting
+// connections, so observe() sees it as not running). Start must be an idempotent
+// no-op then, not error with "already started".
+func TestChildPostmasterStartIdempotentWhileRunning(t *testing.T) {
+	dir := t.TempDir()
+	p := NewChildPostmaster(writeFakePG(t, dir, "exec sleep 30"), dir)
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	pid := p.cmd.Process.Pid
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("idempotent start while running: %v", err)
+	}
+	if p.cmd.Process.Pid != pid {
+		t.Errorf("idempotent Start replaced the running process (pid %d -> %d)", pid, p.cmd.Process.Pid)
+	}
+	_ = p.Stop(context.Background(), Immediate)
+}
+
+// After postgres exits on its own (crash/OOM), the stale handle must not wedge
+// Start on "already started" forever -- the next reconcile tick must restart it.
+func TestChildPostmasterRestartsAfterSelfExit(t *testing.T) {
+	dir := t.TempDir()
+	p := NewChildPostmaster(writeFakePG(t, dir, "exit 0"), dir)
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	pid1 := p.cmd.Process.Pid
+	// wait until the child's exit is queued on p.exited (len peek does not consume)
+	for i := 0; i < 200 && len(p.exited) == 0; i++ {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(p.exited) == 0 {
+		t.Fatal("child did not exit in time")
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatalf("restart after self-exit: %v", err)
+	}
+	if p.cmd.Process.Pid == pid1 {
+		t.Errorf("restart after self-exit did not fork a fresh process (pid still %d)", pid1)
+	}
+	_ = p.Stop(context.Background(), Fast)
 }
 
 func TestHasData(t *testing.T) {
