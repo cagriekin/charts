@@ -68,6 +68,29 @@ repmgr_role=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repm
 assert_contains "repmgr: role has resourceNames for services" "${repmgr_role}" "resourceNames:"
 assert_contains "repmgr: role restricts service to release name" "${repmgr_role}" "test-pg"
 
+# #154: the repmgr Role's pods access must be least-privilege -- list unscoped
+# (cannot be name-scoped), get/patch scoped to the StatefulSet pod names, and
+# delete granted only in fence mode (the sole path that deletes pods).
+pods_rules_fmt='
+import sys,yaml
+for d in yaml.safe_load_all(sys.stdin):
+    if d and d.get("kind")=="Role" and d["metadata"]["name"].endswith("-repmgr"):
+        for r in d["rules"]:
+            if r.get("resources")==["pods"]:
+                print("pods verbs=%s scoped=%s names=%s" % (",".join(sorted(r["verbs"])), "yes" if "resourceNames" in r else "no", ";".join(r.get("resourceNames") or [])))
+        break
+'
+pods_rules_log=$(printf '%s' "${repmgr_role}" | python3 -c "${pods_rules_fmt}")
+assert_contains "#154: pods list rule is unscoped" "${pods_rules_log}" "pods verbs=list scoped=no"
+assert_contains "#154: pods get/patch scoped to pod names" "${pods_rules_log}" "pods verbs=get,patch scoped=yes"
+assert_contains "#154: scoped rule names the StatefulSet pods" "${pods_rules_log}" "test-pg-0"
+assert_not_contains "#154: no pods delete in default (log) mode" "${pods_rules_log}" "delete"
+# fence mode: delete is granted and still scoped to the pod names
+repmgr_role_fence=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set repmgr.splitBrainDetection.action=fence --show-only templates/rbac.yaml 2>&1)
+pods_rules_fence=$(printf '%s' "${repmgr_role_fence}" | python3 -c "${pods_rules_fmt}")
+assert_contains "#154: fence mode grants delete scoped to pod names" "${pods_rules_fence}" "pods verbs=delete,get,patch scoped=yes"
+
 # Full: RBAC role restricts deployment to pgpool resource name
 full_role=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" --show-only templates/rbac.yaml 2>&1)
 assert_contains "full: role has deployment resourceNames" "${full_role}" "test-pg-pgpool"
@@ -1450,11 +1473,12 @@ assert_not_contains "readonly: selector never pins a pod-name" "${ro_svc}" "stat
 # Test: readonly service is not rendered in standalone (minimal) mode
 assert_not_contains "minimal: no readonly service" "${minimal}" "test-pg-readonly"
 
-# Test: rbac grants pod get/list/patch for role labeling (delete kept for
-# split-brain fencing)
+# Test: rbac grants pods list (unscoped) for role labeling; get/patch are scoped
+# to the StatefulSet pods and delete is gated on fence mode (detailed in the
+# #154 least-privilege tests above)
 ro_role=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/rbac.yaml 2>&1)
-assert_contains "readonly: rbac grants pods get/list/patch/delete" "${ro_role}" 'verbs: \["get", "list", "patch", "delete"\]'
+assert_contains "readonly: rbac grants pods list for role labeling" "${ro_role}" 'verbs: \["list"\]'
 
 # Test: service-updater script carries the convergent labeling logic
 ro_updater=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
