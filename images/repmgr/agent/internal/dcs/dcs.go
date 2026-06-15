@@ -6,19 +6,23 @@ package dcs
 
 import "context"
 
-// DCS is a leadership lock. Campaign blocks until the caller holds it; Leader
-// reports the current holder so followers can find their upstream.
+// DCS is a leadership lock backend. Run contends for and maintains leadership for
+// the agent until ctx is cancelled; the reconcile loop reads IsLeader/Leader each
+// tick, and Callbacks fire on transitions.
 type DCS interface {
-	// Campaign blocks until identity holds the lock or ctx is cancelled. The
-	// returned Leadership stays valid until its Done channel closes.
-	Campaign(ctx context.Context, identity string) (Leadership, error)
-	// Leader returns the current holder identity, or "" if unknown/none.
-	Leader(ctx context.Context) (string, error)
+	// Run blocks, contending for and holding the lock until ctx is cancelled. Run
+	// it in a goroutine; on cancel it releases the lock (best effort).
+	Run(ctx context.Context, identity string, cb Callbacks)
+	// IsLeader reports whether this agent currently holds the lock.
+	IsLeader() bool
+	// Leader returns the last-observed holder identity (for followers), or "".
+	Leader() string
 }
 
-// Leadership is an acquired lock. Done closes when leadership is lost (lease
-// expired, resigned, or backend error). Resign relinquishes it cleanly.
-type Leadership interface {
-	Done() <-chan struct{}
-	Resign(ctx context.Context) error
+// Callbacks fire on leadership transitions. OnLost MUST complete its work
+// (demote Postgres) synchronously: it runs before the lock can be re-acquired by
+// anyone, which is the fence-ordering guarantee that prevents two writers.
+type Callbacks struct {
+	OnAcquired func(ctx context.Context)
+	OnLost     func()
 }
