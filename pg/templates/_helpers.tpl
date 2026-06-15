@@ -258,3 +258,26 @@ volumes:
   - name: exporter-config
     emptyDir: {}
 {{- end }}
+
+{{/*
+Failover mode (repmgrd default | agent). Fails fast on an unknown value.
+*/}}
+{{- define "pg.failoverMode" -}}
+{{- $m := .Values.repmgr.failoverMode | default "repmgrd" -}}
+{{- if not (or (eq $m "repmgrd") (eq $m "agent")) -}}
+{{- fail (printf "repmgr.failoverMode must be 'repmgrd' or 'agent', got %q" $m) -}}
+{{- end -}}
+{{- $m -}}
+{{- end -}}
+
+{{/*
+pg.agentMode / pg.repmgrdMode render the string "true"/"false". Call sites gate
+with: {{- if eq (include "pg.agentMode" .) "true" }}
+*/}}
+{{- define "pg.agentMode" -}}
+{{- and .Values.repmgr.enabled (eq (include "pg.failoverMode" .) "agent") -}}
+{{- end -}}
+
+{{- define "pg.repmgrdMode" -}}
+{{- and .Values.repmgr.enabled (eq (include "pg.failoverMode" .) "repmgrd") -}}
+{{- end -}}
