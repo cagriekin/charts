@@ -729,6 +729,10 @@ assert_contains "agent: metrics port 9200 exposed" "${agent_pg_cont}" "container
 assert_contains "agent: liveness probes the agent /healthz" "${agent_pg_cont}" "path: /healthz"
 # startupProbe (#172) kept in agent mode
 assert_contains "agent #172: startupProbe kept" "${agent_pg_cont}" "startupProbe:"
+# the agent owns SIGTERM shutdown, so the repmgrd-tuned preStop pg_ctl stop is
+# gated off in agent mode (a competing stop would race the supervisor)
+assert_not_contains "agent: no preStop pg_ctl stop (agent owns SIGTERM)" "${agent_pg_cont}" "pg_ctl stop"
+assert_contains "agent: postStart config hook kept" "${agent_pg_cont}" "postStart:"
 
 # service-updater configmap is not rendered in agent mode
 agent_all=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" 2>&1)
