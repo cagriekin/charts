@@ -1,5 +1,36 @@
 # pg chart changelog
 
+## 0.5.89
+
+Introduces an opt-in, lease-based failover mode (`repmgr.failoverMode: agent`).
+The default stays `repmgrd`, so existing installs are unaffected and the
+repmgrd rendering is byte-stable. The repmgr image moves to `trixie-5.5.0-16`,
+which bundles the new `pg-ha-agent` binary.
+
+### Added
+
+- `repmgr.failoverMode: agent` runs a Go agent (`pg-ha-agent`) as PID 1 in the
+  postgresql container. The agent holds a Kubernetes `coordination.k8s.io/v1`
+  Lease (`<release>-pg-leader`) as the sole authority for which node is primary
+  and drives repmgr as a pure mechanism (no repmgrd). This removes the
+  hand-rolled split-brain handling and the repmgrd startup race at the source.
+- Agent-mode wiring (gated, repmgrd path unchanged): `podManagementPolicy:
+  Parallel`, the entrypoint `agent` arm, agent env (`LEASE_NAME`,
+  `LEASE_DURATION`, `RENEW_DEADLINE`, `RETRY_PERIOD`, `RECONCILE_INTERVAL`,
+  `POD_NAME`, `MASTER_SERVICE`, `POD_SELECTOR`, `DCS_BACKEND`,
+  `SPLIT_BRAIN_ACTION`), a `9200` metrics/health port with an agent-heartbeat
+  liveness probe, `coordination.k8s.io/leases` RBAC scoped to the leader Lease,
+  pgpool backends fronting the RW/RO Services, and a `9200` NetworkPolicy
+  ingress. The repmgrd sidecar, service-updater sidecar, and the service-updater
+  ConfigMap are omitted in agent mode.
+- `repmgr.agent.*` tunables (`leaseDuration`, `renewDeadline`, `retryPeriod`,
+  `reconcileInterval`, `podCidr`).
+
+### Notes
+
+- Agent mode is opt-in and not yet validated by the live failover suite (added
+  in a follow-up). It becomes the default at chart `1.0.0`.
+
 ## 0.5.88
 
 Bundles the stale-primary/HA hardening, operational fixes, fail-fast

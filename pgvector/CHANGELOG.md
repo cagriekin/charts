@@ -1,5 +1,23 @@
 # pgvector chart changelog
 
+## 0.6.91
+
+Introduces an opt-in, lease-based failover mode (`repmgr.failoverMode: agent`),
+in lockstep with pg 0.5.89. The default stays `repmgrd`, so existing installs
+are unaffected and the repmgrd rendering is byte-stable. The repmgr image moves
+to `trixie-5.5.0-16`, which bundles the new `pg-ha-agent` binary.
+
+### Added
+
+- `repmgr.failoverMode: agent` — a Go agent (`pg-ha-agent`) running as PID 1 in
+  the postgresql container holds a Kubernetes `coordination.k8s.io/v1` Lease as
+  the sole authority for which node is primary and drives repmgr as a pure
+  mechanism (no repmgrd). See the pg 0.5.89 changelog for the full agent-mode
+  wiring (this chart's templates are shared with pg). It becomes the default at
+  chart `1.0.0`.
+- `repmgr.agent.*` tunables (`leaseDuration`, `renewDeadline`, `retryPeriod`,
+  `reconcileInterval`, `podCidr`).
+
 ## 0.6.90
 
 Bundles the stale-primary/HA hardening, operational fixes, fail-fast

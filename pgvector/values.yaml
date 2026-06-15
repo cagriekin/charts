@@ -132,7 +132,7 @@ postgresql:
 repmgr:
   image:
     repository: cagriekin/repmgr
-    tag: trixie-5.5.0-15
+    tag: trixie-5.5.0-16
     pullPolicy: IfNotPresent
     # PostgreSQL major version bundled in the repmgr image. The image ships
     # exactly one PG major and always runs that server, so in repmgr mode the
@@ -142,6 +142,24 @@ repmgr:
     majorVersion: "18"
 
   enabled: true
+
+  # Failover mode:
+  #   repmgrd (default) — repmgrd sidecar + service-updater (the original path)
+  #   agent             — the lease-based Go agent (PID 1) drives failover
+  # Becomes the default at chart v1.0.0.
+  failoverMode: repmgrd
+
+  # Lease-based agent (failoverMode: agent) tunables. Defaults suit a stable
+  # control plane; raise for managed clouds (e.g. 30s/20s/4s) so brief apiserver
+  # blips do not trip an unnecessary demote.
+  agent:
+    leaseDuration: 15s
+    renewDeadline: 10s
+    retryPeriod: 2s
+    reconcileInterval: 5s
+    # Pod-network CIDR the agent trusts in the hardened (SCRAM-only) pg_hba it
+    # assembles in agent mode.
+    podCidr: 10.0.0.0/8
 
   username: repmgr
   database: repmgr
