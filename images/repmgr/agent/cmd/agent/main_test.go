@@ -74,6 +74,31 @@ func TestSelfHealthTracker(t *testing.T) {
 	}
 }
 
+func TestShouldAdvanceMarker(t *testing.T) {
+	tl := func(n uint32) pg.Timeline { return pg.Timeline(n) }
+	cases := []struct {
+		name string
+		tl   pg.Timeline
+		tlOK bool
+		m    reconcile.MarkerState
+		want bool
+	}{
+		{"unreadable local timeline never advances", tl(5), false, reconcile.MarkerState{}, false},
+		{"no marker -> establish it", tl(5), true, reconcile.MarkerState{}, true},
+		{"above highwater -> advance", tl(6), true, reconcile.MarkerState{Present: true, Timeline: tl(5)}, true},
+		{"equal highwater -> no write", tl(5), true, reconcile.MarkerState{Present: true, Timeline: tl(5)}, false},
+		{"below highwater -> never lower", tl(4), true, reconcile.MarkerState{Present: true, Timeline: tl(5)}, false},
+		{"malformed marker -> re-establish", tl(5), true, reconcile.MarkerState{Present: true, Malformed: true, Timeline: tl(9)}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := shouldAdvanceMarker(c.tl, c.tlOK, c.m); got != c.want {
+				t.Errorf("shouldAdvanceMarker = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
 func TestNodeIDAndBaseName(t *testing.T) {
 	if got := baseName("my-pg-0"); got != "my-pg" {
 		t.Errorf("baseName = %q, want my-pg", got)

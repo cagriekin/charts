@@ -10,10 +10,11 @@ import (
 // fakeExec dispatches on a distinctive token in the SQL (the last arg) so each
 // probe query can be stubbed independently.
 type fakeExec struct {
-	role    string // pg_is_in_recovery output ("t"/"f"/"")
-	primary string // pg_walfile_name(...)|pg_current_wal_lsn() output
-	standby string // pg_last_wal_receive_lsn() output
-	err     error  // if set, every call fails (node unreachable)
+	role      string // pg_is_in_recovery output ("t"/"f"/"")
+	primary   string // pg_walfile_name(...)|pg_current_wal_lsn() output
+	standby   string // GREATEST(receive, replay) output
+	standbyTL string // pg_control_checkpoint timeline_id output (decimal)
+	err       error  // if set, every call fails (node unreachable)
 }
 
 func (f fakeExec) Run(_ context.Context, _ []string, _ string, args ...string) (string, error) {
@@ -24,6 +25,8 @@ func (f fakeExec) Run(_ context.Context, _ []string, _ string, args ...string) (
 	switch {
 	case strings.Contains(sql, "pg_is_in_recovery"):
 		return f.role, nil
+	case strings.Contains(sql, "pg_control_checkpoint"):
+		return f.standbyTL, nil
 	case strings.Contains(sql, "pg_last_wal_receive_lsn"):
 		return f.standby, nil
 	case strings.Contains(sql, "pg_walfile_name"):
@@ -49,16 +52,28 @@ func TestProbePrimary(t *testing.T) {
 }
 
 func TestProbeStandby(t *testing.T) {
-	p := proberWith(fakeExec{role: "t", standby: "16/B374D840"})
+	p := proberWith(fakeExec{role: "t", standby: "16/B374D840", standbyTL: "7"})
 	ns := p.Probe(context.Background(), ConnInfo{Host: "pod-1"})
 	if !ns.Reachable || ns.Role != RoleStandby {
 		t.Fatalf("got reachable=%v role=%v", ns.Reachable, ns.Role)
 	}
-	if ns.TimelineOK {
-		t.Errorf("standby should not report a primary timeline")
+	// A running standby MUST report its timeline (control-file, decimal), else
+	// unsafeToServe would refuse to ever promote it and failover would livelock.
+	if !ns.TimelineOK || ns.Timeline != 7 {
+		t.Errorf("standby timeline = (%d, ok=%v), want 7", ns.Timeline, ns.TimelineOK)
 	}
 	if !ns.LSNOK || ns.WriteLSN.Hi != 0x16 || ns.WriteLSN.Lo != 0xB374D840 {
 		t.Errorf("receive LSN = (%+v, ok=%v)", ns.WriteLSN, ns.LSNOK)
+	}
+}
+
+// A standby whose control-file timeline is unreadable must report TimelineOK=false
+// (so the highwater guard fails closed), not a bogus 0.
+func TestProbeStandbyTimelineUnreadable(t *testing.T) {
+	p := proberWith(fakeExec{role: "t", standby: "16/B374D840", standbyTL: ""})
+	ns := p.Probe(context.Background(), ConnInfo{Host: "pod-1"})
+	if ns.TimelineOK {
+		t.Errorf("unreadable standby timeline must be TimelineOK=false, got %d", ns.Timeline)
 	}
 }
 

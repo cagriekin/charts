@@ -72,7 +72,11 @@ type agent struct {
 	metr   *observe.Metrics
 	health *selfHealthTracker
 	base   string    // StatefulSet name (pod name without the ordinal)
-	bootAt time.Time // agent start; the cold-boot window for PeersPending is measured from here
+	bootAt time.Time // agent start; the cold-boot grace fallback for PeersPending is measured from here
+	// peersSeen latches which peers have been SQL-reachable at least once this
+	// lifetime. Once all have, the cold-boot wait never applies again -- so a
+	// steady-state failover is not delayed by a recent agent/pod restart.
+	peersSeen map[string]bool
 
 	// gossip publish state: skip re-patching the pod annotation when the position
 	// is unchanged, refreshing only on change or a heartbeat (to keep it fresh).
@@ -112,8 +116,9 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 		// Self-health grace scales with the lease timing (the cloud preset widens
 		// both), tolerating a transient stall before declaring the primary wedged.
 		health: &selfHealthTracker{grace: cfg.LeaseDuration},
-		base:   baseName(cfg.PodName),
-		bootAt: time.Now(),
+		base:      baseName(cfg.PodName),
+		bootAt:    time.Now(),
+		peersSeen: map[string]bool{},
 	}, nil
 }
 
@@ -305,18 +310,23 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// stuck (frozen/wedged), which drives a self-health failover.
 	shouldServe := o.HoldLease && o.Local.HasData && !o.Local.InRecovery
 	o.LocalStuck = a.health.stuck(shouldServe, o.Local.Running, time.Now())
-	// PeersPending: only during the cold-boot window, while some peer is not yet
-	// SQL-reachable (its true position not yet in). The holder waits rather than
-	// promoting on an incomplete candidate set; recovery-mode guarantees stopped
-	// primary-state peers come up reachable, so the wait terminates.
-	if time.Since(a.bootAt) < a.bootstrapGrace() {
-		for i := range o.Peers {
-			if !o.Peers[i].Reachable {
-				o.PeersPending = true
-				break
-			}
+	// PeersPending: the holder waits (does not promote/resume) only during a true
+	// cold boot -- some peer's true position is not yet in. The latch (peersSeen)
+	// records peers ever SQL-reachable; once all have been seen, the wait never
+	// applies again, so a steady-state failover is NOT delayed by a recent agent
+	// restart (the dead primary being unreachable then does not re-arm the wait).
+	// The bootstrap grace is a hard fallback so a genuinely-absent peer at cold boot
+	// cannot block promotion forever.
+	anyUnreachable := false
+	for i := range o.Peers {
+		if o.Peers[i].Reachable {
+			a.peersSeen[o.Peers[i].Name] = true
+		} else {
+			anyUnreachable = true
 		}
 	}
+	allSeen := len(a.peersSeen) >= len(o.Peers)
+	o.PeersPending = anyUnreachable && !allSeen && time.Since(a.bootAt) < a.bootstrapGrace()
 	return o
 }
 
@@ -330,9 +340,18 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		}
 		a.metr.IncPromotion()
 		_ = a.mech.RegisterPrimary(ctx)
+		// H3 order: promote PG -> advance the highwater marker -> assert routing.
+		// Re-probe the post-promote timeline (promotion bumped it) and advance the
+		// marker, so a later stale node is correctly refused by unsafeToServe.
+		if tl, _, ok, _ := a.prober.PrimaryWALPosition(ctx, a.selfConn()); ok {
+			a.advanceMarker(ctx, tl, true, obs.Marker)
+		}
 		return a.assertPrimaryRouting(ctx, obs)
 
 	case reconcile.StayPrimary:
+		// Keep the highwater marker at this primary's timeline (monotonic; written
+		// only when it advances, so steady-state ticks make no API write).
+		a.advanceMarker(ctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
 		return a.assertPrimaryRouting(ctx, obs)
 
 	case reconcile.Follow:
@@ -457,6 +476,33 @@ func (a *agent) gossipFresh(g k8s.NodeStatus) bool {
 	age := time.Now().Unix() - g.UpdatedAtUnix
 	tol := int64(a.cfg.RenewDeadline.Seconds())
 	return age >= -tol && time.Duration(age)*time.Second <= 4*a.cfg.ReconcileInterval
+}
+
+// advanceMarker records tl as the durable highwater (the #125 marker) when it is
+// strictly above the current marker -- monotonic, so it never lowers the highwater
+// and writes only on a real advance. A node booting below this later refuses to
+// serve (unsafeToServe). No-op when the local timeline is unreadable.
+func (a *agent) advanceMarker(ctx context.Context, tl pg.Timeline, tlOK bool, m reconcile.MarkerState) {
+	if !shouldAdvanceMarker(tl, tlOK, m) {
+		return
+	}
+	if err := a.kube.WriteMarker(ctx, a.cfg.MarkerName, a.cfg.PodName, uint32(tl)); err != nil {
+		a.log.Warn("advance marker", "err", err)
+	}
+}
+
+// shouldAdvanceMarker reports whether tl is strictly above the recorded highwater
+// (so the marker only ever moves up, and a no-op tick makes no API write). An
+// unreadable local timeline never advances it; a malformed marker is treated as
+// "no constraint" so the primary can re-establish the highwater.
+func shouldAdvanceMarker(tl pg.Timeline, tlOK bool, m reconcile.MarkerState) bool {
+	if !tlOK {
+		return false
+	}
+	if m.Present && !m.Malformed && tl <= m.Timeline {
+		return false
+	}
+	return true
 }
 
 // assertPrimaryRouting is run by the holder/primary: it points the write Service
