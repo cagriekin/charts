@@ -36,7 +36,7 @@ func (f *fakeRunner) lastArgs() string {
 }
 
 func newTestRepmgr(fr *fakeRunner) *Repmgr {
-	return &Repmgr{Runner: fr, Bin: "repmgr", ConfPath: "/etc/repmgr/repmgr.conf", Now: time.Now}
+	return &Repmgr{Runner: fr, Bin: "repmgr", ConfPath: "/etc/repmgr/repmgr.conf", Password: "secret", Now: time.Now}
 }
 
 func TestCLICommands(t *testing.T) {
@@ -126,6 +126,9 @@ func TestGenerateConfig(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Errorf("config missing %q in:\n%s", want, s)
 		}
+	}
+	if strings.Contains(s, "password=") || strings.Contains(s, "pw") {
+		t.Errorf("repmgr.conf must not contain the password (security H1):\n%s", s)
 	}
 	if info, _ := os.Stat(conf); info.Mode().Perm() != 0o600 {
 		t.Errorf("repmgr.conf mode = %v, want 0600 (carries the conninfo password)", info.Mode().Perm())

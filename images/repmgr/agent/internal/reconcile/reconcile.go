@@ -123,6 +123,9 @@ func Decide(o Observation) Decision {
 			return d(StayPrimary, "", "primary holds lease and is current")
 
 		default: // has data, not running
+			if newer != nil {
+				return d(RejoinForward, newer.Name, "lease holder has data on an older timeline; rejoin forward before starting (never start stale data read-write)")
+			}
 			return d(Wait, "", "has data but not running; start, then reassess next tick")
 		}
 	}

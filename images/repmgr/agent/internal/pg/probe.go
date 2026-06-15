@@ -87,11 +87,15 @@ func NewProber() *Prober { return &Prober{Exec: OSExec{}, Timeout: 10 * time.Sec
 // per-call context bounds total time; PGCONNECT_TIMEOUT bounds the connect phase
 // (mirrors the shell `timeout 10 psql ... connect_timeout=10`).
 func (p *Prober) psql(ctx context.Context, ci ConnInfo, sql string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, p.Timeout)
+	to := p.Timeout
+	if to <= 0 {
+		to = 10 * time.Second // a zero Timeout would make the deadline expire immediately
+	}
+	ctx, cancel := context.WithTimeout(ctx, to)
 	defer cancel()
 	env := []string{
 		"PGPASSWORD=" + ci.Password,
-		fmt.Sprintf("PGCONNECT_TIMEOUT=%d", int(p.Timeout.Seconds())),
+		fmt.Sprintf("PGCONNECT_TIMEOUT=%d", int(to.Seconds())),
 	}
 	args := []string{"-h", ci.Host, "-p", strconv.Itoa(ci.Port), "-U", ci.User, "-d", ci.DB, "-tAc", sql}
 	return p.Exec.Run(ctx, env, "psql", args...)
