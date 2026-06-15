@@ -38,24 +38,25 @@ type Repmgr struct {
 	Bin      string // repmgr binary (default "repmgr")
 	ConfPath string // /etc/repmgr/repmgr.conf
 	DataDir  string // PGDATA (for ReclonePreserving)
+	Password string // cluster-wide repmgr password, supplied to libpq via PGPASSWORD
 	Now      Clock
 }
 
 // NewRepmgr returns a Repmgr with production defaults.
-func NewRepmgr(confPath, dataDir string) *Repmgr {
-	return &Repmgr{Runner: OSRunner{}, Bin: "repmgr", ConfPath: confPath, DataDir: dataDir, Now: time.Now}
+func NewRepmgr(confPath, dataDir, password string) *Repmgr {
+	return &Repmgr{Runner: OSRunner{}, Bin: "repmgr", ConfPath: confPath, DataDir: dataDir, Password: password, Now: time.Now}
 }
 
-func (r *Repmgr) run(ctx context.Context, env []string, args ...string) (string, error) {
+// run invokes repmgr with -f <conf> and PGPASSWORD set to the cluster-wide repmgr
+// password (libpq uses it for every connection). The password is never written to
+// repmgr.conf or passed in argv (security H1).
+func (r *Repmgr) run(ctx context.Context, args ...string) (string, error) {
+	var env []string
+	if r.Password != "" {
+		env = []string{"PGPASSWORD=" + r.Password}
+	}
 	full := append([]string{"-f", r.ConfPath}, args...)
 	return r.Runner.Run(ctx, env, r.Bin, full...)
-}
-
-func pgpass(c Conn) []string {
-	if c.Password == "" {
-		return nil
-	}
-	return []string{"PGPASSWORD=" + c.Password}
 }
 
 func (c Conn) port() int {
@@ -76,14 +77,14 @@ func (c Conn) conninfo() string {
 }
 
 func (r *Repmgr) Promote(ctx context.Context) error {
-	if out, err := r.run(ctx, nil, "standby", "promote"); err != nil {
+	if out, err := r.run(ctx, "standby", "promote"); err != nil {
 		return fmt.Errorf("repmgr standby promote: %w: %s", err, strings.TrimSpace(out))
 	}
 	return nil
 }
 
 func (r *Repmgr) Follow(ctx context.Context, upstreamNodeID int) error {
-	if out, err := r.run(ctx, nil, "standby", "follow", "--upstream-node-id="+strconv.Itoa(upstreamNodeID)); err != nil {
+	if out, err := r.run(ctx, "standby", "follow", "--upstream-node-id="+strconv.Itoa(upstreamNodeID)); err != nil {
 		return fmt.Errorf("repmgr standby follow: %w: %s", err, strings.TrimSpace(out))
 	}
 	return nil
@@ -91,7 +92,7 @@ func (r *Repmgr) Follow(ctx context.Context, upstreamNodeID int) error {
 
 func (r *Repmgr) Clone(ctx context.Context, source Conn) error {
 	args := []string{"standby", "clone", "-h", source.Host, "-p", strconv.Itoa(source.port()), "-U", source.User, "-d", source.DB, "--force"}
-	if out, err := r.run(ctx, pgpass(source), args...); err != nil {
+	if out, err := r.run(ctx, args...); err != nil {
 		return fmt.Errorf("repmgr standby clone from %s: %w: %s", source.Host, err, strings.TrimSpace(out))
 	}
 	return nil
@@ -99,7 +100,7 @@ func (r *Repmgr) Clone(ctx context.Context, source Conn) error {
 
 func (r *Repmgr) RejoinForceRewind(ctx context.Context, target Conn) error {
 	args := []string{"node", "rejoin", "-d", target.conninfo(), "--force-rewind", "--config-files=postgresql.conf,pg_hba.conf"}
-	if out, err := r.run(ctx, pgpass(target), args...); err != nil {
+	if out, err := r.run(ctx, args...); err != nil {
 		// Any rejoin failure means pg_rewind could not proceed; the caller falls
 		// back to ReclonePreserving (the data-safe path, #175).
 		return fmt.Errorf("%w: repmgr node rejoin onto %s: %v: %s", ErrRewindDiverged, target.Host, err, strings.TrimSpace(out))
@@ -108,14 +109,14 @@ func (r *Repmgr) RejoinForceRewind(ctx context.Context, target Conn) error {
 }
 
 func (r *Repmgr) RegisterPrimary(ctx context.Context) error {
-	if out, err := r.run(ctx, nil, "primary", "register", "--force"); err != nil {
+	if out, err := r.run(ctx, "primary", "register", "--force"); err != nil {
 		return fmt.Errorf("repmgr primary register: %w: %s", err, strings.TrimSpace(out))
 	}
 	return nil
 }
 
 func (r *Repmgr) RegisterStandby(ctx context.Context, upstreamNodeID int) error {
-	if out, err := r.run(ctx, nil, "standby", "register", "--upstream-node-id="+strconv.Itoa(upstreamNodeID), "--force"); err != nil {
+	if out, err := r.run(ctx, "standby", "register", "--upstream-node-id="+strconv.Itoa(upstreamNodeID), "--force"); err != nil {
 		return fmt.Errorf("repmgr standby register: %w: %s", err, strings.TrimSpace(out))
 	}
 	return nil
@@ -132,8 +133,10 @@ func (r *Repmgr) GenerateConfig(ctx context.Context, n NodeIdentity, o ConfigOpt
 	if o.UseReplicationSlots {
 		slots = 1
 	}
-	conninfo := fmt.Sprintf("host=%s port=5432 user=%s password=%s dbname=%s connect_timeout=10",
-		n.FQDN, n.ReplUser, n.ReplPassword, n.ReplDB)
+	// The password is NOT written to repmgr.conf (security H1); libpq picks it up
+	// from PGPASSWORD on each repmgr invocation (see run).
+	conninfo := fmt.Sprintf("host=%s port=5432 user=%s dbname=%s connect_timeout=10",
+		n.FQDN, n.ReplUser, n.ReplDB)
 	var b strings.Builder
 	fmt.Fprintf(&b, "node_id=%d\n", n.NodeID)
 	fmt.Fprintf(&b, "node_name='%s'\n", n.NodeName)
