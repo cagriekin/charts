@@ -54,6 +54,27 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create"]
+{{- if eq (include "pg.agentMode" .) "true" }}
+  # Durable primary marker (<fullname>-primary): the agent records the highest
+  # timeline here (#125). In agent mode get/patch are scoped to the one marker
+  # name; create stays unscoped (resourceNames cannot restrict create).
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["{{ include "pg.fullname" . }}-primary"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  # Lease <fullname>-leader is the sole leadership authority (client-go
+  # leaderelection): get/update/patch scoped to that name, create unscoped.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["{{ include "pg.fullname" . }}-leader"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+{{- else }}
   # Durable primary marker (<fullname>-primary): the service-updater records the
   # highest-timeline primary here so a node booting first under OrderedReady can
   # tell it is stale (#125). create cannot be resourceName-scoped; the chart only
@@ -61,7 +82,10 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "create", "patch"]
-{{- if .Values.pgpool.enabled }}
+{{- end }}
+{{- if and .Values.pgpool.enabled (eq (include "pg.repmgrdMode" .) "true") }}
+  # repmgrd mode restarts pgpool on failover; the agent fronts the Services
+  # instead, so this grant is dropped in agent mode.
   - apiGroups: ["apps"]
     resources: ["deployments"]
     resourceNames: ["{{ include "pg.fullname" . }}-pgpool"]
