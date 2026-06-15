@@ -25,6 +25,13 @@ metadata:
   {{- end }}
 spec:
   serviceName: {{ include "pg.fullname" . }}-headless
+  # OrderedReady is REQUIRED by the #125 stale-resurrection guard: on a
+  # full-cluster restart pods must come up lowest-ordinal-first, one at a time,
+  # so a stale lowest-ordinal pod boots ALONE and the guard/service-updater can
+  # refuse to serve it until a newer-timeline peer is up. Parallel would let a
+  # stale and the real primary race and silently defeat the guard. Pinned
+  # explicitly (not left to the API default) so it cannot be changed silently.
+  podManagementPolicy: OrderedReady
   replicas: {{ add .Values.postgresql.replicaCount 1 }}
   {{- with .Values.postgresql.updateStrategy }}
   updateStrategy:
