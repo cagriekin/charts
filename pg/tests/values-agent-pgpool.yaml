@@ -1,0 +1,58 @@
+postgresql:
+  image:
+    repository: postgres
+    tag: 18.1-trixie
+    pullPolicy: IfNotPresent
+
+  replicaCount: 1
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  persistence:
+    enabled: true
+    size: 1Gi
+
+  database: testdb
+  username: testuser
+
+  podDisruptionBudget:
+    enabled: false
+
+repmgr:
+  image:
+    repository: cagriekin/repmgr
+    tag: trixie-5.5.0-16
+    pullPolicy: IfNotPresent
+
+  enabled: true
+  failoverMode: agent
+
+  username: repmgr
+  database: repmgr
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+pgpool:
+  enabled: true
+
+prometheusExporter:
+  enabled: false
+
+backup:
+  enabled: false
+
+service:
+  type: ClusterIP
+  port: 5432

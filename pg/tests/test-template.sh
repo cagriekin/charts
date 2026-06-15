@@ -703,6 +703,73 @@ assert_contains "#172: livenessProbe still present when startupProbe disabled" "
 # silently stop exercising the guard -- fails the suite instead.
 assert_contains "#176: statefulset pins podManagementPolicy OrderedReady (#125 depends on it)" "${sts_repmgr}" "podManagementPolicy: OrderedReady"
 
+# --- agent failover mode (repmgr.failoverMode: agent) ---
+# The lease-based Go agent replaces repmgrd + service-updater. These assert the
+# mode renders correctly while the default repmgrd path stays byte-stable.
+agent_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+# #176: agent mode flips podManagementPolicy to Parallel (complete-candidate
+# survivor selection at cold boot); repmgrd stays OrderedReady (asserted above).
+assert_contains "agent #176: podManagementPolicy Parallel" "${agent_sts}" "podManagementPolicy: Parallel"
+assert_not_contains "agent #176: not OrderedReady in agent mode" "${agent_sts}" "podManagementPolicy: OrderedReady"
+# postgresql container runs the entrypoint 'agent' arm
+assert_contains "agent: postgresql runs the agent arm" "${agent_sts}" '"/usr/local/bin/entrypoint.sh", "agent"'
+# repmgrd + service-updater sidecars are gone
+assert_not_contains "agent: no repmgrd sidecar" "${agent_sts}" "name: repmgrd"
+assert_not_contains "agent: no service-updater sidecar" "${agent_sts}" "name: service-updater"
+# shareProcessNamespace dropped (the agent is PID 1 in the postgresql container)
+assert_not_contains "agent: no shareProcessNamespace" "${agent_sts}" "shareProcessNamespace"
+# agent env + metrics port + liveness wiring (scoped to the postgresql container)
+agent_pg_cont=$(printf '%s\n' "${agent_sts}" | awk '/^        - name: postgresql$/{f=1; next} f && /^        - name: /{exit} f{print}')
+assert_contains "agent: LEASE_NAME env present" "${agent_pg_cont}" "name: LEASE_NAME"
+assert_contains "agent: lease name is <fullname>-leader" "${agent_pg_cont}" "test-pg-leader"
+assert_contains "agent: POD_NAME env present" "${agent_pg_cont}" "name: POD_NAME"
+assert_contains "agent: DCS_BACKEND env present" "${agent_pg_cont}" "name: DCS_BACKEND"
+assert_contains "agent: metrics port 9200 exposed" "${agent_pg_cont}" "containerPort: 9200"
+assert_contains "agent: liveness probes the agent /healthz" "${agent_pg_cont}" "path: /healthz"
+# startupProbe (#172) kept in agent mode
+assert_contains "agent #172: startupProbe kept" "${agent_pg_cont}" "startupProbe:"
+
+# service-updater configmap is not rendered in agent mode
+agent_all=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" 2>&1)
+assert_not_contains "agent: no service-updater configmap" "${agent_all}" "name: test-pg-service-updater"
+
+# agent RBAC: leases + scoped marker, no pods delete in the default log mode
+agent_rbac=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --show-only templates/rbac.yaml 2>&1)
+assert_contains "agent rbac: coordination.k8s.io leases granted" "${agent_rbac}" "coordination.k8s.io"
+assert_contains "agent rbac: lease scoped to <fullname>-leader" "${agent_rbac}" "test-pg-leader"
+assert_contains "agent rbac: configmaps scoped to <fullname>-primary marker" "${agent_rbac}" "test-pg-primary"
+assert_not_contains "agent rbac: no pods delete in log mode" "${agent_rbac}" '"delete"'
+# fence mode re-grants pods delete (split-brain safety net)
+agent_rbac_fence=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.splitBrainDetection.action=fence --show-only templates/rbac.yaml 2>&1)
+assert_contains "agent rbac: fence mode grants pods delete" "${agent_rbac_fence}" '"delete"'
+
+# agent pgpool backends front the RW/RO Services, failover off, health checks on
+agent_pgpool=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent-pgpool.yaml" \
+  --show-only templates/pgpool-configmap.yaml 2>&1)
+assert_contains "agent pgpool: backend0 RW Service ALWAYS_PRIMARY" "${agent_pgpool}" "backend_flag0 = 'ALWAYS_PRIMARY|DISALLOW_TO_FAILOVER'"
+assert_contains "agent pgpool: backend1 is the RO Service" "${agent_pgpool}" "test-pg-readonly"
+assert_contains "agent pgpool: failover disabled" "${agent_pgpool}" "failover_command = ''"
+assert_contains "agent pgpool: fail_over_on_backend_error off" "${agent_pgpool}" "fail_over_on_backend_error = off"
+assert_contains "agent pgpool: sr_check stays on" "${agent_pgpool}" "sr_check_period = 10"
+agent_hc=$(printf '%s\n' "${agent_pgpool}" | awk '/health_check_period =/{print $3; exit}')
+[ "${agent_hc:-0}" -gt 0 ] && agent_hc_ok=ok || agent_hc_ok="period=${agent_hc:-0}"
+assert_eq "agent pgpool: health_check_period non-zero" "ok" "${agent_hc_ok}"
+
+# agent NetworkPolicy opens the 9200 metrics ingress; apiserver egress present
+agent_np=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set networkPolicy.enabled=true --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "agent netpol: 9200 metrics ingress present" "${agent_np}" "port: 9200"
+assert_contains "agent netpol: apiserver egress present" "${agent_np}" "port: 6443"
+
+# regression: default (no failoverMode) still renders repmgrd + service-updater
+default_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "agent regression: default still runs repmgrd" "${default_sts}" "name: repmgrd"
+assert_contains "agent regression: default still runs service-updater" "${default_sts}" "name: service-updater"
+
 # rbac grants configmap access for the marker
 rbac_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/rbac.yaml 2>&1)
