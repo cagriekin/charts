@@ -140,6 +140,10 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 | `postgresql.readinessProbe.periodSeconds` | Check interval | `10` |
 | `postgresql.readinessProbe.timeoutSeconds` | Timeout | `5` |
 | `postgresql.readinessProbe.failureThreshold` | Failure threshold | `6` |
+| `postgresql.startupProbe.enabled` | Enable startup probe (suspends liveness/readiness until PostgreSQL first accepts connections, so the repmgr stale-primary guard and crash recovery are not killed mid-startup) | `true` |
+| `postgresql.startupProbe.periodSeconds` | Check interval | `10` |
+| `postgresql.startupProbe.timeoutSeconds` | Timeout | `5` |
+| `postgresql.startupProbe.failureThreshold` | Failure threshold (`periodSeconds` x this = total startup budget, 600s) | `60` |
 
 ### Pod Disruption Budgets
 
