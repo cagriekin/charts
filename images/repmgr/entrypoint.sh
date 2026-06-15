@@ -207,12 +207,16 @@ hot_standby = on
 hot_standby_feedback = on
 listen_addresses = '*'
 shared_preload_libraries = 'repmgr'
+wal_log_hints = on
+max_replication_slots = 10
+max_slot_wal_keep_size = 4GB
 EOF
 
             if [ "${PGBACKREST_ENABLED:-}" = "true" ]; then
                 cat >> "$PGDATA/postgresql.conf" << PGBR
 archive_mode = on
 archive_command = 'pgbackrest --stanza=${PGBACKREST_STANZA:-db} archive-push %p'
+restore_command = 'pgbackrest --stanza=${PGBACKREST_STANZA:-db} archive-get %f "%p"'
 PGBR
             fi
 
