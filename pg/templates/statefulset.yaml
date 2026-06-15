@@ -34,7 +34,15 @@ spec:
   # refuse to serve it until a newer-timeline peer is up. Parallel would let a
   # stale and the real primary race and silently defeat the guard. Pinned
   # explicitly (not left to the API default) so it cannot be changed silently.
+  {{- if eq (include "pg.agentMode" .) "true" }}
+  # agent mode: Parallel — all pods are present at a cold boot, so the lease winner
+  # compares timelines across the complete candidate set and the highest-timeline
+  # survivor is chosen before any node promotes (immutable; switching needs an STS
+  # recreate, see the migration guide).
+  podManagementPolicy: Parallel
+  {{- else }}
   podManagementPolicy: OrderedReady
+  {{- end }}
   replicas: {{ add .Values.postgresql.replicaCount 1 }}
   {{- with .Values.postgresql.updateStrategy }}
   updateStrategy:
@@ -69,7 +77,11 @@ spec:
       securityContext:
         {{- toYaml .Values.postgresql.podSecurityContext | nindent 8 }}
       {{- if .Values.repmgr.enabled }}
+      {{- if eq (include "pg.repmgrdMode" .) "true" }}
+      # repmgrd mode signals postgres cross-container (failover test); the agent is
+      # PID 1 in the postgresql container and owns its child, so it is not needed.
       shareProcessNamespace: true
+      {{- end }}
       serviceAccountName: {{ include "pg.fullname" . }}-repmgr
       {{- end }}
       {{- with .Values.postgresql.priorityClassName }}
@@ -240,7 +252,11 @@ spec:
           # init container) it detects a peer promoted to a newer timeline and
           # rejoins this node as a standby via pg_rewind instead of resuming as
           # a second primary. See repmgr-docker entrypoint.sh.
+          {{- if eq (include "pg.agentMode" .) "true" }}
+          command: ["/usr/local/bin/entrypoint.sh", "agent"]
+          {{- else }}
           command: ["/usr/local/bin/entrypoint.sh", "postgres"]
+          {{- end }}
 {{- else }}
           image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
@@ -249,6 +265,11 @@ spec:
             - name: postgresql
               containerPort: 5432
               protocol: TCP
+{{- if eq (include "pg.agentMode" .) "true" }}
+            - name: agent-metrics
+              containerPort: 9200
+              protocol: TCP
+{{- end }}
           env:
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
@@ -291,6 +312,30 @@ spec:
                   fieldPath: metadata.namespace
             - name: PRIMARY_MARKER
               value: {{ include "pg.fullname" . }}-primary
+{{- if eq (include "pg.agentMode" .) "true" }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: LEASE_NAME
+              value: {{ include "pg.fullname" . }}-leader
+            - name: LEASE_DURATION
+              value: {{ .Values.repmgr.agent.leaseDuration | quote }}
+            - name: RENEW_DEADLINE
+              value: {{ .Values.repmgr.agent.renewDeadline | quote }}
+            - name: RETRY_PERIOD
+              value: {{ .Values.repmgr.agent.retryPeriod | quote }}
+            - name: RECONCILE_INTERVAL
+              value: {{ .Values.repmgr.agent.reconcileInterval | quote }}
+            - name: MASTER_SERVICE
+              value: {{ include "pg.fullname" . }}
+            - name: POD_SELECTOR
+              value: app.kubernetes.io/name={{ include "pg.name" . }},app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=postgresql
+            - name: DCS_BACKEND
+              value: kubernetes
+            - name: SPLIT_BRAIN_ACTION
+              value: {{ .Values.repmgr.splitBrainDetection.action | quote }}
+{{- end }}
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
             - name: PGBACKREST_ENABLED
@@ -516,11 +561,23 @@ spec:
 {{- end }}
 {{- if .Values.postgresql.livenessProbe.enabled }}
           livenessProbe:
+{{- if eq (include "pg.agentMode" .) "true" }}
+            # In agent mode the agent (PID 1) supervises postgres as a child, so
+            # liveness asserts the agent's reconcile/renew loop is alive (its
+            # /healthz fails when the last successful lease renew is older than
+            # RenewDeadline). A wedged agent that still answered 200 would keep a
+            # stale primary read-write; a dead child postgres is the supervisor's
+            # concern, not the kubelet's.
+            httpGet:
+              path: /healthz
+              port: agent-metrics
+{{- else }}
             exec:
               command:
                 - /bin/bash
                 - -c
                 - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+{{- end }}
             initialDelaySeconds: {{ .Values.postgresql.livenessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.postgresql.livenessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.postgresql.livenessProbe.timeoutSeconds }}
@@ -568,6 +625,8 @@ spec:
 {{- if .Values.repmgr.enabled }}
             - name: repmgr-config
               mountPath: /etc/repmgr
+{{- end }}
+{{- if eq (include "pg.repmgrdMode" .) "true" }}
         - name: repmgrd
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
@@ -804,6 +863,8 @@ spec:
 {{- if .Values.repmgr.enabled }}
         - name: repmgr-config
           emptyDir: {}
+{{- end }}
+{{- if eq (include "pg.repmgrdMode" .) "true" }}
         - name: service-updater-script
           configMap:
             name: {{ include "pg.fullname" . }}-service-updater
