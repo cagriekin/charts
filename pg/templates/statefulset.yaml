@@ -314,6 +314,9 @@ spec:
             - name: PRIMARY_MARKER
               value: {{ include "pg.fullname" . }}-primary
 {{- if eq (include "pg.agentMode" .) "true" }}
+            {{- /* fail fast with a clear message if an overlay nulls out the agent
+                   block, rather than a raw nil-pointer on .leaseDuration below */}}
+            {{- $_ := required "repmgr.agent is required when repmgr.failoverMode=agent" .Values.repmgr.agent }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:

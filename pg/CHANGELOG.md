@@ -30,6 +30,12 @@ which bundles the new `pg-ha-agent` binary.
 
 - Agent mode is opt-in and not yet validated by the live failover suite (added
   in a follow-up). It becomes the default at chart `1.0.0`.
+- The new PostgreSQL settings (`wal_log_hints`, `max_replication_slots`,
+  `max_slot_wal_keep_size`, `restore_command`) are applied at `initdb`, so they
+  take effect on freshly-provisioned clusters only. An existing cluster keeps its
+  current settings on upgrade; to get `wal_log_hints=on` (so `pg_rewind` works
+  without data checksums) and the bounded slot cap, set them via
+  `postgresql.configuration` or apply them manually and restart.
 
 ## 0.5.88
 
