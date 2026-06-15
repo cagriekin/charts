@@ -264,10 +264,10 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		}
 		a.metr.IncPromotion()
 		_ = a.mech.RegisterPrimary(ctx)
-		return a.assertPrimaryRouting(ctx)
+		return a.assertPrimaryRouting(ctx, obs)
 
 	case reconcile.StayPrimary:
-		return a.assertPrimaryRouting(ctx)
+		return a.assertPrimaryRouting(ctx, obs)
 
 	case reconcile.Follow:
 		return a.mech.Follow(ctx, nodeID(dec.Target))
@@ -319,11 +319,34 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 	return nil
 }
 
-func (a *agent) assertPrimaryRouting(ctx context.Context) error {
+// assertPrimaryRouting is run by the holder/primary: it points the write Service
+// at this pod and publishes the cluster's pg-role labels for the read-only Service.
+func (a *agent) assertPrimaryRouting(ctx context.Context, obs reconcile.Observation) error {
 	if _, err := a.kube.PatchWriteSelector(ctx, a.cfg.MasterService, a.cfg.PodName); err != nil {
 		return err
 	}
-	return a.kube.ReconcilePodLabels(ctx, a.cfg.PodSelector, map[string]string{a.cfg.PodName: "primary"})
+	return a.kube.ReconcilePodLabels(ctx, a.cfg.PodSelector, desiredRoleLabels(a.cfg.PodName, obs.Peers))
+}
+
+// desiredRoleLabels builds the pg-role map the primary publishes each tick (the
+// #140 3-way classification): self is the primary; an in-recovery peer is a
+// standby (joins the read-only Service); a reachable non-recovery peer is an
+// orphan (a divergent second primary -- kept OUT of read traffic); an unreachable
+// peer is omitted so ReconcilePodLabels leaves its label untouched rather than
+// churning a node it cannot classify.
+func desiredRoleLabels(self string, peers []reconcile.PeerState) map[string]string {
+	m := map[string]string{self: "primary"}
+	for _, p := range peers {
+		switch {
+		case !p.Reachable:
+			// omit: leave the label untouched
+		case p.Role == pg.RoleStandby:
+			m[p.Name] = "standby"
+		case p.Role == pg.RolePrimary:
+			m[p.Name] = "orphan"
+		}
+	}
+	return m
 }
 
 func (a *agent) selfConn() pg.ConnInfo {
