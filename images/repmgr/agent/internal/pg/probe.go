@@ -157,6 +157,24 @@ func (p *Prober) StandbyReceiveLSN(ctx context.Context, ci ConnInfo) (recv LSN, 
 	return recv, true, nil
 }
 
+// StandbyTimeline reads a standby's current timeline from the control file
+// (pg_control_checkpoint), since pg_walfile_name(pg_current_wal_lsn()) is
+// primary-only -- without it a RUNNING standby has no timeline, so unsafeToServe's
+// "timeline unreadable" guard would refuse to ever promote it (failover would
+// livelock). The control-file timeline is printed decimal, like pg_controldata
+// (NOT the hex WAL-file timeline), so it is parsed base 10.
+func (p *Prober) StandbyTimeline(ctx context.Context, ci ConnInfo) (tl Timeline, ok bool, err error) {
+	out, err := p.psql(ctx, ci, "SELECT timeline_id FROM pg_control_checkpoint();")
+	if err != nil {
+		return 0, false, err
+	}
+	n, perr := strconv.ParseUint(strings.TrimSpace(out), 10, 32)
+	if perr != nil {
+		return 0, false, nil
+	}
+	return Timeline(n), true, nil
+}
+
 // Probe classifies a node by its actual role and reads the WAL position relevant
 // to that role. An unreachable node returns NodeState{Host, Reachable:false}.
 func (p *Prober) Probe(ctx context.Context, ci ConnInfo) NodeState {
@@ -170,6 +188,9 @@ func (p *Prober) Probe(ctx context.Context, ci ConnInfo) NodeState {
 		ns.Role = RoleStandby
 		if recv, ok, _ := p.StandbyReceiveLSN(ctx, ci); ok {
 			ns.WriteLSN, ns.LSNOK = recv, true
+		}
+		if tl, ok, _ := p.StandbyTimeline(ctx, ci); ok {
+			ns.Timeline, ns.TimelineOK = tl, true
 		}
 		return ns
 	}
