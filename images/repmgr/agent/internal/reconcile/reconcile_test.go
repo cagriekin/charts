@@ -16,6 +16,12 @@ func standby(name string, t uint32, hi, lo uint64) PeerState {
 	return PeerState{Name: name, Reachable: true, Role: pg.RoleStandby, Timeline: tl(t), TimelineOK: true, LSN: ls(hi, lo), LSNOK: true}
 }
 
+// gossipPeer is an unreachable peer whose position is known only from gossip (its
+// role is unknown -- gossip carries position, not a trusted role).
+func gossipPeer(name string, t uint32, hi, lo uint64) PeerState {
+	return PeerState{Name: name, Reachable: false, Gossip: true, Role: pg.RoleUnknown, Timeline: tl(t), TimelineOK: true, LSN: ls(hi, lo), LSNOK: true}
+}
+
 func TestDecide(t *testing.T) {
 	localStandby := LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: ls(5, 0x100), LSNOK: true}
 	localPrimary := LocalState{HasData: true, Running: true, InRecovery: false, Timeline: tl(5), TimelineOK: true, LSN: ls(5, 0x100), LSNOK: true}
@@ -24,6 +30,9 @@ func TestDecide(t *testing.T) {
 	// dataStopped is on-disk primary state, dataStoppedStandby is on-disk standby state.
 	dataStopped := LocalState{HasData: true, Running: false, Timeline: tl(5), TimelineOK: true}
 	dataStoppedStandby := LocalState{HasData: true, Running: false, InRecovery: true, Timeline: tl(5), TimelineOK: true}
+	// a stopped primary whose controldata checkpoint LSN was read (LSNOK), so it can
+	// be compared against a gossiped peer position.
+	dataStoppedLSN := LocalState{HasData: true, Running: false, Timeline: tl(5), TimelineOK: true, LSN: ls(5, 0x100), LSNOK: true}
 
 	cases := []struct {
 		name       string
@@ -76,6 +85,14 @@ func TestDecide(t *testing.T) {
 		{"holder + stuck primary + single node -> restart in place", Observation{HoldLease: true, Local: dataStopped, LocalStuck: true}, RestartLocal, ""},
 		// Stuck but below highwater still fails closed (release) before self-health restart is considered.
 		{"holder + stuck primary + below highwater -> release (highwater first)", Observation{HoldLease: true, Local: dataStopped, LocalStuck: true, Marker: MarkerState{Present: true, Timeline: tl(6)}}, ReleaseLease, ""},
+
+		// --- LSN gossip: rank an unreachable peer's gossiped position at cold boot ---
+		// A running standby holder sees an unreachable peer that gossips a higher same-timeline LSN: release.
+		{"holder standby + more-advanced gossip peer -> release", Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{gossipPeer("pg-2", 5, 5, 0x200)}}, ReleaseLease, "pg-2"},
+		// A stopped primary-state holder likewise steps aside for a more-advanced gossip peer.
+		{"holder primary-state stopped + more-advanced gossip peer -> release", Observation{HoldLease: true, Local: dataStoppedLSN, Peers: []PeerState{gossipPeer("pg-2", 5, 5, 0x200)}}, ReleaseLease, "pg-2"},
+		// A gossip peer that is BEHIND must not cause a spurious release: the holder starts.
+		{"holder primary-state stopped + behind gossip peer -> start", Observation{HoldLease: true, Local: dataStoppedLSN, Peers: []PeerState{gossipPeer("pg-2", 5, 5, 0x10)}}, StartLocal, ""},
 	}
 
 	for _, c := range cases {

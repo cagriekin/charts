@@ -56,10 +56,15 @@ type LocalState struct {
 	LSNOK      bool
 }
 
-// PeerState is a reachable sibling's observed state (from pg.Probe).
+// PeerState is a sibling's observed state. Position (Timeline/LSN) comes from a
+// live SQL probe when Reachable, or from the peer's gossiped pod annotation when
+// not (Gossip=true) -- the latter lets the most-advanced election rank a
+// stopped/unreachable peer at cold boot. A gossip-only peer is never a rewind or
+// follow target (it is unreachable); it only informs the release/handoff decision.
 type PeerState struct {
 	Name       string
 	Reachable  bool
+	Gossip     bool // position is from gossip (peer not SQL-reachable)
 	Role       pg.Role
 	Timeline   pg.Timeline
 	TimelineOK bool
@@ -140,6 +145,13 @@ func Decide(o Observation) Decision {
 				if bad, why := unsafeToServe(o); bad {
 					return d(ReleaseLease, "", "stopped primary-state data must not start read-write: "+why)
 				}
+				// Most-advanced election (invariant 8): if a peer has more WAL on this
+				// timeline -- reachable, or stopped-but-gossiping its position -- release
+				// so it wins the lease and serves, rather than starting here and
+				// discarding its tail (the cold-boot RPO gap LSN gossip closes).
+				if t := moreAdvancedPeer(o); t != "" {
+					return d(ReleaseLease, t, "a peer has more WAL on this timeline (incl. gossip); release so the most-advanced node serves (invariant 8)")
+				}
 				// Self-health: a previously-running primary stuck unreachable past the
 				// grace (frozen/wedged) cannot be recovered by Start. Fail over to a
 				// standby if one exists; on a single node force-restart in place (no
@@ -218,17 +230,21 @@ func sameTimelinePrimary(o Observation) *PeerState {
 //     ReleaseLease, which now actually releases the Lease (DCS.Release), so the
 //     highest-timeline node (its timeline == the marker it wrote) wins the freed
 //     Lease and serves. This is the C2 "lower-timeline pod boots first" case.
-//   - same-timeline, reachable peers: moreAdvancedPeer hands off to a peer with
-//     more WAL on the local timeline.
+//   - same-timeline peers: moreAdvancedPeer hands off to a peer with more WAL on
+//     the local timeline -- whether reachable (live LSN) or stopped-but-gossiping
+//     its pg_controldata LSN to its pod annotation (LSN gossip). A stopped
+//     primary-state ex-primary the flap-fix holds is therefore no longer invisible
+//     at election time: its position is ranked and the less-advanced winner
+//     releases for it.
 //
-// RESIDUAL (documented async-RPO limit, NOT yet closed): a more-advanced peer on
-// the SAME timeline that is UNREACHABLE during the election -- e.g. a stopped
-// primary-state ex-primary the flap-fix holds rather than starting read-write --
-// is invisible here (the marker is timeline-granular, not LSN). A less-advanced
-// node can then promote and the ex-primary's un-replicated tail is discarded when
-// it later rejoins. Closing this needs LSN gossip across stopped nodes (publish
-// each node's pg_controldata LSN to an observable object and rank on it); deferred
-// to a follow-up. Two-writer safety is unaffected -- only RPO at cold boot.
+// RESIDUAL (small, documented): a stopped node gossips its checkpoint LSN, which
+// for a CRASHED node is a lower bound on its true end-of-WAL. In the normal
+// single-primary topology this still ranks correctly (the primary's checkpoint
+// dominates the standbys it feeds), so the only exposure is a divergent
+// same-timeline split-brain (handled separately by the marker/fence). A peer whose
+// agent is also dead (no fresh gossip, not SQL-reachable) is ranked as unknown and
+// the holder proceeds -- a double-fault, not the common cold boot. Two-writer
+// safety is never affected -- this is purely cold-boot RPO.
 //
 // unsafeToServe ports the evaluate_lone_primary guard (#171/#173/#174): refuse to
 // promote/serve when the marker is malformed, the local timeline is unreadable
@@ -308,8 +324,8 @@ func moreAdvancedPeer(o Observation) string {
 	var bestLSN pg.LSN
 	for i := range o.Peers {
 		p := &o.Peers[i]
-		if !p.Reachable {
-			continue
+		if !p.Reachable && !p.Gossip {
+			continue // no known position for this peer
 		}
 		if !peerAhead(*p, o.Local) {
 			continue
