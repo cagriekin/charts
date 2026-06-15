@@ -237,14 +237,23 @@ func sameTimelinePrimary(o Observation) *PeerState {
 //     at election time: its position is ranked and the less-advanced winner
 //     releases for it.
 //
-// RESIDUAL (small, documented): a stopped node gossips its checkpoint LSN, which
-// for a CRASHED node is a lower bound on its true end-of-WAL. In the normal
-// single-primary topology this still ranks correctly (the primary's checkpoint
-// dominates the standbys it feeds), so the only exposure is a divergent
-// same-timeline split-brain (handled separately by the marker/fence). A peer whose
-// agent is also dead (no fresh gossip, not SQL-reachable) is ranked as unknown and
-// the holder proceeds -- a double-fault, not the common cold boot. Two-writer
-// safety is never affected -- this is purely cold-boot RPO.
+// RESIDUAL (documented, cold-boot RPO only -- never a two-writer risk):
+//   - A stopped node gossips its pg_controldata CHECKPOINT LSN. After a graceful
+//     shutdown that equals the true end-of-WAL (shutdown checkpoint), so a planned
+//     full-cluster restart ranks exactly. After an UNGRACEFUL crash (power loss,
+//     OOM-kill) the checkpoint lags the true end by up to a checkpoint interval of
+//     WAL. A running standby reports its LIVE replay LSN, which can sit ahead of a
+//     crashed primary's last checkpoint -- so the crashed ex-primary can be
+//     under-ranked and a less-advanced standby promoted, discarding the ex-primary's
+//     acknowledged tail when it rejoins. This is no worse than before gossip, but it
+//     is NOT fully closed for crash cold-boots. The exact fix (deferred): start a
+//     held primary-state node with standby.signal so it replays its own WAL to the
+//     true end and reports an exact LSN read-only (then it is SQL-reachable and
+//     ranked precisely, no gossip estimate). Within async replication's inherent
+//     RPO>0 this lost tail was also un-replicated, but at cold boot the ex-primary
+//     IS present, so a sound election could have preserved it.
+//   - A peer whose agent is also dead (no fresh gossip, not SQL-reachable) is ranked
+//     unknown and the holder proceeds -- a double-fault, not the common cold boot.
 //
 // unsafeToServe ports the evaluate_lone_primary guard (#171/#173/#174): refuse to
 // promote/serve when the marker is malformed, the local timeline is unreadable
