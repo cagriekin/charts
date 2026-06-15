@@ -38,7 +38,16 @@ func TestK8sDCSAcquiresLeadership(t *testing.T) {
 	if !k.IsLeader() {
 		t.Error("IsLeader() = false after acquiring")
 	}
-	if got := k.Leader(); got != "pod-0" {
+	// OnNewLeader (which sets Leader()) is a separate callback that can lag the
+	// OnAcquired close by a scheduling tick, so poll rather than read once.
+	var got string
+	for i := 0; i < 100; i++ {
+		if got = k.Leader(); got == "pod-0" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got != "pod-0" {
 		t.Errorf("Leader() = %q, want pod-0", got)
 	}
 }
