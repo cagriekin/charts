@@ -442,11 +442,29 @@ spec:
                         {{- end }}
                         {{- if .Values.postgresql.pgHba }}
                         HBA_FILE_USER=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
-                        {{- range .Values.postgresql.pgHba }}
-                        if ! grep -qF '{{ . }}' "$HBA_FILE_USER"; then
-                          sed -i '$ a {{ . }}' "$HBA_FILE_USER"
+                        # pg_hba.conf is first-match-wins. The repmgr image writes broad
+                        # 10.0.0.0/8 and 0.0.0.0/0 catch-alls, so user entries appended at
+                        # EOF (the previous behavior) could never match an IPv4 host (#144).
+                        # Insert them above the first non-loopback host rule -- below the
+                        # local/loopback trust rules, above every network auth rule -- so
+                        # user trust/reject/scram overrides actually take effect. Idempotent
+                        # via the sentinel; order among entries is preserved.
+                        HBA_USER_SENTINEL="# cagriekin-charts: user pgHba entries (above network auth rules)"
+                        if [ -n "$HBA_FILE_USER" ] && [ -f "$HBA_FILE_USER" ] && ! grep -qF "$HBA_USER_SENTINEL" "$HBA_FILE_USER"; then
+                          HBA_USER_TMP="${HBA_FILE_USER}.cagriekin-user.tmp"
+                          awk -v ins=0 '
+                            !ins && $1 == "host" && $4 != "127.0.0.1/32" && $4 != "::1/128" {
+                              print "# cagriekin-charts: user pgHba entries (above network auth rules)"
+                              {{- range .Values.postgresql.pgHba }}
+                              print "{{ . }}"
+                              {{- end }}
+                              ins=1
+                            }
+                            { print }
+                          ' "$HBA_FILE_USER" > "$HBA_USER_TMP"
+                          cp "$HBA_USER_TMP" "$HBA_FILE_USER"
+                          rm -f "$HBA_USER_TMP"
                         fi
-                        {{- end }}
                         {{- end }}
                         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
