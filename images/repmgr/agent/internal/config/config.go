@@ -111,10 +111,12 @@ func Load(get func(string) string) (*Config, error) {
 				c.LeaseDuration, c.RenewDeadline, c.RetryPeriod))
 		}
 	}
-	switch c.DCSBackend {
-	case "", "kubernetes", "etcd":
-	default:
+	// Validate enums only when present (an empty value is already a "missing" error).
+	if c.DCSBackend != "" && c.DCSBackend != "kubernetes" && c.DCSBackend != "etcd" {
 		l.invalid = append(l.invalid, fmt.Sprintf("DCS_BACKEND=%q (want kubernetes|etcd)", c.DCSBackend))
+	}
+	if c.SplitBrainAction != "" && c.SplitBrainAction != "log" && c.SplitBrainAction != "fence" {
+		l.invalid = append(l.invalid, fmt.Sprintf("SPLIT_BRAIN_ACTION=%q (want log|fence)", c.SplitBrainAction))
 	}
 
 	if len(l.missing) > 0 || len(l.invalid) > 0 {
@@ -126,3 +128,16 @@ func Load(get func(string) string) (*Config, error) {
 
 // FromEnv loads the config from the process environment.
 func FromEnv() (*Config, error) { return Load(os.Getenv) }
+
+// String renders the config with the repmgr password redacted, so logging the
+// config (e.g. at startup) never leaks the secret. fmt uses this for %v/%s/%+v.
+func (c Config) String() string {
+	return fmt.Sprintf("Config{PodName:%s Namespace:%s LeaseName:%s "+
+		"LeaseDuration:%s RenewDeadline:%s RetryPeriod:%s ReconcileInterval:%s "+
+		"HeadlessService:%s NodeCount:%d MasterService:%s MarkerName:%s PodSelector:%q "+
+		"RepmgrUser:%s RepmgrDB:%s RepmgrPassword:*** PGDATA:%s DCSBackend:%s SplitBrainAction:%s}",
+		c.PodName, c.Namespace, c.LeaseName,
+		c.LeaseDuration, c.RenewDeadline, c.RetryPeriod, c.ReconcileInterval,
+		c.HeadlessService, c.NodeCount, c.MasterService, c.MarkerName, c.PodSelector,
+		c.RepmgrUser, c.RepmgrDB, c.PGDATA, c.DCSBackend, c.SplitBrainAction)
+}

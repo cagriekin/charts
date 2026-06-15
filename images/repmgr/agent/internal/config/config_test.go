@@ -73,3 +73,26 @@ func TestLoadRejectsBadDCSBackend(t *testing.T) {
 		t.Errorf("expected DCS_BACKEND validation error, got %v", err)
 	}
 }
+
+func TestLoadRejectsBadSplitBrainAction(t *testing.T) {
+	m := fullEnv()
+	m["SPLIT_BRAIN_ACTION"] = "nuke"
+	_, err := Load(getter(m))
+	if err == nil || !strings.Contains(err.Error(), "SPLIT_BRAIN_ACTION") {
+		t.Errorf("expected SPLIT_BRAIN_ACTION validation error, got %v", err)
+	}
+}
+
+func TestStringRedactsPassword(t *testing.T) {
+	c, err := Load(getter(fullEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := c.String()
+	if strings.Contains(s, "secret") {
+		t.Errorf("String() leaked the password: %s", s)
+	}
+	if !strings.Contains(s, "RepmgrPassword:***") {
+		t.Errorf("String() should mask the password: %s", s)
+	}
+}
