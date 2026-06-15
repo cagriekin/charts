@@ -1,0 +1,25 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+README.md
+*.md
+
+# Docker
+Dockerfile*
+.dockerignore
+
+# Development files
+.idea
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp

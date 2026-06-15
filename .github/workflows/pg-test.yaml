@@ -9,12 +9,12 @@ on:
       - master
     paths:
       - 'pg/**'
+      - 'images/repmgr/**'
       - '.github/workflows/pg-test.yaml'
 
 env:
   IMAGES: >-
     postgres:18.1-trixie
-    cagriekin/repmgr:trixie-5.5.0-15
     cagriekin/pgpool:4.7.1
     pgpool/pgpool2_exporter:1.2.2
     quay.io/prometheuscommunity/postgres-exporter:v0.19.1
@@ -63,6 +63,26 @@ jobs:
             docker save "$image" -o "/tmp/kind-images/${safe_name}.tar"
             kind load image-archive "/tmp/kind-images/${safe_name}.tar" --name pg-test
           done
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The repmgr image is built from source (images/repmgr) rather than pulled,
+      # so an image change is tested together with the chart in one PR. The tag is
+      # read from pg/values.yaml so the locally-built image satisfies the chart's
+      # IfNotPresent pull policy without a registry round-trip. buildx + gha cache
+      # keeps the apt-heavy image build off the critical path on cache hits.
+      - name: Build repmgr image from source and load into Kind
+        run: |
+          set -euo pipefail
+          tag=$(awk '/^repmgr:/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
+          if [ -z "$tag" ]; then echo "could not resolve repmgr image tag from pg/values.yaml" >&2; exit 1; fi
+          echo "Building cagriekin/repmgr:${tag} from images/repmgr"
+          docker buildx build --load \
+            --cache-from type=gha,scope=repmgr-image \
+            --cache-to type=gha,mode=max,scope=repmgr-image \
+            -t "cagriekin/repmgr:${tag}" images/repmgr
+          kind load docker-image "cagriekin/repmgr:${tag}" --name pg-test
 
       - name: Run template tests
         run: make -C pg test-template
