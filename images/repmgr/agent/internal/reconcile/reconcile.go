@@ -211,6 +211,25 @@ func sameTimelinePrimary(o Observation) *PeerState {
 	return nil
 }
 
+// Cold-boot election (full-cluster restart, podManagementPolicy: Parallel).
+// Leadership is granted arbitrarily by the Lease, so a less-advanced node can win.
+// Two gates converge the cluster on the right primary WITHOUT two writers:
+//   - cross-timeline: a winner below the marker highwater is unsafeToServe ->
+//     ReleaseLease, which now actually releases the Lease (DCS.Release), so the
+//     highest-timeline node (its timeline == the marker it wrote) wins the freed
+//     Lease and serves. This is the C2 "lower-timeline pod boots first" case.
+//   - same-timeline, reachable peers: moreAdvancedPeer hands off to a peer with
+//     more WAL on the local timeline.
+//
+// RESIDUAL (documented async-RPO limit, NOT yet closed): a more-advanced peer on
+// the SAME timeline that is UNREACHABLE during the election -- e.g. a stopped
+// primary-state ex-primary the flap-fix holds rather than starting read-write --
+// is invisible here (the marker is timeline-granular, not LSN). A less-advanced
+// node can then promote and the ex-primary's un-replicated tail is discarded when
+// it later rejoins. Closing this needs LSN gossip across stopped nodes (publish
+// each node's pg_controldata LSN to an observable object and rank on it); deferred
+// to a follow-up. Two-writer safety is unaffected -- only RPO at cold boot.
+//
 // unsafeToServe ports the evaluate_lone_primary guard (#171/#173/#174): refuse to
 // promote/serve when the marker is malformed, the local timeline is unreadable
 // (even with no marker), the local timeline is below the highwater, or a different
