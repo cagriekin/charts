@@ -196,6 +196,7 @@ func (a *agent) boot(ctx context.Context) error {
 func (a *agent) tick(ctx context.Context) {
 	a.metr.Beat()
 	obs := a.observe(ctx)
+	a.publishStatus(ctx, obs.Local)
 	dec := reconcile.Decide(obs)
 	observe.Audit(a.log, obs.HoldLease, dec.Action.String(), dec.Target, dec.Reason)
 	a.opMu.Lock()
@@ -228,6 +229,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		} else {
 			ls.Timeline, ls.TimelineOK = cd.Timeline, cd.TimelineOK
 			ls.InRecovery = cd.InRecovery
+			ls.LSN, ls.LSNOK = cd.LSN, cd.LSNOK // checkpoint LSN: position for gossip ranking while stopped
 		}
 	}
 	o := reconcile.Observation{
@@ -235,16 +237,34 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		LeaderIdentity: a.dcs.Leader(),
 		Local:          ls,
 	}
+	// Peers' gossiped positions (pod annotations) let the most-advanced election
+	// rank a stopped/unreachable peer at cold boot. Best-effort: a read failure
+	// just means no gossip this tick.
+	gossip, gerr := a.kube.ReadPeerStatuses(ctx, a.cfg.PodSelector, a.cfg.PodName)
+	if gerr != nil {
+		a.log.Warn("read peer statuses (gossip)", "err", gerr)
+	}
 	for i := 0; i < a.cfg.NodeCount; i++ {
 		name := a.base + "-" + strconv.Itoa(i)
 		if name == a.cfg.PodName {
 			continue
 		}
 		ns := a.prober.Probe(ctx, a.peerConn(name))
-		o.Peers = append(o.Peers, reconcile.PeerState{
+		ps := reconcile.PeerState{
 			Name: name, Reachable: ns.Reachable, Role: ns.Role,
 			Timeline: ns.Timeline, TimelineOK: ns.TimelineOK, LSN: ns.WriteLSN, LSNOK: ns.LSNOK,
-		})
+		}
+		// An unreachable peer with fresh gossip contributes its self-reported
+		// position to the election (it is never a rewind/follow target -- only the
+		// release/handoff decision uses it).
+		if !ps.Reachable {
+			if g, ok := gossip[name]; ok && a.gossipFresh(g) {
+				ps.Gossip = true
+				ps.Timeline, ps.TimelineOK = pg.Timeline(g.Timeline), g.TimelineOK
+				ps.LSN, ps.LSNOK = pg.LSN{Hi: g.LSNHi, Lo: g.LSNLo}, g.LSNOK
+			}
+		}
+		o.Peers = append(o.Peers, ps)
 	}
 	m, err := a.kube.ReadMarker(ctx, a.cfg.MarkerName)
 	if err != nil {
@@ -346,6 +366,33 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 
 // assertPrimaryRouting is run by the holder/primary: it points the write Service
 // at this pod and publishes the cluster's pg-role labels for the read-only Service.
+// publishStatus gossips this node's WAL position to its own pod annotation so the
+// lease holder can rank it at election time even when it is stopped/unreachable.
+func (a *agent) publishStatus(ctx context.Context, ls reconcile.LocalState) {
+	if !ls.HasData {
+		return // nothing meaningful to report yet
+	}
+	st := k8s.NodeStatus{
+		Timeline: uint32(ls.Timeline), TimelineOK: ls.TimelineOK,
+		LSNHi: ls.LSN.Hi, LSNLo: ls.LSN.Lo, LSNOK: ls.LSNOK,
+		UpdatedAtUnix: time.Now().Unix(),
+	}
+	if err := a.kube.PublishStatus(ctx, a.cfg.PodName, st); err != nil {
+		a.log.Warn("publish status (gossip)", "err", err)
+	}
+}
+
+// gossipFresh reports whether a peer's gossiped status is recent enough to trust
+// (a wedged/dead agent stops refreshing it). The window is generous relative to
+// the reconcile cadence; cross-node clocks are assumed NTP-synced.
+func (a *agent) gossipFresh(g k8s.NodeStatus) bool {
+	if g.UpdatedAtUnix == 0 {
+		return false
+	}
+	age := time.Now().Unix() - g.UpdatedAtUnix
+	return age >= 0 && time.Duration(age)*time.Second <= 4*a.cfg.ReconcileInterval
+}
+
 func (a *agent) assertPrimaryRouting(ctx context.Context, obs reconcile.Observation) error {
 	if _, err := a.kube.PatchWriteSelector(ctx, a.cfg.MasterService, a.cfg.PodName); err != nil {
 		return err

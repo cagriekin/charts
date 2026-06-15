@@ -15,6 +15,12 @@ type ControlInfo struct {
 	Timeline   Timeline // "Latest checkpoint's TimeLineID"
 	TimelineOK bool
 	InRecovery bool // on-disk standby state ("in archive recovery" / "shut down in recovery")
+	// LSN is the "Latest checkpoint location" -- the best WAL position available
+	// without a running server. For a cleanly shut-down node this is the end of
+	// WAL (shutdown checkpoint); for a crashed node it is a lower bound (WAL may
+	// exist past the last online checkpoint). Used for cold-boot LSN gossip.
+	LSN   LSN
+	LSNOK bool
 }
 
 // ReadControlData runs `pg_controldata -D <dataDir>` and parses the cluster state
@@ -49,6 +55,10 @@ func parseControlData(out string) ControlInfo {
 		case "Latest checkpoint's TimeLineID":
 			if n, err := strconv.ParseUint(val, 10, 32); err == nil {
 				ci.Timeline, ci.TimelineOK = Timeline(n), true
+			}
+		case "Latest checkpoint location":
+			if lsn, ok := ParseLSN(val); ok {
+				ci.LSN, ci.LSNOK = lsn, true
 			}
 		}
 	}

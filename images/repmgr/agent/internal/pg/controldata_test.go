@@ -87,4 +87,8 @@ func TestReadControlDataOK(t *testing.T) {
 	if !ci.InRecovery || !ci.TimelineOK || ci.Timeline != 7 {
 		t.Errorf("got %+v, want InRecovery=true Timeline=7", ci)
 	}
+	// "Latest checkpoint location: 0/14D8C18" -> the gossip-ranking LSN.
+	if !ci.LSNOK || ci.LSN.Hi != 0 || ci.LSN.Lo != 0x14D8C18 {
+		t.Errorf("checkpoint LSN = (%+v, ok=%v), want 0/14D8C18", ci.LSN, ci.LSNOK)
+	}
 }
