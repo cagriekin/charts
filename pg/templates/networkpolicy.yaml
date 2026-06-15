@@ -48,8 +48,14 @@ spec:
 {{- if .Values.networkPolicy.postgresql.allowExternal }}
         - podSelector: {}
 {{- end }}
+{{- /*
+extraIngress entries are full ingress rules (each with its own from/ports),
+spliced at the rules level -- symmetric with extraEgress. Previously they were
+injected into the 5432 rule's `from:` list, which rejected rule-shaped input at
+apply time and silently restricted peer-shaped input to port 5432 (#136).
+*/}}
 {{- with .Values.networkPolicy.postgresql.extraIngress }}
-        {{- toYaml . | nindent 8 }}
+    {{- toYaml . | nindent 4 }}
 {{- end }}
   egress:
     - ports:
@@ -130,8 +136,22 @@ spec:
           protocol: TCP
       from:
         - podSelector: {}
+{{- if .Values.pgpool.metrics.enabled }}
+{{- /*
+pgpool advertises Prometheus scraping on 9719 (the pgpool2_exporter sidecar);
+without this rule the CNI drops every scrape and pgpool metrics silently
+disappear despite the scrape annotations the chart itself emits (#135). Mirrors
+the prometheus-exporter policy's 9116 rule.
+*/}}
+    - ports:
+        - port: 9719
+          protocol: TCP
+      from:
+        - podSelector: {}
+{{- end }}
+{{- /* extraIngress: full ingress rules at the rules level, symmetric with extraEgress (#136) */}}
 {{- with .Values.networkPolicy.pgpool.extraIngress }}
-        {{- toYaml . | nindent 8 }}
+    {{- toYaml . | nindent 4 }}
 {{- end }}
   egress:
     - ports:
