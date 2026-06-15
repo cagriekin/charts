@@ -2,6 +2,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
 	"github.com/cagriekin/pg-ha-agent/internal/reconcile"
@@ -26,6 +27,50 @@ func TestDesiredRoleLabels(t *testing.T) {
 	}
 	if _, ok := got["pg-3"]; ok {
 		t.Error("unreachable peer must be omitted so its label is left untouched (#140)")
+	}
+}
+
+func TestSelfHealthTracker(t *testing.T) {
+	t0 := time.Unix(1_700_000_000, 0)
+	h := &selfHealthTracker{grace: 15 * time.Second}
+
+	// A slow startup (should serve, never been running) must NOT arm the timer,
+	// even well past the grace -- otherwise crash-recovery WAL replay looks "stuck".
+	if h.stuck(true, false, t0) {
+		t.Fatal("startup (never running) must not be stuck")
+	}
+	if h.stuck(true, false, t0.Add(60*time.Second)) {
+		t.Fatal("never-running data must never trip self-health")
+	}
+
+	// Once it comes up healthy the tracker is primed.
+	if h.stuck(true, true, t0.Add(61*time.Second)) {
+		t.Fatal("a running primary is not stuck")
+	}
+
+	// It then goes unreachable (frozen): not stuck until the grace elapses, then stuck.
+	base := t0.Add(70 * time.Second)
+	if h.stuck(true, false, base) {
+		t.Fatal("just-unreachable primary should not be stuck before the grace")
+	}
+	if h.stuck(true, false, base.Add(14*time.Second)) {
+		t.Fatal("within grace must not be stuck")
+	}
+	if !h.stuck(true, false, base.Add(15*time.Second)) {
+		t.Fatal("past the grace the wedged primary must be stuck")
+	}
+
+	// Recovery (running again) clears the timer; a later blip re-arms from scratch.
+	if h.stuck(true, true, base.Add(20*time.Second)) {
+		t.Fatal("recovered primary is not stuck")
+	}
+	if h.stuck(true, false, base.Add(21*time.Second)) {
+		t.Fatal("a fresh unreachable period must re-arm, not carry the old timer")
+	}
+
+	// Losing the holder role (or becoming a standby) resets everything.
+	if h.stuck(false, false, base.Add(100*time.Second)) {
+		t.Fatal("a non-serving node is never stuck")
 	}
 }
 

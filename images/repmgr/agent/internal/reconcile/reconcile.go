@@ -24,13 +24,14 @@ const (
 	Follow                   // not holder, standby: follow Target (the leader)
 	DemoteFence              // read-write without the lease: demote now (soft fence)
 	RejoinForward            // local data behind Target's newer timeline: rewind forward
-	ReleaseLease             // holds lease but must not serve (stale/behind): release + step down
+	ReleaseLease             // holds lease but must not serve (stale/behind/unhealthy): release + step down
 	StartLocal               // initialized but stopped, and safe to start in its on-disk role
+	RestartLocal             // stuck single-node primary: force-restart postgres in place (no peer to fail over to)
 )
 
 func (a Action) String() string {
 	return [...]string{"NoOp", "Wait", "BootstrapInitdb", "BootstrapClone", "Promote",
-		"StayPrimary", "Follow", "DemoteFence", "RejoinForward", "ReleaseLease", "StartLocal"}[a]
+		"StayPrimary", "Follow", "DemoteFence", "RejoinForward", "ReleaseLease", "StartLocal", "RestartLocal"}[a]
 }
 
 // Decision is the chosen action plus the peer it targets and a human reason for
@@ -81,6 +82,11 @@ type Observation struct {
 	Local          LocalState
 	Peers          []PeerState
 	Marker         MarkerState
+	// LocalStuck is set by the agent (a stateful, time-based signal) when a
+	// previously-running local primary has been unreachable past the self-health
+	// grace -- a frozen/wedged postmaster that Start cannot recover and the
+	// reconcile-loop liveness probe won't catch. It drives self-health failover.
+	LocalStuck bool
 }
 
 // Decide maps an Observation to the single action to take.
@@ -133,6 +139,16 @@ func Decide(o Observation) Decision {
 				// read-write even as the lease holder.
 				if bad, why := unsafeToServe(o); bad {
 					return d(ReleaseLease, "", "stopped primary-state data must not start read-write: "+why)
+				}
+				// Self-health: a previously-running primary stuck unreachable past the
+				// grace (frozen/wedged) cannot be recovered by Start. Fail over to a
+				// standby if one exists; on a single node force-restart in place (no
+				// peer to take over -- releasing would strand the only node).
+				if o.LocalStuck {
+					if len(o.Peers) == 0 {
+						return d(RestartLocal, "", "single-node primary stuck unhealthy; force-restart postgres in place")
+					}
+					return d(ReleaseLease, "", "primary stuck unhealthy and standbys exist; release the lease for failover (self-health)")
 				}
 			}
 			return d(StartLocal, "", "lease holder, initialized but stopped: start (role per on-disk data)")

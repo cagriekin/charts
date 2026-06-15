@@ -66,6 +66,14 @@ func TestDecide(t *testing.T) {
 		{"not holder + standby-state stopped -> start", Observation{HoldLease: false, Local: dataStoppedStandby}, StartLocal, ""},
 		// A stale primary on a LOWER timeline is never a rejoin source (forward-only, invariant 5): hold.
 		{"not holder + primary-state stopped + lower-tl primary -> hold", Observation{HoldLease: false, Local: dataStopped, Peers: []PeerState{primary("pg-1", 4, 4, 0x10)}}, Wait, ""},
+
+		// --- self-health (LocalStuck): a wedged primary fails over / restarts ---
+		// Holder, primary stuck unhealthy, a standby exists: release the lease for failover.
+		{"holder + stuck primary + standby -> release for failover", Observation{HoldLease: true, Local: dataStopped, LocalStuck: true, Peers: []PeerState{standby("pg-1", 5, 5, 0x80)}}, ReleaseLease, ""},
+		// Holder, primary stuck unhealthy, single node: force-restart in place (no peer to take over).
+		{"holder + stuck primary + single node -> restart in place", Observation{HoldLease: true, Local: dataStopped, LocalStuck: true}, RestartLocal, ""},
+		// Stuck but below highwater still fails closed (release) before self-health restart is considered.
+		{"holder + stuck primary + below highwater -> release (highwater first)", Observation{HoldLease: true, Local: dataStopped, LocalStuck: true, Marker: MarkerState{Present: true, Timeline: tl(6)}}, ReleaseLease, ""},
 	}
 
 	for _, c := range cases {
