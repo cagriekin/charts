@@ -139,10 +139,14 @@ func (p *Prober) PrimaryWALPosition(ctx context.Context, ci ConnInfo) (tl Timeli
 	return tl, lsn, true, nil
 }
 
-// StandbyReceiveLSN reads a standby's last received WAL LSN (the position used to
-// rank standbys for most-advanced promotion, invariant 8).
+// StandbyReceiveLSN reads a standby's furthest WAL position -- the greater of the
+// last RECEIVED (streaming) and last REPLAYED LSN -- used to rank standbys for
+// most-advanced promotion (invariant 8). A node replaying its OWN WAL in recovery
+// mode (no streaming upstream, e.g. a primary-state node brought up read-only for
+// the cold-boot election) has a NULL receive LSN but a real replay LSN, so the
+// GREATEST (with NULLs coalesced) reports its true end-of-WAL.
 func (p *Prober) StandbyReceiveLSN(ctx context.Context, ci ConnInfo) (recv LSN, ok bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT pg_last_wal_receive_lsn();")
+	out, err := p.psql(ctx, ci, "SELECT GREATEST(COALESCE(pg_last_wal_receive_lsn(), '0/0'), COALESCE(pg_last_wal_replay_lsn(), '0/0'));")
 	if err != nil {
 		return LSN{}, false, err
 	}

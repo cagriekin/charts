@@ -27,11 +27,12 @@ const (
 	ReleaseLease             // holds lease but must not serve (stale/behind/unhealthy): release + step down
 	StartLocal               // initialized but stopped, and safe to start in its on-disk role
 	RestartLocal             // stuck single-node primary: force-restart postgres in place (no peer to fail over to)
+	StartRecovery            // non-holder primary-state data: start READ-ONLY (standby.signal) so its true position is observable
 )
 
 func (a Action) String() string {
 	return [...]string{"NoOp", "Wait", "BootstrapInitdb", "BootstrapClone", "Promote",
-		"StayPrimary", "Follow", "DemoteFence", "RejoinForward", "ReleaseLease", "StartLocal", "RestartLocal"}[a]
+		"StayPrimary", "Follow", "DemoteFence", "RejoinForward", "ReleaseLease", "StartLocal", "RestartLocal", "StartRecovery"}[a]
 }
 
 // Decision is the chosen action plus the peer it targets and a human reason for
@@ -92,6 +93,13 @@ type Observation struct {
 	// grace -- a frozen/wedged postmaster that Start cannot recover and the
 	// reconcile-loop liveness probe won't catch. It drives self-health failover.
 	LocalStuck bool
+	// PeersPending is set by the agent only during the cold-boot window (shortly
+	// after agent start) while some peer is not yet SQL-reachable. The holder waits
+	// rather than promoting/resuming, so the most-advanced election runs against
+	// peers' TRUE positions (recovery-mode brings stopped primary-state peers up
+	// read-only and observable) instead of a checkpoint estimate or an empty set.
+	// It is false in steady state, so a real failover is never delayed.
+	PeersPending bool
 }
 
 // Decide maps an Observation to the single action to take.
@@ -123,6 +131,9 @@ func Decide(o Observation) Decision {
 			if t := moreAdvancedPeer(o); t != "" {
 				return d(ReleaseLease, t, "a peer has more WAL on the same timeline; release so the most-advanced node promotes (invariant 8)")
 			}
+			if o.PeersPending {
+				return d(Wait, "", "cold boot: waiting for peers to report their position before promoting (recovery-mode makes stopped primary-state peers observable)")
+			}
 			return d(Promote, "", "standby holds lease, caught up and most-advanced: promote")
 
 		case o.Local.Running && !o.Local.InRecovery:
@@ -145,13 +156,6 @@ func Decide(o Observation) Decision {
 				if bad, why := unsafeToServe(o); bad {
 					return d(ReleaseLease, "", "stopped primary-state data must not start read-write: "+why)
 				}
-				// Most-advanced election (invariant 8): if a peer has more WAL on this
-				// timeline -- reachable, or stopped-but-gossiping its position -- release
-				// so it wins the lease and serves, rather than starting here and
-				// discarding its tail (the cold-boot RPO gap LSN gossip closes).
-				if t := moreAdvancedPeer(o); t != "" {
-					return d(ReleaseLease, t, "a peer has more WAL on this timeline (incl. gossip); release so the most-advanced node serves (invariant 8)")
-				}
 				// Self-health: a previously-running primary stuck unreachable past the
 				// grace (frozen/wedged) cannot be recovered by Start. Fail over to a
 				// standby if one exists; on a single node force-restart in place (no
@@ -161,6 +165,14 @@ func Decide(o Observation) Decision {
 						return d(RestartLocal, "", "single-node primary stuck unhealthy; force-restart postgres in place")
 					}
 					return d(ReleaseLease, "", "primary stuck unhealthy and standbys exist; release the lease for failover (self-health)")
+				}
+				// At cold boot, wait until peers are observable before resuming as
+				// primary: a peer that promoted to a NEWER timeline may still be coming
+				// up (recovery-mode), and `newer` only sees reachable peers. A primary
+				// source is never behind its own same-timeline peers, so no LSN compare
+				// is needed here once no newer-timeline peer exists.
+				if o.PeersPending {
+					return d(Wait, "", "cold boot: waiting for peers before resuming as primary (a newer-timeline peer may still be coming up)")
 				}
 			}
 			return d(StartLocal, "", "lease holder, initialized but stopped: start (role per on-disk data)")
@@ -195,11 +207,16 @@ func Decide(o Observation) Decision {
 			// On-disk primary state without the lease. Never start read-write -- it
 			// would come up primary, then be fenced next tick (the flap). Rejoin a
 			// same-timeline live primary as a standby if one exists (split-brain
-			// recovery; pg_rewind/reclone handles the divergence), else hold.
+			// recovery; pg_rewind/reclone handles the divergence).
 			if p := sameTimelinePrimary(o); p != nil {
 				return d(RejoinForward, p.Name, "stopped primary-state data without the lease; a same-timeline primary exists, rejoin it as a standby")
 			}
-			return d(Wait, "", "stopped primary-state data without the lease and no rejoin target; hold (never start read-write)")
+			// Otherwise start READ-ONLY in recovery mode (standby.signal): it replays
+			// its own WAL to the true end and reports an exact LSN, so the holder's
+			// most-advanced election ranks it precisely (closing the cold-boot RPO that
+			// the gossiped checkpoint estimate only narrowed). It never opens
+			// read-write here; it promotes only if it later wins the lease.
+			return d(StartRecovery, "", "stopped primary-state data without the lease; start read-only (recovery mode) so its true position is observable for the election")
 		}
 		return d(StartLocal, "", "standby-state data, stopped: start as a standby")
 	}
@@ -230,30 +247,26 @@ func sameTimelinePrimary(o Observation) *PeerState {
 //     ReleaseLease, which now actually releases the Lease (DCS.Release), so the
 //     highest-timeline node (its timeline == the marker it wrote) wins the freed
 //     Lease and serves. This is the C2 "lower-timeline pod boots first" case.
-//   - same-timeline peers: moreAdvancedPeer hands off to a peer with more WAL on
-//     the local timeline -- whether reachable (live LSN) or stopped-but-gossiping
-//     its pg_controldata LSN to its pod annotation (LSN gossip). A stopped
-//     primary-state ex-primary the flap-fix holds is therefore no longer invisible
-//     at election time: its position is ranked and the less-advanced winner
-//     releases for it.
+//   - same-timeline peers: a non-holder primary-state node is started READ-ONLY in
+//     recovery mode (StartRecovery / standby.signal), so it replays its own WAL to
+//     the TRUE end and reports an exact LSN over SQL -- no two-writer, no checkpoint
+//     estimate. moreAdvancedPeer (holder-standby branch) then ranks it precisely and
+//     a less-advanced standby winner releases for it. PeersPending makes the holder
+//     wait through the cold-boot window until peers are SQL-reachable, so it does not
+//     promote before those true positions are in. LSN gossip remains a secondary
+//     signal for a transiently-unreachable peer (a checkpoint lower bound).
+//   - a primary source is never behind its own same-timeline standbys, so a
+//     primary-state holder resumes directly (StartLocal, crash recovery, no timeline
+//     bump) once no NEWER-timeline peer exists -- no LSN compare needed.
 //
 // RESIDUAL (documented, cold-boot RPO only -- never a two-writer risk):
-//   - A stopped node gossips its pg_controldata CHECKPOINT LSN. After a graceful
-//     shutdown that equals the true end-of-WAL (shutdown checkpoint), so a planned
-//     full-cluster restart ranks exactly. After an UNGRACEFUL crash (power loss,
-//     OOM-kill) the checkpoint lags the true end by up to a checkpoint interval of
-//     WAL. A running standby reports its LIVE replay LSN, which can sit ahead of a
-//     crashed primary's last checkpoint -- so the crashed ex-primary can be
-//     under-ranked and a less-advanced standby promoted, discarding the ex-primary's
-//     acknowledged tail when it rejoins. This is no worse than before gossip, but it
-//     is NOT fully closed for crash cold-boots. The exact fix (deferred): start a
-//     held primary-state node with standby.signal so it replays its own WAL to the
-//     true end and reports an exact LSN read-only (then it is SQL-reachable and
-//     ranked precisely, no gossip estimate). Within async replication's inherent
-//     RPO>0 this lost tail was also un-replicated, but at cold boot the ex-primary
-//     IS present, so a sound election could have preserved it.
-//   - A peer whose agent is also dead (no fresh gossip, not SQL-reachable) is ranked
-//     unknown and the holder proceeds -- a double-fault, not the common cold boot.
+//   - Divergent SAME-timeline split-brain (two nodes were both primaries on one
+//     timeline with forked WAL): recovery-mode brings the loser up as a read-only
+//     standby (safe), but its divergent tail is discarded on rejoin. This is the
+//     marker/fence's domain, not the LSN election's.
+//   - A peer whose agent is also dead (never SQL-reachable, no fresh gossip) through
+//     the whole cold-boot window: once PeersPending's grace elapses the holder
+//     proceeds -- a double-fault, not the common cold boot.
 //
 // unsafeToServe ports the evaluate_lone_primary guard (#171/#173/#174): refuse to
 // promote/serve when the marker is malformed, the local timeline is unreadable

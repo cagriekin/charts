@@ -69,14 +69,16 @@ func TestDecide(t *testing.T) {
 		{"holder + primary-state stopped + at highwater -> start", Observation{HoldLease: true, Local: dataStopped, Marker: MarkerState{Present: true, Timeline: tl(5)}}, StartLocal, ""},
 		// Holder, standby-state data stopped: start as a standby (promotes a later tick).
 		{"holder + standby-state stopped -> start", Observation{HoldLease: true, Local: dataStoppedStandby}, StartLocal, ""},
-		// Non-holder, primary-state data stopped, no rejoin target: HOLD (never start RW -> the flap).
-		{"not holder + primary-state stopped + no primary -> hold", Observation{HoldLease: false, Local: dataStopped}, Wait, ""},
+		// Non-holder, primary-state data stopped, no rejoin target: start READ-ONLY in
+		// recovery mode so its true position is observable (never read-write).
+		{"not holder + primary-state stopped + no primary -> recovery", Observation{HoldLease: false, Local: dataStopped}, StartRecovery, ""},
 		// Non-holder, primary-state data stopped, a same-timeline primary exists: rejoin it as a standby.
 		{"not holder + primary-state stopped + same-tl primary -> rejoin", Observation{HoldLease: false, Local: dataStopped, Peers: []PeerState{primary("pg-1", 5, 5, 0x200)}}, RejoinForward, "pg-1"},
 		// Non-holder, standby-state data stopped: start as a standby.
 		{"not holder + standby-state stopped -> start", Observation{HoldLease: false, Local: dataStoppedStandby}, StartLocal, ""},
-		// A stale primary on a LOWER timeline is never a rejoin source (forward-only, invariant 5): hold.
-		{"not holder + primary-state stopped + lower-tl primary -> hold", Observation{HoldLease: false, Local: dataStopped, Peers: []PeerState{primary("pg-1", 4, 4, 0x10)}}, Wait, ""},
+		// A stale primary on a LOWER timeline is never a rejoin source (forward-only, invariant 5):
+		// start read-only in recovery mode instead (observable, not read-write).
+		{"not holder + primary-state stopped + lower-tl primary -> recovery", Observation{HoldLease: false, Local: dataStopped, Peers: []PeerState{primary("pg-1", 4, 4, 0x10)}}, StartRecovery, ""},
 
 		// --- self-health (LocalStuck): a wedged primary fails over / restarts ---
 		// Holder, primary stuck unhealthy, a standby exists: release the lease for failover.
@@ -89,10 +91,20 @@ func TestDecide(t *testing.T) {
 		// --- LSN gossip: rank an unreachable peer's gossiped position at cold boot ---
 		// A running standby holder sees an unreachable peer that gossips a higher same-timeline LSN: release.
 		{"holder standby + more-advanced gossip peer -> release", Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{gossipPeer("pg-2", 5, 5, 0x200)}}, ReleaseLease, "pg-2"},
-		// A stopped primary-state holder likewise steps aside for a more-advanced gossip peer.
-		{"holder primary-state stopped + more-advanced gossip peer -> release", Observation{HoldLease: true, Local: dataStoppedLSN, Peers: []PeerState{gossipPeer("pg-2", 5, 5, 0x200)}}, ReleaseLease, "pg-2"},
-		// A gossip peer that is BEHIND must not cause a spurious release: the holder starts.
-		{"holder primary-state stopped + behind gossip peer -> start", Observation{HoldLease: true, Local: dataStoppedLSN, Peers: []PeerState{gossipPeer("pg-2", 5, 5, 0x10)}}, StartLocal, ""},
+		// A PRIMARY-state holder is a source on its timeline -- a same-timeline peer
+		// (standby or gossip estimate) can never be ahead of it, so it resumes directly
+		// (no LSN compare here). Only a NEWER-timeline peer (newer) or the highwater
+		// guard can stop it; the standby-holder branch handles a less-advanced winner.
+		{"holder primary-state stopped + same-tl gossip peer -> start (source not behind)", Observation{HoldLease: true, Local: dataStoppedLSN, Peers: []PeerState{gossipPeer("pg-2", 5, 5, 0x200)}}, StartLocal, ""},
+
+		// --- PeersPending: cold-boot wait until peers' true positions are observable ---
+		// A standby holder must not promote while a peer is still coming up (its true
+		// position not yet in -- recovery-mode will make it reachable).
+		{"holder standby + peers pending -> wait", Observation{HoldLease: true, Local: localStandby, PeersPending: true}, Wait, ""},
+		// A primary-state holder waits too (a newer-timeline peer may still be booting).
+		{"holder primary-state stopped + peers pending -> wait", Observation{HoldLease: true, Local: dataStopped, PeersPending: true}, Wait, ""},
+		// But a known-ahead peer triggers an immediate handoff even while pending.
+		{"holder standby + ahead peer wins over pending -> release", Observation{HoldLease: true, Local: localStandby, PeersPending: true, Peers: []PeerState{standby("pg-2", 5, 5, 0x200)}}, ReleaseLease, "pg-2"},
 	}
 
 	for _, c := range cases {

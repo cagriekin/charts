@@ -99,6 +99,34 @@ func TestChildPostmasterRestartsAfterSelfExit(t *testing.T) {
 	_ = p.Stop(context.Background(), Fast)
 }
 
+func TestRecoverySignalSetAndClear(t *testing.T) {
+	dir := t.TempDir()
+	sig := filepath.Join(dir, "standby.signal")
+
+	// ClearRecoverySignal is a no-op when the file is absent.
+	if err := ClearRecoverySignal(dir); err != nil {
+		t.Fatalf("clear (absent): %v", err)
+	}
+
+	if err := SetRecoverySignal(dir); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if _, err := os.Stat(sig); err != nil {
+		t.Fatalf("standby.signal not created: %v", err)
+	}
+	// idempotent
+	if err := SetRecoverySignal(dir); err != nil {
+		t.Fatalf("set (again): %v", err)
+	}
+
+	if err := ClearRecoverySignal(dir); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if _, err := os.Stat(sig); !os.IsNotExist(err) {
+		t.Fatalf("standby.signal should be gone, stat err = %v", err)
+	}
+}
+
 func TestHasData(t *testing.T) {
 	dir := t.TempDir()
 	if HasData(dir) {
