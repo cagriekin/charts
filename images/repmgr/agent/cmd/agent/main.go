@@ -71,7 +71,8 @@ type agent struct {
 	prober *pg.Prober
 	metr   *observe.Metrics
 	health *selfHealthTracker
-	base   string // StatefulSet name (pod name without the ordinal)
+	base   string    // StatefulSet name (pod name without the ordinal)
+	bootAt time.Time // agent start; the cold-boot window for PeersPending is measured from here
 
 	// gossip publish state: skip re-patching the pod annotation when the position
 	// is unchanged, refreshing only on change or a heartbeat (to keep it fresh).
@@ -112,8 +113,15 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 		// both), tolerating a transient stall before declaring the primary wedged.
 		health: &selfHealthTracker{grace: cfg.LeaseDuration},
 		base:   baseName(cfg.PodName),
+		bootAt: time.Now(),
 	}, nil
 }
+
+// bootstrapGrace is the cold-boot window during which the holder waits for peers to
+// become SQL-reachable before promoting/resuming (so the most-advanced election
+// sees true positions). Measured from agent start, so a steady-state failover --
+// where the agent has long been up -- never waits. Scales with the lease timing.
+func (a *agent) bootstrapGrace() time.Duration { return 2 * a.cfg.LeaseDuration }
 
 func (a *agent) run() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -297,6 +305,18 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// stuck (frozen/wedged), which drives a self-health failover.
 	shouldServe := o.HoldLease && o.Local.HasData && !o.Local.InRecovery
 	o.LocalStuck = a.health.stuck(shouldServe, o.Local.Running, time.Now())
+	// PeersPending: only during the cold-boot window, while some peer is not yet
+	// SQL-reachable (its true position not yet in). The holder waits rather than
+	// promoting on an incomplete candidate set; recovery-mode guarantees stopped
+	// primary-state peers come up reachable, so the wait terminates.
+	if time.Since(a.bootAt) < a.bootstrapGrace() {
+		for i := range o.Peers {
+			if !o.Peers[i].Reachable {
+				o.PeersPending = true
+				break
+			}
+		}
+	}
 	return o
 }
 
@@ -355,8 +375,27 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// Bring an initialized-but-stopped node up in its on-disk role. The decision
 		// table only chooses StartLocal when this is safe (holder + highwater-ok for
 		// primary-state data, or any standby-state data); a non-holder's primary-state
-		// data is routed to RejoinForward/Wait instead, never started read-write here.
+		// data is routed to RejoinForward/StartRecovery instead, never read-write here.
 		if !obs.Local.Running && obs.Local.HasData {
+			if !obs.Local.InRecovery {
+				// primary-state: clear any stray standby.signal so it opens read-write
+				// (crash recovery on the same timeline -- a resume, not a promotion).
+				if err := process.ClearRecoverySignal(a.cfg.PGDATA); err != nil {
+					return err
+				}
+			}
+			return a.sup.Start(ctx)
+		}
+		return nil
+
+	case reconcile.StartRecovery:
+		// Non-holder primary-state data: start READ-ONLY (standby.signal) so it
+		// replays its WAL to the true end and is observable for the election, without
+		// risking a second writer. It promotes only if it later wins the lease.
+		if !obs.Local.Running && obs.Local.HasData {
+			if err := process.SetRecoverySignal(a.cfg.PGDATA); err != nil {
+				return err
+			}
 			return a.sup.Start(ctx)
 		}
 		return nil
