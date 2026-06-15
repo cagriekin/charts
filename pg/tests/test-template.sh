@@ -1305,6 +1305,20 @@ pcp_noname=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-
 assert_eq "pgpool admin existingSecret: missing name fails" "1" "${pcp_noname_rc}"
 assert_contains "pgpool admin existingSecret: missing name error names the value" "${pcp_noname}" "pgpool.admin.existingSecret.name is required"
 
+# #137: postgresql.existingSecret.enabled=true with no name must fail fast, not
+# render an empty secretKeyRef.name across the StatefulSet/pgpool/exporter/backup
+pg_secret_noname=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.existingSecret.enabled=true 2>&1) && pg_secret_noname_rc=0 || pg_secret_noname_rc=$?
+assert_eq "#137: postgresql.existingSecret missing name fails" "1" "${pg_secret_noname_rc}"
+assert_contains "#137: postgresql.existingSecret missing name error names the value" "${pg_secret_noname}" "postgresql.existingSecret.name is required"
+# with a name it renders and references the named secret
+pg_secret_named=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.existingSecret.enabled=true \
+  --set postgresql.existingSecret.name=my-pg-secret \
+  --show-only templates/statefulset.yaml 2>&1) && pg_secret_named_rc=0 || pg_secret_named_rc=$?
+assert_eq "#137: postgresql.existingSecret with a name renders" "0" "${pg_secret_named_rc}"
+assert_contains "#137: postgresql.existingSecret named secret referenced" "${pg_secret_named}" "name: my-pg-secret"
+
 # Test: removed pgpool.adminUsername/adminPassword values fail fast
 pcp_legacy=$(helm template test-pg "${CHART_DIR}" \
   --set pgpool.enabled=true \

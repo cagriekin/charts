@@ -35,7 +35,7 @@ annotation consumers -- #128.)
 
 {{- define "pg.secretName" -}}
 {{- if .Values.postgresql.existingSecret.enabled }}
-{{- .Values.postgresql.existingSecret.name }}
+{{- required "postgresql.existingSecret.name is required when postgresql.existingSecret.enabled is true" .Values.postgresql.existingSecret.name }}
 {{- else }}
 {{- include "pg.fullname" . }}
 {{- end }}
