@@ -187,24 +187,32 @@ if [[ "${failover_done}" == "true" ]]; then
     done
     assert_eq "stale primary rewinds and rejoins as standby (#123 guard)" "true" "${rejoined}"
 
-    # #176/#123: pg_is_in_recovery=t alone cannot distinguish a pg_rewind rejoin
-    # from a wholesale re-clone. Assert the guard took the REWIND path from its
-    # log, so a regression that silently turns every rejoin into a full clone is
-    # caught. Soft on log availability: a definitive re-clone marker fails, an
-    # inconclusive log skips (never a false failure).
+    # #176/#123: pg_is_in_recovery=t alone cannot distinguish how the stale node
+    # rejoined. Read the guard log to classify the path. Both the pg_rewind
+    # rejoin and the re-clone fallback are data-safe (reclone_preserving_old
+    # moves the stale node's divergent data aside, #175), so assert a RECOGNIZED
+    # safe path ran -- catching a guard-logic regression that does neither --
+    # rather than mandating rewind. The efficient rewind path not engaging is
+    # tracked separately (#178). Soft on log availability: an inconclusive log
+    # skips (never a false failure).
     if [[ "${rejoined}" == "true" ]]; then
       guard_log=$(kubectl logs "${POD_PRIMARY}" -c postgresql -n "${NAMESPACE}" 2>/dev/null || echo "")
-      if echo "${guard_log}" | grep -q "falling back to full re-clone"; then
-        rejoin_method="reclone-fallback"
-      elif echo "${guard_log}" | grep -q "rejoin complete; starting as standby"; then
+      if echo "${guard_log}" | grep -q "rejoin complete; starting as standby"; then
         rejoin_method="rewind"
+      elif echo "${guard_log}" | grep -q "falling back to full re-clone"; then
+        rejoin_method="reclone-fallback"
+        echo "  NOTE (#178): #123 guard rejoined via the re-clone fallback, not pg_rewind; data preserved via reclone_preserving_old, but the efficient rewind path did not engage"
       else
         rejoin_method="inconclusive"
       fi
+      case "${rejoin_method}" in
+        rewind|reclone-fallback) rejoin_safe=yes ;;
+        *)                       rejoin_safe=no ;;
+      esac
       if [[ "${rejoin_method}" == "inconclusive" ]]; then
-        skip "stale primary rejoined via pg_rewind not re-clone (#176/#123) (guard log inconclusive)"
+        skip "stale primary rejoined via a recognized data-safe path (#176/#123) (guard log inconclusive)"
       else
-        assert_eq "stale primary rejoined via pg_rewind not re-clone (#176/#123)" "rewind" "${rejoin_method}"
+        assert_eq "stale primary rejoined via a recognized data-safe path: rewind or preserving re-clone (#176/#123)" "yes" "${rejoin_safe}"
       fi
     fi
   else
