@@ -18,7 +18,25 @@ data:
     pcp_port = 9898
     pcp_socket_dir = '/tmp'
 
-{{- if .Values.repmgr.enabled }}
+{{- if eq (include "pg.agentMode" .) "true" }}
+    # agent mode: pgpool fronts the RW (<fullname>) and RO (<fullname>-readonly)
+    # Services for single-endpoint read/write split. The agent owns failover, so
+    # pgpool never changes roles -- writes pin to the ALWAYS_PRIMARY backend, reads
+    # balance to the RO backend (primary weight 0). DISALLOW_TO_FAILOVER on both +
+    # failover_command='' keep pgpool a stateless router; health checks stay ON so
+    # it recycles connections when the RW Service endpoint moves after a failover.
+    backend_hostname0 = '{{ include "pg.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local'
+    backend_port0 = 5432
+    backend_weight0 = 0
+    backend_flag0 = 'ALWAYS_PRIMARY|DISALLOW_TO_FAILOVER'
+    backend_application_name0 = 'primary'
+
+    backend_hostname1 = '{{ include "pg.fullname" . }}-readonly.{{ .Release.Namespace }}.svc.cluster.local'
+    backend_port1 = 5432
+    backend_weight1 = 1
+    backend_flag1 = 'DISALLOW_TO_FAILOVER'
+    backend_application_name1 = 'readonly'
+{{- else if .Values.repmgr.enabled }}
     {{- range $i := until (int (add .Values.postgresql.replicaCount 1)) }}
     backend_hostname{{ $i }} = '{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local'
     backend_port{{ $i }} = 5432
