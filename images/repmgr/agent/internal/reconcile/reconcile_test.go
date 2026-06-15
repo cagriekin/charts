@@ -56,6 +56,8 @@ func TestDecide(t *testing.T) {
 		{"holder + primary-state stopped + safe -> start", Observation{HoldLease: true, Local: dataStopped}, StartLocal, ""},
 		// Holder, primary-state data stopped, below the recorded highwater: must not start RW.
 		{"holder + primary-state stopped + below highwater -> release", Observation{HoldLease: true, Local: dataStopped, Marker: MarkerState{Present: true, Timeline: tl(6)}}, ReleaseLease, ""},
+		// Cold-boot winner AT the highwater (its own timeline == marker): safe to start as primary.
+		{"holder + primary-state stopped + at highwater -> start", Observation{HoldLease: true, Local: dataStopped, Marker: MarkerState{Present: true, Timeline: tl(5)}}, StartLocal, ""},
 		// Holder, standby-state data stopped: start as a standby (promotes a later tick).
 		{"holder + standby-state stopped -> start", Observation{HoldLease: true, Local: dataStoppedStandby}, StartLocal, ""},
 		// Non-holder, primary-state data stopped, no rejoin target: HOLD (never start RW -> the flap).
