@@ -186,6 +186,27 @@ if [[ "${failover_done}" == "true" ]]; then
       r_elapsed=$((r_elapsed + 10))
     done
     assert_eq "stale primary rewinds and rejoins as standby (#123 guard)" "true" "${rejoined}"
+
+    # #176/#123: pg_is_in_recovery=t alone cannot distinguish a pg_rewind rejoin
+    # from a wholesale re-clone. Assert the guard took the REWIND path from its
+    # log, so a regression that silently turns every rejoin into a full clone is
+    # caught. Soft on log availability: a definitive re-clone marker fails, an
+    # inconclusive log skips (never a false failure).
+    if [[ "${rejoined}" == "true" ]]; then
+      guard_log=$(kubectl logs "${POD_PRIMARY}" -c postgresql -n "${NAMESPACE}" 2>/dev/null || echo "")
+      if echo "${guard_log}" | grep -q "falling back to full re-clone"; then
+        rejoin_method="reclone-fallback"
+      elif echo "${guard_log}" | grep -q "rejoin complete; starting as standby"; then
+        rejoin_method="rewind"
+      else
+        rejoin_method="inconclusive"
+      fi
+      if [[ "${rejoin_method}" == "inconclusive" ]]; then
+        skip "stale primary rejoined via pg_rewind not re-clone (#176/#123) (guard log inconclusive)"
+      else
+        assert_eq "stale primary rejoined via pg_rewind not re-clone (#176/#123)" "rewind" "${rejoin_method}"
+      fi
+    fi
   else
     skip "stale primary rewinds and rejoins as standby (#123 guard) (data did not survive)"
   fi

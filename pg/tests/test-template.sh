@@ -615,6 +615,11 @@ startup_off=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repm
 assert_not_contains "#172: startupProbe omitted when disabled" "${startup_off}" "startupProbe:"
 assert_contains "#172: livenessProbe still present when startupProbe disabled" "${startup_off}" "livenessProbe:"
 
+# #176: the #125 full-restart guard depends on OrderedReady (lowest-ordinal pod
+# boots first and ALONE). Pin/assert it so switching to Parallel -- which would
+# silently stop exercising the guard -- fails the suite instead.
+assert_contains "#176: statefulset pins podManagementPolicy OrderedReady (#125 depends on it)" "${sts_repmgr}" "podManagementPolicy: OrderedReady"
+
 # rbac grants configmap access for the marker
 rbac_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/rbac.yaml 2>&1)
@@ -670,6 +675,12 @@ bash -c '
   MARKER_MALFORMED=false MARKER_TL=5 MARKER_PRIMARY=test-pg-0 CURRENT_MASTER=test-pg-0 current_tl=5; check false reassert
   # valid timeline, no marker yet (bootstrap) -> proceed
   MARKER_MALFORMED=false MARKER_TL=0 MARKER_PRIMARY="" CURRENT_MASTER=test-pg-0 current_tl=3; check false bootstrap
+  # #176/#168: the comparison must stay numeric past TL 10 (0x0A), where the old
+  # ::int-on-hex bug broke. tl_to_int already feeds decimals here; assert the
+  # -lt/-gt/-eq arithmetic is right above the boundary too.
+  MARKER_MALFORMED=false MARKER_TL=10 MARKER_PRIMARY=test-pg-1 CURRENT_MASTER=test-pg-0 current_tl=16; check false hi_advance
+  MARKER_MALFORMED=false MARKER_TL=16 MARKER_PRIMARY=test-pg-1 CURRENT_MASTER=test-pg-0 current_tl=10; check true  hi_below
+  MARKER_MALFORMED=false MARKER_TL=10 MARKER_PRIMARY=test-pg-1 CURRENT_MASTER=test-pg-0 current_tl=10; check true  hi_sametl_diffnode
   exit 0
 ' || elp_rc=$?
 assert_eq "su #171/#173: lone-primary guard fails closed on unverified/split-brain, proceeds on valid failover" "0" "${elp_rc}"
