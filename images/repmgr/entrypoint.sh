@@ -184,7 +184,7 @@ primary_safety_guard() {
 }
 
 case "$SCRIPT_NAME" in
-    "postgres")
+    "postgres"|"agent")
         export PATH=$PATH:/usr/lib/postgresql/18/bin
         PGDATA=${PGDATA:-/var/lib/postgresql/data/pgdata}
         export PGDATA
@@ -251,6 +251,15 @@ EOF
             echo "PostgreSQL initialization complete"
         fi
 
+        # agent mode: hand off to the Go HA agent as PID 1; it generates
+        # repmgr.conf (failover=manual), starts/supervises PostgreSQL, and runs the
+        # lease-based failover loop. postgres mode runs the postmaster directly
+        # (repmgrd-mode path).
+        if [ "$SCRIPT_NAME" = "agent" ]; then
+            echo "Starting pg-ha-agent (PID 1; the agent manages PostgreSQL)..."
+            exec /usr/local/bin/pg-ha-agent
+        fi
+
         echo "Starting PostgreSQL..."
         exec postgres -D "$PGDATA"
         ;;
@@ -264,7 +273,7 @@ EOF
         exec /usr/local/bin/service-updater.sh
         ;;
     *)
-        echo "Usage: $0 {postgres|init|repmgrd|service-updater}"
+        echo "Usage: $0 {postgres|agent|init|repmgrd|service-updater}"
         exit 1
         ;;
 esac
