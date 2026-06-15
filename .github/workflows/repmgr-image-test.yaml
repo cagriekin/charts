@@ -1,0 +1,26 @@
+name: Test repmgr image scripts
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'images/repmgr/**'
+      - '.github/workflows/repmgr-image-test.yaml'
+  pull_request:
+    paths:
+      - 'images/repmgr/**'
+      - '.github/workflows/repmgr-image-test.yaml'
+
+jobs:
+  scripts-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run script tests
+        run: bash images/repmgr/test/scripts-test.sh
