@@ -601,6 +601,58 @@ assert_contains "su #125: rbac grants configmaps verbs" "${rbac_repmgr}" "config
 # template, so helm upgrade / ArgoCD sync cannot reset the highwater
 assert_contains "su #125: marker written at runtime via kubectl" "${su_cm}" "kubectl create configmap"
 
+# --- #171/#173/#174: lone-primary marker guard hardening (service-updater) ---
+# read_marker must distinguish a corrupt marker from an absent one (#174), and
+# evaluate_lone_primary must fail closed on an unreadable timeline even with no
+# marker (#173) and on an equal-timeline different-node split-brain (#171),
+# while still allowing a legitimate higher-timeline failover through.
+printf '%s' "${su_cm}" | python3 -c "import sys,yaml; sys.stdout.write(yaml.safe_load(sys.stdin)['data']['service-updater.sh'])" > "${SCRIPT_DIR}/.su_render.sh"
+sed -n '/^read_marker() {/,/^}/p'           "${SCRIPT_DIR}/.su_render.sh" >  "${SCRIPT_DIR}/.su_fn.sh"
+sed -n '/^evaluate_lone_primary() {/,/^}/p' "${SCRIPT_DIR}/.su_render.sh" >> "${SCRIPT_DIR}/.su_fn.sh"
+
+# read_marker: a present-but-corrupt timeline is flagged, not aliased to absent
+rm_rc=0
+bash -c '
+  source "'"${SCRIPT_DIR}"'/.su_fn.sh"
+  PRIMARY_MARKER=m NAMESPACE=ns
+  kubectl() { echo "test-pg-1|5"; }                 # valid marker
+  read_marker
+  [ "$MARKER_PRIMARY" = "test-pg-1" ] && [ "$MARKER_TL" = "5" ] && [ "$MARKER_MALFORMED" = false ] || exit 1
+  kubectl() { echo "test-pg-1|garbage"; }           # corrupt timeline
+  read_marker
+  [ "$MARKER_TL" = "0" ] && [ "$MARKER_MALFORMED" = true ] || exit 2
+  kubectl() { return 1; }                           # absent (kubectl get fails)
+  read_marker
+  [ "$MARKER_TL" = "0" ] && [ "$MARKER_MALFORMED" = false ] || exit 3
+  exit 0
+' || rm_rc=$?
+assert_eq "su #174: read_marker flags a corrupt marker distinct from absent" "0" "${rm_rc}"
+
+# evaluate_lone_primary: fail-closed vs proceed decisions
+elp_rc=0
+bash -c '
+  source "'"${SCRIPT_DIR}"'/.su_fn.sh"
+  PRIMARY_MARKER=m NAMESPACE=ns
+  check() { evaluate_lone_primary >/dev/null 2>&1; [ "$skip_select" = "$1" ] || { echo "case $2: skip=$skip_select want $1"; exit 1; }; }
+  # #173: unreadable timeline with NO marker must still skip (bug: it selected)
+  MARKER_MALFORMED=false MARKER_TL=0 MARKER_PRIMARY="" CURRENT_MASTER=test-pg-0 current_tl=""; check true u173
+  # #174: corrupt marker -> skip even with a valid current_tl
+  MARKER_MALFORMED=true MARKER_TL=0 MARKER_PRIMARY=test-pg-1 CURRENT_MASTER=test-pg-0 current_tl=7; check true u174
+  # #171: same TL, different node -> skip (equal-timeline split-brain)
+  MARKER_MALFORMED=false MARKER_TL=5 MARKER_PRIMARY=test-pg-1 CURRENT_MASTER=test-pg-0 current_tl=5; check true u171
+  # below marker -> skip (existing #125 behavior preserved)
+  MARKER_MALFORMED=false MARKER_TL=5 MARKER_PRIMARY=test-pg-1 CURRENT_MASTER=test-pg-0 current_tl=4; check true below
+  # legitimate higher-TL failover -> proceed
+  MARKER_MALFORMED=false MARKER_TL=5 MARKER_PRIMARY=test-pg-1 CURRENT_MASTER=test-pg-0 current_tl=6; check false advance
+  # same node re-asserting its own TL -> proceed
+  MARKER_MALFORMED=false MARKER_TL=5 MARKER_PRIMARY=test-pg-0 CURRENT_MASTER=test-pg-0 current_tl=5; check false reassert
+  # valid timeline, no marker yet (bootstrap) -> proceed
+  MARKER_MALFORMED=false MARKER_TL=0 MARKER_PRIMARY="" CURRENT_MASTER=test-pg-0 current_tl=3; check false bootstrap
+  exit 0
+' || elp_rc=$?
+assert_eq "su #171/#173: lone-primary guard fails closed on unverified/split-brain, proceeds on valid failover" "0" "${elp_rc}"
+rm -f "${SCRIPT_DIR}/.su_render.sh" "${SCRIPT_DIR}/.su_fn.sh"
+
 # Test: repmgr disabled does not render preStop or terminationGracePeriodSeconds
 assert_not_contains "minimal: no preStop hook" "${minimal}" "preStop:"
 assert_not_contains "minimal: no terminationGracePeriodSeconds" "${minimal}" "terminationGracePeriodSeconds"

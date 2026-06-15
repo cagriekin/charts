@@ -105,13 +105,21 @@ data:
     read_marker() {
         MARKER_PRIMARY=""
         MARKER_TL=0
+        MARKER_MALFORMED=false
         [ -z "$PRIMARY_MARKER" ] && return 0
         local data
         data=$(kubectl get configmap "${PRIMARY_MARKER}" -n "${NAMESPACE}" \
             -o jsonpath='{.data.primary}|{.data.timeline}' 2>/dev/null) || return 0
         MARKER_PRIMARY="${data%%|*}"
         local t="${data##*|}"
-        case "$t" in ''|*[!0-9]*) MARKER_TL=0 ;; *) MARKER_TL="$t" ;; esac
+        # A present marker with a non-numeric timeline is corrupt (manual edit,
+        # GitOps drift, partial apply), NOT absent. Flag it so the caller fails
+        # closed: collapsing it to MARKER_TL=0 would alias "no marker" and
+        # silently re-introduce the #125 data loss the marker prevents (#174).
+        case "$t" in
+            ''|*[!0-9]*) MARKER_TL=0; MARKER_MALFORMED=true ;;
+            *)           MARKER_TL="$t" ;;
+        esac
     }
 
     write_marker() {
@@ -124,6 +132,45 @@ data:
             --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1; then
             echo "WARNING: failed to update primary marker ${PRIMARY_MARKER} (${primary} timeline ${tl})"
         fi
+    }
+
+    # Decide whether the lone live primary may receive writes this tick, applying
+    # the #125 durable-highwater guard. Reads current_tl + CURRENT_MASTER and the
+    # MARKER_* globals (set by read_marker); sets skip_select=true to keep the
+    # current selector (fail-closed) whenever the node cannot be trusted, so a
+    # stale, divergent, or unverified node never gets the write Service.
+    evaluate_lone_primary() {
+        skip_select=false
+        if [ "$MARKER_MALFORMED" = true ]; then
+            # Corrupt marker: the highwater cannot be evaluated, so hold (#174).
+            echo "WARNING: primary marker ${PRIMARY_MARKER} has a non-numeric timeline (corrupt); keeping current selector this tick. Fix or delete it to proceed"
+            skip_select=true
+            return 0
+        fi
+        case "$current_tl" in
+            ''|*[!0-9]*)
+                # Unreadable timeline: never point the Service at an unverified
+                # node, even when no marker exists yet -- bootstrap / post-marker
+                # deletion is exactly the window the marker cannot protect (#173).
+                # Retry next tick.
+                echo "WARNING: cannot read timeline of ${CURRENT_MASTER}; keeping current selector this tick"
+                skip_select=true
+                ;;
+            *)
+                if [ "$MARKER_TL" -gt 0 ] && [ "$current_tl" -lt "$MARKER_TL" ]; then
+                    echo "CRITICAL: only live primary ${CURRENT_MASTER} is on timeline ${current_tl}, below the recorded primary ${MARKER_PRIMARY} on timeline ${MARKER_TL}; refusing to route writes to a stale node. If ${MARKER_PRIMARY} is permanently lost, accept its data loss with: kubectl -n ${NAMESPACE} delete configmap ${PRIMARY_MARKER}"
+                    skip_select=true
+                elif [ "$MARKER_TL" -gt 0 ] && [ "$current_tl" -eq "$MARKER_TL" ] && [ -n "$MARKER_PRIMARY" ] && [ "$CURRENT_MASTER" != "$MARKER_PRIMARY" ]; then
+                    # Same timeline number, different node: an equal-timeline
+                    # split-brain. We cannot LSN-compare (the marker stores no LSN
+                    # and its node is down), so refuse rather than overwrite the
+                    # marker and silently discard the other node's history (#171).
+                    echo "CRITICAL: only live primary ${CURRENT_MASTER} is on the same timeline ${current_tl} as the recorded primary ${MARKER_PRIMARY} but is a DIFFERENT node (equal-timeline split-brain); ${CURRENT_MASTER} may be missing ${MARKER_PRIMARY}'s history. Refusing to route writes. If ${CURRENT_MASTER} is the correct survivor, accept ${MARKER_PRIMARY}'s data loss with: kubectl -n ${NAMESPACE} delete configmap ${PRIMARY_MARKER}"
+                    skip_select=true
+                fi
+                ;;
+        esac
+        return 0
     }
 
     # Failover audit trail: record a core/v1 Event on the primary Service.
@@ -367,27 +414,14 @@ data:
             read_marker
 
             # Stale-resurrection guard (#125): on a full-cluster restart under
-            # OrderedReady, the lowest-ordinal pod boots first and ALONE, so it
-            # can be the only live primary even though it is stale (a higher
-            # timeline was promoted before the restart). The durable marker
-            # records the highest timeline ever served; refuse to route writes to
-            # a lone primary below it. A legitimate new failover always has a
-            # HIGHER timeline than the marker, so it is never blocked.
-            skip_select=false
-            case "$current_tl" in
-                ''|*[!0-9]*)
-                    if [ "$MARKER_TL" -gt 0 ]; then
-                        echo "WARNING: cannot read timeline of ${CURRENT_MASTER}; keeping current selector this tick"
-                        skip_select=true
-                    fi
-                    ;;
-                *)
-                    if [ "$MARKER_TL" -gt 0 ] && [ "$current_tl" -lt "$MARKER_TL" ]; then
-                        echo "CRITICAL: only live primary ${CURRENT_MASTER} is on timeline ${current_tl}, below the recorded primary ${MARKER_PRIMARY} on timeline ${MARKER_TL}; refusing to route writes to a stale node. If ${MARKER_PRIMARY} is permanently lost, accept its data loss with: kubectl -n ${NAMESPACE} delete configmap ${PRIMARY_MARKER}"
-                        skip_select=true
-                    fi
-                    ;;
-            esac
+            # OrderedReady the lowest-ordinal pod can boot first and ALONE and be
+            # the only live primary even though it is stale (a higher timeline was
+            # promoted before the restart). evaluate_lone_primary applies the
+            # durable highwater marker and refuses to route writes to a node
+            # at/below it, with an unreadable timeline, or behind a corrupt
+            # marker. A legitimate new failover is on a HIGHER timeline, so it is
+            # never blocked.
+            evaluate_lone_primary
 
             if [ "$skip_select" = true ]; then
                 CURRENT_MASTER=""
