@@ -7,6 +7,9 @@
 {{- fail (printf "postgresql.majorVersion=%q does not match repmgr.image.majorVersion=%q. In repmgr mode the PostgreSQL server runs from the repmgr image (%s), which bundles only PostgreSQL %s and always runs that server regardless of postgresql.image; a mismatch crash-loops the extension init container or silently runs the wrong major. Set postgresql.majorVersion=%q (with a matching postgresql.image), or point repmgr.image at an image built for PostgreSQL %s and set repmgr.image.majorVersion to match" (toString .Values.postgresql.majorVersion) (toString $repmgrMajor) .Values.repmgr.image.repository (toString $repmgrMajor) (toString $repmgrMajor) (toString .Values.postgresql.majorVersion)) }}
 {{- end }}
 {{- end }}
+{{- if and .Values.pgbackrest.enabled (not .Values.repmgr.enabled) }}
+{{- fail "pgbackrest.enabled requires repmgr.enabled=true: the pgbackrest binary and the archive_command run inside the postgresql container, which in standalone mode is the official postgres image without pgbackrest. WAL archiving would fail on every segment (unbounded WAL growth) and backups would time out. Enable repmgr, or disable pgbackrest" }}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
