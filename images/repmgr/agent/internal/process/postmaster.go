@@ -96,8 +96,16 @@ func (p *ChildPostmaster) Stop(ctx context.Context, mode StopMode) error {
 	_ = cmd.Process.Signal(sig)
 	select {
 	case <-ctx.Done():
+		// Last-resort SIGKILL when a wedged postmaster ignores SIGINT/SIGQUIT past
+		// the deadline. SIGKILL denies the postmaster the chance to reap its
+		// backends, so they reparent to this agent (PID 1). They are not reaped here
+		// (the agent runs no generic Wait4(-1) reaper -- it would race the
+		// single-Wait-owner model below and corrupt crash detection). They exit
+		// promptly once they observe the postmaster gone and linger only as zombies
+		// (a PID-table slot, no memory) until the container restarts. Acceptable: a
+		// SIGKILL fence is rare and bounded; a full PID-1 reaper is a known follow-up.
 		_ = cmd.Process.Kill()
-		<-exited // reap the killed child
+		<-exited // reap the killed postmaster (the direct child)
 		p.clear()
 		return ctx.Err()
 	case <-exited:

@@ -11,6 +11,7 @@ import (
 )
 
 type recordedCall struct {
+	name string
 	env  []string
 	args []string
 }
@@ -20,8 +21,8 @@ type fakeRunner struct {
 	failOn string // if a call's args contain this substring, it errors
 }
 
-func (f *fakeRunner) Run(_ context.Context, env []string, _ string, args ...string) (string, error) {
-	f.calls = append(f.calls, recordedCall{env: env, args: args})
+func (f *fakeRunner) Run(_ context.Context, env []string, name string, args ...string) (string, error) {
+	f.calls = append(f.calls, recordedCall{name: name, env: env, args: args})
 	if f.failOn != "" && strings.Contains(strings.Join(args, " "), f.failOn) {
 		return "simulated failure", errors.New("exit status 1")
 	}
@@ -88,6 +89,33 @@ func TestCLICommands(t *testing.T) {
 		}
 		if got := fr.lastArgs(); !strings.Contains(got, "node rejoin -d host=pg-1.h") || !strings.Contains(got, "--force-rewind") {
 			t.Errorf("argv = %q", got)
+		}
+		// rejoin failed -> must NOT attempt a post-rejoin stop (no postmaster started)
+		for _, c := range fr.calls {
+			if c.name == "pg_ctl" {
+				t.Errorf("unexpected pg_ctl stop after a failed rejoin: %v", c.args)
+			}
+		}
+	})
+
+	t.Run("rejoin success stops the repmgr-started postmaster", func(t *testing.T) {
+		fr := &fakeRunner{}
+		r := newTestRepmgr(fr)
+		r.DataDir = "/pgdata"
+		if err := r.RejoinForceRewind(ctx, src); err != nil {
+			t.Fatal(err)
+		}
+		// repmgr node rejoin starts Postgres; the agent must stop that untracked
+		// postmaster (fast) so it can supervise its own child (two-writer safety).
+		last := fr.calls[len(fr.calls)-1]
+		if last.name != "pg_ctl" {
+			t.Fatalf("last call should be pg_ctl stop, got name=%q args=%v", last.name, last.args)
+		}
+		if got := strings.Join(last.args, " "); got != "-D /pgdata -m fast -w stop" {
+			t.Errorf("post-rejoin stop argv = %q", got)
+		}
+		if first := strings.Join(fr.calls[0].args, " "); !strings.Contains(first, "node rejoin") {
+			t.Errorf("rejoin must run before the stop, first argv = %q", first)
 		}
 	})
 
@@ -167,11 +195,17 @@ func TestReclonePreservingDropsBackupOnSuccess(t *testing.T) {
 	fixed := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	r := &Repmgr{Runner: &fakeRunner{}, Bin: "repmgr", ConfPath: "x", DataDir: dataDir, Now: func() time.Time { return fixed }}
 
+	fr := &fakeRunner{}
+	r.Runner = fr
 	if err := r.ReclonePreserving(context.Background(), Conn{Host: "src", User: "u", DB: "d"}); err != nil {
 		t.Fatal(err)
 	}
 	backup := dataDir + ".diverged.20260615T120000Z"
 	if _, statErr := os.Stat(backup); !os.IsNotExist(statErr) {
 		t.Errorf("backup should be removed on clone success, stat err = %v", statErr)
+	}
+	// the immediate stop must run before the data dir is moved aside
+	if len(fr.calls) == 0 || fr.calls[0].name != "pg_ctl" || strings.Join(fr.calls[0].args, " ") != "-D "+dataDir+" -m immediate -w stop" {
+		t.Errorf("expected an immediate pg_ctl stop first, calls = %+v", fr.calls)
 	}
 }

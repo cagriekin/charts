@@ -226,7 +226,7 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 | `repmgr.agent.renewDeadline` | Holder self-demotes if it cannot renew within this | `10s` |
 | `repmgr.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
 | `repmgr.agent.reconcileInterval` | Reconcile tick interval | `5s` |
-| `repmgr.agent.podCidr` | Pod CIDR trusted in the hardened pg_hba (agent mode) | `10.0.0.0/8` |
+| `repmgr.agent.podCidr` | Reserved (not yet consumed in v1): pod CIDR the agent will trust in the hardened pg_hba once it owns pg_hba assembly | `10.0.0.0/8` |
 
 Must satisfy `leaseDuration > renewDeadline > retryPeriod`; widen for managed clouds (e.g. `30s/20s/4s`). This chart shares pg's templates and agent — see the [pg chart README](../pg/README.md#failover-modes-repmgrd-default-and-lease-based-agent) for the full agent-mode behavior and the **migration runbook** (the immutable `podManagementPolicy` change requires a one-time `kubectl delete statefulset --cascade=orphan` + `helm upgrade`). See `ENVIRONMENT.md` for the injected-variable catalog.
 

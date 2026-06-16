@@ -156,8 +156,10 @@ repmgr:
     renewDeadline: 10s
     retryPeriod: 2s
     reconcileInterval: 5s
-    # Pod-network CIDR the agent trusts in the hardened (SCRAM-only) pg_hba it
-    # assembles in agent mode.
+    # RESERVED (not yet active in v1): the pod-network CIDR the agent will trust in
+    # the hardened (SCRAM-only) pg_hba once the agent owns pg_hba assembly. In v1
+    # pg_hba is still managed by the image/postStart path, so this value is not
+    # consumed yet; it is kept so the eventual switch needs no values change.
     podCidr: 10.0.0.0/8
 
   username: repmgr

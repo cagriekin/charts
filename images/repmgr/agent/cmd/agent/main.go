@@ -365,11 +365,15 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		_ = a.mech.RegisterPrimary(ctx)
 		// H3 order: promote PG -> advance the highwater marker -> assert routing.
 		// Re-probe the post-promote timeline (promotion bumped it) and advance the
-		// marker, so a later stale node is correctly refused by unsafeToServe.
+		// marker, so a later stale node is correctly refused by unsafeToServe. The
+		// apiserver writes (marker + routing) run under the fence budget so a slow
+		// apiserver cannot starve a lost-leadership OnLost fence (see fenceBudget).
+		wctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
+		defer cancel()
 		if tl, _, ok, _ := a.prober.PrimaryWALPosition(ctx, a.selfConn()); ok {
-			a.advanceMarker(ctx, tl, true, obs.Marker)
+			a.advanceMarker(wctx, tl, true, obs.Marker)
 		}
-		return a.assertPrimaryRouting(ctx, obs)
+		return a.assertPrimaryRouting(wctx, obs)
 
 	case reconcile.StayPrimary:
 		// Register this primary in repmgr.nodes. In agent mode there is no repmgrd
@@ -383,9 +387,12 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			a.log.Warn("register primary in repmgr.nodes", "err", err)
 		}
 		// Keep the highwater marker at this primary's timeline (monotonic; written
-		// only when it advances, so steady-state ticks make no API write).
-		a.advanceMarker(ctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
-		return a.assertPrimaryRouting(ctx, obs)
+		// only when it advances, so steady-state ticks make no API write). The
+		// apiserver writes run under the fence budget (see Promote / fenceBudget).
+		wctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
+		defer cancel()
+		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
+		return a.assertPrimaryRouting(wctx, obs)
 
 	case reconcile.Follow:
 		// Ensure this standby has a repmgr.nodes record. In agent mode no repmgrd
@@ -583,6 +590,21 @@ func shouldAdvanceMarker(tl pg.Timeline, tlOK bool, m reconcile.MarkerState) boo
 		return false
 	}
 	return true
+}
+
+// fenceBudget is the maximum time the primary-serving apiserver writes (highwater
+// marker + routing) may hold opMu. Bounding them under the soft-fence window
+// (LeaseDuration - RenewDeadline) guarantees a lost-leadership OnLost fence -- which
+// must also take opMu to demote -- is never starved behind a slow or partitioned
+// apiserver while this node is still read-write (the two-writer window). The writes
+// are idempotent and re-asserted every tick, so a deadline-exceeded self-heals on
+// the next reconcile. Floored at RetryPeriod for any odd timing config.
+func (a *agent) fenceBudget() time.Duration {
+	b := a.cfg.LeaseDuration - a.cfg.RenewDeadline
+	if b < a.cfg.RetryPeriod {
+		b = a.cfg.RetryPeriod
+	}
+	return b
 }
 
 // assertPrimaryRouting is run by the holder/primary: it points the write Service
