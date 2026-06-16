@@ -1,0 +1,19 @@
+# Overlay on values-agent.yaml: agent mode with the etcd DCS backend + the bundled
+# 3-node etcd subchart. Small etcd footprint for a kind cluster.
+repmgr:
+  agent:
+    dcs:
+      backend: etcd
+
+etcd:
+  enabled: true
+  replicaCount: 3
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  persistence:
+    size: 1Gi
