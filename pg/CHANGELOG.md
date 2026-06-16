@@ -25,6 +25,21 @@ which bundles the new `pg-ha-agent` binary.
   ConfigMap are omitted in agent mode.
 - `repmgr.agent.*` tunables (`leaseDuration`, `renewDeadline`, `retryPeriod`,
   `reconcileInterval`, `podCidr`).
+- Agent operability: **cluster-identity safety** — a clone/follow/rewind from a
+  peer of a different cluster is refused by comparing the PostgreSQL
+  `system_identifier` (guards against a stale/misrouted/DR-restored peer);
+  **maintenance mode** — `kubectl annotate configmap <release>-pg-primary
+  pg-ha/pause=true` suspends automatic promote/demote/fence/self-health while the
+  agent keeps serving; **controlled switchover** — `pg-ha/switchover-target=<pod>`
+  hands the primary role to a caught-up, same-timeline standby; and on-DCS data
+  (the marker + gossip) carries a `schemaVersion` so a mixed-version rolling agent
+  upgrade is safe.
+- Agent monitoring (opt-in, agent mode): `repmgr.agent.monitoring.serviceMonitor`
+  and `repmgr.agent.monitoring.prometheusRule` ship a ServiceMonitor (scraping the
+  agent's read-only metrics on `9200`) and example alert rules — no-leader,
+  multiple-leaders (split-brain), agent-down, lease-renew-failing,
+  reconcile-errors, flapping, and paused-too-long. Replication-lag alerting stays
+  with the PostgreSQL exporter.
 
 ### Notes
 
