@@ -61,8 +61,11 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create"]
+{{- if ne (include "pg.agentEtcdMode" .) "true" }}
   # Lease <fullname>-leader is the sole leadership authority (client-go
-  # leaderelection): get/update/patch scoped to that name, create unscoped.
+  # leaderelection): get/update/patch scoped to that name, create unscoped. With the
+  # etcd DCS backend leadership lives in etcd, not the apiserver, so this grant is
+  # dropped (least privilege); routing still uses the services/pods grants above.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     resourceNames: ["{{ include "pg.fullname" . }}-leader"]
@@ -70,6 +73,7 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["create"]
+{{- end }}
 {{- else }}
   # core/v1 Events emitted by service-updater on primary failover.
   # resourceNames cannot restrict create: the object name is not known at

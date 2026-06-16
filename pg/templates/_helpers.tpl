@@ -281,3 +281,16 @@ with: {{- if eq (include "pg.agentMode" .) "true" }}
 {{- define "pg.repmgrdMode" -}}
 {{- and .Values.repmgr.enabled (eq (include "pg.failoverMode" .) "repmgrd") -}}
 {{- end -}}
+
+{{- /* True in agent mode when the leadership backend is etcd (repmgr.agent.dcs.backend
+       == "etcd"), false otherwise. Nil-safe at every level so a partial overlay does
+       not nil-pointer; defaults to the kubernetes backend. */ -}}
+{{- define "pg.agentEtcdMode" -}}
+{{- if eq (include "pg.agentMode" .) "true" -}}
+{{- $agent := .Values.repmgr.agent | default dict -}}
+{{- $dcs := $agent.dcs | default dict -}}
+{{- eq ($dcs.backend | default "kubernetes") "etcd" -}}
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
