@@ -338,6 +338,10 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		HoldLease:      a.dcs.IsLeader(),
 		LeaderIdentity: a.dcs.Leader(),
 		Local:          ls,
+		// Process liveness (alive, not SQL-ready): a starting/recovering node is
+		// alive but Running (SQL) is false; the decider waits instead of acting on
+		// stale on-disk role (#181).
+		LocalProcessAlive: a.sup.Running(),
 	}
 	// Peers' gossiped positions (pod annotations) let the most-advanced election
 	// rank a stopped/unreachable peer at cold boot. Only the holder consults gossip

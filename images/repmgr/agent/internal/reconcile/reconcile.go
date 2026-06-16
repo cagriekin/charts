@@ -106,12 +106,29 @@ type Observation struct {
 	// serving primary steps down for it only once the target is a caught-up,
 	// same-timeline standby (switchoverTargetReady) -- otherwise it keeps serving.
 	SwitchoverTarget string
+	// LocalProcessAlive is process liveness of the agent's supervised postmaster
+	// (alive, distinct from Local.Running which is SQL reachability). A postmaster
+	// replaying WAL toward consistency is alive but not yet SQL-ready. The agent
+	// must not act on a starting node's stale on-disk role (#181).
+	LocalProcessAlive bool
 }
 
 // Decide maps an Observation to the single action to take.
 func Decide(o Observation) Decision {
 	if o.Paused {
 		return d(NoOp, "", "paused: automatic failover suspended (maintenance mode)")
+	}
+
+	// The agent's own postmaster is running but not yet accepting SQL connections:
+	// the node is STARTING (e.g. a freshly-cloned standby replaying WAL to a
+	// consistent point). Do not act on its on-disk role -- right after pg_basebackup
+	// the control file still carries the source primary's "in production" state,
+	// which would misread a starting standby as a stopped primary and trigger a
+	// RejoinForward that kills its walreceiver mid-stream (#181). Wait for SQL to
+	// confirm the role. A previously-ready node now frozen is caught by LocalStuck
+	// below (self-health failover), so exclude that case.
+	if o.LocalProcessAlive && !o.Local.Running && !o.LocalStuck {
+		return d(Wait, "", "postgres is running but not yet accepting connections; waiting for it to reach a ready state")
 	}
 
 	newer := newestPrimaryAbove(o) // reachable live primary on a strictly newer timeline than local

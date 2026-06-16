@@ -99,15 +99,30 @@ if [[ "${promoted}" == "true" ]]; then
     sleep 5
     caught=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT value FROM failover_test WHERE value='${AFTER}'" "testuser" "testdb" 2>/dev/null || echo "")
     assert_eq "rejoined standby caught up post-failover data" "${AFTER}" "${caught}"
+
+    # #181 regression: the rejoined node must actually be STREAMING from the new
+    # primary, not just present. Queried on the new primary (${STANDBY}, always up),
+    # so a wedged standby (agent killing/blocking its walreceiver) FAILS here rather
+    # than skipping. application_name == the standby's pod name (primary_conninfo).
+    stream_state=""
+    s=0
+    while [[ ${s} -lt 90 ]]; do
+      stream_state=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT state FROM pg_stat_replication WHERE application_name='${PRIMARY}'" "testuser" "testdb" 2>/dev/null || echo "")
+      [[ "${stream_state}" == "streaming" ]] && break
+      sleep 5; s=$((s + 5))
+    done
+    assert_eq "#181: rejoined standby is actively streaming (pg_stat_replication)" "streaming" "${stream_state}"
   else
     skip "demoted ex-primary rejects writes (soft fence) (rejoin did not complete)"
     skip "rejoined standby caught up post-failover data (rejoin did not complete)"
+    skip "#181: rejoined standby is actively streaming (rejoin did not complete)"
   fi
 else
   skip "ex-primary rejoins as a standby (in recovery) (failover did not complete)"
   skip "ex-primary did NOT re-acquire the lease (failover did not complete)"
   skip "demoted ex-primary rejects writes (soft fence) (failover did not complete)"
   skip "rejoined standby caught up post-failover data (failover did not complete)"
+  skip "#181: rejoined standby is actively streaming (failover did not complete)"
 fi
 
 # --- cold boot: full-cluster restart. Both pods come up at once (Parallel); the

@@ -132,6 +132,24 @@ func TestDecide(t *testing.T) {
 		{"holder primary-state stopped + peers pending -> wait", Observation{HoldLease: true, Local: dataStopped, PeersPending: true}, Wait, ""},
 		// But a known-ahead peer triggers an immediate handoff even while pending.
 		{"holder standby + ahead peer wins over pending -> release", Observation{HoldLease: true, Local: localStandby, PeersPending: true, Peers: []PeerState{standby("pg-2", 5, 5, 0x200)}}, ReleaseLease, "pg-2"},
+
+		// --- #181: a STARTING node (process alive, SQL not ready) must not be acted
+		// on via its stale on-disk role. Right after a clone, controldata still shows
+		// the source's primary state; without the guard this is the RejoinForward that
+		// kills the freshly-started standby's walreceiver, and the StartLocal loop.
+		// The race itself: non-holder, on-disk primary-state (stale), a same-timeline
+		// primary peer, postmaster alive -> WAIT, not RejoinForward.
+		{"#181 starting node, stale primary-state + same-tl primary -> wait (not rejoin)", Observation{HoldLease: false, LocalProcessAlive: true, Local: dataStopped, Peers: []PeerState{primary("pg-1", 5, 5, 0x100)}}, Wait, ""},
+		// Non-holder starting standby -> wait, not the StartLocal loop.
+		{"#181 starting standby (non-holder) -> wait (not StartLocal)", Observation{HoldLease: false, LocalProcessAlive: true, Local: dataStoppedStandby}, Wait, ""},
+		// Holder primary-state resume that is still starting -> wait until SQL-ready.
+		{"#181 holder primary-state starting -> wait", Observation{HoldLease: true, LocalProcessAlive: true, Local: dataStopped}, Wait, ""},
+		// Contrast: with the postmaster NOT alive, the same observation still starts
+		// (StartLocal) -- the guard only suppresses action while it is coming up.
+		{"#181 contrast: holder primary-state stopped (process dead) -> StartLocal", Observation{HoldLease: true, LocalProcessAlive: false, Local: dataStopped}, StartLocal, ""},
+		// Self-health is NOT pre-empted: a previously-ready primary now frozen
+		// (LocalStuck) still fails over even though its postmaster is alive.
+		{"#181 frozen primary (process alive + stuck) -> release for failover", Observation{HoldLease: true, LocalProcessAlive: true, LocalStuck: true, Local: dataStopped, Peers: []PeerState{standby("pg-1", 5, 5, 0x80)}}, ReleaseLease, ""},
 	}
 
 	for _, c := range cases {

@@ -48,7 +48,7 @@ kubectl delete statefulset "${FULLNAME}" -n "${NAMESPACE}" --cascade=orphan
 # A real 1.0.0 migration also bumps the repmgr image to an agent-capable tag (the
 # pre-agent image has no `agent` entrypoint arm). values-repmgr.yaml installs the
 # released image; bump it to the agent-capable tag as part of the failoverMode flip.
-AGENT_IMAGE_TAG="${AGENT_IMAGE_TAG:-trixie-5.5.0-16}"
+AGENT_IMAGE_TAG="${AGENT_IMAGE_TAG:-trixie-5.5.0-17}"
 helm upgrade "${RELEASE}" "${CHART_DIR}" \
   -n "${NAMESPACE}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --set repmgr.failoverMode=agent --set "repmgr.image.tag=${AGENT_IMAGE_TAG}" --wait --timeout 10m
@@ -66,9 +66,12 @@ while [[ ${m} -lt 480 ]]; do
   r1=$(pg_exec "${NAMESPACE}" "${POD1}" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")
   HOLDER=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || echo "")
   PRIMARY=""; STANDBY=""
-  if [[ "${r0}" == "f" && "${r1}" == "t" ]]; then PRIMARY="${POD0}"; STANDBY="${POD1}"; fi
-  if [[ "${r1}" == "f" && "${r0}" == "t" ]]; then PRIMARY="${POD1}"; STANDBY="${POD0}"; fi
-  if [[ -n "${PRIMARY}" && "${HOLDER}" == "${PRIMARY}" ]]; then echo "  migrated after ${m}s: primary=${PRIMARY} holder=${HOLDER}"; break; fi
+  # Identify the primary by holder + not-in-recovery only -- do NOT require the
+  # standby to be queryable. A wedged standby (#181) must still let us settle on the
+  # primary so the streaming assertion below FAILS rather than the block skipping.
+  if [[ "${r0}" == "f" && "${HOLDER}" == "${POD0}" ]]; then PRIMARY="${POD0}"; STANDBY="${POD1}"; fi
+  if [[ "${r1}" == "f" && "${HOLDER}" == "${POD1}" ]]; then PRIMARY="${POD1}"; STANDBY="${POD0}"; fi
+  if [[ -n "${PRIMARY}" ]]; then echo "  migrated after ${m}s: primary=${PRIMARY} holder=${HOLDER}"; break; fi
   sleep 10; m=$((m + 10))
 done
 
@@ -82,6 +85,17 @@ if [[ -n "${PRIMARY}" && -n "${STANDBY}" ]]; then
   assert_eq "after: lease holder is the primary" "${PRIMARY}" "${HOLDER}"
   survived=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT value FROM migrate_test WHERE value='${MV}'" "testuser" "testdb" 2>/dev/null || echo "")
   assert_eq "data survives the repmgrd->agent migration" "${MV}" "${survived}"
+
+  # #181 regression: the migrated standby must actually re-establish STREAMING, not
+  # just exist. Queried on the primary (always up), so a wedged standby FAILS here
+  # rather than the block skipping.
+  mstream=""; ms=0
+  while [[ ${ms} -lt 120 ]]; do
+    mstream=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT state FROM pg_stat_replication WHERE application_name='${STANDBY}'" "testuser" "testdb" 2>/dev/null || echo "")
+    [[ "${mstream}" == "streaming" ]] && break
+    sleep 5; ms=$((ms + 5))
+  done
+  assert_eq "#181: migrated standby is actively streaming" "streaming" "${mstream}"
 
   echo "  Post-migration failover: deleting primary ${PRIMARY}..."
   kubectl delete pod "${PRIMARY}" -n "${NAMESPACE}" --grace-period=30 --wait=false 2>/dev/null || true

@@ -15,8 +15,9 @@ type fakePostmaster struct {
 	stopCalls int
 }
 
-func (f *fakePostmaster) Start(context.Context) error { f.started = true; return nil }
+func (f *fakePostmaster) Start(context.Context) error  { f.started = true; return nil }
 func (f *fakePostmaster) Reload(context.Context) error { f.reloaded = true; return nil }
+func (f *fakePostmaster) Running() bool                { return f.started }
 func (f *fakePostmaster) Stop(_ context.Context, m StopMode) error {
 	f.stopMode = m
 	f.stopCalls++
