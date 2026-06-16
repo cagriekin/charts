@@ -257,6 +257,18 @@ kubectl annotate configmap <release>-pg-primary -n <ns> pg-ha/pause-
 
 While paused, `pg_ha_agent_is_paused` reads `1`. Pausing does not stop the cluster from serving — it only stops the agent from reacting to faults, so a genuine failure during the window will NOT fail over until you resume.
 
+### Controlled switchover (agent mode)
+
+To hand the primary role to a specific standby on purpose (e.g. to move the primary off a node you are about to drain), annotate the marker with the target pod:
+
+```bash
+kubectl annotate configmap <release>-pg-primary -n <ns> pg-ha/switchover-target=<release>-pg-1 --overwrite
+```
+
+The serving primary waits until that target is a **caught-up, same-timeline standby** (its replay LSN has reached the primary's WAL position — invariant 8), then clears the annotation (one-shot) and steps down so the target promotes. If the target is lagging or unreachable, the primary keeps serving and retries — it never steps down onto a behind standby, so committed data is not discarded. The graceful step-down flushes WAL to the connected target, making the handoff near-zero-RPO in practice.
+
+Caveats: this is a planned handoff layered on the lease election, not a fenced zero-RPO transaction — the directed target promotes deterministically on a two-pod cluster; with three or more pods the most-advanced standby wins the freed lease (usually but not necessarily the named target). For strict RPO=0 use synchronous replication (not enabled in this chart).
+
 ### Monitoring the agent (agent mode)
 
 The agent serves read-only Prometheus metrics on port `9200` (`pg_ha_agent_is_leader`, `_is_paused`, `_renew_failures_total`, `_promotions_total`, `_demotes_total`, `_fences_total`, `_reconcile_errors_total`). With the Prometheus Operator installed:

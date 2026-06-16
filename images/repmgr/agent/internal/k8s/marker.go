@@ -29,6 +29,13 @@ const SchemaVersion = 1
 // `pg-ha/pause-` to resume).
 const PauseAnnotation = "pg-ha/pause"
 
+// SwitchoverTargetAnnotation, set to a pod name on the marker ConfigMap, requests
+// a controlled handoff to that pod (Part H2). The serving primary steps down for
+// it only once the target is a caught-up same-timeline standby, then clears the
+// annotation (one-shot, so a later unrelated failover cannot re-trigger it). Set
+// with `kubectl annotate configmap <fullname>-primary pg-ha/switchover-target=<pod>`.
+const SwitchoverTargetAnnotation = "pg-ha/switchover-target"
+
 // Marker is the durable highwater primary marker (<fullname>-primary ConfigMap):
 // the highest-timeline primary ever recorded, so a node booting first under
 // OrderedReady can tell it is stale (#125). Malformed is set when the marker
@@ -41,6 +48,8 @@ type Marker struct {
 	Timeline   uint32
 	TimelineOK bool
 	Paused     bool // maintenance mode: PauseAnnotation == "true" on the ConfigMap
+	// SwitchoverTarget is the pod named by SwitchoverTargetAnnotation ("" if none).
+	SwitchoverTarget string
 	// SchemaVersion is the on-DCS data version (absent/0 == legacy v1). A reader
 	// seeing a value above its own SchemaVersion is talking to a newer agent
 	// mid-upgrade (Part H4).
@@ -57,7 +66,12 @@ func (c *Client) ReadMarker(ctx context.Context, name string) (Marker, error) {
 	if err != nil {
 		return Marker{}, fmt.Errorf("get marker %s: %w", name, err)
 	}
-	m := Marker{Present: true, Primary: cm.Data["primary"], Paused: strings.EqualFold(strings.TrimSpace(cm.Annotations[PauseAnnotation]), "true")}
+	m := Marker{
+		Present:          true,
+		Primary:          cm.Data["primary"],
+		Paused:           strings.EqualFold(strings.TrimSpace(cm.Annotations[PauseAnnotation]), "true"),
+		SwitchoverTarget: strings.TrimSpace(cm.Annotations[SwitchoverTargetAnnotation]),
+	}
 	if v, perr := strconv.Atoi(cm.Data["schemaVersion"]); perr == nil {
 		m.SchemaVersion = v
 	} // absent/unparseable -> 0 == legacy v1 (a repmgrd-mode service-updater marker)
@@ -102,6 +116,29 @@ func (c *Client) WriteMarker(ctx context.Context, name, primary string, timeline
 	cm.Data = data
 	if _, uerr := cms.Update(ctx, cm, metav1.UpdateOptions{}); uerr != nil {
 		return fmt.Errorf("update marker %s: %w", name, uerr)
+	}
+	return nil
+}
+
+// ClearSwitchoverTarget removes the switchover-target annotation from the marker
+// ConfigMap so a controlled switchover is one-shot -- a later, unrelated failover
+// cannot re-trigger a handoff to the same pod. A missing marker or already-absent
+// annotation is a no-op (nil).
+func (c *Client) ClearSwitchoverTarget(ctx context.Context, name string) error {
+	cms := c.cs.CoreV1().ConfigMaps(c.namespace)
+	cm, err := cms.Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get marker %s: %w", name, err)
+	}
+	if _, ok := cm.Annotations[SwitchoverTargetAnnotation]; !ok {
+		return nil
+	}
+	delete(cm.Annotations, SwitchoverTargetAnnotation)
+	if _, uerr := cms.Update(ctx, cm, metav1.UpdateOptions{}); uerr != nil {
+		return fmt.Errorf("clear switchover annotation on %s: %w", name, uerr)
 	}
 	return nil
 }
