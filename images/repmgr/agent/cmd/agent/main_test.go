@@ -100,6 +100,36 @@ func TestActReleaseLeaseForceStopsWedgedPrimary(t *testing.T) {
 	}
 }
 
+// fenceBudget = LeaseDuration - RenewDeadline, floored at RetryPeriod. It bounds
+// the apiserver writes on a read-write tick so a slow write cannot starve the
+// OnLost fence past the soft-fence window.
+func TestFenceBudget(t *testing.T) {
+	cases := []struct {
+		lease, renew, retry, want time.Duration
+	}{
+		{15 * time.Second, 10 * time.Second, 2 * time.Second, 5 * time.Second}, // normal margin
+		{30 * time.Second, 20 * time.Second, 4 * time.Second, 10 * time.Second},
+		{12 * time.Second, 10 * time.Second, 3 * time.Second, 3 * time.Second}, // margin < retry -> floored
+	}
+	for _, c := range cases {
+		a := &agent{cfg: &config.Config{LeaseDuration: c.lease, RenewDeadline: c.renew, RetryPeriod: c.retry}}
+		if got := a.fenceBudget(); got != c.want {
+			t.Errorf("fenceBudget(L=%s R=%s r=%s) = %s, want %s", c.lease, c.renew, c.retry, got, c.want)
+		}
+	}
+}
+
+// Invariant 9: a peer is a valid replication source only if its system_identifier
+// matches the local cluster's.
+func TestSameClusterCheck(t *testing.T) {
+	if err := sameClusterCheck("pg-1", 7395000000000000001, 7395000000000000001); err != nil {
+		t.Errorf("matching system_identifier must be accepted, got %v", err)
+	}
+	if err := sameClusterCheck("pg-1", 7395000000000000001, 9999999999999999999); err == nil {
+		t.Error("a different system_identifier must be refused (invariant 9)")
+	}
+}
+
 // Releasing the lease as a read-only standby must NOT churn its postmaster.
 func TestActReleaseLeaseLeavesStandbyRunning(t *testing.T) {
 	pm := &fakePostmaster{}

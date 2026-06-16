@@ -792,8 +792,15 @@ func (a *agent) assertSameCluster(ctx context.Context, peer string) error {
 		a.log.Warn("cluster-identity check: peer system_identifier unreadable; proceeding (pg_rewind/walreceiver still enforce it)", "peer", peer, "err", perr)
 		return nil
 	}
-	if peerID != cd.SystemID {
-		return fmt.Errorf("invariant 9: refusing %s as replication source: system_identifier %d != local %d (different cluster)", peer, peerID, cd.SystemID)
+	return sameClusterCheck(peer, cd.SystemID, peerID)
+}
+
+// sameClusterCheck is the invariant-9 decision: a peer is a valid replication
+// source only if its PG system_identifier matches the local cluster's. Extracted
+// so the enforcement (not just the controldata/SQL parsing) is unit-testable.
+func sameClusterCheck(peer string, localID, peerID uint64) error {
+	if peerID != localID {
+		return fmt.Errorf("invariant 9: refusing %s as replication source: system_identifier %d != local %d (different cluster)", peer, peerID, localID)
 	}
 	return nil
 }
