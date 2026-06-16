@@ -5,9 +5,11 @@ FROM --platform=$BUILDPLATFORM golang:1.23-bookworm@sha256:167053a2bb901972bf2c1
 ARG TARGETARCH
 WORKDIR /src/agent
 COPY agent/go.mod agent/go.sum ./
-RUN go mod download && go mod verify
+COPY agent/vendor ./vendor
 COPY agent/ ./
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
+# Hermetic, air-gappable build: vendored deps only, no module downloads
+# (GOPROXY=off). -mod=vendor also fails if vendor/ drifts from go.mod.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH GOFLAGS=-mod=vendor GOPROXY=off \
     go build -trimpath -ldflags="-s -w" -o /out/pg-ha-agent ./cmd/agent
 
 # --- Stage 2: the runtime image (PostgreSQL 18 + repmgr + pgbackrest + agent) ---

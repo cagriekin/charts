@@ -46,6 +46,13 @@ jobs:
         working-directory: images/repmgr/agent
         run: go mod verify
 
+      - name: hermetic vendored build (no network)
+        working-directory: images/repmgr/agent
+        env:
+          GOFLAGS: -mod=vendor
+          GOPROXY: "off"
+        run: go build ./...
+
       - name: govulncheck (pinned)
         working-directory: images/repmgr/agent
         run: |
