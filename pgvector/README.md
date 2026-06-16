@@ -653,11 +653,14 @@ Repmgr will automatically rebuild standbys from the restored primary.
 
 Enabling pgBackRest on an existing cluster sets `archive_mode = on` in postgresql.conf. This change requires a PostgreSQL restart. The pods will restart automatically on the next helm upgrade since the StatefulSet spec changes, but `archive_mode` only takes effect after the restart.
 
-## Upgrade
+## Upgrade and migration
 
 ```bash
-helm upgrade my-pgvector cagriekin/pgvector
+helm repo update
+helm upgrade my-pgvector cagriekin/pgvector   # add -f your-values.yaml
 ```
+
+`pgvector` tracks `pg` in lockstep (same image and agent; `pgvector` 0.6.x ↔ `pg` 0.5.x, both unifying at `1.0.0`). The default failover mode stays `repmgrd`, so routine upgrades need no action beyond reading the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. For the **compatibility matrix, the version model, the agent-mode opt-in runbook, and the breaking `1.0.0` migration**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
 
 ## pgvector Resources
 

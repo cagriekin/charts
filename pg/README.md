@@ -926,11 +926,37 @@ Then restore from the latest backup using one of the methods above.
 | Backup job hanging | S3 unreachable | `activeDeadlineSeconds` (default 3600s) will terminate the job. Check S3 connectivity. |
 | Split-brain detected in logs | Network partition | Follow the split-brain recovery runbook above. |
 
-## Upgrade
+## Upgrade and migration
+
+### Version model
+
+Each chart is released independently and tagged `<chart>-<version>` (e.g. `pg-0.5.89`); `pg` and `pgvector` are released in lockstep (same image, same agent), and both **unify at `1.0.0`** (the `0.5.x`/`0.6.x` split ends there). The `common` and `etcd` charts are vendored dependencies — they ship inside the `pg`/`pgvector` packages, not released on their own.
+
+### Compatibility matrix
+
+| `pg` | `pgvector` | repmgr image | PostgreSQL | Kubernetes |
+|------|-----------|--------------|-----------|-----------|
+| 0.5.89 | 0.6.91 | `trixie-5.5.0-16` | 18.x | ≥ 1.21 (PDB `policy/v1`) |
+| 1.0.0 *(planned)* | 1.0.0 *(planned)* | `trixie-5.5.0-16`+ | 18.x | ≥ 1.21 |
+
+Extras: agent monitoring (`repmgr.agent.monitoring.*`) needs the Prometheus Operator CRDs; the etcd backend (`repmgr.agent.dcs.backend: etcd`) needs an etcd ≥ 3.5 (BYO/shared) or the bundled etcd subchart (`etcd.enabled=true`).
+
+### Routine upgrade (within 0.x)
 
 ```bash
-helm upgrade my-postgres cagriekin/pg
+helm repo update
+helm upgrade my-postgres cagriekin/pg   # add -f your-values.yaml
 ```
+
+The default failover mode stays `repmgrd`, so existing installs are unaffected and the repmgrd rendering is byte-stable across these releases. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, pg_hba, or image changes) have one-time steps. The CHANGELOG carries an unbroken trail back to 0.5.71.
+
+### Opt in to agent mode (still 0.x)
+
+Lease-based agent failover is opt-in (`repmgr.failoverMode: agent`) and requires a one-time, zero-downtime StatefulSet recreate (the `podManagementPolicy` change is immutable). See **[Migrating an existing release to agent mode](#migrating-an-existing-release-to-agent-mode)** for the `--cascade=orphan` runbook + the GitOps caveats.
+
+### Migrating to 1.0.0 (the breaking change)
+
+At `1.0.0` the default `failoverMode` flips from `repmgrd` to `agent`. Because the agent's `podManagementPolicy: Parallel` is immutable on an existing StatefulSet, the `kubectl delete statefulset <release> --cascade=orphan` + `helm upgrade` recreate (today optional, for opting into agent mode) becomes **required for every consumer** upgrading across the `1.0.0` boundary — unless you pin `repmgr.failoverMode: repmgrd` to stay on the (still-supported, one-major-cycle deprecation) repmgrd path and defer the move. The full step-by-step `1.0.0` runbook ships with that release; the mechanics are identical to the agent-mode runbook linked above.
 
 ## Troubleshooting PGPool
 
