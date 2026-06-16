@@ -28,11 +28,12 @@ const (
 	StartLocal               // initialized but stopped, and safe to start in its on-disk role
 	RestartLocal             // stuck single-node primary: force-restart postgres in place (no peer to fail over to)
 	StartRecovery            // non-holder primary-state data: start READ-ONLY (standby.signal) so its true position is observable
+	Switchover               // operator-requested handoff: a caught-up target standby exists; clear the request + step down so it promotes
 )
 
 func (a Action) String() string {
 	return [...]string{"NoOp", "Wait", "BootstrapInitdb", "BootstrapClone", "Promote",
-		"StayPrimary", "Follow", "DemoteFence", "RejoinForward", "ReleaseLease", "StartLocal", "RestartLocal", "StartRecovery"}[a]
+		"StayPrimary", "Follow", "DemoteFence", "RejoinForward", "ReleaseLease", "StartLocal", "RestartLocal", "StartRecovery", "Switchover"}[a]
 }
 
 // Decision is the chosen action plus the peer it targets and a human reason for
@@ -100,6 +101,11 @@ type Observation struct {
 	// read-only and observable) instead of a checkpoint estimate or an empty set.
 	// It is false in steady state, so a real failover is never delayed.
 	PeersPending bool
+	// SwitchoverTarget is the pod an operator requested a controlled handoff to
+	// (the pg-ha/switchover-target marker annotation, Part H2); "" when none. The
+	// serving primary steps down for it only once the target is a caught-up,
+	// same-timeline standby (switchoverTargetReady) -- otherwise it keeps serving.
+	SwitchoverTarget string
 }
 
 // Decide maps an Observation to the single action to take.
@@ -142,6 +148,9 @@ func Decide(o Observation) Decision {
 			}
 			if bad, why := unsafeToServe(o); bad {
 				return d(ReleaseLease, "", "primary must not serve: "+why)
+			}
+			if t := switchoverTargetReady(o); t != "" {
+				return d(Switchover, t, "controlled switchover: target "+t+" is a caught-up same-timeline standby; clear the request and step down so it promotes")
 			}
 			return d(StayPrimary, "", "primary holds lease and is current")
 
@@ -380,4 +389,36 @@ func ahead(aTL pg.Timeline, aTLok bool, aLSN pg.LSN, aLSNok bool, bTL pg.Timelin
 		return aLSN.Greater(bLSN)
 	}
 	return false
+}
+
+// switchoverTargetReady returns o.SwitchoverTarget when an operator has requested a
+// controlled handoff (Part H2) AND that target is safe to promote: a DIFFERENT pod
+// that is a reachable (SQL-confirmed, not gossip), same-timeline standby caught up
+// to the serving primary's WAL position (its replay/receive LSN >= the local
+// primary's LSN, invariant 8). Until then it returns "" and the primary keeps
+// serving -- so the handoff never discards already-committed data. An empty/self/
+// unreachable/divergent/lagging target all defer. (Self-target naturally defers:
+// peers exclude self, so it is never found.)
+func switchoverTargetReady(o Observation) string {
+	t := o.SwitchoverTarget
+	if t == "" || !o.Local.TimelineOK || !o.Local.LSNOK {
+		return ""
+	}
+	for i := range o.Peers {
+		p := &o.Peers[i]
+		if p.Name != t {
+			continue
+		}
+		if !p.Reachable || p.Role != pg.RoleStandby {
+			return "" // must be a live, in-recovery standby (a confirmed position)
+		}
+		if !p.TimelineOK || p.Timeline != o.Local.Timeline {
+			return "" // different timeline -> not a clean same-line handoff
+		}
+		if !p.LSNOK || o.Local.LSN.Greater(p.LSN) {
+			return "" // target has not caught up to the primary's WAL position yet
+		}
+		return t
+	}
+	return "" // requested target is not among the observed peers
 }

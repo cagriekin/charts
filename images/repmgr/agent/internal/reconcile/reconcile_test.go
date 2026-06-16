@@ -54,6 +54,22 @@ func TestDecide(t *testing.T) {
 		{"holder primary current -> stay", Observation{HoldLease: true, Local: localPrimary, Peers: []PeerState{standby("pg-1", 5, 5, 0x80)}}, StayPrimary, ""},
 		{"holder primary + malformed marker -> release", Observation{HoldLease: true, Local: localPrimary, Marker: MarkerState{Malformed: true}}, ReleaseLease, ""},
 
+		// --- controlled switchover (Part H2): step down only for a caught-up target ---
+		// target caught up (same tl, LSN >= local) -> hand off
+		{"switchover: caught-up target -> switchover", Observation{HoldLease: true, Local: localPrimary, SwitchoverTarget: "pg-1", Peers: []PeerState{standby("pg-1", 5, 5, 0x100)}}, Switchover, "pg-1"},
+		// target lagging (LSN < local) -> keep serving until it catches up (no data loss)
+		{"switchover: lagging target -> stay", Observation{HoldLease: true, Local: localPrimary, SwitchoverTarget: "pg-1", Peers: []PeerState{standby("pg-1", 5, 5, 0x80)}}, StayPrimary, ""},
+		// target on a different timeline -> not a clean handoff
+		{"switchover: divergent-timeline target -> stay", Observation{HoldLease: true, Local: localPrimary, SwitchoverTarget: "pg-1", Peers: []PeerState{standby("pg-1", 4, 5, 0x200)}}, StayPrimary, ""},
+		// target not a standby (a reachable non-recovery node) -> refuse
+		{"switchover: non-standby target -> stay", Observation{HoldLease: true, Local: localPrimary, SwitchoverTarget: "pg-1", Peers: []PeerState{primary("pg-1", 5, 5, 0x200)}}, StayPrimary, ""},
+		// target only known via gossip (unreachable) -> no confirmed position, refuse
+		{"switchover: gossip-only target -> stay", Observation{HoldLease: true, Local: localPrimary, SwitchoverTarget: "pg-2", Peers: []PeerState{gossipPeer("pg-2", 5, 5, 0x200)}}, StayPrimary, ""},
+		// target not among peers (e.g. self or a typo) -> refuse
+		{"switchover: unknown target -> stay", Observation{HoldLease: true, Local: localPrimary, SwitchoverTarget: "pg-9", Peers: []PeerState{standby("pg-1", 5, 5, 0x200)}}, StayPrimary, ""},
+		// paused overrides a pending switchover (maintenance owns the cluster)
+		{"switchover: paused overrides", Observation{Paused: true, HoldLease: true, Local: localPrimary, SwitchoverTarget: "pg-1", Peers: []PeerState{standby("pg-1", 5, 5, 0x200)}}, NoOp, ""},
+
 		{"not holder + read-write -> soft fence", Observation{HoldLease: false, Local: localPrimary}, DemoteFence, ""},
 		{"not holder + standby + known leader -> follow", Observation{HoldLease: false, Local: localStandby, LeaderIdentity: "pg-0"}, Follow, "pg-0"},
 		{"not holder + empty + leader primary -> clone from leader", Observation{HoldLease: false, Local: emptyData, LeaderIdentity: "pg-0", Peers: []PeerState{primary("pg-0", 5, 5, 0x100)}}, BootstrapClone, "pg-0"},

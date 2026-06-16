@@ -117,6 +117,37 @@ func TestMarkerLegacySchemaVersion(t *testing.T) {
 	}
 }
 
+func TestMarkerSwitchoverTarget(t *testing.T) {
+	cs := fake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pg-primary", Namespace: ns,
+			Annotations: map[string]string{SwitchoverTargetAnnotation: " pg-1 "},
+		},
+		Data: map[string]string{"primary": "pg-0", "timeline": "7"},
+	})
+	c := NewWithClient(cs, ns)
+	ctx := context.Background()
+
+	m, err := c.ReadMarker(ctx, "pg-primary")
+	if err != nil || m.SwitchoverTarget != "pg-1" {
+		t.Fatalf("switchover target = %q err=%v, want trimmed pg-1", m.SwitchoverTarget, err)
+	}
+	// ClearSwitchoverTarget makes the request one-shot.
+	if err := c.ClearSwitchoverTarget(ctx, "pg-primary"); err != nil {
+		t.Fatal(err)
+	}
+	if m2, _ := c.ReadMarker(ctx, "pg-primary"); m2.SwitchoverTarget != "" {
+		t.Errorf("after clear, target = %q, want empty", m2.SwitchoverTarget)
+	}
+	// Clearing an already-absent annotation (or a missing marker) is a no-op.
+	if err := c.ClearSwitchoverTarget(ctx, "pg-primary"); err != nil {
+		t.Errorf("clear when absent should be nil, got %v", err)
+	}
+	if err := c.ClearSwitchoverTarget(ctx, "does-not-exist"); err != nil {
+		t.Errorf("clear on a missing marker should be nil, got %v", err)
+	}
+}
+
 func TestMarkerPauseAnnotation(t *testing.T) {
 	mk := func(val string) Marker {
 		cs := fake.NewSimpleClientset(&corev1.ConfigMap{

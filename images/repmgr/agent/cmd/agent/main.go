@@ -328,6 +328,8 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// agent keeps renewing the Lease and serving.
 	o.Paused = m.Paused
 	a.metr.SetPaused(m.Paused)
+	// Controlled switchover (Part H2): the requested handoff target, if any.
+	o.SwitchoverTarget = m.SwitchoverTarget
 	// Self-health (stateful/time-based, so computed here, not in the pure Decide):
 	// a holder whose primary-state postgres has been unreachable past the grace is
 	// stuck (frozen/wedged), which drives a self-health failover.
@@ -460,6 +462,24 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// at cold boot, or self-health failover). Only stop postgres if we were
 		// serving read-write; a standby is already read-only, so releasing the Lease
 		// is enough and we avoid churning its postmaster.
+		a.dcs.Release()
+		if obs.Local.Running && !obs.Local.InRecovery {
+			a.metr.IncDemote()
+			return a.sup.Demote(ctx, false)
+		}
+		return nil
+
+	case reconcile.Switchover:
+		// Controlled handoff (Part H2): the decision guard already confirmed the
+		// target is a caught-up, same-timeline standby. Clear the request FIRST so a
+		// later unrelated failover cannot re-trigger a handoff to the same pod; only
+		// on a successful clear do we step down (release the Lease + graceful/fast
+		// demote, which flushes WAL to the connected, caught-up target). The target,
+		// being caught up, then wins the freed Lease and promotes. If the clear fails
+		// we do NOT step down -- the request persists, so the next tick retries.
+		if err := a.kube.ClearSwitchoverTarget(ctx, a.cfg.MarkerName); err != nil {
+			return err
+		}
 		a.dcs.Release()
 		if obs.Local.Running && !obs.Local.InRecovery {
 			a.metr.IncDemote()
