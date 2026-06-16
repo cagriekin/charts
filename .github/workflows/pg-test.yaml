@@ -10,6 +10,9 @@ on:
     paths:
       - 'pg/**'
       - 'images/repmgr/**'
+      # the bundled etcd subchart is exercised by this suite (template asserts +
+      # the agent etcd-mode test), so an etcd-source change must re-run it.
+      - 'etcd/**'
       - '.github/workflows/pg-test.yaml'
 
 env:
