@@ -4,7 +4,7 @@ TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-repmgr test-repmgr-chaos test-full test-failover test-upgrade \
-        test-repmgr-failover test-agent test-config test-config-repmgr test-backup-restore test-special-chars cluster-create cluster-delete cluster-exists clean help
+        test-repmgr-failover test-agent test-agent-etcd test-config test-config-repmgr test-backup-restore test-special-chars cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -17,6 +17,7 @@ help:
 	@echo "  test-full       - Run full install tests"
 	@echo "  test-failover   - Run failover tests (requires test-repmgr first)"
 	@echo "  test-agent      - Run lease-based agent install + failover tests"
+	@echo "  test-agent-etcd - Run agent etcd-DCS test (bundled etcd; standalone, opt-in)"
 	@echo "  test-upgrade    - Run upgrade path tests"
 	@echo "  test-config     - Run postgresql configuration tests (standalone)"
 	@echo "  test-config-repmgr - Run postgresql configuration tests (repmgr)"
@@ -47,6 +48,12 @@ test-repmgr-failover: cluster-exists
 test-agent: cluster-exists
 	@bash $(TESTS_DIR)/test-agent.sh
 	@bash $(TESTS_DIR)/test-agent-failover.sh
+
+# etcd DCS backend (bundled etcd). Standalone + opt-in: deploys 3 extra etcd pods
+# and is not yet validated in CI, so it is NOT part of test-cluster. Run explicitly
+# in a clean cluster once verified, then wire into CI.
+test-agent-etcd: cluster-exists
+	@bash $(TESTS_DIR)/test-agent-etcd.sh
 
 cluster-exists:
 	@kind get clusters 2>/dev/null | grep -q "^$(CLUSTER_NAME)$$" || (echo "Cluster '$(CLUSTER_NAME)' not found. Run: make cluster-create" && exit 1)
