@@ -16,7 +16,13 @@ to `trixie-5.5.0-16`, which bundles the new `pg-ha-agent` binary.
   wiring (this chart's templates are shared with pg). It becomes the default at
   chart `1.0.0`.
 - `repmgr.agent.*` tunables (`leaseDuration`, `renewDeadline`, `retryPeriod`,
-  `reconcileInterval`, `podCidr`).
+  `reconcileInterval`, `podCidr`) and `repmgr.agent.monitoring.*` (opt-in
+  ServiceMonitor + example PrometheusRule for the agent metrics).
+- Agent operability (shared with pg): cluster-identity safety
+  (`system_identifier` check before clone/follow/rewind), maintenance mode
+  (`pg-ha/pause` annotation), controlled switchover (`pg-ha/switchover-target`
+  annotation), and a `schemaVersion` on the on-DCS data for safe mixed-version
+  agent upgrades. See the pg 0.5.89 changelog for details.
 
 ### Notes
 

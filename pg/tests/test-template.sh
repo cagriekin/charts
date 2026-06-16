@@ -1667,6 +1667,31 @@ assert_contains "pgvector #126: backup mc image present" "${pgv_backup}" "minio/
 assert_contains "pgvector #126: backup container securityContext populated" "${pgv_backup}" "runAsUser: 999"
 assert_not_contains "pgvector #126: no null securityContext" "${pgv_backup}" "securityContext: null"
 
+# --- pgvector agent-mode parity ---
+# The agent-mode templates are symlinks to pg's, but pgvector/values.yaml is an
+# independent copy: a missing repmgr.agent.* / monitoring value would break
+# agent-mode rendering only for pgvector. Render the agent-mode paths against the
+# pgvector chart to catch that #126-class gap, and confirm repmgrd stays the default.
+pgv_agent_rc=0
+pgv_agent=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=agent \
+  --show-only templates/statefulset.yaml --show-only templates/rbac.yaml 2>&1) || pgv_agent_rc=$?
+assert_eq "pgvector agent: renders in agent mode" "0" "${pgv_agent_rc}"
+assert_contains "pgvector agent: postgresql runs the agent arm" "${pgv_agent}" '"/usr/local/bin/entrypoint.sh", "agent"'
+assert_not_contains "pgvector agent: no repmgrd sidecar" "${pgv_agent}" "name: repmgrd"
+assert_contains "pgvector agent: rbac grants coordination.k8s.io leases" "${pgv_agent}" "coordination.k8s.io"
+assert_contains "pgvector agent: lease scoped to <fullname>-leader" "${pgv_agent}" "test-pgv-pgvector-leader"
+pgv_agent_hl=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=agent \
+  --show-only templates/service-headless.yaml 2>&1)
+assert_contains "pgvector agent: headless exposes agent-metrics port" "${pgv_agent_hl}" "name: agent-metrics"
+pgv_agent_mon=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=agent \
+  --set repmgr.agent.monitoring.serviceMonitor.enabled=true \
+  --set repmgr.agent.monitoring.prometheusRule.enabled=true \
+  --show-only templates/agent-servicemonitor.yaml --show-only templates/agent-prometheusrule.yaml 2>&1)
+assert_contains "pgvector agent: ServiceMonitor renders" "${pgv_agent_mon}" "kind: ServiceMonitor"
+assert_contains "pgvector agent: PrometheusRule scoped to the pgvector headless Service" "${pgv_agent_mon}" "test-pgv-pgvector-headless"
+pgv_repmgrd=$(helm template test-pgv "${PGVECTOR_DIR}" --show-only templates/statefulset.yaml 2>&1)
+assert_contains "pgvector repmgrd: default still runs repmgrd (byte-stable parity)" "${pgv_repmgrd}" "name: repmgrd"
+
 # --- #128: global.annotations render as metadata.annotations, not labels ---
 # global.annotations used to be spliced into pg.labels and rendered under
 # metadata.labels on every resource: non-label-safe values (spaces, URLs, >63
