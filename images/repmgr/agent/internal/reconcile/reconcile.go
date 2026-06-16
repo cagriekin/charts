@@ -152,6 +152,13 @@ func Decide(o Observation) Decision {
 			if t := switchoverTargetReady(o); t != "" {
 				return d(Switchover, t, "controlled switchover: target "+t+" is a caught-up same-timeline standby; clear the request and step down so it promotes")
 			}
+			if o.SwitchoverTarget != "" {
+				// Requested but not yet actionable: keep serving and surface why in the
+				// audit trail (the target is lagging, unreachable, divergent, not a
+				// standby, or names self/an unknown pod) so the stuck request is
+				// diagnosable rather than a silent no-op.
+				return d(StayPrimary, "", "primary holds lease; switchover to "+o.SwitchoverTarget+" requested but the target is not yet a caught-up, reachable, same-timeline standby")
+			}
 			return d(StayPrimary, "", "primary holds lease and is current")
 
 		default: // has data, not running

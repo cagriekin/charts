@@ -72,6 +72,24 @@ func TestSelfHealthTracker(t *testing.T) {
 	if h.stuck(false, false, base.Add(100*time.Second)) {
 		t.Fatal("a non-serving node is never stuck")
 	}
+
+	// Maintenance pause: the caller passes shouldServe=false while paused, so a
+	// primary intentionally stopped during the window does NOT arm self-health, and
+	// on resume a still-stopped node is treated as a startup -- it must not fire an
+	// immediate failover (the pause-contract fix).
+	hp := &selfHealthTracker{grace: 15 * time.Second}
+	if hp.stuck(true, true, t0) {
+		t.Fatal("running primary not stuck (primes the tracker)")
+	}
+	if hp.stuck(false, false, t0.Add(60*time.Second)) {
+		t.Fatal("paused (shouldServe=false) must not be stuck even past the grace")
+	}
+	if hp.stuck(true, false, t0.Add(61*time.Second)) {
+		t.Fatal("on resume a still-stopped node is a startup, not stuck")
+	}
+	if hp.stuck(true, false, t0.Add(120*time.Second)) {
+		t.Fatal("a slow post-resume startup must not trip self-health")
+	}
 }
 
 func TestShouldAdvanceMarker(t *testing.T) {
