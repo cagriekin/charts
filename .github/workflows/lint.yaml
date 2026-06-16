@@ -9,14 +9,20 @@ on:
       - master
     paths:
       - '**/Chart.yaml'
+      - '**/Chart.lock'
       - '**/values.yaml'
       - '**/templates/**'
+      - '**/charts/*.tgz'
+      - 'scripts/**'
       - '.github/workflows/lint.yaml'
   pull_request:
     paths:
       - '**/Chart.yaml'
+      - '**/Chart.lock'
       - '**/values.yaml'
       - '**/templates/**'
+      - '**/charts/*.tgz'
+      - 'scripts/**'
       - '.github/workflows/lint.yaml'
 
 jobs:
@@ -47,4 +53,7 @@ jobs:
             echo "Linting ${chart_dir}"
             helm lint "${chart_dir}"
           done
+
+      - name: Verify vendored subcharts are fresh
+        run: bash scripts/check-vendored-subcharts.sh
 
