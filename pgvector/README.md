@@ -339,7 +339,7 @@ psql -h localhost -U postgres -d postgres
 
 ### Read-Only Connection to Replicas
 
-When repmgr is enabled, a `<fullname>-readonly` service routes only to standby pods (selected via the `pg-role: standby` label maintained by the service-updater sidecar):
+When repmgr is enabled, a `<fullname>-readonly` service routes only to standby pods, selected via the `pg-role: standby` label. In repmgrd mode the service-updater sidecar maintains the label; in agent mode the agent does, with a 3-way classification (in-recovery -> `standby`; reachable-but-not-in-recovery -> `orphan`, kept OUT of the read pool; unreachable -> left untouched):
 
 ```bash
 kubectl port-forward svc/my-pgvector-readonly 5432:5432

@@ -447,16 +447,16 @@ When enabled, NetworkPolicies restrict traffic:
 ### Direct Connection to Primary
 
 ```bash
-kubectl port-forward svc/my-postgres 5432:5432
+kubectl port-forward svc/my-postgres-pg 5432:5432
 psql -h localhost -U postgres -d postgres
 ```
 
 ### Read-Only Connection to Replicas
 
-When repmgr is enabled, a `<fullname>-readonly` service routes only to standby pods (selected via the `pg-role: standby` label maintained by the service-updater sidecar):
+When repmgr is enabled, a `<fullname>-readonly` service routes only to standby pods, selected via the `pg-role: standby` label. In repmgrd mode the service-updater sidecar maintains the label; in agent mode the agent does, with a 3-way classification (in-recovery -> `standby`; reachable-but-not-in-recovery -> `orphan`, kept OUT of the read pool so a divergent node never serves stale reads; unreachable -> left untouched):
 
 ```bash
-kubectl port-forward svc/my-postgres-readonly 5432:5432
+kubectl port-forward svc/my-postgres-pg-readonly 5432:5432
 psql -h localhost -U postgres -d postgres
 ```
 
@@ -465,7 +465,7 @@ With `postgresql.replicaCount: 0` the service exists but has no endpoints.
 ### Through PGPool-II
 
 ```bash
-kubectl port-forward svc/my-postgres-pgpool 9999:9999
+kubectl port-forward svc/my-postgres-pg-pgpool 9999:9999
 psql -h localhost -p 9999 -U postgres -d postgres
 ```
 
@@ -474,7 +474,7 @@ psql -h localhost -p 9999 -U postgres -d postgres
 Repmgr manages replication automatically. To check cluster status:
 
 ```bash
-kubectl exec -it my-postgres-0 -- repmgr -f /etc/repmgr/repmgr.conf cluster show
+kubectl exec -it my-postgres-pg-0 -- repmgr -f /etc/repmgr/repmgr.conf cluster show
 ```
 
 ## PGPool-II Connection Pooling and Load Balancing
@@ -600,9 +600,9 @@ scrape_configs:
   - job_name: 'postgres'
     static_configs:
       - targets:
-        - my-postgres-0.my-postgres-headless.default.svc.cluster.local:5432
-        - my-postgres-1.my-postgres-headless.default.svc.cluster.local:5432
-        - my-postgres-2.my-postgres-headless.default.svc.cluster.local:5432
+        - my-postgres-pg-0.my-postgres-pg-headless.default.svc.cluster.local:5432
+        - my-postgres-pg-1.my-postgres-pg-headless.default.svc.cluster.local:5432
+        - my-postgres-pg-2.my-postgres-pg-headless.default.svc.cluster.local:5432
     metrics_path: /probe
     params:
       auth_module: [postgres]
@@ -612,7 +612,7 @@ scrape_configs:
       - source_labels: [__param_target]
         target_label: instance
       - target_label: __address__
-        replacement: my-postgres-postgres-exporter.default.svc.cluster.local:9116
+        replacement: my-postgres-pg-postgres-exporter.default.svc.cluster.local:9116
 ```
 
 ### Replication Metrics
@@ -671,7 +671,7 @@ helm install my-postgres cagriekin/pg \
 ### Manual Trigger
 
 ```bash
-kubectl create job --from=cronjob/my-postgres-backup manual-backup
+kubectl create job --from=cronjob/my-postgres-pg-backup manual-backup
 ```
 
 ### Backup Parameters
@@ -795,7 +795,7 @@ postgresql:
 ### Check Backup Status
 
 ```bash
-kubectl exec -it my-postgres-0 -- pgbackrest --stanza=db info
+kubectl exec -it my-postgres-pg-0 -- pgbackrest --stanza=db info
 ```
 
 ### Point-in-Time Recovery
@@ -804,12 +804,12 @@ PITR requires manual intervention:
 
 ```bash
 # 1. Scale down the StatefulSet
-kubectl scale statefulset my-postgres --replicas=0
+kubectl scale statefulset my-postgres-pg --replicas=0
 
 # 2. Run a restore pod mounting the data PVC
 kubectl run pg-restore --rm -it \
   --image=cagriekin/repmgr:trixie-5.5.0-16 \
-  --overrides='{ "spec": { "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-16", "command": ["bash"], "stdin": true, "tty": true, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "value": "YOUR_KEY" }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "value": "YOUR_SECRET" }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-postgres-0" } }] } }'
+  --overrides='{ "spec": { "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-16", "command": ["bash"], "stdin": true, "tty": true, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "value": "YOUR_KEY" }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "value": "YOUR_SECRET" }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-postgres-pg-0" } }] } }'
 
 # 3. Inside the restore pod, run:
 pgbackrest --stanza=db restore \
@@ -818,7 +818,7 @@ pgbackrest --stanza=db restore \
   --delta
 
 # 4. Scale back up
-kubectl scale statefulset my-postgres --replicas=2
+kubectl scale statefulset my-postgres-pg --replicas=2
 ```
 
 Repmgr will automatically rebuild standbys from the restored primary.
@@ -890,14 +890,20 @@ make test-template
 # Create cluster, then run individual suites
 make cluster-create
 make test-minimal           # standalone postgres, no repmgr
-make test-repmgr            # primary + replica with repmgr
-make test-failover           # kill primary, verify promotion
+make test-repmgr-failover   # repmgrd: primary + replica, then kill primary -> promote
+make test-repmgr-chaos      # repmgrd: chaos restart regression
 make test-full              # repmgr + pgpool + prometheus exporter
 make test-upgrade           # upgrade path with data persistence
+make test-agent             # lease-based agent: install + failover (AGENT_COLDBOOT=1 adds cold boot)
+make test-agent-etcd        # agent with the bundled etcd DCS backend
+make test-migrate-agent     # repmgrd -> agent --cascade=orphan migration
 make cluster-delete
 
-# Run cluster tests in parallel
+# Run the core cluster suites in parallel
 make -j4 test-cluster
+
+# Confirm the repmgrd (default) render has not drifted vs a baseline ref
+make byte-stable REF=origin/master
 ```
 
 ## Failover RTO/RPO
@@ -922,6 +928,16 @@ The `terminationGracePeriodSeconds` (default 120s) controls the maximum time all
 | pg_dump S3 backup | Up to last backup interval | Default daily at 2am. Not suitable for near-zero RPO. |
 
 ## Recovery Runbooks
+
+> The runbooks below describe **repmgrd mode** (the default). In **agent mode**
+> (`repmgr.failoverMode: agent`) failover is driven by the Kubernetes Lease, not
+> repmgrd/service-updater: a primary failure is handled automatically (a standby
+> wins the Lease and promotes; the agent repoints the Service selector), and
+> split-brain is prevented at the source (a node serves read-write only while it
+> holds the Lease), so the Split-Brain Recovery runbook does not apply. For
+> agent-mode operations see [Maintenance mode](#maintenance-mode-pause--agent-mode),
+> [Controlled switchover](#controlled-switchover-agent-mode), and the agent-mode
+> notes in [Point-in-Time Recovery](#point-in-time-recovery).
 
 ### Primary Failure (Automatic Failover)
 
@@ -1049,49 +1065,49 @@ At `1.0.0` the default `failoverMode` flips from `repmgrd` to `agent`. Because t
 When clients cannot connect, isolate the failing layer first. Query through PGPool-II:
 
 ```bash
-kubectl port-forward svc/my-postgres-pgpool 9999:9999
+kubectl port-forward svc/my-postgres-pg-pgpool 9999:9999
 psql -h localhost -p 9999 -U postgres -d postgres -c "SELECT 1"
 ```
 
 Then bypass PGPool-II and query the primary Service directly:
 
 ```bash
-kubectl port-forward svc/my-postgres 5432:5432
+kubectl port-forward svc/my-postgres-pg 5432:5432
 psql -h localhost -p 5432 -U postgres -d postgres -c "SELECT 1"
 ```
 
 If only the PGPool-II path fails, check backend status and logs below. If both fail, troubleshoot PostgreSQL itself first (see the recovery runbooks above).
 
-Check that the Services have endpoints (`my-postgres-readonly` exists when repmgr is enabled):
+Check that the Services have endpoints (`my-postgres-pg-readonly` exists when repmgr is enabled):
 
 ```bash
-kubectl get endpoints my-postgres my-postgres-pgpool my-postgres-readonly
+kubectl get endpoints my-postgres-pg my-postgres-pg-pgpool my-postgres-pg-readonly
 ```
 
-The PGPool-II readiness probe runs `SELECT 1` through port 9999 rather than a TCP check, so PGPool-II pods turn unready and drop out of the Service whenever they cannot serve queries from at least one backend. Empty `my-postgres-pgpool` endpoints therefore usually point at a backend or authentication problem, not at the Service. Restarts of the pgpool Deployment pods have the same root cause: the liveness probe runs the same query and restarts a wedged PGPool-II after about 60 seconds.
+The PGPool-II readiness probe runs `SELECT 1` through port 9999 rather than a TCP check, so PGPool-II pods turn unready and drop out of the Service whenever they cannot serve queries from at least one backend. Empty `my-postgres-pg-pgpool` endpoints therefore usually point at a backend or authentication problem, not at the Service. Restarts of the pgpool Deployment pods have the same root cause: the liveness probe runs the same query and restarts a wedged PGPool-II after about 60 seconds.
 
-If reads through the `my-postgres-readonly` Service do not reach standbys, the problem is the `pg-role` labels rather than PGPool-II: the Service selects `pg-role: standby`, which the service-updater re-applies every cycle, and pods stay absent from its endpoints until labeled (fresh installs, recreated or scaled-up pods).
+If reads through the `my-postgres-pg-readonly` Service do not reach standbys, the problem is the `pg-role` labels rather than PGPool-II: the Service selects `pg-role: standby`, which the service-updater (repmgrd mode) or the agent (agent mode) re-applies every cycle, and pods stay absent from its endpoints until labeled (fresh installs, recreated or scaled-up pods).
 
 ### Checking Backend Status
 
 `SHOW pool_nodes` through port 9999 reports each backend as PGPool-II sees it. `pool_hba.conf` trusts local connections inside the pod, so no password is needed:
 
 ```bash
-kubectl exec -it deploy/my-postgres-pgpool -c pgpool -- \
+kubectl exec -it deploy/my-postgres-pg-pgpool -c pgpool -- \
   sh -c 'psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SHOW pool_nodes;"'
 ```
 
-The PCP admin interface on port 9898 (also exposed on the pgpool Service) provides the same data. It authenticates against `pcp.conf`, which the init container generates from the admin Secret: the chart-managed `my-postgres-pgpool-admin` (keys `username`/`password`, populated from `pgpool.admin.username`/`pgpool.admin.password`), or your own Secret when `pgpool.admin.existingSecret.enabled` is set. Retrieve the password, then run the pcp commands (they prompt for it):
+The PCP admin interface on port 9898 (also exposed on the pgpool Service) provides the same data. It authenticates against `pcp.conf`, which the init container generates from the admin Secret: the chart-managed `my-postgres-pg-pgpool-admin` (keys `username`/`password`, populated from `pgpool.admin.username`/`pgpool.admin.password`), or your own Secret when `pgpool.admin.existingSecret.enabled` is set. Retrieve the password, then run the pcp commands (they prompt for it):
 
 ```bash
-kubectl get secret my-postgres-pgpool-admin -o jsonpath='{.data.password}' | base64 -d
-kubectl exec -it deploy/my-postgres-pgpool -c pgpool -- pcp_node_count -h localhost -p 9898 -U admin
-kubectl exec -it deploy/my-postgres-pgpool -c pgpool -- pcp_node_info -h localhost -p 9898 -U admin 0
+kubectl get secret my-postgres-pg-pgpool-admin -o jsonpath='{.data.password}' | base64 -d
+kubectl exec -it deploy/my-postgres-pg-pgpool -c pgpool -- pcp_node_count -h localhost -p 9898 -U admin
+kubectl exec -it deploy/my-postgres-pg-pgpool -c pgpool -- pcp_node_info -h localhost -p 9898 -U admin 0
 ```
 
-Changing the chart-managed credentials rolls the Deployment via the Secret checksum annotation; rotating an existing Secret requires `kubectl rollout restart deployment my-postgres-pgpool`, because `pcp.conf` is generated at pod start.
+Changing the chart-managed credentials rolls the Deployment via the Secret checksum annotation; rotating an existing Secret requires `kubectl rollout restart deployment my-postgres-pg-pgpool`, because `pcp.conf` is generated at pod start.
 
-Node IDs follow the StatefulSet ordinals: node 0 is `my-postgres-0`, node 1 is `my-postgres-1`, and so on.
+Node IDs follow the StatefulSet ordinals: node 0 is `my-postgres-pg-0`, node 1 is `my-postgres-pg-1`, and so on.
 
 | Column | Meaning |
 |--------|---------|
@@ -1107,22 +1123,22 @@ A recovered backend is reattached automatically when `pgpool.autoFailback` is `t
 With repmgr enabled the chart automates PGPool-II recovery:
 
 1. The service-updater sidecar repoints the primary Service selector to the new primary pod.
-2. On a primary change it runs `kubectl rollout restart deployment my-postgres-pgpool`, so PGPool-II restarts with a fresh backend status file and rediscovers the topology.
+2. On a primary change it runs `kubectl rollout restart deployment my-postgres-pg-pgpool`, so PGPool-II restarts with a fresh backend status file and rediscovers the topology.
 3. The same sidecar probes PGPool-II through its Service every 30 seconds and forces a rollout restart after 3 consecutive failures.
 4. Independently, the PGPool-II liveness probe restarts any instance that cannot serve queries for about 60 seconds.
 
 If clients still reach a stale topology (for example writes failing with read-only errors), apply the manual equivalent:
 
 ```bash
-kubectl rollout restart deployment my-postgres-pgpool
+kubectl rollout restart deployment my-postgres-pg-pgpool
 ```
 
 Failover history is recorded as Kubernetes Events: on every primary change the service-updater emits a `PrimaryChanged` Event attached to the primary Service, and its container logs on the PostgreSQL pods carry the same transition:
 
 ```bash
 kubectl get events --field-selector reason=PrimaryChanged
-kubectl describe service my-postgres
-kubectl logs my-postgres-0 -c service-updater | grep "Master change"
+kubectl describe service my-postgres-pg
+kubectl logs my-postgres-pg-0 -c service-updater | grep "Master change"
 ```
 
 Events are pruned by the cluster's event TTL (one hour by default), so the service-updater logs are the longer-lived record.
@@ -1132,7 +1148,7 @@ Events are pruned by the cluster's event TTL (one hour by default), so the servi
 PGPool-II logs to stderr, so everything is available through the container logs:
 
 ```bash
-kubectl logs deploy/my-postgres-pgpool -c pgpool
+kubectl logs deploy/my-postgres-pg-pgpool -c pgpool
 ```
 
 Verbosity is controlled by the `pgpool.logging.*` values: `logConnections` (default `true`), `logStatement` (log every client query), `logPerNodeStatement` (log which backend each query was routed to), and `logMinMessages` (default `warning`; `debug1` and below add internal detail). Changing them rolls the Deployment automatically via the config checksum annotation.
