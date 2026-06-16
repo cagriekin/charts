@@ -1,0 +1,84 @@
+{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.monitoring.prometheusRule.enabled }}
+{{- /*
+Example alert rules over the pg-ha-agent's metrics (scraped by the agent
+ServiceMonitor). Scoped to this release by namespace + the headless Service label
+the Prometheus Operator stamps on each series. Replication-lag alerts are NOT here
+-- they come from the postgres exporter (prometheusExporter.enabled); the agent
+exposes leadership/fencing health, not row-level replication state. Requires the
+Prometheus Operator CRDs.
+*/}}
+{{- $m := printf "namespace=%q,service=%q" .Release.Namespace (printf "%s-headless" (include "pg.fullname" .)) }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "pg.fullname" . }}-agent
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    {{- with .Values.repmgr.agent.monitoring.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  groups:
+    - name: {{ include "pg.fullname" . }}-agent
+      rules:
+        - alert: PGHAAgentNoLeader
+          expr: sum(pg_ha_agent_is_leader{ {{ $m }} }) == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "No pg-ha-agent holds the leader Lease ({{ include "pg.fullname" . }})"
+            description: "No agent has held the Lease for 2m, so there is no writable primary. Check agent logs and the Lease object."
+        - alert: PGHAAgentMultipleLeaders
+          expr: sum(pg_ha_agent_is_leader{ {{ $m }} }) > 1
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Multiple pg-ha-agents report leadership ({{ include "pg.fullname" . }})"
+            description: "More than one agent reports is_leader=1 for 1m -- a possible split-brain. The single Lease should permit only one; investigate immediately."
+        - alert: PGHAAgentDown
+          expr: up{ {{ $m }} } == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "pg-ha-agent metrics target down ({{ include "pg.fullname" . }})"
+            description: "An agent's metrics endpoint has been unscrapable for 5m (pod down or reconcile loop wedged)."
+        - alert: PGHAAgentLeaseRenewFailing
+          expr: rate(pg_ha_agent_renew_failures_total{ {{ $m }} }[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "pg-ha-agent failing to renew its Lease ({{ include "pg.fullname" . }})"
+            description: "Sustained lease-renew failures (apiserver reachability) -- the primary will self-demote if it cannot renew within renewDeadline."
+        - alert: PGHAAgentReconcileErrors
+          expr: rate(pg_ha_agent_reconcile_errors_total{ {{ $m }} }[5m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "pg-ha-agent reconcile errors ({{ include "pg.fullname" . }})"
+            description: "The agent has been failing to apply its decided action for 10m. Check agent logs."
+        - alert: PGHAAgentFlapping
+          expr: increase(pg_ha_agent_fences_total{ {{ $m }} }[15m]) > 2
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "pg-ha-agent fencing repeatedly ({{ include "pg.fullname" . }})"
+            description: "More than 2 fences in 15m suggests instability (intermittent apiserver/node slowness or a flapping primary)."
+        - alert: PGHAAgentPausedTooLong
+          expr: max(pg_ha_agent_is_paused{ {{ $m }} }) == 1
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "pg-ha-agent left in maintenance mode ({{ include "pg.fullname" . }})"
+            description: "Maintenance mode (pg-ha/pause) has been active for 1h -- automatic failover is suspended. Resume with: kubectl annotate configmap {{ include "pg.fullname" . }}-primary pg-ha/pause-"
+{{- end }}

@@ -1,0 +1,33 @@
+{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.monitoring.serviceMonitor.enabled }}
+{{- /*
+Scrapes the pg-ha-agent's read-only metrics (port 9200, /metrics) off the
+per-pod headless Service endpoints. The selector matches every Service carrying
+the chart's selector labels, but only the headless Service exposes the
+agent-metrics port, so only it is scraped. Requires the Prometheus Operator CRDs.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "pg.fullname" . }}-agent
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    {{- with .Values.repmgr.agent.monitoring.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "pg.selectorLabels" . | nindent 6 }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: agent-metrics
+      path: /metrics
+      interval: {{ .Values.repmgr.agent.monitoring.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.repmgr.agent.monitoring.serviceMonitor.scrapeTimeout }}
+{{- end }}

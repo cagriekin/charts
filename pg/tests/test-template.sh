@@ -783,6 +783,32 @@ agent_np=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.y
 assert_contains "agent netpol: 9200 metrics ingress present" "${agent_np}" "port: 9200"
 assert_contains "agent netpol: apiserver egress present" "${agent_np}" "port: 6443"
 
+# agent monitoring (Part H6): headless Service exposes the metrics port; the
+# ServiceMonitor + PrometheusRule render only in agent mode AND when enabled.
+agent_headless=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --show-only templates/service-headless.yaml 2>&1)
+assert_contains "agent headless: exposes agent-metrics port" "${agent_headless}" "name: agent-metrics"
+repmgrd_headless=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --show-only templates/service-headless.yaml 2>&1)
+assert_not_contains "repmgrd headless: no agent-metrics port (byte-stable)" "${repmgrd_headless}" "agent-metrics"
+agent_sm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.monitoring.serviceMonitor.enabled=true --show-only templates/agent-servicemonitor.yaml 2>&1)
+assert_contains "agent monitoring: ServiceMonitor scrapes agent-metrics" "${agent_sm}" "port: agent-metrics"
+assert_contains "agent monitoring: ServiceMonitor is the operator CRD" "${agent_sm}" "kind: ServiceMonitor"
+agent_pr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1)
+assert_contains "agent monitoring: PrometheusRule has the no-leader alert" "${agent_pr}" "PGHAAgentNoLeader"
+assert_contains "agent monitoring: PrometheusRule has the split-brain alert" "${agent_pr}" "PGHAAgentMultipleLeaders"
+assert_contains "agent monitoring: rules scoped to this release's headless Service" "${agent_pr}" "test-pg-headless"
+# disabled by default: neither monitoring template renders
+agent_sm_off=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --show-only templates/agent-servicemonitor.yaml 2>&1 || true)
+assert_not_contains "agent monitoring: ServiceMonitor off by default" "${agent_sm_off}" "kind: ServiceMonitor"
+# agent-gated: not rendered in repmgrd mode even if enabled
+agent_pr_repmgrd=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set repmgr.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1 || true)
+assert_not_contains "agent monitoring: PrometheusRule not in repmgrd mode" "${agent_pr_repmgrd}" "kind: PrometheusRule"
+
 # regression: default (no failoverMode) still renders repmgrd + service-updater
 default_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/statefulset.yaml 2>&1)
