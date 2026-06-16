@@ -1,6 +1,22 @@
 # pgvector chart changelog
 
-## 1.0.0
+## 1.0.1
+
+Bugfix for agent mode (the 1.0.0 default), in lockstep with pg 1.0.1. Image moves
+to `trixie-5.5.0-17`.
+
+### Fixed
+
+- **Agent standby never re-established streaming after a failover / repmgrd->agent
+  migration (#181).** A freshly-cloned, still-recovering standby was misclassified
+  as a stopped primary (SQL unreachable + `pg_controldata` still showing the source's
+  `in production` state), so the agent issued `RejoinForward` and killed the
+  standby's walreceiver, then looped `StartLocal`; the cluster was left single-node.
+  The agent now tracks process liveness separately from SQL readiness and waits for a
+  starting node to become ready instead of acting on its transient on-disk role. See
+  the pg 1.0.1 entry for full detail; the charts share the agent.
+
+
 
 First major release, in lockstep with pg 1.0.0 (the two charts now share a single
 1.0.0 version line). The lease-based Go agent (`pg-ha-agent`) is now the

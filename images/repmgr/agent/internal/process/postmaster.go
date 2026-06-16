@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -31,6 +32,7 @@ type Postmaster interface {
 	Start(ctx context.Context) error
 	Stop(ctx context.Context, mode StopMode) error
 	Reload(ctx context.Context) error
+	Running() bool
 }
 
 // HasData reports whether dataDir holds an initialized cluster (PG_VERSION present).
@@ -46,7 +48,8 @@ type ChildPostmaster struct {
 
 	mu     sync.Mutex
 	cmd    *exec.Cmd
-	exited chan error // single waiter delivers the child's exit here
+	exited chan error   // single waiter delivers the child's exit here
+	done   atomic.Bool  // true once the child's Wait has returned (race-free liveness)
 }
 
 // NewChildPostmaster builds a ChildPostmaster (PostgresBin e.g. /usr/lib/postgresql/18/bin/postgres).
@@ -78,8 +81,25 @@ func (p *ChildPostmaster) Start(_ context.Context) error {
 	}
 	p.cmd = cmd
 	p.exited = make(chan error, 1)
-	go func() { p.exited <- cmd.Wait() }() // the single Wait owner (also reaps the child)
+	p.done.Store(false)
+	go func() { // the single Wait owner (also reaps the child)
+		err := cmd.Wait()
+		p.done.Store(true) // set before the channel send so Running() never reports a dead child as alive
+		p.exited <- err
+	}()
 	return nil
+}
+
+// Running reports whether the supervised postmaster process is currently alive
+// (started and not yet exited). This is process liveness, distinct from SQL
+// readiness: a postmaster replaying WAL toward consistency is Running()=true but
+// still rejects connections. The reconcile loop uses it so a starting standby is
+// not misclassified as stopped (#181).
+func (p *ChildPostmaster) Running() bool {
+	p.mu.Lock()
+	alive := p.cmd != nil
+	p.mu.Unlock()
+	return alive && !p.done.Load()
 }
 
 func (p *ChildPostmaster) Stop(ctx context.Context, mode StopMode) error {
@@ -138,5 +158,6 @@ func (p *ChildPostmaster) Exited() <-chan error {
 func (p *ChildPostmaster) clear() {
 	p.mu.Lock()
 	p.cmd, p.exited = nil, nil
+	p.done.Store(false)
 	p.mu.Unlock()
 }

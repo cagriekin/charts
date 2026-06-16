@@ -13,6 +13,11 @@ func NewSupervisor(pm Postmaster) *Supervisor { return &Supervisor{pm: pm} }
 
 func (s *Supervisor) Start(ctx context.Context) error  { return s.pm.Start(ctx) }
 func (s *Supervisor) Reload(ctx context.Context) error { return s.pm.Reload(ctx) }
+
+// Running reports process liveness of the supervised postmaster (alive, not SQL
+// readiness). The reconcile loop uses it so a starting/recovering node is not
+// treated as stopped (#181).
+func (s *Supervisor) Running() bool { return s.pm.Running() }
 func (s *Supervisor) Stop(ctx context.Context, mode StopMode) error {
 	return s.pm.Stop(ctx, mode)
 }

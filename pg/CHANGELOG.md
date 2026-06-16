@@ -1,6 +1,29 @@
 # pg chart changelog
 
-## 1.0.0
+## 1.0.1
+
+Bugfix for agent mode (the 1.0.0 default). Image moves to `trixie-5.5.0-17`.
+
+### Fixed
+
+- **Agent standby never re-established streaming after a failover / repmgrd->agent
+  migration (#181).** The agent decided "running vs stopped" purely from SQL
+  reachability and, when SQL was unreachable, read the role from `pg_controldata`.
+  A freshly-cloned standby still rejecting connections (`the database system is
+  starting up`) was therefore misclassified: right after `pg_basebackup` the control
+  file still carries the source primary's `in production` state, so the agent saw a
+  "stopped primary" and issued `RejoinForward`, which terminated the standby's
+  walreceiver mid-stream; it then looped `StartLocal` on the recovering node. The
+  standby never reached consistency and the cluster was left single-node.
+  The agent now tracks **process liveness** (`Supervisor.Running()`) separately from
+  SQL readiness: while its own postmaster is alive but not yet accepting connections
+  (and not self-health-stuck), it **waits** for the node to reach a ready state
+  instead of acting on the transient on-disk role. Self-health failover of a
+  genuinely frozen primary is unaffected. Regression coverage: reconcile
+  decision-table cases, plus `test-agent-failover` / `test-migrate-agent` now assert
+  the rejoined standby is actively streaming (`pg_stat_replication`).
+
+
 
 First major release. The lease-based Go agent (`pg-ha-agent`) is now the
 **default** failover mode, and the `pg` and `pgvector` charts move to a single,
