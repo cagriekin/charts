@@ -4,7 +4,7 @@ TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-repmgr test-repmgr-chaos test-full test-failover test-upgrade \
-        test-repmgr-failover test-agent test-agent-etcd test-migrate-agent test-config test-config-repmgr test-backup-restore test-special-chars cluster-create cluster-delete cluster-exists clean help
+        test-repmgr-failover test-agent test-agent-etcd test-migrate-agent test-config test-config-repmgr test-backup-restore test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -32,6 +32,12 @@ test: cluster-create test-template test-cluster cluster-delete
 
 test-template:
 	@bash $(TESTS_DIR)/test-template.sh
+
+# Diff the repmgrd (default) render of pg+pgvector vs a baseline ref (default
+# origin/master) to confirm the default path stays byte-stable. Intended bumps show
+# as a diff to review; not a hard gate. Usage: make byte-stable [REF=<ref>]
+byte-stable:
+	@bash ../scripts/check-repmgrd-byte-stable.sh $(REF)
 
 # Run independent suites in parallel with -j
 # test-repmgr-failover is sequential (repmgr then failover)

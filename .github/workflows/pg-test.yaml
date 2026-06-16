@@ -14,6 +14,14 @@ on:
       # the agent etcd-mode test), so an etcd-source change must re-run it.
       - 'etcd/**'
       - '.github/workflows/pg-test.yaml'
+  # Also gate PRs: the chart integration suite (incl. agent + failover) catches
+  # regressions a merge to master otherwise only surfaces after the fact.
+  pull_request:
+    paths:
+      - 'pg/**'
+      - 'images/repmgr/**'
+      - 'etcd/**'
+      - '.github/workflows/pg-test.yaml'
 
 env:
   IMAGES: >-
@@ -21,6 +29,7 @@ env:
     cagriekin/pgpool:4.7.1
     pgpool/pgpool2_exporter:1.2.2
     quay.io/prometheuscommunity/postgres-exporter:v0.19.1
+    quay.io/coreos/etcd:v3.5.16
     busybox:1.37
     busybox:1.35
 
@@ -129,6 +138,31 @@ jobs:
 
       - name: Run upgrade tests
         run: make -C pg test-upgrade
+
+      # Free the cluster before the remaining heavy live suites (2-CPU runner).
+      - name: Clean up before etcd/migration suites
+        run: |
+          kubectl delete namespace pg-test-agent pg-test-upgrade \
+            --ignore-not-found --wait=true --timeout=180s \
+            || echo "WARNING: namespace cleanup timed out, continuing"
+
+      # etcd DCS backend: bundled 3-node etcd, leadership off the apiserver, failover.
+      - name: Run agent etcd-mode tests
+        run: make -C pg test-agent-etcd
+
+      - name: Clean up etcd-mode namespace
+        run: |
+          kubectl delete namespace pg-test-agent-etcd --ignore-not-found --wait=true --timeout=180s \
+            || echo "WARNING: namespace cleanup timed out, continuing"
+
+      # The 1.0.0 breaking-change path: repmgrd -> agent via --cascade=orphan recreate.
+      - name: Run repmgrd->agent migration test
+        run: make -C pg test-migrate-agent
+
+      - name: Clean up migration namespace
+        run: |
+          kubectl delete namespace pg-test-migrate --ignore-not-found --wait=true --timeout=180s \
+            || echo "WARNING: namespace cleanup timed out, continuing"
 
       - name: Dump cluster state on failure
         if: failure()
