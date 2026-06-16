@@ -405,6 +405,10 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if a.followUpstream == dec.Target {
 			return nil
 		}
+		// Invariant 9: never follow an upstream from a different cluster.
+		if err := a.assertSameCluster(ctx, dec.Target); err != nil {
+			return err
+		}
 		up := nodeID(dec.Target)
 		if err := a.mech.RegisterStandby(ctx, up); err != nil {
 			a.log.Warn("register standby in repmgr.nodes", "err", err)
@@ -420,6 +424,11 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		return a.sup.Demote(ctx, true)
 
 	case reconcile.RejoinForward:
+		// Invariant 9: never rewind/reclone onto a different cluster. Checked before
+		// the demote so a healthy node is not stopped for a doomed rejoin.
+		if err := a.assertSameCluster(ctx, dec.Target); err != nil {
+			return err
+		}
 		if err := a.sup.Demote(ctx, true); err != nil {
 			return err
 		}
@@ -605,6 +614,31 @@ func (a *agent) fenceBudget() time.Duration {
 		b = a.cfg.RetryPeriod
 	}
 	return b
+}
+
+// assertSameCluster enforces invariant 9: never use a peer of a DIFFERENT
+// PostgreSQL cluster as a follow/rewind/reclone source (a stale or misrouted pod on
+// the shared headless Service, a leftover, or a DR-restored cluster with a fresh
+// system_identifier). It compares the peer's pg_control system_identifier to the
+// local one. When the local data dir is empty/uninitialized there is no identity to
+// protect yet (a bootstrap clone DEFINES it), so the check is a no-op. When the
+// peer's identifier cannot be read it does not block -- pg_rewind and the streaming
+// walreceiver also reject a sysid mismatch -- so this only refuses on a CONFIRMED
+// mismatch, turning a cryptic downstream failure into a clear, actionable one.
+func (a *agent) assertSameCluster(ctx context.Context, peer string) error {
+	cd, err := pg.ReadControlData(ctx, pg.OSExec{}, pgControlDataBin, a.cfg.PGDATA)
+	if err != nil || cd.SystemID == 0 {
+		return nil // no local cluster identity yet -> nothing to protect
+	}
+	peerID, ok, perr := a.prober.SystemIdentifier(ctx, a.peerConn(peer))
+	if perr != nil || !ok {
+		a.log.Warn("cluster-identity check: peer system_identifier unreadable; proceeding (pg_rewind/walreceiver still enforce it)", "peer", peer, "err", perr)
+		return nil
+	}
+	if peerID != cd.SystemID {
+		return fmt.Errorf("invariant 9: refusing %s as replication source: system_identifier %d != local %d (different cluster)", peer, peerID, cd.SystemID)
+	}
+	return nil
 }
 
 // assertPrimaryRouting is run by the holder/primary: it points the write Service

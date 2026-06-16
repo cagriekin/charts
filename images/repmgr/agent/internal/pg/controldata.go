@@ -21,6 +21,10 @@ type ControlInfo struct {
 	// exist past the last online checkpoint). Used for cold-boot LSN gossip.
 	LSN   LSN
 	LSNOK bool
+	// SystemID is the "Database system identifier" -- the cluster's unique identity,
+	// set at initdb and inherited by clones. Used to refuse a clone/follow/rewind
+	// from a peer of a DIFFERENT cluster (invariant 9). 0 when unreadable.
+	SystemID uint64
 }
 
 // ReadControlData runs `pg_controldata -D <dataDir>` and parses the cluster state
@@ -59,6 +63,10 @@ func parseControlData(out string) ControlInfo {
 		case "Latest checkpoint location":
 			if lsn, ok := ParseLSN(val); ok {
 				ci.LSN, ci.LSNOK = lsn, true
+			}
+		case "Database system identifier":
+			if n, err := strconv.ParseUint(val, 10, 64); err == nil {
+				ci.SystemID = n
 			}
 		}
 	}
