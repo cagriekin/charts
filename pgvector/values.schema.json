@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "pgvector chart values (enum guards)",
+  "description": "Partial schema: constrains the values whose typos silently misconfigure HA. additionalProperties stays open so the rest of values.yaml is unconstrained.",
+  "type": "object",
+  "properties": {
+    "repmgr": {
+      "type": "object",
+      "properties": {
+        "failoverMode": {
+          "enum": ["repmgrd", "agent"],
+          "description": "repmgrd (default) or the lease-based Go agent."
+        },
+        "agent": {
+          "type": "object",
+          "properties": {
+            "dcs": {
+              "type": "object",
+              "properties": {
+                "backend": {
+                  "enum": ["kubernetes", "etcd"],
+                  "description": "Leadership store: the Kubernetes Lease API (default) or etcd."
+                }
+              }
+            }
+          }
+        },
+        "splitBrainDetection": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "enum": ["log", "fence"]
+            }
+          }
+        }
+      }
+    },
+    "pgbackrest": {
+      "type": "object",
+      "properties": {
+        "s3": {
+          "type": "object",
+          "properties": {
+            "keyType": {
+              "enum": ["shared", "auto"],
+              "description": "shared = static keys from existingSecret; auto = cloud workload identity / instance credential chain."
+            }
+          }
+        }
+      }
+    }
+  }
+}
