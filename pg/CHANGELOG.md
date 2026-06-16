@@ -1,11 +1,48 @@
 # pg chart changelog
 
-## 0.5.89
+## 1.0.0
 
-Introduces an opt-in, lease-based failover mode (`repmgr.failoverMode: agent`).
-The default stays `repmgrd`, so existing installs are unaffected and the
-repmgrd rendering is byte-stable. The repmgr image moves to `trixie-5.5.0-16`,
-which bundles the new `pg-ha-agent` binary.
+First major release. The lease-based Go agent (`pg-ha-agent`) is now the
+**default** failover mode, and the `pg` and `pgvector` charts move to a single,
+aligned 1.0.0 version line. The repmgr image is `trixie-5.5.0-16`, which bundles
+the agent binary.
+
+### BREAKING
+
+- **`repmgr.failoverMode` defaults to `agent`** (was `repmgrd`). New installs run
+  the lease-based agent. The legacy repmgrd + service-updater path remains
+  available for one major cycle via `repmgr.failoverMode: repmgrd` (deprecated).
+- Agent mode uses `podManagementPolicy: Parallel` (repmgrd uses `OrderedReady`),
+  an **immutable** StatefulSet field, so switching an existing repmgrd release to
+  agent mode requires a one-time `--cascade=orphan` StatefulSet recreate.
+- Agent mode assembles a hardened `pg_hba.conf` (pod-CIDR + SCRAM, no implicit
+  `0.0.0.0/0 md5`). Consumers who relied on the broad md5 rule must add explicit
+  `postgresql.pgHba` rules before switching.
+- The postgresql PodDisruptionBudget default is `maxUnavailable: 1` +
+  `unhealthyPodEvictionPolicy: AlwaysAllow` (was `minAvailable: 1`); equivalent on
+  a 2-pod cluster, strictly better for drains/upgrades (k8s >= 1.27).
+
+### Migrating to 1.0.0
+
+- **Stay on repmgrd (no behavior change):** set `repmgr.failoverMode: repmgrd` and
+  `helm upgrade`. Pods roll once for image `trixie-5.5.0-16`; nothing else changes.
+- **Adopt agent mode (default):** with a fresh backup and a healthy cluster, and
+  ArgoCD auto-sync paused if used:
+  1. `kubectl delete statefulset <release>-pg --cascade=orphan -n <ns>` (keeps pods
+     + PVCs running; Helm re-adopts them).
+  2. `helm upgrade <release> ... ` (recreates the StatefulSet as `Parallel`, adopts
+     the orphaned pods, rolls them into agent mode). The migration guard stops a
+     first-rolled standby from becoming a second writer.
+  3. Verify: `kubectl get lease <release>-pg-leader` holder == the primary;
+     `kubectl get endpoints <release>-pg` points at it; write a row; in staging
+     trigger a failover and confirm the Lease moves and data survives.
+  - Rollback is symmetric (flip back to `repmgrd` with the same `--cascade=orphan`
+    recreate, then optionally `kubectl delete lease <release>-pg-leader`).
+  - Full runbook (GitOps caveats, DR/PITR, pg_upgrade, the etcd DCS backend) is in
+    the README.
+
+The sections below describe the agent machinery introduced across the 0.5.x line
+and now shipping as the 1.0.0 default; the repmgrd rendering is byte-stable.
 
 ### Added
 

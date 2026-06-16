@@ -168,10 +168,11 @@ repmgr:
   enabled: true
 
   # Failover mode:
-  #   repmgrd (default) — repmgrd sidecar + service-updater (the original path)
-  #   agent             — the lease-based Go agent (PID 1) drives failover
-  # Becomes the default at chart v1.0.0.
-  failoverMode: repmgrd
+  #   agent (default)   — the lease-based Go agent (PID 1) drives failover
+  #   repmgrd           — repmgrd sidecar + service-updater (the original path)
+  # Default since chart v1.0.0 (was repmgrd through 0.x). Pin failoverMode: repmgrd
+  # to stay on the legacy path for one major cycle (deprecated).
+  failoverMode: agent
 
   # Lease-based agent (failoverMode: agent) tunables. Defaults suit a stable
   # control plane; raise for managed clouds (e.g. 30s/20s/4s) so brief apiserver

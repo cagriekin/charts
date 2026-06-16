@@ -22,9 +22,12 @@ git -C "${root}" worktree add -q --detach "${wt}" "${ref}"
 filt() { grep -vE '^[[:space:]]+(password|repmgr-password):'; }
 
 rc=0
+# Force repmgrd mode on both sides: since 1.0.0 the chart default is `agent`, so a
+# bare render no longer exercises the legacy path. On the 0.x baseline this --set is
+# a no-op (repmgrd was already the default), so the comparison stays apples-to-apples.
 for chart in pg pgvector; do
-  helm template rel "${root}/${chart}" 2>/dev/null | filt > "${tmp}/${chart}-wt.yaml"
-  helm template rel "${wt}/${chart}"  2>/dev/null | filt > "${tmp}/${chart}-base.yaml"
+  helm template rel "${root}/${chart}" --set repmgr.failoverMode=repmgrd 2>/dev/null | filt > "${tmp}/${chart}-wt.yaml"
+  helm template rel "${wt}/${chart}"  --set repmgr.failoverMode=repmgrd 2>/dev/null | filt > "${tmp}/${chart}-base.yaml"
   if diff -u "${tmp}/${chart}-base.yaml" "${tmp}/${chart}-wt.yaml" > "${tmp}/${chart}.diff"; then
     echo "OK: ${chart} repmgrd default render unchanged vs ${ref}"
   else

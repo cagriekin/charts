@@ -49,6 +49,9 @@ postgresql:
       additionalCommands: ""
 
 repmgr:
+  # The legacy path is no longer the chart default (agent is, since 1.0.0); pin it
+  # explicitly so this fixture exercises repmgrd mode.
+  failoverMode: repmgrd
   image:
     repository: cagriekin/repmgr
     tag: trixie-5.5.0-15

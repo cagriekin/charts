@@ -213,23 +213,23 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 - **repmgrd**: monitors replication and triggers automatic failover when the primary becomes unavailable
 - **service-updater**: watches repmgr cluster state and patches the Kubernetes Service selector to point to the current primary, then restarts PGPool-II if enabled. Also maintains a `pg-role` label (`primary`/`standby`) on every postgresql pod each cycle, which the `<fullname>-readonly` service selects (`pg-role: standby`) to route read traffic to replicas
 
-### Failover modes: `repmgrd` (default) and lease-based `agent`
+### Failover modes: lease-based `agent` (default) and legacy `repmgrd`
 
 `repmgr.failoverMode` selects how failover is decided:
 
-- **`repmgrd`** (default): the repmgrd + service-updater sidecars described above. Unchanged behavior.
-- **`agent`** (opt-in): a Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a Kubernetes `coordination.k8s.io/v1` Lease (`<fullname>-leader`) as the **sole authority** for which pod is primary, driving repmgr as a pure mechanism (`failover=manual`, no repmgrd). Becomes the default at chart `1.0.0`.
+- **`agent`** (default since `1.0.0`): a Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a Kubernetes `coordination.k8s.io/v1` Lease (`<fullname>-leader`) as the **sole authority** for which pod is primary, driving repmgr as a pure mechanism (`failover=manual`, no repmgrd).
+- **`repmgrd`** (legacy, opt-in): the repmgrd + service-updater sidecars described above. Unchanged behavior; supported for one major cycle (deprecated). Pin `repmgr.failoverMode: repmgrd` to stay on it.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `repmgr.failoverMode` | `repmgrd` or `agent` | `repmgrd` |
+| `repmgr.failoverMode` | `agent` or `repmgrd` | `agent` |
 | `repmgr.agent.leaseDuration` | Lease TTL | `15s` |
 | `repmgr.agent.renewDeadline` | Holder self-demotes if it cannot renew within this | `10s` |
 | `repmgr.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
 | `repmgr.agent.reconcileInterval` | Reconcile tick interval | `5s` |
 | `repmgr.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
 
-Must satisfy `leaseDuration > renewDeadline > retryPeriod`; widen for managed clouds (e.g. `30s/20s/4s`). This chart shares pg's templates and agent — see the [pg chart README](../pg/README.md#failover-modes-repmgrd-default-and-lease-based-agent) for the full agent-mode behavior and the **migration runbook** (the immutable `podManagementPolicy` change requires a one-time `kubectl delete statefulset --cascade=orphan` + `helm upgrade`). See `ENVIRONMENT.md` for the injected-variable catalog.
+Must satisfy `leaseDuration > renewDeadline > retryPeriod`; widen for managed clouds (e.g. `30s/20s/4s`). This chart shares pg's templates and agent — see the [pg chart README](../pg/README.md#failover-modes-lease-based-agent-default-and-legacy-repmgrd) for the full agent-mode behavior and the **migration runbook** (the immutable `podManagementPolicy` change requires a one-time `kubectl delete statefulset --cascade=orphan` + `helm upgrade`). See `ENVIRONMENT.md` for the injected-variable catalog.
 
 ### PGPool-II Parameters
 
@@ -710,7 +710,7 @@ helm repo update
 helm upgrade my-pgvector cagriekin/pgvector   # add -f your-values.yaml
 ```
 
-`pgvector` tracks `pg` in lockstep (same image and agent; `pgvector` 0.6.x ↔ `pg` 0.5.x, both unifying at `1.0.0`). The default failover mode stays `repmgrd`, so routine upgrades need no action beyond reading the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. For the **compatibility matrix, the version model, the agent-mode opt-in runbook, and the breaking `1.0.0` migration**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
+`pgvector` tracks `pg` in lockstep (same image and agent; the 0.6.x ↔ 0.5.x lines unified at `1.0.0`). As of `1.0.0` the default failover mode is `agent` (it was `repmgrd` through 0.x) — upgrading an existing repmgrd install across the `1.0.0` boundary and adopting the default needs the one-time `--cascade=orphan` recreate; pin `repmgr.failoverMode: repmgrd` to defer. Read the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. For the **compatibility matrix, the version model, and the full `1.0.0` migration runbook**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
 
 ## pgvector Resources
 

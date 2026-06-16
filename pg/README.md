@@ -208,12 +208,12 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 
 **Split-brain detection**: In a 2-node cluster, network partitions can cause both nodes to believe they are the primary. The service-updater detects this by checking all nodes each monitoring cycle. With `action: log` (default), it logs a critical warning. With `action: fence`, it compares WAL LSN positions and terminates connections on the stale primary. For production deployments, use 3+ nodes to reduce split-brain risk.
 
-### Failover modes: `repmgrd` (default) and lease-based `agent`
+### Failover modes: lease-based `agent` (default) and legacy `repmgrd`
 
 `repmgr.failoverMode` selects how failover is decided:
 
-- **`repmgrd`** (default): the repmgrd + service-updater sidecars described above. Unchanged behavior.
-- **`agent`** (opt-in): a Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a Kubernetes `coordination.k8s.io/v1` Lease (`<fullname>-leader`) as the **sole authority** for which pod is primary, driving repmgr as a pure mechanism (`failover=manual`, no repmgrd). The Lease replaces hand-rolled split-brain handling and removes the repmgrd startup race. Becomes the default at chart `1.0.0`.
+- **`agent`** (default since `1.0.0`): a Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a Kubernetes `coordination.k8s.io/v1` Lease (`<fullname>-leader`) as the **sole authority** for which pod is primary, driving repmgr as a pure mechanism (`failover=manual`, no repmgrd). The Lease replaces hand-rolled split-brain handling and removes the repmgrd startup race.
+- **`repmgrd`** (legacy, opt-in): the repmgrd + service-updater sidecars described above. Unchanged behavior; supported for one major cycle (deprecated). Pin `repmgr.failoverMode: repmgrd` to stay on it.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
@@ -902,7 +902,7 @@ make cluster-delete
 # Run the core cluster suites in parallel
 make -j4 test-cluster
 
-# Confirm the repmgrd (default) render has not drifted vs a baseline ref
+# Confirm the legacy repmgrd render has not drifted vs a baseline ref
 make byte-stable REF=origin/master
 ```
 
@@ -929,7 +929,7 @@ The `terminationGracePeriodSeconds` (default 120s) controls the maximum time all
 
 ## Recovery Runbooks
 
-> The runbooks below describe **repmgrd mode** (the default). In **agent mode**
+> The runbooks below describe **repmgrd mode** (the legacy, opt-in path). In **agent mode** (the default since 1.0.0)
 > (`repmgr.failoverMode: agent`) failover is driven by the Kubernetes Lease, not
 > repmgrd/service-updater: a primary failure is handled automatically (a standby
 > wins the Lease and promotes; the agent repoints the Service selector), and
@@ -1048,15 +1048,11 @@ helm repo update
 helm upgrade my-postgres cagriekin/pg   # add -f your-values.yaml
 ```
 
-The default failover mode stays `repmgrd`, so existing installs are unaffected and the repmgrd rendering is byte-stable across these releases. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, pg_hba, or image changes) have one-time steps. The CHANGELOG carries an unbroken trail back to 0.5.71.
-
-### Opt in to agent mode (still 0.x)
-
-Lease-based agent failover is opt-in (`repmgr.failoverMode: agent`) and requires a one-time, zero-downtime StatefulSet recreate (the `podManagementPolicy` change is immutable). See **[Migrating an existing release to agent mode](#migrating-an-existing-release-to-agent-mode)** for the `--cascade=orphan` runbook + the GitOps caveats.
+Within the 0.x line the default failover mode was `repmgrd`, so those upgrades were unaffected and the repmgrd rendering stayed byte-stable. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, pg_hba, or image changes) have one-time steps. The CHANGELOG carries an unbroken trail back to 0.5.71.
 
 ### Migrating to 1.0.0 (the breaking change)
 
-At `1.0.0` the default `failoverMode` flips from `repmgrd` to `agent`. Because the agent's `podManagementPolicy: Parallel` is immutable on an existing StatefulSet, the `kubectl delete statefulset <release> --cascade=orphan` + `helm upgrade` recreate (today optional, for opting into agent mode) becomes **required for every consumer** upgrading across the `1.0.0` boundary — unless you pin `repmgr.failoverMode: repmgrd` to stay on the (still-supported, one-major-cycle deprecation) repmgrd path and defer the move. The full step-by-step `1.0.0` runbook ships with that release; the mechanics are identical to the agent-mode runbook linked above.
+As of `1.0.0` the default `failoverMode` is `agent` (it was `repmgrd` through 0.x). Because the agent's `podManagementPolicy: Parallel` is immutable on an existing StatefulSet, upgrading an existing repmgrd install across the `1.0.0` boundary and adopting the new default requires a one-time `kubectl delete statefulset <release>-pg --cascade=orphan` + `helm upgrade` recreate — see **[Migrating an existing release to agent mode](#migrating-an-existing-release-to-agent-mode)** for the full `--cascade=orphan` runbook and the GitOps caveats. To defer the move, pin `repmgr.failoverMode: repmgrd` (the legacy path stays supported for one major cycle, then deprecation); that upgrade needs no recreate.
 
 ## Troubleshooting PGPool
 
