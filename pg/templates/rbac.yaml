@@ -5,9 +5,13 @@ metadata:
   name: {{ include "pg.fullname" . }}-repmgr
   labels:
     {{- include "pg.labels" . | nindent 4 }}
-  {{- with (include "pg.annotations" .) }}
+  {{- /* This is the postgresql pods' identity: global annotations plus the
+         postgresql.serviceAccount.annotations knob (cloud workload identity for
+         keyless pgbackrest S3 -- IRSA / GKE WI). SA-specific keys win on conflict. */}}
+  {{- $saAnnotations := merge (deepCopy .Values.postgresql.serviceAccount.annotations) .Values.global.annotations }}
+  {{- with $saAnnotations }}
   annotations:
-    {{- . | nindent 4 }}
+    {{- toYaml . | nindent 4 }}
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

@@ -1071,6 +1071,39 @@ assert_contains "pgbackrest: sidecar present" "${pgbackrest_sts}" "name: pgbackr
 assert_contains "pgbackrest: PGBACKREST_STANZA env var" "${pgbackrest_sts}" "PGBACKREST_STANZA"
 assert_contains "pgbackrest: S3 key env var" "${pgbackrest_sts}" "PGBACKREST_REPO1_S3_KEY"
 assert_contains "pgbackrest: config volume mount" "${pgbackrest_sts}" "pgbackrest-config"
+
+# pgBackRest S3 key-type: default (shared) keeps static-key env + emits key-type.
+assert_contains "pgbackrest: default key-type is shared" "${pgbackrest}" "repo1-s3-key-type=shared"
+
+# keyType=auto (cloud workload identity): no static-key env, no existingSecret
+# required, SA annotation flows to the postgresql pods' ServiceAccount.
+pgb_auto=$(helm template test-pg "${CHART_DIR}" \
+  --set pgbackrest.enabled=true \
+  --set pgbackrest.s3.endpoint=https://s3.amazonaws.com \
+  --set pgbackrest.s3.bucket=test-backups \
+  --set pgbackrest.s3.keyType=auto \
+  --set 'postgresql.serviceAccount.annotations.eks\.amazonaws\.com/role-arn=arn:aws:iam::1:role/r' 2>&1)
+assert_contains "pgbackrest auto: key-type is auto" "${pgb_auto}" "repo1-s3-key-type=auto"
+assert_not_contains "pgbackrest auto: no static S3 key env" "${pgb_auto}" "PGBACKREST_REPO1_S3_KEY"
+assert_contains "pgbackrest auto: pod SA carries IRSA annotation" "${pgb_auto}" "eks.amazonaws.com/role-arn: arn:aws:iam::1:role/r"
+
+# keyType=auto renders without existingSecret.name (the required() is shared-only).
+pgb_auto_noexsec_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set pgbackrest.enabled=true \
+  --set pgbackrest.s3.endpoint=https://s3.amazonaws.com \
+  --set pgbackrest.s3.bucket=test-backups \
+  --set pgbackrest.s3.keyType=auto >/dev/null 2>&1 || pgb_auto_noexsec_rc=$?
+assert_eq "pgbackrest auto: no existingSecret required" "0" "${pgb_auto_noexsec_rc}"
+
+# Invalid keyType fails fast.
+pgb_bad_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set pgbackrest.enabled=true \
+  --set pgbackrest.s3.endpoint=https://s3.amazonaws.com \
+  --set pgbackrest.s3.bucket=test-backups \
+  --set pgbackrest.s3.keyType=bogus >/dev/null 2>&1 || pgb_bad_rc=$?
+assert_eq "pgbackrest: invalid keyType fails fast" "1" "$([ "${pgb_bad_rc}" -ne 0 ] && echo 1 || echo 0)"
 assert_contains "pgbackrest: sidecar runs sleep infinity" "${pgbackrest_sts}" "exec sleep infinity"
 
 # pgBackRest: sidecar must NOT carry per-fire schedule envs (scheduling lives
