@@ -41,3 +41,13 @@ jobs:
         run: |
           go vet ./...
           go test ./...
+
+      - name: verify module checksums (supply chain)
+        working-directory: images/repmgr/agent
+        run: go mod verify
+
+      - name: govulncheck (pinned)
+        working-directory: images/repmgr/agent
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          "$(go env GOPATH)/bin/govulncheck" ./...
