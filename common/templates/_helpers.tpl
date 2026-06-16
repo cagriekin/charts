@@ -210,6 +210,12 @@ spec:
   {{- with .maxUnavailable }}
   maxUnavailable: {{ . }}
   {{- end }}
+  {{- with .unhealthyPodEvictionPolicy }}
+  {{- /* k8s >=1.27 (beta, default on); older API servers prune the unknown field
+         harmlessly. Lets a not-yet-Ready/unhealthy pod be evicted during a drain so
+         a stuck reattaching pod cannot wedge node maintenance / autoscaler scale-down. */}}
+  unhealthyPodEvictionPolicy: {{ . }}
+  {{- end }}
 {{- end }}
 
 {{- define "common.exporterDeployment" -}}

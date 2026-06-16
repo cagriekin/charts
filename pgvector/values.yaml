@@ -76,6 +76,10 @@ postgresql:
     failureThreshold: 60
 
   affinity: {}
+  # Hard topology spread for the postgresql pods (default none; the affinity above
+  # already does a soft zone spread + hard hostname anti-affinity). Set a hard zone
+  # spread for multi-AZ production -- see values-cloud.yaml.
+  topologySpreadConstraints: []
 
   nodeSelector: {}
 
@@ -87,7 +91,14 @@ postgresql:
 
   podDisruptionBudget:
     enabled: true
-    minAvailable: 1
+    # maxUnavailable (not minAvailable) so a drain / rolling upgrade / autoscaler
+    # scale-down takes at most one PostgreSQL pod at a time regardless of replica
+    # count. unhealthyPodEvictionPolicy: AlwaysAllow lets a stuck/not-yet-Ready pod
+    # (e.g. one slowly reattaching its volume) still be evicted, so it cannot wedge
+    # node maintenance (k8s >= 1.27; older API servers prune the field harmlessly).
+    maxUnavailable: 1
+    unhealthyPodEvictionPolicy: AlwaysAllow
+    minAvailable: null
 
   configuration: {}
     # max_connections: "200"
