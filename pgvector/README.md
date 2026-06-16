@@ -191,7 +191,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 |-----------|-------------|---------|
 | `repmgr.enabled` | Enable repmgr | `true` |
 | `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
-| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-7` |
+| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-16` |
 | `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `repmgr.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Bump with `repmgr.image.tag` when moving to an image built for a new PG major. | `"18"` |
 | `repmgr.username` | Repmgr database user | `repmgr` |
@@ -667,8 +667,8 @@ kubectl scale statefulset my-pgvector --replicas=0
 
 # 2. Run a restore pod mounting the data PVC
 kubectl run pg-restore --rm -it \
-  --image=cagriekin/repmgr:trixie-5.5.0-7 \
-  --overrides='{ "spec": { "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-7", "command": ["bash"], "stdin": true, "tty": true, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "value": "YOUR_KEY" }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "value": "YOUR_SECRET" }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-pgvector-0" } }] } }'
+  --image=cagriekin/repmgr:trixie-5.5.0-16 \
+  --overrides='{ "spec": { "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-16", "command": ["bash"], "stdin": true, "tty": true, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "value": "YOUR_KEY" }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "value": "YOUR_SECRET" }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-pgvector-0" } }] } }'
 
 # 3. Inside the restore pod, run:
 pgbackrest --stanza=db restore \
@@ -681,6 +681,23 @@ kubectl scale statefulset my-pgvector --replicas=2
 ```
 
 Repmgr will automatically rebuild standbys from the restored primary.
+
+#### Agent mode: clear the stale leadership state before scaling up
+
+In agent mode the Lease and the highwater-marker ConfigMap survive the scale-to-0
+but describe the *pre-restore* cluster, so a leftover marker makes the agents
+refuse to promote onto the rewound (lower) timeline. Before scaling back up:
+
+```bash
+kubectl delete lease     my-pgvector-leader   -n <ns> --ignore-not-found
+kubectl delete configmap my-pgvector-primary  -n <ns> --ignore-not-found
+```
+
+The same applies to a major-version (`pg_upgrade`) upgrade, which is a primary-first
+manual operation: pause the agent first (`kubectl annotate configmap
+my-pgvector-primary pg-ha/pause=true --overwrite`) so it does not fail over
+mid-upgrade, then resume. See the pg chart's README (Point-in-Time Recovery and
+major-version upgrade sections) for the full agent-mode runbook.
 
 ### Upgrading Existing Clusters
 

@@ -183,7 +183,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 |-----------|-------------|---------|
 | `repmgr.enabled` | Enable repmgr | `true` |
 | `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
-| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-7` |
+| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-16` |
 | `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `repmgr.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Bump with `repmgr.image.tag` when moving to an image built for a new PG major. | `"18"` |
 | `repmgr.username` | Repmgr database user | `repmgr` |
@@ -808,8 +808,8 @@ kubectl scale statefulset my-postgres --replicas=0
 
 # 2. Run a restore pod mounting the data PVC
 kubectl run pg-restore --rm -it \
-  --image=cagriekin/repmgr:trixie-5.5.0-7 \
-  --overrides='{ "spec": { "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-7", "command": ["bash"], "stdin": true, "tty": true, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "value": "YOUR_KEY" }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "value": "YOUR_SECRET" }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-postgres-0" } }] } }'
+  --image=cagriekin/repmgr:trixie-5.5.0-16 \
+  --overrides='{ "spec": { "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-16", "command": ["bash"], "stdin": true, "tty": true, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "value": "YOUR_KEY" }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "value": "YOUR_SECRET" }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-postgres-0" } }] } }'
 
 # 3. Inside the restore pod, run:
 pgbackrest --stanza=db restore \
@@ -822,6 +822,55 @@ kubectl scale statefulset my-postgres --replicas=2
 ```
 
 Repmgr will automatically rebuild standbys from the restored primary.
+
+#### Agent mode: clear the stale leadership state before scaling up
+
+In agent mode (`repmgr.failoverMode: agent`) the Lease and the highwater-marker
+ConfigMap survive the scale-to-0 but now describe the *pre-restore* cluster. Before
+scaling back up, delete both so the restored data re-elects cleanly:
+
+```bash
+kubectl delete lease     my-postgres-leader   -n <ns> --ignore-not-found
+kubectl delete configmap my-postgres-primary  -n <ns> --ignore-not-found
+```
+
+Why: the marker records the highest timeline the old cluster ever reached. A PITR
+restore rewinds to an earlier point on a lower timeline, so a leftover marker would
+make every agent refuse to promote (the #125 stale-primary guard, working as
+intended) and the cluster would never come up. Deleting the marker lets the
+restored primary set a fresh highwater. The Lease is deleted so leadership is
+decided by the restored set, not a holder annotation from the old generation.
+
+If the restore produced a cluster with a **new** PostgreSQL system identifier
+(e.g. restored into a different release name), the agent's cluster-identity guard
+(invariant 9) will correctly refuse to clone/rejoin a leftover pod from the old
+cluster — delete any such orphaned pods/PVCs rather than letting them rejoin.
+
+### PostgreSQL major-version upgrade (agent mode)
+
+`pg_upgrade` is a manual, primary-first operation that the agent would otherwise
+fight (it sees the primary stop and would fail over). Use maintenance mode to
+suspend automatic failover for the window:
+
+```bash
+# 1. Fresh backup. Pause the agent (it keeps renewing the Lease + serving, but
+#    will not promote/demote/fence on its own):
+kubectl annotate configmap my-postgres-primary -n <ns> pg-ha/pause=true --overwrite
+
+# 2. Perform the major upgrade primary-first per the PostgreSQL pg_upgrade
+#    procedure (new-major image, pg_upgrade against the primary's PGDATA), then
+#    rebuild each standby from the upgraded primary (delete its PVC + pod so the
+#    agent re-clones it on the new major).
+
+# 3. Resume automatic failover:
+kubectl annotate configmap my-postgres-primary -n <ns> pg-ha/pause-
+
+# 4. Verify: kubectl get lease my-postgres-leader holder == the upgraded primary;
+#    a standby promotes on a test failover.
+```
+
+While paused, a genuine primary failure will NOT fail over until you resume, so
+keep the window short and watch the cluster (see [Maintenance mode](#maintenance-mode-pause--agent-mode)).
 
 ### Upgrading Existing Clusters
 
