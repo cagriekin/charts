@@ -830,8 +830,8 @@ ConfigMap survive the scale-to-0 but now describe the *pre-restore* cluster. Bef
 scaling back up, delete both so the restored data re-elects cleanly:
 
 ```bash
-kubectl delete lease     my-postgres-leader   -n <ns> --ignore-not-found
-kubectl delete configmap my-postgres-primary  -n <ns> --ignore-not-found
+kubectl delete lease     my-postgres-pg-leader   -n <ns> --ignore-not-found
+kubectl delete configmap my-postgres-pg-primary  -n <ns> --ignore-not-found
 ```
 
 Why: the marker records the highest timeline the old cluster ever reached. A PITR
@@ -855,7 +855,7 @@ suspend automatic failover for the window:
 ```bash
 # 1. Fresh backup. Pause the agent (it keeps renewing the Lease + serving, but
 #    will not promote/demote/fence on its own):
-kubectl annotate configmap my-postgres-primary -n <ns> pg-ha/pause=true --overwrite
+kubectl annotate configmap my-postgres-pg-primary -n <ns> pg-ha/pause=true --overwrite
 
 # 2. Perform the major upgrade primary-first per the PostgreSQL pg_upgrade
 #    procedure (new-major image, pg_upgrade against the primary's PGDATA), then
@@ -863,9 +863,9 @@ kubectl annotate configmap my-postgres-primary -n <ns> pg-ha/pause=true --overwr
 #    agent re-clones it on the new major).
 
 # 3. Resume automatic failover:
-kubectl annotate configmap my-postgres-primary -n <ns> pg-ha/pause-
+kubectl annotate configmap my-postgres-pg-primary -n <ns> pg-ha/pause-
 
-# 4. Verify: kubectl get lease my-postgres-leader holder == the upgraded primary;
+# 4. Verify: kubectl get lease my-postgres-pg-leader holder == the upgraded primary;
 #    a standby promotes on a test failover.
 ```
 
