@@ -100,3 +100,40 @@ func TestMarkerMalformed(t *testing.T) {
 		t.Errorf("malformed marker: %+v err=%v", m, err)
 	}
 }
+
+func TestMarkerPauseAnnotation(t *testing.T) {
+	mk := func(val string) Marker {
+		cs := fake.NewSimpleClientset(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "pg-primary", Namespace: ns,
+				Annotations: map[string]string{PauseAnnotation: val},
+			},
+			Data: map[string]string{"primary": "pg-0", "timeline": "7"},
+		})
+		m, err := NewWithClient(cs, ns).ReadMarker(context.Background(), "pg-primary")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	if !mk("true").Paused {
+		t.Error(`annotation "true" must set Paused`)
+	}
+	if !mk(" True ").Paused {
+		t.Error("annotation must be trimmed + case-insensitive")
+	}
+	if mk("false").Paused {
+		t.Error(`annotation "false" must not set Paused`)
+	}
+	// A marker with no annotation (the WriteMarker default) is not paused.
+	if m, _ := func() (Marker, error) {
+		cs := fake.NewSimpleClientset()
+		c := NewWithClient(cs, ns)
+		if err := c.WriteMarker(context.Background(), "pg-primary", "pg-0", 7); err != nil {
+			t.Fatal(err)
+		}
+		return c.ReadMarker(context.Background(), "pg-primary")
+	}(); m.Paused {
+		t.Error("WriteMarker-created marker must not be paused")
+	}
+}

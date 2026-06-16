@@ -318,6 +318,11 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		Malformed: m.Malformed || (m.Present && !m.TimelineOK),
 		Timeline:  pg.Timeline(m.Timeline),
 	}
+	// Maintenance mode (Part H1): an operator-set annotation on the marker ConfigMap
+	// suspends automatic promote/demote/fence/self-health (Decide -> NoOp) while the
+	// agent keeps renewing the Lease and serving.
+	o.Paused = m.Paused
+	a.metr.SetPaused(m.Paused)
 	// Self-health (stateful/time-based, so computed here, not in the pure Decide):
 	// a holder whose primary-state postgres has been unreachable past the grace is
 	// stuck (frozen/wedged), which drives a self-health failover.

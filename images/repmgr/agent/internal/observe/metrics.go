@@ -16,6 +16,7 @@ import (
 // goroutine and the reconcile loop are race-free.
 type Metrics struct {
 	isLeader        atomic.Int64 // 0/1 gauge
+	isPaused        atomic.Int64 // 0/1 gauge (maintenance mode, Part H1)
 	renewFailures   atomic.Int64
 	promotions      atomic.Int64
 	demotes         atomic.Int64
@@ -40,6 +41,7 @@ func b2i(b bool) int64 {
 }
 
 func (m *Metrics) SetLeader(v bool)     { m.isLeader.Store(b2i(v)) }
+func (m *Metrics) SetPaused(v bool)     { m.isPaused.Store(b2i(v)) }
 func (m *Metrics) IncRenewFailure()     { m.renewFailures.Add(1) }
 func (m *Metrics) IncPromotion()        { m.promotions.Add(1) }
 func (m *Metrics) IncDemote()           { m.demotes.Add(1) }
@@ -88,6 +90,7 @@ func (m *Metrics) write(w io.Writer) {
 	}
 	for _, x := range []metric{
 		{"pg_ha_agent_is_leader", "Whether this agent currently holds the Lease.", "gauge", m.isLeader.Load()},
+		{"pg_ha_agent_is_paused", "Whether maintenance mode is active (automatic failover suspended).", "gauge", m.isPaused.Load()},
 		{"pg_ha_agent_renew_failures_total", "Lease renew failures.", "counter", m.renewFailures.Load()},
 		{"pg_ha_agent_promotions_total", "Promotions performed.", "counter", m.promotions.Load()},
 		{"pg_ha_agent_demotes_total", "Demotions performed.", "counter", m.demotes.Load()},
