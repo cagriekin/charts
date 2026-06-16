@@ -19,6 +19,17 @@ import (
 // of the last successful keepalive -- the same time-based soft-fence window as the
 // Kubernetes backend). Unlike the K8s backend, leadership lives in etcd, so a
 // Kubernetes control-plane outage does not by itself demote the primary (Part G5).
+//
+// Soft-fence margin note: the K8s backend self-demotes at RenewDeadline (an explicit
+// pre-expiry margin) while a challenger waits the full LeaseDuration. The etcd
+// session has no RenewDeadline analog -- the holder self-fences at ~TTL (its
+// client-side deadline) and a challenger acquires at ~TTL (server lease expiry), so
+// the demote-before-acquire ordering still holds (the holder's deadline runs off its
+// last keepalive, <=TTL/3 stale vs the server), but the margin is implicit, not the
+// explicit RenewDeadline slack. It is comfortable at the shipped 15s; the config
+// validator enforces LeaseDuration >= 5s so a tiny TTL cannot collapse it. A future
+// enhancement (deferred to the live etcd-mode test) can add an explicit early
+// self-demote by managing the lease keepalive directly instead of via Session.
 type EtcdConfig struct {
 	Endpoints   []string
 	Prefix      string // election key prefix, e.g. /pg-ha/<release>/leader
@@ -153,7 +164,7 @@ func (e *EtcdDCS) runElection(ctx context.Context, identity string, cb Callbacks
 	if err != nil {
 		return // etcd unreachable; retry next iteration (leadership unchanged)
 	}
-	defer sess.Close()
+	defer e.releaseSession(sess) // frees the lease+key on the way out (runs after OnLost)
 	el := concurrency.NewElection(sess, e.cfg.Prefix)
 
 	// Observe the current leader for followers (Leader()), independent of whether
@@ -179,13 +190,23 @@ func (e *EtcdDCS) runElection(ctx context.Context, identity string, cb Callbacks
 	}
 	e.isLeader.Store(false)
 	if cb.OnLost != nil {
-		cb.OnLost() // synchronous: demote before the Run loop re-contends
+		cb.OnLost() // synchronous: demote before the Run loop re-contends (and before releaseSession)
 	}
-	// Best-effort prompt key release if the session is still alive (Release/shutdown
-	// path); on a lapsed session the key is already gone. Bounded, off ctx (which may
-	// be cancelled), and never on the critical demote path (that already ran above).
+}
+
+// releaseSession tears the session down on the way out of an election iteration. It
+// orphans the keepalive and revokes the lease, which deletes the lease-bound
+// election key in one step so a peer's Campaign proceeds immediately on a voluntary
+// step-down. The revoke runs off context.Background() because the iteration ctx is
+// cancelled on Release/shutdown -- the session's own ctx-bound Close() would then
+// fail to revoke and leak the lease until TTL expiry. Best-effort: on a lapsed
+// session (etcd unreachable) the lease is already gone and the revoke just times out
+// (bounded), with TTL expiry as the backstop. Never on the critical demote path
+// (OnLost already ran), so it cannot delay a fence.
+func (e *EtcdDCS) releaseSession(sess *concurrency.Session) {
+	sess.Orphan() // stop the keepalive refresh (Close would also revoke on the dead ctx)
 	rc, rcancel := context.WithTimeout(context.Background(), e.retryPeriod())
-	_ = el.Resign(rc)
+	_, _ = e.client.Revoke(rc, sess.Lease())
 	rcancel()
 }
 

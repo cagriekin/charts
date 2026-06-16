@@ -109,6 +109,21 @@ func TestLoadEtcdBackendParsesEndpoints(t *testing.T) {
 	}
 }
 
+func TestLoadEtcdBackendRejectsTinyLeaseDuration(t *testing.T) {
+	m := fullEnv()
+	m["DCS_BACKEND"] = "etcd"
+	m["ETCD_ENDPOINTS"] = "https://a:2379"
+	m["ETCD_PREFIX"] = "/p"
+	// keep the ordering valid (3>2>1) so the etcd-min check is what trips, not ordering
+	m["LEASE_DURATION"] = "3s"
+	m["RENEW_DEADLINE"] = "2s"
+	m["RETRY_PERIOD"] = "1s"
+	_, err := Load(getter(m))
+	if err == nil || !strings.Contains(err.Error(), "LEASE_DURATION >= 5s") {
+		t.Errorf("etcd backend must reject a sub-5s LeaseDuration, got %v", err)
+	}
+}
+
 func TestLoadKubernetesBackendIgnoresEtcdVars(t *testing.T) {
 	// In kubernetes mode the etcd vars are neither required nor read.
 	c, err := Load(getter(fullEnv())) // DCS_BACKEND=kubernetes
