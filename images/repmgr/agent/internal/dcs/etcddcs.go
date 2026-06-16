@@ -189,6 +189,12 @@ func (e *EtcdDCS) runElection(ctx context.Context, identity string, cb Callbacks
 	case <-ctx.Done():
 	}
 	e.isLeader.Store(false)
+	// No longer leader. observe() stops when the iteration ctx cancels, so on a
+	// voluntary Release it would not catch a successor and Leader() would keep
+	// reporting self through the step-down cooldown. Clear the cached identity (only
+	// if it still names us, so a successor observe() did catch is preserved) so
+	// Leader() reports "unknown" rather than stale-self -- symmetric with K8sDCS.
+	e.leader.CompareAndSwap(identity, "")
 	if cb.OnLost != nil {
 		cb.OnLost() // synchronous: demote before the Run loop re-contends (and before releaseSession)
 	}

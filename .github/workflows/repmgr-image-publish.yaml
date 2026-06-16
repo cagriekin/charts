@@ -16,7 +16,35 @@ permissions:
   id-token: write   # keyless cosign signing via the GitHub OIDC token
 
 jobs:
+  # Gate the publish on the same tests the PR/master workflow runs, because a
+  # `trixie-*` tag push does NOT trigger repmgr-image-test.yaml -- without this an
+  # untested image could be built, signed, and pushed.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run script tests
+        run: bash images/repmgr/test/scripts-test.sh
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: vet + test + verify + hermetic build + govulncheck
+        working-directory: images/repmgr/agent
+        run: |
+          go vet ./...
+          go test ./...
+          go mod verify
+          GOFLAGS=-mod=vendor GOPROXY=off go build ./...
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
   build-and-publish:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -46,13 +74,6 @@ jobs:
       - name: Log in to DockerHub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Log in to dhi.io
-        uses: docker/login-action@v3
-        with:
-          registry: dhi.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 

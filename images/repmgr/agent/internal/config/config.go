@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -137,6 +138,13 @@ func Load(get func(string) string) (*Config, error) {
 	}
 	if c.SplitBrainAction != "" && c.SplitBrainAction != "log" && c.SplitBrainAction != "fence" {
 		l.invalid = append(l.invalid, fmt.Sprintf("SPLIT_BRAIN_ACTION=%q (want log|fence)", c.SplitBrainAction))
+	}
+	// POD_CIDR is interpolated raw into pg_hba.conf; a malformed value would corrupt
+	// the whole file and fail Postgres start. Validate the CIDR form up front.
+	if c.PgHbaPeerCIDR != "" {
+		if _, _, err := net.ParseCIDR(c.PgHbaPeerCIDR); err != nil {
+			l.invalid = append(l.invalid, fmt.Sprintf("POD_CIDR=%q is not a valid CIDR: %v", c.PgHbaPeerCIDR, err))
+		}
 	}
 	// etcd backend config is required only when DCS_BACKEND=etcd, so a kubernetes
 	// install needs none of it. TLS is optional (all-or-none, enforced in dcs).

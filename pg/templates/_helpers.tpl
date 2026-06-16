@@ -33,6 +33,13 @@ annotation consumers -- #128.)
 {{- end }}
 {{- end }}
 
+{{- /* repmgr image reference: repository:tag, with @digest appended when set so a
+       digest pin (supply-chain) overrides the mutable tag. */ -}}
+{{- define "pg.repmgrImage" -}}
+{{- printf "%s:%s" .Values.repmgr.image.repository .Values.repmgr.image.tag -}}
+{{- with .Values.repmgr.image.digest }}@{{ . }}{{- end -}}
+{{- end -}}
+
 {{- define "pg.secretName" -}}
 {{- if .Values.postgresql.existingSecret.enabled }}
 {{- required "postgresql.existingSecret.name is required when postgresql.existingSecret.enabled is true" .Values.postgresql.existingSecret.name }}

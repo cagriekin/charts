@@ -148,7 +148,7 @@ spec:
 {{- if and .Values.postgresql.extensions.enabled .Values.repmgr.enabled }}
 {{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
         - name: copy-base-ext
-          image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
+          image: "{{ include "pg.repmgrImage" . }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
           command: ['sh', '-c', 'cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
           securityContext:
@@ -175,7 +175,7 @@ spec:
 {{- end }}
 {{- if .Values.repmgr.enabled }}
         - name: repmgr-init
-          image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
+          image: "{{ include "pg.repmgrImage" . }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
           command: ["/usr/local/bin/entrypoint.sh", "init"]
           securityContext:
@@ -260,7 +260,7 @@ spec:
       containers:
         - name: postgresql
 {{- if .Values.repmgr.enabled }}
-          image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
+          image: "{{ include "pg.repmgrImage" . }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
           # The image entrypoint runs a stale-primary guard before starting
           # read-write: on a container-only restart (which does not re-run the
@@ -690,7 +690,7 @@ spec:
 {{- end }}
 {{- if eq (include "pg.repmgrdMode" .) "true" }}
         - name: repmgrd
-          image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
+          image: "{{ include "pg.repmgrImage" . }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
           # Workaround: cagriekin/repmgr <= trixie-5.5.0-7 calls
           # `standby register --force` without --upstream-node-id, leaving the
@@ -796,7 +796,7 @@ spec:
             - name: repmgr-config
               mountPath: /etc/repmgr
         - name: service-updater
-          image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
+          image: "{{ include "pg.repmgrImage" . }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
           command: ["/bin/bash", "/scripts/service-updater.sh"]
           securityContext:
@@ -879,7 +879,7 @@ spec:
         # into this container to perform the actual backup. Scheduling lives
         # in the CronJobs, not here.
         - name: pgbackrest
-          image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
+          image: "{{ include "pg.repmgrImage" . }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
           command: ["/bin/bash", "-c", "exec sleep infinity"]
           securityContext:

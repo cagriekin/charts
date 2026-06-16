@@ -1,4 +1,4 @@
-{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.monitoring.serviceMonitor.enabled }}
+{{- if and (eq (include "pg.agentMode" .) "true") (dig "serviceMonitor" "enabled" false (.Values.repmgr.agent.monitoring | default dict)) }}
 {{- /*
 Scrapes the pg-ha-agent's read-only metrics (port 9200, /metrics) off the
 per-pod headless Service endpoints. The selector matches every Service carrying
