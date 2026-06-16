@@ -1,0 +1,18 @@
+apiVersion: v2
+name: etcd
+description: Minimal 3-node etcd cluster for the pg-ha-agent etcd DCS backend (bundled, self-contained)
+type: application
+version: 0.1.0
+appVersion: "3.5.16"
+home: https://github.com/cagriekin/charts/tree/master/etcd
+sources:
+  - https://github.com/cagriekin/charts
+  - https://etcd.io
+keywords:
+  - etcd
+  - coordination
+  - leader-election
+maintainers:
+  - name: cagriekin
+    email: cagri.ekin@gmail.com
+    url: https://github.com/cagriekin

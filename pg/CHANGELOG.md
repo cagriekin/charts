@@ -40,6 +40,14 @@ which bundles the new `pg-ha-agent` binary.
   multiple-leaders (split-brain), agent-down, lease-renew-failing,
   reconcile-errors, flapping, and paused-too-long. Replication-lag alerting stays
   with the PostgreSQL exporter.
+- etcd leadership backend (opt-in, agent mode): `repmgr.agent.dcs.backend: etcd`
+  holds the leader lock in etcd instead of a Kubernetes Lease, so a control-plane
+  outage no longer self-demotes the primary (only an etcd quorum loss does).
+  Provide a **BYO/shared** etcd via `repmgr.agent.dcs.etcd.endpoints` (+ optional
+  mutual TLS via `dcs.etcd.tls.secretName`), or set `etcd.enabled=true` to deploy a
+  **bundled** 3-node etcd subchart that the agent auto-targets. In etcd mode the
+  `coordination.k8s.io/leases` RBAC grant is dropped and egress to etcd `:2379` is
+  opened. Default stays `kubernetes`.
 
 ### Notes
 

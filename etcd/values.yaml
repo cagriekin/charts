@@ -1,0 +1,69 @@
+# Bundled etcd for the pg-ha-agent etcd DCS backend. Enabled by the parent chart
+# only when repmgr.agent.dcs.backend=etcd and no external endpoints are given.
+# Self-contained at the cost of 3 stateful pods; for several databases prefer one
+# shared/BYO etcd (repmgr.agent.dcs.etcd.endpoints) over a bundle per release.
+
+# etcd requires an odd member count for a stable quorum (3 tolerates one failure).
+replicaCount: 3
+
+image:
+  repository: quay.io/coreos/etcd
+  # Pin matches the agent's vendored client (go.etcd.io/etcd/client/v3 v3.5.16).
+  # Supply-chain hardening (digest pin) is a follow-up.
+  tag: v3.5.16
+  pullPolicy: IfNotPresent
+
+# Cluster DNS domain, for building peer/client FQDNs.
+clusterDomain: cluster.local
+
+# The etcd client port the agent connects to (2379) and the peer port (2380).
+clientPort: 2379
+peerPort: 2380
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+persistence:
+  enabled: true
+  size: 2Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# Spread the members across nodes/zones so one node loss cannot break quorum.
+topologySpreadConstraints: []
+affinity: {}
+nodeSelector: {}
+tolerations: []
+
+# Hardened by default, matching the parent chart (runAsNonRoot, drop ALL caps).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Bundled etcd runs plaintext within the pod network; isolate it with a
+# NetworkPolicy (the parent opens egress to 2379 in etcd mode). The leadership data
+# is non-secret (pod names + a key prefix). Client/peer TLS for the bundled cluster
+# is a deferred option; for a TLS-secured store use a BYO/shared etcd instead.
+
+commonLabels: {}
+commonAnnotations: {}

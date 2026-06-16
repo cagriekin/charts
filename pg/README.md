@@ -302,7 +302,12 @@ repmgr:
 
 The TLS secret must contain all three keys (`tls.crt`, `tls.key`, `ca.crt`). cert-manager `Certificate` secrets include `ca.crt`, but a plain `kubectl create secret tls` does **not** — add `ca.crt` explicitly, or the agent fails fast at startup (it reads all three).
 
-With etcd, a Kubernetes control-plane outage no longer demotes the primary — only an etcd quorum loss does (so etcd must be operated for HA). Failover-time **routing** (the write-Service selector patch) still uses the apiserver, but during a no-failover outage kube-proxy holds the last endpoints. The chart drops the `coordination.k8s.io/leases` RBAC grant and opens egress to etcd `:2379` automatically in this mode. Pick the backend at install time; switching it on a live cluster is a controlled re-election (treat like a planned failover). A bundled etcd subchart (for self-contained installs that have no etcd) is a separate, later option — for now this is the **BYO/shared-etcd** path, recommended when running several databases against one platform etcd.
+With etcd, a Kubernetes control-plane outage no longer demotes the primary — only an etcd quorum loss does (so etcd must be operated for HA). Failover-time **routing** (the write-Service selector patch) still uses the apiserver, but during a no-failover outage kube-proxy holds the last endpoints. The chart drops the `coordination.k8s.io/leases` RBAC grant and opens egress to etcd `:2379` automatically in this mode. Pick the backend at install time; switching it on a live cluster is a controlled re-election (treat like a planned failover).
+
+Two ways to provide etcd:
+
+- **BYO/shared** (recommended, especially for several databases against one platform etcd): set `repmgr.agent.dcs.etcd.endpoints` as above and leave `etcd.enabled=false`.
+- **Bundled** (self-contained, for an install with no existing etcd): set `etcd.enabled=true` and leave `endpoints` empty — the chart deploys a 3-node etcd cluster (`<release>-etcd`) and points the agent at it automatically. Adds 3 stateful pods (`+~0.3 CPU / 0.4Gi` requested, small SSD PVCs). The bundled etcd runs plaintext within the pod network (isolate it with a NetworkPolicy; the leadership data is non-secret); tune it under the `etcd:` values key (`replicaCount`, `resources`, `persistence`, `topologySpreadConstraints`). For a TLS-secured store, use a BYO/shared etcd with `dcs.etcd.tls`.
 
 > Agent mode is opt-in and validated by the chart's live failover suite (graceful failover: a standby promotes, the write Service repoints, the ex-primary rejoins read-only). See `ENVIRONMENT.md` for the full injected-variable catalog.
 

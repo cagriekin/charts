@@ -23,6 +23,10 @@ to `trixie-5.5.0-16`, which bundles the new `pg-ha-agent` binary.
   (`pg-ha/pause` annotation), controlled switchover (`pg-ha/switchover-target`
   annotation), and a `schemaVersion` on the on-DCS data for safe mixed-version
   agent upgrades. See the pg 0.5.89 changelog for details.
+- etcd leadership backend (opt-in): `repmgr.agent.dcs.backend: etcd` (BYO/shared
+  via `dcs.etcd.endpoints`, or a bundled 3-node etcd subchart via `etcd.enabled=true`)
+  decouples leadership from the Kubernetes control plane. Default stays `kubernetes`.
+  See the pg 0.5.89 changelog for details.
 
 ### Notes
 

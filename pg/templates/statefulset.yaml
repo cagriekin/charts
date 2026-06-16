@@ -339,9 +339,15 @@ spec:
               value: {{ (.Values.repmgr.agent.dcs).backend | default "kubernetes" | quote }}
 {{- if eq (include "pg.agentEtcdMode" .) "true" }}
             {{- $etcd := required "repmgr.agent.dcs.etcd is required when dcs.backend=etcd" .Values.repmgr.agent.dcs.etcd }}
-            {{- if not $etcd.endpoints }}{{ fail "repmgr.agent.dcs.etcd.endpoints is required when dcs.backend=etcd (BYO/shared etcd; a bundled subchart is a later option)" }}{{ end }}
+            {{- $endpoints := $etcd.endpoints }}
+            {{- /* No explicit endpoints + the bundled etcd subchart enabled: target the
+                   bundled cluster's client Service (<release>-etcd:<clientPort>). */}}
+            {{- if and (not $endpoints) (.Values.etcd).enabled }}
+            {{- $endpoints = list (printf "http://%s-etcd:%v" .Release.Name ((.Values.etcd).clientPort | default 2379)) }}
+            {{- end }}
+            {{- if not $endpoints }}{{ fail "etcd backend needs endpoints: set repmgr.agent.dcs.etcd.endpoints for a BYO/shared etcd, or enable the bundled etcd with etcd.enabled=true" }}{{ end }}
             - name: ETCD_ENDPOINTS
-              value: {{ $etcd.endpoints | join "," | quote }}
+              value: {{ $endpoints | join "," | quote }}
             - name: ETCD_PREFIX
               value: {{ $etcd.prefix | default (printf "/pg-ha/%s/" .Release.Name) | quote }}
 {{- if (($etcd.tls).secretName) }}

@@ -498,3 +498,12 @@ networkPolicy:
 
 global:
   annotations: {}
+
+# Bundled etcd subchart (conditional dependency). Turn on ONLY for a self-contained
+# install that has no external etcd: set both repmgr.agent.dcs.backend=etcd AND
+# etcd.enabled=true; the agent then auto-targets the bundled <release>-etcd:2379
+# (leave repmgr.agent.dcs.etcd.endpoints empty). For several databases, prefer one
+# shared/BYO etcd (set endpoints, leave etcd.enabled=false). See the etcd subchart's
+# values for tuning (replicaCount, resources, persistence). Adds 3 stateful pods.
+etcd:
+  enabled: false

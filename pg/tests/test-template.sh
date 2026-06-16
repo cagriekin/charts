@@ -840,6 +840,18 @@ helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set 'repmgr.agent.dcs.backend=etcd' --show-only templates/statefulset.yaml >/dev/null 2>&1 || etcd_noeps_rc=$?
 assert_eq "agent etcd: missing endpoints fails fast" "1" "$([ "${etcd_noeps_rc}" -ne 0 ] && echo 1 || echo 0)"
 
+# bundled etcd subchart (conditional dependency): enabling it deploys the 3-node
+# cluster and the agent auto-targets the bundled client Service; disabled by default.
+agent_bundled=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'repmgr.agent.dcs.backend=etcd' --set 'etcd.enabled=true' 2>&1)
+assert_contains "bundled etcd: subchart StatefulSet renders" "${agent_bundled}" "name: test-pg-etcd"
+assert_contains "bundled etcd: 3-member static initial-cluster" "${agent_bundled}" "test-pg-etcd-2=http://test-pg-etcd-2"
+assert_contains "bundled etcd: Parallel pod management for static bootstrap" "${agent_bundled}" "podManagementPolicy: Parallel"
+assert_contains "bundled etcd: agent auto-targets the bundled client Service" "${agent_bundled}" 'value: "http://test-pg-etcd:2379"'
+agent_byo_nobundle=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'repmgr.agent.dcs.backend=etcd' --set 'repmgr.agent.dcs.etcd.endpoints={https://e:2379}' 2>&1)
+assert_not_contains "bundled etcd: not rendered when etcd.enabled=false (BYO)" "${agent_byo_nobundle}" "test-pg-etcd-headless"
+
 # regression: default (no failoverMode) still renders repmgrd + service-updater
 default_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/statefulset.yaml 2>&1)
