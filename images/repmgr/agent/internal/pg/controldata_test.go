@@ -91,4 +91,16 @@ func TestReadControlDataOK(t *testing.T) {
 	if !ci.LSNOK || ci.LSN.Hi != 0 || ci.LSN.Lo != 0x14D8C18 {
 		t.Errorf("checkpoint LSN = (%+v, ok=%v), want 0/14D8C18", ci.LSN, ci.LSNOK)
 	}
+	// "Database system identifier: 7395000000000000001" -> the cluster identity
+	// used to refuse a clone/follow/rewind from a foreign cluster (invariant 9).
+	if ci.SystemID != 7395000000000000001 {
+		t.Errorf("SystemID = %d, want 7395000000000000001", ci.SystemID)
+	}
+}
+
+func TestParseControlDataUnreadableSystemID(t *testing.T) {
+	ci := parseControlData("Database cluster state:               in production\n")
+	if ci.SystemID != 0 {
+		t.Errorf("SystemID = %d with no identifier line; want 0 (unreadable)", ci.SystemID)
+	}
 }

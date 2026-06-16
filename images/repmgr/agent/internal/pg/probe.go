@@ -175,6 +175,23 @@ func (p *Prober) StandbyTimeline(ctx context.Context, ci ConnInfo) (tl Timeline,
 	return Timeline(n), true, nil
 }
 
+// SystemIdentifier reads a running peer's cluster identity from pg_control_system().
+// It is compared to the local pg_controldata identifier to refuse a clone/follow/
+// rewind from a peer of a different cluster (invariant 9 -- a stale/misrouted pod on
+// a shared headless Service, a leftover, or a DR-restored cluster). ok is false when
+// the peer is unreachable or returns an unparseable value.
+func (p *Prober) SystemIdentifier(ctx context.Context, ci ConnInfo) (id uint64, ok bool, err error) {
+	out, err := p.psql(ctx, ci, "SELECT system_identifier FROM pg_control_system();")
+	if err != nil {
+		return 0, false, err
+	}
+	n, perr := strconv.ParseUint(strings.TrimSpace(out), 10, 64)
+	if perr != nil {
+		return 0, false, nil
+	}
+	return n, true, nil
+}
+
 // Probe classifies a node by its actual role and reads the WAL position relevant
 // to that role. An unreachable node returns NodeState{Host, Reachable:false}.
 func (p *Prober) Probe(ctx context.Context, ci ConnInfo) NodeState {

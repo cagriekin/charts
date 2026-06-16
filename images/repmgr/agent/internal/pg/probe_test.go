@@ -14,6 +14,7 @@ type fakeExec struct {
 	primary   string // pg_walfile_name(...)|pg_current_wal_lsn() output
 	standby   string // GREATEST(receive, replay) output
 	standbyTL string // pg_control_checkpoint timeline_id output (decimal)
+	sysID     string // pg_control_system() system_identifier output (decimal)
 	err       error  // if set, every call fails (node unreachable)
 }
 
@@ -25,6 +26,8 @@ func (f fakeExec) Run(_ context.Context, _ []string, _ string, args ...string) (
 	switch {
 	case strings.Contains(sql, "pg_is_in_recovery"):
 		return f.role, nil
+	case strings.Contains(sql, "pg_control_system"):
+		return f.sysID, nil
 	case strings.Contains(sql, "pg_control_checkpoint"):
 		return f.standbyTL, nil
 	case strings.Contains(sql, "pg_last_wal_receive_lsn"):
@@ -92,5 +95,27 @@ func TestProbeUnexpectedRoleOutput(t *testing.T) {
 	ns := p.Probe(context.Background(), ConnInfo{Host: "pod-3"})
 	if ns.Reachable || ns.Role == RolePrimary {
 		t.Errorf("unparseable role must not classify as reachable/primary: %+v", ns)
+	}
+}
+
+func TestSystemIdentifier(t *testing.T) {
+	p := proberWith(fakeExec{sysID: "7395000000000000001"})
+	id, ok, err := p.SystemIdentifier(context.Background(), ConnInfo{Host: "pod-1"})
+	if err != nil || !ok || id != 7395000000000000001 {
+		t.Fatalf("got (id=%d ok=%v err=%v), want 7395000000000000001", id, ok, err)
+	}
+}
+
+func TestSystemIdentifierUnreachable(t *testing.T) {
+	p := proberWith(fakeExec{err: errors.New("connection refused")})
+	if _, ok, err := p.SystemIdentifier(context.Background(), ConnInfo{Host: "x"}); ok || err == nil {
+		t.Errorf("unreachable peer must return ok=false + err, got ok=%v err=%v", ok, err)
+	}
+}
+
+func TestSystemIdentifierUnparseable(t *testing.T) {
+	p := proberWith(fakeExec{sysID: "not-a-number"})
+	if _, ok, err := p.SystemIdentifier(context.Background(), ConnInfo{Host: "x"}); ok || err != nil {
+		t.Errorf("unparseable id must return ok=false, nil err, got ok=%v err=%v", ok, err)
 	}
 }
