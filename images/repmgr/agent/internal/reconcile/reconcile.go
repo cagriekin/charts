@@ -134,8 +134,20 @@ func Decide(o Observation) Decision {
 			if bad, why := unsafeToServe(o); bad {
 				return d(ReleaseLease, "", "refuse to promote: "+why)
 			}
-			if t := moreAdvancedPeer(o); t != "" {
-				return d(ReleaseLease, t, "a peer has more WAL on the same timeline; release so the most-advanced node promotes (invariant 8)")
+			if t, reachable := moreAdvancedPeer(o); t != "" {
+				if reachable {
+					// A live peer is ahead and can take over: hand off (invariant 8).
+					return d(ReleaseLease, t, "a reachable peer has more WAL on the same timeline; release so the most-advanced node promotes (invariant 8)")
+				}
+				// Gossip-only (unreachable) peer is "ahead": at cold boot it may be a
+				// stopped primary-state peer that will become observable via recovery
+				// mode, so wait for it. In steady state it is almost always the
+				// just-dead primary whose annotation is still fresh -- a corpse that can
+				// never reacquire, so handing off to it would only flap the lease and
+				// delay failover. Do not hand off; fall through to promote.
+				if o.PeersPending {
+					return d(Wait, "", "cold boot: a gossip-only peer reports more WAL; wait for it to become observable before promoting (it may promote to a newer timeline)")
+				}
 			}
 			if o.PeersPending {
 				return d(Wait, "", "cold boot: waiting for peers to report their position before promoting (recovery-mode makes stopped primary-state peers observable)")
@@ -358,11 +370,15 @@ func primaryNamed(o Observation, name string) *PeerState {
 	return nil
 }
 
-// moreAdvancedPeer returns the name of a reachable peer strictly ahead of the
-// local node (higher timeline, or same timeline + higher LSN), or "". This is the
-// handoff target when the lease holder is not the most-advanced replica.
-func moreAdvancedPeer(o Observation) string {
+// moreAdvancedPeer returns the name of the peer strictly ahead of the local node
+// (higher timeline, or same timeline + higher LSN), or "", and whether that peer is
+// currently SQL-reachable. A reachable peer can actually take over (a real handoff
+// target); an unreachable, gossip-only peer cannot -- it may be the just-dead
+// primary whose annotation is still fresh, so handing the lease to it would never
+// complete. The caller distinguishes the two (see the holder-standby branch).
+func moreAdvancedPeer(o Observation) (string, bool) {
 	best := ""
+	bestReachable := false
 	var bestTL pg.Timeline
 	var bestLSN pg.LSN
 	for i := range o.Peers {
@@ -374,10 +390,10 @@ func moreAdvancedPeer(o Observation) string {
 			continue
 		}
 		if best == "" || ahead(p.Timeline, p.TimelineOK, p.LSN, p.LSNOK, bestTL, true, bestLSN, true) {
-			best, bestTL, bestLSN = p.Name, p.Timeline, p.LSN
+			best, bestReachable, bestTL, bestLSN = p.Name, p.Reachable, p.Timeline, p.LSN
 		}
 	}
-	return best
+	return best, bestReachable
 }
 
 func peerAhead(p PeerState, l LocalState) bool {

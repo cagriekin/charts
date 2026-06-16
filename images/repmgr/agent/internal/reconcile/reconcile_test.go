@@ -108,8 +108,16 @@ func TestDecide(t *testing.T) {
 		{"holder + stuck primary + below highwater -> release (highwater first)", Observation{HoldLease: true, Local: dataStopped, LocalStuck: true, Marker: MarkerState{Present: true, Timeline: tl(6)}}, ReleaseLease, ""},
 
 		// --- LSN gossip: rank an unreachable peer's gossiped position at cold boot ---
-		// A running standby holder sees an unreachable peer that gossips a higher same-timeline LSN: release.
-		{"holder standby + more-advanced gossip peer -> release", Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{gossipPeer("pg-2", 5, 5, 0x200)}}, ReleaseLease, "pg-2"},
+		// A gossip-only (unreachable) peer that appears more advanced is almost always
+		// the just-dead primary whose annotation is still fresh. In STEADY state
+		// (PeersPending false) it can never reacquire, so do NOT hand off (that only
+		// flaps the lease + delays failover) -- promote.
+		{"holder standby + more-advanced gossip-only peer (steady) -> promote", Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{gossipPeer("pg-2", 5, 5, 0x200)}}, Promote, ""},
+		// At COLD BOOT (PeersPending) the same gossip-only peer may be a stopped
+		// primary-state node coming up via recovery-mode: wait for it to be observable.
+		{"holder standby + more-advanced gossip-only peer (cold boot) -> wait", Observation{HoldLease: true, Local: localStandby, PeersPending: true, Peers: []PeerState{gossipPeer("pg-2", 5, 5, 0x200)}}, Wait, ""},
+		// A REACHABLE more-advanced peer can actually take over -> hand off.
+		{"holder standby + reachable more-advanced peer -> release/handoff", Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{standby("pg-2", 5, 5, 0x200)}}, ReleaseLease, "pg-2"},
 		// A PRIMARY-state holder is a source on its timeline -- a same-timeline peer
 		// (standby or gossip estimate) can never be ahead of it, so it resumes directly
 		// (no LSN compare here). Only a NEWER-timeline peer (newer) or the highwater
