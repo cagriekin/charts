@@ -137,7 +137,8 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `postgresql.podDisruptionBudget.enabled` | Enable PDB for PostgreSQL | `true` |
-| `postgresql.podDisruptionBudget.minAvailable` | Minimum available pods | `1` |
+| `postgresql.podDisruptionBudget.maxUnavailable` | Max pods unavailable during a voluntary disruption | `1` |
+| `postgresql.podDisruptionBudget.unhealthyPodEvictionPolicy` | Allow evicting not-yet-Ready pods so a stuck pod cannot wedge a drain (k8s >=1.27) | `AlwaysAllow` |
 | `pgpool.podDisruptionBudget.enabled` | Enable PDB for PGPool-II | `true` |
 | `pgpool.podDisruptionBudget.minAvailable` | Minimum available pods | `1` |
 
@@ -154,6 +155,8 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.migrateLegacyMd5Users` | Re-hash MD5 user passwords to SCRAM on PG14+ | `true` |
 | `postgresql.nodeSelector` | Node selector for PostgreSQL pods | `{}` |
 | `postgresql.tolerations` | Tolerations for PostgreSQL pods | `[]` |
+| `postgresql.topologySpreadConstraints` | Spread constraints added alongside the built-in affinity (e.g. a hard zone spread) | `[]` |
+| `postgresql.serviceAccount.annotations` | Annotations on the postgresql pods' ServiceAccount (cloud workload identity for keyless pgBackRest S3) | `{}` |
 
 Example:
 
@@ -540,7 +543,17 @@ postgresql:
 
 Setting `postgresql.affinity` replaces the entire built-in affinity block, including the hostname rule. With a required zone rule that is harmless (distinct zones imply distinct nodes), but any other custom affinity should re-add the hostname rule explicitly. A required zone rule also caps the cluster size: total instances (`replicaCount + 1`) must not exceed the number of zones or the surplus pods stay Pending.
 
-There is no `postgresql.topologySpreadConstraints` value; zone placement of PostgreSQL pods is controlled through affinity only. PGPool-II supports `pgpool.topologySpreadConstraints` (as in the example above) and, like PostgreSQL, has a default hostname anti-affinity that `pgpool.affinity` replaces wholesale.
+`postgresql.topologySpreadConstraints` (default `[]`) adds spread constraints alongside the built-in affinity without replacing it — set a hard zone spread (`whenUnsatisfiable: DoNotSchedule`) here to keep the hostname anti-affinity intact. PGPool-II supports `pgpool.topologySpreadConstraints` (as in the example above) and, like PostgreSQL, has a default hostname anti-affinity that `pgpool.affinity` replaces wholesale.
+
+### Cloud preset (`values-cloud.yaml`)
+
+The chart ships an opt-in `values-cloud.yaml` overlay with opinionated multi-AZ production settings, so you do not have to assemble them by hand:
+
+```bash
+helm install my-pg cagriekin/pg -f values-cloud.yaml [-f your-values.yaml]
+```
+
+It sets `replicaCount: 2` (3 instances), a hard `DoNotSchedule` zone spread, a `WaitForFirstConsumer` `storageClass` placeholder, and the managed-cloud agent lease timings (`30s`/`20s`/`4s`). Do not use it on single-zone / kind / dev clusters — the hard spread leaves pods Pending when there are fewer schedulable zones than replicas. The base `values.yaml` stays dev/CI-friendly; this preset is the production opt-in.
 
 ### Storage Classes
 
@@ -733,7 +746,8 @@ helm install my-postgres cagriekin/pg \
 | `pgbackrest.s3.bucket` | S3 bucket name | `""` |
 | `pgbackrest.s3.region` | S3 region | `us-east-1` |
 | `pgbackrest.s3.prefix` | Key prefix within bucket | `pgbackrest` |
-| `pgbackrest.existingSecret.name` | Secret containing S3 credentials | `""` |
+| `pgbackrest.s3.keyType` | `shared` (static keys from `existingSecret`) or `auto` (cloud workload identity) | `shared` |
+| `pgbackrest.existingSecret.name` | Secret containing S3 credentials (required when `keyType: shared`) | `""` |
 | `pgbackrest.existingSecret.accessKeyIdKey` | Key for access key ID in secret | `access-key-id` |
 | `pgbackrest.existingSecret.secretAccessKeyKey` | Key for secret access key in secret | `secret-access-key` |
 | `pgbackrest.retention.full` | Number of full backups to retain | `4` |
@@ -756,6 +770,27 @@ helm install my-postgres cagriekin/pg \
 | `pgbackrest.cronjob.resources.requests.memory` | CronJob memory request | `64Mi` |
 | `pgbackrest.cronjob.resources.limits.cpu` | CronJob CPU limit | `200m` |
 | `pgbackrest.cronjob.resources.limits.memory` | CronJob memory limit | `128Mi` |
+
+### Keyless backups (cloud workload identity)
+
+Instead of static S3 keys, set `pgbackrest.s3.keyType: auto` to use the cloud credential chain (AWS IRSA, GKE Workload Identity, or an EC2 instance profile). No `existingSecret` is needed; annotate the postgresql pods' ServiceAccount (`<fullname>-repmgr`, the identity the pgbackrest sidecar runs under) via `postgresql.serviceAccount.annotations`:
+
+```yaml
+pgbackrest:
+  enabled: true
+  s3:
+    keyType: auto            # use the cloud credential chain, not static keys
+    endpoint: https://s3.<region>.amazonaws.com
+    bucket: my-backups
+
+postgresql:
+  serviceAccount:
+    annotations:
+      # EKS (IRSA):
+      eks.amazonaws.com/role-arn: arn:aws:iam::<account>:role/<role>
+      # GKE (Workload Identity):
+      # iam.gke.io/gcp-service-account: <gsa>@<project>.iam.gserviceaccount.com
+```
 
 ### Check Backup Status
 
