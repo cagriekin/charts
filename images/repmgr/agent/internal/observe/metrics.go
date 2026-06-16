@@ -22,6 +22,7 @@ type Metrics struct {
 	demotes         atomic.Int64
 	fences          atomic.Int64
 	reconcileErrors atomic.Int64
+	recoveryStarts  atomic.Int64 // recovery-mode (read-only WAL replay) entries
 	lastBeatUnixNs  atomic.Int64 // last reconcile-loop heartbeat
 	now             func() time.Time
 }
@@ -47,6 +48,7 @@ func (m *Metrics) IncPromotion()        { m.promotions.Add(1) }
 func (m *Metrics) IncDemote()           { m.demotes.Add(1) }
 func (m *Metrics) IncFence()            { m.fences.Add(1) }
 func (m *Metrics) IncReconcileError()   { m.reconcileErrors.Add(1) }
+func (m *Metrics) IncRecoveryStart()    { m.recoveryStarts.Add(1) }
 
 // Beat records that the reconcile loop ran; call it each tick.
 func (m *Metrics) Beat() { m.lastBeatUnixNs.Store(m.now().UnixNano()) }
@@ -96,6 +98,7 @@ func (m *Metrics) write(w io.Writer) {
 		{"pg_ha_agent_demotes_total", "Demotions performed.", "counter", m.demotes.Load()},
 		{"pg_ha_agent_fences_total", "Soft fences performed.", "counter", m.fences.Load()},
 		{"pg_ha_agent_reconcile_errors_total", "Reconcile-loop errors.", "counter", m.reconcileErrors.Load()},
+		{"pg_ha_agent_recovery_starts_total", "Recovery-mode (read-only WAL replay) starts at cold boot.", "counter", m.recoveryStarts.Load()},
 	} {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %d\n", x.name, x.help, x.name, x.typ, x.name, x.val)
 	}
