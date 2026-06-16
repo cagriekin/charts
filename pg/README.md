@@ -274,7 +274,7 @@ Caveats: this is a planned handoff layered on the lease election, not a fenced z
 
 ### Monitoring the agent (agent mode)
 
-The agent serves read-only Prometheus metrics on port `9200` (`pg_ha_agent_is_leader`, `_is_paused`, `_renew_failures_total`, `_promotions_total`, `_demotes_total`, `_fences_total`, `_reconcile_errors_total`). With the Prometheus Operator installed:
+The agent serves read-only Prometheus metrics on port `9200` (`pg_ha_agent_is_leader`, `_is_paused`, `_renew_failures_total`, `_promotions_total`, `_demotes_total`, `_fences_total`, `_reconcile_errors_total`, `_recovery_starts_total`). With the Prometheus Operator installed:
 
 ```yaml
 repmgr:

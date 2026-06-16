@@ -16,6 +16,7 @@ func TestMetricsExposition(t *testing.T) {
 	m.IncPromotion()
 	m.IncPromotion()
 	m.IncFence()
+	m.IncRecoveryStart()
 
 	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
 	rr := httptest.NewRecorder()
@@ -26,6 +27,7 @@ func TestMetricsExposition(t *testing.T) {
 		"pg_ha_agent_is_leader 1",
 		"pg_ha_agent_promotions_total 2",
 		"pg_ha_agent_fences_total 1",
+		"pg_ha_agent_recovery_starts_total 1",
 		"# TYPE pg_ha_agent_is_leader gauge",
 	} {
 		if !strings.Contains(body, want) {

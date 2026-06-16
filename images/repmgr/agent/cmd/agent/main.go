@@ -597,7 +597,11 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			if err := process.SetRecoverySignal(a.cfg.PGDATA); err != nil {
 				return err
 			}
-			return a.sup.Start(ctx)
+			if err := a.sup.Start(ctx); err != nil {
+				return err
+			}
+			a.metr.IncRecoveryStart()
+			return nil
 		}
 		return nil
 
