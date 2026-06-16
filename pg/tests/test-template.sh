@@ -875,6 +875,22 @@ helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set 'repmgr.agent.dcs.backend=etcd' --set 'etcd.enabled=true' --set 'repmgr.agent.dcs.etcd.endpoints={https://e:2379}' >/dev/null 2>&1 || etcd_both_rc=$?
 assert_eq "bundled etcd: enabled + external endpoints fails fast" "1" "$([ "${etcd_both_rc}" -ne 0 ] && echo 1 || echo 0)"
 
+# postgresql PDB: maxUnavailable + unhealthyPodEvictionPolicy (the 1.0.0 default
+# change), NOT minAvailable. Applies in both modes (base values).
+pdb=$(helm template test-pg "${CHART_DIR}" --show-only templates/pdb-postgresql.yaml 2>&1)
+assert_contains "pdb: postgresql uses maxUnavailable: 1" "${pdb}" "maxUnavailable: 1"
+assert_contains "pdb: postgresql sets unhealthyPodEvictionPolicy: AlwaysAllow" "${pdb}" "unhealthyPodEvictionPolicy: AlwaysAllow"
+assert_not_contains "pdb: postgresql no longer uses minAvailable" "${pdb}" "minAvailable"
+
+# values-cloud.yaml preset: 3-node, hard zone spread, managed-cloud lease timings.
+# Off by default (base renders no DoNotSchedule spread).
+cloud=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/../values-cloud.yaml" --set repmgr.failoverMode=agent --show-only templates/statefulset.yaml 2>&1)
+assert_contains "cloud preset: 3-node cluster (replicas: 3)" "${cloud}" "replicas: 3"
+assert_contains "cloud preset: hard zone topologySpread" "${cloud}" "whenUnsatisfiable: DoNotSchedule"
+assert_contains "cloud preset: managed-cloud lease timing (30s)" "${cloud}" 'value: "30s"'
+base_sts_spread=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "cloud preset: hard zone spread off by default" "${base_sts_spread}" "whenUnsatisfiable: DoNotSchedule"
+
 # regression: default (no failoverMode) still renders repmgrd + service-updater
 default_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/statefulset.yaml 2>&1)

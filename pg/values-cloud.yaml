@@ -1,0 +1,42 @@
+# Cloud HA preset (opt-in overlay) — layer over the base values:
+#
+#   helm install my-pg cagriekin/pg -f values-cloud.yaml [-f your-values.yaml]
+#
+# Opinionated settings for a managed-cloud, multi-AZ production deployment. Do NOT
+# use on single-node / kind / dev clusters: the hard zone spread below will leave
+# pods Pending if there are fewer schedulable zones than replicas. The base
+# values.yaml stays dev/CI-friendly; this preset is the production opt-in.
+
+postgresql:
+  # 3-node cluster (1 primary + 2 standbys): an AZ/node loss still leaves a standby
+  # to promote, and async "most-advanced" election has a real choice.
+  replicaCount: 2
+
+  # Hard-spread the postgresql pods across zones so a single AZ failure cannot take
+  # the whole cluster. Pairs with replicaCount across >= 3 zones; complements the
+  # base soft zone affinity + hard hostname anti-affinity.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: postgresql
+
+  persistence:
+    enabled: true
+    # Use a StorageClass with volumeBindingMode: WaitForFirstConsumer so the volume
+    # is provisioned in the SAME zone the pod schedules into (a default Immediate SC
+    # can bind a PV in a different zone than the pod -> permanent cross-zone attach
+    # failure). Set your cluster's zonal SC name here.
+    storageClass: ""
+
+repmgr:
+  agent:
+    # Managed-cloud lease timing: a routine control-plane blip (apiserver upgrade,
+    # etc.) under the on-prem 15/10/2 would trip an unnecessary self-demote. Wider
+    # timings tolerate longer blips; a sustained control-plane outage is still a
+    # write outage with the kubernetes DCS backend (use dcs.backend: etcd to decouple).
+    leaseDuration: 30s
+    renewDeadline: 20s
+    retryPeriod: 4s
