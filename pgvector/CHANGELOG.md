@@ -18,6 +18,14 @@ to `trixie-5.5.0-16`, which bundles the new `pg-ha-agent` binary.
 - `repmgr.agent.*` tunables (`leaseDuration`, `renewDeadline`, `retryPeriod`,
   `reconcileInterval`, `podCidr`).
 
+### Notes
+
+- Opt-in; repmgrd installs need no action. **Migrating to agent mode** needs a
+  one-time `kubectl delete statefulset <release>-pgvector --cascade=orphan` then
+  `helm upgrade --set repmgr.failoverMode=agent` (`podManagementPolicy` is
+  immutable). Runbook + GitOps caveats: README "Failover modes"; injected env:
+  `ENVIRONMENT.md`.
+
 ## 0.6.90
 
 Bundles the stale-primary/HA hardening, operational fixes, fail-fast

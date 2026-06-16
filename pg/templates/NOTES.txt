@@ -1,0 +1,39 @@
+{{ include "pg.fullname" . }} ({{ .Chart.Name }}-{{ .Chart.Version }}) installed in namespace {{ .Release.Namespace }}.
+
+Connect (read/write -> current primary):
+  {{ include "pg.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:5432
+{{- if .Values.repmgr.enabled }}
+Read-only (standbys):
+  {{ include "pg.fullname" . }}-readonly.{{ .Release.Namespace }}.svc.cluster.local:5432
+{{- end }}
+{{- if .Values.pgpool.enabled }}
+Pooled endpoint (pgpool, automatic read/write split):
+  {{ include "pg.fullname" . }}-pgpool.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.pgpool.service.port }}
+{{- end }}
+
+Credentials:
+{{- if .Values.postgresql.existingSecret.enabled }}
+  from the pre-created Secret {{ .Values.postgresql.existingSecret.name }}
+{{- else }}
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "pg.fullname" . }} -o jsonpath='{.data.password}' | base64 -d
+{{- end }}
+
+{{- if eq (include "pg.agentMode" .) "true" }}
+
+Failover mode: AGENT (lease-based). The Go agent holds the Lease
+"{{ include "pg.fullname" . }}-leader" as the sole authority for which pod is
+primary, and drives repmgr as a mechanism (no repmgrd). Inspect:
+
+  kubectl -n {{ .Release.Namespace }} get lease {{ include "pg.fullname" . }}-leader \
+    -o jsonpath='{.spec.holderIdentity}'   # the current primary pod
+  kubectl -n {{ .Release.Namespace }} get endpoints {{ include "pg.fullname" . }}  # points at the primary
+
+NOTE: agent mode uses podManagementPolicy: Parallel (immutable on an existing
+StatefulSet). See the chart README "Migrating to agent mode" runbook before
+switching an existing repmgrd release.
+{{- else if eq (include "pg.repmgrdMode" .) "true" }}
+
+Failover mode: repmgrd (default). repmgrd + the service-updater sidecar manage
+failover and keep the write Service pointed at the primary. An opt-in lease-based
+agent mode is available via repmgr.failoverMode=agent -- see the chart README.
+{{- end }}

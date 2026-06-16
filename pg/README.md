@@ -205,6 +205,47 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 
 **Split-brain detection**: In a 2-node cluster, network partitions can cause both nodes to believe they are the primary. The service-updater detects this by checking all nodes each monitoring cycle. With `action: log` (default), it logs a critical warning. With `action: fence`, it compares WAL LSN positions and terminates connections on the stale primary. For production deployments, use 3+ nodes to reduce split-brain risk.
 
+### Failover modes: `repmgrd` (default) and lease-based `agent`
+
+`repmgr.failoverMode` selects how failover is decided:
+
+- **`repmgrd`** (default): the repmgrd + service-updater sidecars described above. Unchanged behavior.
+- **`agent`** (opt-in): a Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a Kubernetes `coordination.k8s.io/v1` Lease (`<fullname>-leader`) as the **sole authority** for which pod is primary, driving repmgr as a pure mechanism (`failover=manual`, no repmgrd). The Lease replaces hand-rolled split-brain handling and removes the repmgrd startup race. Becomes the default at chart `1.0.0`.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `repmgr.failoverMode` | `repmgrd` or `agent` | `repmgrd` |
+| `repmgr.agent.leaseDuration` | Lease TTL; a challenger cannot acquire until this elapses since the last renew | `15s` |
+| `repmgr.agent.renewDeadline` | Holder self-demotes if it cannot renew within this | `10s` |
+| `repmgr.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
+| `repmgr.agent.reconcileInterval` | Reconcile tick interval | `5s` |
+| `repmgr.agent.podCidr` | Pod CIDR trusted in the hardened pg_hba (agent mode) | `10.0.0.0/8` |
+
+Must satisfy `leaseDuration > renewDeadline > retryPeriod`. For managed clouds, widen them (e.g. `30s/20s/4s`) so a brief apiserver blip does not trip an unnecessary demote. Note: with the Kubernetes Lease backend, a control-plane outage longer than `renewDeadline` is itself a write outage (the healthy primary self-demotes on losing apiserver contact, and no standby can acquire until the control plane returns); this is the safe choice under an asymmetric partition.
+
+In agent mode the agent also fronts the read/write split: `pgpool` (if enabled) points at the RW (`<fullname>`) and RO (`<fullname>-readonly`) Services with failover off, and the agent maintains the Service selector and `pg-role` labels itself (no repmgrd/service-updater sidecars).
+
+### Migrating an existing release to agent mode
+
+`podManagementPolicy` differs by mode (`OrderedReady` for repmgrd, `Parallel` for agent) and is **immutable** on an existing StatefulSet, so switching an existing release needs a one-time recreate (zero data loss — pods and PVCs are kept):
+
+```bash
+# 1. Healthy cluster + a fresh backup first. GitOps: disable auto-sync for these steps.
+# 2. Orphan-delete the StatefulSet (keeps pods + PVCs running; Helm re-adopts them):
+kubectl delete statefulset <release>-pg -n <ns> --cascade=orphan
+# 3. Upgrade into agent mode (recreates the STS as Parallel, adopts the orphaned pods):
+helm upgrade <release> cagriekin/pg -n <ns> --set repmgr.failoverMode=agent  # + your -f values
+# 4. Verify:
+kubectl get lease <release>-pg-leader -n <ns> -o jsonpath='{.spec.holderIdentity}'  # == the primary pod
+kubectl get endpoints <release>-pg -n <ns>                                          # points at it
+# Rollback is symmetric: --set repmgr.failoverMode=repmgrd with the same --cascade=orphan recreate,
+# then optionally: kubectl delete lease <release>-pg-leader -n <ns>
+```
+
+GitOps/ArgoCD: the Lease, the primary-marker ConfigMap, and the write-Service `.spec.selector` are runtime-owned by the agent — `ignoreDifferences` on the Service selector and do not prune the Lease/marker, or auto-sync will fight the agent. Set `postgresql.existingSecret.enabled=true` (the `lookup`-based password generation returns nil under ArgoCD).
+
+> Agent mode is opt-in and validated by the chart's live failover suite (graceful failover: a standby promotes, the write Service repoints, the ex-primary rejoins read-only). See `ENVIRONMENT.md` for the full injected-variable catalog.
+
 ### PGPool-II Parameters
 
 | Parameter | Description | Default |

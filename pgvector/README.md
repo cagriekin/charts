@@ -212,6 +212,24 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 - **repmgrd**: monitors replication and triggers automatic failover when the primary becomes unavailable
 - **service-updater**: watches repmgr cluster state and patches the Kubernetes Service selector to point to the current primary, then restarts PGPool-II if enabled. Also maintains a `pg-role` label (`primary`/`standby`) on every postgresql pod each cycle, which the `<fullname>-readonly` service selects (`pg-role: standby`) to route read traffic to replicas
 
+### Failover modes: `repmgrd` (default) and lease-based `agent`
+
+`repmgr.failoverMode` selects how failover is decided:
+
+- **`repmgrd`** (default): the repmgrd + service-updater sidecars described above. Unchanged behavior.
+- **`agent`** (opt-in): a Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a Kubernetes `coordination.k8s.io/v1` Lease (`<fullname>-leader`) as the **sole authority** for which pod is primary, driving repmgr as a pure mechanism (`failover=manual`, no repmgrd). Becomes the default at chart `1.0.0`.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `repmgr.failoverMode` | `repmgrd` or `agent` | `repmgrd` |
+| `repmgr.agent.leaseDuration` | Lease TTL | `15s` |
+| `repmgr.agent.renewDeadline` | Holder self-demotes if it cannot renew within this | `10s` |
+| `repmgr.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
+| `repmgr.agent.reconcileInterval` | Reconcile tick interval | `5s` |
+| `repmgr.agent.podCidr` | Pod CIDR trusted in the hardened pg_hba (agent mode) | `10.0.0.0/8` |
+
+Must satisfy `leaseDuration > renewDeadline > retryPeriod`; widen for managed clouds (e.g. `30s/20s/4s`). This chart shares pg's templates and agent — see the [pg chart README](../pg/README.md#failover-modes-repmgrd-default-and-lease-based-agent) for the full agent-mode behavior and the **migration runbook** (the immutable `podManagementPolicy` change requires a one-time `kubectl delete statefulset --cascade=orphan` + `helm upgrade`). See `ENVIRONMENT.md` for the injected-variable catalog.
+
 ### PGPool-II Parameters
 
 | Parameter | Description | Default |
