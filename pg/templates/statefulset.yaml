@@ -10,6 +10,16 @@
 {{- if and .Values.pgbackrest.enabled (not .Values.repmgr.enabled) }}
 {{- fail "pgbackrest.enabled requires repmgr.enabled=true: the pgbackrest binary and the archive_command run inside the postgresql container, which in standalone mode is the official postgres image without pgbackrest. WAL archiving would fail on every segment (unbounded WAL growth) and backups would time out. Enable repmgr, or disable pgbackrest" }}
 {{- end }}
+{{- /* Bundled etcd consistency: the subchart deploys 3 stateful pods, so reject the
+       contradictory inputs that would silently orphan them (fail-fast, CLAUDE.md). */}}
+{{- if (.Values.etcd).enabled }}
+{{- if ne (include "pg.agentEtcdMode" .) "true" }}
+{{- fail "etcd.enabled=true deploys a bundled etcd cluster, but the agent etcd backend is not active (it would be left unused). Set repmgr.failoverMode=agent and repmgr.agent.dcs.backend=etcd, or set etcd.enabled=false" }}
+{{- end }}
+{{- if (.Values.repmgr.agent.dcs.etcd).endpoints }}
+{{- fail "etcd.enabled=true (bundled etcd) and repmgr.agent.dcs.etcd.endpoints (external etcd) are both set; the agent would target the external endpoints and leave the bundled cluster unused. Pick one: enable the bundle OR set endpoints" }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
