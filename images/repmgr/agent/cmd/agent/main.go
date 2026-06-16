@@ -548,9 +548,21 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// serving read-write; a standby is already read-only, so releasing the Lease
 		// is enough and we avoid churning its postmaster.
 		a.dcs.Release()
-		if obs.Local.Running && !obs.Local.InRecovery {
+		switch {
+		case obs.Local.Running && !obs.Local.InRecovery:
 			a.metr.IncDemote()
 			return a.sup.Demote(ctx, false)
+		case obs.LocalStuck && !obs.Local.InRecovery:
+			// Self-health failover: a primary-state postmaster that is wedged/frozen
+			// (SQL unreachable, so Running is false and the OnLost fence -- gated on the
+			// already-cleared servingRW -- would NOT demote it). The agent owns this
+			// PID-1 child, so force-stop it (SIGQUIT->SIGKILL on timeout) BEFORE the
+			// released lease lets a standby promote: a frozen primary that later
+			// unfreezes would be a second writer. Harmless if it is already down.
+			a.metr.IncDemote()
+			rctx, cancel := context.WithTimeout(ctx, a.cfg.RenewDeadline)
+			defer cancel()
+			return a.sup.Stop(rctx, process.Immediate)
 		}
 		return nil
 
@@ -578,14 +590,27 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// primary-state data, or any standby-state data); a non-holder's primary-state
 		// data is routed to RejoinForward/StartRecovery instead, never read-write here.
 		if !obs.Local.Running && obs.Local.HasData {
-			if !obs.Local.InRecovery {
+			primaryState := !obs.Local.InRecovery
+			if primaryState {
 				// primary-state: clear any stray standby.signal so it opens read-write
 				// (crash recovery on the same timeline -- a resume, not a promotion).
 				if err := process.ClearRecoverySignal(a.cfg.PGDATA); err != nil {
 					return err
 				}
 			}
-			return a.sup.Start(ctx)
+			if err := a.sup.Start(ctx); err != nil {
+				return err
+			}
+			if primaryState {
+				// Resuming as a read-write primary (the lease holder, per the decision
+				// guard). Arm the OnLost fence synchronously -- mirror the Promote path
+				// -- so a lease loss during the resume window (before the next tick
+				// observes the postmaster SQL-reachable) still fences. Postgres may still
+				// be in crash recovery here; pre-arming only ever makes OnLost demote a
+				// node that is becoming a writer (the fail-safe direction).
+				a.servingRW.Store(true)
+			}
+			return nil
 		}
 		return nil
 

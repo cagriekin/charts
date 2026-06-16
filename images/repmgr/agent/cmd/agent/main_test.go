@@ -1,12 +1,121 @@
 package main
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
+	"github.com/cagriekin/pg-ha-agent/internal/config"
+	"github.com/cagriekin/pg-ha-agent/internal/dcs"
+	"github.com/cagriekin/pg-ha-agent/internal/observe"
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
+	"github.com/cagriekin/pg-ha-agent/internal/process"
 	"github.com/cagriekin/pg-ha-agent/internal/reconcile"
 )
+
+// --- fakes for the act() path ---
+
+type fakePostmaster struct {
+	started  bool
+	stopped  bool
+	stopMode process.StopMode
+}
+
+func (f *fakePostmaster) Start(context.Context) error { f.started = true; return nil }
+func (f *fakePostmaster) Stop(_ context.Context, m process.StopMode) error {
+	f.stopped, f.stopMode = true, m
+	return nil
+}
+func (f *fakePostmaster) Reload(context.Context) error { return nil }
+
+type fakeDCS struct{ released bool }
+
+func (f *fakeDCS) Run(context.Context, string, dcs.Callbacks) {}
+func (f *fakeDCS) IsLeader() bool                             { return false }
+func (f *fakeDCS) Leader() string                             { return "" }
+func (f *fakeDCS) Release()                                   { f.released = true }
+
+func newTestAgent(t *testing.T, pm *fakePostmaster, d *fakeDCS) *agent {
+	t.Helper()
+	return &agent{
+		cfg:  &config.Config{PGDATA: t.TempDir(), RenewDeadline: 2 * time.Second},
+		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		dcs:  d,
+		sup:  process.NewSupervisor(pm),
+		metr: observe.New(),
+	}
+}
+
+// StartLocal resuming on-disk primary-state data must arm servingRW synchronously
+// so a lease loss during the resume window still fences (mirrors the Promote path).
+func TestActStartLocalArmsServingRWForPrimaryState(t *testing.T) {
+	pm := &fakePostmaster{}
+	a := newTestAgent(t, pm, &fakeDCS{})
+	obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: false, InRecovery: false}}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.StartLocal}, obs); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if !pm.started {
+		t.Fatal("postmaster must be started")
+	}
+	if !a.servingRW.Load() {
+		t.Fatal("servingRW must be armed synchronously when resuming primary-state data read-write")
+	}
+}
+
+// A standby-state StartLocal (read-only) must NOT arm servingRW (it is not a writer).
+func TestActStartLocalDoesNotArmServingRWForStandbyState(t *testing.T) {
+	pm := &fakePostmaster{}
+	a := newTestAgent(t, pm, &fakeDCS{})
+	obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: false, InRecovery: true}}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.StartLocal}, obs); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if !pm.started {
+		t.Fatal("postmaster must be started")
+	}
+	if a.servingRW.Load() {
+		t.Fatal("a read-only standby must not arm servingRW")
+	}
+}
+
+// Self-health failover (a wedged/frozen primary-state node) must force-stop the
+// supervised postmaster before releasing the lease, so a peer cannot promote into a
+// second writer if the frozen primary later unfreezes.
+func TestActReleaseLeaseForceStopsWedgedPrimary(t *testing.T) {
+	pm := &fakePostmaster{}
+	d := &fakeDCS{}
+	a := newTestAgent(t, pm, d)
+	obs := reconcile.Observation{LocalStuck: true, Local: reconcile.LocalState{HasData: true, Running: false, InRecovery: false}}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.ReleaseLease}, obs); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if !d.released {
+		t.Fatal("lease must be released")
+	}
+	if !pm.stopped || pm.stopMode != process.Immediate {
+		t.Fatalf("a wedged primary must be force-stopped (Immediate) before handing leadership away; stopped=%v mode=%v", pm.stopped, pm.stopMode)
+	}
+}
+
+// Releasing the lease as a read-only standby must NOT churn its postmaster.
+func TestActReleaseLeaseLeavesStandbyRunning(t *testing.T) {
+	pm := &fakePostmaster{}
+	d := &fakeDCS{}
+	a := newTestAgent(t, pm, d)
+	obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: true, InRecovery: true}}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.ReleaseLease}, obs); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if !d.released {
+		t.Fatal("lease must be released")
+	}
+	if pm.stopped {
+		t.Fatal("a read-only standby must not be stopped on ReleaseLease")
+	}
+}
 
 func TestDesiredRoleLabels(t *testing.T) {
 	peers := []reconcile.PeerState{
