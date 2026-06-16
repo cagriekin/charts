@@ -211,12 +211,17 @@ func Decide(o Observation) Decision {
 			if p := sameTimelinePrimary(o); p != nil {
 				return d(RejoinForward, p.Name, "stopped primary-state data without the lease; a same-timeline primary exists, rejoin it as a standby")
 			}
-			// Otherwise start READ-ONLY in recovery mode (standby.signal): it replays
-			// its own WAL to the true end and reports an exact LSN, so the holder's
-			// most-advanced election ranks it precisely (closing the cold-boot RPO that
-			// the gossiped checkpoint estimate only narrowed). It never opens
-			// read-write here; it promotes only if it later wins the lease.
-			return d(StartRecovery, "", "stopped primary-state data without the lease; start read-only (recovery mode) so its true position is observable for the election")
+			// Recovery mode is only for a genuine cold-boot election, signalled by
+			// another node already holding the lease: come up READ-ONLY (standby.signal)
+			// so the holder can rank our true position. With NO leader yet, the lease is
+			// merely settling (acquisition is async) -- a fresh or sole primary that will
+			// win it. Do NOT enter recovery mode then: a fresh master has no repmgr
+			// record, so it could never promote back out, deadlocking the bootstrap
+			// (the standby's clone waits for this node to become a registered primary).
+			if o.LeaderIdentity != "" {
+				return d(StartRecovery, "", "stopped primary-state data, another node holds the lease; start read-only (recovery mode) so its true position is observable for the election")
+			}
+			return d(Wait, "", "stopped primary-state data, no leader yet; wait to acquire the lease (a fresh/sole primary must not enter recovery mode -- it has no repmgr record to promote out of)")
 		}
 		return d(StartLocal, "", "standby-state data, stopped: start as a standby")
 	}
