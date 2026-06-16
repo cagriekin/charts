@@ -317,7 +317,10 @@ assert_not_contains "#135: pgpool netpol omits 9719 when metrics disabled" "${ne
 # rule's from: list (which rejected rule-shaped input and limited peers to 5432).
 # Parse the postgresql policy: a correct splice yields 2 ingress rules, one with
 # the extra port; the old from:-nesting yielded a single rule.
+# Pin repmgrd mode so the base ingress-rule count is deterministic (agent mode adds
+# an agent-metrics rule); this test isolates the extraIngress splice shape.
 netpol_xi=$(helm template test-pg "${CHART_DIR}" --set networkPolicy.enabled=true \
+  --set repmgr.failoverMode=repmgrd \
   --set 'networkPolicy.postgresql.extraIngress[0].from[0].namespaceSelector.matchLabels.name=monitoring' \
   --set 'networkPolicy.postgresql.extraIngress[0].ports[0].port=9116' \
   --show-only templates/networkpolicy.yaml 2>&1)
@@ -1321,6 +1324,7 @@ assert_contains "service selector: pod-0 in standalone mode" "${svc_selector_sta
 # the postStart discovery loop and the repmgrd peer scan must both reach
 # ordinal replicaCount; replicaCount=2 disambiguates from the old bounds
 discovery_sts=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.failoverMode=repmgrd \
   --set postgresql.replicaCount=2 \
   --set postgresql.lifecycle.postStart.additionalCommands="echo noop" \
   --show-only templates/statefulset.yaml 2>&1)
@@ -1801,7 +1805,7 @@ assert_not_contains "pgvector #126: no null securityContext" "${pgv_backup}" "se
 # The agent-mode templates are symlinks to pg's, but pgvector/values.yaml is an
 # independent copy: a missing repmgr.agent.* / monitoring value would break
 # agent-mode rendering only for pgvector. Render the agent-mode paths against the
-# pgvector chart to catch that #126-class gap, and confirm repmgrd stays the default.
+# pgvector chart to catch that #126-class gap, and confirm the agent is the default.
 pgv_agent_rc=0
 pgv_agent=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=agent \
   --show-only templates/statefulset.yaml --show-only templates/rbac.yaml 2>&1) || pgv_agent_rc=$?
@@ -1819,8 +1823,13 @@ pgv_agent_mon=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMo
   --show-only templates/agent-servicemonitor.yaml --show-only templates/agent-prometheusrule.yaml 2>&1)
 assert_contains "pgvector agent: ServiceMonitor renders" "${pgv_agent_mon}" "kind: ServiceMonitor"
 assert_contains "pgvector agent: PrometheusRule scoped to the pgvector headless Service" "${pgv_agent_mon}" "test-pgv-pgvector-headless"
-pgv_repmgrd=$(helm template test-pgv "${PGVECTOR_DIR}" --show-only templates/statefulset.yaml 2>&1)
-assert_contains "pgvector repmgrd: default still runs repmgrd (byte-stable parity)" "${pgv_repmgrd}" "name: repmgrd"
+# pgvector default is the agent (since 1.0.0), matching pg.
+pgv_default=$(helm template test-pgv "${PGVECTOR_DIR}" --show-only templates/statefulset.yaml 2>&1)
+assert_contains "pgvector: default runs the agent arm (1.0.0 default flip)" "${pgv_default}" '"/usr/local/bin/entrypoint.sh", "agent"'
+assert_not_contains "pgvector: default has no repmgrd sidecar" "${pgv_default}" "name: repmgrd"
+# the legacy repmgrd path stays available as an explicit opt-in.
+pgv_repmgrd=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=repmgrd --show-only templates/statefulset.yaml 2>&1)
+assert_contains "pgvector repmgrd: opt-in still runs repmgrd" "${pgv_repmgrd}" "name: repmgrd"
 
 # --- #128: global.annotations render as metadata.annotations, not labels ---
 # global.annotations used to be spliced into pg.labels and rendered under

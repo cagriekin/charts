@@ -57,6 +57,7 @@ postgresql:
       additionalCommands: ""
 
 repmgr:
+  failoverMode: repmgrd
   image:
     repository: cagriekin/repmgr
     tag: trixie-5.5.0-15

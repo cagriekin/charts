@@ -1,11 +1,35 @@
 # pgvector chart changelog
 
-## 0.6.91
+## 1.0.0
 
-Introduces an opt-in, lease-based failover mode (`repmgr.failoverMode: agent`),
-in lockstep with pg 0.5.89. The default stays `repmgrd`, so existing installs
-are unaffected and the repmgrd rendering is byte-stable. The repmgr image moves
-to `trixie-5.5.0-16`, which bundles the new `pg-ha-agent` binary.
+First major release, in lockstep with pg 1.0.0 (the two charts now share a single
+1.0.0 version line). The lease-based Go agent (`pg-ha-agent`) is now the
+**default** failover mode. The repmgr image is `trixie-5.5.0-16`.
+
+### BREAKING
+
+- **`repmgr.failoverMode` defaults to `agent`** (was `repmgrd`). The legacy
+  repmgrd path remains available via `repmgr.failoverMode: repmgrd` (deprecated,
+  one major cycle).
+- Agent mode uses `podManagementPolicy: Parallel` (immutable), so switching an
+  existing repmgrd release needs a one-time `--cascade=orphan` StatefulSet recreate.
+- Agent mode ships a hardened `pg_hba.conf` (pod-CIDR + SCRAM, no `0.0.0.0/0 md5`);
+  add explicit `postgresql.pgHba` rules if you relied on the broad md5 rule.
+- postgresql PDB default is `maxUnavailable: 1` + `unhealthyPodEvictionPolicy:
+  AlwaysAllow` (was `minAvailable: 1`; k8s >= 1.27).
+
+### Migrating to 1.0.0
+
+- **Stay on repmgrd:** set `repmgr.failoverMode: repmgrd` and `helm upgrade` (pods
+  roll once for image `trixie-5.5.0-16`; no other change).
+- **Adopt agent mode (default):** fresh backup, then
+  `kubectl delete statefulset <release>-pgvector --cascade=orphan -n <ns>` followed
+  by `helm upgrade` (recreates the StatefulSet as `Parallel`, adopts the orphaned
+  pods). Verify the `<release>-pgvector-leader` Lease holder is the primary. See
+  the pg chart README for the full agent-mode runbook (it applies identically).
+
+The sections below describe the agent machinery now shipping as the 1.0.0 default;
+the repmgrd rendering is byte-stable.
 
 ### Added
 

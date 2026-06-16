@@ -23,7 +23,8 @@ begin_suite "Migration: repmgrd -> agent (--cascade=orphan recreate, Part F6)"
 kubectl delete namespace "${NAMESPACE}" --ignore-not-found --wait=true --timeout=5m
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
-# 1. install the DEFAULT (repmgrd) mode
+# 1. install repmgrd mode (the legacy 0.x path; values-repmgr.yaml pins
+# failoverMode: repmgrd now that agent is the 1.0.0 default)
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
   -n "${NAMESPACE}" -f "${SCRIPT_DIR}/values-repmgr.yaml" --wait --timeout 10m
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 600
