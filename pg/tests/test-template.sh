@@ -757,6 +757,9 @@ assert_contains "agent rbac: configmaps scoped to <fullname>-primary marker" "${
 # update (not patch) or every marker advance would be Forbidden once wired
 assert_contains "agent rbac: marker configmaps grant get+update (marker.go uses Update)" "${agent_rbac}" '"get", "update"'
 assert_not_contains "agent rbac: no pods delete in log mode" "${agent_rbac}" '"delete"'
+# agent mode records decisions in a structured audit log, not core/v1 Events, so
+# the events:create grant (service-updater only) must be dropped (least privilege)
+assert_not_contains "agent rbac: no events grant (agent emits no Events)" "${agent_rbac}" 'resources: ["events"]'
 # fence mode re-grants pods delete (split-brain safety net)
 agent_rbac_fence=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.splitBrainDetection.action=fence --show-only templates/rbac.yaml 2>&1)

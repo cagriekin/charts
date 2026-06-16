@@ -105,7 +105,29 @@ func (r *Repmgr) RejoinForceRewind(ctx context.Context, target Conn) error {
 		// back to ReclonePreserving (the data-safe path, #175).
 		return fmt.Errorf("%w: repmgr node rejoin onto %s: %v: %s", ErrRewindDiverged, target.Host, err, strings.TrimSpace(out))
 	}
+	// `node rejoin` starts Postgres as its final step to verify the node attaches,
+	// but that postmaster is NOT the agent's supervised child -- it cannot be
+	// fenced on lease loss (two-writer risk) and would collide on the pid lock with
+	// the child the caller is about to Start. Stop it (best-effort, mirroring
+	// entrypoint.sh:170-175) so the agent owns the postmaster it then starts. A
+	// stop failure here is non-fatal: rejoin itself succeeded, so do NOT report
+	// ErrRewindDiverged (that would trigger an unnecessary full re-clone); the next
+	// reconcile tick reconciles the running state.
+	r.stopServer(ctx, "fast")
 	return nil
+}
+
+// stopServer stops the local postmaster (best-effort) so the agent can (re)start
+// it as its supervised child. repmgr starts Postgres as the final step of `node
+// rejoin` (daemonized and untracked); the agent must stop it and run its own
+// child to retain the soft-fence guarantee. pg_ctl resolves via PATH (like
+// repmgr). Errors are ignored: if the server is already down there is nothing to
+// stop, and a genuine stop failure self-corrects on the next tick.
+func (r *Repmgr) stopServer(ctx context.Context, mode string) {
+	if r.DataDir == "" {
+		return
+	}
+	_, _ = r.Runner.Run(ctx, nil, "pg_ctl", "-D", r.DataDir, "-m", mode, "-w", "stop")
 }
 
 func (r *Repmgr) RegisterPrimary(ctx context.Context) error {
@@ -165,6 +187,10 @@ func (r *Repmgr) ReclonePreserving(ctx context.Context, source Conn) error {
 	if r.DataDir == "" {
 		return fmt.Errorf("reclone: DataDir not set")
 	}
+	// A prior `node rejoin` (or an earlier start) may have left a postmaster holding
+	// the data directory open; stop it immediate before moving PGDATA aside so the
+	// rename cannot race a running server (mirrors entrypoint.sh:179).
+	r.stopServer(ctx, "immediate")
 	backup := fmt.Sprintf("%s.diverged.%s", strings.TrimRight(r.DataDir, "/"), r.Now().UTC().Format("20060102T150405Z"))
 	if err := os.Rename(r.DataDir, backup); err != nil {
 		return fmt.Errorf("reclone: move PGDATA aside to %s: %w", backup, err)

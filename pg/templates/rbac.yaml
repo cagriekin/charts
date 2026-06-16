@@ -48,17 +48,12 @@ rules:
       {{- if eq .Values.repmgr.splitBrainDetection.action "fence" }}
       - "delete"
       {{- end }}
-  # core/v1 Events emitted by service-updater on primary failover.
-  # resourceNames cannot restrict create: the object name is not known at
-  # authorization time.
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create"]
 {{- if eq (include "pg.agentMode" .) "true" }}
   # Durable primary marker (<fullname>-primary): the agent records the highest
   # timeline here (#125) via Get -> Create-if-absent -> Update. get/update are
   # scoped to the one marker name; create stays unscoped (resourceNames cannot
-  # restrict create).
+  # restrict create). The agent records its failover decisions in a structured
+  # audit log (not core/v1 Events), so it needs no events grant.
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: ["{{ include "pg.fullname" . }}-primary"]
@@ -76,6 +71,12 @@ rules:
     resources: ["leases"]
     verbs: ["create"]
 {{- else }}
+  # core/v1 Events emitted by service-updater on primary failover.
+  # resourceNames cannot restrict create: the object name is not known at
+  # authorization time. Agent mode does not emit Events, so this is repmgrd-only.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
   # Durable primary marker (<fullname>-primary): the service-updater records the
   # highest-timeline primary here so a node booting first under OrderedReady can
   # tell it is stale (#125). create cannot be resourceName-scoped; the chart only

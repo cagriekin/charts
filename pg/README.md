@@ -219,7 +219,7 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 | `repmgr.agent.renewDeadline` | Holder self-demotes if it cannot renew within this | `10s` |
 | `repmgr.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
 | `repmgr.agent.reconcileInterval` | Reconcile tick interval | `5s` |
-| `repmgr.agent.podCidr` | Pod CIDR trusted in the hardened pg_hba (agent mode) | `10.0.0.0/8` |
+| `repmgr.agent.podCidr` | Reserved (not yet consumed in v1): pod CIDR the agent will trust in the hardened pg_hba once it owns pg_hba assembly | `10.0.0.0/8` |
 
 Must satisfy `leaseDuration > renewDeadline > retryPeriod`. For managed clouds, widen them (e.g. `30s/20s/4s`) so a brief apiserver blip does not trip an unnecessary demote. Note: with the Kubernetes Lease backend, a control-plane outage longer than `renewDeadline` is itself a write outage (the healthy primary self-demotes on losing apiserver contact, and no standby can acquire until the control plane returns); this is the safe choice under an asymmetric partition.
 
