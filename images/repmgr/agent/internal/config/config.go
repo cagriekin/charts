@@ -141,6 +141,13 @@ func Load(get func(string) string) (*Config, error) {
 		if c.EtcdPrefix = strings.TrimSpace(l.get("ETCD_PREFIX")); c.EtcdPrefix == "" {
 			l.missing = append(l.missing, "ETCD_PREFIX")
 		}
+		// The etcd session lease TTL is whole seconds (LeaseDuration maps to it); a
+		// sub-5s lease leaves no soft-fence margin given etcd's 1s client deadline
+		// granularity + the up-to-1s server reap, and truncation toward an integer TTL
+		// would silently degrade it (e.g. 1500ms -> TTL=1). Require >= 5s for etcd.
+		if c.LeaseDuration > 0 && c.LeaseDuration < 5*time.Second {
+			l.invalid = append(l.invalid, fmt.Sprintf("etcd DCS needs LEASE_DURATION >= 5s (lease TTL is whole seconds), got %s", c.LeaseDuration))
+		}
 		c.EtcdCertFile = l.get("ETCD_TLS_CERT")
 		c.EtcdKeyFile = l.get("ETCD_TLS_KEY")
 		c.EtcdCAFile = l.get("ETCD_TLS_CA")

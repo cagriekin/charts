@@ -97,9 +97,11 @@ func newDCS(cfg *config.Config) (dcs.DCS, error) {
 	switch cfg.DCSBackend {
 	case "etcd":
 		return dcs.NewEtcdDCS(dcs.EtcdConfig{
-			Endpoints:   cfg.EtcdEndpoints,
-			Prefix:      cfg.EtcdPrefix,
-			TTLSeconds:  int(cfg.LeaseDuration.Seconds()),
+			Endpoints: cfg.EtcdEndpoints,
+			Prefix:    cfg.EtcdPrefix,
+			// Whole-second lease TTL, rounded (not truncated) from LeaseDuration; the
+			// config validator already enforces LeaseDuration >= 5s for etcd.
+			TTLSeconds:  int(cfg.LeaseDuration.Round(time.Second).Seconds()),
 			RetryPeriod: cfg.RetryPeriod,
 			CertFile:    cfg.EtcdCertFile,
 			KeyFile:     cfg.EtcdKeyFile,
