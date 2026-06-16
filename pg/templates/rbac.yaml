@@ -35,11 +35,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["list"]
-  {{- /* get/patch (pg-role labeling for the readonly Service) and, only in fence
-         mode, delete (split-brain fencing) are scoped to the chart's own
-         StatefulSet pods <fullname>-0..N, so a leaked SA token cannot patch or
-         delete arbitrary namespace pods. delete is withheld unless
-         splitBrainDetection.action=fence, where it is actually exercised (#154). */}}
+  {{- /* get/patch (pg-role labeling for the readonly Service) and, only in repmgrd
+         fence mode, delete (split-brain fencing by the service-updater) are scoped
+         to the chart's own StatefulSet pods <fullname>-0..N, so a leaked SA token
+         cannot patch or delete arbitrary namespace pods. delete is withheld unless
+         splitBrainDetection.action=fence (#154); agent mode never gets it -- the
+         agent soft-fences locally via pg_ctl and never deletes a pod. */}}
   - apiGroups: [""]
     resources: ["pods"]
     resourceNames:
@@ -49,7 +50,7 @@ rules:
     verbs:
       - "get"
       - "patch"
-      {{- if eq .Values.repmgr.splitBrainDetection.action "fence" }}
+      {{- if and (eq (include "pg.repmgrdMode" .) "true") (eq .Values.repmgr.splitBrainDetection.action "fence") }}
       - "delete"
       {{- end }}
 {{- if eq (include "pg.agentMode" .) "true" }}

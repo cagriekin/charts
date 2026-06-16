@@ -113,7 +113,15 @@ func (c *Client) WriteMarker(ctx context.Context, name, primary string, timeline
 	if err != nil {
 		return fmt.Errorf("get marker %s: %w", name, err)
 	}
-	cm.Data = data
+	// Merge our keys into the existing Data rather than replacing the whole map, so
+	// any other keys on the marker ConfigMap (operator annotations-as-data, future
+	// schema fields) survive a marker advance.
+	if cm.Data == nil {
+		cm.Data = map[string]string{}
+	}
+	for k, v := range data {
+		cm.Data[k] = v
+	}
 	if _, uerr := cms.Update(ctx, cm, metav1.UpdateOptions{}); uerr != nil {
 		return fmt.Errorf("update marker %s: %w", name, uerr)
 	}

@@ -1,4 +1,4 @@
-{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.monitoring.prometheusRule.enabled }}
+{{- if and (eq (include "pg.agentMode" .) "true") (dig "prometheusRule" "enabled" false (.Values.repmgr.agent.monitoring | default dict)) }}
 {{- /*
 Example alert rules over the pg-ha-agent's metrics (scraped by the agent
 ServiceMonitor). Scoped to this release by namespace + the headless Service label

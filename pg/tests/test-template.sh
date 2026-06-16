@@ -768,10 +768,16 @@ assert_not_contains "agent rbac: no pods delete in log mode" "${agent_rbac}" '"d
 # agent mode records decisions in a structured audit log, not core/v1 Events, so
 # the events:create grant (service-updater only) must be dropped (least privilege)
 assert_not_contains "agent rbac: no events grant (agent emits no Events)" "${agent_rbac}" 'resources: ["events"]'
-# fence mode re-grants pods delete (split-brain safety net)
+# Agent mode NEVER grants pods delete, even in fence mode: the agent soft-fences
+# locally via pg_ctl and never calls pods.Delete (the delete grant is the repmgrd
+# service-updater's split-brain net only). Least privilege for the 1.0.0 default.
 agent_rbac_fence=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.splitBrainDetection.action=fence --show-only templates/rbac.yaml 2>&1)
-assert_contains "agent rbac: fence mode grants pods delete" "${agent_rbac_fence}" '"delete"'
+assert_not_contains "agent rbac: fence mode still grants NO pods delete (soft fence is local)" "${agent_rbac_fence}" '"delete"'
+# repmgrd mode + fence DOES grant delete (the service-updater split-brain net, #154).
+repmgrd_rbac_fence=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set repmgr.splitBrainDetection.action=fence --show-only templates/rbac.yaml 2>&1)
+assert_contains "repmgrd rbac: fence mode grants pods delete (service-updater net)" "${repmgrd_rbac_fence}" '"delete"'
 
 # agent pgpool backends front the RW/RO Services, failover off, health checks on
 agent_pgpool=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent-pgpool.yaml" \
