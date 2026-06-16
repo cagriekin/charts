@@ -9,8 +9,12 @@ replicaCount: 3
 image:
   repository: quay.io/coreos/etcd
   # Pin matches the agent's vendored client (go.etcd.io/etcd/client/v3 v3.5.16).
-  # Supply-chain hardening (digest pin) is a follow-up.
   tag: v3.5.16
+  # Digest pin (multi-arch manifest list) takes precedence over the tag, so a
+  # mutable-tag repush cannot change the bundled etcd. Refresh with:
+  #   docker buildx imagetools inspect quay.io/coreos/etcd:v3.5.16
+  # Set to "" to pull by tag only.
+  digest: "sha256:d967d98a12dc220a1a290794711dba7eba04b8ce465e12b02383d1bfbb33e159"
   pullPolicy: IfNotPresent
 
 # Cluster DNS domain, for building peer/client FQDNs.
