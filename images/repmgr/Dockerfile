@@ -1,15 +1,19 @@
 # --- Stage 1: build the Go HA agent (cross-compiled, static, no cgo) ---
-FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS agent-build
+# Digest-pinned (manifest-list digest, multi-arch). Refresh with:
+#   docker buildx imagetools inspect golang:1.23-bookworm
+FROM --platform=$BUILDPLATFORM golang:1.23-bookworm@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db AS agent-build
 ARG TARGETARCH
 WORKDIR /src/agent
 COPY agent/go.mod agent/go.sum ./
-RUN go mod download
+RUN go mod download && go mod verify
 COPY agent/ ./
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w" -o /out/pg-ha-agent ./cmd/agent
 
 # --- Stage 2: the runtime image (PostgreSQL 18 + repmgr + pgbackrest + agent) ---
-FROM debian:trixie-slim
+# Digest-pinned (manifest-list digest, multi-arch). Refresh with:
+#   docker buildx imagetools inspect debian:trixie-slim
+FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -34,11 +38,16 @@ RUN apt-get update && apt-get install -y \
     cron \
     && rm -rf /var/lib/apt/lists/*
 
-# Install kubectl for service updater sidecar
+# Install kubectl for the service-updater sidecar (repmgrd mode). Pinned version
+# (matches client-go's API minor) + checksum verification -- no floating stable.txt.
+ARG KUBECTL_VERSION=v1.31.3
 RUN ARCH=$(dpkg --print-architecture) && \
-    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${ARCH}/kubectl" && \
+    curl -fsSLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" && \
+    curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl.sha256" -o kubectl.sha256 && \
+    echo "$(cat kubectl.sha256)  kubectl" | sha256sum -c - && \
     chmod +x kubectl && \
-    mv kubectl /usr/local/bin/
+    mv kubectl /usr/local/bin/ && \
+    rm kubectl.sha256
 
 # Create repmgr user and directories
 RUN useradd -r -s /bin/bash repmgr && \

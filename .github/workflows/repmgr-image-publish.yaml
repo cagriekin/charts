@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # keyless cosign signing via the GitHub OIDC token
 
 jobs:
   build-and-publish:
@@ -56,11 +57,22 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: images/repmgr
           push: true
           platforms: linux/amd64,linux/arm64
           tags: cagriekin/repmgr:${{ steps.meta.outputs.tag }}
+          sbom: true
+          provenance: mode=max
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the image (keyless, OIDC)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "cagriekin/repmgr@${DIGEST}"
