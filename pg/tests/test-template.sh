@@ -851,6 +851,21 @@ assert_contains "bundled etcd: agent auto-targets the bundled client Service" "$
 agent_byo_nobundle=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set 'repmgr.agent.dcs.backend=etcd' --set 'repmgr.agent.dcs.etcd.endpoints={https://e:2379}' 2>&1)
 assert_not_contains "bundled etcd: not rendered when etcd.enabled=false (BYO)" "${agent_byo_nobundle}" "test-pg-etcd-headless"
+# bundled etcd ships an ingress NetworkPolicy (plaintext etcd must not be open
+# namespace-wide): agent (postgresql) on the client port + the peer mesh, default on.
+agent_etcd_np2=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'repmgr.agent.dcs.backend=etcd' --set 'etcd.enabled=true' \
+  --show-only charts/etcd/templates/networkpolicy.yaml 2>&1)
+assert_contains "bundled etcd: ships an ingress NetworkPolicy" "${agent_etcd_np2}" "kind: NetworkPolicy"
+assert_contains "bundled etcd: NP admits the agent (postgresql) on the client port" "${agent_etcd_np2}" "app.kubernetes.io/component: postgresql"
+# fail-fast on contradictory etcd config (bundled deployed but unused)
+etcd_orphan_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" --set 'etcd.enabled=true' >/dev/null 2>&1 || etcd_orphan_rc=$?
+assert_eq "bundled etcd: enabled without the etcd backend fails fast" "1" "$([ "${etcd_orphan_rc}" -ne 0 ] && echo 1 || echo 0)"
+etcd_both_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'repmgr.agent.dcs.backend=etcd' --set 'etcd.enabled=true' --set 'repmgr.agent.dcs.etcd.endpoints={https://e:2379}' >/dev/null 2>&1 || etcd_both_rc=$?
+assert_eq "bundled etcd: enabled + external endpoints fails fast" "1" "$([ "${etcd_both_rc}" -ne 0 ] && echo 1 || echo 0)"
 
 # regression: default (no failoverMode) still renders repmgrd + service-updater
 default_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \

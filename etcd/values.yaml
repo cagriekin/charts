@@ -29,6 +29,12 @@ resources:
     memory: 512Mi
 
 persistence:
+  # NOTE: the hardened securityContext below runs etcd as uid 1000 with a read-only
+  # root filesystem, so the data PVC is the only writable path. fsGroup (in
+  # podSecurityContext) makes a freshly-provisioned PVC group-writable by that uid;
+  # a CSI driver that IGNORES fsGroup (some NFS/hostPath provisioners) will leave the
+  # PVC root-owned and etcd will crashloop ("cannot access data directory"). Use a
+  # CSI driver that honors fsGroup, or relax the securityContext for such drivers.
   enabled: true
   size: 2Gi
   storageClass: ""
@@ -39,11 +45,24 @@ podDisruptionBudget:
   enabled: true
   maxUnavailable: 1
 
-# Spread the members across nodes/zones so one node loss cannot break quorum.
+# Spread the members across nodes so one node loss cannot break quorum. Empty here
+# means the StatefulSet emits a DEFAULT soft (ScheduleAnyway) hostname spread, so
+# members prefer distinct nodes but still schedule on a single-node/kind cluster.
+# Set this to override (e.g. a hard zone spread with whenUnsatisfiable: DoNotSchedule).
 topologySpreadConstraints: []
 affinity: {}
 nodeSelector: {}
 tolerations: []
+
+# Ingress NetworkPolicy for the etcd pods. Bundled etcd runs PLAINTEXT, so without
+# this any pod in the namespace could read/rewrite the leadership keyspace. Default
+# on; takes effect only on a NetworkPolicy-enforcing CNI. Allows the etcd peer mesh
+# and the agent (the parent's postgresql pods, this release) on the client port.
+networkPolicy:
+  enabled: true
+  # Extra ingress rules to the client port (e.g. a Prometheus scrape of etcd
+  # metrics, or an external etcdctl). Standard NetworkPolicy ingress entries.
+  extraIngress: []
 
 # Hardened by default, matching the parent chart (runAsNonRoot, drop ALL caps).
 podSecurityContext:

@@ -40,10 +40,20 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.topologySpreadConstraints }}
       topologySpreadConstraints:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- if .Values.topologySpreadConstraints }}
+        {{- toYaml .Values.topologySpreadConstraints | nindent 8 }}
+        {{- else }}
+        {{- /* Default: prefer one member per node (soft, so a single-node/kind cluster
+               still schedules all three) -- an empty default would let all members
+               land on one node and a single node loss would break quorum. */}}
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "etcd.selectorLabels" . | nindent 14 }}
+        {{- end }}
       containers:
         - name: etcd
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
