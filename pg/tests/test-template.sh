@@ -809,6 +809,37 @@ agent_pr_repmgrd=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values
   --set repmgr.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1 || true)
 assert_not_contains "agent monitoring: PrometheusRule not in repmgrd mode" "${agent_pr_repmgrd}" "kind: PrometheusRule"
 
+# agent etcd DCS (BYO/shared): backend selectable; etcd env + TLS mount, the leases
+# RBAC dropped, NetworkPolicy egress to 2379; the default kubernetes backend is
+# unaffected; missing endpoints fails fast.
+agent_etcd=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'repmgr.agent.dcs.backend=etcd' \
+  --set 'repmgr.agent.dcs.etcd.endpoints={https://e1:2379,https://e2:2379}' \
+  --set 'repmgr.agent.dcs.etcd.tls.secretName=etcd-tls' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "agent etcd: DCS_BACKEND=etcd" "${agent_etcd}" 'value: "etcd"'
+assert_contains "agent etcd: endpoints joined into ETCD_ENDPOINTS" "${agent_etcd}" "https://e1:2379,https://e2:2379"
+assert_contains "agent etcd: ETCD_PREFIX defaulted to /pg-ha/<release>/" "${agent_etcd}" "/pg-ha/test-pg/"
+assert_contains "agent etcd: TLS cert path env" "${agent_etcd}" "/etc/etcd-tls/tls.crt"
+assert_contains "agent etcd: TLS secret mounted" "${agent_etcd}" 'secretName: "etcd-tls"'
+agent_k8s_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "agent k8s: DCS_BACKEND=kubernetes (default)" "${agent_k8s_sts}" 'value: "kubernetes"'
+assert_not_contains "agent k8s: no etcd env in kubernetes mode" "${agent_k8s_sts}" "ETCD_ENDPOINTS"
+agent_etcd_rbac=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'repmgr.agent.dcs.backend=etcd' --set 'repmgr.agent.dcs.etcd.endpoints={https://e1:2379}' \
+  --show-only templates/rbac.yaml 2>&1)
+assert_not_contains "agent etcd: leases RBAC dropped (leadership not in apiserver)" "${agent_etcd_rbac}" "coordination.k8s.io"
+assert_contains "agent k8s: leases RBAC present (default backend)" "${agent_rbac}" "coordination.k8s.io"
+agent_etcd_np=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'repmgr.agent.dcs.backend=etcd' --set 'repmgr.agent.dcs.etcd.endpoints={https://e1:2379}' \
+  --set networkPolicy.enabled=true --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "agent etcd: NetworkPolicy egress to etcd 2379" "${agent_etcd_np}" "port: 2379"
+etcd_noeps_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'repmgr.agent.dcs.backend=etcd' --show-only templates/statefulset.yaml >/dev/null 2>&1 || etcd_noeps_rc=$?
+assert_eq "agent etcd: missing endpoints fails fast" "1" "$([ "${etcd_noeps_rc}" -ne 0 ] && echo 1 || echo 0)"
+
 # regression: default (no failoverMode) still renders repmgrd + service-updater
 default_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/statefulset.yaml 2>&1)

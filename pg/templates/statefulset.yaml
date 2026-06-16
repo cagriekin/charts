@@ -336,7 +336,23 @@ spec:
             - name: POD_SELECTOR
               value: app.kubernetes.io/name={{ include "pg.name" . }},app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=postgresql
             - name: DCS_BACKEND
-              value: kubernetes
+              value: {{ (.Values.repmgr.agent.dcs).backend | default "kubernetes" | quote }}
+{{- if eq (include "pg.agentEtcdMode" .) "true" }}
+            {{- $etcd := required "repmgr.agent.dcs.etcd is required when dcs.backend=etcd" .Values.repmgr.agent.dcs.etcd }}
+            {{- if not $etcd.endpoints }}{{ fail "repmgr.agent.dcs.etcd.endpoints is required when dcs.backend=etcd (BYO/shared etcd; a bundled subchart is a later option)" }}{{ end }}
+            - name: ETCD_ENDPOINTS
+              value: {{ $etcd.endpoints | join "," | quote }}
+            - name: ETCD_PREFIX
+              value: {{ $etcd.prefix | default (printf "/pg-ha/%s/" .Release.Name) | quote }}
+{{- if (($etcd.tls).secretName) }}
+            - name: ETCD_TLS_CERT
+              value: /etc/etcd-tls/tls.crt
+            - name: ETCD_TLS_KEY
+              value: /etc/etcd-tls/tls.key
+            - name: ETCD_TLS_CA
+              value: /etc/etcd-tls/ca.crt
+{{- end }}
+{{- end }}
             - name: SPLIT_BRAIN_ACTION
               value: {{ .Values.repmgr.splitBrainDetection.action | quote }}
 {{- end }}
@@ -636,6 +652,11 @@ spec:
             - name: repmgr-config
               mountPath: /etc/repmgr
 {{- end }}
+{{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.repmgr.agent.dcs.etcd).tls).secretName) }}
+            - name: etcd-tls
+              mountPath: /etc/etcd-tls
+              readOnly: true
+{{- end }}
 {{- if eq (include "pg.repmgrdMode" .) "true" }}
         - name: repmgrd
           image: "{{ .Values.repmgr.image.repository }}:{{ .Values.repmgr.image.tag }}"
@@ -873,6 +894,12 @@ spec:
 {{- if .Values.repmgr.enabled }}
         - name: repmgr-config
           emptyDir: {}
+{{- end }}
+{{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.repmgr.agent.dcs.etcd).tls).secretName) }}
+        - name: etcd-tls
+          secret:
+            secretName: {{ .Values.repmgr.agent.dcs.etcd.tls.secretName | quote }}
+            defaultMode: 0400
 {{- end }}
 {{- if eq (include "pg.repmgrdMode" .) "true" }}
         - name: service-updater-script

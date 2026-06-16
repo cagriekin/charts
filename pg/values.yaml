@@ -156,6 +156,24 @@ repmgr:
     renewDeadline: 10s
     retryPeriod: 2s
     reconcileInterval: 5s
+    # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
+    # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane
+    # outage no longer self-demotes the primary (only an etcd quorum loss does);
+    # routing still needs the apiserver but only at failover time. With etcd,
+    # leaseDuration must be >= 5s (the etcd lease TTL is whole seconds).
+    dcs:
+      backend: kubernetes # kubernetes | etcd
+      etcd:
+        # BYO/shared etcd: point at an existing cluster (recommended when running
+        # several databases -- one platform etcd, ~0 marginal cost per DB). A bundled
+        # etcd subchart is a separate, later option.
+        endpoints: [] # e.g. ["https://etcd-0.etcd:2379","https://etcd-1.etcd:2379"]
+        # Election key prefix; defaults to /pg-ha/<release>/ when empty.
+        prefix: ""
+        tls:
+          # Optional mutual TLS. Set to a Secret with keys tls.crt, tls.key, ca.crt
+          # (the cert-manager / kubernetes.io/tls convention); empty = plaintext.
+          secretName: ""
     # RESERVED (not yet active in v1): the pod-network CIDR the agent will trust in
     # the hardened (SCRAM-only) pg_hba once the agent owns pg_hba assembly. In v1
     # pg_hba is still managed by the image/postStart path, so this value is not

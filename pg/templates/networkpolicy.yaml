@@ -118,6 +118,16 @@ port 443 is not enough.
           protocol: TCP
 {{- end }}
 {{- end }}
+{{- if eq (include "pg.agentEtcdMode" .) "true" }}
+{{- /*
+The agent's etcd DCS client dials the (BYO/shared) etcd endpoints on the client
+port 2379. Endpoints are arbitrary external hosts, so this opens egress to 2379
+cluster-wide (the same unrestricted-port shape as the 443/6443 apiserver rule).
+*/}}
+    - ports:
+        - port: 2379
+          protocol: TCP
+{{- end }}
 {{- with .Values.networkPolicy.postgresql.extraEgress }}
     {{- toYaml . | nindent 4 }}
 {{- end }}
