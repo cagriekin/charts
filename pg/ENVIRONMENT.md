@@ -44,12 +44,30 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `RECONCILE_INTERVAL` | duration | yes | `repmgr.agent.reconcileInterval` (5s) | agent (tick) |
 | `MASTER_SERVICE` | string | yes | `<fullname>` (write Service whose selector the agent patches) | agent |
 | `POD_SELECTOR` | string | yes | chart selector labels + `component=postgresql` | agent (pg-role labeling) |
-| `DCS_BACKEND` | enum | yes | `kubernetes` (`etcd` planned) | agent |
+| `DCS_BACKEND` | enum | yes | `repmgr.agent.dcs.backend` (`kubernetes`/`etcd`) | agent (leadership store) |
 | `SPLIT_BRAIN_ACTION` | enum | yes | `repmgr.splitBrainDetection.action` (`log`/`fence`) | agent |
 
 Lease timings must satisfy `LEASE_DURATION > RENEW_DEADLINE > RETRY_PERIOD`
 (validated at boot). The agent also writes a `0600 ~/.pgpass` from `REPMGR_*` so a
 passwordless `primary_conninfo` can authenticate streaming replication.
+
+### etcd backend only (`repmgr.agent.dcs.backend=etcd`)
+
+Required only when the leadership store is etcd; `config.Load` fail-fasts on a
+missing endpoint/prefix in that mode. With the bundled etcd subchart
+(`etcd.enabled=true`) the chart fills `ETCD_ENDPOINTS` automatically.
+
+| Variable | Type | Required | Default / source | Consumer |
+|----------|------|----------|------------------|----------|
+| `ETCD_ENDPOINTS` | csv | yes (etcd) | `repmgr.agent.dcs.etcd.endpoints`, or the bundled `<release>-etcd:2379` | agent (etcd client) |
+| `ETCD_PREFIX` | string | yes (etcd) | `repmgr.agent.dcs.etcd.prefix` or `/pg-ha/<release>/` | agent (election key prefix) |
+| `ETCD_TLS_CERT` | path | no | `/etc/etcd-tls/tls.crt` when `dcs.etcd.tls.secretName` set | agent (mutual TLS) |
+| `ETCD_TLS_KEY` | path | no | `/etc/etcd-tls/tls.key` when `dcs.etcd.tls.secretName` set | agent (mutual TLS) |
+| `ETCD_TLS_CA` | path | no | `/etc/etcd-tls/ca.crt` when `dcs.etcd.tls.secretName` set | agent (mutual TLS) |
+
+`LEASE_DURATION` must be `>= 5s` in etcd mode (the etcd lease TTL is whole
+seconds). TLS env is all-or-none; the secret must carry `tls.crt`, `tls.key`, and
+`ca.crt`.
 
 ## repmgrd mode only (`repmgr.failoverMode=repmgrd`, the default)
 
