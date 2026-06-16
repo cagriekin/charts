@@ -297,8 +297,10 @@ repmgr:
         endpoints: ["https://etcd-0.etcd:2379", "https://etcd-1.etcd:2379"]
         prefix: ""                # defaults to /pg-ha/<release>/
         tls:
-          secretName: etcd-client-tls   # optional mutual TLS (keys: tls.crt, tls.key, ca.crt)
+          secretName: etcd-client-tls   # optional mutual TLS; Secret must carry tls.crt, tls.key, AND ca.crt
 ```
+
+The TLS secret must contain all three keys (`tls.crt`, `tls.key`, `ca.crt`). cert-manager `Certificate` secrets include `ca.crt`, but a plain `kubectl create secret tls` does **not** — add `ca.crt` explicitly, or the agent fails fast at startup (it reads all three).
 
 With etcd, a Kubernetes control-plane outage no longer demotes the primary — only an etcd quorum loss does (so etcd must be operated for HA). Failover-time **routing** (the write-Service selector patch) still uses the apiserver, but during a no-failover outage kube-proxy holds the last endpoints. The chart drops the `coordination.k8s.io/leases` RBAC grant and opens egress to etcd `:2379` automatically in this mode. Pick the backend at install time; switching it on a live cluster is a controlled re-election (treat like a planned failover). A bundled etcd subchart (for self-contained installs that have no etcd) is a separate, later option — for now this is the **BYO/shared-etcd** path, recommended when running several databases against one platform etcd.
 
