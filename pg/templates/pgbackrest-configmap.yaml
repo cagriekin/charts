@@ -1,4 +1,7 @@
 {{- if .Values.pgbackrest.enabled }}
+{{- if not (has .Values.pgbackrest.s3.keyType (list "shared" "auto")) }}
+{{- fail "pgbackrest.s3.keyType must be 'shared' (static access/secret key) or 'auto' (cloud workload identity / instance credential chain)" }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -14,6 +17,7 @@ data:
   pgbackrest.conf: |
     [global]
     repo1-type=s3
+    repo1-s3-key-type={{ .Values.pgbackrest.s3.keyType }}
     repo1-s3-endpoint={{ required "pgbackrest.s3.endpoint is required" .Values.pgbackrest.s3.endpoint }}
     repo1-s3-bucket={{ required "pgbackrest.s3.bucket is required" .Values.pgbackrest.s3.bucket }}
     repo1-s3-region={{ .Values.pgbackrest.s3.region }}

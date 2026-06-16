@@ -391,16 +391,18 @@ spec:
               value: "true"
             - name: PGBACKREST_STANZA
               value: {{ .Values.pgbackrest.stanza }}
+{{- if eq .Values.pgbackrest.s3.keyType "shared" }}
             - name: PGBACKREST_REPO1_S3_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ required "pgbackrest.existingSecret.name is required" .Values.pgbackrest.existingSecret.name }}
+                  name: {{ required "pgbackrest.existingSecret.name is required (pgbackrest.s3.keyType=shared); use keyType=auto for cloud workload identity" .Values.pgbackrest.existingSecret.name }}
                   key: {{ .Values.pgbackrest.existingSecret.accessKeyIdKey }}
             - name: PGBACKREST_REPO1_S3_KEY_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.pgbackrest.existingSecret.name }}
                   key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
+{{- end }}
 {{- end }}
 {{- if not .Values.repmgr.enabled }}
           lifecycle:
@@ -885,6 +887,7 @@ spec:
           env:
             - name: PGBACKREST_STANZA
               value: {{ .Values.pgbackrest.stanza }}
+{{- if eq .Values.pgbackrest.s3.keyType "shared" }}
             - name: PGBACKREST_REPO1_S3_KEY
               valueFrom:
                 secretKeyRef:
@@ -895,6 +898,7 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.pgbackrest.existingSecret.name }}
                   key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
+{{- end }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data

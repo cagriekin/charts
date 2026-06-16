@@ -89,6 +89,15 @@ postgresql:
 
   podAnnotations: {}
 
+  # Annotations for the postgresql pods' ServiceAccount (<fullname>-repmgr), the
+  # identity pgbackrest uses to reach S3. Set a cloud workload-identity annotation
+  # here for keyless backups (pair with pgbackrest.s3.keyType: auto, no static
+  # existingSecret needed):
+  #   IRSA (EKS): eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/<role>
+  #   WI  (GKE):  iam.gke.io/gcp-service-account: <gsa>@<project>.iam.gserviceaccount.com
+  serviceAccount:
+    annotations: {}
+
   podDisruptionBudget:
     enabled: true
     # maxUnavailable (not minAvailable) so a drain / rolling upgrade / autoscaler
@@ -450,6 +459,11 @@ pgbackrest:
     bucket: ""
     region: "us-east-1"
     prefix: "pgbackrest"
+    # shared = static access/secret key from existingSecret (default).
+    # auto    = cloud workload identity / instance credential chain (IRSA, GKE WI,
+    #           EC2 instance profile); no existingSecret -- annotate the pod SA via
+    #           postgresql.serviceAccount.annotations instead.
+    keyType: shared
 
   existingSecret:
     name: ""
