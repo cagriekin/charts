@@ -69,16 +69,19 @@ func TestDecide(t *testing.T) {
 		{"holder + primary-state stopped + at highwater -> start", Observation{HoldLease: true, Local: dataStopped, Marker: MarkerState{Present: true, Timeline: tl(5)}}, StartLocal, ""},
 		// Holder, standby-state data stopped: start as a standby (promotes a later tick).
 		{"holder + standby-state stopped -> start", Observation{HoldLease: true, Local: dataStoppedStandby}, StartLocal, ""},
-		// Non-holder, primary-state data stopped, no rejoin target: start READ-ONLY in
-		// recovery mode so its true position is observable (never read-write).
-		{"not holder + primary-state stopped + no primary -> recovery", Observation{HoldLease: false, Local: dataStopped}, StartRecovery, ""},
+		// Non-holder, primary-state stopped, ANOTHER node holds the lease (cold-boot
+		// election): come up READ-ONLY in recovery mode so its true position is observable.
+		{"not holder + primary-state stopped + a leader exists -> recovery", Observation{HoldLease: false, Local: dataStopped, LeaderIdentity: "pg-2"}, StartRecovery, ""},
+		// Non-holder, primary-state stopped, NO leader yet (lease settling): wait to acquire,
+		// never recovery mode -- a fresh/sole master has no repmgr record to promote back out.
+		{"not holder + primary-state stopped + no leader -> wait", Observation{HoldLease: false, Local: dataStopped}, Wait, ""},
 		// Non-holder, primary-state data stopped, a same-timeline primary exists: rejoin it as a standby.
 		{"not holder + primary-state stopped + same-tl primary -> rejoin", Observation{HoldLease: false, Local: dataStopped, Peers: []PeerState{primary("pg-1", 5, 5, 0x200)}}, RejoinForward, "pg-1"},
 		// Non-holder, standby-state data stopped: start as a standby.
 		{"not holder + standby-state stopped -> start", Observation{HoldLease: false, Local: dataStoppedStandby}, StartLocal, ""},
-		// A stale primary on a LOWER timeline is never a rejoin source (forward-only, invariant 5):
-		// start read-only in recovery mode instead (observable, not read-write).
-		{"not holder + primary-state stopped + lower-tl primary -> recovery", Observation{HoldLease: false, Local: dataStopped, Peers: []PeerState{primary("pg-1", 4, 4, 0x10)}}, StartRecovery, ""},
+		// A stale primary on a LOWER timeline is never a rejoin source (forward-only, invariant 5);
+		// with a leader present it comes up read-only in recovery mode for the election.
+		{"not holder + primary-state stopped + lower-tl primary + leader -> recovery", Observation{HoldLease: false, Local: dataStopped, LeaderIdentity: "pg-2", Peers: []PeerState{primary("pg-1", 4, 4, 0x10)}}, StartRecovery, ""},
 
 		// --- self-health (LocalStuck): a wedged primary fails over / restarts ---
 		// Holder, primary stuck unhealthy, a standby exists: release the lease for failover.

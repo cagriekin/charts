@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -77,6 +78,11 @@ type agent struct {
 	// lifetime. Once all have, the cold-boot wait never applies again -- so a
 	// steady-state failover is not delayed by a recent agent/pod restart.
 	peersSeen map[string]bool
+	// followUpstream is the leader this standby is currently registered/configured
+	// to follow, so repmgr standby follow (which reconfigures and can restart the
+	// server) runs only when the upstream actually changes, not every tick. Reset
+	// on any non-Follow action.
+	followUpstream string
 
 	// gossip publish state: skip re-patching the pod annotation when the position
 	// is unchanged, refreshing only on change or a heartbeat (to keep it fresh).
@@ -196,6 +202,13 @@ func (a *agent) boot(ctx context.Context) error {
 		ReplDB:   a.cfg.RepmgrDB,
 	}
 	if err := a.mech.GenerateConfig(ctx, nid, mechanism.ConfigOpts{Failover: "manual", UseReplicationSlots: true}); err != nil {
+		return err
+	}
+	// Streaming replication authenticates as the repmgr user via primary_conninfo,
+	// which is deliberately passwordless (the password is not stored in repmgr.conf
+	// -- the PR1 hardening). Without a credential the standby's walreceiver fails
+	// with "no password supplied", so write a 0600 ~/.pgpass libpq picks up.
+	if err := a.writePgpass(); err != nil {
 		return err
 	}
 	if !process.HasData(a.cfg.PGDATA) {
@@ -326,11 +339,21 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		}
 	}
 	allSeen := len(a.peersSeen) >= len(o.Peers)
-	o.PeersPending = anyUnreachable && !allSeen && time.Since(a.bootAt) < a.bootstrapGrace()
+	// Only wait when a prior cluster existed (the marker records a past primary's
+	// highwater) -- that is the cold-boot most-advanced election PeersPending guards.
+	// At a FRESH install there is no marker and no election to wait for, so the sole
+	// primary must not stall the ~grace waiting for a standby that is still cloning
+	// FROM it (which would deadlock-by-delay the bootstrap).
+	o.PeersPending = o.Marker.Present && anyUnreachable && !allSeen && time.Since(a.bootAt) < a.bootstrapGrace()
 	return o
 }
 
 func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.Observation) error {
+	// Any action other than Follow changes (or ends) this node's standby identity, so
+	// the next Follow must re-register + repoint.
+	if dec.Action != reconcile.Follow {
+		a.followUpstream = ""
+	}
 	switch dec.Action {
 	case reconcile.Promote:
 		// The node is already running as a standby (the reconcile guard); promote
@@ -349,13 +372,41 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		return a.assertPrimaryRouting(ctx, obs)
 
 	case reconcile.StayPrimary:
+		// Register this primary in repmgr.nodes. In agent mode there is no repmgrd
+		// sidecar to do it, and a fresh primary comes up via StartLocal (never
+		// Promote), so without this repmgr.nodes stays empty and a standby's
+		// init-clone (which waits for a registered primary) hangs forever. The
+		// command is idempotent (--force) and self-healing; the standby clone needs
+		// only that the primary is registered, so a best-effort per-tick reconcile is
+		// fine (it succeeds within a tick or two of the primary opening).
+		if err := a.mech.RegisterPrimary(ctx); err != nil {
+			a.log.Warn("register primary in repmgr.nodes", "err", err)
+		}
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(ctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
 		return a.assertPrimaryRouting(ctx, obs)
 
 	case reconcile.Follow:
-		return a.mech.Follow(ctx, nodeID(dec.Target))
+		// Ensure this standby has a repmgr.nodes record. In agent mode no repmgrd
+		// sidecar registers it, and without the record BOTH repmgr standby follow and
+		// a later promote fail ("unable to retrieve node record"). Registration must
+		// happen while the upstream primary is reachable (now, before any failover),
+		// so register here. Then repoint only when the upstream actually changes --
+		// repmgr standby follow reconfigures and can restart the server, so running it
+		// every tick on a healthy standby would churn it.
+		if a.followUpstream == dec.Target {
+			return nil
+		}
+		up := nodeID(dec.Target)
+		if err := a.mech.RegisterStandby(ctx, up); err != nil {
+			a.log.Warn("register standby in repmgr.nodes", "err", err)
+		}
+		if err := a.mech.Follow(ctx, up); err != nil {
+			return err
+		}
+		a.followUpstream = dec.Target
+		return nil
 
 	case reconcile.DemoteFence:
 		a.metr.IncDemote()
@@ -435,6 +486,35 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// without passing the holdership/highwater guard (fresh-node initdb is done by
 		// the entrypoint before the agent starts).
 		return nil
+	}
+	return nil
+}
+
+// pgpassPath is the postgres user's home in the repmgr image; written/owned by the
+// postgres uid the agent runs as. Fixed (not $HOME) because after gosu the agent
+// may inherit root's HOME, which postgres cannot write.
+const pgpassPath = "/var/lib/postgresql/.pgpass"
+
+// writePgpass writes a 0600 .pgpass with the repmgr replication credential so a
+// passwordless primary_conninfo (the password is kept out of repmgr.conf -- the
+// PR1 hardening) can still authenticate streaming replication. It also exports
+// PGPASSFILE so the walreceiver child (and the agent's repmgr shells) find it
+// regardless of HOME. Rewritten every boot; the home is ephemeral so the secret
+// never persists on a volume. The wildcard host/port/db entry matches both
+// replication and regular connections.
+func (a *agent) writePgpass() error {
+	// Escape '\' then ':' per the .pgpass format so a credential containing them
+	// round-trips.
+	esc := func(s string) string {
+		s = strings.ReplaceAll(s, `\`, `\\`)
+		return strings.ReplaceAll(s, `:`, `\:`)
+	}
+	line := fmt.Sprintf("*:*:*:%s:%s\n", esc(a.cfg.RepmgrUser), esc(a.cfg.RepmgrPassword))
+	if err := os.WriteFile(pgpassPath, []byte(line), 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", pgpassPath, err)
+	}
+	if err := os.Setenv("PGPASSFILE", pgpassPath); err != nil {
+		return fmt.Errorf("set PGPASSFILE: %w", err)
 	}
 	return nil
 }
