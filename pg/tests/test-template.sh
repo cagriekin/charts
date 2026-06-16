@@ -856,6 +856,7 @@ assert_contains "bundled etcd: subchart StatefulSet renders" "${agent_bundled}" 
 assert_contains "bundled etcd: 3-member static initial-cluster" "${agent_bundled}" "test-pg-etcd-2=http://test-pg-etcd-2"
 assert_contains "bundled etcd: Parallel pod management for static bootstrap" "${agent_bundled}" "podManagementPolicy: Parallel"
 assert_contains "bundled etcd: agent auto-targets the bundled client Service" "${agent_bundled}" 'value: "http://test-pg-etcd:2379"'
+assert_contains "bundled etcd: image is digest-pinned" "${agent_bundled}" "quay.io/coreos/etcd:v3.5.16@sha256:"
 agent_byo_nobundle=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set 'repmgr.agent.dcs.backend=etcd' --set 'repmgr.agent.dcs.etcd.endpoints={https://e:2379}' 2>&1)
 assert_not_contains "bundled etcd: not rendered when etcd.enabled=false (BYO)" "${agent_byo_nobundle}" "test-pg-etcd-headless"
