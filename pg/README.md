@@ -244,6 +244,19 @@ kubectl get endpoints <release>-pg -n <ns>                                      
 
 GitOps/ArgoCD: the Lease, the primary-marker ConfigMap, and the write-Service `.spec.selector` are runtime-owned by the agent — `ignoreDifferences` on the Service selector and do not prune the Lease/marker, or auto-sync will fight the agent. Set `postgresql.existingSecret.enabled=true` (the `lookup`-based password generation returns nil under ArgoCD).
 
+### Maintenance mode (pause) — agent mode
+
+For planned work that would otherwise trigger an unwanted failover (a deliberate primary restart, a node drain, a PostgreSQL minor-version restart), put the agent in **maintenance mode**: it keeps renewing the Lease and serving, but suspends all automatic promote / demote / fence / self-health actions (it only observes). Toggle it with an annotation on the primary-marker ConfigMap:
+
+```bash
+# Pause (before the planned operation):
+kubectl annotate configmap <release>-pg-primary -n <ns> pg-ha/pause=true --overwrite
+# Resume (after):
+kubectl annotate configmap <release>-pg-primary -n <ns> pg-ha/pause-
+```
+
+While paused, `pg_ha_agent_is_paused` reads `1`. Pausing does not stop the cluster from serving — it only stops the agent from reacting to faults, so a genuine failure during the window will NOT fail over until you resume.
+
 > Agent mode is opt-in and validated by the chart's live failover suite (graceful failover: a standby promotes, the write Service repoints, the ex-primary rejoins read-only). See `ENVIRONMENT.md` for the full injected-variable catalog.
 
 ### PGPool-II Parameters

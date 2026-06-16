@@ -4,11 +4,20 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// PauseAnnotation, when set to "true" on the marker ConfigMap, puts the agent in
+// maintenance mode (Part H1): it keeps renewing the Lease and serving but suspends
+// automatic promote/demote/fence/self-health. An annotation (not a Data key) is
+// used so it survives WriteMarker, which rewrites only the ConfigMap's Data. Toggle
+// with `kubectl annotate configmap <fullname>-primary pg-ha/pause=true` (and
+// `pg-ha/pause-` to resume).
+const PauseAnnotation = "pg-ha/pause"
 
 // Marker is the durable highwater primary marker (<fullname>-primary ConfigMap):
 // the highest-timeline primary ever recorded, so a node booting first under
@@ -21,6 +30,7 @@ type Marker struct {
 	Primary    string
 	Timeline   uint32
 	TimelineOK bool
+	Paused     bool // maintenance mode: PauseAnnotation == "true" on the ConfigMap
 }
 
 // ReadMarker reads the marker ConfigMap. A missing marker is Present=false (not an
@@ -33,7 +43,7 @@ func (c *Client) ReadMarker(ctx context.Context, name string) (Marker, error) {
 	if err != nil {
 		return Marker{}, fmt.Errorf("get marker %s: %w", name, err)
 	}
-	m := Marker{Present: true, Primary: cm.Data["primary"]}
+	m := Marker{Present: true, Primary: cm.Data["primary"], Paused: strings.EqualFold(strings.TrimSpace(cm.Annotations[PauseAnnotation]), "true")}
 	tlStr, ok := cm.Data["timeline"]
 	if !ok || tlStr == "" {
 		m.Malformed = true
