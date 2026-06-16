@@ -11,6 +11,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// SchemaVersion is the version of the data the agent writes to the DCS (the marker
+// ConfigMap and the gossip pod-status). It is stamped on writes and checked on
+// reads so a rolling agent upgrade -- which transiently runs mixed versions -- can
+// detect an incompatible schema instead of silently misreading it (Part H4). v1
+// fields (marker primary/timeline, gossip tl/lsn) are stable; readers tolerate a
+// MISSING version (legacy data == v1) and ignore unknown fields, so the same minor
+// stays forward/backward-compatible. A future breaking change bumps this and the
+// older agent logs + degrades rather than corrupting state.
+const SchemaVersion = 1
+
 // PauseAnnotation, when set to "true" on the marker ConfigMap, puts the agent in
 // maintenance mode (Part H1): it keeps renewing the Lease and serving but suspends
 // automatic promote/demote/fence/self-health. An annotation (not a Data key) is
@@ -31,6 +41,10 @@ type Marker struct {
 	Timeline   uint32
 	TimelineOK bool
 	Paused     bool // maintenance mode: PauseAnnotation == "true" on the ConfigMap
+	// SchemaVersion is the on-DCS data version (absent/0 == legacy v1). A reader
+	// seeing a value above its own SchemaVersion is talking to a newer agent
+	// mid-upgrade (Part H4).
+	SchemaVersion int
 }
 
 // ReadMarker reads the marker ConfigMap. A missing marker is Present=false (not an
@@ -44,6 +58,9 @@ func (c *Client) ReadMarker(ctx context.Context, name string) (Marker, error) {
 		return Marker{}, fmt.Errorf("get marker %s: %w", name, err)
 	}
 	m := Marker{Present: true, Primary: cm.Data["primary"], Paused: strings.EqualFold(strings.TrimSpace(cm.Annotations[PauseAnnotation]), "true")}
+	if v, perr := strconv.Atoi(cm.Data["schemaVersion"]); perr == nil {
+		m.SchemaVersion = v
+	} // absent/unparseable -> 0 == legacy v1 (a repmgrd-mode service-updater marker)
 	tlStr, ok := cm.Data["timeline"]
 	if !ok || tlStr == "" {
 		m.Malformed = true
@@ -63,8 +80,9 @@ func (c *Client) ReadMarker(ctx context.Context, name string) (Marker, error) {
 // timeline is at least the recorded highwater).
 func (c *Client) WriteMarker(ctx context.Context, name, primary string, timeline uint32) error {
 	data := map[string]string{
-		"primary":  primary,
-		"timeline": strconv.FormatUint(uint64(timeline), 10),
+		"primary":       primary,
+		"timeline":      strconv.FormatUint(uint64(timeline), 10),
+		"schemaVersion": strconv.Itoa(SchemaVersion),
 	}
 	cms := c.cs.CoreV1().ConfigMaps(c.namespace)
 	cm, err := cms.Get(ctx, name, metav1.GetOptions{})

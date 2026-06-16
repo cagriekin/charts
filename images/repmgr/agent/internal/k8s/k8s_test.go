@@ -80,6 +80,9 @@ func TestMarkerReadWrite(t *testing.T) {
 	if err != nil || !m.Present || m.Primary != "pg-1" || !m.TimelineOK || m.Timeline != 7 {
 		t.Fatalf("read back: %+v err=%v", m, err)
 	}
+	if m.SchemaVersion != SchemaVersion {
+		t.Errorf("SchemaVersion = %d, want %d (stamped on write, Part H4)", m.SchemaVersion, SchemaVersion)
+	}
 	// Update advances it.
 	if err := c.WriteMarker(ctx, "pg-primary", "pg-0", 9); err != nil {
 		t.Fatal(err)
@@ -98,6 +101,19 @@ func TestMarkerMalformed(t *testing.T) {
 	m, err := c.ReadMarker(context.Background(), "pg-primary")
 	if err != nil || !m.Present || !m.Malformed || m.TimelineOK {
 		t.Errorf("malformed marker: %+v err=%v", m, err)
+	}
+}
+
+func TestMarkerLegacySchemaVersion(t *testing.T) {
+	// A marker written by the repmgrd-mode service-updater (or an older agent) has
+	// no schemaVersion key; it must read back as 0 (== legacy v1), not error.
+	cs := fake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "pg-primary", Namespace: ns},
+		Data:       map[string]string{"primary": "pg-0", "timeline": "3"},
+	})
+	m, err := NewWithClient(cs, ns).ReadMarker(context.Background(), "pg-primary")
+	if err != nil || !m.Present || m.SchemaVersion != 0 || !m.TimelineOK || m.Timeline != 3 {
+		t.Errorf("legacy marker: %+v err=%v", m, err)
 	}
 }
 

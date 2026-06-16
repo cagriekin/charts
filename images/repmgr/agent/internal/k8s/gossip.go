@@ -27,10 +27,16 @@ type NodeStatus struct {
 	LSNLo         uint64 `json:"lsnLo"`
 	LSNOK         bool   `json:"lsnOK"`
 	UpdatedAtUnix int64  `json:"ts"`
+	// SchemaVersion is the on-DCS data version (omitted/0 == legacy v1). Stamped on
+	// publish so a peer reading this can detect a newer agent mid-upgrade (Part H4).
+	SchemaVersion int `json:"v,omitempty"`
 }
 
 // PublishStatus merge-patches this node's status onto its own pod annotation.
 func (c *Client) PublishStatus(ctx context.Context, podName string, st NodeStatus) error {
+	if st.SchemaVersion == 0 {
+		st.SchemaVersion = SchemaVersion
+	}
 	b, err := json.Marshal(st)
 	if err != nil {
 		return fmt.Errorf("marshal status: %w", err)

@@ -313,6 +313,11 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	if err != nil {
 		a.log.Warn("read marker", "err", err)
 	}
+	if m.SchemaVersion > k8s.SchemaVersion {
+		// A newer agent (mid rolling-upgrade) wrote the marker. v1 fields are stable,
+		// so we read what we understand; this only flags the skew (Part H4).
+		a.log.Warn("marker written by a newer agent schema; reading known fields only", "markerSchema", m.SchemaVersion, "agentSchema", k8s.SchemaVersion)
+	}
 	o.Marker = reconcile.MarkerState{
 		Present:   m.Present,
 		Malformed: m.Malformed || (m.Present && !m.TimelineOK),

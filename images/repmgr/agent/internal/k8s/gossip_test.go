@@ -25,6 +25,7 @@ func TestPublishAndReadStatusRoundTrip(t *testing.T) {
 	if err := c.PublishStatus(ctx, "pg-1", want); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
+	want.SchemaVersion = SchemaVersion // PublishStatus stamps the current schema (Part H4)
 
 	// pg-0 reads peers (excludes itself); pg-1's status must round-trip.
 	got, err := c.ReadPeerStatuses(ctx, "app.kubernetes.io/component=postgresql", "pg-0")
