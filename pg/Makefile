@@ -4,7 +4,7 @@ TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-repmgr test-repmgr-chaos test-full test-failover test-upgrade \
-        test-repmgr-failover test-config test-config-repmgr test-backup-restore test-special-chars cluster-create cluster-delete cluster-exists clean help
+        test-repmgr-failover test-agent test-config test-config-repmgr test-backup-restore test-special-chars cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -16,6 +16,7 @@ help:
 	@echo "  test-repmgr-chaos - Run standby pod chaos restart regression test"
 	@echo "  test-full       - Run full install tests"
 	@echo "  test-failover   - Run failover tests (requires test-repmgr first)"
+	@echo "  test-agent      - Run lease-based agent install + failover tests"
 	@echo "  test-upgrade    - Run upgrade path tests"
 	@echo "  test-config     - Run postgresql configuration tests (standalone)"
 	@echo "  test-config-repmgr - Run postgresql configuration tests (repmgr)"
@@ -33,13 +34,19 @@ test-template:
 # Run independent suites in parallel with -j
 # test-repmgr-failover is sequential (repmgr then failover)
 # test-minimal, test-repmgr-failover, test-full, test-upgrade run in parallel
-test-cluster: test-minimal test-repmgr-failover test-repmgr-chaos test-full test-upgrade test-config test-config-repmgr test-backup-restore test-special-chars
+test-cluster: test-minimal test-repmgr-failover test-agent test-repmgr-chaos test-full test-upgrade test-config test-config-repmgr test-backup-restore test-special-chars
 	@echo "All test suites passed"
 
 # Chain: repmgr install -> failover test (must be sequential)
 test-repmgr-failover: cluster-exists
 	@bash $(TESTS_DIR)/test-repmgr.sh
 	@bash $(TESTS_DIR)/test-failover.sh
+
+# Chain: agent install -> agent failover test (must be sequential; the failover
+# suite reads the lease-elected primary/standby that the install suite records)
+test-agent: cluster-exists
+	@bash $(TESTS_DIR)/test-agent.sh
+	@bash $(TESTS_DIR)/test-agent-failover.sh
 
 cluster-exists:
 	@kind get clusters 2>/dev/null | grep -q "^$(CLUSTER_NAME)$$" || (echo "Cluster '$(CLUSTER_NAME)' not found. Run: make cluster-create" && exit 1)

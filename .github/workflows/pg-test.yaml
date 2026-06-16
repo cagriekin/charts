@@ -93,6 +93,9 @@ jobs:
       - name: Run repmgr and failover tests
         run: make -C pg test-repmgr-failover
 
+      - name: Run lease-based agent install + failover tests
+        run: make -C pg test-agent
+
       - name: Run repmgr chaos restart regression test
         run: make -C pg test-repmgr-chaos
 
