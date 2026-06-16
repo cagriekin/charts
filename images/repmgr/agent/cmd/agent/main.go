@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -88,6 +89,16 @@ type agent struct {
 	// the OnLost fence callback never drive the supervisor concurrently (single
 	// transition path; also avoids a concurrent-Stop deadlock).
 	opMu sync.Mutex
+
+	// servingRW is true while local Postgres is a read-write primary. The OnLost
+	// fence only demotes when this is set: a read-only standby that loses/releases
+	// leadership is not a writer, so shutting it down is needless churn -- and during
+	// a repmgrd->agent rolling migration a standby-agent that holds the lease but
+	// refuses to promote (equal-timeline with the still-repmgrd primary) would
+	// otherwise demote/restart-loop and never go Ready, deadlocking the roll. Set
+	// each tick from the observed role, and synchronously on promote (to close the
+	// window before the next tick); fail-safe is to demote on uncertainty.
+	servingRW atomic.Bool
 }
 
 // newDCS builds the leadership backend selected by DCS_BACKEND (validated to
@@ -168,15 +179,25 @@ func (a *agent) run() {
 		},
 		OnLost: func() {
 			a.metr.SetLeader(false)
-			a.metr.IncFence()
-			a.log.Warn("lost leadership; demoting (fence)")
 			a.opMu.Lock()
 			defer a.opMu.Unlock()
+			// Only a read-write primary needs fencing on lease loss (so a peer cannot
+			// promote into a second writer). A read-only standby is not a writer:
+			// shutting it down is needless churn and, during a repmgrd->agent rolling
+			// migration, would deadlock the roll (a standby-agent that holds the lease
+			// but refuses to promote against the still-repmgrd primary). Skip it.
+			if !a.servingRW.Load() {
+				a.log.Info("lost leadership while not read-write; no fence needed")
+				return
+			}
+			a.metr.IncFence()
+			a.log.Warn("lost leadership; demoting (fence)")
 			dctx, cancel := context.WithTimeout(context.Background(), a.cfg.RenewDeadline)
 			defer cancel()
 			if err := a.sup.Demote(dctx, true); err != nil {
 				a.log.Error("fence demote failed", "err", err)
 			}
+			a.servingRW.Store(false)
 		},
 	})
 
@@ -258,6 +279,12 @@ func (a *agent) boot(ctx context.Context) error {
 func (a *agent) tick(ctx context.Context) {
 	a.metr.Beat()
 	obs := a.observe(ctx)
+	// Track read-write role for the OnLost fence (a standby needs no fence). This is
+	// the pure writer-state (NOT lease-gated: the lease flips to lost before OnLost
+	// demotes, so gating on it could skip a real fence). Postgres stays read-write
+	// until demoted, so a tick during the loss window still sees RW -> fence fires.
+	// The Promote act also sets it synchronously, closing the promote->next-tick gap.
+	a.servingRW.Store(obs.Local.Running && !obs.Local.InRecovery)
 	a.publishStatus(ctx, obs.Local)
 	dec := reconcile.Decide(obs)
 	observe.Audit(a.log, obs.HoldLease, dec.Action.String(), dec.Target, dec.Reason)
@@ -412,6 +439,9 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			return err
 		}
 		a.metr.IncPromotion()
+		// Now read-write: arm the OnLost fence immediately (before the next tick's
+		// observation), so a lease loss right after promoting still fences.
+		a.servingRW.Store(true)
 		// After promotion the node is read-write. Bound ALL the post-promote
 		// bookkeeping -- repmgr register, the WAL re-probe, and the marker + routing
 		// apiserver writes -- under the fence budget, sharing one context so the total
