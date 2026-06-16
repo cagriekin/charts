@@ -96,7 +96,14 @@ jobs:
       - name: Run repmgr and failover tests
         run: make -C pg test-repmgr-failover
 
-      - name: Run lease-based agent install + failover tests
+      # AGENT_COLDBOOT=1 also exercises the full-cluster-restart recovery-mode path
+      # (StartRecovery + promote-from-recovery). It is opt-in for local runs (it is
+      # heavy and the local kind cluster degrades over repeated cycles) but must run
+      # in CI, which always uses a fresh cluster -- otherwise the cold-boot election
+      # is never automatically validated.
+      - name: Run lease-based agent install + failover tests (incl. cold boot)
+        env:
+          AGENT_COLDBOOT: "1"
         run: make -C pg test-agent
 
       - name: Run repmgr chaos restart regression test
