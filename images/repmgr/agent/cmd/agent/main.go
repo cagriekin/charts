@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -48,12 +49,6 @@ func main() {
 	}
 	log.Info("starting pg-ha-agent", "config", cfg.String())
 
-	if cfg.DCSBackend != "kubernetes" {
-		// etcd backend is a planned addition (plan Part G); only kubernetes ships now.
-		log.Error("unsupported DCS backend", "backend", cfg.DCSBackend)
-		os.Exit(1)
-	}
-
 	a, err := newAgent(cfg, log)
 	if err != nil {
 		log.Error("init", "err", err)
@@ -65,7 +60,7 @@ func main() {
 type agent struct {
 	cfg    *config.Config
 	log    *slog.Logger
-	dcs    *dcs.K8sDCS
+	dcs    dcs.DCS
 	kube   *k8s.Client
 	mech   *mechanism.Repmgr
 	sup    *process.Supervisor
@@ -95,14 +90,36 @@ type agent struct {
 	opMu sync.Mutex
 }
 
+// newDCS builds the leadership backend selected by DCS_BACKEND (validated to
+// kubernetes|etcd in config.Load). Both satisfy the same dcs.DCS interface, so the
+// reconcile loop is backend-agnostic.
+func newDCS(cfg *config.Config) (dcs.DCS, error) {
+	switch cfg.DCSBackend {
+	case "etcd":
+		return dcs.NewEtcdDCS(dcs.EtcdConfig{
+			Endpoints:   cfg.EtcdEndpoints,
+			Prefix:      cfg.EtcdPrefix,
+			TTLSeconds:  int(cfg.LeaseDuration.Seconds()),
+			RetryPeriod: cfg.RetryPeriod,
+			CertFile:    cfg.EtcdCertFile,
+			KeyFile:     cfg.EtcdKeyFile,
+			CAFile:      cfg.EtcdCAFile,
+		})
+	case "kubernetes":
+		return dcs.NewK8sDCS(dcs.K8sConfig{
+			Namespace:     cfg.Namespace,
+			LeaseName:     cfg.LeaseName,
+			LeaseDuration: cfg.LeaseDuration,
+			RenewDeadline: cfg.RenewDeadline,
+			RetryPeriod:   cfg.RetryPeriod,
+		})
+	default:
+		return nil, fmt.Errorf("unsupported DCS backend %q (want kubernetes|etcd)", cfg.DCSBackend)
+	}
+}
+
 func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
-	d, err := dcs.NewK8sDCS(dcs.K8sConfig{
-		Namespace:     cfg.Namespace,
-		LeaseName:     cfg.LeaseName,
-		LeaseDuration: cfg.LeaseDuration,
-		RenewDeadline: cfg.RenewDeadline,
-		RetryPeriod:   cfg.RetryPeriod,
-	})
+	d, err := newDCS(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -181,6 +198,11 @@ func (a *agent) run() {
 			_ = a.sup.Demote(sctx, false) // graceful (fast) on planned shutdown
 			a.opMu.Unlock()
 			cancel()
+			// Best-effort close of the DCS client (etcd holds a gRPC connection; the
+			// K8s backend has nothing to close).
+			if c, ok := a.dcs.(io.Closer); ok {
+				_ = c.Close()
+			}
 			return
 		case <-ticker.C:
 			a.tick(ctx)
