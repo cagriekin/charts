@@ -897,6 +897,14 @@ default_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repm
 assert_contains "agent regression: default still runs repmgrd" "${default_sts}" "name: repmgrd"
 assert_contains "agent regression: default still runs service-updater" "${default_sts}" "name: service-updater"
 
+# values.schema.json: enum guards reject typos at template/install time.
+schema_bad_mode_rc=0
+helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=bogus >/dev/null 2>&1 || schema_bad_mode_rc=$?
+assert_eq "schema: invalid failoverMode rejected" "1" "$([ "${schema_bad_mode_rc}" -ne 0 ] && echo 1 || echo 0)"
+schema_bad_dcs_rc=0
+helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=agent --set repmgr.agent.dcs.backend=zookeeper >/dev/null 2>&1 || schema_bad_dcs_rc=$?
+assert_eq "schema: invalid dcs.backend rejected" "1" "$([ "${schema_bad_dcs_rc}" -ne 0 ] && echo 1 || echo 0)"
+
 # rbac grants configmap access for the marker
 rbac_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/rbac.yaml 2>&1)
