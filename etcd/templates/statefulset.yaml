@@ -1,0 +1,126 @@
+{{- $full := include "etcd.fullname" . -}}
+{{- $headless := printf "%s-headless" $full -}}
+{{- $fqdnSuffix := printf "%s.%s.svc.%s" $headless .Release.Namespace .Values.clusterDomain -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $full }}
+  labels:
+    {{- include "etcd.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  serviceName: {{ $headless }}
+  replicas: {{ .Values.replicaCount }}
+  # Parallel: a fresh cluster bootstraps statically with all members at once;
+  # OrderedReady would deadlock (member 0 is not Ready until quorum, which needs the
+  # others). An established member rejoins from its persisted data-dir regardless.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "etcd.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "etcd.labels" . | nindent 8 }}
+    spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: etcd
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          command: ["/usr/local/bin/etcd"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: ETCD_NAME
+              value: $(POD_NAME)
+            - name: ETCD_DATA_DIR
+              value: /etcd-data
+            - name: ETCD_LISTEN_PEER_URLS
+              value: http://0.0.0.0:{{ .Values.peerPort }}
+            - name: ETCD_LISTEN_CLIENT_URLS
+              value: http://0.0.0.0:{{ .Values.clientPort }}
+            - name: ETCD_INITIAL_ADVERTISE_PEER_URLS
+              value: http://$(POD_NAME).{{ $fqdnSuffix }}:{{ .Values.peerPort }}
+            - name: ETCD_ADVERTISE_CLIENT_URLS
+              value: http://$(POD_NAME).{{ $fqdnSuffix }}:{{ .Values.clientPort }}
+            - name: ETCD_INITIAL_CLUSTER
+              value: {{ include "etcd.initialCluster" . | quote }}
+            - name: ETCD_INITIAL_CLUSTER_STATE
+              value: "new"
+            - name: ETCD_INITIAL_CLUSTER_TOKEN
+              value: {{ $full | quote }}
+          ports:
+            - name: client
+              containerPort: {{ .Values.clientPort }}
+              protocol: TCP
+            - name: peer
+              containerPort: {{ .Values.peerPort }}
+              protocol: TCP
+          readinessProbe:
+            # /health reports 200 only once the member can reach quorum, so a member
+            # joins endpoints only when actually usable.
+            httpGet:
+              path: /health
+              port: client
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket:
+              port: client
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /etcd-data
+{{- if not .Values.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+{{- end }}
+{{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "etcd.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+{{- end }}

@@ -1,0 +1,21 @@
+{{- /* Stable client Service the agent connects to: <release>-etcd:2379. Load-balances
+       across the Ready members. */ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "etcd.fullname" . }}
+  labels:
+    {{- include "etcd.labels" . | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: client
+      port: {{ .Values.clientPort }}
+      targetPort: client
+      protocol: TCP
+  selector:
+    {{- include "etcd.selectorLabels" . | nindent 4 }}
