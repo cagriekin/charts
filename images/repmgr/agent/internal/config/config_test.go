@@ -83,6 +83,43 @@ func TestLoadRejectsBadSplitBrainAction(t *testing.T) {
 	}
 }
 
+func TestLoadEtcdBackendRequiresEndpointsAndPrefix(t *testing.T) {
+	m := fullEnv()
+	m["DCS_BACKEND"] = "etcd" // ETCD_ENDPOINTS / ETCD_PREFIX not set
+	_, err := Load(getter(m))
+	if err == nil || !strings.Contains(err.Error(), "ETCD_ENDPOINTS") || !strings.Contains(err.Error(), "ETCD_PREFIX") {
+		t.Errorf("etcd backend must require ETCD_ENDPOINTS + ETCD_PREFIX, got %v", err)
+	}
+}
+
+func TestLoadEtcdBackendParsesEndpoints(t *testing.T) {
+	m := fullEnv()
+	m["DCS_BACKEND"] = "etcd"
+	m["ETCD_ENDPOINTS"] = "https://a:2379, https://b:2379 ,https://c:2379"
+	m["ETCD_PREFIX"] = "/pg-ha/rel/leader"
+	c, err := Load(getter(m))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(c.EtcdEndpoints) != 3 || c.EtcdEndpoints[0] != "https://a:2379" || c.EtcdEndpoints[2] != "https://c:2379" {
+		t.Errorf("endpoints not split/trimmed: %#v", c.EtcdEndpoints)
+	}
+	if c.EtcdPrefix != "/pg-ha/rel/leader" {
+		t.Errorf("prefix = %q", c.EtcdPrefix)
+	}
+}
+
+func TestLoadKubernetesBackendIgnoresEtcdVars(t *testing.T) {
+	// In kubernetes mode the etcd vars are neither required nor read.
+	c, err := Load(getter(fullEnv())) // DCS_BACKEND=kubernetes
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(c.EtcdEndpoints) != 0 || c.EtcdPrefix != "" {
+		t.Errorf("etcd config should be empty in kubernetes mode: %#v", c.EtcdEndpoints)
+	}
+}
+
 func TestStringRedactsPassword(t *testing.T) {
 	c, err := Load(getter(fullEnv()))
 	if err != nil {

@@ -36,6 +36,14 @@ type Config struct {
 
 	DCSBackend       string // "kubernetes" | "etcd"
 	SplitBrainAction string // "log" | "fence"
+
+	// etcd backend (required only when DCSBackend == "etcd"). TLS is optional
+	// (all-or-none, enforced by the dcs layer).
+	EtcdEndpoints []string
+	EtcdPrefix    string
+	EtcdCertFile  string
+	EtcdKeyFile   string
+	EtcdCAFile    string
 }
 
 type loader struct {
@@ -118,6 +126,25 @@ func Load(get func(string) string) (*Config, error) {
 	if c.SplitBrainAction != "" && c.SplitBrainAction != "log" && c.SplitBrainAction != "fence" {
 		l.invalid = append(l.invalid, fmt.Sprintf("SPLIT_BRAIN_ACTION=%q (want log|fence)", c.SplitBrainAction))
 	}
+	// etcd backend config is required only when DCS_BACKEND=etcd, so a kubernetes
+	// install needs none of it. TLS is optional (all-or-none, enforced in dcs).
+	if c.DCSBackend == "etcd" {
+		if eps := l.get("ETCD_ENDPOINTS"); eps == "" {
+			l.missing = append(l.missing, "ETCD_ENDPOINTS")
+		} else {
+			for _, e := range strings.Split(eps, ",") {
+				if e = strings.TrimSpace(e); e != "" {
+					c.EtcdEndpoints = append(c.EtcdEndpoints, e)
+				}
+			}
+		}
+		if c.EtcdPrefix = strings.TrimSpace(l.get("ETCD_PREFIX")); c.EtcdPrefix == "" {
+			l.missing = append(l.missing, "ETCD_PREFIX")
+		}
+		c.EtcdCertFile = l.get("ETCD_TLS_CERT")
+		c.EtcdKeyFile = l.get("ETCD_TLS_KEY")
+		c.EtcdCAFile = l.get("ETCD_TLS_CA")
+	}
 
 	if len(l.missing) > 0 || len(l.invalid) > 0 {
 		return nil, fmt.Errorf("config error: missing [%s]; invalid [%s]",
@@ -135,9 +162,11 @@ func (c Config) String() string {
 	return fmt.Sprintf("Config{PodName:%s Namespace:%s LeaseName:%s "+
 		"LeaseDuration:%s RenewDeadline:%s RetryPeriod:%s ReconcileInterval:%s "+
 		"HeadlessService:%s NodeCount:%d MasterService:%s MarkerName:%s PodSelector:%q "+
-		"RepmgrUser:%s RepmgrDB:%s RepmgrPassword:*** PGDATA:%s DCSBackend:%s SplitBrainAction:%s}",
+		"RepmgrUser:%s RepmgrDB:%s RepmgrPassword:*** PGDATA:%s DCSBackend:%s SplitBrainAction:%s "+
+		"EtcdEndpoints:%v EtcdPrefix:%s EtcdTLS:%t}",
 		c.PodName, c.Namespace, c.LeaseName,
 		c.LeaseDuration, c.RenewDeadline, c.RetryPeriod, c.ReconcileInterval,
 		c.HeadlessService, c.NodeCount, c.MasterService, c.MarkerName, c.PodSelector,
-		c.RepmgrUser, c.RepmgrDB, c.PGDATA, c.DCSBackend, c.SplitBrainAction)
+		c.RepmgrUser, c.RepmgrDB, c.PGDATA, c.DCSBackend, c.SplitBrainAction,
+		c.EtcdEndpoints, c.EtcdPrefix, c.EtcdCertFile != "")
 }
