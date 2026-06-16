@@ -26,6 +26,7 @@ func fullEnv() map[string]string {
 		"PGDATA":             "/var/lib/postgresql/data/pgdata",
 		"DCS_BACKEND":        "kubernetes",
 		"SPLIT_BRAIN_ACTION": "log",
+		"POD_CIDR":           "10.0.0.0/8",
 	}
 }
 
@@ -132,6 +133,30 @@ func TestLoadKubernetesBackendIgnoresEtcdVars(t *testing.T) {
 	}
 	if len(c.EtcdEndpoints) != 0 || c.EtcdPrefix != "" {
 		t.Errorf("etcd config should be empty in kubernetes mode: %#v", c.EtcdEndpoints)
+	}
+}
+
+func TestLoadRequiresPodCIDR(t *testing.T) {
+	m := fullEnv()
+	delete(m, "POD_CIDR")
+	_, err := Load(getter(m))
+	if err == nil || !strings.Contains(err.Error(), "POD_CIDR") {
+		t.Errorf("POD_CIDR must be required (agent owns the hardened pg_hba), got %v", err)
+	}
+}
+
+func TestLoadParsesPgHbaRules(t *testing.T) {
+	m := fullEnv()
+	m["POSTGRESQL_PGHBA"] = "host all admin 1.2.3.0/24 scram-sha-256\n\n  host all bob 5.6.7.0/24 reject  "
+	c, err := Load(getter(m))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(c.PgHbaRules) != 2 || c.PgHbaRules[0] != "host all admin 1.2.3.0/24 scram-sha-256" || c.PgHbaRules[1] != "host all bob 5.6.7.0/24 reject" {
+		t.Errorf("pgHba rules not split/trimmed (blank dropped): %#v", c.PgHbaRules)
+	}
+	if c.PgHbaPeerCIDR != "10.0.0.0/8" {
+		t.Errorf("PgHbaPeerCIDR = %q", c.PgHbaPeerCIDR)
 	}
 }
 

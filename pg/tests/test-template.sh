@@ -725,6 +725,14 @@ assert_contains "agent: LEASE_NAME env present" "${agent_pg_cont}" "name: LEASE_
 assert_contains "agent: lease name is <fullname>-leader" "${agent_pg_cont}" "test-pg-leader"
 assert_contains "agent: POD_NAME env present" "${agent_pg_cont}" "name: POD_NAME"
 assert_contains "agent: DCS_BACKEND env present" "${agent_pg_cont}" "name: DCS_BACKEND"
+# agent owns pg_hba: POD_CIDR feeds the hardened SCRAM-only pg_hba (no 0.0.0.0/0 md5)
+assert_contains "agent: POD_CIDR env present (hardened pg_hba)" "${agent_pg_cont}" "name: POD_CIDR"
+agent_hba=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'postgresql.pgHba[0]=host all admin 10.1.0.0/16 scram-sha-256' --show-only templates/statefulset.yaml 2>&1)
+assert_contains "agent: postgresql.pgHba flows to POSTGRESQL_PGHBA" "${agent_hba}" "name: POSTGRESQL_PGHBA"
+# repmgrd mode does not get these (the agent-only pg_hba ownership; byte-stable)
+repmgrd_sts_hba=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "repmgrd: no POD_CIDR env (agent-only pg_hba ownership)" "${repmgrd_sts_hba}" "name: POD_CIDR"
 # config completeness: the agent's Load() fail-fasts on any missing var, so a
 # dropped env here is a boot crash-loop the other asserts would not catch.
 agent_env_missing=""

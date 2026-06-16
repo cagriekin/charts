@@ -37,6 +37,10 @@ type Config struct {
 	DCSBackend       string // "kubernetes" | "etcd"
 	SplitBrainAction string // "log" | "fence"
 
+	// pg_hba assembly (agent mode owns pg_hba: hardened, SCRAM-only, no 0.0.0.0/0 md5).
+	PgHbaPeerCIDR string   // POD_CIDR: the trusted pod network for SCRAM rules
+	PgHbaRules    []string // POSTGRESQL_PGHBA: user rules, placed above the catch-alls
+
 	// etcd backend (required only when DCSBackend == "etcd"). TLS is optional
 	// (all-or-none, enforced by the dcs layer).
 	EtcdEndpoints []string
@@ -109,6 +113,14 @@ func Load(get func(string) string) (*Config, error) {
 		PGDATA:            l.str("PGDATA"),
 		DCSBackend:        l.str("DCS_BACKEND"),
 		SplitBrainAction:  l.str("SPLIT_BRAIN_ACTION"),
+		PgHbaPeerCIDR:     l.str("POD_CIDR"),
+	}
+	// User pg_hba rules (optional), newline-separated; the agent places them above
+	// the hardened network catch-alls.
+	for _, r := range strings.Split(get("POSTGRESQL_PGHBA"), "\n") {
+		if r = strings.TrimSpace(r); r != "" {
+			c.PgHbaRules = append(c.PgHbaRules, r)
+		}
 	}
 
 	// Cross-field validation that the lease timings are internally consistent
@@ -170,10 +182,10 @@ func (c Config) String() string {
 		"LeaseDuration:%s RenewDeadline:%s RetryPeriod:%s ReconcileInterval:%s "+
 		"HeadlessService:%s NodeCount:%d MasterService:%s MarkerName:%s PodSelector:%q "+
 		"RepmgrUser:%s RepmgrDB:%s RepmgrPassword:*** PGDATA:%s DCSBackend:%s SplitBrainAction:%s "+
-		"EtcdEndpoints:%v EtcdPrefix:%s EtcdTLS:%t}",
+		"EtcdEndpoints:%v EtcdPrefix:%s EtcdTLS:%t PgHbaPeerCIDR:%s PgHbaRules:%d}",
 		c.PodName, c.Namespace, c.LeaseName,
 		c.LeaseDuration, c.RenewDeadline, c.RetryPeriod, c.ReconcileInterval,
 		c.HeadlessService, c.NodeCount, c.MasterService, c.MarkerName, c.PodSelector,
 		c.RepmgrUser, c.RepmgrDB, c.PGDATA, c.DCSBackend, c.SplitBrainAction,
-		c.EtcdEndpoints, c.EtcdPrefix, c.EtcdCertFile != "")
+		c.EtcdEndpoints, c.EtcdPrefix, c.EtcdCertFile != "", c.PgHbaPeerCIDR, len(c.PgHbaRules))
 }
