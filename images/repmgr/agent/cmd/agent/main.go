@@ -286,6 +286,16 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 			a.log.Warn("read peer statuses (gossip)", "err", gerr)
 		}
 		gossip = g
+		// Version-skew detection (Part H4), mirroring the marker check: a peer
+		// gossiping a newer schema than this agent understands signals a mixed-version
+		// rolling upgrade. v1 fields are stable so the position still ranks correctly;
+		// this only flags it.
+		for name, st := range gossip {
+			if st.SchemaVersion > k8s.SchemaVersion {
+				a.log.Warn("peer gossips a newer agent schema; ranking on known fields only", "peer", name, "peerSchema", st.SchemaVersion, "agentSchema", k8s.SchemaVersion)
+				break
+			}
+		}
 	}
 	for i := 0; i < a.cfg.NodeCount; i++ {
 		name := a.base + "-" + strconv.Itoa(i)
@@ -332,8 +342,12 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	o.SwitchoverTarget = m.SwitchoverTarget
 	// Self-health (stateful/time-based, so computed here, not in the pure Decide):
 	// a holder whose primary-state postgres has been unreachable past the grace is
-	// stuck (frozen/wedged), which drives a self-health failover.
-	shouldServe := o.HoldLease && o.Local.HasData && !o.Local.InRecovery
+	// stuck (frozen/wedged), which drives a self-health failover. Suppressed while
+	// paused: an operator who stops postgres during a maintenance window (passing
+	// !shouldServe) must not arm the tracker -- otherwise it would latch "stuck" and
+	// fire an unwanted ReleaseLease failover the moment pause is lifted. On resume a
+	// still-stopped node is then treated as a startup, not a regression.
+	shouldServe := o.HoldLease && !o.Paused && o.Local.HasData && !o.Local.InRecovery
 	o.LocalStuck = a.health.stuck(shouldServe, o.Local.Running, time.Now())
 	// PeersPending: the holder waits (does not promote/resume) only during a true
 	// cold boot -- some peer's true position is not yet in. The latch (peersSeen)

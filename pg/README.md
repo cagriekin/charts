@@ -255,7 +255,7 @@ kubectl annotate configmap <release>-pg-primary -n <ns> pg-ha/pause=true --overw
 kubectl annotate configmap <release>-pg-primary -n <ns> pg-ha/pause-
 ```
 
-While paused, `pg_ha_agent_is_paused` reads `1`. Pausing does not stop the cluster from serving — it only stops the agent from reacting to faults, so a genuine failure during the window will NOT fail over until you resume.
+While paused, `pg_ha_agent_is_paused` reads `1`. Pausing does not stop the cluster from serving — it only stops the agent from reacting to faults, so a genuine failure during the window will NOT fail over until you resume. In particular, if the primary itself wedges or dies while paused, the agent keeps renewing the Lease and the write Service keeps pointing at it; there is no automatic failover until you remove the annotation. (There is no split-brain risk: a real Lease loss still fences via the leader-election callback.) Keep maintenance windows short and watch the cluster while paused.
 
 ### Controlled switchover (agent mode)
 
