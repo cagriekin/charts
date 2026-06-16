@@ -176,10 +176,12 @@ repmgr:
           # `kubectl create secret tls` does NOT -- add ca.crt explicitly or the agent
           # fails fast at boot (it reads all three). Empty = plaintext.
           secretName: ""
-    # RESERVED (not yet active in v1): the pod-network CIDR the agent will trust in
-    # the hardened (SCRAM-only) pg_hba once the agent owns pg_hba assembly. In v1
-    # pg_hba is still managed by the image/postStart path, so this value is not
-    # consumed yet; it is kept so the eventual switch needs no values change.
+    # The pod-network CIDR the agent trusts in the hardened (SCRAM-only) pg_hba it
+    # assembles in agent mode: loopback + this CIDR over SCRAM, with NO legacy
+    # 0.0.0.0/0 md5 catch-all (agent mode is secure by construction). Set this to
+    # your cluster's pod CIDR if it is outside 10.0.0.0/8, or replication/clients on
+    # the pod network are refused. Add explicit `postgresql.pgHba` rules for any
+    # access from outside the pod network.
     podCidr: 10.0.0.0/8
     # Monitoring for the agent's read-only metrics on port 9200 (agent mode only).
     # Both require the Prometheus Operator CRDs (same as prometheusExporter).

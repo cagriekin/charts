@@ -345,6 +345,15 @@ spec:
               value: {{ include "pg.fullname" . }}
             - name: POD_SELECTOR
               value: app.kubernetes.io/name={{ include "pg.name" . }},app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=postgresql
+            {{- /* The agent owns pg_hba in agent mode: it writes a hardened SCRAM-only
+                   pg_hba trusting POD_CIDR (no legacy 0.0.0.0/0 md5), with the user's
+                   postgresql.pgHba inserted above the network catch-alls. */}}
+            - name: POD_CIDR
+              value: {{ required "repmgr.agent.podCidr is required in agent mode (the pod network trusted by the hardened pg_hba)" .Values.repmgr.agent.podCidr | quote }}
+{{- with .Values.postgresql.pgHba }}
+            - name: POSTGRESQL_PGHBA
+              value: {{ join "\n" . | quote }}
+{{- end }}
             - name: DCS_BACKEND
               value: {{ (.Values.repmgr.agent.dcs).backend | default "kubernetes" | quote }}
 {{- if eq (include "pg.agentEtcdMode" .) "true" }}

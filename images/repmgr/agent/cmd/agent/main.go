@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,7 @@ import (
 	"github.com/cagriekin/pg-ha-agent/internal/mechanism"
 	"github.com/cagriekin/pg-ha-agent/internal/observe"
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
+	"github.com/cagriekin/pg-ha-agent/internal/pgconf"
 	"github.com/cagriekin/pg-ha-agent/internal/process"
 	"github.com/cagriekin/pg-ha-agent/internal/reconcile"
 )
@@ -258,6 +260,17 @@ func (a *agent) boot(ctx context.Context) error {
 	}
 	if !process.HasData(a.cfg.PGDATA) {
 		return nil
+	}
+	// Harden pg_hba: overwrite the image's initdb default -- which carries the legacy
+	// 0.0.0.0/0 md5 catch-alls -- with a SCRAM-only base trusting only loopback + the
+	// pod CIDR (no external access), before any start. This is the agent-mode-only
+	// hardening (security review C1: external md5 is the SUPERUSER-exposure risk);
+	// repmgrd mode keeps the legacy base. The chart's md5-compat postStart still runs
+	// (both modes) to layer the md5->scram user re-hash + a pod-CIDR md5 fallback for
+	// the image's md5-created users, so this base composes with it rather than
+	// replacing it. Written every boot (idempotent); a clone inherits the source's.
+	if err := a.writePgHba(); err != nil {
+		return err
 	}
 	// Only bring up data that is safe to start regardless of holdership: a
 	// standby-state node comes up in recovery and follows its upstream. Primary-state
@@ -635,6 +648,19 @@ func (a *agent) writePgpass() error {
 		return fmt.Errorf("set PGPASSFILE: %w", err)
 	}
 	return nil
+}
+
+// writePgHba assembles and writes the hardened, SCRAM-only pg_hba.conf the agent
+// owns in agent mode (loopback + the pod CIDR over SCRAM, no legacy 0.0.0.0/0 md5;
+// user POSTGRESQL_PGHBA rules inserted above the network catch-alls, #144). It
+// replaces the image's initdb default so external md5 access never opens.
+func (a *agent) writePgHba() error {
+	content := pgconf.AssemblePgHba(pgconf.PgHbaOptions{
+		ReplicationUser: a.cfg.RepmgrUser,
+		PeerCIDR:        a.cfg.PgHbaPeerCIDR,
+		ExtraRules:      a.cfg.PgHbaRules,
+	})
+	return pgconf.WritePgHba(filepath.Join(a.cfg.PGDATA, "pg_hba.conf"), content)
 }
 
 // publishStatus gossips this node's WAL position to its own pod annotation so the
