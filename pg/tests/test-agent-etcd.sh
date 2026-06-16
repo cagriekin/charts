@@ -15,6 +15,7 @@ RELEASE="${RELEASE:-pgetcd}"
 FULLNAME=$(resolve_fullname "${RELEASE}" "${CHART_DIR}" "${SCRIPT_DIR}/values-agent.yaml")
 LEASE="${FULLNAME}-leader"
 ETCD_STS="${RELEASE}-etcd"
+FAILOVER_BUDGET="${FAILOVER_BUDGET:-90}"
 
 begin_suite "Agent etcd DCS (bundled etcd, leadership off the apiserver) — Part G6"
 
@@ -56,41 +57,53 @@ while [[ ${s} -lt 240 ]]; do
 done
 assert_contains "exactly one primary elected via etcd" "${PRIMARY:-none}" "${FULLNAME}"
 
-svc_endpoint=$(kubectl get endpoints -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.subsets[0].addresses[0].targetRef.name}' 2>/dev/null || echo "")
-assert_eq "write service points at the primary" "${PRIMARY}" "${svc_endpoint}"
+# Everything past election needs a settled primary+standby. Gate it (mirroring the
+# failover suite) so a slow/failed election produces clean FAILs + a summary rather
+# than a `set -e` abort on an unguarded pg_exec with an empty pod name.
+if [[ -n "${PRIMARY}" && -n "${STANDBY}" ]]; then
+  svc_endpoint=$(kubectl get endpoints -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.subsets[0].addresses[0].targetRef.name}' 2>/dev/null || echo "")
+  assert_eq "write service points at the primary" "${PRIMARY}" "${svc_endpoint}"
 
-# --- replication ---
-FV="etcd-$(date +%s)"
-pg_exec "${NAMESPACE}" "${PRIMARY}" "CREATE TABLE IF NOT EXISTS etcd_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
-pg_exec "${NAMESPACE}" "${PRIMARY}" "INSERT INTO etcd_test (value) VALUES ('${FV}')" "testuser" "testdb"
-sleep 3
-repl=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT value FROM etcd_test WHERE value='${FV}'" "testuser" "testdb" 2>/dev/null || echo "")
-assert_eq "data replicated to standby" "${FV}" "${repl}"
+  # --- replication ---
+  FV="etcd-$(date +%s)"
+  pg_exec "${NAMESPACE}" "${PRIMARY}" "CREATE TABLE IF NOT EXISTS etcd_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
+  pg_exec "${NAMESPACE}" "${PRIMARY}" "INSERT INTO etcd_test (value) VALUES ('${FV}')" "testuser" "testdb"
+  sleep 3
+  repl=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT value FROM etcd_test WHERE value='${FV}'" "testuser" "testdb" 2>/dev/null || echo "")
+  assert_eq "data replicated to standby" "${FV}" "${repl}"
 
-# --- failover: delete the primary; the standby promotes (leadership moves in etcd) ---
-echo "  Deleting primary ${PRIMARY} (etcd-mode failover)..."
-kubectl delete pod "${PRIMARY}" -n "${NAMESPACE}" --grace-period=30 --wait=false 2>/dev/null || true
-promoted=false; e=0
-while [[ ${e} -lt 90 ]]; do
-  rec=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT NOT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")
-  if [[ "${rec}" == "t" ]]; then promoted=true; echo "  failover after ${e}s (new primary = ${STANDBY})"; break; fi
-  sleep 3; e=$((e + 3))
-done
-assert_eq "standby promoted on etcd-mode failover" "true" "${promoted}"
+  # --- failover: delete the primary; the standby promotes (leadership moves in etcd) ---
+  echo "  Deleting primary ${PRIMARY} (etcd-mode failover)..."
+  kubectl delete pod "${PRIMARY}" -n "${NAMESPACE}" --grace-period=30 --wait=false 2>/dev/null || true
+  promoted=false; e=0
+  while [[ ${e} -lt ${FAILOVER_BUDGET} ]]; do
+    rec=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT NOT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")
+    if [[ "${rec}" == "t" ]]; then promoted=true; echo "  failover after ${e}s (new primary = ${STANDBY})"; break; fi
+    sleep 3; e=$((e + 3))
+  done
+  assert_eq "standby promoted on etcd-mode failover" "true" "${promoted}"
 
-if [[ "${promoted}" == "true" ]]; then
-  survived=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT value FROM etcd_test WHERE value='${FV}'" "testuser" "testdb")
-  assert_eq "data survives failover" "${FV}" "${survived}"
-  AFTER="etcd-after-$(date +%s)"
-  pg_exec "${NAMESPACE}" "${STANDBY}" "INSERT INTO etcd_test (value) VALUES ('${AFTER}')" "testuser" "testdb"
-  wv=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT value FROM etcd_test WHERE value='${AFTER}'" "testuser" "testdb")
-  assert_eq "new primary is writable" "${AFTER}" "${wv}"
-  ep=$(kubectl get endpoints -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.subsets[0].addresses[0].targetRef.name}' 2>/dev/null || echo "")
-  assert_eq "write service repoints to the new primary" "${STANDBY}" "${ep}"
+  if [[ "${promoted}" == "true" ]]; then
+    survived=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT value FROM etcd_test WHERE value='${FV}'" "testuser" "testdb")
+    assert_eq "data survives failover" "${FV}" "${survived}"
+    AFTER="etcd-after-$(date +%s)"
+    pg_exec "${NAMESPACE}" "${STANDBY}" "INSERT INTO etcd_test (value) VALUES ('${AFTER}')" "testuser" "testdb"
+    wv=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT value FROM etcd_test WHERE value='${AFTER}'" "testuser" "testdb")
+    assert_eq "new primary is writable" "${AFTER}" "${wv}"
+    ep=$(kubectl get endpoints -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.subsets[0].addresses[0].targetRef.name}' 2>/dev/null || echo "")
+    assert_eq "write service repoints to the new primary" "${STANDBY}" "${ep}"
+  else
+    skip "data survives failover (failover did not complete)"
+    skip "new primary is writable (failover did not complete)"
+    skip "write service repoints to the new primary (failover did not complete)"
+  fi
 else
-  skip "data survives failover (failover did not complete)"
-  skip "new primary is writable (failover did not complete)"
-  skip "write service repoints to the new primary (failover did not complete)"
+  skip "write service points at the primary (no primary settled)"
+  skip "data replicated to standby (no primary settled)"
+  skip "standby promoted on etcd-mode failover (no primary settled)"
+  skip "data survives failover (no primary settled)"
+  skip "new primary is writable (no primary settled)"
+  skip "write service repoints to the new primary (no primary settled)"
 fi
 
 # --- decoupling proof (apiserver outage tolerance) is NOT automated here ---
