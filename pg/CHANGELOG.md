@@ -28,8 +28,15 @@ which bundles the new `pg-ha-agent` binary.
 
 ### Notes
 
-- Agent mode is opt-in and not yet validated by the live failover suite (added
-  in a follow-up). It becomes the default at chart `1.0.0`.
+- Agent mode is opt-in and stays off by default — repmgrd installs are unchanged
+  and need no action. It becomes the default at chart `1.0.0`. Graceful failover
+  in agent mode is covered by the live KinD suite (`make -C pg test-agent`).
+- **Migrating to agent mode:** `podManagementPolicy` is immutable, so switching an
+  existing release needs a one-time `kubectl delete statefulset <release>-pg
+  --cascade=orphan` (keeps pods + PVCs) then `helm upgrade --set
+  repmgr.failoverMode=agent`. Full runbook + GitOps caveats in the README
+  ("Failover modes" / "Migrating an existing release to agent mode"); injected env
+  is catalogued in `ENVIRONMENT.md`.
 - The new PostgreSQL settings (`wal_log_hints`, `max_replication_slots`,
   `max_slot_wal_keep_size`, `restore_command`) are applied at `initdb`, so they
   take effect on freshly-provisioned clusters only. An existing cluster keeps its
