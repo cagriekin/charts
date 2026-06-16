@@ -388,15 +388,17 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			return err
 		}
 		a.metr.IncPromotion()
-		_ = a.mech.RegisterPrimary(ctx)
-		// H3 order: promote PG -> advance the highwater marker -> assert routing.
-		// Re-probe the post-promote timeline (promotion bumped it) and advance the
-		// marker, so a later stale node is correctly refused by unsafeToServe. The
-		// apiserver writes (marker + routing) run under the fence budget so a slow
-		// apiserver cannot starve a lost-leadership OnLost fence (see fenceBudget).
+		// After promotion the node is read-write. Bound ALL the post-promote
+		// bookkeeping -- repmgr register, the WAL re-probe, and the marker + routing
+		// apiserver writes -- under the fence budget, sharing one context so the total
+		// opMu hold cannot exceed the soft-fence window and starve a lost-leadership
+		// OnLost demote while this node is still RW (the register is repmgr->local PG,
+		// bounded only by connect_timeout otherwise; a post-connect query hang would
+		// hold opMu unbounded). H3 order: promote PG -> advance marker -> assert routing.
 		wctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
 		defer cancel()
-		if tl, _, ok, _ := a.prober.PrimaryWALPosition(ctx, a.selfConn()); ok {
+		_ = a.mech.RegisterPrimary(wctx)
+		if tl, _, ok, _ := a.prober.PrimaryWALPosition(wctx, a.selfConn()); ok {
 			a.advanceMarker(wctx, tl, true, obs.Marker)
 		}
 		return a.assertPrimaryRouting(wctx, obs)
@@ -409,14 +411,16 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// command is idempotent (--force) and self-healing; the standby clone needs
 		// only that the primary is registered, so a best-effort per-tick reconcile is
 		// fine (it succeeds within a tick or two of the primary opening).
-		if err := a.mech.RegisterPrimary(ctx); err != nil {
+		// The node is read-write here, so bound the register + marker + routing under
+		// one fence-budget context (see Promote): a hung register/apiserver write must
+		// not hold opMu past the soft-fence window and starve a lost-leadership fence.
+		wctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
+		defer cancel()
+		if err := a.mech.RegisterPrimary(wctx); err != nil {
 			a.log.Warn("register primary in repmgr.nodes", "err", err)
 		}
 		// Keep the highwater marker at this primary's timeline (monotonic; written
-		// only when it advances, so steady-state ticks make no API write). The
-		// apiserver writes run under the fence budget (see Promote / fenceBudget).
-		wctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
-		defer cancel()
+		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
 		return a.assertPrimaryRouting(wctx, obs)
 
