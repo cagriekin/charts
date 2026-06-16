@@ -257,6 +257,20 @@ kubectl annotate configmap <release>-pg-primary -n <ns> pg-ha/pause-
 
 While paused, `pg_ha_agent_is_paused` reads `1`. Pausing does not stop the cluster from serving — it only stops the agent from reacting to faults, so a genuine failure during the window will NOT fail over until you resume.
 
+### Monitoring the agent (agent mode)
+
+The agent serves read-only Prometheus metrics on port `9200` (`pg_ha_agent_is_leader`, `_is_paused`, `_renew_failures_total`, `_promotions_total`, `_demotes_total`, `_fences_total`, `_reconcile_errors_total`). With the Prometheus Operator installed:
+
+```yaml
+repmgr:
+  agent:
+    monitoring:
+      serviceMonitor: { enabled: true }   # scrape the agent metrics off the headless Service
+      prometheusRule: { enabled: true }   # example alerts (no-leader, split-brain, renew-failure, flapping, agent-down, paused-too-long)
+```
+
+The bundled `PrometheusRule` covers leadership/fencing health only; row-level **replication lag** alerts come from the PostgreSQL exporter (`prometheusExporter.enabled`).
+
 > Agent mode is opt-in and validated by the chart's live failover suite (graceful failover: a standby promotes, the write Service repoints, the ex-primary rejoins read-only). See `ENVIRONMENT.md` for the full injected-variable catalog.
 
 ### PGPool-II Parameters

@@ -162,6 +162,19 @@ repmgr:
     # pg_hba is still managed by the image/postStart path, so this value is not
     # consumed yet; it is kept so the eventual switch needs no values change.
     podCidr: 10.0.0.0/8
+    # Monitoring for the agent's read-only metrics on port 9200 (agent mode only).
+    # Both require the Prometheus Operator CRDs (same as prometheusExporter).
+    monitoring:
+      serviceMonitor:
+        enabled: false
+        interval: 30s
+        scrapeTimeout: 10s
+        additionalLabels: {}
+      # Example alert rules over the agent metrics (no-leader, split-brain,
+      # renew-failure, reconcile-error, flapping, agent-down, paused-too-long).
+      prometheusRule:
+        enabled: false
+        additionalLabels: {}
 
   username: repmgr
   database: repmgr
