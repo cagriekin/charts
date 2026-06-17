@@ -17,14 +17,19 @@ type recordedCall struct {
 }
 
 type fakeRunner struct {
-	calls  []recordedCall
-	failOn string // if a call's args contain this substring, it errors
+	calls   []recordedCall
+	failOn  string // if a call's args contain this substring, it errors
+	failOut string // combined output returned alongside the error on a failing call
 }
 
 func (f *fakeRunner) Run(_ context.Context, env []string, name string, args ...string) (string, error) {
 	f.calls = append(f.calls, recordedCall{name: name, env: env, args: args})
 	if f.failOn != "" && strings.Contains(strings.Join(args, " "), f.failOn) {
-		return "simulated failure", errors.New("exit status 1")
+		out := "simulated failure"
+		if f.failOut != "" {
+			out = f.failOut
+		}
+		return out, errors.New("exit status 23")
 	}
 	return "ok", nil
 }
@@ -61,6 +66,28 @@ func TestCLICommands(t *testing.T) {
 		}
 		if got := fr.lastArgs(); !strings.Contains(got, "standby follow --upstream-node-id=1001") {
 			t.Errorf("argv = %q", got)
+		}
+	})
+
+	t.Run("follow treats already-following exit as a no-op (#182)", func(t *testing.T) {
+		// A healthy standby already streaming from the target: repmgr exits non-zero
+		// but there is nothing to do. Must be a successful no-op so the agent latches
+		// and does not re-run follow every tick.
+		fr := &fakeRunner{failOn: "standby follow", failOut: "INFO: timelines are same, this server is not ahead\n" +
+			"DETAIL: local node lsn is 0/3000000, follow target lsn is 0/3000000\n" +
+			"ERROR: slot \"repmgr_slot_1000\" already exists as an active slot\n" +
+			"NOTICE: STANDBY FOLLOW failed"}
+		if err := newTestRepmgr(fr).Follow(ctx, 1000); err != nil {
+			t.Fatalf("an already-following standby must be a no-op, got %v", err)
+		}
+	})
+
+	t.Run("follow surfaces a genuine failure", func(t *testing.T) {
+		// A real failure (slot active but NOT the benign already-following case) must
+		// still surface so it is not silently swallowed.
+		fr := &fakeRunner{failOn: "standby follow", failOut: "ERROR: connection to upstream node failed"}
+		if err := newTestRepmgr(fr).Follow(ctx, 1000); err == nil {
+			t.Fatal("a genuine follow failure must surface as an error")
 		}
 	})
 

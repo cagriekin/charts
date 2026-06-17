@@ -4,11 +4,13 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/cagriekin/pg-ha-agent/internal/config"
 	"github.com/cagriekin/pg-ha-agent/internal/dcs"
+	"github.com/cagriekin/pg-ha-agent/internal/mechanism"
 	"github.com/cagriekin/pg-ha-agent/internal/observe"
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
 	"github.com/cagriekin/pg-ha-agent/internal/process"
@@ -38,6 +40,126 @@ func (f *fakeDCS) Run(context.Context, string, dcs.Callbacks) {}
 func (f *fakeDCS) IsLeader() bool                             { return false }
 func (f *fakeDCS) Leader() string                             { return "" }
 func (f *fakeDCS) Release()                                   { f.released = true }
+
+// scriptedExec backs BOTH mechanism.Runner (repmgr CLI) and pg.Exec (psql) -- the
+// signatures are identical -- so one fake drives the whole Follow act() path. It
+// counts repmgr standby follow invocations and stubs the pg_stat_wal_receiver probe.
+type scriptedExec struct {
+	walRcv  string // pg_stat_wal_receiver "sender_host|status" output (psql)
+	follows int    // number of `repmgr standby follow` calls
+}
+
+func (s *scriptedExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
+	joined := strings.Join(args, " ")
+	switch {
+	case name == "psql" && strings.Contains(joined, "pg_stat_wal_receiver"):
+		return s.walRcv, nil
+	case name == "repmgr" && strings.Contains(joined, "standby follow"):
+		s.follows++
+		return "ok", nil
+	}
+	return "ok", nil
+}
+
+// newFollowTestAgent wires a real Repmgr + Prober backed by one scriptedExec so the
+// Follow act() path (register -> streaming probe -> follow) is exercised end to end.
+func newFollowTestAgent(t *testing.T, ex *scriptedExec) *agent {
+	t.Helper()
+	m := mechanism.NewRepmgr("/etc/repmgr/repmgr.conf", t.TempDir(), "pw")
+	m.Runner = ex
+	return &agent{
+		cfg: &config.Config{
+			PGDATA:          t.TempDir(),
+			HeadlessService: "h",
+			RepmgrUser:      "repmgr",
+			RepmgrDB:        "repmgr",
+			RepmgrPassword:  "pw",
+			RenewDeadline:   2 * time.Second,
+		},
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		dcs:    &fakeDCS{},
+		mech:   m,
+		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
+		sup:    process.NewSupervisor(&fakePostmaster{}),
+		metr:   observe.New(),
+	}
+}
+
+// #182: a standby already streaming from the lease holder must NOT re-run repmgr
+// standby follow (which errors "slot already active" and, unlatched, repeats every
+// tick). The act path skips the command and latches followUpstream.
+func TestActFollowSkipsWhenAlreadyStreaming(t *testing.T) {
+	ex := &scriptedExec{walRcv: "pg-0.h|streaming"}
+	a := newFollowTestAgent(t, ex)
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if ex.follows != 0 {
+		t.Fatalf("repmgr standby follow must be skipped when already streaming, got %d calls", ex.follows)
+	}
+	if a.followUpstream != "pg-0" {
+		t.Fatalf("followUpstream must latch to skip future ticks, got %q", a.followUpstream)
+	}
+}
+
+// A standby not yet streaming (or being repointed to a new upstream) must run
+// repmgr standby follow, then latch.
+func TestActFollowRunsWhenNotStreaming(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""} // no walreceiver row
+	a := newFollowTestAgent(t, ex)
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if ex.follows != 1 {
+		t.Fatalf("repmgr standby follow must run when not streaming, got %d calls", ex.follows)
+	}
+	if a.followUpstream != "pg-0" {
+		t.Fatal("followUpstream must latch after a successful follow")
+	}
+}
+
+// Streaming from a DIFFERENT host than the target (a stale upstream after a leader
+// change) must NOT be mistaken for already-following: the agent repoints via follow.
+func TestActFollowRepointsWhenStreamingFromWrongUpstream(t *testing.T) {
+	ex := &scriptedExec{walRcv: "pg-9.h|streaming"} // streaming from the old leader
+	a := newFollowTestAgent(t, ex)
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if ex.follows != 1 {
+		t.Fatalf("a standby streaming from the wrong upstream must be repointed via follow, got %d calls", ex.follows)
+	}
+}
+
+// Once latched, a steady-state Follow tick is a pure no-op: no probe, no follow.
+func TestActFollowShortCircuitsWhenLatched(t *testing.T) {
+	ex := &scriptedExec{walRcv: "pg-0.h|streaming"}
+	a := newFollowTestAgent(t, ex)
+	a.followUpstream = "pg-0"
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if ex.follows != 0 {
+		t.Fatalf("a latched standby must not re-run follow, got %d calls", ex.follows)
+	}
+}
+
+// A non-Follow action resets the latch so the next Follow re-registers + repoints.
+func TestActResetsFollowLatchOnNonFollow(t *testing.T) {
+	a := newTestAgent(t, &fakePostmaster{}, &fakeDCS{})
+	a.followUpstream = "pg-0"
+	obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: true, InRecovery: true}}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.ReleaseLease}, obs); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if a.followUpstream != "" {
+		t.Fatalf("followUpstream must reset on a non-Follow action, got %q", a.followUpstream)
+	}
+}
 
 func newTestAgent(t *testing.T, pm *fakePostmaster, d *fakeDCS) *agent {
 	t.Helper()

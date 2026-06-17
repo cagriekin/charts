@@ -1,5 +1,29 @@
 # pgvector chart changelog
 
+## 1.0.2
+
+Bugfix for agent mode (the 1.0.0 default), in lockstep with pg 1.0.2. Image moves
+to `trixie-5.5.0-18`. No chart-template or values changes beyond the image tag; a
+`helm upgrade` rolls the pods once.
+
+### Fixed
+
+- **Agent re-ran `repmgr standby follow` every reconcile tick on a healthy,
+  already-streaming standby and logged an ERROR each time (#182).** The `Follow`
+  executor latched its idempotency guard (`followUpstream`) only after
+  `repmgr standby follow` returned success. On a standby already correctly streaming
+  from the lease holder -- the steady state right after a repmgrd->agent migration
+  (`primary_conninfo` persists across the roll) or a post-failover rejoin -- the
+  command exits non-zero (`slot "..." already exists as an active slot` / `this
+  server is not ahead`), so the guard never latched and the agent re-forked the
+  failing command every ~5s. Replication was unaffected, but the ERROR spam buried
+  genuine errors and tripped log-based alerting. The agent now (1) skips
+  `repmgr standby follow` when it observes via `pg_stat_wal_receiver` that the
+  standby is already streaming from the target, and (2) treats the benign "already
+  following" repmgr exit as a successful no-op. Repointing to a genuinely new
+  upstream (after a leader change) still runs `follow`. (Issue reported against
+  pgvector 1.0.1 / `trixie-5.5.0-17`.)
+
 ## 1.0.1
 
 Bugfix for agent mode (the 1.0.0 default), in lockstep with pg 1.0.1. Image moves

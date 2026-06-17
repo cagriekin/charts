@@ -84,10 +84,30 @@ func (r *Repmgr) Promote(ctx context.Context) error {
 }
 
 func (r *Repmgr) Follow(ctx context.Context, upstreamNodeID int) error {
-	if out, err := r.run(ctx, "standby", "follow", "--upstream-node-id="+strconv.Itoa(upstreamNodeID)); err != nil {
+	out, err := r.run(ctx, "standby", "follow", "--upstream-node-id="+strconv.Itoa(upstreamNodeID))
+	if err != nil {
+		// #182: a standby already correctly following this upstream (same timeline,
+		// not ahead, its slot already active because it is streaming through it) makes
+		// repmgr exit non-zero with nothing to do. Treat that as a successful no-op so
+		// the caller latches and does not re-run follow -- and log it ERROR -- every
+		// tick. A genuine follow failure (different message) still surfaces.
+		if isAlreadyFollowing(out) {
+			return nil
+		}
 		return fmt.Errorf("repmgr standby follow: %w: %s", err, strings.TrimSpace(out))
 	}
 	return nil
+}
+
+// isAlreadyFollowing recognizes the repmgr standby follow output emitted when the
+// standby is ALREADY correctly attached to the target: its replication slot is
+// active (it is streaming through it) AND the timelines match / it is not ahead.
+// Both conditions are required so this only swallows the benign no-op, never a
+// genuine failure that happens to mention an active slot while real work is pending.
+func isAlreadyFollowing(out string) bool {
+	s := strings.ToLower(out)
+	return strings.Contains(s, "already exists as an active slot") &&
+		(strings.Contains(s, "this server is not ahead") || strings.Contains(s, "timelines are same"))
 }
 
 func (r *Repmgr) Clone(ctx context.Context, source Conn) error {

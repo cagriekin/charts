@@ -112,10 +112,20 @@ if [[ "${promoted}" == "true" ]]; then
       sleep 5; s=$((s + 5))
     done
     assert_eq "#181: rejoined standby is actively streaming (pg_stat_replication)" "streaming" "${stream_state}"
+
+    # #182 regression: a healthy, already-streaming standby must NOT re-run repmgr
+    # standby follow every reconcile tick. Sample several steady-state ticks of the
+    # rejoined standby's agent log (the agent is PID 1 of the postgresql container)
+    # and assert no `act action=Follow` failure surfaced -- the follow is skipped or
+    # latched after attach, never re-forked + logged ERROR each tick.
+    sleep 20
+    follow_errs=$(kubectl logs "${PRIMARY}" -c postgresql -n "${NAMESPACE}" --since=25s 2>/dev/null | grep "repmgr standby follow:" || echo "")
+    assert_not_contains "#182: steady-state standby does not re-run/err on repmgr standby follow" "${follow_errs}" "repmgr standby follow:"
   else
     skip "demoted ex-primary rejects writes (soft fence) (rejoin did not complete)"
     skip "rejoined standby caught up post-failover data (rejoin did not complete)"
     skip "#181: rejoined standby is actively streaming (rejoin did not complete)"
+    skip "#182: steady-state standby does not re-run/err on repmgr standby follow (rejoin did not complete)"
   fi
 else
   skip "ex-primary rejoins as a standby (in recovery) (failover did not complete)"
@@ -123,6 +133,7 @@ else
   skip "demoted ex-primary rejects writes (soft fence) (failover did not complete)"
   skip "rejoined standby caught up post-failover data (failover did not complete)"
   skip "#181: rejoined standby is actively streaming (failover did not complete)"
+  skip "#182: steady-state standby does not re-run/err on repmgr standby follow (failover did not complete)"
 fi
 
 # --- cold boot: full-cluster restart. Both pods come up at once (Parallel); the
