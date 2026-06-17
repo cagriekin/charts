@@ -514,6 +514,17 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if err := a.mech.RegisterStandby(ctx, up); err != nil {
 			a.log.Warn("register standby in repmgr.nodes", "err", err)
 		}
+		// #182: a healthy standby is already streaming from the lease holder before
+		// this first Follow runs -- a repmgrd->agent migration keeps primary_conninfo
+		// across the roll, and a post-failover rejoin attaches before Follow. repmgr
+		// standby follow then exits non-zero (slot already active), which, left
+		// unlatched, repeats every tick. Skip the command when already streaming from
+		// the target and latch; repointing to a NEW upstream (sender_host differs, or
+		// no walreceiver yet) still falls through to Follow.
+		if a.streamingFromTarget(ctx, dec.Target) {
+			a.followUpstream = dec.Target
+			return nil
+		}
 		if err := a.mech.Follow(ctx, up); err != nil {
 			return err
 		}
@@ -852,6 +863,22 @@ func (a *agent) peerMechConn(name string) mechanism.Conn {
 }
 
 func (a *agent) fqdn(name string) string { return name + "." + a.cfg.HeadlessService }
+
+// streamingFromTarget reports whether local Postgres is already actively streaming
+// from target's FQDN (#182). Both the standby's primary_conninfo and a.fqdn derive
+// the upstream host from the same registered conninfo, so sender_host equals
+// a.fqdn(target); compared case-insensitively with any trailing dot trimmed. A probe
+// error or any mismatch returns false -- the caller then runs repmgr standby follow
+// (which repoints to a new upstream, or no-ops benignly if already attached), so a
+// false negative only costs one extra follow, never a missed repoint.
+func (a *agent) streamingFromTarget(ctx context.Context, target string) bool {
+	host, streaming, err := a.prober.StreamingUpstream(ctx, a.selfConn())
+	if err != nil || !streaming {
+		return false
+	}
+	norm := func(s string) string { return strings.ToLower(strings.TrimRight(s, ".")) }
+	return norm(host) == norm(a.fqdn(target))
+}
 
 func (a *agent) startMetrics(ctx context.Context) {
 	srv := &http.Server{Addr: metricsAddr, Handler: a.metr.Handler(a.cfg.ReconcileInterval * 3)}

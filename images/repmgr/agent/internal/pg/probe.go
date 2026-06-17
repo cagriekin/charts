@@ -175,6 +175,29 @@ func (p *Prober) StandbyTimeline(ctx context.Context, ci ConnInfo) (tl Timeline,
 	return Timeline(n), true, nil
 }
 
+// StreamingUpstream reports the host of the upstream this standby's walreceiver is
+// connected to and whether it is actively streaming, read from
+// pg_stat_wal_receiver. A standby with no walreceiver row (not yet attached, or a
+// primary) returns streaming=false. Used to make the Follow reconcile idempotent
+// (#182): a standby already streaming from the lease holder needs no repmgr standby
+// follow (which would error "slot already active" and re-run every tick). The host
+// is sender_host, derived from primary_conninfo -- the upstream's registered FQDN.
+func (p *Prober) StreamingUpstream(ctx context.Context, ci ConnInfo) (host string, streaming bool, err error) {
+	out, err := p.psql(ctx, ci, "SELECT sender_host, status FROM pg_stat_wal_receiver;")
+	if err != nil {
+		return "", false, err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return "", false, nil // no walreceiver row: not streaming
+	}
+	h, status, found := strings.Cut(out, "|")
+	if !found {
+		return "", false, nil
+	}
+	return strings.TrimSpace(h), strings.TrimSpace(status) == "streaming", nil
+}
+
 // SystemIdentifier reads a running peer's cluster identity from pg_control_system().
 // It is compared to the local pg_controldata identifier to refuse a clone/follow/
 // rewind from a peer of a different cluster (invariant 9 -- a stale/misrouted pod on

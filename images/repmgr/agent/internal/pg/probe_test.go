@@ -15,6 +15,7 @@ type fakeExec struct {
 	standby   string // GREATEST(receive, replay) output
 	standbyTL string // pg_control_checkpoint timeline_id output (decimal)
 	sysID     string // pg_control_system() system_identifier output (decimal)
+	walRcv    string // pg_stat_wal_receiver "sender_host|status" output
 	err       error  // if set, every call fails (node unreachable)
 }
 
@@ -24,6 +25,8 @@ func (f fakeExec) Run(_ context.Context, _ []string, _ string, args ...string) (
 	}
 	sql := args[len(args)-1]
 	switch {
+	case strings.Contains(sql, "pg_stat_wal_receiver"):
+		return f.walRcv, nil
 	case strings.Contains(sql, "pg_is_in_recovery"):
 		return f.role, nil
 	case strings.Contains(sql, "pg_control_system"):
@@ -96,6 +99,36 @@ func TestProbeUnexpectedRoleOutput(t *testing.T) {
 	if ns.Reachable || ns.Role == RolePrimary {
 		t.Errorf("unparseable role must not classify as reachable/primary: %+v", ns)
 	}
+}
+
+func TestStreamingUpstream(t *testing.T) {
+	t.Run("streaming reports host + true", func(t *testing.T) {
+		p := proberWith(fakeExec{walRcv: "pg-0.h|streaming"})
+		host, streaming, err := p.StreamingUpstream(context.Background(), ConnInfo{Host: "x"})
+		if err != nil || !streaming || host != "pg-0.h" {
+			t.Fatalf("got (host=%q streaming=%v err=%v), want pg-0.h/true/nil", host, streaming, err)
+		}
+	})
+	t.Run("no walreceiver row -> not streaming", func(t *testing.T) {
+		p := proberWith(fakeExec{walRcv: ""})
+		host, streaming, err := p.StreamingUpstream(context.Background(), ConnInfo{Host: "x"})
+		if err != nil || streaming || host != "" {
+			t.Fatalf("got (host=%q streaming=%v err=%v), want empty/false/nil", host, streaming, err)
+		}
+	})
+	t.Run("connecting (not yet streaming) -> false", func(t *testing.T) {
+		p := proberWith(fakeExec{walRcv: "pg-0.h|connecting"})
+		_, streaming, err := p.StreamingUpstream(context.Background(), ConnInfo{Host: "x"})
+		if err != nil || streaming {
+			t.Fatalf("a non-streaming status must report false, got streaming=%v err=%v", streaming, err)
+		}
+	})
+	t.Run("unreachable -> err", func(t *testing.T) {
+		p := proberWith(fakeExec{err: errors.New("connection refused")})
+		if _, _, err := p.StreamingUpstream(context.Background(), ConnInfo{Host: "x"}); err == nil {
+			t.Fatal("an unreachable node must return an error")
+		}
+	})
 }
 
 func TestSystemIdentifier(t *testing.T) {
