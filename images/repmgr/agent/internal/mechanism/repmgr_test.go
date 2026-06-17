@@ -91,6 +91,16 @@ func TestCLICommands(t *testing.T) {
 		}
 	})
 
+	t.Run("follow does not swallow slot-active without the not-ahead signal", func(t *testing.T) {
+		// Both conditions are required: a slot-active error WITHOUT same-timeline/
+		// not-ahead may mean real work is pending (e.g. a stale slot on a divergent
+		// upstream), so it must surface, not be treated as already-following.
+		fr := &fakeRunner{failOn: "standby follow", failOut: "ERROR: slot \"repmgr_slot_1000\" already exists as an active slot"}
+		if err := newTestRepmgr(fr).Follow(ctx, 1000); err == nil {
+			t.Fatal("slot-active alone (no same-timeline/not-ahead) must surface as an error")
+		}
+	})
+
 	t.Run("clone passes PGPASSWORD via env, not argv", func(t *testing.T) {
 		fr := &fakeRunner{}
 		if err := newTestRepmgr(fr).Clone(ctx, src); err != nil {

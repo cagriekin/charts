@@ -511,8 +511,9 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			return err
 		}
 		up := nodeID(dec.Target)
-		if err := a.mech.RegisterStandby(ctx, up); err != nil {
-			a.log.Warn("register standby in repmgr.nodes", "err", err)
+		regErr := a.mech.RegisterStandby(ctx, up)
+		if regErr != nil {
+			a.log.Warn("register standby in repmgr.nodes", "err", regErr)
 		}
 		// #182: a healthy standby is already streaming from the lease holder before
 		// this first Follow runs -- a repmgrd->agent migration keeps primary_conninfo
@@ -521,7 +522,15 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// unlatched, repeats every tick. Skip the command when already streaming from
 		// the target and latch; repointing to a NEW upstream (sender_host differs, or
 		// no walreceiver yet) still falls through to Follow.
-		if a.streamingFromTarget(ctx, dec.Target) {
+		//
+		// Gate the skip on a successful register: the follow it replaces implicitly
+		// requires the repmgr.nodes record (repmgr fails "unable to retrieve node
+		// record" -- NOT the benign exit -- and retries when it is missing), but the
+		// probe bypasses that check. A freshly-cloned standby streams before it is ever
+		// registered, so latching here on a failed register would strand it without a
+		// record and break a later promote. On a failed register, fall through to
+		// follow (which re-establishes the record, or errors so the next tick retries).
+		if regErr == nil && a.streamingFromTarget(ctx, dec.Target) {
 			a.followUpstream = dec.Target
 			return nil
 		}
