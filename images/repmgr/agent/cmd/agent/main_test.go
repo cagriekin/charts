@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -46,6 +47,7 @@ func (f *fakeDCS) Release()                                   { f.released = tru
 // counts repmgr standby follow invocations and stubs the pg_stat_wal_receiver probe.
 type scriptedExec struct {
 	walRcv  string // pg_stat_wal_receiver "sender_host|status" output (psql)
+	regErr  error  // error returned for `repmgr standby register` (nil = success)
 	follows int    // number of `repmgr standby follow` calls
 }
 
@@ -54,6 +56,11 @@ func (s *scriptedExec) Run(_ context.Context, _ []string, name string, args ...s
 	switch {
 	case name == "psql" && strings.Contains(joined, "pg_stat_wal_receiver"):
 		return s.walRcv, nil
+	case name == "repmgr" && strings.Contains(joined, "standby register"):
+		if s.regErr != nil {
+			return "register failed", s.regErr
+		}
+		return "ok", nil
 	case name == "repmgr" && strings.Contains(joined, "standby follow"):
 		s.follows++
 		return "ok", nil
@@ -131,6 +138,22 @@ func TestActFollowRepointsWhenStreamingFromWrongUpstream(t *testing.T) {
 	}
 	if ex.follows != 1 {
 		t.Fatalf("a standby streaming from the wrong upstream must be repointed via follow, got %d calls", ex.follows)
+	}
+}
+
+// A freshly-cloned standby streams before it is registered in repmgr.nodes. If
+// RegisterStandby fails, the probe-skip must NOT latch (that would strand the node
+// without a record and break a later promote); it falls through to repmgr standby
+// follow, which re-establishes the record or errors so the next tick retries.
+func TestActFollowDoesNotSkipWhenRegisterFails(t *testing.T) {
+	ex := &scriptedExec{walRcv: "pg-0.h|streaming", regErr: errors.New("primary unreachable")}
+	a := newFollowTestAgent(t, ex)
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if ex.follows != 1 {
+		t.Fatalf("a failed register must NOT skip follow (the probe bypasses repmgr's node-record check), got %d follow calls", ex.follows)
 	}
 }
 
