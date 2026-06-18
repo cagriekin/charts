@@ -4,6 +4,10 @@
 
 ### Security
 
+- **The `fix-permissions` init container drops its excess capabilities (#162).** The
+  chown init container needs root but inherited the full default capability set; it now
+  drops ALL and adds back only `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, matching the chart's
+  other root init container.
 - **The pgBackRest backup CronJob is now security-hardened (#155).** It was the one
   pod with zero hardening (ran as root, full caps, no seccomp) yet carries the
   exec-capable pgBackRest SA token, and failed admission in Pod-Security-`restricted`
