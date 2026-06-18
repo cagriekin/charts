@@ -30,6 +30,16 @@
 
 ### Fixed
 
+- **A failed `pg_dump` left a truncated dump masquerading as the newest backup
+  (#159).** If `pg_dump` exited non-zero mid-stream (connection drop during failover,
+  OOM), `mc pipe` finalized the truncated object at the canonical
+  `backup_<ts>.dump` name and it remained the lexically-newest backup until the next
+  successful run (~24h) — so an operator restoring "the latest" during an incident
+  could pick a corrupt dump. The dump is now streamed to a `.tmp` staging object and
+  published to the canonical name with `mc mv` only after the `pg_restore --list`
+  integrity check passes, so a truncated dump never reaches the canonical name. An
+  EXIT trap removes the staging object on failure, and retention also sweeps stale
+  `.tmp` objects orphaned by a hard-killed run.
 - **pgBackRest config changes (S3 endpoint/bucket/retention) didn't roll the pods
   (#145).** `pgbackrest.conf` is a subPath mount — which the kubelet never
   live-updates — and the StatefulSet pod template did not checksum the pgBackRest

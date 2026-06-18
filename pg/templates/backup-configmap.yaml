@@ -62,11 +62,20 @@ data:
     echo "Configuring S3 alias..."
     export MC_HOST_s3="${S3_ENDPOINT%%://*}://$(urlencode "$S3_ACCESS_KEY"):$(urlencode "$S3_SECRET_KEY")@${S3_ENDPOINT#*://}"
 
-    echo "Starting streaming backup to s3/${S3_PATH}..."
-    PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -Fc -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" | mc pipe "s3/${S3_PATH}"
+    # Stage to a .tmp object and publish (mc mv) to the canonical backup_<ts>.dump
+    # name ONLY after integrity is verified (#159). A mid-stream pg_dump failure makes
+    # mc finalize a truncated object; staging keeps that truncation off the canonical
+    # name, so a restore of "the newest backup" can never pick a half-written dump.
+    # The EXIT trap removes the staging object on any early failure (a no-op once the
+    # mv has run); stale stages from a hard-killed run are swept by retention below.
+    S3_TMP="${S3_PATH}.tmp"
+    trap 'mc rm "s3/${S3_TMP}" >/dev/null 2>&1 || true' EXIT
+
+    echo "Starting streaming backup to s3/${S3_PATH} (staged via .tmp)..."
+    PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -Fc -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" | mc pipe "s3/${S3_TMP}"
 
     echo "Verifying upload..."
-    UPLOADED_SIZE=$(mc ls --json "s3/${S3_PATH}" | grep -o '"size":[0-9]*' | grep -o '[0-9]*')
+    UPLOADED_SIZE=$(mc ls --json "s3/${S3_TMP}" | grep -o '"size":[0-9]*' | grep -o '[0-9]*')
     if [ -z "$UPLOADED_SIZE" ] || [ "$UPLOADED_SIZE" -eq 0 ]; then
       echo "ERROR: Upload verification failed - file missing or zero bytes"
       exit 1
@@ -74,10 +83,16 @@ data:
     echo "Upload verified: ${UPLOADED_SIZE} bytes"
 
     echo "Verifying backup integrity via pg_restore --list..."
-    mc cat "s3/${S3_PATH}" > /tmp/verify_backup.dump
+    mc cat "s3/${S3_TMP}" > /tmp/verify_backup.dump
     pg_restore --list /tmp/verify_backup.dump > /dev/null
     echo "Backup integrity verified"
     rm -f /tmp/verify_backup.dump
+
+    # Integrity confirmed -> publish the staged object to the canonical name. mc mv is
+    # a server-side copy + delete; the canonical PutObject is itself atomic, so a reader
+    # of backup_<ts>.dump only ever sees a complete, verified dump (never a torn one).
+    echo "Publishing verified backup to s3/${S3_PATH}..."
+    mc mv "s3/${S3_TMP}" "s3/${S3_PATH}"
 
     # Guard against wiping the whole prefix: the dump uploaded above must be
     # visible as a recent object. If it is not (upload landed elsewhere,
@@ -96,6 +111,13 @@ data:
     # under the prefix safe (#143).
     echo "Running retention cleanup (removing backups older than ${RETENTION_DAYS} days)..."
     mc find "s3/${S3_DIR}/" --name 'backup_*.dump' --older-than "${RETENTION_DAYS}d" --exec "mc rm {}"
+
+    # Sweep stale staging objects orphaned by a hard-killed run (the EXIT trap covers
+    # the normal failure path; this catches a SIGKILL/OOM that skipped it). A short 1d
+    # window reaps them promptly (vs RETENTION_DAYS) while never racing a concurrent
+    # run's fresh stage. Scoped to this release's subpath; never matches a published
+    # backup_<ts>.dump (#159).
+    mc find "s3/${S3_DIR}/" --name '*.tmp' --older-than "1d" --exec "mc rm {}"
 
     echo "Backup completed successfully"
 {{- end }}
