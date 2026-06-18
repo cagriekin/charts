@@ -89,6 +89,11 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if not .Values.repmgr.enabled }}
+      # Standalone (no repmgr): the agent/service-updater that need the API token are
+      # not present, so don't mount one (#166). In repmgr mode the token is required.
+      automountServiceAccountToken: false
+      {{- end }}
       {{- if .Values.repmgr.enabled }}
       terminationGracePeriodSeconds: {{ .Values.repmgr.terminationGracePeriodSeconds | default 120 }}
       {{- end }}

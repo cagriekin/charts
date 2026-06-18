@@ -190,6 +190,8 @@ preStop:
 {{- end }}
 
 {{- define "pg.exporterPodSpec" -}}
+# The exporter scrapes PostgreSQL only, never the Kubernetes API, so don't mount an SA token (#166).
+automountServiceAccountToken: false
 {{- with .Values.imagePullSecrets }}
 imagePullSecrets:
   {{- toYaml . | nindent 2 }}

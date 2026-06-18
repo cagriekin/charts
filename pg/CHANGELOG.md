@@ -4,6 +4,13 @@
 
 ### Security
 
+- **Pods that make no Kubernetes API calls no longer mount a ServiceAccount token
+  (#166).** The pgpool Deployment, the prometheus-exporter Deployment, the backup
+  CronJob, and the StatefulSet in standalone (`repmgr.enabled=false`) mode ran as the
+  namespace default ServiceAccount with its token projected in — an unnecessary,
+  valid API credential in pods that also hold the postgres superuser password. They
+  now set `automountServiceAccountToken: false`. The repmgr StatefulSet keeps its
+  token (the agent / service-updater genuinely call the API).
 - **S3 credentials no longer passed on the `mc` command line (#167).** The backup
   job ran `mc alias set s3 <endpoint> <access-key> <secret-key>`, exposing both keys
   in the process argv (`/proc/<pid>/cmdline`, readable via `ps` by other users on the
