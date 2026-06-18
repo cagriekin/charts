@@ -149,6 +149,14 @@ assert_contains "#157: archive_command doubles single quotes in the stanza" "${s
 numericenv=$(helm template test-pg "${CHART_DIR}" --set repmgr.database=12345 --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#156: numeric REPMGR_DB renders as a quoted string" "${numericenv}" 'value: "12345"'
 assert_not_contains "#156: numeric REPMGR_DB not a bare YAML scalar" "${numericenv}" 'value: 12345'
+# boolean coercion (the other half of #156): YAML types unquoted true/false as a bool,
+# which the API server also rejects for the string EnvVar.value.
+boolenv=$(helm template test-pg "${CHART_DIR}" --set repmgr.database=true --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#156: boolean REPMGR_DB renders as a quoted string" "${boolenv}" 'value: "true"'
+assert_not_contains "#156: boolean REPMGR_DB not a bare YAML bool" "${boolenv}" 'value: true'
+# a second quoted field (the env-var path the agent/sidecars also consume)
+stanzaenv=$(helm template test-pg "${CHART_DIR}" --set pgbackrest.enabled=true --set pgbackrest.s3.endpoint=https://s --set pgbackrest.s3.bucket=b --set pgbackrest.existingSecret.name=sec --set pgbackrest.stanza=123 --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#156: numeric PGBACKREST_STANZA renders as a quoted string" "${stanzaenv}" 'value: "123"'
 
 # Full: should have prometheus exporter deployment
 assert_contains "full: prometheus exporter present" "${full}" "postgres-exporter"
@@ -1285,9 +1293,12 @@ assert_contains "pgbackrest: CronJob runs as service account" "${pgbackrest_cron
 assert_contains "pgbackrest: CronJob resolves primary via endpoints" "${pgbackrest_cron}" "endpoints"
 assert_contains "pgbackrest: CronJob execs into sidecar" "${pgbackrest_cron}" "exec \"\$PRIMARY\" -c pgbackrest"
 assert_contains "pgbackrest: CronJob ensures stanza" "${pgbackrest_cron}" "stanza-create"
-# #160: stanza-create must NOT be masked with '|| true' -- a real failure (S3 perms,
-# kubectl exec error, needed stanza-upgrade) must surface, not be swallowed.
+# #160: stanza-create must NOT be masked -- a real failure (S3 perms, kubectl exec
+# error, needed stanza-upgrade) must surface, not be swallowed. Reject the common
+# error-suppression idioms, not just the exact original token.
 assert_not_contains "#160: stanza-create not masked with || true" "${pgbackrest_cron}" "stanza-create || true"
+assert_not_contains "#160: stanza-create not masked with || :" "${pgbackrest_cron}" "stanza-create || :"
+assert_not_contains "#160: stanza-create stderr not silenced" "${pgbackrest_cron}" "stanza-create 2>/dev/null"
 assert_contains "pgbackrest: CronJob runs backup" "${pgbackrest_cron}" "type=\"\$BACKUP_TYPE\" backup"
 assert_contains "pgbackrest: CronJob concurrency Forbid" "${pgbackrest_cron}" "concurrencyPolicy: Forbid"
 # assert_contains uses `grep` (regex), so escape the cron-spec stars.

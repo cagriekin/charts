@@ -370,6 +370,21 @@ Repmgr manages replication automatically. To check cluster status:
 kubectl exec -it my-pgvector-0 -- repmgr -f /etc/repmgr/repmgr.conf cluster show
 ```
 
+### Scaling down
+
+Scaling `postgresql.replicaCount` **down** removes the highest-ordinal pods but does
+**not** unregister them from `repmgr.nodes`, so they linger as `active` ghosts (`repmgr
+cluster show` shows them failed; in repmgrd mode survivors keep retrying the gone DNS
+names, adding failover-election delay) — a known gap (#139). After scaling down,
+manually unregister each removed ordinal from the current primary (node id =
+`ordinal + 1000`):
+
+```bash
+# for each removed ordinal N (>= the new replicaCount):
+kubectl exec -it my-pgvector-0 -- \
+  repmgr -f /etc/repmgr/repmgr.conf standby unregister --node-id=$((N + 1000))
+```
+
 ## PGPool-II Connection Pooling and Load Balancing
 
 When PGPool-II is enabled, it provides connection pooling and load balancing:
@@ -459,6 +474,24 @@ With repmgr enabled, the `<fullname>-readonly` service (see [Read-Only Connectio
 ## Prometheus Exporter
 
 This chart includes an optional PostgreSQL metrics exporter for Prometheus monitoring. The exporter runs as a single instance and can scrape metrics from all PostgreSQL instances (primary and replicas) using the multi-target pattern.
+
+> **Cross-namespace scraping with NetworkPolicy.** When `networkPolicy.enabled: true`,
+> the metric-port ingress rules (exporter 9116, pgpool 9719, agent 9200) admit
+> same-namespace pods only. A Prometheus in a separate monitoring namespace must be
+> allowed via a `namespaceSelector` — use `networkPolicy.prometheusExporter.extraIngress`
+> for 9116 (and `networkPolicy.pgpool.extraIngress` / `networkPolicy.postgresql.extraIngress`
+> for 9719 / 9200), e.g.:
+>
+> ```yaml
+> networkPolicy:
+>   prometheusExporter:
+>     extraIngress:
+>       - ports: [{ port: 9116, protocol: TCP }]
+>         from:
+>           - namespaceSelector:
+>               matchLabels:
+>                 kubernetes.io/metadata.name: monitoring
+> ```
 
 ### Enable Exporter
 
