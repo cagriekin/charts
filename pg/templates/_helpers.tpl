@@ -275,7 +275,10 @@ containers:
         protocol: TCP
     livenessProbe:
       httpGet:
-        path: /
+        # /metrics (not the always-200 landing page /) so the probe fails on a broken
+        # scrape pipeline -- a queries.yaml/collector regression returns 500 here while
+        # / stays 200 (#146). A DB outage returns 200 + pg_up 0, so this does not flap.
+        path: /metrics
         port: metrics
       initialDelaySeconds: 10
       periodSeconds: 10
@@ -283,7 +286,10 @@ containers:
       failureThreshold: 3
     readinessProbe:
       httpGet:
-        path: /
+        # /metrics (not the always-200 landing page /) so the probe fails on a broken
+        # scrape pipeline -- a queries.yaml/collector regression returns 500 here while
+        # / stays 200 (#146). A DB outage returns 200 + pg_up 0, so this does not flap.
+        path: /metrics
         port: metrics
       initialDelaySeconds: 5
       periodSeconds: 10

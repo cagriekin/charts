@@ -38,6 +38,14 @@
 
 ### Fixed
 
+- **postgres-exporter probes now detect a broken scrape pipeline (#146).** Both probes
+  hit the landing page `/`, which returns 200 unconditionally — so a `queries.yaml` /
+  collector regression that makes every scrape fail with HTTP 500 (as the chart's own
+  0.5.73–0.5.81 regression did for nine releases) left the exporter pods Ready and never
+  restarted while all DB metrics went dark. The liveness and readiness probes now hit
+  `/metrics` (matching the pgpool exporter), which returns 500 on genuine exporter/
+  registry breakage but 200 + `pg_up 0` on a database outage — so the probe catches
+  config breakage without flapping when the DB is merely down.
 - **pgpool PDB no longer wedges node drains on a single-replica install (#161).** The
   pgpool PodDisruptionBudget used `minAvailable: 1` with the default `pgpool.replicaCount:
   1`, so allowed disruptions were permanently 0 — `kubectl drain`, managed node upgrades,
