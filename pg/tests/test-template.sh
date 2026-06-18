@@ -1099,6 +1099,20 @@ assert_contains "pgbackrest: sidecar present" "${pgbackrest_sts}" "name: pgbackr
 assert_contains "pgbackrest: PGBACKREST_STANZA env var" "${pgbackrest_sts}" "PGBACKREST_STANZA"
 assert_contains "pgbackrest: S3 key env var" "${pgbackrest_sts}" "PGBACKREST_REPO1_S3_KEY"
 assert_contains "pgbackrest: config volume mount" "${pgbackrest_sts}" "pgbackrest-config"
+# #145: pgbackrest.conf is a subPath mount (never live-updated), so the pod template
+# must checksum it to roll the pod when the S3/retention config changes.
+assert_contains "pgbackrest #145: pod template checksums the pgbackrest config" "${pgbackrest_sts}" "checksum/pgbackrest-config:"
+pgbackrest_sts_changed=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --set pgbackrest.s3.bucket=other-bucket --show-only templates/statefulset.yaml 2>&1)
+csum_base=$(printf '%s\n' "${pgbackrest_sts}" | grep "checksum/pgbackrest-config:")
+csum_changed=$(printf '%s\n' "${pgbackrest_sts_changed}" | grep "checksum/pgbackrest-config:")
+if [ -n "${csum_base}" ] && [ "${csum_base}" != "${csum_changed}" ]; then
+  pass "pgbackrest #145: checksum changes when the pgbackrest config changes (pod rolls)"
+else
+  fail "pgbackrest #145: checksum changes when the pgbackrest config changes (pod rolls)" "base='${csum_base}' changed='${csum_changed}'"
+fi
+# default (pgbackrest disabled) must not emit the checksum
+pgbackrest_off=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "pgbackrest #145: no checksum when pgbackrest disabled" "${pgbackrest_off}" "checksum/pgbackrest-config:"
 
 # pgBackRest S3 key-type: default (shared) keeps static-key env + emits key-type.
 assert_contains "pgbackrest: default key-type is shared" "${pgbackrest}" "repo1-s3-key-type=shared"

@@ -13,6 +13,16 @@
 
 ### Fixed
 
+- **pgBackRest config changes (S3 endpoint/bucket/retention) didn't roll the pods
+  (#145).** `pgbackrest.conf` is a subPath mount (never live-updated by the kubelet)
+  and the StatefulSet pod template did not checksum the pgBackRest ConfigMap, so after
+  a `helm upgrade` that repointed the repository the pods kept archiving WAL + running
+  backups against the OLD location until manually restarted. The pod template now
+  carries a `checksum/pgbackrest-config` annotation, so any pgBackRest config change
+  rolls the StatefulSet and the new config takes effect. Operator note: changing
+  `pgbackrest.s3.*`/`pgbackrest.retention.*` now restarts the pods (previously a
+  no-op); rolling the current primary triggers a controlled failover, the same as any
+  rolling upgrade.
 - **Backup retention could delete another release's dumps under a shared
   bucket/prefix (#143).** `pg_dump` backups were written to a flat
   `<bucket>/<prefix>/backup_<ts>.dump` with no release identity, and the retention
