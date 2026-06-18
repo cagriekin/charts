@@ -431,7 +431,7 @@ When `postgresql.existingSecret.enabled` is `false`, a secret will be auto-gener
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `networkPolicy.enabled` | Enable NetworkPolicy resources for pod isolation | `false` |
-| `networkPolicy.postgresql.allowExternal` | Allow ingress to PostgreSQL from any pod in the namespace | `true` |
+| `networkPolicy.postgresql.allowExternal` | Allow ingress to PostgreSQL on 5432 from any pod in the namespace. This is the path the read-only Service (`<fullname>-readonly`, direct standby reads) relies on — see the caveat below before setting `false`. | `true` |
 | `networkPolicy.postgresql.extraIngress` | Additional ingress rules for PostgreSQL (full ingress-rule objects with their own `from`/`ports`, like `extraEgress`; appended at the rules level) | `[]` |
 | `networkPolicy.postgresql.extraEgress` | Additional egress rules for PostgreSQL | `[]` |
 | `networkPolicy.pgpool.extraIngress` | Additional ingress rules for PGPool-II (full ingress-rule objects with their own `from`/`ports`) | `[]` |
@@ -441,6 +441,34 @@ When enabled, NetworkPolicies restrict traffic:
 - **PostgreSQL**: ingress on 5432 from peer pods, PGPool, Prometheus exporter, backup jobs, and optionally all namespace pods. Egress allows DNS, peer replication, 443 and 6443 (S3 over HTTPS and the Kubernetes API server), and the port of `pgbackrest.s3.endpoint` when pgBackRest is enabled.
 - **PGPool**: ingress on 9999 from namespace pods. Egress only to PostgreSQL on 5432.
 - **Prometheus exporter**: ingress on 9116 from namespace pods. Egress only to PostgreSQL on 5432.
+
+> **`allowExternal: false` and the read-only Service.** `allowExternal` gates *direct*
+> client access to PostgreSQL on 5432. PGPool (9999) is always reachable in-namespace,
+> so read-write clients going through PGPool are unaffected. But the
+> `<fullname>-readonly` Service connects clients *directly* to standbys on 5432, so with
+> `allowExternal: false` those read connections are blocked while `kubectl get endpoints`
+> still looks healthy (connections simply time out). To keep direct-5432 clients
+> (read-only consumers, or apps connecting straight to the primary) working under
+> `allowExternal: false`, add a scoped `extraIngress` rule allowing your client pods,
+> e.g.:
+>
+> ```yaml
+> networkPolicy:
+>   postgresql:
+>     allowExternal: false
+>     extraIngress:
+>       - ports:
+>           - port: 5432
+>             protocol: TCP
+>         from:
+>           - podSelector:
+>               matchLabels:
+>                 app: my-read-client
+> ```
+>
+> For clients in another namespace, add a `namespaceSelector` (alone, or combined with
+> `podSelector` in the same `from` entry) — `podSelector` matches the policy's own
+> namespace only.
 
 ## Connecting to PostgreSQL
 

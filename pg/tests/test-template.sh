@@ -250,6 +250,16 @@ assert_contains "netpol: pgpool allows port 9999" "${netpol}" "port: 9999"
 assert_contains "netpol: exporter policy rendered" "${netpol}" "test-pg-prometheus-exporter"
 assert_contains "netpol: exporter allows port 9116" "${netpol}" "port: 9116"
 
+# #148: under allowExternal=false the documented extraIngress recipe re-allows scoped
+# direct-5432 clients (the read-only Service path), proving the documented workaround.
+netpol_extra=$(helm template test-pg "${CHART_DIR}" \
+  --set networkPolicy.enabled=true \
+  --set networkPolicy.postgresql.allowExternal=false \
+  --set "networkPolicy.postgresql.extraIngress[0].ports[0].port=5432" \
+  --set "networkPolicy.postgresql.extraIngress[0].from[0].podSelector.matchLabels.app=my-read-client" \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "#148: extraIngress recipe re-allows scoped direct-5432 clients" "${netpol_extra}" "app: my-read-client"
+
 # Test: NetworkPolicy without pgpool/exporter only renders postgresql policy
 netpol_minimal=$(helm template test-pg "${CHART_DIR}" \
   -f "${SCRIPT_DIR}/values-repmgr.yaml" \

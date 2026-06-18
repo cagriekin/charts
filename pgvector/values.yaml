@@ -523,6 +523,11 @@ pgbackrest:
 networkPolicy:
   enabled: false
   postgresql:
+    # Gates DIRECT client access to PostgreSQL on 5432 from any same-namespace pod.
+    # The <fullname>-readonly Service connects clients directly to standbys on 5432,
+    # so allowExternal=false blocks the read-only path (PGPool on 9999 stays reachable,
+    # so read-write clients via PGPool are unaffected). To keep direct-5432 clients
+    # working under allowExternal=false, add a scoped extraIngress rule for them.
     allowExternal: true
     extraIngress: []
     extraEgress: []
