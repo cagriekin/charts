@@ -207,16 +207,16 @@ spec:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretDatabaseKey" . }}
             - name: REPMGR_USER
-              value: {{ .Values.repmgr.username }}
+              value: {{ .Values.repmgr.username | quote }}
             - name: REPMGR_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretRepmgrPasswordKey" . }}
             - name: REPMGR_DB
-              value: {{ .Values.repmgr.database }}
+              value: {{ .Values.repmgr.database | quote }}
             - name: HEADLESS_SERVICE
-              value: {{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
+              value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
             - name: REPMGR_NODE_COUNT
               value: {{ add .Values.postgresql.replicaCount 1 | quote }}
           volumeMounts:
@@ -313,16 +313,16 @@ spec:
                   key: {{ include "pg.secretDatabaseKey" . }}
 {{- if .Values.repmgr.enabled }}
             - name: REPMGR_USER
-              value: {{ .Values.repmgr.username }}
+              value: {{ .Values.repmgr.username | quote }}
             - name: REPMGR_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretRepmgrPasswordKey" . }}
             - name: REPMGR_DB
-              value: {{ .Values.repmgr.database }}
+              value: {{ .Values.repmgr.database | quote }}
             - name: HEADLESS_SERVICE
-              value: {{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
+              value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
             - name: REPMGR_NODE_COUNT
               value: {{ add .Values.postgresql.replicaCount 1 | quote }}
             # Lets the entrypoint stale-primary guard read the durable primary
@@ -334,7 +334,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: PRIMARY_MARKER
-              value: {{ include "pg.fullname" . }}-primary
+              value: {{ printf "%s-primary" (include "pg.fullname" .) | quote }}
 {{- if eq (include "pg.agentMode" .) "true" }}
             {{- /* fail fast with a clear message if an overlay nulls out the agent
                    block, rather than a raw nil-pointer on .leaseDuration below */}}
@@ -344,7 +344,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             - name: LEASE_NAME
-              value: {{ include "pg.fullname" . }}-leader
+              value: {{ printf "%s-leader" (include "pg.fullname" .) | quote }}
             - name: LEASE_DURATION
               value: {{ .Values.repmgr.agent.leaseDuration | quote }}
             - name: RENEW_DEADLINE
@@ -354,7 +354,7 @@ spec:
             - name: RECONCILE_INTERVAL
               value: {{ .Values.repmgr.agent.reconcileInterval | quote }}
             - name: MASTER_SERVICE
-              value: {{ include "pg.fullname" . }}
+              value: {{ include "pg.fullname" . | quote }}
             - name: POD_SELECTOR
               value: app.kubernetes.io/name={{ include "pg.name" . }},app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=postgresql
             {{- /* The agent owns pg_hba in agent mode: it writes a hardened SCRAM-only
@@ -398,7 +398,7 @@ spec:
             - name: PGBACKREST_ENABLED
               value: "true"
             - name: PGBACKREST_STANZA
-              value: {{ .Values.pgbackrest.stanza }}
+              value: {{ .Values.pgbackrest.stanza | quote }}
 {{- if eq .Values.pgbackrest.s3.keyType "shared" }}
             - name: PGBACKREST_REPO1_S3_KEY
               valueFrom:
@@ -774,16 +774,16 @@ spec:
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
             - name: REPMGR_USER
-              value: {{ .Values.repmgr.username }}
+              value: {{ .Values.repmgr.username | quote }}
             - name: REPMGR_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretRepmgrPasswordKey" . }}
             - name: REPMGR_DB
-              value: {{ .Values.repmgr.database }}
+              value: {{ .Values.repmgr.database | quote }}
             - name: HEADLESS_SERVICE
-              value: {{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
+              value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
             - name: REPMGR_NODE_COUNT
               value: {{ add .Values.postgresql.replicaCount 1 | quote }}
             - name: MONITORING_HISTORY_DAYS
@@ -815,29 +815,29 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: MASTER_SERVICE
-              value: {{ include "pg.fullname" . }}
+              value: {{ include "pg.fullname" . | quote }}
             - name: PRIMARY_MARKER
-              value: {{ include "pg.fullname" . }}-primary
+              value: {{ printf "%s-primary" (include "pg.fullname" .) | quote }}
             - name: HEADLESS_SERVICE
-              value: {{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local
+              value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
             - name: REPMGR_NODE_COUNT
               value: {{ add .Values.postgresql.replicaCount 1 | quote }}
             - name: REPMGR_USER
-              value: {{ .Values.repmgr.username }}
+              value: {{ .Values.repmgr.username | quote }}
             - name: REPMGR_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretRepmgrPasswordKey" . }}
             - name: REPMGR_DB
-              value: {{ .Values.repmgr.database }}
+              value: {{ .Values.repmgr.database | quote }}
             - name: SPLIT_BRAIN_ACTION
-              value: {{ .Values.repmgr.splitBrainDetection.action }}
+              value: {{ .Values.repmgr.splitBrainDetection.action | quote }}
 {{- if .Values.pgpool.enabled }}
             - name: PGPOOL_DEPLOYMENT
-              value: {{ include "pg.fullname" . }}-pgpool
+              value: {{ printf "%s-pgpool" (include "pg.fullname" .) | quote }}
             - name: PGPOOL_SERVICE
-              value: {{ include "pg.fullname" . }}-pgpool.{{ .Release.Namespace }}.svc.cluster.local
+              value: {{ printf "%s-pgpool.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
             - name: PGPOOL_PORT
               value: "{{ .Values.pgpool.service.port }}"
             - name: POSTGRES_USER
@@ -894,7 +894,7 @@ spec:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
             - name: PGBACKREST_STANZA
-              value: {{ .Values.pgbackrest.stanza }}
+              value: {{ .Values.pgbackrest.stanza | quote }}
 {{- if eq .Values.pgbackrest.s3.keyType "shared" }}
             - name: PGBACKREST_REPO1_S3_KEY
               valueFrom:

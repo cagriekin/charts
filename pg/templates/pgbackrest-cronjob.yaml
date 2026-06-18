@@ -75,11 +75,11 @@ spec:
                     fieldRef:
                       fieldPath: metadata.namespace
                 - name: PRIMARY_SVC
-                  value: {{ include "pg.fullname" $root }}
+                  value: {{ include "pg.fullname" $root | quote }}
                 - name: STANZA
-                  value: {{ $root.Values.pgbackrest.stanza }}
+                  value: {{ $root.Values.pgbackrest.stanza | quote }}
                 - name: BACKUP_TYPE
-                  value: {{ $type }}
+                  value: {{ $type | quote }}
               resources:
                 {{- toYaml $root.Values.pgbackrest.cronjob.resources | nindent 16 }}
 {{- end }}
