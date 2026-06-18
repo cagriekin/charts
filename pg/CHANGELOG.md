@@ -68,6 +68,13 @@
 
 ### Fixed
 
+- **emptyDir volumes are now size-capped (#165).** None of the chart's emptyDirs set a
+  `sizeLimit`, so a runaway volume — especially PGDATA when `persistence.enabled=false`
+  — could fill the node's root filesystem and evict unrelated pods instead of being
+  capped and evicted itself. Fixed caps are set on the config/tool/extension volumes
+  (16Mi config, 128Mi backup tools, 1Gi extension trees), and the non-persistent data
+  volume gets a configurable `postgresql.persistence.emptyDir.sizeLimit` (default empty
+  = unbounded, preserving prior behavior; set e.g. `8Gi` for ephemeral use).
 - **pgBackRest `stanza-create` no longer masks real failures (#160).** The pgBackRest
   backup CronJob ran `stanza-create || true`, which swallowed not just the benign
   "stanza already exists" case (`stanza-create` is natively idempotent and exits 0 then)

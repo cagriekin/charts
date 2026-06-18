@@ -311,7 +311,8 @@ volumes:
     configMap:
       name: {{ include "pg.fullname" . }}-postgres-exporter
   - name: exporter-config
-    emptyDir: {}
+    emptyDir:
+      sizeLimit: 16Mi
 {{- end }}
 
 {{/*

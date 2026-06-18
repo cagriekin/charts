@@ -943,13 +943,16 @@ spec:
 {{- end }}
 {{- if .Values.postgresql.extensions.enabled }}
         - name: ext-lib
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 1Gi
         - name: ext-share
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 1Gi
 {{- end }}
 {{- if .Values.repmgr.enabled }}
         - name: repmgr-config
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 16Mi
 {{- end }}
 {{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.repmgr.agent.dcs.etcd).tls).secretName) }}
         - name: etcd-tls
@@ -965,14 +968,20 @@ spec:
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
         - name: pg-run
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 16Mi
         - name: pgbackrest-config
           configMap:
             name: {{ include "pg.fullname" . }}-pgbackrest
 {{- end }}
 {{- if not .Values.postgresql.persistence.enabled }}
         - name: data
+{{- with .Values.postgresql.persistence.emptyDir.sizeLimit }}
+          emptyDir:
+            sizeLimit: {{ . }}
+{{- else }}
           emptyDir: {}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- if .Values.postgresql.persistence.enabled }}
