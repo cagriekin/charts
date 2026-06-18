@@ -1293,6 +1293,35 @@ assert_not_contains "pgbackrest disabled: no configmap" "${pgbackrest_disabled}"
 assert_not_contains "pgbackrest disabled: no sidecar" "${pgbackrest_disabled}" "name: pgbackrest"
 assert_not_contains "pgbackrest disabled: no CronJob" "${pgbackrest_disabled}" "kind: CronJob"
 
+# --- Resource name length guard (#158) ---
+
+# Test: a fullnameOverride that pushes a Service name past 63 fails fast at render.
+longname_svc=$(helm template test-pg "${CHART_DIR}" \
+  --set fullnameOverride=averyveryverylongfullnameoverridethatreachessixtythreecharsabc 2>&1) && longname_svc_rc=0 || longname_svc_rc=$?
+assert_eq "#158: render fails when a Service name exceeds 63 chars" "1" "${longname_svc_rc}"
+assert_contains "#158: Service-length error names the 63 limit" "${longname_svc}" "limited to 63"
+
+# Test: a name short enough for Services but too long for a CronJob (+pgbackrest) fails.
+longname_cron=$(helm template test-pg "${CHART_DIR}" \
+  --set fullnameOverride=shorterbutstilltoolongforcronjobxxxxxxx \
+  --set pgbackrest.enabled=true --set pgbackrest.s3.endpoint=https://s --set pgbackrest.s3.bucket=b \
+  --set pgbackrest.existingSecret.name=sec 2>&1) && longname_cron_rc=0 || longname_cron_rc=$?
+assert_eq "#158: render fails when a CronJob name exceeds 52 chars" "1" "${longname_cron_rc}"
+assert_contains "#158: CronJob-length error names the 52 limit" "${longname_cron}" "<= 52"
+
+# Test: a name short enough for a Service (<=63) but too long for a Deployment-backed
+# resource (pgpool/exporter, <=47 for the generated Pod name) fails.
+longname_deploy=$(helm template test-pg "${CHART_DIR}" \
+  --set fullnameOverride=fiftycharfullnameoverrideforpgpooldeploycheck00000 \
+  --set pgpool.enabled=true 2>&1) && longname_deploy_rc=0 || longname_deploy_rc=$?
+assert_eq "#158: render fails when a Deployment name exceeds 47 chars" "1" "${longname_deploy_rc}"
+assert_contains "#158: Deployment-length error names the 47 limit" "${longname_deploy}" "<= 47"
+
+# Test: a normal release name renders fine (guard is a no-op).
+normalname=$(helm template test-pg "${CHART_DIR}" 2>&1) && normalname_rc=0 || normalname_rc=$?
+assert_eq "#158: normal release name renders (guard no-op)" "0" "${normalname_rc}"
+assert_not_contains "#158: no length error for a normal name" "${normalname}" "limited to 63"
+
 # --- Standalone replica validation Tests ---
 
 # Test: rendering fails fast when repmgr is disabled with replicaCount > 0
