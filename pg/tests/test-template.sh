@@ -1261,6 +1261,15 @@ fi
 pgbackrest_off=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1)
 assert_not_contains "pgbackrest #145: no checksum when pgbackrest disabled" "${pgbackrest_off}" "checksum/pgbackrest-config:"
 
+# #121: the primary lookup uses EndpointSlices (discovery.k8s.io), not the
+# deprecated core Endpoints API, in both the CronJob script and the RBAC Role.
+pgbackrest_cj=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/pgbackrest-cronjob.yaml 2>&1)
+assert_contains "pgbackrest #121: CronJob resolves primary via endpointslices" "${pgbackrest_cj}" "get endpointslices"
+assert_not_contains "pgbackrest #121: CronJob no longer uses the Endpoints API" "${pgbackrest_cj}" 'get endpoints "'
+pgbackrest_rbac=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/pgbackrest-rbac.yaml 2>&1)
+assert_contains "pgbackrest #121: RBAC grants discovery.k8s.io endpointslices" "${pgbackrest_rbac}" "discovery.k8s.io"
+assert_not_contains "pgbackrest #121: RBAC drops the deprecated endpoints resource" "${pgbackrest_rbac}" 'resources: ["endpoints"]'
+
 # pgBackRest S3 key-type: default (shared) keeps static-key env + emits key-type.
 assert_contains "pgbackrest: default key-type is shared" "${pgbackrest}" "repo1-s3-key-type=shared"
 
@@ -1382,13 +1391,15 @@ assert_contains "pgbackrest rbac: ServiceAccount renders" "${pgbackrest_rbac}" "
 assert_contains "pgbackrest rbac: Role renders" "${pgbackrest_rbac}" "kind: Role"
 assert_contains "pgbackrest rbac: RoleBinding renders" "${pgbackrest_rbac}" "kind: RoleBinding"
 assert_contains "pgbackrest rbac: pods/exec verb create" "${pgbackrest_rbac}" "pods/exec"
-assert_contains "pgbackrest rbac: endpoints get verb" "${pgbackrest_rbac}" "endpoints"
+assert_contains "pgbackrest rbac: endpointslices list verb (#121)" "${pgbackrest_rbac}" "endpointslices"
 # #134: pods get and pods/exec create must be scoped by resourceNames to the
 # StatefulSet's deterministic pod names, not left namespace-wide (an unscoped
-# Role lets a leaked SA token exec into every pod in the namespace). All three
-# rules (endpoints, pods, pods/exec) carry resourceNames after the fix.
+# Role lets a leaked SA token exec into every pod in the namespace). Both pod
+# rules (pods, pods/exec) carry resourceNames. The EndpointSlice list (#121)
+# cannot be resourceName-scoped (slice names are auto-generated) and reads only
+# EndpointSlice metadata, so it is excluded from this count.
 pgbackrest_rn_count=$(printf '%s\n' "${pgbackrest_rbac}" | grep -c 'resourceNames:')
-assert_eq "pgbackrest rbac: endpoints+pods+pods/exec all resourceName-scoped (#134)" "3" "${pgbackrest_rn_count}"
+assert_eq "pgbackrest rbac: pods+pods/exec resourceName-scoped (#134)" "2" "${pgbackrest_rn_count}"
 assert_contains "pgbackrest rbac: scoped to pod test-pg-0 (#134)" "${pgbackrest_rbac}" "\"test-pg-0\""
 assert_contains "pgbackrest rbac: scoped to pod test-pg-1 (#134)" "${pgbackrest_rbac}" "\"test-pg-1\""
 pgbackrest_rbac_n=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --set postgresql.replicaCount=2 --show-only templates/pgbackrest-rbac.yaml 2>&1)
