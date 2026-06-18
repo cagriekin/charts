@@ -30,6 +30,16 @@
 
 ### Fixed
 
+- **Long release/fullname now fails fast instead of rendering invalid resource names
+  (#158).** `pg.fullname` is capped at 63 but per-resource suffixes are appended after
+  it, so a long `fullnameOverride` could render a Service name over 63 chars (rejected
+  by the API server) or a CronJob name over ~52 chars (silently fails to spawn Jobs) —
+  with no render-time hint. The chart now validates composed Service (≤63),
+  Deployment-backed (≤47, for pgpool/exporter Pod names) and CronJob (≤52) names at
+  render time and fails with a clear message naming the offending name and the current
+  `pg.fullname` length. Truncation was rejected as unsafe on a stateful
+  chart (two long names could collide on one StatefulSet/PVC). Normal names are
+  unaffected (the guard is a no-op).
 - **A failed `pg_dump` left a truncated dump masquerading as the newest backup
   (#159).** If `pg_dump` exited non-zero mid-stream (connection drop during failover,
   OOM), `mc pipe` finalized the truncated object at the canonical

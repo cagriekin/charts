@@ -6,6 +6,46 @@
 {{- include "common.fullname" . }}
 {{- end }}
 
+{{/*
+Validate composed resource names against Kubernetes limits (#158). pg.fullname is
+capped at 63, but per-resource suffixes are appended AFTER it, so a long
+fullnameOverride can push a Service name past 63 (RFC1035 label) or a CronJob name
+past ~52 (a CronJob must leave room for the generated -<timestamp> Job and -<hash>
+Pod name suffixes). Truncating composed names is unsafe on a STATEFUL chart -- two
+long names could collide on one StatefulSet/PVC -- so fail fast at render time with a
+clear hint instead of a confusing API rejection at apply / first scheduled run.
+*/}}
+{{- define "pg.validateResourceNames" -}}
+{{- $f := include "pg.fullname" . -}}
+{{- /* Plain Services (and the base name): RFC1035 label, max 63. */ -}}
+{{- $services := list $f (printf "%s-headless" $f) (printf "%s-readonly" $f) -}}
+{{- range $n := $services -}}
+{{- if gt (len $n) 63 -}}
+{{- fail (printf "\n\nresource name %q is %d chars, but Kubernetes Service names are limited to 63 (RFC1035 label). Shorten the release name or fullnameOverride (pg.fullname is currently %q, %d chars)." $n (len $n) $f (len $f)) -}}
+{{- end -}}
+{{- end -}}
+{{- /* Deployment-backed names (pgpool, exporter) are ALSO Services, but the binding
+limit is the Deployment's generated Pod name <name>-<rs-hash>-<suffix>: the ~16-char
+ReplicaSet-hash + Pod suffix must fit under 63, so the name itself must be <= 47. */ -}}
+{{- $deployments := list -}}
+{{- if .Values.pgpool.enabled -}}{{- $deployments = append $deployments (printf "%s-pgpool" $f) -}}{{- end -}}
+{{- if .Values.prometheusExporter.enabled -}}{{- $deployments = append $deployments (printf "%s-postgres-exporter" $f) -}}{{- end -}}
+{{- range $n := $deployments -}}
+{{- if gt (len $n) 47 -}}
+{{- fail (printf "\n\nDeployment name %q is %d chars, but must be <= 47 to leave room for the generated ReplicaSet-hash + Pod name suffixes (a 63-char Pod name limit). Shorten the release name or fullnameOverride (pg.fullname is currently %q, %d chars)." $n (len $n) $f (len $f)) -}}
+{{- end -}}
+{{- end -}}
+{{- /* CronJobs: max 52, to leave room for the generated -<timestamp> Job suffix. */ -}}
+{{- $cronjobs := list -}}
+{{- if .Values.backup.enabled -}}{{- $cronjobs = append $cronjobs (printf "%s-backup" $f) -}}{{- end -}}
+{{- if .Values.pgbackrest.enabled -}}{{- $cronjobs = concat $cronjobs (list (printf "%s-pgbackrest-full" $f) (printf "%s-pgbackrest-diff" $f)) -}}{{- end -}}
+{{- range $n := $cronjobs -}}
+{{- if gt (len $n) 52 -}}
+{{- fail (printf "\n\nCronJob name %q is %d chars, but must be <= 52 to leave room for the generated Job/Pod name suffixes. Shorten the release name or fullnameOverride (pg.fullname is currently %q, %d chars)." $n (len $n) $f (len $f)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "pg.chart" -}}
 {{- include "common.chart" . }}
 {{- end }}
