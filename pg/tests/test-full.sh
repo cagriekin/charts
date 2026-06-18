@@ -97,9 +97,11 @@ assert_eq "write through pgpool persisted on primary" "${PGPOOL_VALUE}" "${pgpoo
 pgpool_containers=$(kubectl get pod -n "${NAMESPACE}" "${pgpool_pod}" -o jsonpath='{.spec.containers[*].name}')
 assert_contains "pgpool has metrics sidecar" "${pgpool_containers}" "pgpool-exporter"
 
-# Test: pgpool pcp port
+# Test: the PCP admin port (9898) is NOT exposed on the Service by default (#118).
+# It is opt-in via pgpool.service.exposePcp; the pcp_* tools still reach it on the
+# container port (localhost) inside the pod, validated next.
 pcp_port=$(kubectl get svc -n "${NAMESPACE}" "${FULLNAME}-pgpool" -o jsonpath='{.spec.ports[?(@.name=="pcp")].port}')
-assert_eq "pgpool pcp port is 9898" "9898" "${pcp_port}"
+assert_eq "pgpool PCP port not exposed on Service by default (#118)" "" "${pcp_port}"
 
 # Test: PCP admin auth works end-to-end (#130). pcp.conf must hash the admin
 # password as md5; under the old sha256 every pcp_* command failed auth. pgpool's
