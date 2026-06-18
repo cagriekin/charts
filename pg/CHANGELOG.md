@@ -68,6 +68,14 @@
 
 ### Fixed
 
+- **Init containers now declare resource requests/limits (#153).** No init container
+  set resources, so in a namespace with a `ResourceQuota` requiring requests/limits
+  every pod of the chart was rejected at admission (Forbidden) unless a `LimitRange`
+  happened to inject defaults — and the `repmgr-init` standby clone (a full
+  `pg_basebackup`) ran with unbounded CPU/memory/IO. The lightweight inits (chown, cp,
+  config-gen across the StatefulSet, pgpool/exporter Deployments, and backup CronJob)
+  now use a small shared default; `repmgr-init` uses an overridable
+  `repmgr.initContainerResources` (heavier, sized for the clone).
 - **emptyDir volumes are now size-capped (#165).** None of the chart's emptyDirs set a
   `sizeLimit`, so a runaway volume — especially PGDATA when `persistence.enabled=false`
   — could fill the node's root filesystem and evict unrelated pods instead of being

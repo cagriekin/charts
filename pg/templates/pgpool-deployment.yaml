@@ -157,6 +157,8 @@ spec:
                 secretKeyRef:
                   name: {{ include "pg.pgpoolAdminSecretName" . }}
                   key: {{ include "pg.pgpoolAdminPasswordKey" . }}
+          resources:
+            {{- include "pg.initResources" . | nindent 12 }}
           volumeMounts:
             - name: config
               mountPath: /config

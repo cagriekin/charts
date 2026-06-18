@@ -57,6 +57,11 @@
 
 ### Fixed
 
+- **Init containers now declare resource requests/limits (#153).** No init container set
+  resources, so in a namespace with a `ResourceQuota` every pod was rejected at admission
+  unless a `LimitRange` injected defaults, and the `repmgr-init` clone ran unbounded. The
+  lightweight inits now use a small shared default; `repmgr-init` uses an overridable
+  `repmgr.initContainerResources`.
 - **emptyDir volumes are now size-capped (#165).** No emptyDir set a `sizeLimit`, so a
   runaway volume — especially PGDATA when `persistence.enabled=false` — could fill the
   node and evict unrelated pods. Fixed caps are set on the config/tool/extension volumes

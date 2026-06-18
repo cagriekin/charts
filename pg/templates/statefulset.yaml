@@ -164,6 +164,8 @@ spec:
                 - CHOWN
                 - DAC_OVERRIDE
                 - FOWNER
+          resources:
+            {{- include "pg.initResources" . | nindent 12 }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
@@ -181,6 +183,8 @@ spec:
               mountPath: /ext-lib
             - name: ext-share
               mountPath: /ext-share
+          resources:
+            {{- include "pg.initResources" . | nindent 12 }}
 {{- end }}
 {{- if .Values.postgresql.extensions.enabled }}
 {{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
@@ -195,6 +199,8 @@ spec:
               mountPath: /ext-lib
             - name: ext-share
               mountPath: /ext-share
+          resources:
+            {{- include "pg.initResources" . | nindent 12 }}
 {{- end }}
 {{- if .Values.repmgr.enabled }}
         - name: repmgr-init
@@ -239,6 +245,8 @@ spec:
               mountPath: /var/lib/postgresql/data
             - name: repmgr-config
               mountPath: /etc/repmgr
+          resources:
+            {{- toYaml .Values.repmgr.initContainerResources | nindent 12 }}
 {{- end }}
         - name: setup-config
           image: busybox:1.37
@@ -280,6 +288,8 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+          resources:
+            {{- include "pg.initResources" . | nindent 12 }}
       containers:
         - name: postgresql
 {{- if .Values.repmgr.enabled }}

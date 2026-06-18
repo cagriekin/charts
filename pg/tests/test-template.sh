@@ -257,6 +257,13 @@ assert_not_contains "#165: no uncapped emptyDir in a full render" "${sized_full}
 data_capped=$(helm template test-pg "${CHART_DIR}" --set postgresql.persistence.enabled=false --set postgresql.persistence.emptyDir.sizeLimit=8Gi --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#165: non-persistent data emptyDir honors the sizeLimit" "${data_capped}" "sizeLimit: 8Gi"
 
+# #153: init containers must declare resources (else pods are Forbidden under a
+# ResourceQuota). Lightweight inits use the small shared block (cpu: 10m); repmgr-init
+# (the clone) uses its own heavier, overridable resources.
+init_res=$(helm template test-pg "${CHART_DIR}" --set postgresql.extensions.enabled=true --set postgresql.majorVersion=18 --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#153: lightweight init containers declare resources" "${init_res}" "cpu: 10m"
+assert_contains "#153: repmgr-init declares its (heavier) clone resources" "${init_res}" "memory: 1Gi"
+
 # Test: pgpool deployment has pod securityContext
 assert_contains "full: pgpool has runAsNonRoot" "${full}" "runAsNonRoot: true"
 

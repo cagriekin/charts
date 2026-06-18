@@ -15,6 +15,21 @@ Pod name suffixes). Truncating composed names is unsafe on a STATEFUL chart -- t
 long names could collide on one StatefulSet/PVC -- so fail fast at render time with a
 clear hint instead of a confusing API rejection at apply / first scheduled run.
 */}}
+{{/*
+Small default resources for the lightweight init containers (chown, cp, config-gen).
+Init containers without requests/limits make every pod Forbidden in ResourceQuota-
+enforced namespaces (#153). repmgr-init (the standby clone) is heavier and uses its own
+values-overridable repmgr.initContainerResources instead.
+*/}}
+{{- define "pg.initResources" -}}
+requests:
+  cpu: 10m
+  memory: 16Mi
+limits:
+  cpu: 100m
+  memory: 64Mi
+{{- end -}}
+
 {{- define "pg.validateResourceNames" -}}
 {{- $f := include "pg.fullname" . -}}
 {{- /* Plain Services (and the base name): RFC1035 label, max 63. */ -}}
@@ -250,6 +265,8 @@ initContainers:
           secretKeyRef:
             name: {{ include "pg.secretName" . }}
             key: {{ include "pg.secretDatabaseKey" . }}
+    resources:
+      {{- include "pg.initResources" . | nindent 6 }}
     volumeMounts:
       - name: config
         mountPath: /config
