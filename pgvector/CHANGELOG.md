@@ -13,6 +13,13 @@
 
 ### Documentation
 
+- **Documented scale-down ghost nodes in `repmgr.nodes` (#139).** Scaling
+  `postgresql.replicaCount` down removes the highest-ordinal pods but does not
+  unregister them from `repmgr.nodes`, so they linger as `active` ghosts (`repmgr
+  cluster show` shows them failed; in repmgrd mode survivors keep retrying the gone DNS
+  names). After scaling down, manually unregister each removed ordinal from the primary:
+  `repmgr -f /etc/repmgr/repmgr.conf standby unregister --node-id=<ordinal+1000>`.
+  (Automatic deregistration is not yet implemented — tracked in #139.)
 - **Clarified that `networkPolicy.postgresql.allowExternal=false` blocks the read-only
   Service (#148).** `allowExternal` gates direct client access to PostgreSQL on 5432 —
   the path the `<fullname>-readonly` Service (direct standby reads) uses — so with

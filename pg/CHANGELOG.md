@@ -15,6 +15,15 @@
 
 ### Documentation
 
+- **Corrected the false "clean deregistration" claim and documented scale-down ghost
+  nodes (#139).** The README claimed the repmgrd preStop hook (`repmgr daemon stop`)
+  performed "clean deregistration" — it does not; it only stops the daemon. Scaling
+  `postgresql.replicaCount` down therefore leaves the removed nodes in `repmgr.nodes`
+  as `active` ghosts (`repmgr cluster show` shows them failed; in repmgrd mode the
+  survivors keep retrying the gone DNS names, adding failover-election delay). The
+  README now describes the preStop hook accurately and adds a **Scaling down** section
+  with the manual `repmgr standby unregister --node-id=<ordinal+1000>` cleanup.
+  (Automatic deregistration is not yet implemented — tracked in #139.)
 - **Clarified that `networkPolicy.postgresql.allowExternal=false` blocks the read-only
   Service (#148).** `allowExternal` gates direct client access to PostgreSQL on 5432,
   which is exactly the path the `<fullname>-readonly` Service (direct standby reads)
