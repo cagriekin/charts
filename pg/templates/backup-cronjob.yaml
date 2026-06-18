@@ -31,6 +31,8 @@ spec:
           priorityClassName: {{ . }}
           {{- end }}
           restartPolicy: OnFailure
+          # The backup job talks only to PostgreSQL + S3, never the Kubernetes API (#166).
+          automountServiceAccountToken: false
           securityContext:
             {{- toYaml .Values.backup.podSecurityContext | nindent 12 }}
           initContainers:

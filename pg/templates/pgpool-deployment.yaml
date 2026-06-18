@@ -48,6 +48,8 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      # pgpool makes no Kubernetes API calls, so don't mount an SA token (#166).
+      automountServiceAccountToken: false
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

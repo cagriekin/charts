@@ -1148,6 +1148,18 @@ assert_not_contains "backup #159: pg_dump no longer streams directly to the cano
 assert_contains "backup: pod has runAsNonRoot" "${backup_cronjob}" "runAsNonRoot: true"
 assert_contains "backup: container has allowPrivilegeEscalation false" "${backup_cronjob}" "allowPrivilegeEscalation: false"
 
+# #166: pods that make no Kubernetes API calls must not mount an SA token; the repmgr
+# StatefulSet (agent/service-updater DO call the API) must keep its token.
+assert_contains "#166: backup pod disables SA token automount" "${backup_cronjob}" "automountServiceAccountToken: false"
+pgpool_deploy166=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --show-only templates/pgpool-deployment.yaml 2>&1)
+assert_contains "#166: pgpool pod disables SA token automount" "${pgpool_deploy166}" "automountServiceAccountToken: false"
+exporter_deploy166=$(helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true --show-only templates/prometheus-exporter-deployment.yaml 2>&1)
+assert_contains "#166: exporter pod disables SA token automount" "${exporter_deploy166}" "automountServiceAccountToken: false"
+sts_agent166=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#166: repmgr StatefulSet keeps its SA token (agent needs the API)" "${sts_agent166}" "automountServiceAccountToken"
+sts_standalone166=$(helm template test-pg "${CHART_DIR}" --set repmgr.enabled=false --set postgresql.replicaCount=0 --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#166: standalone StatefulSet disables SA token automount" "${sts_standalone166}" "automountServiceAccountToken: false"
+
 # Test: backup cronjob respects custom activeDeadlineSeconds
 backup_custom=$(helm template test-pg "${CHART_DIR}" \
   --set backup.enabled=true \
