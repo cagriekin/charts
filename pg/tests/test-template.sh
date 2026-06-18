@@ -1313,6 +1313,12 @@ assert_not_contains "#160: stanza-create not masked with || :" "${pgbackrest_cro
 assert_not_contains "#160: stanza-create stderr not silenced" "${pgbackrest_cron}" "stanza-create 2>/dev/null"
 assert_contains "pgbackrest: CronJob runs backup" "${pgbackrest_cron}" "type=\"\$BACKUP_TYPE\" backup"
 assert_contains "pgbackrest: CronJob concurrency Forbid" "${pgbackrest_cron}" "concurrencyPolicy: Forbid"
+# #155: the pgbackrest CronJob (which holds the exec-capable SA token) must be hardened
+# like the chart's other pods (runAsNonRoot + drop ALL), not run as root.
+assert_contains "#155: pgbackrest CronJob pod runs as non-root" "${pgbackrest_cron}" "runAsNonRoot: true"
+assert_contains "#155: pgbackrest CronJob seccompProfile RuntimeDefault" "${pgbackrest_cron}" "type: RuntimeDefault"
+assert_contains "#155: pgbackrest CronJob container drops capabilities" "${pgbackrest_cron}" "capabilities:"
+assert_contains "#155: pgbackrest CronJob no privilege escalation" "${pgbackrest_cron}" "allowPrivilegeEscalation: false"
 # assert_contains uses `grep` (regex), so escape the cron-spec stars.
 assert_contains "pgbackrest: full CronJob carries full schedule" "${pgbackrest_cron}" 'schedule: "0 1 \* \* 0"'
 assert_contains "pgbackrest: diff CronJob carries diff schedule" "${pgbackrest_cron}" 'schedule: "0 1 \* \* 1-6"'

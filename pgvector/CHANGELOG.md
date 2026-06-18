@@ -4,6 +4,13 @@
 
 ### Security
 
+- **The pgBackRest backup CronJob is now security-hardened (#155).** It was the one
+  pod with zero hardening (ran as root, full caps, no seccomp) yet carries the
+  exec-capable pgBackRest SA token, and failed admission in Pod-Security-`restricted`
+  namespaces. It now applies `pgbackrest.cronjob.podSecurityContext` /
+  `containerSecurityContext` (defaults: `runAsNonRoot`, `runAsUser: 65534`,
+  `seccompProfile: RuntimeDefault`, `allowPrivilegeEscalation: false`, drop ALL),
+  matching the chart's other pods.
 - **Pods that make no Kubernetes API calls no longer mount a ServiceAccount token
   (#166).** The pgpool Deployment, the prometheus-exporter Deployment, the backup
   CronJob, and the StatefulSet in standalone (`repmgr.enabled=false`) mode now set
