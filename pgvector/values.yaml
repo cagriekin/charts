@@ -366,7 +366,14 @@ pgpool:
 
   podDisruptionBudget:
     enabled: true
-    minAvailable: 1
+    # maxUnavailable (not minAvailable) so a single-replica pgpool can still be evicted
+    # during a node drain / upgrade / autoscaler scale-down (minAvailable: 1 with
+    # replicaCount: 1 leaves zero allowed disruptions forever and wedges drains, #161),
+    # while a multi-replica pgpool keeps rolling protection. pgpool is stateless, so an
+    # eviction simply reschedules. Mirrors the postgresql PDB.
+    maxUnavailable: 1
+    unhealthyPodEvictionPolicy: AlwaysAllow
+    minAvailable: null
 
 prometheusExporter:
   enabled: false

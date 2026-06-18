@@ -5,6 +5,8 @@
   "labels"          "pg.labels"
   "selectorLabels"  "pg.selectorLabels"
   "minAvailable"    .Values.pgpool.podDisruptionBudget.minAvailable
+  "maxUnavailable"  .Values.pgpool.podDisruptionBudget.maxUnavailable
+  "unhealthyPodEvictionPolicy" .Values.pgpool.podDisruptionBudget.unhealthyPodEvictionPolicy
   "annotations"     .Values.global.annotations
 ) }}
 {{- end }}

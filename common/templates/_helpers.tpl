@@ -204,11 +204,14 @@ spec:
     matchLabels:
       {{- include .selectorLabels .ctx | nindent 6 }}
       app.kubernetes.io/component: {{ .component }}
-  {{- with .minAvailable }}
-  minAvailable: {{ . }}
-  {{- end }}
-  {{- with .maxUnavailable }}
-  maxUnavailable: {{ . }}
+  {{- /* A PDB accepts exactly ONE of minAvailable/maxUnavailable; the API rejects both.
+         Render only one: an explicitly-set minAvailable wins (callers default it to
+         null), else fall back to maxUnavailable -- so a caller that sets minAvailable
+         without also nulling a default maxUnavailable cannot render both (#161). */}}
+  {{- if .minAvailable }}
+  minAvailable: {{ .minAvailable }}
+  {{- else if .maxUnavailable }}
+  maxUnavailable: {{ .maxUnavailable }}
   {{- end }}
   {{- with .unhealthyPodEvictionPolicy }}
   {{- /* k8s >=1.27 (beta, default on); older API servers prune the unknown field

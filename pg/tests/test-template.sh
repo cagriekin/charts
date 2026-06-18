@@ -917,6 +917,18 @@ assert_contains "pdb: postgresql uses maxUnavailable: 1" "${pdb}" "maxUnavailabl
 assert_contains "pdb: postgresql sets unhealthyPodEvictionPolicy: AlwaysAllow" "${pdb}" "unhealthyPodEvictionPolicy: AlwaysAllow"
 assert_not_contains "pdb: postgresql no longer uses minAvailable" "${pdb}" "minAvailable"
 
+# #161: pgpool PDB uses maxUnavailable (not minAvailable: 1) so a single-replica
+# pgpool can still be evicted on a node drain instead of wedging it forever.
+pdb_pgpool=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --show-only templates/pdb-pgpool.yaml 2>&1)
+assert_contains "#161: pgpool PDB uses maxUnavailable: 1" "${pdb_pgpool}" "maxUnavailable: 1"
+assert_contains "#161: pgpool PDB sets unhealthyPodEvictionPolicy: AlwaysAllow" "${pdb_pgpool}" "unhealthyPodEvictionPolicy: AlwaysAllow"
+assert_not_contains "#161: pgpool PDB no longer uses minAvailable" "${pdb_pgpool}" "minAvailable"
+# #161: an explicit minAvailable override must render ONE field, never both (the API
+# rejects a PDB with both min+maxUnavailable). minAvailable wins over the default maxUnavailable.
+pdb_override=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.podDisruptionBudget.minAvailable=1 --show-only templates/pdb-pgpool.yaml 2>&1)
+assert_contains "#161: explicit minAvailable override is honored" "${pdb_override}" "minAvailable: 1"
+assert_not_contains "#161: PDB never renders both minAvailable and maxUnavailable" "${pdb_override}" "maxUnavailable"
+
 # values-cloud.yaml preset: 3-node, hard zone spread, managed-cloud lease timings.
 # Off by default (base renders no DoNotSchedule spread).
 cloud=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/../values-cloud.yaml" --set repmgr.failoverMode=agent --show-only templates/statefulset.yaml 2>&1)
