@@ -270,6 +270,16 @@ netpol_extra=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/networkpolicy.yaml 2>&1)
 assert_contains "#148: extraIngress recipe re-allows scoped direct-5432 clients" "${netpol_extra}" "app: my-read-client"
 
+# #147: the exporter NetworkPolicy now has an extraIngress escape hatch so a Prometheus
+# in another namespace can scrape 9116 (the default 9116 ingress is same-namespace only).
+netpol_exporter_extra=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-full-test.yaml" \
+  --set networkPolicy.enabled=true \
+  --set "networkPolicy.prometheusExporter.extraIngress[0].ports[0].port=9116" \
+  --set "networkPolicy.prometheusExporter.extraIngress[0].from[0].namespaceSelector.matchLabels.team=monitoring" \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "#147: exporter NetworkPolicy honors extraIngress (cross-namespace scrape)" "${netpol_exporter_extra}" "team: monitoring"
+
 # Test: NetworkPolicy without pgpool/exporter only renders postgresql policy
 netpol_minimal=$(helm template test-pg "${CHART_DIR}" \
   -f "${SCRIPT_DIR}/values-repmgr.yaml" \
