@@ -1058,6 +1058,10 @@ assert_contains "backup: pg_restore verification present" "${backup_configmap}" 
 assert_contains "backup #143: dump path namespaced per release (fullname)" "${backup_configmap}" 'S3_DIR="${S3_BUCKET}/${S3_PREFIX%/}/test-pg"'
 assert_contains "backup #143: find calls scoped to the release subpath + name filter" "${backup_configmap}" 'mc find "s3/${S3_DIR}/" --name '"'"'backup_'
 assert_not_contains "backup #143: retention not run over the bare shared prefix" "${backup_configmap}" 'mc find "s3/${S3_BUCKET}/${S3_PREFIX}/" --older-than'
+# #167: S3 credentials must not be passed in mc argv (visible in /proc/<pid>/cmdline);
+# provide them via MC_HOST_s3 read from the environment instead.
+assert_contains "backup #167: credentials provided via MC_HOST_s3 env" "${backup_configmap}" "export MC_HOST_s3="
+assert_not_contains "backup #167: no mc alias set with the endpoint in argv" "${backup_configmap}" 'mc alias set s3 "$S3_ENDPOINT"'
 
 assert_contains "backup: pod has runAsNonRoot" "${backup_cronjob}" "runAsNonRoot: true"
 assert_contains "backup: container has allowPrivilegeEscalation false" "${backup_cronjob}" "allowPrivilegeEscalation: false"

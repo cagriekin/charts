@@ -37,8 +37,30 @@ data:
     # postgres image ships no CA bundle; use the one copied from the mc image
     export SSL_CERT_FILE=/tools/ca-bundle.crt
 
+    # Provide S3 credentials to mc via MC_HOST_<alias> read from the environment,
+    # NOT `mc alias set ... <access> <secret>` which exposes both keys in the
+    # process argv (/proc/<pid>/cmdline, readable via ps) on every run (#167).
+    # Percent-encode the keys so reserved characters (/, +, @, :, found in real
+    # AWS secret keys) survive inside the credential URL.
+    case "$S3_ENDPOINT" in
+      *://*) ;;
+      *) echo "ERROR: S3_ENDPOINT must include a scheme (http:// or https://)" >&2; exit 1 ;;
+    esac
+    urlencode() {
+      # LC_ALL=C forces byte-wise iteration: under the image's UTF-8 locale
+      # ${#s}/${s:i:1} index by codepoint and would mis-encode a non-ASCII key byte.
+      local LC_ALL=C s="$1" out="" i c
+      for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+          [a-zA-Z0-9.~_-]) out+="$c" ;;
+          *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+        esac
+      done
+      printf '%s' "$out"
+    }
     echo "Configuring S3 alias..."
-    mc alias set s3 "$S3_ENDPOINT" "$S3_ACCESS_KEY" "$S3_SECRET_KEY"
+    export MC_HOST_s3="${S3_ENDPOINT%%://*}://$(urlencode "$S3_ACCESS_KEY"):$(urlencode "$S3_SECRET_KEY")@${S3_ENDPOINT#*://}"
 
     echo "Starting streaming backup to s3/${S3_PATH}..."
     PGPASSWORD="$POSTGRES_PASSWORD" pg_dump -Fc -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" | mc pipe "s3/${S3_PATH}"
