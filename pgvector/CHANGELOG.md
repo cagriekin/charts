@@ -57,6 +57,10 @@
 
 ### Fixed
 
+- **Backup integrity check no longer buffers the whole dump to `/tmp` (#119).** The
+  verify step wrote the entire dump to the container's unbounded writable layer before
+  `pg_restore --list`; a large DB could hit node-disk eviction. It now streams
+  (`mc cat … | pg_restore --list`).
 - **Init containers now declare resource requests/limits (#153).** No init container set
   resources, so in a namespace with a `ResourceQuota` every pod was rejected at admission
   unless a `LimitRange` injected defaults, and the `repmgr-init` clone ran unbounded. The

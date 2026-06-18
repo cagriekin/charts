@@ -86,11 +86,13 @@ data:
     fi
     echo "Upload verified: ${UPLOADED_SIZE} bytes"
 
+    # Stream the integrity check instead of buffering the whole dump to /tmp on the
+    # container's (unbounded, unsized) writable layer -- a large DB could otherwise hit
+    # node-disk eviction (#119). pg_restore --list reads the TOC from stdin; under
+    # pipefail a failure in mc cat or pg_restore aborts the job.
     echo "Verifying backup integrity via pg_restore --list..."
-    mc cat "s3/${S3_TMP}" > /tmp/verify_backup.dump
-    pg_restore --list /tmp/verify_backup.dump > /dev/null
+    mc cat "s3/${S3_TMP}" | pg_restore --list > /dev/null
     echo "Backup integrity verified"
-    rm -f /tmp/verify_backup.dump
 
     # Integrity confirmed -> publish the staged object to the canonical name. mc mv is
     # a server-side copy + delete; the canonical PutObject is itself atomic, so a reader

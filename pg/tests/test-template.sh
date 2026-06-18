@@ -1137,6 +1137,10 @@ backup_configmap=$(helm template test-pg "${CHART_DIR}" \
   --set backup.existingSecret.name=test-secret \
   --show-only templates/backup-configmap.yaml 2>&1)
 assert_contains "backup: pg_restore verification present" "${backup_configmap}" "pg_restore --list"
+# #119: the verify streams the dump to pg_restore (no unbounded /tmp buffer that could
+# fill the node on a large DB).
+assert_contains "#119: backup verify is streamed to pg_restore" "${backup_configmap}" "| pg_restore --list"
+assert_not_contains "#119: backup verify does not buffer the dump to /tmp" "${backup_configmap}" "verify_backup.dump"
 # #143: dumps are namespaced per release and retention is scoped to this release's
 # own dump objects, so a shared bucket/prefix can never delete another release's backups.
 # needles are regex-safe (assert_contains greps as a regex): avoid the *. in backup_*.dump

@@ -68,6 +68,12 @@
 
 ### Fixed
 
+- **Backup integrity check no longer buffers the whole dump to `/tmp` (#119).** The
+  verify step did `mc cat > /tmp/verify_backup.dump` before `pg_restore --list`, writing
+  the entire dump to the container's unbounded, unsized writable layer — a large
+  database could hit node-disk eviction. It now streams the archive
+  (`mc cat … | pg_restore --list`), so the TOC is checked without staging the dump
+  locally.
 - **Init containers now declare resource requests/limits (#153).** No init container
   set resources, so in a namespace with a `ResourceQuota` requiring requests/limits
   every pod of the chart was rejected at admission (Forbidden) unless a `LimitRange`
