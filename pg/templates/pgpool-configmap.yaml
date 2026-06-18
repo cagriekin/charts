@@ -75,7 +75,7 @@ data:
     client_idle_limit = {{ .Values.pgpool.clientIdleLimit }}
 
     connection_cache = on
-    reset_query_list = '{{ .Values.pgpool.resetQueryList }}'
+    reset_query_list = '{{ .Values.pgpool.resetQueryList | toString | replace "'" "''" }}'
     load_balance_mode = on
     ssl = off
 

@@ -26,6 +26,15 @@
 
 ### Fixed
 
+- **Single quotes in `postgresql.configuration` / `pgpool.resetQueryList` no longer
+  produce an invalid config (#157).** Both were interpolated naively into single-quoted
+  conf lines, so a value containing a `'` rendered a syntactically-invalid `custom.conf`
+  (postgres CrashLoopBackOff after the config roll) or a broken `reset_query_list`
+  (pgpool fails to start). Embedded single quotes are now doubled (`''`, the
+  PostgreSQL/pgpool conf-lexer escape) in `postgresql.configuration` values,
+  `pgpool.resetQueryList`, and the `archive_command` stanza. Values without quotes
+  render unchanged. (Newline-bearing conf values remain unsupported — they fail the
+  render rather than injecting a directive.)
 - **Long release/fullname now fails fast instead of rendering invalid resource names
   (#158).** `pg.fullname` is capped at 63 but per-resource suffixes are appended after
   it, so a long `fullnameOverride` could render a Service name over 63 chars or a
