@@ -55,6 +55,8 @@
   left in place (not migrated, not deleted); see the README restore section for the
   new path layout.
 
+## 1.0.2
+
 Bugfix for agent mode (the 1.0.0 default), in lockstep with pg 1.0.2. Image moves
 to `trixie-5.5.0-18`. No chart-template or values changes beyond the image tag; a
 `helm upgrade` rolls the pods once.
