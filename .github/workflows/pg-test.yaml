@@ -37,6 +37,20 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # GitHub-hosted runners ship ~14GB free on /, which the cache-miss path
+      # (a pg/values.yaml change busts the image cache key, so docker pull + save +
+      # kind load makes three on-disk copies of every cached image) plus the
+      # apt-heavy repmgr build and its mode=max buildx cache export intermittently
+      # exhaust -> "No space left on device". Reclaim the preinstalled toolchains
+      # this job never uses (~25GB) before anything touches the disk.
+      - name: Free up runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell /usr/share/swift
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
       - name: Check out repository
         uses: actions/checkout@v4
 
@@ -95,6 +109,9 @@ jobs:
             --cache-to type=gha,mode=max,scope=repmgr-image \
             -t "cagriekin/repmgr:${tag}" images/repmgr
           kind load docker-image "cagriekin/repmgr:${tag}" --name pg-test
+          # kind keeps its own copy inside the node container, so drop the daemon
+          # copy (~2GB) to leave headroom for the live test suites that follow.
+          docker image rm "cagriekin/repmgr:${tag}" >/dev/null 2>&1 || true
 
       - name: Run template tests
         run: make -C pg test-template
