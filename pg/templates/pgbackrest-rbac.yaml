@@ -23,11 +23,13 @@ metadata:
     {{- . | nindent 4 }}
   {{- end }}
 rules:
-  # Resolve the current primary pod via the primary service endpoints.
-  - apiGroups: [""]
-    resources: ["endpoints"]
-    resourceNames: [{{ include "pg.fullname" . | quote }}]
-    verbs: ["get"]
+  # Resolve the current primary pod via the primary Service's EndpointSlices
+  # (the core Endpoints API is deprecated). EndpointSlice names are
+  # auto-generated, so the lookup is a label-selected list and cannot be
+  # resourceName-scoped; it reads only EndpointSlice metadata in this namespace.
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list"]
   # Exec into the pgbackrest sidecar of the primary pod to run the backup.
   # kubectl exec GETs the target pod then POSTs to its pods/exec subresource;
   # the backup only ever targets the resolved primary, which is always one of

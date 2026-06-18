@@ -101,6 +101,15 @@
   deployments. They now share a `busyboxImage` value (`repository`/`tag`/`pullPolicy`,
   default `busybox:1.37`). The pgBackRest CronJob (`pgbackrest.cronjob.image`) and the
   backup `mc` image (`backup.mc.image`) were already configurable.
+- **Primary lookup uses EndpointSlice instead of the deprecated Endpoints API
+  (#121).** The pgBackRest backup CronJob resolved the current primary with
+  `kubectl get endpoints`; the core Endpoints API is deprecated in favor of
+  EndpointSlice. The CronJob now lists the write Service's EndpointSlices
+  (`discovery.k8s.io`, filtered to the Ready endpoint) and the Role grants
+  `endpointslices` instead of `endpoints`. EndpointSlice names are auto-generated,
+  so this is a namespace-scoped read of EndpointSlice metadata (list) rather than a
+  resourceName-scoped get; the security-critical pods/exec scoping (#134) is
+  unchanged.
 - **Backup integrity check no longer buffers the whole dump to `/tmp` (#119).** The
   verify step did `mc cat > /tmp/verify_backup.dump` before `pg_restore --list`, writing
   the entire dump to the container's unbounded, unsized writable layer — a large

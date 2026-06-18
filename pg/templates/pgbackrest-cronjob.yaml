@@ -50,10 +50,15 @@ spec:
               command: ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
               args:
                 - |
-                  PRIMARY=$(kubectl -n "$NAMESPACE" get endpoints "$PRIMARY_SVC" \
-                    -o jsonpath='{.subsets[0].addresses[0].targetRef.name}')
+                  # Resolve the primary pod from the write Service's EndpointSlices
+                  # (the core Endpoints API is deprecated). Take the first Ready
+                  # endpoint; the write Service selects only the primary pod.
+                  PRIMARY_RAW=$(kubectl -n "$NAMESPACE" get endpointslices \
+                    -l "kubernetes.io/service-name=$PRIMARY_SVC" \
+                    -o jsonpath='{.items[*].endpoints[?(@.conditions.ready==true)].targetRef.name}')
+                  PRIMARY=${PRIMARY_RAW%% *}
                   if [ -z "$PRIMARY" ]; then
-                    echo "ERROR: no primary pod found in endpoints/$PRIMARY_SVC" >&2
+                    echo "ERROR: no ready primary pod found in endpointslices for $PRIMARY_SVC" >&2
                     exit 1
                   fi
                   echo "Primary pod resolved to: $PRIMARY"
