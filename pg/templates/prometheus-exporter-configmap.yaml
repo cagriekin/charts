@@ -40,4 +40,34 @@ data:
         - receive_replay_lag_bytes:
             usage: "GAUGE"
             description: "Bytes of WAL received from the primary but not yet replayed; 0 on the primary"
+{{- if .Values.pgbackrest.enabled }}
+    # WAL archiving health (#30). archive_mode is on only when pgBackRest is
+    # enabled, so this group is gated on it and scraped on the primary (archiving
+    # happens there). pg_stat_archiver is readable without filesystem/superuser
+    # access, so it does not depend on the exporter running as a superuser.
+    # failed_count rising = archive_command failing; seconds_since_last_archived
+    # rising while WAL is generated = archiving falling behind.
+    pg_wal_archive:
+      query: |
+        SELECT
+          archived_count,
+          failed_count,
+          COALESCE(EXTRACT(EPOCH FROM (now() - last_archived_time))::float, -1) AS seconds_since_last_archived,
+          COALESCE(EXTRACT(EPOCH FROM (now() - last_failed_time))::float, -1) AS seconds_since_last_failed
+        FROM pg_stat_archiver
+      master: true
+      metrics:
+        - archived_count:
+            usage: "COUNTER"
+            description: "WAL segments successfully archived since the last stats reset"
+        - failed_count:
+            usage: "COUNTER"
+            description: "Failed WAL archive attempts since the last stats reset (archive_command failures)"
+        - seconds_since_last_archived:
+            usage: "GAUGE"
+            description: "Seconds since the last successful WAL archive (-1 if none yet); rising while WAL is generated indicates archiving lag"
+        - seconds_since_last_failed:
+            usage: "GAUGE"
+            description: "Seconds since the last failed WAL archive attempt (-1 if none)"
+{{- end }}
 {{- end }}
