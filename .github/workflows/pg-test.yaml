@@ -185,18 +185,25 @@ jobs:
         if: failure()
         run: |
           kubectl get pods -A -o wide || true
-          kubectl get events -A --sort-by=.lastTimestamp | tail -80 || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
           kubectl get pvc -A || true
-          # container logs for any non-Ready pod, so startup crash loops
-          # (e.g. a repmgrd register race) are diagnosable from the CI log
-          for ns in pg-test-minimal pg-test-repmgr pg-test-repmgr-chaos pg-test-full pg-test-config-repmgr; do
+          # Iterate every chart test namespace (repmgrd, agent, etcd, migration,
+          # upgrade) discovered at runtime, not a fixed subset, so any suite's
+          # failure is diagnosable -- the agent/etcd/migrate namespaces were
+          # previously invisible here.
+          for ns in $(kubectl get ns -o name 2>/dev/null | sed 's#namespace/##' | grep '^pg-test'); do
             for pod in $(kubectl get pods -n "$ns" -o name 2>/dev/null); do
               ready=$(kubectl get -n "$ns" "$pod" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
               [ "$ready" = "True" ] && continue
               echo "===== $ns/$pod (Ready=$ready) ====="
-              for c in postgresql repmgrd service-updater; do
-                echo "--- $c (current) ---"; kubectl logs -n "$ns" "$pod" -c "$c" --tail=40 2>/dev/null || true
-                echo "--- $c (previous) ---"; kubectl logs -n "$ns" "$pod" -c "$c" --previous --tail=40 2>/dev/null || true
+              # describe surfaces init-container progress and waiting/terminated
+              # reasons (OOMKilled, CrashLoopBackOff, the failing init's exit code)
+              kubectl describe -n "$ns" "$pod" 2>/dev/null | sed -n '/^Init Containers:/,/^Conditions:/p' || true
+              # logs for every container -- init AND regular -- current + previous,
+              # so a clone/register crash loop in any init is captured
+              for c in $(kubectl get -n "$ns" "$pod" -o jsonpath='{.spec.initContainers[*].name} {.spec.containers[*].name}' 2>/dev/null); do
+                echo "--- $c (current) ---"; kubectl logs -n "$ns" "$pod" -c "$c" --tail=50 2>/dev/null || true
+                echo "--- $c (previous) ---"; kubectl logs -n "$ns" "$pod" -c "$c" --previous --tail=50 2>/dev/null || true
               done
             done
           done
