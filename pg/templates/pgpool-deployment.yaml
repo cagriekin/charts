@@ -85,7 +85,8 @@ spec:
         {{- toYaml .Values.pgpool.podSecurityContext | nindent 8 }}
       initContainers:
         - name: init-config
-          image: busybox:1.35
+          image: "{{ .Values.busyboxImage.repository }}:{{ .Values.busyboxImage.tag }}"
+          imagePullPolicy: {{ .Values.busyboxImage.pullPolicy }}
           securityContext:
             {{- toYaml .Values.pgpool.containerSecurityContext | nindent 12 }}
           command:

@@ -218,7 +218,8 @@ securityContext:
   {{- toYaml .Values.prometheusExporter.podSecurityContext | nindent 2 }}
 initContainers:
   - name: init-config
-    image: busybox:1.35
+    image: "{{ .Values.busyboxImage.repository }}:{{ .Values.busyboxImage.tag }}"
+    imagePullPolicy: {{ .Values.busyboxImage.pullPolicy }}
     securityContext:
       {{- toYaml .Values.prometheusExporter.containerSecurityContext | nindent 6 }}
     command:
