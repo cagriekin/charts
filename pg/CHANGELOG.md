@@ -38,6 +38,17 @@
 
 ### Fixed
 
+- **pgpool PDB no longer wedges node drains on a single-replica install (#161).** The
+  pgpool PodDisruptionBudget used `minAvailable: 1` with the default `pgpool.replicaCount:
+  1`, so allowed disruptions were permanently 0 — `kubectl drain`, managed node upgrades,
+  and autoscaler scale-down hung indefinitely on the pgpool node. It now uses
+  `maxUnavailable: 1` + `unhealthyPodEvictionPolicy: AlwaysAllow` (mirroring the
+  postgresql PDB): a single-replica pgpool can be evicted (it is stateless and simply
+  reschedules), while a multi-replica pgpool keeps rolling protection (at most one pod
+  down at a time). The shared `common.podDisruptionBudget` helper now renders exactly
+  one of `minAvailable`/`maxUnavailable` (an explicit `minAvailable` wins, else
+  `maxUnavailable`), so a partial override can no longer emit both — which the API
+  rejects.
 - **Numeric/boolean-looking env values no longer fail at apply (#156).** Several
   container env values (`REPMGR_USER`, `REPMGR_DB`, `PGBACKREST_STANZA`, `STANZA`,
   `SPLIT_BRAIN_ACTION`, the Service/marker/Lease names, FQDNs) were interpolated into
