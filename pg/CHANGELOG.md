@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- **WAL-archiving health metrics for the Prometheus exporter (#30).** When
+  pgBackRest is enabled the exporter now serves a `pg_wal_archive` query group from
+  `pg_stat_archiver` (scraped on the primary): `pg_wal_archive_failed_count`
+  (archive_command failures), `pg_wal_archive_archived_count`,
+  `pg_wal_archive_seconds_since_last_archived`, and
+  `pg_wal_archive_seconds_since_last_failed`. Previously a stalled `archive_command`
+  surfaced no metric and fired no alert. The query reads only `pg_stat_archiver`, so
+  it needs no filesystem/superuser access (compatible with a future read-only
+  monitoring user, #28).
+
 ### Security
 
 - **The PgPool-II PCP admin port (9898) is no longer exposed on the Service by default

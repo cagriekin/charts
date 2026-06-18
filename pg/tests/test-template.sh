@@ -1742,6 +1742,18 @@ assert_contains "exporter cm: byte lag metric declared" "${exporter_cm}" "receiv
 gauge_count=$(printf '%s' "${exporter_cm}" | grep -c 'usage: "GAUGE"' || true)
 assert_eq "exporter cm: two GAUGE metrics in pg_wal_replication" "2" "${gauge_count}"
 
+# #30: WAL-archiving health metrics from pg_stat_archiver, gated on pgbackrest
+# (archive_mode is on only then) and scraped on the primary.
+exporter_cm_arch=$(helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true \
+  --set pgbackrest.enabled=true --set pgbackrest.s3.endpoint=https://e --set pgbackrest.s3.bucket=b \
+  --set pgbackrest.existingSecret.name=s --show-only templates/prometheus-exporter-configmap.yaml 2>&1)
+assert_contains "exporter cm #30: pg_wal_archive group present when pgbackrest enabled" "${exporter_cm_arch}" "pg_wal_archive:"
+assert_contains "exporter cm #30: failed_count metric declared" "${exporter_cm_arch}" "failed_count:"
+assert_contains "exporter cm #30: seconds_since_last_archived metric declared" "${exporter_cm_arch}" "seconds_since_last_archived:"
+assert_contains "exporter cm #30: archiver query reads pg_stat_archiver" "${exporter_cm_arch}" "FROM pg_stat_archiver"
+# absent when pgbackrest disabled (no archiving); exporter_cm above is full-test (pgbackrest off)
+assert_not_contains "exporter cm #30: no pg_wal_archive group when pgbackrest disabled" "${exporter_cm}" "pg_wal_archive:"
+
 # Test: exporter container loads the custom queries file from the configmap mount
 assert_contains "exporter: extend.query-path flag wired" "${full}" "extend.query-path=/config/queries.yaml"
 exporter_deploy=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
