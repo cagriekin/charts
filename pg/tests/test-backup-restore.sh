@@ -104,10 +104,11 @@ job_status=$?
 assert_eq "backup job completed successfully" "0" "${job_status}"
 
 echo "Verifying backup exists in S3..."
+# Dumps are namespaced per release under <prefix>/<fullname>/ (#143), so list that subpath.
 kubectl run mc-check -n "${NAMESPACE}" --restart=Never --image=minio/mc:RELEASE.2024-11-21T17-21-54Z \
   --command -- sh -c "
     mc alias set s3 http://minio:9000 minioadmin minioadmin &&
-    mc ls s3/pg-backups/backups/ --json | head -1
+    mc ls s3/pg-backups/backups/${FULLNAME}/ --json | head -1
   "
 kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/mc-check -n "${NAMESPACE}" --timeout=120s
 backup_file=$(kubectl logs -n "${NAMESPACE}" mc-check | tail -1)
@@ -129,8 +130,8 @@ kubectl run mc-fetch -n "${NAMESPACE}" --restart=Never --image=minio/mc:RELEASE.
   --command -- sh -c "sleep 300"
 kubectl wait --for=condition=Ready pod/mc-fetch -n "${NAMESPACE}" --timeout=120s
 kubectl exec -n "${NAMESPACE}" mc-fetch -- mc alias set s3 http://minio:9000 minioadmin minioadmin
-DUMP_FILE=$(kubectl exec -n "${NAMESPACE}" mc-fetch -- mc ls s3/pg-backups/backups/ --json | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)
-kubectl exec -n "${NAMESPACE}" mc-fetch -- mc cat "s3/pg-backups/backups/${DUMP_FILE}" \
+DUMP_FILE=$(kubectl exec -n "${NAMESPACE}" mc-fetch -- mc ls "s3/pg-backups/backups/${FULLNAME}/" --json | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)
+kubectl exec -n "${NAMESPACE}" mc-fetch -- mc cat "s3/pg-backups/backups/${FULLNAME}/${DUMP_FILE}" \
   | kubectl exec -i -n "${NAMESPACE}" "${POD}" -c postgresql -- bash -c "cat > /tmp/restore.dump"
 kubectl delete pod mc-fetch -n "${NAMESPACE}" --wait=false
 kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- bash -c "

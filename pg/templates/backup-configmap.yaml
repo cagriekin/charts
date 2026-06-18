@@ -23,7 +23,14 @@ data:
     done
 
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    S3_PATH="${S3_BUCKET}/${S3_PREFIX}/backup_${TIMESTAMP}.dump"
+    # Namespace every object under a per-release subpath (#143) so a retention
+    # pass never sees, counts, or deletes another release's dumps when multiple
+    # releases share one bucket/prefix. Mirrors the pgBackRest repo layout
+    # (repo1-path=/<prefix>/<fullname>). The fullname is release-unique.
+    # Strip any trailing slash on the prefix so the key never gets an empty
+    # segment (b/backups//<fullname>); upload, guard, and retention then agree.
+    S3_DIR="${S3_BUCKET}/${S3_PREFIX%/}/{{ include "pg.fullname" . }}"
+    S3_PATH="${S3_DIR}/backup_${TIMESTAMP}.dump"
 
     export PATH="/tools:${PATH}"
     export MC_CONFIG_DIR=/tmp/.mc
@@ -52,17 +59,21 @@ data:
 
     # Guard against wiping the whole prefix: the dump uploaded above must be
     # visible as a recent object. If it is not (upload landed elsewhere,
-    # prefix mismatch, clock skew), deletion must not run.
+    # prefix mismatch, clock skew), deletion must not run. Scoped to this
+    # release's subpath and dump objects only (#143).
     echo "Verifying a recent backup exists before retention cleanup..."
-    RECENT_COUNT=$(mc find "s3/${S3_BUCKET}/${S3_PREFIX}/" --newer-than "${RETENTION_DAYS}d" | grep -c . || true)
+    RECENT_COUNT=$(mc find "s3/${S3_DIR}/" --name 'backup_*.dump' --newer-than "${RETENTION_DAYS}d" | grep -c . || true)
     if [ "$RECENT_COUNT" -eq 0 ]; then
-      echo "ERROR: No backup newer than ${RETENTION_DAYS} days found under s3/${S3_BUCKET}/${S3_PREFIX}/ - aborting retention cleanup" >&2
+      echo "ERROR: No backup newer than ${RETENTION_DAYS} days found under s3/${S3_DIR}/ - aborting retention cleanup" >&2
       exit 1
     fi
     echo "Found ${RECENT_COUNT} recent backup(s)"
 
+    # Delete only this release's own dump objects under its subpath: the per-release
+    # path isolates releases, and --name keeps unrelated objects a user may store
+    # under the prefix safe (#143).
     echo "Running retention cleanup (removing backups older than ${RETENTION_DAYS} days)..."
-    mc find "s3/${S3_BUCKET}/${S3_PREFIX}/" --older-than "${RETENTION_DAYS}d" --exec "mc rm {}"
+    mc find "s3/${S3_DIR}/" --name 'backup_*.dump' --older-than "${RETENTION_DAYS}d" --exec "mc rm {}"
 
     echo "Backup completed successfully"
 {{- end }}

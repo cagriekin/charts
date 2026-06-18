@@ -682,7 +682,7 @@ kubectl create job --from=cronjob/my-postgres-pg-backup manual-backup
 | `backup.schedule` | Cron schedule | `0 2 * * *` |
 | `backup.s3.endpoint` | S3-compatible endpoint URL | `""` |
 | `backup.s3.bucket` | S3 bucket name | `""` |
-| `backup.s3.prefix` | Key prefix within bucket | `backups` |
+| `backup.s3.prefix` | Key prefix within bucket. Dumps are stored under `<prefix>/<release-fullname>/`, so multiple releases can safely share one bucket/prefix (retention only ever touches a release's own subpath). | `backups` |
 | `backup.existingSecret.name` | Secret containing S3 credentials | `""` |
 | `backup.existingSecret.accessKeyIdKey` | Key for access key ID in secret | `access-key-id` |
 | `backup.existingSecret.secretAccessKeyKey` | Key for secret access key in secret | `secret-access-key` |
@@ -702,8 +702,13 @@ kubectl create job --from=cronjob/my-postgres-pg-backup manual-backup
 
 ### Restore
 
+Dumps are namespaced per release under `<prefix>/<release-fullname>/`. List the
+release's own backups, then restore the chosen one (replace `<release>-pg` with
+your release's fullname):
+
 ```bash
-mc cp s3/pg-backups/backups/backup_20250101_020000.dump /tmp/backup.dump
+mc ls s3/pg-backups/backups/<release>-pg/
+mc cp s3/pg-backups/backups/<release>-pg/backup_20250101_020000.dump /tmp/backup.dump
 pg_restore -h localhost -U postgres -d postgres /tmp/backup.dump
 ```
 
