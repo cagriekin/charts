@@ -33,6 +33,12 @@
 
 ### Fixed
 
+- **pgBackRest `stanza-create` no longer masks real failures (#160).** The backup
+  CronJob ran `stanza-create || true`, which swallowed not just the benign "stanza
+  already exists" case (`stanza-create` is idempotent and exits 0 then) but also genuine
+  failures (S3 permissions, repo lock, `kubectl exec` errors, a needed `stanza-upgrade`),
+  so the job failed later at the backup step with a misleading error. Dropped `|| true`;
+  under `set -eu -o pipefail` a real failure now aborts at the right step.
 - **The postgres-exporter NetworkPolicy now has a cross-namespace scrape escape hatch
   (#147).** The exporter's 9116 metrics ingress admitted same-namespace pods only and,
   unlike the postgresql/pgpool policies, had no `extraIngress` value, so a Prometheus in

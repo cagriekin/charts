@@ -54,13 +54,17 @@ spec:
                   fi
                   echo "Primary pod resolved to: $PRIMARY"
 
-                  # Idempotent. Required so the first backup after a fresh
-                  # install (or after a failover that promoted a node which
-                  # was a standby at boot) creates the stanza on the actual
-                  # primary.
+                  # Required so the first backup after a fresh install (or after a
+                  # failover that promoted a node which was a standby at boot) creates
+                  # the stanza on the actual primary. stanza-create is natively
+                  # idempotent -- it exits 0 when the stanza already exists -- so it is
+                  # NOT guarded with `|| true`: a real failure (S3 permissions, repo
+                  # lock, a kubectl exec error, or a needed stanza-upgrade after a PG
+                  # major upgrade) must abort here with the root-cause message under
+                  # `set -eu -o pipefail`, not be masked into a misleading backup error.
                   echo "Ensuring stanza '$STANZA' exists..."
                   kubectl -n "$NAMESPACE" exec "$PRIMARY" -c pgbackrest -- \
-                    pgbackrest --stanza="$STANZA" stanza-create || true
+                    pgbackrest --stanza="$STANZA" stanza-create
 
                   echo "Starting $BACKUP_TYPE backup..."
                   kubectl -n "$NAMESPACE" exec "$PRIMARY" -c pgbackrest -- \
