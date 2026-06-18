@@ -122,6 +122,13 @@ assert_contains "full: pgpool anti-affinity uses hostname topology" "${full}" "t
 pgpool_svc=$(echo "${full}" | grep -c "port: 9999" || echo "0")
 assert_gt "full: pgpool service port 9999 present" "${pgpool_svc}" "0"
 
+# #118: the PCP admin port (9898) must not be exposed on the Service by default; it is
+# opt-in via pgpool.service.exposePcp.
+pgpool_svc_default=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --show-only templates/pgpool-service.yaml 2>&1)
+assert_not_contains "#118: pgpool Service does not expose PCP 9898 by default" "${pgpool_svc_default}" "9898"
+pgpool_svc_pcp=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.service.exposePcp=true --show-only templates/pgpool-service.yaml 2>&1)
+assert_contains "#118: pgpool Service exposes PCP 9898 when opted in" "${pgpool_svc_pcp}" "9898"
+
 # Full: should have pgpool configmap
 assert_contains "full: pgpool configmap present" "${full}" "pgpool.conf"
 

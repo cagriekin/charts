@@ -16,10 +16,12 @@ spec:
       port: {{ .Values.pgpool.service.port }}
       targetPort: pgpool
       protocol: TCP
+{{- if .Values.pgpool.service.exposePcp }}
     - name: pcp
       port: 9898
       targetPort: pcp
       protocol: TCP
+{{- end }}
   selector:
     {{- include "pg.selectorLabels" . | nindent 4 }}
     app.kubernetes.io/component: pgpool
