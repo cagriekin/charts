@@ -184,7 +184,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 |-----------|-------------|---------|
 | `repmgr.enabled` | Enable repmgr | `true` |
 | `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
-| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-16` |
+| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-18` |
 | `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `repmgr.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Bump with `repmgr.image.tag` when moving to an image built for a new PG major. | `"18"` |
 | `repmgr.username` | Repmgr database user | `repmgr` |
@@ -1120,7 +1120,7 @@ Then restore from the latest backup using one of the methods above.
 | Failover not triggering | repmgrd not detecting failure | Check repmgrd logs. Verify `health_check_interval` and `reconnect_attempts`. |
 | Service not updating after failover | service-updater stuck or crashed | Check service-updater logs. Liveness probe should restart it if stuck. |
 | PGPool returning errors after failover | PGPool not restarted | service-updater should restart PGPool. Check service-updater logs. Manual restart: `kubectl rollout restart deployment <fullname>-pgpool` |
-| WAL archiving failing (pgBackRest) | S3 credentials or connectivity | Check pgbackrest-scheduler logs. Verify S3 endpoint and credentials. |
+| WAL archiving failing (pgBackRest) | S3 credentials or connectivity | Check the `pgbackrest` sidecar logs on the primary pod and the `<fullname>-pgbackrest-full`/`-diff` CronJob pod logs. Verify S3 endpoint and credentials. |
 | Backup job hanging | S3 unreachable | `activeDeadlineSeconds` (default 3600s) will terminate the job. Check S3 connectivity. |
 | Split-brain detected in logs | Network partition | Follow the split-brain recovery runbook above. |
 
