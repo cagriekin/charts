@@ -39,10 +39,14 @@ spec:
           {{- end }}
           serviceAccountName: {{ include "pg.fullname" $root }}-pgbackrest
           restartPolicy: Never
+          securityContext:
+            {{- toYaml $root.Values.pgbackrest.cronjob.podSecurityContext | nindent 12 }}
           containers:
             - name: pgbackrest
               image: "{{ $root.Values.pgbackrest.cronjob.image.repository }}:{{ $root.Values.pgbackrest.cronjob.image.tag }}"
               imagePullPolicy: {{ $root.Values.pgbackrest.cronjob.image.pullPolicy }}
+              securityContext:
+                {{- toYaml $root.Values.pgbackrest.cronjob.containerSecurityContext | nindent 16 }}
               command: ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
               args:
                 - |

@@ -519,6 +519,20 @@ pgbackrest:
     successfulJobsHistoryLimit: 3
     failedJobsHistoryLimit: 3
     priorityClassName: ""
+    # Hardened by default so the CronJob (which holds the exec-capable pgbackrest SA
+    # token) matches the chart's other pods and passes restricted Pod Security (#155).
+    # alpine/k8s runs kubectl fine as a non-root uid.
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 65534
+      runAsGroup: 65534
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+          - ALL
     resources:
       requests:
         cpu: 50m
