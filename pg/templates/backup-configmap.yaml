@@ -141,4 +141,90 @@ data:
       || echo "WARN: stale-stage sweep encountered an error (non-fatal)" >&2
 
     echo "Backup completed successfully"
+{{- if .Values.backup.validation.enabled }}
+  validate.sh: |
+    #!/bin/bash
+    # Restore-validation (#31): prove the latest pg_dump backup is actually
+    # restorable by restoring it into a throwaway PostgreSQL inside this pod (never
+    # the live database) and failing the Job on any pg_restore error.
+    set -euo pipefail
+
+    for var in S3_ENDPOINT S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY S3_PREFIX; do
+      if [ -z "${!var}" ]; then
+        echo "ERROR: Required environment variable $var is not set"
+        exit 1
+      fi
+    done
+
+    # Same release-scoped path the backup writer uses (#143) so we read this
+    # release's own dumps, not another release's under a shared bucket/prefix.
+    S3_DIR="${S3_BUCKET}/${S3_PREFIX%/}/{{ include "pg.fullname" . }}"
+
+    export PATH="/tools:${PATH}"
+    export MC_CONFIG_DIR=/tmp/.mc
+    export SSL_CERT_FILE=/tools/ca-bundle.crt
+
+    case "$S3_ENDPOINT" in
+      *://*) ;;
+      *) echo "ERROR: S3_ENDPOINT must include a scheme (http:// or https://)" >&2; exit 1 ;;
+    esac
+    # Credentials via MC_HOST_<alias>, never argv (#167); percent-encode reserved chars.
+    urlencode() {
+      local LC_ALL=C s="$1" out="" i c
+      for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+          [a-zA-Z0-9.~_-]) out+="$c" ;;
+          *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+        esac
+      done
+      printf '%s' "$out"
+    }
+    export MC_HOST_s3="${S3_ENDPOINT%%://*}://$(urlencode "$S3_ACCESS_KEY"):$(urlencode "$S3_SECRET_KEY")@${S3_ENDPOINT#*://}"
+
+    echo "Finding the latest backup under s3/${S3_DIR}/ ..."
+    # backup_<YYYYmmdd_HHMMSS>.dump sorts lexically by timestamp, so tail -1 is newest.
+    LATEST=$(mc ls "s3/${S3_DIR}/" | awk '{print $NF}' | grep -E '^backup_.*\.dump$' | sort | tail -1 || true)
+    if [ -z "$LATEST" ]; then
+      echo "ERROR: no backup_*.dump found under s3/${S3_DIR}/ -- nothing to validate" >&2
+      exit 1
+    fi
+    echo "Latest backup: ${LATEST}"
+
+    WORK=/work
+    echo "Downloading ${LATEST}..."
+    mc cp "s3/${S3_DIR}/${LATEST}" "${WORK}/latest.dump"
+
+    # Throwaway PostgreSQL in this pod's emptyDir -- isolated from production. fsync
+    # off (ephemeral) speeds the restore; only the unix socket is used (no TCP).
+    export PGDATA="${WORK}/pgdata"
+    mkdir -p "${WORK}/run"
+    echo "Initializing a throwaway PostgreSQL for the restore test..."
+    initdb -D "$PGDATA" --auth-local=trust >/dev/null
+    pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c unix_socket_directories=${WORK}/run -c fsync=off" -w start
+    trap 'pg_ctl -D "$PGDATA" -m immediate -w stop >/dev/null 2>&1 || true' EXIT
+
+    createdb -h "${WORK}/run" validation
+    echo "Restoring ${LATEST} into the throwaway database (any error fails the Job)..."
+    # --exit-on-error: a torn/corrupt dump or a missing object aborts here, which is
+    # exactly the failure this Job exists to surface. --no-owner/--no-privileges so a
+    # missing source role does not fail an otherwise-good restore.
+    pg_restore -h "${WORK}/run" -d validation --no-owner --no-privileges --exit-on-error "${WORK}/latest.dump"
+
+    echo "Validating restored contents..."
+    psql -h "${WORK}/run" -d validation -q -c "ANALYZE"
+    SUMMARY=$(psql -h "${WORK}/run" -d validation -tAF'|' -c "
+      SELECT count(*),
+             COALESCE(sum(c.reltuples)::bigint, 0)
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema')")
+    TABLES="${SUMMARY%%|*}"
+    ROWS="${SUMMARY##*|}"
+    echo "Restore OK: ${TABLES} user table(s), ~${ROWS} row(s) (estimate)"
+    if [ "${TABLES:-0}" -eq 0 ]; then
+      echo "ERROR: restored database has no user tables -- backup may be empty or corrupt" >&2
+      exit 1
+    fi
+    echo "Backup validation succeeded for ${LATEST}"
+{{- end }}
 {{- end }}

@@ -1230,6 +1230,30 @@ backup_custom=$(helm template test-pg "${CHART_DIR}" \
 assert_contains "backup: custom activeDeadlineSeconds" "${backup_custom}" "activeDeadlineSeconds: 7200"
 assert_contains "backup: custom backoffLimit" "${backup_custom}" "backoffLimit: 3"
 
+# #31: opt-in backup-validation CronJob (restore the latest dump into a throwaway
+# PostgreSQL in the Job pod and fail on a bad restore).
+backup_val_args="--set backup.enabled=true --set backup.s3.endpoint=https://s3.test --set backup.s3.bucket=test --set backup.existingSecret.name=test-secret"
+# default: validation off -> no CronJob, no validate.sh
+backup_noval_cm=$(helm template test-pg "${CHART_DIR}" ${backup_val_args} --show-only templates/backup-configmap.yaml 2>&1)
+assert_not_contains "#31: validate.sh absent when validation disabled" "${backup_noval_cm}" "validate.sh:"
+backup_noval_cj=$(helm template test-pg "${CHART_DIR}" ${backup_val_args} 2>&1)
+assert_not_contains "#31: no backup-validation CronJob when disabled" "${backup_noval_cj}" "backup-validation"
+# enabled: CronJob + script render
+backup_val_cj=$(helm template test-pg "${CHART_DIR}" ${backup_val_args} --set backup.validation.enabled=true --show-only templates/backup-validation-cronjob.yaml 2>&1)
+assert_contains "#31: backup-validation CronJob present when enabled" "${backup_val_cj}" "name: test-pg-backup-validation"
+assert_contains "#31: validation runs validate.sh" "${backup_val_cj}" "/scripts/validate.sh"
+assert_contains "#31: validation makes no API calls (no SA token)" "${backup_val_cj}" "automountServiceAccountToken: false"
+# runs initdb/postgres, so it must use the postgres uid (101), not the backup uid (999)
+assert_contains "#31: validation container runs as the postgres uid 101" "${backup_val_cj}" "runAsUser: 101"
+assert_contains "#31: validation schedule wired" "${backup_val_cj}" 'schedule: "0 3 \* \* 0"'
+backup_val_cm=$(helm template test-pg "${CHART_DIR}" ${backup_val_args} --set backup.validation.enabled=true --show-only templates/backup-configmap.yaml 2>&1)
+assert_contains "#31: validate.sh present when enabled" "${backup_val_cm}" "validate.sh:"
+assert_contains "#31: validate.sh fails the Job on a bad restore (--exit-on-error)" "${backup_val_cm}" "pg_restore -h"
+assert_contains "#31: validate.sh uses --exit-on-error" "${backup_val_cm}" "exit-on-error"
+assert_contains "#31: validate.sh reads this release's scoped backup path" "${backup_val_cm}" 'S3_DIR="${S3_BUCKET}/${S3_PREFIX%/}/test-pg"'
+# workdir emptyDir cap is configurable; default unbounded (emptyDir: {})
+assert_contains "#31: workdir cap configurable" "$(helm template test-pg "${CHART_DIR}" ${backup_val_args} --set backup.validation.enabled=true --set backup.validation.workdirSizeLimit=10Gi --show-only templates/backup-validation-cronjob.yaml 2>&1)" "sizeLimit: 10Gi"
+
 # --- pgBackRest Tests ---
 
 # Test: helm lint with pgbackrest values

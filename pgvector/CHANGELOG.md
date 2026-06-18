@@ -13,6 +13,15 @@
   surfaced no metric and fired no alert. The query reads only `pg_stat_archiver`, so
   it needs no filesystem/superuser access (compatible with a future read-only
   monitoring user, #28).
+- **Opt-in automated backup-validation CronJob (#31).** A new weekly CronJob
+  (`backup.validation.enabled`, default off) downloads the latest `pg_dump` backup
+  and restores it into a throwaway PostgreSQL inside the Job pod -- never the live
+  database -- failing the Job (so it alerts) if `pg_restore` errors or the restored
+  database has no user tables. Nothing previously verified that backups were
+  actually restorable beyond a TOC `pg_restore --list` check. Configurable
+  `schedule`, `resources`, and `workdirSizeLimit` (the throwaway PGDATA emptyDir
+  cap, default unbounded). It reuses the postgresql securityContext (runs
+  initdb/postgres as the postgres uid) and the release-scoped S3 path.
 
 ### Security
 

@@ -493,6 +493,25 @@ backup:
     limits:
       cpu: 500m
       memory: 512Mi
+  # Opt-in weekly restore test (#31): downloads the latest pg_dump backup and
+  # restores it into a throwaway PostgreSQL inside the Job pod (never the live
+  # database), failing the Job if pg_restore errors -- so an unrestorable or
+  # corrupt backup raises an alert. The validation container runs initdb/postgres
+  # as the postgres uid, reusing postgresql.podSecurityContext /
+  # containerSecurityContext.
+  validation:
+    enabled: false
+    schedule: "0 3 * * 0"
+    # emptyDir sizeLimit for the throwaway PGDATA + the downloaded dump. Must
+    # exceed the restored database size; empty = unbounded (node disk bounds it).
+    workdirSizeLimit: ""
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
 
 pgbackrest:
   enabled: false

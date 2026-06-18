@@ -1,0 +1,108 @@
+{{- if and .Values.backup.enabled .Values.backup.validation.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "pg.fullname" . }}-backup-validation
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backup-validation
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  schedule: {{ .Values.backup.validation.schedule | quote }}
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: {{ .Values.backup.activeDeadlineSeconds }}
+      backoffLimit: {{ .Values.backup.backoffLimit }}
+      template:
+        metadata:
+          labels:
+            {{- include "pg.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup-validation
+        spec:
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.backup.priorityClassName }}
+          priorityClassName: {{ . }}
+          {{- end }}
+          restartPolicy: OnFailure
+          # Talks only to S3 and a throwaway local PostgreSQL, never the K8s API.
+          automountServiceAccountToken: false
+          # Runs initdb/postgres for the throwaway restore, so it reuses the
+          # postgresql securityContext (postgres uid 101, fsGroup 103) -- the
+          # backup writer's 999 cannot own a PGDATA the server will start.
+          securityContext:
+            {{- toYaml .Values.postgresql.podSecurityContext | nindent 12 }}
+          initContainers:
+            - name: mc-installer
+              image: "{{ .Values.backup.mc.image.repository }}:{{ .Values.backup.mc.image.tag }}"
+              imagePullPolicy: {{ .Values.backup.mc.image.pullPolicy }}
+              # /usr/bin/mc is mode 0711 (root-only read), so the copy runs as root;
+              # the validation container stays non-root.
+              securityContext:
+                runAsUser: 0
+                runAsNonRoot: false
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+              command: ["/bin/sh", "-c", "cp /usr/bin/mc /tools/mc && chmod 0755 /tools/mc && cp /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /tools/ca-bundle.crt"]
+              resources:
+                {{- include "pg.initResources" . | nindent 16 }}
+              volumeMounts:
+                - name: tools
+                  mountPath: /tools
+          containers:
+            - name: backup-validation
+              image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+              imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+              securityContext:
+                {{- toYaml .Values.postgresql.containerSecurityContext | nindent 16 }}
+              command: ["/bin/bash", "/scripts/validate.sh"]
+              env:
+                - name: S3_ENDPOINT
+                  value: {{ required "backup.s3.endpoint is required when backup is enabled" .Values.backup.s3.endpoint | quote }}
+                - name: S3_BUCKET
+                  value: {{ required "backup.s3.bucket is required when backup is enabled" .Values.backup.s3.bucket | quote }}
+                - name: S3_PREFIX
+                  value: {{ .Values.backup.s3.prefix | quote }}
+                - name: S3_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ required "backup.existingSecret.name is required when backup is enabled" (include "pg.backupSecretName" .) }}
+                      key: {{ include "pg.backupAccessKeyIdKey" . }}
+                - name: S3_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "pg.backupSecretName" . }}
+                      key: {{ include "pg.backupSecretAccessKeyKey" . }}
+              resources:
+                {{- toYaml .Values.backup.validation.resources | nindent 16 }}
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                - name: tools
+                  mountPath: /tools
+                - name: work
+                  mountPath: /work
+          volumes:
+            - name: scripts
+              configMap:
+                name: {{ include "pg.fullname" . }}-backup
+                defaultMode: 0755
+            - name: tools
+              emptyDir:
+                sizeLimit: 128Mi
+            - name: work
+              {{- with .Values.backup.validation.workdirSizeLimit }}
+              emptyDir:
+                sizeLimit: {{ . }}
+              {{- else }}
+              emptyDir: {}
+              {{- end }}
+{{- end }}
