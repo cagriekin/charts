@@ -11,6 +11,19 @@
   (percent-encoded), so they never appear in argv. Requires `backup.s3.endpoint` to
   include a scheme (`http://`/`https://`), which `mc` already required.
 
+### Documentation
+
+- **The pgBackRest PITR restore runbook could not work as written (#149).** The
+  documented restore pod mounted only the data PVC and set the S3 key env vars, but
+  not the `<fullname>-pgbackrest` ConfigMap — the only place `pg1-path` and the
+  `repo1-*` S3 settings live — so `pgbackrest restore` failed with `requires option:
+  pg1-path` and would default to a local posix repo. The runbook now mounts the
+  ConfigMap at `/etc/pgbackrest/pgbackrest.conf`, sources the keys from the existing
+  pgBackRest secret, sets the chart's `securityContext` (101:103), adds the required
+  `--type=time` to the `restore --target` command, corrects the `keyType: auto`
+  guidance (bind to the `<fullname>-repmgr` SA, not the default), and uses the current
+  image tag.
+
 ### Fixed
 
 - **pgBackRest config changes (S3 endpoint/bucket/retention) didn't roll the pods

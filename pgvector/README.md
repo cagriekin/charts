@@ -670,13 +670,28 @@ PITR requires manual intervention:
 # 1. Scale down the StatefulSet
 kubectl scale statefulset my-pgvector --replicas=0
 
-# 2. Run a restore pod mounting the data PVC
+# 2. Run a restore pod that mounts the data PVC AND the pgbackrest ConfigMap.
+# The repo settings (repo1-type=s3, endpoint, bucket, path) and pg1-path live ONLY
+# in the <fullname>-pgbackrest ConfigMap, so it MUST be mounted at
+# /etc/pgbackrest/pgbackrest.conf or pgbackrest fails with "requires option: pg1-path"
+# and would default to a local posix repo (never finding the S3 backup).
+# Replace YOUR_PGBACKREST_SECRET with your pgbackrest.existingSecret.name.
+# The securityContext (101:103) matches the chart so restored files are owned
+# correctly and the pod is accepted under restricted PodSecurity / OpenShift SCC.
+# keyType: auto (IRSA / Workload Identity)? Drop the env block, add
+# "serviceAccountName": "my-pgvector-repmgr" to the spec (that SA carries the
+# cloud-role annotation; the namespace default SA does not), and ensure the pod lands
+# where your IRSA/WI webhook injects the token; pgbackrest then uses the credential chain.
 kubectl run pg-restore --rm -it \
-  --image=cagriekin/repmgr:trixie-5.5.0-16 \
-  --overrides='{ "spec": { "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-16", "command": ["bash"], "stdin": true, "tty": true, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "value": "YOUR_KEY" }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "value": "YOUR_SECRET" }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-pgvector-0" } }] } }'
+  --image=cagriekin/repmgr:trixie-5.5.0-18 \
+  --overrides='{ "spec": { "securityContext": { "runAsUser": 101, "runAsGroup": 103, "fsGroup": 103, "runAsNonRoot": true }, "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-18", "command": ["bash"], "stdin": true, "tty": true, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }, { "name": "pgbackrest-config", "mountPath": "/etc/pgbackrest/pgbackrest.conf", "subPath": "pgbackrest.conf", "readOnly": true }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "valueFrom": { "secretKeyRef": { "name": "YOUR_PGBACKREST_SECRET", "key": "access-key-id" } } }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "valueFrom": { "secretKeyRef": { "name": "YOUR_PGBACKREST_SECRET", "key": "secret-access-key" } } }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-pgvector-0" } }, { "name": "pgbackrest-config", "configMap": { "name": "my-pgvector-pgbackrest" } }] } }'
 
-# 3. Inside the restore pod, run:
+# 3. Inside the restore pod, run (stanza = pgbackrest.stanza, default "db").
+# --type=time is REQUIRED with --target (pgbackrest rejects --target otherwise);
+# use --type=xid|name|lsn for other recovery targets. Leave the existing data dir in
+# place so --delta restores only changed files (a wiped PGDATA disables --delta).
 pgbackrest --stanza=db restore \
+  --type=time \
   --target="2026-03-22 12:00:00+00" \
   --target-action=promote \
   --delta
