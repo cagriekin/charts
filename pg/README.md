@@ -103,6 +103,7 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.resources.limits.memory` | Memory limit | `1Gi` |
 | `postgresql.persistence.enabled` | Enable persistence | `true` |
 | `postgresql.persistence.size` | Storage size | `10Gi` |
+| `postgresql.persistence.emptyDir.sizeLimit` | `sizeLimit` for the non-persistent (`persistence.enabled=false`) PGDATA emptyDir; empty = unbounded | `""` |
 | `postgresql.persistence.storageClass` | Storage class | `""` |
 | `postgresql.updateStrategy.type` | StatefulSet update strategy | `RollingUpdate` |
 | `postgresql.updateStrategy.rollingUpdate.partition` | Partition for rolling update | `0` |
@@ -198,6 +199,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 | `repmgr.serviceUpdater.resources.requests.cpu` | Service-updater CPU request | `50m` |
 | `repmgr.serviceUpdater.resources.requests.memory` | Service-updater memory request | `64Mi` |
 | `repmgr.serviceUpdater.resources.limits.memory` | Service-updater memory limit | `128Mi` |
+| `repmgr.initContainerResources` | Resources for the `repmgr-init` standby-clone init container (heavier than the shared init default; raise for large databases) | `requests: 100m/128Mi, limits: 1/1Gi` |
 
 When repmgr is enabled, a preStop lifecycle hook stops PostgreSQL cleanly (`pg_ctl stop -m fast`) before pod termination. If the terminated pod was the primary, repmgrd on a standby detects the outage and promotes via its `promote_command`, which also updates repmgr metadata; the hook deliberately does not promote out-of-band, since a raw `pg_promote()` would leave repmgr.nodes stale and strand every repmgrd. The `terminationGracePeriodSeconds` controls how long Kubernetes waits for the shutdown to complete.
 
@@ -340,6 +342,7 @@ Two ways to provide etcd:
 | `pgpool.admin.existingSecret.passwordKey` | Key in the existing Secret containing the admin password | `password` |
 | `pgpool.service.type` | Service type | `ClusterIP` |
 | `pgpool.service.port` | Service port | `9999` |
+| `pgpool.service.exposePcp` | Expose the PgPool-II PCP admin port (9898) on the Service. Off by default (admin endpoint); enable only if you run `pcp_*` against the Service, and add a `pgpool.extraIngress` rule for 9898 under NetworkPolicy. | `false` |
 | `pgpool.resources.requests.cpu` | CPU request | `100m` |
 | `pgpool.resources.requests.memory` | Memory request | `128Mi` |
 | `pgpool.resources.limits.cpu` | CPU limit | `500m` |
@@ -848,6 +851,8 @@ helm install my-postgres cagriekin/pg \
 | `pgbackrest.cronjob.resources.requests.memory` | CronJob memory request | `64Mi` |
 | `pgbackrest.cronjob.resources.limits.cpu` | CronJob CPU limit | `200m` |
 | `pgbackrest.cronjob.resources.limits.memory` | CronJob memory limit | `128Mi` |
+| `pgbackrest.cronjob.podSecurityContext` | Pod securityContext for the pgBackRest CronJob | `runAsNonRoot: true`, `runAsUser: 65534`, `seccompProfile: RuntimeDefault` |
+| `pgbackrest.cronjob.containerSecurityContext` | Container securityContext for the pgBackRest CronJob | `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` |
 
 ### Keyless backups (cloud workload identity)
 
@@ -1186,7 +1191,7 @@ kubectl exec -it deploy/my-postgres-pg-pgpool -c pgpool -- \
   sh -c 'psql -h 127.0.0.1 -p 9999 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SHOW pool_nodes;"'
 ```
 
-The PCP admin interface on port 9898 (also exposed on the pgpool Service) provides the same data. It authenticates against `pcp.conf`, which the init container generates from the admin Secret: the chart-managed `my-postgres-pg-pgpool-admin` (keys `username`/`password`, populated from `pgpool.admin.username`/`pgpool.admin.password`), or your own Secret when `pgpool.admin.existingSecret.enabled` is set. Retrieve the password, then run the pcp commands (they prompt for it):
+The PCP admin interface on port 9898 (exposed on the pgpool Service only when `pgpool.service.exposePcp=true`) provides the same data. It authenticates against `pcp.conf`, which the init container generates from the admin Secret: the chart-managed `my-postgres-pg-pgpool-admin` (keys `username`/`password`, populated from `pgpool.admin.username`/`pgpool.admin.password`), or your own Secret when `pgpool.admin.existingSecret.enabled` is set. Retrieve the password, then run the pcp commands (they prompt for it):
 
 ```bash
 kubectl get secret my-postgres-pg-pgpool-admin -o jsonpath='{.data.password}' | base64 -d
