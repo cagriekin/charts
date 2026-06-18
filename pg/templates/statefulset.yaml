@@ -847,8 +847,6 @@ spec:
               value: {{ printf "%s-primary" (include "pg.fullname" .) | quote }}
             - name: HEADLESS_SERVICE
               value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
-            - name: REPMGR_NODE_COUNT
-              value: {{ add .Values.postgresql.replicaCount 1 | quote }}
             - name: REPMGR_USER
               value: {{ .Values.repmgr.username | quote }}
             - name: REPMGR_PASSWORD

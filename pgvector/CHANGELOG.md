@@ -116,6 +116,12 @@
   so this is a namespace-scoped read of EndpointSlice metadata (list) rather than a
   resourceName-scoped get; the security-critical pods/exec scoping (#134) is
   unchanged.
+- **Removed the dead `REPMGR_NODE_COUNT` env from the service-updater container
+  (#177).** The service-updater script derives its peer-scan range from
+  `replicaCount` at template time and never read the env, so it was dead config on
+  that container. It stays on the `repmgr-init`/`postgresql`/`repmgrd` containers,
+  which the image scripts do consume. (The image-side de-duplication of the
+  triplicated peer-scan/timeline logic noted in #177 is a separate follow-up.)
 - **Backup integrity check no longer buffers the whole dump to `/tmp` (#119).** The
   verify step wrote the entire dump to the container's unbounded writable layer before
   `pg_restore --list`; a large DB could hit node-disk eviction. It now streams
