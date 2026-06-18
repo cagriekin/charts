@@ -68,7 +68,11 @@ data:
     # name, so a restore of "the newest backup" can never pick a half-written dump.
     # The EXIT trap removes the staging object on any early failure (a no-op once the
     # mv has run); stale stages from a hard-killed run are swept by retention below.
-    S3_TMP="${S3_PATH}.tmp"
+    # The staging key is made unique per run (pod hostname + pid) so a manually
+    # triggered backup overlapping the scheduled one cannot share a .tmp key -- each
+    # run's trap then only ever deletes its OWN stage, never a concurrent run's (#159
+    # review). The '*.tmp' sweep glob still reaps it.
+    S3_TMP="${S3_PATH}.$(hostname)-$$.tmp"
     trap 'mc rm "s3/${S3_TMP}" >/dev/null 2>&1 || true' EXIT
 
     echo "Starting streaming backup to s3/${S3_PATH} (staged via .tmp)..."
@@ -92,7 +96,18 @@ data:
     # a server-side copy + delete; the canonical PutObject is itself atomic, so a reader
     # of backup_<ts>.dump only ever sees a complete, verified dump (never a torn one).
     echo "Publishing verified backup to s3/${S3_PATH}..."
-    mc mv "s3/${S3_TMP}" "s3/${S3_PATH}"
+    # mc mv is a server-side copy then a delete of the stage. If the copy succeeds but
+    # the stage-delete half errors transiently, do NOT fail an already-published,
+    # verified backup: treat a present canonical object as success (the EXIT trap
+    # removes the leftover stage). Only a genuinely absent canonical is fatal.
+    if ! mc mv "s3/${S3_TMP}" "s3/${S3_PATH}"; then
+      if mc stat "s3/${S3_PATH}" >/dev/null 2>&1; then
+        echo "WARN: mc mv reported an error but the canonical dump is present; continuing" >&2
+      else
+        echo "ERROR: failed to publish the verified dump to s3/${S3_PATH}" >&2
+        exit 1
+      fi
+    fi
 
     # Guard against wiping the whole prefix: the dump uploaded above must be
     # visible as a recent object. If it is not (upload landed elsewhere,
@@ -109,15 +124,19 @@ data:
     # Delete only this release's own dump objects under its subpath: the per-release
     # path isolates releases, and --name keeps unrelated objects a user may store
     # under the prefix safe (#143).
+    # The dump is already published + verified above, so retention maintenance must
+    # never fail the Job (a transient S3 list/rm error would mark a good backup Failed
+    # and re-run the whole pg_dump). Both maintenance finds are best-effort.
     echo "Running retention cleanup (removing backups older than ${RETENTION_DAYS} days)..."
-    mc find "s3/${S3_DIR}/" --name 'backup_*.dump' --older-than "${RETENTION_DAYS}d" --exec "mc rm {}"
+    mc find "s3/${S3_DIR}/" --name 'backup_*.dump' --older-than "${RETENTION_DAYS}d" --exec "mc rm {}" \
+      || echo "WARN: retention cleanup encountered an error (non-fatal; backup already published)" >&2
 
     # Sweep stale staging objects orphaned by a hard-killed run (the EXIT trap covers
     # the normal failure path; this catches a SIGKILL/OOM that skipped it). A short 1d
-    # window reaps them promptly (vs RETENTION_DAYS) while never racing a concurrent
-    # run's fresh stage. Scoped to this release's subpath; never matches a published
-    # backup_<ts>.dump (#159).
-    mc find "s3/${S3_DIR}/" --name '*.tmp' --older-than "1d" --exec "mc rm {}"
+    # window reaps them promptly (vs RETENTION_DAYS). Scoped to this release's subpath;
+    # never matches a published backup_<ts>.dump (#159). Best-effort (see above).
+    mc find "s3/${S3_DIR}/" --name '*.tmp' --older-than "1d" --exec "mc rm {}" \
+      || echo "WARN: stale-stage sweep encountered an error (non-fatal)" >&2
 
     echo "Backup completed successfully"
 {{- end }}

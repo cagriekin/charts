@@ -712,6 +712,11 @@ mc cp s3/pg-backups/backups/<release>-pg/backup_20250101_020000.dump /tmp/backup
 pg_restore -h localhost -U postgres -d postgres /tmp/backup.dump
 ```
 
+Dumps taken before the per-release-path change live at the **old flat path**
+`s3/<bucket>/<prefix>/backup_*.dump` (no `<release-fullname>/` segment). They are not
+migrated and are no longer covered by automatic retention, so list and restore them
+directly there (`mc ls s3/pg-backups/backups/`), and delete them manually once obsolete.
+
 ## pgBackRest (PITR)
 
 pgBackRest provides WAL-based incremental backups for point-in-time recovery. When enabled, WAL segments are continuously archived from the primary to S3, and scheduled full/differential backups run automatically. This allows restoring the database to any point in time within the retention window.
@@ -825,7 +830,7 @@ kubectl scale statefulset my-postgres-pg --replicas=0
 # where your IRSA/WI webhook injects the token; pgbackrest then uses the credential chain.
 kubectl run pg-restore --rm -it \
   --image=cagriekin/repmgr:trixie-5.5.0-18 \
-  --overrides='{ "spec": { "securityContext": { "runAsUser": 101, "runAsGroup": 103, "fsGroup": 103, "runAsNonRoot": true }, "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-18", "command": ["bash"], "stdin": true, "tty": true, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }, { "name": "pgbackrest-config", "mountPath": "/etc/pgbackrest/pgbackrest.conf", "subPath": "pgbackrest.conf", "readOnly": true }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "valueFrom": { "secretKeyRef": { "name": "YOUR_PGBACKREST_SECRET", "key": "access-key-id" } } }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "valueFrom": { "secretKeyRef": { "name": "YOUR_PGBACKREST_SECRET", "key": "secret-access-key" } } }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-postgres-pg-0" } }, { "name": "pgbackrest-config", "configMap": { "name": "my-postgres-pg-pgbackrest" } }] } }'
+  --overrides='{ "spec": { "securityContext": { "runAsUser": 101, "runAsGroup": 103, "fsGroup": 103, "runAsNonRoot": true, "seccompProfile": { "type": "RuntimeDefault" } }, "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-18", "command": ["bash"], "stdin": true, "tty": true, "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] } }, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }, { "name": "pgbackrest-config", "mountPath": "/etc/pgbackrest/pgbackrest.conf", "subPath": "pgbackrest.conf", "readOnly": true }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "valueFrom": { "secretKeyRef": { "name": "YOUR_PGBACKREST_SECRET", "key": "access-key-id" } } }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "valueFrom": { "secretKeyRef": { "name": "YOUR_PGBACKREST_SECRET", "key": "secret-access-key" } } }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-postgres-pg-0" } }, { "name": "pgbackrest-config", "configMap": { "name": "my-postgres-pg-pgbackrest" } }] } }'
 
 # 3. Inside the restore pod, run (stanza = pgbackrest.stanza, default "db").
 # --type=time is REQUIRED with --target (pgbackrest rejects --target otherwise);

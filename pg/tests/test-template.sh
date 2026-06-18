@@ -1062,6 +1062,17 @@ assert_not_contains "backup #143: retention not run over the bare shared prefix"
 # provide them via MC_HOST_s3 read from the environment instead.
 assert_contains "backup #167: credentials provided via MC_HOST_s3 env" "${backup_configmap}" "export MC_HOST_s3="
 assert_not_contains "backup #167: no mc alias set with the endpoint in argv" "${backup_configmap}" 'mc alias set s3 "$S3_ENDPOINT"'
+# #167: urlencode is the load-bearing credential path -- a regression would silently
+# break S3 auth for keys with reserved chars. Extract the function from the rendered
+# script and run it against an adversarial key to assert correct percent-encoding.
+urlencode_fn=$(printf '%s\n' "${backup_configmap}" | awk '/urlencode\(\) \{/{f=1} f{print} f&&/^    \}$/{exit}' | sed 's/^    //')
+if [ -n "${urlencode_fn}" ]; then
+  urlencode_out=$(bash -c "${urlencode_fn}
+urlencode 'a/b+c@d:e%f'")
+  assert_eq "backup #167: urlencode percent-encodes reserved chars (/ + @ : %)" "a%2Fb%2Bc%40d%3Ae%25f" "${urlencode_out}"
+else
+  fail "backup #167: urlencode function extractable from the rendered script" "could not extract urlencode()"
+fi
 # #159: stage the dump to a .tmp object and publish (mc mv) to the canonical name only
 # after integrity verification, so a truncated dump never sits at backup_<ts>.dump.
 assert_contains "backup #159: pg_dump streams to the staging object" "${backup_configmap}" 'mc pipe "s3/${S3_TMP}"'

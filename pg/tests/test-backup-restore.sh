@@ -95,6 +95,11 @@ pg_exec "${NAMESPACE}" "${POD}" "INSERT INTO backup_test (value) VALUES ('before
 row_count_before=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT count(*) FROM backup_test" "testuser" "testdb")
 assert_eq "inserted 3 rows before backup" "3" "${row_count_before}"
 
+# NOTE (#143/#159 coverage): the retention DELETE (mc find --name 'backup_*.dump'
+# --older-than ${RETENTION_DAYS}d) and the stale-stage sweep (--older-than 1d) are
+# day-granular and mc cannot back-date an S3 object, so they cannot be exercised in a
+# minute-scale CI run. Their scoping (per-release subpath + name filter) is asserted at
+# the template level in test-template.sh; only the publish/restore path is live here.
 echo "Triggering backup job..."
 kubectl create job -n "${NAMESPACE}" backup-test --from=cronjob/"${FULLNAME}-backup"
 
@@ -130,13 +135,18 @@ kubectl run mc-fetch -n "${NAMESPACE}" --restart=Never --image=minio/mc:RELEASE.
   --command -- sh -c "sleep 300"
 kubectl wait --for=condition=Ready pod/mc-fetch -n "${NAMESPACE}" --timeout=120s
 kubectl exec -n "${NAMESPACE}" mc-fetch -- mc alias set s3 http://minio:9000 minioadmin minioadmin
+# #159 adversarial decoy: plant a staging object with a FAR-FUTURE timestamp so it is
+# lexically newer than the real dump. A correct selection must still reject it (it is a
+# .tmp stage), so this proves the .tmp-rejection rather than restating the filter.
+kubectl exec -n "${NAMESPACE}" mc-fetch -- sh -c "echo decoy | mc pipe 's3/pg-backups/backups/${FULLNAME}/backup_99999999_999999.dump.tmp'"
 # Select the NEWEST published dump, and only a published one: filter to
 # backup_<ts>.dump (rejecting any backup_<ts>.dump.tmp staging object, #159) and sort
 # descending so the lexically-greatest timestamp (the latest) wins -- the exact
 # "restore the latest" path #159 protects.
 DUMP_FILE=$(kubectl exec -n "${NAMESPACE}" mc-fetch -- mc ls "s3/pg-backups/backups/${FULLNAME}/" --json \
   | grep -o '"key":"[^"]*"' | cut -d'"' -f4 | grep -E '^backup_.*\.dump$' | sort -r | head -1)
-assert_contains "#159: restore target is a published dump, not a .tmp stage" "${DUMP_FILE}" ".dump"
+assert_not_contains "#159: a .tmp stage is never selected for restore (even if lexically newest)" "${DUMP_FILE}" ".tmp"
+assert_contains "#159: restore target is a published backup_<ts>.dump" "${DUMP_FILE}" "backup_"
 kubectl exec -n "${NAMESPACE}" mc-fetch -- mc cat "s3/pg-backups/backups/${FULLNAME}/${DUMP_FILE}" \
   | kubectl exec -i -n "${NAMESPACE}" "${POD}" -c postgresql -- bash -c "cat > /tmp/restore.dump"
 kubectl delete pod mc-fetch -n "${NAMESPACE}" --wait=false
