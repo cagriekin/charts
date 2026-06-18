@@ -94,6 +94,13 @@
   migration drives them to), so replication auth works from first boot regardless of
   migration timing. The global default stays `md5` for legacy/app users; the migration
   and the md5-above-scram `pg_hba` patch remain as a safety net.
+- **Helper init images are now a single configurable value (#116).** The four
+  busybox init containers (the StatefulSet `fix-permissions`/`setup-config`, and the
+  pgpool and exporter config inits) hardcoded the busybox image -- inconsistently
+  (`1.35` vs `1.37`) and with no override, blocking air-gapped/private-registry
+  deployments. They now share a `busyboxImage` value (`repository`/`tag`/`pullPolicy`,
+  default `busybox:1.37`). The pgBackRest CronJob (`pgbackrest.cronjob.image`) and the
+  backup `mc` image (`backup.mc.image`) were already configurable.
 - **Backup integrity check no longer buffers the whole dump to `/tmp` (#119).** The
   verify step did `mc cat > /tmp/verify_backup.dump` before `pg_restore --list`, writing
   the entire dump to the container's unbounded, unsized writable layer — a large

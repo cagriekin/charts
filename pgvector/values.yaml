@@ -3,6 +3,14 @@ fullnameOverride: ""
 
 imagePullSecrets: []
 
+# Lightweight image for helper init containers (permission fixups, config
+# copy/templating) across the StatefulSet, pgpool, and exporter pods. Shared so
+# the pin is consistent and overridable for air-gapped/private registries.
+busyboxImage:
+  repository: busybox
+  tag: "1.37"
+  pullPolicy: IfNotPresent
+
 postgresql:
   image:
     repository: pgvector/pgvector

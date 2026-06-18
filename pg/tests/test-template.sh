@@ -281,6 +281,16 @@ assert_contains "#153: lightweight init containers declare resources" "${init_re
 repmgr_init_res=$(printf '%s\n' "${init_res}" | sed -n '/name: repmgr-init/,/name: setup-config/p')
 assert_contains "#153: repmgr-init declares its (heavier) clone resources" "${repmgr_init_res}" 'cpu: "1"'
 
+# #116: the busybox helper init image is a single shared value (default 1.37 for all
+# four init containers, no more 1.35/1.37 split) and is overridable for air-gapped
+# registries. Default render must carry no hardcoded busybox tag.
+busybox_full=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set prometheusExporter.enabled=true --set postgresql.persistence.enabled=true 2>&1)
+assert_not_contains "#116: no hardcoded busybox:1.35 left" "${busybox_full}" 'image: busybox:1.35'
+assert_eq "#116: all four busybox inits use the shared default 1.37" "4" "$(printf '%s\n' "${busybox_full}" | grep -c 'image: "busybox:1.37"')"
+busybox_override=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set prometheusExporter.enabled=true --set busyboxImage.repository=mirror.local/busybox --set busyboxImage.tag=1.36 --set busyboxImage.pullPolicy=Always 2>&1)
+assert_contains "#116: busyboxImage override applies" "${busybox_override}" 'image: "mirror.local/busybox:1.36"'
+assert_contains "#116: busyboxImage pullPolicy override applies" "${busybox_override}" "imagePullPolicy: Always"
+
 # Test: pgpool deployment has pod securityContext
 assert_contains "full: pgpool has runAsNonRoot" "${full}" "runAsNonRoot: true"
 
