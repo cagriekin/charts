@@ -42,6 +42,25 @@ else
   ok "entrypoint.sh has no ::int-on-hex timeline cast"
 fi
 
+# --- managed users (postgres, repmgr) must be created with a SCRAM secret ---
+# initdb --auth-host=md5 sets password_encryption=md5, but pg_hba requires
+# scram-sha-256 for the pod network -- so a bare CREATE USER stores an MD5 secret
+# that the scram rule rejects ("does not have a valid SCRAM secret"), a startup
+# race that wedges repmgrd / the standby clone. The CREATE/ALTER USER for the
+# managed users must force scram-sha-256 in-session.
+create_repmgr_line=$(grep -E "CREATE USER \\\$\{REPMGR_USER\}" "${ROOT}/entrypoint.sh")
+if printf '%s' "${create_repmgr_line}" | grep -q "password_encryption='scram-sha-256'"; then
+  ok "entrypoint.sh creates the repmgr user with a SCRAM secret"
+else
+  bad "entrypoint.sh creates the repmgr user with a SCRAM secret"
+fi
+create_pg_line=$(grep -E "CREATE USER \\\$\{POSTGRES_USER\}" "${ROOT}/entrypoint.sh")
+if printf '%s' "${create_pg_line}" | grep -q "password_encryption='scram-sha-256'"; then
+  ok "entrypoint.sh creates the postgres user with a SCRAM secret"
+else
+  bad "entrypoint.sh creates the postgres user with a SCRAM secret"
+fi
+
 # --- #175: reclone_preserving_old must not destroy data before a successful clone ---
 # rm -rf'ing PGDATA before the clone leaves an empty data dir if every clone
 # attempt fails. Extract the shipped function and drive it with a failing and a
