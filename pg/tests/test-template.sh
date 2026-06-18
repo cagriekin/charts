@@ -1052,6 +1052,12 @@ backup_configmap=$(helm template test-pg "${CHART_DIR}" \
   --set backup.existingSecret.name=test-secret \
   --show-only templates/backup-configmap.yaml 2>&1)
 assert_contains "backup: pg_restore verification present" "${backup_configmap}" "pg_restore --list"
+# #143: dumps are namespaced per release and retention is scoped to this release's
+# own dump objects, so a shared bucket/prefix can never delete another release's backups.
+# needles are regex-safe (assert_contains greps as a regex): avoid the *. in backup_*.dump
+assert_contains "backup #143: dump path namespaced per release (fullname)" "${backup_configmap}" 'S3_DIR="${S3_BUCKET}/${S3_PREFIX%/}/test-pg"'
+assert_contains "backup #143: find calls scoped to the release subpath + name filter" "${backup_configmap}" 'mc find "s3/${S3_DIR}/" --name '"'"'backup_'
+assert_not_contains "backup #143: retention not run over the bare shared prefix" "${backup_configmap}" 'mc find "s3/${S3_BUCKET}/${S3_PREFIX}/" --older-than'
 
 assert_contains "backup: pod has runAsNonRoot" "${backup_cronjob}" "runAsNonRoot: true"
 assert_contains "backup: container has allowPrivilegeEscalation false" "${backup_cronjob}" "allowPrivilegeEscalation: false"
@@ -1484,7 +1490,7 @@ guard_configmap=$(helm template test-pg "${CHART_DIR}" \
   --set backup.s3.bucket=test \
   --set backup.existingSecret.name=test-secret \
   --show-only templates/backup-configmap.yaml 2>&1)
-assert_contains "backup guard: --newer-than check present" "${guard_configmap}" 'mc find "s3/${S3_BUCKET}/${S3_PREFIX}/" --newer-than "${RETENTION_DAYS}d"'
+assert_contains "backup guard: --newer-than check present (scoped to the release subpath, #143)" "${guard_configmap}" 'mc find "s3/${S3_DIR}/" --name '"'"'backup_'
 assert_contains "backup guard: aborts when no recent backup found" "${guard_configmap}" "aborting retention cleanup"
 assert_contains "backup guard: error message goes to stderr" "${guard_configmap}" 'ERROR: No backup newer than ${RETENTION_DAYS} days'
 

@@ -1,6 +1,21 @@
 # pg chart changelog
 
-## 1.0.2
+## Unreleased
+
+### Fixed
+
+- **Backup retention could delete another release's dumps under a shared
+  bucket/prefix (#143).** `pg_dump` backups were written to a flat
+  `<bucket>/<prefix>/backup_<ts>.dump` with no release identity, and the retention
+  `mc find ... --older-than --exec mc rm` ran recursively over the whole prefix with
+  no name filter — so two releases (e.g. staging + prod) sharing one bucket/prefix
+  each deleted the other's dumps older than their own `retentionDays`. Dumps are now
+  namespaced per release under `<prefix>/<release-fullname>/` (mirroring the
+  pgBackRest repo layout), and both the recent-backup guard and the retention delete
+  are scoped to that subpath with a `--name 'backup_*.dump'` filter (so unrelated
+  objects under the prefix are never touched either). Existing dumps under the old
+  flat path are left in place (not migrated, not deleted); see the README restore
+  section for the new path layout.
 
 Bugfix for agent mode (the 1.0.0 default). Image moves to `trixie-5.5.0-18`. No
 chart-template or values changes beyond the image tag; a `helm upgrade` rolls the
