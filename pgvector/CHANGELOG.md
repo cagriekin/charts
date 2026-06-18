@@ -13,6 +13,13 @@
 
 ### Documentation
 
+- **Clarified that `networkPolicy.postgresql.allowExternal=false` blocks the read-only
+  Service (#148).** `allowExternal` gates direct client access to PostgreSQL on 5432 —
+  the path the `<fullname>-readonly` Service (direct standby reads) uses — so with
+  `allowExternal: false` those read connections silently time out while endpoints look
+  healthy (PGPool on 9999 stays reachable, so read-write clients via PGPool are
+  unaffected). Documented in `values.yaml` with a scoped `extraIngress` recipe to
+  re-allow direct-5432 clients. No default behavior change.
 - **The pgBackRest PITR restore runbook could not work as written (#149).** The
   documented restore pod mounted only the data PVC and set the S3 key env vars, but
   not the `<fullname>-pgbackrest` ConfigMap — the only place `pg1-path` and the

@@ -348,6 +348,13 @@ psql -h localhost -U postgres -d postgres
 
 With `postgresql.replicaCount: 0` the service exists but has no endpoints.
 
+> **NetworkPolicy note.** The read-only Service connects clients *directly* to standbys
+> on 5432, so when `networkPolicy.enabled: true` with
+> `networkPolicy.postgresql.allowExternal: false`, these read connections are blocked
+> (PGPool on 9999 stays reachable, so read-write clients via PGPool are unaffected).
+> Re-allow your read clients with a scoped `networkPolicy.postgresql.extraIngress` rule
+> on port 5432 (add a `namespaceSelector` for cross-namespace clients).
+
 ### Through PGPool-II
 
 ```bash
