@@ -79,10 +79,11 @@ kubectl run mc-setup -n "${NAMESPACE}" --restart=Never --image=minio/mc:RELEASE.
 kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/mc-setup -n "${NAMESPACE}" --timeout=120s
 kubectl delete pod mc-setup -n "${NAMESPACE}" --wait=false
 
-echo "Installing pg chart with backup enabled..."
+echo "Installing pg chart with backup + restore-validation enabled..."
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
   -n "${NAMESPACE}" \
   -f "${SCRIPT_DIR}/values-backup-test.yaml" \
+  --set backup.validation.enabled=true \
   --wait --timeout 5m
 
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 300
@@ -107,6 +108,21 @@ echo "Waiting for backup job to complete..."
 kubectl wait --for=condition=complete job/backup-test -n "${NAMESPACE}" --timeout=300s
 job_status=$?
 assert_eq "backup job completed successfully" "0" "${job_status}"
+
+# #31: drive the restore-validation job end-to-end against the real dump just
+# written -- it downloads the latest backup, restores it into a throwaway
+# PostgreSQL in the Job pod (uid 999 on the official image + fsGroup), and must
+# complete. This is the live coverage the template tests cannot give (it would
+# catch e.g. a wrong runAsUser making initdb fail).
+echo "Triggering backup-validation job (throwaway restore of the latest dump)..."
+kubectl create job -n "${NAMESPACE}" backup-validation-test --from=cronjob/"${FULLNAME}-backup-validation"
+val_status=0
+kubectl wait --for=condition=complete job/backup-validation-test -n "${NAMESPACE}" --timeout=300s || val_status=$?
+if [ "${val_status}" -ne 0 ]; then
+  echo "  validation job did not complete; recent logs:"
+  kubectl logs -n "${NAMESPACE}" job/backup-validation-test --tail=60 2>/dev/null || true
+fi
+assert_eq "backup-validation job completed successfully (#31)" "0" "${val_status}"
 
 echo "Verifying backup exists in S3..."
 # Dumps are namespaced per release under <prefix>/<fullname>/ (#143), so list that subpath.

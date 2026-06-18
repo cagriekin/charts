@@ -249,8 +249,8 @@ EOF
             # moment a standby clone or repmgrd connects over the pod network, before
             # the chart's postStart md5->scram migration has had a chance to run. That
             # is a startup race that crash-loops repmgrd / wedges the standby clone.
-            # Create the managed users with a SCRAM secret directly (SET LOCAL applies
-            # to the CREATE/ALTER in the same session) -- the same end state the chart's
+            # Create the managed users with a SCRAM secret directly (a session-scoped
+            # SET applies to the CREATE/ALTER in that same psql -c session) -- the same end state the chart's
             # fix_user_auth migration drives them to, but race-free from first boot.
             # Legacy/app users keep the md5 default and the existing migration path.
             psql -U postgres -d postgres -c "CREATE DATABASE ${POSTGRES_DB};" 2>/dev/null || true

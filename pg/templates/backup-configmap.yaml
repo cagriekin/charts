@@ -183,8 +183,12 @@ data:
     export MC_HOST_s3="${S3_ENDPOINT%%://*}://$(urlencode "$S3_ACCESS_KEY"):$(urlencode "$S3_SECRET_KEY")@${S3_ENDPOINT#*://}"
 
     echo "Finding the latest backup under s3/${S3_DIR}/ ..."
+    # Separate the mc listing from the parse so a real S3/mc error fails the Job
+    # loudly (set -e) instead of being swallowed by the pipeline and misreported as
+    # "no backup found". A successful-but-empty listing still yields no LATEST.
+    LISTING=$(mc ls "s3/${S3_DIR}/")
     # backup_<YYYYmmdd_HHMMSS>.dump sorts lexically by timestamp, so tail -1 is newest.
-    LATEST=$(mc ls "s3/${S3_DIR}/" | awk '{print $NF}' | grep -E '^backup_.*\.dump$' | sort | tail -1 || true)
+    LATEST=$(printf '%s\n' "$LISTING" | awk '{print $NF}' | grep -E '^backup_.*\.dump$' | sort | tail -1 || true)
     if [ -z "$LATEST" ]; then
       echo "ERROR: no backup_*.dump found under s3/${S3_DIR}/ -- nothing to validate" >&2
       exit 1
@@ -198,6 +202,10 @@ data:
     # Throwaway PostgreSQL in this pod's emptyDir -- isolated from production. fsync
     # off (ephemeral) speeds the restore; only the unix socket is used (no TCP).
     export PGDATA="${WORK}/pgdata"
+    # restartPolicy OnFailure reuses the pod's emptyDir, so a prior failed attempt
+    # leaves a non-empty PGDATA that initdb refuses -- clear it so a retry starts
+    # clean (the downloaded dump elsewhere under ${WORK} is untouched).
+    rm -rf "${PGDATA}" "${WORK}/run"
     mkdir -p "${WORK}/run"
     echo "Initializing a throwaway PostgreSQL for the restore test..."
     initdb -D "$PGDATA" --auth-local=trust >/dev/null
@@ -217,13 +225,16 @@ data:
       SELECT count(*),
              COALESCE(sum(c.reltuples)::bigint, 0)
       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema')")
-    TABLES="${SUMMARY%%|*}"
+      WHERE c.relkind IN ('r', 'p', 'm', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema')")
+    RELS="${SUMMARY%%|*}"
     ROWS="${SUMMARY##*|}"
-    echo "Restore OK: ${TABLES} user table(s), ~${ROWS} row(s) (estimate)"
-    if [ "${TABLES:-0}" -eq 0 ]; then
-      echo "ERROR: restored database has no user tables -- backup may be empty or corrupt" >&2
-      exit 1
+    echo "Restore OK: ${RELS} table-like relation(s), ~${ROWS} row(s) (estimate)"
+    # The hard pass/fail signal is pg_restore --exit-on-error above. A restored DB
+    # with no ordinary/partitioned/matview/foreign relations is only a WARNING, not
+    # a failure: a schema-only or extension-only database restores cleanly yet has
+    # none, and false-failing it would block a perfectly restorable backup.
+    if [ "${RELS:-0}" -eq 0 ]; then
+      echo "WARN: restored database has no table-like relations (schema-only/extension-only?); the dump still restored cleanly via --exit-on-error" >&2
     fi
     echo "Backup validation succeeded for ${LATEST}"
 {{- end }}

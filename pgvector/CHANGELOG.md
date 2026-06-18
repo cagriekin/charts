@@ -16,8 +16,9 @@
 - **Opt-in automated backup-validation CronJob (#31).** A new weekly CronJob
   (`backup.validation.enabled`, default off) downloads the latest `pg_dump` backup
   and restores it into a throwaway PostgreSQL inside the Job pod -- never the live
-  database -- failing the Job (so it alerts) if `pg_restore` errors or the restored
-  database has no user tables. Nothing previously verified that backups were
+  database -- failing the Job (so it alerts) if `pg_restore --exit-on-error` trips (a
+  restored database with no table-like relations is only a warning, since a
+  schema/extension-only database restores cleanly). Nothing previously verified that backups were
   actually restorable beyond a TOC `pg_restore --list` check. Configurable
   `schedule`, `resources`, and `workdirSizeLimit` (the throwaway PGDATA emptyDir
   cap, default unbounded). It reuses the postgresql securityContext (runs

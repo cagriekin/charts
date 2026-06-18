@@ -90,7 +90,15 @@ if [[ -n "${PRIMARY}" && -n "${STANDBY}" ]]; then
     pg_exec "${NAMESPACE}" "${STANDBY}" "INSERT INTO etcd_test (value) VALUES ('${AFTER}')" "testuser" "testdb"
     wv=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT value FROM etcd_test WHERE value='${AFTER}'" "testuser" "testdb")
     assert_eq "new primary is writable" "${AFTER}" "${wv}"
-    ep=$(kubectl get endpoints -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.subsets[0].addresses[0].targetRef.name}' 2>/dev/null || echo "")
+    # The agent patches the write-Service selector asynchronously after promotion,
+    # and endpoints update only once kube reconciles the new selector -- so poll
+    # rather than checking once immediately after promotion is detected.
+    ep=""; r=0
+    while [[ ${r} -lt 30 ]]; do
+      ep=$(kubectl get endpoints -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.subsets[0].addresses[0].targetRef.name}' 2>/dev/null || echo "")
+      [[ "${ep}" == "${STANDBY}" ]] && break
+      sleep 3; r=$((r + 3))
+    done
     assert_eq "write service repoints to the new primary" "${STANDBY}" "${ep}"
   else
     skip "data survives failover (failover did not complete)"

@@ -1243,14 +1243,20 @@ backup_val_cj=$(helm template test-pg "${CHART_DIR}" ${backup_val_args} --set ba
 assert_contains "#31: backup-validation CronJob present when enabled" "${backup_val_cj}" "name: test-pg-backup-validation"
 assert_contains "#31: validation runs validate.sh" "${backup_val_cj}" "/scripts/validate.sh"
 assert_contains "#31: validation makes no API calls (no SA token)" "${backup_val_cj}" "automountServiceAccountToken: false"
-# runs initdb/postgres, so it must use the postgres uid (101), not the backup uid (999)
-assert_contains "#31: validation container runs as the postgres uid 101" "${backup_val_cj}" "runAsUser: 101"
+# runs initdb/postgres on the OFFICIAL postgres image (uid 999), so it must use the
+# backup securityContext (999), not the repmgr-image uid 101 (which has no passwd
+# entry in the official image -> initdb aborts). #shell-1 from the multi-pillar review.
+assert_contains "#31: validation container runs as the official-postgres uid 999" "${backup_val_cj}" "runAsUser: 999"
+assert_contains "#31: validation pod sets fsGroup 999 so initdb can write the emptyDir PGDATA" "${backup_val_cj}" "fsGroup: 999"
 assert_contains "#31: validation schedule wired" "${backup_val_cj}" 'schedule: "0 3 \* \* 0"'
 backup_val_cm=$(helm template test-pg "${CHART_DIR}" ${backup_val_args} --set backup.validation.enabled=true --show-only templates/backup-configmap.yaml 2>&1)
 assert_contains "#31: validate.sh present when enabled" "${backup_val_cm}" "validate.sh:"
-assert_contains "#31: validate.sh fails the Job on a bad restore (--exit-on-error)" "${backup_val_cm}" "pg_restore -h"
-assert_contains "#31: validate.sh uses --exit-on-error" "${backup_val_cm}" "exit-on-error"
-assert_contains "#31: validate.sh reads this release's scoped backup path" "${backup_val_cm}" 'S3_DIR="${S3_BUCKET}/${S3_PREFIX%/}/test-pg"'
+# Scope to the validate.sh stanza so these assert what validate.sh carries, not
+# what backup.sh (in the same ConfigMap, with the identical S3_DIR line) carries.
+validate_sh=$(printf '%s\n' "${backup_val_cm}" | sed -n '/validate.sh: |/,$p')
+assert_contains "#31: validate.sh fails the Job on a bad restore (--exit-on-error)" "${validate_sh}" "pg_restore -h"
+assert_contains "#31: validate.sh uses --exit-on-error" "${validate_sh}" "exit-on-error"
+assert_contains "#31: validate.sh reads this release's scoped backup path" "${validate_sh}" 'S3_DIR="${S3_BUCKET}/${S3_PREFIX%/}/test-pg"'
 # workdir emptyDir cap is configurable; default unbounded (emptyDir: {})
 assert_contains "#31: workdir cap configurable" "$(helm template test-pg "${CHART_DIR}" ${backup_val_args} --set backup.validation.enabled=true --set backup.validation.workdirSizeLimit=10Gi --show-only templates/backup-validation-cronjob.yaml 2>&1)" "sizeLimit: 10Gi"
 
@@ -1297,7 +1303,7 @@ assert_contains "pgbackrest #121: CronJob resolves primary via endpointslices" "
 assert_not_contains "pgbackrest #121: CronJob no longer uses the Endpoints API" "${pgbackrest_cj}" 'get endpoints "'
 pgbackrest_rbac=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/pgbackrest-rbac.yaml 2>&1)
 assert_contains "pgbackrest #121: RBAC grants discovery.k8s.io endpointslices" "${pgbackrest_rbac}" "discovery.k8s.io"
-assert_not_contains "pgbackrest #121: RBAC drops the deprecated endpoints resource" "${pgbackrest_rbac}" 'resources: ["endpoints"]'
+assert_not_contains "pgbackrest #121: RBAC drops the deprecated endpoints resource" "${pgbackrest_rbac}" 'resources: \["endpoints"\]'
 
 # pgBackRest S3 key-type: default (shared) keeps static-key env + emits key-type.
 assert_contains "pgbackrest: default key-type is shared" "${pgbackrest}" "repo1-s3-key-type=shared"
@@ -2064,6 +2070,14 @@ assert_eq "pgvector #126: renders with backup enabled" "0" "${pgv_backup_rc}"
 assert_contains "pgvector #126: backup mc image present" "${pgv_backup}" "minio/mc:"
 assert_contains "pgvector #126: backup container securityContext populated" "${pgv_backup}" "runAsUser: 999"
 assert_not_contains "pgvector #126: no null securityContext" "${pgv_backup}" "securityContext: null"
+# #31 parity: the backup-validation CronJob is a separate template; without the
+# pgvector symlink the feature renders nothing despite the values claiming it runs.
+pgv_val=$(helm template test-pgv "${PGVECTOR_DIR}" \
+  --set backup.enabled=true --set backup.s3.endpoint=https://s3.example.com \
+  --set backup.s3.bucket=b --set backup.existingSecret.name=creds \
+  --set backup.validation.enabled=true --show-only templates/backup-validation-cronjob.yaml 2>&1)
+assert_contains "pgvector #31: backup-validation CronJob renders (symlink present)" "${pgv_val}" "app.kubernetes.io/component: backup-validation"
+assert_contains "pgvector #31: validation runs as the official-postgres uid 999" "${pgv_val}" "runAsUser: 999"
 
 # --- pgvector agent-mode parity ---
 # The agent-mode templates are symlinks to pg's, but pgvector/values.yaml is an

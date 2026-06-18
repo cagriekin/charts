@@ -55,6 +55,10 @@ data:
           COALESCE(EXTRACT(EPOCH FROM (now() - last_archived_time))::float, -1) AS seconds_since_last_archived,
           COALESCE(EXTRACT(EPOCH FROM (now() - last_failed_time))::float, -1) AS seconds_since_last_failed
         FROM pg_stat_archiver
+        -- Emit only on the primary: a standby's pg_stat_archiver reflects its own
+        -- (non-)archiving and would otherwise add misleading series. On a standby
+        -- this returns zero rows, so no metric is produced there.
+        WHERE NOT pg_is_in_recovery()
       master: true
       metrics:
         - archived_count:
