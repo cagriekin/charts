@@ -263,13 +263,23 @@ sized_full=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-
 assert_not_contains "#165: no uncapped emptyDir in a full render" "${sized_full}" "emptyDir: {}"
 data_capped=$(helm template test-pg "${CHART_DIR}" --set postgresql.persistence.enabled=false --set postgresql.persistence.emptyDir.sizeLimit=8Gi --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#165: non-persistent data emptyDir honors the sizeLimit" "${data_capped}" "sizeLimit: 8Gi"
+# default (sizeLimit unset) -> the documented unbounded fallback (emptyDir: {})
+data_default=$(helm template test-pg "${CHART_DIR}" --set postgresql.persistence.enabled=false --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#165: non-persistent data emptyDir defaults to unbounded emptyDir: {}" "${data_default}" "emptyDir: {}"
+# cover the feature-gated caps the full render omits (ext trees 1Gi; pgbackrest pg-run 16Mi)
+sized_feature=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --set postgresql.extensions.enabled=true --set postgresql.majorVersion=18 2>&1)
+assert_contains "#165: extension-tree emptyDir capped at 1Gi" "${sized_feature}" "sizeLimit: 1Gi"
 
 # #153: init containers must declare resources (else pods are Forbidden under a
 # ResourceQuota). Lightweight inits use the small shared block (cpu: 10m); repmgr-init
 # (the clone) uses its own heavier, overridable resources.
 init_res=$(helm template test-pg "${CHART_DIR}" --set postgresql.extensions.enabled=true --set postgresql.majorVersion=18 --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#153: lightweight init containers declare resources" "${init_res}" "cpu: 10m"
-assert_contains "#153: repmgr-init declares its (heavier) clone resources" "${init_res}" "memory: 1Gi"
+# scope to the repmgr-init block and assert its distinctive clone CPU limit (cpu: "1"),
+# which no other container uses -- a plain "memory: 1Gi" needle would also match the
+# main postgresql container and so would not prove repmgr-init has resources.
+repmgr_init_res=$(printf '%s\n' "${init_res}" | sed -n '/name: repmgr-init/,/name: setup-config/p')
+assert_contains "#153: repmgr-init declares its (heavier) clone resources" "${repmgr_init_res}" 'cpu: "1"'
 
 # Test: pgpool deployment has pod securityContext
 assert_contains "full: pgpool has runAsNonRoot" "${full}" "runAsNonRoot: true"
@@ -1188,6 +1198,8 @@ exporter_deploy166=$(helm template test-pg "${CHART_DIR}" --set prometheusExport
 assert_contains "#166: exporter pod disables SA token automount" "${exporter_deploy166}" "automountServiceAccountToken: false"
 sts_agent166=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1)
 assert_not_contains "#166: repmgr StatefulSet keeps its SA token (agent needs the API)" "${sts_agent166}" "automountServiceAccountToken"
+sts_repmgrd166=$(helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=repmgrd --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#166: repmgrd-mode StatefulSet also keeps its SA token (service-updater needs the API)" "${sts_repmgrd166}" "automountServiceAccountToken"
 sts_standalone166=$(helm template test-pg "${CHART_DIR}" --set repmgr.enabled=false --set postgresql.replicaCount=0 --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#166: standalone StatefulSet disables SA token automount" "${sts_standalone166}" "automountServiceAccountToken: false"
 
@@ -2020,6 +2032,17 @@ assert_not_contains "pgvector: default has no repmgrd sidecar" "${pgv_default}" 
 # the legacy repmgrd path stays available as an explicit opt-in.
 pgv_repmgrd=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=repmgrd --show-only templates/statefulset.yaml 2>&1)
 assert_contains "pgvector repmgrd: opt-in still runs repmgrd" "${pgv_repmgrd}" "name: repmgrd"
+
+# pgvector parity for the security/resource cluster: the templates are symlinked but the
+# values are per-chart, so guard the #126-class "drop a key -> securityContext: null"
+# regression on the symlink-fed, securityContext-bearing keys (#155/#118/#166).
+pgv_pgbackrest_cron=$(helm template test-pgv "${PGVECTOR_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/pgbackrest-cronjob.yaml 2>&1)
+assert_contains "pgvector #155: pgbackrest CronJob runs non-root" "${pgv_pgbackrest_cron}" "runAsNonRoot: true"
+assert_not_contains "pgvector #155: pgbackrest CronJob has no null securityContext" "${pgv_pgbackrest_cron}" "securityContext: null"
+pgv_pgpool_svc=$(helm template test-pgv "${PGVECTOR_DIR}" --set pgpool.enabled=true --show-only templates/pgpool-service.yaml 2>&1)
+assert_not_contains "pgvector #118: pgpool Service does not expose PCP 9898 by default" "${pgv_pgpool_svc}" "9898"
+pgv_backup_cron=$(helm template test-pgv "${PGVECTOR_DIR}" --set backup.enabled=true --set backup.existingSecret.name=s --set backup.s3.endpoint=https://m --set backup.s3.bucket=b --show-only templates/backup-cronjob.yaml 2>&1)
+assert_contains "pgvector #166: backup pod disables SA token automount" "${pgv_backup_cron}" "automountServiceAccountToken: false"
 
 # --- #128: global.annotations render as metadata.annotations, not labels ---
 # global.annotations used to be spliced into pg.labels and rendered under
