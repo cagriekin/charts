@@ -130,7 +130,13 @@ kubectl run mc-fetch -n "${NAMESPACE}" --restart=Never --image=minio/mc:RELEASE.
   --command -- sh -c "sleep 300"
 kubectl wait --for=condition=Ready pod/mc-fetch -n "${NAMESPACE}" --timeout=120s
 kubectl exec -n "${NAMESPACE}" mc-fetch -- mc alias set s3 http://minio:9000 minioadmin minioadmin
-DUMP_FILE=$(kubectl exec -n "${NAMESPACE}" mc-fetch -- mc ls "s3/pg-backups/backups/${FULLNAME}/" --json | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)
+# Select the NEWEST published dump, and only a published one: filter to
+# backup_<ts>.dump (rejecting any backup_<ts>.dump.tmp staging object, #159) and sort
+# descending so the lexically-greatest timestamp (the latest) wins -- the exact
+# "restore the latest" path #159 protects.
+DUMP_FILE=$(kubectl exec -n "${NAMESPACE}" mc-fetch -- mc ls "s3/pg-backups/backups/${FULLNAME}/" --json \
+  | grep -o '"key":"[^"]*"' | cut -d'"' -f4 | grep -E '^backup_.*\.dump$' | sort -r | head -1)
+assert_contains "#159: restore target is a published dump, not a .tmp stage" "${DUMP_FILE}" ".dump"
 kubectl exec -n "${NAMESPACE}" mc-fetch -- mc cat "s3/pg-backups/backups/${FULLNAME}/${DUMP_FILE}" \
   | kubectl exec -i -n "${NAMESPACE}" "${POD}" -c postgresql -- bash -c "cat > /tmp/restore.dump"
 kubectl delete pod mc-fetch -n "${NAMESPACE}" --wait=false

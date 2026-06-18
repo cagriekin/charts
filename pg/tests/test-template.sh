@@ -1062,6 +1062,12 @@ assert_not_contains "backup #143: retention not run over the bare shared prefix"
 # provide them via MC_HOST_s3 read from the environment instead.
 assert_contains "backup #167: credentials provided via MC_HOST_s3 env" "${backup_configmap}" "export MC_HOST_s3="
 assert_not_contains "backup #167: no mc alias set with the endpoint in argv" "${backup_configmap}" 'mc alias set s3 "$S3_ENDPOINT"'
+# #159: stage the dump to a .tmp object and publish (mc mv) to the canonical name only
+# after integrity verification, so a truncated dump never sits at backup_<ts>.dump.
+assert_contains "backup #159: pg_dump streams to the staging object" "${backup_configmap}" 'mc pipe "s3/${S3_TMP}"'
+assert_contains "backup #159: verified dump published with mc mv" "${backup_configmap}" 'mc mv "s3/${S3_TMP}" "s3/${S3_PATH}"'
+assert_contains "backup #159: staging removed on failure (EXIT trap)" "${backup_configmap}" 'mc rm "s3/${S3_TMP}"'
+assert_not_contains "backup #159: pg_dump no longer streams directly to the canonical name" "${backup_configmap}" 'pg_dump -Fc -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" | mc pipe "s3/${S3_PATH}"'
 
 assert_contains "backup: pod has runAsNonRoot" "${backup_cronjob}" "runAsNonRoot: true"
 assert_contains "backup: container has allowPrivilegeEscalation false" "${backup_cronjob}" "allowPrivilegeEscalation: false"
