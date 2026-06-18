@@ -14,7 +14,7 @@ data:
 {{- if .Values.postgresql.configuration }}
   custom.conf: |
     {{- range $key, $value := .Values.postgresql.configuration }}
-    {{ $key }} = '{{ $value }}'
+    {{ $key }} = '{{ $value | toString | replace "'" "''" }}'
     {{- end }}
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
@@ -23,7 +23,7 @@ data:
   # configmap checksum annotation on the StatefulSet triggers.
   pgbackrest-archive.conf: |
     archive_mode = on
-    archive_command = 'pgbackrest --stanza={{ .Values.pgbackrest.stanza }} archive-push %p'
+    archive_command = 'pgbackrest --stanza={{ .Values.pgbackrest.stanza | toString | replace "'" "''" }} archive-push %p'
     wal_level = replica
     max_wal_senders = 10
 {{- end }}

@@ -135,6 +135,15 @@ pgpool_cleartext=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/pgpool-configmap.yaml 2>&1)
 assert_contains "pgpool clear-text auth: enabled when set to true" "${pgpool_cleartext}" "allow_clear_text_frontend_auth = on"
 
+# #157: single quotes in conf values must be doubled or the postmaster/pgpool fails to
+# start (PostgreSQL/pgpool conf lexer requires '' to embed a literal single quote).
+pgconf_quote=$(helm template test-pg "${CHART_DIR}" --set-string "postgresql.configuration.log_line_prefix=it's" --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#157: postgresql.conf doubles embedded single quotes" "${pgconf_quote}" "log_line_prefix = 'it''s'"
+pgpool_quote=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set-string "pgpool.resetQueryList=SET x='y'" --show-only templates/pgpool-configmap.yaml 2>&1)
+assert_contains "#157: pgpool reset_query_list doubles embedded single quotes" "${pgpool_quote}" "reset_query_list = 'SET x=''y'''"
+stanza_quote=$(helm template test-pg "${CHART_DIR}" --set pgbackrest.enabled=true --set pgbackrest.s3.endpoint=https://s --set pgbackrest.s3.bucket=b --set pgbackrest.existingSecret.name=sec --set-string "pgbackrest.stanza=x'y" --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#157: archive_command doubles single quotes in the stanza" "${stanza_quote}" "stanza=x''y archive-push"
+
 # Full: should have prometheus exporter deployment
 assert_contains "full: prometheus exporter present" "${full}" "postgres-exporter"
 
