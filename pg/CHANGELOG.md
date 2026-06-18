@@ -4,6 +4,13 @@
 
 ### Security
 
+- **The PgPool-II PCP admin port (9898) is no longer exposed on the Service by default
+  (#118).** The pgpool Service published the PCP admin/control port cluster-wide, while
+  the pgpool NetworkPolicy only admits 9999 — so with NetworkPolicy off the admin
+  endpoint was reachable by any pod, and with it on the Service port was dead. It is now
+  gated behind `pgpool.service.exposePcp` (default `false`). Enable it only if you run
+  `pcp_*` commands against the Service, and pair it with a `pgpool.extraIngress` rule for
+  9898 when NetworkPolicy is enabled.
 - **The `fix-permissions` init container drops its excess capabilities (#162).** The
   chown init container legitimately needs root, but it inherited the runtime's full
   default capability set (SETUID, SETGID, NET_RAW, …). It now drops ALL and adds back

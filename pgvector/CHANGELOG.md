@@ -4,6 +4,12 @@
 
 ### Security
 
+- **The PgPool-II PCP admin port (9898) is no longer exposed on the Service by default
+  (#118).** The pgpool Service published the PCP admin/control port cluster-wide while
+  the pgpool NetworkPolicy only admits 9999. It is now gated behind
+  `pgpool.service.exposePcp` (default `false`); enable it only if you run `pcp_*`
+  commands against the Service (and add a `pgpool.extraIngress` rule for 9898 under
+  NetworkPolicy).
 - **The `fix-permissions` init container drops its excess capabilities (#162).** The
   chown init container needs root but inherited the full default capability set; it now
   drops ALL and adds back only `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, matching the chart's

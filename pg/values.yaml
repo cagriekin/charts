@@ -343,6 +343,12 @@ pgpool:
   service:
     type: ClusterIP
     port: 9999
+    # Expose the PgPool-II PCP admin port (9898) on the Service. Off by default: PCP is
+    # an admin/control endpoint that was reachable cluster-wide with no NetworkPolicy
+    # rule admitting it (the pgpool NetworkPolicy only admits 9999) (#118). Enable only
+    # if you run pcp_* commands against the Service, and pair it with a
+    # pgpool.extraIngress rule for 9898 when NetworkPolicy is enabled.
+    exposePcp: false
 
   affinity: {}
 
