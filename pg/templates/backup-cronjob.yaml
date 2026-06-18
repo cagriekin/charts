@@ -50,6 +50,8 @@ spec:
                   drop:
                     - ALL
               command: ["/bin/sh", "-c", "cp /usr/bin/mc /tools/mc && chmod 0755 /tools/mc && cp /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /tools/ca-bundle.crt"]
+              resources:
+                {{- include "pg.initResources" . | nindent 16 }}
               volumeMounts:
                 - name: tools
                   mountPath: /tools

@@ -245,6 +245,17 @@ repmgr:
       cpu: 500m
       memory: 512Mi
 
+  # Resources for the repmgr-init init container, which runs `repmgr standby clone`
+  # (a full pg_basebackup of the database) -- heavier than the other init containers,
+  # so it is overridable here (#153). Raise the limits for large databases.
+  initContainerResources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
   terminationGracePeriodSeconds: 120
 
   splitBrainDetection:
