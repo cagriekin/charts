@@ -33,11 +33,14 @@ spec:
           restartPolicy: OnFailure
           # Talks only to S3 and a throwaway local PostgreSQL, never the K8s API.
           automountServiceAccountToken: false
-          # Runs initdb/postgres for the throwaway restore, so it reuses the
-          # postgresql securityContext (postgres uid 101, fsGroup 103) -- the
-          # backup writer's 999 cannot own a PGDATA the server will start.
+          # Runs initdb/postgres against the throwaway emptyDir using the official
+          # postgres image (postgresql.image), whose postgres user is uid 999 -- so
+          # it reuses the backup writer's securityContext (uid 999) plus fsGroup 999
+          # (on backup.podSecurityContext) so initdb can write the emptyDir PGDATA.
+          # Running as 101 (the repmgr image's uid) fails: 101 has no passwd entry
+          # in the official image and initdb aborts.
           securityContext:
-            {{- toYaml .Values.postgresql.podSecurityContext | nindent 12 }}
+            {{- toYaml .Values.backup.podSecurityContext | nindent 12 }}
           initContainers:
             - name: mc-installer
               image: "{{ .Values.backup.mc.image.repository }}:{{ .Values.backup.mc.image.tag }}"
@@ -62,7 +65,7 @@ spec:
               image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
               imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
               securityContext:
-                {{- toYaml .Values.postgresql.containerSecurityContext | nindent 16 }}
+                {{- toYaml .Values.backup.containerSecurityContext | nindent 16 }}
               command: ["/bin/bash", "/scripts/validate.sh"]
               env:
                 - name: S3_ENDPOINT

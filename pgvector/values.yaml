@@ -469,6 +469,10 @@ backup:
       pullPolicy: IfNotPresent
   podSecurityContext:
     runAsNonRoot: true
+    # 999 is the postgres uid/gid in the official postgres image. fsGroup lets the
+    # backup-validation Job's uid-999 process write the throwaway PGDATA on its
+    # emptyDir (the writer job does not need it, but it is harmless there).
+    fsGroup: 999
     seccompProfile:
       type: RuntimeDefault
   # 999 is the postgres uid/gid in the official postgres image; the kubelet

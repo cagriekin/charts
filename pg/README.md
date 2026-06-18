@@ -85,6 +85,9 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `imagePullSecrets` | Pull secrets applied to every pod template (StatefulSet, pgpool and exporter Deployments, backup and pgBackRest CronJobs) | `[]` |
+| `busyboxImage.repository` | Image for the helper init containers (permission fixups, config copy/templating) across the StatefulSet, pgpool, and exporter pods; override for air-gapped/private registries | `busybox` |
+| `busyboxImage.tag` | Helper init image tag | `1.37` |
+| `busyboxImage.pullPolicy` | Helper init image pull policy | `IfNotPresent` |
 
 ### PostgreSQL Parameters
 
@@ -697,6 +700,19 @@ The exporter's built-in replication collector provides `pg_replication_lag_secon
 
 Alert on `pg_replication_lag_seconds` to catch a standby falling behind, and on `sum(pg_wal_replication_in_recovery == 0) > 1` across the instances of one release to detect split-brain (two primaries). Note that `pg_replication_lag_seconds` also grows on a healthy standby while the primary is idle (no transactions to replay), so combine it with `pg_wal_replication_receive_replay_lag_bytes` when tuning alert thresholds.
 
+### WAL Archiving Metrics
+
+When pgBackRest is enabled, the exporter adds a `pg_wal_archive` query group from `pg_stat_archiver`, evaluated **only on the primary** (archiving happens there; a standby emits no `pg_wal_archive_*` series):
+
+| Metric | Description |
+|--------|-------------|
+| `pg_wal_archive_archived_count` | WAL segments successfully archived since the last stats reset |
+| `pg_wal_archive_failed_count` | Failed WAL archive attempts (`archive_command` failures) since the last stats reset |
+| `pg_wal_archive_seconds_since_last_archived` | Seconds since the last successful WAL archive (`-1` if none yet) |
+| `pg_wal_archive_seconds_since_last_failed` | Seconds since the last failed WAL archive attempt (`-1` if none) |
+
+Alert on `rate(pg_wal_archive_failed_count[5m]) > 0` to catch a failing `archive_command` — this is the actionable signal. `pg_wal_archive_seconds_since_last_archived` also grows on an idle primary that has no WAL to archive, so alert on it only in conjunction with a WAL-generation signal (e.g. it rising while `pg_wal_archive_archived_count` stays flat), not on its own.
+
 ### Exporter Parameters
 
 | Parameter | Description | Default |
@@ -770,6 +786,13 @@ kubectl create job --from=cronjob/my-postgres-pg-backup manual-backup
 | `backup.resources.requests.memory` | Memory request | `256Mi` |
 | `backup.resources.limits.cpu` | CPU limit | `500m` |
 | `backup.resources.limits.memory` | Memory limit | `512Mi` |
+| `backup.validation.enabled` | Enable the weekly restore-validation CronJob (restores the latest dump into a throwaway PostgreSQL in the Job pod and fails on a bad restore) | `false` |
+| `backup.validation.schedule` | Cron schedule for the validation job | `` `0 3 * * 0` `` |
+| `backup.validation.workdirSizeLimit` | `sizeLimit` for the throwaway PGDATA + downloaded-dump emptyDir; must exceed the restored DB size; empty = unbounded | `""` |
+| `backup.validation.resources.requests.cpu` | Validation job CPU request | `200m` |
+| `backup.validation.resources.requests.memory` | Validation job memory request | `256Mi` |
+| `backup.validation.resources.limits.cpu` | Validation job CPU limit | `1` |
+| `backup.validation.resources.limits.memory` | Validation job memory limit | `1Gi` |
 
 ### Restore
 
