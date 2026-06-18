@@ -60,7 +60,7 @@ spec:
               command: ["/bin/bash", "/scripts/backup.sh"]
               env:
                 - name: POSTGRES_HOST
-                  value: {{ include "pg.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+                  value: {{ printf "%s.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
                 - name: POSTGRES_USER
                   valueFrom:
                     secretKeyRef:

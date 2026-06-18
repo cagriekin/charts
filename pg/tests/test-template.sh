@@ -144,6 +144,12 @@ assert_contains "#157: pgpool reset_query_list doubles embedded single quotes" "
 stanza_quote=$(helm template test-pg "${CHART_DIR}" --set pgbackrest.enabled=true --set pgbackrest.s3.endpoint=https://s --set pgbackrest.s3.bucket=b --set pgbackrest.existingSecret.name=sec --set-string "pgbackrest.stanza=x'y" --show-only templates/postgresql-configmap.yaml 2>&1)
 assert_contains "#157: archive_command doubles single quotes in the stanza" "${stanza_quote}" "stanza=x''y archive-push"
 
+# #156: env values must be quoted (k8s EnvVar.value is a string; a numeric/bool-looking
+# value renders as a YAML scalar the API server rejects with an unmarshal error).
+numericenv=$(helm template test-pg "${CHART_DIR}" --set repmgr.database=12345 --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#156: numeric REPMGR_DB renders as a quoted string" "${numericenv}" 'value: "12345"'
+assert_not_contains "#156: numeric REPMGR_DB not a bare YAML scalar" "${numericenv}" 'value: 12345'
+
 # Full: should have prometheus exporter deployment
 assert_contains "full: prometheus exporter present" "${full}" "postgres-exporter"
 

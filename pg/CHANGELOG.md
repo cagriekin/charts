@@ -30,6 +30,15 @@
 
 ### Fixed
 
+- **Numeric/boolean-looking env values no longer fail at apply (#156).** Several
+  container env values (`REPMGR_USER`, `REPMGR_DB`, `PGBACKREST_STANZA`, `STANZA`,
+  `SPLIT_BRAIN_ACTION`, the Service/marker/Lease names, FQDNs) were interpolated into
+  `value:` without `| quote`. A value that YAML types as a number or bool (e.g.
+  `repmgr.database=12345`, `pgbackrest.stanza=123`) rendered as a bare scalar that the
+  API server rejects (`cannot unmarshal number into field of type string`) — passing
+  `helm template`/`lint` but failing at apply. All
+  user-facing env values are now `| quote`d (composite names via `printf … | quote`),
+  matching the already-quoted `MONITORING_HISTORY_DAYS`/S3 envs.
 - **Single quotes in `postgresql.configuration` / `pgpool.resetQueryList` no longer
   produce an invalid config (#157).** Both were interpolated naively into single-quoted
   conf lines, so a value containing a `'` (e.g. in `log_line_prefix` or
