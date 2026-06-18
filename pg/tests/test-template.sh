@@ -1285,6 +1285,9 @@ assert_contains "pgbackrest: CronJob runs as service account" "${pgbackrest_cron
 assert_contains "pgbackrest: CronJob resolves primary via endpoints" "${pgbackrest_cron}" "endpoints"
 assert_contains "pgbackrest: CronJob execs into sidecar" "${pgbackrest_cron}" "exec \"\$PRIMARY\" -c pgbackrest"
 assert_contains "pgbackrest: CronJob ensures stanza" "${pgbackrest_cron}" "stanza-create"
+# #160: stanza-create must NOT be masked with '|| true' -- a real failure (S3 perms,
+# kubectl exec error, needed stanza-upgrade) must surface, not be swallowed.
+assert_not_contains "#160: stanza-create not masked with || true" "${pgbackrest_cron}" "stanza-create || true"
 assert_contains "pgbackrest: CronJob runs backup" "${pgbackrest_cron}" "type=\"\$BACKUP_TYPE\" backup"
 assert_contains "pgbackrest: CronJob concurrency Forbid" "${pgbackrest_cron}" "concurrencyPolicy: Forbid"
 # assert_contains uses `grep` (regex), so escape the cron-spec stars.
