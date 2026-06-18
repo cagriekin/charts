@@ -60,6 +60,31 @@
   `--type=time` to the `restore --target` command, corrects the `keyType: auto`
   guidance (bind to the `<fullname>-repmgr` SA, not the default), and uses the current
   image tag.
+- **Brought the pgvector README into parity with the pg README (#152).** The pgvector
+  README is an independent copy that had fallen behind: the entire NetworkPolicy section
+  and ~32 parameter rows backed by `values.yaml` — security contexts (postgresql / pgpool /
+  exporter), `repmgr.splitBrainDetection.action`, pgpool clear-text auth / topology spread /
+  node placement / metrics probes / `logMinMessages`, postgresql md5→scram migration / node
+  placement / SA annotations, and backup `mc` image / security contexts / `activeDeadlineSeconds`
+  / `backoffLimit` — were undocumented, some referenced by the README's own prose. Ported
+  the missing section and rows verbatim from pg (defaults are identical).
+- **Fixed pgBackRest docs that described the removed scheduler-sidecar architecture
+  (#151).** "How It Works" still credited a `pgbackrest-scheduler` sidecar and the parameter
+  table labeled `pgbackrest.resources` as "Scheduler sidecar" while omitting every
+  `pgbackrest.cronjob.*` tunable. Updated the prose to the CronJob-exec architecture and
+  added the `pgbackrest.cronjob.*` rows.
+- **Corrected the documented `pgpool.image.tag` default (#150).** The README listed `4.7.0`;
+  the chart ships `cagriekin/pgpool:4.7.1` (the pg README was already correct). Also synced
+  the `repmgr.image.tag` row to the shipped `trixie-5.5.0-18`.
+- **Fixed five CHANGELOG migration commands that named the wrong chart (#163).** Five
+  "Migrating from" notes were copy-pasted from pg and read `helm upgrade my-release
+  cagriekin/pg`; running that against a pgvector release would swap the chart. Corrected to
+  `cagriekin/pgvector`.
+- **Relaxed the `appVersion`/README PostgreSQL-version claim from `18.1` to `18` (#164).**
+  The default image tag `pg18-trixie` floats with upstream pgvector publishing and pins only
+  the PostgreSQL major (no upstream tag pins the minor), so the `18.1` appVersion (stamped
+  into `app.kubernetes.io/version`) and the README claim could silently diverge from the
+  deployed minor. Both now state `18`, matching what the tag guarantees.
 
 ### Fixed
 
@@ -586,7 +611,7 @@ Documentation only; no rendered resources change and no pods roll.
 
 ## Migrating from 0.6.79
 
-`helm upgrade my-release cagriekin/pg` is the entire migration; no pods roll with default values (the StatefulSet pod template is unchanged and the service-updater configmap is not checksummed into it). Because the running service-updater process does not re-read its script, pg-role labeling -- and therefore readonly endpoints -- only activates once the service-updater containers restart (next pod roll or container restart); until then, and with `postgresql.replicaCount: 0` permanently, the `<fullname>-readonly` Service exists but has no endpoints, which is the safe default (unlabeled pods are never selected, so reads can never hit the primary by accident). The RBAC change applies immediately.
+`helm upgrade my-release cagriekin/pgvector` is the entire migration; no pods roll with default values (the StatefulSet pod template is unchanged and the service-updater configmap is not checksummed into it). Because the running service-updater process does not re-read its script, pg-role labeling -- and therefore readonly endpoints -- only activates once the service-updater containers restart (next pod roll or container restart); until then, and with `postgresql.replicaCount: 0` permanently, the `<fullname>-readonly` Service exists but has no endpoints, which is the safe default (unlabeled pods are never selected, so reads can never hit the primary by accident). The RBAC change applies immediately.
 
 ## 0.6.79
 
@@ -622,7 +647,7 @@ With default values (pgpool.enabled=false) nothing changes and no pods roll. Wit
 
 ## Migrating from 0.6.77
 
-`helm upgrade my-release cagriekin/pg` is the entire migration. With default values nothing rolls: `postgresql.majorVersion` defaults to "18", so every rendered manifest is byte-identical to the previous release (the affected paths only render when `postgresql.extensions.enabled=true`, and even then they resolve to the same /18/ paths). Users running a non-18 image with extensions enabled should set `postgresql.majorVersion` to match their image's major version; leaving it empty now fails the render with a clear error.
+`helm upgrade my-release cagriekin/pgvector` is the entire migration. With default values nothing rolls: `postgresql.majorVersion` defaults to "18", so every rendered manifest is byte-identical to the previous release (the affected paths only render when `postgresql.extensions.enabled=true`, and even then they resolve to the same /18/ paths). Users running a non-18 image with extensions enabled should set `postgresql.majorVersion` to match their image's major version; leaving it empty now fails the render with a clear error.
 
 ## 0.6.77
 
@@ -639,7 +664,7 @@ With default values (pgpool.enabled=false) nothing changes and no pods roll. Wit
 
 ## Migrating from 0.6.76
 
-`helm upgrade my-release cagriekin/pg` is the entire migration. With repmgr enabled (the default) the StatefulSet pod template changes (new env var and startup script in the repmgrd sidecar), so the postgresql pods roll once via the normal rolling update; repmgr handles the failover as on any upgrade. The first prune of an existing oversized monitoring_history table happens within 24h of the new pods starting. With repmgr disabled nothing changes and no pods roll.
+`helm upgrade my-release cagriekin/pgvector` is the entire migration. With repmgr enabled (the default) the StatefulSet pod template changes (new env var and startup script in the repmgrd sidecar), so the postgresql pods roll once via the normal rolling update; repmgr handles the failover as on any upgrade. The first prune of an existing oversized monitoring_history table happens within 24h of the new pods starting. With repmgr disabled nothing changes and no pods roll.
 
 ## 0.6.76
 
@@ -679,7 +704,7 @@ With default values the StatefulSet pod template changes (a new preferred zone a
 
 ## Migrating from 0.6.74
 
-`helm upgrade my-release cagriekin/pg` is the entire migration. With the default `prometheusExporter.enabled=false` nothing is rendered and no pods roll. With the exporter enabled, the configmap change rolls only the exporter Deployment (via its checksum/config annotation); database pods do not roll and no values changes are required — the new metrics appear on the next scrape.
+`helm upgrade my-release cagriekin/pgvector` is the entire migration. With the default `prometheusExporter.enabled=false` nothing is rendered and no pods roll. With the exporter enabled, the configmap change rolls only the exporter Deployment (via its checksum/config annotation); database pods do not roll and no values changes are required — the new metrics appear on the next scrape.
 
 ## 0.6.74
 
@@ -697,7 +722,7 @@ With default values the StatefulSet pod template changes (a new preferred zone a
 
 ## Migrating from 0.6.73
 
-`helm upgrade my-release cagriekin/pg` is the entire migration. No pods roll with default values; with `backup.enabled=true` only the backup ConfigMap changes, which the next CronJob run picks up. No values changes are required. The backup job now fails (exit 1) instead of deleting when no backup newer than retentionDays is visible under the configured prefix — a condition that previously resulted in silent total deletion.
+`helm upgrade my-release cagriekin/pgvector` is the entire migration. No pods roll with default values; with `backup.enabled=true` only the backup ConfigMap changes, which the next CronJob run picks up. No values changes are required. The backup job now fails (exit 1) instead of deleting when no backup newer than retentionDays is visible under the configured prefix — a condition that previously resulted in silent total deletion.
 
 ## 0.6.73
 

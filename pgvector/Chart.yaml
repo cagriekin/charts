@@ -3,7 +3,7 @@ name: pgvector
 description: PostgreSQL with pgvector extension and optional PGPool-II
 type: application
 version: 1.0.2
-appVersion: "18.1"
+appVersion: "18"
 home: https://github.com/cagriekin/charts/tree/master/pgvector
 icon: https://wiki.postgresql.org/images/a/a4/PostgreSQL_logo.3colors.svg
 sources:

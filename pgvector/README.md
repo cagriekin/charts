@@ -6,7 +6,7 @@ This chart shares all templates with the [pg chart](../pg/) via symlinks. The on
 
 ## Features
 
-- PostgreSQL 18.1 with pgvector extension for vector similarity search
+- PostgreSQL 18 with pgvector extension for vector similarity search
 - Repmgr for automatic failover and replication management
 - Service-updater sidecar for automatic primary service selector updates after failover
 - Stale-primary protection: a crashed primary that restarts after a standby was promoted rejoins as a standby (via pg_rewind) instead of resuming read-write on a divergent timeline
@@ -126,6 +126,8 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 | `postgresql.priorityClassName` | priorityClassName for PostgreSQL pods | `""` |
 | `postgresql.affinity` | Affinity rules for PostgreSQL pods | `{}` |
 | `postgresql.annotations` | Additional annotations | `{}` |
+| `postgresql.podSecurityContext` | Pod-level securityContext for StatefulSet | `{fsGroup: 103, runAsNonRoot: true, seccompProfile.type: RuntimeDefault}` |
+| `postgresql.containerSecurityContext` | Container-level securityContext for all PostgreSQL containers | `{runAsUser: 101, runAsGroup: 103, allowPrivilegeEscalation: false, capabilities.drop: [ALL]}` |
 
 ### Liveness and Readiness Probes
 
@@ -166,6 +168,11 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.pgHba` | List of pg_hba.conf entries injected via postStart | `[]` |
 | `postgresql.extensions.enabled` | Enable extensions support | `true` |
 | `postgresql.lifecycle.postStart.additionalCommands` | Shell commands to run after PostgreSQL is ready | pgvector CREATE EXTENSION |
+| `postgresql.migrateLegacyMd5Users` | Re-hash MD5 user passwords to SCRAM on PG14+ | `true` |
+| `postgresql.nodeSelector` | Node selector for PostgreSQL pods | `{}` |
+| `postgresql.tolerations` | Tolerations for PostgreSQL pods | `[]` |
+| `postgresql.topologySpreadConstraints` | Spread constraints added alongside the built-in affinity (e.g. a hard zone spread) | `[]` |
+| `postgresql.serviceAccount.annotations` | Annotations on the postgresql pods' ServiceAccount (cloud workload identity for keyless pgBackRest S3) | `{}` |
 
 Example:
 
@@ -192,7 +199,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 |-----------|-------------|---------|
 | `repmgr.enabled` | Enable repmgr | `true` |
 | `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
-| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-16` |
+| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-18` |
 | `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `repmgr.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Bump with `repmgr.image.tag` when moving to an image built for a new PG major. | `"18"` |
 | `repmgr.username` | Repmgr database user | `repmgr` |
@@ -207,6 +214,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 | `repmgr.serviceUpdater.resources.requests.memory` | Service-updater memory request | `64Mi` |
 | `repmgr.serviceUpdater.resources.limits.memory` | Service-updater memory limit | `128Mi` |
 | `repmgr.initContainerResources` | Resources for the `repmgr-init` standby-clone init container (raise for large databases) | `requests: 100m/128Mi, limits: 1/1Gi` |
+| `repmgr.splitBrainDetection.action` | Action on split-brain: `log` (alert only) or `fence` (terminate stale primary) | `log` |
 
 When repmgr is enabled, a preStop lifecycle hook stops PostgreSQL cleanly (`pg_ctl stop -m fast`) before pod termination. If the terminated pod was the primary, repmgrd on a standby detects the outage and promotes via its `promote_command`, which also updates repmgr metadata; the hook deliberately does not promote out-of-band, since a raw `pg_promote()` would leave repmgr.nodes stale and strand every repmgrd. The `terminationGracePeriodSeconds` controls how long Kubernetes waits for the shutdown to complete.
 
@@ -239,7 +247,7 @@ Must satisfy `leaseDuration > renewDeadline > retryPeriod`; widen for managed cl
 |-----------|-------------|---------|
 | `pgpool.enabled` | Enable PGPool-II | `false` |
 | `pgpool.image.repository` | PGPool-II image repository | `cagriekin/pgpool` |
-| `pgpool.image.tag` | PGPool-II image tag | `4.7.0` |
+| `pgpool.image.tag` | PGPool-II image tag | `4.7.1` |
 | `pgpool.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `pgpool.replicaCount` | Number of PGPool-II instances | `1` |
 | `pgpool.numInitChildren` | Number of worker processes | `32` |
@@ -250,6 +258,7 @@ Must satisfy `leaseDuration > renewDeadline > retryPeriod`; widen for managed cl
 | `pgpool.resetQueryList` | Queries to run when returning connection to pool | `ABORT; RESET ALL; DEALLOCATE ALL` |
 | `pgpool.failOverOnBackendError` | Trigger failover on backend errors | `false` |
 | `pgpool.autoFailback` | Automatically reattach recovered backends | `true` |
+| `pgpool.allowClearTextFrontendAuth` | Allow clear-text password authentication from clients | `false` |
 | `pgpool.admin.username` | PGPool-II admin (PCP) user, stored in the chart-managed Secret | `admin` |
 | `pgpool.admin.password` | PGPool-II admin (PCP) password, stored in the chart-managed Secret | `admin` |
 | `pgpool.admin.existingSecret.enabled` | Use an existing Secret for the admin credentials instead of the chart-managed one | `false` |
@@ -263,12 +272,18 @@ Must satisfy `leaseDuration > renewDeadline > retryPeriod`; widen for managed cl
 | `pgpool.resources.requests.memory` | Memory request | `128Mi` |
 | `pgpool.resources.limits.cpu` | CPU limit | `500m` |
 | `pgpool.resources.limits.memory` | Memory limit | `512Mi` |
+| `pgpool.podSecurityContext` | Pod-level securityContext for PGPool-II | `{runAsNonRoot: true, seccompProfile.type: RuntimeDefault}` |
+| `pgpool.containerSecurityContext` | Container-level securityContext for PGPool-II | `{runAsUser: 999, runAsGroup: 999, allowPrivilegeEscalation: false, capabilities.drop: [ALL]}` |
 | `pgpool.podAnnotations` | Annotations for PGPool-II pods | `{}` |
 | `pgpool.priorityClassName` | priorityClassName for PGPool-II pods | `""` |
 | `pgpool.affinity` | Affinity rules for PGPool-II pods | `{}` |
+| `pgpool.topologySpreadConstraints` | Topology spread constraints | `[]` |
+| `pgpool.nodeSelector` | Node selector for PGPool-II pods | `{}` |
+| `pgpool.tolerations` | Tolerations for PGPool-II pods | `[]` |
 | `pgpool.logging.logConnections` | Log client connections | `true` |
 | `pgpool.logging.logStatement` | Log SQL statements | `false` |
 | `pgpool.logging.logPerNodeStatement` | Log backend routing | `false` |
+| `pgpool.logging.logMinMessages` | Minimum log message level | `warning` |
 
 #### TCP Keepalive
 
@@ -298,6 +313,14 @@ Must satisfy `leaseDuration > renewDeadline > retryPeriod`; widen for managed cl
 | `pgpool.metrics.resources.requests.memory` | Memory request | `64Mi` |
 | `pgpool.metrics.resources.limits.cpu` | CPU limit | `200m` |
 | `pgpool.metrics.resources.limits.memory` | Memory limit | `128Mi` |
+| `pgpool.metrics.livenessProbe.initialDelaySeconds` | Liveness initial delay | `30` |
+| `pgpool.metrics.livenessProbe.periodSeconds` | Liveness check interval | `30` |
+| `pgpool.metrics.livenessProbe.timeoutSeconds` | Liveness timeout | `15` |
+| `pgpool.metrics.livenessProbe.failureThreshold` | Liveness failure threshold | `5` |
+| `pgpool.metrics.readinessProbe.initialDelaySeconds` | Readiness initial delay | `10` |
+| `pgpool.metrics.readinessProbe.periodSeconds` | Readiness check interval | `30` |
+| `pgpool.metrics.readinessProbe.timeoutSeconds` | Readiness timeout | `15` |
+| `pgpool.metrics.readinessProbe.failureThreshold` | Readiness failure threshold | `3` |
 
 ### Secret Parameters
 
@@ -330,6 +353,73 @@ When `postgresql.existingSecret.enabled` is `false`, a secret will be auto-gener
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `global.annotations` | Global annotations applied to all resources | `{}` |
+
+### NetworkPolicy Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `networkPolicy.enabled` | Enable NetworkPolicy resources for pod isolation | `false` |
+| `networkPolicy.postgresql.allowExternal` | Allow ingress to PostgreSQL on 5432 from any pod in the namespace. This is the path the read-only Service (`<fullname>-readonly`, direct standby reads) relies on — see the caveat below before setting `false`. | `true` |
+| `networkPolicy.postgresql.extraIngress` | Additional ingress rules for PostgreSQL (full ingress-rule objects with their own `from`/`ports`, like `extraEgress`; appended at the rules level) | `[]` |
+| `networkPolicy.postgresql.extraEgress` | Additional egress rules for PostgreSQL | `[]` |
+| `networkPolicy.pgpool.extraIngress` | Additional ingress rules for PGPool-II (full ingress-rule objects with their own `from`/`ports`) | `[]` |
+| `networkPolicy.pgpool.extraEgress` | Additional egress rules for PGPool-II | `[]` |
+| `networkPolicy.prometheusExporter.extraIngress` | Additional ingress rules for the postgres-exporter (full ingress-rule objects). Use this to allow a Prometheus in another namespace to scrape 9116 — see the cross-namespace note below. | `[]` |
+| `networkPolicy.prometheusExporter.extraEgress` | Additional egress rules for the postgres-exporter | `[]` |
+
+When enabled, NetworkPolicies restrict traffic:
+- **PostgreSQL**: ingress on 5432 from peer pods, PGPool, Prometheus exporter, backup jobs, and optionally all namespace pods. Egress allows DNS, peer replication, 443 and 6443 (S3 over HTTPS and the Kubernetes API server), and the port of `pgbackrest.s3.endpoint` when pgBackRest is enabled.
+- **PGPool**: ingress on 9999 from namespace pods. Egress only to PostgreSQL on 5432.
+- **Prometheus exporter**: ingress on 9116 from namespace pods. Egress only to PostgreSQL on 5432.
+
+> **Cross-namespace metric scraping.** The metric-port ingress rules (exporter 9116,
+> pgpool 9719, agent 9200) admit *same-namespace* pods only. A Prometheus in a separate
+> monitoring namespace (the usual `ServiceMonitor` topology) must be allowed explicitly
+> via a `namespaceSelector`. The exporter now has its own `extraIngress`:
+>
+> ```yaml
+> networkPolicy:
+>   prometheusExporter:
+>     extraIngress:
+>       - ports:
+>           - port: 9116
+>             protocol: TCP
+>         from:
+>           - namespaceSelector:
+>               matchLabels:
+>                 kubernetes.io/metadata.name: monitoring
+> ```
+>
+> Use `networkPolicy.pgpool.extraIngress` (9719) and `networkPolicy.postgresql.extraIngress`
+> (9200) the same way for the pgpool and agent metric ports.
+
+> **`allowExternal: false` and the read-only Service.** `allowExternal` gates *direct*
+> client access to PostgreSQL on 5432. PGPool (9999) is always reachable in-namespace,
+> so read-write clients going through PGPool are unaffected. But the
+> `<fullname>-readonly` Service connects clients *directly* to standbys on 5432, so with
+> `allowExternal: false` those read connections are blocked while `kubectl get endpoints`
+> still looks healthy (connections simply time out). To keep direct-5432 clients
+> (read-only consumers, or apps connecting straight to the primary) working under
+> `allowExternal: false`, add a scoped `extraIngress` rule allowing your client pods,
+> e.g.:
+>
+> ```yaml
+> networkPolicy:
+>   postgresql:
+>     allowExternal: false
+>     extraIngress:
+>       - ports:
+>           - port: 5432
+>             protocol: TCP
+>         from:
+>           - podSelector:
+>               matchLabels:
+>                 app: my-read-client
+> ```
+>
+> For clients in another namespace, add a `namespaceSelector` (alone, or combined with
+> `podSelector` in the same `from` entry) — `podSelector` matches the policy's own
+> namespace only.
 
 ## Connecting to PostgreSQL
 
@@ -558,6 +648,8 @@ Alert on `pg_replication_lag_seconds` to catch a standby falling behind, and on 
 | `prometheusExporter.image.repository` | Exporter image repository | `quay.io/prometheuscommunity/postgres-exporter` |
 | `prometheusExporter.image.tag` | Exporter image tag | `v0.19.1` |
 | `prometheusExporter.image.pullPolicy` | Image pull policy | `IfNotPresent` |
+| `prometheusExporter.podSecurityContext` | Pod-level securityContext for exporter | `{runAsNonRoot: true, seccompProfile.type: RuntimeDefault}` |
+| `prometheusExporter.containerSecurityContext` | Container-level securityContext for exporter containers | `{runAsUser: 65534, runAsGroup: 65534, allowPrivilegeEscalation: false, capabilities.drop: [ALL]}` |
 | `prometheusExporter.podAnnotations` | Annotations for exporter pods | `{}` |
 | `prometheusExporter.priorityClassName` | priorityClassName for exporter pods | `""` |
 | `prometheusExporter.service.type` | Exporter service type | `ClusterIP` |
@@ -608,6 +700,13 @@ kubectl create job --from=cronjob/my-pgvector-backup manual-backup
 | `backup.existingSecret.name` | Secret containing S3 credentials | `""` |
 | `backup.existingSecret.accessKeyIdKey` | Key for access key ID in secret | `access-key-id` |
 | `backup.existingSecret.secretAccessKeyKey` | Key for secret access key in secret | `secret-access-key` |
+| `backup.mc.image.repository` | MinIO client image for the mc-installer init container | `minio/mc` |
+| `backup.mc.image.tag` | MinIO client image tag | `RELEASE.2024-11-21T17-21-54Z` |
+| `backup.mc.image.pullPolicy` | MinIO client image pull policy | `IfNotPresent` |
+| `backup.podSecurityContext` | Backup pod security context | `runAsNonRoot: true`, `seccompProfile: RuntimeDefault` |
+| `backup.containerSecurityContext` | Backup container security context | `runAsUser: 999`, `runAsGroup: 999`, no privilege escalation, all capabilities dropped |
+| `backup.activeDeadlineSeconds` | Job timeout in seconds | `3600` |
+| `backup.backoffLimit` | Number of retries before marking job as failed | `1` |
 | `backup.retentionDays` | Days to retain backups before cleanup | `7` |
 | `backup.priorityClassName` | priorityClassName for backup job pods | `""` |
 | `backup.resources.requests.cpu` | CPU request | `100m` |
@@ -656,9 +755,10 @@ helm install my-pgvector cagriekin/pgvector \
 ### How It Works
 
 - **WAL archiving**: The primary continuously archives WAL segments to S3 via `archive_command`. Standbys do not archive (PostgreSQL default with `archive_mode = on`).
-- **Full backups**: Weekly (default Sunday 1am) via the pgbackrest-scheduler sidecar.
-- **Differential backups**: Daily (default Mon-Sat 1am). Only changed blocks since the last full backup are stored.
+- **Full backups**: Weekly (default Sunday 1am) via a CronJob that execs into the pgbackrest sidecar on the current primary.
+- **Differential backups**: Daily (default Mon-Sat 1am) via a separate CronJob. Only changed blocks since the last full backup are stored.
 - **Failover**: After repmgr promotes a standby, the new primary starts archiving WAL and running backups automatically.
+- **Verification**: After each backup, `pgbackrest info` confirms the backup was recorded in the repository.
 
 ### pgBackRest Parameters
 
@@ -678,10 +778,24 @@ helm install my-pgvector cagriekin/pgvector \
 | `pgbackrest.retention.diff` | Number of differential backups to retain | `14` |
 | `pgbackrest.schedule.full` | Cron schedule for full backups | `0 1 * * 0` |
 | `pgbackrest.schedule.diff` | Cron schedule for differential backups | `0 1 * * 1-6` |
-| `pgbackrest.resources.requests.cpu` | Scheduler sidecar CPU request | `100m` |
-| `pgbackrest.resources.requests.memory` | Scheduler sidecar memory request | `256Mi` |
-| `pgbackrest.resources.limits.cpu` | Scheduler sidecar CPU limit | `1000m` |
-| `pgbackrest.resources.limits.memory` | Scheduler sidecar memory limit | `1Gi` |
+| `pgbackrest.resources.requests.cpu` | Sidecar CPU request | `100m` |
+| `pgbackrest.resources.requests.memory` | Sidecar memory request | `256Mi` |
+| `pgbackrest.resources.limits.cpu` | Sidecar CPU limit | `1000m` |
+| `pgbackrest.resources.limits.memory` | Sidecar memory limit | `1Gi` |
+| `pgbackrest.cronjob.image.repository` | CronJob image | `alpine/k8s` |
+| `pgbackrest.cronjob.image.tag` | CronJob image tag | `1.31.3` |
+| `pgbackrest.cronjob.concurrencyPolicy` | CronJob concurrency policy | `Forbid` |
+| `pgbackrest.cronjob.backoffLimit` | Job backoff limit | `0` |
+| `pgbackrest.cronjob.activeDeadlineSeconds` | Job timeout | `21600` |
+| `pgbackrest.cronjob.successfulJobsHistoryLimit` | Successful job history limit | `3` |
+| `pgbackrest.cronjob.failedJobsHistoryLimit` | Failed job history limit | `3` |
+| `pgbackrest.cronjob.priorityClassName` | priorityClassName for pgBackRest job pods | `""` |
+| `pgbackrest.cronjob.resources.requests.cpu` | CronJob CPU request | `50m` |
+| `pgbackrest.cronjob.resources.requests.memory` | CronJob memory request | `64Mi` |
+| `pgbackrest.cronjob.resources.limits.cpu` | CronJob CPU limit | `200m` |
+| `pgbackrest.cronjob.resources.limits.memory` | CronJob memory limit | `128Mi` |
+| `pgbackrest.cronjob.podSecurityContext` | Pod securityContext for the pgBackRest CronJob | `runAsNonRoot: true`, `runAsUser: 65534`, `seccompProfile: RuntimeDefault` |
+| `pgbackrest.cronjob.containerSecurityContext` | Container securityContext for the pgBackRest CronJob | `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` |
 
 ### Keyless backups (cloud workload identity)
 

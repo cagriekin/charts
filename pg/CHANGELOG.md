@@ -72,6 +72,13 @@
   `--type=time` to the `restore --target` command, corrects the `keyType: auto`
   guidance (bind the restore pod to the `<fullname>-repmgr` SA, not the default), and
   uses the current image tag.
+- **Corrected the pgBackRest troubleshooting pointer (#151).** The troubleshooting table
+  told operators to check `pgbackrest-scheduler` logs — a container that does not exist
+  (backups migrated from an in-pod scheduler sidecar to CronJobs). It now points at the
+  `pgbackrest` sidecar on the primary and the `<fullname>-pgbackrest-full`/`-diff` CronJob
+  pod logs.
+- **Synced the documented `repmgr.image.tag` default with `values.yaml`.** The parameter
+  table listed `trixie-5.5.0-16`; the chart ships `trixie-5.5.0-18`.
 
 ### Fixed
 
