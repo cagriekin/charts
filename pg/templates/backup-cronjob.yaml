@@ -109,5 +109,6 @@ spec:
                 name: {{ include "pg.fullname" . }}-backup
                 defaultMode: 0755
             - name: tools
-              emptyDir: {}
+              emptyDir:
+                sizeLimit: 128Mi
 {{- end }}

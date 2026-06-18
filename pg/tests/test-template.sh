@@ -249,6 +249,14 @@ assert_contains "#162: fix-permissions keeps CHOWN" "${fix_perms}" "CHOWN"
 assert_contains "#162: fix-permissions keeps DAC_OVERRIDE" "${fix_perms}" "DAC_OVERRIDE"
 assert_not_contains "#162: fix-permissions does not keep SETUID" "${fix_perms}" "SETUID"
 
+# #165: emptyDir volumes are size-capped so a runaway volume evicts its own pod
+# instead of filling the node. A full render (persistence on -> PVC, no data emptyDir)
+# must have no uncapped emptyDir.
+sized_full=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" 2>&1)
+assert_not_contains "#165: no uncapped emptyDir in a full render" "${sized_full}" "emptyDir: {}"
+data_capped=$(helm template test-pg "${CHART_DIR}" --set postgresql.persistence.enabled=false --set postgresql.persistence.emptyDir.sizeLimit=8Gi --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#165: non-persistent data emptyDir honors the sizeLimit" "${data_capped}" "sizeLimit: 8Gi"
+
 # Test: pgpool deployment has pod securityContext
 assert_contains "full: pgpool has runAsNonRoot" "${full}" "runAsNonRoot: true"
 

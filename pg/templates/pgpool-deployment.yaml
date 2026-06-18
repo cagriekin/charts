@@ -283,5 +283,6 @@ spec:
           configMap:
             name: {{ include "pg.fullname" . }}-pgpool
         - name: pgpool-config
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 16Mi
 {{- end }}
