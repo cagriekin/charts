@@ -153,6 +153,16 @@ assert_not_contains "#156: numeric REPMGR_DB not a bare YAML scalar" "${numerice
 # Full: should have prometheus exporter deployment
 assert_contains "full: prometheus exporter present" "${full}" "postgres-exporter"
 
+# #146: exporter probes hit /metrics (not the always-200 landing page /) so a broken
+# scrape pipeline (queries.yaml/collector regression -> 500) is detected.
+exporter_deploy=$(helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true --show-only templates/prometheus-exporter-deployment.yaml 2>&1)
+# anchor to the probe path lines ("<indent>path: /metrics$") so the prometheus.io/path
+# annotation is not miscounted; || true keeps a 0-match grep from aborting under set -e.
+exporter_metrics_probes=$(printf '%s\n' "${exporter_deploy}" | grep -cE '^ +path: /metrics$' || true)
+assert_eq "#146: both exporter probes target /metrics" "2" "${exporter_metrics_probes}"
+exporter_root_probes=$(printf '%s\n' "${exporter_deploy}" | grep -cE '^ +path: /$' || true)
+assert_eq "#146: no exporter probe targets the bare landing page /" "0" "${exporter_root_probes}"
+
 # Full: should have prometheus exporter service
 exporter_svc=$(echo "${full}" | grep -c "port: 9116" || echo "0")
 assert_gt "full: exporter service port 9116 present" "${exporter_svc}" "0"
