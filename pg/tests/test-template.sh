@@ -633,6 +633,11 @@ assert_contains "repmgr: service-updater preStop sleeps" "${service_updater_sect
 assert_contains "repmgr: service-updater has livenessProbe" "${service_updater_section}" "livenessProbe:"
 assert_contains "repmgr: service-updater liveness checks heartbeat file" "${service_updater_section}" "service-updater-alive"
 assert_contains "repmgr: service-updater has allowPrivilegeEscalation false" "${service_updater_section}" "allowPrivilegeEscalation: false"
+# #177: the service-updater script computes its scan range from replicaCount at
+# template time and never reads REPMGR_NODE_COUNT, so the env must not be injected
+# into this container (it stays on the repmgr-init/postgresql/repmgrd containers,
+# which the image scripts do consume).
+assert_not_contains "repmgr #177: service-updater drops the dead REPMGR_NODE_COUNT env" "${service_updater_section}" "REPMGR_NODE_COUNT"
 
 # Test: service-updater configmap writes heartbeat file
 assert_contains "repmgr: service-updater script writes heartbeat" "${repmgr_no_addcmd}" "service-updater-alive"
