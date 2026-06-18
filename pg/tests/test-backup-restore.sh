@@ -146,6 +146,9 @@ kubectl exec -n "${NAMESPACE}" mc-fetch -- sh -c "echo decoy | mc pipe 's3/pg-ba
 DUMP_FILE=$(kubectl exec -n "${NAMESPACE}" mc-fetch -- mc ls "s3/pg-backups/backups/${FULLNAME}/" --json \
   | grep -o '"key":"[^"]*"' | cut -d'"' -f4 | grep -E '^backup_.*\.dump$' | sort -r | head -1)
 assert_not_contains "#159: a .tmp stage is never selected for restore (even if lexically newest)" "${DUMP_FILE}" ".tmp"
+# the decoy carries the far-future timestamp 99999999; assert it was NOT selected, so
+# this independently proves the published dump (not just any 'backup_' string) was chosen.
+assert_not_contains "#159: the far-future .tmp decoy is not selected" "${DUMP_FILE}" "99999999"
 assert_contains "#159: restore target is a published backup_<ts>.dump" "${DUMP_FILE}" "backup_"
 kubectl exec -n "${NAMESPACE}" mc-fetch -- mc cat "s3/pg-backups/backups/${FULLNAME}/${DUMP_FILE}" \
   | kubectl exec -i -n "${NAMESPACE}" "${POD}" -c postgresql -- bash -c "cat > /tmp/restore.dump"
