@@ -436,11 +436,34 @@ When `postgresql.existingSecret.enabled` is `false`, a secret will be auto-gener
 | `networkPolicy.postgresql.extraEgress` | Additional egress rules for PostgreSQL | `[]` |
 | `networkPolicy.pgpool.extraIngress` | Additional ingress rules for PGPool-II (full ingress-rule objects with their own `from`/`ports`) | `[]` |
 | `networkPolicy.pgpool.extraEgress` | Additional egress rules for PGPool-II | `[]` |
+| `networkPolicy.prometheusExporter.extraIngress` | Additional ingress rules for the postgres-exporter (full ingress-rule objects). Use this to allow a Prometheus in another namespace to scrape 9116 — see the cross-namespace note below. | `[]` |
+| `networkPolicy.prometheusExporter.extraEgress` | Additional egress rules for the postgres-exporter | `[]` |
 
 When enabled, NetworkPolicies restrict traffic:
 - **PostgreSQL**: ingress on 5432 from peer pods, PGPool, Prometheus exporter, backup jobs, and optionally all namespace pods. Egress allows DNS, peer replication, 443 and 6443 (S3 over HTTPS and the Kubernetes API server), and the port of `pgbackrest.s3.endpoint` when pgBackRest is enabled.
 - **PGPool**: ingress on 9999 from namespace pods. Egress only to PostgreSQL on 5432.
 - **Prometheus exporter**: ingress on 9116 from namespace pods. Egress only to PostgreSQL on 5432.
+
+> **Cross-namespace metric scraping.** The metric-port ingress rules (exporter 9116,
+> pgpool 9719, agent 9200) admit *same-namespace* pods only. A Prometheus in a separate
+> monitoring namespace (the usual `ServiceMonitor` topology) must be allowed explicitly
+> via a `namespaceSelector`. The exporter now has its own `extraIngress`:
+>
+> ```yaml
+> networkPolicy:
+>   prometheusExporter:
+>     extraIngress:
+>       - ports:
+>           - port: 9116
+>             protocol: TCP
+>         from:
+>           - namespaceSelector:
+>               matchLabels:
+>                 kubernetes.io/metadata.name: monitoring
+> ```
+>
+> Use `networkPolicy.pgpool.extraIngress` (9719) and `networkPolicy.postgresql.extraIngress`
+> (9200) the same way for the pgpool and agent metric ports.
 
 > **`allowExternal: false` and the read-only Service.** `allowExternal` gates *direct*
 > client access to PostgreSQL on 5432. PGPool (9999) is always reachable in-namespace,

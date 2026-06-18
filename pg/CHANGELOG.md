@@ -38,6 +38,15 @@
 
 ### Fixed
 
+- **The postgres-exporter NetworkPolicy now has a cross-namespace scrape escape hatch
+  (#147).** The exporter's 9116 metrics ingress admitted same-namespace pods only
+  (`podSelector: {}`), and — unlike the postgresql/pgpool policies — had no `extraIngress`
+  value, so a Prometheus in a separate monitoring namespace (the usual `ServiceMonitor`
+  topology the chart ships) could not scrape it and there was no chart-supported fix
+  short of disabling NetworkPolicy. Added `networkPolicy.prometheusExporter.extraIngress`
+  / `extraEgress` (mirroring postgresql/pgpool) so a `namespaceSelector` rule can allow
+  the scraper; documented the cross-namespace limitation (exporter 9116, pgpool 9719,
+  agent 9200) in the README. No default behavior change.
 - **postgres-exporter probes now detect a broken scrape pipeline (#146).** Both probes
   hit the landing page `/`, which returns 200 unconditionally — so a `queries.yaml` /
   collector regression that makes every scrape fail with HTTP 500 (as the chart's own

@@ -220,6 +220,14 @@ spec:
           protocol: TCP
       from:
         - podSelector: {}
+{{- /*
+extraIngress: full ingress rules at the rules level (symmetric with extraEgress), so a
+Prometheus in a separate monitoring namespace can scrape 9116 via a namespaceSelector
+-- the bare podSelector above is same-namespace only (#147).
+*/}}
+{{- with .Values.networkPolicy.prometheusExporter.extraIngress }}
+    {{- toYaml . | nindent 4 }}
+{{- end }}
   egress:
     - ports:
         - port: 53
@@ -234,5 +242,8 @@ spec:
             matchLabels:
               {{- include "pg.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: postgresql
+{{- with .Values.networkPolicy.prometheusExporter.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+{{- end }}
 {{- end }}
 {{- end }}

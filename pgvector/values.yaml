@@ -541,6 +541,15 @@ networkPolicy:
   pgpool:
     extraIngress: []
     extraEgress: []
+  prometheusExporter:
+    # The exporter's 9116 metrics ingress admits same-namespace pods only, so a
+    # Prometheus in a separate monitoring namespace (the usual ServiceMonitor topology)
+    # cannot scrape. Add an extraIngress rule with a namespaceSelector for the scraper:
+    #   extraIngress:
+    #     - ports: [{port: 9116, protocol: TCP}]
+    #       from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]
+    extraIngress: []
+    extraEgress: []
 
 global:
   annotations: {}

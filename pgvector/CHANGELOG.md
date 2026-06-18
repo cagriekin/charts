@@ -33,6 +33,12 @@
 
 ### Fixed
 
+- **The postgres-exporter NetworkPolicy now has a cross-namespace scrape escape hatch
+  (#147).** The exporter's 9116 metrics ingress admitted same-namespace pods only and,
+  unlike the postgresql/pgpool policies, had no `extraIngress` value, so a Prometheus in
+  a separate monitoring namespace could not scrape it. Added
+  `networkPolicy.prometheusExporter.extraIngress` / `extraEgress` so a `namespaceSelector`
+  rule can allow the scraper. No default behavior change.
 - **postgres-exporter probes now detect a broken scrape pipeline (#146).** Both probes
   hit the always-200 landing page `/`, so a `queries.yaml`/collector regression that
   makes every scrape return HTTP 500 left the exporter pods Ready and never restarted
