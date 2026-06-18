@@ -154,6 +154,16 @@ spec:
             runAsUser: 0
             runAsNonRoot: false
             allowPrivilegeEscalation: false
+            # Root is required to chown the volume, but drop the rest of the default
+            # capability set -- only CHOWN (chown), FOWNER (chmod) and DAC_OVERRIDE
+            # (traverse/modify regardless of perms) are needed (#162).
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data

@@ -4,6 +4,11 @@
 
 ### Security
 
+- **The `fix-permissions` init container drops its excess capabilities (#162).** The
+  chown init container legitimately needs root, but it inherited the runtime's full
+  default capability set (SETUID, SETGID, NET_RAW, …). It now drops ALL and adds back
+  only `CHOWN`, `DAC_OVERRIDE`, `FOWNER` (what `chown -R` / `chmod` need), matching the
+  tighter pattern the chart's other root init container already uses.
 - **The pgBackRest backup CronJob is now security-hardened (#155).** It was the one
   pod with zero hardening — running as the image default (root), full capability set,
   no seccomp profile, `allowPrivilegeEscalation` unset — yet it carries the

@@ -243,6 +243,11 @@ default_sts=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefu
 fix_perms=$(echo "${default_sts}" | sed -n '/name: fix-permissions/,/name: repmgr-init\|name: copy-base-ext\|name: copy-ext\|name: setup-config\|containers:/p')
 assert_contains "fix-permissions: runs as root" "${fix_perms}" "runAsUser: 0"
 assert_contains "fix-permissions: has allowPrivilegeEscalation false" "${fix_perms}" "allowPrivilegeEscalation: false"
+# #162: drop the default capability set, keeping only what chown/chmod need.
+assert_contains "#162: fix-permissions drops capabilities" "${fix_perms}" "capabilities:"
+assert_contains "#162: fix-permissions keeps CHOWN" "${fix_perms}" "CHOWN"
+assert_contains "#162: fix-permissions keeps DAC_OVERRIDE" "${fix_perms}" "DAC_OVERRIDE"
+assert_not_contains "#162: fix-permissions does not keep SETUID" "${fix_perms}" "SETUID"
 
 # Test: pgpool deployment has pod securityContext
 assert_contains "full: pgpool has runAsNonRoot" "${full}" "runAsNonRoot: true"
