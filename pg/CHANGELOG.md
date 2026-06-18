@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Security
+
+- **S3 credentials no longer passed on the `mc` command line (#167).** The backup
+  job ran `mc alias set s3 <endpoint> <access-key> <secret-key>`, exposing both keys
+  in the process argv (`/proc/<pid>/cmdline`, readable via `ps` by other users on the
+  node, hostPID pods, and command-line-logging agents) on every scheduled run.
+  Credentials are now supplied to `mc` via the `MC_HOST_s3` environment variable
+  (percent-encoded so reserved characters in real keys survive), so they never appear
+  in argv. Requires `backup.s3.endpoint` to include a scheme (`http://`/`https://`),
+  which `mc` already required.
+
 ### Fixed
 
 - **Backup retention could delete another release's dumps under a shared
