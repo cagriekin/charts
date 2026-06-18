@@ -241,12 +241,24 @@ EOF
             POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
             POSTGRES_DB=${POSTGRES_DB:-postgres}
 
+            # initdb --auth-host=md5 (above) writes password_encryption=md5 into
+            # postgresql.conf, so a bare CREATE USER stores an MD5 secret. pg_hba.conf
+            # (written above) requires scram-sha-256 for the 10.0.0.0/8 pod network,
+            # and PostgreSQL never falls through on auth failure -- so an MD5-secret
+            # repmgr user is rejected with "does not have a valid SCRAM secret" the
+            # moment a standby clone or repmgrd connects over the pod network, before
+            # the chart's postStart md5->scram migration has had a chance to run. That
+            # is a startup race that crash-loops repmgrd / wedges the standby clone.
+            # Create the managed users with a SCRAM secret directly (SET LOCAL applies
+            # to the CREATE/ALTER in the same session) -- the same end state the chart's
+            # fix_user_auth migration drives them to, but race-free from first boot.
+            # Legacy/app users keep the md5 default and the existing migration path.
             psql -U postgres -d postgres -c "CREATE DATABASE ${POSTGRES_DB};" 2>/dev/null || true
-            psql -U postgres -d postgres -c "CREATE USER ${POSTGRES_USER} WITH SUPERUSER PASSWORD '${POSTGRES_PASSWORD}';" 2>/dev/null || true
-            psql -U postgres -d postgres -c "ALTER USER ${POSTGRES_USER} WITH PASSWORD '${POSTGRES_PASSWORD}';" 2>/dev/null || true
+            psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER ${POSTGRES_USER} WITH SUPERUSER PASSWORD '${POSTGRES_PASSWORD}';" 2>/dev/null || true
+            psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; ALTER USER ${POSTGRES_USER} WITH PASSWORD '${POSTGRES_PASSWORD}';" 2>/dev/null || true
 
             psql -U postgres -d postgres -c "CREATE DATABASE ${REPMGR_DB};" 2>/dev/null || true
-            psql -U postgres -d postgres -c "CREATE USER ${REPMGR_USER} WITH SUPERUSER PASSWORD '${REPMGR_PASSWORD}';" 2>/dev/null || true
+            psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER ${REPMGR_USER} WITH SUPERUSER PASSWORD '${REPMGR_PASSWORD}';" 2>/dev/null || true
             psql -U postgres -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE ${REPMGR_DB} TO ${REPMGR_USER};" 2>/dev/null || true
             psql -U postgres -d ${REPMGR_DB} -c "CREATE EXTENSION IF NOT EXISTS repmgr;" 2>/dev/null || true
 

@@ -82,6 +82,18 @@
 
 ### Fixed
 
+- **repmgr SCRAM startup deadlock eliminated (image `trixie-5.5.0-19`).** `initdb
+  --auth-host=md5` makes the image write `password_encryption=md5`, so the bootstrap
+  created the `repmgr`/`postgres` users with MD5 secrets -- but `pg_hba.conf` requires
+  `scram-sha-256` for the `10.0.0.0/8` pod network. When a standby's `repmgr-init`
+  clone or `repmgrd` connected over that network before the chart's postStart
+  md5->scram migration had run, PostgreSQL rejected it with "does not have a valid
+  SCRAM secret", crash-looping repmgrd / wedging the standby clone until
+  `helm install --wait` timed out -- an intermittent CI/install failure. The image now
+  creates the managed users with a SCRAM secret directly (the same end state the
+  migration drives them to), so replication auth works from first boot regardless of
+  migration timing. The global default stays `md5` for legacy/app users; the migration
+  and the md5-above-scram `pg_hba` patch remain as a safety net.
 - **Backup integrity check no longer buffers the whole dump to `/tmp` (#119).** The
   verify step did `mc cat > /tmp/verify_backup.dump` before `pg_restore --list`, writing
   the entire dump to the container's unbounded, unsized writable layer — a large
