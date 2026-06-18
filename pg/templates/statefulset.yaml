@@ -72,6 +72,13 @@ spec:
 {{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
         checksum/postgresql-config: {{ include (print $.Template.BasePath "/postgresql-configmap.yaml") . | sha256sum }}
 {{- end }}
+{{- if .Values.pgbackrest.enabled }}
+        # Roll the pod when the pgbackrest config (S3 endpoint/bucket/retention)
+        # changes: pgbackrest.conf is a subPath mount, which the kubelet never
+        # live-updates, so without this checksum a helm upgrade would silently keep
+        # archiving WAL + running backups against the OLD repository (#145).
+        checksum/pgbackrest-config: {{ include (print $.Template.BasePath "/pgbackrest-configmap.yaml") . | sha256sum }}
+{{- end }}
       {{- with .Values.postgresql.podAnnotations }}
         {{- toYaml . | nindent 8 }}
       {{- end }}
