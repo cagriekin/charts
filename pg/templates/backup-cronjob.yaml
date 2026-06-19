@@ -31,7 +31,9 @@ spec:
           priorityClassName: {{ . }}
           {{- end }}
           restartPolicy: OnFailure
-          # The backup job talks only to PostgreSQL + S3, never the Kubernetes API (#166).
+          # Dedicated SA with no RBAC (#27); the job talks only to PostgreSQL + S3,
+          # never the Kubernetes API, so its token is not mounted (#166).
+          serviceAccountName: {{ include "pg.fullname" . }}-backup
           automountServiceAccountToken: false
           securityContext:
             {{- toYaml .Values.backup.podSecurityContext | nindent 12 }}

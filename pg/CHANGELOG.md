@@ -34,6 +34,10 @@
   disable to revert to the superuser. With `postgresql.existingSecret.enabled` the
   secret must also carry a `monitoring-password` key (override via
   `postgresql.existingSecret.monitoringPasswordKey`), enforced fail-fast at render.
+- **The backup and backup-validation Jobs run under a dedicated ServiceAccount, not
+  the namespace default (#27).** A new no-RBAC `<fullname>-backup` ServiceAccount
+  (its token is never mounted, #166) backs both Jobs, which talk only to PostgreSQL
+  and S3. Previously they ran as the namespace default SA.
 - **The PgPool-II PCP admin port (9898) is no longer exposed on the Service by default
   (#118).** The pgpool Service published the PCP admin/control port cluster-wide, while
   the pgpool NetworkPolicy only admits 9999 — so with NetworkPolicy off the admin
