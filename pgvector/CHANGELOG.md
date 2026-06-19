@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Monitoring user (#28) multi-target `/probe` scrape returned `pg_up=0` on every
+  target.** The exporter `auth_modules` probe DSN had no database, so libpq used the
+  username `monitoring` as the dbname (`database "monitoring" does not exist`). The
+  probe now pins `dbname` to the configured database. Shared fix with the pg chart
+  (templates are symlinked); see the pg CHANGELOG for detail.
+
 ## 1.1.4 - 2026-06-19
 
 Bundled-etcd security (#184). Bundles `etcd` 0.1.3; image moves to
