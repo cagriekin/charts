@@ -2,12 +2,29 @@
 
 ## Unreleased
 
+## 1.1.5 - 2026-06-19
+
+A monitoring-exporter `/probe` fix (#185). Chart-only; no image change (stays
+`trixie-5.5.0-21`). The exporter ConfigMap changes when
+`prometheusExporter.monitoringUser` is enabled (the default).
+
+### Fixed
+
+- **The least-privilege monitoring user (#28) broke the multi-target `/probe`
+  scrape — every per-target `pg_up` was 0.** The exporter `auth_modules` DSN (used
+  by `/probe`, unlike `DATA_SOURCE_NAME`) carried no database, so libpq defaulted
+  `dbname` to the username `monitoring` and connected to a non-existent `monitoring`
+  database (`pq: database "monitoring" does not exist`). It worked under the old
+  superuser only because `dbname` then defaulted to the always-present `postgres`.
+  The probe DSN now pins `dbname` to the configured database (substituted from
+  `POSTGRES_DATABASE`, the same source as `DATA_SOURCE_NAME` and the only database
+  the monitoring role is granted `CONNECT` on).
+
 ## 1.1.4 - 2026-06-19
 
-Bundled-etcd security (#184) and a monitoring-exporter `/probe` fix (#185). Bundles
-`etcd` 0.1.3; image moves to `trixie-5.5.0-21` (adds the `pg-ha-agent rbac-bootstrap`
-subcommand). The exporter ConfigMap changes when `prometheusExporter.monitoringUser`
-is enabled (the default); no other rendered behavior change at defaults.
+Bundled-etcd security (#184). Bundles `etcd` 0.1.3; image moves to
+`trixie-5.5.0-21` (adds the `pg-ha-agent rbac-bootstrap` subcommand). No rendered
+behavior change at defaults.
 
 ### Added
 
@@ -26,18 +43,6 @@ is enabled (the default); no other rendered behavior change at defaults.
   a new live KinD suite (`make -C pg test-agent-etcd-tls`, wired into CI) that proves
   the TLS handshake, CN auth, failover over mTLS, and that a tenant cert is denied
   outside its prefix.
-
-### Fixed
-
-- **The least-privilege monitoring user (#28) broke the multi-target `/probe`
-  scrape — every per-target `pg_up` was 0.** The exporter `auth_modules` DSN (used
-  by `/probe`, unlike `DATA_SOURCE_NAME`) carried no database, so libpq defaulted
-  `dbname` to the username `monitoring` and connected to a non-existent `monitoring`
-  database (`pq: database "monitoring" does not exist`). It worked under the old
-  superuser only because `dbname` then defaulted to the always-present `postgres`.
-  The probe DSN now pins `dbname` to the configured database (substituted from
-  `POSTGRES_DATABASE`, the same source as `DATA_SOURCE_NAME` and the only database
-  the monitoring role is granted `CONNECT` on).
 
 ## 1.1.3 - 2026-06-19
 
