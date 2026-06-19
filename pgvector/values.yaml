@@ -427,6 +427,9 @@ prometheusExporter:
       type: RuntimeDefault
 
   containerSecurityContext:
+    # The exporter reads config/DSN from mounted volumes and writes nothing to the
+    # root filesystem (a /tmp emptyDir is mounted for scratch). #117
+    readOnlyRootFilesystem: true
     runAsUser: 65534
     runAsGroup: 65534
     allowPrivilegeEscalation: false
@@ -495,6 +498,9 @@ backup:
   # 999 is the postgres uid/gid in the official postgres image; the kubelet
   # rejects root-defaulting images under runAsNonRoot without an explicit uid
   containerSecurityContext:
+    # The backup/validation containers write only to mounted volumes (/tools, /work)
+    # and /tmp (a /tmp emptyDir is mounted, incl. MC_CONFIG_DIR=/tmp/.mc). #117
+    readOnlyRootFilesystem: true
     runAsUser: 999
     runAsGroup: 999
     allowPrivilegeEscalation: false
@@ -610,6 +616,9 @@ pgbackrest:
       seccompProfile:
         type: RuntimeDefault
     containerSecurityContext:
+      # The runner only execs kubectl (HOME=/tmp for its cache) and writes /tmp,
+      # which is a mounted emptyDir. #117
+      readOnlyRootFilesystem: true
       allowPrivilegeEscalation: false
       capabilities:
         drop:

@@ -107,6 +107,8 @@ spec:
                   mountPath: /scripts
                 - name: tools
                   mountPath: /tools
+                - name: tmp
+                  mountPath: /tmp
           volumes:
             - name: scripts
               configMap:
@@ -115,4 +117,9 @@ spec:
             - name: tools
               emptyDir:
                 sizeLimit: 128Mi
+            # writable scratch for the read-only-rootfs backup container
+            # (MC_CONFIG_DIR=/tmp/.mc and any tooling temp). #117
+            - name: tmp
+              emptyDir:
+                sizeLimit: 64Mi
 {{- end }}
