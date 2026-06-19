@@ -93,7 +93,18 @@ spec:
                   value: {{ $root.Values.pgbackrest.stanza | quote }}
                 - name: BACKUP_TYPE
                   value: {{ $type | quote }}
+                # kubectl writes its discovery/http cache under $HOME; point it at the
+                # writable /tmp emptyDir so the read-only root filesystem is enough (#117).
+                - name: HOME
+                  value: /tmp
               resources:
                 {{- toYaml $root.Values.pgbackrest.cronjob.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 64Mi
 {{- end }}
 {{- end }}

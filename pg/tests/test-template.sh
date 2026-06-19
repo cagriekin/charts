@@ -1315,6 +1315,21 @@ enc_rc=0
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --set pgbackrest.repoEncryption.enabled=true >/dev/null 2>&1 || enc_rc=$?
 assert_eq "pgbackrest #120: enabled without a passphrase secret fails fast" "1" "$([ "${enc_rc}" -ne 0 ] && echo 1 || echo 0)"
 
+# #117: readOnlyRootFilesystem on the auxiliary containers with dedicated
+# securityContexts (exporter, backup, validation, pgbackrest runner), each paired
+# with a writable /tmp emptyDir. (service-updater/pgpool-exporter share the
+# postgresql/pgpool securityContext and are intentionally left for a follow-up.)
+ro_exp=$(helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true --show-only templates/prometheus-exporter-deployment.yaml 2>&1)
+assert_contains "#117: exporter readOnlyRootFilesystem" "${ro_exp}" "readOnlyRootFilesystem: true"
+assert_contains "#117: exporter has a writable /tmp" "${ro_exp}" "mountPath: /tmp"
+ro_bk=$(helm template test-pg "${CHART_DIR}" --set backup.enabled=true --set backup.s3.endpoint=https://e --set backup.s3.bucket=b --set backup.existingSecret.name=s --set backup.validation.enabled=true 2>&1)
+ro_bk_count=$(printf '%s\n' "${ro_bk}" | grep -c "readOnlyRootFilesystem: true")
+assert_gt "#117: backup + validation containers are read-only" "${ro_bk_count}" "1"
+assert_contains "#117: backup container has a writable /tmp" "${ro_bk}" "mountPath: /tmp"
+ro_pb=$(helm template test-pg "${CHART_DIR}" --set pgbackrest.enabled=true --set pgbackrest.s3.endpoint=https://e --set pgbackrest.s3.bucket=b --set pgbackrest.existingSecret.name=s --show-only templates/pgbackrest-cronjob.yaml 2>&1)
+assert_contains "#117: pgbackrest runner readOnlyRootFilesystem" "${ro_pb}" "readOnlyRootFilesystem: true"
+assert_contains "#117: pgbackrest runner HOME points at the writable /tmp" "${ro_pb}" "value: /tmp"
+
 # pgBackRest: idle sidecar present in statefulset (exec target for CronJobs)
 pgbackrest_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/statefulset.yaml 2>&1)
 assert_contains "pgbackrest: sidecar present" "${pgbackrest_sts}" "name: pgbackrest"

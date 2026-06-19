@@ -51,6 +51,13 @@
   did). When set it renders `repository:tag@digest`, so a mutable-tag repush cannot
   silently change the deployed image. Empty by default (pull by tag; render is
   byte-stable). Routed through a shared `pg.image` template helper.
+- **`readOnlyRootFilesystem` on the auxiliary containers (#117).** The Prometheus
+  exporter, the backup and backup-validation Jobs, and the pgBackRest CronJob runner
+  now run with a read-only root filesystem, each paired with a writable `/tmp`
+  emptyDir (and `HOME=/tmp` for the runner's kubectl cache). The service-updater and
+  the pgpool metrics exporter share the postgresql/pgpool securityContext (whose main
+  containers need a writable root), so hardening those needs a dedicated context --
+  left as a follow-up.
 - **The PgPool-II PCP admin port (9898) is no longer exposed on the Service by default
   (#118).** The pgpool Service published the PCP admin/control port cluster-wide while
   the pgpool NetworkPolicy only admits 9999. It is now gated behind

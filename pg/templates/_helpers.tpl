@@ -301,6 +301,8 @@ initContainers:
         mountPath: /config
       - name: exporter-config
         mountPath: /etc/postgres_exporter
+      - name: tmp
+        mountPath: /tmp
 containers:
   - name: postgres-exporter
     image: {{ include "pg.image" .Values.prometheusExporter.image | quote }}
@@ -352,6 +354,8 @@ containers:
       # straight from the configmap instead of the init-processed copy
       - name: config
         mountPath: /config
+      - name: tmp
+        mountPath: /tmp
 volumes:
   - name: config
     configMap:
@@ -359,6 +363,9 @@ volumes:
   - name: exporter-config
     emptyDir:
       sizeLimit: 16Mi
+  - name: tmp
+    emptyDir:
+      sizeLimit: 64Mi
 {{- end }}
 
 {{/*

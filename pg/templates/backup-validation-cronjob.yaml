@@ -95,6 +95,8 @@ spec:
                   mountPath: /tools
                 - name: work
                   mountPath: /work
+                - name: tmp
+                  mountPath: /tmp
           volumes:
             - name: scripts
               configMap:
@@ -110,4 +112,9 @@ spec:
               {{- else }}
               emptyDir: {}
               {{- end }}
+            # writable scratch for the read-only-rootfs validation container
+            # (MC_CONFIG_DIR=/tmp/.mc and postgres temp files). #117
+            - name: tmp
+              emptyDir:
+                sizeLimit: 64Mi
 {{- end }}
