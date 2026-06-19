@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The least-privilege monitoring user (#28) broke the multi-target `/probe`
+  scrape — every per-target `pg_up` was 0.** The exporter `auth_modules` DSN (used
+  by `/probe`, unlike `DATA_SOURCE_NAME`) carried no database, so libpq defaulted
+  `dbname` to the username `monitoring` and connected to a non-existent `monitoring`
+  database (`pq: database "monitoring" does not exist`). It worked under the old
+  superuser only because `dbname` then defaulted to the always-present `postgres`.
+  The probe DSN now pins `dbname` to the configured database (substituted from
+  `POSTGRES_DATABASE`, the same source as `DATA_SOURCE_NAME` and the only database
+  the monitoring role is granted `CONNECT` on). No values or default changes.
+
 ## 1.1.4 - 2026-06-19
 
 Bundled-etcd security (#184). Bundles `etcd` 0.1.3; image moves to

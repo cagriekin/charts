@@ -247,7 +247,8 @@ initContainers:
         # corrupts values containing / & or \).
         SUB_USER=$(printf '%s' "$POSTGRES_USER" | sed "s/'/''/g")
         SUB_PASS=$(printf '%s' "$POSTGRES_PASSWORD" | sed "s/'/''/g")
-        export SUB_USER SUB_PASS
+        SUB_DB=$(printf '%s' "$POSTGRES_DATABASE" | sed "s/'/''/g")
+        export SUB_USER SUB_PASS SUB_DB
         awk '
           function splice(s, ph, val,   out, i) {
             out = ""
@@ -256,6 +257,7 @@ initContainers:
           }
           { $0 = splice($0, "__POSTGRES_USER__", ENVIRON["SUB_USER"])
             $0 = splice($0, "__POSTGRES_PASSWORD__", ENVIRON["SUB_PASS"])
+            $0 = splice($0, "__POSTGRES_DB__", ENVIRON["SUB_DB"])
             print }
         ' /config/postgres_exporter.yml > /etc/postgres_exporter/postgres_exporter.yml
         # URI userinfo cannot carry @ : / etc. raw and Kubernetes $(VAR)

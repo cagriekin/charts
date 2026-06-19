@@ -20,6 +20,10 @@ data:
           password: '__POSTGRES_PASSWORD__'
         options:
           sslmode: disable
+          # The /probe builds its DSN from this auth module (not DATA_SOURCE_NAME);
+          # without an explicit dbname libpq defaults it to the username, so the
+          # monitoring user would hit a non-existent "monitoring" database (#28).
+          dbname: '__POSTGRES_DB__'
   queries.yaml: |
     # The exporter's built-in replication collector already serves
     # pg_replication_lag_seconds and pg_replication_is_replica; reusing the
