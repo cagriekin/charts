@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.1.0 - 2026-06-19
+
 ### Added
 
 - **WAL-archiving health metrics for the Prometheus exporter (#30).** When
