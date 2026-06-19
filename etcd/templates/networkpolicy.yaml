@@ -43,6 +43,27 @@ spec:
       ports:
         - port: {{ .Values.clientPort }}
           protocol: TCP
+    {{- with .Values.networkPolicy.allowedClients }}
+    # shared/standalone etcd: explicitly allow-listed clients in other namespaces.
+    # Each entry opens the client port from one namespace; podSelector is optional
+    # and defaults to the agent's postgresql component label.
+    - from:
+        {{- range . }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .namespace | required "etcd networkPolicy.allowedClients[].namespace is required" }}
+          podSelector:
+            matchLabels:
+              {{- with .podSelector }}
+              {{- toYaml . | nindent 14 }}
+              {{- else }}
+              app.kubernetes.io/component: postgresql
+              {{- end }}
+        {{- end }}
+      ports:
+        - port: {{ $.Values.clientPort }}
+          protocol: TCP
+    {{- end }}
     {{- with .Values.networkPolicy.extraIngress }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

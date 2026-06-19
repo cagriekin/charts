@@ -64,6 +64,17 @@ tolerations: []
 # and the agent (the parent's postgresql pods, this release) on the client port.
 networkPolicy:
   enabled: true
+  # Cross-namespace client allow-list for a shared/standalone etcd. The built-in
+  # client rule above only admits THIS release's postgresql pods, which do not exist
+  # when etcd is deployed on its own for several pg releases to share. Each entry
+  # opens the client port (2379) from one namespace; podSelector is optional and
+  # defaults to the agent's postgresql component label. Prefer this over hand-written
+  # extraIngress selectors. Example:
+  #   allowedClients:
+  #     - namespace: backend
+  #     - namespace: sentry
+  #       podSelector: { app.kubernetes.io/component: postgresql }
+  allowedClients: []
   # Extra ingress rules to the client port (e.g. a Prometheus scrape of etcd
   # metrics, or an external etcdctl). Standard NetworkPolicy ingress entries.
   extraIngress: []
