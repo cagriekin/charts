@@ -39,7 +39,7 @@ spec:
             {{- toYaml .Values.backup.podSecurityContext | nindent 12 }}
           initContainers:
             - name: mc-installer
-              image: "{{ .Values.backup.mc.image.repository }}:{{ .Values.backup.mc.image.tag }}"
+              image: {{ include "pg.image" .Values.backup.mc.image | quote }}
               imagePullPolicy: {{ .Values.backup.mc.image.pullPolicy }}
               # /usr/bin/mc in the minio/mc image is mode 0711, readable only
               # by root, so the copy must run as root; the backup container
@@ -59,7 +59,7 @@ spec:
                   mountPath: /tools
           containers:
             - name: backup
-              image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+              image: {{ include "pg.image" .Values.postgresql.image | quote }}
               imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
               securityContext:
                 {{- toYaml .Values.backup.containerSecurityContext | nindent 16 }}

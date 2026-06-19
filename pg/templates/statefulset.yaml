@@ -148,7 +148,7 @@ spec:
       initContainers:
 {{- if .Values.postgresql.persistence.enabled }}
         - name: fix-permissions
-          image: "{{ .Values.busyboxImage.repository }}:{{ .Values.busyboxImage.tag }}"
+          image: {{ include "pg.image" .Values.busyboxImage | quote }}
           imagePullPolicy: {{ .Values.busyboxImage.pullPolicy }}
           command: ['sh', '-c', 'chown -R 101:103 /var/lib/postgresql/data && if [ -d /var/lib/postgresql/data/pgdata ]; then chmod 0700 /var/lib/postgresql/data/pgdata; fi']
           securityContext:
@@ -190,7 +190,7 @@ spec:
 {{- if .Values.postgresql.extensions.enabled }}
 {{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
         - name: copy-ext
-          image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+          image: {{ include "pg.image" .Values.postgresql.image | quote }}
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
           command: ['sh', '-c', 'cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
           securityContext:
@@ -250,7 +250,7 @@ spec:
             {{- toYaml .Values.repmgr.initContainerResources | nindent 12 }}
 {{- end }}
         - name: setup-config
-          image: "{{ .Values.busyboxImage.repository }}:{{ .Values.busyboxImage.tag }}"
+          image: {{ include "pg.image" .Values.busyboxImage | quote }}
           imagePullPolicy: {{ .Values.busyboxImage.pullPolicy }}
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
@@ -308,7 +308,7 @@ spec:
           command: ["/usr/local/bin/entrypoint.sh", "postgres"]
           {{- end }}
 {{- else }}
-          image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+          image: {{ include "pg.image" .Values.postgresql.image | quote }}
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
 {{- end }}
           ports:

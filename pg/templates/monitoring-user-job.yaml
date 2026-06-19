@@ -42,7 +42,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: create-monitoring-user
-          image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+          image: {{ include "pg.image" .Values.postgresql.image | quote }}
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false

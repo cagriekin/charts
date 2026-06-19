@@ -9,12 +9,14 @@ imagePullSecrets: []
 busyboxImage:
   repository: busybox
   tag: "1.37"
+  digest: ""
   pullPolicy: IfNotPresent
 
 postgresql:
   image:
     repository: postgres
     tag: 18.1-trixie
+    digest: ""
     pullPolicy: IfNotPresent
 
   # PostgreSQL major version shipped in image.tag above. Used to build the
@@ -285,6 +287,7 @@ pgpool:
   image:
     repository: cagriekin/pgpool
     tag: 4.7.1
+    digest: ""
     pullPolicy: IfNotPresent
 
   replicaCount: 1
@@ -377,6 +380,7 @@ pgpool:
     image:
       repository: pgpool/pgpool2_exporter
       tag: "1.2.2"
+      digest: ""
       pullPolicy: IfNotPresent
     livenessProbe:
       initialDelaySeconds: 30
@@ -435,6 +439,7 @@ prometheusExporter:
   image:
     repository: quay.io/prometheuscommunity/postgres-exporter
     tag: v0.19.1
+    digest: ""
     pullPolicy: IfNotPresent
 
   priorityClassName: ""
@@ -479,6 +484,7 @@ backup:
     image:
       repository: minio/mc
       tag: RELEASE.2024-11-21T17-21-54Z
+      digest: ""
       pullPolicy: IfNotPresent
   podSecurityContext:
     runAsNonRoot: true
@@ -588,6 +594,7 @@ pgbackrest:
     image:
       repository: alpine/k8s
       tag: "1.31.3"
+      digest: ""
       pullPolicy: IfNotPresent
     concurrencyPolicy: Forbid
     backoffLimit: 0

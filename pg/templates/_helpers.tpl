@@ -95,6 +95,14 @@ annotation consumers -- #128.)
 {{- with .Values.repmgr.image.digest }}@{{ . }}{{- end -}}
 {{- end -}}
 
+{{- /* Generic image reference (#26): pass an image dict {repository, tag, digest?};
+       renders repository:tag, with @digest appended when set so a digest pin overrides
+       the mutable tag. */ -}}
+{{- define "pg.image" -}}
+{{- printf "%s:%s" .repository .tag -}}
+{{- with .digest }}@{{ . }}{{- end -}}
+{{- end -}}
+
 {{- define "pg.secretName" -}}
 {{- if .Values.postgresql.existingSecret.enabled }}
 {{- required "postgresql.existingSecret.name is required when postgresql.existingSecret.enabled is true" .Values.postgresql.existingSecret.name }}
@@ -226,7 +234,7 @@ securityContext:
   {{- toYaml .Values.prometheusExporter.podSecurityContext | nindent 2 }}
 initContainers:
   - name: init-config
-    image: "{{ .Values.busyboxImage.repository }}:{{ .Values.busyboxImage.tag }}"
+    image: {{ include "pg.image" .Values.busyboxImage | quote }}
     imagePullPolicy: {{ .Values.busyboxImage.pullPolicy }}
     securityContext:
       {{- toYaml .Values.prometheusExporter.containerSecurityContext | nindent 6 }}
@@ -295,7 +303,7 @@ initContainers:
         mountPath: /etc/postgres_exporter
 containers:
   - name: postgres-exporter
-    image: "{{ .Values.prometheusExporter.image.repository }}:{{ .Values.prometheusExporter.image.tag }}"
+    image: {{ include "pg.image" .Values.prometheusExporter.image | quote }}
     imagePullPolicy: {{ .Values.prometheusExporter.image.pullPolicy }}
     securityContext:
       {{- toYaml .Values.prometheusExporter.containerSecurityContext | nindent 6 }}

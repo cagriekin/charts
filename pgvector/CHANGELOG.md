@@ -45,6 +45,12 @@
   the `PGBACKREST_REPO1_CIPHER_PASS` env (postgresql container + sidecar), never
   written into the ConfigMap. Default stays unencrypted. A PITR restore pod must set
   the same env when restoring an encrypted repository.
+- **All container images are digest-pinnable (#26).** Every image -- postgres, repmgr,
+  pgpool, pgpool-exporter, prometheus-exporter, busybox, `mc`, and the pgBackRest
+  CronJob runner -- now takes an optional `image.digest` (the repmgr image already
+  did). When set it renders `repository:tag@digest`, so a mutable-tag repush cannot
+  silently change the deployed image. Empty by default (pull by tag; render is
+  byte-stable). Routed through a shared `pg.image` template helper.
 - **The PgPool-II PCP admin port (9898) is no longer exposed on the Service by default
   (#118).** The pgpool Service published the PCP admin/control port cluster-wide while
   the pgpool NetworkPolicy only admits 9999. It is now gated behind

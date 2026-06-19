@@ -291,6 +291,23 @@ busybox_override=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=tru
 assert_contains "#116: busyboxImage override applies" "${busybox_override}" 'image: "mirror.local/busybox:1.36"'
 assert_contains "#116: busyboxImage pullPolicy override applies" "${busybox_override}" "imagePullPolicy: Always"
 
+# #26: every image is digest-pinnable via the shared pg.image helper. Empty digest
+# (default) renders repository:tag; a set digest appends @<digest>.
+img_pin=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set pgpool.metrics.enabled=true --set prometheusExporter.enabled=true \
+  --set busyboxImage.digest=sha256:bbb --set postgresql.image.digest=sha256:ppp \
+  --set pgpool.image.digest=sha256:ggg --set pgpool.metrics.image.digest=sha256:mmm \
+  --set prometheusExporter.image.digest=sha256:eee 2>&1)
+assert_contains "#26: busybox image digest-pinnable" "${img_pin}" 'image: "busybox:1.37@sha256:bbb"'
+assert_contains "#26: postgresql image digest-pinnable" "${img_pin}" '@sha256:ppp"'
+assert_contains "#26: pgpool image digest-pinnable" "${img_pin}" '@sha256:ggg"'
+assert_contains "#26: pgpool-exporter image digest-pinnable" "${img_pin}" '@sha256:mmm"'
+assert_contains "#26: prometheus-exporter image digest-pinnable" "${img_pin}" '@sha256:eee"'
+img_pin_bk=$(helm template test-pg "${CHART_DIR}" --set backup.enabled=true --set backup.s3.endpoint=https://e --set backup.s3.bucket=b --set backup.existingSecret.name=s --set backup.mc.image.digest=sha256:ccc --set pgbackrest.enabled=true --set pgbackrest.s3.endpoint=https://e --set pgbackrest.s3.bucket=b --set pgbackrest.existingSecret.name=s3 --set pgbackrest.cronjob.image.digest=sha256:kkk 2>&1)
+assert_contains "#26: backup mc image digest-pinnable" "${img_pin_bk}" '@sha256:ccc"'
+assert_contains "#26: pgbackrest cronjob image digest-pinnable" "${img_pin_bk}" '@sha256:kkk"'
+# default: no @sha256 in any image ref
+assert_not_contains "#26: no digest in image refs by default" "$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set prometheusExporter.enabled=true 2>&1 | grep '          image:')" "@sha256"
+
 # Test: pgpool deployment has pod securityContext
 assert_contains "full: pgpool has runAsNonRoot" "${full}" "runAsNonRoot: true"
 

@@ -43,7 +43,7 @@ spec:
             {{- toYaml $root.Values.pgbackrest.cronjob.podSecurityContext | nindent 12 }}
           containers:
             - name: pgbackrest
-              image: "{{ $root.Values.pgbackrest.cronjob.image.repository }}:{{ $root.Values.pgbackrest.cronjob.image.tag }}"
+              image: {{ include "pg.image" $root.Values.pgbackrest.cronjob.image | quote }}
               imagePullPolicy: {{ $root.Values.pgbackrest.cronjob.image.pullPolicy }}
               securityContext:
                 {{- toYaml $root.Values.pgbackrest.cronjob.containerSecurityContext | nindent 16 }}
