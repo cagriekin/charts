@@ -1284,6 +1284,20 @@ assert_contains "pgbackrest: configmap has stanza" "${pgbackrest}" "[db]"
 assert_contains "pgbackrest: configmap has s3 endpoint" "${pgbackrest}" "repo1-s3-endpoint=https://s3.amazonaws.com"
 assert_contains "pgbackrest: configmap has s3 bucket" "${pgbackrest}" "repo1-s3-bucket=test-backups"
 
+# #120: repository encryption is off by default and opt-in via repoEncryption.
+assert_contains "pgbackrest #120: cipher-type none by default" "${pgbackrest}" "repo1-cipher-type=none"
+assert_not_contains "pgbackrest #120: no cipher passphrase env by default" "${pgbackrest}" "PGBACKREST_REPO1_CIPHER_PASS"
+pgbackrest_enc=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set pgbackrest.repoEncryption.enabled=true --set pgbackrest.repoEncryption.existingSecret.name=cipher-sec 2>&1)
+assert_contains "pgbackrest #120: cipher-type set when enabled" "${pgbackrest_enc}" "repo1-cipher-type=aes-256-cbc"
+assert_not_contains "pgbackrest #120: passphrase never written into the ConfigMap" "${pgbackrest_enc}" "repo1-cipher-pass="
+enc_env_count=$(printf '%s\n' "${pgbackrest_enc}" | grep -c "name: PGBACKREST_REPO1_CIPHER_PASS")
+assert_eq "pgbackrest #120: passphrase env injected into postgresql + sidecar" "2" "${enc_env_count}"
+assert_contains "pgbackrest #120: passphrase from the configured secret key" "${pgbackrest_enc}" "key: cipher-pass"
+enc_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --set pgbackrest.repoEncryption.enabled=true >/dev/null 2>&1 || enc_rc=$?
+assert_eq "pgbackrest #120: enabled without a passphrase secret fails fast" "1" "$([ "${enc_rc}" -ne 0 ] && echo 1 || echo 0)"
+
 # pgBackRest: idle sidecar present in statefulset (exec target for CronJobs)
 pgbackrest_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/statefulset.yaml 2>&1)
 assert_contains "pgbackrest: sidecar present" "${pgbackrest_sts}" "name: pgbackrest"

@@ -426,6 +426,13 @@ spec:
               value: "true"
             - name: PGBACKREST_STANZA
               value: {{ .Values.pgbackrest.stanza | quote }}
+{{- if .Values.pgbackrest.repoEncryption.enabled }}
+            - name: PGBACKREST_REPO1_CIPHER_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "pgbackrest.repoEncryption.existingSecret.name is required when pgbackrest.repoEncryption.enabled" .Values.pgbackrest.repoEncryption.existingSecret.name }}
+                  key: {{ .Values.pgbackrest.repoEncryption.existingSecret.passphraseKey }}
+{{- end }}
 {{- if eq .Values.pgbackrest.s3.keyType "shared" }}
             - name: PGBACKREST_REPO1_S3_KEY
               valueFrom:
@@ -920,6 +927,13 @@ spec:
           env:
             - name: PGBACKREST_STANZA
               value: {{ .Values.pgbackrest.stanza | quote }}
+{{- if .Values.pgbackrest.repoEncryption.enabled }}
+            - name: PGBACKREST_REPO1_CIPHER_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "pgbackrest.repoEncryption.existingSecret.name is required when pgbackrest.repoEncryption.enabled" .Values.pgbackrest.repoEncryption.existingSecret.name }}
+                  key: {{ .Values.pgbackrest.repoEncryption.existingSecret.passphraseKey }}
+{{- end }}
 {{- if eq .Values.pgbackrest.s3.keyType "shared" }}
             - name: PGBACKREST_REPO1_S3_KEY
               valueFrom:

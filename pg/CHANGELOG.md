@@ -38,6 +38,13 @@
   the namespace default (#27).** A new no-RBAC `<fullname>-backup` ServiceAccount
   (its token is never mounted, #166) backs both Jobs, which talk only to PostgreSQL
   and S3. Previously they ran as the namespace default SA.
+- **pgBackRest repository encryption is now an option (#120).** `repo1-cipher-type`
+  was hardcoded to `none`. Set `pgbackrest.repoEncryption.enabled=true` (cipher
+  `aes-256-cbc` by default) to encrypt the repository at rest in S3; the passphrase is
+  read from `pgbackrest.repoEncryption.existingSecret` and supplied to pgbackrest via
+  the `PGBACKREST_REPO1_CIPHER_PASS` env (postgresql container + sidecar), never
+  written into the ConfigMap. Default stays unencrypted. A PITR restore pod must set
+  the same env when restoring an encrypted repository.
 - **The PgPool-II PCP admin port (9898) is no longer exposed on the Service by default
   (#118).** The pgpool Service published the PCP admin/control port cluster-wide, while
   the pgpool NetworkPolicy only admits 9999 — so with NetworkPolicy off the admin
