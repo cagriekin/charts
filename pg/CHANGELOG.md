@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 1.1.3 - 2026-06-19
+
+Multi-pillar-review remediation of the 1.1.2 etcd changes. Refreshes the bundled
+`etcd` subchart to 0.1.2. Docs/test-quality only; no image change (stays
+`trixie-5.5.0-20`) and no rendered behavior change at defaults.
+
+### Fixed
+
+- **Standalone-etcd guide pointed at a Service that never exists.** The etcd
+  README's shared-store wiring used `http://<release>-etcd.<ns>` but the client
+  Service renders as `<release>-etcd-etcd`; the install now sets
+  `fullnameOverride` so the documented endpoint matches (#183 follow-up).
+- **etcd `image.tag` pin comment was stale** (claimed it matched the agent's
+  vendored client, which moved to v3.5.31); corrected to note the server is held
+  at v3.5.16 and 3.5.x client/server are wire-compatible.
+
+### Security
+
+- **Hardened the `etcd.networkPolicy.allowedClients` guidance.** The default
+  podSelector matches any `app.kubernetes.io/component: postgresql` pod in an
+  allow-listed namespace, and the bundled etcd is plaintext/no-auth — documented
+  this exposure in `values.yaml` and recommend an instance-pinned selector plus
+  client TLS (#184).
+
+### Changed
+
+- Release landing page no longer advertises the `common` library chart as
+  installable; `helm repo add` alias unified to `cagriekin` across the READMEs.
+- Test coverage for `allowedClients` tightened: the default-podSelector assertion
+  is now scoped (was doc-wide/tautological), and the custom-podSelector branch,
+  multi-entry rendering, and the missing-namespace fail-fast message are asserted.
+
 ## 1.1.2 - 2026-06-19
 
 Refreshes the bundled `etcd` subchart to 0.1.1. Chart-only; no image change

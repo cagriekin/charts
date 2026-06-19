@@ -1000,23 +1000,37 @@ assert_contains "bundled etcd: ships an ingress NetworkPolicy" "${agent_etcd_np2
 assert_contains "bundled etcd: NP admits the agent (postgresql) on the client port" "${agent_etcd_np2}" "app.kubernetes.io/component: postgresql"
 assert_not_contains "bundled etcd: no namespaceSelector without allowedClients" "${agent_etcd_np2}" "namespaceSelector"
 # allowedClients: cross-namespace client allow-list for a shared/standalone etcd
-# (#183); the bundled subchart and the standalone chart share the template.
+# (#183); the bundled subchart and the standalone chart share the template. Render
+# two entries via the bundled path (proves the re-vendored subchart carries it):
+# [0] default podSelector, [1] an explicit custom podSelector.
 etcd_allow=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set 'repmgr.agent.dcs.backend=etcd' --set 'etcd.enabled=true' \
-  --set 'etcd.networkPolicy.allowedClients[0].namespace=sentry' \
+  --set 'etcd.networkPolicy.allowedClients[0].namespace=backend' \
+  --set 'etcd.networkPolicy.allowedClients[1].namespace=sentry' \
+  --set 'etcd.networkPolicy.allowedClients[1].podSelector.app\.kubernetes\.io/instance=sentry-pg' \
   --show-only charts/etcd/templates/networkpolicy.yaml 2>&1)
-assert_contains "bundled etcd: allowedClients opens a namespaceSelector" "${etcd_allow}" "kubernetes.io/metadata.name: sentry"
-assert_contains "bundled etcd: allowedClients defaults podSelector to postgresql" "${etcd_allow}" "app.kubernetes.io/component: postgresql"
+# both entries render (the range loop) -- exactly two namespaceSelectors
+assert_contains "bundled etcd: allowedClients first namespace renders" "${etcd_allow}" "kubernetes.io/metadata.name: backend"
+assert_contains "bundled etcd: allowedClients second namespace renders" "${etcd_allow}" "kubernetes.io/metadata.name: sentry"
+ac_ns_count=$(printf '%s\n' "${etcd_allow}" | grep -c "kubernetes.io/metadata.name:")
+assert_eq "bundled etcd: exactly two allowedClients namespaceSelectors" "2" "${ac_ns_count}"
+# default podSelector branch -- scoped to the FIRST entry (not a doc-wide grep that
+# would also match the built-in same-release rule and the peer mesh)
+ac_default=$(printf '%s\n' "${etcd_allow}" | grep -A5 "kubernetes.io/metadata.name: backend")
+assert_contains "bundled etcd: entry without podSelector defaults to the postgresql component" "${ac_default}" "app.kubernetes.io/component: postgresql"
+# custom podSelector branch -- scoped to the SECOND entry; the default must NOT fire there
+ac_custom=$(printf '%s\n' "${etcd_allow}" | grep -A5 "kubernetes.io/metadata.name: sentry")
+assert_contains "bundled etcd: custom podSelector is used verbatim" "${ac_custom}" "app.kubernetes.io/instance: sentry-pg"
+assert_not_contains "bundled etcd: custom entry does not also get the default component label" "${ac_custom}" "component: postgresql"
 # standalone etcd chart (now published on its own): allowedClients renders, and a
-# missing namespace fails fast.
+# missing namespace fails fast with the required-guard message (not just any error).
 etcd_standalone=$(helm template platform-etcd "${SCRIPT_DIR}/../../etcd" \
   --set 'networkPolicy.allowedClients[0].namespace=backend' \
   --show-only templates/networkpolicy.yaml 2>&1)
 assert_contains "standalone etcd: allowedClients namespaceSelector renders" "${etcd_standalone}" "kubernetes.io/metadata.name: backend"
-etcd_allow_nons_rc=0
-helm template platform-etcd "${SCRIPT_DIR}/../../etcd" \
-  --set 'networkPolicy.allowedClients[0].podSelector.foo=bar' >/dev/null 2>&1 || etcd_allow_nons_rc=$?
-assert_eq "etcd: allowedClients entry without namespace fails fast" "1" "$([ "${etcd_allow_nons_rc}" -ne 0 ] && echo 1 || echo 0)"
+etcd_allow_err=$(helm template platform-etcd "${SCRIPT_DIR}/../../etcd" \
+  --set 'networkPolicy.allowedClients[0].podSelector.foo=bar' 2>&1 || true)
+assert_contains "standalone etcd: missing namespace fails with the required-guard message" "${etcd_allow_err}" "allowedClients\[\].namespace is required"
 # fail-fast on contradictory etcd config (bundled deployed but unused)
 etcd_orphan_rc=0
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" --set 'etcd.enabled=true' >/dev/null 2>&1 || etcd_orphan_rc=$?

@@ -30,11 +30,15 @@ this chart on its own and point each `pg`/`pgvector` release at it (leave
 `etcd.enabled=false` on the parents):
 
 ```bash
-helm repo add cagriekin-charts https://cagriekin.github.io/charts
-helm install platform-etcd cagriekin-charts/etcd -n platform \
+helm repo add cagriekin https://cagriekin.github.io/charts
+helm install platform-etcd cagriekin/etcd -n platform \
+  --set fullnameOverride=platform-etcd \
   --set 'networkPolicy.allowedClients[0].namespace=backend' \
   --set 'networkPolicy.allowedClients[1].namespace=sentry'
 ```
+
+`fullnameOverride` pins the client Service name (otherwise it is `<release>-etcd`,
+e.g. `platform-etcd-etcd`); the endpoint below must match whichever name renders.
 
 ```yaml
 # in each pg / pgvector release's values
