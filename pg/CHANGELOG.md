@@ -31,9 +31,13 @@
   monitoring role on the primary (it replicates to standbys) and the exporter
   authenticates as it. Chart-only -- works in both repmgr and standalone modes with no
   image change. Enabled by default (`prometheusExporter.monitoringUser.enabled`);
-  disable to revert to the superuser. With `postgresql.existingSecret.enabled` the
-  secret must also carry a `monitoring-password` key (override via
-  `postgresql.existingSecret.monitoringPasswordKey`), enforced fail-fast at render.
+  disable to revert to the superuser. **Migration (existingSecret users):** because
+  this is on by default, before upgrading add a `monitoring-password` key to your
+  existing secret (key name overridable via
+  `postgresql.existingSecret.monitoringPasswordKey`), or set
+  `prometheusExporter.monitoringUser.enabled=false`. The chart references that key name
+  (validated at render); a key missing from the secret itself surfaces at runtime as
+  the exporter + hook Job failing to authenticate, not as a render error.
 - **The backup and backup-validation Jobs run under a dedicated ServiceAccount, not
   the namespace default (#27).** A new no-RBAC `<fullname>-backup` ServiceAccount
   (its token is never mounted, #166) backs both Jobs, which talk only to PostgreSQL

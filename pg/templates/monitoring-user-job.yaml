@@ -61,12 +61,15 @@ spec:
               done
               echo "Creating/updating the read-only monitoring role '$MONITORING_USER'..."
               # psql variables: :"x" = quoted identifier, :'x' = quoted literal, so
-              # the role name and password are injection-safe. \gexec makes the
-              # CREATE ROLE conditional (idempotent on every upgrade). password_
-              # encryption=scram so the role auths under the pod-CIDR scram pg_hba rule.
+              # the role name/password are injection-safe. The password is read from the
+              # environment with \getenv -- NOT passed as `-v mpass=...`, which would
+              # expose it in the process argv (/proc/<pid>/cmdline, ps). \gexec makes the
+              # CREATE ROLE conditional (idempotent on every upgrade); password_encryption
+              # =scram so the role auths under the pod-CIDR scram pg_hba rule.
               PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 \
                 -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-                -v muser="$MONITORING_USER" -v mpass="$MONITORING_PASSWORD" -v dbname="$POSTGRES_DB" <<'SQL'
+                -v muser="$MONITORING_USER" -v dbname="$POSTGRES_DB" <<'SQL'
+              \getenv mpass MONITORING_PASSWORD
               SET password_encryption = 'scram-sha-256';
               SELECT format('CREATE ROLE %I LOGIN', :'muser')
                 WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'muser')

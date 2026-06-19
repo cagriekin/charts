@@ -133,12 +133,16 @@ assert_eq "prometheus exporter pod is Running" "Running" "${exporter_phase}"
 exporter_port=$(kubectl get svc -n "${NAMESPACE}" "${FULLNAME}-postgres-exporter" -o jsonpath='{.spec.ports[0].port}')
 assert_eq "exporter service port is 9116" "9116" "${exporter_port}"
 
-# Test: exporter returns metrics (use a temp pod to avoid curl dependency)
+# Test: exporter scrapes succeed as the least-privilege monitoring user (#28).
+# pg_up=1 proves the exporter connected and ran a query as the pg_monitor role --
+# a plain '^pg_' match would still pass with pg_up 0 (auth failed). Grepping only
+# pg_up lines, then asserting none carry a " 0" value, confirms every target is up.
 exporter_svc="${FULLNAME}-postgres-exporter.${NAMESPACE}.svc.cluster.local"
 metrics_output=$(kubectl run "metrics-check-$(date +%s)" -n "${NAMESPACE}" --rm -i --restart=Never \
   --image=busybox:1.37 -- wget -qO- "http://${exporter_svc}:9116/metrics" 2>/dev/null \
-  | grep -m1 '^pg_' || echo "")
-assert_contains "exporter returns pg metrics" "${metrics_output}" "pg_"
+  | grep '^pg_up' || echo "")
+assert_contains "exporter returns pg_up metric" "${metrics_output}" "pg_up"
+assert_not_contains "exporter scrapes succeed as the monitoring user, no pg_up 0 (#28)" "${metrics_output}" " 0"
 
 end_suite
 print_summary

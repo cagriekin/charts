@@ -1322,10 +1322,14 @@ assert_eq "pgbackrest #120: enabled without a passphrase secret fails fast" "1" 
 ro_exp=$(helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true --show-only templates/prometheus-exporter-deployment.yaml 2>&1)
 assert_contains "#117: exporter readOnlyRootFilesystem" "${ro_exp}" "readOnlyRootFilesystem: true"
 assert_contains "#117: exporter has a writable /tmp" "${ro_exp}" "mountPath: /tmp"
-ro_bk=$(helm template test-pg "${CHART_DIR}" --set backup.enabled=true --set backup.s3.endpoint=https://e --set backup.s3.bucket=b --set backup.existingSecret.name=s --set backup.validation.enabled=true 2>&1)
-ro_bk_count=$(printf '%s\n' "${ro_bk}" | grep -c "readOnlyRootFilesystem: true")
-assert_gt "#117: backup + validation containers are read-only" "${ro_bk_count}" "1"
-assert_contains "#117: backup container has a writable /tmp" "${ro_bk}" "mountPath: /tmp"
+# scope each per-container so the assert proves THAT container is read-only with a
+# writable /tmp (a whole-render grep would let one container's /tmp satisfy the other).
+ro_bk_cj=$(helm template test-pg "${CHART_DIR}" --set backup.enabled=true --set backup.s3.endpoint=https://e --set backup.s3.bucket=b --set backup.existingSecret.name=s --show-only templates/backup-cronjob.yaml 2>&1)
+assert_contains "#117: backup container readOnlyRootFilesystem" "${ro_bk_cj}" "readOnlyRootFilesystem: true"
+assert_contains "#117: backup container has a writable /tmp" "${ro_bk_cj}" "mountPath: /tmp"
+ro_val_cj=$(helm template test-pg "${CHART_DIR}" --set backup.enabled=true --set backup.s3.endpoint=https://e --set backup.s3.bucket=b --set backup.existingSecret.name=s --set backup.validation.enabled=true --show-only templates/backup-validation-cronjob.yaml 2>&1)
+assert_contains "#117: validation container readOnlyRootFilesystem" "${ro_val_cj}" "readOnlyRootFilesystem: true"
+assert_contains "#117: validation container has a writable /tmp" "${ro_val_cj}" "mountPath: /tmp"
 ro_pb=$(helm template test-pg "${CHART_DIR}" --set pgbackrest.enabled=true --set pgbackrest.s3.endpoint=https://e --set pgbackrest.s3.bucket=b --set pgbackrest.existingSecret.name=s --show-only templates/pgbackrest-cronjob.yaml 2>&1)
 assert_contains "#117: pgbackrest runner readOnlyRootFilesystem" "${ro_pb}" "readOnlyRootFilesystem: true"
 assert_contains "#117: pgbackrest runner HOME points at the writable /tmp" "${ro_pb}" "value: /tmp"
@@ -2155,6 +2159,14 @@ pgv_val=$(helm template test-pgv "${PGVECTOR_DIR}" \
   --set backup.validation.enabled=true --show-only templates/backup-validation-cronjob.yaml 2>&1)
 assert_contains "pgvector #31: backup-validation CronJob renders (symlink present)" "${pgv_val}" "app.kubernetes.io/component: backup-validation"
 assert_contains "pgvector #31: validation runs as the official-postgres uid 999" "${pgv_val}" "runAsUser: 999"
+# #27 parity: the backup ServiceAccount is a separate template; its pgvector symlink
+# must render or the backup Jobs fall back to the namespace default SA.
+pgv_bksa=$(helm template test-pgv "${PGVECTOR_DIR}" \
+  --set backup.enabled=true --set backup.s3.endpoint=https://s3.example.com \
+  --set backup.s3.bucket=b --set backup.existingSecret.name=creds \
+  --show-only templates/backup-serviceaccount.yaml 2>&1)
+assert_contains "pgvector #27: backup ServiceAccount renders (symlink present)" "${pgv_bksa}" "kind: ServiceAccount"
+assert_contains "pgvector #27: backup SA token not automounted" "${pgv_bksa}" "automountServiceAccountToken: false"
 # #28 parity: the monitoring-user hook Job is a separate template; without the
 # pgvector symlink the exporter would reference a pg_monitor user nothing creates.
 pgv_mon=$(helm template test-pgv "${PGVECTOR_DIR}" --set prometheusExporter.enabled=true --show-only templates/monitoring-user-job.yaml 2>&1)
