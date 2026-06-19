@@ -729,6 +729,14 @@ Alert on `rate(pg_wal_archive_failed_count[5m]) > 0` to catch a failing `archive
 | `prometheusExporter.enabled` | Enable Prometheus exporter | `false` |
 | `prometheusExporter.monitoringUser.enabled` | Create a read-only `pg_monitor` role (via a post-install hook Job) and have the exporter authenticate as it instead of the postgres superuser (#28) | `true` |
 | `prometheusExporter.monitoringUser.username` | Name of the monitoring role | `monitoring` |
+
+> **Monitoring-user notes.** The `pg_monitor` role is created by a post-install/upgrade
+> hook Job, so on a *fresh* install the exporter may log auth failures for a few seconds
+> until the hook completes — it recovers on its own. If you rotate the
+> `monitoring-password` in an `existingSecret`, the running exporter keeps the old value
+> until restarted (env is read at pod start): run
+> `kubectl rollout restart deployment/<release>-postgres-exporter` after the upgrade
+> (same as the pgpool credential note below).
 | `prometheusExporter.image.repository` | Exporter image repository | `quay.io/prometheuscommunity/postgres-exporter` |
 | `prometheusExporter.image.tag` | Exporter image tag | `v0.19.1` |
 | `prometheusExporter.image.pullPolicy` | Image pull policy | `IfNotPresent` |
