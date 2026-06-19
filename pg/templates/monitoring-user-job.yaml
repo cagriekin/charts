@@ -1,0 +1,106 @@
+{{- if and .Values.prometheusExporter.enabled .Values.prometheusExporter.monitoringUser.enabled }}
+{{- /* #28: the exporter connects as a least-privilege pg_monitor role, not the
+       postgres superuser. This post-install/upgrade hook Job creates that role on
+       the primary (it replicates to standbys), in BOTH repmgr and standalone modes
+       -- a chart-only mechanism that needs no image change. The role is created
+       idempotently so re-running on every upgrade is safe. */}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "pg.fullname" . }}-monitoring-user
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: monitoring-user
+  annotations:
+    {{- with (include "pg.annotations" .) }}
+    {{- . | nindent 4 }}
+    {{- end }}
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "pg.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: monitoring-user
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      restartPolicy: Never
+      # Talks only to PostgreSQL, never the Kubernetes API.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: create-monitoring-user
+          image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          command: ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
+          args:
+            - |
+              echo "Waiting for the primary to accept connections..."
+              for i in $(seq 1 60); do
+                if PGPASSWORD="$POSTGRES_PASSWORD" pg_isready -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; then
+                  break
+                fi
+                sleep 5
+              done
+              echo "Creating/updating the read-only monitoring role '$MONITORING_USER'..."
+              # psql variables: :"x" = quoted identifier, :'x' = quoted literal, so
+              # the role name and password are injection-safe. \gexec makes the
+              # CREATE ROLE conditional (idempotent on every upgrade). password_
+              # encryption=scram so the role auths under the pod-CIDR scram pg_hba rule.
+              PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 \
+                -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+                -v muser="$MONITORING_USER" -v mpass="$MONITORING_PASSWORD" -v dbname="$POSTGRES_DB" <<'SQL'
+              SET password_encryption = 'scram-sha-256';
+              SELECT format('CREATE ROLE %I LOGIN', :'muser')
+                WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'muser')
+              \gexec
+              ALTER ROLE :"muser" WITH LOGIN PASSWORD :'mpass';
+              GRANT pg_monitor TO :"muser";
+              GRANT CONNECT ON DATABASE :"dbname" TO :"muser";
+              SQL
+              echo "Monitoring role '$MONITORING_USER' is ready."
+          env:
+            - name: POSTGRES_HOST
+              value: {{ printf "%s.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretUsernameKey" . }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretPasswordKey" . }}
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretDatabaseKey" . }}
+            - name: MONITORING_USER
+              value: {{ .Values.prometheusExporter.monitoringUser.username | quote }}
+            - name: MONITORING_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretMonitoringPasswordKey" . }}
+          resources:
+            {{- include "pg.initResources" . | nindent 12 }}
+{{- end }}

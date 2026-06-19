@@ -60,6 +60,8 @@ postgresql:
     passwordKey: password
     databaseKey: database
     repmgrPasswordKey: repmgr-password
+    # Required only when prometheusExporter.monitoringUser.enabled is true.
+    monitoringPasswordKey: monitoring-password
 
   livenessProbe:
     enabled: true
@@ -405,6 +407,15 @@ pgpool:
 
 prometheusExporter:
   enabled: false
+
+  # Least-privilege monitoring user (#28). When enabled, a post-install/upgrade
+  # hook Job creates a read-only `pg_monitor` role on the primary (replicated to
+  # standbys) and the exporter connects as it instead of the postgres superuser.
+  # Disable to fall back to the superuser. With postgresql.existingSecret.enabled,
+  # the existing secret must also carry a `monitoring-password` key.
+  monitoringUser:
+    enabled: true
+    username: monitoring
 
   podSecurityContext:
     runAsNonRoot: true

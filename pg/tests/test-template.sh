@@ -1669,8 +1669,8 @@ assert_eq "helm lint with nodeSelector and tolerations passes" "0" "${lint_rc}"
 assert_not_contains "default: no imagePullSecrets in minimal render" "${minimal}" "imagePullSecrets"
 assert_not_contains "default: no imagePullSecrets in full render" "${full}" "imagePullSecrets"
 
-# Test: imagePullSecrets propagates to statefulset, pgpool, exporter and
-# backup cronjob pod templates (one occurrence each)
+# Test: imagePullSecrets propagates to statefulset, pgpool, exporter, backup
+# cronjob, and the monitoring-user hook Job pod templates (one occurrence each)
 ips_full=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
   --set 'imagePullSecrets[0].name=registry-cred' \
   --set backup.enabled=true \
@@ -1679,7 +1679,7 @@ ips_full=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-te
   --set backup.existingSecret.name=s3-backup-creds \
   2>&1)
 ips_count=$(printf '%s' "${ips_full}" | grep -c "name: registry-cred" || true)
-assert_eq "imagePullSecrets: statefulset, pgpool, exporter, backup all carry the secret" "4" "${ips_count}"
+assert_eq "imagePullSecrets: statefulset, pgpool, exporter, backup, monitoring-user all carry the secret" "5" "${ips_count}"
 
 # Test: imagePullSecrets propagates to both pgbackrest cronjob pod templates
 ips_pgbackrest=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
@@ -1783,6 +1783,28 @@ assert_contains "exporter cm #30: seconds_since_last_archived metric declared" "
 assert_contains "exporter cm #30: archiver query reads pg_stat_archiver" "${exporter_cm_arch}" "FROM pg_stat_archiver"
 # absent when pgbackrest disabled (no archiving); exporter_cm above is full-test (pgbackrest off)
 assert_not_contains "exporter cm #30: no pg_wal_archive group when pgbackrest disabled" "${exporter_cm}" "pg_wal_archive:"
+
+# #28: least-privilege monitoring user. A post-install/upgrade hook Job creates a
+# pg_monitor role; the exporter connects as it, not the postgres superuser.
+exp_on="--set prometheusExporter.enabled=true"
+mon_secret=$(helm template test-pg "${CHART_DIR}" ${exp_on} --show-only templates/secret.yaml 2>&1)
+assert_contains "#28: secret carries monitoring-password when exporter enabled" "${mon_secret}" "monitoring-password:"
+mon_job=$(helm template test-pg "${CHART_DIR}" ${exp_on} --show-only templates/monitoring-user-job.yaml 2>&1)
+assert_contains "#28: monitoring-user hook Job present" "${mon_job}" "name: test-pg-monitoring-user"
+assert_contains "#28: hook runs post-install,post-upgrade" "${mon_job}" "post-install,post-upgrade"
+assert_contains "#28: hook grants pg_monitor (read-only)" "${mon_job}" "GRANT pg_monitor"
+assert_contains "#28: hook role creation is idempotent (gexec guard)" "${mon_job}" "WHERE NOT EXISTS (SELECT FROM pg_roles"
+assert_contains "#28: hook makes no API calls (no SA token)" "${mon_job}" "automountServiceAccountToken: false"
+mon_exp=$(helm template test-pg "${CHART_DIR}" ${exp_on} --show-only templates/prometheus-exporter-deployment.yaml 2>&1)
+mon_user_block=$(printf '%s\n' "${mon_exp}" | sed -n '/name: POSTGRES_USER/,/POSTGRES_DATABASE/p')
+assert_contains "#28: exporter connects as the monitoring user, not the superuser" "${mon_user_block}" 'value: "monitoring"'
+assert_contains "#28: exporter password from the monitoring-password secret key" "${mon_user_block}" "key: monitoring-password"
+# disabled -> no hook Job, no monitoring-password, exporter falls back to the superuser secret
+mon_off_all=$(helm template test-pg "${CHART_DIR}" ${exp_on} --set prometheusExporter.monitoringUser.enabled=false 2>&1)
+assert_not_contains "#28: no hook Job when monitoringUser disabled" "${mon_off_all}" "monitoring-user"
+mon_off_exp=$(helm template test-pg "${CHART_DIR}" ${exp_on} --set prometheusExporter.monitoringUser.enabled=false --show-only templates/prometheus-exporter-deployment.yaml 2>&1)
+mon_off_block=$(printf '%s\n' "${mon_off_exp}" | sed -n '/name: POSTGRES_USER/,/POSTGRES_DATABASE/p')
+assert_contains "#28: disabled falls back to the superuser username key" "${mon_off_block}" "key: username"
 
 # Test: exporter container loads the custom queries file from the configmap mount
 assert_contains "exporter: extend.query-path flag wired" "${full}" "extend.query-path=/config/queries.yaml"
@@ -2078,6 +2100,11 @@ pgv_val=$(helm template test-pgv "${PGVECTOR_DIR}" \
   --set backup.validation.enabled=true --show-only templates/backup-validation-cronjob.yaml 2>&1)
 assert_contains "pgvector #31: backup-validation CronJob renders (symlink present)" "${pgv_val}" "app.kubernetes.io/component: backup-validation"
 assert_contains "pgvector #31: validation runs as the official-postgres uid 999" "${pgv_val}" "runAsUser: 999"
+# #28 parity: the monitoring-user hook Job is a separate template; without the
+# pgvector symlink the exporter would reference a pg_monitor user nothing creates.
+pgv_mon=$(helm template test-pgv "${PGVECTOR_DIR}" --set prometheusExporter.enabled=true --show-only templates/monitoring-user-job.yaml 2>&1)
+assert_contains "pgvector #28: monitoring-user hook Job renders (symlink present)" "${pgv_mon}" "app.kubernetes.io/component: monitoring-user"
+assert_contains "pgvector #28: hook grants pg_monitor" "${pgv_mon}" "GRANT pg_monitor"
 
 # --- pgvector agent-mode parity ---
 # The agent-mode templates are symlinks to pg's, but pgvector/values.yaml is an
