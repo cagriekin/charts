@@ -85,7 +85,7 @@ spec:
         {{- toYaml .Values.pgpool.podSecurityContext | nindent 8 }}
       initContainers:
         - name: init-config
-          image: "{{ .Values.busyboxImage.repository }}:{{ .Values.busyboxImage.tag }}"
+          image: {{ include "pg.image" .Values.busyboxImage | quote }}
           imagePullPolicy: {{ .Values.busyboxImage.pullPolicy }}
           securityContext:
             {{- toYaml .Values.pgpool.containerSecurityContext | nindent 12 }}
@@ -167,7 +167,7 @@ spec:
               mountPath: /usr/local/etc
       containers:
         - name: pgpool
-          image: "{{ .Values.pgpool.image.repository }}:{{ .Values.pgpool.image.tag }}"
+          image: {{ include "pg.image" .Values.pgpool.image | quote }}
           imagePullPolicy: {{ .Values.pgpool.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.pgpool.containerSecurityContext | nindent 12 }}
@@ -232,7 +232,7 @@ spec:
               mountPath: /usr/local/etc
 {{- if .Values.pgpool.metrics.enabled }}
         - name: pgpool-exporter
-          image: "{{ .Values.pgpool.metrics.image.repository }}:{{ .Values.pgpool.metrics.image.tag }}"
+          image: {{ include "pg.image" .Values.pgpool.metrics.image | quote }}
           imagePullPolicy: {{ .Values.pgpool.metrics.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.pgpool.containerSecurityContext | nindent 12 }}

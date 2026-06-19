@@ -88,6 +88,14 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `busyboxImage.repository` | Image for the helper init containers (permission fixups, config copy/templating) across the StatefulSet, pgpool, and exporter pods; override for air-gapped/private registries | `busybox` |
 | `busyboxImage.tag` | Helper init image tag | `1.37` |
 | `busyboxImage.pullPolicy` | Helper init image pull policy | `IfNotPresent` |
+| `busyboxImage.digest` | Optional digest pin (`sha256:...`), appended as `repository:tag@digest` | `""` |
+
+> **Pinning images by digest (#26).** Every image block — `postgresql.image`,
+> `repmgr.image`, `pgpool.image`, `pgpool.metrics.image`, `prometheusExporter.image`,
+> `busyboxImage`, `backup.mc.image`, and `pgbackrest.cronjob.image` — accepts an
+> optional `digest` (e.g. `sha256:…`). When set, the image is rendered as
+> `repository:tag@digest` so a mutable-tag repush cannot silently change what runs.
+> Empty (default) pulls by tag.
 
 ### PostgreSQL Parameters
 
