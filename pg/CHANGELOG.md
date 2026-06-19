@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 1.1.2 - 2026-06-19
+
+Refreshes the bundled `etcd` subchart to 0.1.1. Chart-only; no image change
+(stays `trixie-5.5.0-20`) and no behavior change at defaults -- a `helm upgrade`
+rolls nothing unless `etcd.enabled` and the new value is set.
+
+### Added
+
+- **`etcd.networkPolicy.allowedClients` for the bundled etcd (#183).** The etcd
+  NetworkPolicy only admitted this release's own postgresql pods on the client
+  port, so a shared/standalone etcd had no first-class way to allow clients in
+  other namespaces (only raw `extraIngress` with hand-written selectors). Added a
+  declarative `allowedClients: [{namespace, podSelector?}]` knob that opens the
+  client port (2379) per namespace; `podSelector` defaults to the agent's
+  `app.kubernetes.io/component: postgresql` label. Default `[]` (render
+  byte-stable). The `etcd` chart is now also published standalone (0.1.1) so
+  several `pg` releases can share one etcd; see its README.
+
 ## 1.1.1 - 2026-06-19
 
 Security: bump the HA agent's vendored Go dependencies off two CVE-flagged

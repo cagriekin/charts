@@ -998,6 +998,25 @@ agent_etcd_np2=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-a
   --show-only charts/etcd/templates/networkpolicy.yaml 2>&1)
 assert_contains "bundled etcd: ships an ingress NetworkPolicy" "${agent_etcd_np2}" "kind: NetworkPolicy"
 assert_contains "bundled etcd: NP admits the agent (postgresql) on the client port" "${agent_etcd_np2}" "app.kubernetes.io/component: postgresql"
+assert_not_contains "bundled etcd: no namespaceSelector without allowedClients" "${agent_etcd_np2}" "namespaceSelector"
+# allowedClients: cross-namespace client allow-list for a shared/standalone etcd
+# (#183); the bundled subchart and the standalone chart share the template.
+etcd_allow=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'repmgr.agent.dcs.backend=etcd' --set 'etcd.enabled=true' \
+  --set 'etcd.networkPolicy.allowedClients[0].namespace=sentry' \
+  --show-only charts/etcd/templates/networkpolicy.yaml 2>&1)
+assert_contains "bundled etcd: allowedClients opens a namespaceSelector" "${etcd_allow}" "kubernetes.io/metadata.name: sentry"
+assert_contains "bundled etcd: allowedClients defaults podSelector to postgresql" "${etcd_allow}" "app.kubernetes.io/component: postgresql"
+# standalone etcd chart (now published on its own): allowedClients renders, and a
+# missing namespace fails fast.
+etcd_standalone=$(helm template platform-etcd "${SCRIPT_DIR}/../../etcd" \
+  --set 'networkPolicy.allowedClients[0].namespace=backend' \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "standalone etcd: allowedClients namespaceSelector renders" "${etcd_standalone}" "kubernetes.io/metadata.name: backend"
+etcd_allow_nons_rc=0
+helm template platform-etcd "${SCRIPT_DIR}/../../etcd" \
+  --set 'networkPolicy.allowedClients[0].podSelector.foo=bar' >/dev/null 2>&1 || etcd_allow_nons_rc=$?
+assert_eq "etcd: allowedClients entry without namespace fails fast" "1" "$([ "${etcd_allow_nons_rc}" -ne 0 ] && echo 1 || echo 0)"
 # fail-fast on contradictory etcd config (bundled deployed but unused)
 etcd_orphan_rc=0
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" --set 'etcd.enabled=true' >/dev/null 2>&1 || etcd_orphan_rc=$?

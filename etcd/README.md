@@ -1,11 +1,14 @@
-# etcd (bundled subchart)
+# etcd
 
 A minimal 3-node etcd cluster used as the leadership store (DCS) for the
 `pg`/`pgvector` charts' lease-based HA agent when `repmgr.agent.dcs.backend=etcd`.
 
-This is a **dependency-only subchart** — it is not published or installed on its
-own. It ships vendored inside the `pg` and `pgvector` chart packages (consumed via
-`file://../etcd`, condition `etcd.enabled`) and is enabled from the parent chart:
+It is used two ways:
+
+## 1. Bundled per release
+
+Ships vendored inside the `pg` and `pgvector` chart packages (consumed via
+`file://../etcd`, condition `etcd.enabled`) and enabled from the parent chart:
 
 ```yaml
 # in pg / pgvector values
@@ -18,8 +21,35 @@ etcd:
 ```
 
 The parent then points the agent at the bundled cluster's client Service
-(`<release>-etcd:2379`) automatically. For multiple databases, prefer one
-shared/BYO etcd (`repmgr.agent.dcs.etcd.endpoints`) over a bundle per release.
+(`<release>-etcd:2379`) automatically.
+
+## 2. Standalone / shared
+
+For several databases, prefer **one shared etcd** over a bundle per release. Install
+this chart on its own and point each `pg`/`pgvector` release at it (leave
+`etcd.enabled=false` on the parents):
+
+```bash
+helm repo add cagriekin-charts https://cagriekin.github.io/charts
+helm install platform-etcd cagriekin-charts/etcd -n platform \
+  --set 'networkPolicy.allowedClients[0].namespace=backend' \
+  --set 'networkPolicy.allowedClients[1].namespace=sentry'
+```
+
+```yaml
+# in each pg / pgvector release's values
+repmgr:
+  agent:
+    dcs:
+      backend: etcd
+      etcd:
+        endpoints: ["http://platform-etcd.platform.svc:2379"]
+```
+
+`networkPolicy.allowedClients` opens the client port (2379) to postgresql pods in the
+named namespaces — the supported alternative to hand-writing cross-namespace
+`extraIngress` selectors. `podSelector` is optional per entry and defaults to the
+agent's `app.kubernetes.io/component: postgresql` label.
 
 ## What it deploys
 
@@ -30,7 +60,8 @@ shared/BYO etcd (`repmgr.agent.dcs.etcd.endpoints`) over a bundle per release.
   readOnlyRootFilesystem; `fsGroup` makes the data PVC writable).
 - A default soft anti-co-location topology spread across nodes.
 - An ingress NetworkPolicy (default on): only the etcd peer mesh and the agent
-  (the parent's postgresql pods, same release) may reach the etcd ports.
+  (the parent's postgresql pods, same release, plus any `networkPolicy.allowedClients`
+  namespaces) may reach the etcd ports.
 
 ## Security
 
@@ -51,6 +82,7 @@ BYO/shared etcd with `repmgr.agent.dcs.etcd.tls` instead of this bundle.
 | `podDisruptionBudget.maxUnavailable` | PDB | `1` |
 | `topologySpreadConstraints` | override the default soft hostname spread | `[]` |
 | `networkPolicy.enabled` | ingress lockdown (needs a NP-enforcing CNI) | `true` |
+| `networkPolicy.allowedClients` | cross-namespace client allow-list for a shared etcd (`[{namespace, podSelector?}]`) | `[]` |
 | `networkPolicy.extraIngress` | extra client-port ingress (e.g. metrics scrape) | `[]` |
 
 See the pg chart README ("Leadership backend") for the full agent-mode behavior.

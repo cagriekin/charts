@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 1.1.2 - 2026-06-19
+
+Refreshes the bundled `etcd` subchart to 0.1.1. Chart-only; no image change
+(stays `trixie-5.5.0-20`) and no behavior change at defaults.
+
+### Added
+
+- **`etcd.networkPolicy.allowedClients` for the bundled etcd (#183).** Declarative
+  cross-namespace client allow-list (`[{namespace, podSelector?}]`) on the etcd
+  client port, replacing hand-written `extraIngress` selectors for a shared etcd.
+  Default `[]` (render byte-stable). The `etcd` chart is now also published
+  standalone (0.1.1) so several releases can share one etcd; see its README.
+
 ## 1.1.1 - 2026-06-19
 
 Security: bump the HA agent's vendored Go dependencies off two CVE-flagged

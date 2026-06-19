@@ -169,6 +169,7 @@ jobs:
             case "$chart_name" in
               pg|pgvector|redis) ns="data" ;;
               kafka) ns="messaging" ;;
+              etcd) ns="coordination" ;;
             esac
 
             cat >> "$workdir/index.html" <<CHART
