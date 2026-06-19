@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 1.1.3 - 2026-06-19
+
+Multi-pillar-review remediation of the 1.1.2 etcd changes. Refreshes the bundled
+`etcd` subchart to 0.1.2. Docs/test-quality only; no image change (stays
+`trixie-5.5.0-20`) and no rendered behavior change at defaults. See the pg
+CHANGELOG for the full list; pgvector shares pg's templates and the bundled etcd.
+
+### Fixed
+
+- Standalone-etcd guide endpoint corrected (Service is `<release>-etcd-etcd`;
+  install now sets `fullnameOverride`); stale etcd `image.tag` pin comment fixed.
+
+### Security
+
+- Hardened `etcd.networkPolicy.allowedClients` guidance (plaintext/no-auth etcd;
+  recommend an instance-pinned podSelector + client TLS, #184).
+
 ## 1.1.2 - 2026-06-19
 
 Refreshes the bundled `etcd` subchart to 0.1.1. Chart-only; no image change

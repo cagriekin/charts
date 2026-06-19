@@ -16,17 +16,17 @@ The charts in this repository are published as a Helm repository backed by GitHu
 - **Add the Helm repository**
 
 ```bash
-helm repo add cagriekin-charts https://cagriekin.github.io/charts
+helm repo add cagriekin https://cagriekin.github.io/charts
 helm repo update
 ```
 
 - **Install a chart from the remote repo**
 
 ```bash
-helm install my-pg cagriekin-charts/pg -n your-namespace
-helm install my-pgvector cagriekin-charts/pgvector -n your-namespace
-helm install my-kafka cagriekin-charts/kafka -n your-namespace
-helm install my-redis cagriekin-charts/redis -n your-namespace
+helm install my-pg cagriekin/pg -n your-namespace
+helm install my-pgvector cagriekin/pgvector -n your-namespace
+helm install my-kafka cagriekin/kafka -n your-namespace
+helm install my-redis cagriekin/redis -n your-namespace
 ```
 
 - **Develop or test charts locally**

@@ -1180,8 +1180,8 @@ Each chart is tagged `<chart>-<version>` (e.g. `pg-1.1.0`); `pg` and `pgvector` 
 
 | `pg` / `pgvector` | repmgr image | PostgreSQL | Kubernetes |
 |-------------------|--------------|-----------|-----------|
-| 1.1.1 *(current)* | `trixie-5.5.0-20` | 18.x | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
-| 1.0.0 – 1.1.0 | `trixie-5.5.0-16` … `-19` | 18.x | as above |
+| 1.1.3 *(current)* | `trixie-5.5.0-20` | 18.x | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.0.0 – 1.1.2 | `trixie-5.5.0-16` … `-20` | 18.x | as above |
 | 0.5.88 / 0.6.90 *(last 0.x)* | `trixie-5.5.0-15` | 18.x | ≥ 1.21 (PDB `policy/v1`) |
 
 Extras: agent monitoring (`repmgr.agent.monitoring.*`) needs the Prometheus Operator CRDs; the etcd backend (`repmgr.agent.dcs.backend: etcd`) needs an etcd ≥ 3.5 (BYO/shared) or the bundled etcd subchart (`etcd.enabled=true`).
@@ -1193,7 +1193,7 @@ helm repo update
 helm upgrade my-postgres cagriekin/pg   # add -f your-values.yaml
 ```
 
-Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.1.1`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-20` at 1.1.1) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
+Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.1.3`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-20` at 1.1.3) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
 
 ### Crossing the 0.x → 1.x boundary (agent mode is now the default)
 

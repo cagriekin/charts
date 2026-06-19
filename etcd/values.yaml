@@ -8,7 +8,10 @@ replicaCount: 3
 
 image:
   repository: quay.io/coreos/etcd
-  # Pin matches the agent's vendored client (go.etcd.io/etcd/client/v3 v3.5.16).
+  # etcd SERVER image. The agent's vendored CLIENT (go.etcd.io/etcd/client/v3) is
+  # v3.5.31; 3.5.x client/server are wire-compatible, so the server is held here at
+  # v3.5.16 (bump deliberately, with a live etcd-mode test, rather than tracking the
+  # client). Keep the digest below in sync with the tag.
   tag: v3.5.16
   # Digest pin (multi-arch manifest list) takes precedence over the tag, so a
   # mutable-tag repush cannot change the bundled etcd. Refresh with:
@@ -74,6 +77,13 @@ networkPolicy:
   #     - namespace: backend
   #     - namespace: sentry
   #       podSelector: { app.kubernetes.io/component: postgresql }
+  # SECURITY: this etcd is PLAINTEXT with no client auth, so the NetworkPolicy is the
+  # ONLY access control over the leadership keyspace. The default podSelector matches
+  # ANY pod carrying app.kubernetes.io/component=postgresql in the listed namespace
+  # (a label other PostgreSQL charts also set) -- so a foreign or attacker-deployed pod
+  # in that namespace can reach it. For a shared etcd, set an explicit podSelector that
+  # also pins app.kubernetes.io/instance (per consuming release), and prefer client
+  # TLS/auth (tracked in #184) over relying on the NetworkPolicy alone.
   allowedClients: []
   # Extra ingress rules to the client port (e.g. a Prometheus scrape of etcd
   # metrics, or an external etcdctl). Standard NetworkPolicy ingress entries.

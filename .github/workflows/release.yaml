@@ -165,6 +165,9 @@ jobs:
             chart_name=$(grep '^name:' "$chart_yaml" | awk '{print $2}')
             chart_version=$(grep '^version:' "$chart_yaml" | awk '{print $2}')
             chart_desc=$(grep '^description:' "$chart_yaml" | sed 's/^description:[[:space:]]*//')
+            chart_type=$(grep '^type:' "$chart_yaml" | awk '{print $2}')
+            # library charts (e.g. common) are dependency-only -- not installable.
+            if [ "$chart_type" = "library" ]; then continue; fi
             ns="default"
             case "$chart_name" in
               pg|pgvector|redis) ns="data" ;;
