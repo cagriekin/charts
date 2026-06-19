@@ -2,19 +2,12 @@
 
 ## Unreleased
 
-### Fixed
-
-- **Monitoring user (#28) multi-target `/probe` scrape returned `pg_up=0` on every
-  target.** The exporter `auth_modules` probe DSN had no database, so libpq used the
-  username `monitoring` as the dbname (`database "monitoring" does not exist`). The
-  probe now pins `dbname` to the configured database. Shared fix with the pg chart
-  (templates are symlinked); see the pg CHANGELOG for detail.
-
 ## 1.1.4 - 2026-06-19
 
-Bundled-etcd security (#184). Bundles `etcd` 0.1.3; image moves to
-`trixie-5.5.0-21` (adds the `pg-ha-agent rbac-bootstrap` subcommand). No rendered
-behavior change at defaults. See the pg CHANGELOG for detail; pgvector shares pg's
+Bundled-etcd security (#184) and a monitoring-exporter `/probe` fix (#185). Bundles
+`etcd` 0.1.3; image moves to `trixie-5.5.0-21` (adds the `pg-ha-agent rbac-bootstrap`
+subcommand). The exporter ConfigMap changes when `prometheusExporter.monitoringUser`
+is enabled (the default). See the pg CHANGELOG for detail; pgvector shares pg's
 templates and the bundled etcd.
 
 ### Added
@@ -24,6 +17,14 @@ templates and the bundled etcd.
   `pg-ha-agent rbac-bootstrap`) granting each tenant readwrite only on its key prefix.
   Flag-gated (default off, render byte-stable); a consuming release's agent
   authenticates by client-cert CN with no change.
+
+### Fixed
+
+- **Monitoring user (#28) multi-target `/probe` scrape returned `pg_up=0` on every
+  target.** The exporter `auth_modules` probe DSN had no database, so libpq used the
+  username `monitoring` as the dbname (`database "monitoring" does not exist`). The
+  probe now pins `dbname` to the configured database. Shared fix with the pg chart
+  (templates are symlinked); see the pg CHANGELOG for detail.
 
 ## 1.1.3 - 2026-06-19
 
