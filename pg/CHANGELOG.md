@@ -56,6 +56,14 @@ cleanup described below.
   refuses primary rows) rather than dropped. Covered by a new live `test-scaledown`
   suite (wired into CI). The manual `repmgr standby unregister` step previously
   documented for the 1.1.0 README is no longer required.
+- **The repmgr image's two shell scripts now share the timeline helpers (#177).**
+  `entrypoint.sh` and `init-repmgr.sh` had each carried their own copy of the timeline
+  decode and reads; they now source a single `repmgr-common.sh` (`tl_to_int` + the
+  WAL-insert and offline control-file reads), so a fix to the hex decode can't land in
+  only some copies. `init-repmgr.sh` keeps its intentionally **symmetric** control-file
+  timeline comparison (both the local node and the primary are read the same way), which
+  avoids needlessly re-cloning a standby that has followed a new timeline by streaming
+  but not yet checkpointed it.
 
 ## 1.1.4 - 2026-06-19
 

@@ -39,6 +39,11 @@ detail.
   service-updater). Keyed on the ordinal, never reachability, so a momentarily-down
   live node is never touched. The manual `repmgr standby unregister` cleanup is no
   longer required.
+- **Image shell scripts share the timeline helpers (#177):** `entrypoint.sh` and
+  `init-repmgr.sh` now source a single `repmgr-common.sh` (`tl_to_int` + the timeline
+  reads), so a fix can't land in only some copies. `init-repmgr.sh` keeps its symmetric
+  control-file timeline comparison, avoiding a needless re-clone of a streaming-caught-up
+  standby.
 
 ## 1.1.4 - 2026-06-19
 

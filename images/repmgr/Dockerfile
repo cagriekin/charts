@@ -67,6 +67,9 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY init-repmgr.sh /usr/local/bin/init-repmgr.sh
 COPY service-updater.sh /usr/local/bin/service-updater.sh
 COPY repmgrd-entrypoint.sh /usr/local/bin/repmgrd-entrypoint.sh
+# Sourced (not executed) by entrypoint.sh + init-repmgr.sh -- shared timeline/topology
+# helpers, single definition for the image's shell scripts (#177). No +x needed.
+COPY repmgr-common.sh /usr/local/bin/repmgr-common.sh
 
 # Make scripts executable
 RUN chmod +x /usr/local/bin/entrypoint.sh \

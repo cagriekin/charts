@@ -8,16 +8,25 @@ ok()   { echo "PASS: $1"; }
 bad()  { echo "FAIL: $1"; fail=1; }
 
 # --- syntax check every shipped script ---
-for s in entrypoint.sh init-repmgr.sh repmgrd-entrypoint.sh service-updater.sh; do
+for s in entrypoint.sh init-repmgr.sh repmgrd-entrypoint.sh service-updater.sh repmgr-common.sh; do
   if bash -n "${ROOT}/${s}" 2>/dev/null; then ok "bash -n ${s}"; else bad "bash -n ${s}"; fi
+done
+
+# --- #177: entrypoint + init-repmgr source the shared helper (one definition) ---
+for s in entrypoint.sh init-repmgr.sh; do
+  if grep -q "source /usr/local/bin/repmgr-common.sh" "${ROOT}/${s}"; then
+    ok "#177: ${s} sources repmgr-common.sh"
+  else
+    bad "#177: ${s} does not source repmgr-common.sh"
+  fi
 done
 
 # --- tl_to_int: WAL-filename timeline is HEX, must NOT be parsed as decimal ---
 # Guards the #168 regression (a SQL ::int cast errored at TL 0x0A and was wrong
-# from 0x10). Extract the shipped function and exercise the boundary cases.
-sed -n '/^tl_to_int() {/,/^}/p' "${ROOT}/entrypoint.sh" > /tmp/.tl_fn.sh
-if [ ! -s /tmp/.tl_fn.sh ]; then bad "extract tl_to_int from entrypoint.sh"; else
-  ok "extract tl_to_int from entrypoint.sh"
+# from 0x10). The function now lives in the shared lib (#177); exercise it there.
+sed -n '/^tl_to_int() {/,/^}/p' "${ROOT}/repmgr-common.sh" > /tmp/.tl_fn.sh
+if [ ! -s /tmp/.tl_fn.sh ]; then bad "extract tl_to_int from repmgr-common.sh"; else
+  ok "extract tl_to_int from repmgr-common.sh"
   # shellcheck disable=SC1091
   source /tmp/.tl_fn.sh
   check() { # check INPUT EXPECTED
@@ -35,11 +44,29 @@ if [ ! -s /tmp/.tl_fn.sh ]; then bad "extract tl_to_int from entrypoint.sh"; els
 fi
 rm -f /tmp/.tl_fn.sh
 
-# --- entrypoint must not reintroduce the ::int-on-hex parse ---
-if grep -q "from 1 for 8)::int" "${ROOT}/entrypoint.sh"; then
-  bad "entrypoint.sh has no ::int-on-hex timeline cast"
+# --- the shared timeline read must not reintroduce the ::int-on-hex parse ---
+# The WAL-insert timeline read lives in repmgr-common.sh now (#177); guard it there.
+if grep -q "from 1 for 8)::int" "${ROOT}/repmgr-common.sh"; then
+  bad "repmgr-common.sh has no ::int-on-hex timeline cast"
 else
-  ok "entrypoint.sh has no ::int-on-hex timeline cast"
+  ok "repmgr-common.sh has no ::int-on-hex timeline cast"
+fi
+
+# --- #177: init-repmgr reads its LOCAL timeline via the shared helper (de-dup), and
+# keeps a SYMMETRIC control-file comparison for the primary. The two sides MUST be read
+# the same way: an immediate WAL-insert primary read against the offline control-file
+# local read would wipe a standby that has followed a new timeline by streaming but not
+# yet checkpointed it (both read the pre-checkpoint timeline and match). So init must use
+# the shared local helper AND still query pg_control_checkpoint for the primary. ---
+if grep -q "local_node_timeline_int" "${ROOT}/init-repmgr.sh"; then
+  ok "#177: init-repmgr.sh reads its local timeline via the shared helper"
+else
+  bad "#177: init-repmgr.sh does not use the shared local timeline helper"
+fi
+if grep -q "FROM pg_control_checkpoint" "${ROOT}/init-repmgr.sh"; then
+  ok "#177: init-repmgr.sh keeps the symmetric control-file primary read (no asymmetric re-clone)"
+else
+  bad "#177: init-repmgr.sh primary read is not the symmetric control-file read (asymmetry risks spurious re-clone)"
 fi
 
 # --- managed users (postgres, repmgr) must be created with a SCRAM secret ---
