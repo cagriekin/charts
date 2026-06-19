@@ -68,4 +68,8 @@ type Mechanism interface {
 	// Lease-derived role.
 	RegisterPrimary(ctx context.Context) error
 	RegisterStandby(ctx context.Context, upstreamNodeID int) error
+	// Unregister removes a node's repmgr.nodes record (repmgr standby unregister
+	// --node-id), to clean up the ghost rows a replicaCount scale-down leaves
+	// behind (#139). Run on the primary for nodes the StatefulSet no longer hosts.
+	Unregister(ctx context.Context, nodeID int) error
 }

@@ -164,6 +164,19 @@ func (r *Repmgr) RegisterStandby(ctx context.Context, upstreamNodeID int) error 
 	return nil
 }
 
+// Unregister removes node nodeID's record from repmgr.nodes (#139). repmgr standby
+// unregister --node-id can be run from any node (here, the primary) to delete a
+// record whose pod the StatefulSet no longer runs after a scale-down, so repmgrd
+// and `repmgr cluster show` stop treating it as a permanently-failed member. The
+// caller lists the live records first, so this targets only genuine ghosts; a row
+// that vanished in between surfaces as an error the best-effort caller retries.
+func (r *Repmgr) Unregister(ctx context.Context, nodeID int) error {
+	if out, err := r.run(ctx, "standby", "unregister", "--node-id="+strconv.Itoa(nodeID)); err != nil {
+		return fmt.Errorf("repmgr standby unregister %d: %w: %s", nodeID, err, strings.TrimSpace(out))
+	}
+	return nil
+}
+
 // GenerateConfig writes repmgr.conf (mode 0600 — it carries the conninfo password,
 // security review H1). Idempotent: it always rewrites the file from the inputs.
 func (r *Repmgr) GenerateConfig(ctx context.Context, n NodeIdentity, o ConfigOpts) error {

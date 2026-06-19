@@ -4,7 +4,7 @@ TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-repmgr test-repmgr-chaos test-full test-failover test-upgrade \
-        test-repmgr-failover test-agent test-agent-etcd test-agent-etcd-tls test-migrate-agent test-config test-config-repmgr test-backup-restore test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
+        test-repmgr-failover test-agent test-agent-etcd test-agent-etcd-tls test-migrate-agent test-scaledown test-config test-config-repmgr test-backup-restore test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -43,7 +43,7 @@ byte-stable:
 # Run independent suites in parallel with -j
 # test-repmgr-failover is sequential (repmgr then failover)
 # test-minimal, test-repmgr-failover, test-full, test-upgrade run in parallel
-test-cluster: test-minimal test-repmgr-failover test-agent test-repmgr-chaos test-full test-upgrade test-config test-config-repmgr test-backup-restore test-special-chars
+test-cluster: test-minimal test-repmgr-failover test-agent test-repmgr-chaos test-full test-upgrade test-scaledown test-config test-config-repmgr test-backup-restore test-special-chars
 	@echo "All test suites passed"
 
 # Chain: repmgr install -> failover test (must be sequential)
@@ -70,6 +70,11 @@ test-agent-etcd-tls: cluster-exists
 # (installs repmgrd, then rolls to agent), so not in test-cluster; run explicitly.
 test-migrate-agent: cluster-exists
 	@bash $(TESTS_DIR)/test-migrate-agent.sh
+
+# Scale replicaCount down and assert the primary unregisters the ghost repmgr.nodes
+# record (#139). Uses repmgrd mode for a deterministic standby ghost.
+test-scaledown: cluster-exists
+	@bash $(TESTS_DIR)/test-scaledown.sh
 
 cluster-exists:
 	@kind get clusters 2>/dev/null | grep -q "^$(CLUSTER_NAME)$$" || (echo "Cluster '$(CLUSTER_NAME)' not found. Run: make cluster-create" && exit 1)

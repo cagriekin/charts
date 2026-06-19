@@ -477,18 +477,14 @@ kubectl exec -it my-pgvector-0 -- repmgr -f /etc/repmgr/repmgr.conf cluster show
 
 ### Scaling down
 
-Scaling `postgresql.replicaCount` **down** removes the highest-ordinal pods but does
-**not** unregister them from `repmgr.nodes`, so they linger as `active` ghosts (`repmgr
-cluster show` shows them failed; in repmgrd mode survivors keep retrying the gone DNS
-names, adding failover-election delay) — a known gap (#139). After scaling down,
-manually unregister each removed ordinal from the current primary (node id =
-`ordinal + 1000`):
-
-```bash
-# for each removed ordinal N (>= the new replicaCount):
-kubectl exec -it my-pgvector-0 -- \
-  repmgr -f /etc/repmgr/repmgr.conf standby unregister --node-id=$((N + 1000))
-```
+Scaling `postgresql.replicaCount` **down** removes the highest-ordinal pods. The primary
+now **automatically unregisters** the removed nodes from `repmgr.nodes` (#139), so
+`repmgr cluster show` no longer lists them as failed and failover elections do not retry
+the gone DNS names. Reconciliation is keyed on the ordinal (node id = `ordinal + 1000`),
+never on reachability, so a momentarily-down live node is never unregistered; cleanup
+completes within ~a minute of the rolled pods settling. If the removed node was the
+*current primary*, unregister it by hand (`repmgr standby unregister` refuses primary
+rows). See the [pg chart README — Scaling down](../pg/README.md#scaling-down) for detail.
 
 ## PGPool-II Connection Pooling and Load Balancing
 

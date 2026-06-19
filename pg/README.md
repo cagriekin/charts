@@ -216,7 +216,7 @@ When repmgr is enabled, a preStop lifecycle hook stops PostgreSQL cleanly (`pg_c
 
 When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 
-- **repmgrd**: monitors replication and triggers automatic failover when the primary becomes unavailable. Has a preStop hook that runs `repmgr daemon stop` so the shutting-down node's daemon does not trigger a spurious failover during pod termination. (This stops the daemon only — it does **not** unregister the node from `repmgr.nodes`; see [Scaling down](#scaling-down) for the ghost-node cleanup.)
+- **repmgrd**: monitors replication and triggers automatic failover when the primary becomes unavailable. Has a preStop hook that runs `repmgr daemon stop` so the shutting-down node's daemon does not trigger a spurious failover during pod termination. (This stops the daemon only; the master's service-updater handles unregistering nodes that a scale-down removed — see [Scaling down](#scaling-down).)
 - **service-updater**: watches repmgr cluster state and patches the Kubernetes Service selector to point to the current primary, then restarts PGPool-II if enabled. Also maintains a `pg-role` label (`primary`/`standby`) on every postgresql pod each cycle, which the `<fullname>-readonly` service selects (`pg-role: standby`) to route read traffic to replicas; pods without the label (fresh, recreated or scaled-up) are excluded until labeled. Has a preStop hook that sleeps 5s to allow in-flight patches to complete. Includes a liveness probe that checks for a heartbeat file updated each loop iteration (fails if no update within 120s). Performs split-brain detection each cycle by querying all nodes for `pg_is_in_recovery()` -- if multiple primaries are found, takes the configured action (`log` or `fence`).
 
 **Split-brain detection**: In a 2-node cluster, network partitions can cause both nodes to believe they are the primary. The service-updater detects this by checking all nodes each monitoring cycle. With `action: log` (default), it logs a critical warning. With `action: fence`, it compares WAL LSN positions and terminates connections on the stale primary. For production deployments, use 3+ nodes to reduce split-brain risk.
@@ -545,20 +545,24 @@ kubectl exec -it my-postgres-pg-0 -- repmgr -f /etc/repmgr/repmgr.conf cluster s
 
 ### Scaling down
 
-Scaling `postgresql.replicaCount` **down** removes the highest-ordinal pods and their
-PVCs, but the chart does **not** automatically unregister those nodes from
-`repmgr.nodes`. The removed nodes linger as `active`, so `repmgr cluster show` reports
-them as permanently failed and, in repmgrd mode, the surviving nodes keep retrying the
-(now-gone) DNS names — adding connection-timeout delay to failover elections. This is a
-known gap (#139); after scaling down, manually unregister each removed ordinal from the
-current primary (node id = `ordinal + 1000`, e.g. ordinal 2 → node id `1002`):
+Scaling `postgresql.replicaCount` **down** removes the highest-ordinal pods. The
+primary now **automatically unregisters** the removed nodes from `repmgr.nodes` (#139),
+so `repmgr cluster show` no longer reports them as permanently failed and failover
+elections do not retry the gone DNS names. The primary reconciles `repmgr.nodes` against
+the live ordinal range on each tick (agent mode: the lease-holding primary; repmgrd
+mode: the master's service-updater), keyed on the ordinal (node id = `ordinal + 1000`),
+never on reachability — so a momentarily-down *live* node is never unregistered. Cleanup
+typically completes within a minute of the rolled pods settling; verify with:
 
 ```bash
-# for each removed ordinal N (>= the new replicaCount):
-kubectl exec -it my-postgres-pg-0 -- \
-  repmgr -f /etc/repmgr/repmgr.conf standby unregister --node-id=$((N + 1000))
 kubectl exec -it my-postgres-pg-0 -- repmgr -f /etc/repmgr/repmgr.conf cluster show
 ```
+
+> The removed pods' PVCs are retained (StatefulSet does not delete them); reclaim them
+> manually if desired. If the node being removed is the *current primary* (possible when
+> a prior failover left the primary on a high ordinal), `repmgr standby unregister`
+> refuses to drop a primary row — unregister it by hand after the cluster settles:
+> `kubectl exec -it my-postgres-pg-0 -- repmgr -f /etc/repmgr/repmgr.conf standby unregister --node-id=$((N + 1000))`.
 
 ## PGPool-II Connection Pooling and Load Balancing
 

@@ -191,6 +191,16 @@ jobs:
           kubectl delete namespace pg-test-migrate --ignore-not-found --wait=true --timeout=180s \
             || echo "WARNING: namespace cleanup timed out, continuing"
 
+      # Scale replicaCount down and assert the primary unregisters the ghost
+      # repmgr.nodes record left behind (#139).
+      - name: Run scale-down ghost-node cleanup test
+        run: make -C pg test-scaledown
+
+      - name: Clean up scale-down namespace
+        run: |
+          kubectl delete namespace pg-test-scaledown --ignore-not-found --wait=true --timeout=180s \
+            || echo "WARNING: namespace cleanup timed out, continuing"
+
       # Backup + restore (pg_dump path): stands up MinIO, runs a full backup/restore
       # cycle, drives the restore-validation Job (#31), and exercises the dedicated
       # backup ServiceAccount (#27) and the read-only-rootfs backup/validation

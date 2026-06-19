@@ -655,12 +655,23 @@ assert_contains "repmgr: service-updater has allowPrivilegeEscalation false" "${
 # into this container (it stays on the repmgr-init/postgresql/repmgrd containers,
 # which the image scripts do consume).
 assert_not_contains "repmgr #177: service-updater drops the dead REPMGR_NODE_COUNT env" "${service_updater_section}" "REPMGR_NODE_COUNT"
+# #139: the service-updater mounts repmgr.conf so the master can run
+# `repmgr standby unregister` to clean up ghost repmgr.nodes rows after a scale-down.
+assert_contains "repmgr #139: service-updater mounts repmgr-config (/etc/repmgr)" "${service_updater_section}" "mountPath: /etc/repmgr"
 
 # Test: service-updater configmap writes heartbeat file
 assert_contains "repmgr: service-updater script writes heartbeat" "${repmgr_no_addcmd}" "service-updater-alive"
 
 # Test: split-brain handling present in service-updater configmap
 assert_contains "repmgr: split-brain handling in service-updater" "${repmgr}" "handle_split_brain"
+
+# #139: the configmap cleans up ghost repmgr.nodes rows on the primary after a
+# scale-down via `repmgr standby unregister`.
+assert_contains "repmgr #139: service-updater has ghost-node cleanup" "${repmgr}" "cleanup_ghost_nodes"
+assert_contains "repmgr #139: ghost cleanup uses repmgr standby unregister" "${repmgr}" "standby unregister --node-id"
+# Only standby rows are cleanup candidates -- a primary-type ghost can't be removed by
+# `standby unregister`, so excluding it avoids a forever-retried, forever-warned unregister.
+assert_contains "repmgr #139: ghost cleanup lists only standby rows" "${repmgr}" "FROM repmgr.nodes WHERE type = 'standby'"
 
 # Test: SPLIT_BRAIN_ACTION env var in statefulset
 assert_contains "repmgr: SPLIT_BRAIN_ACTION env var in statefulset" "${repmgr_no_addcmd}" "SPLIT_BRAIN_ACTION"

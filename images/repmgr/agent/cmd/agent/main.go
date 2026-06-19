@@ -531,6 +531,11 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if err := a.mech.RegisterPrimary(wctx); err != nil {
 			a.log.Warn("register primary in repmgr.nodes", "err", err)
 		}
+		// Drop repmgr.nodes records for pods a scale-down removed (#139). Bounded by
+		// the same fence-budget context as the register above: a hung psql/unregister
+		// must not hold opMu past the soft-fence window. Best-effort -- it resumes next
+		// tick if cut short, and only ever targets ordinals above the live range.
+		a.cleanupGhostNodes(wctx)
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
@@ -914,6 +919,32 @@ func (a *agent) peerMechConn(name string) mechanism.Conn {
 
 func (a *agent) fqdn(name string) string { return name + "." + a.cfg.HeadlessService }
 
+// cleanupGhostNodes unregisters repmgr.nodes records for pods the StatefulSet no
+// longer runs (ordinal >= NodeCount), left behind by a replicaCount scale-down
+// (#139). Primary-only -- the agent calls it while holding the lease as primary, the
+// single owner of repmgr.nodes, so there is no cross-node race. Best-effort and
+// idempotent: it lists the STANDBY node_ids and unregisters only those above the live
+// ordinal range, so a momentarily-unreachable live node is never touched and a row
+// already gone just yields a warning the next tick retries. It lists only standby rows
+// (StandbyNodeIDs) so a scaled-down ex-primary -- which `repmgr standby unregister`
+// cannot remove -- is left for an operator rather than re-attempted (and re-warned)
+// every tick. A non-positive NodeCount is a no-op via ghostNodeIDs, so this can never
+// unregister a live node.
+func (a *agent) cleanupGhostNodes(ctx context.Context) {
+	ids, err := a.prober.StandbyNodeIDs(ctx, a.selfConn())
+	if err != nil {
+		a.log.Warn("list repmgr.nodes for ghost cleanup", "err", err)
+		return
+	}
+	for _, id := range ghostNodeIDs(ids, a.cfg.NodeCount) {
+		if err := a.mech.Unregister(ctx, id); err != nil {
+			a.log.Warn("unregister ghost repmgr node", "node_id", id, "err", err)
+			continue
+		}
+		a.log.Info("unregistered ghost repmgr node left by a scale-down", "node_id", id)
+	}
+}
+
 // streamingFromTarget reports whether local Postgres is already actively streaming
 // from target's FQDN (#182). Both the standby's primary_conninfo and a.fqdn derive
 // the upstream host from the same registered conninfo, so sender_host equals
@@ -983,12 +1014,37 @@ func baseName(pod string) string {
 	return pod
 }
 
-// nodeID maps a pod name to its repmgr node_id (ordinal + 1000), matching init-repmgr.sh.
+// nodeIDBase is the repmgr node_id of ordinal 0 (node_id = nodeIDBase + ordinal),
+// matching init-repmgr.sh and nodeID().
+const nodeIDBase = 1000
+
+// nodeID maps a pod name to its repmgr node_id (ordinal + nodeIDBase), matching init-repmgr.sh.
 func nodeID(pod string) int {
 	if i := strings.LastIndex(pod, "-"); i >= 0 {
 		if n, err := strconv.Atoi(pod[i+1:]); err == nil {
-			return n + 1000
+			return n + nodeIDBase
 		}
 	}
 	return 0
+}
+
+// ghostNodeIDs returns the registered node_ids whose pods the StatefulSet no longer
+// runs -- ordinal (node_id - nodeIDBase) >= nodeCount, since the live set is ordinals
+// 0..nodeCount-1. These are the rows a replicaCount scale-down strands in repmgr.nodes
+// (#139). The discriminator is purely structural (the StatefulSet always trims from the
+// top ordinal), never reachability, so a live-but-momentarily-unreachable node is never
+// flagged. Returns nil when nodeCount is not positive -- a misconfigured/zero count must
+// never make every node look like a ghost -- and ignores ids below the base (an unknown
+// numbering scheme this agent did not assign).
+func ghostNodeIDs(ids []int, nodeCount int) []int {
+	if nodeCount <= 0 {
+		return nil
+	}
+	var ghosts []int
+	for _, id := range ids {
+		if ord := id - nodeIDBase; ord >= nodeCount {
+			ghosts = append(ghosts, id)
+		}
+	}
+	return ghosts
 }
