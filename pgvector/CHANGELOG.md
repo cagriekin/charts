@@ -15,6 +15,23 @@ CHANGELOG for detail; pgvector shares pg's templates.
   probe now pins `dbname` to the configured database. Shared fix with the pg chart
   (templates are symlinked); see the pg CHANGELOG for detail.
 
+## 1.1.5 - 2026-06-19
+
+Restores efficient stale-primary recovery (#178). Image moves to
+`trixie-5.5.0-22`; bundles `etcd` 0.1.4 (bootstrap-image tag lockstep only). No
+rendered behavior change at defaults. pgvector shares pg's templates and image; see
+the pg CHANGELOG for detail.
+
+### Fixed
+
+- **Stale-primary recovery now rewinds with `pg_rewind` instead of always falling
+  back to a full re-clone (#178):** the container-restart guard's `repmgr node
+  rejoin --force-rewind` now supplies the repmgr password via `PGPASSWORD` so
+  repmgr can open the replication connection the rewind needs, instead of an inline
+  conninfo password that did not reach it. Data safety is unchanged (the re-clone
+  fallback remains); this restores the efficient O(diverged-WAL) path over an
+  O(database-size) base backup on large databases.
+
 ## 1.1.4 - 2026-06-19
 
 Bundled-etcd security (#184). Bundles `etcd` 0.1.3; image moves to

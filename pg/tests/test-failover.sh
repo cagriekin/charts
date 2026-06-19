@@ -187,32 +187,35 @@ if [[ "${failover_done}" == "true" ]]; then
     done
     assert_eq "stale primary rewinds and rejoins as standby (#123 guard)" "true" "${rejoined}"
 
-    # #176/#123: pg_is_in_recovery=t alone cannot distinguish how the stale node
-    # rejoined. Read the guard log to classify the path. Both the pg_rewind
-    # rejoin and the re-clone fallback are data-safe (reclone_preserving_old
-    # moves the stale node's divergent data aside, #175), so assert a RECOGNIZED
-    # safe path ran -- catching a guard-logic regression that does neither --
-    # rather than mandating rewind. The efficient rewind path not engaging is
-    # tracked separately (#178). Soft on log availability: an inconclusive log
-    # skips (never a false failure).
+    # #178/#176/#123: pg_is_in_recovery=t alone cannot distinguish how the stale
+    # node rejoined. Read the guard log to classify the path. The efficient
+    # pg_rewind path MUST engage (#178): the guard supplies the repmgr password via
+    # PGPASSWORD so repmgr can open the replication connection the rewind needs. The
+    # re-clone fallback is still data-safe (reclone_preserving_old moves the stale
+    # node's divergent data aside, #175), but taking it here means the rewind path
+    # regressed -- so assert rewind, not merely "some data-safe path". Soft only on
+    # log availability: an inconclusive log skips (never a false failure).
     if [[ "${rejoined}" == "true" ]]; then
       guard_log=$(kubectl logs "${POD_PRIMARY}" -c postgresql -n "${NAMESPACE}" 2>/dev/null || echo "")
-      if echo "${guard_log}" | grep -q "rejoin complete; starting as standby"; then
-        rejoin_method="rewind"
-      elif echo "${guard_log}" | grep -q "falling back to full re-clone"; then
-        rejoin_method="reclone-fallback"
-        echo "  NOTE (#178): #123 guard rejoined via the re-clone fallback, not pg_rewind; data preserved via reclone_preserving_old, but the efficient rewind path did not engage"
+      # The guard always emits exactly one of these two markers before postgres
+      # takes over, so we can only fail to classify when the log itself is
+      # unavailable (kubectl logs failed / rotated). Skip ONLY in that case; a
+      # NON-empty log that matches neither marker is itself anomalous and must fail
+      # -- otherwise the inconclusive path silently bypasses the #178 rewind assert
+      # and reports green, the exact failure shape #178 is about.
+      if [[ -z "${guard_log}" ]]; then
+        skip "stale primary rewind-rejoins via pg_rewind, not the re-clone fallback (#178) (guard log unavailable)"
       else
-        rejoin_method="inconclusive"
-      fi
-      case "${rejoin_method}" in
-        rewind|reclone-fallback) rejoin_safe=yes ;;
-        *)                       rejoin_safe=no ;;
-      esac
-      if [[ "${rejoin_method}" == "inconclusive" ]]; then
-        skip "stale primary rejoined via a recognized data-safe path (#176/#123) (guard log inconclusive)"
-      else
-        assert_eq "stale primary rejoined via a recognized data-safe path: rewind or preserving re-clone (#176/#123)" "yes" "${rejoin_safe}"
+        if echo "${guard_log}" | grep -q "rejoin complete; starting as standby"; then
+          rejoin_method="rewind"
+        elif echo "${guard_log}" | grep -q "falling back to full re-clone"; then
+          rejoin_method="reclone-fallback"
+          echo "  #178 regression: #123 guard fell back to a full re-clone instead of pg_rewind (data is still safe via reclone_preserving_old, but the efficient rewind path did not engage)"
+        else
+          rejoin_method="unclassified"
+          echo "  #178: guard log present but matched neither the rewind nor the re-clone marker (the guard always emits one); treating as a failure"
+        fi
+        assert_eq "stale primary rewind-rejoins via pg_rewind, not the re-clone fallback (#178)" "rewind" "${rejoin_method}"
       fi
     fi
   else

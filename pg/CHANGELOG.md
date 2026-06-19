@@ -20,6 +20,27 @@ A monitoring-exporter `/probe` fix (#185). Chart-only; no image change (stays
   `POSTGRES_DATABASE`, the same source as `DATA_SOURCE_NAME` and the only database
   the monitoring role is granted `CONNECT` on).
 
+## 1.1.5 - 2026-06-19
+
+Restores efficient stale-primary recovery (#178). Image moves to
+`trixie-5.5.0-22`; bundles `etcd` 0.1.4 (bootstrap-image tag lockstep only). No
+rendered behavior change at defaults.
+
+### Fixed
+
+- **Stale-primary recovery now rewinds with `pg_rewind` instead of always falling
+  back to a full re-clone (#178).** The container-restart guard ran `repmgr node
+  rejoin --force-rewind` with the repmgr password inlined in the `-d` connection
+  string, but repmgr opens a *separate* replication connection to the rejoin target
+  for the rewind and the inline password did not carry into it — so the rewind
+  failed with "unable to establish a replication connection to the rejoin target
+  node" and every stale-primary rejoin did an O(database-size) base backup. The
+  guard now passes the credential via `PGPASSWORD` (as the clone path already did),
+  so a diverged ex-primary rewinds forward onto the surviving primary's timeline.
+  Data safety is unchanged (the re-clone fallback remains for genuine rewind
+  failures); this only restores the efficient path on large databases. The live
+  failover suite now asserts the rewind path engages.
+
 ## 1.1.4 - 2026-06-19
 
 Bundled-etcd security (#184). Bundles `etcd` 0.1.3; image moves to

@@ -166,12 +166,20 @@ primary_safety_guard() {
 
     if [ "$NEWEST_TLI" -gt "$local_tli" ]; then
         echo "stale-primary guard: ${NEWEST_PEER} is primary on timeline ${NEWEST_TLI}, local timeline is ${local_tli}; rejoining as standby" >&2
-        local conninfo="host=${NEWEST_PEER} port=5432 user=${ru} password=${REPMGR_PASSWORD} dbname=${rd} connect_timeout=10"
+        local conninfo="host=${NEWEST_PEER} port=5432 user=${ru} dbname=${rd} connect_timeout=10"
         # node rejoin needs a dormant node and rewinds via pg_rewind (PG18
         # initdb enables data checksums, so pg_rewind is available). It starts
         # the node to verify it attaches; stop it afterward so the postmaster
         # can run as the container's main process via the exec below.
-        if repmgr -f /etc/repmgr/repmgr.conf node rejoin -d "$conninfo" --force-rewind --config-files=postgresql.conf,pg_hba.conf; then
+        #
+        # repmgr opens a SEPARATE replication connection to the rejoin target for
+        # the rewind; a password inlined in the -d conninfo does not carry into it,
+        # so the rewind fails with "unable to establish a replication connection to
+        # the rejoin target node" and the guard always fell back to a full re-clone
+        # (#178). Supply the credential via PGPASSWORD (libpq uses it for every
+        # connection, including the replication one and pg_rewind's source-server),
+        # exactly as the clone path above does -- and keep the secret out of argv.
+        if PGPASSWORD="$REPMGR_PASSWORD" repmgr -f /etc/repmgr/repmgr.conf node rejoin -d "$conninfo" --force-rewind --config-files=postgresql.conf,pg_hba.conf; then
             pg_ctl -D "$PGDATA" -m fast -w stop >/dev/null 2>&1 || true
             echo "stale-primary guard: rejoin complete; starting as standby" >&2
         else

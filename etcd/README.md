@@ -164,7 +164,7 @@ matching `prefix`.
 | `rbac.enabled` | per-tenant key-prefix isolation (needs `tls.enabled` + `clientCertAuth`) | `false` |
 | `rbac.adminSecret` | admin client cert Secret (CN must be `root`) | `""` |
 | `rbac.tenants` | per-tenant grants (`[{commonName, prefix}]`) | `[]` |
-| `rbac.bootstrapImage` | image running `pg-ha-agent rbac-bootstrap` (etcd image has no shell) | `cagriekin/repmgr:trixie-5.5.0-21` |
+| `rbac.bootstrapImage` | image running `pg-ha-agent rbac-bootstrap` (etcd image has no shell) | `cagriekin/repmgr:trixie-5.5.0-22` |
 | `rbac.resources` | bootstrap Job container resources | small requests/limits |
 | `networkPolicy.enabled` | ingress lockdown (needs a NP-enforcing CNI) | `true` |
 | `networkPolicy.allowedClients` | cross-namespace client allow-list for a shared etcd (`[{namespace, podSelector?}]`) | `[]` |
