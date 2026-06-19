@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 1.1.1 - 2026-06-19
+
+Security: bump the HA agent's vendored Go dependencies off two CVE-flagged
+versions. Image moves to `trixie-5.5.0-20`. No chart-template or values changes
+beyond the image tag; a `helm upgrade` rolls the pods once. (Shares pg's agent and
+image; see the pg CHANGELOG for the dependency-level detail.)
+
+### Security
+
+- **Bumped `google.golang.org/grpc` 1.59.0 -> 1.79.3 (CVE-2026-33186, critical)
+  and `golang.org/x/oauth2` 0.21.0 -> 0.34.0 (CVE-2025-22868, high)** in the
+  `pg-ha-agent` module (both transitive; etcd client bumped 3.5.16 -> 3.5.31 to keep
+  the grpc jump source-compatible). `govulncheck` reported both as unreachable, so
+  there was no exploit path in the running binary; the bump clears the advisories.
+
 ## 1.1.0 - 2026-06-19
 
 ### Added
