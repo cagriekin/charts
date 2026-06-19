@@ -3,16 +3,10 @@ set -e
 
 SCRIPT_NAME=${1:-default}
 
-# Decimal value of an 8-hex-digit WAL-filename timeline. The first 8 chars of
-# pg_walfile_name(pg_current_wal_lsn()) are the timeline in HEX, so a SQL
-# `::int` cast is WRONG: it parses decimal, so '0000000A' (TL 10) errors and
-# '00000010' (TL 16) yields 10. Decode the hex here. Empty/non-hex -> empty
-# output (caller treats as unreadable). Kept in sync with the chart's
-# service-updater tl_to_int.
-tl_to_int() {
-    case "$1" in ''|*[!0-9A-Fa-f]*) return 0 ;; esac
-    echo $((16#$1))
-}
+# Shared topology/timeline helpers (tl_to_int, remote_node_timeline_int,
+# local_node_timeline_int): one definition for the image's shell scripts so a fix
+# can't land in only some copies (#177).
+source /usr/local/bin/repmgr-common.sh
 
 # Scan sibling StatefulSet pods for an active primary and the newest timeline
 # seen. Sets REACHED_ANY/FOUND_PRIMARY/NEWEST_TLI/NEWEST_PEER. Timeline comes
@@ -26,7 +20,7 @@ scan_peers() {
     local ordinal="${HOSTNAME##*-}" base="${HOSTNAME%-*}"
     local node_count="${REPMGR_NODE_COUNT:-10}"
     case "$node_count" in ''|*[!0-9]*) node_count=10 ;; esac
-    local i peer in_recovery remote_hex remote_tli
+    local i peer in_recovery remote_tli
     for i in $(seq 0 $((node_count - 1))); do
         [ "$i" = "$ordinal" ] && continue
         peer="${base}-${i}.${HEADLESS_SERVICE}"
@@ -35,8 +29,7 @@ scan_peers() {
         in_recovery=$(PGPASSWORD="$REPMGR_PASSWORD" psql -tAX -h "$peer" -p 5432 -U "$ru" -d "$rd" -c "SELECT pg_is_in_recovery();" 2>/dev/null) || in_recovery=""
         [ "$in_recovery" = "f" ] || continue
         FOUND_PRIMARY=1
-        remote_hex=$(PGPASSWORD="$REPMGR_PASSWORD" psql -tAX -h "$peer" -p 5432 -U "$ru" -d "$rd" -c "SELECT substring(pg_walfile_name(pg_current_wal_lsn()) from 1 for 8);" 2>/dev/null) || remote_hex=""
-        remote_tli=$(tl_to_int "$remote_hex")
+        remote_tli=$(remote_node_timeline_int "$peer")
         [ -n "$remote_tli" ] || continue
         if [ "$remote_tli" -gt "$NEWEST_TLI" ]; then NEWEST_TLI="$remote_tli"; NEWEST_PEER="$peer"; fi
     done
@@ -154,7 +147,7 @@ primary_safety_guard() {
     done
 
     local local_tli
-    local_tli=$(pg_controldata -D "$PGDATA" 2>/dev/null | awk -F: '/Latest checkpoint.s TimeLineID/{gsub(/[^0-9]/,"",$2);print $2}') || local_tli=""
+    local_tli=$(local_node_timeline_int "$PGDATA")
     case "$local_tli" in
         ''|*[!0-9]*)
             if [ "$NEWEST_TLI" -gt 0 ]; then

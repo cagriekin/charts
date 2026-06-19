@@ -10,6 +10,10 @@ fi
 # silently fails and every standby restart does a full re-clone.
 export PATH=$PATH:/usr/lib/postgresql/18/bin
 
+# Shared topology/timeline helpers (tl_to_int, remote_node_timeline_int,
+# local_node_timeline_int): one definition for the image's shell scripts (#177).
+source /usr/local/bin/repmgr-common.sh
+
 ORDINAL=${HOSTNAME##*-}
 NODE_ID=$((ORDINAL + 1000))
 
@@ -156,15 +160,25 @@ for i in $(seq 1 120); do
 done
 
 if [ -s "${PGDATA}/PG_VERSION" ]; then
-    LOCAL_TIMELINE=$(pg_controldata -D "${PGDATA}" 2>/dev/null | grep "Latest checkpoint's TimeLineID" | awk '{print $NF}')
+    # Both timelines are read from the CONTROL FILE, symmetrically: LOCAL offline via the
+    # shared helper (#177), PRIMARY via pg_control_checkpoint() on the running primary.
+    # They MUST be read the same way. A standby that has followed onto a new timeline by
+    # streaming but not yet run its first restartpoint still shows the OLD control-file
+    # timeline; a fast promotion likewise defers the primary's checkpoint, so the primary's
+    # control-file timeline also lags -- both report the pre-checkpoint timeline and match
+    # (skip). Using the immediate WAL-insert read for the primary while LOCAL stays the
+    # control-file read would be asymmetric and wipe such a caught-up standby with a
+    # needless full re-clone. A genuinely-behind standby still catches up via streaming; a
+    # diverged primary-state node is handled by the entrypoint guard, not here.
+    LOCAL_TIMELINE=$(local_node_timeline_int "${PGDATA}")
     PRIMARY_TIMELINE=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h "${PRIMARY_FQDN}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" -t -c "SELECT timeline_id FROM pg_control_checkpoint();" 2>/dev/null | xargs)
 
-    if [ "$LOCAL_TIMELINE" = "$PRIMARY_TIMELINE" ]; then
+    if [ -n "$LOCAL_TIMELINE" ] && [ "$LOCAL_TIMELINE" = "$PRIMARY_TIMELINE" ]; then
         echo "Data directory exists and timeline matches ($LOCAL_TIMELINE), skipping clone"
         exit 0
     fi
 
-    echo "Timeline mismatch (local: ${LOCAL_TIMELINE}, primary: ${PRIMARY_TIMELINE}), re-cloning..."
+    echo "Timeline mismatch (local: ${LOCAL_TIMELINE:-?}, primary: ${PRIMARY_TIMELINE:-?}), re-cloning..."
     rm -rf "${PGDATA:?}"/*
 fi
 
