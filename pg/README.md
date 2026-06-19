@@ -1174,29 +1174,36 @@ Then restore from the latest backup using one of the methods above.
 
 ### Version model
 
-Each chart is released independently and tagged `<chart>-<version>` (e.g. `pg-0.5.89`); `pg` and `pgvector` are released in lockstep (same image, same agent), and both **unify at `1.0.0`** (the `0.5.x`/`0.6.x` split ends there). The `common` and `etcd` charts are vendored dependencies — they ship inside the `pg`/`pgvector` packages, not released on their own.
+Each chart is tagged `<chart>-<version>` (e.g. `pg-1.1.0`); `pg` and `pgvector` are released in lockstep — same version, same image, same agent. They **unified at `1.0.0`**: the earlier `0.5.x`/`0.6.x` split ended there and both charts now share a single version line. The `common` and `etcd` charts are vendored dependencies — they ship inside the `pg`/`pgvector` packages and are not released on their own.
 
 ### Compatibility matrix
 
-| `pg` | `pgvector` | repmgr image | PostgreSQL | Kubernetes |
-|------|-----------|--------------|-----------|-----------|
-| 0.5.89 | 0.6.91 | `trixie-5.5.0-16` | 18.x | ≥ 1.21 (PDB `policy/v1`) |
-| 1.0.0 *(planned)* | 1.0.0 *(planned)* | `trixie-5.5.0-16`+ | 18.x | ≥ 1.21 |
+| `pg` / `pgvector` | repmgr image | PostgreSQL | Kubernetes |
+|-------------------|--------------|-----------|-----------|
+| 1.1.0 *(current)* | `trixie-5.5.0-19` | 18.x | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.0.0 – 1.0.2 | `trixie-5.5.0-16` … `-18` | 18.x | as above |
+| 0.5.88 / 0.6.90 *(last 0.x)* | `trixie-5.5.0-15` | 18.x | ≥ 1.21 (PDB `policy/v1`) |
 
 Extras: agent monitoring (`repmgr.agent.monitoring.*`) needs the Prometheus Operator CRDs; the etcd backend (`repmgr.agent.dcs.backend: etcd`) needs an etcd ≥ 3.5 (BYO/shared) or the bundled etcd subchart (`etcd.enabled=true`).
 
-### Routine upgrade (within 0.x)
+### Routine upgrade (within 1.x)
 
 ```bash
 helm repo update
 helm upgrade my-postgres cagriekin/pg   # add -f your-values.yaml
 ```
 
-Within the 0.x line the default failover mode was `repmgrd`, so those upgrades were unaffected and the repmgrd rendering stayed byte-stable. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, pg_hba, or image changes) have one-time steps. The CHANGELOG carries an unbroken trail back to 0.5.71.
+Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.1.0`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-19` at 1.1.0) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
 
-### Migrating to 1.0.0 (the breaking change)
+### Crossing the 0.x → 1.x boundary (agent mode is now the default)
 
-As of `1.0.0` the default `failoverMode` is `agent` (it was `repmgrd` through 0.x). Because the agent's `podManagementPolicy: Parallel` is immutable on an existing StatefulSet, upgrading an existing repmgrd install across the `1.0.0` boundary and adopting the new default requires a one-time `kubectl delete statefulset <release>-pg --cascade=orphan` + `helm upgrade` recreate — see **[Migrating an existing release to agent mode](#migrating-an-existing-release-to-agent-mode)** for the full `--cascade=orphan` runbook and the GitOps caveats. To defer the move, pin `repmgr.failoverMode: repmgrd` (the legacy path stays supported for one major cycle, then deprecation); that upgrade needs no recreate.
+This applies only when upgrading **from a 0.x release**. Since `1.0.0` the default `failoverMode` is `agent` (it was `repmgrd` through 0.x). Three consumer-visible changes land at the boundary:
+
+1. **Immutable `podManagementPolicy`.** Agent mode uses `Parallel` (repmgrd used `OrderedReady`), which cannot be changed in place. Adopting agent mode on an existing repmgrd install needs a one-time `kubectl delete statefulset <release>-pg --cascade=orphan` + `helm upgrade` recreate — full runbook and GitOps caveats in **[Migrating an existing release to agent mode](#migrating-an-existing-release-to-agent-mode)**.
+2. **Hardened `pg_hba`.** Agent mode assembles a pod-CIDR + SCRAM `pg_hba.conf` with no implicit `0.0.0.0/0 md5` catch-all. If you relied on the broad md5 rule, add explicit `postgresql.pgHba` rules **before** switching.
+3. **PDB default.** The postgresql PodDisruptionBudget defaults to `maxUnavailable: 1` + `unhealthyPodEvictionPolicy: AlwaysAllow` (was `minAvailable: 1`) — equivalent on a 2-pod cluster, strictly better for drains/upgrades on k8s ≥ 1.27.
+
+To defer the move, pin `repmgr.failoverMode: repmgrd`: the legacy path stays supported for one major cycle (then deprecation per the policy below) and that upgrade needs no recreate.
 
 ## Troubleshooting PGPool
 

@@ -938,7 +938,7 @@ helm repo update
 helm upgrade my-pgvector cagriekin/pgvector   # add -f your-values.yaml
 ```
 
-`pgvector` tracks `pg` in lockstep (same image and agent; the 0.6.x ↔ 0.5.x lines unified at `1.0.0`). As of `1.0.0` the default failover mode is `agent` (it was `repmgrd` through 0.x) — upgrading an existing repmgrd install across the `1.0.0` boundary and adopting the default needs the one-time `--cascade=orphan` recreate; pin `repmgr.failoverMode: repmgrd` to defer. Read the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. For the **compatibility matrix, the version model, and the full `1.0.0` migration runbook**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
+`pgvector` tracks `pg` in lockstep — same version, image, and agent; the earlier 0.6.x ↔ 0.5.x split unified at `1.0.0` (current: `1.1.0`, image `trixie-5.5.0-19`). Within the 1.x line `helm upgrade` rolls the pods once and needs no manual step. The default failover mode is `agent` since `1.0.0` (it was `repmgrd` through 0.x); **only when crossing from a 0.x release** does adopting the agent default need the one-time `--cascade=orphan` recreate — pin `repmgr.failoverMode: repmgrd` to defer. Read the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. For the **compatibility matrix, the version model, and the full 0.x → 1.x migration runbook**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
 
 ## pgvector Resources
 
