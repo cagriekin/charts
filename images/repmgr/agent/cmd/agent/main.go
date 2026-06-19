@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -45,6 +46,18 @@ const (
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
+	// One-shot subcommand: provision etcd RBAC and enable auth. The bundled etcd
+	// image is distroless (no shell), so this runs in the repmgr image via the etcd
+	// client rather than a shell + etcdctl. Used by the etcd chart's bootstrap Job.
+	if len(os.Args) > 1 && os.Args[1] == "rbac-bootstrap" {
+		if err := runRBACBootstrap(log); err != nil {
+			log.Error("rbac-bootstrap", "err", err)
+			os.Exit(1)
+		}
+		log.Info("rbac-bootstrap complete")
+		return
+	}
+
 	cfg, err := config.FromEnv()
 	if err != nil {
 		log.Error("config", "err", err)
@@ -58,6 +71,34 @@ func main() {
 		os.Exit(1)
 	}
 	a.run()
+}
+
+// runRBACBootstrap reads the bootstrap inputs from env and drives the etcd Auth API.
+func runRBACBootstrap(log *slog.Logger) error {
+	endpoints := splitNonEmpty(os.Getenv("ETCD_ENDPOINTS"))
+	rootCN := strings.TrimSpace(os.Getenv("ETCD_RBAC_ROOT_CN"))
+	var tenants []dcs.RBACTenant
+	if raw := strings.TrimSpace(os.Getenv("ETCD_RBAC_TENANTS")); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &tenants); err != nil {
+			return fmt.Errorf("ETCD_RBAC_TENANTS is not valid JSON: %w", err)
+		}
+	}
+	log.Info("rbac-bootstrap", "endpoints", endpoints, "rootCN", rootCN, "tenants", len(tenants))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	return dcs.RBACBootstrap(ctx, endpoints,
+		os.Getenv("ETCD_TLS_CERT"), os.Getenv("ETCD_TLS_KEY"), os.Getenv("ETCD_TLS_CA"),
+		rootCN, tenants)
+}
+
+func splitNonEmpty(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 type agent struct {

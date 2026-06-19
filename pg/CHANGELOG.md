@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## 1.1.4 - 2026-06-19
+
+Bundled-etcd security (#184). Bundles `etcd` 0.1.3; image moves to
+`trixie-5.5.0-21` (adds the `pg-ha-agent rbac-bootstrap` subcommand). No rendered
+behavior change at defaults.
+
+### Added
+
+- **Bundled etcd transport TLS (`etcd.tls.*`) and per-tenant RBAC (`etcd.rbac.*`),
+  for the shared-etcd topology (#184).** etcd can now serve client + peer TLS from a
+  BYO cert Secret with `--client-cert-auth` (mutual TLS), and a post-install/upgrade
+  Job grants each tenant (matched by its client-cert Common Name) a role with
+  `readwrite` only on its key prefix — so one release cannot read or rewrite another's
+  leadership keys. A consuming release's agent authenticates by CN with no change (its
+  existing etcd client mTLS); in bundled mode the parent auto-switches the endpoint to
+  `https` and fails the render if the agent's client Secret is missing under
+  client-cert-auth. The RBAC bootstrap runs via a new `pg-ha-agent rbac-bootstrap`
+  subcommand (the bundled etcd image is distroless, so the Job uses the agent image +
+  the Go etcd Auth API rather than a shell + etcdctl). All flag-gated
+  (`etcd.tls.enabled`/`etcd.rbac.enabled` default off; render byte-stable). Covered by
+  a new live KinD suite (`make -C pg test-agent-etcd-tls`, wired into CI) that proves
+  the TLS handshake, CN auth, failover over mTLS, and that a tenant cert is denied
+  outside its prefix.
+
 ## 1.1.3 - 2026-06-19
 
 Multi-pillar-review remediation of the 1.1.2 etcd changes. Refreshes the bundled

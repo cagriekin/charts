@@ -27,6 +27,78 @@ clusterDomain: cluster.local
 clientPort: 2379
 peerPort: 2380
 
+# Transport TLS for the bundled etcd. Off by default (plaintext, isolated by the
+# NetworkPolicy). Turn on for a SHARED etcd: with clientCertAuth a client that does
+# not present a cert signed by ca.crt cannot connect at all -- the real access
+# control across releases, where the NetworkPolicy only gates pod reachability. The
+# parent agent must then connect over https with a client cert
+# (repmgr.agent.dcs.etcd.tls.secretName); the parent auto-switches the bundled
+# endpoint to https when this is enabled.
+tls:
+  enabled: false
+  # Secret with the etcd SERVER cert material -- keys: tls.crt, tls.key, ca.crt
+  # (a cert-manager Certificate emits exactly these; or
+  # `kubectl create secret generic <name> --from-file=tls.crt --from-file=tls.key --from-file=ca.crt`).
+  # Required when tls.enabled. The certificate MUST:
+  #   - list SANs for the client Service (<release>-etcd, <release>-etcd.<ns>.svc.<domain>)
+  #     and, when peer.enabled, the headless peer FQDNs
+  #     (<release>-etcd-<0..N>.<release>-etcd-headless.<ns>.svc.<domain>), plus 127.0.0.1;
+  #   - carry BOTH server-auth and client-auth usages (the health probe runs etcdctl
+  #     with this cert as a client). cert-manager: `usages: [server auth, client auth]`.
+  existingSecret: ""
+  # Require clients to present a cert signed by ca.crt (mutual TLS). Keep on for a
+  # shared store; off encrypts the transport but accepts any client.
+  clientCertAuth: true
+  peer:
+    # Encrypt the member-to-member mesh too (recommended for a shared etcd that
+    # crosses trust boundaries).
+    enabled: true
+    # Peer cert Secret (same tls.crt/tls.key/ca.crt layout). Defaults to
+    # existingSecret when empty -- one cert covering both client and peer SANs is fine.
+    existingSecret: ""
+
+# Per-tenant key-prefix isolation via etcd RBAC. Without it, transport TLS lets any
+# cert-holding client read/rewrite the WHOLE keyspace -- fine for one tenant, not for
+# a shared store. With it, each tenant (pg release) gets a user (matched by its
+# client-cert Common Name) and a role granting readwrite ONLY on its prefix, so one
+# release cannot touch another's leadership keys. A post-install/upgrade Job creates
+# the users/roles and enables auth. Requires tls.enabled + tls.clientCertAuth (auth
+# is by client-cert CN -- no passwords, so the agent needs no change beyond a cert
+# whose CN equals its tenant commonName below).
+rbac:
+  enabled: false
+  # Admin client cert used by the bootstrap Job to manage auth (and to re-authenticate
+  # after auth is enabled). Its CN MUST be "root" -- etcd's reserved superuser, which
+  # `auth enable` requires. Secret keys: tls.crt, tls.key, ca.crt. Required when
+  # rbac.enabled.
+  adminSecret: ""
+  # The bootstrap Job runs `pg-ha-agent rbac-bootstrap`, which drives the etcd Auth
+  # API via the Go client -- the bundled etcd image is distroless (no shell; it ships
+  # etcd + etcdctl only), so the Job uses the pg-ha-agent (repmgr) image instead. Keep
+  # the tag in lockstep with the pg/pgvector repmgr image when sharing one etcd.
+  bootstrapImage:
+    repository: cagriekin/repmgr
+    tag: trixie-5.5.0-21
+    digest: ""
+    pullPolicy: IfNotPresent
+  # Resources for the short-lived bootstrap Job container.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+  # Per-tenant grants. commonName MUST equal the CN in that release's agent client
+  # cert; prefix MUST equal that release's ETCD_PREFIX (default /pg-ha/<release>/).
+  # NOTE: `etcdctl auth enable` is cluster-global and (re)applies on every upgrade;
+  # removing a tenant here does NOT revoke it -- delete the user manually.
+  tenants: []
+  #  - commonName: backend-pg
+  #    prefix: /pg-ha/backend/
+  #  - commonName: sentry-pg
+  #    prefix: /pg-ha/sentry/
+
 resources:
   requests:
     cpu: 100m
@@ -83,7 +155,8 @@ networkPolicy:
   # (a label other PostgreSQL charts also set) -- so a foreign or attacker-deployed pod
   # in that namespace can reach it. For a shared etcd, set an explicit podSelector that
   # also pins app.kubernetes.io/instance (per consuming release), and prefer client
-  # TLS/auth (tracked in #184) over relying on the NetworkPolicy alone.
+  # TLS + per-tenant RBAC (tls.enabled + rbac.enabled above) over relying on the
+  # NetworkPolicy alone.
   allowedClients: []
   # Extra ingress rules to the client port (e.g. a Prometheus scrape of etcd
   # metrics, or an external etcdctl). Standard NetworkPolicy ingress entries.
@@ -104,10 +177,12 @@ containerSecurityContext:
     drop:
       - ALL
 
-# Bundled etcd runs plaintext within the pod network; isolate it with a
-# NetworkPolicy (the parent opens egress to 2379 in etcd mode). The leadership data
-# is non-secret (pod names + a key prefix). Client/peer TLS for the bundled cluster
-# is a deferred option; for a TLS-secured store use a BYO/shared etcd instead.
+# By default the bundled etcd runs plaintext within the pod network, isolated by the
+# NetworkPolicy (the parent opens egress to 2379 in etcd mode); the leadership data
+# is non-secret (pod names + a key prefix). For a shared/standalone store that crosses
+# trust boundaries, enable transport TLS above (tls.enabled) so only cert-holding
+# clients can connect, plus per-tenant key-prefix isolation (rbac.enabled) so one
+# release cannot read or rewrite another's leadership keys.
 
 commonLabels: {}
 commonAnnotations: {}

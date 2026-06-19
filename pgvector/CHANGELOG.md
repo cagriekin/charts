@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 1.1.4 - 2026-06-19
+
+Bundled-etcd security (#184). Bundles `etcd` 0.1.3; image moves to
+`trixie-5.5.0-21` (adds the `pg-ha-agent rbac-bootstrap` subcommand). No rendered
+behavior change at defaults. See the pg CHANGELOG for detail; pgvector shares pg's
+templates and the bundled etcd.
+
+### Added
+
+- **Bundled etcd transport TLS (`etcd.tls.*`) + per-tenant RBAC (`etcd.rbac.*`) for a
+  shared etcd (#184):** mutual TLS + a CN-keyed bootstrap Job (running
+  `pg-ha-agent rbac-bootstrap`) granting each tenant readwrite only on its key prefix.
+  Flag-gated (default off, render byte-stable); a consuming release's agent
+  authenticates by client-cert CN with no change.
+
 ## 1.1.3 - 2026-06-19
 
 Multi-pillar-review remediation of the 1.1.2 etcd changes. Refreshes the bundled

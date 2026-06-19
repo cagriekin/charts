@@ -172,6 +172,16 @@ jobs:
           kubectl delete namespace pg-test-agent-etcd --ignore-not-found --wait=true --timeout=180s \
             || echo "WARNING: namespace cleanup timed out, continuing"
 
+      # etcd DCS over mutual TLS + per-tenant RBAC (#184): generates a CA + certs,
+      # proves the TLS handshake/exec-probe, CN-based auth, failover, and prefix denial.
+      - name: Run agent etcd-mode TLS + RBAC test
+        run: make -C pg test-agent-etcd-tls
+
+      - name: Clean up etcd-mode TLS namespace
+        run: |
+          kubectl delete namespace pg-test-agent-etcd-tls --ignore-not-found --wait=true --timeout=180s \
+            || echo "WARNING: namespace cleanup timed out, continuing"
+
       # The 1.0.0 breaking-change path: repmgrd -> agent via --cascade=orphan recreate.
       - name: Run repmgrd->agent migration test
         run: make -C pg test-migrate-agent

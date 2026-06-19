@@ -30,18 +30,34 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: etcd
 {{- end -}}
 
+{{- /* http or https for the client URLs (tls.enabled) and the peer mesh
+       (tls.enabled AND tls.peer.enabled). */ -}}
+{{- define "etcd.clientScheme" -}}
+{{- if .Values.tls.enabled -}}https{{- else -}}http{{- end -}}
+{{- end -}}
+{{- define "etcd.peerScheme" -}}
+{{- if and .Values.tls.enabled .Values.tls.peer.enabled -}}https{{- else -}}http{{- end -}}
+{{- end -}}
+
+{{- /* Peer cert Secret, defaulting to the client/server Secret when unset. */ -}}
+{{- define "etcd.peerSecret" -}}
+{{- .Values.tls.peer.existingSecret | default .Values.tls.existingSecret -}}
+{{- end -}}
+
 {{- /* The static initial-cluster string: every member by its stable pod FQDN. etcd
        needs all peers listed for static bootstrap, and each member's --name must
-       match its entry here (ETCD_NAME = the pod name). */ -}}
+       match its entry here (ETCD_NAME = the pod name). The peer scheme follows
+       tls.peer (https when the mesh is encrypted). */ -}}
 {{- define "etcd.initialCluster" -}}
 {{- $full := include "etcd.fullname" . -}}
 {{- $svc := printf "%s-headless" $full -}}
 {{- $ns := .Release.Namespace -}}
 {{- $domain := .Values.clusterDomain -}}
 {{- $peer := .Values.peerPort | int -}}
+{{- $scheme := include "etcd.peerScheme" . -}}
 {{- $parts := list -}}
 {{- range $i := until (int .Values.replicaCount) -}}
-{{- $parts = append $parts (printf "%s-%d=http://%s-%d.%s.%s.svc.%s:%d" $full $i $full $i $svc $ns $domain $peer) -}}
+{{- $parts = append $parts (printf "%s-%d=%s://%s-%d.%s.%s.svc.%s:%d" $full $i $scheme $full $i $svc $ns $domain $peer) -}}
 {{- end -}}
 {{- join "," $parts -}}
 {{- end -}}
