@@ -31,7 +31,9 @@ spec:
           priorityClassName: {{ . }}
           {{- end }}
           restartPolicy: OnFailure
-          # Talks only to S3 and a throwaway local PostgreSQL, never the K8s API.
+          # Dedicated SA with no RBAC (#27); talks only to S3 and a throwaway local
+          # PostgreSQL, never the Kubernetes API, so its token is not mounted.
+          serviceAccountName: {{ include "pg.fullname" . }}-backup
           automountServiceAccountToken: false
           # Runs initdb/postgres against the throwaway emptyDir using the official
           # postgres image (postgresql.image), whose postgres user is uid 999 -- so

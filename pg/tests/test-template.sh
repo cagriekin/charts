@@ -1260,6 +1260,15 @@ assert_contains "#31: validate.sh reads this release's scoped backup path" "${va
 # workdir emptyDir cap is configurable; default unbounded (emptyDir: {})
 assert_contains "#31: workdir cap configurable" "$(helm template test-pg "${CHART_DIR}" ${backup_val_args} --set backup.validation.enabled=true --set backup.validation.workdirSizeLimit=10Gi --show-only templates/backup-validation-cronjob.yaml 2>&1)" "sizeLimit: 10Gi"
 
+# #27: the backup + backup-validation Jobs run under a dedicated no-RBAC SA, not
+# the namespace default.
+backup_sa=$(helm template test-pg "${CHART_DIR}" ${backup_val_args} --show-only templates/backup-serviceaccount.yaml 2>&1)
+assert_contains "#27: dedicated backup ServiceAccount renders" "${backup_sa}" "name: test-pg-backup"
+assert_contains "#27: backup SA token is not automounted" "${backup_sa}" "automountServiceAccountToken: false"
+backup_sa_refs=$(helm template test-pg "${CHART_DIR}" ${backup_val_args} --set backup.validation.enabled=true 2>&1 | grep -c "serviceAccountName: test-pg-backup")
+assert_eq "#27: both backup Jobs reference the dedicated SA" "2" "${backup_sa_refs}"
+assert_not_contains "#27: no backup SA when backup disabled" "$(helm template test-pg "${CHART_DIR}" --show-only templates/backup-serviceaccount.yaml 2>&1)" "kind: ServiceAccount"
+
 # --- pgBackRest Tests ---
 
 # Test: helm lint with pgbackrest values
