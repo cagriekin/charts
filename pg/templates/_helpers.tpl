@@ -135,6 +135,14 @@ annotation consumers -- #128.)
 {{- end }}
 {{- end }}
 
+{{- define "pg.secretMonitoringPasswordKey" -}}
+{{- if .Values.postgresql.existingSecret.enabled }}
+{{- required "postgresql.existingSecret.monitoringPasswordKey is required when prometheusExporter.monitoringUser.enabled and postgresql.existingSecret.enabled" .Values.postgresql.existingSecret.monitoringPasswordKey }}
+{{- else }}
+{{- "monitoring-password" }}
+{{- end }}
+{{- end }}
+
 {{- define "pg.pgpoolAdminSecretName" -}}
 {{- if .Values.pgpool.admin.existingSecret.enabled }}
 {{- required "pgpool.admin.existingSecret.name is required when pgpool.admin.existingSecret.enabled is true" .Values.pgpool.admin.existingSecret.name }}
@@ -251,6 +259,17 @@ initContainers:
         ENC_DB=$(enc "$POSTGRES_DATABASE")
         printf '%s' "{{ range $i := until (int (add .Values.postgresql.replicaCount 1)) }}{{ if $i }},{{ end }}postgresql://${ENC_USER}:${ENC_PASS}@{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless:5432/${ENC_DB}?sslmode=disable{{ end }}" > /etc/postgres_exporter/dsn
     env:
+{{- if .Values.prometheusExporter.monitoringUser.enabled }}
+      # #28: scrape as the least-privilege pg_monitor role (created by the
+      # monitoring-user hook Job), not the postgres superuser.
+      - name: POSTGRES_USER
+        value: {{ .Values.prometheusExporter.monitoringUser.username | quote }}
+      - name: POSTGRES_PASSWORD
+        valueFrom:
+          secretKeyRef:
+            name: {{ include "pg.secretName" . }}
+            key: {{ include "pg.secretMonitoringPasswordKey" . }}
+{{- else }}
       - name: POSTGRES_USER
         valueFrom:
           secretKeyRef:
@@ -261,6 +280,7 @@ initContainers:
           secretKeyRef:
             name: {{ include "pg.secretName" . }}
             key: {{ include "pg.secretPasswordKey" . }}
+{{- end }}
       - name: POSTGRES_DATABASE
         valueFrom:
           secretKeyRef:

@@ -410,6 +410,7 @@ Two ways to provide etcd:
 | `postgresql.existingSecret.passwordKey` | Password key in secret | `password` |
 | `postgresql.existingSecret.databaseKey` | Database key in secret | `database` |
 | `postgresql.existingSecret.repmgrPasswordKey` | Repmgr password key in secret | `repmgr-password` |
+| `postgresql.existingSecret.monitoringPasswordKey` | Monitoring-user password key in secret (required when `prometheusExporter.monitoringUser.enabled`) | `monitoring-password` |
 
 When `postgresql.existingSecret.enabled` is `false`, a secret will be auto-generated with:
 - `username`: Base64 encoded value from `postgresql.username`
@@ -718,6 +719,8 @@ Alert on `rate(pg_wal_archive_failed_count[5m]) > 0` to catch a failing `archive
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `prometheusExporter.enabled` | Enable Prometheus exporter | `false` |
+| `prometheusExporter.monitoringUser.enabled` | Create a read-only `pg_monitor` role (via a post-install hook Job) and have the exporter authenticate as it instead of the postgres superuser (#28) | `true` |
+| `prometheusExporter.monitoringUser.username` | Name of the monitoring role | `monitoring` |
 | `prometheusExporter.image.repository` | Exporter image repository | `quay.io/prometheuscommunity/postgres-exporter` |
 | `prometheusExporter.image.tag` | Exporter image tag | `v0.19.1` |
 | `prometheusExporter.image.pullPolicy` | Image pull policy | `IfNotPresent` |

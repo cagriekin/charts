@@ -26,6 +26,14 @@
 
 ### Security
 
+- **The Prometheus exporter connects as a least-privilege `pg_monitor` user, not the
+  postgres superuser (#28).** A post-install/post-upgrade hook Job creates a read-only
+  monitoring role on the primary (it replicates to standbys) and the exporter
+  authenticates as it. Chart-only -- works in both repmgr and standalone modes with no
+  image change. Enabled by default (`prometheusExporter.monitoringUser.enabled`);
+  disable to revert to the superuser. With `postgresql.existingSecret.enabled` the
+  secret must also carry a `monitoring-password` key (override via
+  `postgresql.existingSecret.monitoringPasswordKey`), enforced fail-fast at render.
 - **The PgPool-II PCP admin port (9898) is no longer exposed on the Service by default
   (#118).** The pgpool Service published the PCP admin/control port cluster-wide while
   the pgpool NetworkPolicy only admits 9999. It is now gated behind
