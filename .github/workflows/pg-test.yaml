@@ -181,6 +181,18 @@ jobs:
           kubectl delete namespace pg-test-migrate --ignore-not-found --wait=true --timeout=180s \
             || echo "WARNING: namespace cleanup timed out, continuing"
 
+      # Backup + restore (pg_dump path): stands up MinIO, runs a full backup/restore
+      # cycle, drives the restore-validation Job (#31), and exercises the dedicated
+      # backup ServiceAccount (#27) and the read-only-rootfs backup/validation
+      # containers (#117) live -- render tests cannot catch a missed writable path.
+      - name: Run backup and restore tests
+        run: make -C pg test-backup-restore
+
+      - name: Clean up backup namespace
+        run: |
+          kubectl delete namespace pg-test-backup --ignore-not-found --wait=true --timeout=180s \
+            || echo "WARNING: namespace cleanup timed out, continuing"
+
       - name: Dump cluster state on failure
         if: failure()
         run: |
