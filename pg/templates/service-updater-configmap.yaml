@@ -339,6 +339,36 @@ data:
         fi
     }
 
+    # Unregister repmgr.nodes records for pods the StatefulSet no longer runs after a
+    # replicaCount scale-down (#139). Without this the ghost rows stay active=true
+    # forever: repmgrd keeps retrying their now-dead conninfo (connect_timeout each),
+    # `repmgr cluster show` reports a permanently-failed node, and failover elections
+    # pay a timeout per ghost. Primary-only (repmgr.nodes lives on the primary; one
+    # writer, no race), keyed purely on the ordinal -- node_id-1000 > replicaCount,
+    # since scan_primaries' live set is ordinals 0..replicaCount -- never on
+    # reachability, so a momentarily-down live node is never unregistered. The
+    # replicaCount is templated, so a re-rendered ConfigMap after `helm upgrade` carries
+    # the new (lower) bound. Only STANDBY rows are considered: `repmgr standby
+    # unregister` cannot remove a primary-type row, so a scaled-down ex-primary is left
+    # for an operator (the documented edge) rather than re-attempted -- and re-warned --
+    # every tick.
+    cleanup_ghost_nodes() {
+        [ "$CURRENT_MASTER" = "$HOSTNAME" ] || return 0
+        [ -f /etc/repmgr/repmgr.conf ] || return 0
+        local ids id ord
+        ids=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${HOSTNAME}.${HEADLESS_SERVICE}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
+            -tAc "SELECT node_id FROM repmgr.nodes WHERE type = 'standby';" 2>/dev/null) || return 0
+        for id in ${ids}; do
+            case "$id" in ''|*[!0-9]*) continue ;; esac
+            ord=$((id - 1000))
+            if [ "$ord" -gt {{ .Values.postgresql.replicaCount }} ]; then
+                echo "Unregistering ghost repmgr node ${id} (ordinal ${ord} > replicaCount {{ .Values.postgresql.replicaCount }}) left by a scale-down"
+                repmgr -f /etc/repmgr/repmgr.conf standby unregister --node-id="${id}" 2>&1 \
+                    || echo "WARNING: failed to unregister ghost node ${id} (will retry next tick)"
+            fi
+        done
+    }
+
     # Called only when scan_primaries found >= 2 live primaries (split-brain).
     # Both modes pick the survivor (highest timeline, then LSN); action=log
     # re-asserts the write selector toward it (non-destructive), action=fence
@@ -481,6 +511,10 @@ data:
                 fi
                 CONSECUTIVE_FAILURES=0
                 check_pgpool_health
+                # Reconcile repmgr.nodes against the live ordinal range (no-op unless
+                # this pod is the primary). Best-effort and idempotent, like the
+                # selector re-assertion above.
+                cleanup_ghost_nodes
             fi
         elif [ "$PRIMARY_COUNT" -ge 2 ]; then
             # Two or more live primaries: the cluster state is ambiguous, so do

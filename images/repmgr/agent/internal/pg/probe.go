@@ -215,6 +215,34 @@ func (p *Prober) SystemIdentifier(ctx context.Context, ci ConnInfo) (id uint64, 
 	return n, true, nil
 }
 
+// StandbyNodeIDs returns the node_ids of the STANDBY rows in repmgr.nodes, queried on
+// the repmgr database (ci must point at it). The primary uses this to find ghost records
+// left by a replicaCount scale-down (#139). It excludes the primary row deliberately: a
+// scaled-down ex-primary's row is type='primary', which `repmgr standby unregister`
+// cannot remove, so listing it would make the caller re-attempt (and re-warn) a
+// never-succeeding unregister every tick -- such a row is left for an operator instead.
+// An unparseable row is an error rather than a silent skip, so a malformed table never
+// masks a ghost.
+func (p *Prober) StandbyNodeIDs(ctx context.Context, ci ConnInfo) ([]int, error) {
+	out, err := p.psql(ctx, ci, "SELECT node_id FROM repmgr.nodes WHERE type = 'standby';")
+	if err != nil {
+		return nil, err
+	}
+	var ids []int
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		n, perr := strconv.Atoi(line)
+		if perr != nil {
+			return nil, fmt.Errorf("parse repmgr.nodes node_id %q: %w", line, perr)
+		}
+		ids = append(ids, n)
+	}
+	return ids, nil
+}
+
 // Probe classifies a node by its actual role and reads the WAL position relevant
 // to that role. An unreachable node returns NodeState{Host, Reachable:false}.
 func (p *Prober) Probe(ctx context.Context, ci ConnInfo) NodeState {

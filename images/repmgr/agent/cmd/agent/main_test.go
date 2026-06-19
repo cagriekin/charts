@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -46,14 +47,18 @@ func (f *fakeDCS) Release()                                   { f.released = tru
 // signatures are identical -- so one fake drives the whole Follow act() path. It
 // counts repmgr standby follow invocations and stubs the pg_stat_wal_receiver probe.
 type scriptedExec struct {
-	walRcv  string // pg_stat_wal_receiver "sender_host|status" output (psql)
-	regErr  error  // error returned for `repmgr standby register` (nil = success)
-	follows int    // number of `repmgr standby follow` calls
+	walRcv       string // pg_stat_wal_receiver "sender_host|status" output (psql)
+	nodes        string // SELECT node_id FROM repmgr.nodes output (psql)
+	regErr       error  // error returned for `repmgr standby register` (nil = success)
+	follows      int    // number of `repmgr standby follow` calls
+	unregistered []int  // node_ids passed to `repmgr standby unregister`
 }
 
 func (s *scriptedExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
 	joined := strings.Join(args, " ")
 	switch {
+	case name == "psql" && strings.Contains(joined, "repmgr.nodes"):
+		return s.nodes, nil
 	case name == "psql" && strings.Contains(joined, "pg_stat_wal_receiver"):
 		return s.walRcv, nil
 	case name == "repmgr" && strings.Contains(joined, "standby register"):
@@ -63,6 +68,15 @@ func (s *scriptedExec) Run(_ context.Context, _ []string, name string, args ...s
 		return "ok", nil
 	case name == "repmgr" && strings.Contains(joined, "standby follow"):
 		s.follows++
+		return "ok", nil
+	case name == "repmgr" && strings.Contains(joined, "standby unregister"):
+		for _, a := range args {
+			if strings.HasPrefix(a, "--node-id=") {
+				if n, err := strconv.Atoi(strings.TrimPrefix(a, "--node-id=")); err == nil {
+					s.unregistered = append(s.unregistered, n)
+				}
+			}
+		}
 		return "ok", nil
 	}
 	return "ok", nil
@@ -409,5 +423,70 @@ func TestNodeIDAndBaseName(t *testing.T) {
 	}
 	if got := nodeID("my-pg-3"); got != 1003 {
 		t.Errorf("nodeID = %d, want 1003", got)
+	}
+}
+
+// ghostNodeIDs is the #139 scale-down discriminator: a repmgr.nodes row is a ghost
+// iff its ordinal (node_id - nodeIDBase) is >= the live pod count (live ordinals are
+// 0..nodeCount-1). It must be purely structural and must never flag a live node --
+// including the safety case of a zero/negative nodeCount, which must be a no-op.
+func TestGhostNodeIDs(t *testing.T) {
+	eq := func(a, b []int) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				return false
+			}
+		}
+		return true
+	}
+	cases := []struct {
+		name      string
+		ids       []int
+		nodeCount int
+		want      []int
+	}{
+		{"two ghosts above the live range", []int{1000, 1001, 1002, 1003, 1004}, 3, []int{1003, 1004}},
+		{"no ghosts when all in range", []int{1000, 1001, 1002}, 3, nil},
+		{"single-node cluster, one ghost", []int{1000, 1001}, 1, []int{1001}},
+		{"zero nodeCount is a no-op (never treat all as ghosts)", []int{1000, 1001}, 0, nil},
+		{"negative nodeCount is a no-op", []int{1000, 1001}, -1, nil},
+		{"ids below the base are never flagged", []int{999, 1000, 1001}, 1, []int{1001}},
+		{"empty input", nil, 3, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ghostNodeIDs(c.ids, c.nodeCount); !eq(got, c.want) {
+				t.Fatalf("ghostNodeIDs(%v, %d) = %v, want %v", c.ids, c.nodeCount, got, c.want)
+			}
+		})
+	}
+}
+
+// cleanupGhostNodes wires the real Prober.StandbyNodeIDs + ghostNodeIDs +
+// Repmgr.Unregister: the primary lists standby rows and unregisters only the ordinals
+// above the live range (#139). End-to-end over the same scriptedExec the Follow tests use.
+func TestCleanupGhostNodes(t *testing.T) {
+	// 3 registered nodes but NodeCount=2 (a scale-down from 3 pods to 2): node 1002
+	// (ordinal 2) is a ghost and must be unregistered; the live 1000/1001 must not.
+	ex := &scriptedExec{nodes: "1000\n1001\n1002\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.NodeCount = 2
+	a.cleanupGhostNodes(context.Background())
+	if len(ex.unregistered) != 1 || ex.unregistered[0] != 1002 {
+		t.Fatalf("expected only node 1002 unregistered, got %v", ex.unregistered)
+	}
+}
+
+func TestCleanupGhostNodesNoGhosts(t *testing.T) {
+	// Every registered node is within the live ordinal range: no unregister at all.
+	ex := &scriptedExec{nodes: "1000\n1001\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.NodeCount = 2
+	a.cleanupGhostNodes(context.Background())
+	if len(ex.unregistered) != 0 {
+		t.Fatalf("expected no unregister when there are no ghosts, got %v", ex.unregistered)
 	}
 }

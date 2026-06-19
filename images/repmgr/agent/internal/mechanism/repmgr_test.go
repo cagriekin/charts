@@ -118,6 +118,30 @@ func TestCLICommands(t *testing.T) {
 		}
 	})
 
+	t.Run("unregister targets the node-id and keeps PGPASSWORD off argv (#139)", func(t *testing.T) {
+		fr := &fakeRunner{}
+		if err := newTestRepmgr(fr).Unregister(ctx, 1003); err != nil {
+			t.Fatal(err)
+		}
+		got := fr.lastArgs()
+		if !strings.Contains(got, "-f /etc/repmgr/repmgr.conf standby unregister --node-id=1003") {
+			t.Errorf("argv = %q", got)
+		}
+		if strings.Contains(got, "secret") {
+			t.Errorf("password leaked into argv: %q", got)
+		}
+		if env := fr.calls[len(fr.calls)-1].env; len(env) == 0 || env[0] != "PGPASSWORD=secret" {
+			t.Errorf("PGPASSWORD not in env: %v", env)
+		}
+	})
+
+	t.Run("unregister surfaces a repmgr error", func(t *testing.T) {
+		fr := &fakeRunner{failOn: "standby unregister"}
+		if err := newTestRepmgr(fr).Unregister(ctx, 1003); err == nil {
+			t.Fatal("a failed unregister must surface as an error")
+		}
+	})
+
 	t.Run("rejoin failure maps to ErrRewindDiverged", func(t *testing.T) {
 		fr := &fakeRunner{failOn: "rejoin"}
 		err := newTestRepmgr(fr).RejoinForceRewind(ctx, src)

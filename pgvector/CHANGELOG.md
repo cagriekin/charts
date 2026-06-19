@@ -17,10 +17,11 @@ CHANGELOG for detail; pgvector shares pg's templates.
 
 ## 1.1.5 - 2026-06-19
 
-Restores efficient stale-primary recovery (#178). Image moves to
-`trixie-5.5.0-22`; bundles `etcd` 0.1.4 (bootstrap-image tag lockstep only). No
-rendered behavior change at defaults. pgvector shares pg's templates and image; see
-the pg CHANGELOG for detail.
+Restores efficient stale-primary recovery (#178) and auto-cleans ghost
+`repmgr.nodes` rows on scale-down (#139). Image moves to `trixie-5.5.0-22`; bundles
+`etcd` 0.1.4 (bootstrap-image tag lockstep only). No rendered change in agent mode
+(the default). pgvector shares pg's templates and image; see the pg CHANGELOG for
+detail.
 
 ### Fixed
 
@@ -31,6 +32,13 @@ the pg CHANGELOG for detail.
   conninfo password that did not reach it. Data safety is unchanged (the re-clone
   fallback remains); this restores the efficient O(diverged-WAL) path over an
   O(database-size) base backup on large databases.
+- **Scaling `postgresql.replicaCount` down no longer leaves permanent ghost rows in
+  `repmgr.nodes` (#139):** the primary now reconciles `repmgr.nodes` against the live
+  ordinal range each tick and unregisters records for pods the StatefulSet no longer
+  runs (agent mode: the lease-holding primary; repmgrd mode: the master's
+  service-updater). Keyed on the ordinal, never reachability, so a momentarily-down
+  live node is never touched. The manual `repmgr standby unregister` cleanup is no
+  longer required.
 
 ## 1.1.4 - 2026-06-19
 

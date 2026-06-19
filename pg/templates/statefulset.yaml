@@ -919,6 +919,11 @@ spec:
           volumeMounts:
             - name: service-updater-script
               mountPath: /scripts
+            # repmgr.conf (written by the init container) so the master's
+            # service-updater can run `repmgr standby unregister` for ghost nodes (#139).
+            - name: repmgr-config
+              mountPath: /etc/repmgr
+              readOnly: true
           resources:
             {{- toYaml .Values.repmgr.serviceUpdater.resources | nindent 12 }}
 {{- end }}

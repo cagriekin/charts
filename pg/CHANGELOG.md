@@ -22,9 +22,11 @@ A monitoring-exporter `/probe` fix (#185). Chart-only; no image change (stays
 
 ## 1.1.5 - 2026-06-19
 
-Restores efficient stale-primary recovery (#178). Image moves to
+Restores efficient stale-primary recovery (#178) and automatically cleans up the
+ghost `repmgr.nodes` rows a scale-down used to leave behind (#139). Image moves to
 `trixie-5.5.0-22`; bundles `etcd` 0.1.4 (bootstrap-image tag lockstep only). No
-rendered behavior change at defaults.
+rendered change in agent mode (the default); repmgrd mode gains the service-updater
+cleanup described below.
 
 ### Fixed
 
@@ -40,6 +42,20 @@ rendered behavior change at defaults.
   Data safety is unchanged (the re-clone fallback remains for genuine rewind
   failures); this only restores the efficient path on large databases. The live
   failover suite now asserts the rewind path engages.
+- **Scaling `postgresql.replicaCount` down no longer leaves permanent ghost rows in
+  `repmgr.nodes` (#139).** The StatefulSet trims the highest ordinals, but their
+  `repmgr.nodes` records used to remain `active=true` forever — repmgrd kept retrying
+  their now-dead conninfo, `repmgr cluster show` reported a permanently-failed node,
+  and every failover paid a connect-timeout per ghost. The primary now reconciles
+  `repmgr.nodes` against the live ordinal range on each tick and unregisters records
+  for pods the StatefulSet no longer runs (agent mode: the lease-holding primary;
+  repmgrd mode: the master's service-updater, which now mounts `repmgr.conf`). The
+  discriminator is purely the ordinal (`node_id - 1000 > replicaCount`), never
+  reachability, so a momentarily-down live node is never unregistered, and a
+  scaled-down *primary* row is left for an operator (`repmgr standby unregister`
+  refuses primary rows) rather than dropped. Covered by a new live `test-scaledown`
+  suite (wired into CI). The manual `repmgr standby unregister` step previously
+  documented for the 1.1.0 README is no longer required.
 
 ## 1.1.4 - 2026-06-19
 

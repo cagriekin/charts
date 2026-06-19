@@ -16,6 +16,7 @@ type fakeExec struct {
 	standbyTL string // pg_control_checkpoint timeline_id output (decimal)
 	sysID     string // pg_control_system() system_identifier output (decimal)
 	walRcv    string // pg_stat_wal_receiver "sender_host|status" output
+	nodes     string // SELECT node_id FROM repmgr.nodes output (newline-separated)
 	err       error  // if set, every call fails (node unreachable)
 }
 
@@ -25,6 +26,8 @@ func (f fakeExec) Run(_ context.Context, _ []string, _ string, args ...string) (
 	}
 	sql := args[len(args)-1]
 	switch {
+	case strings.Contains(sql, "repmgr.nodes"):
+		return f.nodes, nil
 	case strings.Contains(sql, "pg_stat_wal_receiver"):
 		return f.walRcv, nil
 	case strings.Contains(sql, "pg_is_in_recovery"):
@@ -150,5 +153,45 @@ func TestSystemIdentifierUnparseable(t *testing.T) {
 	p := proberWith(fakeExec{sysID: "not-a-number"})
 	if _, ok, err := p.SystemIdentifier(context.Background(), ConnInfo{Host: "x"}); ok || err != nil {
 		t.Errorf("unparseable id must return ok=false, nil err, got ok=%v err=%v", ok, err)
+	}
+}
+
+func TestStandbyNodeIDs(t *testing.T) {
+	p := proberWith(fakeExec{nodes: "1000\n1001\n1002\n"})
+	ids, err := p.StandbyNodeIDs(context.Background(), ConnInfo{Host: "x", DB: "repmgr"})
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	want := []int{1000, 1001, 1002}
+	if len(ids) != len(want) {
+		t.Fatalf("ids = %v, want %v", ids, want)
+	}
+	for i := range want {
+		if ids[i] != want[i] {
+			t.Fatalf("ids = %v, want %v", ids, want)
+		}
+	}
+}
+
+func TestStandbyNodeIDsEmpty(t *testing.T) {
+	p := proberWith(fakeExec{nodes: ""})
+	if ids, err := p.StandbyNodeIDs(context.Background(), ConnInfo{Host: "x"}); err != nil || ids != nil {
+		t.Fatalf("empty result must return (nil, nil), got (%v, %v)", ids, err)
+	}
+}
+
+func TestStandbyNodeIDsUnparseable(t *testing.T) {
+	// A malformed node_id must surface as an error, never be silently dropped: a
+	// dropped row could hide a real ghost (or, inversely, make a live node look absent).
+	p := proberWith(fakeExec{nodes: "1000\nbogus\n"})
+	if _, err := p.StandbyNodeIDs(context.Background(), ConnInfo{Host: "x"}); err == nil {
+		t.Fatal("a malformed node_id must surface as an error")
+	}
+}
+
+func TestStandbyNodeIDsUnreachable(t *testing.T) {
+	p := proberWith(fakeExec{err: errors.New("connection refused")})
+	if _, err := p.StandbyNodeIDs(context.Background(), ConnInfo{Host: "x"}); err == nil {
+		t.Fatal("an unreachable node must return an error")
 	}
 }
