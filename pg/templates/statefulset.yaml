@@ -399,9 +399,19 @@ spec:
             {{- $etcd := required "repmgr.agent.dcs.etcd is required when dcs.backend=etcd" .Values.repmgr.agent.dcs.etcd }}
             {{- $endpoints := $etcd.endpoints }}
             {{- /* No explicit endpoints + the bundled etcd subchart enabled: target the
-                   bundled cluster's client Service (<release>-etcd:<clientPort>). */}}
+                   bundled cluster's client Service (<release>-etcd:<clientPort>). The
+                   scheme follows the bundled etcd's tls.enabled, and under
+                   client-cert-auth the agent must carry a client cert. */}}
             {{- if and (not $endpoints) (.Values.etcd).enabled }}
-            {{- $endpoints = list (printf "http://%s-etcd:%v" .Release.Name ((.Values.etcd).clientPort | default 2379)) }}
+            {{- $etcdTls := ((.Values.etcd).tls).enabled | default false }}
+            {{- /* dig (not `| default true`) so an explicit clientCertAuth=false is honored:
+                   `false | default true` would wrongly coerce to true and force a client cert
+                   on an encrypt-only (no mutual-auth) etcd. */}}
+            {{- $etcdCca := dig "tls" "clientCertAuth" true (.Values.etcd | default dict) }}
+            {{- if and $etcdTls $etcdCca (not (($etcd.tls).secretName)) }}
+            {{ fail "bundled etcd tls.enabled with clientCertAuth requires the agent's client cert: set repmgr.agent.dcs.etcd.tls.secretName to a Secret with tls.crt, tls.key, ca.crt" }}
+            {{- end }}
+            {{- $endpoints = list (printf "%s://%s-etcd:%v" (ternary "https" "http" $etcdTls) .Release.Name ((.Values.etcd).clientPort | default 2379)) }}
             {{- end }}
             {{- if not $endpoints }}{{ fail "etcd backend needs endpoints: set repmgr.agent.dcs.etcd.endpoints for a BYO/shared etcd, or enable the bundled etcd with etcd.enabled=true" }}{{ end }}
             - name: ETCD_ENDPOINTS

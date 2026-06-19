@@ -1031,6 +1031,106 @@ assert_contains "standalone etcd: allowedClients namespaceSelector renders" "${e
 etcd_allow_err=$(helm template platform-etcd "${SCRIPT_DIR}/../../etcd" \
   --set 'networkPolicy.allowedClients[0].podSelector.foo=bar' 2>&1 || true)
 assert_contains "standalone etcd: missing namespace fails with the required-guard message" "${etcd_allow_err}" "allowedClients\[\].namespace is required"
+
+# etcd transport TLS (#184): client + peer TLS from a BYO Secret, mutual auth, and
+# exec health probes. Default (off) must stay byte-stable; on must flip every URL to
+# https, mount the cert Secret, and require existingSecret.
+etcd_tls=$(helm template e "${SCRIPT_DIR}/../../etcd" \
+  --set tls.enabled=true --set tls.existingSecret=etcd-server-tls \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "etcd TLS: client URLs are https" "${etcd_tls}" "value: https://0.0.0.0:2379"
+assert_contains "etcd TLS: peer mesh URLs are https in initial-cluster" "${etcd_tls}" "https://e-etcd-0.e-etcd-headless"
+assert_contains "etcd TLS: client cert-file env" "${etcd_tls}" "value: /etc/etcd/tls/tls.crt"
+# assert the VALUE (true), not just the env name -- the name renders regardless of the setting
+cca_on=$(printf '%s\n' "${etcd_tls}" | grep -A1 "name: ETCD_CLIENT_CERT_AUTH" | grep "value:")
+assert_contains "etcd TLS: client-cert-auth (mutual TLS) on by default" "${cca_on}" 'value: "true"'
+assert_contains "etcd TLS: peer cert-file env" "${etcd_tls}" "name: ETCD_PEER_CERT_FILE"
+# clientCertAuth=false (encrypt-only): the value flips to false
+etcd_tls_nocca=$(helm template e "${SCRIPT_DIR}/../../etcd" \
+  --set tls.enabled=true --set tls.existingSecret=s --set tls.clientCertAuth=false \
+  --show-only templates/statefulset.yaml 2>&1)
+cca_off=$(printf '%s\n' "${etcd_tls_nocca}" | grep -A1 "name: ETCD_CLIENT_CERT_AUTH" | grep "value:")
+assert_contains "etcd TLS: client-cert-auth can be disabled (encrypt-only)" "${cca_off}" 'value: "false"'
+# peer.enabled=false: client URLs stay https but the peer mesh stays http (mixed scheme)
+etcd_tls_nopeer=$(helm template e "${SCRIPT_DIR}/../../etcd" \
+  --set tls.enabled=true --set tls.existingSecret=s --set tls.peer.enabled=false \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "etcd TLS: client URLs https with peer TLS off" "${etcd_tls_nopeer}" "value: https://0.0.0.0:2379"
+assert_contains "etcd TLS: peer mesh stays http with peer TLS off" "${etcd_tls_nopeer}" "e-etcd-0=http://e-etcd-0.e-etcd-headless"
+assert_not_contains "etcd TLS: no peer cert env with peer TLS off" "${etcd_tls_nopeer}" "ETCD_PEER_CERT_FILE"
+assert_contains "etcd TLS: health probe uses etcdctl with the certs" "${etcd_tls}" "/usr/local/bin/etcdctl"
+assert_contains "etcd TLS: cert Secret mounted" "${etcd_tls}" 'secretName: "etcd-server-tls"'
+# peer secret defaults to the server secret -- one mount, no separate peer volume
+assert_not_contains "etcd TLS: no separate peer volume when peer reuses the server secret" "${etcd_tls}" "etcd-peer-tls"
+# a distinct peer secret mounts separately
+etcd_tls_peer=$(helm template e "${SCRIPT_DIR}/../../etcd" \
+  --set tls.enabled=true --set tls.existingSecret=etcd-server-tls \
+  --set tls.peer.existingSecret=etcd-peer-tls --show-only templates/statefulset.yaml 2>&1)
+assert_contains "etcd TLS: distinct peer Secret mounts separately" "${etcd_tls_peer}" 'secretName: "etcd-peer-tls"'
+# default render (TLS off) is byte-stable: no https, no cert env, no etcdctl probe
+etcd_plain=$(helm template e "${SCRIPT_DIR}/../../etcd" --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "etcd TLS off: no https URLs" "${etcd_plain}" "https://"
+assert_not_contains "etcd TLS off: no cert env" "${etcd_plain}" "ETCD_CERT_FILE"
+# fail-fast: tls.enabled without a Secret
+etcd_tls_nosecret_rc=0
+helm template e "${SCRIPT_DIR}/../../etcd" --set tls.enabled=true >/dev/null 2>&1 || etcd_tls_nosecret_rc=$?
+assert_eq "etcd TLS: tls.enabled without existingSecret fails fast" "1" "$([ "${etcd_tls_nosecret_rc}" -ne 0 ] && echo 1 || echo 0)"
+# parent wiring: bundled etcd with TLS -> agent connects over https; missing the
+# agent client cert under client-cert-auth fails fast.
+agent_etcd_tls=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.dcs.backend=etcd --set etcd.enabled=true \
+  --set etcd.tls.enabled=true --set etcd.tls.existingSecret=etcd-server-tls \
+  --set repmgr.agent.dcs.etcd.tls.secretName=etcd-client-tls \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "bundled etcd TLS: agent endpoint is https" "${agent_etcd_tls}" 'value: "https://test-pg-etcd:2379"'
+agent_etcd_tls_nocert_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.dcs.backend=etcd --set etcd.enabled=true \
+  --set etcd.tls.enabled=true --set etcd.tls.existingSecret=etcd-server-tls \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || agent_etcd_tls_nocert_rc=$?
+assert_eq "bundled etcd TLS: missing agent client cert fails fast" "1" "$([ "${agent_etcd_tls_nocert_rc}" -ne 0 ] && echo 1 || echo 0)"
+
+# etcd RBAC (#184): per-tenant key-prefix isolation via a CN-keyed bootstrap Job.
+etcd_rbac=$(helm template platform-etcd "${SCRIPT_DIR}/../../etcd" \
+  --set tls.enabled=true --set tls.existingSecret=etcd-server-tls \
+  --set rbac.enabled=true --set rbac.adminSecret=etcd-admin-tls \
+  --set 'rbac.tenants[0].commonName=backend-pg' --set 'rbac.tenants[0].prefix=/pg-ha/backend/' \
+  --set 'rbac.tenants[1].commonName=sentry-pg' --set 'rbac.tenants[1].prefix=/pg-ha/sentry/' \
+  --show-only templates/rbac-bootstrap-job.yaml 2>&1)
+assert_contains "etcd RBAC: bootstrap Job renders" "${etcd_rbac}" "kind: Job"
+assert_contains "etcd RBAC: runs as a post-install/upgrade hook" "${etcd_rbac}" "post-install,post-upgrade"
+# the etcd image is distroless, so the Job runs the agent subcommand, not a shell/etcdctl
+assert_contains "etcd RBAC: runs pg-ha-agent rbac-bootstrap" "${etcd_rbac}" "rbac-bootstrap"
+assert_contains "etcd RBAC: uses the agent (repmgr) image, not the etcd image" "${etcd_rbac}" "cagriekin/repmgr:"
+# tenants travel as a JSON env (commonName/prefix); the value is YAML-quoted, so
+# match on the unescaped tokens rather than the escaped-quote punctuation.
+assert_contains "etcd RBAC: tenants env is JSON" "${etcd_rbac}" "ETCD_RBAC_TENANTS"
+assert_contains "etcd RBAC: JSON carries commonName/prefix keys" "${etcd_rbac}" "commonName"
+assert_contains "etcd RBAC: first tenant CN + prefix present" "${etcd_rbac}" "backend-pg"
+assert_contains "etcd RBAC: first tenant prefix present" "${etcd_rbac}" "/pg-ha/backend/"
+assert_contains "etcd RBAC: second tenant present" "${etcd_rbac}" "sentry-pg"
+assert_contains "etcd RBAC: root CN env" "${etcd_rbac}" "ETCD_RBAC_ROOT_CN"
+assert_contains "etcd RBAC: connects to etcd over https" "${etcd_rbac}" 'value: "https://platform-etcd-etcd:2379"'
+assert_contains "etcd RBAC: admin cert mounted" "${etcd_rbac}" 'secretName: "etcd-admin-tls"'
+# the etcd image (distroless) is NOT used for the Job (no shell there)
+assert_not_contains "etcd RBAC: Job does not use the distroless etcd image" "${etcd_rbac}" "quay.io/coreos/etcd"
+# default off: the bootstrap Job is absent from the full render (--show-only would
+# error on an empty template and leak the filename, so render the whole chart).
+etcd_norbac=$(helm template platform-etcd "${SCRIPT_DIR}/../../etcd" 2>&1)
+assert_not_contains "etcd RBAC: no Job when disabled" "${etcd_norbac}" "rbac-bootstrap"
+# fail-fast: rbac without tls, and rbac+tls without adminSecret
+etcd_rbac_notls_rc=0
+helm template e "${SCRIPT_DIR}/../../etcd" --set rbac.enabled=true --set rbac.adminSecret=a >/dev/null 2>&1 || etcd_rbac_notls_rc=$?
+assert_eq "etcd RBAC: rbac.enabled without tls fails fast" "1" "$([ "${etcd_rbac_notls_rc}" -ne 0 ] && echo 1 || echo 0)"
+etcd_rbac_noadmin_rc=0
+helm template e "${SCRIPT_DIR}/../../etcd" --set tls.enabled=true --set tls.existingSecret=s --set rbac.enabled=true >/dev/null 2>&1 || etcd_rbac_noadmin_rc=$?
+assert_eq "etcd RBAC: rbac.enabled without adminSecret fails fast" "1" "$([ "${etcd_rbac_noadmin_rc}" -ne 0 ] && echo 1 || echo 0)"
+# empty tenants must fail fast: enabling auth with only root would lock every
+# CN-authenticated agent out of the keyspace (review #1).
+etcd_rbac_notenants_rc=0
+helm template e "${SCRIPT_DIR}/../../etcd" --set tls.enabled=true --set tls.existingSecret=s \
+  --set rbac.enabled=true --set rbac.adminSecret=a >/dev/null 2>&1 || etcd_rbac_notenants_rc=$?
+assert_eq "etcd RBAC: rbac.enabled with no tenants fails fast (avoids agent lockout)" "1" "$([ "${etcd_rbac_notenants_rc}" -ne 0 ] && echo 1 || echo 0)"
 # fail-fast on contradictory etcd config (bundled deployed but unused)
 etcd_orphan_rc=0
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" --set 'etcd.enabled=true' >/dev/null 2>&1 || etcd_orphan_rc=$?

@@ -1,0 +1,37 @@
+# Overlay on values-agent.yaml + values-agent-etcd.yaml: the bundled etcd serves
+# mutual TLS and enforces per-tenant RBAC (#184). The cert Secrets (etcd-server-tls,
+# etcd-admin-tls, etcd-client-tls) are created by test-agent-etcd-tls.sh BEFORE install.
+# The release MUST be `pgetcdtls` so the agent's ETCD_PREFIX (/pg-ha/<release>/) and
+# the client-cert CN match the tenant grant below.
+etcd:
+  enabled: true
+  replicaCount: 3
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  persistence:
+    size: 1Gi
+  tls:
+    enabled: true
+    existingSecret: etcd-server-tls
+    clientCertAuth: true
+    peer:
+      enabled: true
+  rbac:
+    enabled: true
+    adminSecret: etcd-admin-tls
+    tenants:
+      - commonName: pgetcdtls
+        prefix: /pg-ha/pgetcdtls/
+
+repmgr:
+  agent:
+    dcs:
+      backend: etcd
+      etcd:
+        tls:
+          secretName: etcd-client-tls

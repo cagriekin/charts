@@ -1,6 +1,13 @@
 {{- $full := include "etcd.fullname" . -}}
 {{- $headless := printf "%s-headless" $full -}}
 {{- $fqdnSuffix := printf "%s.%s.svc.%s" $headless .Release.Namespace .Values.clusterDomain -}}
+{{- $clientScheme := include "etcd.clientScheme" . -}}
+{{- $peerScheme := include "etcd.peerScheme" . -}}
+{{- $tlsPath := "/etc/etcd/tls" -}}
+{{- $peerSecret := include "etcd.peerSecret" . -}}
+{{- $peerSeparate := and .Values.tls.enabled .Values.tls.peer.enabled (ne $peerSecret .Values.tls.existingSecret) -}}
+{{- $peerPath := ternary "/etc/etcd/peer-tls" $tlsPath $peerSeparate -}}
+{{- if .Values.tls.enabled }}{{- if not .Values.tls.existingSecret }}{{ fail "etcd: tls.enabled requires tls.existingSecret (a Secret with keys tls.crt, tls.key, ca.crt)" }}{{- end }}{{- end -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -71,19 +78,41 @@ spec:
             - name: ETCD_DATA_DIR
               value: /etcd-data
             - name: ETCD_LISTEN_PEER_URLS
-              value: http://0.0.0.0:{{ .Values.peerPort }}
+              value: {{ $peerScheme }}://0.0.0.0:{{ .Values.peerPort }}
             - name: ETCD_LISTEN_CLIENT_URLS
-              value: http://0.0.0.0:{{ .Values.clientPort }}
+              value: {{ $clientScheme }}://0.0.0.0:{{ .Values.clientPort }}
             - name: ETCD_INITIAL_ADVERTISE_PEER_URLS
-              value: http://$(POD_NAME).{{ $fqdnSuffix }}:{{ .Values.peerPort }}
+              value: {{ $peerScheme }}://$(POD_NAME).{{ $fqdnSuffix }}:{{ .Values.peerPort }}
             - name: ETCD_ADVERTISE_CLIENT_URLS
-              value: http://$(POD_NAME).{{ $fqdnSuffix }}:{{ .Values.clientPort }}
+              value: {{ $clientScheme }}://$(POD_NAME).{{ $fqdnSuffix }}:{{ .Values.clientPort }}
             - name: ETCD_INITIAL_CLUSTER
               value: {{ include "etcd.initialCluster" . | quote }}
             - name: ETCD_INITIAL_CLUSTER_STATE
               value: "new"
             - name: ETCD_INITIAL_CLUSTER_TOKEN
               value: {{ $full | quote }}
+{{- if .Values.tls.enabled }}
+            # client TLS (transport + optional mutual auth)
+            - name: ETCD_CERT_FILE
+              value: {{ $tlsPath }}/tls.crt
+            - name: ETCD_KEY_FILE
+              value: {{ $tlsPath }}/tls.key
+            - name: ETCD_TRUSTED_CA_FILE
+              value: {{ $tlsPath }}/ca.crt
+            - name: ETCD_CLIENT_CERT_AUTH
+              value: {{ .Values.tls.clientCertAuth | quote }}
+{{- if .Values.tls.peer.enabled }}
+            # peer TLS (the member-to-member mesh always mutually authenticates)
+            - name: ETCD_PEER_CERT_FILE
+              value: {{ $peerPath }}/tls.crt
+            - name: ETCD_PEER_KEY_FILE
+              value: {{ $peerPath }}/tls.key
+            - name: ETCD_PEER_TRUSTED_CA_FILE
+              value: {{ $peerPath }}/ca.crt
+            - name: ETCD_PEER_CLIENT_CERT_AUTH
+              value: "true"
+{{- end }}
+{{- end }}
           ports:
             - name: client
               containerPort: {{ .Values.clientPort }}
@@ -92,18 +121,44 @@ spec:
               containerPort: {{ .Values.peerPort }}
               protocol: TCP
           readinessProbe:
+{{- if .Values.tls.enabled }}
+            # under client-cert-auth the HTTP probe cannot authenticate, so check
+            # health with etcdctl + the mounted certs instead.
+            exec:
+              command:
+                - /usr/local/bin/etcdctl
+                - --cacert={{ $tlsPath }}/ca.crt
+                - --cert={{ $tlsPath }}/tls.crt
+                - --key={{ $tlsPath }}/tls.key
+                - --endpoints=https://127.0.0.1:{{ .Values.clientPort }}
+                - endpoint
+                - health
+{{- else }}
             # /health reports 200 only once the member can reach quorum, so a member
             # joins endpoints only when actually usable.
             httpGet:
               path: /health
               port: client
+{{- end }}
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 6
           livenessProbe:
+{{- if .Values.tls.enabled }}
+            exec:
+              command:
+                - /usr/local/bin/etcdctl
+                - --cacert={{ $tlsPath }}/ca.crt
+                - --cert={{ $tlsPath }}/tls.crt
+                - --key={{ $tlsPath }}/tls.key
+                - --endpoints=https://127.0.0.1:{{ .Values.clientPort }}
+                - endpoint
+                - health
+{{- else }}
             tcpSocket:
               port: client
+{{- end }}
             initialDelaySeconds: 15
             periodSeconds: 20
             timeoutSeconds: 5
@@ -113,10 +168,32 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /etcd-data
-{{- if not .Values.persistence.enabled }}
+{{- if .Values.tls.enabled }}
+            - name: etcd-tls
+              mountPath: {{ $tlsPath }}
+              readOnly: true
+{{- if $peerSeparate }}
+            - name: etcd-peer-tls
+              mountPath: {{ $peerPath }}
+              readOnly: true
+{{- end }}
+{{- end }}
+{{- if or .Values.tls.enabled (not .Values.persistence.enabled) }}
       volumes:
+{{- if not .Values.persistence.enabled }}
         - name: data
           emptyDir: {}
+{{- end }}
+{{- if .Values.tls.enabled }}
+        - name: etcd-tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret | quote }}
+{{- if $peerSeparate }}
+        - name: etcd-peer-tls
+          secret:
+            secretName: {{ $peerSecret | quote }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
