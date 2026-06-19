@@ -24,7 +24,11 @@ data:
     repo1-path=/{{ .Values.pgbackrest.s3.prefix }}/{{ include "pg.fullname" . }}
     repo1-retention-full={{ .Values.pgbackrest.retention.full }}
     repo1-retention-diff={{ .Values.pgbackrest.retention.diff }}
+    {{- if .Values.pgbackrest.repoEncryption.enabled }}
+    repo1-cipher-type={{ .Values.pgbackrest.repoEncryption.cipherType }}
+    {{- else }}
     repo1-cipher-type=none
+    {{- end }}
     start-fast=y
     log-level-console=info
     compress-type=zst

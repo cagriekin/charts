@@ -548,6 +548,18 @@ pgbackrest:
     accessKeyIdKey: access-key-id
     secretAccessKeyKey: secret-access-key
 
+  # Encrypt the pgBackRest repository at rest in S3 (#120). Off by default
+  # (repo1-cipher-type=none). When enabled, the passphrase is supplied to
+  # pgbackrest via the PGBACKREST_REPO1_CIPHER_PASS env from an existingSecret --
+  # never written into the ConfigMap. The passphrase is fixed for the life of the
+  # repository: changing it cannot decrypt existing backups (create a new stanza).
+  repoEncryption:
+    enabled: false
+    cipherType: aes-256-cbc
+    existingSecret:
+      name: ""
+      passphraseKey: cipher-pass
+
   retention:
     full: 4
     diff: 14

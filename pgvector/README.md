@@ -800,6 +800,10 @@ helm install my-pgvector cagriekin/pgvector \
 | `pgbackrest.existingSecret.name` | Secret containing S3 credentials (required when `keyType: shared`) | `""` |
 | `pgbackrest.existingSecret.accessKeyIdKey` | Key for access key ID in secret | `access-key-id` |
 | `pgbackrest.existingSecret.secretAccessKeyKey` | Key for secret access key in secret | `secret-access-key` |
+| `pgbackrest.repoEncryption.enabled` | Encrypt the pgBackRest repository at rest in S3 (`repo1-cipher-type`). Passphrase via `PGBACKREST_REPO1_CIPHER_PASS` env, never the ConfigMap. Fixed for the repo's life. | `false` |
+| `pgbackrest.repoEncryption.cipherType` | Cipher when encryption is enabled | `aes-256-cbc` |
+| `pgbackrest.repoEncryption.existingSecret.name` | Secret holding the repository passphrase (required when encryption is enabled) | `""` |
+| `pgbackrest.repoEncryption.existingSecret.passphraseKey` | Key for the passphrase in that secret | `cipher-pass` |
 | `pgbackrest.retention.full` | Number of full backups to retain | `4` |
 | `pgbackrest.retention.diff` | Number of differential backups to retain | `14` |
 | `pgbackrest.schedule.full` | Cron schedule for full backups | `0 1 * * 0` |
