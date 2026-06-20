@@ -18,7 +18,12 @@ detail.
   repmgr can open the replication connection the rewind needs, instead of an inline
   conninfo password that did not reach it. Data safety is unchanged (the re-clone
   fallback remains); this restores the efficient O(diverged-WAL) path over an
-  O(database-size) base backup on large databases.
+  O(database-size) base backup on large databases. Working rewind also exposed a
+  latent agent-failover bug: the agent read a standby's timeline from the laggy
+  control file, so a streaming-caught-up standby was wrongly rejected by the `#125`
+  highwater guard on failover; it now reads
+  `GREATEST(checkpoint timeline, pg_control_recovery.min_recovery_end_timeline)`. See
+  the pg CHANGELOG for detail.
 - **Scaling `postgresql.replicaCount` down no longer leaves permanent ghost rows in
   `repmgr.nodes` (#139):** the primary now reconciles `repmgr.nodes` against the live
   ordinal range each tick and unregisters records for pods the StatefulSet no longer

@@ -24,6 +24,19 @@ cleanup described below.
   Data safety is unchanged (the re-clone fallback remains for genuine rewind
   failures); this only restores the efficient path on large databases. The live
   failover suite now asserts the rewind path engages.
+  - Working rewind exposed a latent agent-failover bug it had been masking: the
+    agent read a standby's timeline from the control file (`pg_control_checkpoint`),
+    which only advances at a restartpoint, so a node that had followed a newly
+    promoted primary onto a higher timeline by streaming — but not yet checkpointed
+    — reported the old timeline and was wrongly rejected by the `#125` highwater guard
+    on a subsequent failover (it could acquire the lease but refused to promote, so
+    leadership never moved). The full re-clone used to hide this by copying the
+    primary's control file at the new timeline. The agent now reads a standby's
+    timeline as `GREATEST(checkpoint timeline, pg_control_recovery.min_recovery_end_timeline)`
+    — the recovery-end timeline advances as the standby replays the timeline switch and
+    persists in the control file after the upstream dies (the failover moment), so a
+    streaming-caught-up standby reports its true timeline and promotes; data
+    completeness remains the separate LSN/most-advanced-replica check.
 - **Scaling `postgresql.replicaCount` down no longer leaves permanent ghost rows in
   `repmgr.nodes` (#139).** The StatefulSet trims the highest ordinals, but their
   `repmgr.nodes` records used to remain `active=true` forever — repmgrd kept retrying

@@ -13,9 +13,9 @@ type fakeExec struct {
 	role      string // pg_is_in_recovery output ("t"/"f"/"")
 	primary   string // pg_walfile_name(...)|pg_current_wal_lsn() output
 	standby   string // GREATEST(receive, replay) output
-	standbyTL string // pg_control_checkpoint timeline_id output (decimal)
+	standbyTL string // StandbyTimeline GREATEST(checkpoint TL, min_recovery_end_timeline) output (decimal)
 	sysID     string // pg_control_system() system_identifier output (decimal)
-	walRcv    string // pg_stat_wal_receiver "sender_host|status" output
+	walRcv    string // StreamingUpstream "sender_host|status" output
 	nodes     string // SELECT node_id FROM repmgr.nodes output (newline-separated)
 	err       error  // if set, every call fails (node unreachable)
 }
@@ -28,7 +28,11 @@ func (f fakeExec) Run(_ context.Context, _ []string, _ string, args ...string) (
 	switch {
 	case strings.Contains(sql, "repmgr.nodes"):
 		return f.nodes, nil
-	case strings.Contains(sql, "pg_stat_wal_receiver"):
+	// StandbyTimeline reads GREATEST(checkpoint TL, min_recovery_end_timeline); match
+	// it on the distinctive recovery field.
+	case strings.Contains(sql, "min_recovery_end_timeline"):
+		return f.standbyTL, nil
+	case strings.Contains(sql, "sender_host"):
 		return f.walRcv, nil
 	case strings.Contains(sql, "pg_is_in_recovery"):
 		return f.role, nil
@@ -83,6 +87,42 @@ func TestProbeStandbyTimelineUnreadable(t *testing.T) {
 	ns := p.Probe(context.Background(), ConnInfo{Host: "pod-1"})
 	if ns.TimelineOK {
 		t.Errorf("unreadable standby timeline must be TimelineOK=false, got %d", ns.Timeline)
+	}
+}
+
+// sqlCaptureExec records the last SQL it was asked to run and returns a fixed result.
+type sqlCaptureExec struct {
+	lastSQL string
+	ret     string
+}
+
+func (e *sqlCaptureExec) Run(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+	e.lastSQL = args[len(args)-1]
+	return e.ret, nil
+}
+
+// StandbyTimeline must read the recovery-end timeline
+// (pg_control_recovery.min_recovery_end_timeline) GREATEST'd with the checkpoint
+// timeline -- a standby that has followed a new timeline by streaming but not yet
+// checkpointed reports the new timeline, and that signal PERSISTS in the control file
+// after the upstream dies (unlike pg_stat_wal_receiver, which vanishes at the failover
+// moment), so the #125 highwater guard does not reject a caught-up standby after a
+// pg_rewind rejoin (#178). Guards against reverting to the bare control-file read or
+// to the transient walreceiver field.
+func TestStandbyTimelineUsesRecoveryTimeline(t *testing.T) {
+	e := &sqlCaptureExec{ret: "2"}
+	p := &Prober{Exec: e}
+	tl, ok, err := p.StandbyTimeline(context.Background(), ConnInfo{Host: "x"})
+	if err != nil || !ok || tl != 2 {
+		t.Fatalf("got tl=%d ok=%v err=%v, want 2", tl, ok, err)
+	}
+	for _, needle := range []string{"min_recovery_end_timeline", "pg_control_checkpoint", "GREATEST"} {
+		if !strings.Contains(e.lastSQL, needle) {
+			t.Errorf("StandbyTimeline query missing %q: %s", needle, e.lastSQL)
+		}
+	}
+	if strings.Contains(e.lastSQL, "pg_stat_wal_receiver") {
+		t.Errorf("StandbyTimeline must not depend on the transient pg_stat_wal_receiver: %s", e.lastSQL)
 	}
 }
 
