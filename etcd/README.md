@@ -99,6 +99,14 @@ The server certificate (e.g. a cert-manager `Certificate`) **must**:
 - carry **both** server-auth and client-auth usages — the readiness/liveness probes run
   `etcdctl endpoint health` with this cert as a client. With cert-manager:
   `usages: [server auth, client auth]`.
+- **when `rbac.enabled`, set the certificate's Common Name to `rbac.healthCheckCN`
+  (default `etcd-healthcheck`).** Under `--client-cert-auth` etcd derives the request user
+  from the client-cert CN; the probe presents this server cert, so its CN must map to the
+  read-only health user the bootstrap Job creates. Otherwise the CN maps to no user and
+  every probe logs `cannot find a user for permission check` at ERROR. (The probe still
+  passes — etcdctl treats permission-denied as healthy — so this is log noise, not a
+  broken health check.) The CN is otherwise unused — tenant clients verify the server by
+  SAN, not CN — so this is free to set.
 
 The parent `pg`/`pgvector` agent then connects over `https` with its own client cert via
 `repmgr.agent.dcs.etcd.tls.secretName`; with the bundled etcd the parent auto-switches the
@@ -163,8 +171,9 @@ matching `prefix`.
 | `tls.peer.enabled` / `tls.peer.existingSecret` | encrypt the member mesh / its cert Secret | `true` / `""` |
 | `rbac.enabled` | per-tenant key-prefix isolation (needs `tls.enabled` + `clientCertAuth`) | `false` |
 | `rbac.adminSecret` | admin client cert Secret (CN must be `root`) | `""` |
+| `rbac.healthCheckCN` | CN of the read-only health user; the server cert's CN must equal it | `etcd-healthcheck` |
 | `rbac.tenants` | per-tenant grants (`[{commonName, prefix}]`) | `[]` |
-| `rbac.bootstrapImage` | image running `pg-ha-agent rbac-bootstrap` (etcd image has no shell) | `cagriekin/repmgr:trixie-5.5.0-22` |
+| `rbac.bootstrapImage` | image running `pg-ha-agent rbac-bootstrap` (etcd image has no shell) | `cagriekin/repmgr:trixie-5.5.0-24` |
 | `rbac.resources` | bootstrap Job container resources | small requests/limits |
 | `networkPolicy.enabled` | ingress lockdown (needs a NP-enforcing CNI) | `true` |
 | `networkPolicy.allowedClients` | cross-namespace client allow-list for a shared etcd (`[{namespace, podSelector?}]`) | `[]` |

@@ -48,7 +48,11 @@ gen_cert() {
 }
 SERVER_SAN="DNS:${ETCD_FULL},DNS:${ETCD_FULL}.${NAMESPACE}.svc,DNS:${ETCD_FULL}.${NAMESPACE}.svc.cluster.local,DNS:*.${ETCD_FULL}-headless.${NAMESPACE}.svc.cluster.local,DNS:localhost,IP:127.0.0.1"
 gen_ca
-gen_cert server "${ETCD_FULL}" "${SERVER_SAN}" "serverAuth,clientAuth"
+# The server cert's CN is the health user (#187): under client-cert-auth the probe
+# presents this cert and etcd derives the user from its CN, so it must equal
+# rbac.healthCheckCN (default etcd-healthcheck). Clients verify the server by SAN, not
+# CN, so serving is unaffected.
+gen_cert server "etcd-healthcheck" "${SERVER_SAN}" "serverAuth,clientAuth"
 gen_cert admin  "root"         ""               "clientAuth"
 gen_cert client "${TENANT_CN}" ""               "clientAuth"
 certs_ok=$([[ -s "${CERTDIR}/server.crt" && -s "${CERTDIR}/admin.crt" && -s "${CERTDIR}/client.crt" ]] && echo ok || echo fail)
@@ -97,6 +101,15 @@ plain_rc=0
 kubectl exec -n "${NAMESPACE}" "${ETCD_FULL}-0" -c etcd -- \
   etcdctl --endpoints=http://127.0.0.1:2379 endpoint health >/dev/null 2>&1 || plain_rc=$?
 assert_gt "etcd: plaintext client is rejected (TLS-only)" "${plain_rc}" "0"
+
+# #187: with the read-only health user (CN = the server cert CN = etcd-healthcheck), the
+# liveness/readiness probes authenticate cleanly -- no "cannot find a user" ERROR spam.
+# Probes have already run (members are Ready). Read the logs WITHOUT swallowing errors so a
+# failed/empty log read aborts the suite (set -e) instead of masquerading as a clean log.
+hc_logs=$(kubectl logs "${ETCD_FULL}-0" -c etcd -n "${NAMESPACE}" --tail=500)
+[ -n "${hc_logs}" ] || { echo "FATAL: empty etcd log read for #187 assertion"; exit 1; }
+hc_err=$(grep -c "cannot find a user for permission check" <<<"${hc_logs}" || true)
+assert_eq "#187: no 'cannot find a user' ERROR spam (server cert CN maps to the read-only health user)" "0" "${hc_err}"
 
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 600
 

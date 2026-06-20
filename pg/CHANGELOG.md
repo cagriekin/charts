@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 1.1.8 - 2026-06-21
+
+Quiets the etcd RBAC health-probe noise (#187). Bundles `etcd` 0.1.5; image moves to
+`trixie-5.5.0-24`. Only affects the opt-in shared-etcd TLS+RBAC path; no rendered change
+at defaults.
+
+### Fixed
+
+- **etcd RBAC health probe no longer spams `cannot find a user for permission check`
+  (#187).** With the bundled etcd's `tls.clientCertAuth` + `rbac.enabled`, the
+  liveness/readiness probe presents the server cert, whose CN maps to no registered etcd
+  user, so etcd logged this ERROR on every probe interval. (The probe still passed and
+  quorum was still verified — `etcdctl endpoint health` treats permission-denied as
+  healthy — so this was log noise, not a broken health check.) The `rbac-bootstrap` Job
+  now provisions a dedicated **read-only health user** (read on the single `health` key
+  the probe ranges), and the etcd server cert's CN is set to it
+  (`etcd.rbac.healthCheckCN`, default `etcd-healthcheck`), so the probe authenticates
+  cleanly and the log clears. The server cert CN is otherwise unused (clients verify by
+  SAN), so this costs no new Secret. **Action for existing shared-etcd TLS+RBAC users:**
+  reissue the etcd server cert with `CN=etcd-healthcheck` (see the etcd chart README).
+
 ## 1.1.7 - 2026-06-20
 
 Fixes an agent-mode rolling-restart deadlock (#186). Image moves to

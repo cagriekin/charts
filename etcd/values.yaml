@@ -72,13 +72,21 @@ rbac:
   # `auth enable` requires. Secret keys: tls.crt, tls.key, ca.crt. Required when
   # rbac.enabled.
   adminSecret: ""
+  # Common Name of the read-only health user the bootstrap Job creates (#187). Under
+  # client-cert-auth the liveness/readiness probe presents the SERVER cert; etcd derives
+  # the user from its CN. So the SERVER cert's CN MUST equal this value, and the bootstrap
+  # grants it read on the single "health" key the probe ranges -- otherwise the CN maps to
+  # no user and every probe logs "cannot find a user for permission check" at ERROR. (The
+  # probe still passes -- etcdctl treats permission-denied as healthy -- so this is log
+  # noise, not a broken health check.) Set to "" to disable (keeps the noise).
+  healthCheckCN: etcd-healthcheck
   # The bootstrap Job runs `pg-ha-agent rbac-bootstrap`, which drives the etcd Auth
   # API via the Go client -- the bundled etcd image is distroless (no shell; it ships
   # etcd + etcdctl only), so the Job uses the pg-ha-agent (repmgr) image instead. Keep
   # the tag in lockstep with the pg/pgvector repmgr image when sharing one etcd.
   bootstrapImage:
     repository: cagriekin/repmgr
-    tag: trixie-5.5.0-22
+    tag: trixie-5.5.0-24
     digest: ""
     pullPolicy: IfNotPresent
   # Resources for the short-lived bootstrap Job container.

@@ -56,6 +56,11 @@ spec:
             # so the admin cert's CN must be "root".
             - name: ETCD_RBAC_ROOT_CN
               value: "root"
+            # Read-only health user (#187): its CN must equal the SERVER cert's CN, which
+            # the liveness/readiness probe presents, so the probe stops logging
+            # "cannot find a user for permission check". Empty disables (no health user).
+            - name: ETCD_RBAC_HEALTHCHECK_CN
+              value: {{ .Values.rbac.healthCheckCN | quote }}
             - name: ETCD_RBAC_TENANTS
               value: {{ .Values.rbac.tenants | toJson | quote }}
           volumeMounts:
