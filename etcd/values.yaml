@@ -78,7 +78,7 @@ rbac:
   # the tag in lockstep with the pg/pgvector repmgr image when sharing one etcd.
   bootstrapImage:
     repository: cagriekin/repmgr
-    tag: trixie-5.5.0-23
+    tag: trixie-5.5.0-22
     digest: ""
     pullPolicy: IfNotPresent
   # Resources for the short-lived bootstrap Job container.
