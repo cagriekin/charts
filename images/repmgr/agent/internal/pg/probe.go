@@ -157,14 +157,33 @@ func (p *Prober) StandbyReceiveLSN(ctx context.Context, ci ConnInfo) (recv LSN, 
 	return recv, true, nil
 }
 
-// StandbyTimeline reads a standby's current timeline from the control file
-// (pg_control_checkpoint), since pg_walfile_name(pg_current_wal_lsn()) is
-// primary-only -- without it a RUNNING standby has no timeline, so unsafeToServe's
-// "timeline unreadable" guard would refuse to ever promote it (failover would
-// livelock). The control-file timeline is printed decimal, like pg_controldata
-// (NOT the hex WAL-file timeline), so it is parsed base 10.
+// StandbyTimeline reads a standby's current timeline as the GREATER of its
+// control-file checkpoint timeline and its minimum-recovery-end timeline
+// (pg_control_recovery.min_recovery_end_timeline). pg_walfile_name(pg_current_wal_lsn())
+// is primary-only, so without a timeline a RUNNING standby would trip unsafeToServe's
+// "timeline unreadable" guard and never promote (failover livelock).
+//
+// The checkpoint timeline alone is NOT enough: it only advances at a restartpoint, so
+// a standby that has FOLLOWED a newly-promoted primary onto a higher timeline by
+// streaming, but not yet checkpointed, still reports the OLD timeline. That made the
+// #125 highwater guard reject a genuinely caught-up standby on failover -- masked
+// while a rejoin always fell back to a full re-clone (which copied the primary's
+// control file at the new timeline), but exposed once pg_rewind rejoin works (#178):
+// the rewound node streams the new timeline while its checkpoint timeline lags.
+//
+// min_recovery_end_timeline is the timeline of the furthest WAL the standby has
+// durably received/flushed during recovery; it advances as the standby replays the
+// timeline switch -- ahead of the checkpoint -- and, crucially, PERSISTS in the
+// control file after the upstream dies (unlike pg_stat_wal_receiver.received_tli, which
+// vanishes the instant the walreceiver disconnects -- i.e. exactly at the failover
+// moment when promotion is decided). So GREATEST gives the node's true current
+// timeline even mid-failover; whether it has all committed WAL is the separate
+// LSN/most-advanced-replica check, not this timeline-staleness gate. The recovery
+// timeline is NULL/0 outside recovery (COALESCE -> 0, GREATEST falls back to the
+// checkpoint timeline). Both are decimal (like pg_controldata, NOT the hex WAL-file
+// timeline), parsed base 10.
 func (p *Prober) StandbyTimeline(ctx context.Context, ci ConnInfo) (tl Timeline, ok bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT timeline_id FROM pg_control_checkpoint();")
+	out, err := p.psql(ctx, ci, "SELECT GREATEST((SELECT timeline_id FROM pg_control_checkpoint()), COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0));")
 	if err != nil {
 		return 0, false, err
 	}
