@@ -880,6 +880,13 @@ done
 assert_eq "agent: all required agent env vars present (Load fail-fast)" "" "${agent_env_missing}"
 assert_contains "agent: metrics port 9200 exposed" "${agent_pg_cont}" "containerPort: 9200"
 assert_contains "agent: liveness probes the agent /healthz" "${agent_pg_cont}" "path: /healthz"
+# #186: agent-mode readiness is replication-aware -- a standby is Ready only when its
+# walreceiver is streaming, so RollingUpdate won't roll the primary/clone-source while
+# a standby is mid-clone. Primary readiness stays plain pg_isready.
+assert_contains "agent #186: readiness checks recovery role" "${agent_pg_cont}" "SELECT pg_is_in_recovery()"
+assert_contains "agent #186: standby readiness gated on streaming" "${agent_pg_cont}" "SELECT status FROM pg_stat_wal_receiver"
+# repmgrd mode keeps the bare pg_isready readiness probe (byte-stable).
+assert_not_contains "repmgrd #186: readiness stays bare pg_isready (no wal_receiver check)" "${repmgrd_sts_hba}" "SELECT status FROM pg_stat_wal_receiver"
 # startupProbe (#172) kept in agent mode
 assert_contains "agent #172: startupProbe kept" "${agent_pg_cont}" "startupProbe:"
 # the agent owns SIGTERM shutdown, so the repmgrd-tuned preStop pg_ctl stop is

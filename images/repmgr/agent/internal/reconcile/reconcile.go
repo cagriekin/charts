@@ -79,6 +79,11 @@ type MarkerState struct {
 	Present   bool
 	Malformed bool // #174: present but unparseable -> fail closed
 	Timeline  pg.Timeline
+	// Primary is the node the marker records as the last-known primary. Used to
+	// decide that an empty-data lease holder which is NOT this primary must release
+	// the lease so the data-bearing primary can acquire and serve (#186); "" when
+	// the marker is absent or carries no primary.
+	Primary string
 }
 
 // Observation is the full input to a decision.
@@ -89,6 +94,9 @@ type Observation struct {
 	Local          LocalState
 	Peers          []PeerState
 	Marker         MarkerState
+	// LocalNode is this pod's name, compared against Marker.Primary so an empty-data
+	// lease holder can tell it is NOT the recorded primary and step aside (#186).
+	LocalNode string
 	// LocalStuck is set by the agent (a stateful, time-based signal) when a
 	// previously-running local primary has been unreachable past the self-health
 	// grace -- a frozen/wedged postmaster that Start cannot recover and the
@@ -138,6 +146,18 @@ func Decide(o Observation) Decision {
 		case !o.Local.HasData && !o.Local.Running:
 			if p := anyReachablePrimary(o.Peers); p != nil {
 				return d(BootstrapClone, p.Name, "hold lease but a live primary exists; clone, never initdb (avoids a divergent cluster)")
+			}
+			// Empty PGDATA while holding the lease and the marker names a DIFFERENT
+			// node as primary: this node cannot serve (it has no data and must not
+			// initdb over the marker), and holding the lease blocks the data-bearing
+			// primary from acquiring and promoting -- the #186 rolling-restart deadlock
+			// (an interrupted clone left this node empty while it held the lease).
+			// Release so the recorded primary takes over; the step-down cooldown lets it
+			// win before this node could re-contend. Only when the marker names a
+			// different node -- if it is malformed, has no primary, or names THIS node
+			// (its own data was lost), fall through to the #170 settle below.
+			if o.Marker.Present && !o.Marker.Malformed && o.Marker.Primary != "" && o.Marker.Primary != o.LocalNode {
+				return d(ReleaseLease, o.Marker.Primary, "empty data holding the lease, but the marker names a different primary; release so the data-bearing primary can acquire and serve (#186)")
 			}
 			if o.Marker.Present || o.Marker.Malformed {
 				return d(Wait, "", "empty data with a marker present; settle before initdb (PVC-loss recreate, #170)")

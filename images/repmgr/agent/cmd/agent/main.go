@@ -441,7 +441,11 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		Present:   m.Present,
 		Malformed: m.Malformed || (m.Present && !m.TimelineOK),
 		Timeline:  pg.Timeline(m.Timeline),
+		Primary:   m.Primary,
 	}
+	// This pod's name, compared against Marker.Primary so an empty-data lease holder
+	// can recognize it is not the recorded primary and release the lease (#186).
+	o.LocalNode = a.cfg.PodName
 	// Maintenance mode (Part H1): an operator-set annotation on the marker ConfigMap
 	// suspends automatic promote/demote/fence/self-health (Decide -> NoOp) while the
 	// agent keeps renewing the Lease and serving.

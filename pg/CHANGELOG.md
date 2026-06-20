@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 1.1.7 - 2026-06-20
+
+Fixes an agent-mode rolling-restart deadlock (#186). Image moves to
+`trixie-5.5.0-23`. No rendered change in repmgrd mode; agent mode gains a
+replication-aware standby readiness probe (below).
+
+### Fixed
+
+- **A rolling restart of a 2-node agent-mode cluster could deadlock with no writable
+  primary (#186).** A within-1.x image bump triggers a StatefulSet `RollingUpdate`;
+  two gaps combined to strand the cluster (data was safe, but writes stopped until
+  manual intervention). Both are now fixed:
+  - **Replication-aware standby readiness.** A standby reported `Ready` on bare
+    `pg_isready` — before its clone/rejoin was durably streaming. Since `RollingUpdate`
+    advances to the next pod only once the current one is Ready, this let the
+    controller roll the primary / clone-source while a standby was still cloning,
+    interrupting the clone. Agent-mode readiness is now role-aware: a primary stays
+    `pg_isready`, but a standby is Ready only once its walreceiver reports
+    `status='streaming'` (`pg_stat_wal_receiver`). The rolling update now serializes
+    safely with no timing dependence. repmgrd-mode readiness is unchanged (byte-stable).
+  - **Release the lease when the node cannot serve.** The `#170` PVC-loss guard
+    correctly refuses to `initdb` an empty node, but the agent kept holding the
+    leadership lease in that `Wait` state, blocking a data-bearing peer from promoting.
+    An empty-data lease holder whose durable primary-marker names a *different* node now
+    releases the lease so that recorded primary acquires and serves (the step-down
+    cooldown lets it win before the empty node re-contends). A node whose own data was
+    lost (the marker names itself) still settles as before. Downgrades any residual
+    interruption from a manual-intervention deadlock to a few-second self-heal.
+  - Covered by a new live `test-agent-rolling` suite (wired into CI) that rolling-restarts
+    a 2-node agent cluster and asserts a single writable primary + re-streaming standby,
+    no manual intervention.
+
 ## 1.1.6 - 2026-06-20
 
 Restores efficient stale-primary recovery (#178) and automatically cleans up the
