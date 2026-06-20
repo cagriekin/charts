@@ -2,20 +2,7 @@
 
 ## Unreleased
 
-## 1.1.5 - 2026-06-19
-
-A monitoring-exporter `/probe` fix (#185). Chart-only; no image change. See the pg
-CHANGELOG for detail; pgvector shares pg's templates.
-
-### Fixed
-
-- **Monitoring user (#28) multi-target `/probe` scrape returned `pg_up=0` on every
-  target.** The exporter `auth_modules` probe DSN had no database, so libpq used the
-  username `monitoring` as the dbname (`database "monitoring" does not exist`). The
-  probe now pins `dbname` to the configured database. Shared fix with the pg chart
-  (templates are symlinked); see the pg CHANGELOG for detail.
-
-## 1.1.5 - 2026-06-19
+## 1.1.6 - 2026-06-20
 
 Restores efficient stale-primary recovery (#178) and auto-cleans ghost
 `repmgr.nodes` rows on scale-down (#139). Image moves to `trixie-5.5.0-22`; bundles
@@ -44,6 +31,19 @@ detail.
   reads), so a fix can't land in only some copies. `init-repmgr.sh` keeps its symmetric
   control-file timeline comparison, avoiding a needless re-clone of a streaming-caught-up
   standby.
+
+## 1.1.5 - 2026-06-19
+
+A monitoring-exporter `/probe` fix (#185). Chart-only; no image change. See the pg
+CHANGELOG for detail; pgvector shares pg's templates.
+
+### Fixed
+
+- **Monitoring user (#28) multi-target `/probe` scrape returned `pg_up=0` on every
+  target.** The exporter `auth_modules` probe DSN had no database, so libpq used the
+  username `monitoring` as the dbname (`database "monitoring" does not exist`). The
+  probe now pins `dbname` to the configured database. Shared fix with the pg chart
+  (templates are symlinked); see the pg CHANGELOG for detail.
 
 ## 1.1.4 - 2026-06-19
 
