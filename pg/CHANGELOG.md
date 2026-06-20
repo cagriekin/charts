@@ -2,25 +2,7 @@
 
 ## Unreleased
 
-## 1.1.5 - 2026-06-19
-
-A monitoring-exporter `/probe` fix (#185). Chart-only; no image change (stays
-`trixie-5.5.0-21`). The exporter ConfigMap changes when
-`prometheusExporter.monitoringUser` is enabled (the default).
-
-### Fixed
-
-- **The least-privilege monitoring user (#28) broke the multi-target `/probe`
-  scrape — every per-target `pg_up` was 0.** The exporter `auth_modules` DSN (used
-  by `/probe`, unlike `DATA_SOURCE_NAME`) carried no database, so libpq defaulted
-  `dbname` to the username `monitoring` and connected to a non-existent `monitoring`
-  database (`pq: database "monitoring" does not exist`). It worked under the old
-  superuser only because `dbname` then defaulted to the always-present `postgres`.
-  The probe DSN now pins `dbname` to the configured database (substituted from
-  `POSTGRES_DATABASE`, the same source as `DATA_SOURCE_NAME` and the only database
-  the monitoring role is granted `CONNECT` on).
-
-## 1.1.5 - 2026-06-19
+## 1.1.6 - 2026-06-20
 
 Restores efficient stale-primary recovery (#178) and automatically cleans up the
 ghost `repmgr.nodes` rows a scale-down used to leave behind (#139). Image moves to
@@ -64,6 +46,24 @@ cleanup described below.
   timeline comparison (both the local node and the primary are read the same way), which
   avoids needlessly re-cloning a standby that has followed a new timeline by streaming
   but not yet checkpointed it.
+
+## 1.1.5 - 2026-06-19
+
+A monitoring-exporter `/probe` fix (#185). Chart-only; no image change (stays
+`trixie-5.5.0-21`). The exporter ConfigMap changes when
+`prometheusExporter.monitoringUser` is enabled (the default).
+
+### Fixed
+
+- **The least-privilege monitoring user (#28) broke the multi-target `/probe`
+  scrape — every per-target `pg_up` was 0.** The exporter `auth_modules` DSN (used
+  by `/probe`, unlike `DATA_SOURCE_NAME`) carried no database, so libpq defaulted
+  `dbname` to the username `monitoring` and connected to a non-existent `monitoring`
+  database (`pq: database "monitoring" does not exist`). It worked under the old
+  superuser only because `dbname` then defaulted to the always-present `postgres`.
+  The probe DSN now pins `dbname` to the configured database (substituted from
+  `POSTGRES_DATABASE`, the same source as `DATA_SOURCE_NAME` and the only database
+  the monitoring role is granted `CONNECT` on).
 
 ## 1.1.4 - 2026-06-19
 
