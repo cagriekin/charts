@@ -694,11 +694,37 @@ spec:
 {{- end }}
 {{- if .Values.postgresql.readinessProbe.enabled }}
           readinessProbe:
+{{- if eq (include "pg.agentMode" .) "true" }}
+            # Agent mode: readiness is replication-aware (#186). A standby reports Ready
+            # only once its walreceiver is actually streaming -- NOT merely when postgres
+            # accepts connections. Because a StatefulSet RollingUpdate advances to the
+            # next pod only after the current one is Ready, gating standby readiness on
+            # streaming stops the controller from rolling the primary / clone-source
+            # while a standby is still cloning or catching up (which interrupted the
+            # clone and deadlocked the cluster). A primary stays plain pg_isready. A
+            # cloning standby (no postgres yet, or walreceiver not yet streaming) is
+            # NotReady by design -- it is not killed (agent-mode liveness is the agent
+            # /healthz heartbeat, and readiness is independent of the startup probe).
+            exec:
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 || exit 1
+                  rec=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()" 2>/dev/null)
+                  if [ "$rec" = "f" ]; then exit 0; fi
+                  if [ "$rec" = "t" ]; then
+                    st=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT status FROM pg_stat_wal_receiver" 2>/dev/null)
+                    [ "$st" = "streaming" ] && exit 0 || exit 1
+                  fi
+                  exit 1
+{{- else }}
             exec:
               command:
                 - /bin/bash
                 - -c
                 - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+{{- end }}
             initialDelaySeconds: {{ .Values.postgresql.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.postgresql.readinessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.postgresql.readinessProbe.timeoutSeconds }}

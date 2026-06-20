@@ -201,6 +201,16 @@ jobs:
           kubectl delete namespace pg-test-scaledown --ignore-not-found --wait=true --timeout=180s \
             || echo "WARNING: namespace cleanup timed out, continuing"
 
+      # Rolling-restart a 2-node agent cluster; assert it converges to a single
+      # writable primary with the standby re-streaming, no deadlock (#186).
+      - name: Run agent rolling-restart test
+        run: make -C pg test-agent-rolling
+
+      - name: Clean up agent rolling namespace
+        run: |
+          kubectl delete namespace pg-test-agent-rolling --ignore-not-found --wait=true --timeout=180s \
+            || echo "WARNING: namespace cleanup timed out, continuing"
+
       # Backup + restore (pg_dump path): stands up MinIO, runs a full backup/restore
       # cycle, drives the restore-validation Job (#31), and exercises the dedicated
       # backup ServiceAccount (#27) and the read-only-rootfs backup/validation

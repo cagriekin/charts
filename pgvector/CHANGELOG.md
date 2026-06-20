@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 1.1.7 - 2026-06-20
+
+Fixes an agent-mode rolling-restart deadlock (#186). Image moves to
+`trixie-5.5.0-23`. pgvector shares pg's templates and image; see the pg CHANGELOG for
+detail.
+
+### Fixed
+
+- **A rolling restart of a 2-node agent-mode cluster could deadlock with no writable
+  primary (#186):** two fixes — (1) **replication-aware standby readiness**, so a
+  standby is Ready only once its walreceiver is `streaming`, stopping `RollingUpdate`
+  from rolling the primary/clone-source mid-clone (primary readiness and repmgrd mode
+  unchanged); and (2) an empty-data lease holder whose durable marker names a
+  *different* primary now **releases the lease** so the data-bearing primary promotes,
+  turning the deadlock into a few-second self-heal. Covered by a new live
+  `test-agent-rolling` suite.
+
 ## 1.1.6 - 2026-06-20
 
 Restores efficient stale-primary recovery (#178) and auto-cleans ghost

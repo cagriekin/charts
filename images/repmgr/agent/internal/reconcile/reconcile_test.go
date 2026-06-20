@@ -43,7 +43,16 @@ func TestDecide(t *testing.T) {
 		{"paused suspends everything", Observation{Paused: true, HoldLease: true, Local: localPrimary}, NoOp, ""},
 
 		{"holder + empty + no peers -> initdb", Observation{HoldLease: true, Local: emptyData}, BootstrapInitdb, ""},
-		{"holder + empty + marker present -> wait/settle", Observation{HoldLease: true, Local: emptyData, Marker: MarkerState{Present: true, Timeline: tl(5)}}, Wait, ""},
+		{"holder + empty + marker present (no primary named) -> wait/settle", Observation{HoldLease: true, Local: emptyData, Marker: MarkerState{Present: true, Timeline: tl(5)}}, Wait, ""},
+		// #186: empty data holding the lease while the marker names a DIFFERENT primary
+		// -> release so the data-bearing primary can acquire (the rolling-restart deadlock).
+		{"holder + empty + marker names a different primary -> release (#186)", Observation{HoldLease: true, Local: emptyData, LocalNode: "pg-1", Marker: MarkerState{Present: true, Timeline: tl(5), Primary: "pg-0"}}, ReleaseLease, "pg-0"},
+		// ...but if the marker names THIS node (its own PVC was lost), settle -- do not
+		// hand off to a node that may be less advanced (#170 self-PVC-loss).
+		{"holder + empty + marker names this node -> wait/settle (#170)", Observation{HoldLease: true, Local: emptyData, LocalNode: "pg-0", Marker: MarkerState{Present: true, Timeline: tl(5), Primary: "pg-0"}}, Wait, ""},
+		// ...and a MALFORMED marker is never trusted to hand off (#174 fail-closed): settle,
+		// even though it names a different primary -- do not release on a corrupt marker.
+		{"holder + empty + malformed marker names a different primary -> wait/settle (#174)", Observation{HoldLease: true, Local: emptyData, LocalNode: "pg-1", Marker: MarkerState{Present: true, Malformed: true, Primary: "pg-0"}}, Wait, ""},
 		{"holder + empty + a live primary -> clone not initdb", Observation{HoldLease: true, Local: emptyData, Peers: []PeerState{primary("pg-1", 5, 5, 0x100)}}, BootstrapClone, "pg-1"},
 
 		{"holder standby caught up most-advanced -> promote", Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{standby("pg-1", 5, 5, 0x80)}}, Promote, ""},
