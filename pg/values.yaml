@@ -150,6 +150,28 @@ postgresql:
     # - "host all all 10.0.0.0/8 md5"
     # - "host replication repmgr 10.0.0.0/8 trust"
 
+  # Client-connection TLS (#110). Off by default (render byte-stable). When enabled,
+  # PostgreSQL serves ssl=on from the cert Secret (BYO, like the etcd TLS block).
+  # NOTE: replication between primary/standby stays plaintext on the pod network --
+  # `require`/`clientCertAuth` never convert the `host replication` or loopback pg_hba
+  # rules, and the chart's internal service users (repmgr, postgres, monitoring) are
+  # exempted from the client-cert requirement so the agent/repmgr/exporter/pgpool keep
+  # working. After rotating the Secret, `kubectl rollout restart` to reload the cert.
+  tls:
+    enabled: false
+    # Secret with the SERVER cert material -- keys: tls.crt, tls.key, ca.crt. Required
+    # when enabled. The certificate MUST list SANs for the write/readonly/pgpool
+    # Services and the headless pod FQDNs that clients connect to. ca.crt is used only
+    # under clientCertAuth (to verify client certs).
+    existingSecret: ""
+    # Reject non-TLS client connections on the pod network (pg_hba hostssl). Clients
+    # must then use sslmode=require or stronger. When true, prometheusExporter.sslmode
+    # and pgpool.tls.backendSslmode must be >= require (enforced by a render guard).
+    require: false
+    # Mutual TLS: app/other users must present a client cert signed by ca.crt
+    # (clientcert=verify-ca). Internal service users are exempted. Implies require.
+    clientCertAuth: false
+
   # When repmgr.enabled is true, re-hash any managed user (POSTGRES_USER,
   # REPMGR_USER) whose stored password is still MD5 to SCRAM at pod startup.
   # Idempotent (no-op once everyone is SCRAM-hashed, and auto-skipped on
@@ -169,7 +191,7 @@ postgresql:
 repmgr:
   image:
     repository: cagriekin/repmgr
-    tag: trixie-5.5.0-24
+    tag: trixie-5.5.0-25
     # Optional digest pin (e.g. "sha256:..."). When set it is appended as
     # repository:tag@digest, so the cosign-signed / provenance-attested image is
     # pinned at deploy time and a mutable-tag repush cannot silently change it.
@@ -328,6 +350,18 @@ pgpool:
   autoFailback: true
   allowClearTextFrontendAuth: false
 
+  # PGPool TLS (#110). Off by default. `enabled` serves frontend TLS (clients->pgpool);
+  # backendSslmode controls pgpool->PostgreSQL (libpq, via PGSSLMODE). Under PostgreSQL
+  # mTLS, set backendClientCert so pgpool can present a client cert to the backends.
+  tls:
+    enabled: false
+    existingSecret: ""        # frontend SERVER cert: tls.crt, tls.key[, ca.crt]
+    clientCertAuth: false     # validate a client cert IF the frontend client presents one
+                              # (sets ssl_ca_cert; needs ca.crt). pool_hba still authenticates
+                              # by password -- it does not by itself REQUIRE a client cert.
+    backendSslmode: prefer    # pgpool -> postgres: disable|prefer|require|verify-ca|verify-full
+    backendClientCert: ""     # Secret (tls.crt, tls.key[, ca.crt]) for pgpool->postgres under mTLS
+
   logging:
     logConnections: true
     logStatement: false
@@ -413,6 +447,17 @@ pgpool:
 
 prometheusExporter:
   enabled: false
+
+  # sslmode for the exporter's connection to PostgreSQL (#110): disable | require |
+  # verify-ca | verify-full. Default disable (byte-stable). When postgresql.tls.require
+  # (or clientCertAuth) is true this must be >= require (a render guard enforces it), since
+  # the server then rejects non-TLS. verify-* additionally validates the server cert
+  # against ca.crt from postgresql.tls.existingSecret (mounted into the exporter). The
+  # exporter connects as the monitoring user, exempt from client-cert auth under mTLS.
+  # NOTE: the exporter scrapes each pod at its SHORT headless name
+  # (<release>-pg-<i>.<release>-pg-headless), so verify-full needs those short names in the
+  # cert SANs; verify-ca (recommended here) verifies the chain without the hostname check.
+  sslmode: disable
 
   # Least-privilege monitoring user (#28). When enabled, a post-install/upgrade
   # hook Job creates a read-only `pg_monitor` role on the primary (replicated to

@@ -132,6 +132,21 @@ spec:
               SUB_PASS=$(printf '%s' "$POSTGRES_PASSWORD" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g')
               SUB_DB="$POSTGRES_DB"
               subst /usr/local/etc/pool_passwd
+{{- if .Values.pgpool.tls.enabled }}
+              # Stage TLS certs from the read-only Secret mounts into the emptyDir with
+              # a 0600 key (pgpool/libpq reject a group/world-readable key), like the
+              # config staging above (#110).
+              mkdir -p /usr/local/etc/tls
+              cp /config-tls/tls.crt /usr/local/etc/tls/tls.crt
+              cp /config-tls/tls.key /usr/local/etc/tls/tls.key
+              chmod 0600 /usr/local/etc/tls/tls.key
+              [ -f /config-tls/ca.crt ] && cp /config-tls/ca.crt /usr/local/etc/tls/ca.crt
+{{- if .Values.pgpool.tls.backendClientCert }}
+              cp /config-tls-backend/tls.crt /usr/local/etc/tls/backend.crt
+              cp /config-tls-backend/tls.key /usr/local/etc/tls/backend.key
+              chmod 0600 /usr/local/etc/tls/backend.key
+{{- end }}
+{{- end }}
           env:
             - name: POSTGRES_USER
               valueFrom:
@@ -165,6 +180,16 @@ spec:
               mountPath: /config
             - name: pgpool-config
               mountPath: /usr/local/etc
+{{- if .Values.pgpool.tls.enabled }}
+            - name: pgpool-tls
+              mountPath: /config-tls
+              readOnly: true
+{{- if .Values.pgpool.tls.backendClientCert }}
+            - name: pgpool-tls-backend
+              mountPath: /config-tls-backend
+              readOnly: true
+{{- end }}
+{{- end }}
       containers:
         - name: pgpool
           image: {{ include "pg.image" .Values.pgpool.image | quote }}
@@ -189,6 +214,22 @@ spec:
               containerPort: 9898
               protocol: TCP
           env:
+{{- if .Values.pgpool.tls.enabled }}
+            # Backend TLS (pgpool -> PostgreSQL) via libpq env (#110). Under PostgreSQL
+            # mTLS, backendClientCert supplies the client cert pgpool presents.
+            - name: PGSSLMODE
+              value: {{ .Values.pgpool.tls.backendSslmode | quote }}
+{{- if has .Values.pgpool.tls.backendSslmode (list "verify-ca" "verify-full") }}
+            - name: PGSSLROOTCERT
+              value: /usr/local/etc/tls/ca.crt
+{{- end }}
+{{- if .Values.pgpool.tls.backendClientCert }}
+            - name: PGSSLCERT
+              value: /usr/local/etc/tls/backend.crt
+            - name: PGSSLKEY
+              value: /usr/local/etc/tls/backend.key
+{{- end }}
+{{- end }}
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
@@ -257,7 +298,7 @@ spec:
             - name: PGPOOL_SERVICE_PORT
               value: "9999"
             - name: SSLMODE
-              value: "disable"
+              value: {{ if .Values.pgpool.tls.enabled }}"require"{{ else }}"disable"{{ end }}
           ports:
             - name: metrics
               containerPort: 9719
@@ -288,4 +329,16 @@ spec:
         - name: pgpool-config
           emptyDir:
             sizeLimit: 16Mi
+{{- if .Values.pgpool.tls.enabled }}
+        - name: pgpool-tls
+          secret:
+            secretName: {{ required "pgpool.tls.enabled requires pgpool.tls.existingSecret (a Secret with keys tls.crt, tls.key[, ca.crt])" .Values.pgpool.tls.existingSecret | quote }}
+            defaultMode: 0444
+{{- if .Values.pgpool.tls.backendClientCert }}
+        - name: pgpool-tls-backend
+          secret:
+            secretName: {{ .Values.pgpool.tls.backendClientCert | quote }}
+            defaultMode: 0444
+{{- end }}
+{{- end }}
 {{- end }}

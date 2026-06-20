@@ -173,3 +173,68 @@ func TestStringRedactsPassword(t *testing.T) {
 		t.Errorf("String() should mask the password: %s", s)
 	}
 }
+
+// --- #110: client-TLS config fields ---
+
+func TestLoadTLSFieldsDefaultOff(t *testing.T) {
+	// fullEnv() sets no TLS vars -> every #110 field is off/empty (existing installs
+	// are unchanged; no "missing" error).
+	c, err := Load(getter(fullEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TLSRequireSSL || c.TLSClientCertAuth {
+		t.Errorf("TLS booleans must default false: require=%v mtls=%v", c.TLSRequireSSL, c.TLSClientCertAuth)
+	}
+	if c.PostgresUser != "" || c.MonitoringUser != "" {
+		t.Errorf("user exemptions must default empty: postgres=%q monitoring=%q", c.PostgresUser, c.MonitoringUser)
+	}
+}
+
+func TestLoadTLSFieldsParsed(t *testing.T) {
+	m := fullEnv()
+	m["TLS_REQUIRE_SSL"] = "true"
+	m["TLS_CLIENT_CERT_AUTH"] = "true"
+	m["POSTGRES_USER"] = "  postgres  " // trimmed
+	m["MONITORING_USER"] = "monitoring"
+	c, err := Load(getter(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.TLSRequireSSL || !c.TLSClientCertAuth {
+		t.Errorf("expected both TLS booleans true: %+v", c)
+	}
+	if c.PostgresUser != "postgres" {
+		t.Errorf("POSTGRES_USER must be trimmed: %q", c.PostgresUser)
+	}
+	if c.MonitoringUser != "monitoring" {
+		t.Errorf("MONITORING_USER mismatch: %q", c.MonitoringUser)
+	}
+}
+
+func TestLoadBoolEnvVariants(t *testing.T) {
+	truthy := []string{"true", "TRUE", "True", "1", "yes", "YES", " true "}
+	falsy := []string{"", "false", "0", "no", "off", "garbage", "2"}
+	for _, v := range truthy {
+		m := fullEnv()
+		m["TLS_REQUIRE_SSL"] = v
+		c, err := Load(getter(m))
+		if err != nil {
+			t.Fatalf("%q: %v", v, err)
+		}
+		if !c.TLSRequireSSL {
+			t.Errorf("TLS_REQUIRE_SSL=%q should parse true", v)
+		}
+	}
+	for _, v := range falsy {
+		m := fullEnv()
+		m["TLS_REQUIRE_SSL"] = v
+		c, err := Load(getter(m))
+		if err != nil {
+			t.Fatalf("%q: %v", v, err)
+		}
+		if c.TLSRequireSSL {
+			t.Errorf("TLS_REQUIRE_SSL=%q should parse false", v)
+		}
+	}
+}
