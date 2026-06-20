@@ -19,7 +19,10 @@ data:
           username: '__POSTGRES_USER__'
           password: '__POSTGRES_PASSWORD__'
         options:
-          sslmode: disable
+          sslmode: {{ .Values.prometheusExporter.sslmode }}
+{{- if has .Values.prometheusExporter.sslmode (list "verify-ca" "verify-full") }}
+          sslrootcert: /etc/postgres_exporter/tls/ca.crt
+{{- end }}
           # The /probe builds its DSN from this auth module (not DATA_SOURCE_NAME);
           # without an explicit dbname libpq defaults it to the username, so the
           # monitoring user would hit a non-existent "monitoring" database (#28).

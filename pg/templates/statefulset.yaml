@@ -2,6 +2,39 @@
 {{- if and (not .Values.repmgr.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
 {{- fail "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr" }}
 {{- end }}
+{{- /* Client TLS validation (#110) */}}
+{{- if .Values.postgresql.tls.enabled }}
+{{- if not .Values.postgresql.tls.existingSecret }}{{ fail "postgresql.tls.enabled requires postgresql.tls.existingSecret (a Secret with keys tls.crt, tls.key, ca.crt)" }}{{- end }}
+{{- end }}
+{{- if and (or .Values.postgresql.tls.require .Values.postgresql.tls.clientCertAuth) (not .Values.postgresql.tls.enabled) }}
+{{- fail "postgresql.tls.require / clientCertAuth require postgresql.tls.enabled" }}
+{{- end }}
+{{- /* require/mTLS are enforced via the agent-assembled pg_hba (hostssl). In repmgrd
+       mode pg_hba carries an md5-fallback line that would bypass a hostssl rule, so
+       enforced TLS is unsafe there -- server TLS (ssl=on) still works; clients can opt
+       in with sslmode=require, or add explicit hostssl rules via postgresql.pgHba. */}}
+{{- if and (or .Values.postgresql.tls.require .Values.postgresql.tls.clientCertAuth) (ne (include "pg.agentMode" .) "true") }}
+{{- fail "postgresql.tls.require / clientCertAuth are supported only in agent mode (repmgr.failoverMode=agent). In repmgrd mode use postgresql.tls.enabled for optional server TLS; enforced TLS needs agent mode." }}
+{{- end }}
+{{- /* Cross-component sslmode consistency: when the server requires TLS, the exporter
+       must also use TLS or its scrapes are rejected by hostssl. clientCertAuth forces
+       hostssl on its own (it implies require in AssemblePgHba), so guard on either. */}}
+{{- $tlsRequired := or .Values.postgresql.tls.require .Values.postgresql.tls.clientCertAuth }}
+{{- if and $tlsRequired .Values.prometheusExporter.enabled (eq .Values.prometheusExporter.sslmode "disable") }}
+{{- fail "postgresql.tls.require/clientCertAuth requires prometheusExporter.sslmode >= require (else the exporter's scrapes are rejected by hostssl). Set prometheusExporter.sslmode: require (or verify-ca/verify-full)." }}
+{{- end }}
+{{- if and (has .Values.prometheusExporter.sslmode (list "verify-ca" "verify-full")) (not .Values.postgresql.tls.enabled) }}
+{{- fail "prometheusExporter.sslmode verify-ca/verify-full requires postgresql.tls.enabled (the CA from postgresql.tls.existingSecret is mounted to verify the server cert)." }}
+{{- end }}
+{{- /* pgpool backend must also speak TLS when the server requires it. */}}
+{{- if and $tlsRequired .Values.pgpool.enabled .Values.pgpool.tls.enabled (eq .Values.pgpool.tls.backendSslmode "disable") }}
+{{- fail "postgresql.tls.require/clientCertAuth requires pgpool.tls.backendSslmode >= require (else pgpool's backend connections are rejected by hostssl). Set pgpool.tls.backendSslmode: require (or verify-ca/verify-full)." }}
+{{- end }}
+{{- /* Under PostgreSQL mTLS, application connections passing through pgpool need pgpool
+       to present a backend client cert (the app users are not exempted from clientcert). */}}
+{{- if and .Values.postgresql.tls.clientCertAuth .Values.pgpool.enabled (or (not .Values.pgpool.tls.enabled) (not .Values.pgpool.tls.backendClientCert)) }}
+{{- fail "postgresql.tls.clientCertAuth=true with pgpool.enabled requires pgpool.tls.enabled and pgpool.tls.backendClientCert (a client cert pgpool presents to the backends for app-user passthrough under mTLS)." }}
+{{- end }}
 {{- if .Values.repmgr.enabled }}
 {{- $repmgrMajor := required "repmgr.image.majorVersion is required (the PostgreSQL major bundled in the repmgr image)" .Values.repmgr.image.majorVersion }}
 {{- if ne (toString .Values.postgresql.majorVersion) (toString $repmgrMajor) }}
@@ -68,9 +101,9 @@ spec:
       labels:
         {{- include "pg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: postgresql
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.podAnnotations }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.podAnnotations }}
       annotations:
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled }}
         checksum/postgresql-config: {{ include (print $.Template.BasePath "/postgresql-configmap.yaml") . | sha256sum }}
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
@@ -259,7 +292,7 @@ spec:
             - -c
             - |
               CONF=/var/lib/postgresql/data/pgdata/postgresql.conf
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled }}
               if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
                 echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
               fi
@@ -393,6 +426,19 @@ spec:
             - name: POSTGRESQL_PGHBA
               value: {{ join "\n" . | quote }}
 {{- end }}
+{{- if .Values.postgresql.tls.enabled }}
+            {{- /* Client TLS pg_hba (#110): the agent emits hostssl on the pod CIDR
+                   when require/clientCertAuth, exempting the internal service users
+                   (repmgr/postgres/monitoring) from the client-cert requirement. */}}
+            - name: TLS_REQUIRE_SSL
+              value: {{ .Values.postgresql.tls.require | quote }}
+            - name: TLS_CLIENT_CERT_AUTH
+              value: {{ .Values.postgresql.tls.clientCertAuth | quote }}
+{{- if and .Values.prometheusExporter.enabled .Values.prometheusExporter.monitoringUser.enabled }}
+            - name: MONITORING_USER
+              value: {{ .Values.prometheusExporter.monitoringUser.username | quote }}
+{{- end }}
+{{- end }}
             - name: DCS_BACKEND
               value: {{ (.Values.repmgr.agent.dcs).backend | default "kubernetes" | quote }}
 {{- if eq (include "pg.agentEtcdMode" .) "true" }}
@@ -466,7 +512,7 @@ spec:
                   - |
                     for i in {1..30}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
-                        {{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
+                        {{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled }}
                         CONF="$PGDATA/postgresql.conf"
                         if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
                           echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
@@ -505,7 +551,7 @@ spec:
                   - |
                     for i in {1..90}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
-                        {{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
+                        {{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled }}
                         CONF="$PGDATA/postgresql.conf"
                         if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
                           echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
@@ -737,9 +783,14 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled }}
             - name: postgresql-config
               mountPath: /etc/postgresql/conf.d
+              readOnly: true
+{{- end }}
+{{- if .Values.postgresql.tls.enabled }}
+            - name: postgresql-tls
+              mountPath: /etc/postgresql/tls
               readOnly: true
 {{- end }}
 {{- if .Values.postgresql.extensions.enabled }}
@@ -999,12 +1050,21 @@ spec:
           resources:
             {{- toYaml .Values.pgbackrest.resources | nindent 12 }}
 {{- end }}
-{{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.repmgr.enabled .Values.pgbackrest.enabled (not .Values.postgresql.persistence.enabled) }}
+{{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.repmgr.enabled .Values.pgbackrest.enabled .Values.postgresql.tls.enabled (not .Values.postgresql.persistence.enabled) }}
       volumes:
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled }}
         - name: postgresql-config
           configMap:
             name: {{ include "pg.fullname" . }}-postgresql-config
+{{- end }}
+{{- if .Values.postgresql.tls.enabled }}
+        # Server cert (#110). defaultMode 0400 + fsGroup 103 -> the postgres uid reads
+        # it and PostgreSQL accepts the key (root-owned, not group/world readable),
+        # the same pattern the etcd-tls mount uses below.
+        - name: postgresql-tls
+          secret:
+            secretName: {{ required "postgresql.tls.enabled requires postgresql.tls.existingSecret (a Secret with keys tls.crt, tls.key, ca.crt)" .Values.postgresql.tls.existingSecret | quote }}
+            defaultMode: 0400
 {{- end }}
 {{- if .Values.postgresql.extensions.enabled }}
         - name: ext-lib

@@ -1,4 +1,4 @@
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -26,5 +26,17 @@ data:
     archive_command = 'pgbackrest --stanza={{ .Values.pgbackrest.stanza | toString | replace "'" "''" }} archive-push %p'
     wal_level = replica
     max_wal_senders = 10
+{{- end }}
+{{- if .Values.postgresql.tls.enabled }}
+  # Server TLS (#110). The cert Secret is mounted at /etc/postgresql/tls; ssl_ca_file
+  # is set only under mutual TLS (it verifies CLIENT certs). ssl is SIGHUP-reloadable;
+  # the configmap checksum annotation rolls the pod when this changes.
+  tls.conf: |
+    ssl = on
+    ssl_cert_file = '/etc/postgresql/tls/tls.crt'
+    ssl_key_file = '/etc/postgresql/tls/tls.key'
+{{- if .Values.postgresql.tls.clientCertAuth }}
+    ssl_ca_file = '/etc/postgresql/tls/ca.crt'
+{{- end }}
 {{- end }}
 {{- end }}

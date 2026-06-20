@@ -267,7 +267,7 @@ initContainers:
         ENC_USER=$(enc "$POSTGRES_USER")
         ENC_PASS=$(enc "$POSTGRES_PASSWORD")
         ENC_DB=$(enc "$POSTGRES_DATABASE")
-        printf '%s' "{{ range $i := until (int (add .Values.postgresql.replicaCount 1)) }}{{ if $i }},{{ end }}postgresql://${ENC_USER}:${ENC_PASS}@{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless:5432/${ENC_DB}?sslmode=disable{{ end }}" > /etc/postgres_exporter/dsn
+        printf '%s' "{{ range $i := until (int (add .Values.postgresql.replicaCount 1)) }}{{ if $i }},{{ end }}postgresql://${ENC_USER}:${ENC_PASS}@{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless:5432/${ENC_DB}?sslmode={{ $.Values.prometheusExporter.sslmode }}{{ if has $.Values.prometheusExporter.sslmode (list "verify-ca" "verify-full") }}&sslrootcert=/etc/postgres_exporter/tls/ca.crt{{ end }}{{ end }}" > /etc/postgres_exporter/dsn
     env:
 {{- if .Values.prometheusExporter.monitoringUser.enabled }}
       # #28: scrape as the least-privilege pg_monitor role (created by the
@@ -358,6 +358,12 @@ containers:
         mountPath: /config
       - name: tmp
         mountPath: /tmp
+{{- if and .Values.postgresql.tls.enabled (has .Values.prometheusExporter.sslmode (list "verify-ca" "verify-full")) }}
+      # CA to verify the PostgreSQL server cert under sslmode=verify-* (#110).
+      - name: postgresql-tls
+        mountPath: /etc/postgres_exporter/tls
+        readOnly: true
+{{- end }}
 volumes:
   - name: config
     configMap:
@@ -368,6 +374,12 @@ volumes:
   - name: tmp
     emptyDir:
       sizeLimit: 64Mi
+{{- if and .Values.postgresql.tls.enabled (has .Values.prometheusExporter.sslmode (list "verify-ca" "verify-full")) }}
+  - name: postgresql-tls
+    secret:
+      secretName: {{ .Values.postgresql.tls.existingSecret | quote }}
+      defaultMode: 0400
+{{- end }}
 {{- end }}
 
 {{/*
