@@ -77,18 +77,19 @@ func main() {
 func runRBACBootstrap(log *slog.Logger) error {
 	endpoints := splitNonEmpty(os.Getenv("ETCD_ENDPOINTS"))
 	rootCN := strings.TrimSpace(os.Getenv("ETCD_RBAC_ROOT_CN"))
+	healthCheckCN := strings.TrimSpace(os.Getenv("ETCD_RBAC_HEALTHCHECK_CN"))
 	var tenants []dcs.RBACTenant
 	if raw := strings.TrimSpace(os.Getenv("ETCD_RBAC_TENANTS")); raw != "" {
 		if err := json.Unmarshal([]byte(raw), &tenants); err != nil {
 			return fmt.Errorf("ETCD_RBAC_TENANTS is not valid JSON: %w", err)
 		}
 	}
-	log.Info("rbac-bootstrap", "endpoints", endpoints, "rootCN", rootCN, "tenants", len(tenants))
+	log.Info("rbac-bootstrap", "endpoints", endpoints, "rootCN", rootCN, "healthCheckCN", healthCheckCN, "tenants", len(tenants))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	return dcs.RBACBootstrap(ctx, endpoints,
 		os.Getenv("ETCD_TLS_CERT"), os.Getenv("ETCD_TLS_KEY"), os.Getenv("ETCD_TLS_CA"),
-		rootCN, tenants)
+		rootCN, healthCheckCN, tenants)
 }
 
 func splitNonEmpty(s string) []string {

@@ -2,7 +2,7 @@ apiVersion: v2
 name: pgvector
 description: PostgreSQL with pgvector extension and optional PGPool-II
 type: application
-version: 1.1.7
+version: 1.1.8
 appVersion: "18"
 home: https://github.com/cagriekin/charts/tree/master/pgvector
 icon: https://wiki.postgresql.org/images/a/a4/PostgreSQL_logo.3colors.svg
@@ -27,6 +27,6 @@ dependencies:
     version: 0.1.0
     repository: file://../common
   - name: etcd
-    version: 0.1.4
+    version: 0.1.5
     repository: file://../etcd
     condition: etcd.enabled

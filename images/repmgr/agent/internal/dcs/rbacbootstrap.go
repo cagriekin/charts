@@ -23,7 +23,7 @@ type RBACTenant struct {
 // user must exist before auth flips on (so already-connected agents keep
 // authenticating by CN). Every step is existence-checked, so re-running on each
 // helm upgrade reconciles the tenant list without erroring on what already exists.
-func RBACBootstrap(ctx context.Context, endpoints []string, certFile, keyFile, caFile, rootCN string, tenants []RBACTenant) error {
+func RBACBootstrap(ctx context.Context, endpoints []string, certFile, keyFile, caFile, rootCN, healthCheckCN string, tenants []RBACTenant) error {
 	if len(endpoints) == 0 {
 		return fmt.Errorf("rbac-bootstrap: no ETCD_ENDPOINTS")
 	}
@@ -53,6 +53,31 @@ func RBACBootstrap(ctx context.Context, endpoints []string, certFile, keyFile, c
 	}
 	if err := ensureUserRole(ctx, cli, rootCN, "root"); err != nil {
 		return err
+	}
+
+	// Read-only health user (#187): the etcd liveness/readiness probe runs
+	// `etcdctl endpoint health`, a Range on key "health". Under --client-cert-auth the
+	// probe presents the server cert, whose CN maps to no registered user, so etcd logs
+	// `cannot find a user for permission check` at ERROR on every probe interval. (The
+	// probe still passed: etcd runs the linearizable read-index before the auth check,
+	// and `endpoint health` treats permission-denied as healthy -- so the bug was log
+	// noise, not a broken health check.) A dedicated read-only user whose CN = the server
+	// cert CN the probe presents lets the probe authenticate cleanly and silences the log.
+	// Created before AuthEnable so the probe authenticates the moment auth flips on.
+	// Read-only on the single "health" key -- no access to any tenant prefix.
+	if healthCheckCN != "" {
+		if err := ensureUser(ctx, cli, healthCheckCN); err != nil {
+			return err
+		}
+		if err := ensureRole(ctx, cli, "healthcheck"); err != nil {
+			return err
+		}
+		if err := ensureReadKeyPerm(ctx, cli, "healthcheck", "health"); err != nil {
+			return err
+		}
+		if err := ensureUserRole(ctx, cli, healthCheckCN, "healthcheck"); err != nil {
+			return err
+		}
 	}
 
 	for _, t := range tenants {
@@ -167,6 +192,24 @@ func ensurePrefixPerm(ctx context.Context, cli *clientv3.Client, role, prefix st
 	}
 	if _, err := cli.RoleGrantPermission(ctx, role, prefix, end, clientv3.PermissionType(clientv3.PermReadWrite)); err != nil {
 		return fmt.Errorf("rbac-bootstrap: grant %q readwrite on %q: %w", role, prefix, err)
+	}
+	return nil
+}
+
+// ensureReadKeyPerm grants read on the single key `key` (rangeEnd "") to the role if
+// not already present. Used for the health user's read on "health" (#187).
+func ensureReadKeyPerm(ctx context.Context, cli *clientv3.Client, role, key string) error {
+	r, err := cli.RoleGet(ctx, role)
+	if err != nil {
+		return fmt.Errorf("rbac-bootstrap: role get %q: %w", role, err)
+	}
+	for _, p := range r.Perm {
+		if string(p.Key) == key && string(p.RangeEnd) == "" && p.PermType == clientv3.PermRead {
+			return nil
+		}
+	}
+	if _, err := cli.RoleGrantPermission(ctx, role, key, "", clientv3.PermissionType(clientv3.PermRead)); err != nil {
+		return fmt.Errorf("rbac-bootstrap: grant %q read on %q: %w", role, key, err)
 	}
 	return nil
 }
