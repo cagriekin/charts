@@ -42,6 +42,12 @@ type Config struct {
 	PgHbaPeerCIDR string   // POD_CIDR: the trusted pod network for SCRAM rules
 	PgHbaRules    []string // POSTGRESQL_PGHBA: user rules, placed above the catch-alls
 
+	// Client TLS pg_hba (issue #110). All optional; default off (TLS disabled).
+	TLSRequireSSL     bool   // TLS_REQUIRE_SSL: peer-CIDR client rule -> hostssl
+	TLSClientCertAuth bool   // TLS_CLIENT_CERT_AUTH: app users need a client cert (mTLS)
+	PostgresUser      string // POSTGRES_USER: superuser, exempt from clientcert
+	MonitoringUser    string // MONITORING_USER: monitoring user, exempt; "" when disabled
+
 	// etcd backend (required only when DCSBackend == "etcd"). TLS is optional
 	// (all-or-none, enforced by the dcs layer).
 	EtcdEndpoints []string
@@ -76,6 +82,17 @@ func (l *loader) dur(key string) time.Duration {
 		l.invalid = append(l.invalid, fmt.Sprintf("%s=%q (%v)", key, v, err))
 	}
 	return d
+}
+
+// boolEnv parses an optional boolean env value (true/1/yes, case-insensitive);
+// anything else (incl. empty/unset) is false.
+func boolEnv(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes":
+		return true
+	default:
+		return false
+	}
 }
 
 func (l *loader) intv(key string) int {
@@ -123,6 +140,13 @@ func Load(get func(string) string) (*Config, error) {
 			c.PgHbaRules = append(c.PgHbaRules, r)
 		}
 	}
+
+	// Client TLS pg_hba inputs (issue #110). Optional -- absent/empty means off, so
+	// existing installs are unchanged; no "missing" error.
+	c.TLSRequireSSL = boolEnv(get("TLS_REQUIRE_SSL"))
+	c.TLSClientCertAuth = boolEnv(get("TLS_CLIENT_CERT_AUTH"))
+	c.PostgresUser = strings.TrimSpace(get("POSTGRES_USER"))
+	c.MonitoringUser = strings.TrimSpace(get("MONITORING_USER"))
 
 	// Cross-field validation that the lease timings are internally consistent
 	// (client-go requires LeaseDuration > RenewDeadline > RetryPeriod).

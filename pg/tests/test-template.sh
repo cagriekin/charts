@@ -2399,5 +2399,202 @@ gann_merge=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-
 assert_contains "global.annotations: merges, global key kept (#128)" "${gann_merge}" "example.com/team: data platform"
 assert_contains "global.annotations: merges, component key kept (#128)" "${gann_merge}" "sts.local/own"
 
+# ======================================================================
+# #110: client-connection TLS (PostgreSQL + PGPool + exporter sslmode)
+# ======================================================================
+# Off by default the render is byte-stable (the rest of this suite renders with
+# TLS off); these assert the OFF render adds nothing, then exercise each knob.
+
+# --- default (TLS off): no ssl, no cert mount, no TLS env ---
+tls_off=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" 2>&1)
+assert_not_contains "#110 off: no postgresql tls.conf ssl=on" "${tls_off}" "ssl = on"
+assert_not_contains "#110 off: no postgresql-tls volume" "${tls_off}" "postgresql-tls"
+assert_not_contains "#110 off: no TLS_REQUIRE_SSL env" "${tls_off}" "TLS_REQUIRE_SSL"
+
+# --- Component 1: PostgreSQL server TLS (ssl=on via conf.d) ---
+tls_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#110 C1: tls.conf sets ssl = on" "${tls_cm}" "ssl = on"
+assert_contains "#110 C1: tls.conf sets ssl_cert_file" "${tls_cm}" "ssl_cert_file = '/etc/postgresql/tls/tls.crt'"
+assert_contains "#110 C1: tls.conf sets ssl_key_file" "${tls_cm}" "ssl_key_file = '/etc/postgresql/tls/tls.key'"
+assert_not_contains "#110 C1: no ssl_ca_file without mTLS" "${tls_cm}" "ssl_ca_file = '"
+# mTLS -> ssl_ca_file present (verifies client certs)
+tls_cm_mtls=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --set postgresql.tls.clientCertAuth=true \
+  --set pgpool.enabled=false \
+  --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#110 C1: mTLS adds ssl_ca_file" "${tls_cm_mtls}" "ssl_ca_file = '/etc/postgresql/tls/ca.crt'"
+# cert mount + volume (defaultMode 0400, BYO secret name)
+tls_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#110 C1: cert mounted at /etc/postgresql/tls" "${tls_sts}" "mountPath: /etc/postgresql/tls"
+assert_contains "#110 C1: cert volume uses the BYO secret" "${tls_sts}" 'secretName: "pg-tls"'
+assert_contains "#110 C1: cert volume defaultMode 0400" "${tls_sts}" "defaultMode: 0400"
+# TLS-only install (no postgresql.configuration / pgbackrest): conf.d include must
+# still be wired (checksum annotation + include_dir management) or ssl=on never applies.
+assert_contains "#110 C1: TLS-only install keeps postgresql-config checksum" "${tls_sts}" "checksum/postgresql-config"
+assert_contains "#110 C1: TLS-only install keeps the conf.d include" "${tls_sts}" "include_dir = '/etc/postgresql/conf.d'"
+# standalone (repmgr off, replicaCount 0, persistence on): the cert VOLUME must
+# render alongside its mount (the outer volumes gate must include tls.enabled).
+tls_standalone=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --set postgresql.persistence.enabled=true \
+  --show-only templates/statefulset.yaml 2>&1)
+sa_mounts=$(printf '%s\n' "${tls_standalone}" | grep -c "name: postgresql-tls")
+assert_eq "#110 C1: standalone+TLS emits both the tls mount AND volume" "2" "${sa_mounts}"
+# fail-fast: tls.enabled without a Secret
+tls_nosecret_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.tls.enabled=true >/dev/null 2>&1 || tls_nosecret_rc=$?
+assert_eq "#110 C1: tls.enabled without existingSecret fails fast" "1" "$([ "${tls_nosecret_rc}" -ne 0 ] && echo 1 || echo 0)"
+
+# --- Component 2: require/mTLS pg_hba env wiring (agent assembles pg_hba) ---
+assert_contains "#110 C2: TLS_REQUIRE_SSL env present when tls.enabled" "${tls_sts}" "name: TLS_REQUIRE_SSL"
+assert_contains "#110 C2: TLS_CLIENT_CERT_AUTH env present when tls.enabled" "${tls_sts}" "name: TLS_CLIENT_CERT_AUTH"
+tls_require=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --set postgresql.tls.require=true \
+  --set prometheusExporter.enabled=true --set prometheusExporter.sslmode=require \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#110 C2: require -> TLS_REQUIRE_SSL true" "${tls_require}" 'name: TLS_REQUIRE_SSL
+              value: "true"'
+# monitoring user passed so the agent can exempt it from clientcert
+tls_mon=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --set postgresql.tls.clientCertAuth=true \
+  --set prometheusExporter.enabled=true --set prometheusExporter.monitoringUser.enabled=true \
+  --set prometheusExporter.sslmode=require \
+  --set pgpool.enabled=false \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#110 C2: mTLS passes MONITORING_USER for exemption" "${tls_mon}" "name: MONITORING_USER"
+# fail-fast: require/clientCertAuth need tls.enabled
+tls_req_noenable_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.tls.require=true >/dev/null 2>&1 || tls_req_noenable_rc=$?
+assert_eq "#110 C2: require without tls.enabled fails fast" "1" "$([ "${tls_req_noenable_rc}" -ne 0 ] && echo 1 || echo 0)"
+# fail-fast: require/mTLS unsupported in repmgrd mode (md5-fallback bypasses hostssl)
+tls_repmgrd_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=true --set repmgr.failoverMode=repmgrd \
+  --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --set postgresql.tls.require=true >/dev/null 2>&1 || tls_repmgrd_rc=$?
+assert_eq "#110 C2: require in repmgrd mode fails fast (agent-only)" "1" "$([ "${tls_repmgrd_rc}" -ne 0 ] && echo 1 || echo 0)"
+# repmgrd mode with plain server TLS (no require) still renders ssl=on
+tls_repmgrd_ok=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=true --set repmgr.failoverMode=repmgrd \
+  --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#110 C2: repmgrd mode allows optional server TLS (ssl=on)" "${tls_repmgrd_ok}" "ssl = on"
+
+# --- Component 3: PGPool TLS (frontend + backend) ---
+pp_tls=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set pgpool.enabled=true --set pgpool.tls.enabled=true --set pgpool.tls.existingSecret=pp-tls \
+  --show-only templates/pgpool-configmap.yaml 2>&1)
+assert_contains "#110 C3: pgpool frontend ssl = on" "${pp_tls}" "ssl = on"
+assert_contains "#110 C3: pgpool ssl_cert path" "${pp_tls}" "ssl_cert = '/usr/local/etc/tls/tls.crt'"
+assert_not_contains "#110 C3: no ssl_ca_cert without frontend mTLS" "${pp_tls}" "ssl_ca_cert"
+pp_tls_mtls=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set pgpool.enabled=true --set pgpool.tls.enabled=true --set pgpool.tls.existingSecret=pp-tls \
+  --set pgpool.tls.clientCertAuth=true \
+  --show-only templates/pgpool-configmap.yaml 2>&1)
+assert_contains "#110 C3: pgpool frontend mTLS adds ssl_ca_cert" "${pp_tls_mtls}" "ssl_ca_cert = '/usr/local/etc/tls/ca.crt'"
+pp_dep=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set pgpool.enabled=true --set pgpool.tls.enabled=true --set pgpool.tls.existingSecret=pp-tls \
+  --set pgpool.tls.backendSslmode=require \
+  --show-only templates/pgpool-deployment.yaml 2>&1)
+assert_contains "#110 C3: pgpool stages key as 0600" "${pp_dep}" "chmod 0600 /usr/local/etc/tls/tls.key"
+assert_contains "#110 C3: pgpool-tls frontend volume" "${pp_dep}" "name: pgpool-tls"
+assert_contains "#110 C3: backend PGSSLMODE set" "${pp_dep}" 'name: PGSSLMODE
+              value: "require"'
+assert_contains "#110 C3: pgpool-exporter SSLMODE follows frontend (require)" "${pp_dep}" 'name: SSLMODE
+              value: "require"'
+# backend client cert (for PostgreSQL mTLS passthrough)
+pp_dep_bcc=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set pgpool.enabled=true --set pgpool.tls.enabled=true --set pgpool.tls.existingSecret=pp-tls \
+  --set pgpool.tls.backendClientCert=pp-backend \
+  --show-only templates/pgpool-deployment.yaml 2>&1)
+assert_contains "#110 C3: backend client cert -> PGSSLCERT" "${pp_dep_bcc}" "name: PGSSLCERT"
+assert_contains "#110 C3: backend client cert volume" "${pp_dep_bcc}" "name: pgpool-tls-backend"
+# default off: pgpool ssl = off
+pp_off=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set pgpool.enabled=true --show-only templates/pgpool-configmap.yaml 2>&1)
+assert_contains "#110 C3: pgpool off keeps ssl = off" "${pp_off}" "ssl = off"
+# fail-fast: pgpool.tls.enabled without a Secret
+pp_nosecret_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set pgpool.enabled=true --set pgpool.tls.enabled=true >/dev/null 2>&1 || pp_nosecret_rc=$?
+assert_eq "#110 C3: pgpool.tls.enabled without existingSecret fails fast" "1" "$([ "${pp_nosecret_rc}" -ne 0 ] && echo 1 || echo 0)"
+
+# --- Component 4: exporter sslmode ---
+exp_req=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set prometheusExporter.enabled=true --set prometheusExporter.sslmode=require 2>&1)
+assert_contains "#110 C4: exporter DSN carries sslmode=require" "${exp_req}" "sslmode=require"
+assert_contains "#110 C4: exporter auth_modules sslmode require" "${exp_req}" "sslmode: require"
+assert_not_contains "#110 C4: require has no sslrootcert" "${exp_req}" "sslrootcert"
+exp_verify=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --set prometheusExporter.enabled=true --set prometheusExporter.sslmode=verify-ca 2>&1)
+assert_contains "#110 C4: verify-ca adds sslrootcert" "${exp_verify}" "sslrootcert: /etc/postgres_exporter/tls/ca.crt"
+assert_contains "#110 C4: verify-ca mounts the CA on the exporter" "${exp_verify}" "mountPath: /etc/postgres_exporter/tls"
+# default off: sslmode disable
+exp_off=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set prometheusExporter.enabled=true 2>&1)
+assert_contains "#110 C4: exporter default sslmode=disable" "${exp_off}" "sslmode=disable"
+# fail-fast: verify-* requires tls.enabled (CA comes from the server cert Secret)
+exp_verify_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set prometheusExporter.enabled=true --set prometheusExporter.sslmode=verify-ca >/dev/null 2>&1 || exp_verify_rc=$?
+assert_eq "#110 C4: verify-* without tls.enabled fails fast" "1" "$([ "${exp_verify_rc}" -ne 0 ] && echo 1 || echo 0)"
+
+# --- Cross-component fail-fast guards ---
+g_exp_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --set postgresql.tls.require=true \
+  --set prometheusExporter.enabled=true >/dev/null 2>&1 || g_exp_rc=$?
+assert_eq "#110 guard: require + exporter sslmode=disable fails fast" "1" "$([ "${g_exp_rc}" -ne 0 ] && echo 1 || echo 0)"
+g_pp_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --set postgresql.tls.require=true \
+  --set pgpool.enabled=true --set pgpool.tls.enabled=true --set pgpool.tls.existingSecret=pp-tls \
+  --set pgpool.tls.backendSslmode=disable >/dev/null 2>&1 || g_pp_rc=$?
+assert_eq "#110 guard: require + pgpool backendSslmode=disable fails fast" "1" "$([ "${g_pp_rc}" -ne 0 ] && echo 1 || echo 0)"
+g_mtls_pp_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --set postgresql.tls.clientCertAuth=true \
+  --set prometheusExporter.enabled=true --set prometheusExporter.sslmode=require \
+  --set pgpool.enabled=true --set pgpool.tls.enabled=true --set pgpool.tls.existingSecret=pp-tls >/dev/null 2>&1 || g_mtls_pp_rc=$?
+assert_eq "#110 guard: mTLS + pgpool without backendClientCert fails fast" "1" "$([ "${g_mtls_pp_rc}" -ne 0 ] && echo 1 || echo 0)"
+# clientCertAuth alone (require=false) also forces hostssl, so the sslmode guards must
+# fire on it too -- else the exporter / pgpool backend silently break.
+g_cca_exp_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --set postgresql.tls.clientCertAuth=true --set postgresql.tls.require=false \
+  --set prometheusExporter.enabled=true >/dev/null 2>&1 || g_cca_exp_rc=$?
+assert_eq "#110 guard: clientCertAuth-only + exporter sslmode=disable fails fast" "1" "$([ "${g_cca_exp_rc}" -ne 0 ] && echo 1 || echo 0)"
+g_cca_pp_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --set postgresql.tls.clientCertAuth=true --set postgresql.tls.require=false \
+  --set pgpool.enabled=true --set pgpool.tls.enabled=true --set pgpool.tls.existingSecret=pp-tls \
+  --set pgpool.tls.backendClientCert=pp-backend \
+  --set pgpool.tls.backendSslmode=disable >/dev/null 2>&1 || g_cca_pp_rc=$?
+assert_eq "#110 guard: clientCertAuth-only + pgpool backendSslmode=disable fails fast" "1" "$([ "${g_cca_pp_rc}" -ne 0 ] && echo 1 || echo 0)"
+
+# --- pgvector parity (templates are symlinks; values carry the TLS blocks) ---
+pgv_tls=$(helm template test-pgv "${PGVECTOR_DIR}" \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#110 pgvector: server TLS renders ssl = on" "${pgv_tls}" "ssl = on"
+
 end_suite
 print_summary

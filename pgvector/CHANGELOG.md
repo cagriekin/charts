@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 1.2.0 - 2026-06-21
+
+Optional client-connection TLS for PostgreSQL, PGPool, and the metrics exporter (#110).
+Off by default — no rendered change at defaults. Image moves to `trixie-5.5.0-25`.
+pgvector shares pg's templates and agent; see the pg CHANGELOG for the full detail.
+
+### Added
+
+- **PostgreSQL server TLS** (`postgresql.tls.enabled`, BYO `existingSecret`), **enforced
+  TLS** (`postgresql.tls.require`) and **mutual TLS** (`postgresql.tls.clientCertAuth`,
+  agent mode only, with internal service users exempted from the client-cert requirement).
+- **PGPool TLS** (`pgpool.tls.*`: frontend + backend, with a backend client cert for
+  PostgreSQL mTLS) and a configurable exporter **`prometheusExporter.sslmode`**.
+- Fail-fast guards for every TLS combination.
+
+### Notes
+
+- Replication stays plaintext on the pod network (documented non-goal). repmgrd mode
+  supports only optional server TLS; `require`/`clientCertAuth` are agent-mode only.
+- Reload `ssl_*` with `kubectl rollout restart` after rotating the cert Secret.
+
 ## 1.1.8 - 2026-06-21
 
 Quiets the etcd RBAC health-probe noise (#187). Bundles `etcd` 0.1.5; image moves to
