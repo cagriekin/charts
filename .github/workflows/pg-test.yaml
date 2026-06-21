@@ -47,22 +47,22 @@ jobs:
           df -h /
 
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: v3.14.2
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # Cache the third-party base images. Keyed on the image MANIFEST, not on
       # pg/values.yaml -- a chart image-tag bump no longer busts this cache (only
       # editing pg/tests/ci-base-images.txt does).
       - name: Cache base images
         id: base-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /tmp/base-images
           key: pg-base-images-${{ hashFiles('pg/tests/ci-base-images.txt') }}
@@ -109,7 +109,7 @@ jobs:
           ls -lh /tmp/kind-images/
 
       - name: Upload image bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kind-images
           path: /tmp/kind-images
@@ -152,10 +152,10 @@ jobs:
           df -h /
 
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: v3.14.2
 
@@ -166,7 +166,7 @@ jobs:
           config: pg/kind-config.yaml
 
       - name: Download image bundle
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: kind-images
           path: /tmp/kind-images
