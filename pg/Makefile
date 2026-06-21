@@ -4,7 +4,7 @@ TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-repmgr test-repmgr-chaos test-full test-failover test-upgrade \
-        test-repmgr-failover test-agent test-agent-etcd test-agent-etcd-tls test-tls test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
+        test-repmgr-failover test-agent test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -20,6 +20,7 @@ help:
 	@echo "  test-agent-etcd - Run agent etcd-DCS test (bundled etcd; standalone, opt-in)"
 	@echo "  test-agent-etcd-tls - Run agent etcd-DCS test over mutual TLS + RBAC (standalone, opt-in)"
 	@echo "  test-tls           - Run client-connection TLS test (PostgreSQL+PGPool+exporter, standalone, opt-in)"
+	@echo "  test-pgpool-failover - Run PGPool failover + health-check test (standalone, opt-in)"
 	@echo "  test-migrate-agent - Run repmgrd->agent migration test (standalone, long)"
 	@echo "  test-upgrade    - Run upgrade path tests"
 	@echo "  test-config     - Run postgresql configuration tests (standalone)"
@@ -69,6 +70,9 @@ test-agent-etcd-tls: cluster-exists
 
 test-tls: cluster-exists
 	@bash $(TESTS_DIR)/test-tls.sh
+
+test-pgpool-failover: cluster-exists
+	@bash $(TESTS_DIR)/test-pgpool-failover.sh
 
 # repmgrd -> agent migration (--cascade=orphan recreate). Standalone + long-running
 # (installs repmgrd, then rolls to agent), so not in test-cluster; run explicitly.
