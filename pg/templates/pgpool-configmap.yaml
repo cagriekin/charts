@@ -77,7 +77,16 @@ data:
     connection_cache = on
     reset_query_list = '{{ .Values.pgpool.resetQueryList | toString | replace "'" "''" }}'
     load_balance_mode = on
+{{- if .Values.pgpool.tls.enabled }}
+    ssl = on
+    ssl_cert = '/usr/local/etc/tls/tls.crt'
+    ssl_key = '/usr/local/etc/tls/tls.key'
+{{- if .Values.pgpool.tls.clientCertAuth }}
+    ssl_ca_cert = '/usr/local/etc/tls/ca.crt'
+{{- end }}
+{{- else }}
     ssl = off
+{{- end }}
 
     pg_keepalives_idle = {{ .Values.pgpool.tcpKeepalive.idle }}
     pg_keepalives_interval = {{ .Values.pgpool.tcpKeepalive.interval }}
