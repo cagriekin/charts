@@ -21,6 +21,12 @@ data:
     repo1-s3-endpoint={{ required "pgbackrest.s3.endpoint is required" .Values.pgbackrest.s3.endpoint }}
     repo1-s3-bucket={{ required "pgbackrest.s3.bucket is required" .Values.pgbackrest.s3.bucket }}
     repo1-s3-region={{ .Values.pgbackrest.s3.region }}
+    {{- if ne .Values.pgbackrest.s3.uriStyle "host" }}
+    repo1-s3-uri-style={{ .Values.pgbackrest.s3.uriStyle }}
+    {{- end }}
+    {{- if not .Values.pgbackrest.s3.verifyTls }}
+    repo1-storage-verify-tls=n
+    {{- end }}
     repo1-path=/{{ .Values.pgbackrest.s3.prefix }}/{{ include "pg.fullname" . }}
     repo1-retention-full={{ .Values.pgbackrest.retention.full }}
     repo1-retention-diff={{ .Values.pgbackrest.retention.diff }}
