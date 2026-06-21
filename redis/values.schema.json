@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "redis chart values (enum guards)",
+  "description": "Partial schema: constrains the values whose typos silently misconfigure Redis. additionalProperties stays open so the rest of values.yaml is unconstrained.",
+  "type": "object",
+  "properties": {
+    "redis": {
+      "type": "object",
+      "properties": {
+        "image": {
+          "type": "object",
+          "properties": {
+            "pullPolicy": {
+              "enum": ["Always", "IfNotPresent", "Never"]
+            }
+          }
+        },
+        "config": {
+          "type": "object",
+          "properties": {
+            "maxmemory-policy": {
+              "enum": [
+                "noeviction",
+                "allkeys-lru",
+                "allkeys-lfu",
+                "allkeys-random",
+                "volatile-lru",
+                "volatile-lfu",
+                "volatile-random",
+                "volatile-ttl"
+              ]
+            },
+            "appendfsync": {
+              "enum": ["always", "everysec", "no"]
+            }
+          }
+        }
+      }
+    },
+    "exporter": {
+      "type": "object",
+      "properties": {
+        "image": {
+          "type": "object",
+          "properties": {
+            "pullPolicy": {
+              "enum": ["Always", "IfNotPresent", "Never"]
+            }
+          }
+        },
+        "service": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "enum": ["ClusterIP", "NodePort", "LoadBalancer", "ExternalName"]
+            }
+          }
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "enum": ["ClusterIP", "NodePort", "LoadBalancer", "ExternalName"]
+        }
+      }
+    }
+  }
+}
