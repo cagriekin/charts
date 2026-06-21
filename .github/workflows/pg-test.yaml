@@ -157,6 +157,7 @@ jobs:
           - { name: tls, target: test-tls }
           - { name: pgpool-failover, target: test-pgpool-failover }
           - { name: config-failover, target: test-config-failover }
+          - { name: cascading-replication, target: test-cascading-replication }
           - { name: agent-rolling, target: test-agent-rolling }
           - { name: backup-restore, target: test-backup-restore }
           - { name: backup-concurrent, target: test-backup-concurrent }

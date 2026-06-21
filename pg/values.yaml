@@ -222,6 +222,13 @@ repmgr:
     renewDeadline: 10s
     retryPeriod: 2s
     reconcileInterval: 5s
+    # Cascading replication (#29). Off by default: every standby streams from the
+    # primary. When true, a standby may instead follow another standby (a chain by
+    # pod ordinal toward the primary) to offload the primary's WAL senders on larger
+    # clusters. The agent only picks a verifiably-safe same-timeline upstream and
+    # falls back to the primary otherwise, and re-homes on failover -- a broken or
+    # promoted upstream never strands a standby. Most useful at higher replicaCount.
+    cascadingReplication: false
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
     # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane
     # outage no longer self-demotes the primary (only an etcd quorum loss does);

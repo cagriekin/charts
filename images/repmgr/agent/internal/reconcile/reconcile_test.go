@@ -186,3 +186,88 @@ func TestDecideFenceIsUnconditional(t *testing.T) {
 		t.Errorf("lost-lease read-write node must fence, got %v (%s)", got.Action, got.Reason)
 	}
 }
+
+// #29: cascading replication. cascadeFollowTarget is a pure chooser; default off and
+// every unsafe case falls back to the leader so a standby is never stranded.
+func TestCascadeFollowTarget(t *testing.T) {
+	localTL5 := LocalState{Timeline: tl(5), TimelineOK: true}
+	// unreachable peer (not gossip): position unknown, never a cascade upstream.
+	down := func(name string) PeerState { return PeerState{Name: name, Reachable: false} }
+
+	cases := []struct {
+		name   string
+		o      Observation
+		expect string
+	}{
+		// Off -> always the leader, even with perfectly good intermediate standbys.
+		{"cascade off -> leader", Observation{Cascade: false, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5,
+			Peers: []PeerState{standby("pg-1", 5, 5, 1), standby("pg-2", 5, 5, 1)}}, "pg-0"},
+		// On: chain by ordinal toward the leader -> the immediate upstream (closest below self).
+		{"on: pg-3 follows pg-2 (immediate upstream)", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5,
+			Peers: []PeerState{standby("pg-1", 5, 5, 1), standby("pg-2", 5, 5, 1)}}, "pg-2"},
+		{"on: pg-2 follows pg-1", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-2", Local: localTL5,
+			Peers: []PeerState{standby("pg-1", 5, 5, 1)}}, "pg-1"},
+		// Adjacent to the leader -> nothing safe to interpose -> leader.
+		{"on: pg-1 adjacent to leader -> leader", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-1", Local: localTL5,
+			Peers: []PeerState{standby("pg-2", 5, 5, 1)}}, "pg-0"},
+		// Leader elsewhere in ordinal space (post-failover): chain still works by distance.
+		{"on: leader pg-2, pg-0 follows pg-1", Observation{Cascade: true, LeaderIdentity: "pg-2", LocalNode: "pg-0", Local: localTL5,
+			Peers: []PeerState{standby("pg-1", 5, 5, 1)}}, "pg-1"},
+		// No SAFE upstream -> leader (re-home). Intermediate down/divergent/primary/gossip excluded.
+		{"on: only intermediate is down -> leader", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5,
+			Peers: []PeerState{down("pg-1"), down("pg-2")}}, "pg-0"},
+		{"on: divergent-timeline intermediate excluded -> leader", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5,
+			Peers: []PeerState{standby("pg-2", 4, 5, 1)}}, "pg-0"},
+		{"on: primary-role intermediate excluded -> leader", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5,
+			Peers: []PeerState{primary("pg-2", 5, 5, 1)}}, "pg-0"},
+		{"on: gossip-only intermediate excluded -> leader", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5,
+			Peers: []PeerState{gossipPeer("pg-2", 5, 5, 1)}}, "pg-0"},
+		// Mixed: pg-2 down, pg-1 healthy -> falls through to pg-1 (still a valid closer upstream).
+		{"on: nearest down, next healthy -> next", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5,
+			Peers: []PeerState{standby("pg-1", 5, 5, 1), down("pg-2")}}, "pg-1"},
+		// Defensive: unparseable ordinals / empty leader -> leader (never strand).
+		{"on: unparseable local ordinal -> leader", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "weird", Local: localTL5,
+			Peers: []PeerState{standby("pg-1", 5, 5, 1)}}, "pg-0"},
+		{"on: empty leader -> empty (no upstream yet)", Observation{Cascade: true, LeaderIdentity: "", LocalNode: "pg-3", Local: localTL5,
+			Peers: []PeerState{standby("pg-1", 5, 5, 1)}}, ""},
+		// local timeline not yet known -> never cascade (cannot verify same line).
+		{"on: local timeline unknown -> leader", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: LocalState{TimelineOK: false},
+			Peers: []PeerState{standby("pg-2", 5, 5, 1)}}, "pg-0"},
+		// Stickiness (#29 thrash fix): when the upstream we already follow still qualifies,
+		// keep it -- do NOT flap to a closer peer. This is the tick-B half of the oscillation:
+		// we follow pg-1 (re-homed when pg-2 flapped down); pg-2 is back, but pg-1 still
+		// qualifies, so STAY on pg-1 rather than switching back to pg-2 (which would re-run
+		// `repmgr standby follow` and, if pg-2 keeps flapping, every tick).
+		{"sticky: current upstream still qualifies -> keep it (no flap to closer peer)", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5, CurrentUpstream: "pg-1",
+			Peers: []PeerState{standby("pg-1", 5, 5, 1), standby("pg-2", 5, 5, 1)}}, "pg-1"},
+		// But re-home when the current upstream stops qualifying -- that is when re-homing
+		// is actually needed (never strand on a dead/diverged upstream).
+		{"sticky: current upstream down -> re-home to next qualifying", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5, CurrentUpstream: "pg-2",
+			Peers: []PeerState{standby("pg-1", 5, 5, 1), down("pg-2")}}, "pg-1"},
+		{"sticky: current upstream diverged -> re-home to next qualifying", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5, CurrentUpstream: "pg-2",
+			Peers: []PeerState{standby("pg-1", 5, 5, 1), standby("pg-2", 4, 5, 1)}}, "pg-1"},
+		// A stale current upstream no longer present as a peer -> ignored, normal closest pick.
+		{"sticky: current upstream absent -> normal closest pick", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5, CurrentUpstream: "pg-9",
+			Peers: []PeerState{standby("pg-1", 5, 5, 1), standby("pg-2", 5, 5, 1)}}, "pg-2"},
+	}
+	for _, c := range cases {
+		if got := cascadeFollowTarget(c.o); got != c.expect {
+			t.Errorf("%s: got %q want %q", c.name, got, c.expect)
+		}
+	}
+}
+
+// #29: the chooser is wired into Decide -- a running standby with cascade on and a safe
+// upstream returns Follow targeting that upstream (not the leader); off -> the leader.
+func TestDecideCascadeWiring(t *testing.T) {
+	local := LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: ls(5, 0x100), LSNOK: true}
+	peers := []PeerState{standby("pg-1", 5, 5, 1), standby("pg-2", 5, 5, 1)}
+	off := Decide(Observation{HoldLease: false, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: local, Peers: peers})
+	if off.Action != Follow || off.Target != "pg-0" {
+		t.Errorf("cascade off: want Follow pg-0, got %v %q", off.Action, off.Target)
+	}
+	on := Decide(Observation{HoldLease: false, Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: local, Peers: peers})
+	if on.Action != Follow || on.Target != "pg-2" {
+		t.Errorf("cascade on: want Follow pg-2 (immediate upstream), got %v %q", on.Action, on.Target)
+	}
+}
