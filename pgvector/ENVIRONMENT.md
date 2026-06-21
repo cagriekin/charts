@@ -48,6 +48,7 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `SPLIT_BRAIN_ACTION` | enum | yes | `repmgr.splitBrainDetection.action` (`log`/`fence`) | agent |
 | `POD_CIDR` | CIDR | yes | `repmgr.agent.podCidr` (`10.0.0.0/8`) | agent (hardened pg_hba: trusted pod network) |
 | `POSTGRESQL_PGHBA` | newline-list | no | `postgresql.pgHba` (joined) | agent (user pg_hba rules, above the catch-alls) |
+| `CASCADE_REPLICATION` | boolean | no | `repmgr.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
 
 Lease timings must satisfy `LEASE_DURATION > RENEW_DEADLINE > RETRY_PERIOD`
 (validated at boot). The agent also writes a `0600 ~/.pgpass` from `REPMGR_*` so a

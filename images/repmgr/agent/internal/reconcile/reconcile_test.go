@@ -233,6 +233,22 @@ func TestCascadeFollowTarget(t *testing.T) {
 		// local timeline not yet known -> never cascade (cannot verify same line).
 		{"on: local timeline unknown -> leader", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: LocalState{TimelineOK: false},
 			Peers: []PeerState{standby("pg-2", 5, 5, 1)}}, "pg-0"},
+		// Stickiness (#29 thrash fix): when the upstream we already follow still qualifies,
+		// keep it -- do NOT flap to a closer peer. This is the tick-B half of the oscillation:
+		// we follow pg-1 (re-homed when pg-2 flapped down); pg-2 is back, but pg-1 still
+		// qualifies, so STAY on pg-1 rather than switching back to pg-2 (which would re-run
+		// `repmgr standby follow` and, if pg-2 keeps flapping, every tick).
+		{"sticky: current upstream still qualifies -> keep it (no flap to closer peer)", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5, CurrentUpstream: "pg-1",
+			Peers: []PeerState{standby("pg-1", 5, 5, 1), standby("pg-2", 5, 5, 1)}}, "pg-1"},
+		// But re-home when the current upstream stops qualifying -- that is when re-homing
+		// is actually needed (never strand on a dead/diverged upstream).
+		{"sticky: current upstream down -> re-home to next qualifying", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5, CurrentUpstream: "pg-2",
+			Peers: []PeerState{standby("pg-1", 5, 5, 1), down("pg-2")}}, "pg-1"},
+		{"sticky: current upstream diverged -> re-home to next qualifying", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5, CurrentUpstream: "pg-2",
+			Peers: []PeerState{standby("pg-1", 5, 5, 1), standby("pg-2", 4, 5, 1)}}, "pg-1"},
+		// A stale current upstream no longer present as a peer -> ignored, normal closest pick.
+		{"sticky: current upstream absent -> normal closest pick", Observation{Cascade: true, LeaderIdentity: "pg-0", LocalNode: "pg-3", Local: localTL5, CurrentUpstream: "pg-9",
+			Peers: []PeerState{standby("pg-1", 5, 5, 1), standby("pg-2", 5, 5, 1)}}, "pg-2"},
 	}
 	for _, c := range cases {
 		if got := cascadeFollowTarget(c.o); got != c.expect {

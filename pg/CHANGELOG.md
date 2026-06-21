@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- **Optional cascading replication (#29, `repmgr.agent.cascadingReplication`, agent mode,
+  default off).** A standby may stream from another standby — a chain by pod ordinal toward
+  the primary — to offload the primary's WAL senders on larger clusters (`replicaCount >= 2`).
+  The agent only follows a verifiably-safe same-timeline upstream and stays sticky on it,
+  re-homing to the leader on any upstream failure/promotion, so a standby is never stranded
+  and failover is not delayed. Off by default the render and follow behavior are byte-stable.
+  The agent binary changed, so this needs a new image tag + chart minor when released.
+
 ## 1.2.0 - 2026-06-21
 
 Optional client-connection TLS for PostgreSQL, PGPool, and the metrics exporter (#110).

@@ -131,6 +131,13 @@ type Observation struct {
 	// falls back to the leader, so a broken/missing/promoted upstream never strands a
 	// standby (it re-homes on the next tick via the Follow target change).
 	Cascade bool
+	// CurrentUpstream is the node this standby currently follows (the agent's
+	// followUpstream). cascadeFollowTarget is STICKY on it: when cascade is on and the
+	// upstream we already follow still qualifies, keep it instead of re-homing to a
+	// different node. Without this, a transient reachability flap of a CLOSER peer
+	// oscillates the chosen upstream and re-runs `repmgr standby follow` every tick
+	// (the #182 no-thrash invariant). "" before the first follow.
+	CurrentUpstream string
 }
 
 // Decide maps an Observation to the single action to take.
@@ -531,29 +538,31 @@ func cascadeFollowTarget(o Observation) string {
 	if selfDist <= 1 {
 		return leader // adjacent to the primary: nothing safe to interpose
 	}
+	// Stickiness (#29 thrash fix): if the upstream we already follow still qualifies,
+	// keep it. A transient reachability flap of a CLOSER peer must not pull us off a
+	// still-valid upstream and back again every tick (which would re-run `repmgr standby
+	// follow` -- the #182 no-thrash invariant). We only re-home when the current upstream
+	// stops qualifying (down/promoted/diverged), which is exactly when re-homing is needed.
+	if o.CurrentUpstream != "" && o.CurrentUpstream != leader && o.CurrentUpstream != o.LocalNode {
+		for _, p := range o.Peers {
+			if p.Name == o.CurrentUpstream && cascadeQualifies(o, p, selfDist, lead) {
+				return o.CurrentUpstream
+			}
+		}
+	}
 	best := ""
 	bestDist := -1
 	for _, p := range o.Peers {
 		if p.Name == o.LocalNode || p.Name == leader {
 			continue
 		}
-		// Must be a live, same-timeline standby: never gossip-only/unreachable, never a
-		// primary, never on a divergent line -- following anything else risks stranding
-		// or a divergent chain.
-		if !p.Reachable || p.Gossip || p.Role != pg.RoleStandby {
+		if !cascadeQualifies(o, p, selfDist, lead) {
 			continue
 		}
-		if !p.TimelineOK || !o.Local.TimelineOK || p.Timeline != o.Local.Timeline {
-			continue
-		}
-		po := podOrdinal(p.Name)
-		if po < 0 {
-			continue
-		}
-		dist := absInt(po - lead)
-		// strictly closer to the leader than this node (acyclic) and the closest such
-		// node to this one (immediate upstream -> a chain, not a fan-in).
-		if dist < selfDist && dist > bestDist {
+		dist := absInt(podOrdinal(p.Name) - lead)
+		// the closest qualifying node to this one (immediate upstream -> a chain, not a
+		// fan-in onto the node nearest the primary).
+		if dist > bestDist {
 			best = p.Name
 			bestDist = dist
 		}
@@ -562,6 +571,25 @@ func cascadeFollowTarget(o Observation) string {
 		return leader
 	}
 	return best
+}
+
+// cascadeQualifies reports whether peer p is a safe cascade upstream for the local node:
+// a live (SQL-reachable, not gossip-only), same-timeline STANDBY -- never a primary or a
+// divergent line, which would risk stranding or a divergent chain -- whose ordinal
+// distance to the leader is strictly less than the local node's (so the chain is acyclic:
+// distance strictly decreases toward the primary, two nodes can never follow each other).
+func cascadeQualifies(o Observation, p PeerState, selfDist, lead int) bool {
+	if !p.Reachable || p.Gossip || p.Role != pg.RoleStandby {
+		return false
+	}
+	if !p.TimelineOK || !o.Local.TimelineOK || p.Timeline != o.Local.Timeline {
+		return false
+	}
+	po := podOrdinal(p.Name)
+	if po < 0 {
+		return false
+	}
+	return absInt(po-lead) < selfDist
 }
 
 // podOrdinal extracts the StatefulSet ordinal from a pod name (<base>-<ordinal>),

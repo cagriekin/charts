@@ -1,11 +1,13 @@
 #!/bin/bash
-# Live cascading-replication test (#29). With repmgr.agent.cascadingReplication=true and
-# 3 nodes, the standby two hops from the leader follows the INTERMEDIATE standby (pod-1),
-# not the primary directly — offloading the primary's WAL senders into a chain. Proves:
-# (1) the chain forms (the far standby streams from the intermediate, not the leader),
-# (2) data propagates leader -> intermediate -> far standby, and (3) re-homing: killing
-# the intermediate does NOT strand the far standby (it falls back to a live upstream and
-# keeps receiving). Agent mode. OPT-IN / standalone: `make -C pg test-cascading-replication`.
+# Live cascading-replication test (#29). With repmgr.agent.cascadingReplication=true the
+# agent chains standbys by pod ordinal toward the leader so a standby may follow another
+# standby instead of the primary (offloading the primary's WAL senders). 4 nodes are used
+# so a cascade hop exists REGARDLESS of which ordinal the agent elects leader -- the test
+# never skips to a false green. Proves: (1) the chain forms (some standby has a downstream
+# that streams from it, not from the leader), (2) data propagates leader -> chain -> tail,
+# and (3) re-homing -- killing an intermediate does NOT strand its downstream: the
+# downstream's upstream moves to another LIVE node and it keeps receiving.
+# Agent mode. OPT-IN / standalone: `make -C pg test-cascading-replication`.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,20 +18,28 @@ NAMESPACE="${NAMESPACE:-pg-test-cascading}"
 RELEASE="${RELEASE:-pgcasc}"
 FULLNAME=$(resolve_fullname "${RELEASE}" "${CHART_DIR}" "${SCRIPT_DIR}/values-agent.yaml")
 LEASE="${FULLNAME}-leader"
+PODS=("${FULLNAME}-0" "${FULLNAME}-1" "${FULLNAME}-2" "${FULLNAME}-3")
 
 begin_suite "Cascading replication (#29)"
 
-# --- install agent mode, replicaCount 2 (-> 3 pods), cascading on ---
+# downstreams_of <pod> -> space-separated application_names streaming FROM that pod
+downstreams_of() {
+  pg_exec "${NAMESPACE}" "$1" "SELECT string_agg(application_name, ' ') FROM pg_stat_replication" "testuser" "testdb" 2>/dev/null || echo ""
+}
+# is <pod> Running (for the re-home liveness check)
+pod_running() { [ "$(kubectl get pod "$1" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Running" ]; }
+
+# --- install agent mode, replicaCount 3 (-> 4 pods), cascading on ---
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" -n "${NAMESPACE}" \
   -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set postgresql.replicaCount=2 \
+  --set postgresql.replicaCount=3 \
   --set repmgr.agent.cascadingReplication=true \
-  --wait --timeout 10m
+  --wait --timeout 12m
 
-wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 3 600
+wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 4 700
 
-# --- find the leader (lease holder that is actually read-write) ---
+# --- find the read-write leader (lease holder) ---
 echo "  Waiting for a primary + lease holder to settle (up to 240s)..."
 LEADER=""; s=0
 while [[ ${s} -lt 240 ]]; do
@@ -42,26 +52,13 @@ while [[ ${s} -lt 240 ]]; do
 done
 assert_contains "agent elected a read-write leader" "${LEADER:-none}" "${FULLNAME}"
 
-# The chain is by pod ordinal toward the leader. The INTERMEDIATE is always ordinal 1;
-# the cascaded (far) node is the one two hops from the leader: ordinal 2 when the leader
-# is 0, ordinal 0 when the leader is 2. When the leader is the middle (ordinal 1) both
-# standbys are adjacent — no cascade is possible (correct), so those asserts are skipped.
-INTERMEDIATE="${FULLNAME}-1"
-lead_ord="${LEADER##*-}"
-case "${lead_ord}" in
-  0) CASCADED="${FULLNAME}-2" ;;
-  2) CASCADED="${FULLNAME}-0" ;;
-  *) CASCADED="" ;;
-esac
-echo "  leader=${LEADER} intermediate=${INTERMEDIATE} cascaded=${CASCADED:-<none: leader is middle ordinal>}"
-
-# --- data propagates from the leader to ALL standbys (the chain carries WAL) ---
+# --- data propagates from the leader to ALL standbys (the chain carries WAL end to end) ---
 MARK="casc-$(date +%s)"
 pg_exec "${NAMESPACE}" "${LEADER}" "CREATE TABLE IF NOT EXISTS casc (id serial PRIMARY KEY, v text); INSERT INTO casc (v) VALUES ('${MARK}')" "testuser" "testdb"
-for pod in "${FULLNAME}-0" "${FULLNAME}-1" "${FULLNAME}-2"; do
+for pod in "${PODS[@]}"; do
   [[ "${pod}" == "${LEADER}" ]] && continue
   got=""; w=0
-  while [[ ${w} -lt 60 ]]; do
+  while [[ ${w} -lt 90 ]]; do
     got=$(pg_exec "${NAMESPACE}" "${pod}" "SELECT v FROM casc WHERE v='${MARK}'" "testuser" "testdb" 2>/dev/null || echo "")
     [[ "${got}" == "${MARK}" ]] && break
     sleep 3; w=$((w + 3))
@@ -69,42 +66,68 @@ for pod in "${FULLNAME}-0" "${FULLNAME}-1" "${FULLNAME}-2"; do
   assert_eq "#29: data reached standby ${pod}" "${MARK}" "${got}"
 done
 
-if [[ -n "${CASCADED}" ]]; then
-  # --- the chain formed: the far standby streams from the INTERMEDIATE, not the leader.
-  #     application_name in pg_stat_replication is the downstream pod name (agent sets it). ---
-  echo "  Waiting for the cascade to form (${CASCADED} <- ${INTERMEDIATE}) up to 150s..."
-  cascaded_off_intermediate=false; c=0
-  while [[ ${c} -lt 150 ]]; do
-    n=$(pg_exec "${NAMESPACE}" "${INTERMEDIATE}" "SELECT count(*) FROM pg_stat_replication WHERE application_name='${CASCADED}'" "testuser" "testdb" 2>/dev/null || echo "0")
-    [[ "${n}" == "1" ]] && { cascaded_off_intermediate=true; echo "  cascade formed after ~${c}s"; break; }
-    sleep 5; c=$((c + 5))
+# --- the chain formed: SOME standby (not the leader) has a downstream streaming from it.
+#     With 4 nodes this holds for ANY elected leader ordinal, so this assertion ALWAYS
+#     runs -- it cannot silently skip to green. INTERMEDIATE = a standby with a downstream;
+#     CASCADED = the node streaming from it (an application_name = pod name). ---
+echo "  Waiting for a cascade hop to form (a standby with a downstream) up to 150s..."
+INTERMEDIATE=""; CASCADED=""; c=0
+while [[ ${c} -lt 150 ]]; do
+  for pod in "${PODS[@]}"; do
+    [[ "${pod}" == "${LEADER}" ]] && continue
+    downs=$(downstreams_of "${pod}")
+    if [[ -n "${downs}" ]]; then
+      for d in ${downs}; do
+        [[ "${d}" == "${FULLNAME}-"* ]] || continue
+        INTERMEDIATE="${pod}"; CASCADED="${d}"; break
+      done
+    fi
+    [[ -n "${INTERMEDIATE}" ]] && break
   done
-  assert_eq "#29: far standby ${CASCADED} streams from the intermediate ${INTERMEDIATE}" "true" "${cascaded_off_intermediate}"
-  # and it does NOT also stream directly from the leader (load really moved off the primary)
-  on_leader=$(pg_exec "${NAMESPACE}" "${LEADER}" "SELECT count(*) FROM pg_stat_replication WHERE application_name='${CASCADED}'" "testuser" "testdb" 2>/dev/null || echo "")
-  assert_eq "#29: far standby does NOT stream directly from the leader (offloaded)" "0" "${on_leader}"
+  [[ -n "${INTERMEDIATE}" ]] && { echo "  cascade hop: ${CASCADED} streams from ${INTERMEDIATE} (after ~${c}s)"; break; }
+  sleep 5; c=$((c + 5))
+done
+assert_contains "#29: a standby acts as a cascade upstream (chain formed, not all from leader)" "${INTERMEDIATE:-none}" "${FULLNAME}"
 
-  # --- re-homing: kill the intermediate. The far standby's upstream is gone, so the agent
-  #     must re-home it to a live upstream (falls back to the leader) -- never stranded. ---
-  if [[ "${cascaded_off_intermediate}" == "true" ]]; then
-    echo "  Deleting the intermediate ${INTERMEDIATE} (re-homing the far standby)..."
-    kubectl delete pod "${INTERMEDIATE}" -n "${NAMESPACE}" --grace-period=10 --wait=false 2>/dev/null || true
-    REMARK="casc-rehome-$(date +%s)"
-    pg_exec "${NAMESPACE}" "${LEADER}" "INSERT INTO casc (v) VALUES ('${REMARK}')" "testuser" "testdb"
-    rehomed=""; rh=0
-    while [[ ${rh} -lt 120 ]]; do
-      rehomed=$(pg_exec "${NAMESPACE}" "${CASCADED}" "SELECT v FROM casc WHERE v='${REMARK}'" "testuser" "testdb" 2>/dev/null || echo "")
-      [[ "${rehomed}" == "${REMARK}" ]] && { echo "  far standby kept receiving after ~${rh}s (re-homed, not stranded)"; break; }
-      sleep 5; rh=$((rh + 5))
+if [[ -n "${INTERMEDIATE}" && -n "${CASCADED}" ]]; then
+  # the cascaded node streams from the INTERMEDIATE, not directly from the leader
+  on_leader=$(downstreams_of "${LEADER}")
+  has_cascaded_on_leader=$(printf '%s\n' "${on_leader}" | grep -wc "${CASCADED}" || true)
+  assert_eq "#29: cascaded ${CASCADED} does NOT stream directly from the leader (offloaded)" "0" "${has_cascaded_on_leader}"
+
+  # --- re-homing: kill the INTERMEDIATE. Its downstream must re-home to another LIVE node
+  #     (not the dead intermediate) and keep receiving -- never stranded. We prove the
+  #     UPSTREAM MOVED (some live node != INTERMEDIATE now has CASCADED as a downstream),
+  #     not merely that data arrived (which the StatefulSet recreating the pod could mask). ---
+  echo "  Deleting intermediate ${INTERMEDIATE}; ${CASCADED} must re-home to a live upstream..."
+  kubectl delete pod "${INTERMEDIATE}" -n "${NAMESPACE}" --grace-period=10 --wait=false 2>/dev/null || true
+  rehomed=""; rh=0
+  while [[ ${rh} -lt 120 ]]; do
+    for pod in "${PODS[@]}"; do
+      [[ "${pod}" == "${INTERMEDIATE}" || "${pod}" == "${CASCADED}" ]] && continue
+      pod_running "${pod}" || continue
+      downs=$(downstreams_of "${pod}")
+      if printf '%s\n' "${downs}" | grep -qw "${CASCADED}"; then rehomed="${pod}"; break; fi
     done
-    assert_eq "#29: far standby is NOT stranded when its upstream dies (re-homed + still receiving)" "${REMARK}" "${rehomed}"
-  else
-    skip "#29: far standby is NOT stranded when its upstream dies (cascade never formed)"
-  fi
+    [[ -n "${rehomed}" ]] && { echo "  ${CASCADED} re-homed to ${rehomed} after ~${rh}s"; break; }
+    sleep 5; rh=$((rh + 5))
+  done
+  assert_contains "#29: cascaded node re-homed to a live upstream when its intermediate died" "${rehomed:-none}" "${FULLNAME}"
+
+  # and it kept receiving: a marker written AFTER the intermediate died reaches it
+  REMARK="casc-rehome-$(date +%s)"
+  pg_exec "${NAMESPACE}" "${LEADER}" "INSERT INTO casc (v) VALUES ('${REMARK}')" "testuser" "testdb"
+  arr=""; a=0
+  while [[ ${a} -lt 90 ]]; do
+    arr=$(pg_exec "${NAMESPACE}" "${CASCADED}" "SELECT v FROM casc WHERE v='${REMARK}'" "testuser" "testdb" 2>/dev/null || echo "")
+    [[ "${arr}" == "${REMARK}" ]] && break
+    sleep 3; a=$((a + 3))
+  done
+  assert_eq "#29: cascaded node keeps receiving after re-home (not stranded)" "${REMARK}" "${arr}"
 else
-  skip "#29: far standby streams from the intermediate (leader is the middle ordinal -- no cascade)"
-  skip "#29: far standby does NOT stream directly from the leader (leader is the middle ordinal)"
-  skip "#29: far standby is NOT stranded when its upstream dies (leader is the middle ordinal)"
+  skip "#29: cascaded node does NOT stream directly from the leader (no cascade hop formed)"
+  skip "#29: cascaded node re-homed to a live upstream when its intermediate died (no cascade hop)"
+  skip "#29: cascaded node keeps receiving after re-home (no cascade hop)"
 fi
 
 end_suite

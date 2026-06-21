@@ -450,6 +450,9 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// Cascading replication (#29): when enabled, a standby may follow another standby
 	// (the pure cascadeFollowTarget decides; default off -> follow the primary).
 	o.Cascade = a.cfg.CascadeReplication
+	// The upstream this standby currently follows, so cascadeFollowTarget can stay
+	// sticky and not oscillate when a closer peer flaps (#29 thrash fix).
+	o.CurrentUpstream = a.followUpstream
 	// Maintenance mode (Part H1): an operator-set annotation on the marker ConfigMap
 	// suspends automatic promote/demote/fence/self-health (Decide -> NoOp) while the
 	// agent keeps renewing the Lease and serving.
