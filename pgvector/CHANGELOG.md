@@ -1,6 +1,11 @@
 # pgvector chart changelog
 
-## Unreleased
+## 1.2.0 - 2026-06-21
+
+Optional client-connection TLS for PostgreSQL, PGPool, and the metrics exporter (#110),
+plus optional cascading replication (#29). Both off by default — no rendered change at
+defaults. Image moves to `trixie-5.5.0-25`.
+pgvector shares pg's templates and agent; see the pg CHANGELOG for the full detail.
 
 ### Added
 
@@ -8,17 +13,7 @@
   default off).** A standby may stream from another standby (a pod-ordinal chain toward the
   primary) to offload the primary's WAL senders; the agent only follows a verifiably-safe
   same-timeline upstream and re-homes to the leader on failure, never stranding a standby.
-  Byte-stable when off. Shares pg's agent; see the pg CHANGELOG. Needs a new image tag +
-  chart minor when released.
-
-## 1.2.0 - 2026-06-21
-
-Optional client-connection TLS for PostgreSQL, PGPool, and the metrics exporter (#110).
-Off by default — no rendered change at defaults. Image moves to `trixie-5.5.0-25`.
-pgvector shares pg's templates and agent; see the pg CHANGELOG for the full detail.
-
-### Added
-
+  Byte-stable when off. Shares pg's agent; see the pg CHANGELOG.
 - **PostgreSQL server TLS** (`postgresql.tls.enabled`, BYO `existingSecret`), **enforced
   TLS** (`postgresql.tls.require`) and **mutual TLS** (`postgresql.tls.clientCertAuth`,
   agent mode only, with internal service users exempted from the client-cert requirement).
