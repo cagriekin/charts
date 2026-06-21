@@ -32,7 +32,9 @@ jobs:
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             files=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
-            if printf '%s\n' "$files" | grep -qE '^(pg/|images/repmgr/|etcd/|\.github/workflows/pg-test\.yaml)'; then
+            # Documentation-only changes (*.md) never affect rendering, so exclude them:
+            # a PR touching only Markdown leaves nothing to match and the suite is skipped.
+            if printf '%s\n' "$files" | grep -vE '\.md$' | grep -qE '^(pg/|images/repmgr/|etcd/|\.github/workflows/pg-test\.yaml)'; then
               echo "pg=true" >> "$GITHUB_OUTPUT"
             else
               echo "pg=false" >> "$GITHUB_OUTPUT"
