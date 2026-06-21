@@ -9,7 +9,12 @@
 // committed data incorrectly.
 package reconcile
 
-import "github.com/cagriekin/pg-ha-agent/internal/pg"
+import (
+	"strconv"
+	"strings"
+
+	"github.com/cagriekin/pg-ha-agent/internal/pg"
+)
 
 // Action is what the agent should do this tick.
 type Action int
@@ -119,6 +124,20 @@ type Observation struct {
 	// replaying WAL toward consistency is alive but not yet SQL-ready. The agent
 	// must not act on a starting node's stale on-disk role (#181).
 	LocalProcessAlive bool
+	// Cascade enables cascading replication (#29): a standby may follow another
+	// standby instead of the primary, to offload the primary's WAL senders. Default
+	// false -> every standby follows the lease holder (byte-stable). Even when true,
+	// cascadeFollowTarget only picks an upstream that is verifiably safe and otherwise
+	// falls back to the leader, so a broken/missing/promoted upstream never strands a
+	// standby (it re-homes on the next tick via the Follow target change).
+	Cascade bool
+	// CurrentUpstream is the node this standby currently follows (the agent's
+	// followUpstream). cascadeFollowTarget is STICKY on it: when cascade is on and the
+	// upstream we already follow still qualifies, keep it instead of re-homing to a
+	// different node. Without this, a transient reachability flap of a CLOSER peer
+	// oscillates the chosen upstream and re-runs `repmgr standby follow` every tick
+	// (the #182 no-thrash invariant). "" before the first follow.
+	CurrentUpstream string
 }
 
 // Decide maps an Observation to the single action to take.
@@ -252,6 +271,13 @@ func Decide(o Observation) Decision {
 	case o.Local.Running && o.Local.InRecovery:
 		if o.LeaderIdentity == "" {
 			return d(Wait, "", "standby but no known leader; keep the current upstream")
+		}
+		// Cascading replication (#29): a standby may follow another standby to offload
+		// the primary's WAL senders. cascadeFollowTarget returns the leader unless a
+		// verifiably-safe upstream standby qualifies, so this is byte-identical to
+		// following the lease holder when cascade is off or no safe upstream exists.
+		if up := cascadeFollowTarget(o); up != o.LeaderIdentity {
+			return d(Follow, up, "standby; cascade-follow upstream "+up+" (offload primary)")
 		}
 		return d(Follow, o.LeaderIdentity, "standby; follow the lease holder")
 
@@ -481,4 +507,108 @@ func switchoverTargetReady(o Observation) string {
 		return t
 	}
 	return "" // requested target is not among the observed peers
+}
+
+// cascadeFollowTarget returns the node this standby should follow. With cascade off
+// (Observation.Cascade=false) or no safe upstream, it returns the lease holder
+// (LeaderIdentity) -- byte-identical to following the primary. With cascade on it may
+// return an intermediate standby so WAL-sender load spreads into a chain rooted at the
+// primary, but ONLY one that is verifiably safe; the action layer re-homes when this
+// target changes, so a failed/promoted/diverged upstream falls back to the leader on
+// the next tick (it stops qualifying), never stranding the standby.
+//
+// Topology: a chain by pod ordinal toward the leader. A candidate qualifies when it is
+// a reachable, same-timeline STANDBY whose ordinal distance to the leader is strictly
+// less than this node's -- which guarantees an acyclic chain (distance strictly
+// decreases toward the primary, so two nodes can never follow each other). Among
+// qualifying candidates the one CLOSEST to this node (largest distance still below
+// ours) is the immediate upstream, spreading senders across the chain rather than
+// fanning every node onto the one nearest the primary.
+func cascadeFollowTarget(o Observation) string {
+	leader := o.LeaderIdentity
+	if !o.Cascade || leader == "" {
+		return leader
+	}
+	self := podOrdinal(o.LocalNode)
+	lead := podOrdinal(leader)
+	if self < 0 || lead < 0 {
+		return leader // cannot reason about ordinals; follow the primary
+	}
+	selfDist := absInt(self - lead)
+	if selfDist <= 1 {
+		return leader // adjacent to the primary: nothing safe to interpose
+	}
+	// Stickiness (#29 thrash fix): if the upstream we already follow still qualifies,
+	// keep it. A transient reachability flap of a CLOSER peer must not pull us off a
+	// still-valid upstream and back again every tick (which would re-run `repmgr standby
+	// follow` -- the #182 no-thrash invariant). We only re-home when the current upstream
+	// stops qualifying (down/promoted/diverged), which is exactly when re-homing is needed.
+	if o.CurrentUpstream != "" && o.CurrentUpstream != leader && o.CurrentUpstream != o.LocalNode {
+		for _, p := range o.Peers {
+			if p.Name == o.CurrentUpstream && cascadeQualifies(o, p, selfDist, lead) {
+				return o.CurrentUpstream
+			}
+		}
+	}
+	best := ""
+	bestDist := -1
+	for _, p := range o.Peers {
+		if p.Name == o.LocalNode || p.Name == leader {
+			continue
+		}
+		if !cascadeQualifies(o, p, selfDist, lead) {
+			continue
+		}
+		dist := absInt(podOrdinal(p.Name) - lead)
+		// the closest qualifying node to this one (immediate upstream -> a chain, not a
+		// fan-in onto the node nearest the primary).
+		if dist > bestDist {
+			best = p.Name
+			bestDist = dist
+		}
+	}
+	if best == "" {
+		return leader
+	}
+	return best
+}
+
+// cascadeQualifies reports whether peer p is a safe cascade upstream for the local node:
+// a live (SQL-reachable, not gossip-only), same-timeline STANDBY -- never a primary or a
+// divergent line, which would risk stranding or a divergent chain -- whose ordinal
+// distance to the leader is strictly less than the local node's (so the chain is acyclic:
+// distance strictly decreases toward the primary, two nodes can never follow each other).
+func cascadeQualifies(o Observation, p PeerState, selfDist, lead int) bool {
+	if !p.Reachable || p.Gossip || p.Role != pg.RoleStandby {
+		return false
+	}
+	if !p.TimelineOK || !o.Local.TimelineOK || p.Timeline != o.Local.Timeline {
+		return false
+	}
+	po := podOrdinal(p.Name)
+	if po < 0 {
+		return false
+	}
+	return absInt(po-lead) < selfDist
+}
+
+// podOrdinal extracts the StatefulSet ordinal from a pod name (<base>-<ordinal>),
+// returning -1 if absent or unparseable.
+func podOrdinal(pod string) int {
+	i := strings.LastIndex(pod, "-")
+	if i < 0 || i == len(pod)-1 {
+		return -1
+	}
+	n, err := strconv.Atoi(pod[i+1:])
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
+}
+
+func absInt(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
