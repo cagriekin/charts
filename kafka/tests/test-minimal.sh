@@ -7,7 +7,7 @@ source "${SCRIPT_DIR}/helpers.sh"
 
 NAMESPACE="${NAMESPACE:-kafka-test-minimal}"
 RELEASE="${RELEASE:-kafka-minimal}"
-FULLNAME="${RELEASE}-kafka"
+FULLNAME="${RELEASE}"
 
 begin_suite "Minimal Install (1 controller + 1 broker)"
 
