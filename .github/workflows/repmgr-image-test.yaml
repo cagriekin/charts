@@ -4,12 +4,6 @@ permissions:
   contents: read
 
 on:
-  push:
-    branches:
-      - master
-    paths:
-      - 'images/repmgr/**'
-      - '.github/workflows/repmgr-image-test.yaml'
   pull_request:
     paths:
       - 'images/repmgr/**'
