@@ -22,10 +22,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: v3.14.2
 
@@ -37,7 +37,7 @@ jobs:
 
       - name: Cache container images
         id: image-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /tmp/kind-images
           key: kind-images-redis-${{ hashFiles('redis/values.yaml') }}
