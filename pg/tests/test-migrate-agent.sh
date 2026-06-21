@@ -48,7 +48,7 @@ kubectl delete statefulset "${FULLNAME}" -n "${NAMESPACE}" --cascade=orphan
 # A real 1.0.0 migration also bumps the repmgr image to an agent-capable tag (the
 # pre-agent image has no `agent` entrypoint arm). values-repmgr.yaml installs the
 # released image; bump it to the agent-capable tag as part of the failoverMode flip.
-AGENT_IMAGE_TAG="${AGENT_IMAGE_TAG:-trixie-5.5.0-23}"
+AGENT_IMAGE_TAG="${AGENT_IMAGE_TAG:-trixie-5.5.0-25}"
 helm upgrade "${RELEASE}" "${CHART_DIR}" \
   -n "${NAMESPACE}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --set repmgr.failoverMode=agent --set "repmgr.image.tag=${AGENT_IMAGE_TAG}" --wait --timeout 10m

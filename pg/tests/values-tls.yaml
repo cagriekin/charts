@@ -1,0 +1,34 @@
+# #110 live client-TLS test overrides, layered ON TOP OF values-agent.yaml:
+#   helm upgrade --install ... -f values-agent.yaml -f values-tls.yaml
+# Agent mode + full mutual TLS: PostgreSQL server TLS, require + clientCertAuth,
+# PGPool frontend+backend TLS (with a backend client cert for the mTLS passthrough),
+# and the exporter scraping over TLS as the (exempt) monitoring user.
+repmgr:
+  image:
+    tag: trixie-5.5.0-25
+    pullPolicy: IfNotPresent
+
+postgresql:
+  tls:
+    enabled: true
+    existingSecret: postgresql-tls
+    require: true
+    clientCertAuth: true
+
+pgpool:
+  enabled: true
+  image:
+    pullPolicy: IfNotPresent
+  tls:
+    enabled: true
+    existingSecret: pgpool-tls
+    backendSslmode: require
+    backendClientCert: pgpool-backend-tls
+
+prometheusExporter:
+  enabled: true
+  image:
+    pullPolicy: IfNotPresent
+  sslmode: require
+  monitoringUser:
+    enabled: true

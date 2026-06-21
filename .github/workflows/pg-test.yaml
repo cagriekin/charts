@@ -182,6 +182,18 @@ jobs:
           kubectl delete namespace pg-test-agent-etcd-tls --ignore-not-found --wait=true --timeout=180s \
             || echo "WARNING: namespace cleanup timed out, continuing"
 
+      # Client-connection TLS (#110): CA + certs; proves PostgreSQL ssl=on, `require`
+      # rejecting non-TLS, mutual TLS rejecting a no-cert app user while the exempt
+      # internal users + replication + failover keep working, the exporter scraping over
+      # TLS, PGPool serving over TLS, and optional server TLS in repmgrd mode.
+      - name: Run client TLS test
+        run: make -C pg test-tls
+
+      - name: Clean up TLS namespaces
+        run: |
+          kubectl delete namespace pg-test-tls pg-test-tls-repmgrd pg-test-tls-standalone --ignore-not-found --wait=true --timeout=180s \
+            || echo "WARNING: namespace cleanup timed out, continuing"
+
       # The 1.0.0 breaking-change path: repmgrd -> agent via --cascade=orphan recreate.
       - name: Run repmgrd->agent migration test
         run: make -C pg test-migrate-agent

@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+## 1.2.0 - 2026-06-21
+
+Optional client-connection TLS for PostgreSQL, PGPool, and the metrics exporter (#110).
+Off by default — no rendered change at defaults. Image moves to `trixie-5.5.0-25`.
+
+### Added
+
+- **PostgreSQL server TLS (`postgresql.tls.enabled`).** Serves `ssl = on` from a BYO
+  Secret (`postgresql.tls.existingSecret`, keys `tls.crt`/`tls.key`/`ca.crt`, mounted
+  read-only at `/etc/postgresql/tls`, `defaultMode: 0400`) via a chart-managed
+  `tls.conf` injected over the `conf.d` include. Works in both agent and repmgrd mode and
+  in standalone (`replicaCount: 0`) installs.
+- **Enforced TLS (`postgresql.tls.require`) and mutual TLS
+  (`postgresql.tls.clientCertAuth`), agent mode only.** `require` makes the pod-CIDR
+  client rule `hostssl` (rejects non-TLS clients); `clientCertAuth` additionally requires
+  a client cert (`clientcert=verify-ca`) for app users. The chart's internal service users
+  (the `repmgr` user, the superuser, and the monitoring user) are **exempted** from the
+  client-cert requirement so the agent prober, repmgr, the exporter, and PGPool keep
+  working. Loopback and the `host replication` rule are never converted — **replication
+  stays plaintext on the pod network** (a documented non-goal; repmgr/agent replication
+  conninfo carries no `sslmode`).
+- **PGPool TLS (`pgpool.tls.*`).** Frontend `ssl = on` (`existingSecret`, optional
+  `clientCertAuth`), backend TLS to PostgreSQL via `backendSslmode`
+  (`disable|prefer|require|verify-ca|verify-full`), and `backendClientCert` so PGPool can
+  present a client cert to the backends under PostgreSQL mTLS.
+- **Exporter `sslmode` (`prometheusExporter.sslmode`).** `disable|require|verify-ca|
+  verify-full` for the metrics exporter's connection; `verify-*` mounts the CA from the
+  server-cert Secret and sets `sslrootcert`.
+- **Fail-fast guards.** Each `tls.enabled` requires its `existingSecret`;
+  `require`/`clientCertAuth` require `tls.enabled` and agent mode; `require` requires the
+  exporter and PGPool backend `sslmode >= require`; mTLS requires a CA and (with PGPool) a
+  PGPool backend client cert; `verify-*` requires `postgresql.tls.enabled`.
+
+### Fixed
+
+- The outer `volumes:`/`annotations:` gates on the StatefulSet now include
+  `postgresql.tls.enabled`, so a TLS-only install (no `postgresql.configuration`/
+  `pgbackrest`) renders the cert volume (not just its mount) and the config checksum that
+  rolls the pod when the cert/config changes.
+
+### Notes
+
+- repmgrd mode supports only **optional server TLS** (`ssl = on`); `require`/`clientCertAuth`
+  are agent-mode only (repmgrd's md5-fallback `pg_hba` line would bypass a `hostssl` rule)
+  and the render fails fast if requested there.
+- PostgreSQL reloads `ssl_*` on SIGHUP, not when the mounted Secret changes — run
+  `kubectl rollout restart` after rotating the cert Secret.
+
 ## 1.1.8 - 2026-06-21
 
 Quiets the etcd RBAC health-probe noise (#187). Bundles `etcd` 0.1.5; image moves to

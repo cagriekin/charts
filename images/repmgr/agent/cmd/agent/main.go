@@ -763,6 +763,10 @@ func (a *agent) writePgHba() error {
 		ReplicationUser: a.cfg.RepmgrUser,
 		PeerCIDR:        a.cfg.PgHbaPeerCIDR,
 		ExtraRules:      a.cfg.PgHbaRules,
+		RequireSSL:      a.cfg.TLSRequireSSL,
+		ClientCertAuth:  a.cfg.TLSClientCertAuth,
+		PostgresUser:    a.cfg.PostgresUser,
+		MonitoringUser:  a.cfg.MonitoringUser,
 	})
 	return pgconf.WritePgHba(filepath.Join(a.cfg.PGDATA, "pg_hba.conf"), content)
 }
