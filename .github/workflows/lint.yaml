@@ -15,15 +15,10 @@ on:
       - '**/charts/*.tgz'
       - 'scripts/**'
       - '.github/workflows/lint.yaml'
+  # No paths filter: lint is global (it lints every chart) and fast, so it runs on
+  # EVERY PR -- which lets it be a required status check without blocking PRs that
+  # happen not to touch a chart path.
   pull_request:
-    paths:
-      - '**/Chart.yaml'
-      - '**/Chart.lock'
-      - '**/values.yaml'
-      - '**/templates/**'
-      - '**/charts/*.tgz'
-      - 'scripts/**'
-      - '.github/workflows/lint.yaml'
 
 jobs:
   lint:
