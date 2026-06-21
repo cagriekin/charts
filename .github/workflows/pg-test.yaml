@@ -156,6 +156,7 @@ jobs:
           - { name: agent-etcd-tls, target: test-agent-etcd-tls }
           - { name: tls, target: test-tls }
           - { name: pgpool-failover, target: test-pgpool-failover }
+          - { name: config-failover, target: test-config-failover }
           - { name: agent-rolling, target: test-agent-rolling }
           - { name: backup-restore, target: test-backup-restore }
           - { name: migrate-agent, target: test-migrate-agent }
