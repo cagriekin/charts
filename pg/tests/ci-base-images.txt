@@ -1,0 +1,12 @@
+# Third-party container images the pg live test-suites need, pre-pulled and warmed
+# into the Kind nodes by CI (the repmgr image is built from source separately).
+# One image ref per line; blank lines and # comments ignored. The CI base-image
+# cache key is the hash of THIS file, so a chart image-tag bump no longer busts it
+# (only changing this list does).
+postgres:18.1-trixie
+cagriekin/pgpool:4.7.1
+pgpool/pgpool2_exporter:1.2.2
+quay.io/prometheuscommunity/postgres-exporter:v0.19.1
+quay.io/coreos/etcd:v3.5.16
+busybox:1.37
+busybox:1.35
