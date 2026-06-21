@@ -10,24 +10,46 @@ on:
     paths:
       - 'pg/**'
       - 'images/repmgr/**'
-      # the bundled etcd subchart is exercised by this suite (template asserts +
-      # the agent etcd-mode test), so an etcd-source change must re-run it.
       - 'etcd/**'
       - '.github/workflows/pg-test.yaml'
+  # No paths filter on pull_request: the `gate` job must report a status on EVERY PR
+  # so it can be a required check without blocking PRs that do not touch pg. The
+  # `changes` job below skips the heavy work when pg is untouched.
   pull_request:
-    paths:
-      - 'pg/**'
-      - 'images/repmgr/**'
-      - 'etcd/**'
-      - '.github/workflows/pg-test.yaml'
 
-# A new push to the same ref cancels the in-flight run -- rapid iteration no longer
-# leaves a ~30min run burning a runner for a commit that is already superseded.
 concurrency:
   group: pg-test-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Detect whether this PR touches pg (chart, agent image, or bundled etcd). On push
+  # to master the trigger is already path-filtered to those paths, so treat it as
+  # changed. The heavy jobs gate on this; the gate job self-passes when untouched.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      pg: ${{ steps.detect.outputs.pg }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Detect pg changes
+        id: detect
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            files=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+            if printf '%s\n' "$files" | grep -qE '^(pg/|images/repmgr/|etcd/|\.github/workflows/pg-test\.yaml)'; then
+              echo "pg=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "pg=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "pg=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "pg changed: $(grep pg= "$GITHUB_OUTPUT")"
+
   # ---------------------------------------------------------------------------
   # Build the repmgr image + warm the base-image cache ONCE, then hand every
   # suite a ready-to-load image bundle. Also runs the fast render gate so a
@@ -35,6 +57,8 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     name: build images + render gate
+    needs: changes
+    if: needs.changes.outputs.pg == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -97,8 +121,7 @@ jobs:
           docker save "cagriekin/repmgr:${tag}" -o /tmp/kind-images/repmgr.tar
 
       # Fast render gate: template + lint take ~1min and catch most regressions
-      # before any live cluster is started. If this fails the whole matrix is
-      # skipped (it `needs: build`).
+      # before any live cluster is started. If this fails the matrix is skipped.
       - name: Run template + lint tests
         run: make -C pg test-template
 
@@ -123,7 +146,8 @@ jobs:
   # ---------------------------------------------------------------------------
   suite:
     name: ${{ matrix.name }}
-    needs: build
+    needs: [changes, build]
+    if: needs.changes.outputs.pg == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -216,3 +240,24 @@ jobs:
               done
             done
           done
+
+  # The single required status check for pg. ALWAYS runs (no path filter on the
+  # trigger), so it reports on every PR: it self-passes when pg is untouched, and
+  # otherwise fails unless the build + every suite leg succeeded. Require this one
+  # context in branch protection instead of the brittle per-leg names.
+  gate:
+    name: pg-tests-passed
+    needs: [changes, build, suite]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate result
+        run: |
+          if [ "${{ needs.changes.outputs.pg }}" != "true" ]; then
+            echo "pg unchanged — gate passes (no-op)"; exit 0
+          fi
+          if [ "${{ needs.build.result }}" = "success" ] && [ "${{ needs.suite.result }}" = "success" ]; then
+            echo "pg build + all suites passed"; exit 0
+          fi
+          echo "pg gate FAILED: build=${{ needs.build.result }} suite=${{ needs.suite.result }}"
+          exit 1
