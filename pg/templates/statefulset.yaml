@@ -413,6 +413,13 @@ spec:
               value: {{ .Values.repmgr.agent.retryPeriod | quote }}
             - name: RECONCILE_INTERVAL
               value: {{ .Values.repmgr.agent.reconcileInterval | quote }}
+{{- if .Values.repmgr.agent.cascadingReplication }}
+            {{- /* Cascading replication (#29): a standby may follow another standby to
+                   offload the primary's WAL senders. The agent picks a safe upstream and
+                   falls back to the primary, so a failed upstream never strands a node. */}}
+            - name: CASCADE_REPLICATION
+              value: "true"
+{{- end }}
             - name: MASTER_SERVICE
               value: {{ include "pg.fullname" . | quote }}
             - name: POD_SELECTOR

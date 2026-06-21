@@ -2596,5 +2596,25 @@ pgv_tls=$(helm template test-pgv "${PGVECTOR_DIR}" \
   --show-only templates/postgresql-configmap.yaml 2>&1)
 assert_contains "#110 pgvector: server TLS renders ssl = on" "${pgv_tls}" "ssl = on"
 
+# ======================================================================
+# #29: cascading replication. Off by default (byte-stable); the agent gets the
+# CASCADE_REPLICATION env only when the knob is on, and only in agent mode.
+# ======================================================================
+casc_off=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#29 off: no CASCADE_REPLICATION env by default" "${casc_off}" "CASCADE_REPLICATION"
+casc_on=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.cascadingReplication=true \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#29 on: agent gets CASCADE_REPLICATION env" "${casc_on}" 'name: CASCADE_REPLICATION
+              value: "true"'
+# repmgrd mode: cascading is agent-only -> the env is never emitted even if the knob is set
+casc_repmgrd=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=true --set repmgr.failoverMode=repmgrd \
+  --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
+  --set repmgr.agent.cascadingReplication=true \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#29: repmgrd mode never gets CASCADE_REPLICATION (agent-only)" "${casc_repmgrd}" "CASCADE_REPLICATION"
+
 end_suite
 print_summary

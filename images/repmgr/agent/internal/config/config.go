@@ -48,6 +48,11 @@ type Config struct {
 	PostgresUser      string // POSTGRES_USER: superuser, exempt from clientcert
 	MonitoringUser    string // MONITORING_USER: monitoring user, exempt; "" when disabled
 
+	// Cascading replication (issue #29). Optional; default off (every standby follows
+	// the primary, byte-stable). When on, a standby may follow another standby to
+	// offload the primary's WAL senders, with a safe fallback to the primary.
+	CascadeReplication bool // CASCADE_REPLICATION
+
 	// etcd backend (required only when DCSBackend == "etcd"). TLS is optional
 	// (all-or-none, enforced by the dcs layer).
 	EtcdEndpoints []string
@@ -147,6 +152,9 @@ func Load(get func(string) string) (*Config, error) {
 	c.TLSClientCertAuth = boolEnv(get("TLS_CLIENT_CERT_AUTH"))
 	c.PostgresUser = strings.TrimSpace(get("POSTGRES_USER"))
 	c.MonitoringUser = strings.TrimSpace(get("MONITORING_USER"))
+
+	// Cascading replication (issue #29). Optional -- absent/empty means off.
+	c.CascadeReplication = boolEnv(get("CASCADE_REPLICATION"))
 
 	// Cross-field validation that the lease timings are internally consistent
 	// (client-go requires LeaseDuration > RenewDeadline > RetryPeriod).
