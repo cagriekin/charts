@@ -3,6 +3,29 @@ entries:
   etcd:
   - apiVersion: v2
     appVersion: 3.5.16
+    created: "2026-06-21T00:32:47.74569763Z"
+    description: Minimal 3-node etcd cluster for the pg-ha-agent etcd DCS backend
+      (bundled in pg/pgvector, or installed standalone as a shared store)
+    digest: 0a508099f8aa75b7b754020581cb7433a6443219c5f600f462f78095afcacf1c
+    home: https://github.com/cagriekin/charts/tree/master/etcd
+    keywords:
+    - etcd
+    - coordination
+    - leader-election
+    maintainers:
+    - email: cagri.ekin@gmail.com
+      name: cagriekin
+      url: https://github.com/cagriekin
+    name: etcd
+    sources:
+    - https://github.com/cagriekin/charts
+    - https://etcd.io
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/etcd-0.1.5.tgz
+    version: 0.1.5
+  - apiVersion: v2
+    appVersion: 3.5.16
     created: "2026-06-20T13:14:50.220522628Z"
     description: Minimal 3-node etcd cluster for the pg-ha-agent etcd DCS backend
       (bundled in pg/pgvector, or installed standalone as a shared store)
@@ -1512,4 +1535,4 @@ entries:
     urls:
     - https://cagriekin.github.io/charts/redis-0.2.0.tgz
     version: 0.2.0
-generated: "2026-06-20T18:06:26.938199987Z"
+generated: "2026-06-21T00:32:47.744814199Z"
