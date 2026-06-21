@@ -4,14 +4,6 @@ permissions:
   contents: read
 
 on:
-  push:
-    branches:
-      - master
-    paths:
-      - 'pg/**'
-      - 'images/repmgr/**'
-      - 'etcd/**'
-      - '.github/workflows/pg-test.yaml'
   # No paths filter on pull_request: the `gate` job must report a status on EVERY PR
   # so it can be a required check without blocking PRs that do not touch pg. The
   # `changes` job below skips the heavy work when pg is untouched.
