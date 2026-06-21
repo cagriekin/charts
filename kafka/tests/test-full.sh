@@ -7,7 +7,7 @@ source "${SCRIPT_DIR}/helpers.sh"
 
 NAMESPACE="${NAMESPACE:-kafka-test-full}"
 RELEASE="${RELEASE:-kafka-full}"
-FULLNAME="${RELEASE}-kafka"
+FULLNAME="${RELEASE}"
 
 begin_suite "Full Install (1 controller + 2 brokers + exporter + topics)"
 

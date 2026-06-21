@@ -7,9 +7,17 @@ on:
     paths:
       - 'kafka/**'
       - '.github/workflows/kafka-test.yaml'
+  # No paths filter: the `gate` job must report on EVERY PR so it can be required
+  # without blocking PRs that do not touch kafka. The `changes` job skips the heavy
+  # work when kafka is untouched.
+  pull_request:
 
 permissions:
   contents: read
+
+concurrency:
+  group: kafka-test-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   IMAGES: >-
@@ -17,14 +25,41 @@ env:
     danielqsj/kafka-exporter:v1.9.0
 
 jobs:
-  test:
+  changes:
     runs-on: ubuntu-latest
+    outputs:
+      kafka: ${{ steps.detect.outputs.kafka }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Detect kafka changes
+        id: detect
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            files=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+            if printf '%s\n' "$files" | grep -qE '^(kafka/|\.github/workflows/kafka-test\.yaml)'; then
+              echo "kafka=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "kafka=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "kafka=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    needs: changes
+    if: needs.changes.outputs.kafka == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
 
       - name: Set up Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: v3.14.2
 
@@ -36,7 +71,7 @@ jobs:
 
       - name: Cache container images
         id: image-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /tmp/kind-images
           key: kind-images-kafka-${{ hashFiles('kafka/values.yaml') }}
@@ -67,3 +102,22 @@ jobs:
 
       - name: Run full tests
         run: make -C kafka test-full
+
+  # Single required status check for kafka. Always runs; self-passes when kafka is
+  # untouched, otherwise mirrors the test job's result.
+  gate:
+    name: kafka-tests-passed
+    needs: [changes, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate result
+        run: |
+          if [ "${{ needs.changes.outputs.kafka }}" != "true" ]; then
+            echo "kafka unchanged — gate passes (no-op)"; exit 0
+          fi
+          if [ "${{ needs.test.result }}" = "success" ]; then
+            echo "kafka tests passed"; exit 0
+          fi
+          echo "kafka gate FAILED: test=${{ needs.test.result }}"
+          exit 1

@@ -15,25 +15,20 @@ on:
       - '**/charts/*.tgz'
       - 'scripts/**'
       - '.github/workflows/lint.yaml'
+  # No paths filter: lint is global (it lints every chart) and fast, so it runs on
+  # EVERY PR -- which lets it be a required status check without blocking PRs that
+  # happen not to touch a chart path.
   pull_request:
-    paths:
-      - '**/Chart.yaml'
-      - '**/Chart.lock'
-      - '**/values.yaml'
-      - '**/templates/**'
-      - '**/charts/*.tgz'
-      - 'scripts/**'
-      - '.github/workflows/lint.yaml'
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: v3.14.2
 

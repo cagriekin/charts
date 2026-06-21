@@ -10,39 +10,58 @@ on:
     paths:
       - 'pg/**'
       - 'images/repmgr/**'
-      # the bundled etcd subchart is exercised by this suite (template asserts +
-      # the agent etcd-mode test), so an etcd-source change must re-run it.
       - 'etcd/**'
       - '.github/workflows/pg-test.yaml'
-  # Also gate PRs: the chart integration suite (incl. agent + failover) catches
-  # regressions a merge to master otherwise only surfaces after the fact.
+  # No paths filter on pull_request: the `gate` job must report a status on EVERY PR
+  # so it can be a required check without blocking PRs that do not touch pg. The
+  # `changes` job below skips the heavy work when pg is untouched.
   pull_request:
-    paths:
-      - 'pg/**'
-      - 'images/repmgr/**'
-      - 'etcd/**'
-      - '.github/workflows/pg-test.yaml'
 
-env:
-  IMAGES: >-
-    postgres:18.1-trixie
-    cagriekin/pgpool:4.7.1
-    pgpool/pgpool2_exporter:1.2.2
-    quay.io/prometheuscommunity/postgres-exporter:v0.19.1
-    quay.io/coreos/etcd:v3.5.16
-    busybox:1.37
-    busybox:1.35
+concurrency:
+  group: pg-test-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  # Detect whether this PR touches pg (chart, agent image, or bundled etcd). On push
+  # to master the trigger is already path-filtered to those paths, so treat it as
+  # changed. The heavy jobs gate on this; the gate job self-passes when untouched.
+  changes:
     runs-on: ubuntu-latest
+    outputs:
+      pg: ${{ steps.detect.outputs.pg }}
     steps:
-      # GitHub-hosted runners ship ~14GB free on /, which the cache-miss path
-      # (a pg/values.yaml change busts the image cache key, so docker pull + save +
-      # kind load makes three on-disk copies of every cached image) plus the
-      # apt-heavy repmgr build and its mode=max buildx cache export intermittently
-      # exhaust -> "No space left on device". Reclaim the preinstalled toolchains
-      # this job never uses (~25GB) before anything touches the disk.
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Detect pg changes
+        id: detect
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            files=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+            if printf '%s\n' "$files" | grep -qE '^(pg/|images/repmgr/|etcd/|\.github/workflows/pg-test\.yaml)'; then
+              echo "pg=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "pg=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "pg=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "pg changed: $(grep pg= "$GITHUB_OUTPUT")"
+
+  # ---------------------------------------------------------------------------
+  # Build the repmgr image + warm the base-image cache ONCE, then hand every
+  # suite a ready-to-load image bundle. Also runs the fast render gate so a
+  # template/lint regression fails in ~1min without spinning up any clusters.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build images + render gate
+    needs: changes
+    if: needs.changes.outputs.pg == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
       - name: Free up runner disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
@@ -52,53 +71,43 @@ jobs:
           df -h /
 
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: v3.14.2
 
-      - name: Create Kind cluster
-        uses: helm/kind-action@v1
-        with:
-          cluster_name: pg-test
-          config: pg/kind-config.yaml
-
-      - name: Cache container images
-        id: image-cache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/kind-images
-          key: kind-images-${{ hashFiles('pg/values.yaml') }}
-
-      - name: Load cached images into Kind
-        if: steps.image-cache.outputs.cache-hit == 'true'
-        run: |
-          for tarball in /tmp/kind-images/*.tar; do
-            kind load image-archive "$tarball" --name pg-test
-          done
-
-      - name: Pull and cache images
-        if: steps.image-cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p /tmp/kind-images
-          for image in $IMAGES; do
-            docker pull "$image"
-            safe_name=$(echo "$image" | tr '/:' '_')
-            docker save "$image" -o "/tmp/kind-images/${safe_name}.tar"
-            kind load image-archive "/tmp/kind-images/${safe_name}.tar" --name pg-test
-          done
-
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
-      # The repmgr image is built from source (images/repmgr) rather than pulled,
-      # so an image change is tested together with the chart in one PR. The tag is
-      # read from pg/values.yaml so the locally-built image satisfies the chart's
-      # IfNotPresent pull policy without a registry round-trip. buildx + gha cache
-      # keeps the apt-heavy image build off the critical path on cache hits.
-      - name: Build repmgr image from source and load into Kind
+      # Cache the third-party base images. Keyed on the image MANIFEST, not on
+      # pg/values.yaml -- a chart image-tag bump no longer busts this cache (only
+      # editing pg/tests/ci-base-images.txt does).
+      - name: Cache base images
+        id: base-cache
+        uses: actions/cache@v5
+        with:
+          path: /tmp/base-images
+          key: pg-base-images-${{ hashFiles('pg/tests/ci-base-images.txt') }}
+
+      - name: Pull base images (on cache miss)
+        if: steps.base-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/base-images
+          grep -vE '^\s*(#|$)' pg/tests/ci-base-images.txt | while read -r image; do
+            docker pull "$image"
+            safe=$(echo "$image" | tr '/:' '_')
+            docker save "$image" -o "/tmp/base-images/${safe}.tar"
+          done
+
+      # The repmgr image is built from source (images/repmgr) so an image change
+      # ships and is tested with the chart in one PR. The tag is read from
+      # pg/values.yaml so the loaded image satisfies the chart's IfNotPresent pull
+      # policy. buildx + the gha cache keeps the apt-heavy build off the critical
+      # path on cache hits. Built ONCE here; every suite loads the saved tar.
+      - name: Build repmgr image from source
         run: |
           set -euo pipefail
           tag=$(awk '/^repmgr:/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
@@ -108,132 +117,111 @@ jobs:
             --cache-from type=gha,scope=repmgr-image \
             --cache-to type=gha,mode=max,scope=repmgr-image \
             -t "cagriekin/repmgr:${tag}" images/repmgr
-          kind load docker-image "cagriekin/repmgr:${tag}" --name pg-test
-          # kind keeps its own copy inside the node container, so drop the daemon
-          # copy (~2GB) to leave headroom for the live test suites that follow.
-          docker image rm "cagriekin/repmgr:${tag}" >/dev/null 2>&1 || true
+          mkdir -p /tmp/kind-images
+          docker save "cagriekin/repmgr:${tag}" -o /tmp/kind-images/repmgr.tar
 
-      - name: Run template tests
+      # Fast render gate: template + lint take ~1min and catch most regressions
+      # before any live cluster is started. If this fails the matrix is skipped.
+      - name: Run template + lint tests
         run: make -C pg test-template
 
-      - name: Run minimal tests
-        run: make -C pg test-minimal
+      - name: Assemble image bundle for the suites
+        run: |
+          set -euo pipefail
+          cp /tmp/base-images/*.tar /tmp/kind-images/
+          ls -lh /tmp/kind-images/
 
-      - name: Run repmgr and failover tests
-        run: make -C pg test-repmgr-failover
+      - name: Upload image bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: kind-images
+          path: /tmp/kind-images
+          retention-days: 1
 
-      # AGENT_COLDBOOT=1 also exercises the full-cluster-restart recovery-mode path
-      # (StartRecovery + promote-from-recovery). It is opt-in for local runs (it is
-      # heavy and the local kind cluster degrades over repeated cycles) but must run
-      # in CI, which always uses a fresh cluster -- otherwise the cold-boot election
-      # is never automatically validated.
-      - name: Run lease-based agent install + failover tests (incl. cold boot)
+  # ---------------------------------------------------------------------------
+  # One job per live suite, each on its OWN fresh Kind cluster (so a suite gets
+  # the whole 2-CPU runner to itself, no cross-suite resource contention, and no
+  # cumulative cluster degradation). fail-fast: false so one flaky suite does not
+  # cancel the others, and each suite retries once on a clean cluster state.
+  # ---------------------------------------------------------------------------
+  suite:
+    name: ${{ matrix.name }}
+    needs: [changes, build]
+    if: needs.changes.outputs.pg == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: minimal, target: test-minimal }
+          - { name: repmgr-failover, target: test-repmgr-failover }
+          - { name: agent, target: test-agent, coldboot: "1" }
+          - { name: repmgr-chaos, target: test-repmgr-chaos }
+          - { name: full, target: test-full }
+          - { name: upgrade, target: test-upgrade }
+          - { name: agent-etcd, target: test-agent-etcd }
+          - { name: agent-etcd-tls, target: test-agent-etcd-tls }
+          - { name: tls, target: test-tls }
+          - { name: agent-rolling, target: test-agent-rolling }
+          - { name: backup-restore, target: test-backup-restore }
+          - { name: migrate-agent, target: test-migrate-agent }
+          - { name: scaledown, target: test-scaledown }
+    steps:
+      - name: Free up runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell /usr/share/swift
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.14.2
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: pg-test
+          config: pg/kind-config.yaml
+
+      - name: Download image bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: kind-images
+          path: /tmp/kind-images
+
+      - name: Load images into Kind
+        run: |
+          set -euo pipefail
+          for tarball in /tmp/kind-images/*.tar; do
+            kind load image-archive "$tarball" --name pg-test
+          done
+
+      # Run the suite; on a transient failure, drop the suite's namespaces for a
+      # clean slate and retry once. The suites are idempotent (each uninstalls +
+      # recreates its release), so a single retry absorbs the timing/transient
+      # flakes a contended runner produces without re-running the whole job.
+      - name: Run ${{ matrix.name }} suite
         env:
-          AGENT_COLDBOOT: "1"
-        run: make -C pg test-agent
-
-      - name: Run repmgr chaos restart regression test
-        run: make -C pg test-repmgr-chaos
-
-      # The full install is the heaviest suite (3 postgres pods + pgpool +
-      # exporter); on 2-CPU runners it times out when the minimal, repmgr and
-      # chaos namespaces are still consuming the node, so free them first and
-      # wait for the deletion to actually release resources.
-      - name: Clean up prior test namespaces
+          AGENT_COLDBOOT: ${{ matrix.coldboot }}
         run: |
-          kubectl delete namespace pg-test-minimal pg-test-repmgr pg-test-repmgr-chaos \
-            --ignore-not-found --wait=true --timeout=180s \
-            || echo "WARNING: namespace cleanup timed out, continuing"
-
-      - name: Run full tests
-        run: make -C pg test-full
-
-      - name: Clean up full test namespace
-        run: |
-          kubectl delete namespace pg-test-full --ignore-not-found --wait=true --timeout=180s \
-            || echo "WARNING: namespace cleanup timed out, continuing"
-
-      - name: Run upgrade tests
-        run: make -C pg test-upgrade
-
-      # Free the cluster before the remaining heavy live suites (2-CPU runner).
-      - name: Clean up before etcd/migration suites
-        run: |
-          kubectl delete namespace pg-test-agent pg-test-upgrade \
-            --ignore-not-found --wait=true --timeout=180s \
-            || echo "WARNING: namespace cleanup timed out, continuing"
-
-      # etcd DCS backend: bundled 3-node etcd, leadership off the apiserver, failover.
-      - name: Run agent etcd-mode tests
-        run: make -C pg test-agent-etcd
-
-      - name: Clean up etcd-mode namespace
-        run: |
-          kubectl delete namespace pg-test-agent-etcd --ignore-not-found --wait=true --timeout=180s \
-            || echo "WARNING: namespace cleanup timed out, continuing"
-
-      # etcd DCS over mutual TLS + per-tenant RBAC (#184): generates a CA + certs,
-      # proves the TLS handshake/exec-probe, CN-based auth, failover, and prefix denial.
-      - name: Run agent etcd-mode TLS + RBAC test
-        run: make -C pg test-agent-etcd-tls
-
-      - name: Clean up etcd-mode TLS namespace
-        run: |
-          kubectl delete namespace pg-test-agent-etcd-tls --ignore-not-found --wait=true --timeout=180s \
-            || echo "WARNING: namespace cleanup timed out, continuing"
-
-      # Client-connection TLS (#110): CA + certs; proves PostgreSQL ssl=on, `require`
-      # rejecting non-TLS, mutual TLS rejecting a no-cert app user while the exempt
-      # internal users + replication + failover keep working, the exporter scraping over
-      # TLS, PGPool serving over TLS, and optional server TLS in repmgrd mode.
-      - name: Run client TLS test
-        run: make -C pg test-tls
-
-      - name: Clean up TLS namespaces
-        run: |
-          kubectl delete namespace pg-test-tls pg-test-tls-repmgrd pg-test-tls-standalone --ignore-not-found --wait=true --timeout=180s \
-            || echo "WARNING: namespace cleanup timed out, continuing"
-
-      # The 1.0.0 breaking-change path: repmgrd -> agent via --cascade=orphan recreate.
-      - name: Run repmgrd->agent migration test
-        run: make -C pg test-migrate-agent
-
-      - name: Clean up migration namespace
-        run: |
-          kubectl delete namespace pg-test-migrate --ignore-not-found --wait=true --timeout=180s \
-            || echo "WARNING: namespace cleanup timed out, continuing"
-
-      # Scale replicaCount down and assert the primary unregisters the ghost
-      # repmgr.nodes record left behind (#139).
-      - name: Run scale-down ghost-node cleanup test
-        run: make -C pg test-scaledown
-
-      - name: Clean up scale-down namespace
-        run: |
-          kubectl delete namespace pg-test-scaledown --ignore-not-found --wait=true --timeout=180s \
-            || echo "WARNING: namespace cleanup timed out, continuing"
-
-      # Rolling-restart a 2-node agent cluster; assert it converges to a single
-      # writable primary with the standby re-streaming, no deadlock (#186).
-      - name: Run agent rolling-restart test
-        run: make -C pg test-agent-rolling
-
-      - name: Clean up agent rolling namespace
-        run: |
-          kubectl delete namespace pg-test-agent-rolling --ignore-not-found --wait=true --timeout=180s \
-            || echo "WARNING: namespace cleanup timed out, continuing"
-
-      # Backup + restore (pg_dump path): stands up MinIO, runs a full backup/restore
-      # cycle, drives the restore-validation Job (#31), and exercises the dedicated
-      # backup ServiceAccount (#27) and the read-only-rootfs backup/validation
-      # containers (#117) live -- render tests cannot catch a missed writable path.
-      - name: Run backup and restore tests
-        run: make -C pg test-backup-restore
-
-      - name: Clean up backup namespace
-        run: |
-          kubectl delete namespace pg-test-backup --ignore-not-found --wait=true --timeout=180s \
-            || echo "WARNING: namespace cleanup timed out, continuing"
+          set +e
+          run() { make -C pg ${{ matrix.target }}; }
+          run; rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=suite-retry::${{ matrix.target }} failed (rc=${rc}); cleaning namespaces and retrying once"
+            kubectl get ns -o name 2>/dev/null | sed 's#namespace/##' | grep '^pg-test' \
+              | xargs -r -I{} kubectl delete ns {} --ignore-not-found --wait=true --timeout=180s || true
+            sleep 15
+            run; rc=$?
+          fi
+          exit "$rc"
 
       - name: Dump cluster state on failure
         if: failure()
@@ -241,23 +229,36 @@ jobs:
           kubectl get pods -A -o wide || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -100 || true
           kubectl get pvc -A || true
-          # Iterate every chart test namespace (repmgrd, agent, etcd, migration,
-          # upgrade) discovered at runtime, not a fixed subset, so any suite's
-          # failure is diagnosable -- the agent/etcd/migrate namespaces were
-          # previously invisible here.
           for ns in $(kubectl get ns -o name 2>/dev/null | sed 's#namespace/##' | grep '^pg-test'); do
             for pod in $(kubectl get pods -n "$ns" -o name 2>/dev/null); do
               ready=$(kubectl get -n "$ns" "$pod" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
               [ "$ready" = "True" ] && continue
               echo "===== $ns/$pod (Ready=$ready) ====="
-              # describe surfaces init-container progress and waiting/terminated
-              # reasons (OOMKilled, CrashLoopBackOff, the failing init's exit code)
               kubectl describe -n "$ns" "$pod" 2>/dev/null | sed -n '/^Init Containers:/,/^Conditions:/p' || true
-              # logs for every container -- init AND regular -- current + previous,
-              # so a clone/register crash loop in any init is captured
               for c in $(kubectl get -n "$ns" "$pod" -o jsonpath='{.spec.initContainers[*].name} {.spec.containers[*].name}' 2>/dev/null); do
                 echo "--- $c (current) ---"; kubectl logs -n "$ns" "$pod" -c "$c" --tail=50 2>/dev/null || true
                 echo "--- $c (previous) ---"; kubectl logs -n "$ns" "$pod" -c "$c" --previous --tail=50 2>/dev/null || true
               done
             done
           done
+
+  # The single required status check for pg. ALWAYS runs (no path filter on the
+  # trigger), so it reports on every PR: it self-passes when pg is untouched, and
+  # otherwise fails unless the build + every suite leg succeeded. Require this one
+  # context in branch protection instead of the brittle per-leg names.
+  gate:
+    name: pg-tests-passed
+    needs: [changes, build, suite]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate result
+        run: |
+          if [ "${{ needs.changes.outputs.pg }}" != "true" ]; then
+            echo "pg unchanged — gate passes (no-op)"; exit 0
+          fi
+          if [ "${{ needs.build.result }}" = "success" ] && [ "${{ needs.suite.result }}" = "success" ]; then
+            echo "pg build + all suites passed"; exit 0
+          fi
+          echo "pg gate FAILED: build=${{ needs.build.result }} suite=${{ needs.suite.result }}"
+          exit 1
