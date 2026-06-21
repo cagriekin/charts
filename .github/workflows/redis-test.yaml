@@ -1,12 +1,6 @@
 name: Test redis chart
 
 on:
-  push:
-    branches:
-      - master
-    paths:
-      - 'redis/**'
-      - '.github/workflows/redis-test.yaml'
   # No paths filter: the `gate` job must report on EVERY PR so it can be required
   # without blocking PRs that do not touch redis. The `changes` job skips the heavy
   # work when redis is untouched.
