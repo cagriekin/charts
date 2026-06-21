@@ -1,0 +1,72 @@
+suite: enterprise defaults
+templates:
+  - templates/kafka-controller-deployment.yaml
+  - templates/kafka-controller-service.yaml
+  - templates/kafka-configmap.yaml
+  - templates/kafka-certificate.yaml
+release:
+  name: test-kafka
+tests:
+  - it: controller replicas default to 3
+    template: templates/kafka-controller-deployment.yaml
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 3
+
+  - it: controller terminationGracePeriodSeconds is 120
+    template: templates/kafka-controller-deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 120
+
+  - it: controller service is headless
+    template: templates/kafka-controller-service.yaml
+    asserts:
+      - equal:
+          path: spec.clusterIP
+          value: None
+
+  - it: broker config has enterprise defaults
+    template: templates/kafka-configmap.yaml
+    documentIndex: 1
+    asserts:
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: default\.replication\.factor=3
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: min\.insync\.replicas=2
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: log\.retention\.hours=168
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: auto\.create\.topics\.enable=false
+
+  - it: no Certificate when TLS disabled
+    template: templates/kafka-certificate.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: no tls-init init container when TLS disabled
+    template: templates/kafka-controller-deployment.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.initContainers
+          content:
+            name: tls-init
+          any: true
+
+  - it: no ssl keystore or SASL_SSL in controller config when TLS disabled
+    template: templates/kafka-configmap.yaml
+    documentIndex: 0
+    asserts:
+      - notMatchRegex:
+          path: data["server.properties"]
+          pattern: ssl\.keystore
+      - notMatchRegex:
+          path: data["server.properties"]
+          pattern: SASL_SSL

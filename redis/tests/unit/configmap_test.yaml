@@ -1,0 +1,48 @@
+suite: configmap
+templates:
+  - templates/configmap.yaml
+tests:
+  - it: minimal - configmap is created with redis.conf
+    values:
+      - ../values-minimal.yaml
+    asserts:
+      - isKind:
+          of: ConfigMap
+      - exists:
+          path: data["redis.conf"]
+
+  - it: default - persistence tuning rendered in redis.conf
+    asserts:
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: appendfsync everysec
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: no-appendfsync-on-rewrite yes
+
+  - it: default - save disabled (save "") when no rdbSnapshots
+    asserts:
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'save ""'
+
+  - it: rdb - save renders with snapshots and no empty save
+    values:
+      - ../values-minimal.yaml
+    set:
+      redis.config.maxmemory: "200mb"
+      redis.config.maxmemory-policy: "allkeys-lru"
+      redis.config.appendfsync: "everysec"
+      redis.config.no-appendfsync-on-rewrite: "yes"
+      redis.config.auto-aof-rewrite-percentage: "100"
+      redis.config.auto-aof-rewrite-min-size: "64mb"
+      redis.config.rdbSnapshots:
+        - seconds: 3600
+          changes: 1
+    asserts:
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: save 3600 1
+      - notMatchRegex:
+          path: data["redis.conf"]
+          pattern: 'save ""'

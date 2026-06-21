@@ -1,0 +1,48 @@
+suite: prometheusrule
+templates:
+  - templates/prometheusrule.yaml
+tests:
+  - it: full default - no PrometheusRule (prometheusRule disabled)
+    values:
+      - ../values-full-test.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: enabled - PrometheusRule renders with default alerts
+    set:
+      exporter.enabled: true
+      exporter.prometheusRule.enabled: true
+    asserts:
+      - isKind:
+          of: PrometheusRule
+      - contains:
+          path: spec.groups[0].rules
+          content:
+            alert: RedisDown
+            expr: redis_up == 0
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Redis instance is down"
+      - contains:
+          path: spec.groups[0].rules
+          content:
+            alert: RedisMemoryHigh
+            expr: redis_memory_used_bytes / redis_memory_max_bytes * 100 > 90
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Redis memory usage above 90%"
+      - contains:
+          path: spec.groups[0].rules
+          content:
+            alert: RedisAOFWriteFailure
+            expr: redis_aof_last_write_status == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Redis AOF last write failed"

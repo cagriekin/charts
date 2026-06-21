@@ -1,0 +1,18 @@
+suite: pdb
+templates:
+  - templates/pdb.yaml
+tests:
+  - it: default - no PDB rendered
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: enabled - PDB renders with minAvailable 1
+    set:
+      redis.podDisruptionBudget.enabled: true
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: spec.minAvailable
+          value: 1

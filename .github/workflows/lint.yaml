@@ -4,9 +4,10 @@ permissions:
   contents: read
 
 on:
-  # No paths filter: lint is global (it lints every chart) and fast, so it runs on
-  # EVERY PR -- which lets it be a required status check without blocking PRs that
-  # happen not to touch a chart path.
+  # No paths filter: lint is global and must report a status on EVERY PR so it can be a
+  # required check without blocking PRs. The `detect` step below short-circuits all real
+  # work on documentation-only (*.md) PRs -- the job still runs and reports success in
+  # seconds, but installs nothing and runs no checks.
   pull_request:
 
 jobs:
@@ -15,23 +16,52 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Documentation-only changes (*.md) never affect chart rendering or policy, so the
+      # lint work is skipped for them. The job still completes successfully so the
+      # required `lint` check reports (a non-reporting required check would block merge).
+      - name: Detect non-documentation changes
+        id: detect
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            files=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+            if [ -n "$(printf '%s\n' "$files" | grep -vE '\.md$' || true)" ]; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              echo "documentation-only change; skipping lint work"
+            fi
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up Helm
+        if: steps.detect.outputs.run == 'true'
         uses: azure/setup-helm@v5
         with:
           version: v3.14.2
 
       - name: Install kubeconform
+        if: steps.detect.outputs.run == 'true'
         run: |
           curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
             | sudo tar -xz -C /usr/local/bin kubeconform
 
       - name: Install kube-linter
+        if: steps.detect.outputs.run == 'true'
         run: |
           curl -fsSL https://github.com/stackrox/kube-linter/releases/download/v0.7.1/kube-linter-linux.tar.gz \
             | sudo tar -xz -C /usr/local/bin kube-linter
 
+      - name: Install helm-unittest plugin
+        if: steps.detect.outputs.run == 'true'
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest --version v1.0.3
+
       - name: Lint charts
+        if: steps.detect.outputs.run == 'true'
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -49,13 +79,22 @@ jobs:
           done
 
       - name: Verify vendored subcharts are fresh
+        if: steps.detect.outputs.run == 'true'
         run: bash scripts/check-vendored-subcharts.sh
 
       # Validate rendered manifests against real Kubernetes + CRD OpenAPI schemas (#193).
       - name: Validate rendered manifests (kubeconform)
+        if: steps.detect.outputs.run == 'true'
         run: bash scripts/kubeconform-charts.sh
 
       # Enforce the CLAUDE.md Helm standards as policy-as-code (#193).
       - name: Policy gate (kube-linter)
+        if: steps.detect.outputs.run == 'true'
         run: bash scripts/kube-linter-charts.sh
+
+      # Declarative render unit tests (structural assertions on parsed manifests) for
+      # charts that ship tests/unit/*_test.yaml (#193).
+      - name: Render unit tests (helm-unittest)
+        if: steps.detect.outputs.run == 'true'
+        run: bash scripts/helm-unittest-charts.sh
 

@@ -1,0 +1,55 @@
+suite: pg fail-fast guards
+release:
+  name: test-pg
+tests:
+  # --- Scenario 9: schema enum guards ---
+  - it: invalid failoverMode is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.failoverMode: bogus
+    asserts:
+      - failedTemplate: {}
+
+  - it: invalid agent dcs backend is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.failoverMode: agent
+      repmgr.agent.dcs.backend: zookeeper
+    asserts:
+      - failedTemplate: {}
+
+  # --- Scenario 10: standalone replica guard ---
+  - it: standalone with replicas > 0 fails fast
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.enabled: false
+      postgresql.replicaCount: 1
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr"
+
+  - it: standalone with replicaCount 0 renders
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - notFailedTemplate: {}
+
+  # --- Scenario 11: pgbackrest requires repmgr ---
+  - it: pgbackrest without repmgr fails fast
+    templates:
+      - templates/statefulset.yaml
+    set:
+      pgbackrest.enabled: true
+      repmgr.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - failedTemplate:
+          errorMessage: "pgbackrest.enabled requires repmgr.enabled=true: the pgbackrest binary and the archive_command run inside the postgresql container, which in standalone mode is the official postgres image without pgbackrest. WAL archiving would fail on every segment (unbounded WAL growth) and backups would time out. Enable repmgr, or disable pgbackrest"
