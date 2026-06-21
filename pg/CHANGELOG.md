@@ -1,6 +1,10 @@
 # pg chart changelog
 
-## Unreleased
+## 1.2.0 - 2026-06-21
+
+Optional client-connection TLS for PostgreSQL, PGPool, and the metrics exporter (#110),
+plus optional cascading replication (#29). Both off by default — no rendered change at
+defaults. Image moves to `trixie-5.5.0-25`.
 
 ### Added
 
@@ -10,15 +14,6 @@
   The agent only follows a verifiably-safe same-timeline upstream and stays sticky on it,
   re-homing to the leader on any upstream failure/promotion, so a standby is never stranded
   and failover is not delayed. Off by default the render and follow behavior are byte-stable.
-  The agent binary changed, so this needs a new image tag + chart minor when released.
-
-## 1.2.0 - 2026-06-21
-
-Optional client-connection TLS for PostgreSQL, PGPool, and the metrics exporter (#110).
-Off by default — no rendered change at defaults. Image moves to `trixie-5.5.0-25`.
-
-### Added
-
 - **PostgreSQL server TLS (`postgresql.tls.enabled`).** Serves `ssl = on` from a BYO
   Secret (`postgresql.tls.existingSecret`, keys `tls.crt`/`tls.key`/`ca.crt`, mounted
   read-only at `/etc/postgresql/tls`, `defaultMode: 0400`) via a chart-managed
