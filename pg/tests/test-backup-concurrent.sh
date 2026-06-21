@@ -113,6 +113,16 @@ LOAD_PID=$!
 
 # trigger a diff backup WHILE the load is archiving WAL
 kubectl create job -n "${NAMESPACE}" pgbr-diff --from=cronjob/"${FULLNAME}-pgbackrest-diff"
+
+# concurrently (WAL load + pgbackrest physical backup + WAL archiving all active): run a
+# logical pg_dump and assert it succeeds. #34 covers BOTH backup paths running together --
+# the physical (pgbackrest) and logical (pg_dump) backups must not interfere with each
+# other or with WAL archiving (Qodo: the pg_dump + WAL-archiving concurrency scenario).
+echo "  Running a concurrent pg_dump during the backup + WAL-archiving window..."
+dump_rc=0
+dump_lines=$(kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- \
+  pg_dump -U testuser -d testdb 2>/dev/null | wc -l) || dump_rc=$?
+
 diff_rc=0
 kubectl wait --for=condition=complete job/pgbr-diff -n "${NAMESPACE}" --timeout=300s || diff_rc=$?
 if [ "${diff_rc}" -ne 0 ]; then
@@ -121,6 +131,8 @@ fi
 kill "${LOAD_PID}" 2>/dev/null || true; wait "${LOAD_PID}" 2>/dev/null || true
 
 assert_eq "#34: concurrent diff backup completes during active WAL archiving" "0" "${diff_rc}"
+assert_eq "#34: concurrent pg_dump completes during the backup + WAL-archiving window" "0" "${dump_rc}"
+assert_gt "#34: pg_dump produced a non-trivial logical backup" "${dump_lines:-0}" "20"
 
 # --- both backups are in the repo ---
 info=$(kubectl exec -n "${NAMESPACE}" "${POD}" -c pgbackrest -- pgbackrest --stanza="${STANZA}" info 2>&1 || true)
