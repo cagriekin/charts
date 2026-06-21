@@ -1,0 +1,84 @@
+# Fixture for the concurrent backup + WAL archiving test (#34). pgbackrest against an
+# in-cluster MinIO (TLS) instead of AWS S3: path-style addressing + verify-tls off for
+# the self-signed endpoint. Single primary (replicaCount 0) is enough to exercise WAL
+# archiving + a backup concurrently.
+postgresql:
+  image:
+    repository: postgres
+    tag: 18.1-trixie
+    pullPolicy: IfNotPresent
+
+  replicaCount: 0
+  database: testdb
+  username: testuser
+
+  persistence:
+    enabled: true
+    size: 1Gi
+
+  podDisruptionBudget:
+    enabled: false
+
+  lifecycle:
+    postStart:
+      additionalCommands: ""
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+repmgr:
+  image:
+    repository: cagriekin/repmgr
+    tag: trixie-5.5.0-25
+    pullPolicy: IfNotPresent
+  enabled: true
+  failoverMode: repmgrd
+  username: repmgr
+  database: repmgr
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+pgpool:
+  enabled: false
+
+prometheusExporter:
+  enabled: false
+
+backup:
+  enabled: false
+
+pgbackrest:
+  enabled: true
+  stanza: db
+  s3:
+    endpoint: minio   # in-cluster MinIO Service (TLS on :443 -> targetPort 9000)
+    bucket: pgbackrest-test
+    region: us-east-1
+    prefix: pgbackrest
+    keyType: shared
+    uriStyle: path    # MinIO/Ceph addressing
+    verifyTls: false  # self-signed MinIO cert
+  existingSecret:
+    name: s3-backup-creds
+    accessKeyIdKey: access-key-id
+    secretAccessKeyKey: secret-access-key
+  retention:
+    full: 4
+    diff: 14
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi

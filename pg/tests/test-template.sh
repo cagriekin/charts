@@ -1451,6 +1451,15 @@ assert_contains "pgbackrest: configmap renders" "${pgbackrest}" "test-pg-pgbackr
 assert_contains "pgbackrest: configmap has stanza" "${pgbackrest}" "[db]"
 assert_contains "pgbackrest: configmap has s3 endpoint" "${pgbackrest}" "repo1-s3-endpoint=https://s3.amazonaws.com"
 assert_contains "pgbackrest: configmap has s3 bucket" "${pgbackrest}" "repo1-s3-bucket=test-backups"
+# #34: non-AWS S3 knobs (uriStyle/verifyTls) are off at defaults (byte-stable for AWS),
+# emitted only when set -- enables MinIO/Ceph-style endpoints for a CI-testable repo.
+assert_not_contains "pgbackrest #34: no uri-style line at default (host)" "${pgbackrest}" "repo1-s3-uri-style"
+assert_not_contains "pgbackrest #34: no verify-tls line at default" "${pgbackrest}" "repo1-storage-verify-tls"
+pgbackrest_minio=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set pgbackrest.s3.uriStyle=path --set pgbackrest.s3.verifyTls=false \
+  --show-only templates/pgbackrest-configmap.yaml 2>&1)
+assert_contains "pgbackrest #34: uriStyle=path renders repo1-s3-uri-style=path" "${pgbackrest_minio}" "repo1-s3-uri-style=path"
+assert_contains "pgbackrest #34: verifyTls=false renders repo1-storage-verify-tls=n" "${pgbackrest_minio}" "repo1-storage-verify-tls=n"
 
 # #120: repository encryption is off by default and opt-in via repoEncryption.
 assert_contains "pgbackrest #120: cipher-type none by default" "${pgbackrest}" "repo1-cipher-type=none"
