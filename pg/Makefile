@@ -4,7 +4,7 @@ TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-repmgr test-repmgr-chaos test-full test-failover test-upgrade \
-        test-repmgr-failover test-agent test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
+        test-repmgr-failover test-agent test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-backup-concurrent test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -26,6 +26,7 @@ help:
 	@echo "  test-config     - Run postgresql configuration tests (standalone)"
 	@echo "  test-config-repmgr - Run postgresql configuration tests (repmgr)"
 	@echo "  test-backup-restore - Run backup and restore integration tests"
+	@echo "  test-backup-concurrent - Run concurrent pgbackrest backup + WAL archiving test"
 	@echo "  test-special-chars - Run special-character credential tests"
 	@echo "  cluster-create  - Create Kind cluster"
 	@echo "  cluster-delete  - Delete Kind cluster"
@@ -136,6 +137,9 @@ test-config-repmgr: cluster-exists
 
 test-backup-restore: cluster-exists
 	@bash $(TESTS_DIR)/test-backup-restore.sh
+
+test-backup-concurrent: cluster-exists
+	@bash $(TESTS_DIR)/test-backup-concurrent.sh
 
 test-special-chars: cluster-exists
 	@bash $(TESTS_DIR)/test-special-chars.sh
