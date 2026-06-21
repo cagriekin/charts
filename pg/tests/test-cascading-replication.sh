@@ -30,11 +30,17 @@ downstreams_of() {
 pod_running() { [ "$(kubectl get pod "$1" -n "${NAMESPACE}" -o jsonpath='{.status.phase}' 2>/dev/null)" = "Running" ]; }
 
 # --- install agent mode, replicaCount 3 (-> 4 pods), cascading on ---
+# The chart default is a HARD per-node anti-affinity (one postgresql pod per node).
+# The CI Kind cluster has only 3 worker nodes, so a 4th pod stays Pending forever and
+# the install times out. 4 pods are required so a cascade hop exists for ANY elected
+# leader ordinal (3 pods false-greens when the middle ordinal leads). Override with a
+# SOFT anti-affinity so the 4 pods still spread but co-locate when nodes run out.
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" -n "${NAMESPACE}" \
   -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set postgresql.replicaCount=3 \
   --set repmgr.agent.cascadingReplication=true \
+  --set-json 'postgresql.affinity={"podAntiAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[{"weight":100,"podAffinityTerm":{"labelSelector":{"matchLabels":{"app.kubernetes.io/component":"postgresql"}},"topologyKey":"kubernetes.io/hostname"}}]}}' \
   --wait --timeout 12m
 
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 4 700
@@ -95,24 +101,31 @@ if [[ -n "${INTERMEDIATE}" && -n "${CASCADED}" ]]; then
   has_cascaded_on_leader=$(printf '%s\n' "${on_leader}" | grep -wc "${CASCADED}" || true)
   assert_eq "#29: cascaded ${CASCADED} does NOT stream directly from the leader (offloaded)" "0" "${has_cascaded_on_leader}"
 
-  # --- re-homing: kill the INTERMEDIATE. Its downstream must re-home to another LIVE node
-  #     (not the dead intermediate) and keep receiving -- never stranded. We prove the
-  #     UPSTREAM MOVED (some live node != INTERMEDIATE now has CASCADED as a downstream),
-  #     not merely that data arrived (which the StatefulSet recreating the pod could mask). ---
-  echo "  Deleting intermediate ${INTERMEDIATE}; ${CASCADED} must re-home to a live upstream..."
+  # --- re-homing: take the INTERMEDIATE down and prove its downstream re-homes to a
+  #     DIFFERENT live node -- not merely that data still arrives, which the StatefulSet
+  #     recreating the pod would mask. A deleted StatefulSet pod returns in ~40s and the
+  #     chain just re-converges through it (the downstream reconnects to the SAME hostname,
+  #     so the upstream never observably moves). local-path PVCs are node-pinned, so we
+  #     cordon the intermediate's node first: the recreated pod cannot schedule and stays
+  #     down for the whole observation window, forcing a real move. Uncordon after (also
+  #     via an EXIT trap so a mid-test failure never leaves the node cordoned). ---
+  node=$(kubectl get pod "${INTERMEDIATE}" -n "${NAMESPACE}" -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+  trap 'kubectl uncordon "${node}" >/dev/null 2>&1 || true' EXIT
+  echo "  Cordoning ${node}, deleting intermediate ${INTERMEDIATE}; ${CASCADED} must re-home to a different live upstream..."
+  kubectl cordon "${node}" >/dev/null 2>&1 || true
   kubectl delete pod "${INTERMEDIATE}" -n "${NAMESPACE}" --grace-period=10 --wait=false 2>/dev/null || true
   rehomed=""; rh=0
-  while [[ ${rh} -lt 120 ]]; do
+  while [[ ${rh} -lt 150 ]]; do
     for pod in "${PODS[@]}"; do
       [[ "${pod}" == "${INTERMEDIATE}" || "${pod}" == "${CASCADED}" ]] && continue
       pod_running "${pod}" || continue
       downs=$(downstreams_of "${pod}")
       if printf '%s\n' "${downs}" | grep -qw "${CASCADED}"; then rehomed="${pod}"; break; fi
     done
-    [[ -n "${rehomed}" ]] && { echo "  ${CASCADED} re-homed to ${rehomed} after ~${rh}s"; break; }
+    [[ -n "${rehomed}" ]] && { echo "  ${CASCADED} re-homed to ${rehomed} (live, != ${INTERMEDIATE}) after ~${rh}s"; break; }
     sleep 5; rh=$((rh + 5))
   done
-  assert_contains "#29: cascaded node re-homed to a live upstream when its intermediate died" "${rehomed:-none}" "${FULLNAME}"
+  assert_contains "#29: cascaded node re-homed to a different live upstream when its intermediate died" "${rehomed:-none}" "${FULLNAME}"
 
   # and it kept receiving: a marker written AFTER the intermediate died reaches it
   REMARK="casc-rehome-$(date +%s)"
@@ -124,9 +137,13 @@ if [[ -n "${INTERMEDIATE}" && -n "${CASCADED}" ]]; then
     sleep 3; a=$((a + 3))
   done
   assert_eq "#29: cascaded node keeps receiving after re-home (not stranded)" "${REMARK}" "${arr}"
+
+  # let the intermediate recover and the chain re-converge before teardown
+  kubectl uncordon "${node}" >/dev/null 2>&1 || true
+  trap - EXIT
 else
   skip "#29: cascaded node does NOT stream directly from the leader (no cascade hop formed)"
-  skip "#29: cascaded node re-homed to a live upstream when its intermediate died (no cascade hop)"
+  skip "#29: cascaded node re-homed to a different live upstream when its intermediate died (no cascade hop)"
   skip "#29: cascaded node keeps receiving after re-home (no cascade hop)"
 fi
 
