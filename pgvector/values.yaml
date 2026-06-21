@@ -149,6 +149,15 @@ postgresql:
     # - "host all all 10.0.0.0/8 md5"
     # - "host replication repmgr 10.0.0.0/8 trust"
 
+  # Client-connection TLS (#110). Off by default (render byte-stable). See the pg
+  # chart README for the full TLS notes (cert SANs, require/mTLS, internal-user
+  # exemptions, replication-stays-plaintext).
+  tls:
+    enabled: false
+    existingSecret: ""   # SERVER cert: tls.crt, tls.key, ca.crt
+    require: false       # reject non-TLS clients (hostssl); needs exporter/pgpool sslmode >= require
+    clientCertAuth: false # mTLS for app users (clientcert=verify-ca); internal users exempt; implies require
+
   # When repmgr.enabled is true, re-hash any managed user (POSTGRES_USER,
   # REPMGR_USER) whose stored password is still MD5 to SCRAM at pod startup.
   # Idempotent (no-op once everyone is SCRAM-hashed, and auto-skipped on
@@ -169,7 +178,7 @@ postgresql:
 repmgr:
   image:
     repository: cagriekin/repmgr
-    tag: trixie-5.5.0-24
+    tag: trixie-5.5.0-25
     # Optional digest pin (e.g. "sha256:..."). When set it is appended as
     # repository:tag@digest, so the cosign-signed / provenance-attested image is
     # pinned at deploy time and a mutable-tag repush cannot silently change it.
@@ -327,6 +336,14 @@ pgpool:
   autoFailback: true
   allowClearTextFrontendAuth: false
 
+  # PGPool TLS (#110). Off by default. See the pg chart README for detail.
+  tls:
+    enabled: false
+    existingSecret: ""        # frontend SERVER cert: tls.crt, tls.key[, ca.crt]
+    clientCertAuth: false     # require client certs on the pgpool frontend
+    backendSslmode: prefer    # pgpool -> postgres: disable|prefer|require|verify-ca|verify-full
+    backendClientCert: ""     # Secret for pgpool->postgres under mTLS
+
   logging:
     logConnections: true
     logStatement: false
@@ -411,6 +428,11 @@ pgpool:
 
 prometheusExporter:
   enabled: false
+
+  # sslmode for the exporter's connection to PostgreSQL (#110): disable | require |
+  # verify-ca | verify-full. Default disable. Must be >= require when
+  # postgresql.tls.require is true. See the pg chart README for detail.
+  sslmode: disable
 
   # Least-privilege monitoring user (#28). When enabled, a post-install/upgrade
   # hook Job creates a read-only `pg_monitor` role on the primary (replicated to

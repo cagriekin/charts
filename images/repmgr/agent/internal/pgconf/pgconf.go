@@ -16,6 +16,19 @@ type PgHbaOptions struct {
 	ReplicationUser string   // repmgr replication user
 	PeerCIDR        string   // the trusted pod network (e.g. 10.0.0.0/8)
 	ExtraRules      []string // user-supplied postgresql.pgHba, placed ABOVE the network catch-alls (#144)
+
+	// Client TLS (issue #110), optional. RequireSSL makes the peer-CIDR client rule
+	// `hostssl` (reject non-TLS clients). ClientCertAuth additionally requires a
+	// client cert (clientcert=verify-ca) for app/other users, while the internal
+	// service users below are EXEMPTED (they authenticate by password over TLS and
+	// hold no client cert): the agent prober / repmgr CLI (ReplicationUser), pgpool
+	// health + service-updater (PostgresUser), and the exporter (MonitoringUser).
+	// Loopback and the replication rule are never converted -- replication stays
+	// plaintext on the pod network (#110 non-goal).
+	RequireSSL     bool
+	ClientCertAuth bool
+	PostgresUser   string // superuser, exempt from clientcert
+	MonitoringUser string // monitoring user, exempt from clientcert; "" to skip
 }
 
 // AssemblePgHba returns a hardened pg_hba.conf: loopback + the pod CIDR over
@@ -37,8 +50,27 @@ func AssemblePgHba(o PgHbaOptions) string {
 			}
 		}
 	}
+	// Replication stays plaintext (repmgr/agent conninfo carries no sslmode) -- never
+	// hostssl, even under require/mTLS (#110 non-goal).
 	fmt.Fprintf(&b, "host        replication   %s        %s        scram-sha-256\n", o.ReplicationUser, o.PeerCIDR)
-	fmt.Fprintf(&b, "host        all           all        %s        scram-sha-256\n", o.PeerCIDR)
+
+	switch {
+	case o.ClientCertAuth:
+		// mTLS: hostssl, with per-user exemptions for the internal service users
+		// (no clientcert) above the app catch-all (clientcert=verify-ca) (#110).
+		fmt.Fprintf(&b, "hostssl     all           %s        %s        scram-sha-256\n", o.ReplicationUser, o.PeerCIDR)
+		if o.PostgresUser != "" {
+			fmt.Fprintf(&b, "hostssl     all           %s        %s        scram-sha-256\n", o.PostgresUser, o.PeerCIDR)
+		}
+		if o.MonitoringUser != "" {
+			fmt.Fprintf(&b, "hostssl     all           %s        %s        scram-sha-256\n", o.MonitoringUser, o.PeerCIDR)
+		}
+		fmt.Fprintf(&b, "hostssl     all           all        %s        scram-sha-256 clientcert=verify-ca\n", o.PeerCIDR)
+	case o.RequireSSL:
+		fmt.Fprintf(&b, "hostssl     all           all        %s        scram-sha-256\n", o.PeerCIDR)
+	default:
+		fmt.Fprintf(&b, "host        all           all        %s        scram-sha-256\n", o.PeerCIDR)
+	}
 	return b.String()
 }
 
