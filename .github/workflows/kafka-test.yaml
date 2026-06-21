@@ -1,12 +1,6 @@
 name: Test kafka chart
 
 on:
-  push:
-    branches:
-      - master
-    paths:
-      - 'kafka/**'
-      - '.github/workflows/kafka-test.yaml'
   # No paths filter: the `gate` job must report on EVERY PR so it can be required
   # without blocking PRs that do not touch kafka. The `changes` job skips the heavy
   # work when kafka is untouched.
