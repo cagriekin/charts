@@ -70,12 +70,35 @@ if [[ "${promoted}" == "true" ]]; then
   # --- config PERSISTS: the promoted standby still applies the custom value ---
   wm_new=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SHOW work_mem" "testuser" "testdb" 2>/dev/null || echo "")
   assert_eq "#33: custom work_mem persists on the promoted primary (did not revert to default)" "${WORK_MEM}" "${wm_new}"
-  # the new primary is writable + pre-failover data survived
-  after_w=$(pg_exec "${NAMESPACE}" "${STANDBY}" "INSERT INTO cfg_fo (v) VALUES ('after'); SELECT v FROM cfg_fo WHERE v='${FV}'" "testuser" "testdb" 2>/dev/null || echo "")
+  # the new primary is writable + pre-failover data survived. Run the INSERT and the
+  # SELECT as SEPARATE pg_exec calls: a combined "INSERT ...; SELECT ..." emits the
+  # INSERT command tag on stdout, which would corrupt the exact-equality assertion.
+  pg_exec "${NAMESPACE}" "${STANDBY}" "INSERT INTO cfg_fo (v) VALUES ('after')" "testuser" "testdb"
+  after_w=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT v FROM cfg_fo WHERE v='${FV}'" "testuser" "testdb" 2>/dev/null || echo "")
   assert_eq "#33: new primary is writable + pre-failover data survived" "${FV}" "${after_w}"
+
+  # --- re-clone coverage: the ex-primary rejoins as a standby (re-cloned/re-attached to
+  # the new primary) and must ALSO carry the custom config -- the ConfigMap is mounted on
+  # every pod, so a freshly (re)cloned node gets the value independent of the basebackup. ---
+  echo "  Waiting for ${PRIMARY} to rejoin as a standby (up to 300s)..."
+  rejoined=false; r=0
+  while [[ ${r} -lt 300 ]]; do
+    rec=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")
+    [[ "${rec}" == "t" ]] && { rejoined=true; echo "  ${PRIMARY} rejoined as standby after ~${r}s"; break; }
+    sleep 10; r=$((r + 10))
+  done
+  assert_eq "#33: ex-primary rejoined as a standby (re-cloned from new primary)" "true" "${rejoined}"
+  if [[ "${rejoined}" == "true" ]]; then
+    wm_reclone=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SHOW work_mem" "testuser" "testdb" 2>/dev/null || echo "")
+    assert_eq "#33: re-cloned standby inherits the custom work_mem" "${WORK_MEM}" "${wm_reclone}"
+  else
+    skip "#33: re-cloned standby inherits the custom work_mem (rejoin did not complete)"
+  fi
 else
   skip "#33: custom work_mem persists on the promoted primary (failover did not complete)"
   skip "#33: new primary is writable + pre-failover data survived (failover did not complete)"
+  skip "#33: ex-primary rejoined as a standby (re-cloned from new primary) (failover did not complete)"
+  skip "#33: re-cloned standby inherits the custom work_mem (failover did not complete)"
 fi
 
 end_suite
