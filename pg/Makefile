@@ -4,7 +4,7 @@ TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-repmgr test-repmgr-chaos test-full test-failover test-upgrade \
-        test-repmgr-failover test-agent test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-cascading-replication test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
+        test-repmgr-failover test-agent test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-backup-concurrent test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -21,12 +21,14 @@ help:
 	@echo "  test-agent-etcd-tls - Run agent etcd-DCS test over mutual TLS + RBAC (standalone, opt-in)"
 	@echo "  test-tls           - Run client-connection TLS test (PostgreSQL+PGPool+exporter, standalone, opt-in)"
 	@echo "  test-pgpool-failover - Run PGPool failover + health-check test (standalone, opt-in)"
+	@echo "  test-config-failover - Run config-persistence-across-failover test (standalone, opt-in)"
 	@echo "  test-cascading-replication - Run cascading-replication chain + re-homing test (standalone, opt-in)"
 	@echo "  test-migrate-agent - Run repmgrd->agent migration test (standalone, long)"
 	@echo "  test-upgrade    - Run upgrade path tests"
 	@echo "  test-config     - Run postgresql configuration tests (standalone)"
 	@echo "  test-config-repmgr - Run postgresql configuration tests (repmgr)"
 	@echo "  test-backup-restore - Run backup and restore integration tests"
+	@echo "  test-backup-concurrent - Run concurrent pgbackrest backup + WAL archiving test"
 	@echo "  test-special-chars - Run special-character credential tests"
 	@echo "  cluster-create  - Create Kind cluster"
 	@echo "  cluster-delete  - Delete Kind cluster"
@@ -74,6 +76,9 @@ test-tls: cluster-exists
 
 test-pgpool-failover: cluster-exists
 	@bash $(TESTS_DIR)/test-pgpool-failover.sh
+
+test-config-failover: cluster-exists
+	@bash $(TESTS_DIR)/test-config-failover.sh
 
 test-cascading-replication: cluster-exists
 	@bash $(TESTS_DIR)/test-cascading-replication.sh
@@ -140,6 +145,9 @@ test-config-repmgr: cluster-exists
 
 test-backup-restore: cluster-exists
 	@bash $(TESTS_DIR)/test-backup-restore.sh
+
+test-backup-concurrent: cluster-exists
+	@bash $(TESTS_DIR)/test-backup-concurrent.sh
 
 test-special-chars: cluster-exists
 	@bash $(TESTS_DIR)/test-special-chars.sh
