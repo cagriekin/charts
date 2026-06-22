@@ -1,9 +1,10 @@
 {{- if .Values.repmgr.enabled }}
 {{- /* Service selectors are equality-only, so "every pod except the primary"
-       cannot be expressed against pod-name. Instead the service-updater
-       sidecar maintains a pg-role label (primary/standby) on all postgresql
-       pods each reconciliation tick, and this Service selects the standby
-       role. Pods carry no pg-role label until the updater applies one (fresh
+       cannot be expressed against pod-name. Instead a pg-role label
+       (primary/standby) is maintained on all postgresql pods each reconciliation
+       tick -- by the pg-ha-agent in agent mode (the default) or by the
+       service-updater sidecar in repmgrd mode -- and this Service selects the
+       standby role. Pods carry no pg-role label until one is applied (fresh
        installs, upgrades from older chart versions, scale-ups), so they are
        simply absent from the endpoints until labeled -- the primary can never
        be selected by accident. Repmgr-only: standalone installs run a single

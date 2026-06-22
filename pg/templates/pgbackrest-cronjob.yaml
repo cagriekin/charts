@@ -10,10 +10,13 @@ metadata:
     {{- include "pg.labels" $root | nindent 4 }}
     app.kubernetes.io/component: pgbackrest
     pgbackrest.type: {{ $type }}
-  {{- with (include "pg.annotations" $root) }}
   annotations:
+    # one-shot CronJob: liveness/readiness probes do not apply (kube-linter waiver).
+    ignore-check.kube-linter.io/no-liveness-probe: "one-shot pgbackrest CronJob"
+    ignore-check.kube-linter.io/no-readiness-probe: "one-shot pgbackrest CronJob"
+    {{- with (include "pg.annotations" $root) }}
     {{- . | nindent 4 }}
-  {{- end }}
+    {{- end }}
 spec:
   schedule: {{ $schedule | quote }}
   concurrencyPolicy: {{ $root.Values.pgbackrest.cronjob.concurrencyPolicy }}

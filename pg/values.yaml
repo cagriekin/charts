@@ -150,8 +150,9 @@ postgresql:
     # - "host all all 10.0.0.0/8 md5"
     # - "host replication repmgr 10.0.0.0/8 trust"
 
-  # Client-connection TLS (#110). Off by default (render byte-stable). When enabled,
-  # PostgreSQL serves ssl=on from the cert Secret (BYO, like the etcd TLS block).
+  # Client-connection TLS (#110). Off by default (no change to rendered manifests unless
+  # enabled). When enabled, PostgreSQL serves ssl=on from the cert Secret (BYO, like the
+  # etcd TLS block).
   # NOTE: replication between primary/standby stays plaintext on the pod network --
   # `require`/`clientCertAuth` never convert the `host replication` or loopback pg_hba
   # rules, and the chart's internal service users (repmgr, postgres, monitoring) are
@@ -273,9 +274,10 @@ repmgr:
   username: repmgr
   database: repmgr
 
-  # Days of repmgr.monitoring_history to retain. repmgr 5.x has no
-  # conf-based retention, so the repmgrd sidecar prunes the table once
-  # per day on the primary via `repmgr cluster cleanup --keep-history`.
+  # Days of repmgr.monitoring_history to retain. repmgr 5.x has no conf-based retention,
+  # so the table is pruned once per day on the primary via `repmgr cluster cleanup
+  # --keep-history`. Only applies in failoverMode: repmgrd; agent mode runs no repmgrd
+  # and writes no monitoring_history.
   monitoringHistoryDays: 7
 
   resources:
@@ -456,8 +458,9 @@ prometheusExporter:
   enabled: false
 
   # sslmode for the exporter's connection to PostgreSQL (#110): disable | require |
-  # verify-ca | verify-full. Default disable (byte-stable). When postgresql.tls.require
-  # (or clientCertAuth) is true this must be >= require (a render guard enforces it), since
+  # verify-ca | verify-full. Default disable (no change to the rendered exporter unless
+  # set). When postgresql.tls.require (or clientCertAuth) is true this must be >= require
+  # (a render guard enforces it), since
   # the server then rejects non-TLS. verify-* additionally validates the server cert
   # against ca.crt from postgresql.tls.existingSecret (mounted into the exporter). The
   # exporter connects as the monitoring user, exempt from client-cert auth under mTLS.
@@ -727,3 +730,7 @@ global:
 # values for tuning (replicaCount, resources, persistence). Adds 3 stateful pods.
 etcd:
   enabled: false
+  # The bundled etcd's RBAC-bootstrap Job runs the pg-ha-agent (repmgr) image, so keep
+  # this in lockstep with repmgr.image.tag above; the subchart's own default can lag.
+  bootstrapImage:
+    tag: trixie-5.5.0-25

@@ -329,7 +329,7 @@ assert_contains "netpol: has NetworkPolicy kind" "${netpol}" "kind: NetworkPolic
 assert_contains "netpol: postgresql allows port 5432" "${netpol}" "port: 5432"
 assert_contains "netpol: pgpool policy rendered" "${netpol}" "test-pg-pgpool"
 assert_contains "netpol: pgpool allows port 9999" "${netpol}" "port: 9999"
-assert_contains "netpol: exporter policy rendered" "${netpol}" "test-pg-prometheus-exporter"
+assert_contains "netpol: exporter policy rendered" "${netpol}" "test-pg-postgres-exporter"
 assert_contains "netpol: exporter allows port 9116" "${netpol}" "port: 9116"
 
 # #148: under allowExternal=false the documented extraIngress recipe re-allows scoped
@@ -359,7 +359,7 @@ netpol_minimal=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/networkpolicy.yaml 2>&1)
 assert_contains "netpol minimal: postgresql policy rendered" "${netpol_minimal}" "test-pg-postgresql"
 assert_not_contains "netpol minimal: no pgpool policy" "${netpol_minimal}" "test-pg-pgpool"
-assert_not_contains "netpol minimal: no exporter policy" "${netpol_minimal}" "test-pg-prometheus-exporter"
+assert_not_contains "netpol minimal: no exporter policy" "${netpol_minimal}" "test-pg-postgres-exporter"
 
 # Test: postgresql egress allows API server ports
 assert_contains "netpol: egress allows 443" "${netpol}" "port: 443"
@@ -2373,6 +2373,67 @@ pgv_pgpool_svc=$(helm template test-pgv "${PGVECTOR_DIR}" --set pgpool.enabled=t
 assert_not_contains "pgvector #118: pgpool Service does not expose PCP 9898 by default" "${pgv_pgpool_svc}" "9898"
 pgv_backup_cron=$(helm template test-pgv "${PGVECTOR_DIR}" --set backup.enabled=true --set backup.existingSecret.name=s --set backup.s3.endpoint=https://m --set backup.s3.bucket=b --show-only templates/backup-cronjob.yaml 2>&1)
 assert_contains "pgvector #166: backup pod disables SA token automount" "${pgv_backup_cron}" "automountServiceAccountToken: false"
+
+# --- full-chart review fixes (1.2.1) ---
+# C1: pgvector/values.yaml was missing pgbackrest.s3.uriStyle/verifyTls, which the shared
+# template dereferences -> pgvector rendered repo1-storage-verify-tls=n (S3 cert verification
+# OFF) and an empty repo1-s3-uri-style=. Guard both, against the pgvector chart specifically.
+pgv_pgbr_conf=$(helm template test-pgv "${PGVECTOR_DIR}" \
+  --set pgbackrest.enabled=true --set pgbackrest.s3.keyType=auto \
+  --set-string pgbackrest.s3.endpoint=s3.example.com --set-string pgbackrest.s3.bucket=b \
+  --show-only templates/pgbackrest-configmap.yaml 2>&1)
+assert_not_contains "C1 pgvector: pgbackrest does not disable S3 TLS verification" "${pgv_pgbr_conf}" "repo1-storage-verify-tls=n"
+assert_not_contains "C1 pgvector: no empty repo1-s3-uri-style" "${pgv_pgbr_conf}" "repo1-s3-uri-style="
+
+# H1/H2: the exporter NetworkPolicy must be named/select the pods' actual component label
+# (postgres-exporter; the stale prometheus-exporter matched zero pods), and the postgresql
+# NetworkPolicy must admit the monitoring-user hook Job on 5432 (else the install/upgrade
+# hook fails under a default-deny CNI). pgpool is enabled so --show-only emits all NP docs
+# (an empty middle doc otherwise collapses helm's multi-doc --show-only output).
+netpol_fix=$(helm template test-pg "${CHART_DIR}" \
+  --set prometheusExporter.enabled=true --set prometheusExporter.monitoringUser.enabled=true \
+  --set pgpool.enabled=true --set networkPolicy.enabled=true \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "H1: exporter NetworkPolicy named -postgres-exporter" "${netpol_fix}" "name: test-pg-postgres-exporter"
+assert_contains "H1: exporter NetworkPolicy selects postgres-exporter" "${netpol_fix}" "component: postgres-exporter"
+assert_not_contains "H1: no stale prometheus-exporter label anywhere" "${netpol_fix}" "prometheus-exporter"
+assert_contains "H2: postgresql NetworkPolicy admits monitoring-user" "${netpol_fix}" "component: monitoring-user"
+# monitoring-user ingress is gated: absent when the monitoring user is disabled.
+netpol_nomon=$(helm template test-pg "${CHART_DIR}" \
+  --set prometheusExporter.enabled=true --set prometheusExporter.monitoringUser.enabled=false \
+  --set pgpool.enabled=true --set networkPolicy.enabled=true \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_not_contains "H2: no monitoring-user ingress when disabled" "${netpol_nomon}" "component: monitoring-user"
+
+# H8: values.schema.json enum guards reject typos at install time, not pod runtime.
+schema_rc=0; helm template test-pg "${CHART_DIR}" --set prometheusExporter.sslmode=requir >/dev/null 2>&1 || schema_rc=$?
+assert_gt "H8: bogus prometheusExporter.sslmode rejected by schema" "${schema_rc}" "0"
+schema_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.tls.backendSslmode=bogus >/dev/null 2>&1 || schema_rc=$?
+assert_gt "H8: bogus pgpool.tls.backendSslmode rejected by schema" "${schema_rc}" "0"
+schema_rc=0; helm template test-pg "${CHART_DIR}" --set pgbackrest.s3.uriStyle=virtual >/dev/null 2>&1 || schema_rc=$?
+assert_gt "H8: bogus pgbackrest.s3.uriStyle rejected by schema" "${schema_rc}" "0"
+schema_rc=0; helm template test-pg "${CHART_DIR}" --set pgbackrest.repoEncryption.cipherType=bogus >/dev/null 2>&1 || schema_rc=$?
+assert_gt "H8: bogus pgbackrest.repoEncryption.cipherType rejected by schema" "${schema_rc}" "0"
+
+# --- low-priority review fixes (1.2.1) ---
+# K8S-6: the agent ServiceMonitor selector is scoped to the postgresql component so it
+# matches only the headless Service (which carries that label in its metadata + the
+# agent-metrics port), not every Service in the release.
+sm_scope=$(helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=agent \
+  --set repmgr.agent.monitoring.serviceMonitor.enabled=true \
+  --show-only templates/agent-servicemonitor.yaml 2>&1)
+assert_contains "K8S-6: agent ServiceMonitor selector scoped to postgresql component" "${sm_scope}" "app.kubernetes.io/component: postgresql"
+hl_label=$(helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=agent \
+  --show-only templates/service-headless.yaml 2>&1)
+# the label must live in metadata (the SM matches on metadata labels), i.e. above spec:
+hl_meta=$(printf '%s\n' "${hl_label}" | sed -n '/^metadata:/,/^spec:/p')
+assert_contains "K8S-6: headless Service carries component=postgresql in metadata" "${hl_meta}" "app.kubernetes.io/component: postgresql"
+# K8S-5: one-shot Jobs/CronJobs carry the kube-linter probe waivers.
+bk_waiver=$(helm template test-pg "${CHART_DIR}" --set backup.enabled=true \
+  --set backup.existingSecret.name=s --set backup.s3.endpoint=https://m --set backup.s3.bucket=b \
+  --show-only templates/backup-cronjob.yaml 2>&1)
+assert_contains "K8S-5: backup CronJob has no-liveness-probe waiver" "${bk_waiver}" "ignore-check.kube-linter.io/no-liveness-probe"
+assert_contains "K8S-5: backup CronJob has no-readiness-probe waiver" "${bk_waiver}" "ignore-check.kube-linter.io/no-readiness-probe"
 
 # --- #128: global.annotations render as metadata.annotations, not labels ---
 # global.annotations used to be spliced into pg.labels and rendered under

@@ -270,8 +270,8 @@ initContainers:
         printf '%s' "{{ range $i := until (int (add .Values.postgresql.replicaCount 1)) }}{{ if $i }},{{ end }}postgresql://${ENC_USER}:${ENC_PASS}@{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless:5432/${ENC_DB}?sslmode={{ $.Values.prometheusExporter.sslmode }}{{ if has $.Values.prometheusExporter.sslmode (list "verify-ca" "verify-full") }}&sslrootcert=/etc/postgres_exporter/tls/ca.crt{{ end }}{{ end }}" > /etc/postgres_exporter/dsn
     env:
 {{- if .Values.prometheusExporter.monitoringUser.enabled }}
-      # #28: scrape as the least-privilege pg_monitor role (created by the
-      # monitoring-user hook Job), not the postgres superuser.
+      # Scrape as the least-privilege pg_monitor role (created by the monitoring-user
+      # hook Job), not the postgres superuser (#28).
       - name: POSTGRES_USER
         value: {{ .Values.prometheusExporter.monitoringUser.username | quote }}
       - name: POSTGRES_PASSWORD

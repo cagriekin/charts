@@ -1,6 +1,6 @@
 {{- if and (eq (include "pg.agentMode" .) "true") (dig "prometheusRule" "enabled" false (.Values.repmgr.agent.monitoring | default dict)) }}
 {{- /*
-Example alert rules over the pg-ha-agent's metrics (scraped by the agent
+Alert rules over the pg-ha-agent's metrics (scraped by the agent
 ServiceMonitor). Scoped to this release by namespace + the headless Service label
 the Prometheus Operator stamps on each series. Replication-lag alerts are NOT here
 -- they come from the postgres exporter (prometheusExporter.enabled); the agent
