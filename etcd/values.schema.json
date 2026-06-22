@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "etcd chart values (enum guards)",
+  "description": "Partial schema: constrains the values whose typos silently misconfigure the bundled etcd. additionalProperties stays open so the rest of values.yaml is unconstrained.",
+  "type": "object",
+  "properties": {
+    "image": {
+      "type": "object",
+      "properties": {
+        "pullPolicy": {
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "clientCertAuth": { "type": "boolean" },
+        "peer": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "rbac": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "bootstrapImage": {
+          "type": "object",
+          "properties": {
+            "pullPolicy": {
+              "enum": ["Always", "IfNotPresent", "Never"]
+            }
+          }
+        }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "properties": {
+        "accessModes": {
+          "type": "array",
+          "items": {
+            "enum": ["ReadWriteOnce", "ReadOnlyMany", "ReadWriteMany", "ReadWriteOncePod"]
+          }
+        }
+      }
+    }
+  }
+}

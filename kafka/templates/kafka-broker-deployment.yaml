@@ -122,6 +122,13 @@ spec:
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          # Reuse the broker's resources: init runs before the main container, so by
+          # initContainer scheduling semantics (max of init vs sum of app containers)
+          # this reserves nothing extra while satisfying the requests/limits requirement.
+          {{- with .Values.kafka.broker.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: kafka-data
               mountPath: "{{ $brokerLogDirParent }}"

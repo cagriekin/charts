@@ -1,0 +1,44 @@
+suite: exporter-deployment
+templates:
+  - templates/exporter-deployment.yaml
+tests:
+  - it: minimal - no exporter deployment when disabled
+    values:
+      - ../values-minimal.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: full - exporter deployment present
+    values:
+      - ../values-full-test.yaml
+    asserts:
+      - isKind:
+          of: Deployment
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: redis-exporter
+
+  - it: full - exporter container has allowPrivilegeEscalation false
+    values:
+      - ../values-full-test.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+
+  - it: full + auth - exporter has REDIS_PASSWORD env
+    values:
+      - ../values-full-test.yaml
+    set:
+      redis.auth.enabled: true
+      redis.auth.existingSecret.name: my-secret
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: my-secret
+                key: redis-password

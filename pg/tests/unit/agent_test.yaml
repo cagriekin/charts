@@ -1,0 +1,83 @@
+suite: pg agent-mode render and RBAC
+templates:
+  - templates/statefulset.yaml
+  - templates/rbac.yaml
+release:
+  name: test-pg
+tests:
+  # --- Scenario 4: agent render ---
+  - it: agent statefulset uses Parallel podManagementPolicy
+    values:
+      - ../values-agent.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.podManagementPolicy
+          value: Parallel
+
+  - it: agent postgresql container runs the agent entrypoint and has no repmgrd
+    values:
+      - ../values-agent.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].command
+          value:
+            - /usr/local/bin/entrypoint.sh
+            - agent
+      - notExists:
+          path: spec.template.spec.containers[?(@.name=="repmgrd")]
+
+  - it: agent postgresql container env has the lease/identity vars
+    values:
+      - ../values-agent.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env
+          content:
+            name: LEASE_NAME
+          any: true
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env
+          content:
+            name: POD_NAME
+          any: true
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env
+          content:
+            name: DCS_BACKEND
+          any: true
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env
+          content:
+            name: POD_CIDR
+          any: true
+
+  # --- Scenario 5: agent RBAC ---
+  - it: agent Role grants the leader Lease (coordination.k8s.io) and no delete
+    values:
+      - ../values-agent.yaml
+    template: templates/rbac.yaml
+    documentSelector:
+      path: kind
+      value: Role
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - coordination.k8s.io
+            resources:
+              - leases
+            resourceNames:
+              - test-pg-leader
+            verbs:
+              - get
+              - update
+              - patch
+          any: true
+      - notContains:
+          path: rules[*].verbs
+          content: delete
+          any: true

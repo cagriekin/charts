@@ -1,0 +1,125 @@
+suite: pg structural render scenarios
+release:
+  name: test-pg
+tests:
+  # --- Scenario 1: minimal render ---
+  - it: minimal statefulset has 1 replica
+    values:
+      - ../values-minimal.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 1
+
+  - it: minimal has no repmgrd or service-updater container
+    values:
+      - ../values-minimal.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[?(@.name=="repmgrd")]
+      - notExists:
+          path: spec.template.spec.containers[?(@.name=="service-updater")]
+
+  - it: minimal renders a Secret
+    values:
+      - ../values-minimal.yaml
+    template: templates/secret.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: Secret
+
+  - it: minimal renders a Service
+    values:
+      - ../values-minimal.yaml
+    template: templates/service.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: Service
+
+  # --- Scenario 2: repmgr render ---
+  - it: repmgr statefulset has 2 replicas and OrderedReady policy
+    values:
+      - ../values-repmgr.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 2
+      - equal:
+          path: spec.podManagementPolicy
+          value: OrderedReady
+
+  - it: repmgr has repmgrd and service-updater containers
+    values:
+      - ../values-repmgr.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - exists:
+          path: spec.template.spec.containers[?(@.name=="repmgrd")]
+      - exists:
+          path: spec.template.spec.containers[?(@.name=="service-updater")]
+
+  # --- Scenario 3: full render ---
+  - it: full statefulset has 3 replicas
+    values:
+      - ../values-full-test.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 3
+
+  - it: full renders a pgpool Deployment
+    values:
+      - ../values-full-test.yaml
+    template: templates/pgpool-deployment.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: Deployment
+
+  - it: full postgresql pod has hostname podAntiAffinity
+    values:
+      - ../values-full-test.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - exists:
+          path: spec.template.spec.affinity.podAntiAffinity
+      - equal:
+          path: spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].topologyKey
+          value: kubernetes.io/hostname
+
+  # --- Scenario 7: primary Service selector ---
+  - it: primary Service selects pod-name <release>-0
+    values:
+      - ../values-minimal.yaml
+    template: templates/service.yaml
+    asserts:
+      - equal:
+          path: spec.selector["statefulset.kubernetes.io/pod-name"]
+          value: test-pg-0
+
+  # --- Scenario 8: read-only Service ---
+  - it: read-only Service name endswith -readonly, selects standby, targets postgresql
+    values:
+      - ../values-repmgr.yaml
+    template: templates/service-readonly.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - matchRegex:
+          path: metadata.name
+          pattern: -readonly$
+      - equal:
+          path: spec.selector["pg-role"]
+          value: standby
+      - equal:
+          path: spec.ports[0].targetPort
+          value: postgresql
