@@ -700,3 +700,7 @@ global:
 # values for tuning (replicaCount, resources, persistence). Adds 3 stateful pods.
 etcd:
   enabled: false
+  # The bundled etcd's RBAC-bootstrap Job runs the pg-ha-agent (repmgr) image, so keep
+  # this in lockstep with repmgr.image.tag above; the subchart's own default can lag.
+  bootstrapImage:
+    tag: trixie-5.5.0-25

@@ -22,6 +22,16 @@ no rendered change at defaults. Shares pg's templates; see the pg CHANGELOG for 
 - **`values.schema.json` enum guards** for `prometheusExporter.sslmode`,
   `pgpool.tls.backendSslmode`, `pgbackrest.s3.uriStyle`, and
   `pgbackrest.repoEncryption.cipherType`.
+- **`.helmignore`** (the chart had none), excluding `tests/`, `Makefile`,
+  `kind-config.yaml`, and a stray `test.yaml` from the released `.tgz`.
+
+### Changed
+
+- **Bundled etcd RBAC-bootstrap Job image tag** pinned to `trixie-5.5.0-25` via the
+  `etcd.bootstrapImage.tag` override, in lockstep with the repmgr image.
+- **Agent ServiceMonitor selector scoped** to the postgresql component (matches only the
+  headless Service). kube-linter probe waivers added to the one-shot Jobs/CronJobs.
+  Shared with pg; see the pg CHANGELOG.
 
 ## 1.2.0 - 2026-06-21
 

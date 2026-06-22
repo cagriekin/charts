@@ -4,6 +4,7 @@ metadata:
   name: {{ include "pg.fullname" . }}-headless
   labels:
     {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
   {{- with (include "pg.annotations" .) }}
   annotations:
     {{- . | nindent 4 }}

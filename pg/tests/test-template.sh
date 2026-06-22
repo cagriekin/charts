@@ -2413,6 +2413,25 @@ assert_gt "H8: bogus pgpool.tls.backendSslmode rejected by schema" "${schema_rc}
 schema_rc=0; helm template test-pg "${CHART_DIR}" --set pgbackrest.s3.uriStyle=virtual >/dev/null 2>&1 || schema_rc=$?
 assert_gt "H8: bogus pgbackrest.s3.uriStyle rejected by schema" "${schema_rc}" "0"
 
+# --- low-priority review fixes (1.2.1) ---
+# K8S-6: the agent ServiceMonitor selector is scoped to the postgresql component so it
+# matches only the headless Service (which carries that label in its metadata + the
+# agent-metrics port), not every Service in the release.
+sm_scope=$(helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=agent \
+  --set repmgr.agent.monitoring.serviceMonitor.enabled=true \
+  --show-only templates/agent-servicemonitor.yaml 2>&1)
+assert_contains "K8S-6: agent ServiceMonitor selector scoped to postgresql component" "${sm_scope}" "app.kubernetes.io/component: postgresql"
+hl_label=$(helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=agent \
+  --show-only templates/service-headless.yaml 2>&1)
+# the label must live in metadata (the SM matches on metadata labels), i.e. above spec:
+hl_meta=$(printf '%s\n' "${hl_label}" | sed -n '/^metadata:/,/^spec:/p')
+assert_contains "K8S-6: headless Service carries component=postgresql in metadata" "${hl_meta}" "app.kubernetes.io/component: postgresql"
+# K8S-5: one-shot Jobs/CronJobs carry the kube-linter probe waivers.
+bk_waiver=$(helm template test-pg "${CHART_DIR}" --set backup.enabled=true \
+  --set backup.existingSecret.name=s --set backup.s3.endpoint=https://m --set backup.s3.bucket=b \
+  --show-only templates/backup-cronjob.yaml 2>&1)
+assert_contains "K8S-5: backup CronJob has no-liveness-probe waiver" "${bk_waiver}" "ignore-check.kube-linter.io/no-liveness-probe"
+
 # --- #128: global.annotations render as metadata.annotations, not labels ---
 # global.annotations used to be spliced into pg.labels and rendered under
 # metadata.labels on every resource: non-label-safe values (spaces, URLs, >63

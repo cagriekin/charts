@@ -20,12 +20,32 @@ no rendered change at defaults.
   CNI and the hook failed the release. Added a `monitoring-user` ingress allow-from rule
   (gated on `prometheusExporter.monitoringUser.enabled`).
 
+- **Bundled etcd RBAC-bootstrap Job image tag pinned in lockstep with the repmgr image.**
+  The `etcd.bootstrapImage.tag` override is set to `trixie-5.5.0-25` in values so the
+  bundled etcd's bootstrap Job no longer lags the pg-ha-agent image (the subchart default
+  could skew).
+
 ### Added
 
 - **`values.schema.json` enum guards** for `prometheusExporter.sslmode`,
   `pgpool.tls.backendSslmode`, `pgbackrest.s3.uriStyle`, and
   `pgbackrest.repoEncryption.cipherType` — a typo in these now fails install-time
   validation instead of misconfiguring the exporter/pgpool/backup at pod runtime.
+
+### Changed
+
+- **Agent ServiceMonitor selector scoped to the postgresql component.** It now matches
+  only the headless Service (which carries `app.kubernetes.io/component: postgresql` and
+  the agent-metrics port) instead of every Service in the release.
+- **kube-linter probe waivers on one-shot Jobs/CronJobs.** The backup, backup-validation,
+  pgbackrest, and monitoring-user Jobs/CronJobs now carry
+  `ignore-check.kube-linter.io/no-{liveness,readiness}-probe` annotations, matching the
+  policy gate's documented convention for one-shot workloads.
+- **Tighter chart package.** `.helmignore` now excludes `tests/`, `Makefile`, and
+  `kind-config.yaml` (and pgvector gained a `.helmignore`), so chart development
+  scaffolding no longer ships inside the released `.tgz`.
+- `int`-coerced `postgresql.replicaCount` in the service-updater ConfigMap script, for
+  consistency with the rest of the chart.
 
 ## 1.2.0 - 2026-06-21
 
