@@ -195,7 +195,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 |-----------|-------------|---------|
 | `repmgr.enabled` | Enable repmgr | `true` |
 | `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
-| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-25` |
+| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-26` |
 | `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `repmgr.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Bump with `repmgr.image.tag` when moving to an image built for a new PG major. | `"18"` |
 | `repmgr.username` | Repmgr database user | `repmgr` |
@@ -1015,8 +1015,8 @@ kubectl scale statefulset my-postgres-pg --replicas=0
 # cloud-role annotation; the namespace default SA does not), and ensure the pod lands
 # where your IRSA/WI webhook injects the token; pgbackrest then uses the credential chain.
 kubectl run pg-restore --rm -it \
-  --image=cagriekin/repmgr:trixie-5.5.0-25 \
-  --overrides='{ "spec": { "securityContext": { "runAsUser": 101, "runAsGroup": 103, "fsGroup": 103, "runAsNonRoot": true, "seccompProfile": { "type": "RuntimeDefault" } }, "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-25", "command": ["bash"], "stdin": true, "tty": true, "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] } }, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }, { "name": "pgbackrest-config", "mountPath": "/etc/pgbackrest/pgbackrest.conf", "subPath": "pgbackrest.conf", "readOnly": true }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "valueFrom": { "secretKeyRef": { "name": "YOUR_PGBACKREST_SECRET", "key": "access-key-id" } } }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "valueFrom": { "secretKeyRef": { "name": "YOUR_PGBACKREST_SECRET", "key": "secret-access-key" } } }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-postgres-pg-0" } }, { "name": "pgbackrest-config", "configMap": { "name": "my-postgres-pg-pgbackrest" } }] } }'
+  --image=cagriekin/repmgr:trixie-5.5.0-26 \
+  --overrides='{ "spec": { "securityContext": { "runAsUser": 101, "runAsGroup": 103, "fsGroup": 103, "runAsNonRoot": true, "seccompProfile": { "type": "RuntimeDefault" } }, "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-26", "command": ["bash"], "stdin": true, "tty": true, "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] } }, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }, { "name": "pgbackrest-config", "mountPath": "/etc/pgbackrest/pgbackrest.conf", "subPath": "pgbackrest.conf", "readOnly": true }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "valueFrom": { "secretKeyRef": { "name": "YOUR_PGBACKREST_SECRET", "key": "access-key-id" } } }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "valueFrom": { "secretKeyRef": { "name": "YOUR_PGBACKREST_SECRET", "key": "secret-access-key" } } }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-postgres-pg-0" } }, { "name": "pgbackrest-config", "configMap": { "name": "my-postgres-pg-pgbackrest" } }] } }'
 
 # 3. Inside the restore pod, run (stanza = pgbackrest.stanza, default "db").
 # --type=time is REQUIRED with --target (pgbackrest rejects --target otherwise);
@@ -1247,7 +1247,8 @@ Each chart is tagged `<chart>-<version>` (e.g. `pg-1.1.0`); `pg` and `pgvector` 
 
 | `pg` / `pgvector` | repmgr image | PostgreSQL | Kubernetes |
 |-------------------|--------------|-----------|-----------|
-| 1.2.0 *(current)* | `trixie-5.5.0-25` | 18.x | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.2.2 *(current)* | `trixie-5.5.0-26` | 18.x | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.2.0 – 1.2.1 | `trixie-5.5.0-25` | 18.x | as above |
 | 1.0.0 – 1.1.8 | `trixie-5.5.0-16` … `-24` | 18.x | as above |
 | 0.5.88 / 0.6.90 *(last 0.x)* | `trixie-5.5.0-15` | 18.x | ≥ 1.21 (PDB `policy/v1`) |
 
@@ -1260,7 +1261,7 @@ helm repo update
 helm upgrade my-postgres cagriekin/pg   # add -f your-values.yaml
 ```
 
-Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.2.0`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-25` at 1.2.0) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
+Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.2.2`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-26` at 1.2.2) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
 
 ### Crossing the 0.x → 1.x boundary (agent mode is now the default)
 

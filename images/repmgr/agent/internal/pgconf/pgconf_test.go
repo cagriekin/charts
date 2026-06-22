@@ -165,6 +165,70 @@ func TestAssemblePgHbaEmptyPostgresUserMTLS(t *testing.T) {
 	}
 }
 
+func TestAssemblePgHbaMD5FallbackLayersMd5AboveScram(t *testing.T) {
+	out := AssemblePgHba(PgHbaOptions{
+		ReplicationUser: "repmgr",
+		PeerCIDR:        "10.0.0.0/8",
+		MD5Fallback:     true,
+	})
+	// An md5 line is laid above each generated scram rule -- loopback x2, replication,
+	// and the peer-CIDR catch-all -- so md5-stored passwords still authenticate (#199).
+	if n := strings.Count(out, "md5\n"); n != 4 {
+		t.Errorf("expected 4 md5 lines (loopback x2 + replication + catch-all), got %d:\n%s", n, out)
+	}
+	// Each md5 line sits ABOVE its scram twin (pg_hba is first-match-wins).
+	if i, j := strings.Index(out, "10.0.0.0/8        md5"), strings.Index(out, "10.0.0.0/8        scram-sha-256"); i < 0 || j < 0 || i > j {
+		t.Errorf("md5 must precede its scram twin (md5=%d scram=%d):\n%s", i, j, out)
+	}
+	// The hardening invariants are unchanged: local trust kept, no 0.0.0.0/0.
+	if !strings.Contains(out, "local       all           all                              trust") {
+		t.Errorf("local trust line missing:\n%s", out)
+	}
+	if strings.Contains(out, "0.0.0.0/0") {
+		t.Errorf("must not reintroduce the 0.0.0.0/0 catch-all:\n%s", out)
+	}
+}
+
+func TestAssemblePgHbaMD5FallbackMTLSNeverBypassesClientCert(t *testing.T) {
+	out := AssemblePgHba(PgHbaOptions{
+		ReplicationUser: "repmgr",
+		PeerCIDR:        "10.0.0.0/8",
+		ClientCertAuth:  true,
+		PostgresUser:    "postgres",
+		MonitoringUser:  "monitoring",
+		MD5Fallback:     true,
+	})
+	// Internal-user exemptions get an md5 twin (they auth by password over TLS).
+	if !strings.Contains(out, "hostssl     all           repmgr        10.0.0.0/8        md5") {
+		t.Errorf("mTLS+md5: repmgr exemption must get an md5 twin:\n%s", out)
+	}
+	// The app catch-all keeps clientcert and is NEVER md5-fallback'd, so app users
+	// cannot skip the client cert via md5 password auth (#199).
+	if !strings.Contains(out, "hostssl     all           all        10.0.0.0/8        scram-sha-256 clientcert=verify-ca") {
+		t.Errorf("mTLS: app catch-all must require clientcert:\n%s", out)
+	}
+	if strings.Contains(out, "hostssl     all           all        10.0.0.0/8        md5") {
+		t.Errorf("mTLS+md5: app catch-all must NOT have an md5 bypass twin:\n%s", out)
+	}
+}
+
+func TestAssemblePgHbaMD5FallbackLeavesExtraRules(t *testing.T) {
+	out := AssemblePgHba(PgHbaOptions{
+		ReplicationUser: "repmgr",
+		PeerCIDR:        "10.0.0.0/8",
+		ExtraRules:      []string{"host all readonly 10.0.0.0/8 scram-sha-256"},
+		MD5Fallback:     true,
+	})
+	// User ExtraRules are verbatim -- no md5 twin (the former chart awk only matched
+	// the chart's own all/replication rules, never user rules).
+	if strings.Contains(out, "host all readonly 10.0.0.0/8 md5") {
+		t.Errorf("ExtraRules must not be md5-fallback'd:\n%s", out)
+	}
+	if !strings.Contains(out, "host all readonly 10.0.0.0/8 scram-sha-256") {
+		t.Errorf("ExtraRule must be present verbatim:\n%s", out)
+	}
+}
+
 func TestEnsureConfdIncludeIdempotentToggle(t *testing.T) {
 	dir := t.TempDir()
 	conf := filepath.Join(dir, "postgresql.conf")

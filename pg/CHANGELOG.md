@@ -1,5 +1,36 @@
 # pg chart changelog
 
+## 1.2.2 - 2026-06-22
+
+Fixes a `pg_hba.conf` dual-authorship bug that broke md5-password authentication on
+agent-mode standbys (#199). Image moves to `trixie-5.5.0-26`.
+
+### Fixed
+
+- **Agent-mode standbys could end up with a SCRAM-only `pg_hba.conf`, breaking
+  md5-password clients (#199).** The agent wrote a SCRAM-only `pg_hba.conf` every boot
+  while the chart's postStart hook layered an md5-first fallback on top; the two raced,
+  and on a rejoined standby the agent won, leaving it SCRAM-only. With legacy md5-stored
+  passwords, every TCP password auth into the standby then failed (exporter `pg_up=0`,
+  pgpool `-readonly` backend auth failure, and a failover lockout if such a standby were
+  promoted). The agent is now the **single author** of `pg_hba.conf` in agent mode: it
+  writes the md5-first compat form (an md5 line above each scram rule, on the pod CIDR
+  only -- never the mTLS clientcert catch-all, never `0.0.0.0/0`) on every node, so
+  primary and standby are byte-identical. The postStart md5-fallback + re-hash now run
+  only in repmgrd mode.
+- **md5->scram managed-user re-hash now runs on failover-promotion, not just at boot
+  (#199).** The re-hash moved into the agent and runs on promotion/boot-primary, so a
+  node promoted by an in-process failover (no container restart) converges its managed
+  users (POSTGRES_USER, REPMGR_USER) to scram. Still gated by
+  `postgresql.migrateLegacyMd5Users` (default true); the password never appears on argv.
+
+### Changed
+
+- repmgr image -> `trixie-5.5.0-26` (`repmgr.image.tag` and the bundled
+  `etcd.bootstrapImage.tag` default). The agent-mode `pg_hba.conf` now includes the md5
+  compat lines it previously received from the postStart hook (byte-identical across
+  primary and standby).
+
 ## 1.2.1 - 2026-06-22
 
 Chart-only bug fixes from a full-chart review. No image change (`trixie-5.5.0-25`);

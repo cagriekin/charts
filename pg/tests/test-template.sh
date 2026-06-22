@@ -1386,6 +1386,22 @@ assert_not_contains "#166: repmgrd-mode StatefulSet also keeps its SA token (ser
 sts_standalone166=$(helm template test-pg "${CHART_DIR}" --set repmgr.enabled=false --set postgresql.replicaCount=0 --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#166: standalone StatefulSet disables SA token automount" "${sts_standalone166}" "automountServiceAccountToken: false"
 
+# #199: in agent mode the agent is the SINGLE author of pg_hba.conf -- the md5-first
+# compat layer + the md5->scram re-hash are folded into the agent, so the postStart md5
+# blocks (which raced the agent and left rejoined standbys SCRAM-only) run only in
+# repmgrd mode. The agent gets MIGRATE_LEGACY_MD5_USERS to run the re-hash on promotion.
+assert_not_contains "#199: agent mode drops the postStart md5-fallback awk" "${sts_agent166}" "md5 fallback applied"
+assert_not_contains "#199: agent mode drops the postStart md5->scram re-hash" "${sts_agent166}" "fix_user_auth"
+assert_contains "#199: agent mode passes MIGRATE_LEGACY_MD5_USERS to the agent" "${sts_agent166}" "MIGRATE_LEGACY_MD5_USERS"
+assert_contains "#199: repmgrd mode keeps the postStart md5-fallback awk" "${sts_repmgrd166}" "md5 fallback applied"
+assert_contains "#199: repmgrd mode keeps the postStart md5->scram re-hash" "${sts_repmgrd166}" "fix_user_auth"
+assert_not_contains "#199: MIGRATE_LEGACY_MD5_USERS is agent-only (absent in repmgrd)" "${sts_repmgrd166}" "MIGRATE_LEGACY_MD5_USERS"
+# #199 + #144: user pgHba in agent mode flows through the agent (POSTGRESQL_PGHBA env),
+# not the postStart insert (which now runs only in repmgrd mode).
+sts_agent_hba=$(helm template test-pg "${CHART_DIR}" --set 'postgresql.pgHba[0]=host all custom 10.1.2.3/32 reject' --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#199: agent receives user pgHba via POSTGRESQL_PGHBA env" "${sts_agent_hba}" "host all custom 10.1.2.3/32 reject"
+assert_not_contains "#199: agent mode drops the postStart user-pgHba insert" "${sts_agent_hba}" "user pgHba entries"
+
 # Test: backup cronjob respects custom activeDeadlineSeconds
 backup_custom=$(helm template test-pg "${CHART_DIR}" \
   --set backup.enabled=true \

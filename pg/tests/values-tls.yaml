@@ -5,7 +5,7 @@
 # and the exporter scraping over TLS as the (exempt) monitoring user.
 repmgr:
   image:
-    tag: trixie-5.5.0-25
+    tag: trixie-5.5.0-26
     pullPolicy: IfNotPresent
 
 postgresql:
