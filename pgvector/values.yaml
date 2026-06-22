@@ -149,9 +149,9 @@ postgresql:
     # - "host all all 10.0.0.0/8 md5"
     # - "host replication repmgr 10.0.0.0/8 trust"
 
-  # Client-connection TLS (#110). Off by default (render byte-stable). See the pg
-  # chart README for the full TLS notes (cert SANs, require/mTLS, internal-user
-  # exemptions, replication-stays-plaintext).
+  # Client-connection TLS (#110). Off by default (no change to rendered manifests unless
+  # enabled). See the pg chart README for the full TLS notes (cert SANs, require/mTLS,
+  # internal-user exemptions, replication-stays-plaintext).
   tls:
     enabled: false
     existingSecret: ""   # SERVER cert: tls.crt, tls.key, ca.crt
@@ -259,9 +259,10 @@ repmgr:
   username: repmgr
   database: repmgr
 
-  # Days of repmgr.monitoring_history to retain. repmgr 5.x has no
-  # conf-based retention, so the repmgrd sidecar prunes the table once
-  # per day on the primary via `repmgr cluster cleanup --keep-history`.
+  # Days of repmgr.monitoring_history to retain. repmgr 5.x has no conf-based retention,
+  # so the table is pruned once per day on the primary via `repmgr cluster cleanup
+  # --keep-history`. Only applies in failoverMode: repmgrd; agent mode runs no repmgrd
+  # and writes no monitoring_history.
   monitoringHistoryDays: 7
 
   terminationGracePeriodSeconds: 120
@@ -346,7 +347,7 @@ pgpool:
   tls:
     enabled: false
     existingSecret: ""        # frontend SERVER cert: tls.crt, tls.key[, ca.crt]
-    clientCertAuth: false     # require client certs on the pgpool frontend
+    clientCertAuth: false     # validate a client cert if the frontend presents one (does not itself require one)
     backendSslmode: prefer    # pgpool -> postgres: disable|prefer|require|verify-ca|verify-full
     backendClientCert: ""     # Secret for pgpool->postgres under mTLS
 
@@ -580,6 +581,12 @@ pgbackrest:
     #           EC2 instance profile); no existingSecret -- annotate the pod SA via
     #           postgresql.serviceAccount.annotations instead.
     keyType: shared
+    # Addressing + TLS for S3-compatible stores that are not AWS (MinIO, Ceph RGW,
+    # on-prem gateways). Defaults match AWS, so these render nothing for AWS users.
+    #   uriStyle: host (AWS virtual-host style, default) | path (most other stores).
+    #   verifyTls: false to accept a self-signed / internal-CA endpoint.
+    uriStyle: host
+    verifyTls: true
 
   existingSecret:
     name: ""
@@ -694,3 +701,7 @@ global:
 # values for tuning (replicaCount, resources, persistence). Adds 3 stateful pods.
 etcd:
   enabled: false
+  # The bundled etcd's RBAC-bootstrap Job runs the pg-ha-agent (repmgr) image, so keep
+  # this in lockstep with repmgr.image.tag above; the subchart's own default can lag.
+  bootstrapImage:
+    tag: trixie-5.5.0-25

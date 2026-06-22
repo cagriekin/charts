@@ -4,6 +4,7 @@ metadata:
   name: {{ include "pg.fullname" . }}-headless
   labels:
     {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgresql
   {{- with (include "pg.annotations" .) }}
   annotations:
     {{- . | nindent 4 }}
@@ -17,8 +18,8 @@ spec:
       targetPort: postgresql
       protocol: TCP
 {{- if eq (include "pg.agentMode" .) "true" }}
-    # the pg-ha-agent's read-only Prometheus metrics + /healthz (agent mode only),
-    # so a ServiceMonitor can discover them on the per-pod headless endpoints.
+    # Expose port 9200 -- the pg-ha-agent's read-only Prometheus metrics + /healthz
+    # (agent mode only) -- so a ServiceMonitor can scrape the per-pod headless endpoints.
     - name: agent-metrics
       port: 9200
       targetPort: agent-metrics

@@ -12,6 +12,9 @@ metadata:
     {{- include "pg.labels" . | nindent 4 }}
     app.kubernetes.io/component: monitoring-user
   annotations:
+    # one-shot hook Job: liveness/readiness probes do not apply (kube-linter waiver).
+    ignore-check.kube-linter.io/no-liveness-probe: "one-shot monitoring-user hook Job"
+    ignore-check.kube-linter.io/no-readiness-probe: "one-shot monitoring-user hook Job"
     {{- with (include "pg.annotations" .) }}
     {{- . | nindent 4 }}
     {{- end }}

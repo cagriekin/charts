@@ -6,10 +6,13 @@ metadata:
   labels:
     {{- include "pg.labels" . | nindent 4 }}
     app.kubernetes.io/component: backup
-  {{- with (include "pg.annotations" .) }}
   annotations:
+    # one-shot CronJob: liveness/readiness probes do not apply (kube-linter waiver).
+    ignore-check.kube-linter.io/no-liveness-probe: "one-shot backup CronJob"
+    ignore-check.kube-linter.io/no-readiness-probe: "one-shot backup CronJob"
+    {{- with (include "pg.annotations" .) }}
     {{- . | nindent 4 }}
-  {{- end }}
+    {{- end }}
 spec:
   schedule: {{ .Values.backup.schedule | quote }}
   concurrencyPolicy: Forbid

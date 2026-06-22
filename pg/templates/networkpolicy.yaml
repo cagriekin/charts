@@ -37,7 +37,18 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "pg.selectorLabels" . | nindent 14 }}
-              app.kubernetes.io/component: prometheus-exporter
+              app.kubernetes.io/component: postgres-exporter
+{{- if .Values.prometheusExporter.monitoringUser.enabled }}
+{{- /*
+The monitoring-user post-install/post-upgrade hook Job connects to 5432 (via the
+write Service) to create the exporter's least-privileged role; without this rule a
+default-deny CNI drops it and the helm hook fails the release.
+*/}}
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: monitoring-user
+{{- end }}
 {{- end }}
 {{- if .Values.backup.enabled }}
         - podSelector:
@@ -163,7 +174,7 @@ spec:
 pgpool advertises Prometheus scraping on 9719 (the pgpool2_exporter sidecar);
 without this rule the CNI drops every scrape and pgpool metrics silently
 disappear despite the scrape annotations the chart itself emits (#135). Mirrors
-the prometheus-exporter policy's 9116 rule.
+the postgres-exporter policy's 9116 rule.
 */}}
     - ports:
         - port: 9719
@@ -198,10 +209,10 @@ the prometheus-exporter policy's 9116 rule.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "pg.fullname" . }}-prometheus-exporter
+  name: {{ include "pg.fullname" . }}-postgres-exporter
   labels:
     {{- include "pg.labels" . | nindent 4 }}
-    app.kubernetes.io/component: prometheus-exporter
+    app.kubernetes.io/component: postgres-exporter
   {{- with (include "pg.annotations" .) }}
   annotations:
     {{- . | nindent 4 }}
@@ -210,7 +221,7 @@ spec:
   podSelector:
     matchLabels:
       {{- include "pg.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: prometheus-exporter
+      app.kubernetes.io/component: postgres-exporter
   policyTypes:
     - Ingress
     - Egress

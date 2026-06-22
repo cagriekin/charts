@@ -49,7 +49,7 @@ data:
         PRIMARY_NODES=""
         PRIMARY_COUNT=0
         local i node in_recovery
-        for i in $(seq 0 {{ .Values.postgresql.replicaCount }}); do
+        for i in $(seq 0 {{ int .Values.postgresql.replicaCount }}); do
             node="${BASE_NAME}-${i}.${HEADLESS_SERVICE}"
             in_recovery=$(PGPASSWORD=${REPMGR_PASSWORD} timeout 10 psql -h "${node}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
                 -tAc "SELECT pg_is_in_recovery();" 2>/dev/null)
@@ -125,8 +125,8 @@ data:
     write_marker() {
         local primary=$1 tl=$2
         [ -z "$PRIMARY_MARKER" ] && return 0
-        # create-or-update idempotently; no heredoc so the rendered script has no
-        # block-scalar indentation hazards
+        # Create-or-update idempotently. Avoid a heredoc here: its body would inherit
+        # this script's ConfigMap block-scalar indentation and corrupt the manifest.
         if ! kubectl create configmap "${PRIMARY_MARKER}" -n "${NAMESPACE}" \
             --from-literal=primary="${primary}" --from-literal=timeline="${tl}" \
             --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1; then
@@ -361,8 +361,8 @@ data:
         for id in ${ids}; do
             case "$id" in ''|*[!0-9]*) continue ;; esac
             ord=$((id - 1000))
-            if [ "$ord" -gt {{ .Values.postgresql.replicaCount }} ]; then
-                echo "Unregistering ghost repmgr node ${id} (ordinal ${ord} > replicaCount {{ .Values.postgresql.replicaCount }}) left by a scale-down"
+            if [ "$ord" -gt {{ int .Values.postgresql.replicaCount }} ]; then
+                echo "Unregistering ghost repmgr node ${id} (ordinal ${ord} > replicaCount {{ int .Values.postgresql.replicaCount }}) left by a scale-down"
                 repmgr -f /etc/repmgr/repmgr.conf standby unregister --node-id="${id}" 2>&1 \
                     || echo "WARNING: failed to unregister ghost node ${id} (will retry next tick)"
             fi
