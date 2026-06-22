@@ -46,6 +46,9 @@ no rendered change at defaults.
   scaffolding no longer ships inside the released `.tgz`.
 - `int`-coerced `postgresql.replicaCount` in the service-updater ConfigMap script, for
   consistency with the rest of the chart.
+- Clarified several values.yaml/template comments: plain-English wording for the
+  "off by default" TLS notes, the `monitoringHistoryDays` repmgrd-mode scope (agent mode
+  writes no monitoring_history), and the exporter scrape-role note.
 
 ## 1.2.0 - 2026-06-21
 

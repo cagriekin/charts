@@ -125,8 +125,8 @@ data:
     write_marker() {
         local primary=$1 tl=$2
         [ -z "$PRIMARY_MARKER" ] && return 0
-        # create-or-update idempotently; no heredoc so the rendered script has no
-        # block-scalar indentation hazards
+        # Create-or-update idempotently. Avoid a heredoc here: its body would inherit
+        # this script's ConfigMap block-scalar indentation and corrupt the manifest.
         if ! kubectl create configmap "${PRIMARY_MARKER}" -n "${NAMESPACE}" \
             --from-literal=primary="${primary}" --from-literal=timeline="${tl}" \
             --dry-run=client -o yaml | kubectl apply -f - >/dev/null 2>&1; then

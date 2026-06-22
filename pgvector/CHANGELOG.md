@@ -32,6 +32,9 @@ no rendered change at defaults. Shares pg's templates; see the pg CHANGELOG for 
 - **Agent ServiceMonitor selector scoped** to the postgresql component (matches only the
   headless Service). kube-linter probe waivers added to the one-shot Jobs/CronJobs.
   Shared with pg; see the pg CHANGELOG.
+- Corrected misleading values.yaml comments: `pgpool.tls.clientCertAuth` validates a
+  client cert only if the frontend presents one (it does not require one), and
+  `monitoringHistoryDays` pruning applies only in repmgrd mode.
 
 ## 1.2.0 - 2026-06-21
 
