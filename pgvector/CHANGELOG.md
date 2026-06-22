@@ -1,5 +1,18 @@
 # pgvector chart changelog
 
+## 1.2.2 - 2026-06-22
+
+Fixes the agent-mode `pg_hba.conf` dual-authorship bug (#199); image moves to
+`trixie-5.5.0-26`. Shares pg's agent + templates; see the pg CHANGELOG for detail.
+
+### Fixed
+
+- **Agent-mode standbys could end up SCRAM-only, breaking md5-password auth (#199).**
+  The agent is now the single author of `pg_hba.conf` (md5-first compat on every node, so
+  primary and standby match); the postStart md5-fallback + re-hash run only in repmgrd
+  mode. The md5->scram managed-user re-hash moved into the agent and runs on
+  promotion/boot-primary, gated by `postgresql.migrateLegacyMd5Users` (default true).
+
 ## 1.2.1 - 2026-06-22
 
 Chart-only bug fixes from a full-chart review. No image change (`trixie-5.5.0-25`);
