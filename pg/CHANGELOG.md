@@ -26,9 +26,10 @@ agent-mode standbys (#199). Image moves to `trixie-5.5.0-26`.
 
 ### Changed
 
-- repmgr image -> `trixie-5.5.0-26`. Chart values are unchanged; the agent-mode
-  `pg_hba.conf` gains the md5 compat lines it previously received from the postStart hook
-  (now byte-identical across primary and standby).
+- repmgr image -> `trixie-5.5.0-26` (`repmgr.image.tag` and the bundled
+  `etcd.bootstrapImage.tag` default). The agent-mode `pg_hba.conf` now includes the md5
+  compat lines it previously received from the postStart hook (byte-identical across
+  primary and standby).
 
 ## 1.2.1 - 2026-06-22
 

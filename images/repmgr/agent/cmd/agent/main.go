@@ -790,12 +790,26 @@ func (a *agent) rehashManagedUsersOnce(ctx context.Context) {
 	if !a.cfg.MigrateLegacyMd5Users || a.rehashedManagedUsers.Load() {
 		return
 	}
+	// The superuser identity + a target DB are needed to connect over the local socket;
+	// without them nothing can run, so return WITHOUT latching (retry once they appear).
+	if a.cfg.PostgresUser == "" || a.cfg.PostgresDB == "" {
+		a.log.Warn("md5->scram re-hash skipped: POSTGRES_USER/POSTGRES_DB unset")
+		return
+	}
 	users := []struct{ name, pass string }{
 		{a.cfg.PostgresUser, a.cfg.PostgresPassword},
 		{a.cfg.RepmgrUser, a.cfg.RepmgrPassword},
 	}
 	ok := true
 	for _, u := range users {
+		// A managed user with no known password cannot be re-hashed; skip it but do NOT
+		// latch convergence, so it retries if the credential later appears (avoids a
+		// false "converged" when RehashMd5User no-ops on an empty arg).
+		if u.name == "" || u.pass == "" {
+			a.log.Warn("md5->scram re-hash skipped (no credential)", "user", u.name)
+			ok = false
+			continue
+		}
 		// Connect as the superuser over the local socket (pg_hba `local all all trust`).
 		if err := pg.RehashMd5User(ctx, pg.OSExec{}, a.cfg.PostgresUser, a.cfg.PostgresDB, u.name, u.pass); err != nil {
 			a.log.Warn("md5->scram re-hash failed (retries next primary tick)", "user", u.name, "err", err)
