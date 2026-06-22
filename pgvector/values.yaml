@@ -580,6 +580,12 @@ pgbackrest:
     #           EC2 instance profile); no existingSecret -- annotate the pod SA via
     #           postgresql.serviceAccount.annotations instead.
     keyType: shared
+    # Addressing + TLS for S3-compatible stores that are not AWS (MinIO, Ceph RGW,
+    # on-prem gateways). Defaults match AWS, so these render nothing for AWS users.
+    #   uriStyle: host (AWS virtual-host style, default) | path (most other stores).
+    #   verifyTls: false to accept a self-signed / internal-CA endpoint.
+    uriStyle: host
+    verifyTls: true
 
   existingSecret:
     name: ""

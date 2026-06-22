@@ -1,5 +1,28 @@
 # pgvector chart changelog
 
+## 1.2.1 - 2026-06-22
+
+Chart-only bug fixes from a full-chart review. No image change (`trixie-5.5.0-25`);
+no rendered change at defaults. Shares pg's templates; see the pg CHANGELOG for detail.
+
+### Fixed
+
+- **pgBackRest silently disabled S3 TLS verification (pgvector-specific).** `values.yaml`
+  was missing `pgbackrest.s3.uriStyle` and `pgbackrest.s3.verifyTls`, which the shared
+  template dereferences. With pgBackRest + S3 enabled, pgvector rendered
+  `repo1-storage-verify-tls=n` (cert verification off) and an empty `repo1-s3-uri-style=`.
+  Added both keys (`uriStyle: host`, `verifyTls: true`) to match pg.
+- **NetworkPolicy never matched the metrics exporter** (shared template; selected
+  `prometheus-exporter` instead of the pods' `postgres-exporter` label). Fixed.
+- **`helm install/upgrade` failed under NetworkPolicy with the monitoring user enabled**
+  (the `monitoring-user` hook Job was not admitted to PostgreSQL). Fixed.
+
+### Added
+
+- **`values.schema.json` enum guards** for `prometheusExporter.sslmode`,
+  `pgpool.tls.backendSslmode`, `pgbackrest.s3.uriStyle`, and
+  `pgbackrest.repoEncryption.cipherType`.
+
 ## 1.2.0 - 2026-06-21
 
 Optional client-connection TLS for PostgreSQL, PGPool, and the metrics exporter (#110),

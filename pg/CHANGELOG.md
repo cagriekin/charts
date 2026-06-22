@@ -1,5 +1,32 @@
 # pg chart changelog
 
+## 1.2.1 - 2026-06-22
+
+Chart-only bug fixes from a full-chart review. No image change (`trixie-5.5.0-25`);
+no rendered change at defaults.
+
+### Fixed
+
+- **NetworkPolicy never matched the metrics exporter.** The exporter NetworkPolicy and
+  the postgresql ingress allow-from rule selected `app.kubernetes.io/component:
+  prometheus-exporter`, but the exporter pods are labeled `postgres-exporter`. Under a
+  default-deny CNI the policy attached to zero pods, so the exporter got no egress (DNS,
+  5432) and was not admitted to PostgreSQL — metrics silently broke whenever
+  `networkPolicy.enabled` and `prometheusExporter.enabled` were both true. The policy is
+  now named `<fullname>-postgres-exporter` and selects the correct label.
+- **`helm install/upgrade` failed under NetworkPolicy when the monitoring user was
+  enabled.** The postgresql NetworkPolicy ingress did not admit the `monitoring-user`
+  post-install/upgrade hook Job, so its connection to 5432 was dropped on a default-deny
+  CNI and the hook failed the release. Added a `monitoring-user` ingress allow-from rule
+  (gated on `prometheusExporter.monitoringUser.enabled`).
+
+### Added
+
+- **`values.schema.json` enum guards** for `prometheusExporter.sslmode`,
+  `pgpool.tls.backendSslmode`, `pgbackrest.s3.uriStyle`, and
+  `pgbackrest.repoEncryption.cipherType` — a typo in these now fails install-time
+  validation instead of misconfiguring the exporter/pgpool/backup at pod runtime.
+
 ## 1.2.0 - 2026-06-21
 
 Optional client-connection TLS for PostgreSQL, PGPool, and the metrics exporter (#110),

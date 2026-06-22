@@ -35,6 +35,29 @@
         }
       }
     },
+    "pgpool": {
+      "type": "object",
+      "properties": {
+        "tls": {
+          "type": "object",
+          "properties": {
+            "backendSslmode": {
+              "enum": ["disable", "prefer", "require", "verify-ca", "verify-full"],
+              "description": "libpq sslmode for pgpool -> postgres backend connections. Must be >= require when postgresql.tls.require is true."
+            }
+          }
+        }
+      }
+    },
+    "prometheusExporter": {
+      "type": "object",
+      "properties": {
+        "sslmode": {
+          "enum": ["disable", "require", "verify-ca", "verify-full"],
+          "description": "libpq sslmode for the exporter -> postgres connection. Must be >= require when postgresql.tls.require is true."
+        }
+      }
+    },
     "pgbackrest": {
       "type": "object",
       "properties": {
@@ -44,6 +67,19 @@
             "keyType": {
               "enum": ["shared", "auto"],
               "description": "shared = static keys from existingSecret; auto = cloud workload identity / instance credential chain."
+            },
+            "uriStyle": {
+              "enum": ["host", "path"],
+              "description": "S3 addressing: host (AWS virtual-host style, default) or path (most non-AWS stores)."
+            }
+          }
+        },
+        "repoEncryption": {
+          "type": "object",
+          "properties": {
+            "cipherType": {
+              "enum": ["aes-256-cbc", "none"],
+              "description": "pgBackRest repo1-cipher-type when repoEncryption.enabled."
             }
           }
         }
