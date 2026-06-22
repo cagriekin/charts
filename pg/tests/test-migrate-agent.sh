@@ -124,10 +124,24 @@ if [[ -n "${PRIMARY}" && -n "${STANDBY}" ]]; then
   done
   assert_eq "post-migration agent failover promotes the standby" "true" "${promoted}"
 
-  # #199: the agent re-hashes md5 managed users to scram on promotion/boot-primary, so
-  # after the migration + failover the managed users are SCRAM-stored (converged), not md5.
+  # #199: the agent re-hashes md5 managed users to scram once a node STABLY becomes
+  # primary (~1s after promotion). A 2-node failover can first surface a transient
+  # read-write window during the rejoin/timeline-divergence dance, then settle on the
+  # real primary after a re-promote -- so poll the current LEASE HOLDER (the agent's
+  # authoritative primary) for convergence with a generous window, not the pod that
+  # first reported not-in-recovery.
   if [[ "${promoted}" == "true" ]]; then
-    scram=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT rolpassword LIKE 'scram%' FROM pg_authid WHERE rolname='testuser'" "testuser" "testdb" 2>/dev/null || echo "")
+    scram=""; sc=0
+    while [[ ${sc} -lt 150 ]]; do
+      HP=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || echo "")
+      if [[ -n "${HP}" ]]; then
+        # rolpassword for a SCRAM secret starts with the literal "SCRAM-SHA-256$" (uppercase);
+        # LIKE is case-sensitive, so match 'SCRAM%', not 'scram%'.
+        scram=$(pg_exec "${NAMESPACE}" "${HP}" "SELECT rolpassword LIKE 'SCRAM%' FROM pg_authid WHERE rolname='testuser'" "testuser" "testdb" 2>/dev/null || echo "")
+        [[ "${scram}" == "t" ]] && break
+      fi
+      sleep 5; sc=$((sc + 5))
+    done
     assert_eq "#199: managed users re-hashed to scram after promotion" "t" "${scram}"
   fi
 else
