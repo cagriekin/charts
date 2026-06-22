@@ -2412,6 +2412,8 @@ schema_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.tls.backendSslmod
 assert_gt "H8: bogus pgpool.tls.backendSslmode rejected by schema" "${schema_rc}" "0"
 schema_rc=0; helm template test-pg "${CHART_DIR}" --set pgbackrest.s3.uriStyle=virtual >/dev/null 2>&1 || schema_rc=$?
 assert_gt "H8: bogus pgbackrest.s3.uriStyle rejected by schema" "${schema_rc}" "0"
+schema_rc=0; helm template test-pg "${CHART_DIR}" --set pgbackrest.repoEncryption.cipherType=bogus >/dev/null 2>&1 || schema_rc=$?
+assert_gt "H8: bogus pgbackrest.repoEncryption.cipherType rejected by schema" "${schema_rc}" "0"
 
 # --- low-priority review fixes (1.2.1) ---
 # K8S-6: the agent ServiceMonitor selector is scoped to the postgresql component so it
@@ -2431,6 +2433,7 @@ bk_waiver=$(helm template test-pg "${CHART_DIR}" --set backup.enabled=true \
   --set backup.existingSecret.name=s --set backup.s3.endpoint=https://m --set backup.s3.bucket=b \
   --show-only templates/backup-cronjob.yaml 2>&1)
 assert_contains "K8S-5: backup CronJob has no-liveness-probe waiver" "${bk_waiver}" "ignore-check.kube-linter.io/no-liveness-probe"
+assert_contains "K8S-5: backup CronJob has no-readiness-probe waiver" "${bk_waiver}" "ignore-check.kube-linter.io/no-readiness-probe"
 
 # --- #128: global.annotations render as metadata.annotations, not labels ---
 # global.annotations used to be spliced into pg.labels and rendered under
