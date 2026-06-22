@@ -446,6 +446,10 @@ spec:
               value: {{ .Values.prometheusExporter.monitoringUser.username | quote }}
 {{- end }}
 {{- end }}
+            {{- /* The agent runs the md5->scram managed-user re-hash on promotion/boot-primary
+                   (#199); POSTGRES_PASSWORD/POSTGRES_DB are already on the container env above. */}}
+            - name: MIGRATE_LEGACY_MD5_USERS
+              value: {{ .Values.postgresql.migrateLegacyMd5Users | quote }}
             - name: DCS_BACKEND
               value: {{ (.Values.repmgr.agent.dcs).backend | default "kubernetes" | quote }}
 {{- if eq (include "pg.agentEtcdMode" .) "true" }}
@@ -564,6 +568,13 @@ spec:
                           echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
                         fi
                         {{- end }}
+                        {{- /* md5/SCRAM pg_hba compat + the md5->scram re-hash + user pgHba are
+                               authored by the agent in agent mode (single author, #199): the agent
+                               writes the md5-first compat pg_hba on every node and re-hashes managed
+                               users on promotion/boot-primary. These postStart patches therefore run
+                               only in repmgrd mode, where the image writes the legacy pg_hba and no
+                               agent owns the file. */}}
+                        {{- if eq (include "pg.repmgrdMode" .) "true" }}
                         # PG18 + repmgr MD5/SCRAM auth deadlock fix: the cagriekin/repmgr image
                         # entrypoint creates managed users (pgvector, repmgr) with MD5-hashed
                         # passwords while only writing `scram-sha-256` rules into pg_hba.conf,
@@ -675,6 +686,7 @@ spec:
                           cp "$HBA_USER_TMP" "$HBA_FILE_USER"
                           rm -f "$HBA_USER_TMP"
                         fi
+                        {{- end }}
                         {{- end }}
                         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}

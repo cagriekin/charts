@@ -48,6 +48,17 @@ type Config struct {
 	PostgresUser      string // POSTGRES_USER: superuser, exempt from clientcert
 	MonitoringUser    string // MONITORING_USER: monitoring user, exempt; "" when disabled
 
+	// md5->scram managed-user re-hash on promotion/boot-primary (#199). When
+	// MigrateLegacyMd5Users is set the agent re-hashes any managed user whose stored
+	// password is still md5 to scram-sha-256 via local psql; it needs the plaintext
+	// superuser/repmgr passwords to ALTER ... PASSWORD. All optional -- absent means
+	// the re-hash is skipped (md5 hashes keep authenticating via the md5 pg_hba line).
+	// The passwords are already on the postgresql container env, so no new secret is
+	// exposed; only the boolean flag env is new.
+	MigrateLegacyMd5Users bool   // MIGRATE_LEGACY_MD5_USERS
+	PostgresPassword      string // POSTGRES_PASSWORD (superuser, for the re-hash)
+	PostgresDB            string // POSTGRES_DB (psql -d target for the re-hash)
+
 	// Cascading replication (issue #29). Optional; default off (every standby follows
 	// the primary, byte-stable). When on, a standby may follow another standby to
 	// offload the primary's WAL senders, with a safe fallback to the primary.
@@ -152,6 +163,13 @@ func Load(get func(string) string) (*Config, error) {
 	c.TLSClientCertAuth = boolEnv(get("TLS_CLIENT_CERT_AUTH"))
 	c.PostgresUser = strings.TrimSpace(get("POSTGRES_USER"))
 	c.MonitoringUser = strings.TrimSpace(get("MONITORING_USER"))
+
+	// md5->scram re-hash inputs (#199). Optional -- the agent runs the re-hash on
+	// promotion/boot-primary when enabled; the passwords are already on the postgresql
+	// container env (the chart's postStart used them), so no new secret is exposed.
+	c.MigrateLegacyMd5Users = boolEnv(get("MIGRATE_LEGACY_MD5_USERS"))
+	c.PostgresPassword = get("POSTGRES_PASSWORD")
+	c.PostgresDB = strings.TrimSpace(get("POSTGRES_DB"))
 
 	// Cascading replication (issue #29). Optional -- absent/empty means off.
 	c.CascadeReplication = boolEnv(get("CASCADE_REPLICATION"))

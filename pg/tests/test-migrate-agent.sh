@@ -48,7 +48,7 @@ kubectl delete statefulset "${FULLNAME}" -n "${NAMESPACE}" --cascade=orphan
 # A real 1.0.0 migration also bumps the repmgr image to an agent-capable tag (the
 # pre-agent image has no `agent` entrypoint arm). values-repmgr.yaml installs the
 # released image; bump it to the agent-capable tag as part of the failoverMode flip.
-AGENT_IMAGE_TAG="${AGENT_IMAGE_TAG:-trixie-5.5.0-25}"
+AGENT_IMAGE_TAG="${AGENT_IMAGE_TAG:-trixie-5.5.0-26}"
 helm upgrade "${RELEASE}" "${CHART_DIR}" \
   -n "${NAMESPACE}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --set repmgr.failoverMode=agent --set "repmgr.image.tag=${AGENT_IMAGE_TAG}" --wait --timeout 10m
@@ -97,6 +97,23 @@ if [[ -n "${PRIMARY}" && -n "${STANDBY}" ]]; then
   done
   assert_eq "#181: migrated standby is actively streaming" "streaming" "${mstream}"
 
+  # #199 regression: the rejoined STANDBY must carry the md5-first pg_hba the agent
+  # authors on every node. It formerly ended up SCRAM-only (the agent's boot write won
+  # the race against the chart's postStart md5-fallback), which broke md5-password TCP
+  # auth into the standby -- exporter pg_up=0, pgpool -readonly backend auth failure,
+  # and a failover lockout if such a standby were promoted.
+  standby_hba=$(kubectl exec -n "${NAMESPACE}" "${STANDBY}" -c postgresql -- bash -lc 'cat "$PGDATA"/pg_hba.conf' 2>/dev/null || echo "")
+  assert_contains "#199: standby pg_hba is agent-authored" "${standby_hba}" "Managed by pg-ha-agent"
+  md5hosts=$(printf '%s\n' "${standby_hba}" | grep -cE '^host[[:space:]].*[[:space:]]md5[[:space:]]*$' || true)
+  assert_gt "#199: standby pg_hba carries md5 fallback host rules (not SCRAM-only)" "${md5hosts}" "0"
+  # End-to-end: a managed user authenticates over TCP to the standby (the exact path that
+  # failed in #199). Connect from the primary pod to the standby's headless FQDN.
+  PGPASS=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.data.password}' | base64 -d)
+  std_auth=$(kubectl exec -n "${NAMESPACE}" "${PRIMARY}" -c postgresql -- \
+    env PGPASSWORD="${PGPASS}" psql -h "${STANDBY}.${FULLNAME}-headless.${NAMESPACE}.svc.cluster.local" \
+    -U testuser -d testdb -tAc "SELECT 1" 2>/dev/null || echo "")
+  assert_eq "#199: managed user authenticates over TCP to the standby" "1" "${std_auth}"
+
   echo "  Post-migration failover: deleting primary ${PRIMARY}..."
   kubectl delete pod "${PRIMARY}" -n "${NAMESPACE}" --grace-period=30 --wait=false 2>/dev/null || true
   promoted=false; e=0
@@ -106,10 +123,21 @@ if [[ -n "${PRIMARY}" && -n "${STANDBY}" ]]; then
     sleep 5; e=$((e + 5))
   done
   assert_eq "post-migration agent failover promotes the standby" "true" "${promoted}"
+
+  # #199: the agent re-hashes md5 managed users to scram on promotion/boot-primary, so
+  # after the migration + failover the managed users are SCRAM-stored (converged), not md5.
+  if [[ "${promoted}" == "true" ]]; then
+    scram=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT rolpassword LIKE 'scram%' FROM pg_authid WHERE rolname='testuser'" "testuser" "testdb" 2>/dev/null || echo "")
+    assert_eq "#199: managed users re-hashed to scram after promotion" "t" "${scram}"
+  fi
 else
   skip "after: lease holder is the primary (migration did not settle)"
   skip "data survives the repmgrd->agent migration (migration did not settle)"
+  skip "#199: standby pg_hba is agent-authored (migration did not settle)"
+  skip "#199: standby pg_hba carries md5 fallback host rules (migration did not settle)"
+  skip "#199: managed user authenticates over TCP to the standby (migration did not settle)"
   skip "post-migration agent failover promotes the standby (migration did not settle)"
+  skip "#199: managed users re-hashed to scram after promotion (migration did not settle)"
 fi
 
 end_suite

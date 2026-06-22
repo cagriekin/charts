@@ -191,7 +191,7 @@ kubectl create secret generic postgresql-tls -n "${NS2}" \
 helm upgrade --install "${RELEASE2}" "${CHART_DIR}" -n "${NS2}" \
   -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.failoverMode=repmgrd \
-  --set repmgr.image.tag=trixie-5.5.0-25 \
+  --set repmgr.image.tag=trixie-5.5.0-26 \
   --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=postgresql-tls \
   --wait --timeout 10m
 wait_for_pods_ready "${NS2}" "app.kubernetes.io/component=postgresql" 2 600

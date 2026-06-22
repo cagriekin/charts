@@ -143,6 +143,12 @@ type agent struct {
 	// each tick from the observed role, and synchronously on promote (to close the
 	// window before the next tick); fail-safe is to demote on uncertainty.
 	servingRW atomic.Bool
+
+	// rehashedManagedUsers latches once the md5->scram managed-user re-hash has
+	// succeeded on this node as primary (#199). It runs once per process on the first
+	// RW path (Promote or boot-as-primary StayPrimary) -- not every tick -- and only
+	// flips true on success, so a transient failure retries the next primary tick.
+	rehashedManagedUsers atomic.Bool
 }
 
 // newDCS builds the leadership backend selected by DCS_BACKEND (validated to
@@ -304,13 +310,14 @@ func (a *agent) boot(ctx context.Context) error {
 		return nil
 	}
 	// Harden pg_hba: overwrite the image's initdb default -- which carries the legacy
-	// 0.0.0.0/0 md5 catch-alls -- with a SCRAM-only base trusting only loopback + the
-	// pod CIDR (no external access), before any start. This is the agent-mode-only
-	// hardening (security review C1: external md5 is the SUPERUSER-exposure risk);
-	// repmgrd mode keeps the legacy base. The chart's md5-compat postStart still runs
-	// (both modes) to layer the md5->scram user re-hash + a pod-CIDR md5 fallback for
-	// the image's md5-created users, so this base composes with it rather than
-	// replacing it. Written every boot (idempotent); a clone inherits the source's.
+	// 0.0.0.0/0 md5 catch-alls -- with a base trusting only loopback + the pod CIDR
+	// (no external access), before any start (security review C1: external md5 is the
+	// SUPERUSER-exposure risk; repmgrd mode keeps the legacy base). The agent is the
+	// SINGLE author of pg_hba in agent mode: it writes the md5-first compat form
+	// directly (md5 above each scram rule on the pod CIDR), so every node -- primary
+	// and standby -- is byte-identical. This replaces the chart's former postStart
+	// md5-fallback awk, which raced this write and left rejoined standbys SCRAM-only
+	// (#199). Written every boot (idempotent); a clone/rejoin inherits the source's.
 	if err := a.writePgHba(); err != nil {
 		return err
 	}
@@ -524,7 +531,13 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if tl, _, ok, _ := a.prober.PrimaryWALPosition(wctx, a.selfConn()); ok {
 			a.advanceMarker(wctx, tl, true, obs.Marker)
 		}
-		return a.assertPrimaryRouting(wctx, obs)
+		if err := a.assertPrimaryRouting(wctx, obs); err != nil {
+			return err
+		}
+		// Converge md5 managed users to scram now that this node is primary (#199);
+		// bounded by the fence budget (wctx) so it cannot starve a lost-leadership fence.
+		a.rehashManagedUsersOnce(wctx)
+		return nil
 
 	case reconcile.StayPrimary:
 		// Register this primary in repmgr.nodes. In agent mode there is no repmgrd
@@ -550,7 +563,12 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
-		return a.assertPrimaryRouting(wctx, obs)
+		if err := a.assertPrimaryRouting(wctx, obs); err != nil {
+			return err
+		}
+		// Boot-as-primary convergence of md5 managed users to scram (#199); see Promote.
+		a.rehashManagedUsersOnce(wctx)
+		return nil
 
 	case reconcile.Follow:
 		// Ensure this standby has a repmgr.nodes record. In agent mode no repmgrd
@@ -760,10 +778,45 @@ func (a *agent) writePgpass() error {
 	return nil
 }
 
-// writePgHba assembles and writes the hardened, SCRAM-only pg_hba.conf the agent
-// owns in agent mode (loopback + the pod CIDR over SCRAM, no legacy 0.0.0.0/0 md5;
-// user POSTGRESQL_PGHBA rules inserted above the network catch-alls, #144). It
-// replaces the image's initdb default so external md5 access never opens.
+// rehashManagedUsersOnce migrates the managed users (POSTGRES_USER, REPMGR_USER) from
+// md5 to scram-sha-256 once this node is serving read-write, when migrateLegacyMd5Users
+// is enabled. It replaces the chart's former postStart re-hash, which never ran on an
+// in-process failover promotion (no container restart), so a promoted primary's md5
+// users never converged (#199). Runs at most once per process, latching only on
+// success so a transient failure retries the next primary tick. The caller passes its
+// fence-budget context, so a hung psql cannot hold opMu past the soft-fence window.
+// Best-effort: the md5 pg_hba line keeps md5 users authenticating regardless.
+func (a *agent) rehashManagedUsersOnce(ctx context.Context) {
+	if !a.cfg.MigrateLegacyMd5Users || a.rehashedManagedUsers.Load() {
+		return
+	}
+	users := []struct{ name, pass string }{
+		{a.cfg.PostgresUser, a.cfg.PostgresPassword},
+		{a.cfg.RepmgrUser, a.cfg.RepmgrPassword},
+	}
+	ok := true
+	for _, u := range users {
+		// Connect as the superuser over the local socket (pg_hba `local all all trust`).
+		if err := pg.RehashMd5User(ctx, pg.OSExec{}, a.cfg.PostgresUser, a.cfg.PostgresDB, u.name, u.pass); err != nil {
+			a.log.Warn("md5->scram re-hash failed (retries next primary tick)", "user", u.name, "err", err)
+			ok = false
+		}
+	}
+	if ok {
+		a.rehashedManagedUsers.Store(true)
+		a.log.Info("md5->scram managed-user re-hash converged")
+	}
+}
+
+// writePgHba assembles and writes the pg_hba.conf the agent owns in agent mode
+// (loopback + the pod CIDR, no legacy 0.0.0.0/0 md5; user POSTGRESQL_PGHBA rules
+// inserted above the network catch-alls, #144). It replaces the image's initdb
+// default so external md5 access never opens. MD5Fallback is always on: it lays an
+// md5 line above each scram rule so md5-stored managed-user passwords still
+// authenticate -- the agent is the single author on every node, replacing the
+// chart's former postStart md5-fallback awk that raced and left standbys SCRAM-only
+// (#199). md5 transparently authenticates SCRAM-stored passwords too, so this is
+// compat, not a downgrade, and the pod CIDR is trusted.
 func (a *agent) writePgHba() error {
 	content := pgconf.AssemblePgHba(pgconf.PgHbaOptions{
 		ReplicationUser: a.cfg.RepmgrUser,
@@ -773,6 +826,7 @@ func (a *agent) writePgHba() error {
 		ClientCertAuth:  a.cfg.TLSClientCertAuth,
 		PostgresUser:    a.cfg.PostgresUser,
 		MonitoringUser:  a.cfg.MonitoringUser,
+		MD5Fallback:     true,
 	})
 	return pgconf.WritePgHba(filepath.Join(a.cfg.PGDATA, "pg_hba.conf"), content)
 }
