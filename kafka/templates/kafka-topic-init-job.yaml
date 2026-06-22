@@ -11,6 +11,10 @@ metadata:
     argocd.argoproj.io/hook: PostSync
     argocd.argoproj.io/hook-delete-policy: HookSucceeded,BeforeHookCreation
     argocd.argoproj.io/sync-options: Replace=true
+    # One-shot Job: liveness/readiness probes are not applicable (the container runs
+    # to completion). Resources are still set; only the probe policy checks are waived.
+    ignore-check.kube-linter.io/no-liveness-probe: "one-shot topic-init job"
+    ignore-check.kube-linter.io/no-readiness-probe: "one-shot topic-init job"
   labels:
     app.kubernetes.io/name: {{ include "kafka.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
@@ -36,6 +40,13 @@ spec:
       containers:
       - name: kafka-topic-init
         image: {{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
         volumeMounts:
         - name: kafka-config
           mountPath: /opt/kafka/config/kraft

@@ -1,0 +1,103 @@
+suite: full values rendering
+templates:
+  - templates/kafka-controller-deployment.yaml
+  - templates/kafka-broker-deployment.yaml
+  - templates/kafka-exporter-deployment.yaml
+  - templates/kafka-exporter-service.yaml
+  - templates/kafka-topic-init-job.yaml
+  - templates/kafka-topics-configmap.yaml
+  - templates/kafka-controller-service.yaml
+  - templates/kafka-broker-service.yaml
+  - templates/kafka-configmap.yaml
+  - templates/serviceaccount.yaml
+release:
+  name: test-kafka
+values:
+  - ../values-full-test.yaml
+tests:
+  - it: controller statefulset present
+    template: templates/kafka-controller-deployment.yaml
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - equal:
+          path: metadata.name
+          value: test-kafka-kafka-controller
+
+  - it: broker statefulset present with replicas 2
+    template: templates/kafka-broker-deployment.yaml
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - equal:
+          path: metadata.name
+          value: test-kafka-kafka-broker
+      - equal:
+          path: spec.replicas
+          value: 2
+
+  - it: exporter deployment present
+    template: templates/kafka-exporter-deployment.yaml
+    asserts:
+      - isKind:
+          of: Deployment
+      - equal:
+          path: metadata.name
+          value: test-kafka-kafka-exporter
+
+  - it: exporter service exposes port 9308
+    template: templates/kafka-exporter-service.yaml
+    asserts:
+      - isKind:
+          of: Service
+      - equal:
+          path: spec.ports[0].port
+          value: 9308
+
+  - it: topic init job present
+    template: templates/kafka-topic-init-job.yaml
+    documentIndex: 0
+    asserts:
+      - isKind:
+          of: Job
+      - matchRegex:
+          path: metadata.name
+          pattern: ^test-kafka-kafka-topic-init-
+
+  - it: topics configmap present
+    template: templates/kafka-topics-configmap.yaml
+    documentIndex: 0
+    asserts:
+      - isKind:
+          of: ConfigMap
+      - equal:
+          path: metadata.name
+          value: test-kafka-kafka-topics
+
+  - it: controller service exposes port 9093
+    template: templates/kafka-controller-service.yaml
+    asserts:
+      - equal:
+          path: spec.ports[0].port
+          value: 9093
+
+  - it: broker service exposes port 9092
+    template: templates/kafka-broker-service.yaml
+    asserts:
+      - equal:
+          path: spec.ports[0].port
+          value: 9092
+
+  - it: broker config uses SASL_PLAINTEXT when TLS disabled
+    template: templates/kafka-configmap.yaml
+    documentIndex: 1
+    asserts:
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: SASL_PLAINTEXT
+
+  - it: serviceaccount created
+    template: templates/serviceaccount.yaml
+    asserts:
+      - isKind:
+          of: ServiceAccount

@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "kafka chart values (enum guards)",
+  "description": "Partial schema: constrains the values whose typos silently misconfigure Kafka. additionalProperties stays open so the rest of values.yaml is unconstrained.",
+  "type": "object",
+  "properties": {
+    "kafka": {
+      "type": "object",
+      "properties": {
+        "image": {
+          "type": "object",
+          "properties": {
+            "pullPolicy": {
+              "enum": ["Always", "IfNotPresent", "Never"]
+            }
+          }
+        },
+        "tls": {
+          "type": "object",
+          "properties": {
+            "certManager": {
+              "type": "object",
+              "properties": {
+                "issuerRef": {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "enum": ["Issuer", "ClusterIssuer"]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "broker": {
+          "type": "object",
+          "properties": {
+            "config": {
+              "type": "object",
+              "properties": {
+                "logCleanupPolicy": {
+                  "enum": ["delete", "compact", "compact,delete", "delete,compact"]
+                }
+              }
+            }
+          }
+        },
+        "auth": {
+          "type": "object",
+          "properties": {
+            "sasl": {
+              "type": "object",
+              "properties": {
+                "mechanism": {
+                  "enum": ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"]
+                },
+                "securityProtocol": {
+                  "enum": ["PLAINTEXT", "SASL_PLAINTEXT", "SASL_SSL", "SSL"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "exporters": {
+      "type": "object",
+      "properties": {
+        "kafka": {
+          "type": "object",
+          "properties": {
+            "image": {
+              "type": "object",
+              "properties": {
+                "pullPolicy": {
+                  "enum": ["Always", "IfNotPresent", "Never"]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

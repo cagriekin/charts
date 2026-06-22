@@ -1,0 +1,138 @@
+suite: TLS configuration
+release:
+  name: test-kafka
+  namespace: default
+tests:
+  # --- TLS with cert-manager ---
+  - it: certificate resource created with cert-manager
+    template: templates/kafka-certificate.yaml
+    set:
+      kafka.tls.enabled: true
+      kafka.tls.certManager.issuerRef.name: my-issuer
+    asserts:
+      - isKind:
+          of: Certificate
+      - equal:
+          path: spec.issuerRef.name
+          value: my-issuer
+      - contains:
+          path: spec.dnsNames
+          content: "*.test-kafka-kafka-controller.default.svc.cluster.local"
+      - contains:
+          path: spec.dnsNames
+          content: "*.test-kafka-kafka-broker.default.svc.cluster.local"
+
+  - it: broker config uses SASL_SSL and PKCS12 stores with TLS
+    template: templates/kafka-configmap.yaml
+    documentIndex: 1
+    set:
+      kafka.tls.enabled: true
+      kafka.tls.certManager.issuerRef.name: my-issuer
+    asserts:
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: SASL_SSL
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: ssl\.keystore\.type=PKCS12
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: ssl\.truststore\.type=PKCS12
+
+  - it: controller config uses CONTROLLER SSL with TLS
+    template: templates/kafka-configmap.yaml
+    documentIndex: 0
+    set:
+      kafka.tls.enabled: true
+      kafka.tls.certManager.issuerRef.name: my-issuer
+    asserts:
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: listener\.security\.protocol\.map=CONTROLLER:SSL
+
+  - it: controller config has no SASL_PLAINTEXT with TLS
+    template: templates/kafka-configmap.yaml
+    documentIndex: 1
+    set:
+      kafka.tls.enabled: true
+      kafka.tls.certManager.issuerRef.name: my-issuer
+    asserts:
+      - notMatchRegex:
+          path: data["server.properties"]
+          pattern: SASL_PLAINTEXT
+
+  - it: controller statefulset has tls-init container and tls-pem volume
+    template: templates/kafka-controller-deployment.yaml
+    set:
+      kafka.tls.enabled: true
+      kafka.tls.certManager.issuerRef.name: my-issuer
+    asserts:
+      - contains:
+          path: spec.template.spec.initContainers
+          content:
+            name: tls-init
+          any: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: kafka-tls-pem
+            secret:
+              secretName: test-kafka-kafka-tls
+          any: true
+
+  - it: exporter command has tls flags with TLS
+    template: templates/kafka-exporter-deployment.yaml
+    set:
+      kafka.tls.enabled: true
+      kafka.tls.certManager.issuerRef.name: my-issuer
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: --tls\.enabled
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: --tls\.ca-file
+
+  # --- TLS with existing secret (no cert-manager Certificate) ---
+  - it: no certificate resource with existing secret
+    template: templates/kafka-certificate.yaml
+    set:
+      kafka.tls.enabled: true
+      kafka.tls.existingSecret: my-tls-secret
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: broker volumes reference existing tls secret
+    template: templates/kafka-broker-deployment.yaml
+    set:
+      kafka.tls.enabled: true
+      kafka.tls.existingSecret: my-tls-secret
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: kafka-tls-pem
+            secret:
+              secretName: my-tls-secret
+          any: true
+
+  - it: broker config uses SASL_SSL with existing secret
+    template: templates/kafka-configmap.yaml
+    documentIndex: 1
+    set:
+      kafka.tls.enabled: true
+      kafka.tls.existingSecret: my-tls-secret
+    asserts:
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: SASL_SSL
+
+  # --- TLS fail-fast: enabled without secret or issuer ---
+  - it: template fails when TLS enabled without secret or issuer
+    template: templates/kafka-certificate.yaml
+    set:
+      kafka.tls.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: kafka.tls.enabled requires either kafka.tls.existingSecret or kafka.tls.certManager.issuerRef.name to be set

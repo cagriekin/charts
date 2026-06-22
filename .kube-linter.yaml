@@ -1,0 +1,14 @@
+# Policy-as-code gate for the CLAUDE.md Helm standards (#193). Runs ONLY the checks
+# that map to mandatory standards, not kube-linter's broader default opinions, so the
+# gate enforces our documented rules without imposing unrelated chart churn:
+#   - resource requests/limits  -> unset-cpu-requirements, unset-memory-requirements
+#   - liveness and readiness probes -> no-liveness-probe, no-readiness-probe
+# Legitimate exceptions (one-shot Jobs, root volume-chown init containers) are waived
+# at the object with an `ignore-check.kube-linter.io/<check>` annotation, not here.
+checks:
+  doNotAutoAddDefaults: true
+  include:
+    - unset-cpu-requirements
+    - unset-memory-requirements
+    - no-liveness-probe
+    - no-readiness-probe

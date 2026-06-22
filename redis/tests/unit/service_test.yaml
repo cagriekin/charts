@@ -1,0 +1,36 @@
+suite: service
+tests:
+  - it: minimal - redis service exists with port 6379
+    template: templates/service.yaml
+    values:
+      - ../values-minimal.yaml
+    asserts:
+      - isKind:
+          of: Service
+      - equal:
+          path: spec.ports[0].port
+          value: 6379
+
+  - it: minimal - no exporter service when exporter disabled
+    template: templates/exporter-service.yaml
+    values:
+      - ../values-minimal.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: full - exporter service present on port 9121
+    template: templates/exporter-service.yaml
+    release:
+      name: test-redis
+    values:
+      - ../values-full-test.yaml
+    asserts:
+      - isKind:
+          of: Service
+      - equal:
+          path: metadata.name
+          value: test-redis-exporter
+      - equal:
+          path: spec.ports[0].port
+          value: 9121

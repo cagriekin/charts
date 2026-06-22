@@ -1,0 +1,63 @@
+suite: networkpolicy
+templates:
+  - templates/networkpolicy.yaml
+tests:
+  - it: default - no NetworkPolicy rendered
+    values:
+      - ../values-minimal.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: full + enabled - redis policy on port 6379
+    template: templates/networkpolicy.yaml
+    release:
+      name: test-redis
+    documentSelector:
+      path: metadata.name
+      value: test-redis
+    values:
+      - ../values-full-test.yaml
+    set:
+      networkPolicy.enabled: true
+    asserts:
+      - isKind:
+          of: NetworkPolicy
+      - equal:
+          path: spec.ingress[0].ports[0].port
+          value: 6379
+
+  - it: full + enabled - exporter policy on port 9121
+    template: templates/networkpolicy.yaml
+    release:
+      name: test-redis
+    documentSelector:
+      path: metadata.name
+      value: test-redis-exporter
+    values:
+      - ../values-full-test.yaml
+    set:
+      networkPolicy.enabled: true
+    asserts:
+      - isKind:
+          of: NetworkPolicy
+      - equal:
+          path: spec.ingress[0].ports[0].port
+          value: 9121
+
+  - it: minimal + enabled - single policy, no exporter network policy
+    values:
+      - ../values-minimal.yaml
+    set:
+      networkPolicy.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - notContains:
+          path: spec.ingress[0].from
+          content:
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: redis
+                app.kubernetes.io/instance: RELEASE-NAME
+                app.kubernetes.io/component: redis-exporter

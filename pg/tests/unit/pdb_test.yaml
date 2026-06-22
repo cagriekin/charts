@@ -1,0 +1,20 @@
+suite: pg postgresql PodDisruptionBudget
+templates:
+  - templates/pdb-postgresql.yaml
+release:
+  name: test-pg
+tests:
+  # --- Scenario 6: postgresql PDB (chart defaults) ---
+  - it: postgresql PDB uses maxUnavailable 1, AlwaysAllow, no minAvailable
+    template: templates/pdb-postgresql.yaml
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+      - equal:
+          path: spec.unhealthyPodEvictionPolicy
+          value: AlwaysAllow
+      - notExists:
+          path: spec.minAvailable

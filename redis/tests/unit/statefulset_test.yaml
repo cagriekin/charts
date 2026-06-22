@@ -1,0 +1,132 @@
+suite: statefulset
+templates:
+  - templates/statefulset.yaml
+  - templates/configmap.yaml
+tests:
+  - it: minimal - statefulset has replicas 1
+    template: templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - equal:
+          path: spec.replicas
+          value: 1
+
+  - it: minimal - pod securityContext runAsNonRoot and fsGroup 999
+    template: templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      redis.podSecurityContext:
+        fsGroup: 999
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.template.spec.securityContext.fsGroup
+          value: 999
+
+  - it: default - container securityContext runAsUser 999 and allowPrivilegeEscalation false
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.runAsUser
+          value: 999
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+
+  - it: default - preStop runs SHUTDOWN SAVE
+    template: templates/statefulset.yaml
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.preStop.exec.command[2]
+          pattern: SHUTDOWN SAVE
+
+  - it: default - terminationGracePeriodSeconds 300
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 300
+
+  - it: default - no auth means no REDIS_PASSWORD env and no requirepass
+    template: templates/statefulset.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].env
+      - equal:
+          path: spec.template.spec.containers[0].command
+          value:
+            - redis-server
+            - /etc/redis/redis.conf
+
+  - it: auth enabled - REDIS_PASSWORD env from secretKeyRef
+    template: templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      redis.auth.enabled: true
+      redis.auth.existingSecret.name: my-secret
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: my-secret
+                key: redis-password
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: requirepass
+
+  - it: auth enabled - probe command uses password
+    template: templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      redis.auth.enabled: true
+      redis.auth.existingSecret.name: my-secret
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
+          pattern: REDIS_PASSWORD.*ping
+      - matchRegex:
+          path: spec.template.spec.containers[0].readinessProbe.exec.command[2]
+          pattern: REDIS_PASSWORD.*ping
+
+  - it: auth enabled - existingSecret name required, fails without it
+    template: templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      redis.auth.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: redis.auth.existingSecret.name is required when auth is enabled
+
+  - it: full - global annotations on statefulset metadata, not in labels
+    template: templates/statefulset.yaml
+    values:
+      - ../values-full-test.yaml
+    asserts:
+      - equal:
+          path: metadata.annotations.test-annotation
+          value: test-value
+      - notExists:
+          path: metadata.labels.test-annotation
+
+  - it: minimal - no global annotations block
+    template: templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    asserts:
+      - notExists:
+          path: metadata.annotations

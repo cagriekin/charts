@@ -1,0 +1,58 @@
+suite: pg client TLS on/off
+templates:
+  - templates/statefulset.yaml
+  - templates/postgresql-configmap.yaml
+release:
+  name: test-pg
+tests:
+  # --- Scenario 12 (TLS off): agent values, no client TLS ---
+  - it: TLS off renders no postgresql-configmap (so no ssl=on)
+    values:
+      - ../values-agent.yaml
+    template: templates/postgresql-configmap.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: TLS off statefulset has no postgresql-tls volume
+    values:
+      - ../values-agent.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.volumes[?(@.name=="postgresql-tls")]
+
+  # --- Scenario 12 (TLS on): existingSecret pg-tls ---
+  - it: TLS on configmap enables ssl
+    values:
+      - ../values-agent.yaml
+    set:
+      postgresql.tls.enabled: true
+      postgresql.tls.existingSecret: pg-tls
+    template: templates/postgresql-configmap.yaml
+    asserts:
+      - matchRegex:
+          path: data["tls.conf"]
+          pattern: "ssl = on"
+
+  - it: TLS on statefulset mounts and projects the tls secret
+    values:
+      - ../values-agent.yaml
+    set:
+      postgresql.tls.enabled: true
+      postgresql.tls.existingSecret: pg-tls
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].volumeMounts
+          content:
+            name: postgresql-tls
+            mountPath: /etc/postgresql/tls
+            readOnly: true
+          any: true
+      - equal:
+          path: spec.template.spec.volumes[?(@.name=="postgresql-tls")].secret.secretName
+          value: pg-tls
+      - equal:
+          path: spec.template.spec.volumes[?(@.name=="postgresql-tls")].secret.defaultMode
+          value: 256

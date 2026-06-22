@@ -1,0 +1,74 @@
+suite: minimal values rendering
+templates:
+  - templates/kafka-controller-deployment.yaml
+  - templates/kafka-broker-deployment.yaml
+  - templates/kafka-controller-service.yaml
+  - templates/kafka-broker-service.yaml
+  - templates/kafka-secret.yaml
+  - templates/kafka-configmap.yaml
+  - templates/kafka-exporter-deployment.yaml
+  - templates/kafka-topics-configmap.yaml
+release:
+  name: test-kafka
+values:
+  - ../values-minimal.yaml
+tests:
+  - it: controller statefulset is present and named
+    template: templates/kafka-controller-deployment.yaml
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - equal:
+          path: metadata.name
+          value: test-kafka-kafka-controller
+
+  - it: broker statefulset is present and named
+    template: templates/kafka-broker-deployment.yaml
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - equal:
+          path: metadata.name
+          value: test-kafka-kafka-broker
+
+  - it: controller service is present
+    template: templates/kafka-controller-service.yaml
+    asserts:
+      - isKind:
+          of: Service
+
+  - it: broker service is present
+    template: templates/kafka-broker-service.yaml
+    asserts:
+      - isKind:
+          of: Service
+
+  - it: secret is created
+    template: templates/kafka-secret.yaml
+    asserts:
+      - isKind:
+          of: Secret
+
+  - it: controller and broker configmaps are created
+    template: templates/kafka-configmap.yaml
+    asserts:
+      - isKind:
+          of: ConfigMap
+        documentIndex: 0
+      - isKind:
+          of: ConfigMap
+        documentIndex: 1
+
+  - it: no exporter deployment when exporter disabled
+    template: templates/kafka-exporter-deployment.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: no declarative topics in topics configmap
+    template: templates/kafka-topics-configmap.yaml
+    documentIndex: 0
+    asserts:
+      - notMatchRegex:
+          path: data["topics.json"]
+          pattern: test-topic
