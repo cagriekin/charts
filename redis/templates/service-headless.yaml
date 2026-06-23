@@ -1,0 +1,38 @@
+{{- if eq .Values.architecture "replication" }}
+{{- /* Headless Service: gives every redis pod a stable DNS name
+       (<fullname>-<ordinal>.<fullname>-headless.<ns>.svc.<clusterDomain>) that Redis
+       and Sentinel announce instead of their ephemeral pod IPs. publishNotReadyAddresses
+       so peers resolve during boot/resync before they are Ready. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redis.headless" . }}
+  labels:
+    {{- include "redis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+  {{- with (include "redis.globalAnnotations" . | fromYaml) }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: redis
+      port: {{ .Values.service.port }}
+      targetPort: redis
+      protocol: TCP
+    - name: sentinel
+      port: {{ .Values.sentinel.service.port }}
+      targetPort: sentinel
+      protocol: TCP
+{{- if .Values.exporter.enabled }}
+    - name: metrics
+      port: {{ .Values.exporter.service.port }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}
+  selector:
+    {{- include "redis.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+{{- end }}

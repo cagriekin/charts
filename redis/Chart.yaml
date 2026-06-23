@@ -1,9 +1,16 @@
 apiVersion: v2
 name: redis
-description: Single-instance Redis with AOF persistence
+description: Redis with AOF persistence and Sentinel-based HA replication
 type: application
-version: 0.3.9
+version: 1.0.0
 appVersion: "8"
+keywords:
+  - redis
+  - cache
+  - key-value
+  - replication
+  - sentinel
+  - high-availability
 dependencies:
   - name: common
     version: 0.1.0

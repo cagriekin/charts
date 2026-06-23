@@ -1,11 +1,26 @@
 fullnameOverride: ""
 nameOverride: ""
 
+# Deployment architecture:
+#   standalone  - single Redis instance with AOF persistence (legacy behavior)
+#   replication - Redis master + replicas with Sentinel-driven automatic failover
+# Default since 1.0.0 is "replication" (HA). See README "Migrating to 1.0.0".
+architecture: replication
+
+# Cluster DNS domain, used to build the stable per-pod FQDNs Sentinel announces.
+clusterDomain: cluster.local
+
 redis:
   image:
     repository: redis
     tag: "8.6.2-trixie"
     pullPolicy: IfNotPresent
+
+  # Number of REPLICAS, excluding the master. Total redis pods = replicaCount + 1.
+  # replication requires replicaCount >= 2 (>= 3 pods): with sidecar Sentinels,
+  # sentinel count == pod count, and 2 sentinels cannot hold quorum after one is lost.
+  replicaCount: 2
+
   persistence:
     enabled: true
     storageClass: ""
@@ -31,11 +46,34 @@ redis:
       drop:
         - ALL
 
+  # Scheduling (replication mode). When affinity is empty a default podAntiAffinity
+  # spreads redis pods across nodes (hard) and zones (soft) so a node/zone loss does
+  # not break Sentinel quorum.
+  affinity: {}
+  topologySpreadConstraints: []
+  nodeSelector: {}
+  tolerations: []
+  priorityClassName: ""
+  podAnnotations: {}
+
   auth:
-    enabled: false
+    # Secure-by-default since 1.0.0. When enabled and existingSecret.name is empty,
+    # the chart generates a random password Secret (persisted across upgrades via
+    # lookup). Set existingSecret.name to bring your own.
+    enabled: true
     existingSecret:
       name: ""
       key: redis-password
+
+  # Resources for the one-shot bootstrap init container (role discovery + config render).
+  bootstrap:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 16Mi
+      limits:
+        cpu: 100m
+        memory: 32Mi
 
   config:
     maxmemory: "200mb"
@@ -44,6 +82,13 @@ redis:
     no-appendfsync-on-rewrite: "yes"
     auto-aof-rewrite-percentage: "100"
     auto-aof-rewrite-min-size: "64mb"
+    # Write-safety (replication mode only): the master refuses writes unless at least
+    # min-replicas-to-write replicas are connected within min-replicas-max-lag seconds.
+    # Shrinks the data-loss window on failover. Must be < replicaCount + 1.
+    min-replicas-to-write: 1
+    min-replicas-max-lag: 10
+    # Replicas reject writes (only the master is writable). Keep "yes".
+    replica-read-only: "yes"
     rdbSnapshots: []
     # - seconds: 3600
     #   changes: 1
@@ -52,17 +97,88 @@ redis:
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 3
-  podDisruptionBudget:
-    enabled: false
-    minAvailable: 1
-
-  terminationGracePeriodSeconds: 300
-
   readinessProbe:
     initialDelaySeconds: 5
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 3
+  startupProbe:
+    enabled: true
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 60
+  podDisruptionBudget:
+    # On by default in replication so a node drain takes at most one pod at a time and
+    # never wedges; with 3 pods / quorum 2 this preserves Sentinel quorum.
+    enabled: true
+    maxUnavailable: 1
+    unhealthyPodEvictionPolicy: AlwaysAllow
+    # Set minAvailable to use it instead of maxUnavailable (mutually exclusive).
+    minAvailable: null
+
+  terminationGracePeriodSeconds: 300
+
+# Redis Sentinel (replication mode). Runs as a sidecar in every redis pod, so the
+# Sentinel count tracks the redis pod count. Sentinel is intrinsic to replication and
+# is ignored in standalone mode.
+sentinel:
+  # Sentinel master group name. Clients pass this to SENTINEL get-master-addr-by-name.
+  masterName: mymaster
+  # Quorum: number of Sentinels that must agree the master is down to start a failover.
+  # Empty => computed as floor((replicaCount+1)/2)+1 (a strict majority).
+  quorum: ""
+  downAfterMilliseconds: 5000
+  failoverTimeout: 60000
+  parallelSyncs: 1
+  image:
+    repository: redis
+    tag: "8.6.2-trixie"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+  containerSecurityContext:
+    runAsUser: 999
+    runAsGroup: 999
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+  service:
+    type: ClusterIP
+    port: 26379
+  auth:
+    # Sentinel requirepass + auth-pass. Empty existingSecret.name => reuse the redis
+    # auth secret/key (one password for the whole cluster).
+    existingSecret:
+      name: ""
+      key: redis-password
+  livenessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+# In-transit TLS (requires architecture=replication). When enabled, Redis and Sentinel
+# listen TLS-only on their standard ports (6379 / 26379); plaintext is disabled. The
+# existingSecret must carry tls.crt, tls.key and ca.crt, and the certificate SANs MUST
+# cover the per-pod headless FQDNs (*.<fullname>-headless.<namespace>.svc.<clusterDomain>),
+# the sentinel/read Service names, and 127.0.0.1/localhost (the in-pod probes connect to
+# localhost over TLS), because resolve-hostnames is on. See README "TLS".
+tls:
+  enabled: false
+  existingSecret: ""
+  # Mutual TLS: require clients (and peers) to present a valid client certificate.
+  clientCertAuth: false
 
 exporter:
   enabled: true
@@ -107,9 +223,11 @@ service:
   port: 6379
 
 networkPolicy:
-  enabled: false
+  # Secure-by-default since 1.0.0.
+  enabled: true
   allowExternal: true
   extraIngress: []
+  extraEgress: []
 
 global:
   annotations: {}

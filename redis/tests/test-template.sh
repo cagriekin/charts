@@ -109,7 +109,15 @@ pdb_output=$(helm template test-redis "${CHART_DIR}" \
   --set redis.podDisruptionBudget.enabled=true \
   --show-only templates/pdb.yaml 2>&1)
 assert_contains "pdb: renders when enabled" "${pdb_output}" "kind: PodDisruptionBudget"
-assert_contains "pdb: minAvailable 1" "${pdb_output}" "minAvailable: 1"
+assert_contains "pdb: maxUnavailable 1 (HA default)" "${pdb_output}" "maxUnavailable: 1"
+assert_contains "pdb: unhealthyPodEvictionPolicy" "${pdb_output}" "unhealthyPodEvictionPolicy: AlwaysAllow"
+
+pdb_minavail=$(helm template test-redis "${CHART_DIR}" \
+  --set redis.podDisruptionBudget.enabled=true \
+  --set redis.podDisruptionBudget.minAvailable=1 \
+  --set redis.podDisruptionBudget.maxUnavailable=null \
+  --show-only templates/pdb.yaml 2>&1)
+assert_contains "pdb: explicit minAvailable wins" "${pdb_minavail}" "minAvailable: 1"
 
 # --- NetworkPolicy Tests ---
 assert_not_contains "default: no NetworkPolicy" "${minimal}" "kind: NetworkPolicy"
@@ -139,6 +147,37 @@ assert_contains "promrule: renders when enabled" "${promrule}" "kind: Prometheus
 assert_contains "promrule: RedisDown alert" "${promrule}" "RedisDown"
 assert_contains "promrule: RedisMemoryHigh alert" "${promrule}" "RedisMemoryHigh"
 assert_contains "promrule: RedisAOFWriteFailure alert" "${promrule}" "RedisAOFWriteFailure"
+
+# --- Replication (Sentinel HA) ---
+lint_output=$(helm lint "${CHART_DIR}" -f "${SCRIPT_DIR}/values-replication-full.yaml" 2>&1) && lint_rc=0 || lint_rc=$?
+assert_eq "helm lint with replication-full values passes" "0" "${lint_rc}"
+
+repl=$(helm template r "${CHART_DIR}" -f "${SCRIPT_DIR}/values-replication-full.yaml" 2>&1)
+assert_contains "repl: 3 pods" "${repl}" "replicas: 3"
+assert_contains "repl: sentinel sidecar container" "${repl}" "name: sentinel"
+assert_contains "repl: bootstrap init container" "${repl}" "name: redis-bootstrap"
+assert_contains "repl: headless service" "${repl}" "r-redis-headless"
+assert_contains "repl: sentinel discovery service" "${repl}" "r-redis-sentinel"
+assert_contains "repl: tmpfs config volume" "${repl}" "medium: Memory"
+assert_contains "repl: generated secret" "${repl}" "kind: Secret"
+assert_contains "repl: sentinel monitor in bootstrap" "${repl}" "sentinel monitor"
+assert_contains "repl: split-brain alert" "${repl}" "RedisMultipleMasters"
+assert_contains "repl: writes-blocked alert" "${repl}" "RedisWritesBlocked"
+assert_contains "repl: netpol opens sentinel port 26379" "${repl}" "port: 26379"
+
+# Standalone is not affected by the replication apparatus
+std=$(helm template r "${CHART_DIR}" --set architecture=standalone --set redis.auth.enabled=false 2>&1)
+assert_not_contains "std: no sentinel container" "${std}" "name: sentinel"
+assert_not_contains "std: no headless service" "${std}" "redis-headless"
+assert_contains "std: single pod" "${std}" "replicas: 1"
+
+# --- TLS ---
+tls=$(helm template r "${CHART_DIR}" -f "${SCRIPT_DIR}/values-tls.yaml" 2>&1)
+assert_contains "tls: redis tls-port" "${tls}" "tls-port 6379"
+assert_contains "tls: replication over TLS" "${tls}" "tls-replication yes"
+assert_contains "tls: cert volume mount" "${tls}" "/etc/redis/tls"
+tls_fail=$(helm template r "${CHART_DIR}" --set tls.enabled=true 2>&1) && tls_rc=0 || tls_rc=$?
+assert_eq "tls: enabled without secret fails" "1" "${tls_rc}"
 
 end_suite
 print_summary

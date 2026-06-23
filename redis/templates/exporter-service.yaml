@@ -1,4 +1,4 @@
-{{- if .Values.exporter.enabled }}
+{{- if and .Values.exporter.enabled (eq .Values.architecture "standalone") }}
 {{- include "common.exporterService" (dict
   "ctx"             .
   "component"       "redis-exporter"

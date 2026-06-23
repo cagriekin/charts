@@ -1,4 +1,5 @@
 {{- if .Values.networkPolicy.enabled }}
+{{- $repl := eq .Values.architecture "replication" }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -16,14 +17,28 @@ spec:
     - Egress
   ingress:
     - ports:
-        - port: 6379
+        - port: {{ .Values.service.port }}
           protocol: TCP
-      from:
+{{- if $repl }}
+        - port: {{ .Values.sentinel.service.port }}
+          protocol: TCP
 {{- if .Values.exporter.enabled }}
+        - port: 9121
+          protocol: TCP
+{{- end }}
+{{- end }}
+      from:
+{{- if and .Values.exporter.enabled (not $repl) }}
         - podSelector:
             matchLabels:
               {{- include "redis.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: redis-exporter
+{{- end }}
+{{- if $repl }}
+        - podSelector:
+            matchLabels:
+              {{- include "redis.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: redis
 {{- end }}
 {{- if .Values.networkPolicy.allowExternal }}
         - podSelector: {}
@@ -37,8 +52,23 @@ spec:
           protocol: UDP
         - port: 53
           protocol: TCP
+{{- if $repl }}
+    - ports:
+        - port: {{ .Values.service.port }}
+          protocol: TCP
+        - port: {{ .Values.sentinel.service.port }}
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              {{- include "redis.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: redis
+{{- end }}
+{{- with .Values.networkPolicy.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+{{- end }}
+{{- if and .Values.exporter.enabled (not $repl) }}
 ---
-{{- if .Values.exporter.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -67,7 +97,7 @@ spec:
         - port: 53
           protocol: TCP
     - ports:
-        - port: 6379
+        - port: {{ .Values.service.port }}
           protocol: TCP
       to:
         - podSelector:

@@ -1,4 +1,6 @@
 {{- if and .Values.exporter.enabled .Values.exporter.prometheusRule.enabled }}
+{{- $scope := printf "namespace=%q, service=%q" .Release.Namespace (include "redis.headless" .) }}
+{{- $rc := int .Values.redis.replicaCount }}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -15,6 +17,64 @@ spec:
 {{- if .Values.exporter.prometheusRule.rules }}
       rules:
         {{- toYaml .Values.exporter.prometheusRule.rules | nindent 8 }}
+{{- else if eq .Values.architecture "replication" }}
+      rules:
+        - alert: RedisDown
+          expr: redis_up{ {{ $scope }} } == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "A Redis member is down"
+        - alert: RedisNoMaster
+          expr: absent(redis_instance_info{ {{ $scope }}, role="master" })
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "No Redis master present (Sentinel failover may be stuck)"
+        - alert: RedisMultipleMasters
+          expr: count(redis_instance_info{ {{ $scope }}, role="master" }) > 1
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "More than one Redis master (split-brain)"
+        - alert: RedisReplicaDown
+          expr: max(redis_connected_slaves{ {{ $scope }} }) < {{ $rc }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Fewer than {{ $rc }} replicas connected to the master"
+        - alert: RedisReplicationLinkDown
+          expr: min(redis_master_link_up{ {{ $scope }} }) == 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "A replica's link to the master is down"
+        - alert: RedisWritesBlocked
+          expr: (redis_connected_slaves{ {{ $scope }} } == 0) and on(instance) (redis_instance_info{ {{ $scope }}, role="master" })
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Master has 0 connected replicas; min-replicas-to-write is blocking writes"
+        - alert: RedisMemoryHigh
+          expr: redis_memory_used_bytes{ {{ $scope }} } / (redis_memory_max_bytes{ {{ $scope }} } > 0) * 100 > 90
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Redis memory usage above 90%"
+        - alert: RedisAOFWriteFailure
+          expr: redis_aof_last_write_status{ {{ $scope }} } == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Redis AOF last write failed"
 {{- else }}
       rules:
         - alert: RedisDown

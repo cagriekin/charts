@@ -1,0 +1,23 @@
+# Replication with full monitoring + NetworkPolicy + PDB for lint/template coverage.
+architecture: replication
+
+redis:
+  replicaCount: 2
+  persistence:
+    enabled: false
+  podDisruptionBudget:
+    enabled: true
+
+exporter:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+  prometheusRule:
+    enabled: true
+
+networkPolicy:
+  enabled: true
+
+global:
+  annotations:
+    test-annotation: test-value

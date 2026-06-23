@@ -1,3 +1,5 @@
+architecture: standalone
+
 redis:
   image:
     repository: redis

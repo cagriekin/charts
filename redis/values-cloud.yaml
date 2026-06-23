@@ -1,0 +1,27 @@
+# Cloud / multi-zone overlay for the replication architecture. Opt in with:
+#   helm install my-redis ./redis -f redis/values-cloud.yaml
+# Not for single-node / kind clusters: the hard zone spread will not schedule there.
+architecture: replication
+
+redis:
+  replicaCount: 2
+  persistence:
+    enabled: true
+    # Use a WaitForFirstConsumer StorageClass so the PV is provisioned in the zone the
+    # pod is scheduled to (avoids cross-zone attach failures).
+    storageClass: ""
+    size: 5Gi
+  podDisruptionBudget:
+    enabled: true
+  # Hard zone spread on top of the default per-node anti-affinity.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: redis
+          app.kubernetes.io/component: redis
+
+networkPolicy:
+  enabled: true
