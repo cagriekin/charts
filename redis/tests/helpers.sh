@@ -81,7 +81,8 @@ wait_for_pods_ready() {
     ready_count=$(kubectl get pods -n "${namespace}" -l "${label_selector}" \
       --field-selector=status.phase=Running \
       -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null \
-      | grep -c "True" || echo "0")
+      | grep -c "True" || true)
+    ready_count=${ready_count:-0}
 
     if [[ "${ready_count}" -ge "${expected_count}" ]]; then
       echo "  All ${expected_count} pod(s) ready (${elapsed}s elapsed)"

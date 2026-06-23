@@ -1,4 +1,8 @@
+architecture: standalone
+
 redis:
+  auth:
+    enabled: false
   image:
     repository: redis
     tag: "8.6.2-trixie"

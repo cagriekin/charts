@@ -2,17 +2,38 @@ suite: pdb
 templates:
   - templates/pdb.yaml
 tests:
-  - it: default - no PDB rendered
+  - it: standalone minimal - no PDB rendered
+    values:
+      - ../values-minimal.yaml
     asserts:
       - hasDocuments:
           count: 0
 
-  - it: enabled - PDB renders with minAvailable 1
-    set:
-      redis.podDisruptionBudget.enabled: true
+  - it: replication default - maxUnavailable 1 + unhealthyPodEvictionPolicy
+    values:
+      - ../values-replication.yaml
     asserts:
       - isKind:
           of: PodDisruptionBudget
       - equal:
+          path: spec.maxUnavailable
+          value: 1
+      - equal:
+          path: spec.unhealthyPodEvictionPolicy
+          value: AlwaysAllow
+      - notExists:
+          path: spec.minAvailable
+
+  - it: explicit minAvailable wins over maxUnavailable
+    values:
+      - ../values-minimal.yaml
+    set:
+      redis.podDisruptionBudget.enabled: true
+      redis.podDisruptionBudget.minAvailable: 1
+      redis.podDisruptionBudget.maxUnavailable: null
+    asserts:
+      - equal:
           path: spec.minAvailable
           value: 1
+      - notExists:
+          path: spec.maxUnavailable

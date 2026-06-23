@@ -6,5 +6,7 @@
   "labels"          "redis.labels"
   "selectorLabels"  "redis.selectorLabels"
   "minAvailable"    .Values.redis.podDisruptionBudget.minAvailable
+  "maxUnavailable"  .Values.redis.podDisruptionBudget.maxUnavailable
+  "unhealthyPodEvictionPolicy" .Values.redis.podDisruptionBudget.unhealthyPodEvictionPolicy
 ) }}
 {{- end }}

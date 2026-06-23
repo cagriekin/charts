@@ -3,16 +3,20 @@ KIND_CONFIG := kind-config.yaml
 TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
-.PHONY: test test-template test-cluster test-minimal test-full test-persistence cluster-create cluster-delete cluster-exists clean help
+.PHONY: test test-template test-cluster test-minimal test-full test-persistence test-replication test-failover test-ha test-tls cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
 	@echo "  test            - Run all tests (creates cluster, runs tests, deletes cluster)"
 	@echo "  test-template   - Run helm template/lint tests (no cluster needed)"
 	@echo "  test-cluster    - Run all cluster tests in parallel (assumes cluster exists)"
-	@echo "  test-minimal    - Run minimal install tests"
-	@echo "  test-full       - Run full install tests (with exporter)"
-	@echo "  test-persistence - Run AOF persistence restart tests"
+	@echo "  test-minimal    - Run minimal install tests (standalone)"
+	@echo "  test-full       - Run full install tests (standalone + exporter)"
+	@echo "  test-persistence - Run AOF persistence restart tests (standalone)"
+	@echo "  test-ha         - Run replication + Sentinel failover tests (sequential)"
+	@echo "  test-replication - Run replication topology tests"
+	@echo "  test-failover   - Run Sentinel failover tests (needs an existing replication release)"
+	@echo "  test-tls        - Run replication-over-TLS smoke (opt-in; generates a self-signed cert)"
 	@echo "  cluster-create  - Create Kind cluster"
 	@echo "  cluster-delete  - Delete Kind cluster"
 	@echo "  clean           - Delete cluster and test namespaces"
@@ -22,7 +26,7 @@ test: cluster-create test-template test-cluster cluster-delete
 test-template:
 	@bash $(TESTS_DIR)/test-template.sh
 
-test-cluster: test-minimal test-full test-persistence
+test-cluster: test-minimal test-full test-persistence test-ha
 	@echo "All test suites passed"
 
 cluster-exists:
@@ -53,6 +57,20 @@ test-full: cluster-exists
 
 test-persistence: cluster-exists
 	@bash $(TESTS_DIR)/test-persistence.sh
+
+# Failover reuses the replication release, so run them in order within one recipe.
+test-ha: cluster-exists
+	@bash $(TESTS_DIR)/test-replication.sh
+	@bash $(TESTS_DIR)/test-failover.sh
+
+test-replication: cluster-exists
+	@bash $(TESTS_DIR)/test-replication.sh
+
+test-failover: cluster-exists
+	@bash $(TESTS_DIR)/test-failover.sh
+
+test-tls: cluster-exists
+	@bash $(TESTS_DIR)/test-tls.sh
 
 clean: cluster-delete
 	@echo "Cleaned up"

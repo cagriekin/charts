@@ -15,7 +15,7 @@ concurrency:
 
 env:
   IMAGES: >-
-    redis:7-alpine
+    redis:8.6.2-trixie
     oliver006/redis_exporter:v1.67.0
     curlimages/curl:latest
 
@@ -50,7 +50,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.redis == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -99,6 +99,15 @@ jobs:
 
       - name: Run full tests
         run: make -C redis test-full
+
+      - name: Run persistence tests
+        run: make -C redis test-persistence
+
+      - name: Run replication + failover tests
+        run: make -C redis test-ha
+
+      - name: Run TLS tests
+        run: make -C redis test-tls
 
   # Single required status check for redis. Always runs; self-passes when redis is
   # untouched, otherwise mirrors the test job's result.

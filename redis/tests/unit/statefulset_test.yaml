@@ -56,8 +56,10 @@ tests:
           path: spec.template.spec.terminationGracePeriodSeconds
           value: 300
 
-  - it: default - no auth means no REDIS_PASSWORD env and no requirepass
+  - it: standalone no-auth - no REDIS_PASSWORD env and plain command
     template: templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
     asserts:
       - notExists:
           path: spec.template.spec.containers[0].env
@@ -102,15 +104,21 @@ tests:
           path: spec.template.spec.containers[0].readinessProbe.exec.command[2]
           pattern: REDIS_PASSWORD.*ping
 
-  - it: auth enabled - existingSecret name required, fails without it
+  - it: auth enabled without existingSecret uses the generated Secret
     template: templates/statefulset.yaml
     values:
       - ../values-minimal.yaml
     set:
       redis.auth.enabled: true
     asserts:
-      - failedTemplate:
-          errorMessage: redis.auth.existingSecret.name is required when auth is enabled
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: RELEASE-NAME-redis
+                key: redis-password
 
   - it: full - global annotations on statefulset metadata, not in labels
     template: templates/statefulset.yaml
@@ -130,3 +138,104 @@ tests:
     asserts:
       - notExists:
           path: metadata.annotations
+
+  # --- Replication (Sentinel HA) ---
+  - it: replication - 3 pods, headless serviceName, OrderedReady
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    release:
+      name: r
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 3
+      - equal:
+          path: spec.serviceName
+          value: r-redis-headless
+      - equal:
+          path: spec.podManagementPolicy
+          value: OrderedReady
+
+  - it: replication - bootstrap init container present
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].name
+          value: redis-bootstrap
+
+  - it: replication - sentinel sidecar + redis run from /config-rw
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers
+          content:
+            name: sentinel
+          any: true
+      - equal:
+          path: spec.template.spec.containers[0].command
+          value:
+            - redis-server
+            - /config-rw/redis.conf
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: config-rw
+            emptyDir:
+              medium: Memory
+
+  - it: replication - default podAntiAffinity by hostname
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].topologyKey
+          value: kubernetes.io/hostname
+
+  - it: replication + TLS - cert volume mounted, no plaintext
+    template: templates/statefulset.yaml
+    values:
+      - ../values-tls.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tls
+            secret:
+              secretName: redis-tls-cert
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tls
+            mountPath: /etc/redis/tls
+            readOnly: true
+
+  - it: replication + TLS - exporter sidecar scrapes over TLS (rediss + client certs)
+    template: templates/statefulset.yaml
+    values:
+      - ../values-tls.yaml
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[?(@.name=="redis-exporter")].env[?(@.name=="REDIS_ADDR")].value
+          pattern: '^rediss://'
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="redis-exporter")].env
+          content:
+            name: REDIS_EXPORTER_TLS_CA_CERT_FILE
+            value: /etc/redis/tls/ca.crt
+
+  - it: replication - bootstrap init mounts data (for the restart-vs-first-boot check)
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.initContainers[0].volumeMounts
+          content:
+            name: data
+            mountPath: /data

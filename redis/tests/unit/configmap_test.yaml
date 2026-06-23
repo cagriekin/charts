@@ -46,3 +46,82 @@ tests:
       - notMatchRegex:
           path: data["redis.conf"]
           pattern: 'save ""'
+
+  - it: standalone - no sentinel.conf or min-replicas directives
+    values:
+      - ../values-minimal.yaml
+    asserts:
+      - notExists:
+          path: data["sentinel.conf"]
+      - notMatchRegex:
+          path: data["redis.conf"]
+          pattern: min-replicas-to-write
+
+  - it: replication - redis.conf write-safety directives
+    values:
+      - ../values-replication.yaml
+    asserts:
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: min-replicas-to-write 1
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: replica-read-only yes
+
+  - it: replication - sentinel.conf + bootstrap.sh rendered
+    values:
+      - ../values-replication.yaml
+    asserts:
+      - matchRegex:
+          path: data["sentinel.conf"]
+          pattern: sentinel resolve-hostnames yes
+      - matchRegex:
+          path: data["sentinel.conf"]
+          pattern: sentinel announce-hostnames yes
+      - matchRegex:
+          path: data["bootstrap.sh"]
+          pattern: get-master-addr-by-name
+
+  - it: replication - stable-DNS announce wired into bootstrap
+    values:
+      - ../values-replication.yaml
+    asserts:
+      - matchRegex:
+          path: data["bootstrap.sh"]
+          pattern: 'replica-announce-ip \$\{POD_FQDN\}'
+      - matchRegex:
+          path: data["bootstrap.sh"]
+          pattern: 'sentinel announce-ip \$\{POD_FQDN\}'
+      - matchRegex:
+          path: data["bootstrap.sh"]
+          pattern: 'sentinel monitor \$\{MASTER_NAME\} \$\{MASTER_FQDN\}'
+
+  - it: replication + TLS - tls-port and tls-replication in configs, mTLS off by default
+    values:
+      - ../values-tls.yaml
+    asserts:
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: tls-port 6379
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: tls-replication yes
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: tls-auth-clients no
+      - matchRegex:
+          path: data["sentinel.conf"]
+          pattern: tls-port 26379
+
+  - it: replication + mTLS - tls-auth-clients yes when clientCertAuth
+    values:
+      - ../values-tls.yaml
+    set:
+      tls.clientCertAuth: true
+    asserts:
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: tls-auth-clients yes
+      - matchRegex:
+          path: data["sentinel.conf"]
+          pattern: tls-auth-clients yes

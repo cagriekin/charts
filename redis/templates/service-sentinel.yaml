@@ -1,0 +1,27 @@
+{{- if eq .Values.architecture "replication" }}
+{{- /* Sentinel discovery Service: the client entry point. Sentinel-aware clients
+       connect here and call SENTINEL get-master-addr-by-name <masterName> to find the
+       current master. Every pod runs a Sentinel sidecar, so a plain all-pods selector
+       is correct -- no master-tracking reconciler is needed. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "redis.sentinelServiceName" . }}
+  labels:
+    {{- include "redis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+  {{- with (include "redis.globalAnnotations" . | fromYaml) }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.sentinel.service.type }}
+  ports:
+    - name: sentinel
+      port: {{ .Values.sentinel.service.port }}
+      targetPort: sentinel
+      protocol: TCP
+  selector:
+    {{- include "redis.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+{{- end }}

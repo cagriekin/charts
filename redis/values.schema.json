@@ -4,6 +4,9 @@
   "description": "Partial schema: constrains the values whose typos silently misconfigure Redis. additionalProperties stays open so the rest of values.yaml is unconstrained.",
   "type": "object",
   "properties": {
+    "architecture": {
+      "enum": ["standalone", "replication"]
+    },
     "redis": {
       "type": "object",
       "properties": {
@@ -14,6 +17,10 @@
               "enum": ["Always", "IfNotPresent", "Never"]
             }
           }
+        },
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 0
         },
         "config": {
           "type": "object",
@@ -32,8 +39,51 @@
             },
             "appendfsync": {
               "enum": ["always", "everysec", "no"]
+            },
+            "min-replicas-to-write": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "min-replicas-max-lag": {
+              "type": "integer",
+              "minimum": 0
             }
           }
+        }
+      }
+    },
+    "sentinel": {
+      "type": "object",
+      "properties": {
+        "image": {
+          "type": "object",
+          "properties": {
+            "pullPolicy": {
+              "enum": ["Always", "IfNotPresent", "Never"]
+            }
+          }
+        },
+        "service": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "enum": ["ClusterIP", "NodePort", "LoadBalancer", "ExternalName"]
+            }
+          }
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "existingSecret": {
+          "type": "string"
+        },
+        "clientCertAuth": {
+          "type": "boolean"
         }
       }
     },

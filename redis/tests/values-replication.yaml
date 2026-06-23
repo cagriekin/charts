@@ -1,0 +1,19 @@
+# Replication (Sentinel HA) live-test fixture: 3 pods (1 master + 2 replicas),
+# auth on (chart-generated Secret), persistence off for fast CI, exporter on.
+architecture: replication
+
+redis:
+  replicaCount: 2
+  persistence:
+    enabled: false
+  podDisruptionBudget:
+    enabled: true
+
+sentinel:
+  downAfterMilliseconds: 5000
+  failoverTimeout: 30000
+
+exporter:
+  enabled: true
+  serviceMonitor:
+    enabled: false
