@@ -1498,6 +1498,16 @@ assert_eq "pgbackrest #120: enabled without a passphrase secret fails fast" "1" 
 ro_exp=$(helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true --show-only templates/prometheus-exporter-deployment.yaml 2>&1)
 assert_contains "#117: exporter readOnlyRootFilesystem" "${ro_exp}" "readOnlyRootFilesystem: true"
 assert_contains "#117: exporter has a writable /tmp" "${ro_exp}" "mountPath: /tmp"
+
+# #204: under sslmode=verify-*, the exporter's CA volume must project only the (public)
+# ca.crt at a world-readable mode (0444), not the whole secret at 0400 -- the exporter
+# runs as a non-root UID with no fsGroup, so root-owned 0400 files were unreadable
+# (pg_up=0). The server private key tls.key must not be mounted into the exporter.
+tls_exp=$(helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls --set prometheusExporter.sslmode=verify-ca --show-only templates/prometheus-exporter-deployment.yaml 2>&1)
+assert_contains "#204: exporter CA volume world-readable (0444)" "${tls_exp}" "defaultMode: 0444"
+assert_contains "#204: exporter CA volume projects ca.crt" "${tls_exp}" "key: ca.crt"
+assert_not_contains "#204: exporter CA volume does not mount server private key" "${tls_exp}" "key: tls.key"
+
 # scope each per-container so the assert proves THAT container is read-only with a
 # writable /tmp (a whole-render grep would let one container's /tmp satisfy the other).
 ro_bk_cj=$(helm template test-pg "${CHART_DIR}" --set backup.enabled=true --set backup.s3.endpoint=https://e --set backup.s3.bucket=b --set backup.existingSecret.name=s --show-only templates/backup-cronjob.yaml 2>&1)

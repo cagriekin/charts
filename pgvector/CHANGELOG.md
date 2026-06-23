@@ -1,5 +1,18 @@
 # pgvector chart changelog
 
+## 1.2.3 - 2026-06-23
+
+Chart-only fix for a postgres-exporter TLS regression (#204). No image change
+(`trixie-5.5.0-26`). Shares pg's exporter template; see the pg CHANGELOG for detail.
+
+### Fixed
+
+- **Exporter could not read the TLS CA under `sslmode=verify-ca`/`verify-full`
+  (`permission denied`, `pg_up=0`) (#204).** The CA secret was mounted whole at
+  `defaultMode: 0400`, unreadable by the exporter's non-root UID (no `fsGroup`). The TLS
+  volume now projects only the public `ca.crt` at `0444`; `tls.crt`/`tls.key` are no
+  longer mounted. Regression from the #110 mTLS work.
+
 ## 1.2.2 - 2026-06-22
 
 Fixes the agent-mode `pg_hba.conf` dual-authorship bug (#199); image moves to

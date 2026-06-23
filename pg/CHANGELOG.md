@@ -1,5 +1,23 @@
 # pg chart changelog
 
+## 1.2.3 - 2026-06-23
+
+Chart-only fix for a postgres-exporter TLS regression (#204). No image change
+(`trixie-5.5.0-26`); only affects deployments with `prometheusExporter.enabled` and
+`prometheusExporter.sslmode` set to `verify-ca`/`verify-full`.
+
+### Fixed
+
+- **Exporter could not read the TLS CA under `sslmode=verify-ca`/`verify-full`, so every
+  scrape failed with `permission denied` and `pg_up` stayed `0` (#204).** The CA secret
+  was mounted whole at `defaultMode: 0400` (owner-read only); the exporter runs as a
+  non-root UID with no `fsGroup`, so the root-owned `ca.crt` was unreadable. The scrape
+  target stayed `up` (the `/metrics` endpoint returns 200 with `pg_up 0`), making it a
+  silent monitoring blackout. The exporter's TLS volume now projects **only** the public
+  `ca.crt` at a world-readable `0444` -- no `fsGroup` needed. The server cert `tls.crt`
+  and private key `tls.key` are no longer mounted into the exporter (it never read them;
+  the monitoring user is exempt from client-cert auth). Regression from the #110 mTLS work.
+
 ## 1.2.2 - 2026-06-22
 
 Fixes a `pg_hba.conf` dual-authorship bug that broke md5-password authentication on

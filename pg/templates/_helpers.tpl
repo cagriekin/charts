@@ -378,7 +378,16 @@ volumes:
   - name: postgresql-tls
     secret:
       secretName: {{ .Values.postgresql.tls.existingSecret | quote }}
-      defaultMode: 0400
+      # Project only the (public) CA at a world-readable mode (#204). Secret-volume
+      # files are owned root:root; the exporter runs as a non-root UID with no fsGroup,
+      # so the previous 0400 left ca.crt unreadable (sslmode=verify-* scrapes failed with
+      # "permission denied", pg_up=0). The exporter verifies the server cert with ca.crt
+      # only -- it needs neither tls.crt nor the server private key tls.key, so they are
+      # no longer mounted.
+      items:
+        - key: ca.crt
+          path: ca.crt
+      defaultMode: 0444
 {{- end }}
 {{- end }}
 
