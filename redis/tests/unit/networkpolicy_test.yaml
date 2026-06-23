@@ -82,6 +82,22 @@ tests:
             port: 26379
             protocol: TCP
 
+  - it: replication - metrics port 9121 reachable by any namespace pod (own ingress rule)
+    release:
+      name: r
+    values:
+      - ../values-replication-full.yaml
+    asserts:
+      - contains:
+          path: spec.ingress[1].ports
+          content:
+            port: 9121
+            protocol: TCP
+      - equal:
+          path: spec.ingress[1].from
+          value:
+            - podSelector: {}
+
   - it: replication - egress to sibling pods on redis + sentinel ports
     release:
       name: r

@@ -22,7 +22,7 @@ helm install cache ./redis
 This deploys 3 pods (1 master + 2 replicas), each running a Redis Sentinel sidecar, plus
 a generated password Secret. Connect Sentinel-aware clients to the Sentinel Service:
 
-```
+```text
 host: cache-redis-sentinel:26379    # SENTINEL get-master-addr-by-name mymaster
 master name: mymaster
 password: kubectl get secret cache-redis -o jsonpath='{.data.redis-password}' | base64 -d

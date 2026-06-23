@@ -54,11 +54,15 @@ assert_eq "master reports 2 connected replicas" "2" "${slaves}"
 # Sentinel discovery agrees with the actual master.
 assert_eq "sentinel agrees on the master" "${MASTER_POD}" "$(sentinel_master "${REPLICA_POD}")"
 
-# Write on the master replicates to a replica.
+# Write on the master replicates to a replica (poll until it converges).
 TEST_VALUE="repl-$(date +%s)"
 kubectl exec -n "${NAMESPACE}" "${MASTER_POD}" -c redis -- redis-cli SET replkey "${TEST_VALUE}" >/dev/null
-sleep 3
-read_val=$(kubectl exec -n "${NAMESPACE}" "${REPLICA_POD}" -c redis -- redis-cli GET replkey 2>/dev/null | tr -d '\r')
+read_val=""
+for _ in $(seq 1 15); do
+  read_val=$(kubectl exec -n "${NAMESPACE}" "${REPLICA_POD}" -c redis -- redis-cli GET replkey 2>/dev/null | tr -d '\r')
+  [ "${read_val}" = "${TEST_VALUE}" ] && break
+  sleep 2
+done
 assert_eq "write on master replicates to replica" "${TEST_VALUE}" "${read_val}"
 
 # Replicas reject writes (replica-read-only).

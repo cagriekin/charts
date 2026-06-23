@@ -22,10 +22,6 @@ spec:
 {{- if $repl }}
         - port: {{ .Values.sentinel.service.port }}
           protocol: TCP
-{{- if .Values.exporter.enabled }}
-        - port: 9121
-          protocol: TCP
-{{- end }}
 {{- end }}
       from:
 {{- if and .Values.exporter.enabled (not $repl) }}
@@ -45,6 +41,17 @@ spec:
 {{- end }}
 {{- with .Values.networkPolicy.extraIngress }}
         {{- toYaml . | nindent 8 }}
+{{- end }}
+{{- if and $repl .Values.exporter.enabled }}
+    {{- /* Metrics: the exporter sidecar is scraped on 9121. Open it to any pod in the
+           namespace (independent of allowExternal, mirroring the standalone exporter
+           policy) so Prometheus can scrape even with the data ports locked down.
+           Cross-namespace Prometheus needs a networkPolicy.extraIngress rule. */}}
+    - ports:
+        - port: 9121
+          protocol: TCP
+      from:
+        - podSelector: {}
 {{- end }}
   egress:
     - ports:

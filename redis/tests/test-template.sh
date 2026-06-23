@@ -163,7 +163,11 @@ assert_contains "repl: generated secret" "${repl}" "kind: Secret"
 assert_contains "repl: sentinel monitor in bootstrap" "${repl}" "sentinel monitor"
 assert_contains "repl: split-brain alert" "${repl}" "RedisMultipleMasters"
 assert_contains "repl: writes-blocked alert" "${repl}" "RedisWritesBlocked"
-assert_contains "repl: netpol opens sentinel port 26379" "${repl}" "port: 26379"
+
+repl_netpol=$(helm template r "${CHART_DIR}" -f "${SCRIPT_DIR}/values-replication-full.yaml" \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "repl: netpol opens sentinel port 26379" "${repl_netpol}" "port: 26379"
+assert_contains "repl: netpol opens metrics port 9121" "${repl_netpol}" "port: 9121"
 
 # Standalone is not affected by the replication apparatus
 std=$(helm template r "${CHART_DIR}" --set architecture=standalone --set redis.auth.enabled=false 2>&1)
