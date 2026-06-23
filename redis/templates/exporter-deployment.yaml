@@ -1,4 +1,6 @@
-{{- if .Values.exporter.enabled }}
+{{- /* Standalone only. In replication the exporter runs as a per-pod sidecar in the
+       StatefulSet so each member's role/replication metrics are scraped. */}}
+{{- if and .Values.exporter.enabled (eq .Values.architecture "standalone") }}
 {{- include "common.exporterDeployment" (dict
   "ctx"             .
   "component"       "redis-exporter"

@@ -61,3 +61,77 @@ tests:
                 app.kubernetes.io/name: redis
                 app.kubernetes.io/instance: RELEASE-NAME
                 app.kubernetes.io/component: redis-exporter
+
+  # --- Replication ---
+  - it: replication - single policy opens redis + sentinel ports, no separate exporter policy
+    release:
+      name: r
+    values:
+      - ../values-replication-full.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - contains:
+          path: spec.ingress[0].ports
+          content:
+            port: 6379
+            protocol: TCP
+      - contains:
+          path: spec.ingress[0].ports
+          content:
+            port: 26379
+            protocol: TCP
+
+  - it: replication - metrics port 9121 reachable by any pod in the namespace (own ingress rule)
+    release:
+      name: r
+    values:
+      - ../values-replication-full.yaml
+    asserts:
+      # Order-independent: assert an ingress rule that opens 9121 from any in-namespace
+      # pod (podSelector: {} is namespace-scoped by design; cross-namespace Prometheus
+      # uses networkPolicy.extraIngress).
+      - contains:
+          path: spec.ingress
+          content:
+            from:
+              - podSelector: {}
+            ports:
+              - port: 9121
+                protocol: TCP
+
+  - it: replication - egress to sibling pods on redis + sentinel ports
+    release:
+      name: r
+    values:
+      - ../values-replication-full.yaml
+    asserts:
+      - contains:
+          path: spec.egress[1].ports
+          content:
+            port: 26379
+            protocol: TCP
+
+  - it: replication - extraEgress splices at rule level
+    release:
+      name: r
+    values:
+      - ../values-replication-full.yaml
+    set:
+      networkPolicy.extraEgress:
+        - to:
+            - ipBlock:
+                cidr: 10.0.0.0/8
+          ports:
+            - port: 443
+              protocol: TCP
+    asserts:
+      - contains:
+          path: spec.egress
+          content:
+            to:
+              - ipBlock:
+                  cidr: 10.0.0.0/8
+            ports:
+              - port: 443
+                protocol: TCP

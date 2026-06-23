@@ -15,7 +15,7 @@ fail=0
 
 # Source subcharts vendored via file:// (name == source directory).
 sources=(common etcd)
-consumers=(pg pgvector)
+consumers=(pg pgvector redis)
 
 for src in "${sources[@]}"; do
   [ -d "${src}" ] || continue

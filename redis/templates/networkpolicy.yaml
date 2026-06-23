@@ -1,4 +1,5 @@
 {{- if .Values.networkPolicy.enabled }}
+{{- $repl := eq .Values.architecture "replication" }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -16,14 +17,24 @@ spec:
     - Egress
   ingress:
     - ports:
-        - port: 6379
+        - port: {{ .Values.service.port }}
           protocol: TCP
+{{- if $repl }}
+        - port: {{ .Values.sentinel.service.port }}
+          protocol: TCP
+{{- end }}
       from:
-{{- if .Values.exporter.enabled }}
+{{- if and .Values.exporter.enabled (not $repl) }}
         - podSelector:
             matchLabels:
               {{- include "redis.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: redis-exporter
+{{- end }}
+{{- if $repl }}
+        - podSelector:
+            matchLabels:
+              {{- include "redis.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: redis
 {{- end }}
 {{- if .Values.networkPolicy.allowExternal }}
         - podSelector: {}
@@ -31,14 +42,40 @@ spec:
 {{- with .Values.networkPolicy.extraIngress }}
         {{- toYaml . | nindent 8 }}
 {{- end }}
+{{- if and $repl .Values.exporter.enabled }}
+    {{- /* Metrics: the exporter sidecar is scraped on 9121. Open it to any pod in the
+           namespace (independent of allowExternal, mirroring the standalone exporter
+           policy) so Prometheus can scrape even with the data ports locked down.
+           Cross-namespace Prometheus needs a networkPolicy.extraIngress rule. */}}
+    - ports:
+        - port: 9121
+          protocol: TCP
+      from:
+        - podSelector: {}
+{{- end }}
   egress:
     - ports:
         - port: 53
           protocol: UDP
         - port: 53
           protocol: TCP
+{{- if $repl }}
+    - ports:
+        - port: {{ .Values.service.port }}
+          protocol: TCP
+        - port: {{ .Values.sentinel.service.port }}
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              {{- include "redis.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: redis
+{{- end }}
+{{- with .Values.networkPolicy.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+{{- end }}
+{{- if and .Values.exporter.enabled (not $repl) }}
 ---
-{{- if .Values.exporter.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -67,7 +104,7 @@ spec:
         - port: 53
           protocol: TCP
     - ports:
-        - port: 6379
+        - port: {{ .Values.service.port }}
           protocol: TCP
       to:
         - podSelector:

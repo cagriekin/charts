@@ -1,3 +1,354 @@
+{{- include "redis.validate" . -}}
+{{- if eq .Values.architecture "replication" -}}
+{{- $port := .Values.service.port -}}
+{{- $sentinelPort := .Values.sentinel.service.port -}}
+{{- $tlsCli := "" -}}
+{{- if .Values.tls.enabled -}}
+{{- $tlsCli = "--tls --cert /etc/redis/tls/tls.crt --key /etc/redis/tls/tls.key --cacert /etc/redis/tls/ca.crt " -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "redis.fullname" . }}
+  labels:
+    {{- include "redis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+  {{- with (include "redis.globalAnnotations" . | fromYaml) }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ include "redis.podCount" . }}
+  serviceName: {{ include "redis.headless" . }}
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      {{- include "redis.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: redis
+  template:
+    metadata:
+      labels:
+        {{- include "redis.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: redis
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.redis.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.redis.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.redis.podSecurityContext | nindent 8 }}
+      {{- with .Values.redis.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.redis.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.redis.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.redis.affinity }}
+      affinity:
+        {{- toYaml .Values.redis.affinity | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "redis.selectorLabels" . | nindent 18 }}
+                  app.kubernetes.io/component: redis
+              topologyKey: kubernetes.io/hostname
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "redis.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: redis
+                topologyKey: topology.kubernetes.io/zone
+      {{- end }}
+      {{- with .Values.redis.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: redis-bootstrap
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.redis.containerSecurityContext | nindent 12 }}
+          command:
+            - sh
+            - /config-ro/bootstrap.sh
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: FULLNAME
+              value: {{ include "redis.fullname" . }}
+            - name: HEADLESS_DOMAIN
+              value: {{ include "redis.headlessDomain" . }}
+            - name: SENTINEL_SERVICE
+              value: {{ include "redis.sentinelServiceName" . }}
+            - name: NODE_COUNT
+              value: {{ include "redis.podCount" . | quote }}
+            - name: MASTER_NAME
+              value: {{ include "redis.sentinelMasterName" . | quote }}
+            - name: QUORUM
+              value: {{ include "redis.quorum" . | quote }}
+            - name: REDIS_PORT
+              value: {{ $port | quote }}
+            - name: SENTINEL_PORT
+              value: {{ $sentinelPort | quote }}
+            - name: DOWN_AFTER_MS
+              value: {{ .Values.sentinel.downAfterMilliseconds | quote }}
+            - name: FAILOVER_TIMEOUT
+              value: {{ .Values.sentinel.failoverTimeout | quote }}
+            - name: PARALLEL_SYNCS
+              value: {{ .Values.sentinel.parallelSyncs | quote }}
+            - name: TLS_ENABLED
+              value: {{ .Values.tls.enabled | quote }}
+            {{- if .Values.redis.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis.secretName" . }}
+                  key: {{ .Values.redis.auth.existingSecret.key }}
+            - name: SENTINEL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis.sentinelSecretName" . }}
+                  key: {{ include "redis.sentinelSecretKey" . }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.redis.bootstrap.resources | nindent 12 }}
+          volumeMounts:
+            - name: config-ro
+              mountPath: /config-ro
+              readOnly: true
+            - name: config-rw
+              mountPath: /config-rw
+            - name: data
+              mountPath: /data
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/redis/tls
+              readOnly: true
+            {{- end }}
+      containers:
+        - name: redis
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.redis.containerSecurityContext | nindent 12 }}
+          command:
+            - redis-server
+            - /config-rw/redis.conf
+          env:
+            {{- if .Values.redis.auth.enabled }}
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis.secretName" . }}
+                  key: {{ .Values.redis.auth.existingSecret.key }}
+            {{- end }}
+          ports:
+            - name: redis
+              containerPort: {{ $port }}
+              protocol: TCP
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli {{ $tlsCli }}-p {{ $port }} ping
+            initialDelaySeconds: {{ .Values.redis.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.redis.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.redis.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.redis.livenessProbe.failureThreshold }}
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli {{ $tlsCli }}-p {{ $port }} ping
+            initialDelaySeconds: {{ .Values.redis.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.redis.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.redis.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.redis.readinessProbe.failureThreshold }}
+          {{- if .Values.redis.startupProbe.enabled }}
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli {{ $tlsCli }}-p {{ $port }} ping
+            periodSeconds: {{ .Values.redis.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.redis.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.redis.startupProbe.failureThreshold }}
+          {{- end }}
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - redis-cli {{ $tlsCli }}-p {{ $port }} SHUTDOWN SAVE
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          volumeMounts:
+            - name: config-rw
+              mountPath: /config-rw
+            - name: data
+              mountPath: /data
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/redis/tls
+              readOnly: true
+            {{- end }}
+        - name: sentinel
+          image: "{{ .Values.sentinel.image.repository }}:{{ .Values.sentinel.image.tag }}"
+          imagePullPolicy: {{ .Values.sentinel.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.sentinel.containerSecurityContext | nindent 12 }}
+          command:
+            - redis-sentinel
+            - /config-rw/sentinel.conf
+          env:
+            {{- if .Values.redis.auth.enabled }}
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis.sentinelSecretName" . }}
+                  key: {{ include "redis.sentinelSecretKey" . }}
+            {{- end }}
+          ports:
+            - name: sentinel
+              containerPort: {{ $sentinelPort }}
+              protocol: TCP
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli {{ $tlsCli }}-p {{ $sentinelPort }} ping
+            initialDelaySeconds: {{ .Values.sentinel.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.sentinel.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.sentinel.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.sentinel.livenessProbe.failureThreshold }}
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli {{ $tlsCli }}-p {{ $sentinelPort }} ping
+            initialDelaySeconds: {{ .Values.sentinel.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.sentinel.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.sentinel.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.sentinel.readinessProbe.failureThreshold }}
+          resources:
+            {{- toYaml .Values.sentinel.resources | nindent 12 }}
+          volumeMounts:
+            - name: config-rw
+              mountPath: /config-rw
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: /etc/redis/tls
+              readOnly: true
+            {{- end }}
+{{- if .Values.exporter.enabled }}
+        - name: redis-exporter
+          image: "{{ .Values.exporter.image.repository }}:{{ .Values.exporter.image.tag }}"
+          imagePullPolicy: {{ .Values.exporter.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.exporter.containerSecurityContext | nindent 12 }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: REDIS_ADDR
+              value: "{{ if .Values.tls.enabled }}rediss{{ else }}redis{{ end }}://$(POD_NAME).{{ include "redis.headlessDomain" . }}:{{ $port }}"
+            {{- if .Values.redis.auth.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis.secretName" . }}
+                  key: {{ .Values.redis.auth.existingSecret.key }}
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: REDIS_EXPORTER_TLS_CLIENT_KEY_FILE
+              value: /etc/redis/tls/tls.key
+            - name: REDIS_EXPORTER_TLS_CLIENT_CERT_FILE
+              value: /etc/redis/tls/tls.crt
+            - name: REDIS_EXPORTER_TLS_CA_CERT_FILE
+              value: /etc/redis/tls/ca.crt
+            {{- end }}
+          ports:
+            - name: metrics
+              containerPort: 9121
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.exporter.resources | nindent 12 }}
+          {{- if .Values.tls.enabled }}
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/redis/tls
+              readOnly: true
+          {{- end }}
+{{- end }}
+      volumes:
+        - name: config-ro
+          configMap:
+            name: {{ include "redis.fullname" . }}
+        - name: config-rw
+          emptyDir:
+            medium: Memory
+        {{- if .Values.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+        {{- end }}
+        {{- if not .Values.redis.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.redis.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- if .Values.redis.persistence.storageClass }}
+        storageClassName: {{ .Values.redis.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.redis.persistence.size }}
+  {{- end }}
+{{- else -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -42,7 +393,7 @@ spec:
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ required "redis.auth.existingSecret.name is required when auth is enabled" .Values.redis.auth.existingSecret.name }}
+                  name: {{ include "redis.secretName" . }}
                   key: {{ .Values.redis.auth.existingSecret.key }}
 {{- else }}
           command:
@@ -109,3 +460,4 @@ spec:
           requests:
             storage: {{ .Values.redis.persistence.size }}
   {{- end }}
+{{- end }}

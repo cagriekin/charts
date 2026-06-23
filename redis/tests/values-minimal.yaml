@@ -1,4 +1,10 @@
+architecture: standalone
+
 redis:
+  auth:
+    enabled: false
+  podDisruptionBudget:
+    enabled: false
   image:
     repository: redis
     tag: "8.6.2-trixie"
@@ -24,6 +30,9 @@ redis:
     failureThreshold: 3
 
 exporter:
+  enabled: false
+
+networkPolicy:
   enabled: false
 
 service:

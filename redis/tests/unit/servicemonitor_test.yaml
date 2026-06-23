@@ -1,0 +1,42 @@
+suite: servicemonitor
+templates:
+  - templates/servicemonitor.yaml
+tests:
+  - it: standalone - ServiceMonitor selects the redis-exporter component
+    release:
+      name: r
+    values:
+      - ../values-full-test.yaml
+    set:
+      exporter.serviceMonitor.enabled: true
+    asserts:
+      - isKind:
+          of: ServiceMonitor
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: redis-exporter
+
+  - it: replication - ServiceMonitor selects redis pods (scraped via headless)
+    release:
+      name: r
+    values:
+      - ../values-replication-full.yaml
+    asserts:
+      - isKind:
+          of: ServiceMonitor
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: redis
+      - equal:
+          path: spec.endpoints[0].port
+          value: metrics
+
+  - it: disabled - no ServiceMonitor
+    values:
+      - ../values-minimal.yaml
+    set:
+      exporter.enabled: true
+      exporter.serviceMonitor.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

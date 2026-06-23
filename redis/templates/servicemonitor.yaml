@@ -1,4 +1,19 @@
 {{- if and .Values.exporter.enabled .Values.exporter.serviceMonitor.enabled }}
+{{- if eq .Values.architecture "replication" }}
+{{- /* Replication: the exporter is a per-pod sidecar, scraped through the headless
+       Service (component: redis) so every member is scraped on its metrics port. */}}
+{{- include "common.exporterServiceMonitor" (dict
+  "ctx"             .
+  "component"       "redis"
+  "nameSuffix"      "exporter"
+  "labels"          "redis.labels"
+  "selectorLabels"  "redis.selectorLabels"
+  "additionalLabels" .Values.exporter.serviceMonitor.additionalLabels
+  "interval"        .Values.exporter.serviceMonitor.interval
+  "scrapeTimeout"   .Values.exporter.serviceMonitor.scrapeTimeout
+  "path"            "/metrics"
+) }}
+{{- else }}
 {{- include "common.exporterServiceMonitor" (dict
   "ctx"             .
   "component"       "redis-exporter"
@@ -10,4 +25,5 @@
   "scrapeTimeout"   .Values.exporter.serviceMonitor.scrapeTimeout
   "path"            "/metrics"
 ) }}
+{{- end }}
 {{- end }}

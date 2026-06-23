@@ -1,0 +1,18 @@
+# Replication + in-transit TLS. The referenced Secret (redis-tls-cert) must carry
+# tls.crt/tls.key/ca.crt with SANs covering the per-pod headless FQDNs; the live
+# TLS suite creates a self-signed one before install.
+architecture: replication
+
+redis:
+  replicaCount: 2
+  persistence:
+    enabled: false
+
+tls:
+  enabled: true
+  existingSecret: redis-tls-cert
+
+exporter:
+  enabled: true
+  serviceMonitor:
+    enabled: false

@@ -26,3 +26,38 @@ data:
 {{- else }}
     save ""
 {{- end }}
+{{- if eq .Values.architecture "replication" }}
+    replica-read-only {{ index .Values.redis.config "replica-read-only" }}
+    min-replicas-to-write {{ index .Values.redis.config "min-replicas-to-write" }}
+    min-replicas-max-lag {{ index .Values.redis.config "min-replicas-max-lag" }}
+{{- end }}
+{{- if .Values.tls.enabled }}
+    port 0
+    tls-port {{ .Values.service.port }}
+    tls-cert-file /etc/redis/tls/tls.crt
+    tls-key-file /etc/redis/tls/tls.key
+    tls-ca-cert-file /etc/redis/tls/ca.crt
+    tls-auth-clients {{ if .Values.tls.clientCertAuth }}yes{{ else }}no{{ end }}
+{{- if eq .Values.architecture "replication" }}
+    tls-replication yes
+{{- end }}
+{{- end }}
+{{- if eq .Values.architecture "replication" }}
+  sentinel.conf: |
+{{- if .Values.tls.enabled }}
+    port 0
+    tls-port {{ .Values.sentinel.service.port }}
+    tls-cert-file /etc/redis/tls/tls.crt
+    tls-key-file /etc/redis/tls/tls.key
+    tls-ca-cert-file /etc/redis/tls/ca.crt
+    tls-auth-clients {{ if .Values.tls.clientCertAuth }}yes{{ else }}no{{ end }}
+    tls-replication yes
+{{- else }}
+    port {{ .Values.sentinel.service.port }}
+{{- end }}
+    dir /config-rw
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+  bootstrap.sh: |
+    {{- include "redis.bootstrapScript" . | nindent 4 }}
+{{- end }}

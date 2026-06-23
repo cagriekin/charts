@@ -1,0 +1,85 @@
+suite: fail-fast guards
+templates:
+  - templates/statefulset.yaml
+  - templates/configmap.yaml
+tests:
+  - it: replication requires replicaCount >= 2
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.replicaCount: 1
+    asserts:
+      - failedTemplate:
+          errorMessage: architecture=replication requires redis.replicaCount >= 2 (>= 3 pods) so Sentinel keeps quorum after losing one pod; use architecture=standalone for a single instance
+
+  - it: quorum cannot exceed the pod count
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      sentinel.quorum: 9
+    asserts:
+      - failedTemplate:
+          errorMessage: sentinel.quorum (9) must be between 1 and the total pod count (3)
+
+  - it: explicit quorum 0 is rejected (not silently defaulted)
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      sentinel.quorum: 0
+    asserts:
+      - failedTemplate:
+          errorMessage: sentinel.quorum (0) must be between 1 and the total pod count (3)
+
+  - it: tls.enabled with architecture=standalone is rejected
+    template: templates/statefulset.yaml
+    set:
+      architecture: standalone
+      tls.enabled: true
+      tls.existingSecret: some-cert
+    asserts:
+      - failedTemplate:
+          errorMessage: "tls.enabled requires architecture=replication: TLS is wired into the replication StatefulSet (cert volume, --tls probes, per-pod-FQDN SAN model). Use architecture=replication, or terminate TLS at a proxy in front of standalone."
+
+  - it: min-replicas-to-write must be below the pod count
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.config.min-replicas-to-write: 3
+    asserts:
+      - failedTemplate:
+          errorMessage: redis.config.min-replicas-to-write must be < total pods (redis.replicaCount + 1), else the master can never accept writes
+
+  - it: tls.enabled requires existingSecret
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      tls.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: tls.enabled requires tls.existingSecret (a Secret with keys tls.crt, tls.key, ca.crt)
+
+  - it: clientCertAuth requires tls.enabled
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      tls.clientCertAuth: true
+    asserts:
+      - failedTemplate:
+          errorMessage: tls.clientCertAuth requires tls.enabled
+
+  - it: standalone renders a single-pod StatefulSet
+    template: templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - equal:
+          path: spec.replicas
+          value: 1

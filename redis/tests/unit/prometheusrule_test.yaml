@@ -9,7 +9,9 @@ tests:
       - hasDocuments:
           count: 0
 
-  - it: enabled - PrometheusRule renders with default alerts
+  - it: standalone enabled - PrometheusRule renders default alerts
+    values:
+      - ../values-minimal.yaml
     set:
       exporter.enabled: true
       exporter.prometheusRule.enabled: true
@@ -46,3 +48,23 @@ tests:
               severity: critical
             annotations:
               summary: "Redis AOF last write failed"
+
+  - it: replication enabled - HA alerts (split-brain, writes-blocked) scoped per release
+    values:
+      - ../values-replication.yaml
+    release:
+      name: r
+    set:
+      exporter.prometheusRule.enabled: true
+    asserts:
+      - isKind:
+          of: PrometheusRule
+      - matchRegex:
+          path: spec.groups[0].rules[?(@.alert=="RedisMultipleMasters")].expr
+          pattern: 'count\(redis_instance_info\{.*role="master".*\}\) > 1'
+      - matchRegex:
+          path: spec.groups[0].rules[?(@.alert=="RedisWritesBlocked")].expr
+          pattern: 'redis_connected_slaves\{.*\} == 0'
+      - matchRegex:
+          path: spec.groups[0].rules[?(@.alert=="RedisNoMaster")].expr
+          pattern: 'service="r-redis-headless"'
