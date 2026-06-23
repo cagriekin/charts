@@ -83,6 +83,46 @@
 {{- end }}
 {{- end }}
 
+{{- /* Render a numeric value as a plain integer, never scientific notation. Helm parses
+       an unquoted YAML number as float64, and toString of one >= 1e7 yields e.g. "3e+08",
+       which redis-server rejects and the byte parser mangles. Strings pass through. */ -}}
+{{- define "redis.intval" -}}
+{{- if or (kindIs "float64" .) (kindIs "int" .) (kindIs "int64" .) }}{{- int64 . -}}{{- else }}{{- . -}}{{- end -}}
+{{- end }}
+
+{{- /* Parse a memory quantity to bytes. Accepts a bare number (bytes), redis units
+       (k/kb/m/mb/g/gb, *b = binary, bare = decimal) and k8s units (Ki/Mi/Gi/Ti/Pi binary,
+       K/M/G/T/P decimal) -- collapsed to one lowercased map. A numeric (unquoted) input is
+       used directly to avoid float64 scientific-notation corruption. Fails fast on an
+       unparseable number or an unsupported unit (no silent fall-through to bytes). */ -}}
+{{- define "redis.bytes" -}}
+{{- if or (kindIs "float64" .) (kindIs "int" .) (kindIs "int64" .) -}}
+{{- int64 . -}}
+{{- else -}}
+{{- $s := trim (toString .) -}}
+{{- $num := regexReplaceAll "[^0-9.]" $s "" -}}
+{{- $unit := lower (trim (regexReplaceAll "[0-9.]" $s "")) -}}
+{{- if not (regexMatch "^[0-9]+(\\.[0-9]+)?$" $num) -}}
+{{- fail (printf "redis: cannot parse memory quantity %q" $s) -}}
+{{- end -}}
+{{- $mult := 0.0 -}}
+{{- if eq $unit "" }}{{- $mult = 1.0 -}}
+{{- else if eq $unit "k" }}{{- $mult = 1000.0 -}}
+{{- else if or (eq $unit "ki") (eq $unit "kb") }}{{- $mult = 1024.0 -}}
+{{- else if eq $unit "m" }}{{- $mult = 1000000.0 -}}
+{{- else if or (eq $unit "mi") (eq $unit "mb") }}{{- $mult = 1048576.0 -}}
+{{- else if eq $unit "g" }}{{- $mult = 1000000000.0 -}}
+{{- else if or (eq $unit "gi") (eq $unit "gb") }}{{- $mult = 1073741824.0 -}}
+{{- else if eq $unit "t" }}{{- $mult = 1000000000000.0 -}}
+{{- else if or (eq $unit "ti") (eq $unit "tb") }}{{- $mult = 1099511627776.0 -}}
+{{- else if eq $unit "p" }}{{- $mult = 1000000000000000.0 -}}
+{{- else if or (eq $unit "pi") (eq $unit "pb") }}{{- $mult = 1125899906842624.0 -}}
+{{- else }}{{- fail (printf "redis: unsupported memory unit %q in %q (use bytes or k/kb/ki, m/mb/mi, g/gb/gi, t/tb/ti, p/pb/pi)" $unit $s) -}}
+{{- end -}}
+{{- mulf (float64 $num) $mult | floor | int64 -}}
+{{- end -}}
+{{- end }}
+
 {{- /* Fail-fast validation. Called at the top of statefulset.yaml. */ -}}
 {{- define "redis.validate" -}}
 {{- if not (has .Values.architecture (list "standalone" "replication")) }}
@@ -111,6 +151,15 @@
 {{- end }}
 {{- if and .Values.tls.clientCertAuth (not .Values.tls.enabled) }}
 {{- fail "tls.clientCertAuth requires tls.enabled" }}
+{{- end }}
+{{- $memLimit := dig "resources" "limits" "memory" "" .Values.redis }}
+{{- $maxmemory := index .Values.redis.config "maxmemory" }}
+{{- if and $memLimit $maxmemory }}
+{{- $maxBytes := int64 (include "redis.bytes" $maxmemory) }}
+{{- $limitBytes := int64 (include "redis.bytes" $memLimit) }}
+{{- if gt $maxBytes $limitBytes }}
+{{- fail (printf "redis.config.maxmemory (%s) exceeds redis.resources.limits.memory (%s); set maxmemory to ~80%% of the limit to leave headroom for AOF rewrite buffers and fragmentation" (include "redis.intval" $maxmemory) $memLimit) }}
+{{- end }}
 {{- end }}
 {{- end }}
 
@@ -217,6 +266,10 @@ cp /config-ro/sentinel.conf /config-rw/sentinel.conf
 {{- define "redis.exporterPodSpec" -}}
 securityContext:
   {{- toYaml .Values.exporter.podSecurityContext | nindent 2 }}
+{{- with .Values.imagePullSecrets }}
+imagePullSecrets:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
 containers:
   - name: redis-exporter
     image: "{{ .Values.exporter.image.repository }}:{{ .Values.exporter.image.tag }}"

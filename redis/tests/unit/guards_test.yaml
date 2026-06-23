@@ -73,6 +73,70 @@ tests:
       - failedTemplate:
           errorMessage: tls.clientCertAuth requires tls.enabled
 
+  - it: maxmemory exceeding the container memory limit is rejected
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.config.maxmemory: 512mb
+      redis.resources.limits.memory: 256Mi
+    asserts:
+      - failedTemplate:
+          errorMessage: "redis.config.maxmemory (512mb) exceeds redis.resources.limits.memory (256Mi); set maxmemory to ~80% of the limit to leave headroom for AOF rewrite buffers and fragmentation"
+
+  - it: maxmemory within the limit renders
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.config.maxmemory: 200mb
+      redis.resources.limits.memory: 256Mi
+    asserts:
+      - isKind:
+          of: StatefulSet
+
+  - it: large k8s units (Gi/Ti) parse correctly (no false-positive rejection)
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.config.maxmemory: 1gb
+      redis.resources.limits.memory: 2Ti
+    asserts:
+      - isKind:
+          of: StatefulSet
+
+  - it: unquoted numeric maxmemory over the limit is rejected (no float64 bypass)
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.config.maxmemory: 300000000
+      redis.resources.limits.memory: 256Mi
+    asserts:
+      - failedTemplate:
+          errorMessage: "redis.config.maxmemory (300000000) exceeds redis.resources.limits.memory (256Mi); set maxmemory to ~80% of the limit to leave headroom for AOF rewrite buffers and fragmentation"
+
+  - it: an unsupported memory unit fails fast (no silent byte fallthrough)
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.config.maxmemory: 200mib
+    asserts:
+      - failedTemplate:
+          errorMessage: "redis: unsupported memory unit \"mib\" in \"200mib\" (use bytes or k/kb/ki, m/mb/mi, g/gb/gi, t/tb/ti, p/pb/pi)"
+
+  - it: a malformed memory quantity fails fast
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.config.maxmemory: 1.2.3gb
+    asserts:
+      - failedTemplate:
+          errorMessage: 'redis: cannot parse memory quantity "1.2.3gb"'
+
   - it: standalone renders a single-pod StatefulSet
     template: templates/statefulset.yaml
     values:
