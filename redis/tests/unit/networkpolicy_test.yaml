@@ -82,21 +82,23 @@ tests:
             port: 26379
             protocol: TCP
 
-  - it: replication - metrics port 9121 reachable by any namespace pod (own ingress rule)
+  - it: replication - metrics port 9121 reachable by any pod in the namespace (own ingress rule)
     release:
       name: r
     values:
       - ../values-replication-full.yaml
     asserts:
+      # Order-independent: assert an ingress rule that opens 9121 from any in-namespace
+      # pod (podSelector: {} is namespace-scoped by design; cross-namespace Prometheus
+      # uses networkPolicy.extraIngress).
       - contains:
-          path: spec.ingress[1].ports
+          path: spec.ingress
           content:
-            port: 9121
-            protocol: TCP
-      - equal:
-          path: spec.ingress[1].from
-          value:
-            - podSelector: {}
+            from:
+              - podSelector: {}
+            ports:
+              - port: 9121
+                protocol: TCP
 
   - it: replication - egress to sibling pods on redis + sentinel ports
     release:
