@@ -64,6 +64,20 @@ tests:
           path: data["redis.conf"]
           pattern: 'slowlog-log-slower-than 10000'
 
+  - it: client timeout and tcp-keepalive are configurable
+    values:
+      - ../values-minimal.yaml
+    set:
+      redis.config.timeout: 300
+      redis.config.tcp-keepalive: 120
+    asserts:
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'timeout 300'
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'tcp-keepalive 120'
+
   - it: client-output-buffer-limit rendered when set
     values:
       - ../values-minimal.yaml

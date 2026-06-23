@@ -87,6 +87,10 @@ redis:
     auto-aof-rewrite-percentage: "100"
     auto-aof-rewrite-min-size: "64mb"
     # General production settings (defaults match Redis defaults).
+    # Close idle client connections after N seconds (0 = never).
+    timeout: 0
+    # TCP keepalive (seconds); 0 disables.
+    tcp-keepalive: 60
     loglevel: "notice"
     databases: 16
     slowlog-log-slower-than: 10000

@@ -25,8 +25,8 @@ data:
 {{- range (index .Values.redis.config "client-output-buffer-limit") }}
     client-output-buffer-limit {{ . }}
 {{- end }}
-    tcp-keepalive 60
-    timeout 0
+    tcp-keepalive {{ index .Values.redis.config "tcp-keepalive" }}
+    timeout {{ .Values.redis.config.timeout }}
 {{- if .Values.redis.config.rdbSnapshots }}
 {{- range .Values.redis.config.rdbSnapshots }}
     save {{ .seconds }} {{ .changes }}
