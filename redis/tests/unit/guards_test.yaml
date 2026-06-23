@@ -73,6 +73,28 @@ tests:
       - failedTemplate:
           errorMessage: tls.clientCertAuth requires tls.enabled
 
+  - it: maxmemory exceeding the container memory limit is rejected
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.config.maxmemory: 512mb
+      redis.resources.limits.memory: 256Mi
+    asserts:
+      - failedTemplate:
+          errorMessage: "redis.config.maxmemory (512mb) exceeds redis.resources.limits.memory (256Mi); set maxmemory to ~80% of the limit to leave headroom for AOF rewrite buffers and fragmentation"
+
+  - it: maxmemory within the limit renders
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.config.maxmemory: 200mb
+      redis.resources.limits.memory: 256Mi
+    asserts:
+      - isKind:
+          of: StatefulSet
+
   - it: standalone renders a single-pod StatefulSet
     template: templates/statefulset.yaml
     values:

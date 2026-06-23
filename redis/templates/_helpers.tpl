@@ -83,6 +83,24 @@
 {{- end }}
 {{- end }}
 
+{{- /* Parse a memory quantity to bytes. Accepts redis units (b/k/kb/m/mb/g/gb, where
+       the *b suffix is binary and the bare suffix is decimal) and k8s units
+       (Ki/Mi/Gi binary, K/M/G decimal) -- both collapse to the same lowercased map. */ -}}
+{{- define "redis.bytes" -}}
+{{- $s := . | toString -}}
+{{- $num := regexReplaceAll "[^0-9.]" $s "" | float64 -}}
+{{- $unit := regexReplaceAll "[0-9.]" $s "" | lower -}}
+{{- $mult := 1.0 -}}
+{{- if or (eq $unit "gi") (eq $unit "gb") }}{{- $mult = 1073741824.0 -}}
+{{- else if eq $unit "g" }}{{- $mult = 1000000000.0 -}}
+{{- else if or (eq $unit "mi") (eq $unit "mb") }}{{- $mult = 1048576.0 -}}
+{{- else if eq $unit "m" }}{{- $mult = 1000000.0 -}}
+{{- else if or (eq $unit "ki") (eq $unit "kb") }}{{- $mult = 1024.0 -}}
+{{- else if eq $unit "k" }}{{- $mult = 1000.0 -}}
+{{- end -}}
+{{- mulf $num $mult | floor | int64 -}}
+{{- end }}
+
 {{- /* Fail-fast validation. Called at the top of statefulset.yaml. */ -}}
 {{- define "redis.validate" -}}
 {{- if not (has .Values.architecture (list "standalone" "replication")) }}
@@ -111,6 +129,15 @@
 {{- end }}
 {{- if and .Values.tls.clientCertAuth (not .Values.tls.enabled) }}
 {{- fail "tls.clientCertAuth requires tls.enabled" }}
+{{- end }}
+{{- $memLimit := dig "resources" "limits" "memory" "" .Values.redis }}
+{{- $maxmemory := index .Values.redis.config "maxmemory" }}
+{{- if and $memLimit $maxmemory }}
+{{- $maxBytes := int64 (include "redis.bytes" $maxmemory) }}
+{{- $limitBytes := int64 (include "redis.bytes" $memLimit) }}
+{{- if gt $maxBytes $limitBytes }}
+{{- fail (printf "redis.config.maxmemory (%s) exceeds redis.resources.limits.memory (%s); set maxmemory to ~80%% of the limit to leave headroom for AOF rewrite buffers and fragmentation" $maxmemory $memLimit) }}
+{{- end }}
 {{- end }}
 {{- end }}
 
