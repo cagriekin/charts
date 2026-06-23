@@ -1,0 +1,48 @@
+suite: pgvector extension wiring
+templates:
+  - templates/statefulset.yaml
+release:
+  name: test-pgv
+tests:
+  # The vector extension is loaded by copying its files out of the pgvector image
+  # (copy-ext) and the base extensions out of the repmgr image (copy-base-ext) into
+  # shared volumes the repmgr-image postgres container then reads.
+  - it: copy-ext initContainer runs the pgvector image into the shared ext volumes
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.initContainers[?(@.name=="copy-ext")].image
+          pattern: "^pgvector/pgvector:"
+      - contains:
+          path: spec.template.spec.initContainers[?(@.name=="copy-ext")].volumeMounts
+          content:
+            name: ext-lib
+            mountPath: /ext-lib
+          any: true
+      - contains:
+          path: spec.template.spec.initContainers[?(@.name=="copy-ext")].volumeMounts
+          content:
+            name: ext-share
+            mountPath: /ext-share
+          any: true
+
+  - it: copy-base-ext initContainer runs the repmgr image (extensions + repmgr enabled)
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")].image
+          pattern: "^cagriekin/repmgr:"
+
+  - it: ext-lib and ext-share are emptyDir volumes shared into the postgresql container
+    asserts:
+      - exists:
+          path: spec.template.spec.volumes[?(@.name=="ext-lib")].emptyDir
+      - exists:
+          path: spec.template.spec.volumes[?(@.name=="ext-share")].emptyDir
+
+  - it: extensions disabled drops the extension-copy initContainers
+    set:
+      postgresql.extensions.enabled: false
+    asserts:
+      - notExists:
+          path: spec.template.spec.initContainers[?(@.name=="copy-ext")]
+      - notExists:
+          path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")]

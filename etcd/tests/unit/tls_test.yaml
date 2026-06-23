@@ -1,0 +1,66 @@
+suite: etcd transport TLS
+templates:
+  - templates/statefulset.yaml
+release:
+  name: test-etcd
+tests:
+  - it: TLS off mounts no tls volume and keeps the http probe
+    asserts:
+      - notExists:
+          path: spec.template.spec.volumes[?(@.name=="etcd-tls")]
+      - notExists:
+          path: spec.template.spec.containers[0].env[?(@.name=="ETCD_CERT_FILE")]
+
+  - it: TLS on switches client scheme to https and enables client-cert auth
+    set:
+      tls.enabled: true
+      tls.existingSecret: etcd-tls
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ETCD_CERT_FILE
+            value: /etc/etcd/tls/tls.crt
+          any: true
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ETCD_CLIENT_CERT_AUTH
+            value: "true"
+          any: true
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ETCD_LISTEN_CLIENT_URLS
+            value: https://0.0.0.0:2379
+          any: true
+
+  - it: TLS on probes with etcdctl over the mounted certs (HTTP probe cannot auth)
+    set:
+      tls.enabled: true
+      tls.existingSecret: etcd-tls
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet
+      - contains:
+          path: spec.template.spec.containers[0].readinessProbe.exec.command
+          content: /usr/local/bin/etcdctl
+      - contains:
+          path: spec.template.spec.containers[0].readinessProbe.exec.command
+          content: health
+
+  - it: TLS on mounts the server cert secret read-only
+    set:
+      tls.enabled: true
+      tls.existingSecret: etcd-tls
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[?(@.name=="etcd-tls")].secret.secretName
+          value: etcd-tls
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: etcd-tls
+            mountPath: /etc/etcd/tls
+            readOnly: true
+          any: true

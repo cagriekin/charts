@@ -1,0 +1,148 @@
+suite: etcd structural render
+release:
+  name: test-etcd
+tests:
+  # --- StatefulSet defaults ---
+  - it: statefulset has 3 replicas, Parallel policy, headless serviceName
+    template: templates/statefulset.yaml
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - equal:
+          path: spec.replicas
+          value: 3
+      - equal:
+          path: spec.podManagementPolicy
+          value: Parallel
+      - equal:
+          path: spec.serviceName
+          value: test-etcd-etcd-headless
+
+  - it: etcd container runs the etcd binary, pinned image+digest, both ports
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].command
+          value:
+            - /usr/local/bin/etcd
+      - matchRegex:
+          path: spec.template.spec.containers[0].image
+          pattern: ^quay\.io/coreos/etcd:v3\.5\.16@sha256:[0-9a-f]{64}$
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: client
+            containerPort: 2379
+            protocol: TCP
+          any: true
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: peer
+            containerPort: 2380
+            protocol: TCP
+          any: true
+
+  - it: plaintext default uses httpGet readiness and tcpSocket liveness
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /health
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.port
+          value: client
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.tcpSocket.port
+          value: client
+      - notExists:
+          path: spec.template.spec.containers[0].readinessProbe.exec
+
+  - it: pod and container are hardened (non-root, read-only fs, drop ALL)
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.template.spec.securityContext.runAsUser
+          value: 1000
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+      - contains:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          content: ALL
+
+  - it: resources carry both requests and limits
+    template: templates/statefulset.yaml
+    asserts:
+      - isNotNullOrEmpty:
+          path: spec.template.spec.containers[0].resources.requests
+      - isNotNullOrEmpty:
+          path: spec.template.spec.containers[0].resources.limits
+
+  - it: data PVC is provisioned at the configured size
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.volumeClaimTemplates[0].metadata.name
+          value: data
+      - equal:
+          path: spec.volumeClaimTemplates[0].spec.resources.requests.storage
+          value: 2Gi
+
+  - it: default soft hostname topology spread is emitted
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.topologySpreadConstraints[0].topologyKey
+          value: kubernetes.io/hostname
+      - equal:
+          path: spec.template.spec.topologySpreadConstraints[0].whenUnsatisfiable
+          value: ScheduleAnyway
+
+  - it: persistence disabled uses an emptyDir data volume and no PVC template
+    template: templates/statefulset.yaml
+    set:
+      persistence.enabled: false
+    asserts:
+      - exists:
+          path: spec.template.spec.volumes[?(@.name=="data")].emptyDir
+      - notExists:
+          path: spec.volumeClaimTemplates
+
+  # --- Services ---
+  - it: client Service is ClusterIP on the client port
+    template: templates/service.yaml
+    asserts:
+      - isKind:
+          of: Service
+      - equal:
+          path: spec.type
+          value: ClusterIP
+      - equal:
+          path: spec.ports[0].name
+          value: client
+      - equal:
+          path: spec.ports[0].port
+          value: 2379
+
+  - it: headless Service is clusterIP None, publishes not-ready, exposes both ports
+    template: templates/service-headless.yaml
+    asserts:
+      - equal:
+          path: metadata.name
+          value: test-etcd-etcd-headless
+      - equal:
+          path: spec.clusterIP
+          value: None
+      - equal:
+          path: spec.publishNotReadyAddresses
+          value: true
+      - lengthEqual:
+          path: spec.ports
+          count: 2

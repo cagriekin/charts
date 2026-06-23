@@ -1,0 +1,72 @@
+suite: etcd NetworkPolicy
+templates:
+  - templates/networkpolicy.yaml
+release:
+  name: test-etcd
+tests:
+  - it: default policy gates Ingress and Egress
+    asserts:
+      - isKind:
+          of: NetworkPolicy
+      - contains:
+          path: spec.policyTypes
+          content: Ingress
+      - contains:
+          path: spec.policyTypes
+          content: Egress
+
+  - it: ingress admits the peer mesh on peer+client and the agent on client
+    asserts:
+      # peer mesh rule (own selector) opens both ports
+      - contains:
+          path: spec.ingress[0].ports
+          content:
+            port: 2380
+            protocol: TCP
+          any: true
+      - contains:
+          path: spec.ingress[0].ports
+          content:
+            port: 2379
+            protocol: TCP
+          any: true
+      # agent rule admits this release's postgresql pods on the client port only
+      - equal:
+          path: spec.ingress[1].from[0].podSelector.matchLabels["app.kubernetes.io/component"]
+          value: postgresql
+      - equal:
+          path: spec.ingress[1].from[0].podSelector.matchLabels["app.kubernetes.io/instance"]
+          value: test-etcd
+      - contains:
+          path: spec.ingress[1].ports
+          content:
+            port: 2379
+            protocol: TCP
+
+  - it: egress permits DNS resolution
+    asserts:
+      - contains:
+          path: spec.egress[0].ports
+          content:
+            port: 53
+            protocol: UDP
+          any: true
+
+  - it: allowedClients adds a cross-namespace client rule
+    set:
+      networkPolicy.allowedClients:
+        - namespace: backend
+    asserts:
+      - equal:
+          path: spec.ingress[2].from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"]
+          value: backend
+      - equal:
+          path: spec.ingress[2].from[0].podSelector.matchLabels["app.kubernetes.io/component"]
+          value: postgresql
+
+  - it: policy is omitted when disabled
+    set:
+      networkPolicy.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

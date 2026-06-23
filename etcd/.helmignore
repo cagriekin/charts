@@ -1,0 +1,21 @@
+.DS_Store
+.git/
+.gitignore
+.bzr/
+.bzrignore
+.hg/
+.hgignore
+.svn/
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+.project
+.idea/
+*.tmproj
+.vscode/
+# Chart development scaffolding -- not part of the installable package. etcd is
+# vendored into pg/pgvector (charts/etcd-*.tgz), so excluding tests keeps the
+# bundled dependency lean.
+tests/

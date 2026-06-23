@@ -1,0 +1,43 @@
+suite: pgvector structural render
+release:
+  name: test-pgv
+tests:
+  # pgvector defaults to agent-mode HA (repmgr.enabled, failoverMode: agent,
+  # replicaCount 1) -- the symlinked pg templates must render under pgvector values.
+  - it: default statefulset is agent-mode HA (2 replicas, Parallel, agent entrypoint)
+    template: templates/statefulset.yaml
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - equal:
+          path: spec.replicas
+          value: 2
+      - equal:
+          path: spec.podManagementPolicy
+          value: Parallel
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].command
+          value:
+            - /usr/local/bin/entrypoint.sh
+            - agent
+      - notExists:
+          path: spec.template.spec.containers[?(@.name=="repmgrd")]
+
+  - it: default renders a Secret
+    template: templates/secret.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: Secret
+
+  - it: default renders a primary Service selecting <release>-0
+    template: templates/service.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: Service
+      - equal:
+          path: spec.selector["statefulset.kubernetes.io/pod-name"]
+          value: test-pgv-pgvector-0

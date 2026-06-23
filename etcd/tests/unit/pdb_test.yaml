@@ -1,0 +1,22 @@
+suite: etcd PodDisruptionBudget
+templates:
+  - templates/pdb.yaml
+release:
+  name: test-etcd
+tests:
+  - it: PDB defaults to maxUnavailable 1 (quorum tolerates one member loss)
+    asserts:
+      - isKind:
+          of: PodDisruptionBudget
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+      - notExists:
+          path: spec.minAvailable
+
+  - it: PDB is omitted when disabled
+    set:
+      podDisruptionBudget.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
