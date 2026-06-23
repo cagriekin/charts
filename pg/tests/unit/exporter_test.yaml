@@ -1,0 +1,74 @@
+suite: pg prometheus exporter TLS CA volume
+# The configmap is listed so the deployment's checksum/config include resolves; each
+# test scopes its assertions to the deployment with an explicit `template:`.
+templates:
+  - templates/prometheus-exporter-deployment.yaml
+  - templates/prometheus-exporter-configmap.yaml
+release:
+  name: test-pg
+tests:
+  # #204: under sslmode=verify-*, the exporter must mount the CA and be able to read it.
+  - it: verify-ca projects only ca.crt at a world-readable mode
+    template: templates/prometheus-exporter-deployment.yaml
+    values:
+      - ../values-agent.yaml
+    set:
+      prometheusExporter.enabled: true
+      postgresql.tls.enabled: true
+      postgresql.tls.existingSecret: pg-tls
+      prometheusExporter.sslmode: verify-ca
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[?(@.name=="postgresql-tls")].secret.secretName
+          value: pg-tls
+      # 0444 octal == 292 decimal (go-yaml parses the rendered 0444 literal as octal).
+      - equal:
+          path: spec.template.spec.volumes[?(@.name=="postgresql-tls")].secret.defaultMode
+          value: 292
+      # only ca.crt is projected -- tls.key (server private key) and tls.crt are not mounted
+      - lengthEqual:
+          path: spec.template.spec.volumes[?(@.name=="postgresql-tls")].secret.items
+          count: 1
+      - contains:
+          path: spec.template.spec.volumes[?(@.name=="postgresql-tls")].secret.items
+          content:
+            key: ca.crt
+            path: ca.crt
+      - notContains:
+          path: spec.template.spec.volumes[?(@.name=="postgresql-tls")].secret.items
+          content:
+            key: tls.key
+            path: tls.key
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="postgres-exporter")].volumeMounts
+          content:
+            name: postgresql-tls
+            mountPath: /etc/postgres_exporter/tls
+            readOnly: true
+          any: true
+
+  - it: verify-full also projects the CA volume
+    template: templates/prometheus-exporter-deployment.yaml
+    values:
+      - ../values-agent.yaml
+    set:
+      prometheusExporter.enabled: true
+      postgresql.tls.enabled: true
+      postgresql.tls.existingSecret: pg-tls
+      prometheusExporter.sslmode: verify-full
+    asserts:
+      - exists:
+          path: spec.template.spec.volumes[?(@.name=="postgresql-tls")]
+
+  - it: sslmode require mounts no CA volume (no cert verification)
+    template: templates/prometheus-exporter-deployment.yaml
+    values:
+      - ../values-agent.yaml
+    set:
+      prometheusExporter.enabled: true
+      postgresql.tls.enabled: true
+      postgresql.tls.existingSecret: pg-tls
+      prometheusExporter.sslmode: require
+    asserts:
+      - notExists:
+          path: spec.template.spec.volumes[?(@.name=="postgresql-tls")]
