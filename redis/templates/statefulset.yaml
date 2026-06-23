@@ -6,6 +6,7 @@
 {{- if .Values.tls.enabled -}}
 {{- $tlsCli = "--tls --cert /etc/redis/tls/tls.crt --key /etc/redis/tls/tls.key --cacert /etc/redis/tls/ca.crt " -}}
 {{- end -}}
+{{- $cliUser := include "redis.cliUserOpt" . -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -129,6 +130,7 @@ spec:
                   name: {{ include "redis.sentinelSecretName" . }}
                   key: {{ include "redis.sentinelSecretKey" . }}
             {{- end }}
+            {{- include "redis.aclEnv" . | nindent 12 }}
           resources:
             {{- toYaml .Values.redis.bootstrap.resources | nindent 12 }}
           volumeMounts:
@@ -158,8 +160,13 @@ spec:
             - name: REDISCLI_AUTH
               valueFrom:
                 secretKeyRef:
+                {{- if and .Values.redis.auth.acl.enabled (ne (include "redis.operatorUser" .) "default") }}
+                  name: {{ include "redis.operatorSecretName" . }}
+                  key: {{ include "redis.operatorSecretKey" . }}
+                {{- else }}
                   name: {{ include "redis.secretName" . }}
                   key: {{ .Values.redis.auth.existingSecret.key }}
+                {{- end }}
             {{- end }}
           ports:
             - name: redis
@@ -170,7 +177,7 @@ spec:
               command:
                 - sh
                 - -c
-                - redis-cli {{ $tlsCli }}-p {{ $port }} ping
+                - redis-cli {{ $tlsCli }}{{ $cliUser }}-p {{ $port }} ping
             initialDelaySeconds: {{ .Values.redis.livenessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.redis.livenessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.redis.livenessProbe.timeoutSeconds }}
@@ -180,7 +187,7 @@ spec:
               command:
                 - sh
                 - -c
-                - redis-cli {{ $tlsCli }}-p {{ $port }} ping
+                - redis-cli {{ $tlsCli }}{{ $cliUser }}-p {{ $port }} ping
             initialDelaySeconds: {{ .Values.redis.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.redis.readinessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.redis.readinessProbe.timeoutSeconds }}
@@ -191,7 +198,7 @@ spec:
               command:
                 - sh
                 - -c
-                - redis-cli {{ $tlsCli }}-p {{ $port }} ping
+                - redis-cli {{ $tlsCli }}{{ $cliUser }}-p {{ $port }} ping
             periodSeconds: {{ .Values.redis.startupProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.redis.startupProbe.timeoutSeconds }}
             failureThreshold: {{ .Values.redis.startupProbe.failureThreshold }}
@@ -202,7 +209,7 @@ spec:
                 command:
                   - sh
                   - -c
-                  - redis-cli {{ $tlsCli }}-p {{ $port }} SHUTDOWN SAVE
+                  - redis-cli {{ $tlsCli }}{{ $cliUser }}-p {{ $port }} SHUTDOWN SAVE
           resources:
             {{- toYaml .Values.redis.resources | nindent 12 }}
           volumeMounts:
@@ -279,11 +286,21 @@ spec:
             - name: REDIS_ADDR
               value: "{{ if .Values.tls.enabled }}rediss{{ else }}redis{{ end }}://$(POD_NAME).{{ include "redis.headlessDomain" . }}:{{ $port }}"
             {{- if .Values.redis.auth.enabled }}
+            {{- if ne (include "redis.operatorUser" .) "default" }}
+            - name: REDIS_USER
+              value: {{ .Values.redis.auth.acl.operatorUser | quote }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis.operatorSecretName" . }}
+                  key: {{ include "redis.operatorSecretKey" . }}
+            {{- else }}
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "redis.secretName" . }}
                   key: {{ .Values.redis.auth.existingSecret.key }}
+            {{- end }}
             {{- end }}
             {{- if .Values.tls.enabled }}
             - name: REDIS_EXPORTER_TLS_CLIENT_KEY_FILE
@@ -353,6 +370,15 @@ spec:
             storage: {{ .Values.redis.persistence.size }}
   {{- end }}
 {{- else -}}
+{{- $cliUser := include "redis.cliUserOpt" . -}}
+{{- $saAuth := "" -}}
+{{- if .Values.redis.auth.enabled -}}
+{{- if and .Values.redis.auth.acl.enabled (ne (include "redis.operatorUser" .) "default") -}}
+{{- $saAuth = "-a \"$OPERATOR_PWD\" " -}}
+{{- else -}}
+{{- $saAuth = "-a \"$REDIS_PASSWORD\" " -}}
+{{- end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -392,7 +418,20 @@ spec:
           imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.redis.containerSecurityContext | nindent 12 }}
-{{- if .Values.redis.auth.enabled }}
+{{- if .Values.redis.auth.acl.enabled }}
+          command:
+            - sh
+            - -c
+            - |-
+              {{- include "redis.standaloneStartScript" . | nindent 14 }}
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "redis.secretName" . }}
+                  key: {{ .Values.redis.auth.existingSecret.key }}
+            {{- include "redis.aclEnv" . | nindent 12 }}
+{{- else if .Values.redis.auth.enabled }}
           command:
             - sh
             - -c
@@ -417,7 +456,7 @@ spec:
               command:
                 - sh
                 - -c
-                - redis-cli {{ if .Values.redis.auth.enabled }}-a "$REDIS_PASSWORD" {{ end }}ping
+                - redis-cli {{ $cliUser }}{{ $saAuth }}ping
             initialDelaySeconds: {{ .Values.redis.livenessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.redis.livenessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.redis.livenessProbe.timeoutSeconds }}
@@ -427,7 +466,7 @@ spec:
               command:
                 - sh
                 - -c
-                - redis-cli {{ if .Values.redis.auth.enabled }}-a "$REDIS_PASSWORD" {{ end }}ping
+                - redis-cli {{ $cliUser }}{{ $saAuth }}ping
             initialDelaySeconds: {{ .Values.redis.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.redis.readinessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.redis.readinessProbe.timeoutSeconds }}
@@ -438,18 +477,27 @@ spec:
                 command:
                   - sh
                   - -c
-                  - redis-cli {{ if .Values.redis.auth.enabled }}-a "$REDIS_PASSWORD" {{ end }}SHUTDOWN SAVE
+                  - redis-cli {{ $cliUser }}{{ $saAuth }}SHUTDOWN SAVE
           resources:
             {{- toYaml .Values.redis.resources | nindent 12 }}
           volumeMounts:
             - name: config
               mountPath: /etc/redis
+            {{- if .Values.redis.auth.acl.enabled }}
+            - name: config-rw
+              mountPath: /config-rw
+            {{- end }}
             - name: data
               mountPath: /data
       volumes:
         - name: config
           configMap:
             name: {{ include "redis.fullname" . }}
+        {{- if .Values.redis.auth.acl.enabled }}
+        - name: config-rw
+          emptyDir:
+            medium: Memory
+        {{- end }}
         {{- if not .Values.redis.persistence.enabled }}
         - name: data
           emptyDir: {}

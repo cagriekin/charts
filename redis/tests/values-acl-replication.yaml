@@ -1,0 +1,22 @@
+# Replication + ACL with a locked-down `default` user and a separate privileged operator.
+# Exercises masteruser/masterauth, sentinel auth-user/auth-pass, the exporter REDIS_USER,
+# and probe --user -- all of which must use the operator identity, not `default`.
+architecture: replication
+redis:
+  replicaCount: 2
+  persistence:
+    enabled: false
+  auth:
+    enabled: true
+    acl:
+      enabled: true
+      operatorUser: ops
+      users:
+        - name: default
+          rules: "~app:* +@read"
+        - name: app
+          rules: "~app:* +@read +@write"
+exporter:
+  enabled: true
+networkPolicy:
+  enabled: false

@@ -183,5 +183,30 @@ assert_contains "tls: cert volume mount" "${tls}" "/etc/redis/tls"
 tls_fail=$(helm template r "${CHART_DIR}" --set tls.enabled=true 2>&1) && tls_rc=0 || tls_rc=$?
 assert_eq "tls: enabled without secret fails" "1" "${tls_rc}"
 
+# --- ACL ---
+lint_output=$(helm lint "${CHART_DIR}" -f "${SCRIPT_DIR}/values-acl.yaml" 2>&1) && lint_rc=0 || lint_rc=$?
+assert_eq "helm lint with acl (standalone) values passes" "0" "${lint_rc}"
+lint_output=$(helm lint "${CHART_DIR}" -f "${SCRIPT_DIR}/values-acl-replication.yaml" 2>&1) && lint_rc=0 || lint_rc=$?
+assert_eq "helm lint with acl (replication) values passes" "0" "${lint_rc}"
+
+# Replication, locked-down default + custom operator: the operator identity is wired into the
+# replication link, Sentinel, and the in-pod redis-cli probes, and default becomes a user line.
+acl=$(helm template r "${CHART_DIR}" -f "${SCRIPT_DIR}/values-acl-replication.yaml" 2>&1)
+assert_contains "acl: operator user line rendered" "${acl}" "user ops on"
+assert_contains "acl: default user redefined (requirepass dropped)" "${acl}" "user default on"
+assert_contains "acl: replication uses masteruser" "${acl}" "masteruser"
+assert_contains "acl: sentinel auth-user wired" "${acl}" "sentinel auth-user"
+assert_contains "acl: probes carry --user" "${acl}" "redis-cli --user ops"
+
+# Default operator (additive user) keeps the standalone requirepass path; no operator wiring.
+acl_add=$(helm template r "${CHART_DIR}" -f "${SCRIPT_DIR}/values-acl.yaml" 2>&1)
+assert_contains "acl(additive): app user line rendered" "${acl_add}" "user app on"
+assert_not_contains "acl(additive): no masteruser in standalone" "${acl_add}" "masteruser"
+
+# Guard: locking down default without a separate operator is rejected.
+acl_fail=$(helm template r "${CHART_DIR}" --set redis.auth.acl.enabled=true \
+  --set 'redis.auth.acl.users[0].name=default' --set 'redis.auth.acl.users[0].rules=~* +@read' 2>&1) && acl_rc=0 || acl_rc=$?
+assert_eq "acl: locked default without operator fails" "1" "${acl_rc}"
+
 end_suite
 print_summary
