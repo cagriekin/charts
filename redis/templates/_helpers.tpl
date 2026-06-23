@@ -244,6 +244,10 @@ cp /config-ro/sentinel.conf /config-rw/sentinel.conf
 {{- define "redis.exporterPodSpec" -}}
 securityContext:
   {{- toYaml .Values.exporter.podSecurityContext | nindent 2 }}
+{{- with .Values.imagePullSecrets }}
+imagePullSecrets:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
 containers:
   - name: redis-exporter
     image: "{{ .Values.exporter.image.repository }}:{{ .Values.exporter.image.tag }}"

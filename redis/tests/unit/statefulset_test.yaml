@@ -139,6 +139,32 @@ tests:
       - notExists:
           path: metadata.annotations
 
+  - it: imagePullSecrets render on the pod (standalone)
+    template: templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      imagePullSecrets:
+        - name: my-creds
+    asserts:
+      - contains:
+          path: spec.template.spec.imagePullSecrets
+          content:
+            name: my-creds
+
+  - it: imagePullSecrets render on the pod (replication)
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      imagePullSecrets:
+        - name: my-creds
+    asserts:
+      - contains:
+          path: spec.template.spec.imagePullSecrets
+          content:
+            name: my-creds
+
   # --- Replication (Sentinel HA) ---
   - it: replication - 3 pods, headless serviceName, OrderedReady
     template: templates/statefulset.yaml

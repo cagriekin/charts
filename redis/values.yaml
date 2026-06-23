@@ -10,6 +10,10 @@ architecture: replication
 # Cluster DNS domain, used to build the stable per-pod FQDNs Sentinel announces.
 clusterDomain: cluster.local
 
+# Image pull secrets, applied to every pod (redis, sentinel, exporter, init).
+imagePullSecrets: []
+# - name: my-registry-creds
+
 redis:
   image:
     repository: redis
