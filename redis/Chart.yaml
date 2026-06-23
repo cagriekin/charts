@@ -4,6 +4,12 @@ description: Redis with AOF persistence and Sentinel-based HA replication
 type: application
 version: 1.0.0
 appVersion: "8"
+home: https://github.com/cagriekin/charts/tree/master/redis
+icon: https://www.vectorlogo.zone/logos/redis/redis-icon.svg
+sources:
+  - https://github.com/cagriekin/charts
+  - https://redis.io
+  - https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/
 keywords:
   - redis
   - cache
@@ -11,6 +17,10 @@ keywords:
   - replication
   - sentinel
   - high-availability
+maintainers:
+  - name: cagriekin
+    email: cagri.ekin@gmail.com
+    url: https://github.com/cagriekin
 dependencies:
   - name: common
     version: 0.1.0
