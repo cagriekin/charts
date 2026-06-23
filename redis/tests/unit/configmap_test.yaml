@@ -64,6 +64,23 @@ tests:
           path: data["redis.conf"]
           pattern: 'slowlog-log-slower-than 10000'
 
+  - it: unquoted numeric config values render as plain integers (no scientific notation)
+    values:
+      - ../values-minimal.yaml
+    set:
+      redis.config.maxmemory: 100000000
+      redis.config.slowlog-log-slower-than: 10000000
+    asserts:
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'maxmemory 100000000'
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'slowlog-log-slower-than 10000000'
+      - notMatchRegex:
+          path: data["redis.conf"]
+          pattern: 'e\+0'
+
   - it: client timeout and tcp-keepalive are configurable
     values:
       - ../values-minimal.yaml
