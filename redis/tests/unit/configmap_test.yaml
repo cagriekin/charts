@@ -47,6 +47,34 @@ tests:
           path: data["redis.conf"]
           pattern: 'save ""'
 
+  - it: production redis.conf settings rendered
+    values:
+      - ../values-minimal.yaml
+    asserts:
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'dir /data'
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'loglevel notice'
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'databases 16'
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'slowlog-log-slower-than 10000'
+
+  - it: client-output-buffer-limit rendered when set
+    values:
+      - ../values-minimal.yaml
+    set:
+      redis.config.client-output-buffer-limit:
+        - "replica 512mb 128mb 60"
+    asserts:
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'client-output-buffer-limit replica 512mb 128mb 60'
+
   - it: standalone - no sentinel.conf or min-replicas directives
     values:
       - ../values-minimal.yaml

@@ -17,6 +17,14 @@ data:
     auto-aof-rewrite-min-size {{ index .Values.redis.config "auto-aof-rewrite-min-size" }}
     maxmemory {{ .Values.redis.config.maxmemory }}
     maxmemory-policy {{ index .Values.redis.config "maxmemory-policy" }}
+    dir /data
+    loglevel {{ .Values.redis.config.loglevel }}
+    databases {{ .Values.redis.config.databases }}
+    slowlog-log-slower-than {{ index .Values.redis.config "slowlog-log-slower-than" }}
+    slowlog-max-len {{ index .Values.redis.config "slowlog-max-len" }}
+{{- range (index .Values.redis.config "client-output-buffer-limit") }}
+    client-output-buffer-limit {{ . }}
+{{- end }}
     tcp-keepalive 60
     timeout 0
 {{- if .Values.redis.config.rdbSnapshots }}
