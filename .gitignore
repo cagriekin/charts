@@ -2,3 +2,6 @@
 *.iml
 test.yaml
 values-full.yaml
+# helm-unittest auto-creates an (empty) snapshot dir per chart even when no suite uses
+# matchSnapshot; the committed suites assert on parsed paths, so these are artifacts.
+**/tests/unit/__snapshot__/

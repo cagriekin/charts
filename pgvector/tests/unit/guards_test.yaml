@@ -1,0 +1,30 @@
+suite: pgvector fail-fast guards
+templates:
+  - templates/statefulset.yaml
+release:
+  name: test-pgv
+tests:
+  # The fail-fast guards live in the symlinked pg templates; confirm they still fire
+  # when rendered with pgvector's own values + schema.
+  - it: standalone with replicas > 0 fails fast
+    set:
+      repmgr.enabled: false
+      postgresql.replicaCount: 1
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr"
+
+  - it: invalid failoverMode is rejected by the values schema
+    set:
+      repmgr.failoverMode: bogus
+    asserts:
+      - failedTemplate: {}
+
+  - it: standalone with replicaCount 0 renders
+    set:
+      repmgr.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - notFailedTemplate: {}

@@ -1,0 +1,41 @@
+suite: etcd fail-fast guards
+release:
+  name: test-etcd
+tests:
+  - it: tls.enabled without existingSecret fails fast
+    templates:
+      - templates/statefulset.yaml
+    set:
+      tls.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "etcd: tls.enabled requires tls.existingSecret (a Secret with keys tls.crt, tls.key, ca.crt)"
+
+  - it: rbac.enabled without tls fails fast
+    templates:
+      - templates/rbac-bootstrap-job.yaml
+    set:
+      rbac.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "etcd: rbac.enabled requires tls.enabled (auth is by client-cert Common Name)"
+
+  - it: rbac.enabled with tls but no tenants fails fast
+    templates:
+      - templates/rbac-bootstrap-job.yaml
+    set:
+      rbac.enabled: true
+      tls.enabled: true
+      tls.existingSecret: etcd-tls
+      rbac.adminSecret: etcd-root
+    asserts:
+      - failedTemplate:
+          errorMessage: "etcd: rbac.enabled requires at least one rbac.tenants entry -- enabling auth with no tenant user would lock every CN-authenticated agent out of the keyspace"
+
+  - it: invalid image.pullPolicy is rejected by the values schema
+    templates:
+      - templates/statefulset.yaml
+    set:
+      image.pullPolicy: Sometimes
+    asserts:
+      - failedTemplate: {}
