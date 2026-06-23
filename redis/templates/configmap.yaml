@@ -13,12 +13,20 @@ data:
     appendonly yes
     appendfsync {{ .Values.redis.config.appendfsync }}
     no-appendfsync-on-rewrite {{ index .Values.redis.config "no-appendfsync-on-rewrite" }}
-    auto-aof-rewrite-percentage {{ index .Values.redis.config "auto-aof-rewrite-percentage" }}
+    auto-aof-rewrite-percentage {{ include "redis.intval" (index .Values.redis.config "auto-aof-rewrite-percentage") }}
     auto-aof-rewrite-min-size {{ index .Values.redis.config "auto-aof-rewrite-min-size" }}
-    maxmemory {{ .Values.redis.config.maxmemory }}
+    maxmemory {{ include "redis.intval" .Values.redis.config.maxmemory }}
     maxmemory-policy {{ index .Values.redis.config "maxmemory-policy" }}
-    tcp-keepalive 60
-    timeout 0
+    dir /data
+    loglevel {{ .Values.redis.config.loglevel }}
+    databases {{ include "redis.intval" .Values.redis.config.databases }}
+    slowlog-log-slower-than {{ include "redis.intval" (index .Values.redis.config "slowlog-log-slower-than") }}
+    slowlog-max-len {{ include "redis.intval" (index .Values.redis.config "slowlog-max-len") }}
+{{- range (index .Values.redis.config "client-output-buffer-limit") }}
+    client-output-buffer-limit {{ . }}
+{{- end }}
+    tcp-keepalive {{ include "redis.intval" (index .Values.redis.config "tcp-keepalive") }}
+    timeout {{ include "redis.intval" .Values.redis.config.timeout }}
 {{- if .Values.redis.config.rdbSnapshots }}
 {{- range .Values.redis.config.rdbSnapshots }}
     save {{ .seconds }} {{ .changes }}
@@ -28,8 +36,8 @@ data:
 {{- end }}
 {{- if eq .Values.architecture "replication" }}
     replica-read-only {{ index .Values.redis.config "replica-read-only" }}
-    min-replicas-to-write {{ index .Values.redis.config "min-replicas-to-write" }}
-    min-replicas-max-lag {{ index .Values.redis.config "min-replicas-max-lag" }}
+    min-replicas-to-write {{ include "redis.intval" (index .Values.redis.config "min-replicas-to-write") }}
+    min-replicas-max-lag {{ include "redis.intval" (index .Values.redis.config "min-replicas-max-lag") }}
 {{- end }}
 {{- if .Values.tls.enabled }}
     port 0

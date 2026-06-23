@@ -39,6 +39,10 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.redis.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.redis.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.redis.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
@@ -378,6 +382,10 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.redis.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.redis.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: redis
           image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"

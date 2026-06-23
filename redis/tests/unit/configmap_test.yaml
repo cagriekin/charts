@@ -47,6 +47,65 @@ tests:
           path: data["redis.conf"]
           pattern: 'save ""'
 
+  - it: production redis.conf settings rendered
+    values:
+      - ../values-minimal.yaml
+    asserts:
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'dir /data'
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'loglevel notice'
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'databases 16'
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'slowlog-log-slower-than 10000'
+
+  - it: unquoted numeric config values render as plain integers (no scientific notation)
+    values:
+      - ../values-minimal.yaml
+    set:
+      redis.config.maxmemory: 100000000
+      redis.config.slowlog-log-slower-than: 10000000
+    asserts:
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'maxmemory 100000000'
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'slowlog-log-slower-than 10000000'
+      - notMatchRegex:
+          path: data["redis.conf"]
+          pattern: 'e\+0'
+
+  - it: client timeout and tcp-keepalive are configurable
+    values:
+      - ../values-minimal.yaml
+    set:
+      redis.config.timeout: 300
+      redis.config.tcp-keepalive: 120
+    asserts:
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'timeout 300'
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'tcp-keepalive 120'
+
+  - it: client-output-buffer-limit rendered when set
+    values:
+      - ../values-minimal.yaml
+    set:
+      redis.config.client-output-buffer-limit:
+        - "replica 512mb 128mb 60"
+    asserts:
+      - matchRegex:
+          path: data["redis.conf"]
+          pattern: 'client-output-buffer-limit replica 512mb 128mb 60'
+
   - it: standalone - no sentinel.conf or min-replicas directives
     values:
       - ../values-minimal.yaml

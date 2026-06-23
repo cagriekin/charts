@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.0
+
+Operability and production-hardening (non-breaking; defaults unchanged).
+
+### Added
+- Fail-fast validation that `redis.config.maxmemory` does not exceed
+  `redis.resources.limits.memory` (#82).
+- `imagePullSecrets` applied to every pod — redis, sentinel, exporter, and the
+  bootstrap init container (#84).
+- Configurable production `redis.conf` settings: `loglevel`, `databases`,
+  `slowlog-log-slower-than`, `slowlog-max-len`, `client-output-buffer-limit`, an
+  explicit `dir /data`, and configurable `timeout` / `tcp-keepalive` (#81, #78).
+- Complete `Chart.yaml` metadata: `home`, `icon`, `sources`, `maintainers` (#85).
+
 ## 1.0.0
 
 High-availability replication via Redis Sentinel. **Breaking**: the default

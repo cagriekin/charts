@@ -10,6 +10,10 @@ architecture: replication
 # Cluster DNS domain, used to build the stable per-pod FQDNs Sentinel announces.
 clusterDomain: cluster.local
 
+# Image pull secrets, applied to every pod (redis, sentinel, exporter, init).
+imagePullSecrets: []
+# - name: my-registry-creds
+
 redis:
   image:
     repository: redis
@@ -82,6 +86,21 @@ redis:
     no-appendfsync-on-rewrite: "yes"
     auto-aof-rewrite-percentage: "100"
     auto-aof-rewrite-min-size: "64mb"
+    # General production settings (defaults match Redis defaults).
+    # Close idle client connections after N seconds (0 = never).
+    timeout: 0
+    # TCP keepalive (seconds); 0 disables.
+    tcp-keepalive: 60
+    loglevel: "notice"
+    databases: 16
+    slowlog-log-slower-than: 10000
+    slowlog-max-len: 128
+    # Per-class client output buffer limits (list of full directive args). Empty = Redis
+    # defaults. Example for a busy replication/pubsub workload:
+    # client-output-buffer-limit:
+    #   - "replica 512mb 128mb 60"
+    #   - "pubsub 32mb 8mb 60"
+    client-output-buffer-limit: []
     # Write-safety (replication mode only): the master refuses writes unless at least
     # min-replicas-to-write replicas are connected within min-replicas-max-lag seconds.
     # Shrinks the data-loss window on failover. Must be < replicaCount + 1.
