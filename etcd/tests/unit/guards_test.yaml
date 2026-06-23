@@ -38,4 +38,5 @@ tests:
     set:
       image.pullPolicy: Sometimes
     asserts:
-      - failedTemplate: {}
+      - failedTemplate:
+          errorPattern: "at '/image/pullPolicy': value must be one of"

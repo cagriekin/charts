@@ -18,7 +18,8 @@ tests:
     set:
       repmgr.failoverMode: bogus
     asserts:
-      - failedTemplate: {}
+      - failedTemplate:
+          errorPattern: "at '/repmgr/failoverMode': value must be one of"
 
   - it: standalone with replicaCount 0 renders
     set:
