@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.0
+
+ACL support (non-breaking; `redis.auth.acl.enabled` defaults `false`, so existing installs
+are unchanged).
+
+### Added
+- Redis ACL users via `redis.auth.acl` (#87): layer named, per-command/per-key users on top
+  of password auth, in both `standalone` and `replication`. Passwords stay out of the
+  ConfigMap (rendered into `redis.conf` at runtime from Secret-backed env).
+- A chart-managed **operator user** (`redis.auth.acl.operatorUser`) — the privileged identity
+  used for replication (`masteruser`/`masterauth`), Sentinel (`auth-user`/`auth-pass`), the
+  exporter (`REDIS_USER`), and probes; lets you lock down the `default` user.
+- Fail-fast validation of ACL config (auth prerequisite, username charset, no
+  `on`/`off`/`nopass`/`reset*`/`>`/`#` and no shell metacharacters (`" $ ` + backslash) in
+  `rules` — they are appended to `redis.conf` via a shell `echo` at startup —
+  operator/`default` interlocks, ACL knobs set while `acl.enabled` is false, and BYO
+  `existingSecret` requiring an explicit `passwordSecret.name` for every ACL user and the
+  operator).
+
 ## 1.1.0
 
 Operability and production-hardening (non-breaking; defaults unchanged).

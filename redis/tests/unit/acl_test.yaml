@@ -1,0 +1,311 @@
+suite: acl
+templates:
+  - templates/statefulset.yaml
+  - templates/configmap.yaml
+  - templates/secret.yaml
+  - templates/exporter-deployment.yaml
+tests:
+  # ---- replication, default operator (additive app user) ----
+  - it: replication default-operator - app user line + requirepass kept, no operator wiring
+    template: templates/configmap.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.acl.enabled: true
+      redis.auth.acl.users:
+        - name: app
+          rules: "~app:* &app:* +@read +@write"
+    asserts:
+      - matchRegex:
+          path: data["bootstrap.sh"]
+          pattern: 'user app on >\$\{ACL_PASS_0\} ~app:\* &app:\* \+@read \+@write'
+      - matchRegex:
+          path: data["bootstrap.sh"]
+          pattern: 'requirepass \$\{REDIS_PASSWORD\}'
+      - matchRegex:
+          path: data["bootstrap.sh"]
+          pattern: 'masterauth \$\{REDIS_PASSWORD\}'
+      - notMatchRegex:
+          path: data["bootstrap.sh"]
+          pattern: masteruser
+      - notMatchRegex:
+          path: data["bootstrap.sh"]
+          pattern: sentinel auth-user
+
+  # ---- replication, locked-down default + custom operator ----
+  - it: replication custom-operator - operator/masteruser/auth-user wired, requirepass dropped
+    template: templates/configmap.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.acl.enabled: true
+      redis.auth.acl.operatorUser: ops
+      redis.auth.acl.users:
+        - name: default
+          rules: "~app:* +@read"
+        - name: app
+          rules: "~app:* +@all"
+    asserts:
+      - matchRegex:
+          path: data["bootstrap.sh"]
+          pattern: 'user ops on >\$\{OPERATOR_PWD\} ~\* &\* \+@all'
+      - matchRegex:
+          path: data["bootstrap.sh"]
+          pattern: 'user default on >\$\{ACL_PASS_0\} ~app:\* \+@read'
+      - matchRegex:
+          path: data["bootstrap.sh"]
+          pattern: 'masteruser \$\{OPERATOR_USER\}'
+      - matchRegex:
+          path: data["bootstrap.sh"]
+          pattern: 'masterauth \$\{OPERATOR_PWD\}'
+      - matchRegex:
+          path: data["bootstrap.sh"]
+          pattern: 'sentinel auth-user \$\{MASTER_NAME\} \$\{OPERATOR_USER\}'
+      - notMatchRegex:
+          path: data["bootstrap.sh"]
+          pattern: 'requirepass \$\{REDIS_PASSWORD\}'
+
+  - it: replication custom-operator - probes carry --user and envs are wired
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.acl.enabled: true
+      redis.auth.acl.operatorUser: ops
+      redis.auth.acl.users:
+        - name: app
+          rules: "~app:* +@all"
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
+          pattern: 'redis-cli --user ops -p 6379 ping'
+      - contains:
+          path: spec.template.spec.initContainers[0].env
+          content:
+            name: OPERATOR_USER
+            value: "ops"
+      - contains:
+          path: spec.template.spec.containers[2].env
+          content:
+            name: REDIS_USER
+            value: "ops"
+
+  # ---- standalone parity ----
+  - it: standalone custom-operator - wrapper renders user lines + config-rw volume
+    template: templates/statefulset.yaml
+    set:
+      architecture: standalone
+      redis.auth.acl.enabled: true
+      redis.auth.acl.operatorUser: ops
+      redis.auth.acl.users:
+        - name: default
+          rules: "~app:* +@read"
+        - name: app
+          rules: "~app:* +@all"
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'user ops on >\$\{OPERATOR_PWD\} ~\* &\* \+@all'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'exec redis-server /config-rw/redis.conf'
+      - matchRegex:
+          path: spec.template.spec.containers[0].livenessProbe.exec.command[2]
+          pattern: 'redis-cli --user ops -a "\$OPERATOR_PWD" ping'
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: config-rw
+            emptyDir:
+              medium: Memory
+
+  - it: standalone exporter deployment - REDIS_USER set for custom operator
+    template: templates/exporter-deployment.yaml
+    set:
+      architecture: standalone
+      exporter.enabled: true
+      redis.auth.acl.enabled: true
+      redis.auth.acl.operatorUser: ops
+      redis.auth.acl.users:
+        - name: app
+          rules: "~app:* +@all"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_USER
+            value: "ops"
+
+  # ---- secret multi-key generation ----
+  - it: secret - per-user password key generated alongside primary
+    template: templates/secret.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.acl.enabled: true
+      redis.auth.acl.users:
+        - name: app
+          rules: "~app:* +@all"
+    asserts:
+      - exists:
+          path: data["redis-password"]
+      - exists:
+          path: data["acl-app-password"]
+
+  - it: secret - custom operator + locked default generate their keys
+    template: templates/secret.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.acl.enabled: true
+      redis.auth.acl.operatorUser: ops
+      redis.auth.acl.users:
+        - name: default
+          rules: "~app:* +@read"
+        - name: app
+          rules: "~app:* +@all"
+    asserts:
+      # The operator reuses the primary redis-password key by default (operatorPasswordSecret
+      # unset => operatorSecretKey falls back to existingSecret.key), so no separate
+      # acl-ops-password is generated; the primary key carries the operator password.
+      - exists:
+          path: data["redis-password"]
+      - exists:
+          path: data["acl-default-password"]
+      - exists:
+          path: data["acl-app-password"]
+
+  # ---- ACL disabled: no leakage ----
+  - it: acl disabled - no ACL user lines or operator wiring
+    template: templates/configmap.yaml
+    values:
+      - ../values-replication.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["bootstrap.sh"]
+          pattern: 'user .* on >'
+      - notMatchRegex:
+          path: data["bootstrap.sh"]
+          pattern: masteruser
+
+  # ---- guards ----
+  - it: guard - acl requires auth.enabled
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.enabled: false
+      redis.auth.acl.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: redis.auth.acl.enabled requires redis.auth.enabled
+
+  - it: guard - rules may not contain enablement/password tokens
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.acl.enabled: true
+      redis.auth.acl.users:
+        - name: app
+          rules: "nopass +@all"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'redis.auth.acl: user "app" rules must contain permission tokens only; the chart manages enablement (drop on/off/nopass/reset*)'
+
+  - it: guard - rules may not embed a password
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.acl.enabled: true
+      redis.auth.acl.users:
+        - name: app
+          rules: ">hunter2 +@all"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'redis.auth.acl: user "app" rules must not embed a password (>...) or hash (#...); set passwordSecret instead'
+
+  - it: guard - locking down default requires a separate operator
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.acl.enabled: true
+      redis.auth.acl.users:
+        - name: default
+          rules: "~app:* +@read"
+    asserts:
+      - failedTemplate:
+          errorMessage: "redis.auth.acl: redefining the `default` user requires a separate operatorUser; the chart authenticates as operatorUser for replication, failover, the exporter, and probes, so locking down `default` while it is the operator would break them"
+
+  - it: guard - operatorUser must not also appear in users[]
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.acl.enabled: true
+      redis.auth.acl.operatorUser: ops
+      redis.auth.acl.users:
+        - name: ops
+          rules: "~* +@all"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'redis.auth.acl: operatorUser "ops" must not also appear in users[]; the chart manages the operator user with full permissions (~* &* +@all)'
+
+  - it: guard - rules may not contain shell metacharacters
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.acl.enabled: true
+      redis.auth.acl.operatorUser: ops
+      redis.auth.acl.users:
+        - name: app
+          rules: "~app:* +@read $(touch /pwned)"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'redis.auth.acl: user "app" rules must not contain the shell metacharacters " $ ` or \ (rules are appended to redis.conf via a shell echo at startup)'
+
+  - it: guard - non-default operatorUser while acl disabled is rejected
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.acl.enabled: false
+      redis.auth.acl.operatorUser: ops
+    asserts:
+      - failedTemplate:
+          errorMessage: "redis.auth.acl.operatorUser is non-default but redis.auth.acl.enabled is false; enable ACL or leave operatorUser as 'default'"
+
+  - it: guard - acl users while acl disabled is rejected
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.acl.enabled: false
+      redis.auth.acl.users:
+        - name: app
+          rules: "~app:* +@read"
+    asserts:
+      - failedTemplate:
+          errorMessage: "redis.auth.acl.users is set but redis.auth.acl.enabled is false; set redis.auth.acl.enabled=true or remove the users"
+
+  - it: guard - existingSecret with ACL requires explicit per-user passwordSecret.name
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.existingSecret.name: my-redis-secret
+      redis.auth.acl.enabled: true
+      redis.auth.acl.operatorUser: ops
+      redis.auth.acl.operatorPasswordSecret.name: my-redis-secret
+      redis.auth.acl.operatorPasswordSecret.key: ops-pw
+      redis.auth.acl.users:
+        - name: default
+          rules: "~app:* +@read"
+        - name: app
+          rules: "~app:* +@all"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'redis.auth.acl: with redis.auth.existingSecret.name set, user "default" must set passwordSecret.name (the chart writes no per-user password into a user-supplied Secret)'
