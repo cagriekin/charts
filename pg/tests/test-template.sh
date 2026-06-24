@@ -151,6 +151,17 @@ assert_contains "#157: pgpool reset_query_list doubles embedded single quotes" "
 stanza_quote=$(helm template test-pg "${CHART_DIR}" --set pgbackrest.enabled=true --set pgbackrest.s3.endpoint=https://s --set pgbackrest.s3.bucket=b --set pgbackrest.existingSecret.name=sec --set-string "pgbackrest.stanza=x'y" --show-only templates/postgresql-configmap.yaml 2>&1)
 assert_contains "#157: archive_command doubles single quotes in the stanza" "${stanza_quote}" "stanza=x''y archive-push"
 
+# #207: agent-mode pgpool must only configure the RO (-readonly) backend when standbys
+# exist. With replicaCount=0 the -readonly Service has zero endpoints, so a backend1
+# there fails every health check and churns pgpool into "restarting myself" cycles,
+# killing live connections to the healthy primary.
+pgpool_agent_ro=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set repmgr.enabled=true --set repmgr.failoverMode=agent --set postgresql.replicaCount=2 --show-only templates/pgpool-configmap.yaml 2>&1)
+assert_contains "#207: agent mode with standbys configures RO backend1" "${pgpool_agent_ro}" "backend_hostname1 = 'test-pg-readonly"
+assert_contains "#207: agent mode with standbys weights primary 0" "${pgpool_agent_ro}" "backend_weight0 = 0"
+pgpool_agent_primary=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set repmgr.enabled=true --set repmgr.failoverMode=agent --set postgresql.replicaCount=0 --show-only templates/pgpool-configmap.yaml 2>&1)
+assert_not_contains "#207: agent mode primary-only omits RO backend1" "${pgpool_agent_primary}" "backend_hostname1"
+assert_contains "#207: agent mode primary-only weights the sole primary 1" "${pgpool_agent_primary}" "backend_weight0 = 1"
+
 # #156: env values must be quoted (k8s EnvVar.value is a string; a numeric/bool-looking
 # value renders as a YAML scalar the API server rejects with an unmarshal error).
 numericenv=$(helm template test-pg "${CHART_DIR}" --set repmgr.database=12345 --show-only templates/statefulset.yaml 2>&1)

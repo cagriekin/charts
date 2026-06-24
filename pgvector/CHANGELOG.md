@@ -1,5 +1,20 @@
 # pgvector chart changelog
 
+## 1.2.4 - 2026-06-24
+
+Chart-only fix for agent-mode pgpool instability at `postgresql.replicaCount: 0` (#207).
+No image change (`trixie-5.5.0-26`). Shares pg's pgpool template (symlinked); see the pg
+CHANGELOG for detail.
+
+### Fixed
+
+- **Agent-mode pgpool churned `restarting myself` and dropped live primary connections
+  when `postgresql.replicaCount: 0` (#207).** The pgpool ConfigMap unconditionally
+  configured a second backend at the `-readonly` Service, which has zero endpoints with no
+  standbys, so pgpool health-checked an unreachable backend and repeatedly restarted. The
+  RO backend is now emitted only when `replicaCount > 0`; primary-only agent mode renders a
+  single, stable RW backend.
+
 ## 1.2.3 - 2026-06-23
 
 Chart-only fix for a postgres-exporter TLS regression (#204). No image change
