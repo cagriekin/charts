@@ -295,6 +295,9 @@ exec redis-server /config-rw/redis.conf
 {{- fail "redis.auth.acl.enabled requires redis.auth.enabled" }}
 {{- end }}
 {{- $op := include "redis.operatorUser" . }}
+{{- if and (ne $op "default") (not (regexMatch "^[A-Za-z0-9_.-]+$" $op)) }}
+{{- fail (printf "redis.auth.acl.operatorUser %q must match ^[A-Za-z0-9_.-]+$ (no spaces or shell-significant characters)" $op) }}
+{{- end }}
 {{- $names := list }}
 {{- range .Values.redis.auth.acl.users }}
 {{- if not (regexMatch "^[A-Za-z0-9_.-]+$" .name) }}
