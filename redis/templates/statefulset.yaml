@@ -302,6 +302,9 @@ spec:
             - name: REDIS_EXPORTER_TLS_CA_CERT_FILE
               value: /etc/redis/tls/ca.crt
             {{- end }}
+            {{- with (include "redis.exporterConfigEnv" . | trim) }}
+            {{- . | nindent 12 }}
+            {{- end }}
           ports:
             - name: metrics
               containerPort: 9121

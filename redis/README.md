@@ -222,6 +222,14 @@ window.
 | `redis.config.appendfsync` | AOF sync (`always`/`everysec`/`no`) | `everysec` |
 | `exporter.enabled` | Prometheus exporter (sidecar in replication) | `true` |
 | `exporter.serviceMonitor.enabled` / `exporter.prometheusRule.enabled` | ServiceMonitor / alerts | `true` / `false` |
+| `exporter.serviceMonitor.interval` / `scrapeTimeout` | Prometheus scrape interval / timeout | `30s` / `10s` |
+| `exporter.connectionTimeout` | Go-duration connect timeout to Redis (empty = exporter default 15s) | `""` |
+| `exporter.logFormat` | Exporter log format: `txt` (logfmt) or `json` | `txt` |
+| `exporter.includeConfigMetrics` | Include `CONFIG GET` key metrics | `false` |
+| `exporter.inclSystemMetrics` | Include system-level metrics from INFO (process cpu/mem) | `false` |
+| `exporter.exportClientList` | Export per-client metrics via `CLIENT LIST` (expensive) | `false` |
+| `exporter.disableExporterMetrics` | Disable go-runtime metrics from the exporter itself | `false` |
+| `exporter.extraEnvVars` | Additional env vars for the exporter container (supports `value` and `valueFrom`) | `[]` |
 
 ## Monitoring
 
@@ -230,6 +238,22 @@ role and replication metrics are scraped. Enabling `exporter.prometheusRule.enab
 HA alerts: `RedisDown`/`RedisNoMaster`, `RedisMultipleMasters` (split-brain),
 `RedisReplicaDown`, `RedisReplicationLinkDown`, and `RedisWritesBlocked` (the
 `min-replicas-to-write` tripwire). Standalone keeps the original single-instance alerts.
+
+### Exporter tuning
+
+All new options apply to both architectures (replication sidecar and standalone Deployment):
+
+- **`connectionTimeout`** — if your Redis is slow to respond during startup or network
+  hiccups cause false scrape timeouts, raise this (e.g. `"30s"`).
+- **`includeConfigMetrics`** — adds a small set of metrics from `CONFIG GET` (useful for
+  auditing live config without `redis-cli`).
+- **`inclSystemMetrics`** — adds `redis_used_cpu_sys`/`redis_used_cpu_user` from `INFO`.
+- **`exportClientList`** — exports per-client connection metrics via `CLIENT LIST`; avoid on
+  instances with many connected clients (O(n) overhead per scrape).
+- **`disableExporterMetrics`** — suppresses go-runtime and process metrics emitted by the
+  exporter process itself; useful when you want only Redis metrics in the scraped output.
+- **`extraEnvVars`** — pass any other `REDIS_EXPORTER_*` flag (e.g. a Lua script path via
+  `REDIS_EXPORTER_SCRIPT`, or `REDIS_EXPORTER_MAX_DISTINCT_KEY_GROUPS`).
 
 ## Persistence
 

@@ -148,7 +148,14 @@
               "enum": ["ClusterIP", "NodePort", "LoadBalancer", "ExternalName"]
             }
           }
-        }
+        },
+        "logFormat": {
+          "enum": ["txt", "json"]
+        },
+        "includeConfigMetrics": { "type": "boolean" },
+        "inclSystemMetrics":    { "type": "boolean" },
+        "exportClientList":     { "type": "boolean" },
+        "disableExporterMetrics": { "type": "boolean" }
       }
     },
     "service": {
