@@ -1,0 +1,4 @@
+exporter:
+  extraEnvVars:
+    - name: REDIS_EXPORTER_SCRIPT
+      value: /scripts/custom.lua

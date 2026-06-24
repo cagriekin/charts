@@ -295,3 +295,54 @@ tests:
           content:
             name: REDIS_EXPORTER_LOG_FORMAT
             value: "txt"
+
+  - it: replication - logFormat json sets env in sidecar
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      exporter.logFormat: "json"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="redis-exporter")].env
+          content:
+            name: REDIS_EXPORTER_LOG_FORMAT
+            value: "json"
+
+  - it: replication - includeSystemMetrics true sets env in sidecar
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      exporter.includeSystemMetrics: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="redis-exporter")].env
+          content:
+            name: REDIS_EXPORTER_INCL_SYSTEM_METRICS
+            value: "true"
+
+  - it: replication - exportClientList true sets env in sidecar
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      exporter.exportClientList: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="redis-exporter")].env
+          content:
+            name: REDIS_EXPORTER_EXPORT_CLIENT_LIST
+            value: "true"
+
+  - it: replication - extraEnvVars are injected into sidecar
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+      - ../values-exporter-extras-replication.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="redis-exporter")].env
+          content:
+            name: REDIS_EXPORTER_SCRIPT
+            value: /scripts/custom.lua

@@ -276,7 +276,7 @@ exporter:
   # Include metrics derived from CONFIG GET.
   includeConfigMetrics: false
   # Include system-level metrics from INFO (cpu/mem used by the redis process).
-  inclSystemMetrics: false
+  includeSystemMetrics: false
   # Export per-client metrics via CLIENT LIST (expensive on large connection counts).
   exportClientList: false
   # Disable go-runtime metrics emitted by the exporter process itself.

@@ -496,10 +496,10 @@ cp /config-ro/sentinel.conf /config-rw/sentinel.conf
 {{- end }}
 
 {{- /* Non-auth exporter configuration env vars: connection timeout, log format, metric
-       group toggles, and the user-supplied extraEnvVars escape hatch. Emits list items at
-       zero indent; the caller trims and nindents. Shared by the standalone exporter
-       Deployment (redis.exporterPodSpec) and the replication exporter sidecar
-       (statefulset.yaml) so both topologies always have the same config knobs. */ -}}
+       group toggles, TLS client certs, and the user-supplied extraEnvVars escape hatch.
+       Emits list items at zero indent; the caller trims and nindents. Shared by the
+       standalone exporter Deployment (redis.exporterPodSpec) and the replication exporter
+       sidecar (statefulset.yaml) so both topologies always have the same config knobs. */ -}}
 {{- define "redis.exporterConfigEnv" -}}
 {{- if .Values.exporter.connectionTimeout }}
 - name: REDIS_EXPORTER_CONNECTION_TIMEOUT
@@ -513,7 +513,7 @@ cp /config-ro/sentinel.conf /config-rw/sentinel.conf
 - name: REDIS_EXPORTER_INCLUDE_CONFIG_METRICS
   value: "true"
 {{- end }}
-{{- if .Values.exporter.inclSystemMetrics }}
+{{- if .Values.exporter.includeSystemMetrics }}
 - name: REDIS_EXPORTER_INCL_SYSTEM_METRICS
   value: "true"
 {{- end }}
@@ -524,6 +524,14 @@ cp /config-ro/sentinel.conf /config-rw/sentinel.conf
 {{- if .Values.exporter.disableExporterMetrics }}
 - name: REDIS_EXPORTER_DISABLE_EXPORTER_METRICS
   value: "true"
+{{- end }}
+{{- if .Values.tls.enabled }}
+- name: REDIS_EXPORTER_TLS_CLIENT_KEY_FILE
+  value: /etc/redis/tls/tls.key
+- name: REDIS_EXPORTER_TLS_CLIENT_CERT_FILE
+  value: /etc/redis/tls/tls.crt
+- name: REDIS_EXPORTER_TLS_CA_CERT_FILE
+  value: /etc/redis/tls/ca.crt
 {{- end }}
 {{- with .Values.exporter.extraEnvVars }}
 {{ toYaml . | trim }}
@@ -549,14 +557,6 @@ containers:
       {{- with (include "redis.exporterAuthEnv" . | trim) }}
       {{- . | nindent 6 }}
       {{- end }}
-{{- if .Values.tls.enabled }}
-      - name: REDIS_EXPORTER_TLS_CLIENT_KEY_FILE
-        value: /etc/redis/tls/tls.key
-      - name: REDIS_EXPORTER_TLS_CLIENT_CERT_FILE
-        value: /etc/redis/tls/tls.crt
-      - name: REDIS_EXPORTER_TLS_CA_CERT_FILE
-        value: /etc/redis/tls/ca.crt
-{{- end }}
       {{- with (include "redis.exporterConfigEnv" . | trim) }}
       {{- . | nindent 6 }}
       {{- end }}

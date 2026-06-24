@@ -89,6 +89,42 @@ tests:
             name: REDIS_EXPORTER_INCLUDE_CONFIG_METRICS
             value: "true"
 
+  - it: includeSystemMetrics true sets env
+    values:
+      - ../values-full-test.yaml
+    set:
+      exporter.includeSystemMetrics: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_INCL_SYSTEM_METRICS
+            value: "true"
+
+  - it: exportClientList true sets env
+    values:
+      - ../values-full-test.yaml
+    set:
+      exporter.exportClientList: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_EXPORT_CLIENT_LIST
+            value: "true"
+
+  - it: disableExporterMetrics true sets env
+    values:
+      - ../values-full-test.yaml
+    set:
+      exporter.disableExporterMetrics: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_DISABLE_EXPORTER_METRICS
+            value: "true"
+
   - it: all metric toggles false emits none of them
     values:
       - ../values-full-test.yaml
@@ -114,7 +150,7 @@ tests:
             name: REDIS_EXPORTER_DISABLE_EXPORTER_METRICS
             value: "true"
 
-  - it: extraEnvVars are passed through to the exporter container
+  - it: extraEnvVars value form is passed through to the exporter container
     values:
       - ../values-exporter-extras.yaml
     asserts:
@@ -123,3 +159,16 @@ tests:
           content:
             name: REDIS_EXPORTER_SCRIPT
             value: /scripts/custom.lua
+
+  - it: extraEnvVars valueFrom form is passed through to the exporter container
+    values:
+      - ../values-exporter-extras.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_SECRET_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: my-extra-secret
+                key: token

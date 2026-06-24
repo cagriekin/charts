@@ -226,7 +226,7 @@ window.
 | `exporter.connectionTimeout` | Go-duration connect timeout to Redis (empty = exporter default 15s) | `""` |
 | `exporter.logFormat` | Exporter log format: `txt` (logfmt) or `json` | `txt` |
 | `exporter.includeConfigMetrics` | Include `CONFIG GET` key metrics | `false` |
-| `exporter.inclSystemMetrics` | Include system-level metrics from INFO (process cpu/mem) | `false` |
+| `exporter.includeSystemMetrics` | Include system-level metrics from INFO (process cpu/mem) | `false` |
 | `exporter.exportClientList` | Export per-client metrics via `CLIENT LIST` (expensive) | `false` |
 | `exporter.disableExporterMetrics` | Disable go-runtime metrics from the exporter itself | `false` |
 | `exporter.extraEnvVars` | Additional env vars for the exporter container (supports `value` and `valueFrom`) | `[]` |
@@ -247,7 +247,7 @@ All new options apply to both architectures (replication sidecar and standalone 
   hiccups cause false scrape timeouts, raise this (e.g. `"30s"`).
 - **`includeConfigMetrics`** — adds a small set of metrics from `CONFIG GET` (useful for
   auditing live config without `redis-cli`).
-- **`inclSystemMetrics`** — adds `redis_used_cpu_sys`/`redis_used_cpu_user` from `INFO`.
+- **`includeSystemMetrics`** — adds `redis_used_cpu_sys`/`redis_used_cpu_user` from `INFO`.
 - **`exportClientList`** — exports per-client connection metrics via `CLIENT LIST`; avoid on
   instances with many connected clients (O(n) overhead per scrape).
 - **`disableExporterMetrics`** — suppresses go-runtime and process metrics emitted by the

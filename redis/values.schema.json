@@ -149,13 +149,15 @@
             }
           }
         },
+        "connectionTimeout": { "type": "string" },
         "logFormat": {
-          "enum": ["txt", "json"]
+          "enum": ["", "txt", "json"]
         },
-        "includeConfigMetrics": { "type": "boolean" },
-        "inclSystemMetrics":    { "type": "boolean" },
-        "exportClientList":     { "type": "boolean" },
-        "disableExporterMetrics": { "type": "boolean" }
+        "includeConfigMetrics":   { "type": "boolean" },
+        "includeSystemMetrics":   { "type": "boolean" },
+        "exportClientList":       { "type": "boolean" },
+        "disableExporterMetrics": { "type": "boolean" },
+        "extraEnvVars": { "type": "array" }
       }
     },
     "service": {
