@@ -253,6 +253,20 @@ tests:
       - failedTemplate:
           errorMessage: 'redis.auth.acl: operatorUser "ops" must not also appear in users[]; the chart manages the operator user with full permissions (~* &* +@all)'
 
+  - it: guard - rules may not contain shell metacharacters
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      redis.auth.acl.enabled: true
+      redis.auth.acl.operatorUser: ops
+      redis.auth.acl.users:
+        - name: app
+          rules: "~app:* +@read $(touch /pwned)"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'redis.auth.acl: user "app" rules must not contain the shell metacharacters " $ ` or \ (rules are appended to redis.conf via a shell echo at startup)'
+
   - it: guard - non-default operatorUser while acl disabled is rejected
     template: templates/statefulset.yaml
     values:

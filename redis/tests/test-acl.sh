@@ -70,12 +70,13 @@ helm upgrade --install "${REL_RE}" "${CHART_DIR}" \
 wait_for_pods_ready "${NS_RE}" "app.kubernetes.io/component=redis" 3 300
 
 # Sentinel can move the master role to any pod, so don't assume -0 is the master --
-# discover the pod currently reporting role:master. The redis container's REDISCLI_AUTH is
-# the operator password, so authenticate as the operator (default is locked down).
-acl_role() {
-  kubectl exec -n "${NS_RE}" "$1" -c redis -- \
-    redis-cli --user ops INFO replication 2>/dev/null | tr -d '\r' | awk -F: '/^role:/{print $2}'
-}
+# discover the pod currently reporting role:master. Authenticate as the operator (default is
+# locked down) with an explicit -a, fetched from the Secret, rather than relying on the redis
+# container's REDISCLI_AUTH env -- the test then stays correct regardless of that wiring.
+# operatorUser=ops reuses the primary key (operatorPasswordSecret is unset).
+OPS_PW=$(get_secret "${NS_RE}" "${FULLNAME_RE}" "redis-password")
+acl_ops_cli() { kubectl exec -n "${NS_RE}" "$1" -c redis -- redis-cli --user ops -a "${OPS_PW}" --no-auth-warning "${@:2}"; }
+acl_role() { acl_ops_cli "$1" INFO replication 2>/dev/null | tr -d '\r' | awk -F: '/^role:/{print $2}'; }
 MASTER_POD=""
 for i in 0 1 2; do
   if [ "$(acl_role "${FULLNAME_RE}-${i}")" = "master" ]; then MASTER_POD="${FULLNAME_RE}-${i}"; break; fi
@@ -86,8 +87,7 @@ if [ -z "${MASTER_POD}" ]; then
 fi
 
 # Replication is live: the master reports at least one connected replica.
-slaves=$(kubectl exec -n "${NS_RE}" "${MASTER_POD}" -c redis -- \
-  redis-cli --user ops INFO replication 2>/dev/null | tr -d '\r' | awk -F: '/^connected_slaves:/{print $2}')
+slaves=$(acl_ops_cli "${MASTER_POD}" INFO replication 2>/dev/null | tr -d '\r' | awk -F: '/^connected_slaves:/{print $2}')
 if [[ "${slaves:-0}" -ge 1 ]]; then
   pass "operator-driven replication has >=1 connected replica"
 else

@@ -176,14 +176,25 @@ cp /etc/redis/redis.conf /config-rw/redis.conf
 {{- if ne (include "redis.aclDefinesDefault" .) "true" }}
   echo "requirepass ${REDIS_PASSWORD}"
 {{- end }}
+{{- include "redis.aclUserLines" . }}
+} >> /config-rw/redis.conf
+exec redis-server /config-rw/redis.conf
+{{- end }}
+
+{{- /* The operator + per-user ACL `user` lines appended to redis.conf at startup, shared by
+       the standalone start script and the replication bootstrap so the two topologies can
+       never render divergent ACLs. Emits nothing when ACL is off. Passwords come from env
+       (OPERATOR_PWD / ACL_PASS_<i>); names are charset-validated and rules are rejected if
+       they contain shell metacharacters, both in redis.validate, before reaching this echo. */ -}}
+{{- define "redis.aclUserLines" -}}
+{{- if .Values.redis.auth.acl.enabled }}
 {{- if ne (include "redis.operatorUser" .) "default" }}
   echo "user {{ .Values.redis.auth.acl.operatorUser }} on >${OPERATOR_PWD} ~* &* +@all"
 {{- end }}
 {{- range $i, $u := .Values.redis.auth.acl.users }}
   echo "user {{ $u.name }} on >${ACL_PASS_{{ $i }}} {{ $u.rules }}"
 {{- end }}
-} >> /config-rw/redis.conf
-exec redis-server /config-rw/redis.conf
+{{- end }}
 {{- end }}
 
 {{- /* Total redis pods = replicas + 1 master. */ -}}
@@ -300,6 +311,17 @@ exec redis-server /config-rw/redis.conf
 {{- if regexMatch "(^|[[:space:]])[>#]" $rules }}
 {{- fail (printf "redis.auth.acl: user %q rules must not embed a password (>...) or hash (#...); set passwordSecret instead" .name) }}
 {{- end }}
+{{- /* rules is appended to redis.conf through a double-quoted shell `echo` at startup, so any
+       character the shell still interprets inside double quotes ($, `, ", \) would allow
+       command injection. None of these appear in legitimate Redis ACL rule syntax (key/channel
+       globs, +/-commands, @categories, selectors), so reject them outright. Checks the raw
+       value, not the lowercased copy. */}}
+{{- if regexMatch "[\"$`\\\\]" (.rules | default "") }}
+{{- fail (printf "redis.auth.acl: user %q rules must not contain the shell metacharacters \" $ ` or \\ (rules are appended to redis.conf via a shell echo at startup)" .name) }}
+{{- end }}
+{{- if regexMatch "[[:cntrl:]]" (.rules | default "") }}
+{{- fail (printf "redis.auth.acl: user %q rules must not contain control characters or newlines" .name) }}
+{{- end }}
 {{- end }}
 {{- if and (ne $op "default") (has $op $names) }}
 {{- fail (printf "redis.auth.acl: operatorUser %q must not also appear in users[]; the chart manages the operator user with full permissions (~* &* +@all)" $op) }}
@@ -410,14 +432,7 @@ cp /config-ro/redis.conf /config-rw/redis.conf
   echo "masteruser ${OPERATOR_USER}"
   echo "masterauth ${OPERATOR_PWD}"
 {{- end }}
-{{- if .Values.redis.auth.acl.enabled }}
-{{- if ne (include "redis.operatorUser" .) "default" }}
-  echo "user {{ .Values.redis.auth.acl.operatorUser }} on >${OPERATOR_PWD} ~* &* +@all"
-{{- end }}
-{{- range $i, $u := .Values.redis.auth.acl.users }}
-  echo "user {{ $u.name }} on >${ACL_PASS_{{ $i }}} {{ $u.rules }}"
-{{- end }}
-{{- end }}
+{{- include "redis.aclUserLines" . }}
 } >> /config-rw/redis.conf
 
 if [ -n "$MASTER" ] && [ "$MASTER" != "$POD_FQDN" ]; then
@@ -456,6 +471,30 @@ cp /config-ro/sentinel.conf /config-rw/sentinel.conf
 } >> /config-rw/sentinel.conf
 {{- end }}
 
+{{- /* Exporter auth env (REDIS_USER/REDIS_PASSWORD), selecting operator vs default-user
+       credentials. Shared by the replication exporter sidecar (statefulset.yaml) and the
+       standalone exporter Deployment (redis.exporterPodSpec) so the two never desync. Emits
+       list items at zero indent; the caller guards on redis.auth.enabled and applies nindent. */ -}}
+{{- define "redis.exporterAuthEnv" -}}
+{{- if .Values.redis.auth.enabled }}
+{{- if ne (include "redis.operatorUser" .) "default" }}
+- name: REDIS_USER
+  value: {{ .Values.redis.auth.acl.operatorUser | quote }}
+- name: REDIS_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "redis.operatorSecretName" . }}
+      key: {{ include "redis.operatorSecretKey" . }}
+{{- else }}
+- name: REDIS_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "redis.secretName" . }}
+      key: {{ .Values.redis.auth.existingSecret.key }}
+{{- end }}
+{{- end }}
+{{- end }}
+
 {{- define "redis.exporterPodSpec" -}}
 securityContext:
   {{- toYaml .Values.exporter.podSecurityContext | nindent 2 }}
@@ -472,23 +511,9 @@ containers:
     env:
       - name: REDIS_ADDR
         value: "{{ if .Values.tls.enabled }}rediss{{ else }}redis{{ end }}://{{ include "redis.fullname" . }}:{{ .Values.service.port }}"
-{{- if .Values.redis.auth.enabled }}
-{{- if ne (include "redis.operatorUser" .) "default" }}
-      - name: REDIS_USER
-        value: {{ .Values.redis.auth.acl.operatorUser | quote }}
-      - name: REDIS_PASSWORD
-        valueFrom:
-          secretKeyRef:
-            name: {{ include "redis.operatorSecretName" . }}
-            key: {{ include "redis.operatorSecretKey" . }}
-{{- else }}
-      - name: REDIS_PASSWORD
-        valueFrom:
-          secretKeyRef:
-            name: {{ include "redis.secretName" . }}
-            key: {{ .Values.redis.auth.existingSecret.key }}
-{{- end }}
-{{- end }}
+      {{- with (include "redis.exporterAuthEnv" . | trim) }}
+      {{- . | nindent 6 }}
+      {{- end }}
 {{- if .Values.tls.enabled }}
       - name: REDIS_EXPORTER_TLS_CLIENT_KEY_FILE
         value: /etc/redis/tls/tls.key

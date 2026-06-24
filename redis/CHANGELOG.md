@@ -13,9 +13,11 @@ are unchanged).
   used for replication (`masteruser`/`masterauth`), Sentinel (`auth-user`/`auth-pass`), the
   exporter (`REDIS_USER`), and probes; lets you lock down the `default` user.
 - Fail-fast validation of ACL config (auth prerequisite, username charset, no
-  `on`/`off`/`nopass`/`reset*`/`>`/`#` in `rules`, operator/`default` interlocks, ACL knobs
-  set while `acl.enabled` is false, and BYO `existingSecret` requiring an explicit
-  `passwordSecret.name` for every ACL user and the operator).
+  `on`/`off`/`nopass`/`reset*`/`>`/`#` and no shell metacharacters (`" $ ` + backslash) in
+  `rules` — they are appended to `redis.conf` via a shell `echo` at startup —
+  operator/`default` interlocks, ACL knobs set while `acl.enabled` is false, and BYO
+  `existingSecret` requiring an explicit `passwordSecret.name` for every ACL user and the
+  operator).
 
 ## 1.1.0
 

@@ -210,6 +210,13 @@ acl_fail=$(helm template r "${CHART_DIR}" --set redis.auth.acl.enabled=true \
 assert_eq "acl: locked default without operator fails" "1" "${acl_rc}"
 assert_contains "acl: locked-default guard names the cause" "${acl_fail}" "requires a separate operatorUser"
 
+# Guard: rules with shell metacharacters are rejected (rules are appended to redis.conf via a
+# shell echo, so $()/backticks/quotes would be command injection at pod startup).
+acl_inj=$(helm template r "${CHART_DIR}" -f "${SCRIPT_DIR}/values-acl.yaml" \
+  --set-string 'redis.auth.acl.users[0].rules=~app:* +@read $(touch /pwned)' 2>&1) && inj_rc=0 || inj_rc=$?
+assert_eq "acl: rules with shell metacharacters fail" "1" "${inj_rc}"
+assert_contains "acl: injection guard names the cause" "${acl_inj}" "must not contain the shell metacharacters"
+
 # Guard: operatorUser set while ACL is disabled is rejected (would feed undefined OPERATOR_ env).
 acl_op_off=$(helm template r "${CHART_DIR}" --set redis.auth.acl.operatorUser=ops 2>&1) && op_rc=0 || op_rc=$?
 assert_eq "acl: non-default operatorUser with acl disabled fails" "1" "${op_rc}"

@@ -285,22 +285,8 @@ spec:
                   fieldPath: metadata.name
             - name: REDIS_ADDR
               value: "{{ if .Values.tls.enabled }}rediss{{ else }}redis{{ end }}://$(POD_NAME).{{ include "redis.headlessDomain" . }}:{{ $port }}"
-            {{- if .Values.redis.auth.enabled }}
-            {{- if ne (include "redis.operatorUser" .) "default" }}
-            - name: REDIS_USER
-              value: {{ .Values.redis.auth.acl.operatorUser | quote }}
-            - name: REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "redis.operatorSecretName" . }}
-                  key: {{ include "redis.operatorSecretKey" . }}
-            {{- else }}
-            - name: REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "redis.secretName" . }}
-                  key: {{ .Values.redis.auth.existingSecret.key }}
-            {{- end }}
+            {{- with (include "redis.exporterAuthEnv" . | trim) }}
+            {{- . | nindent 12 }}
             {{- end }}
             {{- if .Values.tls.enabled }}
             - name: REDIS_EXPORTER_TLS_CLIENT_KEY_FILE
@@ -425,11 +411,16 @@ spec:
             - |-
               {{- include "redis.standaloneStartScript" . | nindent 14 }}
           env:
+            {{- /* Only the requirepass path consumes REDIS_PASSWORD; when a users[] entry
+                   redefines `default`, its password comes from the ACL line (ACL_PASS_i), so
+                   the standalone start script emits no requirepass and this env is unused. */}}
+            {{- if ne (include "redis.aclDefinesDefault" .) "true" }}
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "redis.secretName" . }}
                   key: {{ .Values.redis.auth.existingSecret.key }}
+            {{- end }}
             {{- include "redis.aclEnv" . | nindent 12 }}
 {{- else if .Values.redis.auth.enabled }}
           command:
