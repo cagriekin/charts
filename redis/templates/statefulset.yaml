@@ -119,11 +119,17 @@ spec:
             - name: TLS_ENABLED
               value: {{ .Values.tls.enabled | quote }}
             {{- if .Values.redis.auth.enabled }}
+            {{- /* Only the requirepass/masterauth-as-default path consumes REDIS_PASSWORD. When a
+                   users[] entry redefines `default`, the bootstrap emits no requirepass and (a
+                   separate operatorUser being required) masterauth uses OPERATOR_PWD, so this env
+                   is unused -- mirror the standalone container's gate. */}}
+            {{- if ne (include "redis.aclDefinesDefault" .) "true" }}
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "redis.secretName" . }}
                   key: {{ .Values.redis.auth.existingSecret.key }}
+            {{- end }}
             - name: SENTINEL_PASSWORD
               valueFrom:
                 secretKeyRef:
