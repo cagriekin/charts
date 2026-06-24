@@ -183,5 +183,51 @@ assert_contains "tls: cert volume mount" "${tls}" "/etc/redis/tls"
 tls_fail=$(helm template r "${CHART_DIR}" --set tls.enabled=true 2>&1) && tls_rc=0 || tls_rc=$?
 assert_eq "tls: enabled without secret fails" "1" "${tls_rc}"
 
+# --- ACL ---
+lint_output=$(helm lint "${CHART_DIR}" -f "${SCRIPT_DIR}/values-acl.yaml" 2>&1) && lint_rc=0 || lint_rc=$?
+assert_eq "helm lint with acl (standalone) values passes" "0" "${lint_rc}"
+lint_output=$(helm lint "${CHART_DIR}" -f "${SCRIPT_DIR}/values-acl-replication.yaml" 2>&1) && lint_rc=0 || lint_rc=$?
+assert_eq "helm lint with acl (replication) values passes" "0" "${lint_rc}"
+
+# Replication, locked-down default + custom operator: the operator identity is wired into the
+# replication link, Sentinel, and the in-pod redis-cli probes, and default becomes a user line.
+acl=$(helm template r "${CHART_DIR}" -f "${SCRIPT_DIR}/values-acl-replication.yaml" 2>&1)
+assert_contains "acl: operator user line rendered" "${acl}" "user ops on"
+assert_contains "acl: default user redefined (requirepass dropped)" "${acl}" "user default on"
+assert_contains "acl: replication uses masteruser" "${acl}" "masteruser"
+assert_contains "acl: sentinel auth-user wired" "${acl}" "sentinel auth-user"
+assert_contains "acl: probes carry --user" "${acl}" "redis-cli --user ops"
+
+# Default operator (additive user) keeps the standalone requirepass path; no operator wiring.
+acl_add=$(helm template r "${CHART_DIR}" -f "${SCRIPT_DIR}/values-acl.yaml" 2>&1)
+assert_contains "acl(additive): app user line rendered" "${acl_add}" "user app on"
+assert_not_contains "acl(additive): no masteruser in standalone" "${acl_add}" "masteruser"
+
+# Guard: locking down default without a separate operator is rejected. Assert the specific
+# guard message, not just a non-zero exit, so an unrelated template error can't pass this.
+acl_fail=$(helm template r "${CHART_DIR}" --set redis.auth.acl.enabled=true \
+  --set 'redis.auth.acl.users[0].name=default' --set 'redis.auth.acl.users[0].rules=~* +@read' 2>&1) && acl_rc=0 || acl_rc=$?
+assert_eq "acl: locked default without operator fails" "1" "${acl_rc}"
+assert_contains "acl: locked-default guard names the cause" "${acl_fail}" "requires a separate operatorUser"
+
+# Guard: rules with shell metacharacters are rejected (rules are appended to redis.conf via a
+# shell echo, so $()/backticks/quotes would be command injection at pod startup).
+acl_inj=$(helm template r "${CHART_DIR}" -f "${SCRIPT_DIR}/values-acl.yaml" \
+  --set-string 'redis.auth.acl.users[0].rules=~app:* +@read $(touch /pwned)' 2>&1) && inj_rc=0 || inj_rc=$?
+assert_eq "acl: rules with shell metacharacters fail" "1" "${inj_rc}"
+assert_contains "acl: injection guard names the cause" "${acl_inj}" "must not contain the shell metacharacters"
+
+# Guard: operatorUser set while ACL is disabled is rejected (would feed undefined OPERATOR_ env).
+acl_op_off=$(helm template r "${CHART_DIR}" --set redis.auth.acl.operatorUser=ops 2>&1) && op_rc=0 || op_rc=$?
+assert_eq "acl: non-default operatorUser with acl disabled fails" "1" "${op_rc}"
+assert_contains "acl: operator-without-acl guard names the cause" "${acl_op_off}" "redis.auth.acl.enabled is false"
+
+# Guard: a BYO existingSecret with ACL users lacking an explicit passwordSecret.name is rejected
+# (the chart writes no ACL passwords into a user-supplied Secret, so the keys would be missing).
+acl_byo=$(helm template r "${CHART_DIR}" -f "${SCRIPT_DIR}/values-acl.yaml" \
+  --set redis.auth.existingSecret.name=mysecret 2>&1) && byo_rc=0 || byo_rc=$?
+assert_eq "acl: existingSecret without per-user passwordSecret.name fails" "1" "${byo_rc}"
+assert_contains "acl: BYO-secret guard names the cause" "${acl_byo}" "must set passwordSecret.name"
+
 end_suite
 print_summary

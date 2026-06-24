@@ -69,6 +69,36 @@ redis:
       name: ""
       key: redis-password
 
+    # Redis ACL users (requires auth.enabled). Layer named users on top of the
+    # password auth above for least-privilege, per-command/per-key access. See
+    # README "ACL".
+    acl:
+      enabled: false
+      # The single privileged identity the CHART ITSELF authenticates as: probes,
+      # preStop SHUTDOWN, the exporter, the replication link (masteruser/masterauth),
+      # and Sentinel (auth-user/auth-pass). Its permissions are chart-managed and
+      # always full (~* &* +@all) -- you choose only the name and password source,
+      # never its rules, because a restricted operator silently breaks replication,
+      # failover, and the exporter. Default "default" keeps today's behavior exactly.
+      # To lock down the `default` user you MUST name a separate operator user here.
+      operatorUser: default
+      # Password source for a non-default operator user. Empty name => reuse the
+      # redis auth Secret above; empty key => reuse existingSecret.key.
+      operatorPasswordSecret:
+        name: ""
+        key: ""
+      # Additional ACL users. `rules` carries ONLY permission tokens (key/channel
+      # patterns and +/- command rules); the chart emits `on` and the password
+      # itself, so do NOT put on/off/nopass/reset*/>password/#hash in `rules`.
+      # Each user's password comes from a Secret: empty passwordSecret.name reuses
+      # the redis auth Secret and the chart generates a random value for the key.
+      users: []
+      # - name: app
+      #   rules: "~app:* &app:* +@read +@write -@dangerous"
+      #   passwordSecret:
+      #     name: ""
+      #     key: app-acl-password
+
   # Resources for the one-shot bootstrap init container (role discovery + config render).
   bootstrap:
     resources:
