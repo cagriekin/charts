@@ -463,6 +463,17 @@ spec:
             periodSeconds: {{ .Values.redis.readinessProbe.periodSeconds }}
             timeoutSeconds: {{ .Values.redis.readinessProbe.timeoutSeconds }}
             failureThreshold: {{ .Values.redis.readinessProbe.failureThreshold }}
+          {{- if .Values.redis.startupProbe.enabled }}
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli {{ $cliUser }}{{ $saAuth }}ping
+            periodSeconds: {{ .Values.redis.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.redis.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.redis.startupProbe.failureThreshold }}
+          {{- end }}
           lifecycle:
             preStop:
               exec:
