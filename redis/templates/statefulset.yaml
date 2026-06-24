@@ -294,13 +294,8 @@ spec:
             {{- with (include "redis.exporterAuthEnv" . | trim) }}
             {{- . | nindent 12 }}
             {{- end }}
-            {{- if .Values.tls.enabled }}
-            - name: REDIS_EXPORTER_TLS_CLIENT_KEY_FILE
-              value: /etc/redis/tls/tls.key
-            - name: REDIS_EXPORTER_TLS_CLIENT_CERT_FILE
-              value: /etc/redis/tls/tls.crt
-            - name: REDIS_EXPORTER_TLS_CA_CERT_FILE
-              value: /etc/redis/tls/ca.crt
+            {{- with (include "redis.exporterConfigEnv" . | trim) }}
+            {{- . | nindent 12 }}
             {{- end }}
           ports:
             - name: metrics
