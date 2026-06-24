@@ -267,6 +267,26 @@ exporter:
     additionalLabels: {}
     rules: []
 
+  # Connection timeout for the exporter when connecting to Redis.
+  # Uses Go duration syntax (e.g. "5s", "15s"). Empty leaves the exporter default (15s).
+  connectionTimeout: ""
+  # Log format emitted by the exporter: txt (logfmt, default) or json.
+  logFormat: "txt"
+  # Metric group toggles (all off by default; enabling adds scrape overhead / cardinality).
+  # Include metrics derived from CONFIG GET.
+  includeConfigMetrics: false
+  # Include system-level metrics from INFO (cpu/mem used by the redis process).
+  includeSystemMetrics: false
+  # Export per-client metrics via CLIENT LIST (expensive on large connection counts).
+  exportClientList: false
+  # Disable go-runtime metrics emitted by the exporter process itself.
+  disableExporterMetrics: false
+  # Additional env vars for the exporter container (escape hatch for less-common flags).
+  # Supports both value and valueFrom forms.
+  extraEnvVars: []
+  # - name: REDIS_EXPORTER_SCRIPT
+  #   value: /scripts/custom.lua
+
 service:
   type: ClusterIP
   port: 6379

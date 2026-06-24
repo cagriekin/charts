@@ -42,3 +42,133 @@ tests:
               secretKeyRef:
                 name: my-secret
                 key: redis-password
+
+  - it: connectionTimeout sets REDIS_EXPORTER_CONNECTION_TIMEOUT env
+    values:
+      - ../values-full-test.yaml
+    set:
+      exporter.connectionTimeout: "30s"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_CONNECTION_TIMEOUT
+            value: "30s"
+
+  - it: logFormat json sets REDIS_EXPORTER_LOG_FORMAT env
+    values:
+      - ../values-full-test.yaml
+    set:
+      exporter.logFormat: "json"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_LOG_FORMAT
+            value: "json"
+
+  - it: default logFormat txt emits no REDIS_EXPORTER_LOG_FORMAT env
+    values:
+      - ../values-full-test.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_LOG_FORMAT
+            value: "txt"
+
+  - it: includeConfigMetrics true sets env
+    values:
+      - ../values-full-test.yaml
+    set:
+      exporter.includeConfigMetrics: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_INCLUDE_CONFIG_METRICS
+            value: "true"
+
+  - it: includeSystemMetrics true sets env
+    values:
+      - ../values-full-test.yaml
+    set:
+      exporter.includeSystemMetrics: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_INCL_SYSTEM_METRICS
+            value: "true"
+
+  - it: exportClientList true sets env
+    values:
+      - ../values-full-test.yaml
+    set:
+      exporter.exportClientList: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_EXPORT_CLIENT_LIST
+            value: "true"
+
+  - it: disableExporterMetrics true sets env
+    values:
+      - ../values-full-test.yaml
+    set:
+      exporter.disableExporterMetrics: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_DISABLE_EXPORTER_METRICS
+            value: "true"
+
+  - it: all metric toggles false emits none of them
+    values:
+      - ../values-full-test.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_INCLUDE_CONFIG_METRICS
+            value: "true"
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_INCL_SYSTEM_METRICS
+            value: "true"
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_EXPORT_CLIENT_LIST
+            value: "true"
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_DISABLE_EXPORTER_METRICS
+            value: "true"
+
+  - it: extraEnvVars value form is passed through to the exporter container
+    values:
+      - ../values-exporter-extras.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_SCRIPT
+            value: /scripts/custom.lua
+
+  - it: extraEnvVars valueFrom form is passed through to the exporter container
+    values:
+      - ../values-exporter-extras.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REDIS_EXPORTER_SECRET_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: my-extra-secret
+                key: token

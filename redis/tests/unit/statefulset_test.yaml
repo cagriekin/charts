@@ -265,3 +265,84 @@ tests:
           content:
             name: data
             mountPath: /data
+
+  # --- exporter config env in replication sidecar (#88) ---
+  - it: replication - connectionTimeout sets REDIS_EXPORTER_CONNECTION_TIMEOUT in sidecar
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      exporter.connectionTimeout: "30s"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="redis-exporter")].env
+          content:
+            name: REDIS_EXPORTER_CONNECTION_TIMEOUT
+            value: "30s"
+
+  - it: replication - default values emit no optional REDIS_EXPORTER_ vars in sidecar
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[?(@.name=="redis-exporter")].env
+          content:
+            name: REDIS_EXPORTER_CONNECTION_TIMEOUT
+            value: ""
+      - notContains:
+          path: spec.template.spec.containers[?(@.name=="redis-exporter")].env
+          content:
+            name: REDIS_EXPORTER_LOG_FORMAT
+            value: "txt"
+
+  - it: replication - logFormat json sets env in sidecar
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      exporter.logFormat: "json"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="redis-exporter")].env
+          content:
+            name: REDIS_EXPORTER_LOG_FORMAT
+            value: "json"
+
+  - it: replication - includeSystemMetrics true sets env in sidecar
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      exporter.includeSystemMetrics: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="redis-exporter")].env
+          content:
+            name: REDIS_EXPORTER_INCL_SYSTEM_METRICS
+            value: "true"
+
+  - it: replication - exportClientList true sets env in sidecar
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+    set:
+      exporter.exportClientList: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="redis-exporter")].env
+          content:
+            name: REDIS_EXPORTER_EXPORT_CLIENT_LIST
+            value: "true"
+
+  - it: replication - extraEnvVars are injected into sidecar
+    template: templates/statefulset.yaml
+    values:
+      - ../values-replication.yaml
+      - ../values-exporter-extras-replication.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="redis-exporter")].env
+          content:
+            name: REDIS_EXPORTER_SCRIPT
+            value: /scripts/custom.lua

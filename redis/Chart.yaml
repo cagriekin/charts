@@ -2,7 +2,7 @@ apiVersion: v2
 name: redis
 description: Redis with AOF persistence and Sentinel-based HA replication
 type: application
-version: 1.2.0
+version: 1.3.0
 appVersion: "8"
 home: https://github.com/cagriekin/charts/tree/master/redis
 icon: https://www.vectorlogo.zone/logos/redis/redis-icon.svg

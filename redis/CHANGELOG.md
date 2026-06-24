@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.0 - 2026-06-24
+
+Exporter configuration options (non-breaking; all new values default to the exporter's
+own defaults, so existing installs are unchanged).
+
+### Added
+- `exporter.connectionTimeout` — Go-duration connection timeout passed as
+  `REDIS_EXPORTER_CONNECTION_TIMEOUT` (#88).
+- `exporter.logFormat` — `txt` (default logfmt) or `json`; passed as
+  `REDIS_EXPORTER_LOG_FORMAT` (#88).
+- Metric group toggles: `includeConfigMetrics`, `inclSystemMetrics`, `exportClientList`,
+  `disableExporterMetrics` — map directly to the matching `REDIS_EXPORTER_*` boolean env
+  vars; all default `false` (#88).
+- `exporter.extraEnvVars` — arbitrary additional env vars for the exporter container
+  (escape hatch for less-common flags, e.g. `REDIS_EXPORTER_SCRIPT`); supports both
+  `value` and `valueFrom` forms (#88).
+- All new options apply to both the replication per-pod sidecar and the standalone
+  exporter Deployment via the shared `redis.exporterConfigEnv` helper (#88).
+
 ## 1.2.0
 
 ACL support (non-breaking; `redis.auth.acl.enabled` defaults `false`, so existing installs

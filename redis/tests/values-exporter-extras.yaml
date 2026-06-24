@@ -1,0 +1,20 @@
+architecture: standalone
+redis:
+  auth:
+    enabled: false
+exporter:
+  enabled: true
+  connectionTimeout: "30s"
+  logFormat: "json"
+  includeConfigMetrics: true
+  includeSystemMetrics: true
+  exportClientList: true
+  disableExporterMetrics: true
+  extraEnvVars:
+    - name: REDIS_EXPORTER_SCRIPT
+      value: /scripts/custom.lua
+    - name: REDIS_EXPORTER_SECRET_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: my-extra-secret
+          key: token
