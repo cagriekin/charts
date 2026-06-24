@@ -1,5 +1,23 @@
 # pg chart changelog
 
+## 1.2.4 - 2026-06-24
+
+Chart-only fix for agent-mode pgpool instability at `postgresql.replicaCount: 0` (#207).
+No image change (`trixie-5.5.0-26`); only affects `pgpool.enabled` + `repmgr.enabled` +
+`repmgr.failoverMode: agent` deployments running primary-only.
+
+### Fixed
+
+- **Agent-mode pgpool churned `restarting myself` and dropped live primary connections
+  when `postgresql.replicaCount: 0` (#207).** The pgpool ConfigMap unconditionally
+  configured a second backend (`backend_hostname1`) pointing at the `-readonly` Service.
+  With zero standbys that Service has no endpoints, so pgpool health-checked a backend that
+  could never come up, repeatedly fired failover/failback events, and restarted itself --
+  tearing down every client connection to the healthy primary on each cycle. Clients saw
+  `EOF`/`unable to read data from DB node 0` even though node 0 was fine. The RO backend is
+  now emitted only when `replicaCount > 0`; primary-only agent mode renders as a single
+  RW backend (weighted 1) -- a valid, stable single-backend router.
+
 ## 1.2.3 - 2026-06-23
 
 Chart-only fix for a postgres-exporter TLS regression (#204). No image change
