@@ -1,0 +1,45 @@
+suite: pgpool ConfigMap backend topology
+release:
+  name: test-pg
+templates:
+  - templates/pgpool-configmap.yaml
+tests:
+  # --- agent mode WITH standbys: RW (weight 0) + RO (weight 1) ---
+  - it: agent mode with standbys emits both RW and RO backends
+    values:
+      - ../values-agent-pgpool.yaml
+    set:
+      postgresql.replicaCount: 2
+    asserts:
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_hostname0 = 'test-pg\.
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_weight0 = 0
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_hostname1 = 'test-pg-readonly\.
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_weight1 = 1
+
+  # --- agent mode primary-only (replicaCount=0): RW only, no RO backend (#207) ---
+  - it: agent mode primary-only omits the RO backend and weights the primary 1
+    values:
+      - ../values-agent-pgpool.yaml
+    set:
+      postgresql.replicaCount: 0
+    asserts:
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_hostname0 = 'test-pg\.
+      - matchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_weight0 = 1
+      - notMatchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_hostname1
+      - notMatchRegex:
+          path: data["pgpool.conf"]
+          pattern: backend_hostname[0-9]+ = '[^']*-readonly
