@@ -27,15 +27,26 @@ data:
     # it recycles connections when the RW Service endpoint moves after a failover.
     backend_hostname0 = '{{ include "pg.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local'
     backend_port0 = 5432
+{{- if gt (int .Values.postgresql.replicaCount) 0 }}
     backend_weight0 = 0
+{{- else }}
+    backend_weight0 = 1
+{{- end }}
     backend_flag0 = 'ALWAYS_PRIMARY|DISALLOW_TO_FAILOVER'
     backend_application_name0 = 'primary'
+{{- if gt (int .Values.postgresql.replicaCount) 0 }}
 
+    # RO backend only when standbys exist. With replicaCount=0 the -readonly
+    # Service has zero endpoints, so a backend1 here would fail every health
+    # check and churn pgpool into repeated "restarting myself" cycles, tearing
+    # down live connections to the healthy primary. Omit it -> single-backend
+    # router to the primary, which is valid and stable for primary-only agent mode.
     backend_hostname1 = '{{ include "pg.fullname" . }}-readonly.{{ .Release.Namespace }}.svc.cluster.local'
     backend_port1 = 5432
     backend_weight1 = 1
     backend_flag1 = 'DISALLOW_TO_FAILOVER'
     backend_application_name1 = 'readonly'
+{{- end }}
 {{- else if .Values.repmgr.enabled }}
     {{- range $i := until (int (add .Values.postgresql.replicaCount 1)) }}
     backend_hostname{{ $i }} = '{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local'

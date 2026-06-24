@@ -240,7 +240,7 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 
 Must satisfy `leaseDuration > renewDeadline > retryPeriod`. For managed clouds, widen them (e.g. `30s/20s/4s`) so a brief apiserver blip does not trip an unnecessary demote. Note: with the Kubernetes Lease backend, a control-plane outage longer than `renewDeadline` is itself a write outage (the healthy primary self-demotes on losing apiserver contact, and no standby can acquire until the control plane returns); this is the safe choice under an asymmetric partition.
 
-In agent mode the agent also fronts the read/write split: `pgpool` (if enabled) points at the RW (`<fullname>`) and RO (`<fullname>-readonly`) Services with failover off, and the agent maintains the Service selector and `pg-role` labels itself (no repmgrd/service-updater sidecars).
+In agent mode the agent also fronts the read/write split: `pgpool` (if enabled) points at the RW (`<fullname>`) and RO (`<fullname>-readonly`) Services with failover off, and the agent maintains the Service selector and `pg-role` labels itself (no repmgrd/service-updater sidecars). With `postgresql.replicaCount: 0` (primary-only) there are no standbys, so pgpool configures only the RW backend and runs as a single-backend router — the RO backend is omitted to avoid health-checking an endpointless Service (#207).
 
 ### Migrating an existing release to agent mode
 
