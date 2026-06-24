@@ -140,6 +140,64 @@ also Sentinel's admin port — keep `redis.auth.enabled: true` (the default) so 
 password; disabling auth while `allowExternal: true` leaves cluster reconfiguration open to
 any in-namespace pod.
 
+### ACL
+
+Redis ACLs layer named, per-command/per-key users on top of the password auth above
+(`redis.auth.acl`, requires `redis.auth.enabled`). Works in both `standalone` and
+`replication`.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `redis.auth.acl.enabled` | Enable ACL users | `false` |
+| `redis.auth.acl.operatorUser` | Privileged identity the chart authenticates as | `default` |
+| `redis.auth.acl.operatorPasswordSecret.name` / `.key` | Operator password source (empty = reuse the redis auth Secret) | `""` |
+| `redis.auth.acl.users[].name` | ACL username (`^[A-Za-z0-9_.-]+$`) | — |
+| `redis.auth.acl.users[].rules` | Permission tokens only (no `on`/password) | `""` |
+| `redis.auth.acl.users[].passwordSecret.name` / `.key` | Per-user password source | `""` |
+
+```yaml
+redis:
+  auth:
+    acl:
+      enabled: true
+      users:
+        - name: app
+          rules: "~app:* &app:* +@read +@write -@dangerous"
+          passwordSecret:
+            key: app-acl-password   # empty name => chart generates this key
+```
+
+**`rules` carries permission tokens only** — key patterns (`~app:*`), channel patterns
+(`&app:*`), and command rules (`+@read`, `-@dangerous`). The chart emits `on` and the
+password itself, so do **not** put `on`/`off`/`nopass`/`reset*`/`>password`/`#hash` in
+`rules` (rejected at render time). Pub/sub needs an explicit `&<pattern>` because Redis
+defaults to `resetchannels`.
+
+**Operator user.** The chart authenticates as `operatorUser` for replication
+(`masteruser`/`masterauth`), Sentinel (`auth-user`/`auth-pass`), the exporter, and the
+liveness/readiness/preStop probes. Its permissions are **chart-managed and always full**
+(`~* &* +@all`) — you pick only its name and password source, never its rules, because a
+restricted operator silently breaks replication, failover, and metrics. The default
+`operatorUser: default` keeps today's behavior exactly (the `default` user via
+`requirepass`). **To lock down the `default` user, define it under `users[]` and set
+`operatorUser` to a separate name** — the chart then drops `requirepass` and renders an
+explicit `user default` line. (Locking down `default` while it is still the operator is
+rejected.)
+
+**Passwords.** Each user's password comes from a Secret. With an empty `passwordSecret.name`
+the chart generates a random value (key `acl-<name>-password` unless you set `.key`) and
+persists it across upgrades via `lookup`. Under render-only pipelines (e.g. ArgoCD) `lookup`
+is empty, so **set `passwordSecret.name` (and `operatorPasswordSecret.name`) for every ACL
+user**, or each sync regenerates the passwords and locks out clients — the same caveat as
+`redis.auth.existingSecret.name`.
+
+**Runtime changes are not persisted.** There is no `aclfile`; the rendered config is the
+source of truth, so `ACL SETUSER`/`ACL SAVE` at runtime are lost on restart — change users
+through values + `helm upgrade`. **Rotating a password** is a deliberate operation: during
+the rolling restart a re-elected master may briefly hold the new password while a
+not-yet-restarted replica still presents the old `masterauth`, so rotate during a quiet
+window.
+
 ### Scheduling, PDB, NetworkPolicy
 
 | Parameter | Description | Default |

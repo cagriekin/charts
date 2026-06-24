@@ -1,0 +1,18 @@
+# Standalone + ACL: an additive, restricted `app` user on top of the default user.
+architecture: standalone
+redis:
+  persistence:
+    enabled: false
+  auth:
+    enabled: true
+    acl:
+      enabled: true
+      users:
+        - name: app
+          rules: "~app:* +@read +@write"
+          passwordSecret:
+            key: acl-app-password
+exporter:
+  enabled: false
+networkPolicy:
+  enabled: false
