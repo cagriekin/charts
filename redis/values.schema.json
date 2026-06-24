@@ -22,6 +22,49 @@
           "type": "integer",
           "minimum": 0
         },
+        "auth": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "acl": {
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "operatorUser": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_.-]+$"
+                },
+                "users": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                      "name": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9_.-]+$"
+                      },
+                      "rules": {
+                        "type": "string"
+                      },
+                      "passwordSecret": {
+                        "type": "object",
+                        "properties": {
+                          "name": { "type": "string" },
+                          "key": { "type": "string" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
         "config": {
           "type": "object",
           "properties": {
