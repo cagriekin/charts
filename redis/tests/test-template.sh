@@ -203,10 +203,24 @@ acl_add=$(helm template r "${CHART_DIR}" -f "${SCRIPT_DIR}/values-acl.yaml" 2>&1
 assert_contains "acl(additive): app user line rendered" "${acl_add}" "user app on"
 assert_not_contains "acl(additive): no masteruser in standalone" "${acl_add}" "masteruser"
 
-# Guard: locking down default without a separate operator is rejected.
+# Guard: locking down default without a separate operator is rejected. Assert the specific
+# guard message, not just a non-zero exit, so an unrelated template error can't pass this.
 acl_fail=$(helm template r "${CHART_DIR}" --set redis.auth.acl.enabled=true \
   --set 'redis.auth.acl.users[0].name=default' --set 'redis.auth.acl.users[0].rules=~* +@read' 2>&1) && acl_rc=0 || acl_rc=$?
 assert_eq "acl: locked default without operator fails" "1" "${acl_rc}"
+assert_contains "acl: locked-default guard names the cause" "${acl_fail}" "requires a separate operatorUser"
+
+# Guard: operatorUser set while ACL is disabled is rejected (would feed undefined OPERATOR_ env).
+acl_op_off=$(helm template r "${CHART_DIR}" --set redis.auth.acl.operatorUser=ops 2>&1) && op_rc=0 || op_rc=$?
+assert_eq "acl: non-default operatorUser with acl disabled fails" "1" "${op_rc}"
+assert_contains "acl: operator-without-acl guard names the cause" "${acl_op_off}" "redis.auth.acl.enabled is false"
+
+# Guard: a BYO existingSecret with ACL users lacking an explicit passwordSecret.name is rejected
+# (the chart writes no ACL passwords into a user-supplied Secret, so the keys would be missing).
+acl_byo=$(helm template r "${CHART_DIR}" -f "${SCRIPT_DIR}/values-acl.yaml" \
+  --set redis.auth.existingSecret.name=mysecret 2>&1) && byo_rc=0 || byo_rc=$?
+assert_eq "acl: existingSecret without per-user passwordSecret.name fails" "1" "${byo_rc}"
+assert_contains "acl: BYO-secret guard names the cause" "${acl_byo}" "must set passwordSecret.name"
 
 end_suite
 print_summary

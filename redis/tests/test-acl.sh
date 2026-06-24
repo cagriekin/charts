@@ -69,10 +69,23 @@ helm upgrade --install "${REL_RE}" "${CHART_DIR}" \
 # (masteruser/masterauth) and Sentinel auth (auth-user/auth-pass) work end to end.
 wait_for_pods_ready "${NS_RE}" "app.kubernetes.io/component=redis" 3 300
 
-MASTER_POD="${FULLNAME_RE}-0"
+# Sentinel can move the master role to any pod, so don't assume -0 is the master --
+# discover the pod currently reporting role:master. The redis container's REDISCLI_AUTH is
+# the operator password, so authenticate as the operator (default is locked down).
+acl_role() {
+  kubectl exec -n "${NS_RE}" "$1" -c redis -- \
+    redis-cli --user ops INFO replication 2>/dev/null | tr -d '\r' | awk -F: '/^role:/{print $2}'
+}
+MASTER_POD=""
+for i in 0 1 2; do
+  if [ "$(acl_role "${FULLNAME_RE}-${i}")" = "master" ]; then MASTER_POD="${FULLNAME_RE}-${i}"; break; fi
+done
+if [ -z "${MASTER_POD}" ]; then
+  fail "a pod reports role:master" "none of ${FULLNAME_RE}-{0,1,2} reported role:master"
+  MASTER_POD="${FULLNAME_RE}-0"
+fi
 
-# Replication is live: the master reports at least one connected replica. The redis
-# container's REDISCLI_AUTH is the operator password, so authenticate as the operator.
+# Replication is live: the master reports at least one connected replica.
 slaves=$(kubectl exec -n "${NS_RE}" "${MASTER_POD}" -c redis -- \
   redis-cli --user ops INFO replication 2>/dev/null | tr -d '\r' | awk -F: '/^connected_slaves:/{print $2}')
 if [[ "${slaves:-0}" -ge 1 ]]; then

@@ -71,8 +71,18 @@
 {{- /* ACL operator user: the single privileged identity the chart itself authenticates as
        (replication masteruser, Sentinel auth-user, exporter, probes). "default" => the chart
        keeps using the primary password (requirepass) and emits no operator-specific wiring. */ -}}
+{{- /* The privileged identity the chart authenticates as (replication masteruser/masterauth,
+       Sentinel auth-user, exporter REDIS_USER, probes). Meaningful only when ACL is enabled;
+       returns "default" otherwise so every `eq/ne operatorUser "default"` call site collapses
+       to the no-ACL path and never wires OPERATOR_ or REDIS_USER env against undefined or a
+       user that does not exist. A non-default operatorUser while ACL is off is rejected by
+       redis.validate. */ -}}
 {{- define "redis.operatorUser" -}}
+{{- if .Values.redis.auth.acl.enabled }}
 {{- .Values.redis.auth.acl.operatorUser | default "default" }}
+{{- else }}
+{{- "default" }}
+{{- end }}
 {{- end }}
 
 {{- /* True (string) only when ACL is on AND a users[] entry redefines the `default` user, in
@@ -296,6 +306,30 @@ exec redis-server /config-rw/redis.conf
 {{- end }}
 {{- if and (has "default" $names) (eq $op "default") }}
 {{- fail "redis.auth.acl: redefining the `default` user requires a separate operatorUser; the chart authenticates as operatorUser for replication, failover, the exporter, and probes, so locking down `default` while it is the operator would break them" }}
+{{- end }}
+{{- /* BYO Secret: secret.yaml generates no ACL passwords when existingSecret.name is set,
+       so every ACL identity must point at a key the user pre-populated, or the pods fail at
+       startup on a missing secretKeyRef. Require explicit names rather than silently
+       defaulting to acl-<name>-password keys that will not exist in the supplied Secret. */}}
+{{- if .Values.redis.auth.existingSecret.name }}
+{{- if and (ne $op "default") (not .Values.redis.auth.acl.operatorPasswordSecret.name) }}
+{{- fail "redis.auth.acl: with redis.auth.existingSecret.name set, operatorPasswordSecret.name must also be set (the chart writes no operator password into a user-supplied Secret)" }}
+{{- end }}
+{{- range .Values.redis.auth.acl.users }}
+{{- if not (and .passwordSecret .passwordSecret.name) }}
+{{- fail (printf "redis.auth.acl: with redis.auth.existingSecret.name set, user %q must set passwordSecret.name (the chart writes no per-user password into a user-supplied Secret)" .name) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- else }}
+{{- /* ACL knobs set while disabled would feed undefined OPERATOR_ and ACL_PASS_ env into the
+       bootstrap and exporter wiring. Fail fast. Checks the raw value, since redis.operatorUser
+       reports "default" whenever ACL is off. */}}
+{{- if ne (.Values.redis.auth.acl.operatorUser | default "default") "default" }}
+{{- fail "redis.auth.acl.operatorUser is non-default but redis.auth.acl.enabled is false; enable ACL or leave operatorUser as 'default'" }}
+{{- end }}
+{{- if .Values.redis.auth.acl.users }}
+{{- fail "redis.auth.acl.users is set but redis.auth.acl.enabled is false; set redis.auth.acl.enabled=true or remove the users" }}
 {{- end }}
 {{- end }}
 {{- end }}
