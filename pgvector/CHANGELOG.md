@@ -1,5 +1,24 @@
 # pgvector chart changelog
 
+## 1.2.5 - 2026-06-25
+
+Chart-only correctness fixes inherited from pg's symlinked templates (#211, #212, #213,
+#214). No image change (`trixie-5.5.0-26`). See the pg CHANGELOG for full detail.
+
+### Fixed
+
+- **md5→scram rehash broke on passwords containing a single quote (#211).** `fix_user_auth`
+  now reads credentials from the environment via psql `\getenv` instead of `-v`, so any
+  password value is handled.
+- **pgBackRest backup could target a standby and silently skip it (#212).** The cronjob now
+  validates the read-write primary with `pg_is_in_recovery()` (timeout-bounded, retried,
+  deterministic selection), with a single-endpoint fallback so a lone primary is never
+  skipped on a transient probe failure.
+- **Inconsistent `required` guard on the pgBackRest S3 secret name (#213).** Now applied
+  consistently across all references via a shared helper.
+- **Unbounded ephemeral PGDATA emptyDir when `persistence.enabled=false` (#214).** The cap
+  now falls back to `persistence.size`, then a 10Gi floor, so it is never null.
+
 ## 1.2.4 - 2026-06-24
 
 Chart-only fix for agent-mode pgpool instability at `postgresql.replicaCount: 0` (#207).
