@@ -1,5 +1,17 @@
 # pgvector chart changelog
 
+## 1.2.6 - 2026-06-26
+
+Image security refresh: repmgr image `trixie-5.5.0-26` → `trixie-5.5.0-27`. No chart
+template or behavior change. See the pg CHANGELOG for full detail.
+
+### Fixed
+
+- **Bundled `kubectl` upgraded `v1.31.3` → `v1.36.2`**, clearing its image-scan CVEs
+  (1 Critical + ~24 High in the old Go 1.22 / `x/net` 0.26 build).
+- **Debian security updates applied at build time (`apt-get upgrade`)**, picking up fixes
+  such as `libssh2` `1.11.1-1+deb13u1` (`CVE-2026-7598`, `CVE-2026-55200`).
+
 ## 1.2.5 - 2026-06-25
 
 Chart-only correctness fixes inherited from pg's symlinked templates (#211, #212, #213,
