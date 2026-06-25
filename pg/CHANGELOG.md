@@ -1,5 +1,26 @@
 # pg chart changelog
 
+## 1.2.6 - 2026-06-26
+
+Image security refresh: repmgr image `trixie-5.5.0-26` → `trixie-5.5.0-27`. No chart
+template or behavior change — only the bundled image is updated.
+
+### Fixed
+
+- **Bundled `kubectl` upgraded `v1.31.3` → `v1.36.2` to clear its image-scan CVEs.**
+  kubectl 1.31.3 linked Go 1.22.8 and `golang.org/x/net` 0.26.0, which Trivy flagged as
+  1 Critical (`CVE-2025-68121`, Go stdlib) plus ~24 High (Go stdlib / `x/net` / `x/oauth2`
+  / `moby/spdystream`). The current release links a patched Go 1.25 stdlib and recent
+  modules. kubectl is only used by the service-updater for core verbs
+  (`get`/`patch`/`label`/`exec`/`rollout`), so the version skew is immaterial.
+- **Debian security updates now applied at build time (`apt-get upgrade`).** The
+  digest-pinned base shipped stale pre-installed packages; the build now picks up released
+  fixes such as `libssh2` `1.11.1-1+deb13u1` (`CVE-2026-7598`, `CVE-2026-55200`, High).
+
+The remaining image-scan findings are Debian packages with no upstream fix yet (the Perl
+`CVE-2026-42496` / `CVE-2026-8376` Criticals, plus `libexpat1`/`curl`/`gnupg`/`ncurses`
+Highs); they are tracked and will clear on a future rebuild once Debian ships patches.
+
 ## 1.2.5 - 2026-06-25
 
 Chart-only correctness fixes for four edge cases in the repmgr/pgBackRest paths

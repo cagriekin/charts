@@ -18,8 +18,11 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH GOFLAGS=-mod=vendor GOPROXY=off 
 #   docker buildx imagetools inspect debian:trixie-slim
 FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Install system dependencies. `apt-get upgrade` first so the digest-pinned base
+# picks up Debian security updates released after the base snapshot (e.g. the
+# libssh2 CVE-2026-7598 / CVE-2026-55200 fix in 1.11.1-1+deb13u1) instead of
+# shipping the stale pre-installed versions.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     curl \
     gnupg \
     lsb-release \
@@ -42,8 +45,12 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install kubectl for the service-updater sidecar (repmgrd mode). Pinned version
-# (matches client-go's API minor) + checksum verification -- no floating stable.txt.
-ARG KUBECTL_VERSION=v1.31.3
+# + checksum verification -- no floating stable.txt. Kept on a current release so
+# the vendored Go stdlib / golang.org/x/net it links carry their CVE fixes (older
+# kubectl builds linked Go 1.22 + x/net 0.26, flagged Critical/High by Trivy).
+# Independent of the agent's client-go (a separate binary); only the core verbs
+# get/patch/label/exec/rollout are used, so cluster version skew is a non-issue.
+ARG KUBECTL_VERSION=v1.36.2
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -fsSLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" && \
     curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl.sha256" -o kubectl.sha256 && \
