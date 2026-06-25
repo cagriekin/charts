@@ -72,9 +72,13 @@ spec:
                   fi
                   PRIMARY=""
                   for cand in $CANDIDATES; do
+                    # `|| rec=""` so a candidate that vanishes between the
+                    # EndpointSlice list and the exec (a pod terminating during the
+                    # very failover/scale-down race handled here) does not trip
+                    # `set -e -o pipefail` and abort the scan -- we just move on.
                     rec=$(kubectl -n "$NAMESPACE" exec "$cand" -c postgresql -- \
                       sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()"' 2>/dev/null \
-                      | tr -d '[:space:]')
+                      | tr -d '[:space:]') || rec=""
                     if [ "$rec" = "f" ]; then
                       PRIMARY="$cand"
                       break

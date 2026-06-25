@@ -2,8 +2,8 @@
 
 ## 1.2.5 - 2026-06-25
 
-Chart-only correctness fixes for four edge cases in the repmgr/pgBackRest paths (#211,
-#212, #213, #214). No image change (`trixie-5.5.0-26`).
+Chart-only correctness fixes for four edge cases in the repmgr/pgBackRest paths
+(#211, #212, #213, #214). No image change (`trixie-5.5.0-26`).
 
 ### Fixed
 
