@@ -33,17 +33,35 @@ jobs:
         id: detect
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            files=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
-            # Documentation-only changes (*.md) never affect rendering, so exclude them:
-            # a PR touching only Markdown leaves nothing to match and the suite is skipped.
-            if printf '%s\n' "$files" | grep -vE '\.md$' | grep -qE '^(redis/|\.github/workflows/redis-test\.yaml)'; then
-              echo "redis=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "redis=false" >> "$GITHUB_OUTPUT"
-            fi
-          else
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            # push to master is already path-filtered upstream; always run.
             echo "redis=true" >> "$GITHUB_OUTPUT"
+            echo "redis changed: $(grep redis= "$GITHUB_OUTPUT")"
+            exit 0
+          fi
+          base="${{ github.event.pull_request.base.sha }}"
+          files=$(git diff --name-only "$base" HEAD)
+          # Build the render-affecting set by removing changes that cannot affect what
+          # the chart renders, so release/docs-only PRs skip the kind matrix and are
+          # gated by `lint` (always-on) alone:
+          #   - Markdown (*.md): docs never affect rendering.
+          #   - redis/Chart.yaml when ONLY version:/appVersion: changed (a pure release
+          #     bump). Any other Chart.yaml edit (dependencies, description, ...) is
+          #     kept and still runs the full suite. helm lint validates Chart.yaml on
+          #     every PR regardless.
+          render_files=$(printf '%s\n' "$files" | grep -vE '\.md$' || true)
+          if printf '%s\n' "$render_files" | grep -qxE 'redis/Chart\.yaml'; then
+            non_version=$(git diff "$base" HEAD -- redis/Chart.yaml \
+              | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' \
+              | grep -vE '^[+-](version|appVersion):' || true)
+            if [ -z "$non_version" ]; then
+              render_files=$(printf '%s\n' "$render_files" | grep -vxE 'redis/Chart\.yaml' || true)
+            fi
+          fi
+          if printf '%s\n' "$render_files" | grep -qE '^(redis/|\.github/workflows/redis-test\.yaml)'; then
+            echo "redis=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "redis=false" >> "$GITHUB_OUTPUT"
           fi
 
   test:
