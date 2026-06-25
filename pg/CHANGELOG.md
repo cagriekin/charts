@@ -20,7 +20,10 @@ Chart-only correctness fixes for four edge cases in the repmgr/pgBackRest paths
   than one Ready endpoint, and with `backoffLimit: 0` a backup that landed on a read-only
   pod was silently dropped for that schedule. The cronjob now validates every Ready
   candidate with `pg_is_in_recovery()` and runs the backup only against the confirmed
-  read-write primary, failing loudly if none qualifies.
+  read-write primary, failing loudly if none qualifies. The probe is `timeout`-bounded
+  (a wedged mid-shutdown candidate can't hang the run) and retried once (a transient blip
+  on the real primary doesn't skip a backup); the EndpointSlice lookup degrades to the
+  actionable "no ready endpoint" error instead of a bare `set -e` abort.
 - **Inconsistent `required` guard on the pgBackRest S3 secret name (#213).**
   `PGBACKREST_REPO1_S3_KEY_SECRET` (init env) and both keys in the pgbackrest sidecar
   referenced `pgbackrest.existingSecret.name` without the `required` wrapper that
@@ -30,7 +33,8 @@ Chart-only correctness fixes for four edge cases in the repmgr/pgBackRest paths
   empty `persistence.emptyDir.sizeLimit`, the `data` volume rendered as `emptyDir: {}`, an
   unbounded ephemeral volume a runaway DB/WAL could use to fill the node and evict
   co-tenants. The volume is now always bounded: `emptyDir.sizeLimit` falls back to
-  `persistence.size` (the cap already declared for persistent mode) when unset.
+  `persistence.size` (the cap already declared for persistent mode) when unset, then to a
+  10Gi floor if `persistence.size` is also blank, so the cap is never null.
 
 ## 1.2.4 - 2026-06-24
 

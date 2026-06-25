@@ -1135,9 +1135,11 @@ spec:
           # Always bound the ephemeral PGDATA volume: an unbounded emptyDir lets a
           # runaway DB/WAL fill the node's ephemeral storage and evict co-tenants
           # (#165, #214). Falls back to persistence.size (the cap the operator
-          # already declared for persistent mode) when emptyDir.sizeLimit is unset.
+          # already declared for persistent mode) when emptyDir.sizeLimit is unset,
+          # then to a 10Gi floor if persistence.size is also blank -- so the cap is
+          # never null (an empty sizeLimit would render as unbounded again).
           emptyDir:
-            sizeLimit: {{ .Values.postgresql.persistence.emptyDir.sizeLimit | default .Values.postgresql.persistence.size }}
+            sizeLimit: {{ .Values.postgresql.persistence.emptyDir.sizeLimit | default .Values.postgresql.persistence.size | default "10Gi" }}
 {{- end }}
 {{- end }}
 {{- if .Values.postgresql.persistence.enabled }}

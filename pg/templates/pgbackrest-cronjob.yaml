@@ -63,22 +63,33 @@ spec:
                   # pick the one true read-write primary (=f). The check runs in the
                   # candidate's postgresql container over its local socket -- the same
                   # invocation the readiness probe uses, so no extra creds are needed.
+                  # `|| CANDIDATES=""` so a failed EndpointSlice list (RBAC denial,
+                  # transient API error) under `set -eu -o pipefail` falls through to
+                  # the actionable error below instead of aborting with a bare trace.
                   CANDIDATES=$(kubectl -n "$NAMESPACE" get endpointslices \
                     -l "kubernetes.io/service-name=$PRIMARY_SVC" \
-                    -o jsonpath='{.items[*].endpoints[?(@.conditions.ready==true)].targetRef.name}')
+                    -o jsonpath='{.items[*].endpoints[?(@.conditions.ready==true)].targetRef.name}') || CANDIDATES=""
                   if [ -z "$CANDIDATES" ]; then
-                    echo "ERROR: no ready endpoint found in endpointslices for $PRIMARY_SVC" >&2
+                    echo "ERROR: no ready endpoint found (or the endpointslice lookup failed) for $PRIMARY_SVC" >&2
                     exit 1
                   fi
                   PRIMARY=""
                   for cand in $CANDIDATES; do
-                    # `|| rec=""` so a candidate that vanishes between the
-                    # EndpointSlice list and the exec (a pod terminating during the
-                    # very failover/scale-down race handled here) does not trip
-                    # `set -e -o pipefail` and abort the scan -- we just move on.
-                    rec=$(kubectl -n "$NAMESPACE" exec "$cand" -c postgresql -- \
-                      sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()"' 2>/dev/null \
-                      | tr -d '[:space:]') || rec=""
+                    # Validate over the candidate's local socket -- the same psql call
+                    # the readiness probe uses. `timeout 10` bounds a wedged/mid-shutdown
+                    # pod (socket open but not serving) so the scan can never hang until
+                    # activeDeadlineSeconds. Two attempts absorb a transient blip on the
+                    # real primary so a backup we could have taken is not skipped. The
+                    # trailing `|| rec=""` keeps a failed exec (a candidate that vanished
+                    # mid-scan) from tripping `set -e -o pipefail` -- we just move on.
+                    rec=""
+                    for attempt in 1 2; do
+                      rec=$(kubectl -n "$NAMESPACE" exec "$cand" -c postgresql -- \
+                        sh -c 'timeout 10 psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()"' 2>/dev/null \
+                        | tr -d '[:space:]') || rec=""
+                      [ -n "$rec" ] && break
+                      [ "$attempt" -lt 2 ] && sleep 2
+                    done
                     if [ "$rec" = "f" ]; then
                       PRIMARY="$cand"
                       break

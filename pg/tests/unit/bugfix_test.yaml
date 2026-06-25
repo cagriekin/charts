@@ -68,3 +68,16 @@ tests:
       - equal:
           path: spec.template.spec.volumes[?(@.name=="data")].emptyDir.sizeLimit
           value: 2Gi
+
+  - it: non-persistent PGDATA emptyDir is never null even when size and sizeLimit are blank
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.persistence.enabled: false
+      postgresql.persistence.size: ""
+      postgresql.persistence.emptyDir.sizeLimit: ""
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[?(@.name=="data")].emptyDir.sizeLimit
+          value: 10Gi
