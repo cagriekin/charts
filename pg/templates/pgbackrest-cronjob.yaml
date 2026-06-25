@@ -66,22 +66,29 @@ spec:
                   # `|| CANDIDATES=""` so a failed EndpointSlice list (RBAC denial,
                   # transient API error) under `set -eu -o pipefail` falls through to
                   # the actionable error below instead of aborting with a bare trace.
+                  # Sorted so selection is deterministic across runs and independent of
+                  # EndpointSlice list order (matters only in the rare multi-endpoint case).
                   CANDIDATES=$(kubectl -n "$NAMESPACE" get endpointslices \
                     -l "kubernetes.io/service-name=$PRIMARY_SVC" \
-                    -o jsonpath='{.items[*].endpoints[?(@.conditions.ready==true)].targetRef.name}') || CANDIDATES=""
-                  if [ -z "$CANDIDATES" ]; then
+                    -o jsonpath='{.items[*].endpoints[?(@.conditions.ready==true)].targetRef.name}' \
+                    | tr ' ' '\n' | sort | tr '\n' ' ') || CANDIDATES=""
+                  if [ -z "$(echo $CANDIDATES)" ]; then
                     echo "ERROR: no ready endpoint found (or the endpointslice lookup failed) for $PRIMARY_SVC" >&2
                     exit 1
                   fi
+                  # Pick the one read-write primary among the Ready endpoints. Validate
+                  # over each candidate's local socket -- the same psql call the readiness
+                  # probe uses. `timeout 10` bounds a wedged/mid-shutdown pod (socket open
+                  # but not serving) so the scan can never hang until activeDeadlineSeconds;
+                  # two attempts absorb a transient blip. `|| rec=""` keeps a failed exec
+                  # (a candidate that vanished mid-scan) from tripping `set -e -o pipefail`.
                   PRIMARY=""
+                  saw_standby=""
+                  ncand=0
+                  last_cand=""
                   for cand in $CANDIDATES; do
-                    # Validate over the candidate's local socket -- the same psql call
-                    # the readiness probe uses. `timeout 10` bounds a wedged/mid-shutdown
-                    # pod (socket open but not serving) so the scan can never hang until
-                    # activeDeadlineSeconds. Two attempts absorb a transient blip on the
-                    # real primary so a backup we could have taken is not skipped. The
-                    # trailing `|| rec=""` keeps a failed exec (a candidate that vanished
-                    # mid-scan) from tripping `set -e -o pipefail` -- we just move on.
+                    ncand=$((ncand + 1))
+                    last_cand="$cand"
                     rec=""
                     for attempt in 1 2; do
                       rec=$(kubectl -n "$NAMESPACE" exec "$cand" -c postgresql -- \
@@ -94,11 +101,26 @@ spec:
                       PRIMARY="$cand"
                       break
                     fi
-                    echo "Skipping $cand: pg_is_in_recovery=${rec:-unreadable} (not the read-write primary)"
+                    [ "$rec" = "t" ] && saw_standby="yes"
+                    echo "Skipping $cand: pg_is_in_recovery=${rec:-unreadable} (not a confirmed read-write primary)"
                   done
                   if [ -z "$PRIMARY" ]; then
-                    echo "ERROR: none of the ready endpoints ($CANDIDATES) is a read-write primary for $PRIMARY_SVC" >&2
-                    exit 1
+                    # No candidate confirmed pg_is_in_recovery()=f. Fall back ONLY when
+                    # there is exactly one Ready endpoint whose state we could not read
+                    # (not a confirmed standby 't'): the write Service selects only the
+                    # primary, so a lone unverifiable endpoint is almost certainly it, and
+                    # master would have backed it up -- skipping on a transient probe blip
+                    # would silently drop the backup (backoffLimit:0). pgbackrest fails
+                    # cleanly if it really is a standby. The ambiguous MULTI-endpoint case
+                    # (#212) still requires a confirmed primary, and a confirmed standby is
+                    # never used.
+                    if [ "$ncand" -eq 1 ] && [ -z "$saw_standby" ]; then
+                      PRIMARY="$last_cand"
+                      echo "WARNING: could not confirm read-write state of the sole Ready endpoint $PRIMARY; proceeding (it is the write Service target). pgbackrest will fail cleanly if it is not the primary."
+                    else
+                      echo "ERROR: none of the ready endpoints ($CANDIDATES) is a confirmed read-write primary for $PRIMARY_SVC" >&2
+                      exit 1
+                    fi
                   fi
                   echo "Primary pod resolved to: $PRIMARY"
 

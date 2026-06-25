@@ -43,6 +43,16 @@ tests:
       - matchRegex:
           path: spec.jobTemplate.spec.template.spec.containers[0].args[0]
           pattern: 'exec "\$cand" -c postgresql'
+      # The sole-endpoint fallback must be present: a lone unverifiable primary is
+      # still backed up (not silently dropped), while a confirmed standby never is.
+      # (helm-unittest can only match rendered text; the runtime loop is exercised
+      # by the kind-based backup-restore / repmgr-failover integration suites.)
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args[0]
+          pattern: 'ncand" -eq 1 \] && \[ -z "\$saw_standby"'
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args[0]
+          pattern: 'timeout 10 psql'
 
   # --- #214: ephemeral PGDATA emptyDir is always bounded ---
   - it: non-persistent PGDATA emptyDir falls back to persistence.size when sizeLimit unset

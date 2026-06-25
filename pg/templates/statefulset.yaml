@@ -504,12 +504,12 @@ spec:
             - name: PGBACKREST_REPO1_S3_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ required "pgbackrest.existingSecret.name is required (pgbackrest.s3.keyType=shared); use keyType=auto for cloud workload identity" .Values.pgbackrest.existingSecret.name }}
+                  name: {{ include "pg.pgbackrestS3SecretName" . }}
                   key: {{ .Values.pgbackrest.existingSecret.accessKeyIdKey }}
             - name: PGBACKREST_REPO1_S3_KEY_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ required "pgbackrest.existingSecret.name is required (pgbackrest.s3.keyType=shared); use keyType=auto for cloud workload identity" .Values.pgbackrest.existingSecret.name }}
+                  name: {{ include "pg.pgbackrestS3SecretName" . }}
                   key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
 {{- end }}
 {{- end }}
@@ -1061,12 +1061,12 @@ spec:
             - name: PGBACKREST_REPO1_S3_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ required "pgbackrest.existingSecret.name is required (pgbackrest.s3.keyType=shared); use keyType=auto for cloud workload identity" .Values.pgbackrest.existingSecret.name }}
+                  name: {{ include "pg.pgbackrestS3SecretName" . }}
                   key: {{ .Values.pgbackrest.existingSecret.accessKeyIdKey }}
             - name: PGBACKREST_REPO1_S3_KEY_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ required "pgbackrest.existingSecret.name is required (pgbackrest.s3.keyType=shared); use keyType=auto for cloud workload identity" .Values.pgbackrest.existingSecret.name }}
+                  name: {{ include "pg.pgbackrestS3SecretName" . }}
                   key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
 {{- end }}
           volumeMounts:

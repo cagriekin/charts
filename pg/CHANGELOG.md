@@ -20,10 +20,14 @@ Chart-only correctness fixes for four edge cases in the repmgr/pgBackRest paths
   than one Ready endpoint, and with `backoffLimit: 0` a backup that landed on a read-only
   pod was silently dropped for that schedule. The cronjob now validates every Ready
   candidate with `pg_is_in_recovery()` and runs the backup only against the confirmed
-  read-write primary, failing loudly if none qualifies. The probe is `timeout`-bounded
-  (a wedged mid-shutdown candidate can't hang the run) and retried once (a transient blip
-  on the real primary doesn't skip a backup); the EndpointSlice lookup degrades to the
-  actionable "no ready endpoint" error instead of a bare `set -e` abort.
+  read-write primary. The probe is `timeout`-bounded (a wedged mid-shutdown candidate
+  can't hang the run) and retried once; candidates are validated in a deterministic
+  (sorted) order; and the EndpointSlice lookup degrades to the actionable "no ready
+  endpoint" error instead of a bare `set -e` abort. To avoid regressing the common
+  single-node case, when exactly one Ready endpoint exists and its recovery state is
+  merely unreadable (not a confirmed standby), the backup proceeds against it — matching
+  the prior behavior — rather than being skipped on a transient probe failure; a
+  confirmed standby is still never backed up.
 - **Inconsistent `required` guard on the pgBackRest S3 secret name (#213).**
   `PGBACKREST_REPO1_S3_KEY_SECRET` (init env) and both keys in the pgbackrest sidecar
   referenced `pgbackrest.existingSecret.name` without the `required` wrapper that
