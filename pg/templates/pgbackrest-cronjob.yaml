@@ -54,15 +54,73 @@ spec:
               args:
                 - |
                   # Resolve the primary pod from the write Service's EndpointSlices
-                  # (the core Endpoints API is deprecated). Take the first Ready
-                  # endpoint; the write Service selects only the primary pod.
-                  PRIMARY_RAW=$(kubectl -n "$NAMESPACE" get endpointslices \
+                  # (the core Endpoints API is deprecated). The write Service selects
+                  # only the primary, but during a failover + scale-down collision
+                  # stale EndpointSlices can briefly expose more than one Ready
+                  # endpoint; taking the first blindly could target a standby, and
+                  # with backoffLimit:0 the failed backup is silently skipped (#212).
+                  # So validate every Ready candidate with pg_is_in_recovery() and
+                  # pick the one true read-write primary (=f). The check runs in the
+                  # candidate's postgresql container over its local socket -- the same
+                  # invocation the readiness probe uses, so no extra creds are needed.
+                  # `|| CANDIDATES=""` so a failed EndpointSlice list (RBAC denial,
+                  # transient API error) under `set -eu -o pipefail` falls through to
+                  # the actionable error below instead of aborting with a bare trace.
+                  # Sorted so selection is deterministic across runs and independent of
+                  # EndpointSlice list order (matters only in the rare multi-endpoint case).
+                  CANDIDATES=$(kubectl -n "$NAMESPACE" get endpointslices \
                     -l "kubernetes.io/service-name=$PRIMARY_SVC" \
-                    -o jsonpath='{.items[*].endpoints[?(@.conditions.ready==true)].targetRef.name}')
-                  PRIMARY=${PRIMARY_RAW%% *}
-                  if [ -z "$PRIMARY" ]; then
-                    echo "ERROR: no ready primary pod found in endpointslices for $PRIMARY_SVC" >&2
+                    -o jsonpath='{.items[*].endpoints[?(@.conditions.ready==true)].targetRef.name}' \
+                    | tr ' ' '\n' | sort | tr '\n' ' ') || CANDIDATES=""
+                  if [ -z "$(echo $CANDIDATES)" ]; then
+                    echo "ERROR: no ready endpoint found (or the endpointslice lookup failed) for $PRIMARY_SVC" >&2
                     exit 1
+                  fi
+                  # Pick the one read-write primary among the Ready endpoints. Validate
+                  # over each candidate's local socket -- the same psql call the readiness
+                  # probe uses. `timeout 10` bounds a wedged/mid-shutdown pod (socket open
+                  # but not serving) so the scan can never hang until activeDeadlineSeconds;
+                  # two attempts absorb a transient blip. `|| rec=""` keeps a failed exec
+                  # (a candidate that vanished mid-scan) from tripping `set -e -o pipefail`.
+                  PRIMARY=""
+                  saw_standby=""
+                  ncand=0
+                  last_cand=""
+                  for cand in $CANDIDATES; do
+                    ncand=$((ncand + 1))
+                    last_cand="$cand"
+                    rec=""
+                    for attempt in 1 2; do
+                      rec=$(kubectl -n "$NAMESPACE" exec "$cand" -c postgresql -- \
+                        sh -c 'timeout 10 psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()"' 2>/dev/null \
+                        | tr -d '[:space:]') || rec=""
+                      [ -n "$rec" ] && break
+                      [ "$attempt" -lt 2 ] && sleep 2
+                    done
+                    if [ "$rec" = "f" ]; then
+                      PRIMARY="$cand"
+                      break
+                    fi
+                    [ "$rec" = "t" ] && saw_standby="yes"
+                    echo "Skipping $cand: pg_is_in_recovery=${rec:-unreadable} (not a confirmed read-write primary)"
+                  done
+                  if [ -z "$PRIMARY" ]; then
+                    # No candidate confirmed pg_is_in_recovery()=f. Fall back ONLY when
+                    # there is exactly one Ready endpoint whose state we could not read
+                    # (not a confirmed standby 't'): the write Service selects only the
+                    # primary, so a lone unverifiable endpoint is almost certainly it, and
+                    # master would have backed it up -- skipping on a transient probe blip
+                    # would silently drop the backup (backoffLimit:0). pgbackrest fails
+                    # cleanly if it really is a standby. The ambiguous MULTI-endpoint case
+                    # (#212) still requires a confirmed primary, and a confirmed standby is
+                    # never used.
+                    if [ "$ncand" -eq 1 ] && [ -z "$saw_standby" ]; then
+                      PRIMARY="$last_cand"
+                      echo "WARNING: could not confirm read-write state of the sole Ready endpoint $PRIMARY; proceeding (it is the write Service target). pgbackrest will fail cleanly if it is not the primary."
+                    else
+                      echo "ERROR: none of the ready endpoints ($CANDIDATES) is a confirmed read-write primary for $PRIMARY_SVC" >&2
+                      exit 1
+                    fi
                   fi
                   echo "Primary pod resolved to: $PRIMARY"
 

@@ -30,10 +30,12 @@ rules:
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list"]
-  # Exec into the pgbackrest sidecar of the primary pod to run the backup.
-  # kubectl exec GETs the target pod then POSTs to its pods/exec subresource;
-  # the backup only ever targets the resolved primary, which is always one of
-  # the StatefulSet's deterministic pod names (<fullname>-0 .. <fullname>-N).
+  # Exec into the candidate pods to (a) validate the read-write primary via
+  # pg_is_in_recovery() in the postgresql container (#212) and (b) run the backup
+  # in the pgbackrest sidecar of the resolved primary. kubectl exec GETs the
+  # target pod then POSTs to its pods/exec subresource; exec is scoped per pod,
+  # not per container. The candidates are always StatefulSet pod names
+  # (<fullname>-0 .. <fullname>-N).
   # resourceNames scopes get on pods and create on the pods/exec subresource
   # (the pod name is in the request path), so a leaked SA token cannot exec into
   # arbitrary pods in the namespace (#134).

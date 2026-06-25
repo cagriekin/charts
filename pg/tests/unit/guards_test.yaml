@@ -53,3 +53,15 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: "pgbackrest.enabled requires repmgr.enabled=true: the pgbackrest binary and the archive_command run inside the postgresql container, which in standalone mode is the official postgres image without pgbackrest. WAL archiving would fail on every segment (unbounded WAL growth) and backups would time out. Enable repmgr, or disable pgbackrest"
+
+  # --- Scenario 12: pgbackrest S3 secret name is required on every ref (#213) ---
+  - it: empty pgbackrest.existingSecret.name with keyType=shared fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.existingSecret.name: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: "pgbackrest.existingSecret.name is required (pgbackrest.s3.keyType=shared); use keyType=auto for cloud workload identity"
