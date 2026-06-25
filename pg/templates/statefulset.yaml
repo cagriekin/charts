@@ -509,7 +509,7 @@ spec:
             - name: PGBACKREST_REPO1_S3_KEY_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.pgbackrest.existingSecret.name }}
+                  name: {{ required "pgbackrest.existingSecret.name is required (pgbackrest.s3.keyType=shared); use keyType=auto for cloud workload identity" .Values.pgbackrest.existingSecret.name }}
                   key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
 {{- end }}
 {{- end }}
@@ -624,14 +624,27 @@ spec:
                         # GUCs read back inside the DO block via current_setting().
                         # GUC names use `tgt_user`/`tgt_pass` — `user` would
                         # collide with the SQL reserved keyword.
+                        #
+                        # User/pass are read from the environment with \getenv (as
+                        # the monitoring-user job does), NOT passed via `-v`. A `-v`
+                        # value containing a single quote breaks psql's :'var'
+                        # quoting -- e.g. pass `a'b` rendered an unterminated literal
+                        # and the rehash silently no-op'd for that user (#211). The
+                        # md5 pg_hba fallback masks the failure, so connectivity is
+                        # kept but the scram migration never converges. randAlphaNum
+                        # never emits `'`, so only existingSecret passwords hit it.
+                        # \getenv is client-side (psql >= 16, image is PG 18), so the
+                        # PG < 14 server guard below is unaffected.
                         fix_user_auth() {
                           local target_user="$1"
                           local target_pass="$2"
                           [ -z "$target_user" ] && return 0
                           [ -z "$target_pass" ] && return 0
                           local sql="
-                            SET myvars.tgt_user = :'u';
-                            SET myvars.tgt_pass = :'p';
+                            \\getenv tgt_user FIX_TGT_USER
+                            \\getenv tgt_pass FIX_TGT_PASS
+                            SET myvars.tgt_user = :'tgt_user';
+                            SET myvars.tgt_pass = :'tgt_pass';
                             DO \$\$
                             DECLARE
                               v_user TEXT := current_setting('myvars.tgt_user');
@@ -650,10 +663,9 @@ spec:
                               END IF;
                             END
                             \$\$;"
-                          if ! psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+                          if ! FIX_TGT_USER="$target_user" FIX_TGT_PASS="$target_pass" \
+                            psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
                             -v ON_ERROR_STOP=1 \
-                            -v u="$target_user" \
-                            -v p="$target_pass" \
                             --no-psqlrc <<<"$sql"; then
                             echo "fix_user_auth: md5->scram rehash failed for ${target_user} (psql returned non-zero, see error above)" >&2
                           fi
@@ -1049,12 +1061,12 @@ spec:
             - name: PGBACKREST_REPO1_S3_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.pgbackrest.existingSecret.name }}
+                  name: {{ required "pgbackrest.existingSecret.name is required (pgbackrest.s3.keyType=shared); use keyType=auto for cloud workload identity" .Values.pgbackrest.existingSecret.name }}
                   key: {{ .Values.pgbackrest.existingSecret.accessKeyIdKey }}
             - name: PGBACKREST_REPO1_S3_KEY_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.pgbackrest.existingSecret.name }}
+                  name: {{ required "pgbackrest.existingSecret.name is required (pgbackrest.s3.keyType=shared); use keyType=auto for cloud workload identity" .Values.pgbackrest.existingSecret.name }}
                   key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
 {{- end }}
           volumeMounts:
@@ -1120,12 +1132,12 @@ spec:
 {{- end }}
 {{- if not .Values.postgresql.persistence.enabled }}
         - name: data
-{{- with .Values.postgresql.persistence.emptyDir.sizeLimit }}
+          # Always bound the ephemeral PGDATA volume: an unbounded emptyDir lets a
+          # runaway DB/WAL fill the node's ephemeral storage and evict co-tenants
+          # (#165, #214). Falls back to persistence.size (the cap the operator
+          # already declared for persistent mode) when emptyDir.sizeLimit is unset.
           emptyDir:
-            sizeLimit: {{ . }}
-{{- else }}
-          emptyDir: {}
-{{- end }}
+            sizeLimit: {{ .Values.postgresql.persistence.emptyDir.sizeLimit | default .Values.postgresql.persistence.size }}
 {{- end }}
 {{- end }}
 {{- if .Values.postgresql.persistence.enabled }}

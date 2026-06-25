@@ -54,14 +54,35 @@ spec:
               args:
                 - |
                   # Resolve the primary pod from the write Service's EndpointSlices
-                  # (the core Endpoints API is deprecated). Take the first Ready
-                  # endpoint; the write Service selects only the primary pod.
-                  PRIMARY_RAW=$(kubectl -n "$NAMESPACE" get endpointslices \
+                  # (the core Endpoints API is deprecated). The write Service selects
+                  # only the primary, but during a failover + scale-down collision
+                  # stale EndpointSlices can briefly expose more than one Ready
+                  # endpoint; taking the first blindly could target a standby, and
+                  # with backoffLimit:0 the failed backup is silently skipped (#212).
+                  # So validate every Ready candidate with pg_is_in_recovery() and
+                  # pick the one true read-write primary (=f). The check runs in the
+                  # candidate's postgresql container over its local socket -- the same
+                  # invocation the readiness probe uses, so no extra creds are needed.
+                  CANDIDATES=$(kubectl -n "$NAMESPACE" get endpointslices \
                     -l "kubernetes.io/service-name=$PRIMARY_SVC" \
                     -o jsonpath='{.items[*].endpoints[?(@.conditions.ready==true)].targetRef.name}')
-                  PRIMARY=${PRIMARY_RAW%% *}
+                  if [ -z "$CANDIDATES" ]; then
+                    echo "ERROR: no ready endpoint found in endpointslices for $PRIMARY_SVC" >&2
+                    exit 1
+                  fi
+                  PRIMARY=""
+                  for cand in $CANDIDATES; do
+                    rec=$(kubectl -n "$NAMESPACE" exec "$cand" -c postgresql -- \
+                      sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()"' 2>/dev/null \
+                      | tr -d '[:space:]')
+                    if [ "$rec" = "f" ]; then
+                      PRIMARY="$cand"
+                      break
+                    fi
+                    echo "Skipping $cand: pg_is_in_recovery=${rec:-unreadable} (not the read-write primary)"
+                  done
                   if [ -z "$PRIMARY" ]; then
-                    echo "ERROR: no ready primary pod found in endpointslices for $PRIMARY_SVC" >&2
+                    echo "ERROR: none of the ready endpoints ($CANDIDATES) is a read-write primary for $PRIMARY_SVC" >&2
                     exit 1
                   fi
                   echo "Primary pod resolved to: $PRIMARY"

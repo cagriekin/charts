@@ -1,0 +1,70 @@
+suite: pg correctness fixes (211/212/214)
+release:
+  name: test-pg
+tests:
+  # --- #211: md5->scram rehash reads password via \getenv, not -v ---
+  - it: fix_user_auth sources user/pass from the environment with getenv
+    values:
+      - ../values-repmgr.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].lifecycle.postStart.exec.command[2]
+          pattern: "getenv tgt_user FIX_TGT_USER"
+      - matchRegex:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].lifecycle.postStart.exec.command[2]
+          pattern: "getenv tgt_pass FIX_TGT_PASS"
+      - matchRegex:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].lifecycle.postStart.exec.command[2]
+          pattern: 'FIX_TGT_USER="\$target_user" FIX_TGT_PASS="\$target_pass"'
+
+  - it: fix_user_auth no longer passes the password through psql -v
+    values:
+      - ../values-repmgr.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - notMatchRegex:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].lifecycle.postStart.exec.command[2]
+          pattern: '-v p="\$target_pass"'
+
+  # --- #212: pgbackrest cronjob validates the primary via pg_is_in_recovery ---
+  - it: pgbackrest cronjob validates the read-write primary before backing up
+    values:
+      - ../values-pgbackrest.yaml
+    template: templates/pgbackrest-cronjob.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args[0]
+          pattern: "SELECT pg_is_in_recovery"
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args[0]
+          pattern: "none of the ready endpoints"
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args[0]
+          pattern: 'exec "\$cand" -c postgresql'
+
+  # --- #214: ephemeral PGDATA emptyDir is always bounded ---
+  - it: non-persistent PGDATA emptyDir falls back to persistence.size when sizeLimit unset
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.persistence.enabled: false
+      postgresql.persistence.size: 10Gi
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[?(@.name=="data")].emptyDir.sizeLimit
+          value: 10Gi
+
+  - it: non-persistent PGDATA emptyDir honors an explicit sizeLimit override
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.persistence.enabled: false
+      postgresql.persistence.emptyDir.sizeLimit: 2Gi
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[?(@.name=="data")].emptyDir.sizeLimit
+          value: 2Gi
