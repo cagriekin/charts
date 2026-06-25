@@ -151,6 +151,13 @@ annotation consumers -- #128.)
 {{- end }}
 {{- end }}
 
+{{- /* Name of the Secret holding the shared S3 access/secret key for pgBackRest
+       (pgbackrest.s3.keyType=shared). Single source of truth for the `required`
+       guard so the four secretKeyRef sites can't drift apart. */ -}}
+{{- define "pg.pgbackrestS3SecretName" -}}
+{{- required "pgbackrest.existingSecret.name is required (pgbackrest.s3.keyType=shared); use keyType=auto for cloud workload identity" .Values.pgbackrest.existingSecret.name -}}
+{{- end }}
+
 {{- define "pg.pgpoolAdminSecretName" -}}
 {{- if .Values.pgpool.admin.existingSecret.enabled }}
 {{- required "pgpool.admin.existingSecret.name is required when pgpool.admin.existingSecret.enabled is true" .Values.pgpool.admin.existingSecret.name }}

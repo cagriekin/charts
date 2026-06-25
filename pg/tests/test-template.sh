@@ -274,9 +274,11 @@ sized_full=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-
 assert_not_contains "#165: no uncapped emptyDir in a full render" "${sized_full}" "emptyDir: {}"
 data_capped=$(helm template test-pg "${CHART_DIR}" --set postgresql.persistence.enabled=false --set postgresql.persistence.emptyDir.sizeLimit=8Gi --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#165: non-persistent data emptyDir honors the sizeLimit" "${data_capped}" "sizeLimit: 8Gi"
-# default (sizeLimit unset) -> the documented unbounded fallback (emptyDir: {})
-data_default=$(helm template test-pg "${CHART_DIR}" --set postgresql.persistence.enabled=false --show-only templates/statefulset.yaml 2>&1)
-assert_contains "#165: non-persistent data emptyDir defaults to unbounded emptyDir: {}" "${data_default}" "emptyDir: {}"
+# #214: sizeLimit unset -> fall back to persistence.size (never the old unbounded
+# emptyDir: {}), so the ephemeral PGDATA volume can never fill the node.
+data_default=$(helm template test-pg "${CHART_DIR}" --set postgresql.persistence.enabled=false --set postgresql.persistence.size=10Gi --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#214: non-persistent data emptyDir falls back to persistence.size" "${data_default}" "sizeLimit: 10Gi"
+assert_not_contains "#214: non-persistent data emptyDir is never unbounded" "${data_default}" "emptyDir: {}"
 # cover the feature-gated caps the full render omits (ext trees 1Gi; pgbackrest pg-run 16Mi)
 sized_feature=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --set postgresql.extensions.enabled=true --set postgresql.majorVersion=18 2>&1)
 assert_contains "#165: extension-tree emptyDir capped at 1Gi" "${sized_feature}" "sizeLimit: 1Gi"

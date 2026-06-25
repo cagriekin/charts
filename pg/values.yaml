@@ -46,10 +46,10 @@ postgresql:
     enabled: true
     storageClass: ""
     size: 10Gi
-    # When persistence.enabled=false, PGDATA lives in an emptyDir. Set a sizeLimit so a
+    # When persistence.enabled=false, PGDATA lives in an emptyDir. A sizeLimit caps it so a
     # runaway DB/WAL is evicted itself instead of filling the node and evicting
-    # co-tenants (#165). Empty = unbounded (the prior behavior); set e.g. "8Gi" for
-    # ephemeral/dev use.
+    # co-tenants (#165, #214). Empty = fall back to persistence.size above, then a 10Gi
+    # floor if that is also blank (never unbounded); set e.g. "8Gi" to override the cap.
     emptyDir:
       sizeLimit: ""
 

@@ -114,7 +114,7 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.resources.limits.memory` | Memory limit | `1Gi` |
 | `postgresql.persistence.enabled` | Enable persistence | `true` |
 | `postgresql.persistence.size` | Storage size | `10Gi` |
-| `postgresql.persistence.emptyDir.sizeLimit` | `sizeLimit` for the non-persistent (`persistence.enabled=false`) PGDATA emptyDir; empty = unbounded | `""` |
+| `postgresql.persistence.emptyDir.sizeLimit` | `sizeLimit` for the non-persistent (`persistence.enabled=false`) PGDATA emptyDir; empty = fall back to `persistence.size` (never unbounded) | `""` |
 | `postgresql.persistence.storageClass` | Storage class | `""` |
 | `postgresql.updateStrategy.type` | StatefulSet update strategy | `RollingUpdate` |
 | `postgresql.updateStrategy.rollingUpdate.partition` | Partition for rolling update | `0` |

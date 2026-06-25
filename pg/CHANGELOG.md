@@ -1,5 +1,45 @@
 # pg chart changelog
 
+## 1.2.5 - 2026-06-25
+
+Chart-only correctness fixes for four edge cases in the repmgr/pgBackRest paths
+(#211, #212, #213, #214). No image change (`trixie-5.5.0-26`).
+
+### Fixed
+
+- **`fix_user_auth` md5→scram migration silently no-op'd for users whose password contains
+  a single quote (#211).** The init script passed the password via `psql -v p=...`; a `'`
+  in the value broke psql's `:'p'` literal quoting, so the rehash failed and the migration
+  never converged (the md5 pg_hba fallback masked it, so connectivity was kept). The
+  password is now read from the environment with `\getenv` — the same injection-safe
+  pattern the monitoring-user job already uses — so any password value is handled. Only
+  affected `existingSecret` passwords; the chart's `randAlphaNum` generator never emits `'`.
+- **pgBackRest cronjob could run the backup against a standby and silently skip it (#212).**
+  Primary discovery took the first Ready endpoint from the write Service's EndpointSlices;
+  during a failover + scale-down collision, stale EndpointSlices can briefly expose more
+  than one Ready endpoint, and with `backoffLimit: 0` a backup that landed on a read-only
+  pod was silently dropped for that schedule. The cronjob now validates every Ready
+  candidate with `pg_is_in_recovery()` and runs the backup only against the confirmed
+  read-write primary. The probe is `timeout`-bounded (a wedged mid-shutdown candidate
+  can't hang the run) and retried once; candidates are validated in a deterministic
+  (sorted) order; and the EndpointSlice lookup degrades to the actionable "no ready
+  endpoint" error instead of a bare `set -e` abort. To avoid regressing the common
+  single-node case, when exactly one Ready endpoint exists and its recovery state is
+  merely unreadable (not a confirmed standby), the backup proceeds against it — matching
+  the prior behavior — rather than being skipped on a transient probe failure; a
+  confirmed standby is still never backed up.
+- **Inconsistent `required` guard on the pgBackRest S3 secret name (#213).**
+  `PGBACKREST_REPO1_S3_KEY_SECRET` (init env) and both keys in the pgbackrest sidecar
+  referenced `pgbackrest.existingSecret.name` without the `required` wrapper that
+  `PGBACKREST_REPO1_S3_KEY` already had. Functionally safe (the first `required` failed
+  render first), but `required` is now applied consistently to every reference.
+- **Unbounded ephemeral PGDATA when `persistence.enabled=false` (#214).** With the default
+  empty `persistence.emptyDir.sizeLimit`, the `data` volume rendered as `emptyDir: {}`, an
+  unbounded ephemeral volume a runaway DB/WAL could use to fill the node and evict
+  co-tenants. The volume is now always bounded: `emptyDir.sizeLimit` falls back to
+  `persistence.size` (the cap already declared for persistent mode) when unset, then to a
+  10Gi floor if `persistence.size` is also blank, so the cap is never null.
+
 ## 1.2.4 - 2026-06-24
 
 Chart-only fix for agent-mode pgpool instability at `postgresql.replicaCount: 0` (#207).
