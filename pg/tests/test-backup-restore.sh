@@ -12,17 +12,26 @@ MINIO_RELEASE="minio-test"
 
 begin_suite "Backup and Restore Integration"
 
+# #221 regression guard: the S3 secret key deliberately contains '/' and '+'.
+# A prior fix (#167) percent-encoded credentials into an MC_HOST URL, but mc then
+# signed SigV4 with the *encoded* secret, so any key with these chars failed every
+# upload with a signature mismatch in production. Running the whole backup ->
+# validation -> restore path against such a key makes a regression fail the backup
+# job here instead of silently in prod. mc alias set (raw argv) handles it fine, so
+# the test harness's own setup calls use the same key.
+S3_SECRET='9Ea4amnO1POkgnUvz8TC/O9hLv58Ka+n91UW5/ek'
+
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
 echo "Deploying MinIO for S3-compatible storage..."
-kubectl apply -n "${NAMESPACE}" -f - <<'MINIO_MANIFEST'
+kubectl apply -n "${NAMESPACE}" -f - <<MINIO_MANIFEST
 apiVersion: v1
 kind: Secret
 metadata:
   name: minio-creds
 stringData:
   access-key-id: minioadmin
-  secret-access-key: minioadmin
+  secret-access-key: "${S3_SECRET}"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -46,7 +55,7 @@ spec:
             - name: MINIO_ROOT_USER
               value: minioadmin
             - name: MINIO_ROOT_PASSWORD
-              value: minioadmin
+              value: "${S3_SECRET}"
           ports:
             - containerPort: 9000
           readinessProbe:
@@ -73,7 +82,7 @@ wait_for_deployment_ready "${NAMESPACE}" "minio" 120
 echo "Creating S3 bucket..."
 kubectl run mc-setup -n "${NAMESPACE}" --restart=Never --image=minio/mc:RELEASE.2024-11-21T17-21-54Z \
   --command -- sh -c "
-    mc alias set s3 http://minio:9000 minioadmin minioadmin &&
+    mc alias set s3 http://minio:9000 minioadmin '${S3_SECRET}' &&
     mc mb s3/pg-backups || true
   "
 kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/mc-setup -n "${NAMESPACE}" --timeout=120s
@@ -128,7 +137,7 @@ echo "Verifying backup exists in S3..."
 # Dumps are namespaced per release under <prefix>/<fullname>/ (#143), so list that subpath.
 kubectl run mc-check -n "${NAMESPACE}" --restart=Never --image=minio/mc:RELEASE.2024-11-21T17-21-54Z \
   --command -- sh -c "
-    mc alias set s3 http://minio:9000 minioadmin minioadmin &&
+    mc alias set s3 http://minio:9000 minioadmin '${S3_SECRET}' &&
     mc ls s3/pg-backups/backups/${FULLNAME}/ --json | head -1
   "
 kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/mc-check -n "${NAMESPACE}" --timeout=120s
@@ -150,7 +159,7 @@ echo "Restoring from backup..."
 kubectl run mc-fetch -n "${NAMESPACE}" --restart=Never --image=minio/mc:RELEASE.2024-11-21T17-21-54Z \
   --command -- sh -c "sleep 300"
 kubectl wait --for=condition=Ready pod/mc-fetch -n "${NAMESPACE}" --timeout=120s
-kubectl exec -n "${NAMESPACE}" mc-fetch -- mc alias set s3 http://minio:9000 minioadmin minioadmin
+kubectl exec -n "${NAMESPACE}" mc-fetch -- mc alias set s3 http://minio:9000 minioadmin "${S3_SECRET}"
 # #159 adversarial decoy: plant a staging object with a FAR-FUTURE timestamp so it is
 # lexically newer than the real dump. A correct selection must still reject it (it is a
 # .tmp stage), so this proves the .tmp-rejection rather than restating the filter.
