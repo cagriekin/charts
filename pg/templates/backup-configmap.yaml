@@ -78,7 +78,14 @@ data:
       printf '{"url":"%s","accessKey":"%s","secretKey":"%s","api":"s3v4","path":"auto"}\n' \
         "$(json_escape "$S3_ENDPOINT")" "$(json_escape "$S3_ACCESS_KEY")" "$(json_escape "$S3_SECRET_KEY")" \
         > "$ALIAS_FILE" )
-    mc alias import s3 "$ALIAS_FILE"
+    # Remove the temp doc whether or not the import succeeds, so a failed import
+    # under `set -e` never leaves the credential file behind (the imported
+    # credentials still persist in $MC_CONFIG_DIR/config.json, 0600, for mc's use).
+    if ! mc alias import s3 "$ALIAS_FILE"; then
+      rm -f "$ALIAS_FILE"
+      echo "ERROR: failed to import S3 credentials into mc" >&2
+      exit 1
+    fi
     rm -f "$ALIAS_FILE"
 
     # Stage to a .tmp object and publish (mc mv) to the canonical backup_<ts>.dump
@@ -211,7 +218,12 @@ data:
       printf '{"url":"%s","accessKey":"%s","secretKey":"%s","api":"s3v4","path":"auto"}\n' \
         "$(json_escape "$S3_ENDPOINT")" "$(json_escape "$S3_ACCESS_KEY")" "$(json_escape "$S3_SECRET_KEY")" \
         > "$ALIAS_FILE" )
-    mc alias import s3 "$ALIAS_FILE"
+    # Remove the temp doc whether or not the import succeeds (see backup.sh).
+    if ! mc alias import s3 "$ALIAS_FILE"; then
+      rm -f "$ALIAS_FILE"
+      echo "ERROR: failed to import S3 credentials into mc" >&2
+      exit 1
+    fi
     rm -f "$ALIAS_FILE"
 
     echo "Finding the latest backup under s3/${S3_DIR}/ ..."

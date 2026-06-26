@@ -1369,6 +1369,21 @@ assert_not_contains "backup #167: no mc alias set with the endpoint in argv" "${
 assert_not_contains "backup #221: credentials NOT percent-encoded into an MC_HOST URL" "${backup_configmap}" "export MC_HOST_s3="
 assert_contains "backup #221: credentials imported from a JSON doc" "${backup_configmap}" 'mc alias import s3 "$ALIAS_FILE"'
 assert_contains "backup #221: alias doc carries url/accessKey/secretKey" "${backup_configmap}" '"url":"%s","accessKey":"%s","secretKey":"%s"'
+assert_contains "backup #221: alias doc written with a restrictive umask (0600 contract)" "${backup_configmap}" "umask 077"
+# The block above renders validation disabled, so it only exercises backup.sh.
+# validate.sh shares the credential path and must not silently regress to the
+# MC_HOST URL -- render it and assert the same contract over just that script.
+backup_val_configmap=$(helm template test-pg "${CHART_DIR}" \
+  --set backup.enabled=true \
+  --set backup.validation.enabled=true \
+  --set backup.s3.endpoint=https://s3.test \
+  --set backup.s3.bucket=test \
+  --set backup.existingSecret.name=test-secret \
+  --show-only templates/backup-configmap.yaml 2>&1)
+validate_sh=$(printf '%s\n' "${backup_val_configmap}" | sed -n '/validate.sh: |/,$p')
+assert_not_contains "validate #221: credentials NOT percent-encoded into an MC_HOST URL" "${validate_sh}" "export MC_HOST_s3="
+assert_contains "validate #221: credentials imported from a JSON doc" "${validate_sh}" 'mc alias import s3 "$ALIAS_FILE"'
+assert_contains "validate #221: alias doc written with a restrictive umask (0600 contract)" "${validate_sh}" "umask 077"
 # #221: json_escape is the load-bearing credential path -- it must leave the chars
 # urlencode mangled ('/', '+', ':', '@', '=') UNTOUCHED (so SigV4 sees the raw
 # secret) and escape only JSON metacharacters. Extract the function from the
