@@ -37,7 +37,7 @@ helm search repo cagriekin
         <pre><code>helm install etcd cagriekin/etcd \
   --namespace coordination --create-namespace
 </code></pre>
-        <p>Minimal 3-node etcd cluster for the pg-ha-agent etcd DCS backend (bundled in pg/pgvector, or installed standalone as a shared store) (v0.1.5)</p>
+        <p>Minimal 3-node etcd cluster providing the quorum-based leadership store (DCS) for the pg/pgvector failover agent; bundled per release or run standalone as a shared store (v0.1.5)</p>
         <p>
           Review the chart documentation in the
           <a href="https://github.com/cagriekin/charts/blob/master/etcd/README.md" rel="noopener">etcd/README.md</a>
@@ -49,7 +49,7 @@ helm search repo cagriekin
         <pre><code>helm install kafka cagriekin/kafka \
   --namespace messaging --create-namespace
 </code></pre>
-        <p>Apache Kafka with KRaft mode, SASL authentication, TLS encryption, and topic management (v0.2.0)</p>
+        <p>Apache Kafka in KRaft mode (no ZooKeeper) with SASL authentication, TLS, declarative topic management, and a metrics exporter (v0.2.0)</p>
         <p>
           Review the chart documentation in the
           <a href="https://github.com/cagriekin/charts/blob/master/kafka/README.md" rel="noopener">kafka/README.md</a>
@@ -61,7 +61,7 @@ helm search repo cagriekin
         <pre><code>helm install pg cagriekin/pg \
   --namespace data --create-namespace
 </code></pre>
-        <p>PostgreSQL with repmgr replication and optional PGPool-II (v1.2.7)</p>
+        <p>Highly-available PostgreSQL with repmgr replication, automatic agent failover (Kubernetes Lease or etcd-quorum DCS), optional PgPool-II, pgBackRest S3 backups, TLS, and Prometheus metrics (v1.2.7)</p>
         <p>
           Review the chart documentation in the
           <a href="https://github.com/cagriekin/charts/blob/master/pg/README.md" rel="noopener">pg/README.md</a>
@@ -73,7 +73,7 @@ helm search repo cagriekin
         <pre><code>helm install pgvector cagriekin/pgvector \
   --namespace data --create-namespace
 </code></pre>
-        <p>PostgreSQL with pgvector extension and optional PGPool-II (v1.2.7)</p>
+        <p>PostgreSQL with the pgvector extension for vector search, plus repmgr replication, agent failover (Kubernetes Lease or etcd-quorum DCS), optional PgPool-II, S3 backups, TLS, and metrics (v1.2.7)</p>
         <p>
           Review the chart documentation in the
           <a href="https://github.com/cagriekin/charts/blob/master/pgvector/README.md" rel="noopener">pgvector/README.md</a>
@@ -85,7 +85,7 @@ helm search repo cagriekin
         <pre><code>helm install redis cagriekin/redis \
   --namespace data --create-namespace
 </code></pre>
-        <p>Redis with AOF persistence and Sentinel-based HA replication (v1.3.0)</p>
+        <p>Redis standalone or Sentinel-managed HA replication, with ACLs, TLS, AOF persistence, and a Prometheus metrics exporter (v1.3.0)</p>
         <p>
           Review the chart documentation in the
           <a href="https://github.com/cagriekin/charts/blob/master/redis/README.md" rel="noopener">redis/README.md</a>
