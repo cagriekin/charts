@@ -97,14 +97,6 @@
             "workdirSizeLimit": { "type": "string" },
             "activeDeadlineSeconds": { "type": "integer" },
             "backoffLimit": { "type": "integer" }
-          },
-          "if": {
-            "properties": { "targetType": { "enum": ["time", "xid", "name", "lsn"] } },
-            "required": ["targetType"]
-          },
-          "then": {
-            "required": ["target"],
-            "properties": { "target": { "type": "string", "minLength": 1 } }
           }
         }
       }
