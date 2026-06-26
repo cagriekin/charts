@@ -1496,7 +1496,7 @@ assert_not_contains "#38: never restores onto the live data directory" "${pgbr_v
 # The restore/validate program lives in the pgbackrest ConfigMap (mirrors #31), mounted
 # and invoked by the CronJob -- assert the CronJob wires it...
 assert_contains "#38: CronJob invokes the mounted validate.sh" "${pgbr_val}" "/scripts/validate.sh"
-assert_contains "#38: CronJob mounts validate.sh from the configmap" "${pgbr_val}" "subPath: validate.sh"
+assert_contains "#38: CronJob mounts validate.sh from the configmap" "${pgbr_val}" "key: validate.sh"
 # ...and assert the script content lives in the ConfigMap (gated on validation.enabled).
 pgbr_script=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --show-only templates/pgbackrest-configmap.yaml 2>&1)
 pgbr_noscript=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --show-only templates/pgbackrest-configmap.yaml 2>&1)
@@ -2445,6 +2445,15 @@ pgv_pgbr_val=$(helm template test-pgv "${PGVECTOR_DIR}" \
   --show-only templates/pgbackrest-validation-cronjob.yaml 2>&1)
 assert_contains "pgvector #38: pgbackrest-validation CronJob renders (symlink present)" "${pgv_pgbr_val}" "app.kubernetes.io/component: pgbackrest-validation"
 assert_contains "pgvector #38: restores into a throwaway PGDATA, not the live dir" "${pgv_pgbr_val}" "value: /work/pgdata"
+# validate.sh now lives in pgbackrest-configmap.yaml (also symlinked): a missing pgvector
+# symlink for THAT template would pass the CronJob check above but break the Job at runtime.
+pgv_pgbr_cm=$(helm template test-pgv "${PGVECTOR_DIR}" \
+  --set pgbackrest.enabled=true --set repmgr.enabled=true \
+  --set pgbackrest.s3.endpoint=https://s3.example.com --set pgbackrest.s3.bucket=b \
+  --set pgbackrest.existingSecret.name=creds --set pgbackrest.validation.enabled=true \
+  --show-only templates/pgbackrest-configmap.yaml 2>&1)
+assert_contains "pgvector #38: validate.sh renders from the ConfigMap (symlink present)" "${pgv_pgbr_cm}" "validate.sh:"
+assert_contains "pgvector #38: validate.sh body inherited (archive_mode safeguard)" "${pgv_pgbr_cm}" "archive_mode=off"
 # #27 parity: the backup ServiceAccount is a separate template; its pgvector symlink
 # must render or the backup Jobs fall back to the namespace default SA.
 pgv_bksa=$(helm template test-pgv "${PGVECTOR_DIR}" \
