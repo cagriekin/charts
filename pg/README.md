@@ -1247,7 +1247,7 @@ Each chart is tagged `<chart>-<version>` (e.g. `pg-1.1.0`); `pg` and `pgvector` 
 
 | `pg` / `pgvector` | repmgr image | PostgreSQL | Kubernetes |
 |-------------------|--------------|-----------|-----------|
-| 1.2.6 *(current)* | `trixie-5.5.0-27` | 18.x | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.2.6 – 1.2.7 *(current)* | `trixie-5.5.0-27` | 18.x | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
 | 1.2.2 – 1.2.5 | `trixie-5.5.0-26` | 18.x | as above |
 | 1.2.0 – 1.2.1 | `trixie-5.5.0-25` | 18.x | as above |
 | 1.0.0 – 1.1.8 | `trixie-5.5.0-16` … `-24` | 18.x | as above |
@@ -1262,7 +1262,7 @@ helm repo update
 helm upgrade my-postgres cagriekin/pg   # add -f your-values.yaml
 ```
 
-Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.2.6`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-27` at 1.2.6) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
+Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.2.7`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-27` at 1.2.7) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
 
 ### Crossing the 0.x → 1.x boundary (agent mode is now the default)
 

@@ -1,6 +1,6 @@
 apiVersion: v2
 name: kafka
-description: Apache Kafka with KRaft mode, SASL authentication, TLS encryption, and topic management
+description: Apache Kafka in KRaft mode (no ZooKeeper) with SASL authentication, TLS, declarative topic management, and a metrics exporter
 type: application
 version: 0.2.0
 appVersion: 4.1.0
