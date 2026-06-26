@@ -1526,6 +1526,8 @@ assert_not_contains "#38: keyType=auto emits no static S3 key env" "${pgbr_val_a
 # PITR target wiring + the guard that target is required once a targetType is set.
 pgbr_val_pitr=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --set pgbackrest.validation.targetType=time --set-string 'pgbackrest.validation.target=2026-06-26 03:00:00+00' --show-only templates/pgbackrest-validation-cronjob.yaml 2>&1)
 assert_contains "#38: PITR target value wired into the env" "${pgbr_val_pitr}" "2026-06-26 03:00:00+00"
+# A targeted restore must promote, not pause: default recovery_target_action is `pause`.
+assert_contains "#38: targeted restore promotes (not pause)" "${pgbr_script}" "target-action=promote"
 # targetType set without target is rejected by the template fail guard (a schema if/then
 # is not portable to helm 3.x). bogus targetType is rejected by the values.schema.json enum.
 pgbr_val_badtarget=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --set pgbackrest.validation.targetType=time 2>&1 || true)
