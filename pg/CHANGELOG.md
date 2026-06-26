@@ -1,5 +1,23 @@
 # pg chart changelog
 
+## 1.2.7 - 2026-06-26
+
+Chart-only fix for the legacy `backup.enabled` (pg_dump → S3) path. No image change
+(`trixie-5.5.0-27`).
+
+### Fixed
+
+- **Backup to AWS S3 failed when the secret access key contained `/` or `+` (#221).**
+  #167 moved S3 credentials out of the `mc` argv (where they were visible in
+  `/proc/<pid>/cmdline`) by percent-encoding them into an `MC_HOST_<alias>` URL, but `mc`
+  then signed SigV4 requests with the *encoded* secret — so any key containing URL-reserved
+  characters (common in real AWS keys) produced `The request signature we calculated does
+  not match the signature you provided` and every upload failed. `backup.sh` and
+  `validate.sh` now write a `0600` JSON credential document and load it via `mc alias
+  import`, which feeds the **raw** secret to the signer while still keeping credentials out
+  of the process argv. The integration test now runs the full backup → validation → restore
+  path against a secret key containing `/` and `+` so a regression fails in CI.
+
 ## 1.2.6 - 2026-06-26
 
 Image security refresh: repmgr image `trixie-5.5.0-26` → `trixie-5.5.0-27`. No chart

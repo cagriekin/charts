@@ -1,5 +1,19 @@
 # pgvector chart changelog
 
+## 1.2.7 - 2026-06-26
+
+Chart-only fix inherited from pg's symlinked templates, for the legacy `backup.enabled`
+(pg_dump → S3) path. No image change (`trixie-5.5.0-27`). See the pg CHANGELOG for full
+detail.
+
+### Fixed
+
+- **Backup to AWS S3 failed when the secret access key contained `/` or `+` (#221).**
+  Credentials are now loaded via `mc alias import` from a `0600` JSON document (feeding the
+  raw secret to the SigV4 signer) instead of a percent-encoded `MC_HOST` URL, which `mc`
+  signed with the encoded secret and rejected. Credentials still never appear in the process
+  argv.
+
 ## 1.2.6 - 2026-06-26
 
 Image security refresh: repmgr image `trixie-5.5.0-26` → `trixie-5.5.0-27`. No chart
