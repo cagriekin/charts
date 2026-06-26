@@ -1,6 +1,6 @@
 apiVersion: v2
 name: pgvector
-description: PostgreSQL with pgvector extension and optional PGPool-II
+description: PostgreSQL with the pgvector extension for vector search, plus repmgr replication, agent failover (Kubernetes Lease or etcd-quorum DCS), optional PgPool-II, S3 backups, TLS, and metrics
 type: application
 version: 1.3.0
 appVersion: "18"

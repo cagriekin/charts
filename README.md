@@ -4,10 +4,11 @@ This repository houses the Helm charts I rely on across several projects. Each c
 
 ## Repository Structure
 
-- `pg/` – Helm chart for deploying PostgreSQL with repmgr replication, optional ProxySQL for query routing, and Prometheus metrics exporter.
-- `pgvector/` – Helm chart for deploying a PostgreSQL cluster with pgvector, pgBouncer, HAProxy, and auxiliary resources.
-- `kafka/` – Helm chart for deploying Apache Kafka using KRaft mode, including controller and broker StatefulSets, SASL authentication, configurable topics, metrics exporter, secrets, and related Kubernetes resources.
-- `redis/` – Helm chart for deploying Redis, including configuration, persistence, and metrics where applicable.
+- `pg/` – A highly-available PostgreSQL cluster. Uses repmgr for streaming replication and an agent for automatic failover, electing the primary through a distributed leadership store (DCS) that is either the Kubernetes Lease API or an etcd quorum. Provides optional PgPool-II for connection pooling and read/write routing, pgBackRest/pg_dump backups to S3, client and replication TLS, and a Prometheus metrics exporter.
+- `pgvector/` – The same PostgreSQL cluster as `pg` with the pgvector extension enabled for vector similarity search. Carries all of pg's capabilities: replication and failover, the Kubernetes-Lease-or-etcd-quorum DCS, optional PgPool-II, S3 backups, TLS, and metrics.
+- `etcd/` – A 3-node etcd cluster that provides the quorum-based leadership store (DCS) for the `pg`/`pgvector` failover agent. Run it bundled inside a database release, or standalone as a single shared coordination store for several databases.
+- `kafka/` – An Apache Kafka cluster in KRaft mode (no ZooKeeper), with separate controller and broker StatefulSets, SASL authentication, declarative topic management, secrets, and a metrics exporter.
+- `redis/` – A Redis deployment that can run standalone or as a Sentinel-managed high-availability replication set. Supports ACLs (with a chart-managed operator user), TLS, persistence, and a Prometheus metrics exporter.
 
 ## Usage
 
