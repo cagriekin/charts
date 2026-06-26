@@ -87,6 +87,8 @@ POD="${FULLNAME}-0"
 
 # --- first full backup: runs stanza-create, after which WAL archiving succeeds ---
 echo "Triggering initial full backup (creates the stanza)..."
+# --ignore-not-found so the standalone target can be rerun in the same namespace.
+kubectl delete job pgbr-full -n "${NAMESPACE}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
 kubectl create job -n "${NAMESPACE}" pgbr-full --from=cronjob/"${FULLNAME}-pgbackrest-full"
 full_rc=0
 kubectl wait --for=condition=complete job/pgbr-full -n "${NAMESPACE}" --timeout=300s || full_rc=$?
@@ -96,18 +98,31 @@ fi
 assert_eq "initial full backup (stanza-create) succeeds" "0" "${full_rc}"
 
 # --- write data AFTER the full backup and archive it as WAL, so a correct restore must
-#     replay WAL (not just unpack the base backup) to recover it: this is the PITR proof ---
+#     replay WAL (not just unpack the base backup) to recover it: this is the PITR proof.
+#     pitr_proof did not exist at backup time, so it can ONLY appear in the throwaway
+#     restore if the post-backup WAL was archived and replayed. ---
 echo "Writing post-backup data and forcing WAL archiving..."
 pg_exec "${NAMESPACE}" "${POD}" "CREATE TABLE pitr_proof (id bigserial PRIMARY KEY, v text)" "testuser" "testdb"
 pg_exec "${NAMESPACE}" "${POD}" "INSERT INTO pitr_proof (v) SELECT repeat('x',256) FROM generate_series(1,5000)" "testuser" "testdb"
-pg_exec "${NAMESPACE}" "${POD}" "SELECT pg_switch_wal()" "testuser" "testdb" >/dev/null
-# give the archiver a moment to push the switched segment
-sleep 10
+# Capture the segment we switch, then poll pg_stat_archiver until that segment (or a later
+# one) is actually archived -- a fixed sleep races on slow runners and could validate before
+# the WAL holding pitr_proof reaches the repo.
+switched=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT pg_walfile_name(pg_switch_wal())" "testuser" "testdb" | tr -d '[:space:]')
+echo "Forced WAL switch at segment ${switched}; waiting for it to be archived..."
+archived_ok=""
+for _ in $(seq 1 30); do
+  last=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT COALESCE(last_archived_wal,'')" "testuser" "testdb" 2>/dev/null | tr -d '[:space:]' || echo "")
+  # last_archived_wal >= switched (lexical compare is valid for WAL filenames on one timeline)
+  if [ -n "${last}" ] && [ ! "${last}" \< "${switched}" ]; then archived_ok="yes"; break; fi
+  sleep 2
+done
 failed=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT failed_count FROM pg_stat_archiver" "testuser" "testdb" 2>/dev/null || echo "")
 assert_eq "WAL archiving healthy before restore (no failed pushes)" "0" "${failed}"
+assert_eq "post-backup WAL segment archived before validation" "yes" "${archived_ok}"
 
 # --- run the validation CronJob: restore repo + replay WAL into a throwaway instance ---
 echo "Triggering pgbackrest PITR validation job (throwaway restore + WAL replay)..."
+kubectl delete job pgbr-validate -n "${NAMESPACE}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
 kubectl create job -n "${NAMESPACE}" pgbr-validate --from=cronjob/"${FULLNAME}-pgbackrest-validation"
 val_rc=0
 kubectl wait --for=condition=complete job/pgbr-validate -n "${NAMESPACE}" --timeout=420s || val_rc=$?
@@ -118,6 +133,10 @@ fi
 assert_eq "#38: pgbackrest PITR validation job completes" "0" "${val_rc}"
 assert_contains "#38: validation restored + promoted the throwaway instance" "${val_logs}" "recovery completed and promoted"
 assert_contains "#38: validation reports success" "${val_logs}" "PITR validation succeeded"
+# The throwaway restored testdb is reported by the validation job. pitr_proof was created
+# AFTER the base backup, so a non-zero relation count proves WAL was replayed -- not just
+# the base backup unpacked. (The job validates POSTGRES_DB == testdb from the secret.)
+assert_not_contains "#38: WAL replay restored the post-backup table (not just the base backup)" "${val_logs}" "0 table-like relation"
 
 # --- the live cluster is untouched: validation restored into a throwaway, never here ---
 live_rows=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT count(*) FROM pitr_proof" "testuser" "testdb" 2>/dev/null || echo "")

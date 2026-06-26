@@ -86,7 +86,12 @@ spec:
                   # so the instance becomes queryable once it reaches the target.
                   if [ -n "$TARGET_TYPE" ]; then
                     echo "PITR target: type=$TARGET_TYPE target=$TARGET"
-                    pgbackrest --stanza="$PGBACKREST_STANZA" --type="$TARGET_TYPE" --target="$TARGET" restore
+                    # --target-action=promote is REQUIRED: with a recovery target,
+                    # PostgreSQL's default recovery_target_action is `pause`, which would
+                    # leave the instance paused in recovery (never accepting connections),
+                    # so `pg_ctl -w` below would hang until the Job times out. The
+                    # latest-only branch promotes on its own (end of WAL + recovery.signal).
+                    pgbackrest --stanza="$PGBACKREST_STANZA" --type="$TARGET_TYPE" --target="$TARGET" --target-action=promote restore
                   else
                     pgbackrest --stanza="$PGBACKREST_STANZA" restore
                   fi

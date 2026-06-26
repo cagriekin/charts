@@ -1506,6 +1506,9 @@ assert_contains "#38: makes no API calls (no SA token)" "${pgbr_val}" "automount
 assert_contains "#38: keyType=shared wires the static S3 key from the secret" "${pgbr_val}" "name: PGBACKREST_REPO1_S3_KEY"
 assert_contains "#38: schedule wired" "${pgbr_val}" 'schedule: "0 4 \* \* 0"'
 assert_contains "#38: workdir cap configurable" "$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --set pgbackrest.validation.workdirSizeLimit=20Gi --show-only templates/pgbackrest-validation-cronjob.yaml 2>&1)" "sizeLimit: 20Gi"
+pgbr_val_limits=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --set pgbackrest.validation.activeDeadlineSeconds=7200 --set pgbackrest.validation.backoffLimit=3 --show-only templates/pgbackrest-validation-cronjob.yaml 2>&1)
+assert_contains "#38: activeDeadlineSeconds override wired" "${pgbr_val_limits}" "activeDeadlineSeconds: 7200"
+assert_contains "#38: backoffLimit override wired" "${pgbr_val_limits}" "backoffLimit: 3"
 # keyType=auto must NOT emit static keys (relies on the SA's workload identity).
 pgbr_val_auto=$(helm template test-pg "${CHART_DIR}" --set pgbackrest.enabled=true --set repmgr.enabled=true --set pgbackrest.s3.endpoint=https://s3.test --set pgbackrest.s3.bucket=b --set pgbackrest.s3.keyType=auto --set pgbackrest.validation.enabled=true --show-only templates/pgbackrest-validation-cronjob.yaml 2>&1)
 assert_not_contains "#38: keyType=auto emits no static S3 key env" "${pgbr_val_auto}" "PGBACKREST_REPO1_S3_KEY"
