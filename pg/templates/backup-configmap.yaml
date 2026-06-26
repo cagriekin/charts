@@ -37,30 +37,56 @@ data:
     # postgres image ships no CA bundle; use the one copied from the mc image
     export SSL_CERT_FILE=/tools/ca-bundle.crt
 
-    # Provide S3 credentials to mc via MC_HOST_<alias> read from the environment,
-    # NOT `mc alias set ... <access> <secret>` which exposes both keys in the
-    # process argv (/proc/<pid>/cmdline, readable via ps) on every run (#167).
-    # Percent-encode the keys so reserved characters (/, +, @, :, found in real
-    # AWS secret keys) survive inside the credential URL.
+    # Provide S3 credentials to mc WITHOUT exposing them in the process argv
+    # (/proc/<pid>/cmdline, readable via ps) -- the reason #167 moved off
+    # `mc alias set ... <access> <secret>`. #167 percent-encoded the keys into an
+    # MC_HOST_<alias> URL, but mc signs SigV4 with the *encoded* secret, so a key
+    # containing '/' or '+' (common in real AWS secret keys) produced a signature
+    # mismatch and every upload failed (#221). Instead write a 0600 credential doc
+    # and import it with `mc alias import`, which feeds the RAW secret to the
+    # signer regardless of character set. mc persists it to $MC_CONFIG_DIR/config.json
+    # (mode 0600); the temporary doc is removed right after the import.
     case "$S3_ENDPOINT" in
       *://*) ;;
       *) echo "ERROR: S3_ENDPOINT must include a scheme (http:// or https://)" >&2; exit 1 ;;
     esac
-    urlencode() {
-      # LC_ALL=C forces byte-wise iteration: under the image's UTF-8 locale
-      # ${#s}/${s:i:1} index by codepoint and would mis-encode a non-ASCII key byte.
-      local LC_ALL=C s="$1" out="" i c
+    json_escape() {
+      # Escape a value for embedding in a JSON double-quoted string. LC_ALL=C
+      # forces byte-wise iteration: under the image's UTF-8 locale ${#s}/${s:i:1}
+      # index by codepoint and would mishandle a non-ASCII key byte. Handles the
+      # characters JSON requires escaping -- backslash and double-quote -- plus C0
+      # control bytes via \u00XX.
+      local LC_ALL=C s="$1" out="" i c ord
       for (( i = 0; i < ${#s}; i++ )); do
         c="${s:i:1}"
         case "$c" in
-          [a-zA-Z0-9.~_-]) out+="$c" ;;
-          *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+          '"') out+='\"' ;;
+          '\') out+='\\' ;;
+          *)
+            printf -v ord '%d' "'$c"
+            if [ "$ord" -lt 32 ]; then printf -v c '\\u%04x' "$ord"; fi
+            out+="$c"
+            ;;
         esac
       done
       printf '%s' "$out"
     }
     echo "Configuring S3 alias..."
-    export MC_HOST_s3="${S3_ENDPOINT%%://*}://$(urlencode "$S3_ACCESS_KEY"):$(urlencode "$S3_SECRET_KEY")@${S3_ENDPOINT#*://}"
+    mkdir -p "$MC_CONFIG_DIR"
+    ALIAS_FILE="$MC_CONFIG_DIR/s3-alias.json"
+    ( umask 077
+      printf '{"url":"%s","accessKey":"%s","secretKey":"%s","api":"s3v4","path":"auto"}\n' \
+        "$(json_escape "$S3_ENDPOINT")" "$(json_escape "$S3_ACCESS_KEY")" "$(json_escape "$S3_SECRET_KEY")" \
+        > "$ALIAS_FILE" )
+    # Remove the temp doc whether or not the import succeeds, so a failed import
+    # under `set -e` never leaves the credential file behind (the imported
+    # credentials still persist in $MC_CONFIG_DIR/config.json, 0600, for mc's use).
+    if ! mc alias import s3 "$ALIAS_FILE"; then
+      rm -f "$ALIAS_FILE"
+      echo "ERROR: failed to import S3 credentials into mc" >&2
+      exit 1
+    fi
+    rm -f "$ALIAS_FILE"
 
     # Stage to a .tmp object and publish (mc mv) to the canonical backup_<ts>.dump
     # name ONLY after integrity is verified (#159). A mid-stream pg_dump failure makes
@@ -168,19 +194,37 @@ data:
       *://*) ;;
       *) echo "ERROR: S3_ENDPOINT must include a scheme (http:// or https://)" >&2; exit 1 ;;
     esac
-    # Credentials via MC_HOST_<alias>, never argv (#167); percent-encode reserved chars.
-    urlencode() {
-      local LC_ALL=C s="$1" out="" i c
+    # Credentials imported from a 0600 JSON doc, never argv (#167) and never a
+    # percent-encoded MC_HOST URL (#221, which broke SigV4 for keys with / or +).
+    json_escape() {
+      local LC_ALL=C s="$1" out="" i c ord
       for (( i = 0; i < ${#s}; i++ )); do
         c="${s:i:1}"
         case "$c" in
-          [a-zA-Z0-9.~_-]) out+="$c" ;;
-          *) printf -v c '%%%02X' "'$c"; out+="$c" ;;
+          '"') out+='\"' ;;
+          '\') out+='\\' ;;
+          *)
+            printf -v ord '%d' "'$c"
+            if [ "$ord" -lt 32 ]; then printf -v c '\\u%04x' "$ord"; fi
+            out+="$c"
+            ;;
         esac
       done
       printf '%s' "$out"
     }
-    export MC_HOST_s3="${S3_ENDPOINT%%://*}://$(urlencode "$S3_ACCESS_KEY"):$(urlencode "$S3_SECRET_KEY")@${S3_ENDPOINT#*://}"
+    mkdir -p "$MC_CONFIG_DIR"
+    ALIAS_FILE="$MC_CONFIG_DIR/s3-alias.json"
+    ( umask 077
+      printf '{"url":"%s","accessKey":"%s","secretKey":"%s","api":"s3v4","path":"auto"}\n' \
+        "$(json_escape "$S3_ENDPOINT")" "$(json_escape "$S3_ACCESS_KEY")" "$(json_escape "$S3_SECRET_KEY")" \
+        > "$ALIAS_FILE" )
+    # Remove the temp doc whether or not the import succeeds (see backup.sh).
+    if ! mc alias import s3 "$ALIAS_FILE"; then
+      rm -f "$ALIAS_FILE"
+      echo "ERROR: failed to import S3 credentials into mc" >&2
+      exit 1
+    fi
+    rm -f "$ALIAS_FILE"
 
     echo "Finding the latest backup under s3/${S3_DIR}/ ..."
     # Separate the mc listing from the parse so a real S3/mc error fails the Job

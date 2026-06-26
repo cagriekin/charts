@@ -1360,20 +1360,44 @@ assert_not_contains "#119: backup verify does not buffer the dump to /tmp" "${ba
 assert_contains "backup #143: dump path namespaced per release (fullname)" "${backup_configmap}" 'S3_DIR="${S3_BUCKET}/${S3_PREFIX%/}/test-pg"'
 assert_contains "backup #143: find calls scoped to the release subpath + name filter" "${backup_configmap}" 'mc find "s3/${S3_DIR}/" --name '"'"'backup_'
 assert_not_contains "backup #143: retention not run over the bare shared prefix" "${backup_configmap}" 'mc find "s3/${S3_BUCKET}/${S3_PREFIX}/" --older-than'
-# #167: S3 credentials must not be passed in mc argv (visible in /proc/<pid>/cmdline);
-# provide them via MC_HOST_s3 read from the environment instead.
-assert_contains "backup #167: credentials provided via MC_HOST_s3 env" "${backup_configmap}" "export MC_HOST_s3="
+# #167 + #221: S3 credentials must not appear in mc argv (/proc/<pid>/cmdline),
+# AND must not be percent-encoded into an MC_HOST URL -- mc signs SigV4 with the
+# encoded secret, so a key containing '/' or '+' (common in real AWS keys) fails
+# with a signature mismatch (#221). Credentials are imported from a 0600 JSON doc
+# instead, which feeds the RAW secret to the signer.
 assert_not_contains "backup #167: no mc alias set with the endpoint in argv" "${backup_configmap}" 'mc alias set s3 "$S3_ENDPOINT"'
-# #167: urlencode is the load-bearing credential path -- a regression would silently
-# break S3 auth for keys with reserved chars. Extract the function from the rendered
-# script and run it against an adversarial key to assert correct percent-encoding.
-urlencode_fn=$(printf '%s\n' "${backup_configmap}" | awk '/urlencode\(\) \{/{f=1} f{print} f&&/^    \}$/{exit}' | sed 's/^    //')
-if [ -n "${urlencode_fn}" ]; then
-  urlencode_out=$(bash -c "${urlencode_fn}
-urlencode 'a/b+c@d:e%f'")
-  assert_eq "backup #167: urlencode percent-encodes reserved chars (/ + @ : %)" "a%2Fb%2Bc%40d%3Ae%25f" "${urlencode_out}"
+assert_not_contains "backup #221: credentials NOT percent-encoded into an MC_HOST URL" "${backup_configmap}" "export MC_HOST_s3="
+assert_contains "backup #221: credentials imported from a JSON doc" "${backup_configmap}" 'mc alias import s3 "$ALIAS_FILE"'
+assert_contains "backup #221: alias doc carries url/accessKey/secretKey" "${backup_configmap}" '"url":"%s","accessKey":"%s","secretKey":"%s"'
+assert_contains "backup #221: alias doc written with a restrictive umask (0600 contract)" "${backup_configmap}" "umask 077"
+# The block above renders validation disabled, so it only exercises backup.sh.
+# validate.sh shares the credential path and must not silently regress to the
+# MC_HOST URL -- render it and assert the same contract over just that script.
+backup_val_configmap=$(helm template test-pg "${CHART_DIR}" \
+  --set backup.enabled=true \
+  --set backup.validation.enabled=true \
+  --set backup.s3.endpoint=https://s3.test \
+  --set backup.s3.bucket=test \
+  --set backup.existingSecret.name=test-secret \
+  --show-only templates/backup-configmap.yaml 2>&1)
+validate_sh=$(printf '%s\n' "${backup_val_configmap}" | sed -n '/validate.sh: |/,$p')
+assert_not_contains "validate #221: credentials NOT percent-encoded into an MC_HOST URL" "${validate_sh}" "export MC_HOST_s3="
+assert_contains "validate #221: credentials imported from a JSON doc" "${validate_sh}" 'mc alias import s3 "$ALIAS_FILE"'
+assert_contains "validate #221: alias doc written with a restrictive umask (0600 contract)" "${validate_sh}" "umask 077"
+# #221: json_escape is the load-bearing credential path -- it must leave the chars
+# urlencode mangled ('/', '+', ':', '@', '=') UNTOUCHED (so SigV4 sees the raw
+# secret) and escape only JSON metacharacters. Extract the function from the
+# rendered script and run it against adversarial keys.
+json_escape_fn=$(printf '%s\n' "${backup_configmap}" | awk '/json_escape\(\) \{/{f=1} f{print} f&&/^    \}$/{exit}' | sed 's/^    //')
+if [ -n "${json_escape_fn}" ]; then
+  json_escape_out=$(bash -c "${json_escape_fn}
+json_escape 'a/b+c:d@e=f'")
+  assert_eq "backup #221: json_escape leaves /,+,:,@,= untouched (was percent-encoded, broke SigV4)" 'a/b+c:d@e=f' "${json_escape_out}"
+  json_escape_bs=$(bash -c "${json_escape_fn}"'
+json_escape "$(printf '"'"'a\\b'"'"')"')
+  assert_eq "backup #221: json_escape escapes a backslash for valid JSON" 'a\\b' "${json_escape_bs}"
 else
-  fail "backup #167: urlencode function extractable from the rendered script" "could not extract urlencode()"
+  fail "backup #221: json_escape function extractable from the rendered script" "could not extract json_escape()"
 fi
 # #159: stage the dump to a .tmp object and publish (mc mv) to the canonical name only
 # after integrity verification, so a truncated dump never sits at backup_<ts>.dump.
