@@ -1,6 +1,6 @@
 apiVersion: v2
 name: pg
-description: PostgreSQL with repmgr replication and optional PGPool-II
+description: Highly-available PostgreSQL with repmgr replication, automatic agent failover (Kubernetes Lease or etcd-quorum DCS), optional PgPool-II, pgBackRest S3 backups, TLS, and Prometheus metrics
 type: application
 version: 1.2.7
 appVersion: "18.1"
