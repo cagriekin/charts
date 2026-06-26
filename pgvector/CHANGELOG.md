@@ -1,5 +1,18 @@
 # pgvector chart changelog
 
+## 1.3.0 - 2026-06-26
+
+Chart-only feature inherited from pg's symlinked templates. No image change
+(`trixie-5.5.0-27`). See the pg CHANGELOG for full detail.
+
+### Added
+
+- **Automated pgBackRest PITR restore-validation (#38).** Opt-in CronJob
+  (`pgbackrest.validation.enabled`) that restores the pgBackRest repository into a
+  throwaway PostgreSQL, replays archived WAL, validates, and exits — proving the backups
+  are restorable without touching the live cluster. Supports an optional PITR target;
+  defaults to restoring the latest backup + all WAL.
+
 ## 1.2.7 - 2026-06-26
 
 Chart-only fix inherited from pg's symlinked templates, for the legacy `backup.enabled`

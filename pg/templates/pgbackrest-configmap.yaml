@@ -44,4 +44,126 @@ data:
     pg1-path=/var/lib/postgresql/data/pgdata
     pg1-port=5432
     pg1-socket-path=/var/run/postgresql
+{{- if .Values.pgbackrest.validation.enabled }}
+  # Automated PITR restore-validation script (#38), mounted into the
+  # pgbackrest-validation CronJob. Kept here (not inlined in the CronJob args) to
+  # mirror the #31 pg_dump validate.sh. All inputs arrive via env (PGBACKREST_*,
+  # POSTGRES_USER/DB, RECOVERY_TIMEOUT, TARGET_TYPE/TARGET) so the body is literal.
+  validate.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    # The PostgreSQL binaries (pg_ctl, psql, postgres) live in
+    # /usr/lib/postgresql/<major>/bin in the Debian-based repmgr image and are NOT on
+    # PATH when this script runs as the container command (the image entrypoint, which
+    # would add them, is bypassed). pgbackrest is in /usr/bin so the restore works, but
+    # pg_ctl would be "command not found". Prepend the PG bin dir (glob -> major-agnostic).
+    PG_BIN=$(dirname "$(ls -1 /usr/lib/postgresql/*/bin/pg_ctl 2>/dev/null | sort -V | tail -1)")
+    [ -n "$PG_BIN" ] && export PATH="$PG_BIN:$PATH"
+
+    WORK=/work
+    # Restore into a throwaway PGDATA on the emptyDir. PGBACKREST_PG1_PATH (env)
+    # overrides the pg1-path baked into the mounted pgbackrest.conf for BOTH the
+    # restore and the archive-get the recovery runs, so we never touch
+    # /var/lib/postgresql/data. restartPolicy:Never gives a fresh pod each run, but
+    # clear defensively in case of a manual rerun.
+    rm -rf "$PGDATA" "$WORK/run"
+    mkdir -p "$PGDATA" "$WORK/run" "$PGBACKREST_LOG_PATH" "$PGBACKREST_LOCK_PATH"
+
+    echo "Restoring stanza '$PGBACKREST_STANZA' into the throwaway PGDATA ($PGDATA)..."
+    # No --type => recover to the end of the archived WAL stream (latest). With a
+    # target, --target-action=promote is REQUIRED: PostgreSQL's default
+    # recovery_target_action is `pause`, which would leave the instance paused in
+    # recovery (never accepting connections) so the wait below would hang until the
+    # Job times out. The latest-only branch promotes on its own (end of WAL +
+    # recovery.signal).
+    if [ -n "$TARGET_TYPE" ]; then
+      echo "PITR target: type=$TARGET_TYPE target=$TARGET"
+      pgbackrest --stanza="$PGBACKREST_STANZA" --type="$TARGET_TYPE" --target="$TARGET" --target-action=promote restore
+    else
+      pgbackrest --stanza="$PGBACKREST_STANZA" restore
+    fi
+
+    # The restored postgresql.conf is the live cluster's. The chart appends
+    # `include_dir = '/etc/postgresql/conf.d'` to PGDATA (statefulset setup-config),
+    # captured in the base backup -- but this Job has no conf.d (a ConfigMap mount on
+    # live pods only, and pg_ctl bypasses the entrypoint), so postgres would FATAL
+    # with "could not open configuration directory". Strip the line; the throwaway
+    # needs none of those tunables to prove restorability.
+    if [ -f "$PGDATA/postgresql.conf" ]; then
+      grep -v "include_dir = '/etc/postgresql/conf.d'" "$PGDATA/postgresql.conf" > "$PGDATA/postgresql.conf.tmp"
+      mv "$PGDATA/postgresql.conf.tmp" "$PGDATA/postgresql.conf"
+    fi
+    # The restored pg_hba.conf is the live cluster's (scram/peer over the pod
+    # network), and this Job has no DB password. Prepend a trust rule for the local
+    # socket so the validation queries can connect as the restored superuser without
+    # a secret -- safe because this throwaway instance is socket-only
+    # (listen_addresses='') and discarded when the pod ends.
+    printf 'local all all trust\n%s\n' "$(cat "$PGDATA/pg_hba.conf")" > "$PGDATA/pg_hba.conf"
+
+    echo "Starting the throwaway PostgreSQL to replay WAL (archive recovery)..."
+    # recovery.signal (written by restore) makes postgres replay WAL via the
+    # restore_command (pgbackrest archive-get, inheriting this container's env for S3
+    # creds + PGBACKREST_PG1_PATH). listen_addresses='' keeps it socket-only.
+    # archive_mode=off is CRITICAL: the restored config still has archive_mode=on +
+    # the archive-push command, so once this throwaway PROMOTES it would push its own
+    # new-timeline WAL into the PRODUCTION repo and pollute it. archive-get
+    # (restore_command) for reading WAL during recovery is unaffected.
+    # hot_standby=on is forced so the postmaster accepts (read-only) connections at the
+    # consistency point DURING recovery; otherwise `pg_ctl -w` blocks for its whole
+    # timeout waiting for connections the server won't accept until it promotes.
+    # `-l startup.log` captures the server log so a failure is diagnosable; `-w -t 60`
+    # bounds the wait (don't block for the full recoveryTimeout here), and the poll
+    # below -- which also tolerates a not-yet-connectable server -- does the real wait.
+    # Overrides applied at startup (win over the restored postgresql.conf):
+    #   shared_preload_libraries='' : the live config preloads repmgr, whose GUCs live in
+    #     the conf.d we stripped above -- loading it here would FATAL. The throwaway needs
+    #     no operational extensions to replay WAL.
+    #   logging_collector=off + log_destination=stderr : send any startup error to the
+    #     -l file so a failure is visible (with logging_collector on it goes to PGDATA/log).
+    #   archive_mode=off, hot_standby=on, socket-only : see above.
+    pg_ctl -D "$PGDATA" -w -t 60 -l "$PGDATA/startup.log" \
+      -o "-c listen_addresses='' -c unix_socket_directories=$WORK/run -c port=5432 -c archive_mode=off -c hot_standby=on -c shared_preload_libraries='' -c logging_collector=off -c log_destination=stderr" start \
+      || echo "WARN: server not connectable within 60s; polling for recovery/promotion below" >&2
+    trap 'pg_ctl -D "$PGDATA" -m immediate -w stop >/dev/null 2>&1 || true' EXIT
+
+    # Poll pg_is_in_recovery() until the instance promotes to read-write ('f'), bounded
+    # by recoveryTimeout. Bail early (and surface the server log) if the postmaster dies,
+    # so a startup failure fails the Job in seconds instead of hanging the full timeout.
+    echo "Waiting for WAL replay to finish and the instance to promote..."
+    promoted=""
+    poll_interval=5
+    poll_iters=$(( (RECOVERY_TIMEOUT + poll_interval - 1) / poll_interval ))
+    rec=""
+    for _ in $(seq 1 "$poll_iters"); do
+      if ! pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then
+        echo "ERROR: the throwaway postmaster is not running (it exited during startup/recovery)" >&2
+        break
+      fi
+      rec=$(psql -h "$WORK/run" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | tr -d '[:space:]') || rec=""
+      [ "$rec" = "f" ] && { promoted="yes"; break; }
+      sleep "$poll_interval"
+    done
+    if [ -z "$promoted" ]; then
+      echo "ERROR: recovery did not promote within ${RECOVERY_TIMEOUT}s (pg_is_in_recovery=${rec:-unreadable})" >&2
+      echo "----- throwaway postgres startup log -----" >&2
+      cat "$PGDATA/startup.log" >&2 2>/dev/null || true
+      for f in "$PGDATA"/log/*; do [ -f "$f" ] && { echo "----- $f -----" >&2; cat "$f" >&2; }; done 2>/dev/null || true
+      exit 1
+    fi
+
+    echo "Validating restored contents..."
+    # No ANALYZE: a physical restore preserves pg_class.reltuples from the source, and
+    # the load-bearing signal is the relation COUNT (needs no stats). Skipping it
+    # avoids a full-database scan that could dominate runtime on a large restore.
+    SUMMARY=$(psql -h "$WORK/run" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAF'|' -c "
+      SELECT count(*),
+             COALESCE(sum(c.reltuples)::bigint, 0)
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relkind IN ('r','p','m','f') AND n.nspname NOT IN ('pg_catalog','information_schema')")
+    RELS="${SUMMARY%%|*}"
+    ROWS="${SUMMARY##*|}"
+    echo "Restore OK: recovery completed and promoted; ${RELS} table-like relation(s), ~${ROWS} row(s) (estimate) in '$POSTGRES_DB'"
+    echo "pgBackRest PITR validation succeeded for stanza '$PGBACKREST_STANZA'"
+{{- end }}
 {{- end }}

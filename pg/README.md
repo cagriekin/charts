@@ -966,6 +966,29 @@ helm install my-postgres cagriekin/pg \
 | `pgbackrest.cronjob.resources.limits.memory` | CronJob memory limit | `128Mi` |
 | `pgbackrest.cronjob.podSecurityContext` | Pod securityContext for the pgBackRest CronJob | `runAsNonRoot: true`, `runAsUser: 65534`, `seccompProfile: RuntimeDefault` |
 | `pgbackrest.cronjob.containerSecurityContext` | Container securityContext for the pgBackRest CronJob | `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` |
+| `pgbackrest.validation.enabled` | Enable the automated PITR restore-validation CronJob (#38) — restores the repo into a throwaway PostgreSQL, replays WAL, validates, exits | `false` |
+| `pgbackrest.validation.schedule` | Cron schedule for the validation job | `` `0 4 * * 0` `` |
+| `pgbackrest.validation.targetType` | PITR target type (`pgbackrest --type`): `""` (latest) \| `time` \| `xid` \| `name` \| `lsn`. `target` is required when set | `""` |
+| `pgbackrest.validation.target` | PITR target value for the type above (e.g. `2026-06-26 03:00:00+00`) | `""` |
+| `pgbackrest.validation.recoveryTimeout` | Seconds `pg_ctl` waits for WAL replay + promotion before failing the Job | `1800` |
+| `pgbackrest.validation.workdirSizeLimit` | `sizeLimit` for the throwaway restored-PGDATA emptyDir; must exceed the DB size; empty = node-disk bounded | `""` |
+| `pgbackrest.validation.activeDeadlineSeconds` | Validation Job timeout | `3600` |
+| `pgbackrest.validation.backoffLimit` | Validation Job backoff limit | `1` |
+| `pgbackrest.validation.resources.*` | Validation Job resource requests/limits | `200m`/`256Mi` … `1`/`1Gi` |
+
+### Automated PITR restore-validation (#38)
+
+A backup you have never restored is a hope, not a backup. Set `pgbackrest.validation.enabled=true` to add a CronJob that, on a schedule (default weekly, `0 4 * * 0`), **continuously proves the repository is restorable**:
+
+1. Restores the pgBackRest repository into a **throwaway PostgreSQL inside the Job pod** — `PGBACKREST_PG1_PATH` is overridden to an `emptyDir`, so the live data directory is never touched.
+2. Starts that instance so it replays the archived WAL (`restore_command` → `pgbackrest archive-get`) and promotes to read-write — failing the Job if recovery does not complete within `recoveryTimeout`.
+3. Runs a sanity query (confirms `pg_is_in_recovery()` is false and counts relations), then exits. The `emptyDir` is discarded with the pod.
+
+It is read-only against S3 and fully decoupled from the live cluster. By default it restores the **latest** backup set and replays all WAL; set `validation.targetType`/`validation.target` to validate recovery to a specific point in time instead. The Job runs from the repmgr image (it ships `pgbackrest` and the matching PostgreSQL major) under the postgresql pods' ServiceAccount — so `s3.keyType: auto` works with no extra setup — with its API token unmounted.
+
+This complements `backup.validation` (which restore-tests the legacy `pg_dump` path): this one exercises the pgBackRest repository **and** the WAL archive, i.e. the actual PITR mechanism. The `make -C pg test-pgbackrest-restore` integration test drives the whole restore + WAL-replay path against an in-cluster MinIO.
+
+> Failures surface as a failed Job. Alert on it via `kube_job_failed{job_name=~".*-pgbackrest-validation.*"}` (kube-state-metrics) or a CronJob-failure alert, the same way you would the backup jobs.
 
 ### Keyless backups (cloud workload identity)
 
@@ -1247,7 +1270,7 @@ Each chart is tagged `<chart>-<version>` (e.g. `pg-1.1.0`); `pg` and `pgvector` 
 
 | `pg` / `pgvector` | repmgr image | PostgreSQL | Kubernetes |
 |-------------------|--------------|-----------|-----------|
-| 1.2.6 – 1.2.7 *(current)* | `trixie-5.5.0-27` | 18.x | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.2.6 – 1.3.0 *(current)* | `trixie-5.5.0-27` | 18.x | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
 | 1.2.2 – 1.2.5 | `trixie-5.5.0-26` | 18.x | as above |
 | 1.2.0 – 1.2.1 | `trixie-5.5.0-25` | 18.x | as above |
 | 1.0.0 – 1.1.8 | `trixie-5.5.0-16` … `-24` | 18.x | as above |
@@ -1262,7 +1285,7 @@ helm repo update
 helm upgrade my-postgres cagriekin/pg   # add -f your-values.yaml
 ```
 
-Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.2.7`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-27` at 1.2.7) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
+Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.3.0`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-27` at 1.3.0) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
 
 ### Crossing the 0.x → 1.x boundary (agent mode is now the default)
 

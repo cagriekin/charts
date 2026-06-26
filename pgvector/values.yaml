@@ -666,6 +666,40 @@ pgbackrest:
         cpu: 200m
         memory: 128Mi
 
+  # Automated PITR restore-validation (#38). Opt-in CronJob that restores the pgBackRest
+  # repository into a THROWAWAY PostgreSQL inside the Job pod (never the live cluster),
+  # replays archived WAL to a consistent state, runs a sanity query, and exits -- so an
+  # unrestorable or corrupt repository raises an alert instead of being discovered during
+  # a real disaster. Read-only against S3; the throwaway PGDATA lives on an emptyDir
+  # discarded when the pod ends. Runs from the repmgr image (pgbackrest + matching PG
+  # major) as the postgresql pods' ServiceAccount (so s3.keyType=auto works), with its
+  # token unmounted (it never calls the Kubernetes API).
+  validation:
+    enabled: false
+    # Default offset from the backup schedules (full Sun 1am, diff 1am): validate weekly.
+    schedule: "0 4 * * 0"
+    # PITR target. Empty (default) restores the latest backup set and replays all archived
+    # WAL to the end of the stream. To validate recovery to a specific point, set both:
+    #   targetType: time   target: "2026-06-26 03:00:00+00"
+    # targetType is one of: "" (latest) | time | xid | name | lsn (pgbackrest --type).
+    targetType: ""
+    target: ""
+    # Seconds pg_ctl waits for WAL replay + promotion before failing the Job. Raise for
+    # large databases / long WAL chains.
+    recoveryTimeout: 1800
+    # emptyDir sizeLimit for the throwaway restored PGDATA (+ replayed WAL). Must exceed
+    # the restored database size; empty = bounded by node disk.
+    workdirSizeLimit: ""
+    activeDeadlineSeconds: 3600
+    backoffLimit: 1
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
 networkPolicy:
   enabled: false
   postgresql:

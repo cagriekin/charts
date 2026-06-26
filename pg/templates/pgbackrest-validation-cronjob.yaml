@@ -1,0 +1,160 @@
+{{- if and .Values.pgbackrest.enabled .Values.pgbackrest.validation.enabled }}
+{{- /* targetType's allowed values are enforced by the values.schema.json enum (portable
+       across helm versions). The dependent "target is required when targetType is set"
+       rule is a template fail rather than a schema `if/then` because helm 3.x's schema
+       validator does not honor `if/then` the way helm 4 does. */}}
+{{- if and (ne .Values.pgbackrest.validation.targetType "") (not .Values.pgbackrest.validation.target) }}
+{{- fail "pgbackrest.validation.target is required when pgbackrest.validation.targetType is set" }}
+{{- end }}
+# Automated PITR restore-validation (#38): on a schedule, restore the pgBackRest
+# repository into a THROWAWAY PostgreSQL inside this Job pod (never the live cluster),
+# replay archived WAL to a consistent state, run a sanity query, then exit. Proves the
+# backups are actually restorable end to end. Read-only against S3; the throwaway data
+# lives on an emptyDir that is discarded when the pod terminates.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "pg.fullname" . }}-pgbackrest-validation
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgbackrest-validation
+  annotations:
+    # one-shot CronJob: liveness/readiness probes do not apply (kube-linter waiver).
+    ignore-check.kube-linter.io/no-liveness-probe: "one-shot pgbackrest-validation CronJob"
+    ignore-check.kube-linter.io/no-readiness-probe: "one-shot pgbackrest-validation CronJob"
+    {{- with (include "pg.annotations" .) }}
+    {{- . | nindent 4 }}
+    {{- end }}
+spec:
+  schedule: {{ .Values.pgbackrest.validation.schedule | quote }}
+  concurrencyPolicy: {{ .Values.pgbackrest.cronjob.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.pgbackrest.cronjob.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.pgbackrest.cronjob.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: {{ .Values.pgbackrest.validation.activeDeadlineSeconds }}
+      backoffLimit: {{ .Values.pgbackrest.validation.backoffLimit }}
+      template:
+        metadata:
+          labels:
+            {{- include "pg.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: pgbackrest-validation
+        spec:
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.pgbackrest.cronjob.priorityClassName }}
+          priorityClassName: {{ . }}
+          {{- end }}
+          restartPolicy: Never
+          # Reuse the postgresql pods' ServiceAccount: it carries the cloud
+          # workload-identity annotation (postgresql.serviceAccount.annotations) that
+          # pgbackrest needs to reach S3 under s3.keyType=auto -- the same identity the
+          # backups use. The script never calls the Kubernetes API (it only restores
+          # from S3 and runs a local PostgreSQL), so its token is not mounted.
+          serviceAccountName: {{ include "pg.fullname" . }}-repmgr
+          automountServiceAccountToken: false
+          # Runs pgbackrest restore + a throwaway postgres from the repmgr image, whose
+          # postgres user is uid 101 -- so reuse the postgresql pods' security contexts
+          # (uid 101, gid 103, fsGroup 103) rather than the official-image uid 999 the
+          # pg_dump validation uses. The image ships the matching PG major, so the
+          # restored cluster starts under the same binaries that wrote the backup.
+          securityContext:
+            {{- toYaml .Values.postgresql.podSecurityContext | nindent 12 }}
+          containers:
+            - name: pgbackrest-validation
+              image: "{{ include "pg.repmgrImage" . }}"
+              imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+              securityContext:
+                {{- toYaml .Values.postgresql.containerSecurityContext | nindent 16 }}
+              # The restore-and-validate program lives in the pgbackrest ConfigMap
+              # (validate.sh), mounted below -- mirrors the #31 pg_dump validation rather
+              # than inlining ~80 lines of shell here. All inputs arrive via env.
+              command: ["/bin/bash", "/scripts/validate.sh"]
+              env:
+                - name: PGBACKREST_STANZA
+                  value: {{ .Values.pgbackrest.stanza | quote }}
+                # The restored cluster's superuser + a database to validate against. Same
+                # credentials the rest of the chart uses; the restored pg_authid matches
+                # the live one, but local trust (set above) means no password is needed.
+                - name: POSTGRES_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "pg.secretName" . }}
+                      key: {{ include "pg.secretUsernameKey" . }}
+                - name: POSTGRES_DB
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "pg.secretName" . }}
+                      key: {{ include "pg.secretDatabaseKey" . }}
+                # Override the conf's pg1-path so the restore + recovery archive-get
+                # target the throwaway PGDATA, never the live data directory.
+                - name: PGBACKREST_PG1_PATH
+                  value: /work/pgdata
+                - name: PGDATA
+                  value: /work/pgdata
+                # pgbackrest's default log/lock paths (/var/log/pgbackrest, /tmp) may be
+                # unwritable; point them at the writable work volume.
+                - name: PGBACKREST_LOG_PATH
+                  value: /work/pgbackrest-log
+                - name: PGBACKREST_LOCK_PATH
+                  value: /work/pgbackrest-lock
+                - name: RECOVERY_TIMEOUT
+                  value: {{ .Values.pgbackrest.validation.recoveryTimeout | quote }}
+                - name: TARGET_TYPE
+                  value: {{ .Values.pgbackrest.validation.targetType | quote }}
+                - name: TARGET
+                  value: {{ .Values.pgbackrest.validation.target | quote }}
+{{- if .Values.pgbackrest.repoEncryption.enabled }}
+                - name: PGBACKREST_REPO1_CIPHER_PASS
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ required "pgbackrest.repoEncryption.existingSecret.name is required when pgbackrest.repoEncryption.enabled" .Values.pgbackrest.repoEncryption.existingSecret.name }}
+                      key: {{ .Values.pgbackrest.repoEncryption.existingSecret.passphraseKey }}
+{{- end }}
+{{- if eq .Values.pgbackrest.s3.keyType "shared" }}
+                - name: PGBACKREST_REPO1_S3_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "pg.pgbackrestS3SecretName" . }}
+                      key: {{ .Values.pgbackrest.existingSecret.accessKeyIdKey }}
+                - name: PGBACKREST_REPO1_S3_KEY_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "pg.pgbackrestS3SecretName" . }}
+                      key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
+{{- end }}
+              resources:
+                {{- toYaml .Values.pgbackrest.validation.resources | nindent 16 }}
+              volumeMounts:
+                - name: pgbackrest-config
+                  mountPath: /etc/pgbackrest/pgbackrest.conf
+                  subPath: pgbackrest.conf
+                  readOnly: true
+                # Mount validate.sh via a dedicated directory volume (not a subPath file),
+                # so /scripts is created by the mount and need not pre-exist in the image.
+                - name: validate-script
+                  mountPath: /scripts
+                  readOnly: true
+                - name: work
+                  mountPath: /work
+          volumes:
+            - name: pgbackrest-config
+              configMap:
+                name: {{ include "pg.fullname" . }}-pgbackrest
+            - name: validate-script
+              configMap:
+                name: {{ include "pg.fullname" . }}-pgbackrest
+                defaultMode: 0755
+                items:
+                  - key: validate.sh
+                    path: validate.sh
+            - name: work
+              {{- with .Values.pgbackrest.validation.workdirSizeLimit }}
+              emptyDir:
+                sizeLimit: {{ . }}
+              {{- else }}
+              emptyDir: {}
+              {{- end }}
+{{- end }}
