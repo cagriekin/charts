@@ -82,6 +82,7 @@ helm upgrade --install "${RELEASE}" "${CHART_DIR}" -n "${NAMESPACE}" \
   -f "${SCRIPT_DIR}/values-pgbackrest-minio.yaml" \
   --set pgbackrest.validation.enabled=true \
   --set pgbackrest.validation.recoveryTimeout=240 \
+  --set pgbackrest.validation.backoffLimit=0 \
   --wait --timeout 8m
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 600
 POD="${FULLNAME}-0"
@@ -119,7 +120,7 @@ seg=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT pg_walfile_name(pg_current_wal_lsn
 pg_exec "${NAMESPACE}" "${POD}" "SELECT pg_switch_wal()" "testuser" "testdb" >/dev/null
 echo "Closed WAL segment ${seg} (holds pitr_proof); waiting for it to be archived..."
 archived_ok=""
-for _ in $(seq 1 60); do
+for _ in $(seq 1 90); do
   last=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT COALESCE(last_archived_wal,'')" "testuser" "testdb" 2>/dev/null | tr -d '[:space:]' || echo "")
   # last_archived_wal >= seg (lexical compare is valid for WAL filenames on one timeline)
   if [ -n "${last}" ] && [ ! "${last}" \< "${seg}" ]; then archived_ok="yes"; break; fi
@@ -133,8 +134,18 @@ assert_eq "post-backup WAL segment archived before validation" "yes" "${archived
 echo "Triggering pgbackrest PITR validation job (throwaway restore + WAL replay)..."
 kubectl delete job pgbr-validate -n "${NAMESPACE}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
 kubectl create job -n "${NAMESPACE}" pgbr-validate --from=cronjob/"${FULLNAME}-pgbackrest-validation"
-val_rc=0
-kubectl wait --for=condition=complete job/pgbr-validate -n "${NAMESPACE}" --timeout=300s || val_rc=$?
+# Wait for the job to either complete OR fail. `kubectl wait --for=condition=complete`
+# alone blocks the full timeout on a FAILED job (it only ever satisfies on success), which
+# is what made a failing run burn 5 min/attempt. backoffLimit=0 means one pod attempt, so
+# .status.failed flips fast on a startup error.
+val_rc=2
+for _ in $(seq 1 100); do
+  succeeded=$(kubectl get job pgbr-validate -n "${NAMESPACE}" -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "")
+  failed=$(kubectl get job pgbr-validate -n "${NAMESPACE}" -o jsonpath='{.status.failed}' 2>/dev/null || echo "")
+  [ "${succeeded:-0}" -ge 1 ] 2>/dev/null && { val_rc=0; break; }
+  [ "${failed:-0}" -ge 1 ] 2>/dev/null && { val_rc=1; break; }
+  sleep 3
+done
 val_logs=$(kubectl logs -n "${NAMESPACE}" job/pgbr-validate --tail=200 2>/dev/null || true)
 if [ "${val_rc}" -ne 0 ]; then
   echo "  validation job did not complete; logs:"; printf '%s\n' "${val_logs}"

@@ -107,8 +107,15 @@ data:
     # `-l startup.log` captures the server log so a failure is diagnosable; `-w -t 60`
     # bounds the wait (don't block for the full recoveryTimeout here), and the poll
     # below -- which also tolerates a not-yet-connectable server -- does the real wait.
+    # Overrides applied at startup (win over the restored postgresql.conf):
+    #   shared_preload_libraries='' : the live config preloads repmgr, whose GUCs live in
+    #     the conf.d we stripped above -- loading it here would FATAL. The throwaway needs
+    #     no operational extensions to replay WAL.
+    #   logging_collector=off + log_destination=stderr : send any startup error to the
+    #     -l file so a failure is visible (with logging_collector on it goes to PGDATA/log).
+    #   archive_mode=off, hot_standby=on, socket-only : see above.
     pg_ctl -D "$PGDATA" -w -t 60 -l "$PGDATA/startup.log" \
-      -o "-c listen_addresses='' -c unix_socket_directories=$WORK/run -c port=5432 -c archive_mode=off -c hot_standby=on" start \
+      -o "-c listen_addresses='' -c unix_socket_directories=$WORK/run -c port=5432 -c archive_mode=off -c hot_standby=on -c shared_preload_libraries='' -c logging_collector=off -c log_destination=stderr" start \
       || echo "WARN: server not connectable within 60s; polling for recovery/promotion below" >&2
     trap 'pg_ctl -D "$PGDATA" -m immediate -w stop >/dev/null 2>&1 || true' EXIT
 
