@@ -1515,9 +1515,13 @@ assert_not_contains "#38: keyType=auto emits no static S3 key env" "${pgbr_val_a
 # PITR target wiring + the guard that target is required once a targetType is set.
 pgbr_val_pitr=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --set pgbackrest.validation.targetType=time --set-string 'pgbackrest.validation.target=2026-06-26 03:00:00+00' --show-only templates/pgbackrest-validation-cronjob.yaml 2>&1)
 assert_contains "#38: PITR target value wired into the env" "${pgbr_val_pitr}" "2026-06-26 03:00:00+00"
+# targetType set without target is rejected by the schema if/then (validation/target
+# minLength) -- and, crucially, even when validation is DISABLED (caught at input time).
 pgbr_val_badtarget=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --set pgbackrest.validation.targetType=time 2>&1 || true)
-assert_contains "#38: targetType without target fails fast" "${pgbr_val_badtarget}" "validation.target is required"
-# bogus targetType is rejected before the template guard by the values.schema.json enum.
+assert_contains "#38: targetType without target fails fast" "${pgbr_val_badtarget}" "validation/target"
+pgbr_val_badtarget_off=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.targetType=time 2>&1 || true)
+assert_contains "#38: targetType without target rejected even when validation is disabled" "${pgbr_val_badtarget_off}" "validation/target"
+# bogus targetType is rejected by the values.schema.json enum.
 pgbr_val_badtype=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --set pgbackrest.validation.targetType=bogus 2>&1 || true)
 assert_contains "#38: invalid targetType rejected" "${pgbr_val_badtype}" "must be one of"
 

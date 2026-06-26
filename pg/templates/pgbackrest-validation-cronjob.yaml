@@ -1,11 +1,8 @@
 {{- if and .Values.pgbackrest.enabled .Values.pgbackrest.validation.enabled }}
-{{- $tt := .Values.pgbackrest.validation.targetType -}}
-{{- if not (has $tt (list "" "time" "xid" "name" "lsn")) }}
-{{- fail "pgbackrest.validation.targetType must be one of \"\" (latest), time, xid, name, lsn" }}
-{{- end }}
-{{- if and (ne $tt "") (not .Values.pgbackrest.validation.target) }}
-{{- fail "pgbackrest.validation.target is required when pgbackrest.validation.targetType is set" }}
-{{- end }}
+{{- /* targetType enum and the "target required when targetType is set" rule are
+       enforced by values.schema.json (an `if/then` on validation), which validates
+       even when this CronJob is gated off -- so the misconfiguration is caught at the
+       point of bad input, not deferred to the next render that enables validation. */}}
 # Automated PITR restore-validation (#38): on a schedule, restore the pgBackRest
 # repository into a THROWAWAY PostgreSQL inside this Job pod (never the live cluster),
 # replay archived WAL to a consistent state, run a sanity query, then exit. Proves the
@@ -27,7 +24,7 @@ metadata:
     {{- end }}
 spec:
   schedule: {{ .Values.pgbackrest.validation.schedule | quote }}
-  concurrencyPolicy: Forbid
+  concurrencyPolicy: {{ .Values.pgbackrest.cronjob.concurrencyPolicy }}
   successfulJobsHistoryLimit: {{ .Values.pgbackrest.cronjob.successfulJobsHistoryLimit }}
   failedJobsHistoryLimit: {{ .Values.pgbackrest.cronjob.failedJobsHistoryLimit }}
   jobTemplate:
@@ -96,6 +93,16 @@ spec:
                     pgbackrest --stanza="$PGBACKREST_STANZA" restore
                   fi
 
+                  # The restored postgresql.conf is the live cluster's. The chart appends
+                  # `include_dir = '/etc/postgresql/conf.d'` to PGDATA (statefulset setup-config),
+                  # so it is captured in the base backup -- but this Job has no conf.d (that dir
+                  # is a ConfigMap mount on live pods only, and pg_ctl bypasses the entrypoint),
+                  # so postgres would FATAL with "could not open configuration directory". Strip
+                  # the line; the throwaway needs none of those tunables to prove restorability.
+                  if [ -f "$PGDATA/postgresql.conf" ]; then
+                    grep -v "include_dir = '/etc/postgresql/conf.d'" "$PGDATA/postgresql.conf" > "$PGDATA/postgresql.conf.tmp"
+                    mv "$PGDATA/postgresql.conf.tmp" "$PGDATA/postgresql.conf"
+                  fi
                   # The restored pg_hba.conf is the live cluster's (scram/peer over the pod
                   # network), and this Job has no DB password. Prepend a trust rule for the
                   # local socket so the validation queries can connect as the restored
@@ -106,10 +113,7 @@ spec:
                   echo "Starting the throwaway PostgreSQL to replay WAL (archive recovery)..."
                   # recovery.signal (written by restore) makes postgres replay WAL via the
                   # restore_command (pgbackrest archive-get, inheriting this container's env
-                  # for S3 creds + PGBACKREST_PG1_PATH) then promote to read-write -- so it
-                  # only accepts connections after recovery completes. `-w -t` blocks for
-                  # that, bounded by recoveryTimeout; a recovery failure fails `pg_ctl` and
-                  # thus the Job. listen_addresses='' keeps it socket-only (never networked).
+                  # for S3 creds + PGBACKREST_PG1_PATH). listen_addresses='' keeps it socket-only.
                   # archive_mode=off is CRITICAL: the restored config still has archive_mode=on
                   # + the archive-push command, so once this throwaway PROMOTES it would push
                   # its own new-timeline WAL into the PRODUCTION repo and pollute it. Disabling
@@ -119,18 +123,30 @@ spec:
                     -o "-c listen_addresses='' -c unix_socket_directories=$WORK/run -c port=5432 -c archive_mode=off" start
                   trap 'pg_ctl -D "$PGDATA" -m immediate -w stop >/dev/null 2>&1 || true' EXIT
 
-                  echo "Confirming recovery promoted the instance to read-write..."
-                  rec=$(psql -h "$WORK/run" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()" | tr -d '[:space:]')
-                  if [ "$rec" != "f" ]; then
-                    echo "ERROR: instance is still in recovery (pg_is_in_recovery=$rec) after start" >&2
+                  # hot_standby (default on) lets the postmaster accept read-only connections at
+                  # the consistency point -- DURING recovery -- so `pg_ctl -w` returning does NOT
+                  # mean WAL replay finished. Poll pg_is_in_recovery() until it promotes to
+                  # read-write ('f'), bounded by recoveryTimeout. A single check here would fail
+                  # spuriously whenever replay outlasts the moment connections first open.
+                  echo "Waiting for WAL replay to finish and the instance to promote..."
+                  promoted=""
+                  poll_interval=5
+                  poll_iters=$(( (RECOVERY_TIMEOUT + poll_interval - 1) / poll_interval ))
+                  rec=""
+                  for _ in $(seq 1 "$poll_iters"); do
+                    rec=$(psql -h "$WORK/run" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | tr -d '[:space:]') || rec=""
+                    [ "$rec" = "f" ] && { promoted="yes"; break; }
+                    sleep "$poll_interval"
+                  done
+                  if [ -z "$promoted" ]; then
+                    echo "ERROR: recovery did not promote within ${RECOVERY_TIMEOUT}s (pg_is_in_recovery=${rec:-unreadable})" >&2
                     exit 1
                   fi
 
                   echo "Validating restored contents..."
-                  psql -h "$WORK/run" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -q -c "ANALYZE" >/dev/null
-                  # The hard signal is that the cluster recovered + promoted (above). Report
-                  # the table-like relation count in the restored database too; zero is only a
-                  # warning (a schema-only / freshly-initialized database legitimately has none).
+                  # No ANALYZE: a physical restore preserves pg_class.reltuples from the source,
+                  # and the load-bearing signal is the relation COUNT (needs no stats). Skipping
+                  # it avoids a full-database scan that could dominate runtime on a large restore.
                   SUMMARY=$(psql -h "$WORK/run" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAF'|' -c "
                     SELECT count(*),
                            COALESCE(sum(c.reltuples)::bigint, 0)

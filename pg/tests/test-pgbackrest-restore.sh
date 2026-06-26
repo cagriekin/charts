@@ -97,6 +97,12 @@ if [ "${full_rc}" -ne 0 ]; then
 fi
 assert_eq "initial full backup (stanza-create) succeeds" "0" "${full_rc}"
 
+# archive_command runs `pgbackrest archive-push` from pod startup, but those pushes FAIL
+# until the stanza exists (created by the full backup above), bumping pg_stat_archiver
+# .failed_count. Reset the archiver stats now so the failed_count assertion below measures
+# only post-stanza pushes (mirrors test-backup-concurrent.sh).
+pg_exec "${NAMESPACE}" "${POD}" "SELECT pg_stat_reset_shared('archiver')" "testuser" "testdb" >/dev/null 2>&1 || true
+
 # --- write data AFTER the full backup and archive it as WAL, so a correct restore must
 #     replay WAL (not just unpack the base backup) to recover it: this is the PITR proof.
 #     pitr_proof did not exist at backup time, so it can ONLY appear in the throwaway
@@ -133,10 +139,12 @@ fi
 assert_eq "#38: pgbackrest PITR validation job completes" "0" "${val_rc}"
 assert_contains "#38: validation restored + promoted the throwaway instance" "${val_logs}" "recovery completed and promoted"
 assert_contains "#38: validation reports success" "${val_logs}" "PITR validation succeeded"
-# The throwaway restored testdb is reported by the validation job. pitr_proof was created
-# AFTER the base backup, so a non-zero relation count proves WAL was replayed -- not just
-# the base backup unpacked. (The job validates POSTGRES_DB == testdb from the secret.)
-assert_not_contains "#38: WAL replay restored the post-backup table (not just the base backup)" "${val_logs}" "0 table-like relation"
+# The throwaway restored testdb is reported by the validation job. pitr_proof is the only
+# user table in testdb and was created AFTER the base backup, so the job logging exactly
+# "1 table-like relation(s)" proves WAL was replayed -- not just the base backup unpacked.
+# (The job validates POSTGRES_DB == testdb from the secret.) An exact match avoids the
+# substring collision a "0 table-like relation" check would have with 10/20/... .
+assert_contains "#38: WAL replay restored the post-backup table (not just the base backup)" "${val_logs}" "1 table-like relation(s)"
 
 # --- the live cluster is untouched: validation restored into a throwaway, never here ---
 live_rows=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT count(*) FROM pitr_proof" "testuser" "testdb" 2>/dev/null || echo "")
