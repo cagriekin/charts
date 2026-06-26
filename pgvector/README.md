@@ -838,6 +838,15 @@ helm install my-pgvector cagriekin/pgvector \
 | `pgbackrest.cronjob.resources.limits.memory` | CronJob memory limit | `128Mi` |
 | `pgbackrest.cronjob.podSecurityContext` | Pod securityContext for the pgBackRest CronJob | `runAsNonRoot: true`, `runAsUser: 65534`, `seccompProfile: RuntimeDefault` |
 | `pgbackrest.cronjob.containerSecurityContext` | Container securityContext for the pgBackRest CronJob | `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` |
+| `pgbackrest.validation.enabled` | Enable the automated PITR restore-validation CronJob (#38) — restores the repo into a throwaway PostgreSQL, replays WAL, validates, exits. See the [pg chart README](../pg/README.md#automated-pitr-restore-validation-38) | `false` |
+| `pgbackrest.validation.schedule` | Cron schedule for the validation job | `` `0 4 * * 0` `` |
+| `pgbackrest.validation.targetType` | PITR target type (`pgbackrest --type`): `""` (latest) \| `time` \| `xid` \| `name` \| `lsn`; `target` required when set | `""` |
+| `pgbackrest.validation.target` | PITR target value for the type above | `""` |
+| `pgbackrest.validation.recoveryTimeout` | Seconds `pg_ctl` waits for WAL replay + promotion before failing the Job | `1800` |
+| `pgbackrest.validation.workdirSizeLimit` | `sizeLimit` for the throwaway restored-PGDATA emptyDir; empty = node-disk bounded | `""` |
+| `pgbackrest.validation.activeDeadlineSeconds` | Validation Job timeout | `3600` |
+| `pgbackrest.validation.backoffLimit` | Validation Job backoff limit | `1` |
+| `pgbackrest.validation.resources.*` | Validation Job resource requests/limits | `200m`/`256Mi` … `1`/`1Gi` |
 
 ### Keyless backups (cloud workload identity)
 
@@ -934,7 +943,7 @@ helm repo update
 helm upgrade my-pgvector cagriekin/pgvector   # add -f your-values.yaml
 ```
 
-`pgvector` tracks `pg` in lockstep — same version, image, and agent; the earlier 0.6.x ↔ 0.5.x split unified at `1.0.0` (current: `1.2.7`, image `trixie-5.5.0-27`). Within the 1.x line `helm upgrade` rolls the pods once and needs no manual step. The default failover mode is `agent` since `1.0.0` (it was `repmgrd` through 0.x); **only when crossing from a 0.x release** does adopting the agent default need the one-time `--cascade=orphan` recreate — pin `repmgr.failoverMode: repmgrd` to defer. Read the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. For the **compatibility matrix, the version model, and the full 0.x → 1.x migration runbook**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
+`pgvector` tracks `pg` in lockstep — same version, image, and agent; the earlier 0.6.x ↔ 0.5.x split unified at `1.0.0` (current: `1.3.0`, image `trixie-5.5.0-27`). Within the 1.x line `helm upgrade` rolls the pods once and needs no manual step. The default failover mode is `agent` since `1.0.0` (it was `repmgrd` through 0.x); **only when crossing from a 0.x release** does adopting the agent default need the one-time `--cascade=orphan` recreate — pin `repmgr.failoverMode: repmgrd` to defer. Read the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. For the **compatibility matrix, the version model, and the full 0.x → 1.x migration runbook**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
 
 ## pgvector Resources
 
