@@ -81,6 +81,7 @@ echo "Installing pg chart with pgbackrest + PITR validation enabled..."
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" -n "${NAMESPACE}" \
   -f "${SCRIPT_DIR}/values-pgbackrest-minio.yaml" \
   --set pgbackrest.validation.enabled=true \
+  --set pgbackrest.validation.recoveryTimeout=240 \
   --wait --timeout 8m
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 600
 POD="${FULLNAME}-0"
@@ -110,16 +111,18 @@ pg_exec "${NAMESPACE}" "${POD}" "SELECT pg_stat_reset_shared('archiver')" "testu
 echo "Writing post-backup data and forcing WAL archiving..."
 pg_exec "${NAMESPACE}" "${POD}" "CREATE TABLE pitr_proof (id bigserial PRIMARY KEY, v text)" "testuser" "testdb"
 pg_exec "${NAMESPACE}" "${POD}" "INSERT INTO pitr_proof (v) SELECT repeat('x',256) FROM generate_series(1,5000)" "testuser" "testdb"
-# Capture the segment we switch, then poll pg_stat_archiver until that segment (or a later
-# one) is actually archived -- a fixed sleep races on slow runners and could validate before
-# the WAL holding pitr_proof reaches the repo.
-switched=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT pg_walfile_name(pg_switch_wal())" "testuser" "testdb" | tr -d '[:space:]')
-echo "Forced WAL switch at segment ${switched}; waiting for it to be archived..."
+# Capture the CURRENT segment (the one holding pitr_proof) BEFORE switching, then switch:
+# pg_switch_wal() closes that segment so it gets archived. NOTE pg_walfile_name(pg_switch_wal())
+# would name the NEXT segment (the new current one), which is not archived until more WAL is
+# written -- so we name the pre-switch segment and wait for IT (or later) to land in the repo.
+seg=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT pg_walfile_name(pg_current_wal_lsn())" "testuser" "testdb" | tr -d '[:space:]')
+pg_exec "${NAMESPACE}" "${POD}" "SELECT pg_switch_wal()" "testuser" "testdb" >/dev/null
+echo "Closed WAL segment ${seg} (holds pitr_proof); waiting for it to be archived..."
 archived_ok=""
-for _ in $(seq 1 30); do
+for _ in $(seq 1 60); do
   last=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT COALESCE(last_archived_wal,'')" "testuser" "testdb" 2>/dev/null | tr -d '[:space:]' || echo "")
-  # last_archived_wal >= switched (lexical compare is valid for WAL filenames on one timeline)
-  if [ -n "${last}" ] && [ ! "${last}" \< "${switched}" ]; then archived_ok="yes"; break; fi
+  # last_archived_wal >= seg (lexical compare is valid for WAL filenames on one timeline)
+  if [ -n "${last}" ] && [ ! "${last}" \< "${seg}" ]; then archived_ok="yes"; break; fi
   sleep 2
 done
 failed=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT failed_count FROM pg_stat_archiver" "testuser" "testdb" 2>/dev/null || echo "")
@@ -131,8 +134,8 @@ echo "Triggering pgbackrest PITR validation job (throwaway restore + WAL replay)
 kubectl delete job pgbr-validate -n "${NAMESPACE}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
 kubectl create job -n "${NAMESPACE}" pgbr-validate --from=cronjob/"${FULLNAME}-pgbackrest-validation"
 val_rc=0
-kubectl wait --for=condition=complete job/pgbr-validate -n "${NAMESPACE}" --timeout=420s || val_rc=$?
-val_logs=$(kubectl logs -n "${NAMESPACE}" job/pgbr-validate --tail=120 2>/dev/null || true)
+kubectl wait --for=condition=complete job/pgbr-validate -n "${NAMESPACE}" --timeout=300s || val_rc=$?
+val_logs=$(kubectl logs -n "${NAMESPACE}" job/pgbr-validate --tail=200 2>/dev/null || true)
 if [ "${val_rc}" -ne 0 ]; then
   echo "  validation job did not complete; logs:"; printf '%s\n' "${val_logs}"
 fi

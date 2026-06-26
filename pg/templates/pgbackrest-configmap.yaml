@@ -99,30 +99,41 @@ data:
     # creds + PGBACKREST_PG1_PATH). listen_addresses='' keeps it socket-only.
     # archive_mode=off is CRITICAL: the restored config still has archive_mode=on +
     # the archive-push command, so once this throwaway PROMOTES it would push its own
-    # new-timeline WAL into the PRODUCTION repo and pollute it. Disabling archive_mode
-    # at startup neutralizes that; archive-get (restore_command) for reading WAL
-    # during recovery is unaffected.
-    pg_ctl -D "$PGDATA" -w -t "$RECOVERY_TIMEOUT" \
-      -o "-c listen_addresses='' -c unix_socket_directories=$WORK/run -c port=5432 -c archive_mode=off" start
+    # new-timeline WAL into the PRODUCTION repo and pollute it. archive-get
+    # (restore_command) for reading WAL during recovery is unaffected.
+    # hot_standby=on is forced so the postmaster accepts (read-only) connections at the
+    # consistency point DURING recovery; otherwise `pg_ctl -w` blocks for its whole
+    # timeout waiting for connections the server won't accept until it promotes.
+    # `-l startup.log` captures the server log so a failure is diagnosable; `-w -t 60`
+    # bounds the wait (don't block for the full recoveryTimeout here), and the poll
+    # below -- which also tolerates a not-yet-connectable server -- does the real wait.
+    pg_ctl -D "$PGDATA" -w -t 60 -l "$PGDATA/startup.log" \
+      -o "-c listen_addresses='' -c unix_socket_directories=$WORK/run -c port=5432 -c archive_mode=off -c hot_standby=on" start \
+      || echo "WARN: server not connectable within 60s; polling for recovery/promotion below" >&2
     trap 'pg_ctl -D "$PGDATA" -m immediate -w stop >/dev/null 2>&1 || true' EXIT
 
-    # hot_standby (default on) lets the postmaster accept read-only connections at the
-    # consistency point -- DURING recovery -- so `pg_ctl -w` returning does NOT mean
-    # WAL replay finished. Poll pg_is_in_recovery() until it promotes to read-write
-    # ('f'), bounded by recoveryTimeout. A single check would fail spuriously whenever
-    # replay outlasts the moment connections first open.
+    # Poll pg_is_in_recovery() until the instance promotes to read-write ('f'), bounded
+    # by recoveryTimeout. Bail early (and surface the server log) if the postmaster dies,
+    # so a startup failure fails the Job in seconds instead of hanging the full timeout.
     echo "Waiting for WAL replay to finish and the instance to promote..."
     promoted=""
     poll_interval=5
     poll_iters=$(( (RECOVERY_TIMEOUT + poll_interval - 1) / poll_interval ))
     rec=""
     for _ in $(seq 1 "$poll_iters"); do
+      if ! pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then
+        echo "ERROR: the throwaway postmaster is not running (it exited during startup/recovery)" >&2
+        break
+      fi
       rec=$(psql -h "$WORK/run" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()" 2>/dev/null | tr -d '[:space:]') || rec=""
       [ "$rec" = "f" ] && { promoted="yes"; break; }
       sleep "$poll_interval"
     done
     if [ -z "$promoted" ]; then
       echo "ERROR: recovery did not promote within ${RECOVERY_TIMEOUT}s (pg_is_in_recovery=${rec:-unreadable})" >&2
+      echo "----- throwaway postgres startup log -----" >&2
+      cat "$PGDATA/startup.log" >&2 2>/dev/null || true
+      for f in "$PGDATA"/log/*; do [ -f "$f" ] && { echo "----- $f -----" >&2; cat "$f" >&2; }; done 2>/dev/null || true
       exit 1
     fi
 
