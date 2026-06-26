@@ -1508,6 +1508,7 @@ assert_contains "#38: script starts a socket-only throwaway postgres (no network
 assert_contains "#38: script disables archive_mode so the throwaway never pollutes the prod repo" "${pgbr_script}" "archive_mode=off"
 assert_contains "#38: script polls until recovery promotes to read-write" "${pgbr_script}" "pg_is_in_recovery()"
 assert_contains "#38: script strips the unmountable include_dir to avoid a startup FATAL" "${pgbr_script}" "include_dir = '/etc/postgresql/conf.d'"
+assert_contains "#38: script puts the PG bin dir on PATH (pg_ctl/psql are not on the default PATH)" "${pgbr_script}" "/usr/lib/postgresql"
 # Runs from the repmgr image (has pgbackrest + matching PG major), as the repmgr SA
 # (workload identity for keyType=auto), with no API token.
 assert_contains "#38: uses the repmgr image" "${pgbr_val}" "cagriekin/repmgr"

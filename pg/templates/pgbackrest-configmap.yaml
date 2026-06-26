@@ -53,6 +53,14 @@ data:
     #!/bin/bash
     set -euo pipefail
 
+    # The PostgreSQL binaries (pg_ctl, psql, postgres) live in
+    # /usr/lib/postgresql/<major>/bin in the Debian-based repmgr image and are NOT on
+    # PATH when this script runs as the container command (the image entrypoint, which
+    # would add them, is bypassed). pgbackrest is in /usr/bin so the restore works, but
+    # pg_ctl would be "command not found". Prepend the PG bin dir (glob -> major-agnostic).
+    PG_BIN=$(dirname "$(ls -1 /usr/lib/postgresql/*/bin/pg_ctl 2>/dev/null | sort -V | tail -1)")
+    [ -n "$PG_BIN" ] && export PATH="$PG_BIN:$PATH"
+
     WORK=/work
     # Restore into a throwaway PGDATA on the emptyDir. PGBACKREST_PG1_PATH (env)
     # overrides the pg1-path baked into the mounted pgbackrest.conf for BOTH the
