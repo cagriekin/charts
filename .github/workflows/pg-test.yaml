@@ -182,6 +182,7 @@ jobs:
           - { name: backup-restore, target: test-backup-restore }
           - { name: backup-concurrent, target: test-backup-concurrent }
           - { name: pgbackrest-restore, target: test-pgbackrest-restore }
+          - { name: databases-roles, target: test-databases-roles }
           - { name: migrate-agent, target: test-migrate-agent }
           - { name: scaledown, target: test-scaledown }
     steps:

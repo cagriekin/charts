@@ -1,5 +1,27 @@
 # pg chart changelog
 
+## 1.4.0 - 2026-06-26
+
+Chart-only feature. No image change (`trixie-5.5.0-27`).
+
+### Added
+
+- **Declarative databases, roles & grants (#218).** New `postgresql.roles[]` and
+  `postgresql.databases[]` turn the chart into a self-serve platform database: a
+  post-install/upgrade hook Job idempotently creates the declared roles (LOGIN/NOLOGIN,
+  `memberOf` group membership), databases (with `owner` + per-database `extensions`), and
+  grants (database-, schema-, and `ALL_TABLES`/`ALL_SEQUENCES`-level, including
+  `ALTER DEFAULT PRIVILEGES` for future objects) on the primary — replicated to standbys,
+  re-applied on every upgrade and after a restore. Default-empty, so a minimal install is
+  byte-identical to before. Passwords are sourced from Secrets and read into the Job via
+  psql `\getenv` (never argv, never the ConfigMap); a chart-generated, upgrade-persisted
+  password is minted per LOGIN role unless an explicit `passwordSecret` is given. Render
+  guards (`pg.validateDatabasesRoles`) enforce identifier safety, uniqueness, reserved-name
+  protection, owner resolution, and a GRANT-privilege allowlist so a value can never inject
+  SQL. **GitOps caveat:** under `helm template` (ArgoCD) set an explicit `passwordSecret.name`
+  for every role, since the chart-generated password relies on a cluster `lookup` that is
+  empty during render. Inherited by `pgvector` via its symlinked template.
+
 ## 1.3.0 - 2026-06-26
 
 Chart-only feature. No image change (`trixie-5.5.0-27`).

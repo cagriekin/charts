@@ -1,0 +1,154 @@
+{{- if or .Values.postgresql.databases .Values.postgresql.roles }}
+{{- include "pg.validateDatabasesRoles" . }}
+{{- /* #218: declarative databases/roles/grants. A post-install/upgrade hook Job that
+       idempotently creates the declared roles, databases, per-database extensions, and
+       grants on the PRIMARY (they replicate to standbys) -- the same chart-only mechanism
+       as the monitoring-user Job, generalized. Re-runs safely on every upgrade and after a
+       restore. Passwords arrive via secretKeyRef env + psql \getenv, never the ConfigMap;
+       identifiers/privileges are validated by pg.validateDatabasesRoles so a value can
+       never inject SQL. */}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "pg.fullname" . }}-databases-roles
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: databases-roles
+  annotations:
+    ignore-check.kube-linter.io/no-liveness-probe: "one-shot databases-roles hook Job"
+    ignore-check.kube-linter.io/no-readiness-probe: "one-shot databases-roles hook Job"
+    {{- with (include "pg.annotations" .) }}
+    {{- . | nindent 4 }}
+    {{- end }}
+    "helm.sh/hook": post-install,post-upgrade
+    # weight 6: after the monitoring-user Job (5) -- order is otherwise independent.
+    "helm.sh/hook-weight": "6"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "pg.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: databases-roles
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      restartPolicy: Never
+      # Talks only to PostgreSQL, never the Kubernetes API.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: apply-databases-roles
+          image: {{ include "pg.image" .Values.postgresql.image | quote }}
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          command: ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
+          args:
+            - |
+              echo "Waiting for the primary to accept connections..."
+              for i in $(seq 1 60); do
+                if PGPASSWORD="$POSTGRES_PASSWORD" pg_isready -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; then
+                  break
+                fi
+                sleep 5
+              done
+{{- if .Values.postgresql.roles }}
+              echo "Applying declarative roles..."
+              # :"x" = quoted identifier, :'x' = quoted literal; role names are validated
+              # identifiers and embedded as %I/"" (injection-safe). Passwords are read from
+              # the environment via \getenv (never argv). \gexec makes CREATE ROLE
+              # conditional (idempotent). password_encryption=scram for the pod-CIDR pg_hba.
+              PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 \
+                -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
+{{- range $i, $r := .Values.postgresql.roles }}
+{{- if ne $r.login false }}
+              \getenv p{{ $i }} ACL_PASS_{{ $i }}
+{{- end }}
+{{- end }}
+              SET password_encryption = 'scram-sha-256';
+{{- range $i, $r := .Values.postgresql.roles }}
+              SELECT format('CREATE ROLE %I {{ if ne $r.login false }}LOGIN{{ else }}NOLOGIN{{ end }}', '{{ $r.name }}') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ $r.name }}') \gexec
+{{- if ne $r.login false }}
+              ALTER ROLE "{{ $r.name }}" WITH LOGIN PASSWORD :'p{{ $i }}';
+{{- end }}
+{{- end }}
+{{- range $r := .Values.postgresql.roles }}{{- range $m := ($r.memberOf | default list) }}
+              GRANT "{{ $m }}" TO "{{ $r.name }}";
+{{- end }}{{- end }}
+              SQL
+{{- end }}
+{{- if .Values.postgresql.databases }}
+              echo "Applying declarative databases..."
+              # CREATE DATABASE cannot run inside a transaction block; psql autocommits
+              # each statement here. \gexec makes it conditional (idempotent).
+              PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 \
+                -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
+{{- range $d := .Values.postgresql.databases }}
+              SELECT format('CREATE DATABASE %I{{ if $d.owner }} OWNER %I{{ end }}', '{{ $d.name }}'{{ if $d.owner }}, '{{ $d.owner }}'{{ end }}) WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '{{ $d.name }}') \gexec
+{{- if $d.owner }}
+              ALTER DATABASE "{{ $d.name }}" OWNER TO "{{ $d.owner }}";
+{{- end }}
+{{- end }}
+              SQL
+{{- range $d := .Values.postgresql.databases }}{{- range $e := ($d.extensions | default list) }}
+              echo "Ensuring extension '{{ $e }}' in database '{{ $d.name }}'..."
+              PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 \
+                -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "{{ $d.name }}" \
+                -c 'CREATE EXTENSION IF NOT EXISTS "{{ $e }}"'
+{{- end }}{{- end }}
+{{- end }}
+{{- range $r := .Values.postgresql.roles }}{{- range $g := ($r.grants | default list) }}
+              echo "Granting privileges to '{{ $r.name }}' in database '{{ $g.database }}'..."
+              PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 \
+                -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "{{ $g.database }}" \
+                -c '{{ include "pg.aclGrantSql" (dict "g" $g "role" $r.name) }}'
+{{- end }}{{- end }}
+              echo "Declarative databases/roles applied."
+          env:
+            - name: POSTGRES_HOST
+              value: {{ printf "%s.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretUsernameKey" . }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretPasswordKey" . }}
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretDatabaseKey" . }}
+{{- range $i, $r := .Values.postgresql.roles }}
+{{- if ne $r.login false }}
+            - name: ACL_PASS_{{ $i }}
+              valueFrom:
+                secretKeyRef:
+{{- if ($r.passwordSecret).name }}
+                  name: {{ $r.passwordSecret.name | quote }}
+                  key: {{ required (printf "postgresql.roles[%s].passwordSecret.key is required when passwordSecret.name is set" $r.name) ($r.passwordSecret).key | quote }}
+{{- else }}
+                  name: {{ include "pg.secretName" $ }}
+                  key: {{ include "pg.aclRoleSecretKey" $r.name | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+          resources:
+            {{- include "pg.initResources" . | nindent 12 }}
+{{- end }}

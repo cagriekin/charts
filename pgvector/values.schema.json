@@ -4,6 +4,52 @@
   "description": "Partial schema: constrains the values whose typos silently misconfigure HA. additionalProperties stays open so the rest of values.yaml is unconstrained.",
   "type": "object",
   "properties": {
+    "postgresql": {
+      "type": "object",
+      "properties": {
+        "roles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+              "login": { "type": "boolean" },
+              "passwordSecret": {
+                "type": "object",
+                "properties": { "name": { "type": "string" }, "key": { "type": "string" } }
+              },
+              "memberOf": { "type": "array", "items": { "type": "string" } },
+              "grants": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["database", "privileges"],
+                  "properties": {
+                    "database": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+                    "schema": { "type": "string" },
+                    "objects": { "enum": ["", "ALL_TABLES", "ALL_SEQUENCES"] },
+                    "privileges": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "databases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+              "owner": { "type": "string" },
+              "extensions": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
     "repmgr": {
       "type": "object",
       "properties": {
