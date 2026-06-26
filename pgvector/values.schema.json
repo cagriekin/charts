@@ -82,6 +82,22 @@
               "description": "pgBackRest repo1-cipher-type when repoEncryption.enabled."
             }
           }
+        },
+        "validation": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "schedule": { "type": "string" },
+            "targetType": {
+              "enum": ["", "time", "xid", "name", "lsn"],
+              "description": "PITR target type (pgbackrest --type); empty restores the latest backup + replays all WAL. validation.target is required when set."
+            },
+            "target": { "type": "string" },
+            "recoveryTimeout": { "type": "integer" },
+            "workdirSizeLimit": { "type": "string" },
+            "activeDeadlineSeconds": { "type": "integer" },
+            "backoffLimit": { "type": "integer" }
+          }
         }
       }
     }

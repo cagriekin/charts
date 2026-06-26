@@ -1481,6 +1481,43 @@ assert_contains "#31: validate.sh reads this release's scoped backup path" "${va
 # workdir emptyDir cap is configurable; default unbounded (emptyDir: {})
 assert_contains "#31: workdir cap configurable" "$(helm template test-pg "${CHART_DIR}" ${backup_val_args} --set backup.validation.enabled=true --set backup.validation.workdirSizeLimit=10Gi --show-only templates/backup-validation-cronjob.yaml 2>&1)" "sizeLimit: 10Gi"
 
+# #38: opt-in pgBackRest PITR restore-validation CronJob -- restores the repo into a
+# throwaway PostgreSQL, replays WAL, validates, exits. Distinct from the #31 pg_dump
+# validation (this exercises the pgbackrest repo + WAL archive, the real DR mechanism).
+pgbr_args="--set pgbackrest.enabled=true --set repmgr.enabled=true --set pgbackrest.s3.endpoint=https://s3.test --set pgbackrest.s3.bucket=b --set pgbackrest.existingSecret.name=s3sec"
+pgbr_noval=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} 2>&1)
+assert_not_contains "#38: no pgbackrest-validation CronJob when disabled" "${pgbr_noval}" "component: pgbackrest-validation"
+pgbr_val=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --show-only templates/pgbackrest-validation-cronjob.yaml 2>&1)
+assert_contains "#38: pgbackrest-validation CronJob present when enabled" "${pgbr_val}" "name: test-pg-pgbackrest-validation"
+# Must restore into a THROWAWAY path, never the live data dir -- the whole safety premise.
+assert_contains "#38: restores into a throwaway PGDATA (pg1-path override)" "${pgbr_val}" "name: PGBACKREST_PG1_PATH"
+assert_contains "#38: throwaway path is /work, not the live /var/lib/postgresql/data" "${pgbr_val}" "value: /work/pgdata"
+assert_not_contains "#38: never restores onto the live data directory" "${pgbr_val}" "/var/lib/postgresql/data/pgdata"
+assert_contains "#38: runs pgbackrest restore" "${pgbr_val}" "pgbackrest --stanza="
+assert_contains "#38: starts a socket-only throwaway postgres (no network listener)" "${pgbr_val}" "listen_addresses=''"
+# Safety: the promoted throwaway must NOT push its WAL into the production repo.
+assert_contains "#38: disables archive_mode so the throwaway never pollutes the prod repo" "${pgbr_val}" "archive_mode=off"
+assert_contains "#38: confirms recovery promoted to read-write" "${pgbr_val}" "pg_is_in_recovery()"
+# Runs from the repmgr image (has pgbackrest + matching PG major), as the repmgr SA
+# (workload identity for keyType=auto), with no API token.
+assert_contains "#38: uses the repmgr image" "${pgbr_val}" "cagriekin/repmgr"
+assert_contains "#38: reuses the postgresql/repmgr ServiceAccount (workload identity)" "${pgbr_val}" "serviceAccountName: test-pg-repmgr"
+assert_contains "#38: makes no API calls (no SA token)" "${pgbr_val}" "automountServiceAccountToken: false"
+assert_contains "#38: keyType=shared wires the static S3 key from the secret" "${pgbr_val}" "name: PGBACKREST_REPO1_S3_KEY"
+assert_contains "#38: schedule wired" "${pgbr_val}" 'schedule: "0 4 \* \* 0"'
+assert_contains "#38: workdir cap configurable" "$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --set pgbackrest.validation.workdirSizeLimit=20Gi --show-only templates/pgbackrest-validation-cronjob.yaml 2>&1)" "sizeLimit: 20Gi"
+# keyType=auto must NOT emit static keys (relies on the SA's workload identity).
+pgbr_val_auto=$(helm template test-pg "${CHART_DIR}" --set pgbackrest.enabled=true --set repmgr.enabled=true --set pgbackrest.s3.endpoint=https://s3.test --set pgbackrest.s3.bucket=b --set pgbackrest.s3.keyType=auto --set pgbackrest.validation.enabled=true --show-only templates/pgbackrest-validation-cronjob.yaml 2>&1)
+assert_not_contains "#38: keyType=auto emits no static S3 key env" "${pgbr_val_auto}" "PGBACKREST_REPO1_S3_KEY"
+# PITR target wiring + the guard that target is required once a targetType is set.
+pgbr_val_pitr=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --set pgbackrest.validation.targetType=time --set-string 'pgbackrest.validation.target=2026-06-26 03:00:00+00' --show-only templates/pgbackrest-validation-cronjob.yaml 2>&1)
+assert_contains "#38: PITR target value wired into the env" "${pgbr_val_pitr}" "2026-06-26 03:00:00+00"
+pgbr_val_badtarget=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --set pgbackrest.validation.targetType=time 2>&1 || true)
+assert_contains "#38: targetType without target fails fast" "${pgbr_val_badtarget}" "validation.target is required"
+# bogus targetType is rejected before the template guard by the values.schema.json enum.
+pgbr_val_badtype=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --set pgbackrest.validation.targetType=bogus 2>&1 || true)
+assert_contains "#38: invalid targetType rejected" "${pgbr_val_badtype}" "must be one of"
+
 # #27: the backup + backup-validation Jobs run under a dedicated no-RBAC SA, not
 # the namespace default.
 backup_sa=$(helm template test-pg "${CHART_DIR}" ${backup_val_args} --show-only templates/backup-serviceaccount.yaml 2>&1)
@@ -2382,6 +2419,15 @@ pgv_val=$(helm template test-pgv "${PGVECTOR_DIR}" \
   --set backup.validation.enabled=true --show-only templates/backup-validation-cronjob.yaml 2>&1)
 assert_contains "pgvector #31: backup-validation CronJob renders (symlink present)" "${pgv_val}" "app.kubernetes.io/component: backup-validation"
 assert_contains "pgvector #31: validation runs as the official-postgres uid 999" "${pgv_val}" "runAsUser: 999"
+# #38 parity: the pgbackrest PITR validation CronJob is a new template; without the
+# pgvector symlink the feature renders nothing despite the values exposing it.
+pgv_pgbr_val=$(helm template test-pgv "${PGVECTOR_DIR}" \
+  --set pgbackrest.enabled=true --set repmgr.enabled=true \
+  --set pgbackrest.s3.endpoint=https://s3.example.com --set pgbackrest.s3.bucket=b \
+  --set pgbackrest.existingSecret.name=creds --set pgbackrest.validation.enabled=true \
+  --show-only templates/pgbackrest-validation-cronjob.yaml 2>&1)
+assert_contains "pgvector #38: pgbackrest-validation CronJob renders (symlink present)" "${pgv_pgbr_val}" "app.kubernetes.io/component: pgbackrest-validation"
+assert_contains "pgvector #38: restores into a throwaway PGDATA, not the live dir" "${pgv_pgbr_val}" "value: /work/pgdata"
 # #27 parity: the backup ServiceAccount is a separate template; its pgvector symlink
 # must render or the backup Jobs fall back to the namespace default SA.
 pgv_bksa=$(helm template test-pgv "${PGVECTOR_DIR}" \

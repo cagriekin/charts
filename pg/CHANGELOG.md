@@ -1,5 +1,25 @@
 # pg chart changelog
 
+## 1.3.0 - 2026-06-26
+
+Chart-only feature. No image change (`trixie-5.5.0-27`).
+
+### Added
+
+- **Automated pgBackRest PITR restore-validation (#38).** New opt-in CronJob
+  (`pgbackrest.validation.enabled`) that, on a schedule, restores the pgBackRest
+  repository into a **throwaway PostgreSQL inside the Job pod** (never the live cluster),
+  replays the archived WAL to a consistent state, runs a sanity query, and exits — so an
+  unrestorable or corrupt repository raises an alert continuously instead of being
+  discovered during a real disaster. Read-only against S3; the throwaway PGDATA lives on
+  an emptyDir discarded when the pod ends. Runs from the repmgr image (pgbackrest +
+  matching PostgreSQL major) as the postgresql pods' ServiceAccount (so `s3.keyType=auto`
+  works), with its token unmounted (it never calls the Kubernetes API). Supports an
+  optional PITR target (`validation.targetType`/`target`); the default restores the latest
+  backup set and replays all WAL. This is the physical-backup counterpart to the existing
+  `backup.validation` job, which only restore-tests the legacy `pg_dump` path. Covered by
+  the new `test-pgbackrest-restore` integration test (restore + WAL replay on kind/MinIO).
+
 ## 1.2.7 - 2026-06-26
 
 Chart-only fix for the legacy `backup.enabled` (pg_dump → S3) path. No image change
