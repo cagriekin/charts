@@ -39,8 +39,10 @@ ANALYST_PW=$(kubectl get secret "${FULLNAME}" -n "${NAMESPACE}" -o jsonpath='{.d
 # Helper: run psql inside the primary as a given role over TCP (exercises pg_hba + the role
 # password), capturing rc. Allowed ops exit 0; denied ops exit non-zero (permission denied).
 run_as() { # role password db sql
+  # Pass PGPASSWORD via env and exec psql directly (no nested bash -c re-quoting), so a
+  # password containing shell metacharacters can't break the command.
   kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- \
-    bash -c "PGPASSWORD='$2' psql -tA -h 127.0.0.1 -U '$1' -d '$3' -v ON_ERROR_STOP=1 -c \"$4\"" 2>/dev/null
+    env PGPASSWORD="$2" psql -tA -h 127.0.0.1 -U "$1" -d "$3" -v ON_ERROR_STOP=1 -c "$4" 2>/dev/null
 }
 
 echo "Verifying 'app' (SELECT+INSERT granted)..."

@@ -19,7 +19,7 @@
                 "type": "object",
                 "properties": { "name": { "type": "string" }, "key": { "type": "string" } }
               },
-              "memberOf": { "type": "array", "items": { "type": "string" } },
+              "memberOf": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" } },
               "grants": {
                 "type": "array",
                 "items": {
@@ -27,7 +27,7 @@
                   "required": ["database", "privileges"],
                   "properties": {
                     "database": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-                    "schema": { "type": "string" },
+                    "schema": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
                     "objects": { "enum": ["", "ALL_TABLES", "ALL_SEQUENCES"] },
                     "privileges": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
                   }
@@ -43,8 +43,8 @@
             "required": ["name"],
             "properties": {
               "name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-              "owner": { "type": "string" },
-              "extensions": { "type": "array", "items": { "type": "string" } }
+              "owner": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+              "extensions": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$" } }
             }
           }
         }

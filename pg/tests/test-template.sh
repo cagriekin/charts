@@ -2146,8 +2146,11 @@ assert_contains "#28: disabled falls back to the superuser username key" "${mon_
 # #218: declarative databases/roles/grants.
 # default-empty -> no hook Job (byte-identical install).
 assert_not_contains "#218: no databases-roles Job by default" "${minimal}" "component: databases-roles"
-dr_args='--set-json postgresql.roles=[{"name":"app","grants":[{"database":"appdb","privileges":["CONNECT"]},{"database":"appdb","schema":"public","objects":"ALL_TABLES","privileges":["SELECT","INSERT"]}]},{"name":"readers","login":false}] --set-json postgresql.databases=[{"name":"appdb","owner":"app","extensions":["pg_stat_statements"]}]'
-dr_job=$(helm template test-pg "${CHART_DIR}" ${dr_args} --show-only templates/databases-roles-job.yaml 2>&1)
+dr_args=(
+  --set-json 'postgresql.roles=[{"name":"app","grants":[{"database":"appdb","privileges":["CONNECT"]},{"database":"appdb","schema":"public","objects":"ALL_TABLES","privileges":["SELECT","INSERT"]}]},{"name":"readers","login":false}]'
+  --set-json 'postgresql.databases=[{"name":"appdb","owner":"app","extensions":["pg_stat_statements"]}]'
+)
+dr_job=$(helm template test-pg "${CHART_DIR}" "${dr_args[@]}" --show-only templates/databases-roles-job.yaml 2>&1)
 assert_contains "#218: databases-roles hook Job present when set" "${dr_job}" "name: test-pg-databases-roles"
 assert_contains "#218: is a post-install/upgrade hook" "${dr_job}" "post-install,post-upgrade"
 assert_contains "#218: makes no API calls (no SA token)" "${dr_job}" "automountServiceAccountToken: false"
@@ -2162,7 +2165,7 @@ assert_contains "#218: per-database extension created idempotently" "${dr_job}" 
 assert_contains "#218: database-level grant" "${dr_job}" 'GRANT CONNECT ON DATABASE "appdb" TO "app"'
 assert_contains "#218: ALL TABLES grant + default privileges for future objects" "${dr_job}" 'GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA "public" TO "app"; ALTER DEFAULT PRIVILEGES IN SCHEMA "public" GRANT SELECT, INSERT ON TABLES TO "app"'
 # password plumbing: chart-generated key in the chart Secret, secretKeyRef env, none in a ConfigMap.
-dr_secret=$(helm template test-pg "${CHART_DIR}" ${dr_args} --show-only templates/secret.yaml 2>&1)
+dr_secret=$(helm template test-pg "${CHART_DIR}" "${dr_args[@]}" --show-only templates/secret.yaml 2>&1)
 assert_contains "#218: chart-generated role password persisted in the Secret" "${dr_secret}" "app-acl-password:"
 assert_not_contains "#218: NOLOGIN role gets no generated password" "${dr_secret}" "readers-acl-password:"
 assert_contains "#218: role password wired via secretKeyRef (not the ConfigMap)" "${dr_job}" "key: \"app-acl-password\""
@@ -2172,7 +2175,9 @@ assert_contains "#218 guard: privilege allowlist rejects arbitrary SQL keywords"
 assert_contains "#218 guard: reserved role name rejected" "$(g --set-json 'postgresql.roles=[{"name":"repmgr"}]')" "reserved/internal"
 assert_contains "#218 guard: duplicate role rejected" "$(g --set-json 'postgresql.roles=[{"name":"a"},{"name":"a"}]')" "duplicate"
 assert_contains "#218 guard: owner must be a declared role or the primary user" "$(g --set-json 'postgresql.databases=[{"name":"d","owner":"ghost"}]')" "must be declared"
-assert_contains "#218 guard: invalid identifier rejected (schema pattern)" "$(g --set-json 'postgresql.databases=[{"name":"bad-name"}]')" "does not match pattern"
+# "pattern" substring is stable across helm 3.x/4.x schema-error phrasings (the full
+# message wording differs by version, as the enum message does).
+assert_contains "#218 guard: invalid identifier rejected (schema pattern)" "$(g --set-json 'postgresql.databases=[{"name":"bad-name"}]')" "pattern"
 
 # Test: exporter container loads the custom queries file from the configmap mount
 assert_contains "exporter: extend.query-path flag wired" "${full}" "extend.query-path=/config/queries.yaml"
