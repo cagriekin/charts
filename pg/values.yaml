@@ -182,6 +182,41 @@ postgresql:
   # Recommended: true on PG14+.
   migrateLegacyMd5Users: true
 
+  # Declarative databases, roles, and grants (#218). Default-empty -> renders nothing
+  # (the chart still provisions exactly the single database/username above). When set, a
+  # post-install/upgrade hook Job idempotently creates them on the primary (replicated to
+  # standbys), so a platform team can self-serve additional databases and least-privilege
+  # roles as declared desired state -- re-applied on every upgrade and after a restore.
+  # Passwords are sourced from Secrets (never the ConfigMap). Names must match
+  # ^[A-Za-z_][A-Za-z0-9_]*$ and may not be a reserved/internal identifier
+  # (postgres, repmgr, the monitoring user, the primary username, template0/1).
+  roles: []
+    # - name: app
+    #   login: true                     # default true; set false for a NOLOGIN group role
+    #   # Password source for a LOGIN role. Empty name => chart-generated and persisted in
+    #   # the chart Secret under key "<name>-acl-password" (survives upgrades like the
+    #   # primary password). Set name/key to read from your own pre-created Secret.
+    #   # GitOps/render-only (ArgoCD): ALWAYS set an explicit passwordSecret.name -- under
+    #   # `helm template` the lookup is empty, so a chart-generated password would
+    #   # regenerate every sync and lock the role out.
+    #   passwordSecret: { name: "", key: "" }
+    #   # Memberships: roles this role is granted INTO (e.g. a group role). Validated names.
+    #   memberOf: []
+    #   # Grants. Each entry targets one database; `privileges` are GRANT keywords only
+    #   # (allowlist-validated, never arbitrary SQL):
+    #   #   no schema/objects  -> GRANT <privs> ON DATABASE <database>
+    #   #   schema, no objects -> GRANT <privs> ON SCHEMA <schema> (in <database>)
+    #   #   objects=ALL_TABLES|ALL_SEQUENCES -> GRANT on all existing + ALTER DEFAULT
+    #   #     PRIVILEGES for future objects in <schema> (so later tables inherit it)
+    #   grants:
+    #     - { database: app, privileges: [CONNECT] }
+    #     - { database: app, schema: public, privileges: [USAGE] }
+    #     - { database: app, schema: public, objects: ALL_TABLES, privileges: [SELECT, INSERT, UPDATE, DELETE] }
+  databases: []
+    # - name: app
+    #   owner: app          # optional; must be a role in roles[] or a pre-existing role
+    #   extensions: []      # optional CREATE EXTENSION IF NOT EXISTS in this database
+
   extensions:
     enabled: false
 

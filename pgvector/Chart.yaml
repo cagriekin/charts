@@ -2,7 +2,7 @@ apiVersion: v2
 name: pgvector
 description: PostgreSQL with the pgvector extension for vector search, plus repmgr replication, agent failover (Kubernetes Lease or etcd-quorum DCS), optional PgPool-II, S3 backups, TLS, and metrics
 type: application
-version: 1.3.0
+version: 1.4.0
 appVersion: "18"
 home: https://github.com/cagriekin/charts/tree/master/pgvector
 icon: https://wiki.postgresql.org/images/a/a4/PostgreSQL_logo.3colors.svg

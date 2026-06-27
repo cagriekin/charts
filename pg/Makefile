@@ -4,7 +4,7 @@ TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-repmgr test-repmgr-chaos test-full test-failover test-upgrade \
-        test-repmgr-failover test-agent test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-backup-concurrent test-pgbackrest-restore test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
+        test-repmgr-failover test-agent test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-backup-concurrent test-pgbackrest-restore test-databases-roles test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -30,6 +30,7 @@ help:
 	@echo "  test-backup-restore - Run backup and restore integration tests"
 	@echo "  test-backup-concurrent - Run concurrent pgbackrest backup + WAL archiving test"
 	@echo "  test-pgbackrest-restore - Run pgbackrest PITR restore-validation test (#38)"
+	@echo "  test-databases-roles - Run declarative databases/roles/grants test (#218)"
 	@echo "  test-special-chars - Run special-character credential tests"
 	@echo "  cluster-create  - Create Kind cluster"
 	@echo "  cluster-delete  - Delete Kind cluster"
@@ -152,6 +153,9 @@ test-backup-concurrent: cluster-exists
 
 test-pgbackrest-restore: cluster-exists
 	@bash $(TESTS_DIR)/test-pgbackrest-restore.sh
+
+test-databases-roles: cluster-exists
+	@bash $(TESTS_DIR)/test-databases-roles.sh
 
 test-special-chars: cluster-exists
 	@bash $(TESTS_DIR)/test-special-chars.sh

@@ -1,5 +1,18 @@
 # pgvector chart changelog
 
+## 1.4.0 - 2026-06-26
+
+Chart-only feature inherited from pg's symlinked templates. No image change
+(`trixie-5.5.0-27`). See the pg CHANGELOG for full detail.
+
+### Added
+
+- **Declarative databases, roles & grants (#218).** `postgresql.roles[]` /
+  `postgresql.databases[]` idempotently create roles, databases (with `owner` +
+  per-database `extensions`), and grants via a post-install/upgrade hook Job on the
+  primary. Default-empty; passwords sourced from Secrets (never the ConfigMap); identifiers
+  and privileges are guard-validated. See the pg chart README "Databases & roles".
+
 ## 1.3.0 - 2026-06-26
 
 Chart-only feature inherited from pg's symlinked templates. No image change

@@ -2143,6 +2143,48 @@ mon_off_exp=$(helm template test-pg "${CHART_DIR}" ${exp_on} --set prometheusExp
 mon_off_block=$(printf '%s\n' "${mon_off_exp}" | sed -n '/name: POSTGRES_USER/,/POSTGRES_DATABASE/p')
 assert_contains "#28: disabled falls back to the superuser username key" "${mon_off_block}" "key: username"
 
+# #218: declarative databases/roles/grants.
+# default-empty -> no hook Job (byte-identical install).
+assert_not_contains "#218: no databases-roles Job by default" "${minimal}" "component: databases-roles"
+dr_args=(
+  --set-json 'postgresql.roles=[{"name":"app","grants":[{"database":"appdb","privileges":["CONNECT"]},{"database":"appdb","schema":"public","objects":"ALL_TABLES","privileges":["SELECT","INSERT"]}]},{"name":"readers","login":false}]'
+  --set-json 'postgresql.databases=[{"name":"appdb","owner":"app","extensions":["pg_stat_statements"]}]'
+)
+dr_job=$(helm template test-pg "${CHART_DIR}" "${dr_args[@]}" --show-only templates/databases-roles-job.yaml 2>&1)
+assert_contains "#218: databases-roles hook Job present when set" "${dr_job}" "name: test-pg-databases-roles"
+assert_contains "#218: is a post-install/upgrade hook" "${dr_job}" "post-install,post-upgrade"
+assert_contains "#218: makes no API calls (no SA token)" "${dr_job}" "automountServiceAccountToken: false"
+# roles: idempotent create + password via \getenv (never argv), login flags honored.
+assert_contains "#218: CREATE ROLE is conditional/idempotent" "${dr_job}" "WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app')"
+assert_contains "#218: login role gets LOGIN + password from env via getenv" "${dr_job}" "ALTER ROLE \"app\" WITH LOGIN PASSWORD :'p0'"
+assert_contains "#218: password read from the environment with getenv (not argv)" "${dr_job}" "getenv p0 ACL_PASS_0"
+assert_contains "#218: login:false yields a NOLOGIN role" "${dr_job}" "CREATE ROLE %I NOLOGIN', 'readers'"
+# databases: idempotent create + owner, extensions, grants (incl. default privileges).
+assert_contains "#218: CREATE DATABASE conditional with owner" "${dr_job}" "format('CREATE DATABASE %I OWNER %I', 'appdb', 'app')"
+assert_contains "#218: per-database extension created idempotently" "${dr_job}" 'CREATE EXTENSION IF NOT EXISTS "pg_stat_statements"'
+assert_contains "#218: database-level grant" "${dr_job}" 'GRANT CONNECT ON DATABASE "appdb" TO "app"'
+assert_contains "#218: ALL TABLES grant + default privileges for future objects" "${dr_job}" 'GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA "public" TO "app"; ALTER DEFAULT PRIVILEGES IN SCHEMA "public" GRANT SELECT, INSERT ON TABLES TO "app"'
+# password plumbing: chart-generated key in the chart Secret, secretKeyRef env, none in a ConfigMap.
+dr_secret=$(helm template test-pg "${CHART_DIR}" "${dr_args[@]}" --show-only templates/secret.yaml 2>&1)
+assert_contains "#218: chart-generated role password persisted in the Secret" "${dr_secret}" "app-acl-password:"
+assert_not_contains "#218: NOLOGIN role gets no generated password" "${dr_secret}" "readers-acl-password:"
+assert_contains "#218: role password wired via secretKeyRef (not the ConfigMap)" "${dr_job}" "key: \"app-acl-password\""
+# render guards (token denylist / identifiers / reserved / owner) -- enforced by fail, not schema.
+g() { helm template test-pg "${CHART_DIR}" "$@" --show-only templates/databases-roles-job.yaml 2>&1; }
+# database "postgres" is the default primary db -> passes the grant-db guard, reaching the privilege check.
+assert_contains "#218 guard: privilege allowlist rejects arbitrary SQL keywords" "$(g --set-json 'postgresql.roles=[{"name":"app","grants":[{"database":"postgres","privileges":["DROP"]}]}]')" "allowlist"
+assert_contains "#218 guard: reserved role name rejected (unconditional)" "$(g --set repmgr.enabled=false --set postgresql.replicaCount=0 --set-json 'postgresql.roles=[{"name":"repmgr"}]')" "reserved/internal"
+assert_contains "#218 guard: duplicate role rejected" "$(g --set-json 'postgresql.roles=[{"name":"a"},{"name":"a"}]')" "duplicate"
+assert_contains "#218 guard: owner must be a declared role or the primary user" "$(g --set-json 'postgresql.databases=[{"name":"d","owner":"ghost"}]')" "must be declared"
+# new guards from the high-effort review: objects-needs-schema, grant-db existence, memberOf existence.
+assert_contains "#218 guard: objects without schema rejected (no silent DB-level downgrade)" "$(g --set-json 'postgresql.databases=[{"name":"d"}]' --set-json 'postgresql.roles=[{"name":"app","grants":[{"database":"d","objects":"ALL_TABLES","privileges":["SELECT"]}]}]')" "requires a schema"
+assert_contains "#218 guard: grant target database must be declared or primary" "$(g --set-json 'postgresql.roles=[{"name":"app","grants":[{"database":"ghostdb","privileges":["CONNECT"]}]}]')" "must be declared in postgresql.databases"
+assert_contains "#218 guard: memberOf must be a declared or pg_* role" "$(g --set-json 'postgresql.roles=[{"name":"app","memberOf":["typo"]}]')" "must be a role declared"
+assert_contains "#218: built-in pg_* role allowed in memberOf" "$(g --set-json 'postgresql.roles=[{"name":"app","memberOf":["pg_read_all_data"]}]')" "GRANT \"pg_read_all_data\" TO \"app\""
+# "pattern" substring is stable across helm 3.x/4.x schema-error phrasings (the full
+# message wording differs by version, as the enum message does).
+assert_contains "#218 guard: invalid identifier rejected (schema pattern)" "$(g --set-json 'postgresql.databases=[{"name":"bad-name"}]')" "pattern"
+
 # Test: exporter container loads the custom queries file from the configmap mount
 assert_contains "exporter: extend.query-path flag wired" "${full}" "extend.query-path=/config/queries.yaml"
 exporter_deploy=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
@@ -2455,6 +2497,14 @@ pgv_pgbr_cm=$(helm template test-pgv "${PGVECTOR_DIR}" \
   --show-only templates/pgbackrest-configmap.yaml 2>&1)
 assert_contains "pgvector #38: validate.sh renders from the ConfigMap (symlink present)" "${pgv_pgbr_cm}" "validate.sh:"
 assert_contains "pgvector #38: validate.sh body inherited (archive_mode safeguard)" "${pgv_pgbr_cm}" "archive_mode=off"
+# #218 parity: the databases-roles hook Job is a new template; without the pgvector
+# symlink the feature renders nothing despite the values exposing roles/databases.
+pgv_dr=$(helm template test-pgv "${PGVECTOR_DIR}" \
+  --set-json 'postgresql.roles=[{"name":"app","grants":[{"database":"appdb","privileges":["CONNECT"]}]}]' \
+  --set-json 'postgresql.databases=[{"name":"appdb","owner":"app"}]' \
+  --show-only templates/databases-roles-job.yaml 2>&1)
+assert_contains "pgvector #218: databases-roles Job renders (symlink present)" "${pgv_dr}" "app.kubernetes.io/component: databases-roles"
+assert_contains "pgvector #218: creates the declared database" "${pgv_dr}" "format('CREATE DATABASE %I OWNER %I', 'appdb', 'app')"
 # #27 parity: the backup ServiceAccount is a separate template; its pgvector symlink
 # must render or the backup Jobs fall back to the namespace default SA.
 pgv_bksa=$(helm template test-pgv "${PGVECTOR_DIR}" \

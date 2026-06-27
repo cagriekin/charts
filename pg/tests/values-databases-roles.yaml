@@ -1,0 +1,59 @@
+# Fixture for the declarative databases/roles integration test (#218). Single primary
+# (replicaCount 0) is enough to exercise the post-install hook Job; no backup/pgpool/exporter.
+postgresql:
+  image:
+    repository: postgres
+    tag: 18.1-trixie
+    pullPolicy: IfNotPresent
+  replicaCount: 0
+  database: maindb
+  username: mainuser
+  persistence:
+    enabled: false
+  podDisruptionBudget:
+    enabled: false
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 1000m, memory: 1Gi }
+
+  # The feature under test.
+  roles:
+    - name: app
+      grants:
+        - { database: appdb, privileges: [CONNECT] }
+        - { database: appdb, schema: public, privileges: [USAGE] }
+        - { database: appdb, schema: public, objects: ALL_TABLES, privileges: [SELECT, INSERT] }
+        # INSERT into a serial/identity column also needs USAGE on its sequence
+        # (separate privilege from table INSERT) -- exercises the ALL_SEQUENCES path.
+        - { database: appdb, schema: public, objects: ALL_SEQUENCES, privileges: [USAGE] }
+    - name: analyst
+      memberOf: [readers]
+      grants:
+        - { database: appdb, privileges: [CONNECT] }
+        - { database: appdb, schema: public, privileges: [USAGE] }
+        - { database: appdb, schema: public, objects: ALL_TABLES, privileges: [SELECT] }
+    - name: readers
+      login: false
+  databases:
+    - name: appdb
+      owner: app
+
+repmgr:
+  image:
+    repository: cagriekin/repmgr
+    tag: trixie-5.5.0-27
+    pullPolicy: IfNotPresent
+  enabled: true
+  failoverMode: repmgrd
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+pgpool:
+  enabled: false
+prometheusExporter:
+  enabled: false
+backup:
+  enabled: false
+pgbackrest:
+  enabled: false

@@ -509,6 +509,74 @@ When enabled, NetworkPolicies restrict traffic:
 > `podSelector` in the same `from` entry) — `podSelector` matches the policy's own
 > namespace only.
 
+## Databases & roles
+
+By default the chart provisions exactly one database and one superuser
+(`postgresql.database` / `postgresql.username`). To run it as a **platform database**
+serving several apps/teams, declare additional databases, roles, and grants — a
+post-install/upgrade hook Job (`<release>-pg-databases-roles`) applies them idempotently
+on the primary (they replicate to standbys), re-running on every `helm upgrade` and after
+a restore. Default-empty, so a minimal install is unaffected.
+
+```yaml
+postgresql:
+  roles:
+    - name: app
+      # LOGIN role. Empty passwordSecret.name => the chart generates a password and
+      # persists it in the chart Secret under key "app-acl-password" (survives upgrades).
+      passwordSecret: { name: "", key: "" }
+      grants:
+        - { database: app, privileges: [CONNECT] }
+        - { database: app, schema: public, privileges: [USAGE] }
+        - { database: app, schema: public, objects: ALL_TABLES, privileges: [SELECT, INSERT, UPDATE, DELETE] }
+    - name: analyst
+      memberOf: [readers]
+      grants:
+        - { database: app, schema: public, objects: ALL_TABLES, privileges: [SELECT] }
+    - name: readers
+      login: false          # NOLOGIN group role
+  databases:
+    - name: app
+      owner: app            # must be a role in roles[] or the primary user
+      extensions: [pgvector]
+```
+
+**Grant forms** (each entry targets one `database`; `privileges` are GRANT keywords only,
+allowlist-validated — never arbitrary SQL):
+
+| `schema` | `objects` | Emits |
+|---|---|---|
+| — | — | `GRANT … ON DATABASE` |
+| set | — | `GRANT … ON SCHEMA` |
+| set | `ALL_TABLES` / `ALL_SEQUENCES` | `GRANT … ON ALL <objs> IN SCHEMA` **plus** `ALTER DEFAULT PRIVILEGES` so future objects inherit it |
+
+**Rules enforced at render time** (`helm` fails fast, before anything is applied, so a typo
+never reaches the cluster as a half-failed hook): names match `^[A-Za-z_][A-Za-z0-9_]*$`; no
+reserved/internal names (`postgres`, `repmgr`, the monitoring user, the primary user,
+`template0/1` — reserved unconditionally, even when repmgr/the exporter are disabled);
+unique; `owner` must be a declared role or the primary user; a grant's `database` must be a
+declared database or the primary database; `memberOf` targets must be a declared role or a
+built-in `pg_*` role; a grant with `objects` must also set `schema` (an object grant has no
+database-level meaning); privileges from the allowlist (`CONNECT, CREATE, TEMP, USAGE,
+SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, EXECUTE, MAINTAIN, ALL`).
+
+**Passwords** never touch the ConfigMap — they are read into the Job from a Secret via psql
+`\getenv`. A chart-generated password is minted per LOGIN role unless you set an explicit
+`passwordSecret.name`/`key` (read from your own Secret).
+
+> **The Secret is the source of truth for role passwords.** The hook re-applies it (`ALTER
+> ROLE … PASSWORD`) on every upgrade, so rotate by updating the Secret and re-running
+> `helm upgrade` — an out-of-band `ALTER ROLE` done directly in PostgreSQL will be reverted
+> on the next upgrade (same model as the primary and monitoring passwords).
+
+> **GitOps / render-only (ArgoCD):** always set an explicit `passwordSecret.name` for every
+> LOGIN role. The chart-generated password relies on a cluster `lookup` that is empty under
+> `helm template`, so a generated password would regenerate on every sync and lock the role
+> out. With `postgresql.existingSecret.enabled`, an explicit `passwordSecret` is required.
+
+> The hook runs the declared state idempotently; it **creates and grants**, it does not drop
+> roles/databases you remove from values (that would risk data loss) — drop those by hand.
+
 ## Connecting to PostgreSQL
 
 ### Direct Connection to Primary
@@ -1270,7 +1338,7 @@ Each chart is tagged `<chart>-<version>` (e.g. `pg-1.1.0`); `pg` and `pgvector` 
 
 | `pg` / `pgvector` | repmgr image | PostgreSQL | Kubernetes |
 |-------------------|--------------|-----------|-----------|
-| 1.2.6 – 1.3.0 *(current)* | `trixie-5.5.0-27` | 18.x | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.2.6 – 1.4.0 *(current)* | `trixie-5.5.0-27` | 18.x | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
 | 1.2.2 – 1.2.5 | `trixie-5.5.0-26` | 18.x | as above |
 | 1.2.0 – 1.2.1 | `trixie-5.5.0-25` | 18.x | as above |
 | 1.0.0 – 1.1.8 | `trixie-5.5.0-16` … `-24` | 18.x | as above |
@@ -1285,7 +1353,7 @@ helm repo update
 helm upgrade my-postgres cagriekin/pg   # add -f your-values.yaml
 ```
 
-Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.3.0`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-27` at 1.3.0) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
+Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.4.0`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-27` at 1.4.0) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
 
 ### Crossing the 0.x → 1.x boundary (agent mode is now the default)
 

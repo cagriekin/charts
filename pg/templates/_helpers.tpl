@@ -158,6 +158,109 @@ annotation consumers -- #128.)
 {{- required "pgbackrest.existingSecret.name is required (pgbackrest.s3.keyType=shared); use keyType=auto for cloud workload identity" .Values.pgbackrest.existingSecret.name -}}
 {{- end }}
 
+{{- /* Declarative databases/roles (#218): chart-managed LOGIN roles whose password the
+       chart generates+persists (passwordSecret.name empty). These get a generated key in
+       the chart Secret and a secretKeyRef env in the hook Job. */ -}}
+{{- define "pg.aclManagedRoles" -}}
+{{- $out := list -}}
+{{- range $r := .Values.postgresql.roles -}}
+{{- if and (ne $r.login false) (not (($r.passwordSecret).name)) -}}
+{{- $out = append $out $r.name -}}
+{{- end -}}
+{{- end -}}
+{{- $out | join "," -}}
+{{- end }}
+
+{{- /* Secret key holding a chart-generated ACL role password. */ -}}
+{{- define "pg.aclRoleSecretKey" -}}
+{{- printf "%s-acl-password" . -}}
+{{- end }}
+
+{{- /* Build a single GRANT statement for one role grant (#218). Input dict: "g" (grant),
+       "role" (role name). Identifiers are validated elsewhere to ^[A-Za-z_][A-Za-z0-9_]*$
+       so double-quoting is injection-safe; privileges are allowlist-validated keywords. */ -}}
+{{- define "pg.aclGrantSql" -}}
+{{- $g := .g -}}{{- $role := .role -}}
+{{- $privs := $g.privileges | join ", " | upper -}}
+{{- $schema := $g.schema | default "" -}}
+{{- $objects := $g.objects | default "" -}}
+{{- if and $schema (eq $objects "ALL_TABLES") -}}
+GRANT {{ $privs }} ON ALL TABLES IN SCHEMA "{{ $schema }}" TO "{{ $role }}"; ALTER DEFAULT PRIVILEGES IN SCHEMA "{{ $schema }}" GRANT {{ $privs }} ON TABLES TO "{{ $role }}"
+{{- else if and $schema (eq $objects "ALL_SEQUENCES") -}}
+GRANT {{ $privs }} ON ALL SEQUENCES IN SCHEMA "{{ $schema }}" TO "{{ $role }}"; ALTER DEFAULT PRIVILEGES IN SCHEMA "{{ $schema }}" GRANT {{ $privs }} ON SEQUENCES TO "{{ $role }}"
+{{- else if $schema -}}
+GRANT {{ $privs }} ON SCHEMA "{{ $schema }}" TO "{{ $role }}"
+{{- else -}}
+GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
+{{- end -}}
+{{- end }}
+
+{{- /* Validate postgresql.roles[] / postgresql.databases[] (#218): identifier safety,
+       uniqueness, reserved names, owner resolution, and a GRANT-privilege allowlist so a
+       value can never smuggle arbitrary SQL into the hook Job. */ -}}
+{{- define "pg.validateDatabasesRoles" -}}
+{{- $idRe := "^[A-Za-z_][A-Za-z0-9_]*$" -}}
+{{- $privs := list "CONNECT" "CREATE" "TEMP" "TEMPORARY" "USAGE" "SELECT" "INSERT" "UPDATE" "DELETE" "TRUNCATE" "REFERENCES" "TRIGGER" "EXECUTE" "MAINTAIN" "ALL" -}}
+{{- $objs := list "" "ALL_TABLES" "ALL_SEQUENCES" -}}
+{{- /* Reserve the chart-internal identifiers UNCONDITIONALLY (even when repmgr / the
+       monitoring user are currently disabled): a declared role colliding with one that a
+       later `helm upgrade` enables would produce conflicting role management. */ -}}
+{{- $reserved := list "postgres" "template0" "template1" .Values.postgresql.username .Values.repmgr.username .Values.prometheusExporter.monitoringUser.username -}}
+{{- /* Precompute the declared role names and the databases a grant may target (declared
+       databases + the primary database) so memberOf/grant refs can be checked at render
+       time -- they may reference an entry declared later in the list. */ -}}
+{{- $declaredRoles := list -}}
+{{- range $r := .Values.postgresql.roles -}}{{- $declaredRoles = append $declaredRoles ($r.name | toString) -}}{{- end -}}
+{{- $allowedDbs := list (.Values.postgresql.database | toString) -}}
+{{- range $d := .Values.postgresql.databases -}}{{- $allowedDbs = append $allowedDbs ($d.name | toString) -}}{{- end -}}
+{{- $roleNames := list -}}
+{{- range $r := .Values.postgresql.roles -}}
+  {{- $n := $r.name | toString -}}
+  {{- if not (regexMatch $idRe $n) }}{{- fail (printf "postgresql.roles: invalid role name %q (must match %s)" $n $idRe) }}{{- end -}}
+  {{- if has $n $reserved }}{{- fail (printf "postgresql.roles: %q is a reserved/internal role name and may not be redefined" $n) }}{{- end -}}
+  {{- if has $n $roleNames }}{{- fail (printf "postgresql.roles: duplicate role name %q" $n) }}{{- end -}}
+  {{- $roleNames = append $roleNames $n -}}
+  {{- if and (ne $r.login false) (not (($r.passwordSecret).name)) $.Values.postgresql.existingSecret.enabled -}}
+    {{- fail (printf "postgresql.roles[%s]: with postgresql.existingSecret.enabled the chart cannot generate a password; set an explicit passwordSecret.name/key" $n) -}}
+  {{- end -}}
+  {{- range $m := ($r.memberOf | default list) -}}
+    {{- $mn := $m | toString -}}
+    {{- if not (regexMatch $idRe $mn) }}{{- fail (printf "postgresql.roles[%s].memberOf: invalid role name %q" $n $mn) }}{{- end -}}
+    {{- /* must be a declared role or a PostgreSQL predefined (pg_*) role -- otherwise the
+           GRANT <group> TO <role> aborts the hook with "role does not exist". */ -}}
+    {{- if and (not (has $mn $declaredRoles)) (not (hasPrefix "pg_" $mn)) }}{{- fail (printf "postgresql.roles[%s].memberOf %q must be a role declared in postgresql.roles[] or a built-in pg_* role" $n $mn) }}{{- end -}}
+  {{- end -}}
+  {{- range $g := ($r.grants | default list) -}}
+    {{- $gdb := $g.database | toString -}}
+    {{- if not (regexMatch $idRe $gdb) }}{{- fail (printf "postgresql.roles[%s].grants: invalid database %q" $n $gdb) }}{{- end -}}
+    {{- if not (has $gdb $allowedDbs) }}{{- fail (printf "postgresql.roles[%s].grants: database %q must be declared in postgresql.databases[] or be the primary database (else the grant aborts the hook)" $n $gdb) }}{{- end -}}
+    {{- if and $g.schema (not (regexMatch $idRe ($g.schema | toString))) }}{{- fail (printf "postgresql.roles[%s].grants: invalid schema %q" $n $g.schema) }}{{- end -}}
+    {{- if not (has ($g.objects | default "" | toString) $objs) }}{{- fail (printf "postgresql.roles[%s].grants.objects must be one of \"\", ALL_TABLES, ALL_SEQUENCES (got %q)" $n $g.objects) }}{{- end -}}
+    {{- if and ($g.objects | default "") (not $g.schema) }}{{- fail (printf "postgresql.roles[%s].grants: objects=%s requires a schema (an object-level grant has no database-level meaning)" $n $g.objects) }}{{- end -}}
+    {{- if not $g.privileges }}{{- fail (printf "postgresql.roles[%s].grants: privileges is required" $n) }}{{- end -}}
+    {{- range $p := $g.privileges -}}
+      {{- if not (has (upper ($p | toString)) $privs) }}{{- fail (printf "postgresql.roles[%s].grants: privilege %q not in the allowlist (%s)" $n $p (join ", " $privs)) }}{{- end -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- $dbNames := list -}}
+{{- range $d := .Values.postgresql.databases -}}
+  {{- $n := $d.name | toString -}}
+  {{- if not (regexMatch $idRe $n) }}{{- fail (printf "postgresql.databases: invalid database name %q (must match %s)" $n $idRe) }}{{- end -}}
+  {{- if has $n (list "template0" "template1") }}{{- fail (printf "postgresql.databases: %q is reserved" $n) }}{{- end -}}
+  {{- if has $n $dbNames }}{{- fail (printf "postgresql.databases: duplicate database name %q" $n) }}{{- end -}}
+  {{- $dbNames = append $dbNames $n -}}
+  {{- if $d.owner -}}
+    {{- $o := $d.owner | toString -}}
+    {{- if not (regexMatch $idRe $o) }}{{- fail (printf "postgresql.databases[%s].owner: invalid role name %q" $n $o) }}{{- end -}}
+    {{- if and (not (has $o $roleNames)) (ne $o $.Values.postgresql.username) }}{{- fail (printf "postgresql.databases[%s].owner %q must be declared in postgresql.roles[] or be the primary user" $n $o) }}{{- end -}}
+  {{- end -}}
+  {{- range $e := ($d.extensions | default list) -}}
+    {{- if not (regexMatch "^[A-Za-z_][A-Za-z0-9_-]*$" ($e | toString)) }}{{- fail (printf "postgresql.databases[%s].extensions: invalid extension name %q" $n $e) }}{{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- end }}
+
 {{- define "pg.pgpoolAdminSecretName" -}}
 {{- if .Values.pgpool.admin.existingSecret.enabled }}
 {{- required "pgpool.admin.existingSecret.name is required when pgpool.admin.existingSecret.enabled is true" .Values.pgpool.admin.existingSecret.name }}
