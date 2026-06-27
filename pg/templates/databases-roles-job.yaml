@@ -103,19 +103,25 @@ spec:
 {{- end }}
 {{- end }}
               SQL
-{{- range $d := .Values.postgresql.databases }}{{- range $e := ($d.extensions | default list) }}
-              echo "Ensuring extension '{{ $e }}' in database '{{ $d.name }}'..."
-              PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 \
-                -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "{{ $d.name }}" \
-                -c 'CREATE EXTENSION IF NOT EXISTS "{{ $e }}"'
-{{- end }}{{- end }}
 {{- end }}
-{{- range $r := .Values.postgresql.roles }}{{- range $g := ($r.grants | default list) }}
-              echo "Granting privileges to '{{ $r.name }}' in database '{{ $g.database }}'..."
+{{- /* Extensions + grants are applied per target database in ONE psql session each
+       (not one process per item): build the unique set of databases referenced by
+       databases[] and by any grant, then for each emit a single heredoc. */ -}}
+{{- $targets := list }}
+{{- range $d := .Values.postgresql.databases }}{{- if not (has $d.name $targets) }}{{- $targets = append $targets $d.name }}{{- end }}{{- end }}
+{{- range $r := .Values.postgresql.roles }}{{- range $g := ($r.grants | default list) }}{{- if not (has $g.database $targets) }}{{- $targets = append $targets $g.database }}{{- end }}{{- end }}{{- end }}
+{{- range $db := $targets }}
+              echo "Applying extensions + grants in database '{{ $db }}'..."
               PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 \
-                -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "{{ $g.database }}" \
-                -c '{{ include "pg.aclGrantSql" (dict "g" $g "role" $r.name) }}'
-{{- end }}{{- end }}
+                -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "{{ $db }}" <<'SQL'
+{{- range $d := $.Values.postgresql.databases }}{{- if eq $d.name $db }}{{- range $e := ($d.extensions | default list) }}
+              CREATE EXTENSION IF NOT EXISTS "{{ $e }}";
+{{- end }}{{- end }}{{- end }}
+{{- range $r := $.Values.postgresql.roles }}{{- range $g := ($r.grants | default list) }}{{- if eq $g.database $db }}
+              {{ include "pg.aclGrantSql" (dict "g" $g "role" $r.name) }};
+{{- end }}{{- end }}{{- end }}
+              SQL
+{{- end }}
               echo "Declarative databases/roles applied."
           env:
             - name: POSTGRES_HOST

@@ -2171,10 +2171,16 @@ assert_not_contains "#218: NOLOGIN role gets no generated password" "${dr_secret
 assert_contains "#218: role password wired via secretKeyRef (not the ConfigMap)" "${dr_job}" "key: \"app-acl-password\""
 # render guards (token denylist / identifiers / reserved / owner) -- enforced by fail, not schema.
 g() { helm template test-pg "${CHART_DIR}" "$@" --show-only templates/databases-roles-job.yaml 2>&1; }
-assert_contains "#218 guard: privilege allowlist rejects arbitrary SQL keywords" "$(g --set-json 'postgresql.roles=[{"name":"app","grants":[{"database":"d","privileges":["DROP"]}]}]')" "allowlist"
-assert_contains "#218 guard: reserved role name rejected" "$(g --set-json 'postgresql.roles=[{"name":"repmgr"}]')" "reserved/internal"
+# database "postgres" is the default primary db -> passes the grant-db guard, reaching the privilege check.
+assert_contains "#218 guard: privilege allowlist rejects arbitrary SQL keywords" "$(g --set-json 'postgresql.roles=[{"name":"app","grants":[{"database":"postgres","privileges":["DROP"]}]}]')" "allowlist"
+assert_contains "#218 guard: reserved role name rejected (unconditional)" "$(g --set repmgr.enabled=false --set postgresql.replicaCount=0 --set-json 'postgresql.roles=[{"name":"repmgr"}]')" "reserved/internal"
 assert_contains "#218 guard: duplicate role rejected" "$(g --set-json 'postgresql.roles=[{"name":"a"},{"name":"a"}]')" "duplicate"
 assert_contains "#218 guard: owner must be a declared role or the primary user" "$(g --set-json 'postgresql.databases=[{"name":"d","owner":"ghost"}]')" "must be declared"
+# new guards from the high-effort review: objects-needs-schema, grant-db existence, memberOf existence.
+assert_contains "#218 guard: objects without schema rejected (no silent DB-level downgrade)" "$(g --set-json 'postgresql.databases=[{"name":"d"}]' --set-json 'postgresql.roles=[{"name":"app","grants":[{"database":"d","objects":"ALL_TABLES","privileges":["SELECT"]}]}]')" "requires a schema"
+assert_contains "#218 guard: grant target database must be declared or primary" "$(g --set-json 'postgresql.roles=[{"name":"app","grants":[{"database":"ghostdb","privileges":["CONNECT"]}]}]')" "must be declared in postgresql.databases"
+assert_contains "#218 guard: memberOf must be a declared or pg_* role" "$(g --set-json 'postgresql.roles=[{"name":"app","memberOf":["typo"]}]')" "must be a role declared"
+assert_contains "#218: built-in pg_* role allowed in memberOf" "$(g --set-json 'postgresql.roles=[{"name":"app","memberOf":["pg_read_all_data"]}]')" "GRANT \"pg_read_all_data\" TO \"app\""
 # "pattern" substring is stable across helm 3.x/4.x schema-error phrasings (the full
 # message wording differs by version, as the enum message does).
 assert_contains "#218 guard: invalid identifier rejected (schema pattern)" "$(g --set-json 'postgresql.databases=[{"name":"bad-name"}]')" "pattern"

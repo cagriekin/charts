@@ -202,9 +202,17 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- $idRe := "^[A-Za-z_][A-Za-z0-9_]*$" -}}
 {{- $privs := list "CONNECT" "CREATE" "TEMP" "TEMPORARY" "USAGE" "SELECT" "INSERT" "UPDATE" "DELETE" "TRUNCATE" "REFERENCES" "TRIGGER" "EXECUTE" "MAINTAIN" "ALL" -}}
 {{- $objs := list "" "ALL_TABLES" "ALL_SEQUENCES" -}}
-{{- $reserved := list "postgres" "template0" "template1" .Values.postgresql.username -}}
-{{- if .Values.repmgr.enabled }}{{- $reserved = append $reserved .Values.repmgr.username -}}{{- end -}}
-{{- if and .Values.prometheusExporter.enabled .Values.prometheusExporter.monitoringUser.enabled }}{{- $reserved = append $reserved .Values.prometheusExporter.monitoringUser.username -}}{{- end -}}
+{{- /* Reserve the chart-internal identifiers UNCONDITIONALLY (even when repmgr / the
+       monitoring user are currently disabled): a declared role colliding with one that a
+       later `helm upgrade` enables would produce conflicting role management. */ -}}
+{{- $reserved := list "postgres" "template0" "template1" .Values.postgresql.username .Values.repmgr.username .Values.prometheusExporter.monitoringUser.username -}}
+{{- /* Precompute the declared role names and the databases a grant may target (declared
+       databases + the primary database) so memberOf/grant refs can be checked at render
+       time -- they may reference an entry declared later in the list. */ -}}
+{{- $declaredRoles := list -}}
+{{- range $r := .Values.postgresql.roles -}}{{- $declaredRoles = append $declaredRoles ($r.name | toString) -}}{{- end -}}
+{{- $allowedDbs := list (.Values.postgresql.database | toString) -}}
+{{- range $d := .Values.postgresql.databases -}}{{- $allowedDbs = append $allowedDbs ($d.name | toString) -}}{{- end -}}
 {{- $roleNames := list -}}
 {{- range $r := .Values.postgresql.roles -}}
   {{- $n := $r.name | toString -}}
@@ -216,12 +224,19 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
     {{- fail (printf "postgresql.roles[%s]: with postgresql.existingSecret.enabled the chart cannot generate a password; set an explicit passwordSecret.name/key" $n) -}}
   {{- end -}}
   {{- range $m := ($r.memberOf | default list) -}}
-    {{- if not (regexMatch $idRe ($m | toString)) }}{{- fail (printf "postgresql.roles[%s].memberOf: invalid role name %q" $n $m) }}{{- end -}}
+    {{- $mn := $m | toString -}}
+    {{- if not (regexMatch $idRe $mn) }}{{- fail (printf "postgresql.roles[%s].memberOf: invalid role name %q" $n $mn) }}{{- end -}}
+    {{- /* must be a declared role or a PostgreSQL predefined (pg_*) role -- otherwise the
+           GRANT <group> TO <role> aborts the hook with "role does not exist". */ -}}
+    {{- if and (not (has $mn $declaredRoles)) (not (hasPrefix "pg_" $mn)) }}{{- fail (printf "postgresql.roles[%s].memberOf %q must be a role declared in postgresql.roles[] or a built-in pg_* role" $n $mn) }}{{- end -}}
   {{- end -}}
   {{- range $g := ($r.grants | default list) -}}
-    {{- if not (regexMatch $idRe ($g.database | toString)) }}{{- fail (printf "postgresql.roles[%s].grants: invalid database %q" $n $g.database) }}{{- end -}}
+    {{- $gdb := $g.database | toString -}}
+    {{- if not (regexMatch $idRe $gdb) }}{{- fail (printf "postgresql.roles[%s].grants: invalid database %q" $n $gdb) }}{{- end -}}
+    {{- if not (has $gdb $allowedDbs) }}{{- fail (printf "postgresql.roles[%s].grants: database %q must be declared in postgresql.databases[] or be the primary database (else the grant aborts the hook)" $n $gdb) }}{{- end -}}
     {{- if and $g.schema (not (regexMatch $idRe ($g.schema | toString))) }}{{- fail (printf "postgresql.roles[%s].grants: invalid schema %q" $n $g.schema) }}{{- end -}}
     {{- if not (has ($g.objects | default "" | toString) $objs) }}{{- fail (printf "postgresql.roles[%s].grants.objects must be one of \"\", ALL_TABLES, ALL_SEQUENCES (got %q)" $n $g.objects) }}{{- end -}}
+    {{- if and ($g.objects | default "") (not $g.schema) }}{{- fail (printf "postgresql.roles[%s].grants: objects=%s requires a schema (an object-level grant has no database-level meaning)" $n $g.objects) }}{{- end -}}
     {{- if not $g.privileges }}{{- fail (printf "postgresql.roles[%s].grants: privileges is required" $n) }}{{- end -}}
     {{- range $p := $g.privileges -}}
       {{- if not (has (upper ($p | toString)) $privs) }}{{- fail (printf "postgresql.roles[%s].grants: privilege %q not in the allowlist (%s)" $n $p (join ", " $privs)) }}{{- end -}}

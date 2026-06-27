@@ -550,15 +550,24 @@ allowlist-validated — never arbitrary SQL):
 | set | — | `GRANT … ON SCHEMA` |
 | set | `ALL_TABLES` / `ALL_SEQUENCES` | `GRANT … ON ALL <objs> IN SCHEMA` **plus** `ALTER DEFAULT PRIVILEGES` so future objects inherit it |
 
-**Rules enforced at render time** (`helm` fails fast, before anything is applied): names
-match `^[A-Za-z_][A-Za-z0-9_]*$`; no reserved/internal names (`postgres`, `repmgr`, the
-monitoring user, the primary user, `template0/1`); unique; `owner` must be a declared role
-or the primary user; privileges from the allowlist (`CONNECT, CREATE, TEMP, USAGE, SELECT,
-INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, EXECUTE, MAINTAIN, ALL`).
+**Rules enforced at render time** (`helm` fails fast, before anything is applied, so a typo
+never reaches the cluster as a half-failed hook): names match `^[A-Za-z_][A-Za-z0-9_]*$`; no
+reserved/internal names (`postgres`, `repmgr`, the monitoring user, the primary user,
+`template0/1` — reserved unconditionally, even when repmgr/the exporter are disabled);
+unique; `owner` must be a declared role or the primary user; a grant's `database` must be a
+declared database or the primary database; `memberOf` targets must be a declared role or a
+built-in `pg_*` role; a grant with `objects` must also set `schema` (an object grant has no
+database-level meaning); privileges from the allowlist (`CONNECT, CREATE, TEMP, USAGE,
+SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER, EXECUTE, MAINTAIN, ALL`).
 
 **Passwords** never touch the ConfigMap — they are read into the Job from a Secret via psql
 `\getenv`. A chart-generated password is minted per LOGIN role unless you set an explicit
 `passwordSecret.name`/`key` (read from your own Secret).
+
+> **The Secret is the source of truth for role passwords.** The hook re-applies it (`ALTER
+> ROLE … PASSWORD`) on every upgrade, so rotate by updating the Secret and re-running
+> `helm upgrade` — an out-of-band `ALTER ROLE` done directly in PostgreSQL will be reverted
+> on the next upgrade (same model as the primary and monitoring passwords).
 
 > **GitOps / render-only (ArgoCD):** always set an explicit `passwordSecret.name` for every
 > LOGIN role. The chart-generated password relies on a cluster `lookup` that is empty under
