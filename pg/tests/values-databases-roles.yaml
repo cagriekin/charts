@@ -23,6 +23,9 @@ postgresql:
         - { database: appdb, privileges: [CONNECT] }
         - { database: appdb, schema: public, privileges: [USAGE] }
         - { database: appdb, schema: public, objects: ALL_TABLES, privileges: [SELECT, INSERT] }
+        # INSERT into a serial/identity column also needs USAGE on its sequence
+        # (separate privilege from table INSERT) -- exercises the ALL_SEQUENCES path.
+        - { database: appdb, schema: public, objects: ALL_SEQUENCES, privileges: [USAGE] }
     - name: analyst
       memberOf: [readers]
       grants:
