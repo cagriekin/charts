@@ -167,6 +167,20 @@ postgresql:
   # Recommended: true on PG14+.
   migrateLegacyMd5Users: true
 
+  # Declarative databases, roles, and grants (#218). Default-empty -> renders nothing.
+  # See the pg chart README "Databases & roles" for the full contract (identifier rules,
+  # the GRANT-privilege allowlist, password sourcing, and the GitOps/render-only caveat).
+  roles: []
+    # - name: app
+    #   passwordSecret: { name: "", key: "" }   # empty name => chart-generated + persisted
+    #   grants:
+    #     - { database: app, privileges: [CONNECT] }
+    #     - { database: app, schema: public, objects: ALL_TABLES, privileges: [SELECT] }
+  databases: []
+    # - name: app
+    #   owner: app
+    #   extensions: [vector]
+
   extensions:
     enabled: true
 
