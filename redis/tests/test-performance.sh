@@ -94,9 +94,9 @@ assert_eq "PING returns PONG after load" "PONG" "${result}"
 used_memory=$(redis_exec "${NAMESPACE}" "${POD}" "INFO memory" | grep "^used_memory_human:" | cut -d: -f2 | tr -d '\r')
 echo "  used_memory after run: ${used_memory:-unknown}"
 
-# Clean up the namespace so repeated runs start fresh.
-helm uninstall "${RELEASE}" -n "${NAMESPACE}" >/dev/null 2>&1 || true
-kubectl delete namespace "${NAMESPACE}" --wait=false >/dev/null 2>&1 || true
+# No teardown here: like the other suites, the release/namespace are left for the
+# ephemeral cluster teardown (make cluster-delete / clean). Reruns are idempotent
+# (create-namespace is apply-based and the install is `helm upgrade --install`).
 
 end_suite
 print_summary

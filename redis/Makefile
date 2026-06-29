@@ -18,7 +18,7 @@ help:
 	@echo "  test-failover   - Run Sentinel failover tests (needs an existing replication release)"
 	@echo "  test-tls        - Run replication-over-TLS smoke (opt-in; generates a self-signed cert)"
 	@echo "  test-acl        - Run ACL tests (standalone restricted user + replication locked default)"
-	@echo "  test-performance - Run redis-benchmark throughput baseline (opt-in; standalone)"
+	@echo "  test-performance - Run redis-benchmark throughput baseline (opt-in; needs a cluster)"
 	@echo "  cluster-create  - Create Kind cluster"
 	@echo "  cluster-delete  - Delete Kind cluster"
 	@echo "  clean           - Delete cluster and test namespaces"

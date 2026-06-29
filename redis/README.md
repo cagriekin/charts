@@ -377,7 +377,7 @@ make -C redis test            # full: create cluster, run all suites, delete clu
 make -C redis test-template   # helm lint + template assertions (no cluster)
 make -C redis test-ha         # replication + Sentinel failover (needs a cluster)
 make -C redis test-tls        # replication-over-TLS smoke (opt-in)
-make -C redis test-performance # redis-benchmark throughput baseline (opt-in)
+make -C redis test-performance # redis-benchmark throughput baseline (opt-in; needs a cluster)
 ```
 
 Declarative unit tests run with `helm unittest -f 'tests/unit/*_test.yaml' redis`.
