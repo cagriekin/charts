@@ -165,8 +165,14 @@
             "label": { "type": "string", "minLength": 1 },
             "labelValue": { "type": "string" },
             "namespace": { "type": "string" },
-            "additionalLabels": { "type": "object" },
-            "annotations": { "type": "object" }
+            "additionalLabels": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            }
           }
         }
       }
