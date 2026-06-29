@@ -3,7 +3,7 @@ KIND_CONFIG := kind-config.yaml
 TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
-.PHONY: test test-template test-cluster test-minimal test-full test-persistence test-replication test-failover test-ha test-tls test-acl cluster-create cluster-delete cluster-exists clean help
+.PHONY: test test-template test-cluster test-minimal test-full test-persistence test-replication test-failover test-ha test-tls test-acl test-performance cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -18,6 +18,7 @@ help:
 	@echo "  test-failover   - Run Sentinel failover tests (needs an existing replication release)"
 	@echo "  test-tls        - Run replication-over-TLS smoke (opt-in; generates a self-signed cert)"
 	@echo "  test-acl        - Run ACL tests (standalone restricted user + replication locked default)"
+	@echo "  test-performance - Run redis-benchmark throughput baseline (opt-in; needs a cluster)"
 	@echo "  cluster-create  - Create Kind cluster"
 	@echo "  cluster-delete  - Delete Kind cluster"
 	@echo "  clean           - Delete cluster and test namespaces"
@@ -72,6 +73,9 @@ test-failover: cluster-exists
 
 test-tls: cluster-exists
 	@bash $(TESTS_DIR)/test-tls.sh
+
+test-performance: cluster-exists
+	@bash $(TESTS_DIR)/test-performance.sh
 
 test-acl: cluster-exists
 	@bash $(TESTS_DIR)/test-acl.sh
