@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.4.0 - 2026-06-30
+
+Grafana dashboard (additive; `exporter.dashboards.enabled` defaults `false`, so existing
+installs render no new objects).
+
+### Added
+- `exporter.dashboards.*` — ship `dashboards/redis-dashboard.json` as a ConfigMap labeled for
+  Grafana sidecar auto-discovery. Covers memory/fragmentation, hit/miss ratio, connected and
+  blocked clients, command throughput and per-command latency, keyspace and evicted/expired
+  keys, AOF/RDB persistence status, and replication health (#95).
+- Configurable sidecar `label`/`labelValue`, ConfigMap `namespace`, `additionalLabels`, and
+  `annotations` (e.g. `grafana_folder`). The dashboard's `datasource`/`namespace`/`service`/
+  `instance` template variables make one dashboard serve both standalone and replication and
+  any number of releases (#95).
+
 ## 1.3.1 - 2026-06-29
 
 Sizing guidance and a throughput baseline (docs + tests only; no chart template or values

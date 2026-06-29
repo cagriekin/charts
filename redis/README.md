@@ -230,6 +230,10 @@ window.
 | `exporter.exportClientList` | Export per-client metrics via `CLIENT LIST` (expensive) | `false` |
 | `exporter.disableExporterMetrics` | Disable go-runtime metrics from the exporter itself | `false` |
 | `exporter.extraEnvVars` | Additional env vars for the exporter container (supports `value` and `valueFrom`) | `[]` |
+| `exporter.dashboards.enabled` | Ship the Grafana dashboard as a sidecar-discoverable ConfigMap | `false` |
+| `exporter.dashboards.label` / `labelValue` | Label the Grafana sidecar watches for | `grafana_dashboard` / `"1"` |
+| `exporter.dashboards.namespace` | ConfigMap namespace (empty = release namespace) | `""` |
+| `exporter.dashboards.additionalLabels` / `annotations` | Extra labels / annotations (e.g. `grafana_folder`) | `{}` / `{}` |
 
 ## Monitoring
 
@@ -254,6 +258,34 @@ All new options apply to both architectures (replication sidecar and standalone 
   exporter process itself; useful when you want only Redis metrics in the scraped output.
 - **`extraEnvVars`** — pass any other `REDIS_EXPORTER_*` flag (e.g. a Lua script path via
   `REDIS_EXPORTER_SCRIPT`, or `REDIS_EXPORTER_MAX_DISTINCT_KEY_GROUPS`).
+
+### Grafana dashboard
+
+A ready-made dashboard ships with the chart (`dashboards/redis-dashboard.json`): memory and
+fragmentation, hit/miss ratio, connected/blocked clients, command throughput and per-command
+latency, keyspace and evicted/expired keys, AOF/RDB persistence status, and replication
+health. Set `exporter.dashboards.enabled: true` to render it as a ConfigMap that the Grafana
+sidecar ([kiwigrid/k8s-sidecar](https://github.com/kiwigrid/k8s-sidecar), bundled with the
+Grafana and kube-prometheus-stack charts) auto-imports:
+
+```yaml
+exporter:
+  dashboards:
+    enabled: true
+    # Match whatever your Grafana install watches for; "1" is the common default.
+    label: grafana_dashboard
+    labelValue: "1"
+    # Optional: drop it in a Grafana folder and/or a namespace the sidecar watches.
+    annotations:
+      grafana_folder: Redis
+    # namespace: monitoring
+```
+
+The dashboard has `datasource`, `namespace`, `service`, and `instance` template variables, so
+one dashboard covers both standalone and replication and any number of releases — pick the
+release via `service` and drill into individual pods via `instance`. It is gated on
+`exporter.enabled`; with the exporter off, nothing is rendered. No Grafana sidecar? Import the
+JSON file directly through the Grafana UI.
 
 ## Persistence
 
