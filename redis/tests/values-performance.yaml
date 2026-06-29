@@ -1,0 +1,40 @@
+# Performance baseline fixture: a single standalone instance sized like a small
+# production cache (1 vCPU / 512Mi, maxmemory at ~80% of the limit). Auth and
+# persistence are disabled to isolate raw in-memory throughput from network auth
+# round-trips and fsync cost — the guide documents those overheads separately.
+architecture: standalone
+
+redis:
+  auth:
+    enabled: false
+  podDisruptionBudget:
+    enabled: false
+  image:
+    repository: redis
+    tag: "8.6.2-trixie"
+    pullPolicy: IfNotPresent
+  persistence:
+    enabled: false
+  config:
+    maxmemory: "400mb"
+    maxmemory-policy: "allkeys-lru"
+    # AOF stays enabled (the chart hardcodes appendonly yes), but appendfsync=no defers
+    # flushing to the OS so the benchmark measures CPU-bound throughput, not fsync latency.
+    appendfsync: "no"
+  resources:
+    requests:
+      cpu: "1"
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+exporter:
+  enabled: false
+
+networkPolicy:
+  enabled: false
+
+service:
+  type: ClusterIP
+  port: 6379
