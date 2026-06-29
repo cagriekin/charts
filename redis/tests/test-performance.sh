@@ -66,7 +66,10 @@ assert_throughput() {
   fi
   echo "${output}" | sed 's/^/      /'
 
-  rps=$(extract_rps "${output}")
+  # `|| true`: extract_rps's grep pipeline exits non-zero on no-match, which under
+  # `set -euo pipefail` would abort the whole suite at this assignment — before the
+  # graceful guard below. Neutralize it so an unparseable result becomes a clean FAIL.
+  rps=$(extract_rps "${output}") || true
   if [[ -z "${rps}" ]]; then
     fail "${label}" "could not parse throughput from benchmark output"
     return
@@ -91,7 +94,9 @@ result=$(redis_exec "${NAMESPACE}" "${POD}" "PING")
 assert_eq "PING returns PONG after load" "PONG" "${result}"
 
 # Surface the realized memory footprint — useful context for the sizing guide.
-used_memory=$(redis_exec "${NAMESPACE}" "${POD}" "INFO memory" | grep "^used_memory_human:" | cut -d: -f2 | tr -d '\r')
+# `|| true`: this is informational only; a grep no-match must not abort the suite
+# (pipefail + set -e) after every assertion has already passed.
+used_memory=$(redis_exec "${NAMESPACE}" "${POD}" "INFO memory" | grep "^used_memory_human:" | cut -d: -f2 | tr -d '\r') || true
 echo "  used_memory after run: ${used_memory:-unknown}"
 
 # No teardown here: like the other suites, the release/namespace are left for the

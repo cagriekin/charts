@@ -34,7 +34,3 @@ exporter:
 
 networkPolicy:
   enabled: false
-
-service:
-  type: ClusterIP
-  port: 6379
