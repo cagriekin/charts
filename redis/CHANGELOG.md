@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.1 - 2026-06-29
+
+Sizing guidance and a throughput baseline (docs + tests only; no chart template or values
+changes, so rendered output is unchanged).
+
+### Added
+- `tests/test-performance.sh` + `values-performance.yaml` — opt-in `make test-performance`
+  target that runs `redis-benchmark` against a small standalone instance and asserts a
+  conservative throughput floor (regression guard, not a precise number) (#89).
+- README "Sizing & performance" guide: memory headroom and `maxmemory` table, single-threaded
+  CPU guidance, connection/`maxclients` notes, throughput expectations, and replication/
+  persistence overhead (#89).
+
 ## 1.3.0 - 2026-06-24
 
 Exporter configuration options (non-breaking; all new values default to the exporter's

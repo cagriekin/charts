@@ -264,16 +264,73 @@ AOF is enabled by default; every write is appended and replayed on startup.
   (list of `{seconds, changes}`) for faster restarts.
 - **Data directory**: `/data`, backed by a PVC when `redis.persistence.enabled: true`.
 
-## Memory Tuning
+## Sizing & performance
 
-Set `redis.config.maxmemory` to ~80% of the container memory limit to leave room for AOF
-rewrite buffers and fragmentation.
+Redis is fast and lightweight; the usual constraint is **memory**, not CPU. Start small and
+scale the memory limit (and `maxmemory` with it) to your working set.
 
-| Container Limit | Recommended maxmemory |
+### Memory
+
+Set `redis.config.maxmemory` to ~80% of the container memory limit. The remaining headroom
+absorbs AOF rewrite buffers, replication backlog, client output buffers, and allocator
+fragmentation — without it the pod gets OOMKilled before `maxmemory-policy` can evict.
+
+| Container limit (`redis.resources.limits.memory`) | Recommended `maxmemory` |
 |----------------|-----------------------|
 | 256Mi | 200mb |
 | 512Mi | 400mb |
 | 1Gi | 800mb |
+| 4Gi | 3200mb |
+
+When the working set exceeds `maxmemory`, the `maxmemory-policy` decides behavior: the
+default `allkeys-lru` evicts least-recently-used keys (cache mode); `noeviction` rejects
+writes instead (datastore mode — use when every key must survive). Watch `evicted_keys` and
+`mem_fragmentation_ratio` (exposed by the exporter) in production.
+
+### CPU
+
+Command execution is **single-threaded**, so one core handles a very high request rate and
+extra cores do *not* raise single-instance throughput. The `1` vCPU default request/limit is
+ample for most workloads. Give more CPU only when you also run heavy background work (RDB
+`save`/AOF rewrite forks, TLS termination, the exporter sidecar) or enable Redis I/O threads.
+Scale **read** capacity horizontally with `architecture: replication` (replicas serve reads),
+not by adding cores.
+
+### Connections
+
+`maxclients` defaults to 10000. Each idle connection costs a few KB plus its output buffer;
+thousands of connections from an app without pooling can dominate memory. Prefer a client-side
+connection pool, and bound noisy clients with `redis.config.client-output-buffer-limit`.
+
+### Throughput baseline
+
+`make -C redis test-performance` runs `redis-benchmark` against a small standalone instance
+(1 vCPU / 512Mi, AOF fsync deferred) and asserts a conservative floor. It's a regression guard
+and a starting point — **measure on your own hardware with your own value sizes**, since rates
+swing widely with CPU, payload size, pipelining, TLS, and `appendfsync`. Rough expectations on
+a single modern core:
+
+| Scenario | Order of magnitude |
+|----------|--------------------|
+| `SET`/`GET`, no pipelining | tens of thousands of ops/s (latency-bound) |
+| `SET`/`GET`, pipelined (`-P 16`) | hundreds of thousands to millions of ops/s |
+| `appendfsync always` | substantially lower writes (one fsync per write) |
+| TLS enabled | lower, from per-connection handshake + encryption cost |
+
+Pipelining and a connection pool usually buy more than any server-side tuning. To benchmark a
+live release yourself:
+
+```bash
+kubectl exec -n <ns> <release>-redis-0 -c redis -- \
+  redis-benchmark -h 127.0.0.1 -q -n 100000 -c 50 -P 16 -t set,get
+```
+
+### Replication & persistence overhead
+
+Each replica holds a full copy of the dataset, so HA (`replication`, 3 pods by default) needs
+~3× the memory of a single instance. `appendfsync everysec` (default) costs little; `always`
+trades throughput for the smallest durability window. RDB `save` and AOF rewrite fork the
+process and briefly raise memory via copy-on-write — another reason for the 20% headroom above.
 
 ## Migrating to 1.0.0
 
@@ -320,6 +377,7 @@ make -C redis test            # full: create cluster, run all suites, delete clu
 make -C redis test-template   # helm lint + template assertions (no cluster)
 make -C redis test-ha         # replication + Sentinel failover (needs a cluster)
 make -C redis test-tls        # replication-over-TLS smoke (opt-in)
+make -C redis test-performance # redis-benchmark throughput baseline (opt-in; needs a cluster)
 ```
 
 Declarative unit tests run with `helm unittest -f 'tests/unit/*_test.yaml' redis`.
