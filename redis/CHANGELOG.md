@@ -12,8 +12,10 @@ installs render no new objects).
   keys, AOF/RDB persistence status, and replication health (#95).
 - Configurable sidecar `label`/`labelValue`, ConfigMap `namespace`, `additionalLabels`, and
   `annotations` (e.g. `grafana_folder`). The dashboard's `datasource`/`namespace`/`service`/
-  `instance` template variables make one dashboard serve both standalone and replication and
-  any number of releases (#95).
+  `pod` template variables make one dashboard serve both standalone and replication and
+  any number of releases. The dashboard assumes the chart's ServiceMonitor (Prometheus
+  Operator) scrape path for its `namespace`/`service`/`pod` target labels — the same labels
+  the bundled alerts use (#95).
 
 ## 1.3.1 - 2026-06-29
 

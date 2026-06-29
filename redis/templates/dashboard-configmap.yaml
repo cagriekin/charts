@@ -11,8 +11,8 @@ metadata:
   {{- end }}
   labels:
     {{- include "redis.labels" . | nindent 4 }}
-    app.kubernetes.io/component: redis
-    {{ .Values.exporter.dashboards.label }}: {{ .Values.exporter.dashboards.labelValue | quote }}
+    app.kubernetes.io/component: metrics
+    {{ .Values.exporter.dashboards.label | quote }}: {{ .Values.exporter.dashboards.labelValue | quote }}
     {{- with .Values.exporter.dashboards.additionalLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

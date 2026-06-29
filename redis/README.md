@@ -281,11 +281,19 @@ exporter:
     # namespace: monitoring
 ```
 
-The dashboard has `datasource`, `namespace`, `service`, and `instance` template variables, so
-one dashboard covers both standalone and replication and any number of releases — pick the
-release via `service` and drill into individual pods via `instance`. It is gated on
-`exporter.enabled`; with the exporter off, nothing is rendered. No Grafana sidecar? Import the
-JSON file directly through the Grafana UI.
+The dashboard has `datasource`, `namespace`, `service`, and `pod` template variables, so one
+dashboard covers both standalone and replication and any number of releases — pick the release
+via `service` and drill into individual members via `pod`. It is gated on `exporter.enabled`;
+with the exporter off, nothing is rendered. No Grafana sidecar? Import the JSON file directly
+through the Grafana UI.
+
+> **Scrape labels.** Panels and variables filter on the `namespace`, `service`, and `pod`
+> labels — the target labels the Prometheus Operator adds when scraping through the chart's
+> ServiceMonitor (`exporter.serviceMonitor.enabled`, default `true`). This is the same scrape
+> path the bundled alerts assume. If you scrape with a plain `scrape_config` or Prometheus
+> Agent instead, relabel those three labels onto the series or the panels read empty. When
+> `exporter.dashboards.namespace` points the ConfigMap at a namespace outside the release,
+> `helm uninstall` will not reap it — remove it yourself.
 
 ## Persistence
 

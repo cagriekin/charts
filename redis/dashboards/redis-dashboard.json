@@ -54,7 +54,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "min(redis_up{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"})",
+          "expr": "min(redis_up{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"})",
           "legendFormat": "up",
           "refId": "A"
         }
@@ -87,7 +87,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "max(redis_uptime_in_seconds{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"})",
+          "expr": "max(redis_uptime_in_seconds{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"})",
           "legendFormat": "uptime",
           "refId": "A"
         }
@@ -120,7 +120,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(redis_connected_clients{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"})",
+          "expr": "sum(redis_connected_clients{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"})",
           "legendFormat": "clients",
           "refId": "A"
         }
@@ -153,7 +153,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "max(redis_memory_used_bytes{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"} / (redis_memory_max_bytes{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"} > 0)) * 100",
+          "expr": "max(redis_memory_used_bytes{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"} / (redis_memory_max_bytes{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"} > 0)) * 100",
           "legendFormat": "mem %",
           "refId": "A"
         }
@@ -188,7 +188,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(redis_keyspace_hits_total{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}[5m])) / (sum(rate(redis_keyspace_hits_total{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}[5m])) + sum(rate(redis_keyspace_misses_total{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}[5m])))",
+          "expr": "sum(rate(redis_keyspace_hits_total{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}[5m])) / (sum(rate(redis_keyspace_hits_total{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}[5m])) + sum(rate(redis_keyspace_misses_total{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}[5m])))",
           "legendFormat": "hit ratio",
           "refId": "A"
         }
@@ -221,7 +221,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "max(redis_connected_slaves{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"})",
+          "expr": "max(redis_connected_slaves{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"})",
           "legendFormat": "replicas",
           "refId": "A"
         }
@@ -278,20 +278,20 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "redis_memory_used_bytes{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}",
-          "legendFormat": "used - {{instance}}",
+          "expr": "redis_memory_used_bytes{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}",
+          "legendFormat": "used - {{pod}}",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "redis_memory_used_rss_bytes{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}",
-          "legendFormat": "rss - {{instance}}",
+          "expr": "redis_memory_used_rss_bytes{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}",
+          "legendFormat": "rss - {{pod}}",
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "redis_memory_max_bytes{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"} > 0",
-          "legendFormat": "maxmemory - {{instance}}",
+          "expr": "redis_memory_max_bytes{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"} > 0",
+          "legendFormat": "maxmemory - {{pod}}",
           "refId": "C"
         }
       ],
@@ -337,8 +337,8 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "redis_mem_fragmentation_ratio{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}",
-          "legendFormat": "{{instance}}",
+          "expr": "redis_mem_fragmentation_ratio{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ],
@@ -392,8 +392,8 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "rate(redis_commands_processed_total{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}[5m])",
-          "legendFormat": "{{instance}}",
+          "expr": "rate(redis_commands_processed_total{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}[5m])",
+          "legendFormat": "{{pod}}",
           "refId": "A"
         }
       ],
@@ -439,14 +439,14 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "redis_connected_clients{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}",
-          "legendFormat": "connected - {{instance}}",
+          "expr": "redis_connected_clients{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}",
+          "legendFormat": "connected - {{pod}}",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "redis_blocked_clients{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}",
-          "legendFormat": "blocked - {{instance}}",
+          "expr": "redis_blocked_clients{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}",
+          "legendFormat": "blocked - {{pod}}",
           "refId": "B"
         }
       ],
@@ -503,13 +503,13 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(redis_keyspace_hits_total{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}[5m]))",
+          "expr": "sum(rate(redis_keyspace_hits_total{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}[5m]))",
           "legendFormat": "hits",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(redis_keyspace_misses_total{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}[5m]))",
+          "expr": "sum(rate(redis_keyspace_misses_total{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}[5m]))",
           "legendFormat": "misses",
           "refId": "B"
         }
@@ -556,13 +556,13 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum by (db) (redis_db_keys{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"})",
+          "expr": "sum by (db) (redis_db_keys{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"})",
           "legendFormat": "keys - {{db}}",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum by (db) (redis_db_keys_expiring{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"})",
+          "expr": "sum by (db) (redis_db_keys_expiring{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"})",
           "legendFormat": "expiring - {{db}}",
           "refId": "B"
         }
@@ -617,7 +617,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "topk(10, sum by (cmd) (rate(redis_commands_duration_seconds_total{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}[5m])) / sum by (cmd) (rate(redis_commands_total{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}[5m])))",
+          "expr": "topk(10, sum by (cmd) (rate(redis_commands_duration_seconds_total{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}[5m])) / sum by (cmd) (rate(redis_commands_total{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}[5m])))",
           "legendFormat": "{{cmd}}",
           "refId": "A"
         }
@@ -666,13 +666,13 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(redis_evicted_keys_total{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}[5m]))",
+          "expr": "sum(rate(redis_evicted_keys_total{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}[5m]))",
           "legendFormat": "evicted",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(redis_expired_keys_total{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}[5m]))",
+          "expr": "sum(rate(redis_expired_keys_total{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}[5m]))",
           "legendFormat": "expired",
           "refId": "B"
         }
@@ -715,20 +715,20 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "redis_aof_last_write_status{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}",
-          "legendFormat": "AOF write - {{instance}}",
+          "expr": "redis_aof_last_write_status{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}",
+          "legendFormat": "AOF write - {{pod}}",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "redis_aof_last_bgrewrite_status{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}",
-          "legendFormat": "AOF rewrite - {{instance}}",
+          "expr": "redis_aof_last_bgrewrite_status{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}",
+          "legendFormat": "AOF rewrite - {{pod}}",
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "redis_rdb_last_bgsave_status{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}",
-          "legendFormat": "RDB bgsave - {{instance}}",
+          "expr": "redis_rdb_last_bgsave_status{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}",
+          "legendFormat": "RDB bgsave - {{pod}}",
           "refId": "C"
         }
       ],
@@ -776,13 +776,13 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "max(redis_rdb_changes_since_last_save{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"})",
+          "expr": "max(redis_rdb_changes_since_last_save{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"})",
           "legendFormat": "changes since last save",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "time() - max(redis_rdb_last_save_timestamp_seconds{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"})",
+          "expr": "time() - min(redis_rdb_last_save_timestamp_seconds{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"})",
           "legendFormat": "time since last save",
           "refId": "B"
         }
@@ -837,14 +837,14 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "redis_connected_slaves{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}",
-          "legendFormat": "connected replicas - {{instance}}",
+          "expr": "redis_connected_slaves{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}",
+          "legendFormat": "connected replicas - {{pod}}",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "redis_master_link_up{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}",
-          "legendFormat": "master link up - {{instance}}",
+          "expr": "redis_master_link_up{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}",
+          "legendFormat": "master link up - {{pod}}",
           "refId": "B"
         }
       ],
@@ -890,13 +890,13 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(redis_net_input_bytes_total{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}[5m]))",
+          "expr": "sum(rate(redis_net_input_bytes_total{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}[5m]))",
           "legendFormat": "in",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(redis_net_output_bytes_total{namespace=\"$namespace\", service=\"$service\", instance=~\"$instance\"}[5m]))",
+          "expr": "sum(rate(redis_net_output_bytes_total{namespace=\"$namespace\", service=\"$service\", pod=~\"$pod\"}[5m]))",
           "legendFormat": "out",
           "refId": "B"
         }
@@ -958,14 +958,14 @@
       {
         "current": {},
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
-        "definition": "label_values(redis_up{namespace=\"$namespace\", service=\"$service\"}, instance)",
+        "definition": "label_values(redis_up{namespace=\"$namespace\", service=\"$service\"}, pod)",
         "hide": 0,
         "includeAll": true,
-        "label": "Instance",
+        "label": "Pod",
         "multi": true,
-        "name": "instance",
+        "name": "pod",
         "options": [],
-        "query": { "query": "label_values(redis_up{namespace=\"$namespace\", service=\"$service\"}, instance)", "refId": "instance" },
+        "query": { "query": "label_values(redis_up{namespace=\"$namespace\", service=\"$service\"}, pod)", "refId": "pod" },
         "refresh": 2,
         "regex": "",
         "sort": 1,
