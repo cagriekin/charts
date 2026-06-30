@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.1 - 2026-07-01
+
+Bugfix: standalone mode now honors pod scheduling fields (additive; no change to
+replication mode or to standalone installs that don't set these).
+
+### Fixed
+- **`architecture: standalone` ignored `redis.nodeSelector`, `redis.tolerations`,
+  `redis.affinity`, and `redis.podAnnotations`.** Only the replication StatefulSet
+  rendered them, so a standalone install could not be pinned to a node pool — e.g. it
+  could land on an EKS Auto Mode node that doesn't support the `ebs.csi.aws.com`
+  (`gp3`) provisioner, leaving the PVC unbound and the pod Pending. The standalone
+  StatefulSet now renders the same scheduling fields as the replication branch
+  (no default podAntiAffinity, since standalone is a single pod).
+
 ## 1.4.0 - 2026-06-30
 
 Grafana dashboard (additive; `exporter.dashboards.enabled` defaults `false`, so existing
