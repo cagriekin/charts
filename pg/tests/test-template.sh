@@ -1360,6 +1360,9 @@ assert_not_contains "#119: backup verify does not buffer the dump to /tmp" "${ba
 # the Job before publishing. The fix wraps the pipe in set +o pipefail / PIPESTATUS[1].
 assert_contains "#230: integrity check reads pg_restore's status via PIPESTATUS" "${backup_configmap}" 'rc=${PIPESTATUS\[1\]}'
 assert_contains "#230: integrity check tolerates mc cat SIGPIPE (pipefail disabled around the pipe)" "${backup_configmap}" "set +o pipefail"
+# ...and pipefail is restored afterward, so the rest of backup.sh keeps its
+# fail-on-pipe-error behavior (the disable is scoped to the integrity pipe only).
+assert_contains "#230: pipefail restored after the integrity pipe" "${backup_configmap}" "set -o pipefail"
 # #143: dumps are namespaced per release and retention is scoped to this release's
 # own dump objects, so a shared bucket/prefix can never delete another release's backups.
 # needles are regex-safe (assert_contains greps as a regex): avoid the *. in backup_*.dump
