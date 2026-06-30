@@ -1354,6 +1354,22 @@ assert_contains "backup: pg_restore verification present" "${backup_configmap}" 
 # fill the node on a large DB).
 assert_contains "#119: backup verify is streamed to pg_restore" "${backup_configmap}" "| pg_restore --list"
 assert_not_contains "#119: backup verify does not buffer the dump to /tmp" "${backup_configmap}" "verify_backup.dump"
+# #230: the integrity check must inspect BOTH ends of the pipe via PIPESTATUS, not rely
+# on pipefail. pg_restore --list closes the stream after the TOC, so on any dump > the
+# ~64 KB pipe buffer mc cat is SIGPIPE-killed (141) and bare pipefail would abort the Job
+# before publishing. The fix disables errexit+pipefail around the pipe so it can require
+# pg_restore success while tolerating ONLY mc cat's SIGPIPE -- a real mc cat read error
+# stays fatal -- and so the diagnostics run instead of being skipped by set -e at the pipe.
+# Needles are regex-safe (assert_contains greps as BRE): escaped brackets, no ${ }.
+assert_contains "#230: integrity check snapshots both pipe statuses via PIPESTATUS" "${backup_configmap}" 'PIPESTATUS\[@\]'
+assert_contains "#230: errexit+pipefail disabled around the integrity pipe" "${backup_configmap}" "set +o pipefail +e"
+# ...and both are restored afterward, so the rest of backup.sh keeps its fail-fast
+# behavior (the disable is scoped to the integrity pipe only).
+assert_contains "#230: errexit+pipefail restored after the integrity pipe" "${backup_configmap}" "set -e -o pipefail"
+# The consumer (pg_restore) must succeed...
+assert_contains "#230: pg_restore (consumer) failure is fatal" "${backup_configmap}" "rc_restore"
+# ...and a non-SIGPIPE mc cat (producer) failure stays fatal -- only 141 is tolerated.
+assert_contains "#230: only mc cat SIGPIPE (141) is tolerated, other producer failures fatal" "${backup_configmap}" "ne 141"
 # #143: dumps are namespaced per release and retention is scoped to this release's
 # own dump objects, so a shared bucket/prefix can never delete another release's backups.
 # needles are regex-safe (assert_contains greps as a regex): avoid the *. in backup_*.dump
