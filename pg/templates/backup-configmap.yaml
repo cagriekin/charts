@@ -114,10 +114,22 @@ data:
 
     # Stream the integrity check instead of buffering the whole dump to /tmp on the
     # container's (unbounded, unsized) writable layer -- a large DB could otherwise hit
-    # node-disk eviction (#119). pg_restore --list reads the TOC from stdin; under
-    # pipefail a failure in mc cat or pg_restore aborts the job.
+    # node-disk eviction (#119). pg_restore --list reads only the header + TOC at the
+    # front of a -Fc dump; it does NOT consume the data blocks. On any dump larger than
+    # the OS pipe buffer (~64 KB) pg_restore exits 0 while `mc cat` is still streaming,
+    # `mc cat` is then SIGPIPE-killed (exit 141), and pipefail would propagate that and
+    # abort the Job *before* the publish step -- so no backup is ever produced (#230).
+    # Check the CONSUMER's (pg_restore) status via PIPESTATUS and tolerate mc's SIGPIPE:
+    # a genuine pg_restore parse failure is still fatal.
     echo "Verifying backup integrity via pg_restore --list..."
+    set +o pipefail
     mc cat "s3/${S3_TMP}" | pg_restore --list > /dev/null
+    rc=${PIPESTATUS[1]}
+    set -o pipefail
+    if [ "$rc" -ne 0 ]; then
+      echo "ERROR: backup integrity check failed (pg_restore --list exit $rc)" >&2
+      exit 1
+    fi
     echo "Backup integrity verified"
 
     # Integrity confirmed -> publish the staged object to the canonical name. mc mv is

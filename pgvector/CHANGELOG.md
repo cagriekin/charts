@@ -1,5 +1,19 @@
 # pgvector chart changelog
 
+## 1.4.1 - 2026-06-30
+
+Chart-only fix inherited from pg's symlinked templates. No image change. See the pg
+CHANGELOG for full detail.
+
+### Fixed
+
+- **Backup integrity check no longer aborts on dumps larger than the pipe buffer (#230).**
+  The `backup.enabled` (pg_dump → S3) integrity step (`mc cat … | pg_restore --list`) was
+  SIGPIPE-killed and aborted by `pipefail` on any dump exceeding the ~64 KB pipe buffer
+  (any real database), before the staged `.tmp` object was promoted — so no backup was ever
+  published. The check now reads `pg_restore`'s exit status via `PIPESTATUS[1]` and tolerates
+  `mc cat`'s SIGPIPE.
+
 ## 1.4.0 - 2026-06-26
 
 Chart-only feature inherited from pg's symlinked templates. No image change

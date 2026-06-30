@@ -1,5 +1,24 @@
 # pg chart changelog
 
+## 1.4.1 - 2026-06-30
+
+Chart-only fix. No image change (`trixie-5.5.0-27`).
+
+### Fixed
+
+- **Backup integrity check no longer aborts on dumps larger than the pipe buffer (#230).**
+  The `backup.enabled` (pg_dump → S3) integrity step (`mc cat … | pg_restore --list`) ran
+  under `set -o pipefail`. `pg_restore --list` reads only the header + TOC at the front of a
+  `-Fc` dump, so on any dump exceeding the OS pipe buffer (~64 KB — i.e. any real database)
+  it exits 0 while `mc cat` is still streaming; `mc cat` was then SIGPIPE-killed (exit 141)
+  and `pipefail` propagated that, aborting the Job *before* the staged `.tmp` object was
+  promoted to its canonical `backup_<ts>.dump` name — so no usable backup was ever published
+  and the CronJob never recorded a success. The check now reads `pg_restore`'s own exit
+  status via `PIPESTATUS[1]` and tolerates `mc cat`'s expected SIGPIPE, while a genuine
+  `pg_restore` parse failure stays fatal. The integration test now seeds a table whose
+  `-Fc` dump exceeds the pipe buffer so the SIGPIPE path is covered in CI. Inherited by
+  `pgvector` via its symlinked template.
+
 ## 1.4.0 - 2026-06-26
 
 Chart-only feature. No image change (`trixie-5.5.0-27`).

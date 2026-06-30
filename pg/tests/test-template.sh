@@ -1354,6 +1354,12 @@ assert_contains "backup: pg_restore verification present" "${backup_configmap}" 
 # fill the node on a large DB).
 assert_contains "#119: backup verify is streamed to pg_restore" "${backup_configmap}" "| pg_restore --list"
 assert_not_contains "#119: backup verify does not buffer the dump to /tmp" "${backup_configmap}" "verify_backup.dump"
+# #230: the integrity check must check pg_restore's own exit status via PIPESTATUS and
+# tolerate mc cat's SIGPIPE -- pg_restore --list closes the stream after the TOC, so on
+# any dump > the ~64 KB pipe buffer mc is SIGPIPE-killed and bare pipefail would abort
+# the Job before publishing. The fix wraps the pipe in set +o pipefail / PIPESTATUS[1].
+assert_contains "#230: integrity check reads pg_restore's status via PIPESTATUS" "${backup_configmap}" 'rc=${PIPESTATUS\[1\]}'
+assert_contains "#230: integrity check tolerates mc cat SIGPIPE (pipefail disabled around the pipe)" "${backup_configmap}" "set +o pipefail"
 # #143: dumps are namespaced per release and retention is scoped to this release's
 # own dump objects, so a shared bucket/prefix can never delete another release's backups.
 # needles are regex-safe (assert_contains greps as a regex): avoid the *. in backup_*.dump

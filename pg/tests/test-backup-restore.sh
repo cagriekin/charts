@@ -105,6 +105,18 @@ pg_exec "${NAMESPACE}" "${POD}" "INSERT INTO backup_test (value) VALUES ('before
 row_count_before=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT count(*) FROM backup_test" "testuser" "testdb")
 assert_eq "inserted 3 rows before backup" "3" "${row_count_before}"
 
+# #230 regression guard: pg_restore --list only reads the header + TOC at the front
+# of a -Fc dump, so on any dump LARGER than the OS pipe buffer (~64 KB) it exits 0
+# while `mc cat` is still streaming -- mc is then SIGPIPE-killed and (pre-fix) pipefail
+# aborted the whole Job before publishing, so no backup was ever produced. Seed a table
+# whose dump far exceeds the pipe buffer (high-entropy md5 text resists -Fc compression)
+# so the backup job below exercises the SIGPIPE path; the fix must let it complete.
+echo "Seeding a large table so the -Fc dump exceeds the 64 KB pipe buffer (#230)..."
+pg_exec "${NAMESPACE}" "${POD}" "CREATE TABLE backup_big (id int PRIMARY KEY, payload text)" "testuser" "testdb"
+pg_exec "${NAMESPACE}" "${POD}" "INSERT INTO backup_big SELECT g, md5(random()::text) FROM generate_series(1, 50000) g" "testuser" "testdb"
+big_count=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT count(*) FROM backup_big" "testuser" "testdb")
+assert_eq "seeded 50000 rows for the >64 KB dump (#230)" "50000" "${big_count}"
+
 # NOTE (#143/#159 coverage): the retention DELETE (mc find --name 'backup_*.dump'
 # --older-than ${RETENTION_DAYS}d) and the stale-stage sweep (--older-than 1d) are
 # day-granular and mc cannot back-date an S3 object, so they cannot be exercised in a
@@ -148,6 +160,16 @@ if echo "${backup_file}" | grep -q '"size"'; then
   pass "backup file exists in S3"
 else
   fail "backup file exists in S3" "no file found"
+fi
+
+# #230: prove the published dump actually exceeds the 64 KB pipe buffer, so the backup
+# job above genuinely traversed the SIGPIPE integrity-check path (not a sub-buffer dump
+# that would pass even with the bug present).
+backup_size=$(echo "${backup_file}" | grep -o '"size":[0-9]*' | grep -o '[0-9]*' | head -1)
+if [ -n "${backup_size}" ] && [ "${backup_size}" -gt 65536 ]; then
+  pass "#230: published dump exceeds the 64 KB pipe buffer (${backup_size} bytes)"
+else
+  fail "#230: published dump exceeds the 64 KB pipe buffer" "size=${backup_size:-unknown}"
 fi
 
 echo "Dropping test data..."
