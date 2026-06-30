@@ -2383,6 +2383,38 @@ entries:
   redis:
   - apiVersion: v2
     appVersion: "8"
+    created: "2026-06-30T23:11:58.273925745Z"
+    dependencies:
+    - name: common
+      repository: file://../common
+      version: 0.1.0
+    description: Redis standalone or Sentinel-managed HA replication, with ACLs, TLS,
+      AOF persistence, and a Prometheus metrics exporter
+    digest: a3e032d11f681efa85079889c452baf5df89b1faea1660e34013fd05bb1bb12b
+    home: https://github.com/cagriekin/charts/tree/master/redis
+    icon: https://www.vectorlogo.zone/logos/redis/redis-icon.svg
+    keywords:
+    - redis
+    - cache
+    - key-value
+    - replication
+    - sentinel
+    - high-availability
+    maintainers:
+    - email: cagri.ekin@gmail.com
+      name: cagriekin
+      url: https://github.com/cagriekin
+    name: redis
+    sources:
+    - https://github.com/cagriekin/charts
+    - https://redis.io
+    - https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/redis-1.4.1.tgz
+    version: 1.4.1
+  - apiVersion: v2
+    appVersion: "8"
     created: "2026-06-30T08:43:06.442935192Z"
     dependencies:
     - name: common
@@ -2518,4 +2550,4 @@ entries:
     urls:
     - https://cagriekin.github.io/charts/redis-0.2.0.tgz
     version: 0.2.0
-generated: "2026-06-30T19:11:32.92851557Z"
+generated: "2026-06-30T23:11:58.271550144Z"
