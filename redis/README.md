@@ -230,6 +230,10 @@ window.
 | `exporter.exportClientList` | Export per-client metrics via `CLIENT LIST` (expensive) | `false` |
 | `exporter.disableExporterMetrics` | Disable go-runtime metrics from the exporter itself | `false` |
 | `exporter.extraEnvVars` | Additional env vars for the exporter container (supports `value` and `valueFrom`) | `[]` |
+| `exporter.dashboards.enabled` | Ship the Grafana dashboard as a sidecar-discoverable ConfigMap | `false` |
+| `exporter.dashboards.label` / `labelValue` | Label the Grafana sidecar watches for | `grafana_dashboard` / `"1"` |
+| `exporter.dashboards.namespace` | ConfigMap namespace (empty = release namespace) | `""` |
+| `exporter.dashboards.additionalLabels` / `annotations` | Extra labels / annotations (e.g. `grafana_folder`) | `{}` / `{}` |
 
 ## Monitoring
 
@@ -254,6 +258,57 @@ All new options apply to both architectures (replication sidecar and standalone 
   exporter process itself; useful when you want only Redis metrics in the scraped output.
 - **`extraEnvVars`** — pass any other `REDIS_EXPORTER_*` flag (e.g. a Lua script path via
   `REDIS_EXPORTER_SCRIPT`, or `REDIS_EXPORTER_MAX_DISTINCT_KEY_GROUPS`).
+
+### Grafana dashboard
+
+A ready-made dashboard ships with the chart (`dashboards/redis-dashboard.json`): memory and
+fragmentation, hit/miss ratio, connected/blocked clients, command throughput and per-command
+latency, keyspace and evicted/expired keys, AOF/RDB persistence status, and replication
+health. Set `exporter.dashboards.enabled: true` to render it as a ConfigMap that the Grafana
+sidecar ([kiwigrid/k8s-sidecar](https://github.com/kiwigrid/k8s-sidecar), bundled with the
+Grafana and kube-prometheus-stack charts) auto-imports:
+
+```yaml
+exporter:
+  dashboards:
+    enabled: true
+    # Match whatever your Grafana install watches for; "1" is the common default.
+    label: grafana_dashboard
+    labelValue: "1"
+    # Optional: drop it in a Grafana folder and/or a namespace the sidecar watches.
+    annotations:
+      grafana_folder: Redis
+    # namespace: monitoring
+```
+
+The dashboard has `datasource`, `namespace`, `service`, and `pod` template variables, so one
+dashboard covers both standalone and replication and any number of releases — pick the release
+via `service` and drill into individual members via `pod`. It is gated on `exporter.enabled`;
+with the exporter off, nothing is rendered.
+
+For the sidecar to import it automatically, three things must line up — otherwise the
+ConfigMap is created but silently ignored:
+
+1. **The dashboard sidecar is enabled.** In kube-prometheus-stack that is
+   `grafana.sidecar.dashboards.enabled: true` (default on); a plain Grafana with no sidecar
+   never sees the ConfigMap — import the JSON through the Grafana UI instead.
+2. **The label matches.** `exporter.dashboards.label`/`labelValue` must equal what the sidecar
+   watches for (`grafana.sidecar.dashboards.label`/`labelValue`). The defaults here
+   (`grafana_dashboard: "1"`) match the kube-prometheus-stack default.
+3. **The namespace is watched.** By default the sidecar only watches its own namespace. If
+   Grafana and this release live in different namespaces, either run the sidecar with
+   `searchNamespace: ALL` (or a list including this one), or set `exporter.dashboards.namespace`
+   to a namespace the sidecar watches. The `grafana_folder` annotation likewise only takes
+   effect when the sidecar has folder-annotation support enabled (on by default in
+   kube-prometheus-stack).
+
+> **Scrape labels.** Panels and variables filter on the `namespace`, `service`, and `pod`
+> labels — the target labels the Prometheus Operator adds when scraping through the chart's
+> ServiceMonitor (`exporter.serviceMonitor.enabled`, default `true`). This is the same scrape
+> path the bundled alerts assume. If you scrape with a plain `scrape_config` or Prometheus
+> Agent instead, relabel those three labels onto the series or the panels read empty. When
+> `exporter.dashboards.namespace` points the ConfigMap at a namespace outside the release,
+> `helm uninstall` will not reap it — remove it yourself.
 
 ## Persistence
 

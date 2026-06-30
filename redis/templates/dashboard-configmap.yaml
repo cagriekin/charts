@@ -1,0 +1,26 @@
+{{- if and .Values.exporter.enabled .Values.exporter.dashboards.enabled }}
+{{- /* Grafana dashboard for the Redis metrics exporter. The sidecar in the
+       Grafana chart (kiwigrid/k8s-sidecar) discovers ConfigMaps carrying the
+       configured label and imports every *.json entry. */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "redis.fullname" . }}-dashboard
+  {{- with .Values.exporter.dashboards.namespace }}
+  namespace: {{ . }}
+  {{- end }}
+  labels:
+    {{- include "redis.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+    {{ .Values.exporter.dashboards.label | quote }}: {{ .Values.exporter.dashboards.labelValue | quote }}
+    {{- with .Values.exporter.dashboards.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.exporter.dashboards.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  redis-dashboard.json: |-
+{{ .Files.Get "dashboards/redis-dashboard.json" | indent 4 }}
+{{- end }}

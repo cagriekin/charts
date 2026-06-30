@@ -266,6 +266,20 @@ exporter:
     enabled: false
     additionalLabels: {}
     rules: []
+  # Grafana dashboard, shipped as a ConfigMap for the Grafana sidecar to import.
+  dashboards:
+    enabled: false
+    # Label the Grafana sidecar watches for (kiwigrid/k8s-sidecar). The value is
+    # whatever your Grafana install was configured with (commonly "1").
+    label: grafana_dashboard
+    labelValue: "1"
+    # Namespace for the dashboard ConfigMap. Empty defaults to the release
+    # namespace; set it if your Grafana sidecar watches a specific namespace.
+    namespace: ""
+    # Extra labels on the ConfigMap (e.g. to target a specific Grafana instance).
+    additionalLabels: {}
+    # Annotations on the ConfigMap (e.g. grafana_folder for the sidecar).
+    annotations: {}
 
   # Connection timeout for the exporter when connecting to Redis.
   # Uses Go duration syntax (e.g. "5s", "15s"). Empty leaves the exporter default (15s).
