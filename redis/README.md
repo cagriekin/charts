@@ -284,8 +284,23 @@ exporter:
 The dashboard has `datasource`, `namespace`, `service`, and `pod` template variables, so one
 dashboard covers both standalone and replication and any number of releases — pick the release
 via `service` and drill into individual members via `pod`. It is gated on `exporter.enabled`;
-with the exporter off, nothing is rendered. No Grafana sidecar? Import the JSON file directly
-through the Grafana UI.
+with the exporter off, nothing is rendered.
+
+For the sidecar to import it automatically, three things must line up — otherwise the
+ConfigMap is created but silently ignored:
+
+1. **The dashboard sidecar is enabled.** In kube-prometheus-stack that is
+   `grafana.sidecar.dashboards.enabled: true` (default on); a plain Grafana with no sidecar
+   never sees the ConfigMap — import the JSON through the Grafana UI instead.
+2. **The label matches.** `exporter.dashboards.label`/`labelValue` must equal what the sidecar
+   watches for (`grafana.sidecar.dashboards.label`/`labelValue`). The defaults here
+   (`grafana_dashboard: "1"`) match the kube-prometheus-stack default.
+3. **The namespace is watched.** By default the sidecar only watches its own namespace. If
+   Grafana and this release live in different namespaces, either run the sidecar with
+   `searchNamespace: ALL` (or a list including this one), or set `exporter.dashboards.namespace`
+   to a namespace the sidecar watches. The `grafana_folder` annotation likewise only takes
+   effect when the sidecar has folder-annotation support enabled (on by default in
+   kube-prometheus-stack).
 
 > **Scrape labels.** Panels and variables filter on the `namespace`, `service`, and `pod`
 > labels — the target labels the Prometheus Operator adds when scraping through the chart's
