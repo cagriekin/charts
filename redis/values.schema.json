@@ -157,7 +157,24 @@
         "includeSystemMetrics":   { "type": "boolean" },
         "exportClientList":       { "type": "boolean" },
         "disableExporterMetrics": { "type": "boolean" },
-        "extraEnvVars": { "type": "array" }
+        "extraEnvVars": { "type": "array" },
+        "dashboards": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "label": { "type": "string", "minLength": 1 },
+            "labelValue": { "type": "string" },
+            "namespace": { "type": "string" },
+            "additionalLabels": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            }
+          }
+        }
       }
     },
     "service": {
