@@ -11,8 +11,8 @@ CHANGELOG for full detail.
   The `backup.enabled` (pg_dump → S3) integrity step (`mc cat … | pg_restore --list`) was
   SIGPIPE-killed and aborted by `pipefail` on any dump exceeding the ~64 KB pipe buffer
   (any real database), before the staged `.tmp` object was promoted — so no backup was ever
-  published. The check now reads `pg_restore`'s exit status via `PIPESTATUS[1]` and tolerates
-  `mc cat`'s SIGPIPE.
+  published. The check now inspects both ends of the pipe via `PIPESTATUS`: `pg_restore`
+  must succeed and `mc cat` may only exit `141` (SIGPIPE), so a real read error stays fatal.
 
 ## 1.4.0 - 2026-06-26
 

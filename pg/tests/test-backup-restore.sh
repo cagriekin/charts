@@ -147,10 +147,13 @@ assert_eq "backup-validation job completed successfully (#31)" "0" "${val_status
 
 echo "Verifying backup exists in S3..."
 # Dumps are namespaced per release under <prefix>/<fullname>/ (#143), so list that subpath.
+# Filter to the canonical backup_<ts>.dump JSON line (rejecting any *.tmp stage) so both
+# the existence and the #230 size assertion below measure the PUBLISHED dump, never a
+# leftover stage or an unrelated object that happened to sort first.
 kubectl run mc-check -n "${NAMESPACE}" --restart=Never --image=minio/mc:RELEASE.2024-11-21T17-21-54Z \
   --command -- sh -c "
     mc alias set s3 http://minio:9000 minioadmin '${S3_SECRET}' &&
-    mc ls s3/pg-backups/backups/${FULLNAME}/ --json | head -1
+    mc ls s3/pg-backups/backups/${FULLNAME}/ --json | grep -E '\"key\":\"backup_[^\"]*\\.dump\"' | head -1
   "
 kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/mc-check -n "${NAMESPACE}" --timeout=120s
 backup_file=$(kubectl logs -n "${NAMESPACE}" mc-check | tail -1)

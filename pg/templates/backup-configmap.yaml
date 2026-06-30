@@ -119,15 +119,29 @@ data:
     # the OS pipe buffer (~64 KB) pg_restore exits 0 while `mc cat` is still streaming,
     # `mc cat` is then SIGPIPE-killed (exit 141), and pipefail would propagate that and
     # abort the Job *before* the publish step -- so no backup is ever produced (#230).
-    # Check the CONSUMER's (pg_restore) status via PIPESTATUS and tolerate mc's SIGPIPE:
-    # a genuine pg_restore parse failure is still fatal.
+    # Disable BOTH pipefail and errexit around the pipe so we can inspect each end via
+    # PIPESTATUS rather than aborting on the first non-zero (and so the diagnostics below
+    # actually run on a failure instead of being skipped by `set -e` at the pipe). The
+    # consumer (pg_restore) must succeed; the producer (mc cat) may exit 141 (128+SIGPIPE)
+    # because pg_restore closed the read end early -- that is expected -- but any OTHER
+    # mc cat failure (a real S3 read error / mid-stream truncation) is still fatal, so a
+    # damaged read can never be published as "verified".
     echo "Verifying backup integrity via pg_restore --list..."
-    set +o pipefail
+    set +o pipefail +e
     mc cat "s3/${S3_TMP}" | pg_restore --list > /dev/null
-    rc=${PIPESTATUS[1]}
-    set -o pipefail
-    if [ "$rc" -ne 0 ]; then
-      echo "ERROR: backup integrity check failed (pg_restore --list exit $rc)" >&2
+    # Copy the WHOLE array in one statement: any later command (even a bare assignment)
+    # resets PIPESTATUS, so reading [0] then [1] on separate lines would leave [1] unset
+    # (fatal under set -u). Index the snapshot instead.
+    rc=( "${PIPESTATUS[@]}" )
+    set -e -o pipefail
+    rc_cat=${rc[0]}
+    rc_restore=${rc[1]}
+    if [ "$rc_restore" -ne 0 ]; then
+      echo "ERROR: backup integrity check failed (pg_restore --list exit $rc_restore)" >&2
+      exit 1
+    fi
+    if [ "$rc_cat" -ne 0 ] && [ "$rc_cat" -ne 141 ]; then
+      echo "ERROR: reading the staged dump for verification failed (mc cat exit $rc_cat)" >&2
       exit 1
     fi
     echo "Backup integrity verified"

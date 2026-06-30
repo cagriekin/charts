@@ -13,9 +13,11 @@ Chart-only fix. No image change (`trixie-5.5.0-27`).
   it exits 0 while `mc cat` is still streaming; `mc cat` was then SIGPIPE-killed (exit 141)
   and `pipefail` propagated that, aborting the Job *before* the staged `.tmp` object was
   promoted to its canonical `backup_<ts>.dump` name — so no usable backup was ever published
-  and the CronJob never recorded a success. The check now reads `pg_restore`'s own exit
-  status via `PIPESTATUS[1]` and tolerates `mc cat`'s expected SIGPIPE, while a genuine
-  `pg_restore` parse failure stays fatal. The integration test now seeds a table whose
+  and the CronJob never recorded a success. The check now disables `errexit`/`pipefail`
+  around the pipe and inspects both ends via `PIPESTATUS`: `pg_restore` must succeed and
+  `mc cat` may only exit `141` (SIGPIPE) — a genuine `pg_restore` parse failure **or** a
+  real `mc cat` S3-read error both stay fatal, so a damaged dump is never published as
+  verified. The integration test now seeds a table whose
   `-Fc` dump exceeds the pipe buffer so the SIGPIPE path is covered in CI. Inherited by
   `pgvector` via its symlinked template.
 
