@@ -153,10 +153,12 @@ echo "Verifying backup exists in S3..."
 kubectl run mc-check -n "${NAMESPACE}" --restart=Never --image=minio/mc:RELEASE.2024-11-21T17-21-54Z \
   --command -- sh -c "
     mc alias set s3 http://minio:9000 minioadmin '${S3_SECRET}' &&
-    mc ls s3/pg-backups/backups/${FULLNAME}/ --json | grep -E '\"key\":\"backup_[^\"]*\\.dump\"' | head -1
+    mc ls s3/pg-backups/backups/${FULLNAME}/ --json
   "
 kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/mc-check -n "${NAMESPACE}" --timeout=120s
-backup_file=$(kubectl logs -n "${NAMESPACE}" mc-check | tail -1)
+# Filter host-side (the mc image ships no grep): the canonical backup_<ts>.dump JSON
+# line, rejecting any *.tmp stage, so the size assertion below measures the published dump.
+backup_file=$(kubectl logs -n "${NAMESPACE}" mc-check | grep -E '"key":"backup_[^"]*\.dump"' | head -1)
 kubectl delete pod mc-check -n "${NAMESPACE}" --wait=false
 
 if echo "${backup_file}" | grep -q '"size"'; then
