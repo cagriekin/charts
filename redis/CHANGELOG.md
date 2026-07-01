@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.5.0 - 2026-07-01
+
+PVC lifecycle documentation and a retention knob (additive; `redis.persistence.retain`
+defaults `true`, which renders no new manifest fields — existing installs are unchanged).
+
+### Added
+- `redis.persistence.retain` (default `true`) — controls the StatefulSet
+  `persistentVolumeClaimRetentionPolicy`. `true` keeps data PVCs on uninstall and
+  scale-down (no policy emitted; relies on the Kubernetes default `Retain`, so rendered
+  output matches earlier versions). `false` emits
+  `persistentVolumeClaimRetentionPolicy: {whenDeleted: Delete, whenScaled: Delete}` so
+  PVCs are garbage-collected on uninstall and scale-down — for ephemeral/dev installs
+  (requires Kubernetes 1.27+). Applies to both replication and standalone (#91).
+- README "PVC lifecycle & reclaim behavior" section: PVC naming, why `helm uninstall`
+  leaves PVCs behind, the `retain` knob, manual cleanup commands, the interaction with
+  the PV/`storageClass` reclaim policy, and recovering data from orphaned PVCs (#91).
+
 ## 1.4.1 - 2026-07-01
 
 Bugfix: standalone mode now honors pod scheduling fields (additive; no change to

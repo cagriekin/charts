@@ -346,3 +346,49 @@ tests:
           content:
             name: REDIS_EXPORTER_SCRIPT
             value: /scripts/custom.lua
+
+  - it: default - persistence.retain true emits no PVC retention policy
+    template: templates/statefulset.yaml
+    set:
+      redis.persistence.enabled: true
+      redis.persistence.retain: true
+    asserts:
+      - notExists:
+          path: spec.persistentVolumeClaimRetentionPolicy
+
+  - it: replication - persistence.retain false sets PVC retention policy to Delete
+    template: templates/statefulset.yaml
+    set:
+      redis.persistence.enabled: true
+      redis.persistence.retain: false
+    asserts:
+      - equal:
+          path: spec.persistentVolumeClaimRetentionPolicy.whenDeleted
+          value: Delete
+      - equal:
+          path: spec.persistentVolumeClaimRetentionPolicy.whenScaled
+          value: Delete
+
+  - it: standalone - persistence.retain false sets PVC retention policy to Delete
+    template: templates/statefulset.yaml
+    set:
+      architecture: standalone
+      redis.persistence.enabled: true
+      redis.persistence.retain: false
+    asserts:
+      - equal:
+          path: spec.persistentVolumeClaimRetentionPolicy.whenDeleted
+          value: Delete
+      - equal:
+          path: spec.persistentVolumeClaimRetentionPolicy.whenScaled
+          value: Delete
+
+  - it: standalone - persistence.retain true emits no PVC retention policy
+    template: templates/statefulset.yaml
+    set:
+      architecture: standalone
+      redis.persistence.enabled: true
+      redis.persistence.retain: true
+    asserts:
+      - notExists:
+          path: spec.persistentVolumeClaimRetentionPolicy

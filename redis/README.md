@@ -217,6 +217,7 @@ window.
 |-----------|-------------|---------|
 | `redis.image.repository` / `redis.image.tag` | Redis image | `redis` / `8.6.2-trixie` |
 | `redis.persistence.enabled` / `size` / `storageClass` | Persistence | `true` / `1Gi` / `""` |
+| `redis.persistence.retain` | Keep data PVCs on uninstall / scale-down (`false` = auto-delete) | `true` |
 | `redis.resources` | Requests/limits | see `values.yaml` |
 | `redis.config.maxmemory` / `maxmemory-policy` | Memory cap / eviction | `200mb` / `allkeys-lru` |
 | `redis.config.appendfsync` | AOF sync (`always`/`everysec`/`no`) | `everysec` |
@@ -318,6 +319,54 @@ AOF is enabled by default; every write is appended and replayed on startup.
 - **RDB snapshots**: off by default (`save ""`); enable via `redis.config.rdbSnapshots`
   (list of `{seconds, changes}`) for faster restarts.
 - **Data directory**: `/data`, backed by a PVC when `redis.persistence.enabled: true`.
+
+### PVC lifecycle & reclaim behavior
+
+Persistent volumes are provisioned from the StatefulSet's `volumeClaimTemplates`, one PVC
+per pod named `data-<release>-redis-<ordinal>` (e.g. `data-myredis-redis-0`). Because the
+PVCs are created by the StatefulSet controller — not rendered by Helm — **`helm uninstall`
+does not delete them**, and neither does deleting the StatefulSet directly. This is
+deliberate: your data (AOF/RDB) survives an accidental uninstall or a chart re-install.
+
+**Retention is controlled by `redis.persistence.retain` (default `true`):**
+
+- **`retain: true` (default)** — PVCs are kept when the release is uninstalled and when
+  replicas are scaled down. The chart emits no `persistentVolumeClaimRetentionPolicy`, so
+  it relies on Kubernetes' own default (`Retain` for both `whenDeleted` and `whenScaled`).
+  Rendered output is unchanged from earlier chart versions.
+- **`retain: false`** — the StatefulSet is rendered with
+  `persistentVolumeClaimRetentionPolicy: {whenDeleted: Delete, whenScaled: Delete}`, so
+  PVCs are garbage-collected on uninstall **and** when you scale `replicaCount` down. Use
+  this only for ephemeral or dev installs where losing the data is acceptable. Requires
+  Kubernetes 1.27+ (the feature is stable since 1.32; on older clusters the field is
+  ignored and PVCs are retained).
+
+> The retention policy governs only controller/uninstall-driven deletion. It does not
+> protect against manually deleting a PVC, and it does not affect the underlying
+> PersistentVolume's own reclaim policy (see below).
+
+**Manual cleanup.** With the default `retain: true`, reclaim the storage yourself after an
+uninstall:
+
+```sh
+# list the orphaned claims for a release
+kubectl get pvc -l app.kubernetes.io/instance=<release> -n <namespace>
+
+# delete them (irreversible — this frees the underlying PV per its reclaim policy)
+kubectl delete pvc -l app.kubernetes.io/instance=<release> -n <namespace>
+```
+
+Whether the backing PersistentVolume (and cloud disk) is then deleted or kept depends on
+the **PV reclaim policy** set by your `storageClass` — usually `Delete` for dynamically
+provisioned cloud volumes, `Retain` if you want the disk to outlive the PVC. Check with
+`kubectl get pv` / `kubectl get storageclass -o wide`.
+
+**Recovering data from an orphaned PVC.** A reinstall with the same release name and the
+same PVC naming (same ordinals, same `storageClass`/`size`) will bind to the existing
+`data-<release>-redis-<ordinal>` claims and start from their AOF/RDB — no extra steps. To
+recover into a *different* release, pre-create PVCs with the new release's expected names
+bound to the retained PVs (set the PV's `claimRef` accordingly), or copy the data out of a
+temporary pod that mounts the old PVC before deleting it.
 
 ## Sizing & performance
 

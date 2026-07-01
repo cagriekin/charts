@@ -2,7 +2,7 @@ apiVersion: v2
 name: redis
 description: Redis standalone or Sentinel-managed HA replication, with ACLs, TLS, AOF persistence, and a Prometheus metrics exporter
 type: application
-version: 1.4.1
+version: 1.5.0
 appVersion: "8"
 home: https://github.com/cagriekin/charts/tree/master/redis
 icon: https://www.vectorlogo.zone/logos/redis/redis-icon.svg

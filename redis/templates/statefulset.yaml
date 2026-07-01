@@ -343,6 +343,11 @@ spec:
           emptyDir: {}
         {{- end }}
   {{- if .Values.redis.persistence.enabled }}
+  {{- if not .Values.redis.persistence.retain }}
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Delete
+    whenScaled: Delete
+  {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -524,6 +529,11 @@ spec:
           emptyDir: {}
         {{- end }}
   {{- if .Values.redis.persistence.enabled }}
+  {{- if not .Values.redis.persistence.retain }}
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Delete
+    whenScaled: Delete
+  {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: data

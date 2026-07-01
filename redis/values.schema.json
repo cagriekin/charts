@@ -22,6 +22,15 @@
           "type": "integer",
           "minimum": 0
         },
+        "persistence": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "storageClass": { "type": "string" },
+            "size": { "type": "string" },
+            "retain": { "type": "boolean" }
+          }
+        },
         "auth": {
           "type": "object",
           "properties": {
