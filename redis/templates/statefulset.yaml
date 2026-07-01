@@ -344,9 +344,7 @@ spec:
         {{- end }}
   {{- if .Values.redis.persistence.enabled }}
   {{- if not .Values.redis.persistence.retain }}
-  persistentVolumeClaimRetentionPolicy:
-    whenDeleted: Delete
-    whenScaled: Delete
+  {{- include "redis.pvcRetentionPolicy" . | nindent 2 }}
   {{- end }}
   volumeClaimTemplates:
     - metadata:
@@ -530,9 +528,7 @@ spec:
         {{- end }}
   {{- if .Values.redis.persistence.enabled }}
   {{- if not .Values.redis.persistence.retain }}
-  persistentVolumeClaimRetentionPolicy:
-    whenDeleted: Delete
-    whenScaled: Delete
+  {{- include "redis.pvcRetentionPolicy" . | nindent 2 }}
   {{- end }}
   volumeClaimTemplates:
     - metadata:
