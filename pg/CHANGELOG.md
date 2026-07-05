@@ -1,5 +1,25 @@
 # pg chart changelog
 
+## 1.4.2 - 2026-07-05
+
+Chart-only fix. No image change (`trixie-5.5.0-27`).
+
+### Fixed
+
+- **pgBackRest PITR restore-validation no longer fails when the primary raises a
+  recovery-relevant GUC (e.g. `max_connections`).** PostgreSQL refuses to begin archive
+  recovery with `hot_standby=on` unless the recovery instance's `max_connections`,
+  `max_worker_processes`, `max_wal_senders`, `max_prepared_transactions` and
+  `max_locks_per_transaction` are each `>=` the value the primary had when the WAL was
+  written (recorded in `pg_control`). Those tunables live in the chart's `conf.d` overlay,
+  which `validate.sh` strips along with the `include_dir` line — so the throwaway instance
+  fell back to initdb defaults (`max_connections=100`, etc.) and
+  the postmaster died at startup with *"recovery aborted because of insufficient parameter
+  settings"*, failing the validation Job even though the backup itself was fully restorable. The script now reads the required minimums straight from
+  `pg_controldata` (which reports exactly the primary values recovery checks against) and
+  passes them as `pg_ctl` startup overrides, so validation stays green and self-adjusts if
+  the primary is ever retuned. Inherited by `pgvector` via its symlinked template.
+
 ## 1.4.1 - 2026-06-30
 
 Chart-only fix. No image change (`trixie-5.5.0-27`).
