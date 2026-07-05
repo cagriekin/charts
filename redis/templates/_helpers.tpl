@@ -202,6 +202,15 @@ exec redis-server /config-rw/redis.conf
 {{- add (int .Values.redis.replicaCount) 1 }}
 {{- end }}
 
+{{- /* PVC retention policy shared by the replication and standalone StatefulSets. Rendered
+       only when persistence.retain is false (guarded at each call site); retain: true keeps
+       PVCs by relying on the Kubernetes default, so nothing is emitted. */ -}}
+{{- define "redis.pvcRetentionPolicy" -}}
+persistentVolumeClaimRetentionPolicy:
+  whenDeleted: Delete
+  whenScaled: Delete
+{{- end -}}
+
 {{- /* Sentinel quorum: explicit override (incl. an out-of-range value, which the
        validate guard then rejects), else a strict majority of the pods. */ -}}
 {{- define "redis.quorum" -}}

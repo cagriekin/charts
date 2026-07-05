@@ -29,6 +29,11 @@ redis:
     enabled: true
     storageClass: ""
     size: 1Gi
+    # Keep PVCs when the release/StatefulSet is deleted or replicas are scaled down.
+    # true (default) leaves data PVCs behind for recovery (see README "Persistence").
+    # false sets the StatefulSet persistentVolumeClaimRetentionPolicy to Delete, so
+    # PVCs are garbage-collected on uninstall and on scale-down — use for ephemeral/dev.
+    retain: true
   resources:
     requests:
       cpu: 50m
