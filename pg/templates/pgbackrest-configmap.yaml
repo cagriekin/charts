@@ -101,6 +101,28 @@ data:
     # (listen_addresses='') and discarded when the pod ends.
     printf 'local all all trust\n%s\n' "$(cat "$PGDATA/pg_hba.conf")" > "$PGDATA/pg_hba.conf"
 
+    # PostgreSQL refuses to begin archive recovery with hot_standby=on unless the
+    # recovery instance's max_connections / max_worker_processes / max_wal_senders /
+    # max_prepared_transactions / max_locks_per_transaction are >= the values the
+    # PRIMARY had when the WAL was generated (checked against pg_control). Those
+    # primary values come from the chart's conf.d overlay (e.g. max_connections=150),
+    # which we stripped above with the include_dir line -- so the throwaway would fall
+    # back to initdb defaults (max_connections=100) and FATAL with "recovery aborted
+    # because of insufficient parameter settings". pg_controldata reports exactly the
+    # primary values recorded in pg_control, so echo them back as startup overrides;
+    # self-adjusting if the primary is ever retuned.
+    CTL=$(pg_controldata "$PGDATA")
+    REC_OVERRIDES=""
+    for pair in max_connections:max_connections \
+                max_worker_processes:max_worker_processes \
+                max_wal_senders:max_wal_senders \
+                max_prepared_xacts:max_prepared_transactions \
+                max_locks_per_xact:max_locks_per_transaction; do
+      ctlname="${pair%%:*}"; gucname="${pair##*:}"
+      val=$(printf '%s\n' "$CTL" | sed -n "s/^${ctlname} setting: *//p" | tr -d '[:space:]')
+      [ -n "$val" ] && REC_OVERRIDES="$REC_OVERRIDES -c ${gucname}=${val}"
+    done
+
     echo "Starting the throwaway PostgreSQL to replay WAL (archive recovery)..."
     # recovery.signal (written by restore) makes postgres replay WAL via the
     # restore_command (pgbackrest archive-get, inheriting this container's env for S3
@@ -122,8 +144,9 @@ data:
     #   logging_collector=off + log_destination=stderr : send any startup error to the
     #     -l file so a failure is visible (with logging_collector on it goes to PGDATA/log).
     #   archive_mode=off, hot_standby=on, socket-only : see above.
+    #   $REC_OVERRIDES : per-parameter minimums recovered from pg_control (see above).
     pg_ctl -D "$PGDATA" -w -t 60 -l "$PGDATA/startup.log" \
-      -o "-c listen_addresses='' -c unix_socket_directories=$WORK/run -c port=5432 -c archive_mode=off -c hot_standby=on -c shared_preload_libraries='' -c logging_collector=off -c log_destination=stderr" start \
+      -o "-c listen_addresses='' -c unix_socket_directories=$WORK/run -c port=5432 -c archive_mode=off -c hot_standby=on -c shared_preload_libraries='' -c logging_collector=off -c log_destination=stderr${REC_OVERRIDES}" start \
       || echo "WARN: server not connectable within 60s; polling for recovery/promotion below" >&2
     trap 'pg_ctl -D "$PGDATA" -m immediate -w stop >/dev/null 2>&1 || true' EXIT
 

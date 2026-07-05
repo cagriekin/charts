@@ -1,5 +1,20 @@
 # pgvector chart changelog
 
+## 1.4.2 - 2026-07-05
+
+Chart-only fix inherited from pg's symlinked templates. No image change
+(`trixie-5.5.0-27`). See the pg CHANGELOG for full detail.
+
+### Fixed
+
+- **pgBackRest PITR restore-validation no longer fails when the primary raises a
+  recovery-relevant GUC (e.g. `max_connections`).** The throwaway recovery instance started
+  with initdb defaults (`max_connections=100`) after `validate.sh` strips the `conf.d`
+  overlay, so archive recovery aborted with *"recovery aborted because of insufficient
+  parameter settings"* whenever the primary's value was higher — failing the validation Job
+  despite a fully restorable backup. The script now reads the required minimums from
+  `pg_controldata` and passes them as `pg_ctl` startup overrides.
+
 ## 1.4.1 - 2026-06-30
 
 Chart-only fix inherited from pg's symlinked templates. No image change. See the pg
