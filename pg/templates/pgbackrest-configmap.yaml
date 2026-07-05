@@ -101,6 +101,54 @@ data:
     # (listen_addresses='') and discarded when the pod ends.
     printf 'local all all trust\n%s\n' "$(cat "$PGDATA/pg_hba.conf")" > "$PGDATA/pg_hba.conf"
 
+    # PostgreSQL refuses to begin archive recovery with hot_standby=on unless the
+    # recovery instance's max_connections / max_worker_processes / max_wal_senders /
+    # max_prepared_transactions / max_locks_per_transaction are >= the values the
+    # PRIMARY had when the WAL was generated (checked against pg_control). Those
+    # primary values come from the chart's conf.d overlay (any of these tunables raised
+    # above its default), which we stripped above with the include_dir line -- so the
+    # throwaway would fall back to initdb defaults and FATAL with "recovery aborted
+    # because of insufficient parameter settings". pg_controldata reports exactly the
+    # primary values recorded in pg_control, so echo them back as startup overrides
+    # (self-adjusting if the primary is ever retuned). Guarded with `|| CTL=""`: under
+    # `set -e` a non-zero pg_controldata (e.g. a version-mismatched PGDATA vs the newest
+    # installed PG binary picked for PG_BIN above) would otherwise abort the Job HERE,
+    # before recovery is even attempted -- instead we fall through to the recovery
+    # diagnostics below. A single awk pass maps each pg_controldata field to its GUC and
+    # WARNs (rather than silently dropping) if an expected label is absent, so a future
+    # label rename surfaces as a warning instead of a mystifying "recovery did not
+    # promote" failure that silently reintroduces the very bug this guards against.
+    CTL=$(pg_controldata "$PGDATA" 2>/dev/null) || CTL=""
+    REC_OVERRIDES=""
+    if [ -n "$CTL" ]; then
+      REC_OVERRIDES=$(printf '%s\n' "$CTL" | awk '
+        BEGIN {
+          g["max_connections setting"]      = "max_connections"
+          g["max_worker_processes setting"] = "max_worker_processes"
+          g["max_wal_senders setting"]      = "max_wal_senders"
+          g["max_prepared_xacts setting"]   = "max_prepared_transactions"
+          g["max_locks_per_xact setting"]   = "max_locks_per_transaction"
+        }
+        {
+          c = index($0, ":")
+          if (c > 0) {
+            label = substr($0, 1, c - 1); val = substr($0, c + 1)
+            gsub(/^[ \t]+|[ \t]+$/, "", label); gsub(/[ \t]/, "", val)
+            if ((label in g) && val != "") found[label] = val
+          }
+        }
+        END {
+          ov = ""
+          for (label in g) {
+            if (label in found) ov = ov " -c " g[label] "=" found[label]
+            else print "WARN: pg_controldata reported no \"" label "\"; recovery may abort if the source raised " g[label] > "/dev/stderr"
+          }
+          print ov
+        }')
+    else
+      echo "WARN: pg_controldata produced no output; starting recovery without derived GUC overrides (may abort if the source raised a recovery-relevant setting)" >&2
+    fi
+
     echo "Starting the throwaway PostgreSQL to replay WAL (archive recovery)..."
     # recovery.signal (written by restore) makes postgres replay WAL via the
     # restore_command (pgbackrest archive-get, inheriting this container's env for S3
@@ -122,8 +170,9 @@ data:
     #   logging_collector=off + log_destination=stderr : send any startup error to the
     #     -l file so a failure is visible (with logging_collector on it goes to PGDATA/log).
     #   archive_mode=off, hot_standby=on, socket-only : see above.
+    #   $REC_OVERRIDES : per-parameter minimums recovered from pg_control (see above).
     pg_ctl -D "$PGDATA" -w -t 60 -l "$PGDATA/startup.log" \
-      -o "-c listen_addresses='' -c unix_socket_directories=$WORK/run -c port=5432 -c archive_mode=off -c hot_standby=on -c shared_preload_libraries='' -c logging_collector=off -c log_destination=stderr" start \
+      -o "-c listen_addresses='' -c unix_socket_directories=$WORK/run -c port=5432 -c archive_mode=off -c hot_standby=on -c shared_preload_libraries='' -c logging_collector=off -c log_destination=stderr${REC_OVERRIDES}" start \
       || echo "WARN: server not connectable within 60s; polling for recovery/promotion below" >&2
     trap 'pg_ctl -D "$PGDATA" -m immediate -w stop >/dev/null 2>&1 || true' EXIT
 
