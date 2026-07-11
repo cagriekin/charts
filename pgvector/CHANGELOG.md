@@ -1,5 +1,12 @@
 # pgvector chart changelog
 
+## 1.4.3 - 2026-07-11
+
+Chart-only fix inherited from pg's symlinked templates. No image change
+(`trixie-5.5.0-27`). pgpool now reaps orphaned SysV shmem (`ipcrm -a`) before
+starting, preventing a crash loop after repeated container OOM kills, and adds a
+`pgpool.command` override. See the pg CHANGELOG for full detail (#234).
+
 ## 1.4.2 - 2026-07-05
 
 Chart-only fix inherited from pg's symlinked templates. No image change

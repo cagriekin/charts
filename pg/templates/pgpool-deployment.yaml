@@ -197,15 +197,24 @@ spec:
           securityContext:
             {{- toYaml .Values.pgpool.containerSecurityContext | nindent 12 }}
           command:
-            - pgpool
-            - -D
-            - -n
-            - -f
-            - /usr/local/etc/pgpool.conf
-            - -F
-            - /usr/local/etc/pcp.conf
-            - -a
-            - /usr/local/etc/pool_hba.conf
+          {{- with .Values.pgpool.command }}
+            {{- toYaml . | nindent 12 }}
+          {{- else }}
+            - /bin/sh
+            - -c
+            - |
+              # Reap SysV shmem/semaphores orphaned by a prior OOM-killed pgpool in
+              # this pod's IPC namespace before allocating new ones. A container OOM
+              # kill (pod cgroup memory.oom.group=0) leaves the pod -- and its IPC
+              # namespace -- alive, but SIGKILL can't run shmctl(IPC_RMID), so each
+              # restart strands another ~136Mi segment. After enough cycles the pod
+              # cgroup fills and the kernel OOM-kills runc init before pgpool runs,
+              # wedging the pod in a crash loop recoverable only by pod deletion
+              # (#234). The namespace holds nothing but pgpool's own orphans (the
+              # exporter sidecar uses no SysV IPC), so `ipcrm -a` is safe here.
+              ipcrm -a 2>/dev/null || true
+              exec pgpool -D -n -f /usr/local/etc/pgpool.conf -F /usr/local/etc/pcp.conf -a /usr/local/etc/pool_hba.conf
+          {{- end }}
           ports:
             - name: pgpool
               containerPort: 9999

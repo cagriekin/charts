@@ -84,6 +84,11 @@
     "pgpool": {
       "type": "object",
       "properties": {
+        "command": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Override the pgpool container startup command. Empty uses the chart default (ipcrm -a reap + exec pgpool)."
+        },
         "tls": {
           "type": "object",
           "properties": {

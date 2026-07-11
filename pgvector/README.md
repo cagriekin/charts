@@ -261,6 +261,7 @@ Must satisfy `leaseDuration > renewDeadline > retryPeriod`; widen for managed cl
 | `pgpool.image.tag` | PGPool-II image tag | `4.7.1` |
 | `pgpool.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `pgpool.replicaCount` | Number of PGPool-II instances | `1` |
+| `pgpool.command` | Override the pgpool container startup command. Empty uses the chart default, which runs `ipcrm -a` to reap SysV shmem orphaned by a prior OOM-killed pgpool before `exec`ing pgpool (prevents a cross-restart shmem-accumulation crash loop). Keep the `ipcrm` reap and `exec` if you override. | `[]` |
 | `pgpool.numInitChildren` | Number of worker processes | `32` |
 | `pgpool.maxPool` | Max cached connections per process | `4` |
 | `pgpool.childLifeTime` | Worker process lifetime in seconds | `300` |

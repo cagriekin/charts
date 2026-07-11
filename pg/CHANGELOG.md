@@ -1,5 +1,25 @@
 # pg chart changelog
 
+## 1.4.3 - 2026-07-11
+
+Chart-only fix. No image change (`trixie-5.5.0-27`).
+
+### Fixed
+
+- **pgpool no longer wedges in a permanent crash loop after repeated container
+  OOM kills.** pgpool allocates its connection-pool state as an `IPC_PRIVATE`
+  SysV shared-memory segment. When the pgpool container is OOM-killed the pod (and
+  its IPC namespace) survives, but SIGKILL can't run `shmctl(IPC_RMID)`, so each
+  restart strands another ~136Mi segment. After enough cycles the pod cgroup fills
+  and the kernel OOM-kills `runc init` before pgpool runs, leaving the pod
+  recoverable only by deletion (#234). The pgpool container now runs `ipcrm -a`
+  to reap orphaned segments before `exec`ing pgpool.
+
+### Added
+
+- **`pgpool.command`** — override the pgpool container startup command. Empty
+  (default) keeps the chart's `ipcrm -a` reap + `exec pgpool` sequence (#234).
+
 ## 1.4.2 - 2026-07-05
 
 Chart-only fix. No image change (`trixie-5.5.0-27`).
