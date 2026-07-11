@@ -212,7 +212,10 @@ spec:
               # wedging the pod in a crash loop recoverable only by pod deletion
               # (#234). The namespace holds nothing but pgpool's own orphans (the
               # exporter sidecar uses no SysV IPC), so `ipcrm -a` is safe here.
-              ipcrm -a 2>/dev/null || true
+              # stderr is left visible (a missing ipcrm or a permission error is a
+              # signal worth logging); `|| true` keeps a no-op reap non-fatal so a
+              # healthy first boot with nothing to remove still starts pgpool.
+              ipcrm -a || true
               exec pgpool -D -n -f /usr/local/etc/pgpool.conf -F /usr/local/etc/pcp.conf -a /usr/local/etc/pool_hba.conf
           {{- end }}
           ports:
