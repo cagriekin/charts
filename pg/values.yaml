@@ -358,6 +358,14 @@ pgpool:
 
   replicaCount: 1
 
+  # Startup command override for the pgpool container. Empty uses the chart default,
+  # which reaps SysV shmem/semaphores orphaned by a prior OOM-killed pgpool
+  # (`ipcrm -a`) before exec'ing pgpool -- without this, orphaned segments pile up
+  # in the pod's IPC namespace across container restarts until the pod cgroup fills
+  # and wedges in a crash loop (#234). Override only if you need a custom startup
+  # sequence; keep the ipcrm reap and `exec` so pgpool still receives SIGTERM.
+  command: []
+
   numInitChildren: 32
   maxPool: 4
   childLifeTime: 300

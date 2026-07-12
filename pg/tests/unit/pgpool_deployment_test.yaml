@@ -1,0 +1,43 @@
+suite: pgpool Deployment startup command
+release:
+  name: test-pg
+# pgpool-deployment computes checksum/* annotations by include-ing the configmap
+# and secret templates, so both must be loaded for the deployment to render.
+templates:
+  - templates/pgpool-deployment.yaml
+  - templates/pgpool-configmap.yaml
+  - templates/pgpool-secret.yaml
+tests:
+  # --- default: ipcrm -a reap wrapper, exec pgpool with the original flags (#234) ---
+  - it: default command reaps orphaned SysV shmem then execs pgpool
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].command[0]
+          value: /bin/sh
+      - equal:
+          path: spec.template.spec.containers[0].command[1]
+          value: -c
+      # Single ordered match: the reap MUST precede exec, or pgpool replaces the
+      # shell before the shmem is cleared and the reap never runs. exec also keeps
+      # pgpool as the container's main process so it still receives SIGTERM.
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: 'ipcrm -a \|\| true[\s\S]*exec pgpool -D -n -f /usr/local/etc/pgpool.conf -F /usr/local/etc/pcp.conf -a /usr/local/etc/pool_hba.conf'
+
+  # --- override: pgpool.command replaces the default verbatim ---
+  - it: pgpool.command overrides the default startup command
+    template: templates/pgpool-deployment.yaml
+    set:
+      pgpool.enabled: true
+      pgpool.command:
+        - /custom/entrypoint.sh
+        - --flag
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].command
+          value:
+            - /custom/entrypoint.sh
+            - --flag
