@@ -36,10 +36,13 @@ RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmo
 
 RUN echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/postgresql.list
 
-# Install PostgreSQL and repmgr
+# Install PostgreSQL and repmgr. postgresql-18-pgaudit ships the pgaudit extension
+# used by the chart's opt-in compliance audit logging (#219); it is inert unless the
+# chart adds it to shared_preload_libraries, so it costs nothing when audit is off.
 RUN apt-get update && apt-get install -y \
     postgresql-18 \
     postgresql-18-repmgr \
+    postgresql-18-pgaudit \
     pgbackrest \
     cron \
     && rm -rf /var/lib/apt/lists/*

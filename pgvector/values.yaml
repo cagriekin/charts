@@ -158,6 +158,42 @@ postgresql:
     require: false       # reject non-TLS clients (hostssl); needs exporter/pgpool sslmode >= require
     clientCertAuth: false # mTLS for app users (clientcert=verify-ca); internal users exempt; implies require
 
+  # pgaudit-based audit logging (#219) for compliance regimes (SOC 2, HIPAA, PCI-DSS,
+  # ISO 27001) that require a per-object record of who did what. Off by default:
+  # audit.enabled=false renders manifests identically to a chart with no audit block.
+  #
+  # Requires repmgr.enabled=true -- the cagriekin/repmgr image bundles the pgaudit
+  # extension. Standalone mode (repmgr.enabled=false) uses the stock postgres image,
+  # which has no pgaudit, so audit + standalone fails a render guard (a bare
+  # shared_preload_libraries=pgaudit would crash-loop the postmaster). To audit in
+  # standalone mode, supply a postgresql.image that ships pgaudit.
+  #
+  # shared_preload_libraries is a postmaster parameter: enabling audit triggers a
+  # controlled rolling restart via the StatefulSet's config-checksum annotation. The
+  # chart keeps repmgr in shared_preload_libraries (replication depends on it) and adds
+  # pgaudit. pgaudit writes to the PostgreSQL server log (stderr -> `kubectl logs`);
+  # tamper-evident retention is your platform's job -- ship the logs to Loki/ELK/
+  # CloudWatch. Runtime `ALTER SYSTEM`/session GUC changes are NOT persisted; this
+  # declarative config is the source of truth.
+  audit:
+    enabled: false
+    # pgaudit session-logging classes (comma-separated): read, write, function, role,
+    # ddl, misc, misc_set, all. Prefix a class with `-` to subtract from `all`
+    # (e.g. "all, -misc"). Validated against the allowlist at render time.
+    log: "ddl, role, write"
+    # Include catalog (pg_catalog) statements. Off keeps the log free of routine
+    # client/tooling metadata queries.
+    logCatalog: false
+    # Log statement parameter values. Off by default -- parameters can contain PII/
+    # secrets; enable only when your log sink is access-controlled and retained safely.
+    logParameter: false
+    # Log the fully-qualified relation for each affected table in READ/WRITE.
+    logRelation: false
+    # Optional object-level auditing: the pgaudit.role GUC. Set to an existing role;
+    # any object that role is GRANTed on is audited regardless of the class list.
+    # Empty disables object auditing (session logging via `log` still applies).
+    role: ""
+
   # When repmgr.enabled is true, re-hash any managed user (POSTGRES_USER,
   # REPMGR_USER) whose stored password is still MD5 to SCRAM at pod startup.
   # Idempotent (no-op once everyone is SCRAM-hashed, and auto-skipped on
@@ -192,7 +228,7 @@ postgresql:
 repmgr:
   image:
     repository: cagriekin/repmgr
-    tag: trixie-5.5.0-27
+    tag: trixie-5.5.0-28
     # Optional digest pin (e.g. "sha256:..."). When set it is appended as
     # repository:tag@digest, so the cosign-signed / provenance-attested image is
     # pinned at deploy time and a mutable-tag repush cannot silently change it.
@@ -760,4 +796,4 @@ etcd:
   # The bundled etcd's RBAC-bootstrap Job runs the pg-ha-agent (repmgr) image, so keep
   # this in lockstep with repmgr.image.tag above; the subchart's own default can lag.
   bootstrapImage:
-    tag: trixie-5.5.0-27
+    tag: trixie-5.5.0-28

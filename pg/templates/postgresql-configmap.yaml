@@ -1,4 +1,4 @@
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -14,7 +14,12 @@ data:
 {{- if .Values.postgresql.configuration }}
   custom.conf: |
     {{- range $key, $value := .Values.postgresql.configuration }}
+    {{- /* When audit is on, shared_preload_libraries is owned by pgaudit.conf (which
+           merges this value with repmgr + pgaudit); emitting it here too would be a
+           dead duplicate that pgaudit.conf overrides, so skip it. */}}
+    {{- if not (and $.Values.postgresql.audit.enabled (eq $key "shared_preload_libraries")) }}
     {{ $key }} = '{{ $value | toString | replace "'" "''" }}'
+    {{- end }}
     {{- end }}
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
@@ -37,6 +42,23 @@ data:
     ssl_key_file = '/etc/postgresql/tls/tls.key'
 {{- if .Values.postgresql.tls.clientCertAuth }}
     ssl_ca_file = '/etc/postgresql/tls/ca.crt'
+{{- end }}
+{{- end }}
+{{- if .Values.postgresql.audit.enabled }}
+  # pgaudit audit logging (#219). shared_preload_libraries is a postmaster parameter,
+  # so it takes effect only after a restart -- toggling audit.enabled changes this
+  # ConfigMap's checksum, which the StatefulSet's checksum/postgresql-config annotation
+  # turns into a controlled rolling restart. This file sorts after custom.conf under
+  # conf.d's include_dir, so its shared_preload_libraries is authoritative; the helper
+  # keeps repmgr (replication) and any operator-declared libraries and adds pgaudit.
+  pgaudit.conf: |
+    shared_preload_libraries = '{{ include "pg.auditSharedPreloadLibraries" . }}'
+    pgaudit.log = '{{ .Values.postgresql.audit.log | toString | replace "'" "''" }}'
+    pgaudit.log_catalog = {{ ternary "on" "off" .Values.postgresql.audit.logCatalog }}
+    pgaudit.log_parameter = {{ ternary "on" "off" .Values.postgresql.audit.logParameter }}
+    pgaudit.log_relation = {{ ternary "on" "off" .Values.postgresql.audit.logRelation }}
+{{- if .Values.postgresql.audit.role }}
+    pgaudit.role = '{{ .Values.postgresql.audit.role | toString | replace "'" "''" }}'
 {{- end }}
 {{- end }}
 {{- end }}

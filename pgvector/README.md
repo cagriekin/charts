@@ -178,6 +178,12 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.configuration` | Map of postgresql.conf parameters | `{}` |
 | `postgresql.pgHba` | List of pg_hba.conf entries injected via postStart | `[]` |
 | `postgresql.extensions.enabled` | Enable extensions support | `true` |
+| `postgresql.audit.enabled` | Enable pgaudit audit logging (requires repmgr mode; see [Audit logging](#audit-logging-pgaudit)) | `false` |
+| `postgresql.audit.log` | pgaudit session classes: `read,write,function,role,ddl,misc,misc_set,all` (negate with `-`) | `"ddl, role, write"` |
+| `postgresql.audit.logCatalog` | Audit `pg_catalog` statements | `false` |
+| `postgresql.audit.logParameter` | Log statement parameter values (may contain PII/secrets) | `false` |
+| `postgresql.audit.logRelation` | Log the fully-qualified relation per affected table | `false` |
+| `postgresql.audit.role` | Optional `pgaudit.role` for object-level auditing (empty = session-only) | `""` |
 | `postgresql.lifecycle.postStart.additionalCommands` | Shell commands to run after PostgreSQL is ready | pgvector CREATE EXTENSION |
 | `postgresql.migrateLegacyMd5Users` | Re-hash MD5 user passwords to SCRAM on PG14+ | `true` |
 | `postgresql.nodeSelector` | Node selector for PostgreSQL pods | `{}` |
@@ -467,6 +473,34 @@ With `postgresql.replicaCount: 0` the service exists but has no endpoints.
 kubectl port-forward svc/my-pgvector-pgpool 9999:9999
 psql -h localhost -p 9999 -U postgres -d postgres
 ```
+
+## Audit logging (pgaudit)
+
+Opt-in, [pgaudit](https://github.com/pgaudit/pgaudit)-based audit logging for compliance
+regimes (SOC 2, HIPAA, PCI-DSS, ISO 27001). Off by default — inherited unchanged from the
+pg chart's symlinked templates.
+
+```yaml
+postgresql:
+  audit:
+    enabled: true
+    log: "ddl, role, write"
+    role: ""   # optional pgaudit.role for object-level auditing
+```
+
+When enabled, the chart adds `pgaudit` to `shared_preload_libraries` (preserving `repmgr`),
+renders the `pgaudit.*` GUCs, and creates the extension idempotently on the primary via a
+post-install/upgrade hook Job.
+
+- **Requires `repmgr.enabled: true`** — the `cagriekin/repmgr` image bundles pgaudit;
+  standalone mode uses the stock `postgres` image (no pgaudit) and fails a render guard.
+- **Enabling audit restarts PostgreSQL** (`shared_preload_libraries` is a postmaster
+  parameter) via the config-checksum rolling restart — no manual step.
+- **Classes** (`log`): `read,write,function,role,ddl,misc,misc_set,all`, each negatable with
+  a leading `-`. **Retention** is your platform's job: pgaudit writes to the server log
+  (stderr → `kubectl logs`); ship it to Loki/ELK/CloudWatch with immutable retention.
+
+See the [pg chart README](../pg/README.md#audit-logging-pgaudit) for full detail.
 
 ## Replication Management
 

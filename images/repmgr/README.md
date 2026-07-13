@@ -5,7 +5,7 @@
 > `.github/workflows/repmgr-image-publish.yaml` on `trixie-*` tags; the pg/pgvector chart CI
 > builds the image from this source (`pg-test.yaml`) rather than pulling it.
 
-PostgreSQL 18 with repmgr 5.5.0, pgBackRest, and cron on Debian Trixie. Designed for Kubernetes StatefulSet deployments with automatic failover and WAL-based incremental backups.
+PostgreSQL 18 with repmgr 5.5.0, pgBackRest, pgaudit, and cron on Debian Trixie. Designed for Kubernetes StatefulSet deployments with automatic failover and WAL-based incremental backups.
 
 ## Execution Modes
 
@@ -130,5 +130,6 @@ docker build -t cagriekin/repmgr:trixie-5.5.0-5 .
 - PostgreSQL 18
 - repmgr 5.5.0
 - pgBackRest (latest from PostgreSQL APT repository)
+- pgaudit (`postgresql-18-pgaudit`; opt-in compliance audit logging)
 - Debian Trixie
 - Kubernetes 1.19+

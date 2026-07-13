@@ -1,0 +1,96 @@
+{{- if .Values.postgresql.audit.enabled }}
+{{- /* #219: pgaudit session logging works purely from shared_preload_libraries, but
+       object-level auditing (the pgaudit.role GUC) and the DDL event triggers need the
+       extension installed. This post-install/upgrade hook Job creates it idempotently on
+       the primary (it replicates to standbys), in the primary database. The extension's
+       control file ships in the repmgr image regardless of the preload, so this does not
+       depend on the config-change rolling restart having completed. For object auditing in
+       OTHER databases, add `pgaudit` to that database's postgresql.databases[].extensions. */}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "pg.fullname" . }}-audit-extension
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: audit-extension
+  annotations:
+    # one-shot hook Job: liveness/readiness probes do not apply (kube-linter waiver).
+    ignore-check.kube-linter.io/no-liveness-probe: "one-shot audit-extension hook Job"
+    ignore-check.kube-linter.io/no-readiness-probe: "one-shot audit-extension hook Job"
+    {{- with (include "pg.annotations" .) }}
+    {{- . | nindent 4 }}
+    {{- end }}
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "7"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        {{- include "pg.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: audit-extension
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      restartPolicy: Never
+      # Talks only to PostgreSQL, never the Kubernetes API.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: create-pgaudit-extension
+          image: {{ include "pg.image" .Values.postgresql.image | quote }}
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          command: ["/bin/bash", "-eu", "-o", "pipefail", "-c"]
+          args:
+            - |
+              echo "Waiting for the primary to accept connections..."
+              for i in $(seq 1 60); do
+                if PGPASSWORD="$POSTGRES_PASSWORD" pg_isready -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; then
+                  break
+                fi
+                sleep 5
+              done
+              echo "Ensuring the pgaudit extension exists in database '$POSTGRES_DB'..."
+              # Idempotent (IF NOT EXISTS) so re-running on every upgrade is safe. No
+              # user-supplied identifier is interpolated -- the extension name is a fixed
+              # literal, so there is no injection surface.
+              PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 \
+                -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
+              CREATE EXTENSION IF NOT EXISTS pgaudit;
+              SQL
+              echo "pgaudit extension is ready."
+          env:
+            - name: POSTGRES_HOST
+              value: {{ printf "%s.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretUsernameKey" . }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretPasswordKey" . }}
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.secretName" . }}
+                  key: {{ include "pg.secretDatabaseKey" . }}
+          resources:
+            {{- include "pg.initResources" . | nindent 12 }}
+{{- end }}

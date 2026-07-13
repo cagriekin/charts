@@ -47,6 +47,17 @@
               "extensions": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$" } }
             }
           }
+        },
+        "audit": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "log": { "type": "string", "description": "Comma-separated pgaudit classes (read, write, function, role, ddl, misc, misc_set, all), optionally prefixed with - to subtract. Allowlist enforced by the pg.validateAudit template, not this schema." },
+            "logCatalog": { "type": "boolean" },
+            "logParameter": { "type": "boolean" },
+            "logRelation": { "type": "boolean" },
+            "role": { "type": "string", "description": "Optional pgaudit.role for object-level auditing. Empty disables object auditing." }
+          }
         }
       }
     },
