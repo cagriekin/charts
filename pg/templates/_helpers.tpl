@@ -267,10 +267,16 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        pgaudit. repmgr is always kept (replication + repmgr GUCs depend on the preload,
        and audit is guarded to repmgr mode); any libraries the operator declared in
        postgresql.configuration.shared_preload_libraries are merged in (comma-split,
-       trimmed, de-duplicated) so enabling audit never silently drops a preload. */ -}}
+       trimmed, de-duplicated) so enabling audit never silently drops a preload. The
+       operator's key is matched case-insensitively -- PostgreSQL GUC names are
+       case-insensitive, so a value under e.g. `Shared_Preload_Libraries` must still be
+       picked up (and is likewise suppressed in custom.conf) or it would be dropped. */ -}}
 {{- define "pg.auditSharedPreloadLibraries" -}}
 {{- $libs := list -}}
-{{- $user := (.Values.postgresql.configuration).shared_preload_libraries | default "" | toString -}}
+{{- $user := "" -}}
+{{- range $k, $v := (.Values.postgresql.configuration | default dict) -}}
+  {{- if eq (lower ($k | toString)) "shared_preload_libraries" -}}{{- $user = $v | toString -}}{{- end -}}
+{{- end -}}
 {{- range $l := splitList "," $user -}}
   {{- $t := trim $l -}}
   {{- if and $t (not (has $t $libs)) -}}{{- $libs = append $libs $t -}}{{- end -}}

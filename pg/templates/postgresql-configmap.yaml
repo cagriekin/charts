@@ -16,8 +16,11 @@ data:
     {{- range $key, $value := .Values.postgresql.configuration }}
     {{- /* When audit is on, shared_preload_libraries is owned by pgaudit.conf (which
            merges this value with repmgr + pgaudit); emitting it here too would be a
-           dead duplicate that pgaudit.conf overrides, so skip it. */}}
-    {{- if not (and $.Values.postgresql.audit.enabled (eq $key "shared_preload_libraries")) }}
+           dead duplicate that pgaudit.conf overrides, so skip it. Matched case-
+           insensitively -- PostgreSQL GUC names are case-insensitive, and the merge
+           helper reads the key the same way, so both must agree or a non-canonically
+           cased key would be emitted here yet dropped from the merged preload list. */}}
+    {{- if not (and $.Values.postgresql.audit.enabled (eq (lower ($key | toString)) "shared_preload_libraries")) }}
     {{ $key }} = '{{ $value | toString | replace "'" "''" }}'
     {{- end }}
     {{- end }}

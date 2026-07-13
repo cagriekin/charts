@@ -89,6 +89,21 @@ tests:
           path: data["custom.conf"]
           pattern: shared_preload_libraries
 
+  - it: a non-canonically-cased shared_preload_libraries key is still merged (GUC names are case-insensitive)
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.audit.enabled: true
+      postgresql.configuration:
+        Shared_Preload_Libraries: pg_stat_statements
+    asserts:
+      - matchRegex:
+          path: data["pgaudit.conf"]
+          pattern: "shared_preload_libraries = 'repmgr,pg_stat_statements,pgaudit'"
+      # and it must be suppressed in custom.conf, not left as a dead override target
+      - notMatchRegex:
+          path: data["custom.conf"]
+          pattern: (?i)shared_preload_libraries
+
   # --- the CREATE EXTENSION hook Job ---
   - it: enabled renders an idempotent post-install/upgrade extension hook Job
     template: templates/audit-extension-job.yaml
