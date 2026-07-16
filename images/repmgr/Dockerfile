@@ -1,8 +1,9 @@
 # --- Stage 1: build the Go HA agent (cross-compiled, static, no cgo) ---
-# Digest-pinned (manifest-list digest, multi-arch). Go 1.25 carries the patched
-# stdlib (net/textproto, mime, crypto/x509, html/template, net) the agent links.
+# Digest-pinned (manifest-list digest, multi-arch). go1.25.12 carries the patched
+# stdlib (crypto/tls GO-2026-5856 ECH leak, plus net/textproto, mime, crypto/x509,
+# html/template, net) the agent links.
 # Refresh with: docker buildx imagetools inspect golang:1.25-bookworm
-FROM --platform=$BUILDPLATFORM golang:1.25-bookworm@sha256:bbb255b0e131db500cf0520adc97441d2260cf629c7fa7e39e025ddf53995a24 AS agent-build
+FROM --platform=$BUILDPLATFORM golang:1.25-bookworm@sha256:ea341baa9bd5ba6784f6d7161ace70544349a6242d54d34a0fbfd2c4d51c9d58 AS agent-build
 ARG TARGETARCH
 WORKDIR /src/agent
 COPY agent/go.mod agent/go.sum ./
