@@ -170,6 +170,23 @@ tests:
     asserts:
       - failedTemplate: {}
 
+  - it: g2 a trailing comma in audit.log fails fast (would render an empty class token)
+    template: templates/statefulset.yaml
+    set:
+      postgresql.audit.enabled: true
+      postgresql.audit.log: "ddl,"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'postgresql.audit.log: empty class segment in "ddl," (check for a stray, leading, trailing, or doubled comma)'
+
+  - it: g2 a doubled comma in audit.log fails fast
+    template: templates/statefulset.yaml
+    set:
+      postgresql.audit.enabled: true
+      postgresql.audit.log: "ddl,,write"
+    asserts:
+      - failedTemplate: {}
+
   # --- rolling restart on toggle: the config checksum must render when ONLY audit is
   #     enabled (no other conf.d feature), else toggling audit would not restart the
   #     postmaster and shared_preload_libraries=pgaudit would never take effect ---

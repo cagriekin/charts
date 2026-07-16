@@ -303,10 +303,14 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- if not (trim $log) -}}{{- fail "postgresql.audit.log must not be empty when audit.enabled (e.g. \"ddl, role, write\" or \"all\")" -}}{{- end -}}
   {{- range $c := splitList "," $log -}}
     {{- $t := trim $c -}}
-    {{- if $t -}}
-      {{- $cls := lower (trimPrefix "-" $t) -}}
-      {{- if not (has $cls $allowed) -}}{{- fail (printf "postgresql.audit.log: %q is not a valid pgaudit class (allowed: %s, each optionally prefixed with - to subtract)" $t (join ", " $allowed)) -}}{{- end -}}
-    {{- end -}}
+    {{- /* Reject empty segments (stray/trailing/double comma). The raw log string is
+           rendered verbatim into `pgaudit.log = '...'`, so a value like "ddl," would
+           pass a skip-empties check yet leave an empty class token that pgaudit
+           rejects at postmaster start -- a config the chart accepted but that breaks
+           the server. Fail fast at render time instead. */ -}}
+    {{- if not $t -}}{{- fail (printf "postgresql.audit.log: empty class segment in %q (check for a stray, leading, trailing, or doubled comma)" $log) -}}{{- end -}}
+    {{- $cls := lower (trimPrefix "-" $t) -}}
+    {{- if not (has $cls $allowed) -}}{{- fail (printf "postgresql.audit.log: %q is not a valid pgaudit class (allowed: %s, each optionally prefixed with - to subtract)" $t (join ", " $allowed)) -}}{{- end -}}
   {{- end -}}
   {{- $role := .Values.postgresql.audit.role | default "" | toString -}}
   {{- if and $role (not (regexMatch "^[A-Za-z_][A-Za-z0-9_]*$" $role)) -}}

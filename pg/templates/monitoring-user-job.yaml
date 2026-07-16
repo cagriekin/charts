@@ -23,7 +23,12 @@ metadata:
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   activeDeadlineSeconds: 600
-  backoffLimit: 1   # 2 runs x the 300s readiness wait = the 600s activeDeadlineSeconds ceiling; a higher value was unreachable under the deadline
+  # readiness (a slow-booting primary) is absorbed by the in-pod pg_isready loop; these
+  # retries exist for transient SQL failures -- e.g. a primary that is momentarily
+  # read-only mid-failover -- which fail fast, so many attempts fit before
+  # activeDeadlineSeconds. A persistently unreachable primary is bounded by that
+  # deadline, not by this count.
+  backoffLimit: 6
   template:
     metadata:
       labels:
