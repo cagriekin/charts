@@ -25,7 +25,7 @@ metadata:
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   activeDeadlineSeconds: 600
-  backoffLimit: 6
+  backoffLimit: 1   # 2 runs x the 300s readiness wait = the 600s activeDeadlineSeconds ceiling; a higher value was unreachable under the deadline
   template:
     metadata:
       labels:
