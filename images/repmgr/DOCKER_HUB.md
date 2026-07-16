@@ -8,6 +8,7 @@ High-availability PostgreSQL image with automatic failover for Kubernetes Statef
 - **Base image**: `debian:trixie-slim`
 - **PostgreSQL**: 18
 - **repmgr**: 5.5.0
+- **pgaudit**: bundled (`postgresql-18-pgaudit`; opt-in audit logging)
 - **Kubernetes**: 1.19+
 - **Exposed port**: 5432
 

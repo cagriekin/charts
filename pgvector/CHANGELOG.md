@@ -1,5 +1,18 @@
 # pgvector chart changelog
 
+## 1.5.0 - 2026-07-12
+
+Inherited from pg's symlinked templates. Requires the new repmgr image
+(`trixie-5.5.0-28`), which bundles the `pgaudit` extension; the default
+`repmgr.image.tag` is bumped accordingly. pgaudit is inert until
+`postgresql.audit.enabled` is set.
+
+### Added
+
+- **pgaudit-based audit logging (`postgresql.audit.*`)** for compliance regimes
+  (SOC 2, HIPAA, PCI-DSS, ISO 27001) — opt-in, default-off. See the pg CHANGELOG for
+  full detail (#219).
+
 ## 1.4.3 - 2026-07-11
 
 Chart-only fix inherited from pg's symlinked templates. No image change

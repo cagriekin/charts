@@ -261,6 +261,64 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end -}}
 {{- end }}
 
+{{- /* #219: the authoritative shared_preload_libraries value when audit is enabled.
+       This renders into pgaudit.conf, which sorts after custom.conf under conf.d's
+       include_dir and therefore wins -- so it MUST reassemble the full list, not just
+       pgaudit. repmgr is always kept (replication + repmgr GUCs depend on the preload,
+       and audit is guarded to repmgr mode); any libraries the operator declared in
+       postgresql.configuration.shared_preload_libraries are merged in (comma-split,
+       trimmed, de-duplicated) so enabling audit never silently drops a preload. The
+       operator's key is matched case-insensitively -- PostgreSQL GUC names are
+       case-insensitive, so a value under e.g. `Shared_Preload_Libraries` must still be
+       picked up (and is likewise suppressed in custom.conf) or it would be dropped. */ -}}
+{{- define "pg.auditSharedPreloadLibraries" -}}
+{{- $libs := list -}}
+{{- $user := "" -}}
+{{- range $k, $v := (.Values.postgresql.configuration | default dict) -}}
+  {{- if eq (lower ($k | toString)) "shared_preload_libraries" -}}{{- $user = $v | toString -}}{{- end -}}
+{{- end -}}
+{{- range $l := splitList "," $user -}}
+  {{- $t := trim $l -}}
+  {{- if and $t (not (has $t $libs)) -}}{{- $libs = append $libs $t -}}{{- end -}}
+{{- end -}}
+{{- if not (has "repmgr" $libs) -}}{{- $libs = prepend $libs "repmgr" -}}{{- end -}}
+{{- if not (has "pgaudit" $libs) -}}{{- $libs = append $libs "pgaudit" -}}{{- end -}}
+{{- join "," $libs -}}
+{{- end -}}
+
+{{- /* #219: validate postgresql.audit. Guards: (g1) audit requires repmgr mode -- the
+       cagriekin/repmgr image bundles pgaudit; standalone uses the stock postgres image
+       (no pgaudit) and a bare shared_preload_libraries=pgaudit would crash-loop the
+       postmaster. (g2) log must be non-empty and every class in the allowlist (negatable
+       with a leading -). (g3) role, if set, must be a valid identifier. Class + role
+       validation also blocks smuggling a `'` that would break out of the single-quoted
+       GUC in pgaudit.conf. */ -}}
+{{- define "pg.validateAudit" -}}
+{{- if .Values.postgresql.audit.enabled -}}
+  {{- if not .Values.repmgr.enabled -}}
+    {{- fail "postgresql.audit.enabled requires repmgr.enabled=true: audit logging needs the cagriekin/repmgr image, which bundles pgaudit. Standalone mode uses the stock postgres image (no pgaudit) and would fail to start on shared_preload_libraries. To audit in standalone mode, build a postgresql.image that ships pgaudit." -}}
+  {{- end -}}
+  {{- $allowed := list "read" "write" "function" "role" "ddl" "misc" "misc_set" "all" -}}
+  {{- $log := .Values.postgresql.audit.log | default "" | toString -}}
+  {{- if not (trim $log) -}}{{- fail "postgresql.audit.log must not be empty when audit.enabled (e.g. \"ddl, role, write\" or \"all\")" -}}{{- end -}}
+  {{- range $c := splitList "," $log -}}
+    {{- $t := trim $c -}}
+    {{- /* Reject empty segments (stray/trailing/double comma). The raw log string is
+           rendered verbatim into `pgaudit.log = '...'`, so a value like "ddl," would
+           pass a skip-empties check yet leave an empty class token that pgaudit
+           rejects at postmaster start -- a config the chart accepted but that breaks
+           the server. Fail fast at render time instead. */ -}}
+    {{- if not $t -}}{{- fail (printf "postgresql.audit.log: empty class segment in %q (check for a stray, leading, trailing, or doubled comma)" $log) -}}{{- end -}}
+    {{- $cls := lower (trimPrefix "-" $t) -}}
+    {{- if not (has $cls $allowed) -}}{{- fail (printf "postgresql.audit.log: %q is not a valid pgaudit class (allowed: %s, each optionally prefixed with - to subtract)" $t (join ", " $allowed)) -}}{{- end -}}
+  {{- end -}}
+  {{- $role := .Values.postgresql.audit.role | default "" | toString -}}
+  {{- if and $role (not (regexMatch "^[A-Za-z_][A-Za-z0-9_]*$" $role)) -}}
+    {{- fail (printf "postgresql.audit.role: invalid role name %q (must match ^[A-Za-z_][A-Za-z0-9_]*$)" $role) -}}
+  {{- end -}}
+{{- end -}}
+{{- end }}
+
 {{- define "pg.pgpoolAdminSecretName" -}}
 {{- if .Values.pgpool.admin.existingSecret.enabled }}
 {{- required "pgpool.admin.existingSecret.name is required when pgpool.admin.existingSecret.enabled is true" .Values.pgpool.admin.existingSecret.name }}

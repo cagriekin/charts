@@ -1,25 +1,27 @@
-{{- if and .Values.prometheusExporter.enabled .Values.prometheusExporter.monitoringUser.enabled }}
-{{- /* #28: the exporter connects as a least-privilege pg_monitor role, not the
-       postgres superuser. This post-install/upgrade hook Job creates that role on
-       the primary (it replicates to standbys), in BOTH repmgr and standalone modes
-       -- a chart-only mechanism that needs no image change. The role is created
-       idempotently so re-running on every upgrade is safe. */}}
+{{- if .Values.postgresql.audit.enabled }}
+{{- /* #219: pgaudit session logging works purely from shared_preload_libraries, but
+       object-level auditing (the pgaudit.role GUC) and the DDL event triggers need the
+       extension installed. This post-install/upgrade hook Job creates it idempotently on
+       the primary (it replicates to standbys), in the primary database. The extension's
+       control file ships in the repmgr image regardless of the preload, so this does not
+       depend on the config-change rolling restart having completed. For object auditing in
+       OTHER databases, add `pgaudit` to that database's postgresql.databases[].extensions. */}}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "pg.fullname" . }}-monitoring-user
+  name: {{ include "pg.fullname" . }}-audit-extension
   labels:
     {{- include "pg.labels" . | nindent 4 }}
-    app.kubernetes.io/component: monitoring-user
+    app.kubernetes.io/component: audit-extension
   annotations:
     # one-shot hook Job: liveness/readiness probes do not apply (kube-linter waiver).
-    ignore-check.kube-linter.io/no-liveness-probe: "one-shot monitoring-user hook Job"
-    ignore-check.kube-linter.io/no-readiness-probe: "one-shot monitoring-user hook Job"
+    ignore-check.kube-linter.io/no-liveness-probe: "one-shot audit-extension hook Job"
+    ignore-check.kube-linter.io/no-readiness-probe: "one-shot audit-extension hook Job"
     {{- with (include "pg.annotations" .) }}
     {{- . | nindent 4 }}
     {{- end }}
     "helm.sh/hook": post-install,post-upgrade
-    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-weight": "7"
     "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   activeDeadlineSeconds: 600
@@ -33,7 +35,7 @@ spec:
     metadata:
       labels:
         {{- include "pg.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: monitoring-user
+        app.kubernetes.io/component: audit-extension
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -49,7 +51,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: create-monitoring-user
+        - name: create-pgaudit-extension
           image: {{ include "pg.image" .Values.postgresql.image | quote }}
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
           securityContext:
@@ -73,26 +75,15 @@ spec:
                 echo "Primary did not accept connections after 300s (60 x 5s); aborting so the hook fails loudly instead of erroring against an unreachable primary. The Job will retry (backoffLimit) within activeDeadlineSeconds." >&2
                 exit 1
               fi
-              echo "Creating/updating the read-only monitoring role '$MONITORING_USER'..."
-              # psql variables: :"x" = quoted identifier, :'x' = quoted literal, so
-              # the role name/password are injection-safe. The password is read from the
-              # environment with \getenv -- NOT passed as `-v mpass=...`, which would
-              # expose it in the process argv (/proc/<pid>/cmdline, ps). \gexec makes the
-              # CREATE ROLE conditional (idempotent on every upgrade); password_encryption
-              # =scram so the role auths under the pod-CIDR scram pg_hba rule.
+              echo "Ensuring the pgaudit extension exists in database '$POSTGRES_DB'..."
+              # Idempotent (IF NOT EXISTS) so re-running on every upgrade is safe. No
+              # user-supplied identifier is interpolated -- the extension name is a fixed
+              # literal, so there is no injection surface.
               PGPASSWORD="$POSTGRES_PASSWORD" psql -v ON_ERROR_STOP=1 \
-                -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-                -v muser="$MONITORING_USER" -v dbname="$POSTGRES_DB" <<'SQL'
-              \getenv mpass MONITORING_PASSWORD
-              SET password_encryption = 'scram-sha-256';
-              SELECT format('CREATE ROLE %I LOGIN', :'muser')
-                WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'muser')
-              \gexec
-              ALTER ROLE :"muser" WITH LOGIN PASSWORD :'mpass';
-              GRANT pg_monitor TO :"muser";
-              GRANT CONNECT ON DATABASE :"dbname" TO :"muser";
+                -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" <<'SQL'
+              CREATE EXTENSION IF NOT EXISTS pgaudit;
               SQL
-              echo "Monitoring role '$MONITORING_USER' is ready."
+              echo "pgaudit extension is ready."
           env:
             - name: POSTGRES_HOST
               value: {{ printf "%s.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
@@ -111,13 +102,6 @@ spec:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretDatabaseKey" . }}
-            - name: MONITORING_USER
-              value: {{ .Values.prometheusExporter.monitoringUser.username | quote }}
-            - name: MONITORING_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretMonitoringPasswordKey" . }}
           resources:
             {{- include "pg.initResources" . | nindent 12 }}
 {{- end }}

@@ -1,0 +1,199 @@
+suite: pgaudit audit logging (#219)
+release:
+  name: test-pg
+templates:
+  - templates/postgresql-configmap.yaml
+  - templates/audit-extension-job.yaml
+  - templates/statefulset.yaml
+tests:
+  # --- default: audit off renders no pgaudit anywhere ---
+  - it: audit disabled emits no pgaudit.conf even when other config is set
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.configuration:
+        max_connections: "200"
+    asserts:
+      - notFailedTemplate: {}
+      - notMatchRegex:
+          path: data["custom.conf"]
+          pattern: pgaudit
+      # pgaudit.conf key must not exist when audit is off
+      - notExists:
+          path: data["pgaudit.conf"]
+
+  - it: audit disabled does not render the extension hook Job
+    template: templates/audit-extension-job.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  # --- enabled: GUC wiring ---
+  - it: enabled renders pgaudit GUCs with repmgr preserved in shared_preload_libraries
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.audit.enabled: true
+    asserts:
+      - equal:
+          path: data["pgaudit.conf"]
+          value: |
+            shared_preload_libraries = 'repmgr,pgaudit'
+            pgaudit.log = 'ddl, role, write'
+            pgaudit.log_catalog = off
+            pgaudit.log_parameter = off
+            pgaudit.log_relation = off
+
+  - it: log_catalog/parameter/relation booleans map to on/off and role is emitted
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.audit.enabled: true
+      postgresql.audit.logCatalog: true
+      postgresql.audit.logParameter: true
+      postgresql.audit.logRelation: true
+      postgresql.audit.role: auditor
+    asserts:
+      - matchRegex:
+          path: data["pgaudit.conf"]
+          pattern: 'pgaudit.log_catalog = on'
+      - matchRegex:
+          path: data["pgaudit.conf"]
+          pattern: 'pgaudit.log_parameter = on'
+      - matchRegex:
+          path: data["pgaudit.conf"]
+          pattern: 'pgaudit.log_relation = on'
+      - matchRegex:
+          path: data["pgaudit.conf"]
+          pattern: "pgaudit.role = 'auditor'"
+
+  - it: role is omitted when empty
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.audit.enabled: true
+    asserts:
+      - notMatchRegex:
+          path: data["pgaudit.conf"]
+          pattern: pgaudit.role
+
+  # --- shared_preload_libraries merge (decision: never drop an operator preload) ---
+  - it: operator-declared shared_preload_libraries are merged with repmgr + pgaudit
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.audit.enabled: true
+      postgresql.configuration:
+        shared_preload_libraries: pg_stat_statements
+    asserts:
+      - matchRegex:
+          path: data["pgaudit.conf"]
+          pattern: "shared_preload_libraries = 'repmgr,pg_stat_statements,pgaudit'"
+      # the skipped key must NOT also appear in custom.conf (pgaudit.conf owns it)
+      - notMatchRegex:
+          path: data["custom.conf"]
+          pattern: shared_preload_libraries
+
+  - it: a non-canonically-cased shared_preload_libraries key is still merged (GUC names are case-insensitive)
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.audit.enabled: true
+      postgresql.configuration:
+        Shared_Preload_Libraries: pg_stat_statements
+    asserts:
+      - matchRegex:
+          path: data["pgaudit.conf"]
+          pattern: "shared_preload_libraries = 'repmgr,pg_stat_statements,pgaudit'"
+      # and it must be suppressed in custom.conf, not left as a dead override target
+      - notMatchRegex:
+          path: data["custom.conf"]
+          pattern: (?i)shared_preload_libraries
+
+  # --- the CREATE EXTENSION hook Job ---
+  - it: enabled renders an idempotent post-install/upgrade extension hook Job
+    template: templates/audit-extension-job.yaml
+    set:
+      postgresql.audit.enabled: true
+    asserts:
+      - isKind:
+          of: Job
+      - equal:
+          path: metadata.annotations["helm.sh/hook"]
+          value: post-install,post-upgrade
+      - matchRegex:
+          path: spec.template.spec.containers[0].args[0]
+          pattern: 'CREATE EXTENSION IF NOT EXISTS pgaudit;'
+      # the wait loop aborts explicitly if the primary never becomes ready
+      - matchRegex:
+          path: spec.template.spec.containers[0].args[0]
+          pattern: 'if \[ -z "\$ready" \]; then'
+
+  # --- guards ---
+  - it: g1 audit in standalone mode fails fast
+    template: templates/statefulset.yaml
+    set:
+      postgresql.audit.enabled: true
+      repmgr.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.audit.enabled requires repmgr.enabled=true: audit logging needs the cagriekin/repmgr image, which bundles pgaudit. Standalone mode uses the stock postgres image (no pgaudit) and would fail to start on shared_preload_libraries. To audit in standalone mode, build a postgresql.image that ships pgaudit."
+
+  - it: g2 an invalid audit class fails fast
+    template: templates/statefulset.yaml
+    set:
+      postgresql.audit.enabled: true
+      postgresql.audit.log: "ddl, bogus"
+    asserts:
+      - failedTemplate: {}
+
+  - it: g2 an empty audit.log fails fast
+    template: templates/statefulset.yaml
+    set:
+      postgresql.audit.enabled: true
+      postgresql.audit.log: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: 'postgresql.audit.log must not be empty when audit.enabled (e.g. "ddl, role, write" or "all")'
+
+  - it: g2 a negated class is accepted
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.audit.enabled: true
+      postgresql.audit.log: "all, -misc"
+    asserts:
+      - notFailedTemplate: {}
+      - matchRegex:
+          path: data["pgaudit.conf"]
+          pattern: "pgaudit.log = 'all, -misc'"
+
+  - it: g3 an invalid audit.role fails fast
+    template: templates/statefulset.yaml
+    set:
+      postgresql.audit.enabled: true
+      postgresql.audit.role: "bad-role;drop"
+    asserts:
+      - failedTemplate: {}
+
+  - it: g2 a trailing comma in audit.log fails fast (would render an empty class token)
+    template: templates/statefulset.yaml
+    set:
+      postgresql.audit.enabled: true
+      postgresql.audit.log: "ddl,"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'postgresql.audit.log: empty class segment in "ddl," (check for a stray, leading, trailing, or doubled comma)'
+
+  - it: g2 a doubled comma in audit.log fails fast
+    template: templates/statefulset.yaml
+    set:
+      postgresql.audit.enabled: true
+      postgresql.audit.log: "ddl,,write"
+    asserts:
+      - failedTemplate: {}
+
+  # --- rolling restart on toggle: the config checksum must render when ONLY audit is
+  #     enabled (no other conf.d feature), else toggling audit would not restart the
+  #     postmaster and shared_preload_libraries=pgaudit would never take effect ---
+  - it: enabling audit alone emits the postgresql-config checksum annotation
+    template: templates/statefulset.yaml
+    set:
+      postgresql.audit.enabled: true
+    asserts:
+      - exists:
+          path: spec.template.metadata.annotations["checksum/postgresql-config"]

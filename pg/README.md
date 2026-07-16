@@ -163,6 +163,12 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.configuration` | Map of postgresql.conf parameters | `{}` |
 | `postgresql.pgHba` | List of pg_hba.conf entries injected via postStart | `[]` |
 | `postgresql.extensions.enabled` | Enable extensions support | `false` |
+| `postgresql.audit.enabled` | Enable pgaudit audit logging (requires repmgr mode; see [Audit logging](#audit-logging-pgaudit)) | `false` |
+| `postgresql.audit.log` | pgaudit session classes: `read,write,function,role,ddl,misc,misc_set,all` (negate with `-`) | `"ddl, role, write"` |
+| `postgresql.audit.logCatalog` | Audit `pg_catalog` statements | `false` |
+| `postgresql.audit.logParameter` | Log statement parameter values (may contain PII/secrets) | `false` |
+| `postgresql.audit.logRelation` | Log the fully-qualified relation per affected table | `false` |
+| `postgresql.audit.role` | Optional `pgaudit.role` for object-level auditing (empty = session-only) | `""` |
 | `postgresql.lifecycle.postStart.additionalCommands` | Shell commands to run after PostgreSQL is ready | `""` |
 | `postgresql.migrateLegacyMd5Users` | Re-hash MD5 user passwords to SCRAM on PG14+ | `true` |
 | `postgresql.nodeSelector` | Node selector for PostgreSQL pods | `{}` |
@@ -195,7 +201,7 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 |-----------|-------------|---------|
 | `repmgr.enabled` | Enable repmgr | `true` |
 | `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
-| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-27` |
+| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-28` |
 | `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `repmgr.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Bump with `repmgr.image.tag` when moving to an image built for a new PG major. | `"18"` |
 | `repmgr.username` | Repmgr database user | `repmgr` |
@@ -666,6 +672,50 @@ Caveats:
 - **Cert rotation:** PostgreSQL reloads `ssl_*` on SIGHUP, not when the mounted Secret
   changes. Run `kubectl rollout restart statefulset/<release>-pg` after rotating the
   cert Secret.
+
+## Audit logging (pgaudit)
+
+Opt-in, [pgaudit](https://github.com/pgaudit/pgaudit)-based audit logging for compliance
+regimes (SOC 2, HIPAA, PCI-DSS, ISO 27001) that need a per-object record of *who did what*.
+Off by default — with `audit.enabled: false` the rendered manifests are unchanged.
+
+```yaml
+postgresql:
+  audit:
+    enabled: true
+    log: "ddl, role, write"   # pgaudit session classes; see below
+    logCatalog: false
+    logParameter: false        # parameters can contain PII/secrets — enable deliberately
+    logRelation: false
+    role: ""                   # optional pgaudit.role for object-level auditing
+```
+
+**What the chart does when enabled:** adds `pgaudit` to `shared_preload_libraries`
+(preserving `repmgr` and any libraries you set in `postgresql.configuration` —
+they are merged), renders the `pgaudit.*` GUCs into the postgresql ConfigMap, and
+creates the extension idempotently on the primary via a post-install/upgrade hook Job.
+
+- **Requires `repmgr.enabled: true`.** Audit logging needs the `cagriekin/repmgr` image,
+  which bundles the `pgaudit` extension. Standalone mode (`repmgr.enabled: false`) uses the
+  stock `postgres` image, which has no pgaudit, so a bare `shared_preload_libraries=pgaudit`
+  would crash-loop the postmaster. The chart **fails fast** at render time in that case; to
+  audit in standalone mode, supply a `postgresql.image` that ships pgaudit.
+- **Enabling audit restarts PostgreSQL.** `shared_preload_libraries` is a postmaster
+  parameter, so it only takes effect after a restart. Toggling `audit.enabled` changes the
+  ConfigMap checksum, which the StatefulSet's `checksum/postgresql-config` annotation turns
+  into a controlled rolling restart — no manual step needed.
+- **Log classes** (`log`): comma-separated `read`, `write`, `function`, `role`, `ddl`,
+  `misc`, `misc_set`, `all`. Prefix a class with `-` to subtract from `all`
+  (e.g. `all, -misc`). Validated against this allowlist at render time.
+- **Object-level auditing** (`role`): set `pgaudit.role` to an existing role; any object it
+  is `GRANT`ed on is audited regardless of the class list. Leave empty for session-only
+  logging. To audit objects in databases other than the primary, add `pgaudit` to that
+  database's `postgresql.databases[].extensions`.
+- **Where the records go, and retention.** pgaudit writes to the PostgreSQL server log
+  (stderr → `kubectl logs`). The chart emits the records; **tamper-evident retention is your
+  platform's job** — ship the pod logs to Loki / ELK / CloudWatch with an
+  append-only/immutable retention policy. Runtime `ALTER SYSTEM` / session GUC changes are
+  **not** persisted; this declarative config is the source of truth.
 
 ## Replication Management
 

@@ -1,5 +1,27 @@
 # pg chart changelog
 
+## 1.5.0 - 2026-07-12
+
+Requires the new repmgr image (`trixie-5.5.0-28`), which bundles the `pgaudit`
+extension. The default `repmgr.image.tag` is bumped accordingly; pgaudit is inert
+until `postgresql.audit.enabled` is set, so upgrading with audit off is a no-op
+beyond the image pull.
+
+### Added
+
+- **pgaudit-based audit logging (`postgresql.audit.*`)** for compliance regimes
+  (SOC 2, HIPAA, PCI-DSS, ISO 27001) that require a per-object record of who did
+  what (#219). Opt-in and default-off: `audit.enabled=false` renders identically to
+  1.4.3. When enabled, the chart adds `pgaudit` to `shared_preload_libraries`
+  (keeping `repmgr` and any operator-declared libraries), renders the `pgaudit.*`
+  GUCs into the postgresql ConfigMap, and creates the extension idempotently on the
+  primary via a post-install/upgrade hook Job. Because `shared_preload_libraries` is
+  a postmaster parameter, toggling audit triggers a controlled rolling restart via
+  the existing config-checksum annotation. Knobs: `log` (audit classes),
+  `logCatalog`, `logParameter`, `logRelation`, and `role` (object-level auditing via
+  `pgaudit.role`). Requires `repmgr.enabled=true` (guarded at render time — the stock
+  postgres image used in standalone mode has no pgaudit).
+
 ## 1.4.3 - 2026-07-11
 
 Chart-only fix. No image change (`trixie-5.5.0-27`).
