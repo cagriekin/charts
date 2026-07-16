@@ -118,6 +118,10 @@ tests:
       - matchRegex:
           path: spec.template.spec.containers[0].args[0]
           pattern: 'CREATE EXTENSION IF NOT EXISTS pgaudit;'
+      # the wait loop aborts explicitly if the primary never becomes ready
+      - matchRegex:
+          path: spec.template.spec.containers[0].args[0]
+          pattern: 'if \[ -z "\$ready" \]; then'
 
   # --- guards ---
   - it: g1 audit in standalone mode fails fast

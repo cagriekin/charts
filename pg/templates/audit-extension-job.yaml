@@ -58,12 +58,18 @@ spec:
           args:
             - |
               echo "Waiting for the primary to accept connections..."
+              ready=""
               for i in $(seq 1 60); do
                 if PGPASSWORD="$POSTGRES_PASSWORD" pg_isready -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1; then
+                  ready=1
                   break
                 fi
                 sleep 5
               done
+              if [ -z "$ready" ]; then
+                echo "Primary did not accept connections after 300s (60 x 5s); aborting so the hook fails loudly instead of erroring against an unreachable primary. The Job will retry (backoffLimit) within activeDeadlineSeconds." >&2
+                exit 1
+              fi
               echo "Ensuring the pgaudit extension exists in database '$POSTGRES_DB'..."
               # Idempotent (IF NOT EXISTS) so re-running on every upgrade is safe. No
               # user-supplied identifier is interpolated -- the extension name is a fixed
