@@ -69,14 +69,14 @@ spec:
 
           SECRET_USERNAME_KEY="{{ include "kafka.auth.usernameKey" . | trim }}"
           SECRET_PASSWORD_KEY="{{ include "kafka.auth.passwordKey" . | trim }}"
-          KAFKA_USERNAME=$$(cat /opt/kafka/secrets/$${SECRET_USERNAME_KEY})
-          KAFKA_PASSWORD=$$(cat /opt/kafka/secrets/$${SECRET_PASSWORD_KEY})
+          KAFKA_USERNAME=$(cat /opt/kafka/secrets/${SECRET_USERNAME_KEY})
+          KAFKA_PASSWORD=$(cat /opt/kafka/secrets/${SECRET_PASSWORD_KEY})
 
           mkdir -p /tmp/kafka-config
           cp /opt/kafka/config/kraft/client.properties /tmp/kafka-config/
           cp /opt/kafka/config/kraft/client_jaas.conf.template /tmp/kafka-config/
 
-          sed -e "s|PLACEHOLDER_USERNAME|$${KAFKA_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|$${KAFKA_PASSWORD}|g" /opt/kafka/config/kraft/client_jaas.conf.template > /tmp/kafka-config/client_jaas.conf
+          sed -e "s|PLACEHOLDER_USERNAME|${KAFKA_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|${KAFKA_PASSWORD}|g" /opt/kafka/config/kraft/client_jaas.conf.template > /tmp/kafka-config/client_jaas.conf
 
           export KAFKA_OPTS="-Djava.security.auth.login.config=/tmp/kafka-config/client_jaas.conf"
 
@@ -87,7 +87,7 @@ spec:
             -file /opt/kafka/tls-pem/{{ .Values.kafka.tls.caFilename }} \
             -keystore /tmp/kafka-config/truststore.p12 \
             -storetype PKCS12 \
-            -storepass "$${STORE_PASS}" \
+            -storepass "${STORE_PASS}" \
             -noprompt -alias ca
           {{- end }}
 

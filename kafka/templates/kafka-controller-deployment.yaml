@@ -142,14 +142,14 @@ spec:
             - |
               set -e
               # Derive node ID from pod ordinal
-              POD_ORDINAL=$$(echo $$POD_NAME | rev | cut -d'-' -f1 | rev)
-              NODE_ID=$$(expr $$POD_ORDINAL + 1)
-              export KAFKA_NODE_ID=$$NODE_ID
+              POD_ORDINAL=$(echo $POD_NAME | rev | cut -d'-' -f1 | rev)
+              NODE_ID=$(expr $POD_ORDINAL + 1)
+              export KAFKA_NODE_ID=$NODE_ID
 
               mkdir -p /tmp/kafka-config
               cp /opt/kafka/config/kraft/server.properties /tmp/kafka-config/
 
-              sed -i "s/PLACEHOLDER_NODE_ID/$${NODE_ID}/g" /tmp/kafka-config/server.properties
+              sed -i "s/PLACEHOLDER_NODE_ID/${NODE_ID}/g" /tmp/kafka-config/server.properties
 
               exec /opt/kafka/bin/kafka-server-start.sh /tmp/kafka-config/server.properties
           ports:
