@@ -179,10 +179,10 @@ Return the Kafka auth password in plain text.
 {{- index $secret.data $key | b64dec -}}
 {{- else }}
 {{- /* Lookup failed - likely RBAC issue. Use fallback; secret will be mounted at runtime. */}}
-{{- $fallback | b64dec -}}
+{{- $fallback -}}
 {{- end }}
 {{- else }}
-{{- $fallback | b64dec -}}
+{{- $fallback -}}
 {{- end }}
 {{- end }}
 
@@ -238,7 +238,7 @@ Generate deterministic Kafka password when not provided.
 {{- $salt := "kafka-password-salt" -}}
 {{- $input := printf "%s-%s-%s" .Release.Name .Chart.Name $salt -}}
 {{- $hash := $input | sha256sum -}}
-{{- $hash | b64enc -}}
+{{- $hash -}}
 {{- end }}
 
 {{/*

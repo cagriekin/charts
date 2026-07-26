@@ -146,22 +146,37 @@ spec:
             - |
               set -e
               # Broker node IDs start after controller IDs
-              POD_ORDINAL=$$(echo $$POD_NAME | rev | cut -d'-' -f1 | rev)
-              NODE_ID=$$(expr $$POD_ORDINAL + {{ $controllerCount }} + 1)
-              export KAFKA_NODE_ID=$$NODE_ID
+              POD_ORDINAL=$(echo $POD_NAME | rev | cut -d'-' -f1 | rev)
+              NODE_ID=$(expr $POD_ORDINAL + {{ $controllerCount }} + 1)
+              export KAFKA_NODE_ID=$NODE_ID
 
               SECRET_USERNAME_KEY="{{ include "kafka.auth.usernameKey" . | trim }}"
               SECRET_PASSWORD_KEY="{{ include "kafka.auth.passwordKey" . | trim }}"
-              KAFKA_USERNAME=$$(cat /opt/kafka/secrets/$${SECRET_USERNAME_KEY})
-              KAFKA_PASSWORD=$$(cat /opt/kafka/secrets/$${SECRET_PASSWORD_KEY})
+              KAFKA_USERNAME=$(cat /opt/kafka/secrets/${SECRET_USERNAME_KEY})
+              KAFKA_PASSWORD=$(cat /opt/kafka/secrets/${SECRET_PASSWORD_KEY})
+
+              # The JAAS config format cannot represent these characters in a quoted
+              # value (the parser does not honor escapes), so reject them up front with
+              # a clear message instead of silently producing a broken config.
+              CREDS="${KAFKA_USERNAME}${KAFKA_PASSWORD}"
+              if [ "${CREDS//[\"\\]/}" != "$CREDS" ] || [[ "$CREDS" == *$'\n'* ]]; then
+                echo "ERROR: Kafka SASL username/password must not contain '\"', '\\', or newline characters (Kafka JAAS config limitation)." >&2
+                exit 1
+              fi
 
               mkdir -p /tmp/kafka-config
               cp /opt/kafka/config/kraft/server.properties /tmp/kafka-config/
 
-              sed -e "s|PLACEHOLDER_USERNAME|$${KAFKA_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|$${KAFKA_PASSWORD}|g" /opt/kafka/config/kraft/kafka_server_jaas.conf.template > /tmp/kafka-config/kafka_server_jaas.conf
+              # Escape characters that are special in a sed replacement (& | \) so that
+              # credentials containing them cannot break or inject into the substitution.
+              sed_escape() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
+              ESC_USERNAME=$(sed_escape "${KAFKA_USERNAME}")
+              ESC_PASSWORD=$(sed_escape "${KAFKA_PASSWORD}")
 
-              sed -i "s|PLACEHOLDER_NODE_ID|$${NODE_ID}|g" /tmp/kafka-config/server.properties
-              sed -i "s|PLACEHOLDER_POD_NAME|$${POD_NAME}|g" /tmp/kafka-config/server.properties
+              sed -e "s|PLACEHOLDER_USERNAME|${ESC_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|${ESC_PASSWORD}|g" /opt/kafka/config/kraft/kafka_server_jaas.conf.template > /tmp/kafka-config/kafka_server_jaas.conf
+
+              sed -i "s|PLACEHOLDER_NODE_ID|${NODE_ID}|g" /tmp/kafka-config/server.properties
+              sed -i "s|PLACEHOLDER_POD_NAME|${POD_NAME}|g" /tmp/kafka-config/server.properties
 
               exec /opt/kafka/bin/kafka-server-start.sh /tmp/kafka-config/server.properties
           ports:

@@ -195,7 +195,7 @@ exporters:
           - ALL
     podDisruptionBudget:
       enabled: true
-      maxUnavailable: 0
+      maxUnavailable: 1
     autoscaling:
       enabled: false
       minReplicas: 1
