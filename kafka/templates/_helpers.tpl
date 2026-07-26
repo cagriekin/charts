@@ -225,6 +225,46 @@ Format: 1@controller-0.svc:9093,2@controller-1.svc:9093,3@controller-2.svc:9093
 {{- end }}
 
 {{/*
+NetworkPolicy peer that selects in-cluster Kafka pods of the given component(s),
+in the release namespace. Used to pod-scope intra-cluster traffic instead of
+allowing the whole namespace.
+Usage: include "kafka.netpol.podPeer" (dict "ctx" . "components" (list "kafka-broker" "kafka-controller"))
+*/}}
+{{- define "kafka.netpol.podPeer" -}}
+- podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "kafka.name" .ctx }}
+      app.kubernetes.io/instance: {{ .ctx.Release.Name }}
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+        {{- range .components }}
+          - {{ . }}
+        {{- end }}
+{{- end }}
+
+{{/*
+NetworkPolicy egress rule allowing DNS resolution (to the release namespace and
+kube-system, where CoreDNS typically runs).
+Usage: include "kafka.netpol.dnsEgress" (dict "ctx" .)
+*/}}
+{{- define "kafka.netpol.dnsEgress" -}}
+- to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ .ctx.Release.Namespace }}
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+  ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+{{- end }}
+
+{{/*
 Generate Kafka cluster ID.
 */}}
 {{- define "kafka.kafka.clusterId" -}}

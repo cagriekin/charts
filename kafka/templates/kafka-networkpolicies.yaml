@@ -24,10 +24,9 @@ spec:
     {{- if .Values.networkPolicy.controller.ingress }}
     {{- toYaml .Values.networkPolicy.controller.ingress | nindent 4 }}
     {{- else }}
+    # KRaft quorum port: reachable only from broker and controller pods.
     - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $namespace }}
+        {{- include "kafka.netpol.podPeer" (dict "ctx" $ "components" (list "kafka-broker" "kafka-controller")) | nindent 8 }}
       ports:
         - protocol: TCP
           port: 9093
@@ -37,32 +36,13 @@ spec:
     {{- toYaml .Values.networkPolicy.controller.egress | nindent 4 }}
     {{- else }}
     - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $namespace }}
+        {{- include "kafka.netpol.podPeer" (dict "ctx" $ "components" (list "kafka-broker" "kafka-controller")) | nindent 8 }}
       ports:
         - protocol: TCP
           port: 9092
         - protocol: TCP
           port: 9093
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $namespace }}
-      ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-      ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
+    {{- include "kafka.netpol.dnsEgress" (dict "ctx" $) | nindent 4 }}
     {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
@@ -89,6 +69,9 @@ spec:
     {{- if .Values.networkPolicy.broker.ingress }}
     {{- toYaml .Values.networkPolicy.broker.ingress | nindent 4 }}
     {{- else }}
+    # Client-facing listener: brokers serve arbitrary client pods (and each
+    # other), so 9092 ingress is namespace-scoped by default. Override
+    # networkPolicy.broker.ingress to restrict to specific client pods.
     - from:
         - namespaceSelector:
             matchLabels:
@@ -101,33 +84,18 @@ spec:
     {{- if .Values.networkPolicy.broker.egress }}
     {{- toYaml .Values.networkPolicy.broker.egress | nindent 4 }}
     {{- else }}
+    # To controllers (quorum) and other brokers (replication) only.
     - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $namespace }}
+        {{- include "kafka.netpol.podPeer" (dict "ctx" $ "components" (list "kafka-controller")) | nindent 8 }}
       ports:
-        - protocol: TCP
-          port: 9092
         - protocol: TCP
           port: 9093
     - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $namespace }}
+        {{- include "kafka.netpol.podPeer" (dict "ctx" $ "components" (list "kafka-broker")) | nindent 8 }}
       ports:
-        - protocol: UDP
-          port: 53
         - protocol: TCP
-          port: 53
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-      ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
+          port: 9092
+    {{- include "kafka.netpol.dnsEgress" (dict "ctx" $) | nindent 4 }}
     {{- end }}
 {{- if .Values.exporters.kafka.enabled }}
 ---
@@ -155,6 +123,9 @@ spec:
     {{- if .Values.networkPolicy.exporter.ingress }}
     {{- toYaml .Values.networkPolicy.exporter.ingress | nindent 4 }}
     {{- else }}
+    # Metrics port: scraped by Prometheus, which commonly runs in another
+    # namespace, so 9308 ingress is namespace-scoped by default. Override
+    # networkPolicy.exporter.ingress to restrict to the monitoring namespace/pods.
     - from:
         - namespaceSelector:
             matchLabels:
@@ -167,36 +138,13 @@ spec:
     {{- if .Values.networkPolicy.exporter.egress }}
     {{- toYaml .Values.networkPolicy.exporter.egress | nindent 4 }}
     {{- else }}
+    # Scrapes brokers over the client listener only.
     - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $namespace }}
+        {{- include "kafka.netpol.podPeer" (dict "ctx" $ "components" (list "kafka-broker")) | nindent 8 }}
       ports:
         - protocol: TCP
           port: 9092
-        - protocol: TCP
-          port: 9093
-        - protocol: TCP
-          port: 9308
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ $namespace }}
-      ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-      ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
+    {{- include "kafka.netpol.dnsEgress" (dict "ctx" $) | nindent 4 }}
     {{- end }}
 {{- end }}
 {{- end }}
-
