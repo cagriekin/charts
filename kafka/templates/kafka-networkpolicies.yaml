@@ -39,9 +39,9 @@ spec:
         {{- include "kafka.netpol.podPeer" (dict "ctx" $ "components" (list "kafka-broker" "kafka-controller")) | nindent 8 }}
       ports:
         - protocol: TCP
-          port: 9092
-        - protocol: TCP
           port: 9093
+        - protocol: TCP
+          port: 9094
     {{- include "kafka.netpol.dnsEgress" (dict "ctx" $) | nindent 4 }}
     {{- end }}
 ---
@@ -79,12 +79,20 @@ spec:
       ports:
         - protocol: TCP
           port: 9092
+    # Internal (inter-broker mTLS) listener: only brokers/controllers, the
+    # metrics exporter, and the bootstrap job connect here.
+    - from:
+        {{- include "kafka.netpol.podPeer" (dict "ctx" $ "components" (list "kafka-broker" "kafka-controller" "kafka-exporter" "kafka-topic-init")) | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: 9094
     {{- end }}
   egress:
     {{- if .Values.networkPolicy.broker.egress }}
     {{- toYaml .Values.networkPolicy.broker.egress | nindent 4 }}
     {{- else }}
-    # To controllers (quorum) and other brokers (replication) only.
+    # To controllers (quorum, 9093) and other brokers (replication over the
+    # INTERNAL mTLS listener, 9094) only.
     - to:
         {{- include "kafka.netpol.podPeer" (dict "ctx" $ "components" (list "kafka-controller")) | nindent 8 }}
       ports:
@@ -94,7 +102,7 @@ spec:
         {{- include "kafka.netpol.podPeer" (dict "ctx" $ "components" (list "kafka-broker")) | nindent 8 }}
       ports:
         - protocol: TCP
-          port: 9092
+          port: 9094
     {{- include "kafka.netpol.dnsEgress" (dict "ctx" $) | nindent 4 }}
     {{- end }}
 {{- if .Values.exporters.kafka.enabled }}
@@ -138,12 +146,17 @@ spec:
     {{- if .Values.networkPolicy.exporter.egress }}
     {{- toYaml .Values.networkPolicy.exporter.egress | nindent 4 }}
     {{- else }}
-    # Scrapes brokers over the client listener only.
+    # Scrapes brokers: mTLS INTERNAL listener (9094) under TLS, else client (9092).
     - to:
         {{- include "kafka.netpol.podPeer" (dict "ctx" $ "components" (list "kafka-broker")) | nindent 8 }}
       ports:
+        {{- if .Values.kafka.tls.enabled }}
+        - protocol: TCP
+          port: 9094
+        {{- else }}
         - protocol: TCP
           port: 9092
+        {{- end }}
     {{- include "kafka.netpol.dnsEgress" (dict "ctx" $) | nindent 4 }}
     {{- end }}
 {{- end }}

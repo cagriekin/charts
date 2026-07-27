@@ -14,7 +14,9 @@ kafka:
   bootstrapServer: ""
 
   tls:
-    enabled: false
+    # TLS is required by default. To run without it (INSECURE), set
+    # tls.enabled=false AND auth.allowInsecure=true.
+    enabled: true
     existingSecret: ""
     certFilename: tls.crt
     keyFilename: tls.key
@@ -144,15 +146,43 @@ kafka:
     topologySpreadConstraints: []
 
   auth:
-    username: user1
-    password: ""
-    existingSecret: ""
-    existingSecretKeys:
-      username: username
-      password: password
-    sasl:
-      mechanism: PLAIN
-      securityProtocol: SASL_PLAINTEXT
+    # SASL mechanism for EXTERNAL clients (the CLIENT listener). Internal
+    # (inter-broker) and controller listeners always use mTLS when TLS is on.
+    # One of: SCRAM-SHA-512 (recommended), SCRAM-SHA-256, PLAIN (legacy/insecure).
+    saslMechanism: SCRAM-SHA-512
+    # Must be true to run with tls.enabled=false. INSECURE.
+    allowInsecure: false
+    # SASL users. SCRAM credentials are provisioned into KRaft metadata by the
+    # bootstrap Job. Passwords: explicit password wins; otherwise a random value
+    # is generated on first install and persisted across upgrades. Set
+    # existingSecret to source the password from a pre-existing Secret instead.
+    users:
+      - username: admin
+        password: ""
+        existingSecret: ""
+        existingSecretPasswordKey: password
+    authorization:
+      # StandardAuthorizer with deny-by-default.
+      enabled: true
+      allowEveryoneIfNoAcl: false
+      # Extra super-users (bypass ACLs). The internal cert principal is always a
+      # super-user; list SASL usernames here to grant them full access too.
+      superUsers:
+        - admin
+      # Declarative ACLs. Either role-based:
+      #   - principal: app
+      #     role: consumer            # producer | consumer | admin
+      #     topics: ["orders"]
+      #     groups: ["orders-consumers"]
+      # or raw:
+      #   - principal: app
+      #     operations: [Read, Describe]
+      #     resourceType: topic       # topic | group | cluster | transactionalId
+      #     resourceName: orders
+      #     patternType: literal      # literal | prefixed
+      #     host: "*"
+      #     permission: allow         # allow | deny
+      acls: []
 
   autoCreateTopicsEnable: false
   deleteTopicEnable: true

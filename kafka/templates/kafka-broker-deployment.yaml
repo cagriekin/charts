@@ -47,6 +47,7 @@ spec:
       {{- $brokerLogDir := .Values.kafka.broker.logDir }}
       {{- $brokerLogDirParent := dir $brokerLogDir }}
       {{- $controllerCount := int .Values.kafka.controller.replicaCount }}
+      {{- $mechanism := include "kafka.auth.mechanism" . }}
       initContainers:
         {{- if .Values.kafka.tls.enabled }}
         - name: tls-init
@@ -134,8 +135,6 @@ spec:
               mountPath: "{{ $brokerLogDirParent }}"
             - name: kafka-config
               mountPath: /opt/kafka/config/kraft
-            - name: kafka-secret
-              mountPath: /opt/kafka/secrets
       containers:
         - name: kafka-broker
           image: "{{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}"
@@ -150,38 +149,37 @@ spec:
               NODE_ID=$(expr $POD_ORDINAL + {{ $controllerCount }} + 1)
               export KAFKA_NODE_ID=$NODE_ID
 
-              SECRET_USERNAME_KEY="{{ include "kafka.auth.usernameKey" . | trim }}"
-              SECRET_PASSWORD_KEY="{{ include "kafka.auth.passwordKey" . | trim }}"
-              KAFKA_USERNAME=$(cat /opt/kafka/secrets/${SECRET_USERNAME_KEY})
-              KAFKA_PASSWORD=$(cat /opt/kafka/secrets/${SECRET_PASSWORD_KEY})
-
-              # The JAAS config format cannot represent these characters in a quoted
-              # value (the parser does not honor escapes), so reject them up front with
-              # a clear message instead of silently producing a broken config.
-              CREDS="${KAFKA_USERNAME}${KAFKA_PASSWORD}"
-              if [ "${CREDS//[\"\\]/}" != "$CREDS" ] || [[ "$CREDS" == *$'\n'* ]]; then
-                echo "ERROR: Kafka SASL username/password must not contain '\"', '\\', or newline characters (Kafka JAAS config limitation)." >&2
-                exit 1
-              fi
-
               mkdir -p /tmp/kafka-config
               cp /opt/kafka/config/kraft/server.properties /tmp/kafka-config/
-
-              # Escape characters that are special in a sed replacement (& | \) so that
-              # credentials containing them cannot break or inject into the substitution.
-              sed_escape() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
-              ESC_USERNAME=$(sed_escape "${KAFKA_USERNAME}")
-              ESC_PASSWORD=$(sed_escape "${KAFKA_PASSWORD}")
-
-              sed -e "s|PLACEHOLDER_USERNAME|${ESC_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|${ESC_PASSWORD}|g" /opt/kafka/config/kraft/kafka_server_jaas.conf.template > /tmp/kafka-config/kafka_server_jaas.conf
-
               sed -i "s|PLACEHOLDER_NODE_ID|${NODE_ID}|g" /tmp/kafka-config/server.properties
               sed -i "s|PLACEHOLDER_POD_NAME|${POD_NAME}|g" /tmp/kafka-config/server.properties
+              {{- if eq $mechanism "PLAIN" }}
+
+              # PLAIN (legacy): build a server JAAS from the mounted per-user secret.
+              # SCRAM (the default) needs no JAAS/credentials here -- it validates
+              # against KRaft metadata. Inter-broker auth uses mTLS, not this.
+              JAAS=/tmp/kafka-config/kafka_jaas.conf
+              {
+                echo 'KafkaServer {'
+                echo '  org.apache.kafka.common.security.plain.PlainLoginModule required'
+                {{- range $u := .Values.kafka.auth.users }}
+                {{- if not $u.existingSecret }}
+                printf '  user_%s="%s"\n' '{{ $u.username }}' "$(cat /opt/kafka/secrets/{{ $u.username }}-password)"
+                {{- end }}
+                {{- end }}
+                echo '  ;'
+                echo '};'
+              } > "$JAAS"
+              export KAFKA_OPTS="-Djava.security.auth.login.config=$JAAS"
+              {{- end }}
 
               exec /opt/kafka/bin/kafka-server-start.sh /tmp/kafka-config/server.properties
           ports:
             - name: broker
               containerPort: 9092
+              protocol: TCP
+            - name: internal
+              containerPort: 9094
               protocol: TCP
           readinessProbe:
             tcpSocket:
@@ -208,8 +206,6 @@ spec:
               value: {{ .Values.kafka.broker.jvm.heapOpts | quote }}
             - name: KAFKA_JVM_PERFORMANCE_OPTS
               value: {{ .Values.kafka.broker.jvm.performanceOpts | quote }}
-            - name: KAFKA_OPTS
-              value: "-Djava.security.auth.login.config=/tmp/kafka-config/kafka_server_jaas.conf"
           {{- with .Values.kafka.broker.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
@@ -221,8 +217,11 @@ spec:
               mountPath: "{{ $brokerLogDirParent }}"
             - name: kafka-config
               mountPath: /opt/kafka/config/kraft
+            {{- if eq $mechanism "PLAIN" }}
             - name: kafka-secret
               mountPath: /opt/kafka/secrets
+              readOnly: true
+            {{- end }}
             {{- if .Values.kafka.tls.enabled }}
             - name: kafka-tls
               mountPath: /opt/kafka/tls
@@ -232,9 +231,11 @@ spec:
         - name: kafka-config
           configMap:
             name: {{ include "kafka.fullname" . }}-kafka-broker-config
+        {{- if eq $mechanism "PLAIN" }}
         - name: kafka-secret
           secret:
             secretName: {{ include "kafka.auth.secretName" . }}
+        {{- end }}
         {{- if .Values.kafka.tls.enabled }}
         - name: kafka-tls-pem
           secret:

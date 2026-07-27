@@ -58,9 +58,19 @@ kafka:
       performanceOpts: "-XX:+UseG1GC"
     affinity: {}
 
+  tls:
+    enabled: false
   auth:
-    username: testuser
-    password: dGVzdHBhc3N3b3Jk
+    allowInsecure: true
+    saslMechanism: SCRAM-SHA-512
+    users:
+      - username: testuser
+        password: testpassword
+    authorization:
+      enabled: true
+      allowEveryoneIfNoAcl: false
+      superUsers:
+        - testuser
 
   autoCreateTopicsEnable: true
   deleteTopicEnable: true

@@ -58,9 +58,29 @@ kafka:
       performanceOpts: "-XX:+UseG1GC"
     affinity: {}
 
+  tls:
+    enabled: false
   auth:
-    username: testuser
-    password: dGVzdHBhc3N3b3Jk
+    allowInsecure: true
+    saslMechanism: SCRAM-SHA-512
+    users:
+      - username: testuser
+        password: testpassword
+      - username: appuser
+        password: apppassword
+    authorization:
+      enabled: true
+      allowEveryoneIfNoAcl: false
+      superUsers:
+        - testuser
+      acls:
+        - principal: appuser
+          role: producer
+          topics: ["test-topic-1"]
+        - principal: appuser
+          role: consumer
+          topics: ["test-topic-1"]
+          groups: ["app-consumers"]
 
   autoCreateTopicsEnable: true
   deleteTopicEnable: true

@@ -1,5 +1,10 @@
 {{- if .Values.kafka.enabled }}
 {{- $jobName := printf "%s-kafka-topic-init-%s" (include "kafka.fullname" .) (include "kafka.topicInit.hash" .) | trunc 63 | trimSuffix "-" }}
+{{- $fullname := include "kafka.fullname" . }}
+{{- $namespace := default "default" .Release.Namespace }}
+{{- $tls := .Values.kafka.tls.enabled }}
+{{- $mechanism := include "kafka.auth.mechanism" . }}
+{{- $root := . }}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -25,6 +30,8 @@ metadata:
     job-name: {{ $jobName }}
 spec:
   ttlSecondsAfterFinished: 300
+  backoffLimit: 6
+  activeDeadlineSeconds: 1200
   template:
     metadata:
       labels:
@@ -37,9 +44,39 @@ spec:
         job-name: {{ $jobName }}
     spec:
       restartPolicy: OnFailure
+      {{- if $tls }}
+      initContainers:
+      - name: tls-init
+        image: {{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}
+        imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+          STORE_PASS="{{ include "kafka.tls.storePassword" . }}"
+          openssl pkcs12 -export \
+            -in /opt/kafka/tls-pem/{{ .Values.kafka.tls.certFilename }} \
+            -inkey /opt/kafka/tls-pem/{{ .Values.kafka.tls.keyFilename }} \
+            -out /tmp/kafka-tls/keystore.p12 \
+            -password "pass:${STORE_PASS}"
+          keytool -importcert \
+            -file /opt/kafka/tls-pem/{{ .Values.kafka.tls.caFilename }} \
+            -keystore /tmp/kafka-tls/truststore.p12 \
+            -storetype PKCS12 \
+            -storepass "${STORE_PASS}" \
+            -noprompt -alias ca
+        volumeMounts:
+        - name: kafka-tls-pem
+          mountPath: /opt/kafka/tls-pem
+          readOnly: true
+        - name: kafka-tls
+          mountPath: /tmp/kafka-tls
+      {{- end }}
       containers:
       - name: kafka-topic-init
         image: {{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}
+        imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
         resources:
           requests:
             cpu: 50m
@@ -47,176 +84,179 @@ spec:
           limits:
             cpu: 200m
             memory: 256Mi
-        volumeMounts:
-        - name: kafka-config
-          mountPath: /opt/kafka/config/kraft
-        - name: kafka-secret
-          mountPath: /opt/kafka/secrets
-          readOnly: true
-        - name: kafka-config-runtime
-          mountPath: /tmp/kafka-config
-        {{- if .Values.kafka.tls.enabled }}
-        - name: kafka-tls-pem
-          mountPath: /opt/kafka/tls-pem
-          readOnly: true
-        {{- end }}
-        {{- $root := . }}
         command:
         - /bin/bash
         - -c
         - |
           set -e
-
-          SECRET_USERNAME_KEY="{{ include "kafka.auth.usernameKey" . | trim }}"
-          SECRET_PASSWORD_KEY="{{ include "kafka.auth.passwordKey" . | trim }}"
-          KAFKA_USERNAME=$(cat /opt/kafka/secrets/${SECRET_USERNAME_KEY})
-          KAFKA_PASSWORD=$(cat /opt/kafka/secrets/${SECRET_PASSWORD_KEY})
-
-          # The JAAS config format cannot represent these characters in a quoted
-          # value (the parser does not honor escapes), so reject them up front with
-          # a clear message instead of silently producing a broken config.
-          CREDS="${KAFKA_USERNAME}${KAFKA_PASSWORD}"
-          if [ "${CREDS//[\"\\]/}" != "$CREDS" ] || [[ "$CREDS" == *$'\n'* ]]; then
-            echo "ERROR: Kafka SASL username/password must not contain '\"', '\\', or newline characters (Kafka JAAS config limitation)." >&2
-            exit 1
-          fi
-
           mkdir -p /tmp/kafka-config
-          cp /opt/kafka/config/kraft/client.properties /tmp/kafka-config/
-          cp /opt/kafka/config/kraft/client_jaas.conf.template /tmp/kafka-config/
+          CC=/tmp/kafka-config/client.properties
 
-          # Escape characters that are special in a sed replacement (& | \) so that
-          # credentials containing them cannot break or inject into the substitution.
-          sed_escape() { printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'; }
-          ESC_USERNAME=$(sed_escape "${KAFKA_USERNAME}")
-          ESC_PASSWORD=$(sed_escape "${KAFKA_PASSWORD}")
-
-          sed -e "s|PLACEHOLDER_USERNAME|${ESC_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|${ESC_PASSWORD}|g" /opt/kafka/config/kraft/client_jaas.conf.template > /tmp/kafka-config/client_jaas.conf
-
-          export KAFKA_OPTS="-Djava.security.auth.login.config=/tmp/kafka-config/client_jaas.conf"
-
-          {{- if .Values.kafka.tls.enabled }}
-          # Build PKCS12 truststore from mounted CA certificate for TLS connections
-          STORE_PASS="{{ include "kafka.tls.storePassword" . }}"
-          keytool -importcert \
-            -file /opt/kafka/tls-pem/{{ .Values.kafka.tls.caFilename }} \
-            -keystore /tmp/kafka-config/truststore.p12 \
-            -storetype PKCS12 \
-            -storepass "${STORE_PASS}" \
-            -noprompt -alias ca
+          # The bootstrap Job authenticates on the INTERNAL listener (9094): via
+          # mTLS (client cert = super-user principal) under TLS, or PLAINTEXT
+          # (ANONYMOUS super-user) in insecure mode. This avoids the SCRAM
+          # chicken-and-egg (creating users requires an already-authorized admin).
+          {{- if $tls }}
+          cat > "$CC" <<EOF
+          security.protocol=SSL
+          ssl.keystore.type=PKCS12
+          ssl.keystore.location=/tmp/kafka-tls/keystore.p12
+          ssl.keystore.password={{ include "kafka.tls.storePassword" . }}
+          ssl.truststore.type=PKCS12
+          ssl.truststore.location=/tmp/kafka-tls/truststore.p12
+          ssl.truststore.password={{ include "kafka.tls.storePassword" . }}
+          EOF
+          {{- else }}
+          cat > "$CC" <<EOF
+          security.protocol=PLAINTEXT
+          EOF
           {{- end }}
 
           {{- if .Values.kafka.bootstrapServer }}
-          BOOTSTRAP_SERVER="{{ .Values.kafka.bootstrapServer }}"
+          BS="{{ .Values.kafka.bootstrapServer }}"
           {{- else }}
-          BOOTSTRAP_SERVER="{{ include "kafka.fullname" . }}-kafka-broker-0.{{ include "kafka.fullname" . }}-kafka-broker.{{ default "default" .Release.Namespace }}.svc.cluster.local:9092"
+          BS="{{ $fullname }}-kafka-broker-0.{{ $fullname }}-kafka-broker.{{ $namespace }}.svc.cluster.local:9094"
           {{- end }}
+
           MAX_ATTEMPTS=${KAFKA_BOOTSTRAP_RETRIES:-30}
           SLEEP_SECONDS=${KAFKA_BOOTSTRAP_SLEEP:-5}
-
-          echo "Waiting for Kafka bootstrap server ${BOOTSTRAP_SERVER} to become reachable..."
+          echo "Waiting for Kafka bootstrap server ${BS} ..."
           ATTEMPT=1
-          until echo "Attempt ${ATTEMPT}/${MAX_ATTEMPTS}: Testing connection to ${BOOTSTRAP_SERVER}" && /opt/kafka/bin/kafka-broker-api-versions.sh \
-            --bootstrap-server "${BOOTSTRAP_SERVER}" \
-            --command-config /tmp/kafka-config/client.properties; do
+          until /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server "${BS}" --command-config "${CC}" >/dev/null 2>&1; do
             if [ "${ATTEMPT}" -ge "${MAX_ATTEMPTS}" ]; then
               echo "Kafka bootstrap server still unreachable after ${ATTEMPT} attempts; giving up." >&2
               exit 1
             fi
-
-            echo "Attempt ${ATTEMPT}/${MAX_ATTEMPTS} failed. Broker not ready yet; sleeping ${SLEEP_SECONDS}s..."
+            echo "Attempt ${ATTEMPT}/${MAX_ATTEMPTS}: not ready; sleeping ${SLEEP_SECONDS}s..."
             ATTEMPT=$((ATTEMPT + 1))
             sleep "${SLEEP_SECONDS}"
           done
-
           echo "Kafka bootstrap server reachable."
 
-          echo "Creating topics..."
-          export KAFKA_OPTS="-Djava.security.auth.login.config=/tmp/kafka-config/client_jaas.conf"
+          {{- if ne $mechanism "PLAIN" }}
+          echo "Provisioning SASL/{{ $mechanism }} credentials..."
+          {{- range $u := .Values.kafka.auth.users }}
+          {{- if not $u.existingSecret }}
+          USER_PW=$(cat /opt/kafka/secrets/{{ $u.username }}-password)
+          /opt/kafka/bin/kafka-configs.sh --bootstrap-server "${BS}" --command-config "${CC}" \
+            --alter --add-config "{{ $mechanism }}=[iterations=8192,password=${USER_PW}]" \
+            --entity-type users --entity-name {{ $u.username | quote }}
+          unset USER_PW
+          echo "Provisioned user {{ $u.username }}."
+          {{- end }}
+          {{- end }}
+          {{- end }}
 
+          echo "Creating topics..."
 {{- range $topicName, $topic := $root.Values.kafka.topics }}
-          echo "Ensuring {{ $topicName }} topic exists with correct configuration..."
+          echo "Ensuring {{ $topicName }} exists..."
           DESIRED_PARTITIONS={{ default 1 $topic.partitions }}
           DESIRED_REPLICATION={{ default 1 $topic.replicationFactor }}
-
-          /opt/kafka/bin/kafka-topics.sh \
-            --create \
-            --bootstrap-server ${BOOTSTRAP_SERVER} \
-            --command-config /tmp/kafka-config/client.properties \
-            --topic {{ $topicName }} \
+          /opt/kafka/bin/kafka-topics.sh --create \
+            --bootstrap-server "${BS}" --command-config "${CC}" \
+            --topic {{ $topicName | quote }} \
             --partitions ${DESIRED_PARTITIONS} \
             --replication-factor ${DESIRED_REPLICATION} \
             {{- with $topic.config }}
-            {{- range $confKey, $confValue := . }}
-            --config {{ $confKey }}={{ $confValue }} \
+            {{- range $k, $v := . }}
+            --config {{ $k }}={{ $v }} \
             {{- end }}
             {{- end }}
             --if-not-exists
-
-          TOPIC_DESC=$(timeout 30 /opt/kafka/bin/kafka-topics.sh \
-            --describe \
-            --bootstrap-server ${BOOTSTRAP_SERVER} \
-            --command-config /tmp/kafka-config/client.properties \
-            --topic {{ $topicName }} 2>/dev/null || echo "")
-
-          if [ -n "$TOPIC_DESC" ]; then
-            echo "Debug: TOPIC_DESC='$TOPIC_DESC'"
-
-            CURRENT_PARTITIONS=$(echo "$TOPIC_DESC" | awk -F'\t' '{for(i=1;i<=NF;i++) if($i ~ /PartitionCount/) {split($i,a,":"); print a[2]}}' | tr -d ' ')
-            CURRENT_REPLICATION=$(echo "$TOPIC_DESC" | awk -F'\t' '{for(i=1;i<=NF;i++) if($i ~ /ReplicationFactor/) {split($i,a,":"); print a[2]}}' | tr -d ' ')
-
-            CURRENT_PARTITIONS=${CURRENT_PARTITIONS:-0}
-            CURRENT_REPLICATION=${CURRENT_REPLICATION:-0}
-
-            echo "Debug: Parsed CURRENT_PARTITIONS='$CURRENT_PARTITIONS', CURRENT_REPLICATION='$CURRENT_REPLICATION'"
-
-            ALTER_NEEDED=false
-
-            if [ "$CURRENT_PARTITIONS" -gt 0 ] && [ "$DESIRED_PARTITIONS" -gt "$CURRENT_PARTITIONS" ]; then
-              echo "Topic {{ $topicName }} partitions need to be increased from $CURRENT_PARTITIONS to $DESIRED_PARTITIONS"
-              ALTER_NEEDED=true
-            fi
-
-            if [ "$CURRENT_REPLICATION" -gt 0 ] && [ "$CURRENT_REPLICATION" != "$DESIRED_REPLICATION" ]; then
-              echo "Warning: Topic {{ $topicName }} has replication factor $CURRENT_REPLICATION, but desired is $DESIRED_REPLICATION."
-              echo "Replication factor changes require manual intervention using kafka-reassign-partitions tool."
-            fi
-
-            if [ "$ALTER_NEEDED" = true ]; then
-              echo "Altering topic {{ $topicName }} partitions..."
-              /opt/kafka/bin/kafka-topics.sh \
-                --alter \
-                --bootstrap-server ${BOOTSTRAP_SERVER} \
-                --command-config /tmp/kafka-config/client.properties \
-                --topic {{ $topicName }} \
-                --partitions ${DESIRED_PARTITIONS}
-              echo "Topic {{ $topicName }} altered successfully"
-            elif [ "$CURRENT_PARTITIONS" -gt 0 ] && [ "$CURRENT_PARTITIONS" = "$DESIRED_PARTITIONS" ]; then
-              echo "Topic {{ $topicName }} already has correct partition count ($CURRENT_PARTITIONS)"
-            fi
-          else
-            echo "Warning: Could not describe topic {{ $topicName }}, skipping alteration check"
+          CURRENT_PARTITIONS=$(/opt/kafka/bin/kafka-topics.sh --describe \
+            --bootstrap-server "${BS}" --command-config "${CC}" \
+            --topic {{ $topicName | quote }} 2>/dev/null \
+            | awk -F'\t' '{for(i=1;i<=NF;i++) if($i ~ /PartitionCount/){split($i,a,":"); print a[2]}}' | tr -d ' ' | head -n1)
+          CURRENT_PARTITIONS=${CURRENT_PARTITIONS:-0}
+          if [ "${CURRENT_PARTITIONS}" -gt 0 ] && [ "${DESIRED_PARTITIONS}" -gt "${CURRENT_PARTITIONS}" ]; then
+            echo "Increasing {{ $topicName }} partitions ${CURRENT_PARTITIONS} -> ${DESIRED_PARTITIONS}"
+            /opt/kafka/bin/kafka-topics.sh --alter \
+              --bootstrap-server "${BS}" --command-config "${CC}" \
+              --topic {{ $topicName | quote }} --partitions ${DESIRED_PARTITIONS}
           fi
-
 {{- end }}
 
-          echo "Topics created successfully. Listing all topics:"
-          /opt/kafka/bin/kafka-topics.sh \
-            --list \
-            --bootstrap-server ${BOOTSTRAP_SERVER} \
-            --command-config /tmp/kafka-config/client.properties
+          {{- if .Values.kafka.auth.authorization.enabled }}
+          echo "Applying ACLs..."
+{{- range $acl := .Values.kafka.auth.authorization.acls }}
+{{- $principal := printf "User:%s" $acl.principal }}
+{{- if $acl.role }}
+{{- if eq $acl.role "producer" }}
+{{- range $t := $acl.topics }}
+          /opt/kafka/bin/kafka-acls.sh --bootstrap-server "${BS}" --command-config "${CC}" \
+            --add --allow-principal {{ $principal | quote }} --producer --topic {{ $t | quote }}
+{{- end }}
+{{- else if eq $acl.role "consumer" }}
+{{- $groups := $acl.groups | default (list "*") }}
+{{- range $t := $acl.topics }}
+{{- range $g := $groups }}
+          /opt/kafka/bin/kafka-acls.sh --bootstrap-server "${BS}" --command-config "${CC}" \
+            --add --allow-principal {{ $principal | quote }} --consumer --topic {{ $t | quote }} --group {{ $g | quote }}
+{{- end }}
+{{- end }}
+{{- else if eq $acl.role "admin" }}
+{{- range $t := $acl.topics }}
+          /opt/kafka/bin/kafka-acls.sh --bootstrap-server "${BS}" --command-config "${CC}" \
+            --add --allow-principal {{ $principal | quote }} --operation All --topic {{ $t | quote }}
+{{- end }}
+          /opt/kafka/bin/kafka-acls.sh --bootstrap-server "${BS}" --command-config "${CC}" \
+            --add --allow-principal {{ $principal | quote }} --operation All --group '*'
+{{- else }}
+          echo "Unknown ACL role '{{ $acl.role }}' for principal {{ $acl.principal }}; skipping." >&2
+{{- end }}
+{{- else }}
+{{- $permFlag := "--allow-principal" }}
+{{- if eq ($acl.permission | default "allow") "deny" }}{{- $permFlag = "--deny-principal" }}{{- end }}
+{{- $resourceFlag := "--topic" }}
+{{- if eq $acl.resourceType "group" }}{{- $resourceFlag = "--group" }}{{- else if eq $acl.resourceType "transactionalId" }}{{- $resourceFlag = "--transactional-id" }}{{- end }}
+          ACL_CMD="/opt/kafka/bin/kafka-acls.sh --bootstrap-server ${BS} --command-config ${CC} --add {{ $permFlag }} '{{ $principal }}'"
+{{- range $op := $acl.operations }}
+          ACL_CMD="${ACL_CMD} --operation {{ $op }}"
+{{- end }}
+{{- if eq $acl.resourceType "cluster" }}
+          ACL_CMD="${ACL_CMD} --cluster"
+{{- else }}
+          ACL_CMD="${ACL_CMD} {{ $resourceFlag }} '{{ $acl.resourceName }}'"
+{{- end }}
+{{- with $acl.patternType }}
+          ACL_CMD="${ACL_CMD} --resource-pattern-type {{ . }}"
+{{- end }}
+{{- with $acl.host }}
+          ACL_CMD="${ACL_CMD} --host '{{ . }}'"
+{{- end }}
+          eval "${ACL_CMD}"
+{{- end }}
+{{- end }}
+          {{- end }}
+
+          echo "Bootstrap complete. Topics:"
+          /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server "${BS}" --command-config "${CC}"
+        volumeMounts:
+        - name: kafka-config-runtime
+          mountPath: /tmp/kafka-config
+        {{- if ne $mechanism "PLAIN" }}
+        - name: kafka-secret
+          mountPath: /opt/kafka/secrets
+          readOnly: true
+        {{- end }}
+        {{- if $tls }}
+        - name: kafka-tls
+          mountPath: /tmp/kafka-tls
+          readOnly: true
+        {{- end }}
       volumes:
-      - name: kafka-config
-        configMap:
-          name: {{ include "kafka.fullname" . }}-kafka-broker-config
+      - name: kafka-config-runtime
+        emptyDir: {}
+      {{- if ne $mechanism "PLAIN" }}
       - name: kafka-secret
         secret:
           secretName: {{ include "kafka.auth.secretName" . }}
-      - name: kafka-config-runtime
-        emptyDir: {}
-      {{- if .Values.kafka.tls.enabled }}
+      {{- end }}
+      {{- if $tls }}
       - name: kafka-tls-pem
         secret:
           secretName: {{ include "kafka.tls.secretName" . }}
+      - name: kafka-tls
+        emptyDir: {}
       {{- end }}
 {{- end }}

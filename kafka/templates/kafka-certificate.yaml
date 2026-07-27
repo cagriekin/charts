@@ -15,6 +15,7 @@ metadata:
     helm.sh/chart: {{ include "kafka.chart" . }}
 spec:
   secretName: {{ include "kafka.tls.secretName" . }}
+  commonName: {{ $fullname }}
   duration: {{ .Values.kafka.tls.certManager.duration }}
   renewBefore: {{ .Values.kafka.tls.certManager.renewBefore }}
   privateKey:
