@@ -33,7 +33,5 @@ spec:
     - {{ . | quote }}
     {{- end }}
   issuerRef:
-    name: {{ .Values.kafka.tls.certManager.issuerRef.name }}
-    kind: {{ .Values.kafka.tls.certManager.issuerRef.kind }}
-    group: {{ .Values.kafka.tls.certManager.issuerRef.group }}
+    {{- include "kafka.tls.issuerRef" . | nindent 4 }}
 {{- end }}

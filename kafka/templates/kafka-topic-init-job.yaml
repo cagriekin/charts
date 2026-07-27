@@ -66,6 +66,13 @@ spec:
             -storetype PKCS12 \
             -storepass "${STORE_PASS}" \
             -noprompt -alias ca
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
         volumeMounts:
         - name: kafka-tls-pem
           mountPath: /opt/kafka/tls-pem

@@ -17,6 +17,10 @@ env:
   IMAGES: >-
     apache/kafka:4.1.0
     danielqsj/kafka-exporter:v1.9.0
+    quay.io/jetstack/cert-manager-controller:v1.16.2
+    quay.io/jetstack/cert-manager-webhook:v1.16.2
+    quay.io/jetstack/cert-manager-cainjector:v1.16.2
+    quay.io/jetstack/cert-manager-startupapicheck:v1.16.2
 
 jobs:
   changes:
@@ -107,6 +111,13 @@ jobs:
             docker save "$image" -o "/tmp/kind-images/${safe_name}.tar"
             kind load image-archive "/tmp/kind-images/${safe_name}.tar" --name kafka-test
           done
+
+      - name: Install cert-manager
+        run: |
+          kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.2/cert-manager.yaml
+          kubectl -n cert-manager rollout status deploy/cert-manager --timeout=180s
+          kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180s
+          kubectl -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=180s
 
       - name: Run template tests
         run: make -C kafka test-template

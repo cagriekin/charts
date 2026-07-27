@@ -23,6 +23,9 @@ kafka:
     caFilename: ca.crt
     certManager:
       issuerRef:
+        # Leave name empty to use a chart-managed self-signed CA (a SelfSigned
+        # Issuer + CA Certificate + CA Issuer are created for you). Requires
+        # cert-manager to be installed. Set name to use your own issuer instead.
         name: ""
         kind: ClusterIssuer
         group: cert-manager.io

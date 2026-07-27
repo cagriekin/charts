@@ -74,6 +74,10 @@ spec:
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- with .Values.kafka.controller.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: kafka-tls-pem
               mountPath: /opt/kafka/tls-pem

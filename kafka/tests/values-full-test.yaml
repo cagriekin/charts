@@ -58,10 +58,8 @@ kafka:
       performanceOpts: "-XX:+UseG1GC"
     affinity: {}
 
-  tls:
-    enabled: false
+  # TLS on (default) using the chart-managed self-signed CA; requires cert-manager.
   auth:
-    allowInsecure: true
     saslMechanism: SCRAM-SHA-512
     users:
       - username: testuser

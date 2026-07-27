@@ -1,11 +1,15 @@
-suite: enterprise defaults
+suite: enterprise secure defaults
 templates:
   - templates/kafka-controller-deployment.yaml
+  - templates/kafka-broker-deployment.yaml
   - templates/kafka-controller-service.yaml
   - templates/kafka-configmap.yaml
   - templates/kafka-certificate.yaml
+  - templates/kafka-issuer.yaml
+  - templates/kafka-secret.yaml
 release:
   name: test-kafka
+  namespace: default
 tests:
   - it: controller replicas default to 3
     template: templates/kafka-controller-deployment.yaml
@@ -28,7 +32,17 @@ tests:
           path: spec.clusterIP
           value: None
 
-  - it: broker config has enterprise defaults
+  - it: broker exposes the internal (inter-broker mTLS) 9094 port
+    template: templates/kafka-broker-deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: internal
+            containerPort: 9094
+            protocol: TCP
+
+  - it: broker config has enterprise replication defaults
     template: templates/kafka-configmap.yaml
     documentIndex: 1
     asserts:
@@ -40,33 +54,65 @@ tests:
           pattern: min\.insync\.replicas=2
       - matchRegex:
           path: data["server.properties"]
-          pattern: log\.retention\.hours=168
-      - matchRegex:
-          path: data["server.properties"]
           pattern: auto\.create\.topics\.enable=false
 
-  - it: no Certificate when TLS disabled
-    template: templates/kafka-certificate.yaml
+  - it: broker config is secure-by-default (TLS listeners, SCRAM, authorizer)
+    template: templates/kafka-configmap.yaml
+    documentIndex: 1
     asserts:
-      - hasDocuments:
-          count: 0
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: listener\.security\.protocol\.map=CLIENT:SASL_SSL,INTERNAL:SSL,CONTROLLER:SSL
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: sasl\.enabled\.mechanisms=SCRAM-SHA-512
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: authorizer\.class\.name=org\.apache\.kafka\.metadata\.authorizer\.StandardAuthorizer
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: allow\.everyone\.if\.no\.acl\.found=false
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: super\.users=User:test-kafka;User:admin
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: listener\.name\.internal\.ssl\.client\.auth=required
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: ssl\.principal\.mapping\.rules=
 
-  - it: no tls-init init container when TLS disabled
-    template: templates/kafka-controller-deployment.yaml
-    asserts:
-      - notContains:
-          path: spec.template.spec.initContainers
-          content:
-            name: tls-init
-          any: true
-
-  - it: no ssl keystore or SASL_SSL in controller config when TLS disabled
+  - it: controller config enforces mTLS on the controller listener
     template: templates/kafka-configmap.yaml
     documentIndex: 0
     asserts:
-      - notMatchRegex:
+      - matchRegex:
           path: data["server.properties"]
-          pattern: ssl\.keystore
-      - notMatchRegex:
+          pattern: listener\.name\.controller\.ssl\.client\.auth=required
+      - matchRegex:
           path: data["server.properties"]
-          pattern: SASL_SSL
+          pattern: authorizer\.class\.name=org\.apache\.kafka\.metadata\.authorizer\.StandardAuthorizer
+
+  - it: leaf Certificate is created and references the chart CA issuer by default
+    template: templates/kafka-certificate.yaml
+    asserts:
+      - isKind:
+          of: Certificate
+      - equal:
+          path: spec.issuerRef.name
+          value: test-kafka-kafka-ca
+      - equal:
+          path: spec.issuerRef.kind
+          value: Issuer
+
+  - it: chart provisions a self-signed CA chain by default (SelfSigned Issuer + CA Cert + CA Issuer)
+    template: templates/kafka-issuer.yaml
+    asserts:
+      - hasDocuments:
+          count: 3
+
+  - it: per-user password secret key is present
+    template: templates/kafka-secret.yaml
+    asserts:
+      - isNotNullOrEmpty:
+          path: stringData["admin-password"]

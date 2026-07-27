@@ -310,13 +310,36 @@ must be provided.
 {{- end }}
 
 {{/*
-Validate TLS configuration. Called from the Certificate template so the
-error surfaces during rendering.
+Whether the chart provisions its own self-signed CA (no external issuer and no
+externally-supplied TLS secret). Returns a non-empty string when true.
+*/}}
+{{- define "kafka.tls.selfSigned" -}}
+{{- if and .Values.kafka.tls.enabled (not .Values.kafka.tls.existingSecret) (not .Values.kafka.tls.certManager.issuerRef.name) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+issuerRef block for the leaf (server/client) Certificate. Uses the operator's
+issuer when kafka.tls.certManager.issuerRef.name is set, otherwise the
+chart-managed self-signed CA Issuer.
+*/}}
+{{- define "kafka.tls.issuerRef" -}}
+{{- if .Values.kafka.tls.certManager.issuerRef.name -}}
+name: {{ .Values.kafka.tls.certManager.issuerRef.name }}
+kind: {{ .Values.kafka.tls.certManager.issuerRef.kind }}
+group: {{ .Values.kafka.tls.certManager.issuerRef.group }}
+{{- else -}}
+name: {{ include "kafka.fullname" . }}-kafka-ca
+kind: Issuer
+group: cert-manager.io
+{{- end -}}
+{{- end }}
+
+{{/*
+Retained as a no-op: TLS configuration no longer requires an external issuer or
+existingSecret (the chart supplies a self-signed CA by default). The
+tls-disabled guard lives in kafka.auth.validateTls.
 */}}
 {{- define "kafka.tls.validate" -}}
-{{- if .Values.kafka.tls.enabled -}}
-{{- if and (not .Values.kafka.tls.existingSecret) (not .Values.kafka.tls.certManager.issuerRef.name) -}}
-{{- fail "kafka.tls.enabled requires either kafka.tls.existingSecret or kafka.tls.certManager.issuerRef.name to be set" -}}
-{{- end -}}
-{{- end -}}
 {{- end }}

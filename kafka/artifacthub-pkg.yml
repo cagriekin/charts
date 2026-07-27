@@ -27,5 +27,7 @@ changes:
     description: "Enable StandardAuthorizer with deny-by-default and declarative multi-user ACL roles (producer/consumer/admin) plus a raw ACL escape hatch."
   - kind: added
     description: "Multi-user support with per-user passwords generated randomly on first install and persisted across upgrades."
+  - kind: added
+    description: "Chart-managed self-signed CA (cert-manager) is used by default when no issuerRef or existingSecret is provided, so the chart installs out-of-the-box with TLS/mTLS."
   - kind: changed
     description: "BREAKING: the kafka.auth API was replaced. kafka.auth.username/password/existingSecret/existingSecretKeys/sasl are removed in favour of kafka.auth.users, kafka.auth.saslMechanism, kafka.auth.allowInsecure, and kafka.auth.authorization. See values.yaml."
