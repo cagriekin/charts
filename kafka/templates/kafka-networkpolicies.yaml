@@ -39,8 +39,6 @@ spec:
         {{- include "kafka.netpol.podPeer" (dict "ctx" $ "components" (list "kafka-broker" "kafka-controller")) | nindent 8 }}
       ports:
         - protocol: TCP
-          port: 9092
-        - protocol: TCP
           port: 9093
     {{- include "kafka.netpol.dnsEgress" (dict "ctx" $) | nindent 4 }}
     {{- end }}
