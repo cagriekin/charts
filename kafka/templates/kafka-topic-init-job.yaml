@@ -85,19 +85,19 @@ spec:
         image: {{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}
         imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
         env:
-          # The Kafka CLI tools default to -Xmx256M; with only 256Mi of container
-          # memory the JVM (heap + metaspace + stacks) is OOM-killed, which surfaces
-          # as silent AdminClient connection timeouts. Cap the heap and give the
-          # container headroom for heap + JVM overhead.
+          # The Kafka CLI tools (AdminClient) need ~256M heap; a smaller heap
+          # thrashes and a container smaller than heap+JVM-overhead gets OOM-killed,
+          # both surfacing as silent connection timeouts. Give it the default heap
+          # and a container with headroom.
           - name: KAFKA_HEAP_OPTS
-            value: "-Xmx192m -Xms64m"
+            value: "-Xmx256m -Xms64m"
         resources:
           requests:
             cpu: 50m
-            memory: 128Mi
+            memory: 256Mi
           limits:
-            cpu: 200m
-            memory: 512Mi
+            cpu: 250m
+            memory: 1Gi
         command:
         - /bin/bash
         - -c
@@ -136,7 +136,7 @@ spec:
           SLEEP_SECONDS=${KAFKA_BOOTSTRAP_SLEEP:-5}
           echo "Waiting for Kafka bootstrap server ${BS} ..."
           ATTEMPT=1
-          until /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server "${BS}" --command-config "${CC}" >/dev/null 2>&1; do
+          until /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server "${BS}" --command-config "${CC}" >/dev/null 2>&1; do
             if [ "${ATTEMPT}" -ge "${MAX_ATTEMPTS}" ]; then
               echo "Kafka bootstrap server still unreachable after ${ATTEMPT} attempts; giving up." >&2
               exit 1

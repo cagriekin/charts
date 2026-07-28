@@ -9,6 +9,22 @@ NAMESPACE="${NAMESPACE:-kafka-test-full}"
 RELEASE="${RELEASE:-kafka-full}"
 FULLNAME="${RELEASE}"
 
+# On any failure (e.g. a helm --wait timeout), dump cluster state so CI logs are
+# self-diagnosing instead of a bare "timed out waiting for the condition".
+dump_diagnostics() {
+  local rc=$?
+  [ "${rc}" -eq 0 ] && return 0
+  echo "=== FAILURE DIAGNOSTICS (rc=${rc}, namespace ${NAMESPACE}) ==="
+  kubectl get pods,jobs,certificate,issuer -n "${NAMESPACE}" 2>&1 || true
+  kubectl get events -n "${NAMESPACE}" --sort-by=.lastTimestamp 2>&1 | tail -25 || true
+  for p in $(kubectl get pods -n "${NAMESPACE}" -o name 2>/dev/null); do
+    echo "--- ${p} ---"
+    kubectl describe "${p}" -n "${NAMESPACE}" 2>&1 | sed -n '/Events:/,$p' | tail -12 || true
+    kubectl logs "${p}" -n "${NAMESPACE}" --all-containers --tail=40 2>&1 | tail -40 || true
+  done
+}
+trap dump_diagnostics EXIT
+
 begin_suite "Full Install (1 controller + 2 brokers + exporter + topics + ACLs, TLS/mTLS/SCRAM)"
 
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
