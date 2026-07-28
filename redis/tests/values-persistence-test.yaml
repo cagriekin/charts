@@ -3,7 +3,7 @@ architecture: standalone
 redis:
   image:
     repository: redis
-    tag: "8.6.2-trixie"
+    tag: "8.8.1-trixie"
     pullPolicy: IfNotPresent
   persistence:
     enabled: true
