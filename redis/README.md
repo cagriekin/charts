@@ -215,7 +215,7 @@ window.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `redis.image.repository` / `redis.image.tag` | Redis image | `redis` / `8.6.2-trixie` |
+| `redis.image.repository` / `redis.image.tag` | Redis image | `redis` / `8.8.1-trixie` |
 | `redis.persistence.enabled` / `size` / `storageClass` | Persistence | `true` / `1Gi` / `""` |
 | `redis.persistence.retain` | Keep data PVCs on uninstall / scale-down (`false` = auto-delete) | `true` |
 | `redis.resources` | Requests/limits | see `values.yaml` |
