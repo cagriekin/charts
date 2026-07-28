@@ -1,7 +1,7 @@
-version: 0.2.1
+version: 0.3.0
 name: kafka
 displayName: Kafka
-createdAt: "2026-07-23T00:00:00Z"
+createdAt: "2026-07-26T00:00:00Z"
 description: Apache Kafka in KRaft mode (no ZooKeeper) with SASL authentication, TLS, declarative topic management, and a metrics exporter
 homeURL: "https://cagriekin.github.io/charts"
 logoPath: ""
@@ -17,11 +17,5 @@ links:
     url: https://github.com/cagriekin/charts
 screenshots: []
 changes:
-  - kind: fixed
-    description: "Correct shell variable escaping in broker/controller/topic-init start scripts so pods no longer crash on startup"
-  - kind: fixed
-    description: "Stop corrupting user-supplied SASL passwords (upgrade note: an install that set a base64-looking kafka.auth.password on <=0.2.0 will now store the literal value; re-verify client credentials after upgrading)"
-  - kind: fixed
-    description: "Handle special characters in SASL credentials safely when building JAAS config: escape sed metacharacters (| & \\), and reject double-quote/backslash/newline that the JAAS format cannot represent"
-  - kind: fixed
-    description: "Render a valid exporter PodDisruptionBudget by default (maxUnavailable: 1)"
+  - kind: security
+    description: "Pod-scope NetworkPolicy intra-cluster traffic: the controller quorum port (9093) is now reachable only from broker/controller pods instead of the whole namespace, and all egress is restricted to specific component pods. Client (9092) and metrics (9308) ingress remain namespace-scoped with override hooks."
