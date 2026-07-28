@@ -48,8 +48,8 @@ for pod in "${BROKER_0}" "${BROKER_1}"; do
   assert_eq "${pod} is Running" "Running" "${phase}"
 done
 
-# PKCS12 store password is deterministic: sha256("<release>-tls-store")[:32]
-STOREPASS=$(printf '%s' "${RELEASE}-tls-store" | sha256sum | cut -c1-32)
+# PKCS12 store password is a random per-install value persisted in the chart Secret.
+STOREPASS=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-kafka-secret" -o jsonpath="{.data.tls-store-password}" | base64 -d)
 TESTUSER_PW=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-kafka-secret" -o jsonpath='{.data.testuser-password}' | base64 -d)
 APPUSER_PW=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-kafka-secret" -o jsonpath='{.data.appuser-password}' | base64 -d)
 
