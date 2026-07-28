@@ -115,14 +115,19 @@ kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
 " >/dev/null 2>&1 || acl_rc=$?
 assert_eq "appuser (producer ACL) can write to test-topic-1" "0" "${acl_rc}"
 
-# appuser has NO ACL on test-topic-2, so a write must be denied.
-deny_rc=0
-kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
+# appuser has NO ACL on test-topic-2, so a write must be denied. Note that
+# kafka-console-producer exits 0 even on an authorization failure, so detect the
+# error message rather than the process exit code.
+deny_out=$(kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
   echo 'nope' | /opt/kafka/bin/kafka-console-producer.sh \
     --bootstrap-server ${BROKER_SVC} --topic test-topic-2 \
-    --producer.config /tmp/appuser.properties
-" >/dev/null 2>&1 || deny_rc=$?
-if [[ "${deny_rc}" -ne 0 ]]; then pass "appuser without ACL is denied on test-topic-2"; else fail "appuser without ACL is denied on test-topic-2"; fi
+    --producer.config /tmp/appuser.properties 2>&1
+" || true)
+if echo "${deny_out}" | grep -qiE 'authorization failed|TOPIC_AUTHORIZATION_FAILED'; then
+  pass "appuser without ACL is denied on test-topic-2"
+else
+  fail "appuser without ACL is denied on test-topic-2" "${deny_out}"
+fi
 
 # --- Exporter tests ---
 echo ""
@@ -138,12 +143,19 @@ exporter_port=$(kubectl get svc -n "${NAMESPACE}" "${FULLNAME}-kafka-exporter" -
 assert_eq "exporter service port is 9308" "9308" "${exporter_port}"
 
 exporter_svc="${FULLNAME}-kafka-exporter"
-kubectl port-forward -n "${NAMESPACE}" "svc/${exporter_svc}" 19308:9308 &
-PF_PID=$!
-sleep 2
-metrics_output=$(wget -qO- "http://127.0.0.1:19308/metrics" 2>/dev/null | grep -m1 '^kafka_' || echo "")
-kill "${PF_PID}" 2>/dev/null || true
-wait "${PF_PID}" 2>/dev/null || true
+# The exporter can restart a few times on a fresh cluster until the broker DNS
+# resolves, so poll /metrics until kafka_ series appear (bounded).
+metrics_output=""
+for _ in $(seq 1 12); do
+  kubectl port-forward -n "${NAMESPACE}" "svc/${exporter_svc}" 19308:9308 >/dev/null 2>&1 &
+  PF_PID=$!
+  sleep 3
+  metrics_output=$( { curl -sf "http://127.0.0.1:19308/metrics" 2>/dev/null || wget -qO- "http://127.0.0.1:19308/metrics" 2>/dev/null; } | grep -m1 '^kafka_' || echo "")
+  kill "${PF_PID}" 2>/dev/null || true
+  wait "${PF_PID}" 2>/dev/null || true
+  [ -n "${metrics_output}" ] && break
+  sleep 5
+done
 assert_contains "exporter returns kafka metrics" "${metrics_output}" "kafka_"
 
 end_suite
