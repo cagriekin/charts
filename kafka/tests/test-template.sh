@@ -113,5 +113,20 @@ guard=$(helm template test-kafka "${CHART_DIR}" \
 assert_eq "guard: template fails when TLS disabled without allowInsecure" "1" "${guard_rc}"
 assert_contains "guard: error mentions allowInsecure" "${guard}" "kafka.auth.allowInsecure"
 
+# --- Guard: controller replicaCount must form a healthy KRaft quorum ---
+qzero=$(helm template test-kafka "${CHART_DIR}" \
+  --set kafka.controller.replicaCount=0 2>&1) && qzero_rc=0 || qzero_rc=$?
+assert_eq "guard: template fails when controller replicaCount < 1" "1" "${qzero_rc}"
+assert_contains "guard: error mentions >= 1" "${qzero}" "must be >= 1"
+
+qeven=$(helm template test-kafka "${CHART_DIR}" \
+  --set kafka.controller.replicaCount=2 2>&1) && qeven_rc=0 || qeven_rc=$?
+assert_eq "guard: template fails when controller replicaCount is even" "1" "${qeven_rc}"
+assert_contains "guard: error mentions odd" "${qeven}" "must be odd"
+
+qodd=$(helm template test-kafka "${CHART_DIR}" \
+  --set kafka.controller.replicaCount=1 2>&1) && qodd_rc=0 || qodd_rc=$?
+assert_eq "guard: template succeeds with odd controller replicaCount" "0" "${qodd_rc}"
+
 end_suite
 print_summary
