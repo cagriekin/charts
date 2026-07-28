@@ -18,6 +18,8 @@ links:
 screenshots: []
 changes:
   - kind: security
+    description: "Pod-scope NetworkPolicy intra-cluster traffic: the controller quorum port (9093) is now reachable only from broker/controller pods instead of the whole namespace, and all egress is restricted to specific component pods. Client (9092) and metrics (9308) ingress remain namespace-scoped with override hooks."
+  - kind: security
     description: "Require TLS by default; run without it only with the explicit kafka.auth.allowInsecure opt-in."
   - kind: security
     description: "Inter-broker and controller listeners now use mutual TLS (mTLS) via a dedicated INTERNAL listener on port 9094."

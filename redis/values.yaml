@@ -17,7 +17,7 @@ imagePullSecrets: []
 redis:
   image:
     repository: redis
-    tag: "8.6.2-trixie"
+    tag: "8.8.1-trixie"
     pullPolicy: IfNotPresent
 
   # Number of REPLICAS, excluding the master. Total redis pods = replicaCount + 1.
@@ -186,7 +186,7 @@ sentinel:
   parallelSyncs: 1
   image:
     repository: redis
-    tag: "8.6.2-trixie"
+    tag: "8.8.1-trixie"
     pullPolicy: IfNotPresent
   resources:
     requests:
