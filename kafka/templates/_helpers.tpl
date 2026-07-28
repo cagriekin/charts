@@ -19,10 +19,18 @@ app.kubernetes.io/part-of: {{ include "kafka.name" . }}
 {{- include "common.selectorLabels" . }}
 {{- end }}
 
+{{/*
+Kafka metrics exporter pod spec.
+In TLS mode the exporter authenticates to the broker INTERNAL (mTLS) listener
+using the chart client certificate, whose principal is a super-user -- no SASL
+credentials are needed. In insecure mode it connects to the CLIENT listener in
+plaintext with no auth.
+*/}}
 {{- define "kafka.exporterPodSpec" -}}
 {{- $fullname := include "kafka.fullname" . }}
 {{- $namespace := default "default" .Release.Namespace }}
 {{- $replicas := int .Values.kafka.broker.replicaCount }}
+{{- $tls := .Values.kafka.tls.enabled }}
 serviceAccountName: {{ include "kafka.serviceAccountName" . }}
 {{- with .Values.exporters.kafka.priorityClassName }}
 priorityClassName: {{ . | quote }}
@@ -39,43 +47,26 @@ containers:
       - /bin/sh
       - -c
       - |
-        kafka_exporter \
+        exec kafka_exporter \
           {{- range $i := until $replicas }}
+          {{- if $tls }}
+          --kafka.server={{ $fullname }}-kafka-broker-{{ $i }}.{{ $fullname }}-kafka-broker.{{ $namespace }}.svc.cluster.local:9094 \
+          {{- else }}
           --kafka.server={{ $fullname }}-kafka-broker-{{ $i }}.{{ $fullname }}-kafka-broker.{{ $namespace }}.svc.cluster.local:9092 \
           {{- end }}
-          --sasl.enabled \
-          --sasl.mechanism=plain \
-          --sasl.username="$KAFKA_SASL_USERNAME" \
-          {{- if $.Values.kafka.tls.enabled }}
-          --sasl.password="$KAFKA_SASL_PASSWORD" \
+          {{- end }}
+          {{- if $tls }}
           --tls.enabled \
-          --tls.ca-file=/opt/kafka/tls-pem/{{ $.Values.kafka.tls.caFilename }}
+          --tls.ca-file=/opt/kafka/tls-pem/{{ .Values.kafka.tls.caFilename }} \
+          --tls.cert-file=/opt/kafka/tls-pem/{{ .Values.kafka.tls.certFilename }} \
+          --tls.key-file=/opt/kafka/tls-pem/{{ .Values.kafka.tls.keyFilename }}
           {{- else }}
-          --sasl.password="$KAFKA_SASL_PASSWORD"
+          --kafka.version=2.0.0
           {{- end }}
     ports:
       - name: metrics
         containerPort: 9308
         protocol: TCP
-    {{- if .Values.kafka.auth.existingSecret }}
-    env:
-      - name: KAFKA_SASL_USERNAME
-        valueFrom:
-          secretKeyRef:
-            name: {{ include "kafka.auth.secretName" . }}
-            key: {{ include "kafka.auth.usernameKey" . | trim }}
-      - name: KAFKA_SASL_PASSWORD
-        valueFrom:
-          secretKeyRef:
-            name: {{ include "kafka.auth.secretName" . }}
-            key: {{ include "kafka.auth.passwordKey" . | trim }}
-    {{- else }}
-    env:
-      - name: KAFKA_SASL_USERNAME
-        value: {{ include "kafka.auth.username" . | quote }}
-      - name: KAFKA_SASL_PASSWORD
-        value: {{ include "kafka.auth.password" . | quote }}
-    {{- end }}
     resources:
       {{- toYaml .Values.exporters.kafka.resources | nindent 6 }}
     livenessProbe:
@@ -94,13 +85,13 @@ containers:
     securityContext:
       {{- toYaml . | nindent 6 }}
     {{- end }}
-    {{- if $.Values.kafka.tls.enabled }}
+    {{- if $tls }}
     volumeMounts:
       - name: kafka-tls-pem
         mountPath: /opt/kafka/tls-pem
         readOnly: true
     {{- end }}
-{{- if $.Values.kafka.tls.enabled }}
+{{- if $tls }}
 volumes:
   - name: kafka-tls-pem
     secret:
@@ -132,82 +123,100 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
-Return the Kafka auth secret name (existing or managed by chart).
+Name of the chart-managed Secret holding per-user SASL passwords
+(one key per user: "<username>-password").
 */}}
 {{- define "kafka.auth.secretName" -}}
-{{- if .Values.kafka.auth.existingSecret }}
-{{- .Values.kafka.auth.existingSecret }}
-{{- else }}
-{{- printf "%s-kafka-secret" (include "kafka.fullname" .) }}
-{{- end }}
+{{- printf "%s-kafka-secret" (include "kafka.fullname" .) -}}
 {{- end }}
 
 {{/*
-Return the Kafka auth username.
+Effective SASL mechanism for external clients.
 */}}
-{{- define "kafka.auth.username" -}}
-{{- $fallback := .Values.kafka.auth.username | default "user1" -}}
-{{- if .Values.kafka.auth.existingSecret }}
-{{- $secret := lookup "v1" "Secret" (default "default" .Release.Namespace) .Values.kafka.auth.existingSecret }}
-{{- if $secret }}
-{{- $key := include "kafka.auth.usernameKey" . | trim }}
-{{- if not (hasKey $secret.data $key) }}
-{{- fail (printf "Kafka auth existingSecret %q must contain key %q" .Values.kafka.auth.existingSecret $key) }}
-{{- end }}
-{{- index $secret.data $key | b64dec -}}
-{{- else }}
-{{- /* Lookup failed - likely RBAC issue. Use fallback; secret will be mounted at runtime. */}}
-{{- $fallback -}}
-{{- end }}
-{{- else }}
-{{- $fallback -}}
-{{- end }}
+{{- define "kafka.auth.mechanism" -}}
+{{- .Values.kafka.auth.saslMechanism | default "SCRAM-SHA-512" -}}
 {{- end }}
 
 {{/*
-Return the Kafka auth password in plain text.
+Lowercased mechanism, used in per-listener config keys (e.g. scram-sha-512).
 */}}
-{{- define "kafka.auth.password" -}}
-{{- $fallback := default (include "kafka.kafka.password" .) .Values.kafka.auth.password -}}
-{{- if .Values.kafka.auth.existingSecret }}
-{{- $secret := lookup "v1" "Secret" (default "default" .Release.Namespace) .Values.kafka.auth.existingSecret }}
-{{- if $secret }}
-{{- $key := include "kafka.auth.passwordKey" . | trim }}
-{{- if not (hasKey $secret.data $key) }}
-{{- fail (printf "Kafka auth existingSecret %q must contain key %q" .Values.kafka.auth.existingSecret $key) }}
-{{- end }}
-{{- index $secret.data $key | b64dec -}}
-{{- else }}
-{{- /* Lookup failed - likely RBAC issue. Use fallback; secret will be mounted at runtime. */}}
-{{- $fallback -}}
-{{- end }}
-{{- else }}
-{{- $fallback -}}
-{{- end }}
+{{- define "kafka.auth.mechanismLower" -}}
+{{- include "kafka.auth.mechanism" . | lower -}}
 {{- end }}
 
 {{/*
-Return the secret key used for username retrieval.
+Resolve a chart-managed user's password at render time (used only by the
+Secret template). Precedence: explicit password -> value persisted in the
+existing chart Secret (so it is stable across upgrades) -> a fresh random
+value on first install.
+Usage: include "kafka.auth.userPassword" (dict "ctx" $ "user" $user)
 */}}
-{{- define "kafka.auth.usernameKey" -}}
-{{- $keys := .Values.kafka.auth.existingSecretKeys -}}
-{{- if and .Values.kafka.auth.existingSecret $keys (hasKey $keys "username") }}
-{{- index $keys "username" -}}
-{{- else }}
-username
-{{- end }}
+{{- define "kafka.auth.userPassword" -}}
+{{- $ctx := .ctx -}}
+{{- $user := .user -}}
+{{- if $user.password -}}
+{{- $user.password -}}
+{{- else -}}
+{{- $ns := default "default" $ctx.Release.Namespace -}}
+{{- $key := printf "%s-password" $user.username -}}
+{{- $existing := lookup "v1" "Secret" $ns (include "kafka.auth.secretName" $ctx) -}}
+{{- if and $existing (hasKey ($existing.data | default dict) $key) -}}
+{{- index $existing.data $key | b64dec -}}
+{{- else -}}
+{{- randAlphaNum 32 -}}
+{{- end -}}
+{{- end -}}
 {{- end }}
 
 {{/*
-Return the secret key used for password retrieval.
+Principal derived from the chart's TLS client certificate (CN == fullname),
+after ssl.principal.mapping.rules maps the DN down to the CN.
 */}}
-{{- define "kafka.auth.passwordKey" -}}
-{{- $keys := .Values.kafka.auth.existingSecretKeys -}}
-{{- if and .Values.kafka.auth.existingSecret $keys (hasKey $keys "password") }}
-{{- index $keys "password" -}}
-{{- else }}
-password
+{{- define "kafka.auth.certPrincipal" -}}
+{{- printf "User:%s" (include "kafka.fullname" .) -}}
 {{- end }}
+
+{{/*
+super.users list (semicolon-separated). Always includes the internal identity
+(the cert principal under TLS/mTLS, or ANONYMOUS in insecure/no-TLS mode so
+inter-broker traffic is authorized), plus any configured superUsers.
+*/}}
+{{- define "kafka.auth.superUsers" -}}
+{{- $ctx := . -}}
+{{- $list := list -}}
+{{- if $ctx.Values.kafka.tls.enabled -}}
+{{- $list = append $list (include "kafka.auth.certPrincipal" $ctx) -}}
+{{- else -}}
+{{- $list = append $list "User:ANONYMOUS" -}}
+{{- end -}}
+{{- range $ctx.Values.kafka.auth.authorization.superUsers -}}
+{{- $list = append $list (printf "User:%s" .) -}}
+{{- end -}}
+{{- $list | uniq | join ";" -}}
+{{- end }}
+
+{{/*
+Transport protocol for the external CLIENT listener.
+*/}}
+{{- define "kafka.clientProtocol" -}}
+{{- if .Values.kafka.tls.enabled -}}SASL_SSL{{- else -}}SASL_PLAINTEXT{{- end -}}
+{{- end }}
+
+{{/*
+Transport protocol for the internal (inter-broker) and controller listeners.
+SSL enables mTLS via ssl.client.auth=required; PLAINTEXT is insecure.
+*/}}
+{{- define "kafka.internalProtocol" -}}
+{{- if .Values.kafka.tls.enabled -}}SSL{{- else -}}PLAINTEXT{{- end -}}
+{{- end }}
+
+{{/*
+Fail the render when TLS is disabled without an explicit insecure opt-in.
+*/}}
+{{- define "kafka.auth.validateTls" -}}
+{{- if and (not .Values.kafka.tls.enabled) (not .Values.kafka.auth.allowInsecure) -}}
+{{- fail "kafka.tls.enabled is false but kafka.auth.allowInsecure is not set. Production requires TLS: set kafka.tls.enabled=true (with kafka.tls.certManager.issuerRef.name or kafka.tls.existingSecret), or explicitly set kafka.auth.allowInsecure=true to run WITHOUT TLS (INSECURE: client credentials travel in cleartext and inter-broker/controller traffic is unauthenticated)." -}}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -272,20 +281,10 @@ Generate Kafka cluster ID.
 {{- end }}
 
 {{/*
-Generate deterministic Kafka password when not provided.
-*/}}
-{{- define "kafka.kafka.password" -}}
-{{- $salt := "kafka-password-salt" -}}
-{{- $input := printf "%s-%s-%s" .Release.Name .Chart.Name $salt -}}
-{{- $hash := $input | sha256sum -}}
-{{- $hash -}}
-{{- end }}
-
-{{/*
-Generate a content-based suffix for the Kafka topic init job so updates trigger a new job name.
+Generate a content-based suffix for the Kafka bootstrap job so updates trigger a new job name.
 */}}
 {{- define "kafka.topicInit.hash" -}}
-{{- $payload := dict "chartVersion" .Chart.Version "image" (printf "%s/%s:%s" .Values.kafka.image.registry .Values.kafka.image.repository .Values.kafka.image.tag) "topics" .Values.kafka.topics -}}
+{{- $payload := dict "chartVersion" .Chart.Version "image" (printf "%s/%s:%s" .Values.kafka.image.registry .Values.kafka.image.repository .Values.kafka.image.tag) "topics" .Values.kafka.topics "acls" .Values.kafka.auth.authorization.acls "users" (.Values.kafka.auth.users | default list) -}}
 {{- toYaml $payload | sha256sum | trunc 10 | trimSuffix "-" -}}
 {{- end }}
 
@@ -311,35 +310,36 @@ must be provided.
 {{- end }}
 
 {{/*
-Validate TLS configuration. Called from the Certificate template so the
-error surfaces during rendering.
+Whether the chart provisions its own self-signed CA (no external issuer and no
+externally-supplied TLS secret). Returns a non-empty string when true.
+*/}}
+{{- define "kafka.tls.selfSigned" -}}
+{{- if and .Values.kafka.tls.enabled (not .Values.kafka.tls.existingSecret) (not .Values.kafka.tls.certManager.issuerRef.name) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+issuerRef block for the leaf (server/client) Certificate. Uses the operator's
+issuer when kafka.tls.certManager.issuerRef.name is set, otherwise the
+chart-managed self-signed CA Issuer.
+*/}}
+{{- define "kafka.tls.issuerRef" -}}
+{{- if .Values.kafka.tls.certManager.issuerRef.name -}}
+name: {{ .Values.kafka.tls.certManager.issuerRef.name }}
+kind: {{ .Values.kafka.tls.certManager.issuerRef.kind }}
+group: {{ .Values.kafka.tls.certManager.issuerRef.group }}
+{{- else -}}
+name: {{ include "kafka.fullname" . }}-kafka-ca
+kind: Issuer
+group: cert-manager.io
+{{- end -}}
+{{- end }}
+
+{{/*
+Retained as a no-op: TLS configuration no longer requires an external issuer or
+existingSecret (the chart supplies a self-signed CA by default). The
+tls-disabled guard lives in kafka.auth.validateTls.
 */}}
 {{- define "kafka.tls.validate" -}}
-{{- if .Values.kafka.tls.enabled -}}
-{{- if and (not .Values.kafka.tls.existingSecret) (not .Values.kafka.tls.certManager.issuerRef.name) -}}
-{{- fail "kafka.tls.enabled requires either kafka.tls.existingSecret or kafka.tls.certManager.issuerRef.name to be set" -}}
-{{- end -}}
-{{- end -}}
-{{- end }}
-
-{{/*
-Return the broker listener protocol based on TLS setting.
-*/}}
-{{- define "kafka.broker.listenerProtocol" -}}
-{{- if .Values.kafka.tls.enabled -}}
-SASL_SSL
-{{- else -}}
-SASL_PLAINTEXT
-{{- end -}}
-{{- end }}
-
-{{/*
-Return the controller listener security protocol based on TLS setting.
-*/}}
-{{- define "kafka.controller.listenerSecurityProtocol" -}}
-{{- if .Values.kafka.tls.enabled -}}
-SSL
-{{- else -}}
-PLAINTEXT
-{{- end -}}
 {{- end }}

@@ -88,13 +88,30 @@ tests:
           path: spec.ports[0].port
           value: 9092
 
-  - it: broker config uses SASL_PLAINTEXT when TLS disabled
+  - it: broker config is secure (SASL_SSL + SCRAM + authorizer) under default TLS
     template: templates/kafka-configmap.yaml
     documentIndex: 1
     asserts:
       - matchRegex:
           path: data["server.properties"]
-          pattern: SASL_PLAINTEXT
+          pattern: listener\.security\.protocol\.map=CLIENT:SASL_SSL,INTERNAL:SSL,CONTROLLER:SSL
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: sasl\.enabled\.mechanisms=SCRAM-SHA-512
+      - matchRegex:
+          path: data["server.properties"]
+          pattern: super\.users=User:test-kafka;User:testuser
+
+  - it: topic-init job provisions SCRAM users and applies ACLs
+    template: templates/kafka-topic-init-job.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[-1]
+          pattern: kafka-configs\.sh
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[-1]
+          pattern: kafka-acls\.sh
 
   - it: serviceaccount created
     template: templates/serviceaccount.yaml

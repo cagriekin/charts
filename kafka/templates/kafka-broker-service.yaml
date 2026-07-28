@@ -18,6 +18,10 @@ spec:
       targetPort: broker
       protocol: TCP
       name: broker
+    - port: 9094
+      targetPort: internal
+      protocol: TCP
+      name: internal
   selector:
     app.kubernetes.io/name: {{ include "kafka.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}

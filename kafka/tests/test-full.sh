@@ -9,20 +9,37 @@ NAMESPACE="${NAMESPACE:-kafka-test-full}"
 RELEASE="${RELEASE:-kafka-full}"
 FULLNAME="${RELEASE}"
 
-begin_suite "Full Install (1 controller + 2 brokers + exporter + topics)"
+# On any failure (e.g. a helm --wait timeout), dump cluster state so CI logs are
+# self-diagnosing instead of a bare "timed out waiting for the condition".
+dump_diagnostics() {
+  local rc=$?
+  [ "${rc}" -eq 0 ] && return 0
+  echo "=== FAILURE DIAGNOSTICS (rc=${rc}, namespace ${NAMESPACE}) ==="
+  kubectl get pods,jobs,certificate,issuer -n "${NAMESPACE}" 2>&1 || true
+  kubectl get events -n "${NAMESPACE}" --sort-by=.lastTimestamp 2>&1 | tail -25 || true
+  for p in $(kubectl get pods -n "${NAMESPACE}" -o name 2>/dev/null); do
+    echo "--- ${p} ---"
+    kubectl describe "${p}" -n "${NAMESPACE}" 2>&1 | sed -n '/Events:/,$p' | tail -12 || true
+    kubectl logs "${p}" -n "${NAMESPACE}" --all-containers --tail=40 2>&1 | tail -40 || true
+  done
+}
+trap dump_diagnostics EXIT
+
+begin_suite "Full Install (1 controller + 2 brokers + exporter + topics + ACLs, TLS/mTLS/SCRAM)"
 
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
+# TLS on by default (chart self-signed CA). The bootstrap Job provisions SCRAM
+# users, declared topics, and ACLs before helm returns.
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
   -n "${NAMESPACE}" \
   -f "${SCRIPT_DIR}/values-full-test.yaml" \
-  --wait --timeout 10m
+  --wait --timeout 12m
 
 CONTROLLER="${FULLNAME}-kafka-controller-0"
 BROKER_0="${FULLNAME}-kafka-broker-0"
 BROKER_1="${FULLNAME}-kafka-broker-1"
 
-# helm --wait already ensures pods are ready; verify phase directly
 ctrl_phase=$(kubectl get pod -n "${NAMESPACE}" "${CONTROLLER}" -o jsonpath='{.status.phase}')
 assert_eq "controller pod is Running" "Running" "${ctrl_phase}"
 
@@ -31,85 +48,90 @@ for pod in "${BROKER_0}" "${BROKER_1}"; do
   assert_eq "${pod} is Running" "Running" "${phase}"
 done
 
-# Wait for declared topics (topic init job runs as post-install/post-upgrade hook)
-BROKER_SVC="${BROKER_0}.${FULLNAME}-kafka-broker.${NAMESPACE}.svc.cluster.local:9092"
-KAFKA_CLI_SETUP='
-  KAFKA_USERNAME=$(cat /opt/kafka/secrets/username)
-  KAFKA_PASSWORD=$(cat /opt/kafka/secrets/password)
-  mkdir -p /tmp/kafka-config
-  cp /opt/kafka/config/kraft/client.properties /tmp/kafka-config/
-  sed -e "s|PLACEHOLDER_USERNAME|${KAFKA_USERNAME}|g" -e "s|PLACEHOLDER_PASSWORD|${KAFKA_PASSWORD}|g" \
-    /opt/kafka/config/kraft/client_jaas.conf.template > /tmp/kafka-config/client_jaas.conf
-  export KAFKA_OPTS="-Djava.security.auth.login.config=/tmp/kafka-config/client_jaas.conf"
-'
+# PKCS12 store password is deterministic: sha256("<release>-tls-store")[:32]
+STOREPASS=$(printf '%s' "${RELEASE}-tls-store" | sha256sum | cut -c1-32)
+TESTUSER_PW=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-kafka-secret" -o jsonpath='{.data.testuser-password}' | base64 -d)
+APPUSER_PW=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-kafka-secret" -o jsonpath='{.data.appuser-password}' | base64 -d)
 
-echo "  Waiting for declared topics to appear..."
-topics_output=""
-topic_timeout=60
-topic_elapsed=0
-while [[ ${topic_elapsed} -lt ${topic_timeout} ]]; do
-  topics_output=$(kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
-    ${KAFKA_CLI_SETUP}
-    /opt/kafka/bin/kafka-topics.sh \
-      --bootstrap-server ${BROKER_SVC} \
-      --list \
-      --command-config /tmp/kafka-config/client.properties 2>/dev/null
-  " 2>/dev/null || echo "")
-  if grep -q "test-topic-1" <<< "${topics_output}" && grep -q "test-topic-2" <<< "${topics_output}"; then
-    break
-  fi
-  sleep 2
-  topic_elapsed=$((topic_elapsed + 2))
-done
+# Write a SASL_SSL/SCRAM client config for a given user inside a pod.
+write_client_props() {
+  local pod="$1" user="$2" pw="$3"
+  kubectl exec -n "${NAMESPACE}" "${pod}" -- bash -c "cat > /tmp/${user}.properties <<EOF
+security.protocol=SASL_SSL
+sasl.mechanism=SCRAM-SHA-512
+sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username=\"${user}\" password=\"${pw}\";
+ssl.truststore.location=/opt/kafka/tls/truststore.p12
+ssl.truststore.password=${STOREPASS}
+ssl.truststore.type=PKCS12
+EOF"
+}
+
+write_client_props "${BROKER_0}" testuser "${TESTUSER_PW}"
+write_client_props "${BROKER_1}" testuser "${TESTUSER_PW}"
+write_client_props "${BROKER_0}" appuser "${APPUSER_PW}"
+
+BROKER_SVC="${BROKER_0}.${FULLNAME}-kafka-broker.${NAMESPACE}.svc.cluster.local:9092"
+BROKER_1_SVC="${BROKER_1}.${FULLNAME}-kafka-broker.${NAMESPACE}.svc.cluster.local:9092"
+
+# Declared topics were created by the bootstrap Job.
+topics_output=$(kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
+  /opt/kafka/bin/kafka-topics.sh --bootstrap-server ${BROKER_SVC} --list \
+    --command-config /tmp/testuser.properties 2>/dev/null
+" || echo "")
 assert_contains "test-topic-1 exists" "${topics_output}" "test-topic-1"
 assert_contains "test-topic-2 exists" "${topics_output}" "test-topic-2"
 
-# Batch topic describe + cross-broker produce/consume + topic list into single execs per broker
-# to minimize JVM startups
-
-# Describe topic and produce from broker-0 in one exec
-CROSS_TOPIC="cross-test-$(date +%s)"
-TEST_VALUE="cross-broker-$(date +%s)"
-
-broker0_output=$(kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
-  ${KAFKA_CLI_SETUP}
-
-  T1_DESC=\$(/opt/kafka/bin/kafka-topics.sh \
-    --bootstrap-server ${BROKER_SVC} \
-    --describe --topic test-topic-1 \
-    --command-config /tmp/kafka-config/client.properties 2>/dev/null \
-    | grep 'PartitionCount' | sed 's/.*PartitionCount:[[:space:]]*//' | cut -f1)
-  echo \"T1_PARTITIONS=\${T1_DESC}\"
-
-  echo '${TEST_VALUE}' | /opt/kafka/bin/kafka-console-producer.sh \
-    --bootstrap-server ${BROKER_SVC} \
-    --topic ${CROSS_TOPIC} \
-    --producer.config /tmp/kafka-config/client.properties 2>/dev/null
-  echo 'PRODUCE_DONE=true'
-" 2>/dev/null || echo "")
-
-t1_partitions=$(echo "${broker0_output}" | grep '^T1_PARTITIONS=' | head -1 | cut -d= -f2-)
+# test-topic-1 has 3 partitions
+t1_partitions=$(kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
+  /opt/kafka/bin/kafka-topics.sh --bootstrap-server ${BROKER_SVC} --describe --topic test-topic-1 \
+    --command-config /tmp/testuser.properties 2>/dev/null \
+    | grep 'PartitionCount' | sed 's/.*PartitionCount:[[:space:]]*//' | cut -f1
+" || echo "")
 assert_eq "test-topic-1 has 3 partitions" "3" "${t1_partitions}"
 
-# Consume from broker-1
-BROKER_1_SVC="${BROKER_1}.${FULLNAME}-kafka-broker.${NAMESPACE}.svc.cluster.local:9092"
+# Cross-broker produce (broker-0) / consume (broker-1) as the superuser
+CROSS_TOPIC="cross-test-$(date +%s)"
+TEST_VALUE="cross-broker-$(date +%s)"
+kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
+  echo '${TEST_VALUE}' | /opt/kafka/bin/kafka-console-producer.sh \
+    --bootstrap-server ${BROKER_SVC} --topic ${CROSS_TOPIC} \
+    --producer.config /tmp/testuser.properties
+"
 consumed=$(kubectl exec -n "${NAMESPACE}" "${BROKER_1}" -- bash -c "
-  ${KAFKA_CLI_SETUP}
-  # Write consumed message to a file so timeout exit code does not lose stdout
   timeout 60 /opt/kafka/bin/kafka-console-consumer.sh \
-    --bootstrap-server ${BROKER_1_SVC} \
-    --topic ${CROSS_TOPIC} \
-    --from-beginning \
-    --max-messages 1 \
-    --consumer.config /tmp/kafka-config/client.properties 2>/dev/null > /tmp/consumed.out || true
-  cat /tmp/consumed.out
-" 2>/dev/null || echo "")
+    --bootstrap-server ${BROKER_1_SVC} --topic ${CROSS_TOPIC} \
+    --from-beginning --max-messages 1 \
+    --consumer.config /tmp/testuser.properties 2>/dev/null
+" || echo "")
 assert_eq "cross-broker produce/consume works" "${TEST_VALUE}" "${consumed}"
+
+# --- ACL enforcement: appuser has a producer role on test-topic-1 ---
+acl_value="acl-$(date +%s)"
+acl_rc=0
+kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
+  echo '${acl_value}' | /opt/kafka/bin/kafka-console-producer.sh \
+    --bootstrap-server ${BROKER_SVC} --topic test-topic-1 \
+    --producer.config /tmp/appuser.properties
+" >/dev/null 2>&1 || acl_rc=$?
+assert_eq "appuser (producer ACL) can write to test-topic-1" "0" "${acl_rc}"
+
+# appuser has NO ACL on test-topic-2, so a write must be denied. Note that
+# kafka-console-producer exits 0 even on an authorization failure, so detect the
+# error message rather than the process exit code.
+deny_out=$(kubectl exec -n "${NAMESPACE}" "${BROKER_0}" -- bash -c "
+  echo 'nope' | /opt/kafka/bin/kafka-console-producer.sh \
+    --bootstrap-server ${BROKER_SVC} --topic test-topic-2 \
+    --producer.config /tmp/appuser.properties 2>&1
+" || true)
+if echo "${deny_out}" | grep -qiE 'authorization failed|TOPIC_AUTHORIZATION_FAILED'; then
+  pass "appuser without ACL is denied on test-topic-2"
+else
+  fail "appuser without ACL is denied on test-topic-2" "${deny_out}"
+fi
 
 # --- Exporter tests ---
 echo ""
 echo "  -- Exporter tests --"
-
 wait_for_deployment_ready "${NAMESPACE}" "${FULLNAME}-kafka-exporter" 300
 
 exporter_pod=$(kubectl get pods -n "${NAMESPACE}" -l "app.kubernetes.io/component=kafka-exporter" \
@@ -120,16 +142,20 @@ assert_eq "exporter pod is Running" "Running" "${exporter_phase}"
 exporter_port=$(kubectl get svc -n "${NAMESPACE}" "${FULLNAME}-kafka-exporter" -o jsonpath='{.spec.ports[0].port}')
 assert_eq "exporter service port is 9308" "9308" "${exporter_port}"
 
-# Fetch metrics via port-forward instead of spinning up an ephemeral pod
 exporter_svc="${FULLNAME}-kafka-exporter"
-kubectl port-forward -n "${NAMESPACE}" "svc/${exporter_svc}" 19308:9308 &
-PF_PID=$!
-sleep 1
-
-metrics_output=$(wget -qO- "http://127.0.0.1:19308/metrics" 2>/dev/null | grep -m1 '^kafka_' || echo "")
-kill "${PF_PID}" 2>/dev/null || true
-wait "${PF_PID}" 2>/dev/null || true
-
+# The exporter can restart a few times on a fresh cluster until the broker DNS
+# resolves, so poll /metrics until kafka_ series appear (bounded).
+metrics_output=""
+for _ in $(seq 1 12); do
+  kubectl port-forward -n "${NAMESPACE}" "svc/${exporter_svc}" 19308:9308 >/dev/null 2>&1 &
+  PF_PID=$!
+  sleep 3
+  metrics_output=$( { curl -sf "http://127.0.0.1:19308/metrics" 2>/dev/null || wget -qO- "http://127.0.0.1:19308/metrics" 2>/dev/null; } | grep -m1 '^kafka_' || echo "")
+  kill "${PF_PID}" 2>/dev/null || true
+  wait "${PF_PID}" 2>/dev/null || true
+  [ -n "${metrics_output}" ] && break
+  sleep 5
+done
 assert_contains "exporter returns kafka metrics" "${metrics_output}" "kafka_"
 
 end_suite

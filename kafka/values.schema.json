@@ -18,6 +18,9 @@
         "tls": {
           "type": "object",
           "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
             "certManager": {
               "type": "object",
               "properties": {
@@ -49,14 +52,52 @@
         "auth": {
           "type": "object",
           "properties": {
-            "sasl": {
+            "saslMechanism": {
+              "enum": ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"]
+            },
+            "allowInsecure": {
+              "type": "boolean"
+            },
+            "users": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "username": { "type": "string" },
+                  "password": { "type": "string" },
+                  "existingSecret": { "type": "string" },
+                  "existingSecretPasswordKey": { "type": "string" }
+                },
+                "required": ["username"]
+              }
+            },
+            "authorization": {
               "type": "object",
               "properties": {
-                "mechanism": {
-                  "enum": ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"]
+                "enabled": { "type": "boolean" },
+                "allowEveryoneIfNoAcl": { "type": "boolean" },
+                "superUsers": {
+                  "type": "array",
+                  "items": { "type": "string" }
                 },
-                "securityProtocol": {
-                  "enum": ["PLAINTEXT", "SASL_PLAINTEXT", "SASL_SSL", "SSL"]
+                "acls": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "principal": { "type": "string" },
+                      "role": { "enum": ["producer", "consumer", "admin"] },
+                      "topics": { "type": "array", "items": { "type": "string" } },
+                      "groups": { "type": "array", "items": { "type": "string" } },
+                      "operations": { "type": "array", "items": { "type": "string" } },
+                      "resourceType": { "enum": ["topic", "group", "cluster", "transactionalId"] },
+                      "resourceName": { "type": "string" },
+                      "patternType": { "enum": ["literal", "prefixed"] },
+                      "host": { "type": "string" },
+                      "permission": { "enum": ["allow", "deny"] }
+                    },
+                    "required": ["principal"]
+                  }
                 }
               }
             }

@@ -1,6 +1,7 @@
 {{- if .Values.kafka.enabled }}
 {{- $fullname := include "kafka.fullname" . }}
 {{- $namespace := default "default" .Release.Namespace }}
+{{- $mechanism := include "kafka.auth.mechanism" . }}
 
 Kafka cluster {{ $fullname }} is rolling out.
 
@@ -11,28 +12,54 @@ Controllers (KRaft quorum)
 - {{ $fullname }}-kafka-controller-{{ $i }}.{{ $fullname }}-kafka-controller.{{ $namespace }}.svc.cluster.local:9093
 {{- end }}
 
-Brokers
--------
+Brokers (client bootstrap)
+--------------------------
 {{- $replicas := int .Values.kafka.broker.replicaCount }}
 {{- range $i, $_ := until $replicas }}
 - {{ $fullname }}-kafka-broker-{{ $i }}.{{ $fullname }}-kafka-broker.{{ $namespace }}.svc.cluster.local:9092
 {{- end }}
 
-Authentication
---------------
-- SASL/PLAIN credentials stored in secret `{{ include "kafka.auth.secretName" . }}`
-- Client configuration mounted via configmap `{{ $fullname }}-kafka-broker-config`
+Security
+--------
 {{- if .Values.kafka.tls.enabled }}
-- TLS encryption enabled (SASL_SSL)
+- Transport: TLS. External clients use SASL_SSL on port 9092; inter-broker and
+  controller listeners use mutual TLS (mTLS).
 {{- else }}
-- TLS encryption disabled (SASL_PLAINTEXT)
+- Transport: INSECURE (kafka.auth.allowInsecure=true). Client credentials travel
+  in cleartext and inter-broker/controller traffic is unauthenticated. Do NOT use
+  in production.
+{{- end }}
+- Client authentication: SASL/{{ $mechanism }}.
+{{- if .Values.kafka.auth.authorization.enabled }}
+- Authorization: StandardAuthorizer (allow.everyone.if.no.acl.found={{ .Values.kafka.auth.authorization.allowEveryoneIfNoAcl }}).
+  Grant access with kafka.auth.authorization.acls.
+{{- end }}
+
+Users & credentials
+-------------------
+{{- range $u := .Values.kafka.auth.users }}
+{{- if $u.existingSecret }}
+- {{ $u.username }}: password sourced from existing secret `{{ $u.existingSecret }}`.
+{{- else }}
+- {{ $u.username }}: kubectl get secret {{ include "kafka.auth.secretName" $ }} -n {{ $namespace }} -o jsonpath='{.data.{{ $u.username }}-password}' | base64 -d
+{{- end }}
+{{- end }}
+
+Sample client.properties (external client, SASL/{{ $mechanism }}{{ if .Values.kafka.tls.enabled }} over TLS{{ end }}):
+
+  security.protocol={{ include "kafka.clientProtocol" . }}
+  sasl.mechanism={{ $mechanism }}
+  sasl.jaas.config={{ if eq $mechanism "PLAIN" }}org.apache.kafka.common.security.plain.PlainLoginModule{{ else }}org.apache.kafka.common.security.scram.ScramLoginModule{{ end }} required username="<user>" password="<password>";
+{{- if .Values.kafka.tls.enabled }}
+  ssl.truststore.type=PKCS12
+  ssl.truststore.location=<path-to-truststore.p12>   # built from the CA in secret {{ include "kafka.tls.secretName" . }}
 {{- end }}
 
 Topics
 ------
 {{- $topics := default (dict) .Values.kafka.topics }}
 {{- if eq (len $topics) 0 }}
-- No declarative topics were provided. Update `kafka.topics` to have the init job reconcile topics.
+- No declarative topics were provided. Update `kafka.topics` to have the bootstrap job reconcile topics.
 {{- else }}
 {{- range $name, $topic := $topics }}
 - {{ $name }} (partitions: {{ default 1 $topic.partitions }}, replication factor: {{ default 1 $topic.replicationFactor }})
@@ -52,8 +79,10 @@ Exporter
 
 Next Steps
 ----------
-- Wait for `kubectl rollout status statefulset/{{ $fullname }}-kafka-broker` to report success.
-- Distribute the SASL credentials to clients and begin provisioning topics.
+- StatefulSets use updateStrategy=OnDelete: after `helm upgrade`, restart pods one
+  at a time (`kubectl delete pod ...`), waiting for each to become Ready.
+- The bootstrap Job provisions SASL users, topics, and ACLs; check its logs if
+  clients cannot authenticate.
 {{- else }}
 Kafka workloads are disabled (`kafka.enabled=false`); no resources were rendered.
 {{- end }}

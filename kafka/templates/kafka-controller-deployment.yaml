@@ -74,6 +74,10 @@ spec:
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- with .Values.kafka.controller.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: kafka-tls-pem
               mountPath: /opt/kafka/tls-pem
@@ -102,12 +106,12 @@ spec:
 
               if [ ! -f "${LOG_DIR}/meta.properties" ]; then
                 mkdir -p /tmp/kafka-controller-config
-                cp /opt/kafka/config/kraft/server.properties /tmp/kafka-controller-config/
+                cp /opt/kafka/config/kraft/server-init.properties /tmp/kafka-controller-config/
 
-                sed -i "s/PLACEHOLDER_NODE_ID/$NODE_ID/g" /tmp/kafka-controller-config/server.properties
+                sed -i "s/PLACEHOLDER_NODE_ID/$NODE_ID/g" /tmp/kafka-controller-config/server-init.properties
 
                 /opt/kafka/bin/kafka-storage.sh format \
-                  --config /tmp/kafka-controller-config/server.properties \
+                  --config /tmp/kafka-controller-config/server-init.properties \
                   --cluster-id {{ include "kafka.kafka.clusterId" . | quote }} \
                   --ignore-formatted
               fi

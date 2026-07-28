@@ -1,11 +1,21 @@
 {{- if .Values.kafka.enabled }}
-{{- $brokerProtocol := include "kafka.broker.listenerProtocol" . -}}
-{{- $controllerSecProtocol := include "kafka.controller.listenerSecurityProtocol" . -}}
+{{- include "kafka.auth.validateTls" . }}
+{{- $fullname := include "kafka.fullname" . }}
+{{- $namespace := default "default" .Release.Namespace }}
+{{- $clientProto := include "kafka.clientProtocol" . }}
+{{- $internalProto := include "kafka.internalProtocol" . }}
+{{- $mechanism := include "kafka.auth.mechanism" . }}
+{{- $mechanismLower := include "kafka.auth.mechanismLower" . }}
+{{- $authz := .Values.kafka.auth.authorization.enabled }}
+{{- $tls := .Values.kafka.tls.enabled }}
+{{- $superUsers := include "kafka.auth.superUsers" . }}
+{{- $voters := include "kafka.kafka.controllerQuorumVoters" . }}
+{{- $principalRule := "RULE:^.*CN=([^,]+).*$/$1/,DEFAULT" }}
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "kafka.fullname" . }}-kafka-controller-config
+  name: {{ $fullname }}-kafka-controller-config
   labels:
     app.kubernetes.io/name: {{ include "kafka.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
@@ -14,43 +24,42 @@ metadata:
     app.kubernetes.io/part-of: {{ .Chart.Name }}
     helm.sh/chart: {{ include "kafka.chart" . }}
 data:
-  kafka_server_jaas.conf.template: |
-    KafkaServer {
-        org.apache.kafka.common.security.plain.PlainLoginModule required
-        username="PLACEHOLDER_USERNAME"
-        password="PLACEHOLDER_PASSWORD"
-        user_PLACEHOLDER_USERNAME="PLACEHOLDER_PASSWORD";
-    };
   server.properties: |
     process.roles=controller
     node.id=PLACEHOLDER_NODE_ID
-    controller.quorum.voters={{ include "kafka.kafka.controllerQuorumVoters" . }}
+    controller.quorum.voters={{ $voters }}
     listeners=CONTROLLER://:9093
-    listener.security.protocol.map=CONTROLLER:{{ $controllerSecProtocol }}
+    listener.security.protocol.map=CONTROLLER:{{ $internalProto }}
     controller.listener.names=CONTROLLER
     log.dirs={{ .Values.kafka.controller.logDir }}
-    {{- if .Values.kafka.tls.enabled }}
+    {{- if $authz }}
+    authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+    allow.everyone.if.no.acl.found={{ .Values.kafka.auth.authorization.allowEveryoneIfNoAcl }}
+    super.users={{ $superUsers }}
+    {{- end }}
+    {{- if $tls }}
     ssl.keystore.type=PKCS12
     ssl.keystore.location=/opt/kafka/tls/keystore.p12
     ssl.keystore.password={{ include "kafka.tls.storePassword" . }}
     ssl.truststore.type=PKCS12
     ssl.truststore.location=/opt/kafka/tls/truststore.p12
     ssl.truststore.password={{ include "kafka.tls.storePassword" . }}
-    ssl.endpoint.identification.algorithm=
+    listener.name.controller.ssl.client.auth=required
+    ssl.principal.mapping.rules={{ $principalRule }}
     {{- end }}
-  client.properties: |
-    security.protocol={{ $brokerProtocol }}
-    sasl.mechanism=PLAIN
-    {{- if .Values.kafka.tls.enabled }}
-    ssl.truststore.type=PKCS12
-    ssl.truststore.location=/opt/kafka/tls/truststore.p12
-    ssl.truststore.password={{ include "kafka.tls.storePassword" . }}
-    {{- end }}
+  server-init.properties: |
+    process.roles=controller
+    node.id=PLACEHOLDER_NODE_ID
+    controller.quorum.voters={{ $voters }}
+    listeners=CONTROLLER://:9093
+    listener.security.protocol.map=CONTROLLER:{{ $internalProto }}
+    controller.listener.names=CONTROLLER
+    log.dirs={{ .Values.kafka.controller.logDir }}
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "kafka.fullname" . }}-kafka-broker-config
+  name: {{ $fullname }}-kafka-broker-config
   labels:
     app.kubernetes.io/name: {{ include "kafka.name" . }}
     app.kubernetes.io/instance: {{ .Release.Name }}
@@ -59,22 +68,20 @@ metadata:
     app.kubernetes.io/part-of: {{ .Chart.Name }}
     helm.sh/chart: {{ include "kafka.chart" . }}
 data:
-  kafka_server_jaas.conf.template: |
-    KafkaServer {
-        org.apache.kafka.common.security.plain.PlainLoginModule required
-        username="PLACEHOLDER_USERNAME"
-        password="PLACEHOLDER_PASSWORD"
-        user_PLACEHOLDER_USERNAME="PLACEHOLDER_PASSWORD";
-    };
   server.properties: |
     process.roles=broker
     node.id=PLACEHOLDER_NODE_ID
-    controller.quorum.voters={{ include "kafka.kafka.controllerQuorumVoters" . }}
-    listeners={{ $brokerProtocol }}://:9092
-    listener.security.protocol.map={{ $brokerProtocol }}:{{ $brokerProtocol }},CONTROLLER:{{ $controllerSecProtocol }}
+    controller.quorum.voters={{ $voters }}
+    listeners=CLIENT://:9092,INTERNAL://:9094
+    listener.security.protocol.map=CLIENT:{{ $clientProto }},INTERNAL:{{ $internalProto }},CONTROLLER:{{ $internalProto }}
     controller.listener.names=CONTROLLER
-    advertised.listeners={{ $brokerProtocol }}://PLACEHOLDER_POD_NAME.{{ include "kafka.fullname" . }}-kafka-broker.{{ default "default" .Release.Namespace }}.svc.cluster.local:9092
-    inter.broker.listener.name={{ $brokerProtocol }}
+    inter.broker.listener.name=INTERNAL
+    advertised.listeners=CLIENT://PLACEHOLDER_POD_NAME.{{ $fullname }}-kafka-broker.{{ $namespace }}.svc.cluster.local:9092,INTERNAL://PLACEHOLDER_POD_NAME.{{ $fullname }}-kafka-broker.{{ $namespace }}.svc.cluster.local:9094
+    sasl.enabled.mechanisms={{ $mechanism }}
+    listener.name.client.sasl.enabled.mechanisms={{ $mechanism }}
+    {{- if ne $mechanism "PLAIN" }}
+    listener.name.client.{{ $mechanismLower }}.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required;
+    {{- end }}
     num.partitions={{ .Values.kafka.broker.config.numPartitions }}
     default.replication.factor={{ .Values.kafka.broker.config.defaultReplicationFactor }}
     min.insync.replicas={{ .Values.kafka.broker.config.minInsyncReplicas }}
@@ -91,17 +98,21 @@ data:
     auto.create.topics.enable={{ .Values.kafka.autoCreateTopicsEnable }}
     delete.topic.enable={{ .Values.kafka.deleteTopicEnable }}
     log.dirs={{ .Values.kafka.broker.logDir }}
-    sasl.enabled.mechanisms=PLAIN
-    sasl.mechanism.inter.broker.protocol=PLAIN
-    sasl.jaas.config=/opt/kafka/config/kraft/kafka_server_jaas.conf
-    {{- if .Values.kafka.tls.enabled }}
+    {{- if $authz }}
+    authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer
+    allow.everyone.if.no.acl.found={{ .Values.kafka.auth.authorization.allowEveryoneIfNoAcl }}
+    super.users={{ $superUsers }}
+    {{- end }}
+    {{- if $tls }}
     ssl.keystore.type=PKCS12
     ssl.keystore.location=/opt/kafka/tls/keystore.p12
     ssl.keystore.password={{ include "kafka.tls.storePassword" . }}
     ssl.truststore.type=PKCS12
     ssl.truststore.location=/opt/kafka/tls/truststore.p12
     ssl.truststore.password={{ include "kafka.tls.storePassword" . }}
-    ssl.endpoint.identification.algorithm=
+    listener.name.internal.ssl.client.auth=required
+    listener.name.controller.ssl.client.auth=required
+    ssl.principal.mapping.rules={{ $principalRule }}
     {{- end }}
     {{- range $key, $value := .Values.kafka.broker.extraConfig }}
     {{ $key }}={{ $value }}
@@ -109,34 +120,11 @@ data:
   server-init.properties: |
     process.roles=broker
     node.id=PLACEHOLDER_NODE_ID
-    controller.quorum.voters={{ include "kafka.kafka.controllerQuorumVoters" . }}
-    listeners={{ $brokerProtocol }}://:9092
-    listener.security.protocol.map={{ $brokerProtocol }}:{{ $brokerProtocol }},CONTROLLER:{{ $controllerSecProtocol }}
+    controller.quorum.voters={{ $voters }}
+    listeners=CLIENT://:9092,INTERNAL://:9094
+    listener.security.protocol.map=CLIENT:{{ $clientProto }},INTERNAL:{{ $internalProto }},CONTROLLER:{{ $internalProto }}
     controller.listener.names=CONTROLLER
-    inter.broker.listener.name={{ $brokerProtocol }}
-    num.partitions={{ .Values.kafka.broker.config.numPartitions }}
-    default.replication.factor={{ .Values.kafka.broker.config.defaultReplicationFactor }}
-    offsets.topic.replication.factor={{ .Values.kafka.broker.config.offsetsTopicReplicationFactor }}
-    transaction.state.log.min.isr={{ .Values.kafka.broker.config.transactionStateLogMinIsr }}
-    transaction.state.log.replication.factor={{ .Values.kafka.broker.config.transactionStateLogReplicationFactor }}
-    auto.create.topics.enable={{ .Values.kafka.autoCreateTopicsEnable }}
-    delete.topic.enable={{ .Values.kafka.deleteTopicEnable }}
+    inter.broker.listener.name=INTERNAL
+    sasl.enabled.mechanisms={{ $mechanism }}
     log.dirs={{ .Values.kafka.broker.logDir }}
-    sasl.enabled.mechanisms=PLAIN
-    sasl.mechanism.inter.broker.protocol=PLAIN
-    sasl.jaas.config=/opt/kafka/config/kraft/kafka_server_jaas.conf
-  client.properties: |
-    security.protocol={{ $brokerProtocol }}
-    sasl.mechanism=PLAIN
-    {{- if .Values.kafka.tls.enabled }}
-    ssl.truststore.type=PKCS12
-    ssl.truststore.location=/tmp/kafka-config/truststore.p12
-    ssl.truststore.password={{ include "kafka.tls.storePassword" . }}
-    {{- end }}
-  client_jaas.conf.template: |
-    KafkaClient {
-        org.apache.kafka.common.security.plain.PlainLoginModule required
-        username="PLACEHOLDER_USERNAME"
-        password="PLACEHOLDER_PASSWORD";
-    };
 {{- end }}
