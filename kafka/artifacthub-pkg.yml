@@ -1,7 +1,7 @@
-version: 0.4.0
+version: 0.4.1
 name: kafka
 displayName: Kafka
-createdAt: "2026-07-27T00:00:00Z"
+createdAt: "2026-07-29T00:00:00Z"
 description: Apache Kafka in KRaft mode (no ZooKeeper) with SASL authentication, TLS, declarative topic management, and a metrics exporter
 homeURL: "https://cagriekin.github.io/charts"
 logoPath: ""
@@ -17,19 +17,5 @@ links:
     url: https://github.com/cagriekin/charts
 screenshots: []
 changes:
-  - kind: security
-    description: "Pod-scope NetworkPolicy intra-cluster traffic: the controller quorum port (9093) is now reachable only from broker/controller pods instead of the whole namespace, and all egress is restricted to specific component pods. Client (9092) and metrics (9308) ingress remain namespace-scoped with override hooks."
-  - kind: security
-    description: "Require TLS by default; run without it only with the explicit kafka.auth.allowInsecure opt-in."
-  - kind: security
-    description: "Inter-broker and controller listeners now use mutual TLS (mTLS) via a dedicated INTERNAL listener on port 9094."
-  - kind: security
-    description: "External client authentication defaults to SASL/SCRAM-SHA-512 (SCRAM-SHA-256 and PLAIN also supported); credentials are no longer written into any JAAS file or config for SCRAM."
-  - kind: security
-    description: "Enable StandardAuthorizer with deny-by-default and declarative multi-user ACL roles (producer/consumer/admin) plus a raw ACL escape hatch."
-  - kind: added
-    description: "Multi-user support with per-user passwords generated randomly on first install and persisted across upgrades."
-  - kind: added
-    description: "Chart-managed self-signed CA (cert-manager) is used by default when no issuerRef or existingSecret is provided, so the chart installs out-of-the-box with TLS/mTLS."
   - kind: changed
-    description: "BREAKING: the kafka.auth API was replaced. kafka.auth.username/password/existingSecret/existingSecretKeys/sasl are removed in favour of kafka.auth.users, kafka.auth.saslMechanism, kafka.auth.allowInsecure, and kafka.auth.authorization. See values.yaml."
+    description: "Remove ArgoCD-specific hook annotations from the topic-init Job; Helm hooks (post-install/post-upgrade) are honored natively by ArgoCD."
