@@ -84,13 +84,20 @@ spec:
       - name: kafka-topic-init
         image: {{ .Values.kafka.image.registry }}/{{ .Values.kafka.image.repository }}:{{ .Values.kafka.image.tag }}
         imagePullPolicy: {{ .Values.kafka.image.pullPolicy }}
+        env:
+          # The Kafka CLI tools default to -Xmx256M; with only 256Mi of container
+          # memory the JVM (heap + metaspace + stacks) is OOM-killed, which surfaces
+          # as silent AdminClient connection timeouts. Cap the heap and give the
+          # container headroom for heap + JVM overhead.
+          - name: KAFKA_HEAP_OPTS
+            value: "-Xmx192m -Xms64m"
         resources:
           requests:
             cpu: 50m
-            memory: 64Mi
+            memory: 128Mi
           limits:
             cpu: 200m
-            memory: 256Mi
+            memory: 512Mi
         command:
         - /bin/bash
         - -c

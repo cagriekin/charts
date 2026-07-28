@@ -72,7 +72,7 @@ data:
     process.roles=broker
     node.id=PLACEHOLDER_NODE_ID
     controller.quorum.voters={{ $voters }}
-    listeners=CLIENT://:9092,INTERNAL://:9094,CONTROLLER://:9093
+    listeners=CLIENT://:9092,INTERNAL://:9094
     listener.security.protocol.map=CLIENT:{{ $clientProto }},INTERNAL:{{ $internalProto }},CONTROLLER:{{ $internalProto }}
     controller.listener.names=CONTROLLER
     inter.broker.listener.name=INTERNAL
@@ -121,7 +121,7 @@ data:
     process.roles=broker
     node.id=PLACEHOLDER_NODE_ID
     controller.quorum.voters={{ $voters }}
-    listeners=CLIENT://:9092,INTERNAL://:9094,CONTROLLER://:9093
+    listeners=CLIENT://:9092,INTERNAL://:9094
     listener.security.protocol.map=CLIENT:{{ $clientProto }},INTERNAL:{{ $internalProto }},CONTROLLER:{{ $internalProto }}
     controller.listener.names=CONTROLLER
     inter.broker.listener.name=INTERNAL
