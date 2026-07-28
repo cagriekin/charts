@@ -56,7 +56,7 @@ spec:
             - -c
             - |
               set -e
-              STORE_PASS="{{ include "kafka.tls.storePassword" . }}"
+              STORE_PASS="${KAFKA_TLS_STORE_PASSWORD}"
 
               openssl pkcs12 -export \
                 -in /opt/kafka/tls-pem/{{ .Values.kafka.tls.certFilename }} \
@@ -70,6 +70,8 @@ spec:
                 -storetype PKCS12 \
                 -storepass "${STORE_PASS}" \
                 -noprompt -alias ca
+          env:
+            {{- include "kafka.tls.storePasswordEnv" . | nindent 12 }}
           {{- with .Values.kafka.controller.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
@@ -154,6 +156,9 @@ spec:
               cp /opt/kafka/config/kraft/server.properties /tmp/kafka-config/
 
               sed -i "s/PLACEHOLDER_NODE_ID/${NODE_ID}/g" /tmp/kafka-config/server.properties
+              {{- if .Values.kafka.tls.enabled }}
+              sed -i "s|PLACEHOLDER_STORE_PASSWORD|${KAFKA_TLS_STORE_PASSWORD}|g" /tmp/kafka-config/server.properties
+              {{- end }}
 
               exec /opt/kafka/bin/kafka-server-start.sh /tmp/kafka-config/server.properties
           ports:
@@ -185,6 +190,9 @@ spec:
               value: {{ .Values.kafka.controller.jvm.heapOpts | quote }}
             - name: KAFKA_JVM_PERFORMANCE_OPTS
               value: {{ .Values.kafka.controller.jvm.performanceOpts | quote }}
+            {{- if .Values.kafka.tls.enabled }}
+            {{- include "kafka.tls.storePasswordEnv" . | nindent 12 }}
+            {{- end }}
           {{- with .Values.kafka.controller.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}

@@ -54,7 +54,7 @@ spec:
         - -c
         - |
           set -e
-          STORE_PASS="{{ include "kafka.tls.storePassword" . }}"
+          STORE_PASS="${KAFKA_TLS_STORE_PASSWORD}"
           openssl pkcs12 -export \
             -in /opt/kafka/tls-pem/{{ .Values.kafka.tls.certFilename }} \
             -inkey /opt/kafka/tls-pem/{{ .Values.kafka.tls.keyFilename }} \
@@ -66,6 +66,8 @@ spec:
             -storetype PKCS12 \
             -storepass "${STORE_PASS}" \
             -noprompt -alias ca
+        env:
+          {{- include "kafka.tls.storePasswordEnv" . | nindent 10 }}
         resources:
           requests:
             cpu: 50m
@@ -91,6 +93,9 @@ spec:
           # and a container with headroom.
           - name: KAFKA_HEAP_OPTS
             value: "-Xmx256m -Xms64m"
+          {{- if $tls }}
+          {{- include "kafka.tls.storePasswordEnv" . | nindent 10 }}
+          {{- end }}
         resources:
           requests:
             cpu: 50m
@@ -115,10 +120,10 @@ spec:
           security.protocol=SSL
           ssl.keystore.type=PKCS12
           ssl.keystore.location=/tmp/kafka-tls/keystore.p12
-          ssl.keystore.password={{ include "kafka.tls.storePassword" . }}
+          ssl.keystore.password=${KAFKA_TLS_STORE_PASSWORD}
           ssl.truststore.type=PKCS12
           ssl.truststore.location=/tmp/kafka-tls/truststore.p12
-          ssl.truststore.password={{ include "kafka.tls.storePassword" . }}
+          ssl.truststore.password=${KAFKA_TLS_STORE_PASSWORD}
           EOF
           {{- else }}
           cat > "$CC" <<EOF

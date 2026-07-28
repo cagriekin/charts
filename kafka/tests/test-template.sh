@@ -68,6 +68,11 @@ assert_contains "defaults: self-signed Issuer created" "${defaults}" "test-kafka
 assert_contains "defaults: CA Issuer created" "${defaults}" "test-kafka-kafka-ca"
 assert_contains "defaults: leaf Certificate created" "${defaults}" "kind: Certificate"
 assert_contains "defaults: tls-init init container present" "${defaults}" "tls-init"
+# TLS store password: random, in a Secret, never baked into the ConfigMap (#243)
+assert_contains "defaults: store password persisted in Secret" "${defaults}" "tls-store-password:"
+assert_contains "defaults: ConfigMap uses store-password placeholder" "${defaults}" "ssl.keystore.password=PLACEHOLDER_STORE_PASSWORD"
+assert_contains "defaults: store password injected via secretKeyRef env" "${defaults}" "KAFKA_TLS_STORE_PASSWORD"
+assert_not_contains "defaults: no predictable -tls-store password derivation" "${defaults}" "sha256sum"
 
 # --- TLS with an operator-supplied cert-manager issuer ---
 tls_cm=$(helm template test-kafka "${CHART_DIR}" \

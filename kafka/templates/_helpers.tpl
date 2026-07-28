@@ -289,10 +289,41 @@ Generate a content-based suffix for the Kafka bootstrap job so updates trigger a
 {{- end }}
 
 {{/*
-Generate deterministic TLS PKCS12 store password.
+Secret key under which the random TLS PKCS12 store password is persisted (in the
+chart-managed Secret named by kafka.auth.secretName).
 */}}
-{{- define "kafka.tls.storePassword" -}}
-{{- printf "%s-tls-store" .Release.Name | sha256sum | trunc 32 -}}
+{{- define "kafka.tls.storePasswordKey" -}}
+tls-store-password
+{{- end }}
+
+{{/*
+Resolve the TLS PKCS12 keystore/truststore password at render time (used only by
+the Secret template). Random per install, persisted across upgrades via lookup of
+the existing chart Secret. randAlphaNum keeps it free of sed/JAAS-special chars.
+The value is never written into a ConfigMap: workloads read it from the Secret via
+env (secretKeyRef) and substitute the PLACEHOLDER_STORE_PASSWORD marker at startup.
+*/}}
+{{- define "kafka.tls.storePasswordValue" -}}
+{{- $ns := default "default" .Release.Namespace -}}
+{{- $key := include "kafka.tls.storePasswordKey" . | trim -}}
+{{- $existing := lookup "v1" "Secret" $ns (include "kafka.auth.secretName" .) -}}
+{{- if and $existing (hasKey ($existing.data | default dict) $key) -}}
+{{- index $existing.data $key | b64dec -}}
+{{- else -}}
+{{- randAlphaNum 32 -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Env var injecting the TLS store password into a container from the chart Secret.
+Usage: {{- include "kafka.tls.storePasswordEnv" . | nindent 12 }}
+*/}}
+{{- define "kafka.tls.storePasswordEnv" -}}
+- name: KAFKA_TLS_STORE_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "kafka.auth.secretName" . }}
+      key: {{ include "kafka.tls.storePasswordKey" . | trim }}
 {{- end }}
 
 {{/*
