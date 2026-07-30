@@ -123,6 +123,7 @@ spec:
           ssl.truststore.type=PKCS12
           ssl.truststore.location=/tmp/kafka-tls/truststore.p12
           ssl.truststore.password=${STORE_PASS}
+          ssl.endpoint.identification.algorithm={{ include "kafka.tls.endpointIdentificationAlgorithm" . }}
           EOF
           {{- else }}
           cat > "$CC" <<EOF

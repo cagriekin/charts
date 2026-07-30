@@ -1,4 +1,4 @@
-version: 0.4.2
+version: 0.4.3
 name: kafka
 displayName: Kafka
 createdAt: "2026-07-30T00:00:00Z"
@@ -17,5 +17,5 @@ links:
     url: https://github.com/cagriekin/charts
 screenshots: []
 changes:
-  - kind: added
-    description: "Fail-fast validation of kafka.controller.replicaCount: rejects counts < 1 that cannot form a KRaft quorum. Even counts are permitted (KRaft accepts them; they are simply suboptimal)."
+  - kind: security
+    description: "Enable TLS hostname verification (ssl.endpoint.identification.algorithm=https) explicitly on broker, controller and client SSL connections; configurable via kafka.tls.endpointIdentificationAlgorithm, defaulting to https when unset and rejecting invalid values."

@@ -64,6 +64,7 @@ assert_contains "defaults: mTLS on internal listener" "${defaults}" "listener.na
 assert_contains "defaults: SCRAM-SHA-512 mechanism" "${defaults}" "sasl.enabled.mechanisms=SCRAM-SHA-512"
 assert_contains "defaults: StandardAuthorizer" "${defaults}" "StandardAuthorizer"
 assert_contains "defaults: deny by default" "${defaults}" "allow.everyone.if.no.acl.found=false"
+assert_contains "defaults: TLS hostname verification on" "${defaults}" "ssl.endpoint.identification.algorithm=https"
 assert_contains "defaults: self-signed Issuer created" "${defaults}" "test-kafka-kafka-selfsigned"
 assert_contains "defaults: CA Issuer created" "${defaults}" "test-kafka-kafka-ca"
 assert_contains "defaults: leaf Certificate created" "${defaults}" "kind: Certificate"
@@ -115,6 +116,21 @@ assert_contains "insecure: SASL_PLAINTEXT client listener" "${insecure}" "CLIENT
 assert_contains "insecure: ANONYMOUS super-user" "${insecure}" "User:ANONYMOUS"
 assert_not_contains "insecure: no Certificate" "${insecure}" "kind: Certificate"
 assert_not_contains "insecure: no tls-init" "${insecure}" "tls-init"
+
+# --- TLS hostname verification is configurable (escape hatch) ---
+noverify=$(helm template test-kafka "${CHART_DIR}" \
+  --set kafka.tls.endpointIdentificationAlgorithm="" 2>&1)
+assert_contains "tls-noverify: verification can be disabled" "${noverify}" "ssl.endpoint.identification.algorithm="
+assert_not_contains "tls-noverify: not left as https" "${noverify}" "ssl.endpoint.identification.algorithm=https"
+
+# Unset key (e.g. a values override that drops it) must default to https, not empty.
+eia_unset=$(helm template test-kafka "${CHART_DIR}" --set kafka.tls.endpointIdentificationAlgorithm=null 2>&1)
+assert_contains "tls-eia: unset key defaults to https" "${eia_unset}" "ssl.endpoint.identification.algorithm=https"
+
+# An invalid value must fail the render, not pass through to CrashLoop the brokers.
+eia_bad=$(helm template test-kafka "${CHART_DIR}" --set kafka.tls.endpointIdentificationAlgorithm=HTTPS 2>&1) && eia_bad_rc=0 || eia_bad_rc=$?
+assert_eq "tls-eia: invalid value fails render" "1" "${eia_bad_rc}"
+assert_contains "tls-eia: error names the setting" "${eia_bad}" "endpointIdentificationAlgorithm must be"
 
 # --- Guard: TLS disabled without the insecure opt-in fails ---
 guard=$(helm template test-kafka "${CHART_DIR}" \

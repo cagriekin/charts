@@ -45,6 +45,7 @@ data:
     ssl.truststore.type=PKCS12
     ssl.truststore.location=/opt/kafka/tls/truststore.p12
     ssl.truststore.password=PLACEHOLDER_STORE_PASSWORD
+    ssl.endpoint.identification.algorithm={{ include "kafka.tls.endpointIdentificationAlgorithm" . }}
     listener.name.controller.ssl.client.auth=required
     ssl.principal.mapping.rules={{ $principalRule }}
     {{- end }}
@@ -111,6 +112,7 @@ data:
     ssl.truststore.type=PKCS12
     ssl.truststore.location=/opt/kafka/tls/truststore.p12
     ssl.truststore.password=PLACEHOLDER_STORE_PASSWORD
+    ssl.endpoint.identification.algorithm={{ include "kafka.tls.endpointIdentificationAlgorithm" . }}
     listener.name.internal.ssl.client.auth=required
     listener.name.controller.ssl.client.auth=required
     ssl.principal.mapping.rules={{ $principalRule }}
