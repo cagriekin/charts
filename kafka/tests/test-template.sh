@@ -36,6 +36,8 @@ assert_contains "full: controller statefulset present" "${full}" "kafka-controll
 assert_contains "full: broker statefulset present" "${full}" "kafka-broker"
 assert_contains "full: exporter deployment present" "${full}" "kafka-exporter"
 assert_contains "full: topic init job present" "${full}" "kafka-topic-init"
+assert_contains "full: topic init keeps Helm hook" "${full}" "helm.sh/hook: post-install,post-upgrade"
+assert_not_contains "full: topic init has no ArgoCD hook annotations" "${full}" "argocd.argoproj.io"
 assert_contains "full: topics configmap present" "${full}" "kafka-topics"
 assert_contains "full: exporter service present" "${full}" "port: 9308"
 assert_contains "full: controller port 9093" "${full}" "port: 9093"

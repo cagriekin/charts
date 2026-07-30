@@ -1,4 +1,4 @@
-version: 0.4.3
+version: 0.4.4
 name: kafka
 displayName: Kafka
 createdAt: "2026-07-30T00:00:00Z"
@@ -17,5 +17,5 @@ links:
     url: https://github.com/cagriekin/charts
 screenshots: []
 changes:
-  - kind: security
-    description: "Enable TLS hostname verification (ssl.endpoint.identification.algorithm=https) explicitly on broker, controller and client SSL connections; configurable via kafka.tls.endpointIdentificationAlgorithm, defaulting to https when unset and rejecting invalid values."
+  - kind: changed
+    description: "Remove ArgoCD-specific hook annotations from the topic-init Job; Helm hooks (post-install/post-upgrade) are honored natively by ArgoCD."

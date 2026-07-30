@@ -11,11 +11,11 @@ kind: Job
 metadata:
   name: {{ $jobName }}
   annotations:
+    # Helm hooks run the job after the brokers are up. ArgoCD natively honors
+    # these helm.sh/hook annotations (post-install/post-upgrade map to a PostSync
+    # hook), so no ArgoCD-specific hook annotations are needed on chart resources.
     helm.sh/hook: post-install,post-upgrade
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
-    argocd.argoproj.io/hook: PostSync
-    argocd.argoproj.io/hook-delete-policy: HookSucceeded,BeforeHookCreation
-    argocd.argoproj.io/sync-options: Replace=true
     # One-shot Job: liveness/readiness probes are not applicable (the container runs
     # to completion). Resources are still set; only the probe policy checks are waived.
     ignore-check.kube-linter.io/no-liveness-probe: "one-shot topic-init job"
