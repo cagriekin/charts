@@ -1,7 +1,7 @@
-version: 0.4.1
+version: 0.4.2
 name: kafka
 displayName: Kafka
-createdAt: "2026-07-29T00:00:00Z"
+createdAt: "2026-07-30T00:00:00Z"
 description: Apache Kafka in KRaft mode (no ZooKeeper) with SASL authentication, TLS, declarative topic management, and a metrics exporter
 homeURL: "https://cagriekin.github.io/charts"
 logoPath: ""
@@ -18,4 +18,4 @@ links:
 screenshots: []
 changes:
   - kind: added
-    description: "Fail-fast validation of kafka.controller.replicaCount: rejects counts < 1 and even counts, which cannot form a healthy KRaft quorum."
+    description: "Fail-fast validation of kafka.controller.replicaCount: rejects counts < 1 that cannot form a KRaft quorum. Even counts are permitted (KRaft accepts them; they are simply suboptimal)."

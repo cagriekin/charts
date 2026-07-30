@@ -56,7 +56,10 @@ spec:
             - -c
             - |
               set -e
-              STORE_PASS="{{ include "kafka.tls.storePassword" . }}"
+              # Ephemeral per-pod store password: generated here, shared with the
+              # main container via the kafka-tls emptyDir, never persisted off-pod.
+              STORE_PASS="$(openssl rand -hex 16)"
+              printf '%s' "${STORE_PASS}" > /opt/kafka/tls/store-pass
 
               openssl pkcs12 -export \
                 -in /opt/kafka/tls-pem/{{ .Values.kafka.tls.certFilename }} \
@@ -154,6 +157,10 @@ spec:
               cp /opt/kafka/config/kraft/server.properties /tmp/kafka-config/
 
               sed -i "s/PLACEHOLDER_NODE_ID/${NODE_ID}/g" /tmp/kafka-config/server.properties
+              {{- if .Values.kafka.tls.enabled }}
+              STORE_PASS="$(cat /opt/kafka/tls/store-pass)"
+              sed -i "s|PLACEHOLDER_STORE_PASSWORD|${STORE_PASS}|g" /tmp/kafka-config/server.properties
+              {{- end }}
 
               exec /opt/kafka/bin/kafka-server-start.sh /tmp/kafka-config/server.properties
           ports:

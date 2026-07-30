@@ -48,20 +48,19 @@ for pod in "${BROKER_0}" "${BROKER_1}"; do
   assert_eq "${pod} is Running" "Running" "${phase}"
 done
 
-# PKCS12 store password is deterministic: sha256("<release>-tls-store")[:32]
-STOREPASS=$(printf '%s' "${RELEASE}-tls-store" | sha256sum | cut -c1-32)
 TESTUSER_PW=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-kafka-secret" -o jsonpath='{.data.testuser-password}' | base64 -d)
 APPUSER_PW=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-kafka-secret" -o jsonpath='{.data.appuser-password}' | base64 -d)
 
-# Write a SASL_SSL/SCRAM client config for a given user inside a pod.
+# Write a SASL_SSL/SCRAM client config for a given user inside a pod. The PKCS12
+# store password is ephemeral and per-pod, so read it from the pod we write into.
 write_client_props() {
   local pod="$1" user="$2" pw="$3"
-  kubectl exec -n "${NAMESPACE}" "${pod}" -- bash -c "cat > /tmp/${user}.properties <<EOF
+  kubectl exec -n "${NAMESPACE}" "${pod}" -- bash -c "SP=\$(cat /opt/kafka/tls/store-pass); cat > /tmp/${user}.properties <<EOF
 security.protocol=SASL_SSL
 sasl.mechanism=SCRAM-SHA-512
 sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username=\"${user}\" password=\"${pw}\";
 ssl.truststore.location=/opt/kafka/tls/truststore.p12
-ssl.truststore.password=${STOREPASS}
+ssl.truststore.password=\${SP}
 ssl.truststore.type=PKCS12
 EOF"
 }
