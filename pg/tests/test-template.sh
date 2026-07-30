@@ -2888,5 +2888,87 @@ casc_repmgrd=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/statefulset.yaml 2>&1)
 assert_not_contains "#29: repmgrd mode never gets CASCADE_REPLICATION (agent-only)" "${casc_repmgrd}" "CASCADE_REPLICATION"
 
+# ======================================================================
+# #262: postgresql.extraVolumes / extraVolumeMounts / extraEnv passthrough,
+# its render-time guards, and the repmgr shared_preload_libraries merge that
+# the review surfaced (previously audit-gated -> silently dropped repmgr).
+# ======================================================================
+xv_args=(--set-json 'postgresql.extraVolumes=[{"name":"pgsodium-key","secret":{"secretName":"pgsodium-root-key","defaultMode":256}}]'
+         --set-json 'postgresql.extraVolumeMounts=[{"name":"pgsodium-key","mountPath":"/etc/postgresql/pgsodium","readOnly":true}]'
+         --set-json 'postgresql.extraEnv=[{"name":"SOME_FLAG","value":"1"},{"name":"KEY_REF","valueFrom":{"secretKeyRef":{"name":"s","key":"k"}}}]')
+
+# Agent mode (the HA path the pgsodium failover case depends on)
+xv_agent=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  "${xv_args[@]}" --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#262 agent: extra volume renders on the pod" "${xv_agent}" "secretName: pgsodium-root-key"
+assert_contains "#262 agent: extra mount renders on the container" "${xv_agent}" "mountPath: /etc/postgresql/pgsodium"
+assert_contains "#262 agent: extraEnv value form renders" "${xv_agent}" 'name: SOME_FLAG'
+assert_contains "#262 agent: extraEnv valueFrom form renders" "${xv_agent}" 'secretKeyRef:'
+
+# Default render must be byte-stable: nothing extra when the values are unset
+xv_default=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#262 off: no extra volume by default" "${xv_default}" "pgsodium-key"
+
+# extraVolumes alone must open the volumes block with persistence ON (the new gate
+# clause): with repmgr/tls/pgbackrest/extensions/configuration all off and persistence
+# on, no other condition renders a `volumes:` block.
+xv_gate=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-minimal.yaml" \
+  --set postgresql.persistence.enabled=true \
+  --set-json 'postgresql.extraVolumes=[{"name":"pgsodium-key","emptyDir":{}}]' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#262 gate: extraVolumes alone opens the volumes block" "${xv_gate}" "pgsodium-key"
+
+# --- guards: each plausible mistake must fail the render, not apply/runtime ---
+guard_fails() { # name, extra helm args...
+  local name="$1"; shift
+  local rc=0
+  helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-minimal.yaml" "$@" >/dev/null 2>&1 || rc=$?
+  assert_eq "${name}" "1" "$([ "${rc}" -ne 0 ] && echo 1 || echo 0)"
+}
+guard_fails "#262 guard: extraEnv as a map fails fast"          --set-json 'postgresql.extraEnv={"FOO":"bar"}'
+guard_fails "#262 guard: extraVolumes as a map fails fast"      --set-json 'postgresql.extraVolumes={"name":"x"}'
+guard_fails "#262 guard: extraVolumes without a name fails"     --set-json 'postgresql.extraVolumes=[{"emptyDir":{}}]'
+guard_fails "#262 guard: extraVolumes colliding with data fails" --set-json 'postgresql.extraVolumes=[{"name":"data","emptyDir":{}}]'
+guard_fails "#262 guard: extraVolumes colliding with repmgr-config fails" --set-json 'postgresql.extraVolumes=[{"name":"repmgr-config","emptyDir":{}}]'
+guard_fails "#262 guard: duplicate extraVolumes name fails"     --set-json 'postgresql.extraVolumes=[{"name":"a","emptyDir":{}},{"name":"a","emptyDir":{}}]'
+guard_fails "#262 guard: dangling extraVolumeMounts fails"      --set-json 'postgresql.extraVolumeMounts=[{"name":"typo","mountPath":"/x"}]'
+guard_fails "#262 guard: extraVolumeMounts without mountPath fails" --set-json 'postgresql.extraVolumes=[{"name":"a","emptyDir":{}}]' --set-json 'postgresql.extraVolumeMounts=[{"name":"a"}]'
+guard_fails "#262 guard: extraEnv reusing PGDATA fails"         --set-json 'postgresql.extraEnv=[{"name":"PGDATA","value":"/x"}]'
+guard_fails "#262 guard: extraEnv reusing POSTGRES_PASSWORD fails" --set-json 'postgresql.extraEnv=[{"name":"POSTGRES_PASSWORD","value":"x"}]'
+guard_fails "#262 guard: extraEnv reusing a disabled-feature name (REPMGR_DB) fails" --set-json 'postgresql.extraEnv=[{"name":"REPMGR_DB","value":"x"}]'
+guard_fails "#262 guard: duplicate extraEnv name fails"         --set-json 'postgresql.extraEnv=[{"name":"A","value":"1"},{"name":"A","value":"2"}]'
+
+# --- shared_preload_libraries: repmgr must survive an operator-set value with audit OFF ---
+spl_repmgr=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=true --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
+  --set-string postgresql.configuration.shared_preload_libraries=pgsodium \
+  --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#262 preload: audit off keeps repmgr (merged)" "${spl_repmgr}" "shared_preload_libraries = 'repmgr,pgsodium'"
+assert_not_contains "#262 preload: bare operator value is not left in custom.conf" "${spl_repmgr}" "shared_preload_libraries = 'pgsodium'"
+# audit ON: unchanged behaviour (pgaudit.conf stays authoritative)
+spl_audit=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=true --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
+  --set postgresql.audit.enabled=true \
+  --set-string postgresql.configuration.shared_preload_libraries=pgsodium \
+  --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#262 preload: audit on merges repmgr + operator + pgaudit" "${spl_audit}" "shared_preload_libraries = 'repmgr,pgsodium,pgaudit'"
+# standalone: nothing to preserve, operator value passes through untouched
+spl_standalone=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 \
+  --set-string postgresql.configuration.shared_preload_libraries=pgsodium \
+  --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#262 preload: standalone passes the value through" "${spl_standalone}" "shared_preload_libraries = 'pgsodium'"
+assert_not_contains "#262 preload: standalone adds no repmgr" "${spl_standalone}" "repmgr,pgsodium"
+
+# --- pgvector parity (symlinked templates + its own values defaults) ---
+pgv_xv=$(helm template test-pgv "${PGVECTOR_DIR}" "${xv_args[@]}" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#262 pgvector: extra volume renders" "${pgv_xv}" "secretName: pgsodium-root-key"
+assert_contains "#262 pgvector: extra mount renders" "${pgv_xv}" "mountPath: /etc/postgresql/pgsodium"
+pgv_guard_rc=0
+helm template test-pgv "${PGVECTOR_DIR}" --set-json 'postgresql.extraEnv=[{"name":"PGDATA","value":"/x"}]' >/dev/null 2>&1 || pgv_guard_rc=$?
+assert_eq "#262 pgvector: guards apply too" "1" "$([ "${pgv_guard_rc}" -ne 0 ] && echo 1 || echo 0)"
+
 end_suite
 print_summary

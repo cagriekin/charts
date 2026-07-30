@@ -177,6 +177,9 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 |-----------|-------------|---------|
 | `postgresql.configuration` | Map of postgresql.conf parameters | `{}` |
 | `postgresql.pgHba` | List of pg_hba.conf entries injected via postStart | `[]` |
+| `postgresql.extraVolumes` | Extra pod-level volumes — mount a file identically on every replica (e.g. a pgsodium key); see the [pg chart README](../pg/README.md#mounting-an-extra-file-on-every-replica) | `[]` |
+| `postgresql.extraVolumeMounts` | Extra mounts for the postgresql container; each must reference a `postgresql.extraVolumes` entry | `[]` |
+| `postgresql.extraEnv` | Extra env vars for the postgresql container (supports `value` and `valueFrom`); may not reuse a chart-set name | `[]` |
 | `postgresql.extensions.enabled` | Enable extensions support | `true` |
 | `postgresql.audit.enabled` | Enable pgaudit audit logging (requires repmgr mode; see [Audit logging](#audit-logging-pgaudit)) | `false` |
 | `postgresql.audit.log` | pgaudit session classes: `read,write,function,role,ddl,misc,misc_set,all` (negate with `-`) | `"ddl, role, write"` |

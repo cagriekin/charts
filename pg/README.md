@@ -162,6 +162,9 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 |-----------|-------------|---------|
 | `postgresql.configuration` | Map of postgresql.conf parameters | `{}` |
 | `postgresql.pgHba` | List of pg_hba.conf entries injected via postStart | `[]` |
+| `postgresql.extraVolumes` | Extra pod-level volumes (see [Mounting an extra file on every replica](#mounting-an-extra-file-on-every-replica)) | `[]` |
+| `postgresql.extraVolumeMounts` | Extra mounts for the postgresql container; each must reference a `postgresql.extraVolumes` entry | `[]` |
+| `postgresql.extraEnv` | Extra env vars for the postgresql container (supports `value` and `valueFrom`); may not reuse a chart-set name | `[]` |
 | `postgresql.extensions.enabled` | Enable extensions support | `false` |
 | `postgresql.audit.enabled` | Enable pgaudit audit logging (requires repmgr mode; see [Audit logging](#audit-logging-pgaudit)) | `false` |
 | `postgresql.audit.log` | pgaudit session classes: `read,write,function,role,ddl,misc,misc_set,all` (negate with `-`) | `"ddl, role, write"` |
@@ -194,6 +197,42 @@ postgresql:
 ```
 
 When `repmgr.enabled` is true, `additionalCommands` automatically discover the current primary and execute against it, so DDL statements like `CREATE EXTENSION` work correctly regardless of which pod the hook runs on (including standbys after a failover).
+
+### Mounting an extra file on every replica
+
+Some extensions read a key or config file from disk that **must be byte-identical on the primary and every standby** — otherwise a promoted standby behaves differently after a failover. The canonical case is **pgsodium** (the basis of Supabase Vault): its server root key is loaded by `pgsodium.getkey_script`, and if a standby has a different key it cannot decrypt `supabase_vault` secrets once promoted — a silent, post-failover data-availability failure.
+
+Mount the file with `postgresql.extraVolumes` + `postgresql.extraVolumeMounts`. Because these render into the StatefulSet pod template, every replica gets the same file, and it survives failover and a `pg_rewind` rejoin:
+
+```yaml
+postgresql:
+  extraVolumes:
+    - name: pgsodium-key
+      secret:
+        secretName: pgsodium-root-key
+        defaultMode: 0400
+        items:
+          - key: getkey.sh
+            path: getkey.sh
+  extraVolumeMounts:
+    - name: pgsodium-key
+      mountPath: /etc/postgresql/pgsodium
+      readOnly: true
+  configuration:
+    shared_preload_libraries: pgsodium
+    pgsodium.getkey_script: /etc/postgresql/pgsodium/getkey.sh
+```
+
+In repmgr mode the chart merges `repmgr` into `shared_preload_libraries` for you — declare only your own libraries. (A bare value in `configuration` is loaded via `include_dir` *after* the image's own `postgresql.conf`, so without that merge it would override the image's `shared_preload_libraries = 'repmgr'` and silently disable failover.)
+
+`postgresql.extraEnv` does the same for environment variables and accepts both `value` and `valueFrom`.
+
+These three values are validated at render time, so a mistake fails `helm install`/`upgrade` with a clear message instead of at apply time or silently at runtime:
+
+- each must be a **list** of objects (a map is a common slip and would otherwise produce an opaque YAML parse error);
+- an `extraVolumes` name may not collide with a chart-managed volume (`data`, `postgresql-config`, `postgresql-tls`, `ext-lib`, `ext-share`, `repmgr-config`, `etcd-tls`, `pg-run`, `pgbackrest-config`, `service-updater-script`) — a `data` collision is silently dropped in favour of the volumeClaimTemplate;
+- every `extraVolumeMounts` entry must reference a declared `extraVolumes` entry (catches the `extraVolume:`/`extraVolumes:` typo, which the API server would otherwise reject only at apply time);
+- `extraEnv` may not reuse a chart-set env name (`PGDATA`, `POSTGRES_*`, `REPMGR_*`, …) — duplicate env names are last-wins at runtime, so an override would silently shadow the chart/Secret value.
 
 ### Repmgr Parameters
 
