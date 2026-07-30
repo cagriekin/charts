@@ -125,10 +125,16 @@ tests:
           value: postgresql
 
   # --- Scenario 9: extraVolumes/extraVolumeMounts/extraEnv passthrough (#262) ---
+  # persistence.enabled=true ON PURPOSE: values-minimal disables persistence, and
+  # `(not persistence.enabled)` already renders a `volumes:` block on its own. With
+  # persistence ON (and repmgr/tls/pgbackrest/extensions/configuration all off in
+  # minimal), extraVolumes is the ONLY reason the block renders -- so this actually
+  # exercises the new render gate instead of passing tautologically.
   - it: extra passthrough renders volume, mount on postgresql container, and env
     values:
       - ../values-minimal.yaml
     set:
+      postgresql.persistence.enabled: true
       postgresql.extraVolumes:
         - name: pgsodium-key
           secret:
@@ -141,26 +147,51 @@ tests:
       postgresql.extraEnv:
         - name: SOME_FLAG
           value: "1"
+        - name: PGSODIUM_KEY_REF
+          valueFrom:
+            secretKeyRef:
+              name: pgsodium-root-key
+              key: pgsodium.key
     template: templates/statefulset.yaml
     asserts:
-      # Pod-level volume present (block renders even with persistence off + repmgr off)
+      # extraVolumes alone opens the volumes block (persistence on, no other volume feature)
       - equal:
           path: spec.template.spec.volumes[?(@.name=="pgsodium-key")].secret.secretName
           value: pgsodium-root-key
+      - equal:
+          path: spec.template.spec.volumes[?(@.name=="pgsodium-key")].secret.defaultMode
+          value: 256 # 0400 octal
+      # The ephemeral data volume must NOT be there -- persistence is on (PVC template)
+      - notExists:
+          path: spec.template.spec.volumes[?(@.name=="data")]
       # Mounted on the postgresql container
       - equal:
           path: spec.template.spec.containers[?(@.name=="postgresql")].volumeMounts[?(@.name=="pgsodium-key")].mountPath
           value: /etc/postgresql/pgsodium
-      # Env injected onto the postgresql container
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].volumeMounts[?(@.name=="pgsodium-key")].readOnly
+          value: true
+      # Env injected onto the postgresql container -- both value and valueFrom forms
       - equal:
           path: spec.template.spec.containers[?(@.name=="postgresql")].env[?(@.name=="SOME_FLAG")].value
           value: "1"
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env[?(@.name=="PGSODIUM_KEY_REF")].valueFrom.secretKeyRef.name
+          value: pgsodium-root-key
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env[?(@.name=="PGSODIUM_KEY_REF")].valueFrom.secretKeyRef.key
+          value: pgsodium.key
 
-  - it: no extra passthrough renders nothing extra by default (minimal has no volumes block)
+  - it: no extra volumes, mounts or env by default
     values:
       - ../values-minimal.yaml
     template: templates/statefulset.yaml
     asserts:
-      # minimal (persistence off) still renders the ephemeral data volume, but no stray extras
+      # minimal (persistence off) still renders the ephemeral `data` volume, so assert
+      # on the absence of the extras specifically, not on the volumes block as a whole.
       - notExists:
           path: spec.template.spec.volumes[?(@.name=="pgsodium-key")]
+      - notExists:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].volumeMounts[?(@.name=="pgsodium-key")]
+      - notExists:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env[?(@.name=="SOME_FLAG")]
