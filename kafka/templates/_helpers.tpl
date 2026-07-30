@@ -220,6 +220,19 @@ Fail the render when TLS is disabled without an explicit insecure opt-in.
 {{- end }}
 
 {{/*
+Fail the render when the controller replicaCount cannot form a KRaft quorum at
+all (< 1). Even counts are permitted -- KRaft accepts them; they are simply
+suboptimal (an even count adds no fault tolerance over the next-lower odd count),
+so the chart does not block them. Prefer 1 for dev or 3/5 for production.
+*/}}
+{{- define "kafka.controller.validateReplicaCount" -}}
+{{- $replicas := int .Values.kafka.controller.replicaCount -}}
+{{- if lt $replicas 1 -}}
+{{- fail (printf "kafka.controller.replicaCount must be >= 1 for a KRaft controller quorum (got %d)." $replicas) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Generate Kafka controller quorum voters string for multi-controller KRaft.
 Format: 1@controller-0.svc:9093,2@controller-1.svc:9093,3@controller-2.svc:9093
 */}}

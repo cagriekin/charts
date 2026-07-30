@@ -1,5 +1,6 @@
 {{- if .Values.kafka.enabled }}
 {{- include "kafka.auth.validateTls" . }}
+{{- include "kafka.controller.validateReplicaCount" . }}
 {{- $fullname := include "kafka.fullname" . }}
 {{- $namespace := default "default" .Release.Namespace }}
 {{- $clientProto := include "kafka.clientProtocol" . }}
