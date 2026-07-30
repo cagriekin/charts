@@ -211,6 +211,25 @@ SSL enables mTLS via ssl.client.auth=required; PLAINTEXT is insecure.
 {{- end }}
 
 {{/*
+Resolved TLS endpoint identification algorithm (hostname verification), used on
+every SSL config block. Defaults to "https" when the key is unset -- including
+when a user override replaces the whole kafka.tls map and drops the key -- so
+verification is never silently disabled. An explicit empty string disables it
+(documented escape hatch). Any other value fails the render up front instead of
+CrashLooping brokers on an invalid Kafka config.
+*/}}
+{{- define "kafka.tls.endpointIdentificationAlgorithm" -}}
+{{- $eia := "https" -}}
+{{- if hasKey .Values.kafka.tls "endpointIdentificationAlgorithm" -}}
+{{- $eia = .Values.kafka.tls.endpointIdentificationAlgorithm -}}
+{{- end -}}
+{{- if not (or (eq $eia "https") (eq $eia "")) -}}
+{{- fail (printf "kafka.tls.endpointIdentificationAlgorithm must be \"https\" (verify hostnames, default) or \"\" (disable, INSECURE); got %q." $eia) -}}
+{{- end -}}
+{{- $eia -}}
+{{- end }}
+
+{{/*
 Fail the render when TLS is disabled without an explicit insecure opt-in.
 */}}
 {{- define "kafka.auth.validateTls" -}}

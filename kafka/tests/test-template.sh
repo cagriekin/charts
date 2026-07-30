@@ -113,6 +113,15 @@ noverify=$(helm template test-kafka "${CHART_DIR}" \
 assert_contains "tls-noverify: verification can be disabled" "${noverify}" "ssl.endpoint.identification.algorithm="
 assert_not_contains "tls-noverify: not left as https" "${noverify}" "ssl.endpoint.identification.algorithm=https"
 
+# Unset key (e.g. a values override that drops it) must default to https, not empty.
+eia_unset=$(helm template test-kafka "${CHART_DIR}" --set kafka.tls.endpointIdentificationAlgorithm=null 2>&1)
+assert_contains "tls-eia: unset key defaults to https" "${eia_unset}" "ssl.endpoint.identification.algorithm=https"
+
+# An invalid value must fail the render, not pass through to CrashLoop the brokers.
+eia_bad=$(helm template test-kafka "${CHART_DIR}" --set kafka.tls.endpointIdentificationAlgorithm=HTTPS 2>&1) && eia_bad_rc=0 || eia_bad_rc=$?
+assert_eq "tls-eia: invalid value fails render" "1" "${eia_bad_rc}"
+assert_contains "tls-eia: error names the setting" "${eia_bad}" "endpointIdentificationAlgorithm must be"
+
 # --- Guard: TLS disabled without the insecure opt-in fails ---
 guard=$(helm template test-kafka "${CHART_DIR}" \
   --set kafka.tls.enabled=false 2>&1) && guard_rc=0 || guard_rc=$?

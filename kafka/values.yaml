@@ -24,9 +24,14 @@ kafka:
     # TLS hostname verification for inter-broker, controller-quorum and client
     # SSL connections. "https" (default) verifies the peer certificate SANs match
     # the host being dialed, closing the MITM window inside the trust domain. The
-    # chart-managed certificate already carries the per-pod service SANs. Set to ""
-    # to disable verification (INSECURE) only for a documented edge case, e.g. an
-    # existingSecret whose certificate lacks the required SANs.
+    # chart-managed certificate already carries the per-pod service SANs. Only
+    # "https" and "" are accepted; any other value fails the render. If the key is
+    # omitted entirely (e.g. a values override that replaces this whole tls map),
+    # it defaults to "https" so verification is never silently disabled.
+    # Set to "" to disable verification (INSECURE) only for a documented edge case,
+    # e.g. an existingSecret (or a custom kafka.bootstrapServer host) whose
+    # certificate lacks the required SANs -- prefer adding the host to
+    # certManager.additionalDnsNames instead of turning verification off.
     endpointIdentificationAlgorithm: https
     certManager:
       issuerRef:
