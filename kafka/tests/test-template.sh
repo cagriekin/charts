@@ -66,10 +66,21 @@ assert_contains "defaults: mTLS on internal listener" "${defaults}" "listener.na
 assert_contains "defaults: SCRAM-SHA-512 mechanism" "${defaults}" "sasl.enabled.mechanisms=SCRAM-SHA-512"
 assert_contains "defaults: StandardAuthorizer" "${defaults}" "StandardAuthorizer"
 assert_contains "defaults: deny by default" "${defaults}" "allow.everyone.if.no.acl.found=false"
+assert_contains "defaults: TLS hostname verification on" "${defaults}" "ssl.endpoint.identification.algorithm=https"
 assert_contains "defaults: self-signed Issuer created" "${defaults}" "test-kafka-kafka-selfsigned"
 assert_contains "defaults: CA Issuer created" "${defaults}" "test-kafka-kafka-ca"
 assert_contains "defaults: leaf Certificate created" "${defaults}" "kind: Certificate"
 assert_contains "defaults: tls-init init container present" "${defaults}" "tls-init"
+# TLS store password (#243): ephemeral, generated per-pod at runtime, never baked
+# into a ConfigMap OR a Secret, and no render-time value (so GitOps stays stable).
+assert_contains "defaults: ConfigMap uses store-password placeholder" "${defaults}" "ssl.keystore.password=PLACEHOLDER_STORE_PASSWORD"
+assert_contains "defaults: store password generated at runtime" "${defaults}" "openssl rand -hex 16"
+assert_contains "defaults: store password shared via emptyDir file" "${defaults}" "/opt/kafka/tls/store-pass"
+assert_not_contains "defaults: store password not in a Secret" "${defaults}" "tls-store-password:"
+assert_not_contains "defaults: no store-password secretKeyRef env" "${defaults}" "KAFKA_TLS_STORE_PASSWORD"
+# No release-name-derived store password anywhere in the rendered output (#243).
+old_derived=$(printf '%s' "test-kafka-tls-store" | sha256sum | cut -c1-32)
+assert_not_contains "defaults: store password is not release-name-derived" "${defaults}" "${old_derived}"
 
 # --- TLS with an operator-supplied cert-manager issuer ---
 tls_cm=$(helm template test-kafka "${CHART_DIR}" \
@@ -108,12 +119,41 @@ assert_contains "insecure: ANONYMOUS super-user" "${insecure}" "User:ANONYMOUS"
 assert_not_contains "insecure: no Certificate" "${insecure}" "kind: Certificate"
 assert_not_contains "insecure: no tls-init" "${insecure}" "tls-init"
 
+# --- TLS hostname verification is configurable (escape hatch) ---
+noverify=$(helm template test-kafka "${CHART_DIR}" \
+  --set kafka.tls.endpointIdentificationAlgorithm="" 2>&1)
+assert_contains "tls-noverify: verification can be disabled" "${noverify}" "ssl.endpoint.identification.algorithm="
+assert_not_contains "tls-noverify: not left as https" "${noverify}" "ssl.endpoint.identification.algorithm=https"
+
+# Unset key (e.g. a values override that drops it) must default to https, not empty.
+eia_unset=$(helm template test-kafka "${CHART_DIR}" --set kafka.tls.endpointIdentificationAlgorithm=null 2>&1)
+assert_contains "tls-eia: unset key defaults to https" "${eia_unset}" "ssl.endpoint.identification.algorithm=https"
+
+# An invalid value must fail the render, not pass through to CrashLoop the brokers.
+eia_bad=$(helm template test-kafka "${CHART_DIR}" --set kafka.tls.endpointIdentificationAlgorithm=HTTPS 2>&1) && eia_bad_rc=0 || eia_bad_rc=$?
+assert_eq "tls-eia: invalid value fails render" "1" "${eia_bad_rc}"
+assert_contains "tls-eia: error names the setting" "${eia_bad}" "endpointIdentificationAlgorithm must be"
+
 # --- Guard: TLS disabled without the insecure opt-in fails ---
 guard=$(helm template test-kafka "${CHART_DIR}" \
   --set kafka.tls.enabled=false 2>&1) && guard_rc=0 || guard_rc=$?
 
 assert_eq "guard: template fails when TLS disabled without allowInsecure" "1" "${guard_rc}"
 assert_contains "guard: error mentions allowInsecure" "${guard}" "kafka.auth.allowInsecure"
+
+# --- Guard: controller replicaCount must form a healthy KRaft quorum ---
+qzero=$(helm template test-kafka "${CHART_DIR}" \
+  --set kafka.controller.replicaCount=0 2>&1) && qzero_rc=0 || qzero_rc=$?
+assert_eq "guard: template fails when controller replicaCount < 1" "1" "${qzero_rc}"
+assert_contains "guard: error mentions >= 1" "${qzero}" "must be >= 1"
+
+qeven=$(helm template test-kafka "${CHART_DIR}" \
+  --set kafka.controller.replicaCount=2 2>&1) && qeven_rc=0 || qeven_rc=$?
+assert_eq "guard: even controller replicaCount is permitted (KRaft accepts it)" "0" "${qeven_rc}"
+
+qodd=$(helm template test-kafka "${CHART_DIR}" \
+  --set kafka.controller.replicaCount=1 2>&1) && qodd_rc=0 || qodd_rc=$?
+assert_eq "guard: template succeeds with odd controller replicaCount" "0" "${qodd_rc}"
 
 end_suite
 print_summary

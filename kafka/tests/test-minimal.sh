@@ -65,8 +65,9 @@ assert_contains "cert-manager issued the broker TLS secret" "${tls_secret}" "sec
 # --- SASL_SSL + SCRAM produce/consume as a client user ---
 BROKER_SVC="${BROKER}.${FULLNAME}-kafka-broker.${NAMESPACE}.svc.cluster.local:9092"
 PASSWORD=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-kafka-secret" -o jsonpath="{.data.${USER_NAME}-password}" | base64 -d)
-# PKCS12 store password is deterministic: sha256("<release>-tls-store")[:32]
-STOREPASS=$(printf '%s' "${RELEASE}-tls-store" | sha256sum | cut -c1-32)
+# PKCS12 store password is an ephemeral per-pod value generated at runtime and
+# shared within the pod; read it from the broker we exec into below.
+STOREPASS=$(kubectl exec -n "${NAMESPACE}" "${BROKER}" -- cat /opt/kafka/tls/store-pass)
 
 # Write a SASL_SSL/SCRAM client config inside the broker pod (reuses the pod's
 # mTLS truststore, which trusts the chart CA).

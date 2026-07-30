@@ -211,11 +211,43 @@ SSL enables mTLS via ssl.client.auth=required; PLAINTEXT is insecure.
 {{- end }}
 
 {{/*
+Resolved TLS endpoint identification algorithm (hostname verification), used on
+every SSL config block. Defaults to "https" when the key is unset -- including
+when a user override replaces the whole kafka.tls map and drops the key -- so
+verification is never silently disabled. An explicit empty string disables it
+(documented escape hatch). Any other value fails the render up front instead of
+CrashLooping brokers on an invalid Kafka config.
+*/}}
+{{- define "kafka.tls.endpointIdentificationAlgorithm" -}}
+{{- $eia := "https" -}}
+{{- if hasKey .Values.kafka.tls "endpointIdentificationAlgorithm" -}}
+{{- $eia = .Values.kafka.tls.endpointIdentificationAlgorithm -}}
+{{- end -}}
+{{- if not (or (eq $eia "https") (eq $eia "")) -}}
+{{- fail (printf "kafka.tls.endpointIdentificationAlgorithm must be \"https\" (verify hostnames, default) or \"\" (disable, INSECURE); got %q." $eia) -}}
+{{- end -}}
+{{- $eia -}}
+{{- end }}
+
+{{/*
 Fail the render when TLS is disabled without an explicit insecure opt-in.
 */}}
 {{- define "kafka.auth.validateTls" -}}
 {{- if and (not .Values.kafka.tls.enabled) (not .Values.kafka.auth.allowInsecure) -}}
 {{- fail "kafka.tls.enabled is false but kafka.auth.allowInsecure is not set. Production requires TLS: set kafka.tls.enabled=true (with kafka.tls.certManager.issuerRef.name or kafka.tls.existingSecret), or explicitly set kafka.auth.allowInsecure=true to run WITHOUT TLS (INSECURE: client credentials travel in cleartext and inter-broker/controller traffic is unauthenticated)." -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Fail the render when the controller replicaCount cannot form a KRaft quorum at
+all (< 1). Even counts are permitted -- KRaft accepts them; they are simply
+suboptimal (an even count adds no fault tolerance over the next-lower odd count),
+so the chart does not block them. Prefer 1 for dev or 3/5 for production.
+*/}}
+{{- define "kafka.controller.validateReplicaCount" -}}
+{{- $replicas := int .Values.kafka.controller.replicaCount -}}
+{{- if lt $replicas 1 -}}
+{{- fail (printf "kafka.controller.replicaCount must be >= 1 for a KRaft controller quorum (got %d)." $replicas) -}}
 {{- end -}}
 {{- end }}
 
@@ -289,11 +321,15 @@ Generate a content-based suffix for the Kafka bootstrap job so updates trigger a
 {{- end }}
 
 {{/*
-Generate deterministic TLS PKCS12 store password.
+The TLS PKCS12 keystore/truststore password is NOT rendered by the chart. The
+stores are rebuilt from the mounted PEM on every pod start, so the password only
+needs to be consistent within a single pod for that pod's lifetime. Each pod's
+tls-init container generates a fresh random password at runtime and writes it to
+a shared emptyDir file (STORE_PASS_FILE); the main container reads it and
+substitutes the PLACEHOLDER_STORE_PASSWORD marker into server.properties. The
+value therefore lives in no ConfigMap and no Secret, and no render-time value is
+produced -- so GitOps (ArgoCD/Flux) renders stay stable.
 */}}
-{{- define "kafka.tls.storePassword" -}}
-{{- printf "%s-tls-store" .Release.Name | sha256sum | trunc 32 -}}
-{{- end }}
 
 {{/*
 Return the TLS secret name. Uses existingSecret if set, otherwise the
