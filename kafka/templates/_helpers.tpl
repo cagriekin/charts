@@ -220,18 +220,15 @@ Fail the render when TLS is disabled without an explicit insecure opt-in.
 {{- end }}
 
 {{/*
-Fail the render when the controller replicaCount cannot form a healthy KRaft
-quorum. The quorum needs an odd number of voters (>= 1): an even count adds a
-voter without improving fault tolerance and only widens the split-brain surface
-(2 voters tolerate 0 failures, same as 1; 4 tolerate 1, same as 3).
+Fail the render when the controller replicaCount cannot form a KRaft quorum at
+all (< 1). Even counts are permitted -- KRaft accepts them; they are simply
+suboptimal (an even count adds no fault tolerance over the next-lower odd count),
+so the chart does not block them. Prefer 1 for dev or 3/5 for production.
 */}}
 {{- define "kafka.controller.validateReplicaCount" -}}
 {{- $replicas := int .Values.kafka.controller.replicaCount -}}
 {{- if lt $replicas 1 -}}
 {{- fail (printf "kafka.controller.replicaCount must be >= 1 for a KRaft controller quorum (got %d)." $replicas) -}}
-{{- end -}}
-{{- if eq (mod $replicas 2) 0 -}}
-{{- fail (printf "kafka.controller.replicaCount must be odd to form a healthy KRaft quorum; got %d. Use 1 for dev or 3/5 for production (an even count adds no fault tolerance over the next-lower odd count)." $replicas) -}}
 {{- end -}}
 {{- end }}
 

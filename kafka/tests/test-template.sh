@@ -121,8 +121,7 @@ assert_contains "guard: error mentions >= 1" "${qzero}" "must be >= 1"
 
 qeven=$(helm template test-kafka "${CHART_DIR}" \
   --set kafka.controller.replicaCount=2 2>&1) && qeven_rc=0 || qeven_rc=$?
-assert_eq "guard: template fails when controller replicaCount is even" "1" "${qeven_rc}"
-assert_contains "guard: error mentions odd" "${qeven}" "must be odd"
+assert_eq "guard: even controller replicaCount is permitted (KRaft accepts it)" "0" "${qeven_rc}"
 
 qodd=$(helm template test-kafka "${CHART_DIR}" \
   --set kafka.controller.replicaCount=1 2>&1) && qodd_rc=0 || qodd_rc=$?
