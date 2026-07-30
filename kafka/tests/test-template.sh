@@ -68,6 +68,16 @@ assert_contains "defaults: self-signed Issuer created" "${defaults}" "test-kafka
 assert_contains "defaults: CA Issuer created" "${defaults}" "test-kafka-kafka-ca"
 assert_contains "defaults: leaf Certificate created" "${defaults}" "kind: Certificate"
 assert_contains "defaults: tls-init init container present" "${defaults}" "tls-init"
+# TLS store password (#243): ephemeral, generated per-pod at runtime, never baked
+# into a ConfigMap OR a Secret, and no render-time value (so GitOps stays stable).
+assert_contains "defaults: ConfigMap uses store-password placeholder" "${defaults}" "ssl.keystore.password=PLACEHOLDER_STORE_PASSWORD"
+assert_contains "defaults: store password generated at runtime" "${defaults}" "openssl rand -hex 16"
+assert_contains "defaults: store password shared via emptyDir file" "${defaults}" "/opt/kafka/tls/store-pass"
+assert_not_contains "defaults: store password not in a Secret" "${defaults}" "tls-store-password:"
+assert_not_contains "defaults: no store-password secretKeyRef env" "${defaults}" "KAFKA_TLS_STORE_PASSWORD"
+# No release-name-derived store password anywhere in the rendered output (#243).
+old_derived=$(printf '%s' "test-kafka-tls-store" | sha256sum | cut -c1-32)
+assert_not_contains "defaults: store password is not release-name-derived" "${defaults}" "${old_derived}"
 
 # --- TLS with an operator-supplied cert-manager issuer ---
 tls_cm=$(helm template test-kafka "${CHART_DIR}" \

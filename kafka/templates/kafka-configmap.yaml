@@ -40,10 +40,10 @@ data:
     {{- if $tls }}
     ssl.keystore.type=PKCS12
     ssl.keystore.location=/opt/kafka/tls/keystore.p12
-    ssl.keystore.password={{ include "kafka.tls.storePassword" . }}
+    ssl.keystore.password=PLACEHOLDER_STORE_PASSWORD
     ssl.truststore.type=PKCS12
     ssl.truststore.location=/opt/kafka/tls/truststore.p12
-    ssl.truststore.password={{ include "kafka.tls.storePassword" . }}
+    ssl.truststore.password=PLACEHOLDER_STORE_PASSWORD
     listener.name.controller.ssl.client.auth=required
     ssl.principal.mapping.rules={{ $principalRule }}
     {{- end }}
@@ -106,10 +106,10 @@ data:
     {{- if $tls }}
     ssl.keystore.type=PKCS12
     ssl.keystore.location=/opt/kafka/tls/keystore.p12
-    ssl.keystore.password={{ include "kafka.tls.storePassword" . }}
+    ssl.keystore.password=PLACEHOLDER_STORE_PASSWORD
     ssl.truststore.type=PKCS12
     ssl.truststore.location=/opt/kafka/tls/truststore.p12
-    ssl.truststore.password={{ include "kafka.tls.storePassword" . }}
+    ssl.truststore.password=PLACEHOLDER_STORE_PASSWORD
     listener.name.internal.ssl.client.auth=required
     listener.name.controller.ssl.client.auth=required
     ssl.principal.mapping.rules={{ $principalRule }}
