@@ -308,11 +308,15 @@ Generate a content-based suffix for the Kafka bootstrap job so updates trigger a
 {{- end }}
 
 {{/*
-Generate deterministic TLS PKCS12 store password.
+The TLS PKCS12 keystore/truststore password is NOT rendered by the chart. The
+stores are rebuilt from the mounted PEM on every pod start, so the password only
+needs to be consistent within a single pod for that pod's lifetime. Each pod's
+tls-init container generates a fresh random password at runtime and writes it to
+a shared emptyDir file (STORE_PASS_FILE); the main container reads it and
+substitutes the PLACEHOLDER_STORE_PASSWORD marker into server.properties. The
+value therefore lives in no ConfigMap and no Secret, and no render-time value is
+produced -- so GitOps (ArgoCD/Flux) renders stay stable.
 */}}
-{{- define "kafka.tls.storePassword" -}}
-{{- printf "%s-tls-store" .Release.Name | sha256sum | trunc 32 -}}
-{{- end }}
 
 {{/*
 Return the TLS secret name. Uses existingSecret if set, otherwise the

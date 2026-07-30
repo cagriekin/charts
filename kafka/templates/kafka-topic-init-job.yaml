@@ -54,7 +54,10 @@ spec:
         - -c
         - |
           set -e
-          STORE_PASS="{{ include "kafka.tls.storePassword" . }}"
+          # Ephemeral per-pod store password: generated here, shared with the main
+          # container via the kafka-tls emptyDir, never persisted off-pod.
+          STORE_PASS="$(openssl rand -hex 16)"
+          printf '%s' "${STORE_PASS}" > /tmp/kafka-tls/store-pass
           openssl pkcs12 -export \
             -in /opt/kafka/tls-pem/{{ .Values.kafka.tls.certFilename }} \
             -inkey /opt/kafka/tls-pem/{{ .Values.kafka.tls.keyFilename }} \
@@ -111,14 +114,15 @@ spec:
           # (ANONYMOUS super-user) in insecure mode. This avoids the SCRAM
           # chicken-and-egg (creating users requires an already-authorized admin).
           {{- if $tls }}
+          STORE_PASS="$(cat /tmp/kafka-tls/store-pass)"
           cat > "$CC" <<EOF
           security.protocol=SSL
           ssl.keystore.type=PKCS12
           ssl.keystore.location=/tmp/kafka-tls/keystore.p12
-          ssl.keystore.password={{ include "kafka.tls.storePassword" . }}
+          ssl.keystore.password=${STORE_PASS}
           ssl.truststore.type=PKCS12
           ssl.truststore.location=/tmp/kafka-tls/truststore.p12
-          ssl.truststore.password={{ include "kafka.tls.storePassword" . }}
+          ssl.truststore.password=${STORE_PASS}
           ssl.endpoint.identification.algorithm={{ include "kafka.tls.endpointIdentificationAlgorithm" . }}
           EOF
           {{- else }}

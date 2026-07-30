@@ -1,7 +1,7 @@
-version: 0.4.1
+version: 0.4.3
 name: kafka
 displayName: Kafka
-createdAt: "2026-07-29T00:00:00Z"
+createdAt: "2026-07-30T00:00:00Z"
 description: Apache Kafka in KRaft mode (no ZooKeeper) with SASL authentication, TLS, declarative topic management, and a metrics exporter
 homeURL: "https://cagriekin.github.io/charts"
 logoPath: ""
@@ -18,4 +18,4 @@ links:
 screenshots: []
 changes:
   - kind: security
-    description: "Enable TLS hostname verification (ssl.endpoint.identification.algorithm=https) explicitly on broker, controller and client SSL connections; configurable via kafka.tls.endpointIdentificationAlgorithm."
+    description: "Enable TLS hostname verification (ssl.endpoint.identification.algorithm=https) explicitly on broker, controller and client SSL connections; configurable via kafka.tls.endpointIdentificationAlgorithm, defaulting to https when unset and rejecting invalid values."
