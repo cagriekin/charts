@@ -18,4 +18,4 @@ links:
 screenshots: []
 changes:
   - kind: security
-    description: "TLS PKCS12 store password is now a random per-install value persisted in the chart Secret and injected via secretKeyRef env; it is no longer derived from the release name or written into a ConfigMap."
+    description: "TLS PKCS12 store password is now an ephemeral per-pod value generated at container start and shared only within the pod via an emptyDir; it is no longer derived from the release name and is never written into a ConfigMap or Secret."
