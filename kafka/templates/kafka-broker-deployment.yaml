@@ -58,7 +58,10 @@ spec:
             - -c
             - |
               set -e
-              STORE_PASS="${KAFKA_TLS_STORE_PASSWORD}"
+              # Ephemeral per-pod store password: generated here, shared with the
+              # main container via the kafka-tls emptyDir, never persisted off-pod.
+              STORE_PASS="$(openssl rand -hex 16)"
+              printf '%s' "${STORE_PASS}" > /opt/kafka/tls/store-pass
 
               openssl pkcs12 -export \
                 -in /opt/kafka/tls-pem/{{ .Values.kafka.tls.certFilename }} \
@@ -72,8 +75,6 @@ spec:
                 -storetype PKCS12 \
                 -storepass "${STORE_PASS}" \
                 -noprompt -alias ca
-          env:
-            {{- include "kafka.tls.storePasswordEnv" . | nindent 12 }}
           {{- with .Values.kafka.broker.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}
@@ -160,7 +161,8 @@ spec:
               sed -i "s|PLACEHOLDER_NODE_ID|${NODE_ID}|g" /tmp/kafka-config/server.properties
               sed -i "s|PLACEHOLDER_POD_NAME|${POD_NAME}|g" /tmp/kafka-config/server.properties
               {{- if .Values.kafka.tls.enabled }}
-              sed -i "s|PLACEHOLDER_STORE_PASSWORD|${KAFKA_TLS_STORE_PASSWORD}|g" /tmp/kafka-config/server.properties
+              STORE_PASS="$(cat /opt/kafka/tls/store-pass)"
+              sed -i "s|PLACEHOLDER_STORE_PASSWORD|${STORE_PASS}|g" /tmp/kafka-config/server.properties
               {{- end }}
               {{- if eq $mechanism "PLAIN" }}
 
@@ -215,9 +217,6 @@ spec:
               value: {{ .Values.kafka.broker.jvm.heapOpts | quote }}
             - name: KAFKA_JVM_PERFORMANCE_OPTS
               value: {{ .Values.kafka.broker.jvm.performanceOpts | quote }}
-            {{- if .Values.kafka.tls.enabled }}
-            {{- include "kafka.tls.storePasswordEnv" . | nindent 12 }}
-            {{- end }}
           {{- with .Values.kafka.broker.containerSecurityContext }}
           securityContext:
             {{- toYaml . | nindent 12 }}

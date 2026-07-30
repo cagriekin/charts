@@ -289,42 +289,15 @@ Generate a content-based suffix for the Kafka bootstrap job so updates trigger a
 {{- end }}
 
 {{/*
-Secret key under which the random TLS PKCS12 store password is persisted (in the
-chart-managed Secret named by kafka.auth.secretName).
+The TLS PKCS12 keystore/truststore password is NOT rendered by the chart. The
+stores are rebuilt from the mounted PEM on every pod start, so the password only
+needs to be consistent within a single pod for that pod's lifetime. Each pod's
+tls-init container generates a fresh random password at runtime and writes it to
+a shared emptyDir file (STORE_PASS_FILE); the main container reads it and
+substitutes the PLACEHOLDER_STORE_PASSWORD marker into server.properties. The
+value therefore lives in no ConfigMap and no Secret, and no render-time value is
+produced -- so GitOps (ArgoCD/Flux) renders stay stable.
 */}}
-{{- define "kafka.tls.storePasswordKey" -}}
-tls-store-password
-{{- end }}
-
-{{/*
-Resolve the TLS PKCS12 keystore/truststore password at render time (used only by
-the Secret template). Random per install, persisted across upgrades via lookup of
-the existing chart Secret. randAlphaNum keeps it free of sed/JAAS-special chars.
-The value is never written into a ConfigMap: workloads read it from the Secret via
-env (secretKeyRef) and substitute the PLACEHOLDER_STORE_PASSWORD marker at startup.
-*/}}
-{{- define "kafka.tls.storePasswordValue" -}}
-{{- $ns := default "default" .Release.Namespace -}}
-{{- $key := include "kafka.tls.storePasswordKey" . | trim -}}
-{{- $existing := lookup "v1" "Secret" $ns (include "kafka.auth.secretName" .) -}}
-{{- if and $existing (hasKey ($existing.data | default dict) $key) -}}
-{{- index $existing.data $key | b64dec -}}
-{{- else -}}
-{{- randAlphaNum 32 -}}
-{{- end -}}
-{{- end }}
-
-{{/*
-Env var injecting the TLS store password into a container from the chart Secret.
-Usage: {{- include "kafka.tls.storePasswordEnv" . | nindent 12 }}
-*/}}
-{{- define "kafka.tls.storePasswordEnv" -}}
-- name: KAFKA_TLS_STORE_PASSWORD
-  valueFrom:
-    secretKeyRef:
-      name: {{ include "kafka.auth.secretName" . }}
-      key: {{ include "kafka.tls.storePasswordKey" . | trim }}
-{{- end }}
 
 {{/*
 Return the TLS secret name. Uses existingSecret if set, otherwise the
