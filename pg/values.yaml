@@ -150,6 +150,30 @@ postgresql:
     # - "host all all 10.0.0.0/8 md5"
     # - "host replication repmgr 10.0.0.0/8 trust"
 
+  # Extra volumes/mounts/env for the postgresql container (#262). Generic pod-spec
+  # passthrough for mounting an operator-supplied file that must be byte-identical on
+  # every replica -- e.g. the pgsodium server root key (Supabase Vault) read via
+  # pgsodium.getkey_script, which a promoted standby needs to decrypt supabase_vault
+  # after failover. Mount a Secret/ConfigMap here and reference it from
+  # postgresql.configuration; the same volume lands on the primary and every standby.
+  # extraVolumes are pod-level; extraVolumeMounts land on the postgresql container.
+  extraVolumes: []
+    # - name: pgsodium-key
+    #   secret:
+    #     secretName: pgsodium-root-key
+    #     defaultMode: 0400
+    #     items:
+    #       - key: pgsodium.key
+    #         path: pgsodium.key
+  extraVolumeMounts: []
+    # - name: pgsodium-key
+    #   mountPath: /etc/postgresql/pgsodium
+    #   readOnly: true
+  # Extra env vars for the postgresql container (supports value and valueFrom).
+  extraEnv: []
+    # - name: SOME_FLAG
+    #   value: "1"
+
   # Client-connection TLS (#110). Off by default (no change to rendered manifests unless
   # enabled). When enabled, PostgreSQL serves ssl=on from the cert Secret (BYO, like the
   # etcd TLS block).

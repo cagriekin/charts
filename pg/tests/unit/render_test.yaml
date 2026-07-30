@@ -123,3 +123,44 @@ tests:
       - equal:
           path: spec.ports[0].targetPort
           value: postgresql
+
+  # --- Scenario 9: extraVolumes/extraVolumeMounts/extraEnv passthrough (#262) ---
+  - it: extra passthrough renders volume, mount on postgresql container, and env
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.extraVolumes:
+        - name: pgsodium-key
+          secret:
+            secretName: pgsodium-root-key
+            defaultMode: 0400
+      postgresql.extraVolumeMounts:
+        - name: pgsodium-key
+          mountPath: /etc/postgresql/pgsodium
+          readOnly: true
+      postgresql.extraEnv:
+        - name: SOME_FLAG
+          value: "1"
+    template: templates/statefulset.yaml
+    asserts:
+      # Pod-level volume present (block renders even with persistence off + repmgr off)
+      - equal:
+          path: spec.template.spec.volumes[?(@.name=="pgsodium-key")].secret.secretName
+          value: pgsodium-root-key
+      # Mounted on the postgresql container
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].volumeMounts[?(@.name=="pgsodium-key")].mountPath
+          value: /etc/postgresql/pgsodium
+      # Env injected onto the postgresql container
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env[?(@.name=="SOME_FLAG")].value
+          value: "1"
+
+  - it: no extra passthrough renders nothing extra by default (minimal has no volumes block)
+    values:
+      - ../values-minimal.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      # minimal (persistence off) still renders the ephemeral data volume, but no stray extras
+      - notExists:
+          path: spec.template.spec.volumes[?(@.name=="pgsodium-key")]

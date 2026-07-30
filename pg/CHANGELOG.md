@@ -1,5 +1,19 @@
 # pg chart changelog
 
+## 1.6.0 - 2026-07-30
+
+### Added
+
+- **`postgresql.extraVolumes` / `postgresql.extraVolumeMounts` / `postgresql.extraEnv`**
+  (#262) — generic pod-spec passthrough for the postgresql container. Lets an operator
+  mount an arbitrary `Secret`/`ConfigMap` as a file that is byte-identical on the primary
+  and every standby, without a per-use-case chart change. The motivating case is the
+  pgsodium server root key (Supabase Vault) read via `pgsodium.getkey_script`: it must be
+  identical across replicas so a promoted standby can still decrypt `supabase_vault` after
+  a failover. `extraVolumes` render into the pod template; `extraVolumeMounts` and
+  `extraEnv` onto the postgresql container. All default to `[]` (no change to rendered
+  output when unset).
+
 ## 1.5.0 - 2026-07-12
 
 Requires the new repmgr image (`trixie-5.5.0-28`), which bundles the `pgaudit`
