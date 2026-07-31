@@ -45,6 +45,9 @@ else
   REPMGR_TAG="${BASE_TAG}-pg${MAJOR}"
 fi
 
+RENDER_SUITE="${SCRIPT_DIR}/test-template.sh"
+render_suite_before=$(cksum "$RENDER_SUITE")
+
 echo "=== set-pg-major: PostgreSQL ${MAJOR} ==="
 echo "  repmgr image tag : ${REPMGR_TAG}"
 echo "  postgres image   : postgres:${PG_IMAGE_TAG}"
@@ -54,9 +57,14 @@ grep -qxF "postgres:${PG_IMAGE_TAG}" "$BASE_IMAGES" || {
   exit 1
 }
 
-# Files whose image references drive what the live suites deploy.
+# Files whose image references drive what the LIVE suites deploy.
+#
+# test-template.sh is deliberately excluded: it is a render-assertion suite that names
+# both majors explicitly on purpose (PG18 defaults, and an explicit PG17 selection with
+# a -pg17 tag). Rewriting it would make it assert whatever the tree happens to be
+# switched to, silently turning "PG17 renders the -pg17 image" into a tautology.
 mapfile -t FIXTURES < <(ls "${SCRIPT_DIR}"/values-*.yaml)
-mapfile -t SUITES < <(ls "${SCRIPT_DIR}"/test-*.sh)
+mapfile -t SUITES < <(ls "${SCRIPT_DIR}"/test-*.sh | grep -v '/test-template\.sh$')
 TARGETS=("$VALUES" "${FIXTURES[@]}" "${SUITES[@]}")
 
 # Apply one sed rule across TARGETS and fail when it matched nothing. Silent no-ops are
@@ -100,6 +108,15 @@ apply "repmgr image tag" \
 apply "postgres image tag" \
   '[0-9]+\.[0-9]+-trixie' \
   's/[0-9]+\.[0-9]+-trixie/'"${PG_IMAGE_TAG}"'/g'
+
+# The render suite must come through untouched (see the TARGETS note). Checked rather
+# than assumed because the damage is invisible: a glob that starts matching it would
+# rewrite its explicit "-pg17" expectations to whatever the tree was switched to, and the
+# assertions would still pass -- as tautologies.
+if [ "$(cksum "$RENDER_SUITE")" != "$render_suite_before" ]; then
+  echo "FATAL: $(basename "$RENDER_SUITE") was rewritten; it must stay out of TARGETS so its explicit per-major assertions keep meaning something" >&2
+  exit 1
+fi
 
 # Prove the render followed, so a rule that matched the wrong thing cannot pass silently.
 if command -v helm >/dev/null 2>&1; then
