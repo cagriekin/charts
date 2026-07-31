@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag (e.g., trixie-5.5.0-16)'
+        description: 'Base image tag (e.g., trixie-5.5.0-29). Published as <tag> (default major) plus <tag>-pg18 / <tag>-pg17'
         required: true
         type: string
   push:
@@ -43,9 +43,49 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           "$(go env GOPATH)/bin/govulncheck" ./...
 
-  build-and-publish:
+  # Build each major for amd64 and start it before anything is pushed (#269): a tag push
+  # does not run repmgr-image-test.yaml, so without this a per-major package regression
+  # (e.g. no postgresql-<major>-pgaudit) could be published and signed. The multi-arch
+  # build below reuses the same layer cache, so this costs little wall-clock.
+  smoke:
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_major: ["18", "17"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build repmgr image (PG${{ matrix.pg_major }}, amd64)
+        run: |
+          docker buildx build --load \
+            --build-arg PG_MAJOR=${{ matrix.pg_major }} \
+            --cache-from type=gha,scope=repmgr-publish-pg${{ matrix.pg_major }} \
+            --cache-to type=gha,mode=max,scope=repmgr-publish-pg${{ matrix.pg_major }} \
+            -t "repmgr:smoke-pg${{ matrix.pg_major }}" images/repmgr
+
+      - name: Smoke-test the image
+        run: bash images/repmgr/test/image-smoke.sh "repmgr:smoke-pg${{ matrix.pg_major }}" "${{ matrix.pg_major }}"
+
+  # One leg per PostgreSQL major (#269). The DEFAULT major also claims the unsuffixed
+  # tag, so every existing chart pin keeps resolving to it; the -pgNN tags let a user
+  # select a major explicitly. Both tags in a leg are one push, hence one digest and
+  # one signature.
+  build-and-publish:
+    needs: [test, smoke]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { pg_major: "18", default_major: "true" }
+          - { pg_major: "17", default_major: "false" }
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -64,6 +104,16 @@ jobs:
             exit 1
           fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          # Tag list for this major. The default major additionally publishes the
+          # UNSUFFIXED tag -- that is the contract every existing chart pin relies on,
+          # and it is why Dockerfile's ARG PG_MAJOR default must stay in step with
+          # default_major here.
+          tags="cagriekin/repmgr:${tag}-pg${{ matrix.pg_major }}"
+          if [ "${{ matrix.default_major }}" = "true" ]; then
+            tags="cagriekin/repmgr:${tag},${tags}"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "Publishing PG${{ matrix.pg_major }} as: ${tags}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -84,15 +134,21 @@ jobs:
           context: images/repmgr
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: cagriekin/repmgr:${{ steps.meta.outputs.tag }}
+          build-args: |
+            PG_MAJOR=${{ matrix.pg_major }}
+          tags: ${{ steps.meta.outputs.tags }}
           sbom: true
           provenance: mode=max
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Per-major cache scope: the two majors share only the layers above the apt
+          # install, so one scope would evict the other on every run.
+          cache-from: type=gha,scope=repmgr-publish-pg${{ matrix.pg_major }}
+          cache-to: type=gha,mode=max,scope=repmgr-publish-pg${{ matrix.pg_major }}
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
+      # One digest per leg (both tags of the default major point at the same manifest),
+      # so one signature covers every tag this leg published.
       - name: Sign the image (keyless, OIDC)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}

@@ -5,14 +5,15 @@ if [ "$(id -u)" = "0" ]; then
     exec gosu postgres "$0" "$@"
 fi
 
+# Shared topology/timeline helpers (tl_to_int, remote_node_timeline_int,
+# local_node_timeline_int): one definition for the image's shell scripts (#177).
+# Sourced BEFORE the PATH export below, which needs the PG_BINDIR it defines (#269).
+source /usr/local/bin/repmgr-common.sh
+
 # pg_controldata / pg_ctl / repmgr's helpers live in the versioned bindir,
 # which is not on the default PATH; without this the local-timeline read below
 # silently fails and every standby restart does a full re-clone.
-export PATH=$PATH:/usr/lib/postgresql/18/bin
-
-# Shared topology/timeline helpers (tl_to_int, remote_node_timeline_int,
-# local_node_timeline_int): one definition for the image's shell scripts (#177).
-source /usr/local/bin/repmgr-common.sh
+export PATH=$PATH:$PG_BINDIR
 
 ORDINAL=${HOSTNAME##*-}
 NODE_ID=$((ORDINAL + 1000))
@@ -37,7 +38,7 @@ node_id=${NODE_ID}
 node_name=${HOSTNAME}
 conninfo='host=${NODE_FQDN} port=5432 user=${REPMGR_USER} password=${REPMGR_PASSWORD} dbname=${REPMGR_DB} connect_timeout=10'
 data_directory='${PGDATA}'
-pg_bindir='/usr/lib/postgresql/18/bin'
+pg_bindir='${PG_BINDIR}'
 replication_user='${REPMGR_USER}'
 replication_type='physical'
 failover='${REPMGR_FAILOVER:-automatic}'
@@ -49,10 +50,10 @@ monitoring_history=true
 monitoring_history_keep=7
 log_level=INFO
 log_status_interval=10
-service_start_command='/usr/lib/postgresql/18/bin/pg_ctl -D ${PGDATA} start'
-service_stop_command='/usr/lib/postgresql/18/bin/pg_ctl -D ${PGDATA} stop'
-service_restart_command='/usr/lib/postgresql/18/bin/pg_ctl -D ${PGDATA} restart'
-service_reload_command='/usr/lib/postgresql/18/bin/pg_ctl -D ${PGDATA} reload'
+service_start_command='${PG_BINDIR}/pg_ctl -D ${PGDATA} start'
+service_stop_command='${PG_BINDIR}/pg_ctl -D ${PGDATA} stop'
+service_restart_command='${PG_BINDIR}/pg_ctl -D ${PGDATA} restart'
+service_reload_command='${PG_BINDIR}/pg_ctl -D ${PGDATA} reload'
 EOF
 
 echo "Generated repmgr.conf for ${NODE_TYPE} node"

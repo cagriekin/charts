@@ -1,5 +1,30 @@
 # pgvector chart changelog
 
+## 1.8.1 - 2026-07-31
+
+Inherited from pg's symlinked templates and the shared repmgr image. See the
+[pg 1.8.1 changelog](../pg/CHANGELOG.md) for the full detail.
+
+### Added
+
+- **PostgreSQL 17 is selectable; 18 remains the default** (#269). The repmgr image — which
+  supplies the server binaries in repmgr mode — now takes the major as a build argument, and
+  each release publishes `trixie-5.5.0-29` (18, the default and what unsuffixed pins
+  resolve to) plus `-pg18` / `-pg17`.
+
+  For this chart the pgvector image must move too: `postgresql.extensions` copies the
+  `vector` extension out of `postgresql.image` into the server container, so a PG17 cluster
+  needs `postgresql.image.tag: pg17-trixie` alongside the two `majorVersion` values and the
+  `-pg17` repmgr tag. See
+  [Choosing the PostgreSQL major](README.md#choosing-the-postgresql-major).
+
+  **Create-time choice, not an upgrade path** — a new-major server refuses to start on an
+  old-major `PGDATA`.
+
+### Changed
+
+- `repmgr.image.tag` / `etcd.bootstrapImage.tag` → `trixie-5.5.0-29`. **An unchanged values
+  file produces an unchanged result**: the unsuffixed tag is still PostgreSQL 18.
 ## 1.8.0 - 2026-07-31
 
 Inherited from pg's symlinked templates (`statefulset.yaml`, `pgbackrest-configmap.yaml`). See

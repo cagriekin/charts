@@ -3,7 +3,12 @@
 # One image ref per line; blank lines and # comments ignored. The CI base-image
 # cache key is the hash of THIS file, so a chart image-tag bump no longer busts it
 # (only changing this list does).
+# One per PostgreSQL major in the CI matrix (#269): the standalone suites and the TLS
+# suite's psql client pod run the official image, so both majors' tags must be warmed
+# even though repmgr-mode suites take the server from the repmgr image. Keep in sync
+# with the mapping in pg/tests/set-pg-major.sh.
 postgres:18.1-trixie
+postgres:17.10-trixie
 cagriekin/pgpool:4.7.1
 pgpool/pgpool2_exporter:1.2.2
 quay.io/prometheuscommunity/postgres-exporter:v0.19.1

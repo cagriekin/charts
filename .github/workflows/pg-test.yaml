@@ -118,46 +118,81 @@ jobs:
       # ships and is tested with the chart in one PR. The tag is read from
       # pg/values.yaml so the loaded image satisfies the chart's IfNotPresent pull
       # policy. buildx + the gha cache keeps the apt-heavy build off the critical
-      # path on cache hits. Built ONCE here; every suite loads the saved tar.
-      - name: Build repmgr image from source
+      # path on cache hits. Built ONCE here; every suite loads the saved tars.
+      #
+      # One build per PostgreSQL major in the suite matrix (#269). The unsuffixed tag is
+      # the default major (matching the Dockerfile's ARG PG_MAJOR default and the
+      # published tag scheme); other majors get the -pgNN tag that pg/tests/set-pg-major.sh
+      # rewrites the fixtures to. Cache scopes are per major -- the layers diverge at the
+      # apt install, so a shared scope would thrash.
+      - name: Build repmgr images from source (one per PG major)
         run: |
           set -euo pipefail
           tag=$(awk '/^repmgr:/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
           if [ -z "$tag" ]; then echo "could not resolve repmgr image tag from pg/values.yaml" >&2; exit 1; fi
-          echo "Building cagriekin/repmgr:${tag} from images/repmgr"
-          docker buildx build --load \
-            --cache-from type=gha,scope=repmgr-image \
-            --cache-to type=gha,mode=max,scope=repmgr-image \
-            -t "cagriekin/repmgr:${tag}" images/repmgr
-          mkdir -p /tmp/kind-images
-          docker save "cagriekin/repmgr:${tag}" -o /tmp/kind-images/repmgr.tar
+          for major in 18 17; do
+            if [ "$major" = "18" ]; then ref="cagriekin/repmgr:${tag}"; else ref="cagriekin/repmgr:${tag}-pg${major}"; fi
+            echo "Building ${ref} (PG_MAJOR=${major}) from images/repmgr"
+            docker buildx build --load \
+              --build-arg "PG_MAJOR=${major}" \
+              --cache-from type=gha,scope=repmgr-image-pg${major} \
+              --cache-to type=gha,mode=max,scope=repmgr-image-pg${major} \
+              -t "$ref" images/repmgr
+            # Own artifact per major (~190MB each): a suite leg needs exactly one, and
+            # with 40 legs bundling both would download a spare 190MB 40 times.
+            mkdir -p "/tmp/kind-images-pg${major}"
+            docker save "$ref" -o "/tmp/kind-images-pg${major}/repmgr.tar"
+          done
 
       # Fast render gate: template + lint take ~1min and catch most regressions
       # before any live cluster is started. If this fails the matrix is skipped.
       - name: Run template + lint tests
         run: make -C pg test-template
 
-      - name: Assemble image bundle for the suites
+      - name: Assemble image bundles for the suites
         run: |
           set -euo pipefail
-          cp /tmp/base-images/*.tar /tmp/kind-images/
-          ls -lh /tmp/kind-images/
+          mkdir -p /tmp/kind-images-common
+          cp /tmp/base-images/*.tar /tmp/kind-images-common/
+          ls -lh /tmp/kind-images-common/ /tmp/kind-images-pg18/ /tmp/kind-images-pg17/
 
-      - name: Upload image bundle
+      # Third-party images every leg needs, regardless of major.
+      - name: Upload common image bundle
         uses: actions/upload-artifact@v7
         with:
-          name: kind-images
-          path: /tmp/kind-images
+          name: kind-images-common
+          path: /tmp/kind-images-common
+          retention-days: 1
+
+      - name: Upload PG18 repmgr image
+        uses: actions/upload-artifact@v7
+        with:
+          name: kind-images-pg18
+          path: /tmp/kind-images-pg18
+          retention-days: 1
+
+      - name: Upload PG17 repmgr image
+        uses: actions/upload-artifact@v7
+        with:
+          name: kind-images-pg17
+          path: /tmp/kind-images-pg17
           retention-days: 1
 
   # ---------------------------------------------------------------------------
-  # One job per live suite, each on its OWN fresh Kind cluster (so a suite gets
-  # the whole 2-CPU runner to itself, no cross-suite resource contention, and no
-  # cumulative cluster degradation). fail-fast: false so one flaky suite does not
-  # cancel the others, and each suite retries once on a clean cluster state.
+  # One job per live suite PER PostgreSQL major, each on its OWN fresh Kind cluster
+  # (so a suite gets the whole 2-CPU runner to itself, no cross-suite resource
+  # contention, and no cumulative cluster degradation). fail-fast: false so one
+  # flaky suite does not cancel the others, and each suite retries once on a clean
+  # cluster state.
+  #
+  # The majors are a real axis (#269), not an include list, so every suite runs on
+  # every major: the chart is version-agnostic by design and PG17 is a supported
+  # selection, not a spot-check. Suite names map 1:1 to Makefile targets
+  # (test-<suite>), and extra per-suite fields come from `include`, which merges into
+  # that suite's combination for both majors.
   # ---------------------------------------------------------------------------
   suite:
-    name: ${{ matrix.name }}
+    name: ${{ matrix.suite }} (pg${{ matrix.pg_major }})
     needs: [changes, build]
     if: needs.changes.outputs.pg == 'true'
     runs-on: ubuntu-latest
@@ -165,28 +200,31 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        pg_major: ["18", "17"]
+        suite:
+          - minimal
+          - repmgr-failover
+          - agent
+          - repmgr-chaos
+          - full
+          - upgrade
+          - agent-etcd
+          - agent-etcd-tls
+          - tls
+          - pgpool-failover
+          - config-failover
+          - cascading-replication
+          - agent-rolling
+          - backup-restore
+          - backup-concurrent
+          - pgbackrest-restore
+          - pgbackrest-restore-ha
+          - pgbackrest-bootstrap
+          - databases-roles
+          - migrate-agent
+          - scaledown
         include:
-          - { name: minimal, target: test-minimal }
-          - { name: repmgr-failover, target: test-repmgr-failover }
-          - { name: agent, target: test-agent, coldboot: "1" }
-          - { name: repmgr-chaos, target: test-repmgr-chaos }
-          - { name: full, target: test-full }
-          - { name: upgrade, target: test-upgrade }
-          - { name: agent-etcd, target: test-agent-etcd }
-          - { name: agent-etcd-tls, target: test-agent-etcd-tls }
-          - { name: tls, target: test-tls }
-          - { name: pgpool-failover, target: test-pgpool-failover }
-          - { name: config-failover, target: test-config-failover }
-          - { name: cascading-replication, target: test-cascading-replication }
-          - { name: agent-rolling, target: test-agent-rolling }
-          - { name: backup-restore, target: test-backup-restore }
-          - { name: backup-concurrent, target: test-backup-concurrent }
-          - { name: pgbackrest-restore, target: test-pgbackrest-restore }
-          - { name: pgbackrest-restore-ha, target: test-pgbackrest-restore-ha }
-          - { name: pgbackrest-bootstrap, target: test-pgbackrest-bootstrap }
-          - { name: databases-roles, target: test-databases-roles }
-          - { name: migrate-agent, target: test-migrate-agent }
-          - { name: scaledown, target: test-scaledown }
+          - { suite: agent, coldboot: "1" }
     steps:
       - name: Free up runner disk space
         run: |
@@ -210,10 +248,17 @@ jobs:
           cluster_name: pg-test
           config: pg/kind-config.yaml
 
-      - name: Download image bundle
+      - name: Download common image bundle
         uses: actions/download-artifact@v8
         with:
-          name: kind-images
+          name: kind-images-common
+          path: /tmp/kind-images
+
+      # Only this leg's major -- the other one is a 190MB download it would never use.
+      - name: Download PG${{ matrix.pg_major }} repmgr image
+        uses: actions/download-artifact@v8
+        with:
+          name: kind-images-pg${{ matrix.pg_major }}
           path: /tmp/kind-images
 
       - name: Load images into Kind
@@ -223,19 +268,26 @@ jobs:
             kind load image-archive "$tarball" --name pg-test
           done
 
+      # Point the chart defaults and every fixture at this leg's major (#269). Both
+      # majors' images are already loaded, so this only decides which one the suite
+      # deploys. The script fails if any rewrite rule matches nothing, so a leg cannot
+      # silently run the wrong major and report green.
+      - name: Target PostgreSQL ${{ matrix.pg_major }}
+        run: bash pg/tests/set-pg-major.sh "${{ matrix.pg_major }}"
+
       # Run the suite; on a transient failure, drop the suite's namespaces for a
       # clean slate and retry once. The suites are idempotent (each uninstalls +
       # recreates its release), so a single retry absorbs the timing/transient
       # flakes a contended runner produces without re-running the whole job.
-      - name: Run ${{ matrix.name }} suite
+      - name: Run ${{ matrix.suite }} suite (pg${{ matrix.pg_major }})
         env:
           AGENT_COLDBOOT: ${{ matrix.coldboot }}
         run: |
           set +e
-          run() { make -C pg ${{ matrix.target }}; }
+          run() { make -C pg test-${{ matrix.suite }}; }
           run; rc=$?
           if [ "$rc" -ne 0 ]; then
-            echo "::warning title=suite-retry::${{ matrix.target }} failed (rc=${rc}); cleaning namespaces and retrying once"
+            echo "::warning title=suite-retry::test-${{ matrix.suite }} (pg${{ matrix.pg_major }}) failed (rc=${rc}); cleaning namespaces and retrying once"
             kubectl get ns -o name 2>/dev/null | sed 's#namespace/##' | grep '^pg-test' \
               | xargs -r -I{} kubectl delete ns {} --ignore-not-found --wait=true --timeout=180s || true
             sleep 15

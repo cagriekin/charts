@@ -5,8 +5,17 @@
 # agent keep their own copies of the same logic; this consolidates the image's two shell
 # scripts, which had diverged (init-repmgr used the laggy pg_control_checkpoint read).
 #
-# Callers provide REPMGR_USER / REPMGR_PASSWORD / REPMGR_DB in the environment and have
-# /usr/lib/postgresql/18/bin on PATH (for psql / pg_controldata).
+# Callers provide REPMGR_USER / REPMGR_PASSWORD / REPMGR_DB in the environment and put
+# $PG_BINDIR on PATH (for psql / pg_controldata).
+
+# The PostgreSQL major this image was built for, and its versioned bindir (#269). PG_MAJOR
+# comes from the image ENV (Dockerfile ARG PG_MAJOR, default 18); the fallback keeps an
+# older env-less image working. Debian installs the server binaries per major under
+# /usr/lib/postgresql/<major>/bin, and pg_ctl / pg_controldata are NOT on the default PATH
+# (unlike the pg_wrapper-provided psql), so every caller needs this on PATH -- without it
+# the timeline reads silently fail and a standby restart does a full re-clone.
+PG_MAJOR="${PG_MAJOR:-18}"
+PG_BINDIR="/usr/lib/postgresql/${PG_MAJOR}/bin"
 
 # Decimal value of an 8-hex-digit WAL-filename timeline. The first 8 chars of
 # pg_walfile_name(pg_current_wal_lsn()) are the timeline in HEX, so a SQL `::int` cast is

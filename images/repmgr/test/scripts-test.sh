@@ -221,6 +221,82 @@ else
   bad "init-repmgr.sh does not honor REPMGR_FAILOVER"
 fi
 
+# --- #269: the PG major must not be hardcoded anywhere in the shipped shell layer ---
+# The whole point of the PG_MAJOR build arg is that one image build can be PG17 or PG18.
+# A single re-hardcoded /usr/lib/postgresql/<major>/bin would send a PG17 image at a
+# bindir that does not exist -- so scan every shipped file rather than the ones that
+# happened to need fixing.
+hardcoded=$(grep -rn '/usr/lib/postgresql/1[0-9]' \
+  "${ROOT}"/*.sh "${ROOT}/repmgr.conf" "${ROOT}/Dockerfile" 2>/dev/null || true)
+if [ -z "$hardcoded" ]; then
+  ok "#269: no hardcoded versioned bindir in the shipped scripts/conf"
+else
+  bad "#269: hardcoded versioned bindir found" "$hardcoded"
+fi
+
+# --- #269: PG_BINDIR is defined once, in the shared helper ---
+if grep -qE '^PG_BINDIR="/usr/lib/postgresql/\$\{PG_MAJOR\}/bin"$' "${ROOT}/repmgr-common.sh" \
+   && grep -qE '^PG_MAJOR="\$\{PG_MAJOR:-18\}"$' "${ROOT}/repmgr-common.sh"; then
+  ok "#269: repmgr-common.sh derives PG_BINDIR from PG_MAJOR (default 18)"
+else
+  bad "#269: repmgr-common.sh does not define PG_MAJOR/PG_BINDIR as expected"
+fi
+
+# --- #269: init-repmgr must source the helper BEFORE it uses PG_BINDIR on PATH ---
+# Ordering is load-bearing, not style: sourcing after the export would put an empty
+# path element on PATH, and pg_controldata would silently not be found -- which is
+# exactly the failure that makes every standby restart do a full re-clone.
+src_line=$(grep -n 'source /usr/local/bin/repmgr-common.sh' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
+path_line=$(grep -n 'export PATH=.*PG_BINDIR' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
+if [ -n "$src_line" ] && [ -n "$path_line" ] && [ "$src_line" -lt "$path_line" ]; then
+  ok "#269: init-repmgr.sh sources repmgr-common.sh before exporting PATH"
+else
+  bad "#269: init-repmgr.sh PATH export does not follow the helper source (source=${src_line:-none} path=${path_line:-none})"
+fi
+
+# --- #269: the generated repmgr.conf must carry the derived bindir ---
+if grep -qF "pg_bindir='\${PG_BINDIR}'" "${ROOT}/init-repmgr.sh"; then
+  ok "#269: generated repmgr.conf uses \$PG_BINDIR"
+else
+  bad "#269: generated repmgr.conf does not use \$PG_BINDIR"
+fi
+for cmd in start stop restart reload; do
+  if grep -qF "service_${cmd}_command='\${PG_BINDIR}/pg_ctl" "${ROOT}/init-repmgr.sh"; then
+    ok "#269: service_${cmd}_command uses \$PG_BINDIR"
+  else
+    bad "#269: service_${cmd}_command does not use \$PG_BINDIR"
+  fi
+done
+
+# --- #269: the unsuffixed published image tag must keep meaning PG18 ---
+# Existing chart pins (repmgr.image.tag without a -pgNN suffix) resolve to the image
+# built with no --build-arg, so flipping this default would silently move every
+# existing installation to another major on the next image refresh.
+if grep -qE '^ARG PG_MAJOR=18$' "${ROOT}/Dockerfile"; then
+  ok "#269: Dockerfile defaults ARG PG_MAJOR to 18"
+else
+  bad "#269: Dockerfile ARG PG_MAJOR default is not 18"
+fi
+
+# --- #269: the major must reach the runtime as an ENV ---
+# The shell layer and the Go agent both read PG_MAJOR from the container env; without
+# this ENV a PG17 build would fall back to the 18 default at runtime.
+if grep -qE '^ENV PG_MAJOR=\$\{PG_MAJOR\}$' "${ROOT}/Dockerfile"; then
+  ok "#269: Dockerfile exports PG_MAJOR to the runtime env"
+else
+  bad "#269: Dockerfile does not export PG_MAJOR as an ENV"
+fi
+
+# --- #269: per-major packages are checked for a candidate before install ---
+# A missing postgresql-<major>-pgaudit must fail the BUILD; discovered at runtime it
+# would mean audit.enabled=true produces silently absent audit logs.
+if grep -qF 'apt-cache policy' "${ROOT}/Dockerfile" \
+   && grep -qF 'postgresql-${PG_MAJOR}-pgaudit' "${ROOT}/Dockerfile"; then
+  ok "#269: Dockerfile asserts per-major package availability before install"
+else
+  bad "#269: Dockerfile does not assert per-major package availability"
+fi
+
 echo "----"
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
 exit "$fail"

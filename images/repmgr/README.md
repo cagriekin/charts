@@ -5,7 +5,28 @@
 > `.github/workflows/repmgr-image-publish.yaml` on `trixie-*` tags; the pg/pgvector chart CI
 > builds the image from this source (`pg-test.yaml`) rather than pulling it.
 
-PostgreSQL 18 with repmgr 5.5.0, pgBackRest, pgaudit, and cron on Debian Trixie. Designed for Kubernetes StatefulSet deployments with automatic failover and WAL-based incremental backups.
+PostgreSQL with repmgr 5.5.0, pgBackRest, pgaudit, and cron on Debian Trixie. Designed for Kubernetes StatefulSet deployments with automatic failover and WAL-based incremental backups.
+
+## PostgreSQL major (`PG_MAJOR`)
+
+The major is a **build argument**, defaulting to 18, and one build ships exactly one major (`postgresql-<major>`, `-repmgr` and `-pgaudit` from PGDG). Supported: **18** (default) and **17**.
+
+```bash
+docker build -t cagriekin/repmgr:trixie-5.5.0-29 .                       # PostgreSQL 18
+docker build --build-arg PG_MAJOR=17 -t cagriekin/repmgr:trixie-5.5.0-29-pg17 .
+```
+
+Published tags per release: `trixie-<repmgr>-<n>` (the **default** major, 18), plus `-pg18` and `-pg17`. The unsuffixed tag is what chart pins resolve to, so `ARG PG_MAJOR`'s default and the publish workflow's `default_major` must stay in step — `test/scripts-test.sh` asserts the `ARG` default is 18 for exactly that reason.
+
+At runtime the major is exported as `ENV PG_MAJOR`, which is how the shell layer (`repmgr-common.sh` derives `PG_BINDIR` from it) and the Go agent (`config.PGMajor` → `PGBindir()`) find the versioned `/usr/lib/postgresql/<major>/bin`. Nothing hardcodes a major; the agent refuses to start if the bindir its `PG_MAJOR` implies holds no `postgres` binary.
+
+The build **fails** if any per-major package has no installation candidate (checked with `apt-cache policy` before installing). That check exists for `pgaudit`: discovered at runtime instead, a missing `postgresql-<major>-pgaudit` would mean the chart's `audit.enabled=true` produces *silently absent* audit logs rather than a loud failure.
+
+Both majors are verified by `test/image-smoke.sh <image-ref> <major>`, which starts the built image and asserts the server version, that `repmgr`/`repmgrd` resolve and report 5.5.0, and that `pgaudit` actually loads via `shared_preload_libraries`:
+
+```bash
+bash test/image-smoke.sh cagriekin/repmgr:trixie-5.5.0-29-pg17 17
+```
 
 ## Execution Modes
 
@@ -122,14 +143,15 @@ pgBackRest configuration (`/etc/pgbackrest/pgbackrest.conf`) and S3 credentials 
 ## Building
 
 ```bash
-docker build -t cagriekin/repmgr:trixie-5.5.0-5 .
+docker build -t cagriekin/repmgr:trixie-5.5.0-29 .                       # PostgreSQL 18 (default)
+docker build --build-arg PG_MAJOR=17 -t cagriekin/repmgr:trixie-5.5.0-29-pg17 .
 ```
 
 ## Compatibility
 
-- PostgreSQL 18
-- repmgr 5.5.0
+- PostgreSQL 18 (default) or 17, selected with `--build-arg PG_MAJOR` — see [PostgreSQL major](#postgresql-major-pg_major)
+- repmgr 5.5.0 (upstream lists PostgreSQL 13–17; the 18 build uses PGDG's `postgresql-18-repmgr`)
 - pgBackRest (latest from PostgreSQL APT repository)
-- pgaudit (`postgresql-18-pgaudit`; opt-in compliance audit logging)
+- pgaudit (`postgresql-<major>-pgaudit`; opt-in compliance audit logging)
 - Debian Trixie
 - Kubernetes 1.19+

@@ -2064,12 +2064,60 @@ assert_contains "major pin: error names both values (#133)" "${major_mismatch}" 
 major_default=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1) && major_default_rc=0 || major_default_rc=$?
 assert_eq "major pin: default 18==18 renders (#133)" "0" "${major_default_rc}"
 
-# a matched rebump to a hypothetical PG17 repmgr image renders (forward-compatible)
+# a matched rebump to a PG17 repmgr image renders (a supported selection since #269)
 major_rebump=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set repmgr.image.majorVersion=17 \
   --show-only templates/statefulset.yaml 2>&1) && major_rebump_rc=0 || major_rebump_rc=$?
 assert_eq "major pin: matched repmgr.image.majorVersion rebump renders (#133)" "0" "${major_rebump_rc}"
+
+# The OTHER direction of the mismatch. #133 only ever tested moving
+# postgresql.majorVersion; the guard has to be symmetric, or parameterising the image
+# (#269) could leave "repmgr image says 17, chart still thinks 18" -- which silently runs
+# a PG17 server while every extension path the chart builds points at /18/.
+major_mismatch_rev=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.image.majorVersion=17 \
+  --set repmgr.image.tag=trixie-5.5.0-29 2>&1) && major_mismatch_rev_rc=0 || major_mismatch_rev_rc=$?
+assert_eq "major pin: render fails when repmgr.image.majorVersion moves alone (#269)" "1" "${major_mismatch_rev_rc}"
+assert_contains "major pin: reverse mismatch names both values (#269)" "${major_mismatch_rev}" "does not match repmgr.image.majorVersion"
+
+# --- #269: PG17 is a first-class selection, not just a render that does not fail ---
+
+# The values triple that selects PG17 (majors on both sides + the -pg17 image tag) must
+# produce a StatefulSet that actually runs that image.
+pg17_full=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.majorVersion=17 \
+  --set postgresql.image.tag=18.1-trixie \
+  --set repmgr.image.majorVersion=17 \
+  --set repmgr.image.tag=trixie-5.5.0-29 \
+  --show-only templates/statefulset.yaml 2>&1) && pg17_full_rc=0 || pg17_full_rc=$?
+assert_eq "#269: PG17 selection renders" "0" "${pg17_full_rc}"
+assert_contains "#269: PG17 selection uses the -pg17 repmgr image" "${pg17_full}" "cagriekin/repmgr:trixie-5.5.0-29"
+
+# Extensions are where a wrong major becomes a crash-looping init container: the copy
+# paths are built from postgresql.majorVersion, so they must follow the selection with no
+# /18/ path left behind.
+pg17_ext=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=17 \
+  --set postgresql.image.tag=18.1-trixie \
+  --set repmgr.image.majorVersion=17 \
+  --set repmgr.image.tag=trixie-5.5.0-29 \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#269: PG17 extension lib path" "${pg17_ext}" "/usr/lib/postgresql/17/lib"
+assert_contains "#269: PG17 extension share path" "${pg17_ext}" "/usr/share/postgresql/17/extension"
+assert_not_contains "#269: no PG18 paths remain under a PG17 selection" "${pg17_ext}" "postgresql/18/"
+
+# audit.enabled=true on PG17 must preload pgaudit exactly as on 18 -- the image asserts
+# postgresql-17-pgaudit at build time (see images/repmgr/Dockerfile), so the chart side
+# must not gate the preload on a major.
+pg17_audit=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.audit.enabled=true \
+  --set postgresql.majorVersion=17 \
+  --set repmgr.image.majorVersion=17 \
+  --set repmgr.image.tag=trixie-5.5.0-29 \
+  --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#269: audit on PG17 preloads pgaudit" "${pg17_audit}" "shared_preload_libraries = 'repmgr,pgaudit'"
 
 # the pin only applies in repmgr mode: standalone may run any major
 major_standalone=$(helm template test-pg "${CHART_DIR}" \

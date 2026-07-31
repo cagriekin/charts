@@ -238,3 +238,62 @@ func TestLoadBoolEnvVariants(t *testing.T) {
 		}
 	}
 }
+
+// --- #269: PG_MAJOR / PGBindir ---
+
+// An image built before the PG_MAJOR build arg existed sets no PG_MAJOR, and every
+// such image was PostgreSQL 18. Defaulting (rather than erroring) is what keeps the
+// agent working when the chart pins an older repmgr image.
+func TestLoadPGMajorDefaultsTo18(t *testing.T) {
+	c, err := Load(getter(fullEnv()))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.PGMajor != "18" {
+		t.Errorf("PGMajor should default to 18, got %q", c.PGMajor)
+	}
+	if got, want := c.PGBindir(), "/usr/lib/postgresql/18/bin"; got != want {
+		t.Errorf("PGBindir() = %q, want %q", got, want)
+	}
+}
+
+func TestLoadPGMajorOverride(t *testing.T) {
+	m := fullEnv()
+	m["PG_MAJOR"] = " 17 " // image ENV values are trimmed
+	c, err := Load(getter(m))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.PGMajor != "17" {
+		t.Errorf("PGMajor = %q, want 17", c.PGMajor)
+	}
+	if got, want := c.PGBindir(), "/usr/lib/postgresql/17/bin"; got != want {
+		t.Errorf("PGBindir() = %q, want %q", got, want)
+	}
+}
+
+// The value is joined into an exec path, so a non-numeric major must fail at config
+// load with the variable named -- not as an exec error deep in a reconcile tick.
+func TestLoadRejectsNonNumericPGMajor(t *testing.T) {
+	for _, v := range []string{"17.2", "pg17", "../18", "17-beta"} {
+		m := fullEnv()
+		m["PG_MAJOR"] = v
+		if _, err := Load(getter(m)); err == nil {
+			t.Errorf("PG_MAJOR=%q should be rejected", v)
+		} else if !strings.Contains(err.Error(), "PG_MAJOR") {
+			t.Errorf("PG_MAJOR=%q: error should name PG_MAJOR: %v", v, err)
+		}
+	}
+}
+
+func TestStringIncludesPGMajor(t *testing.T) {
+	m := fullEnv()
+	m["PG_MAJOR"] = "17"
+	c, err := Load(getter(m))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(c.String(), "PGMajor:17") {
+		t.Errorf("String() should surface the major for startup logs: %s", c.String())
+	}
+}
