@@ -1213,19 +1213,20 @@ kubectl wait --for=delete pod/my-postgres-pg-0 --timeout=5m
 kubectl create job --from=cronjob/my-postgres-pg-pgbackrest-restore restore-now
 kubectl wait --for=condition=complete job/restore-now --timeout=30m
 
-# 3. Scale back up: the pods replay the archived WAL and promote.
+# 3. CONFIRM the restore succeeded -- must print 1. Do not continue otherwise.
+#    (`--for=condition=complete` above only ever succeeds, so a failed attempt leaves it
+#    blocked until the timeout instead of returning; if it seems stuck, check here.)
+kubectl get job restore-now -o jsonpath='{.status.succeeded}{"\n"}'
+
+# 4. Only now scale back up: the pods replay the archived WAL and promote.
 kubectl scale statefulset my-postgres-pg --replicas=2
 ```
 
-`--for=condition=complete` only ever succeeds, so a **failed** restore leaves that wait
-blocked for the full timeout with no signal. `backoffLimit` is `0` (one pod attempt), so a
-failure shows up immediately in the Job status — if the wait seems stuck, check it rather
-than waiting out the clock, and do not scale up until the Job has actually completed:
-
-```bash
-kubectl get job restore-now -o jsonpath='{.status.failed}{"\n"}'   # 1 = the attempt failed
-kubectl logs job/restore-now                                        # why
-```
+**Do not skip step 3.** A failed restore leaves PGDATA half-written; scaling up onto it
+starts PostgreSQL against an incomplete data directory and turns a recoverable incident into
+data loss. `backoffLimit` is `0` (one pod attempt), so failure is final and immediate —
+diagnose with `kubectl logs job/restore-now`, fix the cause, delete the Job and create it
+again. Rerunning is safe: `--delta` re-restores from scratch.
 
 With no target set this restores the **latest** backup set and replays all archived WAL —
 the disaster-recovery case. For a *point in time*, set the target first:
@@ -1268,10 +1269,15 @@ operator action. This is verified end to end by `make -C pg test-pgbackrest-rest
 which restores a primary out from under a live standby and asserts the pair comes back
 streaming.
 
-Only if a standby *does* get stuck on the old timeline, force a fresh clone by hand:
+Only if a standby *does* get stuck on the old timeline, force a fresh clone by hand. Scale it
+away **before** deleting its PVC: deleting the PVC while its pod still exists leaves it
+`Terminating` behind the `pvc-protection` finalizer, and the recreated pod can re-bind that
+same volume — bringing the standby back on exactly the stale data you meant to discard.
 
 ```bash
-kubectl delete pvc data-my-postgres-pg-1 && kubectl delete pod my-postgres-pg-1
+kubectl scale statefulset my-postgres-pg --replicas=1              # remove the standby pod
+kubectl delete pvc data-my-postgres-pg-1                          # returns once it is really gone
+kubectl scale statefulset my-postgres-pg --replicas=2              # clones fresh from the primary
 ```
 
 If the cluster **crashed** rather than being scaled down cleanly, a stale

@@ -146,12 +146,30 @@ else
   echo "  Standby state at give-up:"
   kubectl get pod "${STANDBY}" -n "${NAMESPACE}" -o wide 2>/dev/null || true
   kubectl logs -n "${NAMESPACE}" "${STANDBY}" -c postgresql --tail=40 2>/dev/null || true
-  echo "Applying the documented fallback: delete the standby's PVC + pod so it clones fresh..."
-  kubectl delete pvc "data-${FULLNAME}-1" -n "${NAMESPACE}" --wait=false >/dev/null 2>&1 || true
-  kubectl delete pod "${STANDBY}" -n "${NAMESPACE}" --wait=true >/dev/null 2>&1 || true
+  echo "Applying the documented fallback: drop the standby's PVC so it clones fresh..."
+  # Order matters, and NOT the obvious way round. Deleting the PVC while pod-1 still exists
+  # leaves it Terminating behind the kubernetes.io/pvc-protection finalizer; the StatefulSet
+  # then recreates pod-1, which can re-bind that same PVC before deletion completes -- the
+  # standby would come back on its STALE pre-restore data and the assertions below could
+  # still pass, reporting a re-clone that never happened. So scale the standby away first,
+  # delete the PVC, confirm it is actually GONE, and only then let it be recreated.
+  old_pvc_uid=$(kubectl get pvc "data-${FULLNAME}-1" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
+  kubectl scale statefulset "${FULLNAME}" -n "${NAMESPACE}" --replicas=1
+  kubectl wait --for=delete pod/"${STANDBY}" -n "${NAMESPACE}" --timeout=300s 2>/dev/null || true
+  kubectl delete pvc "data-${FULLNAME}-1" -n "${NAMESPACE}" --wait=true --timeout=300s >/dev/null 2>&1 || true
+  kubectl wait --for=delete pvc/"data-${FULLNAME}-1" -n "${NAMESPACE}" --timeout=300s 2>/dev/null || true
+  kubectl scale statefulset "${FULLNAME}" -n "${NAMESPACE}" --replicas=2
   reclone_rc=0
   wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 600 || reclone_rc=$?
   assert_eq "documented fallback works: standby re-clones after PVC deletion" "0" "${reclone_rc}"
+  # Prove the standby is on a genuinely NEW volume: a re-bound stale PVC keeps its UID, and
+  # would let the checks below pass on pre-restore data.
+  new_pvc_uid=$(kubectl get pvc "data-${FULLNAME}-1" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
+  if [ -n "${old_pvc_uid}" ] && [ "${old_pvc_uid}" = "${new_pvc_uid}" ]; then
+    fail "fallback provisioned a fresh PVC" "PVC data-${FULLNAME}-1 kept uid ${new_pvc_uid}: the stale volume was re-bound, not replaced"
+  else
+    pass "fallback provisioned a fresh PVC (uid changed)"
+  fi
 fi
 
 # --- whichever path got us here, the pair must be a healthy streaming cluster ---
