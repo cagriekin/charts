@@ -1674,12 +1674,23 @@ assert_contains "#266: writes a completion marker inside PGDATA" "${pgbr_boot_sc
 # itself rather than surface as "repository unreachable" during a healthy first install. The
 # check must sit AFTER the early exits: a pod with an intact data directory needs no jq.
 assert_contains "#266: names jq explicitly when it is missing" "${pgbr_boot_script}" "jq is required"
+# EVERY early exit must precede the jq check, not just one of them: each returns before any JSON
+# is parsed, so a pod that needs no repository lookup must still start on an image without jq.
+# Checking only one boundary would let a regression slide the check up between the others.
 jq_line=$(printf '%s\n' "${pgbr_boot_script}" | grep -n "jq is required" | cut -d: -f1)
-marker_line=$(printf '%s\n' "${pgbr_boot_script}" | grep -n "Bootstrap already completed" | cut -d: -f1)
-if [ -n "${jq_line}" ] && [ -n "${marker_line}" ] && [ "${jq_line}" -gt "${marker_line}" ]; then
-  pass "#266: jq check comes after the early exits (intact volume needs no jq)"
+boot_exit_ok=1
+boot_exit_detail=""
+for early in "standbys clone from the primary" "Bootstrap already completed" "already holds an initialized cluster"; do
+  eline=$(printf '%s\n' "${pgbr_boot_script}" | grep -n "${early}" | head -1 | cut -d: -f1)
+  if [ -z "${eline}" ] || [ -z "${jq_line}" ] || [ "${jq_line}" -le "${eline}" ]; then
+    boot_exit_ok=0
+    boot_exit_detail="${boot_exit_detail} [\"${early}\" at ${eline:-missing} vs jq at ${jq_line:-missing}]"
+  fi
+done
+if [ "${boot_exit_ok}" = "1" ]; then
+  pass "#266: jq check comes after every early exit (a pod needing no repo lookup starts without jq)"
 else
-  fail "#266: jq check comes after the early exits (intact volume needs no jq)" "jq check at line ${jq_line}, marker check at ${marker_line}"
+  fail "#266: jq check comes after every early exit (a pod needing no repo lookup starts without jq)" "${boot_exit_detail}"
 fi
 assert_contains "#266: restores with --delta so a retry can resume" "${pgbr_boot_script}" "\-\-delta"
 # It must NOT start postgres -- the entrypoint does that, and recovery follows on startup.
