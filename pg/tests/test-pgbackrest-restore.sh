@@ -1,9 +1,14 @@
 #!/bin/bash
-# Live pgBackRest PITR restore-validation test (#38). Installs pg with pgbackrest +
-# validation against an in-cluster MinIO (TLS), takes a full backup, writes more data and
-# archives it as WAL, then runs the validation CronJob -- which restores the repo into a
-# THROWAWAY PostgreSQL, replays the archived WAL, and validates. Proves the backups are
-# actually restorable end to end. OPT-IN / standalone: `make -C pg test-pgbackrest-restore`.
+# Live pgBackRest PITR restore-validation test (#38) + live restore Job test (#226).
+# Installs pg with pgbackrest + validation against an in-cluster MinIO (TLS), takes a full
+# backup, writes more data and archives it as WAL, then:
+#   #38  runs the validation CronJob -- restores the repo into a THROWAWAY PostgreSQL,
+#        replays the archived WAL and validates, leaving the live cluster untouched.
+#   #226 performs a REAL disaster recovery with the chart's restore Job: scale to 0, wipe
+#        the data directory, `kubectl create job --from` the suspended restore CronJob,
+#        scale back up, and assert the data came back from S3.
+# Proves the backups are restorable end to end AND that the documented restore runbook
+# works. OPT-IN / standalone: `make -C pg test-pgbackrest-restore`.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,75 +19,23 @@ NAMESPACE="${NAMESPACE:-pg-test-pgbackrest-restore}"
 RELEASE="${RELEASE:-pgbrv}"
 STANZA="db"
 FULLNAME=$(resolve_fullname "${RELEASE}" "${CHART_DIR}" "${SCRIPT_DIR}/values-pgbackrest-minio.yaml")
-CERTDIR="$(mktemp -d)"
-trap 'rm -rf "${CERTDIR}"' EXIT
 
-begin_suite "pgBackRest PITR restore-validation (#38)"
+begin_suite "pgBackRest PITR restore-validation (#38) + live restore Job (#226)"
 
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+# MinIO + the S3 credential Secret + the bucket (shared with the multi-replica suite).
+deploy_minio "${NAMESPACE}"
 
-# --- self-signed cert for MinIO TLS (pgbackrest verify-tls is off; cert just needs to exist) ---
-openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=minio" \
-  -addext "subjectAltName=DNS:minio" \
-  -keyout "${CERTDIR}/private.key" -out "${CERTDIR}/public.crt" >/dev/null 2>&1
-kubectl create secret generic minio-tls -n "${NAMESPACE}" \
-  --from-file=public.crt="${CERTDIR}/public.crt" --from-file=private.key="${CERTDIR}/private.key" \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl create secret generic s3-backup-creds -n "${NAMESPACE}" \
-  --from-literal=access-key-id=minioadmin --from-literal=secret-access-key=minioadmin \
-  --dry-run=client -o yaml | kubectl apply -f -
-
-echo "Deploying MinIO (TLS on :9000, Service exposes :443 -> 9000)..."
-kubectl apply -n "${NAMESPACE}" -f - <<'MINIO'
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: minio
-spec:
-  replicas: 1
-  selector: { matchLabels: { app: minio } }
-  template:
-    metadata: { labels: { app: minio } }
-    spec:
-      containers:
-        - name: minio
-          image: minio/minio:RELEASE.2025-02-18T16-25-55Z
-          args: ["server", "/data", "--certs-dir", "/certs"]
-          env:
-            - { name: MINIO_ROOT_USER, value: minioadmin }
-            - { name: MINIO_ROOT_PASSWORD, value: minioadmin }
-          ports: [{ containerPort: 9000 }]
-          volumeMounts:
-            - { name: certs, mountPath: /certs, readOnly: true }
-          readinessProbe:
-            httpGet: { path: /minio/health/ready, port: 9000, scheme: HTTPS }
-            initialDelaySeconds: 5
-            periodSeconds: 5
-      volumes:
-        - name: certs
-          secret: { secretName: minio-tls, defaultMode: 0444 }
----
-apiVersion: v1
-kind: Service
-metadata: { name: minio }
-spec:
-  selector: { app: minio }
-  ports: [{ port: 443, targetPort: 9000 }]
-MINIO
-wait_for_deployment_ready "${NAMESPACE}" "minio" 180
-
-echo "Creating bucket pgbackrest-test..."
-kubectl run mc-setup -n "${NAMESPACE}" --restart=Never --image=minio/mc:RELEASE.2024-11-21T17-21-54Z \
-  --command -- sh -c "mc --insecure alias set s3 https://minio:443 minioadmin minioadmin && mc --insecure mb s3/pgbackrest-test || true"
-kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/mc-setup -n "${NAMESPACE}" --timeout=120s
-kubectl delete pod mc-setup -n "${NAMESPACE}" --wait=false
-
-echo "Installing pg chart with pgbackrest + PITR validation enabled..."
+echo "Installing pg chart with pgbackrest + PITR validation + restore Job enabled..."
+# restore.enabled is on from the start: the resource it renders is INERT (a suspended
+# CronJob), which is the point -- an operator can leave it enabled and clone it when
+# disaster strikes, without a helm upgrade during the incident.
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" -n "${NAMESPACE}" \
   -f "${SCRIPT_DIR}/values-pgbackrest-minio.yaml" \
   --set pgbackrest.validation.enabled=true \
   --set pgbackrest.validation.recoveryTimeout=240 \
   --set pgbackrest.validation.backoffLimit=0 \
+  --set pgbackrest.restore.enabled=true \
   --wait --timeout 8m
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 600
 POD="${FULLNAME}-0"
@@ -169,6 +122,89 @@ assert_contains "#38: WAL replay restored the post-backup table (not just the ba
 # --- the live cluster is untouched: validation restored into a throwaway, never here ---
 live_rows=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT count(*) FROM pitr_proof" "testuser" "testdb" 2>/dev/null || echo "")
 assert_eq "#38: live database is intact after validation (5000 rows)" "5000" "${live_rows}"
+
+# =============================================================================
+# #226: first-class restore Job -- a REAL restore over the live data PVC.
+# The #38 phase above proves the repository is restorable into a throwaway. This phase
+# exercises the path an operator actually walks in a disaster, exactly as the README
+# runbook documents it: scale to 0 -> `kubectl create job --from=cronjob/...` -> scale up.
+# No hand-built `kubectl run --overrides` restore pod anywhere.
+# =============================================================================
+
+# Inert until asked for: enabling restore.enabled must not restore anything by itself.
+suspended=$(kubectl get cronjob "${FULLNAME}-pgbackrest-restore" -n "${NAMESPACE}" -o jsonpath='{.spec.suspend}' 2>/dev/null || echo "")
+assert_eq "#226: restore CronJob is suspended (never fires on its own)" "true" "${suspended}"
+spawned=$(kubectl get jobs -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -c "^${FULLNAME}-pgbackrest-restore" || true)
+assert_eq "#226: suspended restore CronJob spawned no Jobs on its own" "0" "${spawned}"
+
+# The restore must run under the repmgr SA (so s3.keyType=auto would work) with no API
+# token, and mount the LIVE PVC -- assert on the live object, not just the rendered YAML.
+restore_sa=$(kubectl get cronjob "${FULLNAME}-pgbackrest-restore" -n "${NAMESPACE}" -o jsonpath='{.spec.jobTemplate.spec.template.spec.serviceAccountName}')
+assert_eq "#226: restore runs as the repmgr ServiceAccount" "${FULLNAME}-repmgr" "${restore_sa}"
+restore_pvc=$(kubectl get cronjob "${FULLNAME}-pgbackrest-restore" -n "${NAMESPACE}" -o jsonpath='{.spec.jobTemplate.spec.template.spec.volumes[?(@.name=="data")].persistentVolumeClaim.claimName}')
+assert_eq "#226: restore mounts the live data PVC of replica 0" "data-${FULLNAME}-0" "${restore_pvc}"
+
+echo "Scaling the StatefulSet to 0 (the destructive step stays explicit and manual)..."
+kubectl scale statefulset "${FULLNAME}" -n "${NAMESPACE}" --replicas=0
+kubectl wait --for=delete pod/"${POD}" -n "${NAMESPACE}" --timeout=180s 2>/dev/null || true
+
+# Simulate the disaster the restore is FOR: destroy the data directory outright. Without
+# this, a latest-restore over an intact PGDATA would be a near no-op (--delta finds nothing
+# to copy) and would prove nothing. Runs as root because the files are owned by uid 101.
+# (This throwaway pod is exactly the kind of hand-built spec #226 removes from the restore
+# path -- here it is the disaster, not the recovery.)
+echo "Destroying the data directory to simulate total data loss..."
+kubectl delete pod pg-wipe -n "${NAMESPACE}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+kubectl run pg-wipe -n "${NAMESPACE}" --restart=Never --image=busybox:1.37 \
+  --overrides="{\"spec\":{\"containers\":[{\"name\":\"pg-wipe\",\"image\":\"busybox:1.37\",\"command\":[\"sh\",\"-c\",\"rm -rf /data/pgdata && echo wiped\"],\"securityContext\":{\"runAsUser\":0},\"volumeMounts\":[{\"name\":\"data\",\"mountPath\":\"/data\"}]}],\"volumes\":[{\"name\":\"data\",\"persistentVolumeClaim\":{\"claimName\":\"data-${FULLNAME}-0\"}}]}}" >/dev/null
+wipe_rc=0
+kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/pg-wipe -n "${NAMESPACE}" --timeout=180s >/dev/null 2>&1 || wipe_rc=$?
+assert_eq "#226: data directory wiped (disaster simulated)" "0" "${wipe_rc}"
+kubectl delete pod pg-wipe -n "${NAMESPACE}" --wait=false >/dev/null 2>&1 || true
+
+# --- the runbook: one command, no --overrides ---
+echo "Running the chart's restore Job (kubectl create job --from=cronjob/...)..."
+kubectl delete job pgbr-restore -n "${NAMESPACE}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+kubectl create job -n "${NAMESPACE}" pgbr-restore --from=cronjob/"${FULLNAME}-pgbackrest-restore"
+# Same complete-or-fail poll as the validation job above: `kubectl wait --for=condition=
+# complete` alone burns the whole timeout on a failed Job. backoffLimit=0 => one attempt.
+res_rc=2
+for _ in $(seq 1 120); do
+  succeeded=$(kubectl get job pgbr-restore -n "${NAMESPACE}" -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "")
+  failed=$(kubectl get job pgbr-restore -n "${NAMESPACE}" -o jsonpath='{.status.failed}' 2>/dev/null || echo "")
+  [ "${succeeded:-0}" -ge 1 ] 2>/dev/null && { res_rc=0; break; }
+  [ "${failed:-0}" -ge 1 ] 2>/dev/null && { res_rc=1; break; }
+  sleep 3
+done
+res_logs=$(kubectl logs -n "${NAMESPACE}" job/pgbr-restore --tail=200 2>/dev/null || true)
+if [ "${res_rc}" -ne 0 ]; then
+  echo "  restore job did not complete; logs:"; printf '%s\n' "${res_logs}"
+fi
+assert_eq "#226: restore job completes" "0" "${res_rc}"
+assert_contains "#226: restore targeted the LIVE data directory" "${res_logs}" "/var/lib/postgresql/data/pgdata"
+assert_contains "#226: restore reports success" "${res_logs}" "pgBackRest restore succeeded"
+
+# --- scale back up: the StatefulSet's own startup performs recovery (WAL replay+promote) ---
+echo "Scaling back up: WAL replay + promotion happen under the normal chart entrypoint..."
+kubectl scale statefulset "${FULLNAME}" -n "${NAMESPACE}" --replicas=1
+up_rc=0
+wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 600 || up_rc=$?
+if [ "${up_rc}" -ne 0 ]; then
+  kubectl logs -n "${NAMESPACE}" "${POD}" -c postgresql --tail=80 2>/dev/null || true
+fi
+assert_eq "#226: restored cluster becomes ready after scale-up" "0" "${up_rc}"
+
+# The load-bearing assertion: pitr_proof existed ONLY in the wiped data directory and in
+# the S3 repo (base backup + archived WAL). Its 5000 rows being back means the Job really
+# restored from S3 and the scale-up really replayed WAL and promoted.
+restored_rows=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT count(*) FROM pitr_proof" "testuser" "testdb" 2>/dev/null || echo "")
+assert_eq "#226: data recovered from S3 after total data-directory loss (5000 rows)" "5000" "${restored_rows}"
+in_recovery=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null | tr -d '[:space:]' || echo "")
+assert_eq "#226: restored cluster promoted to read-write (not left paused in recovery)" "f" "${in_recovery}"
+# A promoted PITR restore lands on a NEW timeline -- proof recovery actually ran here
+# rather than the old data directory somehow surviving the wipe.
+timeline=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT timeline_id FROM pg_control_checkpoint()" "testuser" "testdb" 2>/dev/null | tr -d '[:space:]' || echo "")
+assert_gt "#226: recovery advanced the timeline (restore + replay really ran)" "${timeline:-0}" "1"
 
 end_suite
 print_summary

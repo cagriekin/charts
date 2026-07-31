@@ -1552,6 +1552,98 @@ assert_contains "#38: targetType without target fails fast" "${pgbr_val_badtarge
 pgbr_val_badtype=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.validation.enabled=true --set pgbackrest.validation.targetType=bogus 2>&1 || true)
 assert_contains "#38: invalid targetType rejected" "${pgbr_val_badtype}" "must be one of"
 
+# #226: first-class PITR restore resource -- replaces the hand-built `kubectl run
+# --overrides` runbook. Restores over the LIVE data PVC (contrast #38, which restores into a
+# throwaway) and never starts postgres: scaling the StatefulSet back up performs recovery.
+assert_not_contains "#226: nothing rendered when restore is disabled (default)" "${pgbr_noval}" "component: pgbackrest-restore"
+assert_not_contains "#226: restore.sh absent from the configmap when restore disabled" "${pgbr_noscript}" "restore.sh:"
+pgbr_res=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --show-only templates/pgbackrest-restore-job.yaml 2>&1)
+# Default mode is the suspended CronJob: `kubectl create job --from` clones it on demand.
+assert_contains "#226: default mode renders a CronJob" "${pgbr_res}" "kind: CronJob"
+assert_contains "#226: restore CronJob name is stable for kubectl create job --from" "${pgbr_res}" "name: test-pg-pgbackrest-restore"
+# Load-bearing safety: enabling the feature must never restore anything by itself.
+assert_contains "#226: restore CronJob is suspended" "${pgbr_res}" "suspend: true"
+assert_contains "#226: restore CronJob schedule can never fire (Feb 31)" "${pgbr_res}" 'schedule: "0 0 31 2 \*"'
+# The whole point: the live PVC + the repo config, mounted by the chart rather than by hand.
+assert_contains "#226: mounts the live data PVC of replica 0" "${pgbr_res}" "claimName: data-test-pg-0"
+assert_contains "#226: mounts the pgbackrest ConfigMap (repo settings + pg1-path)" "${pgbr_res}" "mountPath: /etc/pgbackrest/pgbackrest.conf"
+# pg1-path in the mounted conf is ALREADY the live PGDATA, so (unlike #38) there must be no
+# pg1-path override redirecting the restore somewhere else.
+assert_not_contains "#226: no pg1-path override (the mounted conf already targets live PGDATA)" "${pgbr_res}" "PGBACKREST_PG1_PATH"
+assert_contains "#226: PGDATA is the live data directory" "${pgbr_res}" "value: /var/lib/postgresql/data/pgdata"
+assert_contains "#226: runs the mounted restore.sh" "${pgbr_res}" "/scripts/restore.sh"
+assert_contains "#226: mounts restore.sh from the configmap" "${pgbr_res}" "key: restore.sh"
+# Identity + security context inherited from the chart (the #38 plumbing).
+assert_contains "#226: uses the repmgr image" "${pgbr_res}" "cagriekin/repmgr"
+assert_contains "#226: reuses the postgresql/repmgr ServiceAccount (workload identity)" "${pgbr_res}" "serviceAccountName: test-pg-repmgr"
+assert_contains "#226: makes no API calls (no SA token)" "${pgbr_res}" "automountServiceAccountToken: false"
+assert_contains "#226: postgresql pod securityContext (fsGroup 103)" "${pgbr_res}" "fsGroup: 103"
+assert_contains "#226: postgresql container securityContext (uid 101)" "${pgbr_res}" "runAsUser: 101"
+assert_contains "#226: keyType=shared wires the static S3 key from the secret" "${pgbr_res}" "name: PGBACKREST_REPO1_S3_KEY"
+assert_contains "#226: one pod attempt by default (no auto-retry over a half-written PGDATA)" "${pgbr_res}" "backoffLimit: 0"
+# The restore script itself lives in the pgbackrest ConfigMap, gated on restore.enabled.
+pgbr_res_script=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --show-only templates/pgbackrest-configmap.yaml 2>&1)
+assert_contains "#226: restore.sh present in the configmap when enabled" "${pgbr_res_script}" "restore.sh:"
+assert_contains "#226: script restores with --delta" "${pgbr_res_script}" "\-\-delta"
+assert_contains "#226: script refuses to restore over a running postmaster" "${pgbr_res_script}" "postmaster.pid"
+# It must NOT start postgres -- recovery happens on scale-up, under the chart entrypoint.
+assert_not_contains "#226: script never starts postgres (pg_ctl start)" "${pgbr_res_script}" "pg_ctl -D"
+assert_contains "#226: script puts the PG bin dir on PATH (pg_controldata is not on the default PATH)" "${pgbr_res_script}" "/usr/lib/postgresql"
+# mode: job renders a bare Job (for `helm template -s ... | kubectl apply`), with a
+# nameSuffix escape hatch because Jobs are immutable.
+pgbr_res_job=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set pgbackrest.restore.mode=job --show-only templates/pgbackrest-restore-job.yaml 2>&1)
+assert_contains "#226: mode=job renders a Job" "${pgbr_res_job}" "kind: Job"
+assert_not_contains "#226: mode=job renders no CronJob wrapper" "${pgbr_res_job}" "kind: CronJob"
+assert_not_contains "#226: mode=job has no suspend field" "${pgbr_res_job}" "suspend:"
+pgbr_res_suffix=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set pgbackrest.restore.mode=job --set pgbackrest.restore.nameSuffix=attempt2 --show-only templates/pgbackrest-restore-job.yaml 2>&1)
+assert_contains "#226: nameSuffix makes a rerun a distinct Job" "${pgbr_res_suffix}" "name: test-pg-pgbackrest-restore-attempt2"
+# ...but the CronJob name must stay stable so the runbook command never changes.
+pgbr_res_cj_suffix=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set pgbackrest.restore.nameSuffix=attempt2 --show-only templates/pgbackrest-restore-job.yaml 2>&1)
+assert_contains "#226: nameSuffix is ignored in cronjob mode (stable --from target)" "${pgbr_res_cj_suffix}" "name: test-pg-pgbackrest-restore"
+assert_not_contains "#226: cronjob name carries no suffix" "${pgbr_res_cj_suffix}" "restore-attempt2"
+# PITR target / backup-set / force / podOrdinal wiring.
+pgbr_res_pitr=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set pgbackrest.restore.targetType=time --set-string 'pgbackrest.restore.target=2026-03-22 12:00:00+00' --set pgbackrest.restore.backupSet=20260322-010002F --set pgbackrest.restore.force=true --set pgbackrest.restore.podOrdinal=1 --show-only templates/pgbackrest-restore-job.yaml 2>&1)
+assert_contains "#226: PITR target value wired into the env" "${pgbr_res_pitr}" "2026-03-22 12:00:00+00"
+assert_contains "#226: backupSet wired into the env" "${pgbr_res_pitr}" "20260322-010002F"
+assert_contains "#226: force wired into the env" "${pgbr_res_pitr}" 'name: FORCE'
+assert_contains "#226: podOrdinal selects that replica's PVC" "${pgbr_res_pitr}" "claimName: data-test-pg-1"
+# A targeted restore must promote, not pause (default recovery_target_action is `pause`).
+assert_contains "#226: targeted restore promotes (not pause)" "${pgbr_res_script}" "target-action=promote"
+# Guards: target required with targetType (template fail; a schema if/then is not portable
+# to helm 3.x), enum-checked targetType/mode, and the two prerequisites for restoring at all.
+pgbr_res_badtarget=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set pgbackrest.restore.targetType=time 2>&1 || true)
+assert_contains "#226: targetType without target fails fast" "${pgbr_res_badtarget}" "restore.target is required"
+pgbr_res_badtype=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set pgbackrest.restore.targetType=bogus 2>&1 || true)
+assert_contains "#226: invalid targetType rejected" "${pgbr_res_badtype}" "must be one of"
+pgbr_res_badmode=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set pgbackrest.restore.mode=bogus 2>&1 || true)
+assert_contains "#226: invalid mode rejected" "${pgbr_res_badmode}" "must be one of"
+# nameSuffix lands in metadata.name, so a non-DNS-1123 value must be rejected at render
+# time rather than by the API server mid-incident. The pattern also permits "" (the
+# default): helm validates values.yaml against the schema on every render.
+pgbr_res_badsuffix=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set pgbackrest.restore.mode=job --set pgbackrest.restore.nameSuffix=Attempt_2 2>&1 || true)
+# Match only "match pattern": helm 3.x (gojsonschema) reports "Does not match pattern" while
+# helm 4 (santhosh-tekuri) reports "'Attempt_2' does not match pattern" -- CI pins helm 3.14,
+# so a case-sensitive "does not match pattern" passes locally on helm 4 and fails there.
+assert_contains "#226: non-DNS-1123 nameSuffix rejected" "${pgbr_res_badsuffix}" "match pattern"
+assert_contains "#226: nameSuffix rejection names the offending value" "${pgbr_res_badsuffix}" "nameSuffix"
+pgbr_res_nopersist=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set postgresql.persistence.enabled=false 2>&1 || true)
+assert_contains "#226: restore without persistence fails fast (no PVC to restore into)" "${pgbr_res_nopersist}" "requires postgresql.persistence.enabled"
+pgbr_res_nopgbr=$(helm template test-pg "${CHART_DIR}" --set pgbackrest.restore.enabled=true 2>&1 || true)
+assert_contains "#226: restore without pgbackrest fails fast" "${pgbr_res_nopgbr}" "requires pgbackrest.enabled"
+# keyType=auto must NOT emit static keys (relies on the SA's workload identity).
+pgbr_res_auto=$(helm template test-pg "${CHART_DIR}" --set pgbackrest.enabled=true --set repmgr.enabled=true --set pgbackrest.s3.endpoint=https://s3.test --set pgbackrest.s3.bucket=b --set pgbackrest.s3.keyType=auto --set pgbackrest.restore.enabled=true --show-only templates/pgbackrest-restore-job.yaml 2>&1)
+assert_not_contains "#226: keyType=auto emits no static S3 key env" "${pgbr_res_auto}" "PGBACKREST_REPO1_S3_KEY"
+# The restore has to land where the data PVC can attach: a tainted/labelled database node
+# pool the postgresql pods tolerate must be tolerated here too, or the restore sits Pending
+# mid-incident. postgresql.affinity is deliberately not inherited (it spreads replicas).
+pgbr_res_sched=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set postgresql.nodeSelector.workload=db --set 'postgresql.tolerations[0].key=db' --set 'postgresql.tolerations[0].operator=Exists' --set 'postgresql.tolerations[0].effect=NoSchedule' --show-only templates/pgbackrest-restore-job.yaml 2>&1)
+assert_contains "#226: inherits postgresql.nodeSelector" "${pgbr_res_sched}" "workload: db"
+assert_contains "#226: inherits postgresql.tolerations" "${pgbr_res_sched}" "effect: NoSchedule"
+assert_not_contains "#226: does not inherit postgresql.affinity (replica spreading is meaningless here)" "${pgbr_res_sched}" "affinity:"
+# Repo encryption passphrase reaches the restore (an encrypted repo is undecryptable without it).
+pgbr_res_enc=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set pgbackrest.repoEncryption.enabled=true --set pgbackrest.repoEncryption.existingSecret.name=cipher --show-only templates/pgbackrest-restore-job.yaml 2>&1)
+assert_contains "#226: repo-encryption passphrase wired into the restore" "${pgbr_res_enc}" "PGBACKREST_REPO1_CIPHER_PASS"
+
 # #27: the backup + backup-validation Jobs run under a dedicated no-RBAC SA, not
 # the namespace default.
 backup_sa=$(helm template test-pg "${CHART_DIR}" ${backup_val_args} --show-only templates/backup-serviceaccount.yaml 2>&1)

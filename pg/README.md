@@ -1133,6 +1133,18 @@ helm install my-postgres cagriekin/pg \
 | `pgbackrest.validation.activeDeadlineSeconds` | Validation Job timeout | `3600` |
 | `pgbackrest.validation.backoffLimit` | Validation Job backoff limit | `1` |
 | `pgbackrest.validation.resources.*` | Validation Job resource requests/limits | `200m`/`256Mi` … `1`/`1Gi` |
+| `pgbackrest.restore.enabled` | Render the first-class PITR restore resource (#226) — restores over the **live** data PVC. Inert until you clone/apply it | `false` |
+| `pgbackrest.restore.mode` | `cronjob` (suspended CronJob, clone with `kubectl create job --from`) \| `job` (bare Job, render with `helm template -s`) | `cronjob` |
+| `pgbackrest.restore.targetType` | PITR target type (`pgbackrest --type`): `""` (latest) \| `time` \| `xid` \| `name` \| `lsn`. `target` is required when set | `""` |
+| `pgbackrest.restore.target` | PITR target value for the type above (e.g. `2026-03-22 12:00:00+00`); implies `--target-action=promote` | `""` |
+| `pgbackrest.restore.backupSet` | `pgbackrest --set`: restore a specific backup set label from `pgbackrest info` instead of the latest | `""` |
+| `pgbackrest.restore.force` | `pgbackrest --force`: restore despite a **stale** `postmaster.pid` left by a crash. Leave `false` unless every postgresql pod is confirmed gone | `false` |
+| `pgbackrest.restore.podOrdinal` | Ordinal of the replica PVC (`data-<fullname>-<n>`) restored into; leave `0` | `0` |
+| `pgbackrest.restore.nameSuffix` | `mode: job` only — appended to the Job name so a retry does not collide with the completed Job | `""` |
+| `pgbackrest.restore.activeDeadlineSeconds` | Restore Job timeout | `21600` |
+| `pgbackrest.restore.backoffLimit` | Restore Job backoff limit (0 = one attempt; a half-written PGDATA should not be retried automatically) | `0` |
+| `pgbackrest.restore.resources.*` | Restore Job resource requests/limits | `200m`/`256Mi` … `1`/`1Gi` |
+| _scheduling_ | The restore pod inherits `postgresql.nodeSelector` and `postgresql.tolerations` so it lands where the data PVC can attach (`postgresql.affinity` is not inherited) | — |
 
 ### Automated PITR restore-validation (#38)
 
@@ -1177,43 +1189,101 @@ kubectl exec -it my-postgres-pg-0 -- pgbackrest --stanza=db info
 
 ### Point-in-Time Recovery
 
-PITR requires manual intervention:
+Set `pgbackrest.restore.enabled=true` and the chart renders a ready-made restore resource
+(#226) carrying everything a restore needs — the `-repmgr` ServiceAccount (so
+`s3.keyType: auto` works, with its API token unmounted), the postgresql security contexts,
+the `data-<fullname>-0` PVC and `<fullname>-pgbackrest` ConfigMap mounts, the S3 /
+repo-encryption credentials, and `pgbackrest restore --delta`. Nothing to hand-build.
+
+Enabling it is safe: what it renders is **inert** — by default a *suspended* CronJob that
+can never fire. It restores only when you clone it. Leave it enabled so a disaster does not
+also require a `helm upgrade`.
+
+The restore never starts PostgreSQL. Recovery (WAL replay + promotion) happens when you
+scale the StatefulSet back up, under the normal chart entrypoint — so the destructive
+scale down/up stays an explicit, manual decision:
 
 ```bash
-# 1. Scale down the StatefulSet
+# 1. Stop the cluster. pgbackrest refuses to restore while postmaster.pid exists, so this
+#    is not optional -- wait for the pods to actually terminate.
 kubectl scale statefulset my-postgres-pg --replicas=0
+kubectl wait --for=delete pod/my-postgres-pg-0 --timeout=5m
 
-# 2. Run a restore pod that mounts the data PVC AND the pgbackrest ConfigMap.
-# The repo settings (repo1-type=s3, endpoint, bucket, path) and pg1-path live ONLY
-# in the <fullname>-pgbackrest ConfigMap, so it MUST be mounted at
-# /etc/pgbackrest/pgbackrest.conf or pgbackrest fails with "requires option: pg1-path"
-# and would default to a local posix repo (never finding the S3 backup).
-# Replace YOUR_PGBACKREST_SECRET with your pgbackrest.existingSecret.name.
-# The securityContext (101:103) matches the chart so restored files are owned
-# correctly and the pod is accepted under restricted PodSecurity / OpenShift SCC.
-# keyType: auto (IRSA / Workload Identity)? Drop the env block, add
-# "serviceAccountName": "my-postgres-pg-repmgr" to the spec (that SA carries the
-# cloud-role annotation; the namespace default SA does not), and ensure the pod lands
-# where your IRSA/WI webhook injects the token; pgbackrest then uses the credential chain.
-kubectl run pg-restore --rm -it \
-  --image=cagriekin/repmgr:trixie-5.5.0-27 \
-  --overrides='{ "spec": { "securityContext": { "runAsUser": 101, "runAsGroup": 103, "fsGroup": 103, "runAsNonRoot": true, "seccompProfile": { "type": "RuntimeDefault" } }, "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-27", "command": ["bash"], "stdin": true, "tty": true, "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] } }, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }, { "name": "pgbackrest-config", "mountPath": "/etc/pgbackrest/pgbackrest.conf", "subPath": "pgbackrest.conf", "readOnly": true }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "valueFrom": { "secretKeyRef": { "name": "YOUR_PGBACKREST_SECRET", "key": "access-key-id" } } }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "valueFrom": { "secretKeyRef": { "name": "YOUR_PGBACKREST_SECRET", "key": "secret-access-key" } } }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-postgres-pg-0" } }, { "name": "pgbackrest-config", "configMap": { "name": "my-postgres-pg-pgbackrest" } }] } }'
+# 2. Restore (stanza = pgbackrest.stanza, default "db").
+kubectl create job --from=cronjob/my-postgres-pg-pgbackrest-restore restore-now
+kubectl wait --for=condition=complete job/restore-now --timeout=30m
 
-# 3. Inside the restore pod, run (stanza = pgbackrest.stanza, default "db").
-# --type=time is REQUIRED with --target (pgbackrest rejects --target otherwise);
-# use --type=xid|name|lsn for other recovery targets. Leave the existing data dir in
-# place so --delta restores only changed files (a wiped PGDATA disables --delta).
-pgbackrest --stanza=db restore \
-  --type=time \
-  --target="2026-03-22 12:00:00+00" \
-  --target-action=promote \
-  --delta
+# 3. CONFIRM the restore succeeded -- must print 1. Do not continue otherwise.
+#    (`--for=condition=complete` above only ever succeeds, so a failed attempt leaves it
+#    blocked until the timeout instead of returning; if it seems stuck, check here.)
+kubectl get job restore-now -o jsonpath='{.status.succeeded}{"\n"}'
 
-# 4. Scale back up
+# 4. Only now scale back up: the pods replay the archived WAL and promote.
 kubectl scale statefulset my-postgres-pg --replicas=2
 ```
 
-Repmgr will automatically rebuild standbys from the restored primary.
+**Do not skip step 3.** A failed restore leaves PGDATA half-written; scaling up onto it
+starts PostgreSQL against an incomplete data directory and turns a recoverable incident into
+data loss. `backoffLimit` is `0` (one pod attempt), so failure is final and immediate —
+diagnose with `kubectl logs job/restore-now`, fix the cause, delete the Job and create it
+again. Rerunning is safe: `--delta` re-restores from scratch.
+
+With no target set this restores the **latest** backup set and replays all archived WAL —
+the disaster-recovery case. For a *point in time*, set the target first:
+
+```yaml
+pgbackrest:
+  restore:
+    enabled: true
+    targetType: time                     # "" (latest) | time | xid | name | lsn
+    target: "2026-03-22 12:00:00+00"     # required once targetType is set
+    # backupSet: "20260322-010002F"      # optional: pin a specific set from `pgbackrest info`
+```
+
+A target always implies `--target-action=promote`: PostgreSQL's default
+`recovery_target_action` is `pause`, which would leave the cluster in recovery, never
+accepting connections.
+
+`mode: job` renders a bare Job instead, for passing an arbitrary target inline without
+touching the release (useful when the values live in Git and you cannot wait for a commit):
+
+```bash
+helm get values my-postgres > /tmp/v.yaml
+helm template my-postgres cagriekin/pg -f /tmp/v.yaml \
+  --set pgbackrest.restore.enabled=true --set pgbackrest.restore.mode=job \
+  --set pgbackrest.restore.targetType=time \
+  --set-string 'pgbackrest.restore.target=2026-03-22 12:00:00+00' \
+  -s templates/pgbackrest-restore-job.yaml | kubectl apply -f -
+```
+
+Two caveats for this mode: the Job is not part of the release, so a GitOps controller may
+report or prune it; and Jobs are immutable, so a second attempt needs
+`--set pgbackrest.restore.nameSuffix=attempt2`.
+
+**Standbys rebuild themselves — no extra step.** A PITR restore leaves the restored primary
+on a *new* timeline, while each standby's PVC still holds pre-restore data on the old one. On
+scale-up the standby's init container detects exactly that (`Timeline mismatch (local: 1,
+primary: 2), re-cloning...`) and re-clones from the restored primary via `repmgr standby
+clone` (`pg_basebackup`), then resumes streaming on the new timeline. No PVC deletion, no
+operator action. This is verified end to end by `make -C pg test-pgbackrest-restore-ha`,
+which restores a primary out from under a live standby and asserts the pair comes back
+streaming.
+
+Only if a standby *does* get stuck on the old timeline, force a fresh clone by hand. Scale it
+away **before** deleting its PVC: deleting the PVC while its pod still exists leaves it
+`Terminating` behind the `pvc-protection` finalizer, and the recreated pod can re-bind that
+same volume — bringing the standby back on exactly the stale data you meant to discard.
+
+```bash
+kubectl scale statefulset my-postgres-pg --replicas=1              # remove the standby pod
+kubectl delete pvc data-my-postgres-pg-1                          # returns once it is really gone
+kubectl scale statefulset my-postgres-pg --replicas=2              # clones fresh from the primary
+```
+
+If the cluster **crashed** rather than being scaled down cleanly, a stale
+`postmaster.pid` is left in PGDATA and pgbackrest refuses to restore — the interlock that
+lets this Job run with no Kubernetes API access at all. Confirm every postgresql pod is
+gone, then set `pgbackrest.restore.force=true`.
 
 #### Agent mode: clear the stale leadership state before scaling up
 
@@ -1361,20 +1431,10 @@ pg_restore -h <host> -U <user> -d <database> --clean --if-exists /tmp/backup.dum
 
 ### Point-in-Time Recovery (pgBackRest)
 
-1. Stop the PostgreSQL pod:
-```bash
-kubectl scale statefulset <fullname> -n <namespace> --replicas=0
-```
-
-2. Run PITR restore:
-```bash
-pgbackrest --stanza=db --type=time "--target=2025-01-15 12:00:00" restore
-```
-
-3. Scale back up:
-```bash
-kubectl scale statefulset <fullname> -n <namespace> --replicas=<original-count>
-```
+Enable `pgbackrest.restore.enabled` and use the chart's restore Job — see
+[Point-in-Time Recovery](#point-in-time-recovery) above for the full runbook (scale to 0 →
+`kubectl create job --from=cronjob/<fullname>-pgbackrest-restore` → scale up), the
+point-in-time target values, and the agent-mode leadership cleanup.
 
 ### Split-Brain Recovery
 

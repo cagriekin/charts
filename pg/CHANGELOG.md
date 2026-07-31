@@ -1,5 +1,68 @@
 # pg chart changelog
 
+## 1.7.0 - 2026-07-31
+
+### Added
+
+- **`pgbackrest.restore.*` — a first-class PITR restore resource** (#226). The manual
+  restore runbook made the operator hand-build an entire pod spec via `kubectl run
+  --overrides='{…}'`: ~30 lines of inline JSON reconstructing the ServiceAccount, security
+  contexts, the data PVC mount, the pgbackrest ConfigMap mount and the S3 credential env —
+  all of which the chart already knows how to render. Set `pgbackrest.restore.enabled=true`
+  and it ships that spec for you, and the runbook becomes four ordinary commands:
+
+  ```bash
+  kubectl scale statefulset my-postgres-pg --replicas=0
+  kubectl wait --for=delete pod/my-postgres-pg-0 --timeout=5m
+  kubectl create job --from=cronjob/my-postgres-pg-pgbackrest-restore restore-now
+  kubectl wait --for=condition=complete job/restore-now --timeout=30m
+  kubectl scale statefulset my-postgres-pg --replicas=2
+  ```
+
+  The resource carries the `-repmgr` ServiceAccount (so `s3.keyType: auto` works) with its
+  API token unmounted, the postgresql pod/container security contexts, the
+  `data-<fullname>-0` PVC and `<fullname>-pgbackrest` ConfigMap mounts, the S3 and
+  repo-encryption credentials, and runs `pgbackrest restore --delta`. It reuses the #38
+  validation plumbing, but needs no `pg1-path` override: the mounted `pgbackrest.conf`
+  already points at the live PGDATA.
+
+  Notable properties:
+  - **Enabling it restores nothing.** It renders an *inert* resource — by default a
+    suspended CronJob carrying a schedule that can never fire — so it can be left enabled
+    and cloned when disaster strikes, without a `helm upgrade` mid-incident. The
+    destructive scale down/up stays an explicit operator action.
+  - **Two delivery modes** (`restore.mode`): `cronjob` (default) for
+    `kubectl create job --from`, where the resource belongs to the release and a GitOps
+    controller sees no stray object; or `job`, a bare Job to render on demand with
+    `helm template -s … | kubectl apply -f -` when the point-in-time target must be passed
+    inline (`restore.nameSuffix` gives a retry a fresh name, since Jobs are immutable).
+  - **It never starts PostgreSQL.** WAL replay and promotion happen when the StatefulSet is
+    scaled back up, under the normal chart entrypoint.
+  - **No Kubernetes API access is needed to be safe.** pgbackrest itself refuses to restore
+    while `$PGDATA/postmaster.pid` exists, so "did you actually scale down?" is enforced
+    without an RBAC-carrying token. `restore.force` covers the one legitimate exception, a
+    stale pid file left by a crash.
+  - PITR target wiring (`restore.targetType`/`target`, the same enum as `validation`, with
+    a template `fail` for the "target required once targetType is set" rule), plus
+    `restore.backupSet` (`pgbackrest --set`) to pin a specific backup set, and fail-fast
+    guards for the two prerequisites (`pgbackrest.enabled`, `postgresql.persistence.enabled`).
+
+  Covered by template tests and by two end-to-end suites, both of which destroy the data
+  directory outright and recover it from S3 through the documented runbook:
+  - `make -C pg test-pgbackrest-restore` — single node, plus the #38 validation phase;
+  - `make -C pg test-pgbackrest-restore-ha` (new) — primary + streaming standby. It restores
+    the primary out from under a live standby and confirms the standby rebuilds itself: the
+    restored primary comes back on a new timeline, the standby's init container detects the
+    mismatch (`Timeline mismatch (local: 1, primary: 2), re-cloning...`), re-clones via
+    `repmgr standby clone`, and resumes streaming — with no PVC deletion and no operator
+    action. The README documents this as verified behaviour rather than an assumption.
+
+### Changed
+
+- The README's Point-in-Time Recovery runbook is now the four-command flow above; the
+  `kubectl run --overrides` pod spec is gone, and the duplicate (and misleading — it had no
+  pod to run `pgbackrest` in) PITR recipe in the troubleshooting section now points at it.
+
 ## 1.6.0 - 2026-07-30
 
 ### Added

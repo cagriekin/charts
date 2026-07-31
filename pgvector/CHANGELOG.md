@@ -1,5 +1,39 @@
 # pgvector chart changelog
 
+## 1.7.0 - 2026-07-31
+
+Inherited from pg's symlinked templates (`pgbackrest-restore-job.yaml`,
+`pgbackrest-configmap.yaml`). See the [pg 1.7.0 changelog](../pg/CHANGELOG.md) for the full
+detail.
+
+### Added
+
+- **`pgbackrest.restore.*` — a first-class PITR restore resource** (#226). Replaces the
+  hand-built `kubectl run --overrides='{…}'` restore pod (~30 lines of inline JSON) with a
+  chart-rendered one: scale to 0 →
+  `kubectl create job --from=cronjob/<fullname>-pgbackrest-restore` → wait for the Job to
+  complete → scale back up. It
+  carries the `-repmgr` ServiceAccount (so `s3.keyType: auto` works, API token unmounted),
+  the postgresql security contexts, the `data-<fullname>-0` PVC and pgbackrest ConfigMap
+  mounts, the S3 / repo-encryption credentials, and `pgbackrest restore --delta`.
+
+  Enabling it restores nothing: it renders an inert resource (by default a suspended
+  CronJob that can never fire), so it can be left on and cloned when needed. It never
+  starts PostgreSQL — WAL replay and promotion happen on scale-up. `restore.mode: job`
+  renders a bare Job instead, for passing a point-in-time target inline via
+  `helm template -s`. Supports `restore.targetType`/`target`, `restore.backupSet` and
+  `restore.force`, with fail-fast guards for the target/targetType pair and for the
+  `pgbackrest.enabled` + `postgresql.persistence.enabled` prerequisites.
+
+  Standbys need no extra step: the restored primary returns on a new timeline, and each
+  standby's init container detects the mismatch and re-clones itself from it (verified in
+  the pg chart's `test-pgbackrest-restore-ha` suite, which covers these shared templates).
+
+### Changed
+
+- The README's Point-in-Time Recovery runbook is now that four-command flow; the
+  `kubectl run --overrides` pod spec is gone.
+
 ## 1.6.0 - 2026-07-30
 
 Inherited from pg's symlinked templates (`statefulset.yaml`, `postgresql-configmap.yaml`,

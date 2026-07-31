@@ -134,6 +134,75 @@ pg_exec() {
     psql -U "${user}" -d "${db}" -t -A -c "${query}" 2>/dev/null
 }
 
+# Deploy the in-cluster MinIO the pgbackrest suites back their repository with: a
+# self-signed TLS endpoint (Service :443 -> container :9000), the S3 credential Secret the
+# values fixtures reference, and the bucket. pgbackrest's verify-tls is off in those
+# fixtures, so the cert only has to exist. Idempotent -- safe to rerun in a live namespace.
+# Usage: deploy_minio <namespace> [bucket]
+deploy_minio() {
+  local namespace="$1"
+  local bucket="${2:-pgbackrest-test}"
+  local certdir
+  certdir="$(mktemp -d)"
+
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=minio" \
+    -addext "subjectAltName=DNS:minio" \
+    -keyout "${certdir}/private.key" -out "${certdir}/public.crt" >/dev/null 2>&1
+  kubectl create secret generic minio-tls -n "${namespace}" \
+    --from-file=public.crt="${certdir}/public.crt" --from-file=private.key="${certdir}/private.key" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  kubectl create secret generic s3-backup-creds -n "${namespace}" \
+    --from-literal=access-key-id=minioadmin --from-literal=secret-access-key=minioadmin \
+    --dry-run=client -o yaml | kubectl apply -f -
+  rm -rf "${certdir}"
+
+  echo "Deploying MinIO (TLS on :9000, Service exposes :443 -> 9000)..."
+  kubectl apply -n "${namespace}" -f - <<'MINIO'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: minio } }
+  template:
+    metadata: { labels: { app: minio } }
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2025-02-18T16-25-55Z
+          args: ["server", "/data", "--certs-dir", "/certs"]
+          env:
+            - { name: MINIO_ROOT_USER, value: minioadmin }
+            - { name: MINIO_ROOT_PASSWORD, value: minioadmin }
+          ports: [{ containerPort: 9000 }]
+          volumeMounts:
+            - { name: certs, mountPath: /certs, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: 9000, scheme: HTTPS }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: certs
+          secret: { secretName: minio-tls, defaultMode: 0444 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: minio }
+spec:
+  selector: { app: minio }
+  ports: [{ port: 443, targetPort: 9000 }]
+MINIO
+  wait_for_deployment_ready "${namespace}" "minio" 180
+
+  echo "Creating bucket ${bucket}..."
+  kubectl delete pod mc-setup -n "${namespace}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+  kubectl run mc-setup -n "${namespace}" --restart=Never --image=minio/mc:RELEASE.2024-11-21T17-21-54Z \
+    --command -- sh -c "mc --insecure alias set s3 https://minio:443 minioadmin minioadmin && mc --insecure mb s3/${bucket} || true"
+  kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/mc-setup -n "${namespace}" --timeout=120s
+  kubectl delete pod mc-setup -n "${namespace}" --wait=false
+}
+
 resolve_fullname() {
   local release="$1"
   local chart_dir="$2"

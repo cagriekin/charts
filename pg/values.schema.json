@@ -160,6 +160,31 @@
             "activeDeadlineSeconds": { "type": "integer" },
             "backoffLimit": { "type": "integer" }
           }
+        },
+        "restore": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "mode": {
+              "enum": ["cronjob", "job"],
+              "description": "cronjob = suspended CronJob to clone with `kubectl create job --from`; job = bare Job to render on demand with `helm template -s`."
+            },
+            "targetType": {
+              "enum": ["", "time", "xid", "name", "lsn"],
+              "description": "PITR target type (pgbackrest --type); empty restores the latest backup + replays all WAL. restore.target is required when set."
+            },
+            "target": { "type": "string" },
+            "backupSet": { "type": "string" },
+            "force": { "type": "boolean" },
+            "podOrdinal": { "type": "integer", "minimum": 0 },
+            "nameSuffix": {
+              "type": "string",
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+              "description": "Appended to the Job name (mode: job), so it must be a valid DNS-1123 label segment; empty = no suffix."
+            },
+            "activeDeadlineSeconds": { "type": "integer" },
+            "backoffLimit": { "type": "integer" }
+          }
         }
       }
     }
