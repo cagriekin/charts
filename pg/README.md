@@ -291,6 +291,8 @@ repmgr:
     majorVersion: "17"
 ```
 
+The chart checks the claim rather than trusting it: a `-pgNN` tag that disagrees with `repmgr.image.majorVersion` **fails the render**, and `PG_MAJOR` is passed to every container running the repmgr image — so if the majors are moved while the tag is left on the unsuffixed default (which carries no suffix to compare), the entrypoint and the agent refuse to start, naming both the requested and the bundled major. A wrong-major cluster is therefore a loud failure at install time, not a discovery months later.
+
 Standalone mode (`repmgr.enabled=false`) is unconstrained: there is no repmgr image in play, so `postgresql.image` alone decides the major.
 
 **This is a create-time choice, not an upgrade path.** The chart has no in-place major upgrade: changing the major of an existing cluster would start a new-major server on an old-major `PGDATA`, which refuses to boot. Moving an existing cluster between majors means a logical dump/restore into a fresh release.

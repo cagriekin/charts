@@ -72,7 +72,11 @@ jobs:
     needs: changes
     if: needs.changes.outputs.pg == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Two apt-heavy image builds (one per major, separate cache scopes so each is cold on
+    # its first run), two docker saves and three artifact uploads. A timeout here cancels
+    # the job, which skips all 40 suite legs and fails the required gate with no test
+    # signal at all, so it is sized for the cold case rather than the cached one.
+    timeout-minutes: 50
     steps:
       - name: Free up runner disk space
         run: |
@@ -130,6 +134,16 @@ jobs:
           set -euo pipefail
           tag=$(awk '/^repmgr:/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
           if [ -z "$tag" ]; then echo "could not resolve repmgr image tag from pg/values.yaml" >&2; exit 1; fi
+          # Normalise away a -pgNN suffix, exactly as pg/tests/set-pg-major.sh does when it
+          # rewrites the fixtures. Without this a tree whose chart tag is already suffixed
+          # (someone testing PG17 locally, or a future default flip) would build the PG18
+          # image as "...-pg17" while the switch script points the PG17 fixtures at that
+          # same name -- every PG17 leg would run PostgreSQL 18 and pass.
+          base=${tag%-pg[0-9]*}
+          if [ "$base" != "$tag" ]; then
+            echo "::notice title=pg-major::chart tag ${tag} is major-suffixed; using base ${base} for the per-major builds"
+            tag="$base"
+          fi
           for major in 18 17; do
             if [ "$major" = "18" ]; then ref="cagriekin/repmgr:${tag}"; else ref="cagriekin/repmgr:${tag}-pg${major}"; fi
             echo "Building ${ref} (PG_MAJOR=${major}) from images/repmgr"

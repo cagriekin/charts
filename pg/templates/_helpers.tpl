@@ -95,6 +95,21 @@ annotation consumers -- #128.)
 {{- with .Values.repmgr.image.digest }}@{{ . }}{{- end -}}
 {{- end -}}
 
+{{- /* PG_MAJOR for every container that runs the repmgr image (#269). The image sets
+       this ENV itself from its build arg; declaring it here makes the CHART's claim
+       authoritative instead, so a values file that asks for a major the image does not
+       bundle fails loudly -- the entrypoint's require_pg_bindir and the agent's boot
+       check both resolve their bindir from it. Without this the image would only ever
+       validate itself, and a chart/image disagreement (e.g. majorVersion 17 against the
+       unsuffixed PG18 tag) would run the wrong major silently. Repmgr mode only: in
+       standalone mode the server is the official postgres image, which ignores it. */ -}}
+{{- define "pg.pgMajorEnv" -}}
+{{- if .Values.repmgr.enabled -}}
+- name: PG_MAJOR
+  value: {{ required "repmgr.image.majorVersion is required" .Values.repmgr.image.majorVersion | quote }}
+{{- end -}}
+{{- end -}}
+
 {{- /* Generic image reference (#26): pass an image dict {repository, tag, digest?};
        renders repository:tag, with @digest appended when set so a digest pin overrides
        the mutable tag. */ -}}

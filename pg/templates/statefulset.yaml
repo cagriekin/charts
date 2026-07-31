@@ -42,6 +42,21 @@
 {{- if ne (toString .Values.postgresql.majorVersion) (toString $repmgrMajor) }}
 {{- fail (printf "postgresql.majorVersion=%q does not match repmgr.image.majorVersion=%q. In repmgr mode the PostgreSQL server runs from the repmgr image (%s), which bundles only PostgreSQL %s and always runs that server regardless of postgresql.image; a mismatch crash-loops the extension init container or silently runs the wrong major. Set postgresql.majorVersion=%q (with a matching postgresql.image), or point repmgr.image at an image built for PostgreSQL %s and set repmgr.image.majorVersion to match" (toString .Values.postgresql.majorVersion) (toString $repmgrMajor) .Values.repmgr.image.repository (toString $repmgrMajor) (toString $repmgrMajor) (toString .Values.postgresql.majorVersion)) }}
 {{- end }}
+{{- /* The two majorVersion values above are hand-typed claims; the image TAG is what
+       actually decides the major (#269). The published per-major tags carry a -pgNN
+       suffix, so when one is in use the chart can check the claim against the artifact
+       instead of trusting it -- catching "moved the tag, forgot the majors" (and the
+       reverse) at render time rather than as a crash-looping extension init container or,
+       with extensions off, a silently wrong major. An unsuffixed tag carries no major to
+       compare, which is why the container also gets PG_MAJOR from majorVersion: the
+       entrypoint and agent then refuse to start an image that lacks that major. */}}
+{{- $tagMajor := regexFind "-pg[0-9]+$" (toString .Values.repmgr.image.tag) }}
+{{- if $tagMajor }}
+{{- $tagMajor = trimPrefix "-pg" $tagMajor }}
+{{- if ne $tagMajor (toString $repmgrMajor) }}
+{{- fail (printf "repmgr.image.tag=%q is built for PostgreSQL %s, but repmgr.image.majorVersion=%q. The tag decides which major actually runs, so these must agree: set repmgr.image.majorVersion=%q and postgresql.majorVersion=%q, or change the tag suffix to -pg%s" (toString .Values.repmgr.image.tag) $tagMajor (toString $repmgrMajor) $tagMajor $tagMajor (toString $repmgrMajor)) }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- if and .Values.pgbackrest.enabled (not .Values.repmgr.enabled) }}
 {{- fail "pgbackrest.enabled requires repmgr.enabled=true: the pgbackrest binary and the archive_command run inside the postgresql container, which in standalone mode is the official postgres image without pgbackrest. WAL archiving would fail on every segment (unbounded WAL growth) and backups would time out. Enable repmgr, or disable pgbackrest" }}
@@ -324,6 +339,7 @@ spec:
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
+{{- with (include "pg.pgMajorEnv" .) }}{{ . | nindent 12 }}{{- end }}
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
             - name: POSTGRES_USER
@@ -434,6 +450,7 @@ spec:
               protocol: TCP
 {{- end }}
           env:
+{{- with (include "pg.pgMajorEnv" .) }}{{ . | nindent 12 }}{{- end }}
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
             - name: POSTGRES_USER
@@ -1009,6 +1026,7 @@ spec:
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
+{{- with (include "pg.pgMajorEnv" .) }}{{ . | nindent 12 }}{{- end }}
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
             - name: REPMGR_USER

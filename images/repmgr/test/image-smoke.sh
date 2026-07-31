@@ -14,10 +14,16 @@ set -uo pipefail
 IMAGE="${1:?usage: image-smoke.sh <image-ref> <expected-pg-major>}"
 WANT_MAJOR="${2:?usage: image-smoke.sh <image-ref> <expected-pg-major>}"
 
-# repmgr version the image tags advertise (trixie-<repmgr>-<n>[-pgNN]). PGDG packages
-# repmgr per major, so 17 and 18 could in principle carry different repmgr versions --
-# which would make the tag a lie. Assert both majors land on the same one.
-WANT_REPMGR="${WANT_REPMGR:-5.5.0}"
+# repmgr version to expect, DERIVED from the image tag (trixie-<repmgr>-<n>[-pgNN]) rather
+# than hardcoded. PGDG packages repmgr per major and the Dockerfile pins no repmgr version,
+# so 17 and 18 could carry different ones -- which would make the tag a lie. Deriving keeps
+# the assertion meaningful when PGDG moves on: a tag claiming 5.5.0 that ships 5.6.0 fails
+# with an obvious remedy (publish trixie-5.6.0-N), whereas a hardcoded expectation would
+# block every build and every PR until the test file was edited. Tags that do not encode a
+# version (local `repmgr:smoke-pg17` builds) fall back to the looser cross-check below.
+if [ -z "${WANT_REPMGR:-}" ]; then
+  WANT_REPMGR=$(printf '%s' "${IMAGE##*:}" | sed -nE 's/^trixie-([0-9]+\.[0-9]+\.[0-9]+)-.*/\1/p')
+fi
 
 fail=0
 ok()  { echo "PASS: $1"; }
@@ -25,7 +31,7 @@ bad() { echo "FAIL: $1"; [ -n "${2:-}" ] && echo "      $2"; fail=1; }
 
 command -v docker >/dev/null 2>&1 || { echo "docker is required to smoke-test an image" >&2; exit 1; }
 
-echo "=== SMOKE: ${IMAGE} (expecting PostgreSQL ${WANT_MAJOR}, repmgr ${WANT_REPMGR}) ==="
+echo "=== SMOKE: ${IMAGE} (expecting PostgreSQL ${WANT_MAJOR}, repmgr ${WANT_REPMGR:-<derived from the running image>}) ==="
 
 # One container run collects everything as KEY=value lines, so the assertions below are
 # named and independent while paying the container startup cost once. Each probe falls
@@ -57,7 +63,7 @@ echo "GOSU=$(command -v gosu || echo MISSING)"
 echo "CRON=$(command -v cron || echo MISSING)"
 echo "KUBECTL=$(kubectl version --client 2>&1 | head -1)"
 echo "AGENT=$([ -x /usr/local/bin/pg-ha-agent ] && echo yes || echo MISSING)"
-echo "PGAUDIT_SO=$([ -f "/usr/lib/postgresql/${PG_MAJOR}/lib/pgaudit.so" ] && echo yes || echo MISSING)"
+echo "PGAUDIT_SO=$([ -f "/usr/lib/postgresql/${PG_MAJOR:-unset}/lib/pgaudit.so" ] && echo yes || echo MISSING)"
 
 # pgaudit must LOAD, not merely be installed: the chart adds it to
 # shared_preload_libraries when audit.enabled=true, and PostgreSQL refuses to start if a
@@ -83,19 +89,34 @@ else
     echo "PGAUDIT_PRELOAD_START=failed"
     tail -5 /tmp/pgctl.log | sed "s/^/  pg_ctl: /"
 fi
+# Last line, unconditionally: its absence tells the caller the probe died partway (or the
+# container never started) so every assertion must be treated as failed, not satisfied.
+echo "PROBE_COMPLETE=ok"
 ' 2>&1)
 rc=$?
 
-if [ "$rc" -ne 0 ] && [ -z "$probe" ]; then
-  echo "FAIL: could not run ${IMAGE}"
+# The probe ends with PROBE_COMPLETE=ok. Requiring that sentinel -- rather than just a
+# zero exit or non-empty output -- is what stops a container that never started from
+# producing a wall of PASS lines: with no key lines at all, every "is this present?"
+# assertion below would otherwise read an empty value and be satisfied.
+if ! printf '%s\n' "$probe" | grep -qx 'PROBE_COMPLETE=ok'; then
+  echo "--- probe output ---"
   echo "$probe"
+  echo "FAIL: the probe did not run to completion in ${IMAGE} (rc=${rc}); treating every check as failed"
+  echo "SMOKE FAILED: ${IMAGE}"
   exit 1
 fi
 echo "--- probe output ---"
 echo "$probe"
 echo "--- assertions ---"
 
-val() { printf '%s\n' "$probe" | grep -m1 "^$1=" | cut -d= -f2-; }
+# An ABSENT key returns the literal <absent> rather than the empty string, so a probe
+# line that never ran fails its assertion instead of quietly satisfying a != test.
+val() {
+  local line
+  line=$(printf '%s\n' "$probe" | grep -m1 "^$1=") || { printf '%s' '<absent>'; return; }
+  printf '%s' "${line#*=}"
+}
 
 # The image must announce its own major: the chart's repmgr.image.majorVersion is a
 # render-time claim, while this ENV is what the entrypoint and agent actually follow.
@@ -122,36 +143,65 @@ case "$svn" in
   *) bad "running server_version_num ${svn} is not PostgreSQL ${WANT_MAJOR}" ;;
 esac
 
+# Assert the value the probe emits on success ("yes" / an absolute path). Testing
+# `!= MISSING` would pass for an absent or empty key -- which is exactly how a skipped
+# pgaudit check could report PASS while audit logging was silently unavailable.
 for probe_key in PG_CTL PG_CONTROLDATA AGENT PGAUDIT_SO; do
-  [ "$(val "$probe_key")" != "MISSING" ] \
+  got=$(val "$probe_key")
+  [ "$got" = "yes" ] \
     && ok "${probe_key} present" \
-    || bad "${probe_key} missing from the image"
+    || bad "${probe_key} missing from the image" "got ${got}"
 done
 
 for probe_key in JQ GOSU CRON; do
-  [ "$(val "$probe_key")" != "MISSING" ] \
-    && ok "${probe_key} on PATH" \
-    || bad "${probe_key} not on PATH (the chart's scripts call it)"
+  got=$(val "$probe_key")
+  case "$got" in
+    /*) ok "${probe_key} on PATH (${got})" ;;
+    *)  bad "${probe_key} not on PATH (the chart's scripts call it)" "got ${got}" ;;
+  esac
 done
 
 # repmgrd-entrypoint.sh and the chart's repmgrd container invoke `repmgrd` with no PATH
 # manipulation, so bare resolution must work for whichever major is installed.
 for probe_key in REPMGR_RESOLVED REPMGRD_RESOLVED; do
   got=$(val "$probe_key")
-  [ "$got" != "MISSING" ] \
-    && ok "${probe_key} resolves on the default PATH (${got})" \
-    || bad "${probe_key} does not resolve on the default PATH; the repmgrd container would fail to start"
+  case "$got" in
+    /*) ok "${probe_key} resolves on the default PATH (${got})" ;;
+    *)  bad "${probe_key} does not resolve on the default PATH; the repmgrd container would fail to start" "got ${got}" ;;
+  esac
 done
 
 # A different repmgr version per major would make the trixie-<repmgr>-<n> tag scheme
 # misleading, and puts the cluster on a version the chart was never tested against.
-for probe_key in REPMGR_VERSION REPMGRD_VERSION; do
-  got=$(val "$probe_key")
-  case "$got" in
-    *"${WANT_REPMGR}"*) ok "${probe_key} is ${WANT_REPMGR} (${got})" ;;
-    *) bad "${probe_key} is not ${WANT_REPMGR}; the image tag would misstate it" "$got" ;;
+repmgr_v=$(val REPMGR_VERSION)
+repmgrd_v=$(val REPMGRD_VERSION)
+if [ -n "$WANT_REPMGR" ]; then
+  # The tag names a version, so hold the image to it: a mismatch means the tag lies, and
+  # the remedy is to publish under the version PGDG now ships.
+  for probe_key in REPMGR_VERSION REPMGRD_VERSION; do
+    got=$(val "$probe_key")
+    case "$got" in
+      *"${WANT_REPMGR}"*) ok "${probe_key} is ${WANT_REPMGR} (${got})" ;;
+      *) bad "${probe_key} is not ${WANT_REPMGR} as the tag ${IMAGE##*:} advertises; publish under the version PGDG now ships (or pass WANT_REPMGR)" "$got" ;;
+    esac
+  done
+else
+  # Untagged/local build: no version to hold it to, but the two binaries must still agree
+  # and report something -- a repmgr/repmgrd split would break failover in ways no other
+  # check here would notice.
+  case "$repmgr_v" in
+    "repmgr "[0-9]*) ok "repmgr reports a version (${repmgr_v})" ;;
+    *) bad "repmgr did not report a version" "$repmgr_v" ;;
   esac
-done
+  case "$repmgrd_v" in
+    "repmgrd "[0-9]*) ok "repmgrd reports a version (${repmgrd_v})" ;;
+    *) bad "repmgrd did not report a version" "$repmgrd_v" ;;
+  esac
+  [ "${repmgr_v#repmgr }" = "${repmgrd_v#repmgrd }" ] \
+    && ok "repmgr and repmgrd are the same version (${repmgr_v#repmgr })" \
+    || bad "repmgr and repmgrd disagree on version" "${repmgr_v} vs ${repmgrd_v}"
+  echo "note: ${IMAGE##*:} encodes no repmgr version, so the exact-version check was skipped"
+fi
 
 pgbr=$(val PGBACKREST_VERSION)
 case "$pgbr" in

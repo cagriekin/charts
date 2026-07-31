@@ -73,21 +73,30 @@ TARGETS=("$VALUES" "${FIXTURES[@]}" "${SUITES[@]}")
 # Comment lines are skipped: several suites cite an old image tag as the context for a
 # regression they guard ("... under PG18 + cagriekin/repmgr:trixie-5.5.0-11"), and
 # rewriting that history would make the comment claim something untrue.
+#
+# So are lines marked `set-pg-major: keep` -- a deliberate pin on an OLDER RELEASED image
+# (the migration suite's pre-agent "from" image, the TLS suite's repmgrd release). Those
+# tags are the test's subject, not an incidental reference: rewriting them to the chart's
+# own tag makes the migration suite upgrade an image to itself, silently deleting the
+# "adopt agent mode from a published image" coverage. See KEEP_PASS below for how a
+# non-default major, which has no older published image to migrate from, is handled.
+KEEP_MARK='set-pg-major: keep'
+
 apply() {
-  local what="$1" pattern="$2" script="$3" hits=0 f n
+  local what="$1" pattern="$2" script="$3" total=0 f n
   for f in "${TARGETS[@]}"; do
     [ -f "$f" ] || continue
     # Count only the lines sed will actually rewrite, so a pattern that survives just
-    # inside comments still counts as "matched nothing".
-    n=$(grep -vE '^[[:space:]]*#' "$f" | grep -cE "$pattern" || true)
-    hits=$((hits + n))
-    [ "$n" -gt 0 ] && sed -i -E "/^[[:space:]]*#/! ${script}" "$f"
+    # inside comments or keep-marked lines still counts as "matched nothing".
+    n=$(grep -vE '^[[:space:]]*#' "$f" | grep -v "$KEEP_MARK" | grep -cE "$pattern" || true)
+    total=$((total + n))
+    [ "$n" -gt 0 ] && sed -i -E "/^[[:space:]]*#/! { /${KEEP_MARK}/! ${script} }" "$f"
   done
-  if [ "$hits" -eq 0 ]; then
+  if [ "$total" -eq 0 ]; then
     echo "FATAL: rule '${what}' matched nothing (pattern: ${pattern}); set-pg-major.sh is stale" >&2
     exit 1
   fi
-  echo "  ${what}: ${hits} occurrence(s)"
+  echo "  ${what}: ${total} occurrence(s)"
 }
 
 # postgresql.majorVersion and repmgr.image.majorVersion. The render guard
@@ -104,10 +113,94 @@ apply "repmgr image tag" \
   'trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?' \
   's/trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?/'"${REPMGR_TAG}"'/g'
 
-# postgres image tags (postgresql.image.tag + the TLS suite's client pod).
+# postgres image tags (postgresql.image.tag + the TLS suite's client pod). Deliberately
+# broader than the tags in the tree today -- `postgres:17-trixie` (major-only) and the
+# bookworm variants are equally valid pins, and one left behind would put a PG18 server
+# in a PG17 leg while the rule still reported hits from the other fixtures.
 apply "postgres image tag" \
-  '[0-9]+\.[0-9]+-trixie' \
-  's/[0-9]+\.[0-9]+-trixie/'"${PG_IMAGE_TAG}"'/g'
+  '[0-9]+(\.[0-9]+)?-(trixie|bookworm)' \
+  's/[0-9]+(\.[0-9]+)?-(trixie|bookworm)/'"${PG_IMAGE_TAG}"'/g'
+
+# On the default major the keep-marked pins are left alone -- but a PREVIOUS non-default run
+# in this same tree will have rewritten them to a -pgNN tag, and this run skips them, so the
+# tree would be left half-switched with no other check looking at those lines. That only
+# happens when the tree is not a clean checkout, which is exactly when silence misleads.
+if [ "$MAJOR" = "$DEFAULT_MAJOR" ]; then
+  for f in "${TARGETS[@]}"; do
+    [ -f "$f" ] || continue
+    stale=$(grep "$KEEP_MARK" "$f" | grep -oE 'trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-pg[0-9]+' || true)
+    [ -z "$stale" ] && continue
+    echo "FATAL: $(basename "$f") has a '${KEEP_MARK}' pin left on ${stale} by an earlier non-default run" >&2
+    echo "       this tree is half-switched; restore it first: git checkout -- pg/values.yaml pg/tests" >&2
+    exit 1
+  done
+fi
+
+# A non-default major has no older PUBLISHED image to migrate from -- only the -pgNN build
+# CI just made exists -- so on those legs the keep-marked pins must move after all, or the
+# migration suite would start a PG18 server on a PG17 PGDATA and fail for the wrong reason.
+# Say so loudly: on this leg those suites no longer test "upgrade from an older release",
+# and the default-major leg is what preserves that coverage.
+if [ "$MAJOR" != "$DEFAULT_MAJOR" ]; then
+  keep_hits=0
+  for f in "${TARGETS[@]}"; do
+    [ -f "$f" ] || continue
+    n=$(grep -c "$KEEP_MARK" "$f" || true)
+    [ "$n" -gt 0 ] || continue
+    keep_hits=$((keep_hits + n))
+    sed -i -E "/${KEEP_MARK}/ s/trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?/${REPMGR_TAG}/g" "$f"
+    echo "  note: retargeted ${n} deliberate older-release pin(s) in $(basename "$f") to ${REPMGR_TAG}"
+  done
+  if [ "$keep_hits" -gt 0 ]; then
+    echo "  note: PG${MAJOR} has no older published image, so 'upgrade from an older release' is NOT covered on this leg (the PG${DEFAULT_MAJOR} legs cover it)"
+  fi
+fi
+
+# Nothing may be left pointing at another major. The per-rule counters above only prove a
+# rule fired somewhere; these two checks prove no target still names a different image,
+# which is the property that actually matters -- one missed fixture is a leg that runs the
+# wrong major and passes. Deliberate pins are excluded by their marker, not by the shape of
+# the tag, so `tag: x`, `tag=x` and a bare `${VAR:-x}` default are all covered.
+leftovers=""
+
+# 1. Suite scripts: any repository-qualified reference (inline --set flags, kubectl run
+#    --image=...). Matched on the repository, so an unrecognised tag SHAPE cannot slip by.
+for f in "${SUITES[@]}"; do
+  refs=$(grep -vE '^[[:space:]]*#' "$f" | grep -v "$KEEP_MARK" \
+    | grep -oE '(cagriekin/repmgr|postgres)[:=][A-Za-z0-9._-]+' || true)
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    case "$ref" in
+      *"cagriekin/repmgr:${REPMGR_TAG}") continue ;;
+      *"postgres:${PG_IMAGE_TAG}") continue ;;
+    esac
+    leftovers="${leftovers}"$'\n'"  $(basename "$f"): ${ref}"
+  done <<<"$refs"
+done
+
+# 2. Fixtures: render each one and check the images the chart ACTUALLY produces, rather
+#    than pattern-matching YAML -- the only check that stays true as the values shape
+#    changes. A fixture that cannot render alone (missing prerequisite secrets) is noted
+#    and skipped rather than silently ignored.
+if command -v helm >/dev/null 2>&1; then
+  skipped=""
+  for fx in "${FIXTURES[@]}"; do
+    out=$(helm template verify "$CHART_DIR" -f "$fx" 2>/dev/null) || { skipped="${skipped} $(basename "$fx")"; continue; }
+    while IFS= read -r img; do
+      case "$img" in
+        "cagriekin/repmgr:${REPMGR_TAG}"|"postgres:${PG_IMAGE_TAG}") continue ;;
+      esac
+      leftovers="${leftovers}"$'\n'"  $(basename "$fx") renders: ${img}"
+    done <<<"$(grep -oE '(cagriekin/repmgr|postgres):[A-Za-z0-9._-]+' <<<"$out" | sort -u)"
+  done
+  [ -n "$skipped" ] && echo "  note: fixtures that do not render standalone were not image-checked:${skipped}"
+fi
+
+if [ -n "$leftovers" ]; then
+  echo "FATAL: image references not retargeted to PostgreSQL ${MAJOR}:${leftovers}" >&2
+  echo "       add a rewrite rule, or mark the line '${KEEP_MARK}' if the pin is deliberate" >&2
+  exit 1
+fi
 
 # The render suite must come through untouched (see the TARGETS note). Checked rather
 # than assumed because the damage is invisible: a glob that starts matching it would

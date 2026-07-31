@@ -42,7 +42,7 @@
 
 ### Changed
 
-- `repmgr.image.tag` / `etcd.bootstrapImage.tag` → `trixie-5.5.0-29`, which carries the
+- `repmgr.image.tag` / `etcd.rbac.bootstrapImage.tag` → `trixie-5.5.0-29`, which carries the
   `PG_MAJOR` parameterisation. **An unchanged values file produces an unchanged result**:
   the unsuffixed tag is still PostgreSQL 18, and the render is byte-identical apart from
   the tag itself.
@@ -53,6 +53,23 @@
   `postgresql.majorVersion`). It is now asserted symmetrically, so moving
   `repmgr.image.majorVersion` alone — the direction the parameterisation makes possible —
   also fails fast instead of running one major while building extension paths for another.
+
+- **The image tag now has to agree with the major it claims.** The `-pgNN` suffix is what
+  actually selects the server major, but the guard above only compared two hand-typed
+  `majorVersion` values — so moving the tag without the majors (or the reverse) rendered
+  cleanly and ran the wrong major: a crash-looping extension init container with
+  `extensions.enabled=true`, a silently wrong major without it. The render now fails when a
+  `-pgNN` tag disagrees with `repmgr.image.majorVersion`, and `PG_MAJOR` is passed to every
+  container running the repmgr image so the unsuffixed case is caught too — the entrypoint
+  and the agent refuse to start an image that does not bundle the requested major, naming
+  both sides.
+
+- `etcd.bootstrapImage.tag` was never read: the etcd subchart takes it at
+  `rbac.bootstrapImage`, so the RBAC-bootstrap Job stayed on the subchart's older default
+  (`trixie-5.5.0-24`) while every other container moved with the chart. Anyone mirroring
+  only the tags the chart names got ImagePullBackOff on the post-install Job, leaving etcd
+  auth disabled and every agent with full-keyspace access. Now nested correctly, so one tag
+  covers the whole render.
 
 - The repmgr image's shell layer and Go agent hardcoded `/usr/lib/postgresql/18/bin` in
   seven places, so the bindir is now derived from `PG_MAJOR` (`repmgr-common.sh` exports
@@ -69,7 +86,13 @@
 - The live suites pinned `repmgr.image.tag: trixie-5.5.0-27` in their fixtures while the
   chart shipped `-28`, so they pulled an older published image instead of the one CI
   builds from source. `set-pg-major.sh` now retargets every fixture at the chart's own
-  tag before a suite runs, on both majors — so CI tests the image it built.
+  tag before a suite runs, on both majors — so CI tests the image it built. The two suites
+  that deliberately pin an *older released* image (the repmgrd→agent migration and the
+  repmgrd TLS leg) are marked `set-pg-major: keep` and left alone on the default major, so
+  retargeting does not quietly turn "upgrade from a published image" into "upgrade an image
+  to itself"; on a non-default major, where no older published image exists, they are
+  retargeted with a logged note that the coverage does not apply there.
+
 ## 1.8.0 - 2026-07-31
 
 ### Added

@@ -17,6 +17,21 @@
 PG_MAJOR="${PG_MAJOR:-18}"
 PG_BINDIR="/usr/lib/postgresql/${PG_MAJOR}/bin"
 
+# Refuse to run when PG_MAJOR names a major this image does not bundle. The chart passes
+# PG_MAJOR from repmgr.image.majorVersion, so this is where a values file asking for 17
+# against a PG18 image (or vice versa) stops -- with both majors named. Without it the
+# PATH export below would silently point nowhere and the failure would surface as
+# `initdb: command not found` or, worse, a re-clone loop. Called by the entrypoints
+# rather than at source time so the shell unit tests can source this file anywhere.
+require_pg_bindir() {
+    [ -x "${PG_BINDIR}/postgres" ] && return 0
+    local installed
+    installed=$(ls -1d /usr/lib/postgresql/*/ 2>/dev/null | sed 's#.*/postgresql/##; s#/$##' | paste -sd, -)
+    echo "FATAL: PG_MAJOR=${PG_MAJOR} but ${PG_BINDIR}/postgres is missing; this image bundles PostgreSQL ${installed:-none}." >&2
+    echo "       In repmgr mode the chart's repmgr.image.tag decides the major: set repmgr.image.majorVersion (and postgresql.majorVersion) to ${installed:-the bundled major}, or point repmgr.image.tag at an image built for ${PG_MAJOR} (e.g. a -pg${PG_MAJOR} tag)." >&2
+    return 1
+}
+
 # Decimal value of an 8-hex-digit WAL-filename timeline. The first 8 chars of
 # pg_walfile_name(pg_current_wal_lsn()) are the timeline in HEX, so a SQL `::int` cast is
 # WRONG: it parses decimal, so '0000000A' (TL 10) errors and '00000010' (TL 16) yields 10

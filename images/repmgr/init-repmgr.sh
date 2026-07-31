@@ -10,6 +10,10 @@ fi
 # Sourced BEFORE the PATH export below, which needs the PG_BINDIR it defines (#269).
 source /usr/local/bin/repmgr-common.sh
 
+# Stop here if PG_MAJOR (from the chart) names a major this image does not bundle, so the
+# mismatch is reported once with both majors named instead of as a missing initdb (#269).
+require_pg_bindir || exit 1
+
 # pg_controldata / pg_ctl / repmgr's helpers live in the versioned bindir,
 # which is not on the default PATH; without this the local-timeline read below
 # silently fails and every standby restart does a full re-clone.

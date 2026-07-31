@@ -2119,6 +2119,40 @@ pg17_audit=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/postgresql-configmap.yaml 2>&1)
 assert_contains "#269: audit on PG17 preloads pgaudit" "${pg17_audit}" "shared_preload_libraries = 'repmgr,pgaudit'"
 
+# --- #269 review: the TAG is what actually selects the major, so check it too ---
+
+# The two majorVersion values are hand-typed claims; the -pgNN suffix is the artifact. A
+# values file that moves one and not the other must fail at render, not run the wrong major.
+tag_mismatch=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.image.tag=trixie-5.5.0-29-pg17 2>&1) && tag_mismatch_rc=0 || tag_mismatch_rc=$?
+assert_eq "#269: render fails when the -pg17 tag disagrees with majorVersion" "1" "${tag_mismatch_rc}"
+assert_contains "#269: tag mismatch names the tag and the major" "${tag_mismatch}" "is built for PostgreSQL 17"
+
+# The reverse: majors moved to 17 but the tag left on the unsuffixed (PG18) default. No
+# suffix means nothing to compare, which is why PG_MAJOR is passed to the container -- the
+# entrypoint's require_pg_bindir and the agent then refuse to start the wrong image.
+pgmajor_env=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.majorVersion=17 --set repmgr.image.majorVersion=17 \
+  --set repmgr.image.tag=trixie-5.5.0-29-pg17 \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#269: PG_MAJOR env follows repmgr.image.majorVersion" "${pgmajor_env}" "value: \"17\""
+pgmajor_count=$(grep -c "name: PG_MAJOR" <<< "${pgmajor_env}")
+assert_eq "#269: PG_MAJOR set on both repmgr-image containers (init + postgresql)" "2" "${pgmajor_count}"
+
+# Standalone runs the official postgres image, which knows nothing of PG_MAJOR; setting it
+# there would be misleading noise.
+pgmajor_standalone=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#269: standalone does not set PG_MAJOR" "${pgmajor_standalone}" "name: PG_MAJOR"
+
+# repmgrd mode adds the sidecar, which runs the same image and needs the same major.
+pgmajor_repmgrd=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.failoverMode=repmgrd \
+  --show-only templates/statefulset.yaml 2>&1)
+pgmajor_repmgrd_count=$(grep -c "name: PG_MAJOR" <<< "${pgmajor_repmgrd}")
+assert_eq "#269: repmgrd mode sets PG_MAJOR on all three repmgr-image containers" "3" "${pgmajor_repmgrd_count}"
+
 # the pin only applies in repmgr mode: standalone may run any major
 major_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.enabled=false \

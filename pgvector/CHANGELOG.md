@@ -23,8 +23,20 @@ Inherited from pg's symlinked templates and the shared repmgr image. See the
 
 ### Changed
 
-- `repmgr.image.tag` / `etcd.bootstrapImage.tag` → `trixie-5.5.0-29`. **An unchanged values
-  file produces an unchanged result**: the unsuffixed tag is still PostgreSQL 18.
+- `repmgr.image.tag` → `trixie-5.5.0-29`. **An unchanged values file produces an unchanged
+  result**: the unsuffixed tag is still PostgreSQL 18.
+
+### Fixed
+
+- The render now fails when a `-pgNN` image tag disagrees with `repmgr.image.majorVersion`,
+  and `PG_MAJOR` is passed to every container running the repmgr image, so a mismatch the
+  tag cannot express (majors moved to 17 against the unsuffixed PG18 tag) is refused at
+  startup with both majors named instead of running the wrong major silently.
+
+- The bundled etcd's RBAC-bootstrap Job never picked up the chart's tag override: the
+  subchart reads it at `rbac.bootstrapImage`, so a top-level `etcd.bootstrapImage` was
+  ignored and the Job stayed on `trixie-5.5.0-24`.
+
 ## 1.8.0 - 2026-07-31
 
 Inherited from pg's symlinked templates (`statefulset.yaml`, `pgbackrest-configmap.yaml`). See

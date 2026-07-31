@@ -43,42 +43,12 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           "$(go env GOPATH)/bin/govulncheck" ./...
 
-  # Build each major for amd64 and start it before anything is pushed (#269): a tag push
-  # does not run repmgr-image-test.yaml, so without this a per-major package regression
-  # (e.g. no postgresql-<major>-pgaudit) could be published and signed. The multi-arch
-  # build below reuses the same layer cache, so this costs little wall-clock.
-  smoke:
-    needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        pg_major: ["18", "17"]
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build repmgr image (PG${{ matrix.pg_major }}, amd64)
-        run: |
-          docker buildx build --load \
-            --build-arg PG_MAJOR=${{ matrix.pg_major }} \
-            --cache-from type=gha,scope=repmgr-publish-pg${{ matrix.pg_major }} \
-            --cache-to type=gha,mode=max,scope=repmgr-publish-pg${{ matrix.pg_major }} \
-            -t "repmgr:smoke-pg${{ matrix.pg_major }}" images/repmgr
-
-      - name: Smoke-test the image
-        run: bash images/repmgr/test/image-smoke.sh "repmgr:smoke-pg${{ matrix.pg_major }}" "${{ matrix.pg_major }}"
-
   # One leg per PostgreSQL major (#269). The DEFAULT major also claims the unsuffixed
   # tag, so every existing chart pin keeps resolving to it; the -pgNN tags let a user
   # select a major explicitly. Both tags in a leg are one push, hence one digest and
   # one signature.
   build-and-publish:
-    needs: [test, smoke]
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -103,6 +73,16 @@ jobs:
             echo "Could not resolve an image tag" >&2
             exit 1
           fi
+          # The base tag must NOT carry a major suffix: the suffix is appended per matrix
+          # leg, so `trixie-5.5.0-30-pg17` would publish the PostgreSQL 18 build as
+          # ...-pg17 (and the 17 build as ...-pg17-pg17) -- a signed image whose name
+          # states the wrong major, which the chart's tag guard would then trust.
+          case "$tag" in
+            *-pg[0-9]*)
+              echo "Refusing to publish from ${tag}: pass the UNSUFFIXED base tag (e.g. trixie-5.5.0-30); each leg appends its own -pgNN" >&2
+              exit 1
+              ;;
+          esac
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           # Tag list for this major. The default major additionally publishes the
           # UNSUFFIXED tag -- that is the contract every existing chart pin relies on,
@@ -126,6 +106,26 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Build this major for amd64 and START it before anything is pushed: a tag push does
+      # not run repmgr-image-test.yaml, so without this a per-major regression (a missing
+      # postgresql-<major>-pgaudit, a bindir the scripts cannot find) could be published and
+      # signed. Deliberately inside the publish leg, not a separate job: as its own job it
+      # gated BOTH legs, so a PG17-only failure would withhold the unsuffixed default-major
+      # tag that every existing chart pin resolves to. The multi-arch build below reuses
+      # this leg's layer cache, so the extra wall-clock is small.
+      - name: Build and smoke-test PG${{ matrix.pg_major }} (amd64) before publishing
+        run: |
+          set -euo pipefail
+          ref="cagriekin/repmgr:${{ steps.meta.outputs.tag }}-pg${{ matrix.pg_major }}"
+          docker buildx build --load \
+            --build-arg PG_MAJOR=${{ matrix.pg_major }} \
+            --cache-from type=gha,scope=repmgr-publish-pg${{ matrix.pg_major }} \
+            --cache-to type=gha,mode=max,scope=repmgr-publish-pg${{ matrix.pg_major }} \
+            -t "$ref" images/repmgr
+          # Named with the real tag so image-smoke.sh derives the repmgr version the tag
+          # advertises and holds the artifact to it.
+          bash images/repmgr/test/image-smoke.sh "$ref" "${{ matrix.pg_major }}"
 
       - name: Build and push Docker image
         id: build

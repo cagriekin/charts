@@ -268,6 +268,33 @@ for cmd in start stop restart reload; do
   fi
 done
 
+# --- #269: require_pg_bindir refuses a major the image does not bundle ---
+# The chart passes PG_MAJOR from repmgr.image.majorVersion, so this function is where a
+# values file asking for a major the image was not built with stops. Behavioral, not
+# structural: a bogus major must fail and the message must name both sides, because the
+# alternative failure mode is an empty PATH element and a confusing "initdb: not found".
+bogus=$( PG_MAJOR=999 bash -c 'source '"${ROOT}"'/repmgr-common.sh; require_pg_bindir' 2>&1 )
+bogus_rc=$?
+if [ "$bogus_rc" -ne 0 ]; then
+  ok "#269: require_pg_bindir fails for a major the image does not bundle"
+else
+  bad "#269: require_pg_bindir accepted PG_MAJOR=999"
+fi
+if grep -q 'PG_MAJOR=999' <<<"$bogus" && grep -qi 'repmgr.image.majorVersion' <<<"$bogus"; then
+  ok "#269: require_pg_bindir names the requested major and the values to fix"
+else
+  bad "#269: require_pg_bindir message is not actionable" "$bogus"
+fi
+
+# Both entrypoints must CALL it -- an unused guard is no guard.
+for s in entrypoint.sh init-repmgr.sh; do
+  if grep -q 'require_pg_bindir' "${ROOT}/${s}"; then
+    ok "#269: ${s} calls require_pg_bindir"
+  else
+    bad "#269: ${s} does not call require_pg_bindir"
+  fi
+done
+
 # --- #269: the unsuffixed published image tag must keep meaning PG18 ---
 # Existing chart pins (repmgr.image.tag without a -pgNN suffix) resolve to the image
 # built with no --build-arg, so flipping this default would silently move every
