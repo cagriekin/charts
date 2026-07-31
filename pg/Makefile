@@ -4,7 +4,7 @@ TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-repmgr test-repmgr-chaos test-full test-failover test-upgrade \
-        test-repmgr-failover test-agent test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-backup-concurrent test-pgbackrest-restore test-pgbackrest-restore-ha test-databases-roles test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
+        test-repmgr-failover test-agent test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-backup-concurrent test-pgbackrest-restore test-pgbackrest-restore-ha test-pgbackrest-bootstrap test-databases-roles test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -31,6 +31,7 @@ help:
 	@echo "  test-backup-concurrent - Run concurrent pgbackrest backup + WAL archiving test"
 	@echo "  test-pgbackrest-restore - Run pgbackrest PITR restore-validation + live restore Job test (#38/#226)"
 	@echo "  test-pgbackrest-restore-ha - Run multi-replica pgbackrest restore + standby re-clone test (#226)"
+	@echo "  test-pgbackrest-bootstrap - Run bootstrap-from-backup PVC-loss recovery test (#266)"
 	@echo "  test-databases-roles - Run declarative databases/roles/grants test (#218)"
 	@echo "  test-special-chars - Run special-character credential tests"
 	@echo "  cluster-create  - Create Kind cluster"
@@ -157,6 +158,9 @@ test-pgbackrest-restore: cluster-exists
 
 test-pgbackrest-restore-ha: cluster-exists
 	@bash $(TESTS_DIR)/test-pgbackrest-restore-ha.sh
+
+test-pgbackrest-bootstrap: cluster-exists
+	@bash $(TESTS_DIR)/test-pgbackrest-bootstrap.sh
 
 test-databases-roles: cluster-exists
 	@bash $(TESTS_DIR)/test-databases-roles.sh

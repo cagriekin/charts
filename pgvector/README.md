@@ -897,6 +897,67 @@ helm install my-pgvector cagriekin/pgvector \
 | `pgbackrest.restore.backoffLimit` | Restore Job backoff limit (0 = one attempt; a half-written PGDATA should not be retried automatically) | `0` |
 | `pgbackrest.restore.resources.*` | Restore Job resource requests/limits | `200m`/`256Mi` … `1`/`1Gi` |
 | _scheduling_ | The restore pod inherits `postgresql.nodeSelector` and `postgresql.tolerations` so it lands where the data PVC can attach (`postgresql.affinity` is not inherited) | — |
+| `pgbackrest.bootstrap.enabled` | Seed an **empty** PGDATA on replica 0 from this release's repo via an init container (#266) — a lost PVC recovers instead of initdb-ing an empty cluster | `false` |
+| `pgbackrest.bootstrap.targetType` | PITR target type for the bootstrap: `""` (latest) \| `time` \| `xid` \| `name` \| `lsn`. `target` required when set. Applies to **every** fresh bootstrap, not once | `""` |
+| `pgbackrest.bootstrap.target` | PITR target value for the type above | `""` |
+| `pgbackrest.bootstrap.backupSet` | `pgbackrest --set`: bootstrap from a specific backup set label instead of the latest | `""` |
+| `pgbackrest.bootstrap.resources.*` | Bootstrap init-container resource requests/limits | `200m`/`256Mi` … `1`/`1Gi` |
+
+### Bootstrap from backup: automatic recovery from a lost PVC (#266)
+
+Without this, losing replica 0's PVC is quietly the worst kind of outage. The pod comes back,
+the entrypoint finds an empty data directory, and it **`initdb`s a brand new empty cluster** —
+your backups are safe in S3, but the live database is empty and nothing has failed loudly.
+
+`pgbackrest.bootstrap.enabled=true` adds an init container that runs before `repmgr-init` and
+seeds an *empty* PGDATA from this release's own repository. PostgreSQL then replays the archived
+WAL on startup and promotes, so a lost volume self-heals with no operator action:
+
+```yaml
+pgbackrest:
+  enabled: true
+  bootstrap:
+    enabled: true
+```
+
+**It is safe to leave enabled.** It only ever writes into an *empty* data directory:
+
+| Data directory state | What the bootstrap does |
+|---|---|
+| Empty, repository has backups | Restores, writes a completion marker, lets postgres replay WAL |
+| Empty, repository has **no** backup yet | Nothing — a normal first install proceeds and `initdb` runs |
+| Empty, repository **unreachable** | **Fails loudly** and the pod stays in `Init` |
+| Already initialized | Nothing — refuses to touch it, whatever the marker says |
+| Partially restored (aborted attempt) | Resumes the restore (`--delta`) |
+| Any replica other than 0 | Nothing — standbys are cloned from the primary by repmgr |
+
+That third row is deliberate: if the repository cannot be reached, the state of the backups is
+*unknown*, and initializing an empty cluster then would destroy a database that is probably
+still recoverable. Failing to start is the safe outcome. (Reached only when PGDATA is empty, so
+a pod rescheduled with an intact volume never depends on S3 being up.)
+
+The completion marker lives at `$PGDATA/.pgbackrest-bootstrap-complete` and records the stanza,
+backup set, target and system identifier used. Because it lives inside PGDATA it shares the
+volume's lifecycle — losing the volume clears it exactly when a fresh bootstrap becomes correct
+again, with no external state to drift.
+
+This is the automatic counterpart to the restore Job above; they are orthogonal and can both be
+enabled:
+
+| | `bootstrap` | `restore` |
+|---|---|---|
+| Writes into | An **empty** PGDATA only | A **live** PGDATA (destructive) |
+| Triggered by | Pod startup, automatically | An operator (`kubectl create job`) |
+| Use it for | A lost or replaced PVC | Rolling the database back to a point in time |
+
+Setting `bootstrap.targetType`/`target` pins the bootstrap to a point in time — but note it
+applies to **every** fresh bootstrap of this release, not just the next one, so leave both empty
+unless you really want every rebuilt replica 0 to land on that same target.
+
+Verified end to end by `the pg chart's `test-pgbackrest-bootstrap` suite`, which deletes replica 0's PVC
+outright and asserts the *same* cluster returns — the PostgreSQL system identifier is unchanged,
+which a fresh `initdb` could not produce — then restarts the pod and asserts the bootstrap does
+**not** run a second time.
 
 ### Keyless backups (cloud workload identity)
 

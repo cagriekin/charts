@@ -282,4 +282,133 @@ data:
     echo "pgBackRest restore succeeded for stanza '$PGBACKREST_STANZA'"
     echo "Scale the StatefulSet back up to replay WAL and promote (see the chart README)."
 {{- end }}
+{{- if .Values.pgbackrest.bootstrap.enabled }}
+  # Bootstrap-from-backup program (#266), run as an init container on replica 0 before
+  # repmgr-init. Where restore.sh (#226) deliberately restores OVER a live data directory
+  # under operator control, this one only ever populates an EMPTY one -- so an ordinary pod
+  # restart or rollout can never re-restore over a running cluster. All inputs arrive via env.
+  bootstrap.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    # Seeds an EMPTY data directory from the pgBackRest repository so a replica that lost its
+    # PVC recovers its data instead of initdb-ing an empty cluster. Runs before repmgr-init:
+    # once PGDATA is populated, init-repmgr.sh defers ("Primary-state data directory present")
+    # and the entrypoint skips initdb, so postgres starts, replays the archived WAL via
+    # restore_command and promotes -- the same recovery path as a scale-up after #226's Job.
+
+    # pg_controldata lives in /usr/lib/postgresql/<major>/bin and is NOT on PATH when this
+    # script is the container command (the image entrypoint, which would add it, is bypassed).
+    PG_BIN=$(dirname "$(ls -1 /usr/lib/postgresql/*/bin/pg_controldata 2>/dev/null | sort -V | tail -1)")
+    [ -n "$PG_BIN" ] && export PATH="$PG_BIN:$PATH"
+
+    mkdir -p "$PGBACKREST_LOG_PATH" "$PGBACKREST_LOCK_PATH"
+
+    # The marker records a COMPLETED bootstrap. It lives inside PGDATA on purpose: it shares
+    # the volume's lifecycle, so a wiped/lost PVC clears it exactly when a fresh bootstrap
+    # becomes correct again -- no external state to get out of sync.
+    MARKER="$PGDATA/.pgbackrest-bootstrap-complete"
+    RESUMING=""
+
+    ORDINAL="${HOSTNAME##*-}"
+    # Only replica 0 bootstraps. Standbys must clone from the restored primary (repmgr
+    # standby clone), not each restore their own copy: independent restores of the same repo
+    # would land on divergent recovery points and could not stream from one another.
+    if [ "$ORDINAL" != "0" ]; then
+      echo "Not replica 0 (ordinal $ORDINAL): standbys clone from the primary; nothing to bootstrap."
+      exit 0
+    fi
+
+    if [ -s "$PGDATA/PG_VERSION" ]; then
+      if [ -f "$MARKER" ]; then
+        echo "Bootstrap already completed on this volume:"
+        cat "$MARKER"
+        exit 0
+      fi
+      # PG_VERSION present but no marker. Either a pre-existing cluster (this feature was
+      # enabled on a running release) or an aborted bootstrap. pgbackrest restores
+      # global/pg_control LAST precisely so an interrupted restore cannot be started, so a
+      # READABLE control file means a real cluster -- never touch it. An unreadable one means
+      # the previous attempt died mid-restore, and Kubernetes is retrying this init container.
+      if pg_controldata -D "$PGDATA" >/dev/null 2>&1; then
+        echo "PGDATA already holds an initialized cluster; leaving it untouched."
+        echo "(To restore OVER existing data, use the operator-driven restore Job: pgbackrest.restore.enabled -- see the README.)"
+        exit 0
+      fi
+      echo "WARNING: PGDATA is partially populated and its control file is unreadable -- resuming an aborted bootstrap." >&2
+      RESUMING=yes
+    fi
+
+    # Is there anything to bootstrap FROM? This must be answered before restoring, because a
+    # `restore` with no backup exits non-zero, which under `set -e` would fail this init
+    # container -- and Kubernetes retries init containers forever, so a FIRST install (empty
+    # repo by definition) would never start a pod at all.
+    #
+    # `pgbackrest info` exits 0 even for a missing stanza AND for an unreachable repository, so
+    # the exit code cannot be used; the JSON status code is what distinguishes them:
+    #   1 = missing stanza path/data, 2 = no valid backups  -> benign, nothing to restore yet
+    #   anything else (e.g. 99 HostConnectError)             -> the repo state is UNKNOWN
+    # The distinction is the whole safety story here: "no backup yet" means initialize normally,
+    # while "cannot reach the repo" must NOT fall through to initdb -- that would create an
+    # empty cluster over a database that is probably still recoverable, which is precisely the
+    # silent data loss this feature exists to prevent.
+    #
+    # Reached only when PGDATA is empty (the checks above returned early otherwise), so a pod
+    # rescheduled with an intact volume never depends on the repository being reachable.
+    INFO=$(pgbackrest info --stanza="$PGBACKREST_STANZA" --output=json 2>/dev/null || echo '[]')
+    NBACKUPS=$(printf '%s' "$INFO" | jq -r '[.[].backup[]?] | length' 2>/dev/null || echo 0)
+    REPO_CODE=$(printf '%s' "$INFO" | jq -r '.[0].status.code // 99' 2>/dev/null || echo 99)
+    REPO_MSG=$(printf '%s' "$INFO" | jq -r '.[0].status.message // "unreadable"' 2>/dev/null || echo unreadable)
+    case "${NBACKUPS:-0}" in ''|*[!0-9]*) NBACKUPS=0 ;; esac
+
+    if [ "$NBACKUPS" -eq 0 ]; then
+      if [ "$REPO_CODE" = "1" ] || [ "$REPO_CODE" = "2" ]; then
+        echo "Repository holds no backup for stanza '$PGBACKREST_STANZA' yet (pgbackrest: ${REPO_MSG})."
+        echo "Leaving the data directory empty so this node initializes normally -- the expected path on a first install."
+        exit 0
+      fi
+      echo "FATAL: cannot determine the state of the pgBackRest repository for stanza '$PGBACKREST_STANZA' (status ${REPO_CODE}: ${REPO_MSG})." >&2
+      echo "       Refusing to continue: initializing an empty cluster now would silently discard a database that is probably still recoverable." >&2
+      echo "       Fix repository access (endpoint, credentials, network), or set pgbackrest.bootstrap.enabled=false to initialize an empty cluster deliberately." >&2
+      exit 1
+    fi
+    echo "Repository has ${NBACKUPS} backup(s) for stanza '$PGBACKREST_STANZA'."
+
+    # --delta unconditionally: on a genuinely empty directory pgbackrest just warns and does a
+    # full restore, and on a resumed attempt it copies only what is missing or differs. Without
+    # it, a retry into the partially-restored directory would abort ("directory not empty").
+    ARGS=(--stanza="$PGBACKREST_STANZA" --delta)
+    if [ -n "$BACKUP_SET" ]; then
+      echo "Bootstrapping from backup set: $BACKUP_SET"
+      ARGS+=(--set="$BACKUP_SET")
+    fi
+    if [ -n "$TARGET_TYPE" ]; then
+      # --target-action=promote is REQUIRED with a target: the default recovery_target_action
+      # is `pause`, which would leave the bootstrapped node in recovery, never becoming ready.
+      echo "PITR target: type=$TARGET_TYPE target=$TARGET"
+      ARGS+=(--type="$TARGET_TYPE" --target="$TARGET" --target-action=promote)
+    fi
+
+    if [ -n "$RESUMING" ]; then
+      echo "Resuming bootstrap of stanza '$PGBACKREST_STANZA' into the partially-restored data directory ($PGDATA)..."
+    else
+      echo "Bootstrapping stanza '$PGBACKREST_STANZA' into the empty data directory ($PGDATA)..."
+    fi
+    pgbackrest "${ARGS[@]}" restore
+
+    # Only now is the bootstrap complete: pg_control has been restored, so the cluster is
+    # startable. Record what produced this volume -- the first thing to check if the node
+    # later comes up with unexpected contents.
+    SYSID=$(pg_controldata -D "$PGDATA" 2>/dev/null | awk -F: '/Database system identifier/{gsub(/ /,"",$2); print $2}')
+    {
+      echo "stanza=$PGBACKREST_STANZA"
+      echo "backupSet=${BACKUP_SET:-<latest>}"
+      echo "targetType=${TARGET_TYPE:-<latest-wal>}"
+      echo "target=${TARGET:-}"
+      echo "systemIdentifier=${SYSID:-unknown}"
+      echo "completedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$MARKER"
+
+    echo "Bootstrap succeeded; PostgreSQL will replay the archived WAL and promote on startup."
+{{- end }}
 {{- end }}

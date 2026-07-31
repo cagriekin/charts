@@ -1,5 +1,51 @@
 # pg chart changelog
 
+## 1.8.0 - 2026-07-31
+
+### Added
+
+- **`pgbackrest.bootstrap.*` — automatic recovery from a lost PVC** (#266). Losing replica 0's
+  volume was quietly the worst kind of outage: the pod came back, the entrypoint found an empty
+  data directory, and it `initdb`'d a **brand new empty cluster**. The backups were intact in S3,
+  the live database was empty, and nothing failed loudly. Set `pgbackrest.bootstrap.enabled=true`
+  and an init container (before `repmgr-init`) seeds an *empty* PGDATA from this release's own
+  repository; PostgreSQL then replays the archived WAL on startup and promotes. A lost volume
+  self-heals with no operator action.
+
+  It needs no changes to the repmgr image: once PGDATA is populated, `init-repmgr.sh` defers the
+  start decision and the entrypoint skips `initdb`, so recovery follows the same path as a
+  scale-up after the #226 restore Job.
+
+  **Safe to leave enabled** — it only ever writes into an *empty* data directory:
+  - empty + repository has backups → restore, write a completion marker, replay WAL on startup;
+  - empty + repository has **no backup yet** → do nothing, so a normal first install proceeds
+    (`restore` exits non-zero with no backup, and Kubernetes retries a failed init container
+    forever, so this case is the difference between "works" and "no pod ever starts");
+  - empty + repository **unreachable** → **fail loudly**, pod stays in `Init`. The backup state
+    is unknown, and initializing an empty cluster then would destroy a probably-recoverable
+    database. Reached only when PGDATA is empty, so a pod rescheduled with an intact volume
+    never depends on S3 being reachable;
+  - already initialized → refuse to touch it, marker or not. An ordinary restart, rollout or
+    re-schedule can therefore never re-restore over a running cluster;
+  - partially restored (an attempt that died mid-flight) → resume with `--delta`, which is what
+    makes the init container safe for Kubernetes to retry;
+  - any replica other than 0 → nothing; standbys are cloned from the primary by repmgr.
+
+  The marker at `$PGDATA/.pgbackrest-bootstrap-complete` records the stanza, backup set, target
+  and system identifier. It lives inside PGDATA on purpose: it shares the volume's lifecycle, so
+  losing the volume clears it exactly when a fresh bootstrap becomes correct again.
+
+  Orthogonal to `pgbackrest.restore` (#226) and combinable with it — `bootstrap` populates an
+  empty directory automatically, `restore` overwrites a live one under operator control. Also
+  supports `bootstrap.targetType`/`target` and `bootstrap.backupSet`, with fail-fast guards for
+  the target pair and for the `pgbackrest.enabled` + `postgresql.persistence.enabled`
+  prerequisites.
+
+  Verified by `make -C pg test-pgbackrest-bootstrap`, which deletes replica 0's PVC outright and
+  asserts the **same** cluster returns — the PostgreSQL system identifier is unchanged, which a
+  fresh `initdb` could not produce — then restarts the pod and asserts the bootstrap does not run
+  a second time.
+
 ## 1.7.0 - 2026-07-31
 
 ### Added

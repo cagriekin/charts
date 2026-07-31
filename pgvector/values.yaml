@@ -846,6 +846,43 @@ pgbackrest:
         cpu: "1"
         memory: 1Gi
 
+  # Bootstrap-from-backup (#266). Opt-in. Seeds an EMPTY data directory on replica 0 from this
+  # release's own pgBackRest repository, via an init container that runs before repmgr-init.
+  # The case it exists for: replica 0 loses its PVC (node failure, accidental delete, a storage
+  # class that reclaims). Without this, the entrypoint sees an empty PGDATA and initdb's a
+  # BRAND NEW EMPTY cluster -- the backups are intact in S3, but the running database is empty
+  # until someone notices. With it, the pod restores from S3 and replays the archived WAL on
+  # startup, with no operator action at all.
+  #
+  # Distinct from `restore` above, and safe to leave enabled:
+  #   restore   -- restores OVER a live data directory. Destructive, so it is operator-driven
+  #                (scale to 0, run the Job, scale up) and never automatic.
+  #   bootstrap -- only ever populates an EMPTY data directory. It refuses to touch an
+  #                initialized one, so an ordinary restart, rollout or re-schedule can never
+  #                re-restore over a running cluster.
+  # Only replica 0 bootstraps; standbys are cloned from it by repmgr as usual.
+  bootstrap:
+    enabled: false
+    # PITR target for the bootstrap. Empty (default) restores the latest backup set and replays
+    # all archived WAL -- what you want for recovering a lost replica. To pin a point in time:
+    #   targetType: time   target: "2026-03-22 12:00:00+00"
+    # targetType is one of: "" (latest) | time | xid | name | lsn (pgbackrest --type).
+    # NOTE a target is applied on EVERY fresh bootstrap of this release, not once -- leave both
+    # empty unless you deliberately want every rebuilt replica 0 pinned to that point.
+    targetType: ""
+    target: ""
+    # pgbackrest --set: bootstrap from a SPECIFIC backup set label instead of the latest.
+    backupSet: ""
+    # The init container restores the whole database over the network, so give it room; the pod
+    # stays in Init until it finishes (there is no Job deadline to tune here).
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
 networkPolicy:
   enabled: false
   postgresql:

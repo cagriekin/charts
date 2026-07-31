@@ -1,5 +1,25 @@
 # pgvector chart changelog
 
+## 1.8.0 - 2026-07-31
+
+Inherited from pg's symlinked templates (`statefulset.yaml`, `pgbackrest-configmap.yaml`). See
+the [pg 1.8.0 changelog](../pg/CHANGELOG.md) for the full detail.
+
+### Added
+
+- **`pgbackrest.bootstrap.*` — automatic recovery from a lost PVC** (#266). Previously, losing
+  replica 0's volume meant the pod came back and `initdb`'d a brand new **empty** cluster while
+  the backups sat intact in S3 — silent, with nothing failing loudly. With
+  `pgbackrest.bootstrap.enabled=true` an init container seeds the empty data directory from this
+  release's own pgBackRest repository and PostgreSQL replays the archived WAL on startup.
+
+  Safe to leave enabled: it only ever writes into an *empty* PGDATA and refuses to touch an
+  initialized one, so a restart or rollout can never re-restore over a running cluster. An empty
+  repository is a no-op (a normal first install proceeds), while an *unreachable* repository
+  fails loudly rather than silently initializing an empty cluster. Only replica 0 bootstraps;
+  standbys are cloned from it by repmgr. Supports `bootstrap.targetType`/`target` and
+  `bootstrap.backupSet`.
+
 ## 1.7.0 - 2026-07-31
 
 Inherited from pg's symlinked templates (`pgbackrest-restore-job.yaml`,
