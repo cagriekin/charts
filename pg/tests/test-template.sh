@@ -1621,7 +1621,11 @@ assert_contains "#226: invalid mode rejected" "${pgbr_res_badmode}" "must be one
 # time rather than by the API server mid-incident. The pattern also permits "" (the
 # default): helm validates values.yaml against the schema on every render.
 pgbr_res_badsuffix=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set pgbackrest.restore.mode=job --set pgbackrest.restore.nameSuffix=Attempt_2 2>&1 || true)
-assert_contains "#226: non-DNS-1123 nameSuffix rejected" "${pgbr_res_badsuffix}" "does not match pattern"
+# Match only "match pattern": helm 3.x (gojsonschema) reports "Does not match pattern" while
+# helm 4 (santhosh-tekuri) reports "'Attempt_2' does not match pattern" -- CI pins helm 3.14,
+# so a case-sensitive "does not match pattern" passes locally on helm 4 and fails there.
+assert_contains "#226: non-DNS-1123 nameSuffix rejected" "${pgbr_res_badsuffix}" "match pattern"
+assert_contains "#226: nameSuffix rejection names the offending value" "${pgbr_res_badsuffix}" "nameSuffix"
 pgbr_res_nopersist=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set postgresql.persistence.enabled=false 2>&1 || true)
 assert_contains "#226: restore without persistence fails fast (no PVC to restore into)" "${pgbr_res_nopersist}" "requires postgresql.persistence.enabled"
 pgbr_res_nopgbr=$(helm template test-pg "${CHART_DIR}" --set pgbackrest.restore.enabled=true 2>&1 || true)
