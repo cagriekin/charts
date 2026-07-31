@@ -19,6 +19,39 @@ jobs:
       - name: Run script tests
         run: bash images/repmgr/test/scripts-test.sh
 
+  # Build the image for each supported PostgreSQL major and assert the artifact really
+  # is that major (#269). scripts-test covers the shell logic; this covers the build:
+  # a missing per-major package, a bindir the scripts cannot find, or a pgaudit that
+  # does not load would all pass every other job in this workflow.
+  # amd64 only -- the multi-arch build happens at publish time; correctness of the
+  # per-major package set is arch-independent.
+  image-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_major: ["18", "17"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Separate cache scope per major: the layers diverge from the apt install down,
+      # so a shared scope would thrash between the two legs.
+      - name: Build repmgr image (PG${{ matrix.pg_major }})
+        run: |
+          docker buildx build --load \
+            --build-arg PG_MAJOR=${{ matrix.pg_major }} \
+            --cache-from type=gha,scope=repmgr-smoke-pg${{ matrix.pg_major }} \
+            --cache-to type=gha,mode=max,scope=repmgr-smoke-pg${{ matrix.pg_major }} \
+            -t "repmgr:smoke-pg${{ matrix.pg_major }}" images/repmgr
+
+      - name: Smoke-test the image
+        run: bash images/repmgr/test/image-smoke.sh "repmgr:smoke-pg${{ matrix.pg_major }}" "${{ matrix.pg_major }}"
+
   go-test:
     runs-on: ubuntu-latest
     steps:

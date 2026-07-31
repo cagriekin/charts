@@ -1,16 +1,36 @@
-# PostgreSQL 18 + repmgr 5.5.0
+# PostgreSQL 18 / 17 + repmgr 5.5.0
 
 High-availability PostgreSQL image with automatic failover for Kubernetes StatefulSet deployments. Built on Debian Trixie with repmgr 5.5.0 for streaming replication and automated failover management.
 
 ## Quick Reference
 
-- **Source**: [GitHub](https://github.com/cagriekin/repmgr-docker)
+- **Source**: [GitHub](https://github.com/cagriekin/charts/tree/master/images/repmgr)
 - **Base image**: `debian:trixie-slim`
-- **PostgreSQL**: 18
+- **PostgreSQL**: 18 (default) or 17 — one major per tag, see [Tags](#tags)
 - **repmgr**: 5.5.0
-- **pgaudit**: bundled (`postgresql-18-pgaudit`; opt-in audit logging)
+- **pgaudit**: bundled (`postgresql-<major>-pgaudit`; opt-in audit logging)
 - **Kubernetes**: 1.19+
 - **Exposed port**: 5432
+
+## Tags
+
+Each release publishes one multi-arch (amd64/arm64) manifest per PostgreSQL major, all SBOM- and provenance-attested and cosign-signed:
+
+| Tag | PostgreSQL |
+|-----|------------|
+| `trixie-<repmgr>-<n>` | 18 — the default major; what unsuffixed pins resolve to |
+| `trixie-<repmgr>-<n>-pg18` | 18, named explicitly |
+| `trixie-<repmgr>-<n>-pg17` | 17 |
+
+A container announces its own major as `PG_MAJOR`, and the server binaries live in `/usr/lib/postgresql/$PG_MAJOR/bin`:
+
+```bash
+docker run --rm cagriekin/repmgr:trixie-5.5.0-29-pg17 printenv PG_MAJOR   # -> 17
+```
+
+**The major is fixed at build time and cannot be changed for an existing data directory** — a PostgreSQL 18 server refuses to start on a PG17 `PGDATA`. Choose the major when you create the cluster.
+
+Note that repmgr 5.5.0's [install requirements](https://www.repmgr.org/docs/current/install-requirements.html) list PostgreSQL 13–17; the 18 build uses PGDG's `postgresql-18-repmgr` package. Use a `-pg17` tag if you need an upstream-sanctioned pairing.
 
 ## Multi-Mode Architecture
 

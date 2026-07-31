@@ -1,5 +1,98 @@
 # pg chart changelog
 
+## 1.8.1 - 2026-07-31
+
+### Added
+
+- **PostgreSQL 17 is selectable; 18 remains the default** (#269). The chart was already
+  written to be major-agnostic — `postgresql.majorVersion` and `repmgr.image.majorVersion`
+  both exist, and the render guard only enforces that they *agree* — but the repmgr image
+  was built PG18-only. Because repmgr mode takes the server binaries from that image,
+  pointing `postgresql.image` at another major was **silently inert**, and the only way to
+  run one was to fork the image.
+
+  The major is now a build argument (`PG_MAJOR`, default 18) and each release publishes one
+  multi-arch, attested, cosign-signed manifest per major:
+
+  | Tag | PostgreSQL |
+  |-----|------------|
+  | `trixie-5.5.0-29` | 18 — the default; what every unsuffixed pin resolves to |
+  | `trixie-5.5.0-29-pg18` | 18, named explicitly |
+  | `trixie-5.5.0-29-pg17` | 17 |
+
+  To run 17, move `postgresql.majorVersion`, `repmgr.image.majorVersion` and
+  `repmgr.image.tag` together — see
+  [Choosing the PostgreSQL major](README.md#choosing-the-postgresql-major). Reasons it may
+  matter: repmgr 5.5.0's upstream install requirements list PostgreSQL **13–17, not 18**
+  (the 18 default rests on distro packaging rather than an upstream support claim); PGDG
+  extension availability varies by major; and `pg_dump` output is not guaranteed to load
+  into an older server, so the major a cluster is created on constrains where its data can
+  later go. PostgreSQL 17 is supported upstream until 2029-11-08.
+
+  **This is a create-time choice, not an upgrade path** — a new-major server refuses to
+  start on an old-major `PGDATA`, so moving an existing cluster means a dump/restore into a
+  fresh release.
+
+- **Both majors run the whole live suite in CI**, not a spot-check: every suite (failover,
+  chaos, pgBackRest restore, TLS, pgpool, etcd DCS, repmgrd→agent migration) now runs on 17
+  as well as 18, via a `pg_major` matrix axis and `pg/tests/set-pg-major.sh`. Each published
+  image is also started and verified before release — server version, `repmgr`/`repmgrd`
+  resolving at 5.5.0, and `pgaudit` actually loading — so `audit.enabled=true` works on
+  either major.
+
+### Changed
+
+- `repmgr.image.tag` / `etcd.rbac.bootstrapImage.tag` → `trixie-5.5.0-29`, which carries the
+  `PG_MAJOR` parameterisation. **An unchanged values file produces an unchanged result**:
+  the unsuffixed tag is still PostgreSQL 18, and the render is byte-identical apart from
+  the tag itself.
+
+### Fixed
+
+- The major-mismatch render guard was only tested in one direction (moving
+  `postgresql.majorVersion`). It is now asserted symmetrically, so moving
+  `repmgr.image.majorVersion` alone — the direction the parameterisation makes possible —
+  also fails fast instead of running one major while building extension paths for another.
+
+- **The image tag now has to agree with the major it claims.** The `-pgNN` suffix is what
+  actually selects the server major, but the guard above only compared two hand-typed
+  `majorVersion` values — so moving the tag without the majors (or the reverse) rendered
+  cleanly and ran the wrong major: a crash-looping extension init container with
+  `extensions.enabled=true`, a silently wrong major without it. The render now fails when a
+  `-pgNN` tag disagrees with `repmgr.image.majorVersion`, and `PG_MAJOR` is passed to every
+  container running the repmgr image so the unsuffixed case is caught too — the entrypoint
+  and the agent refuse to start an image that does not bundle the requested major, naming
+  both sides.
+
+- `etcd.bootstrapImage.tag` was never read: the etcd subchart takes it at
+  `rbac.bootstrapImage`, so the RBAC-bootstrap Job stayed on the subchart's older default
+  (`trixie-5.5.0-24`) while every other container moved with the chart. Anyone mirroring
+  only the tags the chart names got ImagePullBackOff on the post-install Job, leaving etcd
+  auth disabled and every agent with full-keyspace access. Now nested correctly, so one tag
+  covers the whole render.
+
+- The repmgr image's shell layer and Go agent hardcoded `/usr/lib/postgresql/18/bin` in
+  seven places, so the bindir is now derived from `PG_MAJOR` (`repmgr-common.sh` exports
+  `PG_BINDIR`; the agent derives it from `config.PGMajor`). The agent refuses to start when
+  that bindir holds no `postgres` binary, rather than failing mid-reconcile after taking the
+  lease.
+
+- The agent's vendored `google.golang.org/grpc` (1.79.3 → 1.82.1) and `golang.org/x/text`
+  (0.37.0 → 0.39.0) carried two advisories that `govulncheck` reports as reachable from
+  the etcd DCS and Service-patch paths: **GO-2026-6061** (xDS RBAC / HTTP-2 transport) and
+  **GO-2026-5970** (infinite loop on invalid input). Bumped and re-vendored; no agent
+  source changed.
+
+- The live suites pinned `repmgr.image.tag: trixie-5.5.0-27` in their fixtures while the
+  chart shipped `-28`, so they pulled an older published image instead of the one CI
+  builds from source. `set-pg-major.sh` now retargets every fixture at the chart's own
+  tag before a suite runs, on both majors — so CI tests the image it built. The two suites
+  that deliberately pin an *older released* image (the repmgrd→agent migration and the
+  repmgrd TLS leg) are marked `set-pg-major: keep` and left alone on the default major, so
+  retargeting does not quietly turn "upgrade from a published image" into "upgrade an image
+  to itself"; on a non-default major, where no older published image exists, they are
+  retargeted with a logged note that the coverage does not apply there.
+
 ## 1.8.0 - 2026-07-31
 
 ### Added

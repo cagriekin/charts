@@ -104,7 +104,7 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.image.repository` | PostgreSQL image repository | `postgres` |
 | `postgresql.image.tag` | PostgreSQL image tag | `18.1-trixie` |
 | `postgresql.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `postgresql.majorVersion` | PostgreSQL major version in `image.tag`; builds the extension paths (`/usr/lib/postgresql/<major>/lib`, `/usr/share/postgresql/<major>/extension`) when `extensions.enabled=true`. In repmgr mode the server runs from the repmgr image and is pinned to `repmgr.image.majorVersion` (currently `18`) regardless of `postgresql.image`; the chart fails to render if the two majors differ. | `"18"` |
+| `postgresql.majorVersion` | PostgreSQL major version in `image.tag`; builds the extension paths (`/usr/lib/postgresql/<major>/lib`, `/usr/share/postgresql/<major>/extension`) when `extensions.enabled=true`. In repmgr mode the server runs from the repmgr image and follows `repmgr.image.majorVersion` regardless of `postgresql.image`; the chart fails to render if the two majors differ. Set both to `"17"` (with a `-pg17` repmgr tag) to run PostgreSQL 17 — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1); values > 0 require `repmgr.enabled=true` | `1` |
 | `postgresql.database` | Database name | `postgres` |
 | `postgresql.username` | Database username | `postgres` |
@@ -240,9 +240,9 @@ These three values are validated at render time, so a mistake fails `helm instal
 |-----------|-------------|---------|
 | `repmgr.enabled` | Enable repmgr | `true` |
 | `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
-| `repmgr.image.tag` | Repmgr image tag | `trixie-5.5.0-28` |
+| `repmgr.image.tag` | Repmgr image tag. Unsuffixed = the default major (18); `-pg18` / `-pg17` select one explicitly | `trixie-5.5.0-29` |
 | `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `repmgr.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Bump with `repmgr.image.tag` when moving to an image built for a new PG major. | `"18"` |
+| `repmgr.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `repmgr.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `repmgr.username` | Repmgr database user | `repmgr` |
 | `repmgr.database` | Repmgr database name | `repmgr` |
 | `repmgr.monitoringHistoryDays` | Days of `repmgr.monitoring_history` to retain; pruned daily on the primary via `repmgr cluster cleanup` | `7` |
@@ -265,6 +265,46 @@ When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
 - **service-updater**: watches repmgr cluster state and patches the Kubernetes Service selector to point to the current primary, then restarts PGPool-II if enabled. Also maintains a `pg-role` label (`primary`/`standby`) on every postgresql pod each cycle, which the `<fullname>-readonly` service selects (`pg-role: standby`) to route read traffic to replicas; pods without the label (fresh, recreated or scaled-up) are excluded until labeled. Has a preStop hook that sleeps 5s to allow in-flight patches to complete. Includes a liveness probe that checks for a heartbeat file updated each loop iteration (fails if no update within 120s). Performs split-brain detection each cycle by querying all nodes for `pg_is_in_recovery()` -- if multiple primaries are found, takes the configured action (`log` or `fence`).
 
 **Split-brain detection**: In a 2-node cluster, network partitions can cause both nodes to believe they are the primary. The service-updater detects this by checking all nodes each monitoring cycle. With `action: log` (default), it logs a critical warning. With `action: fence`, it compares WAL LSN positions and terminates connections on the stale primary. For production deployments, use 3+ nodes to reduce split-brain risk.
+
+### Choosing the PostgreSQL major
+
+**PostgreSQL 18 is the default. PostgreSQL 17 is selectable.** In repmgr mode the server binaries come from the **repmgr image**, not from `postgresql.image` — so the major is decided by which repmgr image you run, and setting `postgresql.image` to another major has no effect on the running server. The image is published per major:
+
+| Tag | PostgreSQL | Use |
+|-----|------------|-----|
+| `trixie-<repmgr>-<n>` | 18 | The default. What every unsuffixed pin resolves to — unchanged by this feature |
+| `trixie-<repmgr>-<n>-pg18` | 18 | The same build, named explicitly |
+| `trixie-<repmgr>-<n>-pg17` | 17 | PostgreSQL 17 |
+
+All three are multi-arch (amd64/arm64), SBOM- and provenance-attested, and cosign-signed exactly like the unsuffixed tag.
+
+Three values move **together**; the chart refuses to render if the two majors disagree (in either direction), because a mismatch would silently run one major while building extension paths for another:
+
+```yaml
+postgresql:
+  majorVersion: "17"
+  image:
+    tag: 17.10-trixie      # only used in standalone mode / for the extension copy
+repmgr:
+  image:
+    tag: trixie-5.5.0-29-pg17
+    majorVersion: "17"
+```
+
+The chart checks the claim rather than trusting it: a `-pgNN` tag that disagrees with `repmgr.image.majorVersion` **fails the render**, and `PG_MAJOR` is passed to every container running the repmgr image — so if the majors are moved while the tag is left on the unsuffixed default (which carries no suffix to compare), the entrypoint and the agent refuse to start, naming both the requested and the bundled major. A wrong-major cluster is therefore a loud failure at install time, not a discovery months later.
+
+Standalone mode (`repmgr.enabled=false`) is unconstrained: there is no repmgr image in play, so `postgresql.image` alone decides the major.
+
+**This is a create-time choice, not an upgrade path.** The chart has no in-place major upgrade: changing the major of an existing cluster would start a new-major server on an old-major `PGDATA`, which refuses to boot. Moving an existing cluster between majors means a logical dump/restore into a fresh release.
+
+Reasons to pick 17 deliberately:
+
+- **repmgr upstream does not list 18.** repmgr's [install requirements](https://www.repmgr.org/docs/current/install-requirements.html) for 5.5.0 (2024-11-24, still the newest release) name PostgreSQL **13–17**. The image builds `postgresql-18-repmgr` from PGDG, and distro packagers do compile 5.5.0 against 18 — but the honest statement is that the PG18 default rests on **distro packaging rather than an upstream support claim**. If you need an upstream-sanctioned repmgr/PostgreSQL pairing, select 17.
+- **Extension availability varies by major** in PGDG, so a required extension can force a major.
+- **`pg_dump` output is not guaranteed to load into an older server** ([docs](https://www.postgresql.org/docs/18/app-pgdump.html)), so the major a cluster is created on constrains where its data can later go. If you may need to move data to an older-major server, choose deliberately now.
+- **PostgreSQL 17 is supported upstream until 2029-11-08**, so it is a long-lived choice, not a stopgap.
+
+Both majors run the **whole** live test suite in CI (failover, pgBackRest restore/bootstrap, TLS, pgpool, etcd DCS, migration), and each published image is started and checked before release — including that `pgaudit` loads, so [audit logging](#audit-logging-pgaudit) works on either major.
 
 ### Failover modes: lease-based `agent` (default) and legacy `repmgrd`
 
@@ -1549,7 +1589,9 @@ Each chart is tagged `<chart>-<version>` (e.g. `pg-1.1.0`); `pg` and `pgvector` 
 
 | `pg` / `pgvector` | repmgr image | PostgreSQL | Kubernetes |
 |-------------------|--------------|-----------|-----------|
-| 1.2.6 – 1.4.0 *(current)* | `trixie-5.5.0-27` | 18.x | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.8.1 *(current)* | `trixie-5.5.0-29` (`-pg18` / `-pg17`) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.5.0 – 1.8.0 | `trixie-5.5.0-28` | 18.x | as above |
+| 1.2.6 – 1.4.x | `trixie-5.5.0-27` | 18.x | as above |
 | 1.2.2 – 1.2.5 | `trixie-5.5.0-26` | 18.x | as above |
 | 1.2.0 – 1.2.1 | `trixie-5.5.0-25` | 18.x | as above |
 | 1.0.0 – 1.1.8 | `trixie-5.5.0-16` … `-24` | 18.x | as above |
@@ -1564,7 +1606,7 @@ helm repo update
 helm upgrade my-postgres cagriekin/pg   # add -f your-values.yaml
 ```
 
-Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.4.0`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-27` at 1.4.0) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
+Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.8.1`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-29` at 1.8.1) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
 
 ### Crossing the 0.x → 1.x boundary (agent mode is now the default)
 

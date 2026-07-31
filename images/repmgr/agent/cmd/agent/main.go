@@ -37,10 +37,8 @@ import (
 )
 
 const (
-	metricsAddr      = ":9200"
-	pgBindir         = "/usr/lib/postgresql/18/bin"
-	pgControlDataBin = pgBindir + "/pg_controldata"
-	repmgrConf       = "/etc/repmgr/repmgr.conf"
+	metricsAddr = ":9200"
+	repmgrConf  = "/etc/repmgr/repmgr.conf"
 )
 
 func main() {
@@ -112,8 +110,12 @@ type agent struct {
 	prober *pg.Prober
 	metr   *observe.Metrics
 	health *selfHealthTracker
-	base   string    // StatefulSet name (pod name without the ordinal)
-	bootAt time.Time // agent start; the cold-boot grace fallback for PeersPending is measured from here
+	// Major-versioned locations of the server binaries this image bundles, derived
+	// from cfg.PGMajor at boot (#269) rather than hardcoded to one major.
+	pgBindir         string
+	pgControlDataBin string
+	base             string    // StatefulSet name (pod name without the ordinal)
+	bootAt           time.Time // agent start; the cold-boot grace fallback for PeersPending is measured from here
 	// peersSeen latches which peers have been SQL-reachable at least once this
 	// lifetime. Once all have, the cold-boot wait never applies again -- so a
 	// steady-state failover is not delayed by a recent agent/pod restart.
@@ -182,6 +184,18 @@ func newDCS(cfg *config.Config) (dcs.DCS, error) {
 }
 
 func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
+	// Server binaries live in the major-versioned bindir (#269). Verify it before
+	// anything else: a PG_MAJOR that disagrees with what the image actually installed
+	// would otherwise surface as an exec failure mid-reconcile, after the agent has
+	// already taken the lease. Fail fast instead.
+	pgBindir := cfg.PGBindir()
+	postgresBin := pgBindir + "/postgres"
+	if fi, err := os.Stat(postgresBin); err != nil {
+		return nil, fmt.Errorf("PG_MAJOR=%s but %s is not usable (%v); this image does not bundle PostgreSQL %s",
+			cfg.PGMajor, postgresBin, err, cfg.PGMajor)
+	} else if fi.Mode()&0o111 == 0 {
+		return nil, fmt.Errorf("PG_MAJOR=%s but %s is not executable (mode %s)", cfg.PGMajor, postgresBin, fi.Mode())
+	}
 	d, err := newDCS(cfg)
 	if err != nil {
 		return nil, err
@@ -196,15 +210,17 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 		dcs:    d,
 		kube:   kube,
 		mech:   mechanism.NewRepmgr(repmgrConf, cfg.PGDATA, cfg.RepmgrPassword),
-		sup:    process.NewSupervisor(process.NewChildPostmaster(pgBindir+"/postgres", cfg.PGDATA)),
+		sup:    process.NewSupervisor(process.NewChildPostmaster(postgresBin, cfg.PGDATA)),
 		prober: pg.NewProber(),
 		metr:   observe.New(),
 		// Self-health grace scales with the lease timing (the cloud preset widens
 		// both), tolerating a transient stall before declaring the primary wedged.
-		health: &selfHealthTracker{grace: cfg.LeaseDuration},
-		base:      baseName(cfg.PodName),
-		bootAt:    time.Now(),
-		peersSeen: map[string]bool{},
+		health:           &selfHealthTracker{grace: cfg.LeaseDuration},
+		pgBindir:         pgBindir,
+		pgControlDataBin: pgBindir + "/pg_controldata",
+		base:             baseName(cfg.PodName),
+		bootAt:           time.Now(),
+		peersSeen:        map[string]bool{},
 	}, nil
 }
 
@@ -292,7 +308,7 @@ func (a *agent) boot(ctx context.Context) error {
 		NodeName: a.cfg.PodName,
 		FQDN:     a.fqdn(a.cfg.PodName),
 		DataDir:  a.cfg.PGDATA,
-		PGBindir: pgBindir,
+		PGBindir: a.pgBindir,
 		ReplUser: a.cfg.RepmgrUser,
 		ReplDB:   a.cfg.RepmgrDB,
 	}
@@ -326,7 +342,7 @@ func (a *agent) boot(ctx context.Context) error {
 	// data is deferred to the reconcile loop, which starts it (StartLocal) only when
 	// this node holds the lease and passes the highwater guard -- otherwise a fenced
 	// ex-primary would come up read-write before the lease state is known and flap.
-	cd, err := pg.ReadControlData(ctx, pg.OSExec{}, pgControlDataBin, a.cfg.PGDATA)
+	cd, err := pg.ReadControlData(ctx, pg.OSExec{}, a.pgControlDataBin, a.cfg.PGDATA)
 	if err != nil {
 		a.log.Warn("boot: read pg_controldata; deferring start to reconcile", "err", err)
 		return nil
@@ -382,7 +398,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// to a stopped node (without this a fenced primary-state node has no timeline,
 	// is started read-write, and immediately fences -- the flap).
 	if !ls.Running && ls.HasData {
-		if cd, err := pg.ReadControlData(ctx, pg.OSExec{}, pgControlDataBin, a.cfg.PGDATA); err != nil {
+		if cd, err := pg.ReadControlData(ctx, pg.OSExec{}, a.pgControlDataBin, a.cfg.PGDATA); err != nil {
 			a.log.Warn("read pg_controldata", "err", err)
 		} else {
 			ls.Timeline, ls.TimelineOK = cd.Timeline, cd.TimelineOK
@@ -936,7 +952,7 @@ func (a *agent) fenceBudget() time.Duration {
 // walreceiver also reject a sysid mismatch -- so this only refuses on a CONFIRMED
 // mismatch, turning a cryptic downstream failure into a clear, actionable one.
 func (a *agent) assertSameCluster(ctx context.Context, peer string) error {
-	cd, err := pg.ReadControlData(ctx, pg.OSExec{}, pgControlDataBin, a.cfg.PGDATA)
+	cd, err := pg.ReadControlData(ctx, pg.OSExec{}, a.pgControlDataBin, a.cfg.PGDATA)
 	if err != nil || cd.SystemID == 0 {
 		return nil // no local cluster identity yet -> nothing to protect
 	}

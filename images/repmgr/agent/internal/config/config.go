@@ -13,6 +13,10 @@ import (
 	"time"
 )
 
+// defaultPGMajor is assumed when PG_MAJOR is unset -- an image built before the
+// PG_MAJOR build arg existed, which was always PostgreSQL 18.
+const defaultPGMajor = "18"
+
 // Config is the validated agent configuration.
 type Config struct {
 	PodName   string // this pod's name — the Lease holder identity
@@ -34,6 +38,13 @@ type Config struct {
 	RepmgrDB       string
 	RepmgrPassword string
 	PGDATA         string
+
+	// PGMajor is the PostgreSQL major bundled in the image, from the PG_MAJOR env the
+	// Dockerfile sets from its build arg (#269). Optional: absent means "18", so an
+	// older env-less image keeps working. The agent locates postgres/pg_controldata
+	// under the versioned bindir it implies, which is why a PG17 image must announce
+	// itself here rather than the agent assuming a major.
+	PGMajor string
 
 	DCSBackend       string // "kubernetes" | "etcd"
 	SplitBrainAction string // "log" | "fence"
@@ -174,6 +185,17 @@ func Load(get func(string) string) (*Config, error) {
 	// Cascading replication (issue #29). Optional -- absent/empty means off.
 	c.CascadeReplication = boolEnv(get("CASCADE_REPLICATION"))
 
+	// PostgreSQL major (#269). Optional -- the image ENV supplies it; default 18 for an
+	// older image that predates the build arg. Digits only: the value is joined into the
+	// bindir path the agent execs postgres/pg_controldata from, so anything else would
+	// surface as a confusing exec failure later instead of a config error now.
+	c.PGMajor = strings.TrimSpace(get("PG_MAJOR"))
+	if c.PGMajor == "" {
+		c.PGMajor = defaultPGMajor
+	} else if strings.TrimLeft(c.PGMajor, "0123456789") != "" {
+		l.invalid = append(l.invalid, fmt.Sprintf("PG_MAJOR=%q (want digits only, e.g. 17 or 18)", c.PGMajor))
+	}
+
 	// Cross-field validation that the lease timings are internally consistent
 	// (client-go requires LeaseDuration > RenewDeadline > RetryPeriod).
 	if c.LeaseDuration > 0 && c.RenewDeadline > 0 && c.RetryPeriod > 0 {
@@ -233,17 +255,21 @@ func Load(get func(string) string) (*Config, error) {
 // FromEnv loads the config from the process environment.
 func FromEnv() (*Config, error) { return Load(os.Getenv) }
 
+// PGBindir is the versioned directory holding this image's server binaries
+// (postgres, pg_ctl, pg_controldata), which Debian installs per major.
+func (c Config) PGBindir() string { return "/usr/lib/postgresql/" + c.PGMajor + "/bin" }
+
 // String renders the config with the repmgr password redacted, so logging the
 // config (e.g. at startup) never leaks the secret. fmt uses this for %v/%s/%+v.
 func (c Config) String() string {
 	return fmt.Sprintf("Config{PodName:%s Namespace:%s LeaseName:%s "+
 		"LeaseDuration:%s RenewDeadline:%s RetryPeriod:%s ReconcileInterval:%s "+
 		"HeadlessService:%s NodeCount:%d MasterService:%s MarkerName:%s PodSelector:%q "+
-		"RepmgrUser:%s RepmgrDB:%s RepmgrPassword:*** PGDATA:%s DCSBackend:%s SplitBrainAction:%s "+
+		"RepmgrUser:%s RepmgrDB:%s RepmgrPassword:*** PGDATA:%s PGMajor:%s DCSBackend:%s SplitBrainAction:%s "+
 		"EtcdEndpoints:%v EtcdPrefix:%s EtcdTLS:%t PgHbaPeerCIDR:%s PgHbaRules:%d}",
 		c.PodName, c.Namespace, c.LeaseName,
 		c.LeaseDuration, c.RenewDeadline, c.RetryPeriod, c.ReconcileInterval,
 		c.HeadlessService, c.NodeCount, c.MasterService, c.MarkerName, c.PodSelector,
-		c.RepmgrUser, c.RepmgrDB, c.PGDATA, c.DCSBackend, c.SplitBrainAction,
+		c.RepmgrUser, c.RepmgrDB, c.PGDATA, c.PGMajor, c.DCSBackend, c.SplitBrainAction,
 		c.EtcdEndpoints, c.EtcdPrefix, c.EtcdCertFile != "", c.PgHbaPeerCIDR, len(c.PgHbaRules))
 }

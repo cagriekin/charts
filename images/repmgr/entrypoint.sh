@@ -186,7 +186,8 @@ primary_safety_guard() {
 
 case "$SCRIPT_NAME" in
     "postgres"|"agent")
-        export PATH=$PATH:/usr/lib/postgresql/18/bin
+        require_pg_bindir || exit 1
+        export PATH=$PATH:$PG_BINDIR
         PGDATA=${PGDATA:-/var/lib/postgresql/data/pgdata}
         export PGDATA
 
