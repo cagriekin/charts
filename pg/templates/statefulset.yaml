@@ -1,5 +1,6 @@
 {{- include "pg.validateResourceNames" . }}
 {{- include "pg.validateAudit" . }}
+{{- include "pg.validateExtraPassthrough" . }}
 {{- if and (not .Values.repmgr.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
 {{- fail "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr" }}
 {{- end }}
@@ -514,6 +515,9 @@ spec:
                   key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
 {{- end }}
 {{- end }}
+{{- with .Values.postgresql.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
 {{- if not .Values.repmgr.enabled }}
           lifecycle:
             postStart:
@@ -849,6 +853,9 @@ spec:
               mountPath: /etc/etcd-tls
               readOnly: true
 {{- end }}
+{{- with .Values.postgresql.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
 {{- if eq (include "pg.repmgrdMode" .) "true" }}
         - name: repmgrd
           image: "{{ include "pg.repmgrImage" . }}"
@@ -1082,7 +1089,7 @@ spec:
           resources:
             {{- toYaml .Values.pgbackrest.resources | nindent 12 }}
 {{- end }}
-{{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.repmgr.enabled .Values.pgbackrest.enabled .Values.postgresql.tls.enabled (not .Values.postgresql.persistence.enabled) }}
+{{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.repmgr.enabled .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.extraVolumes (not .Values.postgresql.persistence.enabled) }}
       volumes:
 {{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled }}
         - name: postgresql-config
@@ -1130,6 +1137,9 @@ spec:
         - name: pgbackrest-config
           configMap:
             name: {{ include "pg.fullname" . }}-pgbackrest
+{{- end }}
+{{- with .Values.postgresql.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
 {{- end }}
 {{- if not .Values.postgresql.persistence.enabled }}
         - name: data

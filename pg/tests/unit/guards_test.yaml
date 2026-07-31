@@ -65,3 +65,151 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: "pgbackrest.existingSecret.name is required (pgbackrest.s3.keyType=shared); use keyType=auto for cloud workload identity"
+
+  # --- Scenario 13: extra passthrough validation (#262) ---
+  - it: extraEnv as a map (not a list) fails render with a shape message
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.extraEnv:
+        FOO: bar
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.extraEnv must be a list of objects, got map. Use a YAML sequence of entries, each with a name (e.g. `postgresql.extraEnv: [{name: my-entry, ...}]`), not a map."
+
+  - it: extraVolumes as a map (not a list) fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.extraVolumes:
+        name: pgsodium-key
+    asserts:
+      - failedTemplate: {}
+
+  - it: extraVolumes entry without a name fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.extraVolumes:
+        - emptyDir: {}
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.extraVolumes[0]: name is required"
+
+  - it: extraVolumes colliding with the chart data volume fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.extraVolumes:
+        - name: data
+          emptyDir: {}
+    asserts:
+      - failedTemplate:
+          errorMessage: 'postgresql.extraVolumes[0]: "data" is a chart-managed volume name and may not be reused (reserved: data, postgresql-config, postgresql-tls, ext-lib, ext-share, repmgr-config, etcd-tls, pg-run, pgbackrest-config, service-updater-script). With persistence enabled a "data" volume is silently discarded in favour of the volumeClaimTemplate; with persistence disabled the duplicate name is rejected by the API server. Pick a distinct name.'
+
+  - it: extraVolumes colliding with an internal volume (repmgr-config) fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.extraVolumes:
+        - name: repmgr-config
+          emptyDir: {}
+    asserts:
+      - failedTemplate: {}
+
+  - it: duplicate extraVolumes names fail render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.extraVolumes:
+        - name: dup
+          emptyDir: {}
+        - name: dup
+          emptyDir: {}
+    asserts:
+      - failedTemplate:
+          errorMessage: 'postgresql.extraVolumes[1]: duplicate volume name "dup"'
+
+  # The sibling-key typo the schema cannot catch (additionalProperties is open):
+  # a mount with no matching volume renders cleanly and is rejected only at apply.
+  - it: extraVolumeMounts with no matching extraVolumes entry fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.extraVolumeMounts:
+        - name: pgsodium-key
+          mountPath: /etc/postgresql/pgsodium
+    asserts:
+      - failedTemplate:
+          errorMessage: 'postgresql.extraVolumeMounts[0]: no postgresql.extraVolumes entry named "pgsodium-key" (declared: none). Every extra mount needs a matching extra volume -- otherwise the API server rejects the StatefulSet at apply time with `volumeMounts[..].name: Not found`. Check for a typo, or that you set extraVolumes (plural). Chart-managed volumes cannot be mounted here.'
+
+  - it: extraVolumeMounts without mountPath fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.extraVolumes:
+        - name: k
+          emptyDir: {}
+      postgresql.extraVolumeMounts:
+        - name: k
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.extraVolumeMounts[0] (k): mountPath is required"
+
+  - it: extraEnv reusing a chart-set env name (PGDATA) fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.extraEnv:
+        - name: PGDATA
+          value: /wrong
+    asserts:
+      - failedTemplate:
+          errorMessage: 'postgresql.extraEnv[0]: "PGDATA" is set by the chart on the postgresql container and may not be overridden -- a duplicate env name is last-wins at runtime, so this would silently shadow the chart/Secret value (e.g. pointing the postmaster at the wrong PGDATA, or breaking cluster-wide auth). Use the chart''s own value for this setting instead.'
+
+  # Reserved unconditionally: repmgr is disabled in values-minimal, but a value that
+  # works today must not start shadowing the chart once an upgrade enables repmgr.
+  - it: extraEnv reusing a disabled-feature env name (REPMGR_PASSWORD) still fails
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.extraEnv:
+        - name: REPMGR_PASSWORD
+          value: x
+    asserts:
+      - failedTemplate: {}
+
+  - it: duplicate extraEnv names fail render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      postgresql.extraEnv:
+        - name: A
+          value: "1"
+        - name: A
+          value: "2"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'postgresql.extraEnv[1]: duplicate env name "A"'

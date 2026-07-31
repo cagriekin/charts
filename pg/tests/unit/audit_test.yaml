@@ -197,3 +197,103 @@ tests:
     asserts:
       - exists:
           path: spec.template.metadata.annotations["checksum/postgresql-config"]
+
+  # --- #262 review: the repmgr merge must NOT be audit-gated ---
+  # custom.conf is loaded via conf.d's include_dir AFTER the repmgr image's own
+  # postgresql.conf, so a bare operator value there overrides
+  # `shared_preload_libraries = 'repmgr'` and starts the postmaster without the repmgr
+  # library -- failover silently stops working. Previously the preserving merge ran only
+  # on the audit path.
+  - it: audit OFF - operator shared_preload_libraries keeps repmgr in an authoritative file
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.audit.enabled: false
+      postgresql.configuration:
+        shared_preload_libraries: pgsodium
+    asserts:
+      - equal:
+          path: data["repmgr-preload.conf"]
+          value: |
+            shared_preload_libraries = 'repmgr,pgsodium'
+      # custom.conf is omitted entirely -- the preload key was its only entry, and an
+      # empty conf.d file would be pointless
+      - notExists:
+          path: data["custom.conf"]
+      # audit off must not smuggle pgaudit into the preload list
+      - notExists:
+          path: data["pgaudit.conf"]
+
+  - it: audit OFF - other configuration keys still render in custom.conf alongside the merge
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.audit.enabled: false
+      postgresql.configuration:
+        shared_preload_libraries: pgsodium
+        work_mem: 32MB
+    asserts:
+      - matchRegex:
+          path: data["repmgr-preload.conf"]
+          pattern: "shared_preload_libraries = 'repmgr,pgsodium'"
+      - matchRegex:
+          path: data["custom.conf"]
+          pattern: "work_mem = '32MB'"
+      # still suppressed in custom.conf -- repmgr-preload.conf owns it
+      - notMatchRegex:
+          path: data["custom.conf"]
+          pattern: shared_preload_libraries
+
+  - it: audit OFF - non-canonically-cased key is merged and suppressed
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.audit.enabled: false
+      postgresql.configuration:
+        Shared_Preload_Libraries: pgsodium
+        work_mem: 32MB
+    asserts:
+      - matchRegex:
+          path: data["repmgr-preload.conf"]
+          pattern: "shared_preload_libraries = 'repmgr,pgsodium'"
+      - notMatchRegex:
+          path: data["custom.conf"]
+          pattern: (?i)shared_preload_libraries
+
+  - it: audit OFF - an explicit repmgr in the operator list is not duplicated
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.audit.enabled: false
+      postgresql.configuration:
+        shared_preload_libraries: "pgsodium, repmgr"
+    asserts:
+      - equal:
+          path: data["repmgr-preload.conf"]
+          value: |
+            shared_preload_libraries = 'pgsodium,repmgr'
+
+  - it: repmgr mode without an operator preload renders no authoritative preload file
+    template: templates/postgresql-configmap.yaml
+    set:
+      postgresql.audit.enabled: false
+      postgresql.configuration:
+        work_mem: 32MB
+    asserts:
+      - notExists:
+          path: data["repmgr-preload.conf"]
+      - matchRegex:
+          path: data["custom.conf"]
+          pattern: "work_mem = '32MB'"
+
+  # Standalone has no repmgr library to preserve, so the operator's value passes through.
+  - it: standalone - operator shared_preload_libraries passes through custom.conf untouched
+    template: templates/postgresql-configmap.yaml
+    set:
+      repmgr.enabled: false
+      postgresql.replicaCount: 0
+      postgresql.audit.enabled: false
+      postgresql.configuration:
+        shared_preload_libraries: pgsodium
+    asserts:
+      - matchRegex:
+          path: data["custom.conf"]
+          pattern: "shared_preload_libraries = 'pgsodium'"
+      - notExists:
+          path: data["repmgr-preload.conf"]

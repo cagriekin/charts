@@ -1,5 +1,28 @@
 # pgvector chart changelog
 
+## 1.6.0 - 2026-07-30
+
+Inherited from pg's symlinked templates (`statefulset.yaml`, `postgresql-configmap.yaml`,
+`_helpers.tpl`). See the [pg 1.6.0 changelog](../pg/CHANGELOG.md) for the full detail.
+
+### Added
+
+- **`postgresql.extraVolumes` / `postgresql.extraVolumeMounts` / `postgresql.extraEnv`**
+  (#262) — generic pod-spec passthrough for the postgresql container, for mounting a file
+  that must be byte-identical on the primary and every standby (e.g. the pgsodium server
+  root key behind Supabase Vault, which a promoted standby needs to decrypt
+  `supabase_vault` after a failover). All default to `[]`, so rendered output is unchanged
+  when unset, and all three are validated at render time (list shape, no chart-managed
+  volume-name collision, every mount must reference a declared volume, no reuse of a
+  chart-set env name).
+
+### Fixed
+
+- **An operator-set `postgresql.configuration.shared_preload_libraries` silently dropped
+  `repmgr` whenever `postgresql.audit.enabled` was false**, disabling failover. The merge
+  preserving `repmgr` now runs unconditionally in repmgr mode. This matters more here than
+  in pg: pgvector operators commonly set `shared_preload_libraries` to load extensions.
+
 ## 1.5.0 - 2026-07-12
 
 Inherited from pg's symlinked templates. Requires the new repmgr image

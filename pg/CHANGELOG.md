@@ -1,5 +1,50 @@
 # pg chart changelog
 
+## 1.6.0 - 2026-07-30
+
+### Added
+
+- **`postgresql.extraVolumes` / `postgresql.extraVolumeMounts` / `postgresql.extraEnv`**
+  (#262) — generic pod-spec passthrough for the postgresql container. Lets an operator
+  mount an arbitrary `Secret`/`ConfigMap` as a file that is byte-identical on the primary
+  and every standby, without a per-use-case chart change. The motivating case is the
+  pgsodium server root key (Supabase Vault) read via `pgsodium.getkey_script`: it must be
+  identical across replicas so a promoted standby can still decrypt `supabase_vault` after
+  a failover. `extraVolumes` render into the pod template; `extraVolumeMounts` and
+  `extraEnv` onto the postgresql container. All default to `[]` (no change to rendered
+  output when unset). See the README, "Mounting an extra file on every replica".
+
+  The three values are validated at render time (`pg.validateExtraPassthrough`), keeping
+  the chart's fail-fast convention — each plausible mistake would otherwise be a silent
+  runtime failure or an apply-time API rejection:
+  - each must be a **list** of objects (a map produced an opaque YAML parse error);
+  - an `extraVolumes` name may not collide with a chart-managed volume — a `data`
+    collision is silently discarded in favour of the volumeClaimTemplate (mount resolves
+    into the PVC, expected file absent → CrashLoopBackOff with nothing to point at), and
+    with persistence off the duplicate name is rejected by the API server;
+  - every `extraVolumeMounts` entry must reference a declared `extraVolumes` entry
+    (catches the `extraVolume:`/`extraVolumes:` typo, which `values.schema.json` cannot —
+    `additionalProperties` is open — and which otherwise fails only at apply, leaving a
+    live release in a failed state);
+  - `extraEnv` may not reuse a chart-set env name (`PGDATA`, `POSTGRES_*`, `REPMGR_*`, …);
+    duplicate env names are last-wins at runtime, so an override would silently shadow the
+    chart/Secret value (wrong data directory, or cluster-wide auth failure).
+
+### Fixed
+
+- **An operator-set `postgresql.configuration.shared_preload_libraries` silently dropped
+  `repmgr` whenever `postgresql.audit.enabled` was false**, disabling failover. The merge
+  that preserves `repmgr` (and the operator's own libraries) previously ran only on the
+  audit path, while `custom.conf` is loaded via `conf.d`'s `include_dir` *after* the repmgr
+  image's own `postgresql.conf` — so a bare value overrode
+  `shared_preload_libraries = 'repmgr'` and the postmaster started without the repmgr
+  library: repmgrd/agent lost their repmgr functions and no standby was ever promoted.
+  The merge is now unconditional in repmgr mode, emitted from an authoritative
+  `repmgr-preload.conf` that sorts after `custom.conf`. Surfaced while reviewing #262,
+  whose pgsodium use case requires exactly this setting. Behaviour is unchanged when audit
+  is enabled, and in standalone mode (nothing to preserve) the operator's value still
+  passes through `custom.conf` untouched.
+
 ## 1.5.0 - 2026-07-12
 
 Requires the new repmgr image (`trixie-5.5.0-28`), which bundles the `pgaudit`

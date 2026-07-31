@@ -11,19 +11,38 @@ metadata:
     {{- . | nindent 4 }}
   {{- end }}
 data:
-{{- if .Values.postgresql.configuration }}
+{{- /* When the chart owns shared_preload_libraries (repmgr and/or pgaudit must be
+       preserved), the merged value is emitted from an authoritative file below that sorts
+       after custom.conf under conf.d's include_dir; emitting it here too would be a dead
+       duplicate that file overrides, so skip it. Matched case-insensitively -- PostgreSQL
+       GUC names are case-insensitive, and the merge helper reads the key the same way, so
+       both must agree or a non-canonically cased key would be emitted here yet dropped
+       from the merged preload list. Keys are collected first so custom.conf is omitted
+       entirely (rather than emitted empty) when the preload key was its only entry. */}}
+{{- $ownsPreload := eq (include "pg.chartOwnsSharedPreloadLibraries" .) "true" }}
+{{- $customKeys := list }}
+{{- range $key, $value := (.Values.postgresql.configuration | default dict) }}
+{{- if not (and $ownsPreload (eq (lower ($key | toString)) "shared_preload_libraries")) }}
+{{- $customKeys = append $customKeys $key }}
+{{- end }}
+{{- end }}
+{{- if $customKeys }}
   custom.conf: |
-    {{- range $key, $value := .Values.postgresql.configuration }}
-    {{- /* When audit is on, shared_preload_libraries is owned by pgaudit.conf (which
-           merges this value with repmgr + pgaudit); emitting it here too would be a
-           dead duplicate that pgaudit.conf overrides, so skip it. Matched case-
-           insensitively -- PostgreSQL GUC names are case-insensitive, and the merge
-           helper reads the key the same way, so both must agree or a non-canonically
-           cased key would be emitted here yet dropped from the merged preload list. */}}
-    {{- if not (and $.Values.postgresql.audit.enabled (eq (lower ($key | toString)) "shared_preload_libraries")) }}
-    {{ $key }} = '{{ $value | toString | replace "'" "''" }}'
+    {{- range $key := $customKeys }}
+    {{ $key }} = '{{ index $.Values.postgresql.configuration $key | toString | replace "'" "''" }}'
     {{- end }}
-    {{- end }}
+{{- end }}
+{{- if and (not .Values.postgresql.audit.enabled) (eq (include "pg.chartOwnsSharedPreloadLibraries" .) "true") }}
+  # repmgr mode with an operator-declared shared_preload_libraries. custom.conf is loaded
+  # via conf.d's include_dir at the END of PGDATA/postgresql.conf, so a bare operator value
+  # there would override the repmgr image entrypoint's `shared_preload_libraries = 'repmgr'`
+  # and start the postmaster WITHOUT the repmgr library -- replication and the repmgr GUCs
+  # lose their functions and failover silently stops working (#262 review). This file sorts
+  # after custom.conf, so its merged value (repmgr + the operator's libraries) wins.
+  # shared_preload_libraries is a postmaster parameter: a change here rolls the pods via the
+  # StatefulSet's checksum/postgresql-config annotation.
+  repmgr-preload.conf: |
+    shared_preload_libraries = '{{ include "pg.sharedPreloadLibraries" . }}'
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
   # Required for pgbackrest WAL archiving. archive_mode is a postmaster
@@ -55,7 +74,7 @@ data:
   # conf.d's include_dir, so its shared_preload_libraries is authoritative; the helper
   # keeps repmgr (replication) and any operator-declared libraries and adds pgaudit.
   pgaudit.conf: |
-    shared_preload_libraries = '{{ include "pg.auditSharedPreloadLibraries" . }}'
+    shared_preload_libraries = '{{ include "pg.sharedPreloadLibraries" . }}'
     pgaudit.log = '{{ .Values.postgresql.audit.log | toString | replace "'" "''" }}'
     pgaudit.log_catalog = {{ ternary "on" "off" .Values.postgresql.audit.logCatalog }}
     pgaudit.log_parameter = {{ ternary "on" "off" .Values.postgresql.audit.logParameter }}

@@ -261,17 +261,41 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end -}}
 {{- end }}
 
-{{- /* #219: the authoritative shared_preload_libraries value when audit is enabled.
-       This renders into pgaudit.conf, which sorts after custom.conf under conf.d's
-       include_dir and therefore wins -- so it MUST reassemble the full list, not just
-       pgaudit. repmgr is always kept (replication + repmgr GUCs depend on the preload,
-       and audit is guarded to repmgr mode); any libraries the operator declared in
-       postgresql.configuration.shared_preload_libraries are merged in (comma-split,
-       trimmed, de-duplicated) so enabling audit never silently drops a preload. The
-       operator's key is matched case-insensitively -- PostgreSQL GUC names are
+{{- /* True when the operator declared shared_preload_libraries in
+       postgresql.configuration (matched case-insensitively -- PostgreSQL GUC names are
        case-insensitive, so a value under e.g. `Shared_Preload_Libraries` must still be
-       picked up (and is likewise suppressed in custom.conf) or it would be dropped. */ -}}
-{{- define "pg.auditSharedPreloadLibraries" -}}
+       found or it would be silently dropped from the merge). */ -}}
+{{- define "pg.userSetSharedPreloadLibraries" -}}
+{{- range $k, $v := (.Values.postgresql.configuration | default dict) -}}
+  {{- if eq (lower ($k | toString)) "shared_preload_libraries" -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* True when the chart -- not custom.conf -- owns shared_preload_libraries, i.e. the
+       merged value is emitted from an authoritative conf.d file that sorts after
+       custom.conf. That is the case whenever a library must be preserved across an
+       operator-declared value: repmgr (replication) and/or pgaudit (#219). In standalone
+       mode with audit off there is nothing to preserve, so the operator's value passes
+       through custom.conf untouched. */ -}}
+{{- define "pg.chartOwnsSharedPreloadLibraries" -}}
+{{- if or .Values.postgresql.audit.enabled (and .Values.repmgr.enabled (eq (include "pg.userSetSharedPreloadLibraries" .) "true")) -}}true{{- end -}}
+{{- end -}}
+
+{{- /* The authoritative shared_preload_libraries value. Rendered into a conf.d file that
+       sorts after custom.conf under include_dir and therefore wins -- so it MUST
+       reassemble the FULL list, not just the chart's own libraries.
+         - repmgr is kept whenever repmgr.enabled: replication and the repmgr GUCs depend
+           on the preload, and the repmgr image entrypoint writes
+           `shared_preload_libraries = 'repmgr'` into PGDATA/postgresql.conf, which any
+           conf.d value overrides. Dropping it disables failover (#262 review).
+         - pgaudit is appended when audit.enabled (#219).
+         - Libraries the operator declared in postgresql.configuration are merged in
+           (comma-split, trimmed, de-duplicated) so the chart never silently drops a
+           preload the operator asked for.
+       Originally audit-only (pg.auditSharedPreloadLibraries); generalized because the
+       audit-gated merge meant an operator-set value with audit OFF silently dropped
+       repmgr and broke HA failover. */ -}}
+{{- define "pg.sharedPreloadLibraries" -}}
 {{- $libs := list -}}
 {{- $user := "" -}}
 {{- range $k, $v := (.Values.postgresql.configuration | default dict) -}}
@@ -281,8 +305,8 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- $t := trim $l -}}
   {{- if and $t (not (has $t $libs)) -}}{{- $libs = append $libs $t -}}{{- end -}}
 {{- end -}}
-{{- if not (has "repmgr" $libs) -}}{{- $libs = prepend $libs "repmgr" -}}{{- end -}}
-{{- if not (has "pgaudit" $libs) -}}{{- $libs = append $libs "pgaudit" -}}{{- end -}}
+{{- if and .Values.repmgr.enabled (not (has "repmgr" $libs)) -}}{{- $libs = prepend $libs "repmgr" -}}{{- end -}}
+{{- if and .Values.postgresql.audit.enabled (not (has "pgaudit" $libs)) -}}{{- $libs = append $libs "pgaudit" -}}{{- end -}}
 {{- join "," $libs -}}
 {{- end -}}
 
@@ -316,6 +340,85 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- if and $role (not (regexMatch "^[A-Za-z_][A-Za-z0-9_]*$" $role)) -}}
     {{- fail (printf "postgresql.audit.role: invalid role name %q (must match ^[A-Za-z_][A-Za-z0-9_]*$)" $role) -}}
   {{- end -}}
+{{- end -}}
+{{- end }}
+
+{{- /* #262: validate the postgresql.extraVolumes / extraVolumeMounts / extraEnv
+       passthrough. These are spliced verbatim into the pod spec, so without guards a
+       plausible mistake becomes a silent runtime failure or an apply-time apiserver
+       rejection instead of a render error -- against the chart's fail-fast convention.
+       Guards:
+        (g1) each value must be a LIST of objects. A map (the shape operators reach for,
+             e.g. `extraEnv: {FOO: bar}`) makes toYaml emit a mapping at the sequence
+             indent, so helm aborts with an opaque "did not find expected '-' indicator"
+             YAML parse error naming neither the value nor the required shape.
+        (g2) every entry needs a name (it is the k8s join key for volume<->mount).
+        (g3) extraVolumes names may not collide with a chart-managed volume. A collision
+             on `data` is the dangerous one: with persistence on, the volumeClaimTemplate
+             wins and the pod-spec volume is silently discarded (the mount then resolves
+             into the PVC and the expected file is simply absent -> CrashLoopBackOff with
+             nothing to point at); with persistence off the pod spec carries a duplicate
+             name and the apiserver rejects the StatefulSet.
+        (g4) extraVolumeMounts must reference a declared extraVolumes entry. Chart-owned
+             volumes are deliberately NOT mountable here -- they are internal, and
+             allowing them would reintroduce the ambiguity g3 exists to prevent. This
+             catches the sibling-key typo (`extraVolume:` for `extraVolumes:`), which
+             values.schema.json cannot (additionalProperties is open) and which otherwise
+             renders cleanly and fails only at apply, leaving a live release failed.
+        (g5) extraEnv may not reuse a chart-managed env name. Duplicate env keys are legal
+             YAML and last-wins in the runtime, so a PGDATA or POSTGRES_PASSWORD override
+             would silently win over the chart/Secret value -- pointing the postmaster at
+             the wrong data directory or breaking auth cluster-wide. */ -}}
+{{- define "pg.validateExtraPassthrough" -}}
+{{- $chartVolumes := list "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "repmgr-config" "etcd-tls" "pg-run" "pgbackrest-config" "service-updater-script" -}}
+{{- /* Env vars the chart sets on the postgresql container (see statefulset.yaml). Reserved
+       UNCONDITIONALLY -- including the ones only a currently-disabled feature emits -- so a
+       passthrough that works today cannot start silently shadowing a chart value after a
+       later `helm upgrade` enables that feature. */ -}}
+{{- $chartEnv := list
+      "PGDATA" "POSTGRES_USER" "POSTGRES_PASSWORD" "POSTGRES_DB"
+      "REPMGR_USER" "REPMGR_PASSWORD" "REPMGR_DB" "REPMGR_NODE_COUNT" "HEADLESS_SERVICE"
+      "NAMESPACE" "PRIMARY_MARKER" "POD_NAME" "POD_SELECTOR" "POD_CIDR" "MASTER_SERVICE"
+      "LEASE_NAME" "LEASE_DURATION" "RENEW_DEADLINE" "RETRY_PERIOD" "RECONCILE_INTERVAL"
+      "CASCADE_REPLICATION" "POSTGRESQL_PGHBA" "TLS_REQUIRE_SSL" "TLS_CLIENT_CERT_AUTH"
+      "MONITORING_USER" "MIGRATE_LEGACY_MD5_USERS" "SPLIT_BRAIN_ACTION"
+      "DCS_BACKEND" "ETCD_ENDPOINTS" "ETCD_PREFIX" "ETCD_TLS_CERT" "ETCD_TLS_KEY" "ETCD_TLS_CA"
+      "PGBACKREST_ENABLED" "PGBACKREST_STANZA" "PGBACKREST_REPO1_CIPHER_PASS"
+      "PGBACKREST_REPO1_S3_KEY" "PGBACKREST_REPO1_S3_KEY_SECRET" "MONITORING_HISTORY_DAYS" -}}
+{{- /* g1: shape. `with` is not used -- an explicitly-set map must reach the check. */ -}}
+{{- range $key := list "extraVolumes" "extraVolumeMounts" "extraEnv" -}}
+  {{- $val := index $.Values.postgresql $key -}}
+  {{- if and $val (not (kindIs "slice" $val)) -}}
+    {{- fail (printf "postgresql.%s must be a list of objects, got %s. Use a YAML sequence of entries, each with a name (e.g. `postgresql.%s: [{name: my-entry, ...}]`), not a map." $key (kindOf $val) $key) -}}
+  {{- end -}}
+{{- end -}}
+{{- $volNames := list -}}
+{{- range $i, $v := (.Values.postgresql.extraVolumes | default list) -}}
+  {{- $n := ($v.name | default "") | toString -}}
+  {{- if not $n -}}{{- fail (printf "postgresql.extraVolumes[%d]: name is required" $i) -}}{{- end -}}
+  {{- if has $n $chartVolumes -}}
+    {{- fail (printf "postgresql.extraVolumes[%d]: %q is a chart-managed volume name and may not be reused (reserved: %s). With persistence enabled a %q volume is silently discarded in favour of the volumeClaimTemplate; with persistence disabled the duplicate name is rejected by the API server. Pick a distinct name." $i $n (join ", " $chartVolumes) $n) -}}
+  {{- end -}}
+  {{- if has $n $volNames -}}{{- fail (printf "postgresql.extraVolumes[%d]: duplicate volume name %q" $i $n) -}}{{- end -}}
+  {{- $volNames = append $volNames $n -}}
+{{- end -}}
+{{- range $i, $m := (.Values.postgresql.extraVolumeMounts | default list) -}}
+  {{- $n := ($m.name | default "") | toString -}}
+  {{- if not $n -}}{{- fail (printf "postgresql.extraVolumeMounts[%d]: name is required" $i) -}}{{- end -}}
+  {{- if not ($m.mountPath | default "") -}}{{- fail (printf "postgresql.extraVolumeMounts[%d] (%s): mountPath is required" $i $n) -}}{{- end -}}
+  {{- if not (has $n $volNames) -}}
+    {{- fail (printf "postgresql.extraVolumeMounts[%d]: no postgresql.extraVolumes entry named %q (declared: %s). Every extra mount needs a matching extra volume -- otherwise the API server rejects the StatefulSet at apply time with `volumeMounts[..].name: Not found`. Check for a typo, or that you set extraVolumes (plural). Chart-managed volumes cannot be mounted here." $i $n (ternary "none" (join ", " $volNames) (empty $volNames))) -}}
+  {{- end -}}
+{{- end -}}
+{{- $envNames := list -}}
+{{- range $i, $e := (.Values.postgresql.extraEnv | default list) -}}
+  {{- $n := ($e.name | default "") | toString -}}
+  {{- if not $n -}}{{- fail (printf "postgresql.extraEnv[%d]: name is required" $i) -}}{{- end -}}
+  {{- if has $n $chartEnv -}}
+    {{- fail (printf "postgresql.extraEnv[%d]: %q is set by the chart on the postgresql container and may not be overridden -- a duplicate env name is last-wins at runtime, so this would silently shadow the chart/Secret value (e.g. pointing the postmaster at the wrong PGDATA, or breaking cluster-wide auth). Use the chart's own value for this setting instead." $i $n) -}}
+  {{- end -}}
+  {{- if has $n $envNames -}}{{- fail (printf "postgresql.extraEnv[%d]: duplicate env name %q" $i $n) -}}{{- end -}}
+  {{- $envNames = append $envNames $n -}}
 {{- end -}}
 {{- end }}
 
