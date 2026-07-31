@@ -1644,6 +1644,79 @@ assert_not_contains "#226: does not inherit postgresql.affinity (replica spreadi
 pgbr_res_enc=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set pgbackrest.repoEncryption.enabled=true --set pgbackrest.repoEncryption.existingSecret.name=cipher --show-only templates/pgbackrest-restore-job.yaml 2>&1)
 assert_contains "#226: repo-encryption passphrase wired into the restore" "${pgbr_res_enc}" "PGBACKREST_REPO1_CIPHER_PASS"
 
+# #266: bootstrap-from-backup -- an init container that seeds an EMPTY PGDATA on replica 0 from
+# the repo, so a lost PVC recovers instead of silently initdb-ing an empty cluster. Contrast
+# #226, which restores OVER live data under explicit operator control.
+assert_not_contains "#266: nothing rendered when bootstrap is disabled (default)" "${pgbr_noval}" "pgbackrest-bootstrap"
+assert_not_contains "#266: bootstrap.sh absent from the configmap when disabled" "${pgbr_noscript}" "bootstrap.sh:"
+pgbr_boot=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.bootstrap.enabled=true --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#266: bootstrap init container renders when enabled" "${pgbr_boot}" "name: pgbackrest-bootstrap"
+assert_contains "#266: bootstrap runs the mounted bootstrap.sh" "${pgbr_boot}" "/scripts/bootstrap.sh"
+assert_contains "#266: bootstrap mounts the pgbackrest ConfigMap (repo settings + pg1-path)" "${pgbr_boot}" "mountPath: /etc/pgbackrest/pgbackrest.conf"
+assert_contains "#266: bootstrap mounts bootstrap.sh from the configmap" "${pgbr_boot}" "key: bootstrap.sh"
+assert_contains "#266: bootstrap targets the live PGDATA" "${pgbr_boot}" "value: /var/lib/postgresql/data/pgdata"
+assert_contains "#266: keyType=shared wires the static S3 key into the bootstrap" "${pgbr_boot}" "name: PGBACKREST_REPO1_S3_KEY"
+# Ordering is load-bearing: the bootstrap must populate PGDATA BEFORE repmgr-init inspects it
+# (init-repmgr.sh defers when PG_VERSION exists) and AFTER fix-permissions has chowned the
+# volume, or the restore cannot write. Compare line numbers in the rendered output.
+boot_init_order=$(printf '%s\n' "${pgbr_boot}" | grep -nE "^        - name: (fix-permissions|pgbackrest-bootstrap|repmgr-init)$" | tr '\n' ' ')
+assert_contains "#266: init order is fix-permissions -> pgbackrest-bootstrap -> repmgr-init" "${boot_init_order}" "fix-permissions.*pgbackrest-bootstrap.*repmgr-init"
+# The script body carries the safety state machine; assert each branch exists so a future
+# edit cannot quietly drop one.
+pgbr_boot_script=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.bootstrap.enabled=true --show-only templates/pgbackrest-configmap.yaml 2>&1)
+assert_contains "#266: bootstrap.sh present in the configmap when enabled" "${pgbr_boot_script}" "bootstrap.sh:"
+assert_contains "#266: only replica 0 bootstraps (standbys clone from it)" "${pgbr_boot_script}" 'ORDINAL" != "0"'
+assert_contains "#266: refuses to touch an initialized cluster" "${pgbr_boot_script}" "already holds an initialized cluster"
+assert_contains "#266: skips when the completion marker is present" "${pgbr_boot_script}" "Bootstrap already completed"
+assert_contains "#266: resumes an aborted bootstrap (unreadable pg_control)" "${pgbr_boot_script}" "resuming an aborted bootstrap"
+assert_contains "#266: writes a completion marker inside PGDATA" "${pgbr_boot_script}" ".pgbackrest-bootstrap-complete"
+# jq parses `pgbackrest info`; repmgr.image is values-configurable, so a missing jq must name
+# itself rather than surface as "repository unreachable" during a healthy first install. The
+# check must sit AFTER the early exits: a pod with an intact data directory needs no jq.
+assert_contains "#266: names jq explicitly when it is missing" "${pgbr_boot_script}" "jq is required"
+# EVERY early exit must precede the jq check, not just one of them: each returns before any JSON
+# is parsed, so a pod that needs no repository lookup must still start on an image without jq.
+# Checking only one boundary would let a regression slide the check up between the others.
+jq_line=$(printf '%s\n' "${pgbr_boot_script}" | grep -n "jq is required" | cut -d: -f1)
+boot_exit_ok=1
+boot_exit_detail=""
+for early in "standbys clone from the primary" "Bootstrap already completed" "already holds an initialized cluster"; do
+  eline=$(printf '%s\n' "${pgbr_boot_script}" | grep -n "${early}" | head -1 | cut -d: -f1)
+  if [ -z "${eline}" ] || [ -z "${jq_line}" ] || [ "${jq_line}" -le "${eline}" ]; then
+    boot_exit_ok=0
+    boot_exit_detail="${boot_exit_detail} [\"${early}\" at ${eline:-missing} vs jq at ${jq_line:-missing}]"
+  fi
+done
+if [ "${boot_exit_ok}" = "1" ]; then
+  pass "#266: jq check comes after every early exit (a pod needing no repo lookup starts without jq)"
+else
+  fail "#266: jq check comes after every early exit (a pod needing no repo lookup starts without jq)" "${boot_exit_detail}"
+fi
+assert_contains "#266: restores with --delta so a retry can resume" "${pgbr_boot_script}" "\-\-delta"
+# It must NOT start postgres -- the entrypoint does that, and recovery follows on startup.
+assert_not_contains "#266: bootstrap never starts postgres" "${pgbr_boot_script}" "pg_ctl -D"
+# PITR/backup-set wiring + guards.
+pgbr_boot_pitr=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.bootstrap.enabled=true --set pgbackrest.bootstrap.targetType=time --set-string 'pgbackrest.bootstrap.target=2026-03-22 12:00:00+00' --set pgbackrest.bootstrap.backupSet=20260322-010002F --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#266: bootstrap PITR target wired into the env" "${pgbr_boot_pitr}" "2026-03-22 12:00:00+00"
+assert_contains "#266: bootstrap backupSet wired into the env" "${pgbr_boot_pitr}" "20260322-010002F"
+pgbr_boot_badtarget=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.bootstrap.enabled=true --set pgbackrest.bootstrap.targetType=time 2>&1 || true)
+assert_contains "#266: bootstrap targetType without target fails fast" "${pgbr_boot_badtarget}" "bootstrap.target is required"
+pgbr_boot_badtype=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.bootstrap.enabled=true --set pgbackrest.bootstrap.targetType=bogus 2>&1 || true)
+assert_contains "#266: invalid bootstrap targetType rejected" "${pgbr_boot_badtype}" "must be one of"
+pgbr_boot_nopersist=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.bootstrap.enabled=true --set postgresql.persistence.enabled=false 2>&1 || true)
+assert_contains "#266: bootstrap without persistence fails fast (would re-restore every restart)" "${pgbr_boot_nopersist}" "requires postgresql.persistence.enabled"
+pgbr_boot_nopgbr=$(helm template test-pg "${CHART_DIR}" --set pgbackrest.bootstrap.enabled=true 2>&1 || true)
+assert_contains "#266: bootstrap without pgbackrest fails fast" "${pgbr_boot_nopgbr}" "requires pgbackrest.enabled"
+# keyType=auto relies on the pod SA's workload identity -- no static keys anywhere.
+pgbr_boot_auto=$(helm template test-pg "${CHART_DIR}" --set pgbackrest.enabled=true --set repmgr.enabled=true --set pgbackrest.s3.endpoint=https://s3.test --set pgbackrest.s3.bucket=b --set pgbackrest.s3.keyType=auto --set pgbackrest.bootstrap.enabled=true --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#266: keyType=auto emits no static S3 key env on the bootstrap" "${pgbr_boot_auto}" "PGBACKREST_REPO1_S3_KEY"
+pgbr_boot_enc=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.bootstrap.enabled=true --set pgbackrest.repoEncryption.enabled=true --set pgbackrest.repoEncryption.existingSecret.name=cipher --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#266: repo-encryption passphrase wired into the bootstrap" "${pgbr_boot_enc}" "PGBACKREST_REPO1_CIPHER_PASS"
+# bootstrap and restore are orthogonal features and must be able to coexist.
+pgbr_both=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.bootstrap.enabled=true --set pgbackrest.restore.enabled=true 2>&1)
+assert_contains "#266: bootstrap + restore coexist (init container)" "${pgbr_both}" "name: pgbackrest-bootstrap"
+assert_contains "#266: bootstrap + restore coexist (restore CronJob)" "${pgbr_both}" "component: pgbackrest-restore"
+
 # #27: the backup + backup-validation Jobs run under a dedicated no-RBAC SA, not
 # the namespace default.
 backup_sa=$(helm template test-pg "${CHART_DIR}" ${backup_val_args} --show-only templates/backup-serviceaccount.yaml 2>&1)

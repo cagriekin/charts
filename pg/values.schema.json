@@ -161,6 +161,18 @@
             "backoffLimit": { "type": "integer" }
           }
         },
+        "bootstrap": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "targetType": {
+              "enum": ["", "time", "xid", "name", "lsn"],
+              "description": "PITR target type (pgbackrest --type) applied when bootstrapping an empty PGDATA; empty restores the latest backup + replays all WAL. bootstrap.target is required when set."
+            },
+            "target": { "type": "string" },
+            "backupSet": { "type": "string" }
+          }
+        },
         "restore": {
           "type": "object",
           "properties": {

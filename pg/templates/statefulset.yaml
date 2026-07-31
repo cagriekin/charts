@@ -46,6 +46,19 @@
 {{- if and .Values.pgbackrest.enabled (not .Values.repmgr.enabled) }}
 {{- fail "pgbackrest.enabled requires repmgr.enabled=true: the pgbackrest binary and the archive_command run inside the postgresql container, which in standalone mode is the official postgres image without pgbackrest. WAL archiving would fail on every segment (unbounded WAL growth) and backups would time out. Enable repmgr, or disable pgbackrest" }}
 {{- end }}
+{{- /* Bootstrap-from-backup (#266) prerequisites. Fail fast rather than rendering an init
+       container that could never work. */}}
+{{- if .Values.pgbackrest.bootstrap.enabled }}
+{{- if not .Values.pgbackrest.enabled }}
+{{- fail "pgbackrest.bootstrap.enabled requires pgbackrest.enabled (the bootstrap init container reads the pgBackRest repo config and S3 credentials the pgbackrest feature renders)" }}
+{{- end }}
+{{- if not .Values.postgresql.persistence.enabled }}
+{{- fail "pgbackrest.bootstrap.enabled requires postgresql.persistence.enabled: with an emptyDir PGDATA every pod restart loses the data directory, so the bootstrap would re-restore the entire database on each start instead of once" }}
+{{- end }}
+{{- if and (ne .Values.pgbackrest.bootstrap.targetType "") (not .Values.pgbackrest.bootstrap.target) }}
+{{- fail "pgbackrest.bootstrap.target is required when pgbackrest.bootstrap.targetType is set" }}
+{{- end }}
+{{- end }}
 {{- /* Bundled etcd consistency: the subchart deploys 3 stateful pods, so reject the
        contradictory inputs that would silently orphan them (fail-fast, CLAUDE.md). */}}
 {{- if (.Values.etcd).enabled }}
@@ -205,6 +218,71 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+{{- end }}
+{{- if .Values.pgbackrest.bootstrap.enabled }}
+        # Bootstrap-from-backup (#266). Seeds an EMPTY data directory from the pgBackRest
+        # repository, so a replica-0 that lost its PVC recovers its data instead of silently
+        # initdb-ing an empty cluster. Ordered BEFORE repmgr-init on purpose: once PGDATA is
+        # populated, init-repmgr.sh defers the start decision and the entrypoint skips initdb,
+        # so postgres starts, replays the archived WAL via restore_command and promotes.
+        # It refuses to touch an already-initialized directory (see bootstrap.sh), which is
+        # what makes it safe to leave enabled across ordinary restarts and rollouts.
+        - name: pgbackrest-bootstrap
+          image: "{{ include "pg.repmgrImage" . }}"
+          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
+          command: ["/bin/bash", "/scripts/bootstrap.sh"]
+          env:
+            - name: PGBACKREST_STANZA
+              value: {{ .Values.pgbackrest.stanza | quote }}
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            # pgbackrest's default log/lock paths may be unwritable, and neither belongs on
+            # the data volume; /tmp is this container's own writable layer.
+            - name: PGBACKREST_LOG_PATH
+              value: /tmp/pgbackrest-log
+            - name: PGBACKREST_LOCK_PATH
+              value: /tmp/pgbackrest-lock
+            - name: TARGET_TYPE
+              value: {{ .Values.pgbackrest.bootstrap.targetType | quote }}
+            - name: TARGET
+              value: {{ .Values.pgbackrest.bootstrap.target | quote }}
+            - name: BACKUP_SET
+              value: {{ .Values.pgbackrest.bootstrap.backupSet | quote }}
+{{- if .Values.pgbackrest.repoEncryption.enabled }}
+            - name: PGBACKREST_REPO1_CIPHER_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "pgbackrest.repoEncryption.existingSecret.name is required when pgbackrest.repoEncryption.enabled" .Values.pgbackrest.repoEncryption.existingSecret.name }}
+                  key: {{ .Values.pgbackrest.repoEncryption.existingSecret.passphraseKey }}
+{{- end }}
+{{- if eq .Values.pgbackrest.s3.keyType "shared" }}
+            - name: PGBACKREST_REPO1_S3_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.pgbackrestS3SecretName" . }}
+                  key: {{ .Values.pgbackrest.existingSecret.accessKeyIdKey }}
+            - name: PGBACKREST_REPO1_S3_KEY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pg.pgbackrestS3SecretName" . }}
+                  key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
+{{- end }}
+          resources:
+            {{- toYaml .Values.pgbackrest.bootstrap.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: pgbackrest-config
+              mountPath: /etc/pgbackrest/pgbackrest.conf
+              subPath: pgbackrest.conf
+              readOnly: true
+            # Dedicated directory volume (not a subPath file) so /scripts is created by the
+            # mount and need not pre-exist in the image.
+            - name: pgbackrest-bootstrap-script
+              mountPath: /scripts
+              readOnly: true
 {{- end }}
 {{- if and .Values.postgresql.extensions.enabled .Values.repmgr.enabled }}
 {{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
@@ -1137,6 +1215,15 @@ spec:
         - name: pgbackrest-config
           configMap:
             name: {{ include "pg.fullname" . }}-pgbackrest
+{{- if .Values.pgbackrest.bootstrap.enabled }}
+        - name: pgbackrest-bootstrap-script
+          configMap:
+            name: {{ include "pg.fullname" . }}-pgbackrest
+            defaultMode: 0755
+            items:
+              - key: bootstrap.sh
+                path: bootstrap.sh
+{{- end }}
 {{- end }}
 {{- with .Values.postgresql.extraVolumes }}
         {{- toYaml . | nindent 8 }}
