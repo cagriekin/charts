@@ -954,7 +954,7 @@ Setting `bootstrap.targetType`/`target` pins the bootstrap to a point in time �
 applies to **every** fresh bootstrap of this release, not just the next one, so leave both empty
 unless you really want every rebuilt replica 0 to land on that same target.
 
-Verified end to end by `the pg chart's `test-pgbackrest-bootstrap` suite`, which deletes replica 0's PVC
+Verified end to end by the pg chart's `test-pgbackrest-bootstrap` suite, which deletes replica 0's PVC
 outright and asserts the *same* cluster returns — the PostgreSQL system identifier is unchanged,
 which a fresh `initdb` could not produce — then restarts the pod and asserts the bootstrap does
 **not** run a second time.

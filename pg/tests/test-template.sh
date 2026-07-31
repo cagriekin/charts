@@ -1670,6 +1670,17 @@ assert_contains "#266: refuses to touch an initialized cluster" "${pgbr_boot_scr
 assert_contains "#266: skips when the completion marker is present" "${pgbr_boot_script}" "Bootstrap already completed"
 assert_contains "#266: resumes an aborted bootstrap (unreadable pg_control)" "${pgbr_boot_script}" "resuming an aborted bootstrap"
 assert_contains "#266: writes a completion marker inside PGDATA" "${pgbr_boot_script}" ".pgbackrest-bootstrap-complete"
+# jq parses `pgbackrest info`; repmgr.image is values-configurable, so a missing jq must name
+# itself rather than surface as "repository unreachable" during a healthy first install. The
+# check must sit AFTER the early exits: a pod with an intact data directory needs no jq.
+assert_contains "#266: names jq explicitly when it is missing" "${pgbr_boot_script}" "jq is required"
+jq_line=$(printf '%s\n' "${pgbr_boot_script}" | grep -n "jq is required" | cut -d: -f1)
+marker_line=$(printf '%s\n' "${pgbr_boot_script}" | grep -n "Bootstrap already completed" | cut -d: -f1)
+if [ -n "${jq_line}" ] && [ -n "${marker_line}" ] && [ "${jq_line}" -gt "${marker_line}" ]; then
+  pass "#266: jq check comes after the early exits (intact volume needs no jq)"
+else
+  fail "#266: jq check comes after the early exits (intact volume needs no jq)" "jq check at line ${jq_line}, marker check at ${marker_line}"
+fi
 assert_contains "#266: restores with --delta so a retry can resume" "${pgbr_boot_script}" "\-\-delta"
 # It must NOT start postgres -- the entrypoint does that, and recovery follows on startup.
 assert_not_contains "#266: bootstrap never starts postgres" "${pgbr_boot_script}" "pg_ctl -D"
