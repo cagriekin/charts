@@ -24,6 +24,10 @@ detail.
   `restore.force`, with fail-fast guards for the target/targetType pair and for the
   `pgbackrest.enabled` + `postgresql.persistence.enabled` prerequisites.
 
+  Standbys need no extra step: the restored primary returns on a new timeline, and each
+  standby's init container detects the mismatch and re-clones itself from it (verified in
+  the pg chart's `test-pgbackrest-restore-ha` suite, which covers these shared templates).
+
 ### Changed
 
 - The README's Point-in-Time Recovery runbook is now that four-command flow; the

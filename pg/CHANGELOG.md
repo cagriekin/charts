@@ -46,9 +46,15 @@
     `restore.backupSet` (`pgbackrest --set`) to pin a specific backup set, and fail-fast
     guards for the two prerequisites (`pgbackrest.enabled`, `postgresql.persistence.enabled`).
 
-  Covered by template tests and by an end-to-end phase in
-  `make -C pg test-pgbackrest-restore`, which destroys the data directory outright and then
-  recovers it from S3 through the documented runbook.
+  Covered by template tests and by two end-to-end suites, both of which destroy the data
+  directory outright and recover it from S3 through the documented runbook:
+  - `make -C pg test-pgbackrest-restore` — single node, plus the #38 validation phase;
+  - `make -C pg test-pgbackrest-restore-ha` (new) — primary + streaming standby. It restores
+    the primary out from under a live standby and confirms the standby rebuilds itself: the
+    restored primary comes back on a new timeline, the standby's init container detects the
+    mismatch (`Timeline mismatch (local: 1, primary: 2), re-cloning...`), re-clones via
+    `repmgr standby clone`, and resumes streaming — with no PVC deletion and no operator
+    action. The README documents this as verified behaviour rather than an assumption.
 
 ### Changed
 

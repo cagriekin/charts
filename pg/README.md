@@ -1249,9 +1249,16 @@ Two caveats for this mode: the Job is not part of the release, so a GitOps contr
 report or prune it; and Jobs are immutable, so a second attempt needs
 `--set pgbackrest.restore.nameSuffix=attempt2`.
 
-Repmgr rebuilds the standbys from the restored primary when they start. If a standby comes
-up on the pre-restore timeline instead of re-cloning, delete its PVC and pod so it clones
-fresh from the restored primary:
+**Standbys rebuild themselves — no extra step.** A PITR restore leaves the restored primary
+on a *new* timeline, while each standby's PVC still holds pre-restore data on the old one. On
+scale-up the standby's init container detects exactly that (`Timeline mismatch (local: 1,
+primary: 2), re-cloning...`) and re-clones from the restored primary via `repmgr standby
+clone` (`pg_basebackup`), then resumes streaming on the new timeline. No PVC deletion, no
+operator action. This is verified end to end by `make -C pg test-pgbackrest-restore-ha`,
+which restores a primary out from under a live standby and asserts the pair comes back
+streaming.
+
+Only if a standby *does* get stuck on the old timeline, force a fresh clone by hand:
 
 ```bash
 kubectl delete pvc data-my-postgres-pg-1 && kubectl delete pod my-postgres-pg-1
