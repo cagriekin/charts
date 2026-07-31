@@ -215,4 +215,71 @@ data:
     echo "Restore OK: recovery completed and promoted; ${RELS} table-like relation(s), ~${ROWS} row(s) (estimate) in '$POSTGRES_DB'"
     echo "pgBackRest PITR validation succeeded for stanza '$PGBACKREST_STANZA'"
 {{- end }}
+{{- if .Values.pgbackrest.restore.enabled }}
+  # First-class PITR restore program (#226), mounted into the pgbackrest-restore
+  # Job/CronJob. Unlike validate.sh above (throwaway instance, proves restorability) this
+  # one restores over the LIVE data directory. Kept here rather than inlined in the Job so
+  # the two stay side by side; all inputs arrive via env (PGBACKREST_*, PGDATA,
+  # TARGET_TYPE/TARGET, BACKUP_SET, FORCE) so the body is literal.
+  restore.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    # Restores the pgBackRest repository over the live data directory and then STOPS: it
+    # deliberately never starts postgres. Recovery (WAL replay + promotion) happens when
+    # the operator scales the StatefulSet back up, under the normal chart entrypoint.
+    # Run this only while the StatefulSet is scaled to 0.
+
+    # pg_controldata lives in /usr/lib/postgresql/<major>/bin in the Debian-based repmgr
+    # image and is NOT on PATH when this script is the container command (the image
+    # entrypoint, which would add it, is bypassed). pgbackrest itself is in /usr/bin, so
+    # the restore works either way -- this is for the post-restore report at the end.
+    PG_BIN=$(dirname "$(ls -1 /usr/lib/postgresql/*/bin/pg_controldata 2>/dev/null | sort -V | tail -1)")
+    [ -n "$PG_BIN" ] && export PATH="$PG_BIN:$PATH"
+
+    mkdir -p "$PGBACKREST_LOG_PATH" "$PGBACKREST_LOCK_PATH"
+
+    # Restoring over a RUNNING cluster would corrupt it. pgbackrest is the real interlock
+    # -- it refuses while $PGDATA/postmaster.pid exists ("unable to restore while
+    # PostgreSQL is running"), which is why this Job needs no API access to check replica
+    # counts -- but test it first so the failure names the actual operator mistake and
+    # points at the one legitimate override.
+    if [ -f "$PGDATA/postmaster.pid" ] && [ "$FORCE" != "true" ]; then
+      echo "ERROR: $PGDATA/postmaster.pid exists -- PostgreSQL is (or was) running on this volume." >&2
+      echo "       Scale the StatefulSet to 0, wait for the pods to terminate, then rerun." >&2
+      echo "       If the cluster crashed and the pid file is stale, set pgbackrest.restore.force=true." >&2
+      exit 1
+    fi
+
+    # --delta compares checksums and copies only the files that differ, so the existing
+    # PGDATA is left in place (a wiped data directory silently degrades to a full restore
+    # -- still correct, just slower). Rerunning the Job simply restores again.
+    ARGS=(--stanza="$PGBACKREST_STANZA" --delta)
+    if [ -n "$BACKUP_SET" ]; then
+      echo "Restoring from backup set: $BACKUP_SET"
+      ARGS+=(--set="$BACKUP_SET")
+    fi
+    if [ -n "$TARGET_TYPE" ]; then
+      # With a target, --target-action=promote is REQUIRED: PostgreSQL's default
+      # recovery_target_action is `pause`, which would leave the restored cluster paused
+      # in recovery (never accepting connections) after scale-up. With no target,
+      # recovery replays to the end of the archived WAL stream and promotes on its own.
+      echo "PITR target: type=$TARGET_TYPE target=$TARGET"
+      ARGS+=(--type="$TARGET_TYPE" --target="$TARGET" --target-action=promote)
+    fi
+    if [ "$FORCE" = "true" ]; then
+      ARGS+=(--force)
+    fi
+
+    echo "Restoring stanza '$PGBACKREST_STANZA' into the live data directory ($PGDATA)..."
+    pgbackrest "${ARGS[@]}" restore
+
+    # Echo the restored control file (state + checkpoint) into the Job log: it is the
+    # first thing to look at if the cluster does not come up after scale-up.
+    echo "----- pg_controldata after restore -----"
+    pg_controldata -D "$PGDATA" 2>/dev/null | grep -E 'Database cluster state|Latest checkpoint location|Time of latest checkpoint' || true
+
+    echo "pgBackRest restore succeeded for stanza '$PGBACKREST_STANZA'"
+    echo "Scale the StatefulSet back up to replay WAL and promote (see the chart README)."
+{{- end }}
 {{- end }}

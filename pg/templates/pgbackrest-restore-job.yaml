@@ -1,0 +1,218 @@
+{{- if .Values.pgbackrest.restore.enabled }}
+{{- /* First-class PITR restore (#226). Replaces the hand-built `kubectl run --overrides`
+       runbook: the chart already knows the identity, security contexts, volumes, repo
+       config and credentials a restore needs (it renders them for the #38 validation
+       CronJob), so the operator should not have to reconstruct ~30 lines of inline JSON.
+       Unlike validation -- which restores into a THROWAWAY emptyDir and starts a
+       throwaway postgres -- this restores into the LIVE data PVC (data-<fullname>-0)
+       and never starts postgres: scaling the StatefulSet back up performs recovery.
+       Because the mounted pgbackrest.conf's pg1-path is already the live PGDATA, no
+       PGBACKREST_PG1_PATH override is needed here (validation only sets one to redirect
+       the restore away from the live directory). */}}
+{{- if not .Values.pgbackrest.enabled }}
+{{- fail "pgbackrest.restore.enabled requires pgbackrest.enabled (the restore reads the pgBackRest repo config and S3 credentials the pgbackrest feature renders)" }}
+{{- end }}
+{{- if not .Values.postgresql.persistence.enabled }}
+{{- fail "pgbackrest.restore.enabled requires postgresql.persistence.enabled: the restore writes into the data PVC (data-<fullname>-0), which only exists when persistence is on" }}
+{{- end }}
+{{- /* targetType's allowed values are enforced by the values.schema.json enum (portable
+       across helm versions). The dependent "target is required when targetType is set"
+       rule is a template fail rather than a schema `if/then` because helm 3.x's schema
+       validator does not honor `if/then` the way helm 4 does. Mirrors #38. */}}
+{{- if and (ne .Values.pgbackrest.restore.targetType "") (not .Values.pgbackrest.restore.target) }}
+{{- fail "pgbackrest.restore.target is required when pgbackrest.restore.targetType is set" }}
+{{- end }}
+{{- end }}
+
+{{- /* The Job spec is shared by both delivery modes (restore.mode), which differ only in
+       the wrapper: a suspended CronJob to clone with `kubectl create job --from` (the
+       release owns the resource -- GitOps-clean), or a bare Job to render on demand with
+       `helm template -s` (arbitrary point-in-time inline, nothing baked into the
+       release). Defined at column 0 and nindent-ed at each call site. */}}
+{{- define "pg.pgbackrestRestoreJobSpec" -}}
+activeDeadlineSeconds: {{ .Values.pgbackrest.restore.activeDeadlineSeconds }}
+{{- /* 0 = one pod attempt: a failed restore leaves PGDATA half-written, and an automatic
+       retry would race the operator's own diagnosis. Failures also surface immediately. */}}
+backoffLimit: {{ .Values.pgbackrest.restore.backoffLimit }}
+template:
+  metadata:
+    labels:
+      {{- include "pg.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: pgbackrest-restore
+  spec:
+    {{- with .Values.imagePullSecrets }}
+    imagePullSecrets:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.pgbackrest.cronjob.priorityClassName }}
+    priorityClassName: {{ . }}
+    {{- end }}
+    {{- /* Inherit the postgresql pods' node placement: this Job must land somewhere the
+           data PVC can attach, so a dedicated (tainted / labelled) database node pool that
+           the postgresql pods tolerate must be tolerated here too -- otherwise the restore
+           sits Pending in the middle of an incident. postgresql.affinity is deliberately
+           NOT inherited: it spreads replicas apart, which is meaningless for a one-shot Job
+           that has to run next to one specific volume. */}}
+    {{- with .Values.postgresql.nodeSelector }}
+    nodeSelector:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.postgresql.tolerations }}
+    tolerations:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    restartPolicy: Never
+    # Reuse the postgresql pods' ServiceAccount: it carries the cloud workload-identity
+    # annotation (postgresql.serviceAccount.annotations) that pgbackrest needs to reach S3
+    # under s3.keyType=auto -- the same identity that wrote the backups. The restore never
+    # calls the Kubernetes API (it only reads S3 and writes the mounted PVC), so its token
+    # is not mounted. The scale down/up around it stays a deliberate operator action.
+    serviceAccountName: {{ include "pg.fullname" . }}-repmgr
+    automountServiceAccountToken: false
+    # Same contexts as the postgresql pods (uid 101, gid 103, fsGroup 103) so the restored
+    # files land with the ownership the postmaster expects on scale-up, and the pod is
+    # accepted under restricted Pod Security / OpenShift SCC.
+    securityContext:
+      {{- toYaml .Values.postgresql.podSecurityContext | nindent 6 }}
+    containers:
+      - name: pgbackrest-restore
+        # The repmgr image ships pgbackrest and the matching PostgreSQL major, so the
+        # restore runs under the same binaries that wrote the backup.
+        image: "{{ include "pg.repmgrImage" . }}"
+        imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+        securityContext:
+          {{- toYaml .Values.postgresql.containerSecurityContext | nindent 10 }}
+        # The restore program lives in the pgbackrest ConfigMap (restore.sh), mounted
+        # below -- mirrors the #38 validation rather than inlining shell here. All inputs
+        # arrive via env.
+        command: ["/bin/bash", "/scripts/restore.sh"]
+        env:
+          - name: PGBACKREST_STANZA
+            value: {{ .Values.pgbackrest.stanza | quote }}
+          # The live data directory, identical to the StatefulSet's PGDATA and to the
+          # mounted pgbackrest.conf's pg1-path. Used for the running-postmaster interlock
+          # and the post-restore pg_controldata report.
+          - name: PGDATA
+            value: /var/lib/postgresql/data/pgdata
+          # pgbackrest's default log/lock paths (/var/log/pgbackrest, /tmp) may be
+          # unwritable; point them at the writable work volume, and keep the restore from
+          # leaving its own scratch files inside the restored PGDATA.
+          - name: PGBACKREST_LOG_PATH
+            value: /work/pgbackrest-log
+          - name: PGBACKREST_LOCK_PATH
+            value: /work/pgbackrest-lock
+          - name: TARGET_TYPE
+            value: {{ .Values.pgbackrest.restore.targetType | quote }}
+          - name: TARGET
+            value: {{ .Values.pgbackrest.restore.target | quote }}
+          - name: BACKUP_SET
+            value: {{ .Values.pgbackrest.restore.backupSet | quote }}
+          - name: FORCE
+            value: {{ .Values.pgbackrest.restore.force | quote }}
+{{- if .Values.pgbackrest.repoEncryption.enabled }}
+          - name: PGBACKREST_REPO1_CIPHER_PASS
+            valueFrom:
+              secretKeyRef:
+                name: {{ required "pgbackrest.repoEncryption.existingSecret.name is required when pgbackrest.repoEncryption.enabled" .Values.pgbackrest.repoEncryption.existingSecret.name }}
+                key: {{ .Values.pgbackrest.repoEncryption.existingSecret.passphraseKey }}
+{{- end }}
+{{- if eq .Values.pgbackrest.s3.keyType "shared" }}
+          - name: PGBACKREST_REPO1_S3_KEY
+            valueFrom:
+              secretKeyRef:
+                name: {{ include "pg.pgbackrestS3SecretName" . }}
+                key: {{ .Values.pgbackrest.existingSecret.accessKeyIdKey }}
+          - name: PGBACKREST_REPO1_S3_KEY_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: {{ include "pg.pgbackrestS3SecretName" . }}
+                key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
+{{- end }}
+        resources:
+          {{- toYaml .Values.pgbackrest.restore.resources | nindent 10 }}
+        volumeMounts:
+          # The LIVE data PVC of replica 0 -- the restore target. Mountable only while the
+          # StatefulSet is scaled to 0 in practice; pgbackrest additionally refuses to
+          # restore while $PGDATA/postmaster.pid exists (see restore.sh).
+          - name: data
+            mountPath: /var/lib/postgresql/data
+          - name: pgbackrest-config
+            mountPath: /etc/pgbackrest/pgbackrest.conf
+            subPath: pgbackrest.conf
+            readOnly: true
+          # Mount restore.sh via a dedicated directory volume (not a subPath file), so
+          # /scripts is created by the mount and need not pre-exist in the image.
+          - name: restore-script
+            mountPath: /scripts
+            readOnly: true
+          - name: work
+            mountPath: /work
+    volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: data-{{ include "pg.fullname" . }}-{{ .Values.pgbackrest.restore.podOrdinal }}
+      - name: pgbackrest-config
+        configMap:
+          name: {{ include "pg.fullname" . }}-pgbackrest
+      - name: restore-script
+        configMap:
+          name: {{ include "pg.fullname" . }}-pgbackrest
+          defaultMode: 0755
+          items:
+            - key: restore.sh
+              path: restore.sh
+      - name: work
+        emptyDir: {}
+{{- end }}
+
+{{- if .Values.pgbackrest.restore.enabled }}
+{{- if eq .Values.pgbackrest.restore.mode "cronjob" }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  # Stable name (restore.nameSuffix deliberately does not apply here) so the runbook's
+  # `kubectl create job --from=cronjob/<fullname>-pgbackrest-restore` never changes.
+  name: {{ include "pg.fullname" . }}-pgbackrest-restore
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgbackrest-restore
+  annotations:
+    # one-shot CronJob: liveness/readiness probes do not apply (kube-linter waiver).
+    ignore-check.kube-linter.io/no-liveness-probe: "one-shot pgbackrest-restore CronJob"
+    ignore-check.kube-linter.io/no-readiness-probe: "one-shot pgbackrest-restore CronJob"
+    {{- with (include "pg.annotations" .) }}
+    {{- . | nindent 4 }}
+    {{- end }}
+spec:
+  # A template, not a schedule: restoring over the live data directory must only ever
+  # happen when an operator asks for it, so the CronJob is suspended AND carries a
+  # schedule that can never fire (Feb 31). Clone it on demand:
+  #   kubectl create job --from=cronjob/<fullname>-pgbackrest-restore restore-now
+  suspend: true
+  schedule: "0 0 31 2 *"
+  concurrencyPolicy: {{ .Values.pgbackrest.cronjob.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.pgbackrest.cronjob.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.pgbackrest.cronjob.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      {{- include "pg.pgbackrestRestoreJobSpec" . | nindent 6 }}
+{{- else }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Jobs are immutable, so a rerun needs a fresh name: restore.nameSuffix.
+  name: {{ include "pg.fullname" . }}-pgbackrest-restore{{ with .Values.pgbackrest.restore.nameSuffix }}-{{ . }}{{ end }}
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgbackrest-restore
+  annotations:
+    # one-shot Job: liveness/readiness probes do not apply (kube-linter waiver).
+    ignore-check.kube-linter.io/no-liveness-probe: "one-shot pgbackrest-restore Job"
+    ignore-check.kube-linter.io/no-readiness-probe: "one-shot pgbackrest-restore Job"
+    {{- with (include "pg.annotations" .) }}
+    {{- . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- include "pg.pgbackrestRestoreJobSpec" . | nindent 2 }}
+{{- end }}
+{{- end }}

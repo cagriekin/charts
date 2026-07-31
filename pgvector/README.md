@@ -885,6 +885,18 @@ helm install my-pgvector cagriekin/pgvector \
 | `pgbackrest.validation.activeDeadlineSeconds` | Validation Job timeout | `3600` |
 | `pgbackrest.validation.backoffLimit` | Validation Job backoff limit | `1` |
 | `pgbackrest.validation.resources.*` | Validation Job resource requests/limits | `200m`/`256Mi` … `1`/`1Gi` |
+| `pgbackrest.restore.enabled` | Render the first-class PITR restore resource (#226) — restores over the **live** data PVC. Inert until you clone/apply it | `false` |
+| `pgbackrest.restore.mode` | `cronjob` (suspended CronJob, clone with `kubectl create job --from`) \| `job` (bare Job, render with `helm template -s`) | `cronjob` |
+| `pgbackrest.restore.targetType` | PITR target type (`pgbackrest --type`): `""` (latest) \| `time` \| `xid` \| `name` \| `lsn`. `target` is required when set | `""` |
+| `pgbackrest.restore.target` | PITR target value for the type above (e.g. `2026-03-22 12:00:00+00`); implies `--target-action=promote` | `""` |
+| `pgbackrest.restore.backupSet` | `pgbackrest --set`: restore a specific backup set label from `pgbackrest info` instead of the latest | `""` |
+| `pgbackrest.restore.force` | `pgbackrest --force`: restore despite a **stale** `postmaster.pid` left by a crash. Leave `false` unless every postgresql pod is confirmed gone | `false` |
+| `pgbackrest.restore.podOrdinal` | Ordinal of the replica PVC (`data-<fullname>-<n>`) restored into; leave `0` | `0` |
+| `pgbackrest.restore.nameSuffix` | `mode: job` only — appended to the Job name so a retry does not collide with the completed Job | `""` |
+| `pgbackrest.restore.activeDeadlineSeconds` | Restore Job timeout | `21600` |
+| `pgbackrest.restore.backoffLimit` | Restore Job backoff limit (0 = one attempt; a half-written PGDATA should not be retried automatically) | `0` |
+| `pgbackrest.restore.resources.*` | Restore Job resource requests/limits | `200m`/`256Mi` … `1`/`1Gi` |
+| _scheduling_ | The restore pod inherits `postgresql.nodeSelector` and `postgresql.tolerations` so it lands where the data PVC can attach (`postgresql.affinity` is not inherited) | — |
 
 ### Keyless backups (cloud workload identity)
 
@@ -915,43 +927,78 @@ kubectl exec -it my-pgvector-0 -- pgbackrest --stanza=db info
 
 ### Point-in-Time Recovery
 
-PITR requires manual intervention:
+Set `pgbackrest.restore.enabled=true` and the chart renders a ready-made restore resource
+(#226) carrying everything a restore needs — the `-repmgr` ServiceAccount (so
+`s3.keyType: auto` works, with its API token unmounted), the postgresql security contexts,
+the `data-<fullname>-0` PVC and `<fullname>-pgbackrest` ConfigMap mounts, the S3 /
+repo-encryption credentials, and `pgbackrest restore --delta`. Nothing to hand-build.
+
+Enabling it is safe: what it renders is **inert** — by default a *suspended* CronJob that
+can never fire. It restores only when you clone it. Leave it enabled so a disaster does not
+also require a `helm upgrade`.
+
+The restore never starts PostgreSQL. Recovery (WAL replay + promotion) happens when you
+scale the StatefulSet back up, under the normal chart entrypoint — so the destructive
+scale down/up stays an explicit, manual decision:
 
 ```bash
-# 1. Scale down the StatefulSet
+# 1. Stop the cluster. pgbackrest refuses to restore while postmaster.pid exists, so this
+#    is not optional -- wait for the pods to actually terminate.
 kubectl scale statefulset my-pgvector --replicas=0
+kubectl wait --for=delete pod/my-pgvector-0 --timeout=5m
 
-# 2. Run a restore pod that mounts the data PVC AND the pgbackrest ConfigMap.
-# The repo settings (repo1-type=s3, endpoint, bucket, path) and pg1-path live ONLY
-# in the <fullname>-pgbackrest ConfigMap, so it MUST be mounted at
-# /etc/pgbackrest/pgbackrest.conf or pgbackrest fails with "requires option: pg1-path"
-# and would default to a local posix repo (never finding the S3 backup).
-# Replace YOUR_PGBACKREST_SECRET with your pgbackrest.existingSecret.name.
-# The securityContext (101:103) matches the chart so restored files are owned
-# correctly and the pod is accepted under restricted PodSecurity / OpenShift SCC.
-# keyType: auto (IRSA / Workload Identity)? Drop the env block, add
-# "serviceAccountName": "my-pgvector-repmgr" to the spec (that SA carries the
-# cloud-role annotation; the namespace default SA does not), and ensure the pod lands
-# where your IRSA/WI webhook injects the token; pgbackrest then uses the credential chain.
-kubectl run pg-restore --rm -it \
-  --image=cagriekin/repmgr:trixie-5.5.0-27 \
-  --overrides='{ "spec": { "securityContext": { "runAsUser": 101, "runAsGroup": 103, "fsGroup": 103, "runAsNonRoot": true, "seccompProfile": { "type": "RuntimeDefault" } }, "containers": [{ "name": "restore", "image": "cagriekin/repmgr:trixie-5.5.0-27", "command": ["bash"], "stdin": true, "tty": true, "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] } }, "volumeMounts": [{ "name": "data", "mountPath": "/var/lib/postgresql/data" }, { "name": "pgbackrest-config", "mountPath": "/etc/pgbackrest/pgbackrest.conf", "subPath": "pgbackrest.conf", "readOnly": true }], "env": [{ "name": "PGBACKREST_REPO1_S3_KEY", "valueFrom": { "secretKeyRef": { "name": "YOUR_PGBACKREST_SECRET", "key": "access-key-id" } } }, { "name": "PGBACKREST_REPO1_S3_KEY_SECRET", "valueFrom": { "secretKeyRef": { "name": "YOUR_PGBACKREST_SECRET", "key": "secret-access-key" } } }] }], "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "data-my-pgvector-0" } }, { "name": "pgbackrest-config", "configMap": { "name": "my-pgvector-pgbackrest" } }] } }'
+# 2. Restore (stanza = pgbackrest.stanza, default "db").
+kubectl create job --from=cronjob/my-pgvector-pgbackrest-restore restore-now
+kubectl wait --for=condition=complete job/restore-now --timeout=30m
 
-# 3. Inside the restore pod, run (stanza = pgbackrest.stanza, default "db").
-# --type=time is REQUIRED with --target (pgbackrest rejects --target otherwise);
-# use --type=xid|name|lsn for other recovery targets. Leave the existing data dir in
-# place so --delta restores only changed files (a wiped PGDATA disables --delta).
-pgbackrest --stanza=db restore \
-  --type=time \
-  --target="2026-03-22 12:00:00+00" \
-  --target-action=promote \
-  --delta
-
-# 4. Scale back up
+# 3. Scale back up: the pods replay the archived WAL and promote.
 kubectl scale statefulset my-pgvector --replicas=2
 ```
 
-Repmgr will automatically rebuild standbys from the restored primary.
+With no target set this restores the **latest** backup set and replays all archived WAL —
+the disaster-recovery case. For a *point in time*, set the target first:
+
+```yaml
+pgbackrest:
+  restore:
+    enabled: true
+    targetType: time                     # "" (latest) | time | xid | name | lsn
+    target: "2026-03-22 12:00:00+00"     # required once targetType is set
+    # backupSet: "20260322-010002F"      # optional: pin a specific set from `pgbackrest info`
+```
+
+A target always implies `--target-action=promote`: PostgreSQL's default
+`recovery_target_action` is `pause`, which would leave the cluster in recovery, never
+accepting connections.
+
+`mode: job` renders a bare Job instead, for passing an arbitrary target inline without
+touching the release (useful when the values live in Git and you cannot wait for a commit):
+
+```bash
+helm get values my-pgvector > /tmp/v.yaml
+helm template my-pgvector cagriekin/pgvector -f /tmp/v.yaml \
+  --set pgbackrest.restore.enabled=true --set pgbackrest.restore.mode=job \
+  --set pgbackrest.restore.targetType=time \
+  --set-string 'pgbackrest.restore.target=2026-03-22 12:00:00+00' \
+  -s templates/pgbackrest-restore-job.yaml | kubectl apply -f -
+```
+
+Two caveats for this mode: the Job is not part of the release, so a GitOps controller may
+report or prune it; and Jobs are immutable, so a second attempt needs
+`--set pgbackrest.restore.nameSuffix=attempt2`.
+
+Repmgr rebuilds the standbys from the restored primary when they start. If a standby comes
+up on the pre-restore timeline instead of re-cloning, delete its PVC and pod so it clones
+fresh from the restored primary:
+
+```bash
+kubectl delete pvc data-my-pgvector-1 && kubectl delete pod my-pgvector-1
+```
+
+If the cluster **crashed** rather than being scaled down cleanly, a stale
+`postmaster.pid` is left in PGDATA and pgbackrest refuses to restore — the interlock that
+lets this Job run with no Kubernetes API access at all. Confirm every postgresql pod is
+gone, then set `pgbackrest.restore.force=true`.
 
 #### Agent mode: clear the stale leadership state before scaling up
 

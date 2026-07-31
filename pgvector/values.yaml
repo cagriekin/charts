@@ -784,6 +784,68 @@ pgbackrest:
         cpu: "1"
         memory: 1Gi
 
+  # First-class PITR restore (#226). Opt-in, and unlike `validation` above this restores
+  # over the LIVE data directory of replica 0 -- it exists so a real disaster recovery is a
+  # `kubectl create job` instead of a hand-built `kubectl run --overrides` pod spec. The
+  # resource carries everything a restore needs (repmgr SA for s3.keyType=auto, postgresql
+  # security contexts, the data PVC + pgbackrest ConfigMap mounts, S3 / repo-encryption
+  # credentials) and runs `pgbackrest restore --delta`; it never starts postgres, so WAL
+  # replay + promotion happen when you scale the StatefulSet back up.
+  #
+  # Enabling this renders an INERT resource -- a suspended CronJob, or a Job you render on
+  # demand -- it does not restore anything by itself. The destructive scale down/up stays
+  # an explicit operator action. See the README, "Point-in-Time Recovery".
+  restore:
+    enabled: false
+    # How the restore is delivered:
+    #   cronjob (default) -- a suspended CronJob to clone on demand:
+    #       kubectl create job --from=cronjob/<fullname>-pgbackrest-restore restore-now
+    #     The resource belongs to the release, so GitOps/ArgoCD sees no stray object; a
+    #     point-in-time target has to be set in values (helm upgrade) before cloning.
+    #   job -- a bare Job, for rendering one off with the target passed inline:
+    #       helm template <release> <chart> -f <release-values> \
+    #         --set pgbackrest.restore.enabled=true --set pgbackrest.restore.mode=job \
+    #         -s templates/pgbackrest-restore-job.yaml | kubectl apply -f -
+    #     Nothing is baked into the release, but the object is not release-managed either
+    #     (ArgoCD may report/prune it), and Jobs are immutable -- see nameSuffix.
+    mode: cronjob
+    # PITR target. Empty (default) restores the latest backup set and replays all archived
+    # WAL to the end of the stream (the disaster-recovery case). For a point in time set:
+    #   targetType: time   target: "2026-03-22 12:00:00+00"
+    # targetType is one of: "" (latest) | time | xid | name | lsn (pgbackrest --type).
+    # A target always implies --target-action=promote.
+    targetType: ""
+    target: ""
+    # pgbackrest --set: restore a SPECIFIC backup set (label from `pgbackrest info`, e.g.
+    # "20260322-010002F") instead of the latest. Empty = latest.
+    backupSet: ""
+    # pgbackrest --force: restore even though $PGDATA/postmaster.pid exists. Needed only
+    # when the cluster crashed and left a stale pid file behind -- pgbackrest otherwise
+    # refuses to restore over what may be a running cluster, which is the safety interlock
+    # that lets this Job run with no Kubernetes API access at all. Leave false unless you
+    # have confirmed every postgresql pod is gone.
+    force: false
+    # Ordinal of the replica whose PVC (data-<fullname>-<ordinal>) is restored into.
+    # Leave 0: replica 0 becomes the restored primary and repmgr re-clones the standbys.
+    podOrdinal: 0
+    # mode: job only -- appended to the Job name so a second attempt does not collide with
+    # the completed first one (Jobs are immutable). Ignored in cronjob mode, where the name
+    # must stay stable for `kubectl create job --from`.
+    nameSuffix: ""
+    # Generous by default: a real restore moves the whole database over the network. The
+    # Job is killed at this deadline even mid-restore (rerun it; --delta resumes cheaply).
+    activeDeadlineSeconds: 21600  # 6 hours
+    # 0 = one pod attempt. A failed restore leaves PGDATA half-written, so an automatic
+    # retry would race the operator's diagnosis -- and failures surface immediately.
+    backoffLimit: 0
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
 networkPolicy:
   enabled: false
   postgresql:
