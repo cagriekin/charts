@@ -62,15 +62,35 @@ jobs:
 
       - name: Resolve image tag
         id: meta
+        # The dispatch input reaches the shell through the ENVIRONMENT, never through
+        # ${{ }} interpolation: an expression is expanded into the script source before bash
+        # parses it, so shell metacharacters in the input would execute as code -- in a job
+        # holding id-token: write (cosign signing) and the DockerHub credentials. Quoting
+        # "$INPUT_TAG" instead keeps it data, and the validation below then actually guards
+        # what gets used.
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          PG_MAJOR: ${{ matrix.pg_major }}
+          DEFAULT_MAJOR: ${{ matrix.default_major }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ inputs.tag }}"
+            tag="$INPUT_TAG"
           else
             tag="${GITHUB_REF_NAME}"
           fi
           if [ -z "$tag" ]; then
             echo "Could not resolve an image tag" >&2
+            exit 1
+          fi
+          # Only the exact shape the tag scheme allows, ANCHORED at both ends. A glob cannot
+          # express that ("trixie-*-[0-9]*" still matches trixie-5.5.0-30-pg17 via the
+          # trailing wildcard), and both rejections matter: a major-suffixed base tag would
+          # publish the PostgreSQL 18 build as ...-pg17 -- a signed image whose name states
+          # the wrong major, which the chart's tag guard would then trust -- and shell
+          # metacharacters must never reach a later step in a job that holds id-token: write.
+          if [[ ! "$tag" =~ ^trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]; then
+            echo "Refusing to publish from '${tag}': expected an UNSUFFIXED trixie-<repmgr-version>-<n>, e.g. trixie-5.5.0-30 (each leg appends its own -pgNN)" >&2
             exit 1
           fi
           # The base tag must NOT carry a major suffix: the suffix is appended per matrix
@@ -88,12 +108,12 @@ jobs:
           # UNSUFFIXED tag -- that is the contract every existing chart pin relies on,
           # and it is why Dockerfile's ARG PG_MAJOR default must stay in step with
           # default_major here.
-          tags="cagriekin/repmgr:${tag}-pg${{ matrix.pg_major }}"
-          if [ "${{ matrix.default_major }}" = "true" ]; then
+          tags="cagriekin/repmgr:${tag}-pg${PG_MAJOR}"
+          if [ "$DEFAULT_MAJOR" = "true" ]; then
             tags="cagriekin/repmgr:${tag},${tags}"
           fi
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
-          echo "Publishing PG${{ matrix.pg_major }} as: ${tags}"
+          echo "Publishing PG${PG_MAJOR} as: ${tags}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -115,17 +135,20 @@ jobs:
       # tag that every existing chart pin resolves to. The multi-arch build below reuses
       # this leg's layer cache, so the extra wall-clock is small.
       - name: Build and smoke-test PG${{ matrix.pg_major }} (amd64) before publishing
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          PG_MAJOR: ${{ matrix.pg_major }}
         run: |
           set -euo pipefail
-          ref="cagriekin/repmgr:${{ steps.meta.outputs.tag }}-pg${{ matrix.pg_major }}"
+          ref="cagriekin/repmgr:${TAG}-pg${PG_MAJOR}"
           docker buildx build --load \
-            --build-arg PG_MAJOR=${{ matrix.pg_major }} \
-            --cache-from type=gha,scope=repmgr-publish-pg${{ matrix.pg_major }} \
-            --cache-to type=gha,mode=max,scope=repmgr-publish-pg${{ matrix.pg_major }} \
+            --build-arg "PG_MAJOR=${PG_MAJOR}" \
+            --cache-from "type=gha,scope=repmgr-publish-pg${PG_MAJOR}" \
+            --cache-to "type=gha,mode=max,scope=repmgr-publish-pg${PG_MAJOR}" \
             -t "$ref" images/repmgr
           # Named with the real tag so image-smoke.sh derives the repmgr version the tag
           # advertises and holds the artifact to it.
-          bash images/repmgr/test/image-smoke.sh "$ref" "${{ matrix.pg_major }}"
+          bash images/repmgr/test/image-smoke.sh "$ref" "$PG_MAJOR"
 
       - name: Build and push Docker image
         id: build

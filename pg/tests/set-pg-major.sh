@@ -187,6 +187,11 @@ if command -v helm >/dev/null 2>&1; then
   for fx in "${FIXTURES[@]}"; do
     out=$(helm template verify "$CHART_DIR" -f "$fx" 2>/dev/null) || { skipped="${skipped} $(basename "$fx")"; continue; }
     while IFS= read -r img; do
+      # A herestring is never empty (`<<<""` still feeds one blank line), so a fixture that
+      # renders none of these images would otherwise append a blank entry and fail the run
+      # with an empty `renders:` line instead of a real mismatch. Same guard as the suite
+      # loop above.
+      [ -n "$img" ] || continue
       case "$img" in
         "cagriekin/repmgr:${REPMGR_TAG}"|"postgres:${PG_IMAGE_TAG}") continue ;;
       esac
