@@ -1617,6 +1617,11 @@ pgbr_res_badtype=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbac
 assert_contains "#226: invalid targetType rejected" "${pgbr_res_badtype}" "must be one of"
 pgbr_res_badmode=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set pgbackrest.restore.mode=bogus 2>&1 || true)
 assert_contains "#226: invalid mode rejected" "${pgbr_res_badmode}" "must be one of"
+# nameSuffix lands in metadata.name, so a non-DNS-1123 value must be rejected at render
+# time rather than by the API server mid-incident. The pattern also permits "" (the
+# default): helm validates values.yaml against the schema on every render.
+pgbr_res_badsuffix=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set pgbackrest.restore.mode=job --set pgbackrest.restore.nameSuffix=Attempt_2 2>&1 || true)
+assert_contains "#226: non-DNS-1123 nameSuffix rejected" "${pgbr_res_badsuffix}" "does not match pattern"
 pgbr_res_nopersist=$(helm template test-pg "${CHART_DIR}" ${pgbr_args} --set pgbackrest.restore.enabled=true --set postgresql.persistence.enabled=false 2>&1 || true)
 assert_contains "#226: restore without persistence fails fast (no PVC to restore into)" "${pgbr_res_nopersist}" "requires postgresql.persistence.enabled"
 pgbr_res_nopgbr=$(helm template test-pg "${CHART_DIR}" --set pgbackrest.restore.enabled=true 2>&1 || true)

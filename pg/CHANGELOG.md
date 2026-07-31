@@ -15,6 +15,7 @@
   kubectl scale statefulset my-postgres-pg --replicas=0
   kubectl wait --for=delete pod/my-postgres-pg-0 --timeout=5m
   kubectl create job --from=cronjob/my-postgres-pg-pgbackrest-restore restore-now
+  kubectl wait --for=condition=complete job/restore-now --timeout=30m
   kubectl scale statefulset my-postgres-pg --replicas=2
   ```
 

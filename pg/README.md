@@ -1217,6 +1217,16 @@ kubectl wait --for=condition=complete job/restore-now --timeout=30m
 kubectl scale statefulset my-postgres-pg --replicas=2
 ```
 
+`--for=condition=complete` only ever succeeds, so a **failed** restore leaves that wait
+blocked for the full timeout with no signal. `backoffLimit` is `0` (one pod attempt), so a
+failure shows up immediately in the Job status — if the wait seems stuck, check it rather
+than waiting out the clock, and do not scale up until the Job has actually completed:
+
+```bash
+kubectl get job restore-now -o jsonpath='{.status.failed}{"\n"}'   # 1 = the attempt failed
+kubectl logs job/restore-now                                        # why
+```
+
 With no target set this restores the **latest** backup set and replays all archived WAL —
 the disaster-recovery case. For a *point in time*, set the target first:
 

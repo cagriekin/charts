@@ -11,7 +11,8 @@ detail.
 - **`pgbackrest.restore.*` — a first-class PITR restore resource** (#226). Replaces the
   hand-built `kubectl run --overrides='{…}'` restore pod (~30 lines of inline JSON) with a
   chart-rendered one: scale to 0 →
-  `kubectl create job --from=cronjob/<fullname>-pgbackrest-restore` → scale back up. It
+  `kubectl create job --from=cronjob/<fullname>-pgbackrest-restore` → wait for the Job to
+  complete → scale back up. It
   carries the `-repmgr` ServiceAccount (so `s3.keyType: auto` works, API token unmounted),
   the postgresql security contexts, the `data-<fullname>-0` PVC and pgbackrest ConfigMap
   mounts, the S3 / repo-encryption credentials, and `pgbackrest restore --delta`.
