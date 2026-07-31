@@ -60,6 +60,12 @@
   that bindir holds no `postgres` binary, rather than failing mid-reconcile after taking the
   lease.
 
+- The agent's vendored `google.golang.org/grpc` (1.79.3 → 1.82.1) and `golang.org/x/text`
+  (0.37.0 → 0.39.0) carried two advisories that `govulncheck` reports as reachable from
+  the etcd DCS and Service-patch paths: **GO-2026-6061** (xDS RBAC / HTTP-2 transport) and
+  **GO-2026-5970** (infinite loop on invalid input). Bumped and re-vendored; no agent
+  source changed.
+
 - The live suites pinned `repmgr.image.tag: trixie-5.5.0-27` in their fixtures while the
   chart shipped `-28`, so they pulled an older published image instead of the one CI
   builds from source. `set-pg-major.sh` now retargets every fixture at the chart's own
