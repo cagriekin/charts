@@ -65,6 +65,12 @@
   kubectl path (`kubectl create job --from=cronjob/...`) needs none of it. It is documented
   in the README and in `rbac.yaml` itself; leave it off unless the trade is worth it.
 
+  What the grant buys is choosing the recovery point **in the request**
+  (`targetType`/`target`/`backupSet` are applied to the Job the agent creates), so an
+  operator can recover to an arbitrary timestamp with one call. The kubectl `mode: cronjob`
+  runbook cannot: it needs the target in values and a `helm upgrade` first. Without that
+  requirement, use the kubectl path and skip the RBAC entirely.
+
   What bounds it:
 
   - The Job is a **verbatim clone** of the rendered restore CronJob's `jobTemplate` —

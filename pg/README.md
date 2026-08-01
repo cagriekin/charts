@@ -474,6 +474,13 @@ privilege trade-off you should decide deliberately:
 
 Nothing else in the API adds any RBAC at all.
 
+**What the grant buys** is choosing the recovery point *in the request*: `targetType`,
+`target` and `backupSet` are applied to the Job the agent creates, so an operator can
+recover to an arbitrary timestamp during an incident with one call. The kubectl
+`mode: cronjob` runbook cannot do that — it requires the target in values and a
+`helm upgrade` before cloning. If you do not need request-time target selection, leave this
+off and use the kubectl path, which needs none of the RBAC above.
+
 ```yaml
 repmgr:
   agent:
