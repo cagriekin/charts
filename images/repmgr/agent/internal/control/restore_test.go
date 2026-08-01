@@ -346,14 +346,19 @@ func TestRestoreHintDoesNotOverclaimFromAnotherPod(t *testing.T) {
 	local := newHarness(t, nil) // PodName == RestoreTargetPod == pg-0
 	local.bk.status = RestoreView{Phase: "pending", PodPhase: "Pending"}
 	hLocal := decode[RestoreView](t, local.do("GET", "/v1/restore", "", "ops")).Hint
-	if !strings.Contains(hLocal, "answered by that pod") {
-		t.Errorf("the target pod should state it as a fact: %q", hLocal)
+	// It may state as FACT that this pod holds the mount (it is answering the request),
+	// but not that this is why the Job has not started -- that stays conditional.
+	if !strings.Contains(hLocal, "answered by pg-0") || !strings.Contains(hLocal, "data-pg-0") {
+		t.Errorf("the target pod should state the mount as a fact: %q", hLocal)
+	}
+	if !strings.Contains(hLocal, "if the Job stays Pending") {
+		t.Errorf("causation must stay conditional: %q", hLocal)
 	}
 
 	remote := newHarness(t, func(o *Options, _ *harness) { o.PodName = "pg-1" })
 	remote.bk.status = RestoreView{Phase: "pending", PodPhase: "Pending"}
 	hRemote := decode[RestoreView](t, remote.do("GET", "/v1/restore", "", "ops")).Hint
-	if strings.Contains(hRemote, "answered by that pod") {
+	if strings.Contains(hRemote, "answered by pg-0") {
 		t.Errorf("a non-target pod must not claim it is holding the volume: %q", hRemote)
 	}
 	if !strings.Contains(hRemote, "usual cause") || !strings.Contains(hRemote, "pg-0") {
@@ -435,5 +440,28 @@ func TestNextStepsRequireTheResume(t *testing.T) {
 	res := strings.Index(joined, "/v1/resume")
 	if up < 0 || res < 0 || res < up {
 		t.Errorf("the resume must be listed after the scale-up: %v", v.NextSteps)
+	}
+}
+
+// A pod waiting on a volume it cannot attach presents as Pending/ContainerCreating -- the
+// kubelet has no distinct reason for it. So that reason must NOT suppress the volume hint,
+// which is the whole point of the hint. (The live suite caught this: the hint was missing
+// exactly when it mattered.) Reasons that DO explain themselves stay unhinted.
+func TestVolumeHintSurvivesContainerCreating(t *testing.T) {
+	for _, reason := range []string{"", "ContainerCreating", "PodInitializing"} {
+		h := newHarness(t, nil)
+		h.bk.status = RestoreView{Phase: "pending", PodPhase: "Pending", WaitingReason: reason}
+		v := decode[RestoreView](t, h.do("GET", "/v1/restore", "", "ops"))
+		if !strings.Contains(v.Hint, "data-pg-0") {
+			t.Errorf("waitingReason=%q should still get the volume hint: %q", reason, v.Hint)
+		}
+	}
+	for _, reason := range []string{"ImagePullBackOff", "CreateContainerConfigError", "ErrImagePull"} {
+		h := newHarness(t, nil)
+		h.bk.status = RestoreView{Phase: "pending", PodPhase: "Pending", WaitingReason: reason}
+		v := decode[RestoreView](t, h.do("GET", "/v1/restore", "", "ops"))
+		if v.Hint != "" {
+			t.Errorf("waitingReason=%q explains itself; no volume hint expected: %q", reason, v.Hint)
+		}
 	}
 }

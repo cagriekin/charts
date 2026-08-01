@@ -81,18 +81,18 @@ func (s *Server) handleRestoreStatus(w http.ResponseWriter, r *http.Request) (in
 // postmaster and required the cluster to be paused first. That pair, not the scale-down,
 // is what keeps a restore off a live data directory.
 func (s *Server) annotateRestoreView(v *RestoreView) {
-	if v.Phase == "pending" && !v.ContainerStarted && v.WaitingReason == "" {
+	if v.Phase == "pending" && !v.ContainerStarted && unexplainedWait(v.WaitingReason) {
 		if s.o.PodName == s.o.RestoreTargetPod {
-			// This pod owns the target volume and is answering the request, so it is
-			// provably still holding the mount -- state it as the fact it is.
+			// This pod owns the target volume and is answering the request, so "that pod
+			// still has it mounted" is a fact -- but whether that is why the Job has not
+			// started is not, so the causation stays conditional.
 			v.Hint = fmt.Sprintf(
-				"the restore Job cannot start while %s is running: this request was answered by that pod, so it still has %s mounted. Scale the StatefulSet to 0.",
+				"the restore Job has not started yet. This request was answered by %s, so that pod still has %s mounted -- if the Job stays Pending, that is why. Scale the StatefulSet to 0 to free it.",
 				s.o.RestoreTargetPod, s.dataPVC())
 		} else {
-			// Answered by a different member, which says nothing about the target pod --
-			// so the hint offers the likely cause without asserting it.
+			// Answered by a different member, which says nothing about the target pod.
 			v.Hint = fmt.Sprintf(
-				"the restore Job has not started; the usual cause is that %s still has %s mounted. Scale the StatefulSet to 0.",
+				"the restore Job has not started yet. If it stays Pending, the usual cause is that %s still has %s mounted. Scale the StatefulSet to 0 to free it.",
 				s.o.RestoreTargetPod, s.dataPVC())
 		}
 	}
@@ -107,6 +107,20 @@ func (s *Server) annotateRestoreView(v *RestoreView) {
 		v.Hint = fmt.Sprintf(
 			"the restore failed and PGDATA on %s may be half-written; read `kubectl logs -n %s job/%s` before retrying, then DELETE /v1/restore (or pass replace:true) to re-create it",
 			s.o.RestoreTargetPod, s.o.Namespace, v.JobName)
+	}
+}
+
+// unexplainedWait reports whether a not-yet-started container's waiting reason explains
+// itself. "ContainerCreating" and "PodInitializing" do NOT: they are exactly what the
+// kubelet reports while a pod waits for a volume it cannot attach, which is the case the
+// volume hint exists for. Reasons like ImagePullBackOff or CreateContainerConfigError DO
+// explain themselves and are already in the response, so the hint stays out of the way.
+func unexplainedWait(reason string) bool {
+	switch reason {
+	case "", "ContainerCreating", "PodInitializing":
+		return true
+	default:
+		return false
 	}
 }
 
