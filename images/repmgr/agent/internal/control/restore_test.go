@@ -360,3 +360,21 @@ func TestRestoreHintDoesNotOverclaimFromAnotherPod(t *testing.T) {
 		t.Errorf("the hint should still name the likely cause and the target pod: %q", hRemote)
 	}
 }
+
+// A failed restore is the state an operator most needs guidance in: PGDATA is
+// half-written, nothing retries it, and the immutable Job has to go before another
+// attempt.
+func TestFailedRestoreHintPointsAtLogsAndRetry(t *testing.T) {
+	h := newHarness(t, nil)
+	h.bk.status = RestoreView{Phase: "failed", JobName: "pg-pgbackrest-restore-api", Failed: 1}
+	v := decode[RestoreView](t, h.do("GET", "/v1/restore", "", "ops"))
+	for _, want := range []string{"half-written", "kubectl logs", "pg-pgbackrest-restore-api", "DELETE /v1/restore"} {
+		if !strings.Contains(v.Hint, want) {
+			t.Errorf("hint should mention %q: %q", want, v.Hint)
+		}
+	}
+	// The scale-down runbook does not apply to a Job that already ran.
+	if len(v.NextSteps) != 0 {
+		t.Errorf("a failed restore should not offer the scale-down steps: %v", v.NextSteps)
+	}
+}

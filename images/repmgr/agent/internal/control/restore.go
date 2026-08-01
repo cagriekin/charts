@@ -93,6 +93,15 @@ func (s *Server) annotateRestoreView(v *RestoreView) {
 	if v.Phase == "pending" || v.Phase == "none" {
 		v.NextSteps = s.restoreNextSteps()
 	}
+	if v.Phase == "failed" {
+		// A failed restore leaves PGDATA half-written and the Job is not retried
+		// automatically (backoffLimit 0), so the operator's next move is to read the log
+		// before doing anything else -- and the Job has to go before another attempt,
+		// because Jobs are immutable.
+		v.Hint = fmt.Sprintf(
+			"the restore failed and PGDATA on %s may be half-written; read `kubectl logs -n %s job/%s` before retrying, then DELETE /v1/restore (or pass replace:true) to re-create it",
+			s.o.RestoreTargetPod, s.o.Namespace, v.JobName)
+	}
 }
 
 func (s *Server) dataPVC() string {

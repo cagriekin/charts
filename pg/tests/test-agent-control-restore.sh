@@ -97,6 +97,27 @@ helm upgrade --install "${RELEASE}" "${CHART_DIR}" -n "${NAMESPACE}" \
   -f "${VALUES}" --wait --timeout 10m
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 900
 
+# --- the granted RBAC is exactly what was documented, no wider ---
+#
+# The README and rbac.yaml both claim that `create jobs` is the ONE grant that cannot be
+# resourceName-scoped, and that nothing else widens. Assert it against the live apiserver
+# rather than against rendered YAML: `kubectl auth can-i --as` takes the same
+# authorization path the agent's token does, so this is the claim itself under test.
+SA="system:serviceaccount:${NAMESPACE}:${FULLNAME}-repmgr"
+can() { kubectl auth can-i "$1" "$2" -n "${NAMESPACE}" --as="${SA}" 2>/dev/null | tail -1; }
+assert_eq "RBAC: can read the CronJob it clones" "yes" "$(can get "cronjobs/${FULLNAME}-pgbackrest-restore")"
+assert_eq "RBAC: can create the restore Job" "yes" "$(can create jobs)"
+assert_eq "RBAC: can read its own Job by name" "yes" "$(can get "jobs/${API_JOB}")"
+assert_eq "RBAC: can delete its own Job by name" "yes" "$(can delete "jobs/${API_JOB}")"
+# The negatives are the point: get/delete really are name-scoped, and none of the sharper
+# grants leaked in with them.
+assert_eq "RBAC: cannot read any OTHER Job" "no" "$(can get jobs/some-other-job)"
+assert_eq "RBAC: cannot delete any OTHER Job" "no" "$(can delete jobs/some-other-job)"
+assert_eq "RBAC: cannot read another CronJob" "no" "$(can get "cronjobs/${FULLNAME}-pgbackrest-full")"
+assert_eq "RBAC: cannot list Jobs" "no" "$(can list jobs)"
+assert_eq "RBAC: no pods/log without restore.readPodLogs" "no" "$(can get pods/log)"
+assert_eq "RBAC: still cannot read Secrets" "no" "$(can get secrets)"
+
 # --- data + a backup to restore from ---
 
 pg_exec "${NAMESPACE}" "${POD0}" "CREATE TABLE api_restore_proof AS SELECT g AS id FROM generate_series(1,5000) g;" >/dev/null
