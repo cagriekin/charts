@@ -7,7 +7,7 @@ import (
 )
 
 func tl(n uint32) pg.Timeline { return pg.Timeline(n) }
-func ls(hi, lo uint64) pg.LSN { return pg.LSN{Hi: hi, Lo: lo} }
+func ls(hi, lo uint64) pg.LSN  { return pg.LSN{Hi: hi, Lo: lo} }
 
 func primary(name string, t uint32, hi, lo uint64) PeerState {
 	return PeerState{Name: name, Reachable: true, Role: pg.RolePrimary, Timeline: tl(t), TimelineOK: true, LSN: ls(hi, lo), LSNOK: true}

@@ -20,20 +20,20 @@ import (
 type Action int
 
 const (
-	NoOp            Action = iota
-	Wait                   // observe again; take no destructive action
-	BootstrapInitdb        // empty data + lease + no live primary: initdb as primary
-	BootstrapClone         // empty data + not the chosen primary: clone from Target
-	Promote                // standby holds lease, caught up & most-advanced: promote
-	StayPrimary            // holds lease, already a current primary: assert routing only
-	Follow                 // not holder, standby: follow Target (the leader)
-	DemoteFence            // read-write without the lease: demote now (soft fence)
-	RejoinForward          // local data behind Target's newer timeline: rewind forward
-	ReleaseLease           // holds lease but must not serve (stale/behind/unhealthy): release + step down
-	StartLocal             // initialized but stopped, and safe to start in its on-disk role
-	RestartLocal           // stuck single-node primary: force-restart postgres in place (no peer to fail over to)
-	StartRecovery          // non-holder primary-state data: start READ-ONLY (standby.signal) so its true position is observable
-	Switchover             // operator-requested handoff: a caught-up target standby exists; clear the request + step down so it promotes
+	NoOp              Action = iota
+	Wait                     // observe again; take no destructive action
+	BootstrapInitdb          // empty data + lease + no live primary: initdb as primary
+	BootstrapClone           // empty data + not the chosen primary: clone from Target
+	Promote                  // standby holds lease, caught up & most-advanced: promote
+	StayPrimary              // holds lease, already a current primary: assert routing only
+	Follow                   // not holder, standby: follow Target (the leader)
+	DemoteFence              // read-write without the lease: demote now (soft fence)
+	RejoinForward            // local data behind Target's newer timeline: rewind forward
+	ReleaseLease             // holds lease but must not serve (stale/behind/unhealthy): release + step down
+	StartLocal               // initialized but stopped, and safe to start in its on-disk role
+	RestartLocal             // stuck single-node primary: force-restart postgres in place (no peer to fail over to)
+	StartRecovery            // non-holder primary-state data: start READ-ONLY (standby.signal) so its true position is observable
+	Switchover               // operator-requested handoff: a caught-up target standby exists; clear the request + step down so it promotes
 )
 
 func (a Action) String() string {
@@ -49,9 +49,7 @@ type Decision struct {
 	Reason string
 }
 
-func d(a Action, target, reason string) Decision {
-	return Decision{Action: a, Target: target, Reason: reason}
-}
+func d(a Action, target, reason string) Decision { return Decision{Action: a, Target: target, Reason: reason} }
 
 // LocalState is the local node's state. Timeline comes from pg_controldata when the
 // node is not a running primary (so it is meaningful even for a stopped/standby node).
