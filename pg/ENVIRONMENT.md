@@ -94,7 +94,11 @@ Two runtime behaviours worth knowing before an incident:
   and fails closed: a transient apiserver error answers `502` and the cluster stays paused
   (so no failover) until the read succeeds. That is deliberate — resuming while pgbackrest
   is rewriting the data directory is the worse outcome — but it does make resume depend on
-  the apiserver, which it does not when restore is off.
+  the apiserver, which it does not when restore is off. Note the check reads **only**
+  `CONTROL_RESTORE_JOB_NAME`, the Job the API creates: a restore started by hand
+  (`kubectl create job --from=cronjob/<fullname>-pgbackrest-restore`) has a different name
+  and is not seen, so keep the cluster paused for the whole of a hand-started restore and
+  clear the pause the same way you set it.
 - A control listener that **fails at startup is fatal** (the agent will not run with a
   silently missing API), but one that dies *later* is logged and not retried: HA is left
   intact rather than taking the database down with the API. The asymmetry means a healthy

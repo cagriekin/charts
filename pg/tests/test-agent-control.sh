@@ -160,14 +160,21 @@ wait_api_ready() {
 # matching the leader's. Needed after a reinitialize -- the leader's snapshot refreshes once
 # per reconcile tick, and while a peer is being wiped and re-cloned it is legitimately
 # unreachable, so a handoff requested too early is (correctly) refused with 409.
+#
+# Both timelines are required to be NUMERIC, not merely equal: `timeline` is omitempty in
+# the JSON, so an unpublished one reads back as the string "null" from jq -- and two
+# "null"s compare equal. The member match is counted explicitly for the same reason:
+# `[...] | all` over an empty selection is true, so a missing member would otherwise look
+# ready.
 wait_candidate_ready() { # wait_candidate_ready <peer>
-  local cand="$1" c ok ctl ltl
+  local cand="$1" c n ok ctl ltl
   for _ in $(seq 1 60); do
     c=$(api_body GET /v1/cluster)
+    n=$(jq -r --arg n "${cand}" '[.members[] | select(.name==$n)] | length' <<< "${c}" 2>/dev/null || echo 0)
     ok=$(jq -r --arg n "${cand}" '[.members[] | select(.name==$n) | .reachable, .timelineKnown, (.role=="standby")] | all' <<< "${c}" 2>/dev/null || echo false)
-    ctl=$(jq -r --arg n "${cand}" '.members[] | select(.name==$n) | .timeline' <<< "${c}" 2>/dev/null || echo x)
-    ltl=$(jq -r '.members[] | select(.self==true) | .timeline' <<< "${c}" 2>/dev/null || echo y)
-    if [ "${ok}" = "true" ] && [ -n "${ctl}" ] && [ "${ctl}" = "${ltl}" ]; then
+    ctl=$(jq -r --arg n "${cand}" '.members[] | select(.name==$n) | .timeline // empty' <<< "${c}" 2>/dev/null || echo x)
+    ltl=$(jq -r '.members[] | select(.self==true) | .timeline // empty' <<< "${c}" 2>/dev/null || echo y)
+    if [ "${n}" = "1" ] && [ "${ok}" = "true" ] && [[ "${ctl}" =~ ^[0-9]+$ ]] && [ "${ctl}" = "${ltl}" ]; then
       return 0
     fi
     sleep 5
@@ -519,9 +526,11 @@ rejoined=fail
 for _ in $(seq 1 60); do
   c=$(api_body GET /v1/cluster)
   self_ok=$(jq -r '[.members[] | select(.self==true) | .reachable, .timelineKnown, (.role=="standby")] | all' <<< "${c}" 2>/dev/null || echo false)
-  self_tl=$(jq -r '.members[] | select(.self==true) | .timeline' <<< "${c}" 2>/dev/null || echo x)
-  lead_tl=$(jq -r --arg l "${CANDIDATE}" '.members[] | select(.name==$l) | .timeline' <<< "${c}" 2>/dev/null || echo y)
-  if [ "${self_ok}" = "true" ] && [ -n "${self_tl}" ] && [ "${self_tl}" = "${lead_tl}" ]; then
+  # `// empty` + a numeric test, because `timeline` is omitempty: an unpublished timeline
+  # reads back as the string "null", and two "null"s would compare equal.
+  self_tl=$(jq -r '.members[] | select(.self==true) | .timeline // empty' <<< "${c}" 2>/dev/null || echo x)
+  lead_tl=$(jq -r --arg l "${CANDIDATE}" '.members[] | select(.name==$l) | .timeline // empty' <<< "${c}" 2>/dev/null || echo y)
+  if [ "${self_ok}" = "true" ] && [[ "${self_tl}" =~ ^[0-9]+$ ]] && [ "${self_tl}" = "${lead_tl}" ]; then
     rejoined=ok; break
   fi
   sleep 5
