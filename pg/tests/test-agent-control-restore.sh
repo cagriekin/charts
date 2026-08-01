@@ -78,6 +78,12 @@ helm uninstall "${RELEASE}" -n "${NAMESPACE}" 2>/dev/null || true
 kubectl delete pvc -n "${NAMESPACE}" --all --wait=false 2>/dev/null || true
 kubectl delete statefulset "${FULLNAME}" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
 kubectl delete job "${API_JOB}" -n "${NAMESPACE}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+# The timeline-highwater marker is agent-created (not helm-managed), so it survives
+# uninstall; a stale marker from a prior run's switchover (timeline > the fresh PVCs')
+# trips the #125 guard and the new primary refuses to start read-write. Drop it so a
+# same-namespace re-run starts clean (CI runs in a fresh namespace and never hits this).
+kubectl delete configmap "${FULLNAME}-primary" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
+kubectl delete lease "${FULLNAME}-leader" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
 sleep 3
 
 kubectl create secret generic "${TLS_SECRET}" -n "${NAMESPACE}" \
@@ -97,14 +103,33 @@ pg_exec "${NAMESPACE}" "${POD0}" "CREATE TABLE api_restore_proof AS SELECT g AS 
 rows_before=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT count(*) FROM api_restore_proof" | tr -d '[:space:]')
 assert_eq "baseline data written" "5000" "${rows_before}"
 
-echo "Taking a full backup..."
-kubectl exec -n "${NAMESPACE}" "${POD0}" -c postgresql -- \
-  pgbackrest --stanza=db --type=full --log-level-console=warn backup >/dev/null 2>&1 \
-  && backup_rc=0 || backup_rc=$?
-assert_eq "full backup succeeds" "0" "${backup_rc}"
+# The chart's full-backup CronJob, not a bare `pgbackrest backup` exec: the first run is
+# what creates the stanza (without which archive-push and every later backup fail), and it
+# brings the repo config, credentials and writable log/lock paths with it. Same pattern as
+# the other pgbackrest suites.
+echo "Triggering the initial full backup (creates the stanza)..."
+kubectl delete job pgbr-full -n "${NAMESPACE}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+kubectl create job -n "${NAMESPACE}" pgbr-full --from=cronjob/"${FULLNAME}-pgbackrest-full"
+backup_rc=0
+kubectl wait --for=condition=complete job/pgbr-full -n "${NAMESPACE}" --timeout=300s || backup_rc=$?
+if [ "${backup_rc}" -ne 0 ]; then
+  echo "  full-backup job did not complete; logs:"
+  kubectl logs -n "${NAMESPACE}" job/pgbr-full --tail=80 2>/dev/null || true
+fi
+assert_eq "initial full backup (stanza-create) succeeds" "0" "${backup_rc}"
+
+# Write MORE data after the backup and force a WAL switch, so a correct restore has to
+# replay archived WAL rather than just unpacking the base backup -- and so the recovery
+# progress GET /v1/status reports after scale-up has something to report.
+pg_exec "${NAMESPACE}" "${POD0}" "INSERT INTO api_restore_proof SELECT g FROM generate_series(5001,6000) g;" >/dev/null
+pg_exec "${NAMESPACE}" "${POD0}" "SELECT pg_switch_wal()" >/dev/null 2>&1 || true
+rows_archived=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT count(*) FROM api_restore_proof" | tr -d '[:space:]')
+assert_eq "post-backup data written (must come back via WAL replay)" "6000" "${rows_archived}"
 
 # --- port-forward + API helpers ---
 
+# Call this directly, never as $(start_pf): a command substitution would run it in a
+# subshell, losing PF_PID and tearing the forward down with the subshell.
 start_pf() {
   [[ -n "${PF_PID:-}" ]] && kill "${PF_PID}" 2>/dev/null || true
   for _ in 1 2 3; do
@@ -118,7 +143,7 @@ start_pf() {
   done
   return 1
 }
-pf_ok=$(start_pf && echo ok || echo fail)
+if start_pf; then pf_ok=ok; else pf_ok=fail; fi
 assert_eq "port-forward to the control port established" "ok" "${pf_ok}"
 
 BASE="https://127.0.0.1:${LOCAL_PORT}"
@@ -129,9 +154,11 @@ api() {
     --cacert "${CERTDIR}/ca.crt" --cert "${CERTDIR}/${who}.crt" --key "${CERTDIR}/${who}.key"
     -X "${method}" "${BASE}${path}")
   [[ -n "${body}" ]] && args+=(-H 'Content-Type: application/json' -d "${body}")
-  local code
-  code=$(curl "${args[@]}" 2>/dev/null || echo "000")
-  echo "${code}"
+  local code=""
+  # curl already prints %{http_code} (000 when it could not connect), so its exit status
+  # is ignored rather than echoing a second value into the same variable.
+  code=$(curl "${args[@]}" 2>/dev/null) || true
+  echo "${code:-000}"
   cat "/tmp/ctlres-body.$$" 2>/dev/null || true
   rm -f "/tmp/ctlres-body.$$"
 }
@@ -247,8 +274,15 @@ up_rc=0
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 900 || up_rc=$?
 assert_eq "the restored node becomes ready" "0" "${up_rc}"
 
-restored_rows=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT count(*) FROM api_restore_proof" 2>/dev/null | tr -d '[:space:]' || echo "")
-assert_eq "the data came back from the repository" "5000" "${restored_rows}"
+# 6000, not 5000: the base backup held 5000 rows and the rest can only appear by replaying
+# archived WAL -- which is what makes this a real PITR rather than an unpack.
+restored_rows=""
+for _ in $(seq 1 30); do
+  restored_rows=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT count(*) FROM api_restore_proof" 2>/dev/null | tr -d '[:space:]' || echo "")
+  [ "${restored_rows}" = "6000" ] && break
+  sleep 5
+done
+assert_eq "the data came back from the repository, WAL replay included" "6000" "${restored_rows}"
 
 # --- the record that outlives the Job ---
 #
@@ -256,7 +290,7 @@ assert_eq "the data came back from the repository" "5000" "${restored_rows}"
 # gone to history limits, but restore.sh wrote the outcome onto the volume and the agent
 # reads it back.
 
-pf_ok=$(start_pf && echo ok || echo fail)
+if start_pf; then pf_ok=ok; else pf_ok=fail; fi
 assert_eq "port-forward re-established after scale-up" "ok" "${pf_ok}"
 
 status=""

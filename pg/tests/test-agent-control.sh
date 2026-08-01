@@ -83,6 +83,12 @@ kubectl delete pvc -n "${NAMESPACE}" --all --wait=false 2>/dev/null || true
 # podManagementPolicy is immutable; a leftover StatefulSet from a repmgrd-mode run
 # (OrderedReady) blocks an agent-mode (Parallel) install.
 kubectl delete statefulset "${FULLNAME}" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
+# The timeline-highwater marker is agent-created (not helm-managed), so it survives
+# uninstall; a stale marker from a prior run's switchover (timeline > the fresh PVCs')
+# trips the #125 guard and the new primary refuses to start read-write. Drop it so a
+# same-namespace re-run starts clean (CI runs in a fresh namespace and never hits this).
+kubectl delete configmap "${FULLNAME}-primary" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
+kubectl delete lease "${FULLNAME}-leader" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
 sleep 3
 
 # All three keys: the agent reads the CA to verify client certificates and refuses to
@@ -116,6 +122,10 @@ assert_contains "a lease holder was elected" "${LEADER}" "${FULLNAME}"
 if [[ "${LEADER}" == "${FULLNAME}-0" ]]; then CANDIDATE="${FULLNAME}-1"; else CANDIDATE="${FULLNAME}-0"; fi
 echo "  leader=${LEADER} candidate=${CANDIDATE}"
 
+# start_pf MUST be called directly, never in a command substitution: $(start_pf) runs in
+# a subshell, so PF_PID would be lost to the parent and the backgrounded kubectl would be
+# torn down with the subshell -- leaving a local port that accepts connections and a
+# forward that is already gone.
 start_pf() { # start_pf <pod> <local-port> <remote-port>
   local pod="$1" lport="$2" rport="$3"
   [[ -n "${PF_PID:-}" ]] && kill "${PF_PID}" 2>/dev/null || true
@@ -132,7 +142,7 @@ start_pf() { # start_pf <pod> <local-port> <remote-port>
   return 1
 }
 
-pf_ok=$(start_pf "${LEADER}" "${LOCAL_PORT}" 9201 && echo ok || echo fail)
+if start_pf "${LEADER}" "${LOCAL_PORT}" 9201; then pf_ok=ok; else pf_ok=fail; fi
 assert_eq "port-forward to the control port established" "ok" "${pf_ok}"
 
 BASE="https://127.0.0.1:${LOCAL_PORT}"
@@ -144,9 +154,11 @@ api() {
     --cacert "${CERTDIR}/ca.crt" --cert "${CERTDIR}/ops.crt" --key "${CERTDIR}/ops.key"
     -X "${method}" "${BASE}${path}")
   [[ -n "${body}" ]] && args+=(-H 'Content-Type: application/json' -d "${body}")
-  local code
-  code=$(curl "${args[@]}" 2>/dev/null || echo "000")
-  echo "${code}"
+  local code=""
+  # curl already prints %{http_code} (000 when it could not connect), so its exit status
+  # is ignored rather than echoing a second value into the same variable.
+  code=$(curl "${args[@]}" 2>/dev/null) || true
+  echo "${code:-000}"
   cat "/tmp/ctl-body.$$" 2>/dev/null || true
   rm -f "/tmp/ctl-body.$$"
 }
@@ -168,7 +180,7 @@ assert_not_contains "plaintext HTTP is not served on the control port" "${plain_
 # A certificate from the SAME CA but an unlisted CN is authenticated yet unauthorized.
 intruder_code=$(curl -sS -o /dev/null -w '%{http_code}' \
   --cacert "${CERTDIR}/ca.crt" --cert "${CERTDIR}/intruder.crt" --key "${CERTDIR}/intruder.key" \
-  "${BASE}/v1/status" 2>/dev/null || echo "000")
+  "${BASE}/v1/status" 2>/dev/null) || true
 assert_eq "an unlisted client CN is refused with 403" "403" "${intruder_code}"
 
 # --- reads ---
@@ -200,13 +212,12 @@ assert_eq "members carry a timeline" "ok" "${tl_ok}"
 
 # --- the metrics port gained no control routes ---
 
-kill "${PF_PID}" 2>/dev/null || true
-metrics_pf=$(start_pf "${LEADER}" "${METRICS_PORT}" 9200 && echo ok || echo fail)
+if start_pf "${LEADER}" "${METRICS_PORT}" 9200; then metrics_pf=ok; else metrics_pf=fail; fi
 assert_eq "port-forward to the metrics port established" "ok" "${metrics_pf}"
-metrics_code=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null || echo "000")
+metrics_code=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null) || true
 assert_eq "the metrics port still serves /metrics over plain HTTP" "200" "${metrics_code}"
 for path in /v1/status /v1/pause /v1/switchover /v1/restore; do
-  code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${METRICS_PORT}${path}" 2>/dev/null || echo "000")
+  code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${METRICS_PORT}${path}" 2>/dev/null) || true
   assert_eq "the metrics port serves no ${path}" "404" "${code}"
 done
 # Control counters are exported on the read-only port, so a denied call is alertable
@@ -219,7 +230,7 @@ assert_gt "the refused calls above were counted" "${rejected:-0}" "0"
 
 # --- pause: the API writes the SAME marker kubectl writes ---
 
-pf_ok=$(start_pf "${LEADER}" "${LOCAL_PORT}" 9201 && echo ok || echo fail)
+if start_pf "${LEADER}" "${LOCAL_PORT}" 9201; then pf_ok=ok; else pf_ok=fail; fi
 assert_eq "port-forward re-established on the control port" "ok" "${pf_ok}"
 
 pause_code=$(api_code POST /v1/pause)
@@ -326,15 +337,28 @@ assert_eq "the switchover request was cleared (one-shot)" "" "${cleared}"
 cleared_by=$(kubectl get configmap "${MARKER}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations.pg-ha/switchover-requested-by}' 2>/dev/null || true)
 assert_eq "the requester was cleared with the request" "" "${cleared_by}"
 
-# The new primary serves writes, i.e. the handoff was a real switchover.
-pg_exec "${NAMESPACE}" "${CANDIDATE}" "CREATE TABLE IF NOT EXISTS ctl_switchover (id int); INSERT INTO ctl_switchover VALUES (1);" >/dev/null 2>&1 \
-  && write_ok=ok || write_ok=fail
+# The new primary serves writes, i.e. the handoff was a real switchover. The lease moves
+# BEFORE the promotion completes (the candidate acquires it, then promotes), so poll
+# rather than asserting on the instant the holder changed.
+write_ok=fail
+for _ in $(seq 1 30); do
+  if pg_exec "${NAMESPACE}" "${CANDIDATE}" "CREATE TABLE IF NOT EXISTS ctl_switchover (id int); INSERT INTO ctl_switchover VALUES (1);" >/dev/null 2>&1; then
+    write_ok=ok; break
+  fi
+  sleep 5
+done
 assert_eq "the promoted candidate accepts writes" "ok" "${write_ok}"
 
-# And the API on the NEW leader reports it as primary.
-pf_ok=$(start_pf "${CANDIDATE}" "${LOCAL_PORT}" 9201 && echo ok || echo fail)
+# And the API on the NEW leader reports it as primary. Its snapshot refreshes once per
+# reconcile tick, so give it a few ticks after the promotion.
+if start_pf "${CANDIDATE}" "${LOCAL_PORT}" 9201; then pf_ok=ok; else pf_ok=fail; fi
 assert_eq "port-forward to the new leader established" "ok" "${pf_ok}"
-new_status=$(api_body GET /v1/status)
+new_status=""
+for _ in $(seq 1 24); do
+  new_status=$(api_body GET /v1/status)
+  [[ "$(jq -r '.local.role // empty' <<< "${new_status}")" == "primary" ]] && break
+  sleep 5
+done
 assert_eq "the new leader reports it holds the lease" "true" "$(jq -r '.holdsLease' <<< "${new_status}")"
 assert_eq "the new leader reports the primary role" "primary" "$(jq -r '.local.role' <<< "${new_status}")"
 

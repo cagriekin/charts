@@ -338,3 +338,25 @@ func TestEmptyCNNeverMatches(t *testing.T) {
 	h := newHarness(t, func(o *Options, _ *harness) { o.AllowedCNs = []string{""} })
 	wantCode(t, h.do("GET", "/v1/status", "", ""), 403)
 }
+
+// The hint must not assert local knowledge it does not have. Answered BY the target pod
+// it is a fact (that pod is provably holding the mount); answered by another member it is
+// only the likely cause.
+func TestRestoreHintDoesNotOverclaimFromAnotherPod(t *testing.T) {
+	local := newHarness(t, nil) // PodName == RestoreTargetPod == pg-0
+	local.bk.status = RestoreView{Phase: "pending", PodPhase: "Pending"}
+	hLocal := decode[RestoreView](t, local.do("GET", "/v1/restore", "", "ops")).Hint
+	if !strings.Contains(hLocal, "answered by that pod") {
+		t.Errorf("the target pod should state it as a fact: %q", hLocal)
+	}
+
+	remote := newHarness(t, func(o *Options, _ *harness) { o.PodName = "pg-1" })
+	remote.bk.status = RestoreView{Phase: "pending", PodPhase: "Pending"}
+	hRemote := decode[RestoreView](t, remote.do("GET", "/v1/restore", "", "ops")).Hint
+	if strings.Contains(hRemote, "answered by that pod") {
+		t.Errorf("a non-target pod must not claim it is holding the volume: %q", hRemote)
+	}
+	if !strings.Contains(hRemote, "usual cause") || !strings.Contains(hRemote, "pg-0") {
+		t.Errorf("the hint should still name the likely cause and the target pod: %q", hRemote)
+	}
+}

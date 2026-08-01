@@ -76,9 +76,19 @@ func (s *Server) handleRestoreStatus(w http.ResponseWriter, r *http.Request) (in
 // common failure ("forgot to scale down").
 func (s *Server) annotateRestoreView(v *RestoreView) {
 	if v.Phase == "pending" && !v.ContainerStarted && v.WaitingReason == "" {
-		v.Hint = fmt.Sprintf(
-			"the restore Job cannot start while %s is running: this request was answered by that pod, so it still has %s mounted. Scale the StatefulSet to 0.",
-			s.o.RestoreTargetPod, s.dataPVC())
+		if s.o.PodName == s.o.RestoreTargetPod {
+			// This pod owns the target volume and is answering the request, so it is
+			// provably still holding the mount -- state it as the fact it is.
+			v.Hint = fmt.Sprintf(
+				"the restore Job cannot start while %s is running: this request was answered by that pod, so it still has %s mounted. Scale the StatefulSet to 0.",
+				s.o.RestoreTargetPod, s.dataPVC())
+		} else {
+			// Answered by a different member, which says nothing about the target pod --
+			// so the hint offers the likely cause without asserting it.
+			v.Hint = fmt.Sprintf(
+				"the restore Job has not started; the usual cause is that %s still has %s mounted. Scale the StatefulSet to 0.",
+				s.o.RestoreTargetPod, s.dataPVC())
+		}
 	}
 	if v.Phase == "pending" || v.Phase == "none" {
 		v.NextSteps = s.restoreNextSteps()
