@@ -24,6 +24,9 @@ func TestLogStartupConfigExcludesSecrets(t *testing.T) {
 	const (
 		repmgrSecret   = "repmgr-password-sentinel"
 		postgresSecret = "postgres-password-sentinel"
+		etcdCert       = "etcd-cert-sentinel"
+		etcdKey        = "etcd-key-sentinel"
+		etcdCA         = "etcd-ca-sentinel"
 	)
 	var out bytes.Buffer
 	cfg := &config.Config{
@@ -43,6 +46,9 @@ func TestLogStartupConfigExcludesSecrets(t *testing.T) {
 		PGMajor:            "17",
 		RepmgrPassword:     repmgrSecret,
 		PostgresPassword:   postgresSecret,
+		EtcdCertFile:       etcdCert,
+		EtcdKeyFile:        etcdKey,
+		EtcdCAFile:         etcdCA,
 	}
 
 	logStartupConfig(slog.New(slog.NewTextHandler(&out, nil)), cfg)
@@ -69,7 +75,11 @@ func TestLogStartupConfigExcludesSecrets(t *testing.T) {
 			t.Errorf("startup log missing %q: %s", want, logLine)
 		}
 	}
-	for _, forbidden := range []string{repmgrSecret, postgresSecret, "RepmgrPassword", "PostgresPassword"} {
+	for _, forbidden := range []string{
+		repmgrSecret, postgresSecret, etcdCert, etcdKey, etcdCA,
+		"RepmgrPassword", "PostgresPassword",
+		"EtcdCertFile", "EtcdKeyFile", "EtcdCAFile",
+	} {
 		if strings.Contains(logLine, forbidden) {
 			t.Errorf("startup log leaked sensitive config %q: %s", forbidden, logLine)
 		}
