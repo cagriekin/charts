@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -18,6 +19,72 @@ import (
 	"github.com/cagriekin/pg-ha-agent/internal/process"
 	"github.com/cagriekin/pg-ha-agent/internal/reconcile"
 )
+
+func TestLogStartupConfigExcludesSecrets(t *testing.T) {
+	const (
+		repmgrSecret   = "repmgr-password-sentinel"
+		postgresSecret = "postgres-password-sentinel"
+		etcdCert       = "etcd-cert-sentinel"
+		etcdKey        = "etcd-key-sentinel"
+		etcdCA         = "etcd-ca-sentinel"
+	)
+	var out bytes.Buffer
+	cfg := &config.Config{
+		PodName:            "pg-0",
+		Namespace:          "db",
+		LeaseName:          "pg-leader",
+		DCSBackend:         "kubernetes",
+		ReconcileInterval:  5 * time.Second,
+		LeaseDuration:      15 * time.Second,
+		RenewDeadline:      10 * time.Second,
+		RetryPeriod:        2 * time.Second,
+		NodeCount:          3,
+		HeadlessService:    "pg-headless",
+		MasterService:      "pg",
+		MarkerName:         "pg-primary",
+		CascadeReplication: true,
+		PGMajor:            "17",
+		RepmgrPassword:     repmgrSecret,
+		PostgresPassword:   postgresSecret,
+		EtcdCertFile:       etcdCert,
+		EtcdKeyFile:        etcdKey,
+		EtcdCAFile:         etcdCA,
+	}
+
+	logStartupConfig(slog.New(slog.NewTextHandler(&out, nil)), cfg)
+	logLine := out.String()
+
+	for _, want := range []string{
+		"starting pg-ha-agent",
+		"podName=pg-0",
+		"namespace=db",
+		"leaseName=pg-leader",
+		"dcsBackend=kubernetes",
+		"reconcileInterval=5s",
+		"leaseDuration=15s",
+		"renewDeadline=10s",
+		"retryPeriod=2s",
+		"nodeCount=3",
+		"headlessService=pg-headless",
+		"masterService=pg",
+		"markerName=pg-primary",
+		"cascadeReplication=true",
+		"pgMajor=17",
+	} {
+		if !strings.Contains(logLine, want) {
+			t.Errorf("startup log missing %q: %s", want, logLine)
+		}
+	}
+	for _, forbidden := range []string{
+		repmgrSecret, postgresSecret, etcdCert, etcdKey, etcdCA,
+		"RepmgrPassword", "PostgresPassword",
+		"EtcdCertFile", "EtcdKeyFile", "EtcdCAFile",
+	} {
+		if strings.Contains(logLine, forbidden) {
+			t.Errorf("startup log leaked sensitive config %q: %s", forbidden, logLine)
+		}
+	}
+}
 
 // --- fakes for the act() path ---
 

@@ -61,7 +61,7 @@ func main() {
 		log.Error("config", "err", err)
 		os.Exit(1)
 	}
-	log.Info("starting pg-ha-agent", "config", cfg.String())
+	logStartupConfig(log, cfg)
 
 	a, err := newAgent(cfg, log)
 	if err != nil {
@@ -69,6 +69,25 @@ func main() {
 		os.Exit(1)
 	}
 	a.run()
+}
+
+func logStartupConfig(log *slog.Logger, cfg *config.Config) {
+	log.Info("starting pg-ha-agent",
+		"podName", cfg.PodName,
+		"namespace", cfg.Namespace,
+		"leaseName", cfg.LeaseName,
+		"dcsBackend", cfg.DCSBackend,
+		"reconcileInterval", cfg.ReconcileInterval,
+		"leaseDuration", cfg.LeaseDuration,
+		"renewDeadline", cfg.RenewDeadline,
+		"retryPeriod", cfg.RetryPeriod,
+		"nodeCount", cfg.NodeCount,
+		"headlessService", cfg.HeadlessService,
+		"masterService", cfg.MasterService,
+		"markerName", cfg.MarkerName,
+		"cascadeReplication", cfg.CascadeReplication,
+		"pgMajor", cfg.PGMajor,
+	)
 }
 
 // runRBACBootstrap reads the bootstrap inputs from env and drives the etcd Auth API.
