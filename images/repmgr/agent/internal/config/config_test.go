@@ -297,3 +297,172 @@ func TestStringIncludesPGMajor(t *testing.T) {
 		t.Errorf("String() should surface the major for startup logs: %s", c.String())
 	}
 }
+
+// --- Control API (#276) ---
+
+// controlEnv is a fully-configured control API on top of fullEnv.
+func controlEnv() map[string]string {
+	m := fullEnv()
+	m["CONTROL_ENABLED"] = "true"
+	m["CONTROL_TLS_CERT"] = "/etc/agent-control-tls/tls.crt"
+	m["CONTROL_TLS_KEY"] = "/etc/agent-control-tls/tls.key"
+	m["CONTROL_TLS_CA"] = "/etc/agent-control-tls/ca.crt"
+	return m
+}
+
+// The default install must be untouched: no control listener, and no error for the
+// absence of TLS material that is only needed when the API is on.
+func TestControlDisabledByDefault(t *testing.T) {
+	c, err := Load(getter(fullEnv()))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.ControlEnabled {
+		t.Error("ControlEnabled must default to false")
+	}
+	if c.ControlAddr != ":9201" {
+		t.Errorf("ControlAddr = %q, want :9201", c.ControlAddr)
+	}
+	if c.ControlRestoreEnabled {
+		t.Error("ControlRestoreEnabled must default to false")
+	}
+}
+
+// Enabling the API without mTLS material must fail the boot, naming every missing
+// file at once -- never fall back to an unauthenticated mutating port.
+func TestControlEnabledRequiresAllTLSMaterial(t *testing.T) {
+	m := fullEnv()
+	m["CONTROL_ENABLED"] = "true"
+	_, err := Load(getter(m))
+	if err == nil {
+		t.Fatal("control enabled without TLS material must fail")
+	}
+	for _, want := range []string{"CONTROL_TLS_CERT", "CONTROL_TLS_KEY", "CONTROL_TLS_CA"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should name %s: %v", want, err)
+		}
+	}
+}
+
+// Partial material is the likelier mistake (a `kubectl create secret tls` has no
+// ca.crt): it must fail just as loudly as none at all.
+func TestControlEnabledRejectsPartialTLSMaterial(t *testing.T) {
+	m := controlEnv()
+	delete(m, "CONTROL_TLS_CA")
+	_, err := Load(getter(m))
+	if err == nil {
+		t.Fatal("control enabled without a CA must fail: client certs could not be verified")
+	}
+	if !strings.Contains(err.Error(), "CONTROL_TLS_CA") {
+		t.Errorf("error should name CONTROL_TLS_CA: %v", err)
+	}
+}
+
+func TestControlEnabledValid(t *testing.T) {
+	c, err := Load(getter(controlEnv()))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !c.ControlEnabled || c.ControlCAFile == "" {
+		t.Errorf("bad parse: %+v", c)
+	}
+	if len(c.ControlAllowedCNs) != 0 {
+		t.Errorf("ControlAllowedCNs should be empty (any cert from the CA): %v", c.ControlAllowedCNs)
+	}
+}
+
+func TestControlAllowedCNsParsed(t *testing.T) {
+	m := controlEnv()
+	m["CONTROL_ALLOWED_CNS"] = " ops-admin , , ci-bot "
+	c, err := Load(getter(m))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(c.ControlAllowedCNs) != 2 || c.ControlAllowedCNs[0] != "ops-admin" || c.ControlAllowedCNs[1] != "ci-bot" {
+		t.Errorf("ControlAllowedCNs = %#v, want [ops-admin ci-bot]", c.ControlAllowedCNs)
+	}
+}
+
+func TestControlRejectsBadAddr(t *testing.T) {
+	m := controlEnv()
+	m["CONTROL_ADDR"] = "9201"
+	_, err := Load(getter(m))
+	if err == nil || !strings.Contains(err.Error(), "CONTROL_ADDR") {
+		t.Errorf("a non host:port CONTROL_ADDR must be rejected: %v", err)
+	}
+}
+
+func TestControlRestoreRequiresControl(t *testing.T) {
+	m := fullEnv()
+	m["CONTROL_RESTORE_ENABLED"] = "true"
+	_, err := Load(getter(m))
+	if err == nil || !strings.Contains(err.Error(), "CONTROL_RESTORE_ENABLED requires CONTROL_ENABLED") {
+		t.Errorf("restore without the control API must be rejected: %v", err)
+	}
+}
+
+// The restore authz list has no "allow all" reading: enabling restore without
+// naming callers must deny everyone, reported at boot.
+func TestControlRestoreRequiresAllowedCNs(t *testing.T) {
+	m := controlEnv()
+	m["CONTROL_RESTORE_ENABLED"] = "true"
+	m["CONTROL_RESTORE_CRONJOB"] = "pg-pgbackrest-restore"
+	m["CONTROL_RESTORE_JOB_NAME"] = "pg-pgbackrest-restore-api"
+	m["CONTROL_RESTORE_POD_ORDINAL"] = "0"
+	_, err := Load(getter(m))
+	if err == nil || !strings.Contains(err.Error(), "CONTROL_RESTORE_ALLOWED_CNS") {
+		t.Errorf("restore without an allowlist must be rejected: %v", err)
+	}
+}
+
+func TestControlRestoreValid(t *testing.T) {
+	m := controlEnv()
+	m["CONTROL_RESTORE_ENABLED"] = "true"
+	m["CONTROL_RESTORE_ALLOWED_CNS"] = "dba-break-glass"
+	m["CONTROL_RESTORE_CRONJOB"] = "pg-pgbackrest-restore"
+	m["CONTROL_RESTORE_JOB_NAME"] = "pg-pgbackrest-restore-api"
+	m["CONTROL_RESTORE_POD_ORDINAL"] = "0"
+	c, err := Load(getter(m))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !c.ControlRestoreEnabled || c.ControlRestoreCronJob == "" || c.ControlRestoreJobName == "" {
+		t.Errorf("bad parse: %+v", c)
+	}
+	if c.ControlRestorePodOrdinal != 0 {
+		t.Errorf("ControlRestorePodOrdinal = %d, want 0", c.ControlRestorePodOrdinal)
+	}
+	if c.ControlRestoreReadPodLogs {
+		t.Error("ControlRestoreReadPodLogs must default to false (it widens RBAC)")
+	}
+}
+
+// The log-tailing flag is the one that adds a namespace-wide `get pods/log` grant,
+// so setting it where it cannot apply is named, not ignored.
+func TestControlRestoreReadPodLogsRequiresRestore(t *testing.T) {
+	m := controlEnv()
+	m["CONTROL_RESTORE_READ_POD_LOGS"] = "true"
+	_, err := Load(getter(m))
+	if err == nil || !strings.Contains(err.Error(), "CONTROL_RESTORE_READ_POD_LOGS") {
+		t.Errorf("readPodLogs without restore must be rejected: %v", err)
+	}
+}
+
+// The startup config log must show the control posture without listing identities.
+func TestStringSummarisesControlWithoutCNs(t *testing.T) {
+	m := controlEnv()
+	m["CONTROL_ALLOWED_CNS"] = "ops-admin"
+	c, err := Load(getter(m))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	s := c.String()
+	for _, want := range []string{"Control:true", "ControlMTLS:true", "ControlAllowedCNs:1"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("String() should contain %q: %s", want, s)
+		}
+	}
+	if strings.Contains(s, "ops-admin") {
+		t.Errorf("String() should summarise the allowlist by count, not spell out identities: %s", s)
+	}
+}

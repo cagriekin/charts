@@ -388,6 +388,86 @@ repmgr:
         enabled: false
         additionalLabels: {}
 
+    # Authenticated control REST API (#276), agent mode only. OFF by default: with
+    # control.enabled=false the chart renders exactly as it did before, and port 9200
+    # stays the agent's only listener (read-only: /metrics, /healthz, /readyz).
+    #
+    # What it adds over `kubectl annotate` is PREFLIGHT and a synchronous answer.
+    # `kubectl annotate ... switchover-target=pg-9` succeeds even when pg-9 does not
+    # exist, is on a divergent timeline, or is far behind, and you find out by reading
+    # logs; POST /v1/switchover refuses those in the request. GET /v1/status and
+    # /v1/cluster additionally expose state that exists nowhere else -- per-member
+    # timeline/LSN, and the reconcile loop's latest decision with its reason.
+    #
+    # It is a FACADE, not a second control plane: pause/switchover write the same
+    # marker annotations kubectl writes, and the reconcile loop stays the sole
+    # authority for when anything happens. kubectl and the API remain equivalent.
+    #
+    # The API is per-pod on the headless Service (or `kubectl port-forward`). There is
+    # deliberately NO ClusterIP Service: node-local verbs (restart, reload, restore)
+    # act on whichever pod answers, and a load-balanced control endpoint would
+    # eventually restart the primary during an incident. Requests must name the pod
+    # they are addressing, so a misrouted call is refused rather than obeyed.
+    control:
+      enabled: false
+      # Control-only listener. NEVER the metrics port: 9200 stays observe-only so a
+      # NetworkPolicy can admit Prometheus there and nobody here.
+      port: 9201
+      # mTLS is mandatory and is the ONLY authentication mode -- there is no token,
+      # password or plaintext mode, and reads are authenticated too. Set this to a
+      # Secret carrying ALL THREE keys: tls.crt, tls.key (the server identity) and
+      # ca.crt (the CA that signs client certificates). cert-manager Certificates
+      # include ca.crt; a stock `kubectl create secret tls` does NOT -- add it
+      # explicitly. Required when enabled: a render guard fails the release without it,
+      # so you cannot end up with an unauthenticated mutating port.
+      #
+      # The server certificate needs SANs for however you reach the pods -- the
+      # headless pod FQDNs (<release>-pg-0.<release>-pg-headless.<ns>.svc) for in-cluster
+      # clients, and 127.0.0.1/localhost if you use port-forward. TLS 1.3 is required.
+      tls:
+        existingSecret: ""
+      # Optional client-CN allowlist for every control route. Empty means "any
+      # certificate signed by ca.crt", which is already a closed set (you issue them).
+      # Set it to restrict further, e.g. ["ops-admin","ci-deployer"].
+      allowedClientCNs: []
+      # Restore triggering (POST /v1/restore) is a SEPARATE opt-in, because it is the
+      # one verb that widens the database pods' Kubernetes privileges: it needs
+      # `create jobs`, which RBAC cannot restrict by resourceName. A leaked pod token
+      # could then create arbitrary Jobs in this namespace, and a Job's pod may name
+      # any ServiceAccount -- i.e. this grant is a namespace-wide privilege-escalation
+      # primitive. Everything else about the API needs no new RBAC at all.
+      #
+      # What the API can and cannot do here: it clones the chart's suspended restore
+      # CronJob verbatim -- identical to `kubectl create job --from=cronjob/...`, so
+      # image, ServiceAccount, security contexts, volumes and secret references all
+      # come from the release -- and overrides only TARGET_TYPE / TARGET / BACKUP_SET.
+      # It cannot change which volume is restored into (that is
+      # pgbackrest.restore.podOrdinal, rendered into the Job) and it never sets
+      # pgbackrest's --force. It also cannot scale the StatefulSet: scaling to 0
+      # deletes every agent, including the one reporting progress, so scale-down/up
+      # stays an operator step and the API returns the remaining commands.
+      #
+      # Requires pgbackrest.enabled, pgbackrest.restore.enabled and
+      # pgbackrest.restore.mode=cronjob (there must be a CronJob to clone).
+      restore:
+        enabled: false
+        # The restore authz verb, separate from allowedClientCNs above: a client must
+        # be listed HERE to trigger a restore. Required when restore.enabled -- an
+        # empty list denies everyone, so forgetting it cannot open the most
+        # destructive verb in the API.
+        allowedClientCNs: []
+        # Live file-copy progress (progress.percent on GET /v1/restore) by tailing the
+        # restore pod's log. Off by default because it needs `get pods/log` across the
+        # namespace -- the Job's pod name is generated, so it cannot be scoped -- and
+        # logs are where other workloads leak secrets.
+        #
+        # It is also of limited use: a restore of podOrdinal 0 requires scaling the
+        # StatefulSet to 0, which removes every agent, so nothing can serve progress
+        # while the copy runs. The progress that IS always available needs none of
+        # this: GET /v1/status reports WAL-replay position and the last replayed
+        # transaction timestamp after scale-up, and lastRestore reports the outcome.
+        readPodLogs: false
+
   username: repmgr
   database: repmgr
 
@@ -976,6 +1056,19 @@ networkPolicy:
     #       from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]
     extraIngress: []
     extraEgress: []
+  # The agent control API port (repmgr.agent.control.port, default 9201) gets NO
+  # ingress rule of its own: this policy is an explicit allowlist, so the absence of a
+  # rule IS deny-by-default -- unlike the 9200 metrics port, which admits every
+  # same-namespace pod so scrapes work. Nothing can reach the control port until you
+  # add a rule here for the specific client:
+  #   extraIngress:
+  #     - ports: [{port: 9201, protocol: TCP}]
+  #       from: [{podSelector: {matchLabels: {app.kubernetes.io/name: my-ops-tool}}}]
+  # `kubectl port-forward` reaches the pod through the kubelet rather than the pod
+  # network, so on most CNIs it keeps working under full deny -- which is the intended
+  # path for humans.
+  agentControl:
+    extraIngress: []
 
 global:
   annotations: {}

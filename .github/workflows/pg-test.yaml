@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     # Two apt-heavy image builds (one per major, separate cache scopes so each is cold on
     # its first run), two docker saves and three artifact uploads. A timeout here cancels
-    # the job, which skips all 40 suite legs and fails the required gate with no test
+    # the job, which skips all 46 suite legs and fails the required gate with no test
     # signal at all, so it is sized for the cold case rather than the cached one.
     timeout-minutes: 50
     steps:
@@ -153,7 +153,7 @@ jobs:
               --cache-to type=gha,mode=max,scope=repmgr-image-pg${major} \
               -t "$ref" images/repmgr
             # Own artifact per major (~190MB each): a suite leg needs exactly one, and
-            # with 40 legs bundling both would download a spare 190MB 40 times.
+            # with 46 legs bundling both would download a spare 190MB 46 times.
             mkdir -p "/tmp/kind-images-pg${major}"
             docker save "$ref" -o "/tmp/kind-images-pg${major}/repmgr.tar"
           done
@@ -219,6 +219,8 @@ jobs:
           - minimal
           - repmgr-failover
           - agent
+          - agent-control
+          - agent-control-restore
           - repmgr-chaos
           - full
           - upgrade

@@ -79,6 +79,41 @@
                   "description": "Leadership store: the Kubernetes Lease API (default) or etcd."
                 }
               }
+            },
+            "control": {
+              "type": "object",
+              "description": "Authenticated control REST API (#276). Dependent rules -- enabled requires tls.existingSecret, restore.enabled requires a non-empty restore.allowedClientCNs -- are template guards, not schema if/then, because helm 3.x does not honor if/then.",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "port": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 65535,
+                  "description": "Control-only listener; must not be the 9200 metrics port (a render guard enforces that)."
+                },
+                "tls": {
+                  "type": "object",
+                  "properties": {
+                    "existingSecret": {
+                      "type": "string",
+                      "description": "Secret with tls.crt, tls.key and ca.crt. Required when control is enabled: mTLS is the only authentication mode."
+                    }
+                  }
+                },
+                "allowedClientCNs": { "type": "array", "items": { "type": "string" } },
+                "restore": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "allowedClientCNs": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "description": "Restore-specific authz verb. An empty list denies every client."
+                    },
+                    "readPodLogs": { "type": "boolean" }
+                  }
+                }
+              }
             }
           }
         },

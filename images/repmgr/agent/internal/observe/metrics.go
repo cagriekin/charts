@@ -24,7 +24,14 @@ type Metrics struct {
 	reconcileErrors atomic.Int64
 	recoveryStarts  atomic.Int64 // recovery-mode (read-only WAL replay) entries
 	lastBeatUnixNs  atomic.Int64 // last reconcile-loop heartbeat
-	now             func() time.Time
+	// Control API (#276). Counted here so the control plane is observable from the
+	// SAME read-only surface Prometheus already scrapes -- a denied or failing control
+	// call must be alertable without opening the control port to the scraper.
+	controlRequests        atomic.Int64
+	controlRejected        atomic.Int64
+	controlIntents         atomic.Int64
+	controlRestoreRequests atomic.Int64
+	now                    func() time.Time
 }
 
 // New returns Metrics with the heartbeat primed so the agent is live at startup.
@@ -41,14 +48,23 @@ func b2i(b bool) int64 {
 	return 0
 }
 
-func (m *Metrics) SetLeader(v bool)     { m.isLeader.Store(b2i(v)) }
-func (m *Metrics) SetPaused(v bool)     { m.isPaused.Store(b2i(v)) }
-func (m *Metrics) IncRenewFailure()     { m.renewFailures.Add(1) }
-func (m *Metrics) IncPromotion()        { m.promotions.Add(1) }
-func (m *Metrics) IncDemote()           { m.demotes.Add(1) }
-func (m *Metrics) IncFence()            { m.fences.Add(1) }
-func (m *Metrics) IncReconcileError()   { m.reconcileErrors.Add(1) }
-func (m *Metrics) IncRecoveryStart()    { m.recoveryStarts.Add(1) }
+func (m *Metrics) SetLeader(v bool)   { m.isLeader.Store(b2i(v)) }
+func (m *Metrics) SetPaused(v bool)   { m.isPaused.Store(b2i(v)) }
+func (m *Metrics) IncRenewFailure()   { m.renewFailures.Add(1) }
+func (m *Metrics) IncPromotion()      { m.promotions.Add(1) }
+func (m *Metrics) IncDemote()         { m.demotes.Add(1) }
+func (m *Metrics) IncFence()          { m.fences.Add(1) }
+func (m *Metrics) IncReconcileError() { m.reconcileErrors.Add(1) }
+func (m *Metrics) IncRecoveryStart()  { m.recoveryStarts.Add(1) }
+
+// Control-API counters. IncControlRequest counts every authenticated request,
+// IncControlRejected every one refused by authn/authz, IncControlIntent every
+// node-local operation handed to the reconcile loop, and IncControlRestoreRequest
+// every accepted restore trigger (the one verb worth alerting on by itself).
+func (m *Metrics) IncControlRequest()        { m.controlRequests.Add(1) }
+func (m *Metrics) IncControlRejected()       { m.controlRejected.Add(1) }
+func (m *Metrics) IncControlIntent()         { m.controlIntents.Add(1) }
+func (m *Metrics) IncControlRestoreRequest() { m.controlRestoreRequests.Add(1) }
 
 // Beat records that the reconcile loop ran; call it each tick.
 func (m *Metrics) Beat() { m.lastBeatUnixNs.Store(m.now().UnixNano()) }
@@ -99,6 +115,10 @@ func (m *Metrics) write(w io.Writer) {
 		{"pg_ha_agent_fences_total", "Soft fences performed.", "counter", m.fences.Load()},
 		{"pg_ha_agent_reconcile_errors_total", "Reconcile-loop errors.", "counter", m.reconcileErrors.Load()},
 		{"pg_ha_agent_recovery_starts_total", "Recovery-mode (read-only WAL replay) starts at cold boot.", "counter", m.recoveryStarts.Load()},
+		{"pg_ha_agent_control_requests_total", "Authenticated control-API requests.", "counter", m.controlRequests.Load()},
+		{"pg_ha_agent_control_rejected_total", "Control-API requests refused by authentication or authorization.", "counter", m.controlRejected.Load()},
+		{"pg_ha_agent_control_intents_total", "Node-local control-API operations handed to the reconcile loop.", "counter", m.controlIntents.Load()},
+		{"pg_ha_agent_control_restore_requests_total", "Restores triggered through the control API.", "counter", m.controlRestoreRequests.Load()},
 	} {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %d\n", x.name, x.help, x.name, x.typ, x.name, x.val)
 	}

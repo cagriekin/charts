@@ -4,7 +4,7 @@ TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-repmgr test-repmgr-chaos test-full test-failover test-upgrade \
-        test-repmgr-failover test-agent test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-backup-concurrent test-pgbackrest-restore test-pgbackrest-restore-ha test-pgbackrest-bootstrap test-databases-roles test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
+        test-repmgr-failover test-agent test-agent-control test-agent-control-restore test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-backup-concurrent test-pgbackrest-restore test-pgbackrest-restore-ha test-pgbackrest-bootstrap test-databases-roles test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -17,6 +17,8 @@ help:
 	@echo "  test-full       - Run full install tests"
 	@echo "  test-failover   - Run failover tests (requires test-repmgr first)"
 	@echo "  test-agent      - Run lease-based agent install + failover tests"
+	@echo "  test-agent-control - Run agent control REST API tests (mTLS, pause, switchover)"
+	@echo "  test-agent-control-restore - Run API-driven pgBackRest restore tests"
 	@echo "  test-agent-etcd - Run agent etcd-DCS test (bundled etcd; standalone, opt-in)"
 	@echo "  test-agent-etcd-tls - Run agent etcd-DCS test over mutual TLS + RBAC (standalone, opt-in)"
 	@echo "  test-tls           - Run client-connection TLS test (PostgreSQL+PGPool+exporter, standalone, opt-in)"
@@ -65,6 +67,16 @@ test-repmgr-failover: cluster-exists
 test-agent: cluster-exists
 	@bash $(TESTS_DIR)/test-agent.sh
 	@bash $(TESTS_DIR)/test-agent-failover.sh
+
+# Agent control REST API (#276): mTLS enforcement, the read surface, and pause /
+# switchover through the API (including that a switchover really moves leadership).
+test-agent-control: cluster-exists
+	@bash $(TESTS_DIR)/test-agent-control.sh
+
+# API-driven pgBackRest restore (#276): proves the granted RBAC is sufficient, the
+# cloned Job actually restores, and the outcome record survives the scale-down/up cycle.
+test-agent-control-restore: cluster-exists
+	@bash $(TESTS_DIR)/test-agent-control-restore.sh
 
 # etcd DCS backend (bundled etcd). Standalone + opt-in: deploys 3 extra etcd pods
 # and is not yet validated in CI, so it is NOT part of test-cluster. Run explicitly

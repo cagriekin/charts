@@ -1,0 +1,494 @@
+package control
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// handlerFunc is a route body: it writes the response and returns the status plus an
+// audit detail string, so guard can audit the outcome without inspecting the body.
+type handlerFunc func(http.ResponseWriter, *http.Request) (status int, detail string)
+
+// route is one endpoint. The table is the single source of truth for the mux, for the
+// 405 Allow header, and for the route list a typo gets back -- three things that
+// silently drift apart when written out separately.
+type route struct {
+	method string
+	path   string
+	verb   Verb
+	// featureGated routes answer "not configured" before "not authorized": the restore
+	// allowlist is empty unless the feature was turned on, so without the gate every
+	// disabled release would report an authorization problem instead.
+	featureGated bool
+	h            handlerFunc
+}
+
+func (s *Server) routeTable() []route {
+	return []route{
+		{http.MethodGet, "/v1/status", VerbObserve, false, s.handleStatus},
+		{http.MethodGet, "/v1/cluster", VerbObserve, false, s.handleCluster},
+
+		{http.MethodPost, "/v1/pause", VerbControl, false, s.handlePause(true)},
+		{http.MethodPost, "/v1/resume", VerbControl, false, s.handlePause(false)},
+		{http.MethodPost, "/v1/switchover", VerbControl, false, s.handleSwitchover},
+		{http.MethodDelete, "/v1/switchover", VerbControl, false, s.handleSwitchoverCancel},
+		{http.MethodPost, "/v1/restart", VerbControl, false, s.handleIntent(IntentRestart)},
+		{http.MethodPost, "/v1/reload", VerbControl, false, s.handleIntent(IntentReload)},
+
+		{http.MethodGet, "/v1/backups", VerbObserve, false, s.handleBackups},
+		{http.MethodGet, "/v1/restore", VerbObserve, false, s.handleRestoreStatus},
+		{http.MethodPost, "/v1/restore", VerbRestore, true, s.handleRestore},
+		{http.MethodDelete, "/v1/restore", VerbRestore, true, s.handleRestoreDelete},
+	}
+}
+
+// routes builds the mux from the table.
+//
+// The catch-all is why the table exists: registering "/" makes Go's ServeMux prefer
+// it over the built-in 405 for a known path with the wrong method, so a GET on
+// /v1/pause would be answered 404 by the fallback. The fallback therefore computes
+// the 405 (with an Allow header) itself.
+func (s *Server) routes() http.Handler {
+	mux := http.NewServeMux()
+	table := s.routeTable()
+	for _, rt := range table {
+		h := s.guard(rt.verb, rt.h)
+		if rt.featureGated {
+			h = s.featureGate(h)
+		}
+		mux.HandleFunc(rt.method+" "+rt.path, h)
+	}
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		var allowed []string
+		for _, rt := range table {
+			if rt.path == r.URL.Path {
+				allowed = append(allowed, rt.method)
+			}
+		}
+		if len(allowed) > 0 {
+			w.Header().Set("Allow", strings.Join(allowed, ", "))
+			writeErr(w, http.StatusMethodNotAllowed,
+				fmt.Sprintf("%s is not allowed on %s", r.Method, r.URL.Path),
+				"allowed: "+strings.Join(allowed, ", "))
+			return
+		}
+		list := make([]string, 0, len(table))
+		for _, rt := range table {
+			list = append(list, rt.method+" "+rt.path)
+		}
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "no such route", "routes": list})
+	})
+	return mux
+}
+
+// StatusResponse is GET /v1/status: this node, plus the cluster intents read fresh.
+type StatusResponse struct {
+	Node       string       `json:"node"`
+	Cluster    string       `json:"cluster"`
+	PGMajor    string       `json:"pgMajor"`
+	HoldsLease bool         `json:"holdsLease"`
+	Leader     string       `json:"leader,omitempty"`
+	Local      MemberState  `json:"local"`
+	Recovery   RecoveryView `json:"recovery"`
+	Intents    IntentsView  `json:"intents"`
+	// LastRestore is data-directory provenance: which backup set and point in time
+	// this PGDATA was restored from, if it ever was.
+	LastRestore *RestoreRecordView `json:"lastRestore,omitempty"`
+	ObservedAt  time.Time          `json:"observedAt"`
+	AgeSeconds  float64            `json:"observationAgeSeconds"`
+	Warning     string             `json:"warning,omitempty"`
+}
+
+// IntentsView is the operator-set state on the marker ConfigMap: what has been asked
+// for, and by whom. Read fresh on every request -- these are the fields an operator
+// checks right after setting them, so serving a cached copy would be actively
+// misleading.
+type IntentsView struct {
+	Paused           bool   `json:"paused"`
+	PausedBy         string `json:"pausedBy,omitempty"`
+	SwitchoverTarget string `json:"switchoverTarget,omitempty"`
+	MarkerPresent    bool   `json:"markerPresent"`
+	MarkerPrimary    string `json:"markerPrimary,omitempty"`
+}
+
+// RestoreRecordView mirrors pgbackrest.RestoreRecord in the API surface.
+type RestoreRecordView struct {
+	StartedAt    string `json:"startedAt,omitempty"`
+	FinishedAt   string `json:"finishedAt,omitempty"`
+	TargetType   string `json:"targetType,omitempty"`
+	Target       string `json:"target,omitempty"`
+	BackupSet    string `json:"backupSet,omitempty"`
+	ExitCode     *int   `json:"exitCode,omitempty"`
+	Succeeded    bool   `json:"succeeded"`
+	ClusterState string `json:"clusterState,omitempty"`
+	Checkpoint   string `json:"checkpoint,omitempty"`
+	RequestedBy  string `json:"requestedBy,omitempty"`
+}
+
+// ClusterResponse is GET /v1/cluster.
+type ClusterResponse struct {
+	Node    string `json:"node"`
+	Cluster string `json:"cluster"`
+	Leader  string `json:"leader,omitempty"`
+	// Members is THIS node's view: its own state from a local probe, and each peer's
+	// from a cross-pod probe or, when unreachable, from gossip. Two members can
+	// legitimately disagree mid-failover.
+	Members []MemberState `json:"members"`
+	Intents IntentsView   `json:"intents"`
+	// Decision is the reconcile loop's latest decision on this node. Diagnostic
+	// output, not a stable contract: action names and reasons change without notice.
+	Decision   DecisionView `json:"lastDecision"`
+	ObservedAt time.Time    `json:"observedAt"`
+	AgeSeconds float64      `json:"observationAgeSeconds"`
+	Warning    string       `json:"warning,omitempty"`
+}
+
+// intents reads the marker fresh. On failure it falls back to the snapshot's copy and
+// returns a warning, so a transient apiserver blip degrades the answer instead of
+// failing the request -- but never silently.
+func (s *Server) intents(r *http.Request, snap Snapshot) (IntentsView, string) {
+	m, err := s.o.Cluster.Marker(r.Context())
+	if err != nil {
+		return IntentsView{
+			Paused:           snap.Paused,
+			SwitchoverTarget: snap.SwitchoverTarget,
+			MarkerPresent:    snap.MarkerPresent,
+			MarkerPrimary:    snap.MarkerPrimary,
+		}, "marker could not be read; pause/switchover shown from the last reconcile tick: " + err.Error()
+	}
+	return IntentsView{
+		Paused:           m.Paused,
+		PausedBy:         m.PausedBy,
+		SwitchoverTarget: m.SwitchoverTarget,
+		MarkerPresent:    m.Present,
+		MarkerPrimary:    m.Primary,
+	}, ""
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) (int, string) {
+	snap := s.o.Node.Snapshot()
+	iv, warn := s.intents(r, snap)
+	resp := StatusResponse{
+		Node:       snap.Node,
+		Cluster:    s.o.ClusterName,
+		PGMajor:    snap.PGMajor,
+		HoldsLease: snap.HoldsLease,
+		Leader:     snap.LeaseHolder,
+		Local:      snap.Local,
+		Recovery:   snap.Recovery,
+		Intents:    iv,
+		ObservedAt: snap.ObservedAt,
+		AgeSeconds: age(snap.ObservedAt),
+		Warning:    warn,
+	}
+	if snap.LastRestore.Present {
+		lr := snap.LastRestore
+		resp.LastRestore = &RestoreRecordView{
+			StartedAt: lr.StartedAt, FinishedAt: lr.FinishedAt,
+			TargetType: lr.TargetType, Target: lr.Target, BackupSet: lr.BackupSet,
+			ExitCode: lr.ExitCode, Succeeded: lr.Succeeded(),
+			ClusterState: lr.ClusterState, Checkpoint: lr.Checkpoint, RequestedBy: lr.RequestedBy,
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+	return http.StatusOK, ""
+}
+
+func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) (int, string) {
+	snap := s.o.Node.Snapshot()
+	iv, warn := s.intents(r, snap)
+	members := make([]MemberState, 0, len(snap.Peers)+1)
+	members = append(members, snap.Local)
+	members = append(members, snap.Peers...)
+	writeJSON(w, http.StatusOK, ClusterResponse{
+		Node:       snap.Node,
+		Cluster:    s.o.ClusterName,
+		Leader:     snap.LeaseHolder,
+		Members:    members,
+		Intents:    iv,
+		Decision:   snap.Decision,
+		ObservedAt: snap.ObservedAt,
+		AgeSeconds: age(snap.ObservedAt),
+		Warning:    warn,
+	})
+	return http.StatusOK, ""
+}
+
+func age(t time.Time) float64 {
+	if t.IsZero() {
+		return 0
+	}
+	return time.Since(t).Round(time.Millisecond).Seconds()
+}
+
+// actionResponse is the shape every mutating route returns.
+type actionResponse struct {
+	Result  string   `json:"result"`
+	Node    string   `json:"node,omitempty"`
+	Cluster string   `json:"cluster,omitempty"`
+	Target  string   `json:"target,omitempty"`
+	Message string   `json:"message,omitempty"`
+	Warning string   `json:"warning,omitempty"`
+	Notes   []string `json:"notes,omitempty"`
+}
+
+// handlePause sets or clears maintenance mode. Idempotent, and it warns about the
+// thing operators most often get wrong: while paused, a REAL failure does not fail
+// over either.
+func (s *Server) handlePause(on bool) func(http.ResponseWriter, *http.Request) (int, string) {
+	return func(w http.ResponseWriter, r *http.Request) (int, string) {
+		var body struct{}
+		if err := decodeBody(r, &body); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error(), "pause and resume take no body")
+			return http.StatusBadRequest, "bad body"
+		}
+		id := identityFrom(r.Context())
+		m, err := s.o.Cluster.Marker(r.Context())
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "could not read the marker: "+err.Error(), "")
+			return http.StatusBadGateway, "marker read failed"
+		}
+		if !m.Present {
+			writeErr(w, http.StatusConflict,
+				"no marker ConfigMap yet: this cluster has not recorded a primary",
+				"there is nothing to pause until the cluster has elected a primary")
+			return http.StatusConflict, "no marker"
+		}
+		if m.Paused == on {
+			result := "already-paused"
+			if !on {
+				result = "already-running"
+			}
+			writeJSON(w, http.StatusOK, actionResponse{
+				Result: result, Cluster: s.o.ClusterName,
+				Message: fmt.Sprintf("no change; paused=%t", m.Paused),
+				Warning: pauseWarning(on, s.o.Node.Snapshot()),
+			})
+			return http.StatusOK, "no change"
+		}
+		if err := s.o.Cluster.SetPause(r.Context(), on, id.CN); err != nil {
+			writeErr(w, http.StatusBadGateway, err.Error(), "")
+			return http.StatusBadGateway, "marker write failed"
+		}
+		result := "paused"
+		if !on {
+			result = "resumed"
+		}
+		writeJSON(w, http.StatusOK, actionResponse{
+			Result: result, Cluster: s.o.ClusterName,
+			Warning: pauseWarning(on, s.o.Node.Snapshot()),
+		})
+		return http.StatusOK, result
+	}
+}
+
+// pauseWarning states the consequence of the pause, and escalates it when the
+// cluster is ALREADY degraded -- pausing a cluster with no reachable leader suspends
+// the recovery that would have fixed it.
+func pauseWarning(on bool, snap Snapshot) string {
+	if !on {
+		return ""
+	}
+	base := "while paused, automatic failover is suspended: a genuine primary failure will NOT fail over until you resume"
+	if snap.LeaseHolder == "" {
+		return base + ". NOTE: this cluster currently has no lease holder, so pausing suspends the recovery that would elect one"
+	}
+	for _, p := range snap.Peers {
+		if !p.Reachable {
+			return base + fmt.Sprintf(". NOTE: peer %s is not reachable right now", p.Name)
+		}
+	}
+	return base
+}
+
+type switchoverRequest struct {
+	// Leader, when set, must be the current lease holder. It is an optimistic
+	// concurrency check: it fails the request if leadership moved between the
+	// operator's last look and this call, instead of switching away from a primary
+	// they did not mean.
+	Leader    string `json:"leader"`
+	Candidate string `json:"candidate"`
+}
+
+// handleSwitchover records a handoff request after checking it would actually be
+// acted on. The loop remains the authority for WHEN (it re-verifies the candidate is
+// caught up at the moment it steps down); this refuses the requests the loop would
+// silently sit on -- which is the whole reason to prefer the API over annotating.
+func (s *Server) handleSwitchover(w http.ResponseWriter, r *http.Request) (int, string) {
+	var req switchoverRequest
+	if err := decodeBody(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error(), `body: {"candidate":"<pod>","leader":"<pod>"}`)
+		return http.StatusBadRequest, "bad body"
+	}
+	if req.Candidate == "" {
+		writeErr(w, http.StatusBadRequest, "candidate is required", "name the pod that should become primary")
+		return http.StatusBadRequest, "no candidate"
+	}
+	snap := s.o.Node.Snapshot()
+	m, err := s.o.Cluster.Marker(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "could not read the marker: "+err.Error(), "")
+		return http.StatusBadGateway, "marker read failed"
+	}
+	if req.Leader != "" && req.Leader != snap.LeaseHolder {
+		writeErr(w, http.StatusConflict,
+			fmt.Sprintf("leader mismatch: you named %q but the lease is held by %q", req.Leader, snap.LeaseHolder),
+			"re-read GET /v1/status and retry if the handoff is still what you want")
+		return http.StatusConflict, "leader mismatch"
+	}
+	if req.Candidate == snap.LeaseHolder {
+		writeErr(w, http.StatusConflict,
+			fmt.Sprintf("%s already holds the lease", req.Candidate), "nothing to switch over")
+		return http.StatusConflict, "candidate is leader"
+	}
+	// A paused loop takes no action at all, so a request recorded now would sit
+	// unnoticed until someone resumed. Refuse instead of accepting a no-op.
+	if m.Paused {
+		writeErr(w, http.StatusConflict, "cluster is paused: a switchover would not be acted on",
+			"POST /v1/resume first (maintenance mode suspends every automatic action)")
+		return http.StatusConflict, "paused"
+	}
+	cand, found := findMember(snap, req.Candidate)
+	if !found {
+		writeErr(w, http.StatusBadRequest,
+			fmt.Sprintf("%s is not a member of this cluster", req.Candidate),
+			"members are listed by GET /v1/cluster")
+		return http.StatusBadRequest, "unknown candidate"
+	}
+	if reason, ok := candidateUnready(snap, cand); !ok {
+		writeErr(w, http.StatusConflict,
+			fmt.Sprintf("%s cannot take over: %s", req.Candidate, reason),
+			"the primary only steps down for a reachable, same-timeline standby that is caught up")
+		return http.StatusConflict, "candidate not ready"
+	}
+	id := identityFrom(r.Context())
+	if err := s.o.Cluster.SetSwitchoverTarget(r.Context(), req.Candidate, id.CN); err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error(), "")
+		return http.StatusBadGateway, "marker write failed"
+	}
+	writeJSON(w, http.StatusAccepted, actionResponse{
+		Result: "switchover-requested", Cluster: s.o.ClusterName, Target: req.Candidate,
+		Message: "the serving primary steps down once the candidate is verified caught up; the request is one-shot",
+		Notes: []string{
+			"watch GET /v1/cluster for the leader to change",
+			"DELETE /v1/switchover cancels a request that has not been acted on",
+		},
+	})
+	return http.StatusAccepted, "target=" + req.Candidate
+}
+
+func findMember(snap Snapshot, name string) (MemberState, bool) {
+	if snap.Local.Name == name {
+		return snap.Local, true
+	}
+	for _, p := range snap.Peers {
+		if p.Name == name {
+			return p, true
+		}
+	}
+	return MemberState{}, false
+}
+
+// candidateUnready mirrors the loop's switchover gate: a reachable, same-timeline
+// standby. It reports the FIRST failing condition in the operator's terms.
+//
+// It deliberately checks position but not an exact LSN equality: replication is
+// moving, so a byte-exact comparison here would be stale by the time the primary
+// acts. The loop re-checks at the moment of handoff; this catches the cases that
+// cannot resolve on their own (wrong role, unreachable, divergent timeline).
+func candidateUnready(snap Snapshot, cand MemberState) (string, bool) {
+	switch {
+	case cand.Gossip || !cand.Reachable:
+		return "it is not reachable from this pod", false
+	case cand.Role != "standby":
+		return fmt.Sprintf("its role is %q, not standby", cand.Role), false
+	case !cand.TimelineOK:
+		return "its timeline could not be read", false
+	case snap.Local.TimelineOK && cand.Timeline != snap.Local.Timeline:
+		return fmt.Sprintf("it is on timeline %d but this node is on %d", cand.Timeline, snap.Local.Timeline), false
+	}
+	return "", true
+}
+
+func (s *Server) handleSwitchoverCancel(w http.ResponseWriter, r *http.Request) (int, string) {
+	if err := s.o.Cluster.ClearSwitchoverTarget(r.Context()); err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error(), "")
+		return http.StatusBadGateway, "marker write failed"
+	}
+	writeJSON(w, http.StatusOK, actionResponse{
+		Result: "switchover-cleared", Cluster: s.o.ClusterName,
+		Message: "any pending handoff request is removed; a switchover already in progress is not rolled back",
+	})
+	return http.StatusOK, "cleared"
+}
+
+type nodeRequest struct {
+	// Node must name the pod being addressed. Node-local verbs act on whichever pod
+	// answered the connection, so requiring the caller to say which pod they think
+	// that is turns a misrouted request into a 409 instead of an action on the wrong
+	// database.
+	Node  string `json:"node"`
+	Force bool   `json:"force"`
+}
+
+// handleIntent serves the node-local verbs by handing the operation to the reconcile
+// loop, which owns the postmaster. Blocking (rather than 202) is deliberate: a
+// restart or reload finishes in seconds, and a synchronous answer is the point of
+// having an API.
+func (s *Server) handleIntent(kind IntentKind) func(http.ResponseWriter, *http.Request) (int, string) {
+	return func(w http.ResponseWriter, r *http.Request) (int, string) {
+		var req nodeRequest
+		if err := decodeBody(r, &req); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error(), `body: {"node":"<this pod>"}`)
+			return http.StatusBadRequest, "bad body"
+		}
+		if status, detail, ok := s.checkNode(w, req.Node); !ok {
+			return status, detail
+		}
+		snap := s.o.Node.Snapshot()
+		// Restarting the serving primary is a write outage. Require an explicit force
+		// so it cannot be the result of a fat-fingered pod name plus a default.
+		if kind == IntentRestart && !req.Force && snap.HoldsLease && snap.Local.Running && snap.Local.Role == "primary" {
+			writeErr(w, http.StatusConflict,
+				"this pod is the serving primary: restarting it interrupts writes",
+				`pass {"force":true} to proceed, and consider POST /v1/pause first so the restart is not read as a failure`)
+			return http.StatusConflict, "primary without force"
+		}
+		ctx, cancel := contextWithTimeout(r, s.o.IntentTimeout)
+		defer cancel()
+		s.o.Metrics.IncControlIntent()
+		if err := s.o.Node.Submit(ctx, kind); err != nil {
+			if ctx.Err() != nil {
+				writeErr(w, http.StatusGatewayTimeout,
+					fmt.Sprintf("%s did not complete within %s", kind, s.o.IntentTimeout),
+					"the operation may still be in progress; check GET /v1/status")
+				return http.StatusGatewayTimeout, kind.String() + " timed out"
+			}
+			writeErr(w, http.StatusInternalServerError, fmt.Sprintf("%s failed: %v", kind, err), "")
+			return http.StatusInternalServerError, kind.String() + " failed"
+		}
+		writeJSON(w, http.StatusOK, actionResponse{
+			Result: kind.String() + "ed", Node: s.o.PodName,
+			Message: "state in GET /v1/status refreshes on the next reconcile tick",
+		})
+		return http.StatusOK, kind.String()
+	}
+}
+
+// checkNode enforces the addressed-pod interlock.
+func (s *Server) checkNode(w http.ResponseWriter, node string) (int, string, bool) {
+	if node == "" {
+		writeErr(w, http.StatusBadRequest, "node is required",
+			fmt.Sprintf("this endpoint acts on the pod that answers it; pass {\"node\":%q}", s.o.PodName))
+		return http.StatusBadRequest, "no node", false
+	}
+	if node != s.o.PodName {
+		writeErr(w, http.StatusConflict,
+			fmt.Sprintf("you addressed %q but this is %q", node, s.o.PodName),
+			"node-local operations are per-pod: connect to the pod you mean (there is deliberately no load-balanced control Service)")
+		return http.StatusConflict, "node mismatch", false
+	}
+	return 0, "", true
+}

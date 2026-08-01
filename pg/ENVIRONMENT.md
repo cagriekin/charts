@@ -49,10 +49,42 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `POD_CIDR` | CIDR | yes | `repmgr.agent.podCidr` (`10.0.0.0/8`) | agent (hardened pg_hba: trusted pod network) |
 | `POSTGRESQL_PGHBA` | newline-list | no | `postgresql.pgHba` (joined) | agent (user pg_hba rules, above the catch-alls) |
 | `CASCADE_REPLICATION` | boolean | no | `repmgr.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
+| `PG_MAJOR` | digits | no | image `ENV` from the Dockerfile's `ARG PG_MAJOR` (`18`) | agent (versioned bindir `/usr/lib/postgresql/<major>/bin`, #269) |
+| `PGBACKREST_ENABLED` | boolean | no | `"true"` when `pgbackrest.enabled` | agent (control API backup routes) |
+| `PGBACKREST_STANZA` | string | no | `pgbackrest.stanza` | agent (`pgbackrest info`), archive_command |
 
 Lease timings must satisfy `LEASE_DURATION > RENEW_DEADLINE > RETRY_PERIOD`
 (validated at boot). The agent also writes a `0600 ~/.pgpass` from `REPMGR_*` so a
 passwordless `primary_conninfo` can authenticate streaming replication.
+
+### control API only (`repmgr.agent.control.enabled=true`)
+
+Emitted only when the control REST API (#276) is on, and validated at boot: enabling it
+without all three TLS files, or restore without an allowlist, is a single fail-fast error
+(the chart also render-guards both, so the failure normally arrives at `helm upgrade`).
+
+| Variable | Type | Required | Default / source | Consumer |
+|----------|------|----------|------------------|----------|
+| `CONTROL_ENABLED` | boolean | no | `"true"` when `repmgr.agent.control.enabled` | agent (control listener) |
+| `CONTROL_ADDR` | host:port | no | `:<repmgr.agent.control.port>` (`:9201`) | agent (never the 9200 metrics port) |
+| `CONTROL_TLS_CERT` | path | yes¹ | `/etc/agent-control-tls/tls.crt` | agent (server identity) |
+| `CONTROL_TLS_KEY` | path | yes¹ | `/etc/agent-control-tls/tls.key` | agent |
+| `CONTROL_TLS_CA` | path | yes¹ | `/etc/agent-control-tls/ca.crt` | agent (verifies CLIENT certificates) |
+| `CONTROL_ALLOWED_CNS` | csv | no | `repmgr.agent.control.allowedClientCNs` | agent (empty = any cert the CA signed) |
+| `CONTROL_RESTORE_ENABLED` | boolean | no | `repmgr.agent.control.restore.enabled` | agent (`POST /v1/restore`) |
+| `CONTROL_RESTORE_ALLOWED_CNS` | csv | yes² | `repmgr.agent.control.restore.allowedClientCNs` | agent (separate authz verb; empty denies everyone) |
+| `CONTROL_RESTORE_CRONJOB` | string | yes² | `<fullname>-pgbackrest-restore` | agent (the jobTemplate it clones) |
+| `CONTROL_RESTORE_JOB_NAME` | string | yes² | `<fullname>-pgbackrest-restore-api` | agent (deterministic, so RBAC get/delete can be resourceName-scoped) |
+| `CONTROL_RESTORE_POD_ORDINAL` | integer | yes² | `pgbackrest.restore.podOrdinal` | agent (confirm-only: the request may echo it, never change it) |
+| `CONTROL_RESTORE_READ_POD_LOGS` | boolean | no | `repmgr.agent.control.restore.readPodLogs` (`false`) | agent (live copy progress; adds namespace-wide `get pods/log`) |
+
+¹ Required when `CONTROL_ENABLED` — mTLS is the only authentication mode, so the agent
+refuses to boot rather than open an unauthenticated mutating port.
+² Required when `CONTROL_RESTORE_ENABLED`.
+
+The restore outcome record the API reads back as `lastRestore` is not an env var: it is
+`<dirname of PGDATA>/pgbackrest-restore.status`, written by the chart's `restore.sh` onto
+the data volume so it outlives the Job.
 
 ### etcd backend only (`repmgr.agent.dcs.backend=etcd`)
 

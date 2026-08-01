@@ -109,6 +109,16 @@ template:
             value: {{ .Values.pgbackrest.restore.backupSet | quote }}
           - name: FORCE
             value: {{ .Values.pgbackrest.restore.force | quote }}
+          {{- /* Who asked for this restore, for the record restore.sh writes onto the
+                 data volume (#276). The control API stamps pg-ha/requested-by on the
+                 Job AND on its pod template; the downward API can only read the POD's
+                 own annotations, hence both. Empty for a restore started with kubectl
+                 (`kubectl create job --from=...`), which is not an error -- the record
+                 simply carries no requester. */}}
+          - name: RESTORE_REQUESTED_BY
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.annotations['pg-ha/requested-by']
 {{- if .Values.pgbackrest.repoEncryption.enabled }}
           - name: PGBACKREST_REPO1_CIPHER_PASS
             valueFrom:

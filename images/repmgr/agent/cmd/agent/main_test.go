@@ -92,6 +92,7 @@ type fakePostmaster struct {
 	started  bool
 	stopped  bool
 	stopMode process.StopMode
+	reloaded bool
 	running  bool
 }
 
@@ -100,7 +101,7 @@ func (f *fakePostmaster) Stop(_ context.Context, m process.StopMode) error {
 	f.stopped, f.stopMode = true, m
 	return nil
 }
-func (f *fakePostmaster) Reload(context.Context) error { return nil }
+func (f *fakePostmaster) Reload(context.Context) error { f.reloaded = true; return nil }
 func (f *fakePostmaster) Running() bool                { return f.running }
 
 type fakeDCS struct{ released bool }

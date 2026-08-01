@@ -26,11 +26,13 @@ import (
 	"time"
 
 	"github.com/cagriekin/pg-ha-agent/internal/config"
+	"github.com/cagriekin/pg-ha-agent/internal/control"
 	"github.com/cagriekin/pg-ha-agent/internal/dcs"
 	"github.com/cagriekin/pg-ha-agent/internal/k8s"
 	"github.com/cagriekin/pg-ha-agent/internal/mechanism"
 	"github.com/cagriekin/pg-ha-agent/internal/observe"
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
+	"github.com/cagriekin/pg-ha-agent/internal/pgbackrest"
 	"github.com/cagriekin/pg-ha-agent/internal/pgconf"
 	"github.com/cagriekin/pg-ha-agent/internal/process"
 	"github.com/cagriekin/pg-ha-agent/internal/reconcile"
@@ -165,6 +167,14 @@ type agent struct {
 	// window before the next tick); fail-safe is to demote on uncertainty.
 	servingRW atomic.Bool
 
+	// Control API (#276), present only when it is enabled. intents carries node-local
+	// operations from HTTP handlers to the reconcile goroutine (which owns the
+	// postmaster); snap is the per-tick state the API serves, so a request costs no
+	// probes; pgbr reads the pgBackRest repository and the restore outcome file.
+	intents chan intentRequest
+	snap    atomic.Pointer[control.Snapshot]
+	pgbr    pgbackrest.Client
+
 	// rehashedManagedUsers latches once the md5->scram managed-user re-hash has
 	// succeeded on this node as primary (#199). It runs once per process on the first
 	// RW path (Promote or boot-as-primary StayPrimary) -- not every tick -- and only
@@ -240,6 +250,10 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 		base:             baseName(cfg.PodName),
 		bootAt:           time.Now(),
 		peersSeen:        map[string]bool{},
+		// One slot: a second concurrent node-local operation waits on the channel rather
+		// than queueing up behind an unbounded backlog of restarts.
+		intents: make(chan intentRequest, 1),
+		pgbr:    newPgbackrest(cfg.PGBackrestStanza, cfg.RestoreStatusPath()),
 	}, nil
 }
 
@@ -254,6 +268,16 @@ func (a *agent) run() {
 	defer stop()
 
 	go a.startMetrics(ctx)
+
+	// Control API (#276) on its own port. Enabling it and getting an agent WITHOUT it
+	// would leave an operator believing a listener is protected when it is simply
+	// absent, so a construction failure (unreadable/unusable TLS material) is fatal.
+	if a.cfg.ControlEnabled {
+		if err := a.startControl(ctx); err != nil {
+			a.log.Error("control API", "err", err)
+			os.Exit(1)
+		}
+	}
 
 	// Leadership: OnLost demotes synchronously (the fence-ordering guarantee)
 	// before the lock can be re-acquired by anyone.
@@ -314,6 +338,14 @@ func (a *agent) run() {
 			return
 		case <-ticker.C:
 			a.tick(ctx)
+		case req := <-a.intents:
+			// Control-API node-local operations run HERE, in the reconcile goroutine, so
+			// they cannot interleave with a tick: the loop owns the postmaster, and a stop
+			// issued from an HTTP goroutine would either be undone by the next tick or be
+			// read as a fault. Handling it in the select (rather than draining once per
+			// tick) also keeps a restart/reload responsive instead of waiting out an
+			// interval.
+			req.done <- a.runIntent(ctx, req.kind)
 		}
 	}
 }
@@ -398,6 +430,11 @@ func (a *agent) tick(ctx context.Context) {
 	// leadership-critical writes for the fence-budget window) would only starve its psql.
 	if dec.Action == reconcile.Promote || dec.Action == reconcile.StayPrimary {
 		a.rehashManagedUsersOnce(ctx)
+	}
+	// Publish what the control API serves. Gated on the API being enabled so a release
+	// without it does exactly the work it did before -- notably no extra replay probe.
+	if a.cfg.ControlEnabled {
+		a.publishSnapshot(ctx, obs, dec)
 	}
 }
 
@@ -1080,7 +1117,18 @@ func (a *agent) streamingFromTarget(ctx context.Context, target string) bool {
 }
 
 func (a *agent) startMetrics(ctx context.Context) {
-	srv := &http.Server{Addr: metricsAddr, Handler: a.metr.Handler(a.cfg.ReconcileInterval * 3)}
+	srv := &http.Server{
+		Addr:    metricsAddr,
+		Handler: a.metr.Handler(a.cfg.ReconcileInterval * 3),
+		// Timeouts on a listener that shares a process with PID 1 and the supervised
+		// postmaster: without them a client that opens connections and never sends a
+		// request accumulates goroutines and buffers here indefinitely.
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

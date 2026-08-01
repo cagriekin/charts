@@ -2,6 +2,7 @@ package k8s
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -182,5 +183,137 @@ func TestMarkerPauseAnnotation(t *testing.T) {
 		return c.ReadMarker(context.Background(), "pg-primary")
 	}(); m.Paused {
 		t.Error("WriteMarker-created marker must not be paused")
+	}
+}
+
+// --- control-API marker mutations (#276) ---
+
+func markerClient(t *testing.T, annotations map[string]string) (*Client, *fake.Clientset) {
+	t.Helper()
+	cs := fake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "pg-primary", Namespace: ns, Annotations: annotations},
+		Data:       map[string]string{"primary": "pg-0", "timeline": "7"},
+	})
+	return NewWithClient(cs, ns), cs
+}
+
+func markerAnnotations(t *testing.T, cs *fake.Clientset) map[string]string {
+	t.Helper()
+	cm, err := cs.CoreV1().ConfigMaps(ns).Get(context.Background(), "pg-primary", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cm.Annotations
+}
+
+func TestSetPauseWritesMarkerAndRequester(t *testing.T) {
+	c, cs := markerClient(t, nil)
+	ctx := context.Background()
+	if err := c.SetPause(ctx, "pg-primary", true, "ops-admin"); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	a := markerAnnotations(t, cs)
+	if a[PauseAnnotation] != "true" || a[PausedByAnnotation] != "ops-admin" {
+		t.Errorf("annotations = %v", a)
+	}
+	m, _ := c.ReadMarker(ctx, "pg-primary")
+	if !m.Paused {
+		t.Error("the marker the reconcile loop reads must report Paused")
+	}
+	// The pause is the same object kubectl annotate writes, so the Data (highwater
+	// timeline) must survive untouched.
+	cm, _ := cs.CoreV1().ConfigMaps(ns).Get(ctx, "pg-primary", metav1.GetOptions{})
+	if cm.Data["timeline"] != "7" || cm.Data["primary"] != "pg-0" {
+		t.Errorf("marker Data must not be disturbed by an annotation write: %v", cm.Data)
+	}
+}
+
+// Resuming must drop the requester with the pause: a leftover paused-by would
+// describe a pause that is no longer in effect.
+func TestSetPauseResumeClearsRequester(t *testing.T) {
+	c, cs := markerClient(t, map[string]string{PauseAnnotation: "true", PausedByAnnotation: "ops-admin"})
+	if err := c.SetPause(context.Background(), "pg-primary", false, ""); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	a := markerAnnotations(t, cs)
+	if _, ok := a[PauseAnnotation]; ok {
+		t.Error("pause annotation must be removed on resume")
+	}
+	if _, ok := a[PausedByAnnotation]; ok {
+		t.Errorf("paused-by must be removed on resume: %v", a)
+	}
+}
+
+func TestSetPauseIsIdempotent(t *testing.T) {
+	c, cs := markerClient(t, nil)
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if err := c.SetPause(ctx, "pg-primary", true, "ops-admin"); err != nil {
+			t.Fatalf("pause %d: %v", i, err)
+		}
+	}
+	if markerAnnotations(t, cs)[PauseAnnotation] != "true" {
+		t.Error("repeated pause must converge on the same value")
+	}
+}
+
+// An absent marker means no primary has ever been recorded. Creating one to hold an
+// annotation would leave it Present-but-Malformed, which readers fail closed on.
+func TestAnnotateMarkerRefusesToCreate(t *testing.T) {
+	c := NewWithClient(fake.NewSimpleClientset(), ns)
+	ctx := context.Background()
+	err := c.SetPause(ctx, "pg-primary", true, "ops-admin")
+	if err == nil {
+		t.Fatal("pausing without a marker must fail rather than create one")
+	}
+	if !strings.Contains(err.Error(), "has not recorded a primary") {
+		t.Errorf("the error should explain why: %v", err)
+	}
+	if _, gerr := c.cs.CoreV1().ConfigMaps(ns).Get(ctx, "pg-primary", metav1.GetOptions{}); gerr == nil {
+		t.Error("no marker ConfigMap should have been created")
+	}
+}
+
+func TestSetSwitchoverTargetWritesRequester(t *testing.T) {
+	c, cs := markerClient(t, nil)
+	ctx := context.Background()
+	if err := c.SetSwitchoverTarget(ctx, "pg-primary", "pg-1", "ops-admin"); err != nil {
+		t.Fatalf("switchover: %v", err)
+	}
+	a := markerAnnotations(t, cs)
+	if a[SwitchoverTargetAnnotation] != "pg-1" || a[SwitchoverRequestedByAnnotation] != "ops-admin" {
+		t.Errorf("annotations = %v", a)
+	}
+	m, _ := c.ReadMarker(ctx, "pg-primary")
+	if m.SwitchoverTarget != "pg-1" {
+		t.Errorf("the loop must see the target: %q", m.SwitchoverTarget)
+	}
+}
+
+// The reconcile loop's one-shot clear must take the requester with it, or the next
+// switchover is attributed to whoever asked for the last one.
+func TestClearSwitchoverTargetDropsRequester(t *testing.T) {
+	c, cs := markerClient(t, map[string]string{
+		SwitchoverTargetAnnotation:      "pg-1",
+		SwitchoverRequestedByAnnotation: "ops-admin",
+	})
+	if err := c.ClearSwitchoverTarget(context.Background(), "pg-primary"); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	a := markerAnnotations(t, cs)
+	if _, ok := a[SwitchoverRequestedByAnnotation]; ok {
+		t.Errorf("requester must be cleared with the request: %v", a)
+	}
+}
+
+// A stale requester left by an older agent (target already gone) must still be
+// cleaned up rather than skipped by the early return.
+func TestClearSwitchoverTargetCleansOrphanRequester(t *testing.T) {
+	c, cs := markerClient(t, map[string]string{SwitchoverRequestedByAnnotation: "ops-admin"})
+	if err := c.ClearSwitchoverTarget(context.Background(), "pg-primary"); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if _, ok := markerAnnotations(t, cs)[SwitchoverRequestedByAnnotation]; ok {
+		t.Error("an orphaned requester annotation must be removed")
 	}
 }

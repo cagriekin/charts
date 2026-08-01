@@ -36,6 +36,16 @@ const PauseAnnotation = "pg-ha/pause"
 // with `kubectl annotate configmap <fullname>-primary pg-ha/switchover-target=<pod>`.
 const SwitchoverTargetAnnotation = "pg-ha/switchover-target"
 
+// PausedByAnnotation and SwitchoverRequestedByAnnotation record WHO asked for the
+// current pause / switchover when it was requested through the control API (#276).
+// They are provenance only -- no agent logic reads them -- but they survive a pod
+// restart and show up in `kubectl describe`, which the agent's own audit log (pod
+// stdout) does not. Absent when the intent was set with plain kubectl annotate.
+const (
+	PausedByAnnotation              = "pg-ha/paused-by"
+	SwitchoverRequestedByAnnotation = "pg-ha/switchover-requested-by"
+)
+
 // Marker is the durable highwater primary marker (<fullname>-primary ConfigMap):
 // the highest-timeline primary ever recorded, so a node booting first under
 // OrderedReady can tell it is stale (#125). Malformed is set when the marker
@@ -48,6 +58,10 @@ type Marker struct {
 	Timeline   uint32
 	TimelineOK bool
 	Paused     bool // maintenance mode: PauseAnnotation == "true" on the ConfigMap
+	// PausedBy is the control-API client that requested the pause (PausedByAnnotation);
+	// "" when it was set with kubectl or not set at all. Provenance for the API's
+	// status response -- no agent logic reads it.
+	PausedBy string
 	// SwitchoverTarget is the pod named by SwitchoverTargetAnnotation ("" if none).
 	SwitchoverTarget string
 	// SchemaVersion is the on-DCS data version (absent/0 == legacy v1). A reader
@@ -70,6 +84,7 @@ func (c *Client) ReadMarker(ctx context.Context, name string) (Marker, error) {
 		Present:          true,
 		Primary:          cm.Data["primary"],
 		Paused:           strings.EqualFold(strings.TrimSpace(cm.Annotations[PauseAnnotation]), "true"),
+		PausedBy:         strings.TrimSpace(cm.Annotations[PausedByAnnotation]),
 		SwitchoverTarget: strings.TrimSpace(cm.Annotations[SwitchoverTargetAnnotation]),
 	}
 	if v, perr := strconv.Atoi(cm.Data["schemaVersion"]); perr == nil {
@@ -128,6 +143,65 @@ func (c *Client) WriteMarker(ctx context.Context, name, primary string, timeline
 	return nil
 }
 
+// annotateMarker applies set (values) and unset (keys) to the marker ConfigMap's
+// annotations in one read-modify-write. It is the single write path for the pause
+// and switchover intents, so both the API and the reconcile loop's one-shot clear
+// behave identically.
+//
+// A MISSING marker is an error, not an implicit create: the marker's Data carries
+// the highwater timeline, and creating an empty one to hold an annotation would make
+// it Present-but-Malformed, which every reader deliberately fails closed on (#174).
+// A cluster with no marker has not elected a primary yet and has nothing to pause.
+func (c *Client) annotateMarker(ctx context.Context, name string, set map[string]string, unset []string) error {
+	cms := c.cs.CoreV1().ConfigMaps(c.namespace)
+	cm, err := cms.Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return fmt.Errorf("marker %s does not exist yet: the cluster has not recorded a primary, so there is nothing to annotate", name)
+	}
+	if err != nil {
+		return fmt.Errorf("get marker %s: %w", name, err)
+	}
+	if cm.Annotations == nil {
+		cm.Annotations = map[string]string{}
+	}
+	for k, v := range set {
+		cm.Annotations[k] = v
+	}
+	for _, k := range unset {
+		delete(cm.Annotations, k)
+	}
+	if _, uerr := cms.Update(ctx, cm, metav1.UpdateOptions{}); uerr != nil {
+		return fmt.Errorf("annotate marker %s: %w", name, uerr)
+	}
+	return nil
+}
+
+// SetPause sets or clears maintenance mode on the marker, recording requestedBy when
+// pausing (and dropping it when resuming, so a stale requester cannot outlive the
+// pause it describes). Idempotent: pausing an already-paused cluster rewrites the
+// same value.
+func (c *Client) SetPause(ctx context.Context, name string, on bool, requestedBy string) error {
+	if !on {
+		return c.annotateMarker(ctx, name, nil, []string{PauseAnnotation, PausedByAnnotation})
+	}
+	set := map[string]string{PauseAnnotation: "true"}
+	if requestedBy != "" {
+		set[PausedByAnnotation] = requestedBy
+	}
+	return c.annotateMarker(ctx, name, set, []string{})
+}
+
+// SetSwitchoverTarget requests a controlled handoff to target. The serving primary
+// still decides WHEN (only once target is a caught-up, same-timeline standby) and
+// clears the annotation itself, so this only records the request.
+func (c *Client) SetSwitchoverTarget(ctx context.Context, name, target, requestedBy string) error {
+	set := map[string]string{SwitchoverTargetAnnotation: target}
+	if requestedBy != "" {
+		set[SwitchoverRequestedByAnnotation] = requestedBy
+	}
+	return c.annotateMarker(ctx, name, set, []string{})
+}
+
 // ClearSwitchoverTarget removes the switchover-target annotation from the marker
 // ConfigMap so a controlled switchover is one-shot -- a later, unrelated failover
 // cannot re-trigger a handoff to the same pod. A missing marker or already-absent
@@ -141,10 +215,15 @@ func (c *Client) ClearSwitchoverTarget(ctx context.Context, name string) error {
 	if err != nil {
 		return fmt.Errorf("get marker %s: %w", name, err)
 	}
-	if _, ok := cm.Annotations[SwitchoverTargetAnnotation]; !ok {
+	_, hasTarget := cm.Annotations[SwitchoverTargetAnnotation]
+	_, hasRequester := cm.Annotations[SwitchoverRequestedByAnnotation]
+	if !hasTarget && !hasRequester {
 		return nil
 	}
+	// Drop the requester with the request: a leftover pg-ha/switchover-requested-by
+	// would attribute the NEXT switchover to whoever asked for the last one.
 	delete(cm.Annotations, SwitchoverTargetAnnotation)
+	delete(cm.Annotations, SwitchoverRequestedByAnnotation)
 	if _, uerr := cms.Update(ctx, cm, metav1.UpdateOptions{}); uerr != nil {
 		return fmt.Errorf("clear switchover annotation on %s: %w", name, uerr)
 	}

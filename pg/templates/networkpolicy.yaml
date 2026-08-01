@@ -70,6 +70,18 @@ the pgpool 9719 / exporter 9116 metrics rules.
           protocol: TCP
       from:
         - podSelector: {}
+{{- /*
+The control API port (#276) deliberately gets NO rule of its own, even when the API
+is enabled. This policy is an explicit allowlist, so the absence of a rule IS
+deny-by-default -- the opposite of the 9200 rule above, which has to admit every
+same-namespace pod for scrapes to work. Admit a specific client with
+networkPolicy.agentControl.extraIngress; humans reach it through `kubectl
+port-forward`, which goes via the kubelet rather than the pod network and so is
+unaffected by this policy on most CNIs.
+*/}}
+{{- with .Values.networkPolicy.agentControl.extraIngress }}
+    {{- toYaml . | nindent 4 }}
+{{- end }}
 {{- end }}
 {{- /*
 extraIngress entries are full ingress rules (each with its own from/ports),
