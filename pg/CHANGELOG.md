@@ -83,6 +83,14 @@
   - It deliberately does **not** scale the StatefulSet — scaling to 0 deletes every agent,
     including the one that would report progress — and returns the remaining commands in
     `nextSteps`. Net effect: it removes the `kubectl create job --from` step, nothing more.
+    Whether a scale-down is needed at all depends on scheduling: ReadWriteOnce binds a
+    volume to a NODE, so a Job co-scheduled with the target pod starts immediately. What
+    keeps a restore off a live data directory is the required pause plus the postmaster
+    stop, not the scale-down.
+  - **The runbook ends with `POST /v1/resume`, and it is not optional.** Maintenance mode
+    makes the reconcile loop a no-op, so a restored node scaled back up while still paused
+    never starts PostgreSQL and never goes Ready. The API will not clear an operator's
+    pause on its own; `nextSteps` lists the resume as a required step.
 
   Progress and provenance: `restore.sh` now records the outcome of each restore attempt to
   `pgbackrest-restore.status` beside PGDATA (backup set, target, exit code, post-restore
