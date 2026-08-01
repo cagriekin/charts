@@ -508,9 +508,11 @@ What it does and does not control:
   interlock — the last guard against restoring over a live volume. If you genuinely need
   the stale-pid bypass, set `pgbackrest.restore.force=true` in values, where it is
   reviewable.
-- Destructive by declaration: `force: true` and `confirm: "<release>-pg"` (the
-  StatefulSet name) are both required, and the cluster must already be **paused** — an
-  active reconcile loop would restart the postmaster the restore needs stopped.
+- Destructive by declaration: `force: true` and `confirm: "<statefulset name>"` are both
+  required, and the cluster must already be **paused** — an active reconcile loop would
+  restart the postmaster the restore needs stopped. (The exact confirm value is whatever
+  `GET /v1/status` reports as `cluster`; it is `<release>-pg` unless the release name
+  already contains the chart name.)
 
 One call performs the whole safe sequence: verify paused → verify the confirmations →
 stop the local postmaster → create the Job, returning `202` with the Job name.
