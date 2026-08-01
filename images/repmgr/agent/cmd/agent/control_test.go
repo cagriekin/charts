@@ -152,7 +152,7 @@ func newIntentAgent(t *testing.T, pm *fakePostmaster) *agent {
 func TestRunIntentRestartStopsAndStarts(t *testing.T) {
 	pm := &fakePostmaster{running: true}
 	a := newIntentAgent(t, pm)
-	if err := a.runIntent(context.Background(), control.IntentRestart); err != nil {
+	if err := a.runIntent(context.Background(), intentRequest{kind: control.IntentRestart}); err != nil {
 		t.Fatalf("restart: %v", err)
 	}
 	if !pm.stopped || !pm.started {
@@ -168,7 +168,7 @@ func TestRunIntentRestartStopsAndStarts(t *testing.T) {
 func TestRunIntentStopLeavesPostgresDown(t *testing.T) {
 	pm := &fakePostmaster{running: true}
 	a := newIntentAgent(t, pm)
-	if err := a.runIntent(context.Background(), control.IntentStop); err != nil {
+	if err := a.runIntent(context.Background(), intentRequest{kind: control.IntentStop}); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
 	if !pm.stopped {
@@ -182,7 +182,7 @@ func TestRunIntentStopLeavesPostgresDown(t *testing.T) {
 func TestRunIntentReload(t *testing.T) {
 	pm := &fakePostmaster{running: true}
 	a := newIntentAgent(t, pm)
-	if err := a.runIntent(context.Background(), control.IntentReload); err != nil {
+	if err := a.runIntent(context.Background(), intentRequest{kind: control.IntentReload}); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	if !pm.reloaded {
@@ -195,7 +195,7 @@ func TestRunIntentReload(t *testing.T) {
 
 func TestRunIntentUnknownKind(t *testing.T) {
 	a := newIntentAgent(t, &fakePostmaster{})
-	if err := a.runIntent(context.Background(), control.IntentKind(99)); err == nil {
+	if err := a.runIntent(context.Background(), intentRequest{kind: control.IntentKind(99)}); err == nil {
 		t.Error("an unknown intent must be an error, not a silent no-op")
 	}
 }
@@ -222,7 +222,7 @@ func TestSubmitReturnsTheLoopsResult(t *testing.T) {
 	go func() { // stands in for the run loop's select
 		defer close(done)
 		req := <-a.intents
-		req.done <- a.runIntent(context.Background(), req.kind)
+		req.done <- a.runIntent(context.Background(), req)
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -341,7 +341,7 @@ func TestRunIntentReinitializeStopsAndWipes(t *testing.T) {
 	if !process.HasData(a.cfg.PGDATA) {
 		t.Fatal("fixture should look like a data directory")
 	}
-	if err := a.runIntent(context.Background(), control.IntentReinitialize); err != nil {
+	if err := a.runIntent(context.Background(), intentRequest{kind: control.IntentReinitialize}); err != nil {
 		t.Fatalf("reinitialize: %v", err)
 	}
 	if !pm.stopped {
@@ -359,13 +359,88 @@ func TestRunIntentReinitializeStopsAndWipes(t *testing.T) {
 	}
 }
 
+// The restore record lives BESIDE PGDATA so it survives the Job that writes it -- which
+// means the wipe cannot reach it. A rebuilt directory holds data cloned from the primary,
+// so leaving the record would make GET /v1/status report a backup set as the provenance of
+// data that never came from one.
+func TestRunIntentReinitializeInvalidatesTheRestoreRecord(t *testing.T) {
+	pm := &fakePostmaster{running: true}
+	a := newIntentAgent(t, pm)
+	if err := os.WriteFile(filepath.Join(a.cfg.PGDATA, "PG_VERSION"), []byte("18"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := a.cfg.RestoreStatusPath()
+	if err := os.WriteFile(rec, []byte("exitCode=0\nbackupSet=20260801-120000F\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.runIntent(context.Background(), intentRequest{kind: control.IntentReinitialize}); err != nil {
+		t.Fatalf("reinitialize: %v", err)
+	}
+	if _, err := os.Stat(rec); !os.IsNotExist(err) {
+		t.Errorf("the restore record must be gone after a wipe, got err=%v", err)
+	}
+}
+
+// Best effort: a missing record is the normal case (no restore ever ran here) and must not
+// turn a completed rebuild into a failure.
+func TestDropRestoreRecordToleratesAMissingFile(t *testing.T) {
+	a := newIntentAgent(t, &fakePostmaster{})
+	a.dropRestoreRecord("test") // must not panic or log an error path
+	if _, err := os.Stat(a.cfg.RestoreStatusPath()); !os.IsNotExist(err) {
+		t.Errorf("nothing should have been created: %v", err)
+	}
+}
+
+// A postmaster that ignores SIGINT must not hold the reconcile loop (and the leadership
+// fence behind the same mutex) for the life of the process: the request's deadline travels
+// with the intent, so the stop escalates exactly as the fence path does.
+func TestRunIntentStopIsBoundedByTheRequestDeadline(t *testing.T) {
+	pm := &fakePostmaster{running: true, stopErr: context.DeadlineExceeded}
+	a := newIntentAgent(t, pm)
+	req := intentRequest{kind: control.IntentStop, deadline: time.Now().Add(50 * time.Millisecond)}
+	err := a.runIntent(context.Background(), req)
+	if err == nil {
+		t.Fatal("a stop that had to be forced must be reported as a failure: SIGKILL leaves postmaster.pid, which blocks the restore Job")
+	}
+	if !pm.stopCtxHadDeadline {
+		t.Error("the stop must run under the request's deadline, not the loop's root context")
+	}
+}
+
+// ... but a restart must still bring PostgreSQL back up after a forced stop, or the node
+// stays down for exactly the wedge this escalated past.
+func TestRunIntentRestartStartsAgainAfterAForcedStop(t *testing.T) {
+	pm := &fakePostmaster{running: true, stopErr: context.DeadlineExceeded, deadOnStop: true}
+	a := newIntentAgent(t, pm)
+	req := intentRequest{kind: control.IntentRestart, deadline: time.Now().Add(50 * time.Millisecond)}
+	if err := a.runIntent(context.Background(), req); err != nil {
+		t.Fatalf("restart after a forced stop: %v", err)
+	}
+	if !pm.started {
+		t.Error("postgres must be started again")
+	}
+}
+
+// A stop that failed for any other reason, or that left the child alive, is still fatal:
+// starting a second postmaster on the same data directory is not a recovery.
+func TestRunIntentRestartDoesNotStartAfterAFailedStop(t *testing.T) {
+	pm := &fakePostmaster{running: true, stopErr: errors.New("boom")}
+	a := newIntentAgent(t, pm)
+	if err := a.runIntent(context.Background(), intentRequest{kind: control.IntentRestart}); err == nil {
+		t.Fatal("a failed stop must fail the restart")
+	}
+	if pm.started {
+		t.Error("it must not start a postmaster on top of a child that would not stop")
+	}
+}
+
 // If the wipe is refused (its own interlocks), the intent must fail rather than report
 // success and leave the loop nothing to do.
 func TestRunIntentReinitializeSurfacesWipeRefusal(t *testing.T) {
 	pm := &fakePostmaster{running: true}
 	a := newIntentAgent(t, pm)
 	// PGDATA exists but is not an initialized data directory -> WipeDataDir refuses.
-	err := a.runIntent(context.Background(), control.IntentReinitialize)
+	err := a.runIntent(context.Background(), intentRequest{kind: control.IntentReinitialize})
 	if err == nil {
 		t.Fatal("a refused wipe must surface as an error")
 	}

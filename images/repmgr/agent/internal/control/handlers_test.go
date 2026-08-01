@@ -490,6 +490,99 @@ func TestSwitchoverRejectsUnreadyCandidates(t *testing.T) {
 	}
 }
 
+// laggingStandbyView is what a pod that is still on the PREVIOUS timeline sees: the
+// primary and the other standby have moved to timeline 7, this pod has not caught up.
+// The API can be addressed to any pod, so this is a state a real request can hit.
+func laggingStandbyView() Snapshot {
+	s := healthySnapshot()
+	s.Node = "pg-2"
+	s.HoldsLease = false
+	s.LeaseHolder = "pg-0"
+	s.Local = MemberState{
+		Name: "pg-2", Self: true, Role: "standby", Reachable: true, Running: true,
+		HasData: boolp(true), Timeline: 6, TimelineOK: true, LSN: "16/A0000000",
+	}
+	s.Peers = []MemberState{
+		{Name: "pg-0", Role: "primary", Reachable: true, Running: true, Timeline: 7, TimelineOK: true, LSN: "16/B3000000"},
+		{Name: "pg-1", Role: "standby", Reachable: true, Running: true, Timeline: 7, TimelineOK: true, LSN: "16/B2FF0000"},
+	}
+	return s
+}
+
+// The candidate must match the timeline of the node that will actually step down -- the
+// lease holder -- not of whichever pod happened to answer. Measuring against the answering
+// pod refuses valid candidates when the API is addressed to a lagging standby.
+func TestSwitchoverMeasuresTheCandidateAgainstTheLeaseHolder(t *testing.T) {
+	h := newHarness(t, func(o *Options, h *harness) { o.PodName = "pg-2" })
+	h.nd.snap = laggingStandbyView()
+	rec := h.do("POST", "/v1/switchover", `{"candidate":"pg-1"}`, "ops-admin")
+	wantCode(t, rec, 202)
+	if h.cl.switchTarget != "pg-1" {
+		t.Errorf("a candidate on the PRIMARY's timeline must be accepted, target=%q", h.cl.switchTarget)
+	}
+}
+
+// The converse, and the dangerous half: a candidate on the answering pod's stale timeline
+// must NOT pass, or the API returns 202 for a request the loop then silently sits on.
+func TestSwitchoverRefusesACandidateOnAStaleTimeline(t *testing.T) {
+	h := newHarness(t, func(o *Options, h *harness) { o.PodName = "pg-2" })
+	h.nd.snap = laggingStandbyView()
+	h.nd.snap.Peers[1].Timeline = 6 // pg-1 is on the old timeline, like the answering pod
+	rec := h.do("POST", "/v1/switchover", `{"candidate":"pg-1"}`, "ops-admin")
+	wantCode(t, rec, 409)
+	if !strings.Contains(rec.Body.String(), "the primary pg-0 is on 7") {
+		t.Errorf("the refusal should measure against the primary: %s", rec.Body.String())
+	}
+	if h.cl.switchTarget != "" {
+		t.Error("nothing should be written")
+	}
+}
+
+// Without the primary's timeline a divergent candidate cannot be ruled out. Refuse rather
+// than skip the comparison: a 202 here becomes a request that is never acted on.
+func TestSwitchoverRefusedWhenThePrimarysTimelineIsUnreadable(t *testing.T) {
+	h := newHarness(t, func(o *Options, h *harness) { o.PodName = "pg-2" })
+	h.nd.snap = laggingStandbyView()
+	h.nd.snap.Peers[0].TimelineOK = false
+	rec := h.do("POST", "/v1/switchover", `{"candidate":"pg-1"}`, "ops-admin")
+	wantCode(t, rec, 409)
+	if !strings.Contains(rec.Body.String(), "could not be read") {
+		t.Errorf("body: %s", rec.Body.String())
+	}
+	if h.cl.switchTarget != "" {
+		t.Error("nothing should be written")
+	}
+}
+
+func TestSwitchoverRefusedWithNoLeaseHolder(t *testing.T) {
+	h := newHarness(t, nil)
+	h.nd.snap.LeaseHolder = ""
+	h.nd.snap.HoldsLease = false
+	rec := h.do("POST", "/v1/switchover", `{"candidate":"pg-1"}`, "ops")
+	wantCode(t, rec, 409)
+	if !strings.Contains(rec.Body.String(), "no lease holder") {
+		t.Errorf("body should say there is no primary to hand over from: %s", rec.Body.String())
+	}
+	if h.cl.switchTarget != "" {
+		t.Error("nothing should be written")
+	}
+}
+
+// The lease names a pod this node cannot see at all: there is no timeline to compare
+// against, so the request is refused rather than measured against a substitute.
+func TestSwitchoverRefusedWhenTheLeaseHolderIsNotVisible(t *testing.T) {
+	h := newHarness(t, nil)
+	h.nd.snap.LeaseHolder = "pg-7"
+	rec := h.do("POST", "/v1/switchover", `{"candidate":"pg-1"}`, "ops")
+	wantCode(t, rec, 409)
+	if !strings.Contains(rec.Body.String(), "not in this pod's view") {
+		t.Errorf("body: %s", rec.Body.String())
+	}
+	if h.cl.switchTarget != "" {
+		t.Error("nothing should be written")
+	}
+}
+
 func TestSwitchoverCancel(t *testing.T) {
 	h := newHarness(t, nil)
 	wantCode(t, h.do("DELETE", "/v1/switchover", "", "ops"), 200)
@@ -605,6 +698,26 @@ func TestUnknownBodyFieldIsRejected(t *testing.T) {
 	if len(h.nd.submitted) != 0 {
 		t.Error("no intent from a malformed request")
 	}
+}
+
+// Same reasoning as the unknown field: a body the caller did not mean must not be
+// half-read. `{"force":true} {"force":false}` decoding as the first object and discarding
+// the second is the silent misreading this API refuses everywhere else.
+func TestTrailingContentAfterTheJSONObjectIsRejected(t *testing.T) {
+	for _, body := range []string{
+		`{"node":"pg-0"} garbage`,
+		`{"node":"pg-0"}{"node":"pg-0","force":true}`,
+	} {
+		h := newHarness(t, nil)
+		rec := h.do("POST", "/v1/restart", body, "ops")
+		wantCode(t, rec, 400)
+		if len(h.nd.submitted) != 0 {
+			t.Errorf("%s: no intent from a malformed request", body)
+		}
+	}
+	// Trailing whitespace and a newline are not garbage: curl and shells add them.
+	h := newHarness(t, nil)
+	wantCode(t, h.do("POST", "/v1/reload", "{\"node\":\"pg-0\"}\n  ", "ops"), 200)
 }
 
 func TestOversizedBodyIsRejected(t *testing.T) {

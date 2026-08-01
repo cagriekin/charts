@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/cagriekin/pg-ha-agent/internal/control"
@@ -30,29 +32,57 @@ const (
 
 // intentRequest is a control-API operation waiting for the reconcile loop. done is
 // buffered so the loop never blocks on a caller that has already given up.
+//
+// deadline carries the REQUEST's deadline into the loop. Without it the operation would
+// run under the process-lifetime root context, so a postmaster that ignores SIGINT would
+// hold opMu until shutdown: the loop stops ticking (peer gossip goes stale, the highwater
+// marker stops advancing) and the leadership OnLost fence blocks behind the same mutex, so
+// a node that comes back read-write is never demoted. A deadline makes the stop escalate
+// to SIGKILL exactly as the fence path does. Zero means "no deadline" (the client sent no
+// timeout), which is the caller's choice to make.
 type intentRequest struct {
-	kind control.IntentKind
-	done chan error
+	kind     control.IntentKind
+	deadline time.Time
+	done     chan error
 }
 
 // runIntent performs a node-local operation. Only ever called from the reconcile
 // goroutine (the run loop selects on the intent channel), so it cannot interleave
 // with a tick; opMu still serialises it against the leadership OnLost fence, which
 // fires on its own goroutine.
-func (a *agent) runIntent(ctx context.Context, kind control.IntentKind) error {
+//
+// parent is the loop's root context: it bounds the operation by process lifetime, while
+// req.deadline bounds the part that can wedge (stopping the postmaster).
+func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 	a.opMu.Lock()
 	defer a.opMu.Unlock()
+	kind := req.kind
+	// Only the stop is deadline-bounded. Start and Reload do not block on the child, and
+	// bounding them would add nothing but a way to fail.
+	stopCtx, cancelStop := parent, context.CancelFunc(func() {})
+	if !req.deadline.IsZero() {
+		stopCtx, cancelStop = context.WithDeadline(parent, req.deadline)
+	}
+	defer cancelStop()
 	switch kind {
 	case control.IntentReload:
-		return a.sup.Reload(ctx)
+		return a.sup.Reload(parent)
 	case control.IntentRestart:
 		// Stop and start explicitly rather than stopping and letting the loop start it
 		// back up: under maintenance mode the loop is a no-op, so relying on it would
 		// leave Postgres down.
-		if err := a.sup.Demote(ctx, false); err != nil {
-			return fmt.Errorf("stop postgres: %w", err)
+		if err := a.sup.Demote(stopCtx, false); err != nil {
+			// A deadline-forced SIGKILL still leaves the postmaster dead and reaped, so
+			// the restart must go on and bring it back up -- returning here would leave
+			// the node down for a wedge this deliberately escalated past. Any other
+			// failure, or a child still alive, is fatal to the operation.
+			if !errors.Is(err, context.DeadlineExceeded) || a.sup.Running() {
+				return fmt.Errorf("stop postgres: %w", err)
+			}
+			a.log.Warn("control: postmaster did not exit before the request deadline and was killed; starting it back up",
+				"deadline", req.deadline)
 		}
-		if err := a.sup.Start(ctx); err != nil {
+		if err := a.sup.Start(parent); err != nil {
 			return fmt.Errorf("start postgres: %w", err)
 		}
 		a.log.Info("control: restarted postgres")
@@ -61,7 +91,12 @@ func (a *agent) runIntent(ctx context.Context, kind control.IntentKind) error {
 		// Leave it stopped: the caller is about to restore over this data directory. Safe
 		// only while paused, which the handler verified against a fresh marker read --
 		// an active loop would start it again on the next tick.
-		if err := a.sup.Demote(ctx, false); err != nil {
+		//
+		// Unlike restart, a deadline-forced kill is reported as a FAILURE here: SIGKILL
+		// leaves postmaster.pid behind, and that file is what stops the restore Job from
+		// writing over a directory something may still own. The caller must see the stop
+		// did not complete cleanly rather than have a Job created behind it.
+		if err := a.sup.Demote(stopCtx, false); err != nil {
 			return fmt.Errorf("stop postgres: %w", err)
 		}
 		a.log.Warn("control: stopped postgres for a restore")
@@ -72,18 +107,46 @@ func (a *agent) runIntent(ctx context.Context, kind control.IntentKind) error {
 		// BootstrapClone case, so the rebuild runs through the same path a brand-new
 		// replica uses. WipeDataDir carries its own interlocks (initialized data
 		// directory, no postmaster.pid, not near the filesystem root).
-		if err := a.sup.Demote(ctx, false); err != nil {
+		if err := a.sup.Demote(stopCtx, false); err != nil {
 			return fmt.Errorf("stop postgres: %w", err)
 		}
 		if err := process.WipeDataDir(a.cfg.PGDATA); err != nil {
 			return err
 		}
+		a.dropRestoreRecord("the data directory was discarded for a rebuild")
 		a.log.Warn("control: discarded the data directory; the reconcile loop will re-clone from the lease holder",
 			"pgdata", a.cfg.PGDATA)
 		return nil
 	default:
 		return fmt.Errorf("unknown intent %v", kind)
 	}
+}
+
+// dropRestoreRecord invalidates the restore-outcome record when this volume's contents
+// stop being what that record describes.
+//
+// The record lives BESIDE PGDATA (it has to outlive the Job that wrote it and the
+// directory that Job rewrites), so neither WipeDataDir nor a clone touches it. Left in
+// place it would make GET /v1/status report a backup set and recovery target as the
+// provenance of a data directory that was rebuilt from the primary -- and the field is
+// documented as exactly that provenance, so anything reasoning or alerting on it would be
+// wrong.
+//
+// Best effort by design: the rebuild has already happened by the time this runs, and a
+// misleading record is not worth failing a completed clone over. The warning names the
+// path so an operator can remove it by hand.
+func (a *agent) dropRestoreRecord(why string) {
+	p := a.cfg.RestoreStatusPath()
+	if err := os.Remove(p); err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		a.log.Warn("could not remove the stale restore record; GET /v1/status may report it as this volume's provenance",
+			"path", p, "reason", why, "err", err)
+		return
+	}
+	a.log.Info("removed the restore record: it no longer describes this data directory",
+		"path", p, "reason", why)
 }
 
 // --- control.Node ---
@@ -109,9 +172,12 @@ func (n nodeAPI) HoldsLeaseNow() bool { return n.a.dcs.IsLeader() }
 //
 // If ctx expires after the intent was accepted, the loop still performs it -- which is
 // why the timeout response says the operation may be in progress rather than claiming
-// it did not happen.
+// it did not happen. The deadline travels WITH the request so "still performs it" stays
+// bounded: without it a wedged postmaster would hold the loop (and the leadership fence
+// behind the same mutex) for the life of the process.
 func (n nodeAPI) Submit(ctx context.Context, kind control.IntentKind) error {
-	req := intentRequest{kind: kind, done: make(chan error, 1)}
+	deadline, _ := ctx.Deadline() // zero when the caller set none
+	req := intentRequest{kind: kind, deadline: deadline, done: make(chan error, 1)}
 	select {
 	case n.a.intents <- req:
 	case <-ctx.Done():

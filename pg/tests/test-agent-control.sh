@@ -489,5 +489,59 @@ done
 assert_eq "the new leader reports it holds the lease" "true" "$(jq -r '.holdsLease' <<< "${new_status}")"
 assert_eq "the new leader reports the primary role" "primary" "$(jq -r '.local.role' <<< "${new_status}")"
 
+# --- a switchover requested THROUGH A STANDBY is measured against the primary ---
+#
+# There is deliberately no control Service, so any pod can be the one answering. The
+# preflight must therefore compare the candidate against the LEASE HOLDER's timeline, not
+# against the answering pod's: the pod that just lost the role is precisely the one most
+# likely to still be on the previous timeline, and comparing against it would both refuse
+# valid candidates and -- worse -- accept a candidate on the stale timeline, producing a 202
+# the loop then silently sits on. Hand the role back through that demoted pod and require
+# the leadership to actually move.
+if start_pf "${LEADER}" "${LOCAL_PORT}" 9201; then pf_ok=ok; else pf_ok=fail; fi
+wait_api_ready || true
+assert_eq "port-forward to the demoted node established" "ok" "${pf_ok}"
+demoted_role=""
+for _ in $(seq 1 24); do
+  demoted_role=$(jq -r '.local.role // empty' <<< "$(api_body GET /v1/status)")
+  [[ "${demoted_role}" == "standby" ]] && break
+  sleep 5
+done
+assert_eq "the demoted node is a standby that still serves the API" "standby" "${demoted_role}"
+
+# Wait for this node to rejoin properly first. A node that has just been demoted stops and
+# restarts PostgreSQL to follow the new primary, and until it is back up on the new timeline
+# it genuinely is not a switchover candidate -- refusing it then is correct, not the
+# behaviour under test. This polls the ANSWERING pod's own view: self reachable, a standby,
+# and on the leader's timeline.
+echo "  Waiting for the demoted node to rejoin on the new timeline (up to 300s)..."
+rejoined=fail
+for _ in $(seq 1 60); do
+  c=$(api_body GET /v1/cluster)
+  self_ok=$(jq -r '[.members[] | select(.self==true) | .reachable, .timelineKnown, (.role=="standby")] | all' <<< "${c}" 2>/dev/null || echo false)
+  self_tl=$(jq -r '.members[] | select(.self==true) | .timeline' <<< "${c}" 2>/dev/null || echo x)
+  lead_tl=$(jq -r --arg l "${CANDIDATE}" '.members[] | select(.name==$l) | .timeline' <<< "${c}" 2>/dev/null || echo y)
+  if [ "${self_ok}" = "true" ] && [ -n "${self_tl}" ] && [ "${self_tl}" = "${lead_tl}" ]; then
+    rejoined=ok; break
+  fi
+  sleep 5
+done
+assert_eq "the demoted node rejoined on the primary's timeline" "ok" "${rejoined}"
+
+# The assertion that matters: the answering pod is NOT the primary, and the candidate is the
+# answering pod itself. Measuring against the answering pod would make this comparison
+# self-referential and meaningless; measuring against the lease holder is what makes it real.
+back_code=$(api_code POST /v1/switchover "{\"leader\":\"${CANDIDATE}\",\"candidate\":\"${LEADER}\"}")
+assert_eq "a switchover requested through a standby is accepted (202)" "202" "${back_code}"
+
+echo "  Waiting for leadership to move back to ${LEADER} (up to 300s)..."
+BACK_LEADER=""
+for _ in $(seq 1 60); do
+  BACK_LEADER=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)
+  [[ "${BACK_LEADER}" == "${LEADER}" ]] && break
+  sleep 5
+done
+assert_eq "the request made through a standby really moved leadership" "${LEADER}" "${BACK_LEADER}"
+
 end_suite
 print_summary

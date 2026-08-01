@@ -94,11 +94,25 @@ type fakePostmaster struct {
 	stopMode process.StopMode
 	reloaded bool
 	running  bool
+	// stopErr, when set, is what Stop returns -- context.DeadlineExceeded stands in for
+	// the real postmaster's deadline-forced SIGKILL. deadOnStop clears running the way a
+	// killed-and-reaped child does; without it the child is still alive after the failure.
+	stopErr            error
+	deadOnStop         bool
+	stopCtxHadDeadline bool
 }
 
 func (f *fakePostmaster) Start(context.Context) error { f.started = true; return nil }
-func (f *fakePostmaster) Stop(_ context.Context, m process.StopMode) error {
+func (f *fakePostmaster) Stop(ctx context.Context, m process.StopMode) error {
 	f.stopped, f.stopMode = true, m
+	_, f.stopCtxHadDeadline = ctx.Deadline()
+	if f.stopErr != nil {
+		if f.deadOnStop {
+			f.running = false
+		}
+		return f.stopErr
+	}
+	f.running = false
 	return nil
 }
 func (f *fakePostmaster) Reload(context.Context) error { f.reloaded = true; return nil }

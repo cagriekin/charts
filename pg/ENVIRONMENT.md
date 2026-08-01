@@ -84,7 +84,22 @@ refuses to boot rather than open an unauthenticated mutating port.
 
 The restore outcome record the API reads back as `lastRestore` is not an env var: it is
 `<dirname of PGDATA>/pgbackrest-restore.status`, written by the chart's `restore.sh` onto
-the data volume so it outlives the Job.
+the data volume so it outlives the Job. The agent **removes** it when the data directory
+stops being what it describes — a `POST /v1/reinitialize` wipe, or a clone by the reconcile
+loop — so it never reports a backup set as the provenance of data cloned from a peer.
+
+Two runtime behaviours worth knowing before an incident:
+
+- With `CONTROL_RESTORE_ENABLED`, **`POST /v1/resume` reads the restore Job on every call**
+  and fails closed: a transient apiserver error answers `502` and the cluster stays paused
+  (so no failover) until the read succeeds. That is deliberate — resuming while pgbackrest
+  is rewriting the data directory is the worse outcome — but it does make resume depend on
+  the apiserver, which it does not when restore is off.
+- A control listener that **fails at startup is fatal** (the agent will not run with a
+  silently missing API), but one that dies *later* is logged and not retried: HA is left
+  intact rather than taking the database down with the API. The asymmetry means a healthy
+  cluster can be serving with no control surface, so alert on
+  `pg_ha_agent_control_requests_total` going flat if you automate against the API.
 
 ### etcd backend only (`repmgr.agent.dcs.backend=etcd`)
 

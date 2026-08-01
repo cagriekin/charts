@@ -424,6 +424,10 @@ func writeErr(w http.ResponseWriter, status int, msg, hint string) {
 // decodeBody reads a JSON body into v, rejecting unknown fields so a typo in a
 // destructive request (`"forced": true`) fails loudly instead of silently defaulting
 // the field it was meant to set. An empty body is accepted as an empty object.
+//
+// Anything after the object is rejected too: `{"force":true} {"force":false}` would
+// otherwise decode the first and discard the rest without a word, which is the same class
+// of silent misreading DisallowUnknownFields exists to prevent.
 func decodeBody(r *http.Request, v any) error {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
@@ -432,6 +436,9 @@ func decodeBody(r *http.Request, v any) error {
 			return nil
 		}
 		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("invalid JSON body: unexpected content after the JSON object")
 	}
 	return nil
 }

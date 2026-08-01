@@ -219,7 +219,6 @@ type Progress struct {
 	Percent   float64 `json:"percent"`
 	PercentOK bool    `json:"percentKnown"`
 	FilesSeen int     `json:"filesSeen"`
-	Truncated bool    `json:"truncated,omitempty"`
 }
 
 // ParseProgress extracts progress from a restore log. It takes the LAST percentage

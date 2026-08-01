@@ -403,7 +403,7 @@ equivalent, so nothing you learn about one is wasted on the other.
 | `GET /v1/status` | this pod | Role, timeline, LSN, lease holder, pause/switchover intents (read fresh), WAL-replay progress, and the last restore recorded on this data volume |
 | `GET /v1/cluster` | this pod's view | Every member's position, plus the reconcile loop's latest decision and its reason |
 | `POST /v1/pause` / `POST /v1/resume` | cluster | Maintenance mode; idempotent, and it warns when the cluster is already degraded |
-| `POST /v1/switchover` | cluster | Handoff request, **rejected up front** unless the candidate is a reachable, same-timeline standby and the cluster is not paused |
+| `POST /v1/switchover` | cluster | Handoff request, **rejected up front** unless the candidate is a reachable standby on the **current primary's** timeline and the cluster is not paused |
 | `DELETE /v1/switchover` | cluster | Cancel a pending request |
 | `POST /v1/restart` / `POST /v1/reload` | this pod | Restart or SIGHUP the supervised postmaster, via the reconcile loop |
 | `POST /v1/reinitialize` | this pod | **Replica only.** Discard this standby's data directory so the loop re-clones it from the primary |
@@ -453,10 +453,25 @@ if in-cluster automation calls it too.
 **diagnostic output, not a stable contract** — action names and wording change without a
 version bump.
 
+The switchover preflight measures the candidate against the **lease holder**, not against
+the pod you happen to be talking to. That matters because there is no control Service: a
+call addressed to a standby that is itself behind on timelines would otherwise refuse valid
+candidates and, worse, accept one on the stale timeline. If the primary is not visible in
+the answering pod's view of the cluster, the request is refused rather than measured
+against a substitute.
+
 New metrics on the read-only port: `pg_ha_agent_control_requests_total`,
 `_control_rejected_total`, `_control_intents_total`, `_control_restore_requests_total`.
 A refused control call is therefore alertable without exposing the control port to your
 scraper.
+
+**If the API dies, the database does not.** A control listener that cannot be constructed
+at startup is fatal — you never get a running agent with a silently missing API — but one
+that fails *later* is logged and not restarted, on the grounds that HA should survive the
+loss of its management surface. The asymmetry is easy to miss during an incident: a healthy,
+serving cluster can have no control port at all. If you automate against the API, alert on
+`pg_ha_agent_control_requests_total` going flat rather than assuming an unreachable port
+means the pod is down.
 
 #### Rebuilding a broken standby — `POST /v1/reinitialize`
 
@@ -580,7 +595,24 @@ clear your pause on its own, and `nextSteps` lists the resume as an explicit ste
 **But not before the restore finishes.** `POST /v1/resume` is refused with 409 while the
 restore Job is `pending` or `running`: resuming then would let the loop start PostgreSQL on
 a data directory pgbackrest is still rewriting. Wait for `GET /v1/restore` to report
-`succeeded` (or `failed`), or abandon the restore with `DELETE /v1/restore` first.
+`succeeded` (or `failed`), or abandon the restore with `DELETE /v1/restore` first. The same
+interlock guards `POST /v1/reinitialize`.
+
+Two limits on that interlock, both worth knowing before you rely on it:
+
+- **It sees only the Job the API creates** (`<release>-pg-pgbackrest-restore-api`). A
+  restore you started the kubectl way —
+  `kubectl create job --from=cronjob/<release>-pg-pgbackrest-restore restore-now` — carries
+  a different name, and finding it would need `list jobs`, which this chart deliberately
+  does not grant. So **do not mix the two paths**: if you trigger a restore with kubectl,
+  clear the pause with kubectl too, and do not use `POST /v1/resume` or
+  `POST /v1/reinitialize` until the Job is done. The same applies in reverse — clearing the
+  pause with `kubectl annotate ... pg-ha/pause-` bypasses the check the API would have made.
+- **It fails closed**, so with restore enabled a transient apiserver error makes
+  `POST /v1/resume` answer `502` and the cluster stays paused (and therefore will not fail
+  over) until the Job read succeeds. Deliberate — the alternative is starting PostgreSQL on
+  a directory that may still be being rewritten — but it is a runtime dependency resume does
+  not otherwise have.
 
 ```bash
 curl -X POST ... -d '{}' https://127.0.0.1:9201/v1/pause
@@ -619,7 +651,9 @@ Progress, honestly:
   post-restore control-file state, who requested it — read from a record `restore.sh`
   writes onto the data volume. It outlives the Job and its logs, so it answers "what
   happened to my restore?" later, and doubles as provenance for where this PGDATA came
-  from.
+  from. The agent removes that record when the directory stops being what it describes (a
+  `POST /v1/reinitialize` wipe, or a clone by the reconcile loop), so a rebuilt replica
+  never reports a backup set as the origin of data it streamed from the primary.
 - Live file-copy percentage is available only via `restore.readPodLogs: true`, which adds
   `get pods/log` **namespace-wide** (the Job's pod name is generated, so it cannot be
   scoped) and only helps when some agent is still running, i.e. `podOrdinal > 0`. Off by

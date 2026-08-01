@@ -345,7 +345,7 @@ func (a *agent) run() {
 			// read as a fault. Handling it in the select (rather than draining once per
 			// tick) also keeps a restart/reload responsive instead of waiting out an
 			// interval.
-			req.done <- a.runIntent(ctx, req.kind)
+			req.done <- a.runIntent(ctx, req)
 		}
 	}
 }
@@ -700,6 +700,9 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			if err := a.mech.ReclonePreserving(ctx, a.peerMechConn(dec.Target)); err != nil {
 				return err
 			}
+			// A full re-clone: this directory's contents now come from the peer, not from
+			// whatever restore the record beside it describes.
+			a.dropRestoreRecord("the data directory was re-cloned from " + dec.Target)
 		}
 		return a.sup.Start(ctx)
 
@@ -707,6 +710,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if err := a.mech.Clone(ctx, a.peerMechConn(dec.Target)); err != nil {
 			return err
 		}
+		a.dropRestoreRecord("the data directory was cloned from " + dec.Target)
 		return a.sup.Start(ctx)
 
 	case reconcile.ReleaseLease:

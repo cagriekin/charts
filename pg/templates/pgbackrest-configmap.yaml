@@ -272,7 +272,10 @@ data:
     write_status() {
       local code="$1"
       local tt="${TARGET_TYPE:-}" tg="${TARGET:-}" bs="${BACKUP_SET:-}" started="${STARTED_AT}"
-      local attempted=""
+      # Kept as three separate variables rather than one packed string: TARGET is
+      # operator- or API-supplied, so any in-band delimiter would be a value that
+      # corrupts the record.
+      local att_tt="" att_tg="" att_bs="" failed=""
       if [ "${code}" != "0" ]; then
         # A FAILED attempt must not become this directory's provenance. Many failures
         # (unreachable repo, bad cipher pass, invalid --target, missing --set) copy nothing
@@ -280,7 +283,7 @@ data:
         # while claiming the mistyped target instead. Keep the previous record's descriptive
         # fields and report what was attempted separately; exitCode still marks it failed,
         # so nothing reads it as a clean restore.
-        attempted="${tt}|${tg}|${bs}"
+        att_tt="${tt}" att_tg="${tg}" att_bs="${bs}" failed="yes"
         tt="$(prev_field targetType)"
         tg="$(prev_field target)"
         bs="$(prev_field backupSet)"
@@ -299,10 +302,10 @@ data:
         echo "requestedBy=${RESTORE_REQUESTED_BY:-}"
         echo "clusterState=${CLUSTER_STATE}"
         echo "checkpoint=${CHECKPOINT}"
-        if [ -n "${attempted}" ]; then
-          echo "attemptedTargetType=${attempted%%|*}"
-          echo "attemptedTarget=$(echo "${attempted}" | cut -d'|' -f2)"
-          echo "attemptedBackupSet=${attempted##*|}"
+        if [ -n "${failed}" ]; then
+          echo "attemptedTargetType=${att_tt}"
+          echo "attemptedTarget=${att_tg}"
+          echo "attemptedBackupSet=${att_bs}"
         fi
       } > "${STATUS_FILE}.tmp" 2>/dev/null && mv -f "${STATUS_FILE}.tmp" "${STATUS_FILE}" || \
         echo "WARNING: could not record the restore outcome to ${STATUS_FILE}" >&2

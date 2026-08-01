@@ -160,6 +160,30 @@
 - The control server's response-write deadline is derived from the request budget instead of
   being a fixed 90s, so a long intent on a release with a wide reconcile interval returns
   its 504 or 200 rather than a dropped connection.
+- The switchover preflight compares the candidate's timeline against the **lease holder**
+  rather than against whichever pod answered the call. There is no control Service, so a
+  request addressed to a standby that was itself behind on timelines would refuse a valid
+  candidate and — the dangerous half — accept one on the stale timeline, yielding a `202`
+  the loop then silently sat on. An unreadable primary timeline, an invisible lease holder
+  and a cluster with no lease holder are now all refusals instead of a skipped comparison.
+- Node-local operations now run under the **request's** deadline instead of the agent's
+  process-lifetime context. A postmaster that ignored SIGINT would otherwise hold the
+  operation mutex indefinitely: the reconcile loop stops ticking and the leadership fence
+  blocks behind the same mutex, so a node that comes back read-write is never demoted. The
+  stop now escalates to SIGKILL exactly as the fence path does; a restart still brings
+  PostgreSQL back up afterwards, while a forced stop for a restore is reported as a failure
+  (SIGKILL leaves the `postmaster.pid` that guards the data directory).
+- The `lastRestore` record is removed when the data directory stops being what it describes
+  — a reinitialize wipe, or a clone by the reconcile loop. It lives beside PGDATA so it can
+  outlive the restore Job, which meant a wipe could not reach it and a rebuilt replica went
+  on reporting a backup set as the provenance of data streamed from the primary.
+- `restore.sh` keeps the attempted recovery point in separate variables instead of packing
+  it into one `|`-delimited string, so an operator- or API-supplied target containing that
+  character no longer corrupts the failure record.
+- Request bodies with trailing content after the JSON object (`{"force":true} {...}`) are
+  rejected rather than silently half-read, matching the existing unknown-field strictness.
+- Dropped `truncated` from the restore-progress payload: nothing ever set it, so it
+  advertised a signal the agent does not produce.
 
 ### Changed
 

@@ -370,7 +370,20 @@ func (s *Server) handleSwitchover(w http.ResponseWriter, r *http.Request) (int, 
 			"members are listed by GET /v1/cluster")
 		return http.StatusBadRequest, "unknown candidate"
 	}
-	if reason, ok := candidateUnready(snap, cand); !ok {
+	if snap.LeaseHolder == "" {
+		writeErr(w, http.StatusConflict,
+			"this cluster currently has no lease holder, so there is no primary to hand the role over from",
+			"wait for a leader (GET /v1/cluster), or check whether the cluster is paused")
+		return http.StatusConflict, "no leader"
+	}
+	ref, refOK := switchoverReference(snap)
+	if !refOK {
+		writeErr(w, http.StatusConflict,
+			fmt.Sprintf("the lease holder %q is not in this pod's view of the cluster, so the candidate cannot be checked against the primary's timeline", snap.LeaseHolder),
+			"re-read GET /v1/cluster, or address this call to a pod that can see the primary")
+		return http.StatusConflict, "leader not visible"
+	}
+	if reason, ok := candidateUnready(ref, cand); !ok {
 		writeErr(w, http.StatusConflict,
 			fmt.Sprintf("%s cannot take over: %s", req.Candidate, reason),
 			"the primary only steps down for a reachable, same-timeline standby that is caught up")
@@ -404,14 +417,30 @@ func findMember(snap Snapshot, name string) (MemberState, bool) {
 	return MemberState{}, false
 }
 
-// candidateUnready mirrors the loop's switchover gate: a reachable, same-timeline
-// standby. It reports the FIRST failing condition in the operator's terms.
+// switchoverReference returns the member a candidate must be measured against: the
+// current lease holder, i.e. the node that will actually step down.
+//
+// It is deliberately NOT this pod. The loop's own switchover gate compares against the
+// primary because there the local node IS the lease holder, but this API can be
+// addressed to any member -- and a standby still on the previous timeline would both
+// refuse valid candidates ("it is on timeline N but this node is on N-1") and admit
+// divergent ones, which is exactly the silent no-op the preflight exists to prevent.
+func switchoverReference(snap Snapshot) (MemberState, bool) {
+	if snap.LeaseHolder == "" {
+		return MemberState{}, false
+	}
+	return findMember(snap, snap.LeaseHolder)
+}
+
+// candidateUnready mirrors the loop's switchover gate: a reachable standby on the
+// primary's timeline. ref is the current lease holder (see switchoverReference); it
+// reports the FIRST failing condition in the operator's terms.
 //
 // It deliberately checks position but not an exact LSN equality: replication is
 // moving, so a byte-exact comparison here would be stale by the time the primary
 // acts. The loop re-checks at the moment of handoff; this catches the cases that
 // cannot resolve on their own (wrong role, unreachable, divergent timeline).
-func candidateUnready(snap Snapshot, cand MemberState) (string, bool) {
+func candidateUnready(ref, cand MemberState) (string, bool) {
 	switch {
 	case cand.Gossip || !cand.Reachable:
 		return "it is not reachable from this pod", false
@@ -419,8 +448,13 @@ func candidateUnready(snap Snapshot, cand MemberState) (string, bool) {
 		return fmt.Sprintf("its role is %q, not standby", cand.Role), false
 	case !cand.TimelineOK:
 		return "its timeline could not be read", false
-	case snap.Local.TimelineOK && cand.Timeline != snap.Local.Timeline:
-		return fmt.Sprintf("it is on timeline %d but this node is on %d", cand.Timeline, snap.Local.Timeline), false
+	case !ref.TimelineOK:
+		// Refuse rather than skip the comparison: without the primary's timeline a
+		// divergent candidate cannot be ruled out, and accepting one yields a 202 the
+		// loop then silently sits on.
+		return fmt.Sprintf("the timeline of the primary %s could not be read, so a divergent candidate cannot be ruled out", ref.Name), false
+	case cand.Timeline != ref.Timeline:
+		return fmt.Sprintf("it is on timeline %d but the primary %s is on %d", cand.Timeline, ref.Name, ref.Timeline), false
 	}
 	return "", true
 }
