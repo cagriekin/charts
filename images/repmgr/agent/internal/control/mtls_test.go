@@ -393,11 +393,15 @@ func TestTLSMaterialIsReloadedOnRotation(t *testing.T) {
 
 	// Rotate: the mounted ca.crt now carries both CAs (what a CA roll looks like).
 	both := append(append([]byte{}, ca.pem...), rotated.pem...)
-	// Ensure the modification time actually differs on filesystems with coarse mtimes.
-	if err := os.Chtimes(o.CAFile, time.Now().Add(time.Second), time.Now().Add(time.Second)); err != nil {
+	if err := os.WriteFile(o.CAFile, both, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(o.CAFile, both, 0o600); err != nil {
+	// AFTER the write: WriteFile sets mtime to now, so bumping it beforehand would be
+	// discarded and the test would pass only because the bundle's size differs. Setting it
+	// afterwards is what makes this exercise mtime-based detection on filesystems with
+	// coarse timestamps.
+	future := time.Now().Add(time.Second)
+	if err := os.Chtimes(o.CAFile, future, future); err != nil {
 		t.Fatal(err)
 	}
 

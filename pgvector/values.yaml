@@ -372,9 +372,10 @@ repmgr:
       # explicitly. Required when enabled: a render guard fails the release without it,
       # so you cannot end up with an unauthenticated mutating port.
       #
-      # The server certificate needs SANs for however you reach the pods -- the
-      # headless pod FQDNs (<release>-pg-0.<release>-pg-headless.<ns>.svc) for in-cluster
-      # clients, and 127.0.0.1/localhost if you use port-forward. TLS 1.3 is required.
+      # The server certificate needs SANs for however you reach the pods -- the headless
+      # pod FQDNs, which in THIS chart are named after pgvector
+      # (<release>-pgvector-0.<release>-pgvector-headless.<ns>.svc), for in-cluster clients,
+      # and 127.0.0.1/localhost if you use port-forward. TLS 1.3 is required.
       tls:
         existingSecret: ""
       # Optional client-CN allowlist for every control route. Empty means "any

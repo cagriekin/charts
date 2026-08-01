@@ -463,14 +463,23 @@ func (s *Server) handleIntent(kind IntentKind) func(http.ResponseWriter, *http.R
 		snap := s.o.Node.Snapshot()
 		// Restarting the serving primary is a write outage. Require an explicit force
 		// so it cannot be the result of a fat-fingered pod name plus a default.
-		// Live lease read, not the snapshot's copy: during startup (before the first tick)
-		// the cached HoldsLease is false, which would let an unforced restart through on
-		// the serving primary -- the exact case this interlock exists for.
-		if kind == IntentRestart && !req.Force && s.o.Node.HoldsLeaseNow() && snap.Local.Running && snap.Local.Role == "primary" {
-			writeErr(w, http.StatusConflict,
-				"this pod is the serving primary: restarting it interrupts writes",
-				`pass {"force":true} to proceed, and consider POST /v1/pause first so the restart is not read as a failure`)
-			return http.StatusConflict, "primary without force"
+		// The lease is read LIVE, and the rest of the condition must not be able to skip
+		// the interlock just because the snapshot has not been published yet: before the
+		// first tick Running is false and Role is "", so an all-zero snapshot would let an
+		// unforced restart through on the serving primary -- exactly what this prevents.
+		// So while the lease is held, require force unless the snapshot POSITIVELY shows
+		// this node is not a running primary.
+		if kind == IntentRestart && !req.Force && s.o.Node.HoldsLeaseNow() {
+			roleUnknown := snap.ObservedAt.IsZero()
+			if roleUnknown || (snap.Local.Running && snap.Local.Role == "primary") {
+				hint := `pass {"force":true} to proceed, and consider POST /v1/pause first so the restart is not read as a failure`
+				msg := "this pod is the serving primary: restarting it interrupts writes"
+				if roleUnknown {
+					msg = "this pod holds the leader lease and has not completed its first reconcile tick, so it may be the serving primary"
+				}
+				writeErr(w, http.StatusConflict, msg, hint)
+				return http.StatusConflict, "primary without force"
+			}
 		}
 		ctx, cancel := contextWithTimeout(r, s.o.IntentTimeout)
 		defer cancel()
@@ -500,7 +509,11 @@ func (s *Server) handleIntent(kind IntentKind) func(http.ResponseWriter, *http.R
 // It fails CLOSED on a read error: not being able to tell whether a restore is running is
 // not evidence that none is.
 func (s *Server) checkNoRestoreInFlight(w http.ResponseWriter, r *http.Request, what string) (int, string, bool) {
-	if s.o.Backups == nil {
+	// Only meaningful when restore triggering is ON: the Job this looks for is the one the
+	// API creates, and the `get jobs` grant that reads it is rendered only under
+	// control.restore.enabled. Calling it otherwise would fail closed on an RBAC error and
+	// break resume outright for every release that has pgbackrest enabled but restore off.
+	if s.o.Backups == nil || !s.o.Backups.RestoreEnabled() {
 		return 0, "", true
 	}
 	v, err := s.o.Backups.RestoreStatus(r.Context())

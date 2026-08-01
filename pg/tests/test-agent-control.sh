@@ -244,7 +244,14 @@ assert_eq "status reports the pod it was served by" "${LEADER}" "$(jq -r '.node'
 assert_eq "status reports the cluster name" "${FULLNAME}" "$(jq -r '.cluster' <<< "${status}")"
 assert_eq "status reports this pod holds the lease" "true" "$(jq -r '.holdsLease' <<< "${status}")"
 assert_eq "status reports the local role" "primary" "$(jq -r '.local.role' <<< "${status}")"
-assert_eq "status reports the PostgreSQL major" "18" "$(jq -r '.pgMajor' <<< "${status}")"
+# Never hardcode the major: this suite runs on every major in the CI matrix, and
+# set-pg-major.sh retargets the image/values fixtures but cannot rewrite an assertion.
+# Compare against what the chart actually rendered into the pod, which is the real contract
+# (the API reports the major its image bundles).
+pod_major=$(kubectl get pod -n "${NAMESPACE}" "${LEADER}" \
+  -o jsonpath='{.spec.containers[?(@.name=="postgresql")].env[?(@.name=="PG_MAJOR")].value}' 2>/dev/null || true)
+assert_contains "the chart rendered a PG_MAJOR for the agent" "${pod_major}" "1"
+assert_eq "status reports the PostgreSQL major the chart rendered" "${pod_major}" "$(jq -r '.pgMajor' <<< "${status}")"
 # The observation age lets a client judge the freshness of a cached snapshot.
 age_ok=$(jq -r 'if .observationAgeSeconds != null then "ok" else "missing" end' <<< "${status}")
 assert_eq "status reports the observation age" "ok" "${age_ok}"
@@ -401,7 +408,16 @@ done
 assert_eq "the standby was re-cloned and has the data again" "1" "${recloned}"
 in_recovery=$(pg_exec "${NAMESPACE}" "${CANDIDATE}" "SELECT pg_is_in_recovery()" 2>/dev/null | tr -d '[:space:]' || echo "")
 assert_eq "the rebuilt node is a standby again" "t" "${in_recovery}"
-reinit_status=$(api_body GET /v1/status)
+# The API serves a snapshot refreshed once per reconcile tick, so a rebuild that SQL has
+# already confirmed is not necessarily published yet -- poll for convergence rather than
+# asserting on the instant the clone landed.
+reinit_status=""
+for _ in $(seq 1 24); do
+  reinit_status=$(api_body GET /v1/status)
+  [ "$(jq -r '.local.role' <<< "${reinit_status}")" = "standby" ] && \
+    [ "$(jq -r '.local.hasData' <<< "${reinit_status}")" = "true" ] && break
+  sleep 5
+done
 assert_eq "its API reports the standby role" "standby" "$(jq -r '.local.role' <<< "${reinit_status}")"
 assert_eq "its API reports it has data" "true" "$(jq -r '.local.hasData' <<< "${reinit_status}")"
 
