@@ -36,6 +36,7 @@ func (s *Server) routeTable() []route {
 		{http.MethodDelete, "/v1/switchover", VerbControl, false, s.handleSwitchoverCancel},
 		{http.MethodPost, "/v1/restart", VerbControl, false, s.handleIntent(IntentRestart)},
 		{http.MethodPost, "/v1/reload", VerbControl, false, s.handleIntent(IntentReload)},
+		{http.MethodPost, "/v1/reinitialize", VerbControl, false, s.handleReinitialize},
 
 		{http.MethodGet, "/v1/backups", VerbObserve, false, s.handleBackups},
 		{http.MethodGet, "/v1/restore", VerbObserve, false, s.handleRestoreStatus},
@@ -491,4 +492,99 @@ func (s *Server) checkNode(w http.ResponseWriter, node string) (int, string, boo
 		return http.StatusConflict, "node mismatch", false
 	}
 	return 0, "", true
+}
+
+// handleReinitialize discards this replica's data directory so the reconcile loop rebuilds
+// it from the lease holder. It is the recovery path for a standby that cannot rejoin on its
+// own -- a diverged timeline, a corrupt local copy -- and it replaces the manual "delete the
+// PVC and the pod" runbook.
+//
+// Three things make it safe to expose:
+//
+// REPLICA ONLY. It refuses on the lease holder. Wiping the primary's data would discard the
+// cluster's only copy of committed writes; that is what POST /v1/restore is for, and it has
+// its own confirmations and its own authz verb. This node's own view is not trusted for the
+// check -- the marker/lease are read fresh -- because a stale snapshot claiming "I am a
+// standby" is exactly the case that would be catastrophic.
+//
+// NOT WHILE PAUSED. Maintenance mode makes the loop a no-op, so a wipe would leave the
+// replica empty and stopped with nothing to rebuild it, until someone resumed. Refusing is
+// better than a cluster that quietly lost a replica.
+//
+// FORCE REQUIRED, and the pod must be named -- it destroys data, even if it is data that
+// can be rebuilt from the primary.
+//
+// It returns 202: the wipe is immediate but the clone that follows takes as long as the
+// database is big, and it is the loop that performs it. Progress is GET /v1/status
+// (local.hasData, then local.role) and GET /v1/cluster.
+func (s *Server) handleReinitialize(w http.ResponseWriter, r *http.Request) (int, string) {
+	var req nodeRequest
+	if err := decodeBody(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error(), `body: {"node":"<this pod>","force":true}`)
+		return http.StatusBadRequest, "bad body"
+	}
+	if status, detail, ok := s.checkNode(w, req.Node); !ok {
+		return status, detail
+	}
+	if !req.Force {
+		writeErr(w, http.StatusBadRequest, "force must be true",
+			fmt.Sprintf("this DISCARDS the data directory on %s and re-clones it from the primary; there is no dry-run", s.o.PodName))
+		return http.StatusBadRequest, "force not set"
+	}
+
+	// Fresh reads for both gates: a cached "I am a standby" is the one error that would
+	// make this destroy the cluster's only copy of its data.
+	m, err := s.o.Cluster.Marker(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "could not read the marker: "+err.Error(),
+			"the replica-only and pause checks cannot be verified, so nothing was changed")
+		return http.StatusBadGateway, "marker read failed"
+	}
+	if m.Paused {
+		writeErr(w, http.StatusConflict, "cluster is paused: the re-clone would not start",
+			"while paused the reconcile loop takes no action, so this would leave the replica empty and stopped. POST /v1/resume first")
+		return http.StatusConflict, "paused"
+	}
+	snap := s.o.Node.Snapshot()
+	if snap.HoldsLease {
+		writeErr(w, http.StatusConflict,
+			fmt.Sprintf("%s holds the leader lease: reinitialize is replica-only", s.o.PodName),
+			"wiping the primary would discard the cluster's only copy of committed data. Hand the primary role to another pod with POST /v1/switchover first, or use POST /v1/restore to recover the primary from a backup")
+		return http.StatusConflict, "holds lease"
+	}
+	if snap.Local.Role == "primary" {
+		// Running read-write without the lease is a fenced/split-brain shape the loop is
+		// about to resolve; do not race it with a destructive local action.
+		writeErr(w, http.StatusConflict,
+			"this node is running read-write without holding the lease",
+			"the reconcile loop is about to demote or fence it; retry once GET /v1/status reports a standby role")
+		return http.StatusConflict, "read-write without lease"
+	}
+
+	id := identityFrom(r.Context())
+	ictx, cancel := contextWithTimeout(r, s.o.IntentTimeout)
+	defer cancel()
+	s.o.Metrics.IncControlIntent()
+	if err := s.o.Node.Submit(ictx, IntentReinitialize); err != nil {
+		if ictx.Err() != nil {
+			writeErr(w, http.StatusGatewayTimeout,
+				fmt.Sprintf("reinitialize did not complete within %s", s.o.IntentTimeout),
+				"the data directory may already have been discarded; check GET /v1/status")
+			return http.StatusGatewayTimeout, "reinitialize timed out"
+		}
+		writeErr(w, http.StatusInternalServerError, "reinitialize failed: "+err.Error(),
+			"the data directory was left as it was unless the error says otherwise")
+		return http.StatusInternalServerError, "reinitialize failed"
+	}
+	s.o.Log.Warn("control: replica data directory discarded for a re-clone",
+		"node", s.o.PodName, "client_cn", id.CN, "client_fingerprint", id.Fingerprint)
+	writeJSON(w, http.StatusAccepted, actionResponse{
+		Result: "reinitializing", Node: s.o.PodName,
+		Message: "the data directory is discarded; the reconcile loop re-clones from the lease holder on its next tick",
+		Notes: []string{
+			"watch GET /v1/status: local.hasData goes true when the clone lands, then local.role becomes standby",
+			"the clone takes as long as the database is large; nothing further is needed from you",
+		},
+	})
+	return http.StatusAccepted, "reinitialize"
 }

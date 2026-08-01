@@ -631,3 +631,127 @@ func TestReadResponsesAreNotCached(t *testing.T) {
 }
 
 var _ = io.Discard
+
+// --- reinitialize (#276 phase 2) ---
+
+// The gate that matters: wiping the primary would discard the cluster's only copy of
+// committed data. reinitialize is replica-only, and the check reads the lease state rather
+// than trusting a role string.
+func TestReinitializeRefusedOnTheLeaseHolder(t *testing.T) {
+	h := newHarness(t, nil) // healthySnapshot holds the lease and is primary
+	rec := h.do("POST", "/v1/reinitialize", `{"node":"pg-0","force":true}`, "ops")
+	wantCode(t, rec, 409)
+	if !strings.Contains(rec.Body.String(), "replica-only") {
+		t.Errorf("the error should say why: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "/v1/switchover") || !strings.Contains(rec.Body.String(), "/v1/restore") {
+		t.Errorf("it should point at the two legitimate alternatives: %s", rec.Body.String())
+	}
+	if len(h.nd.submitted) != 0 {
+		t.Error("nothing may be submitted for the primary")
+	}
+}
+
+// Running read-write without the lease is a fenced/split-brain shape the loop is about to
+// resolve; a destructive local action must not race it.
+func TestReinitializeRefusedWhenReadWriteWithoutLease(t *testing.T) {
+	h := newHarness(t, nil)
+	h.nd.snap.HoldsLease = false // still Role == "primary"
+	rec := h.do("POST", "/v1/reinitialize", `{"node":"pg-0","force":true}`, "ops")
+	wantCode(t, rec, 409)
+	if len(h.nd.submitted) != 0 {
+		t.Error("nothing may be submitted")
+	}
+}
+
+// A paused loop performs no clone, so a wipe would leave the replica empty and stopped.
+func TestReinitializeRefusedWhilePaused(t *testing.T) {
+	h := newHarness(t, nil)
+	h.nd.snap.HoldsLease = false
+	h.nd.snap.Local.Role = "standby"
+	h.cl.marker.Paused = true
+	rec := h.do("POST", "/v1/reinitialize", `{"node":"pg-0","force":true}`, "ops")
+	wantCode(t, rec, 409)
+	if !strings.Contains(rec.Body.String(), "/v1/resume") {
+		t.Errorf("the error should name the fix: %s", rec.Body.String())
+	}
+	if len(h.nd.submitted) != 0 {
+		t.Error("nothing may be submitted while paused")
+	}
+}
+
+func TestReinitializeRequiresForceAndNode(t *testing.T) {
+	standby := func() *harness {
+		h := newHarness(t, nil)
+		h.nd.snap.HoldsLease = false
+		h.nd.snap.Local.Role = "standby"
+		return h
+	}
+	h := standby()
+	wantCode(t, h.do("POST", "/v1/reinitialize", `{"node":"pg-0"}`, "ops"), 400)
+	wantCode(t, standby().do("POST", "/v1/reinitialize", `{"force":true}`, "ops"), 400)
+	// Addressed to another pod: refused, like every other node-local verb.
+	wantCode(t, standby().do("POST", "/v1/reinitialize", `{"node":"pg-1","force":true}`, "ops"), 409)
+	if len(h.nd.submitted) != 0 {
+		t.Error("nothing may be submitted")
+	}
+}
+
+func TestReinitializeOnAStandbySubmitsTheIntent(t *testing.T) {
+	h := newHarness(t, nil)
+	h.nd.snap.HoldsLease = false
+	h.nd.snap.Local.Role = "standby"
+	rec := h.do("POST", "/v1/reinitialize", `{"node":"pg-0","force":true}`, "ops")
+	wantCode(t, rec, 202)
+	if len(h.nd.submitted) != 1 || h.nd.submitted[0] != IntentReinitialize {
+		t.Fatalf("submitted = %v, want one IntentReinitialize", h.nd.submitted)
+	}
+	resp := decode[actionResponse](t, rec)
+	if resp.Result != "reinitializing" || resp.Node != "pg-0" {
+		t.Errorf("bad response: %+v", resp)
+	}
+	// The clone is the loop's job and takes as long as the data is big, so the response
+	// must say how to watch it rather than implying completion.
+	if len(resp.Notes) == 0 || !strings.Contains(strings.Join(resp.Notes, " "), "hasData") {
+		t.Errorf("notes should explain how to watch the re-clone: %v", resp.Notes)
+	}
+}
+
+// A marker read failure must not be treated as "not paused, not the leader".
+func TestReinitializeFailsClosedWhenTheMarkerIsUnreadable(t *testing.T) {
+	h := newHarness(t, nil)
+	h.nd.snap.HoldsLease = false
+	h.nd.snap.Local.Role = "standby"
+	h.cl.markerErr = errors.New("apiserver unreachable")
+	rec := h.do("POST", "/v1/reinitialize", `{"node":"pg-0","force":true}`, "ops")
+	wantCode(t, rec, 502)
+	if len(h.nd.submitted) != 0 {
+		t.Error("an unverifiable precondition must not proceed")
+	}
+}
+
+func TestReinitializeIsListedAndMethodGuarded(t *testing.T) {
+	h := newHarness(t, nil)
+	rec := h.do("GET", "/v1/nope", "", "ops")
+	if !strings.Contains(rec.Body.String(), "/v1/reinitialize") {
+		t.Errorf("the route list should include reinitialize: %s", rec.Body.String())
+	}
+	if got := h.do("GET", "/v1/reinitialize", "", "ops").Code; got != http.StatusMethodNotAllowed {
+		t.Errorf("GET /v1/reinitialize = %d, want 405", got)
+	}
+}
+
+// hasData/running are what a client polls while a reinitialize re-clone runs, so `false`
+// must be REPORTED, not omitted -- otherwise "no data yet" and "field absent" look alike.
+func TestMemberBooleansAreAlwaysReported(t *testing.T) {
+	h := newHarness(t, nil)
+	h.nd.snap.Local.HasData = false
+	h.nd.snap.Local.Running = false
+	h.nd.snap.Local.Reachable = false
+	body := h.do("GET", "/v1/status", "", "ops").Body.String()
+	for _, want := range []string{`"hasData": false`, `"running": false`, `"reachable": false`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("status body should contain %s:\n%s", want, body)
+		}
+	}
+}

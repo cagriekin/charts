@@ -10,6 +10,7 @@ import (
 	"github.com/cagriekin/pg-ha-agent/internal/k8s"
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
 	"github.com/cagriekin/pg-ha-agent/internal/pgbackrest"
+	"github.com/cagriekin/pg-ha-agent/internal/process"
 	"github.com/cagriekin/pg-ha-agent/internal/reconcile"
 )
 
@@ -61,6 +62,21 @@ func (a *agent) runIntent(ctx context.Context, kind control.IntentKind) error {
 			return fmt.Errorf("stop postgres: %w", err)
 		}
 		a.log.Warn("control: stopped postgres for a restore")
+		return nil
+	case control.IntentReinitialize:
+		// Stop, then discard the data directory. The reconcile loop takes it from here:
+		// an empty PGDATA on a node that is not the chosen primary is exactly the
+		// BootstrapClone case, so the rebuild runs through the same path a brand-new
+		// replica uses. WipeDataDir carries its own interlocks (initialized data
+		// directory, no postmaster.pid, not near the filesystem root).
+		if err := a.sup.Demote(ctx, false); err != nil {
+			return fmt.Errorf("stop postgres: %w", err)
+		}
+		if err := process.WipeDataDir(a.cfg.PGDATA); err != nil {
+			return err
+		}
+		a.log.Warn("control: discarded the data directory; the reconcile loop will re-clone from the lease holder",
+			"pgdata", a.cfg.PGDATA)
 		return nil
 	default:
 		return fmt.Errorf("unknown intent %v", kind)

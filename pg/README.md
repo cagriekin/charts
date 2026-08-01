@@ -406,6 +406,7 @@ equivalent, so nothing you learn about one is wasted on the other.
 | `POST /v1/switchover` | cluster | Handoff request, **rejected up front** unless the candidate is a reachable, same-timeline standby and the cluster is not paused |
 | `DELETE /v1/switchover` | cluster | Cancel a pending request |
 | `POST /v1/restart` / `POST /v1/reload` | this pod | Restart or SIGHUP the supervised postmaster, via the reconcile loop |
+| `POST /v1/reinitialize` | this pod | **Replica only.** Discard this standby's data directory so the loop re-clones it from the primary |
 | `GET /v1/backups` | this pod | `pgbackrest info` (requires `pgbackrest.enabled`) |
 | `GET`/`POST`/`DELETE /v1/restore` | this pod | PITR restore — see below; `POST` needs its own opt-in |
 
@@ -456,6 +457,41 @@ New metrics on the read-only port: `pg_ha_agent_control_requests_total`,
 `_control_rejected_total`, `_control_intents_total`, `_control_restore_requests_total`.
 A refused control call is therefore alertable without exposing the control port to your
 scraper.
+
+#### Rebuilding a broken standby — `POST /v1/reinitialize`
+
+When a standby cannot rejoin on its own — a diverged timeline, a corrupt local copy — the
+manual fix is to delete its PVC and its pod and let the StatefulSet re-create it. This
+endpoint does the same thing without touching Kubernetes objects: it stops PostgreSQL and
+empties the data directory, and the reconcile loop's ordinary "empty data, not the chosen
+primary → clone from the lease holder" path rebuilds it. There is deliberately no second
+clone implementation — the rebuild runs through exactly the path a brand-new replica uses.
+
+```bash
+curl -X POST ... -d '{"node":"<release>-pg-1","force":true}' \
+  https://127.0.0.1:9201/v1/reinitialize
+```
+
+It needs no extra RBAC, and it is guarded three ways:
+
+- **Replica only.** It refuses on the lease holder, and the check reads the lease rather
+  than trusting a cached role — wiping the primary would discard the cluster's only copy of
+  committed writes. To rebuild a primary, hand the role away with `POST /v1/switchover`
+  first, or recover it from a backup with `POST /v1/restore` (which has its own
+  confirmations and its own authz verb). A node running read-write *without* the lease is
+  also refused: the loop is about to demote or fence it, and a destructive local action must
+  not race that.
+- **Not while paused.** Maintenance mode makes the loop a no-op, so the wipe would leave the
+  replica empty and stopped with nothing to rebuild it. Resume first.
+- **`force: true` and the pod named**, like every node-local verb.
+
+The wipe itself refuses unless the directory really is an initialized PostgreSQL data
+directory with no `postmaster.pid` present, and it empties the directory rather than removing
+it (it is a volume mount).
+
+It returns `202`: the wipe is immediate, but the clone takes as long as the database is
+large and the loop performs it. Watch `GET /v1/status` — `local.hasData` goes true when the
+clone lands, then `local.role` becomes `standby`.
 
 #### API-driven PITR restore — `repmgr.agent.control.restore`
 

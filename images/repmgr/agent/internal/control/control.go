@@ -54,17 +54,20 @@ type MemberState struct {
 	Name string `json:"name"`
 	// Self marks the member this API is running on. Every other member's fields come
 	// from a cross-pod probe (or gossip), so they are this node's VIEW, not truth.
-	Self       bool   `json:"self"`
-	Role       string `json:"role"`
+	Self bool   `json:"self"`
+	Role string `json:"role"`
+	// No omitempty on the booleans: false is a meaningful state, not an absent one, and
+	// hasData/running are exactly what a client polls during a reinitialize re-clone --
+	// omitting them would make "no data yet" indistinguishable from "field not reported".
 	Reachable  bool   `json:"reachable"`
-	Running    bool   `json:"running,omitempty"`
-	HasData    bool   `json:"hasData,omitempty"`
+	Running    bool   `json:"running"`
+	HasData    bool   `json:"hasData"`
 	Timeline   uint32 `json:"timeline,omitempty"`
 	TimelineOK bool   `json:"timelineKnown"`
 	LSN        string `json:"lsn,omitempty"`
 	// Gossip is true when the position came from the peer's pod annotation rather
 	// than a live SQL probe, i.e. the peer is not reachable right now.
-	Gossip bool `json:"gossip,omitempty"`
+	Gossip bool `json:"gossip"`
 }
 
 // DecisionView is the reconcile loop's most recent decision.
@@ -144,6 +147,12 @@ const (
 	// precondition. Only safe while paused, which is why the restore handler verifies
 	// that against a fresh marker read first; an unpaused loop would restart it.
 	IntentStop
+	// IntentReinitialize discards this replica's data directory so the reconcile loop
+	// rebuilds it from the lease holder. It stops PostgreSQL and empties PGDATA and
+	// nothing more: the loop's ordinary "empty data, not the chosen primary -> clone
+	// from the lease holder" path does the rebuild, so there is no second clone
+	// implementation to diverge from the one every fresh replica uses.
+	IntentReinitialize
 )
 
 func (k IntentKind) String() string {
@@ -154,6 +163,8 @@ func (k IntentKind) String() string {
 		return "reload"
 	case IntentStop:
 		return "stop"
+	case IntentReinitialize:
+		return "reinitialize"
 	default:
 		return "unknown"
 	}

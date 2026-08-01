@@ -33,7 +33,16 @@
 
   Surface: `GET /v1/status`, `GET /v1/cluster`, `POST /v1/pause`, `POST /v1/resume`,
   `POST /v1/switchover`, `DELETE /v1/switchover`, `POST /v1/restart`, `POST /v1/reload`,
-  `GET /v1/backups`, and `GET`/`POST`/`DELETE /v1/restore`.
+  `POST /v1/reinitialize`, `GET /v1/backups`, and `GET`/`POST`/`DELETE /v1/restore`.
+
+  `POST /v1/reinitialize` rebuilds a standby that cannot rejoin on its own, replacing the
+  "delete the PVC and the pod" runbook: it stops PostgreSQL and empties the data directory,
+  and the loop's ordinary empty-data clone path does the rebuild — no second clone
+  implementation. **Replica only**: it refuses on the lease holder (checked against the
+  lease, not a cached role), refuses a node running read-write without the lease, refuses
+  while paused (a paused loop would never re-clone), and requires `force: true`. The wipe
+  itself refuses anything that is not an initialized data directory, or that still has a
+  `postmaster.pid`. No extra RBAC.
 
   Security posture:
 

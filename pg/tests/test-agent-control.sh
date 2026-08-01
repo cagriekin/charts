@@ -335,6 +335,55 @@ assert_eq "an unknown route returns 404" "404" "${unknown_route_code}"
 wrong_method_code=$(api_code GET /v1/pause)
 assert_eq "a GET on a mutating route returns 405" "405" "${wrong_method_code}"
 
+# --- reinitialize: rebuild a standby for real ---
+#
+# The endpoint is replica-only and destructive, so this proves both halves: the primary is
+# refused, and the standby is genuinely wiped and re-cloned by the reconcile loop.
+
+reinit_primary_code=$(api_code POST /v1/reinitialize "{\"node\":\"${LEADER}\",\"force\":true}")
+assert_eq "reinitialize on the lease holder is refused" "409" "${reinit_primary_code}"
+reinit_noforce_code=$(api_code POST /v1/reinitialize "{\"node\":\"${LEADER}\"}")
+assert_eq "reinitialize without force is refused" "400" "${reinit_noforce_code}"
+
+# Mark the standby's data so the re-clone is provable: the row is written on the PRIMARY and
+# streamed, so after a wipe + clone it must be present again from a fresh copy.
+pg_exec "${NAMESPACE}" "${LEADER}" "CREATE TABLE IF NOT EXISTS reinit_proof (id int); INSERT INTO reinit_proof VALUES (42);" >/dev/null 2>&1 || true
+standby_rows=""
+for _ in $(seq 1 20); do
+  standby_rows=$(pg_exec "${NAMESPACE}" "${CANDIDATE}" "SELECT count(*) FROM reinit_proof" 2>/dev/null | tr -d '[:space:]' || echo "")
+  [ "${standby_rows}" = "1" ] && break
+  sleep 3
+done
+assert_eq "standby streamed the marker row before the rebuild" "1" "${standby_rows}"
+
+# Address the STANDBY's own API: node-local verbs act on the pod that answers.
+if start_pf "${CANDIDATE}" "${LOCAL_PORT}" 9201; then pf_ok=ok; else pf_ok=fail; fi
+wait_api_ready || true
+assert_eq "port-forward to the standby's control port" "ok" "${pf_ok}"
+reinit_code=$(api_code POST /v1/reinitialize "{\"node\":\"${CANDIDATE}\",\"force\":true}")
+assert_eq "reinitialize on the standby is accepted (202)" "202" "${reinit_code}"
+
+# The loop re-clones from the lease holder. Watch it land: data comes back, the role returns
+# to standby, and the marker row is present again from the fresh copy.
+echo "  Waiting for the standby to be re-cloned (up to 300s)..."
+recloned=""
+for _ in $(seq 1 60); do
+  recloned=$(pg_exec "${NAMESPACE}" "${CANDIDATE}" "SELECT count(*) FROM reinit_proof" 2>/dev/null | tr -d '[:space:]' || echo "")
+  [ "${recloned}" = "1" ] && break
+  sleep 5
+done
+assert_eq "the standby was re-cloned and has the data again" "1" "${recloned}"
+in_recovery=$(pg_exec "${NAMESPACE}" "${CANDIDATE}" "SELECT pg_is_in_recovery()" 2>/dev/null | tr -d '[:space:]' || echo "")
+assert_eq "the rebuilt node is a standby again" "t" "${in_recovery}"
+reinit_status=$(api_body GET /v1/status)
+assert_eq "its API reports the standby role" "standby" "$(jq -r '.local.role' <<< "${reinit_status}")"
+assert_eq "its API reports it has data" "true" "$(jq -r '.local.hasData' <<< "${reinit_status}")"
+
+# Back to the leader for the switchover below.
+if start_pf "${LEADER}" "${LOCAL_PORT}" 9201; then pf_ok=ok; else pf_ok=fail; fi
+wait_api_ready || true
+assert_eq "port-forward back to the leader" "ok" "${pf_ok}"
+
 # --- the switchover actually moves leadership ---
 
 sw_code=$(api_code POST /v1/switchover "{\"leader\":\"${LEADER}\",\"candidate\":\"${CANDIDATE}\"}")

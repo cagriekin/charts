@@ -5,6 +5,9 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -318,4 +321,55 @@ type countingExec struct{ calls int }
 func (c *countingExec) Run(context.Context, []string, string, ...string) (string, error) {
 	c.calls++
 	return "", nil
+}
+
+// Reinitialize stops PostgreSQL and discards the data directory -- and nothing else. The
+// rebuild is the reconcile loop's ordinary "empty data, not the chosen primary -> clone
+// from the lease holder" path, so there is no second clone implementation to diverge.
+func TestRunIntentReinitializeStopsAndWipes(t *testing.T) {
+	pm := &fakePostmaster{running: true}
+	a := newIntentAgent(t, pm)
+	// Make PGDATA look like a real, stopped data directory.
+	if err := os.MkdirAll(filepath.Join(a.cfg.PGDATA, "base"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"PG_VERSION", "postgresql.conf"} {
+		if err := os.WriteFile(filepath.Join(a.cfg.PGDATA, f), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !process.HasData(a.cfg.PGDATA) {
+		t.Fatal("fixture should look like a data directory")
+	}
+	if err := a.runIntent(context.Background(), control.IntentReinitialize); err != nil {
+		t.Fatalf("reinitialize: %v", err)
+	}
+	if !pm.stopped {
+		t.Error("postgres must be stopped before the data directory is discarded")
+	}
+	if pm.started {
+		t.Error("it must NOT start postgres: there is no data to start, the loop re-clones")
+	}
+	if process.HasData(a.cfg.PGDATA) {
+		t.Error("the data directory should be empty so the loop sees BootstrapClone")
+	}
+	// The directory itself must survive (it is a volume mount).
+	if fi, err := os.Stat(a.cfg.PGDATA); err != nil || !fi.IsDir() {
+		t.Errorf("PGDATA itself must remain: %v", err)
+	}
+}
+
+// If the wipe is refused (its own interlocks), the intent must fail rather than report
+// success and leave the loop nothing to do.
+func TestRunIntentReinitializeSurfacesWipeRefusal(t *testing.T) {
+	pm := &fakePostmaster{running: true}
+	a := newIntentAgent(t, pm)
+	// PGDATA exists but is not an initialized data directory -> WipeDataDir refuses.
+	err := a.runIntent(context.Background(), control.IntentReinitialize)
+	if err == nil {
+		t.Fatal("a refused wipe must surface as an error")
+	}
+	if !strings.Contains(err.Error(), "PG_VERSION") {
+		t.Errorf("the error should carry the reason: %v", err)
+	}
 }
