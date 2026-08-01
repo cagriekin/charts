@@ -30,6 +30,11 @@ func ParseLSN(s string) (lsn LSN, ok bool) {
 	return LSN{Hi: hi, Lo: lo}, true
 }
 
+// Uint64 is the LSN as a single WAL byte offset (hi<<32 | lo), the form PostgreSQL
+// itself stores it in. Used to subtract two positions into a byte distance (replay
+// lag); comparisons should prefer Greater, which needs no arithmetic.
+func (l LSN) Uint64() uint64 { return l.Hi<<32 | l.Lo }
+
 // Greater reports whether a is a strictly higher LSN than b: the hi segment
 // dominates, then lo. Both compare numerically, never lexicographically (#131) —
 // the segments are unpadded hex, so "10/.." must rank above "9/.." and "100/.."

@@ -1,5 +1,22 @@
 # pgvector chart changelog
 
+## 1.9.0 - 2026-08-01
+
+Inherited from pg's symlinked templates and the shared repmgr image. See the
+[pg 1.9.0 changelog](../pg/CHANGELOG.md) for the full detail.
+
+### Added
+
+- Authenticated control REST API for the agent (`repmgr.agent.control`, #276), off by
+  default and agent mode only: mTLS-only on its own port (9201, never the 9200 metrics
+  port), deny-by-default under `networkPolicy.enabled`, with pause / switchover / restart /
+  reload plus reads that expose per-member position and the reconcile loop's latest
+  decision. A facade over the same marker annotations `kubectl annotate` writes.
+- API-driven PITR restore (`repmgr.agent.control.restore`, #276) as a separate opt-in — it
+  grants the pods `create` on `jobs`, which RBAC cannot scope by name. Off by default.
+- `restore.sh` records each restore attempt's outcome beside PGDATA, so it survives the Job
+  and doubles as provenance for the data directory.
+
 ## 1.8.1 - 2026-07-31
 
 Inherited from pg's symlinked templates and the shared repmgr image. See the

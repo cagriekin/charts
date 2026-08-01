@@ -1,0 +1,5 @@
+# The process package's tests start and signal real child processes, so a crash there
+# drops a multi-megabyte core dump into the package directory. Four of them were committed
+# by accident before this file existed; ignore them so it cannot happen again.
+core.*
+!core.go

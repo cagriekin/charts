@@ -66,6 +66,50 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create"]
+{{- if .Values.repmgr.agent.control.restore.enabled }}
+  # Control-API restore triggering (#276). READ THIS BEFORE ENABLING IT.
+  #
+  # `create` on jobs CANNOT be restricted by resourceName -- the API server does not
+  # know an object's name at authorization time for a create -- so this grant lets
+  # anything holding the postgresql pods' ServiceAccount token create ARBITRARY Jobs
+  # in this namespace. A Job's pod may name any ServiceAccount, and Kubernetes does no
+  # separate permission check for that, which makes this a namespace-wide
+  # privilege-escalation primitive. The token is mounted next to a PostgreSQL that
+  # executes user-supplied SQL, i.e. the chart's largest attack surface.
+  #
+  # What narrows it: the grant is rendered ONLY under
+  # repmgr.agent.control.restore.enabled (default false, so a normal install's Role is
+  # unchanged), the API additionally requires a client certificate whose CN is on
+  # repmgr.agent.control.restore.allowedClientCNs, and the Job the agent creates is a
+  # verbatim clone of the CronJob below rather than a spec it composes. The equivalent
+  # kubectl path (`kubectl create job --from=cronjob/...`) needs none of this, so leave
+  # this off unless API-driven restore is worth the trade.
+  #
+  # get on the CronJob: the jobTemplate the agent clones.
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    resourceNames: ["{{ include "pg.fullname" . }}-pgbackrest-restore"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create"]
+  # get/delete ARE scopeable, because the agent always creates the same deterministic
+  # Job name -- which is why it uses one instead of generateName.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    resourceNames: ["{{ include "pg.fullname" . }}-pgbackrest-restore-api"]
+    verbs: ["get", "delete"]
+{{- if .Values.repmgr.agent.control.restore.readPodLogs }}
+  # Live file-copy progress by tailing the restore pod's log. The Job's pod name is
+  # generated, so this cannot be resourceName-scoped either: it grants log read for
+  # EVERY pod in the namespace, and logs are where other workloads leak secrets. Off
+  # by default; the progress that needs no privilege (WAL replay position after
+  # scale-up, and the recorded restore outcome) is always available without it.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+{{- end }}
+{{- end }}
 {{- if ne (include "pg.agentEtcdMode" .) "true" }}
   # Lease <fullname>-leader is the sole leadership authority (client-go
   # leaderelection): get/update/patch scoped to that name, create unscoped. With the

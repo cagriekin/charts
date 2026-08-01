@@ -44,7 +44,7 @@ func TestLivenessReflectsHeartbeat(t *testing.T) {
 
 	get := func() int {
 		rr := httptest.NewRecorder()
-		m.Handler(10 * time.Second).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+		m.Handler(10*time.Second).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 		return rr.Code
 	}
 	if code := get(); code != http.StatusOK {
@@ -63,5 +63,58 @@ func TestAuditWritesStructuredReason(t *testing.T) {
 	out := buf.String()
 	if !strings.Contains(out, "action=DemoteFence") || !strings.Contains(out, "hold_lease=false") {
 		t.Errorf("audit line missing fields: %s", out)
+	}
+}
+
+// The read-only surface must stay read-only. The control API (#276) lives on its own
+// port precisely so a NetworkPolicy can admit Prometheus here and nobody there; a
+// mutating route appearing on 9200 would silently undo that separation.
+func TestMetricsHandlerServesNoControlRoutes(t *testing.T) {
+	h := New().Handler(time.Minute)
+	for _, path := range []string{
+		"/v1/status", "/v1/cluster", "/v1/pause", "/v1/resume",
+		"/v1/switchover", "/v1/restart", "/v1/reload", "/v1/backups", "/v1/restore",
+	} {
+		for _, method := range []string{"GET", "POST", "DELETE"} {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+			if rec.Code != http.StatusNotFound {
+				t.Errorf("%s %s on the metrics port = %d, want 404", method, path, rec.Code)
+			}
+		}
+	}
+}
+
+// Only these three routes exist on the metrics port.
+func TestMetricsHandlerRoutes(t *testing.T) {
+	h := New().Handler(time.Minute)
+	for _, path := range []string{"/metrics", "/healthz", "/readyz"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("GET %s = %d, want 200", path, rec.Code)
+		}
+	}
+}
+
+// The control counters are exported so a denied control call is alertable without
+// opening the control port to the scraper.
+func TestControlCountersAreExported(t *testing.T) {
+	m := New()
+	m.IncControlRequest()
+	m.IncControlRejected()
+	m.IncControlIntent()
+	m.IncControlRestoreRequest()
+	var sb strings.Builder
+	m.write(&sb)
+	for _, want := range []string{
+		"pg_ha_agent_control_requests_total 1",
+		"pg_ha_agent_control_rejected_total 1",
+		"pg_ha_agent_control_intents_total 1",
+		"pg_ha_agent_control_restore_requests_total 1",
+	} {
+		if !strings.Contains(sb.String(), want) {
+			t.Errorf("metrics output should contain %q:\n%s", want, sb.String())
+		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -82,7 +83,69 @@ type Config struct {
 	EtcdCertFile  string
 	EtcdKeyFile   string
 	EtcdCAFile    string
+
+	// Control API (#276). Optional and OFF by default: absent means the agent serves
+	// only the read-only :9200 surface, exactly as before. When on, mTLS is mandatory
+	// (there is no password/token mode and no plaintext mode) -- so all three of
+	// cert/key/CA are required together and the agent refuses to boot without them
+	// rather than opening an unauthenticated mutating port.
+	ControlEnabled  bool
+	ControlAddr     string // host:port, default :9201; never the metrics port
+	ControlCertFile string
+	ControlKeyFile  string
+	ControlCAFile   string
+	// ControlAllowedCNs, when non-empty, restricts control access to client certs
+	// whose subject CN is listed. Empty means "any cert signed by ControlCAFile",
+	// which is already a closed set (the operator issues the certs).
+	ControlAllowedCNs []string
+
+	// Restore-triggering (#276 phase 3) is a SEPARATE opt-in from the rest of the
+	// control API, because it is the one verb whose RBAC grant (create jobs, which
+	// cannot be resourceName-scoped) is a namespace-wide escalation primitive.
+	ControlRestoreEnabled bool
+	// ControlRestoreAllowedCNs is the restore-specific authz verb: a client must be
+	// listed here to trigger a restore, over and above passing mTLS. Required (and
+	// enforced non-empty) when ControlRestoreEnabled, so enabling restore without
+	// naming who may call it denies everyone instead of allowing everyone.
+	ControlRestoreAllowedCNs []string
+	// ControlRestoreCronJob is the chart's suspended restore CronJob, whose
+	// jobTemplate the agent clones verbatim -- the same object and the same semantics
+	// as `kubectl create job --from=cronjob/<name>`.
+	ControlRestoreCronJob string
+	// ControlRestoreJobName is the deterministic name of the Job the agent creates.
+	// Deterministic (not generateName) so the RBAC get/delete grants can be
+	// resourceName-scoped to exactly this one object.
+	ControlRestoreJobName string
+	// ControlRestorePodOrdinal is the ordinal whose PVC the rendered CronJob restores
+	// into. The API accepts a podOrdinal only to CONFIRM it (409 on mismatch): which
+	// volume gets overwritten is baked into the rendered Job and stays a values/git
+	// decision, never an HTTP-body one.
+	ControlRestorePodOrdinal int
+	// ControlRestoreReadPodLogs enables live file-copy progress by tailing the restore
+	// pod's log, which needs a namespace-wide `get pods/log` grant (the Job's pod name
+	// is generated, so it cannot be resourceName-scoped). Off by default: logs are
+	// where other workloads leak secrets, and the progress is only observable while
+	// some agent pod is still running.
+	ControlRestoreReadPodLogs bool
+
+	// pgBackRest, from the env the chart already sets for the archive_command. Used by
+	// the control API's read-only backup routes (`pgbackrest info`, restore outcome);
+	// absent means this release has no repository, and those routes say so.
+	PGBackrestEnabled bool
+	PGBackrestStanza  string
 }
+
+// RestoreStatusPath is where the chart's restore.sh records the outcome of the last
+// restore: beside PGDATA, not inside it, so a restore never writes into the directory
+// it is restoring and the record survives on the PVC after the Job is gone.
+func (c Config) RestoreStatusPath() string {
+	return filepath.Join(filepath.Dir(c.PGDATA), "pgbackrest-restore.status")
+}
+
+// defaultControlAddr is the control API's listen address. Deliberately NOT the
+// metrics port: :9200 stays observe-only so a NetworkPolicy can admit scrapers
+// there without ever admitting them to a mutating surface.
+const defaultControlAddr = ":9201"
 
 type loader struct {
 	get     func(string) string
@@ -120,6 +183,19 @@ func boolEnv(v string) bool {
 	default:
 		return false
 	}
+}
+
+// csvList parses an optional comma-separated list, dropping empty entries. Used for
+// the control-API cert CN allowlists, where an empty result must stay empty (it is
+// the difference between "no restriction" and "deny everyone" at the call site).
+func csvList(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (l *loader) intv(key string) int {
@@ -245,6 +321,68 @@ func Load(get func(string) string) (*Config, error) {
 		c.EtcdCAFile = l.get("ETCD_TLS_CA")
 	}
 
+	// Control API (#276). Every field is read unconditionally so a stray
+	// CONTROL_RESTORE_* on a control-disabled agent can still be reported as a
+	// misconfiguration below, rather than silently ignored.
+	c.ControlEnabled = boolEnv(get("CONTROL_ENABLED"))
+	c.ControlAddr = strings.TrimSpace(get("CONTROL_ADDR"))
+	if c.ControlAddr == "" {
+		c.ControlAddr = defaultControlAddr
+	}
+	c.ControlCertFile = strings.TrimSpace(get("CONTROL_TLS_CERT"))
+	c.ControlKeyFile = strings.TrimSpace(get("CONTROL_TLS_KEY"))
+	c.ControlCAFile = strings.TrimSpace(get("CONTROL_TLS_CA"))
+	c.ControlAllowedCNs = csvList(get("CONTROL_ALLOWED_CNS"))
+	c.ControlRestoreEnabled = boolEnv(get("CONTROL_RESTORE_ENABLED"))
+	c.ControlRestoreAllowedCNs = csvList(get("CONTROL_RESTORE_ALLOWED_CNS"))
+	c.ControlRestoreCronJob = strings.TrimSpace(get("CONTROL_RESTORE_CRONJOB"))
+	c.ControlRestoreJobName = strings.TrimSpace(get("CONTROL_RESTORE_JOB_NAME"))
+	c.ControlRestoreReadPodLogs = boolEnv(get("CONTROL_RESTORE_READ_POD_LOGS"))
+	// pgBackRest presence, already on the container env for the archive_command; the
+	// control API's backup routes need it to know whether a repository exists at all.
+	c.PGBackrestEnabled = boolEnv(get("PGBACKREST_ENABLED"))
+	c.PGBackrestStanza = strings.TrimSpace(get("PGBACKREST_STANZA"))
+	if c.ControlEnabled {
+		// mTLS is not optional. Named individually so one boot error lists every
+		// missing file instead of one-at-a-time discovery across restarts.
+		for _, f := range []struct{ key, val string }{
+			{"CONTROL_TLS_CERT", c.ControlCertFile},
+			{"CONTROL_TLS_KEY", c.ControlKeyFile},
+			{"CONTROL_TLS_CA", c.ControlCAFile},
+		} {
+			if f.val == "" {
+				l.missing = append(l.missing, f.key+" (required by CONTROL_ENABLED: the control API is mTLS-only)")
+			}
+		}
+		if _, _, err := net.SplitHostPort(c.ControlAddr); err != nil {
+			l.invalid = append(l.invalid, fmt.Sprintf("CONTROL_ADDR=%q is not host:port: %v", c.ControlAddr, err))
+		}
+	}
+	if c.ControlRestoreEnabled {
+		if !c.ControlEnabled {
+			l.invalid = append(l.invalid, "CONTROL_RESTORE_ENABLED requires CONTROL_ENABLED")
+		}
+		// Fail closed on the authz list: an empty list denies every client rather than
+		// admitting every control client to the most destructive verb in the API.
+		if len(c.ControlRestoreAllowedCNs) == 0 {
+			l.missing = append(l.missing, "CONTROL_RESTORE_ALLOWED_CNS (required by CONTROL_RESTORE_ENABLED: restore is a separate authz verb, and an empty allowlist denies everyone)")
+		}
+		if c.ControlRestoreCronJob == "" {
+			l.missing = append(l.missing, "CONTROL_RESTORE_CRONJOB")
+		}
+		if c.ControlRestoreJobName == "" {
+			l.missing = append(l.missing, "CONTROL_RESTORE_JOB_NAME")
+		}
+		c.ControlRestorePodOrdinal = l.intv("CONTROL_RESTORE_POD_ORDINAL")
+		if c.ControlRestorePodOrdinal < 0 {
+			l.invalid = append(l.invalid, fmt.Sprintf("CONTROL_RESTORE_POD_ORDINAL=%d (want >= 0)", c.ControlRestorePodOrdinal))
+		}
+	} else if c.ControlRestoreReadPodLogs {
+		// Loud rather than ignored: this flag is the one that widens RBAC, so a values
+		// file that sets it without enabling restore is a mistake worth naming.
+		l.invalid = append(l.invalid, "CONTROL_RESTORE_READ_POD_LOGS requires CONTROL_RESTORE_ENABLED")
+	}
+
 	if len(l.missing) > 0 || len(l.invalid) > 0 {
 		return nil, fmt.Errorf("config error: missing [%s]; invalid [%s]",
 			strings.Join(l.missing, ", "), strings.Join(l.invalid, "; "))
@@ -266,10 +404,14 @@ func (c Config) String() string {
 		"LeaseDuration:%s RenewDeadline:%s RetryPeriod:%s ReconcileInterval:%s "+
 		"HeadlessService:%s NodeCount:%d MasterService:%s MarkerName:%s PodSelector:%q "+
 		"RepmgrUser:%s RepmgrDB:%s RepmgrPassword:*** PGDATA:%s PGMajor:%s DCSBackend:%s SplitBrainAction:%s "+
-		"EtcdEndpoints:%v EtcdPrefix:%s EtcdTLS:%t PgHbaPeerCIDR:%s PgHbaRules:%d}",
+		"EtcdEndpoints:%v EtcdPrefix:%s EtcdTLS:%t PgHbaPeerCIDR:%s PgHbaRules:%d "+
+		"Control:%t ControlAddr:%s ControlMTLS:%t ControlAllowedCNs:%d "+
+		"ControlRestore:%t ControlRestoreAllowedCNs:%d ControlRestoreReadPodLogs:%t}",
 		c.PodName, c.Namespace, c.LeaseName,
 		c.LeaseDuration, c.RenewDeadline, c.RetryPeriod, c.ReconcileInterval,
 		c.HeadlessService, c.NodeCount, c.MasterService, c.MarkerName, c.PodSelector,
 		c.RepmgrUser, c.RepmgrDB, c.PGDATA, c.PGMajor, c.DCSBackend, c.SplitBrainAction,
-		c.EtcdEndpoints, c.EtcdPrefix, c.EtcdCertFile != "", c.PgHbaPeerCIDR, len(c.PgHbaRules))
+		c.EtcdEndpoints, c.EtcdPrefix, c.EtcdCertFile != "", c.PgHbaPeerCIDR, len(c.PgHbaRules),
+		c.ControlEnabled, c.ControlAddr, c.ControlCertFile != "", len(c.ControlAllowedCNs),
+		c.ControlRestoreEnabled, len(c.ControlRestoreAllowedCNs), c.ControlRestoreReadPodLogs)
 }

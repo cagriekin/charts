@@ -220,7 +220,7 @@ data:
   # Job/CronJob. Unlike validate.sh above (throwaway instance, proves restorability) this
   # one restores over the LIVE data directory. Kept here rather than inlined in the Job so
   # the two stay side by side; all inputs arrive via env (PGBACKREST_*, PGDATA,
-  # TARGET_TYPE/TARGET, BACKUP_SET, FORCE) so the body is literal.
+  # TARGET_TYPE/TARGET, BACKUP_SET, FORCE, RESTORE_REQUESTED_BY) so the body is literal.
   restore.sh: |
     #!/bin/bash
     set -euo pipefail
@@ -251,6 +251,67 @@ data:
       exit 1
     fi
 
+    # Record the outcome on the DATA VOLUME (beside PGDATA, never inside it), so it
+    # survives this Job: by the time the operator has scaled the StatefulSet back up, the
+    # Job and its logs may be gone to history limits, and this file is then the only
+    # record of what happened -- and of where this PGDATA came from (which backup set,
+    # which point in time). The agent's control API reads it back as lastRestore (#276).
+    #
+    # Installed only AFTER the interlock above: a refused attempt restored nothing, so it
+    # must not clobber the record of the restore this data directory actually came from.
+    # Written via a temp file + mv so a reader never sees a partial record.
+    STATUS_FILE="$(dirname "$PGDATA")/pgbackrest-restore.status"
+    STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    CLUSTER_STATE=""
+    CHECKPOINT=""
+    # prev_field <key> -- the value that key held in the existing record, if any.
+    prev_field() {
+      [ -f "${STATUS_FILE}" ] || return 0
+      sed -n "s/^$1=//p" "${STATUS_FILE}" 2>/dev/null | head -1
+    }
+    write_status() {
+      local code="$1"
+      local tt="${TARGET_TYPE:-}" tg="${TARGET:-}" bs="${BACKUP_SET:-}" started="${STARTED_AT}"
+      # Kept as three separate variables rather than one packed string: TARGET is
+      # operator- or API-supplied, so any in-band delimiter would be a value that
+      # corrupts the record.
+      local att_tt="" att_tg="" att_bs="" failed=""
+      if [ "${code}" != "0" ]; then
+        # A FAILED attempt must not become this directory's provenance. Many failures
+        # (unreachable repo, bad cipher pass, invalid --target, missing --set) copy nothing
+        # at all, so overwriting the record would erase where the data genuinely came from
+        # while claiming the mistyped target instead. Keep the previous record's descriptive
+        # fields and report what was attempted separately; exitCode still marks it failed,
+        # so nothing reads it as a clean restore.
+        att_tt="${tt}" att_tg="${tg}" att_bs="${bs}" failed="yes"
+        tt="$(prev_field targetType)"
+        tg="$(prev_field target)"
+        bs="$(prev_field backupSet)"
+        local prev_started
+        prev_started="$(prev_field startedAt)"
+        [ -n "${prev_started}" ] && started="${prev_started}"
+      fi
+      {
+        echo "startedAt=${started}"
+        echo "finishedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "stanza=${PGBACKREST_STANZA}"
+        echo "targetType=${tt}"
+        echo "target=${tg}"
+        echo "backupSet=${bs}"
+        echo "exitCode=${code}"
+        echo "requestedBy=${RESTORE_REQUESTED_BY:-}"
+        echo "clusterState=${CLUSTER_STATE}"
+        echo "checkpoint=${CHECKPOINT}"
+        if [ -n "${failed}" ]; then
+          echo "attemptedTargetType=${att_tt}"
+          echo "attemptedTarget=${att_tg}"
+          echo "attemptedBackupSet=${att_bs}"
+        fi
+      } > "${STATUS_FILE}.tmp" 2>/dev/null && mv -f "${STATUS_FILE}.tmp" "${STATUS_FILE}" || \
+        echo "WARNING: could not record the restore outcome to ${STATUS_FILE}" >&2
+    }
+    trap 'write_status $?' EXIT
+
     # --delta compares checksums and copies only the files that differ, so the existing
     # PGDATA is left in place (a wiped data directory silently degrades to a full restore
     # -- still correct, just slower). Rerunning the Job simply restores again.
@@ -278,6 +339,9 @@ data:
     # first thing to look at if the cluster does not come up after scale-up.
     echo "----- pg_controldata after restore -----"
     pg_controldata -D "$PGDATA" 2>/dev/null | grep -E 'Database cluster state|Latest checkpoint location|Time of latest checkpoint' || true
+    # The same two readings go into the status file, so they survive the Job's logs.
+    CLUSTER_STATE="$(pg_controldata -D "$PGDATA" 2>/dev/null | awk -F': *' '/Database cluster state/{print $2}' || true)"
+    CHECKPOINT="$(pg_controldata -D "$PGDATA" 2>/dev/null | awk -F': *' '/Latest checkpoint location/{print $2}' || true)"
 
     echo "pgBackRest restore succeeded for stanza '$PGBACKREST_STANZA'"
     echo "Scale the StatefulSet back up to replay WAL and promote (see the chart README)."

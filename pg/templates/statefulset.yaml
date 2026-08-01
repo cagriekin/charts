@@ -37,6 +37,47 @@
 {{- if and .Values.postgresql.tls.clientCertAuth .Values.pgpool.enabled (or (not .Values.pgpool.tls.enabled) (not .Values.pgpool.tls.backendClientCert)) }}
 {{- fail "postgresql.tls.clientCertAuth=true with pgpool.enabled requires pgpool.tls.enabled and pgpool.tls.backendClientCert (a client cert pgpool presents to the backends for app-user passthrough under mTLS)." }}
 {{- end }}
+{{- /* Control API validation (#276). Every one of these is a RENDER guard rather than
+       only a boot check in the agent: an operator who enables the API without its TLS
+       material would otherwise get a crash-looping database (the agent refuses to open
+       an unauthenticated mutating port), and discovering that from a CrashLoopBackOff
+       is a much worse experience than a failed `helm upgrade`. Mirrors the
+       postgresql.tls.existingSecret guard above. */}}
+{{- $control := .Values.repmgr.agent.control }}
+{{- if $control.enabled }}
+{{- if ne (include "pg.agentMode" .) "true" }}
+{{- fail "repmgr.agent.control.enabled requires agent mode (repmgr.failoverMode=agent): the control API is served by the Go agent, and repmgrd mode runs no agent. In repmgrd mode use the kubectl runbooks in the README instead." }}
+{{- end }}
+{{- if not $control.tls.existingSecret }}
+{{- fail "repmgr.agent.control.enabled requires repmgr.agent.control.tls.existingSecret (a Secret with keys tls.crt, tls.key, ca.crt). The control API is mTLS-only -- there is no token or plaintext mode -- so without client-CA material it would have no way to authenticate callers and the agent refuses to start." }}
+{{- end }}
+{{- if eq (int $control.port) 9200 }}
+{{- fail "repmgr.agent.control.port must not be 9200: that is the agent's read-only metrics/probe port, and keeping the two apart is what lets a NetworkPolicy admit Prometheus to 9200 without admitting anything to the mutating control surface." }}
+{{- end }}
+{{- if eq (int $control.port) 5432 }}
+{{- fail "repmgr.agent.control.port must not be 5432 (the PostgreSQL port)" }}
+{{- end }}
+{{- end }}
+{{- if $control.restore.enabled }}
+{{- if not $control.enabled }}
+{{- fail "repmgr.agent.control.restore.enabled requires repmgr.agent.control.enabled" }}
+{{- end }}
+{{- if not .Values.pgbackrest.enabled }}
+{{- fail "repmgr.agent.control.restore.enabled requires pgbackrest.enabled (there is no repository to restore from)" }}
+{{- end }}
+{{- if not .Values.pgbackrest.restore.enabled }}
+{{- fail "repmgr.agent.control.restore.enabled requires pgbackrest.restore.enabled: the API triggers the chart's restore Job rather than constructing one, so the release must render it" }}
+{{- end }}
+{{- if ne .Values.pgbackrest.restore.mode "cronjob" }}
+{{- fail "repmgr.agent.control.restore.enabled requires pgbackrest.restore.mode=cronjob: the agent clones the suspended CronJob's jobTemplate (exactly as `kubectl create job --from=cronjob/...` does), so in mode=job there is nothing to clone" }}
+{{- end }}
+{{- if not $control.restore.allowedClientCNs }}
+{{- fail "repmgr.agent.control.restore.enabled requires a non-empty repmgr.agent.control.restore.allowedClientCNs: restore is a separate authz verb from pause/switchover, and an empty allowlist denies every client -- name the certificate CNs permitted to overwrite the data directory" }}
+{{- end }}
+{{- end }}
+{{- if and $control.restore.readPodLogs (not $control.restore.enabled) }}
+{{- fail "repmgr.agent.control.restore.readPodLogs requires repmgr.agent.control.restore.enabled (it only affects reading a restore Job's log)" }}
+{{- end }}
 {{- if .Values.repmgr.enabled }}
 {{- $repmgrMajor := required "repmgr.image.majorVersion is required (the PostgreSQL major bundled in the repmgr image)" .Values.repmgr.image.majorVersion }}
 {{- if ne (toString .Values.postgresql.majorVersion) (toString $repmgrMajor) }}
@@ -448,6 +489,13 @@ spec:
             - name: agent-metrics
               containerPort: 9200
               protocol: TCP
+{{- if $control.enabled }}
+            {{- /* Control API (#276) on its own port, so the NetworkPolicy can admit
+                   scrapers to agent-metrics without admitting anything here. */}}
+            - name: agent-control
+              containerPort: {{ int $control.port }}
+              protocol: TCP
+{{- end }}
 {{- end }}
           env:
 {{- with (include "pg.pgMajorEnv" .) }}{{ . | nindent 12 }}{{- end }}
@@ -583,6 +631,46 @@ spec:
 {{- end }}
             - name: SPLIT_BRAIN_ACTION
               value: {{ .Values.repmgr.splitBrainDetection.action | quote }}
+{{- if $control.enabled }}
+            {{- /* Control API (#276). The agent validates all of this at boot and
+                   refuses to start if the mTLS material is incomplete -- the render
+                   guards at the top of this file catch it earlier. */}}
+            - name: CONTROL_ENABLED
+              value: "true"
+            - name: CONTROL_ADDR
+              value: {{ printf ":%d" (int $control.port) | quote }}
+            - name: CONTROL_TLS_CERT
+              value: /etc/agent-control-tls/tls.crt
+            - name: CONTROL_TLS_KEY
+              value: /etc/agent-control-tls/tls.key
+            - name: CONTROL_TLS_CA
+              value: /etc/agent-control-tls/ca.crt
+{{- with $control.allowedClientCNs }}
+            - name: CONTROL_ALLOWED_CNS
+              value: {{ join "," . | quote }}
+{{- end }}
+{{- if $control.restore.enabled }}
+            - name: CONTROL_RESTORE_ENABLED
+              value: "true"
+            - name: CONTROL_RESTORE_ALLOWED_CNS
+              value: {{ join "," $control.restore.allowedClientCNs | quote }}
+            {{- /* The CronJob the agent clones, and the deterministic Job name it
+                   creates -- deterministic so the RBAC get/delete grants can be scoped
+                   to exactly that one object by resourceName. */}}
+            - name: CONTROL_RESTORE_CRONJOB
+              value: {{ printf "%s-pgbackrest-restore" (include "pg.fullname" .) | quote }}
+            - name: CONTROL_RESTORE_JOB_NAME
+              value: {{ printf "%s-pgbackrest-restore-api" (include "pg.fullname" .) | quote }}
+            {{- /* Confirm-only: the volume the rendered Job writes into is decided here,
+                   in values, and an HTTP body may only echo it back. */}}
+            - name: CONTROL_RESTORE_POD_ORDINAL
+              value: {{ .Values.pgbackrest.restore.podOrdinal | quote }}
+{{- if $control.restore.readPodLogs }}
+            - name: CONTROL_RESTORE_READ_POD_LOGS
+              value: "true"
+{{- end }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
@@ -948,6 +1036,14 @@ spec:
               mountPath: /etc/etcd-tls
               readOnly: true
 {{- end }}
+{{- if $control.enabled }}
+            {{- /* Control-API mTLS material (#276), same shape as the etcd-tls mount.
+                   The agent re-reads these files per handshake, so a rotated Secret
+                   takes effect without a pod restart. */}}
+            - name: agent-control-tls
+              mountPath: /etc/agent-control-tls
+              readOnly: true
+{{- end }}
 {{- with .Values.postgresql.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
 {{- end }}
@@ -1218,6 +1314,12 @@ spec:
         - name: etcd-tls
           secret:
             secretName: {{ .Values.repmgr.agent.dcs.etcd.tls.secretName | quote }}
+            defaultMode: 0400
+{{- end }}
+{{- if $control.enabled }}
+        - name: agent-control-tls
+          secret:
+            secretName: {{ $control.tls.existingSecret | quote }}
             defaultMode: 0400
 {{- end }}
 {{- if eq (include "pg.repmgrdMode" .) "true" }}

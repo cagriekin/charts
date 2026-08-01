@@ -371,6 +371,294 @@ The serving primary waits until that target is a **caught-up, same-timeline stan
 
 Caveats: this is a planned handoff layered on the lease election, not a fenced zero-RPO transaction — the directed target promotes deterministically on a two-pod cluster; with three or more pods the most-advanced standby wins the freed lease (usually but not necessarily the named target). For strict RPO=0 use synchronous replication (not enabled in this chart).
 
+### Control REST API (agent mode) — `repmgr.agent.control`
+
+The pause and switchover runbooks above are `kubectl annotate` calls: they work, they are
+the reference, and they need no extra machinery. What they cannot do is **check the
+request before accepting it**. `kubectl annotate ... switchover-target=<pod>` succeeds
+even when the pod does not exist, is on a divergent timeline, or is 4 GB behind — you
+find out by tailing logs. It also cannot tell you the cluster's per-member replication
+position, or *why* the agent is not doing what you expected.
+
+The optional control API closes both gaps. It is off by default:
+
+```yaml
+repmgr:
+  failoverMode: agent
+  agent:
+    control:
+      enabled: true
+      tls:
+        existingSecret: pg-control-tls    # keys: tls.crt, tls.key, ca.crt (all three)
+      allowedClientCNs: [ops-admin]       # optional; empty = any cert the CA signed
+```
+
+It is a **facade, not a second control plane**: `POST /v1/pause` and `POST /v1/switchover`
+write exactly the marker annotations the runbooks above write, and the reconcile loop
+remains the sole authority for when anything happens. kubectl and the API stay
+equivalent, so nothing you learn about one is wasted on the other.
+
+| Endpoint | Scope | What it does |
+|----------|-------|--------------|
+| `GET /v1/status` | this pod | Role, timeline, LSN, lease holder, pause/switchover intents (read fresh), WAL-replay progress, and the last restore recorded on this data volume |
+| `GET /v1/cluster` | this pod's view | Every member's position, plus the reconcile loop's latest decision and its reason |
+| `POST /v1/pause` / `POST /v1/resume` | cluster | Maintenance mode; idempotent, and it warns when the cluster is already degraded |
+| `POST /v1/switchover` | cluster | Handoff request, **rejected up front** unless the candidate is a reachable standby on the **current primary's** timeline and the cluster is not paused |
+| `DELETE /v1/switchover` | cluster | Cancel a pending request |
+| `POST /v1/restart` / `POST /v1/reload` | this pod | Restart or SIGHUP the supervised postmaster, via the reconcile loop |
+| `POST /v1/reinitialize` | this pod | **Replica only.** Discard this standby's data directory so the loop re-clones it from the primary |
+| `GET /v1/backups` | this pod | `pgbackrest info` (requires `pgbackrest.enabled`) |
+| `GET`/`POST`/`DELETE /v1/restore` | this pod | PITR restore — see below; `POST` needs its own opt-in |
+
+**Security.** mTLS is the only authentication mode: there is no token, no password, no
+plaintext, and reads are authenticated too. TLS 1.3 is required. Enabling the API without
+a Secret containing all three of `tls.crt`, `tls.key`, `ca.crt` **fails the render** — you
+cannot end up with an unauthenticated mutating port. The server re-reads the files per
+handshake, so a rotated (e.g. cert-manager-renewed) Secret takes effect without a pod
+restart. Every mutating call emits a structured audit line carrying the client
+certificate's CN, fingerprint and serial, and pause/switchover additionally stamp
+`pg-ha/paused-by` / `pg-ha/switchover-requested-by` on the marker, so the provenance
+survives a pod restart and shows in `kubectl describe`.
+
+The API listens on its own port (`9201` by default) and **never** on `9200` — keeping
+them apart is what lets a NetworkPolicy admit Prometheus to the metrics port and nobody
+to the control port. With `networkPolicy.enabled=true` the control port gets **no ingress
+rule at all**, which in an allowlist policy means deny-by-default; admit a specific
+client with `networkPolicy.agentControl.extraIngress`. There is deliberately **no
+ClusterIP Service**: node-local verbs act on whichever pod answers, and a load-balanced
+control endpoint would eventually restart the primary during an incident. Every node-local
+request must name the pod it is addressing (`{"node": "<release>-pg-0"}`) and is refused
+with 409 otherwise.
+
+Reaching it as a human:
+
+```bash
+kubectl port-forward -n <ns> pod/<release>-pg-0 9201:9201
+curl --cacert ca.crt --cert ops-admin.crt --key ops-admin.key \
+  https://127.0.0.1:9201/v1/status | jq
+
+# The kubectl runbooks' equivalents, with preflight:
+curl -X POST ... https://127.0.0.1:9201/v1/pause
+curl -X POST ... -d '{"leader":"<release>-pg-0","candidate":"<release>-pg-1"}' \
+  https://127.0.0.1:9201/v1/switchover
+```
+
+`port-forward` reaches the pod through the kubelet rather than the pod network, so on
+most CNIs it keeps working under a full deny policy — which is the intended path for
+humans. The server certificate therefore needs SANs for both `127.0.0.1`/`localhost`
+and the headless pod FQDNs (`<release>-pg-0.<release>-pg-headless.<ns>.svc.cluster.local`)
+if in-cluster automation calls it too.
+
+`GET /v1/cluster` includes the loop's `lastDecision` (action, target, reason). That is
+**diagnostic output, not a stable contract** — action names and wording change without a
+version bump.
+
+The switchover preflight measures the candidate against the **lease holder**, not against
+the pod you happen to be talking to. That matters because there is no control Service: a
+call addressed to a standby that is itself behind on timelines would otherwise refuse valid
+candidates and, worse, accept one on the stale timeline. If the primary is not visible in
+the answering pod's view of the cluster, the request is refused rather than measured
+against a substitute.
+
+New metrics on the read-only port: `pg_ha_agent_control_requests_total`,
+`_control_rejected_total`, `_control_intents_total`, `_control_restore_requests_total`.
+A refused control call is therefore alertable without exposing the control port to your
+scraper.
+
+**If the API dies, the database does not.** A control listener that cannot be constructed
+at startup is fatal — you never get a running agent with a silently missing API — but one
+that fails *later* is logged and not restarted, on the grounds that HA should survive the
+loss of its management surface. The asymmetry is easy to miss during an incident: a healthy,
+serving cluster can have no control port at all. If you automate against the API, alert on
+`pg_ha_agent_control_requests_total` going flat rather than assuming an unreachable port
+means the pod is down.
+
+#### Rebuilding a broken standby — `POST /v1/reinitialize`
+
+When a standby cannot rejoin on its own — a diverged timeline, a corrupt local copy — the
+manual fix is to delete its PVC and its pod and let the StatefulSet re-create it. This
+endpoint does the same thing without touching Kubernetes objects: it stops PostgreSQL and
+empties the data directory, and the reconcile loop's ordinary "empty data, not the chosen
+primary → clone from the lease holder" path rebuilds it. There is deliberately no second
+clone implementation — the rebuild runs through exactly the path a brand-new replica uses.
+
+```bash
+curl -X POST ... -d '{"node":"<release>-pg-1","force":true}' \
+  https://127.0.0.1:9201/v1/reinitialize
+```
+
+It needs no extra RBAC, and it is guarded three ways:
+
+- **Replica only**, established from two independent live sources rather than from cached
+  state: the leader lease is read straight from the DCS, and the durable primary marker must
+  not name this pod. Wiping the primary would discard the cluster's only copy of committed
+  writes. To rebuild a primary, hand the role away with `POST /v1/switchover` first, or
+  recover it from a backup with `POST /v1/restore` (which has its own confirmations and its
+  own authz verb). A node running read-write *without* the lease is refused too: the loop is
+  about to demote or fence it, and a destructive local action must not race that. A pod that
+  has not completed its first reconcile tick is also refused — its role is not yet
+  established, and unpopulated state is not evidence of safety.
+- **Not while a restore is in flight**, and **not while paused**: a paused loop would never
+  re-clone, leaving the replica empty and stopped.
+- **`force: true` and the pod named**, like every node-local verb.
+
+The wipe itself refuses unless the directory really is an initialized PostgreSQL data
+directory, and it empties the directory rather than removing it (it is a volume mount). A
+`postmaster.pid` whose process is **still running** is a hard refusal; one left behind by a
+crashed postmaster is recognised as stale and does not block the rebuild — which matters,
+because a crashed replica is exactly what this endpoint is for, and only a clean shutdown
+removes that file.
+
+It returns `202`: the wipe is immediate, but the clone takes as long as the database is
+large and the loop performs it. Watch `GET /v1/status` — `local.hasData` goes true when the
+clone lands, then `local.role` becomes `standby`. (`hasData` is reported only for the node
+answering the request; it is absent for peers in `GET /v1/cluster`, because a cross-pod probe
+cannot observe another member's data directory.)
+
+#### API-driven PITR restore — `repmgr.agent.control.restore`
+
+`POST /v1/restore` triggers the chart's [pgBackRest restore Job](#point-in-time-recovery).
+It is a **separate opt-in from the rest of the API**, and the reason is a genuine
+privilege trade-off you should decide deliberately:
+
+> Creating a Job requires `create` on `jobs`, and RBAC **cannot** restrict `create` by
+> `resourceName`. So this grant lets anything holding the database pods' ServiceAccount
+> token create arbitrary Jobs in the namespace — and a Job's pod may name any
+> ServiceAccount, with no separate permission check. That makes it a namespace-wide
+> privilege-escalation primitive, on a token mounted next to a PostgreSQL that runs
+> user-supplied SQL. The equivalent kubectl path
+> (`kubectl create job --from=cronjob/<release>-pg-pgbackrest-restore`) needs none of it.
+> Leave this off unless API-driven restore is worth that trade.
+
+Nothing else in the API adds any RBAC at all.
+
+**What the grant buys** is choosing the recovery point *in the request*: `targetType`,
+`target` and `backupSet` are applied to the Job the agent creates, so an operator can
+recover to an arbitrary timestamp during an incident with one call. The kubectl
+`mode: cronjob` runbook cannot do that — it requires the target in values and a
+`helm upgrade` before cloning. If you do not need request-time target selection, leave this
+off and use the kubectl path, which needs none of the RBAC above.
+
+```yaml
+repmgr:
+  agent:
+    control:
+      restore:
+        enabled: true
+        allowedClientCNs: [dba-break-glass]   # required; empty denies everyone
+```
+
+It requires `pgbackrest.enabled`, `pgbackrest.restore.enabled` and
+`pgbackrest.restore.mode=cronjob` (all render-guarded), and `allowedClientCNs` here is a
+**second, restore-only** authz list: a client cleared for pause/switchover cannot
+overwrite a data directory.
+
+The two lists **compose** — `control.allowedClientCNs` is the door to the API and
+`control.restore.allowedClientCNs` an extra lock on this one verb — so when the outer list
+is non-empty a restore client must appear in **both**. A 403 tells you which list refused
+the call.
+
+What it does and does not control:
+
+- The Job is a **verbatim clone** of the rendered CronJob's `jobTemplate` — identical to
+  `kubectl create job --from`, so image, ServiceAccount (with its token still not
+  mounted), security contexts, volumes and secret references all come from the release.
+  The agent overrides only `TARGET_TYPE`, `TARGET` and `BACKUP_SET`, and it refuses to
+  overwrite any env backed by `valueFrom` (it cannot turn a `secretKeyRef` into a literal).
+  It overrides **only what the request specifies**: omit `targetType`/`target` and the Job
+  keeps whatever `pgbackrest.restore.targetType`/`target` the release pinned, rather than
+  being blanked to "latest" — the response reports the values actually in effect as
+  `effectiveTargetType`/`effectiveTarget`/`effectiveBackupSet`, so you can see which
+  recovery point is really about to be applied.
+- **Which volume is restored into is not an API decision.** That is
+  `pgbackrest.restore.podOrdinal`, rendered into the Job; a `podOrdinal` in the body may
+  only *confirm* it (409 on mismatch). The request must also be addressed to the pod that
+  owns that volume.
+- The API **never sets pgBackRest's `--force`**, which bypasses the `postmaster.pid`
+  interlock — the last guard against restoring over a live volume. If you genuinely need
+  the stale-pid bypass, set `pgbackrest.restore.force=true` in values, where it is
+  reviewable.
+- Destructive by declaration: `force: true` and `confirm: "<statefulset name>"` are both
+  required, and the cluster must already be **paused** — an active reconcile loop would
+  restart the postmaster the restore needs stopped. (The exact confirm value is whatever
+  `GET /v1/status` reports as `cluster`; it is `<release>-pg` unless the release name
+  already contains the chart name.)
+
+One call performs the whole safe sequence: verify paused → verify the confirmations →
+stop the local postmaster → create the Job, returning `202` with the Job name.
+
+**Do not forget the `POST /v1/resume` at the end.** Maintenance mode makes the reconcile
+loop a no-op, so a restored node that is scaled back up while still paused never starts
+PostgreSQL and never goes Ready — the cluster stays down until you resume. The API will not
+clear your pause on its own, and `nextSteps` lists the resume as an explicit step.
+
+**But not before the restore finishes.** `POST /v1/resume` is refused with 409 while the
+restore Job is `pending` or `running`: resuming then would let the loop start PostgreSQL on
+a data directory pgbackrest is still rewriting. Wait for `GET /v1/restore` to report
+`succeeded` (or `failed`), or abandon the restore with `DELETE /v1/restore` first. The same
+interlock guards `POST /v1/reinitialize`.
+
+Two limits on that interlock, both worth knowing before you rely on it:
+
+- **It sees only the Job the API creates** (`<release>-pg-pgbackrest-restore-api`). A
+  restore you started the kubectl way —
+  `kubectl create job --from=cronjob/<release>-pg-pgbackrest-restore restore-now` — carries
+  a different name, and finding it would need `list jobs`, which this chart deliberately
+  does not grant. So **do not mix the two paths**: if you trigger a restore with kubectl,
+  clear the pause with kubectl too, and do not use `POST /v1/resume` or
+  `POST /v1/reinitialize` until the Job is done. The same applies in reverse — clearing the
+  pause with `kubectl annotate ... pg-ha/pause-` bypasses the check the API would have made.
+- **It fails closed**, so with restore enabled a transient apiserver error makes
+  `POST /v1/resume` answer `502` and the cluster stays paused (and therefore will not fail
+  over) until the Job read succeeds. Deliberate — the alternative is starting PostgreSQL on
+  a directory that may still be being rewritten — but it is a runtime dependency resume does
+  not otherwise have.
+
+```bash
+curl -X POST ... -d '{}' https://127.0.0.1:9201/v1/pause
+curl -X POST ... https://127.0.0.1:9201/v1/restore \
+  -d '{"node":"<release>-pg-0","confirm":"<release>-pg","force":true,
+       "targetType":"time","target":"2026-08-01 09:55:00+00"}'
+```
+
+**What it deliberately does not do: scale the StatefulSet.** Scaling to 0 deletes every
+agent — including the one that would report progress — so it stays an operator step and the
+response hands back the commands in `nextSteps`.
+
+Whether you need it depends on scheduling, and this is worth knowing before an incident:
+**ReadWriteOnce binds a volume to a node, not to a pod.** A restore Job that the scheduler
+places on the same node as the target pod therefore starts *immediately*, with the
+StatefulSet still scaled up — that is safe here only because this flow already stopped the
+postmaster and required the cluster to be paused. **That pair, not the scale-down, is what
+keeps a restore off a live data directory.** A Job placed on any other node sits `Pending`
+on the volume until you scale down, which is what the `hint` explains.
+
+With standbys, scale down regardless: they must not stream from a primary being rewritten
+underneath them, and they re-clone onto the new timeline afterwards (see
+[the multi-replica restore behaviour](#point-in-time-recovery)).
+
+Progress, honestly:
+
+- If the Job had to wait for the volume, `GET /v1/restore` reports `pending` and explains
+  why in `hint` — "the StatefulSet is still scaled up, so the volume cannot attach", the
+  most common mistake. Once you scale down to free it there is **no agent alive** to ask,
+  so nothing reports the copy's progress from then on.
+- After scale-up, `GET /v1/status` reports **WAL-replay progress** (`recovery.replayLsn`,
+  `recovery.replayLagBytes`, and `recovery.lastReplayTime` — directly comparable to a
+  `targetType: time` target). For a PITR this is usually the phase you are actually
+  waiting on.
+- `lastRestore` reports the **outcome** — which backup set, which target, exit code,
+  post-restore control-file state, who requested it — read from a record `restore.sh`
+  writes onto the data volume. It outlives the Job and its logs, so it answers "what
+  happened to my restore?" later, and doubles as provenance for where this PGDATA came
+  from. The agent removes that record when the directory stops being what it describes (a
+  `POST /v1/reinitialize` wipe, or a clone by the reconcile loop), so a rebuilt replica
+  never reports a backup set as the origin of data it streamed from the primary.
+- Live file-copy percentage is available only via `restore.readPodLogs: true`, which adds
+  `get pods/log` **namespace-wide** (the Job's pod name is generated, so it cannot be
+  scoped) and only helps when some agent is still running, i.e. `podOrdinal > 0`. Off by
+  default; the signals above need no extra privilege.
+
 ### Monitoring the agent (agent mode)
 
 The agent serves read-only Prometheus metrics on port `9200` (`pg_ha_agent_is_leader`, `_is_paused`, `_renew_failures_total`, `_promotions_total`, `_demotes_total`, `_fences_total`, `_reconcile_errors_total`, `_recovery_starts_total`). With the Prometheus Operator installed:

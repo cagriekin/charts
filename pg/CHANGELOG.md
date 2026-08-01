@@ -1,5 +1,196 @@
 # pg chart changelog
 
+## 1.9.0 - 2026-08-01
+
+### Added
+
+- **Authenticated control REST API for the agent** (#276), off by default. Agent mode only.
+
+  The existing pause and switchover runbooks are `kubectl annotate` calls on the marker
+  ConfigMap. They stay the reference, and they need no extra machinery — but they cannot
+  check a request before accepting it: `kubectl annotate ... switchover-target=<pod>`
+  succeeds even when the pod does not exist, is on a divergent timeline, or is far behind,
+  and you find out by reading logs. Nor can they tell you each member's replication
+  position, or *why* the loop is not doing what you expected.
+
+  ```yaml
+  repmgr:
+    failoverMode: agent
+    agent:
+      control:
+        enabled: true
+        tls:
+          existingSecret: pg-control-tls    # tls.crt, tls.key, ca.crt — all three
+        allowedClientCNs: [ops-admin]       # optional; empty = any cert the CA signed
+  ```
+
+  It is a **facade, not a second control plane**: pause/switchover write exactly the marker
+  annotations kubectl writes, and the reconcile loop remains the sole authority for when
+  anything happens — so kubectl and the API stay equivalent. What it adds is preflight
+  validation, a synchronous answer, and state that existed nowhere else:
+  `GET /v1/cluster` reports every member's timeline/LSN **and the loop's latest decision
+  with its reason**, which was previously log-only.
+
+  Surface: `GET /v1/status`, `GET /v1/cluster`, `POST /v1/pause`, `POST /v1/resume`,
+  `POST /v1/switchover`, `DELETE /v1/switchover`, `POST /v1/restart`, `POST /v1/reload`,
+  `POST /v1/reinitialize`, `GET /v1/backups`, and `GET`/`POST`/`DELETE /v1/restore`.
+
+  `POST /v1/reinitialize` rebuilds a standby that cannot rejoin on its own, replacing the
+  "delete the PVC and the pod" runbook: it stops PostgreSQL and empties the data directory,
+  and the loop's ordinary empty-data clone path does the rebuild — no second clone
+  implementation. **Replica only**: it refuses on the lease holder (checked against the
+  lease, not a cached role), refuses a node running read-write without the lease, refuses
+  while paused (a paused loop would never re-clone), and requires `force: true`. The wipe
+  itself refuses anything that is not an initialized data directory, or that still has a
+  `postmaster.pid`. No extra RBAC.
+
+  Security posture:
+
+  - **mTLS only** — no token, no password, no plaintext, TLS 1.3, and reads are
+    authenticated too. Enabling it without all three TLS files **fails the render**, so you
+    cannot end up with an unauthenticated mutating port. The material is re-read per
+    handshake, so a rotated (cert-manager-renewed) Secret needs no pod restart.
+  - **Its own port** (`9201`), never `9200`. The metrics port gains no route, and a render
+    guard refuses `control.port: 9200`. Under `networkPolicy.enabled` the control port gets
+    no ingress rule at all — deny-by-default in an allowlist policy — with
+    `networkPolicy.agentControl.extraIngress` to admit a named client. `kubectl
+    port-forward` bypasses the pod network on most CNIs, so it stays the path for humans.
+  - **No control Service**: node-local verbs act on whichever pod answers, so each request
+    must name the pod it addresses (`{"node": "..."}`) and is refused with 409 otherwise.
+  - Structured audit line per mutating call (client CN, certificate fingerprint, serial),
+    plus `pg-ha/paused-by` and `pg-ha/switchover-requested-by` on the marker so the
+    provenance survives a pod restart and shows in `kubectl describe`.
+  - New read-only metrics: `pg_ha_agent_control_requests_total`, `_control_rejected_total`,
+    `_control_intents_total`, `_control_restore_requests_total`.
+
+  Enabling the API adds **no Kubernetes RBAC**.
+
+- **API-driven PITR restore** (`repmgr.agent.control.restore`, #276), a **separate** opt-in
+  on top of the API, because it is the one verb that widens the database pods' privileges:
+  `create` on `jobs` cannot be restricted by `resourceName`, so the grant lets anything
+  holding the pods' ServiceAccount token create arbitrary Jobs in the namespace — and a
+  Job's pod may name any ServiceAccount. That is a namespace-wide privilege-escalation
+  primitive on a token mounted beside a PostgreSQL that runs user-supplied SQL, and the
+  kubectl path (`kubectl create job --from=cronjob/...`) needs none of it. It is documented
+  in the README and in `rbac.yaml` itself; leave it off unless the trade is worth it.
+
+  What the grant buys is choosing the recovery point **in the request**
+  (`targetType`/`target`/`backupSet` are applied to the Job the agent creates), so an
+  operator can recover to an arbitrary timestamp with one call. The kubectl `mode: cronjob`
+  runbook cannot: it needs the target in values and a `helm upgrade` first. Without that
+  requirement, use the kubectl path and skip the RBAC entirely.
+
+  What bounds it:
+
+  - The Job is a **verbatim clone** of the rendered restore CronJob's `jobTemplate` —
+    identical to `kubectl create job --from`, so image, ServiceAccount (token still
+    unmounted), security contexts, volumes and secret references all come from the release.
+    Only `TARGET_TYPE`/`TARGET`/`BACKUP_SET` are overridden, and an env backed by
+    `valueFrom` is never overwritten (a `secretKeyRef` cannot become a request-supplied
+    literal).
+  - **Which volume is restored into is not an API decision** — that is
+    `pgbackrest.restore.podOrdinal`, rendered into the Job; the body may only confirm it.
+  - The API **never sets pgBackRest's `--force`**, so the `postmaster.pid` interlock stays
+    armed; the stale-pid bypass remains a reviewable values change.
+  - Requires `force: true`, `confirm: "<statefulset name>"`, a **second** restore-only CN
+    allowlist, and a **paused** cluster; one call then verifies, stops the local postmaster
+    and creates the Job.
+  - It deliberately does **not** scale the StatefulSet — scaling to 0 deletes every agent,
+    including the one that would report progress — and returns the remaining commands in
+    `nextSteps`. Net effect: it removes the `kubectl create job --from` step, nothing more.
+    Whether a scale-down is needed at all depends on scheduling: ReadWriteOnce binds a
+    volume to a NODE, so a Job co-scheduled with the target pod starts immediately. What
+    keeps a restore off a live data directory is the required pause plus the postmaster
+    stop, not the scale-down.
+  - **The runbook ends with `POST /v1/resume`, and it is not optional.** Maintenance mode
+    makes the reconcile loop a no-op, so a restored node scaled back up while still paused
+    never starts PostgreSQL and never goes Ready. The API will not clear an operator's
+    pause on its own; `nextSteps` lists the resume as a required step.
+
+  Progress and provenance: `restore.sh` now records the outcome of each restore attempt to
+  `pgbackrest-restore.status` beside PGDATA (backup set, target, exit code, post-restore
+  control-file state, requester). It outlives the Job and its logs, and the API returns it
+  as `lastRestore` on `GET /v1/status` — which also doubles as a record of where a data
+  directory came from. `GET /v1/status` additionally reports **WAL-replay progress**
+  (`recovery.replayLsn`, `replayLagBytes`, `lastReplayTime`), which for a PITR is usually
+  the phase you are waiting on. Live file-copy percentage needs
+  `restore.readPodLogs: true`, which grants namespace-wide `get pods/log` and only helps
+  when an agent is still running (`podOrdinal > 0`); it is off by default.
+
+### Fixed (pre-release, from the review of this feature)
+
+- The reinitialize replica-only gate now reads the leader lease **live from the DCS** and
+  additionally requires that the durable primary marker not name this pod, instead of
+  trusting the once-per-tick snapshot. The control listener starts before the first
+  reconcile tick, when that snapshot is all-zero, so the previous check could have admitted
+  a wipe of the actual primary during startup. A pod that has not published an observation
+  yet is refused outright. The restart interlock for the serving primary reads the live
+  lease for the same reason.
+- `POST /v1/resume` and `POST /v1/reinitialize` now refuse while a restore Job is `pending`
+  or `running` (fail-closed if that cannot be determined). The restore runbook ends in a
+  resume, so resuming too early would have let the reconcile loop start PostgreSQL on a data
+  directory pgbackrest was still rewriting.
+- `POST /v1/restore` overrides only the recovery-point fields the request actually
+  specifies. It previously blanked a `pgbackrest.restore.targetType`/`target` pinned in
+  values whenever a request omitted them, restoring the latest backup and replaying all WAL
+  instead of stopping at the reviewed point in time. The response now reports
+  `effectiveTargetType`/`effectiveTarget`/`effectiveBackupSet`, read back from the created Job.
+- The data-directory wipe now distinguishes a **stale** `postmaster.pid` (its process is
+  gone -- what a crashed postmaster leaves behind, and precisely the replica reinitialize
+  exists to rebuild) from a live one, which remains a hard refusal. An unreadable or
+  malformed pid file is treated as live.
+- `replace: true` waits for the previous restore Job to be fully deleted before creating its
+  replacement. Foreground propagation returns while the object still exists behind its
+  finalizer, so the create hit `AlreadyExists` -- after the handler had already stopped
+  PostgreSQL.
+- A failed restore no longer overwrites the data directory's provenance: `restore.sh` keeps
+  the previous record's backup set and target (many failures copy nothing at all) and
+  records the failed attempt separately as `attemptedTargetType`/`attemptedTarget`/
+  `attemptedBackupSet`. A mistyped PITR target previously erased where the data really came from.
+- `hasData` is reported only for the node answering the request and is absent for peers,
+  rather than being emitted as `false` for every peer -- including a primary plainly holding
+  data, and a replica whose re-clone had in fact completed.
+- The restore feature gate now emits its audit line and increments
+  `pg_ha_agent_control_rejected_total` itself. It short-circuits the authorization check by
+  design (so a missing values flag reports as such rather than as a 403), which meant
+  probing of the most destructive routes left no trace in the audit log or metrics.
+- `GET /v1/restore` is feature-gated like the mutating restore routes: it needs the `get
+  jobs` grant that is rendered only when restore is enabled, so it previously failed with a
+  Forbidden error that read as a broken Role.
+- The control server's response-write deadline is derived from the request budget instead of
+  being a fixed 90s, so a long intent on a release with a wide reconcile interval returns
+  its 504 or 200 rather than a dropped connection.
+- The switchover preflight compares the candidate's timeline against the **lease holder**
+  rather than against whichever pod answered the call. There is no control Service, so a
+  request addressed to a standby that was itself behind on timelines would refuse a valid
+  candidate and — the dangerous half — accept one on the stale timeline, yielding a `202`
+  the loop then silently sat on. An unreadable primary timeline, an invisible lease holder
+  and a cluster with no lease holder are now all refusals instead of a skipped comparison.
+- Node-local operations now run under the **request's** deadline instead of the agent's
+  process-lifetime context. A postmaster that ignored SIGINT would otherwise hold the
+  operation mutex indefinitely: the reconcile loop stops ticking and the leadership fence
+  blocks behind the same mutex, so a node that comes back read-write is never demoted. The
+  stop now escalates to SIGKILL exactly as the fence path does; a restart still brings
+  PostgreSQL back up afterwards, while a forced stop for a restore is reported as a failure
+  (SIGKILL leaves the `postmaster.pid` that guards the data directory).
+- The `lastRestore` record is removed when the data directory stops being what it describes
+  — a reinitialize wipe, or a clone by the reconcile loop. It lives beside PGDATA so it can
+  outlive the restore Job, which meant a wipe could not reach it and a rebuilt replica went
+  on reporting a backup set as the provenance of data streamed from the primary.
+- `restore.sh` keeps the attempted recovery point in separate variables instead of packing
+  it into one `|`-delimited string, so an operator- or API-supplied target containing that
+  character no longer corrupts the failure record.
+- Request bodies with trailing content after the JSON object (`{"force":true} {...}`) are
+  rejected rather than silently half-read, matching the existing unknown-field strictness.
+- Dropped `truncated` from the restore-progress payload: nothing ever set it, so it
+  advertised a signal the agent does not produce.
+
+### Changed
+
+- The agent's read-only `:9200` server now sets HTTP timeouts (read-header/read/write/idle)
+  and a header-size cap. It had none, so a client opening connections without sending
+  requests could accumulate goroutines in the process that supervises PostgreSQL.
+
 ## 1.8.1 - 2026-07-31
 
 ### Added

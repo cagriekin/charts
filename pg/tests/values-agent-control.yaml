@@ -1,0 +1,86 @@
+postgresql:
+  image:
+    repository: postgres
+    tag: 18.1-trixie
+    pullPolicy: IfNotPresent
+
+  replicaCount: 1
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  persistence:
+    enabled: true
+    size: 1Gi
+
+  database: testdb
+  username: testuser
+
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+  affinity: {}
+
+  podDisruptionBudget:
+    enabled: false
+
+repmgr:
+  image:
+    repository: cagriekin/repmgr
+    tag: trixie-5.5.0-29
+    pullPolicy: IfNotPresent
+
+  enabled: true
+  failoverMode: agent
+
+  username: repmgr
+  database: repmgr
+
+  agent:
+    # Control REST API (#276). The Secret is created by the suite from a throwaway CA
+    # before install; the chart's render guard requires it to be named here.
+    control:
+      enabled: true
+      tls:
+        existingSecret: pg-agent-control-tls
+      # Only this CN may call the API, so the suite can prove an unlisted identity is
+      # refused with a certificate the same CA signed.
+      allowedClientCNs:
+        - ops-admin
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+pgpool:
+  enabled: false
+
+prometheusExporter:
+  enabled: false
+
+backup:
+  enabled: false
+
+service:
+  type: ClusterIP
+  port: 5432

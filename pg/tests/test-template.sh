@@ -3217,5 +3217,183 @@ pgv_guard_rc=0
 helm template test-pgv "${PGVECTOR_DIR}" --set-json 'postgresql.extraEnv=[{"name":"PGDATA","value":"/x"}]' >/dev/null 2>&1 || pgv_guard_rc=$?
 assert_eq "#262 pgvector: guards apply too" "1" "$([ "${pgv_guard_rc}" -ne 0 ] && echo 1 || echo 0)"
 
+# --- #276 agent control REST API ---
+
+ctl_base=(--set repmgr.enabled=true --set repmgr.failoverMode=agent
+  --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18)
+
+# Default: the control API is OFF, and nothing about it appears anywhere. This is the
+# byte-stability contract -- a release that does not enable it renders as before.
+ctl_off=$(helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" 2>&1)
+assert_not_contains "#276 default: no control listener" "${ctl_off}" "agent-control"
+assert_not_contains "#276 default: no CONTROL_ env" "${ctl_off}" "CONTROL_ENABLED"
+assert_not_contains "#276 default: no control TLS mount" "${ctl_off}" "/etc/agent-control-tls"
+assert_not_contains "#276 default: no batch RBAC" "${ctl_off}" 'resources: \["jobs"\]'
+assert_not_contains "#276 default: no pods/log RBAC" "${ctl_off}" 'resources: \["pods/log"\]'
+
+# Enabling it without the mTLS Secret must fail at RENDER, not leave the operator with
+# a crash-looping database: the agent refuses to open an unauthenticated mutating port.
+ctl_nosecret_rc=0
+helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
+  --set repmgr.agent.control.enabled=true >/dev/null 2>&1 || ctl_nosecret_rc=$?
+assert_eq "#276 enabled without tls.existingSecret fails to render" "1" "$([ "${ctl_nosecret_rc}" -ne 0 ] && echo 1 || echo 0)"
+
+# The control API is served by the Go agent, so repmgrd mode cannot offer it.
+ctl_repmgrd_rc=0
+helm template test-pg "${CHART_DIR}" --set repmgr.enabled=true --set repmgr.failoverMode=repmgrd \
+  --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
+  --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls \
+  >/dev/null 2>&1 || ctl_repmgrd_rc=$?
+assert_eq "#276 control in repmgrd mode fails to render" "1" "$([ "${ctl_repmgrd_rc}" -ne 0 ] && echo 1 || echo 0)"
+
+# Sharing the metrics port would defeat the whole point of separate listeners: the
+# NetworkPolicy admits every same-namespace pod to 9200 so scrapes work.
+ctl_port_rc=0
+helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
+  --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls \
+  --set repmgr.agent.control.port=9200 >/dev/null 2>&1 || ctl_port_rc=$?
+assert_eq "#276 control.port=9200 (the metrics port) fails to render" "1" "$([ "${ctl_port_rc}" -ne 0 ] && echo 1 || echo 0)"
+ctl_port5432_rc=0
+helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
+  --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls \
+  --set repmgr.agent.control.port=5432 >/dev/null 2>&1 || ctl_port5432_rc=$?
+assert_eq "#276 control.port=5432 fails to render" "1" "$([ "${ctl_port5432_rc}" -ne 0 ] && echo 1 || echo 0)"
+
+# Enabled: port, env and the mTLS mount, and STILL no restore RBAC (separate opt-in).
+ctl_on=$(helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
+  --set repmgr.agent.control.enabled=true \
+  --set repmgr.agent.control.tls.existingSecret=ctl-tls 2>&1)
+assert_contains "#276 enabled: control containerPort" "${ctl_on}" "name: agent-control"
+assert_contains "#276 enabled: default port 9201" "${ctl_on}" "containerPort: 9201"
+assert_contains "#276 enabled: CONTROL_ENABLED" "${ctl_on}" "CONTROL_ENABLED"
+assert_contains "#276 enabled: CONTROL_ADDR is the control port" "${ctl_on}" '":9201"'
+assert_contains "#276 enabled: server cert path" "${ctl_on}" "/etc/agent-control-tls/tls.crt"
+assert_contains "#276 enabled: client CA path" "${ctl_on}" "/etc/agent-control-tls/ca.crt"
+assert_contains "#276 enabled: TLS secret mounted" "${ctl_on}" 'secretName: "ctl-tls"'
+assert_contains "#276 enabled: metrics port still present" "${ctl_on}" "name: agent-metrics"
+# Enabling the API alone must NOT widen Kubernetes RBAC at all.
+assert_not_contains "#276 enabled: no Job RBAC without restore" "${ctl_on}" 'resources: \["jobs"\]'
+assert_not_contains "#276 enabled: no CronJob RBAC without restore" "${ctl_on}" 'resources: \["cronjobs"\]'
+assert_not_contains "#276 enabled: restore env absent" "${ctl_on}" "CONTROL_RESTORE_ENABLED"
+
+# A custom port must reach both the containerPort and CONTROL_ADDR.
+ctl_port=$(helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
+  --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls \
+  --set repmgr.agent.control.port=9301 --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#276 custom port: containerPort" "${ctl_port}" "containerPort: 9301"
+assert_contains "#276 custom port: CONTROL_ADDR" "${ctl_port}" '":9301"'
+
+# CN allowlist passes through as a comma-separated list.
+ctl_cns=$(helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
+  --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls \
+  --set 'repmgr.agent.control.allowedClientCNs={ops-admin,ci-bot}' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#276 allowlist: CNs joined" "${ctl_cns}" "ops-admin,ci-bot"
+
+# --- restore triggering: the separate opt-in with the sharp RBAC ---
+
+ctl_restore_args=("${ctl_base[@]}"
+  --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls
+  --set repmgr.agent.control.restore.enabled=true
+  --set 'repmgr.agent.control.restore.allowedClientCNs={dba-break-glass}'
+  --set pgbackrest.enabled=true --set pgbackrest.s3.endpoint=https://s3 --set pgbackrest.s3.bucket=b
+  --set pgbackrest.s3.keyType=auto)
+
+# Every dependency is a render guard, because each one makes the API unusable in a way
+# that would otherwise only show up as a failed request during an incident.
+for guard in \
+  "--set repmgr.agent.control.enabled=false:control disabled" \
+  "--set pgbackrest.restore.enabled=false:restore Job not rendered" \
+  "--set pgbackrest.restore.mode=job:mode=job has no CronJob to clone" \
+  "--set repmgr.agent.control.restore.allowedClientCNs=null:empty allowlist denies everyone"
+do
+  flag="${guard%%:*}"; why="${guard##*:}"
+  rc=0
+  # shellcheck disable=SC2086
+  helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+    ${flag} >/dev/null 2>&1 || rc=$?
+  assert_eq "#276 restore guard: ${why}" "1" "$([ "${rc}" -ne 0 ] && echo 1 || echo 0)"
+done
+
+# readPodLogs without restore is a mistake worth naming: it only widens RBAC.
+ctl_logs_rc=0
+helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
+  --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls \
+  --set repmgr.agent.control.restore.readPodLogs=true >/dev/null 2>&1 || ctl_logs_rc=$?
+assert_eq "#276 readPodLogs without restore fails to render" "1" "$([ "${ctl_logs_rc}" -ne 0 ] && echo 1 || echo 0)"
+
+ctl_restore=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" \
+  --set pgbackrest.restore.enabled=true 2>&1)
+assert_contains "#276 restore: env enabled" "${ctl_restore}" "CONTROL_RESTORE_ENABLED"
+assert_contains "#276 restore: allowlist passed" "${ctl_restore}" "dba-break-glass"
+assert_contains "#276 restore: CronJob to clone named" "${ctl_restore}" "test-pg-pgbackrest-restore"
+assert_contains "#276 restore: deterministic Job name" "${ctl_restore}" "test-pg-pgbackrest-restore-api"
+assert_contains "#276 restore: pod ordinal passed for confirmation" "${ctl_restore}" "CONTROL_RESTORE_POD_ORDINAL"
+# create on jobs cannot be resourceName-scoped; get/delete can, and must be.
+assert_contains "#276 restore RBAC: create jobs" "${ctl_restore}" 'resources: \["jobs"\]'
+assert_contains "#276 restore RBAC: get/delete scoped to the one Job" "${ctl_restore}" 'resourceNames: \["test-pg-pgbackrest-restore-api"\]'
+assert_contains "#276 restore RBAC: CronJob get scoped" "${ctl_restore}" 'resourceNames: \["test-pg-pgbackrest-restore"\]'
+# pods/log stays out unless explicitly asked for.
+assert_not_contains "#276 restore RBAC: no pods/log by default" "${ctl_restore}" 'resources: \["pods/log"\]'
+# The requester reaches the container via the downward API, for the record restore.sh
+# writes onto the data volume.
+assert_contains "#276 restore: requester env from pod annotation" "${ctl_restore}" "metadata.annotations\['pg-ha/requested-by'\]"
+
+ctl_restore_logs=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" \
+  --set pgbackrest.restore.enabled=true --set repmgr.agent.control.restore.readPodLogs=true 2>&1)
+assert_contains "#276 readPodLogs: env set" "${ctl_restore_logs}" "CONTROL_RESTORE_READ_POD_LOGS"
+assert_contains "#276 readPodLogs: pods/log granted" "${ctl_restore_logs}" 'resources: \["pods/log"\]'
+
+# The restore program records its outcome on the data volume so it outlives the Job.
+ctl_restore_sh=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" \
+  --set pgbackrest.restore.enabled=true --show-only templates/pgbackrest-configmap.yaml 2>&1)
+assert_contains "#276 restore.sh: writes a status record" "${ctl_restore_sh}" "pgbackrest-restore.status"
+assert_contains "#276 restore.sh: atomic write via a temp file" "${ctl_restore_sh}" "STATUS_FILE}.tmp"
+# The record is a cross-language contract: restore.sh (bash) writes it and the agent's
+# internal/pgbackrest (Go) parses it. Assert every key the parser reads, so renaming one
+# on either side is caught here rather than silently reporting an empty lastRestore.
+for key in startedAt finishedAt stanza targetType target backupSet exitCode requestedBy clusterState checkpoint; do
+  assert_contains "#276 restore.sh: records ${key}" "${ctl_restore_sh}" "${key}="
+done
+# The trap is installed AFTER the postmaster.pid interlock, so a refused attempt cannot
+# clobber the record of the restore the data directory actually came from.
+assert_contains "#276 restore.sh: outcome trap installed on EXIT" "${ctl_restore_sh}" "trap 'write_status"
+# A FAILED attempt must not become the directory's provenance either: many failures copy
+# nothing, so the previous record's descriptive fields are kept and the attempt is recorded
+# separately. Without this a mistyped PITR target erases where the data really came from.
+assert_contains "#276 restore.sh: reads the previous record on failure" "${ctl_restore_sh}" "prev_field"
+for key in attemptedTargetType attemptedTarget attemptedBackupSet; do
+  assert_contains "#276 restore.sh: records ${key} on failure" "${ctl_restore_sh}" "${key}="
+done
+
+# --- NetworkPolicy: deny-by-default on the control port ---
+
+ctl_np=$(helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
+  --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls \
+  --set networkPolicy.enabled=true --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "#276 netpol: metrics port still admitted" "${ctl_np}" "port: 9200"
+# No rule for the control port: this policy is an allowlist, so absence IS deny.
+assert_not_contains "#276 netpol: control port has no default rule" "${ctl_np}" "port: 9201"
+
+ctl_np_open=$(helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
+  --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls \
+  --set networkPolicy.enabled=true \
+  --set-json 'networkPolicy.agentControl.extraIngress=[{"ports":[{"port":9201,"protocol":"TCP"}],"from":[{"podSelector":{"matchLabels":{"app":"ops"}}}]}]' \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "#276 netpol: extraIngress admits a named client" "${ctl_np_open}" "port: 9201"
+assert_contains "#276 netpol: extraIngress carries its selector" "${ctl_np_open}" "app: ops"
+
+# --- pgvector parity (symlinked templates, its own values defaults) ---
+
+pgv_ctl_off=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=agent 2>&1)
+assert_not_contains "#276 pgvector default: no control listener" "${pgv_ctl_off}" "agent-control"
+pgv_ctl_on=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=agent \
+  --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls 2>&1)
+assert_contains "#276 pgvector: control renders" "${pgv_ctl_on}" "name: agent-control"
+pgv_ctl_rc=0
+helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=agent \
+  --set repmgr.agent.control.enabled=true >/dev/null 2>&1 || pgv_ctl_rc=$?
+assert_eq "#276 pgvector: guards apply too" "1" "$([ "${pgv_ctl_rc}" -ne 0 ] && echo 1 || echo 0)"
+
 end_suite
 print_summary
