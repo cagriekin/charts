@@ -289,8 +289,12 @@ case "${phase}" in
 esac
 assert_eq "the restore Job is pending, running or already complete" "ok" "${phase_ok}"
 if [ "${phase}" = "pending" ]; then
-  # Only a Job that really is waiting for the volume gets the scale-down hint.
-  assert_contains "a pending Job's hint names the volume it cannot attach" \
+  # Only a Job that really is waiting for the volume gets the scale-down hint. The agent
+  # suppresses it for waiting reasons that explain themselves (ImagePullBackOff and
+  # friends), so echo the observed reason: if this ever fails, the reason is the answer.
+  observed_reason=$(jq -r '.waitingReason // ""' <<< "${pending}")
+  echo "  note: pending Job waitingReason=${observed_reason:-<none>}"
+  assert_contains "a pending Job's hint names the volume it cannot attach (waitingReason=${observed_reason:-<none>})" \
     "$(jq -r '.hint' <<< "${pending}")" "data-${POD0}"
 else
   echo "  note: the restore Job co-scheduled with ${POD0} and started without a scale-down"
