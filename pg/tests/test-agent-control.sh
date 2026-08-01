@@ -155,6 +155,26 @@ wait_api_ready() {
   done
   return 1
 }
+# wait_candidate_ready polls the LEADER's view until the named peer satisfies exactly the
+# conditions POST /v1/switchover enforces: reachable, a standby, with a readable timeline
+# matching the leader's. Needed after a reinitialize -- the leader's snapshot refreshes once
+# per reconcile tick, and while a peer is being wiped and re-cloned it is legitimately
+# unreachable, so a handoff requested too early is (correctly) refused with 409.
+wait_candidate_ready() { # wait_candidate_ready <peer>
+  local cand="$1" c ok ctl ltl
+  for _ in $(seq 1 60); do
+    c=$(api_body GET /v1/cluster)
+    ok=$(jq -r --arg n "${cand}" '[.members[] | select(.name==$n) | .reachable, .timelineKnown, (.role=="standby")] | all' <<< "${c}" 2>/dev/null || echo false)
+    ctl=$(jq -r --arg n "${cand}" '.members[] | select(.name==$n) | .timeline' <<< "${c}" 2>/dev/null || echo x)
+    ltl=$(jq -r '.members[] | select(.self==true) | .timeline' <<< "${c}" 2>/dev/null || echo y)
+    if [ "${ok}" = "true" ] && [ -n "${ctl}" ] && [ "${ctl}" = "${ltl}" ]; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
 wait_http_ready() { # wait_http_ready <url>
   for _ in $(seq 1 30); do
     local code
@@ -383,6 +403,13 @@ assert_eq "its API reports it has data" "true" "$(jq -r '.local.hasData' <<< "${
 if start_pf "${LEADER}" "${LOCAL_PORT}" 9201; then pf_ok=ok; else pf_ok=fail; fi
 wait_api_ready || true
 assert_eq "port-forward back to the leader" "ok" "${pf_ok}"
+
+# A rebuilt replica must become a fully usable one, not merely a running one: wait for the
+# leader to see it as a caught-up same-timeline standby, which is exactly what makes it a
+# legal switchover target. (Asking before this holds gets a correct 409 from the preflight.)
+echo "  Waiting for the rebuilt standby to re-qualify as a switchover candidate (up to 300s)..."
+if wait_candidate_ready "${CANDIDATE}"; then cand_ready=ok; else cand_ready=fail; fi
+assert_eq "the rebuilt standby re-qualifies as a switchover candidate" "ok" "${cand_ready}"
 
 # --- the switchover actually moves leadership ---
 
