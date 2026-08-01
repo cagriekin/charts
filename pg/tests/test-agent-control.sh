@@ -219,9 +219,15 @@ nocert_rc=0
 curl -sS --cacert "${CERTDIR}/ca.crt" "${BASE}/v1/status" >/dev/null 2>&1 || nocert_rc=$?
 assert_gt "a client with NO certificate is refused" "${nocert_rc}" "0"
 
-# Plaintext against the TLS port must not be served.
+# Plaintext against the TLS port must not be served. Go's TLS server answers and closes
+# abruptly, and kubectl port-forward sometimes tears the whole forward down with it -- so
+# re-establish it afterwards rather than letting every later call fail with a connection
+# error that looks like an authorization result.
 plain_body=$(curl -sS "http://127.0.0.1:${LOCAL_PORT}/v1/status" 2>&1 || true)
 assert_not_contains "plaintext HTTP is not served on the control port" "${plain_body}" '"node"'
+if start_pf "${LEADER}" "${LOCAL_PORT}" 9201; then pf_ok=ok; else pf_ok=fail; fi
+wait_api_ready || true
+assert_eq "the forward survives (or is restored after) the plaintext probe" "ok" "${pf_ok}"
 
 # A certificate from the SAME CA but an unlisted CN is authenticated yet unauthorized.
 intruder_code=$(curl -sS -o /dev/null -w '%{http_code}' \
