@@ -17,23 +17,23 @@ var ErrRewindDiverged = errors.New("mechanism: rewind diverged, reclone required
 // Conn is how to reach a peer PostgreSQL node for clone/follow/rejoin. Password is
 // passed via PGPASSWORD, never on the command line or in logged argv.
 type Conn struct {
-	Host     string
-	Port     int
-	User     string
-	DB       string
-	Password string
+	Host           string
+	Port           int
+	User           string
+	DB             string
+	Password       string
 	ConnectTimeout time.Duration
 }
 
 // NodeIdentity describes the local node for config generation.
 type NodeIdentity struct {
-	NodeID   int    // ordinal+1000, stable across restarts
-	NodeName string // pod hostname
-	FQDN     string // <pod>.<headless> — the conninfo host
-	DataDir  string // PGDATA
-	PGBindir string // /usr/lib/postgresql/<major>/bin
-	ReplUser string
-	ReplDB   string
+	NodeID       int    // ordinal+1000, stable across restarts
+	NodeName     string // pod hostname
+	FQDN         string // <pod>.<headless> — the conninfo host
+	DataDir      string // PGDATA
+	PGBindir     string // /usr/lib/postgresql/<major>/bin
+	ReplUser     string
+	ReplDB       string
 	ReplPassword string
 }
 

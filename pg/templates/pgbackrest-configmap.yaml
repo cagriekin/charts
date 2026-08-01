@@ -264,19 +264,46 @@ data:
     STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     CLUSTER_STATE=""
     CHECKPOINT=""
+    # prev_field <key> -- the value that key held in the existing record, if any.
+    prev_field() {
+      [ -f "${STATUS_FILE}" ] || return 0
+      sed -n "s/^$1=//p" "${STATUS_FILE}" 2>/dev/null | head -1
+    }
     write_status() {
       local code="$1"
+      local tt="${TARGET_TYPE:-}" tg="${TARGET:-}" bs="${BACKUP_SET:-}" started="${STARTED_AT}"
+      local attempted=""
+      if [ "${code}" != "0" ]; then
+        # A FAILED attempt must not become this directory's provenance. Many failures
+        # (unreachable repo, bad cipher pass, invalid --target, missing --set) copy nothing
+        # at all, so overwriting the record would erase where the data genuinely came from
+        # while claiming the mistyped target instead. Keep the previous record's descriptive
+        # fields and report what was attempted separately; exitCode still marks it failed,
+        # so nothing reads it as a clean restore.
+        attempted="${tt}|${tg}|${bs}"
+        tt="$(prev_field targetType)"
+        tg="$(prev_field target)"
+        bs="$(prev_field backupSet)"
+        local prev_started
+        prev_started="$(prev_field startedAt)"
+        [ -n "${prev_started}" ] && started="${prev_started}"
+      fi
       {
-        echo "startedAt=${STARTED_AT}"
+        echo "startedAt=${started}"
         echo "finishedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "stanza=${PGBACKREST_STANZA}"
-        echo "targetType=${TARGET_TYPE:-}"
-        echo "target=${TARGET:-}"
-        echo "backupSet=${BACKUP_SET:-}"
+        echo "targetType=${tt}"
+        echo "target=${tg}"
+        echo "backupSet=${bs}"
         echo "exitCode=${code}"
         echo "requestedBy=${RESTORE_REQUESTED_BY:-}"
         echo "clusterState=${CLUSTER_STATE}"
         echo "checkpoint=${CHECKPOINT}"
+        if [ -n "${attempted}" ]; then
+          echo "attemptedTargetType=${attempted%%|*}"
+          echo "attemptedTarget=$(echo "${attempted}" | cut -d'|' -f2)"
+          echo "attemptedBackupSet=${attempted##*|}"
+        fi
       } > "${STATUS_FILE}.tmp" 2>/dev/null && mv -f "${STATUS_FILE}.tmp" "${STATUS_FILE}" || \
         echo "WARNING: could not record the restore outcome to ${STATUS_FILE}" >&2
     }

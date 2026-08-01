@@ -39,7 +39,10 @@ func (s *Server) routeTable() []route {
 		{http.MethodPost, "/v1/reinitialize", VerbControl, false, s.handleReinitialize},
 
 		{http.MethodGet, "/v1/backups", VerbObserve, false, s.handleBackups},
-		{http.MethodGet, "/v1/restore", VerbObserve, false, s.handleRestoreStatus},
+		// Feature-gated like the mutating routes: reading the Job needs the `get jobs`
+		// grant that rbac.yaml renders only under control.restore.enabled, so without the
+		// gate this answers 502 Forbidden (reading as a broken Role) instead of 501.
+		{http.MethodGet, "/v1/restore", VerbObserve, true, s.handleRestoreStatus},
 		{http.MethodPost, "/v1/restore", VerbRestore, true, s.handleRestore},
 		{http.MethodDelete, "/v1/restore", VerbRestore, true, s.handleRestoreDelete},
 	}
@@ -269,6 +272,15 @@ func (s *Server) handlePause(on bool) func(http.ResponseWriter, *http.Request) (
 			})
 			return http.StatusOK, "no change"
 		}
+		// Resuming while a restore Job is still copying is the sharpest edge in this API:
+		// the loop would start PostgreSQL on a data directory pgbackrest is rewriting. The
+		// 202 from POST /v1/restore hands the operator a runbook that ENDS in this call, so
+		// the ordering mistake is one an attentive operator makes.
+		if !on {
+			if status, detail, ok := s.checkNoRestoreInFlight(w, r, "resume"); !ok {
+				return status, detail
+			}
+		}
 		if err := s.o.Cluster.SetPause(r.Context(), on, id.CN); err != nil {
 			writeErr(w, http.StatusBadGateway, err.Error(), "")
 			return http.StatusBadGateway, "marker write failed"
@@ -451,7 +463,10 @@ func (s *Server) handleIntent(kind IntentKind) func(http.ResponseWriter, *http.R
 		snap := s.o.Node.Snapshot()
 		// Restarting the serving primary is a write outage. Require an explicit force
 		// so it cannot be the result of a fat-fingered pod name plus a default.
-		if kind == IntentRestart && !req.Force && snap.HoldsLease && snap.Local.Running && snap.Local.Role == "primary" {
+		// Live lease read, not the snapshot's copy: during startup (before the first tick)
+		// the cached HoldsLease is false, which would let an unforced restart through on
+		// the serving primary -- the exact case this interlock exists for.
+		if kind == IntentRestart && !req.Force && s.o.Node.HoldsLeaseNow() && snap.Local.Running && snap.Local.Role == "primary" {
 			writeErr(w, http.StatusConflict,
 				"this pod is the serving primary: restarting it interrupts writes",
 				`pass {"force":true} to proceed, and consider POST /v1/pause first so the restart is not read as a failure`)
@@ -476,6 +491,32 @@ func (s *Server) handleIntent(kind IntentKind) func(http.ResponseWriter, *http.R
 		})
 		return http.StatusOK, kind.String()
 	}
+}
+
+// checkNoRestoreInFlight refuses an operation that would write to, or start PostgreSQL
+// on, a data directory a restore Job is currently rewriting. A Job that is pending or
+// running is in flight; succeeded/failed/none are not.
+//
+// It fails CLOSED on a read error: not being able to tell whether a restore is running is
+// not evidence that none is.
+func (s *Server) checkNoRestoreInFlight(w http.ResponseWriter, r *http.Request, what string) (int, string, bool) {
+	if s.o.Backups == nil {
+		return 0, "", true
+	}
+	v, err := s.o.Backups.RestoreStatus(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway,
+			fmt.Sprintf("could not determine whether a restore is in flight, so %s was refused: %v", what, err),
+			"retry, or check the restore Job directly")
+		return http.StatusBadGateway, "restore status unreadable", false
+	}
+	if v.Phase == "pending" || v.Phase == "running" {
+		writeErr(w, http.StatusConflict,
+			fmt.Sprintf("restore Job %s is %s: %s would write to the data directory it is rewriting", v.JobName, v.Phase, what),
+			"wait for GET /v1/restore to report succeeded or failed, or abandon the restore with DELETE /v1/restore first")
+		return http.StatusConflict, "restore in flight", false
+	}
+	return 0, "", true
 }
 
 // checkNode enforces the addressed-pod interlock.
@@ -545,12 +586,34 @@ func (s *Server) handleReinitialize(w http.ResponseWriter, r *http.Request) (int
 			"while paused the reconcile loop takes no action, so this would leave the replica empty and stopped. POST /v1/resume first")
 		return http.StatusConflict, "paused"
 	}
-	snap := s.o.Node.Snapshot()
-	if snap.HoldsLease {
+	// The replica-only gate is read LIVE from the DCS, never from the snapshot. The
+	// snapshot is all-zero until the first tick publishes, and the control listener starts
+	// before boot() and before that first tick -- so a cached HoldsLease=false would admit
+	// this wipe on the actual primary during startup (unrecoverable on a single-replica
+	// release, since the marker then names an empty node and the loop waits forever).
+	if s.o.Node.HoldsLeaseNow() {
 		writeErr(w, http.StatusConflict,
 			fmt.Sprintf("%s holds the leader lease: reinitialize is replica-only", s.o.PodName),
 			"wiping the primary would discard the cluster's only copy of committed data. Hand the primary role to another pod with POST /v1/switchover first, or use POST /v1/restore to recover the primary from a backup")
 		return http.StatusConflict, "holds lease"
+	}
+	// Second, independent check against the durable marker: if it records THIS pod as the
+	// primary, refuse even if the lease read said otherwise (a lease we have just lost, or
+	// a DCS blip). Two disagreeing sources both have to clear it.
+	if m.Primary == s.o.PodName {
+		writeErr(w, http.StatusConflict,
+			fmt.Sprintf("the primary marker records %s as the primary: reinitialize is replica-only", s.o.PodName),
+			"if this node really is a stale ex-primary, let the reconcile loop resolve it first (GET /v1/cluster shows the current holder)")
+		return http.StatusConflict, "marker names this pod primary"
+	}
+	snap := s.o.Node.Snapshot()
+	// Before the first reconcile tick nothing below is meaningful, and the role field is
+	// "" rather than a role. Refuse rather than infer safety from unpopulated state.
+	if snap.ObservedAt.IsZero() {
+		writeErr(w, http.StatusConflict,
+			"the agent has not completed its first reconcile tick yet",
+			"this node's role is not established, so a destructive rebuild cannot be authorised; retry once GET /v1/status reports a role")
+		return http.StatusConflict, "no observation yet"
 	}
 	if snap.Local.Role == "primary" {
 		// Running read-write without the lease is a fenced/split-brain shape the loop is
@@ -559,6 +622,10 @@ func (s *Server) handleReinitialize(w http.ResponseWriter, r *http.Request) (int
 			"this node is running read-write without holding the lease",
 			"the reconcile loop is about to demote or fence it; retry once GET /v1/status reports a standby role")
 		return http.StatusConflict, "read-write without lease"
+	}
+	// A restore Job writing to this same volume must not be raced by a wipe.
+	if status, detail, ok := s.checkNoRestoreInFlight(w, r, "reinitialize"); !ok {
+		return status, detail
 	}
 
 	id := identityFrom(r.Context())

@@ -42,6 +42,13 @@ type JobView struct {
 	// kubectl rather than the API).
 	RequestedBy string
 	RequestedAt string
+	// TargetType/Target/BackupSet are the recovery point the Job's container actually
+	// carries, whichever supplied it: the request's override or the release's rendered
+	// value. Read back from the object rather than echoed from the request, so what is
+	// reported is what will really run.
+	TargetType string
+	Target     string
+	BackupSet  string
 }
 
 // PodView is the restore pod's schedulability/liveness, which is what actually
@@ -186,7 +193,7 @@ func sortedKeys(m map[string]string) []string {
 }
 
 func jobView(j *batchv1.Job) JobView {
-	return JobView{
+	v := JobView{
 		Present:        true,
 		Name:           j.Name,
 		CreatedAt:      ts(&j.CreationTimestamp),
@@ -197,6 +204,44 @@ func jobView(j *batchv1.Job) JobView {
 		Failed:         j.Status.Failed,
 		RequestedBy:    j.Annotations[RequestedByAnnotation],
 		RequestedAt:    j.Annotations[RequestedAtAnnotation],
+	}
+	// The recovery point as the object really carries it (see the field comments).
+	if cs := j.Spec.Template.Spec.Containers; len(cs) == 1 {
+		for _, e := range cs[0].Env {
+			switch e.Name {
+			case "TARGET_TYPE":
+				v.TargetType = e.Value
+			case "TARGET":
+				v.Target = e.Value
+			case "BACKUP_SET":
+				v.BackupSet = e.Value
+			}
+		}
+	}
+	return v
+}
+
+// WaitJobGone blocks until name no longer exists, or timeout elapses. Needed because a
+// Foreground delete returns while the object is still present behind its finalizer, and
+// the agent re-creates the same deterministic name.
+func (c *Client) WaitJobGone(ctx context.Context, name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		_, err := c.cs.BatchV1().Jobs(c.namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("wait for Job %s to be deleted: %w", name, err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("Job %s still exists %s after deletion was requested; its pods may still be terminating", name, timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
 	}
 }
 

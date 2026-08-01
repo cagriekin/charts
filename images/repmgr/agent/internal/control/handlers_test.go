@@ -71,6 +71,10 @@ type fakeNode struct {
 	snap      Snapshot
 	submitted []IntentKind
 	submitErr error
+	// liveLease models the LIVE DCS read independently of the snapshot, which is what
+	// lets a test reproduce the startup window (snapshot all-zero, lease actually held).
+	liveLease    *bool
+	liveLeaseHit int
 	// hang makes Submit block until the caller's context expires, standing in for a
 	// reconcile loop that is busy with a long action.
 	hang  bool
@@ -78,6 +82,14 @@ type fakeNode struct {
 }
 
 func (f *fakeNode) Snapshot() Snapshot { return f.snap }
+
+func (f *fakeNode) HoldsLeaseNow() bool {
+	f.liveLeaseHit++
+	if f.liveLease != nil {
+		return *f.liveLease
+	}
+	return f.snap.HoldsLease
+}
 
 func (f *fakeNode) Submit(ctx context.Context, kind IntentKind) error {
 	if f.hang {
@@ -133,6 +145,8 @@ func (f *fakeBackups) DeleteRestore(context.Context) error {
 
 func (f *fakeBackups) RestoreEnabled() bool { return f.enabled }
 
+func boolp(b bool) *bool { return &b }
+
 // --- harness ---
 
 func healthySnapshot() Snapshot {
@@ -143,11 +157,12 @@ func healthySnapshot() Snapshot {
 		LeaseHolder: "pg-0",
 		Local: MemberState{
 			Name: "pg-0", Self: true, Role: "primary", Reachable: true, Running: true,
-			HasData: true, Timeline: 7, TimelineOK: true, LSN: "16/B3000000",
+			HasData: boolp(true), Timeline: 7, TimelineOK: true, LSN: "16/B3000000",
 		},
 		Peers: []MemberState{{
+			// No HasData: a peer's data directory is not observable from here.
 			Name: "pg-1", Role: "standby", Reachable: true, Running: true,
-			HasData: true, Timeline: 7, TimelineOK: true, LSN: "16/B2FF0000",
+			Timeline: 7, TimelineOK: true, LSN: "16/B2FF0000",
 		}},
 		Decision:   DecisionView{Action: "StayPrimary", Reason: "holds lease and is a current primary", At: time.Now()},
 		Recovery:   RecoveryView{InRecovery: false},
@@ -656,7 +671,9 @@ func TestReinitializeRefusedOnTheLeaseHolder(t *testing.T) {
 // resolve; a destructive local action must not race it.
 func TestReinitializeRefusedWhenReadWriteWithoutLease(t *testing.T) {
 	h := newHarness(t, nil)
+	h.cl.marker.Primary = "pg-1"
 	h.nd.snap.HoldsLease = false // still Role == "primary"
+	h.nd.liveLease = boolp(false)
 	rec := h.do("POST", "/v1/reinitialize", `{"node":"pg-0","force":true}`, "ops")
 	wantCode(t, rec, 409)
 	if len(h.nd.submitted) != 0 {
@@ -665,10 +682,18 @@ func TestReinitializeRefusedWhenReadWriteWithoutLease(t *testing.T) {
 }
 
 // A paused loop performs no clone, so a wipe would leave the replica empty and stopped.
-func TestReinitializeRefusedWhilePaused(t *testing.T) {
+// standbyHarness is a pod that really is a replica: it does not hold the lease and the
+// durable marker names another pod as primary.
+func standbyHarness(t *testing.T) *harness {
 	h := newHarness(t, nil)
 	h.nd.snap.HoldsLease = false
 	h.nd.snap.Local.Role = "standby"
+	h.cl.marker.Primary = "pg-1"
+	return h
+}
+
+func TestReinitializeRefusedWhilePaused(t *testing.T) {
+	h := standbyHarness(t)
 	h.cl.marker.Paused = true
 	rec := h.do("POST", "/v1/reinitialize", `{"node":"pg-0","force":true}`, "ops")
 	wantCode(t, rec, 409)
@@ -681,12 +706,7 @@ func TestReinitializeRefusedWhilePaused(t *testing.T) {
 }
 
 func TestReinitializeRequiresForceAndNode(t *testing.T) {
-	standby := func() *harness {
-		h := newHarness(t, nil)
-		h.nd.snap.HoldsLease = false
-		h.nd.snap.Local.Role = "standby"
-		return h
-	}
+	standby := func() *harness { return standbyHarness(t) }
 	h := standby()
 	wantCode(t, h.do("POST", "/v1/reinitialize", `{"node":"pg-0"}`, "ops"), 400)
 	wantCode(t, standby().do("POST", "/v1/reinitialize", `{"force":true}`, "ops"), 400)
@@ -698,9 +718,7 @@ func TestReinitializeRequiresForceAndNode(t *testing.T) {
 }
 
 func TestReinitializeOnAStandbySubmitsTheIntent(t *testing.T) {
-	h := newHarness(t, nil)
-	h.nd.snap.HoldsLease = false
-	h.nd.snap.Local.Role = "standby"
+	h := standbyHarness(t)
 	rec := h.do("POST", "/v1/reinitialize", `{"node":"pg-0","force":true}`, "ops")
 	wantCode(t, rec, 202)
 	if len(h.nd.submitted) != 1 || h.nd.submitted[0] != IntentReinitialize {
@@ -719,9 +737,7 @@ func TestReinitializeOnAStandbySubmitsTheIntent(t *testing.T) {
 
 // A marker read failure must not be treated as "not paused, not the leader".
 func TestReinitializeFailsClosedWhenTheMarkerIsUnreadable(t *testing.T) {
-	h := newHarness(t, nil)
-	h.nd.snap.HoldsLease = false
-	h.nd.snap.Local.Role = "standby"
+	h := standbyHarness(t)
 	h.cl.markerErr = errors.New("apiserver unreachable")
 	rec := h.do("POST", "/v1/reinitialize", `{"node":"pg-0","force":true}`, "ops")
 	wantCode(t, rec, 502)
@@ -745,13 +761,163 @@ func TestReinitializeIsListedAndMethodGuarded(t *testing.T) {
 // must be REPORTED, not omitted -- otherwise "no data yet" and "field absent" look alike.
 func TestMemberBooleansAreAlwaysReported(t *testing.T) {
 	h := newHarness(t, nil)
-	h.nd.snap.Local.HasData = false
+	h.nd.snap.Local.HasData = boolp(false)
 	h.nd.snap.Local.Running = false
 	h.nd.snap.Local.Reachable = false
 	body := h.do("GET", "/v1/status", "", "ops").Body.String()
+	// For SELF these are observed, so false must be reported rather than omitted -- a
+	// client polls hasData/running during a reinitialize re-clone.
 	for _, want := range []string{`"hasData": false`, `"running": false`, `"reachable": false`} {
 		if !strings.Contains(body, want) {
 			t.Errorf("status body should contain %s:\n%s", want, body)
 		}
 	}
 }
+
+// A peer's data directory is not observable from this pod, so hasData must be ABSENT for
+// peers rather than reported as false -- which would misreport a primary plainly holding
+// data, and would read as a failed rebuild to anyone polling during a re-clone.
+func TestPeerHasDataIsAbsentNotFalse(t *testing.T) {
+	h := newHarness(t, nil)
+	resp := decode[ClusterResponse](t, h.do("GET", "/v1/cluster", "", "ops"))
+	if len(resp.Members) != 2 {
+		t.Fatalf("want 2 members, got %d", len(resp.Members))
+	}
+	self, peer := resp.Members[0], resp.Members[1]
+	if self.HasData == nil || !*self.HasData {
+		t.Errorf("self should report hasData: %+v", self)
+	}
+	if peer.HasData != nil {
+		t.Errorf("a peer must not claim a hasData value: %v", *peer.HasData)
+	}
+	// And it must not appear in the peer's JSON at all.
+	body := h.do("GET", "/v1/cluster", "", "ops").Body.String()
+	if strings.Count(body, `"hasData"`) != 1 {
+		t.Errorf("hasData should appear once (self only):\n%s", body)
+	}
+}
+
+// THE regression test for the startup window. The control listener accepts requests before
+// boot() and before the first reconcile tick, so Snapshot() is all-zero: HoldsLease=false
+// and Role="". A gate reading the snapshot would admit a wipe of the actual primary --
+// unrecoverable on a single-replica release. The live lease read must catch it.
+func TestReinitializeRefusedBeforeFirstTickOnTheRealPrimary(t *testing.T) {
+	h := newHarness(t, nil)
+	h.nd.snap = Snapshot{Node: "pg-0", PGMajor: "18"} // zero-valued: no tick yet
+	h.cl.marker.Primary = "pg-1"                      // marker does not implicate us either
+	h.nd.liveLease = boolp(true)                      // ...but we DO hold the lease right now
+	rec := h.do("POST", "/v1/reinitialize", `{"node":"pg-0","force":true}`, "ops")
+	wantCode(t, rec, 409)
+	if !strings.Contains(rec.Body.String(), "replica-only") {
+		t.Errorf("must refuse as replica-only: %s", rec.Body.String())
+	}
+	if len(h.nd.submitted) != 0 {
+		t.Fatal("no wipe may be submitted for a node that currently holds the lease")
+	}
+	if h.nd.liveLeaseHit == 0 {
+		t.Error("the gate must consult the LIVE lease, not only the snapshot")
+	}
+}
+
+// Even when neither the lease nor the marker implicates this pod, an unpopulated snapshot
+// means the role is unknown -- refuse rather than infer safety from zero values.
+func TestReinitializeRefusedBeforeFirstTick(t *testing.T) {
+	h := newHarness(t, nil)
+	h.nd.snap = Snapshot{Node: "pg-0", PGMajor: "18"}
+	h.cl.marker.Primary = "pg-1"
+	h.nd.liveLease = boolp(false)
+	rec := h.do("POST", "/v1/reinitialize", `{"node":"pg-0","force":true}`, "ops")
+	wantCode(t, rec, 409)
+	if !strings.Contains(rec.Body.String(), "first reconcile tick") {
+		t.Errorf("should name the reason: %s", rec.Body.String())
+	}
+	if len(h.nd.submitted) != 0 {
+		t.Error("nothing may be submitted")
+	}
+}
+
+// The marker is a second, independent source: if it records this pod as primary, refuse
+// even when the live lease read says otherwise (a lease just lost, or a DCS blip).
+func TestReinitializeRefusedWhenMarkerNamesThisPod(t *testing.T) {
+	h := standbyHarness(t)
+	h.cl.marker.Primary = "pg-0"
+	h.nd.liveLease = boolp(false)
+	rec := h.do("POST", "/v1/reinitialize", `{"node":"pg-0","force":true}`, "ops")
+	wantCode(t, rec, 409)
+	if !strings.Contains(rec.Body.String(), "marker records") {
+		t.Errorf("should cite the marker: %s", rec.Body.String())
+	}
+	if len(h.nd.submitted) != 0 {
+		t.Error("nothing may be submitted")
+	}
+}
+
+// An unforced restart of the serving primary must be refused even during the startup
+// window, when the cached snapshot has not yet recorded that this node holds the lease.
+func TestRestartPrimaryInterlockUsesTheLiveLease(t *testing.T) {
+	h := newHarness(t, nil)
+	h.nd.snap.HoldsLease = false // cached copy is stale/unpopulated
+	h.nd.liveLease = boolp(true) // but the lease IS held
+	rec := h.do("POST", "/v1/restart", `{"node":"pg-0"}`, "ops")
+	wantCode(t, rec, 409)
+	if len(h.nd.submitted) != 0 {
+		t.Error("no unforced restart of the serving primary")
+	}
+}
+
+// Neither reinitialize nor resume may run while a restore Job is rewriting the volume.
+func TestRestoreInFlightBlocksReinitializeAndResume(t *testing.T) {
+	for _, phase := range []string{"pending", "running"} {
+		h := standbyHarness(t)
+		h.bk.status = RestoreView{Phase: phase, JobName: "pg-pgbackrest-restore-api"}
+		rec := h.do("POST", "/v1/reinitialize", `{"node":"pg-0","force":true}`, "ops")
+		wantCode(t, rec, 409)
+		if !strings.Contains(rec.Body.String(), "rewriting") {
+			t.Errorf("phase %s: should explain the conflict: %s", phase, rec.Body.String())
+		}
+		if len(h.nd.submitted) != 0 {
+			t.Errorf("phase %s: nothing may be submitted", phase)
+		}
+
+		// And the resume the restore runbook ends with must refuse too.
+		hr := newHarness(t, nil)
+		hr.cl.marker.Paused = true
+		hr.bk.status = RestoreView{Phase: phase, JobName: "pg-pgbackrest-restore-api"}
+		rr := hr.do("POST", "/v1/resume", "", "ops")
+		wantCode(t, rr, 409)
+		if !strings.Contains(rr.Body.String(), "DELETE /v1/restore") {
+			t.Errorf("phase %s: should offer the way out: %s", phase, rr.Body.String())
+		}
+		if len(hr.cl.pauses) != 0 {
+			t.Errorf("phase %s: the pause must not be cleared", phase)
+		}
+	}
+}
+
+// A completed restore must not block anything, and an unreadable status must fail closed.
+func TestRestoreInFlightCheckBoundaries(t *testing.T) {
+	for _, phase := range []string{"none", "succeeded", "failed"} {
+		h := newHarness(t, nil)
+		h.cl.marker.Paused = true
+		h.bk.status = RestoreView{Phase: phase}
+		wantCode(t, h.do("POST", "/v1/resume", "", "ops"), 200)
+	}
+	h := newHarness(t, nil)
+	h.cl.marker.Paused = true
+	h.bk.statusErr = errors.New("apiserver unreachable")
+	rec := h.do("POST", "/v1/resume", "", "ops")
+	wantCode(t, rec, 502)
+	if len(h.cl.pauses) != 0 {
+		t.Error("an unverifiable interlock must not clear the pause")
+	}
+}
+
+// countingMetrics records the control counters so a test can assert a refusal was counted.
+type countingMetrics struct {
+	requests, rejected, intents, restores int
+}
+
+func (c *countingMetrics) IncControlRequest()        { c.requests++ }
+func (c *countingMetrics) IncControlRejected()       { c.rejected++ }
+func (c *countingMetrics) IncControlIntent()         { c.intents++ }
+func (c *countingMetrics) IncControlRestoreRequest() { c.restores++ }

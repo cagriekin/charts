@@ -117,6 +117,50 @@
   `restore.readPodLogs: true`, which grants namespace-wide `get pods/log` and only helps
   when an agent is still running (`podOrdinal > 0`); it is off by default.
 
+### Fixed (pre-release, from the review of this feature)
+
+- The reinitialize replica-only gate now reads the leader lease **live from the DCS** and
+  additionally requires that the durable primary marker not name this pod, instead of
+  trusting the once-per-tick snapshot. The control listener starts before the first
+  reconcile tick, when that snapshot is all-zero, so the previous check could have admitted
+  a wipe of the actual primary during startup. A pod that has not published an observation
+  yet is refused outright. The restart interlock for the serving primary reads the live
+  lease for the same reason.
+- `POST /v1/resume` and `POST /v1/reinitialize` now refuse while a restore Job is `pending`
+  or `running` (fail-closed if that cannot be determined). The restore runbook ends in a
+  resume, so resuming too early would have let the reconcile loop start PostgreSQL on a data
+  directory pgbackrest was still rewriting.
+- `POST /v1/restore` overrides only the recovery-point fields the request actually
+  specifies. It previously blanked a `pgbackrest.restore.targetType`/`target` pinned in
+  values whenever a request omitted them, restoring the latest backup and replaying all WAL
+  instead of stopping at the reviewed point in time. The response now reports
+  `effectiveTargetType`/`effectiveTarget`/`effectiveBackupSet`, read back from the created Job.
+- The data-directory wipe now distinguishes a **stale** `postmaster.pid` (its process is
+  gone -- what a crashed postmaster leaves behind, and precisely the replica reinitialize
+  exists to rebuild) from a live one, which remains a hard refusal. An unreadable or
+  malformed pid file is treated as live.
+- `replace: true` waits for the previous restore Job to be fully deleted before creating its
+  replacement. Foreground propagation returns while the object still exists behind its
+  finalizer, so the create hit `AlreadyExists` -- after the handler had already stopped
+  PostgreSQL.
+- A failed restore no longer overwrites the data directory's provenance: `restore.sh` keeps
+  the previous record's backup set and target (many failures copy nothing at all) and
+  records the failed attempt separately as `attemptedTargetType`/`attemptedTarget`/
+  `attemptedBackupSet`. A mistyped PITR target previously erased where the data really came from.
+- `hasData` is reported only for the node answering the request and is absent for peers,
+  rather than being emitted as `false` for every peer -- including a primary plainly holding
+  data, and a replica whose re-clone had in fact completed.
+- The restore feature gate now emits its audit line and increments
+  `pg_ha_agent_control_rejected_total` itself. It short-circuits the authorization check by
+  design (so a missing values flag reports as such rather than as a 403), which meant
+  probing of the most destructive routes left no trace in the audit log or metrics.
+- `GET /v1/restore` is feature-gated like the mutating restore routes: it needs the `get
+  jobs` grant that is rendered only when restore is enabled, so it previously failed with a
+  Forbidden error that read as a broken Role.
+- The control server's response-write deadline is derived from the request budget instead of
+  being a fixed 90s, so a long intent on a release with a wide reconcile interval returns
+  its 504 or 200 rather than a dropped connection.
+
 ### Changed
 
 - The agent's read-only `:9200` server now sets HTTP timeouts (read-header/read/write/idle)

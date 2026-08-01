@@ -2,6 +2,7 @@ package control
 
 import (
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 )
@@ -463,5 +464,45 @@ func TestVolumeHintSurvivesContainerCreating(t *testing.T) {
 		if v.Hint != "" {
 			t.Errorf("waitingReason=%q explains itself; no volume hint expected: %q", reason, v.Hint)
 		}
+	}
+}
+
+// The feature gate short-circuits guard, so it must emit the audit line and the rejection
+// counter itself -- otherwise probing of the most destructive routes leaves no trace in
+// either the audit log or pg_ha_agent_control_rejected_total.
+func TestFeatureGateAuditsAndCounts(t *testing.T) {
+	var logged strings.Builder
+	m := &countingMetrics{}
+	h := newHarness(t, func(o *Options, hh *harness) {
+		hh.bk = &fakeBackups{status: RestoreView{Phase: "none"}, enabled: false, order: &hh.order}
+		o.Backups = hh.bk
+		o.Metrics = m
+		o.Log = slog.New(slog.NewTextHandler(&logged, nil))
+	})
+	h.cl.marker.Paused = true
+	wantCode(t, h.do("POST", "/v1/restore", goodRestore, "dba"), 501)
+	if m.rejected == 0 {
+		t.Error("a feature-gated refusal must increment the rejection counter")
+	}
+	out := logged.String()
+	if !strings.Contains(out, "control request") || !strings.Contains(out, "not-configured") {
+		t.Errorf("a feature-gated refusal must be audited:\n%s", out)
+	}
+	if !strings.Contains(out, "dba") {
+		t.Errorf("the audit line must carry the client identity:\n%s", out)
+	}
+}
+
+// GET /v1/restore needs the `get jobs` grant that the chart renders only when restore is
+// enabled, so it must report "not configured" rather than failing with an RBAC error.
+func TestRestoreStatusIsFeatureGated(t *testing.T) {
+	h := newHarness(t, func(o *Options, hh *harness) {
+		hh.bk = &fakeBackups{status: RestoreView{Phase: "none"}, enabled: false, order: &hh.order}
+		o.Backups = hh.bk
+	})
+	rec := h.do("GET", "/v1/restore", "", "ops")
+	wantCode(t, rec, 501)
+	if !strings.Contains(rec.Body.String(), "control.restore.enabled") {
+		t.Errorf("should name the values key: %s", rec.Body.String())
 	}
 }

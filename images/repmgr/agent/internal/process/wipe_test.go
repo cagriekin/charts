@@ -1,6 +1,7 @@
 package process
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -121,5 +122,65 @@ func TestWipeDataDirRefusesFile(t *testing.T) {
 	}
 	if err := WipeDataDir(f); err == nil {
 		t.Error("a regular file must be refused")
+	}
+}
+
+// A crashed or OOM-killed postmaster leaves its pid file behind -- only a clean shutdown
+// removes it -- so that is exactly the state a replica worth reinitializing is in. Refusing
+// on the file's mere presence made the feature fail for its own main use case.
+func TestWipeDataDirTolieratesAStalePidFile(t *testing.T) {
+	dir := initDataDir(t)
+	// A PID that cannot be running: pid 0 is never a user process, so use a very high one
+	// that is free. Verify it is genuinely absent before relying on it.
+	stale := 4194303
+	for processAlive(stale) {
+		stale--
+	}
+	if err := os.WriteFile(filepath.Join(dir, "postmaster.pid"),
+		[]byte(fmt.Sprintf("%d\n/var/lib/postgresql/data/pgdata\n", stale)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := WipeDataDir(dir); err != nil {
+		t.Fatalf("a stale pid file must not block the rebuild: %v", err)
+	}
+	if HasData(dir) {
+		t.Error("the directory should have been emptied")
+	}
+}
+
+// A pid file naming a LIVE process is a hard refusal: something owns this data.
+func TestWipeDataDirRefusesALivePidFile(t *testing.T) {
+	dir := initDataDir(t)
+	if err := os.WriteFile(filepath.Join(dir, "postmaster.pid"),
+		[]byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := WipeDataDir(dir)
+	if err == nil {
+		t.Fatal("a live postmaster.pid must block the wipe")
+	}
+	if !strings.Contains(err.Error(), "still running") {
+		t.Errorf("error should say the process is alive: %v", err)
+	}
+	if !HasData(dir) {
+		t.Error("nothing may have been removed")
+	}
+}
+
+// Unable to prove staleness is not permission to proceed.
+func TestWipeDataDirRefusesUnreadablePidFile(t *testing.T) {
+	for _, body := range []string{"", "not-a-pid\n", "0\n", "-5\n"} {
+		dir := initDataDir(t)
+		if err := os.WriteFile(filepath.Join(dir, "postmaster.pid"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := WipeDataDir(dir); err == nil {
+			t.Errorf("pid file %q must be refused, not assumed stale", body)
+		} else if !strings.Contains(err.Error(), "stale") {
+			t.Errorf("pid file %q: error should explain: %v", body, err)
+		}
+		if !HasData(dir) {
+			t.Errorf("pid file %q: nothing may have been removed", body)
+		}
 	}
 }

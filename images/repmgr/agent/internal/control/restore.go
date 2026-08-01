@@ -16,16 +16,29 @@ func contextWithTimeout(r *http.Request, d time.Duration) (context.Context, cont
 // routes. Without it, a release that never enabled restore would answer 403 (the
 // restore allowlist is empty by construction), sending the operator to look for a
 // certificate problem instead of a values flag.
+// It sits OUTSIDE guard, so it short-circuits the authorization check -- deliberately, so
+// an operator who simply forgot the values flag gets an actionable 501 instead of a 403 for
+// an allowlist that is empty by construction while the feature is off. Because guard is
+// therefore skipped, this must emit the audit line and the rejection counter itself:
+// otherwise probing of the most destructive routes would leave no trace in either the audit
+// log or pg_ha_agent_control_rejected_total.
 func (s *Server) featureGate(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		refuse := func(msg, hint, detail string) {
+			s.o.Metrics.IncControlRejected()
+			s.audit(r, identityFrom(r.Context()), VerbRestore, "not-configured", detail)
+			writeErr(w, http.StatusNotImplemented, msg, hint)
+		}
 		if s.o.Backups == nil {
-			writeErr(w, http.StatusNotImplemented, "pgBackRest is not enabled for this release",
-				"set pgbackrest.enabled=true to use the backup and restore endpoints")
+			refuse("pgBackRest is not enabled for this release",
+				"set pgbackrest.enabled=true to use the backup and restore endpoints",
+				"pgbackrest disabled")
 			return
 		}
 		if !s.o.Backups.RestoreEnabled() {
-			writeErr(w, http.StatusNotImplemented, "restore triggering is not enabled",
-				"set repmgr.agent.control.restore.enabled=true (it is a separate opt-in from the control API: it grants the pods Job-creation RBAC)")
+			refuse("restore triggering is not enabled",
+				"set repmgr.agent.control.restore.enabled=true (it is a separate opt-in from the control API: it grants the pods Job-creation RBAC)",
+				"restore triggering disabled")
 			return
 		}
 		next(w, r)

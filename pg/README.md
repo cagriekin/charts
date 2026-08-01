@@ -474,24 +474,31 @@ curl -X POST ... -d '{"node":"<release>-pg-1","force":true}' \
 
 It needs no extra RBAC, and it is guarded three ways:
 
-- **Replica only.** It refuses on the lease holder, and the check reads the lease rather
-  than trusting a cached role — wiping the primary would discard the cluster's only copy of
-  committed writes. To rebuild a primary, hand the role away with `POST /v1/switchover`
-  first, or recover it from a backup with `POST /v1/restore` (which has its own
-  confirmations and its own authz verb). A node running read-write *without* the lease is
-  also refused: the loop is about to demote or fence it, and a destructive local action must
-  not race that.
-- **Not while paused.** Maintenance mode makes the loop a no-op, so the wipe would leave the
-  replica empty and stopped with nothing to rebuild it. Resume first.
+- **Replica only**, established from two independent live sources rather than from cached
+  state: the leader lease is read straight from the DCS, and the durable primary marker must
+  not name this pod. Wiping the primary would discard the cluster's only copy of committed
+  writes. To rebuild a primary, hand the role away with `POST /v1/switchover` first, or
+  recover it from a backup with `POST /v1/restore` (which has its own confirmations and its
+  own authz verb). A node running read-write *without* the lease is refused too: the loop is
+  about to demote or fence it, and a destructive local action must not race that. A pod that
+  has not completed its first reconcile tick is also refused — its role is not yet
+  established, and unpopulated state is not evidence of safety.
+- **Not while a restore is in flight**, and **not while paused**: a paused loop would never
+  re-clone, leaving the replica empty and stopped.
 - **`force: true` and the pod named**, like every node-local verb.
 
 The wipe itself refuses unless the directory really is an initialized PostgreSQL data
-directory with no `postmaster.pid` present, and it empties the directory rather than removing
-it (it is a volume mount).
+directory, and it empties the directory rather than removing it (it is a volume mount). A
+`postmaster.pid` whose process is **still running** is a hard refusal; one left behind by a
+crashed postmaster is recognised as stale and does not block the rebuild — which matters,
+because a crashed replica is exactly what this endpoint is for, and only a clean shutdown
+removes that file.
 
 It returns `202`: the wipe is immediate, but the clone takes as long as the database is
 large and the loop performs it. Watch `GET /v1/status` — `local.hasData` goes true when the
-clone lands, then `local.role` becomes `standby`.
+clone lands, then `local.role` becomes `standby`. (`hasData` is reported only for the node
+answering the request; it is absent for peers in `GET /v1/cluster`, because a cross-pod probe
+cannot observe another member's data directory.)
 
 #### API-driven PITR restore — `repmgr.agent.control.restore`
 
@@ -543,6 +550,11 @@ What it does and does not control:
   mounted), security contexts, volumes and secret references all come from the release.
   The agent overrides only `TARGET_TYPE`, `TARGET` and `BACKUP_SET`, and it refuses to
   overwrite any env backed by `valueFrom` (it cannot turn a `secretKeyRef` into a literal).
+  It overrides **only what the request specifies**: omit `targetType`/`target` and the Job
+  keeps whatever `pgbackrest.restore.targetType`/`target` the release pinned, rather than
+  being blanked to "latest" — the response reports the values actually in effect as
+  `effectiveTargetType`/`effectiveTarget`/`effectiveBackupSet`, so you can see which
+  recovery point is really about to be applied.
 - **Which volume is restored into is not an API decision.** That is
   `pgbackrest.restore.podOrdinal`, rendered into the Job; a `podOrdinal` in the body may
   only *confirm* it (409 on mismatch). The request must also be addressed to the pod that
@@ -564,6 +576,11 @@ stop the local postmaster → create the Job, returning `202` with the Job name.
 loop a no-op, so a restored node that is scaled back up while still paused never starts
 PostgreSQL and never goes Ready — the cluster stays down until you resume. The API will not
 clear your pause on its own, and `nextSteps` lists the resume as an explicit step.
+
+**But not before the restore finishes.** `POST /v1/resume` is refused with 409 while the
+restore Job is `pending` or `running`: resuming then would let the loop start PostgreSQL on
+a data directory pgbackrest is still rewriting. Wait for `GET /v1/restore` to report
+`succeeded` (or `failed`), or abandon the restore with `DELETE /v1/restore` first.
 
 ```bash
 curl -X POST ... -d '{}' https://127.0.0.1:9201/v1/pause

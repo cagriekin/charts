@@ -59,9 +59,13 @@ type MemberState struct {
 	// No omitempty on the booleans: false is a meaningful state, not an absent one, and
 	// hasData/running are exactly what a client polls during a reinitialize re-clone --
 	// omitting them would make "no data yet" indistinguishable from "field not reported".
-	Reachable  bool   `json:"reachable"`
-	Running    bool   `json:"running"`
-	HasData    bool   `json:"hasData"`
+	Reachable bool `json:"reachable"`
+	Running   bool `json:"running"`
+	// HasData is a pointer because it is only OBSERVABLE for this node: a peer's data
+	// directory is not something a cross-pod probe reports. Set for self, nil (absent in
+	// JSON) for peers -- reporting false for a peer that plainly has data would be worse
+	// than reporting nothing, especially while a client polls it during a re-clone.
+	HasData    *bool  `json:"hasData,omitempty"`
 	Timeline   uint32 `json:"timeline,omitempty"`
 	TimelineOK bool   `json:"timelineKnown"`
 	LSN        string `json:"lsn,omitempty"`
@@ -182,6 +186,12 @@ type Cluster interface {
 // Node is the local node: its published snapshot and the intent queue.
 type Node interface {
 	Snapshot() Snapshot
+	// HoldsLeaseNow reports the LIVE leadership state, straight from the DCS rather
+	// than from the once-per-tick Snapshot. Destructive gates must use this: the
+	// snapshot is all-zero until the first tick publishes (and the control listener
+	// starts before the first tick), so a cached HoldsLease=false is not evidence that
+	// this node is not the primary.
+	HoldsLeaseNow() bool
 	// Submit hands an intent to the reconcile loop and waits for its outcome. It
 	// returns ctx.Err() if the loop does not get to it in time -- the caller reports
 	// that as a timeout, with the node's state still observable, rather than
@@ -221,21 +231,28 @@ type RestoreView struct {
 	// Phase is none | pending | running | succeeded | failed. "none" means no restore
 	// Job exists -- which, after a scale-down/up cycle, is the normal end state, so
 	// LastRestore carries the outcome instead.
-	Phase          string               `json:"phase"`
-	JobName        string               `json:"jobName,omitempty"`
-	CreatedAt      *time.Time           `json:"createdAt,omitempty"`
-	StartedAt      *time.Time           `json:"startedAt,omitempty"`
-	CompletedAt    *time.Time           `json:"completedAt,omitempty"`
-	Active         int32                `json:"active,omitempty"`
-	Succeeded      int32                `json:"succeeded,omitempty"`
-	Failed         int32                `json:"failed,omitempty"`
-	RequestedBy    string               `json:"requestedBy,omitempty"`
-	RequestedAt    string               `json:"requestedAt,omitempty"`
-	PodName        string               `json:"podName,omitempty"`
-	PodPhase       string               `json:"podPhase,omitempty"`
-	WaitingReason  string               `json:"waitingReason,omitempty"`
-	WaitingMessage string               `json:"waitingMessage,omitempty"`
-	Progress       *pgbackrest.Progress `json:"progress,omitempty"`
+	Phase       string     `json:"phase"`
+	JobName     string     `json:"jobName,omitempty"`
+	CreatedAt   *time.Time `json:"createdAt,omitempty"`
+	StartedAt   *time.Time `json:"startedAt,omitempty"`
+	CompletedAt *time.Time `json:"completedAt,omitempty"`
+	Active      int32      `json:"active,omitempty"`
+	Succeeded   int32      `json:"succeeded,omitempty"`
+	Failed      int32      `json:"failed,omitempty"`
+	RequestedBy string     `json:"requestedBy,omitempty"`
+	RequestedAt string     `json:"requestedAt,omitempty"`
+	// Effective* are the recovery-point values actually set on the created Job, whether
+	// they came from the request or from the release's values. Reported because a request
+	// may legitimately omit them and inherit what values pinned -- an operator has to be
+	// able to see which point in time is really about to be recovered.
+	EffectiveTargetType string               `json:"effectiveTargetType,omitempty"`
+	EffectiveTarget     string               `json:"effectiveTarget,omitempty"`
+	EffectiveBackupSet  string               `json:"effectiveBackupSet,omitempty"`
+	PodName             string               `json:"podName,omitempty"`
+	PodPhase            string               `json:"podPhase,omitempty"`
+	WaitingReason       string               `json:"waitingReason,omitempty"`
+	WaitingMessage      string               `json:"waitingMessage,omitempty"`
+	Progress            *pgbackrest.Progress `json:"progress,omitempty"`
 	// ContainerStarted distinguishes a Pending pod whose container is at least
 	// starting (image pull, config error -- WaitingReason says which) from one that has
 	// not been scheduled or cannot attach its volume. Internal to the hint logic.

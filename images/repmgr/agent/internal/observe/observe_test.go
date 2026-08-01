@@ -44,7 +44,7 @@ func TestLivenessReflectsHeartbeat(t *testing.T) {
 
 	get := func() int {
 		rr := httptest.NewRecorder()
-		m.Handler(10 * time.Second).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+		m.Handler(10*time.Second).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 		return rr.Code
 	}
 	if code := get(); code != http.StatusOK {

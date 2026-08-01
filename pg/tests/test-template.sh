@@ -3358,6 +3358,13 @@ done
 # The trap is installed AFTER the postmaster.pid interlock, so a refused attempt cannot
 # clobber the record of the restore the data directory actually came from.
 assert_contains "#276 restore.sh: outcome trap installed on EXIT" "${ctl_restore_sh}" "trap 'write_status"
+# A FAILED attempt must not become the directory's provenance either: many failures copy
+# nothing, so the previous record's descriptive fields are kept and the attempt is recorded
+# separately. Without this a mistyped PITR target erases where the data really came from.
+assert_contains "#276 restore.sh: reads the previous record on failure" "${ctl_restore_sh}" "prev_field"
+for key in attemptedTargetType attemptedTarget attemptedBackupSet; do
+  assert_contains "#276 restore.sh: records ${key} on failure" "${ctl_restore_sh}" "${key}="
+done
 
 # --- NetworkPolicy: deny-by-default on the control port ---
 

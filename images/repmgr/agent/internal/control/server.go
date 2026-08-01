@@ -218,9 +218,13 @@ func (s *Server) Serve(ctx context.Context) error {
 		TLSConfig:         s.tls,
 		ReadHeaderTimeout: readHeaderTO,
 		ReadTimeout:       readTO,
-		WriteTimeout:      writeTO,
-		IdleTimeout:       idleTO,
-		MaxHeaderBytes:    maxHeaderBytes,
+		// Derived from the request budget, not a constant: the write deadline is armed when
+		// the request header is read, so a fixed 90s would cut off the response to a long
+		// intent on a release with a wide reconcile interval (IntentTimeout scales with it),
+		// leaving the client with a dropped connection instead of the specific 504.
+		WriteTimeout:   s.writeTimeout(),
+		IdleTimeout:    idleTO,
+		MaxHeaderBytes: maxHeaderBytes,
 		// Route net/http's own errors -- above all TLS handshake failures, which are
 		// exactly the security signal an operator wants -- into the structured logger
 		// instead of the process-wide standard logger.
@@ -239,6 +243,15 @@ func (s *Server) Serve(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// writeTimeout is the response-write budget: always wider than the whole request budget,
+// with writeTO as a floor for short requests.
+func (s *Server) writeTimeout() time.Duration {
+	if d := s.o.RequestTimeout + 30*time.Second; d > writeTO {
+		return d
+	}
+	return writeTO
 }
 
 // Handler is the full middleware chain plus routes.

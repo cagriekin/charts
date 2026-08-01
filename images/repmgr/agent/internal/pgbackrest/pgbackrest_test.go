@@ -212,3 +212,36 @@ func TestParseProgressIntegerPercent(t *testing.T) {
 		t.Errorf("got %+v, want 100%%", p)
 	}
 }
+
+// A failed attempt must not become this directory's provenance: restore.sh keeps the
+// previous successful restore's descriptive fields and records what was attempted
+// separately, because many failures copy nothing at all.
+func TestLastRestoreFailedAttemptKeepsProvenance(t *testing.T) {
+	c := Client{StatusPath: writeStatus(t, strings.Join([]string{
+		"startedAt=2026-07-30T09:00:00Z",
+		"stanza=db",
+		"targetType=time",
+		"target=2026-07-30 09:00:00+00",
+		"backupSet=20260730-090000F",
+		"exitCode=32",
+		"attemptedTargetType=time",
+		"attemptedTarget=2026-99-99 bad",
+		"attemptedBackupSet=typo-set",
+		"",
+	}, "\n"))}
+	r, err := c.LastRestore()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.Succeeded() {
+		t.Error("exitCode=32 must not read as success")
+	}
+	// Provenance: where the data actually came from.
+	if r.BackupSet != "20260730-090000F" || r.Target != "2026-07-30 09:00:00+00" {
+		t.Errorf("the previous restore's provenance must survive: %+v", r)
+	}
+	// And the failed attempt is still visible, separately.
+	if r.AttemptedBackupSet != "typo-set" || r.AttemptedTarget != "2026-99-99 bad" {
+		t.Errorf("the attempt should be reported: %+v", r)
+	}
+}

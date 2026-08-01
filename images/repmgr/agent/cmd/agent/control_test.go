@@ -373,3 +373,42 @@ func TestRunIntentReinitializeSurfacesWipeRefusal(t *testing.T) {
 		t.Errorf("the error should carry the reason: %v", err)
 	}
 }
+
+// A request that omits the recovery point must INHERIT whatever values pinned, not blank
+// it. Overriding unconditionally would restore the latest backup and replay all WAL over
+// the live data directory instead of stopping at the reviewed point in time.
+func TestRestoreEnvOverridesOnlyWhatTheRequestSpecified(t *testing.T) {
+	b := backupAPI{a: &agent{cfg: &config.Config{}}}
+
+	// Nothing specified: no target keys at all, so the rendered values stand.
+	empty := b.restoreEnvOverrides(control.RestoreRequest{Force: true})
+	for _, k := range []string{"TARGET_TYPE", "TARGET", "BACKUP_SET"} {
+		if _, ok := empty[k]; ok {
+			t.Errorf("%s must not be overridden when the request omits it: %v", k, empty)
+		}
+	}
+
+	// A backup set alone must not blank the values-pinned PITR target.
+	setOnly := b.restoreEnvOverrides(control.RestoreRequest{BackupSet: "20260801-090002F"})
+	if setOnly["BACKUP_SET"] != "20260801-090002F" {
+		t.Errorf("BACKUP_SET should be overridden: %v", setOnly)
+	}
+	if _, ok := setOnly["TARGET_TYPE"]; ok {
+		t.Errorf("TARGET_TYPE must be left alone: %v", setOnly)
+	}
+
+	// A target overrides both halves together (they are validated to arrive together).
+	tgt := b.restoreEnvOverrides(control.RestoreRequest{TargetType: "time", Target: "2026-08-01 09:55:00+00"})
+	if tgt["TARGET_TYPE"] != "time" || tgt["TARGET"] != "2026-08-01 09:55:00+00" {
+		t.Errorf("both target halves should be set: %v", tgt)
+	}
+	if _, ok := tgt["BACKUP_SET"]; ok {
+		t.Errorf("BACKUP_SET must be left alone: %v", tgt)
+	}
+	// FORCE is still never touched.
+	for _, m := range []map[string]string{empty, setOnly, tgt} {
+		if _, ok := m["FORCE"]; ok {
+			t.Errorf("FORCE must never be overridden: %v", m)
+		}
+	}
+}

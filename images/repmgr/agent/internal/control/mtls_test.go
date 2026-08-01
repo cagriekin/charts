@@ -477,3 +477,39 @@ func TestRequestTimeoutStaysWiderThanIntentTimeout(t *testing.T) {
 		t.Errorf("defaults: RequestTimeout=%s IntentTimeout=%s", s3.o.RequestTimeout, s3.o.IntentTimeout)
 	}
 }
+
+// The response-write deadline is armed when the request header is read, so a fixed value
+// would cut off the response to a long intent on a release with a wide reconcile interval
+// (IntentTimeout scales with it) -- the client would see a dropped connection instead of
+// the specific 504.
+func TestWriteTimeoutExceedsTheRequestBudget(t *testing.T) {
+	ca := newCA(t, "control-ca")
+	dir := t.TempDir()
+	certPEM, keyPEM := ca.issue(t, "pg-0", true)
+	mk := func(intent time.Duration) *Server {
+		o := baseOptions(t)
+		o.CertFile = writeFile(t, dir, "tls.crt", certPEM)
+		o.KeyFile = writeFile(t, dir, "tls.key", keyPEM)
+		o.CAFile = writeFile(t, dir, "ca.crt", ca.pem)
+		o.Addr = "127.0.0.1:0"
+		o.RequestTimeout, o.IntentTimeout = 0, intent
+		s, err := New(o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	// A wide reconcile interval (30s) yields IntentTimeout 120s; the write deadline must
+	// outlast the whole request budget, not the old fixed 90s.
+	s := mk(120 * time.Second)
+	if s.writeTimeout() <= s.o.RequestTimeout {
+		t.Errorf("writeTimeout %s must exceed RequestTimeout %s", s.writeTimeout(), s.o.RequestTimeout)
+	}
+	if s.writeTimeout() <= s.o.IntentTimeout {
+		t.Errorf("writeTimeout %s must exceed IntentTimeout %s", s.writeTimeout(), s.o.IntentTimeout)
+	}
+	// Short requests keep the floor rather than shrinking below it.
+	if got := mk(5 * time.Second).writeTimeout(); got < writeTO {
+		t.Errorf("writeTimeout = %s, want at least the %s floor", got, writeTO)
+	}
+}

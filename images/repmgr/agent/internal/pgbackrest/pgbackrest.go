@@ -114,6 +114,13 @@ type RestoreRecord struct {
 	// RequestedBy is set when the restore was triggered through the control API,
 	// carrying the client identity that asked for it.
 	RequestedBy string `json:"requestedBy,omitempty"`
+	// Attempted* describe a FAILED attempt's requested recovery point. On failure the
+	// descriptive fields above keep the previous (successful) restore's values, because
+	// many failures copy nothing and must not erase this directory's provenance -- so the
+	// attempt is reported here instead. Empty for a successful restore.
+	AttemptedTargetType string `json:"attemptedTargetType,omitempty"`
+	AttemptedTarget     string `json:"attemptedTarget,omitempty"`
+	AttemptedBackupSet  string `json:"attemptedBackupSet,omitempty"`
 }
 
 // Succeeded reports a restore that completed with exit code 0. An absent record or
@@ -170,6 +177,12 @@ func (c Client) LastRestore() (RestoreRecord, error) {
 			r.Checkpoint = v
 		case "requestedBy":
 			r.RequestedBy = v
+		case "attemptedTargetType":
+			r.AttemptedTargetType = v
+		case "attemptedTarget":
+			r.AttemptedTarget = v
+		case "attemptedBackupSet":
+			r.AttemptedBackupSet = v
 		}
 	}
 	return r, nil

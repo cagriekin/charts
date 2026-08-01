@@ -23,6 +23,9 @@ import (
 const (
 	restoreLogTailLines = 400
 	restoreLogMaxBytes  = 256 << 10
+	// How long to wait for a deleted restore Job to disappear. Its pods get the default
+	// 30s termination grace, so this allows for that plus apiserver latency.
+	restoreDeleteTimeout = 90 * time.Second
 )
 
 // intentRequest is a control-API operation waiting for the reconcile loop. done is
@@ -97,6 +100,11 @@ func (n nodeAPI) Snapshot() control.Snapshot {
 	return control.Snapshot{Node: n.a.cfg.PodName, PGMajor: n.a.cfg.PGMajor}
 }
 
+// HoldsLeaseNow reports the LIVE leadership state from the DCS. Destructive gates use
+// this rather than the snapshot, which is unpopulated until the first tick publishes --
+// and the control listener is already accepting requests by then.
+func (n nodeAPI) HoldsLeaseNow() bool { return n.a.dcs.IsLeader() }
+
 // Submit enqueues an intent and waits for the loop to run it.
 //
 // If ctx expires after the intent was accepted, the loop still performs it -- which is
@@ -165,10 +173,20 @@ func (b backupAPI) Info(ctx context.Context) (json.RawMessage, error) {
 // neither sets nor clears it: whatever pgbackrest.restore.force renders (a reviewed,
 // git-visible decision) is what applies. An HTTP request cannot reach for it.
 func (b backupAPI) restoreEnvOverrides(req control.RestoreRequest) map[string]string {
-	ov := map[string]string{
-		"TARGET_TYPE": req.TargetType,
-		"TARGET":      req.Target,
-		"BACKUP_SET":  req.BackupSet,
+	ov := map[string]string{}
+	// Override ONLY what the request specified. Unconditionally writing these would blank
+	// a recovery point the release pinned in values when a request omits it -- restoring
+	// the latest backup and replaying all WAL instead of stopping at the reviewed point in
+	// time, over the live data directory. Values supply the default; the request overrides
+	// it; the response reports whichever is in effect.
+	if req.TargetType != "" {
+		// targetType and target are validated to arrive together, so setting both here is
+		// never a half-override.
+		ov["TARGET_TYPE"] = req.TargetType
+		ov["TARGET"] = req.Target
+	}
+	if req.BackupSet != "" {
+		ov["BACKUP_SET"] = req.BackupSet
 	}
 	if b.a.cfg.ControlRestoreReadPodLogs {
 		// pgBackRest logs its per-file lines (which carry the cumulative percentage) at
@@ -188,7 +206,8 @@ func (b backupAPI) Restore(ctx context.Context, req control.RestoreRequest, id c
 	}
 	b.a.log.Warn("control: created restore Job over the live data directory",
 		"job", jv.Name, "client_cn", id.CN, "client_fingerprint", id.Fingerprint,
-		"targetType", req.TargetType, "backupSet", req.BackupSet)
+		"effectiveTargetType", jv.TargetType, "effectiveTarget", jv.Target,
+		"effectiveBackupSet", jv.BackupSet)
 	return b.view(ctx, jv, k8s.PodView{})
 }
 
@@ -215,21 +234,25 @@ func (b backupAPI) RestoreStatus(ctx context.Context) (control.RestoreView, erro
 // outlives the Job) and, when opted in, live progress from the pod's log.
 func (b backupAPI) view(ctx context.Context, jv k8s.JobView, pod k8s.PodView) (control.RestoreView, error) {
 	v := control.RestoreView{
-		Phase:            restorePhase(jv, pod),
-		JobName:          jv.Name,
-		CreatedAt:        jv.CreatedAt,
-		StartedAt:        jv.StartTime,
-		CompletedAt:      jv.CompletionTime,
-		Active:           jv.Active,
-		Succeeded:        jv.Succeeded,
-		Failed:           jv.Failed,
-		RequestedBy:      jv.RequestedBy,
-		RequestedAt:      jv.RequestedAt,
-		PodName:          pod.Name,
-		PodPhase:         pod.Phase,
-		WaitingReason:    pod.WaitingReason,
-		WaitingMessage:   pod.WaitingMessage,
-		ContainerStarted: pod.ContainerStarted,
+		Phase:       restorePhase(jv, pod),
+		JobName:     jv.Name,
+		CreatedAt:   jv.CreatedAt,
+		StartedAt:   jv.StartTime,
+		CompletedAt: jv.CompletionTime,
+		Active:      jv.Active,
+		Succeeded:   jv.Succeeded,
+		Failed:      jv.Failed,
+		RequestedBy: jv.RequestedBy,
+		RequestedAt: jv.RequestedAt,
+		// Whatever the created Job really carries, request-supplied or values-pinned.
+		EffectiveTargetType: jv.TargetType,
+		EffectiveTarget:     jv.Target,
+		EffectiveBackupSet:  jv.BackupSet,
+		PodName:             pod.Name,
+		PodPhase:            pod.Phase,
+		WaitingReason:       pod.WaitingReason,
+		WaitingMessage:      pod.WaitingMessage,
+		ContainerStarted:    pod.ContainerStarted,
 	}
 	if rec, err := b.a.pgbr.LastRestore(); err != nil {
 		b.a.log.Warn("control: could not read the restore status file", "err", err)
@@ -249,8 +272,16 @@ func (b backupAPI) view(ctx context.Context, jv k8s.JobView, pod k8s.PodView) (c
 	return v, nil
 }
 
+// DeleteRestore removes the restore Job and waits for it to be GONE. Foreground
+// propagation returns as soon as the finalizer is set, so without the wait a replace
+// (delete-then-create of the same deterministic name) hits AlreadyExists -- after the
+// handler has already stopped PostgreSQL, leaving the operator with a stopped database
+// and a 502 mid-incident.
 func (b backupAPI) DeleteRestore(ctx context.Context) error {
-	return b.a.kube.DeleteJob(ctx, b.a.cfg.ControlRestoreJobName)
+	if err := b.a.kube.DeleteJob(ctx, b.a.cfg.ControlRestoreJobName); err != nil {
+		return err
+	}
+	return b.a.kube.WaitJobGone(ctx, b.a.cfg.ControlRestoreJobName, restoreDeleteTimeout)
 }
 
 // restorePhase collapses Job status plus pod state into one word. A Job whose pod has
@@ -277,6 +308,10 @@ func restorePhase(jv k8s.JobView, pod k8s.PodView) string {
 // control API is enabled, so a release without it does exactly the work it did
 // before -- including no extra probe for replay progress.
 func (a *agent) publishSnapshot(ctx context.Context, obs reconcile.Observation, dec reconcile.Decision) {
+	// Only this node's data-directory state is observable; peers' MemberState.HasData
+	// stays nil (absent), because a cross-pod probe does not report it and emitting false
+	// would misreport every peer -- including a primary plainly holding data.
+	hasData := obs.Local.HasData
 	snap := control.Snapshot{
 		Node:             a.cfg.PodName,
 		PGMajor:          a.cfg.PGMajor,
@@ -292,7 +327,7 @@ func (a *agent) publishSnapshot(ctx context.Context, obs reconcile.Observation, 
 			Role:       localRole(obs.Local),
 			Reachable:  obs.Local.Running,
 			Running:    obs.Local.Running,
-			HasData:    obs.Local.HasData,
+			HasData:    &hasData,
 			Timeline:   uint32(obs.Local.Timeline),
 			TimelineOK: obs.Local.TimelineOK,
 			LSN:        lsnString(obs.Local.LSN, obs.Local.LSNOK),
