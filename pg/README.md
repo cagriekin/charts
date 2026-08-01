@@ -517,6 +517,11 @@ What it does and does not control:
 One call performs the whole safe sequence: verify paused → verify the confirmations →
 stop the local postmaster → create the Job, returning `202` with the Job name.
 
+**Do not forget the `POST /v1/resume` at the end.** Maintenance mode makes the reconcile
+loop a no-op, so a restored node that is scaled back up while still paused never starts
+PostgreSQL and never goes Ready — the cluster stays down until you resume. The API will not
+clear your pause on its own, and `nextSteps` lists the resume as an explicit step.
+
 ```bash
 curl -X POST ... -d '{}' https://127.0.0.1:9201/v1/pause
 curl -X POST ... https://127.0.0.1:9201/v1/restore \
@@ -524,18 +529,28 @@ curl -X POST ... https://127.0.0.1:9201/v1/restore \
        "targetType":"time","target":"2026-08-01 09:55:00+00"}'
 ```
 
-**What it deliberately does not do: scale the StatefulSet.** Freeing the data volume
-means scaling to 0, which deletes every agent — including the one that would report
-progress. So scale-down/up stays an operator step, and the response hands back the exact
-commands in `nextSteps`. Concretely, the API removes the `kubectl create job --from` step
-from a four-step runbook and nothing else.
+**What it deliberately does not do: scale the StatefulSet.** Scaling to 0 deletes every
+agent — including the one that would report progress — so it stays an operator step and the
+response hands back the commands in `nextSteps`.
+
+Whether you need it depends on scheduling, and this is worth knowing before an incident:
+**ReadWriteOnce binds a volume to a node, not to a pod.** A restore Job that the scheduler
+places on the same node as the target pod therefore starts *immediately*, with the
+StatefulSet still scaled up — that is safe here only because this flow already stopped the
+postmaster and required the cluster to be paused. **That pair, not the scale-down, is what
+keeps a restore off a live data directory.** A Job placed on any other node sits `Pending`
+on the volume until you scale down, which is what the `hint` explains.
+
+With standbys, scale down regardless: they must not stream from a primary being rewritten
+underneath them, and they re-clone onto the new timeline afterwards (see
+[the multi-replica restore behaviour](#point-in-time-recovery)).
 
 Progress, honestly:
 
-- While the copy runs there is (in the default single/ordinal-0 case) **no agent alive**
-  to ask. `GET /v1/restore` before scale-down reports `pending` and explains why in
-  `hint` — usually "the StatefulSet is still scaled up, so the volume cannot attach",
-  which is the most common mistake.
+- If the Job had to wait for the volume, `GET /v1/restore` reports `pending` and explains
+  why in `hint` — "the StatefulSet is still scaled up, so the volume cannot attach", the
+  most common mistake. Once you scale down to free it there is **no agent alive** to ask,
+  so nothing reports the copy's progress from then on.
 - After scale-up, `GET /v1/status` reports **WAL-replay progress** (`recovery.replayLsn`,
   `recovery.replayLagBytes`, and `recovery.lastReplayTime` — directly comparable to a
   `targetType: time` target). For a PITR this is usually the phase you are actually

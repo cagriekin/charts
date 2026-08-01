@@ -415,3 +415,25 @@ func TestForbiddenNamesTheAllowlistThatRefused(t *testing.T) {
 	h2.cl.marker.Paused = true
 	wantCode(t, h2.do("POST", "/v1/restore", goodRestore, "dba"), 202)
 }
+
+// The runbook must name the resume. Maintenance mode makes the reconcile loop a no-op, so
+// a restored node scaled back up while still paused never starts PostgreSQL and never goes
+// Ready -- a runbook that omits this leaves the cluster down. (Found by the live suite,
+// which hung waiting for readiness.)
+func TestNextStepsRequireTheResume(t *testing.T) {
+	h := newHarness(t, nil)
+	v := decode[RestoreView](t, h.do("GET", "/v1/restore", "", "ops"))
+	joined := strings.Join(v.NextSteps, "\n")
+	if !strings.Contains(joined, "/v1/resume") {
+		t.Errorf("nextSteps must include the resume: %v", v.NextSteps)
+	}
+	if !strings.Contains(joined, "REQUIRED") {
+		t.Errorf("the resume step should be marked required, not optional: %v", v.NextSteps)
+	}
+	// And it must come after the scale-up, since that is the order it is performed in.
+	up := strings.Index(joined, "--replicas=<original replicas>")
+	res := strings.Index(joined, "/v1/resume")
+	if up < 0 || res < 0 || res < up {
+		t.Errorf("the resume must be listed after the scale-up: %v", v.NextSteps)
+	}
+}

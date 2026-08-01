@@ -449,7 +449,12 @@ repmgr:
       # pgbackrest.restore.podOrdinal, rendered into the Job) and it never sets
       # pgbackrest's --force. It also cannot scale the StatefulSet: scaling to 0
       # deletes every agent, including the one reporting progress, so scale-down/up
-      # stays an operator step and the API returns the remaining commands.
+      # stays an operator step and the API returns the remaining commands. Whether a
+      # scale-down is needed at all depends on scheduling -- ReadWriteOnce binds the volume
+      # to a NODE, not a pod, so a Job co-scheduled with the target pod starts at once.
+      # What keeps the restore off a live PGDATA is the required pause plus the postmaster
+      # stop, not the scale-down. With standbys, scale down regardless: they must not
+      # stream from a primary being rewritten underneath them.
       #
       # Requires pgbackrest.enabled, pgbackrest.restore.enabled and
       # pgbackrest.restore.mode=cronjob (there must be a CronJob to clone).

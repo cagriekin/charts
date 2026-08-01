@@ -275,11 +275,27 @@ kubectl exec -n "${NAMESPACE}" "${POD0}" -c postgresql -- \
   psql -U testuser -d testdb -c 'SELECT 1' >/dev/null 2>&1 || pg_down_rc=$?
 assert_gt "postgres was stopped on the target pod before the Job was created" "${pg_down_rc}" "0"
 
-# The Job is Pending because the volume is still mounted by this pod -- and the API says
-# exactly that, derived from the fact that it is the one answering the request.
+# Either outcome is correct here, and which one you get is a scheduling detail worth
+# knowing: ReadWriteOnce binds a volume to a NODE, not a pod, so a restore Job the
+# scheduler places on this pod's node attaches the volume and starts IMMEDIATELY, with the
+# StatefulSet still scaled up. A Job placed elsewhere sits Pending until the volume is
+# freed. What must hold either way is that the restore is not racing a live postmaster --
+# asserted above, and guaranteed by the required pause plus the stop this flow performed.
 pending=$(api_body ops GET /v1/restore)
-assert_eq "the restore is pending" "pending" "$(jq -r '.phase' <<< "${pending}")"
-assert_contains "the hint names the scale-down the API cannot perform" "$(jq -r '.hint' <<< "${pending}")" "Scale the StatefulSet to 0"
+phase=$(jq -r '.phase' <<< "${pending}")
+case "${phase}" in
+  pending|running|succeeded) phase_ok=ok ;;
+  *) phase_ok="${phase}" ;;
+esac
+assert_eq "the restore Job is pending, running or already complete" "ok" "${phase_ok}"
+if [ "${phase}" = "pending" ]; then
+  # Only a Job that really is waiting for the volume gets the scale-down hint.
+  assert_contains "a pending Job's hint names the volume it cannot attach" \
+    "$(jq -r '.hint' <<< "${pending}")" "data-${POD0}"
+else
+  echo "  note: the restore Job co-scheduled with ${POD0} and started without a scale-down"
+  assert_eq "a Job that started carries no scale-down hint" "" "$(jq -r '.hint // ""' <<< "${pending}")"
+fi
 assert_eq "the status reports who requested the restore" "dba-break-glass" "$(jq -r '.requestedBy' <<< "${pending}")"
 
 # --- the operator's part: scale down, let it run, scale up ---
@@ -304,9 +320,29 @@ assert_eq "the Job the agent cloned actually completes a restore" "0" "${res_rc}
 
 echo "Scaling back up..."
 kubectl scale statefulset "${FULLNAME}" -n "${NAMESPACE}" --replicas=1
+
+# The restored node must NOT come up while the cluster is still paused: maintenance mode
+# makes the reconcile loop a no-op, so nothing starts PostgreSQL. This is the step an
+# operator forgets, so assert the trap exists before stepping over it -- a runbook that
+# omitted the resume would leave the cluster down.
+kubectl wait --for=jsonpath='{.status.phase}'=Running "pod/${POD0}" -n "${NAMESPACE}" --timeout=300s >/dev/null 2>&1 || true
+still_down=notready
+for _ in $(seq 1 6); do
+  ready=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.status.containerStatuses[?(@.name=="postgresql")].ready}' 2>/dev/null || true)
+  [ "${ready}" = "true" ] && { still_down=ready; break; }
+  sleep 5
+done
+assert_eq "while paused, the restored node deliberately does NOT start postgres" "notready" "${still_down}"
+
+# Resume, and only then expect readiness.
+if start_pf; then pf_ok=ok; else pf_ok=fail; fi
+wait_api_ready || true
+assert_eq "port-forward re-established after scale-up" "ok" "${pf_ok}"
+assert_eq "resuming the cluster succeeds" "200" "$(api_code ops POST /v1/resume)"
+
 up_rc=0
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 900 || up_rc=$?
-assert_eq "the restored node becomes ready" "0" "${up_rc}"
+assert_eq "the restored node becomes ready once resumed" "0" "${up_rc}"
 
 # 6000, not 5000: the base backup held 5000 rows and the rest can only appear by replaying
 # archived WAL -- which is what makes this a real PITR rather than an unpack.
@@ -323,10 +359,6 @@ assert_eq "the data came back from the repository, WAL replay included" "6000" "
 # This is the answer to "what happened to my restore?" after the cycle: the Job may be
 # gone to history limits, but restore.sh wrote the outcome onto the volume and the agent
 # reads it back.
-
-if start_pf; then pf_ok=ok; else pf_ok=fail; fi
-wait_api_ready || true
-assert_eq "port-forward re-established after scale-up" "ok" "${pf_ok}"
 
 status=""
 for _ in $(seq 1 24); do
@@ -360,11 +392,12 @@ assert_eq "the Job is gone" "" "${gone}"
 after_delete=$(api_body ops GET /v1/status)
 assert_eq "the recorded outcome survives the Job's deletion" "true" "$(jq -r '.lastRestore.succeeded' <<< "${after_delete}")"
 
-# --- resume ---
+# --- maintenance mode really is off ---
 
-assert_eq "resuming the cluster succeeds" "200" "$(api_code ops POST /v1/resume)"
 marker_pause=$(kubectl get configmap "${MARKER}" -n "${NAMESPACE}" -o jsonpath='{.metadata.annotations.pg-ha/pause}' 2>/dev/null || true)
 assert_eq "maintenance mode is off again" "" "${marker_pause}"
+resumed=$(api_body ops GET /v1/status)
+assert_eq "status no longer reports a pause" "false" "$(jq -r '.intents.paused' <<< "${resumed}")"
 
 end_suite
 print_summary

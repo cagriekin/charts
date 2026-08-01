@@ -69,11 +69,17 @@ func (s *Server) handleRestoreStatus(w http.ResponseWriter, r *http.Request) (in
 // annotateRestoreView adds the operator-facing explanation and the runbook steps the
 // API deliberately does not perform.
 //
-// The hint for a Pending Job with no container started is derived locally rather than
-// from Kubernetes Events: the agent is answering this request, so it IS a running pod
-// of the StatefulSet that holds the target volume -- which is precisely why the Job
-// cannot attach it. That inference needs no extra RBAC and covers the single most
-// common failure ("forgot to scale down").
+// The Pending hint is derived locally rather than from Kubernetes Events: the agent
+// answering this request is a running pod of the StatefulSet that holds the target
+// volume, so a Job that cannot start is very likely waiting on that volume. It needs no
+// extra RBAC and covers the most common failure ("forgot to scale down").
+//
+// It is only a HINT, and only when the Job is actually Pending, because a restore Job
+// scheduled onto the SAME NODE as the volume holder starts immediately: ReadWriteOnce
+// binds a volume to one node, not one pod. In that case the restore runs while the
+// StatefulSet is still scaled up -- which is safe here only because this flow stopped the
+// postmaster and required the cluster to be paused first. That pair, not the scale-down,
+// is what keeps a restore off a live data directory.
 func (s *Server) annotateRestoreView(v *RestoreView) {
 	if v.Phase == "pending" && !v.ContainerStarted && v.WaitingReason == "" {
 		if s.o.PodName == s.o.RestoreTargetPod {
@@ -108,16 +114,29 @@ func (s *Server) dataPVC() string {
 	return fmt.Sprintf("data-%s", s.o.RestoreTargetPod)
 }
 
-// restoreNextSteps is the remainder of the runbook. The API cannot take these steps:
-// scaling the StatefulSet to 0 deletes every agent, including the one that would
-// report progress, so scale-down/up stays an operator action by design.
+// restoreNextSteps is the remainder of the runbook. The API cannot scale the StatefulSet:
+// scaling to 0 deletes every agent, including the one that would report progress, so
+// scale-down/up stays an operator action by design.
+//
+// Whether a scale-down is needed AT ALL depends on scheduling. ReadWriteOnce binds a
+// volume to a NODE, not a pod, so a restore Job placed on the same node as the volume
+// holder starts straight away; one placed elsewhere waits for the volume. Both cases are
+// covered here, in the order an operator meets them: watch the Job first, and free the
+// volume only if it actually sits Pending.
 func (s *Server) restoreNextSteps() []string {
 	ns := s.o.Namespace
 	return []string{
+		fmt.Sprintf("kubectl logs -n %s -l batch.kubernetes.io/job-name=%s -f   # the restore runs here", ns, s.o.RestoreJobName),
+		fmt.Sprintf("# if the Job stays Pending it cannot attach %s -- free the volume:", s.dataPVC()),
 		fmt.Sprintf("kubectl scale statefulset %s -n %s --replicas=0", s.o.ClusterName, ns),
 		fmt.Sprintf("kubectl wait --for=delete pod/%s -n %s --timeout=5m", s.o.RestoreTargetPod, ns),
-		fmt.Sprintf("kubectl logs -n %s -l batch.kubernetes.io/job-name=%s -f   # the restore runs here", ns, s.o.RestoreJobName),
 		fmt.Sprintf("kubectl scale statefulset %s -n %s --replicas=<original replicas>", s.o.ClusterName, ns),
+		"# with standbys, scale down regardless: they must not stream from a primary being rewritten underneath them, and they re-clone onto the new timeline afterwards",
+		// This step is easy to forget and the cluster stays DOWN without it: maintenance
+		// mode makes the reconcile loop a no-op, so a scaled-back-up pod never starts
+		// PostgreSQL and never goes Ready. It is listed as an explicit step for that
+		// reason -- the API will not clear an operator's pause on its own.
+		"POST /v1/resume   # REQUIRED: while paused the loop is a no-op, so the restored node will not start",
 		"then GET /v1/status: recovery.replayLsn / recovery.lastReplayTime show WAL replay progress, and lastRestore carries the outcome",
 	}
 }
