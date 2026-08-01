@@ -488,6 +488,11 @@ It requires `pgbackrest.enabled`, `pgbackrest.restore.enabled` and
 **second, restore-only** authz list: a client cleared for pause/switchover cannot
 overwrite a data directory.
 
+The two lists **compose** — `control.allowedClientCNs` is the door to the API and
+`control.restore.allowedClientCNs` an extra lock on this one verb — so when the outer list
+is non-empty a restore client must appear in **both**. A 403 tells you which list refused
+the call.
+
 What it does and does not control:
 
 - The Job is a **verbatim clone** of the rendered CronJob's `jobTemplate` — identical to

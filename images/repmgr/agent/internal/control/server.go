@@ -315,17 +315,23 @@ func (s *Server) authnMW(next http.Handler) http.Handler {
 	})
 }
 
-// allowed reports whether id may exercise verb.
-func (s *Server) allowed(id Identity, verb Verb) bool {
+// allowed reports whether id may exercise verb, and on refusal WHICH allowlist refused
+// it. Naming the list matters: the two compose (the general one is the door to the API,
+// the restore one an extra lock on the destructive verb), so a client listed under
+// restore but not generally is refused by the general list -- and a bare "not on the
+// allowlist" would send the operator to edit the wrong one.
+func (s *Server) allowed(id Identity, verb Verb) (bool, string) {
 	if len(s.o.AllowedCNs) > 0 && !containsFold(s.o.AllowedCNs, id.CN) {
-		return false
+		return false, "the client certificate CN is not on repmgr.agent.control.allowedClientCNs, which gates every control route"
 	}
 	if verb == VerbRestore {
 		// No "allow all" reading of an empty restore list: naming nobody denies
 		// everybody, so forgetting the list cannot open the most destructive verb.
-		return containsFold(s.o.RestoreAllowedCNs, id.CN)
+		if !containsFold(s.o.RestoreAllowedCNs, id.CN) {
+			return false, "the client certificate CN is not on repmgr.agent.control.restore.allowedClientCNs (restore is a separate verb; a client must be on BOTH that list and allowedClientCNs)"
+		}
 	}
-	return true
+	return true, ""
 }
 
 func containsFold(list []string, v string) bool {
@@ -346,11 +352,10 @@ func containsFold(list []string, v string) bool {
 func (s *Server) guard(verb Verb, h func(http.ResponseWriter, *http.Request) (status int, detail string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := identityFrom(r.Context())
-		if !s.allowed(id, verb) {
+		if ok, why := s.allowed(id, verb); !ok {
 			s.o.Metrics.IncControlRejected()
-			s.audit(r, id, verb, "denied", "identity not permitted for this verb")
-			writeErr(w, http.StatusForbidden, "not authorized for "+string(verb),
-				"the client certificate CN is not on the allowlist for this verb")
+			s.audit(r, id, verb, "denied", why)
+			writeErr(w, http.StatusForbidden, "not authorized for "+string(verb), why)
 			return
 		}
 		status, detail := h(w, r)

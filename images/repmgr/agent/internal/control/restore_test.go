@@ -378,3 +378,40 @@ func TestFailedRestoreHintPointsAtLogsAndRetry(t *testing.T) {
 		t.Errorf("a failed restore should not offer the scale-down steps: %v", v.NextSteps)
 	}
 }
+
+// The two allowlists COMPOSE: the general one is the door to the API, the restore one an
+// extra lock. A client listed only under restore is refused by the general list -- and the
+// refusal has to say which list, or the operator edits the wrong one. (This exact
+// composition tripped the live suite's own fixture.)
+func TestForbiddenNamesTheAllowlistThatRefused(t *testing.T) {
+	h := newHarness(t, func(o *Options, _ *harness) {
+		o.AllowedCNs = []string{"ops-admin"}
+		o.RestoreAllowedCNs = []string{"dba"}
+	})
+	h.cl.marker.Paused = true
+
+	// dba is on the restore list but NOT on the general one: refused by the general list.
+	rec := h.do("POST", "/v1/restore", goodRestore, "dba")
+	wantCode(t, rec, 403)
+	if !strings.Contains(rec.Body.String(), "allowedClientCNs, which gates every control route") {
+		t.Errorf("should name the GENERAL list: %s", rec.Body.String())
+	}
+
+	// ops-admin passes the general list but is not on the restore list.
+	rec2 := h.do("POST", "/v1/restore", goodRestore, "ops-admin")
+	wantCode(t, rec2, 403)
+	if !strings.Contains(rec2.Body.String(), "restore.allowedClientCNs") {
+		t.Errorf("should name the RESTORE list: %s", rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "BOTH") {
+		t.Errorf("should state that both lists apply: %s", rec2.Body.String())
+	}
+
+	// On both lists: admitted.
+	h2 := newHarness(t, func(o *Options, _ *harness) {
+		o.AllowedCNs = []string{"ops-admin", "dba"}
+		o.RestoreAllowedCNs = []string{"dba"}
+	})
+	h2.cl.marker.Paused = true
+	wantCode(t, h2.do("POST", "/v1/restore", goodRestore, "dba"), 202)
+}

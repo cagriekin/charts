@@ -380,6 +380,10 @@ repmgr:
       # Optional client-CN allowlist for every control route. Empty means "any
       # certificate signed by ca.crt", which is already a closed set (you issue them).
       # Set it to restrict further, e.g. ["ops-admin","ci-deployer"].
+      #
+      # NOTE: this gates EVERY route, so it composes with restore.allowedClientCNs below
+      # rather than being an alternative to it -- when both are set, a restore client must
+      # appear in BOTH lists. A 403 names whichever list refused the call.
       allowedClientCNs: []
       # Restore triggering (POST /v1/restore) is a SEPARATE opt-in, because it is the
       # one verb that widens the database pods' Kubernetes privileges: it needs
@@ -402,10 +406,10 @@ repmgr:
       # pgbackrest.restore.mode=cronjob (there must be a CronJob to clone).
       restore:
         enabled: false
-        # The restore authz verb, separate from allowedClientCNs above: a client must
-        # be listed HERE to trigger a restore. Required when restore.enabled -- an
-        # empty list denies everyone, so forgetting it cannot open the most
-        # destructive verb in the API.
+        # The restore authz verb, an EXTRA lock on top of allowedClientCNs above (not a
+        # replacement): when that list is non-empty a restore client must be on both.
+        # Required when restore.enabled -- an empty list denies everyone, so forgetting
+        # it cannot open the most destructive verb in the API.
         allowedClientCNs: []
         # Live file-copy progress (progress.percent on GET /v1/restore) by tailing the
         # restore pod's log. Off by default because it needs `get pods/log` across the

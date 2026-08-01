@@ -51,12 +51,35 @@ func (c Client) Info(ctx context.Context) (json.RawMessage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pgbackrest info: %w", err)
 	}
-	if !json.Valid([]byte(out)) {
-		// Never forward unvalidated bytes as JSON to a client: a stray log line
-		// prepended to the payload must read as a server error, not a corrupt body.
-		return nil, fmt.Errorf("pgbackrest info returned %d bytes that are not valid JSON", len(out))
+	doc := extractJSON(out)
+	if doc == "" || !json.Valid([]byte(doc)) {
+		// Never forward unvalidated bytes as JSON to a client: output we cannot find a
+		// JSON document in must read as a server error, not a corrupt body.
+		return nil, fmt.Errorf("pgbackrest info returned %d bytes with no valid JSON document", len(out))
 	}
-	return json.RawMessage(out), nil
+	return json.RawMessage(doc), nil
+}
+
+// extractJSON returns the JSON document in pgbackrest's stdout, skipping any leading
+// non-JSON lines. It returns "" when there is none.
+//
+// This exists because pgBackRest writes some diagnostics to STDOUT before logging is even
+// configured, so --log-level-console=off cannot suppress them. The concrete case: the
+// chart puts PGBACKREST_ENABLED on the container env as a feature flag, and pgBackRest
+// treats every PGBACKREST_* variable as an option, so it prepends
+// "P00   WARN: environment contains invalid option 'enabled'" to the payload. (That
+// warning is pre-existing and harmless everywhere else -- nothing else parses this
+// stdout -- and only an unset, not an empty value, silences it.) Rather than depend on
+// the exact set of warnings pgBackRest may emit, find where the document starts.
+func extractJSON(out string) string {
+	lines := strings.Split(out, "\n")
+	for i, ln := range lines {
+		t := strings.TrimSpace(ln)
+		if strings.HasPrefix(t, "[") || strings.HasPrefix(t, "{") {
+			return strings.Join(lines[i:], "\n")
+		}
+	}
+	return ""
 }
 
 func (c Client) bin() string {

@@ -45,12 +45,15 @@ repmgr:
       enabled: true
       tls:
         existingSecret: pg-control-restore-tls
+      # allowedClientCNs gates EVERY control route, so a restore client has to be on it
+      # too -- the two lists compose (this one is the door, restore's is an extra lock).
       allowedClientCNs:
         - ops-admin
+        - dba-break-glass
       restore:
         enabled: true
-        # A SECOND, restore-only allowlist: the suite proves an identity cleared for
-        # pause/switchover cannot trigger a restore.
+        # The restore-only list. ops-admin is deliberately absent, so the suite can prove
+        # an identity cleared for pause/switchover still cannot overwrite the volume.
         allowedClientCNs:
           - dba-break-glass
   username: repmgr

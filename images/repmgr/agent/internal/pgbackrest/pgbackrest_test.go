@@ -2,6 +2,7 @@ package pgbackrest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -40,12 +41,37 @@ func TestInfoPassesThroughJSON(t *testing.T) {
 	}
 }
 
-// A log line prepended to the payload must be a server error, not a corrupt body
-// forwarded to the client as JSON.
+// pgBackRest writes some diagnostics to STDOUT before logging is configured, so
+// --log-level-console=off cannot suppress them. The real one seen in a live cluster: the
+// chart's PGBACKREST_ENABLED feature flag looks like a (bogus) pgBackRest option, so a
+// WARN is prepended to the payload. The document must still be found.
+func TestInfoSkipsLeadingDiagnostics(t *testing.T) {
+	const real = "P00   WARN: environment contains invalid option 'enabled'\n" +
+		`[{"archive":[],"backup":[],"name":"db","status":{"code":0}}]`
+	c := Client{Exec: &fakeRunner{out: real}, Stanza: "db"}
+	got, err := c.Info(context.Background())
+	if err != nil {
+		t.Fatalf("a leading WARN must not fail the call: %v", err)
+	}
+	if strings.Contains(string(got), "WARN") {
+		t.Errorf("the diagnostic must not be forwarded: %s", got)
+	}
+	var v []map[string]any
+	if err := json.Unmarshal(got, &v); err != nil || len(v) != 1 || v[0]["name"] != "db" {
+		t.Errorf("payload did not survive extraction: %s", got)
+	}
+}
+
+// Output with no JSON document at all is still a server error.
 func TestInfoRejectsNonJSON(t *testing.T) {
-	c := Client{Exec: &fakeRunner{out: "INFO: stanza db\n[{\"name\":\"db\"}]"}, Stanza: "db"}
+	c := Client{Exec: &fakeRunner{out: "ERROR: unable to open the repository\nP00 INFO: exiting"}, Stanza: "db"}
 	if _, err := c.Info(context.Background()); err == nil {
-		t.Fatal("non-JSON output must be rejected")
+		t.Fatal("output with no JSON document must be rejected")
+	}
+	// An object-shaped document (not only an array) is accepted too.
+	c2 := Client{Exec: &fakeRunner{out: "noise\n{\"a\":1}"}, Stanza: "db"}
+	if _, err := c2.Info(context.Background()); err != nil {
+		t.Errorf("a JSON object payload must be accepted: %v", err)
 	}
 }
 
