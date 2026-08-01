@@ -75,6 +75,12 @@ backup:
 pgbackrest:
   enabled: true
   stanza: db
+  # Enabled IN THE FIXTURE, not via --set: repmgr.agent.control.restore.enabled render-
+  # guards on it, so a fixture that omitted it would not render at all -- and
+  # resolve_fullname (a helm template call with only this file) would fail before the
+  # suite printed a single line.
+  restore:
+    enabled: true
   s3:
     endpoint: minio   # in-cluster MinIO Service (TLS on :443 -> targetPort 9000)
     bucket: pgbackrest-test

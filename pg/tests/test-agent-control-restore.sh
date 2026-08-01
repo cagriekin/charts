@@ -94,7 +94,7 @@ kubectl create secret generic "${TLS_SECRET}" -n "${NAMESPACE}" \
 
 echo "Installing pg chart (agent mode, control API + restore triggering)..."
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" -n "${NAMESPACE}" \
-  -f "${VALUES}" --set pgbackrest.restore.enabled=true --wait --timeout 10m
+  -f "${VALUES}" --wait --timeout 10m
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 900
 
 # --- data + a backup to restore from ---
