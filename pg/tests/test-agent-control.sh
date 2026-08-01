@@ -142,6 +142,29 @@ start_pf() { # start_pf <pod> <local-port> <remote-port>
   return 1
 }
 
+# kubectl binds the LOCAL port immediately, so start_pf returning 0 proves only that much:
+# the pod side can still refuse connections for a few seconds after the pod goes Ready
+# (the agent's listener and the readiness probe are independent). Every control-port
+# forward is therefore followed by an end-to-end probe -- without it the first few API
+# calls intermittently see 000 and the suite fails for reasons that have nothing to do
+# with the API.
+wait_api_ready() {
+  for _ in $(seq 1 30); do
+    [[ "$(api_code GET /v1/status)" != "000" ]] && return 0
+    sleep 2
+  done
+  return 1
+}
+wait_http_ready() { # wait_http_ready <url>
+  for _ in $(seq 1 30); do
+    local code
+    code=$(curl -sS -o /dev/null -w '%{http_code}' "$1" 2>/dev/null) || true
+    [[ -n "${code}" && "${code}" != "000" ]] && return 0
+    sleep 2
+  done
+  return 1
+}
+
 if start_pf "${LEADER}" "${LOCAL_PORT}" 9201; then pf_ok=ok; else pf_ok=fail; fi
 assert_eq "port-forward to the control port established" "ok" "${pf_ok}"
 
@@ -164,6 +187,9 @@ api() {
 }
 api_code() { api "$@" | head -1; }
 api_body() { api "$@" | tail -n +2; }
+
+if wait_api_ready; then api_ready=ok; else api_ready=fail; fi
+assert_eq "the control API answers through the forward" "ok" "${api_ready}"
 
 # --- authentication: the listener itself must enforce mTLS ---
 
@@ -214,6 +240,7 @@ assert_eq "members carry a timeline" "ok" "${tl_ok}"
 
 if start_pf "${LEADER}" "${METRICS_PORT}" 9200; then metrics_pf=ok; else metrics_pf=fail; fi
 assert_eq "port-forward to the metrics port established" "ok" "${metrics_pf}"
+wait_http_ready "http://127.0.0.1:${METRICS_PORT}/metrics" || true
 metrics_code=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null) || true
 assert_eq "the metrics port still serves /metrics over plain HTTP" "200" "${metrics_code}"
 for path in /v1/status /v1/pause /v1/switchover /v1/restore; do
@@ -231,6 +258,7 @@ assert_gt "the refused calls above were counted" "${rejected:-0}" "0"
 # --- pause: the API writes the SAME marker kubectl writes ---
 
 if start_pf "${LEADER}" "${LOCAL_PORT}" 9201; then pf_ok=ok; else pf_ok=fail; fi
+wait_api_ready || true
 assert_eq "port-forward re-established on the control port" "ok" "${pf_ok}"
 
 pause_code=$(api_code POST /v1/pause)
@@ -352,6 +380,7 @@ assert_eq "the promoted candidate accepts writes" "ok" "${write_ok}"
 # And the API on the NEW leader reports it as primary. Its snapshot refreshes once per
 # reconcile tick, so give it a few ticks after the promotion.
 if start_pf "${CANDIDATE}" "${LOCAL_PORT}" 9201; then pf_ok=ok; else pf_ok=fail; fi
+wait_api_ready || true
 assert_eq "port-forward to the new leader established" "ok" "${pf_ok}"
 new_status=""
 for _ in $(seq 1 24); do

@@ -165,6 +165,19 @@ api() {
 api_code() { api "$@" | head -1; }
 api_body() { api "$@" | tail -n +2; }
 
+# kubectl binds the local port immediately, so a successful start_pf proves only that: the
+# pod side can still refuse connections for a few seconds after the pod goes Ready. Probe
+# end to end before asserting anything, or the first calls intermittently see 000.
+wait_api_ready() {
+  for _ in $(seq 1 30); do
+    [[ "$(api_code ops GET /v1/status)" != "000" ]] && return 0
+    sleep 2
+  done
+  return 1
+}
+if wait_api_ready; then api_ready=ok; else api_ready=fail; fi
+assert_eq "the control API answers through the forward" "ok" "${api_ready}"
+
 # --- reads that need no extra privilege ---
 
 backups_code=$(api_code ops GET /v1/backups)
@@ -291,6 +304,7 @@ assert_eq "the data came back from the repository, WAL replay included" "6000" "
 # reads it back.
 
 if start_pf; then pf_ok=ok; else pf_ok=fail; fi
+wait_api_ready || true
 assert_eq "port-forward re-established after scale-up" "ok" "${pf_ok}"
 
 status=""

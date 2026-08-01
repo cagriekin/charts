@@ -440,3 +440,40 @@ func TestBrokenRotationKeepsServing(t *testing.T) {
 		t.Error("the fallback must not weaken client authentication")
 	}
 }
+
+// The intent deadline hangs off the request deadline, so the request budget must stay
+// strictly wider -- otherwise a slow restart returns a generic request timeout instead of
+// the specific "check GET /v1/status" answer.
+func TestRequestTimeoutStaysWiderThanIntentTimeout(t *testing.T) {
+	ca := newCA(t, "control-ca")
+	dir := t.TempDir()
+	certPEM, keyPEM := ca.issue(t, "pg-0", true)
+	mk := func(req, intent time.Duration) *Server {
+		o := baseOptions(t)
+		o.CertFile = writeFile(t, dir, "tls.crt", certPEM)
+		o.KeyFile = writeFile(t, dir, "tls.key", keyPEM)
+		o.CAFile = writeFile(t, dir, "ca.crt", ca.pem)
+		o.Addr = "127.0.0.1:0"
+		o.RequestTimeout, o.IntentTimeout = req, intent
+		s, err := New(o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	// Equal budgets (the cloud-preset case: 4 x 15s reconcile interval) must be widened.
+	s := mk(60*time.Second, 60*time.Second)
+	if s.o.RequestTimeout <= s.o.IntentTimeout {
+		t.Errorf("RequestTimeout=%s must exceed IntentTimeout=%s", s.o.RequestTimeout, s.o.IntentTimeout)
+	}
+	// An already-wide request budget is left alone.
+	s2 := mk(300*time.Second, 30*time.Second)
+	if s2.o.RequestTimeout != 300*time.Second {
+		t.Errorf("RequestTimeout = %s, want the configured 300s", s2.o.RequestTimeout)
+	}
+	// Defaults are consistent with each other.
+	s3 := mk(0, 0)
+	if s3.o.RequestTimeout <= s3.o.IntentTimeout {
+		t.Errorf("defaults: RequestTimeout=%s IntentTimeout=%s", s3.o.RequestTimeout, s3.o.IntentTimeout)
+	}
+}

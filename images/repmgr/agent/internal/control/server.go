@@ -108,6 +108,14 @@ func New(o Options) (*Server, error) {
 	if o.IntentTimeout <= 0 {
 		o.IntentTimeout = defaultIntentTO
 	}
+	// The intent deadline is derived from the request deadline, so if they were equal
+	// (which they are on a cloud preset, where IntentTimeout scales to 4x a 15s
+	// reconcile interval) the outer one could fire first and return a generic request
+	// timeout instead of the specific "restart did not complete, check GET /v1/status".
+	// Keep the request budget strictly wider.
+	if slack := o.IntentTimeout + 15*time.Second; o.RequestTimeout < slack {
+		o.RequestTimeout = slack
+	}
 	if _, _, err := net.SplitHostPort(o.Addr); err != nil {
 		return nil, fmt.Errorf("control: addr %q is not host:port: %w", o.Addr, err)
 	}
