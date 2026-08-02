@@ -102,9 +102,16 @@ jobs:
             echo "Release ${tag} already exists, uploading asset"
             gh release upload "$tag" "$pkg" --clobber
           else
+            # NOT --generate-notes: chart tags interleave (pg-1.5.0, redis-1.5.1, pg-1.9.0),
+            # and that flag diffs against the previous tag in the WHOLE REPO and cannot filter
+            # by path -- so pg-1.9.0 shipped notes listing six kafka PRs and comparing itself
+            # against redis-1.5.1. scripts/release-notes.sh takes the range from the previous
+            # tag of THIS chart and keeps only commits touching its own files.
+            bash scripts/release-notes.sh "$chart" "$tag" > "$workdir/notes.md"
+            cat "$workdir/notes.md"
             gh release create "$tag" "$pkg" \
               --title "$tag" \
-              --generate-notes
+              --notes-file "$workdir/notes.md"
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
