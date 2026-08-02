@@ -417,6 +417,40 @@ repmgr:
         # Required when restore.enabled -- an empty list denies everyone, so forgetting
         # it cannot open the most destructive verb in the API.
         allowedClientCNs: []
+        # The bound on the `create jobs` grant restore needs (#279). RBAC restricts by verb
+        # and resource; this restricts by CONTENT, which RBAC cannot -- so "create arbitrary
+        # Jobs in this namespace" becomes "create this one restore Job, as this release's
+        # ServiceAccount, with this release's volumes".
+        #
+        # A ValidatingAdmissionPolicy + binding, both CLUSTER-SCOPED: in-tree and GA since
+        # Kubernetes 1.30, so no webhook and nothing that can be down. It polices only this
+        # release's ServiceAccount; every other creator of Jobs is untouched. The installing
+        # identity needs cluster-scoped create on admissionregistration.k8s.io, and the
+        # render FAILS when the cluster does not expose admissionregistration.k8s.io/v1 (GA in
+        # 1.30) rather than letting the apply fail halfway. The check is on the API group, not
+        # the reported version: with no cluster, .Capabilities.KubeVersion is the helm client's.
+        #
+        # Pinned: the Job's name and pg-ha/restore label, its ServiceAccount with
+        # automountServiceAccountToken=false, no host namespaces, no nodeName and only this
+        # release's priorityClassName, the pod's own labels (so it cannot join this release's
+        # Service endpoints), no manualSelector, one container on this release's image running
+        # this release's restore command with no args and no lifecycle hooks, this release's
+        # pod and container security contexts (no privileged / root /
+        # added capabilities), requests and limits, a single pod, the three volumes the
+        # restore renders, and no envFrom / no valueFrom beyond the downward API and this
+        # release's own Secrets.
+        #
+        # NOT bounded, because a restore cannot be expressed without it: the restore
+        # PARAMETERS. Anything holding the token can still run this release's own restore
+        # over the live PGDATA without passing the control API's mTLS. See pg/README.md.
+        admissionPolicy:
+          enabled: true
+          # With admissionPolicy.enabled false the RENDER FAILS unless this is also true:
+          # dropping the bound silently would leave the Role carrying a namespace-wide
+          # privilege-escalation primitive with nothing recording that anyone chose it. Set
+          # both for a cluster below 1.30, a policy installed out of band, or to accept the
+          # unbounded grant as 1.9.0 required.
+          acknowledgeUnbounded: false
         # Live file-copy progress (progress.percent on GET /v1/restore) by tailing the
         # restore pod's log. Off by default because it needs `get pods/log` across the
         # namespace -- the Job's pod name is generated, so it cannot be scoped -- and

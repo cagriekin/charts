@@ -1,5 +1,120 @@
 # pg chart changelog
 
+## 1.10.0 - 2026-08-02
+
+### Added
+
+- **`control.restore`'s job-create grant is now bounded by a `ValidatingAdmissionPolicy`**
+  (#279), rendered by default whenever `repmgr.agent.control.restore.enabled` is set.
+
+  1.9.0 shipped API-driven restore with an honest warning rather than a fix: triggering a
+  restore needs `create` on `jobs`, RBAC **cannot** restrict a create by `resourceName`, and
+  so the grant let anything holding the database pods' ServiceAccount token create arbitrary
+  Jobs in the namespace — naming any ServiceAccount, with no separate permission check. On a
+  token mounted beside a PostgreSQL that runs user-supplied SQL, that is a namespace-wide
+  privilege-escalation primitive, and the documented advice was to leave the feature off.
+
+  The missing restriction is content-based, which is a layer RBAC does not reach.
+  `ValidatingAdmissionPolicy` is exactly that layer, in-tree and GA since Kubernetes 1.30 —
+  no webhook, no serving certificate, nothing that can be down. The policy polices **one
+  subject**, this release's ServiceAccount, and requires of every Job it creates:
+
+  | Pinned | Why |
+  |---|---|
+  | `metadata.name` == the agent's one deterministic Job name | the `resourceName` restriction RBAC refused to give — `create` collapses to a single object |
+  | `pg-ha/restore=<fullname>` label | provenance, and it fails closed if chart and policy drift |
+  | `serviceAccountName` == the release's own SA | removes the escalation; what is left is "the privileges I already hold" |
+  | `automountServiceAccountToken: false`, stated explicitly | makes SA-naming moot: the pod gets no token |
+  | no `hostNetwork` / `hostPID` / `hostIPC`, no explicit `nodeName`, only this release's `priorityClassName` | no escape to the node, no placing the pod by hand, and no claiming a high-priority class to make the scheduler preempt this release's own postgresql pods |
+  | the **pod's own labels**, limited to this release's restore labels plus the batch controller's | a restore pod labelled `component=postgresql` would join the write Service's endpoints — Ready immediately, since it has no readiness probe — and receive application traffic and credentials |
+  | no `manualSelector` | the Job's selector and identity labels stay server-assigned |
+  | one container, no init or ephemeral containers, running this release's repmgr image | bounds what code enters the cluster on this token |
+  | `command` == this release's restore entrypoint, no `args`, no `lifecycle` hooks | the image pin alone is weak: the postgresql container already runs this image against this volume, so without this the Job is "run anything as the database's uid with the live PGDATA mounted" |
+  | this release's pod and container `securityContext` | no `privileged`, no `runAsUser: 0`, no added capabilities — otherwise the Job is a strictly *larger* privilege set than the token started with |
+  | requests and limits present; `parallelism`/`completions` ≤ 1 | the one permitted Job name is otherwise a repeatable way to fill the namespace quota and evict the database's own pods |
+  | volumes limited to the three the restore template renders | with the token gone, mounting another workload's Secret was the remaining way out — this closes it, along with `hostPath` and projected tokens |
+  | no `envFrom`; `valueFrom` limited to the downward API and the release's own Secrets | the same bound for env |
+
+  The security contexts, resources and command are pinned to **what this release's values
+  render**, not to a fixed hardened profile, so changing `postgresql.containerSecurityContext`
+  moves the pin with it — a chart that denied its own restore Job would be worse than no
+  policy.
+
+  Every other creator of Jobs — humans, GitOps controllers, the CronJob controller, other
+  workloads — is **unaffected**; that direction is asserted in the KinD suite alongside the
+  denials, because a policy that broke every other controller in the namespace would be
+  worse than the hole it closes.
+
+  `failurePolicy: Fail` is load-bearing: under `Ignore` an evaluation failure would
+  silently re-open the hole. In the same spirit the grant and its bound cannot be separated
+  — rendering the RBAC without the policy **fails the render** unless you say so in values:
+
+  ```yaml
+  repmgr:
+    agent:
+      control:
+        restore:
+          enabled: true
+          allowedClientCNs: [dba-break-glass]
+          admissionPolicy:
+            enabled: true            # default
+            acknowledgeUnbounded: false
+  ```
+
+  **What it does not bound**, stated plainly because it decides whether the feature belongs
+  on a given cluster: the restore *parameters*. Anything holding the token can still create
+  the one permitted Job with its own `TARGET`/`BACKUP_SET`/`FORCE` — this release's own
+  restore, over the live PGDATA, without presenting a certificate to the control API. A
+  restore over the live data directory is the operation being exposed, so admission has
+  nothing left to reject; pgBackRest's `postmaster.pid` interlock still means this needs the
+  StatefulSet already scaled to 0.
+
+  Nor is the command pin a sandbox: bash reads `$BASH_ENV`, and an actor who already runs code
+  in the postgresql container can write a file into PGDATA, which this Job mounts. That
+  reaches uid 101 with no token and only this release's volumes — the privileges already held,
+  which is the bar — but the image, security-context, volume and env pins are what hold it,
+  not the command pin alone.
+
+  So the policy turns "namespace-wide privilege escalation from a SQL injection" into "an
+  unauthenticated trigger for this release's own restore". That is a large reduction, and it
+  is what makes the feature defensible rather than advisory — but where untrusted SQL runs
+  and an unscheduled restore would itself be a serious incident, leaving `control.restore`
+  off remains the right answer.
+
+- `pgbackrest.restore.mode=cronjob` now renders `jobTemplate.metadata.labels` with
+  `pg-ha/restore=<fullname>`. Both `kubectl create job --from=cronjob/...` and the control
+  API's clone copy jobTemplate labels onto the Job they create, and nothing else does — so
+  a cloned restore Job is now selectable (`kubectl get jobs -l pg-ha/restore=<fullname>`)
+  where before it carried no labels at all. Deliberately *not* the full `app.kubernetes.io`
+  set: a Job the agent creates is not Helm-managed, and claiming otherwise invites a GitOps
+  controller to prune it mid-restore.
+
+### Upgrading
+
+- **Requires Kubernetes ≥ 1.30 and cluster-scoped `create` on
+  `admissionregistration.k8s.io` (`ValidatingAdmissionPolicy`, `ValidatingAdmissionPolicy-
+  Binding`) — but only if you enable `repmgr.agent.control.restore`.** These are this
+  chart's first cluster-scoped objects; a default install renders none of them, so a
+  namespace-limited installer is unaffected unless it opts into restore triggering.
+- Already running `control.restore.enabled: true` on 1.9.0 and cannot render cluster-scoped
+  objects (or are below 1.30, or manage one policy centrally)? Set
+  `repmgr.agent.control.restore.admissionPolicy.enabled: false` **and**
+  `acknowledgeUnbounded: true` to keep 1.9.0's behaviour, which the render otherwise
+  refuses. Without the API the render **fails** rather than letting the apply abort halfway
+  with "no matches for kind ValidatingAdmissionPolicy", so an upgrade cannot leave a release
+  half-applied. The precondition checked is the presence of `admissionregistration.k8s.io/v1`,
+  not the reported Kubernetes version: with no cluster to query, `.Capabilities.KubeVersion` is
+  the *helm client's* built-in version (3.14 reports v1.29), so a version floor would break
+  every `helm template` run by an older helm regardless of the target cluster.
+- Values interpolated into the policy's CEL expressions (`pgbackrest.existingSecret.name`,
+  `pgbackrest.repoEncryption.existingSecret.name`, the image reference, `fullnameOverride`)
+  are now charset-validated at render time. A name containing a quote or whitespace fails
+  the render with the offending value named, instead of producing a policy the API server
+  rejects — or, worse, one whose validation is a tautology.
+- A cluster whose **mutating** admission rewrites `Job` objects (sidecar injectors act on
+  Pods and are unaffected) can make the cloned Job stop matching a pin. The denial names the
+  exact field, and the same two values turn the policy off.
+
 ## 1.9.0 - 2026-08-01
 
 ### Added

@@ -1,0 +1,63 @@
+# The render-time precondition for the #279 admission policy, in its own suite because
+# helm-unittest's suite-level `capabilities.apiVersions` cannot be un-declared by a per-test
+# override -- and this is the one case that needs it ABSENT.
+#
+# helm-unittest's default capability set does not include admissionregistration.k8s.io/v1, so
+# simply not declaring it here reproduces a cluster that cannot host the policy. (helm's own
+# no-cluster default DOES include the group, which is why `helm template` and the kubeconform
+# gate render the policy without a cluster and cannot express this case at all.)
+suite: restore admission policy without the API group (#279)
+release:
+  name: test-pg
+  namespace: pg-ns
+# majorVersion/minorVersion are pinned only because the message quotes the reported version;
+# they are NOT what the guard checks. apiVersions is deliberately left undeclared -- the absent
+# API group is the case under test, and helm-unittest's default set does not include it.
+capabilities:
+  majorVersion: 1
+  minorVersion: 29
+tests:
+  # Failing the RENDER is the point. Without it, an upgrade from 1.9.0 on a cluster below
+  # 1.30 -- or one where --runtime-config disabled the group -- renders clean and then aborts
+  # mid-apply with "no matches for kind ValidatingAdmissionPolicy", leaving the release failed.
+  - it: a cluster without admissionregistration.k8s.io/v1 fails the render
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: "repmgr.agent.control.restore needs admissionregistration.k8s.io/v1 for the ValidatingAdmissionPolicy that bounds its `create jobs` grant, and this cluster does not expose it -- it is GA from Kubernetes 1.30 (this cluster reports v1.29.0), and can also be disabled by --runtime-config (#279). Upgrade or enable the API, or set repmgr.agent.control.restore.admissionPolicy.enabled=false together with acknowledgeUnbounded=true to run the feature with an unbounded grant deliberately"
+
+  # ...and acknowledging the trade is what lets such a cluster run the feature at all. This is
+  # the documented path for a pre-1.30 cluster and for a namespace-limited installer.
+  - it: acknowledging the trade lets a cluster without the API render the grant
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      repmgr.agent.control.restore.admissionPolicy.enabled: false
+      repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  # The grant itself is untouched by that opt-out -- which is exactly why rbac.yaml's comment
+  # says the unbounded state IS reachable and tells the reader to check for the binding.
+  - it: the grant is still rendered when the trade is acknowledged
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      repmgr.agent.control.restore.admissionPolicy.enabled: false
+      repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
+    templates:
+      - templates/rbac.yaml
+    documentIndex: 1
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["batch"]
+            resources: ["jobs"]
+            verbs: ["create"]

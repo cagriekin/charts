@@ -11,7 +11,10 @@
 #     as lastRestore AFTER the scale-down/up cycle -- the whole point of that file, since
 #     by then the Job may be gone;
 #   * WAL-replay progress is visible on GET /v1/status once the cluster is back, which is
-#     the progress signal that survives scaling to 0.
+#     the progress signal that survives scaling to 0;
+#   * the ValidatingAdmissionPolicy that bounds the unscopeable `create jobs` grant (#279)
+#     admits the agent's own Job and denies every tampered one -- content-based admission
+#     exists only in the apiserver, so there is no cheaper layer that could test it.
 #
 # It also documents the honest shape of the flow: the API removes the `kubectl create job
 # --from` step and nothing else. Scaling to 0 deletes every agent, so the API cannot do it
@@ -117,6 +120,243 @@ assert_eq "RBAC: cannot read another CronJob" "no" "$(can get "cronjobs/${FULLNA
 assert_eq "RBAC: cannot list Jobs" "no" "$(can list jobs)"
 assert_eq "RBAC: no pods/log without restore.readPodLogs" "no" "$(can get pods/log)"
 assert_eq "RBAC: still cannot read Secrets" "no" "$(can get secrets)"
+
+# --- and the bound on the one grant RBAC could not scope (#279) ---
+#
+# `create jobs` above is unscopeable, so what limits it is a ValidatingAdmissionPolicy:
+# RBAC restricts by verb and resource, admission restricts by CONTENT. Only a live
+# apiserver can test that, and it has to be tested in BOTH directions -- a policy that
+# denied the agent's own restore would break the feature, and one that policed every
+# creator would break every other controller in the namespace.
+#
+# Each case submits the Job `kubectl create job --from=cronjob/...` builds -- the same
+# clone the agent builds -- as the pods' ServiceAccount, with one field tampered.
+# --dry-run=server runs the full admission chain and creates nothing.
+# The name is hash-suffixed (pg.restoreGuardName), so it is looked up by the release labels
+# rather than reconstructed here -- reconstructing it would make this suite drift from the
+# helper the moment the naming changed.
+GUARD=$(kubectl get validatingadmissionpolicy \
+  -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/name=pg" \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+assert_contains "VAP: the policy is installed, hash-discriminated per namespace and release" \
+  "${GUARD}" "^${NAMESPACE}-${FULLNAME}-restore-guard-[0-9a-f]\{8\}$"
+# Stop here if the lookup found nothing. Every assertion below compares against the output of
+# a kubectl call that takes GUARD as an argument, and `kubectl get vap ""` fails with empty
+# output -- so "" == "" would report PASS for a cluster that has no policy at all. Same
+# vacuity assert_not_eq exists to prevent.
+if [ -z "${GUARD}" ]; then
+  fail "VAP: no policy found for release ${RELEASE}" "the rest of the #279 assertions cannot mean anything"
+else
+assert_eq "VAP: the binding is installed under the same name" "${GUARD}" \
+  "$(kubectl get validatingadmissionpolicybinding "${GUARD}" -o jsonpath='{.metadata.name}' 2>/dev/null || true)"
+assert_eq "VAP: fails closed (Ignore would silently re-open the hole)" "Fail" \
+  "$(kubectl get validatingadmissionpolicy "${GUARD}" -o jsonpath='{.spec.failurePolicy}' 2>/dev/null || true)"
+# The apiserver type-checks every expression against batch/v1 Job and reports what does not
+# resolve. A warning here means a validation that can never do its job -- and under
+# failurePolicy: Fail, one that may deny every restore instead.
+# Checked in two steps on purpose: comparing the warnings list against "" alone would pass
+# identically whether the apiserver found nothing or had not populated .status yet, so the
+# presence of the status block is asserted first.
+vap_status=$(kubectl get validatingadmissionpolicy "${GUARD}" \
+  -o jsonpath='{.status.typeChecking}' 2>/dev/null || true)
+assert_contains "VAP: the apiserver has type-checked the policy at all" "${vap_status}" "."
+vap_warnings=$(kubectl get validatingadmissionpolicy "${GUARD}" \
+  -o jsonpath='{.status.typeChecking.expressionWarnings}' 2>/dev/null || true)
+[ -n "${vap_warnings}" ] && echo "  note: apiserver type-check warnings: ${vap_warnings}"
+assert_eq "VAP: the apiserver type-checks every expression cleanly" "" "${vap_warnings}"
+
+# clone_job <jq filter> -- the Job the agent would create, with the filter applied.
+clone_job() {
+  kubectl create job "${API_JOB}" --from=cronjob/"${FULLNAME}-pgbackrest-restore" \
+    -n "${NAMESPACE}" --dry-run=client -o json 2>/dev/null | jq "$1"
+}
+# admit <jq filter> [<impersonated user>|human] -> "allowed" | the apiserver's denial message
+# The literal "human" means "do not impersonate", i.e. submit as whoever is running the
+# suite. A sentinel rather than an empty second argument, because ${2:-${SA}} would silently
+# substitute the ServiceAccount for one and turn the control case into a duplicate.
+admit() {
+  local filter="$1" who="${2:-${SA}}" out rc=0 args=(-f - -n "${NAMESPACE}" --dry-run=server -o name)
+  [[ "${who}" != "human" ]] && args+=(--as="${who}")
+  out=$(clone_job "${filter}" | kubectl create "${args[@]}" 2>&1) || rc=$?
+  if [ "${rc}" -eq 0 ]; then echo "allowed"; else echo "${out}"; fi
+}
+
+# The direction that is easy to forget: the legitimate restore must still go through, and a
+# human or any other controller must be unaffected by the policy existing.
+assert_eq "VAP: the agent's own restore Job is admitted" "allowed" "$(admit '.')"
+unrelated='.metadata.name="vap-unrelated-job" | .metadata.labels={} | .spec.template.spec.serviceAccountName="default" | .spec.template.spec.automountServiceAccountToken=true'
+assert_eq "VAP: a Job created by a human is untouched" "allowed" "$(admit "${unrelated}" human)"
+
+# The escalation primitive itself: a Job's pod may name any ServiceAccount, with no separate
+# permission check. This is the denial the whole feature's safety rests on.
+assert_contains "VAP: naming another ServiceAccount is denied" \
+  "$(admit '.spec.template.spec.serviceAccountName="privileged-sa"')" \
+  "may only create Jobs running as ServiceAccount"
+# ...and why it would not help even if it were not: no token is mounted.
+assert_contains "VAP: mounting the ServiceAccount token is denied" \
+  "$(admit '.spec.template.spec.automountServiceAccountToken=true')" \
+  "automountServiceAccountToken: false"
+assert_contains "VAP: omitting automountServiceAccountToken is denied (absent is not a pass)" \
+  "$(admit 'del(.spec.template.spec.automountServiceAccountToken)')" \
+  "automountServiceAccountToken: false"
+# The bound RBAC could not express: create collapses to ONE permitted object name.
+assert_contains "VAP: any other Job name is denied" \
+  "$(admit '.metadata.name="evil"')" "may create only the Job"
+# generateName cannot slip past it: name generation happens before VALIDATING admission, so
+# the policy sees the final name. Worth proving rather than reasoning about.
+assert_contains "VAP: generateName cannot dodge the name pin" \
+  "$(admit 'del(.metadata.name) | .metadata.generateName="evil-"')" "may create only the Job"
+assert_contains "VAP: a Job without the pg-ha/restore label is denied" \
+  "$(admit '.metadata.labels={}')" "must carry pg-ha/restore"
+assert_contains "VAP: hostNetwork is denied" \
+  "$(admit '.spec.template.spec.hostNetwork=true')" "hostNetwork, hostPID, hostIPC"
+assert_contains "VAP: hostPID is denied" \
+  "$(admit '.spec.template.spec.hostPID=true')" "hostNetwork, hostPID, hostIPC"
+assert_contains "VAP: another image is denied" \
+  "$(admit '.spec.template.spec.containers[0].image="attacker/img:1"')" "may only run this release's repmgr image"
+assert_contains "VAP: a second container is denied" \
+  "$(admit '.spec.template.spec.containers += [{"name":"x","image":"busybox"}]')" "exactly one container"
+assert_contains "VAP: an init container is denied" \
+  "$(admit '.spec.template.spec.initContainers=[{"name":"i","image":"busybox"}]')" "exactly one container"
+# With the token gone, mounting somebody else's Secret is the remaining route out of this
+# release -- so the volume sources are pinned to the three the restore template renders.
+assert_contains "VAP: mounting an arbitrary Secret is denied" \
+  "$(admit '.spec.template.spec.volumes += [{"name":"steal","secret":{"secretName":"pg-control-restore-tls"}}]')" \
+  "may mount only this release's restore volumes"
+assert_contains "VAP: a hostPath mount is denied" \
+  "$(admit '.spec.template.spec.volumes += [{"name":"node","hostPath":{"path":"/"}}]')" \
+  "may mount only this release's restore volumes"
+assert_contains "VAP: a projected ServiceAccount token is denied" \
+  "$(admit '.spec.template.spec.volumes += [{"name":"tok","projected":{"sources":[{"serviceAccountToken":{"path":"t"}}]}}]')" \
+  "may mount only this release's restore volumes"
+assert_contains "VAP: an unrelated PVC is denied" \
+  "$(admit '.spec.template.spec.volumes += [{"name":"other","persistentVolumeClaim":{"claimName":"data-other-0"}}]')" \
+  "may mount only this release's restore volumes"
+# The same bound for env: envFrom pulls a whole Secret, secretKeyRef/configMapKeyRef a key
+# from any of them. Only the downward API and this release's own Secrets get through.
+assert_contains "VAP: reading another Secret through secretKeyRef is denied" \
+  "$(admit '.spec.template.spec.containers[0].env += [{"name":"X","valueFrom":{"secretKeyRef":{"name":"pg-control-restore-tls","key":"tls.key"}}}]')" \
+  "may not use envFrom"
+assert_contains "VAP: envFrom is denied" \
+  "$(admit '.spec.template.spec.containers[0].envFrom=[{"secretRef":{"name":"pg-control-restore-tls"}}]')" \
+  "may not use envFrom"
+assert_contains "VAP: reading a ConfigMap through configMapKeyRef is denied" \
+  "$(admit '.spec.template.spec.containers[0].env += [{"name":"X","valueFrom":{"configMapKeyRef":{"name":"kube-root-ca.crt","key":"ca.crt"}}}]')" \
+  "may not use envFrom"
+assert_contains "VAP: a resourceFieldRef is denied (only the downward API's own metadata)" \
+  "$(admit '.spec.template.spec.containers[0].env += [{"name":"X","valueFrom":{"resourceFieldRef":{"resource":"limits.cpu"}}}]')" \
+  "may not use envFrom"
+
+# The command pin, and why it is the difference between "one permitted Job" and "run anything
+# you like as the database's uid with the live PGDATA mounted". Destroying the data directory
+# needs no privilege escalation at all, so this is asserted first among the hardening cases.
+assert_contains "VAP: an arbitrary command over the live PGDATA is denied" \
+  "$(admit '.spec.template.spec.containers[0].command=["bash","-c","rm -rf /var/lib/postgresql/data/pgdata/*"]')" \
+  "must run exactly this release's restore command"
+assert_contains "VAP: appending args to the pinned command is denied" \
+  "$(admit '.spec.template.spec.containers[0].args=["-c","id"]')" \
+  "must run exactly this release's restore command"
+assert_contains "VAP: omitting the command is denied" \
+  "$(admit 'del(.spec.template.spec.containers[0].command)')" \
+  "must run exactly this release's restore command"
+
+# Security contexts. Without these the Job is admitted as a root container with CAP_SYS_ADMIN
+# -- which reads every other pod's projected token off the kubelet, and is a strictly LARGER
+# privilege set than the token started with, making "same privileges I already hold" false.
+# privileged:true alongside allowPrivilegeEscalation:false is rejected by the apiserver's own
+# validation, so the realistic payload relaxes both.
+assert_contains "VAP: a privileged container is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.privileged=true | .spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation=true')" \
+  "must run with this release's container security context"
+assert_contains "VAP: running as uid 0 is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.runAsUser=0')" \
+  "must run with this release's container security context"
+assert_contains "VAP: adding capabilities is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.capabilities.add=["SYS_ADMIN"]')" \
+  "must run with this release's container security context"
+assert_contains "VAP: relaxing allowPrivilegeEscalation is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation=true')" \
+  "must run with this release's container security context"
+assert_contains "VAP: dropping the container securityContext entirely is denied" \
+  "$(admit 'del(.spec.template.spec.containers[0].securityContext)')" \
+  "must run with this release's container security context"
+assert_contains "VAP: overriding runAsNonRoot per-container is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.runAsNonRoot=false')" \
+  "must run with this release's container security context"
+assert_contains "VAP: relaxing the pod securityContext is denied" \
+  "$(admit '.spec.template.spec.securityContext.runAsNonRoot=false')" \
+  "must run with this release's pod security context"
+# seccomp is pinned because the command pin does NOT make code execution in this container
+# impossible: bash reads $BASH_ENV, and an actor who already runs code in the postgresql
+# container can write a file into PGDATA -- which this Job mounts -- and point at it. That
+# buys only the privileges already held; Unconfined would be a step past them.
+assert_contains "VAP: relaxing the pod seccomp profile to Unconfined is denied" \
+  "$(admit '.spec.template.spec.securityContext.seccompProfile.type="Unconfined"')" \
+  "must run with this release's pod security context"
+assert_contains "VAP: setting a container seccomp profile the release does not is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.seccompProfile.type="Unconfined"')" \
+  "must run with this release's container security context"
+
+# The pod's OWN labels. The Job object's label (asserted above) says nothing about the pod,
+# and the primary Service selects pg.selectorLabels + component=postgresql: a restore pod
+# wearing those joins the write Service's endpoints, is Ready at once (it has no readiness
+# probe), and receives application traffic and its credentials.
+assert_contains "VAP: relabelling the pod onto the primary Service is denied" \
+  "$(admit '.spec.template.metadata.labels."app.kubernetes.io/component"="postgresql"')" \
+  "may carry only this release's restore pod labels"
+assert_contains "VAP: an extra Service-selector label on the pod is denied" \
+  "$(admit '.spec.template.metadata.labels."statefulset.kubernetes.io/pod-name"="'"${FULLNAME}"'-0"')" \
+  "may carry only this release's restore pod labels"
+assert_contains "VAP: stripping the pod labels is denied" \
+  "$(admit 'del(.spec.template.metadata.labels)')" \
+  "may carry only this release's restore pod labels"
+# ...and the four labels the APISERVER stamps on a Job's pod template must NOT trip that rule:
+# the batch strategy runs before validating admission, so they are already on the object. This
+# is the direction that breaks the feature if the allowlist forgets them.
+assert_eq "VAP: the server-stamped batch controller labels do not trip the pod-label rule" \
+  "allowed" "$(admit '.')"
+
+# manualSelector turns off the server-side selector and identity labels the rule above is
+# written around. Built-in Job validation requires spec.selector to match the pod template
+# labels, so the only payload that reaches the policy is one mirroring the pinned labels.
+assert_contains "VAP: manualSelector is denied" \
+  "$(admit '.spec.manualSelector=true | .spec.selector={"matchLabels":{"app.kubernetes.io/name":"pg","app.kubernetes.io/instance":"'"${RELEASE}"'","app.kubernetes.io/component":"pgbackrest-restore"}}')" \
+  "may not set manualSelector"
+
+# Placement and scale. nodeName bypasses the scheduler and its taints outright; unbounded
+# parallelism over a limitless container turns the one permitted Job name into a repeatable
+# way to fill the namespace quota and evict the database's own pods.
+assert_contains "VAP: an explicit nodeName is denied" \
+  "$(admit '.spec.template.spec.nodeName="'"$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')"'"')" \
+  "an explicit nodeName"
+assert_contains "VAP: parallelism above one is denied" \
+  "$(admit '.spec.parallelism=200')" "must run a single pod"
+assert_contains "VAP: completions above one is denied" \
+  "$(admit '.spec.completions=200')" "must run a single pod"
+assert_contains "VAP: a container with no requests or limits is denied" \
+  "$(admit '.spec.template.spec.containers[0].resources={}')" \
+  "must declare the CPU and memory requests and limits"
+
+# priorityClassName is the placement knob that does not merely restrict: referencing a
+# PriorityClass needs no permission, so a high-priority restore pod lets the scheduler PREEMPT
+# this release's own postgresql pods -- and the SA holds delete on this Job name, so it repeats.
+kubectl get priorityclass vap-probe-high >/dev/null 2>&1 || kubectl create -f - >/dev/null <<'PC'
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: vap-probe-high
+value: 1000000
+description: "test-only: proves the restore Job cannot claim a priority class (#279)"
+PC
+assert_contains "VAP: claiming a priority class is denied" \
+  "$(admit '.spec.template.spec.priorityClassName="vap-probe-high"')" \
+  "priorityClassName other than this release"
+# A lifecycle hook runs a caller-chosen program in the pinned container without touching
+# command or args, which would make the command pin's promise untrue as written.
+assert_contains "VAP: a postStart lifecycle hook is denied" \
+  "$(admit '.spec.template.spec.containers[0].lifecycle={"postStart":{"exec":{"command":["bash","-c","id"]}}}')" \
+  "no lifecycle hooks"
+fi
 
 # --- data + a backup to restore from ---
 

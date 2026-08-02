@@ -45,6 +45,22 @@ assert_eq() {
   fi
 }
 
+# Both sides must be non-empty: "two things differ" is a vacuous assertion when either is
+# the empty string, which is exactly how a renamed template or a moved value turns a
+# uniqueness check into a no-op (#279).
+assert_not_eq() {
+  local description="$1"
+  local a="$2"
+  local b="$3"
+  if [[ -z "${a}" || -z "${b}" ]]; then
+    fail "${description}" "both values must be non-empty (a='${a}' b='${b}')"
+  elif [[ "${a}" != "${b}" ]]; then
+    pass "${description}"
+  else
+    fail "${description}" "both values are '${a}'"
+  fi
+}
+
 assert_contains() {
   local description="$1"
   local haystack="$2"

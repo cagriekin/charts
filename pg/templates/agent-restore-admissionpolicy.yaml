@@ -1,0 +1,461 @@
+{{- if eq (include "pg.controlRestoreEnabled" .) "true" }}
+{{- if .Values.repmgr.agent.control.restore.admissionPolicy.enabled }}
+{{- /* Bound the restore Job-create grant by CONTENT, not just by verb (#279).
+
+       rbac.yaml has to hand the database pods' ServiceAccount `create` on `batch/jobs`,
+       and RBAC cannot restrict a create by resourceName -- the API server does not know
+       the object's name at authorization time. So that grant alone lets anything holding
+       the token (i.e. anything that achieves code execution in a PostgreSQL running
+       user-supplied SQL) create ARBITRARY Jobs in the namespace, and a Job's pod may name
+       any ServiceAccount with no separate permission check. That is a namespace-wide
+       privilege-escalation primitive, and it is why control.restore shipped in 1.9.0 as
+       "leave it off unless the trade is worth it".
+
+       The restriction has to happen at a layer RBAC does not reach. ValidatingAdmission-
+       Policy is exactly that layer: it is in-tree and GA since Kubernetes 1.30, so this
+       adds no webhook, no serving certificate and no new failure domain -- unlike a
+       webhook, there is nothing here that can be down.
+
+       WHAT THIS DOES AND DOES NOT ACHIEVE. The validations below pin the Job to the shape
+       this release's own restore template renders: one deterministic name, this release's
+       ServiceAccount with no token, this release's image running this release's restore
+       command, this release's volumes, env, placement and security contexts, and a single
+       pod. Two things are left, both documented in README.md rather than papered over:
+
+         * The restore PARAMETERS (the literal env values: target, backup set, force). So a
+           token holder can run this release's own restore, over the live PGDATA, without
+           going through the control API's mTLS and restore.allowedClientCNs. Inherent to
+           `create jobs` and not closable by admission -- a restore over the live data
+           directory is what a restore IS.
+         * Code execution inside the pinned container. The command pin is not a sandbox:
+           bash reads $BASH_ENV, and an actor who already runs code in the postgresql
+           container can write a file into PGDATA, which this Job mounts. What that reaches
+           is uid 101 with no token and only this release's volumes -- the privileges
+           already held, which is the bar this policy is written to -- but it is not "only
+           restore.sh can run", and the pins below (image, security contexts, volumes, env)
+           are what keep it at that bar rather than the command pin alone.
+
+       Both are why the feature stays opt-in.
+
+       This is also defence in depth ON TOP OF the agent's own bounds (verbatim jobTemplate
+       clone, valueFrom env never overwritten, podOrdinal not an API decision, never
+       --force), not a replacement for them: those bound what the AGENT builds, and this
+       bounds what anyone else holding the same token can build.
+
+       The >= 1.30 requirement is enforced below by asking whether the API GROUP EXISTS,
+       not by comparing `.Capabilities.KubeVersion` against 1.30. The version comparison
+       looks equivalent and is not: with no cluster to query, `.Capabilities.KubeVersion`
+       is the HELM CLIENT'S OWN built-in version (helm 3.14 reports v1.29), so a semver
+       floor fails every `helm template` run by a slightly older helm -- CI, a GitOps
+       dry-run, `helm diff` -- regardless of what the target cluster actually is. Asking
+       for the API group is also the more accurate question: it is true wherever the kind
+       can be created and false where 1.30+ has it disabled via --runtime-config.
+
+       `.Capabilities.APIVersions` is safe to consult here BECAUSE this is a fail and not
+       a silent skip. Helm's no-cluster default set already contains
+       admissionregistration.k8s.io/v1 (53 entries, not core/v1 only), so `helm template`
+       and the kubeconform gate render the policy without a cluster; a real install or
+       upgrade replaces that set with server discovery, which is what makes the fail fire
+       on a cluster that genuinely cannot host it. helm-unittest's default set is the one
+       exception -- it does NOT include the group -- so the suite declares it, and the
+       fail's own test is the suite that declines to. */}}
+{{- /* Fail at render time, not at apply time: without this, an upgrade from 1.9.0 on a
+       cluster without the API renders clean and then aborts mid-apply with "no matches for
+       kind ValidatingAdmissionPolicy", leaving the release in a failed state. */}}
+{{- if not (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1") }}
+{{- fail (printf "repmgr.agent.control.restore needs admissionregistration.k8s.io/v1 for the ValidatingAdmissionPolicy that bounds its `create jobs` grant, and this cluster does not expose it -- it is GA from Kubernetes 1.30 (this cluster reports %s), and can also be disabled by --runtime-config (#279). Upgrade or enable the API, or set repmgr.agent.control.restore.admissionPolicy.enabled=false together with acknowledgeUnbounded=true to run the feature with an unbounded grant deliberately" .Capabilities.KubeVersion.Version) }}
+{{- end }}
+{{- $fullname := include "pg.fullname" . }}
+{{- $guard := include "pg.restoreGuardName" . }}
+{{- /* The Secrets the rendered restore Job legitimately reads through secretKeyRef. Any
+       other Secret in the namespace must stay unreachable: a Job that could mount or
+       project an arbitrary Secret would be the same exfiltration primitive by another
+       route. Built from the same values the Job's env is built from, so the two cannot
+       disagree. */}}
+{{- $secretRefs := list }}
+{{- if eq .Values.pgbackrest.s3.keyType "shared" }}
+{{- $secretRefs = append $secretRefs (include "pg.pgbackrestS3SecretName" .) }}
+{{- end }}
+{{- if .Values.pgbackrest.repoEncryption.enabled }}
+{{- $secretRefs = append $secretRefs .Values.pgbackrest.repoEncryption.existingSecret.name }}
+{{- end }}
+{{- /* Allowed env valueFrom sources. fieldRef (the downward API, which can read nothing
+       but the pod's own metadata) is always permitted -- the restore's
+       RESTORE_REQUESTED_BY comes from it -- and this release's own Secrets are added when
+       it has any. Everything else (configMapKeyRef, resourceFieldRef, and any Secret that
+       is not the release's own) falls through to a denial.
+
+       Written as an ALLOWLIST of sources rather than "no secretKeyRef": under
+       s3.keyType=auto with repo encryption off the release reads no Secret at all, and a
+       rule phrased as a negation of secretKeyRef would then admit configMapKeyRef -- the
+       opposite of what its message promises, in exactly the keyless configuration a
+       cloud-workload-identity install uses. */}}
+{{- $valueFromRule := "has(e.valueFrom.fieldRef)" }}
+{{- if $secretRefs }}
+{{- $valueFromRule = printf "has(e.valueFrom.fieldRef) || (has(e.valueFrom.secretKeyRef) && e.valueFrom.secretKeyRef.name in ['%s'])" (join "','" $secretRefs) }}
+{{- end }}
+{{- /* The pod-template labels the restore Job renders, read back from the same helper the
+       Job template uses so the two cannot drift. Pinning these is not cosmetic: the
+       primary and read-only Services select on pg.selectorLabels plus
+       app.kubernetes.io/component, so a Job whose POD carried component=postgresql would
+       be added to the write Service's endpoints -- a pod with no readiness probe becomes
+       Ready immediately, and application traffic (with its credentials) would be
+       load-balanced onto it. validation #2's label check is on the Job object and does
+       nothing about that. */}}
+{{- $podLabels := include "pg.selectorLabels" . | fromYaml }}
+{{- $_ := set $podLabels "app.kubernetes.io/component" "pgbackrest-restore" }}
+{{- /* The four labels the API server itself stamps on a Job's pod template, which are
+       therefore already on the object when this policy sees it: the batch controller's
+       PrepareForCreate runs BEFORE validating admission (the same reason a generateName is
+       already resolved by then), so a rule phrased as "exactly the labels the chart
+       renders" would deny every legitimate restore. They are safe to allow: their values
+       are server-assigned (the Job's own name and UID), validation #7 keeps
+       manualSelector from turning that off, and nothing in this chart selects on them.
+
+       Note the coupling this creates, because it fails CLOSED: the list is the set
+       Kubernetes stamps today (verified against 1.36). A future version that adds another
+       pod-template label would deny every restore for this release until the list is
+       extended here. That is the deliberate trade of a key allowlist over a subset check --
+       an EXTRA label is the whole attack this rule exists to stop, so "unknown key" has to
+       mean "deny" -- and the failure is loud, naming the exact rule, rather than silent. */}}
+{{- $ctrlLabelKeys := list "batch.kubernetes.io/controller-uid" "batch.kubernetes.io/job-name" "controller-uid" "job-name" }}
+{{- $podLabelRules := list (printf "variables.podLabels.all(k, k in ['%s'])" (join "','" (concat (keys $podLabels | sortAlpha) $ctrlLabelKeys))) }}
+{{- range $k := (keys $podLabels | sortAlpha) }}
+{{- $podLabelRules = append $podLabelRules (printf "('%s' in variables.podLabels && variables.podLabels['%s'] == '%s')" $k $k (index $podLabels $k)) }}
+{{- end }}
+{{- /* Security contexts, resources and the command are pinned to what THIS RELEASE'S
+       values render, not to a hardcoded hardened profile: a fixed profile would deny the
+       release's own restore the moment an operator legitimately changed
+       postgresql.containerSecurityContext, and a chart that denies its own Job is worse
+       than no policy at all. Each field is "present and equal to the rendered value" when
+       the values set it and "absent" when they do not, which is exactly the shape the
+       jobTemplate produces. */}}
+{{- $csc := .Values.postgresql.containerSecurityContext | default dict }}
+{{- $psc := .Values.postgresql.podSecurityContext | default dict }}
+{{- $caps := $csc.capabilities | default dict }}
+{{- $addPin := "(!has(c.securityContext.capabilities) || !has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0)" }}
+{{- if hasKey $caps "add" }}
+{{- $addPin = printf "(has(c.securityContext.capabilities) && has(c.securityContext.capabilities.add) && c.securityContext.capabilities.add == ['%s'])" (join "','" $caps.add) }}
+{{- end }}
+{{- /* seccompProfile is pinned too, and it is not belt-and-braces. The command pin does not
+       make code execution in the restore container impossible: the container reads
+       $BASH_ENV, and an actor who already has code execution in the postgresql container can
+       write a file into PGDATA -- which this Job mounts -- and point BASH_ENV at it. What
+       that buys is uid 101 with no token and only this release's volumes, i.e. exactly the
+       privileges already held, which is the stated bar. Relaxing seccomp to Unconfined would
+       be a real step past it, so the profile is pinned to the release's own. Nested, hence
+       written out rather than going through pg.celScalarPin: has() on a leaf whose parent is
+       absent is an evaluation ERROR, not false. */}}
+{{- $cscSeccomp := "!has(c.securityContext.seccompProfile)" }}
+{{- if and $csc.seccompProfile $csc.seccompProfile.type }}
+{{- $cscSeccomp = printf "(has(c.securityContext.seccompProfile) && has(c.securityContext.seccompProfile.type) && c.securityContext.seccompProfile.type == '%s')" $csc.seccompProfile.type }}
+{{- end }}
+{{- $pscSeccomp := "!has(variables.pod.securityContext.seccompProfile)" }}
+{{- if and $psc.seccompProfile $psc.seccompProfile.type }}
+{{- $pscSeccomp = printf "(has(variables.pod.securityContext.seccompProfile) && has(variables.pod.securityContext.seccompProfile.type) && variables.pod.securityContext.seccompProfile.type == '%s')" $psc.seccompProfile.type }}
+{{- end }}
+{{- $cscPins := list
+      (include "pg.celScalarPin" (list "c.securityContext.privileged" $csc "privileged"))
+      (include "pg.celScalarPin" (list "c.securityContext.allowPrivilegeEscalation" $csc "allowPrivilegeEscalation"))
+      (include "pg.celScalarPin" (list "c.securityContext.runAsUser" $csc "runAsUser"))
+      (include "pg.celScalarPin" (list "c.securityContext.runAsNonRoot" $csc "runAsNonRoot"))
+      $addPin $cscSeccomp }}
+{{- /* When the values set NOTHING, the rule is "no securityContext, OR one that sets none of
+       the fields pinned above" -- not a bare !has(). `postgresql.containerSecurityContext:
+       {}` renders `securityContext: {}` on the Job, which is PRESENT as far as has() is
+       concerned, so a bare !has() would deny the release's own restore. The
+       !has(parent) || (...) shape is safe despite the pins dereferencing that parent: CEL's
+       logical operators are commutative, so a true left side wins even when the right side
+       would error. */}}
+{{- $cscRule := "" }}
+{{- if $csc }}
+{{- $cscRule = printf "variables.pod.containers.all(c, has(c.securityContext) && %s)" (join " && " $cscPins) }}
+{{- else }}
+{{- $cscRule = printf "variables.pod.containers.all(c, !has(c.securityContext) || (%s))" (join " && " $cscPins) }}
+{{- end }}
+{{- $pscPins := list
+      (include "pg.celScalarPin" (list "variables.pod.securityContext.runAsUser" $psc "runAsUser"))
+      (include "pg.celScalarPin" (list "variables.pod.securityContext.runAsNonRoot" $psc "runAsNonRoot"))
+      $pscSeccomp }}
+{{- $pscRule := "" }}
+{{- if $psc }}
+{{- $pscRule = printf "has(variables.pod.securityContext) && %s" (join " && " $pscPins) }}
+{{- else }}
+{{- $pscRule = printf "!has(variables.pod.securityContext) || (%s)" (join " && " $pscPins) }}
+{{- end }}
+{{- /* priorityClassName, pinned to what the restore jobTemplate renders
+       (pgbackrest.cronjob.priorityClassName). This one does NOT belong with nodeSelector and
+       tolerations, which are left unpinned because they can only ever RESTRICT where a pod
+       runs: a priority class does the opposite. Referencing a PriorityClass needs no
+       permission, so a caller could name a high-priority class and let the scheduler PREEMPT
+       this release's own postgresql pods to make room -- and the SA holds delete on the
+       pinned Job name, so it is repeatable. The parallelism/completions cap does not close
+       that, because one pod is enough. */}}
+{{- $pcnPin := "!has(variables.pod.priorityClassName)" }}
+{{- with .Values.pgbackrest.cronjob.priorityClassName }}
+{{- $pcnPin = printf "(has(variables.pod.priorityClassName) && variables.pod.priorityClassName == '%s')" . }}
+{{- end }}
+{{- /* Resources: presence of exactly the request/limit keys the release renders. The
+       VALUES are not compared -- a Quantity round-trips as the string it was written as
+       ("1" vs "1000m" vs 1), so an equality test on it would be a false-denial generator
+       during an incident. Presence is what matters here anyway: a container with no
+       limits, multiplied by an unbounded parallelism (validation #14), is the resource-
+       exhaustion path against the database's own nodes, and it is the same requests-and-
+       limits rule the chart's kube-linter gate enforces on every other container. */}}
+{{- $rres := .Values.pgbackrest.restore.resources | default dict }}
+{{- $resPins := list }}
+{{- range $section := list "requests" "limits" }}
+{{- $sec := (index $rres $section) | default dict }}
+{{- $keys := list }}
+{{- range $k := list "cpu" "memory" }}
+{{- if hasKey $sec $k }}
+{{- $keys = append $keys (printf "'%s' in c.resources.%s" $k $section) }}
+{{- end }}
+{{- end }}
+{{- if $keys }}
+{{- $resPins = append $resPins (printf "has(c.resources.%s) && %s" $section (join " && " $keys)) }}
+{{- end }}
+{{- end }}
+{{- /* Every value interpolated into a CEL string literal below, checked at render time for
+       characters that would break the expression or turn it into a tautology. */}}
+{{- $literals := list (list "the release namespace" .Release.Namespace) (list "the release fullname" $fullname) (list "repmgr.image (pg.repmgrImage)" (include "pg.repmgrImage" .)) }}
+{{- range $k, $v := $podLabels }}
+{{- $literals = append $literals (list (printf "the restore pod label %s" $k) $v) }}
+{{- end }}
+{{- range $s := $secretRefs }}
+{{- $literals = append $literals (list "a pgbackrest Secret name (pgbackrest.existingSecret.name / pgbackrest.repoEncryption.existingSecret.name)" $s) }}
+{{- end }}
+{{- /* Every OTHER value that reaches a single-quoted CEL literal. Missing one is not
+       cosmetic: `RuntimeDefault' || true || '` renders a syntactically valid, always-true
+       expression -- == binds tighter than || -- so the pin becomes a tautology that renders
+       and lints clean. values.schema.json constrains none of these. */}}
+{{- with $csc.seccompProfile }}{{- with .type }}
+{{- $literals = append $literals (list "postgresql.containerSecurityContext.seccompProfile.type" .) }}
+{{- end }}{{- end }}
+{{- with $psc.seccompProfile }}{{- with .type }}
+{{- $literals = append $literals (list "postgresql.podSecurityContext.seccompProfile.type" .) }}
+{{- end }}{{- end }}
+{{- range $cap := ($caps.add | default list) }}
+{{- $literals = append $literals (list "a postgresql.containerSecurityContext.capabilities.add entry" $cap) }}
+{{- end }}
+{{- with .Values.pgbackrest.cronjob.priorityClassName }}
+{{- $literals = append $literals (list "pgbackrest.cronjob.priorityClassName" .) }}
+{{- end }}
+{{- include "pg.validateCelLiterals" $literals }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  # Cluster-scoped: hash-suffixed so two releases cannot collide (pg.restoreGuardName).
+  name: {{ $guard }}
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- /* Fail, not Ignore, and it is load-bearing: with Ignore a policy-evaluation failure
+         would silently re-open the hole this exists to close, which is the worst possible
+         shape -- the grant still rendered, the bound quietly absent. Every expression
+         below is written to be evaluable (has() guards on every optional field), so a
+         failure here means something is wrong that SHOULD stop a restore. */}}
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["jobs"]
+  {{- /* CREATE only. The agent has no update/patch on jobs (and a Job's spec is immutable
+         anyway), so matching updates would police nothing and could only add false
+         denials on status writes by the Job controller. */}}
+  matchConditions:
+    # Police ONE subject: this release's ServiceAccount. Humans, GitOps controllers, the
+    # CronJob controller and every other workload in the cluster create Jobs unaffected --
+    # which matters as much as the denials do, because a policy that broke every other
+    # controller in the namespace would be worse than the hole it closes.
+    #
+    # Exact equality rather than a prefix/suffix match: matching on the ServiceAccount name
+    # alone would also police an identically-named ServiceAccount in an unrelated namespace
+    # (and break that release's restores), and the username already carries the namespace.
+    - name: only-this-releases-agent
+      expression: "request.userInfo.username == 'system:serviceaccount:{{ .Release.Namespace }}:{{ $fullname }}-repmgr'"
+  variables:
+    # spec.template is required on a Job, so this cannot fail to evaluate.
+    - name: pod
+      expression: "object.spec.template.spec"
+    # spec.template.metadata IS optional, hence the ternary rather than a bare access:
+    # an absent metadata must reach validation #6 as an empty map (and be denied there for
+    # having no labels), not error out of the expression.
+    - name: podLabels
+      expression: "has(object.spec.template.metadata) && has(object.spec.template.metadata.labels) ? object.spec.template.metadata.labels : {}"
+  validations:
+    # 1. The bound RBAC could not express, and the one that collapses the grant: the agent
+    #    always creates ONE deterministic Job name (which is why get/delete ARE scopeable
+    #    in rbac.yaml). Pinning it here means `create jobs` becomes, in effect, create on
+    #    that single object -- the resourceName restriction RBAC refused to give.
+    #
+    #    generateName cannot slip past this: name generation happens before VALIDATING
+    #    admission runs, so object.metadata.name is the final name (a mutating webhook, by
+    #    contrast, would see it empty). A generated name never equals the pinned one.
+    - expression: "object.metadata.name == '{{ $fullname }}-pgbackrest-restore-api'"
+      message: "the pg agent may create only the Job {{ $fullname }}-pgbackrest-restore-api (repmgr.agent.control.restore, #279)"
+      reason: Forbidden
+    # 2. Provenance, and it is why the CronJob's jobTemplate carries this label: the agent
+    #    copies jobTemplate labels onto the Job it clones, so a Job without it did not come
+    #    from this release's restore template. Not a bound by itself (a caller can add a
+    #    label) -- it makes the object attributable, and it fails closed if the chart's
+    #    template and this policy ever drift apart.
+    - expression: "has(object.metadata.labels) && 'pg-ha/restore' in object.metadata.labels && object.metadata.labels['pg-ha/restore'] == '{{ $fullname }}'"
+      message: "the pg agent's Jobs must carry pg-ha/restore={{ $fullname }}, the label this release's restore jobTemplate renders"
+      reason: Forbidden
+    # 3+4. The escalation itself. Naming another ServiceAccount is the primitive; requiring
+    #    the release's own SA removes the "escalate" and leaves only "same privileges I
+    #    already hold". Requiring automountServiceAccountToken=false explicitly (absent
+    #    counts as a denial, not a pass) is what makes SA-naming moot in the first place:
+    #    the pod gets no token to use. The rendered Job sets both.
+    - expression: "has(variables.pod.serviceAccountName) && variables.pod.serviceAccountName == '{{ $fullname }}-repmgr'"
+      message: "the pg agent may only create Jobs running as ServiceAccount {{ $fullname }}-repmgr -- naming another ServiceAccount is the privilege escalation this policy exists to deny"
+      reason: Forbidden
+    - expression: "has(variables.pod.automountServiceAccountToken) && variables.pod.automountServiceAccountToken == false"
+      message: "the pg agent's Jobs must set automountServiceAccountToken: false explicitly (the restore talks to S3 and the PVC, never to the Kubernetes API)"
+      reason: Forbidden
+    # 5. Escapes from the pod boundary to the node, plus the two placement knobs a caller
+    #    could turn against the release. nodeName bypasses the scheduler outright -- it
+    #    ignores taints, and it is how a caller would place this pod on a node of its
+    #    choosing. priorityClassName is pinned for the reason in its construction above: it
+    #    can PREEMPT this release's own pods. nodeSelector and tolerations are deliberately
+    #    NOT pinned -- they are inherited from postgresql.nodeSelector/tolerations so the
+    #    restore can land where the data volume attaches, and unlike priority they can only
+    #    ever RESTRICT where the pod runs.
+    - expression: "(!has(variables.pod.hostNetwork) || variables.pod.hostNetwork == false) && (!has(variables.pod.hostPID) || variables.pod.hostPID == false) && (!has(variables.pod.hostIPC) || variables.pod.hostIPC == false) && !has(variables.pod.nodeName) && {{ $pcnPin }}"
+      message: "hostNetwork, hostPID, hostIPC, an explicit nodeName and any priorityClassName other than this release's are not permitted on the pg agent's Jobs"
+      reason: Forbidden
+    # 6. The pod's OWN labels: an allowlist of keys (this release's restore pod labels plus
+    #    the batch controller's own), with the release's values pinned. A key allowlist
+    #    rather than a subset check, because an EXTRA label is the whole attack -- it is how
+    #    a pod joins a selector it should not match (see the Service-endpoint reasoning above
+    #    the rule's construction).
+    - expression: >-
+        {{ join " && " $podLabelRules }}
+      message: "the pg agent's Jobs may carry only this release's restore pod labels ({{ range $i, $k := (keys $podLabels | sortAlpha) }}{{ if $i }}, {{ end }}{{ $k }}={{ index $podLabels $k }}{{ end }}) plus the batch controller's own -- extra or altered pod labels would let the restore pod join this release's Service endpoints"
+      reason: Forbidden
+    # 7. manualSelector is what turns OFF the server-side selector generation that #6's key
+    #    allowlist is written around, so it is pinned to what the chart renders (absent).
+    #    Honestly labelled defence in depth rather than a closed hole: built-in Job
+    #    validation already requires spec.selector to be present and to MATCH the pod
+    #    template labels, and #6 pins those, so a manual selector cannot be aimed at this
+    #    release's postgresql pods even without this rule. What it removes is the case where
+    #    a Job's identity labels are caller-supplied rather than server-assigned.
+    - expression: "!has(object.spec.manualSelector) || object.spec.manualSelector == false"
+      message: "the pg agent's Jobs may not set manualSelector: the API server must generate the Job's pod selector and identity labels"
+      reason: Forbidden
+    # 8+9. One container, running the release's own image. The agent already refuses to
+    #    clone a jobTemplate with anything other than exactly one container (it will not
+    #    guess which container's env to rewrite), so this matches the agent's own rule.
+    #    ephemeralContainers cannot be set through a pod template at all, but denying it
+    #    here costs one clause and removes the question.
+    - expression: "size(variables.pod.containers) == 1 && (!has(variables.pod.initContainers) || size(variables.pod.initContainers) == 0) && (!has(variables.pod.ephemeralContainers) || size(variables.pod.ephemeralContainers) == 0)"
+      message: "the pg agent's Jobs must have exactly one container and no init or ephemeral containers"
+      reason: Forbidden
+    - expression: "variables.pod.containers.all(c, c.image == '{{ include "pg.repmgrImage" . }}')"
+      message: "the pg agent's Jobs may only run this release's repmgr image ({{ include "pg.repmgrImage" . }})"
+      reason: Forbidden
+    # 10. The command, pinned to the release's own restore entrypoint (pg.restoreCommandJSON,
+    #    the same definition the jobTemplate renders, converted to CEL quoting). The image
+    #    pin alone is a weak bound -- the postgresql container already runs this image with
+    #    this data volume -- so without this the Job is "run anything you like as the
+    #    database's uid, with the live PGDATA mounted", which is a data-destruction
+    #    primitive that needs no privilege escalation at all. With it, the Job can only run
+    #    the chart's restore.sh (delivered by the pinned ConfigMap volume, which this token
+    #    cannot write) plus the literal env values the restore already takes.
+    #
+    #    lifecycle is denied in the same rule because it is the same question: a
+    #    postStart/preStop exec hook runs a caller-chosen program in the pinned container
+    #    without touching command or args, which would make "must run exactly this release's
+    #    restore command" untrue as written. The chart renders no lifecycle hooks, so pinning
+    #    absence costs nothing. It does not close the residual documented at the top of this
+    #    file -- $BASH_ENV reaches the same place -- but there is no reason to leave a second,
+    #    more direct door open.
+    - expression: "variables.pod.containers.all(c, has(c.command) && c.command == {{ include "pg.restoreCommandJSON" . | replace "\"" "'" }} && !has(c.args) && !has(c.lifecycle))"
+      message: "the pg agent's Jobs must run exactly this release's restore command ({{ include "pg.restoreCommandJSON" . | replace "\"" "'" }}) with no args and no lifecycle hooks"
+      reason: Forbidden
+    # 11+12. Security contexts, pinned to the release's own (see the reasoning above their
+    #    construction). Without these the Job is admitted with privileged: true,
+    #    runAsUser: 0 and CAP_SYS_ADMIN -- a root container on a node of the caller's
+    #    choosing, which is a strictly larger privilege set than the token started with and
+    #    would make "same privileges I already hold" false.
+    - expression: "{{ $cscRule }}"
+      message: "the pg agent's Jobs must run with this release's container security context (postgresql.containerSecurityContext) -- privileged, added capabilities, a different runAsUser or a relaxed allowPrivilegeEscalation are denied"
+      reason: Forbidden
+    - expression: "{{ $pscRule }}"
+      message: "the pg agent's Jobs must run with this release's pod security context (postgresql.podSecurityContext)"
+      reason: Forbidden
+    {{- if $resPins }}
+    # 13. Requests and limits, present as the release renders them (values deliberately not
+    #    compared -- see the reasoning above).
+    - expression: "variables.pod.containers.all(c, has(c.resources) && {{ join " && " $resPins }})"
+      message: "the pg agent's Jobs must declare the CPU and memory requests and limits this release renders (pgbackrest.restore.resources)"
+      reason: Forbidden
+    {{- end }}
+    # 14. One pod, once. The API server DEFAULTS both fields to 1 before admission runs, so
+    #    this is written as "<= 1" rather than "absent": the rendered Job sets neither, and
+    #    requiring absence would deny every legitimate restore. Unbounded parallelism is
+    #    what turns one permitted Job name into a repeatable way to fill the namespace's
+    #    ResourceQuota and evict the database's own pods.
+    - expression: "(!has(object.spec.parallelism) || object.spec.parallelism <= 1) && (!has(object.spec.completions) || object.spec.completions <= 1)"
+      message: "the pg agent's Jobs must run a single pod (parallelism and completions <= 1)"
+      reason: Forbidden
+    # 15. Volumes, and after the ServiceAccount pin this is the check that matters most.
+    #    With the token gone, mounting somebody else's Secret is the remaining way to reach
+    #    outside this release -- so the sources are pinned to exactly the three the restore
+    #    template renders. hostPath, projected service-account tokens, arbitrary Secrets
+    #    and arbitrary PVCs all fall out of this as denials rather than needing a rule each.
+    #    volumeMounts (paths, subPath) are not pinned: with the command fixed and the set of
+    #    volumes closed, remapping a mount can only break the restore, not widen it.
+    - expression: >-
+        !has(variables.pod.volumes) || variables.pod.volumes.all(v,
+        has(v.emptyDir)
+        || (has(v.configMap) && v.configMap.name == '{{ $fullname }}-pgbackrest')
+        || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'data-{{ $fullname }}-{{ .Values.pgbackrest.restore.podOrdinal }}'))
+      message: "the pg agent's Jobs may mount only this release's restore volumes: emptyDir, configMap {{ $fullname }}-pgbackrest, and PVC data-{{ $fullname }}-{{ .Values.pgbackrest.restore.podOrdinal }}"
+      reason: Forbidden
+    # 16. The same bound for env: envFrom pulls a whole Secret or ConfigMap, and
+    #    secretKeyRef/configMapKeyRef pull a key from any of them. Only the downward API
+    #    and the release's own Secrets are allowed through (see $valueFromRule above).
+    - expression: >-
+        variables.pod.containers.all(c, !has(c.envFrom) && (!has(c.env) || c.env.all(e,
+        !has(e.valueFrom) || ({{ $valueFromRule }}))))
+      message: "the pg agent's Jobs may not use envFrom, and may reference only the downward API{{ with $secretRefs }} or this release's own Secrets ({{ join ", " . }}){{ end }} through env valueFrom"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $guard }}
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  policyName: {{ $guard }}
+  validationActions: ["Deny"]
+  {{- /* Scoped to the release namespace via kubernetes.io/metadata.name, a label the API
+         server sets on every namespace itself (immutable, and always present since 1.21) --
+         so unlike binding on a label the chart would have to ask an operator to apply, this
+         cannot be left off. It exists to bound the blast radius of a policy-evaluation
+         failure under failurePolicy: Fail to this namespace; it is NOT what enforces the
+         rules, which is why the policy still pins the subject exactly in matchConditions.
+
+         Note what is deliberately absent: an objectSelector. Narrowing the BINDING by the
+         pg-ha/restore label would make validation #2 self-defeating -- a Job created
+         without the label would simply not match the binding, and would be admitted. What
+         the caller controls must be checked by a validation, never by a match rule. */}}
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}
