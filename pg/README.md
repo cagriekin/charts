@@ -518,19 +518,20 @@ cannot observe another member's data directory.)
 #### API-driven PITR restore — `repmgr.agent.control.restore`
 
 `POST /v1/restore` triggers the chart's [pgBackRest restore Job](#point-in-time-recovery).
-It is a **separate opt-in from the rest of the API**, and the reason is a genuine
-privilege trade-off you should decide deliberately:
+It is a **separate opt-in from the rest of the API**, because it is the only part of the API
+that widens the database pods' Kubernetes privileges at all:
 
 > Creating a Job requires `create` on `jobs`, and RBAC **cannot** restrict `create` by
-> `resourceName`. So this grant lets anything holding the database pods' ServiceAccount
-> token create arbitrary Jobs in the namespace — and a Job's pod may name any
+> `resourceName`. So that grant, *by itself*, lets anything holding the database pods'
+> ServiceAccount token create arbitrary Jobs in the namespace — and a Job's pod may name any
 > ServiceAccount, with no separate permission check. That makes it a namespace-wide
 > privilege-escalation primitive, on a token mounted next to a PostgreSQL that runs
-> user-supplied SQL. The equivalent kubectl path
-> (`kubectl create job --from=cronjob/<release>-pg-pgbackrest-restore`) needs none of it.
-> Leave this off unless API-driven restore is worth that trade.
+> user-supplied SQL.
 
-Nothing else in the API adds any RBAC at all.
+Since 1.10.0 that grant does not travel alone: a
+[`ValidatingAdmissionPolicy`](#bounding-the-job-create-grant--admissionpolicy) bounds it by
+**content**, which is the restriction RBAC has no way to express. Nothing else in the API
+adds any RBAC at all.
 
 **What the grant buys** is choosing the recovery point *in the request*: `targetType`,
 `target` and `backupSet` are applied to the Job the agent creates, so an operator can
@@ -557,6 +558,76 @@ The two lists **compose** — `control.allowedClientCNs` is the door to the API 
 `control.restore.allowedClientCNs` an extra lock on this one verb — so when the outer list
 is non-empty a restore client must appear in **both**. A 403 tells you which list refused
 the call.
+
+##### Bounding the job-create grant — `admissionPolicy`
+
+`allowedClientCNs` bounds who may *ask the API* for a restore. It says nothing about what
+anyone holding the pods' ServiceAccount token can do with `create jobs` directly, and
+neither can RBAC: authorization sees a verb and a resource, never the object's content.
+
+So the chart renders a `ValidatingAdmissionPolicy` and its binding alongside the grant —
+in-tree, **GA since Kubernetes 1.30**, so there is no webhook to deploy, no serving
+certificate to rotate, and nothing here that can be *down*. It polices exactly one subject,
+this release's ServiceAccount, and requires of every Job that subject creates:
+
+| Pinned | What it takes away |
+|---|---|
+| `metadata.name` == `<release>-pg-pgbackrest-restore-api` | the `resourceName` restriction RBAC refused to give: `create` collapses to one object. `generateName` cannot dodge it — validating admission sees the final name |
+| label `pg-ha/restore=<release>-pg` | provenance; fails closed if chart and policy ever drift |
+| `serviceAccountName` == `<release>-pg-repmgr` | the escalation itself — what is left is "the privileges the token already holds" |
+| `automountServiceAccountToken: false`, stated explicitly (absent is a denial) | makes naming a ServiceAccount moot: the pod gets no token |
+| no `hostNetwork` / `hostPID` / `hostIPC` | escape to the node |
+| exactly one container, running this release's repmgr image | what code enters the cluster on this token |
+| volumes limited to the three the restore template renders (`emptyDir`, ConfigMap `<release>-pg-pgbackrest`, PVC `data-<release>-pg-<podOrdinal>`) | with the token gone this is the one that matters most: arbitrary Secret mounts, `hostPath`, and projected service-account tokens all fall out as denials |
+| no `envFrom`; `valueFrom` limited to the downward API and this release's own Secrets | the same bound for env — a key from any other Secret or ConfigMap |
+
+**Everyone else is untouched.** Humans, GitOps controllers, the CronJob controller and every
+other workload create Jobs exactly as before; the policy matches on
+`request.userInfo.username` and nothing else. That direction is asserted in the integration
+suite next to the denials, because a policy that broke every other controller in the
+namespace would be worse than the hole it closes.
+
+What it is not: a check that the Job matches the release *in full*. CEL sees only the
+admission request, so the verbatim-`jobTemplate` clone remains what guarantees the rest.
+This is defence in depth on top of that.
+
+`failurePolicy: Fail` is deliberate — under `Ignore`, an evaluation failure would silently
+re-open the hole while the grant stayed rendered. For the same reason the grant and its bound
+cannot be separated by accident: **rendering the RBAC without the policy fails the render**
+unless you acknowledge the trade in values.
+
+```yaml
+repmgr:
+  agent:
+    control:
+      restore:
+        enabled: true
+        allowedClientCNs: [dba-break-glass]
+        admissionPolicy:
+          enabled: true               # default
+          acknowledgeUnbounded: false # required to be true if you set enabled: false
+```
+
+Before you enable restore triggering, two operational consequences:
+
+- **These are this chart's only cluster-scoped objects.** The installing identity needs
+  cluster-scoped `create` on `admissionregistration.k8s.io`
+  (`ValidatingAdmissionPolicy`, `ValidatingAdmissionPolicyBinding`), and the cluster must be
+  **≥ 1.30**. A default install renders neither object, so a namespace-limited installer is
+  unaffected until it opts in. The names are namespace-prefixed
+  (`<namespace>-<release>-pg-restore-guard`) so two releases cannot collide, and the binding
+  is scoped to the release namespace by `kubernetes.io/metadata.name` — a label the API
+  server sets itself, so it cannot be left off.
+- **Mutating admission that rewrites `Job` objects can make the clone stop matching a pin.**
+  Sidecar injectors act on *Pods* and are unaffected, but a policy engine that mutates pod
+  controllers may not be. The denial names the exact field, so you will know immediately
+  rather than during an incident.
+
+Legitimate reasons to turn it off — a cluster below 1.30, a namespace-limited installer, one
+policy managed centrally by a platform team, or simply accepting the unbounded grant as
+1.9.0 required — are all real. Set `admissionPolicy.enabled: false` **and**
+`acknowledgeUnbounded: true`; the second is what keeps the decision reviewable in values
+rather than invisible in a Role.
 
 What it does and does not control:
 

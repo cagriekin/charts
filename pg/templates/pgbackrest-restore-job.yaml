@@ -204,6 +204,20 @@ spec:
   successfulJobsHistoryLimit: {{ .Values.pgbackrest.cronjob.successfulJobsHistoryLimit }}
   failedJobsHistoryLimit: {{ .Values.pgbackrest.cronjob.failedJobsHistoryLimit }}
   jobTemplate:
+    {{- /* Labels on the jobTemplate, not only on the CronJob itself: both `kubectl create
+           job --from=cronjob/...` and the control API's clone copy THESE onto the Job they
+           create, and nothing else does -- before #279 the jobTemplate carried no metadata
+           at all, so a cloned Job had no labels whatsoever.
+
+           Deliberately just this one label rather than the standard pg.labels set: a Job
+           the agent creates is not Helm-managed, and stamping it with
+           app.kubernetes.io/managed-by=Helm plus app.kubernetes.io/instance would make it
+           look like release content to a GitOps controller, which may then prune it
+           mid-restore. pg.fullname is release-unique, so one label is enough to select
+           them: kubectl get jobs -l pg-ha/restore=<fullname>. */}}
+    metadata:
+      labels:
+        pg-ha/restore: {{ include "pg.fullname" . }}
     spec:
       {{- include "pg.pgbackrestRestoreJobSpec" . | nindent 6 }}
 {{- else }}

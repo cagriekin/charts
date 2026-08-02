@@ -700,6 +700,26 @@ with: {{- if eq (include "pg.agentMode" .) "true" }}
 {{- and .Values.repmgr.enabled (eq (include "pg.failoverMode" .) "repmgrd") -}}
 {{- end -}}
 
+{{- /* The single condition under which the `create jobs` grant is rendered (#276). Both
+       rbac.yaml (the grant) and agent-restore-admissionpolicy.yaml (the bound on it) gate
+       on THIS helper rather than on the value directly, so the grant and its guard cannot
+       drift apart -- a Role that carries the escalation primitive without the policy that
+       bounds it is the failure mode #279 exists to prevent. */ -}}
+{{- define "pg.controlRestoreEnabled" -}}
+{{- and .Values.repmgr.enabled (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.control.restore.enabled -}}
+{{- end -}}
+
+{{- /* Name of the ValidatingAdmissionPolicy (and its binding) that bounds the restore
+       Job-create grant (#279). Both objects are CLUSTER-scoped, so the name is prefixed
+       with the release namespace: pg.fullname is only namespace-unique, and two releases
+       of this chart in different namespaces would otherwise fight over one policy object.
+       Worst case is 63 (namespace) + 1 + 63 (fullname) + 14 = 141 characters, comfortably
+       inside the 253-character DNS-subdomain limit these kinds validate against, so no
+       truncation (which could collide two releases onto one policy) is needed. */ -}}
+{{- define "pg.restoreGuardName" -}}
+{{- printf "%s-%s-restore-guard" .Release.Namespace (include "pg.fullname" .) -}}
+{{- end -}}
+
 {{- /* True in agent mode when the leadership backend is etcd (repmgr.agent.dcs.backend
        == "etcd"), false otherwise. Nil-safe at every level so a partial overlay does
        not nil-pointer; defaults to the kubernetes backend. */ -}}

@@ -110,7 +110,18 @@
                       "items": { "type": "string" },
                       "description": "Restore-specific authz verb. An empty list denies every client."
                     },
-                    "readPodLogs": { "type": "boolean" }
+                    "readPodLogs": { "type": "boolean" },
+                    "admissionPolicy": {
+                      "type": "object",
+                      "description": "ValidatingAdmissionPolicy bounding the restore feature's `create jobs` grant by content (#279). Requires Kubernetes >= 1.30 and cluster-scoped create on admissionregistration.k8s.io. Disabling it requires acknowledgeUnbounded=true -- a template guard, not schema if/then.",
+                      "properties": {
+                        "enabled": { "type": "boolean" },
+                        "acknowledgeUnbounded": {
+                          "type": "boolean",
+                          "description": "Accept the unbounded namespace-wide job-create grant when the policy is disabled."
+                        }
+                      }
+                    }
                   }
                 }
               }

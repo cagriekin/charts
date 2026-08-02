@@ -74,6 +74,15 @@
 {{- if not $control.restore.allowedClientCNs }}
 {{- fail "repmgr.agent.control.restore.enabled requires a non-empty repmgr.agent.control.restore.allowedClientCNs: restore is a separate authz verb from pause/switchover, and an empty allowlist denies every client -- name the certificate CNs permitted to overwrite the data directory" }}
 {{- end }}
+{{- /* The grant and its bound render together or not at all (#279). Refusing here rather
+       than warning is the point: `create jobs` cannot be resourceName-scoped, so a Role
+       rendered without the admission policy carries a namespace-wide privilege-escalation
+       primitive on a token that sits next to user-supplied SQL. Opting out stays possible
+       -- a cluster below 1.30, a namespace-limited installer, a platform-managed policy --
+       but it has to be said out loud in values, where it is reviewable. */}}
+{{- if and (not $control.restore.admissionPolicy.enabled) (not $control.restore.admissionPolicy.acknowledgeUnbounded) }}
+{{- fail "repmgr.agent.control.restore.admissionPolicy.enabled=false leaves the restore feature's `create jobs` grant unbounded: RBAC cannot restrict create by resourceName, so anything holding the database pods' ServiceAccount token could create arbitrary Jobs in this namespace and name any ServiceAccount in them. Either leave admissionPolicy.enabled=true (it needs Kubernetes >= 1.30 and cluster-scoped create on ValidatingAdmissionPolicy), or set repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded=true to accept that trade deliberately" }}
+{{- end }}
 {{- end }}
 {{- if and $control.restore.readPodLogs (not $control.restore.enabled) }}
 {{- fail "repmgr.agent.control.restore.readPodLogs requires repmgr.agent.control.restore.enabled (it only affects reading a restore Job's log)" }}

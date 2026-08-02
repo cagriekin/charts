@@ -1,5 +1,31 @@
 # pgvector chart changelog
 
+## 1.10.0 - 2026-08-02
+
+Inherited from pg's symlinked templates and the shared repmgr image. See the
+[pg 1.10.0 changelog](../pg/CHANGELOG.md) for the full detail.
+
+### Added
+
+- **A `ValidatingAdmissionPolicy` bounding `repmgr.agent.control.restore`'s job-create
+  grant** (#279), rendered by default when that feature is enabled. `create` on `jobs`
+  cannot be scoped by `resourceName`, so 1.9.0's grant was a namespace-wide
+  privilege-escalation primitive on a token that sits beside user-supplied SQL. The policy
+  restricts by **content** instead — one permitted Job name, this release's ServiceAccount,
+  no mounted token, no host namespaces, this release's image, volumes and Secrets only —
+  and polices only this release's ServiceAccount, leaving every other Job creator untouched.
+  `failurePolicy: Fail`, and rendering the grant without the policy fails the render unless
+  `admissionPolicy.acknowledgeUnbounded: true` says so deliberately.
+- The restore CronJob's `jobTemplate` now carries `pg-ha/restore=<fullname>`, so a cloned
+  restore Job is selectable where before it carried no labels.
+
+### Upgrading
+
+- Enabling `repmgr.agent.control.restore` now requires **Kubernetes ≥ 1.30** and
+  cluster-scoped `create` on `admissionregistration.k8s.io`. A default install renders no
+  cluster-scoped objects, so nothing else changes. To keep 1.9.0's behaviour, set
+  `admissionPolicy.enabled: false` **and** `acknowledgeUnbounded: true`.
+
 ## 1.9.0 - 2026-08-01
 
 Inherited from pg's symlinked templates and the shared repmgr image. See the

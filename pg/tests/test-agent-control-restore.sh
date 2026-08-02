@@ -11,7 +11,10 @@
 #     as lastRestore AFTER the scale-down/up cycle -- the whole point of that file, since
 #     by then the Job may be gone;
 #   * WAL-replay progress is visible on GET /v1/status once the cluster is back, which is
-#     the progress signal that survives scaling to 0.
+#     the progress signal that survives scaling to 0;
+#   * the ValidatingAdmissionPolicy that bounds the unscopeable `create jobs` grant (#279)
+#     admits the agent's own Job and denies every tampered one -- content-based admission
+#     exists only in the apiserver, so there is no cheaper layer that could test it.
 #
 # It also documents the honest shape of the flow: the API removes the `kubectl create job
 # --from` step and nothing else. Scaling to 0 deletes every agent, so the API cannot do it
@@ -117,6 +120,111 @@ assert_eq "RBAC: cannot read another CronJob" "no" "$(can get "cronjobs/${FULLNA
 assert_eq "RBAC: cannot list Jobs" "no" "$(can list jobs)"
 assert_eq "RBAC: no pods/log without restore.readPodLogs" "no" "$(can get pods/log)"
 assert_eq "RBAC: still cannot read Secrets" "no" "$(can get secrets)"
+
+# --- and the bound on the one grant RBAC could not scope (#279) ---
+#
+# `create jobs` above is unscopeable, so what limits it is a ValidatingAdmissionPolicy:
+# RBAC restricts by verb and resource, admission restricts by CONTENT. Only a live
+# apiserver can test that, and it has to be tested in BOTH directions -- a policy that
+# denied the agent's own restore would break the feature, and one that policed every
+# creator would break every other controller in the namespace.
+#
+# Each case submits the Job `kubectl create job --from=cronjob/...` builds -- the same
+# clone the agent builds -- as the pods' ServiceAccount, with one field tampered.
+# --dry-run=server runs the full admission chain and creates nothing.
+GUARD="${NAMESPACE}-${FULLNAME}-restore-guard"
+assert_eq "VAP: the policy is installed" "${GUARD}" \
+  "$(kubectl get validatingadmissionpolicy "${GUARD}" -o jsonpath='{.metadata.name}' 2>/dev/null || true)"
+assert_eq "VAP: the binding is installed" "${GUARD}" \
+  "$(kubectl get validatingadmissionpolicybinding "${GUARD}" -o jsonpath='{.metadata.name}' 2>/dev/null || true)"
+assert_eq "VAP: fails closed (Ignore would silently re-open the hole)" "Fail" \
+  "$(kubectl get validatingadmissionpolicy "${GUARD}" -o jsonpath='{.spec.failurePolicy}' 2>/dev/null || true)"
+# The apiserver type-checks every expression against batch/v1 Job and reports what does not
+# resolve. A warning here means a validation that can never do its job -- and under
+# failurePolicy: Fail, one that may deny every restore instead.
+vap_warnings=$(kubectl get validatingadmissionpolicy "${GUARD}" \
+  -o jsonpath='{.status.typeChecking.expressionWarnings}' 2>/dev/null || true)
+[ -n "${vap_warnings}" ] && echo "  note: apiserver type-check warnings: ${vap_warnings}"
+assert_eq "VAP: the apiserver type-checks every expression cleanly" "" "${vap_warnings}"
+
+# clone_job <jq filter> -- the Job the agent would create, with the filter applied.
+clone_job() {
+  kubectl create job "${API_JOB}" --from=cronjob/"${FULLNAME}-pgbackrest-restore" \
+    -n "${NAMESPACE}" --dry-run=client -o json 2>/dev/null | jq "$1"
+}
+# admit <jq filter> [<impersonated user>|human] -> "allowed" | the apiserver's denial message
+# The literal "human" means "do not impersonate", i.e. submit as whoever is running the
+# suite. A sentinel rather than an empty second argument, because ${2:-${SA}} would silently
+# substitute the ServiceAccount for one and turn the control case into a duplicate.
+admit() {
+  local filter="$1" who="${2:-${SA}}" out rc=0 args=(-f - -n "${NAMESPACE}" --dry-run=server -o name)
+  [[ "${who}" != "human" ]] && args+=(--as="${who}")
+  out=$(clone_job "${filter}" | kubectl create "${args[@]}" 2>&1) || rc=$?
+  if [ "${rc}" -eq 0 ]; then echo "allowed"; else echo "${out}"; fi
+}
+
+# The direction that is easy to forget: the legitimate restore must still go through, and a
+# human or any other controller must be unaffected by the policy existing.
+assert_eq "VAP: the agent's own restore Job is admitted" "allowed" "$(admit '.')"
+unrelated='.metadata.name="vap-unrelated-job" | .metadata.labels={} | .spec.template.spec.serviceAccountName="default" | .spec.template.spec.automountServiceAccountToken=true'
+assert_eq "VAP: a Job created by a human is untouched" "allowed" "$(admit "${unrelated}" human)"
+
+# The escalation primitive itself: a Job's pod may name any ServiceAccount, with no separate
+# permission check. This is the denial the whole feature's safety rests on.
+assert_contains "VAP: naming another ServiceAccount is denied" \
+  "$(admit '.spec.template.spec.serviceAccountName="privileged-sa"')" \
+  "may only create Jobs running as ServiceAccount"
+# ...and why it would not help even if it were not: no token is mounted.
+assert_contains "VAP: mounting the ServiceAccount token is denied" \
+  "$(admit '.spec.template.spec.automountServiceAccountToken=true')" \
+  "automountServiceAccountToken: false"
+assert_contains "VAP: omitting automountServiceAccountToken is denied (absent is not a pass)" \
+  "$(admit 'del(.spec.template.spec.automountServiceAccountToken)')" \
+  "automountServiceAccountToken: false"
+# The bound RBAC could not express: create collapses to ONE permitted object name.
+assert_contains "VAP: any other Job name is denied" \
+  "$(admit '.metadata.name="evil"')" "may create only the Job"
+# generateName cannot slip past it: name generation happens before VALIDATING admission, so
+# the policy sees the final name. Worth proving rather than reasoning about.
+assert_contains "VAP: generateName cannot dodge the name pin" \
+  "$(admit 'del(.metadata.name) | .metadata.generateName="evil-"')" "may create only the Job"
+assert_contains "VAP: a Job without the pg-ha/restore label is denied" \
+  "$(admit '.metadata.labels={}')" "must carry pg-ha/restore"
+assert_contains "VAP: hostNetwork is denied" \
+  "$(admit '.spec.template.spec.hostNetwork=true')" "hostNetwork, hostPID and hostIPC are not permitted"
+assert_contains "VAP: hostPID is denied" \
+  "$(admit '.spec.template.spec.hostPID=true')" "hostNetwork, hostPID and hostIPC are not permitted"
+assert_contains "VAP: another image is denied" \
+  "$(admit '.spec.template.spec.containers[0].image="attacker/img:1"')" "may only run this release's repmgr image"
+assert_contains "VAP: a second container is denied" \
+  "$(admit '.spec.template.spec.containers += [{"name":"x","image":"busybox"}]')" "exactly one container"
+assert_contains "VAP: an init container is denied" \
+  "$(admit '.spec.template.spec.initContainers=[{"name":"i","image":"busybox"}]')" "exactly one container"
+# With the token gone, mounting somebody else's Secret is the remaining route out of this
+# release -- so the volume sources are pinned to the three the restore template renders.
+assert_contains "VAP: mounting an arbitrary Secret is denied" \
+  "$(admit '.spec.template.spec.volumes += [{"name":"steal","secret":{"secretName":"pg-control-restore-tls"}}]')" \
+  "may mount only this release's restore volumes"
+assert_contains "VAP: a hostPath mount is denied" \
+  "$(admit '.spec.template.spec.volumes += [{"name":"node","hostPath":{"path":"/"}}]')" \
+  "may mount only this release's restore volumes"
+assert_contains "VAP: a projected ServiceAccount token is denied" \
+  "$(admit '.spec.template.spec.volumes += [{"name":"tok","projected":{"sources":[{"serviceAccountToken":{"path":"t"}}]}}]')" \
+  "may mount only this release's restore volumes"
+assert_contains "VAP: an unrelated PVC is denied" \
+  "$(admit '.spec.template.spec.volumes += [{"name":"other","persistentVolumeClaim":{"claimName":"data-other-0"}}]')" \
+  "may mount only this release's restore volumes"
+# The same bound for env: envFrom pulls a whole Secret, secretKeyRef/configMapKeyRef a key
+# from any of them. Only the downward API and this release's own Secrets get through.
+assert_contains "VAP: reading another Secret through secretKeyRef is denied" \
+  "$(admit '.spec.template.spec.containers[0].env += [{"name":"X","valueFrom":{"secretKeyRef":{"name":"pg-control-restore-tls","key":"tls.key"}}}]')" \
+  "may not use envFrom"
+assert_contains "VAP: envFrom is denied" \
+  "$(admit '.spec.template.spec.containers[0].envFrom=[{"secretRef":{"name":"pg-control-restore-tls"}}]')" \
+  "may not use envFrom"
+assert_contains "VAP: reading a ConfigMap through configMapKeyRef is denied" \
+  "$(admit '.spec.template.spec.containers[0].env += [{"name":"X","valueFrom":{"configMapKeyRef":{"name":"kube-root-ca.crt","key":"ca.crt"}}}]')" \
+  "may not use envFrom"
 
 # --- data + a backup to restore from ---
 

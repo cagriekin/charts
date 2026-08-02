@@ -465,6 +465,41 @@ repmgr:
         # Required when restore.enabled -- an empty list denies everyone, so forgetting
         # it cannot open the most destructive verb in the API.
         allowedClientCNs: []
+        # The bound on the `create jobs` grant above (#279). RBAC restricts by VERB and
+        # RESOURCE; this restricts by CONTENT, which is the primitive RBAC does not have --
+        # so with it on, "create arbitrary Jobs in this namespace" becomes "create this one
+        # restore Job, as this release's ServiceAccount, with this release's volumes".
+        #
+        # A ValidatingAdmissionPolicy + binding, both CLUSTER-SCOPED objects: in-tree and
+        # GA since Kubernetes 1.30, so no webhook, no serving certificate and nothing that
+        # can be down. It polices ONLY this release's ServiceAccount -- humans, GitOps
+        # controllers and every other workload create Jobs untouched.
+        #
+        # What it checks: the Job's name (the deterministic one the agent uses, which is the
+        # resourceName restriction RBAC refused to give), its pg-ha/restore label, its
+        # ServiceAccount, automountServiceAccountToken=false, no host namespaces, one
+        # container running this release's image, volumes limited to the three the restore
+        # template renders, and no envFrom / no Secret references beyond this release's own.
+        #
+        # Two consequences worth knowing before you install:
+        #   * The installing identity needs cluster-scoped create on
+        #     admissionregistration.k8s.io ValidatingAdmissionPolicy/-Binding. A namespace-
+        #     limited installer cannot render this (see acknowledgeUnbounded below).
+        #   * A cluster whose mutating admission rewrites JOB objects (not pod specs --
+        #     sidecar injectors act on Pods and are unaffected) can make the rendered Job
+        #     stop matching, which shows up as a denial naming the exact field.
+        admissionPolicy:
+          enabled: true
+          # The escape hatch, and it is deliberately awkward: with admissionPolicy.enabled
+          # false the RENDER FAILS unless this is also true. Turning the bound off silently
+          # would leave the Role carrying a namespace-wide privilege-escalation primitive
+          # with nothing recording that anyone chose that -- which is the exact shape #279
+          # set out to remove. Set both only when you mean it:
+          #   * the cluster is below Kubernetes 1.30;
+          #   * you install the policy out of band (a namespace-limited installer, or one
+          #     cluster-wide policy managed by the platform team);
+          #   * or you accept the unbounded grant, as 1.9.0 required everyone to.
+          acknowledgeUnbounded: false
         # Live file-copy progress (progress.percent on GET /v1/restore) by tailing the
         # restore pod's log. Off by default because it needs `get pods/log` across the
         # namespace -- the Job's pod name is generated, so it cannot be scoped -- and

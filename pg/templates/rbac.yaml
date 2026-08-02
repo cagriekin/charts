@@ -66,24 +66,31 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create"]
-{{- if .Values.repmgr.agent.control.restore.enabled }}
+{{- if eq (include "pg.controlRestoreEnabled" .) "true" }}
   # Control-API restore triggering (#276). READ THIS BEFORE ENABLING IT.
   #
   # `create` on jobs CANNOT be restricted by resourceName -- the API server does not
-  # know an object's name at authorization time for a create -- so this grant lets
-  # anything holding the postgresql pods' ServiceAccount token create ARBITRARY Jobs
+  # know an object's name at authorization time for a create -- so this grant BY ITSELF
+  # lets anything holding the postgresql pods' ServiceAccount token create ARBITRARY Jobs
   # in this namespace. A Job's pod may name any ServiceAccount, and Kubernetes does no
   # separate permission check for that, which makes this a namespace-wide
   # privilege-escalation primitive. The token is mounted next to a PostgreSQL that
   # executes user-supplied SQL, i.e. the chart's largest attack surface.
   #
-  # What narrows it: the grant is rendered ONLY under
+  # What actually bounds it is NOT in this file, because the restriction has to happen at
+  # a layer RBAC does not reach: the ValidatingAdmissionPolicy in
+  # agent-restore-admissionpolicy.yaml (#279) restricts these creates by CONTENT -- one
+  # permitted Job name, this release's ServiceAccount, no mounted token, this release's
+  # volumes and Secrets only. It renders under the same pg.controlRestoreEnabled condition
+  # as this grant, and a values combination that would drop it fails the render, so a Role
+  # carrying this rule without that policy is not a state the chart can produce.
+  #
+  # Narrowing it further: the grant is rendered ONLY under
   # repmgr.agent.control.restore.enabled (default false, so a normal install's Role is
   # unchanged), the API additionally requires a client certificate whose CN is on
   # repmgr.agent.control.restore.allowedClientCNs, and the Job the agent creates is a
   # verbatim clone of the CronJob below rather than a spec it composes. The equivalent
-  # kubectl path (`kubectl create job --from=cronjob/...`) needs none of this, so leave
-  # this off unless API-driven restore is worth the trade.
+  # kubectl path (`kubectl create job --from=cronjob/...`) needs none of this.
   #
   # get on the CronJob: the jobTemplate the agent clones.
   - apiGroups: ["batch"]
