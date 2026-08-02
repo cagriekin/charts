@@ -31,8 +31,14 @@ esac
 
 # The previous tag for THIS chart, by commit date. Tags are matched as <chart>-<semver> so
 # that pg-* never matches pgvector-*.
+#
+# The `|| [ $? -eq 1 ]` is load-bearing under `set -o pipefail`: a chart being released for
+# the FIRST time has no matching tag, grep exits 1, pipefail propagates that through the
+# pipeline, and errexit would kill the script here -- leaving the first-release branch below
+# as dead code and publishing an empty notes body. "No match" has to mean "no previous tag",
+# while grep's exit 2 (a real error) must still fail loudly.
 prev=$(git for-each-ref --sort=creatordate --format='%(refname:short)' refs/tags \
-  | grep -E "^${chart}-[0-9]+\.[0-9]+\.[0-9]+$" \
+  | { grep -E "^${chart}-[0-9]+\.[0-9]+\.[0-9]+$" || [ "$?" -eq 1 ]; } \
   | awk -v t="${tag}" '$0 == t {exit} {print}' \
   | tail -1)
 
