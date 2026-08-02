@@ -477,10 +477,12 @@ repmgr:
         #
         # What it checks: the Job's name (the deterministic one the agent uses, which is the
         # resourceName restriction RBAC refused to give), its pg-ha/restore label, its
-        # ServiceAccount, automountServiceAccountToken=false, no host namespaces and no
-        # explicit nodeName, the pod's own labels (so the restore pod cannot join this
-        # release's Service endpoints), no manualSelector, one container running this
-        # release's image and this release's restore command with no args, this release's
+        # ServiceAccount, automountServiceAccountToken=false, no host namespaces, no
+        # explicit nodeName and only this release's priorityClassName (a higher-priority class
+        # would let the scheduler preempt this release's own pods), the pod's own labels (so
+        # the restore pod cannot join this release's Service endpoints), no manualSelector, one
+        # container running this release's image and this release's restore command with no
+        # args and no lifecycle hooks, this release's
         # pod and container security contexts (so no privileged / root / added-capability
         # container), CPU and memory requests and limits, a single pod (parallelism and
         # completions <= 1), volumes limited to the three the restore template renders, and
@@ -497,8 +499,10 @@ repmgr:
         #   * The installing identity needs cluster-scoped create on
         #     admissionregistration.k8s.io ValidatingAdmissionPolicy/-Binding. A namespace-
         #     limited installer cannot render this (see acknowledgeUnbounded below).
-        #   * Kubernetes >= 1.30 is required, and the render FAILS below that rather than
-        #     letting the apply fail halfway.
+        #   * Kubernetes >= 1.30 is required, and the render FAILS when the cluster does not
+        #     expose admissionregistration.k8s.io/v1 rather than letting the apply fail
+        #     halfway. The check is on the API group, not the reported version: with no
+        #     cluster, .Capabilities.KubeVersion is the helm CLIENT's own version.
         #   * A cluster whose mutating admission rewrites JOB objects (not pod specs --
         #     sidecar injectors act on Pods and are unaffected) can make the rendered Job
         #     stop matching, which shows up as a denial naming the exact field.

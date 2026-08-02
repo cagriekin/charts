@@ -19,33 +19,51 @@
        WHAT THIS DOES AND DOES NOT ACHIEVE. The validations below pin the Job to the shape
        this release's own restore template renders: one deterministic name, this release's
        ServiceAccount with no token, this release's image running this release's restore
-       command, this release's volumes, env and security contexts, and a single pod. What
-       is left is therefore "run this release's restore, with attacker-chosen restore
-       PARAMETERS (the literal env values: target, backup set, force)" -- i.e. the
-       operation the feature exists to expose, reachable without going through the control
-       API's mTLS and restore.allowedClientCNs. That residual is inherent to `create jobs`
-       and cannot be closed by admission: a restore over the live PGDATA is what a restore
-       IS. It is documented in README.md rather than papered over, and it is why the
-       feature stays opt-in.
+       command, this release's volumes, env, placement and security contexts, and a single
+       pod. Two things are left, both documented in README.md rather than papered over:
+
+         * The restore PARAMETERS (the literal env values: target, backup set, force). So a
+           token holder can run this release's own restore, over the live PGDATA, without
+           going through the control API's mTLS and restore.allowedClientCNs. Inherent to
+           `create jobs` and not closable by admission -- a restore over the live data
+           directory is what a restore IS.
+         * Code execution inside the pinned container. The command pin is not a sandbox:
+           bash reads $BASH_ENV, and an actor who already runs code in the postgresql
+           container can write a file into PGDATA, which this Job mounts. What that reaches
+           is uid 101 with no token and only this release's volumes -- the privileges
+           already held, which is the bar this policy is written to -- but it is not "only
+           restore.sh can run", and the pins below (image, security contexts, volumes, env)
+           are what keep it at that bar rather than the command pin alone.
+
+       Both are why the feature stays opt-in.
 
        This is also defence in depth ON TOP OF the agent's own bounds (verbatim jobTemplate
        clone, valueFrom env never overwritten, podOrdinal not an API decision, never
        --force), not a replacement for them: those bound what the AGENT builds, and this
        bounds what anyone else holding the same token can build.
 
-       Deliberately NOT gated on `.Capabilities.APIVersions`: with no cluster to query
-       (plain `helm template`, and therefore every unit test and the kubeconform gate)
-       helm falls back to a capability set containing only core/v1, so a capabilities
-       check would silently drop the policy in exactly the render paths that verify it is
-       present. `.Capabilities.KubeVersion` has no such hole -- it always carries a version
-       (the client's own when there is no cluster) -- so THAT is what the >= 1.30 floor
-       below is checked against. */}}
-{{- /* Fail at render time, not at apply time: `admissionregistration.k8s.io/v1` does not
-       exist before 1.30, and without this an upgrade from 1.9.0 on an older cluster would
-       render clean and then abort mid-apply with "no matches for kind
-       ValidatingAdmissionPolicy", leaving the release in a failed state. */}}
-{{- if not (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) }}
-{{- fail (printf "repmgr.agent.control.restore requires Kubernetes >= 1.30 for the ValidatingAdmissionPolicy that bounds its `create jobs` grant, but this cluster reports %s (#279). Upgrade the cluster, or set repmgr.agent.control.restore.admissionPolicy.enabled=false together with acknowledgeUnbounded=true to run the feature with an unbounded grant deliberately" .Capabilities.KubeVersion.Version) }}
+       The >= 1.30 requirement is enforced below by asking whether the API GROUP EXISTS,
+       not by comparing `.Capabilities.KubeVersion` against 1.30. The version comparison
+       looks equivalent and is not: with no cluster to query, `.Capabilities.KubeVersion`
+       is the HELM CLIENT'S OWN built-in version (helm 3.14 reports v1.29), so a semver
+       floor fails every `helm template` run by a slightly older helm -- CI, a GitOps
+       dry-run, `helm diff` -- regardless of what the target cluster actually is. Asking
+       for the API group is also the more accurate question: it is true wherever the kind
+       can be created and false where 1.30+ has it disabled via --runtime-config.
+
+       `.Capabilities.APIVersions` is safe to consult here BECAUSE this is a fail and not
+       a silent skip. Helm's no-cluster default set already contains
+       admissionregistration.k8s.io/v1 (53 entries, not core/v1 only), so `helm template`
+       and the kubeconform gate render the policy without a cluster; a real install or
+       upgrade replaces that set with server discovery, which is what makes the fail fire
+       on a cluster that genuinely cannot host it. helm-unittest's default set is the one
+       exception -- it does NOT include the group -- so the suite declares it, and the
+       fail's own test is the suite that declines to. */}}
+{{- /* Fail at render time, not at apply time: without this, an upgrade from 1.9.0 on a
+       cluster without the API renders clean and then aborts mid-apply with "no matches for
+       kind ValidatingAdmissionPolicy", leaving the release in a failed state. */}}
+{{- if not (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1") }}
+{{- fail (printf "repmgr.agent.control.restore needs admissionregistration.k8s.io/v1 for the ValidatingAdmissionPolicy that bounds its `create jobs` grant, and this cluster does not expose it -- it is GA from Kubernetes 1.30 (this cluster reports %s), and can also be disabled by --runtime-config (#279). Upgrade or enable the API, or set repmgr.agent.control.restore.admissionPolicy.enabled=false together with acknowledgeUnbounded=true to run the feature with an unbounded grant deliberately" .Capabilities.KubeVersion.Version) }}
 {{- end }}
 {{- $fullname := include "pg.fullname" . }}
 {{- $guard := include "pg.restoreGuardName" . }}
@@ -92,7 +110,14 @@
        already resolved by then), so a rule phrased as "exactly the labels the chart
        renders" would deny every legitimate restore. They are safe to allow: their values
        are server-assigned (the Job's own name and UID), validation #7 keeps
-       manualSelector from turning that off, and nothing in this chart selects on them. */}}
+       manualSelector from turning that off, and nothing in this chart selects on them.
+
+       Note the coupling this creates, because it fails CLOSED: the list is the set
+       Kubernetes stamps today (verified against 1.36). A future version that adds another
+       pod-template label would deny every restore for this release until the list is
+       extended here. That is the deliberate trade of a key allowlist over a subset check --
+       an EXTRA label is the whole attack this rule exists to stop, so "unknown key" has to
+       mean "deny" -- and the failure is loud, naming the exact rule, rather than silent. */}}
 {{- $ctrlLabelKeys := list "batch.kubernetes.io/controller-uid" "batch.kubernetes.io/job-name" "controller-uid" "job-name" }}
 {{- $podLabelRules := list (printf "variables.podLabels.all(k, k in ['%s'])" (join "','" (concat (keys $podLabels | sortAlpha) $ctrlLabelKeys))) }}
 {{- range $k := (keys $podLabels | sortAlpha) }}
@@ -135,11 +160,18 @@
       (include "pg.celScalarPin" (list "c.securityContext.runAsUser" $csc "runAsUser"))
       (include "pg.celScalarPin" (list "c.securityContext.runAsNonRoot" $csc "runAsNonRoot"))
       $addPin $cscSeccomp }}
+{{- /* When the values set NOTHING, the rule is "no securityContext, OR one that sets none of
+       the fields pinned above" -- not a bare !has(). `postgresql.containerSecurityContext:
+       {}` renders `securityContext: {}` on the Job, which is PRESENT as far as has() is
+       concerned, so a bare !has() would deny the release's own restore. The
+       !has(parent) || (...) shape is safe despite the pins dereferencing that parent: CEL's
+       logical operators are commutative, so a true left side wins even when the right side
+       would error. */}}
 {{- $cscRule := "" }}
 {{- if $csc }}
 {{- $cscRule = printf "variables.pod.containers.all(c, has(c.securityContext) && %s)" (join " && " $cscPins) }}
 {{- else }}
-{{- $cscRule = "variables.pod.containers.all(c, !has(c.securityContext))" }}
+{{- $cscRule = printf "variables.pod.containers.all(c, !has(c.securityContext) || (%s))" (join " && " $cscPins) }}
 {{- end }}
 {{- $pscPins := list
       (include "pg.celScalarPin" (list "variables.pod.securityContext.runAsUser" $psc "runAsUser"))
@@ -149,7 +181,19 @@
 {{- if $psc }}
 {{- $pscRule = printf "has(variables.pod.securityContext) && %s" (join " && " $pscPins) }}
 {{- else }}
-{{- $pscRule = "!has(variables.pod.securityContext)" }}
+{{- $pscRule = printf "!has(variables.pod.securityContext) || (%s)" (join " && " $pscPins) }}
+{{- end }}
+{{- /* priorityClassName, pinned to what the restore jobTemplate renders
+       (pgbackrest.cronjob.priorityClassName). This one does NOT belong with nodeSelector and
+       tolerations, which are left unpinned because they can only ever RESTRICT where a pod
+       runs: a priority class does the opposite. Referencing a PriorityClass needs no
+       permission, so a caller could name a high-priority class and let the scheduler PREEMPT
+       this release's own postgresql pods to make room -- and the SA holds delete on the
+       pinned Job name, so it is repeatable. The parallelism/completions cap does not close
+       that, because one pod is enough. */}}
+{{- $pcnPin := "!has(variables.pod.priorityClassName)" }}
+{{- with .Values.pgbackrest.cronjob.priorityClassName }}
+{{- $pcnPin = printf "(has(variables.pod.priorityClassName) && variables.pod.priorityClassName == '%s')" . }}
 {{- end }}
 {{- /* Resources: presence of exactly the request/limit keys the release renders. The
        VALUES are not compared -- a Quantity round-trips as the string it was written as
@@ -180,6 +224,22 @@
 {{- end }}
 {{- range $s := $secretRefs }}
 {{- $literals = append $literals (list "a pgbackrest Secret name (pgbackrest.existingSecret.name / pgbackrest.repoEncryption.existingSecret.name)" $s) }}
+{{- end }}
+{{- /* Every OTHER value that reaches a single-quoted CEL literal. Missing one is not
+       cosmetic: `RuntimeDefault' || true || '` renders a syntactically valid, always-true
+       expression -- == binds tighter than || -- so the pin becomes a tautology that renders
+       and lints clean. values.schema.json constrains none of these. */}}
+{{- with $csc.seccompProfile }}{{- with .type }}
+{{- $literals = append $literals (list "postgresql.containerSecurityContext.seccompProfile.type" .) }}
+{{- end }}{{- end }}
+{{- with $psc.seccompProfile }}{{- with .type }}
+{{- $literals = append $literals (list "postgresql.podSecurityContext.seccompProfile.type" .) }}
+{{- end }}{{- end }}
+{{- range $cap := ($caps.add | default list) }}
+{{- $literals = append $literals (list "a postgresql.containerSecurityContext.capabilities.add entry" $cap) }}
+{{- end }}
+{{- with .Values.pgbackrest.cronjob.priorityClassName }}
+{{- $literals = append $literals (list "pgbackrest.cronjob.priorityClassName" .) }}
 {{- end }}
 {{- include "pg.validateCelLiterals" $literals }}
 apiVersion: admissionregistration.k8s.io/v1
@@ -260,15 +320,16 @@ spec:
     - expression: "has(variables.pod.automountServiceAccountToken) && variables.pod.automountServiceAccountToken == false"
       message: "the pg agent's Jobs must set automountServiceAccountToken: false explicitly (the restore talks to S3 and the PVC, never to the Kubernetes API)"
       reason: Forbidden
-    # 5. Escapes from the pod boundary to the node, plus nodeName. nodeName is here because
-    #    it bypasses the scheduler outright -- it ignores taints, and it is how a caller
-    #    would place this pod on a specific node of its choosing. nodeSelector and
-    #    tolerations are deliberately NOT pinned: they are inherited from
-    #    postgresql.nodeSelector/tolerations (the restore has to be able to land where the
-    #    data volume can attach), they can only ever RESTRICT where the pod runs, and with
-    #    the command and volumes pinned below, placement grants nothing.
-    - expression: "(!has(variables.pod.hostNetwork) || variables.pod.hostNetwork == false) && (!has(variables.pod.hostPID) || variables.pod.hostPID == false) && (!has(variables.pod.hostIPC) || variables.pod.hostIPC == false) && !has(variables.pod.nodeName)"
-      message: "hostNetwork, hostPID, hostIPC and an explicit nodeName are not permitted on the pg agent's Jobs"
+    # 5. Escapes from the pod boundary to the node, plus the two placement knobs a caller
+    #    could turn against the release. nodeName bypasses the scheduler outright -- it
+    #    ignores taints, and it is how a caller would place this pod on a node of its
+    #    choosing. priorityClassName is pinned for the reason in its construction above: it
+    #    can PREEMPT this release's own pods. nodeSelector and tolerations are deliberately
+    #    NOT pinned -- they are inherited from postgresql.nodeSelector/tolerations so the
+    #    restore can land where the data volume attaches, and unlike priority they can only
+    #    ever RESTRICT where the pod runs.
+    - expression: "(!has(variables.pod.hostNetwork) || variables.pod.hostNetwork == false) && (!has(variables.pod.hostPID) || variables.pod.hostPID == false) && (!has(variables.pod.hostIPC) || variables.pod.hostIPC == false) && !has(variables.pod.nodeName) && {{ $pcnPin }}"
+      message: "hostNetwork, hostPID, hostIPC, an explicit nodeName and any priorityClassName other than this release's are not permitted on the pg agent's Jobs"
       reason: Forbidden
     # 6. The pod's OWN labels: an allowlist of keys (this release's restore pod labels plus
     #    the batch controller's own), with the release's values pinned. A key allowlist
@@ -307,10 +368,17 @@ spec:
     #    database's uid, with the live PGDATA mounted", which is a data-destruction
     #    primitive that needs no privilege escalation at all. With it, the Job can only run
     #    the chart's restore.sh (delivered by the pinned ConfigMap volume, which this token
-    #    cannot write) and the only caller-controlled inputs are the literal env values the
-    #    restore already takes.
-    - expression: "variables.pod.containers.all(c, has(c.command) && c.command == {{ include "pg.restoreCommandJSON" . | replace "\"" "'" }} && !has(c.args))"
-      message: "the pg agent's Jobs must run exactly this release's restore command ({{ include "pg.restoreCommandJSON" . | replace "\"" "'" }}) with no args"
+    #    cannot write) plus the literal env values the restore already takes.
+    #
+    #    lifecycle is denied in the same rule because it is the same question: a
+    #    postStart/preStop exec hook runs a caller-chosen program in the pinned container
+    #    without touching command or args, which would make "must run exactly this release's
+    #    restore command" untrue as written. The chart renders no lifecycle hooks, so pinning
+    #    absence costs nothing. It does not close the residual documented at the top of this
+    #    file -- $BASH_ENV reaches the same place -- but there is no reason to leave a second,
+    #    more direct door open.
+    - expression: "variables.pod.containers.all(c, has(c.command) && c.command == {{ include "pg.restoreCommandJSON" . | replace "\"" "'" }} && !has(c.args) && !has(c.lifecycle))"
+      message: "the pg agent's Jobs must run exactly this release's restore command ({{ include "pg.restoreCommandJSON" . | replace "\"" "'" }}) with no args and no lifecycle hooks"
       reason: Forbidden
     # 11+12. Security contexts, pinned to the release's own (see the reasoning above their
     #    construction). Without these the Job is admitted with privileged: true,

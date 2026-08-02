@@ -140,6 +140,13 @@ GUARD=$(kubectl get validatingadmissionpolicy \
   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 assert_contains "VAP: the policy is installed, hash-discriminated per namespace and release" \
   "${GUARD}" "^${NAMESPACE}-${FULLNAME}-restore-guard-[0-9a-f]\{8\}$"
+# Stop here if the lookup found nothing. Every assertion below compares against the output of
+# a kubectl call that takes GUARD as an argument, and `kubectl get vap ""` fails with empty
+# output -- so "" == "" would report PASS for a cluster that has no policy at all. Same
+# vacuity assert_not_eq exists to prevent.
+if [ -z "${GUARD}" ]; then
+  fail "VAP: no policy found for release ${RELEASE}" "the rest of the #279 assertions cannot mean anything"
+else
 assert_eq "VAP: the binding is installed under the same name" "${GUARD}" \
   "$(kubectl get validatingadmissionpolicybinding "${GUARD}" -o jsonpath='{.metadata.name}' 2>/dev/null || true)"
 assert_eq "VAP: fails closed (Ignore would silently re-open the hole)" "Fail" \
@@ -202,9 +209,9 @@ assert_contains "VAP: generateName cannot dodge the name pin" \
 assert_contains "VAP: a Job without the pg-ha/restore label is denied" \
   "$(admit '.metadata.labels={}')" "must carry pg-ha/restore"
 assert_contains "VAP: hostNetwork is denied" \
-  "$(admit '.spec.template.spec.hostNetwork=true')" "hostNetwork, hostPID, hostIPC and an explicit nodeName are not permitted"
+  "$(admit '.spec.template.spec.hostNetwork=true')" "hostNetwork, hostPID, hostIPC"
 assert_contains "VAP: hostPID is denied" \
-  "$(admit '.spec.template.spec.hostPID=true')" "hostNetwork, hostPID, hostIPC and an explicit nodeName are not permitted"
+  "$(admit '.spec.template.spec.hostPID=true')" "hostNetwork, hostPID, hostIPC"
 assert_contains "VAP: another image is denied" \
   "$(admit '.spec.template.spec.containers[0].image="attacker/img:1"')" "may only run this release's repmgr image"
 assert_contains "VAP: a second container is denied" \
@@ -321,7 +328,7 @@ assert_contains "VAP: manualSelector is denied" \
 # way to fill the namespace quota and evict the database's own pods.
 assert_contains "VAP: an explicit nodeName is denied" \
   "$(admit '.spec.template.spec.nodeName="'"$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')"'"')" \
-  "an explicit nodeName are not permitted"
+  "an explicit nodeName"
 assert_contains "VAP: parallelism above one is denied" \
   "$(admit '.spec.parallelism=200')" "must run a single pod"
 assert_contains "VAP: completions above one is denied" \
@@ -329,6 +336,27 @@ assert_contains "VAP: completions above one is denied" \
 assert_contains "VAP: a container with no requests or limits is denied" \
   "$(admit '.spec.template.spec.containers[0].resources={}')" \
   "must declare the CPU and memory requests and limits"
+
+# priorityClassName is the placement knob that does not merely restrict: referencing a
+# PriorityClass needs no permission, so a high-priority restore pod lets the scheduler PREEMPT
+# this release's own postgresql pods -- and the SA holds delete on this Job name, so it repeats.
+kubectl get priorityclass vap-probe-high >/dev/null 2>&1 || kubectl create -f - >/dev/null <<'PC'
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: vap-probe-high
+value: 1000000
+description: "test-only: proves the restore Job cannot claim a priority class (#279)"
+PC
+assert_contains "VAP: claiming a priority class is denied" \
+  "$(admit '.spec.template.spec.priorityClassName="vap-probe-high"')" \
+  "priorityClassName other than this release"
+# A lifecycle hook runs a caller-chosen program in the pinned container without touching
+# command or args, which would make the command pin's promise untrue as written.
+assert_contains "VAP: a postStart lifecycle hook is denied" \
+  "$(admit '.spec.template.spec.containers[0].lifecycle={"postStart":{"exec":{"command":["bash","-c","id"]}}}')" \
+  "no lifecycle hooks"
+fi
 
 # --- data + a backup to restore from ---
 

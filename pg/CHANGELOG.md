@@ -25,11 +25,11 @@
   | `pg-ha/restore=<fullname>` label | provenance, and it fails closed if chart and policy drift |
   | `serviceAccountName` == the release's own SA | removes the escalation; what is left is "the privileges I already hold" |
   | `automountServiceAccountToken: false`, stated explicitly | makes SA-naming moot: the pod gets no token |
-  | no `hostNetwork` / `hostPID` / `hostIPC`, no explicit `nodeName` | no escape to the node, and no placing the pod by hand |
+  | no `hostNetwork` / `hostPID` / `hostIPC`, no explicit `nodeName`, only this release's `priorityClassName` | no escape to the node, no placing the pod by hand, and no claiming a high-priority class to make the scheduler preempt this release's own postgresql pods |
   | the **pod's own labels**, limited to this release's restore labels plus the batch controller's | a restore pod labelled `component=postgresql` would join the write Service's endpoints — Ready immediately, since it has no readiness probe — and receive application traffic and credentials |
   | no `manualSelector` | the Job's selector and identity labels stay server-assigned |
   | one container, no init or ephemeral containers, running this release's repmgr image | bounds what code enters the cluster on this token |
-  | `command` == this release's restore entrypoint, no `args` | the image pin alone is weak: the postgresql container already runs this image against this volume, so without this the Job is "run anything as the database's uid with the live PGDATA mounted" |
+  | `command` == this release's restore entrypoint, no `args`, no `lifecycle` hooks | the image pin alone is weak: the postgresql container already runs this image against this volume, so without this the Job is "run anything as the database's uid with the live PGDATA mounted" |
   | this release's pod and container `securityContext` | no `privileged`, no `runAsUser: 0`, no added capabilities — otherwise the Job is a strictly *larger* privilege set than the token started with |
   | requests and limits present; `parallelism`/`completions` ≤ 1 | the one permitted Job name is otherwise a repeatable way to fill the namespace quota and evict the database's own pods |
   | volumes limited to the three the restore template renders | with the token gone, mounting another workload's Secret was the remaining way out — this closes it, along with `hostPath` and projected tokens |
@@ -69,6 +69,12 @@
   nothing left to reject; pgBackRest's `postmaster.pid` interlock still means this needs the
   StatefulSet already scaled to 0.
 
+  Nor is the command pin a sandbox: bash reads `$BASH_ENV`, and an actor who already runs code
+  in the postgresql container can write a file into PGDATA, which this Job mounts. That
+  reaches uid 101 with no token and only this release's volumes — the privileges already held,
+  which is the bar — but the image, security-context, volume and env pins are what hold it,
+  not the command pin alone.
+
   So the policy turns "namespace-wide privilege escalation from a SQL injection" into "an
   unauthenticated trigger for this release's own restore". That is a large reduction, and it
   is what makes the feature defensible rather than advisory — but where untrusted SQL runs
@@ -94,9 +100,12 @@
   objects (or are below 1.30, or manage one policy centrally)? Set
   `repmgr.agent.control.restore.admissionPolicy.enabled: false` **and**
   `acknowledgeUnbounded: true` to keep 1.9.0's behaviour, which the render otherwise
-  refuses. Below 1.30 the render **fails with the version it detected** rather than letting
-  the apply abort halfway with "no matches for kind ValidatingAdmissionPolicy", so an
-  upgrade cannot leave a release half-applied.
+  refuses. Without the API the render **fails** rather than letting the apply abort halfway
+  with "no matches for kind ValidatingAdmissionPolicy", so an upgrade cannot leave a release
+  half-applied. The precondition checked is the presence of `admissionregistration.k8s.io/v1`,
+  not the reported Kubernetes version: with no cluster to query, `.Capabilities.KubeVersion` is
+  the *helm client's* built-in version (3.14 reports v1.29), so a version floor would break
+  every `helm template` run by an older helm regardless of the target cluster.
 - Values interpolated into the policy's CEL expressions (`pgbackrest.existingSecret.name`,
   `pgbackrest.repoEncryption.existingSecret.name`, the image reference, `fullnameOverride`)
   are now charset-validated at render time. A name containing a quote or whitespace fails

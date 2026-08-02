@@ -426,13 +426,16 @@ repmgr:
         # Kubernetes 1.30, so no webhook and nothing that can be down. It polices only this
         # release's ServiceAccount; every other creator of Jobs is untouched. The installing
         # identity needs cluster-scoped create on admissionregistration.k8s.io, and the
-        # render FAILS below Kubernetes 1.30 rather than letting the apply fail halfway.
+        # render FAILS when the cluster does not expose admissionregistration.k8s.io/v1 (GA in
+        # 1.30) rather than letting the apply fail halfway. The check is on the API group, not
+        # the reported version: with no cluster, .Capabilities.KubeVersion is the helm client's.
         #
         # Pinned: the Job's name and pg-ha/restore label, its ServiceAccount with
-        # automountServiceAccountToken=false, no host namespaces and no nodeName, the pod's
-        # own labels (so it cannot join this release's Service endpoints), no manualSelector,
-        # one container on this release's image running this release's restore command with
-        # no args, this release's pod and container security contexts (no privileged / root /
+        # automountServiceAccountToken=false, no host namespaces, no nodeName and only this
+        # release's priorityClassName, the pod's own labels (so it cannot join this release's
+        # Service endpoints), no manualSelector, one container on this release's image running
+        # this release's restore command with no args and no lifecycle hooks, this release's
+        # pod and container security contexts (no privileged / root /
         # added capabilities), requests and limits, a single pod, the three volumes the
         # restore renders, and no envFrom / no valueFrom beyond the downward API and this
         # release's own Secrets.

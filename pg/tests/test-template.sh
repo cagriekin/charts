@@ -3393,8 +3393,11 @@ assert_not_eq "#279: a hyphen-ambiguous namespace/release pair does not collide"
 # GitOps controllers, the CronJob controller -- must be untouched.
 assert_contains "#279: policed subject is pinned exactly" "${ctl_restore}" \
   "request.userInfo.username == 'system:serviceaccount:default:test-pg-repmgr'"
-assert_not_contains "#279: not a prefix/suffix match on the username" \
-  "$(grep -o 'expression: "request.userInfo.username[^"]*"' <<< "${ctl_restore}")" "endsWith("
+ctl_vap_subject=$(grep -o 'expression: "request.userInfo.username[^"]*"' <<< "${ctl_restore}")
+# Non-empty first: assert_not_contains passes on an empty haystack, so without this the check
+# below stops testing anything the moment the template emits that scalar differently.
+assert_contains "#279: the subject expression was actually extracted" "${ctl_vap_subject}" "userInfo"
+assert_not_contains "#279: not a prefix/suffix match on the username" "${ctl_vap_subject}" "endsWith("
 # The binding must NOT narrow by objectSelector: a Job created without the pg-ha/restore
 # label would then simply not match the binding, and would be admitted -- making the label
 # validation self-defeating. What the caller controls is checked by a validation, never by
@@ -3481,6 +3484,35 @@ assert_contains "#279: the pod seccomp profile is pinned to the release's own" "
   "variables.pod.securityContext.seccompProfile.type == 'RuntimeDefault'"
 assert_contains "#279: a single pod only" "${ctl_vap}" 'object.spec.parallelism <= 1'
 assert_contains "#279: requests and limits are required" "${ctl_vap}" "'cpu' in c.resources.limits"
+# priorityClassName is pinned, unlike nodeSelector/tolerations: a priority class does not
+# restrict placement, it lets the scheduler PREEMPT this release's own postgresql pods.
+assert_contains "#279: priorityClassName is pinned, not just node placement" "${ctl_vap}" \
+  '!has(variables.pod.priorityClassName)'
+ctl_vap_pcn=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set pgbackrest.cronjob.priorityClassName=db-critical --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains "#279: a values-set priority class widens the pin to exactly it" "${ctl_vap_pcn}" \
+  "variables.pod.priorityClassName == 'db-critical'"
+# A lifecycle hook runs caller-chosen code in the pinned container without touching command.
+assert_contains "#279: lifecycle hooks are denied alongside the command pin" "${ctl_vap}" '!has(c.lifecycle)'
+# An operator who empties the security contexts must not have their own restore denied:
+# `containerSecurityContext: {}` renders `securityContext: {}`, which has() sees as PRESENT,
+# so the no-values branch has to be "absent OR sets none of the pinned fields".
+ctl_vap_emptysc=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set postgresql.containerSecurityContext=null --set postgresql.podSecurityContext=null \
+  --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains "#279: emptied security contexts tolerate a present-but-empty securityContext" \
+  "${ctl_vap_emptysc}" '!has(c.securityContext) || (!has(c.securityContext.privileged)'
+# Every value reaching a single-quoted CEL literal is charset-checked, not just the obvious
+# ones: `RuntimeDefault'"'"' || true || '"'"'` renders a valid always-true expression.
+for crafted in "postgresql.podSecurityContext.seccompProfile.type=x' || true || '" \
+               "postgresql.containerSecurityContext.capabilities.add={SYS_ADMIN' || true || '}" \
+               "pgbackrest.cronjob.priorityClassName=p' || true || '"; do
+  rc=0
+  helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+    --set "${crafted}" >/dev/null 2>&1 || rc=$?
+  assert_eq "#279: a CEL tautology through ${crafted%%=*} fails the render" "1" \
+    "$([ "${rc}" -ne 0 ] && echo 1 || echo 0)"
+done
 
 # The security-context pins must MOVE with the values rather than being a fixed profile: a
 # hardcoded hardened profile would deny the release's own restore Job the moment an operator
@@ -3500,19 +3532,22 @@ assert_contains "#279 keyType=auto: only the downward API is permitted" "${ctl_v
 assert_not_contains "#279 keyType=auto: configMapKeyRef is not admitted by a bare negation" \
   "${ctl_vap}" '!has(e.valueFrom.secretKeyRef)'
 
-# Kubernetes >= 1.30 is a render-time failure, not an apply-time one: without this an upgrade
-# from 1.9.0 on an older cluster renders clean and aborts mid-apply with "no matches for kind".
-ctl_vap_129_rc=0
-helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
-  --kube-version 1.29.0 >/dev/null 2>&1 || ctl_vap_129_rc=$?
-assert_eq "#279: a cluster below 1.30 fails the render" "1" \
-  "$([ "${ctl_vap_129_rc}" -ne 0 ] && echo 1 || echo 0)"
-# ...and the acknowledged opt-out is what lets such a cluster run the feature at all.
-ctl_vap_129_ack_rc=0
-helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
-  --kube-version 1.29.0 --set repmgr.agent.control.restore.admissionPolicy.enabled=false \
-  --set repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded=true >/dev/null 2>&1 || ctl_vap_129_ack_rc=$?
-assert_eq "#279: acknowledging the trade lets a pre-1.30 cluster render" "0" "${ctl_vap_129_ack_rc}"
+# The >= 1.30 requirement is enforced by asking whether admissionregistration.k8s.io/v1
+# EXISTS, not by comparing .Capabilities.KubeVersion: with no cluster that reports the HELM
+# CLIENT's version (helm 3.14 says v1.29), so a semver floor fails every `helm template` run
+# by an older helm regardless of the target cluster. Assert the accurate shape here; the
+# negative case cannot be produced from the CLI, because --api-versions only ADDS to the
+# default set, so it lives in tests/unit/restore_admissionpolicy_nocapability_test.yaml.
+assert_contains "#279: the API-group precondition is what gates the policy" "$(cat "${CHART_DIR}/templates/agent-restore-admissionpolicy.yaml")" \
+  'APIVersions.Has "admissionregistration.k8s.io/v1"'
+assert_not_contains "#279: the client's own kube version does not gate the render" \
+  "$(cat "${CHART_DIR}/templates/agent-restore-admissionpolicy.yaml")" 'semverCompare ">=1.30'
+# An old helm renders it fine, which is the regression this replaced: no cluster, client
+# version below the floor, policy still rendered.
+ctl_vap_oldkube=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --kube-version 1.29.0 --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains "#279: a client reporting 1.29 with no cluster still renders the policy" \
+  "${ctl_vap_oldkube}" "kind: ValidatingAdmissionPolicy"
 
 # A value with a quote would produce a broken CEL expression -- or, crafted, a tautological
 # one that looks installed and enforces nothing. Both must fail the render, not the apply.

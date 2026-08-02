@@ -576,11 +576,11 @@ this release's ServiceAccount, and requires of every Job that subject creates:
 | label `pg-ha/restore=<release>-pg` | provenance; fails closed if chart and policy ever drift |
 | `serviceAccountName` == `<release>-pg-repmgr` | the escalation itself — what is left is "the privileges the token already holds" |
 | `automountServiceAccountToken: false`, stated explicitly (absent is a denial) | makes naming a ServiceAccount moot: the pod gets no token |
-| no `hostNetwork` / `hostPID` / `hostIPC`, and no explicit `nodeName` | escape to the node, and placing the pod by hand instead of through the scheduler |
+| no `hostNetwork` / `hostPID` / `hostIPC`, no explicit `nodeName`, and only this release's `priorityClassName` | escape to the node; placing the pod by hand instead of through the scheduler; and claiming a high-priority class so the scheduler **preempts this release's own postgresql pods** (referencing a PriorityClass needs no permission). `nodeSelector`/`tolerations` stay unpinned — inherited from `postgresql.*` so the restore can land where the volume attaches, and unlike priority they can only *restrict* placement |
 | the **pod's own labels**: only this release's restore labels plus the batch controller's | joining this release's Service endpoints. A restore pod labelled `component=postgresql` would be added to the write Service — with no readiness probe it is Ready at once — and would receive application traffic and its credentials |
 | no `manualSelector` | a caller-supplied Job selector and identity labels |
 | exactly one container, no init or ephemeral containers, running this release's repmgr image | what code enters the cluster on this token |
-| `command` == this release's restore entrypoint, no `args` | the image pin alone is weak — the postgresql container already runs this image against this volume. Without this, the Job is "run anything as the database's uid with the live PGDATA mounted", which destroys data with no privilege escalation at all |
+| `command` == this release's restore entrypoint, no `args`, no `lifecycle` hooks | the image pin alone is weak — the postgresql container already runs this image against this volume. Without this, the Job is "run anything as the database's uid with the live PGDATA mounted", which destroys data with no privilege escalation at all. A `postStart` exec hook would sidestep a `command`-only pin |
 | this release's **pod and container `securityContext`** (`privileged`, `allowPrivilegeEscalation`, `runAsUser`, `runAsNonRoot`, added capabilities) | a root/privileged container with `CAP_SYS_ADMIN` — which reads every other pod's token off the kubelet and is *strictly more* than the token started with |
 | CPU and memory requests and limits present; `parallelism` and `completions` ≤ 1 | one permitted Job name as a repeatable way to fill the namespace quota and evict the database's own pods |
 | volumes limited to the three the restore template renders (`emptyDir`, ConfigMap `<release>-pg-pgbackrest`, PVC `data-<release>-pg-<podOrdinal>`) | with the token gone this is the one that matters most: arbitrary Secret mounts, `hostPath`, and projected service-account tokens all fall out as denials |
@@ -609,6 +609,12 @@ cluster:
   restore over the live data directory *is* the operation being exposed, so admission has
   nothing left to reject. pgBackRest still refuses to restore while `postmaster.pid` exists,
   which in practice means this needs the StatefulSet already scaled to 0.
+- **The command pin is not a sandbox.** Bash reads `$BASH_ENV`, and an actor who already runs
+  code in the postgresql container can write a file into PGDATA — which this Job mounts. So
+  code execution inside the restore container is reachable. What it reaches is uid 101 with no
+  token and only this release's volumes: the privileges already held, which is the bar this
+  policy is written to. The image, security-context, volume and env pins are what hold that
+  bar — not the command pin alone.
 - **It is not a check that the Job matches the release in full.** CEL sees only the admission
   request, so the verbatim-`jobTemplate` clone remains what guarantees the rest. This is
   defence in depth on top of that.
@@ -641,8 +647,13 @@ Before you enable restore triggering, two operational consequences:
 - **These are this chart's only cluster-scoped objects.** The installing identity needs
   cluster-scoped `create` on `admissionregistration.k8s.io`
   (`ValidatingAdmissionPolicy`, `ValidatingAdmissionPolicyBinding`), and the cluster must be
-  **≥ 1.30** — below that the *render* fails with the version it found, rather than the apply
-  failing halfway. A default install renders neither object, so a namespace-limited installer
+  **≥ 1.30**. That is enforced by asking whether `admissionregistration.k8s.io/v1` exists, not
+  by comparing the reported Kubernetes version: with no cluster to query, `.Capabilities.
+  KubeVersion` is the *helm client's own* built-in version, so a version floor would fail
+  every `helm template` run by a slightly older helm (3.14 reports v1.29) no matter what the
+  target cluster is. Asking for the API group is also the more accurate question — it is false
+  where 1.30+ has the group disabled via `--runtime-config`. Either way the *render* fails,
+  rather than the apply failing halfway. A default install renders neither object, so a namespace-limited installer
   is unaffected until it opts in. The names carry the namespace and release for readability
   and a hash of the pair for uniqueness (`<namespace>-<release>-pg-restore-guard-<hash>`);
   the hash is the part that matters, because a plain hyphen join is ambiguous when either

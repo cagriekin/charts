@@ -2,14 +2,16 @@ suite: restore job-create admission policy (#279)
 release:
   name: test-pg
   namespace: pg-ns
-# The policy pins admissionregistration.k8s.io/v1, and the template FAILS the render below
-# Kubernetes 1.30 rather than letting the apply abort halfway. helm-unittest's default
-# capability set reports v1.20.0, so every test that renders the policy has to declare a
-# cluster that could actually run it -- which doubles as documentation of the floor. The
-# guard itself is asserted with a per-test override at the bottom of this file.
+# The template FAILS the render when the cluster does not expose
+# admissionregistration.k8s.io/v1, rather than letting the apply abort halfway. helm's own
+# no-cluster default capability set already contains that group, so `helm template` and the
+# kubeconform gate need nothing -- but helm-unittest's default set does NOT, so the suite
+# declares it here. That doubles as documentation of the precondition, and the guard's own
+# test is a separate suite (restore_admissionpolicy_nocapability_test.yaml) that declines to
+# declare it: suite-level apiVersions cannot be un-declared by a per-test override.
 capabilities:
-  majorVersion: 1
-  minorVersion: 30
+  apiVersions:
+    - admissionregistration.k8s.io/v1
 tests:
   # --- the default install is untouched ---
   #
@@ -80,8 +82,10 @@ tests:
       - matchRegex:
           path: metadata.name
           pattern: "^other-ns-test-pg-restore-guard-[0-9a-f]{8}$"
-      # Same namespace+fullname text, different split -- the pair that a hyphen join maps
-      # onto one name. The hash must differ.
+      # A different namespace must land on a different hash. This is NOT the ambiguous pair
+      # itself (other-ns/test-pg and pg-ns/test-pg differ under a plain hyphen join too);
+      # the actual collision -- db/pg-prod vs prod-db/pg -- is asserted in test-template.sh,
+      # which can render two releases in one run.
       - notMatchRegex:
           path: metadata.name
           pattern: "-ce1606a5$"
@@ -206,7 +210,7 @@ tests:
     asserts:
       - equal:
           path: spec.validations[9].expression
-          value: "variables.pod.containers.all(c, has(c.command) && c.command == ['/bin/bash', '/scripts/restore.sh'] && !has(c.args))"
+          value: "variables.pod.containers.all(c, has(c.command) && c.command == ['/bin/bash', '/scripts/restore.sh'] && !has(c.args) && !has(c.lifecycle))"
 
   # Security contexts are pinned to what THIS RELEASE renders, not to a fixed profile: the
   # default values set allowPrivilegeEscalation and runAsUser but not privileged, so the
@@ -449,36 +453,106 @@ tests:
       - failedTemplate:
           errorMessage: "a pgbackrest Secret name (pgbackrest.existingSecret.name / pgbackrest.repoEncryption.existingSecret.name) is \"dba's-key\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
-  # admissionregistration.k8s.io/v1 does not exist before 1.30. Failing the RENDER is the
-  # point: without it, an upgrade from 1.9.0 on an older cluster renders clean and then
-  # aborts mid-apply with "no matches for kind", leaving the release failed.
-  - it: a cluster below 1.30 fails the render rather than the apply
+  # priorityClassName is pinned, and it is deliberately NOT lumped in with
+  # nodeSelector/tolerations: those can only restrict where a pod runs, while a priority class
+  # lets the scheduler PREEMPT this release's own postgresql pods, and referencing one needs no
+  # permission. The parallelism cap does not help -- one pod is enough.
+  - it: priorityClassName is pinned to what the release renders
     values:
       - ../values-agent-control-restore.yaml
-    capabilities:
-      majorVersion: 1
-      minorVersion: 29
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[4].expression
+          pattern: "!has\\(variables\\.pod\\.priorityClassName\\)"
+
+  - it: a values-set priority class widens the pin to exactly that class
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.cronjob.priorityClassName: db-critical
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[4].expression
+          pattern: "variables\\.pod\\.priorityClassName == 'db-critical'"
+
+  # A postStart/preStop exec hook runs a caller-chosen program in the pinned container without
+  # touching command or args, so the command pin's promise needs it denied too.
+  - it: lifecycle hooks are denied alongside the command pin
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[9].expression
+          pattern: "!has\\(c\\.lifecycle\\)"
+
+  # An operator who empties the security contexts must not have their own restore denied.
+  # `postgresql.containerSecurityContext: {}` renders `securityContext: {}` on the Job, which
+  # has() sees as PRESENT -- so the no-values branch must be "absent OR sets none of the
+  # pinned fields", not a bare !has(). The !has(parent) || (...) shape is safe because CEL's
+  # logical operators are commutative: a true left side wins even when the right would error.
+  - it: emptied security contexts tolerate a present-but-empty securityContext
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext: null
+      postgresql.podSecurityContext: null
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "!has\\(c\\.securityContext\\) \\|\\|"
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "!has\\(variables\\.pod\\.securityContext\\) \\|\\|"
+
+  # Every value reaching a single-quoted CEL literal is charset-checked, not only the obvious
+  # ones. `RuntimeDefault' || true || '` renders a syntactically valid, ALWAYS-TRUE expression
+  # (== binds tighter than ||), so the pin silently becomes a tautology that renders and lints
+  # clean, and values.schema.json constrains none of these.
+  - it: a crafted seccomp profile type cannot turn its pin into a tautology
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.podSecurityContext.seccompProfile.type: "x' || true || '"
     templates:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "repmgr.agent.control.restore requires Kubernetes >= 1.30 for the ValidatingAdmissionPolicy that bounds its `create jobs` grant, but this cluster reports v1.29.0 (#279). Upgrade the cluster, or set repmgr.agent.control.restore.admissionPolicy.enabled=false together with acknowledgeUnbounded=true to run the feature with an unbounded grant deliberately"
+          errorMessage: "postgresql.podSecurityContext.seccompProfile.type is \"x' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
-  # ...and acknowledging the trade is what lets a pre-1.30 cluster run the feature at all.
-  - it: acknowledging the trade lets a pre-1.30 cluster render the grant
+  - it: a crafted added capability cannot turn its pin into a tautology
     values:
       - ../values-agent-control-restore.yaml
-    capabilities:
-      majorVersion: 1
-      minorVersion: 29
     set:
-      repmgr.agent.control.restore.admissionPolicy.enabled: false
-      repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
+      postgresql.containerSecurityContext.capabilities.add:
+        - "SYS_ADMIN' || true || '"
     templates:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
-      - hasDocuments:
-          count: 0
+      - failedTemplate:
+          errorMessage: "a postgresql.containerSecurityContext.capabilities.add entry is \"SYS_ADMIN' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+
+  - it: a crafted priority class name cannot turn its pin into a tautology
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.cronjob.priorityClassName: "p' || true || '"
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: "pgbackrest.cronjob.priorityClassName is \"p' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   # --- the grant and the bound cannot be separated ---
   - it: disabling the policy without acknowledging the trade fails the render
