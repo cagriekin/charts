@@ -1431,6 +1431,44 @@ entries:
   pgvector:
   - apiVersion: v2
     appVersion: "18"
+    created: "2026-08-02T13:39:51.852893099Z"
+    dependencies:
+    - name: common
+      repository: file://../common
+      version: 0.1.0
+    - condition: etcd.enabled
+      name: etcd
+      repository: file://../etcd
+      version: 0.1.5
+    description: PostgreSQL with the pgvector extension for vector search, plus repmgr
+      replication, agent failover (Kubernetes Lease or etcd-quorum DCS), optional
+      PgPool-II, S3 backups, TLS, and metrics
+    digest: 7ef6dd491db3c080d072cfeca76088c388167393c93fe3fa9455babb336815cb
+    home: https://github.com/cagriekin/charts/tree/master/pgvector
+    icon: https://wiki.postgresql.org/images/a/a4/PostgreSQL_logo.3colors.svg
+    keywords:
+    - PostgreSQL
+    - pgvector
+    - PGPool-II
+    - Vector Search
+    - Vector Database
+    maintainers:
+    - email: cagri.ekin@gmail.com
+      name: cagriekin
+      url: https://github.com/cagriekin
+    name: pgvector
+    sources:
+    - https://github.com/cagriekin/charts
+    - https://www.postgresql.org
+    - https://github.com/pgvector/pgvector
+    - https://repmgr.org
+    - https://www.pgpool.net
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/pgvector-1.10.0.tgz
+    version: 1.10.0
+  - apiVersion: v2
+    appVersion: "18"
     created: "2026-08-01T23:58:23.206787507Z"
     dependencies:
     - name: common
@@ -2961,4 +2999,4 @@ entries:
     urls:
     - https://cagriekin.github.io/charts/redis-0.2.0.tgz
     version: 0.2.0
-generated: "2026-08-02T13:39:31.811458504Z"
+generated: "2026-08-02T13:39:51.845935403Z"
