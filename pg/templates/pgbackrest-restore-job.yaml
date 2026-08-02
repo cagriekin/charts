@@ -84,8 +84,9 @@ template:
           {{- toYaml .Values.postgresql.containerSecurityContext | nindent 10 }}
         # The restore program lives in the pgbackrest ConfigMap (restore.sh), mounted
         # below -- mirrors the #38 validation rather than inlining shell here. All inputs
-        # arrive via env.
-        command: ["/bin/bash", "/scripts/restore.sh"]
+        # arrive via env. Shared with the admission policy that pins it (#279), so the pin
+        # and the command cannot drift.
+        command: {{ include "pg.restoreCommandJSON" . }}
         env:
           - name: PGBACKREST_STANZA
             value: {{ .Values.pgbackrest.stanza | quote }}

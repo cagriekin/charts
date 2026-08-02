@@ -80,10 +80,19 @@ rules:
   # What actually bounds it is NOT in this file, because the restriction has to happen at
   # a layer RBAC does not reach: the ValidatingAdmissionPolicy in
   # agent-restore-admissionpolicy.yaml (#279) restricts these creates by CONTENT -- one
-  # permitted Job name, this release's ServiceAccount, no mounted token, this release's
-  # volumes and Secrets only. It renders under the same pg.controlRestoreEnabled condition
-  # as this grant, and a values combination that would drop it fails the render, so a Role
-  # carrying this rule without that policy is not a state the chart can produce.
+  # permitted Job name, this release's ServiceAccount with no mounted token, this
+  # release's image running this release's restore command, its security contexts, volumes
+  # and Secrets, and a single pod. It renders under the same pg.controlRestoreEnabled
+  # condition as this grant, and dropping it requires setting
+  # repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded=true, which the
+  # render otherwise refuses.
+  #
+  # So this rule CAN still exist without that policy -- deliberately, for clusters below
+  # Kubernetes 1.30 and for namespace-limited installers -- and in that configuration the
+  # 1.9.0 warning applies unchanged: the grant is unbounded, and it is worth having only
+  # if API-driven restore is worth that trade. Check which state you are in with
+  # `kubectl get validatingadmissionpolicybinding -l app.kubernetes.io/instance=<release>`;
+  # do not infer it from the presence of this rule.
   #
   # Narrowing it further: the grant is rendered ONLY under
   # repmgr.agent.control.restore.enabled (default false, so a normal install's Role is

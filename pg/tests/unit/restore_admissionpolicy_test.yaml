@@ -2,6 +2,14 @@ suite: restore job-create admission policy (#279)
 release:
   name: test-pg
   namespace: pg-ns
+# The policy pins admissionregistration.k8s.io/v1, and the template FAILS the render below
+# Kubernetes 1.30 rather than letting the apply abort halfway. helm-unittest's default
+# capability set reports v1.20.0, so every test that renders the policy has to declare a
+# cluster that could actually run it -- which doubles as documentation of the floor. The
+# guard itself is asserted with a per-test override at the bottom of this file.
+capabilities:
+  majorVersion: 1
+  minorVersion: 30
 tests:
   # --- the default install is untouched ---
   #
@@ -48,16 +56,18 @@ tests:
         documentIndex: 0
       - equal:
           path: metadata.name
-          value: pg-ns-test-pg-restore-guard
+          value: pg-ns-test-pg-restore-guard-ce1606a5
         documentIndex: 0
       - equal:
           path: metadata.name
-          value: pg-ns-test-pg-restore-guard
+          value: pg-ns-test-pg-restore-guard-ce1606a5
         documentIndex: 1
 
-  # The cluster-scoped name carries the namespace: pg.fullname alone is only unique WITHIN
-  # a namespace, so two releases of this chart would otherwise contend for one policy.
-  - it: the cluster-scoped names are namespace-prefixed
+  # The cluster-scoped name carries the namespace and the release for readability, but what
+  # makes it unique is the trailing hash of the "<namespace>/<fullname>" pair: a bare hyphen
+  # join is ambiguous when either segment contains hyphens, and two releases colliding on
+  # one policy is how a release ends up with its grant and no bound (see the helper).
+  - it: the cluster-scoped name is discriminated by a hash of namespace and fullname
     values:
       - ../values-agent-control-restore.yaml
     release:
@@ -67,9 +77,14 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     documentIndex: 0
     asserts:
-      - equal:
+      - matchRegex:
           path: metadata.name
-          value: other-ns-test-pg-restore-guard
+          pattern: "^other-ns-test-pg-restore-guard-[0-9a-f]{8}$"
+      # Same namespace+fullname text, different split -- the pair that a hyphen join maps
+      # onto one name. The hash must differ.
+      - notMatchRegex:
+          path: metadata.name
+          pattern: "-ce1606a5$"
 
   # Ignore, not Fail, would silently re-open the hole on any evaluation failure -- the grant
   # rendered, the bound quietly absent. This assertion is the one that must never regress.
@@ -103,7 +118,7 @@ tests:
           path: spec.matchConditions[0].expression
           value: "request.userInfo.username == 'system:serviceaccount:pg-ns:test-pg-repmgr'"
 
-  - it: the validations pin name, label, identity, token, host namespaces, image, volumes and env
+  - it: the validations pin name, label, identity, placement and containers
     values:
       - ../values-agent-control-restore.yaml
     templates:
@@ -134,28 +149,30 @@ tests:
       - matchRegex:
           path: spec.validations[4].expression
           pattern: "hostIPC == false"
+      # nodeName bypasses the scheduler outright, so it is denied rather than pinned.
+      - matchRegex:
+          path: spec.validations[4].expression
+          pattern: "!has\\(variables\\.pod\\.nodeName\\)"
       - matchRegex:
           path: spec.validations[6].expression
+          pattern: "!has\\(object\\.spec\\.manualSelector\\)"
+      - matchRegex:
+          path: spec.validations[7].expression
+          pattern: "size\\(variables\\.pod\\.containers\\) == 1"
+      - matchRegex:
+          path: spec.validations[7].expression
+          pattern: "ephemeralContainers"
+      - matchRegex:
+          path: spec.validations[8].expression
           pattern: "c\\.image == 'cagriekin/repmgr:trixie-5\\.5\\.0-29'"
-      # Volumes: the sources the restore template actually renders, nothing else -- this is
-      # what keeps another workload's Secret out of a Job created on this token.
-      - matchRegex:
-          path: spec.validations[7].expression
-          pattern: "v\\.configMap\\.name == 'test-pg-pgbackrest'"
-      - matchRegex:
-          path: spec.validations[7].expression
-          pattern: "v\\.persistentVolumeClaim\\.claimName == 'data-test-pg-0'"
-      - matchRegex:
-          path: spec.validations[7].expression
-          pattern: "has\\(v\\.emptyDir\\)"
-      # Every validation denies rather than warns, and says what was wrong.
-      - equal:
-          path: spec.validations[0].reason
-          value: Forbidden
 
-  # The Secret allowlist is built from the same values the Job's env is built from. With
-  # shared S3 keys that is the credential Secret; nothing else in the namespace.
-  - it: the env rule allows only this release's own Secrets
+  # The pod's OWN labels, which validation #2 (the Job object's label) says nothing about.
+  # A restore pod carrying component=postgresql joins the write Service's endpoints, and a
+  # pod with no readiness probe is Ready at once -- so this is a credential-theft path, not
+  # a tidiness rule. The four batch.kubernetes.io/controller keys are in the allowlist
+  # because the API server stamps them BEFORE validating admission runs; a rule demanding
+  # exactly the chart's three labels would deny every legitimate restore.
+  - it: the pod-template labels are an allowlist of keys with this release's values pinned
     values:
       - ../values-agent-control-restore.yaml
     templates:
@@ -163,10 +180,165 @@ tests:
     documentIndex: 0
     asserts:
       - matchRegex:
-          path: spec.validations[8].expression
+          path: spec.validations[5].expression
+          pattern: "variables\\.podLabels\\.all\\(k, k in \\['app.kubernetes.io/component','app.kubernetes.io/instance','app.kubernetes.io/name','batch.kubernetes.io/controller-uid','batch.kubernetes.io/job-name','controller-uid','job-name'\\]\\)"
+      - matchRegex:
+          path: spec.validations[5].expression
+          pattern: "variables\\.podLabels\\['app.kubernetes.io/component'\\] == 'pgbackrest-restore'"
+      - matchRegex:
+          path: spec.validations[5].expression
+          pattern: "variables\\.podLabels\\['app.kubernetes.io/instance'\\] == 'test-pg'"
+      # The variable must survive an absent spec.template.metadata rather than erroring out
+      # of the expression, so the denial is the label rule's message and not a CEL fault.
+      - matchRegex:
+          path: spec.variables[1].expression
+          pattern: "has\\(object\\.spec\\.template\\.metadata\\) &&"
+
+  # The command pin is what stops "one permitted Job" from meaning "run anything you like as
+  # the database's uid with the live PGDATA mounted". Rendered from pg.restoreCommandJSON,
+  # the same definition the jobTemplate uses.
+  - it: the command is pinned to this release's restore entrypoint, with no args
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: spec.validations[9].expression
+          value: "variables.pod.containers.all(c, has(c.command) && c.command == ['/bin/bash', '/scripts/restore.sh'] && !has(c.args))"
+
+  # Security contexts are pinned to what THIS RELEASE renders, not to a fixed profile: the
+  # default values set allowPrivilegeEscalation and runAsUser but not privileged, so the
+  # policy requires those present-and-equal and privileged absent.
+  - it: the security-context pins mirror the release's own values
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "!has\\(c\\.securityContext\\.privileged\\)"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.allowPrivilegeEscalation == false"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.runAsUser == 101"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "size\\(c\\.securityContext\\.capabilities\\.add\\) == 0"
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "variables\\.pod\\.securityContext\\.runAsNonRoot == true"
+      # seccomp is pinned because the command pin does not make code execution in the restore
+      # container impossible (bash reads $BASH_ENV, and PGDATA is mounted and already writable
+      # by the actor in the threat model) -- so Unconfined would be a real step past "the
+      # privileges I already hold". Nested, so written out: has() on a leaf whose parent is
+      # absent is an evaluation error, not false.
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "variables\\.pod\\.securityContext\\.seccompProfile\\.type == 'RuntimeDefault'"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "!has\\(c\\.securityContext\\.seccompProfile\\)"
+
+  # ...and they MOVE with the values. A hardcoded hardened profile would deny the release's
+  # own restore Job the moment an operator legitimately changed the context, which is worse
+  # than no policy at all.
+  - it: a values-set privileged container widens the pin instead of denying the release
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.privileged: true
+      postgresql.containerSecurityContext.capabilities.add: [SYS_ADMIN]
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.privileged == true"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.capabilities\\.add == \\['SYS_ADMIN'\\]"
+
+  # Resources and scale: unbounded parallelism over a limitless container is the
+  # exhaustion path against the database's own nodes. The API server defaults both fields
+  # to 1 before admission, so "<= 1" is required -- "absent" would deny every restore.
+  - it: requests, limits and a single pod are required
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[12].expression
+          pattern: "'cpu' in c\\.resources\\.requests"
+      - matchRegex:
+          path: spec.validations[12].expression
+          pattern: "'memory' in c\\.resources\\.limits"
+      - equal:
+          path: spec.validations[13].expression
+          value: "(!has(object.spec.parallelism) || object.spec.parallelism <= 1) && (!has(object.spec.completions) || object.spec.completions <= 1)"
+
+  # An operator who empties restore.resources must not have their own restore denied: the
+  # rule is derived from the values, so it drops out with them.
+  - it: emptying restore.resources drops the resources rule rather than denying the restore
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.restore.resources: null
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - notMatchRegex:
+          path: spec.validations[12].expression
+          pattern: "c\\.resources"
+      # ...and the scale rule takes its place at that index, so nothing is silently lost.
+      - matchRegex:
+          path: spec.validations[12].expression
+          pattern: "object\\.spec\\.parallelism <= 1"
+
+  - it: the volume rule allows only the three sources the restore template renders
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[14].expression
+          pattern: "v\\.configMap\\.name == 'test-pg-pgbackrest'"
+      - matchRegex:
+          path: spec.validations[14].expression
+          pattern: "v\\.persistentVolumeClaim\\.claimName == 'data-test-pg-0'"
+      - matchRegex:
+          path: spec.validations[14].expression
+          pattern: "has\\(v\\.emptyDir\\)"
+      # Every validation denies rather than warns, and says what was wrong.
+      - equal:
+          path: spec.validations[14].reason
+          value: Forbidden
+
+  # The Secret allowlist is built from the same values the Job's env is built from. With
+  # shared S3 keys that is the credential Secret; nothing else in the namespace.
+  - it: the env rule allows only the downward API and this release's own Secrets
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[15].expression
           pattern: "e\\.valueFrom\\.secretKeyRef\\.name in \\['s3-backup-creds'\\]"
       - matchRegex:
-          path: spec.validations[8].expression
+          path: spec.validations[15].expression
           pattern: "!has\\(c\\.envFrom\\)"
 
   # A repo-encryption passphrase adds a second legitimate Secret; the rule has to widen
@@ -182,12 +354,14 @@ tests:
     documentIndex: 0
     asserts:
       - matchRegex:
-          path: spec.validations[8].expression
+          path: spec.validations[15].expression
           pattern: "in \\['s3-backup-creds','pgbr-cipher'\\]"
 
-  # Workload identity (keyType=auto) means the release reads no Secret at all, so the rule
-  # becomes "no secretKeyRef whatsoever" rather than an allowlist that happens to be empty.
-  - it: with no Secret of its own the env rule forbids secretKeyRef outright
+  # Workload identity (keyType=auto) means the release reads no Secret at all. The rule must
+  # stay an ALLOWLIST of sources -- fieldRef only -- and NOT degrade into "no secretKeyRef",
+  # which would admit configMapKeyRef and turn the keyless install into the one
+  # configuration where a ConfigMap in the namespace is readable.
+  - it: with no Secret of its own the env rule permits only the downward API
     values:
       - ../values-agent-control-restore.yaml
     set:
@@ -196,11 +370,14 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     documentIndex: 0
     asserts:
-      - matchRegex:
-          path: spec.validations[8].expression
+      - equal:
+          path: spec.validations[15].expression
+          value: "variables.pod.containers.all(c, !has(c.envFrom) && (!has(c.env) || c.env.all(e, !has(e.valueFrom) || (has(e.valueFrom.fieldRef)))))"
+      - notMatchRegex:
+          path: spec.validations[15].expression
           pattern: "!has\\(e\\.valueFrom\\.secretKeyRef\\)"
       - notMatchRegex:
-          path: spec.validations[8].expression
+          path: spec.validations[15].expression
           pattern: "secretKeyRef\\.name in"
 
   # --- the binding ---
@@ -218,7 +395,7 @@ tests:
     asserts:
       - equal:
           path: spec.policyName
-          value: pg-ns-test-pg-restore-guard
+          value: pg-ns-test-pg-restore-guard-ce1606a5
       - equal:
           path: spec.validationActions[0]
           value: Deny
@@ -228,12 +405,12 @@ tests:
       - isNull:
           path: spec.matchResources.objectSelector
 
-  # --- the label the policy requires must actually be on the template it clones ---
+  # --- the label and the command the policy requires must be what the CronJob renders ---
   #
   # The agent copies the CronJob's jobTemplate labels onto the Job it creates, and nothing
   # else puts labels there. If this ever regresses, validation #2 denies every API-driven
   # restore -- so it is asserted next to the policy rather than with the backup tests.
-  - it: the restore CronJob's jobTemplate carries the label the policy requires
+  - it: the restore CronJob renders the label and command the policy pins
     values:
       - ../values-agent-control-restore.yaml
     templates:
@@ -246,6 +423,62 @@ tests:
       # otherwise invites a GitOps controller to prune it mid-restore.
       - isNull:
           path: spec.jobTemplate.metadata.labels["app.kubernetes.io/managed-by"]
+      # The pod-template labels validation #6 pins, as the CronJob really renders them.
+      - equal:
+          path: spec.jobTemplate.spec.template.metadata.labels["app.kubernetes.io/component"]
+          value: pgbackrest-restore
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.containers[0].command
+          value: ["/bin/bash", "/scripts/restore.sh"]
+
+  # --- render-time validation ---
+  #
+  # A value with an apostrophe would produce a broken CEL expression that renders, lints and
+  # unit-tests clean and only fails when the API server parses the policy; `x' || true || '`
+  # would produce a TAUTOLOGY that looks installed and enforces nothing. Both are the
+  # apply-time failure the chart's render-time-validation rule exists to prevent.
+  - it: a value that cannot be embedded in a CEL literal fails the render
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.repoEncryption.enabled: true
+      pgbackrest.repoEncryption.existingSecret.name: "dba's-key"
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: "a pgbackrest Secret name (pgbackrest.existingSecret.name / pgbackrest.repoEncryption.existingSecret.name) is \"dba's-key\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+
+  # admissionregistration.k8s.io/v1 does not exist before 1.30. Failing the RENDER is the
+  # point: without it, an upgrade from 1.9.0 on an older cluster renders clean and then
+  # aborts mid-apply with "no matches for kind", leaving the release failed.
+  - it: a cluster below 1.30 fails the render rather than the apply
+    values:
+      - ../values-agent-control-restore.yaml
+    capabilities:
+      majorVersion: 1
+      minorVersion: 29
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: "repmgr.agent.control.restore requires Kubernetes >= 1.30 for the ValidatingAdmissionPolicy that bounds its `create jobs` grant, but this cluster reports v1.29.0 (#279). Upgrade the cluster, or set repmgr.agent.control.restore.admissionPolicy.enabled=false together with acknowledgeUnbounded=true to run the feature with an unbounded grant deliberately"
+
+  # ...and acknowledging the trade is what lets a pre-1.30 cluster run the feature at all.
+  - it: acknowledging the trade lets a pre-1.30 cluster render the grant
+    values:
+      - ../values-agent-control-restore.yaml
+    capabilities:
+      majorVersion: 1
+      minorVersion: 29
+    set:
+      repmgr.agent.control.restore.admissionPolicy.enabled: false
+      repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
 
   # --- the grant and the bound cannot be separated ---
   - it: disabling the policy without acknowledging the trade fails the render

@@ -11,11 +11,21 @@ Inherited from pg's symlinked templates and the shared repmgr image. See the
   grant** (#279), rendered by default when that feature is enabled. `create` on `jobs`
   cannot be scoped by `resourceName`, so 1.9.0's grant was a namespace-wide
   privilege-escalation primitive on a token that sits beside user-supplied SQL. The policy
-  restricts by **content** instead — one permitted Job name, this release's ServiceAccount,
-  no mounted token, no host namespaces, this release's image, volumes and Secrets only —
-  and polices only this release's ServiceAccount, leaving every other Job creator untouched.
-  `failurePolicy: Fail`, and rendering the grant without the policy fails the render unless
+  restricts by **content** instead — one permitted Job name, this release's ServiceAccount
+  with no mounted token, no host namespaces and no `nodeName`, the pod's own labels (so the
+  restore pod cannot join this release's Service endpoints), one container on this release's
+  image running this release's restore command with no args, this release's pod and container
+  security contexts (no privileged / root / added-capability container), requests and limits,
+  a single pod, and only this release's volumes and Secrets — and polices only this release's
+  ServiceAccount, leaving every other Job creator untouched. `failurePolicy: Fail`, and
+  rendering the grant without the policy fails the render unless
   `admissionPolicy.acknowledgeUnbounded: true` says so deliberately.
+
+  What it does **not** bound, stated plainly: the restore *parameters*. Anything holding the
+  token can still run this release's own restore over the live PGDATA without presenting a
+  certificate to the control API — that is the operation being exposed. Where untrusted SQL
+  runs and an unscheduled restore would itself be an incident, leaving `control.restore` off
+  remains the right answer.
 - The restore CronJob's `jobTemplate` now carries `pg-ha/restore=<fullname>`, so a cloned
   restore Job is selectable where before it carried no labels.
 
@@ -23,8 +33,13 @@ Inherited from pg's symlinked templates and the shared repmgr image. See the
 
 - Enabling `repmgr.agent.control.restore` now requires **Kubernetes ≥ 1.30** and
   cluster-scoped `create` on `admissionregistration.k8s.io`. A default install renders no
-  cluster-scoped objects, so nothing else changes. To keep 1.9.0's behaviour, set
+  cluster-scoped objects, so nothing else changes. Below 1.30 the **render** fails with the
+  version it detected, rather than the apply aborting halfway. To keep 1.9.0's behaviour, set
   `admissionPolicy.enabled: false` **and** `acknowledgeUnbounded: true`.
+- Secret names and image references interpolated into the policy's CEL expressions are now
+  charset-validated at render time, so a name containing a quote fails the render with the
+  value named instead of producing a policy the API server rejects — or one whose validation
+  is a tautology.
 
 ## 1.9.0 - 2026-08-01
 

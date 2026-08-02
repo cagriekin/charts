@@ -132,16 +132,27 @@ assert_eq "RBAC: still cannot read Secrets" "no" "$(can get secrets)"
 # Each case submits the Job `kubectl create job --from=cronjob/...` builds -- the same
 # clone the agent builds -- as the pods' ServiceAccount, with one field tampered.
 # --dry-run=server runs the full admission chain and creates nothing.
-GUARD="${NAMESPACE}-${FULLNAME}-restore-guard"
-assert_eq "VAP: the policy is installed" "${GUARD}" \
-  "$(kubectl get validatingadmissionpolicy "${GUARD}" -o jsonpath='{.metadata.name}' 2>/dev/null || true)"
-assert_eq "VAP: the binding is installed" "${GUARD}" \
+# The name is hash-suffixed (pg.restoreGuardName), so it is looked up by the release labels
+# rather than reconstructed here -- reconstructing it would make this suite drift from the
+# helper the moment the naming changed.
+GUARD=$(kubectl get validatingadmissionpolicy \
+  -l "app.kubernetes.io/instance=${RELEASE},app.kubernetes.io/name=pg" \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+assert_contains "VAP: the policy is installed, hash-discriminated per namespace and release" \
+  "${GUARD}" "^${NAMESPACE}-${FULLNAME}-restore-guard-[0-9a-f]\{8\}$"
+assert_eq "VAP: the binding is installed under the same name" "${GUARD}" \
   "$(kubectl get validatingadmissionpolicybinding "${GUARD}" -o jsonpath='{.metadata.name}' 2>/dev/null || true)"
 assert_eq "VAP: fails closed (Ignore would silently re-open the hole)" "Fail" \
   "$(kubectl get validatingadmissionpolicy "${GUARD}" -o jsonpath='{.spec.failurePolicy}' 2>/dev/null || true)"
 # The apiserver type-checks every expression against batch/v1 Job and reports what does not
 # resolve. A warning here means a validation that can never do its job -- and under
 # failurePolicy: Fail, one that may deny every restore instead.
+# Checked in two steps on purpose: comparing the warnings list against "" alone would pass
+# identically whether the apiserver found nothing or had not populated .status yet, so the
+# presence of the status block is asserted first.
+vap_status=$(kubectl get validatingadmissionpolicy "${GUARD}" \
+  -o jsonpath='{.status.typeChecking}' 2>/dev/null || true)
+assert_contains "VAP: the apiserver has type-checked the policy at all" "${vap_status}" "."
 vap_warnings=$(kubectl get validatingadmissionpolicy "${GUARD}" \
   -o jsonpath='{.status.typeChecking.expressionWarnings}' 2>/dev/null || true)
 [ -n "${vap_warnings}" ] && echo "  note: apiserver type-check warnings: ${vap_warnings}"
@@ -191,9 +202,9 @@ assert_contains "VAP: generateName cannot dodge the name pin" \
 assert_contains "VAP: a Job without the pg-ha/restore label is denied" \
   "$(admit '.metadata.labels={}')" "must carry pg-ha/restore"
 assert_contains "VAP: hostNetwork is denied" \
-  "$(admit '.spec.template.spec.hostNetwork=true')" "hostNetwork, hostPID and hostIPC are not permitted"
+  "$(admit '.spec.template.spec.hostNetwork=true')" "hostNetwork, hostPID, hostIPC and an explicit nodeName are not permitted"
 assert_contains "VAP: hostPID is denied" \
-  "$(admit '.spec.template.spec.hostPID=true')" "hostNetwork, hostPID and hostIPC are not permitted"
+  "$(admit '.spec.template.spec.hostPID=true')" "hostNetwork, hostPID, hostIPC and an explicit nodeName are not permitted"
 assert_contains "VAP: another image is denied" \
   "$(admit '.spec.template.spec.containers[0].image="attacker/img:1"')" "may only run this release's repmgr image"
 assert_contains "VAP: a second container is denied" \
@@ -225,6 +236,99 @@ assert_contains "VAP: envFrom is denied" \
 assert_contains "VAP: reading a ConfigMap through configMapKeyRef is denied" \
   "$(admit '.spec.template.spec.containers[0].env += [{"name":"X","valueFrom":{"configMapKeyRef":{"name":"kube-root-ca.crt","key":"ca.crt"}}}]')" \
   "may not use envFrom"
+assert_contains "VAP: a resourceFieldRef is denied (only the downward API's own metadata)" \
+  "$(admit '.spec.template.spec.containers[0].env += [{"name":"X","valueFrom":{"resourceFieldRef":{"resource":"limits.cpu"}}}]')" \
+  "may not use envFrom"
+
+# The command pin, and why it is the difference between "one permitted Job" and "run anything
+# you like as the database's uid with the live PGDATA mounted". Destroying the data directory
+# needs no privilege escalation at all, so this is asserted first among the hardening cases.
+assert_contains "VAP: an arbitrary command over the live PGDATA is denied" \
+  "$(admit '.spec.template.spec.containers[0].command=["bash","-c","rm -rf /var/lib/postgresql/data/pgdata/*"]')" \
+  "must run exactly this release's restore command"
+assert_contains "VAP: appending args to the pinned command is denied" \
+  "$(admit '.spec.template.spec.containers[0].args=["-c","id"]')" \
+  "must run exactly this release's restore command"
+assert_contains "VAP: omitting the command is denied" \
+  "$(admit 'del(.spec.template.spec.containers[0].command)')" \
+  "must run exactly this release's restore command"
+
+# Security contexts. Without these the Job is admitted as a root container with CAP_SYS_ADMIN
+# -- which reads every other pod's projected token off the kubelet, and is a strictly LARGER
+# privilege set than the token started with, making "same privileges I already hold" false.
+# privileged:true alongside allowPrivilegeEscalation:false is rejected by the apiserver's own
+# validation, so the realistic payload relaxes both.
+assert_contains "VAP: a privileged container is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.privileged=true | .spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation=true')" \
+  "must run with this release's container security context"
+assert_contains "VAP: running as uid 0 is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.runAsUser=0')" \
+  "must run with this release's container security context"
+assert_contains "VAP: adding capabilities is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.capabilities.add=["SYS_ADMIN"]')" \
+  "must run with this release's container security context"
+assert_contains "VAP: relaxing allowPrivilegeEscalation is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation=true')" \
+  "must run with this release's container security context"
+assert_contains "VAP: dropping the container securityContext entirely is denied" \
+  "$(admit 'del(.spec.template.spec.containers[0].securityContext)')" \
+  "must run with this release's container security context"
+assert_contains "VAP: overriding runAsNonRoot per-container is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.runAsNonRoot=false')" \
+  "must run with this release's container security context"
+assert_contains "VAP: relaxing the pod securityContext is denied" \
+  "$(admit '.spec.template.spec.securityContext.runAsNonRoot=false')" \
+  "must run with this release's pod security context"
+# seccomp is pinned because the command pin does NOT make code execution in this container
+# impossible: bash reads $BASH_ENV, and an actor who already runs code in the postgresql
+# container can write a file into PGDATA -- which this Job mounts -- and point at it. That
+# buys only the privileges already held; Unconfined would be a step past them.
+assert_contains "VAP: relaxing the pod seccomp profile to Unconfined is denied" \
+  "$(admit '.spec.template.spec.securityContext.seccompProfile.type="Unconfined"')" \
+  "must run with this release's pod security context"
+assert_contains "VAP: setting a container seccomp profile the release does not is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.seccompProfile.type="Unconfined"')" \
+  "must run with this release's container security context"
+
+# The pod's OWN labels. The Job object's label (asserted above) says nothing about the pod,
+# and the primary Service selects pg.selectorLabels + component=postgresql: a restore pod
+# wearing those joins the write Service's endpoints, is Ready at once (it has no readiness
+# probe), and receives application traffic and its credentials.
+assert_contains "VAP: relabelling the pod onto the primary Service is denied" \
+  "$(admit '.spec.template.metadata.labels."app.kubernetes.io/component"="postgresql"')" \
+  "may carry only this release's restore pod labels"
+assert_contains "VAP: an extra Service-selector label on the pod is denied" \
+  "$(admit '.spec.template.metadata.labels."statefulset.kubernetes.io/pod-name"="'"${FULLNAME}"'-0"')" \
+  "may carry only this release's restore pod labels"
+assert_contains "VAP: stripping the pod labels is denied" \
+  "$(admit 'del(.spec.template.metadata.labels)')" \
+  "may carry only this release's restore pod labels"
+# ...and the four labels the APISERVER stamps on a Job's pod template must NOT trip that rule:
+# the batch strategy runs before validating admission, so they are already on the object. This
+# is the direction that breaks the feature if the allowlist forgets them.
+assert_eq "VAP: the server-stamped batch controller labels do not trip the pod-label rule" \
+  "allowed" "$(admit '.')"
+
+# manualSelector turns off the server-side selector and identity labels the rule above is
+# written around. Built-in Job validation requires spec.selector to match the pod template
+# labels, so the only payload that reaches the policy is one mirroring the pinned labels.
+assert_contains "VAP: manualSelector is denied" \
+  "$(admit '.spec.manualSelector=true | .spec.selector={"matchLabels":{"app.kubernetes.io/name":"pg","app.kubernetes.io/instance":"'"${RELEASE}"'","app.kubernetes.io/component":"pgbackrest-restore"}}')" \
+  "may not set manualSelector"
+
+# Placement and scale. nodeName bypasses the scheduler and its taints outright; unbounded
+# parallelism over a limitless container turns the one permitted Job name into a repeatable
+# way to fill the namespace quota and evict the database's own pods.
+assert_contains "VAP: an explicit nodeName is denied" \
+  "$(admit '.spec.template.spec.nodeName="'"$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')"'"')" \
+  "an explicit nodeName are not permitted"
+assert_contains "VAP: parallelism above one is denied" \
+  "$(admit '.spec.parallelism=200')" "must run a single pod"
+assert_contains "VAP: completions above one is denied" \
+  "$(admit '.spec.completions=200')" "must run a single pod"
+assert_contains "VAP: a container with no requests or limits is denied" \
+  "$(admit '.spec.template.spec.containers[0].resources={}')" \
+  "must declare the CPU and memory requests and limits"
 
 # --- data + a backup to restore from ---
 

@@ -710,14 +710,79 @@ with: {{- if eq (include "pg.agentMode" .) "true" }}
 {{- end -}}
 
 {{- /* Name of the ValidatingAdmissionPolicy (and its binding) that bounds the restore
-       Job-create grant (#279). Both objects are CLUSTER-scoped, so the name is prefixed
-       with the release namespace: pg.fullname is only namespace-unique, and two releases
-       of this chart in different namespaces would otherwise fight over one policy object.
-       Worst case is 63 (namespace) + 1 + 63 (fullname) + 14 = 141 characters, comfortably
-       inside the 253-character DNS-subdomain limit these kinds validate against, so no
-       truncation (which could collide two releases onto one policy) is needed. */ -}}
+       Job-create grant (#279). Both objects are CLUSTER-scoped, so the name has to be
+       unique per (namespace, release): pg.fullname alone is only namespace-unique, and two
+       releases in different namespaces would otherwise fight over one policy object.
+
+       The namespace and fullname are there to be read, but they are NOT what makes the
+       name unique -- joining them with a hyphen is ambiguous, because both segments may
+       contain hyphens themselves ("db" in namespace "pg-prod" and "prod-db" in namespace
+       "pg" both produce pg-prod-db-restore-guard). The trailing hash of the unambiguous
+       "<namespace>/<fullname>" pair is the actual discriminator. That matters more than it
+       looks: on a collision the second install fails with an ownership error, and an
+       operator who resolves it by adoption -- or who later uninstalls the first release --
+       leaves the survivor's `create jobs` grant with no policy bounding it, which is the
+       exact state #279 exists to make unreachable.
+
+       Worst case is 63 (namespace) + 1 + 63 (fullname) + 14 + 9 = 150 characters, inside
+       the 253-character DNS-subdomain limit these kinds validate against, so nothing is
+       truncated (truncation would reintroduce collisions). */ -}}
 {{- define "pg.restoreGuardName" -}}
-{{- printf "%s-%s-restore-guard" .Release.Namespace (include "pg.fullname" .) -}}
+{{- $fullname := include "pg.fullname" . -}}
+{{- printf "%s-%s-restore-guard-%s" .Release.Namespace $fullname (printf "%s/%s" .Release.Namespace $fullname | sha256sum | trunc 8) -}}
+{{- end -}}
+
+{{- /* The restore container's command, defined once (#279). pgbackrest-restore-job.yaml
+       renders it as YAML flow style and agent-restore-admissionpolicy.yaml pins it as a
+       CEL list literal (the same text with CEL's single quotes), so the policy cannot
+       drift from the command it is meant to pin. */ -}}
+{{- define "pg.restoreCommandJSON" -}}
+["/bin/bash", "/scripts/restore.sh"]
+{{- end -}}
+
+{{- /* CEL fragment pinning one scalar field to exactly what the chart renders (#279):
+       "present and equal" when the release's values set the field, "absent" when they do
+       not -- which is precisely the shape the rendered Job has, so the policy can never
+       deny the release's own restore. Args: (list <CEL path> <values dict> <key>). */ -}}
+{{- define "pg.celScalarPin" -}}
+{{- $path := index . 0 -}}
+{{- $src := index . 1 -}}
+{{- $key := index . 2 -}}
+{{- if hasKey $src $key -}}
+{{- $v := index $src $key -}}
+{{- if kindIs "string" $v -}}
+(has({{ $path }}) && {{ $path }} == '{{ $v }}')
+{{- else -}}
+(has({{ $path }}) && {{ $path }} == {{ $v }})
+{{- end -}}
+{{- else -}}
+!has({{ $path }})
+{{- end -}}
+{{- end -}}
+
+{{- /* Reject values that cannot be safely interpolated into a single-quoted CEL string
+       literal (#279). agent-restore-admissionpolicy.yaml embeds names straight into CEL
+       expressions -- 'PGBACKREST_REPO1_S3_KEY' style Secret names, the image reference,
+       the namespace, the fullname -- and CEL has no escaping helper on the helm side. A
+       value containing an apostrophe produces a syntactically broken expression that
+       renders, lints and unit-tests clean and only fails when the API server parses the
+       policy; a crafted value (`x' || true || '`) would instead produce a TAUTOLOGICAL
+       validation, leaving a policy that looks installed and enforces nothing. Both are
+       exactly the apply-time failure the chart's render-time-validation rule exists to
+       prevent, so the charset is checked here instead.
+
+       The allowed set is the union of what Kubernetes object names and OCI image
+       references need: alphanumerics plus . _ - / : @ (no quotes, no backslash, no
+       whitespace). Callers pass a list of (label, value) pairs so the message can say
+       which input was wrong. */ -}}
+{{- define "pg.validateCelLiterals" -}}
+{{- range $pair := . -}}
+{{- $label := index $pair 0 -}}
+{{- $value := index $pair 1 | toString -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._:/@-]*$" $value) -}}
+{{- fail (printf "%s is %q, which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $label $value) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{- /* True in agent mode when the leadership backend is etcd (repmgr.agent.dcs.backend

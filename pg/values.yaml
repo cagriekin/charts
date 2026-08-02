@@ -477,14 +477,28 @@ repmgr:
         #
         # What it checks: the Job's name (the deterministic one the agent uses, which is the
         # resourceName restriction RBAC refused to give), its pg-ha/restore label, its
-        # ServiceAccount, automountServiceAccountToken=false, no host namespaces, one
-        # container running this release's image, volumes limited to the three the restore
-        # template renders, and no envFrom / no Secret references beyond this release's own.
+        # ServiceAccount, automountServiceAccountToken=false, no host namespaces and no
+        # explicit nodeName, the pod's own labels (so the restore pod cannot join this
+        # release's Service endpoints), no manualSelector, one container running this
+        # release's image and this release's restore command with no args, this release's
+        # pod and container security contexts (so no privileged / root / added-capability
+        # container), CPU and memory requests and limits, a single pod (parallelism and
+        # completions <= 1), volumes limited to the three the restore template renders, and
+        # no envFrom / no valueFrom beyond the downward API and this release's own Secrets.
         #
-        # Two consequences worth knowing before you install:
+        # What it does NOT bound, because a restore cannot be expressed without it: the
+        # restore PARAMETERS. Anything holding the token can still run this release's own
+        # restore against a target of its choosing, over the live PGDATA, without passing
+        # the control API's mTLS. That is the operation the feature exposes; see the
+        # "Bounding the job-create grant" section of README.md before enabling it on a
+        # cluster running untrusted SQL.
+        #
+        # Three consequences worth knowing before you install:
         #   * The installing identity needs cluster-scoped create on
         #     admissionregistration.k8s.io ValidatingAdmissionPolicy/-Binding. A namespace-
         #     limited installer cannot render this (see acknowledgeUnbounded below).
+        #   * Kubernetes >= 1.30 is required, and the render FAILS below that rather than
+        #     letting the apply fail halfway.
         #   * A cluster whose mutating admission rewrites JOB objects (not pod specs --
         #     sidecar injectors act on Pods and are unaffected) can make the rendered Job
         #     stop matching, which shows up as a denial naming the exact field.
