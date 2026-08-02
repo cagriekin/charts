@@ -10,6 +10,12 @@ suite: restore admission policy without the API group (#279)
 release:
   name: test-pg
   namespace: pg-ns
+# majorVersion/minorVersion are pinned only because the message quotes the reported version;
+# they are NOT what the guard checks. apiVersions is deliberately left undeclared -- the absent
+# API group is the case under test, and helm-unittest's default set does not include it.
+capabilities:
+  majorVersion: 1
+  minorVersion: 29
 tests:
   # Failing the RENDER is the point. Without it, an upgrade from 1.9.0 on a cluster below
   # 1.30 -- or one where --runtime-config disabled the group -- renders clean and then aborts
@@ -21,7 +27,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "repmgr.agent.control.restore needs admissionregistration.k8s.io/v1 for the ValidatingAdmissionPolicy that bounds its `create jobs` grant, and this cluster does not expose it -- it is GA from Kubernetes 1.30 (this cluster reports v1.20.0), and can also be disabled by --runtime-config (#279). Upgrade or enable the API, or set repmgr.agent.control.restore.admissionPolicy.enabled=false together with acknowledgeUnbounded=true to run the feature with an unbounded grant deliberately"
+          errorMessage: "repmgr.agent.control.restore needs admissionregistration.k8s.io/v1 for the ValidatingAdmissionPolicy that bounds its `create jobs` grant, and this cluster does not expose it -- it is GA from Kubernetes 1.30 (this cluster reports v1.29.0), and can also be disabled by --runtime-config (#279). Upgrade or enable the API, or set repmgr.agent.control.restore.admissionPolicy.enabled=false together with acknowledgeUnbounded=true to run the feature with an unbounded grant deliberately"
 
   # ...and acknowledging the trade is what lets such a cluster run the feature at all. This is
   # the documented path for a pre-1.30 cluster and for a namespace-limited installer.

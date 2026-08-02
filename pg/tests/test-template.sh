@@ -3505,13 +3505,19 @@ assert_contains "#279: emptied security contexts tolerate a present-but-empty se
 # Every value reaching a single-quoted CEL literal is charset-checked, not just the obvious
 # ones: `RuntimeDefault'"'"' || true || '"'"'` renders a valid always-true expression.
 for crafted in "postgresql.podSecurityContext.seccompProfile.type=x' || true || '" \
+               "postgresql.containerSecurityContext.seccompProfile.type=x' || true || '" \
                "postgresql.containerSecurityContext.capabilities.add={SYS_ADMIN' || true || '}" \
                "pgbackrest.cronjob.priorityClassName=p' || true || '"; do
   rc=0
-  helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
-    --set "${crafted}" >/dev/null 2>&1 || rc=$?
+  crafted_out=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+    --set "${crafted}" 2>&1) || rc=$?
   assert_eq "#279: a CEL tautology through ${crafted%%=*} fails the render" "1" \
     "$([ "${rc}" -ne 0 ] && echo 1 || echo 0)"
+  # Non-zero alone is not enough: a render that failed for an unrelated reason (a future
+  # schema constraint on these values, say) would keep this passing while the charset guard
+  # stopped being exercised.
+  assert_contains "#279: ...and it is the CEL-literal guard that rejected it" "${crafted_out}" \
+    "cannot be embedded in the restore admission policy"
 done
 
 # The security-context pins must MOVE with the values rather than being a fixed profile: a
