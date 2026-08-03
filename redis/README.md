@@ -222,6 +222,7 @@ window.
 | `redis.config.maxmemory` / `maxmemory-policy` | Memory cap / eviction | `200mb` / `allkeys-lru` |
 | `redis.config.appendfsync` | AOF sync (`always`/`everysec`/`no`) | `everysec` |
 | `exporter.enabled` | Prometheus exporter (sidecar in replication) | `true` |
+| `exporter.podAnnotations` | Annotations on the standalone exporter pod (e.g. `prometheus.io/scrape`); use `redis.podAnnotations` in replication | `{}` |
 | `exporter.serviceMonitor.enabled` / `exporter.prometheusRule.enabled` | ServiceMonitor / alerts | `true` / `false` |
 | `exporter.serviceMonitor.interval` / `scrapeTimeout` | Prometheus scrape interval / timeout | `30s` / `10s` |
 | `exporter.connectionTimeout` | Go-duration connect timeout to Redis (empty = exporter default 15s) | `""` |
@@ -243,6 +244,33 @@ role and replication metrics are scraped. Enabling `exporter.prometheusRule.enab
 HA alerts: `RedisDown`/`RedisNoMaster`, `RedisMultipleMasters` (split-brain),
 `RedisReplicaDown`, `RedisReplicationLinkDown`, and `RedisWritesBlocked` (the
 `min-replicas-to-write` tripwire). Standalone keeps the original single-instance alerts.
+
+### Annotation-based scrapers
+
+`exporter.serviceMonitor.enabled` only helps if a Prometheus Operator is watching (and its
+`serviceMonitorSelector` matches — pass `exporter.serviceMonitor.additionalLabels` such as
+`release: <prometheus-release>` when it does not). Agents that discover targets from pod
+annotations instead (Grafana Alloy, plain Prometheus `kubernetes_sd_configs` with a
+`prometheus.io/scrape` keep rule) need the annotations on the pod:
+
+```yaml
+# standalone: the exporter is its own Deployment
+exporter:
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9121"
+    prometheus.io/path: "/metrics"
+
+# replication: the exporter is a sidecar, so annotate the redis pods
+redis:
+  podAnnotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9121"
+    prometheus.io/path: "/metrics"
+```
+
+Without them such an agent sees no `redis_up` at all, which reads as "no data" on dashboards
+rather than as a failure.
 
 ### Exporter tuning
 

@@ -7,6 +7,7 @@
   "nameSuffix"      "exporter"
   "labels"          "redis.labels"
   "selectorLabels"  "redis.selectorLabels"
+  "podAnnotations"  .Values.exporter.podAnnotations
   "podSpec"         "redis.exporterPodSpec"
 ) }}
 {{- end }}

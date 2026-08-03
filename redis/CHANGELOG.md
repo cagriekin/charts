@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.5.2 - 2026-08-03
+
+Bugfix: the standalone exporter Deployment can now carry pod annotations (additive; default
+`{}` renders no new manifest fields, so existing installs are unchanged).
+
+### Fixed
+- **`architecture: standalone` had no way to annotate the exporter pod.** The exporter runs
+  as its own Deployment there, and the template passed no `podAnnotations` to
+  `common.exporterDeployment` — `redis.podAnnotations` only reaches the StatefulSet. Agents
+  that discover targets from pod annotations (Grafana Alloy, Prometheus
+  `kubernetes_sd_configs` with a `prometheus.io/scrape` keep rule) therefore never scraped a
+  standalone install's exporter, and `exporter.serviceMonitor.enabled` is no help without a
+  Prometheus Operator. `redis_up` was absent entirely, which surfaces as "no data" rather
+  than as a down signal.
+
+### Added
+- `exporter.podAnnotations` (default `{}`) — annotations for the standalone exporter
+  Deployment's pod template. No-op in replication, where the exporter is a sidecar and
+  `redis.podAnnotations` already applies.
+- README "Annotation-based scrapers" section: when a ServiceMonitor is not enough, and the
+  annotation snippet for each architecture.
+
 ## 1.5.0 - 2026-07-01
 
 PVC lifecycle documentation and a retention knob (additive; `redis.persistence.retain`
