@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Policy-as-code gate (#193): lint every installable chart against the CLAUDE.md Helm
+# Policy-as-code gate (#193): lint every installable chart against the documented Helm
 # standards encoded in .kube-linter.yaml (resource requests/limits + liveness/readiness
 # probes). kube-linter renders the chart itself. Runs in CI (lint.yaml) and locally.
 # Requires: kube-linter.
