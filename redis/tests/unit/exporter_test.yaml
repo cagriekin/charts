@@ -172,3 +172,29 @@ tests:
               secretKeyRef:
                 name: my-extra-secret
                 key: token
+
+  - it: podAnnotations land on the exporter pod template
+    values:
+      - ../values-full-test.yaml
+    set:
+      exporter.podAnnotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
+        prometheus.io/path: /metrics
+    asserts:
+      - equal:
+          path: spec.template.metadata.annotations["prometheus.io/scrape"]
+          value: "true"
+      - equal:
+          path: spec.template.metadata.annotations["prometheus.io/port"]
+          value: "9121"
+      - equal:
+          path: spec.template.metadata.annotations["prometheus.io/path"]
+          value: /metrics
+
+  - it: no podAnnotations - exporter pod template has no annotations
+    values:
+      - ../values-full-test.yaml
+    asserts:
+      - notExists:
+          path: spec.template.metadata.annotations

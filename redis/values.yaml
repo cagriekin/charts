@@ -237,6 +237,14 @@ tls:
 exporter:
   enabled: true
 
+  # Annotations on the standalone exporter Deployment's pod template. Needed by
+  # annotation-based scrapers (Grafana Alloy / Prometheus pod-annotation discovery),
+  # which never see the exporter otherwise: e.g. prometheus.io/scrape: "true",
+  # prometheus.io/port: "9121", prometheus.io/path: "/metrics".
+  # No-op in replication -- there the exporter is a sidecar in the StatefulSet, so
+  # use redis.podAnnotations instead.
+  podAnnotations: {}
+
   podSecurityContext:
     runAsNonRoot: true
     seccompProfile:
