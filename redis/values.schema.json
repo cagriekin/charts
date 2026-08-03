@@ -159,6 +159,10 @@
           }
         },
         "connectionTimeout": { "type": "string" },
+        "podAnnotations": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
         "logFormat": {
           "enum": ["", "txt", "json"]
         },
