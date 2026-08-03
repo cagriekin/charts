@@ -125,7 +125,7 @@
 {{- end }}
 {{- end }}
 {{- /* Bundled etcd consistency: the subchart deploys 3 stateful pods, so reject the
-       contradictory inputs that would silently orphan them (fail-fast, CLAUDE.md). */}}
+       contradictory inputs that would silently orphan them (fail-fast). */}}
 {{- if (.Values.etcd).enabled }}
 {{- if ne (include "pg.agentEtcdMode" .) "true" }}
 {{- fail "etcd.enabled=true deploys a bundled etcd cluster, but the agent etcd backend is not active (it would be left unused). Set repmgr.failoverMode=agent and repmgr.agent.dcs.backend=etcd, or set etcd.enabled=false" }}

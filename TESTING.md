@@ -16,7 +16,7 @@ The charts are tested in layers, fast to slow. The first three run on every PR (
 
 | Tool | What it checks | Run locally |
 | --- | --- | --- |
-| **kube-linter** | The mandatory CLAUDE.md Helm standards as policy-as-code: resource requests/limits, and liveness/readiness probes. Config: `.kube-linter.yaml` (only these checks; legitimate exceptions are waived per-object with an `ignore-check.kube-linter.io/<check>` annotation). | `bash scripts/kube-linter-charts.sh` |
+| **kube-linter** | The mandatory documented Helm standards as policy-as-code: resource requests/limits, and liveness/readiness probes. Config: `.kube-linter.yaml` (only these checks; legitimate exceptions are waived per-object with an `ignore-check.kube-linter.io/<check>` annotation). | `bash scripts/kube-linter-charts.sh` |
 
 ## 3. Integration (real cluster — KinD)
 

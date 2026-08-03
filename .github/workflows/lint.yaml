@@ -87,7 +87,7 @@ jobs:
         if: steps.detect.outputs.run == 'true'
         run: bash scripts/kubeconform-charts.sh
 
-      # Enforce the CLAUDE.md Helm standards as policy-as-code (#193).
+      # Enforce the documented Helm standards as policy-as-code (#193).
       - name: Policy gate (kube-linter)
         if: steps.detect.outputs.run == 'true'
         run: bash scripts/kube-linter-charts.sh
