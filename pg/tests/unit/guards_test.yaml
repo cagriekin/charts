@@ -3,22 +3,59 @@ release:
   name: test-pg
 tests:
   # --- Scenario 9: schema enum guards ---
-  - it: invalid failoverMode is rejected
-    templates:
-      - templates/statefulset.yaml
-    set:
-      repmgr.failoverMode: bogus
-    asserts:
-      - failedTemplate: {}
-
   - it: invalid agent dcs backend is rejected
     templates:
       - templates/statefulset.yaml
     set:
-      repmgr.failoverMode: agent
       repmgr.agent.dcs.backend: zookeeper
     asserts:
       - failedTemplate: {}
+
+  # --- #286: the removed repmgrd keys fail the render rather than being ignored ---
+  - it: repmgr.failoverMode=repmgrd is rejected and warns about the immutable field
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.failoverMode: repmgrd
+    asserts:
+      - failedTemplate:
+          errorPattern: "repmgr.failoverMode was removed in chart 2.0.0.*IMMUTABLE"
+
+  - it: repmgr.failoverMode=agent is rejected as a no-op key
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.failoverMode: agent
+    asserts:
+      - failedTemplate:
+          errorPattern: "repmgr.failoverMode was removed in chart 2.0.0"
+
+  - it: repmgr.serviceUpdater is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.serviceUpdater.resources.requests.cpu: 50m
+    asserts:
+      - failedTemplate:
+          errorPattern: "repmgr.serviceUpdater.* was removed in chart 2.0.0"
+
+  - it: repmgr.monitoringHistoryDays is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.monitoringHistoryDays: 7
+    asserts:
+      - failedTemplate:
+          errorPattern: "repmgr.monitoringHistoryDays was removed in chart 2.0.0"
+
+  - it: pgpool.autoFailback is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      pgpool.autoFailback: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "pgpool.autoFailback was removed in chart 2.0.0"
 
   # --- Scenario 10: standalone replica guard ---
   - it: standalone with replicas > 0 fails fast
@@ -113,7 +150,7 @@ tests:
           emptyDir: {}
     asserts:
       - failedTemplate:
-          errorMessage: 'postgresql.extraVolumes[0]: "data" is a chart-managed volume name and may not be reused (reserved: data, postgresql-config, postgresql-tls, ext-lib, ext-share, repmgr-config, etcd-tls, pg-run, pgbackrest-config, service-updater-script). With persistence enabled a "data" volume is silently discarded in favour of the volumeClaimTemplate; with persistence disabled the duplicate name is rejected by the API server. Pick a distinct name.'
+          errorMessage: 'postgresql.extraVolumes[0]: "data" is a chart-managed volume name and may not be reused (reserved: data, postgresql-config, postgresql-tls, ext-lib, ext-share, repmgr-config, etcd-tls, pg-run, pgbackrest-config). With persistence enabled a "data" volume is silently discarded in favour of the volumeClaimTemplate; with persistence disabled the duplicate name is rejected by the API server. Pick a distinct name.'
 
   - it: extraVolumes colliding with an internal volume (repmgr-config) fails render
     templates:

@@ -178,28 +178,6 @@ if [[ "${promoted}" == "true" ]]; then
 fi
 
 # ======================================================================
-# repmgrd mode: optional server TLS (ssl=on). require/mTLS is render-guarded
-# off in repmgrd; this proves the server-TLS conf.d path works there too.
-# ======================================================================
-RELEASE2="pgtlsr"; NS2="${NAMESPACE}-repmgrd"
-F2=$(resolve_fullname "${RELEASE2}" "${CHART_DIR}" "${SCRIPT_DIR}/values-agent.yaml")
-kubectl create namespace "${NS2}" --dry-run=client -o yaml | kubectl apply -f -
-kubectl delete secret postgresql-tls -n "${NS2}" --ignore-not-found >/dev/null 2>&1 || true
-kubectl create secret generic postgresql-tls -n "${NS2}" \
-  --from-file=tls.crt="${CERTDIR}/server.crt" --from-file=tls.key="${CERTDIR}/server.key" \
-  --from-file=ca.crt="${CERTDIR}/ca.crt" >/dev/null
-helm upgrade --install "${RELEASE2}" "${CHART_DIR}" -n "${NS2}" \
-  -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.failoverMode=repmgrd \
-  --set repmgr.image.tag=trixie-5.5.0-26 `# set-pg-major: keep (repmgrd on an older released image)` \
-  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=postgresql-tls \
-  --wait --timeout 10m
-wait_for_pods_ready "${NS2}" "app.kubernetes.io/component=postgresql" 2 600
-ssl_r=$(pg_exec "${NS2}" "${F2}-0" "SHOW ssl" "testuser" "testdb" 2>/dev/null || echo "")
-[ "${ssl_r}" != "on" ] && ssl_r=$(pg_exec "${NS2}" "${F2}-1" "SHOW ssl" "testuser" "testdb" 2>/dev/null || echo "")
-assert_eq "#110 repmgrd: optional server TLS works (ssl = on)" "on" "${ssl_r}"
-
-# ======================================================================
 # Standalone (repmgr off, replicaCount 0): server TLS over the conf.d include with NO
 # repmgr/agent. Exercises the volumes:/annotations: gate fix live -- the cert volume must
 # render alongside its mount and the single postgres pod must start with ssl=on.

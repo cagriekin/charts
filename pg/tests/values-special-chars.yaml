@@ -84,7 +84,6 @@ pgpool:
     retryDelay: 3
 
   failOverOnBackendError: false
-  autoFailback: false
 
   logging:
     logConnections: true

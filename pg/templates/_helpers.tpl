@@ -385,7 +385,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
              would silently win over the chart/Secret value -- pointing the postmaster at
              the wrong data directory or breaking auth cluster-wide. */ -}}
 {{- define "pg.validateExtraPassthrough" -}}
-{{- $chartVolumes := list "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "repmgr-config" "etcd-tls" "pg-run" "pgbackrest-config" "service-updater-script" -}}
+{{- $chartVolumes := list "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "repmgr-config" "etcd-tls" "pg-run" "pgbackrest-config" -}}
 {{- /* Env vars the chart sets on the postgresql container (see statefulset.yaml). Reserved
        UNCONDITIONALLY -- including the ones only a currently-disabled feature emits -- so a
        passthrough that works today cannot start silently shadowing a chart value after a
@@ -399,7 +399,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
       "MONITORING_USER" "MIGRATE_LEGACY_MD5_USERS" "SPLIT_BRAIN_ACTION"
       "DCS_BACKEND" "ETCD_ENDPOINTS" "ETCD_PREFIX" "ETCD_TLS_CERT" "ETCD_TLS_KEY" "ETCD_TLS_CA"
       "PGBACKREST_ENABLED" "PGBACKREST_STANZA" "PGBACKREST_REPO1_CIPHER_PASS"
-      "PGBACKREST_REPO1_S3_KEY" "PGBACKREST_REPO1_S3_KEY_SECRET" "MONITORING_HISTORY_DAYS" -}}
+      "PGBACKREST_REPO1_S3_KEY" "PGBACKREST_REPO1_S3_KEY_SECRET" -}}
 {{- /* g1: shape. `with` is not used -- an explicitly-set map must reach the check. */ -}}
 {{- range $key := list "extraVolumes" "extraVolumeMounts" "extraEnv" -}}
   {{- $val := index $.Values.postgresql $key -}}
@@ -488,22 +488,6 @@ decides (http 80, anything else 443).
 {{- else -}}
 443
 {{- end -}}
-{{- end }}
-
-{{- define "pg.preStop" -}}
-preStop:
-  exec:
-    command:
-      - /bin/bash
-      - -c
-      - |
-        # Stop cleanly and let repmgrd on a standby own the failover:
-        # its promote_command (repmgr standby promote) updates
-        # repmgr.nodes metadata, which a raw SQL-level promotion issued
-        # from this hook cannot do -- the promoted node would keep
-        # type='standby', and every repmgrd then exits on the stale
-        # metadata instead of converging.
-        pg_ctl stop -D "$PGDATA" -m fast -w -t 30
 {{- end }}
 
 {{- define "pg.exporterPodSpec" -}}
@@ -677,27 +661,40 @@ volumes:
 {{- end }}
 {{- end }}
 
-{{/*
-Failover mode (repmgrd default | agent). Fails fast on an unknown value.
-*/}}
-{{- define "pg.failoverMode" -}}
-{{- $m := .Values.repmgr.failoverMode | default "repmgrd" -}}
-{{- if not (or (eq $m "repmgrd") (eq $m "agent")) -}}
-{{- fail (printf "repmgr.failoverMode must be 'repmgrd' or 'agent', got %q" $m) -}}
+{{- /* The repmgrd failover path was removed in 2.0.0 (#286): the lease-based Go agent has
+       been the default since 1.0.0 and repmgrd was deprecated for one major cycle. The keys
+       that only ever configured repmgrd are gone, and a values file still carrying them
+       would otherwise deploy an agent cluster while its author believes repmgrd is running
+       -- silence here is the dangerous outcome, so fail at render time (invariant 4). */ -}}
+{{- define "pg.validateRemovedRepmgrdValues" -}}
+{{- if hasKey .Values.repmgr "failoverMode" -}}
+{{- $m := .Values.repmgr.failoverMode | toString -}}
+{{- if eq $m "agent" -}}
+{{- fail "repmgr.failoverMode was removed in chart 2.0.0: the lease-based agent is now the only failover path, so `failoverMode: agent` no longer means anything. Delete this key -- nothing else changes for you, and the agent is still tuned under repmgr.agent.*." -}}
+{{- else -}}
+{{- fail (printf "repmgr.failoverMode was removed in chart 2.0.0 (got %q): repmgrd and its service-updater sidecar are gone, and the lease-based agent is now the only failover path. Deleting this key switches this release to the agent -- which also flips the StatefulSet's podManagementPolicy from OrderedReady to Parallel, and that field is IMMUTABLE. Read the 2.0.0 upgrade note in CHANGELOG.md before upgrading: the StatefulSet has to be recreated with `kubectl delete sts <name> --cascade=orphan`." $m) -}}
 {{- end -}}
-{{- $m -}}
+{{- end -}}
+{{- if hasKey .Values.repmgr "serviceUpdater" -}}
+{{- fail "repmgr.serviceUpdater.* was removed in chart 2.0.0: the service-updater sidecar only existed to reconcile PGPool backends after a repmgrd failover, and the agent does that itself. Delete this key." -}}
+{{- end -}}
+{{- if hasKey .Values.repmgr "monitoringHistoryDays" -}}
+{{- fail "repmgr.monitoringHistoryDays was removed in chart 2.0.0: it pruned repmgr.monitoring_history, which only repmgrd ever wrote. Delete this key." -}}
+{{- end -}}
+{{- if hasKey .Values.pgpool "autoFailback" -}}
+{{- fail "pgpool.autoFailback was removed in chart 2.0.0: it rendered PGPool's auto_failback, which only applied to the repmgrd failover flow. The agent fronts the Services and re-points them itself, so PGPool never fails a backend over. Delete this key." -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
-pg.agentMode / pg.repmgrdMode render the string "true"/"false". Call sites gate
-with: {{- if eq (include "pg.agentMode" .) "true" }}
+pg.agentMode renders the string "true"/"false". Call sites gate with:
+  {{- if eq (include "pg.agentMode" .) "true" }}
+Since 2.0.0 the agent is the only failover path, so this is exactly "HA is enabled"
+(repmgr.enabled=false is the standalone, single-node, stock-postgres-image mode). The
+helper is kept rather than inlined so the ~20 call sites keep reading as a mode check.
 */}}
 {{- define "pg.agentMode" -}}
-{{- and .Values.repmgr.enabled (eq (include "pg.failoverMode" .) "agent") -}}
-{{- end -}}
-
-{{- define "pg.repmgrdMode" -}}
-{{- and .Values.repmgr.enabled (eq (include "pg.failoverMode" .) "repmgrd") -}}
+{{- .Values.repmgr.enabled -}}
 {{- end -}}
 
 {{- /* The single condition under which the `create jobs` grant is rendered (#276). Both
@@ -706,7 +703,7 @@ with: {{- if eq (include "pg.agentMode" .) "true" }}
        drift apart -- a Role that carries the escalation primitive without the policy that
        bounds it is the failure mode #279 exists to prevent. */ -}}
 {{- define "pg.controlRestoreEnabled" -}}
-{{- and .Values.repmgr.enabled (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.control.restore.enabled -}}
+{{- and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.control.restore.enabled -}}
 {{- end -}}
 
 {{- /* Name of the ValidatingAdmissionPolicy (and its binding) that bounds the restore

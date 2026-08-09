@@ -2,8 +2,8 @@ suite: pgvector structural render
 release:
   name: test-pgv
 tests:
-  # pgvector defaults to agent-mode HA (repmgr.enabled, failoverMode: agent,
-  # replicaCount 1) -- the symlinked pg templates must render under pgvector values.
+  # pgvector defaults to agent HA (repmgr.enabled, replicaCount 1) -- the symlinked pg
+  # templates must render under pgvector values. Since #286 the agent is the only mode.
   - it: default statefulset is agent-mode HA (2 replicas, Parallel, agent entrypoint)
     template: templates/statefulset.yaml
     asserts:
