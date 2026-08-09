@@ -49,9 +49,8 @@ postgresql:
       additionalCommands: ""
 
 repmgr:
-  # The legacy path is no longer the chart default (agent is, since 1.0.0); pin it
-  # explicitly so this fixture exercises repmgrd mode.
-  failoverMode: repmgrd
+  # The generic HA fixture: repmgr.enabled with one replica and persistence. It pinned
+  # failoverMode: repmgrd until #286 removed that path; the agent is now the only mode.
   image:
     repository: cagriekin/repmgr
     tag: trixie-5.5.0-27
@@ -69,14 +68,6 @@ repmgr:
     limits:
       cpu: 500m
       memory: 512Mi
-
-  serviceUpdater:
-    resources:
-      requests:
-        cpu: 50m
-        memory: 64Mi
-      limits:
-        memory: 128Mi
 
 pgpool:
   enabled: false

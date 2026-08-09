@@ -94,10 +94,6 @@
     "repmgr": {
       "type": "object",
       "properties": {
-        "failoverMode": {
-          "enum": ["repmgrd", "agent"],
-          "description": "repmgrd (default) or the lease-based Go agent."
-        },
         "agent": {
           "type": "object",
           "properties": {

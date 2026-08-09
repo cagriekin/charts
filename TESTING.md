@@ -22,8 +22,8 @@ The charts are tested in layers, fast to slow. The first three run on every PR (
 
 The `<chart>/tests/test-*.sh` suites (driven by each chart's `Makefile`) cover what the
 static and policy layers cannot: failover, rolling restart, TLS, backup/restore, and the
-**behavioral tests of rendered shell scripts** (e.g. the pg service-updater's split-brain
-selector, LSN/timeline comparators, marker guards). See `<chart>/Makefile` for targets.
+**behavioral tests of rendered shell scripts** (e.g. the pg entrypoint's stale-primary guard
+and the pgbackrest CronJob's primary discovery). See `<chart>/Makefile` for targets.
 
 ## Per-chart test layout
 

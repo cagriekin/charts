@@ -106,26 +106,14 @@ apply time and silently restricted peer-shaped input to port 5432 (#136).
             matchLabels:
               {{- include "pg.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: postgresql
-{{- if .Values.pgpool.enabled }}
-{{- /*
-service-updater runs inside the postgresql pods and health-checks pgpool on
-its backend port (9999) every tick; NetworkPolicy matches the post-DNAT pod
-port, so without this egress rule the check times out and perpetually
-rollout-restarts the pgpool Deployment (#129).
-*/}}
-    - ports:
-        - port: {{ .Values.pgpool.service.port }}
-          protocol: TCP
-      to:
-        - podSelector:
-            matchLabels:
-              {{- include "pg.selectorLabels" . | nindent 14 }}
-              app.kubernetes.io/component: pgpool
-{{- end }}
+{{- /* No egress to pgpool: the postgresql pods do not connect to it. This rule existed
+       only for the service-updater's pgpool health check (#129), and that sidecar went
+       away with repmgrd (#286). Traffic flows the other way -- pgpool -> postgresql --
+       which the pgpool policy's egress and the ingress rule above already cover. */}}
 {{- /*
 443 covers HTTPS S3 endpoints and cloud API servers; 6443 covers the
-API server on kubeadm-style clusters (service-updater and lifecycle
-hooks run kubectl from these pods). NetworkPolicy matches the backend
+API server on kubeadm-style clusters (the agent's client-go and the
+lifecycle hooks reach it from these pods). NetworkPolicy matches the backend
 port after service translation, so the in-cluster kubernetes Service
 port 443 is not enough.
 */}}

@@ -217,11 +217,9 @@ jobs:
         pg_major: ["18", "17"]
         suite:
           - minimal
-          - repmgr-failover
           - agent
           - agent-control
           - agent-control-restore
-          - repmgr-chaos
           - full
           - upgrade
           - agent-etcd
@@ -238,7 +236,6 @@ jobs:
           - pgbackrest-restore-ha
           - pgbackrest-bootstrap
           - databases-roles
-          - migrate-agent
           - scaledown
         include:
           - { suite: agent, coldboot: "1" }

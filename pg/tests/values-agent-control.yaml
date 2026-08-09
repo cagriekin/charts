@@ -47,7 +47,6 @@ repmgr:
     pullPolicy: IfNotPresent
 
   enabled: true
-  failoverMode: agent
 
   username: repmgr
   database: repmgr
