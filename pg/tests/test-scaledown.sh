@@ -2,19 +2,21 @@
 set -euo pipefail
 
 # #139: scaling postgresql.replicaCount down must not leave permanent ghost rows in
-# repmgr.nodes. The primary now reconciles repmgr.nodes against the live ordinal range
-# and unregisters records for pods the StatefulSet no longer runs. This exercises the
-# repmgrd-mode path (service-updater on the master).
+# repmgr.nodes. The primary reconciles repmgr.nodes against the live ordinal range and
+# unregisters records for pods the StatefulSet no longer runs.
+#
+# Ported to agent mode in #286: this used to pin failoverMode: repmgrd for a deterministic
+# standby ghost, and the service-updater on the master did the unregistering. repmgrd is
+# gone, so the agent's own cleanupGhostNodes now runs it on the lease holder each tick,
+# bounded by REPMGR_NODE_COUNT (which the scale-down `helm upgrade` re-renders). Keeping
+# this suite is the point of the port -- it is the only end-to-end #139 regression, and
+# the Go unit tests cover ghostNodeIDs' arithmetic but not the live unregister.
 #
 # Determinism comes from WHICH node becomes the ghost, not from a fixed primary: the
 # StatefulSet trims the highest ordinal (pod-2) first, while it is still a standby, so
-# node 1002's row is type='standby' -- the case `repmgr standby unregister` handles.
-# The scale-down `helm upgrade` itself changes REPMGR_NODE_COUNT, which rolls the
-# surviving pods (this is also what makes the re-rendered ConfigMap's lower bound take
-# effect); under OrderedReady pod-0 rolls last and its clean preStop fails over to
-# pod-1, so the post-scale primary may be pod-1. The assertions therefore locate the
-# live primary with find_primary rather than assuming pod-0. The agent-mode path shares
-# the same repmgr primitive and is covered by the Go unit tests.
+# node 1002's row is type='standby' -- the case `repmgr standby unregister` handles. The
+# post-scale primary is whichever pod holds the lease, so the assertions locate it with
+# find_primary rather than assuming pod-0.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -79,7 +81,9 @@ helm upgrade "${RELEASE}" "${CHART_DIR}" \
 
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 300
 
-# The master's service-updater unregisters the ghost on its next tick; poll until gone.
+# The lease holder's agent unregisters the ghost on its next reconcile tick; poll until
+# gone. Agent mode is Parallel, so the surviving pods roll concurrently -- give the lease
+# time to settle before concluding the row survived.
 echo "  Waiting for the ghost node 1002 to be unregistered (up to 180s)..."
 gone=0; elapsed=0
 while [[ ${elapsed} -lt 180 ]]; do

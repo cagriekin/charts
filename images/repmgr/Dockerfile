@@ -75,20 +75,10 @@ RUN apt-get update && \
 # fall back to 18 when unset, so an older image without this ENV still works.
 ENV PG_MAJOR=${PG_MAJOR}
 
-# Install kubectl for the service-updater sidecar (repmgrd mode). Pinned version
-# + checksum verification -- no floating stable.txt. Kept on a current release so
-# the vendored Go stdlib / golang.org/x/net it links carry their CVE fixes (older
-# kubectl builds linked Go 1.22 + x/net 0.26, flagged Critical/High by Trivy).
-# Independent of the agent's client-go (a separate binary); only the core verbs
-# get/patch/label/exec/rollout are used, so cluster version skew is a non-issue.
-ARG KUBECTL_VERSION=v1.36.2
-RUN ARCH=$(dpkg --print-architecture) && \
-    curl -fsSLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" && \
-    curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl.sha256" -o kubectl.sha256 && \
-    echo "$(cat kubectl.sha256)  kubectl" | sha256sum -c - && \
-    chmod +x kubectl && \
-    mv kubectl /usr/local/bin/ && \
-    rm kubectl.sha256
+# NOTE: kubectl is deliberately NOT installed. It existed only for the repmgrd-mode
+# service-updater sidecar, which went away with repmgrd (#286). The agent talks to the
+# API server through client-go in its own binary, and the pgbackrest CronJobs run
+# kubectl from their own alpine/k8s image -- so nothing in this image shells out to it.
 
 # Create repmgr user and directories
 RUN useradd -r -s /bin/bash repmgr && \
@@ -103,17 +93,13 @@ RUN useradd -r -s /bin/bash repmgr && \
 COPY repmgr.conf /etc/repmgr/repmgr.conf.template
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY init-repmgr.sh /usr/local/bin/init-repmgr.sh
-COPY service-updater.sh /usr/local/bin/service-updater.sh
-COPY repmgrd-entrypoint.sh /usr/local/bin/repmgrd-entrypoint.sh
 # Sourced (not executed) by entrypoint.sh + init-repmgr.sh -- shared timeline/topology
 # helpers, single definition for the image's shell scripts (#177). No +x needed.
 COPY repmgr-common.sh /usr/local/bin/repmgr-common.sh
 
 # Make scripts executable
 RUN chmod +x /usr/local/bin/entrypoint.sh \
-    /usr/local/bin/init-repmgr.sh \
-    /usr/local/bin/service-updater.sh \
-    /usr/local/bin/repmgrd-entrypoint.sh
+    /usr/local/bin/init-repmgr.sh
 
 # Go HA agent binary (used by the entrypoint "agent" failover mode)
 COPY --from=agent-build /out/pg-ha-agent /usr/local/bin/pg-ha-agent

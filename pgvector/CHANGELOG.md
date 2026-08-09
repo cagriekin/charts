@@ -1,5 +1,82 @@
 # pgvector chart changelog
 
+## 2.0.0 - 2026-08-10
+
+### Removed (breaking)
+
+- **`repmgr.failoverMode: repmgrd` and the repmgrd + service-updater sidecars are gone**
+  (#286). The lease-based Go agent has been the default since `1.0.0` and `values.yaml`
+  marked repmgrd deprecated "for one major cycle"; that cycle is over. The agent is now
+  the only failover path.
+
+  What this removes: the `repmgrd` container, the `service-updater` container and the
+  ConfigMap carrying its script, `repmgrd-entrypoint.sh` and `service-updater.sh` from the
+  image, kubectl from the image (the service-updater was its only consumer — the pgbackrest
+  CronJobs run kubectl from their own `alpine/k8s` image), and `shareProcessNamespace` from
+  the pod (it existed so repmgrd could signal postgres across containers).
+
+  The Role loses two grants with them. `pods` **`delete`** is gone entirely — it was only
+  ever granted under `splitBrainDetection.action=fence` for the service-updater's
+  split-brain net (#154), and the agent soft-fences locally via `pg_ctl`; `fence` still
+  works and still needs no pod-delete privilege. The pgpool `deployments` get/patch grant
+  is gone too: the service-updater restarted pgpool on failover, whereas the agent
+  re-points the Services that pgpool already targets. The `events` create grant follows —
+  the agent records failover decisions in a structured audit log, so the `PrimaryChanged`
+  core/v1 Events are no longer emitted.
+
+  The postgresql **NetworkPolicy** loses its egress rule to pgpool's backend port (9999).
+  It existed only so the service-updater could health-check pgpool from the database pods
+  (#129); nothing in those pods connects to pgpool now, and traffic only flows the other
+  way. The pgpool policy's own ingress is unchanged.
+
+  **Removed values.** Each is rejected at render time with a message naming the fix, so a
+  stale values file fails the upgrade instead of silently deploying something else:
+
+  | Removed | Why |
+  |---------|-----|
+  | `repmgr.failoverMode` | Only one failover path remains |
+  | `repmgr.serviceUpdater.*` | The sidecar it sized no longer exists |
+  | `repmgr.monitoringHistoryDays` | Pruned `repmgr.monitoring_history`, which only repmgrd wrote |
+  | `pgpool.autoFailback` | Rendered PGPool's `auto_failback`, which only applied to the repmgrd failover flow |
+
+### Migrating from 1.x
+
+**If you were on the default (agent):** delete `repmgr.failoverMode: agent` from your values
+if you set it explicitly, then `helm upgrade` normally. Your StatefulSet is already
+`Parallel`; there is no recreate and no behaviour change.
+
+**If you pinned `repmgr.failoverMode: repmgrd`:** `podManagementPolicy` moves `OrderedReady`
+→ `Parallel`, and that field is **immutable**, so the StatefulSet has to be recreated once
+(zero data loss — pods and PVCs are kept):
+
+```bash
+# 1. Healthy cluster + a fresh backup first. GitOps: disable auto-sync for these steps.
+kubectl delete statefulset <release>-pg -n <ns> --cascade=orphan
+# 2. Remove repmgr.failoverMode from your values, then upgrade (recreates the STS as
+#    Parallel and adopts the orphaned pods):
+helm upgrade <release> cagriekin/pg -n <ns>   # + your -f values, minus failoverMode
+# 3. Verify:
+kubectl get lease <release>-pg-leader -n <ns> -o jsonpath='{.spec.holderIdentity}'
+kubectl get endpoints <release>-pg -n <ns>
+```
+
+Rollback is to chart `1.x` with `failoverMode: repmgrd` restored and the same
+`--cascade=orphan` recreate.
+
+Two further changes land for repmgrd users specifically: the agent assembles a pod-CIDR +
+SCRAM `pg_hba.conf` with **no implicit `0.0.0.0/0 md5` catch-all** (add explicit
+`postgresql.pgHba` rules first if you relied on it), and failover history moves from
+`PrimaryChanged` Events to the agent's audit log and the `pg_ha_agent_*` metrics.
+
+### Changed
+
+- `test-scaledown` (the #139 ghost-node regression) was ported from repmgrd mode to the
+  agent; the agent's `cleanupGhostNodes` runs the same `repmgr standby unregister` on the
+  lease holder. The `repmgr-failover`, `repmgr-chaos`, `config-repmgr` and `migrate-agent`
+  suites were removed with the mode they tested.
+- `scripts/check-repmgrd-byte-stable.sh` is now `scripts/check-byte-stable.sh` and diffs the
+  default render (there is no second mode to pin). Across the 1.x → 2.0.0 boundary it diffs
+  heavily by design; compare against a 2.x ref for a meaningful result.
 ## 1.16.0 - 2026-08-25
 
 Inherited from pg: same templates. `pgbackrest` gains `extraEnv`, `extraVolumes` and

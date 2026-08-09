@@ -3,8 +3,8 @@ KIND_CONFIG := kind-config.yaml
 TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
-.PHONY: test test-template test-cluster test-minimal test-repmgr test-repmgr-chaos test-full test-failover test-upgrade \
-        test-repmgr-failover test-agent test-agent-control test-agent-control-restore test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-sync-replication-slots test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-backup-concurrent test-pgbackrest-restore test-pgbackrest-restore-ha test-pgbackrest-bootstrap test-databases-roles test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
+.PHONY: test test-template test-cluster test-minimal test-full test-upgrade \
+        test-agent test-agent-control test-agent-control-restore test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-sync-replication-slots test-scaledown test-agent-rolling test-config test-backup-restore test-backup-concurrent test-pgbackrest-restore test-pgbackrest-restore-ha test-pgbackrest-bootstrap test-databases-roles test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -12,10 +12,7 @@ help:
 	@echo "  test-template   - Run helm template/lint tests (no cluster needed)"
 	@echo "  test-cluster    - Run all cluster tests in parallel (assumes cluster exists)"
 	@echo "  test-minimal    - Run minimal install tests"
-	@echo "  test-repmgr     - Run repmgr install tests"
-	@echo "  test-repmgr-chaos - Run standby pod chaos restart regression test"
 	@echo "  test-full       - Run full install tests"
-	@echo "  test-failover   - Run failover tests (requires test-repmgr first)"
 	@echo "  test-agent      - Run lease-based agent install + failover tests"
 	@echo "  test-agent-control - Run agent control REST API tests (mTLS, pause, switchover)"
 	@echo "  test-agent-control-restore - Run API-driven pgBackRest restore tests"
@@ -26,10 +23,8 @@ help:
 	@echo "  test-config-failover - Run config-persistence-across-failover test (standalone, opt-in)"
 	@echo "  test-cascading-replication - Run cascading-replication chain + re-homing test (standalone, opt-in)"
 	@echo "  test-sync-replication-slots - Run logical replication slot sync test (#308, standalone, opt-in)"
-	@echo "  test-migrate-agent - Run repmgrd->agent migration test (standalone, long)"
 	@echo "  test-upgrade    - Run upgrade path tests"
 	@echo "  test-config     - Run postgresql configuration tests (standalone)"
-	@echo "  test-config-repmgr - Run postgresql configuration tests (repmgr)"
 	@echo "  test-backup-restore - Run backup and restore integration tests"
 	@echo "  test-backup-concurrent - Run concurrent pgbackrest backup + WAL archiving test"
 	@echo "  test-pgbackrest-restore - Run pgbackrest PITR restore-validation + live restore Job test (#38/#226)"
@@ -46,22 +41,15 @@ test: cluster-create test-template test-cluster cluster-delete
 test-template:
 	@bash $(TESTS_DIR)/test-template.sh
 
-# Diff the repmgrd (default) render of pg+pgvector vs a baseline ref (default
-# origin/master) to confirm the default path stays byte-stable. Intended bumps show
-# as a diff to review; not a hard gate. Usage: make byte-stable [REF=<ref>]
+# Diff the default render of pg+pgvector vs a baseline ref (default origin/master) to
+# confirm a change meant for one code path did not move the default one. Intended bumps
+# show as a diff to review; not a hard gate. Usage: make byte-stable [REF=<ref>]
 byte-stable:
-	@bash ../scripts/check-repmgrd-byte-stable.sh $(REF)
+	@bash ../scripts/check-byte-stable.sh $(REF)
 
 # Run independent suites in parallel with -j
-# test-repmgr-failover is sequential (repmgr then failover)
-# test-minimal, test-repmgr-failover, test-full, test-upgrade run in parallel
-test-cluster: test-minimal test-repmgr-failover test-agent test-repmgr-chaos test-full test-upgrade test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-special-chars
+test-cluster: test-minimal test-agent test-full test-upgrade test-scaledown test-agent-rolling test-config test-backup-restore test-special-chars
 	@echo "All test suites passed"
-
-# Chain: repmgr install -> failover test (must be sequential)
-test-repmgr-failover: cluster-exists
-	@bash $(TESTS_DIR)/test-repmgr.sh
-	@bash $(TESTS_DIR)/test-failover.sh
 
 # Chain: agent install -> agent failover test (must be sequential; the failover
 # suite reads the lease-elected primary/standby that the install suite records)
@@ -107,13 +95,9 @@ test-cascading-replication: cluster-exists
 test-sync-replication-slots: cluster-exists
 	@bash $(TESTS_DIR)/test-sync-replication-slots.sh
 
-# repmgrd -> agent migration (--cascade=orphan recreate). Standalone + long-running
-# (installs repmgrd, then rolls to agent), so not in test-cluster; run explicitly.
-test-migrate-agent: cluster-exists
-	@bash $(TESTS_DIR)/test-migrate-agent.sh
-
 # Scale replicaCount down and assert the primary unregisters the ghost repmgr.nodes
-# record (#139). Uses repmgrd mode for a deterministic standby ghost.
+# record (#139). Runs in agent mode since #286; the standby ghost is deterministic
+# because the StatefulSet always trims the top ordinal.
 test-scaledown: cluster-exists
 	@bash $(TESTS_DIR)/test-scaledown.sh
 
@@ -146,26 +130,14 @@ cluster-delete:
 test-minimal: cluster-exists
 	@bash $(TESTS_DIR)/test-minimal.sh
 
-test-repmgr: cluster-exists
-	@bash $(TESTS_DIR)/test-repmgr.sh
-
-test-repmgr-chaos: cluster-exists
-	@bash $(TESTS_DIR)/test-repmgr-chaos.sh
-
 test-full: cluster-exists
 	@bash $(TESTS_DIR)/test-full.sh
-
-test-failover: cluster-exists
-	@bash $(TESTS_DIR)/test-failover.sh
 
 test-upgrade: cluster-exists
 	@bash $(TESTS_DIR)/test-upgrade.sh
 
 test-config: cluster-exists
 	@bash $(TESTS_DIR)/test-config.sh
-
-test-config-repmgr: cluster-exists
-	@bash $(TESTS_DIR)/test-config-repmgr.sh
 
 test-backup-restore: cluster-exists
 	@bash $(TESTS_DIR)/test-backup-restore.sh

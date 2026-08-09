@@ -14,12 +14,14 @@ tests:
       - failedTemplate:
           errorMessage: "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr"
 
-  - it: invalid failoverMode is rejected by the values schema
+  # #286: repmgrd is gone from pgvector too (the templates are symlinks into pg, so the
+  # guard is literally the same code); the removed key must fail rather than be ignored.
+  - it: repmgr.failoverMode is rejected as a removed key
     set:
-      repmgr.failoverMode: bogus
+      repmgr.failoverMode: repmgrd
     asserts:
       - failedTemplate:
-          errorPattern: "at '/repmgr/failoverMode': value must be one of"
+          errorPattern: "repmgr.failoverMode was removed in chart 2.0.0"
 
   - it: standalone with replicaCount 0 renders
     set:

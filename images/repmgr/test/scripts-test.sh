@@ -8,7 +8,7 @@ ok()   { echo "PASS: $1"; }
 bad()  { echo "FAIL: $1"; fail=1; }
 
 # --- syntax check every shipped script ---
-for s in entrypoint.sh init-repmgr.sh repmgrd-entrypoint.sh service-updater.sh repmgr-common.sh; do
+for s in entrypoint.sh init-repmgr.sh repmgr-common.sh; do
   if bash -n "${ROOT}/${s}" 2>/dev/null; then ok "bash -n ${s}"; else bad "bash -n ${s}"; fi
 done
 

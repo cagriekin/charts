@@ -14,6 +14,7 @@
 {{- include "pg.validateWalLevel" . }}
 {{- include "pg.validateSyncReplicationSlotsMajor" . }}
 {{- include "pg.validateSyncReplicationSlotsWalLevel" . }}
+{{- include "pg.validateRemovedRepmgrdValues" . }}
 {{- if and (not .Values.repmgr.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
 {{- fail "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr" }}
 {{- end }}
@@ -24,12 +25,14 @@
 {{- if and (or .Values.postgresql.tls.require .Values.postgresql.tls.clientCertAuth) (not .Values.postgresql.tls.enabled) }}
 {{- fail "postgresql.tls.require / clientCertAuth require postgresql.tls.enabled" }}
 {{- end }}
-{{- /* require/mTLS are enforced via the agent-assembled pg_hba (hostssl). In repmgrd
-       mode pg_hba carries an md5-fallback line that would bypass a hostssl rule, so
-       enforced TLS is unsafe there -- server TLS (ssl=on) still works; clients can opt
-       in with sslmode=require, or add explicit hostssl rules via postgresql.pgHba. */}}
+{{- /* require/mTLS are enforced via the agent-assembled pg_hba (hostssl), and only the
+       agent authors pg_hba. Standalone mode (repmgr.enabled=false) runs the stock postgres
+       image with its own pg_hba, which carries an md5-fallback line that would bypass a
+       hostssl rule -- so enforced TLS is unsafe there. Server TLS (ssl=on) still works;
+       clients can opt in with sslmode=require, or add explicit hostssl rules via
+       postgresql.pgHba. */}}
 {{- if and (or .Values.postgresql.tls.require .Values.postgresql.tls.clientCertAuth) (ne (include "pg.agentMode" .) "true") }}
-{{- fail "postgresql.tls.require / clientCertAuth are supported only in agent mode (repmgr.failoverMode=agent). In repmgrd mode use postgresql.tls.enabled for optional server TLS; enforced TLS needs agent mode." }}
+{{- fail "postgresql.tls.require / clientCertAuth require repmgr.enabled=true: enforced TLS depends on the agent-assembled pg_hba (hostssl with no md5 fallback), and standalone mode runs the stock postgres image's own pg_hba. For standalone, use postgresql.tls.enabled for optional server TLS and have clients set sslmode=require." }}
 {{- end }}
 {{- /* Cross-component sslmode consistency: when the server requires TLS, the exporter
        must also use TLS or its scrapes are rejected by hostssl. clientCertAuth forces
@@ -59,7 +62,7 @@
 {{- $control := .Values.repmgr.agent.control }}
 {{- if $control.enabled }}
 {{- if ne (include "pg.agentMode" .) "true" }}
-{{- fail "repmgr.agent.control.enabled requires agent mode (repmgr.failoverMode=agent): the control API is served by the Go agent, and repmgrd mode runs no agent. In repmgrd mode use the kubectl runbooks in the README instead." }}
+{{- fail "repmgr.agent.control.enabled requires repmgr.enabled=true: the control API is served by the Go agent, and standalone mode runs no agent." }}
 {{- end }}
 {{- if not $control.tls.existingSecret }}
 {{- fail "repmgr.agent.control.enabled requires repmgr.agent.control.tls.existingSecret (a Secret with keys tls.crt, tls.key, ca.crt). The control API is mTLS-only -- there is no token or plaintext mode -- so without client-CA material it would have no way to authenticate callers and the agent refuses to start." }}
@@ -141,7 +144,7 @@
        contradictory inputs that would silently orphan them (fail-fast). */}}
 {{- if (.Values.etcd).enabled }}
 {{- if ne (include "pg.agentEtcdMode" .) "true" }}
-{{- fail "etcd.enabled=true deploys a bundled etcd cluster, but the agent etcd backend is not active (it would be left unused). Set repmgr.failoverMode=agent and repmgr.agent.dcs.backend=etcd, or set etcd.enabled=false" }}
+{{- fail "etcd.enabled=true deploys a bundled etcd cluster, but the agent etcd backend is not active (it would be left unused). Set repmgr.enabled=true and repmgr.agent.dcs.backend=etcd, or set etcd.enabled=false" }}
 {{- end }}
 {{- if (.Values.repmgr.agent.dcs.etcd).endpoints }}
 {{- fail "etcd.enabled=true (bundled etcd) and repmgr.agent.dcs.etcd.endpoints (external etcd) are both set; the agent would target the external endpoints and leave the bundled cluster unused. Pick one: enable the bundle OR set endpoints" }}
@@ -165,19 +168,18 @@ metadata:
   {{- end }}
 spec:
   serviceName: {{ include "pg.fullname" . }}-headless
-  # OrderedReady is REQUIRED by the #125 stale-resurrection guard: on a
-  # full-cluster restart pods must come up lowest-ordinal-first, one at a time,
-  # so a stale lowest-ordinal pod boots ALONE and the guard/service-updater can
-  # refuse to serve it until a newer-timeline peer is up. Parallel would let a
-  # stale and the real primary race and silently defeat the guard. Pinned
-  # explicitly (not left to the API default) so it cannot be changed silently.
+  # Pinned explicitly (not left to the API default) so it cannot change silently.
+  # podManagementPolicy is IMMUTABLE: changing it needs the StatefulSet recreated
+  # (`kubectl delete sts --cascade=orphan`), which is why the 2.0.0 upgrade note calls
+  # this out for anyone coming from failoverMode: repmgrd (#286).
   {{- if eq (include "pg.agentMode" .) "true" }}
-  # agent mode: Parallel — all pods are present at a cold boot, so the lease winner
-  # compares timelines across the complete candidate set and the highest-timeline
-  # survivor is chosen before any node promotes (immutable; switching needs an STS
-  # recreate, see the migration guide).
+  # HA: Parallel — all pods are present at a cold boot, so the lease winner compares
+  # timelines across the complete candidate set and the highest-timeline survivor is
+  # chosen before any node promotes.
   podManagementPolicy: Parallel
   {{- else }}
+  # Standalone: a single pod (replicaCount must be 0), so ordering is moot; OrderedReady
+  # keeps the rollout one-at-a-time and matches the pre-2.0.0 default for this mode.
   podManagementPolicy: OrderedReady
   {{- end }}
   replicas: {{ add .Values.postgresql.replicaCount 1 }}
@@ -216,8 +218,8 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- if not .Values.repmgr.enabled }}
-      # Standalone (no repmgr): the agent/service-updater that need the API token are
-      # not present, so don't mount one (#166). In repmgr mode the token is required.
+      # Standalone (no repmgr): the agent that needs the API token is not present,
+      # so don't mount one (#166). In repmgr mode the token is required.
       automountServiceAccountToken: false
       {{- end }}
       {{- if .Values.repmgr.enabled }}
@@ -226,12 +228,9 @@ spec:
       securityContext:
         {{- toYaml .Values.postgresql.podSecurityContext | nindent 8 }}
       {{- if .Values.repmgr.enabled }}
-      {{- if eq (include "pg.repmgrdMode" .) "true" }}
-      {{- /* repmgrd mode signals postgres cross-container (the failover test);
-             the agent is PID 1 in the postgresql container and owns its child,
-             so it is not needed in agent mode. */}}
-      shareProcessNamespace: true
-      {{- end }}
+      {{- /* No shareProcessNamespace: it existed so repmgrd could signal postgres across
+             containers. The agent is PID 1 in the postgresql container and owns its child
+             directly, so the pods no longer share a PID namespace (#286). */}}
       serviceAccountName: {{ include "pg.fullname" . }}-repmgr
       {{- end }}
       {{- with .Values.postgresql.priorityClassName }}
@@ -846,7 +845,7 @@ spec:
 {{- if eq (include "pg.agentMode" .) "true" }}
             {{- /* fail fast with a clear message if an overlay nulls out the agent
                    block, rather than a raw nil-pointer on .leaseDuration below */}}
-            {{- $_ := required "repmgr.agent is required when repmgr.failoverMode=agent" .Values.repmgr.agent }}
+            {{- $_ := required "repmgr.agent is required when repmgr.enabled=true" .Values.repmgr.agent }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -1048,13 +1047,10 @@ spec:
                     done
 {{- else }}
           lifecycle:
-{{- /* In agent mode the agent is PID 1 and owns SIGTERM shutdown (release the
-       Lease, then stop its postgres child). A preStop pg_ctl stop would race the
-       supervisor and stop postgres before the Lease is released, so the
-       repmgrd-tuned preStop is gated to repmgrd mode. */}}
-{{- if eq (include "pg.repmgrdMode" .) "true" }}
-{{- include "pg.preStop" . | nindent 12 }}
-{{- end }}
+{{- /* No preStop hook: the agent is PID 1 and owns SIGTERM shutdown (release the Lease,
+       then stop its postgres child). A preStop `pg_ctl stop` would race the supervisor and
+       stop postgres before the Lease is released. The repmgrd-tuned preStop that used to
+       render here went away with repmgrd itself (#286). */}}
             postStart:
               exec:
                 command:
@@ -1069,138 +1065,11 @@ spec:
                           echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
                         fi
                         {{- end }}
-                        {{- /* md5/SCRAM pg_hba compat + the md5->scram re-hash + user pgHba are
-                               authored by the agent in agent mode (single author, #199): the agent
-                               writes the md5-first compat pg_hba on every node and re-hashes managed
-                               users on promotion/boot-primary. These postStart patches therefore run
-                               only in repmgrd mode, where the image writes the legacy pg_hba and no
-                               agent owns the file. */}}
-                        {{- if eq (include "pg.repmgrdMode" .) "true" }}
-                        # PG18 + repmgr MD5/SCRAM auth deadlock fix: the cagriekin/repmgr image
-                        # entrypoint creates managed users (pgvector, repmgr) with MD5-hashed
-                        # passwords while only writing `scram-sha-256` rules into pg_hba.conf,
-                        # so every network auth attempt fails with "User <X> does not have a
-                        # valid SCRAM secret" and traps the StatefulSet in CrashLoopBackOff.
-                        #
-                        # We patch pg_hba.conf to insert an `md5` line ABOVE every existing
-                        # `scram-sha-256` line. pg_hba.conf is matched top-down with no
-                        # fall-through on auth failure, so the md5 rule must come first to
-                        # catch legacy MD5-hashed users (managed and custom, e.g. created via
-                        # additionalCommands). On PG14+ the server auto-promotes md5 method
-                        # to SCRAM when the stored password is SCRAM, so SCRAM-hashed users
-                        # still authenticate via SCRAM wire protocol — same security, more
-                        # compat. Marker comment makes the rewrite idempotent.
-                        #
-                        # Optionally re-hash managed users (POSTGRES_USER, REPMGR_USER) from
-                        # MD5 to SCRAM so we converge on the modern hash. Gated by
-                        # postgresql.migrateLegacyMd5Users (default true). When false, only
-                        # the pg_hba fix runs and existing MD5 hashes are preserved; legacy
-                        # users keep authenticating via the md5 rule above. The migration
-                        # block itself is idempotent (gated on rolpassword LIKE 'md5%').
-                        #
-                        # TODO: drop the md5 line and the migrate flag once the chart's
-                        # minimum PG is the first release without MD5 password storage.
-                        HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tA -c "SHOW hba_file" 2>/dev/null)
-                        HBA_SENTINEL="# cagriekin-charts: md5 fallback applied (md5-first)"
-                        if [ -n "$HBA_FILE" ] && [ -f "$HBA_FILE" ] && ! grep -qF "$HBA_SENTINEL" "$HBA_FILE"; then
-                          HBA_TMP="${HBA_FILE}.cagriekin.tmp"
-                          awk '/^[[:space:]]*host(ssl|nossl)?[[:space:]]+(all|replication)[[:space:]]+.*[[:space:]]+scram-sha-256[[:space:]]*$/ { m=$0; sub(/scram-sha-256[[:space:]]*$/, "md5", m); print m } {print}' "$HBA_FILE" > "$HBA_TMP"
-                          printf '\n%s\n' "$HBA_SENTINEL" >> "$HBA_TMP"
-                          cp "$HBA_TMP" "$HBA_FILE"
-                          rm -f "$HBA_TMP"
-                        fi
-                        {{- if .Values.postgresql.migrateLegacyMd5Users }}
-                        # 0.6.58 used `psql -c "DO \$\$ ... :'u' ... \$\$;"`. Two
-                        # broken assumptions: (a) psql does NOT perform :'var'
-                        # substitution inside `-c` (docs: "no psql-specific
-                        # features"); (b) even if it did, substitution is also
-                        # skipped inside dollar-quoted constants. The server saw
-                        # `:'u'` literal, raised `syntax error at or near ":"`,
-                        # and the rehash silently never ran. Connectivity kept
-                        # working because the md5-fallback line in pg_hba.conf
-                        # masked the failure.
-                        #
-                        # Fix: feed SQL via stdin (psql MainLoop, where :'var'
-                        # IS substituted) and hoist user/pass into per-session
-                        # GUCs read back inside the DO block via current_setting().
-                        # GUC names use `tgt_user`/`tgt_pass` — `user` would
-                        # collide with the SQL reserved keyword.
-                        #
-                        # User/pass are read from the environment with \getenv (as
-                        # the monitoring-user job does), NOT passed via `-v`. A `-v`
-                        # value containing a single quote breaks psql's :'var'
-                        # quoting -- e.g. pass `a'b` rendered an unterminated literal
-                        # and the rehash silently no-op'd for that user (#211). The
-                        # md5 pg_hba fallback masks the failure, so connectivity is
-                        # kept but the scram migration never converges. randAlphaNum
-                        # never emits `'`, so only existingSecret passwords hit it.
-                        # \getenv is client-side (psql >= 16, image is PG 18), so the
-                        # PG < 14 server guard below is unaffected.
-                        fix_user_auth() {
-                          local target_user="$1"
-                          local target_pass="$2"
-                          [ -z "$target_user" ] && return 0
-                          [ -z "$target_pass" ] && return 0
-                          local sql="
-                            \\getenv tgt_user FIX_TGT_USER
-                            \\getenv tgt_pass FIX_TGT_PASS
-                            SET myvars.tgt_user = :'tgt_user';
-                            SET myvars.tgt_pass = :'tgt_pass';
-                            DO \$\$
-                            DECLARE
-                              v_user TEXT := current_setting('myvars.tgt_user');
-                              v_pass TEXT := current_setting('myvars.tgt_pass');
-                            BEGIN
-                              IF current_setting('server_version_num')::int < 140000 THEN
-                                RAISE NOTICE 'Skipping md5->scram migration on PG < 14 (no md5->scram auto-promotion in pg_hba)';
-                                RETURN;
-                              END IF;
-                              IF EXISTS (
-                                SELECT 1 FROM pg_authid
-                                WHERE rolname = v_user AND rolpassword LIKE 'md5%'
-                              ) THEN
-                                SET LOCAL password_encryption = 'scram-sha-256';
-                                EXECUTE format('ALTER USER %I WITH PASSWORD %L', v_user, v_pass);
-                              END IF;
-                            END
-                            \$\$;"
-                          if ! FIX_TGT_USER="$target_user" FIX_TGT_PASS="$target_pass" \
-                            psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-                            -v ON_ERROR_STOP=1 \
-                            --no-psqlrc <<<"$sql"; then
-                            echo "fix_user_auth: md5->scram rehash failed for ${target_user} (psql returned non-zero, see error above)" >&2
-                          fi
-                        }
-                        fix_user_auth "$POSTGRES_USER" "$POSTGRES_PASSWORD"
-                        fix_user_auth "$REPMGR_USER" "$REPMGR_PASSWORD"
-                        {{- end }}
-                        {{- if .Values.postgresql.pgHba }}
-                        HBA_FILE_USER=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
-                        # pg_hba.conf is first-match-wins. The repmgr image writes broad
-                        # 10.0.0.0/8 and 0.0.0.0/0 catch-alls, so user entries appended at
-                        # EOF (the previous behavior) could never match an IPv4 host (#144).
-                        # Insert them above the first non-loopback host rule -- below the
-                        # local/loopback trust rules, above every network auth rule -- so
-                        # user trust/reject/scram overrides actually take effect. Idempotent
-                        # via the sentinel; order among entries is preserved.
-                        HBA_USER_SENTINEL="# cagriekin-charts: user pgHba entries (above network auth rules)"
-                        if [ -n "$HBA_FILE_USER" ] && [ -f "$HBA_FILE_USER" ] && ! grep -qF "$HBA_USER_SENTINEL" "$HBA_FILE_USER"; then
-                          HBA_USER_TMP="${HBA_FILE_USER}.cagriekin-user.tmp"
-                          awk -v ins=0 '
-                            !ins && $1 == "host" && $4 != "127.0.0.1/32" && $4 != "::1/128" {
-                              print "# cagriekin-charts: user pgHba entries (above network auth rules)"
-                              {{- range .Values.postgresql.pgHba }}
-                              print "{{ . }}"
-                              {{- end }}
-                              ins=1
-                            }
-                            { print }
-                          ' "$HBA_FILE_USER" > "$HBA_USER_TMP"
-                          cp "$HBA_USER_TMP" "$HBA_FILE_USER"
-                          rm -f "$HBA_USER_TMP"
-                        fi
-                        {{- end }}
-                        {{- end }}
+                        {{- /* md5/SCRAM pg_hba compat, the md5->scram re-hash and the user
+                               pgHba entries are all authored by the agent (single author, #199):
+                               it writes the md5-first compat pg_hba on every node and re-hashes
+                               managed users on promotion/boot-primary. The postStart patches that
+                               used to do this for repmgrd mode went with repmgrd (#286). */}}
                         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
                         HEADLESS="{{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local"
@@ -1372,194 +1241,6 @@ spec:
 {{- with .Values.postgresql.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
 {{- end }}
-{{- if eq (include "pg.repmgrdMode" .) "true" }}
-        - name: repmgrd
-          image: "{{ include "pg.repmgrImage" . }}"
-          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
-          # Workaround: cagriekin/repmgr <= trixie-5.5.0-7 calls
-          # `standby register --force` without --upstream-node-id, leaving the
-          # row on the primary with type='' on PG18 + repmgr 5.5.0 and crashing
-          # the standby. Pre-register here with an explicit upstream node_id,
-          # then exec the image entrypoint (its own register --force becomes a
-          # no-op UPDATE). Drop once the image ships the fix upstream.
-          # Tracking: github.com/cagriekin/repmgr-docker, repmgrd-entrypoint.sh:45.
-          command:
-            - /bin/bash
-            - -c
-            - |
-              ORDINAL="${HOSTNAME##*-}"
-              for _ in $(seq 1 120); do pg_isready -h 127.0.0.1 > /dev/null 2>&1 && break; sleep 2; done
-              IN_RECOVERY=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h 127.0.0.1 -U "${REPMGR_USER}" -d "${REPMGR_DB}" -tA -c "SELECT pg_is_in_recovery();" 2>/dev/null || true)
-              if [ "$IN_RECOVERY" = "f" ]; then
-                echo "pre-register: primary register --force"
-                repmgr -f /etc/repmgr/repmgr.conf primary register --force || true
-              elif [ "$IN_RECOVERY" = "t" ]; then
-                BASE="${HOSTNAME%-*}"
-                PNID=""
-                for _ in $(seq 1 60); do
-                  for i in $(seq 0 {{ int .Values.postgresql.replicaCount }}); do
-                    [ "$i" = "$ORDINAL" ] && continue
-                    P="${BASE}-${i}.${HEADLESS_SERVICE}"
-                    PGPASSWORD="${REPMGR_PASSWORD}" pg_isready -h "$P" -U "${REPMGR_USER}" -d "${REPMGR_DB}" > /dev/null 2>&1 || continue
-                    PNID=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h "$P" -U "${REPMGR_USER}" -d "${REPMGR_DB}" -tA \
-                      -c "SELECT node_id FROM repmgr.nodes WHERE type='primary' AND active=true LIMIT 1;" 2>/dev/null || true)
-                    [ -n "$PNID" ] && break 2
-                  done
-                  sleep 2
-                done
-                if [ -n "$PNID" ]; then
-                  echo "pre-register: standby register --upstream-node-id=${PNID}"
-                  repmgr -f /etc/repmgr/repmgr.conf standby register --upstream-node-id="${PNID}" --force || true
-                  # Read node_id from the generated repmgr.conf instead of
-                  # re-deriving the image's ordinal+1000 convention here.
-                  LOCAL_NID=$(awk -F= '$1=="node_id"{print $2; exit}' /etc/repmgr/repmgr.conf)
-                  if [ -z "$LOCAL_NID" ]; then
-                    echo "pre-register: no node_id in /etc/repmgr/repmgr.conf, skipping type backfill" >&2
-                  else
-                    # Defensive: some PG18 + repmgr image combos land the row
-                    # with type=''. WHERE clause makes this a no-op on rows
-                    # that are already correctly typed.
-                    PGPASSWORD="${REPMGR_PASSWORD}" psql -h "$P" -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
-                      -v ON_ERROR_STOP=1 --no-psqlrc -c "
-                        UPDATE repmgr.nodes SET type='standby'
-                         WHERE node_id=${LOCAL_NID} AND (type IS NULL OR type='');
-                      " || echo "pre-register: type-backfill UPDATE failed (ignored)" >&2
-                  fi
-                fi
-              fi
-              # repmgr 5.x has no conf-based retention for monitoring_history
-              # (the image's monitoring_history_keep conf line is ignored as
-              # an unknown parameter), so the table grows forever. Prune it
-              # once per day on the primary via `repmgr cluster cleanup`.
-              # Failures only log a warning: the loop must never take down
-              # repmgrd (pid 1 via the exec below).
-              (
-                while true; do
-                  sleep 86400
-                  IN_RECOVERY=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h 127.0.0.1 -U "${REPMGR_USER}" -d "${REPMGR_DB}" -tA -c "SELECT pg_is_in_recovery();" 2>/dev/null || true)
-                  [ "$IN_RECOVERY" = "f" ] || continue
-                  if ! repmgr -f /etc/repmgr/repmgr.conf cluster cleanup --keep-history="${MONITORING_HISTORY_DAYS}"; then
-                    echo "monitoring-history-cleanup: repmgr cluster cleanup failed, retrying in 24h" >&2
-                  fi
-                done
-              ) &
-              exec repmgrd -f /etc/repmgr/repmgr.conf --daemonize=no
-          securityContext:
-            {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
-          env:
-{{- with (include "pg.pgMajorEnv" .) }}{{ . | nindent 12 }}{{- end }}
-            - name: PGDATA
-              value: /var/lib/postgresql/data/pgdata
-            - name: REPMGR_USER
-              value: {{ .Values.repmgr.username | quote }}
-            - name: REPMGR_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretRepmgrPasswordKey" . }}
-            - name: REPMGR_DB
-              value: {{ .Values.repmgr.database | quote }}
-            - name: HEADLESS_SERVICE
-              value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
-            - name: REPMGR_NODE_COUNT
-              value: {{ add .Values.postgresql.replicaCount 1 | quote }}
-            - name: MONITORING_HISTORY_DAYS
-              value: {{ int (required "repmgr.monitoringHistoryDays is required when repmgr.enabled=true" .Values.repmgr.monitoringHistoryDays) | quote }}
-          lifecycle:
-            preStop:
-              exec:
-                command:
-                  - /bin/bash
-                  - -c
-                  - |
-                    repmgr daemon stop 2>/dev/null || true
-          resources:
-            {{- toYaml .Values.repmgr.resources | nindent 12 }}
-          volumeMounts:
-            - name: data
-              mountPath: /var/lib/postgresql/data
-            - name: repmgr-config
-              mountPath: /etc/repmgr
-        - name: service-updater
-          image: "{{ include "pg.repmgrImage" . }}"
-          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
-          command: ["/bin/bash", "/scripts/service-updater.sh"]
-          securityContext:
-            {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
-          env:
-            - name: NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-            - name: MASTER_SERVICE
-              value: {{ include "pg.fullname" . | quote }}
-            - name: PRIMARY_MARKER
-              value: {{ printf "%s-primary" (include "pg.fullname" .) | quote }}
-            - name: HEADLESS_SERVICE
-              value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
-            - name: REPMGR_USER
-              value: {{ .Values.repmgr.username | quote }}
-            - name: REPMGR_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretRepmgrPasswordKey" . }}
-            - name: REPMGR_DB
-              value: {{ .Values.repmgr.database | quote }}
-            - name: SPLIT_BRAIN_ACTION
-              value: {{ .Values.repmgr.splitBrainDetection.action | quote }}
-{{- if .Values.pgpool.enabled }}
-            - name: PGPOOL_DEPLOYMENT
-              value: {{ printf "%s-pgpool" (include "pg.fullname" .) | quote }}
-            - name: PGPOOL_SERVICE
-              value: {{ printf "%s-pgpool.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
-            - name: PGPOOL_PORT
-              value: "{{ .Values.pgpool.service.port }}"
-            - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretUsernameKey" . }}
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretPasswordKey" . }}
-            - name: POSTGRES_DB
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretDatabaseKey" . }}
-{{- end }}
-          livenessProbe:
-            exec:
-              command:
-                - /bin/bash
-                - -c
-                - |
-                  [ -f /tmp/service-updater-alive ] && [ $(( $(date +%s) - $(cat /tmp/service-updater-alive) )) -lt 120 ]
-            initialDelaySeconds: 60
-            periodSeconds: 30
-            failureThreshold: 3
-            timeoutSeconds: 5
-          lifecycle:
-            preStop:
-              exec:
-                command:
-                  - /bin/bash
-                  - -c
-                  - sleep 5
-          volumeMounts:
-            - name: service-updater-script
-              mountPath: /scripts
-            # repmgr.conf (written by the init container) so the master's
-            # service-updater can run `repmgr standby unregister` for ghost nodes (#139).
-            - name: repmgr-config
-              mountPath: /etc/repmgr
-              readOnly: true
-          resources:
-            {{- toYaml .Values.repmgr.serviceUpdater.resources | nindent 12 }}
-{{- end }}
 {{- if .Values.pgbackrest.enabled }}
         # Idle sidecar: holds the pgbackrest binary, config and S3 credentials
         # alongside PGDATA on every pg pod. The pgbackrest CronJobs find the
@@ -1679,12 +1360,6 @@ spec:
           secret:
             secretName: {{ $control.tls.existingSecret | quote }}
             defaultMode: 0400
-{{- end }}
-{{- if eq (include "pg.repmgrdMode" .) "true" }}
-        - name: service-updater-script
-          configMap:
-            name: {{ include "pg.fullname" . }}-service-updater
-            defaultMode: 0755
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
         - name: pg-run

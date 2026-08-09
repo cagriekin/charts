@@ -28,12 +28,8 @@ primary, and drives repmgr as a mechanism (no repmgrd). Inspect:
     -o jsonpath='{.spec.holderIdentity}'   # the current primary pod
   kubectl -n {{ .Release.Namespace }} get endpoints {{ include "pg.fullname" . }}  # points at the primary
 
-NOTE: agent mode uses podManagementPolicy: Parallel (immutable on an existing
-StatefulSet). See the chart README "Migrating to agent mode" runbook before
-switching an existing repmgrd release.
-{{- else if eq (include "pg.repmgrdMode" .) "true" }}
-
-Failover mode: repmgrd (default). repmgrd + the service-updater sidecar manage
-failover and keep the write Service pointed at the primary. An opt-in lease-based
-agent mode is available via repmgr.failoverMode=agent -- see the chart README.
+NOTE: this release uses podManagementPolicy: Parallel, which is immutable on an
+existing StatefulSet. If you are upgrading from a chart 1.x release that ran
+failoverMode: repmgrd, read the 2.0.0 upgrade note in CHANGELOG.md first -- the
+StatefulSet has to be recreated with --cascade=orphan.
 {{- end }}

@@ -42,8 +42,8 @@ tests:
       - isKind:
           of: Service
 
-  # --- Scenario 2: repmgr render ---
-  - it: repmgr statefulset has 2 replicas and OrderedReady policy
+  # --- Scenario 2: HA render ---
+  - it: HA statefulset has 2 replicas and the Parallel policy
     values:
       - ../values-repmgr.yaml
     template: templates/statefulset.yaml
@@ -51,18 +51,30 @@ tests:
       - equal:
           path: spec.replicas
           value: 2
+      # #286: HA is agent-only now, and the agent needs every pod present at a cold
+      # boot to compare timelines across the complete candidate set.
+      - equal:
+          path: spec.podManagementPolicy
+          value: Parallel
+
+  - it: standalone keeps OrderedReady
+    set:
+      repmgr.enabled: false
+      postgresql.replicaCount: 0
+    template: templates/statefulset.yaml
+    asserts:
       - equal:
           path: spec.podManagementPolicy
           value: OrderedReady
 
-  - it: repmgr has repmgrd and service-updater containers
+  - it: HA has no repmgrd or service-updater container (#286)
     values:
       - ../values-repmgr.yaml
     template: templates/statefulset.yaml
     asserts:
-      - exists:
+      - notExists:
           path: spec.template.spec.containers[?(@.name=="repmgrd")]
-      - exists:
+      - notExists:
           path: spec.template.spec.containers[?(@.name=="service-updater")]
 
   # --- Scenario 3: full render ---
