@@ -106,8 +106,13 @@ assert_eq "pgpool PCP port not exposed on Service by default (#118)" "" "${pcp_p
 # Test: PCP admin auth works end-to-end (#130). pcp.conf must hash the admin
 # password as md5; under the old sha256 every pcp_* command failed auth. pgpool's
 # pcp tools take the password from a .pcppass file (PCPPASSFILE), not PCPPASSWORD,
-# so feed it that way and assert pcp_node_count returns the backend count (3)
-# rather than an auth error. The trailing `|| pcp_count=auth-failed` keeps an auth
+# so feed it that way and assert pcp_node_count returns the backend count rather
+# than an auth error.
+#
+# The count is 2, not one-per-pod: the agent fronts the read/write split, so pgpool's
+# backends are the RW Service (<fullname>, ALWAYS_PRIMARY) and the RO Service
+# (<fullname>-readonly) -- two regardless of replicaCount. It was 3 here while this
+# fixture pinned failoverMode: repmgrd, which listed one backend per pod (#286). The trailing `|| pcp_count=auth-failed` keeps an auth
 # failure a clean assertion FAIL instead of a set -e abort of the whole suite.
 pcp_user=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-pgpool-admin" -o jsonpath='{.data.username}' | base64 -d)
 pcp_pw=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-pgpool-admin" -o jsonpath='{.data.password}' | base64 -d)
@@ -116,7 +121,7 @@ pcp_count=$(kubectl exec -n "${NAMESPACE}" "${pgpool_pod}" -c pgpool -- sh -c "
   chmod 600 /tmp/.pcppass
   PCPPASSFILE=/tmp/.pcppass pcp_node_count -h localhost -p 9898 -U '${pcp_user}' -w
 " 2>/dev/null | tail -1 | tr -d '[:space:]') || pcp_count="auth-failed"
-assert_eq "pcp_node_count authenticates and returns backend count (#130)" "3" "${pcp_count}"
+assert_eq "pcp_node_count authenticates and returns backend count (#130)" "2" "${pcp_count}"
 
 # --- Prometheus exporter tests ---
 echo ""

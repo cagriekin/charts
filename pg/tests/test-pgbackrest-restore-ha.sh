@@ -114,7 +114,10 @@ assert_eq "restore job completes" "0" "${res_rc}"
 echo "Scaling back up to primary + standby..."
 kubectl scale statefulset "${FULLNAME}" -n "${NAMESPACE}" --replicas=2
 
-# --- the restored primary comes back first (OrderedReady) ---
+# --- the restored primary becomes ready first ---
+# Not an ordering guarantee: this fixture runs agent mode (Parallel) since #286, so both
+# pods start together. It is the restored pod that wins the Lease and serves first, because
+# the standby still has to clone -- hence waiting for exactly 1 ready pod here.
 prim_rc=0
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 600 || prim_rc=$?
 assert_eq "restored primary becomes ready" "0" "${prim_rc}"

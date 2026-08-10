@@ -1478,10 +1478,10 @@ assert_contains "#286: standalone statefulset keeps OrderedReady" "${sts_standal
 # The lease-based Go agent is the only failover path since #286.
 agent_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --show-only templates/statefulset.yaml 2>&1)
-# #176: agent mode flips podManagementPolicy to Parallel (complete-candidate
-# survivor selection at cold boot); repmgrd stays OrderedReady (asserted above).
+# #176: HA uses podManagementPolicy Parallel (complete-candidate survivor selection at
+# cold boot); only standalone renders OrderedReady (asserted above).
 assert_contains "agent #176: podManagementPolicy Parallel" "${agent_sts}" "podManagementPolicy: Parallel"
-assert_not_contains "agent #176: not OrderedReady in agent mode" "${agent_sts}" "podManagementPolicy: OrderedReady"
+assert_not_contains "agent #176: HA is never OrderedReady" "${agent_sts}" "podManagementPolicy: OrderedReady"
 # postgresql container runs the entrypoint 'agent' arm
 assert_contains "agent: postgresql runs the agent arm" "${agent_sts}" '"/usr/local/bin/entrypoint.sh", "agent"'
 # repmgrd + service-updater sidecars are gone
