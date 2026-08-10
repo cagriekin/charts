@@ -49,17 +49,18 @@ echo "BINDIR_EXISTS=$([ -d "$BINDIR" ] && echo yes || echo no)"
 echo "POSTGRES_VERSION=$("$BINDIR/postgres" --version 2>&1 | head -1)"
 echo "PG_CTL=$([ -x "$BINDIR/pg_ctl" ] && echo yes || echo MISSING)"
 echo "PG_CONTROLDATA=$([ -x "$BINDIR/pg_controldata" ] && echo yes || echo MISSING)"
-# The agent's repmgr mechanism invokes `repmgr` bare (no PATH manipulation), so resolve
-# it the same way -- via the default PATH. repmgrd is no longer probed: nothing runs it
-# since the repmgrd failover path was removed (#286); the binary still ships only because
-# it comes in the same PGDG package as the repmgr CLI.
+# The agent repmgr mechanism invokes repmgr bare (no PATH manipulation), so resolve it the
+# same way -- via the default PATH. repmgrd is no longer probed: nothing runs it since the
+# repmgrd failover path was removed (#286); the binary still ships only because it comes in
+# the same PGDG package as the repmgr CLI.
+# NOTE: this whole block is a single-quoted bash -c string. No apostrophes, no backticks.
 echo "REPMGR_RESOLVED=$(PATH="$IMAGE_PATH" command -v repmgr 2>/dev/null || echo MISSING)"
 echo "REPMGR_VERSION=$(repmgr --version 2>&1 | head -1)"
 echo "PGBACKREST_VERSION=$(pgbackrest version 2>&1 | head -1)"
 echo "JQ=$(command -v jq || echo MISSING)"
 echo "GOSU=$(command -v gosu || echo MISSING)"
 echo "CRON=$(command -v cron || echo MISSING)"
-echo "KUBECTL=$(kubectl version --client 2>&1 | head -1)"
+echo "KUBECTL=$(command -v kubectl 2>/dev/null || echo ABSENT)"
 echo "AGENT=$([ -x /usr/local/bin/pg-ha-agent ] && echo yes || echo MISSING)"
 echo "PGAUDIT_SO=$([ -f "/usr/lib/postgresql/${PG_MAJOR:-unset}/lib/pgaudit.so" ] && echo yes || echo MISSING)"
 
@@ -197,10 +198,14 @@ case "$pgbr" in
   *) bad "pgbackrest missing or not runnable" "$pgbr" ;;
 esac
 
+# #286: kubectl was installed ONLY for the repmgrd-mode service-updater sidecar. That
+# sidecar is gone, the agent uses client-go inside its own binary, and the pgbackrest
+# CronJobs run kubectl from their own alpine/k8s image -- so nothing in this image shells
+# out to it. Assert it is absent: a reappearance is dead weight in the CVE surface.
 kube=$(val KUBECTL)
 case "$kube" in
-  *Client*|*version*) ok "kubectl client present (${kube})" ;;
-  *) bad "kubectl missing or not runnable" "$kube" ;;
+  ABSENT) ok "kubectl is absent (removed with the service-updater, #286)" ;;
+  *) bad "kubectl is back in the image; nothing here uses it (#286)" "$kube" ;;
 esac
 
 [ "$(val INITDB)" = "ok" ] \
