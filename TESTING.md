@@ -25,6 +25,14 @@ static and policy layers cannot: failover, rolling restart, TLS, backup/restore,
 **behavioral tests of rendered shell scripts** (e.g. the pg entrypoint's stale-primary guard
 and the pgbackrest CronJob's primary discovery). See `<chart>/Makefile` for targets.
 
+## Known coverage gaps
+
+Recorded here so a gap is a decision rather than a surprise:
+
+- **Agent-mode scale-up of a live cluster** (`postgresql.replicaCount` N → N+1) is not
+  exercised by any suite. The `upgrade` suite covered it only while it ran in repmgrd mode;
+  agent mode hits the race in #297, which restores the coverage as part of its fix.
+
 ## Per-chart test layout
 
 ```
