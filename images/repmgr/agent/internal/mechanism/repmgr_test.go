@@ -82,6 +82,33 @@ func TestCLICommands(t *testing.T) {
 		}
 	})
 
+	t.Run("#297 follow reports a missing LOCAL record distinctly", func(t *testing.T) {
+		// A freshly-cloned standby whose upstream changed before it registered: its own
+		// repmgr.nodes copy has no row for itself, and it can never obtain one. Must be
+		// distinguishable so the agent re-clones instead of retrying forever.
+		fr := &fakeRunner{failOn: "standby follow",
+			failOut: "ERROR: unable to retrieve record for local node 1002"}
+		err := newTestRepmgr(fr).Follow(ctx, 1001)
+		if !errors.Is(err, ErrLocalRecordMissing) {
+			t.Errorf("want ErrLocalRecordMissing so the caller re-clones, got %v", err)
+		}
+	})
+
+	t.Run("#297 a missing UPSTREAM record is NOT the local-record error", func(t *testing.T) {
+		// The ordinary post-failover case: the TARGET has not promoted and registered yet.
+		// Waiting is correct here; escalating demotes and re-clones a healthy standby, which
+		// is the mistake #286 made and reverted. The two must never be conflated.
+		fr := &fakeRunner{failOn: "standby follow",
+			failOut: "ERROR: unable to find record for intended upstream node 1002"}
+		err := newTestRepmgr(fr).Follow(ctx, 1002)
+		if err == nil {
+			t.Fatal("a missing upstream record must still surface as an error")
+		}
+		if errors.Is(err, ErrLocalRecordMissing) {
+			t.Errorf("an upstream-record failure must NOT be classed as a local-record failure: %v", err)
+		}
+	})
+
 	t.Run("follow surfaces a genuine failure", func(t *testing.T) {
 		// A real failure (slot active but NOT the benign already-following case) must
 		// still surface so it is not silently swallowed.

@@ -1,5 +1,46 @@
 # pgvector chart changelog
 
+## 1.10.1 - 2026-08-11
+
+### Fixed
+
+- **Backport (#297): a scale-up could leave the cluster without a serving primary, or with a
+  standby that never replicates.** Both affect agent mode -- the default since `1.0.0` -- from
+  that release onward. Fixed on the 2.0.0 line first; backported here because they are
+  data-availability bugs in a shipped release.
+
+  Adding a replica (`postgresql.replicaCount` N -> N+1) also changes `REPMGR_NODE_COUNT`, which
+  rolls every pod, so the new pod is created while the others restart. Two things could go wrong:
+
+  1. **No serving primary.** The new pod could win the Lease before registering in
+     `repmgr.nodes`. Once it promoted, no survivor held a record for it, so none could
+     `repmgr standby follow` it -- it failed `unable to find record for intended upstream node`
+     on every reconcile tick, and nothing served writes. *Fix:* a promote candidate now reads
+     `repmgr.nodes` and, if it has no row of its own while a registered and reachable peer
+     exists, releases the Lease instead of promoting. Conservative by design -- an unreadable
+     registry, a cluster where nobody is registered, or an unreachable peer all still promote,
+     because serving with degraded metadata beats refusing to serve.
+  2. **A standby that never replicates.** The new pod's own `repmgr.nodes` copy is a snapshot of
+     the primary taken *before* it registered, so it holds no row for itself and cannot obtain
+     one -- receiving it requires replicating, and repointing replication is what needs it. It
+     failed `unable to retrieve record for local node` forever, `Running` but never `Ready`.
+     *Fix:* that specific error now triggers a re-clone from the current primary, replacing data
+     and metadata together.
+
+  The re-clone is scoped by error string, not by state, and the distinction matters: a missing
+  **upstream** record is the ordinary post-failover case where the target has simply not promoted
+  yet, and escalating there would demote and re-clone a healthy standby. A unit test asserts the
+  upstream variant does not escalate.
+
+  **This release is only complete with a republished image.** The fix is in the agent binary, so
+  `repmgr.image.tag` must be bumped past `trixie-5.5.0-29` (and the image published) before
+  1.10.1 ships -- a 1.10.1 pointing at `-29` carries the chart change without the fix.
+
+  Verification: reproduced and fixed on a live KinD cluster on the 2.0.0 line, whose `upgrade`
+  suite scales an agent-mode cluster up. **1.x's own `upgrade` suite pins `failoverMode: repmgrd`**
+  (whose `OrderedReady` serialises pod creation and closes the window), so the 1.x suites prove
+  no regression rather than proving the fix. The agent binary is identical to the verified one.
+
 ## 1.10.0 - 2026-08-02
 
 Inherited from pg's symlinked templates and the shared repmgr image. See the
