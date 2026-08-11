@@ -57,7 +57,6 @@ postgresql:
       additionalCommands: ""
 
 repmgr:
-  failoverMode: repmgrd
   image:
     repository: cagriekin/repmgr
     tag: trixie-5.5.0-27
@@ -75,14 +74,6 @@ repmgr:
     limits:
       cpu: 500m
       memory: 512Mi
-
-  serviceUpdater:
-    resources:
-      requests:
-        cpu: 50m
-        memory: 64Mi
-      limits:
-        memory: 128Mi
 
 pgpool:
   enabled: false

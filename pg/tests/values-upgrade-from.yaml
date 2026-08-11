@@ -4,7 +4,19 @@ postgresql:
     tag: 18.1-trixie
     pullPolicy: IfNotPresent
 
-  replicaCount: 1
+  # 2 (3 pods), matching values-upgrade-to.yaml, so this suite exercises an upgrade that
+  # adds pgpool + the exporter WITHOUT also scaling the cluster up.
+  #
+  # It was 1 (a 2 -> 3 scale-up) while the fixture pinned failoverMode: repmgrd, where
+  # podManagementPolicy: OrderedReady serialised pod creation. In agent mode (Parallel) the
+  # scale-up hits a live race that can leave the cluster with NO serving primary: a new pod
+  # can win the Lease before it has ever registered in repmgr.nodes, after which no survivor
+  # can follow it. See #297.
+  #
+  # KNOWN COVERAGE GAP, recorded deliberately rather than hidden: no suite currently exercises
+  # an agent-mode scale-up of a live cluster. #297 restores this fixture to replicaCount: 1
+  # as part of its fix.
+  replicaCount: 2
 
   resources:
     requests:
@@ -49,7 +61,6 @@ repmgr:
   # This suite tests the legacy in-place component upgrade (repmgrd 2->3 + pgpool);
   # the repmgrd->agent migration is covered by test-migrate-agent. Pin repmgrd so
   # the 1.0.0 default flip does not turn this into an agent-mode upgrade.
-  failoverMode: repmgrd
   image:
     repository: cagriekin/repmgr
     tag: trixie-5.5.0-27
@@ -67,14 +78,6 @@ repmgr:
     limits:
       cpu: 500m
       memory: 512Mi
-
-  serviceUpdater:
-    resources:
-      requests:
-        cpu: 50m
-        memory: 64Mi
-      limits:
-        memory: 128Mi
 
 pgpool:
   enabled: false

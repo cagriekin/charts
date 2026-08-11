@@ -49,19 +49,18 @@ echo "BINDIR_EXISTS=$([ -d "$BINDIR" ] && echo yes || echo no)"
 echo "POSTGRES_VERSION=$("$BINDIR/postgres" --version 2>&1 | head -1)"
 echo "PG_CTL=$([ -x "$BINDIR/pg_ctl" ] && echo yes || echo MISSING)"
 echo "PG_CONTROLDATA=$([ -x "$BINDIR/pg_controldata" ] && echo yes || echo MISSING)"
-# repmgr/repmgrd are invoked bare (no PATH manipulation) by repmgrd-entrypoint.sh, so
-# resolve them the same way that does -- via the default PATH.
+# The agent repmgr mechanism invokes repmgr bare (no PATH manipulation), so resolve it the
+# same way -- via the default PATH. repmgrd is no longer probed: nothing runs it since the
+# repmgrd failover path was removed (#286); the binary still ships only because it comes in
+# the same PGDG package as the repmgr CLI.
+# NOTE: this whole block is a single-quoted bash -c string. No apostrophes, no backticks.
 echo "REPMGR_RESOLVED=$(PATH="$IMAGE_PATH" command -v repmgr 2>/dev/null || echo MISSING)"
-echo "REPMGRD_RESOLVED=$(PATH="$IMAGE_PATH" command -v repmgrd 2>/dev/null || echo MISSING)"
 echo "REPMGR_VERSION=$(repmgr --version 2>&1 | head -1)"
-# repmgrd refuses to run as root even for --version, so ask as the user that actually
-# runs it in the pod.
-echo "REPMGRD_VERSION=$(gosu postgres repmgrd --version 2>&1 | head -1)"
 echo "PGBACKREST_VERSION=$(pgbackrest version 2>&1 | head -1)"
 echo "JQ=$(command -v jq || echo MISSING)"
 echo "GOSU=$(command -v gosu || echo MISSING)"
 echo "CRON=$(command -v cron || echo MISSING)"
-echo "KUBECTL=$(kubectl version --client 2>&1 | head -1)"
+echo "KUBECTL=$(command -v kubectl 2>/dev/null || echo ABSENT)"
 echo "AGENT=$([ -x /usr/local/bin/pg-ha-agent ] && echo yes || echo MISSING)"
 echo "PGAUDIT_SO=$([ -f "/usr/lib/postgresql/${PG_MAJOR:-unset}/lib/pgaudit.so" ] && echo yes || echo MISSING)"
 
@@ -161,24 +160,23 @@ for probe_key in JQ GOSU CRON; do
   esac
 done
 
-# repmgrd-entrypoint.sh and the chart's repmgrd container invoke `repmgrd` with no PATH
-# manipulation, so bare resolution must work for whichever major is installed.
-for probe_key in REPMGR_RESOLVED REPMGRD_RESOLVED; do
+# The agent shells out to `repmgr` with no PATH manipulation, so bare resolution must
+# work for whichever major is installed.
+for probe_key in REPMGR_RESOLVED; do
   got=$(val "$probe_key")
   case "$got" in
     /*) ok "${probe_key} resolves on the default PATH (${got})" ;;
-    *)  bad "${probe_key} does not resolve on the default PATH; the repmgrd container would fail to start" "got ${got}" ;;
+    *)  bad "${probe_key} does not resolve on the default PATH; the agent's repmgr mechanism would fail" "got ${got}" ;;
   esac
 done
 
 # A different repmgr version per major would make the trixie-<repmgr>-<n> tag scheme
 # misleading, and puts the cluster on a version the chart was never tested against.
 repmgr_v=$(val REPMGR_VERSION)
-repmgrd_v=$(val REPMGRD_VERSION)
 if [ -n "$WANT_REPMGR" ]; then
   # The tag names a version, so hold the image to it: a mismatch means the tag lies, and
   # the remedy is to publish under the version PGDG now ships.
-  for probe_key in REPMGR_VERSION REPMGRD_VERSION; do
+  for probe_key in REPMGR_VERSION; do
     got=$(val "$probe_key")
     case "$got" in
       *"${WANT_REPMGR}"*) ok "${probe_key} is ${WANT_REPMGR} (${got})" ;;
@@ -186,20 +184,11 @@ if [ -n "$WANT_REPMGR" ]; then
     esac
   done
 else
-  # Untagged/local build: no version to hold it to, but the two binaries must still agree
-  # and report something -- a repmgr/repmgrd split would break failover in ways no other
-  # check here would notice.
+  # Untagged/local build: no version to hold it to, but the binary must still report one.
   case "$repmgr_v" in
     "repmgr "[0-9]*) ok "repmgr reports a version (${repmgr_v})" ;;
     *) bad "repmgr did not report a version" "$repmgr_v" ;;
   esac
-  case "$repmgrd_v" in
-    "repmgrd "[0-9]*) ok "repmgrd reports a version (${repmgrd_v})" ;;
-    *) bad "repmgrd did not report a version" "$repmgrd_v" ;;
-  esac
-  [ "${repmgr_v#repmgr }" = "${repmgrd_v#repmgrd }" ] \
-    && ok "repmgr and repmgrd are the same version (${repmgr_v#repmgr })" \
-    || bad "repmgr and repmgrd disagree on version" "${repmgr_v} vs ${repmgrd_v}"
   echo "note: ${IMAGE##*:} encodes no repmgr version, so the exact-version check was skipped"
 fi
 
@@ -209,10 +198,14 @@ case "$pgbr" in
   *) bad "pgbackrest missing or not runnable" "$pgbr" ;;
 esac
 
+# #286: kubectl was installed ONLY for the repmgrd-mode service-updater sidecar. That
+# sidecar is gone, the agent uses client-go inside its own binary, and the pgbackrest
+# CronJobs run kubectl from their own alpine/k8s image -- so nothing in this image shells
+# out to it. Assert it is absent: a reappearance is dead weight in the CVE surface.
 kube=$(val KUBECTL)
 case "$kube" in
-  *Client*|*version*) ok "kubectl client present (${kube})" ;;
-  *) bad "kubectl missing or not runnable" "$kube" ;;
+  ABSENT) ok "kubectl is absent (removed with the service-updater, #286)" ;;
+  *) bad "kubectl is back in the image; nothing here uses it (#286)" "$kube" ;;
 esac
 
 [ "$(val INITDB)" = "ok" ] \

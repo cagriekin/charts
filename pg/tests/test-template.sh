@@ -54,9 +54,11 @@ repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.ya
 # Repmgr: should have statefulset with 2 replicas (replicaCount 1 + 1)
 assert_contains "repmgr: statefulset has replicas: 2" "${repmgr}" "replicas: 2"
 
-# Repmgr: should have repmgr sidecars
-assert_contains "repmgr: repmgrd sidecar present" "${repmgr}" "name: repmgrd"
-assert_contains "repmgr: service-updater sidecar present" "${repmgr}" "name: service-updater"
+# #286: repmgrd and its service-updater are gone; HA runs the agent as PID 1 in the
+# postgresql container, so neither sidecar may appear in any render.
+assert_not_contains "#286: no repmgrd sidecar" "${repmgr}" "name: repmgrd"
+assert_not_contains "#286: no service-updater sidecar" "${repmgr}" "name: service-updater"
+assert_contains "#286: HA runs the agent entrypoint" "${repmgr}" '"/usr/local/bin/entrypoint.sh", "agent"'
 
 # Repmgr: should have RBAC resources
 assert_contains "repmgr: serviceaccount created" "${repmgr}" "kind: ServiceAccount"
@@ -85,21 +87,25 @@ assert_contains "#154: pods list rule is unscoped" "${pods_rules_log}" "pods ver
 assert_contains "#154: pods get/patch scoped to pod names" "${pods_rules_log}" "pods verbs=get,patch scoped=yes"
 assert_contains "#154: scoped rule names the StatefulSet pods" "${pods_rules_log}" "test-pg-0"
 assert_not_contains "#154: no pods delete in default (log) mode" "${pods_rules_log}" "delete"
-# fence mode: delete is granted and still scoped to the pod names
+# #286: the pods `delete` verb is gone entirely. It was only ever granted to the
+# repmgrd service-updater for split-brain fencing; the agent soft-fences locally via
+# pg_ctl, so fence mode must NOT re-introduce a pod-delete grant.
 repmgr_role_fence=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --set repmgr.splitBrainDetection.action=fence --show-only templates/rbac.yaml 2>&1)
 pods_rules_fence=$(printf '%s' "${repmgr_role_fence}" | python3 -c "${pods_rules_fmt}")
-assert_contains "#154: fence mode grants delete scoped to pod names" "${pods_rules_fence}" "pods verbs=delete,get,patch scoped=yes"
+assert_contains "#286: fence mode still scopes get/patch to pod names" "${pods_rules_fence}" "pods verbs=get,patch scoped=yes"
+assert_not_contains "#286: fence mode grants no pod delete (agent soft-fences)" "${pods_rules_fence}" "delete"
 
-# Full: RBAC role restricts deployment to pgpool resource name
+# #286: the pgpool Deployment get/patch grant existed so the service-updater could
+# restart pgpool after a repmgrd failover. The agent re-points the Services instead.
 full_role=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" --show-only templates/rbac.yaml 2>&1)
-assert_contains "full: role has deployment resourceNames" "${full_role}" "test-pg-pgpool"
+assert_not_contains "#286: no pgpool Deployment grant in the Role" "${full_role}" "test-pg-pgpool"
 
 # Repmgr: should have headless service
 assert_contains "repmgr: headless service present" "${repmgr}" "clusterIP: None"
 
-# Repmgr: service-updater configmap
-assert_contains "repmgr: service-updater configmap present" "${repmgr}" "service-updater"
+# #286: the service-updater ConfigMap (its rendered script) is gone with the sidecar.
+assert_not_contains "#286: no service-updater ConfigMap" "${repmgr}" "service-updater"
 
 # Render full template
 full=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" 2>&1)
@@ -155,10 +161,10 @@ assert_contains "#157: archive_command doubles single quotes in the stanza" "${s
 # exist. With replicaCount=0 the -readonly Service has zero endpoints, so a backend1
 # there fails every health check and churns pgpool into "restarting myself" cycles,
 # killing live connections to the healthy primary.
-pgpool_agent_ro=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set repmgr.enabled=true --set repmgr.failoverMode=agent --set postgresql.replicaCount=2 --show-only templates/pgpool-configmap.yaml 2>&1)
+pgpool_agent_ro=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set repmgr.enabled=true --set postgresql.replicaCount=2 --show-only templates/pgpool-configmap.yaml 2>&1)
 assert_contains "#207: agent mode with standbys configures RO backend1" "${pgpool_agent_ro}" "backend_hostname1 = 'test-pg-readonly"
 assert_contains "#207: agent mode with standbys weights primary 0" "${pgpool_agent_ro}" "backend_weight0 = 0"
-pgpool_agent_primary=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set repmgr.enabled=true --set repmgr.failoverMode=agent --set postgresql.replicaCount=0 --show-only templates/pgpool-configmap.yaml 2>&1)
+pgpool_agent_primary=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set repmgr.enabled=true --set postgresql.replicaCount=0 --show-only templates/pgpool-configmap.yaml 2>&1)
 assert_not_contains "#207: agent mode primary-only omits RO backend1" "${pgpool_agent_primary}" "backend_hostname1"
 assert_contains "#207: agent mode primary-only weights the sole primary 1" "${pgpool_agent_primary}" "backend_weight0 = 1"
 
@@ -378,11 +384,11 @@ assert_not_contains "netpol minimal: no exporter policy" "${netpol_minimal}" "te
 assert_contains "netpol: egress allows 443" "${netpol}" "port: 443"
 assert_contains "netpol: egress allows 6443" "${netpol}" "port: 6443"
 
-# Test: postgresql egress allows the pgpool backend port (#129). service-updater
-# health-checks pgpool from the pg pods; without an egress rule for 9999 the
-# check times out and perpetually rollout-restarts pgpool. The pgpool policy's
-# ingress also allows 9999, so isolate the postgresql policy's egress block to
-# prove the rule is on the egress side specifically.
+# #129/#286: the postgresql policy used to egress to pgpool's backend port (9999) so the
+# service-updater could health-check it. That sidecar is gone and nothing in the postgresql
+# pods connects to pgpool, so the rule was dropped -- traffic only flows pgpool ->
+# postgresql. The pgpool policy's own ingress still allows 9999, so isolate the postgresql
+# policy's egress block to prove the removal is on the egress side specifically.
 pg_egress=$(printf '%s\n' "${netpol}" | awk '
   /^---/ { inpg=0; eg=0 }
   /name: test-pg-postgresql$/ { inpg=1 }
@@ -390,10 +396,9 @@ pg_egress=$(printf '%s\n' "${netpol}" | awk '
   eg && /^---/ { eg=0 }
   eg { print }
 ')
-assert_contains "netpol: postgresql egress allows pgpool port 9999 (#129)" "${pg_egress}" "port: 9999"
-assert_contains "netpol: postgresql egress targets pgpool component (#129)" "${pg_egress}" "app.kubernetes.io/component: pgpool"
-# pgpool disabled -> no pgpool egress rule (the rule is gated on pgpool.enabled)
-assert_not_contains "netpol minimal: no pgpool egress when pgpool disabled (#129)" "${netpol_minimal}" "app.kubernetes.io/component: pgpool"
+assert_not_contains "#286: postgresql egress no longer opens pgpool port 9999" "${pg_egress}" "port: 9999"
+assert_not_contains "#286: postgresql egress does not target the pgpool component" "${pg_egress}" "app.kubernetes.io/component: pgpool"
+assert_not_contains "netpol minimal: no pgpool egress when pgpool disabled" "${netpol_minimal}" "app.kubernetes.io/component: pgpool"
 
 # Test: egress derives S3 port from pgbackrest endpoint with explicit port
 netpol_pgbackrest=$(helm template test-pg "${CHART_DIR}" \
@@ -447,10 +452,10 @@ assert_not_contains "#135: pgpool netpol omits 9719 when metrics disabled" "${ne
 # rule's from: list (which rejected rule-shaped input and limited peers to 5432).
 # Parse the postgresql policy: a correct splice yields 2 ingress rules, one with
 # the extra port; the old from:-nesting yielded a single rule.
-# Pin repmgrd mode so the base ingress-rule count is deterministic (agent mode adds
-# an agent-metrics rule); this test isolates the extraIngress splice shape.
+# Standalone pins the base ingress-rule count (HA mode adds an agent-metrics rule);
+# this test isolates the extraIngress splice shape.
 netpol_xi=$(helm template test-pg "${CHART_DIR}" --set networkPolicy.enabled=true \
-  --set repmgr.failoverMode=repmgrd \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 \
   --set 'networkPolicy.postgresql.extraIngress[0].from[0].namespaceSelector.matchLabels.name=monitoring' \
   --set 'networkPolicy.postgresql.extraIngress[0].ports[0].port=9116' \
   --show-only templates/networkpolicy.yaml 2>&1)
@@ -522,32 +527,11 @@ assert_contains "config repmgr: checksum annotation present" "${config_repmgr}" 
 # Config repmgr: pgHba entries in postStart
 assert_contains "config repmgr: pgHba entry in postStart" "${config_repmgr}" "host all all 10.244.0.0/16 md5"
 
-# #144: in the repmgr branch pg_hba is first-match-wins behind the image's broad
-# 10.0.0.0/8 and 0.0.0.0/0 catch-alls, so user entries appended at EOF could
-# never match. They must be inserted above the first non-loopback host rule.
-hba_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
-  --set 'postgresql.pgHba[0]=host replication repmgr 10.0.0.0/8 trust' \
-  --show-only templates/statefulset.yaml 2>&1)
-assert_contains "#144: repmgr pgHba inserted above network rules (sentinel present)" "${hba_repmgr}" "user pgHba entries (above network auth rules)"
-assert_not_contains "#144: repmgr pgHba no longer appended at EOF" "${hba_repmgr}" "sed -i '\$ a"
-# behavioral: extract the insertion awk from the rendered postStart and run it
-# over a sample pg_hba mirroring the repmgr image's file (post md5-fallback).
-hba_awk_body=$(printf '%s\n' "${hba_repmgr}" | sed -n "/awk -v ins=0/,/HBA_FILE_USER\" > \"/p" | sed '1d;$d')
-hba_bodyfile=$(mktemp); printf '%s\n' "${hba_awk_body}" > "${hba_bodyfile}"
-hba_sample=$(mktemp)
-printf '%s\n' \
-  "local   all all all trust" \
-  "host    all all 127.0.0.1/32 trust" \
-  "host    all all ::1/128 trust" \
-  "host    replication all 10.0.0.0/8 scram-sha-256" \
-  "host    all all 0.0.0.0/0 md5" > "${hba_sample}"
-hba_result=$(awk -v ins=0 -f "${hba_bodyfile}" "${hba_sample}")
-ut_ln=$(printf '%s\n' "${hba_result}" | grep -n "repmgr 10.0.0.0/8 trust" | head -1 | cut -d: -f1)
-lo_ln=$(printf '%s\n' "${hba_result}" | grep -n "::1/128" | head -1 | cut -d: -f1)
-sc_ln=$(printf '%s\n' "${hba_result}" | grep -n "all 10.0.0.0/8 scram-sha-256" | head -1 | cut -d: -f1)
-if [ -n "${ut_ln}" ] && [ -n "${lo_ln}" ] && [ -n "${sc_ln}" ] && [ "${ut_ln}" -gt "${lo_ln}" ] && [ "${ut_ln}" -lt "${sc_ln}" ]; then hba144=ok; else hba144="ut=${ut_ln:-x} lo=${lo_ln:-x} sc=${sc_ln:-x}"; fi
-assert_eq "#144: user pgHba lands below loopback and above network auth rules" "ok" "${hba144}"
-rm -f "${hba_bodyfile}" "${hba_sample}"
+# #144: the repmgr-branch postStart pg_hba insert (user entries spliced above the
+# image's broad 10.0.0.0/8 and 0.0.0.0/0 catch-alls) went with repmgrd (#286). The agent
+# is the single author of pg_hba now and receives user entries via POSTGRESQL_PGHBA --
+# asserted in the "#199 + #144" block further down. Standalone still uses its own
+# postStart sed insert, covered by the "config standalone: pgHba entry in postStart" case.
 
 # Test: configuration disabled still renders setup-config, which strips a
 # stale include_dir left in PGDATA by a previous enable (#107)
@@ -620,27 +604,35 @@ assert_not_contains "standalone additionalCommands: no primary discovery" "${sta
 repmgr_no_addcmd=$(helm template test-pg "${CHART_DIR}" \
   -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/statefulset.yaml 2>&1)
-repmgr_no_addcmd_poststart=$(echo "${repmgr_no_addcmd}" | sed -n '/postStart:/,/preStop:\|resources:/p')
+# Extract exactly the postStart block: from `postStart:` until the next key at the same
+# or shallower indentation. The old `/postStart:/,/preStop:|resources:/` range broke when
+# #286 removed the preStop hook -- it then ran on into the readinessProbe, which legitimately
+# calls pg_is_in_recovery, and the "no primary discovery" assertion failed on the probe.
+repmgr_no_addcmd_poststart=$(echo "${repmgr_no_addcmd}" | awk '
+  /postStart:/ && !f { f=1; ind=match($0, /[^ ]/); print; next }
+  f { if (match($0, /[^ ]/) <= ind && $0 ~ /[^ ]/) exit; print }
+')
 assert_not_contains "repmgr no additionalCommands: no primary discovery in postStart" "${repmgr_no_addcmd_poststart:-empty}" "pg_is_in_recovery"
 assert_not_contains "repmgr no additionalCommands: no PGHOST in postStart" "${repmgr_no_addcmd_poststart:-empty}" "PGHOST"
 
-# --- Graceful Shutdown (preStop) Tests ---
+# --- Graceful Shutdown Tests ---
 
-# Test: repmgr enabled renders preStop hook
-assert_contains "repmgr: preStop hook present" "${repmgr_no_addcmd}" "preStop:"
-assert_contains "repmgr: preStop runs pg_ctl stop" "${repmgr_no_addcmd}" "pg_ctl stop"
+# #286: the HA arm renders NO preStop hook. The agent is PID 1 and owns SIGTERM
+# (release the Lease, then stop its postgres child); a preStop `pg_ctl stop` would race
+# the supervisor and stop postgres before the Lease was released. The repmgrd-tuned
+# preStop that used to render here went with repmgrd.
+assert_not_contains "#286: HA renders no preStop hook" "${repmgr_no_addcmd}" "preStop:"
 assert_contains "repmgr: terminationGracePeriodSeconds present" "${repmgr_no_addcmd}" "terminationGracePeriodSeconds: 120"
 
-# Test: preStop must not promote out-of-band; a raw pg_promote() bypasses
-# repmgr.nodes metadata and strands every repmgrd on stale state (#102)
-assert_not_contains "repmgr: preStop does not call pg_promote" "${repmgr_no_addcmd}" "pg_promote"
-assert_not_contains "repmgr: preStop does not target a standby" "${repmgr_no_addcmd}" "STANDBY_HOST"
+# A hook must never promote out-of-band: a raw pg_promote() bypasses the agent's
+# lease/timeline election and strands the cluster on stale state (#102).
+assert_not_contains "repmgr: no out-of-band pg_promote" "${repmgr_no_addcmd}" "pg_promote"
+assert_not_contains "repmgr: nothing targets a standby on shutdown" "${repmgr_no_addcmd}" "STANDBY_HOST"
 
-# Test: repmgr with configuration renders both preStop and postStart
+# Test: repmgr with configuration still renders postStart
 repmgr_config=$(helm template test-pg "${CHART_DIR}" \
   -f "${SCRIPT_DIR}/values-config-repmgr.yaml" \
   --show-only templates/statefulset.yaml 2>&1)
-assert_contains "repmgr+config: preStop hook present" "${repmgr_config}" "preStop:"
 assert_contains "repmgr+config: postStart hook present" "${repmgr_config}" "postStart:"
 
 # Test: custom terminationGracePeriodSeconds
@@ -650,41 +642,18 @@ repmgr_custom_tgp=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "repmgr: custom terminationGracePeriodSeconds" "${repmgr_custom_tgp}" "terminationGracePeriodSeconds: 300"
 
-# Test: repmgrd sidecar has preStop hook and securityContext
-repmgrd_section=$(echo "${repmgr_no_addcmd}" | sed -n '/name: repmgrd/,/name: service-updater/p')
-assert_contains "repmgr: repmgrd has preStop hook" "${repmgrd_section}" "preStop:"
-assert_contains "repmgr: repmgrd preStop runs daemon stop" "${repmgrd_section}" "repmgr daemon stop"
-assert_contains "repmgr: repmgrd has allowPrivilegeEscalation false" "${repmgrd_section}" "allowPrivilegeEscalation: false"
-
-# Test: service-updater sidecar has preStop hook, liveness probe, and securityContext
-service_updater_section=$(echo "${repmgr_no_addcmd}" | sed -n '/name: service-updater/,/^      volumes:/p')
-assert_contains "repmgr: service-updater has preStop hook" "${service_updater_section}" "preStop:"
-assert_contains "repmgr: service-updater preStop sleeps" "${service_updater_section}" "sleep 5"
-assert_contains "repmgr: service-updater has livenessProbe" "${service_updater_section}" "livenessProbe:"
-assert_contains "repmgr: service-updater liveness checks heartbeat file" "${service_updater_section}" "service-updater-alive"
-assert_contains "repmgr: service-updater has allowPrivilegeEscalation false" "${service_updater_section}" "allowPrivilegeEscalation: false"
-# #177: the service-updater script computes its scan range from replicaCount at
-# template time and never reads REPMGR_NODE_COUNT, so the env must not be injected
-# into this container (it stays on the repmgr-init/postgresql/repmgrd containers,
-# which the image scripts do consume).
-assert_not_contains "repmgr #177: service-updater drops the dead REPMGR_NODE_COUNT env" "${service_updater_section}" "REPMGR_NODE_COUNT"
-# #139: the service-updater mounts repmgr.conf so the master can run
-# `repmgr standby unregister` to clean up ghost repmgr.nodes rows after a scale-down.
-assert_contains "repmgr #139: service-updater mounts repmgr-config (/etc/repmgr)" "${service_updater_section}" "mountPath: /etc/repmgr"
-
-# Test: service-updater configmap writes heartbeat file
-assert_contains "repmgr: service-updater script writes heartbeat" "${repmgr_no_addcmd}" "service-updater-alive"
-
-# Test: split-brain handling present in service-updater configmap
-assert_contains "repmgr: split-brain handling in service-updater" "${repmgr}" "handle_split_brain"
-
-# #139: the configmap cleans up ghost repmgr.nodes rows on the primary after a
-# scale-down via `repmgr standby unregister`.
-assert_contains "repmgr #139: service-updater has ghost-node cleanup" "${repmgr}" "cleanup_ghost_nodes"
-assert_contains "repmgr #139: ghost cleanup uses repmgr standby unregister" "${repmgr}" "standby unregister --node-id"
-# Only standby rows are cleanup candidates -- a primary-type ghost can't be removed by
-# `standby unregister`, so excluding it avoids a forever-retried, forever-warned unregister.
-assert_contains "repmgr #139: ghost cleanup lists only standby rows" "${repmgr}" "FROM repmgr.nodes WHERE type = 'standby'"
+# #286: the repmgrd and service-updater containers, and the service-updater ConfigMap
+# that carried their script, are all gone. The behaviour that script implemented lives in
+# the agent and is asserted where the code now is:
+#   - split-brain handling / fencing  -> internal/reconcile (Go tests)
+#   - ghost repmgr.nodes cleanup (#139) -> cmd/agent ghostNodeIDs + the scaledown suite
+#   - stale-primary selector (#124), LSN/timeline ordering (#131, #168), split-brain
+#     re-assert (#169), durable marker (#125) -> internal/pg + internal/k8s (Go tests)
+assert_not_contains "#286: no repmgrd container" "${repmgr_no_addcmd}" "name: repmgrd"
+assert_not_contains "#286: no service-updater container" "${repmgr_no_addcmd}" "name: service-updater"
+assert_not_contains "#286: no service-updater heartbeat file" "${repmgr_no_addcmd}" "service-updater-alive"
+assert_not_contains "#286: no split-brain shell handler" "${repmgr}" "handle_split_brain"
+assert_not_contains "#286: no shell ghost-node cleanup" "${repmgr}" "cleanup_ghost_nodes"
 
 # Test: SPLIT_BRAIN_ACTION env var in statefulset
 assert_contains "repmgr: SPLIT_BRAIN_ACTION env var in statefulset" "${repmgr_no_addcmd}" "SPLIT_BRAIN_ACTION"
@@ -692,136 +661,18 @@ assert_contains "repmgr: SPLIT_BRAIN_ACTION env var in statefulset" "${repmgr_no
 # Test: split-brain handling not present when repmgr disabled
 assert_not_contains "minimal: no split-brain handling" "${minimal}" "handle_split_brain"
 
-# --- Stale-primary selector safety (#124) and LSN fence ordering (#131) ---
-su_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
-  --show-only templates/service-updater-configmap.yaml 2>&1)
-
-# #124: master is determined by actual role (pg_is_in_recovery), not by each
-# node's self-reported repmgr.nodes metadata (which a stale primary forges)
-assert_contains "su #124: classifies primaries by pg_is_in_recovery" "${su_cm}" "SELECT pg_is_in_recovery();"
-assert_not_contains "su #124: no longer trusts repmgr.nodes metadata for master" "${su_cm}" "WHERE type = 'primary' AND active = true"
-# #124: the selector only moves when exactly one primary exists; a split-brain
-# is handled (not used to repoint the selector to the lowest-ordinal node)
-assert_contains "su #124: selector update gated on single primary" "${su_cm}" 'PRIMARY_COUNT" -eq 1'
-assert_contains "su #124: two-or-more primaries routed to split-brain handler" "${su_cm}" 'PRIMARY_COUNT" -ge 2'
-
-# #131: fence picks the survivor by timeline then numeric LSN, not a
-# lexicographic string compare that mis-orders unpadded hex
-assert_not_contains "su #131: no lexicographic LSN string compare" "${su_cm}" '"$lsn" > "$best_lsn"'
-assert_contains "su #131: numeric hex LSN comparison" "${su_cm}" "16#"
-assert_contains "su #131: survivor selection is timeline-first" "${su_cm}" "pg_walfile_name(pg_current_wal_lsn())"
-
-# #131: behavioral unit test of the LSN comparator extracted from the rendered
-# script -- the boundary cases the lexicographic compare got wrong
-printf '%s' "${su_cm}" | python3 -c "import sys,yaml; sys.stdout.write(yaml.safe_load(sys.stdin)['data']['service-updater.sh'])" > "${SCRIPT_DIR}/.lsn_gt_render.sh"
-sed -n '/^lsn_gt() {/,/^}/p' "${SCRIPT_DIR}/.lsn_gt_render.sh" > "${SCRIPT_DIR}/.lsn_gt_fn.sh"
-lsn_cmp_rc=0
-bash -c '
-  source "'"${SCRIPT_DIR}"'/.lsn_gt_fn.sh"
-  # left genuinely ahead -> true; the cases lexicographic compare inverted
-  lsn_gt "10/00000001" "9/2B3C4D50" || exit 1
-  lsn_gt "100/0" "F2/FFFFFFFF" || exit 1
-  lsn_gt "2/3000000" "2/2FFFFFF" || exit 1
-  # behind or equal -> false
-  lsn_gt "9/2B3C4D50" "10/00000001" && exit 1
-  lsn_gt "5/100" "5/100" && exit 1
-  exit 0
-' || lsn_cmp_rc=$?
-assert_eq "su #131: lsn_gt orders unpadded hex LSNs numerically" "0" "${lsn_cmp_rc}"
-rm -f "${SCRIPT_DIR}/.lsn_gt_render.sh" "${SCRIPT_DIR}/.lsn_gt_fn.sh"
-
-# #168: the WAL-filename timeline is HEXADECIMAL; it must be decoded with 16#,
-# not a SQL ::int cast (which errors at TL 0x0A and is wrong from 0x10). The
-# timeline read must NOT use ::int, and tl_to_int must decode hex correctly.
-assert_not_contains "su #168: timeline not parsed with ::int (hex-as-decimal bug)" "${su_cm}" "from 1 for 8)::int"
-assert_contains "su #168: timeline decoded via tl_to_int helper" "${su_cm}" "tl_to_int"
-# behavioral unit test of the decoder extracted from the rendered script
-printf '%s' "${su_cm}" | python3 -c "import sys,yaml; sys.stdout.write(yaml.safe_load(sys.stdin)['data']['service-updater.sh'])" > "${SCRIPT_DIR}/.tl_render.sh"
-sed -n '/^tl_to_int() {/,/^}/p' "${SCRIPT_DIR}/.tl_render.sh" > "${SCRIPT_DIR}/.tl_fn.sh"
-tl_rc=0
-bash -c '
-  source "'"${SCRIPT_DIR}"'/.tl_fn.sh"
-  [ "$(tl_to_int 00000001)" = "1" ]  || exit 1   # TL 1
-  [ "$(tl_to_int 00000009)" = "9" ]  || exit 1   # TL 9 (last where hex==dec)
-  [ "$(tl_to_int 0000000A)" = "10" ] || exit 1   # TL 10: ::int would ERROR
-  [ "$(tl_to_int 00000010)" = "16" ] || exit 1   # TL 16: ::int would yield 10
-  [ "$(tl_to_int 000000FF)" = "255" ] || exit 1
-  [ -z "$(tl_to_int "")" ]       || exit 1        # empty -> empty
-  [ -z "$(tl_to_int "garbage")" ] || exit 1       # non-hex -> empty
-  exit 0
-' || tl_rc=$?
-assert_eq "su #168: tl_to_int decodes hex timelines (10->10, 16->16, not ::int)" "0" "${tl_rc}"
-rm -f "${SCRIPT_DIR}/.tl_render.sh" "${SCRIPT_DIR}/.tl_fn.sh"
-
-# --- #169: split-brain re-asserts the write selector to the highest-TL primary ---
-# Under the default action=log the handler must keep re-asserting the write
-# selector (so an ArgoCD sync re-applying the chart's hardcoded pod-0 selector
-# during a split-brain window cannot strand writes), and it must re-assert
-# toward the HIGHEST-timeline live primary -- the legitimate post-failover node,
-# the same survivor the fence path keeps -- not a stale lower-timeline one.
-assert_contains "su #169: log-mode split-brain re-asserts highest-timeline selector" "${su_cm}" "re-asserting write selector to highest-timeline primary"
-# behavioral unit test of handle_split_brain extracted from the rendered script.
-# timeout is stubbed to run its command; psql returns a per-host timeline|LSN so
-# the real survivor selection (tl_to_int + lsn_gt, also sourced) is exercised.
-printf '%s' "${su_cm}" | python3 -c "import sys,yaml; sys.stdout.write(yaml.safe_load(sys.stdin)['data']['service-updater.sh'])" > "${SCRIPT_DIR}/.sb_render.sh"
-sed -n '/^handle_split_brain() {/,/^}/p' "${SCRIPT_DIR}/.sb_render.sh" >  "${SCRIPT_DIR}/.sb_fn.sh"
-sed -n '/^tl_to_int() {/,/^}/p'          "${SCRIPT_DIR}/.sb_render.sh" >> "${SCRIPT_DIR}/.sb_fn.sh"
-sed -n '/^lsn_gt() {/,/^}/p'             "${SCRIPT_DIR}/.sb_render.sh" >> "${SCRIPT_DIR}/.sb_fn.sh"
-sb_rc=0
-bash -c '
-  source "'"${SCRIPT_DIR}"'/.sb_fn.sh"
-  PRIMARY_COUNT=2
-  REPMGR_PASSWORD=x REPMGR_USER=r REPMGR_DB=d NAMESPACE=ns
-  timeout() { shift; "$@"; }            # drop the duration, run the command
-  update_pod_role_labels() { :; }
-  kubectl() { :; }                      # no-op the fence deletion path
-  # pod-1 is on the higher timeline (the legitimate post-failover primary)
-  hi_tl() { local h=""; while [ $# -gt 0 ]; do [ "$1" = "-h" ] && h="$2"; shift; done
-            case "$h" in *-0.*) echo "00000003|3/10";; *-1.*) echo "00000004|4/20";; *) echo "";; esac; }
-
-  # log mode re-asserts toward the highest-TL primary (pod-1), even though the
-  # stale pod-0 is also live and is where LAST_MASTER/the selector points
-  psql() { hi_tl "$@"; }
-  SELECTED=""; update_service_selector() { SELECTED="$1"; }
-  SPLIT_BRAIN_ACTION=log LAST_MASTER=test-pg-0 PRIMARY_NODES="test-pg-0.h.ns test-pg-1.h.ns" handle_split_brain >/dev/null 2>&1
-  [ "$SELECTED" = "test-pg-1" ] || exit 1
-
-  # order independence: same winner when pod-1 is listed first
-  SELECTED=""; update_service_selector() { SELECTED="$1"; }
-  SPLIT_BRAIN_ACTION=log LAST_MASTER="" PRIMARY_NODES="test-pg-1.h.ns test-pg-0.h.ns" handle_split_brain >/dev/null 2>&1
-  [ "$SELECTED" = "test-pg-1" ] || exit 1
-
-  # no readable timeline anywhere -> passive (selector untouched)
-  psql() { echo ""; }
-  SELECTED=""; update_service_selector() { SELECTED="$1"; }
-  SPLIT_BRAIN_ACTION=log LAST_MASTER=test-pg-0 PRIMARY_NODES="test-pg-0.h.ns test-pg-1.h.ns" handle_split_brain >/dev/null 2>&1
-  [ -z "$SELECTED" ] || exit 1
-
-  # fence mode selects the same highest-TL survivor
-  psql() { hi_tl "$@"; }
-  SELECTED=""; update_service_selector() { SELECTED="$1"; }
-  SPLIT_BRAIN_ACTION=fence LAST_MASTER=test-pg-0 PRIMARY_NODES="test-pg-0.h.ns test-pg-1.h.ns" handle_split_brain >/dev/null 2>&1
-  [ "$SELECTED" = "test-pg-1" ] || exit 1
-  exit 0
-' || sb_rc=$?
-assert_eq "su #169: split-brain selects highest-TL primary (log re-asserts, fence too)" "0" "${sb_rc}"
-rm -f "${SCRIPT_DIR}/.sb_render.sh" "${SCRIPT_DIR}/.sb_fn.sh"
-
 # --- Durable primary marker (#125) ---
-# The service-updater records the highest-timeline primary in a ConfigMap so a
-# node booting first under OrderedReady can tell it is stale even when the real
-# primary is not up yet.
-assert_contains "su #125: reads the durable marker" "${su_cm}" "read_marker()"
-assert_contains "su #125: writes the durable marker" "${su_cm}" "write_marker()"
-assert_contains "su #125: refuses a primary below the recorded highwater timeline" "${su_cm}" "below the recorded primary"
-# statefulset passes the marker name to the service-updater container
+# The highest-timeline primary is recorded in a ConfigMap so a node booting first can
+# tell it is stale even when the real primary is not up yet. The read/write of that
+# marker moved into the agent with #286 (internal/k8s/marker.go, covered by Go tests);
+# what the chart still owns is propagating the marker's NAME to the containers.
 sts_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/statefulset.yaml 2>&1)
-assert_contains "su #125: PRIMARY_MARKER env propagated" "${sts_repmgr}" "name: PRIMARY_MARKER"
-assert_contains "su #125: marker name is <fullname>-primary" "${sts_repmgr}" "test-pg-primary"
+assert_contains "#125: PRIMARY_MARKER env propagated" "${sts_repmgr}" "name: PRIMARY_MARKER"
+assert_contains "#125: marker name is <fullname>-primary" "${sts_repmgr}" "test-pg-primary"
 # #170: the entrypoint stale-primary guard (postgresql container) reads the
 # marker to gate its empty-data settle, so the marker env must reach the
-# postgresql container itself -- not just the service-updater sidecar.
+# postgresql container itself.
 pg_cont=$(printf '%s\n' "${sts_repmgr}" | awk '/^        - name: postgresql$/{f=1; next} f && /^        - name: /{exit} f{print}')
 assert_contains "#170: postgresql container gets PRIMARY_MARKER (guard reads marker)" "${pg_cont}" "name: PRIMARY_MARKER"
 assert_contains "#170: postgresql container gets NAMESPACE" "${pg_cont}" "name: NAMESPACE"
@@ -847,20 +698,23 @@ startup_off=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repm
 assert_not_contains "#172: startupProbe omitted when disabled" "${startup_off}" "startupProbe:"
 assert_contains "#172: livenessProbe still present when startupProbe disabled" "${startup_off}" "livenessProbe:"
 
-# #176: the #125 full-restart guard depends on OrderedReady (lowest-ordinal pod
-# boots first and ALONE). Pin/assert it so switching to Parallel -- which would
-# silently stop exercising the guard -- fails the suite instead.
-assert_contains "#176: statefulset pins podManagementPolicy OrderedReady (#125 depends on it)" "${sts_repmgr}" "podManagementPolicy: OrderedReady"
+# #176/#286: the HA render pins Parallel -- all pods are present at a cold boot so the
+# lease winner compares timelines across the complete candidate set. OrderedReady now
+# renders only for standalone. Pinned so a silent flip fails the suite.
+assert_contains "#286: HA statefulset pins podManagementPolicy Parallel" "${sts_repmgr}" "podManagementPolicy: Parallel"
+sts_standalone_pmp=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#286: standalone statefulset keeps OrderedReady" "${sts_standalone_pmp}" "podManagementPolicy: OrderedReady"
 
-# --- agent failover mode (repmgr.failoverMode: agent) ---
-# The lease-based Go agent replaces repmgrd + service-updater. These assert the
-# mode renders correctly while the default repmgrd path stays byte-stable.
+# --- agent HA arm ---
+# The lease-based Go agent is the only failover path since #286.
 agent_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --show-only templates/statefulset.yaml 2>&1)
-# #176: agent mode flips podManagementPolicy to Parallel (complete-candidate
-# survivor selection at cold boot); repmgrd stays OrderedReady (asserted above).
+# #176: HA uses podManagementPolicy Parallel (complete-candidate survivor selection at
+# cold boot); only standalone renders OrderedReady (asserted above).
 assert_contains "agent #176: podManagementPolicy Parallel" "${agent_sts}" "podManagementPolicy: Parallel"
-assert_not_contains "agent #176: not OrderedReady in agent mode" "${agent_sts}" "podManagementPolicy: OrderedReady"
+assert_not_contains "agent #176: HA is never OrderedReady" "${agent_sts}" "podManagementPolicy: OrderedReady"
 # postgresql container runs the entrypoint 'agent' arm
 assert_contains "agent: postgresql runs the agent arm" "${agent_sts}" '"/usr/local/bin/entrypoint.sh", "agent"'
 # repmgrd + service-updater sidecars are gone
@@ -879,9 +733,10 @@ assert_contains "agent: POD_CIDR env present (hardened pg_hba)" "${agent_pg_cont
 agent_hba=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set 'postgresql.pgHba[0]=host all admin 10.1.0.0/16 scram-sha-256' --show-only templates/statefulset.yaml 2>&1)
 assert_contains "agent: postgresql.pgHba flows to POSTGRESQL_PGHBA" "${agent_hba}" "name: POSTGRESQL_PGHBA"
-# repmgrd mode does not get these (the agent-only pg_hba ownership; byte-stable)
-repmgrd_sts_hba=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" --show-only templates/statefulset.yaml 2>&1)
-assert_not_contains "repmgrd: no POD_CIDR env (agent-only pg_hba ownership)" "${repmgrd_sts_hba}" "name: POD_CIDR"
+# standalone has no agent, so it gets none of this (the agent owns pg_hba)
+standalone_sts_hba=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "standalone: no POD_CIDR env (agent-only pg_hba ownership)" "${standalone_sts_hba}" "name: POD_CIDR"
 # config completeness: the agent's Load() fail-fasts on any missing var, so a
 # dropped env here is a boot crash-loop the other asserts would not catch.
 agent_env_missing=""
@@ -898,8 +753,8 @@ assert_contains "agent: liveness probes the agent /healthz" "${agent_pg_cont}" "
 # a standby is mid-clone. Primary readiness stays plain pg_isready.
 assert_contains "agent #186: readiness checks recovery role" "${agent_pg_cont}" "SELECT pg_is_in_recovery()"
 assert_contains "agent #186: standby readiness gated on streaming" "${agent_pg_cont}" "SELECT status FROM pg_stat_wal_receiver"
-# repmgrd mode keeps the bare pg_isready readiness probe (byte-stable).
-assert_not_contains "repmgrd #186: readiness stays bare pg_isready (no wal_receiver check)" "${repmgrd_sts_hba}" "SELECT status FROM pg_stat_wal_receiver"
+# standalone keeps the bare pg_isready readiness probe -- there is no replication.
+assert_not_contains "standalone #186: readiness stays bare pg_isready (no wal_receiver check)" "${standalone_sts_hba}" "SELECT status FROM pg_stat_wal_receiver"
 # startupProbe (#172) kept in agent mode
 assert_contains "agent #172: startupProbe kept" "${agent_pg_cont}" "startupProbe:"
 # the agent owns SIGTERM shutdown, so the repmgrd-tuned preStop pg_ctl stop is
@@ -925,15 +780,13 @@ assert_not_contains "agent rbac: no pods delete in log mode" "${agent_rbac}" '"d
 # the events:create grant (service-updater only) must be dropped (least privilege)
 assert_not_contains "agent rbac: no events grant (agent emits no Events)" "${agent_rbac}" 'resources: ["events"]'
 # Agent mode NEVER grants pods delete, even in fence mode: the agent soft-fences
-# locally via pg_ctl and never calls pods.Delete (the delete grant is the repmgrd
-# service-updater's split-brain net only). Least privilege for the 1.0.0 default.
+# locally via pg_ctl and never calls pods.Delete. Since #286 removed the repmgrd
+# service-updater -- the only thing that ever used it -- the verb is gone entirely.
 agent_rbac_fence=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.splitBrainDetection.action=fence --show-only templates/rbac.yaml 2>&1)
 assert_not_contains "agent rbac: fence mode still grants NO pods delete (soft fence is local)" "${agent_rbac_fence}" '"delete"'
-# repmgrd mode + fence DOES grant delete (the service-updater split-brain net, #154).
-repmgrd_rbac_fence=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
-  --set repmgr.splitBrainDetection.action=fence --show-only templates/rbac.yaml 2>&1)
-assert_contains "repmgrd rbac: fence mode grants pods delete (service-updater net)" "${repmgrd_rbac_fence}" '"delete"'
+# #286: there is no longer ANY mode that grants pods delete -- the repmgrd
+# service-updater was the only consumer of that verb.
 
 # agent pgpool backends front the RW/RO Services, failover off, health checks on
 agent_pgpool=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent-pgpool.yaml" \
@@ -958,9 +811,11 @@ assert_contains "agent netpol: apiserver egress present" "${agent_np}" "port: 64
 agent_headless=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --show-only templates/service-headless.yaml 2>&1)
 assert_contains "agent headless: exposes agent-metrics port" "${agent_headless}" "name: agent-metrics"
-repmgrd_headless=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+# standalone has no agent, so the headless Service exposes no metrics port
+standalone_headless=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 \
   --show-only templates/service-headless.yaml 2>&1)
-assert_not_contains "repmgrd headless: no agent-metrics port (byte-stable)" "${repmgrd_headless}" "agent-metrics"
+assert_not_contains "standalone headless: no agent-metrics port" "${standalone_headless}" "agent-metrics"
 agent_sm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.agent.monitoring.serviceMonitor.enabled=true --show-only templates/agent-servicemonitor.yaml 2>&1)
 assert_contains "agent monitoring: ServiceMonitor scrapes agent-metrics" "${agent_sm}" "port: agent-metrics"
@@ -974,10 +829,11 @@ assert_contains "agent monitoring: rules scoped to this release's headless Servi
 agent_sm_off=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --show-only templates/agent-servicemonitor.yaml 2>&1 || true)
 assert_not_contains "agent monitoring: ServiceMonitor off by default" "${agent_sm_off}" "kind: ServiceMonitor"
-# agent-gated: not rendered in repmgrd mode even if enabled
-agent_pr_repmgrd=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+# agent-gated: not rendered in standalone mode even if enabled (there is no agent)
+agent_pr_standalone=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 \
   --set repmgr.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1 || true)
-assert_not_contains "agent monitoring: PrometheusRule not in repmgrd mode" "${agent_pr_repmgrd}" "kind: PrometheusRule"
+assert_not_contains "agent monitoring: PrometheusRule not in standalone mode" "${agent_pr_standalone}" "kind: PrometheusRule"
 
 # agent etcd DCS (BYO/shared): backend selectable; etcd env + TLS mount, the leases
 # RBAC dropped, NetworkPolicy egress to 2379; the default kubernetes backend is
@@ -1192,136 +1048,64 @@ assert_not_contains "#161: PDB never renders both minAvailable and maxUnavailabl
 
 # values-cloud.yaml preset: 3-node, hard zone spread, managed-cloud lease timings.
 # Off by default (base renders no DoNotSchedule spread).
-cloud=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/../values-cloud.yaml" --set repmgr.failoverMode=agent --show-only templates/statefulset.yaml 2>&1)
+cloud=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/../values-cloud.yaml" --show-only templates/statefulset.yaml 2>&1)
 assert_contains "cloud preset: 3-node cluster (replicas: 3)" "${cloud}" "replicas: 3"
 assert_contains "cloud preset: hard zone topologySpread" "${cloud}" "whenUnsatisfiable: DoNotSchedule"
 assert_contains "cloud preset: managed-cloud lease timing (30s)" "${cloud}" 'value: "30s"'
 base_sts_spread=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" --show-only templates/statefulset.yaml 2>&1)
 assert_not_contains "cloud preset: hard zone spread off by default" "${base_sts_spread}" "whenUnsatisfiable: DoNotSchedule"
 
-# regression: default (no failoverMode) still renders repmgrd + service-updater
+# #286: repmgrd is gone -- the HA render must carry neither sidecar, in any mode.
 default_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/statefulset.yaml 2>&1)
-assert_contains "agent regression: default still runs repmgrd" "${default_sts}" "name: repmgrd"
-assert_contains "agent regression: default still runs service-updater" "${default_sts}" "name: service-updater"
+assert_not_contains "#286: no repmgrd container in any render" "${default_sts}" "name: repmgrd"
+assert_not_contains "#286: no service-updater container in any render" "${default_sts}" "name: service-updater"
+assert_contains "#286: the HA arm runs the agent entrypoint" "${default_sts}" '"/usr/local/bin/entrypoint.sh", "agent"'
+
+# #286: the removed repmgrd keys fail the render rather than being silently ignored --
+# a values file still pinning failoverMode: repmgrd must not quietly deploy an agent.
+for removed in repmgr.failoverMode=repmgrd repmgr.failoverMode=agent \
+               repmgr.serviceUpdater.resources.requests.cpu=50m \
+               repmgr.monitoringHistoryDays=7 pgpool.autoFailback=true; do
+  removed_rc=0
+  removed_out=$(helm template test-pg "${CHART_DIR}" --set "${removed}" 2>&1) || removed_rc=$?
+  assert_eq "#286: ${removed%%=*} is rejected at render time" "1" "$([ "${removed_rc}" -ne 0 ] && echo 1 || echo 0)"
+  assert_contains "#286: ${removed%%=*} rejection names the 2.0.0 removal" "${removed_out}" "removed in chart 2.0.0"
+done
+# The repmgrd rejection must point at the immutable-field consequence, since deleting the
+# key silently flips podManagementPolicy on an existing StatefulSet.
+repmgrd_msg=$(helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=repmgrd 2>&1 || true)
+assert_contains "#286: repmgrd rejection warns about podManagementPolicy" "${repmgrd_msg}" "IMMUTABLE"
 
 # values.schema.json: enum guards reject typos at template/install time.
-schema_bad_mode_rc=0
-helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=bogus >/dev/null 2>&1 || schema_bad_mode_rc=$?
-assert_eq "schema: invalid failoverMode rejected" "1" "$([ "${schema_bad_mode_rc}" -ne 0 ] && echo 1 || echo 0)"
 schema_bad_dcs_rc=0
-helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=agent --set repmgr.agent.dcs.backend=zookeeper >/dev/null 2>&1 || schema_bad_dcs_rc=$?
+helm template test-pg "${CHART_DIR}" --set repmgr.agent.dcs.backend=zookeeper >/dev/null 2>&1 || schema_bad_dcs_rc=$?
 assert_eq "schema: invalid dcs.backend rejected" "1" "$([ "${schema_bad_dcs_rc}" -ne 0 ] && echo 1 || echo 0)"
 
 # rbac grants configmap access for the marker
 rbac_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/rbac.yaml 2>&1)
 assert_contains "su #125: rbac grants configmaps verbs" "${rbac_repmgr}" "configmaps"
-# the marker is runtime-owned (service-updater create/apply), not a helm
-# template, so helm upgrade / ArgoCD sync cannot reset the highwater
-assert_contains "su #125: marker written at runtime via kubectl" "${su_cm}" "kubectl create configmap"
+# The marker stays runtime-owned (the agent creates/updates it through the API), not a
+# helm template, so a helm upgrade / ArgoCD sync cannot reset the highwater. The write
+# path is Go now -- internal/k8s/marker.go, covered by its own tests.
+assert_not_contains "#286: no marker ConfigMap rendered by helm" "${repmgr}" "test-pg-primary\n"
 
-# --- #171/#173/#174: lone-primary marker guard hardening (service-updater) ---
-# read_marker must distinguish a corrupt marker from an absent one (#174), and
-# evaluate_lone_primary must fail closed on an unreadable timeline even with no
-# marker (#173) and on an equal-timeline different-node split-brain (#171),
-# while still allowing a legitimate higher-timeline failover through.
-printf '%s' "${su_cm}" | python3 -c "import sys,yaml; sys.stdout.write(yaml.safe_load(sys.stdin)['data']['service-updater.sh'])" > "${SCRIPT_DIR}/.su_render.sh"
-sed -n '/^read_marker() {/,/^}/p'           "${SCRIPT_DIR}/.su_render.sh" >  "${SCRIPT_DIR}/.su_fn.sh"
-sed -n '/^evaluate_lone_primary() {/,/^}/p' "${SCRIPT_DIR}/.su_render.sh" >> "${SCRIPT_DIR}/.su_fn.sh"
-
-# read_marker: a present-but-corrupt timeline is flagged, not aliased to absent
-rm_rc=0
-bash -c '
-  source "'"${SCRIPT_DIR}"'/.su_fn.sh"
-  PRIMARY_MARKER=m NAMESPACE=ns
-  kubectl() { echo "test-pg-1|5"; }                 # valid marker
-  read_marker
-  [ "$MARKER_PRIMARY" = "test-pg-1" ] && [ "$MARKER_TL" = "5" ] && [ "$MARKER_MALFORMED" = false ] || exit 1
-  kubectl() { echo "test-pg-1|garbage"; }           # corrupt timeline
-  read_marker
-  [ "$MARKER_TL" = "0" ] && [ "$MARKER_MALFORMED" = true ] || exit 2
-  kubectl() { return 1; }                           # absent (kubectl get fails)
-  read_marker
-  [ "$MARKER_TL" = "0" ] && [ "$MARKER_MALFORMED" = false ] || exit 3
-  exit 0
-' || rm_rc=$?
-assert_eq "su #174: read_marker flags a corrupt marker distinct from absent" "0" "${rm_rc}"
-
-# evaluate_lone_primary: fail-closed vs proceed decisions
-elp_rc=0
-bash -c '
-  source "'"${SCRIPT_DIR}"'/.su_fn.sh"
-  PRIMARY_MARKER=m NAMESPACE=ns
-  check() { evaluate_lone_primary >/dev/null 2>&1; [ "$skip_select" = "$1" ] || { echo "case $2: skip=$skip_select want $1"; exit 1; }; }
-  # #173: unreadable timeline with NO marker must still skip (bug: it selected)
-  MARKER_MALFORMED=false MARKER_TL=0 MARKER_PRIMARY="" CURRENT_MASTER=test-pg-0 current_tl=""; check true u173
-  # #174: corrupt marker -> skip even with a valid current_tl
-  MARKER_MALFORMED=true MARKER_TL=0 MARKER_PRIMARY=test-pg-1 CURRENT_MASTER=test-pg-0 current_tl=7; check true u174
-  # #171: same TL, different node -> skip (equal-timeline split-brain)
-  MARKER_MALFORMED=false MARKER_TL=5 MARKER_PRIMARY=test-pg-1 CURRENT_MASTER=test-pg-0 current_tl=5; check true u171
-  # below marker -> skip (existing #125 behavior preserved)
-  MARKER_MALFORMED=false MARKER_TL=5 MARKER_PRIMARY=test-pg-1 CURRENT_MASTER=test-pg-0 current_tl=4; check true below
-  # legitimate higher-TL failover -> proceed
-  MARKER_MALFORMED=false MARKER_TL=5 MARKER_PRIMARY=test-pg-1 CURRENT_MASTER=test-pg-0 current_tl=6; check false advance
-  # same node re-asserting its own TL -> proceed
-  MARKER_MALFORMED=false MARKER_TL=5 MARKER_PRIMARY=test-pg-0 CURRENT_MASTER=test-pg-0 current_tl=5; check false reassert
-  # valid timeline, no marker yet (bootstrap) -> proceed
-  MARKER_MALFORMED=false MARKER_TL=0 MARKER_PRIMARY="" CURRENT_MASTER=test-pg-0 current_tl=3; check false bootstrap
-  # #176/#168: the comparison must stay numeric past TL 10 (0x0A), where the old
-  # ::int-on-hex bug broke. tl_to_int already feeds decimals here; assert the
-  # -lt/-gt/-eq arithmetic is right above the boundary too.
-  MARKER_MALFORMED=false MARKER_TL=10 MARKER_PRIMARY=test-pg-1 CURRENT_MASTER=test-pg-0 current_tl=16; check false hi_advance
-  MARKER_MALFORMED=false MARKER_TL=16 MARKER_PRIMARY=test-pg-1 CURRENT_MASTER=test-pg-0 current_tl=10; check true  hi_below
-  MARKER_MALFORMED=false MARKER_TL=10 MARKER_PRIMARY=test-pg-1 CURRENT_MASTER=test-pg-0 current_tl=10; check true  hi_sametl_diffnode
-  exit 0
-' || elp_rc=$?
-assert_eq "su #171/#173: lone-primary guard fails closed on unverified/split-brain, proceeds on valid failover" "0" "${elp_rc}"
-rm -f "${SCRIPT_DIR}/.su_render.sh" "${SCRIPT_DIR}/.su_fn.sh"
-
-# #138: LAST_MASTER must seed from the live write-Service selector, not "". The
-# sidecar's process state doesn't survive a restart, so an empty seed made the
-# first tick treat the existing primary as a "master change" and spuriously
-# rollout-restart pgpool (severing pooled connections) on every install/upgrade/
-# rolling restart. Seeding from the selector restarts pgpool only on a real
-# transition.
-assert_contains "#138: LAST_MASTER seeded from service selector" "${su_cm}" 'LAST_MASTER=$(kubectl get service'
-assert_not_contains "#138: LAST_MASTER not initialized empty" "${su_cm}" 'LAST_MASTER=""'
-# behavioral: source the extracted seeding line with kubectl stubbed
-seed_line=$(printf '%s\n' "${su_cm}" | grep -m1 'LAST_MASTER=$(kubectl get service' | sed 's/^[[:space:]]*//')
-seed_file=$(mktemp); printf '%s\n' "${seed_line}" > "${seed_file}"
-seed_present=$(MASTER_SERVICE=svc NAMESPACE=ns bash -c 'kubectl() { echo pg-repmgr-1; }; source '"${seed_file}"'; printf "%s" "$LAST_MASTER"')
-assert_eq "#138: seeds to the current selector pod" "pg-repmgr-1" "${seed_present}"
-seed_absent=$(MASTER_SERVICE=svc NAMESPACE=ns bash -c 'kubectl() { return 1; }; source '"${seed_file}"'; printf "%s" "$LAST_MASTER"')
-assert_eq "#138: seeds empty when no selector exists yet" "" "${seed_absent}"
-rm -f "${seed_file}"
-
-# #140: a non-master pod may be labeled pg-role=standby (and thus join the
-# readonly Service) only when it is actually in recovery. A reachable non-master
-# that is NOT in recovery is a stale/divergent primary -> pg-role=orphan (kept
-# out of reads); an unreachable pod is left untouched. Extract the function and
-# drive it with stubbed kubectl/psql.
-printf '%s' "${su_cm}" | python3 -c "import sys,yaml;[sys.stdout.write(d['data']['service-updater.sh']) for d in yaml.safe_load_all(sys.stdin) if d and d.get('kind')=='ConfigMap' and 'service-updater.sh' in d.get('data',{})]" > "${SCRIPT_DIR}/.uprl_render.sh"
-sed -n '/^update_pod_role_labels() {/,/^}/p' "${SCRIPT_DIR}/.uprl_render.sh" > "${SCRIPT_DIR}/.uprl_fn.sh"
-uprl_out=$(bash -c '
-  source "'"${SCRIPT_DIR}"'/.uprl_fn.sh"
-  NAMESPACE=ns HEADLESS_SERVICE=hl REPMGR_USER=r REPMGR_PASSWORD=x REPMGR_DB=d
-  timeout() { shift; "$@"; }
-  kubectl() { case "$1" in
-      get)   printf "pg-0 primary\npg-1 orphan\npg-2 standby\npg-3 standby\n" ;;
-      label) echo "label ${3}=${6}" ;;
-    esac ; }
-  psql() { local h=""; while [ $# -gt 0 ]; do [ "$1" = "-h" ] && h="$2"; shift; done
-    case "$h" in *pg-1.*) echo t;; *pg-2.*) echo f;; *pg-3.*) return 1;; esac ; }
-  update_pod_role_labels pg-0
-')
-echo "${uprl_out}" | grep -q "label pg-1=pg-role=standby" && uprl_a=ok || uprl_a=no
-echo "${uprl_out}" | grep -q "label pg-2=pg-role=orphan"  && uprl_b=ok || uprl_b=no
-echo "${uprl_out}" | grep -q "label pg-3="                && uprl_c=no || uprl_c=ok
-assert_eq "#140: in-recovery non-master labeled standby" "ok" "${uprl_a}"
-assert_eq "#140: not-in-recovery non-master labeled orphan (kept out of reads)" "ok" "${uprl_b}"
-assert_eq "#140: unreachable non-master left untouched" "ok" "${uprl_c}"
-rm -f "${SCRIPT_DIR}/.uprl_render.sh" "${SCRIPT_DIR}/.uprl_fn.sh"
+# --- #171/#173/#174/#138/#140: behaviour that moved into the agent with #286 ---
+# These were behavioural unit tests of shell functions extracted from the rendered
+# service-updater ConfigMap. That ConfigMap and its script are gone; the same logic now
+# lives in Go and is tested there:
+#   - read_marker / evaluate_lone_primary corrupt-vs-absent marker, fail-closed on an
+#     unreadable timeline, equal-timeline split-brain (#174/#173/#171)
+#       -> internal/k8s/marker.go, internal/reconcile
+#   - LAST_MASTER seeding from the live write-Service selector (#138)
+#       -> the agent reconciles Service selectors from the Lease every tick, so there is
+#          no cross-restart process state to seed
+#   - pg-role labeling of non-master pods: standby only when actually in recovery,
+#     orphan when not, untouched when unreachable (#140)
+#       -> internal/k8s (role labeling), covered by its own tests
+# What the chart still owns -- that the marker is runtime-owned rather than templated,
+# and that the RBAC verbs exist for it -- is asserted above.
 
 # Test: repmgr disabled does not render preStop or terminationGracePeriodSeconds
 assert_not_contains "minimal: no preStop hook" "${minimal}" "preStop:"
@@ -1434,21 +1218,16 @@ exporter_deploy166=$(helm template test-pg "${CHART_DIR}" --set prometheusExport
 assert_contains "#166: exporter pod disables SA token automount" "${exporter_deploy166}" "automountServiceAccountToken: false"
 sts_agent166=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1)
 assert_not_contains "#166: repmgr StatefulSet keeps its SA token (agent needs the API)" "${sts_agent166}" "automountServiceAccountToken"
-sts_repmgrd166=$(helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=repmgrd --show-only templates/statefulset.yaml 2>&1)
-assert_not_contains "#166: repmgrd-mode StatefulSet also keeps its SA token (service-updater needs the API)" "${sts_repmgrd166}" "automountServiceAccountToken"
 sts_standalone166=$(helm template test-pg "${CHART_DIR}" --set repmgr.enabled=false --set postgresql.replicaCount=0 --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#166: standalone StatefulSet disables SA token automount" "${sts_standalone166}" "automountServiceAccountToken: false"
 
-# #199: in agent mode the agent is the SINGLE author of pg_hba.conf -- the md5-first
-# compat layer + the md5->scram re-hash are folded into the agent, so the postStart md5
-# blocks (which raced the agent and left rejoined standbys SCRAM-only) run only in
-# repmgrd mode. The agent gets MIGRATE_LEGACY_MD5_USERS to run the re-hash on promotion.
-assert_not_contains "#199: agent mode drops the postStart md5-fallback awk" "${sts_agent166}" "md5 fallback applied"
-assert_not_contains "#199: agent mode drops the postStart md5->scram re-hash" "${sts_agent166}" "fix_user_auth"
-assert_contains "#199: agent mode passes MIGRATE_LEGACY_MD5_USERS to the agent" "${sts_agent166}" "MIGRATE_LEGACY_MD5_USERS"
-assert_contains "#199: repmgrd mode keeps the postStart md5-fallback awk" "${sts_repmgrd166}" "md5 fallback applied"
-assert_contains "#199: repmgrd mode keeps the postStart md5->scram re-hash" "${sts_repmgrd166}" "fix_user_auth"
-assert_not_contains "#199: MIGRATE_LEGACY_MD5_USERS is agent-only (absent in repmgrd)" "${sts_repmgrd166}" "MIGRATE_LEGACY_MD5_USERS"
+# #199: the agent is the SINGLE author of pg_hba.conf -- the md5-first compat layer and
+# the md5->scram re-hash live in the agent. The postStart md5 blocks that used to do this
+# in repmgrd mode (and raced the agent, leaving rejoined standbys SCRAM-only) went with
+# repmgrd itself (#286), so they must not appear in any render.
+assert_not_contains "#199: no postStart md5-fallback awk" "${sts_agent166}" "md5 fallback applied"
+assert_not_contains "#199: no postStart md5->scram re-hash" "${sts_agent166}" "fix_user_auth"
+assert_contains "#199: MIGRATE_LEGACY_MD5_USERS reaches the agent" "${sts_agent166}" "MIGRATE_LEGACY_MD5_USERS"
 # #199 + #144: user pgHba in agent mode flows through the agent (POSTGRESQL_PGHBA env),
 # not the postStart insert (which now runs only in repmgrd mode).
 sts_agent_hba=$(helm template test-pg "${CHART_DIR}" --set 'postgresql.pgHba[0]=host all custom 10.1.2.3/32 reject' --show-only templates/statefulset.yaml 2>&1)
@@ -1906,10 +1685,10 @@ pgbackrest_standalone=$(helm template test-pg "${CHART_DIR}" \
 assert_eq "#142: pgbackrest without repmgr fails fast" "1" "${pgbr_sa_rc}"
 assert_contains "#142: error names the repmgr requirement" "${pgbackrest_standalone}" "pgbackrest.enabled requires repmgr.enabled=true"
 
-# pgBackRest: coexists with repmgr
+# pgBackRest: coexists with the HA agent
 assert_contains "pgbackrest+repmgr: sidecar present" "${pgbackrest_sts}" "name: pgbackrest"
-assert_contains "pgbackrest+repmgr: repmgrd present" "${pgbackrest_sts}" "name: repmgrd"
-assert_contains "pgbackrest+repmgr: service-updater present" "${pgbackrest_sts}" "name: service-updater"
+assert_contains "pgbackrest+repmgr: runs alongside the agent" "${pgbackrest_sts}" '"/usr/local/bin/entrypoint.sh", "agent"'
+assert_not_contains "#286: pgbackrest render has no repmgrd sidecar" "${pgbackrest_sts}" "name: repmgrd"
 
 # pgBackRest: CronJobs (one per backup type) drive scheduling.
 pgbackrest_cron=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/pgbackrest-cronjob.yaml 2>&1)
@@ -2146,13 +1925,6 @@ pgmajor_standalone=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/statefulset.yaml 2>&1)
 assert_not_contains "#269: standalone does not set PG_MAJOR" "${pgmajor_standalone}" "name: PG_MAJOR"
 
-# repmgrd mode adds the sidecar, which runs the same image and needs the same major.
-pgmajor_repmgrd=$(helm template test-pg "${CHART_DIR}" \
-  --set repmgr.failoverMode=repmgrd \
-  --show-only templates/statefulset.yaml 2>&1)
-pgmajor_repmgrd_count=$(grep -c "name: PG_MAJOR" <<< "${pgmajor_repmgrd}")
-assert_eq "#269: repmgrd mode sets PG_MAJOR on all three repmgr-image containers" "3" "${pgmajor_repmgrd_count}"
-
 # the pin only applies in repmgr mode: standalone may run any major
 major_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.enabled=false \
@@ -2178,21 +1950,16 @@ assert_contains "service selector: pod-0 in standalone mode" "${svc_selector_sta
 
 # --- Primary discovery and repmgrd pre-register Tests ---
 
-# The StatefulSet runs replicaCount + 1 pods (ordinals 0..replicaCount), so
-# the postStart discovery loop and the repmgrd peer scan must both reach
-# ordinal replicaCount; replicaCount=2 disambiguates from the old bounds
+# The StatefulSet runs replicaCount + 1 pods (ordinals 0..replicaCount), so the postStart
+# discovery loop must reach ordinal replicaCount; replicaCount=2 disambiguates from the
+# old off-by-one bound (#177). The repmgrd peer scan this used to also cover is gone (#286).
 discovery_sts=$(helm template test-pg "${CHART_DIR}" \
-  --set repmgr.failoverMode=repmgrd \
   --set postgresql.replicaCount=2 \
   --set postgresql.lifecycle.postStart.additionalCommands="echo noop" \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "discovery loops: scan ordinals 0..replicaCount" "${discovery_sts}" "seq 0 2"
 assert_not_contains "postStart discovery: off-by-one bound is gone" "${discovery_sts}" "seq 0 1)"
-assert_not_contains "repmgrd peer scan: hardcoded seq 0 9 is gone" "${discovery_sts}" "seq 0 9"
-assert_not_contains "repmgrd role check: hardcoded postgres user is gone" "${discovery_sts}" "psql -h 127.0.0.1 -U postgres"
-assert_contains "repmgrd role check: uses repmgr credentials" "${discovery_sts}" 'psql -h 127.0.0.1 -U "${REPMGR_USER}"'
-assert_contains "repmgrd backfill: node_id read from repmgr.conf" "${discovery_sts}" 'awk -F='
-assert_not_contains "repmgrd backfill: baked-in node-id convention is gone" "${discovery_sts}" 'ORDINAL + 1000'
+assert_not_contains "peer scan: hardcoded seq 0 9 is gone" "${discovery_sts}" "seq 0 9"
 
 # --- nodeSelector and tolerations Tests ---
 
@@ -2487,26 +2254,15 @@ pgpool_aff=$(helm template test-pg "${CHART_DIR}" \
 assert_contains "zone affinity: pgpool keeps hostname anti-affinity" "${pgpool_aff}" "topologyKey: kubernetes.io/hostname"
 assert_not_contains "zone affinity: pgpool has no zone term" "${pgpool_aff}" "topology.kubernetes.io/zone"
 
-# --- repmgr Monitoring History Retention Tests ---
+# --- repmgr monitoring history (#286: removed with repmgrd) ---
 
-# Test: repmgrd sidecar prunes repmgr.monitoring_history daily on the primary
+# repmgr.monitoring_history was only ever written by repmgrd, and the daily
+# `repmgr cluster cleanup --keep-history` prune ran in the repmgrd sidecar. Both are
+# gone, so no render may carry either the loop or the retention env.
 mhd_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/statefulset.yaml 2>&1)
-assert_contains "repmgr: repmgrd runs cluster cleanup for monitoring history" "${mhd_sts}" 'cluster cleanup --keep-history="${MONITORING_HISTORY_DAYS}"'
-assert_contains "repmgr: cleanup loop gates on pg_is_in_recovery" "${mhd_sts}" 'SELECT pg_is_in_recovery'
-
-# Test: retention defaults to 7 days
-mhd_line=$(printf '%s' "${mhd_sts}" | grep -A1 "name: MONITORING_HISTORY_DAYS" | tail -1)
-assert_contains "repmgr: monitoring history retention defaults to 7 days" "${mhd_line}" 'value: "7"'
-
-# Test: repmgr.monitoringHistoryDays override propagates to the repmgrd env
-mhd_sts_30=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
-  --set repmgr.monitoringHistoryDays=30 \
-  --show-only templates/statefulset.yaml 2>&1)
-mhd_line_30=$(printf '%s' "${mhd_sts_30}" | grep -A1 "name: MONITORING_HISTORY_DAYS" | tail -1)
-assert_contains "repmgr: monitoring history retention override renders" "${mhd_line_30}" 'value: "30"'
-
-# Test: minimal (no repmgr) render carries no cleanup loop or retention env
+assert_not_contains "#286: no monitoring-history cleanup loop" "${mhd_sts}" "cluster cleanup"
+assert_not_contains "#286: no MONITORING_HISTORY_DAYS env" "${mhd_sts}" "MONITORING_HISTORY_DAYS"
 assert_not_contains "minimal: no monitoring history cleanup" "${minimal}" "cluster cleanup"
 assert_not_contains "minimal: no MONITORING_HISTORY_DAYS env" "${minimal}" "MONITORING_HISTORY_DAYS"
 
@@ -2660,38 +2416,14 @@ ro_role=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.y
   --show-only templates/rbac.yaml 2>&1)
 assert_contains "readonly: rbac grants pods list for role labeling" "${ro_role}" 'verbs: \["list"\]'
 
-# Test: service-updater script carries the convergent labeling logic
-ro_updater=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
-  --show-only templates/service-updater-configmap.yaml 2>&1)
-assert_contains "readonly: updater defines update_pod_role_labels" "${ro_updater}" "update_pod_role_labels() {"
-assert_contains "readonly: updater calls labeling each tick" "${ro_updater}" 'update_pod_role_labels "$CURRENT_MASTER"'
-assert_contains "readonly: updater labels with --overwrite for idempotency" "${ro_updater}" 'kubectl label pod "${pod}" -n "${NAMESPACE}" "pg-role=${desired_role}" --overwrite'
-assert_contains "readonly: updater lists pods by chart selector labels" "${ro_updater}" "app.kubernetes.io/instance=test-pg,app.kubernetes.io/component=postgresql"
-
-# --- service-updater Failover Audit Event Tests ---
-
-# Test: service-updater emits a core/v1 PrimaryChanged Event on the Service
-su_audit_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
-  --show-only templates/service-updater-configmap.yaml 2>&1)
-assert_contains "audit event: PrimaryChanged reason present" "${su_audit_cm}" "reason: PrimaryChanged"
-assert_contains "audit event: manifest is core/v1 Event" "${su_audit_cm}" "kind: Event"
-assert_contains "audit event: event regards the primary Service" "${su_audit_cm}" "kind: Service"
-assert_contains "audit event: message carries old and new pod names" "${su_audit_cm}" "message: Primary changed from"
-assert_contains "audit event: event type is Normal" "${su_audit_cm}" "type: Normal"
-assert_contains "audit event: creation failure logged as warning" "${su_audit_cm}" "WARNING: failed to create PrimaryChanged event"
-
-# Test: event emission ordered strictly after the selector patch (patch is
-# correctness, event is observability)
-su_patch_line=$(printf '%s\n' "${su_audit_cm}" | grep -n "kubectl patch service" | head -1 | cut -d: -f1 || true)
-su_event_line=$(printf '%s\n' "${su_audit_cm}" | grep -n 'emit_primary_changed_event "${CURRENT_SELECTOR}"' | head -1 | cut -d: -f1 || true)
-assert_gt "audit event: emission ordered after selector patch" "${su_event_line:-0}" "${su_patch_line:-99999}"
-
-# Test: RBAC role grants create on core events for the audit Event
-su_audit_rbac=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+# #286: the convergent pg-role labeling and the core/v1 PrimaryChanged audit Event were
+# both service-updater shell. The agent does the labeling through the API (internal/k8s,
+# Go tests) and records failover decisions in a structured audit log rather than Events --
+# so the Role must no longer carry an `events` create grant at all.
+ro_role_events=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/rbac.yaml 2>&1)
-assert_contains "audit event: rbac role has events resource" "${su_audit_rbac}" 'resources: \["events"\]'
-su_events_rule=$(printf '%s\n' "${su_audit_rbac}" | grep -A 1 'resources: \["events"\]' || true)
-assert_contains "audit event: events rule grants create verb" "${su_events_rule}" 'verbs: \["create"\]'
+assert_not_contains "#286: Role grants no events create (agent uses an audit log)" "${ro_role_events}" 'resources: \["events"\]'
+assert_not_contains "#286: Role has no unscoped configmaps get/create/patch rule" "${ro_role_events}" 'verbs: \["get", "create", "patch"\]'
 
 # --- Stale-Primary Guard Wiring Tests (issue #123) ---
 # The guard itself lives in the repmgr image entrypoint (so it runs on every
@@ -2788,17 +2520,17 @@ assert_contains "pgvector #28: hook grants pg_monitor" "${pgv_mon}" "GRANT pg_mo
 # agent-mode rendering only for pgvector. Render the agent-mode paths against the
 # pgvector chart to catch that #126-class gap, and confirm the agent is the default.
 pgv_agent_rc=0
-pgv_agent=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=agent \
+pgv_agent=$(helm template test-pgv "${PGVECTOR_DIR}" \
   --show-only templates/statefulset.yaml --show-only templates/rbac.yaml 2>&1) || pgv_agent_rc=$?
 assert_eq "pgvector agent: renders in agent mode" "0" "${pgv_agent_rc}"
 assert_contains "pgvector agent: postgresql runs the agent arm" "${pgv_agent}" '"/usr/local/bin/entrypoint.sh", "agent"'
 assert_not_contains "pgvector agent: no repmgrd sidecar" "${pgv_agent}" "name: repmgrd"
 assert_contains "pgvector agent: rbac grants coordination.k8s.io leases" "${pgv_agent}" "coordination.k8s.io"
 assert_contains "pgvector agent: lease scoped to <fullname>-leader" "${pgv_agent}" "test-pgv-pgvector-leader"
-pgv_agent_hl=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=agent \
+pgv_agent_hl=$(helm template test-pgv "${PGVECTOR_DIR}" \
   --show-only templates/service-headless.yaml 2>&1)
 assert_contains "pgvector agent: headless exposes agent-metrics port" "${pgv_agent_hl}" "name: agent-metrics"
-pgv_agent_mon=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=agent \
+pgv_agent_mon=$(helm template test-pgv "${PGVECTOR_DIR}" \
   --set repmgr.agent.monitoring.serviceMonitor.enabled=true \
   --set repmgr.agent.monitoring.prometheusRule.enabled=true \
   --show-only templates/agent-servicemonitor.yaml --show-only templates/agent-prometheusrule.yaml 2>&1)
@@ -2808,9 +2540,10 @@ assert_contains "pgvector agent: PrometheusRule scoped to the pgvector headless 
 pgv_default=$(helm template test-pgv "${PGVECTOR_DIR}" --show-only templates/statefulset.yaml 2>&1)
 assert_contains "pgvector: default runs the agent arm (1.0.0 default flip)" "${pgv_default}" '"/usr/local/bin/entrypoint.sh", "agent"'
 assert_not_contains "pgvector: default has no repmgrd sidecar" "${pgv_default}" "name: repmgrd"
-# the legacy repmgrd path stays available as an explicit opt-in.
-pgv_repmgrd=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=repmgrd --show-only templates/statefulset.yaml 2>&1)
-assert_contains "pgvector repmgrd: opt-in still runs repmgrd" "${pgv_repmgrd}" "name: repmgrd"
+# #286: pgvector rejects the removed repmgrd key just as pg does (byte-identical templates).
+pgv_repmgrd_rc=0
+helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=repmgrd >/dev/null 2>&1 || pgv_repmgrd_rc=$?
+assert_eq "pgvector #286: repmgr.failoverMode is rejected" "1" "$([ "${pgv_repmgrd_rc}" -ne 0 ] && echo 1 || echo 0)"
 
 # pgvector parity for the security/resource cluster: the templates are symlinked but the
 # values are per-chart, so guard the #126-class "drop a key -> securityContext: null"
@@ -2868,11 +2601,11 @@ assert_gt "H8: bogus pgbackrest.repoEncryption.cipherType rejected by schema" "$
 # K8S-6: the agent ServiceMonitor selector is scoped to the postgresql component so it
 # matches only the headless Service (which carries that label in its metadata + the
 # agent-metrics port), not every Service in the release.
-sm_scope=$(helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=agent \
+sm_scope=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.agent.monitoring.serviceMonitor.enabled=true \
   --show-only templates/agent-servicemonitor.yaml 2>&1)
 assert_contains "K8S-6: agent ServiceMonitor selector scoped to postgresql component" "${sm_scope}" "app.kubernetes.io/component: postgresql"
-hl_label=$(helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=agent \
+hl_label=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/service-headless.yaml 2>&1)
 # the label must live in metadata (the SM matches on metadata labels), i.e. above spec:
 hl_meta=$(printf '%s\n' "${hl_label}" | sed -n '/^metadata:/,/^spec:/p')
@@ -2995,21 +2728,20 @@ tls_req_noenable_rc=0
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set postgresql.tls.require=true >/dev/null 2>&1 || tls_req_noenable_rc=$?
 assert_eq "#110 C2: require without tls.enabled fails fast" "1" "$([ "${tls_req_noenable_rc}" -ne 0 ] && echo 1 || echo 0)"
-# fail-fast: require/mTLS unsupported in repmgrd mode (md5-fallback bypasses hostssl)
-tls_repmgrd_rc=0
+# fail-fast: require/mTLS need the agent-assembled pg_hba, so standalone rejects them
+# (the stock image's md5-fallback line would bypass a hostssl rule).
+tls_standalone_rc=0
 helm template test-pg "${CHART_DIR}" \
-  --set repmgr.enabled=true --set repmgr.failoverMode=repmgrd \
-  --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 \
   --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
-  --set postgresql.tls.require=true >/dev/null 2>&1 || tls_repmgrd_rc=$?
-assert_eq "#110 C2: require in repmgrd mode fails fast (agent-only)" "1" "$([ "${tls_repmgrd_rc}" -ne 0 ] && echo 1 || echo 0)"
-# repmgrd mode with plain server TLS (no require) still renders ssl=on
-tls_repmgrd_ok=$(helm template test-pg "${CHART_DIR}" \
-  --set repmgr.enabled=true --set repmgr.failoverMode=repmgrd \
-  --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
+  --set postgresql.tls.require=true >/dev/null 2>&1 || tls_standalone_rc=$?
+assert_eq "#110 C2: require in standalone mode fails fast (HA-only)" "1" "$([ "${tls_standalone_rc}" -ne 0 ] && echo 1 || echo 0)"
+# standalone with plain server TLS (no require) still renders ssl=on
+tls_standalone_ok=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 \
   --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
   --show-only templates/postgresql-configmap.yaml 2>&1)
-assert_contains "#110 C2: repmgrd mode allows optional server TLS (ssl=on)" "${tls_repmgrd_ok}" "ssl = on"
+assert_contains "#110 C2: standalone allows optional server TLS (ssl=on)" "${tls_standalone_ok}" "ssl = on"
 
 # --- Component 3: PGPool TLS (frontend + backend) ---
 pp_tls=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
@@ -3127,13 +2859,12 @@ casc_on=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.ya
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#29 on: agent gets CASCADE_REPLICATION env" "${casc_on}" 'name: CASCADE_REPLICATION
               value: "true"'
-# repmgrd mode: cascading is agent-only -> the env is never emitted even if the knob is set
-casc_repmgrd=$(helm template test-pg "${CHART_DIR}" \
-  --set repmgr.enabled=true --set repmgr.failoverMode=repmgrd \
-  --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
+# standalone: no agent, so the env is never emitted even if the knob is set
+casc_standalone=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 \
   --set repmgr.agent.cascadingReplication=true \
   --show-only templates/statefulset.yaml 2>&1)
-assert_not_contains "#29: repmgrd mode never gets CASCADE_REPLICATION (agent-only)" "${casc_repmgrd}" "CASCADE_REPLICATION"
+assert_not_contains "#29: standalone never gets CASCADE_REPLICATION (agent-only)" "${casc_standalone}" "CASCADE_REPLICATION"
 
 # ======================================================================
 # #262: postgresql.extraVolumes / extraVolumeMounts / extraEnv passthrough,
@@ -3219,7 +2950,7 @@ assert_eq "#262 pgvector: guards apply too" "1" "$([ "${pgv_guard_rc}" -ne 0 ] &
 
 # --- #276 agent control REST API ---
 
-ctl_base=(--set repmgr.enabled=true --set repmgr.failoverMode=agent
+ctl_base=(--set repmgr.enabled=true
   --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18)
 
 # Default: the control API is OFF, and nothing about it appears anywhere. This is the
@@ -3238,13 +2969,12 @@ helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
   --set repmgr.agent.control.enabled=true >/dev/null 2>&1 || ctl_nosecret_rc=$?
 assert_eq "#276 enabled without tls.existingSecret fails to render" "1" "$([ "${ctl_nosecret_rc}" -ne 0 ] && echo 1 || echo 0)"
 
-# The control API is served by the Go agent, so repmgrd mode cannot offer it.
-ctl_repmgrd_rc=0
-helm template test-pg "${CHART_DIR}" --set repmgr.enabled=true --set repmgr.failoverMode=repmgrd \
-  --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
+# The control API is served by the Go agent, so standalone mode cannot offer it.
+ctl_standalone_rc=0
+helm template test-pg "${CHART_DIR}" --set repmgr.enabled=false --set postgresql.replicaCount=0 \
   --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls \
-  >/dev/null 2>&1 || ctl_repmgrd_rc=$?
-assert_eq "#276 control in repmgrd mode fails to render" "1" "$([ "${ctl_repmgrd_rc}" -ne 0 ] && echo 1 || echo 0)"
+  >/dev/null 2>&1 || ctl_standalone_rc=$?
+assert_eq "#276 control in standalone mode fails to render" "1" "$([ "${ctl_standalone_rc}" -ne 0 ] && echo 1 || echo 0)"
 
 # Sharing the metrics port would defeat the whole point of separate listeners: the
 # NetworkPolicy admits every same-namespace pod to 9200 so scrapes work.
@@ -3594,13 +3324,13 @@ assert_contains "#276 netpol: extraIngress carries its selector" "${ctl_np_open}
 
 # --- pgvector parity (symlinked templates, its own values defaults) ---
 
-pgv_ctl_off=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=agent 2>&1)
+pgv_ctl_off=$(helm template test-pgv "${PGVECTOR_DIR}" 2>&1)
 assert_not_contains "#276 pgvector default: no control listener" "${pgv_ctl_off}" "agent-control"
-pgv_ctl_on=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=agent \
+pgv_ctl_on=$(helm template test-pgv "${PGVECTOR_DIR}" \
   --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls 2>&1)
 assert_contains "#276 pgvector: control renders" "${pgv_ctl_on}" "name: agent-control"
 pgv_ctl_rc=0
-helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=agent \
+helm template test-pgv "${PGVECTOR_DIR}" \
   --set repmgr.agent.control.enabled=true >/dev/null 2>&1 || pgv_ctl_rc=$?
 assert_eq "#276 pgvector: guards apply too" "1" "$([ "${pgv_ctl_rc}" -ne 0 ] && echo 1 || echo 0)"
 

@@ -26,10 +26,10 @@ Required/optional is from the consuming process's perspective at runtime. Secret
 | `REPMGR_DB` | string | yes | `repmgr.database` | entrypoint, init-repmgr, agent |
 | `HEADLESS_SERVICE` | string | yes | `<fullname>-headless.<ns>.svc.cluster.local` | init-repmgr, agent (peer FQDNs) |
 | `REPMGR_NODE_COUNT` | number | yes | `postgresql.replicaCount + 1` | init-repmgr, agent (peer enumeration) |
-| `NAMESPACE` | string | yes | fieldRef `metadata.namespace` | guard, agent, service-updater |
-| `PRIMARY_MARKER` | string | yes | `<fullname>-primary` | guard, agent, service-updater (#125 highwater) |
+| `NAMESPACE` | string | yes | fieldRef `metadata.namespace` | guard, agent |
+| `PRIMARY_MARKER` | string | yes | `<fullname>-primary` | guard, agent (#125 highwater) |
 
-## agent mode only (`repmgr.failoverMode=agent`)
+## HA only (`repmgr.enabled=true`)
 
 The lease-based Go agent (`pg-ha-agent`, PID 1 in the postgresql container) reads
 these; `config.Load` fail-fasts at boot if any is missing.
@@ -123,20 +123,19 @@ missing endpoint/prefix in that mode. With the bundled etcd subchart
 seconds). TLS env is all-or-none; the secret must carry `tls.crt`, `tls.key`, and
 `ca.crt`.
 
-## repmgrd mode only (`repmgr.failoverMode=repmgrd`, the default)
+## Removed in 2.0.0 (#286)
 
-The service-updater sidecar additionally consumes (in addition to the repmgr set):
+The repmgrd failover path and its service-updater sidecar were removed, and with them
+these variables. Nothing injects or reads them any more:
 
-| Variable | Type | Required | Default / source | Consumer |
-|----------|------|----------|------------------|----------|
-| `MASTER_SERVICE` | string | yes | `<fullname>` | service-updater (selector patch) |
-| `SPLIT_BRAIN_ACTION` | enum | yes | `repmgr.splitBrainDetection.action` | service-updater |
-| `MONITORING_HISTORY_DAYS` | number | yes | `repmgr.monitoringHistoryDays` | repmgrd sidecar (cleanup) |
-| `PGPOOL_DEPLOYMENT` / `PGPOOL_SERVICE` / `PGPOOL_PORT` | string/number | when `pgpool.enabled` | `<fullname>-pgpool*` | service-updater |
+| Variable | Was consumed by | Replacement |
+|----------|-----------------|-------------|
+| `MONITORING_HISTORY_DAYS` | repmgrd sidecar (`repmgr cluster cleanup`) | none — only repmgrd wrote `repmgr.monitoring_history` |
+| `PGPOOL_DEPLOYMENT` / `PGPOOL_SERVICE` / `PGPOOL_PORT` | service-updater (pgpool restart on failover) | none — PGPool-II follows the Services the agent re-points |
+| `REPMGR_FAILOVER` | `init-repmgr.sh` (`automatic`/`manual`) | none — the agent always writes `failover=manual` into `repmgr.conf` at boot |
 
-`REPMGR_FAILOVER` (`automatic`/`manual`) is honored by `init-repmgr.sh` when set;
-the chart leaves it default (`automatic`) and the agent rewrites `repmgr.conf` to
-`failover=manual` at boot in agent mode.
+`MASTER_SERVICE` and `SPLIT_BRAIN_ACTION` were listed here too; both survive and are
+consumed by the agent (see the HA table above).
 
 ## pgbackrest (when `pgbackrest.enabled=true`)
 

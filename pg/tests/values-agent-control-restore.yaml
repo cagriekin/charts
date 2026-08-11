@@ -38,7 +38,6 @@ repmgr:
     tag: trixie-5.5.0-29
     pullPolicy: IfNotPresent
   enabled: true
-  failoverMode: agent
 
   agent:
     control:

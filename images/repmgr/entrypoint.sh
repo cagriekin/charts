@@ -284,14 +284,9 @@ EOF
     "init")
         exec /usr/local/bin/init-repmgr.sh
         ;;
-    "repmgrd")
-        exec /usr/local/bin/repmgrd-entrypoint.sh
-        ;;
-    "service-updater")
-        exec /usr/local/bin/service-updater.sh
-        ;;
     *)
-        echo "Usage: $0 {postgres|agent|init|repmgrd|service-updater}"
+        # repmgrd / service-updater were removed with the repmgrd failover path (#286).
+        echo "Usage: $0 {postgres|agent|init}"
         exit 1
         ;;
 esac
