@@ -39,6 +39,37 @@
   | `repmgr.monitoringHistoryDays` | Pruned `repmgr.monitoring_history`, which only repmgrd wrote |
   | `pgpool.autoFailback` | Rendered PGPool's `auto_failback`, which only applied to the repmgrd failover flow |
 
+- **A scale-up could leave the cluster without a serving primary, or with a standby that never
+  replicates** (#297). Both are pre-existing agent-mode bugs affecting every 1.x release; they
+  surfaced here because moving the `upgrade` suite off repmgrd made it the first thing to scale
+  a live agent-mode cluster (repmgrd's `OrderedReady` serialised pod creation and hid them).
+
+  Adding a replica also changes `REPMGR_NODE_COUNT`, which rolls every pod, so the new pod is
+  created while the others restart. Two things could go wrong:
+
+  1. **No serving primary.** The new pod could win the Lease before registering in
+     `repmgr.nodes`. Once it promoted, no survivor held a record for it, so none could
+     `repmgr standby follow` it. *Fix:* a promote candidate now reads `repmgr.nodes` and, if it
+     has no row of its own while a **registered and reachable** peer exists, releases the Lease
+     instead of promoting. Deliberately conservative — an unreadable registry, a cluster where
+     nobody is registered, or an unreachable peer all still promote, because serving with
+     degraded metadata beats refusing to serve.
+  2. **A standby that never replicates.** The new pod's own `repmgr.nodes` copy is a snapshot
+     of the primary taken *before* it registered, so it contains no row for itself, and it
+     cannot obtain one — receiving it requires replicating, and repointing replication is what
+     needs it. It failed `standby follow` with `unable to retrieve record for local node`
+     forever, Running but never Ready. *Fix:* that specific error now triggers a re-clone from
+     the current primary, replacing data and metadata together.
+
+  The second fix is scoped by error string, not by state, and that distinction is load-bearing:
+  `unable to find record for intended **upstream** node` is the ordinary post-failover case
+  where the target simply has not promoted yet, and escalating there demotes and re-clones a
+  healthy standby. A test asserts the upstream variant does **not** escalate.
+
+  Verified on a live KinD cluster: the scale-up reproduced the wedge before the fix, and after
+  it all three nodes come up Ready and agree on the topology; `test-pgpool-failover` still
+  passes with no `pgdata.diverged.*` created.
+
 ### Migrating from 1.x
 
 **If you were on the default (agent):** delete `repmgr.failoverMode: agent` from your values
@@ -74,15 +105,10 @@ SCRAM `pg_hba.conf` with **no implicit `0.0.0.0/0 md5` catch-all** (add explicit
   agent; the agent's `cleanupGhostNodes` runs the same `repmgr standby unregister` on the
   lease holder. The `repmgr-failover`, `repmgr-chaos`, `config-repmgr` and `migrate-agent`
   suites were removed with the mode they tested.
-- The `upgrade` suite no longer scales the cluster up across the upgrade: both of its fixtures
-  install 3 nodes, so it covers the upgrade itself (adding pgpool and the exporter, rolling the
-  pods, preserving data) but not a scale-up. Moving it from repmgrd to the agent surfaced a
-  **pre-existing** agent-mode race in which a new pod can win the Lease before it has
-  registered in `repmgr.nodes`, after which no survivor can follow it and the cluster is left
-  with no serving primary. That is tracked in #297, which restores the scale-up as part of its
-  fix. **Known coverage gap, stated rather than hidden:** no suite currently exercises an
-  agent-mode scale-up of a live cluster, and the race affects every 1.x release in agent mode
-  (a backport decision is recorded on #297).
+- The `upgrade` suite keeps its 2 → 3 scale-up and now also asserts pod **readiness** and
+  per-node topology agreement. It previously asserted only `.status.phase == Running`, which
+  let a permanently-broken standby pass: a node can sit Running-but-never-Ready, silently not
+  replicating (#297).
 - `scripts/check-repmgrd-byte-stable.sh` is now `scripts/check-byte-stable.sh` and diffs the
   default render (there is no second mode to pin). Across the 1.x → 2.0.0 boundary it diffs
   heavily by design; compare against a 2.x ref for a meaningful result.

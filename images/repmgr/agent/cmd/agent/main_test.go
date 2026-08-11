@@ -134,6 +134,8 @@ type scriptedExec struct {
 	regErr       error  // error returned for `repmgr standby register` (nil = success)
 	follows      int    // number of `repmgr standby follow` calls
 	unregistered []int  // node_ids passed to `repmgr standby unregister`
+	followOut    string // combined output for `repmgr standby follow`; non-empty = it fails
+	rejoins      int    // number of `repmgr node rejoin` calls (the #297 re-clone escalation)
 }
 
 func (s *scriptedExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
@@ -150,6 +152,12 @@ func (s *scriptedExec) Run(_ context.Context, _ []string, name string, args ...s
 		return "ok", nil
 	case name == "repmgr" && strings.Contains(joined, "standby follow"):
 		s.follows++
+		if s.followOut != "" {
+			return s.followOut, errors.New("exit status 1")
+		}
+		return "ok", nil
+	case name == "repmgr" && strings.Contains(joined, "node rejoin"):
+		s.rejoins++
 		return "ok", nil
 	case name == "repmgr" && strings.Contains(joined, "standby unregister"):
 		for _, a := range args {
@@ -220,6 +228,40 @@ func TestActFollowRunsWhenNotStreaming(t *testing.T) {
 	}
 	if a.followUpstream != "pg-0" {
 		t.Fatal("followUpstream must latch after a successful follow")
+	}
+}
+
+// #297: a standby absent from its OWN repmgr.nodes copy can never obtain the row, so
+// following is permanently impossible -- it would sit Running-but-never-Ready, silently not
+// replicating. Re-clone from the current primary, which replaces data and metadata together.
+func TestActFollowReclonesWhenLocalRecordMissing(t *testing.T) {
+	ex := &scriptedExec{walRcv: "", followOut: "ERROR: unable to retrieve record for local node 1002"}
+	a := newFollowTestAgent(t, ex)
+	a.followUpstream = "stale"
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-1"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act must recover by re-cloning, got %v", err)
+	}
+	if ex.rejoins != 1 {
+		t.Fatalf("a missing local record must escalate to a rejoin/re-clone, got %d calls", ex.rejoins)
+	}
+	if a.followUpstream != "" {
+		t.Fatalf("the follow latch must reset after a re-clone, got %q", a.followUpstream)
+	}
+}
+
+// ...but a missing UPSTREAM record must NOT re-clone. That is the ordinary post-failover
+// case (the target has not promoted yet) and waiting is correct; re-cloning there demotes a
+// healthy standby and destroys its data directory -- the #286 regression this guards.
+func TestActFollowDoesNotRecloneWhenUpstreamRecordMissing(t *testing.T) {
+	ex := &scriptedExec{walRcv: "", followOut: "ERROR: unable to find record for intended upstream node 1002"}
+	a := newFollowTestAgent(t, ex)
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-1"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err == nil {
+		t.Fatal("a missing upstream record must surface so the next tick retries")
+	}
+	if ex.rejoins != 0 {
+		t.Fatalf("a missing upstream record must NOT re-clone the node, got %d rejoins", ex.rejoins)
 	}
 }
 
