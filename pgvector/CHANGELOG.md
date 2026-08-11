@@ -111,6 +111,15 @@ SCRAM `pg_hba.conf` with **no implicit `0.0.0.0/0 md5` catch-all** (add explicit
   agent; the agent's `cleanupGhostNodes` runs the same `repmgr standby unregister` on the
   lease holder. The `repmgr-failover`, `repmgr-chaos`, `config-repmgr` and `migrate-agent`
   suites were removed with the mode they tested.
+- The `upgrade` suite no longer scales the cluster up across the upgrade: both of its fixtures
+  install 3 nodes, so it covers the upgrade itself (adding pgpool and the exporter, rolling the
+  pods, preserving data) but not a scale-up. Moving it from repmgrd to the agent surfaced a
+  **pre-existing** agent-mode race in which a new pod can win the Lease before it has
+  registered in `repmgr.nodes`, after which no survivor can follow it and the cluster is left
+  with no serving primary. That is tracked in #297, which restores the scale-up as part of its
+  fix. **Known coverage gap, stated rather than hidden:** no suite currently exercises an
+  agent-mode scale-up of a live cluster, and the race affects every 1.x release in agent mode
+  (a backport decision is recorded on #297).
 - `scripts/check-repmgrd-byte-stable.sh` is now `scripts/check-byte-stable.sh` and diffs the
   default render (there is no second mode to pin). Across the 1.x → 2.0.0 boundary it diffs
   heavily by design; compare against a 2.x ref for a meaningful result.
