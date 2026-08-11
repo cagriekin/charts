@@ -94,12 +94,6 @@ func (r *Repmgr) Follow(ctx context.Context, upstreamNodeID int) error {
 		if isAlreadyFollowing(out) {
 			return nil
 		}
-		// The upstream has no record in this node's copy of repmgr.nodes, so repmgr cannot
-		// resolve it and never will -- retrying is futile. Report it distinctly so the
-		// caller can escalate to a rejoin instead of looping (#286).
-		if isUpstreamRecordMissing(out) {
-			return fmt.Errorf("%w: repmgr standby follow onto node %d: %v: %s", ErrUpstreamUnknown, upstreamNodeID, err, strings.TrimSpace(out))
-		}
 		return fmt.Errorf("repmgr standby follow: %w: %s", err, strings.TrimSpace(out))
 	}
 	return nil
@@ -114,16 +108,6 @@ func isAlreadyFollowing(out string) bool {
 	s := strings.ToLower(out)
 	return strings.Contains(s, "already exists as an active slot") &&
 		(strings.Contains(s, "this server is not ahead") || strings.Contains(s, "timelines are same"))
-}
-
-// isUpstreamRecordMissing recognizes the repmgr standby follow output emitted when the
-// intended upstream has no row in repmgr.nodes. Distinct from every other follow failure
-// in that it cannot resolve with time: the record is absent from the only metadata this
-// node can read, and a read-only standby cannot insert it.
-func isUpstreamRecordMissing(out string) bool {
-	s := strings.ToLower(out)
-	return strings.Contains(s, "unable to find record for intended upstream node") ||
-		strings.Contains(s, "unable to retrieve record for upstream node")
 }
 
 func (r *Repmgr) Clone(ctx context.Context, source Conn) error {

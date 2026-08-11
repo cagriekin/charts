@@ -134,8 +134,6 @@ type scriptedExec struct {
 	regErr       error  // error returned for `repmgr standby register` (nil = success)
 	follows      int    // number of `repmgr standby follow` calls
 	unregistered []int  // node_ids passed to `repmgr standby unregister`
-	followOut    string // combined output for `repmgr standby follow`; non-empty = it fails
-	rejoins      int    // number of `repmgr node rejoin` calls (the #286 escalation)
 }
 
 func (s *scriptedExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
@@ -152,12 +150,6 @@ func (s *scriptedExec) Run(_ context.Context, _ []string, name string, args ...s
 		return "ok", nil
 	case name == "repmgr" && strings.Contains(joined, "standby follow"):
 		s.follows++
-		if s.followOut != "" {
-			return s.followOut, errors.New("exit status 23")
-		}
-		return "ok", nil
-	case name == "repmgr" && strings.Contains(joined, "node rejoin"):
-		s.rejoins++
 		return "ok", nil
 	case name == "repmgr" && strings.Contains(joined, "standby unregister"):
 		for _, a := range args {
@@ -228,47 +220,6 @@ func TestActFollowRunsWhenNotStreaming(t *testing.T) {
 	}
 	if a.followUpstream != "pg-0" {
 		t.Fatal("followUpstream must latch after a successful follow")
-	}
-}
-
-// #286: a scale-up can promote a pod the survivors never registered, so their copy of
-// repmgr.nodes holds no row for it and `repmgr standby follow` can never resolve the
-// upstream. Retrying that forever leaves the cluster with no serving primary, so the
-// agent must escalate to a rejoin (rewind onto the current primary, which brings correct
-// data AND metadata) and clear the follow latch so the next tick re-evaluates.
-func TestActFollowEscalatesToRejoinWhenUpstreamUnknown(t *testing.T) {
-	ex := &scriptedExec{
-		walRcv:    "",
-		followOut: "ERROR: unable to find record for intended upstream node 1002",
-	}
-	a := newFollowTestAgent(t, ex)
-	a.followUpstream = "stale"
-	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-2"}
-	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
-		t.Fatalf("act must recover via a rejoin, got %v", err)
-	}
-	if ex.follows != 1 {
-		t.Fatalf("follow must be attempted exactly once before escalating, got %d", ex.follows)
-	}
-	if ex.rejoins != 1 {
-		t.Fatalf("an unresolvable upstream must escalate to `repmgr node rejoin`, got %d calls", ex.rejoins)
-	}
-	if a.followUpstream != "" {
-		t.Fatalf("the follow latch must reset after a rejoin, got %q", a.followUpstream)
-	}
-}
-
-// A transient follow failure must NOT trigger a rejoin: rewinding or re-cloning a healthy
-// standby over a momentary connection error would be far worse than waiting a tick.
-func TestActFollowDoesNotRejoinOnTransientFailure(t *testing.T) {
-	ex := &scriptedExec{walRcv: "", followOut: "ERROR: connection to upstream node failed"}
-	a := newFollowTestAgent(t, ex)
-	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-2"}
-	if err := a.act(context.Background(), dec, reconcile.Observation{}); err == nil {
-		t.Fatal("a transient follow failure must surface so the next tick retries")
-	}
-	if ex.rejoins != 0 {
-		t.Fatalf("a transient failure must not rewind/re-clone the node, got %d rejoins", ex.rejoins)
 	}
 }
 

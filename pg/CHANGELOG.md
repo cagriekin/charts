@@ -39,47 +39,6 @@
   | `repmgr.monitoringHistoryDays` | Pruned `repmgr.monitoring_history`, which only repmgrd wrote |
   | `pgpool.autoFailback` | Rendered PGPool's `auto_failback`, which only applied to the repmgrd failover flow |
 
-### Fixed
-
-- **A scale-up could wedge the cluster with no serving primary** (#286). Adding a replica to
-  a live HA cluster (`postgresql.replicaCount` N → N+1) could leave the former primary
-  unable to rejoin, so nothing served writes until it was manually repaired.
-
-  The new pod can win the Lease before it has ever registered as a standby — it is created
-  concurrently with the rolling restart the `REPMGR_NODE_COUNT` change triggers, so there is
-  a window where no other pod holds the Lease. Once it promotes, the surviving nodes hold no
-  `repmgr.nodes` record for it, and the agent drove repmgr by node id alone:
-
-  ```
-  action=Follow target=pg-2  reason="standby; follow the lease holder"
-  ERROR repmgr standby follow: unable to find record for intended upstream node 1002
-  WARN  repmgr standby register: unable to connect to the primary database
-  ```
-
-  repmgr resolves both the upstream and "the primary" from *this node's own copy* of
-  `repmgr.nodes`, which is only as fresh as its replication and during a scale-up predates
-  the current primary entirely. Its connection flags do not help -- they describe the local
-  node being registered, not the primary to register against ("database connection
-  parameters not required when the standby to be registered is running") -- and a read-only
-  standby cannot insert the row itself. So the condition is terminal, not transient: it
-  repeated every tick with no serving primary.
-
-  `Follow` now reports that specific failure as `ErrUpstreamUnknown`, and the agent
-  escalates to the **rejoin** path instead of retrying: rewind forward onto the current
-  primary, or a preserving re-clone if the histories diverged too far (#175). That lands
-  correct data and correct metadata in one step -- the same recovery a post-failover
-  divergence already uses. Transient follow failures are deliberately excluded and still
-  just retry, so a healthy standby is never rewound over a momentary connection error.
-
-  This bug predates 2.0.0 and affects every 1.x release in agent mode; it went unnoticed
-  because the only suite that scales a live cluster up ran in repmgrd mode (`OrderedReady`,
-  which serialises pod creation and closes the window). Moving that suite to the agent as
-  part of this change is what surfaced it, and it is now the regression test.
-
-  **Release prerequisite:** this fix is in the agent binary, so `repmgr.image.tag` must be
-  republished and bumped past `trixie-5.5.0-29` before 2.0.0 ships. CI builds the image from
-  source, so the suites exercise the fix on this branch regardless.
-
 ### Migrating from 1.x
 
 **If you were on the default (agent):** delete `repmgr.failoverMode: agent` from your values

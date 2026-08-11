@@ -82,38 +82,6 @@ func TestCLICommands(t *testing.T) {
 		}
 	})
 
-	t.Run("follow reports an unresolvable upstream distinctly (#286)", func(t *testing.T) {
-		// A scale-up can promote a pod the survivors never registered, so their copy of
-		// repmgr.nodes has no row for it. repmgr resolves the upstream from that copy
-		// only -- its connection flags describe the LOCAL node -- so this can never
-		// succeed on a retry. It must be distinguishable from a transient failure, so the
-		// agent escalates to a rejoin instead of looping forever with no primary.
-		fr := &fakeRunner{failOn: "standby follow",
-			failOut: "ERROR: unable to find record for intended upstream node 1002"}
-		err := newTestRepmgr(fr).Follow(ctx, 1002)
-		if err == nil {
-			t.Fatal("a missing upstream record must surface as an error")
-		}
-		if !errors.Is(err, ErrUpstreamUnknown) {
-			t.Errorf("want ErrUpstreamUnknown so the caller can escalate to a rejoin, got %v", err)
-		}
-	})
-
-	t.Run("a transient follow failure is NOT reported as unresolvable", func(t *testing.T) {
-		// Only the missing-record case is terminal. A connection failure must stay a
-		// plain error so the next tick retries, rather than triggering a needless
-		// rewind/re-clone of a healthy standby.
-		fr := &fakeRunner{failOn: "standby follow",
-			failOut: "ERROR: connection to upstream node failed"}
-		err := newTestRepmgr(fr).Follow(ctx, 1002)
-		if err == nil {
-			t.Fatal("a connection failure must surface as an error")
-		}
-		if errors.Is(err, ErrUpstreamUnknown) {
-			t.Errorf("a transient failure must not be classed unresolvable: %v", err)
-		}
-	})
-
 	t.Run("follow surfaces a genuine failure", func(t *testing.T) {
 		// A real failure (slot active but NOT the benign already-following case) must
 		// still surface so it is not silently swallowed.

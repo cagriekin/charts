@@ -14,22 +14,6 @@ import (
 // proceed; the caller falls back to ReclonePreserving (the #175 data-safe path).
 var ErrRewindDiverged = errors.New("mechanism: rewind diverged, reclone required")
 
-// ErrUpstreamUnknown is returned by Follow when the mechanism cannot resolve the
-// upstream at all, as opposed to failing to attach to it. With repmgr that means the
-// upstream has no repmgr.nodes record in the copy this node can read.
-//
-// It happens on a scale-up: a new pod can win the Lease and promote before it has ever
-// registered as a standby, so the surviving nodes' metadata -- only as fresh as their
-// replication -- never learned about it. repmgr resolves the upstream and "the primary"
-// from that local copy (its connection flags describe the LOCAL node, not the primary),
-// so no amount of addressing helps: the record simply is not there, and both follow and
-// register fail on every tick forever.
-//
-// The caller escalates to the rejoin path, which rewinds (or re-clones) onto the current
-// primary and thereby obtains correct data AND correct metadata in one step -- the same
-// recovery a post-failover divergence already uses (#286).
-var ErrUpstreamUnknown = errors.New("mechanism: upstream not resolvable from local metadata")
-
 // Conn is how to reach a peer PostgreSQL node for clone/follow/rejoin. Password is
 // passed via PGPASSWORD, never on the command line or in logged argv.
 type Conn struct {
