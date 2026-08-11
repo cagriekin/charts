@@ -654,7 +654,15 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			return err
 		}
 		up := nodeID(dec.Target)
-		regErr := a.mech.RegisterStandby(ctx, up)
+		// Pass the upstream's conninfo, not just its node id: on a scale-up the new pod
+		// can win the Lease before it ever registered as a standby, so no surviving node
+		// holds a repmgr.nodes record for it. Resolving the upstream from local metadata
+		// then fails permanently ("unable to find record for intended upstream node"),
+		// and the register fails too because local metadata still names a former primary
+		// that is now read-only. The Lease holder's pod name is always current, so derive
+		// the connection from it and let repmgr talk to the real primary directly (#286).
+		upConn := a.peerMechConn(dec.Target)
+		regErr := a.mech.RegisterStandby(ctx, upConn, up)
 		if regErr != nil {
 			a.log.Warn("register standby in repmgr.nodes", "err", regErr)
 		}
@@ -677,7 +685,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			a.followUpstream = dec.Target
 			return nil
 		}
-		if err := a.mech.Follow(ctx, up); err != nil {
+		if err := a.mech.Follow(ctx, upConn, up); err != nil {
 			return err
 		}
 		a.followUpstream = dec.Target

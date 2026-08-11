@@ -83,8 +83,19 @@ func (r *Repmgr) Promote(ctx context.Context) error {
 	return nil
 }
 
-func (r *Repmgr) Follow(ctx context.Context, upstreamNodeID int) error {
-	out, err := r.run(ctx, "standby", "follow", "--upstream-node-id="+strconv.Itoa(upstreamNodeID))
+// upstreamArgs are the connection flags that point a repmgr subcommand at a specific
+// upstream instead of letting repmgr resolve one from the local repmgr.nodes copy. That
+// copy is only as fresh as this node's replication, which during a scale-up or a failover
+// can predate the current primary entirely -- the deadlock #286's upgrade suite exposed.
+// The password still travels via PGPASSWORD (see run), never argv.
+func upstreamArgs(c Conn) []string {
+	return []string{"-h", c.Host, "-p", strconv.Itoa(c.port()), "-U", c.User, "-d", c.DB}
+}
+
+func (r *Repmgr) Follow(ctx context.Context, upstream Conn, upstreamNodeID int) error {
+	args := append([]string{"standby", "follow"}, upstreamArgs(upstream)...)
+	args = append(args, "--upstream-node-id="+strconv.Itoa(upstreamNodeID))
+	out, err := r.run(ctx, args...)
 	if err != nil {
 		// #182: a standby already correctly following this upstream (same timeline,
 		// not ahead, its slot already active because it is streaming through it) makes
@@ -157,8 +168,10 @@ func (r *Repmgr) RegisterPrimary(ctx context.Context) error {
 	return nil
 }
 
-func (r *Repmgr) RegisterStandby(ctx context.Context, upstreamNodeID int) error {
-	if out, err := r.run(ctx, "standby", "register", "--upstream-node-id="+strconv.Itoa(upstreamNodeID), "--force"); err != nil {
+func (r *Repmgr) RegisterStandby(ctx context.Context, upstream Conn, upstreamNodeID int) error {
+	args := append([]string{"standby", "register"}, upstreamArgs(upstream)...)
+	args = append(args, "--upstream-node-id="+strconv.Itoa(upstreamNodeID), "--force")
+	if out, err := r.run(ctx, args...); err != nil {
 		return fmt.Errorf("repmgr standby register: %w: %s", err, strings.TrimSpace(out))
 	}
 	return nil
