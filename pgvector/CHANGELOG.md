@@ -56,16 +56,20 @@
   WARN  repmgr standby register: unable to connect to the primary database
   ```
 
-  Both failures are the same root cause: repmgr resolved the upstream through this node's
-  own copy of `repmgr.nodes`, which is only as fresh as its replication and during a
-  scale-up predates the current primary entirely. The register failed too, because that copy
-  still named a former primary that is now read-only — so the node could not even record
-  itself, and retried forever.
+  repmgr resolves both the upstream and "the primary" from *this node's own copy* of
+  `repmgr.nodes`, which is only as fresh as its replication and during a scale-up predates
+  the current primary entirely. Its connection flags do not help -- they describe the local
+  node being registered, not the primary to register against ("database connection
+  parameters not required when the standby to be registered is running") -- and a read-only
+  standby cannot insert the row itself. So the condition is terminal, not transient: it
+  repeated every tick with no serving primary.
 
-  `Follow` and `RegisterStandby` now take the upstream's **connection**, derived from the
-  Lease holder's pod name, and address it with `-h/-p/-U/-d`. The Lease is always current, so
-  repmgr talks to the real primary instead of consulting stale metadata. The password still
-  travels via `PGPASSWORD` only, never argv (#167) — asserted by a test.
+  `Follow` now reports that specific failure as `ErrUpstreamUnknown`, and the agent
+  escalates to the **rejoin** path instead of retrying: rewind forward onto the current
+  primary, or a preserving re-clone if the histories diverged too far (#175). That lands
+  correct data and correct metadata in one step -- the same recovery a post-failover
+  divergence already uses. Transient follow failures are deliberately excluded and still
+  just retry, so a healthy standby is never rewound over a momentary connection error.
 
   This bug predates 2.0.0 and affects every 1.x release in agent mode; it went unnoticed
   because the only suite that scales a live cluster up ran in repmgrd mode (`OrderedReady`,

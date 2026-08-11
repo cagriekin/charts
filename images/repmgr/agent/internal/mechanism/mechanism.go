@@ -14,6 +14,22 @@ import (
 // proceed; the caller falls back to ReclonePreserving (the #175 data-safe path).
 var ErrRewindDiverged = errors.New("mechanism: rewind diverged, reclone required")
 
+// ErrUpstreamUnknown is returned by Follow when the mechanism cannot resolve the
+// upstream at all, as opposed to failing to attach to it. With repmgr that means the
+// upstream has no repmgr.nodes record in the copy this node can read.
+//
+// It happens on a scale-up: a new pod can win the Lease and promote before it has ever
+// registered as a standby, so the surviving nodes' metadata -- only as fresh as their
+// replication -- never learned about it. repmgr resolves the upstream and "the primary"
+// from that local copy (its connection flags describe the LOCAL node, not the primary),
+// so no amount of addressing helps: the record simply is not there, and both follow and
+// register fail on every tick forever.
+//
+// The caller escalates to the rejoin path, which rewinds (or re-clones) onto the current
+// primary and thereby obtains correct data AND correct metadata in one step -- the same
+// recovery a post-failover divergence already uses (#286).
+var ErrUpstreamUnknown = errors.New("mechanism: upstream not resolvable from local metadata")
+
 // Conn is how to reach a peer PostgreSQL node for clone/follow/rejoin. Password is
 // passed via PGPASSWORD, never on the command line or in logged argv.
 type Conn struct {
@@ -53,12 +69,7 @@ type Mechanism interface {
 	// Promote turns the local standby into a read-write primary on a new timeline.
 	Promote(ctx context.Context) error
 	// Follow points the local standby at the upstream node and restarts replication.
-	// upstream is the upstream's connection, passed EXPLICITLY rather than resolved from
-	// repmgr.nodes: on a scale-up the new pod can win the Lease before it ever registered
-	// as a standby, so the surviving nodes hold no record for it and a metadata-resolved
-	// follow deadlocks ("unable to find record for intended upstream node"). The caller
-	// derives the host from the Lease holder's pod name, which is always current.
-	Follow(ctx context.Context, upstream Conn, upstreamNodeID int) error
+	Follow(ctx context.Context, upstreamNodeID int) error
 	// Clone builds the local PGDATA fresh from source (caller guarantees PGDATA is
 	// empty or moved aside).
 	Clone(ctx context.Context, source Conn) error
@@ -70,13 +81,9 @@ type Mechanism interface {
 	// and drops the backup only on success (#175 — never rm -rf before clone succeeds).
 	ReclonePreserving(ctx context.Context, source Conn) error
 	// RegisterPrimary / RegisterStandby reconcile repmgr.nodes toward the
-	// Lease-derived role. RegisterStandby takes the upstream's connection for the same
-	// reason Follow does: it must insert this node's record into the CURRENT primary's
-	// database, and the local metadata's idea of "the primary" can be stale (it names a
-	// node that is now a read-only standby, so the register fails "unable to connect to
-	// the primary database").
+	// Lease-derived role.
 	RegisterPrimary(ctx context.Context) error
-	RegisterStandby(ctx context.Context, upstream Conn, upstreamNodeID int) error
+	RegisterStandby(ctx context.Context, upstreamNodeID int) error
 	// Unregister removes a node's repmgr.nodes record (repmgr standby unregister
 	// --node-id), to clean up the ghost rows a replicaCount scale-down leaves
 	// behind (#139). Run on the primary for nodes the StatefulSet no longer hosts.

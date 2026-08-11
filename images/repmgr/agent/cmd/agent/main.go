@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -654,15 +655,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			return err
 		}
 		up := nodeID(dec.Target)
-		// Pass the upstream's conninfo, not just its node id: on a scale-up the new pod
-		// can win the Lease before it ever registered as a standby, so no surviving node
-		// holds a repmgr.nodes record for it. Resolving the upstream from local metadata
-		// then fails permanently ("unable to find record for intended upstream node"),
-		// and the register fails too because local metadata still names a former primary
-		// that is now read-only. The Lease holder's pod name is always current, so derive
-		// the connection from it and let repmgr talk to the real primary directly (#286).
-		upConn := a.peerMechConn(dec.Target)
-		regErr := a.mech.RegisterStandby(ctx, upConn, up)
+		regErr := a.mech.RegisterStandby(ctx, up)
 		if regErr != nil {
 			a.log.Warn("register standby in repmgr.nodes", "err", regErr)
 		}
@@ -685,7 +678,19 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			a.followUpstream = dec.Target
 			return nil
 		}
-		if err := a.mech.Follow(ctx, upConn, up); err != nil {
+		if err := a.mech.Follow(ctx, up); err != nil {
+			// The upstream is not in this node's copy of repmgr.nodes and never will be:
+			// a scale-up can let a new pod win the Lease and promote before it ever
+			// registered as a standby, so the survivors' metadata never learned it, and a
+			// read-only standby cannot insert the row. Left alone this loops every tick
+			// with no serving primary. Escalate to the rejoin path -- rewind, or a
+			// preserving re-clone -- which lands correct data and correct metadata in one
+			// step, exactly as a post-failover divergence already does (#286).
+			if errors.Is(err, mechanism.ErrUpstreamUnknown) {
+				a.log.Warn("upstream unknown to local metadata; rejoining onto it instead of following",
+					"target", dec.Target, "err", err)
+				return a.rejoinOnto(ctx, dec.Target)
+			}
 			return err
 		}
 		a.followUpstream = dec.Target
@@ -696,23 +701,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		return a.sup.Demote(ctx, true)
 
 	case reconcile.RejoinForward:
-		// Invariant 9: never rewind/reclone onto a different cluster. Checked before
-		// the demote so a healthy node is not stopped for a doomed rejoin.
-		if err := a.assertSameCluster(ctx, dec.Target); err != nil {
-			return err
-		}
-		if err := a.sup.Demote(ctx, true); err != nil {
-			return err
-		}
-		if err := a.mech.RejoinForceRewind(ctx, a.peerMechConn(dec.Target)); err != nil {
-			if err := a.mech.ReclonePreserving(ctx, a.peerMechConn(dec.Target)); err != nil {
-				return err
-			}
-			// A full re-clone: this directory's contents now come from the peer, not from
-			// whatever restore the record beside it describes.
-			a.dropRestoreRecord("the data directory was re-cloned from " + dec.Target)
-		}
-		return a.sup.Start(ctx)
+		return a.rejoinOnto(ctx, dec.Target)
 
 	case reconcile.BootstrapClone:
 		if err := a.mech.Clone(ctx, a.peerMechConn(dec.Target)); err != nil {
@@ -1070,6 +1059,34 @@ func desiredRoleLabels(self string, peers []reconcile.PeerState) map[string]stri
 		}
 	}
 	return m
+}
+
+// rejoinOnto brings this node back under target: rewind forward onto it, or -- if the
+// histories diverged too far for pg_rewind -- re-clone while preserving the old data
+// directory (#175). Shared by the RejoinForward decision and by the Follow path when the
+// upstream is unresolvable from local metadata (#286), because the remedy is identical:
+// take this node's data and metadata from the current primary.
+func (a *agent) rejoinOnto(ctx context.Context, target string) error {
+	// Invariant 9: never rewind/reclone onto a different cluster. Checked before the
+	// demote so a healthy node is not stopped for a doomed rejoin.
+	if err := a.assertSameCluster(ctx, target); err != nil {
+		return err
+	}
+	if err := a.sup.Demote(ctx, true); err != nil {
+		return err
+	}
+	if err := a.mech.RejoinForceRewind(ctx, a.peerMechConn(target)); err != nil {
+		if err := a.mech.ReclonePreserving(ctx, a.peerMechConn(target)); err != nil {
+			return err
+		}
+		// A full re-clone: this directory's contents now come from the peer, not from
+		// whatever restore the record beside it describes.
+		a.dropRestoreRecord("the data directory was re-cloned from " + target)
+	}
+	// The follow latch is meaningless after a rejoin: replication was reconfigured from
+	// scratch, so let the next tick re-evaluate rather than assuming we still track it.
+	a.followUpstream = ""
+	return a.sup.Start(ctx)
 }
 
 func (a *agent) selfConn() pg.ConnInfo {

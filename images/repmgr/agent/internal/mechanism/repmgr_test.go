@@ -45,11 +45,6 @@ func newTestRepmgr(fr *fakeRunner) *Repmgr {
 	return &Repmgr{Runner: fr, Bin: "repmgr", ConfPath: "/etc/repmgr/repmgr.conf", Password: "secret", Now: time.Now}
 }
 
-// upConn is the upstream connection the agent now passes explicitly, so repmgr addresses
-// the current primary by host instead of resolving one from a possibly-stale local
-// repmgr.nodes copy (#286).
-var upConn = Conn{Host: "pg-2.pg-headless", Port: 5432, User: "repmgr", DB: "repmgr"}
-
 func TestCLICommands(t *testing.T) {
 	ctx := context.Background()
 	src := Conn{Host: "pg-1.h", Port: 5432, User: "repmgr", DB: "repmgr", Password: "secret"}
@@ -66,13 +61,10 @@ func TestCLICommands(t *testing.T) {
 
 	t.Run("follow", func(t *testing.T) {
 		fr := &fakeRunner{}
-		if err := newTestRepmgr(fr).Follow(ctx, upConn, 1001); err != nil {
+		if err := newTestRepmgr(fr).Follow(ctx, 1001); err != nil {
 			t.Fatal(err)
 		}
-		// Addressed by host, not resolved from repmgr.nodes: a scale-up leaves the
-		// survivors with no record for a newly-promoted pod, and a metadata-resolved
-		// follow then deadlocks permanently (#286).
-		if got := fr.lastArgs(); !strings.Contains(got, "standby follow -h pg-2.pg-headless -p 5432 -U repmgr -d repmgr --upstream-node-id=1001") {
+		if got := fr.lastArgs(); !strings.Contains(got, "standby follow --upstream-node-id=1001") {
 			t.Errorf("argv = %q", got)
 		}
 	})
@@ -85,8 +77,40 @@ func TestCLICommands(t *testing.T) {
 			"DETAIL: local node lsn is 0/3000000, follow target lsn is 0/3000000\n" +
 			"ERROR: slot \"repmgr_slot_1000\" already exists as an active slot\n" +
 			"NOTICE: STANDBY FOLLOW failed"}
-		if err := newTestRepmgr(fr).Follow(ctx, upConn, 1000); err != nil {
+		if err := newTestRepmgr(fr).Follow(ctx, 1000); err != nil {
 			t.Fatalf("an already-following standby must be a no-op, got %v", err)
+		}
+	})
+
+	t.Run("follow reports an unresolvable upstream distinctly (#286)", func(t *testing.T) {
+		// A scale-up can promote a pod the survivors never registered, so their copy of
+		// repmgr.nodes has no row for it. repmgr resolves the upstream from that copy
+		// only -- its connection flags describe the LOCAL node -- so this can never
+		// succeed on a retry. It must be distinguishable from a transient failure, so the
+		// agent escalates to a rejoin instead of looping forever with no primary.
+		fr := &fakeRunner{failOn: "standby follow",
+			failOut: "ERROR: unable to find record for intended upstream node 1002"}
+		err := newTestRepmgr(fr).Follow(ctx, 1002)
+		if err == nil {
+			t.Fatal("a missing upstream record must surface as an error")
+		}
+		if !errors.Is(err, ErrUpstreamUnknown) {
+			t.Errorf("want ErrUpstreamUnknown so the caller can escalate to a rejoin, got %v", err)
+		}
+	})
+
+	t.Run("a transient follow failure is NOT reported as unresolvable", func(t *testing.T) {
+		// Only the missing-record case is terminal. A connection failure must stay a
+		// plain error so the next tick retries, rather than triggering a needless
+		// rewind/re-clone of a healthy standby.
+		fr := &fakeRunner{failOn: "standby follow",
+			failOut: "ERROR: connection to upstream node failed"}
+		err := newTestRepmgr(fr).Follow(ctx, 1002)
+		if err == nil {
+			t.Fatal("a connection failure must surface as an error")
+		}
+		if errors.Is(err, ErrUpstreamUnknown) {
+			t.Errorf("a transient failure must not be classed unresolvable: %v", err)
 		}
 	})
 
@@ -94,7 +118,7 @@ func TestCLICommands(t *testing.T) {
 		// A real failure (slot active but NOT the benign already-following case) must
 		// still surface so it is not silently swallowed.
 		fr := &fakeRunner{failOn: "standby follow", failOut: "ERROR: connection to upstream node failed"}
-		if err := newTestRepmgr(fr).Follow(ctx, upConn, 1000); err == nil {
+		if err := newTestRepmgr(fr).Follow(ctx, 1000); err == nil {
 			t.Fatal("a genuine follow failure must surface as an error")
 		}
 	})
@@ -104,31 +128,8 @@ func TestCLICommands(t *testing.T) {
 		// not-ahead may mean real work is pending (e.g. a stale slot on a divergent
 		// upstream), so it must surface, not be treated as already-following.
 		fr := &fakeRunner{failOn: "standby follow", failOut: "ERROR: slot \"repmgr_slot_1000\" already exists as an active slot"}
-		if err := newTestRepmgr(fr).Follow(ctx, upConn, 1000); err == nil {
+		if err := newTestRepmgr(fr).Follow(ctx, 1000); err == nil {
 			t.Fatal("slot-active alone (no same-timeline/not-ahead) must surface as an error")
-		}
-	})
-
-	t.Run("follow/register keep the password off argv (#167)", func(t *testing.T) {
-		// upstreamArgs adds -h/-p/-U/-d; the password must still travel only via
-		// PGPASSWORD, since argv is world-readable in the process list.
-		for _, tc := range []struct {
-			name string
-			run  func(r *Repmgr) error
-		}{
-			{"follow", func(r *Repmgr) error { return r.Follow(ctx, upConn, 1001) }},
-			{"register", func(r *Repmgr) error { return r.RegisterStandby(ctx, upConn, 1001) }},
-		} {
-			fr := &fakeRunner{}
-			if err := tc.run(newTestRepmgr(fr)); err != nil {
-				t.Fatalf("%s: %v", tc.name, err)
-			}
-			if got := fr.lastArgs(); strings.Contains(got, "secret") {
-				t.Errorf("%s: password leaked into argv: %q", tc.name, got)
-			}
-			if env := fr.calls[len(fr.calls)-1].env; len(env) == 0 || env[0] != "PGPASSWORD=secret" {
-				t.Errorf("%s: PGPASSWORD not in env: %v", tc.name, env)
-			}
 		}
 	})
 
@@ -220,13 +221,10 @@ func TestCLICommands(t *testing.T) {
 		if got := fr.lastArgs(); !strings.Contains(got, "primary register --force") {
 			t.Errorf("primary argv = %q", got)
 		}
-		if err := r.RegisterStandby(ctx, upConn, 1002); err != nil {
+		if err := r.RegisterStandby(ctx, 1002); err != nil {
 			t.Fatal(err)
 		}
-		// Register against the CURRENT primary by host: local metadata can still name a
-		// former primary that is now read-only, which fails "unable to connect to the
-		// primary database" and leaves this node permanently unregistered (#286).
-		if got := fr.lastArgs(); !strings.Contains(got, "standby register -h pg-2.pg-headless -p 5432 -U repmgr -d repmgr --upstream-node-id=1002 --force") {
+		if got := fr.lastArgs(); !strings.Contains(got, "standby register --upstream-node-id=1002 --force") {
 			t.Errorf("standby argv = %q", got)
 		}
 	})

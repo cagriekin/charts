@@ -83,19 +83,8 @@ func (r *Repmgr) Promote(ctx context.Context) error {
 	return nil
 }
 
-// upstreamArgs are the connection flags that point a repmgr subcommand at a specific
-// upstream instead of letting repmgr resolve one from the local repmgr.nodes copy. That
-// copy is only as fresh as this node's replication, which during a scale-up or a failover
-// can predate the current primary entirely -- the deadlock #286's upgrade suite exposed.
-// The password still travels via PGPASSWORD (see run), never argv.
-func upstreamArgs(c Conn) []string {
-	return []string{"-h", c.Host, "-p", strconv.Itoa(c.port()), "-U", c.User, "-d", c.DB}
-}
-
-func (r *Repmgr) Follow(ctx context.Context, upstream Conn, upstreamNodeID int) error {
-	args := append([]string{"standby", "follow"}, upstreamArgs(upstream)...)
-	args = append(args, "--upstream-node-id="+strconv.Itoa(upstreamNodeID))
-	out, err := r.run(ctx, args...)
+func (r *Repmgr) Follow(ctx context.Context, upstreamNodeID int) error {
+	out, err := r.run(ctx, "standby", "follow", "--upstream-node-id="+strconv.Itoa(upstreamNodeID))
 	if err != nil {
 		// #182: a standby already correctly following this upstream (same timeline,
 		// not ahead, its slot already active because it is streaming through it) makes
@@ -104,6 +93,12 @@ func (r *Repmgr) Follow(ctx context.Context, upstream Conn, upstreamNodeID int) 
 		// tick. A genuine follow failure (different message) still surfaces.
 		if isAlreadyFollowing(out) {
 			return nil
+		}
+		// The upstream has no record in this node's copy of repmgr.nodes, so repmgr cannot
+		// resolve it and never will -- retrying is futile. Report it distinctly so the
+		// caller can escalate to a rejoin instead of looping (#286).
+		if isUpstreamRecordMissing(out) {
+			return fmt.Errorf("%w: repmgr standby follow onto node %d: %v: %s", ErrUpstreamUnknown, upstreamNodeID, err, strings.TrimSpace(out))
 		}
 		return fmt.Errorf("repmgr standby follow: %w: %s", err, strings.TrimSpace(out))
 	}
@@ -119,6 +114,16 @@ func isAlreadyFollowing(out string) bool {
 	s := strings.ToLower(out)
 	return strings.Contains(s, "already exists as an active slot") &&
 		(strings.Contains(s, "this server is not ahead") || strings.Contains(s, "timelines are same"))
+}
+
+// isUpstreamRecordMissing recognizes the repmgr standby follow output emitted when the
+// intended upstream has no row in repmgr.nodes. Distinct from every other follow failure
+// in that it cannot resolve with time: the record is absent from the only metadata this
+// node can read, and a read-only standby cannot insert it.
+func isUpstreamRecordMissing(out string) bool {
+	s := strings.ToLower(out)
+	return strings.Contains(s, "unable to find record for intended upstream node") ||
+		strings.Contains(s, "unable to retrieve record for upstream node")
 }
 
 func (r *Repmgr) Clone(ctx context.Context, source Conn) error {
@@ -168,10 +173,8 @@ func (r *Repmgr) RegisterPrimary(ctx context.Context) error {
 	return nil
 }
 
-func (r *Repmgr) RegisterStandby(ctx context.Context, upstream Conn, upstreamNodeID int) error {
-	args := append([]string{"standby", "register"}, upstreamArgs(upstream)...)
-	args = append(args, "--upstream-node-id="+strconv.Itoa(upstreamNodeID), "--force")
-	if out, err := r.run(ctx, args...); err != nil {
+func (r *Repmgr) RegisterStandby(ctx context.Context, upstreamNodeID int) error {
+	if out, err := r.run(ctx, "standby", "register", "--upstream-node-id="+strconv.Itoa(upstreamNodeID), "--force"); err != nil {
 		return fmt.Errorf("repmgr standby register: %w: %s", err, strings.TrimSpace(out))
 	}
 	return nil
