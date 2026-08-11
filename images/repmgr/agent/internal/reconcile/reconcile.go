@@ -421,24 +421,49 @@ func unsafeToServe(o Observation) (bool, string) {
 	return false, ""
 }
 
-// registeredPeerToServe returns a reachable peer that IS registered in repmgr.nodes when
-// THIS node is not, or "" when the gate must not fire. Guarding promotion on this is the
-// #297 fix: an unregistered primary is one no survivor can follow.
+// registeredPeerToServe returns a peer that is a SAFE substitute for promoting this node
+// when this node has no repmgr.nodes record, or "" when the gate must not fire. Guarding
+// promotion on this is the #297 fix: an unregistered primary is one no survivor can follow.
 //
-// Returns "" -- i.e. allows the promotion -- whenever the answer is not certain:
-// the registry was not read this tick, this node is registered, or no reachable peer has
-// a record. Availability wins over metadata tidiness; the only case worth blocking is the
-// one where a strictly better candidate demonstrably exists.
+// A candidate must be reachable, registered, AND positionally safe -- same valid timeline
+// and an LSN at least as high as this node's. The position requirement is not a nicety:
+// this gate runs only after the invariant-8 check has established that no reachable peer is
+// AHEAD, so any candidate here is equal or behind. Handing the Lease to a node that is
+// behind is doubly wrong. It flaps -- the peer acquires, its own moreAdvancedPeer check sees
+// this node ahead and reachable, and it releases straight back, forever -- and it parks
+// leadership on a node with less WAL, so if this node then dies the peer promotes and those
+// transactions are gone. Equal position is fine and is the case this gate exists for.
+//
+// Returns "" -- allowing the promotion -- whenever the answer is not certain: the registry
+// was not read this tick, this node is registered, or no reachable peer is both registered
+// and current. Availability wins over metadata tidiness, and promoting the most-advanced
+// node is never a durability regression; the only case worth blocking is the one where a
+// demonstrably safe alternative exists.
 func registeredPeerToServe(o Observation) string {
 	if !o.RegistryRead || o.LocalRegistered {
 		return ""
 	}
 	for i := range o.Peers {
-		if o.Peers[i].Reachable && o.Peers[i].Registered {
-			return o.Peers[i].Name
+		p := &o.Peers[i]
+		if p.Reachable && p.Registered && peerNotBehind(*p, o.Local) {
+			return p.Name
 		}
 	}
 	return ""
+}
+
+// peerNotBehind reports whether p is at least as current as the local node: same timeline
+// and an LSN no lower. Both positions must be KNOWN -- an unreadable timeline or LSN on
+// either side means the comparison cannot be made, and an unprovable candidate is not a
+// safe hand-off target (the caller then promotes the local node instead).
+func peerNotBehind(p PeerState, l LocalState) bool {
+	if !p.TimelineOK || !l.TimelineOK || p.Timeline != l.Timeline {
+		return false
+	}
+	if !p.LSNOK || !l.LSNOK {
+		return false
+	}
+	return !l.LSN.Greater(p.LSN)
 }
 
 // newestPrimaryAbove returns the reachable live primary on the highest timeline
