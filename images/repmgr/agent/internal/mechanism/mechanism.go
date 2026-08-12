@@ -43,6 +43,24 @@ type ConfigOpts struct {
 	UseReplicationSlots bool
 }
 
+// ErrLocalRecordMissing is returned by Follow when the mechanism cannot act because
+// THIS node has no record of itself in the metadata it reads.
+//
+// With repmgr that is "unable to retrieve record for local node N", and it identifies a
+// freshly-cloned standby precisely: its repmgr.nodes copy is a snapshot of the primary
+// taken BEFORE it registered, so it contains no row for itself. It cannot obtain the row
+// either -- receiving it requires replicating, and repointing replication is what needs
+// the row. A normal clone never hits this because clone -R writes primary_conninfo and it
+// streams without a follow; only a clone whose upstream changed underneath it must
+// repoint, and then it is stuck permanently (#297).
+//
+// This is deliberately distinct from a MISSING UPSTREAM record ("unable to find record for
+// intended upstream node"), which is the ordinary post-failover case where the target has
+// simply not promoted and registered YET, and where waiting is correct. Conflating the two
+// is not a theoretical concern: escalating on the upstream variant demotes a healthy node
+// and re-clones it over a transient condition.
+var ErrLocalRecordMissing = errors.New("mechanism: local node has no record in its own metadata copy")
+
 // Mechanism performs the Postgres replication mechanics. Each method is its own
 // scoped operation with its own wrapped error (no monolithic catch). The caller
 // (reconcile) has already decided, via the Lease and the timeline/LSN rules, that

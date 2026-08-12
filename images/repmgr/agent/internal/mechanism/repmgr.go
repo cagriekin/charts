@@ -94,6 +94,12 @@ func (r *Repmgr) Follow(ctx context.Context, upstreamNodeID int) error {
 		if isAlreadyFollowing(out) {
 			return nil
 		}
+		// THIS node is absent from its own metadata copy: a freshly-cloned standby whose
+		// upstream changed before it registered. It can never obtain the row on its own, so
+		// report it distinctly and let the caller re-clone from the current primary (#297).
+		if isLocalRecordMissing(out) {
+			return fmt.Errorf("%w: repmgr standby follow: %v: %s", ErrLocalRecordMissing, err, strings.TrimSpace(out))
+		}
 		return fmt.Errorf("repmgr standby follow: %w: %s", err, strings.TrimSpace(out))
 	}
 	return nil
@@ -108,6 +114,17 @@ func isAlreadyFollowing(out string) bool {
 	s := strings.ToLower(out)
 	return strings.Contains(s, "already exists as an active slot") &&
 		(strings.Contains(s, "this server is not ahead") || strings.Contains(s, "timelines are same"))
+}
+
+// isLocalRecordMissing recognizes the repmgr output emitted when the LOCAL node has no
+// repmgr.nodes row in the copy it can read. Matched on "local node" specifically: the
+// superficially-similar "unable to find record for intended upstream node" means the
+// TARGET is unregistered, which is the transient post-failover case and must NOT be
+// escalated (doing so demotes and re-clones a healthy standby).
+func isLocalRecordMissing(out string) bool {
+	s := strings.ToLower(out)
+	return strings.Contains(s, "unable to retrieve record for local node") ||
+		strings.Contains(s, "no record found for local node")
 }
 
 func (r *Repmgr) Clone(ctx context.Context, source Conn) error {

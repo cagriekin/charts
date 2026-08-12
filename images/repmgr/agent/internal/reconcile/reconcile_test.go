@@ -18,6 +18,14 @@ func standby(name string, t uint32, hi, lo uint64) PeerState {
 
 // gossipPeer is an unreachable peer whose position is known only from gossip (its
 // role is unknown -- gossip carries position, not a trusted role).
+// registeredStandby is a reachable standby that HAS a repmgr.nodes row -- a safe
+// hand-off target for the #297 promote gate.
+func registeredStandby(name string, t uint32, hi, lo uint64) PeerState {
+	p := standby(name, t, hi, lo)
+	p.Registered = true
+	return p
+}
+
 func gossipPeer(name string, t uint32, hi, lo uint64) PeerState {
 	return PeerState{Name: name, Reachable: false, Gossip: true, Role: pg.RoleUnknown, Timeline: tl(t), TimelineOK: true, LSN: ls(hi, lo), LSNOK: true}
 }
@@ -56,6 +64,57 @@ func TestDecide(t *testing.T) {
 		{"holder + empty + a live primary -> clone not initdb", Observation{HoldLease: true, Local: emptyData, Peers: []PeerState{primary("pg-1", 5, 5, 0x100)}}, BootstrapClone, "pg-1"},
 
 		{"holder standby caught up most-advanced -> promote", Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{standby("pg-1", 5, 5, 0x80)}}, Promote, ""},
+
+		// #297: a scale-up can hand the Lease to a pod that cloned and started but has
+		// never registered in repmgr.nodes. If it promotes, no survivor holds a record for
+		// it, none can `repmgr standby follow` it, and the cluster ends up with no serving
+		// primary. Release to a registered peer instead -- always recoverable, because this
+		// node registers as its standby on a later tick.
+		//
+		// The target must be positionally SAFE, not merely registered. This gate runs after
+		// the invariant-8 check, so no reachable peer is ahead; a candidate is equal or
+		// behind. Equal is the case to hand off to:
+		{"#297 holder standby NOT registered + caught-up registered peer -> release to it",
+			Observation{HoldLease: true, Local: localStandby, RegistryRead: true, LocalRegistered: false,
+				Peers: []PeerState{registeredStandby("pg-1", 5, 5, 0x100)}}, ReleaseLease, "pg-1"},
+		// ...but a registered peer that is BEHIND must NOT be handed the Lease. It would
+		// acquire, its own moreAdvancedPeer check would see this node ahead and reachable,
+		// and it would release straight back -- an endless flap -- and meanwhile leadership
+		// would sit on a node with less WAL, losing those transactions if this node died.
+		// Promote instead: the most-advanced node serving with stale metadata is strictly
+		// better, and the follow path repairs the metadata.
+		{"#297 registered peer is BEHIND -> promote, never hand off backwards",
+			Observation{HoldLease: true, Local: localStandby, RegistryRead: true, LocalRegistered: false,
+				Peers: []PeerState{registeredStandby("pg-1", 5, 5, 0x80)}}, Promote, ""},
+		// A registered peer on a DIFFERENT timeline is not comparable and so not provably
+		// safe; promote rather than hand off on an unprovable position. (A peer on a NEWER
+		// timeline is caught earlier by the rejoin-forward check.)
+		{"#297 registered peer on an older timeline -> promote",
+			Observation{HoldLease: true, Local: localStandby, RegistryRead: true, LocalRegistered: false,
+				Peers: []PeerState{registeredStandby("pg-1", 4, 4, 0x400)}}, Promote, ""},
+		// Position unknown (LSN unreadable) -> not provably safe -> promote.
+		{"#297 registered peer with an unreadable LSN -> promote",
+			Observation{HoldLease: true, Local: localStandby, RegistryRead: true, LocalRegistered: false,
+				Peers: []PeerState{func() PeerState { p := registeredStandby("pg-1", 5, 5, 0x100); p.LSNOK = false; return p }()}}, Promote, ""},
+		// Registered: the normal case, promote as before.
+		{"#297 holder standby registered -> promote",
+			Observation{HoldLease: true, Local: localStandby, RegistryRead: true, LocalRegistered: true,
+				Peers: []PeerState{registeredStandby("pg-1", 5, 5, 0x100)}}, Promote, ""},
+		// Registry unreadable: must NOT be mistaken for "not registered" -- that would
+		// refuse a legitimate promotion (e.g. the repmgr db briefly unavailable).
+		{"#297 registry unreadable -> promote (never block on an unknown)",
+			Observation{HoldLease: true, Local: localStandby, RegistryRead: false, LocalRegistered: false,
+				Peers: []PeerState{registeredStandby("pg-1", 5, 5, 0x100)}}, Promote, ""},
+		// Nobody else is registered: releasing would hand off to a peer that is no better
+		// off, so serve with degraded metadata rather than refuse to serve at all.
+		{"#297 nobody registered -> promote (availability over metadata)",
+			Observation{HoldLease: true, Local: localStandby, RegistryRead: true, LocalRegistered: false,
+				Peers: []PeerState{standby("pg-1", 5, 5, 0x80)}}, Promote, ""},
+		// The registered peer is unreachable: it cannot take the Lease, so handing off would
+		// only stall. Promote.
+		{"#297 registered peer unreachable -> promote",
+			Observation{HoldLease: true, Local: localStandby, RegistryRead: true, LocalRegistered: false,
+				Peers: []PeerState{func() PeerState { p := registeredStandby("pg-1", 5, 5, 0x100); p.Reachable = false; return p }()}}, Promote, ""},
 		{"holder standby + newer primary peer -> rejoin forward", Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{primary("pg-1", 6, 6, 0x10)}}, RejoinForward, "pg-1"},
 		{"holder standby below highwater -> release", Observation{HoldLease: true, Local: localStandby, Marker: MarkerState{Present: true, Timeline: tl(6)}}, ReleaseLease, ""},
 		{"holder standby but a peer has more WAL -> release/handoff", Observation{HoldLease: true, Local: localStandby, Peers: []PeerState{standby("pg-2", 5, 5, 0x200)}}, ReleaseLease, "pg-2"},
