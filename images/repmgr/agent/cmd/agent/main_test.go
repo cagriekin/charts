@@ -176,6 +176,13 @@ func (s *scriptedExec) Run(_ context.Context, _ []string, name string, args ...s
 // Follow act() path (register -> streaming probe -> follow) is exercised end to end.
 func newFollowTestAgent(t *testing.T, ex *scriptedExec) *agent {
 	t.Helper()
+	return newFollowTestAgentWithPM(t, ex, &fakePostmaster{})
+}
+
+// newFollowTestAgentWithPM is newFollowTestAgent with an injectable postmaster, so a test can
+// make Demote fail and exercise an EARLY return from rejoinOnto.
+func newFollowTestAgentWithPM(t *testing.T, ex *scriptedExec, pm *fakePostmaster) *agent {
+	t.Helper()
 	m := mechanism.NewRepmgr("/etc/repmgr/repmgr.conf", t.TempDir(), "pw")
 	m.Runner = ex
 	return &agent{
@@ -191,7 +198,7 @@ func newFollowTestAgent(t *testing.T, ex *scriptedExec) *agent {
 		dcs:    &fakeDCS{},
 		mech:   m,
 		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
-		sup:    process.NewSupervisor(&fakePostmaster{}),
+		sup:    process.NewSupervisor(pm),
 		metr:   observe.New(),
 	}
 }
@@ -247,6 +254,29 @@ func TestActFollowReclonesWhenLocalRecordMissing(t *testing.T) {
 	}
 	if a.followUpstream != "" {
 		t.Fatalf("the follow latch must reset after a re-clone, got %q", a.followUpstream)
+	}
+}
+
+// The follow latch is invalidated on ENTRY to rejoinOnto, so it is cleared even when the
+// rejoin fails before reconfiguring anything (here: Demote fails). Clearing it late would
+// leave a stale latch behind a failed rejoin. Nothing depends on that today -- the
+// escalation is only reachable when the latch already differs from the target -- but the
+// invariant "an attempt to rejoin invalidates the latch" is unconditional, and this pins it
+// so a future edit that reads the latch earlier cannot silently rely on a stale value.
+func TestRejoinOntoClearsFollowLatchEvenWhenItFailsEarly(t *testing.T) {
+	ex := &scriptedExec{walRcv: "", followOut: "ERROR: unable to retrieve record for local node 1002"}
+	pm := &fakePostmaster{stopErr: errors.New("stop failed")}
+	a := newFollowTestAgentWithPM(t, ex, pm)
+	a.followUpstream = "stale-upstream"
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-1"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err == nil {
+		t.Fatal("a rejoin whose demote fails must surface an error")
+	}
+	if ex.rejoins != 0 {
+		t.Fatalf("rejoin must not have reconfigured anything after a failed demote, got %d", ex.rejoins)
+	}
+	if a.followUpstream != "" {
+		t.Fatalf("the follow latch must be cleared on entry to a rejoin, got %q", a.followUpstream)
 	}
 }
 
