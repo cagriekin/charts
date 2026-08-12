@@ -240,7 +240,7 @@ These three values are validated at render time, so a mistake fails `helm instal
 |-----------|-------------|---------|
 | `repmgr.enabled` | Enable repmgr | `true` |
 | `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
-| `repmgr.image.tag` | Repmgr image tag. Unsuffixed = the default major (18); `-pg18` / `-pg17` select one explicitly | `trixie-5.5.0-29` |
+| `repmgr.image.tag` | Repmgr image tag. Unsuffixed = the default major (18); `-pg18` / `-pg17` select one explicitly | `trixie-5.5.0-30` |
 | `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `repmgr.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `repmgr.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `repmgr.username` | Repmgr database user | `repmgr` |
@@ -287,7 +287,7 @@ postgresql:
     tag: 17.10-trixie      # only used in standalone mode / for the extension copy
 repmgr:
   image:
-    tag: trixie-5.5.0-29-pg17
+    tag: trixie-5.5.0-30-pg17
     majorVersion: "17"
 ```
 
@@ -1990,7 +1990,8 @@ Each chart is tagged `<chart>-<version>` (e.g. `pg-1.1.0`); `pg` and `pgvector` 
 
 | `pg` / `pgvector` | repmgr image | PostgreSQL | Kubernetes |
 |-------------------|--------------|-----------|-----------|
-| 1.8.1 *(current)* | `trixie-5.5.0-29` (`-pg18` / `-pg17`) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.10.1 *(current)* | `trixie-5.5.0-30` (`-pg18` / `-pg17`) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.8.1 – 1.10.0 | `trixie-5.5.0-29` | 18.x (default) or 17.x | as above |
 | 1.5.0 – 1.8.0 | `trixie-5.5.0-28` | 18.x | as above |
 | 1.2.6 – 1.4.x | `trixie-5.5.0-27` | 18.x | as above |
 | 1.2.2 – 1.2.5 | `trixie-5.5.0-26` | 18.x | as above |
@@ -2007,7 +2008,7 @@ helm repo update
 helm upgrade my-postgres cagriekin/pg   # add -f your-values.yaml
 ```
 
-Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.8.1`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-29` at 1.8.1) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
+Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.8.1`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-30` at 1.8.1) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
 
 ### Crossing the 0.x → 1.x boundary (agent mode is now the default)
 
