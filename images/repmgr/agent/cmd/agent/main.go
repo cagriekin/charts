@@ -1095,6 +1095,15 @@ func desiredRoleLabels(self string, peers []reconcile.PeerState) map[string]stri
 // node is absent from its own repmgr.nodes copy (#297); the remedy is the same, namely take
 // this node's data and metadata from the current primary.
 func (a *agent) rejoinOnto(ctx context.Context, target string) error {
+	// Invalidate the follow latch on ENTRY, not after the rejoin succeeds. Either point is
+	// defensible -- the latch caches which upstream replication is actually pointed at, so
+	// keeping it through a failed rejoin is arguably the more truthful state -- but clearing
+	// it up front makes the invariant unconditional: an attempt to rejoin always invalidates
+	// it. Nothing today depends on that (the escalation is only reachable when the latch
+	// already differs from the target, so a stale value can never wedge the Follow path, and
+	// its one consumer -- cascadeFollowTarget's stickiness -- re-checks cascadeQualifies).
+	// It removes a footgun for whoever later reads the latch earlier in the decision.
+	a.followUpstream = ""
 	// Invariant 9: never rewind/reclone onto a different cluster. Checked before the
 	// demote so a healthy node is not stopped for a doomed rejoin.
 	if err := a.assertSameCluster(ctx, target); err != nil {
@@ -1111,9 +1120,6 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 		// whatever restore the record beside it describes.
 		a.dropRestoreRecord("the data directory was re-cloned from " + target)
 	}
-	// Replication was reconfigured from scratch, so the follow latch is meaningless now;
-	// let the next tick re-evaluate rather than assume we still track this upstream.
-	a.followUpstream = ""
 	return a.sup.Start(ctx)
 }
 
