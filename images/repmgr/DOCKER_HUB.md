@@ -25,7 +25,7 @@ Each release publishes one multi-arch (amd64/arm64) manifest per PostgreSQL majo
 A container announces its own major as `PG_MAJOR`, and the server binaries live in `/usr/lib/postgresql/$PG_MAJOR/bin`:
 
 ```bash
-docker run --rm cagriekin/repmgr:trixie-5.5.0-29-pg17 printenv PG_MAJOR   # -> 17
+docker run --rm cagriekin/repmgr:trixie-5.5.0-30-pg17 printenv PG_MAJOR   # -> 17
 ```
 
 **The major is fixed at build time and cannot be changed for an existing data directory** — a PostgreSQL 18 server refuses to start on a PG17 `PGDATA`. Choose the major when you create the cluster.

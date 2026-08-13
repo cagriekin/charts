@@ -12,8 +12,8 @@ PostgreSQL with repmgr 5.5.0, pgBackRest, pgaudit, and cron on Debian Trixie. De
 The major is a **build argument**, defaulting to 18, and one build ships exactly one major (`postgresql-<major>`, `-repmgr` and `-pgaudit` from PGDG). Supported: **18** (default) and **17**.
 
 ```bash
-docker build -t cagriekin/repmgr:trixie-5.5.0-29 .                       # PostgreSQL 18
-docker build --build-arg PG_MAJOR=17 -t cagriekin/repmgr:trixie-5.5.0-29-pg17 .
+docker build -t cagriekin/repmgr:trixie-5.5.0-30 .                       # PostgreSQL 18
+docker build --build-arg PG_MAJOR=17 -t cagriekin/repmgr:trixie-5.5.0-30-pg17 .
 ```
 
 Published tags per release: `trixie-<repmgr>-<n>` (the **default** major, 18), plus `-pg18` and `-pg17`. The unsuffixed tag is what chart pins resolve to, so `ARG PG_MAJOR`'s default and the publish workflow's `default_major` must stay in step — `test/scripts-test.sh` asserts the `ARG` default is 18 for exactly that reason.
@@ -25,7 +25,7 @@ The build **fails** if any per-major package has no installation candidate (chec
 Both majors are verified by `test/image-smoke.sh <image-ref> <major>`, which starts the built image and asserts the server version, that `repmgr`/`repmgrd` resolve and report 5.5.0, and that `pgaudit` actually loads via `shared_preload_libraries`:
 
 ```bash
-bash test/image-smoke.sh cagriekin/repmgr:trixie-5.5.0-29-pg17 17
+bash test/image-smoke.sh cagriekin/repmgr:trixie-5.5.0-30-pg17 17
 ```
 
 ## Execution Modes
@@ -143,8 +143,8 @@ pgBackRest configuration (`/etc/pgbackrest/pgbackrest.conf`) and S3 credentials 
 ## Building
 
 ```bash
-docker build -t cagriekin/repmgr:trixie-5.5.0-29 .                       # PostgreSQL 18 (default)
-docker build --build-arg PG_MAJOR=17 -t cagriekin/repmgr:trixie-5.5.0-29-pg17 .
+docker build -t cagriekin/repmgr:trixie-5.5.0-30 .                       # PostgreSQL 18 (default)
+docker build --build-arg PG_MAJOR=17 -t cagriekin/repmgr:trixie-5.5.0-30-pg17 .
 ```
 
 ## Compatibility

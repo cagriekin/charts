@@ -32,9 +32,10 @@
   yet, and escalating there would demote and re-clone a healthy standby. A unit test asserts the
   upstream variant does not escalate.
 
-  **This release is only complete with a republished image.** The fix is in the agent binary, so
-  `repmgr.image.tag` must be bumped past `trixie-5.5.0-29` (and the image published) before
-  1.10.1 ships -- a 1.10.1 pointing at `-29` carries the chart change without the fix.
+  **Image:** the fix is in the agent binary, so this release republishes the repmgr image as
+  `trixie-5.5.0-30` and pins `repmgr.image.tag` to it (along with `etcd.rbac.bootstrapImage.tag`,
+  which runs the same image and must move in lockstep). A 1.10.1 left pointing at `-29` would
+  have carried the chart change without the fix.
 
   Verification: reproduced and fixed on a live KinD cluster on the 2.0.0 line, whose `upgrade`
   suite scales an agent-mode cluster up. **1.x's own `upgrade` suite pins `failoverMode: repmgrd`**

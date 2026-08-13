@@ -8,7 +8,7 @@
 # package resolved to a different version than the tag advertises.
 #
 # Usage: bash images/repmgr/test/image-smoke.sh <image-ref> <expected-pg-major>
-#   bash images/repmgr/test/image-smoke.sh cagriekin/repmgr:trixie-5.5.0-29-pg17 17
+#   bash images/repmgr/test/image-smoke.sh cagriekin/repmgr:trixie-5.5.0-30-pg17 17
 set -uo pipefail
 
 IMAGE="${1:?usage: image-smoke.sh <image-ref> <expected-pg-major>}"
