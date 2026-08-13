@@ -10,13 +10,12 @@ RELEASE="${RELEASE:-pg-upgrade}"
 FULLNAME_FROM=$(resolve_fullname "${RELEASE}" "${CHART_DIR}" "${SCRIPT_DIR}/values-upgrade-from.yaml")
 FULLNAME_TO=$(resolve_fullname "${RELEASE}" "${CHART_DIR}" "${SCRIPT_DIR}/values-upgrade-to.yaml")
 
-# COVERAGE NOTE (#297): this suite used to scale 2 -> 3 nodes across the upgrade. Both
-# fixtures now install 3 nodes, so it covers the upgrade itself -- adding pgpool and the
-# exporter, rolling the pods, and preserving data -- but NOT a scale-up. Agent-mode scale-up
-# has a live race that can leave the cluster with no serving primary (#297); scaling here
-# would fail the suite for that reason rather than for anything this suite is about. #297
-# restores the scale-up.
-begin_suite "Upgrade (repmgr 3-node, add pgpool + exporter)"
+# This suite scales a LIVE agent-mode cluster 2 -> 3 nodes across the upgrade, which is the
+# only coverage of that path: the new pod is created concurrently with the rolling restart the
+# changed REPMGR_NODE_COUNT triggers, so it can reach the Lease before it has registered in
+# repmgr.nodes (#297). It also asserts readiness and per-node topology agreement below --
+# asserting only .status.phase let a permanently-broken standby pass (#297).
+begin_suite "Upgrade (repmgr 2-node -> 3-node with pgpool + exporter)"
 
 # Start from a clean namespace. Previous runs on a long-lived cluster leave
 # behind a release whose Service selector is owned by the service-updater's
@@ -26,14 +25,14 @@ begin_suite "Upgrade (repmgr 3-node, add pgpool + exporter)"
 kubectl delete namespace "${NAMESPACE}" --ignore-not-found --wait=true --timeout=5m
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
-# Step 1: Install with repmgr (3 pods, persistence enabled)
-echo "  Step 1: Installing repmgr (3 nodes)..."
+# Step 1: Install with repmgr (2 pods, persistence enabled)
+echo "  Step 1: Installing repmgr (2 nodes)..."
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
   -n "${NAMESPACE}" \
   -f "${SCRIPT_DIR}/values-upgrade-from.yaml" \
   --wait --timeout 10m
 
-wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 3 600
+wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 600
 
 POD_0="${FULLNAME_FROM}-0"
 result=$(pg_exec "${NAMESPACE}" "${POD_0}" "SELECT 1" "testuser" "testdb")
@@ -44,9 +43,9 @@ UPGRADE_VALUE="pre-upgrade-$(date +%s)"
 pg_exec "${NAMESPACE}" "${POD_0}" "CREATE TABLE IF NOT EXISTS upgrade_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
 pg_exec "${NAMESPACE}" "${POD_0}" "INSERT INTO upgrade_test (value) VALUES ('${UPGRADE_VALUE}')" "testuser" "testdb"
 
-# Step 2: Upgrade to full (pgpool + exporter added; node count unchanged, see #297)
+# Step 2: Upgrade to full (3 nodes + pgpool + exporter, same persistence)
 echo ""
-echo "  Step 2: Upgrading to full (adding pgpool + exporter)..."
+echo "  Step 2: Upgrading to full (3 nodes + pgpool + exporter)..."
 helm upgrade "${RELEASE}" "${CHART_DIR}" \
   -n "${NAMESPACE}" \
   -f "${SCRIPT_DIR}/values-upgrade-to.yaml" \
@@ -58,10 +57,25 @@ wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 3 60
 wait_for_deployment_ready "${NAMESPACE}" "${FULLNAME_TO}-pgpool" 300
 wait_for_deployment_ready "${NAMESPACE}" "${FULLNAME_TO}-postgres-exporter" 300
 
-# Test: all 3 pg pods running
+# Test: all 3 pg pods running AND READY.
+#
+# Readiness, not just phase: agent-mode readiness is replication-aware (#186), so a standby
+# that is Running but not streaming reads ready=false. Asserting only .status.phase let a
+# permanently-broken standby pass this suite -- pod-2 sat Running/ready=false, unable to
+# replicate, and the suite reported success (#297).
 for i in 0 1 2; do
   phase=$(kubectl get pod -n "${NAMESPACE}" "${FULLNAME_TO}-${i}" -o jsonpath='{.status.phase}')
   assert_eq "after upgrade: pod-${i} is Running" "Running" "${phase}"
+  ready=$(kubectl get pod -n "${NAMESPACE}" "${FULLNAME_TO}-${i}" -o jsonpath='{.status.containerStatuses[0].ready}')
+  assert_eq "after upgrade: pod-${i} is Ready (replication-aware, #186)" "true" "${ready}"
+done
+
+# Every node must agree on the topology: a node whose repmgr.nodes copy predates its own
+# registration cannot `repmgr standby follow` and never streams (#297). Assert each node
+# sees a row for itself.
+for i in 0 1 2; do
+  own=$(pg_exec "${NAMESPACE}" "${FULLNAME_TO}-${i}" "SELECT count(*) FROM repmgr.nodes WHERE node_id = $((1000 + i))" repmgr repmgr 2>/dev/null | xargs || echo "")
+  assert_eq "after upgrade: pod-${i} has its own repmgr.nodes row (#297)" "1" "${own}"
 done
 
 # Test: pgpool running

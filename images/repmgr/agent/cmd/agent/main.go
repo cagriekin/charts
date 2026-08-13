@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -533,6 +534,30 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// This pod's name, compared against Marker.Primary so an empty-data lease holder
 	// can recognize it is not the recorded primary and release the lease (#186).
 	o.LocalNode = a.cfg.PodName
+	// #297: read repmgr.nodes ONLY for a promote candidate -- the holder, running and in
+	// recovery, i.e. the one tick-state where the gate can fire. Every other node skips
+	// the query, so this adds no steady-state cost, and RegistryRead stays false so the
+	// gate is inert. The read is against the LOCAL node: repmgr.nodes replicates from the
+	// primary, so this node's own copy is exactly what repmgr itself would consult when
+	// asked to follow someone.
+	if o.HoldLease && ls.Running && ls.InRecovery {
+		ids, rerr := a.prober.RegisteredNodeIDs(ctx, a.selfConn())
+		if rerr != nil {
+			// Unreadable: leave RegistryRead false so the gate cannot fire on a failed
+			// read (that would refuse a legitimate promotion). Warn, do not block.
+			a.log.Warn("read repmgr.nodes for the promote registration gate", "err", rerr)
+		} else {
+			o.RegistryRead = true
+			registered := make(map[int]bool, len(ids))
+			for _, id := range ids {
+				registered[id] = true
+			}
+			o.LocalRegistered = registered[nodeID(a.cfg.PodName)]
+			for i := range o.Peers {
+				o.Peers[i].Registered = registered[nodeID(o.Peers[i].Name)]
+			}
+		}
+	}
 	// Cascading replication (#29): when enabled, a standby may follow another standby
 	// (the pure cascadeFollowTarget decides; default off -> follow the primary).
 	o.Cascade = a.cfg.CascadeReplication
@@ -678,6 +703,22 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			return nil
 		}
 		if err := a.mech.Follow(ctx, up); err != nil {
+			// #297: this node has no row in its own metadata copy -- a freshly-cloned standby
+			// whose upstream changed before it registered. It can never obtain the row (that
+			// needs replication, which is what it is trying to establish), so it would retry
+			// forever, Running but never Ready, silently not replicating. Re-clone from the
+			// current primary: that replaces both its data AND its metadata copy, and a
+			// standby in this state has no writes of its own to lose.
+			//
+			// Scoped narrowly on purpose. It fires ONLY on the local-record error, never on a
+			// missing UPSTREAM record -- that one is the ordinary post-failover case where the
+			// target simply has not promoted yet, and escalating there demotes and re-clones a
+			// healthy standby (a mistake made and reverted on #286).
+			if errors.Is(err, mechanism.ErrLocalRecordMissing) {
+				a.log.Warn("this node is absent from its own repmgr.nodes copy; re-cloning from the current primary",
+					"target", dec.Target, "err", err)
+				return a.rejoinOnto(ctx, dec.Target)
+			}
 			return err
 		}
 		a.followUpstream = dec.Target
@@ -688,23 +729,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		return a.sup.Demote(ctx, true)
 
 	case reconcile.RejoinForward:
-		// Invariant 9: never rewind/reclone onto a different cluster. Checked before
-		// the demote so a healthy node is not stopped for a doomed rejoin.
-		if err := a.assertSameCluster(ctx, dec.Target); err != nil {
-			return err
-		}
-		if err := a.sup.Demote(ctx, true); err != nil {
-			return err
-		}
-		if err := a.mech.RejoinForceRewind(ctx, a.peerMechConn(dec.Target)); err != nil {
-			if err := a.mech.ReclonePreserving(ctx, a.peerMechConn(dec.Target)); err != nil {
-				return err
-			}
-			// A full re-clone: this directory's contents now come from the peer, not from
-			// whatever restore the record beside it describes.
-			a.dropRestoreRecord("the data directory was re-cloned from " + dec.Target)
-		}
-		return a.sup.Start(ctx)
+		return a.rejoinOnto(ctx, dec.Target)
 
 	case reconcile.BootstrapClone:
 		if err := a.mech.Clone(ctx, a.peerMechConn(dec.Target)); err != nil {
@@ -1062,6 +1087,40 @@ func desiredRoleLabels(self string, peers []reconcile.PeerState) map[string]stri
 		}
 	}
 	return m
+}
+
+// rejoinOnto brings this node back under target: rewind forward onto it, or -- when the
+// histories diverged too far for pg_rewind -- re-clone while preserving the old data
+// directory (#175). Shared by the RejoinForward decision and by the Follow path when this
+// node is absent from its own repmgr.nodes copy (#297); the remedy is the same, namely take
+// this node's data and metadata from the current primary.
+func (a *agent) rejoinOnto(ctx context.Context, target string) error {
+	// Invalidate the follow latch on ENTRY, not after the rejoin succeeds. Either point is
+	// defensible -- the latch caches which upstream replication is actually pointed at, so
+	// keeping it through a failed rejoin is arguably the more truthful state -- but clearing
+	// it up front makes the invariant unconditional: an attempt to rejoin always invalidates
+	// it. Nothing today depends on that (the escalation is only reachable when the latch
+	// already differs from the target, so a stale value can never wedge the Follow path, and
+	// its one consumer -- cascadeFollowTarget's stickiness -- re-checks cascadeQualifies).
+	// It removes a footgun for whoever later reads the latch earlier in the decision.
+	a.followUpstream = ""
+	// Invariant 9: never rewind/reclone onto a different cluster. Checked before the
+	// demote so a healthy node is not stopped for a doomed rejoin.
+	if err := a.assertSameCluster(ctx, target); err != nil {
+		return err
+	}
+	if err := a.sup.Demote(ctx, true); err != nil {
+		return err
+	}
+	if err := a.mech.RejoinForceRewind(ctx, a.peerMechConn(target)); err != nil {
+		if err := a.mech.ReclonePreserving(ctx, a.peerMechConn(target)); err != nil {
+			return err
+		}
+		// A full re-clone: this directory's contents now come from the peer, not from
+		// whatever restore the record beside it describes.
+		a.dropRestoreRecord("the data directory was re-cloned from " + target)
+	}
+	return a.sup.Start(ctx)
 }
 
 func (a *agent) selfConn() pg.ConnInfo {
