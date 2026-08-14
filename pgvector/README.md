@@ -117,7 +117,7 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `postgresql.image.repository` | PostgreSQL image repository | `pgvector/pgvector` |
-| `postgresql.image.tag` | PostgreSQL image tag | `0.8.5-pg18-trixie` |
+| `postgresql.image.tag` | PostgreSQL image tag. Must bundle the same PostgreSQL point release as `repmgr.image.tag` (#302) — `copy-ext`'s no-clobber copy keeps a drifted image from corrupting the running server, but `CREATE EXTENSION vector` still needs a matching point release to load safely. Bump only in lockstep with `repmgr.image`. | `0.8.5-pg18-trixie` |
 | `postgresql.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `postgresql.majorVersion` | PostgreSQL major version in `image.tag`; builds the extension paths (`/usr/lib/postgresql/<major>/lib`, `/usr/share/postgresql/<major>/extension`) when `extensions.enabled=true`. In repmgr mode the server runs from the repmgr image and follows `repmgr.image.majorVersion` regardless of `postgresql.image`; the chart fails to render if the two majors differ. Set both to `"17"` (with a `-pg17` repmgr tag) to run PostgreSQL 17 — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1); values > 0 require `repmgr.enabled=true` | `1` |
