@@ -1,5 +1,28 @@
 # pgvector chart changelog
 
+## 1.10.2 - 2026-08-14
+
+Inherited from pg's symlinked `statefulset.yaml`. See the
+[pg 1.10.2 changelog](../pg/CHANGELOG.md) for the full detail.
+
+### Fixed
+
+- **`copy-ext` could silently overwrite `copy-base-ext`'s libs with a mismatched build
+  (#302).** Hit in production: this chart's `postgresql.image` (previously the floating
+  `pg18-trixie` tag) had drifted to a newer PostgreSQL point release than the pinned
+  `repmgr.image`, and `copy-ext`'s unconditional `cp` replaced the running server's
+  `libpqwalreceiver.so`, breaking replication on every freshly-created pod. `copy-ext`
+  now uses `cp -n` (no-clobber).
+
+### Changed
+
+- **`postgresql.image.tag` default pinned from the floating `pg18-trixie` to
+  `0.8.5-pg18-trixie` (#302),** matching `repmgr.image`'s default point release (18.4).
+  `cp -n` above means this image can no longer clobber the running server's libs
+  regardless, but a matching point release is still required for `CREATE EXTENSION
+  vector` (built against 18.4 headers) to load safely. Bump only in lockstep with
+  `repmgr.image`.
+
 ## 1.10.1 - 2026-08-11
 
 ### Fixed

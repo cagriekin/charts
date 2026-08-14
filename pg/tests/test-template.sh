@@ -294,6 +294,17 @@ assert_contains "#153: lightweight init containers declare resources" "${init_re
 repmgr_init_res=$(printf '%s\n' "${init_res}" | sed -n '/name: repmgr-init/,/name: setup-config/p')
 assert_contains "#153: repmgr-init declares its (heavier) clone resources" "${repmgr_init_res}" 'cpu: "1"'
 
+# #302: copy-ext must never clobber copy-base-ext's libs. copy-base-ext (repmgr
+# image, runs first) populates ext-lib/ext-share; copy-ext (postgresql.image) only
+# adds what copy-base-ext didn't provide, so its cp must stay no-clobber -- a plain
+# cp would silently overwrite the repmgr image's core libs (e.g. libpqwalreceiver.so)
+# if postgresql.image and repmgr.image drift to different postgres point releases.
+copy_base_ext=$(printf '%s\n' "${init_res}" | sed -n '/name: copy-base-ext/,/name: copy-ext/p')
+assert_contains "#302: copy-base-ext copies plainly (it runs first, nothing to preserve yet)" "${copy_base_ext}" "cp /usr/lib/postgresql/18/lib/\*.so /ext-lib/"
+copy_ext=$(printf '%s\n' "${init_res}" | sed -n '/name: copy-ext/,/securityContext/p')
+assert_contains "#302: copy-ext uses cp -n for the lib copy" "${copy_ext}" "cp -n /usr/lib/postgresql/18/lib/\*.so /ext-lib/"
+assert_contains "#302: copy-ext uses cp -n for the extension-share copy" "${copy_ext}" "cp -n /usr/share/postgresql/18/extension/\* /ext-share/"
+
 # #116: the busybox helper init image is a single shared value (default 1.37 for all
 # four init containers, no more 1.35/1.37 split) and is overridable for air-gapped
 # registries. Default render must carry no hardcoded busybox tag.

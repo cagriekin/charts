@@ -1,5 +1,21 @@
 # pg chart changelog
 
+## 1.10.2 - 2026-08-14
+
+### Fixed
+
+- **`copy-ext` could silently overwrite `copy-base-ext`'s libs with a mismatched build
+  (#302).** When `repmgr.enabled=true` and `postgresql.extensions.enabled=true`,
+  `copy-base-ext` populates `ext-lib`/`ext-share` from the repmgr image -- the image that
+  actually runs the server -- and `copy-ext` then ran an unconditional wildcard `cp` from
+  `postgresql.image` on top of it. If the two images drifted to different PostgreSQL point
+  releases (`postgresql.image` is often pinned to a floating tag), `copy-ext` silently
+  replaced core libs such as `libpqwalreceiver.so` with a mismatched build, and every
+  freshly-created pod failed to stream replication (`undefined symbol`) -- `ext-lib`/
+  `ext-share` are emptyDirs, so this hit on every pod, not just the first. `copy-ext`'s
+  copy is now `cp -n` (no-clobber): it can only add files the repmgr image doesn't already
+  provide (e.g. `vector.so`), never overwrite one.
+
 ## 1.10.1 - 2026-08-11
 
 ### Fixed

@@ -15,7 +15,13 @@ busyboxImage:
 postgresql:
   image:
     repository: pgvector/pgvector
-    tag: pg18-trixie
+    # Pinned to the pgvector build bundling postgres 18.4, matching the
+    # repmgr.image default below (also 18.4), instead of the floating
+    # `pg18-trixie` tag (#302). copy-ext's `cp -n` no longer lets this image
+    # clobber the server's own libs regardless, but a matching point release is
+    # still what makes `CREATE EXTENSION vector` (built against 18.4's headers)
+    # safe to load into an 18.4 backend. Bump only in lockstep with repmgr.image.
+    tag: 0.8.5-pg18-trixie
     digest: ""
     pullPolicy: IfNotPresent
 

@@ -370,7 +370,15 @@ spec:
         - name: copy-ext
           image: {{ include "pg.image" .Values.postgresql.image | quote }}
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
-          command: ['sh', '-c', 'cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
+          # -n (no-clobber, #302): copy-base-ext (when repmgr is enabled) already
+          # populated ext-lib/ext-share from the repmgr image, which is what actually
+          # runs the server. This container only ADDS what's missing (e.g. vector.so)
+          # -- it must never overwrite a core lib (e.g. libpqwalreceiver.so) with this
+          # image's build. The two images can drift to different postgres point
+          # releases independently (this image's tag is often floating), and an
+          # unconditional overwrite silently reintroduces an ABI mismatch between
+          # the running server and its own WAL receiver plugin.
+          command: ['sh', '-c', 'cp -n /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp -n /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           volumeMounts:
