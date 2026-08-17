@@ -369,7 +369,18 @@ spec:
           # installed. The repmgr image configures the PGDG apt repo at build time
           # (images/repmgr/Dockerfile), so this is the reliable install path in
           # repmgr mode.
-          command: ['sh', '-c', 'apt-get update && apt-get install -y --no-install-recommends {{ join " " $pkgs }} && cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
+          #
+          # Pin postgresql-{{ $pgMajor }} to whatever's already installed before naming any
+          # extension package on the same apt-get install line (review, #303): an
+          # unversioned `Depends: postgresql-{{ $pgMajor }}` is satisfied by any installed
+          # version and normally left alone, but apt is still free to upgrade it to
+          # satisfy some OTHER package's stricter constraint -- which would replace the
+          # very libs this cp is about to copy with a build from a different point
+          # release than the postmaster this chart actually starts (the #302 failure
+          # mode, one layer up). The pin makes that impossible to do silently: apt
+          # either leaves the server package alone (the normal case) or fails the
+          # render-time-adjacent install outright, never a quiet swap.
+          command: ['sh', '-c', 'PGVER=$(dpkg-query -W postgresql-{{ $pgMajor }} 2>/dev/null | cut -f2); apt-get update && apt-get install -y --no-install-recommends ${PGVER:+"postgresql-{{ $pgMajor }}=$PGVER"} {{ join " " $pkgs }} && cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
           securityContext:
             # apt-get/dpkg needs root to write /var/lib/dpkg and run package
             # maintainer scripts (e.g. ldconfig) -- broader than fix-permissions'
@@ -378,7 +389,13 @@ spec:
             # throwaway init container, which persists nothing: its only output is
             # two file trees copied into emptyDirs. The main postgresql container,
             # and this same container with no packages set, keep running as the
-            # unprivileged containerSecurityContext user.
+            # unprivileged containerSecurityContext user. This whole block REPLACES
+            # postgresql.containerSecurityContext for this container while packages
+            # is set (review, #303) -- deliberate, since dpkg needs root -- but it
+            # means a values-set runAsGroup/seccompProfile/readOnlyRootFilesystem is
+            # NOT merged in here and has no effect on this container. A namespace
+            # enforcing the PSA restricted profile (or any runAsNonRoot admission
+            # policy) will reject this pod outright; see the README PSA note.
             runAsUser: 0
             runAsNonRoot: false
             allowPrivilegeEscalation: false
@@ -390,6 +407,13 @@ spec:
                 - DAC_OVERRIDE
                 - FOWNER
                 - FSETID
+                # SETUID/SETGID/SETFCAP are no-ops here under
+                # allowPrivilegeEscalation: false (kernel no_new_privs blocks the
+                # privilege gain these grant) -- kept anyway so a dpkg postinst
+                # script that merely CALLS setuid()/setgid()/setcap() (e.g. to
+                # verify ownership, not to actually escalate) gets EPERM handled
+                # gracefully by the calling code instead of the syscall itself
+                # being denied in a way some maintainer scripts do not expect.
                 - SETUID
                 - SETGID
                 - SETFCAP
@@ -428,9 +452,18 @@ spec:
           # without packages) is to ADD what's missing, never overwrite a core lib
           # with this image's build. PGDG apt-source availability in
           # postgresql.image is NOT verified by this chart -- see README "Installing
-          # extensions without a custom image".
-          command: ['sh', '-c', 'apt-get update && apt-get install -y --no-install-recommends {{ join " " $pkgs }} && cp -n /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp -n /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
+          # extensions without a custom image". Same postgresql-{{ $pgMajor }} version
+          # pin as copy-base-ext, and for the same reason (review, #303) -- best-effort
+          # here too: if this image did not install PostgreSQL via a dpkg-tracked
+          # postgresql-{{ $pgMajor }} package, PGVER is empty and the pin is skipped
+          # rather than failing an otherwise-valid custom-image install.
+          command: ['sh', '-c', 'PGVER=$(dpkg-query -W postgresql-{{ $pgMajor }} 2>/dev/null | cut -f2); apt-get update && apt-get install -y --no-install-recommends ${PGVER:+"postgresql-{{ $pgMajor }}=$PGVER"} {{ join " " $pkgs }} && cp -n /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp -n /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
           securityContext:
+            # Same as copy-base-ext's apt-step securityContext above (review, #303):
+            # REPLACES postgresql.containerSecurityContext, not a merge -- and will
+            # be rejected under the PSA restricted profile. SETUID/SETGID/SETFCAP
+            # are no-ops under allowPrivilegeEscalation: false; kept so a dpkg
+            # postinst that calls those syscalls gets a handled EPERM.
             runAsUser: 0
             runAsNonRoot: false
             allowPrivilegeEscalation: false

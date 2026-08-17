@@ -241,6 +241,10 @@ networkPolicy:
             protocol: TCP
 ```
 
+This egress is needed on **every** pod (re)start, not just the first install: `ext-lib`/`ext-share` are `emptyDir`s, so `copy-ext`/`copy-base-ext` (and the apt-get step) re-run from scratch on a crash, eviction, or rolling update, same as the plain-copy path always has. Cutting egress to `apt.postgresql.org` after a successful install does not affect the already-running server, but a pod that then restarts for any reason will not come back up — plan for persistent, not just one-time, access in an air-gapped or tightly-firewalled cluster.
+
+**Pod Security Admission.** The apt step's init containers run `runAsUser: 0` (dpkg needs root to write `/var/lib/dpkg` and run maintainer scripts) — this is opt-in only while `packages` is set, but a namespace enforcing the PSA **restricted** profile (or any `runAsNonRoot` admission policy) will reject the pod outright. The rest of the chart runs as uid 101; `packages` is not compatible with a `restricted`-labeled namespace.
+
 **Limitation.** This mechanism only helps for extensions that have a PGDG or Debian package. A small number of extensions — mostly private/internal ones, or ones never packaged for Debian/PGDG — have no such package and are **not** solved by `packages`; those still require a custom image with the extension compiled in.
 
 ### Mounting an extra file on every replica

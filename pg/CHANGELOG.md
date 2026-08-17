@@ -24,6 +24,16 @@
   containing shell metacharacters (the list is interpolated into an `apt-get install`
   shell command) and rejects `packages` set without `extensions.enabled: true`.
 
+  **Review follow-up:** an unversioned PGDG extension dependency on `postgresql-<major>`
+  is normally left alone by apt, but nothing stopped some *other* future package from
+  declaring a stricter dependency and pulling in a newer `postgresql-<major>` as a side
+  effect — silently swapping the very libs about to be copied for a build from a
+  different point release than the postmaster this chart actually starts (the #302
+  failure mode, one layer up). `copy-ext`/`copy-base-ext` now detect the already-installed
+  `postgresql-<major>` version (`dpkg-query`) and pin it on the same `apt-get install`
+  line, so apt either leaves it alone (the normal case, confirmed live) or fails the
+  install outright — never a silent swap.
+
   See README ["Installing extensions without a custom image"](README.md#installing-extensions-without-a-custom-image)
   for a complete `pg_cron` example, why `postgresql.databases[].extensions` (not
   `postStart.additionalCommands`) is the right mechanism for the `CREATE EXTENSION` step

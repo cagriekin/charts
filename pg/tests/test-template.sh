@@ -323,13 +323,26 @@ pkg_res=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/statefulset.yaml 2>&1)
 pkg_base_ext=$(printf '%s\n' "${pkg_res}" | sed -n '/name: copy-base-ext/,/name: copy-ext/p')
 pkg_ext=$(printf '%s\n' "${pkg_res}" | sed -n '/name: copy-ext/,/name: repmgr-init/p')
-assert_contains "#303: copy-base-ext installs the {major}-substituted package" "${pkg_base_ext}" "apt-get install -y --no-install-recommends postgresql-18-cron"
-assert_contains "#303: copy-ext installs the {major}-substituted package too" "${pkg_ext}" "apt-get install -y --no-install-recommends postgresql-18-cron"
+assert_contains "#303: copy-base-ext installs the {major}-substituted package" "${pkg_base_ext}" "postgresql-18-cron"
+assert_contains "#303: copy-ext installs the {major}-substituted package too" "${pkg_ext}" "postgresql-18-cron"
 # the copy step must still follow the apt-get in the same command, and copy-ext
 # must still be -n (#302) even with packages set -- installing a package is not a
 # license to start clobbering the repmgr image's core libs.
-assert_contains "#303: copy-base-ext still copies plainly after apt-get" "${pkg_base_ext}" "apt-get install -y --no-install-recommends postgresql-18-cron && cp /usr/lib/postgresql/18/lib/\*.so /ext-lib/"
-assert_contains "#303: copy-ext still uses cp -n after apt-get" "${pkg_ext}" "apt-get install -y --no-install-recommends postgresql-18-cron && cp -n /usr/lib/postgresql/18/lib/\*.so /ext-lib/"
+assert_contains "#303: copy-base-ext still copies plainly after apt-get" "${pkg_base_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+"postgresql-18=$PGVER"} postgresql-18-cron && cp /usr/lib/postgresql/18/lib/\*.so /ext-lib/'
+assert_contains "#303: copy-ext still uses cp -n after apt-get" "${pkg_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+"postgresql-18=$PGVER"} postgresql-18-cron && cp -n /usr/lib/postgresql/18/lib/\*.so /ext-lib/'
+
+# review (#303): apt-get install could otherwise upgrade the already-installed
+# postgresql-{major} as a side effect of satisfying some extension package's
+# dependency, silently swapping the libs this cp is about to copy for a build from
+# a different point release than the postmaster this chart starts -- the #302
+# failure mode one layer up. Detect the installed version with dpkg-query (no `-f`
+# format string, so no shell-quoting-inside-quoting) and pin it on the same
+# apt-get install line, so apt either leaves it alone (confirmed live: "postgresql-18
+# is already the newest version") or fails the install outright, never a silent
+# swap.
+assert_contains "#303: copy-base-ext detects the installed postgresql-18 version via dpkg-query" "${pkg_base_ext}" 'PGVER=$(dpkg-query -W postgresql-18 2>/dev/null | cut -f2)'
+assert_contains "#303: copy-base-ext pins postgresql-18 on the same apt-get install line" "${pkg_base_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+"postgresql-18=$PGVER"}'
+assert_contains "#303: copy-ext also detects and pins postgresql-18 (best-effort for a custom image)" "${pkg_ext}" 'PGVER=$(dpkg-query -W postgresql-18 2>/dev/null | cut -f2)'
 
 # #303: a version pin (apt's `=` syntax) passes through verbatim -- no chart-side
 # parsing or reformatting of the pin.
@@ -338,7 +351,7 @@ pkg_pin=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=18 \
   --set 'postgresql.extensions.packages[0]=postgresql-18-cron=1.6.4-1' \
   --show-only templates/statefulset.yaml 2>&1)
-assert_contains "#303: a pinned version renders verbatim" "${pkg_pin}" "apt-get install -y --no-install-recommends postgresql-18-cron=1.6.4-1"
+assert_contains "#303: a pinned version renders verbatim" "${pkg_pin}" "postgresql-18-cron=1.6.4-1"
 
 # #303: {major} tracks an overridden majorVersion -- no stale "18" string anywhere
 # once a different major is selected (agent mode's repmgr-image major pin, #133,
@@ -349,7 +362,7 @@ pkg_major19=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.image.majorVersion=19 \
   --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
   --show-only templates/statefulset.yaml 2>&1)
-assert_contains "#303: {major}=19 substitutes into the package name" "${pkg_major19}" "apt-get install -y --no-install-recommends postgresql-19-cron"
+assert_contains "#303: {major}=19 substitutes into the package name" "${pkg_major19}" "postgresql-19-cron"
 assert_not_contains "#303: no stale postgresql-18-cron once majorVersion=19" "${pkg_major19}" "postgresql-18-cron"
 
 # #303: the apt-get step runs root-transiently (dpkg needs it), but ONLY while
@@ -384,7 +397,7 @@ pkg_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
   --show-only templates/statefulset.yaml 2>&1)
 assert_not_contains "#303: standalone has no copy-base-ext" "${pkg_standalone}" "name: copy-base-ext"
-assert_contains "#303: standalone copy-ext installs the package" "${pkg_standalone}" "apt-get install -y --no-install-recommends postgresql-18-cron"
+assert_contains "#303: standalone copy-ext installs the package" "${pkg_standalone}" "postgresql-18-cron"
 
 # #303: postgresql.extensions.packages without extensions.enabled fails the render --
 # a stale/typo'd `enabled: false` must not silently install nothing.
