@@ -181,6 +181,8 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.extraVolumeMounts` | Extra mounts for the postgresql container; each must reference a `postgresql.extraVolumes` entry | `[]` |
 | `postgresql.extraEnv` | Extra env vars for the postgresql container (supports `value` and `valueFrom`); may not reuse a chart-set name | `[]` |
 | `postgresql.extensions.enabled` | Enable extensions support | `true` |
+| `postgresql.extensions.packages` | Debian/PGDG packages to `apt-get install` before the copy step, for *additional* extensions beyond `vector` (`pg_cron`, …); `{major}` substitutes `postgresql.majorVersion`; see the [pg chart README](../pg/README.md#installing-extensions-without-a-custom-image) | `[]` |
+| `postgresql.extensions.installResources` | Resources for the apt-get step (only rendered while `packages` is non-empty) | `100m/128Mi` req, `1/512Mi` limit |
 | `postgresql.audit.enabled` | Enable pgaudit audit logging (requires repmgr mode; see [Audit logging](#audit-logging-pgaudit)) | `false` |
 | `postgresql.audit.log` | pgaudit session classes: `read,write,function,role,ddl,misc,misc_set,all` (negate with `-`) | `"ddl, role, write"` |
 | `postgresql.audit.logCatalog` | Audit `pg_catalog` statements | `false` |

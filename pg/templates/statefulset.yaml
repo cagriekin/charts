@@ -1,6 +1,7 @@
 {{- include "pg.validateResourceNames" . }}
 {{- include "pg.validateAudit" . }}
 {{- include "pg.validateExtraPassthrough" . }}
+{{- include "pg.validateExtensionPackages" . }}
 {{- if and (not .Values.repmgr.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
 {{- fail "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr" }}
 {{- end }}
@@ -351,25 +352,101 @@ spec:
 {{- end }}
 {{- if and .Values.postgresql.extensions.enabled .Values.repmgr.enabled }}
 {{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
+{{- $pkgs := list }}
+{{- range $p := (.Values.postgresql.extensions.packages | default list) }}
+{{- $pkgs = append $pkgs ($p | toString | replace "{major}" ($pgMajor | toString)) }}
+{{- end }}
         - name: copy-base-ext
           image: "{{ include "pg.repmgrImage" . }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+{{- if $pkgs }}
+          # #303: apt-get install into THIS container's own filesystem before the copy
+          # below -- neither ext-lib nor ext-share is mounted at the real
+          # /usr/lib(share)/postgresql/{{ $pgMajor }}/... paths here (only the main
+          # postgresql container mounts them there), so dpkg unpacks straight into
+          # this image's normal extension directories and the unmodified cp then
+          # picks up both the repmgr image's original extensions and anything just
+          # installed. The repmgr image configures the PGDG apt repo at build time
+          # (images/repmgr/Dockerfile), so this is the reliable install path in
+          # repmgr mode.
+          command: ['sh', '-c', 'apt-get update && apt-get install -y --no-install-recommends {{ join " " $pkgs }} && cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
+          securityContext:
+            # apt-get/dpkg needs root to write /var/lib/dpkg and run package
+            # maintainer scripts (e.g. ldconfig) -- broader than fix-permissions'
+            # plain chown/chmod (#162), because dpkg's maintainer-script surface is
+            # inherently wider than one chown call. Root is confined to this
+            # throwaway init container, which persists nothing: its only output is
+            # two file trees copied into emptyDirs. The main postgresql container,
+            # and this same container with no packages set, keep running as the
+            # unprivileged containerSecurityContext user.
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+                - FSETID
+                - SETUID
+                - SETGID
+                - SETFCAP
+                - MKNOD
+{{- else }}
           command: ['sh', '-c', 'cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
+{{- end }}
           volumeMounts:
             - name: ext-lib
               mountPath: /ext-lib
             - name: ext-share
               mountPath: /ext-share
           resources:
+{{- if $pkgs }}
+            {{- toYaml .Values.postgresql.extensions.installResources | nindent 12 }}
+{{- else }}
             {{- include "pg.initResources" . | nindent 12 }}
+{{- end }}
 {{- end }}
 {{- if .Values.postgresql.extensions.enabled }}
 {{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
+{{- $pkgs := list }}
+{{- range $p := (.Values.postgresql.extensions.packages | default list) }}
+{{- $pkgs = append $pkgs ($p | toString | replace "{major}" ($pgMajor | toString)) }}
+{{- end }}
         - name: copy-ext
           image: {{ include "pg.image" .Values.postgresql.image | quote }}
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+{{- if $pkgs }}
+          # #303: apt-get install before the copy below, same reasoning as
+          # copy-base-ext. Still -n (no-clobber, #302) on the copy: in repmgr mode
+          # copy-base-ext already populated ext-lib/ext-share from the repmgr image,
+          # which is what actually runs the server, so this container's job (with or
+          # without packages) is to ADD what's missing, never overwrite a core lib
+          # with this image's build. PGDG apt-source availability in
+          # postgresql.image is NOT verified by this chart -- see README "Installing
+          # extensions without a custom image".
+          command: ['sh', '-c', 'apt-get update && apt-get install -y --no-install-recommends {{ join " " $pkgs }} && cp -n /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp -n /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+                - FSETID
+                - SETUID
+                - SETGID
+                - SETFCAP
+                - MKNOD
+{{- else }}
           # -n (no-clobber, #302): copy-base-ext (when repmgr is enabled) already
           # populated ext-lib/ext-share from the repmgr image, which is what actually
           # runs the server. This container only ADDS what's missing (e.g. vector.so)
@@ -381,13 +458,18 @@ spec:
           command: ['sh', '-c', 'cp -n /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp -n /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
+{{- end }}
           volumeMounts:
             - name: ext-lib
               mountPath: /ext-lib
             - name: ext-share
               mountPath: /ext-share
           resources:
+{{- if $pkgs }}
+            {{- toYaml .Values.postgresql.extensions.installResources | nindent 12 }}
+{{- else }}
             {{- include "pg.initResources" . | nindent 12 }}
+{{- end }}
 {{- end }}
 {{- if .Values.repmgr.enabled }}
         - name: repmgr-init

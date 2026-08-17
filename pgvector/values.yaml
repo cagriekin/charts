@@ -251,6 +251,17 @@ postgresql:
 
   extensions:
     enabled: true
+    # Debian/PGDG package names to `apt-get install` before the lib/share copy (#303),
+    # `{major}` substituted with majorVersion, optional `=version` pin. See the pg chart
+    # README "Installing extensions without a custom image".
+    packages: []
+    installResources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
 
   lifecycle:
     postStart:

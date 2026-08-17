@@ -1,5 +1,36 @@
 # pg chart changelog
 
+## 1.11.0 - 2026-08-17
+
+### Added
+
+- **`postgresql.extensions.packages`: install PGDG/Debian extension packages without a
+  custom image (#303).** Generalizes the existing `postgresql.extensions.enabled`
+  copy-based mechanism: `copy-ext`/`copy-base-ext` can now `apt-get install` a
+  render-time-validated package list (`{major}`-substituted against
+  `postgresql.majorVersion`, optionally version-pinned with apt's `=` syntax) into their
+  own filesystem before the existing lib/share copy, so an extension the donor image
+  never shipped (e.g. `postgresql-<major>-cron`) reaches the server the same way
+  `postgresql.extensions.enabled` always has. Mechanically: neither init container mounts
+  `ext-lib`/`ext-share` at the real native extension paths — only the main postgresql
+  container does — so `apt-get install` writes real files there and the existing
+  `cp`/`cp -n` (#302) step sweeps them up unchanged.
+
+  Off by default (`packages: []`; a default render is byte-identical to 1.10.2). When
+  set, the two init containers run root-transiently for the apt step only (capabilities
+  narrowed, not unrestricted — confined to a throwaway container that persists nothing),
+  with their own values-overridable `postgresql.extensions.installResources` rather than
+  the shared, lighter `pg.initResources`. A render-time guard rejects any package entry
+  containing shell metacharacters (the list is interpolated into an `apt-get install`
+  shell command) and rejects `packages` set without `extensions.enabled: true`.
+
+  See README ["Installing extensions without a custom image"](README.md#installing-extensions-without-a-custom-image)
+  for a complete `pg_cron` example, why `postgresql.databases[].extensions` (not
+  `postStart.additionalCommands`) is the right mechanism for the `CREATE EXTENSION` step
+  even against the bootstrap database, the PGDG apt-source assumption for a non-default
+  `postgresql.image`, the `networkPolicy.postgresql.extraEgress` this requires, and the
+  explicit limitation for extensions with no Debian/PGDG package.
+
 ## 1.10.2 - 2026-08-14
 
 ### Fixed

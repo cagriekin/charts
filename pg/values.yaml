@@ -296,6 +296,30 @@ postgresql:
 
   extensions:
     enabled: false
+    # Debian/PGDG package names to `apt-get install` into the copy-ext/copy-base-ext init
+    # containers before the existing lib/share copy (#303), so an extension the donor
+    # image never shipped (e.g. postgresql-<major>-cron) reaches the server without a
+    # custom image. `{major}` is substituted with postgresql.majorVersion at render time,
+    # so bumping the major doesn't require editing this list. Pin a version with apt's `=`
+    # syntax, e.g. "postgresql-{major}-cron=1.6.4-1". Validated at render time
+    # (pg.validateExtensionPackages) -- see README "Installing extensions without a
+    # custom image" for a full pg_cron example, the PGDG apt-source assumption for a
+    # non-default postgresql.image, and the NetworkPolicy egress this requires.
+    packages: []
+      # - "postgresql-{major}-cron"
+    # Resources for the apt-get step, only rendered while packages is non-empty (the
+    # plain-copy default path keeps using the shared, lighter pg.initResources). apt-get
+    # update + install is a real package-manager run (repo metadata fetch + dependency
+    # resolution + dpkg unpack), not a `cp`, so it gets its own, values-overridable
+    # budget -- same precedent as repmgr.initContainerResources for the standby-clone
+    # init container.
+    installResources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
 
   lifecycle:
     postStart:

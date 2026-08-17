@@ -1,5 +1,21 @@
 # pgvector chart changelog
 
+## 1.11.0 - 2026-08-17
+
+Inherited from pg's symlinked `statefulset.yaml`. See the
+[pg 1.11.0 changelog](../pg/CHANGELOG.md) for the full detail.
+
+### Added
+
+- **`postgresql.extensions.packages`: install PGDG/Debian extension packages without a
+  custom image (#303).** `copy-ext` can now `apt-get install` a package list
+  (`{major}`-substituted, optionally version-pinned) before its existing `cp -n` copy, so
+  an extension beyond `vector` that this chart's donor image never shipped (e.g.
+  `postgresql-<major>-cron`) reaches the server without a custom image. Off by default;
+  a default render is byte-identical to 1.10.2. See the
+  [pg chart README](../pg/README.md#installing-extensions-without-a-custom-image) for a
+  complete example.
+
 ## 1.10.2 - 2026-08-14
 
 Inherited from pg's symlinked `statefulset.yaml`. See the
