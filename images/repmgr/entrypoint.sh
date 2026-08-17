@@ -214,6 +214,20 @@ max_replication_slots = 10
 max_slot_wal_keep_size = 4GB
 EOF
 
+            # Wire in the chart's conf.d include (when the chart mounted it) before this
+            # function's own pg_ctl start/stop below, not after. shared_preload_libraries is
+            # postmaster-only (no reload); the chart's merged value (repmgr + operator
+            # extras/pgaudit) lives in conf.d, previously only spliced in by the postStart
+            # hook once postgres was already accepting connections -- too late to take
+            # effect without a second restart, which nothing forced on a fresh install
+            # (the config checksum -> rolling restart wiring only helps a later
+            # `helm upgrade`, since there is no prior pod to roll on `helm install`). A
+            # directory check, not an env var, because it needs no chart-side signal: the
+            # mount is present here iff the chart rendered postgresql-configmap.yaml.
+            if [ -d /etc/postgresql/conf.d ]; then
+                echo "include_dir = '/etc/postgresql/conf.d'" >> "$PGDATA/postgresql.conf"
+            fi
+
             if [ "${PGBACKREST_ENABLED:-}" = "true" ]; then
                 cat >> "$PGDATA/postgresql.conf" << PGBR
 archive_mode = on

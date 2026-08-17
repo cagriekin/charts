@@ -31,6 +31,30 @@
   `postgresql.image`, the `networkPolicy.postgresql.extraEgress` this requires, and the
   explicit limitation for extensions with no Debian/PGDG package.
 
+### Fixed
+
+- **`shared_preload_libraries` never actually applied before the post-install hook Jobs
+  ran on a fresh install (found while verifying #303's own `pg_cron` recipe).**
+  `shared_preload_libraries` is a postmaster-restart-only parameter. On `helm install`,
+  the repmgr image's entrypoint bakes `shared_preload_libraries = 'repmgr'` directly at
+  `initdb`; the chart's merged value (repmgr + any operator-declared libraries + pgaudit)
+  lives in a conf.d file that was only spliced into `postgresql.conf` by the `postStart`
+  hook, after postgres was already accepting connections -- too late for a
+  restart-only GUC, and nothing forced the restart a `helm upgrade`'s config-checksum
+  rolling restart would have provided. The `databases-roles`/`audit-extension` hook Jobs
+  then failed `CREATE EXTENSION ... must be loaded via shared_preload_libraries`, and
+  (per `hook-delete-policy: before-hook-creation,hook-succeeded`) sat failed rather than
+  retrying. Pre-existing, not introduced by #303 -- confirmed the identical failure on
+  unmodified 1.10.2 with only `postgresql.audit.enabled: true` set.
+
+  Fixed at the source: `repmgr.image.tag` bumped to `trixie-5.5.0-31`, whose entrypoint
+  now wires the chart's conf.d `include_dir` into `postgresql.conf` at `initdb` time --
+  before its own bootstrap `pg_ctl start` -- so the merged `shared_preload_libraries` is
+  active from the very first postmaster start on a fresh install, no restart required.
+  Verified live on a fresh `helm install` for both the `pg_cron` recipe above and
+  `postgresql.audit.enabled: true`. `etcd.rbac.bootstrapImage.tag` bumped alongside it,
+  same lockstep requirement as always.
+
 ## 1.10.2 - 2026-08-14
 
 ### Fixed
