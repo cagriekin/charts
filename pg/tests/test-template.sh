@@ -305,6 +305,128 @@ copy_ext=$(printf '%s\n' "${init_res}" | sed -n '/name: copy-ext/,/securityConte
 assert_contains "#302: copy-ext uses cp -n for the lib copy" "${copy_ext}" "cp -n /usr/lib/postgresql/18/lib/\*.so /ext-lib/"
 assert_contains "#302: copy-ext uses cp -n for the extension-share copy" "${copy_ext}" "cp -n /usr/share/postgresql/18/extension/\* /ext-share/"
 
+# #303: with no packages declared, neither init container should carry an apt-get
+# step or the root-transient securityContext it needs -- the default/existing-user
+# path (containerSecurityContext, uid 101) must be completely unaffected.
+assert_not_contains "#303: no apt-get in copy-base-ext when packages unset" "${copy_base_ext}" "apt-get"
+assert_not_contains "#303: no apt-get in copy-ext when packages unset" "${copy_ext}" "apt-get"
+assert_not_contains "#303: copy-ext keeps the unprivileged user when packages unset" "${copy_ext}" "runAsUser: 0"
+
+# #303: postgresql.extensions.packages installs a PGDG/Debian package into BOTH
+# copy-base-ext and copy-ext before their existing copy step, so an extension the
+# donor image never shipped (e.g. pg_cron) reaches the server without a custom
+# image. {major} is substituted with postgresql.majorVersion at render time.
+pkg_res=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --show-only templates/statefulset.yaml 2>&1)
+pkg_base_ext=$(printf '%s\n' "${pkg_res}" | sed -n '/name: copy-base-ext/,/name: copy-ext/p')
+pkg_ext=$(printf '%s\n' "${pkg_res}" | sed -n '/name: copy-ext/,/name: repmgr-init/p')
+assert_contains "#303: copy-base-ext installs the {major}-substituted package" "${pkg_base_ext}" "postgresql-18-cron"
+assert_contains "#303: copy-ext installs the {major}-substituted package too" "${pkg_ext}" "postgresql-18-cron"
+# the copy step must still follow the apt-get in the same command, and copy-ext
+# must still be -n (#302) even with packages set -- installing a package is not a
+# license to start clobbering the repmgr image's core libs.
+assert_contains "#303: copy-base-ext still copies plainly after apt-get" "${pkg_base_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+"postgresql-18=$PGVER"} postgresql-18-cron && cp /usr/lib/postgresql/18/lib/\*.so /ext-lib/'
+assert_contains "#303: copy-ext still uses cp -n after apt-get" "${pkg_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+"postgresql-18=$PGVER"} postgresql-18-cron && cp -n /usr/lib/postgresql/18/lib/\*.so /ext-lib/'
+
+# review (#303): apt-get install could otherwise upgrade the already-installed
+# postgresql-{major} as a side effect of satisfying some extension package's
+# dependency, silently swapping the libs this cp is about to copy for a build from
+# a different point release than the postmaster this chart starts -- the #302
+# failure mode one layer up. Detect the installed version with dpkg-query (no `-f`
+# format string, so no shell-quoting-inside-quoting) and pin it on the same
+# apt-get install line, so apt either leaves it alone (confirmed live: "postgresql-18
+# is already the newest version") or fails the install outright, never a silent
+# swap.
+assert_contains "#303: copy-base-ext detects the installed postgresql-18 version via dpkg-query" "${pkg_base_ext}" 'PGVER=$(dpkg-query -W postgresql-18 2>/dev/null | cut -f2)'
+assert_contains "#303: copy-base-ext pins postgresql-18 on the same apt-get install line" "${pkg_base_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+"postgresql-18=$PGVER"}'
+assert_contains "#303: copy-ext also detects and pins postgresql-18 (best-effort for a custom image)" "${pkg_ext}" 'PGVER=$(dpkg-query -W postgresql-18 2>/dev/null | cut -f2)'
+
+# #303: a version pin (apt's `=` syntax) passes through verbatim -- no chart-side
+# parsing or reformatting of the pin.
+pkg_pin=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-18-cron=1.6.4-1' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#303: a pinned version renders verbatim" "${pkg_pin}" "postgresql-18-cron=1.6.4-1"
+
+# #303: {major} tracks an overridden majorVersion -- no stale "18" string anywhere
+# once a different major is selected (agent mode's repmgr-image major pin, #133,
+# requires repmgr.image.majorVersion to match).
+pkg_major19=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=19 \
+  --set repmgr.image.majorVersion=19 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#303: {major}=19 substitutes into the package name" "${pkg_major19}" "postgresql-19-cron"
+assert_not_contains "#303: no stale postgresql-18-cron once majorVersion=19" "${pkg_major19}" "postgresql-18-cron"
+
+# #303: the apt-get step runs root-transiently (dpkg needs it), but ONLY while
+# packages is set -- narrowed capabilities, not unrestricted root, and confined to
+# this throwaway init container (its only output is two file trees copied into
+# emptyDirs; nothing here is ever mounted onto the main postgresql container).
+assert_contains "#303: copy-base-ext runs the apt-get step as root" "${pkg_base_ext}" "runAsUser: 0"
+assert_contains "#303: copy-base-ext narrows capabilities rather than running unrestricted" "${pkg_base_ext}" "SETFCAP"
+assert_contains "#303: copy-ext also runs the apt-get step as root" "${pkg_ext}" "runAsUser: 0"
+
+# #303: the apt-get step gets its own, heavier, values-overridable resources
+# (installResources) instead of the shared lightweight pg.initResources (cpu: 10m)
+# -- apt-get update + install is a real package-manager run, not a bare cp.
+assert_contains "#303: copy-base-ext uses installResources when packages is set" "${pkg_base_ext}" 'cpu: "1"'
+assert_not_contains "#303: copy-base-ext does NOT use the shared lightweight init resources" "${pkg_base_ext}" "cpu: 10m"
+
+# #303: no new uncapped volume was introduced -- ext-lib/ext-share stay capped at
+# 1Gi (#165) even with the apt-get step enabled.
+pkg_sized=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' 2>&1)
+assert_contains "#303: extension-tree emptyDir still capped at 1Gi with packages set" "${pkg_sized}" "sizeLimit: 1Gi"
+
+# #303: standalone mode (no repmgr) has only copy-ext, so it alone must be able to
+# carry the apt-get step for the mechanism to help there at all.
+pkg_standalone=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false \
+  --set postgresql.replicaCount=0 \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#303: standalone has no copy-base-ext" "${pkg_standalone}" "name: copy-base-ext"
+assert_contains "#303: standalone copy-ext installs the package" "${pkg_standalone}" "postgresql-18-cron"
+
+# #303: postgresql.extensions.packages without extensions.enabled fails the render --
+# a stale/typo'd `enabled: false` must not silently install nothing.
+helm template test-pg "${CHART_DIR}" \
+  --set 'postgresql.extensions.packages[0]=postgresql-18-cron' \
+  >/dev/null 2>&1 && pkg_noenable_rc=0 || pkg_noenable_rc=$?
+assert_eq "#303: packages without extensions.enabled fails the render" "1" "${pkg_noenable_rc}"
+pkg_noenable_err=$(helm template test-pg "${CHART_DIR}" \
+  --set 'postgresql.extensions.packages[0]=postgresql-18-cron' 2>&1) || true
+assert_contains "#303: error explains extensions.enabled must be true" "${pkg_noenable_err}" "postgresql.extensions.enabled"
+
+# #303: a package entry with a shell metacharacter fails the render -- the list is
+# interpolated into an apt-get install shell command, so this is a command-injection
+# guard. Caught by values.schema.json's pattern (same regex as
+# pg.validateExtensionPackages, matching this chart's existing double-validation
+# convention for postgresql.databases[].extensions).
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-18-cron; rm -rf /' \
+  >/dev/null 2>&1 && pkg_inject_semi_rc=0 || pkg_inject_semi_rc=$?
+assert_eq "#303: a semicolon-injected package entry fails the render" "1" "${pkg_inject_semi_rc}"
+
+# #303: at least one other metacharacter class beyond the semicolon case above.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=`id`' \
+  >/dev/null 2>&1 && pkg_inject_backtick_rc=0 || pkg_inject_backtick_rc=$?
+assert_eq "#303: a backtick-injected package entry fails the render" "1" "${pkg_inject_backtick_rc}"
+
 # #116: the busybox helper init image is a single shared value (default 1.37 for all
 # four init containers, no more 1.35/1.37 split) and is overridable for air-gapped
 # registries. Default render must carry no hardcoded busybox tag.

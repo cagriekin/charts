@@ -48,6 +48,13 @@
             }
           }
         },
+        "extensions": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "packages": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9+.~:=_-]*(\\{major\\}[A-Za-z0-9+.~:=_-]*)*$" }, "description": "Debian/PGDG package names (optionally =version-pinned), apt-get installed into copy-ext/copy-base-ext before the extension-file copy (#303). {major} is substituted with postgresql.majorVersion." }
+          }
+        },
         "audit": {
           "type": "object",
           "properties": {

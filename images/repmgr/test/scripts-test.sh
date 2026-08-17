@@ -324,6 +324,29 @@ else
   bad "#269: Dockerfile does not assert per-major package availability"
 fi
 
+# --- #303 follow-up: conf.d must be wired in before the FIRST pg_ctl start ---
+# shared_preload_libraries is postmaster-only (no reload). The chart's merged value
+# (repmgr + operator extras/pgaudit) lives in conf.d; previously only the chart's
+# postStart hook spliced in the include_dir line, after postgres was already
+# accepting connections -- too late for a postmaster-only GUC, and nothing forces a
+# second restart on a fresh `helm install` (the config-checksum rolling restart only
+# helps a later `helm upgrade`). entrypoint.sh must wire it in at initdb time,
+# before its own bootstrap pg_ctl start below, so the merged preload list is active
+# from the very first postmaster start.
+confd_line=$(grep -n "include_dir = '/etc/postgresql/conf.d'" "${ROOT}/entrypoint.sh" | grep -v "PGDATA\"" | head -1 | cut -d: -f1)
+guard_line=$(grep -n "if \[ -d /etc/postgresql/conf.d \]; then" "${ROOT}/entrypoint.sh" | head -1 | cut -d: -f1)
+first_start_line=$(grep -n 'pg_ctl -D "\$PGDATA" -w start' "${ROOT}/entrypoint.sh" | head -1 | cut -d: -f1)
+if [ -n "$guard_line" ] && [ -n "$confd_line" ]; then
+  ok "#303: entrypoint.sh guards the conf.d include on the mount actually existing"
+else
+  bad "#303: entrypoint.sh does not guard the conf.d include on the mount existing"
+fi
+if [ -n "$confd_line" ] && [ -n "$first_start_line" ] && [ "$confd_line" -lt "$first_start_line" ]; then
+  ok "#303: entrypoint.sh wires conf.d in before the bootstrap pg_ctl start"
+else
+  bad "#303: entrypoint.sh does not wire conf.d in before the bootstrap pg_ctl start"
+fi
+
 echo "----"
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
 exit "$fail"

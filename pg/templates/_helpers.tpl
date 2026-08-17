@@ -358,6 +358,31 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end -}}
 {{- end }}
 
+{{- /* #303: postgresql.extensions.packages is apt-get argv, space-joined into a single
+       `sh -c` string ahead of the existing extension-copy command in copy-ext/
+       copy-base-ext (statefulset.yaml). A malicious or fat-fingered entry could inject
+       shell -- backticks, $(), ;, &, |, quotes, whitespace/newlines all terminate or
+       extend the intended `apt-get install` argv. Restrict to the character class
+       legitimate Debian/PGDG package names and version pins actually use (letters,
+       digits, + . ~ : = _ -), plus the literal `{major}` placeholder token substituted
+       with postgresql.majorVersion at render time, and fail the render otherwise --
+       mirrors pg.validateDatabasesRoles's identifier guard above. */ -}}
+{{- define "pg.validateExtensionPackages" -}}
+{{- $pkgs := .Values.postgresql.extensions.packages | default list -}}
+{{- if $pkgs -}}
+  {{- if not .Values.postgresql.extensions.enabled -}}
+    {{- fail "postgresql.extensions.packages is set but postgresql.extensions.enabled is false, so nothing would ever install them. Set postgresql.extensions.enabled=true." -}}
+  {{- end -}}
+  {{- $re := "^[A-Za-z0-9][A-Za-z0-9+.~:=_-]*(\\{major\\}[A-Za-z0-9+.~:=_-]*)*$" -}}
+  {{- range $p := $pkgs -}}
+    {{- $s := $p | toString -}}
+    {{- if not (regexMatch $re $s) -}}
+      {{- fail (printf "postgresql.extensions.packages: invalid entry %q -- must be a plain Debian/PGDG package name, optionally with an =version pin, using only letters, digits, and the characters + . ~ : = _ - (plus the literal {major} placeholder substituted with postgresql.majorVersion); no whitespace, quotes, backticks, $(), ;, &, |, or newlines (the list is interpolated into an apt-get install shell command)." $s) -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- end }}
+
 {{- /* #262: validate the postgresql.extraVolumes / extraVolumeMounts / extraEnv
        passthrough. These are spliced verbatim into the pod spec, so without guards a
        plausible mistake becomes a silent runtime failure or an apply-time apiserver

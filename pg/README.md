@@ -166,6 +166,8 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.extraVolumeMounts` | Extra mounts for the postgresql container; each must reference a `postgresql.extraVolumes` entry | `[]` |
 | `postgresql.extraEnv` | Extra env vars for the postgresql container (supports `value` and `valueFrom`); may not reuse a chart-set name | `[]` |
 | `postgresql.extensions.enabled` | Enable extensions support | `false` |
+| `postgresql.extensions.packages` | Debian/PGDG packages to `apt-get install` before the copy step, so extensions absent from the donor image (`pg_cron`, `postgis`, …) install without a custom image; `{major}` substitutes `postgresql.majorVersion` (see [Installing extensions without a custom image](#installing-extensions-without-a-custom-image)) | `[]` |
+| `postgresql.extensions.installResources` | Resources for the apt-get step (only rendered while `packages` is non-empty) | `100m/128Mi` req, `1/512Mi` limit |
 | `postgresql.audit.enabled` | Enable pgaudit audit logging (requires repmgr mode; see [Audit logging](#audit-logging-pgaudit)) | `false` |
 | `postgresql.audit.log` | pgaudit session classes: `read,write,function,role,ddl,misc,misc_set,all` (negate with `-`) | `"ddl, role, write"` |
 | `postgresql.audit.logCatalog` | Audit `pg_catalog` statements | `false` |
@@ -197,6 +199,53 @@ postgresql:
 ```
 
 When `repmgr.enabled` is true, `additionalCommands` automatically discover the current primary and execute against it, so DDL statements like `CREATE EXTENSION` work correctly regardless of which pod the hook runs on (including standbys after a failover).
+
+### Installing extensions without a custom image
+
+`postgresql.extensions.packages` extends the existing copy-based extension mechanism (`postgresql.extensions.enabled`) with an `apt-get install` step, run inside the throwaway `copy-ext`/`copy-base-ext` init containers before they copy `/usr/lib/postgresql/<major>/lib` and `/usr/share/postgresql/<major>/extension` into the running server. Neither container mounts those emptyDirs at the real native paths — only the main postgresql container does — so `apt-get install` lands real files at the paths the existing copy step already sweeps, and a PGDG/Debian-packaged extension the donor image never shipped (`pg_cron` is the motivating example) reaches the server without building a custom image.
+
+Complete `pg_cron` example:
+
+```yaml
+postgresql:
+  majorVersion: "18"
+  extensions:
+    enabled: true
+    packages:
+      - "postgresql-{major}-cron"
+  configuration:
+    shared_preload_libraries: pg_cron
+    cron.database_name: postgres   # the bootstrap database (postgresql.database)
+  databases:
+    - name: postgres               # the bootstrap database's own name is a valid target:
+      extensions:                  # CREATE DATABASE is idempotent (skips if it exists),
+        - pg_cron                  # and CREATE EXTENSION still runs against it
+```
+
+Declaring `postgres` (or whatever `postgresql.database` is) under `postgresql.databases[]` works because the databases-roles hook Job's `CREATE DATABASE` is already conditional (`WHERE NOT EXISTS ... \gexec`) — it no-ops when the database already exists — and the extension/grant step then runs against that database by name regardless of whether the Job created it. This is preferable to `postgresql.lifecycle.postStart.additionalCommands` for this case: it's already regex-validated (no injection surface) and runs once via a proper Helm hook Job rather than raw shell on every pod boot.
+
+In repmgr mode, `shared_preload_libraries: pg_cron` is merged with `repmgr` (and `pgaudit`, if audit is on) automatically — declare only your own libraries, per [Mounting an extra file on every replica](#mounting-an-extra-file-on-every-replica) below.
+
+**Version pinning.** Append `=version` in apt syntax, e.g. `"postgresql-{major}-cron=1.6.4-1"`. `{major}` is substituted with `postgresql.majorVersion` at render time, so a package list survives a later major bump without editing (confirm the new major has a PGDG build of the same extension before bumping, though).
+
+**PGDG apt-source assumption.** `copy-base-ext` runs from the `cagriekin/repmgr` image, which configures the PGDG apt repository itself at build time — package installs there are reliable whenever repmgr mode is on. `copy-ext` runs from whatever `postgresql.image` you set (default: the official `postgres:18.1-trixie` Docker Hub image); this chart does not verify that image has PGDG configured. This matters most in **standalone mode** (`repmgr.enabled: false`), where `copy-ext` is your only extension source; in repmgr mode, `copy-base-ext` is a confirmed-good fallback even if `copy-ext`'s apt step comes up short.
+
+**NetworkPolicy.** With `networkPolicy.enabled: true`, egress is closed by default except DNS, PostgreSQL, and 443/6443. `apt-get update`/`install` talks to `apt.postgresql.org` over **port 80** (plain HTTP; the apt source itself is signature-verified via a keyring already baked into the image, so this is not a TLS downgrade of package integrity). Add it via the existing egress hook:
+
+```yaml
+networkPolicy:
+  postgresql:
+    extraEgress:
+      - ports:
+          - port: 80
+            protocol: TCP
+```
+
+This egress is needed on **every** pod (re)start, not just the first install: `ext-lib`/`ext-share` are `emptyDir`s, so `copy-ext`/`copy-base-ext` (and the apt-get step) re-run from scratch on a crash, eviction, or rolling update, same as the plain-copy path always has. Cutting egress to `apt.postgresql.org` after a successful install does not affect the already-running server, but a pod that then restarts for any reason will not come back up — plan for persistent, not just one-time, access in an air-gapped or tightly-firewalled cluster.
+
+**Pod Security Admission.** The apt step's init containers run `runAsUser: 0` (dpkg needs root to write `/var/lib/dpkg` and run maintainer scripts) — this is opt-in only while `packages` is set, but a namespace enforcing the PSA **restricted** profile (or any `runAsNonRoot` admission policy) will reject the pod outright. The rest of the chart runs as uid 101; `packages` is not compatible with a `restricted`-labeled namespace.
+
+**Limitation.** This mechanism only helps for extensions that have a PGDG or Debian package. A small number of extensions — mostly private/internal ones, or ones never packaged for Debian/PGDG — have no such package and are **not** solved by `packages`; those still require a custom image with the extension compiled in.
 
 ### Mounting an extra file on every replica
 
@@ -240,7 +289,7 @@ These three values are validated at render time, so a mistake fails `helm instal
 |-----------|-------------|---------|
 | `repmgr.enabled` | Enable repmgr | `true` |
 | `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
-| `repmgr.image.tag` | Repmgr image tag. Unsuffixed = the default major (18); `-pg18` / `-pg17` select one explicitly | `trixie-5.5.0-30` |
+| `repmgr.image.tag` | Repmgr image tag. Unsuffixed = the default major (18); `-pg18` / `-pg17` select one explicitly | `trixie-5.5.0-31` |
 | `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `repmgr.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `repmgr.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `repmgr.username` | Repmgr database user | `repmgr` |
@@ -287,7 +336,7 @@ postgresql:
     tag: 17.10-trixie      # only used in standalone mode / for the extension copy
 repmgr:
   image:
-    tag: trixie-5.5.0-30-pg17
+    tag: trixie-5.5.0-31-pg17
     majorVersion: "17"
 ```
 
@@ -1990,7 +2039,8 @@ Each chart is tagged `<chart>-<version>` (e.g. `pg-1.1.0`); `pg` and `pgvector` 
 
 | `pg` / `pgvector` | repmgr image | PostgreSQL | Kubernetes |
 |-------------------|--------------|-----------|-----------|
-| 1.10.1 *(current)* | `trixie-5.5.0-30` (`-pg18` / `-pg17`) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.11.0 *(current)* | `trixie-5.5.0-31` (`-pg18` / `-pg17`) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.10.1 – 1.10.2 | `trixie-5.5.0-30` | 18.x (default) or 17.x | as above |
 | 1.8.1 – 1.10.0 | `trixie-5.5.0-29` | 18.x (default) or 17.x | as above |
 | 1.5.0 – 1.8.0 | `trixie-5.5.0-28` | 18.x | as above |
 | 1.2.6 – 1.4.x | `trixie-5.5.0-27` | 18.x | as above |
@@ -2008,7 +2058,7 @@ helm repo update
 helm upgrade my-postgres cagriekin/pg   # add -f your-values.yaml
 ```
 
-Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.10.1`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-30` at 1.10.1) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
+Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.11.0`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-31` at 1.11.0) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
 
 ### Crossing the 0.x → 1.x boundary (agent mode is now the default)
 

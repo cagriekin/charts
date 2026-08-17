@@ -1,5 +1,70 @@
 # pg chart changelog
 
+## 1.11.0 - 2026-08-17
+
+### Added
+
+- **`postgresql.extensions.packages`: install PGDG/Debian extension packages without a
+  custom image (#303).** Generalizes the existing `postgresql.extensions.enabled`
+  copy-based mechanism: `copy-ext`/`copy-base-ext` can now `apt-get install` a
+  render-time-validated package list (`{major}`-substituted against
+  `postgresql.majorVersion`, optionally version-pinned with apt's `=` syntax) into their
+  own filesystem before the existing lib/share copy, so an extension the donor image
+  never shipped (e.g. `postgresql-<major>-cron`) reaches the server the same way
+  `postgresql.extensions.enabled` always has. Mechanically: neither init container mounts
+  `ext-lib`/`ext-share` at the real native extension paths — only the main postgresql
+  container does — so `apt-get install` writes real files there and the existing
+  `cp`/`cp -n` (#302) step sweeps them up unchanged.
+
+  Off by default (`packages: []`; a default render is byte-identical to 1.10.2). When
+  set, the two init containers run root-transiently for the apt step only (capabilities
+  narrowed, not unrestricted — confined to a throwaway container that persists nothing),
+  with their own values-overridable `postgresql.extensions.installResources` rather than
+  the shared, lighter `pg.initResources`. A render-time guard rejects any package entry
+  containing shell metacharacters (the list is interpolated into an `apt-get install`
+  shell command) and rejects `packages` set without `extensions.enabled: true`.
+
+  **Review follow-up:** an unversioned PGDG extension dependency on `postgresql-<major>`
+  is normally left alone by apt, but nothing stopped some *other* future package from
+  declaring a stricter dependency and pulling in a newer `postgresql-<major>` as a side
+  effect — silently swapping the very libs about to be copied for a build from a
+  different point release than the postmaster this chart actually starts (the #302
+  failure mode, one layer up). `copy-ext`/`copy-base-ext` now detect the already-installed
+  `postgresql-<major>` version (`dpkg-query`) and pin it on the same `apt-get install`
+  line, so apt either leaves it alone (the normal case, confirmed live) or fails the
+  install outright — never a silent swap.
+
+  See README ["Installing extensions without a custom image"](README.md#installing-extensions-without-a-custom-image)
+  for a complete `pg_cron` example, why `postgresql.databases[].extensions` (not
+  `postStart.additionalCommands`) is the right mechanism for the `CREATE EXTENSION` step
+  even against the bootstrap database, the PGDG apt-source assumption for a non-default
+  `postgresql.image`, the `networkPolicy.postgresql.extraEgress` this requires, and the
+  explicit limitation for extensions with no Debian/PGDG package.
+
+### Fixed
+
+- **`shared_preload_libraries` never actually applied before the post-install hook Jobs
+  ran on a fresh install (found while verifying #303's own `pg_cron` recipe).**
+  `shared_preload_libraries` is a postmaster-restart-only parameter. On `helm install`,
+  the repmgr image's entrypoint bakes `shared_preload_libraries = 'repmgr'` directly at
+  `initdb`; the chart's merged value (repmgr + any operator-declared libraries + pgaudit)
+  lives in a conf.d file that was only spliced into `postgresql.conf` by the `postStart`
+  hook, after postgres was already accepting connections -- too late for a
+  restart-only GUC, and nothing forced the restart a `helm upgrade`'s config-checksum
+  rolling restart would have provided. The `databases-roles`/`audit-extension` hook Jobs
+  then failed `CREATE EXTENSION ... must be loaded via shared_preload_libraries`, and
+  (per `hook-delete-policy: before-hook-creation,hook-succeeded`) sat failed rather than
+  retrying. Pre-existing, not introduced by #303 -- confirmed the identical failure on
+  unmodified 1.10.2 with only `postgresql.audit.enabled: true` set.
+
+  Fixed at the source: `repmgr.image.tag` bumped to `trixie-5.5.0-31`, whose entrypoint
+  now wires the chart's conf.d `include_dir` into `postgresql.conf` at `initdb` time --
+  before its own bootstrap `pg_ctl start` -- so the merged `shared_preload_libraries` is
+  active from the very first postmaster start on a fresh install, no restart required.
+  Verified live on a fresh `helm install` for both the `pg_cron` recipe above and
+  `postgresql.audit.enabled: true`. `etcd.rbac.bootstrapImage.tag` bumped alongside it,
+  same lockstep requirement as always.
+
 ## 1.10.2 - 2026-08-14
 
 ### Fixed

@@ -213,3 +213,24 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: 'postgresql.extraEnv[1]: duplicate env name "A"'
+
+  # --- Scenario 14: extension package installer guards (#303) ---
+  - it: extensions.packages without extensions.enabled fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.packages:
+        - postgresql-18-cron
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.extensions.packages is set but postgresql.extensions.enabled is false, so nothing would ever install them. Set postgresql.extensions.enabled=true."
+
+  - it: a package entry with a shell metacharacter fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-18-cron; rm -rf /"
+    asserts:
+      - failedTemplate: {}

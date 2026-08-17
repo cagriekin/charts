@@ -1,5 +1,30 @@
 # pgvector chart changelog
 
+## 1.11.0 - 2026-08-17
+
+Inherited from pg's symlinked `statefulset.yaml`. See the
+[pg 1.11.0 changelog](../pg/CHANGELOG.md) for the full detail.
+
+### Added
+
+- **`postgresql.extensions.packages`: install PGDG/Debian extension packages without a
+  custom image (#303).** `copy-ext` can now `apt-get install` a package list
+  (`{major}`-substituted, optionally version-pinned) before its existing `cp -n` copy, so
+  an extension beyond `vector` that this chart's donor image never shipped (e.g.
+  `postgresql-<major>-cron`) reaches the server without a custom image. Off by default;
+  a default render is byte-identical to 1.10.2. See the
+  [pg chart README](../pg/README.md#installing-extensions-without-a-custom-image) for a
+  complete example.
+
+### Fixed
+
+- **`shared_preload_libraries` never actually applied before the post-install hook Jobs
+  ran on a fresh install.** Pre-existing, not introduced by this release's change above.
+  See the [pg 1.11.0 changelog](../pg/CHANGELOG.md) for the full root-cause detail.
+  `repmgr.image.tag` bumped to `trixie-5.5.0-31` (`etcd.rbac.bootstrapImage.tag`
+  alongside it); no chart-side change needed since the fix lives entirely in the image's
+  `initdb`-time config.
+
 ## 1.10.2 - 2026-08-14
 
 Inherited from pg's symlinked `statefulset.yaml`. See the
