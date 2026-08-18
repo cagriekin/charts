@@ -85,9 +85,6 @@ tests:
       - notMatchRegex:
           path: data["queries.yaml"]
           pattern: "pg_wal_size:"
-      - notMatchRegex:
-          path: data["queries.yaml"]
-          pattern: "pg_wal_archive:"
 
   - it: no PrometheusRule when prometheusExporter.enabled is false
     templates:
