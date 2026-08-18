@@ -31,15 +31,15 @@ spec:
         # on only then) -- see prometheus-exporter-configmap.yaml.
         - alert: PGWALArchiveFailing
           expr: rate(pg_wal_archive_failed_count{ {{ $m }} }[5m]) > 0
-          for: 5m
+          for: {{ .Values.prometheusExporter.prometheusRule.archiveFailingFor }}
           labels:
             severity: warning
           annotations:
             summary: "archive_command failing ({{ include "pg.fullname" . }})"
-            description: "pg_wal_archive_failed_count has been increasing for 5m -- pgBackRest's archive-push is failing (repo unreachable, full, or misconfigured). WAL will accumulate on the primary until this is fixed (#305)."
+            description: "pg_wal_archive_failed_count has been increasing for {{ .Values.prometheusExporter.prometheusRule.archiveFailingFor }} -- pgBackRest's archive-push is failing (repo unreachable, full, or misconfigured). WAL will accumulate on the primary until this is fixed (#305)."
         - alert: PGWALArchiveStale
           expr: pg_wal_archive_seconds_since_last_archived{ {{ $m }} } > {{ .Values.prometheusExporter.prometheusRule.staleArchiveSeconds }}
-          for: 15m
+          for: {{ .Values.prometheusExporter.prometheusRule.archiveStaleFor }}
           labels:
             severity: warning
           annotations:
@@ -50,10 +50,10 @@ spec:
         # slot pinning WAL with pgbackrest disabled).
         - alert: PGWALSizeHigh
           expr: pg_wal_size_bytes{ {{ $m }} } > {{ .Values.prometheusExporter.prometheusRule.walSizeBytesThreshold | int64 }}
-          for: 15m
+          for: {{ .Values.prometheusExporter.prometheusRule.sizeHighFor }}
           labels:
             severity: warning
           annotations:
             summary: "pg_wal disk usage high ({{ include "pg.fullname" . }})"
-            description: "pg_wal has held more than {{ .Values.prometheusExporter.prometheusRule.walSizeBytesThreshold | int64 }} bytes for 15m. pg_wal shares the PGDATA volume (postgresql.persistence.size) -- unbounded growth here (stuck archive_command, a lagging replication slot) will eventually fill it and stop writes."
+            description: "pg_wal has held more than {{ .Values.prometheusExporter.prometheusRule.walSizeBytesThreshold | int64 }} bytes for {{ .Values.prometheusExporter.prometheusRule.sizeHighFor }}. pg_wal shares the PGDATA volume (postgresql.persistence.size) -- unbounded growth here (stuck archive_command, a lagging replication slot) will eventually fill it and stop writes."
 {{- end }}

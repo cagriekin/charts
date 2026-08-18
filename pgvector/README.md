@@ -731,19 +731,19 @@ Unlike the counters above, `pg_wal_size` reflects actual bytes on disk regardles
 | Metric | Description |
 |--------|-------------|
 | `pg_wal_size_bytes` | Total bytes currently used by `pg_wal` on disk |
-| `pg_wal_size_file_count` | Number of WAL segment files currently in `pg_wal` |
+| `pg_wal_size_file_count` | Number of files currently in `pg_wal` (segments plus `.partial`/`.history`/`.backup` entries) |
 
 `pg_wal` shares the single PGDATA volume (`postgresql.persistence.size`) — there is no separate WAL volume/tablespace. **This chart ships observability for that condition only** — a shipped alert (below) — not an automatic write-throttle or backpressure mechanism.
 
 ### WAL Alert Rules
 
-Set `prometheusExporter.prometheusRule.enabled: true` to ship a `PrometheusRule` (requires the Prometheus Operator CRDs):
+Set `prometheusExporter.prometheusRule.enabled: true` to ship a `PrometheusRule` (requires the Prometheus Operator CRDs). This is a no-op unless `prometheusExporter.serviceMonitor.enabled` (or an equivalent scrape) is also on.
 
 | Alert | Condition | Requires |
 |-------|-----------|----------|
-| `PGWALArchiveFailing` | `rate(pg_wal_archive_failed_count[5m]) > 0` for 5m | `pgbackrest.enabled` |
-| `PGWALArchiveStale` | `pg_wal_archive_seconds_since_last_archived > prometheusExporter.prometheusRule.staleArchiveSeconds` for 15m | `pgbackrest.enabled` |
-| `PGWALSizeHigh` | `pg_wal_size_bytes > prometheusExporter.prometheusRule.walSizeBytesThreshold` for 15m | — |
+| `PGWALArchiveFailing` | `rate(pg_wal_archive_failed_count[5m]) > 0` for `archiveFailingFor` (default `5m`) | `pgbackrest.enabled` |
+| `PGWALArchiveStale` | `pg_wal_archive_seconds_since_last_archived > staleArchiveSeconds` for `archiveStaleFor` (default `15m`) | `pgbackrest.enabled` |
+| `PGWALSizeHigh` | `pg_wal_size_bytes > walSizeBytesThreshold` for `sizeHighFor` (default `15m`) | — |
 
 See pg's README for the full alert-tuning discussion.
 
@@ -784,6 +784,9 @@ See pg's README for the full alert-tuning discussion.
 | `prometheusExporter.prometheusRule.additionalLabels` | Additional labels on PrometheusRule | `{}` |
 | `prometheusExporter.prometheusRule.staleArchiveSeconds` | `PGWALArchiveStale` threshold, in seconds | `900` |
 | `prometheusExporter.prometheusRule.walSizeBytesThreshold` | `PGWALSizeHigh` threshold, in bytes | `5368709120` (5Gi) |
+| `prometheusExporter.prometheusRule.archiveFailingFor` | `PGWALArchiveFailing` `for` duration | `5m` |
+| `prometheusExporter.prometheusRule.archiveStaleFor` | `PGWALArchiveStale` `for` duration | `15m` |
+| `prometheusExporter.prometheusRule.sizeHighFor` | `PGWALSizeHigh` `for` duration | `15m` |
 
 ## Backup
 

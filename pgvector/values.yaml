@@ -727,12 +727,16 @@ prometheusExporter:
     scrapeTimeout: 10s
     additionalLabels: {}
 
-  # Example alert rules over the exporter's WAL metrics. Observability only. #305
+  # Example alert rules over the exporter's WAL metrics. Observability only. A
+  # no-op unless serviceMonitor.enabled (or an equivalent scrape) is also on. #305
   prometheusRule:
     enabled: false
     additionalLabels: {}
     staleArchiveSeconds: 900
     walSizeBytesThreshold: 5368709120 # 5Gi
+    archiveFailingFor: 5m
+    archiveStaleFor: 15m
+    sizeHighFor: 15m
 
 service:
   type: ClusterIP

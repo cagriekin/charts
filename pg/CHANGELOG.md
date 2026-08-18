@@ -27,6 +27,15 @@
     alert until now) and the new `PGWALSizeHigh` to configurable thresholds
     (`staleArchiveSeconds`, `walSizeBytesThreshold`).
 
+  **Review follow-up:** the `for` durations (`archiveFailingFor`/`archiveStaleFor`/
+  `sizeHighFor`, defaulting to `5m`/`15m`/`15m`) are now values-overridable rather than
+  hardcoded, so a small `postgresql.persistence.size` can page sooner than the default
+  15m backstop; the `pg_wal_size_file_count` description was corrected (it also counts
+  `.partial`/`.history`/`.backup` files, not just segments); and the README/values now
+  call out that `prometheusRule.enabled` alone is a no-op without
+  `serviceMonitor.enabled` (or an equivalent scrape) actually feeding the exporter's
+  metrics to Prometheus.
+
 ## 1.11.0 - 2026-08-17
 
 ### Added

@@ -1444,21 +1444,21 @@ Unlike the counters above, `pg_wal_size` reflects actual bytes on disk regardles
 | Metric | Description |
 |--------|-------------|
 | `pg_wal_size_bytes` | Total bytes currently used by `pg_wal` on disk |
-| `pg_wal_size_file_count` | Number of WAL segment files currently in `pg_wal` |
+| `pg_wal_size_file_count` | Number of files currently in `pg_wal` (segments plus `.partial`/`.history`/`.backup` entries) |
 
 `pg_wal` shares the single PGDATA volume (`postgresql.persistence.size`) — there is no separate WAL volume/tablespace. If `archive_command` gets stuck (repository unreachable or full), PostgreSQL correctly refuses to recycle un-archived WAL, and `pg_wal_size_bytes` will climb without bound until the volume fills and the instance stops accepting writes. **This chart ships observability for that condition only** — a shipped alert (below) so you can page and act manually — not an automatic write-throttle or backpressure mechanism. Bounding the *action*, not just visibility into the problem, is tracked as a follow-up.
 
 ### WAL Alert Rules
 
-Set `prometheusExporter.prometheusRule.enabled: true` to ship a `PrometheusRule` (requires the Prometheus Operator CRDs) wiring the metrics above to alerts:
+Set `prometheusExporter.prometheusRule.enabled: true` to ship a `PrometheusRule` (requires the Prometheus Operator CRDs) wiring the metrics above to alerts. **This is a no-op unless something actually scrapes the exporter** — the rule alerts on metrics the exporter emits, so it does nothing on its own; enable `prometheusExporter.serviceMonitor.enabled` too (or point your own scrape config at it) or the alerts will simply never fire.
 
 | Alert | Condition | Requires |
 |-------|-----------|----------|
-| `PGWALArchiveFailing` | `rate(pg_wal_archive_failed_count[5m]) > 0` for 5m | `pgbackrest.enabled` |
-| `PGWALArchiveStale` | `pg_wal_archive_seconds_since_last_archived > prometheusExporter.prometheusRule.staleArchiveSeconds` for 15m | `pgbackrest.enabled` |
-| `PGWALSizeHigh` | `pg_wal_size_bytes > prometheusExporter.prometheusRule.walSizeBytesThreshold` for 15m | — |
+| `PGWALArchiveFailing` | `rate(pg_wal_archive_failed_count[5m]) > 0` for `archiveFailingFor` (default `5m`) | `pgbackrest.enabled` |
+| `PGWALArchiveStale` | `pg_wal_archive_seconds_since_last_archived > staleArchiveSeconds` for `archiveStaleFor` (default `15m`) | `pgbackrest.enabled` |
+| `PGWALSizeHigh` | `pg_wal_size_bytes > walSizeBytesThreshold` for `sizeHighFor` (default `15m`) | — |
 
-`PGWALArchiveFailing` is the most actionable of the three — it fires as soon as `archive-push` starts failing, before any WAL has had time to accumulate. `PGWALArchiveStale` and `PGWALSizeHigh` are backstops with the same idle-primary caveat as the metrics they read; tune `staleArchiveSeconds`/`walSizeBytesThreshold` to your WAL generation rate and `postgresql.persistence.size` headroom.
+`PGWALArchiveFailing` is the most actionable of the three — it fires as soon as `archive-push` starts failing, before any WAL has had time to accumulate. `PGWALArchiveStale` and `PGWALSizeHigh` are backstops with the same idle-primary caveat as the metrics they read; tune `staleArchiveSeconds`/`walSizeBytesThreshold` to your WAL generation rate and `postgresql.persistence.size` headroom, and tighten the `*For` durations (Prometheus duration syntax) if that volume is small enough that 15m is too long to wait before paging.
 
 ### Exporter Parameters
 
@@ -1497,6 +1497,9 @@ Set `prometheusExporter.prometheusRule.enabled: true` to ship a `PrometheusRule`
 | `prometheusExporter.prometheusRule.additionalLabels` | Additional labels on PrometheusRule | `{}` |
 | `prometheusExporter.prometheusRule.staleArchiveSeconds` | `PGWALArchiveStale` threshold, in seconds | `900` |
 | `prometheusExporter.prometheusRule.walSizeBytesThreshold` | `PGWALSizeHigh` threshold, in bytes | `5368709120` (5Gi) |
+| `prometheusExporter.prometheusRule.archiveFailingFor` | `PGWALArchiveFailing` `for` duration | `5m` |
+| `prometheusExporter.prometheusRule.archiveStaleFor` | `PGWALArchiveStale` `for` duration | `15m` |
+| `prometheusExporter.prometheusRule.sizeHighFor` | `PGWALSizeHigh` `for` duration | `15m` |
 
 ## Backup
 

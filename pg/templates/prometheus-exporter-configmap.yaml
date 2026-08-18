@@ -63,7 +63,7 @@ data:
             description: "Total bytes currently used by pg_wal on disk"
         - file_count:
             usage: "GAUGE"
-            description: "Number of WAL segment files currently in pg_wal"
+            description: "Number of files currently in pg_wal (segments plus .partial/.history/.backup entries)"
 {{- if .Values.pgbackrest.enabled }}
     # WAL archiving health (#30). archive_mode is on only when pgBackRest is
     # enabled, so this group is gated on it and scraped on the primary (archiving
