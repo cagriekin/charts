@@ -2502,8 +2502,16 @@ assert_not_contains "exporter cm: no collision with built-in pg_replication grou
 assert_contains "exporter cm: in_recovery gauge present" "${exporter_cm}" "pg_is_in_recovery()::int AS in_recovery"
 assert_contains "exporter cm: receive/replay byte lag NULL-safe on primaries" "${exporter_cm}" "COALESCE(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()), 0)"
 assert_contains "exporter cm: byte lag metric declared" "${exporter_cm}" "receive_replay_lag_bytes:"
-gauge_count=$(printf '%s' "${exporter_cm}" | grep -c 'usage: "GAUGE"' || true)
+replication_block=$(printf '%s\n' "${exporter_cm}" | sed -n '/pg_wal_replication:/,/pg_wal_size:/p')
+gauge_count=$(printf '%s' "${replication_block}" | grep -c 'usage: "GAUGE"' || true)
 assert_eq "exporter cm: two GAUGE metrics in pg_wal_replication" "2" "${gauge_count}"
+
+# #305: pg_wal disk-usage metrics. Ungated (unlike pg_wal_archive below) --
+# useful even without pgbackrest (e.g. a lagging replication slot).
+assert_contains "exporter cm #305: pg_wal_size group present without pgbackrest" "${exporter_cm}" "pg_wal_size:"
+assert_contains "exporter cm #305: reads pg_ls_waldir" "${exporter_cm}" "FROM pg_ls_waldir()"
+assert_contains "exporter cm #305: bytes metric declared" "${exporter_cm}" "bytes:"
+assert_contains "exporter cm #305: file_count metric declared" "${exporter_cm}" "file_count:"
 
 # #30: WAL-archiving health metrics from pg_stat_archiver, gated on pgbackrest
 # (archive_mode is on only then) and scraped on the primary.
@@ -2516,6 +2524,31 @@ assert_contains "exporter cm #30: seconds_since_last_archived metric declared" "
 assert_contains "exporter cm #30: archiver query reads pg_stat_archiver" "${exporter_cm_arch}" "FROM pg_stat_archiver"
 # absent when pgbackrest disabled (no archiving); exporter_cm above is full-test (pgbackrest off)
 assert_not_contains "exporter cm #30: no pg_wal_archive group when pgbackrest disabled" "${exporter_cm}" "pg_wal_archive:"
+
+# #305: exporter PrometheusRule -- ships only when both prometheusExporter.enabled
+# and prometheusExporter.prometheusRule.enabled are set; the two archive-specific
+# alerts additionally require pgbackrest.enabled (pg_wal_archive_* doesn't exist
+# otherwise), while PGWALSizeHigh is unconditional.
+rule_off=$(helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true \
+  --show-only templates/prometheus-exporter-prometheusrule.yaml 2>&1 || true)
+assert_contains "exporter rule #305: absent when prometheusRule.enabled is false" "${rule_off}" "could not find template"
+
+rule_no_pgbackrest=$(helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true \
+  --set prometheusExporter.prometheusRule.enabled=true --show-only templates/prometheus-exporter-prometheusrule.yaml 2>&1)
+assert_contains "exporter rule #305: PGWALSizeHigh present without pgbackrest" "${rule_no_pgbackrest}" "alert: PGWALSizeHigh"
+assert_not_contains "exporter rule #305: no PGWALArchiveFailing without pgbackrest" "${rule_no_pgbackrest}" "alert: PGWALArchiveFailing"
+assert_not_contains "exporter rule #305: no PGWALArchiveStale without pgbackrest" "${rule_no_pgbackrest}" "alert: PGWALArchiveStale"
+
+rule_full=$(helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true \
+  --set prometheusExporter.prometheusRule.enabled=true --set pgbackrest.enabled=true \
+  --set pgbackrest.s3.endpoint=https://e --set pgbackrest.s3.bucket=b \
+  --set pgbackrest.existingSecret.name=s --show-only templates/prometheus-exporter-prometheusrule.yaml 2>&1)
+assert_contains "exporter rule #305: PGWALArchiveFailing present with pgbackrest" "${rule_full}" "alert: PGWALArchiveFailing"
+assert_contains "exporter rule #305: PGWALArchiveStale present with pgbackrest" "${rule_full}" "alert: PGWALArchiveStale"
+assert_contains "exporter rule #305: PGWALSizeHigh present with pgbackrest" "${rule_full}" "alert: PGWALSizeHigh"
+assert_contains "exporter rule #305: threshold rendered as plain integer, not scientific notation" "${rule_full}" "> 5368709120"
+assert_not_contains "exporter rule #305: no scientific-notation threshold" "${rule_full}" "e+09"
+assert_contains "exporter rule #305: kind is PrometheusRule" "${rule_full}" "kind: PrometheusRule"
 
 # #28: least-privilege monitoring user. A post-install/upgrade hook Job creates a
 # pg_monitor role; the exporter connects as it, not the postgres superuser.

@@ -1,5 +1,32 @@
 # pg chart changelog
 
+## 1.12.0 - 2026-08-18
+
+### Added
+
+- **`prometheusExporter.prometheusRule`: alert on stuck WAL archiving and pg_wal disk
+  usage (#305).** When `archive_command` gets stuck (pgBackRest repository unreachable
+  or full), PostgreSQL correctly refuses to recycle un-archived WAL, and nothing
+  previously surfaced that growth before it filled the shared PGDATA/`pg_wal` volume.
+  This is an **observability-only** fix -- it does not throttle writes or take any
+  automatic corrective action when a threshold is crossed; that remains a separate,
+  larger change to the Go failover agent's reconcile loop, deliberately out of scope
+  here (see README ["WAL Disk Usage"](README.md#wal-disk-usage-305) for the full
+  reasoning).
+
+  Two pieces:
+  - A new, ungated `pg_wal_size` exporter query group (`pg_wal_size_bytes`,
+    `pg_wal_size_file_count` via `pg_ls_waldir()`) reporting actual `pg_wal` bytes on
+    disk, regardless of *why* WAL is being retained -- unlike the existing
+    `pg_wal_archive` counters (which only exist when `pgbackrest.enabled` and only
+    reflect archive attempt/failure counts, not disk usage). No new grant needed:
+    `pg_ls_waldir()` has been part of the `pg_monitor` role since PG10.
+  - `prometheusExporter.prometheusRule.enabled` (default `false`) ships a
+    `PrometheusRule` wiring `PGWALArchiveFailing`/`PGWALArchiveStale` (the existing
+    `pg_wal_archive_*` metrics from #30, collected since 1.x but never wired to an
+    alert until now) and the new `PGWALSizeHigh` to configurable thresholds
+    (`staleArchiveSeconds`, `walSizeBytesThreshold`).
+
 ## 1.11.0 - 2026-08-17
 
 ### Added

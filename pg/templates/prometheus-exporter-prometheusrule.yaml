@@ -1,0 +1,59 @@
+{{- if and .Values.prometheusExporter.enabled (dig "prometheusRule" "enabled" false (.Values.prometheusExporter | default dict)) }}
+{{- /*
+Alert rules over the postgres-exporter's WAL metrics (#305): archive_command
+failures/staleness (pg_wal_archive, already collected but never wired to an
+alert) and actual pg_wal disk usage (pg_wal_size, new). This is observability
+only -- there is no automatic write-throttle or backpressure if a threshold is
+crossed; see the README "WAL Archiving Metrics" section for that scoping
+decision. Requires the Prometheus Operator CRDs (same as
+prometheusExporter.serviceMonitor).
+*/}}
+{{- $m := printf "namespace=%q,service=%q" .Release.Namespace (printf "%s-postgres-exporter" (include "pg.fullname" .)) }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "pg.fullname" . }}-postgres-exporter
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    {{- with .Values.prometheusExporter.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+spec:
+  groups:
+    - name: {{ include "pg.fullname" . }}-postgres-exporter
+      rules:
+{{- if .Values.pgbackrest.enabled }}
+        # pg_wal_archive_* only exists when pgbackrest.enabled (archive_mode is
+        # on only then) -- see prometheus-exporter-configmap.yaml.
+        - alert: PGWALArchiveFailing
+          expr: rate(pg_wal_archive_failed_count{ {{ $m }} }[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "archive_command failing ({{ include "pg.fullname" . }})"
+            description: "pg_wal_archive_failed_count has been increasing for 5m -- pgBackRest's archive-push is failing (repo unreachable, full, or misconfigured). WAL will accumulate on the primary until this is fixed (#305)."
+        - alert: PGWALArchiveStale
+          expr: pg_wal_archive_seconds_since_last_archived{ {{ $m }} } > {{ .Values.prometheusExporter.prometheusRule.staleArchiveSeconds }}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "WAL archiving stale ({{ include "pg.fullname" . }})"
+            description: "No successful WAL archive in over {{ .Values.prometheusExporter.prometheusRule.staleArchiveSeconds }}s. This also rises on an idle primary with no WAL to archive -- cross-check against pg_wal_size_bytes or WAL generation before paging on this alone."
+{{- end }}
+        # pg_wal_size_bytes is ungated (also useful for a lagging replication
+        # slot pinning WAL with pgbackrest disabled).
+        - alert: PGWALSizeHigh
+          expr: pg_wal_size_bytes{ {{ $m }} } > {{ .Values.prometheusExporter.prometheusRule.walSizeBytesThreshold | int64 }}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "pg_wal disk usage high ({{ include "pg.fullname" . }})"
+            description: "pg_wal has held more than {{ .Values.prometheusExporter.prometheusRule.walSizeBytesThreshold | int64 }} bytes for 15m. pg_wal shares the PGDATA volume (postgresql.persistence.size) -- unbounded growth here (stuck archive_command, a lagging replication slot) will eventually fill it and stop writes."
+{{- end }}

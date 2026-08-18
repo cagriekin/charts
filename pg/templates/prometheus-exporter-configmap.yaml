@@ -47,6 +47,23 @@ data:
         - receive_replay_lag_bytes:
             usage: "GAUGE"
             description: "Bytes of WAL received from the primary but not yet replayed; 0 on the primary"
+    # Actual pg_wal disk usage (#305). Unlike pg_wal_archive below (archive
+    # attempt counters), this reflects real bytes on disk regardless of *why*
+    # WAL is being retained -- stuck archive_command, a lagging replication
+    # slot, or a slow standby -- so it is not gated on pgbackrest.enabled.
+    # pg_ls_waldir() has been grantable to pg_monitor since PG10 (see the
+    # pg_monitor role grant, #28), and works identically in recovery.
+    pg_wal_size:
+      query: |
+        SELECT COALESCE(SUM(size), 0) AS bytes, COUNT(*) AS file_count
+        FROM pg_ls_waldir()
+      metrics:
+        - bytes:
+            usage: "GAUGE"
+            description: "Total bytes currently used by pg_wal on disk"
+        - file_count:
+            usage: "GAUGE"
+            description: "Number of WAL segment files currently in pg_wal"
 {{- if .Values.pgbackrest.enabled }}
     # WAL archiving health (#30). archive_mode is on only when pgBackRest is
     # enabled, so this group is gated on it and scraped on the primary (archiving

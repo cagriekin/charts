@@ -727,6 +727,13 @@ prometheusExporter:
     scrapeTimeout: 10s
     additionalLabels: {}
 
+  # Example alert rules over the exporter's WAL metrics. Observability only. #305
+  prometheusRule:
+    enabled: false
+    additionalLabels: {}
+    staleArchiveSeconds: 900
+    walSizeBytesThreshold: 5368709120 # 5Gi
+
 service:
   type: ClusterIP
   port: 5432

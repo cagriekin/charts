@@ -1437,6 +1437,29 @@ When pgBackRest is enabled, the exporter adds a `pg_wal_archive` query group fro
 
 Alert on `rate(pg_wal_archive_failed_count[5m]) > 0` to catch a failing `archive_command` — this is the actionable signal. `pg_wal_archive_seconds_since_last_archived` also grows on an idle primary that has no WAL to archive, so alert on it only in conjunction with a WAL-generation signal (e.g. it rising while `pg_wal_archive_archived_count` stays flat), not on its own.
 
+### WAL Disk Usage (#305)
+
+Unlike the counters above, `pg_wal_size` reflects actual bytes on disk regardless of *why* WAL is being retained — a stuck `archive_command`, a lagging replication slot, or a slow standby — so it is emitted on every instance, not gated on `pgbackrest.enabled`:
+
+| Metric | Description |
+|--------|-------------|
+| `pg_wal_size_bytes` | Total bytes currently used by `pg_wal` on disk |
+| `pg_wal_size_file_count` | Number of WAL segment files currently in `pg_wal` |
+
+`pg_wal` shares the single PGDATA volume (`postgresql.persistence.size`) — there is no separate WAL volume/tablespace. If `archive_command` gets stuck (repository unreachable or full), PostgreSQL correctly refuses to recycle un-archived WAL, and `pg_wal_size_bytes` will climb without bound until the volume fills and the instance stops accepting writes. **This chart ships observability for that condition only** — a shipped alert (below) so you can page and act manually — not an automatic write-throttle or backpressure mechanism. Bounding the *action*, not just visibility into the problem, is tracked as a follow-up.
+
+### WAL Alert Rules
+
+Set `prometheusExporter.prometheusRule.enabled: true` to ship a `PrometheusRule` (requires the Prometheus Operator CRDs) wiring the metrics above to alerts:
+
+| Alert | Condition | Requires |
+|-------|-----------|----------|
+| `PGWALArchiveFailing` | `rate(pg_wal_archive_failed_count[5m]) > 0` for 5m | `pgbackrest.enabled` |
+| `PGWALArchiveStale` | `pg_wal_archive_seconds_since_last_archived > prometheusExporter.prometheusRule.staleArchiveSeconds` for 15m | `pgbackrest.enabled` |
+| `PGWALSizeHigh` | `pg_wal_size_bytes > prometheusExporter.prometheusRule.walSizeBytesThreshold` for 15m | — |
+
+`PGWALArchiveFailing` is the most actionable of the three — it fires as soon as `archive-push` starts failing, before any WAL has had time to accumulate. `PGWALArchiveStale` and `PGWALSizeHigh` are backstops with the same idle-primary caveat as the metrics they read; tune `staleArchiveSeconds`/`walSizeBytesThreshold` to your WAL generation rate and `postgresql.persistence.size` headroom.
+
 ### Exporter Parameters
 
 | Parameter | Description | Default |
@@ -1470,6 +1493,10 @@ Alert on `rate(pg_wal_archive_failed_count[5m]) > 0` to catch a failing `archive
 | `prometheusExporter.serviceMonitor.interval` | Scrape interval | `30s` |
 | `prometheusExporter.serviceMonitor.scrapeTimeout` | Scrape timeout | `10s` |
 | `prometheusExporter.serviceMonitor.additionalLabels` | Additional labels on ServiceMonitor | `{}` |
+| `prometheusExporter.prometheusRule.enabled` | Ship the `PrometheusRule` covering the WAL alerts above (#305) | `false` |
+| `prometheusExporter.prometheusRule.additionalLabels` | Additional labels on PrometheusRule | `{}` |
+| `prometheusExporter.prometheusRule.staleArchiveSeconds` | `PGWALArchiveStale` threshold, in seconds | `900` |
+| `prometheusExporter.prometheusRule.walSizeBytesThreshold` | `PGWALSizeHigh` threshold, in bytes | `5368709120` (5Gi) |
 
 ## Backup
 
