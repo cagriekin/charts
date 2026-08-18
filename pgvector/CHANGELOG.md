@@ -9,10 +9,13 @@ Inherited from pg's symlinked `prometheus-exporter-configmap.yaml` and new
 ### Added
 
 - **`prometheusExporter.prometheusRule`: alert on stuck WAL archiving and pg_wal disk
-  usage (#305).** Observability only -- no automatic write-throttle. A new ungated
-  `pg_wal_size` exporter metric group plus an opt-in `PrometheusRule` wiring it and the
-  existing (previously unused) `pg_wal_archive` failure/staleness metrics to alerts. See
-  the [pg chart README](../pg/README.md#wal-disk-usage-305) for the full detail.
+  usage (#305).** Observability only -- no automatic write-throttle. An opt-in
+  `PrometheusRule` wiring the exporter's own built-in `pg_wal_size_bytes` metric and the
+  existing (previously unused) `pg_wal_archive` failure/staleness metrics to alerts. No
+  new query or grant -- a chart-defined `pg_wal_size` query group was tried and reverted
+  after live-testing caught it colliding with the exporter's built-in metric of the same
+  name, which broke the entire scrape. See the
+  [pg chart README](../pg/README.md#wal-disk-usage-305) for the full detail.
 
 ## 1.11.0 - 2026-08-17
 

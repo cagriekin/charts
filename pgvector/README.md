@@ -726,12 +726,12 @@ Alert on `rate(pg_wal_archive_failed_count[5m]) > 0` to catch a failing `archive
 
 ### WAL Disk Usage (#305)
 
-Unlike the counters above, `pg_wal_size` reflects actual bytes on disk regardless of *why* WAL is being retained — a stuck `archive_command`, a lagging replication slot, or a slow standby — so it is emitted on every instance, not gated on `pgbackrest.enabled`:
+Unlike the counters above, `pg_wal_size_bytes` reflects actual bytes on disk regardless of *why* WAL is being retained. It comes from the exporter's own **built-in** `wal` collector, not a chart-defined query (see the pg chart README for why -- a chart-defined query under the same metric name collided with it and broke the entire scrape):
 
 | Metric | Description |
 |--------|-------------|
 | `pg_wal_size_bytes` | Total bytes currently used by `pg_wal` on disk |
-| `pg_wal_size_file_count` | Number of files currently in `pg_wal` (segments plus `.partial`/`.history`/`.backup` entries) |
+| `pg_wal_segments` | Number of WAL segments currently in `pg_wal` |
 
 `pg_wal` shares the single PGDATA volume (`postgresql.persistence.size`) — there is no separate WAL volume/tablespace. **This chart ships observability for that condition only** — a shipped alert (below) — not an automatic write-throttle or backpressure mechanism.
 

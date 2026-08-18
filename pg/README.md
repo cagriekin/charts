@@ -1439,12 +1439,14 @@ Alert on `rate(pg_wal_archive_failed_count[5m]) > 0` to catch a failing `archive
 
 ### WAL Disk Usage (#305)
 
-Unlike the counters above, `pg_wal_size` reflects actual bytes on disk regardless of *why* WAL is being retained — a stuck `archive_command`, a lagging replication slot, or a slow standby — so it is emitted on every instance, not gated on `pgbackrest.enabled`:
+Unlike the counters above, `pg_wal_size_bytes` reflects actual bytes on disk regardless of *why* WAL is being retained — a stuck `archive_command`, a lagging replication slot, or a slow standby. It comes from the exporter's own **built-in** `wal` collector (enabled by default in `quay.io/prometheuscommunity/postgres-exporter`, not a chart-defined query), so it is emitted on every instance without any chart configuration, regardless of `pgbackrest.enabled`:
 
 | Metric | Description |
 |--------|-------------|
 | `pg_wal_size_bytes` | Total bytes currently used by `pg_wal` on disk |
-| `pg_wal_size_file_count` | Number of files currently in `pg_wal` (segments plus `.partial`/`.history`/`.backup` entries) |
+| `pg_wal_segments` | Number of WAL segments currently in `pg_wal` |
+
+> **Why isn't this a chart-defined query group like the others?** It was, briefly — and it broke the exporter. A custom query naming its metric `pg_wal_size_bytes` collided with the exporter's built-in metric of the exact same name but different help text; Prometheus client libraries reject that as a duplicate-metric registration, which fails the **entire** `/metrics` scrape, not just the new metric. Confirmed live against the shipped `v0.19.1` image before this was caught. The fix was to delete the chart-defined query and alert on the metric the exporter already produces.
 
 `pg_wal` shares the single PGDATA volume (`postgresql.persistence.size`) — there is no separate WAL volume/tablespace. If `archive_command` gets stuck (repository unreachable or full), PostgreSQL correctly refuses to recycle un-archived WAL, and `pg_wal_size_bytes` will climb without bound until the volume fills and the instance stops accepting writes. **This chart ships observability for that condition only** — a shipped alert (below) so you can page and act manually — not an automatic write-throttle or backpressure mechanism. Bounding the *action*, not just visibility into the problem, is tracked as a follow-up.
 

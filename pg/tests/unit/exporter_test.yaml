@@ -74,18 +74,17 @@ tests:
       - notExists:
           path: spec.template.spec.volumes[?(@.name=="postgresql-tls")]
 
-  # #305: pg_wal_size disk-usage metrics and the exporter PrometheusRule.
-  - it: pg_wal_size query group renders without pgbackrest
+  # #305: regression guard -- pg_wal_size_bytes/pg_wal_segments come from the
+  # exporter's built-in `wal` collector; a chart-defined group of the same
+  # name collides and breaks the whole scrape.
+  - it: no chart-defined pg_wal_size query group
     template: templates/prometheus-exporter-configmap.yaml
     set:
       prometheusExporter.enabled: true
     asserts:
-      - matchRegex:
+      - notMatchRegex:
           path: data["queries.yaml"]
           pattern: "pg_wal_size:"
-      - matchRegex:
-          path: data["queries.yaml"]
-          pattern: "FROM pg_ls_waldir\\(\\)"
       - notMatchRegex:
           path: data["queries.yaml"]
           pattern: "pg_wal_archive:"

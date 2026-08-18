@@ -14,27 +14,27 @@
   here (see README ["WAL Disk Usage"](README.md#wal-disk-usage-305) for the full
   reasoning).
 
-  Two pieces:
-  - A new, ungated `pg_wal_size` exporter query group (`pg_wal_size_bytes`,
-    `pg_wal_size_file_count` via `pg_ls_waldir()`) reporting actual `pg_wal` bytes on
-    disk, regardless of *why* WAL is being retained -- unlike the existing
-    `pg_wal_archive` counters (which only exist when `pgbackrest.enabled` and only
-    reflect archive attempt/failure counts, not disk usage). No new grant needed:
-    `pg_ls_waldir()` has been part of the `pg_monitor` role since PG10.
-  - `prometheusExporter.prometheusRule.enabled` (default `false`) ships a
-    `PrometheusRule` wiring `PGWALArchiveFailing`/`PGWALArchiveStale` (the existing
-    `pg_wal_archive_*` metrics from #30, collected since 1.x but never wired to an
-    alert until now) and the new `PGWALSizeHigh` to configurable thresholds
-    (`staleArchiveSeconds`, `walSizeBytesThreshold`).
+  `prometheusExporter.prometheusRule.enabled` (default `false`) ships a `PrometheusRule`
+  wiring `PGWALArchiveFailing`/`PGWALArchiveStale` (the existing `pg_wal_archive_*`
+  metrics from #30, collected since 1.x but never wired to an alert until now) and
+  `PGWALSizeHigh` (`pg_wal_size_bytes`, the exporter's own **built-in** `wal` collector --
+  see below) to configurable thresholds (`staleArchiveSeconds`, `walSizeBytesThreshold`)
+  and `for` durations (`archiveFailingFor`/`archiveStaleFor`/`sizeHighFor`).
 
-  **Review follow-up:** the `for` durations (`archiveFailingFor`/`archiveStaleFor`/
-  `sizeHighFor`, defaulting to `5m`/`15m`/`15m`) are now values-overridable rather than
-  hardcoded, so a small `postgresql.persistence.size` can page sooner than the default
-  15m backstop; the `pg_wal_size_file_count` description was corrected (it also counts
-  `.partial`/`.history`/`.backup` files, not just segments); and the README/values now
-  call out that `prometheusRule.enabled` alone is a no-op without
-  `serviceMonitor.enabled` (or an equivalent scrape) actually feeding the exporter's
-  metrics to Prometheus.
+  **No new metric was added.** The original version of this change defined a chart-side
+  `pg_wal_size` query group to report `pg_wal` disk usage. Live-testing against the
+  actual shipped exporter image (`quay.io/prometheuscommunity/postgres-exporter:v0.19.1`)
+  before merge caught that its `pg_wal_size_bytes` name collides with a metric the
+  exporter's own built-in `wal` collector already emits (enabled by default) under the
+  same name but different help text -- Prometheus client libraries reject that as a
+  duplicate-metric registration, which fails the **entire** `/metrics` scrape, not just
+  the new metric. The chart-defined query was deleted; `PGWALSizeHigh` alerts on the
+  exporter's pre-existing `pg_wal_size_bytes` directly, so this ships with no new query
+  and no new `pg_monitor` grant dependency.
+
+  **Also from review:** the README/values now call out that `prometheusRule.enabled`
+  alone is a no-op without `serviceMonitor.enabled` (or an equivalent scrape) actually
+  feeding the exporter's metrics to Prometheus.
 
 ## 1.11.0 - 2026-08-17
 

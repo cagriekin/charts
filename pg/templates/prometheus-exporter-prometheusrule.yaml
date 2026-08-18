@@ -1,12 +1,14 @@
 {{- if and .Values.prometheusExporter.enabled (dig "prometheusRule" "enabled" false (.Values.prometheusExporter | default dict)) }}
 {{- /*
 Alert rules over the postgres-exporter's WAL metrics (#305): archive_command
-failures/staleness (pg_wal_archive, already collected but never wired to an
-alert) and actual pg_wal disk usage (pg_wal_size, new). This is observability
-only -- there is no automatic write-throttle or backpressure if a threshold is
-crossed; see the README "WAL Archiving Metrics" section for that scoping
-decision. Requires the Prometheus Operator CRDs (same as
-prometheusExporter.serviceMonitor).
+failures/staleness (pg_wal_archive_*, a chart-defined query group collected
+since #30 but never wired to an alert) and actual pg_wal disk usage
+(pg_wal_size_bytes, the exporter's own built-in `wal` collector -- see the
+queries.yaml comment for why this chart does NOT define that metric itself).
+This is observability only -- there is no automatic write-throttle or
+backpressure if a threshold is crossed; see the README "WAL Disk Usage"
+section for that scoping decision. Requires the Prometheus Operator CRDs
+(same as prometheusExporter.serviceMonitor).
 */}}
 {{- $m := printf "namespace=%q,service=%q" .Release.Namespace (printf "%s-postgres-exporter" (include "pg.fullname" .)) }}
 apiVersion: monitoring.coreos.com/v1
@@ -46,8 +48,10 @@ spec:
             summary: "WAL archiving stale ({{ include "pg.fullname" . }})"
             description: "No successful WAL archive in over {{ .Values.prometheusExporter.prometheusRule.staleArchiveSeconds }}s. This also rises on an idle primary with no WAL to archive -- cross-check against pg_wal_size_bytes or WAL generation before paging on this alone."
 {{- end }}
-        # pg_wal_size_bytes is ungated (also useful for a lagging replication
-        # slot pinning WAL with pgbackrest disabled).
+        # pg_wal_size_bytes comes from the exporter's built-in `wal` collector
+        # (enabled by default, no chart-side query), so it is ungated -- also
+        # useful for a lagging replication slot pinning WAL with pgbackrest
+        # disabled.
         - alert: PGWALSizeHigh
           expr: pg_wal_size_bytes{ {{ $m }} } > {{ .Values.prometheusExporter.prometheusRule.walSizeBytesThreshold | int64 }}
           for: {{ .Values.prometheusExporter.prometheusRule.sizeHighFor }}

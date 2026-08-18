@@ -32,6 +32,10 @@ data:
     # pg_replication_lag_seconds and pg_replication_is_replica; reusing the
     # pg_replication namespace makes the Prometheus registry reject every
     # scrape with a help-text mismatch, so the extra metrics get their own.
+    #
+    # #305: don't add a pg_wal_size query group -- the exporter's built-in `wal`
+    # collector already emits pg_wal_size_bytes/pg_wal_segments, and a
+    # chart-defined metric of the same name collides the same way.
     pg_wal_replication:
       # The receive/replay LSN functions return NULL on a primary; COALESCE
       # keeps the metric emitted without errors.
@@ -47,23 +51,6 @@ data:
         - receive_replay_lag_bytes:
             usage: "GAUGE"
             description: "Bytes of WAL received from the primary but not yet replayed; 0 on the primary"
-    # Actual pg_wal disk usage (#305). Unlike pg_wal_archive below (archive
-    # attempt counters), this reflects real bytes on disk regardless of *why*
-    # WAL is being retained -- stuck archive_command, a lagging replication
-    # slot, or a slow standby -- so it is not gated on pgbackrest.enabled.
-    # pg_ls_waldir() has been grantable to pg_monitor since PG10 (see the
-    # pg_monitor role grant, #28), and works identically in recovery.
-    pg_wal_size:
-      query: |
-        SELECT COALESCE(SUM(size), 0) AS bytes, COUNT(*) AS file_count
-        FROM pg_ls_waldir()
-      metrics:
-        - bytes:
-            usage: "GAUGE"
-            description: "Total bytes currently used by pg_wal on disk"
-        - file_count:
-            usage: "GAUGE"
-            description: "Number of files currently in pg_wal (segments plus .partial/.history/.backup entries)"
 {{- if .Values.pgbackrest.enabled }}
     # WAL archiving health (#30). archive_mode is on only when pgBackRest is
     # enabled, so this group is gated on it and scraped on the primary (archiving

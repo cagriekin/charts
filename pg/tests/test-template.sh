@@ -2502,16 +2502,14 @@ assert_not_contains "exporter cm: no collision with built-in pg_replication grou
 assert_contains "exporter cm: in_recovery gauge present" "${exporter_cm}" "pg_is_in_recovery()::int AS in_recovery"
 assert_contains "exporter cm: receive/replay byte lag NULL-safe on primaries" "${exporter_cm}" "COALESCE(pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()), 0)"
 assert_contains "exporter cm: byte lag metric declared" "${exporter_cm}" "receive_replay_lag_bytes:"
-replication_block=$(printf '%s\n' "${exporter_cm}" | sed -n '/pg_wal_replication:/,/pg_wal_size:/p')
+replication_block=$(printf '%s\n' "${exporter_cm}" | sed -n '/pg_wal_replication:/,$p')
 gauge_count=$(printf '%s' "${replication_block}" | grep -c 'usage: "GAUGE"' || true)
 assert_eq "exporter cm: two GAUGE metrics in pg_wal_replication" "2" "${gauge_count}"
 
-# #305: pg_wal disk-usage metrics. Ungated (unlike pg_wal_archive below) --
-# useful even without pgbackrest (e.g. a lagging replication slot).
-assert_contains "exporter cm #305: pg_wal_size group present without pgbackrest" "${exporter_cm}" "pg_wal_size:"
-assert_contains "exporter cm #305: reads pg_ls_waldir" "${exporter_cm}" "FROM pg_ls_waldir()"
-assert_contains "exporter cm #305: bytes metric declared" "${exporter_cm}" "bytes:"
-assert_contains "exporter cm #305: file_count metric declared" "${exporter_cm}" "file_count:"
+# #305: regression guard -- pg_wal_size_bytes/pg_wal_segments come from the
+# exporter's built-in `wal` collector; a chart-defined group of the same name
+# collides and breaks the whole scrape.
+assert_not_contains "exporter cm #305: no chart-defined pg_wal_size group (collides with the exporter's built-in wal collector)" "${exporter_cm}" "pg_wal_size:"
 
 # #30: WAL-archiving health metrics from pg_stat_archiver, gated on pgbackrest
 # (archive_mode is on only then) and scraped on the primary.
