@@ -1,5 +1,22 @@
 # pgvector chart changelog
 
+## 1.12.0 - 2026-08-18
+
+Inherited from pg's symlinked `prometheus-exporter-configmap.yaml` and new
+`prometheus-exporter-prometheusrule.yaml`. See the
+[pg 1.12.0 changelog](../pg/CHANGELOG.md) for the full detail.
+
+### Added
+
+- **`prometheusExporter.prometheusRule`: alert on stuck WAL archiving and pg_wal disk
+  usage (#305).** Observability only -- no automatic write-throttle. An opt-in
+  `PrometheusRule` wiring the exporter's own built-in `pg_wal_size_bytes` metric and the
+  existing (previously unused) `pg_wal_archive` failure/staleness metrics to alerts. No
+  new query or grant -- a chart-defined `pg_wal_size` query group was tried and reverted
+  after live-testing caught it colliding with the exporter's built-in metric of the same
+  name, which broke the entire scrape. See the
+  [pg chart README](../pg/README.md#wal-disk-usage-305) for the full detail.
+
 ## 1.11.0 - 2026-08-17
 
 Inherited from pg's symlinked `statefulset.yaml`. See the

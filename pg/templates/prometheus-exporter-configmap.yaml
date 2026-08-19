@@ -32,6 +32,10 @@ data:
     # pg_replication_lag_seconds and pg_replication_is_replica; reusing the
     # pg_replication namespace makes the Prometheus registry reject every
     # scrape with a help-text mismatch, so the extra metrics get their own.
+    #
+    # #305: don't add a pg_wal_size query group -- the exporter's built-in `wal`
+    # collector already emits pg_wal_size_bytes/pg_wal_segments, and a
+    # chart-defined metric of the same name collides the same way.
     pg_wal_replication:
       # The receive/replay LSN functions return NULL on a primary; COALESCE
       # keeps the metric emitted without errors.

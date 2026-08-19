@@ -1,9 +1,10 @@
-suite: pg prometheus exporter TLS CA volume
+suite: pg prometheus exporter
 # The configmap is listed so the deployment's checksum/config include resolves; each
 # test scopes its assertions to the deployment with an explicit `template:`.
 templates:
   - templates/prometheus-exporter-deployment.yaml
   - templates/prometheus-exporter-configmap.yaml
+  - templates/prometheus-exporter-prometheusrule.yaml
 release:
   name: test-pg
 tests:
@@ -72,3 +73,81 @@ tests:
     asserts:
       - notExists:
           path: spec.template.spec.volumes[?(@.name=="postgresql-tls")]
+
+  # #305: regression guard -- pg_wal_size_bytes/pg_wal_segments come from the
+  # exporter's built-in `wal` collector; a chart-defined group of the same
+  # name collides and breaks the whole scrape.
+  - it: no chart-defined pg_wal_size query group
+    template: templates/prometheus-exporter-configmap.yaml
+    set:
+      prometheusExporter.enabled: true
+    asserts:
+      - notMatchRegex:
+          path: data["queries.yaml"]
+          pattern: "pg_wal_size:"
+
+  - it: no PrometheusRule when prometheusExporter.enabled is false
+    templates:
+      - templates/prometheus-exporter-prometheusrule.yaml
+    set:
+      prometheusExporter.prometheusRule.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: no PrometheusRule when prometheusRule.enabled is false
+    templates:
+      - templates/prometheus-exporter-prometheusrule.yaml
+    set:
+      prometheusExporter.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: PrometheusRule renders PGWALSizeHigh but not the archive alerts without pgbackrest
+    templates:
+      - templates/prometheus-exporter-prometheusrule.yaml
+    set:
+      prometheusExporter.enabled: true
+      prometheusExporter.prometheusRule.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: PrometheusRule
+      - matchRegex:
+          path: spec.groups[0].rules[0].alert
+          pattern: "^PGWALSizeHigh$"
+      - lengthEqual:
+          path: spec.groups[0].rules
+          count: 1
+
+  - it: PrometheusRule renders all three alerts with pgbackrest enabled
+    templates:
+      - templates/prometheus-exporter-prometheusrule.yaml
+    set:
+      prometheusExporter.enabled: true
+      prometheusExporter.prometheusRule.enabled: true
+      pgbackrest.enabled: true
+      pgbackrest.s3.endpoint: https://example.invalid
+      pgbackrest.s3.bucket: b
+      pgbackrest.existingSecret.name: s
+    asserts:
+      - lengthEqual:
+          path: spec.groups[0].rules
+          count: 3
+      - contains:
+          path: spec.groups[0].rules
+          content:
+            alert: PGWALArchiveFailing
+          any: true
+      - contains:
+          path: spec.groups[0].rules
+          content:
+            alert: PGWALArchiveStale
+          any: true
+      - contains:
+          path: spec.groups[0].rules
+          content:
+            alert: PGWALSizeHigh
+          any: true

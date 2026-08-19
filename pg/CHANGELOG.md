@@ -1,5 +1,41 @@
 # pg chart changelog
 
+## 1.12.0 - 2026-08-18
+
+### Added
+
+- **`prometheusExporter.prometheusRule`: alert on stuck WAL archiving and pg_wal disk
+  usage (#305).** When `archive_command` gets stuck (pgBackRest repository unreachable
+  or full), PostgreSQL correctly refuses to recycle un-archived WAL, and nothing
+  previously surfaced that growth before it filled the shared PGDATA/`pg_wal` volume.
+  This is an **observability-only** fix -- it does not throttle writes or take any
+  automatic corrective action when a threshold is crossed; that remains a separate,
+  larger change to the Go failover agent's reconcile loop, deliberately out of scope
+  here (see README ["WAL Disk Usage"](README.md#wal-disk-usage-305) for the full
+  reasoning).
+
+  `prometheusExporter.prometheusRule.enabled` (default `false`) ships a `PrometheusRule`
+  wiring `PGWALArchiveFailing`/`PGWALArchiveStale` (the existing `pg_wal_archive_*`
+  metrics from #30, collected since 1.x but never wired to an alert until now) and
+  `PGWALSizeHigh` (`pg_wal_size_bytes`, the exporter's own **built-in** `wal` collector --
+  see below) to configurable thresholds (`staleArchiveSeconds`, `walSizeBytesThreshold`)
+  and `for` durations (`archiveFailingFor`/`archiveStaleFor`/`sizeHighFor`).
+
+  **No new metric was added.** The original version of this change defined a chart-side
+  `pg_wal_size` query group to report `pg_wal` disk usage. Live-testing against the
+  actual shipped exporter image (`quay.io/prometheuscommunity/postgres-exporter:v0.19.1`)
+  before merge caught that its `pg_wal_size_bytes` name collides with a metric the
+  exporter's own built-in `wal` collector already emits (enabled by default) under the
+  same name but different help text -- Prometheus client libraries reject that as a
+  duplicate-metric registration, which fails the **entire** `/metrics` scrape, not just
+  the new metric. The chart-defined query was deleted; `PGWALSizeHigh` alerts on the
+  exporter's pre-existing `pg_wal_size_bytes` directly, so this ships with no new query
+  and no new `pg_monitor` grant dependency.
+
+  **Also from review:** the README/values now call out that `prometheusRule.enabled`
+  alone is a no-op without `serviceMonitor.enabled` (or an equivalent scrape) actually
+  feeding the exporter's metrics to Prometheus.
+
 ## 1.11.0 - 2026-08-17
 
 ### Added

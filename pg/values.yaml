@@ -814,6 +814,33 @@ prometheusExporter:
     scrapeTimeout: 10s
     additionalLabels: {}
 
+  # Example alert rules over the exporter's WAL metrics (archive failures/
+  # staleness, pg_wal disk usage). Observability only -- no automatic action is
+  # taken when a threshold is crossed. Requires the Prometheus Operator CRDs
+  # (same as serviceMonitor above). The rules alert on metrics THIS exporter
+  # emits, so they are a no-op (rule installed, alerts never fire) unless
+  # something actually scrapes it -- serviceMonitor.enabled above, or your own
+  # equivalent scrape config. #305
+  prometheusRule:
+    enabled: false
+    additionalLabels: {}
+    # PGWALArchiveStale fires when pg_wal_archive_seconds_since_last_archived
+    # exceeds this many seconds (archive_command stuck). This also rises on an
+    # idle primary with no WAL to archive -- see the README "WAL Archiving
+    # Metrics" caveat before tightening this.
+    staleArchiveSeconds: 900
+    # PGWALSizeHigh fires when pg_wal_size_bytes exceeds this many bytes.
+    # pg_wal shares the PGDATA volume (postgresql.persistence.size) -- set this
+    # with headroom for the base data directory.
+    walSizeBytesThreshold: 5368709120 # 5Gi
+    # `for` durations (Prometheus duration syntax) before each alert fires.
+    # PGWALSizeHigh in particular is the backstop against a volume-filling
+    # condition -- tighten sizeHighFor if postgresql.persistence.size is small
+    # relative to your WAL generation rate.
+    archiveFailingFor: 5m
+    archiveStaleFor: 15m
+    sizeHighFor: 15m
+
 service:
   type: ClusterIP
   port: 5432

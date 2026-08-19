@@ -1437,6 +1437,31 @@ When pgBackRest is enabled, the exporter adds a `pg_wal_archive` query group fro
 
 Alert on `rate(pg_wal_archive_failed_count[5m]) > 0` to catch a failing `archive_command` — this is the actionable signal. `pg_wal_archive_seconds_since_last_archived` also grows on an idle primary that has no WAL to archive, so alert on it only in conjunction with a WAL-generation signal (e.g. it rising while `pg_wal_archive_archived_count` stays flat), not on its own.
 
+### WAL Disk Usage (#305)
+
+Unlike the counters above, `pg_wal_size_bytes` reflects actual bytes on disk regardless of *why* WAL is being retained — a stuck `archive_command`, a lagging replication slot, or a slow standby. It comes from the exporter's own **built-in** `wal` collector (enabled by default in `quay.io/prometheuscommunity/postgres-exporter`, not a chart-defined query), so it is emitted on every instance without any chart configuration, regardless of `pgbackrest.enabled`:
+
+| Metric | Description |
+|--------|-------------|
+| `pg_wal_size_bytes` | Total bytes currently used by `pg_wal` on disk |
+| `pg_wal_segments` | Number of WAL segments currently in `pg_wal` |
+
+> **Why isn't this a chart-defined query group like the others?** It was, briefly — and it broke the exporter. A custom query naming its metric `pg_wal_size_bytes` collided with the exporter's built-in metric of the exact same name but different help text; Prometheus client libraries reject that as a duplicate-metric registration, which fails the **entire** `/metrics` scrape, not just the new metric. Confirmed live against the shipped `v0.19.1` image before this was caught. The fix was to delete the chart-defined query and alert on the metric the exporter already produces.
+
+`pg_wal` shares the single PGDATA volume (`postgresql.persistence.size`) — there is no separate WAL volume/tablespace. If `archive_command` gets stuck (repository unreachable or full), PostgreSQL correctly refuses to recycle un-archived WAL, and `pg_wal_size_bytes` will climb without bound until the volume fills and the instance stops accepting writes. **This chart ships observability for that condition only** — a shipped alert (below) so you can page and act manually — not an automatic write-throttle or backpressure mechanism. Bounding the *action*, not just visibility into the problem, is tracked as a follow-up.
+
+### WAL Alert Rules
+
+Set `prometheusExporter.prometheusRule.enabled: true` to ship a `PrometheusRule` (requires the Prometheus Operator CRDs) wiring the metrics above to alerts. **This is a no-op unless something actually scrapes the exporter** — the rule alerts on metrics the exporter emits, so it does nothing on its own; enable `prometheusExporter.serviceMonitor.enabled` too (or point your own scrape config at it) or the alerts will simply never fire.
+
+| Alert | Condition | Requires |
+|-------|-----------|----------|
+| `PGWALArchiveFailing` | `rate(pg_wal_archive_failed_count[5m]) > 0` for `archiveFailingFor` (default `5m`) | `pgbackrest.enabled` |
+| `PGWALArchiveStale` | `pg_wal_archive_seconds_since_last_archived > staleArchiveSeconds` for `archiveStaleFor` (default `15m`) | `pgbackrest.enabled` |
+| `PGWALSizeHigh` | `pg_wal_size_bytes > walSizeBytesThreshold` for `sizeHighFor` (default `15m`) | — |
+
+`PGWALArchiveFailing` is the most actionable of the three — it fires as soon as `archive-push` starts failing, before any WAL has had time to accumulate. `PGWALArchiveStale` and `PGWALSizeHigh` are backstops with the same idle-primary caveat as the metrics they read; tune `staleArchiveSeconds`/`walSizeBytesThreshold` to your WAL generation rate and `postgresql.persistence.size` headroom, and tighten the `*For` durations (Prometheus duration syntax) if that volume is small enough that 15m is too long to wait before paging.
+
 ### Exporter Parameters
 
 | Parameter | Description | Default |
@@ -1470,6 +1495,13 @@ Alert on `rate(pg_wal_archive_failed_count[5m]) > 0` to catch a failing `archive
 | `prometheusExporter.serviceMonitor.interval` | Scrape interval | `30s` |
 | `prometheusExporter.serviceMonitor.scrapeTimeout` | Scrape timeout | `10s` |
 | `prometheusExporter.serviceMonitor.additionalLabels` | Additional labels on ServiceMonitor | `{}` |
+| `prometheusExporter.prometheusRule.enabled` | Ship the `PrometheusRule` covering the WAL alerts above (#305) | `false` |
+| `prometheusExporter.prometheusRule.additionalLabels` | Additional labels on PrometheusRule | `{}` |
+| `prometheusExporter.prometheusRule.staleArchiveSeconds` | `PGWALArchiveStale` threshold, in seconds | `900` |
+| `prometheusExporter.prometheusRule.walSizeBytesThreshold` | `PGWALSizeHigh` threshold, in bytes | `5368709120` (5Gi) |
+| `prometheusExporter.prometheusRule.archiveFailingFor` | `PGWALArchiveFailing` `for` duration | `5m` |
+| `prometheusExporter.prometheusRule.archiveStaleFor` | `PGWALArchiveStale` `for` duration | `15m` |
+| `prometheusExporter.prometheusRule.sizeHighFor` | `PGWALSizeHigh` `for` duration | `15m` |
 
 ## Backup
 
