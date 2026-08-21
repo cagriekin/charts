@@ -698,6 +698,15 @@ spec:
             - name: CASCADE_REPLICATION
               value: "true"
 {{- end }}
+{{- if .Values.repmgr.agent.syncReplicationSlots }}
+            {{- /* Logical failover slot sync (#308): the primary reconciles
+                   synchronized_standby_slots to its current standby's physical slot(s)
+                   on every tick. Requires postgresql.walLevel: logical to be useful
+                   (undocumented here as a hard requirement -- see README -- since setting
+                   it without walLevel: logical is harmless, just a no-op). */}}
+            - name: SYNC_REPLICATION_SLOTS
+              value: "true"
+{{- end }}
             - name: MASTER_SERVICE
               value: {{ include "pg.fullname" . | quote }}
             - name: POD_SELECTOR

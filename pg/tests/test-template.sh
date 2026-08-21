@@ -2128,6 +2128,41 @@ assert_gt "#308: guard matches wal_level case-insensitively" "${schema_rc}" "0"
 schema_rc=0; helm template test-pg "${CHART_DIR}" --set pgbackrest.enabled=false --set-string postgresql.configuration.wal_level=logical >/dev/null 2>&1 || schema_rc=$?
 assert_gt "#308: guard fires even with pgbackrest disabled" "${schema_rc}" "0"
 
+# ======================================================================
+# #308: repmgr.agent.syncReplicationSlots -- off by default (byte-stable); on,
+# it emits the SYNC_REPLICATION_SLOTS env (agent-only) and the
+# sync_replication_slots = on config snippet. The configmap render is gated on
+# an `or`-ed condition that values-agent.yaml alone never trips, so the "off"
+# configmap check layers values-pgbackrest.yaml on top (forcing failoverMode
+# back to agent) purely to get the configmap to render at all.
+sync_slots_off_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#308 off: no SYNC_REPLICATION_SLOTS env by default" "${sync_slots_off_sts}" "SYNC_REPLICATION_SLOTS"
+sync_slots_off_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set repmgr.failoverMode=agent --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_not_contains "#308 off: no sync_replication_slots config by default" "${sync_slots_off_cm}" "sync_replication_slots"
+
+sync_slots_on_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#308 on: agent gets SYNC_REPLICATION_SLOTS env" "${sync_slots_on_sts}" 'name: SYNC_REPLICATION_SLOTS
+              value: "true"'
+sync_slots_on_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#308 on: sync_replication_slots = on renders" "${sync_slots_on_cm}" "sync_replication_slots = on"
+
+# repmgrd mode: sync-slot reconciliation is agent-only -> neither the env nor the
+# config snippet is emitted even if the knob is set.
+sync_slots_repmgrd_sts=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=true --set repmgr.failoverMode=repmgrd \
+  --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
+  --set repmgr.agent.syncReplicationSlots=true \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#308: repmgrd mode never gets SYNC_REPLICATION_SLOTS (agent-only)" "${sync_slots_repmgrd_sts}" "SYNC_REPLICATION_SLOTS"
+sync_slots_repmgrd_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true \
+  --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_not_contains "#308: repmgrd mode never renders sync_replication_slots (agent-only)" "${sync_slots_repmgrd_cm}" "sync_replication_slots"
+
 # Statefulset must mount the postgresql-config volume even when
 # postgresql.configuration is empty, so the archive snippet is delivered.
 assert_contains "pgbackrest: postgresql-config volume mounted" "${pgbackrest_sts}" "mountPath: /etc/postgresql/conf.d"

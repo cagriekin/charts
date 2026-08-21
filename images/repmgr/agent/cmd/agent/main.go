@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -89,6 +90,7 @@ func logStartupConfig(log *slog.Logger, cfg *config.Config) {
 		"masterService", cfg.MasterService,
 		"markerName", cfg.MarkerName,
 		"cascadeReplication", cfg.CascadeReplication,
+		"syncReplicationSlots", cfg.SyncReplicationSlots,
 		"pgMajor", cfg.PGMajor,
 	)
 }
@@ -147,6 +149,13 @@ type agent struct {
 	// server) runs only when the upstream actually changes, not every tick. Reset
 	// on any non-Follow action.
 	followUpstream string
+
+	// lastSyncStandbySlots caches the comma-joined slot list synchronized_standby_slots
+	// was last successfully set to (#308), so a primary tick with an unchanged standby
+	// set skips the ALTER SYSTEM + reload rather than repeating it every 5s. "" before
+	// the first successful reconcile (also matches an intentionally-empty desired value,
+	// so the very first tick with no active standbys is a genuine no-op too).
+	lastSyncStandbySlots string
 
 	// gossip publish state: skip re-patching the pod annotation when the position
 	// is unchanged, refreshing only on change or a heartbeat (to keep it fresh).
@@ -635,6 +644,10 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if tl, _, ok, _ := a.prober.PrimaryWALPosition(wctx, a.selfConn()); ok {
 			a.advanceMarker(wctx, tl, true, obs.Marker)
 		}
+		// #308: reconcile synchronized_standby_slots to whichever standby(s) this new
+		// primary can already see -- a promote is exactly when the standby set most
+		// recently changed. Best-effort/no-op unless cfg.SyncReplicationSlots is set.
+		a.assertSyncStandbySlots(wctx)
 		return a.assertPrimaryRouting(wctx, obs)
 
 	case reconcile.StayPrimary:
@@ -661,6 +674,8 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
+		// #308: keep synchronized_standby_slots current as standbys scale up/down.
+		a.assertSyncStandbySlots(wctx)
 		return a.assertPrimaryRouting(wctx, obs)
 
 	case reconcile.Follow:
@@ -1095,6 +1110,51 @@ func (a *agent) assertPrimaryRouting(ctx context.Context, obs reconcile.Observat
 		return err
 	}
 	return a.kube.ReconcilePodLabels(ctx, a.cfg.PodSelector, desiredRoleLabels(a.cfg.PodName, obs.Peers))
+}
+
+// validSlotName matches PostgreSQL's own replication-slot identifier convention
+// (repmgr's repmgr_slot_<node_id>, and slot names in general). Slot names come from a
+// live SQL query (ActivePhysicalSlots), not untrusted external input, but this is
+// checked defensively before being interpolated into a subsequent ALTER SYSTEM
+// statement (#308) rather than trusted blindly.
+var validSlotName = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
+// assertSyncStandbySlots reconciles synchronized_standby_slots to the primary's current
+// active physical standby slot(s) (#308), so a logical failover slot's decode position
+// tracks the live standby set through scale-up/down and promote. Idempotent and
+// self-healing like assertPrimaryRouting/cleanupGhostNodes -- called from both Promote
+// and StayPrimary, bounded by the same fence-budget context -- and best-effort (logged,
+// never returned) so a slot-sync hiccup can never fail the routing assertion that
+// follows it. No-op entirely when cfg.SyncReplicationSlots is false (byte-identical
+// behavior to today).
+func (a *agent) assertSyncStandbySlots(ctx context.Context) {
+	if !a.cfg.SyncReplicationSlots {
+		return
+	}
+	slots, err := a.prober.ActivePhysicalSlots(ctx, a.selfConn())
+	if err != nil {
+		a.log.Warn("read active physical slots for synchronized_standby_slots", "err", err)
+		return
+	}
+	for _, s := range slots {
+		if !validSlotName.MatchString(s) {
+			a.log.Warn("refusing to set synchronized_standby_slots: unexpected slot name", "slot", s)
+			return
+		}
+	}
+	// Comma-joined is PostgreSQL's own list format for this GUC, and doubles as the
+	// cache key: an unchanged standby set (the common steady-state tick) skips the
+	// ALTER SYSTEM + reload entirely, rather than repeating it every 5s.
+	desired := strings.Join(slots, ",")
+	if desired == a.lastSyncStandbySlots {
+		return
+	}
+	if err := a.prober.SetSynchronizedStandbySlots(ctx, a.selfConn(), slots); err != nil {
+		a.log.Warn("set synchronized_standby_slots", "err", err, "slots", desired)
+		return
+	}
+	a.lastSyncStandbySlots = desired
+	a.log.Info("reconciled synchronized_standby_slots", "slots", desired)
 }
 
 // desiredRoleLabels builds the pg-role map the primary publishes each tick (the

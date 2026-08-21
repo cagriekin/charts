@@ -292,6 +292,61 @@ func (p *Prober) StandbyNodeIDs(ctx context.Context, ci ConnInfo) ([]int, error)
 	return ids, nil
 }
 
+// ActivePhysicalSlots returns the names of active physical replication slots (queried
+// on the primary), for reconciling synchronized_standby_slots (#308). Physical only --
+// a logical failover slot must not be listed here, since synchronized_standby_slots
+// names the PHYSICAL slots a logical slot's decode position must wait behind, not
+// logical slots themselves. "active" (a walsender is currently attached) rather than
+// "exists": a slot for a since-scaled-down or unreachable standby must not keep a
+// logical consumer waiting on a physical connection that will never resume, the same
+// reasoning StandbyNodeIDs already applies to ghost-node cleanup. An unparseable row is
+// an error rather than a silent skip, matching RegisteredNodeIDs/StandbyNodeIDs -- a
+// broken read must not be mistaken for "no active standbys", which would desynchronize
+// every logical failover slot at once.
+func (p *Prober) ActivePhysicalSlots(ctx context.Context, ci ConnInfo) ([]string, error) {
+	out, err := p.psql(ctx, ci, "SELECT slot_name FROM pg_replication_slots WHERE slot_type = 'physical' AND active;")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		names = append(names, line)
+	}
+	return names, nil
+}
+
+// SetSynchronizedStandbySlots sets synchronized_standby_slots on the LOCAL primary via
+// ALTER SYSTEM and reloads (#308), so a logical failover slot's decode position is held
+// back until the named physical standby slot(s) have synced. slots is joined with ",",
+// PostgreSQL's own list format for this GUC; an empty slots means "no slots required",
+// itself a meaningful value (no active standbys), not an error.
+//
+// Two separate psql invocations, not one "ALTER SYSTEM ...; SELECT pg_reload_conf();" --
+// confirmed live that PostgreSQL sends multiple semicolon-separated statements in one
+// simple-query message as an implicit transaction block, and ALTER SYSTEM refuses to run
+// inside one ("ALTER SYSTEM cannot run inside a transaction block"). The reload is
+// skipped if ALTER SYSTEM fails, so a broken value is never silently left unreloaded
+// alongside a stale (but valid) running config.
+//
+// Callers MUST validate each slot name (e.g. against repmgr's own [A-Za-z0-9_]+
+// convention) before calling this: slots is interpolated directly into the ALTER SYSTEM
+// statement text, not passed as a bind parameter, because ALTER SYSTEM SET does not
+// accept one for its value.
+func (p *Prober) SetSynchronizedStandbySlots(ctx context.Context, ci ConnInfo, slots []string) error {
+	alter := fmt.Sprintf("ALTER SYSTEM SET synchronized_standby_slots = '%s';", strings.Join(slots, ","))
+	if _, err := p.psql(ctx, ci, alter); err != nil {
+		return fmt.Errorf("alter system: %w", err)
+	}
+	if _, err := p.psql(ctx, ci, "SELECT pg_reload_conf();"); err != nil {
+		return fmt.Errorf("reload after alter system: %w", err)
+	}
+	return nil
+}
+
 // Probe classifies a node by its actual role and reads the WAL position relevant
 // to that role. An unreachable node returns NodeState{Host, Reachable:false}.
 func (p *Prober) Probe(ctx context.Context, ci ConnInfo) NodeState {

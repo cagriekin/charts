@@ -138,11 +138,18 @@ type scriptedExec struct {
 	unregistered []int  // node_ids passed to `repmgr standby unregister`
 	followOut    string // combined output for `repmgr standby follow`; non-empty = it fails
 	rejoins      int    // number of `repmgr node rejoin` calls (the #297 re-clone escalation)
+	slots        string // pg_replication_slots slot_name output (psql), for #308
+	slotSyncSQL  []string
 }
 
 func (s *scriptedExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
 	joined := strings.Join(args, " ")
 	switch {
+	case name == "psql" && strings.Contains(joined, "pg_replication_slots"):
+		return s.slots, nil
+	case name == "psql" && (strings.Contains(joined, "ALTER SYSTEM") || strings.Contains(joined, "pg_reload_conf")):
+		s.slotSyncSQL = append(s.slotSyncSQL, joined)
+		return "", nil
 	case name == "psql" && strings.Contains(joined, "repmgr.nodes"):
 		return s.nodes, nil
 	case name == "psql" && strings.Contains(joined, "pg_stat_wal_receiver"):
@@ -704,6 +711,61 @@ func TestCleanupGhostNodes(t *testing.T) {
 	a.cleanupGhostNodes(context.Background())
 	if len(ex.unregistered) != 1 || ex.unregistered[0] != 1002 {
 		t.Fatalf("expected only node 1002 unregistered, got %v", ex.unregistered)
+	}
+}
+
+// #308: no-op entirely (byte-identical to today) unless cfg.SyncReplicationSlots is set,
+// even with active standby slots to reconcile.
+func TestAssertSyncStandbySlotsNoOpWhenDisabled(t *testing.T) {
+	ex := &scriptedExec{slots: "repmgr_slot_1001\n"}
+	a := newFollowTestAgent(t, ex)
+	a.assertSyncStandbySlots(context.Background())
+	if len(ex.slotSyncSQL) != 0 {
+		t.Fatalf("expected no SQL when disabled, got %v", ex.slotSyncSQL)
+	}
+}
+
+func TestAssertSyncStandbySlotsReconciles(t *testing.T) {
+	ex := &scriptedExec{slots: "repmgr_slot_1001\nrepmgr_slot_1002\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("expected ALTER SYSTEM + reload (2 calls), got %v", ex.slotSyncSQL)
+	}
+	if !strings.Contains(ex.slotSyncSQL[0], "repmgr_slot_1001,repmgr_slot_1002") {
+		t.Errorf("first call = %q, want the joined slot list", ex.slotSyncSQL[0])
+	}
+	if want := "repmgr_slot_1001,repmgr_slot_1002"; a.lastSyncStandbySlots != want {
+		t.Errorf("lastSyncStandbySlots = %q, want %q", a.lastSyncStandbySlots, want)
+	}
+}
+
+// A steady-state tick with an unchanged standby set must skip the ALTER SYSTEM +
+// reload entirely, not repeat it every 5s.
+func TestAssertSyncStandbySlotsSkipsWhenUnchanged(t *testing.T) {
+	ex := &scriptedExec{slots: "repmgr_slot_1001\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("first call: expected 2 SQL statements, got %v", ex.slotSyncSQL)
+	}
+	a.assertSyncStandbySlots(context.Background())
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("second call with an unchanged slot set must not issue more SQL, got %v", ex.slotSyncSQL)
+	}
+}
+
+// Slot names are read from a live query, not untrusted input, but this must still
+// refuse to interpolate anything unexpected into the ALTER SYSTEM statement.
+func TestAssertSyncStandbySlotsRefusesUnexpectedSlotName(t *testing.T) {
+	ex := &scriptedExec{slots: "repmgr_slot_1001'; DROP TABLE x; --\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if len(ex.slotSyncSQL) != 0 {
+		t.Fatalf("expected no SQL for an unexpected slot name, got %v", ex.slotSyncSQL)
 	}
 }
 

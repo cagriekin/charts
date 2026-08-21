@@ -381,6 +381,15 @@ repmgr:
     # falls back to the primary otherwise, and re-homes on failover -- a broken or
     # promoted upstream never strands a standby. Most useful at higher replicaCount.
     cascadingReplication: false
+    # Logical failover slot sync (#308), PostgreSQL 17+. Off by default. When true:
+    #   - postgresql-configmap.yaml sets sync_replication_slots = on (the slot-sync
+    #     worker; harmless on a primary, needed on a standby that will run one).
+    #   - the primary reconciles synchronized_standby_slots on every tick it serves,
+    #     to the physical replication slot(s) of its current, live standbys -- so a
+    #     logical failover slot (CREATE SUBSCRIPTION ... WITH (failover = true)) can
+    #     be synced to a standby and survive the primary moving.
+    # Requires postgresql.walLevel: logical. See README "Logical Replication".
+    syncReplicationSlots: false
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
     # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane
     # outage no longer self-demotes the primary (only an etcd quorum loss does);

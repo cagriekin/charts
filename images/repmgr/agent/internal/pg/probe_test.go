@@ -17,6 +17,7 @@ type fakeExec struct {
 	sysID     string // pg_control_system() system_identifier output (decimal)
 	walRcv    string // StreamingUpstream "sender_host|status" output
 	nodes     string // SELECT node_id FROM repmgr.nodes output (newline-separated)
+	slots     string // ActivePhysicalSlots slot_name output (newline-separated)
 	err       error  // if set, every call fails (node unreachable)
 }
 
@@ -26,6 +27,8 @@ func (f fakeExec) Run(_ context.Context, _ []string, _ string, args ...string) (
 	}
 	sql := args[len(args)-1]
 	switch {
+	case strings.Contains(sql, "pg_replication_slots"):
+		return f.slots, nil
 	case strings.Contains(sql, "repmgr.nodes"):
 		return f.nodes, nil
 	// StandbyTimeline reads GREATEST(checkpoint TL, min_recovery_end_timeline); match
@@ -233,5 +236,100 @@ func TestStandbyNodeIDsUnreachable(t *testing.T) {
 	p := proberWith(fakeExec{err: errors.New("connection refused")})
 	if _, err := p.StandbyNodeIDs(context.Background(), ConnInfo{Host: "x"}); err == nil {
 		t.Fatal("an unreachable node must return an error")
+	}
+}
+
+// #308: synchronized_standby_slots reconciliation reads this.
+func TestActivePhysicalSlots(t *testing.T) {
+	p := proberWith(fakeExec{slots: "repmgr_slot_1001\nrepmgr_slot_1002\n"})
+	names, err := p.ActivePhysicalSlots(context.Background(), ConnInfo{Host: "x"})
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	want := []string{"repmgr_slot_1001", "repmgr_slot_1002"}
+	if len(names) != len(want) {
+		t.Fatalf("names = %v, want %v", names, want)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("names = %v, want %v", names, want)
+		}
+	}
+}
+
+func TestActivePhysicalSlotsEmpty(t *testing.T) {
+	p := proberWith(fakeExec{slots: ""})
+	if names, err := p.ActivePhysicalSlots(context.Background(), ConnInfo{Host: "x"}); err != nil || names != nil {
+		t.Fatalf("empty result must return (nil, nil), got (%v, %v)", names, err)
+	}
+}
+
+func TestActivePhysicalSlotsUnreachable(t *testing.T) {
+	p := proberWith(fakeExec{err: errors.New("connection refused")})
+	if _, err := p.ActivePhysicalSlots(context.Background(), ConnInfo{Host: "x"}); err == nil {
+		t.Fatal("an unreachable node must return an error")
+	}
+}
+
+// spySlotExec records every SQL statement it is asked to run, and can be told to fail
+// on ALTER SYSTEM specifically -- SetSynchronizedStandbySlots's tests need to assert on
+// call COUNT and ORDER, which fakeExec (shared, value-typed, output-only) does not track.
+type spySlotExec struct {
+	calls    []string
+	alterErr error
+}
+
+func (s *spySlotExec) Run(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+	sql := args[len(args)-1]
+	s.calls = append(s.calls, sql)
+	if s.alterErr != nil && strings.Contains(sql, "ALTER SYSTEM") {
+		return "", s.alterErr
+	}
+	return "", nil
+}
+
+// #308: confirmed live that PostgreSQL treats multiple semicolon-separated statements
+// in one simple-query message as an implicit transaction block, and ALTER SYSTEM
+// refuses to run inside one -- so this must be two separate psql invocations, not one
+// combined "ALTER SYSTEM ...; SELECT pg_reload_conf();" string.
+func TestSetSynchronizedStandbySlotsIssuesTwoSeparateStatements(t *testing.T) {
+	ex := &spySlotExec{}
+	p := &Prober{Exec: ex}
+	if err := p.SetSynchronizedStandbySlots(context.Background(), ConnInfo{Host: "x"}, []string{"repmgr_slot_1001", "repmgr_slot_1002"}); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(ex.calls) != 2 {
+		t.Fatalf("calls = %v, want exactly 2 separate statements", ex.calls)
+	}
+	if !strings.Contains(ex.calls[0], "ALTER SYSTEM SET synchronized_standby_slots = 'repmgr_slot_1001,repmgr_slot_1002'") {
+		t.Errorf("first call = %q", ex.calls[0])
+	}
+	if !strings.Contains(ex.calls[1], "pg_reload_conf") {
+		t.Errorf("second call = %q, want the reload", ex.calls[1])
+	}
+}
+
+func TestSetSynchronizedStandbySlotsEmptyListIsAValidValue(t *testing.T) {
+	// No active standbys is a legitimate steady state (e.g. a lone primary), not an
+	// error -- synchronized_standby_slots = '' means "no slots required".
+	ex := &spySlotExec{}
+	p := &Prober{Exec: ex}
+	if err := p.SetSynchronizedStandbySlots(context.Background(), ConnInfo{Host: "x"}, nil); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if !strings.Contains(ex.calls[0], "synchronized_standby_slots = ''") {
+		t.Errorf("first call = %q, want an empty value, not omitted or erroring", ex.calls[0])
+	}
+}
+
+func TestSetSynchronizedStandbySlotsSkipsReloadOnAlterFailure(t *testing.T) {
+	ex := &spySlotExec{alterErr: errors.New("permission denied")}
+	p := &Prober{Exec: ex}
+	err := p.SetSynchronizedStandbySlots(context.Background(), ConnInfo{Host: "x"}, []string{"repmgr_slot_1001"})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if len(ex.calls) != 1 {
+		t.Fatalf("calls = %v, want the reload skipped after ALTER SYSTEM fails", ex.calls)
 	}
 }

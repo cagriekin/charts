@@ -1,4 +1,4 @@
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled (and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots) }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -96,5 +96,15 @@ data:
 {{- if .Values.postgresql.audit.role }}
     pgaudit.role = '{{ .Values.postgresql.audit.role | toString | replace "'" "''" }}'
 {{- end }}
+{{- end }}
+{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
+  # Logical failover slot sync (#308), PostgreSQL 17+. sync_replication_slots is a plain
+  # boolean, not topology-dependent (unlike synchronized_standby_slots below, which the
+  # agent reconciles per-tick on the primary via ALTER SYSTEM as the standby set changes),
+  # so it is safe to set unconditionally here rather than needing agent involvement: it
+  # enables the slot-sync worker on a standby, and is a documented no-op on a primary
+  # (there is nothing there for it to sync).
+  sync-replication-slots.conf: |
+    sync_replication_slots = on
 {{- end }}
 {{- end }}
