@@ -5,10 +5,17 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// validSlotName matches PostgreSQL's own replication-slot identifier convention
+// (repmgr's repmgr_slot_<node_id>, and slot names in general). Enforced inside
+// SetSynchronizedStandbySlots before that name is interpolated into an ALTER SYSTEM
+// statement (#308).
+var validSlotName = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
 // Exec runs an external command and returns its trimmed stdout. It is an
 // interface so probes are unit-testable with a fake and the psql backend can
@@ -292,19 +299,28 @@ func (p *Prober) StandbyNodeIDs(ctx context.Context, ci ConnInfo) ([]int, error)
 	return ids, nil
 }
 
-// ActivePhysicalSlots returns the names of active physical replication slots (queried
+// PhysicalSlots returns the names of every EXISTING physical replication slot (queried
 // on the primary), for reconciling synchronized_standby_slots (#308). Physical only --
 // a logical failover slot must not be listed here, since synchronized_standby_slots
 // names the PHYSICAL slots a logical slot's decode position must wait behind, not
-// logical slots themselves. "active" (a walsender is currently attached) rather than
-// "exists": a slot for a since-scaled-down or unreachable standby must not keep a
-// logical consumer waiting on a physical connection that will never resume, the same
-// reasoning StandbyNodeIDs already applies to ghost-node cleanup. An unparseable row is
-// an error rather than a silent skip, matching RegisteredNodeIDs/StandbyNodeIDs -- a
-// broken read must not be mistaken for "no active standbys", which would desynchronize
-// every logical failover slot at once.
-func (p *Prober) ActivePhysicalSlots(ctx context.Context, ci ConnInfo) ([]string, error) {
-	out, err := p.psql(ctx, ci, "SELECT slot_name FROM pg_replication_slots WHERE slot_type = 'physical' AND active;")
+// logical slots themselves.
+//
+// Deliberately existence-based, not "active" (a walsender currently attached): an
+// earlier revision filtered on active, which meant a standby restart, a rolling
+// upgrade, or a brief network blip emptied this list -- and an EMPTY
+// synchronized_standby_slots lets a logical slot's decode position advance past
+// exactly the standby that is about to need it (a primary failure during that window
+// silently diverges the subscriber from the new primary, the precise hazard this
+// feature exists to prevent). The caller (assertSyncStandbySlots) intersects this with
+// the currently-registered, non-ghost standby node IDs instead -- a live-but-blipped
+// standby's slot survives (repmgr.nodes registration does not flap), while a genuinely
+// scaled-down standby's slot does not (mirrors cleanupGhostNodes' own reasoning).
+//
+// An unparseable row is an error rather than a silent skip, matching
+// RegisteredNodeIDs/StandbyNodeIDs -- a broken read must not be mistaken for "no
+// standbys", which would desynchronize every logical failover slot at once.
+func (p *Prober) PhysicalSlots(ctx context.Context, ci ConnInfo) ([]string, error) {
+	out, err := p.psql(ctx, ci, "SELECT slot_name FROM pg_replication_slots WHERE slot_type = 'physical';")
 	if err != nil {
 		return nil, err
 	}
@@ -332,11 +348,17 @@ func (p *Prober) ActivePhysicalSlots(ctx context.Context, ci ConnInfo) ([]string
 // skipped if ALTER SYSTEM fails, so a broken value is never silently left unreloaded
 // alongside a stale (but valid) running config.
 //
-// Callers MUST validate each slot name (e.g. against repmgr's own [A-Za-z0-9_]+
-// convention) before calling this: slots is interpolated directly into the ALTER SYSTEM
-// statement text, not passed as a bind parameter, because ALTER SYSTEM SET does not
-// accept one for its value.
+// Each slot name is validated against repmgr's own [A-Za-z0-9_]+ convention HERE, not
+// left to the caller: slots is interpolated directly into the ALTER SYSTEM statement
+// text, not passed as a bind parameter, because ALTER SYSTEM SET does not accept one
+// for its value -- enforcing it in the one function that actually builds that string
+// means a future second call site cannot bypass it by omission.
 func (p *Prober) SetSynchronizedStandbySlots(ctx context.Context, ci ConnInfo, slots []string) error {
+	for _, s := range slots {
+		if !validSlotName.MatchString(s) {
+			return fmt.Errorf("refusing to set synchronized_standby_slots: unexpected slot name %q", s)
+		}
+	}
 	alter := fmt.Sprintf("ALTER SYSTEM SET synchronized_standby_slots = '%s';", strings.Join(slots, ","))
 	if _, err := p.psql(ctx, ci, alter); err != nil {
 		return fmt.Errorf("alter system: %w", err)

@@ -725,8 +725,12 @@ func TestAssertSyncStandbySlotsNoOpWhenDisabled(t *testing.T) {
 	}
 }
 
+// The desired set is registered, non-ghost standby node IDs intersected with slots
+// that actually exist -- not pg_replication_slots.active (see the function's doc
+// comment for why: that flapped on any blip). nodes and slots both need setting for a
+// standby to be reconciled in.
 func TestAssertSyncStandbySlotsReconciles(t *testing.T) {
-	ex := &scriptedExec{slots: "repmgr_slot_1001\nrepmgr_slot_1002\n"}
+	ex := &scriptedExec{nodes: "1001\n1002\n", slots: "repmgr_slot_1001\nrepmgr_slot_1002\n"}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
 	a.assertSyncStandbySlots(context.Background())
@@ -736,15 +740,94 @@ func TestAssertSyncStandbySlotsReconciles(t *testing.T) {
 	if !strings.Contains(ex.slotSyncSQL[0], "repmgr_slot_1001,repmgr_slot_1002") {
 		t.Errorf("first call = %q, want the joined slot list", ex.slotSyncSQL[0])
 	}
-	if want := "repmgr_slot_1001,repmgr_slot_1002"; a.lastSyncStandbySlots != want {
-		t.Errorf("lastSyncStandbySlots = %q, want %q", a.lastSyncStandbySlots, want)
+	if want := "repmgr_slot_1001,repmgr_slot_1002"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
+		t.Errorf("lastSyncStandbySlots = %v, want %q", a.lastSyncStandbySlots, want)
+	}
+}
+
+// A registered standby whose walsender briefly drops (a restart, a rolling upgrade, a
+// network blip) must NOT be dropped from synchronized_standby_slots -- only genuine
+// ghosts (see the next test) and standbys with no physical slot at all are excluded.
+// PhysicalSlots (unlike the earlier active-filtered version) does not care whether the
+// slot is currently attached, only that it exists.
+func TestAssertSyncStandbySlotsSurvivesABlip(t *testing.T) {
+	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
+		t.Errorf("lastSyncStandbySlots = %v, want %q", a.lastSyncStandbySlots, want)
+	}
+}
+
+// A ghost node (scaled down, per cleanupGhostNodes' own ordinal-vs-NodeCount
+// discriminator) must not appear in synchronized_standby_slots even though its slot
+// object may still exist momentarily.
+func TestAssertSyncStandbySlotsExcludesGhostNodes(t *testing.T) {
+	ex := &scriptedExec{nodes: "1001\n1002\n", slots: "repmgr_slot_1001\nrepmgr_slot_1002\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.cfg.NodeCount = 2 // live ordinals 0-1 -> node_id 1002 (ordinal 2) is a ghost
+	a.assertSyncStandbySlots(context.Background())
+	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
+		t.Errorf("lastSyncStandbySlots = %v, want %q (1002 excluded as a ghost)", a.lastSyncStandbySlots, want)
+	}
+}
+
+// A standby registered a moment before its physical slot is created must not have a
+// nonexistent slot named in synchronized_standby_slots -- that is the exact "blocks all
+// logical decoding" failure this feature exists to prevent.
+func TestAssertSyncStandbySlotsExcludesUnslottedStandby(t *testing.T) {
+	ex := &scriptedExec{nodes: "1001\n1002\n", slots: "repmgr_slot_1001\n"} // 1002 has no slot yet
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
+		t.Errorf("lastSyncStandbySlots = %v, want %q (1002 excluded, no slot yet)", a.lastSyncStandbySlots, want)
+	}
+}
+
+// A freshly-promoted primary with no active standby slots yet must still issue the
+// ALTER SYSTEM on its first reconcile (desired=="" is a real value, not a skip) --
+// otherwise a synchronized_standby_slots value inherited from a prior primary term (or
+// from being cloned from one) survives uncorrected, potentially naming a slot that no
+// longer exists and permanently blocking logical decoding.
+func TestAssertSyncStandbySlotsFirstReconcileIsUnconditionalEvenWhenEmpty(t *testing.T) {
+	ex := &scriptedExec{}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("expected an unconditional first ALTER SYSTEM + reload even for an empty desired set, got %v", ex.slotSyncSQL)
+	}
+	if a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != "" {
+		t.Errorf("lastSyncStandbySlots = %v, want a non-nil pointer to \"\"", a.lastSyncStandbySlots)
+	}
+}
+
+// act() must clear the cache whenever this node stops serving as primary, so the next
+// primary term (this node re-promoted, or another node) starts with an unconditional
+// first reconcile rather than a stale cache.
+func TestActClearsLastSyncStandbySlotsWhenNotPrimary(t *testing.T) {
+	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if a.lastSyncStandbySlots == nil {
+		t.Fatal("expected a cached value after the first reconcile")
+	}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.Follow}, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if a.lastSyncStandbySlots != nil {
+		t.Errorf("lastSyncStandbySlots = %v, want nil after a non-primary action", a.lastSyncStandbySlots)
 	}
 }
 
 // A steady-state tick with an unchanged standby set must skip the ALTER SYSTEM +
 // reload entirely, not repeat it every 5s.
 func TestAssertSyncStandbySlotsSkipsWhenUnchanged(t *testing.T) {
-	ex := &scriptedExec{slots: "repmgr_slot_1001\n"}
+	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001\n"}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
 	a.assertSyncStandbySlots(context.Background())
@@ -754,18 +837,6 @@ func TestAssertSyncStandbySlotsSkipsWhenUnchanged(t *testing.T) {
 	a.assertSyncStandbySlots(context.Background())
 	if len(ex.slotSyncSQL) != 2 {
 		t.Fatalf("second call with an unchanged slot set must not issue more SQL, got %v", ex.slotSyncSQL)
-	}
-}
-
-// Slot names are read from a live query, not untrusted input, but this must still
-// refuse to interpolate anything unexpected into the ALTER SYSTEM statement.
-func TestAssertSyncStandbySlotsRefusesUnexpectedSlotName(t *testing.T) {
-	ex := &scriptedExec{slots: "repmgr_slot_1001'; DROP TABLE x; --\n"}
-	a := newFollowTestAgent(t, ex)
-	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background())
-	if len(ex.slotSyncSQL) != 0 {
-		t.Fatalf("expected no SQL for an unexpected slot name, got %v", ex.slotSyncSQL)
 	}
 }
 

@@ -79,6 +79,41 @@ func TestAddDBNameToPrimaryConninfoPreservesOtherLines(t *testing.T) {
 	}
 }
 
+// PostgreSQL honors the LAST occurrence of a duplicate GUC in postgresql.auto.conf, not
+// the first -- patching the first of two primary_conninfo lines would report
+// changed=true (triggering a reload) while the live value never actually picks up
+// dbname, since the second line still wins.
+func TestAddDBNameToPrimaryConninfoPatchesLastOccurrenceNotFirst(t *testing.T) {
+	first := `primary_conninfo = 'host=''pg-0.h'' port=5432 user=repmgr application_name=''pg-1'''`
+	second := `primary_conninfo = 'host=''pg-2.h'' port=5432 user=repmgr application_name=''pg-1'''`
+	conf := first + "\n" + second + "\n"
+	out, changed := addDBNameToPrimaryConninfo(conf, "repmgr")
+	if !changed {
+		t.Fatal("expected a change")
+	}
+	lines := strings.Split(out, "\n")
+	if lines[0] != first {
+		t.Errorf("first (losing) occurrence must be left untouched: %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "dbname=''repmgr''") || !strings.Contains(lines[1], "pg-2.h") {
+		t.Errorf("last (winning) occurrence must be the one patched: %q", lines[1])
+	}
+}
+
+// A value that itself contains the literal text "dbname=" (e.g. inside an options
+// string) must not be mistaken for an existing dbname keyword -- a bare
+// strings.Contains would false-positive and skip patching.
+func TestAddDBNameToPrimaryConninfoIgnoresDBNameSubstringInAnotherValue(t *testing.T) {
+	conf := `primary_conninfo = 'host=''pg-0.h'' port=5432 user=repmgr options=''-c foo.dbname=bar'' application_name=''pg-1'''` + "\n"
+	out, changed := addDBNameToPrimaryConninfo(conf, "repmgr")
+	if !changed {
+		t.Fatalf("expected a change (the dbname= substring is inside options=, not a real keyword):\n%s", out)
+	}
+	if !strings.Contains(out, "dbname=''repmgr''") {
+		t.Errorf("dbname not appended:\n%s", out)
+	}
+}
+
 func TestEnsurePrimaryConninfoDBName(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "postgresql.auto.conf")

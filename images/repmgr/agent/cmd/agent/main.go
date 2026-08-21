@@ -19,7 +19,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -152,10 +151,18 @@ type agent struct {
 
 	// lastSyncStandbySlots caches the comma-joined slot list synchronized_standby_slots
 	// was last successfully set to (#308), so a primary tick with an unchanged standby
-	// set skips the ALTER SYSTEM + reload rather than repeating it every 5s. "" before
-	// the first successful reconcile (also matches an intentionally-empty desired value,
-	// so the very first tick with no active standbys is a genuine no-op too).
-	lastSyncStandbySlots string
+	// set skips the ALTER SYSTEM + reload rather than repeating it every 5s. nil means
+	// "not yet reconciled this primary term" -- distinct from a pointer to "", which
+	// means "reconciled, and the live value really is empty". A bare string sentinel
+	// would conflate the two: a freshly-promoted primary with no active standbys yet
+	// would compute desired="" on its first tick, matching an unset zero-value "" and
+	// wrongly skipping the ALTER SYSTEM -- leaving whatever synchronized_standby_slots
+	// this node inherited (from being cloned from a prior primary's postgresql.auto.conf,
+	// or from its own previous primary term) in place, possibly naming a slot that no
+	// longer exists and permanently blocking logical decoding. Reset to nil on every
+	// demote (see the OnLost handling) so the next term this node is primary again
+	// starts with an unconditional first reconcile, not a stale cache from before.
+	lastSyncStandbySlots *string
 
 	// gossip publish state: skip re-patching the pod annotation when the position
 	// is unchanged, refreshing only on change or a heartbeat (to keep it fresh).
@@ -409,6 +416,19 @@ func (a *agent) boot(ctx context.Context) error {
 		return nil
 	}
 	if cd.InRecovery {
+		// #308: patch dbname into primary_conninfo unconditionally on every cold start of
+		// a standby, BEFORE the tick loop's own Follow-path patch (main.go's `case
+		// reconcile.Follow`) ever runs. That path only patches after actually invoking
+		// `repmgr standby follow`, which it skips whenever the node is already streaming
+		// from its target on the very first tick -- true for a just-cloned standby, since
+		// cloning already establishes streaming. Patching here instead of relying on that
+		// tick is what makes a fresh install deterministic rather than a race against how
+		// fast the standby's walreceiver reports itself as streaming.
+		if changed, err := a.ensurePrimaryConninfoDBName(); err != nil {
+			a.log.Warn("boot: ensure dbname in primary_conninfo", "err", err)
+		} else if changed {
+			a.log.Info("boot: patched dbname into primary_conninfo")
+		}
 		return a.sup.Start(ctx)
 	}
 	a.log.Info("boot: on-disk primary state; deferring start until reconcile confirms holdership + highwater", "state", cd.State)
@@ -620,6 +640,13 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 	if dec.Action != reconcile.Follow {
 		a.followUpstream = ""
 	}
+	// #308: any action other than serving as primary ends this node's current primary
+	// term, so the next time it (or another node) becomes primary must start with an
+	// unconditional first reconcile rather than a cache left over from a previous term
+	// (or its own zero-value on a distinct pod). See lastSyncStandbySlots' field comment.
+	if dec.Action != reconcile.Promote && dec.Action != reconcile.StayPrimary {
+		a.lastSyncStandbySlots = nil
+	}
 	switch dec.Action {
 	case reconcile.Promote:
 		// The node is already running as a standby (the reconcile guard); promote
@@ -644,11 +671,15 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if tl, _, ok, _ := a.prober.PrimaryWALPosition(wctx, a.selfConn()); ok {
 			a.advanceMarker(wctx, tl, true, obs.Marker)
 		}
-		// #308: reconcile synchronized_standby_slots to whichever standby(s) this new
-		// primary can already see -- a promote is exactly when the standby set most
-		// recently changed. Best-effort/no-op unless cfg.SyncReplicationSlots is set.
+		// H3 order: promote PG -> advance marker -> assert routing -> sync slots. Routing
+		// drives the pod pg-role labels and the read/write Service endpoints, so it must
+		// win the fence-budget context if anything is going to; #308's slot reconciliation
+		// is new, best-effort, and self-healing on the next tick either way, so it runs
+		// LAST, not ahead of routing (a hung slot query must not starve the assertion that
+		// actually matters for correctness this tick).
+		routingErr := a.assertPrimaryRouting(wctx, obs)
 		a.assertSyncStandbySlots(wctx)
-		return a.assertPrimaryRouting(wctx, obs)
+		return routingErr
 
 	case reconcile.StayPrimary:
 		// Register this primary in repmgr.nodes. In agent mode there is no repmgrd
@@ -675,8 +706,10 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
 		// #308: keep synchronized_standby_slots current as standbys scale up/down.
+		// After routing, not before (see the Promote case) -- same fence-budget priority.
+		routingErr := a.assertPrimaryRouting(wctx, obs)
 		a.assertSyncStandbySlots(wctx)
-		return a.assertPrimaryRouting(wctx, obs)
+		return routingErr
 
 	case reconcile.Follow:
 		// Ensure this standby has a repmgr.nodes record. In agent mode no repmgrd
@@ -1112,48 +1145,76 @@ func (a *agent) assertPrimaryRouting(ctx context.Context, obs reconcile.Observat
 	return a.kube.ReconcilePodLabels(ctx, a.cfg.PodSelector, desiredRoleLabels(a.cfg.PodName, obs.Peers))
 }
 
-// validSlotName matches PostgreSQL's own replication-slot identifier convention
-// (repmgr's repmgr_slot_<node_id>, and slot names in general). Slot names come from a
-// live SQL query (ActivePhysicalSlots), not untrusted external input, but this is
-// checked defensively before being interpolated into a subsequent ALTER SYSTEM
-// statement (#308) rather than trusted blindly.
-var validSlotName = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
-
 // assertSyncStandbySlots reconciles synchronized_standby_slots to the primary's current
-// active physical standby slot(s) (#308), so a logical failover slot's decode position
-// tracks the live standby set through scale-up/down and promote. Idempotent and
-// self-healing like assertPrimaryRouting/cleanupGhostNodes -- called from both Promote
-// and StayPrimary, bounded by the same fence-budget context -- and best-effort (logged,
-// never returned) so a slot-sync hiccup can never fail the routing assertion that
-// follows it. No-op entirely when cfg.SyncReplicationSlots is false (byte-identical
-// behavior to today).
+// LIVE standby set (#308), so a logical failover slot's decode position tracks the
+// live standby set through scale-up/down and promote. Idempotent and self-healing like
+// assertPrimaryRouting/cleanupGhostNodes -- called from both Promote and StayPrimary,
+// bounded by the same fence-budget context -- and best-effort (logged, never returned)
+// so a slot-sync hiccup can never fail the routing assertion that follows it. No-op
+// entirely when cfg.SyncReplicationSlots is false (byte-identical behavior to today).
+//
+// "Live" means registered in repmgr.nodes and not a ghost (cleanupGhostNodes' own
+// definition: ordinal within the current NodeCount) -- deliberately NOT "the walsender
+// is currently attached". An earlier revision derived the desired set from
+// pg_replication_slots.active, which meant a standby restart, a rolling upgrade, or a
+// brief network blip emptied synchronized_standby_slots -- and an empty value lets a
+// logical slot's decode position advance past exactly the standby that is about to
+// need it (a primary failure during that window silently diverges the subscriber from
+// the new primary, the precise hazard this feature exists to prevent).
+// repmgr.nodes registration does not flap on a blip, only cleanupGhostNodes' own
+// scale-down detection removes a row, so this survives the same transients that broke
+// the active-based version.
+//
+// Still intersected with PhysicalSlots (slots that actually exist): a node can be
+// registered a moment before its physical slot is created, and naming a slot that does
+// not exist is the same "blocks all logical decoding" failure this whole feature exists
+// to prevent, so a registered-but-not-yet-slotted standby is excluded until its slot
+// shows up (typically the same tick, since the clone/follow path that registers a
+// standby is also what creates its slot).
 func (a *agent) assertSyncStandbySlots(ctx context.Context) {
 	if !a.cfg.SyncReplicationSlots {
 		return
 	}
-	slots, err := a.prober.ActivePhysicalSlots(ctx, a.selfConn())
+	standbyIDs, err := a.prober.StandbyNodeIDs(ctx, a.selfConn())
 	if err != nil {
-		a.log.Warn("read active physical slots for synchronized_standby_slots", "err", err)
+		a.log.Warn("list repmgr.nodes for synchronized_standby_slots", "err", err)
 		return
 	}
-	for _, s := range slots {
-		if !validSlotName.MatchString(s) {
-			a.log.Warn("refusing to set synchronized_standby_slots: unexpected slot name", "slot", s)
-			return
+	existing, err := a.prober.PhysicalSlots(ctx, a.selfConn())
+	if err != nil {
+		a.log.Warn("read physical slots for synchronized_standby_slots", "err", err)
+		return
+	}
+	existingSet := make(map[string]bool, len(existing))
+	for _, s := range existing {
+		existingSet[s] = true
+	}
+	ghosts := make(map[int]bool)
+	for _, id := range ghostNodeIDs(standbyIDs, a.cfg.NodeCount) {
+		ghosts[id] = true
+	}
+	var slots []string
+	for _, id := range standbyIDs {
+		if ghosts[id] {
+			continue
+		}
+		name := fmt.Sprintf("repmgr_slot_%d", id)
+		if existingSet[name] {
+			slots = append(slots, name)
 		}
 	}
 	// Comma-joined is PostgreSQL's own list format for this GUC, and doubles as the
 	// cache key: an unchanged standby set (the common steady-state tick) skips the
 	// ALTER SYSTEM + reload entirely, rather than repeating it every 5s.
 	desired := strings.Join(slots, ",")
-	if desired == a.lastSyncStandbySlots {
+	if a.lastSyncStandbySlots != nil && desired == *a.lastSyncStandbySlots {
 		return
 	}
 	if err := a.prober.SetSynchronizedStandbySlots(ctx, a.selfConn(), slots); err != nil {
 		a.log.Warn("set synchronized_standby_slots", "err", err, "slots", desired)
 		return
 	}
-	a.lastSyncStandbySlots = desired
+	a.lastSyncStandbySlots = &desired
 	a.log.Info("reconciled synchronized_standby_slots", "slots", desired)
 }
 
