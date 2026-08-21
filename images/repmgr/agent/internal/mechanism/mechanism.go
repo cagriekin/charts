@@ -23,24 +23,24 @@ var ErrRewindDiverged = errors.New("mechanism: rewind diverged, reclone required
 // mechanism must write an actual host into primary_conninfo and has no use for the id.
 // Zero when the caller has no id to supply -- only repmgr requires it.
 type Conn struct {
-	NodeID int
-	Host     string
-	Port     int
-	User     string
-	DB       string
-	Password string
+	NodeID         int
+	Host           string
+	Port           int
+	User           string
+	DB             string
+	Password       string
 	ConnectTimeout time.Duration
 }
 
 // NodeIdentity describes the local node for config generation.
 type NodeIdentity struct {
-	NodeID   int    // ordinal+1000, stable across restarts
-	NodeName string // pod hostname
-	FQDN     string // <pod>.<headless> — the conninfo host
-	DataDir  string // PGDATA
-	PGBindir string // /usr/lib/postgresql/<major>/bin
-	ReplUser string
-	ReplDB   string
+	NodeID       int    // ordinal+1000, stable across restarts
+	NodeName     string // pod hostname
+	FQDN         string // <pod>.<headless> — the conninfo host
+	DataDir      string // PGDATA
+	PGBindir     string // /usr/lib/postgresql/<major>/bin
+	ReplUser     string
+	ReplDB       string
 	ReplPassword string
 }
 
