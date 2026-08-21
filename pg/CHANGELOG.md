@@ -1,5 +1,36 @@
 # pg chart changelog
 
+## 1.14.0 - 2026-08-21
+
+### Added
+
+- **`postgresql.extensions.aptSources` (#310).** Adds a non-PGDG apt source (e.g.
+  [Pigsty](https://repo.pigsty.io), the only source for `pgsodium`, `supabase_vault`,
+  `pg_graphql`, `pg_net`, `supautils`, `wrappers`, `pgjwt`, `pgmq`) inside
+  `copy-ext`/`copy-base-ext`'s own throwaway filesystem, before the existing
+  `postgresql.extensions.packages` apt-get install -- closing the gap where a
+  Pigsty-only package name previously made `copy-base-ext`'s `apt-get install` fail
+  outright (the `cagriekin/repmgr` image has no Pigsty source and isn't something a
+  chart consumer builds), aborting before its extension-file copy ever ran. Each
+  entry's key is dearmored and its line written to `/etc/apt/sources.list.d/` ahead of
+  a second `apt-get update`; `keyUrl`/`aptLine` are restricted to a narrow character
+  allowlist at render time (`pg.validateExtensionAptSources`), since both are
+  interpolated into a shell command. Requires `packages` to be non-empty. See the
+  README ["Installing packages from a non-PGDG apt
+  source"](README.md#installing-packages-from-a-non-pgdg-apt-source-310).
+
+### Fixed
+
+- **`copy-ext`/`copy-base-ext`'s extension-file copy silently dropped versioned
+  shared libraries (#309).** The copy glob was `*.so`, which only matches Postgres
+  extension modules themselves (`pgsodium.so`); a transitive runtime dependency
+  following the standard SONAME convention (`libsodium.so.23`, needed by
+  `pgsodium`/`supabase_vault`) doesn't match and was silently excluded, producing a
+  `FATAL: could not load library ... : libsodium.so.23: cannot open shared object
+  file` on the first Postgres start against such an extension -- every time,
+  unconditionally. The glob is now `*.so*`, a strict superset of the old match, so
+  this is a safe, unconditional fix rather than a new opt-in.
+
 ## 1.13.1 - 2026-08-21
 
 ### Fixed

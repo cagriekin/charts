@@ -317,6 +317,21 @@ postgresql:
     # non-default postgresql.image, and the NetworkPolicy egress this requires.
     packages: []
       # - "postgresql-{major}-cron"
+    # Non-PGDG apt sources (#310) to add inside copy-ext/copy-base-ext's own filesystem,
+    # before the apt-get install above -- for extensions PGDG simply doesn't package
+    # (pgsodium, supabase_vault, pg_graphql, pg_net, supautils, wrappers, pgjwt, pgmq are
+    # all Pigsty-only, repo.pigsty.io/apt/pgsql/<codename>). Rendered as a curl | gpg
+    # --dearmor + sources.list.d write ahead of apt-get update/install (see README
+    # "Installing extensions without a custom image" for a full Pigsty example).
+    # keyUrl/aptLine are restricted to a narrow character allowlist at render time
+    # (pg.validateExtensionAptSources) since both are interpolated into a shell command;
+    # {major} in aptLine is substituted with postgresql.majorVersion, same as packages
+    # above. Pointless (and rejected) without at least one entry in packages.
+    aptSources: []
+      # - name: pigsty       # becomes /usr/share/keyrings/pigsty-keyring.gpg and
+      #                       # /etc/apt/sources.list.d/pigsty.list -- must be unique
+      #   keyUrl: https://repo.pigsty.io/key
+      #   aptLine: "deb [signed-by=/usr/share/keyrings/pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
     # Resources for the apt-get step, only rendered while packages is non-empty (the
     # plain-copy default path keeps using the shared, lighter pg.initResources). apt-get
     # update + install is a real package-manager run (repo metadata fetch + dependency

@@ -1,5 +1,25 @@
 # pgvector chart changelog
 
+## 1.14.0 - 2026-08-21
+
+Inherited from pg's symlinked templates (`_helpers.tpl`, `statefulset.yaml`) and mirrored
+`values.yaml`/`values.schema.json`. See the [pg 1.14.0 changelog](../pg/CHANGELOG.md) for
+the full detail.
+
+### Added
+
+- **`postgresql.extensions.aptSources` (#310).** Adds a non-PGDG apt source (e.g. Pigsty)
+  inside `copy-ext`/`copy-base-ext` before the `packages` apt-get install, for extensions
+  PGDG doesn't package (`pgsodium`, `supabase_vault`, ...). Requires `packages` to be
+  non-empty. See the [pg chart README](../pg/README.md#installing-packages-from-a-non-pgdg-apt-source-310).
+
+### Fixed
+
+- **The extension-file copy silently dropped versioned shared libraries (#309).** The
+  copy glob is now `*.so*`, not just `*.so`, so a transitive runtime dependency like
+  `libsodium.so.23` (needed by `pgsodium`/`supabase_vault`) is copied along with the
+  extension automatically.
+
 ## 1.13.1 - 2026-08-21
 
 ### Fixed

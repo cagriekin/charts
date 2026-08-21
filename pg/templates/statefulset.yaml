@@ -2,6 +2,7 @@
 {{- include "pg.validateAudit" . }}
 {{- include "pg.validateExtraPassthrough" . }}
 {{- include "pg.validateExtensionPackages" . }}
+{{- include "pg.validateExtensionAptSources" . }}
 {{- include "pg.validateWalLevel" . }}
 {{- include "pg.validateSyncReplicationSlotsMajor" . }}
 {{- include "pg.validateSyncReplicationSlotsWalLevel" . }}
@@ -383,7 +384,7 @@ spec:
           # mode, one layer up). The pin makes that impossible to do silently: apt
           # either leaves the server package alone (the normal case) or fails the
           # render-time-adjacent install outright, never a quiet swap.
-          command: ['sh', '-c', 'PGVER=$(dpkg-query -W postgresql-{{ $pgMajor }} 2>/dev/null | cut -f2); apt-get update && apt-get install -y --no-install-recommends ${PGVER:+"postgresql-{{ $pgMajor }}=$PGVER"} {{ join " " $pkgs }} && cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
+          command: ['sh', '-c', {{ include "pg.extensionInstallCommand" (dict "pgMajor" $pgMajor "pkgs" $pkgs "aptSources" .Values.postgresql.extensions.aptSources "noClobber" false) | quote }}]
           securityContext:
             # apt-get/dpkg needs root to write /var/lib/dpkg and run package
             # maintainer scripts (e.g. ldconfig) -- broader than fix-permissions'
@@ -422,7 +423,7 @@ spec:
                 - SETFCAP
                 - MKNOD
 {{- else }}
-          command: ['sh', '-c', 'cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
+          command: ['sh', '-c', 'cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so* /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
 {{- end }}
@@ -460,7 +461,7 @@ spec:
           # here too: if this image did not install PostgreSQL via a dpkg-tracked
           # postgresql-{{ $pgMajor }} package, PGVER is empty and the pin is skipped
           # rather than failing an otherwise-valid custom-image install.
-          command: ['sh', '-c', 'PGVER=$(dpkg-query -W postgresql-{{ $pgMajor }} 2>/dev/null | cut -f2); apt-get update && apt-get install -y --no-install-recommends ${PGVER:+"postgresql-{{ $pgMajor }}=$PGVER"} {{ join " " $pkgs }} && cp -n /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp -n /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
+          command: ['sh', '-c', {{ include "pg.extensionInstallCommand" (dict "pgMajor" $pgMajor "pkgs" $pkgs "aptSources" .Values.postgresql.extensions.aptSources "noClobber" true) | quote }}]
           securityContext:
             # Same as copy-base-ext's apt-step securityContext above (review, #303):
             # REPLACES postgresql.containerSecurityContext, not a merge -- and will
@@ -491,7 +492,7 @@ spec:
           # releases independently (this image's tag is often floating), and an
           # unconditional overwrite silently reintroduces an ABI mismatch between
           # the running server and its own WAL receiver plugin.
-          command: ['sh', '-c', 'cp -n /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp -n /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
+          command: ['sh', '-c', 'cp -n /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so* /ext-lib/ && cp -n /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
 {{- end }}

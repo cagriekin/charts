@@ -300,10 +300,16 @@ assert_contains "#153: repmgr-init declares its (heavier) clone resources" "${re
 # cp would silently overwrite the repmgr image's core libs (e.g. libpqwalreceiver.so)
 # if postgresql.image and repmgr.image drift to different postgres point releases.
 copy_base_ext=$(printf '%s\n' "${init_res}" | sed -n '/name: copy-base-ext/,/name: copy-ext/p')
-assert_contains "#302: copy-base-ext copies plainly (it runs first, nothing to preserve yet)" "${copy_base_ext}" "cp /usr/lib/postgresql/18/lib/\*.so /ext-lib/"
+assert_contains "#302: copy-base-ext copies plainly (it runs first, nothing to preserve yet)" "${copy_base_ext}" "cp /usr/lib/postgresql/18/lib/\*.so\* /ext-lib/"
 copy_ext=$(printf '%s\n' "${init_res}" | sed -n '/name: copy-ext/,/securityContext/p')
-assert_contains "#302: copy-ext uses cp -n for the lib copy" "${copy_ext}" "cp -n /usr/lib/postgresql/18/lib/\*.so /ext-lib/"
+assert_contains "#302: copy-ext uses cp -n for the lib copy" "${copy_ext}" "cp -n /usr/lib/postgresql/18/lib/\*.so\* /ext-lib/"
 assert_contains "#302: copy-ext uses cp -n for the extension-share copy" "${copy_ext}" "cp -n /usr/share/postgresql/18/extension/\* /ext-share/"
+
+# #309: the copy glob is *.so*, not just *.so -- a strict superset that also matches
+# a versioned SONAME (e.g. libsodium.so.23) a package pulls in as a transitive
+# runtime dependency, which is not itself named like a Postgres extension module.
+assert_contains "#309: copy-base-ext glob also matches versioned SONAMEs" "${copy_base_ext}" "lib/\*.so\* /ext-lib/"
+assert_contains "#309: copy-ext glob also matches versioned SONAMEs" "${copy_ext}" "lib/\*.so\* /ext-lib/"
 
 # #303: with no packages declared, neither init container should carry an apt-get
 # step or the root-transient securityContext it needs -- the default/existing-user
@@ -328,8 +334,8 @@ assert_contains "#303: copy-ext installs the {major}-substituted package too" "$
 # the copy step must still follow the apt-get in the same command, and copy-ext
 # must still be -n (#302) even with packages set -- installing a package is not a
 # license to start clobbering the repmgr image's core libs.
-assert_contains "#303: copy-base-ext still copies plainly after apt-get" "${pkg_base_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+"postgresql-18=$PGVER"} postgresql-18-cron && cp /usr/lib/postgresql/18/lib/\*.so /ext-lib/'
-assert_contains "#303: copy-ext still uses cp -n after apt-get" "${pkg_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+"postgresql-18=$PGVER"} postgresql-18-cron && cp -n /usr/lib/postgresql/18/lib/\*.so /ext-lib/'
+assert_contains "#303: copy-base-ext still copies plainly after apt-get" "${pkg_base_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+\\"postgresql-18=$PGVER\\"} postgresql-18-cron && cp /usr/lib/postgresql/18/lib/\*.so\* /ext-lib/'
+assert_contains "#303: copy-ext still uses cp -n after apt-get" "${pkg_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+\\"postgresql-18=$PGVER\\"} postgresql-18-cron && cp -n /usr/lib/postgresql/18/lib/\*.so\* /ext-lib/'
 
 # review (#303): apt-get install could otherwise upgrade the already-installed
 # postgresql-{major} as a side effect of satisfying some extension package's
@@ -341,7 +347,7 @@ assert_contains "#303: copy-ext still uses cp -n after apt-get" "${pkg_ext}" 'ap
 # is already the newest version") or fails the install outright, never a silent
 # swap.
 assert_contains "#303: copy-base-ext detects the installed postgresql-18 version via dpkg-query" "${pkg_base_ext}" 'PGVER=$(dpkg-query -W postgresql-18 2>/dev/null | cut -f2)'
-assert_contains "#303: copy-base-ext pins postgresql-18 on the same apt-get install line" "${pkg_base_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+"postgresql-18=$PGVER"}'
+assert_contains "#303: copy-base-ext pins postgresql-18 on the same apt-get install line" "${pkg_base_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+\\"postgresql-18=$PGVER\\"}'
 assert_contains "#303: copy-ext also detects and pins postgresql-18 (best-effort for a custom image)" "${pkg_ext}" 'PGVER=$(dpkg-query -W postgresql-18 2>/dev/null | cut -f2)'
 
 # #303: a version pin (apt's `=` syntax) passes through verbatim -- no chart-side
@@ -426,6 +432,109 @@ helm template test-pg "${CHART_DIR}" \
   --set 'postgresql.extensions.packages[0]=`id`' \
   >/dev/null 2>&1 && pkg_inject_backtick_rc=0 || pkg_inject_backtick_rc=$?
 assert_eq "#303: a backtick-injected package entry fails the render" "1" "${pkg_inject_backtick_rc}"
+
+# #310: postgresql.extensions.aptSources adds a non-PGDG apt source (e.g. Pigsty)
+# inside copy-ext/copy-base-ext before the apt-get install, for extensions PGDG
+# doesn't package. Rendered as curl | gpg --dearmor + a sources.list.d write, then a
+# second apt-get update, ahead of the existing PGVER-pinned install.
+apt_src_res=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/{major}/trixie trixie main' \
+  --show-only templates/statefulset.yaml 2>&1)
+apt_src_base_ext=$(printf '%s\n' "${apt_src_res}" | sed -n '/name: copy-base-ext/,/name: copy-ext/p')
+apt_src_ext=$(printf '%s\n' "${apt_src_res}" | sed -n '/name: copy-ext/,/name: repmgr-init/p')
+assert_contains "#310: copy-base-ext installs curl/gnupg before adding the source" "${apt_src_base_ext}" "apt-get install -y --no-install-recommends curl ca-certificates gnupg"
+assert_contains "#310: copy-base-ext dearmors the key to a per-source keyring" "${apt_src_base_ext}" 'curl -fsSL \\"https://repo.pigsty.io/key\\" | gpg --dearmor -o /usr/share/keyrings/pigsty-keyring.gpg'
+assert_contains "#310: copy-base-ext writes the sources.list.d entry" "${apt_src_base_ext}" 'echo \\"deb \[signed-by=/usr/share/keyrings/pigsty-keyring.gpg\] https://repo.pigsty.io/apt/pgsql/18/trixie trixie main\\" > /etc/apt/sources.list.d/pigsty.list'
+assert_contains "#310: copy-ext also gets the apt source (custom postgresql.image case)" "${apt_src_ext}" 'curl -fsSL \\"https://repo.pigsty.io/key\\" | gpg --dearmor -o /usr/share/keyrings/pigsty-keyring.gpg'
+# the source must be added and a second apt-get update run BEFORE the pinned package
+# install -- otherwise the just-added source's packages aren't visible to apt yet.
+assert_contains "#310: source is added, then apt-get updated again, before the pinned install" "${apt_src_base_ext}" 'sources.list.d/pigsty.list && apt-get update && apt-get install -y --no-install-recommends ${PGVER:+\\"postgresql-18=$PGVER\\"} postgresql-18-pgsodium'
+
+# #310: {major} substitutes into aptLine exactly like it does into packages.
+assert_contains "#310: {major} substitutes into aptLine" "${apt_src_base_ext}" "pgsql/18/trixie"
+assert_not_contains "#310: no stale {major} placeholder left in aptLine" "${apt_src_base_ext}" "pgsql/{major}/trixie"
+
+# #310: with no aptSources set, neither container pays for the curl/gnupg install --
+# the default packages-only path must be byte-identical to before this feature existed.
+assert_not_contains "#310: no curl/gnupg install in copy-base-ext without aptSources" "${pkg_base_ext}" "curl ca-certificates gnupg"
+assert_not_contains "#310: no curl/gnupg install in copy-ext without aptSources" "${pkg_ext}" "curl ca-certificates gnupg"
+
+# #310: aptSources without packages fails the render -- it would have nothing to do.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+  >/dev/null 2>&1 && apt_src_nopkg_rc=0 || apt_src_nopkg_rc=$?
+assert_eq "#310: aptSources without packages fails the render" "1" "${apt_src_nopkg_rc}"
+
+# #310: aptSources without extensions.enabled fails the render -- packages is left
+# empty here so this actually exercises pg.validateExtensionAptSources's own enabled
+# check, not the pre-existing pg.validateExtensionPackages guard (which would fire
+# first, with its own message, if packages were also set).
+helm template test-pg "${CHART_DIR}" \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+  >/dev/null 2>&1 && apt_src_noenable_rc=0 || apt_src_noenable_rc=$?
+assert_eq "#310: aptSources without extensions.enabled fails the render" "1" "${apt_src_noenable_rc}"
+apt_src_noenable_err=$(helm template test-pg "${CHART_DIR}" \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+  2>&1) || true
+assert_contains "#310: error is aptSources' own enabled guard, not the packages guard" "${apt_src_noenable_err}" "postgresql.extensions.aptSources is set but postgresql.extensions.enabled is false"
+
+# #310: an invalid name (not a safe filename component) fails the render.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.aptSources[0].name=pig/sty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+  >/dev/null 2>&1 && apt_src_badname_rc=0 || apt_src_badname_rc=$?
+assert_eq "#310: an invalid aptSources name fails the render" "1" "${apt_src_badname_rc}"
+
+# #310: duplicate names fail the render -- a second entry would silently overwrite
+# the first's /etc/apt/sources.list.d/<name>.list.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb https://a.example/x trixie main' \
+  --set 'postgresql.extensions.aptSources[1].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[1].keyUrl=https://repo.pigsty.io/key2' \
+  --set 'postgresql.extensions.aptSources[1].aptLine=deb https://b.example/y trixie main' \
+  >/dev/null 2>&1 && apt_src_dupname_rc=0 || apt_src_dupname_rc=$?
+assert_eq "#310: a duplicate aptSources name fails the render" "1" "${apt_src_dupname_rc}"
+
+# #310: a shell-metacharacter injection via keyUrl fails the render -- keyUrl is
+# interpolated into a `curl ... | gpg ...` shell command.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key;rm -rf /' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+  >/dev/null 2>&1 && apt_src_inject_keyurl_rc=0 || apt_src_inject_keyurl_rc=$?
+assert_eq "#310: a semicolon-injected keyUrl fails the render" "1" "${apt_src_inject_keyurl_rc}"
+
+# #310: a shell-metacharacter injection via aptLine fails the render -- aptLine is
+# interpolated into an `echo "..." > ...` shell command.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb `id` main' \
+  >/dev/null 2>&1 && apt_src_inject_aptline_rc=0 || apt_src_inject_aptline_rc=$?
+assert_eq "#310: a backtick-injected aptLine fails the render" "1" "${apt_src_inject_aptline_rc}"
 
 # #116: the busybox helper init image is a single shared value (default 1.37 for all
 # four init containers, no more 1.35/1.37 split) and is overridable for air-gapped

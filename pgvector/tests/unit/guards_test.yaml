@@ -66,3 +66,16 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "requires postgresql.walLevel: logical"
+
+  # aptSources only exists to make a packages entry installable (#310) -- pointless,
+  # and rejected, without one.
+  - it: extensions.aptSources without packages is rejected
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorPattern: "aptSources is set but postgresql.extensions.packages is empty"

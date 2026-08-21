@@ -383,6 +383,86 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end -}}
 {{- end }}
 
+{{- /* #310: postgresql.extensions.aptSources lets a values-driven install add a
+       non-PGDG apt source (e.g. Pigsty, for pgsodium/supabase_vault/pg_graphql/...)
+       inside copy-ext/copy-base-ext's own throwaway filesystem before their apt-get
+       install, closing the exact gap postgresql.extensions.packages already exists to
+       close for PGDG-only packages. Same injection surface as
+       pg.validateExtensionPackages -- keyUrl and aptLine both get interpolated into a
+       shell command (curl | gpg --dearmor, and echo > sources.list.d), so both are
+       restricted to an allowlisted character class and fail the render otherwise. name
+       becomes a filename (the keyring and the .list file) so it's restricted to a
+       plain identifier -- duplicate names would silently overwrite each other's
+       sources.list.d entry, so those fail too. Pointless (and therefore rejected)
+       without postgresql.extensions.packages: aptSources' only consumer is the
+       apt-get install step gated on packages being non-empty -- see
+       pg.extensionInstallCommand below. */ -}}
+{{- define "pg.validateExtensionAptSources" -}}
+{{- $srcs := .Values.postgresql.extensions.aptSources | default list -}}
+{{- if $srcs -}}
+  {{- if not .Values.postgresql.extensions.enabled -}}
+    {{- fail "postgresql.extensions.aptSources is set but postgresql.extensions.enabled is false, so nothing would ever use it. Set postgresql.extensions.enabled=true." -}}
+  {{- end -}}
+  {{- if not (.Values.postgresql.extensions.packages | default list) -}}
+    {{- fail "postgresql.extensions.aptSources is set but postgresql.extensions.packages is empty -- aptSources only exists to make packages from a non-PGDG source installable, so it has nothing to do without at least one package that needs it." -}}
+  {{- end -}}
+  {{- $nameRe := "^[A-Za-z0-9_-]+$" -}}
+  {{- $keyUrlRe := "^https://[A-Za-z0-9._~:/?#%=-]+$" -}}
+  {{- $aptLineRe := "^[A-Za-z0-9 ./:=_+~%\\[\\]{}@-]+$" -}}
+  {{- $seen := dict -}}
+  {{- range $s := $srcs -}}
+    {{- $name := $s.name | toString -}}
+    {{- if not (regexMatch $nameRe $name) -}}
+      {{- fail (printf "postgresql.extensions.aptSources: invalid name %q -- must match ^[A-Za-z0-9_-]+$ (used verbatim as a keyring and sources.list.d filename)" $name) -}}
+    {{- end -}}
+    {{- if hasKey $seen $name -}}
+      {{- fail (printf "postgresql.extensions.aptSources: duplicate name %q -- each entry must have a unique name (it becomes /etc/apt/sources.list.d/<name>.list, and a duplicate silently overwrites the earlier entry)" $name) -}}
+    {{- end -}}
+    {{- $seen = set $seen $name true -}}
+    {{- $keyUrl := $s.keyUrl | toString -}}
+    {{- if not (regexMatch $keyUrlRe $keyUrl) -}}
+      {{- fail (printf "postgresql.extensions.aptSources[%s].keyUrl: invalid value %q -- must be an https:// URL using only letters, digits, and the characters . _ ~ : / ? # %% = - (it is interpolated into a shell command); no whitespace, quotes, backticks, $(), ;, &, |, or newlines" $name $keyUrl) -}}
+    {{- end -}}
+    {{- $aptLine := $s.aptLine | toString -}}
+    {{- if not (regexMatch $aptLineRe $aptLine) -}}
+      {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine: invalid value %q -- must use only letters, digits, spaces, and the characters . / : = _ + ~ %% [ ] { } @ - (the literal {major} placeholder is substituted with postgresql.majorVersion); no quotes, backticks, $(), ;, &, |, or newlines (it is interpolated into a shell command)" $name $aptLine) -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- end }}
+
+{{- /* #309/#310: builds the copy-base-ext/copy-ext init container command: optionally
+       add postgresql.extensions.aptSources ahead of the apt-get install (#310), then
+       apt-get install the pinned postgresql-<major> + packages (#303), then
+       copy the extension files out. #309: the copy glob is *.so* (not *.so|), so a
+       versioned SONAME a package pulls in as a transitive runtime dependency (e.g.
+       libsodium.so.23, not itself a Postgres extension) is no longer silently dropped
+       -- a strict superset of the old *.so match, so this is safe unconditionally, not
+       just on the aptSources path. noClobber selects copy-ext's `cp -n` (#302): it
+       must never overwrite a lib copy-base-ext already placed from the repmgr image. */ -}}
+{{- define "pg.extensionInstallCommand" -}}
+{{- $pgMajor := .pgMajor | toString -}}
+{{- $pkgs := .pkgs -}}
+{{- $cpFlag := "" -}}
+{{- if .noClobber }}{{- $cpFlag = "-n " }}{{- end -}}
+{{- $srcSteps := list -}}
+{{- range $s := (.aptSources | default list) -}}
+  {{- $aptLine := $s.aptLine | toString | replace "{major}" ($pgMajor | toString) -}}
+  {{- $srcSteps = append $srcSteps (printf "curl -fsSL \"%s\" | gpg --dearmor -o /usr/share/keyrings/%s-keyring.gpg" $s.keyUrl $s.name) -}}
+  {{- $srcSteps = append $srcSteps (printf "echo \"%s\" > /etc/apt/sources.list.d/%s.list" $aptLine $s.name) -}}
+{{- end -}}
+{{- $cmdParts := list "apt-get update" -}}
+{{- if $srcSteps -}}
+  {{- $cmdParts = append $cmdParts "apt-get install -y --no-install-recommends curl ca-certificates gnupg" -}}
+  {{- $cmdParts = concat $cmdParts $srcSteps -}}
+  {{- $cmdParts = append $cmdParts "apt-get update" -}}
+{{- end -}}
+{{- $cmdParts = append $cmdParts (printf "apt-get install -y --no-install-recommends ${PGVER:+\"postgresql-%s=$PGVER\"} %s" $pgMajor (join " " $pkgs)) -}}
+{{- $cmdParts = append $cmdParts (printf "cp %s/usr/lib/postgresql/%s/lib/*.so* /ext-lib/" $cpFlag $pgMajor) -}}
+{{- $cmdParts = append $cmdParts (printf "cp %s/usr/share/postgresql/%s/extension/* /ext-share/" $cpFlag $pgMajor) -}}
+{{- printf "PGVER=$(dpkg-query -W postgresql-%s 2>/dev/null | cut -f2); %s" $pgMajor (join " && " $cmdParts) -}}
+{{- end }}
+
 {{- /* #308: wal_level has exactly one authoritative source: postgresql.walLevel.
        pgbackrest-archive.conf (postgresql-configmap.yaml) renders it there, and that file
        sorts after custom.conf under conf.d's include_dir, so a bare

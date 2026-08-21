@@ -259,6 +259,13 @@ postgresql:
     # `{major}` substituted with majorVersion, optional `=version` pin. See the pg chart
     # README "Installing extensions without a custom image".
     packages: []
+    # Non-PGDG apt sources (#310, e.g. Pigsty) to add before the packages install, for
+    # extensions PGDG doesn't package (pgsodium, supabase_vault, ...). {major} substitutes
+    # into aptLine. Requires packages to be non-empty. See the pg chart README.
+    aptSources: []
+      # - name: pigsty
+      #   keyUrl: https://repo.pigsty.io/key
+      #   aptLine: "deb [signed-by=/usr/share/keyrings/pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
     installResources:
       requests:
         cpu: 100m

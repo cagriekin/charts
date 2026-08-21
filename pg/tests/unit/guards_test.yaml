@@ -234,3 +234,122 @@ tests:
         - "postgresql-18-cron; rm -rf /"
     asserts:
       - failedTemplate: {}
+
+  # --- Scenario 15: non-PGDG apt source guards (#310) ---
+  - it: aptSources without packages fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.extensions.aptSources is set but postgresql.extensions.packages is empty -- aptSources only exists to make packages from a non-PGDG source installable, so it has nothing to do without at least one package that needs it."
+
+  # packages is also set here, so the pre-existing pg.validateExtensionPackages guard
+  # fires first, with its own message -- pg.validateExtensionAptSources's own enabled
+  # check is exercised separately below, with packages left empty.
+  - it: aptSources with packages but without extensions.enabled hits the packages guard
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.extensions.packages is set but postgresql.extensions.enabled is false, so nothing would ever install them. Set postgresql.extensions.enabled=true."
+
+  - it: aptSources alone without extensions.enabled hits its own enabled guard
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.extensions.aptSources is set but postgresql.extensions.enabled is false, so nothing would ever use it. Set postgresql.extensions.enabled=true."
+
+  - it: an aptSources entry with an invalid name fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: "pig/sty"
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate: {}
+
+  - it: duplicate aptSources names fail render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb https://a.example/x trixie main"
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key2
+          aptLine: "deb https://b.example/y trixie main"
+    asserts:
+      - failedTemplate: {}
+
+  - it: an aptSources keyUrl with a shell metacharacter fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: "https://repo.pigsty.io/key; rm -rf /"
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate: {}
+
+  - it: an aptSources aptLine with a shell metacharacter fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb `id` main"
+    asserts:
+      - failedTemplate: {}
+
+  - it: a valid aptSources entry renders successfully
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.majorVersion: "18"
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb [signed-by=/usr/share/keyrings/pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")].command[2]
+          pattern: "curl -fsSL \"https://repo\\.pigsty\\.io/key\" \\| gpg --dearmor -o /usr/share/keyrings/pigsty-keyring\\.gpg"
