@@ -330,10 +330,22 @@ render time — see [Upgrading to 2.0.0](#upgrading-to-200-repmgrd-removed).
 | `repmgr.agent.reconcileInterval` | Reconcile tick interval | `5s` |
 | `repmgr.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
 | `repmgr.agent.cascadingReplication` | Let a standby stream from another standby (a chain by pod ordinal toward the primary) to offload the primary's WAL senders. Default off; meaningful at `replicaCount >= 2` (3+ nodes). The agent only picks a verifiably-safe same-timeline upstream and re-homes to the leader if it fails/promotes, so failover is not delayed and a standby is never stranded. | `false` |
+| `repmgr.agent.mechanism` | **EXPERIMENTAL (#287).** `repmgr` (the repmgr CLI) or `native` (`pg_ctl`/`pg_basebackup`/`pg_rewind` directly). See [Replication Mechanics](#replication-mechanics-experimental-287) below. | `repmgr` |
 
 Must satisfy `leaseDuration > renewDeadline > retryPeriod`. For managed clouds, widen them (e.g. `30s/20s/4s`) so a brief apiserver blip does not trip an unnecessary demote. Note: with the Kubernetes Lease backend, a control-plane outage longer than `renewDeadline` is itself a write outage (the healthy primary self-demotes on losing apiserver contact, and no standby can acquire until the control plane returns); this is the safe choice under an asymmetric partition.
 
 The agent also fronts the read/write split: `pgpool` (if enabled) points at the RW (`<fullname>`) and RO (`<fullname>-readonly`) Services with failover off, and the agent maintains the Service selector and `pg-role` labels itself. With `postgresql.replicaCount: 0` (primary-only) there are no standbys, so pgpool configures only the RW backend and runs as a single-backend router — the RO backend is omitted to avoid health-checking an endpointless Service (#207).
+
+### Replication Mechanics (EXPERIMENTAL, #287)
+
+repmgr ([upstream development has stalled](https://github.com/EnterpriseDB/repmgr)) is the agent's only supported replication mechanic today, but the `Mechanism` interface it is driven through (`images/repmgr/agent/internal/mechanism`) is swappable, and the reconcile loop imports only that interface — never repmgr directly. `repmgr.agent.mechanism: native` selects an alternative that drives PostgreSQL's own tools instead: `pg_ctl promote`, `pg_basebackup`, `pg_rewind`, and `primary_conninfo`/`standby.signal` written directly into an agent-owned config fragment inside `PGDATA`.
+
+**`native` is not usable on a real cluster yet — do not set it in production.** The Lease, the timeline/LSN election, fencing, and Service routing are all unchanged and identical either way (that is the entire point of the `Mechanism` seam), but two things repmgr otherwise provides for free are not yet replaced:
+
+- **No topology source (#288).** repmgr mode discovers "who am I, who is upstream, who is registered" from `repmgr.nodes`. Native mode maintains no such table (`RegisterPrimary`/`RegisterStandby`/`Unregister` are no-ops), so a standby has no way to automatically discover which peer to follow.
+- **No replication slot ownership (#289).** Nothing under native mode manages replication slots, so a primary can recycle WAL a standby still needs, the same class of problem [#305](README.md#wal-disk-usage-305) covers for archiving specifically.
+
+Both are required before `native` is safe to run; `#294` tracks promoting it to supported and eventually default. Until then it exists behind the flag purely to let the mechanics be developed and tested independently of that larger topology/slot work — the `#297` scale-up-race protection (an unregistered node refusing to promote over a registered peer) is a good example of an existing repmgr-mode safety behavior that degrades gracefully rather than needing native-specific code: native mode has no registry to read, so that gate simply never fires, and native promotes on the same criteria repmgr mode would if the registry were empty.
 
 ### Migrating a repmgrd release (chart 1.x) to 2.0.0
 

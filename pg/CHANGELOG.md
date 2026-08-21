@@ -70,6 +70,36 @@
   it all three nodes come up Ready and agree on the topology; `test-pgpool-failover` still
   passes with no `pgdata.diverged.*` created.
 
+### Added
+
+- **`repmgr.agent.mechanism`: an experimental native HA mechanism, alongside repmgr
+  (#287).** repmgr ([upstream development has stalled](https://github.com/EnterpriseDB/repmgr))
+  is still the default and the only supported mechanism; this adds a second implementation
+  behind a flag, not a replacement. The agent's reconcile loop imports only the `Mechanism`
+  interface, never repmgr directly, and this is the seam that lets one be swapped for the
+  other without touching policy (the Lease, the timeline/LSN election, fencing, and Service
+  routing are unchanged either way).
+
+  `repmgr.agent.mechanism: native` drives PostgreSQL's own tools directly instead of the
+  repmgr CLI: `pg_ctl promote`, `pg_basebackup`, `pg_rewind`, and `primary_conninfo`/
+  `standby.signal` written into an agent-owned config fragment inside `PGDATA`. Off by
+  default (`mechanism: repmgr`; a default render is byte-identical to 1.x/2.0.0's repmgrd
+  removal).
+
+  **EXPERIMENTAL -- do not set `native` in production.** It is not usable on a real cluster
+  until two follow-ups land: `#288` (native mode has no topology source at all --
+  `RegisterPrimary`/`RegisterStandby`/`Unregister` are no-ops, so a standby cannot discover
+  which peer to follow) and `#289` (nothing owns replication slots, so a primary can recycle
+  WAL a standby still needs). `#294` tracks promoting it to supported.
+
+  Verified that native mode inherits the mechanism-agnostic safety behaviors already in
+  reconcile/probe rather than needing its own copies -- in particular the `#297` scale-up
+  registration gate, which reads `repmgr.nodes` and is designed to fail open when that read
+  errors (an existing, unit-tested contract): native mode has no `repmgr.nodes` at all, so
+  the gate is permanently inert under it and native promotes exactly as repmgr mode would if
+  the registry were empty, rather than being silently blocked. See the
+  [pg README](README.md#replication-mechanics-experimental-287) for the full writeup.
+
 ### Migrating from 1.x
 
 **If you were on the default (agent):** delete `repmgr.failoverMode: agent` from your values

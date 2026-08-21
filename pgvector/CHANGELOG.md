@@ -70,6 +70,16 @@
   it all three nodes come up Ready and agree on the topology; `test-pgpool-failover` still
   passes with no `pgdata.diverged.*` created.
 
+### Added
+
+- **`repmgr.agent.mechanism`: an experimental native HA mechanism, alongside repmgr
+  (#287).** Inherited from pg's symlinked agent/templates. Off by default
+  (`mechanism: repmgr`); `native` drives PostgreSQL's own tools directly instead of the
+  repmgr CLI. **EXPERIMENTAL -- do not set in production**, not usable on a real cluster
+  until `#288`/`#289` land. See the
+  [pg chart README](../pg/README.md#replication-mechanics-experimental-287) for the full
+  detail.
+
 ### Migrating from 1.x
 
 **If you were on the default (agent):** delete `repmgr.failoverMode: agent` from your values
