@@ -138,6 +138,15 @@ type Observation struct {
 	// cluster with no serving primary. RegistryRead is required before acting on
 	// LocalRegistered: an unreadable table must not be mistaken for "not registered",
 	// which would refuse a legitimate promotion.
+	//
+	// This fail-open-on-unreadable design is also what keeps the #287 native mechanism's
+	// promote path working: native mode maintains no repmgr.nodes table at all (see
+	// mechanism.Native's RegisterPrimary/RegisterStandby, both no-ops), so RegisteredNodeIDs
+	// always errors under it and RegistryRead stays permanently false -- the gate at its
+	// call site in Decide is then always inert, and native promotes exactly as if this
+	// whole mechanism did not exist. Do not change this to fail closed (e.g. "unreadable
+	// counts as unregistered") without adding an equivalent topology source for native
+	// mode first (#288); that would silently make native mode unable to ever promote.
 	RegistryRead    bool
 	LocalRegistered bool
 	// Cascade enables cascading replication (#29): a standby may follow another

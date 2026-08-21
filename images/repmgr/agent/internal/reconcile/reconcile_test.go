@@ -101,7 +101,11 @@ func TestDecide(t *testing.T) {
 			Observation{HoldLease: true, Local: localStandby, RegistryRead: true, LocalRegistered: true,
 				Peers: []PeerState{registeredStandby("pg-1", 5, 5, 0x100)}}, Promote, ""},
 		// Registry unreadable: must NOT be mistaken for "not registered" -- that would
-		// refuse a legitimate promotion (e.g. the repmgr db briefly unavailable).
+		// refuse a legitimate promotion (e.g. the repmgr db briefly unavailable). This is
+		// also the exact, permanent steady-state under the #287 native mechanism, which has
+		// no repmgr.nodes at all -- RegistryRead is always false there, so this case is what
+		// keeps native mode able to promote at all. Do not weaken it without adding a
+		// native-mode topology source first (#288).
 		{"#297 registry unreadable -> promote (never block on an unknown)",
 			Observation{HoldLease: true, Local: localStandby, RegistryRead: false, LocalRegistered: false,
 				Peers: []PeerState{registeredStandby("pg-1", 5, 5, 0x100)}}, Promote, ""},
