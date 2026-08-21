@@ -84,7 +84,7 @@ func (n *Native) ensureInclude() error {
 		return fmt.Errorf("native: read %s: %w", confPath, err)
 	}
 	line := fmt.Sprintf("include '%s'", managedConfName)
-	if strings.Contains(string(b), line) {
+	if hasActiveDirective(string(b), line) {
 		return nil
 	}
 	f, err := os.OpenFile(confPath, os.O_APPEND|os.O_WRONLY, 0o600)
@@ -181,20 +181,28 @@ func (n *Native) Promote(ctx context.Context) error {
 	return nil
 }
 
-// Follow points the local standby at upstream and restarts replication.
+// Follow points the local standby at upstream. It only writes files -- applying the
+// change is the caller's job, and the two callers need different operations:
+//
+//   - main.go's act(), on reconcile.Follow: the node is already Running && InRecovery
+//     (Decide's precondition for that action), so a reload is correct and sufficient --
+//     primary_conninfo is reloadable in modern PostgreSQL, and changing it signals the
+//     running WAL receiver to restart against the new target. act() does this reload
+//     after every successful Follow.
+//   - Clone and RejoinForceRewind, which call Follow themselves on a STOPPED node (one
+//     that may have just been a primary, with no standby.signal yet): a reload cannot
+//     make a stopped/primary-state postmaster enter recovery at all, only a fresh start
+//     picks up a newly-created standby.signal. Both callers follow up with sup.Start.
 //
 // primary_conninfo is written into the managed fragment (never appended to
 // PGDATA/postgresql.conf, which would accumulate a duplicate per repoint) and
 // standby.signal is (re)created so a node that was a primary comes back as a standby.
-// Reload is not enough: primary_conninfo is reloadable in modern PostgreSQL, but a node
-// that needs standby.signal created has to restart to enter recovery at all, so the
-// supervisor restart the caller performs is what actually applies this.
 //
-// #182: the caller skips Follow entirely when pg_stat_wal_receiver already shows this node
-// streaming from the target, so this is only reached when a genuine repoint is needed.
-// That check reads replication state directly instead of pattern-matching CLI output the
-// way the repmgr mechanism must -- strictly better, and the reason native mode needs no
-// "already following" special case here.
+// #182: main.go's act() skips calling Follow at all when pg_stat_wal_receiver already
+// shows this node streaming from the target, so the reload-path case above is only
+// reached when a genuine repoint is needed. That check reads replication state directly
+// instead of pattern-matching CLI output the way the repmgr mechanism must -- strictly
+// better, and the reason native mode needs no "already following" special case here.
 func (n *Native) Follow(ctx context.Context, upstream Conn) error {
 	if n.DataDir == "" {
 		return fmt.Errorf("native: DataDir not set")
@@ -359,6 +367,21 @@ func escapeSingleQuoted(v string) string { return strings.ReplaceAll(v, "'", "''
 // unescapeSingleQuoted reverses escapeSingleQuoted, for reading a GUC value back out of a
 // single-quoted postgresql.conf line.
 func unescapeSingleQuoted(v string) string { return strings.ReplaceAll(v, "''", "'") }
+
+// hasActiveDirective reports whether directive appears as its own uncommented line in
+// conf, ignoring leading/trailing whitespace. A raw substrings.Contains would also match
+// a commented-out directive (e.g. an operator who disabled it with a leading '#', or an
+// occurrence inside an unrelated comment) and wrongly conclude it is already active --
+// ensureInclude would then skip re-adding it, silently dropping wal_log_hints/
+// hot_standby/primary_conninfo from postgresql.conf while still reporting success.
+func hasActiveDirective(conf, directive string) bool {
+	for _, line := range strings.Split(conf, "\n") {
+		if strings.TrimSpace(line) == directive {
+			return true
+		}
+	}
+	return false
+}
 
 // writeFileAtomic writes via a temp file + rename so a crash mid-write cannot leave the
 // postmaster reading a half-written config (which would fail its next start).

@@ -314,3 +314,47 @@ func TestEscapeSingleQuoted(t *testing.T) {
 		t.Errorf("escapeSingleQuoted = %q, want it''s", got)
 	}
 }
+
+func TestHasActiveDirective(t *testing.T) {
+	const directive = "include 'pg-ha-agent.conf'"
+	cases := []struct {
+		name string
+		conf string
+		want bool
+	}{
+		{"active, no indentation", "foo\n" + directive + "\nbar", true},
+		{"active, surrounded by whitespace", "foo\n  " + directive + "  \nbar", true},
+		{"commented out", "foo\n# " + directive + "\nbar", false},
+		{"substring inside an unrelated comment", "# see " + directive + " for detail\n", false},
+		{"absent", "foo\nbar", false},
+		{"empty file", "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := hasActiveDirective(c.conf, directive); got != c.want {
+				t.Errorf("hasActiveDirective(%q) = %v, want %v", c.conf, got, c.want)
+			}
+		})
+	}
+}
+
+// A commented-out include line must not be mistaken for an active one -- ensureInclude
+// would otherwise report success while wal_log_hints/hot_standby/primary_conninfo are
+// never actually included.
+func TestNativeEnsureIncludeReAddsWhenOnlyCommentedOut(t *testing.T) {
+	n, dataDir := newTestNative(t, &fakeRunner{})
+	confPath := filepath.Join(dataDir, "postgresql.conf")
+	if err := os.WriteFile(confPath, []byte("# include 'pg-ha-agent.conf'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.ensureInclude(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasActiveDirective(string(b), "include 'pg-ha-agent.conf'") {
+		t.Errorf("ensureInclude did not add an active include line when only a commented-out one existed:\n%s", b)
+	}
+}

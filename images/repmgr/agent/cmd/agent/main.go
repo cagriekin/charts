@@ -237,12 +237,16 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 	if err != nil {
 		return nil, err
 	}
+	mech, err := newMechanism(cfg, repmgrConf, pgBindir, log)
+	if err != nil {
+		return nil, err
+	}
 	return &agent{
 		cfg:    cfg,
 		log:    log,
 		dcs:    d,
 		kube:   kube,
-		mech:   newMechanism(cfg, repmgrConf, pgBindir, log),
+		mech:   mech,
 		sup:    process.NewSupervisor(process.NewChildPostmaster(postgresBin, cfg.PGDATA)),
 		prober: pg.NewProber(),
 		metr:   observe.New(),
@@ -1145,18 +1149,26 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 // either way -- the Lease, the election, fencing and routing all live in reconcile, which
 // holds only the Mechanism interface -- so this is the single place the two differ.
 //
-// The config loader has already rejected any value that is neither, so the default arm is
-// unreachable for a validated config; it stays repmgr rather than panicking so a future
-// value added to the enum without a case here degrades to today's behaviour instead of
-// crash-looping every pod.
-func newMechanism(cfg *config.Config, repmgrConf, pgBindir string, log *slog.Logger) mechanism.Mechanism {
+// config.Load already rejects any value that is neither repmgr nor native at boot, so the
+// error return here is unreachable for a config that went through Load -- but this fails
+// loudly rather than silently defaulting to repmgr, matching the fail-fast posture the rest
+// of this codebase takes on required config (no ||/?? fallbacks). Without that, a future
+// mechanism value added to the enum without a case here would silently run repmgr with only
+// this function's own log line as a hint, rather than surfacing the drift.
+//
+// "" (distinct from an unrecognised value) is accepted alongside MechanismRepmgr: it is
+// what an older, pre-#287 image or a config built without going through Load's own
+// empty->repmgr normalization looks like, and must keep behaving exactly as it always has.
+func newMechanism(cfg *config.Config, repmgrConf, pgBindir string, log *slog.Logger) (mechanism.Mechanism, error) {
 	switch cfg.Mechanism {
 	case config.MechanismNative:
 		log.Warn("using the EXPERIMENTAL native mechanism: topology still comes from repmgr.nodes (#288) and nothing owns replication slots (#289), so this is not yet usable for a real cluster",
 			"mechanism", cfg.Mechanism)
-		return mechanism.NewNative(cfg.PGDATA, pgBindir, cfg.RepmgrPassword)
+		return mechanism.NewNative(cfg.PGDATA, pgBindir, cfg.RepmgrPassword), nil
+	case config.MechanismRepmgr, "":
+		return mechanism.NewRepmgr(repmgrConf, cfg.PGDATA, cfg.RepmgrPassword), nil
 	default:
-		return mechanism.NewRepmgr(repmgrConf, cfg.PGDATA, cfg.RepmgrPassword)
+		return nil, fmt.Errorf("newMechanism: unrecognised MECHANISM %q (want %s|%s)", cfg.Mechanism, config.MechanismRepmgr, config.MechanismNative)
 	}
 }
 

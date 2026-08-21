@@ -212,22 +212,36 @@ func newFollowTestAgentWithPM(t *testing.T, ex *scriptedExec, pm *fakePostmaster
 // #287: the factory must select the mechanism from config, and an absent value must stay
 // repmgr so an existing release and an older env-less image are unaffected. Asserted on the
 // concrete type because picking the wrong mechanics is invisible until a promote or a clone
-// actually runs -- by which point it has already touched a data directory.
+// actually runs -- by which point it has already touched a data directory. An unrecognised
+// value must fail loudly, not silently fall back to repmgr (fail-fast, matching the rest of
+// this codebase's required-config posture) -- config.Load already rejects it at boot, so
+// this is a defense against the enum and this factory drifting apart in the future.
 func TestNewMechanismSelectsFromConfig(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	for _, tc := range []struct {
-		name string
-		set  string
-		want string
+		name    string
+		set     string
+		want    string
+		wantErr bool
 	}{
-		{"absent -> repmgr (unchanged default)", "", "*mechanism.Repmgr"},
-		{"explicit repmgr", config.MechanismRepmgr, "*mechanism.Repmgr"},
-		{"native", config.MechanismNative, "*mechanism.Native"},
+		{"absent -> repmgr (unchanged default)", "", "*mechanism.Repmgr", false},
+		{"explicit repmgr", config.MechanismRepmgr, "*mechanism.Repmgr", false},
+		{"native", config.MechanismNative, "*mechanism.Native", false},
+		{"unrecognised value fails loudly", "patroni", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := &config.Config{PGDATA: t.TempDir(), Mechanism: tc.set}
-			got := fmt.Sprintf("%T", newMechanism(cfg, "/etc/repmgr/repmgr.conf", "/usr/lib/postgresql/18/bin", log))
-			if got != tc.want {
+			m, err := newMechanism(cfg, "/etc/repmgr/repmgr.conf", "/usr/lib/postgresql/18/bin", log)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("mechanism %q: expected an error, got %T", tc.set, m)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("mechanism %q: unexpected error: %v", tc.set, err)
+			}
+			if got := fmt.Sprintf("%T", m); got != tc.want {
 				t.Errorf("mechanism %q selected %s, want %s", tc.set, got, tc.want)
 			}
 		})
