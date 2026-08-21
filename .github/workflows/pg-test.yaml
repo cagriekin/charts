@@ -230,6 +230,7 @@ jobs:
           - pgpool-failover
           - config-failover
           - cascading-replication
+          - sync-replication-slots
           - agent-rolling
           - backup-restore
           - backup-concurrent
