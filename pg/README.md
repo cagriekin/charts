@@ -203,9 +203,9 @@ When `repmgr.enabled` is true, `additionalCommands` automatically discover the c
 
 ### Logical Replication (#308)
 
-Set `postgresql.walLevel: logical` for a logical-replication subscriber (`CREATE SUBSCRIPTION`, Debezium, or any other decoder on a replication slot). `logical` is a strict superset of `replica` and is fully compatible with `pgbackrest.enabled`/`archive_mode=on`. `wal_level` is a postmaster parameter — the change rolls the pods via the existing configmap-checksum annotation, the same way any other `postgresql.configuration` change does.
+Set `postgresql.walLevel: logical` for a logical-replication subscriber (`CREATE SUBSCRIPTION`, Debezium, or any other decoder on a replication slot). `logical` is a strict superset of `replica` and works whether or not `pgbackrest.enabled`/`archive_mode=on` — the two are unrelated concerns. `wal_level` is a postmaster parameter — the change rolls the pods via the existing configmap-checksum annotation, the same way any other `postgresql.configuration` change does.
 
-**This is the only place to set `wal_level`.** `pgbackrest.enabled` renders its own `pgbackrest-archive.conf`, which sorts after `custom.conf` under `include_dir` and would otherwise silently win over a `postgresql.configuration.wal_level` you set yourself — so the chart rejects `wal_level` in `postgresql.configuration` at render time and tells you to set `postgresql.walLevel` instead, regardless of whether pgBackRest is on.
+**This is the only place to set `wal_level`.** `pgbackrest.enabled` used to render a hardcoded `wal_level = replica` into its own `pgbackrest-archive.conf`, which sorts after `custom.conf` under `include_dir` and would silently win over a `postgresql.configuration.wal_level` you set yourself — that coupling is gone (`postgresql.walLevel` now has its own render block, independent of `pgbackrest.enabled`), but the chart still rejects `wal_level` in `postgresql.configuration` at render time and tells you to set `postgresql.walLevel` instead, so there is exactly one source of truth regardless of pgBackRest's state.
 
 A logical subscriber must connect to the **write Service** (`<fullname>:5432`), not Pgpool — Pgpool's query routing is built for physical replicas, not for holding a replication slot's connection open.
 

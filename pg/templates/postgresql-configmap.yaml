@@ -1,4 +1,4 @@
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled (and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots) }}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled (ne (.Values.postgresql.walLevel | default "replica") "replica") (and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots) }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -49,24 +49,34 @@ data:
   # parameter so it only takes effect after a postgres restart, which the
   # configmap checksum annotation on the StatefulSet triggers.
   #
-  # wal_level (#308): sourced from postgresql.walLevel, not hardcoded, so a logical
-  # subscriber can be supported without losing to this file -- it sorts after
-  # custom.conf under conf.d's include_dir (same ordering the shared_preload_libraries
-  # merge above depends on), so a bare `replica` here would silently override a
-  # postgresql.configuration.wal_level set there whenever pgbackrest is on. The
-  # pg.validateWalLevel guard rejects setting wal_level in postgresql.configuration
-  # directly, so this is the one place it can come from. `logical` is a superset of
-  # `replica` and is fully compatible with archive_mode=on.
-  #
   # max_wal_senders is deliberately NOT set here: it used to be hardcoded to the same
   # value images/repmgr/entrypoint.sh already sets at initdb, which meant this file
   # clobbered any larger postgresql.configuration.max_wal_senders for no reason
   # (nothing else needs it re-asserted). Removed; the value now simply flows from
   # postgresql.configuration (via custom.conf) or the initdb default, uncontested.
+  #
+  # wal_level is intentionally NOT set here (#308) -- it must work whether or not
+  # pgBackRest is even enabled, so it has its own render block below, independent of
+  # this one.
   pgbackrest-archive.conf: |
     archive_mode = on
     archive_command = 'pgbackrest --stanza={{ .Values.pgbackrest.stanza | toString | replace "'" "''" }} archive-push %p'
-    wal_level = {{ .Values.postgresql.walLevel | default "replica" }}
+{{- end }}
+{{- if ne (.Values.postgresql.walLevel | default "replica") "replica" }}
+  # wal_level (#308): sourced from postgresql.walLevel, the one authoritative source
+  # (the pg.validateWalLevel guard rejects setting wal_level in
+  # postgresql.configuration directly). Deliberately independent of
+  # pgbackrest.enabled -- a logical subscriber must work whether or not backups are
+  # configured; wal_level and archive_mode are unrelated concerns that a prior
+  # revision of this file wrongly coupled. Only rendered when non-default, so the
+  # default render (and this ConfigMap's existence at all, for installs that touch
+  # nothing else here) stays byte-stable -- images/repmgr/entrypoint.sh's own
+  # initdb-time default already sets this GUC to the same default, so there is
+  # nothing to add when the value is left unchanged. This file sorts after custom.conf and
+  # pgbackrest-archive.conf under conf.d's include_dir either way, so it would win
+  # even if it were unconditional.
+  wal-level.conf: |
+    wal_level = {{ .Values.postgresql.walLevel }}
 {{- end }}
 {{- if .Values.postgresql.tls.enabled }}
   # Server TLS (#110). The cert Secret is mounted at /etc/postgresql/tls; ssl_ca_file

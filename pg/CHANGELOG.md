@@ -9,7 +9,9 @@
   etc.) to survive a primary failover:
 
   - **`postgresql.walLevel`** (enum `replica`|`logical`, default `replica`) is now the
-    one authoritative source for `wal_level`. Previously, `pgbackrest-archive.conf`
+    one authoritative source for `wal_level`, rendered independent of
+    `pgbackrest.enabled` (its own render block, not `pgbackrest-archive.conf`) so it
+    works whether or not backups are configured. Previously, `pgbackrest-archive.conf`
     hardcoded `wal_level = replica` whenever `pgbackrest.enabled`, silently overriding
     `postgresql.configuration.wal_level` because `include_dir` loads conf.d files in
     filename-sort order and that file sorted last. Setting

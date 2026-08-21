@@ -2098,16 +2098,30 @@ pgbackrest_pgconf=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/value
 assert_contains "pgbackrest: postgresql configmap renders" "${pgbackrest_pgconf}" "test-pg-postgresql-config"
 assert_contains "pgbackrest: archive_mode = on" "${pgbackrest_pgconf}" "archive_mode = on"
 assert_contains "pgbackrest: archive_command uses stanza" "${pgbackrest_pgconf}" "archive_command = 'pgbackrest --stanza=db archive-push %p'"
-assert_contains "pgbackrest: wal_level replica" "${pgbackrest_pgconf}" "wal_level = replica"
+assert_not_contains "pgbackrest: wal_level not set here at default (#308)" "${pgbackrest_pgconf}" "wal_level ="
 assert_not_contains "pgbackrest: no hardcoded max_wal_senders (#308)" "${pgbackrest_pgconf}" "max_wal_senders = 10"
 
 # ======================================================================
-# #308: postgresql.walLevel is the one authoritative source for wal_level.
+# #308: postgresql.walLevel is the one authoritative source for wal_level, and it
+# must work regardless of pgbackrest.enabled -- wal_level and archive_mode are
+# unrelated concerns. (A prior revision of this PR coupled them: wal_level only
+# rendered inside the pgbackrest.enabled block, so postgresql.walLevel: logical was
+# a silent no-op with pgbackrest off. Regression-tested explicitly below.)
 # ======================================================================
 walevel_logical=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
   --set postgresql.walLevel=logical --show-only templates/postgresql-configmap.yaml 2>&1)
-assert_contains "#308: walLevel=logical renders wal_level = logical" "${walevel_logical}" "wal_level = logical"
+assert_contains "#308: walLevel=logical renders wal_level = logical (pgbackrest on)" "${walevel_logical}" "wal_level = logical"
 assert_not_contains "#308: walLevel=logical no longer shows replica" "${walevel_logical}" "wal_level = replica"
+
+walevel_logical_no_pgbackrest=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.walLevel=logical --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#308: walLevel=logical renders wal_level = logical (pgbackrest OFF)" "${walevel_logical_no_pgbackrest}" "wal_level = logical"
+
+# Byte-stable: an install that touches nothing #308-related must not gain a new
+# ConfigMap just because postgresql.walLevel defaults to "replica" in values.yaml.
+walevel_default_no_cm_rc=0
+helm template test-pg "${CHART_DIR}" --show-only templates/postgresql-configmap.yaml >/dev/null 2>&1 || walevel_default_no_cm_rc=$?
+assert_gt "#308: default walLevel renders no configmap at all (byte-stable)" "${walevel_default_no_cm_rc}" "0"
 
 # Custom max_wal_senders must survive now that pgbackrest-archive.conf no longer
 # re-asserts its own value.
