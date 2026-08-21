@@ -123,11 +123,14 @@ func splitNonEmpty(s string) []string {
 }
 
 type agent struct {
-	cfg    *config.Config
-	log    *slog.Logger
-	dcs    dcs.DCS
-	kube   *k8s.Client
-	mech   *mechanism.Repmgr
+	cfg  *config.Config
+	log  *slog.Logger
+	dcs  dcs.DCS
+	kube *k8s.Client
+	// The INTERFACE, not a concrete implementation: this is the seam that lets the mechanics
+	// be swapped without touching policy (#287). Typed as *Repmgr it compiled, but it also
+	// meant the agent was coupled to repmgr in the one place that is supposed not to be.
+	mech   mechanism.Mechanism
 	sup    *process.Supervisor
 	prober *pg.Prober
 	metr   *observe.Metrics
@@ -239,7 +242,7 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 		log:    log,
 		dcs:    d,
 		kube:   kube,
-		mech:   mechanism.NewRepmgr(repmgrConf, cfg.PGDATA, cfg.RepmgrPassword),
+		mech:   newMechanism(cfg, repmgrConf, pgBindir, log),
 		sup:    process.NewSupervisor(process.NewChildPostmaster(postgresBin, cfg.PGDATA)),
 		prober: pg.NewProber(),
 		metr:   observe.New(),
@@ -702,7 +705,11 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			a.followUpstream = dec.Target
 			return nil
 		}
-		if err := a.mech.Follow(ctx, up); err != nil {
+		// Carry both the address and the node id: repmgr uses the id, a native mechanism
+		// uses the host to write primary_conninfo (#287).
+		upConn := a.peerMechConn(dec.Target)
+		upConn.NodeID = up
+		if err := a.mech.Follow(ctx, upConn); err != nil {
 			// #297: this node has no row in its own metadata copy -- a freshly-cloned standby
 			// whose upstream changed before it registered. It can never obtain the row (that
 			// needs replication, which is what it is trying to establish), so it would retry
@@ -1121,6 +1128,25 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 		a.dropRestoreRecord("the data directory was re-cloned from " + target)
 	}
 	return a.sup.Start(ctx)
+}
+
+// newMechanism selects the replication mechanics from config (#287). Policy is identical
+// either way -- the Lease, the election, fencing and routing all live in reconcile, which
+// holds only the Mechanism interface -- so this is the single place the two differ.
+//
+// The config loader has already rejected any value that is neither, so the default arm is
+// unreachable for a validated config; it stays repmgr rather than panicking so a future
+// value added to the enum without a case here degrades to today's behaviour instead of
+// crash-looping every pod.
+func newMechanism(cfg *config.Config, repmgrConf, pgBindir string, log *slog.Logger) mechanism.Mechanism {
+	switch cfg.Mechanism {
+	case config.MechanismNative:
+		log.Warn("using the EXPERIMENTAL native mechanism: topology still comes from repmgr.nodes (#288) and nothing owns replication slots (#289), so this is not yet usable for a real cluster",
+			"mechanism", cfg.Mechanism)
+		return mechanism.NewNative(cfg.PGDATA, pgBindir, cfg.RepmgrPassword)
+	default:
+		return mechanism.NewRepmgr(repmgrConf, cfg.PGDATA, cfg.RepmgrPassword)
+	}
 }
 
 func (a *agent) selfConn() pg.ConnInfo {

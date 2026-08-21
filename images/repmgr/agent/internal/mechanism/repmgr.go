@@ -83,7 +83,11 @@ func (r *Repmgr) Promote(ctx context.Context) error {
 	return nil
 }
 
-func (r *Repmgr) Follow(ctx context.Context, upstreamNodeID int) error {
+func (r *Repmgr) Follow(ctx context.Context, upstream Conn) error {
+	// repmgr addresses the upstream by node_id and resolves its conninfo from repmgr.nodes;
+	// upstream.Host is unused here (see Conn.NodeID). Its connection flags would describe
+	// the LOCAL node, not the upstream -- see #297 before adding any.
+	upstreamNodeID := upstream.NodeID
 	out, err := r.run(ctx, "standby", "follow", "--upstream-node-id="+strconv.Itoa(upstreamNodeID))
 	if err != nil {
 		// #182: a standby already correctly following this upstream (same timeline,

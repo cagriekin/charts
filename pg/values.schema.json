@@ -67,6 +67,10 @@
         "agent": {
           "type": "object",
           "properties": {
+            "mechanism": {
+              "enum": ["repmgr", "native"],
+              "description": "EXPERIMENTAL (#287). Replication mechanics: repmgr (default, the repmgr CLI) or native (pg_ctl/pg_basebackup/pg_rewind). Policy is identical either way. native is not usable until #288 (topology) and #289 (replication slots) land."
+            },
             "dcs": {
               "type": "object",
               "properties": {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strconv"
@@ -206,6 +207,31 @@ func newFollowTestAgentWithPM(t *testing.T, ex *scriptedExec, pm *fakePostmaster
 // #182: a standby already streaming from the lease holder must NOT re-run repmgr
 // standby follow (which errors "slot already active" and, unlatched, repeats every
 // tick). The act path skips the command and latches followUpstream.
+// #287: the factory must select the mechanism from config, and an absent value must stay
+// repmgr so an existing release and an older env-less image are unaffected. Asserted on the
+// concrete type because picking the wrong mechanics is invisible until a promote or a clone
+// actually runs -- by which point it has already touched a data directory.
+func TestNewMechanismSelectsFromConfig(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, tc := range []struct {
+		name string
+		set  string
+		want string
+	}{
+		{"absent -> repmgr (unchanged default)", "", "*mechanism.Repmgr"},
+		{"explicit repmgr", config.MechanismRepmgr, "*mechanism.Repmgr"},
+		{"native", config.MechanismNative, "*mechanism.Native"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{PGDATA: t.TempDir(), Mechanism: tc.set}
+			got := fmt.Sprintf("%T", newMechanism(cfg, "/etc/repmgr/repmgr.conf", "/usr/lib/postgresql/18/bin", log))
+			if got != tc.want {
+				t.Errorf("mechanism %q selected %s, want %s", tc.set, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestActFollowSkipsWhenAlreadyStreaming(t *testing.T) {
 	ex := &scriptedExec{walRcv: "pg-0.h|streaming"}
 	a := newFollowTestAgent(t, ex)

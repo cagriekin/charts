@@ -61,7 +61,7 @@ func TestCLICommands(t *testing.T) {
 
 	t.Run("follow", func(t *testing.T) {
 		fr := &fakeRunner{}
-		if err := newTestRepmgr(fr).Follow(ctx, 1001); err != nil {
+		if err := newTestRepmgr(fr).Follow(ctx, Conn{NodeID: 1001}); err != nil {
 			t.Fatal(err)
 		}
 		if got := fr.lastArgs(); !strings.Contains(got, "standby follow --upstream-node-id=1001") {
@@ -77,7 +77,7 @@ func TestCLICommands(t *testing.T) {
 			"DETAIL: local node lsn is 0/3000000, follow target lsn is 0/3000000\n" +
 			"ERROR: slot \"repmgr_slot_1000\" already exists as an active slot\n" +
 			"NOTICE: STANDBY FOLLOW failed"}
-		if err := newTestRepmgr(fr).Follow(ctx, 1000); err != nil {
+		if err := newTestRepmgr(fr).Follow(ctx, Conn{NodeID: 1000}); err != nil {
 			t.Fatalf("an already-following standby must be a no-op, got %v", err)
 		}
 	})
@@ -88,7 +88,7 @@ func TestCLICommands(t *testing.T) {
 		// distinguishable so the agent re-clones instead of retrying forever.
 		fr := &fakeRunner{failOn: "standby follow",
 			failOut: "ERROR: unable to retrieve record for local node 1002"}
-		err := newTestRepmgr(fr).Follow(ctx, 1001)
+		err := newTestRepmgr(fr).Follow(ctx, Conn{NodeID: 1001})
 		if !errors.Is(err, ErrLocalRecordMissing) {
 			t.Errorf("want ErrLocalRecordMissing so the caller re-clones, got %v", err)
 		}
@@ -100,7 +100,7 @@ func TestCLICommands(t *testing.T) {
 		// is the mistake #286 made and reverted. The two must never be conflated.
 		fr := &fakeRunner{failOn: "standby follow",
 			failOut: "ERROR: unable to find record for intended upstream node 1002"}
-		err := newTestRepmgr(fr).Follow(ctx, 1002)
+		err := newTestRepmgr(fr).Follow(ctx, Conn{NodeID: 1002})
 		if err == nil {
 			t.Fatal("a missing upstream record must still surface as an error")
 		}
@@ -113,7 +113,7 @@ func TestCLICommands(t *testing.T) {
 		// A real failure (slot active but NOT the benign already-following case) must
 		// still surface so it is not silently swallowed.
 		fr := &fakeRunner{failOn: "standby follow", failOut: "ERROR: connection to upstream node failed"}
-		if err := newTestRepmgr(fr).Follow(ctx, 1000); err == nil {
+		if err := newTestRepmgr(fr).Follow(ctx, Conn{NodeID: 1000}); err == nil {
 			t.Fatal("a genuine follow failure must surface as an error")
 		}
 	})
@@ -123,7 +123,7 @@ func TestCLICommands(t *testing.T) {
 		// not-ahead may mean real work is pending (e.g. a stale slot on a divergent
 		// upstream), so it must surface, not be treated as already-following.
 		fr := &fakeRunner{failOn: "standby follow", failOut: "ERROR: slot \"repmgr_slot_1000\" already exists as an active slot"}
-		if err := newTestRepmgr(fr).Follow(ctx, 1000); err == nil {
+		if err := newTestRepmgr(fr).Follow(ctx, Conn{NodeID: 1000}); err == nil {
 			t.Fatal("slot-active alone (no same-timeline/not-ahead) must surface as an error")
 		}
 	})

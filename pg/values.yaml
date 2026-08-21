@@ -343,6 +343,22 @@ repmgr:
     # falls back to the primary otherwise, and re-homes on failover -- a broken or
     # promoted upstream never strands a standby. Most useful at higher replicaCount.
     cascadingReplication: false
+
+    # EXPERIMENTAL -- do not set in production yet (#287).
+    #
+    # Which replication mechanics the agent drives. Policy is identical either way: the
+    # Lease is still the sole authority for who is primary, and the timeline/LSN election,
+    # fencing and Service routing are unchanged. Only the mechanics differ.
+    #
+    #   repmgr (default) -- drive the repmgr CLI (standby clone/follow/promote, node rejoin)
+    #   native           -- drive PostgreSQL directly: pg_ctl promote, pg_basebackup,
+    #                       pg_rewind, primary_conninfo + standby.signal
+    #
+    # `native` is NOT usable on its own yet. It makes the mechanism selectable, but topology
+    # still comes from repmgr.nodes (#288) and nothing owns replication slots (#289) -- so a
+    # standby has no upstream to choose and the primary can recycle WAL a standby still
+    # needs. Leave it at repmgr until #294 marks native supported and flips the default.
+    mechanism: repmgr
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
     # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane
     # outage no longer self-demotes the primary (only an etcd quorum loss does);
