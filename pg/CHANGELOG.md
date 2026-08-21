@@ -25,22 +25,44 @@
   installs to the standard multiarch path (e.g. `libsodium.so.23`, needed by
   `pgsodium`/`supabase_vault`), never under `/usr/lib/postgresql/<major>/lib` where the
   existing extension-file copy reads from -- confirmed live, and true regardless of how
-  broad that copy step's glob is. `extraLibs` is an explicit list of exact paths to
-  additionally copy into `/ext-lib`; the `postgresql` container now also gets
-  `LD_LIBRARY_PATH=/usr/lib/postgresql/<major>/lib` automatically whenever `extraLibs`
-  is non-empty (not just `extensions.enabled` -- `ext-lib` is also populated by the
-  plain glob copy regardless of `extraLibs`, and widening the search path
-  unconditionally would let a same-named file from one image's build shadow a system
-  library for the other image's process, #302), since the copied file has no
-  `RUNPATH`/`RPATH` and is otherwise never found by the dynamic linker (confirmed live
-  end-to-end: fails to load without `LD_LIBRARY_PATH`, loads cleanly with it).
-  Deliberately explicit, not an automatic `ldd`-and-copy-everything walk:
+  broad that copy step's glob is. `extraLibs` is an explicit list of exact absolute FILE
+  paths (no trailing `/`) to additionally copy into a **new, dedicated** `ext-extra-lib`
+  volume -- deliberately kept separate from `ext-lib`, since `ext-lib` is also populated
+  by the unvalidated `*.so*` glob copy (either image, #302) and pointing the search path
+  there would extend the same ABI-shadowing hazard the denylist below exists to prevent
+  to every file that glob happens to sweep in. The `postgresql` container gets
+  `LD_LIBRARY_PATH=/usr/lib/postgresql/<major>/extra-lib` automatically whenever
+  `extraLibs` is non-empty (not just `extensions.enabled`, so a release that doesn't use
+  this feature gets no search-path change and no extra volume at all), since the copied
+  file has no `RUNPATH`/`RPATH` and is otherwise never found by the dynamic linker
+  (confirmed live end-to-end: fails to load without `LD_LIBRARY_PATH`, loads cleanly
+  with it). Deliberately explicit, not an automatic `ldd`-and-copy-everything walk:
   `copy-base-ext`/`copy-ext` can be different image builds, and auto-copying a resolved
-  `libc`/`libstdc++`/etc. between them risks a
-  runtime ABI mismatch -- core C-runtime libraries are refused at render time
+  dependency's transitive closure between them risks a runtime ABI mismatch -- core
+  runtime libraries the server itself links (`libc`, `libm`, `libpthread`, `libdl`,
+  `librt`, `libresolv`, `libnsl`, `libgcc_s`, `libstdc++`, `libssl`, `libcrypto`,
+  `libcrypt`, `libz`, the `libicu` family, `ld-linux`) are refused at render time
   (`pg.validateExtraLibs`). Requires `packages` to be non-empty. See the README
   ["Copying a package's own shared-library
   dependencies"](README.md#copying-a-packages-own-shared-library-dependencies-309).
+- **`aptSources[].keyUrl` allows `&`; `aptLine` allows `,` and fails on a leftover
+  `{`/`}` (review).** `&` in `keyUrl` is needed for a standard keyserver lookup URL
+  (`?op=get&search=...`) and is inert inside the double-quoted `curl` argument; `,` in
+  `aptLine` is needed for the standard multi-arch option syntax (`[arch=amd64,arm64]`)
+  and is inert inside the double-quoted `echo`. A `{`/`}` surviving `{major}`
+  substitution in `aptLine` now fails the render instead of silently writing a
+  literal, nonsensical placeholder (e.g. a typo'd `{MAJOR}`) into `sources.list.d` that
+  would otherwise only fail later, at apply time, inside `apt-get update`.
+- **`aptSources`' `curl` is pinned to `https` (review, hardening).** `--proto '=https'
+  --proto-redir '=https'` on the key download, so a same-origin `https` -> `http`
+  redirect can no longer fetch the key in plaintext. `keyUrl`'s own allowlist already
+  forced the URL's own scheme to `https://`, but did not prevent a redirect.
+- **`LD_LIBRARY_PATH` is now a chart-reserved `postgresql.extraEnv` name.** Consistent
+  with every other chart-set env var (`pg.validateExtraPassthrough` reserves these
+  unconditionally, even for a currently-disabled feature, so a passthrough that works
+  today can't start silently shadowing a chart value after a later upgrade enables it).
+  A `postgresql.extraEnv` entry named `LD_LIBRARY_PATH` now fails the render regardless
+  of `extensions.extraLibs`.
 
 ### Fixed
 

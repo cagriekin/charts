@@ -14,12 +14,17 @@ the full detail.
   `pgchart-` prefix so they can't collide with a source the image already owns. Requires
   `packages` to be non-empty. See the [pg chart README](../pg/README.md#installing-packages-from-a-non-pgdg-apt-source-310).
 - **`postgresql.extensions.extraLibs` + automatic `LD_LIBRARY_PATH` (#309).** Copies an
-  exact, explicit path (e.g. `libsodium.so.23`) into `/ext-lib` for a package's own
-  shared-library dependency Debian installs outside the Postgres extension dir; the
-  `postgresql` container gets `LD_LIBRARY_PATH` automatically whenever `extraLibs` is
-  non-empty (not just `extensions.enabled`, to avoid widening the search path for
-  releases that don't need it) so the copied file is actually found. Requires
-  `packages` to be non-empty; core C-runtime libraries are refused. See the
+  exact, explicit path (e.g. `libsodium.so.23`) into a new, dedicated `ext-extra-lib`
+  volume -- kept separate from `ext-lib`, which is also populated by the unvalidated
+  `*.so*` glob copy -- for a package's own shared-library dependency Debian installs
+  outside the Postgres extension dir. The `postgresql` container gets
+  `LD_LIBRARY_PATH=/usr/lib/postgresql/<major>/extra-lib` automatically whenever
+  `extraLibs` is non-empty (not just `extensions.enabled`, to avoid widening the
+  search path for releases that don't need it) so the copied file is actually found.
+  Requires `packages` to be non-empty; core runtime libraries the server itself links
+  are refused. `aptSources`' `curl` is now pinned to `https` (`--proto`/`--proto-redir`)
+  and `keyUrl`/`aptLine` allow `&`/`,` respectively. `LD_LIBRARY_PATH` is now a
+  chart-reserved `postgresql.extraEnv` name. See the
   [pg chart README](../pg/README.md#copying-a-packages-own-shared-library-dependencies-309).
 
 ### Fixed

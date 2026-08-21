@@ -113,7 +113,7 @@ tests:
           emptyDir: {}
     asserts:
       - failedTemplate:
-          errorMessage: 'postgresql.extraVolumes[0]: "data" is a chart-managed volume name and may not be reused (reserved: data, postgresql-config, postgresql-tls, ext-lib, ext-share, repmgr-config, etcd-tls, pg-run, pgbackrest-config, service-updater-script). With persistence enabled a "data" volume is silently discarded in favour of the volumeClaimTemplate; with persistence disabled the duplicate name is rejected by the API server. Pick a distinct name.'
+          errorMessage: 'postgresql.extraVolumes[0]: "data" is a chart-managed volume name and may not be reused (reserved: data, postgresql-config, postgresql-tls, ext-lib, ext-share, ext-extra-lib, repmgr-config, etcd-tls, pg-run, pgbackrest-config, service-updater-script). With persistence enabled a "data" volume is silently discarded in favour of the volumeClaimTemplate; with persistence disabled the duplicate name is rejected by the API server. Pick a distinct name.'
 
   - it: extraVolumes colliding with an internal volume (repmgr-config) fails render
     templates:
@@ -352,7 +352,7 @@ tests:
     asserts:
       - matchRegex:
           path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")].command[2]
-          pattern: "curl -fsSL \"https://repo\\.pigsty\\.io/key\" \\| gpg --dearmor -o /usr/share/keyrings/pgchart-pigsty-keyring\\.gpg"
+          pattern: "curl -fsSL --proto '=https' --proto-redir '=https' \"https://repo\\.pigsty\\.io/key\" \\| gpg --dearmor -o /usr/share/keyrings/pgchart-pigsty-keyring\\.gpg"
 
   # --- Scenario 16: extraLibs guards + LD_LIBRARY_PATH (#309) ---
   - it: extraLibs without packages fails render
@@ -405,7 +405,7 @@ tests:
   # copy-base-ext and copy-ext can be different image builds -- auto-shadowing the
   # running container's own C runtime with a build from the other image is an ABI
   # hazard, not a convenience, so core libraries are refused outright.
-  - it: a core C-runtime library in extraLibs is refused
+  - it: a core runtime library in extraLibs is refused
     templates:
       - templates/statefulset.yaml
     set:
@@ -416,9 +416,73 @@ tests:
         - "/usr/lib/x86_64-linux-gnu/libc.so.6"
     asserts:
       - failedTemplate:
-          errorPattern: "refusing .* core C-runtime library"
+          errorPattern: "refusing .* core runtime library"
 
-  - it: a valid extraLibs entry copies into ext-lib and sets LD_LIBRARY_PATH
+  # Denylist widened past the original libc-family set (review): the postgres server
+  # itself links libssl/libcrypto too, so shadowing either is just as dangerous.
+  - it: libssl in extraLibs is refused
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - "/usr/lib/x86_64-linux-gnu/libssl.so.3"
+    asserts:
+      - failedTemplate:
+          errorPattern: "refusing .* core runtime library"
+
+  # "libcrypt" (a real, distinct core library, not "libcrypto") must still be caught by
+  # the boundary-aware denylist regex, and an unrelated library that merely starts
+  # with the same letters ("libz" vs "libzstd") must NOT be false-positived.
+  - it: libcrypt (distinct from libcrypto) in extraLibs is refused
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - "/usr/lib/x86_64-linux-gnu/libcrypt.so.1"
+    asserts:
+      - failedTemplate:
+          errorPattern: "refusing .* core runtime library"
+
+  - it: a library merely sharing a denylisted prefix (libzstd, not libz) is allowed
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.majorVersion: "18"
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - /usr/lib/x86_64-linux-gnu/libzstd.so.1
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")].command[2]
+          pattern: "cp /usr/lib/x86_64-linux-gnu/libzstd\\.so\\.1 /ext-extra-lib/"
+
+  # A trailing / is a directory, not a file -- cp would fail at init time and
+  # crashloop the pod instead of failing fast at render time (review).
+  - it: a trailing-slash extraLibs entry (a directory) fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - "/usr/lib/x86_64-linux-gnu/"
+    asserts:
+      - failedTemplate: {}
+
+  # extraLibs lands in a volume SEPARATE from ext-lib (review, #302): ext-lib is also
+  # populated by the unvalidated *.so* glob copy, so LD_LIBRARY_PATH pointing there
+  # instead would extend the ABI-shadowing hazard this denylist exists to prevent to
+  # every file that glob happens to sweep in.
+  - it: a valid extraLibs entry copies into ext-extra-lib and sets LD_LIBRARY_PATH
     templates:
       - templates/statefulset.yaml
     set:
@@ -431,15 +495,27 @@ tests:
     asserts:
       - matchRegex:
           path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")].command[2]
-          pattern: "cp /usr/lib/x86_64-linux-gnu/libsodium\\.so\\.23 /ext-lib/"
+          pattern: "cp /usr/lib/x86_64-linux-gnu/libsodium\\.so\\.23 /ext-extra-lib/"
       - matchRegex:
           path: spec.template.spec.initContainers[?(@.name=="copy-ext")].command[2]
-          pattern: "cp -n /usr/lib/x86_64-linux-gnu/libsodium\\.so\\.23 /ext-lib/"
+          pattern: "cp -n /usr/lib/x86_64-linux-gnu/libsodium\\.so\\.23 /ext-extra-lib/"
+      - contains:
+          path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")].volumeMounts
+          content:
+            name: ext-extra-lib
+            mountPath: /ext-extra-lib
+          any: true
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].volumeMounts
+          content:
+            name: ext-extra-lib
+            mountPath: /usr/lib/postgresql/18/extra-lib
+          any: true
       - contains:
           path: spec.template.spec.containers[?(@.name=="postgresql")].env
           content:
             name: LD_LIBRARY_PATH
-            value: /usr/lib/postgresql/18/lib
+            value: /usr/lib/postgresql/18/extra-lib
           any: true
 
   - it: LD_LIBRARY_PATH is not set when extensions are disabled

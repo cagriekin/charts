@@ -400,7 +400,14 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        fail, since that's always a typo, never intentional. Pointless (and therefore
        rejected) without postgresql.extensions.packages: aptSources' only consumer is
        the apt-get install step gated on packages being non-empty -- see
-       pg.extensionInstallCommand below. */ -}}
+       pg.extensionInstallCommand below. keyUrl allows & (review): it's rendered
+       double-quoted in the curl argument (pg.extensionInstallCommand), where & is
+       inert, and a standard keyserver lookup URL (?op=get&search=...) needs it. A
+       leftover { or } in aptLine after {major} substitution fails the render (review):
+       the only recognized placeholder is the literal {major} token, so anything else
+       braced is a typo (e.g. {MAJOR}) that would otherwise render a literal,
+       nonsensical {...} into sources.list.d and only fail later, at apply time, inside
+       apt-get update. */ -}}
 {{- define "pg.validateExtensionAptSources" -}}
 {{- $srcs := .Values.postgresql.extensions.aptSources | default list -}}
 {{- if $srcs -}}
@@ -410,8 +417,9 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- if not (.Values.postgresql.extensions.packages | default list) -}}
     {{- fail "postgresql.extensions.aptSources is set but postgresql.extensions.packages is empty -- aptSources only exists to make packages from a non-PGDG source installable, so it has nothing to do without at least one package that needs it." -}}
   {{- end -}}
+  {{- $pgMajor := .Values.postgresql.majorVersion | toString -}}
   {{- $nameRe := "^[A-Za-z0-9_-]+$" -}}
-  {{- $keyUrlRe := "^https://[A-Za-z0-9._~:/?#%=-]+$" -}}
+  {{- $keyUrlRe := "^https://[A-Za-z0-9._~:/?#%&=-]+$" -}}
   {{- $aptLineRe := "^[A-Za-z0-9 ./:=,_+~%\\[\\]{}@-]+$" -}}
   {{- $seen := dict -}}
   {{- range $s := $srcs -}}
@@ -425,11 +433,15 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
     {{- $seen = set $seen $name true -}}
     {{- $keyUrl := $s.keyUrl | toString -}}
     {{- if not (regexMatch $keyUrlRe $keyUrl) -}}
-      {{- fail (printf "postgresql.extensions.aptSources[%s].keyUrl: invalid value %q -- must be an https:// URL using only letters, digits, and the characters . _ ~ : / ? # %% = - (it is interpolated into a shell command); no whitespace, quotes, backticks, $(), ;, &, |, or newlines" $name $keyUrl) -}}
+      {{- fail (printf "postgresql.extensions.aptSources[%s].keyUrl: invalid value %q -- must be an https:// URL using only letters, digits, and the characters . _ ~ : / ? # %% & = - (it is interpolated into a shell command); no whitespace, quotes, backticks, $(), ;, |, or newlines" $name $keyUrl) -}}
     {{- end -}}
     {{- $aptLine := $s.aptLine | toString -}}
     {{- if not (regexMatch $aptLineRe $aptLine) -}}
       {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine: invalid value %q -- must use only letters, digits, spaces, and the characters . / : = , + ~ %% [ ] { } @ - (the literal {major} placeholder is substituted with postgresql.majorVersion); no quotes, backticks, $(), ;, &, |, or newlines (it is interpolated into a shell command)" $name $aptLine) -}}
+    {{- end -}}
+    {{- $substituted := $aptLine | replace "{major}" $pgMajor -}}
+    {{- if regexMatch "[{}]" $substituted -}}
+      {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine: %q still contains a { or } after substituting {major} -- the only recognized placeholder is the literal {major} token; apt source lines have no legitimate use for braces otherwise" $name $substituted) -}}
     {{- end -}}
   {{- end -}}
 {{- end -}}
@@ -437,11 +449,11 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 
 {{- /* #309: postgresql.extensions.extraLibs copies additional files -- by exact,
        user-specified path -- out of copy-ext/copy-base-ext's own filesystem into
-       /ext-lib, for a transitive shared-library dependency an apt-installed extension
-       needs that does NOT live under /usr/lib/postgresql/<major>/lib (Debian's normal
-       package layout puts general-purpose libraries, as opposed to Postgres extension
-       modules, under the multiarch path instead, e.g. libsodium23 installs
-       /usr/lib/x86_64-linux-gnu/libsodium.so.23 -- confirmed live -- which the
+       /ext-extra-lib, for a transitive shared-library dependency an apt-installed
+       extension needs that does NOT live under /usr/lib/postgresql/<major>/lib
+       (Debian's normal package layout puts general-purpose libraries, as opposed to
+       Postgres extension modules, under the multiarch path instead, e.g. libsodium23
+       installs /usr/lib/x86_64-linux-gnu/libsodium.so.23 -- confirmed live -- which the
        extension-copy step, however broad its glob, never reads from). Paired with
        LD_LIBRARY_PATH on the postgresql container (statefulset.yaml), which is the
        other half of the fix: dlopen()ing the extension .so by absolute path always
@@ -454,7 +466,15 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        image builds, so blindly copying a resolved dependency's transitive closure risks
        silently shadowing the RUNNING container's own libc/libstdc++/etc. with a build
        from the OTHER image -- an ABI hazard, not a convenience. The denylist below
-       exists for exactly that reason: these are never legitimate extraLibs entries. */ -}}
+       exists for exactly that reason: these are never legitimate extraLibs entries
+       (review: widened past the original libc-family set to also cover libssl,
+       libcrypto, libz, the libicu family, libcrypt, and ld-linux, since the running
+       postgres server itself links all of these -- shadowing any of them is just as
+       dangerous as shadowing libc). extraLibs' own copies land in a volume physically
+       separate from
+       ext-lib (statefulset.yaml, ext-extra-lib) specifically so this denylist is the
+       ONLY gate on what ends up on LD_LIBRARY_PATH -- ext-lib is also populated by the
+       unvalidated *.so* glob copy, which this validator has no visibility into. */ -}}
 {{- define "pg.validateExtraLibs" -}}
 {{- $libs := .Values.postgresql.extensions.extraLibs | default list -}}
 {{- if $libs -}}
@@ -464,19 +484,19 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- if not (.Values.postgresql.extensions.packages | default list) -}}
     {{- fail "postgresql.extensions.extraLibs is set but postgresql.extensions.packages is empty -- extraLibs' copy step only runs alongside the packages apt-get install, so it has nothing to do without at least one package that needs it." -}}
   {{- end -}}
-  {{- $pathRe := "^/[A-Za-z0-9._/+-]+$" -}}
-  {{- $denyRe := "^lib(c|m|pthread|dl|rt|resolv|nsl|gcc_s|stdc\\+\\+)([.-]|\\.so)" -}}
+  {{- $pathRe := "^/[A-Za-z0-9._/+-]*[A-Za-z0-9._+-]$" -}}
+  {{- $denyRe := "^(lib(c|m|pthread|dl|rt|resolv|nsl|gcc_s|stdc\\+\\+|ssl|crypto|crypt|z|icu[A-Za-z0-9]*)(\\.so|[.-])|ld-linux)" -}}
   {{- range $p := $libs -}}
     {{- $path := $p | toString -}}
     {{- if not (regexMatch $pathRe $path) -}}
-      {{- fail (printf "postgresql.extensions.extraLibs: invalid path %q -- must be an absolute path using only letters, digits, and the characters . _ / + - (it is interpolated into a shell command); no .. traversal, whitespace, quotes, backticks, $(), ;, &, |, or newlines" $path) -}}
+      {{- fail (printf "postgresql.extensions.extraLibs: invalid path %q -- must be an absolute path to a FILE (no trailing /) using only letters, digits, and the characters . _ / + - (it is interpolated into a shell command); no .. traversal, whitespace, quotes, backticks, $(), ;, &, |, or newlines" $path) -}}
     {{- end -}}
     {{- if regexMatch "(^|/)\\.\\.(/|$)" $path -}}
       {{- fail (printf "postgresql.extensions.extraLibs: invalid path %q -- must not contain a .. path segment" $path) -}}
     {{- end -}}
     {{- $base := base $path -}}
     {{- if regexMatch $denyRe $base -}}
-      {{- fail (printf "postgresql.extensions.extraLibs: refusing %q -- copying a core C-runtime library (libc/libm/libpthread/libdl/librt/libresolv/libnsl/libgcc_s/libstdc++) risks silently shadowing the postgresql container's own runtime with a build from a different image (copy-base-ext and copy-ext can be different images); this value is for extension-specific dependencies (e.g. libsodium.so.23), not core-runtime libraries" $base) -}}
+      {{- fail (printf "postgresql.extensions.extraLibs: refusing %q -- copying a core runtime library the postgres server itself links (libc/libm/libpthread/libdl/librt/libresolv/libnsl/libgcc_s/libstdc++/libssl/libcrypto/libcrypt/libz/libicu*/ld-linux) risks silently shadowing the postgresql container's own runtime with a build from a different image (copy-base-ext and copy-ext can be different images); this value is for extension-specific dependencies (e.g. libsodium.so.23), not core-runtime libraries" $base) -}}
     {{- end -}}
   {{- end -}}
 {{- end -}}
@@ -485,14 +505,19 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- /* #309/#310: builds the copy-base-ext/copy-ext init container command: optionally
        add postgresql.extensions.aptSources ahead of the apt-get install (#310), then
        apt-get install the pinned postgresql-<major> + packages (#303), then copy the
-       extension files out, then copy any postgresql.extensions.extraLibs (#309) by
-       their exact given path. The *.so* glob (not *.so) additionally covers a versioned
-       SONAME a package places directly alongside the extension modules under
-       /usr/lib/postgresql/<major>/lib itself -- a strict superset of the old match, so
-       safe unconditionally -- but is NOT what makes a multiarch-path dependency like
-       libsodium.so.23 work; extraLibs (above) plus LD_LIBRARY_PATH is. noClobber
-       selects copy-ext's `cp -n` (#302): it must never overwrite a lib copy-base-ext
-       already placed from the repmgr image. */ -}}
+       extension files out, then copy any postgresql.extensions.extraLibs (#309) into
+       the SEPARATE ext-extra-lib volume by their exact given path (statefulset.yaml
+       mounts it and points LD_LIBRARY_PATH there -- physically apart from ext-lib so
+       the *.so* glob's unvalidated copies never end up on that search path). The
+       *.so* glob (not *.so) additionally covers a versioned SONAME a package places
+       directly alongside the extension modules under /usr/lib/postgresql/<major>/lib
+       itself -- a strict superset of the old match, so safe unconditionally -- but is
+       NOT what makes a multiarch-path dependency like libsodium.so.23 work; extraLibs
+       (above) plus LD_LIBRARY_PATH is. noClobber selects copy-ext's `cp -n` (#302): it
+       must never overwrite a lib copy-base-ext already placed from the repmgr image.
+       curl is pinned to https (review): keyUrl's own character allowlist already
+       forces the scheme, but -L would otherwise still follow a same-origin
+       https->http redirect and silently fetch the key in plaintext. */ -}}
 {{- define "pg.extensionInstallCommand" -}}
 {{- $pgMajor := .pgMajor | toString -}}
 {{- $pkgs := .pkgs -}}
@@ -501,7 +526,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- $srcSteps := list -}}
 {{- range $s := (.aptSources | default list) -}}
   {{- $aptLine := $s.aptLine | toString | replace "{major}" $pgMajor -}}
-  {{- $srcSteps = append $srcSteps (printf "curl -fsSL \"%s\" | gpg --dearmor -o /usr/share/keyrings/pgchart-%s-keyring.gpg" $s.keyUrl $s.name) -}}
+  {{- $srcSteps = append $srcSteps (printf "curl -fsSL --proto '=https' --proto-redir '=https' \"%s\" | gpg --dearmor -o /usr/share/keyrings/pgchart-%s-keyring.gpg" $s.keyUrl $s.name) -}}
   {{- $srcSteps = append $srcSteps (printf "echo \"%s\" > /etc/apt/sources.list.d/pgchart-%s.list" $aptLine $s.name) -}}
 {{- end -}}
 {{- $cmdParts := list "apt-get update" -}}
@@ -514,7 +539,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- $cmdParts = append $cmdParts (printf "cp %s/usr/lib/postgresql/%s/lib/*.so* /ext-lib/" $cpFlag $pgMajor) -}}
 {{- $cmdParts = append $cmdParts (printf "cp %s/usr/share/postgresql/%s/extension/* /ext-share/" $cpFlag $pgMajor) -}}
 {{- range $l := (.extraLibs | default list) -}}
-  {{- $cmdParts = append $cmdParts (printf "cp %s%s /ext-lib/" $cpFlag $l) -}}
+  {{- $cmdParts = append $cmdParts (printf "cp %s%s /ext-extra-lib/" $cpFlag $l) -}}
 {{- end -}}
 {{- printf "PGVER=$(dpkg-query -W postgresql-%s 2>/dev/null | cut -f2); %s" $pgMajor (join " && " $cmdParts) -}}
 {{- end }}
@@ -595,7 +620,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
              would silently win over the chart/Secret value -- pointing the postmaster at
              the wrong data directory or breaking auth cluster-wide. */ -}}
 {{- define "pg.validateExtraPassthrough" -}}
-{{- $chartVolumes := list "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "repmgr-config" "etcd-tls" "pg-run" "pgbackrest-config" "service-updater-script" -}}
+{{- $chartVolumes := list "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib" "repmgr-config" "etcd-tls" "pg-run" "pgbackrest-config" "service-updater-script" -}}
 {{- /* Env vars the chart sets on the postgresql container (see statefulset.yaml). Reserved
        UNCONDITIONALLY -- including the ones only a currently-disabled feature emits -- so a
        passthrough that works today cannot start silently shadowing a chart value after a

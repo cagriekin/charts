@@ -433,6 +433,10 @@ spec:
               mountPath: /ext-lib
             - name: ext-share
               mountPath: /ext-share
+{{- if .Values.postgresql.extensions.extraLibs }}
+            - name: ext-extra-lib
+              mountPath: /ext-extra-lib
+{{- end }}
           resources:
 {{- if $pkgs }}
             {{- toYaml .Values.postgresql.extensions.installResources | nindent 12 }}
@@ -502,6 +506,10 @@ spec:
               mountPath: /ext-lib
             - name: ext-share
               mountPath: /ext-share
+{{- if .Values.postgresql.extensions.extraLibs }}
+            - name: ext-extra-lib
+              mountPath: /ext-extra-lib
+{{- end }}
           resources:
 {{- if $pkgs }}
             {{- toYaml .Values.postgresql.extensions.installResources | nindent 12 }}
@@ -677,24 +685,18 @@ spec:
             # loads fine (postgres dlopen()s it by absolute path), but resolving ITS OWN
             # NEEDED entries then fails with "cannot open shared object file" unless the
             # copied-alongside dependency (postgresql.extensions.extraLibs) is on a path
-            # the dynamic linker actually searches. ext-lib is already mounted here, so
-            # this is the cheapest way to make it one, without patchelf/RPATH surgery on
-            # packages this chart doesn't own.
+            # the dynamic linker actually searches.
             #
-            # Gated on extraLibs specifically, NOT bare extensions.enabled (review):
-            # LD_LIBRARY_PATH precedes the default loader directories for every symbol
-            # resolution in the process, not just this one dependency, and ext-lib is
-            # ALSO populated by the plain *.so* glob copy (both copy-base-ext and
-            # copy-ext, potentially different image builds, #302) regardless of
-            # extraLibs. Setting this unconditionally would widen that copy's blast
-            # radius from "an extension module dlopen()'d by its own known absolute
-            # path" to "anything the dynamic linker looks up by name, in either image's
-            # build" -- exactly the ABI-mismatch class #302 exists to prevent, and
-            # pg.validateExtraLibs cannot catch it since those files never go through
-            # extraLibs' own validation. Only set the env when a real consumer
-            # (extraLibs) exists to need it.
+            # Points at ext-extra-lib, NOT ext-lib (review, #302): ext-lib is also
+            # populated by the unvalidated *.so* glob copy from either image, so pointing
+            # the search path there would extend the same ABI-shadowing hazard
+            # pg.validateExtraLibs' denylist exists to prevent to every file that glob
+            # happens to sweep in. ext-extra-lib is written ONLY by the extraLibs copy
+            # step, so LD_LIBRARY_PATH only ever searches paths this chart validated.
+            # Gated on extraLibs specifically, not bare extensions.enabled, so a release
+            # that doesn't use this feature gets no search-path change at all.
             - name: LD_LIBRARY_PATH
-              value: /usr/lib/postgresql/{{ $pgMajor }}/lib
+              value: /usr/lib/postgresql/{{ $pgMajor }}/extra-lib
 {{- end }}
 {{- if .Values.repmgr.enabled }}
             - name: REPMGR_USER
@@ -1208,6 +1210,18 @@ spec:
               mountPath: /usr/lib/postgresql/{{ $pgMajor }}/lib
             - name: ext-share
               mountPath: /usr/share/postgresql/{{ $pgMajor }}/extension
+{{- if .Values.postgresql.extensions.extraLibs }}
+            # #309 (review): a SEPARATE volume from ext-lib, not a subdirectory of it --
+            # ext-lib is also populated by the unvalidated *.so* glob copy (either image,
+            # #302), so pointing LD_LIBRARY_PATH at ext-lib itself would extend the same
+            # ABI-shadowing hazard pg.validateExtraLibs' denylist exists to prevent to
+            # every file that glob happens to sweep in, not just the explicit,
+            # denylist-checked entries in extraLibs. Keeping extraLibs' own copies
+            # physically isolated means LD_LIBRARY_PATH only ever searches paths this
+            # chart validated.
+            - name: ext-extra-lib
+              mountPath: /usr/lib/postgresql/{{ $pgMajor }}/extra-lib
+{{- end }}
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
             - name: pgbackrest-config
@@ -1494,6 +1508,16 @@ spec:
         - name: ext-share
           emptyDir:
             sizeLimit: 1Gi
+{{- if .Values.postgresql.extensions.extraLibs }}
+        # Deliberately separate from ext-lib (review, #309/#302): ext-lib is also
+        # populated by the unvalidated *.so* glob copy from either image, so
+        # LD_LIBRARY_PATH (statefulset.yaml, postgresql container env) points at this
+        # volume instead -- written ONLY by extraLibs' own denylist-checked copy step,
+        # never by the general glob.
+        - name: ext-extra-lib
+          emptyDir:
+            sizeLimit: 64Mi
+{{- end }}
 {{- end }}
 {{- if .Values.repmgr.enabled }}
         - name: repmgr-config

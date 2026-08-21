@@ -93,7 +93,7 @@ tests:
 
   # copy-base-ext/copy-ext can be different image builds -- auto-shadowing the running
   # container's own C runtime with a build from the other image is an ABI hazard.
-  - it: a core C-runtime library in extraLibs is refused
+  - it: a core runtime library in extraLibs is refused
     set:
       postgresql.extensions.enabled: true
       postgresql.extensions.packages:
@@ -102,4 +102,4 @@ tests:
         - /usr/lib/x86_64-linux-gnu/libc.so.6
     asserts:
       - failedTemplate:
-          errorPattern: "refusing .* core C-runtime library"
+          errorPattern: "refusing .* core runtime library"
