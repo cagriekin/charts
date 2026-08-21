@@ -337,8 +337,10 @@ tests:
     asserts:
       - failedTemplate: {}
 
-  # trusted=yes disables apt's signature check entirely, making the curl/gpg
-  # verification step decorative -- unsigned packages would install as root.
+  # trusted=/allow-insecure=/allow-weak=/allow-downgrade-to-insecure= each disable or
+  # weaken apt's signature check, making the curl/gpg verification step decorative --
+  # unsigned or weakly-signed packages would install as root. Case-insensitive with
+  # optional whitespace before "=" (review): apt itself accepts both.
   - it: an aptSources aptLine setting trusted=yes fails render
     templates:
       - templates/statefulset.yaml
@@ -352,7 +354,37 @@ tests:
           aptLine: "deb [trusted=yes] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
     asserts:
       - failedTemplate:
-          errorPattern: "sets trusted="
+          errorPattern: "sets an apt option that weakens or disables signature verification"
+
+  - it: an aptSources aptLine setting allow-insecure=yes fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb [allow-insecure=yes] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorPattern: "sets an apt option that weakens or disables signature verification"
+
+  - it: an aptSources aptLine setting Trusted = yes (mixed case, spaced) fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb [Trusted = yes] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorPattern: "sets an apt option that weakens or disables signature verification"
 
   # Without signed-by referencing exactly the keyring this entry's own key is
   # dearmored to, apt has no way to know which key to trust -- fails at apply time

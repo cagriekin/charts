@@ -695,6 +695,13 @@ spec:
             # step, so LD_LIBRARY_PATH only ever searches paths this chart validated.
             # Gated on extraLibs specifically, not bare extensions.enabled, so a release
             # that doesn't use this feature gets no search-path change at all.
+            #
+            # A Kubernetes container env entry REPLACES (not appends to) the image's own
+            # ENV of the same name (review) -- confirmed neither postgres:*-trixie nor
+            # cagriekin/repmgr sets LD_LIBRARY_PATH today (`docker inspect ... Config.Env`
+            # has no LD_LIBRARY_PATH entry in either), so there's nothing to clobber. If a
+            # future base-image bump ever adds one, this would need to change to prepend
+            # this path onto the image's own value instead of overwriting it outright.
             - name: LD_LIBRARY_PATH
               value: /usr/lib/postgresql/{{ $pgMajor }}/extra-lib
 {{- end }}

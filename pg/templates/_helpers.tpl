@@ -443,8 +443,8 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
     {{- if regexMatch "[{}]" $substituted -}}
       {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine: %q still contains a { or } after substituting {major} -- the only recognized placeholder is the literal {major} token; apt source lines have no legitimate use for braces otherwise" $name $substituted) -}}
     {{- end -}}
-    {{- if regexMatch "trusted=" $substituted -}}
-      {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine: %q sets trusted= -- this disables apt's signature check entirely, making the curl/gpg key-verification step above decorative and installing unsigned packages as root; sign the source properly with signed-by= instead" $name $substituted) -}}
+    {{- if regexMatch "(?i)(trusted|allow-insecure|allow-weak|allow-downgrade-to-insecure) *=" $substituted -}}
+      {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine: %q sets an apt option that weakens or disables signature verification (trusted=/allow-insecure=/allow-weak=/allow-downgrade-to-insecure=) -- this makes the curl/gpg key-verification step above decorative and installs unsigned or weakly-signed packages as root; sign the source properly with signed-by= instead" $name $substituted) -}}
     {{- end -}}
     {{- $expectSignedBy := printf "signed-by=/usr/share/keyrings/pgchart-%s-keyring.gpg" $name -}}
     {{- if not (contains $expectSignedBy $substituted) -}}

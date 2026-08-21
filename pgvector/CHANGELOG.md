@@ -14,8 +14,8 @@ the full detail.
   `pgchart-` prefix so they can't collide with a source the image already owns. Requires
   `packages` to be non-empty. See the [pg chart README](../pg/README.md#installing-packages-from-a-non-pgdg-apt-source-310).
 - **`postgresql.extensions.extraLibs` + automatic `LD_LIBRARY_PATH` (#309).** Copies an
-  exact, explicit path (e.g. `libsodium.so.23`) into a new, dedicated `ext-extra-lib`
-  volume -- kept separate from `ext-lib`, which is also populated by the unvalidated
+  exact, explicit path (e.g. `/usr/lib/x86_64-linux-gnu/libsodium.so.23`) into a new,
+  dedicated `ext-extra-lib` volume -- kept separate from `ext-lib`, which is also populated by the unvalidated
   `*.so*` glob copy -- for a package's own shared-library dependency Debian installs
   outside the Postgres extension dir. The `postgresql` container gets
   `LD_LIBRARY_PATH=/usr/lib/postgresql/<major>/extra-lib` automatically whenever
