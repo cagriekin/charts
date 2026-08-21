@@ -2177,6 +2177,25 @@ sync_slots_repmgrd_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/v
   --show-only templates/postgresql-configmap.yaml 2>&1)
 assert_not_contains "#308: repmgrd mode never renders sync_replication_slots (agent-only)" "${sync_slots_repmgrd_cm}" "sync_replication_slots"
 
+# The pg.validateSyncReplicationSlotsMajor guard: synchronized_standby_slots and the
+# sync_replication_slots worker do not exist before PostgreSQL 17 -- an unrecognized
+# GUC in a conf.d file crash-loops every pod, so this must fail at render time.
+sync_slots_pg16_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true \
+  --set postgresql.majorVersion=16 --set repmgr.image.majorVersion=16 \
+  --set repmgr.image.tag=trixie-5.5.0-27-pg16 >/dev/null 2>&1 || sync_slots_pg16_rc=$?
+assert_gt "#308: syncReplicationSlots on PG16 rejected at render time (agent mode)" "${sync_slots_pg16_rc}" "0"
+# Inert outside agent mode (matches cascadingReplication's own no-op-outside-agent-mode
+# precedent) -- must not block an unrelated repmgrd-mode/older-major install.
+sync_slots_pg16_repmgrd_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=true --set repmgr.failoverMode=repmgrd \
+  --set repmgr.image.majorVersion=16 --set postgresql.majorVersion=16 \
+  --set repmgr.image.tag=trixie-5.5.0-27-pg16 \
+  --set repmgr.agent.syncReplicationSlots=true >/dev/null 2>&1 || sync_slots_pg16_repmgrd_rc=$?
+assert_eq "#308: syncReplicationSlots on PG16 is inert (not a guard failure) in repmgrd mode" "0" "${sync_slots_pg16_repmgrd_rc}"
+
 # Statefulset must mount the postgresql-config volume even when
 # postgresql.configuration is empty, so the archive snippet is delivered.
 assert_contains "pgbackrest: postgresql-config volume mounted" "${pgbackrest_sts}" "mountPath: /etc/postgresql/conf.d"

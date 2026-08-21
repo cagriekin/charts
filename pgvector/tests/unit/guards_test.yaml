@@ -45,3 +45,15 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "at '/postgresql/walLevel': value must be one of"
+
+  # #308: synchronized_standby_slots / sync_replication_slots do not exist before
+  # PostgreSQL 17; agent mode is pgvector's default, so this fires without extra overrides.
+  - it: syncReplicationSlots on PostgreSQL 16 is rejected
+    set:
+      repmgr.agent.syncReplicationSlots: true
+      postgresql.majorVersion: "16"
+      repmgr.image.majorVersion: "16"
+      repmgr.image.tag: trixie-5.5.0-31-pg16
+    asserts:
+      - failedTemplate:
+          errorPattern: "requires PostgreSQL 17\\+"

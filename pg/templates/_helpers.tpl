@@ -395,7 +395,25 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- define "pg.validateWalLevel" -}}
 {{- range $key, $_ := (.Values.postgresql.configuration | default dict) }}
 {{- if eq (lower ($key | toString)) "wal_level" }}
-{{- fail "postgresql.configuration.wal_level is set, but wal_level has a single authoritative source: postgresql.walLevel (enum: replica|logical). Move the value there -- postgresql.configuration.wal_level would otherwise be silently overridden by pgbackrest-archive.conf whenever pgbackrest.enabled is true." }}
+{{- fail "postgresql.configuration.wal_level is set, but wal_level has a single authoritative source: postgresql.walLevel (enum: replica|logical). Move the value there instead." }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- /* #308: synchronized_standby_slots and the sync_replication_slots worker do not
+       exist before PostgreSQL 17 -- an unrecognized GUC in a conf.d file makes the
+       postmaster refuse to start, crash-looping every pod. postgresql.majorVersion is a
+       freeform string (no schema enum), so nothing else catches
+       syncReplicationSlots=true paired with an older major before it reaches a running
+       cluster; fail at render time instead. Scoped to agent mode, matching the
+       postgresql-configmap.yaml/statefulset.yaml render condition -- the value is
+       already a no-op outside agent mode (see repmgr.agent.cascadingReplication for the
+       same pattern), so it should not block an unrelated repmgrd-mode/older-major
+       install that merely left the value set from a prior config. */}}
+{{- define "pg.validateSyncReplicationSlotsMajor" -}}
+{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
+{{- if lt (atoi (toString .Values.postgresql.majorVersion)) 17 }}
+{{- fail (printf "repmgr.agent.syncReplicationSlots requires PostgreSQL 17+ (synchronized_standby_slots and the sync_replication_slots worker were introduced in 17), but postgresql.majorVersion=%q. Set postgresql.majorVersion to \"17\" or \"18\", or set repmgr.agent.syncReplicationSlots to false." (toString .Values.postgresql.majorVersion)) }}
 {{- end }}
 {{- end }}
 {{- end }}

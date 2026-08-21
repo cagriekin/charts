@@ -28,7 +28,10 @@
     reconcile `synchronized_standby_slots` to its current, live standbys' physical
     replication slots on every tick -- so a logical failover slot
     (`CREATE SUBSCRIPTION ... WITH (failover = true)`) survives a promote instead of
-    needing a full resync. Verified live on a 3-node KinD cluster through install,
+    needing a full resync. `synchronized_standby_slots`/`sync_replication_slots` do not
+    exist before PostgreSQL 17, so a render-time guard rejects the combination with an
+    older `postgresql.majorVersion` (agent mode only -- the value is inert, and so not
+    guarded, outside it). Verified live on a 3-node KinD cluster through install,
     promote/failover, and scale-down.
 
   See README ["Logical Replication"](README.md#logical-replication-308) for the full
