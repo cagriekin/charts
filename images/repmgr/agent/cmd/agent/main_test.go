@@ -137,12 +137,14 @@ type scriptedExec struct {
 	unregistered []int  // node_ids passed to `repmgr standby unregister`
 	followOut    string // combined output for `repmgr standby follow`; non-empty = it fails
 	rejoins      int    // number of `repmgr node rejoin` calls (the #297 re-clone escalation)
+	nodesQueries int    // number of `SELECT ... FROM repmgr.nodes` calls (psql)
 }
 
 func (s *scriptedExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
 	joined := strings.Join(args, " ")
 	switch {
 	case name == "psql" && strings.Contains(joined, "repmgr.nodes"):
+		s.nodesQueries++
 		return s.nodes, nil
 	case name == "psql" && strings.Contains(joined, "pg_stat_wal_receiver"):
 		return s.walRcv, nil
@@ -668,5 +670,22 @@ func TestCleanupGhostNodesNoGhosts(t *testing.T) {
 	a.cleanupGhostNodes(context.Background())
 	if len(ex.unregistered) != 0 {
 		t.Fatalf("expected no unregister when there are no ghosts, got %v", ex.unregistered)
+	}
+}
+
+// #287: native mode has no repmgr.nodes at all (mechanism.Native's Unregister is a
+// no-op), so the query would error on every primary tick forever -- pure log noise with
+// nothing to retry. cleanupGhostNodes must skip the query entirely rather than warn.
+func TestCleanupGhostNodesSkippedUnderNativeMechanism(t *testing.T) {
+	ex := &scriptedExec{nodes: "1000\n1001\n1002\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.NodeCount = 2
+	a.cfg.Mechanism = config.MechanismNative
+	a.cleanupGhostNodes(context.Background())
+	if ex.nodesQueries != 0 {
+		t.Fatalf("expected no repmgr.nodes query under native mechanism, got %d", ex.nodesQueries)
+	}
+	if len(ex.unregistered) != 0 {
+		t.Fatalf("expected no unregister under native mechanism, got %v", ex.unregistered)
 	}
 }

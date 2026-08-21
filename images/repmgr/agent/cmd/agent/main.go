@@ -1174,7 +1174,16 @@ func (a *agent) fqdn(name string) string { return name + "." + a.cfg.HeadlessSer
 // cannot remove -- is left for an operator rather than re-attempted (and re-warned)
 // every tick. A non-positive NodeCount is a no-op via ghostNodeIDs, so this can never
 // unregister a live node.
+//
+// Skipped entirely under the #287 native mechanism: it has no repmgr.nodes (native's
+// Unregister is a no-op, see mechanism.Native), so StandbyNodeIDs would error on every
+// primary tick forever. That is harmless (RegistryRead-style fail-open elsewhere), but
+// here it is pure log noise with no cleanup to retry -- skip the call rather than warn
+// on a known, permanent condition.
 func (a *agent) cleanupGhostNodes(ctx context.Context) {
+	if a.cfg.Mechanism == config.MechanismNative {
+		return
+	}
 	ids, err := a.prober.StandbyNodeIDs(ctx, a.selfConn())
 	if err != nil {
 		a.log.Warn("list repmgr.nodes for ghost cleanup", "err", err)
