@@ -217,7 +217,7 @@ The chart and agent (failover mode `agent` only) handle both automatically when 
 - `sync_replication_slots = on` is set in `postgresql.conf` (inert on a primary; needed on any node that may run the slot-sync worker as a standby);
 - the primary reconciles `synchronized_standby_slots` to its current, live standbys' physical replication slot(s) on every tick it serves — through scale-up, scale-down, and promote — so the set is never stale.
 
-Requires `postgresql.walLevel: logical` (above) to actually be useful; setting `syncReplicationSlots` without it is a harmless no-op, not a render-time guard, since nothing breaks either way. See [issue #308](https://github.com/cagriekin/charts/issues/308).
+Requires `postgresql.walLevel: logical` (above) — enforced at render time, not a harmless no-op without it: the `sync_replication_slots` worker this enables on every standby fails its own startup validation below `wal_level: logical` and PostgreSQL restarts it forever, logging the failure on a fixed interval. See [issue #308](https://github.com/cagriekin/charts/issues/308).
 
 ### Installing extensions without a custom image
 

@@ -1,6 +1,19 @@
 # pg chart changelog
 
-## 1.13.0 - 2026-08-21
+## 2.0.0 - 2026-08-21
+
+### Breaking
+
+- **`postgresql.configuration.wal_level` is no longer accepted; use `postgresql.walLevel`
+  instead (#308).** `wal_level` now has exactly one authoritative source. On 1.x with
+  `pgbackrest.enabled: false`, `postgresql.configuration.wal_level` worked (nothing else
+  set the GUC, so it landed in `custom.conf` uncontested) -- it was only silently
+  overridden when pgbackrest was also on. That narrow working case now fails at render
+  time instead of continuing to work: `helm upgrade` on a release that set
+  `postgresql.configuration.wal_level` directly fails fast with a guard message naming
+  the fix. **Migration:** move the value to `postgresql.walLevel` (enum `replica`|
+  `logical`); everyone else is unaffected. This is the reason for the major bump --
+  everything else in this release is additive.
 
 ### Added
 
@@ -14,28 +27,39 @@
     works whether or not backups are configured. Previously, `pgbackrest-archive.conf`
     hardcoded `wal_level = replica` whenever `pgbackrest.enabled`, silently overriding
     `postgresql.configuration.wal_level` because `include_dir` loads conf.d files in
-    filename-sort order and that file sorted last. Setting
-    `postgresql.configuration.wal_level` directly is now a render-time guard failure
-    pointing at `postgresql.walLevel`. The hardcoded `max_wal_senders = 10` in the same
-    file was also removed (redundant with the image's own initdb default, and it was
-    silently clobbering a custom `postgresql.configuration.max_wal_senders`).
+    filename-sort order and that file sorted last.
   - The agent now patches `dbname` into `primary_conninfo` after every clone, follow,
-    and rejoin -- repmgr's own clone/follow machinery never included it, which is
+    and rejoin (and deterministically at every cold start of a standby, not only on a
+    repoint) -- repmgr's own clone/follow machinery never included it, which is
     harmless for physical replication but breaks PostgreSQL 17+'s
-    `sync_replication_slots` worker (it requires `dbname` to be present).
+    `sync_replication_slots` worker (it requires `dbname` to be present). The initial
+    `standby clone` (run by the `repmgr-init` init container) now also requests a
+    physical replication slot in agent mode, matching the agent's own default, so a
+    fresh standby's very first streaming connection is slotted from the start.
   - **`repmgr.agent.syncReplicationSlots`** (default `false`, agent-mode only,
-    PostgreSQL 17+): when true, sets `sync_replication_slots = on` and has the primary
-    reconcile `synchronized_standby_slots` to its current, live standbys' physical
-    replication slots on every tick -- so a logical failover slot
+    PostgreSQL 17+, requires `postgresql.walLevel: logical` -- enforced at render time):
+    when true, sets `sync_replication_slots = on` and has the primary reconcile
+    `synchronized_standby_slots` to its current, live standbys' physical replication
+    slots on every tick -- so a logical failover slot
     (`CREATE SUBSCRIPTION ... WITH (failover = true)`) survives a promote instead of
-    needing a full resync. `synchronized_standby_slots`/`sync_replication_slots` do not
-    exist before PostgreSQL 17, so a render-time guard rejects the combination with an
-    older `postgresql.majorVersion` (agent mode only -- the value is inert, and so not
-    guarded, outside it). Verified live on a 3-node KinD cluster through install,
-    promote/failover, and scale-down.
+    needing a full resync. The live standby set is derived from repmgr's own node
+    registry (excluding genuine scale-down ghosts), not from momentary replication-slot
+    activity, so a standby restart or brief network blip does not empty the GUC and
+    temporarily strand the logical consumer. `synchronized_standby_slots`/
+    `sync_replication_slots` do not exist before PostgreSQL 17, so a render-time guard
+    rejects the combination with an older `postgresql.majorVersion` (agent mode only --
+    the value is inert, and so not guarded, outside it). Verified live on a 3-node KinD
+    cluster through install, promote/failover, and scale-down.
 
   See README ["Logical Replication"](README.md#logical-replication-308) for the full
-  detail. All three are additive / off-by-default; the default render is byte-stable.
+  detail. The default render is byte-stable (nothing renders differently unless
+  `postgresql.walLevel` or `repmgr.agent.syncReplicationSlots` is touched).
+
+### Changed
+
+- `pgbackrest-archive.conf` no longer hardcodes `max_wal_senders = 10` (#308) --
+  redundant with the image's own initdb default, and it was silently clobbering a
+  custom `postgresql.configuration.max_wal_senders` whenever pgBackRest was enabled.
 
 ## 1.12.0 - 2026-08-18
 
