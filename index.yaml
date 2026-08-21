@@ -149,6 +149,45 @@ entries:
   pg:
   - apiVersion: v2
     appVersion: "18.1"
+    created: "2026-08-21T16:26:52.848739179Z"
+    dependencies:
+    - name: common
+      repository: file://../common
+      version: 0.1.0
+    - condition: etcd.enabled
+      name: etcd
+      repository: file://../etcd
+      version: 0.1.5
+    description: Highly-available PostgreSQL with repmgr replication, automatic agent
+      failover (Kubernetes Lease or etcd-quorum DCS), optional PgPool-II, pgBackRest
+      S3 backups, TLS, and Prometheus metrics
+    digest: 26d65575521c65199108c25d3b494646e75764f0dffea4ba8793fe5cefda1b7e
+    home: https://github.com/cagriekin/charts/tree/master/pg
+    icon: https://wiki.postgresql.org/images/a/a4/PostgreSQL_logo.3colors.svg
+    keywords:
+    - PostgreSQL
+    - Database
+    - SQL
+    - Replication
+    - repmgr
+    - PGPool-II
+    - High Availability
+    maintainers:
+    - email: cagri.ekin@gmail.com
+      name: cagriekin
+      url: https://github.com/cagriekin
+    name: pg
+    sources:
+    - https://github.com/cagriekin/charts
+    - https://www.postgresql.org
+    - https://repmgr.org
+    - https://www.pgpool.net
+    type: application
+    urls:
+    - https://cagriekin.github.io/charts/pg-2.0.0.tgz
+    version: 2.0.0
+  - apiVersion: v2
+    appVersion: "18.1"
     created: "2026-08-19T06:29:56.460354569Z"
     dependencies:
     - name: common
@@ -3377,4 +3416,4 @@ entries:
     urls:
     - https://cagriekin.github.io/charts/redis-0.2.0.tgz
     version: 0.2.0
-generated: "2026-08-21T16:26:38.404941707Z"
+generated: "2026-08-21T16:26:52.840562119Z"
