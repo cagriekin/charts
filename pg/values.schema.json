@@ -65,6 +65,10 @@
             "logRelation": { "type": "boolean" },
             "role": { "type": "string", "description": "Optional pgaudit.role for object-level auditing. Empty disables object auditing." }
           }
+        },
+        "walLevel": {
+          "enum": ["replica", "logical"],
+          "description": "replica (default) is enough for physical HA/pgBackRest. logical enables a logical-replication subscriber (#308). The only place to set wal_level -- setting it in postgresql.configuration instead is rejected by pg.validateWalLevel at render time."
         }
       }
     },

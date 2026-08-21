@@ -180,6 +180,7 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.tolerations` | Tolerations for PostgreSQL pods | `[]` |
 | `postgresql.topologySpreadConstraints` | Spread constraints added alongside the built-in affinity (e.g. a hard zone spread) | `[]` |
 | `postgresql.serviceAccount.annotations` | Annotations on the postgresql pods' ServiceAccount (cloud workload identity for keyless pgBackRest S3) | `{}` |
+| `postgresql.walLevel` | `replica` or `logical` (#308; see [Logical Replication](#logical-replication)). The **only** place to set `wal_level` — setting it in `postgresql.configuration` instead fails at render time | `replica` |
 
 Example:
 
@@ -199,6 +200,16 @@ postgresql:
 ```
 
 When `repmgr.enabled` is true, `additionalCommands` automatically discover the current primary and execute against it, so DDL statements like `CREATE EXTENSION` work correctly regardless of which pod the hook runs on (including standbys after a failover).
+
+### Logical Replication (#308)
+
+Set `postgresql.walLevel: logical` for a logical-replication subscriber (`CREATE SUBSCRIPTION`, Debezium, or any other decoder on a replication slot). `logical` is a strict superset of `replica` and is fully compatible with `pgbackrest.enabled`/`archive_mode=on`. `wal_level` is a postmaster parameter — the change rolls the pods via the existing configmap-checksum annotation, the same way any other `postgresql.configuration` change does.
+
+**This is the only place to set `wal_level`.** `pgbackrest.enabled` renders its own `pgbackrest-archive.conf`, which sorts after `custom.conf` under `include_dir` and would otherwise silently win over a `postgresql.configuration.wal_level` you set yourself — so the chart rejects `wal_level` in `postgresql.configuration` at render time and tells you to set `postgresql.walLevel` instead, regardless of whether pgBackRest is on.
+
+A logical subscriber must connect to the **write Service** (`<fullname>:5432`), not Pgpool — Pgpool's query routing is built for physical replicas, not for holding a replication slot's connection open.
+
+**What this chart does not yet do.** `primary_conninfo` written by repmgr's clone/follow has no `dbname=`, which PostgreSQL 17+'s `sync_replication_slots` worker requires, and nothing reconciles `synchronized_standby_slots` on promote — so a **failover** logical slot (one that survives the primary moving) is not yet supported end to end; a plain, non-failover logical slot works today. See [issue #308](https://github.com/cagriekin/charts/issues/308) for the tracked follow-up.
 
 ### Installing extensions without a custom image
 

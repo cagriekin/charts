@@ -48,11 +48,25 @@ data:
   # Required for pgbackrest WAL archiving. archive_mode is a postmaster
   # parameter so it only takes effect after a postgres restart, which the
   # configmap checksum annotation on the StatefulSet triggers.
+  #
+  # wal_level (#308): sourced from postgresql.walLevel, not hardcoded, so a logical
+  # subscriber can be supported without losing to this file -- it sorts after
+  # custom.conf under conf.d's include_dir (same ordering the shared_preload_libraries
+  # merge above depends on), so a bare `replica` here would silently override a
+  # postgresql.configuration.wal_level set there whenever pgbackrest is on. The
+  # pg.validateWalLevel guard rejects setting wal_level in postgresql.configuration
+  # directly, so this is the one place it can come from. `logical` is a superset of
+  # `replica` and is fully compatible with archive_mode=on.
+  #
+  # max_wal_senders is deliberately NOT set here: it used to be hardcoded to the same
+  # value images/repmgr/entrypoint.sh already sets at initdb, which meant this file
+  # clobbered any larger postgresql.configuration.max_wal_senders for no reason
+  # (nothing else needs it re-asserted). Removed; the value now simply flows from
+  # postgresql.configuration (via custom.conf) or the initdb default, uncontested.
   pgbackrest-archive.conf: |
     archive_mode = on
     archive_command = 'pgbackrest --stanza={{ .Values.pgbackrest.stanza | toString | replace "'" "''" }} archive-push %p'
-    wal_level = replica
-    max_wal_senders = 10
+    wal_level = {{ .Values.postgresql.walLevel | default "replica" }}
 {{- end }}
 {{- if .Values.postgresql.tls.enabled }}
   # Server TLS (#110). The cert Secret is mounted at /etc/postgresql/tls; ssl_ca_file

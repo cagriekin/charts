@@ -2099,6 +2099,34 @@ assert_contains "pgbackrest: postgresql configmap renders" "${pgbackrest_pgconf}
 assert_contains "pgbackrest: archive_mode = on" "${pgbackrest_pgconf}" "archive_mode = on"
 assert_contains "pgbackrest: archive_command uses stanza" "${pgbackrest_pgconf}" "archive_command = 'pgbackrest --stanza=db archive-push %p'"
 assert_contains "pgbackrest: wal_level replica" "${pgbackrest_pgconf}" "wal_level = replica"
+assert_not_contains "pgbackrest: no hardcoded max_wal_senders (#308)" "${pgbackrest_pgconf}" "max_wal_senders = 10"
+
+# ======================================================================
+# #308: postgresql.walLevel is the one authoritative source for wal_level.
+# ======================================================================
+walevel_logical=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set postgresql.walLevel=logical --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#308: walLevel=logical renders wal_level = logical" "${walevel_logical}" "wal_level = logical"
+assert_not_contains "#308: walLevel=logical no longer shows replica" "${walevel_logical}" "wal_level = replica"
+
+# Custom max_wal_senders must survive now that pgbackrest-archive.conf no longer
+# re-asserts its own value.
+maxsenders_custom=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set-string postgresql.configuration.max_wal_senders=20 --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#308: custom max_wal_senders survives with pgbackrest on" "${maxsenders_custom}" "max_wal_senders = '20'"
+
+# The guard: wal_level must not be settable via postgresql.configuration, regardless of
+# pgbackrest.enabled -- there is exactly one way to set this GUC.
+schema_rc=0; helm template test-pg "${CHART_DIR}" --set-string postgresql.configuration.wal_level=logical >/dev/null 2>&1 || schema_rc=$?
+assert_gt "#308: postgresql.configuration.wal_level rejected at render time" "${schema_rc}" "0"
+guard_msg=$(helm template test-pg "${CHART_DIR}" --set-string postgresql.configuration.wal_level=logical 2>&1 || true)
+assert_contains "#308: guard message points at postgresql.walLevel" "${guard_msg}" "postgresql.walLevel"
+# Case-insensitive key match (PostgreSQL GUC names are case-insensitive) and unaffected by
+# pgbackrest.enabled -- fires even when pgbackrest is off.
+schema_rc=0; helm template test-pg "${CHART_DIR}" --set-string postgresql.configuration.WAL_LEVEL=logical >/dev/null 2>&1 || schema_rc=$?
+assert_gt "#308: guard matches wal_level case-insensitively" "${schema_rc}" "0"
+schema_rc=0; helm template test-pg "${CHART_DIR}" --set pgbackrest.enabled=false --set-string postgresql.configuration.wal_level=logical >/dev/null 2>&1 || schema_rc=$?
+assert_gt "#308: guard fires even with pgbackrest disabled" "${schema_rc}" "0"
 
 # Statefulset must mount the postgresql-config volume even when
 # postgresql.configuration is empty, so the archive snippet is delivered.

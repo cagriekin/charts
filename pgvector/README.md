@@ -195,6 +195,7 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.tolerations` | Tolerations for PostgreSQL pods | `[]` |
 | `postgresql.topologySpreadConstraints` | Spread constraints added alongside the built-in affinity (e.g. a hard zone spread) | `[]` |
 | `postgresql.serviceAccount.annotations` | Annotations on the postgresql pods' ServiceAccount (cloud workload identity for keyless pgBackRest S3) | `{}` |
+| `postgresql.walLevel` | `replica` or `logical` (#308). The only place to set `wal_level` -- see the [pg chart README](../pg/README.md#logical-replication-308) | `replica` |
 
 Example:
 

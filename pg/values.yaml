@@ -132,6 +132,16 @@ postgresql:
     # shared_buffers: "1GB"
     # work_mem: "32MB"
 
+  # WAL level (#308). "replica" (default) is enough for physical HA/pgBackRest. Set
+  # "logical" for a logical-replication subscriber (CREATE SUBSCRIPTION, Debezium, etc.)
+  # -- it is a strict superset of "replica" and fully compatible with
+  # pgbackrest.enabled/archive_mode=on. A postmaster parameter: changing it rolls the
+  # pods via the existing configmap-checksum annotation. This is the ONLY place to set
+  # wal_level -- setting it in postgresql.configuration instead fails at render time
+  # (see README "Logical Replication"), since pgbackrest.enabled's own conf.d file would
+  # otherwise silently win over it.
+  walLevel: replica
+
   podSecurityContext:
     fsGroup: 103
     runAsNonRoot: true

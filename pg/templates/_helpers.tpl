@@ -383,6 +383,23 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end -}}
 {{- end }}
 
+{{- /* #308: wal_level has exactly one authoritative source: postgresql.walLevel.
+       pgbackrest-archive.conf (postgresql-configmap.yaml) renders it there, and that file
+       sorts after custom.conf under conf.d's include_dir, so a bare
+       postgresql.configuration.wal_level would be silently overridden back to
+       postgresql.walLevel's value (replica, by default) the moment pgbackrest.enabled is
+       true -- exactly the confusing "which one wins, and does it depend on
+       pgbackrest.enabled" footgun this issue is about. Reject it outright, unconditionally
+       (not just when pgbackrest is on), so the answer is never "it depends": there is
+       only ever one way to set this GUC. */ -}}
+{{- define "pg.validateWalLevel" -}}
+{{- range $key, $_ := (.Values.postgresql.configuration | default dict) }}
+{{- if eq (lower ($key | toString)) "wal_level" }}
+{{- fail "postgresql.configuration.wal_level is set, but wal_level has a single authoritative source: postgresql.walLevel (enum: replica|logical). Move the value there -- postgresql.configuration.wal_level would otherwise be silently overridden by pgbackrest-archive.conf whenever pgbackrest.enabled is true." }}
+{{- end }}
+{{- end }}
+{{- end }}
+
 {{- /* #262: validate the postgresql.extraVolumes / extraVolumeMounts / extraEnv
        passthrough. These are spliced verbatim into the pod spec, so without guards a
        plausible mistake becomes a silent runtime failure or an apply-time apiserver

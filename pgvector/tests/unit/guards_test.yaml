@@ -29,3 +29,19 @@ tests:
       - isKind:
           of: StatefulSet
       - notFailedTemplate: {}
+
+  # #308: wal_level has exactly one authoritative source (postgresql.walLevel); setting it
+  # via postgresql.configuration is rejected, confirmed with pgvector's own values+schema.
+  - it: postgresql.configuration.wal_level is rejected
+    set:
+      postgresql.configuration.wal_level: logical
+    asserts:
+      - failedTemplate:
+          errorPattern: "postgresql.walLevel"
+
+  - it: bogus postgresql.walLevel is rejected by the values schema
+    set:
+      postgresql.walLevel: bogus
+    asserts:
+      - failedTemplate:
+          errorPattern: "at '/postgresql/walLevel': value must be one of"
