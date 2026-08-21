@@ -102,4 +102,4 @@ tests:
         - /usr/lib/x86_64-linux-gnu/libc.so.6
     asserts:
       - failedTemplate:
-          errorPattern: "refusing .* core runtime library"
+          errorPattern: "refusing .* copying a library the postgres server itself links"

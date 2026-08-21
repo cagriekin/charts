@@ -334,8 +334,9 @@ postgresql:
       #                       # source the image itself already owns; name must be unique
       #   keyUrl: https://repo.pigsty.io/key
       #   aptLine: "deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
-    # Exact absolute paths to additionally copy into /ext-lib (#309), alongside the
-    # normal extension-file copy above. Debian puts general-purpose shared libraries --
+    # Exact absolute paths to additionally copy into the dedicated ext-extra-lib volume
+    # (#309) -- deliberately NOT ext-lib, which the plain extension-file copy above also
+    # populates unvalidated. Debian puts general-purpose shared libraries --
     # as opposed to Postgres extension modules -- under the multiarch path
     # (/usr/lib/<triplet>/), never under /usr/lib/postgresql/<major>/lib, so a package's
     # transitive runtime dependency (e.g. libsodium.so.23, needed by

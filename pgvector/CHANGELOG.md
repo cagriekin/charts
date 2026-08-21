@@ -21,10 +21,13 @@ the full detail.
   `LD_LIBRARY_PATH=/usr/lib/postgresql/<major>/extra-lib` automatically whenever
   `extraLibs` is non-empty (not just `extensions.enabled`, to avoid widening the
   search path for releases that don't need it) so the copied file is actually found.
-  Requires `packages` to be non-empty; core runtime libraries the server itself links
-  are refused. `aptSources`' `curl` is now pinned to `https` (`--proto`/`--proto-redir`)
-  and `keyUrl`/`aptLine` allow `&`/`,` respectively. `LD_LIBRARY_PATH` is now a
-  chart-reserved `postgresql.extraEnv` name. See the
+  Requires `packages` to be non-empty; every library the postmaster itself links is
+  refused (the full `ldd postgres` NEEDED set, not just `libc`), the path must name a
+  real shared library, and duplicate destination basenames are rejected too.
+  `aptSources`' `curl` is now pinned to `https` (`--proto`/`--proto-redir`),
+  `keyUrl`/`aptLine` allow `&`/`,` respectively, and `aptLine` must include
+  `signed-by=` matching its own entry's keyring (`trusted=` is rejected outright).
+  `LD_LIBRARY_PATH` is now a chart-reserved `postgresql.extraEnv` name. See the
   [pg chart README](../pg/README.md#copying-a-packages-own-shared-library-dependencies-309).
 
 ### Fixed

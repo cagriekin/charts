@@ -38,13 +38,26 @@
   (confirmed live end-to-end: fails to load without `LD_LIBRARY_PATH`, loads cleanly
   with it). Deliberately explicit, not an automatic `ldd`-and-copy-everything walk:
   `copy-base-ext`/`copy-ext` can be different image builds, and auto-copying a resolved
-  dependency's transitive closure between them risks a runtime ABI mismatch -- core
-  runtime libraries the server itself links (`libc`, `libm`, `libpthread`, `libdl`,
-  `librt`, `libresolv`, `libnsl`, `libgcc_s`, `libstdc++`, `libssl`, `libcrypto`,
-  `libcrypt`, `libz`, the `libicu` family, `ld-linux`) are refused at render time
-  (`pg.validateExtraLibs`). Requires `packages` to be non-empty. See the README
+  dependency's transitive closure between them risks a runtime ABI mismatch -- every
+  library the postmaster itself links is refused at render time (`pg.validateExtraLibs`)
+  for exactly that reason: the full `ldd postgres` NEEDED set against the shipped
+  `postgres:*-trixie`/`cagriekin/repmgr` images (glibc, OpenSSL, Kerberos, LDAP, ICU,
+  zstd/lz4/xz, audit, `libcap`/`libcap-ng`/`libkeyutils`, ...), plus `libpq` (the
+  dependency of `libpqwalreceiver.so`, the exact `#302` ABI hazard). An entry must also
+  name a real shared library (basename ending `.so`/`.so.<N>`) and not duplicate another
+  entry's destination filename -- both would otherwise pass validation and only fail at
+  `cp` time, crash-looping the pod. Requires `packages` to be non-empty. See the README
   ["Copying a package's own shared-library
   dependencies"](README.md#copying-a-packages-own-shared-library-dependencies-309).
+- **`aptSources[].aptLine` requires `signed-by=` matching its own entry, and rejects
+  `trusted=` (review, hardening).** Without `signed-by=/usr/share/keyrings/pgchart-
+  <name>-keyring.gpg` naming exactly the keyring the entry's own `keyUrl` is dearmored
+  to, apt has no way to know which key to trust for that source -- previously this
+  failed only later, at apply time, inside `apt-get update` (`NO_PUBKEY`), instead of at
+  render time (CLAUDE.md invariant #4). `trusted=yes` (or any `trusted=` option) is
+  rejected outright: it disables apt's signature check entirely, making the
+  `curl`/`gpg` verification step above decorative and installing unsigned packages as
+  root.
 - **`aptSources[].keyUrl` allows `&`; `aptLine` allows `,` and fails on a leftover
   `{`/`}` (review).** `&` in `keyUrl` is needed for a standard keyserver lookup URL
   (`?op=get&search=...`) and is inert inside the double-quoted `curl` argument; `,` in

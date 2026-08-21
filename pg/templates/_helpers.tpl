@@ -443,6 +443,13 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
     {{- if regexMatch "[{}]" $substituted -}}
       {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine: %q still contains a { or } after substituting {major} -- the only recognized placeholder is the literal {major} token; apt source lines have no legitimate use for braces otherwise" $name $substituted) -}}
     {{- end -}}
+    {{- if regexMatch "trusted=" $substituted -}}
+      {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine: %q sets trusted= -- this disables apt's signature check entirely, making the curl/gpg key-verification step above decorative and installing unsigned packages as root; sign the source properly with signed-by= instead" $name $substituted) -}}
+    {{- end -}}
+    {{- $expectSignedBy := printf "signed-by=/usr/share/keyrings/pgchart-%s-keyring.gpg" $name -}}
+    {{- if not (contains $expectSignedBy $substituted) -}}
+      {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine: %q must include %q -- without it apt has no way to know which key to trust and this fails later, at apply time, inside apt-get update (NO_PUBKEY), instead of at render time; keyUrl's key is dearmored to exactly that path" $name $substituted $expectSignedBy) -}}
+    {{- end -}}
   {{- end -}}
 {{- end -}}
 {{- end }}
@@ -466,15 +473,28 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        image builds, so blindly copying a resolved dependency's transitive closure risks
        silently shadowing the RUNNING container's own libc/libstdc++/etc. with a build
        from the OTHER image -- an ABI hazard, not a convenience. The denylist below
-       exists for exactly that reason: these are never legitimate extraLibs entries
-       (review: widened past the original libc-family set to also cover libssl,
-       libcrypto, libz, the libicu family, libcrypt, and ld-linux, since the running
-       postgres server itself links all of these -- shadowing any of them is just as
-       dangerous as shadowing libc). extraLibs' own copies land in a volume physically
-       separate from
-       ext-lib (statefulset.yaml, ext-extra-lib) specifically so this denylist is the
-       ONLY gate on what ends up on LD_LIBRARY_PATH -- ext-lib is also populated by the
-       unvalidated *.so* glob copy, which this validator has no visibility into. */ -}}
+       exists for exactly that reason: these are never legitimate extraLibs entries.
+       extraLibs' own copies land in a volume physically separate from ext-lib
+       (statefulset.yaml, ext-extra-lib) specifically so this denylist is the ONLY gate
+       on what ends up on LD_LIBRARY_PATH -- ext-lib is also populated by the
+       unvalidated *.so* glob copy, which this validator has no visibility into.
+
+       Denylist is `ldd /usr/lib/postgresql/<major>/bin/postgres` (verified live against
+       the debian:trixie-based postgres/repmgr images this chart ships by default) plus
+       libpq (the dependency of libpqwalreceiver.so, the exact #302 ABI hazard) -- i.e.
+       the full set of libraries the postmaster itself resolves, not just the historical
+       libc family (review: an earlier, narrower list missed libzstd/liblz4/libxml2/
+       libpam/libgssapi_krb5/libnuma/libldap/liburing/libsystemd/libxxhash/liblzma/
+       libaudit/libkrb5/libk5crypto/libcom_err/libkrb5support/liblber/libsasl2/libcap/
+       libcap-ng/libkeyutils, every one of which the postmaster actually links). This is
+       the *current* comprehensive set for the shipped Debian trixie builds, not an
+       eternal guarantee -- a future base-image bump could add a new dependency this
+       list doesn't yet know about. Also requires the path to look like a shared
+       library (basename ends `.so` or `.so.<digits>[.<digits>...]`, review): an
+       absolute path with no such suffix (e.g. a bare directory, or an unrelated file
+       like /etc/passwd) would otherwise pass the character-class check and only fail
+       at cp time inside the init container, crash-looping the pod instead of failing
+       the render. */ -}}
 {{- define "pg.validateExtraLibs" -}}
 {{- $libs := .Values.postgresql.extensions.extraLibs | default list -}}
 {{- if $libs -}}
@@ -485,7 +505,9 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
     {{- fail "postgresql.extensions.extraLibs is set but postgresql.extensions.packages is empty -- extraLibs' copy step only runs alongside the packages apt-get install, so it has nothing to do without at least one package that needs it." -}}
   {{- end -}}
   {{- $pathRe := "^/[A-Za-z0-9._/+-]*[A-Za-z0-9._+-]$" -}}
-  {{- $denyRe := "^(lib(c|m|pthread|dl|rt|resolv|nsl|gcc_s|stdc\\+\\+|ssl|crypto|crypt|z|icu[A-Za-z0-9]*)(\\.so|[.-])|ld-linux)" -}}
+  {{- $soRe := "\\.so(\\.[0-9]+)*$" -}}
+  {{- $denyRe := "^(lib(c|m|pthread|dl|rt|resolv|nsl|gcc_s|stdc\\+\\+|ssl|crypto|crypt|z|icu[A-Za-z0-9]*|zstd|lz4|xml2|pam|gssapi_krb5|numa|ldap|uring|systemd|xxhash|lzma|audit|krb5support|krb5|k5crypto|com_err|lber|sasl2|cap|keyutils|pq)(\\.so|[.-])|ld-linux)" -}}
+  {{- $seenBase := dict -}}
   {{- range $p := $libs -}}
     {{- $path := $p | toString -}}
     {{- if not (regexMatch $pathRe $path) -}}
@@ -495,9 +517,16 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
       {{- fail (printf "postgresql.extensions.extraLibs: invalid path %q -- must not contain a .. path segment" $path) -}}
     {{- end -}}
     {{- $base := base $path -}}
-    {{- if regexMatch $denyRe $base -}}
-      {{- fail (printf "postgresql.extensions.extraLibs: refusing %q -- copying a core runtime library the postgres server itself links (libc/libm/libpthread/libdl/librt/libresolv/libnsl/libgcc_s/libstdc++/libssl/libcrypto/libcrypt/libz/libicu*/ld-linux) risks silently shadowing the postgresql container's own runtime with a build from a different image (copy-base-ext and copy-ext can be different images); this value is for extension-specific dependencies (e.g. libsodium.so.23), not core-runtime libraries" $base) -}}
+    {{- if not (regexMatch $soRe $base) -}}
+      {{- fail (printf "postgresql.extensions.extraLibs: invalid path %q -- must name a shared library (basename ending .so or .so.<digits>...); a directory or unrelated file would pass the character check but fail the cp at init time, crash-looping the pod instead of failing the render" $path) -}}
     {{- end -}}
+    {{- if regexMatch $denyRe $base -}}
+      {{- fail (printf "postgresql.extensions.extraLibs: refusing %q -- copying a library the postgres server itself links (the full glibc/OpenSSL/Kerberos/LDAP/ICU/compression/audit set postgres:*-trixie and cagriekin/repmgr resolve at runtime, not just libc) risks silently shadowing the postgresql container's own runtime with a build from a different image (copy-base-ext and copy-ext can be different images); this value is for extension-specific dependencies (e.g. libsodium.so.23), not libraries the server itself already depends on" $base) -}}
+    {{- end -}}
+    {{- if hasKey $seenBase $base -}}
+      {{- fail (printf "postgresql.extensions.extraLibs: duplicate basename %q -- two different source paths would both copy to the same destination filename in ext-extra-lib, and which one wins depends on copy-base-ext/copy-ext ordering (undefined behavior); use distinct filenames or drop the duplicate" $base) -}}
+    {{- end -}}
+    {{- $seenBase = set $seenBase $base true -}}
   {{- end -}}
 {{- end -}}
 {{- end }}

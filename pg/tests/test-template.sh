@@ -420,7 +420,7 @@ apt_src_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
   --set 'postgresql.extensions.aptSources[0].name=pigsty' \
   --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
-  --set 'postgresql.extensions.aptSources[0].aptLine=deb https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
   --show-only templates/statefulset.yaml 2>&1)
 assert_not_contains "#310: standalone has no copy-base-ext" "${apt_src_standalone}" "name: copy-base-ext"
 assert_contains "#310: standalone copy-ext pins curl to https" "${apt_src_standalone}" "${proto_pin_needle}"
@@ -534,7 +534,7 @@ helm template test-pg "${CHART_DIR}" \
   --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
   --set 'postgresql.extensions.aptSources[0].name=pigsty' \
   --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
-  --set 'postgresql.extensions.aptSources[0].aptLine=deb https://a.example/x trixie main' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://a.example/x trixie main' \
   --set 'postgresql.extensions.aptSources[1].name=pigsty' \
   --set 'postgresql.extensions.aptSources[1].keyUrl=https://repo.pigsty.io/key2' \
   --set 'postgresql.extensions.aptSources[1].aptLine=deb https://b.example/y trixie main' \
@@ -669,9 +669,16 @@ assert_eq "#309: a shell-metacharacter extraLibs entry fails the render" "1" "${
 
 # #309: a core runtime library is refused, to avoid ABI-shadowing the running
 # container's own runtime with a build from a different image (copy-base-ext and
-# copy-ext can be different images). Denylist widened past the original libc-family
-# set (review) to also cover libraries the postgres server itself links.
-for denied_lib in libc.so.6 libstdc++.so.6 libpthread.so.0 libssl.so.3 libcrypto.so.3 libz.so.1 libicuuc.so.74 ld-linux-x86-64.so.2; do
+# copy-ext can be different images). Denylist is the full `ldd postgres` NEEDED set
+# (verified live against postgres:18.1-trixie, review) plus libpq (the #302 hazard for
+# libpqwalreceiver.so specifically), not just the original libc-family subset -- an
+# earlier, narrower list missed all of these, and the test suite itself once used
+# libzstd as a "safe" example when it is in fact a real postgres dependency.
+for denied_lib in libc.so.6 libstdc++.so.6 libpthread.so.0 libssl.so.3 libcrypto.so.3 libz.so.1 \
+  libicuuc.so.74 ld-linux-x86-64.so.2 libzstd.so.1 liblz4.so.1 libxml2.so.2 libpam.so.0 \
+  libgssapi_krb5.so.2 libnuma.so.1 libldap.so.2 liburing.so.2 libsystemd.so.0 libxxhash.so.0 \
+  liblzma.so.5 libaudit.so.1 libkrb5.so.3 libk5crypto.so.3 libcom_err.so.2 libkrb5support.so.0 \
+  liblber.so.2 libsasl2.so.2 libcap.so.2 libcap-ng.so.0 libkeyutils.so.1 libpq.so.5; do
   helm template test-pg "${CHART_DIR}" \
     --set postgresql.extensions.enabled=true \
     --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
@@ -679,6 +686,46 @@ for denied_lib in libc.so.6 libstdc++.so.6 libpthread.so.0 libssl.so.3 libcrypto
     >/dev/null 2>&1 && denylib_rc=0 || denylib_rc=$?
   assert_eq "#309: extraLibs refuses core runtime library ${denied_lib}" "1" "${denylib_rc}"
 done
+
+# #309: a library that merely SHARES A PREFIX with a denied name (not the same
+# library) is not false-positived -- boundary-aware matching, not substring matching.
+for safe_lib in libsodium.so.23 libcairo.so.2 libmagic.so.1 libzip.so.4; do
+  helm template test-pg "${CHART_DIR}" \
+    --set postgresql.extensions.enabled=true \
+    --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+    --set "postgresql.extensions.extraLibs[0]=/usr/lib/x86_64-linux-gnu/${safe_lib}" \
+    >/dev/null 2>&1 && safelib_rc=0 || safelib_rc=$?
+  assert_eq "#309: extraLibs allows unrelated library ${safe_lib}" "0" "${safelib_rc}"
+done
+
+# #309: a path whose basename doesn't look like a shared library (no .so / .so.N
+# suffix) fails the render -- a directory or unrelated file would otherwise pass the
+# character-class check and only fail at cp time, crash-looping the pod.
+for bad_path in /usr/lib/x86_64-linux-gnu /etc/passwd /usr/lib/x86_64-linux-gnu/README; do
+  helm template test-pg "${CHART_DIR}" \
+    --set postgresql.extensions.enabled=true \
+    --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+    --set "postgresql.extensions.extraLibs[0]=${bad_path}" \
+    >/dev/null 2>&1 && nonso_rc=0 || nonso_rc=$?
+  assert_eq "#309: extraLibs rejects a non-.so path (${bad_path})" "1" "${nonso_rc}"
+done
+
+# #309: two extraLibs entries copying to the same destination basename fail the
+# render -- which source wins would otherwise depend on copy-base-ext/copy-ext
+# ordering (undefined behavior from the values file's perspective).
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.extraLibs[0]=/usr/lib/x86_64-linux-gnu/libsodium.so.23' \
+  --set 'postgresql.extensions.extraLibs[1]=/opt/vendor/libsodium.so.23' \
+  >/dev/null 2>&1 && extralibs_dupbase_rc=0 || extralibs_dupbase_rc=$?
+assert_eq "#309: extraLibs rejects duplicate destination basenames" "1" "${extralibs_dupbase_rc}"
+
+# #309: the ext-extra-lib volume is written ONLY by the validated extraLibs copy step,
+# never by the general *.so* glob -- the whole point of keeping it physically separate
+# from ext-lib (review). Confirm the glob's own cp command never targets it.
+assert_not_contains "#309: the *.so* glob never copies into ext-extra-lib" "${extralibs_base_ext}" '*.so* /ext-extra-lib/'
+assert_not_contains "#309: the *.so* glob never copies into ext-extra-lib (copy-ext)" "${extralibs_ext}" '*.so* /ext-extra-lib/'
 
 # #116: the busybox helper init image is a single shared value (default 1.37 for all
 # four init containers, no more 1.35/1.37 split) and is overridable for air-gapped

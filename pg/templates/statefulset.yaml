@@ -1513,10 +1513,13 @@ spec:
         # populated by the unvalidated *.so* glob copy from either image, so
         # LD_LIBRARY_PATH (statefulset.yaml, postgresql container env) points at this
         # volume instead -- written ONLY by extraLibs' own denylist-checked copy step,
-        # never by the general glob.
+        # never by the general glob. Same 1Gi cap as ext-lib/ext-share (review): an
+        # emptyDir sizeLimit is enforced by evicting the POD, not failing the copy
+        # cleanly, so this needs real headroom -- a handful of real-world transitive
+        # dependencies (e.g. a Python/GDAL-linked extension) can each be tens of MB.
         - name: ext-extra-lib
           emptyDir:
-            sizeLimit: 64Mi
+            sizeLimit: 1Gi
 {{- end }}
 {{- end }}
 {{- if .Values.repmgr.enabled }}

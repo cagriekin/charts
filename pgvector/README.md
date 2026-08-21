@@ -183,7 +183,7 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.extensions.enabled` | Enable extensions support | `true` |
 | `postgresql.extensions.packages` | Debian/PGDG packages to `apt-get install` before the copy step, for *additional* extensions beyond `vector` (`pg_cron`, …); `{major}` substitutes `postgresql.majorVersion`; see the [pg chart README](../pg/README.md#installing-extensions-without-a-custom-image) | `[]` |
 | `postgresql.extensions.aptSources` | Non-PGDG apt sources (e.g. Pigsty) to add before installing `packages`; see the [pg chart README](../pg/README.md#installing-packages-from-a-non-pgdg-apt-source-310) | `[]` |
-| `postgresql.extensions.extraLibs` | Exact absolute paths to additionally copy into `/ext-lib`, for a package's own shared-library dependency (e.g. `libsodium.so.23`); see the [pg chart README](../pg/README.md#copying-a-packages-own-shared-library-dependencies-309) | `[]` |
+| `postgresql.extensions.extraLibs` | Exact absolute FILE paths (no trailing `/`) to additionally copy into a dedicated volume, for a package's own shared-library dependency (e.g. `libsodium.so.23`); see the [pg chart README](../pg/README.md#copying-a-packages-own-shared-library-dependencies-309) | `[]` |
 | `postgresql.extensions.installResources` | Resources for the apt-get step (only rendered while `packages` is non-empty) | `100m/128Mi` req, `1/512Mi` limit |
 | `postgresql.audit.enabled` | Enable pgaudit audit logging (requires repmgr mode; see [Audit logging](#audit-logging-pgaudit)) | `false` |
 | `postgresql.audit.log` | pgaudit session classes: `read,write,function,role,ddl,misc,misc_set,all` (negate with `-`) | `"ddl, role, write"` |

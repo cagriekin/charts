@@ -302,7 +302,7 @@ tests:
       postgresql.extensions.aptSources:
         - name: pigsty
           keyUrl: https://repo.pigsty.io/key
-          aptLine: "deb https://a.example/x trixie main"
+          aptLine: "deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://a.example/x trixie main"
         - name: pigsty
           keyUrl: https://repo.pigsty.io/key2
           aptLine: "deb https://b.example/y trixie main"
@@ -336,6 +336,58 @@ tests:
           aptLine: "deb `id` main"
     asserts:
       - failedTemplate: {}
+
+  # trusted=yes disables apt's signature check entirely, making the curl/gpg
+  # verification step decorative -- unsigned packages would install as root.
+  - it: an aptSources aptLine setting trusted=yes fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb [trusted=yes] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorPattern: "sets trusted="
+
+  # Without signed-by referencing exactly the keyring this entry's own key is
+  # dearmored to, apt has no way to know which key to trust -- fails at apply time
+  # (NO_PUBKEY) instead of at render time (CLAUDE.md invariant #4).
+  - it: an aptSources aptLine without signed-by fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorPattern: "must include \"signed-by=/usr/share/keyrings/pgchart-pigsty-keyring\\.gpg\""
+
+  # signed-by referencing a DIFFERENT entry's keyring (or a typo) is just as broken
+  # as omitting it outright -- must match this entry's own name exactly.
+  - it: an aptSources aptLine with a mismatched signed-by fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb [signed-by=/usr/share/keyrings/pgchart-other-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorPattern: "must include \"signed-by=/usr/share/keyrings/pgchart-pigsty-keyring\\.gpg\""
 
   - it: a valid aptSources entry renders successfully
     templates:
@@ -416,7 +468,7 @@ tests:
         - "/usr/lib/x86_64-linux-gnu/libc.so.6"
     asserts:
       - failedTemplate:
-          errorPattern: "refusing .* core runtime library"
+          errorPattern: "refusing .* copying a library the postgres server itself links"
 
   # Denylist widened past the original libc-family set (review): the postgres server
   # itself links libssl/libcrypto too, so shadowing either is just as dangerous.
@@ -431,7 +483,7 @@ tests:
         - "/usr/lib/x86_64-linux-gnu/libssl.so.3"
     asserts:
       - failedTemplate:
-          errorPattern: "refusing .* core runtime library"
+          errorPattern: "refusing .* copying a library the postgres server itself links"
 
   # "libcrypt" (a real, distinct core library, not "libcrypto") must still be caught by
   # the boundary-aware denylist regex, and an unrelated library that merely starts
@@ -447,9 +499,14 @@ tests:
         - "/usr/lib/x86_64-linux-gnu/libcrypt.so.1"
     asserts:
       - failedTemplate:
-          errorPattern: "refusing .* core runtime library"
+          errorPattern: "refusing .* copying a library the postgres server itself links"
 
-  - it: a library merely sharing a denylisted prefix (libzstd, not libz) is allowed
+  # libzstd/liblz4/libxml2/etc. are ALSO denied (review): they're all real postgres
+  # dependencies (verified via `ldd postgres`), not merely prefix-sharing lookalikes --
+  # see the dedicated denial tests above. libcairo genuinely is unrelated to postgres's
+  # own NEEDED set and shares only its first four letters with libc, so it's the correct
+  # example of "boundary-aware matching, not a false positive on a shared prefix".
+  - it: a library merely sharing a denylisted prefix (libcairo, not libc) is allowed
     templates:
       - templates/statefulset.yaml
     set:
@@ -458,11 +515,11 @@ tests:
       postgresql.extensions.packages:
         - "postgresql-{major}-pgsodium"
       postgresql.extensions.extraLibs:
-        - /usr/lib/x86_64-linux-gnu/libzstd.so.1
+        - /usr/lib/x86_64-linux-gnu/libcairo.so.2
     asserts:
       - matchRegex:
           path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")].command[2]
-          pattern: "cp /usr/lib/x86_64-linux-gnu/libzstd\\.so\\.1 /ext-extra-lib/"
+          pattern: "cp /usr/lib/x86_64-linux-gnu/libcairo\\.so\\.2 /ext-extra-lib/"
 
   # A trailing / is a directory, not a file -- cp would fail at init time and
   # crashloop the pod instead of failing fast at render time (review).
