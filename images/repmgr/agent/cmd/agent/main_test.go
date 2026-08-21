@@ -91,11 +91,12 @@ func TestLogStartupConfigExcludesSecrets(t *testing.T) {
 // --- fakes for the act() path ---
 
 type fakePostmaster struct {
-	started  bool
-	stopped  bool
-	stopMode process.StopMode
-	reloaded bool
-	running  bool
+	started   bool
+	stopped   bool
+	stopMode  process.StopMode
+	reloaded  bool
+	reloadErr error
+	running   bool
 	// stopErr, when set, is what Stop returns -- context.DeadlineExceeded stands in for
 	// the real postmaster's deadline-forced SIGKILL. deadOnStop clears running the way a
 	// killed-and-reaped child does; without it the child is still alive after the failure.
@@ -117,8 +118,15 @@ func (f *fakePostmaster) Stop(ctx context.Context, m process.StopMode) error {
 	f.running = false
 	return nil
 }
-func (f *fakePostmaster) Reload(context.Context) error { f.reloaded = true; return nil }
-func (f *fakePostmaster) Running() bool                { return f.running }
+
+// reloadErr, when set, is what Reload returns -- used to test the #308 recovery path
+// where a reload failure must not permanently strand a patched-but-not-reloaded
+// primary_conninfo behind the "already streaming" shortcut.
+func (f *fakePostmaster) Reload(context.Context) error {
+	f.reloaded = true
+	return f.reloadErr
+}
+func (f *fakePostmaster) Running() bool { return f.running }
 
 type fakeDCS struct{ released bool }
 
@@ -272,6 +280,87 @@ func TestActFollowPatchesPrimaryConninfoDBNameAndReloads(t *testing.T) {
 	}
 	if !pm.reloaded {
 		t.Error("act must reload the postmaster after patching primary_conninfo")
+	}
+}
+
+// The dbname patch must also run on the "already streaming" shortcut path (no real
+// `repmgr standby follow` call), not only after a real Follow -- a repmgrd->agent
+// migration or a post-failover rejoin can leave a standby already streaming with a
+// primary_conninfo repmgr itself never patched.
+func TestActFollowPatchesPrimaryConninfoDBNameOnAlreadyStreamingShortcut(t *testing.T) {
+	ex := &scriptedExec{walRcv: "pg-0.h|streaming"} // already streaming -> shortcut, no real Follow
+	pm := &fakePostmaster{}
+	a := newFollowTestAgentWithPM(t, ex, pm)
+	confPath := filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf")
+	if err := os.WriteFile(confPath, []byte(
+		`primary_conninfo = 'host=''pg-0.h'' port=5432 user=repmgr application_name=''pg-1'' connect_timeout=10'`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if ex.follows != 0 {
+		t.Fatalf("repmgr standby follow must still be skipped when already streaming, got %d calls", ex.follows)
+	}
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "dbname=") {
+		t.Errorf("primary_conninfo was not patched with dbname on the shortcut path:\n%s", b)
+	}
+	if !pm.reloaded {
+		t.Error("act must reload the postmaster after patching primary_conninfo, even on the shortcut path")
+	}
+}
+
+// A reload failure must not permanently strand a patched-but-not-reloaded
+// primary_conninfo: act() returns an error (so followUpstream never latches), but the
+// FILE is already patched -- the next tick must retry the reload via the
+// already-streaming shortcut rather than silently giving up once streaming looks fine.
+func TestActFollowRetriesReloadAfterPriorFailure(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""} // not yet streaming -> first tick runs a real Follow
+	pm := &fakePostmaster{reloadErr: errors.New("reload failed")}
+	a := newFollowTestAgentWithPM(t, ex, pm)
+	confPath := filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf")
+	if err := os.WriteFile(confPath, []byte(
+		`primary_conninfo = 'host=''pg-0.h'' port=5432 user=repmgr application_name=''pg-1'' connect_timeout=10'`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err == nil {
+		t.Fatal("expected the reload failure to surface as an error")
+	}
+	if a.followUpstream == "pg-0" {
+		t.Fatal("followUpstream must not latch when the reload failed")
+	}
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "dbname=") {
+		t.Fatalf("the file should already be patched from the failed attempt:\n%s", b)
+	}
+
+	// Second tick: the standby is now streaming (the underlying replication connection
+	// never depended on dbname), so this would take the already-streaming shortcut. The
+	// reload must still be retried -- fix the postmaster and confirm it recovers.
+	ex.walRcv = "pg-0.h|streaming"
+	followsBefore := ex.follows
+	pm.reloadErr = nil
+	pm.reloaded = false
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if ex.follows != followsBefore {
+		t.Fatalf("the retry must go through the shortcut, not another real follow, got %d calls (was %d)", ex.follows, followsBefore)
+	}
+	if !pm.reloaded {
+		t.Error("the second tick must retry the reload rather than silently latching")
+	}
+	if a.followUpstream != "pg-0" {
+		t.Error("followUpstream must latch once the retried reload succeeds")
 	}
 }
 
@@ -742,6 +831,31 @@ func TestAssertSyncStandbySlotsReconciles(t *testing.T) {
 	}
 	if want := "repmgr_slot_1001,repmgr_slot_1002"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
 		t.Errorf("lastSyncStandbySlots = %v, want %q", a.lastSyncStandbySlots, want)
+	}
+}
+
+// repmgr.nodes has no ORDER BY, so StandbyNodeIDs' row order is not guaranteed stable
+// between calls even when the standby SET is unchanged. desired doubles as the cache
+// key (a bare string compare), so an unstable order would make the primary re-run ALTER
+// SYSTEM + reload every tick even in the steady state -- churn indistinguishable from a
+// real topology change. Two ticks with the same IDs in a DIFFERENT order must produce
+// byte-identical output and no second SQL call.
+func TestAssertSyncStandbySlotsOrderIndependent(t *testing.T) {
+	ex := &scriptedExec{nodes: "1002\n1001\n", slots: "repmgr_slot_1001\nrepmgr_slot_1002\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if want := "repmgr_slot_1001,repmgr_slot_1002"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
+		t.Fatalf("lastSyncStandbySlots = %v, want %q (sorted regardless of repmgr.nodes row order)", a.lastSyncStandbySlots, want)
+	}
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("first call: expected 2 SQL statements, got %v", ex.slotSyncSQL)
+	}
+	// Same standbys, rows returned in the OTHER order -- must be treated as unchanged.
+	ex.nodes = "1001\n1002\n"
+	a.assertSyncStandbySlots(context.Background())
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("second call with the same standbys in a different row order must not issue more SQL, got %v", ex.slotSyncSQL)
 	}
 }
 

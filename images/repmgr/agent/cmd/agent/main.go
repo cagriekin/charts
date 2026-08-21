@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -148,6 +149,16 @@ type agent struct {
 	// server) runs only when the upstream actually changes, not every tick. Reset
 	// on any non-Follow action.
 	followUpstream string
+
+	// dbNameReloadPending is set when a #308 primary_conninfo dbname patch was written
+	// to disk but the follow-up postmaster reload failed, and cleared once a reload
+	// succeeds. EnsurePrimaryConninfoDBName's own changed=true/false only reports
+	// whether THIS call wrote a change to the FILE -- once written, every later call
+	// reports changed=false regardless of whether the reload ever actually took, so
+	// that signal alone cannot drive a retry. This flag is what does: the Follow case
+	// reloads whenever changed is true OR this is still true, so a failed reload is
+	// retried on the next tick even though the file itself needs no further change.
+	dbNameReloadPending bool
 
 	// lastSyncStandbySlots caches the comma-joined slot list synchronized_standby_slots
 	// was last successfully set to (#308), so a primary tick with an unchanged standby
@@ -736,49 +747,63 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// across the roll, and a post-failover rejoin attaches before Follow. repmgr
 		// standby follow then exits non-zero (slot already active), which, left
 		// unlatched, repeats every tick. Skip the command when already streaming from
-		// the target and latch; repointing to a NEW upstream (sender_host differs, or
-		// no walreceiver yet) still falls through to Follow.
+		// the target; repointing to a NEW upstream (sender_host differs, or no
+		// walreceiver yet) still falls through to Follow.
 		//
 		// Gate the skip on a successful register: the follow it replaces implicitly
 		// requires the repmgr.nodes record (repmgr fails "unable to retrieve node
 		// record" -- NOT the benign exit -- and retries when it is missing), but the
 		// probe bypasses that check. A freshly-cloned standby streams before it is ever
-		// registered, so latching here on a failed register would strand it without a
+		// registered, so skipping here on a failed register would strand it without a
 		// record and break a later promote. On a failed register, fall through to
 		// follow (which re-establishes the record, or errors so the next tick retries).
-		if regErr == nil && a.streamingFromTarget(ctx, dec.Target) {
-			a.followUpstream = dec.Target
-			return nil
-		}
-		if err := a.mech.Follow(ctx, up); err != nil {
-			// #297: this node has no row in its own metadata copy -- a freshly-cloned standby
-			// whose upstream changed before it registered. It can never obtain the row (that
-			// needs replication, which is what it is trying to establish), so it would retry
-			// forever, Running but never Ready, silently not replicating. Re-clone from the
-			// current primary: that replaces both its data AND its metadata copy, and a
-			// standby in this state has no writes of its own to lose.
-			//
-			// Scoped narrowly on purpose. It fires ONLY on the local-record error, never on a
-			// missing UPSTREAM record -- that one is the ordinary post-failover case where the
-			// target simply has not promoted yet, and escalating there demotes and re-clones a
-			// healthy standby (a mistake made and reverted on #286).
-			if errors.Is(err, mechanism.ErrLocalRecordMissing) {
-				a.log.Warn("this node is absent from its own repmgr.nodes copy; re-cloning from the current primary",
-					"target", dec.Target, "err", err)
-				return a.rejoinOnto(ctx, dec.Target)
+		if regErr != nil || !a.streamingFromTarget(ctx, dec.Target) {
+			if err := a.mech.Follow(ctx, up); err != nil {
+				// #297: this node has no row in its own metadata copy -- a freshly-cloned standby
+				// whose upstream changed before it registered. It can never obtain the row (that
+				// needs replication, which is what it is trying to establish), so it would retry
+				// forever, Running but never Ready, silently not replicating. Re-clone from the
+				// current primary: that replaces both its data AND its metadata copy, and a
+				// standby in this state has no writes of its own to lose.
+				//
+				// Scoped narrowly on purpose. It fires ONLY on the local-record error, never on a
+				// missing UPSTREAM record -- that one is the ordinary post-failover case where the
+				// target simply has not promoted yet, and escalating there demotes and re-clones a
+				// healthy standby (a mistake made and reverted on #286).
+				if errors.Is(err, mechanism.ErrLocalRecordMissing) {
+					a.log.Warn("this node is absent from its own repmgr.nodes copy; re-cloning from the current primary",
+						"target", dec.Target, "err", err)
+					return a.rejoinOnto(ctx, dec.Target)
+				}
+				return err
 			}
-			return err
 		}
-		// #308: repmgr standby follow writes primary_conninfo without dbname (PG17+'s
-		// sync_replication_slots worker needs it); patch it in and reload so the change
-		// takes effect on this already-running standby. A no-op, no-reload when dbname is
-		// already present.
-		if changed, err := a.ensurePrimaryConninfoDBName(); err != nil {
+		// #308: converge dbname in primary_conninfo on EVERY tick that reaches here --
+		// whether this tick just ran a real `repmgr standby follow` (which writes
+		// primary_conninfo without dbname; PG17+'s sync_replication_slots worker
+		// requires it) or skipped it via the already-streaming shortcut above. Running
+		// it unconditionally here, not only after a real Follow, matters specifically
+		// when a PRIOR tick's reload below failed: that tick returns an error without
+		// latching followUpstream, so the next tick re-enters this case, finds itself
+		// already streaming (the file was already patched, just not reloaded), and
+		// would otherwise take the shortcut and latch without ever retrying the reload
+		// -- stranding a standby whose on-disk conninfo has dbname but whose running
+		// postmaster does not. EnsurePrimaryConninfoDBName is a no-op, no-reload read
+		// when dbname is already active, so this costs nothing on the common path.
+		//
+		// changed alone cannot drive the retry once the FILE is already correct
+		// (EnsurePrimaryConninfoDBName then reports changed=false forever, even though
+		// the reload that was supposed to apply it never actually succeeded) -- hence
+		// dbNameReloadPending, sticky across ticks until a reload actually succeeds.
+		changed, err := a.ensurePrimaryConninfoDBName()
+		if err != nil {
 			a.log.Warn("ensure dbname in primary_conninfo", "err", err)
-		} else if changed {
+		} else if changed || a.dbNameReloadPending {
 			if err := a.sup.Reload(ctx); err != nil {
+				a.dbNameReloadPending = true
 				return fmt.Errorf("reload after patching primary_conninfo dbname: %w", err)
 			}
+			a.dbNameReloadPending = false
 		}
 		a.followUpstream = dec.Target
 		return nil
@@ -1193,6 +1218,13 @@ func (a *agent) assertSyncStandbySlots(ctx context.Context) {
 	for _, id := range ghostNodeIDs(standbyIDs, a.cfg.NodeCount) {
 		ghosts[id] = true
 	}
+	// Sorted: standbyIDs comes from `SELECT node_id FROM repmgr.nodes WHERE type =
+	// 'standby'` with no ORDER BY, so its row order is not guaranteed stable between
+	// calls even when the standby SET is unchanged. desired below doubles as the cache
+	// key (a bare string compare, not a set compare), so an unstable order would make
+	// the primary re-run ALTER SYSTEM + reload every tick even in the common steady
+	// state -- churn indistinguishable from a real topology change.
+	sort.Ints(standbyIDs)
 	var slots []string
 	for _, id := range standbyIDs {
 		if ghosts[id] {

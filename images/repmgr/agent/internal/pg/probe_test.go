@@ -240,6 +240,26 @@ func TestStandbyNodeIDsUnreachable(t *testing.T) {
 }
 
 // #308: synchronized_standby_slots reconciliation reads this.
+// Pins the specific regression an earlier revision had: filtering on `active` meant a
+// standby restart, a rolling upgrade, or a brief network blip (walsender momentarily
+// detached) emptied synchronized_standby_slots. This must query existence only.
+func TestPhysicalSlotsQueryHasNoActiveFilter(t *testing.T) {
+	ex := &spySlotExec{}
+	p := &Prober{Exec: ex}
+	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{Host: "x"}); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(ex.calls) != 1 {
+		t.Fatalf("calls = %v, want exactly 1", ex.calls)
+	}
+	if strings.Contains(ex.calls[0], "active") {
+		t.Errorf("query must not filter on active (that reintroduces the blip regression): %q", ex.calls[0])
+	}
+	if !strings.Contains(ex.calls[0], "slot_type = 'physical'") {
+		t.Errorf("query must still scope to physical slots: %q", ex.calls[0])
+	}
+}
+
 func TestPhysicalSlots(t *testing.T) {
 	p := proberWith(fakeExec{slots: "repmgr_slot_1001\nrepmgr_slot_1002\n"})
 	names, err := p.PhysicalSlots(context.Background(), ConnInfo{Host: "x"})
