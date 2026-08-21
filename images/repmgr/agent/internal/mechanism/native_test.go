@@ -60,6 +60,30 @@ func TestNativeGenerateConfigIsIdempotent(t *testing.T) {
 	}
 }
 
+// GenerateConfig runs once per agent process boot (main.go's boot()) -- including every
+// pod restart on an already-following standby, not just a fresh node. It must preserve
+// whatever primary_conninfo Follow already wrote rather than reverting it to empty, or a
+// routine pod restart would silently interrupt replication until the next reconcile tick's
+// Follow re-establishes it.
+func TestNativeGenerateConfigPreservesExistingConninfo(t *testing.T) {
+	n, dataDir := newTestNative(t, &fakeRunner{})
+	upstream := Conn{Host: "pg-1.h", Port: 5432, User: "repmgr"}
+	if err := n.Follow(context.Background(), upstream); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an agent process restart on the same PGDATA.
+	if err := n.GenerateConfig(context.Background(), NodeIdentity{}, ConfigOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	managed, err := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(managed), "pg-1.h") {
+		t.Errorf("GenerateConfig dropped the existing primary_conninfo after a simulated restart:\n%s", managed)
+	}
+}
+
 func TestNativePromote(t *testing.T) {
 	fr := &fakeRunner{}
 	n, dataDir := newTestNative(t, fr)
@@ -112,12 +136,39 @@ func TestNativeCloneArgs(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := fr.lastArgs()
-	for _, want := range []string{"-h pg-0.h", "-D " + dataDir, "-X stream", "-R", "--checkpoint=fast", "--no-password"} {
+	for _, want := range []string{"-h pg-0.h", "-D " + dataDir, "-X stream", "--checkpoint=fast", "--no-password"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("pg_basebackup args %q missing %q", got, want)
 		}
 	}
-	// -R is what makes a fresh clone stream immediately without a separate Follow (#181).
+	// No -R: Clone calls Follow itself instead (below), so primary_conninfo/standby.signal
+	// go through the one managed-fragment path Follow/GenerateConfig also use, rather than
+	// postgresql.auto.conf, which would silently outrank a later Follow (postgresql.auto.conf
+	// is included last).
+	if strings.Contains(got, "-R") {
+		t.Errorf("pg_basebackup args %q must not use -R", got)
+	}
+}
+
+// Clone must leave the node streaming immediately without a separate caller-side Follow
+// (#181) -- achieved by calling Follow itself rather than pg_basebackup -R (see
+// TestNativeCloneArgs).
+func TestNativeCloneCallsFollow(t *testing.T) {
+	n, dataDir := newTestNative(t, &fakeRunner{})
+	source := Conn{Host: "pg-0.h", Port: 5432, User: "repmgr"}
+	if err := n.Clone(context.Background(), source); err != nil {
+		t.Fatal(err)
+	}
+	managed, err := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(managed), "pg-0.h") {
+		t.Errorf("managed conf missing primary_conninfo for the clone source:\n%s", managed)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "standby.signal")); err != nil {
+		t.Errorf("standby.signal not created by Clone: %v", err)
+	}
 }
 
 // #178: a transient failure to REACH the rewind source must not be reported as

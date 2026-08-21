@@ -91,9 +91,16 @@ func (n *Native) ensureInclude() error {
 	if err != nil {
 		return fmt.Errorf("native: open %s: %w", confPath, err)
 	}
-	defer f.Close()
 	if _, err := f.WriteString("\n# Managed by pg-ha-agent (native mechanism, #287)\n" + line + "\n"); err != nil {
+		f.Close()
 		return fmt.Errorf("native: append include to %s: %w", confPath, err)
+	}
+	// Checked, not deferred-and-dropped: a close failure (e.g. a delayed write-back error
+	// surfacing only at close) means the include line's durability is not guaranteed even
+	// though the write above returned success, and a missing include silently drops
+	// wal_log_hints/hot_standby/primary_conninfo from postgresql.conf.
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("native: close %s: %w", confPath, err)
 	}
 	return nil
 }
@@ -133,10 +140,31 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 // restart, so they live in a rewritten fragment rather than being appended to
 // PGDATA/postgresql.conf, where repeated ticks would accumulate duplicates.
 //
-// primary_conninfo is deliberately NOT written here: Follow owns it, because it changes per
-// upstream and must be written together with standby.signal in one operation.
+// Preserves whatever primary_conninfo is already on disk rather than writing "" -- this
+// runs once per agent process boot (main.go's boot()), which includes every pod restart on
+// an already-cloned standby, not just a fresh node. Forcibly clearing it here would drop a
+// working standby's upstream on every restart, self-healing only after the next Follow (a
+// needless replication gap). Follow remains the only place that CHANGES it.
 func (n *Native) GenerateConfig(ctx context.Context, id NodeIdentity, o ConfigOpts) error {
-	return n.writeManagedConf("")
+	return n.writeManagedConf(n.currentPrimaryConninfo())
+}
+
+// currentPrimaryConninfo reads back the primary_conninfo already on disk, or "" if the
+// managed fragment does not exist yet (fresh node) or carries none (primary).
+func (n *Native) currentPrimaryConninfo() string {
+	b, err := os.ReadFile(n.managedConfPath())
+	if err != nil {
+		return ""
+	}
+	const prefix = "primary_conninfo = '"
+	for _, line := range strings.Split(string(b), "\n") {
+		if rest, ok := strings.CutPrefix(line, prefix); ok {
+			if v, ok := strings.CutSuffix(rest, "'"); ok {
+				return unescapeSingleQuoted(v)
+			}
+		}
+	}
+	return ""
 }
 
 // Promote turns the local standby into a read-write primary on a new timeline.
@@ -192,10 +220,17 @@ func (n *Native) Follow(ctx context.Context, upstream Conn) error {
 // has been moved aside (ReclonePreserving does the moving).
 //
 // -R writes primary_conninfo and standby.signal into the new data directory, so the clone
-// streams as soon as it starts without a separate Follow -- the #181 failure mode was a
-// standby that came up after a cutover and never re-established streaming. -X stream copies
-// WAL concurrently so the backup is self-consistent without depending on WAL still being
-// retained on the primary when the copy finishes.
+// streams as soon as it starts without a separate Follow call from the caller -- the #181
+// failure mode was a standby that came up after a cutover and never re-established
+// streaming. -X stream copies WAL concurrently so the backup is self-consistent without
+// depending on WAL still being retained on the primary when the copy finishes.
+//
+// Deliberately NOT pg_basebackup -R: that writes primary_conninfo/standby.signal into
+// postgresql.auto.conf, a SECOND place recovery config can live besides the managed
+// fragment Follow writes to. postgresql.auto.conf is included last (initdb appends it to
+// the end of postgresql.conf), so it would silently outrank any later Follow -- a standby
+// cloned once and later re-pointed to a new upstream would keep streaming from the
+// original source. Calling Follow here instead keeps exactly one authoritative place.
 func (n *Native) Clone(ctx context.Context, source Conn) error {
 	if n.DataDir == "" {
 		return fmt.Errorf("native: DataDir not set")
@@ -209,14 +244,13 @@ func (n *Native) Clone(ctx context.Context, source Conn) error {
 		"-U", source.User,
 		"-D", n.DataDir,
 		"-X", "stream",
-		"-R",
 		"--checkpoint=fast",
 		"--no-password",
 	}
 	if out, err := n.run(ctx, n.bin("pg_basebackup"), args...); err != nil {
 		return fmt.Errorf("native: pg_basebackup from %s: %w: %s", source.Host, err, strings.TrimSpace(out))
 	}
-	return nil
+	return n.Follow(ctx, source)
 }
 
 // RejoinForceRewind rewinds the diverged local node forward onto target via pg_rewind, then
@@ -321,6 +355,10 @@ func isConnectionFailure(out string) bool {
 
 // escapeSingleQuoted escapes a value for inclusion in a single-quoted postgresql.conf GUC.
 func escapeSingleQuoted(v string) string { return strings.ReplaceAll(v, "'", "''") }
+
+// unescapeSingleQuoted reverses escapeSingleQuoted, for reading a GUC value back out of a
+// single-quoted postgresql.conf line.
+func unescapeSingleQuoted(v string) string { return strings.ReplaceAll(v, "''", "'") }
 
 // writeFileAtomic writes via a temp file + rename so a crash mid-write cannot leave the
 // postmaster reading a half-written config (which would fail its next start).

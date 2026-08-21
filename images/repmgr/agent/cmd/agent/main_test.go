@@ -266,6 +266,26 @@ func TestActFollowRunsWhenNotStreaming(t *testing.T) {
 	}
 }
 
+// #287: the native mechanism only writes files (managed conf + standby.signal) and relies
+// on the caller to apply them -- unlike repmgr standby follow, which applies the repoint
+// itself. act() must reload the supervised postmaster after every successful Follow, not
+// just for one mechanism, or native mode's Follow is silently inert (the file changes but
+// the running postmaster never reconnects to the new upstream). Asserted against the
+// generic act() path (mechanism-agnostic) rather than duplicating a full Native-backed
+// harness, since the fix lives in act(), not in either mechanism.
+func TestActFollowReloadsPostmasterAfterSuccess(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""}
+	pm := &fakePostmaster{}
+	a := newFollowTestAgentWithPM(t, ex, pm)
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if !pm.reloaded {
+		t.Fatal("act must reload the postmaster after a successful Follow, or a mechanism that only writes files (native) never applies the repoint")
+	}
+}
+
 // #297: a standby absent from its OWN repmgr.nodes copy can never obtain the row, so
 // following is permanently impossible -- it would sit Running-but-never-Ready, silently not
 // replicating. Re-clone from the current primary, which replaces data and metadata together.

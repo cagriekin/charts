@@ -728,6 +728,17 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			}
 			return err
 		}
+		// repmgr standby follow applies the repoint itself (this reload is a harmless
+		// no-op confirming it). The native mechanism only writes files (managed conf +
+		// standby.signal) and relies on the caller to apply them -- primary_conninfo is
+		// reloadable in modern PostgreSQL (this node is already InRecovery, per Decide's
+		// precondition for the Follow action, so a reload -- not a full restart -- is
+		// sufficient to make the walreceiver reconnect to the new upstream). Skipping
+		// this would leave native mode's Follow silently inert: the file changes, but
+		// nothing tells the running postmaster to pick it up (#287).
+		if err := a.sup.Reload(ctx); err != nil {
+			return fmt.Errorf("reload after follow: %w", err)
+		}
 		a.followUpstream = dec.Target
 		return nil
 

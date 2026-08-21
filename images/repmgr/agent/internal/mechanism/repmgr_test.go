@@ -31,6 +31,23 @@ func (f *fakeRunner) Run(_ context.Context, env []string, name string, args ...s
 		}
 		return out, errors.New("exit status 23")
 	}
+	// A real pg_basebackup creates -D's target directory and copies the whole source
+	// PGDATA tree into it (including postgresql.conf); native.Clone's caller (e.g.
+	// ReclonePreserving, which renames the old PGDATA aside first) and native.Clone's own
+	// trailing Follow call (which reads postgresql.conf) both rely on that, so a
+	// successful fake call must mirror it.
+	if strings.HasSuffix(name, "pg_basebackup") {
+		for i, a := range args {
+			if a == "-D" && i+1 < len(args) {
+				dir := args[i+1]
+				_ = os.MkdirAll(dir, 0o700)
+				confPath := filepath.Join(dir, "postgresql.conf")
+				if _, err := os.Stat(confPath); os.IsNotExist(err) {
+					_ = os.WriteFile(confPath, []byte("# initial\n"), 0o600)
+				}
+			}
+		}
+	}
 	return "ok", nil
 }
 

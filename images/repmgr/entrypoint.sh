@@ -103,6 +103,14 @@ reclone_preserving_old() {
 # init container, which holds the re-clone logic, does not re-run on a
 # container-only restart (CrashLoopBackOff, OOM, liveness kill). Repmgr-managed
 # nodes only; no-op for standalone use of the image.
+#
+# Unconditionally repmgr-backed, with no MECHANISM awareness at all (#287): this shell
+# guard runs before the Go agent (or repmgrd) ever starts, so it cannot consult the
+# agent's config. Harmless for now -- it only acts when a peer is on a strictly newer
+# timeline, which cannot happen under native mode's only currently-supported shape (a
+# lone primary, no peers, per the EXPERIMENTAL warning) -- but this is exactly the kind
+# of pre-agent bootstrap path #288 (native topology) will need to make mechanism-aware
+# before native mode can run a real multi-node cluster.
 primary_safety_guard() {
     [ -f /etc/repmgr/repmgr.conf ] || return 0
     [ -n "${HEADLESS_SERVICE:-}" ] || return 0
