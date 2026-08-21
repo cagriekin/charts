@@ -1,0 +1,9 @@
+postgresql:
+  extensions:
+    enabled: true
+    packages:
+      - "postgresql-{major}-pgsodium"
+    aptSources:
+      - name: pigsty
+        keyUrl: https://repo.pigsty.io/key
+        aptLine: "deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg,arch=amd64,arm64] https://repo.pigsty.io/apt/pgsql/trixie trixie main"

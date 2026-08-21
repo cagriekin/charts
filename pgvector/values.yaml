@@ -263,9 +263,16 @@ postgresql:
     # extensions PGDG doesn't package (pgsodium, supabase_vault, ...). {major} substitutes
     # into aptLine. Requires packages to be non-empty. See the pg chart README.
     aptSources: []
-      # - name: pigsty
+      # - name: pigsty        # keyring/list files get a pgchart- prefix; see pg README
       #   keyUrl: https://repo.pigsty.io/key
-      #   aptLine: "deb [signed-by=/usr/share/keyrings/pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+      #   aptLine: "deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    # Exact absolute paths to additionally copy into /ext-lib (#309), for a transitive
+    # shared-library dependency Debian places outside /usr/lib/postgresql/<major>/lib
+    # (e.g. libsodium.so.23). Pairs with LD_LIBRARY_PATH, set automatically when
+    # extensions.enabled. Requires packages to be non-empty; core C-runtime libraries are
+    # refused. See the pg chart README.
+    extraLibs: []
+      # - /usr/lib/x86_64-linux-gnu/libsodium.so.23
     installResources:
       requests:
         cpu: 100m

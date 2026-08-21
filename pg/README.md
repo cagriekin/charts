@@ -168,6 +168,7 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.extensions.enabled` | Enable extensions support | `false` |
 | `postgresql.extensions.packages` | Debian/PGDG packages to `apt-get install` before the copy step, so extensions absent from the donor image (`pg_cron`, `postgis`, …) install without a custom image; `{major}` substitutes `postgresql.majorVersion` (see [Installing extensions without a custom image](#installing-extensions-without-a-custom-image)) | `[]` |
 | `postgresql.extensions.aptSources` | Non-PGDG apt sources (e.g. Pigsty) to add before installing `packages`, for extensions PGDG doesn't package (see [Installing packages from a non-PGDG apt source](#installing-packages-from-a-non-pgdg-apt-source-310)) | `[]` |
+| `postgresql.extensions.extraLibs` | Exact absolute paths to additionally copy into `/ext-lib`, for a package's own shared-library dependency Debian installs outside the Postgres extension dir (e.g. `libsodium.so.23`; see [Copying a package's own shared-library dependencies](#copying-a-packages-own-shared-library-dependencies-309)) | `[]` |
 | `postgresql.extensions.installResources` | Resources for the apt-get step (only rendered while `packages` is non-empty) | `100m/128Mi` req, `1/512Mi` limit |
 | `postgresql.audit.enabled` | Enable pgaudit audit logging (requires repmgr mode; see [Audit logging](#audit-logging-pgaudit)) | `false` |
 | `postgresql.audit.log` | pgaudit session classes: `read,write,function,role,ddl,misc,misc_set,all` (negate with `-`) | `"ddl, role, write"` |
@@ -273,6 +274,8 @@ This egress is needed on **every** pod (re)start, not just the first install: `e
 
 Several real-world extensions — `pgsodium`, `supabase_vault`, `pg_graphql`, `pg_net`, `supautils`, `wrappers`, `pgjwt`, `pgmq` — aren't PGDG-packaged at all; they're only available via [Pigsty's apt repo](https://repo.pigsty.io) (`repo.pigsty.io/apt/pgsql/<codename>`). `postgresql.extensions.aptSources` adds a source like that inside `copy-ext`/`copy-base-ext`'s own throwaway filesystem, before the `apt-get install` step above — so a package that isn't on PGDG installs the same way a PGDG one does, without needing it pre-baked into either image (including the `cagriekin/repmgr` image copy-base-ext runs from, which has no Pigsty source and isn't something a chart consumer builds).
 
+`pgsodium`/`supabase_vault` also need `postgresql.extensions.extraLibs` (next section) to actually start — `aptSources` + `packages` alone gets the extension `.so` copied, but not its own runtime dependency, so read that section too before using this example for real.
+
 ```yaml
 postgresql:
   majorVersion: "18"
@@ -281,7 +284,7 @@ postgresql:
     aptSources:
       - name: pigsty
         keyUrl: https://repo.pigsty.io/key
-        aptLine: "deb [signed-by=/usr/share/keyrings/pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+        aptLine: "deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
     packages:
       - "postgresql-{major}-pgsodium"
       - "postgresql-{major}-vault"
@@ -289,15 +292,39 @@ postgresql:
 
 `trixie` above is the Debian codename the image actually ships (the official `postgres:18.1-trixie` image, by default) — unlike `{major}` in `packages`/`aptLine`, this isn't derived from any chart value, since the chart has no notion of "Debian codename" independent of the image tag; write the one your `postgresql.image`/`repmgr.image` actually use. `{major}` in `aptLine` still substitutes `postgresql.majorVersion`, same as in `packages`.
 
-Each entry is dearmored to `/usr/share/keyrings/<name>-keyring.gpg` and written to `/etc/apt/sources.list.d/<name>.list` via `curl | gpg --dearmor` before `apt-get update` runs again — `name` must be unique, and both `keyUrl` and `aptLine` are restricted to a narrow character allowlist at render time (`pg.validateExtensionAptSources`), since both are interpolated into a shell command. An entry is rejected outright if `packages` is empty — `aptSources` exists only to make packages from that source installable, so it has nothing to do without at least one.
+Each entry is dearmored to `/usr/share/keyrings/pgchart-<name>-keyring.gpg` and written to `/etc/apt/sources.list.d/pgchart-<name>.list` via `curl | gpg --dearmor` before `apt-get update` runs again — the `pgchart-` prefix means an entry can never collide with a source the image already owns (the `cagriekin/repmgr` image's own PGDG source is `postgresql-keyring.gpg`/`postgresql.list`); `name` must still be unique across your own `aptSources` entries, and both `keyUrl` and `aptLine` are restricted to a narrow character allowlist at render time (`pg.validateExtensionAptSources`), since both are interpolated into a shell command. An entry is rejected outright if `packages` is empty — `aptSources` exists only to make packages from that source installable, so it has nothing to do without at least one.
 
 `curl`/`gnupg`/`ca-certificates` are installed on demand (a no-op if already present, which the `cagriekin/repmgr` image already is) — only when at least one `aptSources` entry is set, so the default `packages`-only path incurs no extra apt-get calls. Add the Pigsty host to the **NetworkPolicy** egress hook above alongside `apt.postgresql.org` (Pigsty serves over HTTPS, port 443, so it may already be covered by the chart's default `networkPolicy` egress rather than needing the port-80 addition `apt.postgresql.org` does).
+
+### Copying a package's own shared-library dependencies (#309)
+
+An apt-installed extension can depend on a general-purpose shared library that is **not itself a Postgres extension module** — `pgsodium`/`supabase_vault` need `libsodium.so.23`, a plain SONAME-versioned runtime library, not something `CREATE EXTENSION` ever loads directly. Debian packages ship libraries like this under the standard multiarch path (`/usr/lib/x86_64-linux-gnu/libsodium.so.23` — confirmed live), **never** under `/usr/lib/postgresql/<major>/lib` where the extension-file copy step reads from. Widening that copy step's glob (`*.so*`, not `*.so`) only helps a package that places a versioned library *directly alongside its own extension modules*; it does nothing for a dependency Debian installs to a different directory entirely, no matter how broad the glob is made. `libsodium.so.23` is exactly this case, and the copy step alone — however broad — cannot fix it.
+
+`postgresql.extensions.extraLibs` closes that gap: an explicit list of exact absolute paths (inside `copy-ext`/`copy-base-ext`'s own filesystem, where `packages` already installed them) to additionally copy into `/ext-lib`, alongside the normal extension files:
+
+```yaml
+postgresql:
+  majorVersion: "18"
+  extensions:
+    enabled: true
+    aptSources:
+      - name: pigsty
+        keyUrl: https://repo.pigsty.io/key
+        aptLine: "deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    packages:
+      - "postgresql-{major}-pgsodium"
+      - "postgresql-{major}-vault"
+    extraLibs:
+      - /usr/lib/x86_64-linux-gnu/libsodium.so.23
+```
+
+Copying the file into `/ext-lib` alone is still not enough: `pgsodium.so` carries `libsodium.so.23` as a `NEEDED` entry with **no `RUNPATH`/`RPATH`** (confirmed live via `readelf -d`), so once Postgres `dlopen()`s `pgsodium.so` itself (which always succeeds — it's given as an absolute path), resolving *that library's own* dependency on `libsodium.so.23` still goes through the normal dynamic-linker search order, which does not include `/usr/lib/postgresql/<major>/lib` by default. The chart closes this second half automatically: whenever `postgresql.extensions.enabled` is true, the `postgresql` container gets `LD_LIBRARY_PATH=/usr/lib/postgresql/<major>/lib` (the same path `ext-lib` is mounted at), so a dependency copied there via `extraLibs` is actually found. Verified end-to-end (`libsodium.so.23` removed from every default search path, present only via a copy at that one location): the module fails to load without `LD_LIBRARY_PATH` and loads cleanly with it.
+
+`extraLibs` is deliberately **explicit, not automatic** — it does not walk `ldd` and copy every transitive dependency a package pulls in. `copy-base-ext` (the `cagriekin/repmgr` image) and `copy-ext` (`postgresql.image`) can be different image builds; silently auto-copying a resolved `libc`/`libstdc++`/etc. from one into the other risks shadowing the *running* container's own C runtime with a build from a different image — an ABI hazard, not a convenience. Core C-runtime libraries (`libc`, `libm`, `libpthread`, `libdl`, `librt`, `libresolv`, `libnsl`, `libgcc_s`, `libstdc++`) are refused at render time (`pg.validateExtraLibs`) for exactly that reason; `extraLibs` is for extension-specific dependencies like `libsodium.so.23`, never for the C runtime itself. An entry is rejected if `packages` is empty, same reasoning as `aptSources`.
 
 ### Mounting an extra file on every replica
 
 Some extensions read a key or config file from disk that **must be byte-identical on the primary and every standby** — otherwise a promoted standby behaves differently after a failover. The canonical case is **pgsodium** (the basis of Supabase Vault): its server root key is loaded by `pgsodium.getkey_script`, and if a standby has a different key it cannot decrypt `supabase_vault` secrets once promoted — a silent, post-failover data-availability failure.
-
-`pgsodium`/`supabase_vault` also link against `libsodium.so.<N>` — a versioned SONAME, not a Postgres extension module itself. `copy-ext`/`copy-base-ext`'s copy step matches `*.so*`, not just the literal `*.so` extension modules use, so a transitive runtime dependency named this way is copied along with the extension automatically (#309) — no image-side `patchelf` workaround needed.
 
 Mount the file with `postgresql.extraVolumes` + `postgresql.extraVolumeMounts`. Because these render into the StatefulSet pod template, every replica gets the same file, and it survives failover and a `pg_rewind` rejoin:
 

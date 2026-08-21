@@ -348,8 +348,106 @@ tests:
       postgresql.extensions.aptSources:
         - name: pigsty
           keyUrl: https://repo.pigsty.io/key
-          aptLine: "deb [signed-by=/usr/share/keyrings/pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+          aptLine: "deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
     asserts:
       - matchRegex:
           path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")].command[2]
-          pattern: "curl -fsSL \"https://repo\\.pigsty\\.io/key\" \\| gpg --dearmor -o /usr/share/keyrings/pigsty-keyring\\.gpg"
+          pattern: "curl -fsSL \"https://repo\\.pigsty\\.io/key\" \\| gpg --dearmor -o /usr/share/keyrings/pgchart-pigsty-keyring\\.gpg"
+
+  # --- Scenario 16: extraLibs guards + LD_LIBRARY_PATH (#309) ---
+  - it: extraLibs without packages fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.extraLibs:
+        - /usr/lib/x86_64-linux-gnu/libsodium.so.23
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.extensions.extraLibs is set but postgresql.extensions.packages is empty -- extraLibs' copy step only runs alongside the packages apt-get install, so it has nothing to do without at least one package that needs it."
+
+  - it: extraLibs without extensions.enabled fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - /usr/lib/x86_64-linux-gnu/libsodium.so.23
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.extensions.packages is set but postgresql.extensions.enabled is false, so nothing would ever install them. Set postgresql.extensions.enabled=true."
+
+  - it: a relative extraLibs path fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - "usr/lib/x86_64-linux-gnu/libsodium.so.23"
+    asserts:
+      - failedTemplate: {}
+
+  - it: a path-traversal extraLibs entry fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - "/usr/lib/../../../etc/passwd"
+    asserts:
+      - failedTemplate: {}
+
+  # copy-base-ext and copy-ext can be different image builds -- auto-shadowing the
+  # running container's own C runtime with a build from the other image is an ABI
+  # hazard, not a convenience, so core libraries are refused outright.
+  - it: a core C-runtime library in extraLibs is refused
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - "/usr/lib/x86_64-linux-gnu/libc.so.6"
+    asserts:
+      - failedTemplate:
+          errorPattern: "refusing .* core C-runtime library"
+
+  - it: a valid extraLibs entry copies into ext-lib and sets LD_LIBRARY_PATH
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.majorVersion: "18"
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - /usr/lib/x86_64-linux-gnu/libsodium.so.23
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")].command[2]
+          pattern: "cp /usr/lib/x86_64-linux-gnu/libsodium\\.so\\.23 /ext-lib/"
+      - matchRegex:
+          path: spec.template.spec.initContainers[?(@.name=="copy-ext")].command[2]
+          pattern: "cp -n /usr/lib/x86_64-linux-gnu/libsodium\\.so\\.23 /ext-lib/"
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env
+          content:
+            name: LD_LIBRARY_PATH
+            value: /usr/lib/postgresql/18/lib
+          any: true
+
+  - it: LD_LIBRARY_PATH is not set when extensions are disabled
+    templates:
+      - templates/statefulset.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env
+          content:
+            name: LD_LIBRARY_PATH
+          any: true

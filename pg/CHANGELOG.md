@@ -12,24 +12,41 @@
   Pigsty-only package name previously made `copy-base-ext`'s `apt-get install` fail
   outright (the `cagriekin/repmgr` image has no Pigsty source and isn't something a
   chart consumer builds), aborting before its extension-file copy ever ran. Each
-  entry's key is dearmored and its line written to `/etc/apt/sources.list.d/` ahead of
-  a second `apt-get update`; `keyUrl`/`aptLine` are restricted to a narrow character
-  allowlist at render time (`pg.validateExtensionAptSources`), since both are
-  interpolated into a shell command. Requires `packages` to be non-empty. See the
-  README ["Installing packages from a non-PGDG apt
-  source"](README.md#installing-packages-from-a-non-pgdg-apt-source-310).
+  entry's key is dearmored to `/usr/share/keyrings/pgchart-<name>-keyring.gpg` and its
+  line written to `/etc/apt/sources.list.d/pgchart-<name>.list` ahead of a second
+  `apt-get update` -- the `pgchart-` prefix so an entry can never collide with a source
+  the image already owns (the `cagriekin/repmgr` image's own PGDG source); `keyUrl`/
+  `aptLine` are restricted to a narrow character allowlist at render time
+  (`pg.validateExtensionAptSources`), since both are interpolated into a shell command.
+  Requires `packages` to be non-empty. See the README ["Installing packages from a
+  non-PGDG apt source"](README.md#installing-packages-from-a-non-pgdg-apt-source-310).
+- **`postgresql.extensions.extraLibs` + automatic `LD_LIBRARY_PATH` (#309).** Some
+  apt-installed extensions depend on a general-purpose shared library that Debian
+  installs to the standard multiarch path (e.g. `libsodium.so.23`, needed by
+  `pgsodium`/`supabase_vault`), never under `/usr/lib/postgresql/<major>/lib` where the
+  existing extension-file copy reads from -- confirmed live, and true regardless of how
+  broad that copy step's glob is. `extraLibs` is an explicit list of exact paths to
+  additionally copy into `/ext-lib`; the `postgresql` container now also gets
+  `LD_LIBRARY_PATH=/usr/lib/postgresql/<major>/lib` automatically whenever
+  `extensions.enabled`, since the copied file has no `RUNPATH`/`RPATH` and is otherwise
+  never found by the dynamic linker (confirmed live end-to-end: fails to load without
+  `LD_LIBRARY_PATH`, loads cleanly with it). Deliberately explicit, not an automatic
+  `ldd`-and-copy-everything walk: `copy-base-ext`/`copy-ext` can be different image
+  builds, and auto-copying a resolved `libc`/`libstdc++`/etc. between them risks a
+  runtime ABI mismatch -- core C-runtime libraries are refused at render time
+  (`pg.validateExtraLibs`). Requires `packages` to be non-empty. See the README
+  ["Copying a package's own shared-library
+  dependencies"](README.md#copying-a-packages-own-shared-library-dependencies-309).
 
 ### Fixed
 
-- **`copy-ext`/`copy-base-ext`'s extension-file copy silently dropped versioned
-  shared libraries (#309).** The copy glob was `*.so`, which only matches Postgres
-  extension modules themselves (`pgsodium.so`); a transitive runtime dependency
-  following the standard SONAME convention (`libsodium.so.23`, needed by
-  `pgsodium`/`supabase_vault`) doesn't match and was silently excluded, producing a
-  `FATAL: could not load library ... : libsodium.so.23: cannot open shared object
-  file` on the first Postgres start against such an extension -- every time,
-  unconditionally. The glob is now `*.so*`, a strict superset of the old match, so
-  this is a safe, unconditional fix rather than a new opt-in.
+- **`copy-ext`/`copy-base-ext`'s extension-file copy glob (`*.so`) missed versioned
+  shared libraries a package places directly alongside its own extension modules
+  (#309).** The glob is now `*.so*`, a strict superset of the old match, so this is a
+  safe, unconditional fix rather than a new opt-in. Note this covers only libraries
+  co-located under `/usr/lib/postgresql/<major>/lib` itself -- it does **not** reach a
+  dependency Debian installs elsewhere (the motivating `libsodium.so.23` case); that
+  needs `postgresql.extensions.extraLibs`, above.
 
 ## 1.13.1 - 2026-08-21
 

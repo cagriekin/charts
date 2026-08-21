@@ -3,6 +3,7 @@
 {{- include "pg.validateExtraPassthrough" . }}
 {{- include "pg.validateExtensionPackages" . }}
 {{- include "pg.validateExtensionAptSources" . }}
+{{- include "pg.validateExtraLibs" . }}
 {{- include "pg.validateWalLevel" . }}
 {{- include "pg.validateSyncReplicationSlotsMajor" . }}
 {{- include "pg.validateSyncReplicationSlotsWalLevel" . }}
@@ -384,7 +385,7 @@ spec:
           # mode, one layer up). The pin makes that impossible to do silently: apt
           # either leaves the server package alone (the normal case) or fails the
           # render-time-adjacent install outright, never a quiet swap.
-          command: ['sh', '-c', {{ include "pg.extensionInstallCommand" (dict "pgMajor" $pgMajor "pkgs" $pkgs "aptSources" .Values.postgresql.extensions.aptSources "noClobber" false) | quote }}]
+          command: ['sh', '-c', {{ include "pg.extensionInstallCommand" (dict "pgMajor" $pgMajor "pkgs" $pkgs "aptSources" .Values.postgresql.extensions.aptSources "extraLibs" .Values.postgresql.extensions.extraLibs "noClobber" false) | quote }}]
           securityContext:
             # apt-get/dpkg needs root to write /var/lib/dpkg and run package
             # maintainer scripts (e.g. ldconfig) -- broader than fix-permissions'
@@ -461,7 +462,7 @@ spec:
           # here too: if this image did not install PostgreSQL via a dpkg-tracked
           # postgresql-{{ $pgMajor }} package, PGVER is empty and the pin is skipped
           # rather than failing an otherwise-valid custom-image install.
-          command: ['sh', '-c', {{ include "pg.extensionInstallCommand" (dict "pgMajor" $pgMajor "pkgs" $pkgs "aptSources" .Values.postgresql.extensions.aptSources "noClobber" true) | quote }}]
+          command: ['sh', '-c', {{ include "pg.extensionInstallCommand" (dict "pgMajor" $pgMajor "pkgs" $pkgs "aptSources" .Values.postgresql.extensions.aptSources "extraLibs" .Values.postgresql.extensions.extraLibs "noClobber" true) | quote }}]
           securityContext:
             # Same as copy-base-ext's apt-step securityContext above (review, #303):
             # REPLACES postgresql.containerSecurityContext, not a merge -- and will
@@ -668,6 +669,20 @@ spec:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretDatabaseKey" . }}
+{{- if .Values.postgresql.extensions.enabled }}
+{{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
+            # #309: an apt-installed extension's transitive shared-library dependency
+            # (e.g. libsodium.so.23, needed by pgsodium/supabase_vault) has no RUNPATH
+            # and is never in the default ld.so search path -- the extension .so itself
+            # loads fine (postgres dlopen()s it by absolute path), but resolving ITS OWN
+            # NEEDED entries then fails with "cannot open shared object file" unless the
+            # copied-alongside dependency (postgresql.extensions.extraLibs) is on a path
+            # the dynamic linker actually searches. ext-lib is already mounted here, so
+            # this is the cheapest way to make it one, without patchelf/RPATH surgery on
+            # packages this chart doesn't own.
+            - name: LD_LIBRARY_PATH
+              value: /usr/lib/postgresql/{{ $pgMajor }}/lib
+{{- end }}
 {{- if .Values.repmgr.enabled }}
             - name: REPMGR_USER
               value: {{ .Values.repmgr.username | quote }}

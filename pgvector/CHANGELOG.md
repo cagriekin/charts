@@ -10,15 +10,22 @@ the full detail.
 
 - **`postgresql.extensions.aptSources` (#310).** Adds a non-PGDG apt source (e.g. Pigsty)
   inside `copy-ext`/`copy-base-ext` before the `packages` apt-get install, for extensions
-  PGDG doesn't package (`pgsodium`, `supabase_vault`, ...). Requires `packages` to be
-  non-empty. See the [pg chart README](../pg/README.md#installing-packages-from-a-non-pgdg-apt-source-310).
+  PGDG doesn't package (`pgsodium`, `supabase_vault`, ...). Keyring/list files get a
+  `pgchart-` prefix so they can't collide with a source the image already owns. Requires
+  `packages` to be non-empty. See the [pg chart README](../pg/README.md#installing-packages-from-a-non-pgdg-apt-source-310).
+- **`postgresql.extensions.extraLibs` + automatic `LD_LIBRARY_PATH` (#309).** Copies an
+  exact, explicit path (e.g. `libsodium.so.23`) into `/ext-lib` for a package's own
+  shared-library dependency Debian installs outside the Postgres extension dir; the
+  `postgresql` container gets `LD_LIBRARY_PATH` automatically whenever
+  `extensions.enabled` so the copied file is actually found. Requires `packages` to be
+  non-empty; core C-runtime libraries are refused. See the [pg chart README](../pg/README.md#copying-a-packages-own-shared-library-dependencies-309).
 
 ### Fixed
 
-- **The extension-file copy silently dropped versioned shared libraries (#309).** The
-  copy glob is now `*.so*`, not just `*.so`, so a transitive runtime dependency like
-  `libsodium.so.23` (needed by `pgsodium`/`supabase_vault`) is copied along with the
-  extension automatically.
+- **The extension-file copy glob (`*.so`) missed versioned shared libraries a package
+  places directly alongside its own extension modules (#309).** Now `*.so*`. This does
+  not, by itself, reach a dependency Debian installs elsewhere (the `libsodium.so.23`
+  case) -- that needs `extraLibs`, above.
 
 ## 1.13.1 - 2026-08-21
 
