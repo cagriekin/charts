@@ -1,5 +1,13 @@
 # pgvector chart changelog
 
+## 1.13.1 - 2026-08-21
+
+### Fixed
+
+- **`repmgr.image.tag` default (`trixie-5.5.0-31`) predated the #311 agent changes
+  (#314).** Bumped to `trixie-5.5.0-32`, built from current `master`. See the
+  [pg 1.13.1 changelog](../pg/CHANGELOG.md) for the full detail.
+
 ## 1.13.0 - 2026-08-21
 
 Inherited from pg's symlinked templates (`postgresql-configmap.yaml`, `statefulset.yaml`,

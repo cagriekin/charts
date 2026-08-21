@@ -1,5 +1,22 @@
 # pg chart changelog
 
+## 1.13.1 - 2026-08-21
+
+### Fixed
+
+- **`repmgr.image.tag` default (`trixie-5.5.0-31`) predated the #311 agent changes
+  (#314).** `trixie-5.5.0-31` was tagged before `dbname` primary_conninfo patching and
+  `synchronized_standby_slots` reconciliation (#308/#311) landed, so a fresh 1.13.0
+  install with `repmgr.agent.syncReplicationSlots: true` set `wal_level`/
+  `sync_replication_slots` correctly via ConfigMap, but ran an agent binary that never
+  patched `primary_conninfo` or reconciled `synchronized_standby_slots` -- the feature
+  documented in the 1.13.0 release notes silently did nothing on the default image.
+  Bumped the default to `trixie-5.5.0-32`, built from current `master` (confirmed via
+  `grep -a` on the shipped binary: it now contains `synchronized_standby_slots` and
+  `EnsurePrimaryConninfoDBName`/`dbNameReloadPending`). `etcd.rbac.bootstrapImage.tag`
+  moves in lockstep, as always. No template or values-schema changes; existing
+  `repmgr.image.tag` overrides are unaffected.
+
 ## 1.13.0 - 2026-08-21
 
 ### Added
