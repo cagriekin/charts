@@ -16,9 +16,11 @@ the full detail.
 - **`postgresql.extensions.extraLibs` + automatic `LD_LIBRARY_PATH` (#309).** Copies an
   exact, explicit path (e.g. `libsodium.so.23`) into `/ext-lib` for a package's own
   shared-library dependency Debian installs outside the Postgres extension dir; the
-  `postgresql` container gets `LD_LIBRARY_PATH` automatically whenever
-  `extensions.enabled` so the copied file is actually found. Requires `packages` to be
-  non-empty; core C-runtime libraries are refused. See the [pg chart README](../pg/README.md#copying-a-packages-own-shared-library-dependencies-309).
+  `postgresql` container gets `LD_LIBRARY_PATH` automatically whenever `extraLibs` is
+  non-empty (not just `extensions.enabled`, to avoid widening the search path for
+  releases that don't need it) so the copied file is actually found. Requires
+  `packages` to be non-empty; core C-runtime libraries are refused. See the
+  [pg chart README](../pg/README.md#copying-a-packages-own-shared-library-dependencies-309).
 
 ### Fixed
 

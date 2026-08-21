@@ -669,7 +669,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretDatabaseKey" . }}
-{{- if .Values.postgresql.extensions.enabled }}
+{{- if and .Values.postgresql.extensions.enabled .Values.postgresql.extensions.extraLibs }}
 {{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
             # #309: an apt-installed extension's transitive shared-library dependency
             # (e.g. libsodium.so.23, needed by pgsodium/supabase_vault) has no RUNPATH
@@ -680,6 +680,19 @@ spec:
             # the dynamic linker actually searches. ext-lib is already mounted here, so
             # this is the cheapest way to make it one, without patchelf/RPATH surgery on
             # packages this chart doesn't own.
+            #
+            # Gated on extraLibs specifically, NOT bare extensions.enabled (review):
+            # LD_LIBRARY_PATH precedes the default loader directories for every symbol
+            # resolution in the process, not just this one dependency, and ext-lib is
+            # ALSO populated by the plain *.so* glob copy (both copy-base-ext and
+            # copy-ext, potentially different image builds, #302) regardless of
+            # extraLibs. Setting this unconditionally would widen that copy's blast
+            # radius from "an extension module dlopen()'d by its own known absolute
+            # path" to "anything the dynamic linker looks up by name, in either image's
+            # build" -- exactly the ABI-mismatch class #302 exists to prevent, and
+            # pg.validateExtraLibs cannot catch it since those files never go through
+            # extraLibs' own validation. Only set the env when a real consumer
+            # (extraLibs) exists to need it.
             - name: LD_LIBRARY_PATH
               value: /usr/lib/postgresql/{{ $pgMajor }}/lib
 {{- end }}

@@ -66,7 +66,7 @@
               },
               "description": "Non-PGDG apt sources (e.g. Pigsty) to add before installing packages (#310), for extensions PGDG doesn't package. {major} is substituted into aptLine. Requires packages to be non-empty."
             },
-            "extraLibs": { "type": "array", "items": { "type": "string", "pattern": "^/[A-Za-z0-9._/+-]+$" }, "description": "Exact absolute paths to additionally copy into /ext-lib (#309), for a transitive shared-library dependency Debian places outside /usr/lib/postgresql/<major>/lib (e.g. libsodium.so.23). Pair with LD_LIBRARY_PATH, set automatically when extensions.enabled. Requires packages to be non-empty; core C-runtime libraries are refused." }
+            "extraLibs": { "type": "array", "items": { "type": "string", "pattern": "^/[A-Za-z0-9._/+-]+$" }, "description": "Exact absolute paths to additionally copy into /ext-lib (#309), for a transitive shared-library dependency Debian places outside /usr/lib/postgresql/<major>/lib (e.g. libsodium.so.23). Pair with LD_LIBRARY_PATH, set automatically when extraLibs is non-empty. Requires packages to be non-empty; core C-runtime libraries are refused." }
           }
         },
         "audit": {

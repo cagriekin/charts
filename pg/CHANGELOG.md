@@ -27,12 +27,16 @@
   existing extension-file copy reads from -- confirmed live, and true regardless of how
   broad that copy step's glob is. `extraLibs` is an explicit list of exact paths to
   additionally copy into `/ext-lib`; the `postgresql` container now also gets
-  `LD_LIBRARY_PATH=/usr/lib/postgresql/<major>/lib` automatically whenever
-  `extensions.enabled`, since the copied file has no `RUNPATH`/`RPATH` and is otherwise
-  never found by the dynamic linker (confirmed live end-to-end: fails to load without
-  `LD_LIBRARY_PATH`, loads cleanly with it). Deliberately explicit, not an automatic
-  `ldd`-and-copy-everything walk: `copy-base-ext`/`copy-ext` can be different image
-  builds, and auto-copying a resolved `libc`/`libstdc++`/etc. between them risks a
+  `LD_LIBRARY_PATH=/usr/lib/postgresql/<major>/lib` automatically whenever `extraLibs`
+  is non-empty (not just `extensions.enabled` -- `ext-lib` is also populated by the
+  plain glob copy regardless of `extraLibs`, and widening the search path
+  unconditionally would let a same-named file from one image's build shadow a system
+  library for the other image's process, #302), since the copied file has no
+  `RUNPATH`/`RPATH` and is otherwise never found by the dynamic linker (confirmed live
+  end-to-end: fails to load without `LD_LIBRARY_PATH`, loads cleanly with it).
+  Deliberately explicit, not an automatic `ldd`-and-copy-everything walk:
+  `copy-base-ext`/`copy-ext` can be different image builds, and auto-copying a resolved
+  `libc`/`libstdc++`/etc. between them risks a
   runtime ABI mismatch -- core C-runtime libraries are refused at render time
   (`pg.validateExtraLibs`). Requires `packages` to be non-empty. See the README
   ["Copying a package's own shared-library

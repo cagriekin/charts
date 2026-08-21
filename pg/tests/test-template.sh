@@ -564,12 +564,21 @@ assert_contains "#309: copy-ext copies the extraLibs path with -n (no-clobber, #
 # apt-get-installed command.
 assert_contains "#309: extraLibs copy follows the normal ext-lib/ext-share copy" "${extralibs_base_ext}" 'cp /usr/share/postgresql/18/extension/\* /ext-share/ && cp /usr/lib/x86_64-linux-gnu/libsodium.so.23 /ext-lib/'
 
-# #309: LD_LIBRARY_PATH is set on the postgresql container whenever extensions.enabled
-# -- this is what actually makes a copied extraLibs dependency resolvable, since the
-# extension .so itself has no RUNPATH/RPATH (verified live).
-ext_enabled_res=$(helm template test-pg "${CHART_DIR}" --set postgresql.extensions.enabled=true --set postgresql.majorVersion=18 --show-only templates/statefulset.yaml 2>&1)
-ldlp_line=$(printf '%s' "${ext_enabled_res}" | grep -A1 "name: LD_LIBRARY_PATH" | tail -1)
-assert_contains "#309: LD_LIBRARY_PATH points at the extension lib dir" "${ldlp_line}" "value: /usr/lib/postgresql/18/lib"
+# #309: LD_LIBRARY_PATH is set on the postgresql container whenever extraLibs is
+# non-empty -- this is what actually makes a copied extraLibs dependency resolvable,
+# since the extension .so itself has no RUNPATH/RPATH (verified live).
+ldlp_line=$(printf '%s' "${extralibs_res}" | grep -A1 "name: LD_LIBRARY_PATH" | tail -1)
+assert_contains "#309: LD_LIBRARY_PATH points at the extension lib dir when extraLibs is set" "${ldlp_line}" "value: /usr/lib/postgresql/18/lib"
+
+# #309: LD_LIBRARY_PATH is gated on extraLibs specifically, NOT bare extensions.enabled
+# -- ext-lib is also populated by the plain *.so* glob copy regardless of extraLibs, and
+# copy-base-ext/copy-ext can be different image builds (#302), so widening the search
+# path for every extensions-enabled release (not just the ones that actually need it)
+# risks a same-named file from one image's build shadowing a system library for the
+# other image's process -- an ABI hazard pg.validateExtraLibs cannot catch, since those
+# files never go through extraLibs' own validation.
+ext_enabled_no_extralibs=$(helm template test-pg "${CHART_DIR}" --set postgresql.extensions.enabled=true --set postgresql.majorVersion=18 --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#309: no LD_LIBRARY_PATH when extensions.enabled but extraLibs is empty" "${ext_enabled_no_extralibs}" "LD_LIBRARY_PATH"
 assert_not_contains "#309: no LD_LIBRARY_PATH when extensions are disabled" "${minimal}" "LD_LIBRARY_PATH"
 
 # #309: extraLibs without packages fails the render -- its copy step only runs
@@ -3007,8 +3016,9 @@ assert_contains "majorVersion default: ext-lib mountPath uses /usr/lib/postgresq
 assert_contains "majorVersion default: ext-share mountPath uses /usr/share/postgresql/18/extension" "${extpaths_default}" "mountPath: /usr/share/postgresql/18/extension"
 ext_lib_count=$(printf '%s' "${extpaths_default}" | grep -c "/usr/lib/postgresql/18/lib" || true)
 ext_share_count=$(printf '%s' "${extpaths_default}" | grep -c "/usr/share/postgresql/18/extension" || true)
-# copy-base-ext cp + copy-ext cp + postgresql volumeMount + LD_LIBRARY_PATH (#309) = 4
-assert_eq "majorVersion default: four /usr/lib/postgresql/18/lib occurrences" "4" "${ext_lib_count}"
+# copy-base-ext cp + copy-ext cp + postgresql volumeMount = 3 each (LD_LIBRARY_PATH,
+# #309, only renders when extraLibs is also set -- not exercised by this fixture)
+assert_eq "majorVersion default: three /usr/lib/postgresql/18/lib occurrences" "3" "${ext_lib_count}"
 assert_eq "majorVersion default: three /usr/share/postgresql/18/extension occurrences" "3" "${ext_share_count}"
 
 # Test: overriding majorVersion swaps every extension path, leaving no /18/.
@@ -3023,7 +3033,7 @@ assert_contains "majorVersion=19: ext-lib mountPath uses /usr/lib/postgresql/19/
 assert_contains "majorVersion=19: ext-share mountPath uses /usr/share/postgresql/19/extension" "${extpaths_19}" "mountPath: /usr/share/postgresql/19/extension"
 ext19_lib_count=$(printf '%s' "${extpaths_19}" | grep -c "/usr/lib/postgresql/19/lib" || true)
 ext19_share_count=$(printf '%s' "${extpaths_19}" | grep -c "/usr/share/postgresql/19/extension" || true)
-assert_eq "majorVersion=19: four /usr/lib/postgresql/19/lib occurrences" "4" "${ext19_lib_count}"
+assert_eq "majorVersion=19: three /usr/lib/postgresql/19/lib occurrences" "3" "${ext19_lib_count}"
 assert_eq "majorVersion=19: three /usr/share/postgresql/19/extension occurrences" "3" "${ext19_share_count}"
 assert_not_contains "majorVersion=19: no /18/ paths remain in statefulset" "${extpaths_19}" "postgresql/18/"
 

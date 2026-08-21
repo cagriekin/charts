@@ -341,8 +341,8 @@ postgresql:
     # transitive runtime dependency (e.g. libsodium.so.23, needed by
     # pgsodium/supabase_vault) is NOT picked up by the extension-file copy no matter how
     # broad its glob -- confirmed live. Pairs with LD_LIBRARY_PATH, which the chart sets
-    # on the postgresql container automatically whenever extensions.enabled (see README
-    # "Installing packages from a non-PGDG apt source"), so a copied dependency is
+    # on the postgresql container automatically whenever extraLibs is non-empty (see README
+    # "Copying a package's own shared-library dependencies"), so a copied dependency is
     # actually found by the dynamic linker. Explicit, not automatic: this does NOT walk
     # `ldd` and copy every transitive dependency, because copy-base-ext (repmgr image)
     # and copy-ext (postgresql.image) can be different image builds -- silently copying

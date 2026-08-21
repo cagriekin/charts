@@ -451,3 +451,21 @@ tests:
           content:
             name: LD_LIBRARY_PATH
           any: true
+
+  # Gated on extraLibs specifically, not bare extensions.enabled (review): ext-lib is
+  # also populated by the plain glob copy regardless of extraLibs, and copy-base-ext/
+  # copy-ext can be different image builds (#302) -- widening LD_LIBRARY_PATH for every
+  # extensions-enabled release risks a same-named file from one image's build shadowing
+  # a system library for the other image's process.
+  - it: LD_LIBRARY_PATH is not set when extensions.enabled but extraLibs is empty
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.majorVersion: "18"
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env
+          content:
+            name: LD_LIBRARY_PATH
+          any: true
