@@ -721,6 +721,17 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			}
 			return err
 		}
+		// #308: repmgr standby follow writes primary_conninfo without dbname (PG17+'s
+		// sync_replication_slots worker needs it); patch it in and reload so the change
+		// takes effect on this already-running standby. A no-op, no-reload when dbname is
+		// already present.
+		if changed, err := a.ensurePrimaryConninfoDBName(); err != nil {
+			a.log.Warn("ensure dbname in primary_conninfo", "err", err)
+		} else if changed {
+			if err := a.sup.Reload(ctx); err != nil {
+				return fmt.Errorf("reload after patching primary_conninfo dbname: %w", err)
+			}
+		}
 		a.followUpstream = dec.Target
 		return nil
 
@@ -736,6 +747,12 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			return err
 		}
 		a.dropRestoreRecord("the data directory was cloned from " + dec.Target)
+		// #308: patch primary_conninfo's dbname while stopped so Start below picks it up
+		// with no extra reload. Best-effort: a failure here must not block a fresh clone
+		// from starting -- physical replication works without it.
+		if _, err := a.ensurePrimaryConninfoDBName(); err != nil {
+			a.log.Warn("ensure dbname in primary_conninfo", "err", err)
+		}
 		return a.sup.Start(ctx)
 
 	case reconcile.ReleaseLease:
@@ -946,6 +963,18 @@ func (a *agent) writePgHba() error {
 	return pgconf.WritePgHba(filepath.Join(a.cfg.PGDATA, "pg_hba.conf"), content)
 }
 
+// ensurePrimaryConninfoDBName patches dbname=<repmgr db> into primary_conninfo in
+// postgresql.auto.conf, where repmgr's own clone/follow/rejoin machinery writes it
+// without one (confirmed live -- repmgr's physical-replication-only conninfo writer
+// carries host/port/user/application_name, never dbname). PostgreSQL 17+'s
+// sync_replication_slots worker requires dbname to be present (#308); physical
+// replication itself works fine without it, so this is a correctness fix with no
+// downside, safe to call unconditionally (a no-op when dbname is already set, or when
+// there is no primary_conninfo line at all -- e.g. on a primary).
+func (a *agent) ensurePrimaryConninfoDBName() (bool, error) {
+	return pgconf.EnsurePrimaryConninfoDBName(filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf"), a.cfg.RepmgrDB)
+}
+
 // publishStatus gossips this node's WAL position to its own pod annotation so the
 // lease holder can rank it at election time even when it is stopped/unreachable.
 // It re-patches only when the position changed or a heartbeat (half the freshness
@@ -1119,6 +1148,14 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 		// A full re-clone: this directory's contents now come from the peer, not from
 		// whatever restore the record beside it describes.
 		a.dropRestoreRecord("the data directory was re-cloned from " + target)
+	}
+	// #308: same dbname patch as BootstrapClone/Follow -- RejoinForceRewind's `repmgr node
+	// rejoin -d <conninfo>` conninfo already includes dbname (Conn.conninfo(), unlike
+	// Clone/Follow), but this is called unconditionally anyway rather than relying on that:
+	// it is a no-op when dbname is already present, and staying correct here does not
+	// depend on repmgr's rejoin/reclone internals never changing.
+	if _, err := a.ensurePrimaryConninfoDBName(); err != nil {
+		a.log.Warn("ensure dbname in primary_conninfo", "err", err)
 	}
 	return a.sup.Start(ctx)
 }

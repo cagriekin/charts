@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -235,6 +237,77 @@ func TestActFollowRunsWhenNotStreaming(t *testing.T) {
 	}
 	if a.followUpstream != "pg-0" {
 		t.Fatal("followUpstream must latch after a successful follow")
+	}
+}
+
+// #308: repmgr's own `standby follow` writes primary_conninfo without dbname (PG17+'s
+// sync_replication_slots worker needs it, physical replication does not). act() must
+// patch it in and reload so the change takes effect on this already-running standby.
+func TestActFollowPatchesPrimaryConninfoDBNameAndReloads(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""} // no walreceiver row -- Follow runs
+	pm := &fakePostmaster{}
+	a := newFollowTestAgentWithPM(t, ex, pm)
+	confPath := filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf")
+	if err := os.WriteFile(confPath, []byte(
+		`primary_conninfo = 'host=''pg-0.h'' port=5432 user=repmgr application_name=''pg-1'' connect_timeout=10'`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "dbname=") {
+		t.Errorf("primary_conninfo was not patched with dbname:\n%s", b)
+	}
+	if !pm.reloaded {
+		t.Error("act must reload the postmaster after patching primary_conninfo")
+	}
+}
+
+// A standby that has no postgresql.auto.conf primary_conninfo line to patch (or no file
+// at all) must not fail the Follow action -- physical replication itself does not depend
+// on this fix, so a missing/malformed file is logged, not fatal.
+func TestActFollowToleratesMissingPrimaryConninfoFile(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""}
+	a := newFollowTestAgent(t, ex)
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act must not fail when postgresql.auto.conf is absent: %v", err)
+	}
+	if a.followUpstream != "pg-0" {
+		t.Fatal("followUpstream must still latch")
+	}
+}
+
+// #308: a fresh clone's primary_conninfo (written by repmgr's own `standby clone`) must
+// be patched with dbname BEFORE Start, so the fresh boot picks it up with no extra
+// reload -- unlike Follow, which patches an already-running standby.
+func TestActBootstrapClonePatchesPrimaryConninfoBeforeStart(t *testing.T) {
+	ex := &scriptedExec{}
+	pm := &fakePostmaster{}
+	a := newFollowTestAgentWithPM(t, ex, pm)
+	confPath := filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf")
+	if err := os.WriteFile(confPath, []byte(
+		`primary_conninfo = 'host=''pg-0.h'' port=5432 user=repmgr application_name=''pg-1'' connect_timeout=10'`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dec := reconcile.Decision{Action: reconcile.BootstrapClone, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "dbname=") {
+		t.Errorf("primary_conninfo was not patched with dbname before Start:\n%s", b)
+	}
+	if !pm.started {
+		t.Error("act must still start the postmaster after a successful clone")
 	}
 }
 
