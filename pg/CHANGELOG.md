@@ -1,5 +1,37 @@
 # pg chart changelog
 
+## 1.13.0 - 2026-08-21
+
+### Added
+
+- **First-class logical replication support and failover slot sync (#308).** Three
+  pieces, needed together for a logical subscriber (`CREATE SUBSCRIPTION`, Debezium,
+  etc.) to survive a primary failover:
+
+  - **`postgresql.walLevel`** (enum `replica`|`logical`, default `replica`) is now the
+    one authoritative source for `wal_level`. Previously, `pgbackrest-archive.conf`
+    hardcoded `wal_level = replica` whenever `pgbackrest.enabled`, silently overriding
+    `postgresql.configuration.wal_level` because `include_dir` loads conf.d files in
+    filename-sort order and that file sorted last. Setting
+    `postgresql.configuration.wal_level` directly is now a render-time guard failure
+    pointing at `postgresql.walLevel`. The hardcoded `max_wal_senders = 10` in the same
+    file was also removed (redundant with the image's own initdb default, and it was
+    silently clobbering a custom `postgresql.configuration.max_wal_senders`).
+  - The agent now patches `dbname` into `primary_conninfo` after every clone, follow,
+    and rejoin -- repmgr's own clone/follow machinery never included it, which is
+    harmless for physical replication but breaks PostgreSQL 17+'s
+    `sync_replication_slots` worker (it requires `dbname` to be present).
+  - **`repmgr.agent.syncReplicationSlots`** (default `false`, agent-mode only,
+    PostgreSQL 17+): when true, sets `sync_replication_slots = on` and has the primary
+    reconcile `synchronized_standby_slots` to its current, live standbys' physical
+    replication slots on every tick -- so a logical failover slot
+    (`CREATE SUBSCRIPTION ... WITH (failover = true)`) survives a promote instead of
+    needing a full resync. Verified live on a 3-node KinD cluster through install,
+    promote/failover, and scale-down.
+
+  See README ["Logical Replication"](README.md#logical-replication-308) for the full
+  detail. All three are additive / off-by-default; the default render is byte-stable.
+
 ## 1.12.0 - 2026-08-18
 
 ### Added

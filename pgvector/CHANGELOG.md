@@ -1,5 +1,21 @@
 # pgvector chart changelog
 
+## 1.13.0 - 2026-08-21
+
+Inherited from pg's symlinked templates (`postgresql-configmap.yaml`, `statefulset.yaml`,
+`_helpers.tpl`) and mirrored `values.yaml`/`values.schema.json`. See the
+[pg 1.13.0 changelog](../pg/CHANGELOG.md) for the full detail.
+
+### Added
+
+- **First-class logical replication support and failover slot sync (#308).**
+  `postgresql.walLevel` (enum `replica`|`logical`, default `replica`) is now the one
+  authoritative source for `wal_level`; the agent patches `dbname` into
+  `primary_conninfo` after clone/follow/rejoin; `repmgr.agent.syncReplicationSlots`
+  (default `false`, agent-mode + PostgreSQL 17+) reconciles `synchronized_standby_slots`
+  to the live standby set on every primary tick. See the
+  [pg chart README](../pg/README.md#logical-replication-308) for the full detail.
+
 ## 1.12.0 - 2026-08-18
 
 Inherited from pg's symlinked `prometheus-exporter-configmap.yaml` and new

@@ -180,7 +180,7 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.tolerations` | Tolerations for PostgreSQL pods | `[]` |
 | `postgresql.topologySpreadConstraints` | Spread constraints added alongside the built-in affinity (e.g. a hard zone spread) | `[]` |
 | `postgresql.serviceAccount.annotations` | Annotations on the postgresql pods' ServiceAccount (cloud workload identity for keyless pgBackRest S3) | `{}` |
-| `postgresql.walLevel` | `replica` or `logical` (#308; see [Logical Replication](#logical-replication)). The **only** place to set `wal_level` — setting it in `postgresql.configuration` instead fails at render time | `replica` |
+| `postgresql.walLevel` | `replica` or `logical` (#308; see [Logical Replication](#logical-replication-308)). The **only** place to set `wal_level` — setting it in `postgresql.configuration` instead fails at render time | `replica` |
 
 Example:
 
@@ -209,7 +209,15 @@ Set `postgresql.walLevel: logical` for a logical-replication subscriber (`CREATE
 
 A logical subscriber must connect to the **write Service** (`<fullname>:5432`), not Pgpool — Pgpool's query routing is built for physical replicas, not for holding a replication slot's connection open.
 
-**What this chart does not yet do.** `primary_conninfo` written by repmgr's clone/follow has no `dbname=`, which PostgreSQL 17+'s `sync_replication_slots` worker requires, and nothing reconciles `synchronized_standby_slots` on promote — so a **failover** logical slot (one that survives the primary moving) is not yet supported end to end; a plain, non-failover logical slot works today. See [issue #308](https://github.com/cagriekin/charts/issues/308) for the tracked follow-up.
+**Surviving a failover: `repmgr.agent.syncReplicationSlots`.** A plain logical slot does not survive the primary moving — `synchronized_standby_slots` (PostgreSQL 17+) is what lets a **failover** slot (`CREATE SUBSCRIPTION ... WITH (failover = true)`) be synced to a standby so it's still there after a promote, but it names physical replication slots, and PostgreSQL 17+'s `sync_replication_slots` worker (the standby-side process that keeps the failover slot in sync) additionally requires `dbname` in `primary_conninfo`, which repmgr's own clone/follow machinery never sets.
+
+The chart and agent (failover mode `agent` only) handle both automatically when `repmgr.agent.syncReplicationSlots: true`:
+
+- the agent patches `dbname` into `primary_conninfo` after every clone, follow, and rejoin (a no-op if it's already present, and harmless for physical-only replication either way — it ships unconditionally, not gated behind this value);
+- `sync_replication_slots = on` is set in `postgresql.conf` (inert on a primary; needed on any node that may run the slot-sync worker as a standby);
+- the primary reconciles `synchronized_standby_slots` to its current, live standbys' physical replication slot(s) on every tick it serves — through scale-up, scale-down, and promote — so the set is never stale.
+
+Requires `postgresql.walLevel: logical` (above) to actually be useful; setting `syncReplicationSlots` without it is a harmless no-op, not a render-time guard, since nothing breaks either way. See [issue #308](https://github.com/cagriekin/charts/issues/308).
 
 ### Installing extensions without a custom image
 
@@ -382,6 +390,7 @@ Both majors run the **whole** live test suite in CI (failover, pgBackRest restor
 | `repmgr.agent.reconcileInterval` | Reconcile tick interval | `5s` |
 | `repmgr.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
 | `repmgr.agent.cascadingReplication` | Let a standby stream from another standby (a chain by pod ordinal toward the primary) to offload the primary's WAL senders. Default off; agent mode only; meaningful at `replicaCount >= 2` (3+ nodes). The agent only picks a verifiably-safe same-timeline upstream and re-homes to the leader if it fails/promotes, so failover is not delayed and a standby is never stranded. | `false` |
+| `repmgr.agent.syncReplicationSlots` | Reconcile `synchronized_standby_slots` to the live standby set on every primary tick, so a logical failover slot survives a promote. Default off; agent mode only; requires PostgreSQL 17+ and `postgresql.walLevel: logical` (#308; see [Logical Replication](#logical-replication-308)). | `false` |
 
 Must satisfy `leaseDuration > renewDeadline > retryPeriod`. For managed clouds, widen them (e.g. `30s/20s/4s`) so a brief apiserver blip does not trip an unnecessary demote. Note: with the Kubernetes Lease backend, a control-plane outage longer than `renewDeadline` is itself a write outage (the healthy primary self-demotes on losing apiserver contact, and no standby can acquire until the control plane returns); this is the safe choice under an asymmetric partition.
 
