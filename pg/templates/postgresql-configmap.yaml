@@ -1,4 +1,4 @@
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled }}
+{{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -48,11 +48,35 @@ data:
   # Required for pgbackrest WAL archiving. archive_mode is a postmaster
   # parameter so it only takes effect after a postgres restart, which the
   # configmap checksum annotation on the StatefulSet triggers.
+  #
+  # max_wal_senders is deliberately NOT set here: it used to be hardcoded to the same
+  # value images/repmgr/entrypoint.sh already sets at initdb, which meant this file
+  # clobbered any larger postgresql.configuration.max_wal_senders for no reason
+  # (nothing else needs it re-asserted). Removed; the value now simply flows from
+  # postgresql.configuration (via custom.conf) or the initdb default, uncontested.
+  #
+  # wal_level is intentionally NOT set here (#308) -- it must work whether or not
+  # pgBackRest is even enabled, so it has its own render block below, independent of
+  # this one.
   pgbackrest-archive.conf: |
     archive_mode = on
     archive_command = 'pgbackrest --stanza={{ .Values.pgbackrest.stanza | toString | replace "'" "''" }} archive-push %p'
-    wal_level = replica
-    max_wal_senders = 10
+{{- end }}
+{{- if ne (.Values.postgresql.walLevel | default "replica") "replica" }}
+  # wal_level (#308): sourced from postgresql.walLevel, the one authoritative source
+  # (the pg.validateWalLevel guard rejects setting wal_level in
+  # postgresql.configuration directly). Deliberately independent of
+  # pgbackrest.enabled -- a logical subscriber must work whether or not backups are
+  # configured; wal_level and archive_mode are unrelated concerns that a prior
+  # revision of this file wrongly coupled. Only rendered when non-default, so the
+  # default render (and this ConfigMap's existence at all, for installs that touch
+  # nothing else here) stays byte-stable -- images/repmgr/entrypoint.sh's own
+  # initdb-time default already sets this GUC to the same default, so there is
+  # nothing to add when the value is left unchanged. This file sorts after custom.conf and
+  # pgbackrest-archive.conf under conf.d's include_dir either way, so it would win
+  # even if it were unconditional.
+  wal-level.conf: |
+    wal_level = {{ .Values.postgresql.walLevel }}
 {{- end }}
 {{- if .Values.postgresql.tls.enabled }}
   # Server TLS (#110). The cert Secret is mounted at /etc/postgresql/tls; ssl_ca_file
@@ -82,5 +106,15 @@ data:
 {{- if .Values.postgresql.audit.role }}
     pgaudit.role = '{{ .Values.postgresql.audit.role | toString | replace "'" "''" }}'
 {{- end }}
+{{- end }}
+{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
+  # Logical failover slot sync (#308), PostgreSQL 17+. sync_replication_slots is a plain
+  # boolean, not topology-dependent (unlike synchronized_standby_slots below, which the
+  # agent reconciles per-tick on the primary via ALTER SYSTEM as the standby set changes),
+  # so it is safe to set unconditionally here rather than needing agent involvement: it
+  # enables the slot-sync worker on a standby, and is a documented no-op on a primary
+  # (there is nothing there for it to sync).
+  sync-replication-slots.conf: |
+    sync_replication_slots = on
 {{- end }}
 {{- end }}

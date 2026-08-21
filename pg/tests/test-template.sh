@@ -2098,7 +2098,133 @@ pgbackrest_pgconf=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/value
 assert_contains "pgbackrest: postgresql configmap renders" "${pgbackrest_pgconf}" "test-pg-postgresql-config"
 assert_contains "pgbackrest: archive_mode = on" "${pgbackrest_pgconf}" "archive_mode = on"
 assert_contains "pgbackrest: archive_command uses stanza" "${pgbackrest_pgconf}" "archive_command = 'pgbackrest --stanza=db archive-push %p'"
-assert_contains "pgbackrest: wal_level replica" "${pgbackrest_pgconf}" "wal_level = replica"
+assert_not_contains "pgbackrest: wal_level not set here at default (#308)" "${pgbackrest_pgconf}" "wal_level ="
+assert_not_contains "pgbackrest: no hardcoded max_wal_senders (#308)" "${pgbackrest_pgconf}" "max_wal_senders = 10"
+
+# ======================================================================
+# #308: postgresql.walLevel is the one authoritative source for wal_level, and it
+# must work regardless of pgbackrest.enabled -- wal_level and archive_mode are
+# unrelated concerns. (A prior revision of this PR coupled them: wal_level only
+# rendered inside the pgbackrest.enabled block, so postgresql.walLevel: logical was
+# a silent no-op with pgbackrest off. Regression-tested explicitly below.)
+# ======================================================================
+walevel_logical=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set postgresql.walLevel=logical --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#308: walLevel=logical renders wal_level = logical (pgbackrest on)" "${walevel_logical}" "wal_level = logical"
+assert_not_contains "#308: walLevel=logical no longer shows replica" "${walevel_logical}" "wal_level = replica"
+
+walevel_logical_no_pgbackrest=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.walLevel=logical --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#308: walLevel=logical renders wal_level = logical (pgbackrest OFF)" "${walevel_logical_no_pgbackrest}" "wal_level = logical"
+
+# Regression: standalone mode (no repmgr) + walLevel=logical must render a matching
+# `volumes:` entry, not just the volumeMount -- an earlier revision left the mount
+# referencing a volume that was never declared (the outer `volumes:` list only opened
+# on postgresql.configuration/extensions/repmgr/pgbackrest/tls/extraVolumes/
+# !persistence.enabled, none of which walLevel alone trips), which the API server
+# rejects at apply time ("volumeMounts[x].name: postgresql-config: not found") even
+# though this renders cleanly.
+walevel_standalone_sts=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 --set postgresql.walLevel=logical \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#308: standalone + walLevel=logical mounts postgresql-config" "${walevel_standalone_sts}" "mountPath: /etc/postgresql/conf.d"
+walevel_standalone_volumes=$(grep -A1 "^      volumes:" <<< "${walevel_standalone_sts}")
+assert_contains "#308: standalone + walLevel=logical declares the matching volume" "${walevel_standalone_volumes}" "name: postgresql-config"
+
+# Byte-stable: an install that touches nothing #308-related must not gain a new
+# ConfigMap just because postgresql.walLevel defaults to "replica" in values.yaml.
+walevel_default_no_cm_rc=0
+helm template test-pg "${CHART_DIR}" --show-only templates/postgresql-configmap.yaml >/dev/null 2>&1 || walevel_default_no_cm_rc=$?
+assert_gt "#308: default walLevel renders no configmap at all (byte-stable)" "${walevel_default_no_cm_rc}" "0"
+
+# Custom max_wal_senders must survive now that pgbackrest-archive.conf no longer
+# re-asserts its own value.
+maxsenders_custom=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set-string postgresql.configuration.max_wal_senders=20 --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#308: custom max_wal_senders survives with pgbackrest on" "${maxsenders_custom}" "max_wal_senders = '20'"
+
+# The guard: wal_level must not be settable via postgresql.configuration, regardless of
+# pgbackrest.enabled -- there is exactly one way to set this GUC.
+schema_rc=0; helm template test-pg "${CHART_DIR}" --set-string postgresql.configuration.wal_level=logical >/dev/null 2>&1 || schema_rc=$?
+assert_gt "#308: postgresql.configuration.wal_level rejected at render time" "${schema_rc}" "0"
+guard_msg=$(helm template test-pg "${CHART_DIR}" --set-string postgresql.configuration.wal_level=logical 2>&1 || true)
+assert_contains "#308: guard message points at postgresql.walLevel" "${guard_msg}" "postgresql.walLevel"
+# Case-insensitive key match (PostgreSQL GUC names are case-insensitive) and unaffected by
+# pgbackrest.enabled -- fires even when pgbackrest is off.
+schema_rc=0; helm template test-pg "${CHART_DIR}" --set-string postgresql.configuration.WAL_LEVEL=logical >/dev/null 2>&1 || schema_rc=$?
+assert_gt "#308: guard matches wal_level case-insensitively" "${schema_rc}" "0"
+schema_rc=0; helm template test-pg "${CHART_DIR}" --set pgbackrest.enabled=false --set-string postgresql.configuration.wal_level=logical >/dev/null 2>&1 || schema_rc=$?
+assert_gt "#308: guard fires even with pgbackrest disabled" "${schema_rc}" "0"
+
+# ======================================================================
+# #308: repmgr.agent.syncReplicationSlots -- off by default (byte-stable); on,
+# it emits the SYNC_REPLICATION_SLOTS env (agent-only) and the
+# sync_replication_slots = on config snippet. The configmap render is gated on
+# an `or`-ed condition that values-agent.yaml alone never trips, so the "off"
+# configmap check layers values-pgbackrest.yaml on top (forcing failoverMode
+# back to agent) purely to get the configmap to render at all.
+sync_slots_off_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#308 off: no SYNC_REPLICATION_SLOTS env by default" "${sync_slots_off_sts}" "SYNC_REPLICATION_SLOTS"
+sync_slots_off_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set repmgr.failoverMode=agent --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_not_contains "#308 off: no sync_replication_slots config by default" "${sync_slots_off_cm}" "sync_replication_slots"
+
+sync_slots_on_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#308 on: agent gets SYNC_REPLICATION_SLOTS env" "${sync_slots_on_sts}" "name: SYNC_REPLICATION_SLOTS"
+sync_slots_on_env=$(grep -A1 "name: SYNC_REPLICATION_SLOTS" <<< "${sync_slots_on_sts}")
+assert_contains "#308 on: SYNC_REPLICATION_SLOTS value is true" "${sync_slots_on_env}" 'value: "true"'
+sync_slots_on_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#308 on: sync_replication_slots = on renders" "${sync_slots_on_cm}" "sync_replication_slots = on"
+
+# The pg.validateSyncReplicationSlotsWalLevel guard: the sync_replication_slots worker
+# this enables on every standby is NOT a harmless no-op below wal_level=logical -- it
+# fails its own startup validation and PostgreSQL respawns it forever.
+sync_slots_replica_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true >/dev/null 2>&1 || sync_slots_replica_rc=$?
+assert_gt "#308: syncReplicationSlots without walLevel=logical rejected at render time" "${sync_slots_replica_rc}" "0"
+
+# repmgrd mode: sync-slot reconciliation is agent-only -> neither the env nor the
+# config snippet is emitted even if the knob is set.
+sync_slots_repmgrd_sts=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=true --set repmgr.failoverMode=repmgrd \
+  --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
+  --set repmgr.agent.syncReplicationSlots=true \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#308: repmgrd mode never gets SYNC_REPLICATION_SLOTS (agent-only)" "${sync_slots_repmgrd_sts}" "SYNC_REPLICATION_SLOTS"
+sync_slots_repmgrd_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true \
+  --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_not_contains "#308: repmgrd mode never renders sync_replication_slots (agent-only)" "${sync_slots_repmgrd_cm}" "sync_replication_slots"
+
+# The pg.validateSyncReplicationSlotsMajor guard: synchronized_standby_slots and the
+# sync_replication_slots worker do not exist before PostgreSQL 17 -- an unrecognized
+# GUC in a conf.d file crash-loops every pod, so this must fail at render time.
+sync_slots_pg16_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
+  --set postgresql.majorVersion=16 --set repmgr.image.majorVersion=16 \
+  --set repmgr.image.tag=trixie-5.5.0-27-pg16 >/dev/null 2>&1 || sync_slots_pg16_rc=$?
+assert_gt "#308: syncReplicationSlots on PG16 rejected at render time (agent mode)" "${sync_slots_pg16_rc}" "0"
+# walLevel=logical isolates this to the MAJOR-version guard specifically (both guards
+# would otherwise fire on the default walLevel, and a bare non-zero rc cannot tell which).
+sync_slots_pg16_msg=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
+  --set postgresql.majorVersion=16 --set repmgr.image.majorVersion=16 \
+  --set repmgr.image.tag=trixie-5.5.0-27-pg16 2>&1 || true)
+assert_contains "#308: PG16 guard message names the version requirement" "${sync_slots_pg16_msg}" "requires PostgreSQL 17+"
+# Inert outside agent mode (matches cascadingReplication's own no-op-outside-agent-mode
+# precedent) -- must not block an unrelated repmgrd-mode/older-major install.
+sync_slots_pg16_repmgrd_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=true --set repmgr.failoverMode=repmgrd \
+  --set repmgr.image.majorVersion=16 --set postgresql.majorVersion=16 \
+  --set repmgr.image.tag=trixie-5.5.0-27-pg16 \
+  --set repmgr.agent.syncReplicationSlots=true >/dev/null 2>&1 || sync_slots_pg16_repmgrd_rc=$?
+assert_eq "#308: syncReplicationSlots on PG16 is inert (not a guard failure) in repmgrd mode" "0" "${sync_slots_pg16_repmgrd_rc}"
 
 # Statefulset must mount the postgresql-config volume even when
 # postgresql.configuration is empty, so the archive snippet is delivered.

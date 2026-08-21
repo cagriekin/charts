@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -89,6 +90,7 @@ func logStartupConfig(log *slog.Logger, cfg *config.Config) {
 		"masterService", cfg.MasterService,
 		"markerName", cfg.MarkerName,
 		"cascadeReplication", cfg.CascadeReplication,
+		"syncReplicationSlots", cfg.SyncReplicationSlots,
 		"pgMajor", cfg.PGMajor,
 	)
 }
@@ -147,6 +149,31 @@ type agent struct {
 	// server) runs only when the upstream actually changes, not every tick. Reset
 	// on any non-Follow action.
 	followUpstream string
+
+	// dbNameReloadPending is set when a #308 primary_conninfo dbname patch was written
+	// to disk but the follow-up postmaster reload failed, and cleared once a reload
+	// succeeds. EnsurePrimaryConninfoDBName's own changed=true/false only reports
+	// whether THIS call wrote a change to the FILE -- once written, every later call
+	// reports changed=false regardless of whether the reload ever actually took, so
+	// that signal alone cannot drive a retry. This flag is what does: the Follow case
+	// reloads whenever changed is true OR this is still true, so a failed reload is
+	// retried on the next tick even though the file itself needs no further change.
+	dbNameReloadPending bool
+
+	// lastSyncStandbySlots caches the comma-joined slot list synchronized_standby_slots
+	// was last successfully set to (#308), so a primary tick with an unchanged standby
+	// set skips the ALTER SYSTEM + reload rather than repeating it every 5s. nil means
+	// "not yet reconciled this primary term" -- distinct from a pointer to "", which
+	// means "reconciled, and the live value really is empty". A bare string sentinel
+	// would conflate the two: a freshly-promoted primary with no active standbys yet
+	// would compute desired="" on its first tick, matching an unset zero-value "" and
+	// wrongly skipping the ALTER SYSTEM -- leaving whatever synchronized_standby_slots
+	// this node inherited (from being cloned from a prior primary's postgresql.auto.conf,
+	// or from its own previous primary term) in place, possibly naming a slot that no
+	// longer exists and permanently blocking logical decoding. Reset to nil on every
+	// demote (see the OnLost handling) so the next term this node is primary again
+	// starts with an unconditional first reconcile, not a stale cache from before.
+	lastSyncStandbySlots *string
 
 	// gossip publish state: skip re-patching the pod annotation when the position
 	// is unchanged, refreshing only on change or a heartbeat (to keep it fresh).
@@ -400,6 +427,19 @@ func (a *agent) boot(ctx context.Context) error {
 		return nil
 	}
 	if cd.InRecovery {
+		// #308: patch dbname into primary_conninfo unconditionally on every cold start of
+		// a standby, BEFORE the tick loop's own Follow-path patch (main.go's `case
+		// reconcile.Follow`) ever runs. That path only patches after actually invoking
+		// `repmgr standby follow`, which it skips whenever the node is already streaming
+		// from its target on the very first tick -- true for a just-cloned standby, since
+		// cloning already establishes streaming. Patching here instead of relying on that
+		// tick is what makes a fresh install deterministic rather than a race against how
+		// fast the standby's walreceiver reports itself as streaming.
+		if changed, err := a.ensurePrimaryConninfoDBName(); err != nil {
+			a.log.Warn("boot: ensure dbname in primary_conninfo", "err", err)
+		} else if changed {
+			a.log.Info("boot: patched dbname into primary_conninfo")
+		}
 		return a.sup.Start(ctx)
 	}
 	a.log.Info("boot: on-disk primary state; deferring start until reconcile confirms holdership + highwater", "state", cd.State)
@@ -611,6 +651,13 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 	if dec.Action != reconcile.Follow {
 		a.followUpstream = ""
 	}
+	// #308: any action other than serving as primary ends this node's current primary
+	// term, so the next time it (or another node) becomes primary must start with an
+	// unconditional first reconcile rather than a cache left over from a previous term
+	// (or its own zero-value on a distinct pod). See lastSyncStandbySlots' field comment.
+	if dec.Action != reconcile.Promote && dec.Action != reconcile.StayPrimary {
+		a.lastSyncStandbySlots = nil
+	}
 	switch dec.Action {
 	case reconcile.Promote:
 		// The node is already running as a standby (the reconcile guard); promote
@@ -635,7 +682,15 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if tl, _, ok, _ := a.prober.PrimaryWALPosition(wctx, a.selfConn()); ok {
 			a.advanceMarker(wctx, tl, true, obs.Marker)
 		}
-		return a.assertPrimaryRouting(wctx, obs)
+		// H3 order: promote PG -> advance marker -> assert routing -> sync slots. Routing
+		// drives the pod pg-role labels and the read/write Service endpoints, so it must
+		// win the fence-budget context if anything is going to; #308's slot reconciliation
+		// is new, best-effort, and self-healing on the next tick either way, so it runs
+		// LAST, not ahead of routing (a hung slot query must not starve the assertion that
+		// actually matters for correctness this tick).
+		routingErr := a.assertPrimaryRouting(wctx, obs)
+		a.assertSyncStandbySlots(wctx)
+		return routingErr
 
 	case reconcile.StayPrimary:
 		// Register this primary in repmgr.nodes. In agent mode there is no repmgrd
@@ -661,7 +716,11 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
-		return a.assertPrimaryRouting(wctx, obs)
+		// #308: keep synchronized_standby_slots current as standbys scale up/down.
+		// After routing, not before (see the Promote case) -- same fence-budget priority.
+		routingErr := a.assertPrimaryRouting(wctx, obs)
+		a.assertSyncStandbySlots(wctx)
+		return routingErr
 
 	case reconcile.Follow:
 		// Ensure this standby has a repmgr.nodes record. In agent mode no repmgrd
@@ -688,38 +747,63 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// across the roll, and a post-failover rejoin attaches before Follow. repmgr
 		// standby follow then exits non-zero (slot already active), which, left
 		// unlatched, repeats every tick. Skip the command when already streaming from
-		// the target and latch; repointing to a NEW upstream (sender_host differs, or
-		// no walreceiver yet) still falls through to Follow.
+		// the target; repointing to a NEW upstream (sender_host differs, or no
+		// walreceiver yet) still falls through to Follow.
 		//
 		// Gate the skip on a successful register: the follow it replaces implicitly
 		// requires the repmgr.nodes record (repmgr fails "unable to retrieve node
 		// record" -- NOT the benign exit -- and retries when it is missing), but the
 		// probe bypasses that check. A freshly-cloned standby streams before it is ever
-		// registered, so latching here on a failed register would strand it without a
+		// registered, so skipping here on a failed register would strand it without a
 		// record and break a later promote. On a failed register, fall through to
 		// follow (which re-establishes the record, or errors so the next tick retries).
-		if regErr == nil && a.streamingFromTarget(ctx, dec.Target) {
-			a.followUpstream = dec.Target
-			return nil
-		}
-		if err := a.mech.Follow(ctx, up); err != nil {
-			// #297: this node has no row in its own metadata copy -- a freshly-cloned standby
-			// whose upstream changed before it registered. It can never obtain the row (that
-			// needs replication, which is what it is trying to establish), so it would retry
-			// forever, Running but never Ready, silently not replicating. Re-clone from the
-			// current primary: that replaces both its data AND its metadata copy, and a
-			// standby in this state has no writes of its own to lose.
-			//
-			// Scoped narrowly on purpose. It fires ONLY on the local-record error, never on a
-			// missing UPSTREAM record -- that one is the ordinary post-failover case where the
-			// target simply has not promoted yet, and escalating there demotes and re-clones a
-			// healthy standby (a mistake made and reverted on #286).
-			if errors.Is(err, mechanism.ErrLocalRecordMissing) {
-				a.log.Warn("this node is absent from its own repmgr.nodes copy; re-cloning from the current primary",
-					"target", dec.Target, "err", err)
-				return a.rejoinOnto(ctx, dec.Target)
+		if regErr != nil || !a.streamingFromTarget(ctx, dec.Target) {
+			if err := a.mech.Follow(ctx, up); err != nil {
+				// #297: this node has no row in its own metadata copy -- a freshly-cloned standby
+				// whose upstream changed before it registered. It can never obtain the row (that
+				// needs replication, which is what it is trying to establish), so it would retry
+				// forever, Running but never Ready, silently not replicating. Re-clone from the
+				// current primary: that replaces both its data AND its metadata copy, and a
+				// standby in this state has no writes of its own to lose.
+				//
+				// Scoped narrowly on purpose. It fires ONLY on the local-record error, never on a
+				// missing UPSTREAM record -- that one is the ordinary post-failover case where the
+				// target simply has not promoted yet, and escalating there demotes and re-clones a
+				// healthy standby (a mistake made and reverted on #286).
+				if errors.Is(err, mechanism.ErrLocalRecordMissing) {
+					a.log.Warn("this node is absent from its own repmgr.nodes copy; re-cloning from the current primary",
+						"target", dec.Target, "err", err)
+					return a.rejoinOnto(ctx, dec.Target)
+				}
+				return err
 			}
-			return err
+		}
+		// #308: converge dbname in primary_conninfo on EVERY tick that reaches here --
+		// whether this tick just ran a real `repmgr standby follow` (which writes
+		// primary_conninfo without dbname; PG17+'s sync_replication_slots worker
+		// requires it) or skipped it via the already-streaming shortcut above. Running
+		// it unconditionally here, not only after a real Follow, matters specifically
+		// when a PRIOR tick's reload below failed: that tick returns an error without
+		// latching followUpstream, so the next tick re-enters this case, finds itself
+		// already streaming (the file was already patched, just not reloaded), and
+		// would otherwise take the shortcut and latch without ever retrying the reload
+		// -- stranding a standby whose on-disk conninfo has dbname but whose running
+		// postmaster does not. EnsurePrimaryConninfoDBName is a no-op, no-reload read
+		// when dbname is already active, so this costs nothing on the common path.
+		//
+		// changed alone cannot drive the retry once the FILE is already correct
+		// (EnsurePrimaryConninfoDBName then reports changed=false forever, even though
+		// the reload that was supposed to apply it never actually succeeded) -- hence
+		// dbNameReloadPending, sticky across ticks until a reload actually succeeds.
+		changed, err := a.ensurePrimaryConninfoDBName()
+		if err != nil {
+			a.log.Warn("ensure dbname in primary_conninfo", "err", err)
+		} else if changed || a.dbNameReloadPending {
+			if err := a.sup.Reload(ctx); err != nil {
+				a.dbNameReloadPending = true
+				return fmt.Errorf("reload after patching primary_conninfo dbname: %w", err)
+			}
+			a.dbNameReloadPending = false
 		}
 		a.followUpstream = dec.Target
 		return nil
@@ -736,6 +820,12 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			return err
 		}
 		a.dropRestoreRecord("the data directory was cloned from " + dec.Target)
+		// #308: patch primary_conninfo's dbname while stopped so Start below picks it up
+		// with no extra reload. Best-effort: a failure here must not block a fresh clone
+		// from starting -- physical replication works without it.
+		if _, err := a.ensurePrimaryConninfoDBName(); err != nil {
+			a.log.Warn("ensure dbname in primary_conninfo", "err", err)
+		}
 		return a.sup.Start(ctx)
 
 	case reconcile.ReleaseLease:
@@ -946,6 +1036,18 @@ func (a *agent) writePgHba() error {
 	return pgconf.WritePgHba(filepath.Join(a.cfg.PGDATA, "pg_hba.conf"), content)
 }
 
+// ensurePrimaryConninfoDBName patches dbname=<repmgr db> into primary_conninfo in
+// postgresql.auto.conf, where repmgr's own clone/follow/rejoin machinery writes it
+// without one (confirmed live -- repmgr's physical-replication-only conninfo writer
+// carries host/port/user/application_name, never dbname). PostgreSQL 17+'s
+// sync_replication_slots worker requires dbname to be present (#308); physical
+// replication itself works fine without it, so this is a correctness fix with no
+// downside, safe to call unconditionally (a no-op when dbname is already set, or when
+// there is no primary_conninfo line at all -- e.g. on a primary).
+func (a *agent) ensurePrimaryConninfoDBName() (bool, error) {
+	return pgconf.EnsurePrimaryConninfoDBName(filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf"), a.cfg.RepmgrDB)
+}
+
 // publishStatus gossips this node's WAL position to its own pod annotation so the
 // lease holder can rank it at election time even when it is stopped/unreachable.
 // It re-patches only when the position changed or a heartbeat (half the freshness
@@ -1068,6 +1170,86 @@ func (a *agent) assertPrimaryRouting(ctx context.Context, obs reconcile.Observat
 	return a.kube.ReconcilePodLabels(ctx, a.cfg.PodSelector, desiredRoleLabels(a.cfg.PodName, obs.Peers))
 }
 
+// assertSyncStandbySlots reconciles synchronized_standby_slots to the primary's current
+// LIVE standby set (#308), so a logical failover slot's decode position tracks the
+// live standby set through scale-up/down and promote. Idempotent and self-healing like
+// assertPrimaryRouting/cleanupGhostNodes -- called from both Promote and StayPrimary,
+// bounded by the same fence-budget context -- and best-effort (logged, never returned)
+// so a slot-sync hiccup can never fail the routing assertion that follows it. No-op
+// entirely when cfg.SyncReplicationSlots is false (byte-identical behavior to today).
+//
+// "Live" means registered in repmgr.nodes and not a ghost (cleanupGhostNodes' own
+// definition: ordinal within the current NodeCount) -- deliberately NOT "the walsender
+// is currently attached". An earlier revision derived the desired set from
+// pg_replication_slots.active, which meant a standby restart, a rolling upgrade, or a
+// brief network blip emptied synchronized_standby_slots -- and an empty value lets a
+// logical slot's decode position advance past exactly the standby that is about to
+// need it (a primary failure during that window silently diverges the subscriber from
+// the new primary, the precise hazard this feature exists to prevent).
+// repmgr.nodes registration does not flap on a blip, only cleanupGhostNodes' own
+// scale-down detection removes a row, so this survives the same transients that broke
+// the active-based version.
+//
+// Still intersected with PhysicalSlots (slots that actually exist): a node can be
+// registered a moment before its physical slot is created, and naming a slot that does
+// not exist is the same "blocks all logical decoding" failure this whole feature exists
+// to prevent, so a registered-but-not-yet-slotted standby is excluded until its slot
+// shows up (typically the same tick, since the clone/follow path that registers a
+// standby is also what creates its slot).
+func (a *agent) assertSyncStandbySlots(ctx context.Context) {
+	if !a.cfg.SyncReplicationSlots {
+		return
+	}
+	standbyIDs, err := a.prober.StandbyNodeIDs(ctx, a.selfConn())
+	if err != nil {
+		a.log.Warn("list repmgr.nodes for synchronized_standby_slots", "err", err)
+		return
+	}
+	existing, err := a.prober.PhysicalSlots(ctx, a.selfConn())
+	if err != nil {
+		a.log.Warn("read physical slots for synchronized_standby_slots", "err", err)
+		return
+	}
+	existingSet := make(map[string]bool, len(existing))
+	for _, s := range existing {
+		existingSet[s] = true
+	}
+	ghosts := make(map[int]bool)
+	for _, id := range ghostNodeIDs(standbyIDs, a.cfg.NodeCount) {
+		ghosts[id] = true
+	}
+	// Sorted: standbyIDs comes from `SELECT node_id FROM repmgr.nodes WHERE type =
+	// 'standby'` with no ORDER BY, so its row order is not guaranteed stable between
+	// calls even when the standby SET is unchanged. desired below doubles as the cache
+	// key (a bare string compare, not a set compare), so an unstable order would make
+	// the primary re-run ALTER SYSTEM + reload every tick even in the common steady
+	// state -- churn indistinguishable from a real topology change.
+	sort.Ints(standbyIDs)
+	var slots []string
+	for _, id := range standbyIDs {
+		if ghosts[id] {
+			continue
+		}
+		name := fmt.Sprintf("repmgr_slot_%d", id)
+		if existingSet[name] {
+			slots = append(slots, name)
+		}
+	}
+	// Comma-joined is PostgreSQL's own list format for this GUC, and doubles as the
+	// cache key: an unchanged standby set (the common steady-state tick) skips the
+	// ALTER SYSTEM + reload entirely, rather than repeating it every 5s.
+	desired := strings.Join(slots, ",")
+	if a.lastSyncStandbySlots != nil && desired == *a.lastSyncStandbySlots {
+		return
+	}
+	if err := a.prober.SetSynchronizedStandbySlots(ctx, a.selfConn(), slots); err != nil {
+		a.log.Warn("set synchronized_standby_slots", "err", err, "slots", desired)
+		return
+	}
+	a.lastSyncStandbySlots = &desired
+	a.log.Info("reconciled synchronized_standby_slots", "slots", desired)
+}
+
 // desiredRoleLabels builds the pg-role map the primary publishes each tick (the
 // #140 3-way classification): self is the primary; an in-recovery peer is a
 // standby (joins the read-only Service); a reachable non-recovery peer is an
@@ -1119,6 +1301,14 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 		// A full re-clone: this directory's contents now come from the peer, not from
 		// whatever restore the record beside it describes.
 		a.dropRestoreRecord("the data directory was re-cloned from " + target)
+	}
+	// #308: same dbname patch as BootstrapClone/Follow -- RejoinForceRewind's `repmgr node
+	// rejoin -d <conninfo>` conninfo already includes dbname (Conn.conninfo(), unlike
+	// Clone/Follow), but this is called unconditionally anyway rather than relying on that:
+	// it is a no-op when dbname is already present, and staying correct here does not
+	// depend on repmgr's rejoin/reclone internals never changing.
+	if _, err := a.ensurePrimaryConninfoDBName(); err != nil {
+		a.log.Warn("ensure dbname in primary_conninfo", "err", err)
 	}
 	return a.sup.Start(ctx)
 }

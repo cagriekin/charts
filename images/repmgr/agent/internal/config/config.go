@@ -76,6 +76,12 @@ type Config struct {
 	// offload the primary's WAL senders, with a safe fallback to the primary.
 	CascadeReplication bool // CASCADE_REPLICATION
 
+	// Logical failover slot sync (#308), PG17+. Optional; default off. When on, the
+	// primary reconciles synchronized_standby_slots to the current standby's physical
+	// slot(s) on every tick it serves, so a logical failover slot can be synced across
+	// promote without a full resync. Physical replication is unaffected either way.
+	SyncReplicationSlots bool // SYNC_REPLICATION_SLOTS
+
 	// etcd backend (required only when DCSBackend == "etcd"). TLS is optional
 	// (all-or-none, enforced by the dcs layer).
 	EtcdEndpoints []string
@@ -260,6 +266,9 @@ func Load(get func(string) string) (*Config, error) {
 
 	// Cascading replication (issue #29). Optional -- absent/empty means off.
 	c.CascadeReplication = boolEnv(get("CASCADE_REPLICATION"))
+
+	// Logical failover slot sync (#308). Optional -- absent/empty means off.
+	c.SyncReplicationSlots = boolEnv(get("SYNC_REPLICATION_SLOTS"))
 
 	// PostgreSQL major (#269). Optional -- the image ENV supplies it; default 18 for an
 	// older image that predates the build arg. Digits only: the value is joined into the

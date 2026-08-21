@@ -1,5 +1,33 @@
 # pgvector chart changelog
 
+## 2.0.0 - 2026-08-21
+
+Inherited from pg's symlinked templates (`postgresql-configmap.yaml`, `statefulset.yaml`,
+`_helpers.tpl`) and mirrored `values.yaml`/`values.schema.json`. See the
+[pg 2.0.0 changelog](../pg/CHANGELOG.md) for the full detail.
+
+### Breaking
+
+- **`postgresql.configuration.wal_level` is no longer accepted; use `postgresql.walLevel`
+  instead (#308).** The reason for the major bump -- everything else in this release is
+  additive. See the pg chart changelog for the migration note.
+
+### Added
+
+- **First-class logical replication support and failover slot sync (#308).**
+  `postgresql.walLevel` (enum `replica`|`logical`, default `replica`) is now the one
+  authoritative source for `wal_level`; the agent patches `dbname` into
+  `primary_conninfo` after clone/follow/rejoin (and deterministically at every cold
+  start of a standby); `repmgr.agent.syncReplicationSlots` (default `false`, agent-mode
+  + PostgreSQL 17+, requires `postgresql.walLevel: logical`) reconciles
+  `synchronized_standby_slots` to the live standby set (repmgr's own node registry, not
+  momentary replication-slot activity) on every primary tick. See the
+  [pg chart README](../pg/README.md#logical-replication-308) for the full detail.
+
+### Changed
+
+- `pgbackrest-archive.conf` no longer hardcodes `max_wal_senders = 10` (#308).
+
 ## 1.12.0 - 2026-08-18
 
 Inherited from pg's symlinked `prometheus-exporter-configmap.yaml` and new

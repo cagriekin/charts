@@ -65,6 +65,10 @@
             "logRelation": { "type": "boolean" },
             "role": { "type": "string", "description": "Optional pgaudit.role for object-level auditing. Empty disables object auditing." }
           }
+        },
+        "walLevel": {
+          "enum": ["replica", "logical"],
+          "description": "replica (default) or logical, for a logical-replication subscriber (#308). The only place to set wal_level -- setting it in postgresql.configuration instead is rejected at render time."
         }
       }
     },
@@ -78,6 +82,10 @@
         "agent": {
           "type": "object",
           "properties": {
+            "syncReplicationSlots": {
+              "type": "boolean",
+              "description": "Reconcile synchronized_standby_slots to the live standby set on every primary tick (#308). Agent mode + PostgreSQL 17+ only; also requires postgresql.walLevel: logical (enforced at render time)."
+            },
             "dcs": {
               "type": "object",
               "properties": {

@@ -137,6 +137,10 @@ postgresql:
     # shared_buffers: "1GB"
     # work_mem: "32MB"
 
+  # WAL level (#308): replica (default) or logical (for a logical-replication
+  # subscriber). The only place to set wal_level -- see the pg chart README.
+  walLevel: replica
+
   podSecurityContext:
     fsGroup: 103
     runAsNonRoot: true
@@ -315,6 +319,11 @@ repmgr:
     # agent only picks a verifiably-safe same-timeline upstream, falls back to the
     # primary otherwise, and re-homes on failover. See the pg chart for detail.
     cascadingReplication: false
+    # Logical failover slot sync (#308), PostgreSQL 17+. Off by default. When true, the
+    # primary reconciles synchronized_standby_slots to its current standbys' physical
+    # slots so a logical failover slot survives the primary moving. Requires
+    # postgresql.walLevel: logical. See the pg chart README for detail.
+    syncReplicationSlots: false
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
     # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane
     # outage no longer self-demotes the primary (only an etcd quorum loss does);

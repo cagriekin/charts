@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -89,11 +91,12 @@ func TestLogStartupConfigExcludesSecrets(t *testing.T) {
 // --- fakes for the act() path ---
 
 type fakePostmaster struct {
-	started  bool
-	stopped  bool
-	stopMode process.StopMode
-	reloaded bool
-	running  bool
+	started   bool
+	stopped   bool
+	stopMode  process.StopMode
+	reloaded  bool
+	reloadErr error
+	running   bool
 	// stopErr, when set, is what Stop returns -- context.DeadlineExceeded stands in for
 	// the real postmaster's deadline-forced SIGKILL. deadOnStop clears running the way a
 	// killed-and-reaped child does; without it the child is still alive after the failure.
@@ -115,8 +118,15 @@ func (f *fakePostmaster) Stop(ctx context.Context, m process.StopMode) error {
 	f.running = false
 	return nil
 }
-func (f *fakePostmaster) Reload(context.Context) error { f.reloaded = true; return nil }
-func (f *fakePostmaster) Running() bool                { return f.running }
+
+// reloadErr, when set, is what Reload returns -- used to test the #308 recovery path
+// where a reload failure must not permanently strand a patched-but-not-reloaded
+// primary_conninfo behind the "already streaming" shortcut.
+func (f *fakePostmaster) Reload(context.Context) error {
+	f.reloaded = true
+	return f.reloadErr
+}
+func (f *fakePostmaster) Running() bool { return f.running }
 
 type fakeDCS struct{ released bool }
 
@@ -136,11 +146,18 @@ type scriptedExec struct {
 	unregistered []int  // node_ids passed to `repmgr standby unregister`
 	followOut    string // combined output for `repmgr standby follow`; non-empty = it fails
 	rejoins      int    // number of `repmgr node rejoin` calls (the #297 re-clone escalation)
+	slots        string // pg_replication_slots slot_name output (psql), for #308
+	slotSyncSQL  []string
 }
 
 func (s *scriptedExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
 	joined := strings.Join(args, " ")
 	switch {
+	case name == "psql" && strings.Contains(joined, "pg_replication_slots"):
+		return s.slots, nil
+	case name == "psql" && (strings.Contains(joined, "ALTER SYSTEM") || strings.Contains(joined, "pg_reload_conf")):
+		s.slotSyncSQL = append(s.slotSyncSQL, joined)
+		return "", nil
 	case name == "psql" && strings.Contains(joined, "repmgr.nodes"):
 		return s.nodes, nil
 	case name == "psql" && strings.Contains(joined, "pg_stat_wal_receiver"):
@@ -235,6 +252,158 @@ func TestActFollowRunsWhenNotStreaming(t *testing.T) {
 	}
 	if a.followUpstream != "pg-0" {
 		t.Fatal("followUpstream must latch after a successful follow")
+	}
+}
+
+// #308: repmgr's own `standby follow` writes primary_conninfo without dbname (PG17+'s
+// sync_replication_slots worker needs it, physical replication does not). act() must
+// patch it in and reload so the change takes effect on this already-running standby.
+func TestActFollowPatchesPrimaryConninfoDBNameAndReloads(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""} // no walreceiver row -- Follow runs
+	pm := &fakePostmaster{}
+	a := newFollowTestAgentWithPM(t, ex, pm)
+	confPath := filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf")
+	if err := os.WriteFile(confPath, []byte(
+		`primary_conninfo = 'host=''pg-0.h'' port=5432 user=repmgr application_name=''pg-1'' connect_timeout=10'`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "dbname=") {
+		t.Errorf("primary_conninfo was not patched with dbname:\n%s", b)
+	}
+	if !pm.reloaded {
+		t.Error("act must reload the postmaster after patching primary_conninfo")
+	}
+}
+
+// The dbname patch must also run on the "already streaming" shortcut path (no real
+// `repmgr standby follow` call), not only after a real Follow -- a repmgrd->agent
+// migration or a post-failover rejoin can leave a standby already streaming with a
+// primary_conninfo repmgr itself never patched.
+func TestActFollowPatchesPrimaryConninfoDBNameOnAlreadyStreamingShortcut(t *testing.T) {
+	ex := &scriptedExec{walRcv: "pg-0.h|streaming"} // already streaming -> shortcut, no real Follow
+	pm := &fakePostmaster{}
+	a := newFollowTestAgentWithPM(t, ex, pm)
+	confPath := filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf")
+	if err := os.WriteFile(confPath, []byte(
+		`primary_conninfo = 'host=''pg-0.h'' port=5432 user=repmgr application_name=''pg-1'' connect_timeout=10'`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if ex.follows != 0 {
+		t.Fatalf("repmgr standby follow must still be skipped when already streaming, got %d calls", ex.follows)
+	}
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "dbname=") {
+		t.Errorf("primary_conninfo was not patched with dbname on the shortcut path:\n%s", b)
+	}
+	if !pm.reloaded {
+		t.Error("act must reload the postmaster after patching primary_conninfo, even on the shortcut path")
+	}
+}
+
+// A reload failure must not permanently strand a patched-but-not-reloaded
+// primary_conninfo: act() returns an error (so followUpstream never latches), but the
+// FILE is already patched -- the next tick must retry the reload via the
+// already-streaming shortcut rather than silently giving up once streaming looks fine.
+func TestActFollowRetriesReloadAfterPriorFailure(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""} // not yet streaming -> first tick runs a real Follow
+	pm := &fakePostmaster{reloadErr: errors.New("reload failed")}
+	a := newFollowTestAgentWithPM(t, ex, pm)
+	confPath := filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf")
+	if err := os.WriteFile(confPath, []byte(
+		`primary_conninfo = 'host=''pg-0.h'' port=5432 user=repmgr application_name=''pg-1'' connect_timeout=10'`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err == nil {
+		t.Fatal("expected the reload failure to surface as an error")
+	}
+	if a.followUpstream == "pg-0" {
+		t.Fatal("followUpstream must not latch when the reload failed")
+	}
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "dbname=") {
+		t.Fatalf("the file should already be patched from the failed attempt:\n%s", b)
+	}
+
+	// Second tick: the standby is now streaming (the underlying replication connection
+	// never depended on dbname), so this would take the already-streaming shortcut. The
+	// reload must still be retried -- fix the postmaster and confirm it recovers.
+	ex.walRcv = "pg-0.h|streaming"
+	followsBefore := ex.follows
+	pm.reloadErr = nil
+	pm.reloaded = false
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if ex.follows != followsBefore {
+		t.Fatalf("the retry must go through the shortcut, not another real follow, got %d calls (was %d)", ex.follows, followsBefore)
+	}
+	if !pm.reloaded {
+		t.Error("the second tick must retry the reload rather than silently latching")
+	}
+	if a.followUpstream != "pg-0" {
+		t.Error("followUpstream must latch once the retried reload succeeds")
+	}
+}
+
+// A standby that has no postgresql.auto.conf primary_conninfo line to patch (or no file
+// at all) must not fail the Follow action -- physical replication itself does not depend
+// on this fix, so a missing/malformed file is logged, not fatal.
+func TestActFollowToleratesMissingPrimaryConninfoFile(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""}
+	a := newFollowTestAgent(t, ex)
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act must not fail when postgresql.auto.conf is absent: %v", err)
+	}
+	if a.followUpstream != "pg-0" {
+		t.Fatal("followUpstream must still latch")
+	}
+}
+
+// #308: a fresh clone's primary_conninfo (written by repmgr's own `standby clone`) must
+// be patched with dbname BEFORE Start, so the fresh boot picks it up with no extra
+// reload -- unlike Follow, which patches an already-running standby.
+func TestActBootstrapClonePatchesPrimaryConninfoBeforeStart(t *testing.T) {
+	ex := &scriptedExec{}
+	pm := &fakePostmaster{}
+	a := newFollowTestAgentWithPM(t, ex, pm)
+	confPath := filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf")
+	if err := os.WriteFile(confPath, []byte(
+		`primary_conninfo = 'host=''pg-0.h'' port=5432 user=repmgr application_name=''pg-1'' connect_timeout=10'`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dec := reconcile.Decision{Action: reconcile.BootstrapClone, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "dbname=") {
+		t.Errorf("primary_conninfo was not patched with dbname before Start:\n%s", b)
+	}
+	if !pm.started {
+		t.Error("act must still start the postmaster after a successful clone")
 	}
 }
 
@@ -631,6 +800,157 @@ func TestCleanupGhostNodes(t *testing.T) {
 	a.cleanupGhostNodes(context.Background())
 	if len(ex.unregistered) != 1 || ex.unregistered[0] != 1002 {
 		t.Fatalf("expected only node 1002 unregistered, got %v", ex.unregistered)
+	}
+}
+
+// #308: no-op entirely (byte-identical to today) unless cfg.SyncReplicationSlots is set,
+// even with active standby slots to reconcile.
+func TestAssertSyncStandbySlotsNoOpWhenDisabled(t *testing.T) {
+	ex := &scriptedExec{slots: "repmgr_slot_1001\n"}
+	a := newFollowTestAgent(t, ex)
+	a.assertSyncStandbySlots(context.Background())
+	if len(ex.slotSyncSQL) != 0 {
+		t.Fatalf("expected no SQL when disabled, got %v", ex.slotSyncSQL)
+	}
+}
+
+// The desired set is registered, non-ghost standby node IDs intersected with slots
+// that actually exist -- not pg_replication_slots.active (see the function's doc
+// comment for why: that flapped on any blip). nodes and slots both need setting for a
+// standby to be reconciled in.
+func TestAssertSyncStandbySlotsReconciles(t *testing.T) {
+	ex := &scriptedExec{nodes: "1001\n1002\n", slots: "repmgr_slot_1001\nrepmgr_slot_1002\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("expected ALTER SYSTEM + reload (2 calls), got %v", ex.slotSyncSQL)
+	}
+	if !strings.Contains(ex.slotSyncSQL[0], "repmgr_slot_1001,repmgr_slot_1002") {
+		t.Errorf("first call = %q, want the joined slot list", ex.slotSyncSQL[0])
+	}
+	if want := "repmgr_slot_1001,repmgr_slot_1002"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
+		t.Errorf("lastSyncStandbySlots = %v, want %q", a.lastSyncStandbySlots, want)
+	}
+}
+
+// repmgr.nodes has no ORDER BY, so StandbyNodeIDs' row order is not guaranteed stable
+// between calls even when the standby SET is unchanged. desired doubles as the cache
+// key (a bare string compare), so an unstable order would make the primary re-run ALTER
+// SYSTEM + reload every tick even in the steady state -- churn indistinguishable from a
+// real topology change. Two ticks with the same IDs in a DIFFERENT order must produce
+// byte-identical output and no second SQL call.
+func TestAssertSyncStandbySlotsOrderIndependent(t *testing.T) {
+	ex := &scriptedExec{nodes: "1002\n1001\n", slots: "repmgr_slot_1001\nrepmgr_slot_1002\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if want := "repmgr_slot_1001,repmgr_slot_1002"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
+		t.Fatalf("lastSyncStandbySlots = %v, want %q (sorted regardless of repmgr.nodes row order)", a.lastSyncStandbySlots, want)
+	}
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("first call: expected 2 SQL statements, got %v", ex.slotSyncSQL)
+	}
+	// Same standbys, rows returned in the OTHER order -- must be treated as unchanged.
+	ex.nodes = "1001\n1002\n"
+	a.assertSyncStandbySlots(context.Background())
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("second call with the same standbys in a different row order must not issue more SQL, got %v", ex.slotSyncSQL)
+	}
+}
+
+// A registered standby whose walsender briefly drops (a restart, a rolling upgrade, a
+// network blip) must NOT be dropped from synchronized_standby_slots -- only genuine
+// ghosts (see the next test) and standbys with no physical slot at all are excluded.
+// PhysicalSlots (unlike the earlier active-filtered version) does not care whether the
+// slot is currently attached, only that it exists.
+func TestAssertSyncStandbySlotsSurvivesABlip(t *testing.T) {
+	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
+		t.Errorf("lastSyncStandbySlots = %v, want %q", a.lastSyncStandbySlots, want)
+	}
+}
+
+// A ghost node (scaled down, per cleanupGhostNodes' own ordinal-vs-NodeCount
+// discriminator) must not appear in synchronized_standby_slots even though its slot
+// object may still exist momentarily.
+func TestAssertSyncStandbySlotsExcludesGhostNodes(t *testing.T) {
+	ex := &scriptedExec{nodes: "1001\n1002\n", slots: "repmgr_slot_1001\nrepmgr_slot_1002\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.cfg.NodeCount = 2 // live ordinals 0-1 -> node_id 1002 (ordinal 2) is a ghost
+	a.assertSyncStandbySlots(context.Background())
+	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
+		t.Errorf("lastSyncStandbySlots = %v, want %q (1002 excluded as a ghost)", a.lastSyncStandbySlots, want)
+	}
+}
+
+// A standby registered a moment before its physical slot is created must not have a
+// nonexistent slot named in synchronized_standby_slots -- that is the exact "blocks all
+// logical decoding" failure this feature exists to prevent.
+func TestAssertSyncStandbySlotsExcludesUnslottedStandby(t *testing.T) {
+	ex := &scriptedExec{nodes: "1001\n1002\n", slots: "repmgr_slot_1001\n"} // 1002 has no slot yet
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
+		t.Errorf("lastSyncStandbySlots = %v, want %q (1002 excluded, no slot yet)", a.lastSyncStandbySlots, want)
+	}
+}
+
+// A freshly-promoted primary with no active standby slots yet must still issue the
+// ALTER SYSTEM on its first reconcile (desired=="" is a real value, not a skip) --
+// otherwise a synchronized_standby_slots value inherited from a prior primary term (or
+// from being cloned from one) survives uncorrected, potentially naming a slot that no
+// longer exists and permanently blocking logical decoding.
+func TestAssertSyncStandbySlotsFirstReconcileIsUnconditionalEvenWhenEmpty(t *testing.T) {
+	ex := &scriptedExec{}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("expected an unconditional first ALTER SYSTEM + reload even for an empty desired set, got %v", ex.slotSyncSQL)
+	}
+	if a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != "" {
+		t.Errorf("lastSyncStandbySlots = %v, want a non-nil pointer to \"\"", a.lastSyncStandbySlots)
+	}
+}
+
+// act() must clear the cache whenever this node stops serving as primary, so the next
+// primary term (this node re-promoted, or another node) starts with an unconditional
+// first reconcile rather than a stale cache.
+func TestActClearsLastSyncStandbySlotsWhenNotPrimary(t *testing.T) {
+	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if a.lastSyncStandbySlots == nil {
+		t.Fatal("expected a cached value after the first reconcile")
+	}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.Follow}, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if a.lastSyncStandbySlots != nil {
+		t.Errorf("lastSyncStandbySlots = %v, want nil after a non-primary action", a.lastSyncStandbySlots)
+	}
+}
+
+// A steady-state tick with an unchanged standby set must skip the ALTER SYSTEM +
+// reload entirely, not repeat it every 5s.
+func TestAssertSyncStandbySlotsSkipsWhenUnchanged(t *testing.T) {
+	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background())
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("first call: expected 2 SQL statements, got %v", ex.slotSyncSQL)
+	}
+	a.assertSyncStandbySlots(context.Background())
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("second call with an unchanged slot set must not issue more SQL, got %v", ex.slotSyncSQL)
 	}
 }
 

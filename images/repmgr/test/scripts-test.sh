@@ -221,6 +221,15 @@ else
   bad "init-repmgr.sh does not honor REPMGR_FAILOVER"
 fi
 
+# --- #308: init-repmgr honors USE_REPLICATION_SLOTS (the chart sets it only in agent
+# mode, matching the agent's own regenerated repmgr.conf so a fresh standby's very
+# first clone gets a physical slot instead of only its second repmgr operation) ---
+if grep -qF 'use_replication_slots=${USE_REPLICATION_SLOTS:-0}' "${ROOT}/init-repmgr.sh"; then
+  ok "#308: init-repmgr.sh honors USE_REPLICATION_SLOTS"
+else
+  bad "#308: init-repmgr.sh does not honor USE_REPLICATION_SLOTS"
+fi
+
 # --- #269: the PG major must not be hardcoded anywhere in the shipped shell layer ---
 # The whole point of the PG_MAJOR build arg is that one image build can be PG17 or PG18.
 # A single re-hardcoded /usr/lib/postgresql/<major>/bin would send a PG17 image at a

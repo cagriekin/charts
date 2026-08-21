@@ -4,7 +4,7 @@ TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-repmgr test-repmgr-chaos test-full test-failover test-upgrade \
-        test-repmgr-failover test-agent test-agent-control test-agent-control-restore test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-backup-concurrent test-pgbackrest-restore test-pgbackrest-restore-ha test-pgbackrest-bootstrap test-databases-roles test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
+        test-repmgr-failover test-agent test-agent-control test-agent-control-restore test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-sync-replication-slots test-migrate-agent test-scaledown test-agent-rolling test-config test-config-repmgr test-backup-restore test-backup-concurrent test-pgbackrest-restore test-pgbackrest-restore-ha test-pgbackrest-bootstrap test-databases-roles test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -25,6 +25,7 @@ help:
 	@echo "  test-pgpool-failover - Run PGPool failover + health-check test (standalone, opt-in)"
 	@echo "  test-config-failover - Run config-persistence-across-failover test (standalone, opt-in)"
 	@echo "  test-cascading-replication - Run cascading-replication chain + re-homing test (standalone, opt-in)"
+	@echo "  test-sync-replication-slots - Run logical replication slot sync test (#308, standalone, opt-in)"
 	@echo "  test-migrate-agent - Run repmgrd->agent migration test (standalone, long)"
 	@echo "  test-upgrade    - Run upgrade path tests"
 	@echo "  test-config     - Run postgresql configuration tests (standalone)"
@@ -98,6 +99,13 @@ test-config-failover: cluster-exists
 
 test-cascading-replication: cluster-exists
 	@bash $(TESTS_DIR)/test-cascading-replication.sh
+
+# Logical replication slot sync (#308): wal_level (independent of pgbackrest.enabled),
+# dbname patched into primary_conninfo, and synchronized_standby_slots reconciliation
+# through install, a forced failover, and a scale-down. Standalone + opt-in, like
+# test-cascading-replication.
+test-sync-replication-slots: cluster-exists
+	@bash $(TESTS_DIR)/test-sync-replication-slots.sh
 
 # repmgrd -> agent migration (--cascade=orphan recreate). Standalone + long-running
 # (installs repmgrd, then rolls to agent), so not in test-cluster; run explicitly.

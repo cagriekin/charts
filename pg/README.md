@@ -180,6 +180,7 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.tolerations` | Tolerations for PostgreSQL pods | `[]` |
 | `postgresql.topologySpreadConstraints` | Spread constraints added alongside the built-in affinity (e.g. a hard zone spread) | `[]` |
 | `postgresql.serviceAccount.annotations` | Annotations on the postgresql pods' ServiceAccount (cloud workload identity for keyless pgBackRest S3) | `{}` |
+| `postgresql.walLevel` | `replica` or `logical` (#308; see [Logical Replication](#logical-replication-308)). The **only** place to set `wal_level` — setting it in `postgresql.configuration` instead fails at render time | `replica` |
 
 Example:
 
@@ -199,6 +200,26 @@ postgresql:
 ```
 
 When `repmgr.enabled` is true, `additionalCommands` automatically discover the current primary and execute against it, so DDL statements like `CREATE EXTENSION` work correctly regardless of which pod the hook runs on (including standbys after a failover).
+
+### Logical Replication (#308)
+
+Set `postgresql.walLevel: logical` for a logical-replication subscriber (`CREATE SUBSCRIPTION`, Debezium, or any other decoder on a replication slot). `logical` is a strict superset of `replica` and works regardless of `pgbackrest.enabled`/`archive_mode=on` — the two are unrelated concerns. `wal_level` is a postmaster parameter — the change rolls the pods via the existing configmap-checksum annotation, the same way any other `postgresql.configuration` change does.
+
+**Capacity.** Every physical standby consumes one `max_wal_senders` slot (and, in agent mode, one `max_replication_slots` entry — see `repmgr.agent.syncReplicationSlots` below); every logical subscriber consumes one more of each. The image's own initdb default is `max_wal_senders = 10` / `max_replication_slots = 10` (unaffected by `postgresql.walLevel`), which now flows through uncontested instead of being silently re-asserted by `pgbackrest-archive.conf` — so raise both via `postgresql.configuration` if `replicaCount` plus your logical subscriber count would otherwise exhaust the default.
+
+**This is the only place to set `wal_level`.** `pgbackrest.enabled` used to render a hardcoded `wal_level = replica` into its own `pgbackrest-archive.conf`, which sorts after `custom.conf` under `include_dir` and would silently win over a `postgresql.configuration.wal_level` you set yourself — that coupling is gone (`postgresql.walLevel` now has its own render block, independent of `pgbackrest.enabled`), but the chart still rejects `wal_level` in `postgresql.configuration` at render time and tells you to set `postgresql.walLevel` instead, so there is exactly one source of truth regardless of pgBackRest's state.
+
+A logical subscriber must connect to the **write Service** (`<fullname>:5432`), not Pgpool — Pgpool's query routing is built for physical replicas, not for holding a replication slot's connection open.
+
+**Surviving a failover: `repmgr.agent.syncReplicationSlots`.** A plain logical slot does not survive the primary moving — `synchronized_standby_slots` (PostgreSQL 17+) is what lets a **failover** slot (`CREATE SUBSCRIPTION ... WITH (failover = true)`) be synced to a standby so it's still there after a promote, but it names physical replication slots, and PostgreSQL 17+'s `sync_replication_slots` worker (the standby-side process that keeps the failover slot in sync) additionally requires `dbname` in `primary_conninfo`, which repmgr's own clone/follow machinery never sets.
+
+The chart and agent (failover mode `agent` only) handle both automatically when `repmgr.agent.syncReplicationSlots: true`:
+
+- the agent patches `dbname` into `primary_conninfo` after every clone, follow, and rejoin (a no-op if it's already present, and harmless for physical-only replication either way — it ships unconditionally, not gated behind this value);
+- `sync_replication_slots = on` is set in `postgresql.conf` (inert on a primary; needed on any node that may run the slot-sync worker as a standby);
+- the primary reconciles `synchronized_standby_slots` to its current, live standbys' physical replication slot(s) on every tick it serves — through scale-up, scale-down, and promote — so the set is never stale.
+
+Requires `postgresql.walLevel: logical` (above) — enforced at render time, not a harmless no-op without it: the `sync_replication_slots` worker this enables on every standby fails its own startup validation below `wal_level: logical` and PostgreSQL restarts it forever, logging the failure on a fixed interval. See [issue #308](https://github.com/cagriekin/charts/issues/308).
 
 ### Installing extensions without a custom image
 
@@ -371,6 +392,7 @@ Both majors run the **whole** live test suite in CI (failover, pgBackRest restor
 | `repmgr.agent.reconcileInterval` | Reconcile tick interval | `5s` |
 | `repmgr.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
 | `repmgr.agent.cascadingReplication` | Let a standby stream from another standby (a chain by pod ordinal toward the primary) to offload the primary's WAL senders. Default off; agent mode only; meaningful at `replicaCount >= 2` (3+ nodes). The agent only picks a verifiably-safe same-timeline upstream and re-homes to the leader if it fails/promotes, so failover is not delayed and a standby is never stranded. | `false` |
+| `repmgr.agent.syncReplicationSlots` | Reconcile `synchronized_standby_slots` to the live standby set on every primary tick, so a logical failover slot survives a promote. Default off; agent mode only; requires PostgreSQL 17+ and `postgresql.walLevel: logical` (#308; see [Logical Replication](#logical-replication-308)). | `false` |
 
 Must satisfy `leaseDuration > renewDeadline > retryPeriod`. For managed clouds, widen them (e.g. `30s/20s/4s`) so a brief apiserver blip does not trip an unnecessary demote. Note: with the Kubernetes Lease backend, a control-plane outage longer than `renewDeadline` is itself a write outage (the healthy primary self-demotes on losing apiserver contact, and no standby can acquire until the control plane returns); this is the safe choice under an asymmetric partition.
 

@@ -45,6 +45,7 @@ data_directory='${PGDATA}'
 pg_bindir='${PG_BINDIR}'
 replication_user='${REPMGR_USER}'
 replication_type='physical'
+use_replication_slots=${USE_REPLICATION_SLOTS:-0}
 failover='${REPMGR_FAILOVER:-automatic}'
 promote_command='repmgr standby promote -f /etc/repmgr/repmgr.conf'
 follow_command='repmgr standby follow -f /etc/repmgr/repmgr.conf --upstream-node-id=%n'
