@@ -1,19 +1,6 @@
 # pg chart changelog
 
-## 2.0.0 - 2026-08-21
-
-### Breaking
-
-- **`postgresql.configuration.wal_level` is no longer accepted; use `postgresql.walLevel`
-  instead (#308).** `wal_level` now has exactly one authoritative source. On 1.x with
-  `pgbackrest.enabled: false`, `postgresql.configuration.wal_level` worked (nothing else
-  set the GUC, so it landed in `custom.conf` uncontested) -- it was only silently
-  overridden when pgbackrest was also on. That narrow working case now fails at render
-  time instead of continuing to work: `helm upgrade` on a release that set
-  `postgresql.configuration.wal_level` directly fails fast with a guard message naming
-  the fix. **Migration:** move the value to `postgresql.walLevel` (enum `replica`|
-  `logical`); everyone else is unaffected. This is the reason for the major bump --
-  everything else in this release is additive.
+## 1.13.0 - 2026-08-21
 
 ### Added
 
@@ -60,6 +47,13 @@
 - `pgbackrest-archive.conf` no longer hardcodes `max_wal_senders = 10` (#308) --
   redundant with the image's own initdb default, and it was silently clobbering a
   custom `postgresql.configuration.max_wal_senders` whenever pgBackRest was enabled.
+- **Compatibility note:** `postgresql.configuration.wal_level` is no longer accepted;
+  use `postgresql.walLevel` instead (#308). `wal_level` now has exactly one
+  authoritative source. If you were setting `postgresql.configuration.wal_level`
+  directly with `pgbackrest.enabled: false` (the only combination where it took
+  effect), move the value to `postgresql.walLevel` (enum `replica`|`logical`) -- the
+  old key now fails at render time with a guard message naming the fix. Everyone else
+  is unaffected.
 
 ## 1.12.0 - 2026-08-18
 

@@ -1,16 +1,10 @@
 # pgvector chart changelog
 
-## 2.0.0 - 2026-08-21
+## 1.13.0 - 2026-08-21
 
 Inherited from pg's symlinked templates (`postgresql-configmap.yaml`, `statefulset.yaml`,
 `_helpers.tpl`) and mirrored `values.yaml`/`values.schema.json`. See the
-[pg 2.0.0 changelog](../pg/CHANGELOG.md) for the full detail.
-
-### Breaking
-
-- **`postgresql.configuration.wal_level` is no longer accepted; use `postgresql.walLevel`
-  instead (#308).** The reason for the major bump -- everything else in this release is
-  additive. See the pg chart changelog for the migration note.
+[pg 1.13.0 changelog](../pg/CHANGELOG.md) for the full detail.
 
 ### Added
 
@@ -27,6 +21,9 @@ Inherited from pg's symlinked templates (`postgresql-configmap.yaml`, `statefuls
 ### Changed
 
 - `pgbackrest-archive.conf` no longer hardcodes `max_wal_senders = 10` (#308).
+- **Compatibility note:** `postgresql.configuration.wal_level` is no longer accepted;
+  use `postgresql.walLevel` instead (#308). See the pg chart changelog for the
+  migration note.
 
 ## 1.12.0 - 2026-08-18
 
