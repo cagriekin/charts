@@ -132,16 +132,26 @@ helm upgrade --install "${RELEASE}" "${CHART_DIR}" -n "${NAMESPACE}" \
 
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 300
 
-echo "  Waiting for synchronized_standby_slots to shrink to exactly 1 slot (up to 60s)..."
+# The remaining standby's slot, computed from the pod-name->node_id convention
+# (node_id = 1000 + ordinal) rather than re-querying the primary -- an identity check,
+# not just a count, so a stale departed slot lingering alongside (or instead of) the
+# live standby's slot is caught, not just a coincidentally-correct total.
 CURRENT_PRIMARY=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || echo "")
+REMAINING_STANDBY=""
+for p in "${FULLNAME}-0" "${FULLNAME}-1"; do
+  [[ "${p}" != "${CURRENT_PRIMARY}" ]] && REMAINING_STANDBY="${p}"
+done
+STANDBY_ORDINAL="${REMAINING_STANDBY##*-}"
+EXPECTED_SLOT="repmgr_slot_$((1000 + STANDBY_ORDINAL))"
+
+echo "  Waiting for synchronized_standby_slots to name exactly ${EXPECTED_SLOT} (up to 60s)..."
 s=0; shrunk_slots=""
 while [[ ${s} -lt 60 ]]; do
-  shrunk_slots=$(pg_exec "${NAMESPACE}" "${CURRENT_PRIMARY}" "SHOW synchronized_standby_slots" "testuser" "testdb" 2>/dev/null || echo "")
-  got=$(echo "${shrunk_slots}" | tr ',' '\n' | grep -c "repmgr_slot_" || true)
-  [[ "${got}" -le 1 ]] && break
+  shrunk_slots=$(pg_exec "${NAMESPACE}" "${CURRENT_PRIMARY}" "SHOW synchronized_standby_slots" "testuser" "testdb" 2>/dev/null | tr -d '[:space:]')
+  [[ "${shrunk_slots}" == "${EXPECTED_SLOT}" ]] && break
   sleep 5; s=$((s + 5))
 done
-assert_eq "primary: synchronized_standby_slots shrunk to 1 slot after scale-down" "1" "$(echo "${shrunk_slots}" | tr ',' '\n' | grep -c "repmgr_slot_" || true)"
+assert_eq "primary: synchronized_standby_slots names exactly the remaining standby's slot" "${EXPECTED_SLOT}" "${shrunk_slots}"
 
 end_suite
 print_summary

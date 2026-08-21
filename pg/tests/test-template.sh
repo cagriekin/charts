@@ -2117,6 +2117,20 @@ walevel_logical_no_pgbackrest=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.walLevel=logical --show-only templates/postgresql-configmap.yaml 2>&1)
 assert_contains "#308: walLevel=logical renders wal_level = logical (pgbackrest OFF)" "${walevel_logical_no_pgbackrest}" "wal_level = logical"
 
+# Regression: standalone mode (no repmgr) + walLevel=logical must render a matching
+# `volumes:` entry, not just the volumeMount -- an earlier revision left the mount
+# referencing a volume that was never declared (the outer `volumes:` list only opened
+# on postgresql.configuration/extensions/repmgr/pgbackrest/tls/extraVolumes/
+# !persistence.enabled, none of which walLevel alone trips), which the API server
+# rejects at apply time ("volumeMounts[x].name: postgresql-config: not found") even
+# though this renders cleanly.
+walevel_standalone_sts=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 --set postgresql.walLevel=logical \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#308: standalone + walLevel=logical mounts postgresql-config" "${walevel_standalone_sts}" "mountPath: /etc/postgresql/conf.d"
+walevel_standalone_volumes=$(grep -A1 "^      volumes:" <<< "${walevel_standalone_sts}")
+assert_contains "#308: standalone + walLevel=logical declares the matching volume" "${walevel_standalone_volumes}" "name: postgresql-config"
+
 # Byte-stable: an install that touches nothing #308-related must not gain a new
 # ConfigMap just because postgresql.walLevel defaults to "replica" in values.yaml.
 walevel_default_no_cm_rc=0
@@ -2158,8 +2172,9 @@ assert_not_contains "#308 off: no sync_replication_slots config by default" "${s
 
 sync_slots_on_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical --show-only templates/statefulset.yaml 2>&1)
-assert_contains "#308 on: agent gets SYNC_REPLICATION_SLOTS env" "${sync_slots_on_sts}" 'name: SYNC_REPLICATION_SLOTS
-              value: "true"'
+assert_contains "#308 on: agent gets SYNC_REPLICATION_SLOTS env" "${sync_slots_on_sts}" "name: SYNC_REPLICATION_SLOTS"
+sync_slots_on_env=$(grep -A1 "name: SYNC_REPLICATION_SLOTS" <<< "${sync_slots_on_sts}")
+assert_contains "#308 on: SYNC_REPLICATION_SLOTS value is true" "${sync_slots_on_env}" 'value: "true"'
 sync_slots_on_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical --show-only templates/postgresql-configmap.yaml 2>&1)
 assert_contains "#308 on: sync_replication_slots = on renders" "${sync_slots_on_cm}" "sync_replication_slots = on"
@@ -2190,10 +2205,17 @@ assert_not_contains "#308: repmgrd mode never renders sync_replication_slots (ag
 # GUC in a conf.d file crash-loops every pod, so this must fail at render time.
 sync_slots_pg16_rc=0
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.agent.syncReplicationSlots=true \
+  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
   --set postgresql.majorVersion=16 --set repmgr.image.majorVersion=16 \
   --set repmgr.image.tag=trixie-5.5.0-27-pg16 >/dev/null 2>&1 || sync_slots_pg16_rc=$?
 assert_gt "#308: syncReplicationSlots on PG16 rejected at render time (agent mode)" "${sync_slots_pg16_rc}" "0"
+# walLevel=logical isolates this to the MAJOR-version guard specifically (both guards
+# would otherwise fire on the default walLevel, and a bare non-zero rc cannot tell which).
+sync_slots_pg16_msg=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
+  --set postgresql.majorVersion=16 --set repmgr.image.majorVersion=16 \
+  --set repmgr.image.tag=trixie-5.5.0-27-pg16 2>&1 || true)
+assert_contains "#308: PG16 guard message names the version requirement" "${sync_slots_pg16_msg}" "requires PostgreSQL 17+"
 # Inert outside agent mode (matches cascadingReplication's own no-op-outside-agent-mode
 # precedent) -- must not block an unrelated repmgrd-mode/older-major install.
 sync_slots_pg16_repmgrd_rc=0

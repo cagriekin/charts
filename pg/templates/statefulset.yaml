@@ -1442,7 +1442,7 @@ spec:
           resources:
             {{- toYaml .Values.pgbackrest.resources | nindent 12 }}
 {{- end }}
-{{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.repmgr.enabled .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.extraVolumes (not .Values.postgresql.persistence.enabled) }}
+{{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.repmgr.enabled .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.extraVolumes (not .Values.postgresql.persistence.enabled) (eq (include "pg.postgresqlConfigRenders" .) "true") }}
       volumes:
 {{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
         - name: postgresql-config
