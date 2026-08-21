@@ -4,6 +4,7 @@
 {{- include "pg.validateExtensionPackages" . }}
 {{- include "pg.validateWalLevel" . }}
 {{- include "pg.validateSyncReplicationSlotsMajor" . }}
+{{- include "pg.validateSyncReplicationSlotsWalLevel" . }}
 {{- if and (not .Values.repmgr.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
 {{- fail "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr" }}
 {{- end }}
@@ -184,9 +185,9 @@ spec:
       labels:
         {{- include "pg.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: postgresql
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled .Values.postgresql.podAnnotations }}
+{{- if or (eq (include "pg.postgresqlConfigRenders" .) "true") .Values.postgresql.podAnnotations }}
       annotations:
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled }}
+{{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
         checksum/postgresql-config: {{ include (print $.Template.BasePath "/postgresql-configmap.yaml") . | sha256sum }}
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
@@ -545,6 +546,22 @@ spec:
               value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
             - name: REPMGR_NODE_COUNT
               value: {{ add .Values.postgresql.replicaCount 1 | quote }}
+{{- if eq (include "pg.agentMode" .) "true" }}
+            {{- /* #308: the agent's own repmgr.conf (regenerated every boot, see
+                   images/repmgr/agent/cmd/agent's boot()) has always used
+                   use_replication_slots=1 for standbys -- this predates #308. The
+                   initial clone below, run from THIS init container's repmgr.conf, did
+                   not, so a fresh standby's first-ever streaming connection carried no
+                   physical slot until an unrelated later repmgr operation happened to
+                   create one. #308's synchronized_standby_slots reconciliation is the
+                   first thing that depends on that slot existing reliably from the
+                   start, so align the initial clone with the agent's own default.
+                   repmgrd mode is deliberately untouched (retention there is
+                   wal_keep_size-based, not slot-based -- introducing slots there is an
+                   unrelated, unreviewed behavior change). */}}
+            - name: USE_REPLICATION_SLOTS
+              value: "1"
+{{- end }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
@@ -563,7 +580,7 @@ spec:
             - -c
             - |
               CONF=/var/lib/postgresql/data/pgdata/postgresql.conf
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled }}
+{{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
               if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
                 echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
               fi
@@ -702,9 +719,10 @@ spec:
 {{- if .Values.repmgr.agent.syncReplicationSlots }}
             {{- /* Logical failover slot sync (#308): the primary reconciles
                    synchronized_standby_slots to its current standby's physical slot(s)
-                   on every tick. Requires postgresql.walLevel: logical to be useful
-                   (undocumented here as a hard requirement -- see README -- since setting
-                   it without walLevel: logical is harmless, just a no-op). */}}
+                   on every tick. Requires postgresql.walLevel: logical -- enforced by
+                   pg.validateSyncReplicationSlotsWalLevel, since the sync_replication_slots
+                   worker this enables on every standby is NOT a harmless no-op without it
+                   (it fails startup validation and PostgreSQL respawns it forever). */}}
             - name: SYNC_REPLICATION_SLOTS
               value: "true"
 {{- end }}
@@ -854,7 +872,7 @@ spec:
                   - |
                     for i in {1..30}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
-                        {{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled }}
+                        {{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
                         CONF="$PGDATA/postgresql.conf"
                         if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
                           echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
@@ -893,7 +911,7 @@ spec:
                   - |
                     for i in {1..90}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
-                        {{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled }}
+                        {{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
                         CONF="$PGDATA/postgresql.conf"
                         if [ -f "$CONF" ] && ! grep -q "include_dir = '/etc/postgresql/conf.d'" "$CONF"; then
                           echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
@@ -1145,7 +1163,7 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled }}
+{{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
             - name: postgresql-config
               mountPath: /etc/postgresql/conf.d
               readOnly: true
@@ -1426,7 +1444,7 @@ spec:
 {{- end }}
 {{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.repmgr.enabled .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.extraVolumes (not .Values.postgresql.persistence.enabled) }}
       volumes:
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled }}
+{{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
         - name: postgresql-config
           configMap:
             name: {{ include "pg.fullname" . }}-postgresql-config

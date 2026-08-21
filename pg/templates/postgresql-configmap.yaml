@@ -1,4 +1,4 @@
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled (ne (.Values.postgresql.walLevel | default "replica") "replica") (and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots) }}
+{{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

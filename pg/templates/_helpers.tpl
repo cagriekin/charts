@@ -418,6 +418,20 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end }}
 {{- end }}
 
+{{- /* #308: the sync_replication_slots worker PostgreSQL starts on every standby when
+       syncReplicationSlots=true also requires wal_level >= logical (ValidateSlotSyncParams);
+       with wal_level=replica (the chart default) it is NOT a harmless no-op -- the worker
+       fails its own startup validation and PostgreSQL respawns it on a fixed interval
+       forever, so every standby logs a repeating "wal_level" error. Same agent-mode
+       scoping as pg.validateSyncReplicationSlotsMajor. */}}
+{{- define "pg.validateSyncReplicationSlotsWalLevel" -}}
+{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
+{{- if ne (.Values.postgresql.walLevel | default "replica") "logical" }}
+{{- fail (printf "repmgr.agent.syncReplicationSlots requires postgresql.walLevel: logical (the sync_replication_slots worker it enables on every standby fails its own startup validation below that, and PostgreSQL restarts it forever, logging the failure on a fixed interval), but postgresql.walLevel=%q. Set postgresql.walLevel to \"logical\", or set repmgr.agent.syncReplicationSlots to false." (.Values.postgresql.walLevel | default "replica")) }}
+{{- end }}
+{{- end }}
+{{- end }}
+
 {{- /* #262: validate the postgresql.extraVolumes / extraVolumeMounts / extraEnv
        passthrough. These are spliced verbatim into the pod spec, so without guards a
        plausible mistake becomes a silent runtime failure or an apply-time apiserver
@@ -758,6 +772,30 @@ with: {{- if eq (include "pg.agentMode" .) "true" }}
 
 {{- define "pg.repmgrdMode" -}}
 {{- and .Values.repmgr.enabled (eq (include "pg.failoverMode" .) "repmgrd") -}}
+{{- end -}}
+
+{{- /* The single condition under which postgresql-configmap.yaml renders a ConfigMap at
+       all (#308). statefulset.yaml needs this SAME condition in seven places -- the
+       checksum annotation, the postgresql-config volume mount (twice, for postStart
+       include_dir wiring on two different code paths), and the volume definition itself
+       -- and duplicating the raw boolean expression at each site is exactly how the
+       postgresql.walLevel / repmgr.agent.syncReplicationSlots additions below ended up
+       missed at first: the ConfigMap's own guard was updated but the volume MOUNT guard
+       was not, so the rendered ConfigMap existed but was never attached to the pod (a
+       live KinD suite run caught it -- wal_level and sync_replication_slots silently
+       stayed at their defaults with no error). Every one of those seven sites -- and the
+       ConfigMap's own top-level `if` -- must use this helper instead of repeating the
+       condition, so a future addition to the list cannot drift the same way. */ -}}
+{{- define "pg.postgresqlConfigRenders" -}}
+{{- /* `if`, not a bare `or` -- Sprig's `or` returns the first truthy ARGUMENT (here,
+       postgresql.configuration itself, a map, when non-empty), not a boolean, so
+       stringifying its result directly would print the map's Go representation instead
+       of "true" and every `eq (include ...) "true"` call site would always be false.
+       `if` properly coerces any type's truthiness and lets this emit a literal "true"
+       or empty string, matching what those call sites actually compare against. */ -}}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled (ne (.Values.postgresql.walLevel | default "replica") "replica") (and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots) -}}
+true
+{{- end -}}
 {{- end -}}
 
 {{- /* The single condition under which the `create jobs` grant is rendered (#276). Both

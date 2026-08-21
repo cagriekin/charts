@@ -57,3 +57,12 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "requires PostgreSQL 17\\+"
+
+  # sync_replication_slots is not a harmless no-op below wal_level=logical -- the worker
+  # it starts on every standby fails its own startup validation and respawns forever.
+  - it: syncReplicationSlots without walLevel=logical is rejected
+    set:
+      repmgr.agent.syncReplicationSlots: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "requires postgresql.walLevel: logical"

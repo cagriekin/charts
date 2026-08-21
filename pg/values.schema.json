@@ -82,6 +82,10 @@
         "agent": {
           "type": "object",
           "properties": {
+            "syncReplicationSlots": {
+              "type": "boolean",
+              "description": "Reconcile synchronized_standby_slots to the live standby set on every primary tick (#308). Agent mode + PostgreSQL 17+ only; also requires postgresql.walLevel: logical (enforced at render time)."
+            },
             "dcs": {
               "type": "object",
               "properties": {

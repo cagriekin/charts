@@ -2157,12 +2157,20 @@ sync_slots_off_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/value
 assert_not_contains "#308 off: no sync_replication_slots config by default" "${sync_slots_off_cm}" "sync_replication_slots"
 
 sync_slots_on_sts=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.agent.syncReplicationSlots=true --show-only templates/statefulset.yaml 2>&1)
+  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#308 on: agent gets SYNC_REPLICATION_SLOTS env" "${sync_slots_on_sts}" 'name: SYNC_REPLICATION_SLOTS
               value: "true"'
 sync_slots_on_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.agent.syncReplicationSlots=true --show-only templates/postgresql-configmap.yaml 2>&1)
+  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical --show-only templates/postgresql-configmap.yaml 2>&1)
 assert_contains "#308 on: sync_replication_slots = on renders" "${sync_slots_on_cm}" "sync_replication_slots = on"
+
+# The pg.validateSyncReplicationSlotsWalLevel guard: the sync_replication_slots worker
+# this enables on every standby is NOT a harmless no-op below wal_level=logical -- it
+# fails its own startup validation and PostgreSQL respawns it forever.
+sync_slots_replica_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true >/dev/null 2>&1 || sync_slots_replica_rc=$?
+assert_gt "#308: syncReplicationSlots without walLevel=logical rejected at render time" "${sync_slots_replica_rc}" "0"
 
 # repmgrd mode: sync-slot reconciliation is agent-only -> neither the env nor the
 # config snippet is emitted even if the knob is set.
