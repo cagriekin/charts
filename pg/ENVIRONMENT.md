@@ -49,6 +49,7 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `POD_CIDR` | CIDR | yes | `repmgr.agent.podCidr` (`10.0.0.0/8`) | agent (hardened pg_hba: trusted pod network) |
 | `POSTGRESQL_PGHBA` | newline-list | no | `postgresql.pgHba` (joined) | agent (user pg_hba rules, above the catch-alls) |
 | `CASCADE_REPLICATION` | boolean | no | `repmgr.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
+| `MECHANISM` | enum | no | `repmgr.agent.mechanism` (`repmgr`/`native`) | agent (HA mechanics, #287, EXPERIMENTAL; emitted only when non-default) |
 | `PG_MAJOR` | digits | no | image `ENV` from the Dockerfile's `ARG PG_MAJOR` (`18`) | agent (versioned bindir `/usr/lib/postgresql/<major>/bin`, #269) |
 | `PGBACKREST_ENABLED` | boolean | no | `"true"` when `pgbackrest.enabled` | agent (control API backup routes) |
 | `PGBACKREST_STANZA` | string | no | `pgbackrest.stanza` | agent (`pgbackrest info`), archive_command |

@@ -16,24 +16,31 @@ var ErrRewindDiverged = errors.New("mechanism: rewind diverged, reclone required
 
 // Conn is how to reach a peer PostgreSQL node for clone/follow/rejoin. Password is
 // passed via PGPASSWORD, never on the command line or in logged argv.
+//
+// NodeID is the peer's repmgr node_id, carried alongside the address so Follow takes one
+// parameter that either mechanism can read the parts it needs from: repmgr addresses an
+// upstream by node_id (it resolves the conninfo from repmgr.nodes), while a native
+// mechanism must write an actual host into primary_conninfo and has no use for the id.
+// Zero when the caller has no id to supply -- only repmgr requires it.
 type Conn struct {
-	Host     string
-	Port     int
-	User     string
-	DB       string
-	Password string
+	NodeID         int
+	Host           string
+	Port           int
+	User           string
+	DB             string
+	Password       string
 	ConnectTimeout time.Duration
 }
 
 // NodeIdentity describes the local node for config generation.
 type NodeIdentity struct {
-	NodeID   int    // ordinal+1000, stable across restarts
-	NodeName string // pod hostname
-	FQDN     string // <pod>.<headless> — the conninfo host
-	DataDir  string // PGDATA
-	PGBindir string // /usr/lib/postgresql/<major>/bin
-	ReplUser string
-	ReplDB   string
+	NodeID       int    // ordinal+1000, stable across restarts
+	NodeName     string // pod hostname
+	FQDN         string // <pod>.<headless> — the conninfo host
+	DataDir      string // PGDATA
+	PGBindir     string // /usr/lib/postgresql/<major>/bin
+	ReplUser     string
+	ReplDB       string
 	ReplPassword string
 }
 
@@ -70,8 +77,12 @@ type Mechanism interface {
 	GenerateConfig(ctx context.Context, n NodeIdentity, o ConfigOpts) error
 	// Promote turns the local standby into a read-write primary on a new timeline.
 	Promote(ctx context.Context) error
-	// Follow points the local standby at the upstream node and restarts replication.
-	Follow(ctx context.Context, upstreamNodeID int) error
+	// Follow points the local standby at upstream and restarts replication. The whole Conn
+	// is passed, not just a node id: repmgr uses upstream.NodeID, while a native mechanism
+	// needs upstream.Host to write primary_conninfo (deriving the pod FQDN inside the
+	// mechanism would push the StatefulSet naming convention into a layer whose entire
+	// purpose is to know nothing about Kubernetes).
+	Follow(ctx context.Context, upstream Conn) error
 	// Clone builds the local PGDATA fresh from source (caller guarantees PGDATA is
 	// empty or moved aside).
 	Clone(ctx context.Context, source Conn) error

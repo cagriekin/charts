@@ -123,11 +123,14 @@ func splitNonEmpty(s string) []string {
 }
 
 type agent struct {
-	cfg    *config.Config
-	log    *slog.Logger
-	dcs    dcs.DCS
-	kube   *k8s.Client
-	mech   *mechanism.Repmgr
+	cfg  *config.Config
+	log  *slog.Logger
+	dcs  dcs.DCS
+	kube *k8s.Client
+	// The INTERFACE, not a concrete implementation: this is the seam that lets the mechanics
+	// be swapped without touching policy (#287). Typed as *Repmgr it compiled, but it also
+	// meant the agent was coupled to repmgr in the one place that is supposed not to be.
+	mech   mechanism.Mechanism
 	sup    *process.Supervisor
 	prober *pg.Prober
 	metr   *observe.Metrics
@@ -234,12 +237,16 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 	if err != nil {
 		return nil, err
 	}
+	mech, err := newMechanism(cfg, repmgrConf, pgBindir, log)
+	if err != nil {
+		return nil, err
+	}
 	return &agent{
 		cfg:    cfg,
 		log:    log,
 		dcs:    d,
 		kube:   kube,
-		mech:   mechanism.NewRepmgr(repmgrConf, cfg.PGDATA, cfg.RepmgrPassword),
+		mech:   mech,
 		sup:    process.NewSupervisor(process.NewChildPostmaster(postgresBin, cfg.PGDATA)),
 		prober: pg.NewProber(),
 		metr:   observe.New(),
@@ -702,7 +709,11 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			a.followUpstream = dec.Target
 			return nil
 		}
-		if err := a.mech.Follow(ctx, up); err != nil {
+		// Carry both the address and the node id: repmgr uses the id, a native mechanism
+		// uses the host to write primary_conninfo (#287).
+		upConn := a.peerMechConn(dec.Target)
+		upConn.NodeID = up
+		if err := a.mech.Follow(ctx, upConn); err != nil {
 			// #297: this node has no row in its own metadata copy -- a freshly-cloned standby
 			// whose upstream changed before it registered. It can never obtain the row (that
 			// needs replication, which is what it is trying to establish), so it would retry
@@ -720,6 +731,17 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 				return a.rejoinOnto(ctx, dec.Target)
 			}
 			return err
+		}
+		// repmgr standby follow applies the repoint itself (this reload is a harmless
+		// no-op confirming it). The native mechanism only writes files (managed conf +
+		// standby.signal) and relies on the caller to apply them -- primary_conninfo is
+		// reloadable in modern PostgreSQL (this node is already InRecovery, per Decide's
+		// precondition for the Follow action, so a reload -- not a full restart -- is
+		// sufficient to make the walreceiver reconnect to the new upstream). Skipping
+		// this would leave native mode's Follow silently inert: the file changes, but
+		// nothing tells the running postmaster to pick it up (#287).
+		if err := a.sup.Reload(ctx); err != nil {
+			return fmt.Errorf("reload after follow: %w", err)
 		}
 		a.followUpstream = dec.Target
 		return nil
@@ -1123,6 +1145,33 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 	return a.sup.Start(ctx)
 }
 
+// newMechanism selects the replication mechanics from config (#287). Policy is identical
+// either way -- the Lease, the election, fencing and routing all live in reconcile, which
+// holds only the Mechanism interface -- so this is the single place the two differ.
+//
+// config.Load already rejects any value that is neither repmgr nor native at boot, so the
+// error return here is unreachable for a config that went through Load -- but this fails
+// loudly rather than silently defaulting to repmgr, matching the fail-fast posture the rest
+// of this codebase takes on required config (no ||/?? fallbacks). Without that, a future
+// mechanism value added to the enum without a case here would silently run repmgr with only
+// this function's own log line as a hint, rather than surfacing the drift.
+//
+// "" (distinct from an unrecognised value) is accepted alongside MechanismRepmgr: it is
+// what an older, pre-#287 image or a config built without going through Load's own
+// empty->repmgr normalization looks like, and must keep behaving exactly as it always has.
+func newMechanism(cfg *config.Config, repmgrConf, pgBindir string, log *slog.Logger) (mechanism.Mechanism, error) {
+	switch cfg.Mechanism {
+	case config.MechanismNative:
+		log.Warn("using the EXPERIMENTAL native mechanism: topology still comes from repmgr.nodes (#288) and nothing owns replication slots (#289), so this is not yet usable for a real cluster",
+			"mechanism", cfg.Mechanism)
+		return mechanism.NewNative(cfg.PGDATA, pgBindir, cfg.RepmgrPassword), nil
+	case config.MechanismRepmgr, "":
+		return mechanism.NewRepmgr(repmgrConf, cfg.PGDATA, cfg.RepmgrPassword), nil
+	default:
+		return nil, fmt.Errorf("newMechanism: unrecognised MECHANISM %q (want %s|%s)", cfg.Mechanism, config.MechanismRepmgr, config.MechanismNative)
+	}
+}
+
 func (a *agent) selfConn() pg.ConnInfo {
 	return pg.ConnInfo{Host: "127.0.0.1", Port: 5432, User: a.cfg.RepmgrUser, DB: a.cfg.RepmgrDB, Password: a.cfg.RepmgrPassword}
 }
@@ -1148,7 +1197,16 @@ func (a *agent) fqdn(name string) string { return name + "." + a.cfg.HeadlessSer
 // cannot remove -- is left for an operator rather than re-attempted (and re-warned)
 // every tick. A non-positive NodeCount is a no-op via ghostNodeIDs, so this can never
 // unregister a live node.
+//
+// Skipped entirely under the #287 native mechanism: it has no repmgr.nodes (native's
+// Unregister is a no-op, see mechanism.Native), so StandbyNodeIDs would error on every
+// primary tick forever. That is harmless (RegistryRead-style fail-open elsewhere), but
+// here it is pure log noise with no cleanup to retry -- skip the call rather than warn
+// on a known, permanent condition.
 func (a *agent) cleanupGhostNodes(ctx context.Context) {
+	if a.cfg.Mechanism == config.MechanismNative {
+		return
+	}
 	ids, err := a.prober.StandbyNodeIDs(ctx, a.selfConn())
 	if err != nil {
 		a.log.Warn("list repmgr.nodes for ghost cleanup", "err", err)

@@ -244,6 +244,13 @@ func (p *Prober) SystemIdentifier(ctx context.Context, ci ConnInfo) (id uint64, 
 // leave the cluster with no serving primary. A malformed row is an error rather than a
 // silent skip, so a broken table cannot read as "nobody is registered" and quietly
 // disable the gate.
+//
+// Under the #287 native mechanism there is no repmgr.nodes at all, so this always errors
+// and reconcile.Observation.RegistryRead stays false -- by design (see that field's doc):
+// the gate the caller drives from this is fail-open, so native mode promotes normally
+// instead of being silently blocked. Do not make this return an empty, error-free result
+// for a missing table; that would flip RegistryRead to true and make the gate fire on every
+// native-mode promote.
 func (p *Prober) RegisteredNodeIDs(ctx context.Context, ci ConnInfo) ([]int, error) {
 	out, err := p.psql(ctx, ci, "SELECT node_id FROM repmgr.nodes;")
 	if err != nil {

@@ -70,6 +70,56 @@
   it all three nodes come up Ready and agree on the topology; `test-pgpool-failover` still
   passes with no `pgdata.diverged.*` created.
 
+### Added
+
+- **`repmgr.agent.mechanism`: an experimental native HA mechanism, alongside repmgr
+  (#287).** repmgr ([upstream development has stalled](https://github.com/EnterpriseDB/repmgr))
+  is still the default and the only supported mechanism; this adds a second implementation
+  behind a flag, not a replacement. The agent's reconcile loop imports only the `Mechanism`
+  interface, never repmgr directly, and this is the seam that lets one be swapped for the
+  other without touching policy (the Lease, the timeline/LSN election, fencing, and Service
+  routing are unchanged either way).
+
+  `repmgr.agent.mechanism: native` drives PostgreSQL's own tools directly instead of the
+  repmgr CLI: `pg_ctl promote`, `pg_basebackup`, `pg_rewind`, and `primary_conninfo`/
+  `standby.signal` written into an agent-owned config fragment inside `PGDATA`. Off by
+  default (`mechanism: repmgr`; a default render is byte-identical to 1.x/2.0.0's repmgrd
+  removal).
+
+  **EXPERIMENTAL -- do not set `native` in production, and only at
+  `postgresql.replicaCount: 0` (a lone primary) until `#288` lands.** `RegisterPrimary`/
+  `RegisterStandby`/`Unregister` are no-ops (no topology source at all), and the chart's
+  `repmgr-init` init container -- which bootstraps every standby's first clone by polling
+  `repmgr.nodes` for the primary to register, before the Go agent ever runs -- has no
+  `MECHANISM` awareness. Verified live: with any replicas, that poll times out and every
+  standby sits `Init:CrashLoopBackOff` forever; the primary itself comes up and serves fine.
+  `#289` (nothing owns replication slots, so a primary can recycle WAL a standby still needs)
+  is the second blocker once #288 lands. `#294` tracks promoting `native` to supported.
+
+  Verified that native mode inherits the mechanism-agnostic safety behaviors already in
+  reconcile/probe rather than needing its own copies -- in particular the `#297` scale-up
+  registration gate, which reads `repmgr.nodes` and is designed to fail open when that read
+  errors (an existing, unit-tested contract): native mode has no `repmgr.nodes` at all, so
+  the gate is permanently inert under it and native promotes exactly as repmgr mode would if
+  the registry were empty, rather than being silently blocked. See the
+  [pg README](README.md#replication-mechanics-experimental-287) for the full writeup.
+
+  **Review follow-up:** three real bugs surfaced building this out further and are fixed in
+  the same change: (1) `act()` never applied a `Follow`'d config change for a mechanism that
+  only writes files -- native's repoint was silently inert until an unrelated restart/reload
+  happened to pick it up; `act()` now reloads the postmaster after every successful `Follow`
+  (a harmless no-op for repmgr, which already applies its own repoint). (2) `Clone` used
+  `pg_basebackup -R`, writing `primary_conninfo` into `postgresql.auto.conf` -- a second,
+  higher-precedence location than the managed fragment `Follow` writes to (auto.conf is
+  included last), so a standby re-pointed to a new upstream after its initial clone would
+  keep silently streaming from the original source. `Clone` now calls `Follow` itself instead
+  of `-R`, keeping one authoritative location. (3) `GenerateConfig` unconditionally wrote an
+  empty `primary_conninfo`, run once per agent process boot -- including every pod restart on
+  an already-following standby, not just a fresh node -- so a routine restart silently
+  interrupted replication until the next tick's `Follow` re-established it; it now preserves
+  whatever conninfo is already on disk. Also: `ensureInclude`'s file close error was
+  previously dropped (deferred and ignored); it is now checked and wrapped.
+
 ### Migrating from 1.x
 
 **If you were on the default (agent):** delete `repmgr.failoverMode: agent` from your values

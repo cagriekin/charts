@@ -31,3 +31,24 @@ tests:
       - isKind:
           of: StatefulSet
       - notFailedTemplate: {}
+
+  # #287: experimental native HA mechanism selector, rendered with pgvector's own
+  # values + schema (the template is the same symlinked file as pg's, but the schema
+  # enum was added separately to pgvector/values.schema.json -- confirm it's really
+  # there, not just copy-pasted into pg's).
+  - it: mechanism native renders the MECHANISM env
+    set:
+      repmgr.agent.mechanism: native
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env
+          content:
+            name: MECHANISM
+            value: "native"
+          any: true
+
+  - it: bogus mechanism value is rejected by the schema
+    set:
+      repmgr.agent.mechanism: patroni
+    asserts:
+      - failedTemplate: {}

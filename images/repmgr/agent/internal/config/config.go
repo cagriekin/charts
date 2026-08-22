@@ -18,6 +18,18 @@ import (
 // PG_MAJOR build arg existed, which was always PostgreSQL 18.
 const defaultPGMajor = "18"
 
+// The HA mechanism the agent drives (#287). Optional -- absent means MechanismRepmgr, so an
+// existing release and an older env-less image both keep their current behaviour.
+//
+// MechanismNative is EXPERIMENTAL and not usable on its own: it makes the flag selectable,
+// but topology still comes from repmgr.nodes (#288) and nobody owns replication slots (#289).
+// Enabling it before those land yields a standby with no upstream to choose and a primary
+// that can recycle WAL a standby still needs. #294 promotes it to supported, then default.
+const (
+	MechanismRepmgr = "repmgr"
+	MechanismNative = "native"
+)
+
 // Config is the validated agent configuration.
 type Config struct {
 	PodName   string // this pod's name — the Lease holder identity
@@ -49,6 +61,12 @@ type Config struct {
 
 	DCSBackend       string // "kubernetes" | "etcd"
 	SplitBrainAction string // "log" | "fence"
+
+	// Mechanism selects the replication mechanics the agent drives: MechanismRepmgr (the
+	// repmgr CLI) or MechanismNative (pg_ctl / pg_basebackup / pg_rewind directly). Policy
+	// -- the Lease, the timeline/LSN election, fencing, routing -- is identical either way;
+	// only the mechanics differ, which is the whole point of the Mechanism seam.
+	Mechanism string
 
 	// pg_hba assembly (agent mode owns pg_hba: hardened, SCRAM-only, no 0.0.0.0/0 md5).
 	PgHbaPeerCIDR string   // POD_CIDR: the trusted pod network for SCRAM rules
@@ -272,6 +290,17 @@ func Load(get func(string) string) (*Config, error) {
 		l.invalid = append(l.invalid, fmt.Sprintf("PG_MAJOR=%q (want digits only, e.g. 17 or 18)", c.PGMajor))
 	}
 
+	// HA mechanism (#287). Optional -- absent means repmgr, so nothing changes for an
+	// existing release. Validated as an enum here rather than discovered at the first
+	// promote: an unrecognised value would otherwise silently fall through to whichever
+	// branch the factory happens to default to.
+	c.Mechanism = strings.TrimSpace(get("MECHANISM"))
+	if c.Mechanism == "" {
+		c.Mechanism = MechanismRepmgr
+	} else if c.Mechanism != MechanismRepmgr && c.Mechanism != MechanismNative {
+		l.invalid = append(l.invalid, fmt.Sprintf("MECHANISM=%q (want %s|%s)", c.Mechanism, MechanismRepmgr, MechanismNative))
+	}
+
 	// Cross-field validation that the lease timings are internally consistent
 	// (client-go requires LeaseDuration > RenewDeadline > RetryPeriod).
 	if c.LeaseDuration > 0 && c.RenewDeadline > 0 && c.RetryPeriod > 0 {
@@ -403,14 +432,14 @@ func (c Config) String() string {
 	return fmt.Sprintf("Config{PodName:%s Namespace:%s LeaseName:%s "+
 		"LeaseDuration:%s RenewDeadline:%s RetryPeriod:%s ReconcileInterval:%s "+
 		"HeadlessService:%s NodeCount:%d MasterService:%s MarkerName:%s PodSelector:%q "+
-		"RepmgrUser:%s RepmgrDB:%s RepmgrPassword:*** PGDATA:%s PGMajor:%s DCSBackend:%s SplitBrainAction:%s "+
+		"RepmgrUser:%s RepmgrDB:%s RepmgrPassword:*** PGDATA:%s PGMajor:%s Mechanism:%s DCSBackend:%s SplitBrainAction:%s "+
 		"EtcdEndpoints:%v EtcdPrefix:%s EtcdTLS:%t PgHbaPeerCIDR:%s PgHbaRules:%d "+
 		"Control:%t ControlAddr:%s ControlMTLS:%t ControlAllowedCNs:%d "+
 		"ControlRestore:%t ControlRestoreAllowedCNs:%d ControlRestoreReadPodLogs:%t}",
 		c.PodName, c.Namespace, c.LeaseName,
 		c.LeaseDuration, c.RenewDeadline, c.RetryPeriod, c.ReconcileInterval,
 		c.HeadlessService, c.NodeCount, c.MasterService, c.MarkerName, c.PodSelector,
-		c.RepmgrUser, c.RepmgrDB, c.PGDATA, c.PGMajor, c.DCSBackend, c.SplitBrainAction,
+		c.RepmgrUser, c.RepmgrDB, c.PGDATA, c.PGMajor, c.Mechanism, c.DCSBackend, c.SplitBrainAction,
 		c.EtcdEndpoints, c.EtcdPrefix, c.EtcdCertFile != "", c.PgHbaPeerCIDR, len(c.PgHbaRules),
 		c.ControlEnabled, c.ControlAddr, c.ControlCertFile != "", len(c.ControlAllowedCNs),
 		c.ControlRestoreEnabled, len(c.ControlRestoreAllowedCNs), c.ControlRestoreReadPodLogs)

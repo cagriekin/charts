@@ -84,6 +84,42 @@ func TestLoadRejectsBadSplitBrainAction(t *testing.T) {
 	}
 }
 
+// #287: MECHANISM is an enum with a default. Absent must mean repmgr so an existing release
+// and an older env-less image keep their behaviour; an unrecognised value must fail at boot
+// rather than fall through to whichever branch the factory defaults to.
+func TestMechanismDefaultsToRepmgr(t *testing.T) {
+	m := fullEnv()
+	delete(m, "MECHANISM")
+	c, err := Load(getter(m))
+	if err != nil {
+		t.Fatalf("MECHANISM must be optional: %v", err)
+	}
+	if c.Mechanism != MechanismRepmgr {
+		t.Errorf("absent MECHANISM must default to %q, got %q", MechanismRepmgr, c.Mechanism)
+	}
+}
+
+func TestMechanismAcceptsNative(t *testing.T) {
+	m := fullEnv()
+	m["MECHANISM"] = MechanismNative
+	c, err := Load(getter(m))
+	if err != nil {
+		t.Fatalf("MECHANISM=native must load: %v", err)
+	}
+	if c.Mechanism != MechanismNative {
+		t.Errorf("want %q, got %q", MechanismNative, c.Mechanism)
+	}
+}
+
+func TestMechanismRejectsUnknown(t *testing.T) {
+	m := fullEnv()
+	m["MECHANISM"] = "patroni"
+	_, err := Load(getter(m))
+	if err == nil || !strings.Contains(err.Error(), "MECHANISM") {
+		t.Errorf("an unrecognised MECHANISM must fail at boot naming the var, got %v", err)
+	}
+}
+
 func TestLoadEtcdBackendRequiresEndpointsAndPrefix(t *testing.T) {
 	m := fullEnv()
 	m["DCS_BACKEND"] = "etcd" // ETCD_ENDPOINTS / ETCD_PREFIX not set
