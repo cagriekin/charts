@@ -877,6 +877,17 @@ spec:
             - name: SYNC_REPLICATION_SLOTS
               value: "true"
 {{- end }}
+            {{- /* Which replication mechanics the agent drives (#287). Emitted only when
+                   set to a non-default value: the agent defaults to repmgr when MECHANISM is
+                   absent, so a default render stays byte-identical to 1.x and an older image
+                   that predates the flag keeps working. EXPERIMENTAL -- `native` is not usable
+                   until #288 (topology) and #289 (replication slots) land. */}}
+            {{- with (.Values.repmgr.agent).mechanism }}
+            {{- if ne . "repmgr" }}
+            - name: MECHANISM
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             - name: MASTER_SERVICE
               value: {{ include "pg.fullname" . | quote }}
             - name: POD_SELECTOR

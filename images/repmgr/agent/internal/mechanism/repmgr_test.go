@@ -31,6 +31,23 @@ func (f *fakeRunner) Run(_ context.Context, env []string, name string, args ...s
 		}
 		return out, errors.New("exit status 23")
 	}
+	// A real pg_basebackup creates -D's target directory and copies the whole source
+	// PGDATA tree into it (including postgresql.conf); native.Clone's caller (e.g.
+	// ReclonePreserving, which renames the old PGDATA aside first) and native.Clone's own
+	// trailing Follow call (which reads postgresql.conf) both rely on that, so a
+	// successful fake call must mirror it.
+	if strings.HasSuffix(name, "pg_basebackup") {
+		for i, a := range args {
+			if a == "-D" && i+1 < len(args) {
+				dir := args[i+1]
+				_ = os.MkdirAll(dir, 0o700)
+				confPath := filepath.Join(dir, "postgresql.conf")
+				if _, err := os.Stat(confPath); os.IsNotExist(err) {
+					_ = os.WriteFile(confPath, []byte("# initial\n"), 0o600)
+				}
+			}
+		}
+	}
 	return "ok", nil
 }
 
@@ -66,13 +83,14 @@ func TestCLICommands(t *testing.T) {
 
 	t.Run("follow", func(t *testing.T) {
 		fr := &fakeRunner{}
-		if err := newTestRepmgr(fr).Follow(ctx, upConn, 1001); err != nil {
+		if err := newTestRepmgr(fr).Follow(ctx, Conn{NodeID: 1001}); err != nil {
 			t.Fatal(err)
 		}
-		// Addressed by host, not resolved from repmgr.nodes: a scale-up leaves the
-		// survivors with no record for a newly-promoted pod, and a metadata-resolved
-		// follow then deadlocks permanently (#286).
-		if got := fr.lastArgs(); !strings.Contains(got, "standby follow -h pg-2.pg-headless -p 5432 -U repmgr -d repmgr --upstream-node-id=1001") {
+		// NO connection flags on follow (#287, which cites #297 before removing them):
+		// repmgr resolves the follow target by node_id, and -h/-p/-U/-d here would describe
+		// the LOCAL node. RegisterStandby still passes them -- it has to reach the CURRENT
+		// primary's database, which the local repmgr.nodes copy can be too stale to name.
+		if got := fr.lastArgs(); !strings.Contains(got, "standby follow --upstream-node-id=1001") {
 			t.Errorf("argv = %q", got)
 		}
 	})
@@ -85,7 +103,7 @@ func TestCLICommands(t *testing.T) {
 			"DETAIL: local node lsn is 0/3000000, follow target lsn is 0/3000000\n" +
 			"ERROR: slot \"repmgr_slot_1000\" already exists as an active slot\n" +
 			"NOTICE: STANDBY FOLLOW failed"}
-		if err := newTestRepmgr(fr).Follow(ctx, upConn, 1000); err != nil {
+		if err := newTestRepmgr(fr).Follow(ctx, Conn{NodeID: 1000}); err != nil {
 			t.Fatalf("an already-following standby must be a no-op, got %v", err)
 		}
 	})
@@ -96,7 +114,7 @@ func TestCLICommands(t *testing.T) {
 		// distinguishable so the agent re-clones instead of retrying forever.
 		fr := &fakeRunner{failOn: "standby follow",
 			failOut: "ERROR: unable to retrieve record for local node 1002"}
-		err := newTestRepmgr(fr).Follow(ctx, 1001)
+		err := newTestRepmgr(fr).Follow(ctx, Conn{NodeID: 1001})
 		if !errors.Is(err, ErrLocalRecordMissing) {
 			t.Errorf("want ErrLocalRecordMissing so the caller re-clones, got %v", err)
 		}
@@ -108,7 +126,7 @@ func TestCLICommands(t *testing.T) {
 		// is the mistake #286 made and reverted. The two must never be conflated.
 		fr := &fakeRunner{failOn: "standby follow",
 			failOut: "ERROR: unable to find record for intended upstream node 1002"}
-		err := newTestRepmgr(fr).Follow(ctx, 1002)
+		err := newTestRepmgr(fr).Follow(ctx, Conn{NodeID: 1002})
 		if err == nil {
 			t.Fatal("a missing upstream record must still surface as an error")
 		}
@@ -121,7 +139,7 @@ func TestCLICommands(t *testing.T) {
 		// A real failure (slot active but NOT the benign already-following case) must
 		// still surface so it is not silently swallowed.
 		fr := &fakeRunner{failOn: "standby follow", failOut: "ERROR: connection to upstream node failed"}
-		if err := newTestRepmgr(fr).Follow(ctx, upConn, 1000); err == nil {
+		if err := newTestRepmgr(fr).Follow(ctx, Conn{NodeID: 1000}); err == nil {
 			t.Fatal("a genuine follow failure must surface as an error")
 		}
 	})
@@ -131,7 +149,7 @@ func TestCLICommands(t *testing.T) {
 		// not-ahead may mean real work is pending (e.g. a stale slot on a divergent
 		// upstream), so it must surface, not be treated as already-following.
 		fr := &fakeRunner{failOn: "standby follow", failOut: "ERROR: slot \"repmgr_slot_1000\" already exists as an active slot"}
-		if err := newTestRepmgr(fr).Follow(ctx, upConn, 1000); err == nil {
+		if err := newTestRepmgr(fr).Follow(ctx, Conn{NodeID: 1000}); err == nil {
 			t.Fatal("slot-active alone (no same-timeline/not-ahead) must surface as an error")
 		}
 	})
@@ -143,7 +161,7 @@ func TestCLICommands(t *testing.T) {
 			name string
 			run  func(r *Repmgr) error
 		}{
-			{"follow", func(r *Repmgr) error { return r.Follow(ctx, upConn, 1001) }},
+			{"follow", func(r *Repmgr) error { return r.Follow(ctx, Conn{Host: upConn.Host, Port: upConn.Port, User: upConn.User, DB: upConn.DB, NodeID: 1001}) }},
 			{"register", func(r *Repmgr) error { return r.RegisterStandby(ctx, upConn, 1001) }},
 		} {
 			fr := &fakeRunner{}

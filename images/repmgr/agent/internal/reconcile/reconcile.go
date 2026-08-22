@@ -20,20 +20,20 @@ import (
 type Action int
 
 const (
-	NoOp              Action = iota
-	Wait                     // observe again; take no destructive action
-	BootstrapInitdb          // empty data + lease + no live primary: initdb as primary
-	BootstrapClone           // empty data + not the chosen primary: clone from Target
-	Promote                  // standby holds lease, caught up & most-advanced: promote
-	StayPrimary              // holds lease, already a current primary: assert routing only
-	Follow                   // not holder, standby: follow Target (the leader)
-	DemoteFence              // read-write without the lease: demote now (soft fence)
-	RejoinForward            // local data behind Target's newer timeline: rewind forward
-	ReleaseLease             // holds lease but must not serve (stale/behind/unhealthy): release + step down
-	StartLocal               // initialized but stopped, and safe to start in its on-disk role
-	RestartLocal             // stuck single-node primary: force-restart postgres in place (no peer to fail over to)
-	StartRecovery            // non-holder primary-state data: start READ-ONLY (standby.signal) so its true position is observable
-	Switchover               // operator-requested handoff: a caught-up target standby exists; clear the request + step down so it promotes
+	NoOp            Action = iota
+	Wait                   // observe again; take no destructive action
+	BootstrapInitdb        // empty data + lease + no live primary: initdb as primary
+	BootstrapClone         // empty data + not the chosen primary: clone from Target
+	Promote                // standby holds lease, caught up & most-advanced: promote
+	StayPrimary            // holds lease, already a current primary: assert routing only
+	Follow                 // not holder, standby: follow Target (the leader)
+	DemoteFence            // read-write without the lease: demote now (soft fence)
+	RejoinForward          // local data behind Target's newer timeline: rewind forward
+	ReleaseLease           // holds lease but must not serve (stale/behind/unhealthy): release + step down
+	StartLocal             // initialized but stopped, and safe to start in its on-disk role
+	RestartLocal           // stuck single-node primary: force-restart postgres in place (no peer to fail over to)
+	StartRecovery          // non-holder primary-state data: start READ-ONLY (standby.signal) so its true position is observable
+	Switchover             // operator-requested handoff: a caught-up target standby exists; clear the request + step down so it promotes
 )
 
 func (a Action) String() string {
@@ -49,7 +49,9 @@ type Decision struct {
 	Reason string
 }
 
-func d(a Action, target, reason string) Decision { return Decision{Action: a, Target: target, Reason: reason} }
+func d(a Action, target, reason string) Decision {
+	return Decision{Action: a, Target: target, Reason: reason}
+}
 
 // LocalState is the local node's state. Timeline comes from pg_controldata when the
 // node is not a running primary (so it is meaningful even for a stopped/standby node).
@@ -138,6 +140,15 @@ type Observation struct {
 	// cluster with no serving primary. RegistryRead is required before acting on
 	// LocalRegistered: an unreadable table must not be mistaken for "not registered",
 	// which would refuse a legitimate promotion.
+	//
+	// This fail-open-on-unreadable design is also what keeps the #287 native mechanism's
+	// promote path working: native mode maintains no repmgr.nodes table at all (see
+	// mechanism.Native's RegisterPrimary/RegisterStandby, both no-ops), so RegisteredNodeIDs
+	// always errors under it and RegistryRead stays permanently false -- the gate at its
+	// call site in Decide is then always inert, and native promotes exactly as if this
+	// whole mechanism did not exist. Do not change this to fail closed (e.g. "unreadable
+	// counts as unregistered") without adding an equivalent topology source for native
+	// mode first (#288); that would silently make native mode unable to ever promote.
 	RegistryRead    bool
 	LocalRegistered bool
 	// Cascade enables cascading replication (#29): a standby may follow another

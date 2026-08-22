@@ -3517,6 +3517,8 @@ schema_rc=0; helm template test-pg "${CHART_DIR}" --set prometheusExporter.sslmo
 assert_gt "H8: bogus prometheusExporter.sslmode rejected by schema" "${schema_rc}" "0"
 schema_rc=0; helm template test-pg "${CHART_DIR}" --set pgpool.tls.backendSslmode=bogus >/dev/null 2>&1 || schema_rc=$?
 assert_gt "H8: bogus pgpool.tls.backendSslmode rejected by schema" "${schema_rc}" "0"
+schema_rc=0; helm template test-pg "${CHART_DIR}" --set repmgr.agent.mechanism=patroni >/dev/null 2>&1 || schema_rc=$?
+assert_gt "#287: bogus repmgr.agent.mechanism rejected by schema" "${schema_rc}" "0"
 schema_rc=0; helm template test-pg "${CHART_DIR}" --set pgbackrest.s3.uriStyle=virtual >/dev/null 2>&1 || schema_rc=$?
 assert_gt "H8: bogus pgbackrest.s3.uriStyle rejected by schema" "${schema_rc}" "0"
 schema_rc=0; helm template test-pg "${CHART_DIR}" --set pgbackrest.repoEncryption.cipherType=bogus >/dev/null 2>&1 || schema_rc=$?
@@ -3790,6 +3792,29 @@ casc_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.agent.cascadingReplication=true \
   --show-only templates/statefulset.yaml 2>&1)
 assert_not_contains "#29: standalone never gets CASCADE_REPLICATION (agent-only)" "${casc_standalone}" "CASCADE_REPLICATION"
+
+# ======================================================================
+# #287: experimental native HA mechanism selector. repmgr by default
+# (byte-stable); the agent gets MECHANISM only when set to a non-default
+# value, and only in agent mode (standalone has no agent to read it).
+# ======================================================================
+mech_off=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#287 default: no MECHANISM env" "${mech_off}" "MECHANISM"
+mech_repmgr_explicit=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.mechanism=repmgr \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#287: explicit repmgr (the default) still emits no env (byte-stable)" "${mech_repmgr_explicit}" "MECHANISM"
+mech_native=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.mechanism=native \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#287: agent gets MECHANISM=native env" "${mech_native}" 'name: MECHANISM
+              value: "native"'
+mech_standalone=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 \
+  --set repmgr.agent.mechanism=native \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#287: standalone never gets MECHANISM (agent-only)" "${mech_standalone}" "MECHANISM"
 
 # ======================================================================
 # #262: postgresql.extraVolumes / extraVolumeMounts / extraEnv passthrough,

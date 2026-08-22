@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -167,6 +168,7 @@ type scriptedExec struct {
 	rejoins      int    // number of `repmgr node rejoin` calls (the #297 re-clone escalation)
 	slots        string // pg_replication_slots slot_name output (psql), for #308
 	slotSyncSQL  []string
+	nodesQueries int // number of `SELECT ... FROM repmgr.nodes` calls (psql)
 }
 
 func (s *scriptedExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
@@ -178,6 +180,7 @@ func (s *scriptedExec) Run(_ context.Context, _ []string, name string, args ...s
 		s.slotSyncSQL = append(s.slotSyncSQL, joined)
 		return "", nil
 	case name == "psql" && strings.Contains(joined, "repmgr.nodes"):
+		s.nodesQueries++
 		return s.nodes, nil
 	case name == "psql" && strings.Contains(joined, "pg_stat_wal_receiver"):
 		return s.walRcv, nil
@@ -242,6 +245,45 @@ func newFollowTestAgentWithPM(t *testing.T, ex *scriptedExec, pm *fakePostmaster
 // #182: a standby already streaming from the lease holder must NOT re-run repmgr
 // standby follow (which errors "slot already active" and, unlatched, repeats every
 // tick). The act path skips the command and latches followUpstream.
+// #287: the factory must select the mechanism from config, and an absent value must stay
+// repmgr so an existing release and an older env-less image are unaffected. Asserted on the
+// concrete type because picking the wrong mechanics is invisible until a promote or a clone
+// actually runs -- by which point it has already touched a data directory. An unrecognised
+// value must fail loudly, not silently fall back to repmgr (fail-fast, matching the rest of
+// this codebase's required-config posture) -- config.Load already rejects it at boot, so
+// this is a defense against the enum and this factory drifting apart in the future.
+func TestNewMechanismSelectsFromConfig(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, tc := range []struct {
+		name    string
+		set     string
+		want    string
+		wantErr bool
+	}{
+		{"absent -> repmgr (unchanged default)", "", "*mechanism.Repmgr", false},
+		{"explicit repmgr", config.MechanismRepmgr, "*mechanism.Repmgr", false},
+		{"native", config.MechanismNative, "*mechanism.Native", false},
+		{"unrecognised value fails loudly", "patroni", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{PGDATA: t.TempDir(), Mechanism: tc.set}
+			m, err := newMechanism(cfg, "/etc/repmgr/repmgr.conf", "/usr/lib/postgresql/18/bin", log)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("mechanism %q: expected an error, got %T", tc.set, m)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("mechanism %q: unexpected error: %v", tc.set, err)
+			}
+			if got := fmt.Sprintf("%T", m); got != tc.want {
+				t.Errorf("mechanism %q selected %s, want %s", tc.set, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestActFollowSkipsWhenAlreadyStreaming(t *testing.T) {
 	ex := &scriptedExec{walRcv: "pg-0.h|streaming"}
 	a := newFollowTestAgent(t, ex)
@@ -423,6 +465,26 @@ func TestActBootstrapClonePatchesPrimaryConninfoBeforeStart(t *testing.T) {
 	}
 	if !pm.started {
 		t.Error("act must still start the postmaster after a successful clone")
+	}
+}
+
+// #287: the native mechanism only writes files (managed conf + standby.signal) and relies
+// on the caller to apply them -- unlike repmgr standby follow, which applies the repoint
+// itself. act() must reload the supervised postmaster after every successful Follow, not
+// just for one mechanism, or native mode's Follow is silently inert (the file changes but
+// the running postmaster never reconnects to the new upstream). Asserted against the
+// generic act() path (mechanism-agnostic) rather than duplicating a full Native-backed
+// harness, since the fix lives in act(), not in either mechanism.
+func TestActFollowReloadsPostmasterAfterSuccess(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""}
+	pm := &fakePostmaster{}
+	a := newFollowTestAgentWithPM(t, ex, pm)
+	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
+	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if !pm.reloaded {
+		t.Fatal("act must reload the postmaster after a successful Follow, or a mechanism that only writes files (native) never applies the repoint")
 	}
 }
 
@@ -981,5 +1043,22 @@ func TestCleanupGhostNodesNoGhosts(t *testing.T) {
 	a.cleanupGhostNodes(context.Background())
 	if len(ex.unregistered) != 0 {
 		t.Fatalf("expected no unregister when there are no ghosts, got %v", ex.unregistered)
+	}
+}
+
+// #287: native mode has no repmgr.nodes at all (mechanism.Native's Unregister is a
+// no-op), so the query would error on every primary tick forever -- pure log noise with
+// nothing to retry. cleanupGhostNodes must skip the query entirely rather than warn.
+func TestCleanupGhostNodesSkippedUnderNativeMechanism(t *testing.T) {
+	ex := &scriptedExec{nodes: "1000\n1001\n1002\n"}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.NodeCount = 2
+	a.cfg.Mechanism = config.MechanismNative
+	a.cleanupGhostNodes(context.Background())
+	if ex.nodesQueries != 0 {
+		t.Fatalf("expected no repmgr.nodes query under native mechanism, got %d", ex.nodesQueries)
+	}
+	if len(ex.unregistered) != 0 {
+		t.Fatalf("expected no unregister under native mechanism, got %v", ex.unregistered)
 	}
 }
