@@ -88,14 +88,20 @@ func (r *Repmgr) Promote(ctx context.Context) error {
 // copy is only as fresh as this node's replication, which during a scale-up or a failover
 // can predate the current primary entirely -- the deadlock #286's upgrade suite exposed.
 // The password still travels via PGPASSWORD (see run), never argv.
+//
+// Follow does NOT use these (see its own comment): repmgr resolves the follow target by
+// node_id, and these flags would describe the LOCAL node. RegisterStandby does, because it
+// must insert this node's row into the CURRENT primary's database.
 func upstreamArgs(c Conn) []string {
 	return []string{"-h", c.Host, "-p", strconv.Itoa(c.port()), "-U", c.User, "-d", c.DB}
 }
 
-func (r *Repmgr) Follow(ctx context.Context, upstream Conn, upstreamNodeID int) error {
-	args := append([]string{"standby", "follow"}, upstreamArgs(upstream)...)
-	args = append(args, "--upstream-node-id="+strconv.Itoa(upstreamNodeID))
-	out, err := r.run(ctx, args...)
+func (r *Repmgr) Follow(ctx context.Context, upstream Conn) error {
+	// repmgr addresses the upstream by node_id and resolves its conninfo from repmgr.nodes;
+	// upstream.Host is unused here (see Conn.NodeID). Its connection flags would describe
+	// the LOCAL node, not the upstream -- see #297 before adding any.
+	upstreamNodeID := upstream.NodeID
+	out, err := r.run(ctx, "standby", "follow", "--upstream-node-id="+strconv.Itoa(upstreamNodeID))
 	if err != nil {
 		// #182: a standby already correctly following this upstream (same timeline,
 		// not ahead, its slot already active because it is streaming through it) makes

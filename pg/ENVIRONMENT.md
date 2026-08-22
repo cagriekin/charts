@@ -52,6 +52,7 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `CASCADE_REPLICATION` | boolean | no | `repmgr.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
 | `SYNC_REPLICATION_SLOTS` | boolean | no | `repmgr.agent.syncReplicationSlots` (`false`) | agent (logical failover slot sync, #308; emitted only when true) |
 | `USE_REPLICATION_SLOTS` | boolean | no | `"1"` in agent mode, unset in repmgrd mode | repmgr-init (initial `standby clone`, #308; matches the agent's own regenerated `repmgr.conf`) |
+| `MECHANISM` | enum | no | `repmgr.agent.mechanism` (`repmgr`/`native`) | agent (HA mechanics, #287, EXPERIMENTAL; emitted only when non-default) |
 | `PG_MAJOR` | digits | no | image `ENV` from the Dockerfile's `ARG PG_MAJOR` (`18`) | agent (versioned bindir `/usr/lib/postgresql/<major>/bin`, #269) |
 | `PGBACKREST_ENABLED` | boolean | no | `"true"` when `pgbackrest.enabled` | agent (control API backup routes) |
 | `PGBACKREST_STANZA` | string | no | `pgbackrest.stanza` | agent (`pgbackrest info`), archive_command |

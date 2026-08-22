@@ -362,6 +362,13 @@ repmgr:
     # slots so a logical failover slot survives the primary moving. Requires
     # postgresql.walLevel: logical. See the pg chart README for detail.
     syncReplicationSlots: false
+
+    # EXPERIMENTAL -- do not set in production yet (#287). Which replication mechanics the
+    # agent drives: `repmgr` (default, the repmgr CLI) or `native` (pg_ctl promote,
+    # pg_basebackup, pg_rewind, primary_conninfo directly). Policy is identical either way.
+    # `native` is NOT usable on its own yet -- topology still comes from repmgr.nodes (#288)
+    # and nothing owns replication slots (#289). See the pg chart README.
+    mechanism: repmgr
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
     # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane
     # outage no longer self-demotes the primary (only an etcd quorum loss does);
