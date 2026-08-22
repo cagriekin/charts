@@ -162,7 +162,7 @@
   `repmgr.nodes` for the primary to register, before the Go agent ever runs -- has no
   `MECHANISM` awareness. Verified live: with any replicas, that poll times out and every
   standby sits `Init:CrashLoopBackOff` forever; the primary itself comes up and serves fine.
-  `#289` (replication slot ownership) has since landed -- see the entry below -- leaving
+  `#289` (replication slot ownership) has since landed -- see the entry above -- leaving
   #288 as the sole remaining blocker. `#294` tracks promoting `native` to supported.
 
   Verified that native mode inherits the mechanism-agnostic safety behaviors already in
