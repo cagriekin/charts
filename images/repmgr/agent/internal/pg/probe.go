@@ -411,14 +411,25 @@ func IsDuplicateSlot(out string, err error) bool {
 // the statement a no-op (not an error) when the slot is already gone, so a concurrent
 // removal or a repeated call is silent rather than a per-tick warning.
 //
-// Returns whether a row was affected, so the caller can log only real drops.
+// Returns whether a row was affected, so the caller can log only real drops. Detecting
+// that through psql means the statement has to PROJECT something: pg_drop_replication_slot
+// returns void, so selecting it directly prints an empty line for an affected row --
+// indistinguishable from the zero-row case under -tA (verified against PostgreSQL 18), and
+// the reclaim would then never be logged even though it happened. Hence the CTE plus a
+// lateral call: the predicate still lives in SQL, the function is still evaluated exactly
+// once per matching slot, and the slot NAME is what comes back.
+//
+// Verified against PostgreSQL 18: an inactive slot prints its name and is gone; a slot held
+// active by a real walsender prints nothing, exits 0, and survives; an absent slot prints
+// nothing and exits 0.
 func (p *Prober) DropPhysicalSlotIfInactive(ctx context.Context, ci ConnInfo, name string) (dropped bool, err error) {
 	if err := validSlotName(name); err != nil {
 		return false, err
 	}
 	out, err := p.psql(ctx, ci, fmt.Sprintf(
-		"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "+
-			"WHERE slot_name = '%s' AND slot_type = 'physical' AND NOT active;", name))
+		"WITH victim AS (SELECT slot_name FROM pg_replication_slots "+
+			"WHERE slot_name = '%s' AND slot_type = 'physical' AND NOT active) "+
+			"SELECT v.slot_name FROM victim v, pg_drop_replication_slot(v.slot_name);", name))
 	if err != nil {
 		return false, err
 	}

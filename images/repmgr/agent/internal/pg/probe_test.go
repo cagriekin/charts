@@ -347,6 +347,27 @@ func TestDropPhysicalSlotRefusesActiveSlotsInSQL(t *testing.T) {
 	}
 }
 
+// The statement must PROJECT the slot name, not the drop function's own result.
+// pg_drop_replication_slot returns void, so `SELECT pg_drop_replication_slot(slot_name)
+// FROM ...` prints an empty line for an affected row under psql -tA -- byte-identical to
+// the zero-row case (verified against PostgreSQL 18). Under that shape the drop still
+// happens but is reported as dropped=false, so the reclaim is never logged and the only
+// observable record of it disappears. This pins the shape that actually reports it.
+func TestDropPhysicalSlotProjectsTheSlotNameNotTheVoidResult(t *testing.T) {
+	ex := &slotExec{out: ""}
+	p := &Prober{Exec: ex}
+	if _, err := p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9"); err != nil {
+		t.Fatalf("DropPhysicalSlotIfInactive: %v", err)
+	}
+	sql := ex.sqls[0]
+	if strings.Contains(sql, "SELECT pg_drop_replication_slot(") {
+		t.Errorf("drop projects the void function result, so an affected row is indistinguishable from none: %s", sql)
+	}
+	if !strings.Contains(sql, "SELECT v.slot_name") {
+		t.Errorf("drop does not project the slot name, so it cannot report what it reclaimed: %s", sql)
+	}
+}
+
 // An empty result means the slot was already gone or is active -- both are "nothing was
 // dropped", not an error the caller should warn about every tick.
 func TestDropPhysicalSlotReportsWhetherARowWasAffected(t *testing.T) {
