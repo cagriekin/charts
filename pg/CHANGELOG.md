@@ -1,5 +1,56 @@
 # pg chart changelog
 
+## 1.14.1 - 2026-08-22
+
+### Changed
+
+- **`repmgr.image.tag` -> `trixie-5.5.0-33` (#317).** The agent now honours `KUBECONFIG`,
+  so its apiserver traffic can be routed through an in-cluster proxy. Chart-only change is
+  the pinned tag; the behaviour ships in the image.
+
+  Why it exists: the agent reads its primary marker and publishes gossip through the
+  apiserver, so on a cluster whose egress policy denies pod traffic to the apiserver **no
+  leader is elected and the cluster never gets a serving primary** -- while every pod,
+  Service and policy looks correctly configured. Such a policy is not always fixable from
+  the policy side: on Cilium deny wins within a tier (no allow rule re-opens the apiserver
+  for one namespace) and reserved identities are compound (`reserved:host` and
+  `reserved:kube-apiserver` sit on the same identity), so any topology reaching the
+  apiserver via a real node IP cannot admit apiserver traffic for one workload without
+  admitting node traffic for it. What remains is an in-cluster TCP proxy, which needs a
+  different **address** while still verifying the apiserver's own **certificate** -- its
+  SANs cover `kubernetes.default.svc` and the apiserver IPs, not the proxy Service.
+  Overriding `KUBERNETES_SERVICE_HOST` retargets the dial but leaves no way to set
+  `ServerName`, trading a routing failure for a verification failure; `server:` +
+  `tls-server-name:` is the pair only a kubeconfig can express.
+
+  **No new value.** Set the variable with `postgresql.extraEnv` and mount the kubeconfig
+  with `postgresql.extraVolumes`/`extraVolumeMounts`, both of which already exist. Keep
+  `tokenFile`/`certificate-authority` pointed at the ServiceAccount mount so the identity
+  stays the pod's ServiceAccount and the chart's RBAC applies unchanged -- only the address
+  moves. See the README ["Routing the agent's apiserver traffic"](README.md#routing-the-agents-apiserver-traffic--kubeconfig-317).
+
+  Both apiserver clients take the route: the mutation client (write-Service selector,
+  `pg-role` labels, primary marker) **and** the Lease-backed leader election when
+  `repmgr.agent.dcs.backend=kubernetes`. Reaching one but not the other would elect a
+  leader that cannot publish. `backend=etcd` is unaffected -- leadership never touches the
+  apiserver in that mode.
+
+  A `KUBECONFIG` that is set but unreadable, malformed, or contextless is a **startup
+  failure naming the file**, not a silent fall back to in-cluster: falling back would
+  reproduce the exact hang this escapes, with a kubeconfig mounted and apparently in
+  effect. `~/.kube/config` is deliberately **not** consulted, so a stray file cannot
+  silently redirect a production cluster. Note `kubectl` is not as strict -- its deferred
+  loader does fall back -- so a broken mount degrades the entrypoint's #170 settle guard to
+  its fail-open fast path while the agent refuses to boot; mount the kubeconfig from a
+  ConfigMap that cannot vanish. The boot log's new `apiserver=` field records which route
+  was taken (`kubeconfig <path>` or `in-cluster`), because a denied-egress hang and a
+  misrouted kubeconfig otherwise log the same dial timeout.
+
+**Migrating from 1.14.0:** nothing to do. With `KUBECONFIG` unset -- the default, and what
+the chart renders -- the agent takes the in-cluster ServiceAccount path exactly as before;
+the default render is byte-identical apart from the image tag, so `helm upgrade` rolls the
+pods once for the new image and the agent re-establishes leadership with no manual step.
+
 ## 1.14.0 - 2026-08-21
 
 ### Added

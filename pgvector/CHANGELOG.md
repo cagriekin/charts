@@ -1,5 +1,30 @@
 # pgvector chart changelog
 
+## 1.14.1 - 2026-08-22
+
+Inherited from pg: same agent and image. See the [pg 1.14.1 changelog](../pg/CHANGELOG.md)
+for the full detail.
+
+### Changed
+
+- **`repmgr.image.tag` -> `trixie-5.5.0-33` (#317).** The agent now honours `KUBECONFIG`,
+  so its apiserver traffic can be routed through an in-cluster proxy -- for clusters whose
+  egress policy denies pod traffic to the apiserver outright, where the agent otherwise
+  never elects a leader and the cluster never gets a serving primary. Reaching a proxy
+  needs a different **address** while still verifying the apiserver's own **certificate**,
+  which only a kubeconfig can express (`server:` + `tls-server-name:`); overriding
+  `KUBERNETES_SERVICE_HOST` breaks verification instead. **No new value**: set it with
+  `postgresql.extraEnv` and mount the file with `postgresql.extraVolumes`/
+  `extraVolumeMounts`. Both apiserver clients take the route -- the mutation client and the
+  Lease-backed leader election. A set-but-unusable `KUBECONFIG` is a startup failure naming
+  the file, never a silent fall back to in-cluster; `~/.kube/config` is not consulted. The
+  boot log's new `apiserver=` field records the route. See the
+  [pg chart README](../pg/README.md#routing-the-agents-apiserver-traffic--kubeconfig-317).
+
+**Migrating from 1.14.0:** nothing to do. With `KUBECONFIG` unset -- the default -- the
+in-cluster path is used exactly as before; `helm upgrade` rolls the pods once for the new
+image.
+
 ## 1.14.0 - 2026-08-21
 
 Inherited from pg's symlinked templates (`_helpers.tpl`, `statefulset.yaml`) and mirrored
