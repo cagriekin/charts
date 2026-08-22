@@ -31,6 +31,7 @@ import (
 	"github.com/cagriekin/pg-ha-agent/internal/control"
 	"github.com/cagriekin/pg-ha-agent/internal/dcs"
 	"github.com/cagriekin/pg-ha-agent/internal/k8s"
+	"github.com/cagriekin/pg-ha-agent/internal/kubecfg"
 	"github.com/cagriekin/pg-ha-agent/internal/mechanism"
 	"github.com/cagriekin/pg-ha-agent/internal/observe"
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
@@ -81,6 +82,9 @@ func logStartupConfig(log *slog.Logger, cfg *config.Config) {
 		"namespace", cfg.Namespace,
 		"leaseName", cfg.LeaseName,
 		"dcsBackend", cfg.DCSBackend,
+		// #317: which apiserver route this agent took. Without it a denied-egress
+		// hang and a misrouted kubeconfig produce the same dial timeout in the log.
+		"apiserver", kubecfg.Source(),
 		"reconcileInterval", cfg.ReconcileInterval,
 		"leaseDuration", cfg.LeaseDuration,
 		"renewDeadline", cfg.RenewDeadline,

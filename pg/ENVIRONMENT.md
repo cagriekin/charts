@@ -60,6 +60,25 @@ Lease timings must satisfy `LEASE_DURATION > RENEW_DEADLINE > RETRY_PERIOD`
 (validated at boot). The agent also writes a `0600 ~/.pgpass` from `REPMGR_*` so a
 passwordless `primary_conninfo` can authenticate streaming replication.
 
+### Not injected by the chart: `KUBECONFIG` (#317)
+
+`KUBECONFIG` is the one variable the agent reads that the chart never sets. When it
+is present the agent (and the entrypoint's `kubectl` stale-primary guard) reaches the
+apiserver through that kubeconfig instead of the in-cluster ServiceAccount; when it is
+absent — the default — the in-cluster path is used exactly as before. It exists so a
+cluster whose egress policy denies pod traffic to the apiserver can route the agent
+through an in-cluster proxy, which needs a different **address** while still verifying
+the apiserver's own **certificate** (`server:` + `tls-server-name:`).
+
+| Variable | Type | Required | Default / source | Consumer |
+|----------|------|----------|------------------|----------|
+| `KUBECONFIG` | path(s) | no | operator-supplied via `postgresql.extraEnv`; unset by default | agent (mutation client **and** the Lease DCS), `kubectl` |
+
+Set but unreadable/malformed/contextless is a startup failure naming the file, never a
+silent fall back to in-cluster. `~/.kube/config` is deliberately not consulted. The boot
+log's `apiserver=` field records which route was taken. See the chart README section
+*Routing the agent's apiserver traffic* for the kubeconfig to mount.
+
 ### control API only (`repmgr.agent.control.enabled=true`)
 
 Emitted only when the control REST API (#276) is on, and validated at boot: enabling it

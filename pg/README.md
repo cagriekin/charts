@@ -947,6 +947,67 @@ Two ways to provide etcd:
 
 > Agent mode is opt-in and validated by the chart's live failover suite (graceful failover: a standby promotes, the write Service repoints, the ex-primary rejoins read-only). See `ENVIRONMENT.md` for the full injected-variable catalog.
 
+### Routing the agent's apiserver traffic — `KUBECONFIG` (#317)
+
+The agent reads its primary marker and publishes gossip through the apiserver, so a cluster whose egress policy denies pod traffic to the apiserver **never elects a leader and never gets a serving primary** — while every pod, Service and policy looks correctly configured. The symptom is a repeating pair of warnings against the apiserver ClusterIP followed by `action=Wait ... no leader yet`:
+
+```
+level=WARN msg="read marker" err="... dial tcp 10.96.0.1:443: i/o timeout"
+level=WARN msg="publish status (gossip)" err="... dial tcp 10.96.0.1:443: i/o timeout"
+level=INFO msg="reconcile decision" hold_lease=false action=Wait reason="... no leader yet"
+```
+
+Some policies cannot be re-opened from the policy side. On Cilium, deny wins within a tier — so no allow rule admits the apiserver for one namespace — and reserved identities are compound (`reserved:host` and `reserved:kube-apiserver` sit on the same identity), so any topology that reaches the apiserver via a real node IP cannot admit apiserver traffic for one workload without admitting node traffic for it. What remains is an in-cluster TCP proxy.
+
+The agent therefore honours **`KUBECONFIG`** (repmgr image `trixie-5.5.0-33` or newer). No new chart value is involved — set the variable and mount the file with the passthrough that already exists:
+
+```yaml
+postgresql:
+  extraEnv:
+    - name: KUBECONFIG
+      value: /etc/apiserver-proxy/kubeconfig
+  extraVolumes:
+    - name: apiserver-proxy
+      configMap:
+        name: apiserver-proxy-kubeconfig
+  extraVolumeMounts:
+    - name: apiserver-proxy
+      mountPath: /etc/apiserver-proxy
+      readOnly: true
+```
+
+```yaml
+# the mounted kubeconfig: a different ADDRESS, the apiserver's own CERTIFICATE
+apiVersion: v1
+kind: Config
+current-context: proxy
+clusters:
+  - name: proxy
+    cluster:
+      server: https://apiserver-proxy.kube-system.svc:8443
+      tls-server-name: kubernetes.default.svc          # what the cert is verified against
+      certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+contexts:
+  - name: proxy
+    context: {cluster: proxy, user: sa}
+users:
+  - name: sa
+    user:
+      tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+```
+
+Keep `tokenFile`/`certificate-authority` pointed at the ServiceAccount mount as above: the identity stays the pod's ServiceAccount, so the chart's RBAC still applies unchanged and there is no second credential to rotate. Only the **address** moves.
+
+Why a kubeconfig and not `KUBERNETES_SERVICE_HOST`: the apiserver's serving certificate has SANs for `kubernetes.default.svc…` and the apiserver IPs, not for the proxy Service. Overriding the host retargets the dial but leaves no way to set the name TLS verifies against, so it trades a routing failure for a verification failure. `tls-server-name` is the half only a kubeconfig can express.
+
+Notes:
+
+- Both apiserver clients take this route — the mutation client (write-Service selector, `pg-role` labels, primary marker) **and** the Lease-backed leader election when `dcs.backend=kubernetes`. Reaching one but not the other would elect a leader that cannot publish. `dcs.backend=etcd` is unaffected, since leadership does not use the apiserver at all in that mode.
+- A `KUBECONFIG` that is set but unreadable, malformed, or contextless is a **startup failure naming the file**, not a silent fall back to in-cluster — falling back would reproduce the exact hang this escapes, with a kubeconfig mounted and apparently in effect.
+- The boot log records which route was taken, so this is answerable without a debugger: `msg="starting pg-ha-agent" ... apiserver="kubeconfig /etc/apiserver-proxy/kubeconfig"` (or `apiserver=in-cluster`).
+- With `KUBECONFIG` unset — the default — behaviour is byte-identical to before: the in-cluster ServiceAccount plus `KUBERNETES_SERVICE_HOST`/`_PORT`. `~/.kube/config` is deliberately *not* consulted, so a stray file in the image or on a mounted home cannot silently redirect a production cluster.
+- The entrypoint's stale-primary guard (`#170`) shells out to `kubectl`, which honours `KUBECONFIG` natively, so it follows the same route with no extra wiring.
+
 ### PGPool-II Parameters
 
 | Parameter | Description | Default |
