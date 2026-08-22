@@ -291,7 +291,7 @@ Must satisfy `leaseDuration > renewDeadline > retryPeriod`; widen for managed cl
 
 ### Routing the agent's apiserver traffic — `KUBECONFIG` (#317)
 
-The agent honours `KUBECONFIG` (repmgr image `trixie-5.5.0-33` or newer), so its apiserver traffic can be sent through an in-cluster proxy on clusters whose egress policy denies pod traffic to the apiserver outright — where it otherwise never elects a leader and the cluster never gets a serving primary. No new value is involved: set the variable with `postgresql.extraEnv` and mount the kubeconfig with `postgresql.extraVolumes`/`extraVolumeMounts`. With it unset the in-cluster ServiceAccount path is used, unchanged. This chart shares pg's agent — see the [pg chart README](../pg/README.md#routing-the-agents-apiserver-traffic--kubeconfig-317) for the example kubeconfig, why `KUBERNETES_SERVICE_HOST` cannot express it, and the failure modes.
+The agent honours `KUBECONFIG`, from the first repmgr image tag published after #317 onwards (`trixie-5.5.0-32` and earlier do not have it), so its apiserver traffic can be sent through an in-cluster proxy on clusters whose egress policy denies pod traffic to the apiserver outright — where it otherwise never elects a leader and the cluster never gets a serving primary. No new value is involved: set the variable with `postgresql.extraEnv` and mount the kubeconfig with `postgresql.extraVolumes`/`extraVolumeMounts`. With it unset the in-cluster ServiceAccount path is used, unchanged. This chart shares pg's agent — see the [pg chart README](../pg/README.md#routing-the-agents-apiserver-traffic--kubeconfig-317) for the example kubeconfig, why `KUBERNETES_SERVICE_HOST` cannot express it, and the failure modes.
 
 ### PGPool-II Parameters
 

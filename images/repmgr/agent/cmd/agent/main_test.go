@@ -30,6 +30,9 @@ func TestLogStartupConfigExcludesSecrets(t *testing.T) {
 		etcdKey        = "etcd-key-sentinel"
 		etcdCA         = "etcd-ca-sentinel"
 	)
+	// #317: the apiserver route is read from the environment, not from cfg, so pin it
+	// or this asserts whatever the developer's shell happens to have set.
+	t.Setenv("KUBECONFIG", "")
 	var out bytes.Buffer
 	cfg := &config.Config{
 		PodName:            "pg-0",
@@ -72,6 +75,10 @@ func TestLogStartupConfigExcludesSecrets(t *testing.T) {
 		"markerName=pg-primary",
 		"cascadeReplication=true",
 		"pgMajor=17",
+		// #317: the one field that says which apiserver address this agent is using.
+		// A denied-egress hang and a misrouted kubeconfig log the same dial timeout,
+		// so losing this field costs the only way to tell them apart.
+		"apiserver=in-cluster",
 	} {
 		if !strings.Contains(logLine, want) {
 			t.Errorf("startup log missing %q: %s", want, logLine)
@@ -85,6 +92,18 @@ func TestLogStartupConfigExcludesSecrets(t *testing.T) {
 		if strings.Contains(logLine, forbidden) {
 			t.Errorf("startup log leaked sensitive config %q: %s", forbidden, logLine)
 		}
+	}
+}
+
+// The kubeconfig route must be distinguishable in the boot log from the in-cluster
+// one, and must name the file -- "some kubeconfig" is not an answer during an
+// incident on a cluster that mounts more than one (#317).
+func TestLogStartupConfigNamesTheKubeconfigRoute(t *testing.T) {
+	t.Setenv("KUBECONFIG", "/etc/apiserver-proxy/kubeconfig")
+	var out bytes.Buffer
+	logStartupConfig(slog.New(slog.NewTextHandler(&out, nil)), &config.Config{PodName: "pg-0", Namespace: "db"})
+	if want := "apiserver=\"kubeconfig /etc/apiserver-proxy/kubeconfig\""; !strings.Contains(out.String(), want) {
+		t.Errorf("startup log missing %s: %s", want, out.String())
 	}
 }
 

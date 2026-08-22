@@ -959,7 +959,7 @@ level=INFO msg="reconcile decision" hold_lease=false action=Wait reason="... no 
 
 Some policies cannot be re-opened from the policy side. On Cilium, deny wins within a tier — so no allow rule admits the apiserver for one namespace — and reserved identities are compound (`reserved:host` and `reserved:kube-apiserver` sit on the same identity), so any topology that reaches the apiserver via a real node IP cannot admit apiserver traffic for one workload without admitting node traffic for it. What remains is an in-cluster TCP proxy.
 
-The agent therefore honours **`KUBECONFIG`** (repmgr image `trixie-5.5.0-33` or newer). No new chart value is involved — set the variable and mount the file with the passthrough that already exists:
+The agent therefore honours **`KUBECONFIG`**, from the first repmgr image tag published after #317 onwards (`trixie-5.5.0-32` and earlier do not have it; the tag this chart pins is in `repmgr.image.tag`). No new chart value is involved — set the variable and mount the file with the passthrough that already exists:
 
 ```yaml
 postgresql:
@@ -1006,7 +1006,8 @@ Notes:
 - A `KUBECONFIG` that is set but unreadable, malformed, or contextless is a **startup failure naming the file**, not a silent fall back to in-cluster — falling back would reproduce the exact hang this escapes, with a kubeconfig mounted and apparently in effect.
 - The boot log records which route was taken, so this is answerable without a debugger: `msg="starting pg-ha-agent" ... apiserver="kubeconfig /etc/apiserver-proxy/kubeconfig"` (or `apiserver=in-cluster`).
 - With `KUBECONFIG` unset — the default — behaviour is byte-identical to before: the in-cluster ServiceAccount plus `KUBERNETES_SERVICE_HOST`/`_PORT`. `~/.kube/config` is deliberately *not* consulted, so a stray file in the image or on a mounted home cannot silently redirect a production cluster.
-- The entrypoint's stale-primary guard (`#170`) shells out to `kubectl`, which honours `KUBECONFIG` natively, so it follows the same route with no extra wiring.
+- The entrypoint's stale-primary guard (`#170`) shells out to `kubectl`, which honours `KUBECONFIG` natively, so it follows the same route with no extra wiring. It runs in the **postgresql** container (`entrypoint.sh` `postgres`/`agent` mode), which is where `postgresql.extraEnv`/`extraVolumeMounts` land; the `repmgr-init` init container makes no apiserver calls at all, so it needs none of this.
+- **`kubectl` and the agent disagree on a *broken* kubeconfig.** The stale-primary guard's `kubectl` uses client-go's deferred loader, which *does* silently fall back to in-cluster when the merged kubeconfig is missing, empty, or has no current context — so on the very clusters this feature is for, a broken mount makes the guard time out and take its documented fail-open fast path (a single peer scan instead of the settle-retry) while the agent refuses to boot. The peer scan still refuses to `initdb` next to a reachable primary, so this narrows a safety margin rather than removing it, but it is the reason to mount the kubeconfig from a ConfigMap that cannot vanish and to check the `apiserver=` log line after the first roll.
 
 ### PGPool-II Parameters
 
