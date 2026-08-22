@@ -365,10 +365,12 @@ Reclaimed as orphans: an agent-minted slot for a **departed** ordinal (no such p
 
 `repmgr.agent.cascadingReplication` is **rejected at render time** together with `mechanism: native`: cascading makes a standby an upstream for other standbys, but slot reconcile runs only on the primary, so a cascading child would reference a slot that does not exist on its actual upstream and its walreceiver would refuse to start. Use `mechanism: repmgr` for cascading replication.
 
-**Alerting.** Slot state is exported on the agent's metrics endpoint as `pg_ha_agent_replication_slots`, `pg_ha_agent_replication_slots_inactive`, and `pg_ha_agent_replication_slot_max_retained_wal_bytes`, with two rules under `repmgr.agent.monitoring.prometheusRule.enabled`:
+**Alerting — and this half is NOT native-only.** Everything above describes slot *ownership*, which is native-mode mechanics. Slot *observation* is not gated on the mechanism: the primary publishes the gauges on every tick under `repmgr` too. Repmgr mode has slots as well (`repmgr_slot_*`), they pin WAL in exactly the same silent way, and the chart renders these rules for every agent-mode release — so gauges that only moved under `native` would ship an alert that can never fire, which reads as coverage while providing none. The agent still never *touches* a slot under the repmgr mechanism (repmgr owns lifecycle there); it only reports what it sees, so a sustained breach in repmgr mode is yours to resolve with the query below.
+
+Slot state is exported on the agent's metrics endpoint as `pg_ha_agent_replication_slots`, `pg_ha_agent_replication_slots_inactive`, and `pg_ha_agent_replication_slot_max_retained_wal_bytes`, with two rules under `repmgr.agent.monitoring.prometheusRule.enabled`:
 
 - `PGHAReplicationSlotRetainingWAL` (critical, 15m) — a slot has held back more than `repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes` (default 16Gi). This is the page that turns a silent disk-fill into a signal.
-- `PGHAReplicationSlotInactive` (warning, 1h) — a slot has had no consumer for an hour. Expected briefly during a standby restart or re-clone; sustained means a standby is down or a slot the agent does not own is orphaned.
+- `PGHAReplicationSlotInactive` (warning, 1h) — a slot has had no consumer for an hour. Expected briefly during a standby restart or re-clone; sustained means a standby is down or a slot the agent does not own is orphaned. Under `mechanism: repmgr` the agent reclaims nothing, so every sustained breach needs a human.
 
 To find a culprit by hand:
 

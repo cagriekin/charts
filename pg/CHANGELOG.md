@@ -127,14 +127,26 @@
     would name a slot that does not exist on its actual upstream and its walreceiver would
     refuse to start. Both flags are independently opt-in, so this forbids nothing that
     worked before.
-  - **Observability.** Three new gauges -- `pg_ha_agent_replication_slots`,
-    `..._replication_slots_inactive`, `..._replication_slot_max_retained_wal_bytes` -- plus
-    two `PrometheusRule` alerts: `PGHAReplicationSlotRetainingWAL` (critical, over
+  - **Observability, and this half is NOT native-only.** Three new gauges --
+    `pg_ha_agent_replication_slots`, `..._replication_slots_inactive`,
+    `..._replication_slot_max_retained_wal_bytes` -- plus two `PrometheusRule` alerts:
+    `PGHAReplicationSlotRetainingWAL` (critical, over
     `repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes`, default 16Gi, for 15m)
     and `PGHAReplicationSlotInactive` (warning, 1h). This is the page that turns a silent
-    disk-fill into a signal. Aggregates rather than per-slot labels on purpose: this metrics
-    surface is hand-written text with no per-series lifecycle, so a label per slot would
-    leak a stale series on every drop.
+    disk-fill into a signal.
+
+    Slot *ownership* is native-mode mechanics, but slot *observation* is not gated on the
+    mechanism: the primary publishes these gauges under `repmgr` too. Repmgr mode has slots
+    as well (`repmgr_slot_*`), they pin WAL in exactly the same silent way, and the chart
+    renders these rules for every agent-mode release -- so gauges that only moved under
+    `native` would have shipped an alert that can never fire, which reads as coverage while
+    providing none. The agent still never *touches* a slot under the repmgr mechanism
+    (repmgr owns lifecycle there); it reports what it sees, so a sustained breach in repmgr
+    mode is the operator's to resolve.
+
+    Aggregates rather than per-slot labels on purpose: this metrics surface is hand-written
+    text with no per-series lifecycle, so a label per slot would leak a stale series on
+    every drop.
 
   Verified end-to-end against real PostgreSQL 18, not only in unit tests: clone through a
   pre-created slot, the slot going active under a live standby, the drop guard refusing that

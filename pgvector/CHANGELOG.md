@@ -83,7 +83,10 @@
   rejected at render time together with `native`. Three new metrics plus two `PrometheusRule`
   alerts (`PGHAReplicationSlotRetainingWAL`, `PGHAReplicationSlotInactive`) make an
   orphaned slot -- which otherwise pins WAL and fills the volume with no error until the
-  disk is full -- alertable. New value:
+  disk is full -- alertable. Those are **not** native-only: ownership is, but the gauges
+  they read are published under `repmgr` too (where the agent reports slots and never
+  reclaims them), because an alert that can only fire under an experimental flag reads as
+  coverage while providing none. New value:
   `repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes` (default 16Gi). See the
   [pg chart README](../pg/README.md#replication-slot-ownership-289).
 

@@ -643,7 +643,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// They will follow this new primary within a tick, and a Follow that arrives before
 		// its slot exists streams slotless -- leaving this primary free to recycle WAL that
 		// standby still needs. Sequencing it ahead of the routing switch closes that window.
-		a.reconcileSlots(wctx)
+		a.slotsTick(wctx)
 		if tl, _, ok, _ := a.prober.PrimaryWALPosition(wctx, a.selfConn()); ok {
 			a.advanceMarker(wctx, tl, true, obs.Marker)
 		}
@@ -670,11 +670,12 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// must not hold opMu past the soft-fence window. Best-effort -- it resumes next
 		// tick if cut short, and only ever targets ordinals above the live range.
 		a.cleanupGhostNodes(wctx)
-		// The slot-side twin of the ghost cleanup above (#289): create slots for expected
-		// standbys and reclaim orphans a scale-down or a repmgr->native migration left
-		// pinning WAL. Bounded by the same fence-budget context, and skipped entirely under
-		// the repmgr mechanism (repmgr owns slots there).
-		a.reconcileSlots(wctx)
+		// The slot-side twin of the ghost cleanup above (#289): publish the slot gauges,
+		// then (native only) create slots for expected standbys and reclaim orphans a
+		// scale-down or a repmgr->native migration left pinning WAL. Bounded by the same
+		// fence-budget context. Only the mutation half is mechanism-gated -- the gauges the
+		// shipped alerts read must be truthful under repmgr too (see slotsTick).
+		a.slotsTick(wctx)
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
@@ -1234,10 +1235,45 @@ func (a *agent) cleanupGhostNodes(ctx context.Context) {
 	}
 }
 
+// slotsTick is the per-primary-tick replication-slot pass (#289): OBSERVE always, then
+// RECONCILE only under the native mechanism.
+//
+// The split is load-bearing, not tidiness. Observation is read-only and mechanism-agnostic,
+// and so is the failure it exists to catch: repmgr mode has slots too (repmgr_slot_*), they
+// pin WAL in exactly the same silent way, and the chart renders the slot PrometheusRules for
+// every agent-mode release regardless of mechanism. Publishing the gauges only in native mode
+// would leave those alerts pinned at zero on the DEFAULT mechanism -- an alert that cannot
+// fire reads as coverage while providing none, which is worse than shipping no alert at all.
+// Mutation stays native-only: under the repmgr mechanism repmgr owns slot lifecycle (it
+// creates/attaches slots during standby clone/follow), so two owners would fight over the
+// same objects.
+func (a *agent) slotsTick(ctx context.Context) {
+	slots, ok := a.observeSlots(ctx)
+	if !ok {
+		return
+	}
+	a.reconcileSlots(ctx, slots)
+}
+
+// observeSlots reads this primary's physical replication slots and publishes the aggregate
+// gauges (#289). Runs under every mechanism -- see slotsTick.
+//
+// Reports false when the query failed, so a caller cannot mistake "could not look" for
+// "there are none": creating or dropping on that basis is how a needed slot gets destroyed.
+// The gauges are left at their previous values in that case rather than zeroed, because a
+// transient psql failure must not read as "the orphan is gone" and resolve the alert.
+func (a *agent) observeSlots(ctx context.Context) ([]pg.SlotState, bool) {
+	slots, err := a.prober.PhysicalSlots(ctx, a.selfConn())
+	if err != nil {
+		a.log.Warn("list physical replication slots", "err", err)
+		return nil, false
+	}
+	a.metr.SetSlots(slotMetrics(slots))
+	return slots, true
+}
+
 // reconcileSlots makes the primary's physical replication slots match the live pod set
-// (#289). Native mode only: under the repmgr mechanism repmgr still owns slot lifecycle
-// (it creates/attaches them during standby clone/follow), so touching them here would
-// have two owners fighting over the same objects.
+// (#289), from the slots observeSlots already read. Native mechanism only (see slotsTick).
 //
 // Runs as the lease holder on a read-write primary, which is what makes it race-free:
 // slots are only ever mutated by the single node that holds the lease, so there is no
@@ -1267,7 +1303,7 @@ func (a *agent) cleanupGhostNodes(ctx context.Context) {
 // Best-effort per slot: a failure is logged and retried next tick rather than aborting the
 // rest, because a single unreachable/locked slot must not block reclaiming the others --
 // and the whole point is that an unreclaimed slot silently fills the volume.
-func (a *agent) reconcileSlots(ctx context.Context) {
+func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) {
 	if a.cfg.Mechanism != config.MechanismNative {
 		return
 	}
@@ -1275,16 +1311,10 @@ func (a *agent) reconcileSlots(ctx context.Context) {
 		return
 	}
 	self := a.selfConn()
-	slots, err := a.prober.PhysicalSlots(ctx, self)
-	if err != nil {
-		a.log.Warn("list physical replication slots", "err", err)
-		return
-	}
 	have := make(map[string]pg.SlotState, len(slots))
 	for _, s := range slots {
 		have[s.Name] = s
 	}
-	a.metr.SetSlots(slotMetrics(slots))
 
 	selfOrd, selfOK := podOrdinal(a.cfg.PodName)
 	for ord := 0; ord < a.cfg.NodeCount; ord++ {

@@ -344,7 +344,10 @@ repmgr:
         additionalLabels: {}
         # #289: page when one physical replication slot has held back more than this many
         # bytes of WAL. An orphaned slot pins WAL forever and fills the volume with no
-        # error until the disk is full. See the pg chart README.
+        # error until the disk is full. Not limited to mechanism: native -- slot ownership
+        # is native-only, but the gauges these alerts read are published under `repmgr`
+        # too (where the agent reports slots but never reclaims them). See the pg chart
+        # README.
         slotRetainedWALBytes: 17179869184
 
     # Authenticated control REST API (#276), agent mode only. OFF by default: with

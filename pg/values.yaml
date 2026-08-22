@@ -408,12 +408,19 @@ repmgr:
         # volume, and it raises NO error until the disk is full. This is the alert that
         # turns that silent failure into a page.
         #
-        # The agent reconciles its own slots away on every primary tick, so a sustained
-        # breach means either a slot the agent does not own (an operator's, or a logical
-        # slot for a subscription) or a standby that has been down long enough to fall
-        # far behind. 16Gi is deliberately well below a default 10Gi..100Gi data volume
-        # but far above normal steady-state retention (a handful of 16MB segments).
-        # Raise it if you run large max_slot_wal_keep_size on purpose.
+        # These alerts are NOT limited to mechanism: native. Slot ownership is native-only,
+        # but the primary publishes the slot gauges under `repmgr` too: repmgr mode has
+        # slots as well (repmgr_slot_*), they pin WAL identically, and this rule renders
+        # for every agent-mode release -- a gauge that only moved under native would ship
+        # an alert that can never fire.
+        #
+        # Under native the agent reconciles its OWN slots away on every primary tick, so a
+        # sustained breach there means either a slot it does not own (an operator's, or a
+        # logical slot for a subscription) or a standby down long enough to fall far
+        # behind. Under repmgr the agent reclaims nothing, so any sustained breach needs a
+        # human. 16Gi is deliberately well below a default 10Gi..100Gi data volume but far
+        # above normal steady-state retention (a handful of 16MB segments). Raise it if you
+        # run large max_slot_wal_keep_size on purpose.
         slotRetainedWALBytes: 17179869184
 
     # Authenticated control REST API (#276), agent mode only. OFF by default: with

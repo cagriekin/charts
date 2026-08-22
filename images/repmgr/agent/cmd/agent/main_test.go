@@ -12,8 +12,15 @@ import (
 	"testing"
 	"time"
 
+	"net/http/httptest"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+
 	"github.com/cagriekin/pg-ha-agent/internal/config"
 	"github.com/cagriekin/pg-ha-agent/internal/dcs"
+	"github.com/cagriekin/pg-ha-agent/internal/k8s"
 	"github.com/cagriekin/pg-ha-agent/internal/mechanism"
 	"github.com/cagriekin/pg-ha-agent/internal/observe"
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
@@ -874,4 +881,133 @@ func TestSlotMetricsAggregatesCountInactiveAndMaxRetained(t *testing.T) {
 	if empty.Total != 0 || empty.Inactive != 0 || empty.MaxRetainedWALBytes != 0 {
 		t.Errorf("no slots: got %+v, want all zero", empty)
 	}
+}
+
+// slotExec answers the three slot statements and records what was asked, so a test can
+// distinguish "looked at the slots" from "changed them".
+type slotExec struct {
+	rows    string // pg_replication_slots output, "name|active|bytes" per line
+	listed  int
+	created []string
+	dropped []string
+}
+
+func (s *slotExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
+	joined := strings.Join(args, " ")
+	switch {
+	case name == "psql" && strings.Contains(joined, "pg_create_physical_replication_slot"):
+		s.created = append(s.created, slotArg(joined))
+		return "", nil
+	case name == "psql" && strings.Contains(joined, "pg_drop_replication_slot"):
+		s.dropped = append(s.dropped, slotArg(joined))
+		return slotArg(joined), nil
+	case name == "psql" && strings.Contains(joined, "pg_replication_slots"):
+		s.listed++
+		return s.rows, nil
+	}
+	return "", nil
+}
+
+// slotArg pulls the first quoted slot name out of a statement, which is enough to identify
+// which slot it acted on without parsing SQL.
+func slotArg(sql string) string {
+	i := strings.Index(sql, "'")
+	if i < 0 {
+		return ""
+	}
+	rest := sql[i+1:]
+	j := strings.Index(rest, "'")
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
+}
+
+// #289: slot OBSERVATION runs under EVERY mechanism; slot MUTATION only under native.
+//
+// The split matters because the chart renders the two slot PrometheusRules for every
+// agent-mode release regardless of mechanism. If the gauges were published only in native
+// mode, those alerts would sit pinned at zero on the DEFAULT mechanism -- an alert that
+// cannot fire reads as coverage while providing none, which is worse than shipping none.
+// Mutation stays gated: under the repmgr mechanism repmgr owns slot lifecycle, and two
+// owners fighting over the same slots is worse than one.
+func TestSlotsTickObservesUnderEveryMechanismAndMutatesOnlyInNative(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		mechanism  string
+		wantMutate bool
+	}{
+		{"repmgr (absent, the default)", "", false},
+		{"repmgr (explicit)", config.MechanismRepmgr, false},
+		{"native", config.MechanismNative, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// One slot for a departed ordinal (2, outside the live pod set below), inactive
+			// and pinning WAL: reclaimable under native, untouchable under repmgr.
+			ex := &slotExec{rows: "pg_ha_slot_2|f|4096\n"}
+			a := newSlotTestAgent(t, ex, tc.mechanism)
+
+			a.slotsTick(context.Background())
+
+			if ex.listed == 0 {
+				t.Errorf("slots were never listed, so the gauges the shipped alerts read stay at zero")
+			}
+			if body := scrapeMetrics(t, a); !strings.Contains(body, "pg_ha_agent_replication_slot_max_retained_wal_bytes 4096") {
+				t.Errorf("retained-WAL gauge not published under mechanism %q: %s", tc.mechanism, body)
+			}
+			mutated := len(ex.created) > 0 || len(ex.dropped) > 0
+			if mutated != tc.wantMutate {
+				t.Errorf("mutated=%v (created=%v dropped=%v), want %v under mechanism %q",
+					mutated, ex.created, ex.dropped, tc.wantMutate, tc.mechanism)
+			}
+		})
+	}
+}
+
+// A failed slot list must not be read as "there are no slots": creating or dropping on that
+// basis is how a slot a standby still needs gets destroyed (#289).
+func TestSlotsTickMutatesNothingWhenTheSlotListFails(t *testing.T) {
+	ex := &slotExec{rows: "not-three-fields\n"} // parse failure inside PhysicalSlots
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+
+	a.slotsTick(context.Background())
+
+	if len(ex.created) > 0 || len(ex.dropped) > 0 {
+		t.Errorf("mutated slots on an unreadable list: created=%v dropped=%v", ex.created, ex.dropped)
+	}
+}
+
+// newSlotTestAgent wires a real Prober over ex plus a fake apiserver holding pods 0 and 1,
+// so the live-pod-set half of the reconcile is exercised rather than stubbed.
+func newSlotTestAgent(t *testing.T, ex *slotExec, mech string) *agent {
+	t.Helper()
+	cs := k8sfake.NewSimpleClientset(
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pg-0", Namespace: "ns", Labels: map[string]string{"app": "pg"}}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pg-1", Namespace: "ns", Labels: map[string]string{"app": "pg"}}},
+	)
+	return &agent{
+		cfg: &config.Config{
+			PodName:        "pg-0",
+			Namespace:      "ns",
+			PodSelector:    "app=pg",
+			NodeCount:      2,
+			Mechanism:      mech,
+			RepmgrUser:     "repmgr",
+			RepmgrDB:       "repmgr",
+			RepmgrPassword: "pw",
+		},
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		kube:   k8s.NewWithClient(cs, "ns"),
+		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
+		metr:   observe.New(),
+	}
+}
+
+// scrapeMetrics reads the agent's real metrics endpoint, so the assertion covers what a
+// Prometheus scrape would actually see rather than an internal field.
+func scrapeMetrics(t *testing.T, a *agent) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	a.metr.Handler(time.Minute).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	return rec.Body.String()
 }
