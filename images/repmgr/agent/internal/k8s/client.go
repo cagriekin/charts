@@ -8,7 +8,8 @@ import (
 	"fmt"
 
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
+
+	"github.com/cagriekin/pg-ha-agent/internal/kubecfg"
 )
 
 // Client wraps a namespaced Kubernetes clientset.
@@ -17,11 +18,12 @@ type Client struct {
 	namespace string
 }
 
-// New builds a Client from the in-cluster config and ServiceAccount.
+// New builds a Client from the resolved apiserver config -- KUBECONFIG when set,
+// the in-cluster ServiceAccount otherwise (#317).
 func New(namespace string) (*Client, error) {
-	rc, err := rest.InClusterConfig()
+	rc, err := kubecfg.RESTConfig()
 	if err != nil {
-		return nil, fmt.Errorf("in-cluster config: %w", err)
+		return nil, err
 	}
 	cs, err := kubernetes.NewForConfig(rc)
 	if err != nil {

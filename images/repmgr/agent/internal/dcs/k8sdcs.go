@@ -9,9 +9,10 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+
+	"github.com/cagriekin/pg-ha-agent/internal/kubecfg"
 )
 
 // K8sConfig parameterizes the Lease-backed lock. The timings map directly to
@@ -42,11 +43,14 @@ type K8sDCS struct {
 	cooldownUntil time.Time          // suppress re-contention until this time (set by Release)
 }
 
-// NewK8sDCS builds a K8sDCS using the in-cluster config and ServiceAccount.
+// NewK8sDCS builds a K8sDCS from the resolved apiserver config -- KUBECONFIG when
+// set, the in-cluster ServiceAccount otherwise. The Lease lock has to travel the
+// same route as the mutation client: reaching one but not the other elects a leader
+// that cannot publish, or publishes without holding the lease (#317).
 func NewK8sDCS(cfg K8sConfig) (*K8sDCS, error) {
-	rc, err := rest.InClusterConfig()
+	rc, err := kubecfg.RESTConfig()
 	if err != nil {
-		return nil, fmt.Errorf("in-cluster config: %w", err)
+		return nil, err
 	}
 	cs, err := kubernetes.NewForConfig(rc)
 	if err != nil {
