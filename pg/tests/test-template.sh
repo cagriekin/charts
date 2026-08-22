@@ -3,6 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# #310: the curl https-pin needle (--proto '=https' --proto-redir '=https') is built
+# once here since it mixes a literal single quote with fixed-string assertions used
+# across several test blocks below.
+proto_pin_needle='curl -fsSL --proto '
+proto_pin_needle="${proto_pin_needle}'=https' --proto-redir '=https'"
 source "${SCRIPT_DIR}/helpers.sh"
 
 begin_suite "Helm Template Rendering"
@@ -300,10 +305,16 @@ assert_contains "#153: repmgr-init declares its (heavier) clone resources" "${re
 # cp would silently overwrite the repmgr image's core libs (e.g. libpqwalreceiver.so)
 # if postgresql.image and repmgr.image drift to different postgres point releases.
 copy_base_ext=$(printf '%s\n' "${init_res}" | sed -n '/name: copy-base-ext/,/name: copy-ext/p')
-assert_contains "#302: copy-base-ext copies plainly (it runs first, nothing to preserve yet)" "${copy_base_ext}" "cp /usr/lib/postgresql/18/lib/\*.so /ext-lib/"
+assert_contains "#302: copy-base-ext copies plainly (it runs first, nothing to preserve yet)" "${copy_base_ext}" "cp /usr/lib/postgresql/18/lib/\*.so\* /ext-lib/"
 copy_ext=$(printf '%s\n' "${init_res}" | sed -n '/name: copy-ext/,/securityContext/p')
-assert_contains "#302: copy-ext uses cp -n for the lib copy" "${copy_ext}" "cp -n /usr/lib/postgresql/18/lib/\*.so /ext-lib/"
+assert_contains "#302: copy-ext uses cp -n for the lib copy" "${copy_ext}" "cp -n /usr/lib/postgresql/18/lib/\*.so\* /ext-lib/"
 assert_contains "#302: copy-ext uses cp -n for the extension-share copy" "${copy_ext}" "cp -n /usr/share/postgresql/18/extension/\* /ext-share/"
+
+# #309: the copy glob is *.so*, not just *.so -- a strict superset that also matches
+# a versioned SONAME (e.g. libsodium.so.23) a package pulls in as a transitive
+# runtime dependency, which is not itself named like a Postgres extension module.
+assert_contains "#309: copy-base-ext glob also matches versioned SONAMEs" "${copy_base_ext}" "lib/\*.so\* /ext-lib/"
+assert_contains "#309: copy-ext glob also matches versioned SONAMEs" "${copy_ext}" "lib/\*.so\* /ext-lib/"
 
 # #303: with no packages declared, neither init container should carry an apt-get
 # step or the root-transient securityContext it needs -- the default/existing-user
@@ -328,8 +339,8 @@ assert_contains "#303: copy-ext installs the {major}-substituted package too" "$
 # the copy step must still follow the apt-get in the same command, and copy-ext
 # must still be -n (#302) even with packages set -- installing a package is not a
 # license to start clobbering the repmgr image's core libs.
-assert_contains "#303: copy-base-ext still copies plainly after apt-get" "${pkg_base_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+"postgresql-18=$PGVER"} postgresql-18-cron && cp /usr/lib/postgresql/18/lib/\*.so /ext-lib/'
-assert_contains "#303: copy-ext still uses cp -n after apt-get" "${pkg_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+"postgresql-18=$PGVER"} postgresql-18-cron && cp -n /usr/lib/postgresql/18/lib/\*.so /ext-lib/'
+assert_contains "#303: copy-base-ext still copies plainly after apt-get" "${pkg_base_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+\\"postgresql-18=$PGVER\\"} postgresql-18-cron && cp /usr/lib/postgresql/18/lib/\*.so\* /ext-lib/'
+assert_contains "#303: copy-ext still uses cp -n after apt-get" "${pkg_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+\\"postgresql-18=$PGVER\\"} postgresql-18-cron && cp -n /usr/lib/postgresql/18/lib/\*.so\* /ext-lib/'
 
 # review (#303): apt-get install could otherwise upgrade the already-installed
 # postgresql-{major} as a side effect of satisfying some extension package's
@@ -341,7 +352,7 @@ assert_contains "#303: copy-ext still uses cp -n after apt-get" "${pkg_ext}" 'ap
 # is already the newest version") or fails the install outright, never a silent
 # swap.
 assert_contains "#303: copy-base-ext detects the installed postgresql-18 version via dpkg-query" "${pkg_base_ext}" 'PGVER=$(dpkg-query -W postgresql-18 2>/dev/null | cut -f2)'
-assert_contains "#303: copy-base-ext pins postgresql-18 on the same apt-get install line" "${pkg_base_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+"postgresql-18=$PGVER"}'
+assert_contains "#303: copy-base-ext pins postgresql-18 on the same apt-get install line" "${pkg_base_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+\\"postgresql-18=$PGVER\\"}'
 assert_contains "#303: copy-ext also detects and pins postgresql-18 (best-effort for a custom image)" "${pkg_ext}" 'PGVER=$(dpkg-query -W postgresql-18 2>/dev/null | cut -f2)'
 
 # #303: a version pin (apt's `=` syntax) passes through verbatim -- no chart-side
@@ -399,6 +410,23 @@ pkg_standalone=$(helm template test-pg "${CHART_DIR}" \
 assert_not_contains "#303: standalone has no copy-base-ext" "${pkg_standalone}" "name: copy-base-ext"
 assert_contains "#303: standalone copy-ext installs the package" "${pkg_standalone}" "postgresql-18-cron"
 
+# #310: standalone mode has only copy-ext, so aptSources must work there too -- it's
+# the only extension source in that mode, same reasoning as #303 above.
+apt_src_standalone=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false \
+  --set postgresql.replicaCount=0 \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#310: standalone has no copy-base-ext" "${apt_src_standalone}" "name: copy-base-ext"
+assert_contains "#310: standalone copy-ext pins curl to https" "${apt_src_standalone}" "${proto_pin_needle}"
+assert_contains "#310: standalone copy-ext adds the apt source" "${apt_src_standalone}" 'gpg --dearmor -o /usr/share/keyrings/pgchart-pigsty-keyring.gpg'
+assert_contains "#310: standalone copy-ext installs the pigsty-sourced package" "${apt_src_standalone}" "postgresql-18-pgsodium"
+
 # #303: postgresql.extensions.packages without extensions.enabled fails the render --
 # a stale/typo'd `enabled: false` must not silently install nothing.
 helm template test-pg "${CHART_DIR}" \
@@ -426,6 +454,278 @@ helm template test-pg "${CHART_DIR}" \
   --set 'postgresql.extensions.packages[0]=`id`' \
   >/dev/null 2>&1 && pkg_inject_backtick_rc=0 || pkg_inject_backtick_rc=$?
 assert_eq "#303: a backtick-injected package entry fails the render" "1" "${pkg_inject_backtick_rc}"
+
+# #310: postgresql.extensions.aptSources adds a non-PGDG apt source (e.g. Pigsty)
+# inside copy-ext/copy-base-ext before the apt-get install, for extensions PGDG
+# doesn't package. Rendered as curl | gpg --dearmor + a sources.list.d write, then a
+# second apt-get update, ahead of the existing PGVER-pinned install.
+apt_src_res=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/{major}/trixie trixie main' \
+  --show-only templates/statefulset.yaml 2>&1)
+apt_src_base_ext=$(printf '%s\n' "${apt_src_res}" | sed -n '/name: copy-base-ext/,/name: copy-ext/p')
+apt_src_ext=$(printf '%s\n' "${apt_src_res}" | sed -n '/name: copy-ext/,/name: repmgr-init/p')
+assert_contains "#310: copy-base-ext installs curl/gnupg before adding the source" "${apt_src_base_ext}" "apt-get install -y --no-install-recommends curl ca-certificates gnupg"
+# the proto pin (review) and the dearmor step are checked as separate substrings to
+# avoid a needle with both a literal single quote (--proto '=https') and the \" YAML
+# double-quote escaping in the same fixed string.
+assert_contains "#310: copy-base-ext pins curl to https (no cross-protocol redirect)" "${apt_src_base_ext}" "${proto_pin_needle}"
+assert_contains "#310: copy-base-ext dearmors the key to a per-source keyring" "${apt_src_base_ext}" 'gpg --dearmor -o /usr/share/keyrings/pgchart-pigsty-keyring.gpg'
+assert_contains "#310: copy-base-ext writes the sources.list.d entry" "${apt_src_base_ext}" 'echo \\"deb \[signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg\] https://repo.pigsty.io/apt/pgsql/18/trixie trixie main\\" > /etc/apt/sources.list.d/pgchart-pigsty.list'
+assert_contains "#310: copy-ext pins curl to https too (custom postgresql.image case)" "${apt_src_ext}" "${proto_pin_needle}"
+assert_contains "#310: copy-ext also gets the apt source (custom postgresql.image case)" "${apt_src_ext}" 'gpg --dearmor -o /usr/share/keyrings/pgchart-pigsty-keyring.gpg'
+# the source must be added and a second apt-get update run BEFORE the pinned package
+# install -- otherwise the just-added source's packages aren't visible to apt yet.
+assert_contains "#310: source is added, then apt-get updated again, before the pinned install" "${apt_src_base_ext}" 'sources.list.d/pgchart-pigsty.list && apt-get update && apt-get install -y --no-install-recommends ${PGVER:+\\"postgresql-18=$PGVER\\"} postgresql-18-pgsodium'
+
+# #310: {major} substitutes into aptLine exactly like it does into packages.
+assert_contains "#310: {major} substitutes into aptLine" "${apt_src_base_ext}" "pgsql/18/trixie"
+assert_not_contains "#310: no stale {major} placeholder left in aptLine" "${apt_src_base_ext}" "pgsql/{major}/trixie"
+
+# #310: with no aptSources set, neither container pays for the curl/gnupg install --
+# the default packages-only path must be byte-identical to before this feature existed.
+assert_not_contains "#310: no curl/gnupg install in copy-base-ext without aptSources" "${pkg_base_ext}" "curl ca-certificates gnupg"
+assert_not_contains "#310: no curl/gnupg install in copy-ext without aptSources" "${pkg_ext}" "curl ca-certificates gnupg"
+
+# #310: aptSources without packages fails the render -- it would have nothing to do.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+  >/dev/null 2>&1 && apt_src_nopkg_rc=0 || apt_src_nopkg_rc=$?
+assert_eq "#310: aptSources without packages fails the render" "1" "${apt_src_nopkg_rc}"
+
+# #310: aptSources without extensions.enabled fails the render -- packages is left
+# empty here so this actually exercises pg.validateExtensionAptSources's own enabled
+# check, not the pre-existing pg.validateExtensionPackages guard (which would fire
+# first, with its own message, if packages were also set).
+helm template test-pg "${CHART_DIR}" \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+  >/dev/null 2>&1 && apt_src_noenable_rc=0 || apt_src_noenable_rc=$?
+assert_eq "#310: aptSources without extensions.enabled fails the render" "1" "${apt_src_noenable_rc}"
+apt_src_noenable_err=$(helm template test-pg "${CHART_DIR}" \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+  2>&1) || true
+assert_contains "#310: error is aptSources' own enabled guard, not the packages guard" "${apt_src_noenable_err}" "postgresql.extensions.aptSources is set but postgresql.extensions.enabled is false"
+
+# #310: an invalid name (not a safe filename component) fails the render.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.aptSources[0].name=pig/sty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+  >/dev/null 2>&1 && apt_src_badname_rc=0 || apt_src_badname_rc=$?
+assert_eq "#310: an invalid aptSources name fails the render" "1" "${apt_src_badname_rc}"
+
+# #310: duplicate names fail the render -- a second entry would silently overwrite
+# the first's /etc/apt/sources.list.d/<name>.list.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://a.example/x trixie main' \
+  --set 'postgresql.extensions.aptSources[1].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[1].keyUrl=https://repo.pigsty.io/key2' \
+  --set 'postgresql.extensions.aptSources[1].aptLine=deb https://b.example/y trixie main' \
+  >/dev/null 2>&1 && apt_src_dupname_rc=0 || apt_src_dupname_rc=$?
+assert_eq "#310: a duplicate aptSources name fails the render" "1" "${apt_src_dupname_rc}"
+
+# #310: a shell-metacharacter injection via keyUrl fails the render -- keyUrl is
+# interpolated into a `curl ... | gpg ...` shell command.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key;rm -rf /' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+  >/dev/null 2>&1 && apt_src_inject_keyurl_rc=0 || apt_src_inject_keyurl_rc=$?
+assert_eq "#310: a semicolon-injected keyUrl fails the render" "1" "${apt_src_inject_keyurl_rc}"
+
+# #310: a shell-metacharacter injection via aptLine fails the render -- aptLine is
+# interpolated into an `echo "..." > ...` shell command.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb `id` main' \
+  >/dev/null 2>&1 && apt_src_inject_aptline_rc=0 || apt_src_inject_aptline_rc=$?
+assert_eq "#310: a backtick-injected aptLine fails the render" "1" "${apt_src_inject_aptline_rc}"
+
+# #310: aptLine allows a comma -- needed for the standard multi-arch option syntax
+# (e.g. `[arch=amd64,arm64]`), and shell-inert inside the double-quoted echo. A
+# values file is used (not --set) since --set itself treats a bare comma as a
+# key=value separator, unrelated to the render-time allowlist under test here.
+apt_line_comma_res=$(helm template test-pg "${CHART_DIR}" --set postgresql.majorVersion=18 \
+  -f "${SCRIPT_DIR}/values-aptline-comma.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#310: aptLine with a comma (multi-arch syntax) renders" "${apt_line_comma_res}" 'arch=amd64,arm64'
+
+# #309: postgresql.extensions.extraLibs copies an exact path into the dedicated
+# ext-extra-lib volume (NOT ext-lib, review -- see below), for a package's own
+# shared-library dependency Debian installs outside the Postgres extension dir (e.g.
+# libsodium.so.23, which the extension-copy glob -- however broad -- never reaches,
+# since it never lives under /usr/lib/postgresql/<major>/lib).
+extralibs_res=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.extraLibs[0]=/usr/lib/x86_64-linux-gnu/libsodium.so.23' \
+  --show-only templates/statefulset.yaml 2>&1)
+extralibs_base_ext=$(printf '%s\n' "${extralibs_res}" | sed -n '/name: copy-base-ext/,/name: copy-ext/p')
+extralibs_ext=$(printf '%s\n' "${extralibs_res}" | sed -n '/name: copy-ext/,/name: repmgr-init/p')
+assert_contains "#309: copy-base-ext copies the extraLibs path plainly" "${extralibs_base_ext}" 'cp /usr/lib/x86_64-linux-gnu/libsodium.so.23 /ext-extra-lib/'
+assert_contains "#309: copy-ext copies the extraLibs path with -n (no-clobber, #302)" "${extralibs_ext}" 'cp -n /usr/lib/x86_64-linux-gnu/libsodium.so.23 /ext-extra-lib/'
+assert_contains "#309: copy-base-ext mounts the ext-extra-lib volume" "${extralibs_base_ext}" $'name: ext-extra-lib\n              mountPath: /ext-extra-lib'
+assert_contains "#309: copy-ext mounts the ext-extra-lib volume" "${extralibs_ext}" $'name: ext-extra-lib\n              mountPath: /ext-extra-lib'
+
+# #309: the extraLibs copy runs AFTER the normal extension-file copy, in the same
+# apt-get-installed command.
+assert_contains "#309: extraLibs copy follows the normal ext-lib/ext-share copy" "${extralibs_base_ext}" 'cp /usr/share/postgresql/18/extension/\* /ext-share/ && cp /usr/lib/x86_64-linux-gnu/libsodium.so.23 /ext-extra-lib/'
+
+# #309: LD_LIBRARY_PATH is set on the postgresql container whenever extraLibs is
+# non-empty, pointing at ext-extra-lib (NOT ext-lib) -- this is what actually makes a
+# copied extraLibs dependency resolvable, since the extension .so itself has no
+# RUNPATH/RPATH (verified live).
+ldlp_line=$(printf '%s' "${extralibs_res}" | grep -A1 "name: LD_LIBRARY_PATH" | tail -1)
+assert_contains "#309: LD_LIBRARY_PATH points at the dedicated extra-lib dir when extraLibs is set" "${ldlp_line}" "value: /usr/lib/postgresql/18/extra-lib"
+# the init containers mount ext-extra-lib at the generic /ext-extra-lib path; only the
+# main postgresql container mounts it at the real, LD_LIBRARY_PATH-matching location,
+# so this exact string is a reliable, container-specific needle.
+assert_contains "#309: the postgresql container mounts ext-extra-lib at the LD_LIBRARY_PATH location" "${extralibs_res}" "mountPath: /usr/lib/postgresql/18/extra-lib"
+
+# #309: LD_LIBRARY_PATH is gated on extraLibs specifically, NOT bare extensions.enabled,
+# and points at a volume SEPARATE from ext-lib -- ext-lib is also populated by the
+# unvalidated plain *.so* glob copy from either image (#302), so pointing the search
+# path there (or widening it for every extensions-enabled release regardless of
+# extraLibs) risks a same-named file from one image's build shadowing a system library
+# for the other image's process -- an ABI hazard pg.validateExtraLibs cannot catch,
+# since those files never go through extraLibs' own validation. ext-extra-lib is
+# written ONLY by the extraLibs copy step, so LD_LIBRARY_PATH only ever searches paths
+# this chart validated.
+ext_enabled_no_extralibs=$(helm template test-pg "${CHART_DIR}" --set postgresql.extensions.enabled=true --set postgresql.majorVersion=18 --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#309: no LD_LIBRARY_PATH when extensions.enabled but extraLibs is empty" "${ext_enabled_no_extralibs}" "LD_LIBRARY_PATH"
+assert_not_contains "#309: no ext-extra-lib volume when extraLibs is empty" "${ext_enabled_no_extralibs}" "ext-extra-lib"
+assert_not_contains "#309: no LD_LIBRARY_PATH when extensions are disabled" "${minimal}" "LD_LIBRARY_PATH"
+
+# #309: extraLibs without packages fails the render -- its copy step only runs
+# alongside the packages apt-get install.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.extraLibs[0]=/usr/lib/x86_64-linux-gnu/libsodium.so.23' \
+  >/dev/null 2>&1 && extralibs_nopkg_rc=0 || extralibs_nopkg_rc=$?
+assert_eq "#309: extraLibs without packages fails the render" "1" "${extralibs_nopkg_rc}"
+
+# #309: extraLibs without extensions.enabled fails the render.
+helm template test-pg "${CHART_DIR}" \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.extraLibs[0]=/usr/lib/x86_64-linux-gnu/libsodium.so.23' \
+  >/dev/null 2>&1 && extralibs_noenable_rc=0 || extralibs_noenable_rc=$?
+assert_eq "#309: extraLibs without extensions.enabled fails the render" "1" "${extralibs_noenable_rc}"
+
+# #309: a relative or malformed path fails the render.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.extraLibs[0]=usr/lib/x86_64-linux-gnu/libsodium.so.23' \
+  >/dev/null 2>&1 && extralibs_relpath_rc=0 || extralibs_relpath_rc=$?
+assert_eq "#309: a relative extraLibs path fails the render" "1" "${extralibs_relpath_rc}"
+
+# #309: a path-traversal segment fails the render.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.extraLibs[0]=/usr/lib/../../../etc/passwd' \
+  >/dev/null 2>&1 && extralibs_traversal_rc=0 || extralibs_traversal_rc=$?
+assert_eq "#309: a path-traversal extraLibs entry fails the render" "1" "${extralibs_traversal_rc}"
+
+# #309: a trailing / (a directory, not a file) fails the render -- cp would fail at
+# init time and crashloop the pod instead of failing fast at render time.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.extraLibs[0]=/usr/lib/x86_64-linux-gnu/' \
+  >/dev/null 2>&1 && extralibs_trailingslash_rc=0 || extralibs_trailingslash_rc=$?
+assert_eq "#309: a trailing-slash (directory) extraLibs entry fails the render" "1" "${extralibs_trailingslash_rc}"
+
+# #309: a shell-metacharacter injection fails the render.
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.extraLibs[0]=/tmp/x; rm -rf /' \
+  >/dev/null 2>&1 && extralibs_inject_rc=0 || extralibs_inject_rc=$?
+assert_eq "#309: a shell-metacharacter extraLibs entry fails the render" "1" "${extralibs_inject_rc}"
+
+# #309: a core runtime library is refused, to avoid ABI-shadowing the running
+# container's own runtime with a build from a different image (copy-base-ext and
+# copy-ext can be different images). Denylist is the full `ldd postgres` NEEDED set
+# (verified live against postgres:18.1-trixie, review) plus libpq (the #302 hazard for
+# libpqwalreceiver.so specifically), not just the original libc-family subset -- an
+# earlier, narrower list missed all of these, and the test suite itself once used
+# libzstd as a "safe" example when it is in fact a real postgres dependency.
+for denied_lib in libc.so.6 libstdc++.so.6 libpthread.so.0 libssl.so.3 libcrypto.so.3 libz.so.1 \
+  libicuuc.so.74 ld-linux-x86-64.so.2 libzstd.so.1 liblz4.so.1 libxml2.so.2 libpam.so.0 \
+  libgssapi_krb5.so.2 libnuma.so.1 libldap.so.2 liburing.so.2 libsystemd.so.0 libxxhash.so.0 \
+  liblzma.so.5 libaudit.so.1 libkrb5.so.3 libk5crypto.so.3 libcom_err.so.2 libkrb5support.so.0 \
+  liblber.so.2 libsasl2.so.2 libcap.so.2 libcap-ng.so.0 libkeyutils.so.1 libpq.so.5; do
+  helm template test-pg "${CHART_DIR}" \
+    --set postgresql.extensions.enabled=true \
+    --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+    --set "postgresql.extensions.extraLibs[0]=/usr/lib/x86_64-linux-gnu/${denied_lib}" \
+    >/dev/null 2>&1 && denylib_rc=0 || denylib_rc=$?
+  assert_eq "#309: extraLibs refuses core runtime library ${denied_lib}" "1" "${denylib_rc}"
+done
+
+# #309: a library that merely SHARES A PREFIX with a denied name (not the same
+# library) is not false-positived -- boundary-aware matching, not substring matching.
+for safe_lib in libsodium.so.23 libcairo.so.2 libmagic.so.1 libzip.so.4; do
+  helm template test-pg "${CHART_DIR}" \
+    --set postgresql.extensions.enabled=true \
+    --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+    --set "postgresql.extensions.extraLibs[0]=/usr/lib/x86_64-linux-gnu/${safe_lib}" \
+    >/dev/null 2>&1 && safelib_rc=0 || safelib_rc=$?
+  assert_eq "#309: extraLibs allows unrelated library ${safe_lib}" "0" "${safelib_rc}"
+done
+
+# #309: a path whose basename doesn't look like a shared library (no .so / .so.N
+# suffix) fails the render -- a directory or unrelated file would otherwise pass the
+# character-class check and only fail at cp time, crash-looping the pod.
+for bad_path in /usr/lib/x86_64-linux-gnu /etc/passwd /usr/lib/x86_64-linux-gnu/README; do
+  helm template test-pg "${CHART_DIR}" \
+    --set postgresql.extensions.enabled=true \
+    --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+    --set "postgresql.extensions.extraLibs[0]=${bad_path}" \
+    >/dev/null 2>&1 && nonso_rc=0 || nonso_rc=$?
+  assert_eq "#309: extraLibs rejects a non-.so path (${bad_path})" "1" "${nonso_rc}"
+done
+
+# #309: two extraLibs entries copying to the same destination basename fail the
+# render -- which source wins would otherwise depend on copy-base-ext/copy-ext
+# ordering (undefined behavior from the values file's perspective).
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.extraLibs[0]=/usr/lib/x86_64-linux-gnu/libsodium.so.23' \
+  --set 'postgresql.extensions.extraLibs[1]=/opt/vendor/libsodium.so.23' \
+  >/dev/null 2>&1 && extralibs_dupbase_rc=0 || extralibs_dupbase_rc=$?
+assert_eq "#309: extraLibs rejects duplicate destination basenames" "1" "${extralibs_dupbase_rc}"
+
+# #309: the ext-extra-lib volume is written ONLY by the validated extraLibs copy step,
+# never by the general *.so* glob -- the whole point of keeping it physically separate
+# from ext-lib (review). Confirm the glob's own cp command never targets it.
+assert_not_contains "#309: the *.so* glob never copies into ext-extra-lib" "${extralibs_base_ext}" '*.so* /ext-extra-lib/'
+assert_not_contains "#309: the *.so* glob never copies into ext-extra-lib (copy-ext)" "${extralibs_ext}" '*.so* /ext-extra-lib/'
 
 # #116: the busybox helper init image is a single shared value (default 1.37 for all
 # four init containers, no more 1.35/1.37 split) and is overridable for air-gapped
@@ -2811,7 +3111,8 @@ assert_contains "majorVersion default: ext-lib mountPath uses /usr/lib/postgresq
 assert_contains "majorVersion default: ext-share mountPath uses /usr/share/postgresql/18/extension" "${extpaths_default}" "mountPath: /usr/share/postgresql/18/extension"
 ext_lib_count=$(printf '%s' "${extpaths_default}" | grep -c "/usr/lib/postgresql/18/lib" || true)
 ext_share_count=$(printf '%s' "${extpaths_default}" | grep -c "/usr/share/postgresql/18/extension" || true)
-# copy-base-ext cp + copy-ext cp + postgresql volumeMount = 3 each
+# copy-base-ext cp + copy-ext cp + postgresql volumeMount = 3 each (LD_LIBRARY_PATH,
+# #309, only renders when extraLibs is also set -- not exercised by this fixture)
 assert_eq "majorVersion default: three /usr/lib/postgresql/18/lib occurrences" "3" "${ext_lib_count}"
 assert_eq "majorVersion default: three /usr/share/postgresql/18/extension occurrences" "3" "${ext_share_count}"
 

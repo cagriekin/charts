@@ -1,5 +1,92 @@
 # pg chart changelog
 
+## 1.14.0 - 2026-08-21
+
+### Added
+
+- **`postgresql.extensions.aptSources` (#310).** Adds a non-PGDG apt source (e.g.
+  [Pigsty](https://repo.pigsty.io), the only source for `pgsodium`, `supabase_vault`,
+  `pg_graphql`, `pg_net`, `supautils`, `wrappers`, `pgjwt`, `pgmq`) inside
+  `copy-ext`/`copy-base-ext`'s own throwaway filesystem, before the existing
+  `postgresql.extensions.packages` apt-get install -- closing the gap where a
+  Pigsty-only package name previously made `copy-base-ext`'s `apt-get install` fail
+  outright (the `cagriekin/repmgr` image has no Pigsty source and isn't something a
+  chart consumer builds), aborting before its extension-file copy ever ran. Each
+  entry's key is dearmored to `/usr/share/keyrings/pgchart-<name>-keyring.gpg` and its
+  line written to `/etc/apt/sources.list.d/pgchart-<name>.list` ahead of a second
+  `apt-get update` -- the `pgchart-` prefix so an entry can never collide with a source
+  the image already owns (the `cagriekin/repmgr` image's own PGDG source); `keyUrl`/
+  `aptLine` are restricted to a narrow character allowlist at render time
+  (`pg.validateExtensionAptSources`), since both are interpolated into a shell command.
+  Requires `packages` to be non-empty. See the README ["Installing packages from a
+  non-PGDG apt source"](README.md#installing-packages-from-a-non-pgdg-apt-source-310).
+- **`postgresql.extensions.extraLibs` + automatic `LD_LIBRARY_PATH` (#309).** Some
+  apt-installed extensions depend on a general-purpose shared library that Debian
+  installs to the standard multiarch path (e.g. `libsodium.so.23`, needed by
+  `pgsodium`/`supabase_vault`), never under `/usr/lib/postgresql/<major>/lib` where the
+  existing extension-file copy reads from -- confirmed live, and true regardless of how
+  broad that copy step's glob is. `extraLibs` is an explicit list of exact absolute FILE
+  paths (no trailing `/`) to additionally copy into a **new, dedicated** `ext-extra-lib`
+  volume -- deliberately kept separate from `ext-lib`, since `ext-lib` is also populated
+  by the unvalidated `*.so*` glob copy (either image, #302) and pointing the search path
+  there would extend the same ABI-shadowing hazard the denylist below exists to prevent
+  to every file that glob happens to sweep in. The `postgresql` container gets
+  `LD_LIBRARY_PATH=/usr/lib/postgresql/<major>/extra-lib` automatically whenever
+  `extraLibs` is non-empty (not just `extensions.enabled`, so a release that doesn't use
+  this feature gets no search-path change and no extra volume at all), since the copied
+  file has no `RUNPATH`/`RPATH` and is otherwise never found by the dynamic linker
+  (confirmed live end-to-end: fails to load without `LD_LIBRARY_PATH`, loads cleanly
+  with it). Deliberately explicit, not an automatic `ldd`-and-copy-everything walk:
+  `copy-base-ext`/`copy-ext` can be different image builds, and auto-copying a resolved
+  dependency's transitive closure between them risks a runtime ABI mismatch -- every
+  library the postmaster itself links is refused at render time (`pg.validateExtraLibs`)
+  for exactly that reason: the full `ldd postgres` NEEDED set against the shipped
+  `postgres:*-trixie`/`cagriekin/repmgr` images (glibc, OpenSSL, Kerberos, LDAP, ICU,
+  zstd/lz4/xz, audit, `libcap`/`libcap-ng`/`libkeyutils`, ...), plus `libpq` (the
+  dependency of `libpqwalreceiver.so`, the exact `#302` ABI hazard). An entry must also
+  name a real shared library (basename ending `.so`/`.so.<N>`) and not duplicate another
+  entry's destination filename -- both would otherwise pass validation and only fail at
+  `cp` time, crash-looping the pod. Requires `packages` to be non-empty. See the README
+  ["Copying a package's own shared-library
+  dependencies"](README.md#copying-a-packages-own-shared-library-dependencies-309).
+- **`aptSources[].aptLine` requires `signed-by=` matching its own entry, and rejects
+  `trusted=` (review, hardening).** Without `signed-by=/usr/share/keyrings/pgchart-
+  <name>-keyring.gpg` naming exactly the keyring the entry's own `keyUrl` is dearmored
+  to, apt has no way to know which key to trust for that source -- previously this
+  failed only later, at apply time, inside `apt-get update` (`NO_PUBKEY`), instead of at
+  render time (CLAUDE.md invariant #4). `trusted=yes` (or any `trusted=` option) is
+  rejected outright: it disables apt's signature check entirely, making the
+  `curl`/`gpg` verification step above decorative and installing unsigned packages as
+  root.
+- **`aptSources[].keyUrl` allows `&`; `aptLine` allows `,` and fails on a leftover
+  `{`/`}` (review).** `&` in `keyUrl` is needed for a standard keyserver lookup URL
+  (`?op=get&search=...`) and is inert inside the double-quoted `curl` argument; `,` in
+  `aptLine` is needed for the standard multi-arch option syntax (`[arch=amd64,arm64]`)
+  and is inert inside the double-quoted `echo`. A `{`/`}` surviving `{major}`
+  substitution in `aptLine` now fails the render instead of silently writing a
+  literal, nonsensical placeholder (e.g. a typo'd `{MAJOR}`) into `sources.list.d` that
+  would otherwise only fail later, at apply time, inside `apt-get update`.
+- **`aptSources`' `curl` is pinned to `https` (review, hardening).** `--proto '=https'
+  --proto-redir '=https'` on the key download, so a same-origin `https` -> `http`
+  redirect can no longer fetch the key in plaintext. `keyUrl`'s own allowlist already
+  forced the URL's own scheme to `https://`, but did not prevent a redirect.
+- **`LD_LIBRARY_PATH` is now a chart-reserved `postgresql.extraEnv` name.** Consistent
+  with every other chart-set env var (`pg.validateExtraPassthrough` reserves these
+  unconditionally, even for a currently-disabled feature, so a passthrough that works
+  today can't start silently shadowing a chart value after a later upgrade enables it).
+  A `postgresql.extraEnv` entry named `LD_LIBRARY_PATH` now fails the render regardless
+  of `extensions.extraLibs`.
+
+### Fixed
+
+- **`copy-ext`/`copy-base-ext`'s extension-file copy glob (`*.so`) missed versioned
+  shared libraries a package places directly alongside its own extension modules
+  (#309).** The glob is now `*.so*`, a strict superset of the old match, so this is a
+  safe, unconditional fix rather than a new opt-in. Note this covers only libraries
+  co-located under `/usr/lib/postgresql/<major>/lib` itself -- it does **not** reach a
+  dependency Debian installs elsewhere (the motivating `libsodium.so.23` case); that
+  needs `postgresql.extensions.extraLibs`, above.
+
 ## 1.13.1 - 2026-08-21
 
 ### Fixed

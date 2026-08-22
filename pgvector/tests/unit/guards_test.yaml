@@ -66,3 +66,40 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "requires postgresql.walLevel: logical"
+
+  # aptSources only exists to make a packages entry installable (#310) -- pointless,
+  # and rejected, without one.
+  - it: extensions.aptSources without packages is rejected
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorPattern: "aptSources is set but postgresql.extensions.packages is empty"
+
+  # extraLibs' copy step only runs alongside the packages apt-get install (#309) --
+  # pointless, and rejected, without one.
+  - it: extensions.extraLibs without packages is rejected
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.extraLibs:
+        - /usr/lib/x86_64-linux-gnu/libsodium.so.23
+    asserts:
+      - failedTemplate:
+          errorPattern: "extraLibs is set but postgresql.extensions.packages is empty"
+
+  # copy-base-ext/copy-ext can be different image builds -- auto-shadowing the running
+  # container's own C runtime with a build from the other image is an ABI hazard.
+  - it: a core runtime library in extraLibs is refused
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - /usr/lib/x86_64-linux-gnu/libc.so.6
+    asserts:
+      - failedTemplate:
+          errorPattern: "refusing .* copying a library the postgres server itself links"

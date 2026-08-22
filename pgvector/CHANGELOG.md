@@ -1,5 +1,42 @@
 # pgvector chart changelog
 
+## 1.14.0 - 2026-08-21
+
+Inherited from pg's symlinked templates (`_helpers.tpl`, `statefulset.yaml`) and mirrored
+`values.yaml`/`values.schema.json`. See the [pg 1.14.0 changelog](../pg/CHANGELOG.md) for
+the full detail.
+
+### Added
+
+- **`postgresql.extensions.aptSources` (#310).** Adds a non-PGDG apt source (e.g. Pigsty)
+  inside `copy-ext`/`copy-base-ext` before the `packages` apt-get install, for extensions
+  PGDG doesn't package (`pgsodium`, `supabase_vault`, ...). Keyring/list files get a
+  `pgchart-` prefix so they can't collide with a source the image already owns. Requires
+  `packages` to be non-empty. See the [pg chart README](../pg/README.md#installing-packages-from-a-non-pgdg-apt-source-310).
+- **`postgresql.extensions.extraLibs` + automatic `LD_LIBRARY_PATH` (#309).** Copies an
+  exact, explicit path (e.g. `/usr/lib/x86_64-linux-gnu/libsodium.so.23`) into a new,
+  dedicated `ext-extra-lib` volume -- kept separate from `ext-lib`, which is also populated by the unvalidated
+  `*.so*` glob copy -- for a package's own shared-library dependency Debian installs
+  outside the Postgres extension dir. The `postgresql` container gets
+  `LD_LIBRARY_PATH=/usr/lib/postgresql/<major>/extra-lib` automatically whenever
+  `extraLibs` is non-empty (not just `extensions.enabled`, to avoid widening the
+  search path for releases that don't need it) so the copied file is actually found.
+  Requires `packages` to be non-empty; every library the postmaster itself links is
+  refused (the full `ldd postgres` NEEDED set, not just `libc`), the path must name a
+  real shared library, and duplicate destination basenames are rejected too.
+  `aptSources`' `curl` is now pinned to `https` (`--proto`/`--proto-redir`),
+  `keyUrl`/`aptLine` allow `&`/`,` respectively, and `aptLine` must include
+  `signed-by=` matching its own entry's keyring (`trusted=` is rejected outright).
+  `LD_LIBRARY_PATH` is now a chart-reserved `postgresql.extraEnv` name. See the
+  [pg chart README](../pg/README.md#copying-a-packages-own-shared-library-dependencies-309).
+
+### Fixed
+
+- **The extension-file copy glob (`*.so`) missed versioned shared libraries a package
+  places directly alongside its own extension modules (#309).** Now `*.so*`. This does
+  not, by itself, reach a dependency Debian installs elsewhere (the `libsodium.so.23`
+  case) -- that needs `extraLibs`, above.
+
 ## 1.13.1 - 2026-08-21
 
 ### Fixed

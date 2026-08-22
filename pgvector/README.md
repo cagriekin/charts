@@ -182,6 +182,8 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.extraEnv` | Extra env vars for the postgresql container (supports `value` and `valueFrom`); may not reuse a chart-set name | `[]` |
 | `postgresql.extensions.enabled` | Enable extensions support | `true` |
 | `postgresql.extensions.packages` | Debian/PGDG packages to `apt-get install` before the copy step, for *additional* extensions beyond `vector` (`pg_cron`, …); `{major}` substitutes `postgresql.majorVersion`; see the [pg chart README](../pg/README.md#installing-extensions-without-a-custom-image) | `[]` |
+| `postgresql.extensions.aptSources` | Non-PGDG apt sources (e.g. Pigsty) to add before installing `packages`; see the [pg chart README](../pg/README.md#installing-packages-from-a-non-pgdg-apt-source-310) | `[]` |
+| `postgresql.extensions.extraLibs` | Exact absolute FILE paths (no trailing `/`) to additionally copy into a dedicated volume, for a package's own shared-library dependency (e.g. `libsodium.so.23`); see the [pg chart README](../pg/README.md#copying-a-packages-own-shared-library-dependencies-309) | `[]` |
 | `postgresql.extensions.installResources` | Resources for the apt-get step (only rendered while `packages` is non-empty) | `100m/128Mi` req, `1/512Mi` limit |
 | `postgresql.audit.enabled` | Enable pgaudit audit logging (requires repmgr mode; see [Audit logging](#audit-logging-pgaudit)) | `false` |
 | `postgresql.audit.log` | pgaudit session classes: `read,write,function,role,ddl,misc,misc_set,all` (negate with `-`) | `"ddl, role, write"` |
@@ -1168,7 +1170,7 @@ helm repo update
 helm upgrade my-pgvector cagriekin/pgvector   # add -f your-values.yaml
 ```
 
-`pgvector` tracks `pg` in lockstep — same version, image, and agent; the earlier 0.6.x ↔ 0.5.x split unified at `1.0.0` (current: `1.13.1`, image `trixie-5.5.0-32`). Within the 1.x line `helm upgrade` rolls the pods once and needs no manual step. The default failover mode is `agent` since `1.0.0` (it was `repmgrd` through 0.x); **only when crossing from a 0.x release** does adopting the agent default need the one-time `--cascade=orphan` recreate — pin `repmgr.failoverMode: repmgrd` to defer. Read the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. For the **compatibility matrix, the version model, and the full 0.x → 1.x migration runbook**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
+`pgvector` tracks `pg` in lockstep — same version, image, and agent; the earlier 0.6.x ↔ 0.5.x split unified at `1.0.0` (current: `1.14.0`, image `trixie-5.5.0-32`). Within the 1.x line `helm upgrade` rolls the pods once and needs no manual step. The default failover mode is `agent` since `1.0.0` (it was `repmgrd` through 0.x); **only when crossing from a 0.x release** does adopting the agent default need the one-time `--cascade=orphan` recreate — pin `repmgr.failoverMode: repmgrd` to defer. Read the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. For the **compatibility matrix, the version model, and the full 0.x → 1.x migration runbook**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
 
 ## pgvector Resources
 

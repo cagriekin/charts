@@ -2,6 +2,8 @@
 {{- include "pg.validateAudit" . }}
 {{- include "pg.validateExtraPassthrough" . }}
 {{- include "pg.validateExtensionPackages" . }}
+{{- include "pg.validateExtensionAptSources" . }}
+{{- include "pg.validateExtraLibs" . }}
 {{- include "pg.validateWalLevel" . }}
 {{- include "pg.validateSyncReplicationSlotsMajor" . }}
 {{- include "pg.validateSyncReplicationSlotsWalLevel" . }}
@@ -383,7 +385,7 @@ spec:
           # mode, one layer up). The pin makes that impossible to do silently: apt
           # either leaves the server package alone (the normal case) or fails the
           # render-time-adjacent install outright, never a quiet swap.
-          command: ['sh', '-c', 'PGVER=$(dpkg-query -W postgresql-{{ $pgMajor }} 2>/dev/null | cut -f2); apt-get update && apt-get install -y --no-install-recommends ${PGVER:+"postgresql-{{ $pgMajor }}=$PGVER"} {{ join " " $pkgs }} && cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
+          command: ['sh', '-c', {{ include "pg.extensionInstallCommand" (dict "pgMajor" $pgMajor "pkgs" $pkgs "aptSources" .Values.postgresql.extensions.aptSources "extraLibs" .Values.postgresql.extensions.extraLibs "noClobber" false) | quote }}]
           securityContext:
             # apt-get/dpkg needs root to write /var/lib/dpkg and run package
             # maintainer scripts (e.g. ldconfig) -- broader than fix-permissions'
@@ -422,7 +424,7 @@ spec:
                 - SETFCAP
                 - MKNOD
 {{- else }}
-          command: ['sh', '-c', 'cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
+          command: ['sh', '-c', 'cp /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so* /ext-lib/ && cp /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
 {{- end }}
@@ -431,6 +433,10 @@ spec:
               mountPath: /ext-lib
             - name: ext-share
               mountPath: /ext-share
+{{- if .Values.postgresql.extensions.extraLibs }}
+            - name: ext-extra-lib
+              mountPath: /ext-extra-lib
+{{- end }}
           resources:
 {{- if $pkgs }}
             {{- toYaml .Values.postgresql.extensions.installResources | nindent 12 }}
@@ -460,7 +466,7 @@ spec:
           # here too: if this image did not install PostgreSQL via a dpkg-tracked
           # postgresql-{{ $pgMajor }} package, PGVER is empty and the pin is skipped
           # rather than failing an otherwise-valid custom-image install.
-          command: ['sh', '-c', 'PGVER=$(dpkg-query -W postgresql-{{ $pgMajor }} 2>/dev/null | cut -f2); apt-get update && apt-get install -y --no-install-recommends ${PGVER:+"postgresql-{{ $pgMajor }}=$PGVER"} {{ join " " $pkgs }} && cp -n /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp -n /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
+          command: ['sh', '-c', {{ include "pg.extensionInstallCommand" (dict "pgMajor" $pgMajor "pkgs" $pkgs "aptSources" .Values.postgresql.extensions.aptSources "extraLibs" .Values.postgresql.extensions.extraLibs "noClobber" true) | quote }}]
           securityContext:
             # Same as copy-base-ext's apt-step securityContext above (review, #303):
             # REPLACES postgresql.containerSecurityContext, not a merge -- and will
@@ -491,7 +497,7 @@ spec:
           # releases independently (this image's tag is often floating), and an
           # unconditional overwrite silently reintroduces an ABI mismatch between
           # the running server and its own WAL receiver plugin.
-          command: ['sh', '-c', 'cp -n /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so /ext-lib/ && cp -n /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
+          command: ['sh', '-c', 'cp -n /usr/lib/postgresql/{{ $pgMajor }}/lib/*.so* /ext-lib/ && cp -n /usr/share/postgresql/{{ $pgMajor }}/extension/* /ext-share/']
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
 {{- end }}
@@ -500,6 +506,10 @@ spec:
               mountPath: /ext-lib
             - name: ext-share
               mountPath: /ext-share
+{{- if .Values.postgresql.extensions.extraLibs }}
+            - name: ext-extra-lib
+              mountPath: /ext-extra-lib
+{{- end }}
           resources:
 {{- if $pkgs }}
             {{- toYaml .Values.postgresql.extensions.installResources | nindent 12 }}
@@ -667,6 +677,34 @@ spec:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretDatabaseKey" . }}
+{{- if and .Values.postgresql.extensions.enabled .Values.postgresql.extensions.extraLibs }}
+{{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
+            # #309: an apt-installed extension's transitive shared-library dependency
+            # (e.g. libsodium.so.23, needed by pgsodium/supabase_vault) has no RUNPATH
+            # and is never in the default ld.so search path -- the extension .so itself
+            # loads fine (postgres dlopen()s it by absolute path), but resolving ITS OWN
+            # NEEDED entries then fails with "cannot open shared object file" unless the
+            # copied-alongside dependency (postgresql.extensions.extraLibs) is on a path
+            # the dynamic linker actually searches.
+            #
+            # Points at ext-extra-lib, NOT ext-lib (review, #302): ext-lib is also
+            # populated by the unvalidated *.so* glob copy from either image, so pointing
+            # the search path there would extend the same ABI-shadowing hazard
+            # pg.validateExtraLibs' denylist exists to prevent to every file that glob
+            # happens to sweep in. ext-extra-lib is written ONLY by the extraLibs copy
+            # step, so LD_LIBRARY_PATH only ever searches paths this chart validated.
+            # Gated on extraLibs specifically, not bare extensions.enabled, so a release
+            # that doesn't use this feature gets no search-path change at all.
+            #
+            # A Kubernetes container env entry REPLACES (not appends to) the image's own
+            # ENV of the same name (review) -- confirmed neither postgres:*-trixie nor
+            # cagriekin/repmgr sets LD_LIBRARY_PATH today (`docker inspect ... Config.Env`
+            # has no LD_LIBRARY_PATH entry in either), so there's nothing to clobber. If a
+            # future base-image bump ever adds one, this would need to change to prepend
+            # this path onto the image's own value instead of overwriting it outright.
+            - name: LD_LIBRARY_PATH
+              value: /usr/lib/postgresql/{{ $pgMajor }}/extra-lib
+{{- end }}
 {{- if .Values.repmgr.enabled }}
             - name: REPMGR_USER
               value: {{ .Values.repmgr.username | quote }}
@@ -1179,6 +1217,18 @@ spec:
               mountPath: /usr/lib/postgresql/{{ $pgMajor }}/lib
             - name: ext-share
               mountPath: /usr/share/postgresql/{{ $pgMajor }}/extension
+{{- if .Values.postgresql.extensions.extraLibs }}
+            # #309 (review): a SEPARATE volume from ext-lib, not a subdirectory of it --
+            # ext-lib is also populated by the unvalidated *.so* glob copy (either image,
+            # #302), so pointing LD_LIBRARY_PATH at ext-lib itself would extend the same
+            # ABI-shadowing hazard pg.validateExtraLibs' denylist exists to prevent to
+            # every file that glob happens to sweep in, not just the explicit,
+            # denylist-checked entries in extraLibs. Keeping extraLibs' own copies
+            # physically isolated means LD_LIBRARY_PATH only ever searches paths this
+            # chart validated.
+            - name: ext-extra-lib
+              mountPath: /usr/lib/postgresql/{{ $pgMajor }}/extra-lib
+{{- end }}
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
             - name: pgbackrest-config
@@ -1465,6 +1515,19 @@ spec:
         - name: ext-share
           emptyDir:
             sizeLimit: 1Gi
+{{- if .Values.postgresql.extensions.extraLibs }}
+        # Deliberately separate from ext-lib (review, #309/#302): ext-lib is also
+        # populated by the unvalidated *.so* glob copy from either image, so
+        # LD_LIBRARY_PATH (statefulset.yaml, postgresql container env) points at this
+        # volume instead -- written ONLY by extraLibs' own denylist-checked copy step,
+        # never by the general glob. Same 1Gi cap as ext-lib/ext-share (review): an
+        # emptyDir sizeLimit is enforced by evicting the POD, not failing the copy
+        # cleanly, so this needs real headroom -- a handful of real-world transitive
+        # dependencies (e.g. a Python/GDAL-linked extension) can each be tens of MB.
+        - name: ext-extra-lib
+          emptyDir:
+            sizeLimit: 1Gi
+{{- end }}
 {{- end }}
 {{- if .Values.repmgr.enabled }}
         - name: repmgr-config

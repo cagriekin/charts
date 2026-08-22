@@ -317,6 +317,41 @@ postgresql:
     # non-default postgresql.image, and the NetworkPolicy egress this requires.
     packages: []
       # - "postgresql-{major}-cron"
+    # Non-PGDG apt sources (#310) to add inside copy-ext/copy-base-ext's own filesystem,
+    # before the apt-get install above -- for extensions PGDG simply doesn't package
+    # (pgsodium, supabase_vault, pg_graphql, pg_net, supautils, wrappers, pgjwt, pgmq are
+    # all Pigsty-only, repo.pigsty.io/apt/pgsql/<codename>). Rendered as a curl | gpg
+    # --dearmor + sources.list.d write ahead of apt-get update/install (see README
+    # "Installing packages from a non-PGDG apt source" for a full Pigsty example).
+    # keyUrl/aptLine are restricted to a narrow character allowlist at render time
+    # (pg.validateExtensionAptSources) since both are interpolated into a shell command;
+    # {major} in aptLine is substituted with postgresql.majorVersion, same as packages
+    # above. Pointless (and rejected) without at least one entry in packages.
+    aptSources: []
+      # - name: pigsty       # becomes /usr/share/keyrings/pgchart-pigsty-keyring.gpg
+      #                       # and /etc/apt/sources.list.d/pgchart-pigsty.list -- the
+      #                       # pgchart- prefix keeps this from ever colliding with a
+      #                       # source the image itself already owns; name must be unique
+      #   keyUrl: https://repo.pigsty.io/key
+      #   aptLine: "deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    # Exact absolute paths to additionally copy into the dedicated ext-extra-lib volume
+    # (#309) -- deliberately NOT ext-lib, which the plain extension-file copy above also
+    # populates unvalidated. Debian puts general-purpose shared libraries --
+    # as opposed to Postgres extension modules -- under the multiarch path
+    # (/usr/lib/<triplet>/), never under /usr/lib/postgresql/<major>/lib, so a package's
+    # transitive runtime dependency (e.g. libsodium.so.23, needed by
+    # pgsodium/supabase_vault) is NOT picked up by the extension-file copy no matter how
+    # broad its glob -- confirmed live. Pairs with LD_LIBRARY_PATH, which the chart sets
+    # on the postgresql container automatically whenever extraLibs is non-empty (see README
+    # "Copying a package's own shared-library dependencies"), so a copied dependency is
+    # actually found by the dynamic linker. Explicit, not automatic: this does NOT walk
+    # `ldd` and copy every transitive dependency, because copy-base-ext (repmgr image)
+    # and copy-ext (postgresql.image) can be different image builds -- silently copying
+    # a resolved libc/libstdc++/etc. from one into the other risks a runtime ABI
+    # mismatch. Core C-runtime libraries are refused at render time
+    # (pg.validateExtraLibs) for exactly that reason. Requires packages to be non-empty.
+    extraLibs: []
+      # - /usr/lib/x86_64-linux-gnu/libsodium.so.23
     # Resources for the apt-get step, only rendered while packages is non-empty (the
     # plain-copy default path keeps using the shared, lighter pg.initResources). apt-get
     # update + install is a real package-manager run (repo metadata fetch + dependency

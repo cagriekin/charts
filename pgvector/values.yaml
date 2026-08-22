@@ -259,6 +259,22 @@ postgresql:
     # `{major}` substituted with majorVersion, optional `=version` pin. See the pg chart
     # README "Installing extensions without a custom image".
     packages: []
+    # Non-PGDG apt sources (#310, e.g. Pigsty) to add before the packages install, for
+    # extensions PGDG doesn't package (pgsodium, supabase_vault, ...). {major} substitutes
+    # into aptLine. Requires packages to be non-empty. See the pg chart README.
+    aptSources: []
+      # - name: pigsty        # keyring/list files get a pgchart- prefix; see pg README
+      #   keyUrl: https://repo.pigsty.io/key
+      #   aptLine: "deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    # Exact absolute paths to additionally copy into the dedicated ext-extra-lib volume
+    # (#309) -- NOT ext-lib, which the plain extension-file copy also populates
+    # unvalidated -- for a transitive shared-library dependency Debian places outside
+    # /usr/lib/postgresql/<major>/lib (e.g. libsodium.so.23). Pairs with
+    # LD_LIBRARY_PATH, set automatically whenever extraLibs is non-empty (not just
+    # extensions.enabled). Requires packages to be non-empty; libraries the server
+    # itself links are refused. See the pg chart README.
+    extraLibs: []
+      # - /usr/lib/x86_64-linux-gnu/libsodium.so.23
     installResources:
       requests:
         cpu: 100m

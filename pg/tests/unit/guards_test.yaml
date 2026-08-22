@@ -113,7 +113,7 @@ tests:
           emptyDir: {}
     asserts:
       - failedTemplate:
-          errorMessage: 'postgresql.extraVolumes[0]: "data" is a chart-managed volume name and may not be reused (reserved: data, postgresql-config, postgresql-tls, ext-lib, ext-share, repmgr-config, etcd-tls, pg-run, pgbackrest-config, service-updater-script). With persistence enabled a "data" volume is silently discarded in favour of the volumeClaimTemplate; with persistence disabled the duplicate name is rejected by the API server. Pick a distinct name.'
+          errorMessage: 'postgresql.extraVolumes[0]: "data" is a chart-managed volume name and may not be reused (reserved: data, postgresql-config, postgresql-tls, ext-lib, ext-share, ext-extra-lib, repmgr-config, etcd-tls, pg-run, pgbackrest-config, service-updater-script). With persistence enabled a "data" volume is silently discarded in favour of the volumeClaimTemplate; with persistence disabled the duplicate name is rejected by the API server. Pick a distinct name.'
 
   - it: extraVolumes colliding with an internal volume (repmgr-config) fails render
     templates:
@@ -234,3 +234,403 @@ tests:
         - "postgresql-18-cron; rm -rf /"
     asserts:
       - failedTemplate: {}
+
+  # --- Scenario 15: non-PGDG apt source guards (#310) ---
+  - it: aptSources without packages fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.extensions.aptSources is set but postgresql.extensions.packages is empty -- aptSources only exists to make packages from a non-PGDG source installable, so it has nothing to do without at least one package that needs it."
+
+  # packages is also set here, so the pre-existing pg.validateExtensionPackages guard
+  # fires first, with its own message -- pg.validateExtensionAptSources's own enabled
+  # check is exercised separately below, with packages left empty.
+  - it: aptSources with packages but without extensions.enabled hits the packages guard
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.extensions.packages is set but postgresql.extensions.enabled is false, so nothing would ever install them. Set postgresql.extensions.enabled=true."
+
+  - it: aptSources alone without extensions.enabled hits its own enabled guard
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.extensions.aptSources is set but postgresql.extensions.enabled is false, so nothing would ever use it. Set postgresql.extensions.enabled=true."
+
+  - it: an aptSources entry with an invalid name fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: "pig/sty"
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate: {}
+
+  - it: duplicate aptSources names fail render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://a.example/x trixie main"
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key2
+          aptLine: "deb https://b.example/y trixie main"
+    asserts:
+      - failedTemplate: {}
+
+  - it: an aptSources keyUrl with a shell metacharacter fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: "https://repo.pigsty.io/key; rm -rf /"
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate: {}
+
+  - it: an aptSources aptLine with a shell metacharacter fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb `id` main"
+    asserts:
+      - failedTemplate: {}
+
+  # trusted=/allow-insecure=/allow-weak=/allow-downgrade-to-insecure= each disable or
+  # weaken apt's signature check, making the curl/gpg verification step decorative --
+  # unsigned or weakly-signed packages would install as root. Case-insensitive with
+  # optional whitespace before "=" (review): apt itself accepts both.
+  - it: an aptSources aptLine setting trusted=yes fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb [trusted=yes] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorPattern: "sets an apt option that weakens or disables signature verification"
+
+  - it: an aptSources aptLine setting allow-insecure=yes fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb [allow-insecure=yes] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorPattern: "sets an apt option that weakens or disables signature verification"
+
+  - it: an aptSources aptLine setting Trusted = yes (mixed case, spaced) fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb [Trusted = yes] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorPattern: "sets an apt option that weakens or disables signature verification"
+
+  # Without signed-by referencing exactly the keyring this entry's own key is
+  # dearmored to, apt has no way to know which key to trust -- fails at apply time
+  # (NO_PUBKEY) instead of at render time (CLAUDE.md invariant #4).
+  - it: an aptSources aptLine without signed-by fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorPattern: "must include \"signed-by=/usr/share/keyrings/pgchart-pigsty-keyring\\.gpg\""
+
+  # signed-by referencing a DIFFERENT entry's keyring (or a typo) is just as broken
+  # as omitting it outright -- must match this entry's own name exactly.
+  - it: an aptSources aptLine with a mismatched signed-by fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb [signed-by=/usr/share/keyrings/pgchart-other-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorPattern: "must include \"signed-by=/usr/share/keyrings/pgchart-pigsty-keyring\\.gpg\""
+
+  - it: a valid aptSources entry renders successfully
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.majorVersion: "18"
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")].command[2]
+          pattern: "curl -fsSL --proto '=https' --proto-redir '=https' \"https://repo\\.pigsty\\.io/key\" \\| gpg --dearmor -o /usr/share/keyrings/pgchart-pigsty-keyring\\.gpg"
+
+  # --- Scenario 16: extraLibs guards + LD_LIBRARY_PATH (#309) ---
+  - it: extraLibs without packages fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.extraLibs:
+        - /usr/lib/x86_64-linux-gnu/libsodium.so.23
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.extensions.extraLibs is set but postgresql.extensions.packages is empty -- extraLibs' copy step only runs alongside the packages apt-get install, so it has nothing to do without at least one package that needs it."
+
+  - it: extraLibs without extensions.enabled fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - /usr/lib/x86_64-linux-gnu/libsodium.so.23
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.extensions.packages is set but postgresql.extensions.enabled is false, so nothing would ever install them. Set postgresql.extensions.enabled=true."
+
+  - it: a relative extraLibs path fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - "usr/lib/x86_64-linux-gnu/libsodium.so.23"
+    asserts:
+      - failedTemplate: {}
+
+  - it: a path-traversal extraLibs entry fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - "/usr/lib/../../../etc/passwd"
+    asserts:
+      - failedTemplate: {}
+
+  # copy-base-ext and copy-ext can be different image builds -- auto-shadowing the
+  # running container's own C runtime with a build from the other image is an ABI
+  # hazard, not a convenience, so core libraries are refused outright.
+  - it: a core runtime library in extraLibs is refused
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - "/usr/lib/x86_64-linux-gnu/libc.so.6"
+    asserts:
+      - failedTemplate:
+          errorPattern: "refusing .* copying a library the postgres server itself links"
+
+  # Denylist widened past the original libc-family set (review): the postgres server
+  # itself links libssl/libcrypto too, so shadowing either is just as dangerous.
+  - it: libssl in extraLibs is refused
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - "/usr/lib/x86_64-linux-gnu/libssl.so.3"
+    asserts:
+      - failedTemplate:
+          errorPattern: "refusing .* copying a library the postgres server itself links"
+
+  # "libcrypt" (a real, distinct core library, not "libcrypto") must still be caught by
+  # the boundary-aware denylist regex, and an unrelated library that merely starts
+  # with the same letters ("libz" vs "libzstd") must NOT be false-positived.
+  - it: libcrypt (distinct from libcrypto) in extraLibs is refused
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - "/usr/lib/x86_64-linux-gnu/libcrypt.so.1"
+    asserts:
+      - failedTemplate:
+          errorPattern: "refusing .* copying a library the postgres server itself links"
+
+  # libzstd/liblz4/libxml2/etc. are ALSO denied (review): they're all real postgres
+  # dependencies (verified via `ldd postgres`), not merely prefix-sharing lookalikes --
+  # see the dedicated denial tests above. libcairo genuinely is unrelated to postgres's
+  # own NEEDED set and shares only its first four letters with libc, so it's the correct
+  # example of "boundary-aware matching, not a false positive on a shared prefix".
+  - it: a library merely sharing a denylisted prefix (libcairo, not libc) is allowed
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.majorVersion: "18"
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - /usr/lib/x86_64-linux-gnu/libcairo.so.2
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")].command[2]
+          pattern: "cp /usr/lib/x86_64-linux-gnu/libcairo\\.so\\.2 /ext-extra-lib/"
+
+  # A trailing / is a directory, not a file -- cp would fail at init time and
+  # crashloop the pod instead of failing fast at render time (review).
+  - it: a trailing-slash extraLibs entry (a directory) fails render
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - "/usr/lib/x86_64-linux-gnu/"
+    asserts:
+      - failedTemplate: {}
+
+  # extraLibs lands in a volume SEPARATE from ext-lib (review, #302): ext-lib is also
+  # populated by the unvalidated *.so* glob copy, so LD_LIBRARY_PATH pointing there
+  # instead would extend the ABI-shadowing hazard this denylist exists to prevent to
+  # every file that glob happens to sweep in.
+  - it: a valid extraLibs entry copies into ext-extra-lib and sets LD_LIBRARY_PATH
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.majorVersion: "18"
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - /usr/lib/x86_64-linux-gnu/libsodium.so.23
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")].command[2]
+          pattern: "cp /usr/lib/x86_64-linux-gnu/libsodium\\.so\\.23 /ext-extra-lib/"
+      - matchRegex:
+          path: spec.template.spec.initContainers[?(@.name=="copy-ext")].command[2]
+          pattern: "cp -n /usr/lib/x86_64-linux-gnu/libsodium\\.so\\.23 /ext-extra-lib/"
+      - contains:
+          path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")].volumeMounts
+          content:
+            name: ext-extra-lib
+            mountPath: /ext-extra-lib
+          any: true
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].volumeMounts
+          content:
+            name: ext-extra-lib
+            mountPath: /usr/lib/postgresql/18/extra-lib
+          any: true
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env
+          content:
+            name: LD_LIBRARY_PATH
+            value: /usr/lib/postgresql/18/extra-lib
+          any: true
+
+  - it: LD_LIBRARY_PATH is not set when extensions are disabled
+    templates:
+      - templates/statefulset.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env
+          content:
+            name: LD_LIBRARY_PATH
+          any: true
+
+  # Gated on extraLibs specifically, not bare extensions.enabled (review): ext-lib is
+  # also populated by the plain glob copy regardless of extraLibs, and copy-base-ext/
+  # copy-ext can be different image builds (#302) -- widening LD_LIBRARY_PATH for every
+  # extensions-enabled release risks a same-named file from one image's build shadowing
+  # a system library for the other image's process.
+  - it: LD_LIBRARY_PATH is not set when extensions.enabled but extraLibs is empty
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.majorVersion: "18"
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env
+          content:
+            name: LD_LIBRARY_PATH
+          any: true

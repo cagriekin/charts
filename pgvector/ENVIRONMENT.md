@@ -16,6 +16,7 @@ Required/optional is from the consuming process's perspective at runtime. Secret
 | `POSTGRES_USER` | string | yes | secret (`username`) | entrypoint, exporter, pgpool |
 | `POSTGRES_PASSWORD` | string | yes | secret (`password`) | entrypoint |
 | `POSTGRES_DB` | string | yes | secret (`database`) | entrypoint |
+| `LD_LIBRARY_PATH` | string | no | `/usr/lib/postgresql/<major>/extra-lib` | dynamic linker (`postgresql.extensions.extraLibs`, #309; emitted only when non-empty) |
 
 ## repmgr (both failover modes, when `repmgr.enabled=true`)
 

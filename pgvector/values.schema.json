@@ -52,7 +52,21 @@
           "type": "object",
           "properties": {
             "enabled": { "type": "boolean" },
-            "packages": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9+.~:=_-]*(\\{major\\}[A-Za-z0-9+.~:=_-]*)*$" }, "description": "Debian/PGDG package names (optionally =version-pinned), apt-get installed into copy-ext/copy-base-ext before the extension-file copy (#303). {major} is substituted with postgresql.majorVersion." }
+            "packages": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9+.~:=_-]*(\\{major\\}[A-Za-z0-9+.~:=_-]*)*$" }, "description": "Debian/PGDG package names (optionally =version-pinned), apt-get installed into copy-ext/copy-base-ext before the extension-file copy (#303). {major} is substituted with postgresql.majorVersion." },
+            "aptSources": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "keyUrl", "aptLine"],
+                "properties": {
+                  "name": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
+                  "keyUrl": { "type": "string", "pattern": "^https://[A-Za-z0-9._~:/?#%&=-]+$" },
+                  "aptLine": { "type": "string", "pattern": "^[A-Za-z0-9 ./:=,_+~%\\[\\]{}@-]+$" }
+                }
+              },
+              "description": "Non-PGDG apt sources (e.g. Pigsty) to add before installing packages (#310), for extensions PGDG doesn't package. {major} is substituted into aptLine. Requires packages to be non-empty."
+            },
+            "extraLibs": { "type": "array", "items": { "type": "string", "pattern": "^/[A-Za-z0-9._/+-]*[A-Za-z0-9._+-]$" }, "description": "Exact absolute FILE paths (no trailing /) to additionally copy into a dedicated volume (#309), for a transitive shared-library dependency Debian places outside /usr/lib/postgresql/<major>/lib (e.g. libsodium.so.23). Pair with LD_LIBRARY_PATH, set automatically when extraLibs is non-empty. Requires packages to be non-empty; core runtime libraries the server itself links are refused." }
           }
         },
         "audit": {
