@@ -17,9 +17,10 @@ import (
 // timeline/LSN election, fencing and Service routing all live in reconcile, which imports
 // only the Mechanism interface. Only the mechanics differ -- that is what the seam is for.
 //
-// EXPERIMENTAL and not usable on its own. Topology still comes from repmgr.nodes (#288) and
-// nothing owns replication slots (#289), so a standby has no upstream to choose and the
-// primary can recycle WAL a standby still needs. #294 promotes it to supported.
+// EXPERIMENTAL and not usable on its own: topology still comes from repmgr.nodes (#288),
+// so a standby has no upstream to choose. Replication slot ownership (#289) HAS landed --
+// this mechanism creates its own slot before every clone/rejoin and the primary reconciles
+// the set each tick -- so the WAL-recycling gap is closed. #294 promotes it to supported.
 //
 // Every binary is resolved under PGBindir rather than PATH: the image ships exactly one
 // PostgreSQL major and the agent must exec that major's tools, not whatever PATH resolves
@@ -331,9 +332,29 @@ func (n *Native) ensureSlotOnUpstream(ctx context.Context, source Conn) error {
 		"-tAc", sql,
 	}
 	if out, err := n.run(ctx, n.bin("psql"), args...); err != nil {
+		// Losing a create/create race means the slot now EXISTS, which is exactly what this
+		// call is for -- so it is success, not failure. The WHERE NOT EXISTS guard above is
+		// not atomic (verified: 40 of 40 concurrent pairs race on PostgreSQL 18), and there
+		// are two legitimate independent creators of this name -- this cloning standby, and
+		// the primary's own periodic reconcile. Propagating the error here would abort an
+		// otherwise-fine clone over a slot that is present and usable.
+		if isDuplicateSlot(out, err) {
+			return nil
+		}
 		return fmt.Errorf("native: create slot %q on %s: %w: %s", n.SlotName, source.Host, err, strings.TrimSpace(out))
 	}
 	return nil
+}
+
+// isDuplicateSlot mirrors pg.IsDuplicateSlot. Duplicated for the same reason
+// validSlotName is: mechanism deliberately does not import internal/pg (that dependency
+// runs the other way). Kept narrow so it cannot swallow an unrelated failure.
+func isDuplicateSlot(out string, err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(out + " " + err.Error())
+	return strings.Contains(s, "already exists") && strings.Contains(s, "replication slot")
 }
 
 // validSlotName mirrors internal/pg's guard. Duplicated rather than imported because
@@ -383,6 +404,16 @@ func (n *Native) RejoinForceRewind(ctx context.Context, target Conn) error {
 	}
 	out, err := n.run(ctx, n.bin("pg_rewind"), args...)
 	if err == nil {
+		// Same reasoning as Clone (#289): make sure this node's slot exists on the target
+		// BEFORE it starts streaming. The rewind path had been relying on the new primary's
+		// own reconcile having already created it -- true almost always (reconcileSlots runs
+		// in the same tick as Promote, ahead of the routing switch, while a rejoin is paced
+		// by the reconcile interval), but "almost always" is the wrong guarantee for the one
+		// thing standing between a standby and a WAL gap. Idempotent, so the overwhelmingly
+		// common case where the slot is already there costs one cheap query.
+		if err := n.ensureSlotOnUpstream(ctx, target); err != nil {
+			return err
+		}
 		// pg_rewind leaves the node needing standby.signal + primary_conninfo to come back
 		// as a standby; write them now so the supervisor's Start attaches it to the target
 		// rather than booting a second read-write primary (the two-writer risk).

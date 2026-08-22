@@ -2923,6 +2923,25 @@ mech_standalone=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/statefulset.yaml 2>&1)
 assert_not_contains "#287: standalone never gets MECHANISM (agent-only)" "${mech_standalone}" "MECHANISM"
 
+# #289: cascading replication makes a STANDBY an upstream, but native-mode slot ownership
+# only ever runs on the primary -- so a cascading child would reference a slot that does
+# not exist on its actual upstream and its walreceiver would refuse to start. Rejected at
+# render time rather than shipping a combination that only breaks at runtime.
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.mechanism=native --set repmgr.agent.cascadingReplication=true \
+  >/dev/null 2>&1 && mech_cascade_rc=0 || mech_cascade_rc=$?
+assert_eq "#289: native + cascadingReplication fails the render" "1" "${mech_cascade_rc}"
+mech_cascade_err=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.mechanism=native --set repmgr.agent.cascadingReplication=true 2>&1 || true)
+assert_contains "#289: the error names both values and the fix" "${mech_cascade_err}" "cascadingReplication is not supported with repmgr.agent.mechanism: native"
+# Neither flag alone may be affected -- this must forbid nothing that worked before.
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.mechanism=native >/dev/null 2>&1 && native_alone_rc=0 || native_alone_rc=$?
+assert_eq "#289: native alone still renders" "0" "${native_alone_rc}"
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.cascadingReplication=true >/dev/null 2>&1 && cascade_alone_rc=0 || cascade_alone_rc=$?
+assert_eq "#289: cascadingReplication alone (repmgr mode) still renders" "0" "${cascade_alone_rc}"
+
 # ======================================================================
 # #262: postgresql.extraVolumes / extraVolumeMounts / extraEnv passthrough,
 # its render-time guards, and the repmgr shared_preload_libraries merge that

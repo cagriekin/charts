@@ -355,9 +355,11 @@ repmgr:
     #                       pg_rewind, primary_conninfo + standby.signal
     #
     # `native` is NOT usable on its own yet. It makes the mechanism selectable, but topology
-    # still comes from repmgr.nodes (#288) and nothing owns replication slots (#289) -- so a
-    # standby has no upstream to choose and the primary can recycle WAL a standby still
-    # needs. Leave it at repmgr until #294 marks native supported and flips the default.
+    # still comes from repmgr.nodes (#288), so a standby has no upstream to choose. It DOES
+    # own its replication slots (#289): a slot is created before every clone/rejoin and the
+    # primary reconciles the set against the live pod set each tick, so the WAL-recycling
+    # gap is closed. Leave it at repmgr until #294 marks native supported and flips the
+    # default.
     mechanism: repmgr
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
     # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane

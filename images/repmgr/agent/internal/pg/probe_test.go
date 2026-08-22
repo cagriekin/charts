@@ -407,3 +407,53 @@ func TestSlotHelpersRejectBadNamesWithoutQuerying(t *testing.T) {
 		t.Errorf("an invalid name reached psql: %v", ex.sqls)
 	}
 }
+
+// A create that loses a create/create race means the slot now EXISTS, which is the
+// caller's goal -- so it must be reported as success, not failure. The WHERE NOT EXISTS
+// guard is NOT atomic (verified against PostgreSQL 18: 40 of 40 concurrent pairs raced),
+// and there are two legitimate independent creators (a cloning standby and the primary's
+// own reconcile), so this path is genuinely reachable at bootstrap.
+func TestCreatePhysicalSlotToleratesLosingACreateRace(t *testing.T) {
+	dup := &slotExec{out: `ERROR:  replication slot "pg_ha_slot_1" already exists`, err: errors.New("exit status 1")}
+	p := &Prober{Exec: dup}
+	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err != nil {
+		t.Errorf("a lost create race must be success (the slot exists), got %v", err)
+	}
+}
+
+// It must NOT swallow an unrelated failure -- a connection error or a permission denial
+// has to surface, or a primary that cannot create slots at all would look healthy.
+func TestCreatePhysicalSlotPropagatesUnrelatedErrors(t *testing.T) {
+	for _, out := range []string{
+		"psql: error: connection to server failed: Connection refused",
+		"ERROR:  permission denied for function pg_create_physical_replication_slot",
+		"ERROR:  all replication slots are in use",
+		"",
+	} {
+		p := &Prober{Exec: &slotExec{out: out, err: errors.New("exit status 1")}}
+		if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err == nil {
+			t.Errorf("error %q was swallowed; only a duplicate-slot race may be treated as success", out)
+		}
+	}
+}
+
+func TestIsDuplicateSlotIsNarrow(t *testing.T) {
+	if IsDuplicateSlot("anything", nil) {
+		t.Error("a nil error is not a duplicate-slot outcome")
+	}
+	if !IsDuplicateSlot(`ERROR:  replication slot "x" already exists`, errors.New("exit 1")) {
+		t.Error("the real PostgreSQL duplicate-slot message was not recognised")
+	}
+	// Both halves are required, so an unrelated "already exists" (a table, a role, a
+	// database) cannot be mistaken for a slot race.
+	for _, out := range []string{
+		`ERROR:  relation "foo" already exists`,
+		`ERROR:  role "repmgr" already exists`,
+		`ERROR:  database "x" already exists`,
+		"replication slot is active",
+	} {
+		if IsDuplicateSlot(out, errors.New("exit 1")) {
+			t.Errorf("IsDuplicateSlot(%q) = true, want false", out)
+		}
+	}
+}

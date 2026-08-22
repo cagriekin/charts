@@ -353,24 +353,53 @@ func (p *Prober) PhysicalSlots(ctx context.Context, ci ConnInfo) ([]SlotState, e
 	return slots, nil
 }
 
-// CreatePhysicalSlot creates a physical replication slot, idempotently (#289).
+// CreatePhysicalSlot creates a physical replication slot if it does not already exist
+// (#289).
 //
-// The WHERE NOT EXISTS guard makes a re-run a silent no-op instead of the error
-// pg_create_physical_replication_slot raises on a duplicate name. That matters because
-// this runs on every primary tick and before every clone: an unguarded create would
-// either need caller-side error-string matching (the fragile pattern #289 exists to
-// retire) or would log a spurious failure forever once the slot exists.
+// Two layers, because one is not enough:
 //
-// name is validated by the caller (validSlotName); it is interpolated into SQL, so an
-// unvalidated name would be an injection vector.
+//   - The WHERE NOT EXISTS guard makes the ordinary repeat call a silent no-op rather than
+//     the duplicate-name error pg_create_physical_replication_slot raises. This runs on
+//     every primary tick, so without it the log would carry a spurious failure forever
+//     once the slot exists.
+//   - IsDuplicateSlot on the returned error, because that guard is NOT atomic. Verified
+//     against PostgreSQL 18: two callers racing the same not-yet-existing name both pass
+//     the NOT EXISTS check and one loses with "already exists" -- reproducibly, in 40 of
+//     40 concurrent pairs. Two legitimate, independent creators exist (a cloning standby
+//     creating its own slot, and the primary's own periodic reconcile), so this race is
+//     reachable at bootstrap and must not surface as a failure.
+//
+// "The slot exists" is the caller's goal, and both paths achieve it, so both are success.
+//
+// name is validated before interpolation; it is interpolated into SQL, so an unvalidated
+// name would be an injection vector.
 func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name string) error {
 	if err := validSlotName(name); err != nil {
 		return err
 	}
-	_, err := p.psql(ctx, ci, fmt.Sprintf(
+	out, err := p.psql(ctx, ci, fmt.Sprintf(
 		"SELECT pg_create_physical_replication_slot('%s') "+
 			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '%s');", name, name))
+	if err != nil && IsDuplicateSlot(out, err) {
+		return nil
+	}
 	return err
+}
+
+// IsDuplicateSlot reports whether a failed slot create lost a create/create race, i.e. the
+// slot now exists -- which is the outcome the caller wanted (#289).
+//
+// Matched on message text because psql surfaces the server error only as combined output
+// plus a non-zero exit status; there is no SQLSTATE to read through this transport. Kept
+// narrow (the literal phrase PostgreSQL uses for duplicate_object on a slot) so it cannot
+// swallow an unrelated failure, and exported so the mechanism layer can apply the same
+// judgement to its own clone-time create without duplicating the string.
+func IsDuplicateSlot(out string, err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(out + " " + err.Error())
+	return strings.Contains(s, "already exists") && strings.Contains(s, "replication slot")
 }
 
 // DropPhysicalSlotIfInactive drops a physical slot only when it is not active (#289).

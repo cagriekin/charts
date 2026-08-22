@@ -75,9 +75,12 @@
 - **The agent owns physical replication slot lifecycle in native mode (#289).** Inherited
   from pg's symlinked agent/templates. repmgr mode is untouched (repmgr keeps owning slots
   there). Under `mechanism: native` the agent creates `pg_ha_slot_<ordinal>` on the upstream
-  before every clone (so `pg_basebackup` streams through it and no WAL gap can open),
-  reconciles slots against the expected pod set on every primary tick, and drops orphans --
-  never an active one, and never while paused. Three new metrics plus two `PrometheusRule`
+  before every clone and rejoin (so `pg_basebackup`/`pg_rewind` stream through it and no WAL
+  gap can open), reconciles slots on every primary tick, and drops orphans -- never an
+  active one, never one belonging to a pod that still exists (decided from the live
+  Kubernetes pod list, not the render-time `REPMGR_NODE_COUNT`, which is stale on a
+  not-yet-rolled pod during a scale-up), and never while paused. `cascadingReplication` is
+  rejected at render time together with `native`. Three new metrics plus two `PrometheusRule`
   alerts (`PGHAReplicationSlotRetainingWAL`, `PGHAReplicationSlotInactive`) make an
   orphaned slot -- which otherwise pins WAL and fills the volume with no error until the
   disk is full -- alertable. New value:

@@ -536,3 +536,92 @@ func TestNativeSlotCreatePassesPasswordViaEnvNotArgv(t *testing.T) {
 		}
 	}
 }
+
+// Losing a create/create race means the slot exists, so the clone must proceed rather than
+// abort. Two legitimate creators exist (this cloning standby and the primary's own
+// reconcile), and the WHERE NOT EXISTS guard is not atomic -- verified against PostgreSQL
+// 18, 40 of 40 concurrent pairs raced.
+func TestNativeCloneProceedsWhenTheSlotCreateLosesARace(t *testing.T) {
+	fr := &fakeRunner{failOn: "pg_create_physical_replication_slot",
+		failOut: `ERROR:  replication slot "pg_ha_slot_1" already exists`}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	if err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Clone aborted on a lost create race, but the slot exists: %v", err)
+	}
+	var ranBackup bool
+	for _, c := range fr.calls {
+		if strings.HasSuffix(c.name, "pg_basebackup") {
+			ranBackup = true
+		}
+	}
+	if !ranBackup {
+		t.Error("Clone did not run pg_basebackup after the (benign) duplicate-slot error")
+	}
+}
+
+// A rewind-based rejoin streams from the target just like a clone does, so it must also
+// guarantee its slot exists first -- otherwise it relies on the new primary's reconcile
+// having already run, which is "almost always" rather than a guarantee.
+func TestNativeRejoinForceRewindEnsuresItsSlotOnTheTarget(t *testing.T) {
+	fr := &fakeRunner{}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_2")
+	if err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("RejoinForceRewind: %v", err)
+	}
+	var rewindIdx, createIdx = -1, -1
+	for i, c := range fr.calls {
+		joined := strings.Join(c.args, " ")
+		if strings.HasSuffix(c.name, "pg_rewind") {
+			rewindIdx = i
+		}
+		if strings.HasSuffix(c.name, "psql") && strings.Contains(joined, "pg_create_physical_replication_slot") {
+			createIdx = i
+			if !strings.Contains(joined, "pg-0.hl") {
+				t.Errorf("slot must be created on the rewind TARGET: %v", c.args)
+			}
+		}
+	}
+	if rewindIdx < 0 {
+		t.Fatal("never ran pg_rewind")
+	}
+	if createIdx < 0 {
+		t.Fatal("RejoinForceRewind did not ensure its slot on the target -- a rejoining standby can stream slotless")
+	}
+	if createIdx < rewindIdx {
+		t.Errorf("slot created before the rewind (idx %d < %d); it must follow the rewind and precede the Follow", createIdx, rewindIdx)
+	}
+}
+
+// A failed rewind must NOT create a slot: the node is about to re-clone instead, and
+// Clone does its own slot handling.
+func TestNativeRejoinDoesNotTouchSlotsWhenTheRewindFails(t *testing.T) {
+	fr := &fakeRunner{failOn: "--target-pgdata", failOut: "target server must be shut down cleanly"}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_2")
+	if err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err == nil {
+		t.Fatal("want an error from a failed rewind")
+	}
+	for _, c := range fr.calls {
+		if strings.Contains(strings.Join(c.args, " "), "pg_create_physical_replication_slot") {
+			t.Errorf("created a slot despite the rewind failing: %v", c.args)
+		}
+	}
+}
+
+// The two validSlotName copies (this one and internal/pg's) must stay in agreement --
+// mechanism deliberately does not import internal/pg, so nothing but a mirrored test
+// catches a drift between them.
+func TestMechanismValidSlotNameMatchesTheProbeGuard(t *testing.T) {
+	for _, n := range []string{
+		"", "bad; name", "pg_ha_slot_1'; DROP TABLE x; --", "PG_HA_SLOT_1",
+		"pg-ha-slot-1", "pg ha slot 1", strings.Repeat("a", 64),
+	} {
+		if err := validSlotName(n); err == nil {
+			t.Errorf("validSlotName(%q) = nil, want an error", n)
+		}
+	}
+	for _, n := range []string{"pg_ha_slot_0", "pg_ha_slot_12", "repmgr_slot_1001", strings.Repeat("a", 63)} {
+		if err := validSlotName(n); err != nil {
+			t.Errorf("validSlotName(%q) = %v, want nil", n, err)
+		}
+	}
+}

@@ -1252,9 +1252,17 @@ func (a *agent) cleanupGhostNodes(ctx context.Context) {
 //     after a promote the surviving standbys will follow this node within a tick. Waiting
 //     to observe them first would leave every Follow racing slot creation, which is the
 //     ordering the issue calls out. This is also why the call sits ahead of the routing
-//     switch in the Promote path.
-//   - DROP every orphan (see orphanSlot). The drop refuses an active slot in SQL, so a
-//     slot someone is still streaming through survives even if the name looks reclaimable.
+//     switch in the Promote path. Over-creating is harmless (an unused slot for an ordinal
+//     that never appears is reclaimed by the drop pass below); under-creating is not.
+//   - DROP every orphan (see orphanSlot), decided against the LIVE pod set read from the
+//     API rather than NodeCount -- see orphanSlot for why that distinction is load-bearing.
+//     The drop additionally refuses an active slot in SQL, so a slot someone is streaming
+//     through survives even if the name and pod set both say reclaimable.
+//
+// A failed pod list SKIPS the drop pass entirely rather than falling back to NodeCount:
+// without knowing what exists, the only safe answer is to reclaim nothing this tick and
+// retry on the next one. Creation still runs, because creating a slot that turns out to be
+// unnecessary costs nothing but a later drop.
 //
 // Best-effort per slot: a failure is logged and retried next tick rather than aborting the
 // rest, because a single unreachable/locked slot must not block reclaiming the others --
@@ -1294,8 +1302,16 @@ func (a *agent) reconcileSlots(ctx context.Context) {
 		a.log.Info("created replication slot for an expected standby", "slot", name)
 	}
 
+	live, err := a.livePodOrdinals(ctx)
+	if err != nil {
+		// No authoritative view of what exists -> reclaim nothing. Dropping on a stale or
+		// guessed pod set is how a needed slot gets destroyed; an orphan surviving one more
+		// tick costs only WAL, and the alert covers a sustained breach.
+		a.log.Warn("list live pods for slot reconcile; skipping the drop pass this tick", "err", err)
+		return
+	}
 	for _, s := range slots {
-		if !orphanSlot(s.Name, a.cfg.PodName, a.cfg.NodeCount) {
+		if !orphanSlot(s.Name, a.cfg.PodName, live) {
 			continue
 		}
 		dropped, err := a.prober.DropPhysicalSlotIfInactive(ctx, self, s.Name)
@@ -1308,6 +1324,27 @@ func (a *agent) reconcileSlots(ctx context.Context) {
 				"slot", s.Name, "retained_wal_bytes", s.RetainedWALBytes)
 		}
 	}
+}
+
+// livePodOrdinals reads the StatefulSet's actual pod set from the API and returns the set
+// of ordinals present (#289).
+//
+// The API, not REPMGR_NODE_COUNT: that env var is baked into each pod at render time, so
+// during a scale-up rollout it is stale on every pod that has not rolled yet -- see
+// orphanSlot. A pod whose name carries no parseable ordinal is ignored rather than failing
+// the whole read; it cannot own an agent-minted slot either way.
+func (a *agent) livePodOrdinals(ctx context.Context) (map[int]bool, error) {
+	names, err := a.kube.ListPodNames(ctx, a.cfg.PodSelector)
+	if err != nil {
+		return nil, err
+	}
+	live := make(map[int]bool, len(names))
+	for _, n := range names {
+		if ord, ok := podOrdinal(n); ok {
+			live[ord] = true
+		}
+	}
+	return live, nil
 }
 
 // slotMetrics reduces the observed slots to what the metrics surface exports (#289):
@@ -1494,44 +1531,75 @@ func podOrdinal(pod string) (int, bool) {
 	return n, true
 }
 
-// orphanSlot decides whether the primary may drop slot on the strength of its NAME alone
-// (#289). Activity is NOT considered here -- the drop itself refuses an active slot
-// atomically in SQL, which is both safer and race-free.
+// orphanSlot decides whether the primary may drop slot on the strength of its NAME and
+// the LIVE POD SET (#289). Activity is not considered here -- the drop itself refuses an
+// active slot atomically in SQL, which is both safer and race-free.
 //
-// Three cases are reclaimable:
-//   - an agent-minted slot whose ordinal is at or above nodeCount: the pod it belonged to
-//     was removed by a scale-down, so no one will ever reattach (the slot-side twin of the
-//     #139 ghost row, and the one with real consequences)
+// liveOrdinals is every pod ordinal the Kubernetes API currently reports for this
+// StatefulSet, and it -- not REPMGR_NODE_COUNT -- is the authority on what exists. That
+// distinction is the whole safety argument here:
+//
+//   - NodeCount is read once at process boot from an env var baked into the pod template,
+//     so during a scale-up rollout every pod that has not rolled yet (including, typically,
+//     the ordinal-0 primary, which the StatefulSet rolls LAST) still holds the OLD count.
+//     Deciding ownership from it would make the stale primary classify a brand-new
+//     standby's just-created slot as a scale-down ghost and drop it -- while that standby
+//     is briefly inactive between pg_basebackup finishing and its postmaster reattaching
+//     -- reintroducing exactly the WAL gap this whole change exists to close.
+//   - A pod that is mid-restart, still starting, or has never gossiped is present in the
+//     live pod list, so its slot is protected. Inactivity alone is NOT evidence that a
+//     consumer is gone for good; it is also what a routine restart looks like.
+//
+// Reclaimable, and only when the ordinal has no live pod:
+//   - an agent-minted slot for a departed ordinal: the slot-side twin of the #139 ghost
+//     row, and the one with real consequences (it pins WAL until the volume fills)
+//   - a legacy repmgr_slot_* for a departed ordinal: native mode never streams through one,
+//     so it is dead weight -- this is what keeps a repmgr->native migration (#292) from
+//     leaving a permanent orphan. Scoped to departed ordinals for the same reason as above:
+//     a LIVE node's repmgr slot may still be carrying its stream mid-migration.
+//
+// Plus one case that does not depend on the pod set at all:
 //   - an agent-minted slot for THIS pod: the primary does not stream from itself, so its
-//     own slot is by definition unused while it holds the lease
-//   - a legacy repmgr_slot_*: native mode never uses one (see legacySlotPrefix)
+//     own slot is unused while it holds the lease, even though its pod plainly exists.
 //
-// Everything else -- an unrecognised name, or a live peer's slot -- is left alone.
-// nodeCount <= 0 reclaims nothing: a zero/misconfigured count must never make every
-// live standby's slot look like an orphan.
-func orphanSlot(name, selfPod string, nodeCount int) bool {
-	if nodeCount <= 0 {
+// Everything else -- an unrecognised name, or any live peer's slot -- is left alone. An
+// empty liveOrdinals reclaims nothing but self: a failed or empty pod list must never make
+// every standby's slot look orphaned.
+func orphanSlot(name, selfPod string, liveOrdinals map[int]bool) bool {
+	selfOrd, selfOK := podOrdinal(selfPod)
+
+	ord, ok := slotOrdinal(name)
+	if !ok {
+		return false // not a name this agent minted, and not a legacy repmgr slot
+	}
+	// This pod's own slot: unused while it is the primary, regardless of liveness.
+	if selfOK && ord == selfOrd && strings.HasPrefix(name, slotPrefix) {
+		return true
+	}
+	if len(liveOrdinals) == 0 {
 		return false
+	}
+	return !liveOrdinals[ord]
+}
+
+// slotOrdinal extracts the pod ordinal from a slot name the agent recognises as ownable --
+// its own pg_ha_slot_<ordinal> or a legacy repmgr_slot_<node_id> (whose id is
+// nodeIDBase+ordinal). Reports false for anything else, which is what keeps an operator's
+// own slot, or a logical slot backing a subscription, permanently out of reach.
+func slotOrdinal(name string) (int, bool) {
+	if rest, ok := strings.CutPrefix(name, slotPrefix); ok {
+		n, err := strconv.Atoi(rest)
+		if err != nil || n < 0 {
+			return 0, false
+		}
+		return n, true
 	}
 	if rest, ok := strings.CutPrefix(name, legacySlotPrefix); ok {
-		if _, err := strconv.Atoi(rest); err == nil {
-			return true
+		n, err := strconv.Atoi(rest)
+		if err != nil || n < nodeIDBase {
+			return 0, false
 		}
-		return false
+		return n - nodeIDBase, true
 	}
-	rest, ok := strings.CutPrefix(name, slotPrefix)
-	if !ok {
-		return false
-	}
-	ord, err := strconv.Atoi(rest)
-	if err != nil {
-		return false
-	}
-	if ord >= nodeCount {
-		return true
-	}
-	if selfOrd, ok := podOrdinal(selfPod); ok && ord == selfOrd {
-		return true
-	}
-	return false
+	return 0, false
 }

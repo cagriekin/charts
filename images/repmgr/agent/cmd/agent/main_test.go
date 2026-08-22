@@ -763,50 +763,95 @@ func TestSlotNameForProducesAValidSlotName(t *testing.T) {
 	}
 }
 
-func TestOrphanSlotReclaimsScaledDownAndLegacySlotsOnly(t *testing.T) {
+func TestOrphanSlotReclaimsOnlyDepartedOrdinalsAndSelf(t *testing.T) {
 	const self = "pg-0"
+	live3 := map[int]bool{0: true, 1: true, 2: true} // a 3-pod StatefulSet
 	for _, tc := range []struct {
-		name      string
-		slot      string
-		nodeCount int
-		want      bool
-		why       string
+		name string
+		slot string
+		live map[int]bool
+		want bool
+		why  string
 	}{
-		// Scale-down ghosts: the pod is gone, nobody will ever reattach.
-		{"ghost above the live range", "pg_ha_slot_3", 3, true, "ordinal 3 >= nodeCount 3"},
-		{"ghost far above", "pg_ha_slot_9", 2, true, "ordinal 9 >= nodeCount 2"},
+		// Departed ordinals: the pod is gone, nobody will ever reattach.
+		{"ghost above the live range", "pg_ha_slot_3", live3, true, "no pod-3 exists"},
+		{"ghost far above", "pg_ha_slot_9", live3, true, "no pod-9 exists"},
 		// Live peers: their standby is expected to stream through this slot.
-		{"live peer", "pg_ha_slot_1", 3, false, "ordinal 1 is inside the live range"},
-		{"highest live peer", "pg_ha_slot_2", 3, false, "ordinal 2 is the last live ordinal"},
+		{"live peer", "pg_ha_slot_1", live3, false, "pod-1 exists"},
+		{"highest live peer", "pg_ha_slot_2", live3, false, "pod-2 exists"},
 		// The primary does not stream from itself, so its own slot is unused.
-		{"own slot while primary", "pg_ha_slot_0", 3, true, "self ordinal"},
-		// Legacy repmgr slots: native mode never streams through one.
-		{"legacy repmgr slot", "repmgr_slot_1001", 3, true, "native never uses repmgr_slot_*"},
-		{"legacy repmgr slot, live ordinal", "repmgr_slot_1000", 3, true, "still unused under native"},
+		{"own slot while primary", "pg_ha_slot_0", live3, true, "self ordinal"},
+		// Legacy repmgr slots are reclaimable ONLY for departed ordinals -- a live node
+		// may still be carrying its stream through one mid-migration (#292).
+		{"legacy slot, departed ordinal", "repmgr_slot_1003", live3, true, "no pod-3 exists"},
+		{"legacy slot, LIVE ordinal", "repmgr_slot_1001", live3, false, "pod-1 exists; may still be streaming"},
+		{"legacy slot for self", "repmgr_slot_1000", live3, false, "pod-0 exists; only agent-minted self slots are reclaimed"},
 		// Anything the agent did not mint is left strictly alone.
-		{"operator's own slot", "my_own_slot", 3, false, "not agent-minted"},
-		{"logical-looking slot", "debezium_cdc", 3, false, "not agent-minted"},
-		{"prefix but no ordinal", "pg_ha_slot_abc", 3, false, "unparseable ordinal"},
-		{"legacy prefix but no ordinal", "repmgr_slot_abc", 3, false, "unparseable ordinal"},
-		// A zero/misconfigured count must never make every live slot look orphaned.
-		{"zero nodeCount", "pg_ha_slot_9", 0, false, "nodeCount <= 0 reclaims nothing"},
-		{"negative nodeCount", "pg_ha_slot_9", -1, false, "nodeCount <= 0 reclaims nothing"},
+		{"operator's own slot", "my_own_slot", live3, false, "not agent-minted"},
+		{"logical-looking slot", "debezium_cdc", live3, false, "not agent-minted"},
+		{"prefix but no ordinal", "pg_ha_slot_abc", live3, false, "unparseable ordinal"},
+		{"legacy prefix but no ordinal", "repmgr_slot_abc", live3, false, "unparseable ordinal"},
+		{"legacy id below the base", "repmgr_slot_7", live3, false, "not a node_id this agent assigned"},
+		// An empty/failed pod list must reclaim nothing but self -- never treat every
+		// standby's slot as orphaned because the API read came back empty.
+		{"empty pod list, peer slot", "pg_ha_slot_1", map[int]bool{}, false, "no authoritative pod set"},
+		{"empty pod list, ghost slot", "pg_ha_slot_9", map[int]bool{}, false, "no authoritative pod set"},
+		{"empty pod list, legacy slot", "repmgr_slot_1009", map[int]bool{}, false, "no authoritative pod set"},
+		{"empty pod list, own slot", "pg_ha_slot_0", map[int]bool{}, true, "self is unused regardless of the pod set"},
 	} {
-		if got := orphanSlot(tc.slot, self, tc.nodeCount); got != tc.want {
-			t.Errorf("%s: orphanSlot(%q, %q, %d) = %v, want %v (%s)",
-				tc.name, tc.slot, self, tc.nodeCount, got, tc.want, tc.why)
+		if got := orphanSlot(tc.slot, self, tc.live); got != tc.want {
+			t.Errorf("%s: orphanSlot(%q, %q, %v) = %v, want %v (%s)",
+				tc.name, tc.slot, self, tc.live, got, tc.want, tc.why)
 		}
+	}
+}
+
+// The scale-up regression this guards (review finding): REPMGR_NODE_COUNT is baked into
+// each pod at render time, so during a scale-up rollout the not-yet-rolled primary holds
+// the OLD count. Deciding ownership from the LIVE pod set instead means a brand-new
+// standby's just-created slot survives even while the primary's own NodeCount still says
+// that ordinal should not exist -- and it is briefly inactive between pg_basebackup
+// finishing and its postmaster reattaching, which is exactly when a drop would land.
+func TestOrphanSlotSurvivesAScaleUpWithAStalePrimaryNodeCount(t *testing.T) {
+	// Scaled 2 -> 3: pod-2 now exists, but the primary still believes NodeCount == 2.
+	live := map[int]bool{0: true, 1: true, 2: true}
+	if orphanSlot("pg_ha_slot_2", "pg-0", live) {
+		t.Error("pg_ha_slot_2 reclaimed during a scale-up: a live standby's slot must never be dropped, even when the primary's NodeCount is stale")
 	}
 }
 
 // A promoted pod's own slot becomes reclaimable, and the ex-primary's does not: ownership
 // follows whoever currently holds the lease, so the set shifts on failover.
 func TestOrphanSlotSelfSlotFollowsTheCurrentPrimary(t *testing.T) {
-	if !orphanSlot("pg_ha_slot_1", "pg-1", 3) {
+	live := map[int]bool{0: true, 1: true, 2: true}
+	if !orphanSlot("pg_ha_slot_1", "pg-1", live) {
 		t.Error("pg-1 as primary should reclaim its own slot pg_ha_slot_1")
 	}
-	if orphanSlot("pg_ha_slot_0", "pg-1", 3) {
+	if orphanSlot("pg_ha_slot_0", "pg-1", live) {
 		t.Error("pg-1 as primary must NOT reclaim pg-0's slot -- pg-0 is a live standby streaming through it")
+	}
+}
+
+func TestSlotOrdinalRecognisesOnlyOwnableNames(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ord  int
+		ok   bool
+	}{
+		{"pg_ha_slot_0", 0, true},
+		{"pg_ha_slot_12", 12, true},
+		{"repmgr_slot_1000", 0, true},
+		{"repmgr_slot_1002", 2, true},
+		{"repmgr_slot_999", 0, false}, // below nodeIDBase: not our numbering
+		{"pg_ha_slot_-1", 0, false},
+		{"pg_ha_slot_", 0, false},
+		{"my_own_slot", 0, false},
+		{"", 0, false},
+	} {
+		ord, ok := slotOrdinal(tc.name)
+		if ok != tc.ok || (ok && ord != tc.ord) {
+			t.Errorf("slotOrdinal(%q) = (%d, %v), want (%d, %v)", tc.name, ord, ok, tc.ord, tc.ok)
+		}
 	}
 }
 

@@ -88,23 +88,45 @@
     and the walreceiver attaching. Created idempotently via SQL rather than `pg_basebackup
     -C`: `-C` fails outright when the slot already exists (verified), which is the normal
     case for a re-clone -- so `-C` would break exactly the retry path that matters most.
-    `primary_slot_name` in the managed fragment holds the slot for the ongoing stream.
+    `primary_slot_name` in the managed fragment holds the slot for the ongoing stream. A
+    rewind-based rejoin ensures its slot the same way, rather than relying on the new
+    primary's reconcile having already run. The `WHERE NOT EXISTS` create guard is *not*
+    atomic (verified: 40 of 40 concurrent pairs race on PostgreSQL 18) and two legitimate
+    independent creators exist, so losing that race is treated as success -- the slot
+    exists, which is the goal -- while any unrelated failure still surfaces.
   - **Reconcile on every primary tick.** The lease holder creates a slot for every expected
     peer ordinal and drops orphans. Creation is driven by the *expected* pod set
     (`REPMGR_NODE_COUNT`), not observed standbys, because a slot must exist before its
     standby streams; on the `Promote` path it is sequenced **ahead of the routing switch**,
     so surviving standbys never race slot creation when they follow the new primary.
+  - **Dropping is decided from the LIVE pod set read from the Kubernetes API**, never from
+    `REPMGR_NODE_COUNT`. That variable is baked into each pod's env at render time, so
+    during a scale-up rollout every pod that has not rolled yet -- including, typically, the
+    ordinal-0 primary, which the StatefulSet rolls last -- still holds the OLD count.
+    Deciding ownership from it would make the stale primary classify a brand-new standby's
+    just-created slot as a scale-down ghost and drop it, precisely while that standby is
+    briefly inactive between `pg_basebackup` finishing and its postmaster reattaching --
+    reintroducing the WAL gap this change exists to close. A failed pod list skips the drop
+    pass for that tick rather than falling back to a guess.
   - **Never drops an active slot.** The `AND NOT active` predicate lives in the SQL, making
     the guard atomic with the drop -- a read-then-decide in Go would leave a window for a
     standby to reattach in between, and dropping an in-use slot breaks its replication.
     Verified live against a real streaming standby: the drop is refused, no error, and the
-    standby keeps streaming. Reclaimed cases are a scale-down ghost (ordinal at or above
-    `nodeCount`), the primary's own slot (it does not stream from itself), and a legacy
-    `repmgr_slot_*` (native never uses one, so an inactive one is pure dead weight -- this
-    is what keeps a future repmgr->native migration, #292, from leaving a permanent orphan).
-    A zero or misconfigured `nodeCount` reclaims nothing.
+    standby keeps streaming. Reclaimed cases are an agent-minted slot for a **departed**
+    ordinal, the primary's own slot (it does not stream from itself), and a legacy
+    `repmgr_slot_*` for a departed ordinal -- native never streams through one, so it is
+    dead weight, and this is what keeps a future repmgr->native migration (#292) from
+    leaving a permanent orphan. Legacy slots are scoped to departed ordinals for the same
+    reason live ones are: inactivity alone is not evidence a consumer is gone, it is also
+    what a routine restart looks like, so a LIVE node's repmgr slot is left alone even
+    mid-migration. An empty or failed pod list reclaims nothing but self.
   - **Only the lease holder mutates slots**, and `Decide` returns `NoOp` before any primary
     branch while paused, so a maintenance window cannot drop anything.
+  - **`cascadingReplication` + `native` is rejected at render time.** Cascading makes a
+    standby an upstream, but slot reconcile runs only on the primary, so a cascading child
+    would name a slot that does not exist on its actual upstream and its walreceiver would
+    refuse to start. Both flags are independently opt-in, so this forbids nothing that
+    worked before.
   - **Observability.** Three new gauges -- `pg_ha_agent_replication_slots`,
     `..._replication_slots_inactive`, `..._replication_slot_max_retained_wal_bytes` -- plus
     two `PrometheusRule` alerts: `PGHAReplicationSlotRetainingWAL` (critical, over
