@@ -951,7 +951,7 @@ Two ways to provide etcd:
 
 The agent reads its primary marker and publishes gossip through the apiserver, so a cluster whose egress policy denies pod traffic to the apiserver **never elects a leader and never gets a serving primary** — while every pod, Service and policy looks correctly configured. The symptom is a repeating pair of warnings against the apiserver ClusterIP followed by `action=Wait ... no leader yet`:
 
-```
+```text
 level=WARN msg="read marker" err="... dial tcp 10.96.0.1:443: i/o timeout"
 level=WARN msg="publish status (gossip)" err="... dial tcp 10.96.0.1:443: i/o timeout"
 level=INFO msg="reconcile decision" hold_lease=false action=Wait reason="... no leader yet"
