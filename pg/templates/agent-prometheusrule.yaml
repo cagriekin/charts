@@ -73,6 +73,28 @@ spec:
           annotations:
             summary: "pg-ha-agent fencing repeatedly ({{ include "pg.fullname" . }})"
             description: "More than 2 fences in 15m suggests instability (intermittent apiserver/node slowness or a flapping primary)."
+        {{- /* #289: the slot alerts. An orphaned physical replication slot pins WAL on
+               the primary forever and fills the volume, and raises no error until the
+               disk is full -- these two are what make that silent failure alertable.
+               Scoped to the primary implicitly: only the lease holder publishes non-zero
+               slot gauges (reconcileSlots runs on the primary branches), so max() picks
+               the primary's view without needing a role label. */}}
+        - alert: PGHAReplicationSlotRetainingWAL
+          expr: max(pg_ha_agent_replication_slot_max_retained_wal_bytes{ {{ $m }} }) > {{ int64 (dig "prometheusRule" "slotRetainedWALBytes" 17179869184 (.Values.repmgr.agent.monitoring | default dict)) }}
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: "A replication slot is retaining too much WAL ({{ include "pg.fullname" . }})"
+            description: "Some physical replication slot has held back more than {{ int64 (dig "prometheusRule" "slotRetainedWALBytes" 17179869184 (.Values.repmgr.agent.monitoring | default dict)) }} bytes of WAL for 15m. WAL cannot be recycled while a slot needs it, so the data volume will fill. Find it with: SELECT slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots ORDER BY 3 DESC; -- then drop it if its consumer is gone for good (pg_drop_replication_slot)."
+        - alert: PGHAReplicationSlotInactive
+          expr: max(pg_ha_agent_replication_slots_inactive{ {{ $m }} }) > 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "A replication slot has no consumer ({{ include "pg.fullname" . }})"
+            description: "At least one physical replication slot has had no active consumer for 1h, so it is accumulating WAL. Expected briefly while a standby restarts or re-clones; sustained means a standby is down or the slot is orphaned. The agent reclaims slots it owns automatically -- a persistent one is either an operator-created slot or a standby that needs attention."
         - alert: PGHAAgentPausedTooLong
           expr: max(pg_ha_agent_is_paused{ {{ $m }} }) == 1
           for: 1h

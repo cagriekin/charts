@@ -31,7 +31,27 @@ type Metrics struct {
 	controlRejected        atomic.Int64
 	controlIntents         atomic.Int64
 	controlRestoreRequests atomic.Int64
-	now                    func() time.Time
+	// Physical replication slots as the primary last observed them (#289). An orphaned
+	// slot pins WAL on the primary forever and fills the volume, and nothing else reports
+	// it -- the failure is silent until the disk is full, which is precisely why it needs
+	// a metric and an alert rather than only a log line.
+	slotsTotal              atomic.Int64
+	slotsInactive           atomic.Int64
+	slotMaxRetainedWALBytes atomic.Int64
+	now                     func() time.Time
+}
+
+// SlotStats is the aggregate slot picture the primary publishes each tick (#289).
+//
+// Aggregates, not per-slot labels: this metrics surface is hand-written Prometheus text
+// with no per-series lifecycle, so a label per slot would leak a stale series every time
+// a slot is dropped -- and the question worth alerting on ("is some slot holding back too
+// much WAL?") is answered by the maximum. Per-slot identity stays in the agent's logs and
+// in pg_replication_slots.
+type SlotStats struct {
+	Total               int64
+	Inactive            int64
+	MaxRetainedWALBytes int64
 }
 
 // New returns Metrics with the heartbeat primed so the agent is live at startup.
@@ -65,6 +85,13 @@ func (m *Metrics) IncControlRequest()        { m.controlRequests.Add(1) }
 func (m *Metrics) IncControlRejected()       { m.controlRejected.Add(1) }
 func (m *Metrics) IncControlIntent()         { m.controlIntents.Add(1) }
 func (m *Metrics) IncControlRestoreRequest() { m.controlRestoreRequests.Add(1) }
+
+// SetSlots publishes the primary's observed physical replication slots (#289).
+func (m *Metrics) SetSlots(s SlotStats) {
+	m.slotsTotal.Store(s.Total)
+	m.slotsInactive.Store(s.Inactive)
+	m.slotMaxRetainedWALBytes.Store(s.MaxRetainedWALBytes)
+}
 
 // Beat records that the reconcile loop ran; call it each tick.
 func (m *Metrics) Beat() { m.lastBeatUnixNs.Store(m.now().UnixNano()) }
@@ -119,6 +146,9 @@ func (m *Metrics) write(w io.Writer) {
 		{"pg_ha_agent_control_rejected_total", "Control-API requests refused by authentication or authorization.", "counter", m.controlRejected.Load()},
 		{"pg_ha_agent_control_intents_total", "Node-local control-API operations handed to the reconcile loop.", "counter", m.controlIntents.Load()},
 		{"pg_ha_agent_control_restore_requests_total", "Restores triggered through the control API.", "counter", m.controlRestoreRequests.Load()},
+		{"pg_ha_agent_replication_slots", "Physical replication slots on this primary.", "gauge", m.slotsTotal.Load()},
+		{"pg_ha_agent_replication_slots_inactive", "Physical replication slots with no active consumer (each pins WAL).", "gauge", m.slotsInactive.Load()},
+		{"pg_ha_agent_replication_slot_max_retained_wal_bytes", "Largest WAL volume retained by any one physical replication slot.", "gauge", m.slotMaxRetainedWALBytes.Load()},
 	} {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %d\n", x.name, x.help, x.name, x.typ, x.name, x.val)
 	}

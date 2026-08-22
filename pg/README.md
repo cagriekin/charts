@@ -340,13 +340,40 @@ The agent also fronts the read/write split: `pgpool` (if enabled) points at the 
 
 repmgr ([upstream development has stalled](https://github.com/EnterpriseDB/repmgr)) is the agent's only supported replication mechanic today, but the `Mechanism` interface it is driven through (`images/repmgr/agent/internal/mechanism`) is swappable, and the reconcile loop imports only that interface — never repmgr directly. `repmgr.agent.mechanism: native` selects an alternative that drives PostgreSQL's own tools instead: `pg_ctl promote`, `pg_basebackup`, `pg_rewind`, and `primary_conninfo`/`standby.signal` written directly into an agent-owned config fragment inside `PGDATA`.
 
-**`native` is not usable on a real cluster yet — do not set it in production.** The Lease, the timeline/LSN election, fencing, and Service routing are all unchanged and identical either way (that is the entire point of the `Mechanism` seam), but two things repmgr otherwise provides for free are not yet replaced:
+**`native` is not usable on a real cluster yet — do not set it in production.** The Lease, the timeline/LSN election, fencing, and Service routing are all unchanged and identical either way (that is the entire point of the `Mechanism` seam), but one thing repmgr otherwise provides for free is not yet replaced:
 
 - **No topology source (#288), which currently makes any standby fail outright, not just degrade.** `pg/templates/statefulset.yaml`'s `repmgr-init` init container (`images/repmgr/init-repmgr.sh`) bootstraps every standby's first clone by polling `repmgr.nodes` for the primary to register, before the Go agent (or its `Mechanism.Clone`) ever runs. Native mode's `RegisterPrimary` is a no-op, so that poll times out and the pod sits `Init:CrashLoopBackOff` forever. Verified live: with `postgresql.replicaCount > 0` under `mechanism: native`, the primary comes up fine but every standby is permanently stuck in this state. **`native` is therefore only usable at `postgresql.replicaCount: 0` (a lone primary) until #288 lands** — confirmed working live, including a real `pg_basebackup`-based clone/rejoin/reclone exercised at the unit level (`internal/mechanism`'s shared scenario table).
-- **No replication slot ownership (#289).** Nothing under native mode manages replication slots, so a primary can recycle WAL a standby still needs, the same class of problem [#305](README.md#wal-disk-usage-305) covers for archiving specifically.
 - **The pre-agent stale-primary guard is repmgr-only.** `images/repmgr/entrypoint.sh`'s `primary_safety_guard` runs before the Go agent starts and rejoins/re-clones via the repmgr CLI directly; it has no `MECHANISM` awareness at all. Harmless today because it only acts when a peer is on a strictly newer timeline than this node, which cannot happen under native mode's only supported shape (a lone primary, no peers) -- but it will need to become mechanism-aware as part of #288.
 
-Both are required before `native` is safe to run; `#294` tracks promoting it to supported and eventually default. Until then it exists behind the flag purely to let the mechanics be developed and tested independently of that larger topology/slot work — the `#297` scale-up-race protection (an unregistered node refusing to promote over a registered peer) is a good example of an existing repmgr-mode safety behavior that degrades gracefully rather than needing native-specific code: native mode has no registry to read, so that gate simply never fires, and native promotes on the same criteria repmgr mode would if the registry were empty.
+#288 is required before `native` is safe to run; `#294` tracks promoting it to supported and eventually default. Until then it exists behind the flag purely to let the mechanics be developed and tested independently of that larger topology work — the `#297` scale-up-race protection (an unregistered node refusing to promote over a registered peer) is a good example of an existing repmgr-mode safety behavior that degrades gracefully rather than needing native-specific code: native mode has no registry to read, so that gate simply never fires, and native promotes on the same criteria repmgr mode would if the registry were empty.
+
+#### Replication slot ownership (#289)
+
+Under `mechanism: repmgr`, repmgr creates and attaches physical replication slots itself (`repmgr_slot_<node_id>`), and that is unchanged. Under `mechanism: native` **the agent owns slot lifecycle**, because an unowned slot is the most dangerous loose end in the exit: an orphaned slot pins WAL on the primary forever and fills the data volume, and it raises no error at all until the disk is full.
+
+Slots are named `pg_ha_slot_<pod ordinal>` — ordinal-derived, so a pod restart reattaches to the same slot instead of stranding one and reserving a second, and prefixed so ownership is decidable. The agent creates and drops **only names it minted**; an operator's own slot, or a logical slot backing a subscription, is never touched.
+
+| Phase | Behavior |
+|-------|----------|
+| Before a clone | The slot is created on the upstream *first*, then `pg_basebackup --slot` streams through it — so no WAL gap can open between the base backup starting and the walreceiver attaching. `primary_slot_name` holds it for the ongoing stream. |
+| Every primary tick | The lease holder creates a slot for every **expected** peer ordinal (`replicaCount + 1`, not observed standbys — a slot must exist *before* its standby streams) and drops orphans. |
+| On promote | Slot creation is sequenced **ahead of the routing switch**, so surviving standbys never race slot creation when they follow the new primary. |
+| Active slots | **Never dropped.** The `AND NOT active` predicate is in the SQL, so the guard is atomic with the drop; a read-then-decide would leave a window for a standby to reattach in between. |
+| Paused | No slot mutation at all — `Decide` returns `NoOp` before any primary branch while `pg-ha/pause` is set. |
+
+Reclaimed as orphans: a scale-down ghost (ordinal at or above the live count), the primary's own slot (it does not stream from itself), and a legacy `repmgr_slot_*` (native never uses one, so an inactive one is dead weight — this is what stops a future repmgr→native migration, #292, from leaving a permanent orphan). A zero or misconfigured node count reclaims nothing, so a misread can never make every live standby's slot look orphaned.
+
+**Alerting.** Slot state is exported on the agent's metrics endpoint as `pg_ha_agent_replication_slots`, `pg_ha_agent_replication_slots_inactive`, and `pg_ha_agent_replication_slot_max_retained_wal_bytes`, with two rules under `repmgr.agent.monitoring.prometheusRule.enabled`:
+
+- `PGHAReplicationSlotRetainingWAL` (critical, 15m) — a slot has held back more than `repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes` (default 16Gi). This is the page that turns a silent disk-fill into a signal.
+- `PGHAReplicationSlotInactive` (warning, 1h) — a slot has had no consumer for an hour. Expected briefly during a standby restart or re-clone; sustained means a standby is down or a slot the agent does not own is orphaned.
+
+To find a culprit by hand:
+
+```sql
+SELECT slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+FROM pg_replication_slots ORDER BY 3 DESC;
+```
 
 ### Migrating a repmgrd release (chart 1.x) to 2.0.0
 

@@ -235,3 +235,175 @@ func TestStandbyNodeIDsUnreachable(t *testing.T) {
 		t.Fatal("an unreachable node must return an error")
 	}
 }
+
+// slotExec records the SQL it is asked to run and replies with a canned result, so the
+// slot helpers can be asserted on BOTH the statement they build and the value they parse.
+type slotExec struct {
+	out  string
+	err  error
+	sqls []string
+}
+
+func (s *slotExec) Run(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+	s.sqls = append(s.sqls, args[len(args)-1])
+	return s.out, s.err
+}
+
+func TestPhysicalSlotsParsesNameActiveAndRetainedWAL(t *testing.T) {
+	ex := &slotExec{out: "pg_ha_slot_1|t|0\npg_ha_slot_2|f|16777216"}
+	p := &Prober{Exec: ex}
+	got, err := p.PhysicalSlots(context.Background(), ConnInfo{})
+	if err != nil {
+		t.Fatalf("PhysicalSlots: %v", err)
+	}
+	want := []SlotState{
+		{Name: "pg_ha_slot_1", Active: true, RetainedWALBytes: 0},
+		{Name: "pg_ha_slot_2", Active: false, RetainedWALBytes: 16777216},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d slots, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("slot %d: got %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// Logical slots belong to the operator's subscriptions; the agent must never enumerate
+// them as candidates for its own reconcile.
+func TestPhysicalSlotsQueryExcludesLogicalSlots(t *testing.T) {
+	ex := &slotExec{}
+	p := &Prober{Exec: ex}
+	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{}); err != nil {
+		t.Fatalf("PhysicalSlots: %v", err)
+	}
+	if !strings.Contains(ex.sqls[0], "slot_type = 'physical'") {
+		t.Errorf("query does not filter to physical slots: %s", ex.sqls[0])
+	}
+}
+
+// A NULL restart_lsn (freshly created slot, no WAL reserved yet) must read as 0 rather
+// than erroring the whole listing -- otherwise one new slot hides every other slot's
+// retained WAL.
+func TestPhysicalSlotsEmptyOutputIsNoSlotsNotAnError(t *testing.T) {
+	p := &Prober{Exec: &slotExec{out: ""}}
+	got, err := p.PhysicalSlots(context.Background(), ConnInfo{})
+	if err != nil {
+		t.Fatalf("PhysicalSlots: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %+v, want no slots", got)
+	}
+}
+
+// A malformed row is an error, not a silent skip: silently dropping a row would hide an
+// orphaned slot that is filling the disk.
+func TestPhysicalSlotsMalformedRowIsAnError(t *testing.T) {
+	p := &Prober{Exec: &slotExec{out: "pg_ha_slot_1|t"}}
+	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{}); err == nil {
+		t.Fatal("want an error for a 2-field row, got nil")
+	}
+}
+
+func TestPhysicalSlotsUnparseableRetainedWALIsAnError(t *testing.T) {
+	p := &Prober{Exec: &slotExec{out: "pg_ha_slot_1|t|notanumber"}}
+	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{}); err == nil {
+		t.Fatal("want an error for a non-numeric retained-WAL value, got nil")
+	}
+}
+
+// The create must be idempotent in SQL so a per-tick reconcile does not log a duplicate
+// -name failure forever once the slot exists.
+func TestCreatePhysicalSlotIsIdempotentInSQL(t *testing.T) {
+	ex := &slotExec{}
+	p := &Prober{Exec: ex}
+	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err != nil {
+		t.Fatalf("CreatePhysicalSlot: %v", err)
+	}
+	sql := ex.sqls[0]
+	if !strings.Contains(sql, "pg_create_physical_replication_slot('pg_ha_slot_1')") {
+		t.Errorf("does not create the named slot: %s", sql)
+	}
+	if !strings.Contains(sql, "WHERE NOT EXISTS") {
+		t.Errorf("create is not guarded against an existing slot: %s", sql)
+	}
+}
+
+// "never drop an active slot" must be enforced by the statement itself: a read-then-drop
+// in Go would let a standby reattach in the window between the two.
+func TestDropPhysicalSlotRefusesActiveSlotsInSQL(t *testing.T) {
+	ex := &slotExec{out: ""}
+	p := &Prober{Exec: ex}
+	if _, err := p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9"); err != nil {
+		t.Fatalf("DropPhysicalSlotIfInactive: %v", err)
+	}
+	sql := ex.sqls[0]
+	if !strings.Contains(sql, "NOT active") {
+		t.Errorf("drop is not guarded on inactivity: %s", sql)
+	}
+	if !strings.Contains(sql, "slot_type = 'physical'") {
+		t.Errorf("drop is not restricted to physical slots: %s", sql)
+	}
+}
+
+// An empty result means the slot was already gone or is active -- both are "nothing was
+// dropped", not an error the caller should warn about every tick.
+func TestDropPhysicalSlotReportsWhetherARowWasAffected(t *testing.T) {
+	p := &Prober{Exec: &slotExec{out: ""}}
+	dropped, err := p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9")
+	if err != nil || dropped {
+		t.Errorf("empty result: got dropped=%v err=%v, want false/nil", dropped, err)
+	}
+	p = &Prober{Exec: &slotExec{out: "pg_ha_slot_9"}}
+	dropped, err = p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9")
+	if err != nil || !dropped {
+		t.Errorf("non-empty result: got dropped=%v err=%v, want true/nil", dropped, err)
+	}
+}
+
+func TestDropPhysicalSlotPropagatesQueryErrors(t *testing.T) {
+	p := &Prober{Exec: &slotExec{err: errors.New("boom")}}
+	if _, err := p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9"); err == nil {
+		t.Fatal("want the query error propagated, got nil")
+	}
+}
+
+// Slot names are interpolated into SQL, so anything outside PostgreSQL's own accepted
+// character class must be refused before it reaches the statement.
+func TestSlotNameValidationRejectsInjectionAndAcceptsRealNames(t *testing.T) {
+	bad := []string{
+		"",
+		"pg_ha_slot_1'; DROP TABLE x; --",
+		"pg_ha_slot_1;",
+		"PG_HA_SLOT_1", // upper case: PostgreSQL would reject it too
+		"pg-ha-slot-1",
+		"pg ha slot 1",
+		strings.Repeat("a", 64),
+	}
+	for _, n := range bad {
+		if err := validSlotName(n); err == nil {
+			t.Errorf("validSlotName(%q) = nil, want an error", n)
+		}
+	}
+	for _, n := range []string{"pg_ha_slot_0", "pg_ha_slot_12", "repmgr_slot_1001", strings.Repeat("a", 63)} {
+		if err := validSlotName(n); err != nil {
+			t.Errorf("validSlotName(%q) = %v, want nil", n, err)
+		}
+	}
+}
+
+// The guard must run BEFORE the SQL is built, so a rejected name never reaches psql.
+func TestSlotHelpersRejectBadNamesWithoutQuerying(t *testing.T) {
+	ex := &slotExec{}
+	p := &Prober{Exec: ex}
+	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "bad; name"); err == nil {
+		t.Error("CreatePhysicalSlot accepted an invalid name")
+	}
+	if _, err := p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "bad; name"); err == nil {
+		t.Error("DropPhysicalSlotIfInactive accepted an invalid name")
+	}
+	if len(ex.sqls) != 0 {
+		t.Errorf("an invalid name reached psql: %v", ex.sqls)
+	}
+}

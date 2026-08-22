@@ -29,6 +29,15 @@ type Native struct {
 	DataDir  string // PGDATA
 	PGBindir string // /usr/lib/postgresql/<major>/bin
 	Password string // replication password, supplied to libpq via PGPASSWORD only
+	// SlotName is THIS node's physical replication slot on whatever upstream it streams
+	// from (#289) -- ordinal-derived and stable across restarts, so a pod that restarts
+	// reattaches to the same slot instead of stranding one and reserving a second.
+	//
+	// It names a slot on the UPSTREAM, not locally: Clone creates it there before the base
+	// backup and primary_slot_name makes the walreceiver keep using it. Empty disables slot
+	// use entirely (the pre-#289 behaviour), which keeps the mechanism usable in tests and
+	// for any caller that has no ordinal to derive a name from.
+	SlotName string
 	Now      Clock
 }
 
@@ -39,8 +48,17 @@ type Native struct {
 // per-node location the chart already appends to at initdb/postStart, it survives restarts
 // with the data it describes, and it keeps the agent's fragment clear of both the operator's
 // ConfigMap and postgresql.auto.conf (which ALTER SYSTEM and pg_basebackup -R own).
-func NewNative(dataDir, pgBindir, password string) *Native {
-	return &Native{Runner: OSRunner{}, DataDir: dataDir, PGBindir: pgBindir, Password: password, Now: time.Now}
+//
+// slotName is this node's own slot on its upstream (#289); "" disables slot use.
+func NewNative(dataDir, pgBindir, password, slotName string) *Native {
+	return &Native{
+		Runner:   OSRunner{},
+		DataDir:  dataDir,
+		PGBindir: pgBindir,
+		Password: password,
+		SlotName: slotName,
+		Now:      time.Now,
+	}
 }
 
 // managedConfName is the agent-owned fragment inside PGDATA, included from
@@ -125,6 +143,14 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 		// Single-quoted and escaped: a host or user containing a quote would otherwise break
 		// out of the GUC and corrupt the file, failing postmaster start.
 		b.WriteString(fmt.Sprintf("primary_conninfo = '%s'\n", escapeSingleQuoted(primaryConninfo)))
+		// primary_slot_name is what makes the ONGOING stream hold the slot (#289). Without
+		// it the walreceiver connects without a slot, so the upstream is free to recycle WAL
+		// this standby has not received yet -- the gap that forces a full re-clone. Written
+		// only alongside primary_conninfo: the GUC is meaningless without an upstream, and a
+		// primary that carried it would reserve WAL for a stream it never opens.
+		if n.SlotName != "" {
+			b.WriteString(fmt.Sprintf("primary_slot_name = '%s'\n", escapeSingleQuoted(n.SlotName)))
+		}
 	}
 	if err := writeFileAtomic(n.managedConfPath(), b.String(), 0o600); err != nil {
 		return fmt.Errorf("native: write %s: %w", n.managedConfPath(), err)
@@ -239,12 +265,23 @@ func (n *Native) Follow(ctx context.Context, upstream Conn) error {
 // the end of postgresql.conf), so it would silently outrank any later Follow -- a standby
 // cloned once and later re-pointed to a new upstream would keep streaming from the
 // original source. Calling Follow here instead keeps exactly one authoritative place.
+// #289: the backup streams through this node's own named slot, created on the source
+// FIRST so no WAL gap can open between the base backup starting and the walreceiver
+// attaching. Without a slot the source may recycle a segment the new standby still needs
+// before it finishes copying, and the clone comes up permanently behind -- recoverable
+// only by another full clone. The slot is created idempotently rather than with
+// pg_basebackup -C: -C fails outright when the slot already exists (verified), which is
+// the normal case for a re-clone of a pod that had one, so -C would break exactly the
+// retry path that matters most.
 func (n *Native) Clone(ctx context.Context, source Conn) error {
 	if n.DataDir == "" {
 		return fmt.Errorf("native: DataDir not set")
 	}
 	if source.Host == "" {
 		return fmt.Errorf("native: clone needs source.Host")
+	}
+	if err := n.ensureSlotOnUpstream(ctx, source); err != nil {
+		return err
 	}
 	args := []string{
 		"-h", source.Host,
@@ -255,10 +292,69 @@ func (n *Native) Clone(ctx context.Context, source Conn) error {
 		"--checkpoint=fast",
 		"--no-password",
 	}
+	if n.SlotName != "" {
+		args = append(args, "--slot", n.SlotName)
+	}
 	if out, err := n.run(ctx, n.bin("pg_basebackup"), args...); err != nil {
 		return fmt.Errorf("native: pg_basebackup from %s: %w: %s", source.Host, err, strings.TrimSpace(out))
 	}
 	return n.Follow(ctx, source)
+}
+
+// ensureSlotOnUpstream idempotently creates THIS node's slot on the upstream before a
+// clone (#289).
+//
+// Run from the cloning standby rather than left to the primary's own slot reconcile
+// because the two race at bootstrap: a fresh standby can reach pg_basebackup before the
+// primary's first reconcile tick has created its slot, and pg_basebackup --slot fails on
+// a missing slot. Creating it here makes the clone self-sufficient; the primary's
+// reconcile then finds it already present and does nothing.
+//
+// Uses psql (not a Prober) because mechanism must not depend on internal/pg -- the
+// dependency runs the other way. The name is validated before interpolation.
+func (n *Native) ensureSlotOnUpstream(ctx context.Context, source Conn) error {
+	if n.SlotName == "" {
+		return nil
+	}
+	if err := validSlotName(n.SlotName); err != nil {
+		return fmt.Errorf("native: clone slot: %w", err)
+	}
+	sql := fmt.Sprintf(
+		"SELECT pg_create_physical_replication_slot('%s') "+
+			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '%s');",
+		n.SlotName, n.SlotName)
+	args := []string{
+		"-h", source.Host,
+		"-p", strconv.Itoa(source.port()),
+		"-U", source.User,
+		"-d", source.database(),
+		"-tAc", sql,
+	}
+	if out, err := n.run(ctx, n.bin("psql"), args...); err != nil {
+		return fmt.Errorf("native: create slot %q on %s: %w: %s", n.SlotName, source.Host, err, strings.TrimSpace(out))
+	}
+	return nil
+}
+
+// validSlotName mirrors internal/pg's guard. Duplicated rather than imported because
+// mechanism deliberately does not depend on internal/pg (that import runs the other way,
+// and inverting it would couple the mechanics layer to the probe layer). PostgreSQL
+// restricts slot names to lower-case letters, digits and underscore -- none of which can
+// terminate a quoted SQL literal, so a name that passes cannot inject.
+func validSlotName(name string) error {
+	if name == "" {
+		return fmt.Errorf("replication slot name is empty")
+	}
+	if len(name) > 63 {
+		return fmt.Errorf("replication slot name %q is longer than 63 characters", name)
+	}
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			continue
+		}
+		return fmt.Errorf("invalid replication slot name %q: only lower-case letters, digits and underscore are allowed", name)
+	}
+	return nil
 }
 
 // RejoinForceRewind rewinds the diverged local node forward onto target via pg_rewind, then

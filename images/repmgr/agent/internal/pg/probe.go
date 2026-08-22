@@ -299,6 +299,123 @@ func (p *Prober) StandbyNodeIDs(ctx context.Context, ci ConnInfo) ([]int, error)
 	return ids, nil
 }
 
+// SlotState is one physical replication slot as the primary sees it (#289).
+//
+// RetainedWALBytes is how much WAL the slot is holding back:
+// pg_current_wal_lsn() - restart_lsn. This is the number that turns a silent
+// disk-fill into an alertable signal -- an orphaned slot's retained WAL grows without
+// bound and nothing else reports it until the volume is full. NULL restart_lsn (a
+// freshly created slot that has not reserved WAL yet) reads as 0 rather than being
+// skipped, so a new slot is still enumerated with a truthful "holding nothing" value.
+type SlotState struct {
+	Name             string
+	Active           bool
+	RetainedWALBytes int64
+}
+
+// PhysicalSlots lists the physical replication slots on the node ci points at, with
+// their active flag and retained WAL (#289).
+//
+// Deliberately unfiltered by name: the caller decides which slots it owns. The agent
+// must SEE every physical slot to report retained WAL for all of them (an orphan it
+// does not own still fills the disk), even where it will refuse to drop them.
+//
+// Logical slots are excluded (slot_type='physical'): those belong to the operator's
+// subscriptions, the agent never creates or drops them, and enumerating them here
+// would invite a caller to treat one as an orphan.
+func (p *Prober) PhysicalSlots(ctx context.Context, ci ConnInfo) ([]SlotState, error) {
+	out, err := p.psql(ctx, ci,
+		"SELECT slot_name, active, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint "+
+			"FROM pg_replication_slots WHERE slot_type = 'physical' ORDER BY slot_name;")
+	if err != nil {
+		return nil, err
+	}
+	var slots []SlotState
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "|")
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("parse pg_replication_slots row %q: want 3 fields, got %d", line, len(parts))
+		}
+		n, perr := strconv.ParseInt(strings.TrimSpace(parts[2]), 10, 64)
+		if perr != nil {
+			return nil, fmt.Errorf("parse retained WAL bytes %q for slot %q: %w", parts[2], parts[0], perr)
+		}
+		slots = append(slots, SlotState{
+			Name:             strings.TrimSpace(parts[0]),
+			Active:           strings.TrimSpace(parts[1]) == "t",
+			RetainedWALBytes: n,
+		})
+	}
+	return slots, nil
+}
+
+// CreatePhysicalSlot creates a physical replication slot, idempotently (#289).
+//
+// The WHERE NOT EXISTS guard makes a re-run a silent no-op instead of the error
+// pg_create_physical_replication_slot raises on a duplicate name. That matters because
+// this runs on every primary tick and before every clone: an unguarded create would
+// either need caller-side error-string matching (the fragile pattern #289 exists to
+// retire) or would log a spurious failure forever once the slot exists.
+//
+// name is validated by the caller (validSlotName); it is interpolated into SQL, so an
+// unvalidated name would be an injection vector.
+func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name string) error {
+	if err := validSlotName(name); err != nil {
+		return err
+	}
+	_, err := p.psql(ctx, ci, fmt.Sprintf(
+		"SELECT pg_create_physical_replication_slot('%s') "+
+			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '%s');", name, name))
+	return err
+}
+
+// DropPhysicalSlotIfInactive drops a physical slot only when it is not active (#289).
+//
+// The `AND NOT active` lives in the SQL, not in Go, on purpose: it makes "never drop a
+// slot someone is streaming through" atomic with the drop itself. A read-then-decide in
+// Go would leave a window where a standby reattaches between the list and the drop, and
+// dropping an in-use slot breaks that standby's replication. The same predicate makes
+// the statement a no-op (not an error) when the slot is already gone, so a concurrent
+// removal or a repeated call is silent rather than a per-tick warning.
+//
+// Returns whether a row was affected, so the caller can log only real drops.
+func (p *Prober) DropPhysicalSlotIfInactive(ctx context.Context, ci ConnInfo, name string) (dropped bool, err error) {
+	if err := validSlotName(name); err != nil {
+		return false, err
+	}
+	out, err := p.psql(ctx, ci, fmt.Sprintf(
+		"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "+
+			"WHERE slot_name = '%s' AND slot_type = 'physical' AND NOT active;", name))
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
+// validSlotName rejects anything PostgreSQL would not accept as a slot name, which is
+// also exactly the character class that is safe to interpolate into the SQL above.
+// PostgreSQL restricts slot names to lower-case letters, digits and underscore; nothing
+// in that set can terminate a quoted literal, so a name that passes here cannot inject.
+func validSlotName(name string) error {
+	if name == "" {
+		return fmt.Errorf("replication slot name is empty")
+	}
+	if len(name) > 63 {
+		return fmt.Errorf("replication slot name %q is longer than 63 characters", name)
+	}
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			continue
+		}
+		return fmt.Errorf("invalid replication slot name %q: only lower-case letters, digits and underscore are allowed", name)
+	}
+	return nil
+}
+
 // Probe classifies a node by its actual role and reads the WAL position relevant
 // to that role. An unreachable node returns NodeState{Host, Reachable:false}.
 func (p *Prober) Probe(ctx context.Context, ci ConnInfo) NodeState {

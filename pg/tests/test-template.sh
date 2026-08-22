@@ -835,6 +835,38 @@ agent_pr_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1 || true)
 assert_not_contains "agent monitoring: PrometheusRule not in standalone mode" "${agent_pr_standalone}" "kind: PrometheusRule"
 
+# #289: the replication-slot alerts. An orphaned slot pins WAL and fills the volume with
+# no error until the disk is full, so these two rules are the only thing that turns that
+# silent failure into a page -- assert both the rules and the threshold plumbing.
+assert_contains "#289: PrometheusRule has the retained-WAL alert" "${agent_pr}" "PGHAReplicationSlotRetainingWAL"
+assert_contains "#289: PrometheusRule has the inactive-slot alert" "${agent_pr}" "PGHAReplicationSlotInactive"
+assert_contains "#289: retained-WAL alert reads the max-retained gauge" "${agent_pr}" "pg_ha_agent_replication_slot_max_retained_wal_bytes"
+assert_contains "#289: inactive-slot alert reads the inactive gauge" "${agent_pr}" "pg_ha_agent_replication_slots_inactive"
+# The default threshold must render as a bare integer, not 1.7179869184e+10: Prometheus
+# rejects scientific notation in a comparison, so a float-rendered default would ship an
+# alert that never evaluates.
+assert_contains "#289: default retained-WAL threshold renders as an integer (16Gi)" "${agent_pr}" "> 17179869184"
+assert_not_contains "#289: threshold is not rendered in scientific notation" "${agent_pr}" "e+"
+# The threshold is operator-tunable, and the override must reach the expression.
+agent_pr_thresh=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.monitoring.prometheusRule.enabled=true \
+  --set repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes=1073741824 \
+  --show-only templates/agent-prometheusrule.yaml 2>&1)
+assert_contains "#289: slotRetainedWALBytes override reaches the alert expression" "${agent_pr_thresh}" "> 1073741824"
+assert_not_contains "#289: overridden threshold replaces the default" "${agent_pr_thresh}" "> 17179869184"
+# A non-integer or zero threshold would render an alert that never fires -- rejected by
+# the schema at render time rather than shipping a silently-dead rule.
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.monitoring.prometheusRule.enabled=true \
+  --set repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes=lots \
+  >/dev/null 2>&1 && slot_thresh_str_rc=0 || slot_thresh_str_rc=$?
+assert_eq "#289: a non-integer slotRetainedWALBytes fails the render" "1" "${slot_thresh_str_rc}"
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.monitoring.prometheusRule.enabled=true \
+  --set repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes=0 \
+  >/dev/null 2>&1 && slot_thresh_zero_rc=0 || slot_thresh_zero_rc=$?
+assert_eq "#289: a zero slotRetainedWALBytes fails the render" "1" "${slot_thresh_zero_rc}"
+
 # agent etcd DCS (BYO/shared): backend selectable; etcd env + TLS mount, the leases
 # RBAC dropped, NetworkPolicy egress to 2379; the default kubernetes backend is
 # unaffected; missing endpoints fails fast.

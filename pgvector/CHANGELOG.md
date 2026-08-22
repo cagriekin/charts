@@ -72,6 +72,18 @@
 
 ### Added
 
+- **The agent owns physical replication slot lifecycle in native mode (#289).** Inherited
+  from pg's symlinked agent/templates. repmgr mode is untouched (repmgr keeps owning slots
+  there). Under `mechanism: native` the agent creates `pg_ha_slot_<ordinal>` on the upstream
+  before every clone (so `pg_basebackup` streams through it and no WAL gap can open),
+  reconciles slots against the expected pod set on every primary tick, and drops orphans --
+  never an active one, and never while paused. Three new metrics plus two `PrometheusRule`
+  alerts (`PGHAReplicationSlotRetainingWAL`, `PGHAReplicationSlotInactive`) make an
+  orphaned slot -- which otherwise pins WAL and fills the volume with no error until the
+  disk is full -- alertable. New value:
+  `repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes` (default 16Gi). See the
+  [pg chart README](../pg/README.md#replication-slot-ownership-289).
+
 - **`repmgr.agent.mechanism`: an experimental native HA mechanism, alongside repmgr
   (#287).** Inherited from pg's symlinked agent/templates. Off by default
   (`mechanism: repmgr`); `native` drives PostgreSQL's own tools directly instead of the

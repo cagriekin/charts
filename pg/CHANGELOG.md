@@ -72,6 +72,53 @@
 
 ### Added
 
+- **The agent owns physical replication slot lifecycle in native mode (#289).** Under the
+  repmgr mechanism repmgr creates, names and attaches slots itself; native mode had nobody
+  doing it, and an unowned slot is the most dangerous loose end in the exit -- an orphaned
+  slot pins WAL on the primary forever and fills the volume, raising **no error at all**
+  until the disk is full. repmgr mode is untouched (repmgr keeps owning slots there).
+
+  Slots are named `pg_ha_slot_<pod ordinal>` -- ordinal-derived so a pod restart reattaches
+  to the same slot instead of stranding one, and prefixed so ownership is decidable: the
+  agent creates and drops only names it can prove it minted, never an operator's slot or a
+  logical slot for a subscription.
+
+  - **Create before clone.** `pg_basebackup` now streams through the node's own named slot,
+    created on the upstream *first*, so no WAL gap can open between the base backup starting
+    and the walreceiver attaching. Created idempotently via SQL rather than `pg_basebackup
+    -C`: `-C` fails outright when the slot already exists (verified), which is the normal
+    case for a re-clone -- so `-C` would break exactly the retry path that matters most.
+    `primary_slot_name` in the managed fragment holds the slot for the ongoing stream.
+  - **Reconcile on every primary tick.** The lease holder creates a slot for every expected
+    peer ordinal and drops orphans. Creation is driven by the *expected* pod set
+    (`REPMGR_NODE_COUNT`), not observed standbys, because a slot must exist before its
+    standby streams; on the `Promote` path it is sequenced **ahead of the routing switch**,
+    so surviving standbys never race slot creation when they follow the new primary.
+  - **Never drops an active slot.** The `AND NOT active` predicate lives in the SQL, making
+    the guard atomic with the drop -- a read-then-decide in Go would leave a window for a
+    standby to reattach in between, and dropping an in-use slot breaks its replication.
+    Verified live against a real streaming standby: the drop is refused, no error, and the
+    standby keeps streaming. Reclaimed cases are a scale-down ghost (ordinal at or above
+    `nodeCount`), the primary's own slot (it does not stream from itself), and a legacy
+    `repmgr_slot_*` (native never uses one, so an inactive one is pure dead weight -- this
+    is what keeps a future repmgr->native migration, #292, from leaving a permanent orphan).
+    A zero or misconfigured `nodeCount` reclaims nothing.
+  - **Only the lease holder mutates slots**, and `Decide` returns `NoOp` before any primary
+    branch while paused, so a maintenance window cannot drop anything.
+  - **Observability.** Three new gauges -- `pg_ha_agent_replication_slots`,
+    `..._replication_slots_inactive`, `..._replication_slot_max_retained_wal_bytes` -- plus
+    two `PrometheusRule` alerts: `PGHAReplicationSlotRetainingWAL` (critical, over
+    `repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes`, default 16Gi, for 15m)
+    and `PGHAReplicationSlotInactive` (warning, 1h). This is the page that turns a silent
+    disk-fill into a signal. Aggregates rather than per-slot labels on purpose: this metrics
+    surface is hand-written text with no per-series lifecycle, so a label per slot would
+    leak a stale series on every drop.
+
+  Verified end-to-end against real PostgreSQL 18, not only in unit tests: clone through a
+  pre-created slot, the slot going active under a live standby, the drop guard refusing that
+  active slot without error, an orphaned slot pinning 160MB of WAL after its standby left,
+  and reclaim freeing it again.
+
 - **`repmgr.agent.mechanism`: an experimental native HA mechanism, alongside repmgr
   (#287).** repmgr ([upstream development has stalled](https://github.com/EnterpriseDB/repmgr))
   is still the default and the only supported mechanism; this adds a second implementation
@@ -93,8 +140,8 @@
   `repmgr.nodes` for the primary to register, before the Go agent ever runs -- has no
   `MECHANISM` awareness. Verified live: with any replicas, that poll times out and every
   standby sits `Init:CrashLoopBackOff` forever; the primary itself comes up and serves fine.
-  `#289` (nothing owns replication slots, so a primary can recycle WAL a standby still needs)
-  is the second blocker once #288 lands. `#294` tracks promoting `native` to supported.
+  `#289` (replication slot ownership) has since landed -- see the entry below -- leaving
+  #288 as the sole remaining blocker. `#294` tracks promoting `native` to supported.
 
   Verified that native mode inherits the mechanism-agnostic safety behaviors already in
   reconcile/probe rather than needing its own copies -- in particular the `#297` scale-up

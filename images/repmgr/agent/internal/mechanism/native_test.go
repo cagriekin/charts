@@ -358,3 +358,181 @@ func TestNativeEnsureIncludeReAddsWhenOnlyCommentedOut(t *testing.T) {
 		t.Errorf("ensureInclude did not add an active include line when only a commented-out one existed:\n%s", b)
 	}
 }
+
+// --- #289: replication slot ownership ---
+
+// newTestNativeWithSlot is newTestNative plus this node's own slot name, i.e. how
+// newMechanism builds it in native mode once an ordinal is known.
+func newTestNativeWithSlot(t *testing.T, fr *fakeRunner, slot string) (*Native, string) {
+	t.Helper()
+	n, dataDir := newTestNative(t, fr)
+	n.SlotName = slot
+	return n, dataDir
+}
+
+// The base backup must stream through the node's own named slot, and that slot must be
+// created on the upstream FIRST -- otherwise the source can recycle a segment the new
+// standby still needs before the copy finishes, and the clone comes up permanently behind.
+func TestNativeCloneCreatesSlotOnUpstreamBeforeStreamingThroughIt(t *testing.T) {
+	fr := &fakeRunner{}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	if err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	var createIdx, backupIdx = -1, -1
+	for i, c := range fr.calls {
+		joined := strings.Join(c.args, " ")
+		if strings.HasSuffix(c.name, "psql") && strings.Contains(joined, "pg_create_physical_replication_slot") {
+			createIdx = i
+			if !strings.Contains(joined, "WHERE NOT EXISTS") {
+				t.Errorf("slot create is not idempotent; a re-clone would fail: %s", joined)
+			}
+			if !strings.Contains(joined, "pg-0.hl") {
+				t.Errorf("slot must be created on the UPSTREAM, not locally: %v", c.args)
+			}
+		}
+		if strings.HasSuffix(c.name, "pg_basebackup") {
+			backupIdx = i
+			if !strings.Contains(joined, "--slot pg_ha_slot_1") {
+				t.Errorf("pg_basebackup does not stream through the slot: %s", joined)
+			}
+			// -C would fail on an existing slot, which is the normal re-clone case.
+			for _, a := range c.args {
+				if a == "-C" || a == "--create-slot" {
+					t.Errorf("pg_basebackup must not use -C (fails when the slot already exists): %v", c.args)
+				}
+			}
+		}
+	}
+	if createIdx < 0 {
+		t.Fatal("Clone never created the slot on the upstream")
+	}
+	if backupIdx < 0 {
+		t.Fatal("Clone never ran pg_basebackup")
+	}
+	if createIdx > backupIdx {
+		t.Errorf("slot created AFTER the base backup (idx %d > %d): the WAL gap this closes is still open", createIdx, backupIdx)
+	}
+}
+
+// primary_slot_name is what holds the slot for the ONGOING stream; without it the
+// walreceiver reconnects slotless and the upstream may recycle WAL again.
+func TestNativeFollowWritesPrimarySlotName(t *testing.T) {
+	n, dataDir := newTestNativeWithSlot(t, &fakeRunner{}, "pg_ha_slot_2")
+	if err := n.Follow(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Follow: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "primary_slot_name = 'pg_ha_slot_2'") {
+		t.Errorf("managed conf missing primary_slot_name:\n%s", b)
+	}
+}
+
+// A primary has no upstream, so a primary_slot_name would reserve WAL for a stream it
+// never opens. It must appear only alongside primary_conninfo.
+func TestNativePrimarySlotNameOnlyAppearsWithAnUpstream(t *testing.T) {
+	n, dataDir := newTestNativeWithSlot(t, &fakeRunner{}, "pg_ha_slot_2")
+	if err := n.GenerateConfig(context.Background(), NodeIdentity{}, ConfigOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "primary_slot_name") {
+		t.Errorf("primary_slot_name written with no primary_conninfo:\n%s", b)
+	}
+}
+
+// An empty SlotName is the pre-#289 behaviour and must stay slotless rather than emitting
+// an empty GUC (which the postmaster would reject) or an empty --slot argument.
+func TestNativeNoSlotNameStaysSlotless(t *testing.T) {
+	fr := &fakeRunner{}
+	n, dataDir := newTestNativeWithSlot(t, fr, "")
+	if err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	for _, c := range fr.calls {
+		joined := strings.Join(c.args, " ")
+		if strings.Contains(joined, "pg_create_physical_replication_slot") {
+			t.Errorf("created a slot with no SlotName set: %v", c.args)
+		}
+		if strings.Contains(joined, "--slot") {
+			t.Errorf("passed --slot with no SlotName set: %v", c.args)
+		}
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "primary_slot_name") {
+		t.Errorf("wrote primary_slot_name with no SlotName set:\n%s", b)
+	}
+}
+
+// A slot-create failure must abort the clone: proceeding without the slot silently
+// reintroduces the WAL gap the slot exists to prevent.
+func TestNativeCloneFailsWhenSlotCreateFails(t *testing.T) {
+	fr := &fakeRunner{failOn: "pg_create_physical_replication_slot"}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"})
+	if err == nil {
+		t.Fatal("Clone succeeded despite a failed slot create")
+	}
+	for _, c := range fr.calls {
+		if strings.HasSuffix(c.name, "pg_basebackup") {
+			t.Error("ran pg_basebackup after the slot create failed")
+		}
+	}
+}
+
+// The slot name is interpolated into SQL, so a name outside PostgreSQL's own character
+// class must be refused before any command runs.
+func TestNativeCloneRejectsAnInvalidSlotName(t *testing.T) {
+	fr := &fakeRunner{}
+	n, _ := newTestNativeWithSlot(t, fr, "bad'; DROP TABLE x; --")
+	if err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err == nil {
+		t.Fatal("Clone accepted an invalid slot name")
+	}
+	if len(fr.calls) != 0 {
+		t.Errorf("an invalid slot name reached a command: %v", fr.calls)
+	}
+}
+
+// The slot create must connect to a real database even when the caller supplied no DB.
+func TestConnDatabaseDefaultsToPostgres(t *testing.T) {
+	if got := (Conn{}).database(); got != "postgres" {
+		t.Errorf("database() with no DB = %q, want postgres", got)
+	}
+	if got := (Conn{DB: "repmgr"}).database(); got != "repmgr" {
+		t.Errorf("database() = %q, want repmgr", got)
+	}
+}
+
+// The password must reach the slot-create psql via PGPASSWORD, never argv (#167).
+func TestNativeSlotCreatePassesPasswordViaEnvNotArgv(t *testing.T) {
+	fr := &fakeRunner{}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	if err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	for _, c := range fr.calls {
+		if strings.Contains(strings.Join(c.args, " "), "secret") {
+			t.Errorf("password leaked into argv: %v", c.args)
+		}
+		if strings.HasSuffix(c.name, "psql") {
+			var found bool
+			for _, e := range c.env {
+				if e == "PGPASSWORD=secret" {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("slot-create psql did not get PGPASSWORD: %v", c.env)
+			}
+		}
+	}
+}

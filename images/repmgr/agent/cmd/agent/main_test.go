@@ -723,3 +723,110 @@ func TestCleanupGhostNodesSkippedUnderNativeMechanism(t *testing.T) {
 		t.Fatalf("expected no unregister under native mechanism, got %v", ex.unregistered)
 	}
 }
+
+// --- #289: replication slot ownership ---
+
+func TestSlotNameForIsOrdinalDerivedAndStable(t *testing.T) {
+	for _, tc := range []struct{ pod, want string }{
+		{"pg-0", "pg_ha_slot_0"},
+		{"pg-1", "pg_ha_slot_1"},
+		{"my-release-pg-12", "pg_ha_slot_12"},
+		// No parseable ordinal: better slotless than an unstable name that strands a
+		// new slot on every restart.
+		{"pg", ""},
+		{"pg-abc", ""},
+		{"", ""},
+	} {
+		if got := slotNameFor(tc.pod); got != tc.want {
+			t.Errorf("slotNameFor(%q) = %q, want %q", tc.pod, got, tc.want)
+		}
+	}
+}
+
+// The slot name must be one PostgreSQL accepts, for every ordinal the chart can produce
+// -- a name rejected at create time would leave the standby slotless with only a per-tick
+// warning. PostgreSQL allows lower-case letters, digits and underscore, max 63 chars;
+// asserted here directly so this stays honest even if the probe's own guard drifts.
+func TestSlotNameForProducesAValidSlotName(t *testing.T) {
+	for _, ord := range []int{0, 1, 9, 10, 99, 1000} {
+		name := slotNameFor(fmt.Sprintf("pg-%d", ord))
+		if name == "" || len(name) > 63 {
+			t.Errorf("slotNameFor(pg-%d) = %q: empty or over 63 chars", ord, name)
+			continue
+		}
+		for _, r := range name {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+				continue
+			}
+			t.Errorf("slotNameFor(pg-%d) = %q contains %q, which PostgreSQL rejects in a slot name", ord, name, r)
+		}
+	}
+}
+
+func TestOrphanSlotReclaimsScaledDownAndLegacySlotsOnly(t *testing.T) {
+	const self = "pg-0"
+	for _, tc := range []struct {
+		name      string
+		slot      string
+		nodeCount int
+		want      bool
+		why       string
+	}{
+		// Scale-down ghosts: the pod is gone, nobody will ever reattach.
+		{"ghost above the live range", "pg_ha_slot_3", 3, true, "ordinal 3 >= nodeCount 3"},
+		{"ghost far above", "pg_ha_slot_9", 2, true, "ordinal 9 >= nodeCount 2"},
+		// Live peers: their standby is expected to stream through this slot.
+		{"live peer", "pg_ha_slot_1", 3, false, "ordinal 1 is inside the live range"},
+		{"highest live peer", "pg_ha_slot_2", 3, false, "ordinal 2 is the last live ordinal"},
+		// The primary does not stream from itself, so its own slot is unused.
+		{"own slot while primary", "pg_ha_slot_0", 3, true, "self ordinal"},
+		// Legacy repmgr slots: native mode never streams through one.
+		{"legacy repmgr slot", "repmgr_slot_1001", 3, true, "native never uses repmgr_slot_*"},
+		{"legacy repmgr slot, live ordinal", "repmgr_slot_1000", 3, true, "still unused under native"},
+		// Anything the agent did not mint is left strictly alone.
+		{"operator's own slot", "my_own_slot", 3, false, "not agent-minted"},
+		{"logical-looking slot", "debezium_cdc", 3, false, "not agent-minted"},
+		{"prefix but no ordinal", "pg_ha_slot_abc", 3, false, "unparseable ordinal"},
+		{"legacy prefix but no ordinal", "repmgr_slot_abc", 3, false, "unparseable ordinal"},
+		// A zero/misconfigured count must never make every live slot look orphaned.
+		{"zero nodeCount", "pg_ha_slot_9", 0, false, "nodeCount <= 0 reclaims nothing"},
+		{"negative nodeCount", "pg_ha_slot_9", -1, false, "nodeCount <= 0 reclaims nothing"},
+	} {
+		if got := orphanSlot(tc.slot, self, tc.nodeCount); got != tc.want {
+			t.Errorf("%s: orphanSlot(%q, %q, %d) = %v, want %v (%s)",
+				tc.name, tc.slot, self, tc.nodeCount, got, tc.want, tc.why)
+		}
+	}
+}
+
+// A promoted pod's own slot becomes reclaimable, and the ex-primary's does not: ownership
+// follows whoever currently holds the lease, so the set shifts on failover.
+func TestOrphanSlotSelfSlotFollowsTheCurrentPrimary(t *testing.T) {
+	if !orphanSlot("pg_ha_slot_1", "pg-1", 3) {
+		t.Error("pg-1 as primary should reclaim its own slot pg_ha_slot_1")
+	}
+	if orphanSlot("pg_ha_slot_0", "pg-1", 3) {
+		t.Error("pg-1 as primary must NOT reclaim pg-0's slot -- pg-0 is a live standby streaming through it")
+	}
+}
+
+func TestSlotMetricsAggregatesCountInactiveAndMaxRetained(t *testing.T) {
+	got := slotMetrics([]pg.SlotState{
+		{Name: "pg_ha_slot_1", Active: true, RetainedWALBytes: 1024},
+		{Name: "pg_ha_slot_2", Active: false, RetainedWALBytes: 16 << 20},
+		{Name: "pg_ha_slot_3", Active: false, RetainedWALBytes: 8 << 20},
+	})
+	if got.Total != 3 {
+		t.Errorf("Total = %d, want 3", got.Total)
+	}
+	if got.Inactive != 2 {
+		t.Errorf("Inactive = %d, want 2", got.Inactive)
+	}
+	if got.MaxRetainedWALBytes != 16<<20 {
+		t.Errorf("MaxRetainedWALBytes = %d, want %d", got.MaxRetainedWALBytes, 16<<20)
+	}
+	empty := slotMetrics(nil)
+	if empty.Total != 0 || empty.Inactive != 0 || empty.MaxRetainedWALBytes != 0 {
+		t.Errorf("no slots: got %+v, want all zero", empty)
+	}
+}

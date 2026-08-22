@@ -639,6 +639,11 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		wctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
 		defer cancel()
 		_ = a.mech.RegisterPrimary(wctx)
+		// #289: give every surviving standby a slot BEFORE routing switches to this node.
+		// They will follow this new primary within a tick, and a Follow that arrives before
+		// its slot exists streams slotless -- leaving this primary free to recycle WAL that
+		// standby still needs. Sequencing it ahead of the routing switch closes that window.
+		a.reconcileSlots(wctx)
 		if tl, _, ok, _ := a.prober.PrimaryWALPosition(wctx, a.selfConn()); ok {
 			a.advanceMarker(wctx, tl, true, obs.Marker)
 		}
@@ -665,6 +670,11 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// must not hold opMu past the soft-fence window. Best-effort -- it resumes next
 		// tick if cut short, and only ever targets ordinals above the live range.
 		a.cleanupGhostNodes(wctx)
+		// The slot-side twin of the ghost cleanup above (#289): create slots for expected
+		// standbys and reclaim orphans a scale-down or a repmgr->native migration left
+		// pinning WAL. Bounded by the same fence-budget context, and skipped entirely under
+		// the repmgr mechanism (repmgr owns slots there).
+		a.reconcileSlots(wctx)
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
@@ -1162,9 +1172,12 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 func newMechanism(cfg *config.Config, repmgrConf, pgBindir string, log *slog.Logger) (mechanism.Mechanism, error) {
 	switch cfg.Mechanism {
 	case config.MechanismNative:
-		log.Warn("using the EXPERIMENTAL native mechanism: topology still comes from repmgr.nodes (#288) and nothing owns replication slots (#289), so this is not yet usable for a real cluster",
+		// #289 has landed: the agent now owns physical slot lifecycle in native mode
+		// (create before clone, reconcile against the live pod set on every primary tick,
+		// drop only inactive orphans). Topology (#288) is still the outstanding blocker.
+		log.Warn("using the EXPERIMENTAL native mechanism: topology still comes from repmgr.nodes (#288), so this is not yet usable for a real cluster",
 			"mechanism", cfg.Mechanism)
-		return mechanism.NewNative(cfg.PGDATA, pgBindir, cfg.RepmgrPassword), nil
+		return mechanism.NewNative(cfg.PGDATA, pgBindir, cfg.RepmgrPassword, slotNameFor(cfg.PodName)), nil
 	case config.MechanismRepmgr, "":
 		return mechanism.NewRepmgr(repmgrConf, cfg.PGDATA, cfg.RepmgrPassword), nil
 	default:
@@ -1219,6 +1232,105 @@ func (a *agent) cleanupGhostNodes(ctx context.Context) {
 		}
 		a.log.Info("unregistered ghost repmgr node left by a scale-down", "node_id", id)
 	}
+}
+
+// reconcileSlots makes the primary's physical replication slots match the live pod set
+// (#289). Native mode only: under the repmgr mechanism repmgr still owns slot lifecycle
+// (it creates/attaches them during standby clone/follow), so touching them here would
+// have two owners fighting over the same objects.
+//
+// Runs as the lease holder on a read-write primary, which is what makes it race-free:
+// slots are only ever mutated by the single node that holds the lease, so there is no
+// cross-node coordination to get wrong -- the same argument that makes the primary-only
+// repmgr.nodes cleanup safe. Callers must also skip it while paused; act() only reaches
+// the primary branches when not paused.
+//
+// Two directions, both idempotent:
+//
+//   - CREATE for every expected peer ordinal. Driven by the EXPECTED pod set (NodeCount),
+//     not by observed standbys: a slot must exist BEFORE its standby tries to stream, and
+//     after a promote the surviving standbys will follow this node within a tick. Waiting
+//     to observe them first would leave every Follow racing slot creation, which is the
+//     ordering the issue calls out. This is also why the call sits ahead of the routing
+//     switch in the Promote path.
+//   - DROP every orphan (see orphanSlot). The drop refuses an active slot in SQL, so a
+//     slot someone is still streaming through survives even if the name looks reclaimable.
+//
+// Best-effort per slot: a failure is logged and retried next tick rather than aborting the
+// rest, because a single unreachable/locked slot must not block reclaiming the others --
+// and the whole point is that an unreclaimed slot silently fills the volume.
+func (a *agent) reconcileSlots(ctx context.Context) {
+	if a.cfg.Mechanism != config.MechanismNative {
+		return
+	}
+	if a.cfg.NodeCount <= 0 {
+		return
+	}
+	self := a.selfConn()
+	slots, err := a.prober.PhysicalSlots(ctx, self)
+	if err != nil {
+		a.log.Warn("list physical replication slots", "err", err)
+		return
+	}
+	have := make(map[string]pg.SlotState, len(slots))
+	for _, s := range slots {
+		have[s.Name] = s
+	}
+	a.metr.SetSlots(slotMetrics(slots))
+
+	selfOrd, selfOK := podOrdinal(a.cfg.PodName)
+	for ord := 0; ord < a.cfg.NodeCount; ord++ {
+		if selfOK && ord == selfOrd {
+			continue // the primary does not stream from itself
+		}
+		name := slotPrefix + strconv.Itoa(ord)
+		if _, ok := have[name]; ok {
+			continue
+		}
+		if err := a.prober.CreatePhysicalSlot(ctx, self, name); err != nil {
+			a.log.Warn("create replication slot", "slot", name, "err", err)
+			continue
+		}
+		a.log.Info("created replication slot for an expected standby", "slot", name)
+	}
+
+	for _, s := range slots {
+		if !orphanSlot(s.Name, a.cfg.PodName, a.cfg.NodeCount) {
+			continue
+		}
+		dropped, err := a.prober.DropPhysicalSlotIfInactive(ctx, self, s.Name)
+		if err != nil {
+			a.log.Warn("drop orphaned replication slot", "slot", s.Name, "err", err)
+			continue
+		}
+		if dropped {
+			a.log.Info("dropped orphaned replication slot",
+				"slot", s.Name, "retained_wal_bytes", s.RetainedWALBytes)
+		}
+	}
+}
+
+// slotMetrics reduces the observed slots to what the metrics surface exports (#289):
+// the total count, how many are inactive (an inactive slot is the one that pins WAL with
+// nobody consuming it), and the largest retained-WAL figure across all slots.
+//
+// Max rather than a per-slot label set: the alert that matters is "some slot is holding
+// back too much WAL", and a single gauge answers it without making cardinality grow with
+// the cluster or leaving stale series behind when a slot is dropped (this metrics surface
+// is hand-written text with no per-series lifecycle, so an unbounded label set would
+// leak). The slot's identity is in the agent's log line at drop time and in
+// pg_replication_slots itself.
+func slotMetrics(slots []pg.SlotState) observe.SlotStats {
+	st := observe.SlotStats{Total: int64(len(slots))}
+	for _, s := range slots {
+		if !s.Active {
+			st.Inactive++
+		}
+		if s.RetainedWALBytes > st.MaxRetainedWALBytes {
+			st.MaxRetainedWALBytes = s.RetainedWALBytes
+		}
+	}
+	return st
 }
 
 // streamingFromTarget reports whether local Postgres is already actively streaming
@@ -1305,14 +1417,15 @@ func baseName(pod string) string {
 // matching init-repmgr.sh and nodeID().
 const nodeIDBase = 1000
 
-// nodeID maps a pod name to its repmgr node_id (ordinal + nodeIDBase), matching init-repmgr.sh.
+// nodeID maps a pod name to its repmgr node_id (ordinal + nodeIDBase), matching
+// init-repmgr.sh. Shares podOrdinal with the slot naming (#289) so the pod-name ->
+// ordinal convention has exactly one implementation; 0 when the name carries none.
 func nodeID(pod string) int {
-	if i := strings.LastIndex(pod, "-"); i >= 0 {
-		if n, err := strconv.Atoi(pod[i+1:]); err == nil {
-			return n + nodeIDBase
-		}
+	ord, ok := podOrdinal(pod)
+	if !ok {
+		return 0
 	}
-	return 0
+	return ord + nodeIDBase
 }
 
 // ghostNodeIDs returns the registered node_ids whose pods the StatefulSet no longer
@@ -1334,4 +1447,91 @@ func ghostNodeIDs(ids []int, nodeCount int) []int {
 		}
 	}
 	return ghosts
+}
+
+// slotPrefix names the agent's own physical replication slots (#289): slotPrefix +
+// pod ordinal, e.g. pg_ha_slot_1.
+//
+// Ordinal-derived, not node_id-derived: the ordinal is the StatefulSet's own stable
+// identity, it survives pod restarts, and it does not carry the +1000 repmgr offset into
+// a mechanism that has no repmgr. The prefix is what makes ownership decidable -- the
+// agent creates and drops only names it can prove it minted, so an operator's own slot
+// (or a logical slot for a subscription) is never touched.
+const slotPrefix = "pg_ha_slot_"
+
+// legacySlotPrefix is repmgr's own slot naming (repmgr_slot_<node_id>).
+//
+// Native mode never streams through one, so an INACTIVE slot with this prefix on a
+// native-mode primary is dead weight pinning WAL -- exactly the silent disk-fill #289
+// exists to stop. It is therefore reclaimable by the native reconcile, which is what
+// makes a repmgr->native migration (#292) safe rather than leaving a permanent orphan
+// behind. The `NOT active` guard in the drop is what keeps this safe mid-migration: a
+// standby still streaming through its repmgr slot holds it active, so it survives until
+// it has genuinely moved onto its pg_ha_slot_ replacement.
+const legacySlotPrefix = "repmgr_slot_"
+
+// slotNameFor returns the slot a pod streams through, or "" when the pod name carries no
+// parseable ordinal (nothing to derive a stable name from -- better no slot than an
+// unstable one that strands a new slot on every restart).
+func slotNameFor(pod string) string {
+	ord, ok := podOrdinal(pod)
+	if !ok {
+		return ""
+	}
+	return slotPrefix + strconv.Itoa(ord)
+}
+
+// podOrdinal extracts the StatefulSet ordinal from a pod name.
+func podOrdinal(pod string) (int, bool) {
+	i := strings.LastIndex(pod, "-")
+	if i < 0 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(pod[i+1:])
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// orphanSlot decides whether the primary may drop slot on the strength of its NAME alone
+// (#289). Activity is NOT considered here -- the drop itself refuses an active slot
+// atomically in SQL, which is both safer and race-free.
+//
+// Three cases are reclaimable:
+//   - an agent-minted slot whose ordinal is at or above nodeCount: the pod it belonged to
+//     was removed by a scale-down, so no one will ever reattach (the slot-side twin of the
+//     #139 ghost row, and the one with real consequences)
+//   - an agent-minted slot for THIS pod: the primary does not stream from itself, so its
+//     own slot is by definition unused while it holds the lease
+//   - a legacy repmgr_slot_*: native mode never uses one (see legacySlotPrefix)
+//
+// Everything else -- an unrecognised name, or a live peer's slot -- is left alone.
+// nodeCount <= 0 reclaims nothing: a zero/misconfigured count must never make every
+// live standby's slot look like an orphan.
+func orphanSlot(name, selfPod string, nodeCount int) bool {
+	if nodeCount <= 0 {
+		return false
+	}
+	if rest, ok := strings.CutPrefix(name, legacySlotPrefix); ok {
+		if _, err := strconv.Atoi(rest); err == nil {
+			return true
+		}
+		return false
+	}
+	rest, ok := strings.CutPrefix(name, slotPrefix)
+	if !ok {
+		return false
+	}
+	ord, err := strconv.Atoi(rest)
+	if err != nil {
+		return false
+	}
+	if ord >= nodeCount {
+		return true
+	}
+	if selfOrd, ok := podOrdinal(selfPod); ok && ord == selfOrd {
+		return true
+	}
+	return false
 }
