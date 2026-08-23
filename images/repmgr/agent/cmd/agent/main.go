@@ -369,7 +369,10 @@ func (a *agent) run() {
 // before the agent starts, or by the reconcile loop's clone path).
 func (a *agent) boot(ctx context.Context) error {
 	nid := mechanism.NodeIdentity{
-		NodeID:   nodeID(a.cfg.PodName),
+		// 0 under native (#288 audit): only Repmgr.GenerateConfig reads this, and carrying a
+		// repmgr node_id through a native path is how a future change accidentally starts
+		// depending on one.
+		NodeID:   a.repmgrNodeID(),
 		NodeName: a.cfg.PodName,
 		FQDN:     a.fqdn(a.cfg.PodName),
 		DataDir:  a.cfg.PGDATA,
@@ -761,7 +764,10 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if err := a.assertSameCluster(ctx, dec.Target); err != nil {
 			return err
 		}
-		up := nodeID(dec.Target)
+		// 0 under native (#288 audit): repmgr addresses a follow target by node_id out of
+		// repmgr.nodes; native writes upstream.Host into primary_conninfo and has no use for
+		// an id. RegisterStandby is already a no-op under native.
+		up := a.repmgrPeerNodeID(dec.Target)
 		regErr := a.mech.RegisterStandby(ctx, up)
 		if regErr != nil {
 			a.log.Warn("register standby in repmgr.nodes", "err", regErr)
@@ -996,7 +1002,10 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 		return fmt.Errorf("bootstrap initdb: %w: %s", err, strings.TrimSpace(out))
 	}
 	nid := mechanism.NodeIdentity{
-		NodeID:   nodeID(a.cfg.PodName),
+		// 0 under native (#288 audit): only Repmgr.GenerateConfig reads this, and carrying a
+		// repmgr node_id through a native path is how a future change accidentally starts
+		// depending on one.
+		NodeID:   a.repmgrNodeID(),
 		NodeName: a.cfg.PodName,
 		FQDN:     a.fqdn(a.cfg.PodName),
 		DataDir:  a.cfg.PGDATA,
@@ -1838,7 +1847,42 @@ func baseName(pod string) string {
 
 // nodeIDBase is the repmgr node_id of ordinal 0 (node_id = nodeIDBase + ordinal),
 // matching init-repmgr.sh and nodeID().
+// #288 audit. Every consumer of the +1000 offset, and which of them must outlive
+// mechanism.Repmgr:
+//
+//   - nodeID() -> NodeIdentity.NodeID, read only by Repmgr.GenerateConfig (node_id= in
+//     repmgr.conf). Repmgr-only; native's GenerateConfig discards NodeIdentity entirely.
+//   - nodeID() -> the #297 registry gate mapping in readRegistryForGate. Repmgr-only since
+//     #288: that whole read is skipped under native.
+//   - nodeID() -> RegisterStandby + Conn.NodeID in the Follow branch. Repmgr-only;
+//     Native.Follow reads upstream.Host and mentions NodeID only in an error string.
+//   - ghostNodeIDs(), from cleanupGhostNodes. Repmgr-only; already native-skipped.
+//   - slotOrdinal()'s legacy branch. **This one must survive #294's deletion of
+//     mechanism.Repmgr**: it reverses the offset to reclaim repmgr_slot_<node_id> orphans
+//     left behind by a repmgr->native migration (#292). Deleting nodeIDBase with the repmgr
+//     mechanism would silently strand those slots, pinning WAL forever.
+//
+// So the offset is NOT removable while mechanism: repmgr is selectable (#288 lists that as a
+// non-goal), and even afterwards slotOrdinal keeps needing it. What #288 does instead is stop
+// PROPAGATING a node id on native code paths, so no native path carries a repmgr identity.
+// podOrdinal (below) and reconcile.podOrdinal are not repmgr-specific and stay.
 const nodeIDBase = 1000
+
+// repmgrNodeID is this node's repmgr node_id, or 0 under the native mechanism (#288 audit).
+func (a *agent) repmgrNodeID() int {
+	if a.cfg.Mechanism == config.MechanismNative {
+		return 0
+	}
+	return nodeID(a.cfg.PodName)
+}
+
+// repmgrPeerNodeID is pod's repmgr node_id, or 0 under the native mechanism (#288 audit).
+func (a *agent) repmgrPeerNodeID(pod string) int {
+	if a.cfg.Mechanism == config.MechanismNative {
+		return 0
+	}
+	return nodeID(pod)
+}
 
 // nodeID maps a pod name to its repmgr node_id (ordinal + nodeIDBase), matching
 // init-repmgr.sh. Shares podOrdinal with the slot naming (#289) so the pod-name ->

@@ -1371,3 +1371,27 @@ func TestTopologyTickLogsTheGapOnlyOnChange(t *testing.T) {
 		t.Errorf("recovery from a topology gap was not logged:\n%s", out.String())
 	}
 }
+
+// #288 audit: no native code path may carry a repmgr node_id. The offset itself cannot be
+// deleted (slotOrdinal's legacy branch needs it to reclaim repmgr_slot_<node_id> orphans during
+// a repmgr->native migration), so the tightening is to stop propagating ids instead.
+func TestNativePathsCarryNoRepmgrNodeID(t *testing.T) {
+	a := &agent{cfg: &config.Config{PodName: "pg-3", Mechanism: config.MechanismNative}}
+	if got := a.repmgrNodeID(); got != 0 {
+		t.Errorf("native self node_id = %d, want 0", got)
+	}
+	if got := a.repmgrPeerNodeID("pg-5"); got != 0 {
+		t.Errorf("native peer node_id = %d, want 0", got)
+	}
+	a.cfg.Mechanism = config.MechanismRepmgr
+	if got := a.repmgrNodeID(); got != 1003 {
+		t.Errorf("repmgr self node_id = %d, want 1003", got)
+	}
+	if got := a.repmgrPeerNodeID("pg-5"); got != 1005 {
+		t.Errorf("repmgr peer node_id = %d, want 1005", got)
+	}
+	// The offset must still be reversible for legacy slot reclaim -- #294 must not delete it.
+	if ord, ok := slotOrdinal("repmgr_slot_1002"); !ok || ord != 2 {
+		t.Errorf("legacy slot reclaim broken: slotOrdinal(repmgr_slot_1002) = (%d,%v)", ord, ok)
+	}
+}

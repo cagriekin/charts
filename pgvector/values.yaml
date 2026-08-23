@@ -298,7 +298,10 @@ repmgr:
     # EXPERIMENTAL -- do not set in production yet (#287). Which replication mechanics the
     # agent drives: `repmgr` (default, the repmgr CLI) or `native` (pg_ctl promote,
     # pg_basebackup, pg_rewind, primary_conninfo directly). Policy is identical either way.
-    # `native` is NOT usable on its own yet -- topology still comes from repmgr.nodes (#288).
+    # `native` now runs a real multi-node cluster (#288): topology comes from
+    # pg_stat_replication, and the lease holder initdbs while the rest clone via
+    # pg_basebackup. Still EXPERIMENTAL -- cascadingReplication is render-rejected with it,
+    # and an existing repmgr cluster cannot be flipped in place yet (#292).
     # It does own its replication slots (#289). See the pg chart README.
     mechanism: repmgr
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the

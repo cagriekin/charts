@@ -2,6 +2,13 @@
 
 ## 2.0.0 - 2026-08-10
 
+- **Topology from `pg_stat_replication`; `repmgr.nodes` retired in native mode (#288).**
+  Inherited from pg's symlinked templates and shared agent. `native` can now run a real
+  multi-node cluster: the init container no longer polls `repmgr.nodes` (which nothing writes
+  under native, so every standby used to sit in `Init:CrashLoopBackOff`), the lease holder
+  `initdb`s and the rest clone via `pg_basebackup`, and a native cluster carries no repmgr
+  extension at all. Still EXPERIMENTAL. See the [pg 2.0.0 changelog](../pg/CHANGELOG.md).
+
 ### Removed (breaking)
 
 - **`repmgr.failoverMode: repmgrd` and the repmgrd + service-updater sidecars are gone**

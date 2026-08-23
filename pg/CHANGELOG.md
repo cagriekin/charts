@@ -72,6 +72,45 @@
 
 ### Added
 
+- **Topology comes from `pg_stat_replication`; `repmgr.nodes` is retired in native mode
+  (#288).** `native` can now run a real multi-node cluster -- it could not before, at any
+  `replicaCount > 0`.
+
+  The blocker was never the topology read. It was the bootstrap: `init-repmgr.sh` polled
+  `repmgr.nodes` for a primary to register itself, which nothing does under native, so every
+  standby burned the ~240s timeout and sat in `Init:CrashLoopBackOff` forever while the primary
+  came up fine. The init container now exits immediately under native, and **the agent owns the
+  bootstrap**: the lease holder `initdb`s, every other pod waits and then clones with
+  `pg_basebackup` through its own pre-created slot (#289). Whether to `initdb` is a cluster-wide
+  decision and only the lease can make it happen exactly once -- if each pod decided for itself,
+  every one would create its own cluster with its own `system_identifier` and `assertSameCluster`
+  would refuse to rejoin any of them.
+
+  Topology now reads the primary's live connection list. `repmgr.nodes` was a *cache* of
+  self-reported metadata whose rows outlived the pods that wrote them (#139); a departed pod is
+  simply absent from `pg_stat_replication`, so there is no durable row to strand. Rows map back
+  to pods by `application_name` -- native now writes the pod name into `primary_conninfo` -- with
+  the ordinal-named replication slot as a fallback for any standby cloned before this change,
+  which still dials with libpq's default `walreceiver`. Exported as
+  `pg_ha_agent_replicas_streaming`, `..._replicas_expected` and `..._replicas_unidentified`.
+  Observe-only, deliberately: a standby's row vanishes the instant it disconnects, which is
+  exactly the failover moment, so nothing in the promotion decision may consume it.
+
+  A native cluster now has **no repmgr extension and no `repmgr.nodes` at all**. The repmgr
+  database and role remain -- the agent authenticates as that role for every probe and for
+  `pg_basebackup` -- and renaming them is #291. The pre-agent stale-primary guard is skipped
+  under native too: it rejoins and re-clones through the repmgr CLI on a peer scan with no notion
+  of the lease.
+
+  The `#297` promote-registration gate is skipped rather than replaced. It guards against
+  promoting a node no survivor can `repmgr standby follow`, which is a constraint of resolving an
+  upstream by `node_id`; native follows by conninfo, so a native primary is followable the moment
+  it promotes.
+
+  Still EXPERIMENTAL. `cascadingReplication` remains render-rejected with native (slot ownership
+  is primary-only), and an existing repmgr cluster cannot be flipped in place yet (#292). CI now
+  runs 8 suites against both mechanisms (56 legs, up from 40).
+
 - **The agent owns physical replication slot lifecycle in native mode (#289).** Under the
   repmgr mechanism repmgr creates, names and attaches slots itself; native mode had nobody
   doing it, and an unowned slot is the most dangerous loose end in the exit -- an orphaned

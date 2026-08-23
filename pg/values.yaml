@@ -354,12 +354,19 @@ repmgr:
     #   native           -- drive PostgreSQL directly: pg_ctl promote, pg_basebackup,
     #                       pg_rewind, primary_conninfo + standby.signal
     #
-    # `native` is NOT usable on its own yet. It makes the mechanism selectable, but topology
-    # still comes from repmgr.nodes (#288), so a standby has no upstream to choose. It DOES
-    # own its replication slots (#289): a slot is created before every clone/rejoin and the
-    # primary reconciles the set against the live pod set each tick, so the WAL-recycling
-    # gap is closed. Leave it at repmgr until #294 marks native supported and flips the
-    # default.
+    # `native` now runs a real multi-node cluster (#288). Topology comes from
+    # pg_stat_replication rather than repmgr.nodes, and the bootstrap is the agent's: the
+    # lease holder initdbs, every other pod waits and then clones with pg_basebackup through
+    # its own pre-created slot (#289). A native cluster has no repmgr extension and no
+    # repmgr.nodes at all -- the repmgr DATABASE and ROLE remain, because the agent
+    # authenticates as that role for replication (renaming them is #291).
+    #
+    # Still EXPERIMENTAL, and still not the default. Remaining gaps:
+    #   - cascadingReplication is rejected at render time with native (slot ownership is
+    #     primary-only, so a cascading child's slot would have no owner)
+    #   - an EXISTING repmgr cluster cannot be flipped in place yet (#292); native is for
+    #     fresh installs until that lands
+    #   - #294 owns marking native supported and flipping the default
     mechanism: repmgr
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
     # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane

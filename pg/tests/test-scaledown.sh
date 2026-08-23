@@ -57,18 +57,36 @@ node_count() { # node_count <primary-pod> <node_id>
   pg_exec "${NAMESPACE}" "$1" "SELECT count(*) FROM repmgr.nodes WHERE node_id=$2" repmgr repmgr 2>/dev/null | xargs || echo ""
 }
 
+# #288: the native equivalent of "is node N in the topology". There is no repmgr.nodes to
+# consult -- a native cluster has neither the extension nor the table -- so the question becomes
+# "is that pod streaming from the primary", which is the primary's own live connection list.
+# Ordinal 0 is the primary itself: it never appears in its own pg_stat_replication, so it counts
+# as present whenever it is the node answering.
+node_streaming() { # node_streaming <primary-pod> <ordinal>
+  local primary="$1" ord="$2"
+  if [[ "${primary}" == "${FULLNAME}-${ord}" ]]; then echo "1"; return 0; fi
+  pg_exec "${NAMESPACE}" "${primary}" \
+    "SELECT count(*) FROM pg_stat_replication WHERE state='streaming' AND (application_name='${FULLNAME}-${ord}' OR pid IN (SELECT active_pid FROM pg_replication_slots WHERE slot_name='pg_ha_slot_${ord}'))" \
+    repmgr repmgr 2>/dev/null | xargs || echo ""
+}
+
+# in_topology dispatches on the mechanism so the three checks below read the same either way.
+in_topology() { # in_topology <primary-pod> <ordinal>
+  if [ "$(chart_mechanism)" = "native" ]; then node_streaming "$1" "$2"; else node_count "$1" "$((1000 + $2))"; fi
+}
+
 # Precondition: all three nodes registered (so the scaled node 1002 exists first --
 # otherwise the post-scale assertion would pass vacuously).
 echo "  Waiting for all 3 nodes (1000,1001,1002) to register (up to 180s)..."
 pre=0; elapsed=0
 while [[ ${elapsed} -lt 180 ]]; do
   P=$(find_primary 2)
-  if [[ -n "${P}" && "$(node_count "${P}" 1000)" == "1" && "$(node_count "${P}" 1001)" == "1" && "$(node_count "${P}" 1002)" == "1" ]]; then
+  if [[ -n "${P}" && "$(in_topology "${P}" 0)" == "1" && "$(in_topology "${P}" 1)" == "1" && "$(in_topology "${P}" 2)" == "1" ]]; then
     pre=1; break
   fi
   sleep 5; elapsed=$((elapsed + 5))
 done
-assert_eq "all 3 nodes registered before scale-down (incl. node 1002)" "1" "${pre}"
+assert_eq "all 3 nodes in the topology before scale-down (incl. ordinal 2)" "1" "${pre}"
 
 # Scale down to 2 instances (replicaCount=1 -> ordinals 0,1). The StatefulSet trims the
 # top ordinal, so pod-2 (a standby) is removed; its repmgr.nodes row (node_id 1002) is
@@ -88,16 +106,16 @@ echo "  Waiting for the ghost node 1002 to be unregistered (up to 180s)..."
 gone=0; elapsed=0
 while [[ ${elapsed} -lt 180 ]]; do
   P=$(find_primary 1)
-  if [[ -n "${P}" && "$(node_count "${P}" 1002)" == "0" ]]; then gone=1; break; fi
+  if [[ -n "${P}" && "$(in_topology "${P}" 2)" == "0" ]]; then gone=1; break; fi
   sleep 10; elapsed=$((elapsed + 10))
 done
-assert_eq "ghost node 1002 unregistered after scale-down (#139)" "1" "${gone}"
+assert_eq "the departed ordinal 2 left the topology after scale-down (#139)" "1" "${gone}"
 
 # The live nodes must NOT be unregistered (the discriminator is the ordinal, not
 # reachability -- a momentarily-down live node must never be treated as a ghost).
 P=$(find_primary 1)
-assert_eq "live node 1000 still registered" "1" "$(node_count "${P}" 1000)"
-assert_eq "live node 1001 still registered" "1" "$(node_count "${P}" 1001)"
+assert_eq "live ordinal 0 still in the topology" "1" "$(in_topology "${P}" 0)"
+assert_eq "live ordinal 1 still in the topology" "1" "$(in_topology "${P}" 1)"
 
 # The surviving cluster is still healthy: a single primary serves.
 serves=$(pg_exec "${NAMESPACE}" "${P}" "SELECT NOT pg_is_in_recovery()" repmgr repmgr 2>/dev/null || echo "")
@@ -111,18 +129,38 @@ assert_eq "a primary still serves after scale-down + cleanup" "t" "${serves}"
 # the same resource -- and, worse, its orphan rule would start dropping repmgr's slots.
 agent_slots=$(pg_exec "${NAMESPACE}" "${P}" \
   "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
-assert_eq "#289: the agent creates no slots under the repmgr mechanism (repmgr owns them)" "0" "${agent_slots}"
+if [ "$(chart_mechanism)" = "native" ]; then
+  # #288: the assertion inverts. Native owns its slots, so after scaling 3 -> 2 there must be
+  # exactly one agent-minted slot -- ordinal 1, the surviving peer. The primary does not stream
+  # from itself, and ordinal 2 is gone.
+  assert_eq "#289/#288: native leaves exactly one agent slot for the surviving standby" "1" "${agent_slots}"
+  ghost_agent=$(pg_exec "${NAMESPACE}" "${P}" \
+    "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
+  assert_eq "#289/#288: no agent slot left pinning WAL for the scaled-away ordinal 2" "0" "${ghost_agent}"
+  # #288's own acceptance line: a native cluster carries no repmgr metadata at all, so there is
+  # no stale cache for anything to fall back to by accident.
+  ext=$(pg_exec "${NAMESPACE}" "${P}" \
+    "SELECT count(*) FROM pg_extension WHERE extname='repmgr'" repmgr repmgr 2>/dev/null | xargs || echo "")
+  assert_eq "#288: a native cluster has no repmgr extension" "0" "${ext}"
+  nodes_rel=$(pg_exec "${NAMESPACE}" "${P}" \
+    "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='repmgr' AND c.relname='nodes'" repmgr repmgr 2>/dev/null | xargs || echo "")
+  assert_eq "#288: a native cluster has no repmgr.nodes relation" "0" "${nodes_rel}"
+  # And the topology the agent publishes must agree with the surviving pod set.
+  streaming=$(pg_exec "${NAMESPACE}" "${P}" \
+    "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" repmgr repmgr 2>/dev/null | xargs || echo "")
+  assert_eq "#288: the primary sees exactly one streaming standby after the scale-down" "1" "${streaming}"
+else
+  assert_eq "#289: the agent creates no slots under the repmgr mechanism (repmgr owns them)" "0" "${agent_slots}"
+fi
 
-# No physical slot may be left pinning WAL for a pod that no longer exists. Under repmgr
-# mode repmgr names them repmgr_slot_<node_id>, so the scaled-away node 1002's slot is the
-# one to look for. NOTE: the equivalent native-mode assertion (zero pg_ha_slot_* above the
-# live ordinal range) cannot be written until #288 lands -- native mode cannot run with any
-# replicas at all today, since the shared repmgr-init container leaves every standby in
-# Init:CrashLoopBackOff. Tracked there; the native path is covered at the unit level and was
-# verified by hand against a real two-node PostgreSQL 18 pair.
-ghost_slot=$(pg_exec "${NAMESPACE}" "${P}" \
-  "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'repmgr_slot_1002'" repmgr repmgr 2>/dev/null | xargs || echo "")
-assert_eq "#289: no replication slot left pinning WAL for the scaled-away node 1002" "0" "${ghost_slot}"
+# No physical slot may be left pinning WAL for a pod that no longer exists. Under repmgr mode
+# repmgr names them repmgr_slot_<node_id>, so the scaled-away node 1002's slot is the one to
+# look for; the native equivalent is asserted above (#288 made it possible to run at all).
+if [ "$(chart_mechanism)" != "native" ]; then
+  ghost_slot=$(pg_exec "${NAMESPACE}" "${P}" \
+    "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'repmgr_slot_1002'" repmgr repmgr 2>/dev/null | xargs || echo "")
+  assert_eq "#289: no replication slot left pinning WAL for the scaled-away node 1002" "0" "${ghost_slot}"
+fi
 
 # Cleanup.
 helm uninstall "${RELEASE}" -n "${NAMESPACE}" 2>/dev/null || true
