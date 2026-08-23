@@ -282,7 +282,7 @@ A Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a
 | `repmgr.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
 | `repmgr.agent.reconcileInterval` | Reconcile tick interval | `5s` |
 | `repmgr.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
-| `repmgr.agent.mechanism` | **EXPERIMENTAL (#287), do not set in production yet.** `repmgr` or `native` (drives `pg_ctl`/`pg_basebackup`/`pg_rewind` directly instead of the repmgr CLI). Not usable on a real cluster until #288/#289 land -- see the [pg chart README](../pg/README.md#replication-mechanics-experimental-287) for the full detail. | `repmgr` |
+| `repmgr.agent.mechanism` | **EXPERIMENTAL (#287), do not set in production yet.** `repmgr` or `native` (drives `pg_ctl`/`pg_basebackup`/`pg_rewind` directly instead of the repmgr CLI). It owns its physical replication slots (#289), but topology still comes from `repmgr.nodes`, so it is not usable on a real cluster until #288 lands -- see the [pg chart README](../pg/README.md#replication-mechanics-experimental-287) for the full detail. | `repmgr` |
 
 Must satisfy `leaseDuration > renewDeadline > retryPeriod`; widen for managed clouds (e.g. `30s/20s/4s`). This chart shares pg's templates and agent — see the [pg chart README](../pg/README.md#failover-the-lease-based-agent) for the full agent behaviour and the **2.0.0 migration runbook** (a release that pinned `failoverMode: repmgrd` needs a one-time `kubectl delete statefulset --cascade=orphan` + `helm upgrade`, because `podManagementPolicy` is immutable). See `ENVIRONMENT.md` for the injected-variable catalog.
 

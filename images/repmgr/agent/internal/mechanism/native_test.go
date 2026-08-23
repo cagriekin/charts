@@ -358,3 +358,316 @@ func TestNativeEnsureIncludeReAddsWhenOnlyCommentedOut(t *testing.T) {
 		t.Errorf("ensureInclude did not add an active include line when only a commented-out one existed:\n%s", b)
 	}
 }
+
+// --- #289: replication slot ownership ---
+
+// newTestNativeWithSlot is newTestNative plus this node's own slot name, i.e. how
+// newMechanism builds it in native mode once an ordinal is known.
+func newTestNativeWithSlot(t *testing.T, fr *fakeRunner, slot string) (*Native, string) {
+	t.Helper()
+	n, dataDir := newTestNative(t, fr)
+	n.SlotName = slot
+	return n, dataDir
+}
+
+// The base backup must stream through the node's own named slot, and that slot must be
+// created on the upstream FIRST -- otherwise the source can recycle a segment the new
+// standby still needs before the copy finishes, and the clone comes up permanently behind.
+func TestNativeCloneCreatesSlotOnUpstreamBeforeStreamingThroughIt(t *testing.T) {
+	fr := &fakeRunner{}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	if err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	var createIdx, backupIdx = -1, -1
+	for i, c := range fr.calls {
+		joined := strings.Join(c.args, " ")
+		if strings.HasSuffix(c.name, "psql") && strings.Contains(joined, "pg_create_physical_replication_slot") {
+			// FIRST create only. Clone ends by calling Follow, which ensures the slot again
+			// (it is the repoint path's own guarantee, and idempotent) -- so recording the
+			// last match would measure that second call and say nothing about the ordering
+			// that matters, which is create-before-pg_basebackup.
+			if createIdx < 0 {
+				createIdx = i
+			}
+			if !strings.Contains(joined, "WHERE NOT EXISTS") {
+				t.Errorf("slot create is not idempotent; a re-clone would fail: %s", joined)
+			}
+			if !strings.Contains(joined, "pg-0.hl") {
+				t.Errorf("slot must be created on the UPSTREAM, not locally: %v", c.args)
+			}
+		}
+		if strings.HasSuffix(c.name, "pg_basebackup") {
+			backupIdx = i
+			if !strings.Contains(joined, "--slot pg_ha_slot_1") {
+				t.Errorf("pg_basebackup does not stream through the slot: %s", joined)
+			}
+			// -C would fail on an existing slot, which is the normal re-clone case.
+			for _, a := range c.args {
+				if a == "-C" || a == "--create-slot" {
+					t.Errorf("pg_basebackup must not use -C (fails when the slot already exists): %v", c.args)
+				}
+			}
+		}
+	}
+	if createIdx < 0 {
+		t.Fatal("Clone never created the slot on the upstream")
+	}
+	if backupIdx < 0 {
+		t.Fatal("Clone never ran pg_basebackup")
+	}
+	if createIdx > backupIdx {
+		t.Errorf("slot created AFTER the base backup (idx %d > %d): the WAL gap this closes is still open", createIdx, backupIdx)
+	}
+}
+
+// primary_slot_name is what holds the slot for the ONGOING stream; without it the
+// walreceiver reconnects slotless and the upstream may recycle WAL again.
+func TestNativeFollowWritesPrimarySlotName(t *testing.T) {
+	n, dataDir := newTestNativeWithSlot(t, &fakeRunner{}, "pg_ha_slot_2")
+	if err := n.Follow(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Follow: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "primary_slot_name = 'pg_ha_slot_2'") {
+		t.Errorf("managed conf missing primary_slot_name:\n%s", b)
+	}
+}
+
+// A primary has no upstream, so a primary_slot_name would reserve WAL for a stream it
+// never opens. It must appear only alongside primary_conninfo.
+func TestNativePrimarySlotNameOnlyAppearsWithAnUpstream(t *testing.T) {
+	n, dataDir := newTestNativeWithSlot(t, &fakeRunner{}, "pg_ha_slot_2")
+	if err := n.GenerateConfig(context.Background(), NodeIdentity{}, ConfigOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "primary_slot_name") {
+		t.Errorf("primary_slot_name written with no primary_conninfo:\n%s", b)
+	}
+}
+
+// An empty SlotName is the pre-#289 behaviour and must stay slotless rather than emitting
+// an empty GUC (which the postmaster would reject) or an empty --slot argument.
+func TestNativeNoSlotNameStaysSlotless(t *testing.T) {
+	fr := &fakeRunner{}
+	n, dataDir := newTestNativeWithSlot(t, fr, "")
+	if err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	for _, c := range fr.calls {
+		joined := strings.Join(c.args, " ")
+		if strings.Contains(joined, "pg_create_physical_replication_slot") {
+			t.Errorf("created a slot with no SlotName set: %v", c.args)
+		}
+		if strings.Contains(joined, "--slot") {
+			t.Errorf("passed --slot with no SlotName set: %v", c.args)
+		}
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "primary_slot_name") {
+		t.Errorf("wrote primary_slot_name with no SlotName set:\n%s", b)
+	}
+}
+
+// A slot-create failure must abort the clone: proceeding without the slot silently
+// reintroduces the WAL gap the slot exists to prevent.
+func TestNativeCloneFailsWhenSlotCreateFails(t *testing.T) {
+	fr := &fakeRunner{failOn: "pg_create_physical_replication_slot"}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"})
+	if err == nil {
+		t.Fatal("Clone succeeded despite a failed slot create")
+	}
+	for _, c := range fr.calls {
+		if strings.HasSuffix(c.name, "pg_basebackup") {
+			t.Error("ran pg_basebackup after the slot create failed")
+		}
+	}
+}
+
+// The slot name is interpolated into SQL, so a name outside PostgreSQL's own character
+// class must be refused before any command runs.
+func TestNativeCloneRejectsAnInvalidSlotName(t *testing.T) {
+	fr := &fakeRunner{}
+	n, _ := newTestNativeWithSlot(t, fr, "bad'; DROP TABLE x; --")
+	if err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err == nil {
+		t.Fatal("Clone accepted an invalid slot name")
+	}
+	if len(fr.calls) != 0 {
+		t.Errorf("an invalid slot name reached a command: %v", fr.calls)
+	}
+}
+
+// The slot create must connect to a real database even when the caller supplied no DB.
+func TestConnDatabaseDefaultsToPostgres(t *testing.T) {
+	if got := (Conn{}).database(); got != "postgres" {
+		t.Errorf("database() with no DB = %q, want postgres", got)
+	}
+	if got := (Conn{DB: "repmgr"}).database(); got != "repmgr" {
+		t.Errorf("database() = %q, want repmgr", got)
+	}
+}
+
+// The password must reach the slot-create psql via PGPASSWORD, never argv (#167).
+func TestNativeSlotCreatePassesPasswordViaEnvNotArgv(t *testing.T) {
+	fr := &fakeRunner{}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	if err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	for _, c := range fr.calls {
+		if strings.Contains(strings.Join(c.args, " "), "secret") {
+			t.Errorf("password leaked into argv: %v", c.args)
+		}
+		if strings.HasSuffix(c.name, "psql") {
+			var found bool
+			for _, e := range c.env {
+				if e == "PGPASSWORD=secret" {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("slot-create psql did not get PGPASSWORD: %v", c.env)
+			}
+		}
+	}
+}
+
+// Losing a create/create race means the slot exists, so the clone must proceed rather than
+// abort. Two legitimate creators exist (this cloning standby and the primary's own
+// reconcile), and the WHERE NOT EXISTS guard is not atomic -- verified against PostgreSQL
+// 18, 40 of 40 concurrent pairs raced.
+func TestNativeCloneProceedsWhenTheSlotCreateLosesARace(t *testing.T) {
+	fr := &fakeRunner{failOn: "pg_create_physical_replication_slot",
+		failOut: `ERROR:  replication slot "pg_ha_slot_1" already exists`}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	if err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Clone aborted on a lost create race, but the slot exists: %v", err)
+	}
+	var ranBackup bool
+	for _, c := range fr.calls {
+		if strings.HasSuffix(c.name, "pg_basebackup") {
+			ranBackup = true
+		}
+	}
+	if !ranBackup {
+		t.Error("Clone did not run pg_basebackup after the (benign) duplicate-slot error")
+	}
+}
+
+// A rewind-based rejoin streams from the target just like a clone does, so it must also
+// guarantee its slot exists first -- otherwise it relies on the new primary's reconcile
+// having already run, which is "almost always" rather than a guarantee.
+func TestNativeRejoinForceRewindEnsuresItsSlotOnTheTarget(t *testing.T) {
+	fr := &fakeRunner{}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_2")
+	if err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("RejoinForceRewind: %v", err)
+	}
+	var rewindIdx, createIdx = -1, -1
+	for i, c := range fr.calls {
+		joined := strings.Join(c.args, " ")
+		if strings.HasSuffix(c.name, "pg_rewind") {
+			rewindIdx = i
+		}
+		if strings.HasSuffix(c.name, "psql") && strings.Contains(joined, "pg_create_physical_replication_slot") {
+			createIdx = i
+			if !strings.Contains(joined, "pg-0.hl") {
+				t.Errorf("slot must be created on the rewind TARGET: %v", c.args)
+			}
+		}
+	}
+	if rewindIdx < 0 {
+		t.Fatal("never ran pg_rewind")
+	}
+	if createIdx < 0 {
+		t.Fatal("RejoinForceRewind did not ensure its slot on the target -- a rejoining standby can stream slotless")
+	}
+	if createIdx < rewindIdx {
+		t.Errorf("slot created before the rewind (idx %d < %d); it must follow the rewind and precede the Follow", createIdx, rewindIdx)
+	}
+}
+
+// A failed rewind must NOT create a slot: the node is about to re-clone instead, and
+// Clone does its own slot handling.
+func TestNativeRejoinDoesNotTouchSlotsWhenTheRewindFails(t *testing.T) {
+	fr := &fakeRunner{failOn: "--target-pgdata", failOut: "target server must be shut down cleanly"}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_2")
+	if err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err == nil {
+		t.Fatal("want an error from a failed rewind")
+	}
+	for _, c := range fr.calls {
+		if strings.Contains(strings.Join(c.args, " "), "pg_create_physical_replication_slot") {
+			t.Errorf("created a slot despite the rewind failing: %v", c.args)
+		}
+	}
+}
+
+// The two validSlotName copies (this one and internal/pg's) must stay in agreement --
+// mechanism deliberately does not import internal/pg, so nothing but a mirrored test
+// catches a drift between them.
+func TestMechanismValidSlotNameMatchesTheProbeGuard(t *testing.T) {
+	for _, n := range []string{
+		"", "bad; name", "pg_ha_slot_1'; DROP TABLE x; --", "PG_HA_SLOT_1",
+		"pg-ha-slot-1", "pg ha slot 1", strings.Repeat("a", 64),
+	} {
+		if err := validSlotName(n); err == nil {
+			t.Errorf("validSlotName(%q) = nil, want an error", n)
+		}
+	}
+	for _, n := range []string{"pg_ha_slot_0", "pg_ha_slot_12", "repmgr_slot_1001", strings.Repeat("a", 63)} {
+		if err := validSlotName(n); err != nil {
+			t.Errorf("validSlotName(%q) = %v, want nil", n, err)
+		}
+	}
+}
+
+// A repoint must ensure its own slot on the NEW upstream, not assume that upstream's
+// reconcile already created it (#289 review). primary_slot_name is written unconditionally,
+// and a walreceiver whose named slot is missing does not fall back to slotless streaming --
+// it errors and retries, so the standby streams nothing at all.
+func TestNativeFollowEnsuresTheSlotOnTheNewUpstream(t *testing.T) {
+	fr := &fakeRunner{}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	if err := n.Follow(context.Background(), Conn{Host: "pg-2.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Follow: %v", err)
+	}
+	var created bool
+	for _, c := range fr.calls {
+		joined := strings.Join(c.args, " ")
+		if strings.HasSuffix(c.name, "psql") && strings.Contains(joined, "pg_create_physical_replication_slot('pg_ha_slot_1')") {
+			created = true
+			if !strings.Contains(joined, "pg-2.hl") {
+				t.Errorf("slot created somewhere other than the new upstream: %v", c.args)
+			}
+			if !strings.Contains(joined, "WHERE NOT EXISTS") {
+				t.Errorf("slot create is not idempotent, so a normal repoint would error: %s", joined)
+			}
+		}
+	}
+	if !created {
+		t.Error("Follow repointed with primary_slot_name set but never ensured the slot exists on the upstream")
+	}
+}
+
+// A slot-ensure failure must FAIL the repoint rather than be swallowed: with
+// primary_slot_name naming a slot that does not exist the standby cannot stream either
+// way, so a loud error the agent logs and retries beats a "successful" repoint whose only
+// symptom is a walreceiver looping in the postmaster log.
+func TestNativeFollowFailsWhenTheSlotCannotBeEnsured(t *testing.T) {
+	fr := &fakeRunner{failOn: "pg_create_physical_replication_slot", failOut: "FATAL:  all replication slots are in use"}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	if err := n.Follow(context.Background(), Conn{Host: "pg-2.hl", User: "repmgr", DB: "repmgr"}); err == nil {
+		t.Fatal("Follow reported success despite being unable to create the slot it points at")
+	}
+}

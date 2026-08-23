@@ -17,7 +17,6 @@ type fakeExec struct {
 	sysID     string // pg_control_system() system_identifier output (decimal)
 	walRcv    string // StreamingUpstream "sender_host|status" output
 	nodes     string // SELECT node_id FROM repmgr.nodes output (newline-separated)
-	slots     string // PhysicalSlots slot_name output (newline-separated)
 	err       error  // if set, every call fails (node unreachable)
 }
 
@@ -27,8 +26,6 @@ func (f fakeExec) Run(_ context.Context, _ []string, _ string, args ...string) (
 	}
 	sql := args[len(args)-1]
 	switch {
-	case strings.Contains(sql, "pg_replication_slots"):
-		return f.slots, nil
 	case strings.Contains(sql, "repmgr.nodes"):
 		return f.nodes, nil
 	// StandbyTimeline reads GREATEST(checkpoint TL, min_recovery_end_timeline); match
@@ -239,6 +236,300 @@ func TestStandbyNodeIDsUnreachable(t *testing.T) {
 	}
 }
 
+// slotExec records the SQL it is asked to run and replies with a canned result, so the
+// slot helpers can be asserted on BOTH the statement they build and the value they parse.
+type slotExec struct {
+	out  string
+	err  error
+	sqls []string
+}
+
+func (s *slotExec) Run(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+	s.sqls = append(s.sqls, args[len(args)-1])
+	return s.out, s.err
+}
+
+// The three states verified against real PostgreSQL 18, in the order the query returns
+// them: a slot created ahead of its standby (wal_status NULL -> "", restart_lsn NULL),
+// a healthy reserving one, and one PostgreSQL invalidated for exceeding
+// max_slot_wal_keep_size (wal_status "lost", restart_lsn back to NULL -- which is why
+// its retained-bytes figure reads 0 and cannot be alerted on).
+func TestPhysicalSlotsParsesNameActiveRetainedWALAndWALStatus(t *testing.T) {
+	ex := &slotExec{out: "pg_ha_slot_1|f|0||f\npg_ha_slot_2|t|16777216|reserved|t\npg_ha_slot_3|f|0|lost|f"}
+	p := &Prober{Exec: ex}
+	got, err := p.PhysicalSlots(context.Background(), ConnInfo{})
+	if err != nil {
+		t.Fatalf("PhysicalSlots: %v", err)
+	}
+	want := []SlotState{
+		{Name: "pg_ha_slot_1", Active: false, RetainedWALBytes: 0, WALStatus: "", Reserving: false},
+		{Name: "pg_ha_slot_2", Active: true, RetainedWALBytes: 16777216, WALStatus: "reserved", Reserving: true},
+		{Name: "pg_ha_slot_3", Active: false, RetainedWALBytes: 0, WALStatus: "lost", Reserving: false},
+	}
+	if got[2].Invalidated() != true || got[1].Invalidated() != false {
+		t.Errorf("Invalidated() misreads wal_status: %+v", got)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d slots, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("slot %d: got %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// The listing has to work on a STANDBY too, since a demoted primary reclaims the slots it
+// minted while it was primary. pg_current_wal_lsn() is primary-only and raises "recovery is
+// in progress" on a standby (verified against PostgreSQL 18), which returned an EMPTY
+// listing there and made those leftovers invisible.
+func TestPhysicalSlotsQueryWorksOnAStandby(t *testing.T) {
+	ex := &slotExec{}
+	p := &Prober{Exec: ex}
+	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{}); err != nil {
+		t.Fatalf("PhysicalSlots: %v", err)
+	}
+	sql := ex.sqls[0]
+	if !strings.Contains(sql, "pg_is_in_recovery()") {
+		t.Errorf("query does not branch on recovery, so it errors out on a standby: %s", sql)
+	}
+	if !strings.Contains(sql, "pg_last_wal_receive_lsn()") {
+		t.Errorf("query has no standby reference LSN: %s", sql)
+	}
+}
+
+// Logical slots belong to the operator's subscriptions; the agent must never enumerate
+// them as candidates for its own reconcile.
+func TestPhysicalSlotsQueryExcludesLogicalSlots(t *testing.T) {
+	ex := &slotExec{}
+	p := &Prober{Exec: ex}
+	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{}); err != nil {
+		t.Fatalf("PhysicalSlots: %v", err)
+	}
+	if !strings.Contains(ex.sqls[0], "slot_type = 'physical'") {
+		t.Errorf("query does not filter to physical slots: %s", ex.sqls[0])
+	}
+}
+
+// A NULL restart_lsn (freshly created slot, no WAL reserved yet) must read as 0 rather
+// than erroring the whole listing -- otherwise one new slot hides every other slot's
+// retained WAL.
+func TestPhysicalSlotsEmptyOutputIsNoSlotsNotAnError(t *testing.T) {
+	p := &Prober{Exec: &slotExec{out: ""}}
+	got, err := p.PhysicalSlots(context.Background(), ConnInfo{})
+	if err != nil {
+		t.Fatalf("PhysicalSlots: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %+v, want no slots", got)
+	}
+}
+
+// A malformed row is an error, not a silent skip: silently dropping a row would hide an
+// orphaned slot that is filling the disk.
+func TestPhysicalSlotsMalformedRowIsAnError(t *testing.T) {
+	p := &Prober{Exec: &slotExec{out: "pg_ha_slot_1|t"}}
+	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{}); err == nil {
+		t.Fatal("want an error for a 2-field row, got nil")
+	}
+}
+
+func TestPhysicalSlotsUnparseableRetainedWALIsAnError(t *testing.T) {
+	p := &Prober{Exec: &slotExec{out: "pg_ha_slot_1|t|notanumber"}}
+	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{}); err == nil {
+		t.Fatal("want an error for a non-numeric retained-WAL value, got nil")
+	}
+}
+
+// The create must be idempotent in SQL so a per-tick reconcile does not log a duplicate
+// -name failure forever once the slot exists.
+func TestCreatePhysicalSlotIsIdempotentInSQL(t *testing.T) {
+	ex := &slotExec{}
+	p := &Prober{Exec: ex}
+	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err != nil {
+		t.Fatalf("CreatePhysicalSlot: %v", err)
+	}
+	sql := ex.sqls[0]
+	if !strings.Contains(sql, "pg_create_physical_replication_slot('pg_ha_slot_1')") {
+		t.Errorf("does not create the named slot: %s", sql)
+	}
+	if !strings.Contains(sql, "WHERE NOT EXISTS") {
+		t.Errorf("create is not guarded against an existing slot: %s", sql)
+	}
+}
+
+// "never drop an active slot" must be enforced by the statement itself: a read-then-drop
+// in Go would let a standby reattach in the window between the two.
+func TestDropPhysicalSlotRefusesActiveSlotsInSQL(t *testing.T) {
+	ex := &slotExec{out: ""}
+	p := &Prober{Exec: ex}
+	if _, err := p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9"); err != nil {
+		t.Fatalf("DropPhysicalSlotIfInactive: %v", err)
+	}
+	sql := ex.sqls[0]
+	if !strings.Contains(sql, "NOT active") {
+		t.Errorf("drop is not guarded on inactivity: %s", sql)
+	}
+	if !strings.Contains(sql, "slot_type = 'physical'") {
+		t.Errorf("drop is not restricted to physical slots: %s", sql)
+	}
+}
+
+// The statement must PROJECT the slot name, not the drop function's own result.
+// pg_drop_replication_slot returns void, so `SELECT pg_drop_replication_slot(slot_name)
+// FROM ...` prints an empty line for an affected row under psql -tA -- byte-identical to
+// the zero-row case (verified against PostgreSQL 18). Under that shape the drop still
+// happens but is reported as dropped=false, so the reclaim is never logged and the only
+// observable record of it disappears. This pins the shape that actually reports it.
+func TestDropPhysicalSlotProjectsTheSlotNameNotTheVoidResult(t *testing.T) {
+	ex := &slotExec{out: ""}
+	p := &Prober{Exec: ex}
+	if _, err := p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9"); err != nil {
+		t.Fatalf("DropPhysicalSlotIfInactive: %v", err)
+	}
+	sql := ex.sqls[0]
+	if strings.Contains(sql, "SELECT pg_drop_replication_slot(") {
+		t.Errorf("drop projects the void function result, so an affected row is indistinguishable from none: %s", sql)
+	}
+	if !strings.Contains(sql, "SELECT v.slot_name") {
+		t.Errorf("drop does not project the slot name, so it cannot report what it reclaimed: %s", sql)
+	}
+}
+
+// An empty result means the slot was already gone or is active -- both are "nothing was
+// dropped", not an error the caller should warn about every tick.
+func TestDropPhysicalSlotReportsWhetherARowWasAffected(t *testing.T) {
+	p := &Prober{Exec: &slotExec{out: ""}}
+	dropped, err := p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9")
+	if err != nil || dropped {
+		t.Errorf("empty result: got dropped=%v err=%v, want false/nil", dropped, err)
+	}
+	p = &Prober{Exec: &slotExec{out: "pg_ha_slot_9"}}
+	dropped, err = p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9")
+	if err != nil || !dropped {
+		t.Errorf("non-empty result: got dropped=%v err=%v, want true/nil", dropped, err)
+	}
+}
+
+func TestDropPhysicalSlotPropagatesQueryErrors(t *testing.T) {
+	p := &Prober{Exec: &slotExec{err: errors.New("boom")}}
+	if _, err := p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "pg_ha_slot_9"); err == nil {
+		t.Fatal("want the query error propagated, got nil")
+	}
+}
+
+// Slot names are interpolated into SQL, so anything outside PostgreSQL's own accepted
+// character class must be refused before it reaches the statement.
+func TestSlotNameValidationRejectsInjectionAndAcceptsRealNames(t *testing.T) {
+	bad := []string{
+		"",
+		"pg_ha_slot_1'; DROP TABLE x; --",
+		"pg_ha_slot_1;",
+		"PG_HA_SLOT_1", // upper case: PostgreSQL would reject it too
+		"pg-ha-slot-1",
+		"pg ha slot 1",
+		strings.Repeat("a", 64),
+	}
+	for _, n := range bad {
+		if err := validSlotName(n); err == nil {
+			t.Errorf("validSlotName(%q) = nil, want an error", n)
+		}
+	}
+	for _, n := range []string{"pg_ha_slot_0", "pg_ha_slot_12", "repmgr_slot_1001", strings.Repeat("a", 63)} {
+		if err := validSlotName(n); err != nil {
+			t.Errorf("validSlotName(%q) = %v, want nil", n, err)
+		}
+	}
+}
+
+// The guard must run BEFORE the SQL is built, so a rejected name never reaches psql.
+func TestSlotHelpersRejectBadNamesWithoutQuerying(t *testing.T) {
+	ex := &slotExec{}
+	p := &Prober{Exec: ex}
+	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "bad; name"); err == nil {
+		t.Error("CreatePhysicalSlot accepted an invalid name")
+	}
+	if _, err := p.DropPhysicalSlotIfInactive(context.Background(), ConnInfo{}, "bad; name"); err == nil {
+		t.Error("DropPhysicalSlotIfInactive accepted an invalid name")
+	}
+	if len(ex.sqls) != 0 {
+		t.Errorf("an invalid name reached psql: %v", ex.sqls)
+	}
+}
+
+// A create that loses a create/create race means the slot now EXISTS, which is the
+// caller's goal -- so it must be reported as success, not failure. The WHERE NOT EXISTS
+// guard is NOT atomic (verified against PostgreSQL 18: 40 of 40 concurrent pairs raced),
+// and there are two legitimate independent creators (a cloning standby and the primary's
+// own reconcile), so this path is genuinely reachable at bootstrap.
+func TestCreatePhysicalSlotToleratesLosingACreateRace(t *testing.T) {
+	dup := &slotExec{out: `ERROR:  replication slot "pg_ha_slot_1" already exists`, err: errors.New("exit status 1")}
+	p := &Prober{Exec: dup}
+	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err != nil {
+		t.Errorf("a lost create race must be success (the slot exists), got %v", err)
+	}
+}
+
+// It must NOT swallow an unrelated failure -- a connection error or a permission denial
+// has to surface, or a primary that cannot create slots at all would look healthy.
+func TestCreatePhysicalSlotPropagatesUnrelatedErrors(t *testing.T) {
+	for _, out := range []string{
+		"psql: error: connection to server failed: Connection refused",
+		"ERROR:  permission denied for function pg_create_physical_replication_slot",
+		"ERROR:  all replication slots are in use",
+		"",
+	} {
+		p := &Prober{Exec: &slotExec{out: out, err: errors.New("exit status 1")}}
+		if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err == nil {
+			t.Errorf("error %q was swallowed; only a duplicate-slot race may be treated as success", out)
+		}
+	}
+}
+
+func TestIsDuplicateSlotIsNarrow(t *testing.T) {
+	if IsDuplicateSlot("anything", nil) {
+		t.Error("a nil error is not a duplicate-slot outcome")
+	}
+	if !IsDuplicateSlot(`ERROR:  replication slot "x" already exists`, errors.New("exit 1")) {
+		t.Error("the real PostgreSQL duplicate-slot message was not recognised")
+	}
+	// Both halves are required, so an unrelated "already exists" (a table, a role, a
+	// database) cannot be mistaken for a slot race.
+	for _, out := range []string{
+		`ERROR:  relation "foo" already exists`,
+		`ERROR:  role "repmgr" already exists`,
+		`ERROR:  database "x" already exists`,
+		"replication slot is active",
+	} {
+		if IsDuplicateSlot(out, errors.New("exit 1")) {
+			t.Errorf("IsDuplicateSlot(%q) = true, want false", out)
+		}
+	}
+}
+
+// The production Exec must surface the command's stderr in its error, because psql puts
+// every diagnostic there and exec.ExitError.Error() renders only "exit status N". Without
+// this, IsDuplicateSlot had nothing to match on and a lost create/create race -- the
+// documented, reproducible one -- surfaced as a per-tick warning instead of a no-op. Runs
+// against the real OSExec, since a fake that returns the text as stdout is exactly what
+// hid the gap.
+func TestOSExecSurfacesStderrSoDiagnosticsAreInspectable(t *testing.T) {
+	const msg = `ERROR:  replication slot "pg_ha_slot_1" already exists`
+	out, err := OSExec{}.Run(context.Background(), nil, "sh", "-c", "echo '"+msg+"' >&2; exit 1")
+	if err == nil {
+		t.Fatal("want a non-nil error for a non-zero exit")
+	}
+	if out != "" {
+		t.Errorf("stderr leaked into stdout, which callers parse as query output: %q", out)
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("error message drops the stderr diagnostic: %q", err.Error())
+	}
+	if !IsDuplicateSlot(out, err) {
+		t.Errorf("IsDuplicateSlot cannot recognise a real duplicate-slot failure: out=%q err=%q", out, err.Error())
+	}
+}
+
 // #308: synchronized_standby_slots reconciliation reads this.
 // Pins the specific regression an earlier revision had: filtering on `active` meant a
 // standby restart, a rolling upgrade, or a brief network blip (walsender momentarily
@@ -252,7 +543,10 @@ func TestPhysicalSlotsQueryHasNoActiveFilter(t *testing.T) {
 	if len(ex.calls) != 1 {
 		t.Fatalf("calls = %v, want exactly 1", ex.calls)
 	}
-	if strings.Contains(ex.calls[0], "active") {
+	// #289 SELECTS the active column (the slot gauges report it); what must never come back
+	// is a WHERE that FILTERS on it -- that is the blip regression this pins.
+	where := ex.calls[0][strings.Index(ex.calls[0], "WHERE"):]
+	if strings.Contains(where, "active") {
 		t.Errorf("query must not filter on active (that reintroduces the blip regression): %q", ex.calls[0])
 	}
 	if !strings.Contains(ex.calls[0], "slot_type = 'physical'") {
@@ -260,40 +554,6 @@ func TestPhysicalSlotsQueryHasNoActiveFilter(t *testing.T) {
 	}
 }
 
-func TestPhysicalSlots(t *testing.T) {
-	p := proberWith(fakeExec{slots: "repmgr_slot_1001\nrepmgr_slot_1002\n"})
-	names, err := p.PhysicalSlots(context.Background(), ConnInfo{Host: "x"})
-	if err != nil {
-		t.Fatalf("err = %v", err)
-	}
-	want := []string{"repmgr_slot_1001", "repmgr_slot_1002"}
-	if len(names) != len(want) {
-		t.Fatalf("names = %v, want %v", names, want)
-	}
-	for i := range want {
-		if names[i] != want[i] {
-			t.Fatalf("names = %v, want %v", names, want)
-		}
-	}
-}
-
-func TestPhysicalSlotsEmpty(t *testing.T) {
-	p := proberWith(fakeExec{slots: ""})
-	if names, err := p.PhysicalSlots(context.Background(), ConnInfo{Host: "x"}); err != nil || names != nil {
-		t.Fatalf("empty result must return (nil, nil), got (%v, %v)", names, err)
-	}
-}
-
-func TestPhysicalSlotsUnreachable(t *testing.T) {
-	p := proberWith(fakeExec{err: errors.New("connection refused")})
-	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{Host: "x"}); err == nil {
-		t.Fatal("an unreachable node must return an error")
-	}
-}
-
-// spySlotExec records every SQL statement it is asked to run, and can be told to fail
-// on ALTER SYSTEM specifically -- SetSynchronizedStandbySlots's tests need to assert on
-// call COUNT and ORDER, which fakeExec (shared, value-typed, output-only) does not track.
 type spySlotExec struct {
 	calls    []string
 	alterErr error
@@ -308,10 +568,6 @@ func (s *spySlotExec) Run(_ context.Context, _ []string, _ string, args ...strin
 	return "", nil
 }
 
-// #308: confirmed live that PostgreSQL treats multiple semicolon-separated statements
-// in one simple-query message as an implicit transaction block, and ALTER SYSTEM
-// refuses to run inside one -- so this must be two separate psql invocations, not one
-// combined "ALTER SYSTEM ...; SELECT pg_reload_conf();" string.
 func TestSetSynchronizedStandbySlotsIssuesTwoSeparateStatements(t *testing.T) {
 	ex := &spySlotExec{}
 	p := &Prober{Exec: ex}

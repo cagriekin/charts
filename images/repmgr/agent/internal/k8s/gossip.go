@@ -54,6 +54,28 @@ func (c *Client) PublishStatus(ctx context.Context, podName string, st NodeStatu
 	return nil
 }
 
+// ListPodNames returns the names of every pod matching labelSelector, including self and
+// including pods that have published no gossip status yet.
+//
+// This is deliberately NOT ReadPeerStatuses: that one filters to pods carrying a parseable
+// status annotation, which is the wrong question for "does this pod exist". A pod that is
+// mid-restart, still starting, or has never published gossip is absent from that map but
+// very much present in the cluster -- and treating it as gone is how a replication slot
+// that is still needed gets reclaimed (#289). The live pod list is also the only source
+// that stays correct during a scale-up rollout, when REPMGR_NODE_COUNT is baked into each
+// pod's env at render time and is therefore STALE on every pod that has not rolled yet.
+func (c *Client) ListPodNames(ctx context.Context, labelSelector string) ([]string, error) {
+	pods, err := c.cs.CoreV1().Pods(c.namespace).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+	if err != nil {
+		return nil, fmt.Errorf("list pods: %w", err)
+	}
+	names := make([]string, 0, len(pods.Items))
+	for i := range pods.Items {
+		names = append(names, pods.Items[i].Name)
+	}
+	return names, nil
+}
+
 // ReadPeerStatuses lists pods matching labelSelector and returns each peer's
 // gossiped status keyed by pod name, excluding self. Pods missing the annotation
 // or carrying an unparseable value are skipped (treated as no gossip). Freshness

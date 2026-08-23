@@ -66,6 +66,17 @@ func (c Conn) port() int {
 	return c.Port
 }
 
+// database is the dbname to connect to, defaulting to "postgres" (#289). Only the
+// native slot helpers need a default: conninfo() below is built from a Conn the caller
+// always populates, but a slot create must connect SOMEWHERE even when the caller had no
+// replication DB to name, and "postgres" always exists.
+func (c Conn) database() string {
+	if c.DB == "" {
+		return "postgres"
+	}
+	return c.DB
+}
+
 // conninfo builds a libpq conninfo string WITHOUT the password (that goes via
 // PGPASSWORD), so it never lands in argv or logs.
 func (c Conn) conninfo() string {

@@ -1602,6 +1602,53 @@ agent_pr_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1 || true)
 assert_not_contains "agent monitoring: PrometheusRule not in standalone mode" "${agent_pr_standalone}" "kind: PrometheusRule"
 
+# #289: the replication-slot alerts. An orphaned slot pins WAL and fills the volume with
+# no error until the disk is full, so these two rules are the only thing that turns that
+# silent failure into a page -- assert both the rules and the threshold plumbing.
+assert_contains "#289: PrometheusRule has the retained-WAL alert" "${agent_pr}" "PGHAReplicationSlotRetainingWAL"
+assert_contains "#289: PrometheusRule has the inactive-slot alert" "${agent_pr}" "PGHAReplicationSlotInactive"
+assert_contains "#289: retained-WAL alert reads the max-retained gauge" "${agent_pr}" "pg_ha_agent_replication_slot_max_retained_wal_bytes"
+assert_contains "#289: inactive-slot alert reads the inactive gauge" "${agent_pr}" "pg_ha_agent_replication_slots_inactive"
+# The default threshold must render as a bare integer, not 1.7179869184e+10: Prometheus
+# rejects scientific notation in a comparison, so a float-rendered default would ship an
+# alert that never evaluates.
+assert_contains "#289: default retained-WAL threshold renders as an integer (3Gi)" "${agent_pr}" "> 3221225472"
+# The default MUST stay below the image's max_slot_wal_keep_size = 4GB (4294967296). Past
+# that cap PostgreSQL invalidates the slot rather than letting it fill the volume, and
+# invalidation nulls restart_lsn so this gauge collapses to zero -- a threshold at or above
+# the cap renders an alert no slot can ever trip. The earlier 16Gi default did exactly that.
+threshold=$(printf '%s\n' "${agent_pr}" | sed -n 's/.*replication_slot_max_retained_wal_bytes.*> \([0-9][0-9]*\).*/\1/p' | head -1 || true)
+if [ -z "${threshold}" ] || [ "${threshold}" -ge 4294967296 ]; then
+  fail "#289: default threshold is reachable below max_slot_wal_keep_size" \
+    "rendered threshold '${threshold}' is not below the image's 4GB max_slot_wal_keep_size, so the alert can never fire"
+else
+  pass "#289: default threshold is reachable below max_slot_wal_keep_size"
+fi
+# The invalidated-slot alert is the one that catches the outcome the retained-WAL gauge
+# cannot see, so its absence is a silent hole rather than a missing nicety.
+assert_contains "#289: PrometheusRule has the invalidated-slot alert" "${agent_pr}" "PGHAReplicationSlotInvalidated"
+assert_contains "#289: invalidated-slot alert reads the invalidated gauge" "${agent_pr}" "pg_ha_agent_replication_slots_invalidated"
+assert_not_contains "#289: threshold is not rendered in scientific notation" "${agent_pr}" "e+"
+# The threshold is operator-tunable, and the override must reach the expression.
+agent_pr_thresh=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.monitoring.prometheusRule.enabled=true \
+  --set repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes=1073741824 \
+  --show-only templates/agent-prometheusrule.yaml 2>&1)
+assert_contains "#289: slotRetainedWALBytes override reaches the alert expression" "${agent_pr_thresh}" "> 1073741824"
+assert_not_contains "#289: overridden threshold replaces the default" "${agent_pr_thresh}" "> 3221225472"
+# A non-integer or zero threshold would render an alert that never fires -- rejected by
+# the schema at render time rather than shipping a silently-dead rule.
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.monitoring.prometheusRule.enabled=true \
+  --set repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes=lots \
+  >/dev/null 2>&1 && slot_thresh_str_rc=0 || slot_thresh_str_rc=$?
+assert_eq "#289: a non-integer slotRetainedWALBytes fails the render" "1" "${slot_thresh_str_rc}"
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.monitoring.prometheusRule.enabled=true \
+  --set repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes=0 \
+  >/dev/null 2>&1 && slot_thresh_zero_rc=0 || slot_thresh_zero_rc=$?
+assert_eq "#289: a zero slotRetainedWALBytes fails the render" "1" "${slot_thresh_zero_rc}"
+
 # agent etcd DCS (BYO/shared): backend selectable; etcd env + TLS mount, the leases
 # RBAC dropped, NetworkPolicy egress to 2379; the default kubernetes backend is
 # unaffected; missing endpoints fails fast.
@@ -3815,6 +3862,25 @@ mech_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.agent.mechanism=native \
   --show-only templates/statefulset.yaml 2>&1)
 assert_not_contains "#287: standalone never gets MECHANISM (agent-only)" "${mech_standalone}" "MECHANISM"
+
+# #289: cascading replication makes a STANDBY an upstream, but native-mode slot ownership
+# only ever runs on the primary -- so a cascading child would reference a slot that does
+# not exist on its actual upstream and its walreceiver would refuse to start. Rejected at
+# render time rather than shipping a combination that only breaks at runtime.
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.mechanism=native --set repmgr.agent.cascadingReplication=true \
+  >/dev/null 2>&1 && mech_cascade_rc=0 || mech_cascade_rc=$?
+assert_eq "#289: native + cascadingReplication fails the render" "1" "${mech_cascade_rc}"
+mech_cascade_err=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.mechanism=native --set repmgr.agent.cascadingReplication=true 2>&1 || true)
+assert_contains "#289: the error names both values and the fix" "${mech_cascade_err}" "cascadingReplication is not supported with repmgr.agent.mechanism: native"
+# Neither flag alone may be affected -- this must forbid nothing that worked before.
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.mechanism=native >/dev/null 2>&1 && native_alone_rc=0 || native_alone_rc=$?
+assert_eq "#289: native alone still renders" "0" "${native_alone_rc}"
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.cascadingReplication=true >/dev/null 2>&1 && cascade_alone_rc=0 || cascade_alone_rc=$?
+assert_eq "#289: cascadingReplication alone (repmgr mode) still renders" "0" "${cascade_alone_rc}"
 
 # ======================================================================
 # #262: postgresql.extraVolumes / extraVolumeMounts / extraEnv passthrough,
