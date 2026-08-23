@@ -343,12 +343,14 @@ repmgr:
         enabled: false
         additionalLabels: {}
         # #289: page when one physical replication slot has held back more than this many
-        # bytes of WAL. An orphaned slot pins WAL forever and fills the volume with no
-        # error until the disk is full. Not limited to mechanism: native -- slot ownership
-        # is native-only, but the gauges these alerts read are published under `repmgr`
-        # too (where the agent reports slots but never reclaims them). See the pg chart
-        # README.
-        slotRetainedWALBytes: 17179869184
+        # bytes of WAL. 3Gi, deliberately below the image's max_slot_wal_keep_size = 4GB:
+        # past that cap PostgreSQL invalidates the slot instead of filling the volume, the
+        # standby behind it then needs a full re-clone, and this gauge collapses to zero at
+        # that moment -- so this is the early warning and PGHAReplicationSlotInvalidated
+        # catches the outcome. Not limited to mechanism: native -- slot ownership is
+        # native-only, but the gauges these alerts read are published under `repmgr` too
+        # (where the agent reports slots but never reclaims them). See the pg chart README.
+        slotRetainedWALBytes: 3221225472
 
     # Authenticated control REST API (#276), agent mode only. OFF by default: with
     # control.enabled=false the chart renders exactly as it did before, and port 9200

@@ -2,6 +2,7 @@ package pg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,13 +21,35 @@ type Exec interface {
 // OSExec is the production Exec backed by os/exec.
 type OSExec struct{}
 
-// Run executes name with args, appending env to the current environment, and
-// returns trimmed stdout. Stderr is captured into the error (psql diagnostics).
+// Run executes name with args, appending env to the current environment, and returns
+// trimmed stdout.
+//
+// psql writes its diagnostics to STDERR, and cmd.Output() puts them in
+// exec.ExitError.Stderr -- but ExitError.Error() renders only "exit status N", so an
+// unwrapped error carries none of them. Every caller that inspects the message therefore
+// saw nothing to inspect: IsDuplicateSlot could never match a real create/create race
+// (verified: stdout empty, err.Error() == "exit status 1", the ERROR text only in
+// ExitError.Stderr), and every probe failure logged an opaque "exit status 1" instead of
+// the reason PostgreSQL gave. Fold stderr into the error so both work.
+//
+// Stdout is returned separately and unchanged: callers parse it as query output, so
+// diagnostics must not be mixed into it the way CombinedOutput would.
 func (OSExec) Run(ctx context.Context, env []string, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = append(os.Environ(), env...)
 	out, err := cmd.Output()
-	return strings.TrimSpace(string(out)), err
+	return strings.TrimSpace(string(out)), withStderr(err)
+}
+
+// withStderr rewraps an *exec.ExitError so its message carries the command's stderr,
+// which is where psql puts every diagnostic worth reading. Non-ExitError failures
+// (context deadline, binary not found) already describe themselves and pass through.
+func withStderr(err error) error {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || len(ee.Stderr) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(ee.Stderr)))
 }
 
 // ConnInfo is how to reach one PostgreSQL node. Password is passed via PGPASSWORD,
@@ -302,16 +325,37 @@ func (p *Prober) StandbyNodeIDs(ctx context.Context, ci ConnInfo) ([]int, error)
 // SlotState is one physical replication slot as the primary sees it (#289).
 //
 // RetainedWALBytes is how much WAL the slot is holding back:
-// pg_current_wal_lsn() - restart_lsn. This is the number that turns a silent
-// disk-fill into an alertable signal -- an orphaned slot's retained WAL grows without
-// bound and nothing else reports it until the volume is full. NULL restart_lsn (a
-// freshly created slot that has not reserved WAL yet) reads as 0 rather than being
-// skipped, so a new slot is still enumerated with a truthful "holding nothing" value.
+// pg_current_wal_lsn() - restart_lsn. A NULL restart_lsn reads as 0 rather than being
+// skipped, so a slot is always enumerated -- but 0 is ambiguous on its own, which is
+// exactly what Reserving and WALStatus below disambiguate.
 type SlotState struct {
 	Name             string
 	Active           bool
 	RetainedWALBytes int64
+	// WALStatus is pg_replication_slots.wal_status verbatim, "" when the slot has reserved
+	// no WAL yet. "lost" is the one that matters most: PostgreSQL has INVALIDATED the slot
+	// because it exceeded max_slot_wal_keep_size, so the WAL its consumer needs is gone and
+	// that standby can only recover by a full re-clone.
+	WALStatus string
+	// Reserving is restart_lsn IS NOT NULL -- whether the slot is holding any WAL back at
+	// all. It separates the two states that both read as RetainedWALBytes == 0: a slot
+	// freshly created ahead of its standby (nothing reserved yet, harmless) and an
+	// invalidated one (reservation destroyed, harmful). Verified against PostgreSQL 18:
+	// wal_status is NULL with a NULL restart_lsn before first reservation, and "lost" with
+	// a NULL restart_lsn after invalidation.
+	Reserving bool
 }
+
+// Invalidated reports that PostgreSQL dropped this slot's WAL reservation because the slot
+// exceeded max_slot_wal_keep_size (#289).
+//
+// This is the failure the chart actually ships into, not an unbounded disk-fill: the image
+// sets max_slot_wal_keep_size = 4GB at initdb, so PostgreSQL caps the damage by killing the
+// slot rather than filling the volume. The consequence is quieter and worse to miss -- the
+// standby behind it cannot resume and needs a full re-clone -- and retained-WAL alerting
+// cannot see it, because invalidation sets restart_lsn to NULL and the retained-bytes gauge
+// COLLAPSES TO ZERO at exactly that moment (verified against PostgreSQL 18).
+func (s SlotState) Invalidated() bool { return s.WALStatus == "lost" }
 
 // PhysicalSlots lists the physical replication slots on the node ci points at, with
 // their active flag and retained WAL (#289).
@@ -325,7 +369,8 @@ type SlotState struct {
 // would invite a caller to treat one as an orphan.
 func (p *Prober) PhysicalSlots(ctx context.Context, ci ConnInfo) ([]SlotState, error) {
 	out, err := p.psql(ctx, ci,
-		"SELECT slot_name, active, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint "+
+		"SELECT slot_name, active, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint, "+
+			"COALESCE(wal_status, ''), (restart_lsn IS NOT NULL) "+
 			"FROM pg_replication_slots WHERE slot_type = 'physical' ORDER BY slot_name;")
 	if err != nil {
 		return nil, err
@@ -337,8 +382,8 @@ func (p *Prober) PhysicalSlots(ctx context.Context, ci ConnInfo) ([]SlotState, e
 			continue
 		}
 		parts := strings.Split(line, "|")
-		if len(parts) != 3 {
-			return nil, fmt.Errorf("parse pg_replication_slots row %q: want 3 fields, got %d", line, len(parts))
+		if len(parts) != 5 {
+			return nil, fmt.Errorf("parse pg_replication_slots row %q: want 5 fields, got %d", line, len(parts))
 		}
 		n, perr := strconv.ParseInt(strings.TrimSpace(parts[2]), 10, 64)
 		if perr != nil {
@@ -348,6 +393,8 @@ func (p *Prober) PhysicalSlots(ctx context.Context, ci ConnInfo) ([]SlotState, e
 			Name:             strings.TrimSpace(parts[0]),
 			Active:           strings.TrimSpace(parts[1]) == "t",
 			RetainedWALBytes: n,
+			WALStatus:        strings.TrimSpace(parts[3]),
+			Reserving:        strings.TrimSpace(parts[4]) == "t",
 		})
 	}
 	return slots, nil

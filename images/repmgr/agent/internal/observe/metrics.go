@@ -31,12 +31,15 @@ type Metrics struct {
 	controlRejected        atomic.Int64
 	controlIntents         atomic.Int64
 	controlRestoreRequests atomic.Int64
-	// Physical replication slots as the primary last observed them (#289). An orphaned
-	// slot pins WAL on the primary forever and fills the volume, and nothing else reports
-	// it -- the failure is silent until the disk is full, which is precisely why it needs
-	// a metric and an alert rather than only a log line.
+	// Physical replication slots as the primary last observed them (#289). A neglected
+	// slot fails silently in one of two ways and nothing else reports either: it holds WAL
+	// back until the volume fills, or -- on chart defaults, where the image caps it with
+	// max_slot_wal_keep_size = 4GB -- PostgreSQL invalidates it and the standby behind it
+	// can only recover by a full re-clone. Hence a metric and an alert, not just a log line.
+	// Zeroed on demotion (ClearSlots): only the primary observes slots.
 	slotsTotal              atomic.Int64
 	slotsInactive           atomic.Int64
+	slotsInvalidated        atomic.Int64
 	slotMaxRetainedWALBytes atomic.Int64
 	now                     func() time.Time
 }
@@ -49,8 +52,15 @@ type Metrics struct {
 // much WAL?") is answered by the maximum. Per-slot identity stays in the agent's logs and
 // in pg_replication_slots.
 type SlotStats struct {
-	Total               int64
-	Inactive            int64
+	Total    int64
+	Inactive int64
+	// Invalidated counts slots PostgreSQL has killed for exceeding max_slot_wal_keep_size
+	// (wal_status = "lost"). It needs its own gauge because retained-WAL alerting is blind
+	// to it: invalidation nulls restart_lsn, so MaxRetainedWALBytes collapses to zero at the
+	// exact moment the slot dies. The image sets max_slot_wal_keep_size = 4GB at initdb, so
+	// on chart defaults this -- not an unbounded disk-fill -- is where a neglected slot ends
+	// up, and the standby behind it then needs a full re-clone.
+	Invalidated         int64
 	MaxRetainedWALBytes int64
 }
 
@@ -90,8 +100,16 @@ func (m *Metrics) IncControlRestoreRequest() { m.controlRestoreRequests.Add(1) }
 func (m *Metrics) SetSlots(s SlotStats) {
 	m.slotsTotal.Store(s.Total)
 	m.slotsInactive.Store(s.Inactive)
+	m.slotsInvalidated.Store(s.Invalidated)
 	m.slotMaxRetainedWALBytes.Store(s.MaxRetainedWALBytes)
 }
+
+// ClearSlots zeroes the slot gauges (#289). Only the primary observes slots, so a node that
+// stops being primary must retract what it published rather than leave it standing: the slot
+// alerts aggregate with max() across the release, so one demoted pod still exporting the
+// figures it saw while primary would latch those alerts on for the rest of its process
+// lifetime and keep paging after the condition moved or was resolved.
+func (m *Metrics) ClearSlots() { m.SetSlots(SlotStats{}) }
 
 // Beat records that the reconcile loop ran; call it each tick.
 func (m *Metrics) Beat() { m.lastBeatUnixNs.Store(m.now().UnixNano()) }
@@ -147,7 +165,8 @@ func (m *Metrics) write(w io.Writer) {
 		{"pg_ha_agent_control_intents_total", "Node-local control-API operations handed to the reconcile loop.", "counter", m.controlIntents.Load()},
 		{"pg_ha_agent_control_restore_requests_total", "Restores triggered through the control API.", "counter", m.controlRestoreRequests.Load()},
 		{"pg_ha_agent_replication_slots", "Physical replication slots on this primary.", "gauge", m.slotsTotal.Load()},
-		{"pg_ha_agent_replication_slots_inactive", "Physical replication slots with no active consumer (each pins WAL).", "gauge", m.slotsInactive.Load()},
+		{"pg_ha_agent_replication_slots_inactive", "Physical replication slots reserving WAL with no active consumer.", "gauge", m.slotsInactive.Load()},
+		{"pg_ha_agent_replication_slots_invalidated", "Physical replication slots PostgreSQL invalidated for exceeding max_slot_wal_keep_size; the standby behind each needs a full re-clone.", "gauge", m.slotsInvalidated.Load()},
 		{"pg_ha_agent_replication_slot_max_retained_wal_bytes", "Largest WAL volume retained by any one physical replication slot.", "gauge", m.slotMaxRetainedWALBytes.Load()},
 	} {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %d\n", x.name, x.help, x.name, x.typ, x.name, x.val)

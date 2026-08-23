@@ -383,7 +383,13 @@ func TestNativeCloneCreatesSlotOnUpstreamBeforeStreamingThroughIt(t *testing.T) 
 	for i, c := range fr.calls {
 		joined := strings.Join(c.args, " ")
 		if strings.HasSuffix(c.name, "psql") && strings.Contains(joined, "pg_create_physical_replication_slot") {
-			createIdx = i
+			// FIRST create only. Clone ends by calling Follow, which ensures the slot again
+			// (it is the repoint path's own guarantee, and idempotent) -- so recording the
+			// last match would measure that second call and say nothing about the ordering
+			// that matters, which is create-before-pg_basebackup.
+			if createIdx < 0 {
+				createIdx = i
+			}
 			if !strings.Contains(joined, "WHERE NOT EXISTS") {
 				t.Errorf("slot create is not idempotent; a re-clone would fail: %s", joined)
 			}
@@ -623,5 +629,45 @@ func TestMechanismValidSlotNameMatchesTheProbeGuard(t *testing.T) {
 		if err := validSlotName(n); err != nil {
 			t.Errorf("validSlotName(%q) = %v, want nil", n, err)
 		}
+	}
+}
+
+// A repoint must ensure its own slot on the NEW upstream, not assume that upstream's
+// reconcile already created it (#289 review). primary_slot_name is written unconditionally,
+// and a walreceiver whose named slot is missing does not fall back to slotless streaming --
+// it errors and retries, so the standby streams nothing at all.
+func TestNativeFollowEnsuresTheSlotOnTheNewUpstream(t *testing.T) {
+	fr := &fakeRunner{}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	if err := n.Follow(context.Background(), Conn{Host: "pg-2.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Follow: %v", err)
+	}
+	var created bool
+	for _, c := range fr.calls {
+		joined := strings.Join(c.args, " ")
+		if strings.HasSuffix(c.name, "psql") && strings.Contains(joined, "pg_create_physical_replication_slot('pg_ha_slot_1')") {
+			created = true
+			if !strings.Contains(joined, "pg-2.hl") {
+				t.Errorf("slot created somewhere other than the new upstream: %v", c.args)
+			}
+			if !strings.Contains(joined, "WHERE NOT EXISTS") {
+				t.Errorf("slot create is not idempotent, so a normal repoint would error: %s", joined)
+			}
+		}
+	}
+	if !created {
+		t.Error("Follow repointed with primary_slot_name set but never ensured the slot exists on the upstream")
+	}
+}
+
+// A slot-ensure failure must FAIL the repoint rather than be swallowed: with
+// primary_slot_name naming a slot that does not exist the standby cannot stream either
+// way, so a loud error the agent logs and retries beats a "successful" repoint whose only
+// symptom is a walreceiver looping in the postmaster log.
+func TestNativeFollowFailsWhenTheSlotCannotBeEnsured(t *testing.T) {
+	fr := &fakeRunner{failOn: "pg_create_physical_replication_slot", failOut: "FATAL:  all replication slots are in use"}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	if err := n.Follow(context.Background(), Conn{Host: "pg-2.hl", User: "repmgr", DB: "repmgr"}); err == nil {
+		t.Fatal("Follow reported success despite being unable to create the slot it points at")
 	}
 }

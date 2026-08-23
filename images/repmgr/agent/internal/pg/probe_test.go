@@ -249,16 +249,25 @@ func (s *slotExec) Run(_ context.Context, _ []string, _ string, args ...string) 
 	return s.out, s.err
 }
 
-func TestPhysicalSlotsParsesNameActiveAndRetainedWAL(t *testing.T) {
-	ex := &slotExec{out: "pg_ha_slot_1|t|0\npg_ha_slot_2|f|16777216"}
+// The three states verified against real PostgreSQL 18, in the order the query returns
+// them: a slot created ahead of its standby (wal_status NULL -> "", restart_lsn NULL),
+// a healthy reserving one, and one PostgreSQL invalidated for exceeding
+// max_slot_wal_keep_size (wal_status "lost", restart_lsn back to NULL -- which is why
+// its retained-bytes figure reads 0 and cannot be alerted on).
+func TestPhysicalSlotsParsesNameActiveRetainedWALAndWALStatus(t *testing.T) {
+	ex := &slotExec{out: "pg_ha_slot_1|f|0||f\npg_ha_slot_2|t|16777216|reserved|t\npg_ha_slot_3|f|0|lost|f"}
 	p := &Prober{Exec: ex}
 	got, err := p.PhysicalSlots(context.Background(), ConnInfo{})
 	if err != nil {
 		t.Fatalf("PhysicalSlots: %v", err)
 	}
 	want := []SlotState{
-		{Name: "pg_ha_slot_1", Active: true, RetainedWALBytes: 0},
-		{Name: "pg_ha_slot_2", Active: false, RetainedWALBytes: 16777216},
+		{Name: "pg_ha_slot_1", Active: false, RetainedWALBytes: 0, WALStatus: "", Reserving: false},
+		{Name: "pg_ha_slot_2", Active: true, RetainedWALBytes: 16777216, WALStatus: "reserved", Reserving: true},
+		{Name: "pg_ha_slot_3", Active: false, RetainedWALBytes: 0, WALStatus: "lost", Reserving: false},
+	}
+	if got[2].Invalidated() != true || got[1].Invalidated() != false {
+		t.Errorf("Invalidated() misreads wal_status: %+v", got)
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d slots, want %d: %+v", len(got), len(want), got)
@@ -476,5 +485,28 @@ func TestIsDuplicateSlotIsNarrow(t *testing.T) {
 		if IsDuplicateSlot(out, errors.New("exit 1")) {
 			t.Errorf("IsDuplicateSlot(%q) = true, want false", out)
 		}
+	}
+}
+
+// The production Exec must surface the command's stderr in its error, because psql puts
+// every diagnostic there and exec.ExitError.Error() renders only "exit status N". Without
+// this, IsDuplicateSlot had nothing to match on and a lost create/create race -- the
+// documented, reproducible one -- surfaced as a per-tick warning instead of a no-op. Runs
+// against the real OSExec, since a fake that returns the text as stdout is exactly what
+// hid the gap.
+func TestOSExecSurfacesStderrSoDiagnosticsAreInspectable(t *testing.T) {
+	const msg = `ERROR:  replication slot "pg_ha_slot_1" already exists`
+	out, err := OSExec{}.Run(context.Background(), nil, "sh", "-c", "echo '"+msg+"' >&2; exit 1")
+	if err == nil {
+		t.Fatal("want a non-nil error for a non-zero exit")
+	}
+	if out != "" {
+		t.Errorf("stderr leaked into stdout, which callers parse as query output: %q", out)
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("error message drops the stderr diagnostic: %q", err.Error())
+	}
+	if !IsDuplicateSlot(out, err) {
+		t.Errorf("IsDuplicateSlot cannot recognise a real duplicate-slot failure: out=%q err=%q", out, err.Error())
 	}
 }

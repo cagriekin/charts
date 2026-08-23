@@ -148,6 +148,54 @@
     text with no per-series lifecycle, so a label per slot would leak a stale series on
     every drop.
 
+  A second review pass corrected several defects in the above before release, each verified
+  against real PostgreSQL 18 rather than reasoned about:
+
+  - **The flagship retained-WAL alert could never fire.** The image sets
+    `max_slot_wal_keep_size = 4GB` at initdb, so PostgreSQL never lets a slot fill the
+    volume -- it INVALIDATES the slot instead (`wal_status = 'lost'`), and the standby behind
+    it can then only recover by a full re-clone. Invalidation also nulls `restart_lsn`, so the
+    retained-bytes gauge **collapses to zero at the exact moment the slot dies**: the metric
+    inverts precisely when the failure lands. The default threshold was also 16Gi -- above
+    both the 4GB cap and the default 10Gi data volume. Fixed by adding
+    `pg_ha_agent_replication_slots_invalidated` and a `PGHAReplicationSlotInvalidated`
+    (critical, 5m) rule for the outcome, and lowering `slotRetainedWALBytes` to **3Gi** so the
+    retained-WAL rule works as the early warning ahead of it. A render-time test now fails if
+    the default is ever raised to or above the cap.
+  - **`IsDuplicateSlot` could never match.** `pg.OSExec` used `cmd.Output()`, and
+    `exec.ExitError.Error()` renders only "exit status N" -- psql writes its diagnostics to
+    stderr. So the create/create race documented above surfaced as a per-tick warning rather
+    than the no-op it should be, and every probe failure anywhere in the agent logged an
+    opaque "exit status 1" instead of PostgreSQL's reason. The production Exec now folds
+    stderr into the error (stdout stays clean, since callers parse it as query output).
+  - **A demoted primary kept publishing stale slot gauges.** Only the primary observes slots,
+    but nothing retracted the figures on demotion -- and the alerts aggregate with `max()`
+    across the release, so one ex-primary latched them on for the rest of its process
+    lifetime. Non-primary actions now zero the gauges.
+  - **An inactive slot reserving nothing is no longer counted as inactive.** A slot minted
+    ahead of its standby has a NULL `restart_lsn`; counting it tripped
+    `PGHAReplicationSlotInactive` ("so it is accumulating WAL") over a slot accumulating
+    nothing -- and native pre-creates one per expected ordinal, so that was its DEFAULT state.
+  - **The create and drop passes no longer fight.** Creation ran off `REPMGR_NODE_COUNT` while
+    reclaim ran off the live pod set, so any ordinal inside the stale count with no live pod
+    was created on one tick and dropped on the next -- for the whole duration of a scale-down
+    rollout, since the StatefulSet rolls the ordinal-0 primary last. Creation now skips
+    ordinals with no live pod (a pod that exists but is still cloning is already in that set,
+    so slots are still minted before anything streams).
+  - **Legacy `repmgr_slot_*` reclaim was too narrow to do its job.** Scoping it to departed
+    ordinals left a repmgr->native migration (#292) with a permanent orphan for every node
+    that survived the migration -- the exact case it exists to clean up. Any legacy slot is
+    now reclaimable; the atomic `AND NOT active` in the drop, not the pod set, is what
+    protects one still carrying a stream mid-migration.
+  - **`Follow` now ensures its slot on the new upstream**, as `Clone` and the rewind rejoin
+    already did. It was the one slot-using path that did not, and a walreceiver whose
+    `primary_slot_name` is missing does not fall back to slotless streaming -- it errors and
+    retries, so the standby streams nothing at all.
+  - **The promote-path slot pass runs under its own sub-budget.** On the shared fence budget
+    (5s on chart defaults, against a 10s per-psql timeout) one slow slot query could consume
+    the whole window and leave the promote without its routing switch -- a write outage
+    strictly worse than the WAL gap the call prevents.
+
   Verified end-to-end against real PostgreSQL 18, not only in unit tests: clone through a
   pre-created slot, the slot going active under a live standby, the drop guard refusing that
   active slot without error, an orphaned slot pinning 160MB of WAL after its standby left,

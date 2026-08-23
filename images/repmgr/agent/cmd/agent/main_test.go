@@ -788,11 +788,15 @@ func TestOrphanSlotReclaimsOnlyDepartedOrdinalsAndSelf(t *testing.T) {
 		{"highest live peer", "pg_ha_slot_2", live3, false, "pod-2 exists"},
 		// The primary does not stream from itself, so its own slot is unused.
 		{"own slot while primary", "pg_ha_slot_0", live3, true, "self ordinal"},
-		// Legacy repmgr slots are reclaimable ONLY for departed ordinals -- a live node
-		// may still be carrying its stream through one mid-migration (#292).
+		// Legacy repmgr slots are reclaimable regardless of liveness: native never streams
+		// through one, so every one is dead weight the moment the cluster is on this
+		// mechanism. Scoping them to departed ordinals left a repmgr->native migration
+		// (#292) with a permanent orphan per surviving node -- the exact case it cleans up.
+		// The atomic `AND NOT active` in the drop, not the pod set, is what protects a slot
+		// still carrying a stream mid-migration.
 		{"legacy slot, departed ordinal", "repmgr_slot_1003", live3, true, "no pod-3 exists"},
-		{"legacy slot, LIVE ordinal", "repmgr_slot_1001", live3, false, "pod-1 exists; may still be streaming"},
-		{"legacy slot for self", "repmgr_slot_1000", live3, false, "pod-0 exists; only agent-minted self slots are reclaimed"},
+		{"legacy slot, LIVE ordinal", "repmgr_slot_1001", live3, true, "native never streams through it; NOT active guards a live stream"},
+		{"legacy slot for self", "repmgr_slot_1000", live3, true, "native never streams through it"},
 		// Anything the agent did not mint is left strictly alone.
 		{"operator's own slot", "my_own_slot", live3, false, "not agent-minted"},
 		{"logical-looking slot", "debezium_cdc", live3, false, "not agent-minted"},
@@ -803,7 +807,7 @@ func TestOrphanSlotReclaimsOnlyDepartedOrdinalsAndSelf(t *testing.T) {
 		// standby's slot as orphaned because the API read came back empty.
 		{"empty pod list, peer slot", "pg_ha_slot_1", map[int]bool{}, false, "no authoritative pod set"},
 		{"empty pod list, ghost slot", "pg_ha_slot_9", map[int]bool{}, false, "no authoritative pod set"},
-		{"empty pod list, legacy slot", "repmgr_slot_1009", map[int]bool{}, false, "no authoritative pod set"},
+		{"empty pod list, legacy slot", "repmgr_slot_1009", map[int]bool{}, true, "legacy slots do not depend on the pod set"},
 		{"empty pod list, own slot", "pg_ha_slot_0", map[int]bool{}, true, "self is unused regardless of the pod set"},
 	} {
 		if got := orphanSlot(tc.slot, self, tc.live); got != tc.want {
@@ -864,9 +868,9 @@ func TestSlotOrdinalRecognisesOnlyOwnableNames(t *testing.T) {
 
 func TestSlotMetricsAggregatesCountInactiveAndMaxRetained(t *testing.T) {
 	got := slotMetrics([]pg.SlotState{
-		{Name: "pg_ha_slot_1", Active: true, RetainedWALBytes: 1024},
-		{Name: "pg_ha_slot_2", Active: false, RetainedWALBytes: 16 << 20},
-		{Name: "pg_ha_slot_3", Active: false, RetainedWALBytes: 8 << 20},
+		{Name: "pg_ha_slot_1", Active: true, RetainedWALBytes: 1024, WALStatus: "reserved", Reserving: true},
+		{Name: "pg_ha_slot_2", Active: false, RetainedWALBytes: 16 << 20, WALStatus: "reserved", Reserving: true},
+		{Name: "pg_ha_slot_3", Active: false, RetainedWALBytes: 8 << 20, WALStatus: "extended", Reserving: true},
 	})
 	if got.Total != 3 {
 		t.Errorf("Total = %d, want 3", got.Total)
@@ -880,6 +884,43 @@ func TestSlotMetricsAggregatesCountInactiveAndMaxRetained(t *testing.T) {
 	empty := slotMetrics(nil)
 	if empty.Total != 0 || empty.Inactive != 0 || empty.MaxRetainedWALBytes != 0 {
 		t.Errorf("no slots: got %+v, want all zero", empty)
+	}
+}
+
+// A slot the primary pre-created for a standby that has not arrived is inactive and
+// reserves NOTHING (restart_lsn NULL). Counting it as inactive would fire
+// PGHAReplicationSlotInactive -- "so it is accumulating WAL" -- over a slot accumulating
+// nothing, and native mode pre-creates one per expected ordinal, so that is the DEFAULT
+// state there rather than an edge case.
+func TestSlotMetricsIgnoresSlotsThatReserveNothing(t *testing.T) {
+	got := slotMetrics([]pg.SlotState{
+		{Name: "pg_ha_slot_1", Active: false, RetainedWALBytes: 0, WALStatus: "", Reserving: false},
+	})
+	if got.Total != 1 {
+		t.Errorf("Total = %d, want 1 (the slot still exists and must be enumerated)", got.Total)
+	}
+	if got.Inactive != 0 {
+		t.Errorf("Inactive = %d, want 0: a slot reserving no WAL is not accumulating any", got.Inactive)
+	}
+}
+
+// An invalidated slot needs its OWN gauge: exceeding max_slot_wal_keep_size (4GB by default
+// in this image) nulls restart_lsn, so the retained-bytes figure collapses to zero at the
+// instant the slot dies. Read through the bytes gauge alone, the worst outcome -- a standby
+// that can now only recover by a full re-clone -- is indistinguishable from the healthiest.
+func TestSlotMetricsCountsInvalidatedSlotsSeparately(t *testing.T) {
+	got := slotMetrics([]pg.SlotState{
+		{Name: "pg_ha_slot_1", Active: false, RetainedWALBytes: 0, WALStatus: "lost", Reserving: false},
+		{Name: "pg_ha_slot_2", Active: true, RetainedWALBytes: 4096, WALStatus: "reserved", Reserving: true},
+	})
+	if got.Invalidated != 1 {
+		t.Errorf("Invalidated = %d, want 1", got.Invalidated)
+	}
+	if got.MaxRetainedWALBytes != 4096 {
+		t.Errorf("MaxRetainedWALBytes = %d: the invalidated slot reports 0 bytes, which is exactly why it needs its own gauge", got.MaxRetainedWALBytes)
+	}
+	if got.Inactive != 0 {
+		t.Errorf("Inactive = %d, want 0: an invalidated slot reserves nothing, and it is counted as invalidated instead", got.Inactive)
 	}
 }
 
@@ -944,7 +985,7 @@ func TestSlotsTickObservesUnderEveryMechanismAndMutatesOnlyInNative(t *testing.T
 		t.Run(tc.name, func(t *testing.T) {
 			// One slot for a departed ordinal (2, outside the live pod set below), inactive
 			// and pinning WAL: reclaimable under native, untouchable under repmgr.
-			ex := &slotExec{rows: "pg_ha_slot_2|f|4096\n"}
+			ex := &slotExec{rows: "pg_ha_slot_2|f|4096|reserved|t\n"}
 			a := newSlotTestAgent(t, ex, tc.mechanism)
 
 			a.slotsTick(context.Background())

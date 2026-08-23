@@ -87,8 +87,16 @@
   they read are published under `repmgr` too (where the agent reports slots and never
   reclaims them), because an alert that can only fire under an experimental flag reads as
   coverage while providing none. New value:
-  `repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes` (default 16Gi). See the
-  [pg chart README](../pg/README.md#replication-slot-ownership-289).
+  `repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes` (default **3Gi**).
+
+  A third alert, `PGHAReplicationSlotInvalidated`, is the one that fires on chart defaults:
+  the image caps slots with `max_slot_wal_keep_size = 4GB`, so PostgreSQL invalidates a
+  neglected slot rather than letting it fill the volume -- and invalidation nulls
+  `restart_lsn`, so the retained-WAL gauge collapses to zero at exactly that moment. The
+  retained-WAL threshold is therefore the early warning and must stay below the 4GB cap. See
+  the [pg chart README](../pg/README.md#replication-slot-ownership-289) for the full second
+  review pass (stderr-blind error matching, stale gauges on a demoted primary, create/drop
+  oscillation, legacy-slot reclaim scope, `Follow` slot ensure, promote sub-budget).
 
 - **`repmgr.agent.mechanism`: an experimental native HA mechanism, alongside repmgr
   (#287).** Inherited from pg's symlinked agent/templates. Off by default

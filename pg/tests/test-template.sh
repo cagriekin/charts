@@ -845,7 +845,22 @@ assert_contains "#289: inactive-slot alert reads the inactive gauge" "${agent_pr
 # The default threshold must render as a bare integer, not 1.7179869184e+10: Prometheus
 # rejects scientific notation in a comparison, so a float-rendered default would ship an
 # alert that never evaluates.
-assert_contains "#289: default retained-WAL threshold renders as an integer (16Gi)" "${agent_pr}" "> 17179869184"
+assert_contains "#289: default retained-WAL threshold renders as an integer (3Gi)" "${agent_pr}" "> 3221225472"
+# The default MUST stay below the image's max_slot_wal_keep_size = 4GB (4294967296). Past
+# that cap PostgreSQL invalidates the slot rather than letting it fill the volume, and
+# invalidation nulls restart_lsn so this gauge collapses to zero -- a threshold at or above
+# the cap renders an alert no slot can ever trip. The earlier 16Gi default did exactly that.
+threshold=$(printf '%s\n' "${agent_pr}" | sed -n 's/.*replication_slot_max_retained_wal_bytes.*> \([0-9][0-9]*\).*/\1/p' | head -1 || true)
+if [ -z "${threshold}" ] || [ "${threshold}" -ge 4294967296 ]; then
+  fail "#289: default threshold is reachable below max_slot_wal_keep_size" \
+    "rendered threshold '${threshold}' is not below the image's 4GB max_slot_wal_keep_size, so the alert can never fire"
+else
+  pass "#289: default threshold is reachable below max_slot_wal_keep_size"
+fi
+# The invalidated-slot alert is the one that catches the outcome the retained-WAL gauge
+# cannot see, so its absence is a silent hole rather than a missing nicety.
+assert_contains "#289: PrometheusRule has the invalidated-slot alert" "${agent_pr}" "PGHAReplicationSlotInvalidated"
+assert_contains "#289: invalidated-slot alert reads the invalidated gauge" "${agent_pr}" "pg_ha_agent_replication_slots_invalidated"
 assert_not_contains "#289: threshold is not rendered in scientific notation" "${agent_pr}" "e+"
 # The threshold is operator-tunable, and the override must reach the expression.
 agent_pr_thresh=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
@@ -853,7 +868,7 @@ agent_pr_thresh=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-
   --set repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes=1073741824 \
   --show-only templates/agent-prometheusrule.yaml 2>&1)
 assert_contains "#289: slotRetainedWALBytes override reaches the alert expression" "${agent_pr_thresh}" "> 1073741824"
-assert_not_contains "#289: overridden threshold replaces the default" "${agent_pr_thresh}" "> 17179869184"
+assert_not_contains "#289: overridden threshold replaces the default" "${agent_pr_thresh}" "> 3221225472"
 # A non-integer or zero threshold would render an alert that never fires -- rejected by
 # the schema at render time rather than shipping a silently-dead rule.
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \

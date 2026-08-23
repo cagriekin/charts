@@ -239,6 +239,23 @@ func (n *Native) Follow(ctx context.Context, upstream Conn) error {
 		// to write into primary_conninfo. Fail loudly rather than write a broken conninfo.
 		return fmt.Errorf("native: follow needs upstream.Host (node_id %d is not addressable)", upstream.NodeID)
 	}
+	// #289: ensure this node's slot exists on the upstream BEFORE pointing at it, the same
+	// way Clone and RejoinForceRewind do -- this was the one slot-using path that did not.
+	//
+	// writeManagedConf below sets primary_slot_name, and a walreceiver whose named slot is
+	// missing does NOT fall back to slotless streaming: it errors with `replication slot
+	// "..." does not exist` and retries, so the standby streams nothing at all. On a repoint
+	// after failover the new primary's own reconcile has usually created it already, but
+	// "usually" is the wrong guarantee here -- that create can have failed transiently, or
+	// been skipped entirely because the slot list read failed on that tick.
+	//
+	// Failing the Follow on error is deliberate rather than best-effort: with
+	// primary_slot_name pointing at a slot that does not exist the standby cannot stream
+	// either way, so a loud error the agent logs and retries beats a "successful" repoint
+	// whose only symptom is a walreceiver looping in the postmaster log.
+	if err := n.ensureSlotOnUpstream(ctx, upstream); err != nil {
+		return err
+	}
 	if err := n.writeManagedConf(upstream.conninfo()); err != nil {
 		return err
 	}
