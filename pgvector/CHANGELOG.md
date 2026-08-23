@@ -72,6 +72,34 @@
 
 ### Added
 
+- **The agent owns physical replication slot lifecycle in native mode (#289).** Inherited
+  from pg's symlinked agent/templates. repmgr mode is untouched (repmgr keeps owning slots
+  there). Under `mechanism: native` the agent creates `pg_ha_slot_<ordinal>` on the upstream
+  before every clone and rejoin (so `pg_basebackup`/`pg_rewind` stream through it and no WAL
+  gap can open), reconciles slots on every primary tick, and drops orphans -- never an
+  active one, never one belonging to a pod that still exists (decided from the live
+  Kubernetes pod list, not the render-time `REPMGR_NODE_COUNT`, which is stale on a
+  not-yet-rolled pod during a scale-up), and never while paused. `cascadingReplication` is
+  rejected at render time together with `native`. Three new metrics plus two `PrometheusRule`
+  alerts (`PGHAReplicationSlotRetainingWAL`, `PGHAReplicationSlotInactive`) make an
+  orphaned slot -- which otherwise pins WAL and fills the volume with no error until the
+  disk is full -- alertable. Those are **not** native-only: ownership is, but the gauges
+  they read are published under `repmgr` too (where the agent reports slots and never
+  reclaims them), because an alert that can only fire under an experimental flag reads as
+  coverage while providing none. New value:
+  `repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes` (default **3Gi**).
+
+  A third alert, `PGHAReplicationSlotInvalidated`, is the one that fires on chart defaults:
+  the image caps slots with `max_slot_wal_keep_size = 4GB`, so PostgreSQL invalidates a
+  neglected slot rather than letting it fill the volume -- and invalidation nulls
+  `restart_lsn`, so the retained-WAL gauge collapses to zero at exactly that moment. The
+  retained-WAL threshold is therefore the early warning and must stay below the 4GB cap. See
+  the [pg chart README](../pg/README.md#replication-slot-ownership-289) for the full second
+  review pass (stderr-blind error matching, stale gauges on a demoted primary, create/drop
+  oscillation, legacy-slot reclaim scope, `Follow` slot ensure, promote sub-budget, and a
+  demoted primary reclaiming the slots it minted -- which also needed a standby-safe slot
+  query, since `pg_current_wal_lsn()` raises `recovery is in progress` on a standby).
+
 - **`repmgr.agent.mechanism`: an experimental native HA mechanism, alongside repmgr
   (#287).** Inherited from pg's symlinked agent/templates. Off by default
   (`mechanism: repmgr`); `native` drives PostgreSQL's own tools directly instead of the

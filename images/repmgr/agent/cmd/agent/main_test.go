@@ -12,8 +12,15 @@ import (
 	"testing"
 	"time"
 
+	"net/http/httptest"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+
 	"github.com/cagriekin/pg-ha-agent/internal/config"
 	"github.com/cagriekin/pg-ha-agent/internal/dcs"
+	"github.com/cagriekin/pg-ha-agent/internal/k8s"
 	"github.com/cagriekin/pg-ha-agent/internal/mechanism"
 	"github.com/cagriekin/pg-ha-agent/internal/observe"
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
@@ -721,5 +728,419 @@ func TestCleanupGhostNodesSkippedUnderNativeMechanism(t *testing.T) {
 	}
 	if len(ex.unregistered) != 0 {
 		t.Fatalf("expected no unregister under native mechanism, got %v", ex.unregistered)
+	}
+}
+
+// --- #289: replication slot ownership ---
+
+func TestSlotNameForIsOrdinalDerivedAndStable(t *testing.T) {
+	for _, tc := range []struct{ pod, want string }{
+		{"pg-0", "pg_ha_slot_0"},
+		{"pg-1", "pg_ha_slot_1"},
+		{"my-release-pg-12", "pg_ha_slot_12"},
+		// No parseable ordinal: better slotless than an unstable name that strands a
+		// new slot on every restart.
+		{"pg", ""},
+		{"pg-abc", ""},
+		{"", ""},
+	} {
+		if got := slotNameFor(tc.pod); got != tc.want {
+			t.Errorf("slotNameFor(%q) = %q, want %q", tc.pod, got, tc.want)
+		}
+	}
+}
+
+// The slot name must be one PostgreSQL accepts, for every ordinal the chart can produce
+// -- a name rejected at create time would leave the standby slotless with only a per-tick
+// warning. PostgreSQL allows lower-case letters, digits and underscore, max 63 chars;
+// asserted here directly so this stays honest even if the probe's own guard drifts.
+func TestSlotNameForProducesAValidSlotName(t *testing.T) {
+	for _, ord := range []int{0, 1, 9, 10, 99, 1000} {
+		name := slotNameFor(fmt.Sprintf("pg-%d", ord))
+		if name == "" || len(name) > 63 {
+			t.Errorf("slotNameFor(pg-%d) = %q: empty or over 63 chars", ord, name)
+			continue
+		}
+		for _, r := range name {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+				continue
+			}
+			t.Errorf("slotNameFor(pg-%d) = %q contains %q, which PostgreSQL rejects in a slot name", ord, name, r)
+		}
+	}
+}
+
+func TestOrphanSlotReclaimsOnlyDepartedOrdinalsAndSelf(t *testing.T) {
+	const self = "pg-0"
+	live3 := map[int]bool{0: true, 1: true, 2: true} // a 3-pod StatefulSet
+	for _, tc := range []struct {
+		name string
+		slot string
+		live map[int]bool
+		want bool
+		why  string
+	}{
+		// Departed ordinals: the pod is gone, nobody will ever reattach.
+		{"ghost above the live range", "pg_ha_slot_3", live3, true, "no pod-3 exists"},
+		{"ghost far above", "pg_ha_slot_9", live3, true, "no pod-9 exists"},
+		// Live peers: their standby is expected to stream through this slot.
+		{"live peer", "pg_ha_slot_1", live3, false, "pod-1 exists"},
+		{"highest live peer", "pg_ha_slot_2", live3, false, "pod-2 exists"},
+		// The primary does not stream from itself, so its own slot is unused.
+		{"own slot while primary", "pg_ha_slot_0", live3, true, "self ordinal"},
+		// Legacy repmgr slots are reclaimable regardless of liveness: native never streams
+		// through one, so every one is dead weight the moment the cluster is on this
+		// mechanism. Scoping them to departed ordinals left a repmgr->native migration
+		// (#292) with a permanent orphan per surviving node -- the exact case it cleans up.
+		// The atomic `AND NOT active` in the drop, not the pod set, is what protects a slot
+		// still carrying a stream mid-migration.
+		{"legacy slot, departed ordinal", "repmgr_slot_1003", live3, true, "no pod-3 exists"},
+		{"legacy slot, LIVE ordinal", "repmgr_slot_1001", live3, true, "native never streams through it; NOT active guards a live stream"},
+		{"legacy slot for self", "repmgr_slot_1000", live3, true, "native never streams through it"},
+		// Anything the agent did not mint is left strictly alone.
+		{"operator's own slot", "my_own_slot", live3, false, "not agent-minted"},
+		{"logical-looking slot", "debezium_cdc", live3, false, "not agent-minted"},
+		{"prefix but no ordinal", "pg_ha_slot_abc", live3, false, "unparseable ordinal"},
+		{"legacy prefix but no ordinal", "repmgr_slot_abc", live3, false, "unparseable ordinal"},
+		{"legacy id below the base", "repmgr_slot_7", live3, false, "not a node_id this agent assigned"},
+		// An empty/failed pod list must reclaim nothing but self -- never treat every
+		// standby's slot as orphaned because the API read came back empty.
+		{"empty pod list, peer slot", "pg_ha_slot_1", map[int]bool{}, false, "no authoritative pod set"},
+		{"empty pod list, ghost slot", "pg_ha_slot_9", map[int]bool{}, false, "no authoritative pod set"},
+		{"empty pod list, legacy slot", "repmgr_slot_1009", map[int]bool{}, true, "legacy slots do not depend on the pod set"},
+		{"empty pod list, own slot", "pg_ha_slot_0", map[int]bool{}, true, "self is unused regardless of the pod set"},
+	} {
+		if got := orphanSlot(tc.slot, self, tc.live); got != tc.want {
+			t.Errorf("%s: orphanSlot(%q, %q, %v) = %v, want %v (%s)",
+				tc.name, tc.slot, self, tc.live, got, tc.want, tc.why)
+		}
+	}
+}
+
+// The scale-up regression this guards (review finding): REPMGR_NODE_COUNT is baked into
+// each pod at render time, so during a scale-up rollout the not-yet-rolled primary holds
+// the OLD count. Deciding ownership from the LIVE pod set instead means a brand-new
+// standby's just-created slot survives even while the primary's own NodeCount still says
+// that ordinal should not exist -- and it is briefly inactive between pg_basebackup
+// finishing and its postmaster reattaching, which is exactly when a drop would land.
+func TestOrphanSlotSurvivesAScaleUpWithAStalePrimaryNodeCount(t *testing.T) {
+	// Scaled 2 -> 3: pod-2 now exists, but the primary still believes NodeCount == 2.
+	live := map[int]bool{0: true, 1: true, 2: true}
+	if orphanSlot("pg_ha_slot_2", "pg-0", live) {
+		t.Error("pg_ha_slot_2 reclaimed during a scale-up: a live standby's slot must never be dropped, even when the primary's NodeCount is stale")
+	}
+}
+
+// A promoted pod's own slot becomes reclaimable, and the ex-primary's does not: ownership
+// follows whoever currently holds the lease, so the set shifts on failover.
+func TestOrphanSlotSelfSlotFollowsTheCurrentPrimary(t *testing.T) {
+	live := map[int]bool{0: true, 1: true, 2: true}
+	if !orphanSlot("pg_ha_slot_1", "pg-1", live) {
+		t.Error("pg-1 as primary should reclaim its own slot pg_ha_slot_1")
+	}
+	if orphanSlot("pg_ha_slot_0", "pg-1", live) {
+		t.Error("pg-1 as primary must NOT reclaim pg-0's slot -- pg-0 is a live standby streaming through it")
+	}
+}
+
+func TestSlotOrdinalRecognisesOnlyOwnableNames(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ord  int
+		ok   bool
+	}{
+		{"pg_ha_slot_0", 0, true},
+		{"pg_ha_slot_12", 12, true},
+		{"repmgr_slot_1000", 0, true},
+		{"repmgr_slot_1002", 2, true},
+		{"repmgr_slot_999", 0, false}, // below nodeIDBase: not our numbering
+		{"pg_ha_slot_-1", 0, false},
+		{"pg_ha_slot_", 0, false},
+		{"my_own_slot", 0, false},
+		{"", 0, false},
+	} {
+		ord, ok := slotOrdinal(tc.name)
+		if ok != tc.ok || (ok && ord != tc.ord) {
+			t.Errorf("slotOrdinal(%q) = (%d, %v), want (%d, %v)", tc.name, ord, ok, tc.ord, tc.ok)
+		}
+	}
+}
+
+func TestSlotMetricsAggregatesCountInactiveAndMaxRetained(t *testing.T) {
+	got := slotMetrics([]pg.SlotState{
+		{Name: "pg_ha_slot_1", Active: true, RetainedWALBytes: 1024, WALStatus: "reserved", Reserving: true},
+		{Name: "pg_ha_slot_2", Active: false, RetainedWALBytes: 16 << 20, WALStatus: "reserved", Reserving: true},
+		{Name: "pg_ha_slot_3", Active: false, RetainedWALBytes: 8 << 20, WALStatus: "extended", Reserving: true},
+	})
+	if got.Total != 3 {
+		t.Errorf("Total = %d, want 3", got.Total)
+	}
+	if got.Inactive != 2 {
+		t.Errorf("Inactive = %d, want 2", got.Inactive)
+	}
+	if got.MaxRetainedWALBytes != 16<<20 {
+		t.Errorf("MaxRetainedWALBytes = %d, want %d", got.MaxRetainedWALBytes, 16<<20)
+	}
+	empty := slotMetrics(nil)
+	if empty.Total != 0 || empty.Inactive != 0 || empty.MaxRetainedWALBytes != 0 {
+		t.Errorf("no slots: got %+v, want all zero", empty)
+	}
+}
+
+// A slot the primary pre-created for a standby that has not arrived is inactive and
+// reserves NOTHING (restart_lsn NULL). Counting it as inactive would fire
+// PGHAReplicationSlotInactive -- "so it is accumulating WAL" -- over a slot accumulating
+// nothing, and native mode pre-creates one per expected ordinal, so that is the DEFAULT
+// state there rather than an edge case.
+func TestSlotMetricsIgnoresSlotsThatReserveNothing(t *testing.T) {
+	got := slotMetrics([]pg.SlotState{
+		{Name: "pg_ha_slot_1", Active: false, RetainedWALBytes: 0, WALStatus: "", Reserving: false},
+	})
+	if got.Total != 1 {
+		t.Errorf("Total = %d, want 1 (the slot still exists and must be enumerated)", got.Total)
+	}
+	if got.Inactive != 0 {
+		t.Errorf("Inactive = %d, want 0: a slot reserving no WAL is not accumulating any", got.Inactive)
+	}
+}
+
+// An invalidated slot needs its OWN gauge: exceeding max_slot_wal_keep_size (4GB by default
+// in this image) nulls restart_lsn, so the retained-bytes figure collapses to zero at the
+// instant the slot dies. Read through the bytes gauge alone, the worst outcome -- a standby
+// that can now only recover by a full re-clone -- is indistinguishable from the healthiest.
+func TestSlotMetricsCountsInvalidatedSlotsSeparately(t *testing.T) {
+	got := slotMetrics([]pg.SlotState{
+		{Name: "pg_ha_slot_1", Active: false, RetainedWALBytes: 0, WALStatus: "lost", Reserving: false},
+		{Name: "pg_ha_slot_2", Active: true, RetainedWALBytes: 4096, WALStatus: "reserved", Reserving: true},
+	})
+	if got.Invalidated != 1 {
+		t.Errorf("Invalidated = %d, want 1", got.Invalidated)
+	}
+	if got.MaxRetainedWALBytes != 4096 {
+		t.Errorf("MaxRetainedWALBytes = %d: the invalidated slot reports 0 bytes, which is exactly why it needs its own gauge", got.MaxRetainedWALBytes)
+	}
+	if got.Inactive != 0 {
+		t.Errorf("Inactive = %d, want 0: an invalidated slot reserves nothing, and it is counted as invalidated instead", got.Inactive)
+	}
+}
+
+// slotExec answers the three slot statements and records what was asked, so a test can
+// distinguish "looked at the slots" from "changed them".
+type slotExec struct {
+	rows    string // pg_replication_slots output, "name|active|bytes" per line
+	listed  int
+	created []string
+	dropped []string
+}
+
+func (s *slotExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
+	joined := strings.Join(args, " ")
+	switch {
+	case name == "psql" && strings.Contains(joined, "pg_create_physical_replication_slot"):
+		s.created = append(s.created, slotArg(joined))
+		return "", nil
+	case name == "psql" && strings.Contains(joined, "pg_drop_replication_slot"):
+		s.dropped = append(s.dropped, slotArg(joined))
+		return slotArg(joined), nil
+	case name == "psql" && strings.Contains(joined, "pg_replication_slots"):
+		s.listed++
+		return s.rows, nil
+	}
+	return "", nil
+}
+
+// slotArg pulls the first quoted slot name out of a statement, which is enough to identify
+// which slot it acted on without parsing SQL.
+func slotArg(sql string) string {
+	i := strings.Index(sql, "'")
+	if i < 0 {
+		return ""
+	}
+	rest := sql[i+1:]
+	j := strings.Index(rest, "'")
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
+}
+
+// #289: slot OBSERVATION runs under EVERY mechanism; slot MUTATION only under native.
+//
+// The split matters because the chart renders the two slot PrometheusRules for every
+// agent-mode release regardless of mechanism. If the gauges were published only in native
+// mode, those alerts would sit pinned at zero on the DEFAULT mechanism -- an alert that
+// cannot fire reads as coverage while providing none, which is worse than shipping none.
+// Mutation stays gated: under the repmgr mechanism repmgr owns slot lifecycle, and two
+// owners fighting over the same slots is worse than one.
+func TestSlotsTickObservesUnderEveryMechanismAndMutatesOnlyInNative(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		mechanism  string
+		wantMutate bool
+	}{
+		{"repmgr (absent, the default)", "", false},
+		{"repmgr (explicit)", config.MechanismRepmgr, false},
+		{"native", config.MechanismNative, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// One slot for a departed ordinal (2, outside the live pod set below), inactive
+			// and pinning WAL: reclaimable under native, untouchable under repmgr.
+			ex := &slotExec{rows: "pg_ha_slot_2|f|4096|reserved|t\n"}
+			a := newSlotTestAgent(t, ex, tc.mechanism)
+
+			a.slotsTick(context.Background())
+
+			if ex.listed == 0 {
+				t.Errorf("slots were never listed, so the gauges the shipped alerts read stay at zero")
+			}
+			if body := scrapeMetrics(t, a); !strings.Contains(body, "pg_ha_agent_replication_slot_max_retained_wal_bytes 4096") {
+				t.Errorf("retained-WAL gauge not published under mechanism %q: %s", tc.mechanism, body)
+			}
+			mutated := len(ex.created) > 0 || len(ex.dropped) > 0
+			if mutated != tc.wantMutate {
+				t.Errorf("mutated=%v (created=%v dropped=%v), want %v under mechanism %q",
+					mutated, ex.created, ex.dropped, tc.wantMutate, tc.mechanism)
+			}
+		})
+	}
+}
+
+// A failed slot list must not be read as "there are no slots": creating or dropping on that
+// basis is how a slot a standby still needs gets destroyed (#289).
+func TestSlotsTickMutatesNothingWhenTheSlotListFails(t *testing.T) {
+	ex := &slotExec{rows: "not-three-fields\n"} // parse failure inside PhysicalSlots
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+
+	a.slotsTick(context.Background())
+
+	if len(ex.created) > 0 || len(ex.dropped) > 0 {
+		t.Errorf("mutated slots on an unreadable list: created=%v dropped=%v", ex.created, ex.dropped)
+	}
+}
+
+// newSlotTestAgent wires a real Prober over ex plus a fake apiserver holding pods 0 and 1,
+// so the live-pod-set half of the reconcile is exercised rather than stubbed.
+func newSlotTestAgent(t *testing.T, ex *slotExec, mech string) *agent {
+	t.Helper()
+	cs := k8sfake.NewSimpleClientset(
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pg-0", Namespace: "ns", Labels: map[string]string{"app": "pg"}}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pg-1", Namespace: "ns", Labels: map[string]string{"app": "pg"}}},
+	)
+	return &agent{
+		cfg: &config.Config{
+			PodName:        "pg-0",
+			Namespace:      "ns",
+			PodSelector:    "app=pg",
+			NodeCount:      2,
+			Mechanism:      mech,
+			RepmgrUser:     "repmgr",
+			RepmgrDB:       "repmgr",
+			RepmgrPassword: "pw",
+		},
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		kube:   k8s.NewWithClient(cs, "ns"),
+		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
+		metr:   observe.New(),
+	}
+}
+
+// scrapeMetrics reads the agent's real metrics endpoint, so the assertion covers what a
+// Prometheus scrape would actually see rather than an internal field.
+func scrapeMetrics(t *testing.T, a *agent) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	a.metr.Handler(time.Minute).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	return rec.Body.String()
+}
+
+// #289 review: a demoted primary keeps every slot it minted while it WAS the primary --
+// pg_basebackup and pg_rewind both exclude pg_replslot, and a plain Follow touches nothing.
+// Those slots go inactive and an inactive slot restricts WAL removal on a standby exactly as
+// it does on a primary, so the ex-primary's own pg_wal grows without bound on its own volume.
+// It does not self-heal on a later re-promotion either: by then those ordinals have live pods
+// again, so the primary reconcile reads them as live peers' slots and leaves them alone.
+func TestStandbySlotsTickReclaimsSlotsLeftBehindByADemotion(t *testing.T) {
+	// Two slots this node minted while primary, for ordinals whose pods are very much alive
+	// (they stream from the NEW primary now) -- which is precisely why the primary-side
+	// pod-set test cannot reclaim them.
+	ex := &slotExec{rows: "pg_ha_slot_1|f|16777216|reserved|t\npg_ha_slot_2|f|8388608|reserved|t\n"}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+
+	a.standbySlotsTick(context.Background())
+
+	if len(ex.dropped) != 2 {
+		t.Fatalf("dropped %v, want both leftover slots reclaimed", ex.dropped)
+	}
+	if len(ex.created) != 0 {
+		t.Errorf("a standby created slots (%v): it is never an upstream under this mechanism", ex.created)
+	}
+}
+
+// Observation is mechanism-agnostic (a standby holding WAL back must be visible), mutation
+// is native-only -- under repmgr, repmgr owns slot lifecycle and two owners would fight.
+func TestStandbySlotsTickPublishesUnderRepmgrButReclaimsNothing(t *testing.T) {
+	ex := &slotExec{rows: "pg_ha_slot_1|f|16777216|reserved|t\n"}
+	a := newSlotTestAgent(t, ex, config.MechanismRepmgr)
+
+	a.standbySlotsTick(context.Background())
+
+	if len(ex.dropped) != 0 {
+		t.Errorf("reclaimed %v under the repmgr mechanism, where repmgr owns slot lifecycle", ex.dropped)
+	}
+	if body := scrapeMetrics(t, a); !strings.Contains(body, "pg_ha_agent_replication_slot_max_retained_wal_bytes 16777216") {
+		t.Errorf("a standby holding 16MiB of WAL back published nothing: %s", body)
+	}
+}
+
+// What a standby may reclaim is decided by NAME alone, with no ordinal or pod-set test: a
+// standby is never an upstream under this mechanism (its own slot lives on its upstream, and
+// cascadingReplication + native is rejected at render time), so the ordinal a leftover names
+// says nothing about whether it is still needed. An operator's slot stays untouchable.
+func TestLeftoverStandbySlotClaimsOnlyAgentMintedAndLegacyNames(t *testing.T) {
+	for _, tc := range []struct {
+		slot string
+		want bool
+		why  string
+	}{
+		{"pg_ha_slot_0", true, "agent-minted"},
+		{"pg_ha_slot_7", true, "agent-minted, ordinal irrelevant on a standby"},
+		{"repmgr_slot_1001", true, "native never streams through a legacy slot"},
+		{"my_own_slot", false, "operator's"},
+		{"debezium_cdc", false, "a logical subscription's"},
+		{"pg_ha_slot_abc", false, "unparseable ordinal: not a name this agent mints"},
+	} {
+		if got := leftoverStandbySlot(tc.slot); got != tc.want {
+			t.Errorf("leftoverStandbySlot(%q) = %v, want %v (%s)", tc.slot, got, tc.want, tc.why)
+		}
+	}
+}
+
+// The gauges must be retracted when a node is neither primary nor a steady-state standby,
+// but NOT on Follow -- that is the branch a demoted ex-primary settles into, and it is where
+// leftover slots reserving WAL on its own volume have to stay visible.
+func TestFollowKeepsPublishingSlotGaugesWhileOtherActionsRetractThem(t *testing.T) {
+	for _, tc := range []struct {
+		action reconcile.Action
+		want   bool
+	}{
+		{reconcile.Promote, true},
+		{reconcile.StayPrimary, true},
+		{reconcile.Follow, true},
+		{reconcile.DemoteFence, false},
+		{reconcile.NoOp, false},
+	} {
+		m := observe.New()
+		m.SetSlots(observe.SlotStats{Total: 3, Inactive: 1, MaxRetainedWALBytes: 4096})
+		switch tc.action {
+		case reconcile.Promote, reconcile.StayPrimary, reconcile.Follow:
+		default:
+			m.ClearSlots()
+		}
+		rec := httptest.NewRecorder()
+		m.Handler(time.Minute).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+		kept := strings.Contains(rec.Body.String(), "pg_ha_agent_replication_slot_max_retained_wal_bytes 4096")
+		if kept != tc.want {
+			t.Errorf("action %v: gauges kept=%v, want %v", tc.action, kept, tc.want)
+		}
 	}
 }

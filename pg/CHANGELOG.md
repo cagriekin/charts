@@ -72,6 +72,150 @@
 
 ### Added
 
+- **The agent owns physical replication slot lifecycle in native mode (#289).** Under the
+  repmgr mechanism repmgr creates, names and attaches slots itself; native mode had nobody
+  doing it, and an unowned slot is the most dangerous loose end in the exit -- an orphaned
+  slot pins WAL on the primary forever and fills the volume, raising **no error at all**
+  until the disk is full. repmgr mode is untouched (repmgr keeps owning slots there).
+
+  Slots are named `pg_ha_slot_<pod ordinal>` -- ordinal-derived so a pod restart reattaches
+  to the same slot instead of stranding one, and prefixed so ownership is decidable: the
+  agent creates and drops only names it can prove it minted, never an operator's slot or a
+  logical slot for a subscription.
+
+  - **Create before clone.** `pg_basebackup` now streams through the node's own named slot,
+    created on the upstream *first*, so no WAL gap can open between the base backup starting
+    and the walreceiver attaching. Created idempotently via SQL rather than `pg_basebackup
+    -C`: `-C` fails outright when the slot already exists (verified), which is the normal
+    case for a re-clone -- so `-C` would break exactly the retry path that matters most.
+    `primary_slot_name` in the managed fragment holds the slot for the ongoing stream. A
+    rewind-based rejoin ensures its slot the same way, rather than relying on the new
+    primary's reconcile having already run. The `WHERE NOT EXISTS` create guard is *not*
+    atomic (verified: 40 of 40 concurrent pairs race on PostgreSQL 18) and two legitimate
+    independent creators exist, so losing that race is treated as success -- the slot
+    exists, which is the goal -- while any unrelated failure still surfaces.
+  - **Reconcile on every primary tick.** The lease holder creates a slot for every expected
+    peer ordinal and drops orphans. Creation is driven by the *expected* pod set
+    (`REPMGR_NODE_COUNT`), not observed standbys, because a slot must exist before its
+    standby streams; on the `Promote` path it is sequenced **ahead of the routing switch**,
+    so surviving standbys never race slot creation when they follow the new primary.
+  - **Dropping is decided from the LIVE pod set read from the Kubernetes API**, never from
+    `REPMGR_NODE_COUNT`. That variable is baked into each pod's env at render time, so
+    during a scale-up rollout every pod that has not rolled yet -- including, typically, the
+    ordinal-0 primary, which the StatefulSet rolls last -- still holds the OLD count.
+    Deciding ownership from it would make the stale primary classify a brand-new standby's
+    just-created slot as a scale-down ghost and drop it, precisely while that standby is
+    briefly inactive between `pg_basebackup` finishing and its postmaster reattaching --
+    reintroducing the WAL gap this change exists to close. A failed pod list skips the drop
+    pass for that tick rather than falling back to a guess.
+  - **Never drops an active slot.** The `AND NOT active` predicate lives in the SQL, making
+    the guard atomic with the drop -- a read-then-decide in Go would leave a window for a
+    standby to reattach in between, and dropping an in-use slot breaks its replication.
+    Verified live against a real streaming standby: the drop is refused, no error, and the
+    standby keeps streaming. Reclaimed cases are an agent-minted slot for a **departed**
+    ordinal, the primary's own slot (it does not stream from itself), and a legacy
+    `repmgr_slot_*` for a departed ordinal -- native never streams through one, so it is
+    dead weight, and this is what keeps a future repmgr->native migration (#292) from
+    leaving a permanent orphan. Legacy slots are scoped to departed ordinals for the same
+    reason live ones are: inactivity alone is not evidence a consumer is gone, it is also
+    what a routine restart looks like, so a LIVE node's repmgr slot is left alone even
+    mid-migration. An empty or failed pod list reclaims nothing but self.
+  - **Only the lease holder mutates slots**, and `Decide` returns `NoOp` before any primary
+    branch while paused, so a maintenance window cannot drop anything.
+  - **`cascadingReplication` + `native` is rejected at render time.** Cascading makes a
+    standby an upstream, but slot reconcile runs only on the primary, so a cascading child
+    would name a slot that does not exist on its actual upstream and its walreceiver would
+    refuse to start. Both flags are independently opt-in, so this forbids nothing that
+    worked before.
+  - **Observability, and this half is NOT native-only.** Three new gauges --
+    `pg_ha_agent_replication_slots`, `..._replication_slots_inactive`,
+    `..._replication_slot_max_retained_wal_bytes` -- plus two `PrometheusRule` alerts:
+    `PGHAReplicationSlotRetainingWAL` (critical, over
+    `repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes`, default 16Gi, for 15m)
+    and `PGHAReplicationSlotInactive` (warning, 1h). This is the page that turns a silent
+    disk-fill into a signal.
+
+    Slot *ownership* is native-mode mechanics, but slot *observation* is not gated on the
+    mechanism: the primary publishes these gauges under `repmgr` too. Repmgr mode has slots
+    as well (`repmgr_slot_*`), they pin WAL in exactly the same silent way, and the chart
+    renders these rules for every agent-mode release -- so gauges that only moved under
+    `native` would have shipped an alert that can never fire, which reads as coverage while
+    providing none. The agent still never *touches* a slot under the repmgr mechanism
+    (repmgr owns lifecycle there); it reports what it sees, so a sustained breach in repmgr
+    mode is the operator's to resolve.
+
+    Aggregates rather than per-slot labels on purpose: this metrics surface is hand-written
+    text with no per-series lifecycle, so a label per slot would leak a stale series on
+    every drop.
+
+  A second review pass corrected several defects in the above before release, each verified
+  against real PostgreSQL 18 rather than reasoned about:
+
+  - **The flagship retained-WAL alert could never fire.** The image sets
+    `max_slot_wal_keep_size = 4GB` at initdb, so PostgreSQL never lets a slot fill the
+    volume -- it INVALIDATES the slot instead (`wal_status = 'lost'`), and the standby behind
+    it can then only recover by a full re-clone. Invalidation also nulls `restart_lsn`, so the
+    retained-bytes gauge **collapses to zero at the exact moment the slot dies**: the metric
+    inverts precisely when the failure lands. The default threshold was also 16Gi -- above
+    both the 4GB cap and the default 10Gi data volume. Fixed by adding
+    `pg_ha_agent_replication_slots_invalidated` and a `PGHAReplicationSlotInvalidated`
+    (critical, 5m) rule for the outcome, and lowering `slotRetainedWALBytes` to **3Gi** so the
+    retained-WAL rule works as the early warning ahead of it. A render-time test now fails if
+    the default is ever raised to or above the cap.
+  - **`IsDuplicateSlot` could never match.** `pg.OSExec` used `cmd.Output()`, and
+    `exec.ExitError.Error()` renders only "exit status N" -- psql writes its diagnostics to
+    stderr. So the create/create race documented above surfaced as a per-tick warning rather
+    than the no-op it should be, and every probe failure anywhere in the agent logged an
+    opaque "exit status 1" instead of PostgreSQL's reason. The production Exec now folds
+    stderr into the error (stdout stays clean, since callers parse it as query output).
+  - **A demoted primary kept publishing stale slot gauges.** Only the primary observes slots,
+    but nothing retracted the figures on demotion -- and the alerts aggregate with `max()`
+    across the release, so one ex-primary latched them on for the rest of its process
+    lifetime. Non-primary actions now zero the gauges.
+  - **An inactive slot reserving nothing is no longer counted as inactive.** A slot minted
+    ahead of its standby has a NULL `restart_lsn`; counting it tripped
+    `PGHAReplicationSlotInactive` ("so it is accumulating WAL") over a slot accumulating
+    nothing -- and native pre-creates one per expected ordinal, so that was its DEFAULT state.
+  - **The create and drop passes no longer fight.** Creation ran off `REPMGR_NODE_COUNT` while
+    reclaim ran off the live pod set, so any ordinal inside the stale count with no live pod
+    was created on one tick and dropped on the next -- for the whole duration of a scale-down
+    rollout, since the StatefulSet rolls the ordinal-0 primary last. Creation now skips
+    ordinals with no live pod (a pod that exists but is still cloning is already in that set,
+    so slots are still minted before anything streams).
+  - **Legacy `repmgr_slot_*` reclaim was too narrow to do its job.** Scoping it to departed
+    ordinals left a repmgr->native migration (#292) with a permanent orphan for every node
+    that survived the migration -- the exact case it exists to clean up. Any legacy slot is
+    now reclaimable; the atomic `AND NOT active` in the drop, not the pod set, is what
+    protects one still carrying a stream mid-migration.
+  - **`Follow` now ensures its slot on the new upstream**, as `Clone` and the rewind rejoin
+    already did. It was the one slot-using path that did not, and a walreceiver whose
+    `primary_slot_name` is missing does not fall back to slotless streaming -- it errors and
+    retries, so the standby streams nothing at all.
+  - **A demoted primary now reclaims the slots it minted while it was primary.** Reconcile was
+    primary-only, and `pg_basebackup`/`pg_rewind` both exclude `pg_replslot`, so an ex-primary
+    kept every `pg_ha_slot_*` it had created -- inactive, since those standbys had moved to the
+    new primary -- and an inactive slot restricts WAL removal on a standby exactly as it does
+    on a primary, so its own `pg_wal` grew until `max_slot_wal_keep_size` invalidated them.
+    Nor did it self-heal on a re-promotion: those ordinals have live pods by then, so the
+    primary-side pod-set test reads the leftovers as live peers' slots. The slot pass now runs
+    on the standby branch too (ahead of the follow latch, which returns early every tick in
+    exactly that steady state). The standby policy needs no pod set: under `native` a standby is
+    never an upstream, so every agent-minted slot found locally is a leftover. Listing slots on
+    a standby also required a standby-safe query -- `pg_current_wal_lsn()` raises `recovery is in
+    progress` there, which had been returning an EMPTY listing and hiding the leftovers -- so it
+    now branches on `pg_is_in_recovery()` and uses the last received LSN. Verified on a real
+    streaming PostgreSQL 18 pair: the leftover is reported with its reserved WAL, reclaimed, and
+    the standby keeps streaming, while an active slot on the primary is still refused.
+  - **The promote-path slot pass runs under its own sub-budget.** On the shared fence budget
+    (5s on chart defaults, against a 10s per-psql timeout) one slow slot query could consume
+    the whole window and leave the promote without its routing switch -- a write outage
+    strictly worse than the WAL gap the call prevents.
+
+  Verified end-to-end against real PostgreSQL 18, not only in unit tests: clone through a
+  pre-created slot, the slot going active under a live standby, the drop guard refusing that
+  active slot without error, an orphaned slot pinning 160MB of WAL after its standby left,
+  and reclaim freeing it again.
+
 - **`repmgr.agent.mechanism`: an experimental native HA mechanism, alongside repmgr
   (#287).** repmgr ([upstream development has stalled](https://github.com/EnterpriseDB/repmgr))
   is still the default and the only supported mechanism; this adds a second implementation
@@ -93,8 +237,8 @@
   `repmgr.nodes` for the primary to register, before the Go agent ever runs -- has no
   `MECHANISM` awareness. Verified live: with any replicas, that poll times out and every
   standby sits `Init:CrashLoopBackOff` forever; the primary itself comes up and serves fine.
-  `#289` (nothing owns replication slots, so a primary can recycle WAL a standby still needs)
-  is the second blocker once #288 lands. `#294` tracks promoting `native` to supported.
+  `#289` (replication slot ownership) has since landed -- see the entry above -- leaving
+  #288 as the sole remaining blocker. `#294` tracks promoting `native` to supported.
 
   Verified that native mode inherits the mechanism-agnostic safety behaviors already in
   reconcile/probe rather than needing its own copies -- in particular the `#297` scale-up

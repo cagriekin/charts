@@ -2,6 +2,7 @@ package pg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,13 +21,35 @@ type Exec interface {
 // OSExec is the production Exec backed by os/exec.
 type OSExec struct{}
 
-// Run executes name with args, appending env to the current environment, and
-// returns trimmed stdout. Stderr is captured into the error (psql diagnostics).
+// Run executes name with args, appending env to the current environment, and returns
+// trimmed stdout.
+//
+// psql writes its diagnostics to STDERR, and cmd.Output() puts them in
+// exec.ExitError.Stderr -- but ExitError.Error() renders only "exit status N", so an
+// unwrapped error carries none of them. Every caller that inspects the message therefore
+// saw nothing to inspect: IsDuplicateSlot could never match a real create/create race
+// (verified: stdout empty, err.Error() == "exit status 1", the ERROR text only in
+// ExitError.Stderr), and every probe failure logged an opaque "exit status 1" instead of
+// the reason PostgreSQL gave. Fold stderr into the error so both work.
+//
+// Stdout is returned separately and unchanged: callers parse it as query output, so
+// diagnostics must not be mixed into it the way CombinedOutput would.
 func (OSExec) Run(ctx context.Context, env []string, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = append(os.Environ(), env...)
 	out, err := cmd.Output()
-	return strings.TrimSpace(string(out)), err
+	return strings.TrimSpace(string(out)), withStderr(err)
+}
+
+// withStderr rewraps an *exec.ExitError so its message carries the command's stderr,
+// which is where psql puts every diagnostic worth reading. Non-ExitError failures
+// (context deadline, binary not found) already describe themselves and pass through.
+func withStderr(err error) error {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || len(ee.Stderr) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(ee.Stderr)))
 }
 
 // ConnInfo is how to reach one PostgreSQL node. Password is passed via PGPASSWORD,
@@ -297,6 +320,200 @@ func (p *Prober) StandbyNodeIDs(ctx context.Context, ci ConnInfo) ([]int, error)
 		ids = append(ids, n)
 	}
 	return ids, nil
+}
+
+// SlotState is one physical replication slot as the primary sees it (#289).
+//
+// RetainedWALBytes is how much WAL the slot is holding back:
+// pg_current_wal_lsn() - restart_lsn. A NULL restart_lsn reads as 0 rather than being
+// skipped, so a slot is always enumerated -- but 0 is ambiguous on its own, which is
+// exactly what Reserving and WALStatus below disambiguate.
+type SlotState struct {
+	Name             string
+	Active           bool
+	RetainedWALBytes int64
+	// WALStatus is pg_replication_slots.wal_status verbatim, "" when the slot has reserved
+	// no WAL yet. "lost" is the one that matters most: PostgreSQL has INVALIDATED the slot
+	// because it exceeded max_slot_wal_keep_size, so the WAL its consumer needs is gone and
+	// that standby can only recover by a full re-clone.
+	WALStatus string
+	// Reserving is restart_lsn IS NOT NULL -- whether the slot is holding any WAL back at
+	// all. It separates the two states that both read as RetainedWALBytes == 0: a slot
+	// freshly created ahead of its standby (nothing reserved yet, harmless) and an
+	// invalidated one (reservation destroyed, harmful). Verified against PostgreSQL 18:
+	// wal_status is NULL with a NULL restart_lsn before first reservation, and "lost" with
+	// a NULL restart_lsn after invalidation.
+	Reserving bool
+}
+
+// Invalidated reports that PostgreSQL dropped this slot's WAL reservation because the slot
+// exceeded max_slot_wal_keep_size (#289).
+//
+// This is the failure the chart actually ships into, not an unbounded disk-fill: the image
+// sets max_slot_wal_keep_size = 4GB at initdb, so PostgreSQL caps the damage by killing the
+// slot rather than filling the volume. The consequence is quieter and worse to miss -- the
+// standby behind it cannot resume and needs a full re-clone -- and retained-WAL alerting
+// cannot see it, because invalidation sets restart_lsn to NULL and the retained-bytes gauge
+// COLLAPSES TO ZERO at exactly that moment (verified against PostgreSQL 18).
+func (s SlotState) Invalidated() bool { return s.WALStatus == "lost" }
+
+// PhysicalSlots lists the physical replication slots on the node ci points at, with
+// their active flag and retained WAL (#289).
+//
+// Works on a STANDBY as well as a primary, which the obvious form of this query does not:
+// pg_current_wal_lsn() is primary-only and raises `ERROR: recovery is in progress` on a
+// standby (verified against PostgreSQL 18), so the whole listing came back empty there.
+// That mattered once a demoted primary had to be able to reclaim the slots it minted while
+// it was the primary -- slots that keep reserving WAL on the ex-primary's own volume, with
+// nothing consuming them (verified: a leftover slot on a live streaming standby reports
+// 16MB reserved and wal_status = reserved). The CASE picks the standby's last RECEIVED LSN
+// instead, which is that node's own end-of-WAL and therefore the right reference for how
+// much a local slot is holding back. pg_current_wal_lsn() is volatile, so it is not
+// evaluated on the branch not taken.
+//
+// Deliberately unfiltered by name: the caller decides which slots it owns. The agent
+// must SEE every physical slot to report retained WAL for all of them (an orphan it
+// does not own still fills the disk), even where it will refuse to drop them.
+//
+// Logical slots are excluded (slot_type='physical'): those belong to the operator's
+// subscriptions, the agent never creates or drops them, and enumerating them here
+// would invite a caller to treat one as an orphan.
+func (p *Prober) PhysicalSlots(ctx context.Context, ci ConnInfo) ([]SlotState, error) {
+	out, err := p.psql(ctx, ci,
+		"SELECT slot_name, active, COALESCE(pg_wal_lsn_diff("+
+			"CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_lsn() END, "+
+			"restart_lsn), 0)::bigint, "+
+			"COALESCE(wal_status, ''), (restart_lsn IS NOT NULL) "+
+			"FROM pg_replication_slots WHERE slot_type = 'physical' ORDER BY slot_name;")
+	if err != nil {
+		return nil, err
+	}
+	var slots []SlotState
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "|")
+		if len(parts) != 5 {
+			return nil, fmt.Errorf("parse pg_replication_slots row %q: want 5 fields, got %d", line, len(parts))
+		}
+		n, perr := strconv.ParseInt(strings.TrimSpace(parts[2]), 10, 64)
+		if perr != nil {
+			return nil, fmt.Errorf("parse retained WAL bytes %q for slot %q: %w", parts[2], parts[0], perr)
+		}
+		slots = append(slots, SlotState{
+			Name:             strings.TrimSpace(parts[0]),
+			Active:           strings.TrimSpace(parts[1]) == "t",
+			RetainedWALBytes: n,
+			WALStatus:        strings.TrimSpace(parts[3]),
+			Reserving:        strings.TrimSpace(parts[4]) == "t",
+		})
+	}
+	return slots, nil
+}
+
+// CreatePhysicalSlot creates a physical replication slot if it does not already exist
+// (#289).
+//
+// Two layers, because one is not enough:
+//
+//   - The WHERE NOT EXISTS guard makes the ordinary repeat call a silent no-op rather than
+//     the duplicate-name error pg_create_physical_replication_slot raises. This runs on
+//     every primary tick, so without it the log would carry a spurious failure forever
+//     once the slot exists.
+//   - IsDuplicateSlot on the returned error, because that guard is NOT atomic. Verified
+//     against PostgreSQL 18: two callers racing the same not-yet-existing name both pass
+//     the NOT EXISTS check and one loses with "already exists" -- reproducibly, in 40 of
+//     40 concurrent pairs. Two legitimate, independent creators exist (a cloning standby
+//     creating its own slot, and the primary's own periodic reconcile), so this race is
+//     reachable at bootstrap and must not surface as a failure.
+//
+// "The slot exists" is the caller's goal, and both paths achieve it, so both are success.
+//
+// name is validated before interpolation; it is interpolated into SQL, so an unvalidated
+// name would be an injection vector.
+func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name string) error {
+	if err := validSlotName(name); err != nil {
+		return err
+	}
+	out, err := p.psql(ctx, ci, fmt.Sprintf(
+		"SELECT pg_create_physical_replication_slot('%s') "+
+			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '%s');", name, name))
+	if err != nil && IsDuplicateSlot(out, err) {
+		return nil
+	}
+	return err
+}
+
+// IsDuplicateSlot reports whether a failed slot create lost a create/create race, i.e. the
+// slot now exists -- which is the outcome the caller wanted (#289).
+//
+// Matched on message text because psql surfaces the server error only as combined output
+// plus a non-zero exit status; there is no SQLSTATE to read through this transport. Kept
+// narrow (the literal phrase PostgreSQL uses for duplicate_object on a slot) so it cannot
+// swallow an unrelated failure, and exported so the mechanism layer can apply the same
+// judgement to its own clone-time create without duplicating the string.
+func IsDuplicateSlot(out string, err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(out + " " + err.Error())
+	return strings.Contains(s, "already exists") && strings.Contains(s, "replication slot")
+}
+
+// DropPhysicalSlotIfInactive drops a physical slot only when it is not active (#289).
+//
+// The `AND NOT active` lives in the SQL, not in Go, on purpose: it makes "never drop a
+// slot someone is streaming through" atomic with the drop itself. A read-then-decide in
+// Go would leave a window where a standby reattaches between the list and the drop, and
+// dropping an in-use slot breaks that standby's replication. The same predicate makes
+// the statement a no-op (not an error) when the slot is already gone, so a concurrent
+// removal or a repeated call is silent rather than a per-tick warning.
+//
+// Returns whether a row was affected, so the caller can log only real drops. Detecting
+// that through psql means the statement has to PROJECT something: pg_drop_replication_slot
+// returns void, so selecting it directly prints an empty line for an affected row --
+// indistinguishable from the zero-row case under -tA (verified against PostgreSQL 18), and
+// the reclaim would then never be logged even though it happened. Hence the CTE plus a
+// lateral call: the predicate still lives in SQL, the function is still evaluated exactly
+// once per matching slot, and the slot NAME is what comes back.
+//
+// Verified against PostgreSQL 18: an inactive slot prints its name and is gone; a slot held
+// active by a real walsender prints nothing, exits 0, and survives; an absent slot prints
+// nothing and exits 0.
+func (p *Prober) DropPhysicalSlotIfInactive(ctx context.Context, ci ConnInfo, name string) (dropped bool, err error) {
+	if err := validSlotName(name); err != nil {
+		return false, err
+	}
+	out, err := p.psql(ctx, ci, fmt.Sprintf(
+		"WITH victim AS (SELECT slot_name FROM pg_replication_slots "+
+			"WHERE slot_name = '%s' AND slot_type = 'physical' AND NOT active) "+
+			"SELECT v.slot_name FROM victim v, pg_drop_replication_slot(v.slot_name);", name))
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
+// validSlotName rejects anything PostgreSQL would not accept as a slot name, which is
+// also exactly the character class that is safe to interpolate into the SQL above.
+// PostgreSQL restricts slot names to lower-case letters, digits and underscore; nothing
+// in that set can terminate a quoted literal, so a name that passes here cannot inject.
+func validSlotName(name string) error {
+	if name == "" {
+		return fmt.Errorf("replication slot name is empty")
+	}
+	if len(name) > 63 {
+		return fmt.Errorf("replication slot name %q is longer than 63 characters", name)
+	}
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			continue
+		}
+		return fmt.Errorf("invalid replication slot name %q: only lower-case letters, digits and underscore are allowed", name)
+	}
+	return nil
 }
 
 // Probe classifies a node by its actual role and reads the WAL position relevant
