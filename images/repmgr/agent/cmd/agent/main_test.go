@@ -1425,6 +1425,33 @@ func TestBootstrapInitdbNativeDoesNotStartAfterLosingTheLease(t *testing.T) {
 	}
 }
 
+// Refusing to start is necessary but not sufficient: the data directory is initialized and no
+// highwater marker exists yet, so this pod would sit HasData=true forever -- never eligible for
+// BootstrapClone again, and rejected by assertSameCluster on every rejoin because the new holder
+// created its own cluster with a different system_identifier. Only a PVC delete would recover
+// it. The directory has never served a client, so it must be discarded (#288 review).
+func TestBootstrapInitdbNativeDiscardsTheDataDirWhenTheLeaseIsLost(t *testing.T) {
+	ex := &initdbExec{}
+	pm := &fakePostmaster{}
+	a := newBootstrapTestAgentWithPM(t, ex, config.MechanismNative, pm)
+	a.dcs = &fakeDCS{leader: false}
+	// Stand in for what a real initdb leaves behind; WipeDataDir keys on PG_VERSION.
+	if err := os.WriteFile(filepath.Join(a.cfg.PGDATA, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.act(context.Background(),
+		reconcile.Decision{Action: reconcile.BootstrapInitdb},
+		reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if process.HasData(a.cfg.PGDATA) {
+		t.Error("the orphaned cluster was left on disk: this pod can now never clone or rejoin")
+	}
+	if pm.started {
+		t.Error("started read-write after losing the lease")
+	}
+}
+
 // #288 review: a clone in flight opens its own replication connection (pg_basebackup -X
 // stream). Counting it inflated the replica count, and taking its application_name at face
 // value hid the pod the slot would have identified.

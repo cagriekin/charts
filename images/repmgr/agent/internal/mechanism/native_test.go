@@ -716,3 +716,27 @@ func TestNativeFollowOmitsApplicationNameWhenNodeNameIsEmpty(t *testing.T) {
 		t.Errorf("emitted application_name with no NodeName set:\n%s", string(b))
 	}
 }
+
+// #288 review: GenerateConfig re-reads the primary_conninfo already on disk and writes it back,
+// so an unconditional application_name append accumulated a copy on every agent boot. A standby
+// already streaming never re-enters Follow, so nothing ever rewrote it cleanly.
+func TestNativeApplicationNameIsNotAppendedTwice(t *testing.T) {
+	n, dataDir := newTestNativeWithSlot(t, &fakeRunner{}, "pg_ha_slot_1")
+	n.NodeName = "pg-1"
+	if err := n.Follow(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Follow: %v", err)
+	}
+	// Four more agent boots.
+	for i := 0; i < 4; i++ {
+		if err := n.GenerateConfig(context.Background(), NodeIdentity{DataDir: dataDir}, ConfigOpts{}); err != nil {
+			t.Fatalf("GenerateConfig: %v", err)
+		}
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(b), "application_name="); n != 1 {
+		t.Errorf("application_name appears %d times after repeated boots, want 1:\n%s", n, string(b))
+	}
+}

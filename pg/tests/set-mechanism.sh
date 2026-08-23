@@ -41,10 +41,20 @@ sed -i "s/^    mechanism: .*/    mechanism: ${MECH}/" "${VALUES}"
 # it has to reach BOTH the postgresql container and repmgr-init -- the init container is the one
 # that used to poll repmgr.nodes forever, so a leg where only the main container got the value
 # would still crash-loop its standbys while looking correctly configured.
+# Render the tree AS-IS. An earlier revision passed --set postgresql.majorVersion=18 here,
+# which broke every native PG17 leg: CI runs set-pg-major.sh first, so the tree already carries
+# majorVersion 17, and the override tripped the repmgr-image/major cross-check validator. The
+# render then failed outright, stderr was discarded, `grep -c || true` turned it into 0, and the
+# script exited with a misleading "rendered 0 MECHANISM env entries". Never override values the
+# overlay is not responsible for, and never hide the render's own error.
 want=0
 [ "${MECH}" = "native" ] && want=2
-got="$(helm template ci "${CHART_DIR}" --set postgresql.majorVersion=18 \
-        --show-only templates/statefulset.yaml 2>/dev/null | grep -c 'name: MECHANISM' || true)"
+render="$(helm template ci "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1)" || {
+  echo "FATAL: the chart does not render with mechanism=${MECH}:" >&2
+  printf '%s\n' "${render}" | tail -20 >&2
+  exit 1
+}
+got="$(printf '%s\n' "${render}" | grep -c 'name: MECHANISM' || true)"
 if [ "${got}" != "${want}" ]; then
   echo "FATAL: rendered ${got} MECHANISM env entries, want ${want} for mechanism=${MECH}" >&2
   exit 1

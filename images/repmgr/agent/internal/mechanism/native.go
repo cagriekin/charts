@@ -167,7 +167,14 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 		// to the conninfo rather than set as a separate GUC because primary_conninfo is what the
 		// walreceiver actually dials; a bare application_name GUC would name the postmaster's
 		// own sessions, not the replication connection.
-		if n.NodeName != "" {
+		// Idempotent: GenerateConfig feeds currentPrimaryConninfo() -- the value already on
+		// disk -- straight back in, so an unconditional append accumulated a copy on every
+		// agent boot (#288 review). A standby that is already streaming never re-enters Follow
+		// (the streamingFromTarget latch short-circuits it), so nothing rewrote it cleanly:
+		// after four boots the GUC read `... application_name=pg-1 application_name=pg-1
+		// application_name=pg-1 application_name=pg-1`. libpq takes the last, so replication
+		// kept working while the value grew without bound.
+		if n.NodeName != "" && !strings.Contains(primaryConninfo, "application_name=") {
 			primaryConninfo = fmt.Sprintf("%s application_name=%s", primaryConninfo, n.NodeName)
 		}
 		// Single-quoted and escaped: a host or user containing a quote would otherwise break

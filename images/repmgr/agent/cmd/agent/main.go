@@ -1042,6 +1042,23 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 	if err := a.writePgHba(); err != nil {
 		return fmt.Errorf("bootstrap initdb: write pg_hba: %w", err)
 	}
+	// The conf.d include, which nothing else writes on a fresh native install (#288 review).
+	// The setup-config init container is guarded on postgresql.conf already existing, and it
+	// runs before PGDATA does; the only other writer is the postStart hook, whose fixed ~30s
+	// pg_isready loop now has to cover lease acquisition AND a reconcile tick AND initdb. If it
+	// overruns, the include is silently absent and every postgresql.configuration / TLS /
+	// pgbackrest conf.d setting is missing -- and standbys clone that same config. Doing it
+	// here removes the race entirely.
+	//
+	// Presence of the directory is a faithful proxy for "some conf.d feature is enabled": the
+	// chart mounts it only then. setup-config remains the authority on every later boot,
+	// including removal, and EnsureConfdInclude converges either way.
+	if entries, derr := os.ReadDir(confdDir); derr == nil && len(entries) > 0 {
+		if err := pgconf.EnsureConfdInclude(filepath.Join(a.cfg.PGDATA, "postgresql.conf"), confdDir, true); err != nil {
+			return fmt.Errorf("bootstrap initdb: ensure the conf.d include: %w", err)
+		}
+		a.log.Info("wrote the conf.d include for a fresh native install", "dir", confdDir)
+	}
 	// Holdership re-check before going read-write (#288 review). The exec above is
 	// deliberately not fence-bounded -- initdb plus role/database creation is legitimately
 	// slower than a failover window -- but that means the lease can flip during it, and OnLost
@@ -1049,7 +1066,29 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 	// each initdb'd their own data with different system_identifiers, which assertSameCluster
 	// then refuses to rejoin: exactly the outcome this whole branch exists to prevent.
 	if !a.dcs.IsLeader() {
-		a.log.Warn("lost the lease during initdb; not starting read-write (#288)")
+		// Refusing to start is necessary but NOT sufficient (#288 review). The data directory is
+		// now fully initialized, and no highwater marker exists yet -- that is written on the
+		// next StayPrimary tick, which will never come. So this pod would sit with
+		// HasData == true forever: never eligible for BootstrapClone again, and rejected by
+		// assertSameCluster on every Follow/RejoinForward because the new holder initdb'd its
+		// own cluster with a different system_identifier. A manual PVC delete would be the only
+		// way out.
+		//
+		// This branch created the directory milliseconds ago and it has never served a client,
+		// so removing it is safe and makes the pod eligible to clone from the winner instead.
+		// WipeDataDir refuses a live postmaster.pid, and nothing was started.
+		if !process.HasData(a.cfg.PGDATA) {
+			// The initdb did not get far enough to leave a cluster behind, so there is nothing
+			// to discard and nothing to strand. WipeDataDir would refuse this anyway (it
+			// requires PG_VERSION), and treating that refusal as an error would turn the
+			// harmless case into a loud one.
+			a.log.Warn("lost the lease during initdb; no cluster was created, nothing to discard (#288)")
+			return nil
+		}
+		a.log.Warn("lost the lease during initdb; discarding the fresh data directory so this node can clone from the new holder (#288)")
+		if err := process.WipeDataDir(a.cfg.PGDATA); err != nil {
+			return fmt.Errorf("bootstrap initdb: lost the lease and could not discard the fresh data directory (delete the PVC to recover): %w", err)
+		}
 		return nil
 	}
 	if err := a.sup.Start(ctx); err != nil {
@@ -1065,6 +1104,11 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 	// The log line above is the record.
 	return nil
 }
+
+// confdDir is where the chart mounts the operator's postgresql.configuration / TLS / audit /
+// pgbackrest fragments. Mounted only when one of those features is on, which is what makes its
+// presence a usable signal (#288).
+const confdDir = "/etc/postgresql/conf.d"
 
 // entrypointPath is the image's entrypoint, invoked with an explicit mode. Fixed rather than
 // derived: the agent runs inside that image by construction (#288).
@@ -1455,6 +1499,15 @@ func (a *agent) topologyTick(ctx context.Context) {
 		a.log.Warn("read replication topology", "err", err)
 		return
 	}
+	// Cascading replication makes a standby an upstream for other standbys, so a cascading
+	// child streams from a PEER and never appears in this primary's pg_stat_replication
+	// (#288 review). Publishing expected-vs-streaming there would report a permanent shortfall
+	// on a perfectly healthy cluster, and the gap warning would never clear. The count is only
+	// meaningful in a star topology.
+	if a.cfg.CascadeReplication {
+		a.metr.SetTopology(observe.TopologyStats{Streaming: countStreamingReplicas(rows)})
+		return
+	}
 	// The live pod set from the API, not NodeCount: that env var is baked in at render time and
 	// is stale on every pod that has not rolled yet (see orphanSlot).
 	live, liveErr := a.livePodOrdinals(ctx)
@@ -1522,6 +1575,18 @@ func (a *agent) topologyTick(ctx context.Context) {
 		"pods", state, "streaming", streaming, "expected", expected, "unidentified", unidentified)
 }
 
+// countStreamingReplicas counts the rows that are real streaming standbys, excluding a base
+// backup in flight (#288).
+func countStreamingReplicas(rows []pg.ReplicaRow) int64 {
+	var n int64
+	for _, r := range rows {
+		if r.Streaming() && !isCloneConnection(r) {
+			n++
+		}
+	}
+	return n
+}
+
 // resolveReplicaPod maps one pg_stat_replication row to a pod name (#288).
 //
 // application_name first: native writes the pod name there via primary_conninfo, and repmgr
@@ -1552,11 +1617,6 @@ func (a *agent) resolveReplicaPod(r pg.ReplicaRow) string {
 // counting it would inflate the replica count while the pod it belongs to is still not
 // replicating.
 func isCloneConnection(r pg.ReplicaRow) bool { return r.AppName == "pg_basebackup" }
-
-// libpqDefaultAppName is what a replication connection reports when primary_conninfo carries no
-// application_name -- i.e. any standby cloned before #288. It is a sentinel to fall back FROM,
-// never a pod name.
-const libpqDefaultAppName = "walreceiver"
 
 // slotsTick is the per-primary-tick replication-slot pass (#289): OBSERVE always, then
 // RECONCILE only under the native mechanism.

@@ -193,9 +193,19 @@ standby_tl=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT timeline_id FROM pg_con
 assert_eq "standby is on the primary's post-restore timeline" "${tl_after}" "${standby_tl}"
 # repmgr's own view: one primary, one active standby -- no orphaned/duplicate rows after
 # the restore rewrote the primary's identity.
-repmgr_rows=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT type, active FROM repmgr.nodes ORDER BY node_id" "repmgr" "repmgr" 2>/dev/null || echo "")
-assert_contains "repmgr sees the restored primary" "${repmgr_rows}" "primary|t"
-assert_contains "repmgr sees an active standby" "${repmgr_rows}" "standby|t"
+if [ "$(chart_mechanism)" = "native" ]; then
+  # #288: a native cluster has no repmgr extension and no repmgr.nodes, so the same
+  # "one primary, one active standby, no orphans after the restore rewrote the primary's
+  # identity" property is asserted against the primary's own connection list instead.
+  streaming=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" "repmgr" "repmgr" 2>/dev/null | tr -d '[:space:]' || echo "")
+  assert_eq "#288: the restored primary sees exactly one streaming standby" "1" "${streaming}"
+  ext=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT count(*) FROM pg_extension WHERE extname='repmgr'" "repmgr" "repmgr" 2>/dev/null | tr -d '[:space:]' || echo "")
+  assert_eq "#288: the restored native cluster has no repmgr extension" "0" "${ext}"
+else
+  repmgr_rows=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT type, active FROM repmgr.nodes ORDER BY node_id" "repmgr" "repmgr" 2>/dev/null || echo "")
+  assert_contains "repmgr sees the restored primary" "${repmgr_rows}" "primary|t"
+  assert_contains "repmgr sees an active standby" "${repmgr_rows}" "standby|t"
+fi
 
 # --- new writes replicate: the cluster is functional, not just structurally present ---
 pg_exec "${NAMESPACE}" "${PRIMARY}" "CREATE TABLE post_restore_write (id int)" "testuser" "testdb" >/dev/null
