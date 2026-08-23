@@ -96,7 +96,9 @@
   retained-WAL threshold is therefore the early warning and must stay below the 4GB cap. See
   the [pg chart README](../pg/README.md#replication-slot-ownership-289) for the full second
   review pass (stderr-blind error matching, stale gauges on a demoted primary, create/drop
-  oscillation, legacy-slot reclaim scope, `Follow` slot ensure, promote sub-budget).
+  oscillation, legacy-slot reclaim scope, `Follow` slot ensure, promote sub-budget, and a
+  demoted primary reclaiming the slots it minted -- which also needed a standby-safe slot
+  query, since `pg_current_wal_lsn()` raises `recovery is in progress` on a standby).
 
 - **`repmgr.agent.mechanism`: an experimental native HA mechanism, alongside repmgr
   (#287).** Inherited from pg's symlinked agent/templates. Off by default

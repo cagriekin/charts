@@ -1052,3 +1052,95 @@ func scrapeMetrics(t *testing.T, a *agent) string {
 	a.metr.Handler(time.Minute).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	return rec.Body.String()
 }
+
+// #289 review: a demoted primary keeps every slot it minted while it WAS the primary --
+// pg_basebackup and pg_rewind both exclude pg_replslot, and a plain Follow touches nothing.
+// Those slots go inactive and an inactive slot restricts WAL removal on a standby exactly as
+// it does on a primary, so the ex-primary's own pg_wal grows without bound on its own volume.
+// It does not self-heal on a later re-promotion either: by then those ordinals have live pods
+// again, so the primary reconcile reads them as live peers' slots and leaves them alone.
+func TestStandbySlotsTickReclaimsSlotsLeftBehindByADemotion(t *testing.T) {
+	// Two slots this node minted while primary, for ordinals whose pods are very much alive
+	// (they stream from the NEW primary now) -- which is precisely why the primary-side
+	// pod-set test cannot reclaim them.
+	ex := &slotExec{rows: "pg_ha_slot_1|f|16777216|reserved|t\npg_ha_slot_2|f|8388608|reserved|t\n"}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+
+	a.standbySlotsTick(context.Background())
+
+	if len(ex.dropped) != 2 {
+		t.Fatalf("dropped %v, want both leftover slots reclaimed", ex.dropped)
+	}
+	if len(ex.created) != 0 {
+		t.Errorf("a standby created slots (%v): it is never an upstream under this mechanism", ex.created)
+	}
+}
+
+// Observation is mechanism-agnostic (a standby holding WAL back must be visible), mutation
+// is native-only -- under repmgr, repmgr owns slot lifecycle and two owners would fight.
+func TestStandbySlotsTickPublishesUnderRepmgrButReclaimsNothing(t *testing.T) {
+	ex := &slotExec{rows: "pg_ha_slot_1|f|16777216|reserved|t\n"}
+	a := newSlotTestAgent(t, ex, config.MechanismRepmgr)
+
+	a.standbySlotsTick(context.Background())
+
+	if len(ex.dropped) != 0 {
+		t.Errorf("reclaimed %v under the repmgr mechanism, where repmgr owns slot lifecycle", ex.dropped)
+	}
+	if body := scrapeMetrics(t, a); !strings.Contains(body, "pg_ha_agent_replication_slot_max_retained_wal_bytes 16777216") {
+		t.Errorf("a standby holding 16MiB of WAL back published nothing: %s", body)
+	}
+}
+
+// What a standby may reclaim is decided by NAME alone, with no ordinal or pod-set test: a
+// standby is never an upstream under this mechanism (its own slot lives on its upstream, and
+// cascadingReplication + native is rejected at render time), so the ordinal a leftover names
+// says nothing about whether it is still needed. An operator's slot stays untouchable.
+func TestLeftoverStandbySlotClaimsOnlyAgentMintedAndLegacyNames(t *testing.T) {
+	for _, tc := range []struct {
+		slot string
+		want bool
+		why  string
+	}{
+		{"pg_ha_slot_0", true, "agent-minted"},
+		{"pg_ha_slot_7", true, "agent-minted, ordinal irrelevant on a standby"},
+		{"repmgr_slot_1001", true, "native never streams through a legacy slot"},
+		{"my_own_slot", false, "operator's"},
+		{"debezium_cdc", false, "a logical subscription's"},
+		{"pg_ha_slot_abc", false, "unparseable ordinal: not a name this agent mints"},
+	} {
+		if got := leftoverStandbySlot(tc.slot); got != tc.want {
+			t.Errorf("leftoverStandbySlot(%q) = %v, want %v (%s)", tc.slot, got, tc.want, tc.why)
+		}
+	}
+}
+
+// The gauges must be retracted when a node is neither primary nor a steady-state standby,
+// but NOT on Follow -- that is the branch a demoted ex-primary settles into, and it is where
+// leftover slots reserving WAL on its own volume have to stay visible.
+func TestFollowKeepsPublishingSlotGaugesWhileOtherActionsRetractThem(t *testing.T) {
+	for _, tc := range []struct {
+		action reconcile.Action
+		want   bool
+	}{
+		{reconcile.Promote, true},
+		{reconcile.StayPrimary, true},
+		{reconcile.Follow, true},
+		{reconcile.DemoteFence, false},
+		{reconcile.NoOp, false},
+	} {
+		m := observe.New()
+		m.SetSlots(observe.SlotStats{Total: 3, Inactive: 1, MaxRetainedWALBytes: 4096})
+		switch tc.action {
+		case reconcile.Promote, reconcile.StayPrimary, reconcile.Follow:
+		default:
+			m.ClearSlots()
+		}
+		rec := httptest.NewRecorder()
+		m.Handler(time.Minute).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+		kept := strings.Contains(rec.Body.String(), "pg_ha_agent_replication_slot_max_retained_wal_bytes 4096")
+		if kept != tc.want {
+			t.Errorf("action %v: gauges kept=%v, want %v", tc.action, kept, tc.want)
+		}
+	}
+}

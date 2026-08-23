@@ -618,14 +618,15 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 	if dec.Action != reconcile.Follow {
 		a.followUpstream = ""
 	}
-	// #289: only the primary branches observe slots, so any other action means this node
-	// has stopped publishing them and must RETRACT what it last published. The slot alerts
-	// aggregate with max() across the release, so a demoted pod still exporting the figures
-	// it saw while primary would latch them on for the rest of its process lifetime -- the
-	// alert would keep paging after the condition had moved to the new primary or been
-	// resolved outright. Retracting is a no-op on a node that never was primary.
+	// #289: only the primary and standby steady-state branches observe slots, so any other
+	// action means this node has stopped publishing them and must RETRACT what it last
+	// published. The slot alerts aggregate with max() across the release, so a pod still
+	// exporting the figures it saw while primary would latch them on for the rest of its
+	// process lifetime -- the alert would keep paging after the condition had moved to the
+	// new primary or been resolved outright. Retracting is a no-op on a node that never
+	// published any.
 	switch dec.Action {
-	case reconcile.Promote, reconcile.StayPrimary:
+	case reconcile.Promote, reconcile.StayPrimary, reconcile.Follow:
 	default:
 		a.metr.ClearSlots()
 	}
@@ -704,6 +705,15 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		return a.assertPrimaryRouting(wctx, obs)
 
 	case reconcile.Follow:
+		// #289 review: reclaim slots this node minted while it was the primary, and publish
+		// the slot gauges from a standby's point of view.
+		//
+		// FIRST in the branch, ahead of the followUpstream latch below: that latch returns
+		// early on every tick for a healthy standby that is already pointed at the right
+		// upstream, which is exactly the steady state a demoted ex-primary settles into.
+		// Anything placed after it would run once and never again -- so the leftover slots
+		// would keep reserving WAL on this node's own volume for the rest of its life.
+		a.standbySlotsTick(ctx)
 		// Ensure this standby has a repmgr.nodes record. In agent mode no repmgrd
 		// sidecar registers it, and without the record BOTH repmgr standby follow and
 		// a later promote fail ("unable to retrieve node record"). Registration must
@@ -1277,7 +1287,69 @@ func (a *agent) slotsTick(ctx context.Context) {
 	a.reconcileSlots(ctx, slots)
 }
 
-// observeSlots reads this primary's physical replication slots and publishes the aggregate
+// standbySlotsTick is the slot pass for a node running as a STANDBY (#289 review).
+//
+// A demoted primary keeps every slot it minted while it WAS the primary. Nothing removed
+// them: reconcileSlots runs only on the primary branches, pg_basebackup and pg_rewind both
+// exclude pg_replslot, and a plain Follow touches nothing. Those slots go inactive (their
+// standbys now stream from the new primary) and an inactive slot restricts WAL removal on a
+// standby exactly as it does on a primary -- so the ex-primary's own pg_wal grows without
+// bound on its own volume until max_slot_wal_keep_size invalidates them. That is the same
+// silent failure this whole change exists to prevent, just on the node nobody was watching.
+// It also does not self-heal on a later re-promotion: by then those ordinals have live pods
+// again, so the primary reconcile classifies them as live peers' slots and leaves them.
+//
+// The reclaim policy here is simpler than the primary's, and deliberately so: under native a
+// standby has NO legitimate downstream at all. Its own slot lives on its upstream, not
+// locally, and cascadingReplication + native is rejected at render time precisely because
+// slot reconcile is primary-only -- so there is no configuration in which a standby is
+// someone's upstream. Every agent-minted slot found locally is therefore a leftover, with no
+// pod set to consult. The atomic `AND NOT active` in the drop is still what makes it safe:
+// anything genuinely streaming through one survives regardless of what this decides.
+//
+// Observation runs under every mechanism (the gauges must be truthful about a standby
+// holding WAL back too); mutation is native-only, same as the primary path.
+func (a *agent) standbySlotsTick(ctx context.Context) {
+	slots, ok := a.observeSlots(ctx)
+	if !ok {
+		return
+	}
+	if a.cfg.Mechanism != config.MechanismNative {
+		return
+	}
+	for _, sl := range slots {
+		if !leftoverStandbySlot(sl.Name) {
+			continue
+		}
+		dropped, err := a.prober.DropPhysicalSlotIfInactive(ctx, a.selfConn(), sl.Name)
+		if err != nil {
+			a.log.Warn("drop leftover replication slot on standby", "slot", sl.Name, "err", err)
+			continue
+		}
+		if dropped {
+			a.log.Info("dropped leftover replication slot left behind by a demotion",
+				"slot", sl.Name, "retained_wal_bytes", sl.RetainedWALBytes)
+		}
+	}
+}
+
+// leftoverStandbySlot reports whether a slot found on a STANDBY is one this agent may
+// reclaim (#289 review): any name it can prove it minted, plus any legacy repmgr slot.
+//
+// No ordinal or pod-set test, unlike orphanSlot: a standby is never an upstream under this
+// mechanism (see standbySlotsTick), so the ordinal a leftover names says nothing about
+// whether it is still needed -- it names the peer that used to stream from this node back
+// when it was primary. An operator's own slot, and any logical slot backing a subscription,
+// stay out of reach exactly as they do on the primary path.
+func leftoverStandbySlot(name string) bool {
+	if strings.HasPrefix(name, legacySlotPrefix) {
+		return true
+	}
+	_, ok := slotOrdinal(name)
+	return ok && strings.HasPrefix(name, slotPrefix)
+}
+
+// observeSlots reads this node's physical replication slots and publishes the aggregate
 // gauges (#289). Runs under every mechanism -- see slotsTick.
 //
 // Reports false when the query failed, so a caller cannot mistake "could not look" for

@@ -191,6 +191,21 @@
     already did. It was the one slot-using path that did not, and a walreceiver whose
     `primary_slot_name` is missing does not fall back to slotless streaming -- it errors and
     retries, so the standby streams nothing at all.
+  - **A demoted primary now reclaims the slots it minted while it was primary.** Reconcile was
+    primary-only, and `pg_basebackup`/`pg_rewind` both exclude `pg_replslot`, so an ex-primary
+    kept every `pg_ha_slot_*` it had created -- inactive, since those standbys had moved to the
+    new primary -- and an inactive slot restricts WAL removal on a standby exactly as it does
+    on a primary, so its own `pg_wal` grew until `max_slot_wal_keep_size` invalidated them.
+    Nor did it self-heal on a re-promotion: those ordinals have live pods by then, so the
+    primary-side pod-set test reads the leftovers as live peers' slots. The slot pass now runs
+    on the standby branch too (ahead of the follow latch, which returns early every tick in
+    exactly that steady state). The standby policy needs no pod set: under `native` a standby is
+    never an upstream, so every agent-minted slot found locally is a leftover. Listing slots on
+    a standby also required a standby-safe query -- `pg_current_wal_lsn()` raises `recovery is in
+    progress` there, which had been returning an EMPTY listing and hiding the leftovers -- so it
+    now branches on `pg_is_in_recovery()` and uses the last received LSN. Verified on a real
+    streaming PostgreSQL 18 pair: the leftover is reported with its reserved WAL, reclaimed, and
+    the standby keeps streaming, while an active slot on the primary is still refused.
   - **The promote-path slot pass runs under its own sub-budget.** On the shared fence budget
     (5s on chart defaults, against a 10s per-psql timeout) one slow slot query could consume
     the whole window and leave the promote without its routing switch -- a write outage

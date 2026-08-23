@@ -360,6 +360,17 @@ func (s SlotState) Invalidated() bool { return s.WALStatus == "lost" }
 // PhysicalSlots lists the physical replication slots on the node ci points at, with
 // their active flag and retained WAL (#289).
 //
+// Works on a STANDBY as well as a primary, which the obvious form of this query does not:
+// pg_current_wal_lsn() is primary-only and raises `ERROR: recovery is in progress` on a
+// standby (verified against PostgreSQL 18), so the whole listing came back empty there.
+// That mattered once a demoted primary had to be able to reclaim the slots it minted while
+// it was the primary -- slots that keep reserving WAL on the ex-primary's own volume, with
+// nothing consuming them (verified: a leftover slot on a live streaming standby reports
+// 16MB reserved and wal_status = reserved). The CASE picks the standby's last RECEIVED LSN
+// instead, which is that node's own end-of-WAL and therefore the right reference for how
+// much a local slot is holding back. pg_current_wal_lsn() is volatile, so it is not
+// evaluated on the branch not taken.
+//
 // Deliberately unfiltered by name: the caller decides which slots it owns. The agent
 // must SEE every physical slot to report retained WAL for all of them (an orphan it
 // does not own still fills the disk), even where it will refuse to drop them.
@@ -369,7 +380,9 @@ func (s SlotState) Invalidated() bool { return s.WALStatus == "lost" }
 // would invite a caller to treat one as an orphan.
 func (p *Prober) PhysicalSlots(ctx context.Context, ci ConnInfo) ([]SlotState, error) {
 	out, err := p.psql(ctx, ci,
-		"SELECT slot_name, active, COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)::bigint, "+
+		"SELECT slot_name, active, COALESCE(pg_wal_lsn_diff("+
+			"CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_lsn() END, "+
+			"restart_lsn), 0)::bigint, "+
 			"COALESCE(wal_status, ''), (restart_lsn IS NOT NULL) "+
 			"FROM pg_replication_slots WHERE slot_type = 'physical' ORDER BY slot_name;")
 	if err != nil {

@@ -279,6 +279,25 @@ func TestPhysicalSlotsParsesNameActiveRetainedWALAndWALStatus(t *testing.T) {
 	}
 }
 
+// The listing has to work on a STANDBY too, since a demoted primary reclaims the slots it
+// minted while it was primary. pg_current_wal_lsn() is primary-only and raises "recovery is
+// in progress" on a standby (verified against PostgreSQL 18), which returned an EMPTY
+// listing there and made those leftovers invisible.
+func TestPhysicalSlotsQueryWorksOnAStandby(t *testing.T) {
+	ex := &slotExec{}
+	p := &Prober{Exec: ex}
+	if _, err := p.PhysicalSlots(context.Background(), ConnInfo{}); err != nil {
+		t.Fatalf("PhysicalSlots: %v", err)
+	}
+	sql := ex.sqls[0]
+	if !strings.Contains(sql, "pg_is_in_recovery()") {
+		t.Errorf("query does not branch on recovery, so it errors out on a standby: %s", sql)
+	}
+	if !strings.Contains(sql, "pg_last_wal_receive_lsn()") {
+		t.Errorf("query has no standby reference LSN: %s", sql)
+	}
+}
+
 // Logical slots belong to the operator's subscriptions; the agent must never enumerate
 // them as candidates for its own reconcile.
 func TestPhysicalSlotsQueryExcludesLogicalSlots(t *testing.T) {
