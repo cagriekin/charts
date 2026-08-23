@@ -268,12 +268,18 @@ func (p *Prober) SystemIdentifier(ctx context.Context, ci ConnInfo) (id uint64, 
 // silent skip, so a broken table cannot read as "nobody is registered" and quietly
 // disable the gate.
 //
-// Under the #287 native mechanism there is no repmgr.nodes at all, so this always errors
-// and reconcile.Observation.RegistryRead stays false -- by design (see that field's doc):
-// the gate the caller drives from this is fail-open, so native mode promotes normally
-// instead of being silently blocked. Do not make this return an empty, error-free result
-// for a missing table; that would flip RegistryRead to true and make the gate fire on every
-// native-mode promote.
+// REPMGR MODE ONLY. Since #288 the caller does not invoke this under the native mechanism at
+// all -- native clusters have no repmgr extension, so the read could only ever fail, and it
+// was warning on every promote-candidate tick about a permanent condition. Nothing replaces it
+// there, and nothing needs to: the gate exists because repmgr addresses a follow target by
+// node_id out of this table, whereas native follows by conninfo, so a native primary is
+// followable the moment it promotes.
+//
+// Do not make this return an empty, error-free result for a missing table. It is still
+// reachable under repmgr against a genuinely broken table, and an empty-but-successful read
+// would flip reconcile.Observation.RegistryRead to true and fire the gate -- refusing a
+// legitimate promotion -- which is the opposite of the fail-open behaviour that field's doc
+// promises.
 func (p *Prober) RegisteredNodeIDs(ctx context.Context, ci ConnInfo) ([]int, error) {
 	out, err := p.psql(ctx, ci, "SELECT node_id FROM repmgr.nodes;")
 	if err != nil {

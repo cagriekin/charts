@@ -37,6 +37,13 @@ type Metrics struct {
 	// max_slot_wal_keep_size = 4GB -- PostgreSQL invalidates it and the standby behind it
 	// can only recover by a full re-clone. Hence a metric and an alert, not just a log line.
 	// Zeroed on demotion (ClearSlots): only the primary observes slots.
+	// Replication topology as the primary last observed it (#288). Derived from
+	// pg_stat_replication, which replaced repmgr.nodes as the topology source: a departed pod
+	// is simply absent from the primary's connection list, so there is no stale row to strand
+	// the way #139's ghost records did.
+	topologyStreaming       atomic.Int64
+	topologyExpected        atomic.Int64
+	topologyUnidentified    atomic.Int64
 	slotsTotal              atomic.Int64
 	slotsInactive           atomic.Int64
 	slotsInvalidated        atomic.Int64
@@ -95,6 +102,34 @@ func (m *Metrics) IncControlRequest()        { m.controlRequests.Add(1) }
 func (m *Metrics) IncControlRejected()       { m.controlRejected.Add(1) }
 func (m *Metrics) IncControlIntent()         { m.controlIntents.Add(1) }
 func (m *Metrics) IncControlRestoreRequest() { m.controlRestoreRequests.Add(1) }
+
+// TopologyStats is the primary's view of its streaming standbys (#288).
+//
+// Expected comes from the live pod set read from the Kubernetes API, not from
+// REPMGR_NODE_COUNT: that env var is baked in at render time and is stale on every pod that
+// has not rolled yet, which is the same trap orphanSlot documents for #289.
+type TopologyStats struct {
+	// Streaming is how many replicas the primary sees in state 'streaming'.
+	Streaming int64
+	// Expected is how many peers ought to be streaming (live pods, excluding this one).
+	Expected int64
+	// Unidentified counts streaming replicas that resolved to no pod at all -- neither by
+	// application_name nor by slot name. A non-zero value means the topology view is
+	// incomplete, so alerting on Streaming vs Expected alone would be misleading.
+	Unidentified int64
+}
+
+// SetTopology publishes the primary's replication topology (#288).
+func (m *Metrics) SetTopology(t TopologyStats) {
+	m.topologyStreaming.Store(t.Streaming)
+	m.topologyExpected.Store(t.Expected)
+	m.topologyUnidentified.Store(t.Unidentified)
+}
+
+// ClearTopology zeroes the topology gauges, for the same reason ClearSlots exists: only the
+// primary observes them, and a demoted pod still exporting its last view would latch any
+// alert that aggregates with max() across the release.
+func (m *Metrics) ClearTopology() { m.SetTopology(TopologyStats{}) }
 
 // SetSlots publishes the primary's observed physical replication slots (#289).
 func (m *Metrics) SetSlots(s SlotStats) {
@@ -164,6 +199,9 @@ func (m *Metrics) write(w io.Writer) {
 		{"pg_ha_agent_control_rejected_total", "Control-API requests refused by authentication or authorization.", "counter", m.controlRejected.Load()},
 		{"pg_ha_agent_control_intents_total", "Node-local control-API operations handed to the reconcile loop.", "counter", m.controlIntents.Load()},
 		{"pg_ha_agent_control_restore_requests_total", "Restores triggered through the control API.", "counter", m.controlRestoreRequests.Load()},
+		{"pg_ha_agent_replicas_streaming", "Replicas this primary sees in pg_stat_replication state 'streaming'.", "gauge", m.topologyStreaming.Load()},
+		{"pg_ha_agent_replicas_expected", "Peers that ought to be streaming, from the live pod set.", "gauge", m.topologyExpected.Load()},
+		{"pg_ha_agent_replicas_unidentified", "Streaming replicas that resolved to no pod (neither application_name nor slot name).", "gauge", m.topologyUnidentified.Load()},
 		{"pg_ha_agent_replication_slots", "Physical replication slots on this primary.", "gauge", m.slotsTotal.Load()},
 		{"pg_ha_agent_replication_slots_inactive", "Physical replication slots reserving WAL with no active consumer.", "gauge", m.slotsInactive.Load()},
 		{"pg_ha_agent_replication_slots_invalidated", "Physical replication slots PostgreSQL invalidated for exceeding max_slot_wal_keep_size; the standby behind each needs a full re-clone.", "gauge", m.slotsInvalidated.Load()},

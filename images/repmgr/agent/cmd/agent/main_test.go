@@ -1260,3 +1260,114 @@ func newBootstrapTestAgentWithPM(t *testing.T, ex *initdbExec, mech string, pm *
 		metr:   observe.New(),
 	}
 }
+
+// #288: no repmgr.nodes query may run under the native mechanism. A native cluster has no
+// repmgr extension at all now, so the read could only ever fail -- it was warning on every
+// promote-candidate tick about a permanent condition. The #297 gate it fed is repmgr-specific
+// (it guards against promoting a node no survivor can `repmgr standby follow`, which is a
+// node_id-resolution constraint); native follows by conninfo, so nothing replaces it.
+func TestObserveSkipsTheRegistryReadUnderNative(t *testing.T) {
+	for _, tc := range []struct {
+		mech        string
+		wantQueries int
+	}{
+		{config.MechanismNative, 0},
+		{config.MechanismRepmgr, 1},
+	} {
+		ex := &scriptedExec{nodes: "1000\n1001\n", walRcv: "pg-0.h|streaming"}
+		a := newFollowTestAgent(t, ex)
+		a.cfg.Mechanism = tc.mech
+		a.cfg.PodName = "pg-1"
+		// The one tick-state where the gate can fire: holder, running, in recovery.
+		o := reconcile.Observation{HoldLease: true}
+		o.Local = reconcile.LocalState{Running: true, InRecovery: true, HasData: true}
+		a.readRegistryForGate(context.Background(), &o)
+		if ex.nodesQueries != tc.wantQueries {
+			t.Errorf("mechanism %q: %d repmgr.nodes queries, want %d", tc.mech, ex.nodesQueries, tc.wantQueries)
+		}
+		if tc.mech == config.MechanismNative && o.RegistryRead {
+			t.Errorf("native mode set RegistryRead, which would arm the #297 gate")
+		}
+	}
+}
+
+// #288: identity resolution. application_name first (native writes the pod name there, repmgr
+// writes node_name, same string); the ordinal-named slot as fallback for any standby cloned
+// before #288, which still dials with libpq's default. Both shapes were verified streaming to
+// one real PostgreSQL 18 primary at once.
+func TestResolveReplicaPodUsesAppNameThenSlot(t *testing.T) {
+	a := &agent{base: "pg"}
+	for _, tc := range []struct {
+		row  pg.ReplicaRow
+		want string
+		why  string
+	}{
+		{pg.ReplicaRow{AppName: "pg-1", SlotName: "pg_ha_slot_1"}, "pg-1", "application_name wins"},
+		{pg.ReplicaRow{AppName: "walreceiver", SlotName: "pg_ha_slot_2"}, "pg-2", "libpq default falls back to the slot"},
+		{pg.ReplicaRow{AppName: "", SlotName: "pg_ha_slot_3"}, "pg-3", "empty app name falls back to the slot"},
+		{pg.ReplicaRow{AppName: "walreceiver", SlotName: "repmgr_slot_1004"}, "pg-4", "a legacy repmgr slot still resolves (mid-migration)"},
+		{pg.ReplicaRow{AppName: "walreceiver", SlotName: ""}, "", "slotless and unnamed: unidentifiable"},
+		{pg.ReplicaRow{AppName: "walreceiver", SlotName: "someone_elses_slot"}, "", "not a slot this agent mints"},
+	} {
+		if got := a.resolveReplicaPod(tc.row); got != tc.want {
+			t.Errorf("%s: resolveReplicaPod(%+v) = %q, want %q", tc.why, tc.row, got, tc.want)
+		}
+	}
+}
+
+// The gauges must count what the primary can actually see, and must report separately when a
+// streaming replica cannot be identified at all -- otherwise streaming-vs-expected alone would
+// read as healthy while the topology view is incomplete.
+func TestTopologyTickPublishesGaugesUnderBothMechanisms(t *testing.T) {
+	for _, mech := range []string{config.MechanismRepmgr, config.MechanismNative} {
+		ex := &slotExec{rows: "pg-1|pg_ha_slot_1|streaming\nwalreceiver||streaming\npg-9|pg_ha_slot_9|catchup\n"}
+		a := newSlotTestAgent(t, ex, mech)
+		a.base = "pg"
+		a.topologyTick(context.Background())
+		body := scrapeMetrics(t, a)
+		// Two streaming rows (the catchup one is not counted), one of them unidentifiable.
+		for _, want := range []string{
+			"pg_ha_agent_replicas_streaming 2",
+			"pg_ha_agent_replicas_unidentified 1",
+			// The fake apiserver holds pods 0 and 1; self is pg-0, so one peer is expected.
+			"pg_ha_agent_replicas_expected 1",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("mechanism %q: missing %q in:\n%s", mech, want, body)
+			}
+		}
+	}
+}
+
+// A catchup replica exists but cannot serve or be promoted safely, so it must not be counted
+// as streaming -- the distinction is the whole reason ReplicaRow carries State.
+func TestTopologyTickIgnoresCatchupReplicas(t *testing.T) {
+	ex := &slotExec{rows: "pg-1|pg_ha_slot_1|catchup\n"}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.base = "pg"
+	a.topologyTick(context.Background())
+	if body := scrapeMetrics(t, a); !strings.Contains(body, "pg_ha_agent_replicas_streaming 0") {
+		t.Errorf("a catchup replica counted as streaming:\n%s", body)
+	}
+}
+
+// The missing-peer warning is logged once per CHANGE, not once per tick: a rolling restart
+// legitimately parks a peer off-stream, and a 5s warning loop would bury everything else.
+func TestTopologyTickLogsTheGapOnlyOnChange(t *testing.T) {
+	var out bytes.Buffer
+	ex := &slotExec{rows: ""} // nothing streaming; the fake apiserver has a live peer pg-1
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.base = "pg"
+	a.log = slog.New(slog.NewTextHandler(&out, nil))
+	a.topologyTick(context.Background())
+	a.topologyTick(context.Background())
+	if n := strings.Count(out.String(), "live peers are not streaming"); n != 1 {
+		t.Errorf("gap warning logged %d times across two unchanged ticks, want 1:\n%s", n, out.String())
+	}
+	// And it must report recovery, so a resolved gap does not look like a silent stall.
+	ex.rows = "pg-1|pg_ha_slot_1|streaming\n"
+	a.topologyTick(context.Background())
+	if !strings.Contains(out.String(), "replication topology complete") {
+		t.Errorf("recovery from a topology gap was not logged:\n%s", out.String())
+	}
+}

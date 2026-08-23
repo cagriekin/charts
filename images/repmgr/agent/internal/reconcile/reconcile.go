@@ -135,6 +135,15 @@ type Observation struct {
 	// promote candidate (holder, running, in recovery), so a non-candidate leaves
 	// RegistryRead false and the #297 gate inert.
 	//
+	// REPMGR MODE ONLY (#288). The observer skips the read outright under the native
+	// mechanism, so RegistryRead is permanently false there and the gate never fires. That is
+	// deliberate and nothing replaces it: the gate protects against promoting a node no
+	// survivor can `repmgr standby follow`, which is a constraint of resolving an upstream by
+	// node_id out of this table. Native follows by conninfo -- the lease holder's identity
+	// plus the headless FQDN -- so a native primary is followable the moment it promotes.
+	// Earlier revisions of this comment said native's inertness came from the read always
+	// FAILING; it now comes from the read not happening.
+	//
 	// A node with no row of its own has never registered, so no survivor holds a record
 	// for it and none can follow it after it promotes -- the scale-up race that leaves a
 	// cluster with no serving primary. RegistryRead is required before acting on

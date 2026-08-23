@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -150,6 +151,11 @@ type agent struct {
 	// server) runs only when the upstream actually changes, not every tick. Reset
 	// on any non-Follow action.
 	followUpstream string
+
+	// lastTopologyGap is the comma-joined set of live peers not streaming, so topologyTick logs
+	// one line per CHANGE instead of one per tick (#288). A rolling restart legitimately parks a
+	// peer off-stream for a while, and warning every 5s about it would bury everything else.
+	lastTopologyGap string
 
 	// gossip publish state: skip re-patching the pod annotation when the position
 	// is unchanged, refreshing only on change or a heartbeat (to keep it fresh).
@@ -547,24 +553,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// gate is inert. The read is against the LOCAL node: repmgr.nodes replicates from the
 	// primary, so this node's own copy is exactly what repmgr itself would consult when
 	// asked to follow someone.
-	if o.HoldLease && ls.Running && ls.InRecovery {
-		ids, rerr := a.prober.RegisteredNodeIDs(ctx, a.selfConn())
-		if rerr != nil {
-			// Unreadable: leave RegistryRead false so the gate cannot fire on a failed
-			// read (that would refuse a legitimate promotion). Warn, do not block.
-			a.log.Warn("read repmgr.nodes for the promote registration gate", "err", rerr)
-		} else {
-			o.RegistryRead = true
-			registered := make(map[int]bool, len(ids))
-			for _, id := range ids {
-				registered[id] = true
-			}
-			o.LocalRegistered = registered[nodeID(a.cfg.PodName)]
-			for i := range o.Peers {
-				o.Peers[i].Registered = registered[nodeID(o.Peers[i].Name)]
-			}
-		}
-	}
+	a.readRegistryForGate(ctx, &o)
 	// Cascading replication (#29): when enabled, a standby may follow another standby
 	// (the pure cascadeFollowTarget decides; default off -> follow the primary).
 	o.Cascade = a.cfg.CascadeReplication
@@ -612,6 +601,45 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	return o
 }
 
+// readRegistryForGate populates the #297 promote-registration gate's inputs from repmgr.nodes.
+// Only for a promote candidate (holder, running, in recovery); every other node leaves
+// RegistryRead false, which keeps the gate inert.
+//
+// Native mode skips the read entirely (#288), the same treatment cleanupGhostNodes gets.
+// The gate's premise is a repmgr METADATA requirement: an unregistered promoted primary is
+// one no survivor can `repmgr standby follow`, because repmgr resolves an upstream by
+// node_id out of repmgr.nodes. Native has no such dependency -- act() builds the follow
+// target from the lease holder's identity plus the headless FQDN, and Native.Follow needs
+// only upstream.Host, so a native primary is followable by DNS the moment it promotes
+// (with the survivors' slots already created ahead of the routing switch, #289).
+// Skipping it is also what makes "no repmgr.nodes query runs under native" literally true:
+// a native cluster has no repmgr extension at all now, so this read could only ever fail,
+// and it was logging a warning on every promote-candidate tick about a permanent condition.
+func (a *agent) readRegistryForGate(ctx context.Context, o *reconcile.Observation) {
+	if !(o.HoldLease && o.Local.Running && o.Local.InRecovery) {
+		return
+	}
+	if a.cfg.Mechanism == config.MechanismNative {
+		return
+	}
+	ids, rerr := a.prober.RegisteredNodeIDs(ctx, a.selfConn())
+	if rerr != nil {
+		// Unreadable: leave RegistryRead false so the gate cannot fire on a failed read
+		// (that would refuse a legitimate promotion). Warn, do not block.
+		a.log.Warn("read repmgr.nodes for the promote registration gate", "err", rerr)
+		return
+	}
+	o.RegistryRead = true
+	registered := make(map[int]bool, len(ids))
+	for _, id := range ids {
+		registered[id] = true
+	}
+	o.LocalRegistered = registered[nodeID(a.cfg.PodName)]
+	for i := range o.Peers {
+		o.Peers[i].Registered = registered[nodeID(o.Peers[i].Name)]
+	}
+}
+
 func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.Observation) error {
 	// Any action other than Follow changes (or ends) this node's standby identity, so
 	// the next Follow must re-register + repoint.
@@ -629,6 +657,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 	case reconcile.Promote, reconcile.StayPrimary, reconcile.Follow:
 	default:
 		a.metr.ClearSlots()
+		a.metr.ClearTopology()
 	}
 	switch dec.Action {
 	case reconcile.Promote:
@@ -666,6 +695,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			sctx, scancel := context.WithTimeout(wctx, a.fenceBudget()/2)
 			defer scancel()
 			a.slotsTick(sctx)
+			a.topologyTick(sctx)
 		}()
 		if tl, _, ok, _ := a.prober.PrimaryWALPosition(wctx, a.selfConn()); ok {
 			a.advanceMarker(wctx, tl, true, obs.Marker)
@@ -699,6 +729,9 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// fence-budget context. Only the mutation half is mechanism-gated -- the gauges the
 		// shipped alerts read must be truthful under repmgr too (see slotsTick).
 		a.slotsTick(wctx)
+		// #288: publish the topology from pg_stat_replication. Observe-only -- see topologyTick
+		// for why nothing in Decide may consume it.
+		a.topologyTick(wctx)
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
@@ -1354,6 +1387,113 @@ func (a *agent) cleanupGhostNodes(ctx context.Context) {
 		a.log.Info("unregistered ghost repmgr node left by a scale-down", "node_id", id)
 	}
 }
+
+// topologyTick publishes the primary's replication topology from pg_stat_replication (#288).
+//
+// This is what replaced repmgr.nodes. That table was a CACHE of self-reported metadata:
+// nodes wrote their own rows, the rows outlived the pods (#139's ghosts), and it could
+// disagree with both the lease and the observed positions. pg_stat_replication cannot go stale
+// that way -- it is the primary's live connection list, so a departed pod is simply absent and
+// there is no durable row to strand.
+//
+// OBSERVE-ONLY, under BOTH mechanisms. Two deliberate constraints:
+//
+//   - Nothing in reconcile.Decide may consume this, and it deliberately does not populate an
+//     Observation field. A standby's row VANISHES the instant it disconnects -- i.e. exactly at
+//     the failover moment a promotion is being decided -- which is the mirror of the
+//     pg_stat_wal_receiver caveat in probe.go. Absence here means "not streaming right now",
+//     never "this node does not exist". An unused Observation field would just invite a future
+//     contributor to gate a promote on it.
+//   - It runs under repmgr too, not only native. repmgr sets application_name to the node name
+//     itself, so the view is equally readable there, and publishing a gauge that only ever
+//     moves on the non-default mechanism is the mistake slotsTick's own comment argues against.
+func (a *agent) topologyTick(ctx context.Context) {
+	rows, err := a.prober.ReplicationTopology(ctx, a.selfConn())
+	if err != nil {
+		a.log.Warn("read replication topology", "err", err)
+		return
+	}
+	// The live pod set from the API, not NodeCount: that env var is baked in at render time and
+	// is stale on every pod that has not rolled yet (see orphanSlot).
+	live, liveErr := a.livePodOrdinals(ctx)
+	selfOrd, selfOK := podOrdinal(a.cfg.PodName)
+	var expected int64
+	if liveErr == nil {
+		for ord := range live {
+			if selfOK && ord == selfOrd {
+				continue // the primary does not stream from itself
+			}
+			expected++
+		}
+	}
+
+	seen := make(map[string]bool, len(rows))
+	var streaming, unidentified int64
+	for _, r := range rows {
+		if !r.Streaming() {
+			continue // exists, but still catching up: not yet a usable replica
+		}
+		streaming++
+		if pod := a.resolveReplicaPod(r); pod != "" {
+			seen[pod] = true
+		} else {
+			unidentified++
+		}
+	}
+	a.metr.SetTopology(observe.TopologyStats{Streaming: streaming, Expected: expected, Unidentified: unidentified})
+
+	// One log line per CHANGE, not per tick: a rolling restart legitimately parks a pod
+	// off-stream for a while, and warning every 5s about it would bury everything else.
+	if liveErr != nil {
+		return
+	}
+	var missing []string
+	for ord := range live {
+		if selfOK && ord == selfOrd {
+			continue
+		}
+		pod := fmt.Sprintf("%s-%d", a.base, ord)
+		if !seen[pod] {
+			missing = append(missing, pod)
+		}
+	}
+	sort.Strings(missing)
+	state := strings.Join(missing, ",")
+	if state == a.lastTopologyGap {
+		return
+	}
+	a.lastTopologyGap = state
+	if state == "" {
+		a.log.Info("replication topology complete: every live peer is streaming", "streaming", streaming)
+		return
+	}
+	a.log.Warn("live peers are not streaming from this primary",
+		"pods", state, "streaming", streaming, "expected", expected, "unidentified", unidentified)
+}
+
+// resolveReplicaPod maps one pg_stat_replication row to a pod name (#288).
+//
+// application_name first: native writes the pod name there via primary_conninfo, and repmgr
+// writes node_name, which is the same string. A standby cloned BEFORE #288 still dials with
+// libpq's default ("walreceiver"), so the slot recovers it instead -- native names slots by pod
+// ordinal, and slotOrdinal already understands both pg_ha_slot_<ord> and the legacy
+// repmgr_slot_<node_id>. Verified against real PostgreSQL 18 with both shapes streaming to one
+// primary at once. Returns "" when neither source identifies the pod, which the caller counts
+// rather than hides.
+func (a *agent) resolveReplicaPod(r pg.ReplicaRow) string {
+	if n := r.AppName; n != "" && n != libpqDefaultAppName {
+		return n
+	}
+	if ord, ok := slotOrdinal(r.SlotName); ok {
+		return fmt.Sprintf("%s-%d", a.base, ord)
+	}
+	return ""
+}
+
+// libpqDefaultAppName is what a replication connection reports when primary_conninfo carries no
+// application_name -- i.e. any standby cloned before #288. It is a sentinel to fall back FROM,
+// never a pod name.
+const libpqDefaultAppName = "walreceiver"
 
 // slotsTick is the per-primary-tick replication-slot pass (#289): OBSERVE always, then
 // RECONCILE only under the native mechanism.
