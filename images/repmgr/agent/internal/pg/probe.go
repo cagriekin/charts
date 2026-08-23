@@ -322,6 +322,79 @@ func (p *Prober) StandbyNodeIDs(ctx context.Context, ci ConnInfo) ([]int, error)
 	return ids, nil
 }
 
+// ReplicaRow is one row of the primary's view of its streaming standbys (#288).
+//
+// Both identity fields are returned RAW and unresolved: mapping either to a pod name needs
+// the StatefulSet's base name and the slot-naming convention, which are the agent's business,
+// not this package's. See the resolution in cmd/agent.
+type ReplicaRow struct {
+	// AppName is pg_stat_replication.application_name. Under the native mechanism the agent
+	// writes the pod name here via primary_conninfo (#288). It is "walreceiver" -- libpq's
+	// default -- for any standby whose primary_conninfo predates that, which is the case the
+	// SlotName fallback exists for.
+	AppName string
+	// SlotName is the slot the standby is streaming through, recovered by joining
+	// pg_replication_slots on active_pid, or "" for a slotless stream. Because native names
+	// slots by pod ordinal (#289), this identifies the pod even when AppName does not.
+	SlotName string
+	// State is pg_stat_replication.state: "streaming", "catchup", "startup", "backup".
+	State string
+}
+
+// Streaming reports whether this replica is actually caught up and streaming, as opposed to
+// still catching up or backing up. Callers deciding topology should care about the
+// distinction: a "catchup" standby exists but cannot yet serve or be promoted safely.
+func (r ReplicaRow) Streaming() bool { return r.State == "streaming" }
+
+// ReplicationTopology reads the primary's own view of who is streaming from it (#288).
+//
+// This replaces repmgr.nodes as the topology source. That table was a CACHE of self-reported
+// metadata: nodes registered themselves into it, rows outlived the pods that wrote them (#139),
+// and it could disagree with both the lease and the observed positions. pg_stat_replication
+// cannot go stale in that way -- it is the primary's live connection list, so a departed pod is
+// simply absent and there is no row to strand.
+//
+// The join is what makes a row identifiable. application_name carries the pod name under
+// native mode, but a standby cloned before #288 still dials with libpq's default
+// ("walreceiver"), so pg_replication_slots.active_pid recovers the pod from the ordinal-named
+// slot instead. Verified against real PostgreSQL 18 with both shapes streaming to one primary
+// at once: `pg-1|pg_ha_slot_1|streaming` alongside `walreceiver|pg_ha_slot_2|streaming`.
+//
+// PRIMARY-ONLY, and it must not become a promotion gate on its own. pg_stat_replication is the
+// mirror of the pg_stat_wal_receiver caveat above: a standby's row VANISHES the instant it
+// disconnects, which is exactly the failover moment when a promotion decision is being made.
+// Absence here means "not streaming right now", never "this node does not exist".
+func (p *Prober) ReplicationTopology(ctx context.Context, ci ConnInfo) ([]ReplicaRow, error) {
+	out, err := p.psql(ctx, ci,
+		"SELECT r.application_name, COALESCE(s.slot_name, ''), r.state "+
+			"FROM pg_stat_replication r "+
+			"LEFT JOIN pg_replication_slots s ON s.active_pid = r.pid "+
+			"ORDER BY 1, 2;")
+	if err != nil {
+		return nil, err
+	}
+	var rows []ReplicaRow
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "|")
+		if len(parts) != 3 {
+			// Strict, like every other parse here: application_name is operator-settable in
+			// principle, so a value containing the separator would otherwise be silently
+			// mis-split into a bogus topology rather than reported.
+			return nil, fmt.Errorf("parse pg_stat_replication row %q: want 3 fields, got %d", line, len(parts))
+		}
+		rows = append(rows, ReplicaRow{
+			AppName:  strings.TrimSpace(parts[0]),
+			SlotName: strings.TrimSpace(parts[1]),
+			State:    strings.TrimSpace(parts[2]),
+		})
+	}
+	return rows, nil
+}
+
 // SlotState is one physical replication slot as the primary sees it (#289).
 //
 // RetainedWALBytes is how much WAL the slot is holding back:

@@ -39,6 +39,21 @@ type Native struct {
 	// use entirely (the pre-#289 behaviour), which keeps the mechanism usable in tests and
 	// for any caller that has no ordinal to derive a name from.
 	SlotName string
+	// NodeName is THIS node's pod name, written into primary_conninfo as
+	// application_name so the UPSTREAM can tell its standbys apart (#288).
+	//
+	// Without it every native standby shows up in the primary's pg_stat_replication as
+	// application_name = 'walreceiver' -- the libpq default -- so the primary can see HOW
+	// MANY standbys are streaming but not WHICH pods they are. That makes
+	// pg_stat_replication useless as a topology source, which is exactly what this issue
+	// needs it to be. repmgr mode does not have the problem because repmgr injects
+	// node_name itself during standby clone.
+	//
+	// Deliberately not added to Conn.conninfo(): that builder also feeds
+	// `repmgr node rejoin -d` and `pg_rewind --source-server`, which are ordinary client
+	// connections where an application_name would be noise, and touching it would move the
+	// repmgr-mode render. Empty omits the setting.
+	NodeName string
 	Now      Clock
 }
 
@@ -51,13 +66,16 @@ type Native struct {
 // ConfigMap and postgresql.auto.conf (which ALTER SYSTEM and pg_basebackup -R own).
 //
 // slotName is this node's own slot on its upstream (#289); "" disables slot use.
-func NewNative(dataDir, pgBindir, password, slotName string) *Native {
+// nodeName is this node's pod name, published to the upstream as application_name (#288);
+// "" omits it.
+func NewNative(dataDir, pgBindir, password, slotName, nodeName string) *Native {
 	return &Native{
 		Runner:   OSRunner{},
 		DataDir:  dataDir,
 		PGBindir: pgBindir,
 		Password: password,
 		SlotName: slotName,
+		NodeName: nodeName,
 		Now:      time.Now,
 	}
 }
@@ -141,6 +159,14 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 	// what makes the readonly Service useful.
 	b.WriteString("hot_standby = on\n")
 	if primaryConninfo != "" {
+		// application_name identifies THIS node in the upstream's pg_stat_replication (#288),
+		// which is what makes that view a usable topology source -- see Native.NodeName. Appended
+		// to the conninfo rather than set as a separate GUC because primary_conninfo is what the
+		// walreceiver actually dials; a bare application_name GUC would name the postmaster's
+		// own sessions, not the replication connection.
+		if n.NodeName != "" {
+			primaryConninfo = fmt.Sprintf("%s application_name=%s", primaryConninfo, n.NodeName)
+		}
 		// Single-quoted and escaped: a host or user containing a quote would otherwise break
 		// out of the GUC and corrupt the file, failing postmaster start.
 		b.WriteString(fmt.Sprintf("primary_conninfo = '%s'\n", escapeSingleQuoted(primaryConninfo)))

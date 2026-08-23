@@ -671,3 +671,48 @@ func TestNativeFollowFailsWhenTheSlotCannotBeEnsured(t *testing.T) {
 		t.Fatal("Follow reported success despite being unable to create the slot it points at")
 	}
 }
+
+// #288: primary_conninfo must publish this node's pod name as application_name, because that
+// is the only thing that makes the upstream's pg_stat_replication a usable topology source.
+// Without it every native standby is application_name = 'walreceiver' (the libpq default), so
+// the primary can count its standbys but cannot tell which pods they are. repmgr mode does not
+// have the problem: repmgr injects node_name itself during standby clone.
+func TestNativeFollowPublishesApplicationNameForTopology(t *testing.T) {
+	n, dataDir := newTestNativeWithSlot(t, &fakeRunner{}, "pg_ha_slot_1")
+	n.NodeName = "pg-1"
+	if err := n.Follow(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Follow: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	// Inside primary_conninfo, not as a standalone GUC: primary_conninfo is what the
+	// walreceiver actually dials, so a bare application_name would name the postmaster's own
+	// sessions rather than the replication connection.
+	if !strings.Contains(got, "application_name=pg-1") {
+		t.Errorf("primary_conninfo carries no application_name, so the upstream cannot identify this standby:\n%s", got)
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "application_name") {
+			t.Errorf("application_name written as its own GUC (%q) -- it must live inside primary_conninfo", line)
+		}
+		if strings.HasPrefix(line, "primary_conninfo") && !strings.Contains(line, "application_name=pg-1") {
+			t.Errorf("application_name is not inside primary_conninfo: %q", line)
+		}
+	}
+}
+
+// An empty NodeName omits the setting rather than emitting a dangling `application_name=`,
+// which libpq would reject and which would fail postmaster start.
+func TestNativeFollowOmitsApplicationNameWhenNodeNameIsEmpty(t *testing.T) {
+	n, dataDir := newTestNativeWithSlot(t, &fakeRunner{}, "pg_ha_slot_1")
+	if err := n.Follow(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Follow: %v", err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if strings.Contains(string(b), "application_name") {
+		t.Errorf("emitted application_name with no NodeName set:\n%s", string(b))
+	}
+}

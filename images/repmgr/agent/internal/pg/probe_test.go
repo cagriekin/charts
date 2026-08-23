@@ -529,3 +529,93 @@ func TestOSExecSurfacesStderrSoDiagnosticsAreInspectable(t *testing.T) {
 		t.Errorf("IsDuplicateSlot cannot recognise a real duplicate-slot failure: out=%q err=%q", out, err.Error())
 	}
 }
+
+// #288: the row shapes are the two verified against real PostgreSQL 18 with both kinds of
+// standby streaming to one primary at once -- a native standby publishing its pod name, and a
+// pre-#288 standby still dialling with libpq's default application_name whose identity has to
+// come from the ordinal-named slot instead.
+func TestReplicationTopologyParsesBothIdentitySources(t *testing.T) {
+	ex := &slotExec{out: "pg-1|pg_ha_slot_1|streaming\nwalreceiver|pg_ha_slot_2|streaming"}
+	rows, err := (&Prober{Exec: ex}).ReplicationTopology(context.Background(), ConnInfo{})
+	if err != nil {
+		t.Fatalf("ReplicationTopology: %v", err)
+	}
+	want := []ReplicaRow{
+		{AppName: "pg-1", SlotName: "pg_ha_slot_1", State: "streaming"},
+		{AppName: "walreceiver", SlotName: "pg_ha_slot_2", State: "streaming"},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("got %d rows, want %d: %+v", len(rows), len(want), rows)
+	}
+	for i := range want {
+		if rows[i] != want[i] {
+			t.Errorf("row %d: got %+v, want %+v", i, rows[i], want[i])
+		}
+	}
+	if !rows[0].Streaming() {
+		t.Error("a streaming row does not report Streaming()")
+	}
+}
+
+// A standby that exists but is still catching up must be distinguishable from one that is
+// caught up: it has a row, so it is present, but it cannot serve or be safely promoted yet.
+func TestReplicationTopologyDistinguishesCatchupFromStreaming(t *testing.T) {
+	ex := &slotExec{out: "pg-1|pg_ha_slot_1|catchup"}
+	rows, err := (&Prober{Exec: ex}).ReplicationTopology(context.Background(), ConnInfo{})
+	if err != nil {
+		t.Fatalf("ReplicationTopology: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Streaming() {
+		t.Errorf("a catchup replica reported as streaming: %+v", rows)
+	}
+}
+
+// A slotless stream is still a real replica -- it just cannot be identified by slot, so the
+// empty SlotName must survive rather than dropping the row.
+func TestReplicationTopologyKeepsSlotlessRows(t *testing.T) {
+	ex := &slotExec{out: "pg-1||streaming"}
+	rows, err := (&Prober{Exec: ex}).ReplicationTopology(context.Background(), ConnInfo{})
+	if err != nil {
+		t.Fatalf("ReplicationTopology: %v", err)
+	}
+	if len(rows) != 1 || rows[0].SlotName != "" || rows[0].AppName != "pg-1" {
+		t.Errorf("slotless row mishandled: %+v", rows)
+	}
+}
+
+// No standbys is a legitimate answer (a lone primary), not an error -- unlike the repmgr.nodes
+// reads this replaces, where an empty result meant "the table is missing" and had to be an
+// error to keep the #297 gate from firing.
+func TestReplicationTopologyEmptyIsNoReplicasNotAnError(t *testing.T) {
+	rows, err := (&Prober{Exec: &slotExec{out: ""}}).ReplicationTopology(context.Background(), ConnInfo{})
+	if err != nil || len(rows) != 0 {
+		t.Errorf("empty output: got rows=%+v err=%v, want none/nil", rows, err)
+	}
+}
+
+// A row that does not split into exactly three fields is an error, not a silently mis-split
+// topology: application_name is operator-settable in principle, so a value containing the
+// separator must be reported rather than guessed at.
+func TestReplicationTopologyRejectsMalformedRows(t *testing.T) {
+	if _, err := (&Prober{Exec: &slotExec{out: "pg-1|pg_ha_slot_1"}}).ReplicationTopology(context.Background(), ConnInfo{}); err == nil {
+		t.Fatal("want an error for a 2-field row")
+	}
+}
+
+// The query must read the primary's live connection list and recover identity from the slot,
+// and must NOT fall back to repmgr.nodes -- retiring that table is the point of #288.
+func TestReplicationTopologyQueryShape(t *testing.T) {
+	ex := &slotExec{}
+	if _, err := (&Prober{Exec: ex}).ReplicationTopology(context.Background(), ConnInfo{}); err != nil {
+		t.Fatalf("ReplicationTopology: %v", err)
+	}
+	sql := ex.sqls[0]
+	for _, needle := range []string{"pg_stat_replication", "pg_replication_slots", "active_pid", "application_name"} {
+		if !strings.Contains(sql, needle) {
+			t.Errorf("query is missing %q: %s", needle, sql)
+		}
+	}
+	if strings.Contains(sql, "repmgr.nodes") {
+		t.Errorf("topology still reads repmgr.nodes, which #288 exists to retire: %s", sql)
+	}
+}

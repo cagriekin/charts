@@ -1210,7 +1210,11 @@ func newMechanism(cfg *config.Config, repmgrConf, pgBindir string, log *slog.Log
 		// drop only inactive orphans). Topology (#288) is still the outstanding blocker.
 		log.Warn("using the EXPERIMENTAL native mechanism: topology still comes from repmgr.nodes (#288), so this is not yet usable for a real cluster",
 			"mechanism", cfg.Mechanism)
-		return mechanism.NewNative(cfg.PGDATA, pgBindir, cfg.RepmgrPassword, slotNameFor(cfg.PodName)), nil
+		// PodName is passed twice by design: once derived into the slot name (#289) and once
+		// verbatim as application_name (#288). Both are this node's identity, but they land in
+		// different places -- pg_replication_slots and pg_stat_replication -- and the topology
+		// probe reads whichever is available.
+		return mechanism.NewNative(cfg.PGDATA, pgBindir, cfg.RepmgrPassword, slotNameFor(cfg.PodName), cfg.PodName), nil
 	case config.MechanismRepmgr, "":
 		return mechanism.NewRepmgr(repmgrConf, cfg.PGDATA, cfg.RepmgrPassword), nil
 	default:
