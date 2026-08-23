@@ -17,9 +17,10 @@ import (
 // timeline/LSN election, fencing and Service routing all live in reconcile, which imports
 // only the Mechanism interface. Only the mechanics differ -- that is what the seam is for.
 //
-// EXPERIMENTAL and not usable on its own. Topology still comes from repmgr.nodes (#288) and
-// nothing owns replication slots (#289), so a standby has no upstream to choose and the
-// primary can recycle WAL a standby still needs. #294 promotes it to supported.
+// EXPERIMENTAL and not usable on its own: topology still comes from repmgr.nodes (#288),
+// so a standby has no upstream to choose. Replication slot ownership (#289) HAS landed --
+// this mechanism creates its own slot before every clone/rejoin and the primary reconciles
+// the set each tick -- so the WAL-recycling gap is closed. #294 promotes it to supported.
 //
 // Every binary is resolved under PGBindir rather than PATH: the image ships exactly one
 // PostgreSQL major and the agent must exec that major's tools, not whatever PATH resolves
@@ -29,6 +30,15 @@ type Native struct {
 	DataDir  string // PGDATA
 	PGBindir string // /usr/lib/postgresql/<major>/bin
 	Password string // replication password, supplied to libpq via PGPASSWORD only
+	// SlotName is THIS node's physical replication slot on whatever upstream it streams
+	// from (#289) -- ordinal-derived and stable across restarts, so a pod that restarts
+	// reattaches to the same slot instead of stranding one and reserving a second.
+	//
+	// It names a slot on the UPSTREAM, not locally: Clone creates it there before the base
+	// backup and primary_slot_name makes the walreceiver keep using it. Empty disables slot
+	// use entirely (the pre-#289 behaviour), which keeps the mechanism usable in tests and
+	// for any caller that has no ordinal to derive a name from.
+	SlotName string
 	Now      Clock
 }
 
@@ -39,8 +49,17 @@ type Native struct {
 // per-node location the chart already appends to at initdb/postStart, it survives restarts
 // with the data it describes, and it keeps the agent's fragment clear of both the operator's
 // ConfigMap and postgresql.auto.conf (which ALTER SYSTEM and pg_basebackup -R own).
-func NewNative(dataDir, pgBindir, password string) *Native {
-	return &Native{Runner: OSRunner{}, DataDir: dataDir, PGBindir: pgBindir, Password: password, Now: time.Now}
+//
+// slotName is this node's own slot on its upstream (#289); "" disables slot use.
+func NewNative(dataDir, pgBindir, password, slotName string) *Native {
+	return &Native{
+		Runner:   OSRunner{},
+		DataDir:  dataDir,
+		PGBindir: pgBindir,
+		Password: password,
+		SlotName: slotName,
+		Now:      time.Now,
+	}
 }
 
 // managedConfName is the agent-owned fragment inside PGDATA, included from
@@ -125,6 +144,14 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 		// Single-quoted and escaped: a host or user containing a quote would otherwise break
 		// out of the GUC and corrupt the file, failing postmaster start.
 		b.WriteString(fmt.Sprintf("primary_conninfo = '%s'\n", escapeSingleQuoted(primaryConninfo)))
+		// primary_slot_name is what makes the ONGOING stream hold the slot (#289). Without
+		// it the walreceiver connects without a slot, so the upstream is free to recycle WAL
+		// this standby has not received yet -- the gap that forces a full re-clone. Written
+		// only alongside primary_conninfo: the GUC is meaningless without an upstream, and a
+		// primary that carried it would reserve WAL for a stream it never opens.
+		if n.SlotName != "" {
+			b.WriteString(fmt.Sprintf("primary_slot_name = '%s'\n", escapeSingleQuoted(n.SlotName)))
+		}
 	}
 	if err := writeFileAtomic(n.managedConfPath(), b.String(), 0o600); err != nil {
 		return fmt.Errorf("native: write %s: %w", n.managedConfPath(), err)
@@ -212,6 +239,23 @@ func (n *Native) Follow(ctx context.Context, upstream Conn) error {
 		// to write into primary_conninfo. Fail loudly rather than write a broken conninfo.
 		return fmt.Errorf("native: follow needs upstream.Host (node_id %d is not addressable)", upstream.NodeID)
 	}
+	// #289: ensure this node's slot exists on the upstream BEFORE pointing at it, the same
+	// way Clone and RejoinForceRewind do -- this was the one slot-using path that did not.
+	//
+	// writeManagedConf below sets primary_slot_name, and a walreceiver whose named slot is
+	// missing does NOT fall back to slotless streaming: it errors with `replication slot
+	// "..." does not exist` and retries, so the standby streams nothing at all. On a repoint
+	// after failover the new primary's own reconcile has usually created it already, but
+	// "usually" is the wrong guarantee here -- that create can have failed transiently, or
+	// been skipped entirely because the slot list read failed on that tick.
+	//
+	// Failing the Follow on error is deliberate rather than best-effort: with
+	// primary_slot_name pointing at a slot that does not exist the standby cannot stream
+	// either way, so a loud error the agent logs and retries beats a "successful" repoint
+	// whose only symptom is a walreceiver looping in the postmaster log.
+	if err := n.ensureSlotOnUpstream(ctx, upstream); err != nil {
+		return err
+	}
 	if err := n.writeManagedConf(upstream.conninfo()); err != nil {
 		return err
 	}
@@ -239,12 +283,23 @@ func (n *Native) Follow(ctx context.Context, upstream Conn) error {
 // the end of postgresql.conf), so it would silently outrank any later Follow -- a standby
 // cloned once and later re-pointed to a new upstream would keep streaming from the
 // original source. Calling Follow here instead keeps exactly one authoritative place.
+// #289: the backup streams through this node's own named slot, created on the source
+// FIRST so no WAL gap can open between the base backup starting and the walreceiver
+// attaching. Without a slot the source may recycle a segment the new standby still needs
+// before it finishes copying, and the clone comes up permanently behind -- recoverable
+// only by another full clone. The slot is created idempotently rather than with
+// pg_basebackup -C: -C fails outright when the slot already exists (verified), which is
+// the normal case for a re-clone of a pod that had one, so -C would break exactly the
+// retry path that matters most.
 func (n *Native) Clone(ctx context.Context, source Conn) error {
 	if n.DataDir == "" {
 		return fmt.Errorf("native: DataDir not set")
 	}
 	if source.Host == "" {
 		return fmt.Errorf("native: clone needs source.Host")
+	}
+	if err := n.ensureSlotOnUpstream(ctx, source); err != nil {
+		return err
 	}
 	args := []string{
 		"-h", source.Host,
@@ -255,10 +310,89 @@ func (n *Native) Clone(ctx context.Context, source Conn) error {
 		"--checkpoint=fast",
 		"--no-password",
 	}
+	if n.SlotName != "" {
+		args = append(args, "--slot", n.SlotName)
+	}
 	if out, err := n.run(ctx, n.bin("pg_basebackup"), args...); err != nil {
 		return fmt.Errorf("native: pg_basebackup from %s: %w: %s", source.Host, err, strings.TrimSpace(out))
 	}
 	return n.Follow(ctx, source)
+}
+
+// ensureSlotOnUpstream idempotently creates THIS node's slot on the upstream before a
+// clone (#289).
+//
+// Run from the cloning standby rather than left to the primary's own slot reconcile
+// because the two race at bootstrap: a fresh standby can reach pg_basebackup before the
+// primary's first reconcile tick has created its slot, and pg_basebackup --slot fails on
+// a missing slot. Creating it here makes the clone self-sufficient; the primary's
+// reconcile then finds it already present and does nothing.
+//
+// Uses psql (not a Prober) because mechanism must not depend on internal/pg -- the
+// dependency runs the other way. The name is validated before interpolation.
+func (n *Native) ensureSlotOnUpstream(ctx context.Context, source Conn) error {
+	if n.SlotName == "" {
+		return nil
+	}
+	if err := validSlotName(n.SlotName); err != nil {
+		return fmt.Errorf("native: clone slot: %w", err)
+	}
+	sql := fmt.Sprintf(
+		"SELECT pg_create_physical_replication_slot('%s') "+
+			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '%s');",
+		n.SlotName, n.SlotName)
+	args := []string{
+		"-h", source.Host,
+		"-p", strconv.Itoa(source.port()),
+		"-U", source.User,
+		"-d", source.database(),
+		"-tAc", sql,
+	}
+	if out, err := n.run(ctx, n.bin("psql"), args...); err != nil {
+		// Losing a create/create race means the slot now EXISTS, which is exactly what this
+		// call is for -- so it is success, not failure. The WHERE NOT EXISTS guard above is
+		// not atomic (verified: 40 of 40 concurrent pairs race on PostgreSQL 18), and there
+		// are two legitimate independent creators of this name -- this cloning standby, and
+		// the primary's own periodic reconcile. Propagating the error here would abort an
+		// otherwise-fine clone over a slot that is present and usable.
+		if isDuplicateSlot(out, err) {
+			return nil
+		}
+		return fmt.Errorf("native: create slot %q on %s: %w: %s", n.SlotName, source.Host, err, strings.TrimSpace(out))
+	}
+	return nil
+}
+
+// isDuplicateSlot mirrors pg.IsDuplicateSlot. Duplicated for the same reason
+// validSlotName is: mechanism deliberately does not import internal/pg (that dependency
+// runs the other way). Kept narrow so it cannot swallow an unrelated failure.
+func isDuplicateSlot(out string, err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(out + " " + err.Error())
+	return strings.Contains(s, "already exists") && strings.Contains(s, "replication slot")
+}
+
+// validSlotName mirrors internal/pg's guard. Duplicated rather than imported because
+// mechanism deliberately does not depend on internal/pg (that import runs the other way,
+// and inverting it would couple the mechanics layer to the probe layer). PostgreSQL
+// restricts slot names to lower-case letters, digits and underscore -- none of which can
+// terminate a quoted SQL literal, so a name that passes cannot inject.
+func validSlotName(name string) error {
+	if name == "" {
+		return fmt.Errorf("replication slot name is empty")
+	}
+	if len(name) > 63 {
+		return fmt.Errorf("replication slot name %q is longer than 63 characters", name)
+	}
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			continue
+		}
+		return fmt.Errorf("invalid replication slot name %q: only lower-case letters, digits and underscore are allowed", name)
+	}
+	return nil
 }
 
 // RejoinForceRewind rewinds the diverged local node forward onto target via pg_rewind, then
@@ -287,6 +421,16 @@ func (n *Native) RejoinForceRewind(ctx context.Context, target Conn) error {
 	}
 	out, err := n.run(ctx, n.bin("pg_rewind"), args...)
 	if err == nil {
+		// Same reasoning as Clone (#289): make sure this node's slot exists on the target
+		// BEFORE it starts streaming. The rewind path had been relying on the new primary's
+		// own reconcile having already created it -- true almost always (reconcileSlots runs
+		// in the same tick as Promote, ahead of the routing switch, while a rejoin is paced
+		// by the reconcile interval), but "almost always" is the wrong guarantee for the one
+		// thing standing between a standby and a WAL gap. Idempotent, so the overwhelmingly
+		// common case where the slot is already there costs one cheap query.
+		if err := n.ensureSlotOnUpstream(ctx, target); err != nil {
+			return err
+		}
 		// pg_rewind leaves the node needing standby.signal + primary_conninfo to come back
 		// as a standby; write them now so the supervisor's Start attaches it to the target
 		// rather than booting a second read-write primary (the two-writer risk).

@@ -103,7 +103,23 @@
             },
             "mechanism": {
               "enum": ["repmgr", "native"],
-              "description": "EXPERIMENTAL (#287). Replication mechanics: repmgr (default, the repmgr CLI) or native (pg_ctl/pg_basebackup/pg_rewind). Policy is identical either way. native is not usable until #288 (topology) and #289 (replication slots) land."
+              "description": "EXPERIMENTAL (#287). Replication mechanics: repmgr (default, the repmgr CLI) or native (pg_ctl/pg_basebackup/pg_rewind). Policy is identical either way. native owns replication slot lifecycle (#289) but is still not usable until #288 (topology) lands."
+            },
+            "monitoring": {
+              "type": "object",
+              "properties": {
+                "prometheusRule": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "slotRetainedWALBytes": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "description": "Bytes of WAL retained by a single physical replication slot before PGHAReplicationSlotRetainingWAL fires (#289). Keep it BELOW max_slot_wal_keep_size (4GB in this image, hence the 3Gi default): past that cap PostgreSQL invalidates the slot instead, and invalidation nulls restart_lsn so this gauge collapses to zero -- a threshold above the cap can never fire. Typed and floored because a string or 0 would do the same."
+                    }
+                  }
+                }
+              }
             },
             "dcs": {
               "type": "object",

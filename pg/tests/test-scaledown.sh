@@ -103,6 +103,27 @@ assert_eq "live node 1001 still registered" "1" "$(node_count "${P}" 1001)"
 serves=$(pg_exec "${NAMESPACE}" "${P}" "SELECT NOT pg_is_in_recovery()" repmgr repmgr 2>/dev/null || echo "")
 assert_eq "a primary still serves after scale-down + cleanup" "t" "${serves}"
 
+# #289: this suite runs the repmgr mechanism, where repmgr -- not the agent -- owns
+# replication slots. The agent's slot reconcile is gated on MECHANISM=native and must be
+# completely inert here, so no agent-minted slot may exist. This is the regression guard
+# for that gate: if reconcileSlots ever ran under repmgr mode it would create
+# pg_ha_slot_<ordinal> alongside repmgr's own repmgr_slot_<node_id>, giving two owners for
+# the same resource -- and, worse, its orphan rule would start dropping repmgr's slots.
+agent_slots=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
+assert_eq "#289: the agent creates no slots under the repmgr mechanism (repmgr owns them)" "0" "${agent_slots}"
+
+# No physical slot may be left pinning WAL for a pod that no longer exists. Under repmgr
+# mode repmgr names them repmgr_slot_<node_id>, so the scaled-away node 1002's slot is the
+# one to look for. NOTE: the equivalent native-mode assertion (zero pg_ha_slot_* above the
+# live ordinal range) cannot be written until #288 lands -- native mode cannot run with any
+# replicas at all today, since the shared repmgr-init container leaves every standby in
+# Init:CrashLoopBackOff. Tracked there; the native path is covered at the unit level and was
+# verified by hand against a real two-node PostgreSQL 18 pair.
+ghost_slot=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'repmgr_slot_1002'" repmgr repmgr 2>/dev/null | xargs || echo "")
+assert_eq "#289: no replication slot left pinning WAL for the scaled-away node 1002" "0" "${ghost_slot}"
+
 # Cleanup.
 helm uninstall "${RELEASE}" -n "${NAMESPACE}" 2>/dev/null || true
 kubectl delete pvc -n "${NAMESPACE}" --all --wait=false 2>/dev/null || true

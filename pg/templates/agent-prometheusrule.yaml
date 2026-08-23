@@ -73,6 +73,50 @@ spec:
           annotations:
             summary: "pg-ha-agent fencing repeatedly ({{ include "pg.fullname" . }})"
             description: "More than 2 fences in 15m suggests instability (intermittent apiserver/node slowness or a flapping primary)."
+        {{- /* #289: the slot alerts. A neglected physical replication slot fails silently
+               in one of two ways, and nothing else in the stack reports either.
+               Scoped to the primary implicitly: only the lease holder publishes non-zero
+               slot gauges (the slot pass runs on the primary branches, and a demoted node
+               retracts them), so max() picks the primary's view without a role label.
+
+               The FIRST alert below is the one that matters on chart defaults. The image
+               sets max_slot_wal_keep_size = 4GB at initdb (images/repmgr/entrypoint.sh), so
+               PostgreSQL does not let a slot fill the volume -- it INVALIDATES the slot
+               instead (wal_status = 'lost'), and the standby behind it can then only recover
+               by a full re-clone. Verified against PostgreSQL 18: invalidation also nulls
+               restart_lsn, so the retained-bytes gauge COLLAPSES TO ZERO at the exact moment
+               the slot dies. Retained-WAL alerting is therefore blind to the outcome it was
+               supposed to catch, which is why the invalidated count gets its own rule.
+
+               The retained-WAL rule is the EARLY WARNING ahead of that, so its threshold
+               has to sit below max_slot_wal_keep_size to be reachable at all -- 3Gi against
+               the 4GB cap. It was 16Gi, which no slot could ever reach and which also
+               exceeded the default 10Gi data volume: an alert that cannot fire reads as
+               coverage while providing none. */}}
+        - alert: PGHAReplicationSlotInvalidated
+          expr: max(pg_ha_agent_replication_slots_invalidated{ {{ $m }} }) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "A replication slot was invalidated ({{ include "pg.fullname" . }})"
+            description: "PostgreSQL dropped a physical replication slot's WAL reservation because it exceeded max_slot_wal_keep_size (4GB in this image). The WAL the standby behind it needs is gone, so that standby cannot resume streaming and requires a full re-clone -- delete its PVC and let the agent re-clone it, or trigger a rejoin. Identify it with: SELECT slot_name, active, wal_status, restart_lsn FROM pg_replication_slots WHERE wal_status = 'lost'; -- note the retained-WAL gauge reads ZERO for these, because invalidation nulls restart_lsn."
+        - alert: PGHAReplicationSlotRetainingWAL
+          expr: max(pg_ha_agent_replication_slot_max_retained_wal_bytes{ {{ $m }} }) > {{ int64 (dig "prometheusRule" "slotRetainedWALBytes" 3221225472 (.Values.repmgr.agent.monitoring | default dict)) }}
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: "A replication slot is retaining too much WAL ({{ include "pg.fullname" . }})"
+            description: "Some physical replication slot has held back more than {{ int64 (dig "prometheusRule" "slotRetainedWALBytes" 3221225472 (.Values.repmgr.agent.monitoring | default dict)) }} bytes of WAL for 15m. This is the early warning before max_slot_wal_keep_size (4GB) is reached: past that PostgreSQL invalidates the slot, this gauge drops back to zero, and the standby behind it needs a full re-clone. Find it with: SELECT slot_name, active, wal_status, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots ORDER BY 4 DESC; -- then reattach its consumer, or drop the slot if that consumer is gone for good (pg_drop_replication_slot)."
+        - alert: PGHAReplicationSlotInactive
+          expr: max(pg_ha_agent_replication_slots_inactive{ {{ $m }} }) > 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "A replication slot has no consumer ({{ include "pg.fullname" . }})"
+            description: "At least one physical replication slot has been reserving WAL with no active consumer for 1h. Slots that have reserved nothing yet (a slot minted ahead of its standby) are not counted, so this really is accumulation. Expected briefly while a standby restarts or re-clones; sustained means a standby is down or the slot is orphaned. Under repmgr.agent.mechanism: native the agent reclaims slots it owns automatically, so a persistent one is an operator-created slot or a standby needing attention; under the default repmgr mechanism the agent reclaims nothing and every sustained breach needs a human."
         - alert: PGHAAgentPausedTooLong
           expr: max(pg_ha_agent_is_paused{ {{ $m }} }) == 1
           for: 1h
