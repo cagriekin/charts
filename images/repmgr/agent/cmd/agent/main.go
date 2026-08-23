@@ -412,7 +412,15 @@ func (a *agent) boot(ctx context.Context) error {
 	//
 	// Nothing is lost by waiting: both paths that create a data directory regenerate the config
 	// once it exists (Native.Clone ends in Follow, and finishInitdbNative calls GenerateConfig).
-	if process.HasData(a.cfg.PGDATA) {
+	// NATIVE ONLY (#288 review). Repmgr.GenerateConfig writes /etc/repmgr/repmgr.conf and never
+	// touches PGDATA, so skipping it there is pure loss: the pod would run on init-repmgr.sh's
+	// version of that file for the rest of its life, which carries the password in plaintext
+	// (the agent's omits it), sets failover=automatic, and -- functionally -- has NO
+	// use_replication_slots, so every subsequent standby clone/follow/rejoin would run slotless
+	// and re-expose the WAL-recycling gap #289 closed. Reachable in repmgr mode via an
+	// interrupted ReclonePreserving: discardTornClone wipes PGDATA, HasData goes false, and the
+	// skip would then persist.
+	if a.cfg.Mechanism != config.MechanismNative || process.HasData(a.cfg.PGDATA) {
 		if err := a.mech.GenerateConfig(ctx, nid, mechanism.ConfigOpts{Failover: "manual", UseReplicationSlots: true}); err != nil {
 			return err
 		}

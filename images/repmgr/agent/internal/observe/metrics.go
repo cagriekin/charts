@@ -201,7 +201,7 @@ func (m *Metrics) write(w io.Writer) {
 		{"pg_ha_agent_control_intents_total", "Node-local control-API operations handed to the reconcile loop.", "counter", m.controlIntents.Load()},
 		{"pg_ha_agent_control_restore_requests_total", "Restores triggered through the control API.", "counter", m.controlRestoreRequests.Load()},
 		{"pg_ha_agent_replicas_streaming", "Replicas this primary sees in pg_stat_replication state 'streaming'.", "gauge", m.topologyStreaming.Load()},
-		{"pg_ha_agent_replicas_expected", "Peers that ought to be streaming, from the live pod set.", "gauge", m.topologyExpected.Load()},
+		{"pg_ha_agent_replicas_expected", "Peers that ought to be streaming, from the live pod set. NOT MEASURED (always 0) under repmgr.agent.mechanism=repmgr, which does not make the extra apiserver pod LIST -- alert on this only where native is in use.", "gauge", m.topologyExpected.Load()},
 		{"pg_ha_agent_replicas_unidentified", "Streaming replicas that resolved to no pod (neither application_name nor slot name).", "gauge", m.topologyUnidentified.Load()},
 		{"pg_ha_agent_replication_slots", "Physical replication slots on this primary.", "gauge", m.slotsTotal.Load()},
 		{"pg_ha_agent_replication_slots_inactive", "Physical replication slots reserving WAL with no active consumer.", "gauge", m.slotsInactive.Load()},

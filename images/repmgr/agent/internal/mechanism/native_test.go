@@ -826,3 +826,47 @@ func TestNativeEnsureIncludeMovesItselfLast(t *testing.T) {
 		t.Errorf("the operator's include_dir was dropped:\n%s", got)
 	}
 }
+
+// #288 review: the reposition must be ONE atomic write. An earlier revision truncated and then
+// re-appended, so between the two writes postgresql.conf carried no include at all -- and act()
+// issues pg_reload_conf() after every successful Follow on a RUNNING standby, so a reload landing
+// in that window would drop primary_conninfo/primary_slot_name/hot_standby/wal_log_hints and stop
+// the walreceiver. A crash mid-truncate also leaves a file the postmaster cannot start on.
+func TestNativeEnsureIncludeIsAtomicAndDoesNotAccumulateHeaders(t *testing.T) {
+	n, dataDir := newTestNative(t, &fakeRunner{})
+	confPath := filepath.Join(dataDir, "postgresql.conf")
+	body := "# initial\ninclude '" + managedConfName + "'\ninclude_dir = '/etc/postgresql/conf.d'\n"
+	if err := os.WriteFile(confPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Three repositions in a row: the file must converge, not grow.
+	for i := 0; i < 3; i++ {
+		if err := n.GenerateConfig(context.Background(), NodeIdentity{DataDir: dataDir}, ConfigOpts{}); err != nil {
+			t.Fatalf("GenerateConfig %d: %v", i, err)
+		}
+	}
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	if c := strings.Count(got, "include '"+managedConfName+"'"); c != 1 {
+		t.Errorf("the managed include appears %d times, want 1:\n%s", c, got)
+	}
+	if c := strings.Count(got, "# Managed by pg-ha-agent (native mechanism, #287)"); c != 1 {
+		t.Errorf("the managed header appears %d times, want 1 (orphans accumulating):\n%s", c, got)
+	}
+	if !isLastActiveDirective(got, "include '"+managedConfName+"'") {
+		t.Errorf("the managed include is not last:\n%s", got)
+	}
+	if !strings.Contains(got, "include_dir = '/etc/postgresql/conf.d'") {
+		t.Errorf("the operator's include_dir was dropped:\n%s", got)
+	}
+	// No temp file left behind by the atomic write.
+	entries, _ := os.ReadDir(dataDir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".") || strings.Contains(e.Name(), "tmp") {
+			t.Errorf("atomic write left %q behind", e.Name())
+		}
+	}
+}

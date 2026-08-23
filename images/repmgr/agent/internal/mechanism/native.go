@@ -124,6 +124,7 @@ func (n *Native) ensureInclude() error {
 		return fmt.Errorf("native: read %s: %w", confPath, err)
 	}
 	line := fmt.Sprintf("include '%s'", managedConfName)
+	const header = "# Managed by pg-ha-agent (native mechanism, #287)"
 	// REPOSITION rather than skip when the line is already present (#288 review). The agent's
 	// fragment must be the LAST include so its replication settings win, and an
 	// append-only-if-absent check cannot maintain that: a native cluster created with no conf.d
@@ -131,29 +132,25 @@ func (n *Native) ensureInclude() error {
 	// makes the setup-config init container append include_dir AFTER it on the next pod start.
 	// From then on an operator's wal_log_hints or hot_standby would silently override the
 	// agent's -- removing the cheap pg_rewind rejoin path -- and the inverted file would be
-	// cloned verbatim to every standby. Stripping and re-appending converges on every boot.
-	if hasActiveDirective(string(b), line) {
-		if isLastActiveDirective(string(b), line) {
-			return nil
-		}
-		if err := os.WriteFile(confPath, []byte(stripActiveDirective(string(b), line)), 0o600); err != nil {
-			return fmt.Errorf("native: rewrite %s to move the managed include last: %w", confPath, err)
-		}
+	// cloned verbatim to every standby.
+	if hasActiveDirective(string(b), line) && isLastActiveDirective(string(b), line) {
+		return nil
 	}
-	f, err := os.OpenFile(confPath, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("native: open %s: %w", confPath, err)
-	}
-	if _, err := f.WriteString("\n# Managed by pg-ha-agent (native mechanism, #287)\n" + line + "\n"); err != nil {
-		f.Close()
-		return fmt.Errorf("native: append include to %s: %w", confPath, err)
-	}
-	// Checked, not deferred-and-dropped: a close failure (e.g. a delayed write-back error
-	// surfacing only at close) means the include line's durability is not guaranteed even
-	// though the write above returned success, and a missing include silently drops
-	// wal_log_hints/hot_standby/primary_conninfo from postgresql.conf.
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("native: close %s: %w", confPath, err)
+	// ONE ATOMIC WRITE (#288 review). An earlier revision truncated the file and then re-appended
+	// in a second O_APPEND write, which is unsafe twice over: between the two writes
+	// postgresql.conf carries no include at all, and act() issues pg_reload_conf() after every
+	// successful Follow on a RUNNING standby (as does the chart's postStart hook) -- a reload
+	// landing in that window drops primary_conninfo, primary_slot_name, hot_standby and
+	// wal_log_hints and stops the walreceiver. A crash or ENOSPC mid-truncate also leaves a
+	// postgresql.conf the postmaster will not start on at all. writeFileAtomic exists in this
+	// file for exactly that reason.
+	body := stripActiveDirective(string(b), line)
+	// Drop the orphaned header the strip would otherwise leave behind, so repeated repositions
+	// do not accumulate them.
+	body = stripActiveDirective(body, header)
+	body = strings.TrimRight(body, "\n")
+	if err := writeFileAtomic(confPath, body+"\n\n"+header+"\n"+line+"\n", 0o600); err != nil {
+		return fmt.Errorf("native: rewrite %s with the managed include last: %w", confPath, err)
 	}
 	return nil
 }

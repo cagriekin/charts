@@ -404,16 +404,19 @@ func (p *Prober) ReplicationTopology(ctx context.Context, ci ConnInfo) ([]Replic
 			continue
 		}
 		parts := strings.Split(line, "|")
-		if len(parts) != 3 {
-			// Strict, like every other parse here: application_name is operator-settable in
-			// principle, so a value containing the separator would otherwise be silently
-			// mis-split into a bogus topology rather than reported.
-			return nil, fmt.Errorf("parse pg_stat_replication row %q: want 3 fields, got %d", line, len(parts))
+		if len(parts) < 3 {
+			return nil, fmt.Errorf("parse pg_stat_replication row %q: want at least 3 fields, got %d", line, len(parts))
 		}
+		// EXTRA separators belong to application_name, which is the FIRST column and the only
+		// operator-settable one (#288 review). pg_stat_replication is a cluster-wide view this
+		// chart does not control: one unrelated client whose application_name contains a '|' --
+		// third-party tooling sets it freely -- would otherwise fail the whole read and blind all
+		// three gauges on every tick. slot_name is restricted to [a-z0-9_] and state is a fixed
+		// enum, so the LAST two fields are unambiguous and everything before them is the name.
 		rows = append(rows, ReplicaRow{
-			AppName:  strings.TrimSpace(parts[0]),
-			SlotName: strings.TrimSpace(parts[1]),
-			State:    strings.TrimSpace(parts[2]),
+			AppName:  strings.TrimSpace(strings.Join(parts[:len(parts)-2], "|")),
+			SlotName: strings.TrimSpace(parts[len(parts)-2]),
+			State:    strings.TrimSpace(parts[len(parts)-1]),
 		})
 	}
 	return rows, nil

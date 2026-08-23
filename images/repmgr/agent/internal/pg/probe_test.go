@@ -593,12 +593,29 @@ func TestReplicationTopologyEmptyIsNoReplicasNotAnError(t *testing.T) {
 	}
 }
 
-// A row that does not split into exactly three fields is an error, not a silently mis-split
-// topology: application_name is operator-settable in principle, so a value containing the
-// separator must be reported rather than guessed at.
-func TestReplicationTopologyRejectsMalformedRows(t *testing.T) {
+// Too FEW fields is still an error -- that is a genuinely unparseable row.
+func TestReplicationTopologyRejectsTruncatedRows(t *testing.T) {
 	if _, err := (&Prober{Exec: &slotExec{out: "pg-1|pg_ha_slot_1"}}).ReplicationTopology(context.Background(), ConnInfo{}); err == nil {
 		t.Fatal("want an error for a 2-field row")
+	}
+}
+
+// EXTRA fields belong to application_name, which is the first column and the only
+// operator-settable one (#288 review). pg_stat_replication is cluster-wide and this chart does
+// not control it: one unrelated client whose application_name contains a '|' would otherwise fail
+// the whole read and blind all three gauges on every tick. slot_name is [a-z0-9_] and state is a
+// fixed enum, so the last two fields are unambiguous.
+func TestReplicationTopologyToleratesSeparatorsInApplicationName(t *testing.T) {
+	rows, err := (&Prober{Exec: &slotExec{out: "some|third|party|tool|pg_ha_slot_1|streaming"}}).ReplicationTopology(context.Background(), ConnInfo{})
+	if err != nil {
+		t.Fatalf("a '|' in application_name blinded the whole topology view: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1: %+v", len(rows), rows)
+	}
+	want := ReplicaRow{AppName: "some|third|party|tool", SlotName: "pg_ha_slot_1", State: "streaming"}
+	if rows[0] != want {
+		t.Errorf("got %+v, want %+v", rows[0], want)
 	}
 }
 
