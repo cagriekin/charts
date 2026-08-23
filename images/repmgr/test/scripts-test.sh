@@ -363,13 +363,17 @@ fi
 # Only the extension (which creates the nodes table this issue retires) is skipped.
 # Line-based: the CREATE EXTENSION must sit immediately inside the native gate, not merely
 # somewhere in the same file.
-ext_gate_line=$(grep -n '!= "native"' "${ROOT}/entrypoint.sh" | head -1 | cut -d: -f1)
+# NEAREST-PRECEDING gate, not the first in the file: there is now more than one `!= "native"`
+# block (shared_preload_libraries has its own), and `head -1` picked the wrong one.
 ext_line=$(grep -n 'CREATE EXTENSION IF NOT EXISTS repmgr' "${ROOT}/entrypoint.sh" | head -1 | cut -d: -f1)
-if [ -n "${ext_gate_line}" ] && [ -n "${ext_line}" ] && [ "${ext_line}" -gt "${ext_gate_line}" ] \
-   && [ $((ext_line - ext_gate_line)) -le 3 ]; then
+ext_ok=no
+for g in $(grep -n '!= "native"' "${ROOT}/entrypoint.sh" | cut -d: -f1); do
+  if [ -n "${ext_line}" ] && [ "${ext_line}" -gt "${g}" ] && [ $((ext_line - g)) -le 3 ]; then ext_ok=yes; fi
+done
+if [ "${ext_ok}" = "yes" ]; then
   ok "#288: CREATE EXTENSION repmgr is skipped under native"
 else
-  bad "#288: CREATE EXTENSION repmgr is not gated on MECHANISM (gate=${ext_gate_line:-none} ext=${ext_line:-none})"
+  bad "#288: CREATE EXTENSION repmgr is not gated on MECHANISM (ext=${ext_line:-none})"
 fi
 for keep in "CREATE DATABASE \${REPMGR_DB}" "CREATE USER \${REPMGR_USER}"; do
   if grep -qF "${keep}" "${ROOT}/entrypoint.sh"; then
@@ -436,6 +440,25 @@ if grep -q 'postgres|agent|init|initdb' "${ROOT}/entrypoint.sh"; then
   ok "#288: the usage string lists the initdb mode"
 else
   bad "#288: the usage string does not list the initdb mode"
+fi
+
+# --- #288: repmgr.so is preloaded only under the repmgr mechanism ---
+# A native cluster has no repmgr extension, so preloading the library is pure liability -- and
+# the line is baked into the primary's postgresql.conf and cloned to every standby, which would
+# make every native cluster created by this code unstartable the moment #290/#294 drop repmgr
+# from the image.
+spl_line=$(grep -n "shared_preload_libraries = 'repmgr'" "${ROOT}/entrypoint.sh" | head -1 | cut -d: -f1)
+# Line-based, like the CREATE EXTENSION check: the nearest preceding native gate must be within
+# a couple of lines, i.e. the write really sits inside it.
+spl_gates=$(grep -n '!= "native"' "${ROOT}/entrypoint.sh" | cut -d: -f1)
+spl_ok=no
+for g in ${spl_gates}; do
+  if [ -n "${spl_line}" ] && [ "${spl_line}" -gt "${g}" ] && [ $((spl_line - g)) -le 2 ]; then spl_ok=yes; fi
+done
+if [ "${spl_ok}" = "yes" ]; then
+  ok "#288: shared_preload_libraries=repmgr is gated on the mechanism"
+else
+  bad "#288: shared_preload_libraries=repmgr is not mechanism-gated (line=${spl_line:-none}, gates=${spl_gates})"
 fi
 
 echo "----"

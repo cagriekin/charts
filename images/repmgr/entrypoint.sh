@@ -232,11 +232,23 @@ wal_keep_size = 1GB
 hot_standby = on
 hot_standby_feedback = on
 listen_addresses = '*'
-shared_preload_libraries = 'repmgr'
 wal_log_hints = on
 max_replication_slots = 10
 max_slot_wal_keep_size = 4GB
 EOF
+
+    # #288/#293: repmgr's shared library is preloaded only under the repmgr mechanism. A native
+    # cluster has no repmgr extension (the CREATE EXTENSION below is skipped), so preloading
+    # repmgr.so is pure liability -- and this line is baked into the primary's postgresql.conf
+    # and then cloned verbatim to every standby, so it would make every native cluster created
+    # by this code UNSTARTABLE ("could not access file \"repmgr\"") the moment #290/#294 drop
+    # the repmgr package from the image. Removing it from an EXISTING data directory, and the
+    # render-time guard, remain #293's half.
+    if [ "${MECHANISM:-repmgr}" != "native" ]; then
+        echo "shared_preload_libraries = 'repmgr'" >> "$PGDATA/postgresql.conf"
+    else
+        echo "MECHANISM=native: not preloading repmgr.so (no repmgr extension on this cluster, #288)"
+    fi
 
     if [ "${PGBACKREST_ENABLED:-}" = "true" ]; then
         cat >> "$PGDATA/postgresql.conf" << PGBR

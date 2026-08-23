@@ -764,13 +764,18 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// fence-budget context. Only the mutation half is mechanism-gated -- the gauges the
 		// shipped alerts read must be truthful under repmgr too (see slotsTick).
 		a.slotsTick(wctx)
-		// #288: publish the topology from pg_stat_replication. Observe-only -- see topologyTick
-		// for why nothing in Decide may consume it.
-		a.topologyTick(wctx)
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
-		return a.assertPrimaryRouting(wctx, obs)
+		routingErr := a.assertPrimaryRouting(wctx, obs)
+		// #288: publish the topology from pg_stat_replication. Observe-only -- see topologyTick
+		// for why nothing in Decide may consume it -- and therefore LAST, after the two
+		// leadership-critical writes (#288 review). On the shared fence budget (5s on chart
+		// defaults, already contended by slotsTick) an extra query plus a pod LIST in FRONT of
+		// them could make a slow tick skip the marker write and the Service routing assertion,
+		// which is a write outage. Nothing here may cost that.
+		a.topologyTick(wctx)
+		return routingErr
 
 	case reconcile.Follow:
 		// #289 review: reclaim slots this node minted while it was the primary, and publish
@@ -872,6 +877,12 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// than stranding the pod with a torn PGDATA (#288 review).
 		a.beginClone()
 		if err := a.mech.Clone(ctx, a.peerMechConn(dec.Target)); err != nil {
+			// Discard here, not only at the next boot (#288 review). If pg_basebackup's child is
+			// killed while the agent survives, PGDATA is left with PG_VERSION present, so Decide
+			// takes the has-data branch and fails every tick -- and discardTornClone only runs in
+			// boot(), so recovery would wait for the startup probe to kill the container (600s on
+			// defaults). Doing it now re-arms BootstrapClone on the very next tick.
+			a.discardTornClone()
 			return err
 		}
 		a.endClone()
@@ -1034,7 +1045,15 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 	// Not bounded by the fence budget: initdb plus role/database creation is legitimately
 	// slower than a failover window, and this node is not serving anything yet, so there is
 	// no read-write exposure for a soft fence to race.
-	if out, err := a.prober.Exec.Run(ctx, nil, entrypointPath, "initdb"); err != nil {
+	// Bounded, just not by the FENCE budget (#288 review). initdb plus role/database creation is
+	// legitimately slower than a failover window, but "not the fence budget" must not mean "no
+	// budget": bootstrap_initdb runs `pg_ctl -w start` and `pg_ctl -w stop`, and if either wait
+	// never returns -- or a failed stop leaves the postmaster holding the stdout pipe, which
+	// Cmd.Output waits on -- act() would hold opMu forever, the reconcile loop would stop
+	// beating, and dcs.OnLost (which also takes opMu) could never fence.
+	ictx, icancel := context.WithTimeout(ctx, initdbBudget)
+	defer icancel()
+	if out, err := a.prober.Exec.Run(ictx, nil, entrypointPath, "initdb"); err != nil {
 		return fmt.Errorf("bootstrap initdb: %w: %s", err, strings.TrimSpace(out))
 	}
 	nid := mechanism.NodeIdentity{
@@ -1066,28 +1085,22 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 // finishInitdbNative is everything that must happen after the cluster exists and before it
 // serves. Split out so a single cleanup path covers every failure (#288 review).
 func (a *agent) finishInitdbNative(ctx context.Context, nid mechanism.NodeIdentity) error {
+	// FIRST, before GenerateConfig (#288 review). Both append to postgresql.conf, and the LAST
+	// include wins in PostgreSQL. Native.ensureInclude documents that the agent's fragment is
+	// "appended LAST so the agent's replication settings win over anything earlier" -- and on
+	// every non-fresh boot that holds, because setup-config writes include_dir before the agent
+	// runs. Doing it the other way round here would invert precedence on native fresh installs
+	// only: a postgresql.configuration carrying wal_log_hints or hot_standby would silently
+	// override the agent's authoritative value, the inverted file would be cloned verbatim to
+	// every standby, and setup-config would never repair it (its grep finds the line present).
+	if err := a.ensureConfdInclude(); err != nil {
+		return err
+	}
 	if err := a.mech.GenerateConfig(ctx, nid, mechanism.ConfigOpts{Failover: "manual", UseReplicationSlots: true}); err != nil {
 		return fmt.Errorf("bootstrap initdb: generate config: %w", err)
 	}
 	if err := a.writePgHba(); err != nil {
 		return fmt.Errorf("bootstrap initdb: write pg_hba: %w", err)
-	}
-	// The conf.d include, which nothing else writes on a fresh native install (#288 review).
-	// The setup-config init container is guarded on postgresql.conf already existing, and it
-	// runs before PGDATA does; the only other writer is the postStart hook, whose fixed ~30s
-	// pg_isready loop now has to cover lease acquisition AND a reconcile tick AND initdb. If it
-	// overruns, the include is silently absent and every postgresql.configuration / TLS /
-	// pgbackrest conf.d setting is missing -- and standbys clone that same config. Doing it
-	// here removes the race entirely.
-	//
-	// Presence of the directory is a faithful proxy for "some conf.d feature is enabled": the
-	// chart mounts it only then. setup-config remains the authority on every later boot,
-	// including removal, and EnsureConfdInclude converges either way.
-	if entries, derr := os.ReadDir(confdDir); derr == nil && len(entries) > 0 {
-		if err := pgconf.EnsureConfdInclude(filepath.Join(a.cfg.PGDATA, "postgresql.conf"), confdDir, true); err != nil {
-			return fmt.Errorf("bootstrap initdb: ensure the conf.d include: %w", err)
-		}
-		a.log.Info("wrote the conf.d include for a fresh native install", "dir", confdDir)
 	}
 	// Holdership re-check before going read-write (#288 review). The exec above is
 	// deliberately not fence-bounded -- initdb plus role/database creation is legitimately
@@ -1121,6 +1134,29 @@ func (a *agent) finishInitdbNative(ctx context.Context, nid mechanism.NodeIdenti
 	// cold boot, which this is the opposite of, and there is no existing counter for "created
 	// the cluster" -- a once-per-cluster-lifetime event that a counter would describe poorly.
 	// The log line above is the record.
+	return nil
+}
+
+// ensureConfdInclude writes the operator's conf.d include on a fresh native install (#288).
+//
+// Nothing else does: the setup-config init container is guarded on postgresql.conf already
+// existing and runs before PGDATA does, and the only other writer is the postStart hook, whose
+// fixed ~30s pg_isready loop now has to cover lease acquisition AND a reconcile tick AND initdb.
+// If it overruns, the include is silently absent and every postgresql.configuration / TLS /
+// pgbackrest setting is missing -- and standbys clone that same config.
+//
+// Presence of the directory is a faithful proxy for "some conf.d feature is enabled": the chart
+// mounts it only then. setup-config remains the authority on every later boot, including
+// removal, and EnsureConfdInclude converges either way.
+func (a *agent) ensureConfdInclude() error {
+	entries, err := os.ReadDir(confdDir)
+	if err != nil || len(entries) == 0 {
+		return nil
+	}
+	if err := pgconf.EnsureConfdInclude(filepath.Join(a.cfg.PGDATA, "postgresql.conf"), confdDir, true); err != nil {
+		return fmt.Errorf("bootstrap initdb: ensure the conf.d include: %w", err)
+	}
+	a.log.Info("wrote the conf.d include for a fresh native install", "dir", confdDir)
 	return nil
 }
 
@@ -1193,6 +1229,11 @@ func (a *agent) discardTornClone() {
 	}
 	a.endClone()
 }
+
+// initdbBudget bounds the one-off cluster creation. Generous rather than tight -- it covers
+// initdb, a postmaster start/stop cycle and six psql calls on a possibly-contended node -- but
+// finite, so a wedged pg_ctl cannot deadlock the reconcile loop (#288 review).
+const initdbBudget = 5 * time.Minute
 
 // confdDir is where the chart mounts the operator's postgresql.configuration / TLS / audit /
 // pgbackrest fragments. Mounted only when one of those features is on, which is what makes its
