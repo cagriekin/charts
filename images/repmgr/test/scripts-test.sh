@@ -343,21 +343,10 @@ else
   bad "#288: the repmgr.nodes poll is still reachable under native (gate=${init_native_gate_line:-none} poll=${init_poll_line:-none})"
 fi
 
-# Behavioural, not just positional: run the script's own gate expression both ways.
-for m in native repmgr; do
-  got=$(MECHANISM="$m" bash -c 'if [ "${MECHANISM:-repmgr}" = "native" ]; then echo skip; else echo run; fi')
-  case "$m:$got" in
-    native:skip|repmgr:run) ok "#288: gate expression yields '${got}' for MECHANISM=${m}" ;;
-    *) bad "#288: gate expression yielded '${got}' for MECHANISM=${m}" ;;
-  esac
-done
-# An unset MECHANISM must behave as repmgr -- every existing release ships without it.
-got=$(bash -c 'unset MECHANISM; if [ "${MECHANISM:-repmgr}" = "native" ]; then echo skip; else echo run; fi')
-if [ "${got}" = "run" ]; then
-  ok "#288: an unset MECHANISM defaults to the repmgr path"
-else
-  bad "#288: an unset MECHANISM does not default to repmgr (got '${got}')"
-fi
+# NOT re-testing the gate expression by hand-copying it: `MECHANISM=x bash -c 'if [ ... ]'`
+# asserts that bash evaluates a literal this test wrote, which is true regardless of what the
+# shipped script says. The positional greps above carry the real weight, and bootstrap_initdb
+# is exercised behaviourally further down by sourcing the function out of entrypoint.sh.
 
 # --- #288: the stale-primary guard is repmgr-only ---
 # It shells out to `repmgr node rejoin` / `repmgr standby clone` before the agent starts; under
@@ -389,6 +378,65 @@ for keep in "CREATE DATABASE \${REPMGR_DB}" "CREATE USER \${REPMGR_USER}"; do
     bad "#288: ${keep} was removed -- native connects as that role to that database"
   fi
 done
+
+# --- #288: initdb has exactly ONE call site, and native must not reach it inline ---
+# The regression this guards: with the init container no longer cloning under native, an
+# inline initdb on any empty PGDATA means every pod creates its own cluster with its own
+# system_identifier -- and assertSameCluster (invariant 9) then refuses to rejoin any of them,
+# so pods sit Running-but-never-Ready holding bogus databases. Strictly worse than the
+# Init:CrashLoopBackOff it replaced.
+if [ "$(grep -c 'initdb -D' "${ROOT}/entrypoint.sh")" = "1" ]; then
+  ok "#288: initdb has exactly one call site"
+else
+  bad "#288: initdb has $(grep -c 'initdb -D' "${ROOT}/entrypoint.sh") call sites; it must live only in bootstrap_initdb"
+fi
+if sed -n '/^bootstrap_initdb() {/,/^}/p' "${ROOT}/entrypoint.sh" | grep -q 'initdb -D'; then
+  ok "#288: the initdb call site is inside bootstrap_initdb"
+else
+  bad "#288: initdb is not inside bootstrap_initdb"
+fi
+# The function must refuse to touch a populated data directory, whichever caller invokes it.
+if sed -n '/^bootstrap_initdb() {/,/^}/p' "${ROOT}/entrypoint.sh" | grep -q 'if \[ -s "$PGDATA/PG_VERSION" \]'; then
+  ok "#288: bootstrap_initdb no-ops on an existing data directory"
+else
+  bad "#288: bootstrap_initdb would initdb over existing data"
+fi
+# Behavioural, against the SHIPPED function rather than a hand-copied expression: source it
+# out of the script and drive it with stubs, both ways round.
+_bi_tmp=$(mktemp -d)
+mkdir -p "${_bi_tmp}/pgdata"
+echo 18 > "${_bi_tmp}/pgdata/PG_VERSION"
+_bi_out=$(PGDATA="${_bi_tmp}/pgdata" bash -c '
+  source <(sed -n "/^bootstrap_initdb() {/,/^}/p" '"${ROOT}"'/entrypoint.sh)
+  initdb() { echo INITDB-RAN; }; pg_ctl() { :; }; psql() { :; }
+  bootstrap_initdb 2>/dev/null' || true)
+if printf '%s' "${_bi_out}" | grep -q INITDB-RAN; then
+  bad "#288: bootstrap_initdb ran initdb over a populated PGDATA"
+else
+  ok "#288: bootstrap_initdb skipped a populated PGDATA (behavioural)"
+fi
+rm -f "${_bi_tmp}/pgdata/PG_VERSION"
+_bi_out=$(PGDATA="${_bi_tmp}/pgdata" bash -c '
+  source <(sed -n "/^bootstrap_initdb() {/,/^}/p" '"${ROOT}"'/entrypoint.sh)
+  initdb() { echo INITDB-RAN; }; pg_ctl() { :; }; psql() { :; }
+  bootstrap_initdb 2>/dev/null' || true)
+if printf '%s' "${_bi_out}" | grep -q INITDB-RAN; then
+  ok "#288: bootstrap_initdb initdbs an empty PGDATA (behavioural)"
+else
+  bad "#288: bootstrap_initdb did not initdb an empty PGDATA"
+fi
+rm -rf "${_bi_tmp}"
+# The agent invokes it through a dispatch mode, so that mode must exist and be advertised.
+if grep -q '"initdb")' "${ROOT}/entrypoint.sh"; then
+  ok "#288: entrypoint.sh has an initdb dispatch mode for the agent"
+else
+  bad "#288: no initdb dispatch mode; the agent cannot bootstrap the lease holder"
+fi
+if grep -q 'postgres|agent|init|initdb' "${ROOT}/entrypoint.sh"; then
+  ok "#288: the usage string lists the initdb mode"
+else
+  bad "#288: the usage string does not list the initdb mode"
+fi
 
 echo "----"
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"

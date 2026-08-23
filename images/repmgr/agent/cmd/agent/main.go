@@ -901,15 +901,99 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		cancel()
 		return a.sup.Start(ctx)
 
-	case reconcile.Wait, reconcile.NoOp, reconcile.BootstrapInitdb:
+	case reconcile.BootstrapInitdb:
+		// Under repmgr this stays inert, exactly as before: the entrypoint initdbs inline on
+		// any empty data directory before the agent ever runs, so by the time the loop sees
+		// the node it already has data.
+		//
+		// Under native the entrypoint deliberately does NOT (#288). It cannot: the init
+		// container no longer clones, so every pod would arrive with an empty PGDATA and
+		// create its own cluster with its own system_identifier -- and assertSameCluster
+		// (invariant 9) then refuses to rejoin any of them, leaving pods Running, never
+		// Ready, holding bogus databases. Whether to initdb is a CLUSTER-WIDE decision, and
+		// the lease is the only thing that can make it exactly once.
+		//
+		// Decide already guarantees that: BootstrapInitdb is returned only for the lease
+		// holder with empty data, no reachable primary and no highwater marker -- i.e. a
+		// genuine fresh install. Non-holders get Wait, then BootstrapClone once this node is
+		// open, and clone with pg_basebackup through their own pre-created slot (#289).
+		if a.cfg.Mechanism != config.MechanismNative {
+			return nil
+		}
+		if obs.Local.HasData || obs.Local.Running {
+			// Belt and braces: never initdb over anything. The shell function refuses too.
+			return nil
+		}
+		return a.bootstrapInitdbNative(ctx)
+
+	case reconcile.Wait, reconcile.NoOp:
 		// Inert: never auto-start here. Starting a stopped node is an explicit
 		// StartLocal decision so primary-state data is never brought up read-write
-		// without passing the holdership/highwater guard (fresh-node initdb is done by
-		// the entrypoint before the agent starts).
+		// without passing the holdership/highwater guard.
 		return nil
 	}
 	return nil
 }
+
+// bootstrapInitdbNative creates the cluster for a fresh native install (#288), as the lease
+// holder, then starts it.
+//
+// The mechanics stay in the shell (`entrypoint.sh initdb` -> bootstrap_initdb) rather than
+// being ported to Go here. There is exactly ONE bootstrap implementation while both
+// mechanisms are live, so the two cannot drift -- and drift would be invisible until a suite
+// that runs on only one mechanism failed. #290 deletes the shell wholesale; porting it then is
+// mechanical. What moves into the agent now is the AUTHORITY (who initdbs, and when), which is
+// the part the lease has to own.
+//
+// Two things must be redone afterwards, because boot() ran against an empty data directory:
+//
+//   - GenerateConfig: native's ensureInclude reads PGDATA/postgresql.conf, which did not exist
+//     yet, so boot()'s call failed (logged, non-fatal). Without a second call the managed
+//     fragment and its include line are simply absent.
+//   - writePgHba: boot() returns early on !HasData, before the C1 hardening that replaces
+//     initdb's legacy 0.0.0.0/0 md5 catch-alls. Skipping it would leave a fresh native cluster
+//     on the legacy pg_hba until some later pod restart -- a security regression, not just an
+//     inconsistency.
+func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
+	a.log.Info("fresh install: initdb as the lease holder (#288)", "pgdata", a.cfg.PGDATA)
+	// Not bounded by the fence budget: initdb plus role/database creation is legitimately
+	// slower than a failover window, and this node is not serving anything yet, so there is
+	// no read-write exposure for a soft fence to race.
+	if out, err := a.prober.Exec.Run(ctx, nil, entrypointPath, "initdb"); err != nil {
+		return fmt.Errorf("bootstrap initdb: %w: %s", err, strings.TrimSpace(out))
+	}
+	nid := mechanism.NodeIdentity{
+		NodeID:   nodeID(a.cfg.PodName),
+		NodeName: a.cfg.PodName,
+		FQDN:     a.fqdn(a.cfg.PodName),
+		DataDir:  a.cfg.PGDATA,
+		PGBindir: a.pgBindir,
+		ReplUser: a.cfg.RepmgrUser,
+		ReplDB:   a.cfg.RepmgrDB,
+	}
+	if err := a.mech.GenerateConfig(ctx, nid, mechanism.ConfigOpts{Failover: "manual", UseReplicationSlots: true}); err != nil {
+		return fmt.Errorf("bootstrap initdb: generate config: %w", err)
+	}
+	if err := a.writePgHba(); err != nil {
+		return fmt.Errorf("bootstrap initdb: write pg_hba: %w", err)
+	}
+	if err := a.sup.Start(ctx); err != nil {
+		return fmt.Errorf("bootstrap initdb: start: %w", err)
+	}
+	// Arm the lost-leadership fence before the first tick observes this node, mirroring
+	// StartLocal's primary-state arming: this node is now a writer, and pre-arming only ever
+	// errs toward demoting a node that is becoming one.
+	a.servingRW.Store(true)
+	// Deliberately no metric bump here. IncRecoveryStart counts read-only WAL-replay starts at
+	// cold boot, which this is the opposite of, and there is no existing counter for "created
+	// the cluster" -- a once-per-cluster-lifetime event that a counter would describe poorly.
+	// The log line above is the record.
+	return nil
+}
+
+// entrypointPath is the image's entrypoint, invoked with an explicit mode. Fixed rather than
+// derived: the agent runs inside that image by construction (#288).
+const entrypointPath = "/usr/local/bin/entrypoint.sh"
 
 // pgpassPath is the postgres user's home in the repmgr image; written/owned by the
 // postgres uid the agent runs as. Fixed (not $HOME) because after gosu the agent

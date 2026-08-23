@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1142,5 +1144,119 @@ func TestFollowKeepsPublishingSlotGaugesWhileOtherActionsRetractThem(t *testing.
 		if kept != tc.want {
 			t.Errorf("action %v: gauges kept=%v, want %v", tc.action, kept, tc.want)
 		}
+	}
+}
+
+// initdbExec records what the bootstrap branch shells out to, so the sequencing can be
+// asserted without a real initdb.
+type initdbExec struct {
+	calls [][]string
+	err   error
+}
+
+func (e *initdbExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
+	e.calls = append(e.calls, append([]string{name}, args...))
+	if e.err != nil {
+		return "boom", e.err
+	}
+	return "", nil
+}
+
+// #288: under repmgr the branch must stay inert -- the entrypoint initdbs inline before the
+// agent runs, and any behaviour change here would move the default path.
+func TestBootstrapInitdbIsInertUnderRepmgr(t *testing.T) {
+	ex := &initdbExec{}
+	a := newBootstrapTestAgent(t, ex, config.MechanismRepmgr)
+	if err := a.act(context.Background(),
+		reconcile.Decision{Action: reconcile.BootstrapInitdb},
+		reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if len(ex.calls) != 0 {
+		t.Errorf("repmgr mode shelled out to %v; the entrypoint owns initdb there", ex.calls)
+	}
+}
+
+// Under native the lease holder creates the cluster. Whether to initdb at all is a
+// cluster-wide decision, and the lease is the only thing that makes it happen exactly once --
+// without this, every pod arrives with an empty PGDATA and initdbs its own cluster, which
+// assertSameCluster then refuses to rejoin forever.
+func TestBootstrapInitdbNativeInvokesTheEntrypointThenStarts(t *testing.T) {
+	ex := &initdbExec{}
+	pm := &fakePostmaster{}
+	a := newBootstrapTestAgentWithPM(t, ex, config.MechanismNative, pm)
+	if err := a.act(context.Background(),
+		reconcile.Decision{Action: reconcile.BootstrapInitdb},
+		reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if len(ex.calls) != 1 || ex.calls[0][0] != entrypointPath || ex.calls[0][1] != "initdb" {
+		t.Fatalf("want one %s initdb call, got %v", entrypointPath, ex.calls)
+	}
+	if !pm.started {
+		t.Error("the cluster was created but never started")
+	}
+	// The lost-leadership fence must be armed before any tick observes this node as a writer.
+	if !a.servingRW.Load() {
+		t.Error("servingRW not armed after creating a read-write primary")
+	}
+}
+
+// Never initdb over existing data, whatever the decision says. Decide should not produce this
+// combination, but the branch is the last line of defence before a destructive command.
+func TestBootstrapInitdbNativeRefusesWhenDataExists(t *testing.T) {
+	for _, obs := range []reconcile.Observation{
+		{Local: reconcile.LocalState{HasData: true}},
+		{Local: reconcile.LocalState{Running: true}},
+	} {
+		ex := &initdbExec{}
+		a := newBootstrapTestAgent(t, ex, config.MechanismNative)
+		if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.BootstrapInitdb}, obs); err != nil {
+			t.Fatalf("act: %v", err)
+		}
+		if len(ex.calls) != 0 {
+			t.Errorf("initdb attempted over existing data (obs=%+v): %v", obs.Local, ex.calls)
+		}
+	}
+}
+
+// A failed initdb must surface, not be swallowed: the node has no cluster, and a silent
+// success would let the next tick observe an empty PGDATA forever.
+func TestBootstrapInitdbNativePropagatesFailure(t *testing.T) {
+	ex := &initdbExec{err: errors.New("exit status 1")}
+	a := newBootstrapTestAgent(t, ex, config.MechanismNative)
+	if err := a.act(context.Background(),
+		reconcile.Decision{Action: reconcile.BootstrapInitdb},
+		reconcile.Observation{}); err == nil {
+		t.Fatal("a failed initdb reported success")
+	}
+}
+
+func newBootstrapTestAgent(t *testing.T, ex *initdbExec, mech string) *agent {
+	t.Helper()
+	return newBootstrapTestAgentWithPM(t, ex, mech, &fakePostmaster{})
+}
+
+func newBootstrapTestAgentWithPM(t *testing.T, ex *initdbExec, mech string, pm *fakePostmaster) *agent {
+	t.Helper()
+	dataDir := t.TempDir()
+	// native's GenerateConfig appends an include line to PGDATA/postgresql.conf, which a real
+	// initdb would have created; the fake exec does not, so seed it.
+	if err := os.WriteFile(filepath.Join(dataDir, "postgresql.conf"), []byte("# seeded\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := mechanism.NewNative(dataDir, "/usr/lib/postgresql/18/bin", "pw", "pg_ha_slot_0", "pg-0")
+	return &agent{
+		cfg: &config.Config{
+			PGDATA: dataDir, PodName: "pg-0", HeadlessService: "h",
+			RepmgrUser: "repmgr", RepmgrDB: "repmgr", RepmgrPassword: "pw",
+			Mechanism: mech, PgHbaPeerCIDR: "10.0.0.0/8", RenewDeadline: 2 * time.Second,
+		},
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		dcs:    &fakeDCS{},
+		mech:   m,
+		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
+		sup:    process.NewSupervisor(pm),
+		metr:   observe.New(),
 	}
 }
