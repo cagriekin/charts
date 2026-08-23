@@ -12,7 +12,14 @@ both init containers and to neither the postgresql container, render only while 
 non-empty, and are rejected at render time when they would be silently inert or would shadow
 the chart's own volumes and install paths. A `pgdg` entry in `aptSources` is now refused too:
 both images already configure PGDG under their own keyring, so a second entry made apt reject
-the whole source list. See the [pg 1.15.0 changelog](../pg/CHANGELOG.md) and the
+the whole source list.
+
+`postgresql.extensions.image` goes further and takes the install off the pod-start path
+entirely: the packages are resolved once at build time (recipe in `images/pg-extensions/`) and
+a third init container does a plain `cp`, so there is no egress at pod start at all and no
+root -- which means it works in a PSA-`restricted` namespace, where the apt path cannot run.
+Mutually exclusive with `packages`/`aptSources`; `extraLibs` still applies, reading from the
+prebuilt image. See the [pg 1.15.0 changelog](../pg/CHANGELOG.md) and the
 [pg chart README](../pg/README.md#pointing-the-extension-install-at-an-apt-mirror-or-proxy-320).
 
 **Migrating from 1.14.1:** nothing to do; the default render is byte-identical.

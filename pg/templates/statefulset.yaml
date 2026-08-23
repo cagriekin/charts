@@ -2,9 +2,14 @@
 {{- include "pg.validateAudit" . }}
 {{- include "pg.validateExtraPassthrough" . }}
 {{- include "pg.validateExtensionPackages" . }}
+{{- /* #320: BEFORE the aptSources/extraLibs guards below. Those two reject anything set
+       while packages is empty -- which is the NORMAL state on the prebuilt-image path, so
+       left first they would answer "you set aptSources with no packages" to an operator
+       whose actual mistake was combining aptSources with an image. This one names the
+       image, so it has to speak first. */}}
+{{- include "pg.validateExtensionInitOverrides" . }}
 {{- include "pg.validateExtensionAptSources" . }}
 {{- include "pg.validateExtraLibs" . }}
-{{- include "pg.validateExtensionInitOverrides" . }}
 {{- include "pg.validateWalLevel" . }}
 {{- include "pg.validateSyncReplicationSlotsMajor" . }}
 {{- include "pg.validateSyncReplicationSlotsWalLevel" . }}
@@ -565,6 +570,45 @@ spec:
 {{- else }}
             {{- include "pg.initResources" . | nindent 12 }}
 {{- end }}
+{{- end }}
+{{- if and .Values.postgresql.extensions.enabled .Values.postgresql.extensions.image.repository }}
+{{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
+{{- $extImg := dict "repository" .Values.postgresql.extensions.image.repository "tag" (.Values.postgresql.extensions.image.tag | toString | replace "{major}" ($pgMajor | toString)) "digest" .Values.postgresql.extensions.image.digest }}
+        {{- /* #320: the prebuilt-extension path. The packages were resolved ONCE, at image
+               build time (images/pg-extensions/), so this container runs a plain `cp` --
+               no apt-get, therefore no egress on the pod-start path and no root. That last
+               part matters beyond tidiness: the apt path has to REPLACE
+               postgresql.containerSecurityContext with runAsUser: 0 (dpkg needs it), which
+               a namespace enforcing the PSA restricted profile rejects outright. This path
+               keeps the unprivileged context, so it works where the apt path cannot run at
+               all.
+
+               LAST of the three extension init containers, and `cp -n` (no-clobber), for
+               the same #302 reason copy-ext is: copy-base-ext populated ext-lib/ext-share
+               from the image that actually RUNS the server, and this image is an
+               independent build that can sit on a different postgres point release. An
+               unconditional copy would overwrite a core lib (e.g. libpqwalreceiver.so)
+               with a build the running postmaster never linked against. Adding only what
+               is missing is the whole job. */}}
+        - name: copy-prebuilt-ext
+          image: {{ include "pg.image" $extImg | quote }}
+          imagePullPolicy: {{ .Values.postgresql.extensions.image.pullPolicy }}
+          command: ['sh', '-c', {{ include "pg.extensionPrebuiltCopyCommand" (dict "pgMajor" $pgMajor "extraLibs" .Values.postgresql.extensions.extraLibs) | quote }}]
+          securityContext:
+            {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: ext-lib
+              mountPath: /ext-lib
+            - name: ext-share
+              mountPath: /ext-share
+{{- if .Values.postgresql.extensions.extraLibs }}
+            - name: ext-extra-lib
+              mountPath: /ext-extra-lib
+{{- end }}
+          resources:
+            {{- /* pg.initResources, not installResources: this is a `cp`, not a
+                   package-manager run -- which is the entire point of the prebuilt path. */}}
+            {{- include "pg.initResources" . | nindent 12 }}
 {{- end }}
 {{- if .Values.repmgr.enabled }}
         - name: repmgr-init

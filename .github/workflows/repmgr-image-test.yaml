@@ -7,6 +7,13 @@ on:
   pull_request:
     paths:
       - 'images/repmgr/**'
+      # #320: images/pg-extensions/ is the prebuilt-extension image build recipe the
+      # pg/pgvector charts point at via postgresql.extensions.image. A paths filter is
+      # safe HERE (unlike pg-test/kafka-test/redis-test/lint) because nothing in this
+      # workflow feeds a required status check -- required checks must report on every
+      # PR, which is why those workflows use a `changes` job and a self-passing gate
+      # instead. Adding a filter to one of those would block merge forever.
+      - 'images/pg-extensions/**'
       - '.github/workflows/repmgr-image-test.yaml'
 
 jobs:
@@ -85,3 +92,65 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           "$(go env GOPATH)/bin/govulncheck" ./...
+
+  # #320: static checks on the pg-extensions Dockerfile. Cheap and build-free -- these are
+  # the invariants that make the image safe for the chart to copy from (digest-pinned base,
+  # PG_MAJOR default matching the repmgr image, the copy paths agreeing with
+  # pg.extensionPrebuiltCopyCommand), each with a failure mode that is silent at build time.
+  pg-extensions-dockerfile-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Run Dockerfile tests
+        run: bash images/pg-extensions/test/dockerfile-test.sh
+
+  # And a real build, because the static checks cannot tell whether the recipe actually
+  # resolves packages -- and the chart's whole prebuilt path is worthless if it does not.
+  # Asserts the built image carries extension files at the exact paths the chart's copy
+  # command reads, then runs that command verbatim against it: drift between the two is
+  # otherwise invisible until every pod comes up without the extension it was to gain.
+  # amd64 only, matching image-smoke: package resolution is arch-independent.
+  pg-extensions-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_major: ["18", "17"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build the extension image
+        run: |
+          docker build -t pgext:${{ matrix.pg_major }} \
+            --build-arg PG_MAJOR=${{ matrix.pg_major }} \
+            --build-arg PACKAGES="postgresql-${{ matrix.pg_major }}-cron" \
+            images/pg-extensions
+
+      - name: The chart's own copy command must work against it
+        run: |
+          set -euo pipefail
+          M=${{ matrix.pg_major }}
+          mkdir -p /tmp/ext-lib /tmp/ext-share
+          # Verbatim from pg.extensionPrebuiltCopyCommand (pg/templates/_helpers.tpl).
+          docker run --rm -v /tmp/ext-lib:/ext-lib -v /tmp/ext-share:/ext-share "pgext:${M}" \
+            sh -c "cp -n /usr/lib/postgresql/${M}/lib/*.so* /ext-lib/ && cp -n /usr/share/postgresql/${M}/extension/* /ext-share/"
+          test -s "/tmp/ext-share/pg_cron.control" \
+            || { echo "pg_cron.control did not reach ext-share: the image and the chart's copy paths have drifted" >&2; exit 1; }
+          test -f "/tmp/ext-lib/pg_cron.so" \
+            || { echo "pg_cron.so did not reach ext-lib" >&2; exit 1; }
+          echo "extension files reached both volumes via the chart's own copy command"
+
+      - name: An empty PACKAGES must fail the build
+        run: |
+          if docker build -q --build-arg PG_MAJOR=${{ matrix.pg_major }} images/pg-extensions >/dev/null 2>&1; then
+            echo "build succeeded with no PACKAGES -- it would produce an extension-less image" >&2
+            exit 1
+          fi
+          echo "empty PACKAGES correctly fails the build"

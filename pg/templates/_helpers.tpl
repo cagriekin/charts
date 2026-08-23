@@ -515,8 +515,13 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- if not .Values.postgresql.extensions.enabled -}}
     {{- fail "postgresql.extensions.extraLibs is set but postgresql.extensions.enabled is false, so nothing would ever copy them. Set postgresql.extensions.enabled=true." -}}
   {{- end -}}
-  {{- if not (.Values.postgresql.extensions.packages | default list) -}}
-    {{- fail "postgresql.extensions.extraLibs is set but postgresql.extensions.packages is empty -- extraLibs' copy step only runs alongside the packages apt-get install, so it has nothing to do without at least one package that needs it." -}}
+  {{- /* #320: satisfied by EITHER path. extraLibs names absolute paths inside whichever
+         init container does the copying, so it reads from the prebuilt extension image
+         just as well as from the apt-installed filesystem -- which is exactly what lets a
+         working values file move from packages to image with no other edit. Requiring
+         packages here would have made that migration impossible. */ -}}
+  {{- if and (not (.Values.postgresql.extensions.packages | default list)) (not ((.Values.postgresql.extensions.image | default dict).repository | default "")) -}}
+    {{- fail "postgresql.extensions.extraLibs is set but neither postgresql.extensions.packages nor postgresql.extensions.image.repository is -- extraLibs' copy step runs alongside one of those two (the apt-get install, or the prebuilt-image copy), so it has nothing to do without one of them." -}}
   {{- end -}}
   {{- $pathRe := "^/[A-Za-z0-9._/+-]*[A-Za-z0-9._+-]$" -}}
   {{- $soRe := "\\.so(\\.[0-9]+)*$" -}}
@@ -587,6 +592,30 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- printf "PGVER=$(dpkg-query -W postgresql-%s 2>/dev/null | cut -f2); %s" $pgMajor (join " && " $cmdParts) -}}
 {{- end }}
 
+{{- /* #320: the copy command for the prebuilt-extension init container. Deliberately a
+       separate helper from pg.extensionInstallCommand rather than a flag on it: that one
+       renders a five-to-eight-step apt pipeline (PGVER pin, key fetch, sources.list write,
+       two apt-get updates, install) and this one renders three `cp`s. Folding them together
+       would put the shell that runs as root and the shell that does not behind one
+       conditional, which is precisely the code you do not want to have to re-read to
+       convince yourself the unprivileged path stays unprivileged.
+
+       Always -n (no-clobber): see the copy-prebuilt-ext comment in statefulset.yaml -- this
+       container is LAST and must only ADD what copy-base-ext/copy-ext did not provide.
+       extraLibs paths are copied from THIS image's filesystem, so the same absolute paths
+       the apt path uses work unchanged -- which is what lets an operator switch from
+       packages to image without touching anything else in values. */ -}}
+{{- define "pg.extensionPrebuiltCopyCommand" -}}
+{{- $pgMajor := .pgMajor | toString -}}
+{{- $cmdParts := list -}}
+{{- $cmdParts = append $cmdParts (printf "cp -n /usr/lib/postgresql/%s/lib/*.so* /ext-lib/" $pgMajor) -}}
+{{- $cmdParts = append $cmdParts (printf "cp -n /usr/share/postgresql/%s/extension/* /ext-share/" $pgMajor) -}}
+{{- range $l := (.extraLibs | default list) -}}
+  {{- $cmdParts = append $cmdParts (printf "cp -n %s /ext-extra-lib/" $l) -}}
+{{- end -}}
+{{- join " && " $cmdParts -}}
+{{- end }}
+
 {{- /* #320: postgresql.extensions.env / envFrom / extraVolumes / extraVolumeMounts exist so
        an install under a default-deny egress policy can be pointed at an in-cell apt mirror
        or proxy instead of permanently allowing apt.postgresql.org, repo.pigsty.io and
@@ -609,6 +638,33 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        kubelet rejects the pod) rather than at render time. */ -}}
 {{- define "pg.validateExtensionInitOverrides" -}}
 {{- $ext := .Values.postgresql.extensions -}}
+{{- $img := $ext.image | default dict -}}
+{{- $repo := $img.repository | default "" | toString -}}
+{{- if $repo -}}
+  {{- /* #320: the prebuilt path and the apt path are mutually exclusive. Both populate the
+         same ext-lib/ext-share volumes, and with `cp -n` in both the winner would be decided
+         by init-container ORDER -- i.e. by an implementation detail of this template rather
+         than by anything in the values file. That is the "which one wins" question the
+         wal_level guard (#308) exists to make unaskable, and the answer here would be worse:
+         a version-pinned package silently losing to whatever the image happened to contain.
+         extraLibs is deliberately NOT rejected -- it names absolute paths inside whichever
+         container does the copying, so it reads from the prebuilt image unchanged, which is
+         what lets a working values file move from packages to image with no other edit. */ -}}
+  {{- if not $ext.enabled -}}
+    {{- fail "postgresql.extensions.image.repository is set but postgresql.extensions.enabled is false, so the init container that would copy from it is never rendered. Set postgresql.extensions.enabled=true." -}}
+  {{- end -}}
+  {{- if ($ext.packages | default list) -}}
+    {{- fail "postgresql.extensions.image.repository and postgresql.extensions.packages are both set, and they are mutually exclusive: both populate the same ext-lib/ext-share volumes with a no-clobber copy, so which build of an extension actually wins would be decided by init-container order rather than by anything in this values file -- a version-pinned package could silently lose to whatever the image happens to contain. Use the image (packages are resolved once at build time, no apt on the pod-start path) OR packages (installed on every pod start), not both." -}}
+  {{- end -}}
+  {{- if ($ext.aptSources | default list) -}}
+    {{- fail "postgresql.extensions.image.repository and postgresql.extensions.aptSources are both set. aptSources only exists to make an apt-get install find non-PGDG packages, and the prebuilt-image path runs no apt at all -- the source belongs in the image build instead (see images/pg-extensions/, APT_SOURCE_* build args)." -}}
+  {{- end -}}
+  {{- if not ($img.tag | default "" | toString) -}}
+    {{- if not ($img.digest | default "" | toString) -}}
+      {{- fail "postgresql.extensions.image.repository is set but neither tag nor digest is. An untagged reference resolves to :latest, which for an extension image means the extension .so files can change under a pod restart without anything in this release changing -- and an extension built for the wrong major does not load at all. Set a tag (\"{major}-v1\" substitutes postgresql.majorVersion) or a digest." -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
 {{- $env := $ext.env | default list -}}
 {{- $envFrom := $ext.envFrom | default list -}}
 {{- $vols := $ext.extraVolumes | default list -}}

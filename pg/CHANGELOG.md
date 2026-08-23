@@ -40,6 +40,49 @@
   This does not take the install off the pod-start path; a chart-built extension image
   (resolve the packages once, mount the result) remains the larger follow-up.
 
+- **`postgresql.extensions.image`: a prebuilt extension image, so the install leaves the
+  pod-start path entirely (#320).** The values above only redirect WHERE the per-start install
+  fetches from; this removes it. The packages are resolved once at image build time (new build
+  recipe in `images/pg-extensions/`) and a third init container, `copy-prebuilt-ext`, does a
+  plain `cp` from that image.
+
+  Two consequences matter more than the speed. There is **no egress on the pod-start path at
+  all** -- not proxied, absent, so there is nothing to allow per tenant permanently. And there
+  is **no root**: the apt path has to REPLACE `postgresql.containerSecurityContext` with
+  `runAsUser: 0` because dpkg needs it, and a namespace enforcing the PSA `restricted` profile
+  (or any `runAsNonRoot` admission policy) rejects that pod outright -- so this path works
+  where the apt path cannot run at all.
+
+  `packages` and `aptSources` are refused alongside `image`. They are not additive: both
+  populate the same `ext-lib`/`ext-share` volumes with a no-clobber copy, so which build of an
+  extension actually won would be decided by init-container order -- an implementation detail
+  of the template -- rather than by anything in the values file, and a version-pinned package
+  silently losing to whatever the image happened to contain is not a trade worth allowing. A
+  non-PGDG source belongs in the image build instead (`APT_SOURCE_*` build args). `extraLibs`
+  DOES still apply, reading from the prebuilt image's filesystem, so the same absolute paths
+  work on either path and a working values file moves across with no other edit.
+
+  Either `tag` or `digest` is required, refused at render time otherwise: an untagged
+  reference resolves to `:latest`, which for an extension image means the `.so` files can
+  change under a pod restart with nothing in the release changing, and an extension built for
+  the wrong major does not load at all. `{major}` in `tag` substitutes
+  `postgresql.majorVersion`, as in `packages` and `aptLine`.
+
+  `copy-prebuilt-ext` runs LAST of the three extension init containers and copies with `cp -n`
+  (no-clobber), for the same reason `copy-ext` does: `copy-base-ext` populated
+  `ext-lib`/`ext-share` from the image that actually RUNS the server, and this is an
+  independent build that can sit on a different postgres point release -- an unconditional
+  copy would overwrite a core lib (e.g. `libpqwalreceiver.so`) with one the running postmaster
+  never linked against (#302).
+
+  The image build fails rather than producing a quietly useless artifact when `PACKAGES` is
+  empty, the `APT_SOURCE_*` triple is partially set, `APT_SOURCE_LINE` carries no `signed-by=`,
+  or the install leaves `/usr/share/postgresql/<major>/extension` empty -- that last one
+  catching the mistake otherwise invisible until `CREATE EXTENSION` (a package name that
+  exists but installs nothing for this major). CI builds it for both supported majors and runs
+  the chart's own copy command verbatim against the result, so drift between the Dockerfile
+  and `pg.extensionPrebuiltCopyCommand` cannot go unnoticed.
+
 - **A `pgdg` entry in `postgresql.extensions.aptSources` is now refused at render time
   (#320).** It was always fatal and the failure named nothing useful. Both `postgres:*-trixie`
   and the `cagriekin/repmgr` image already configure `apt.postgresql.org` under their OWN
@@ -53,8 +96,8 @@
   not the entry name, so any `aptLine` pointing at `apt.postgresql.org` is caught regardless
   of what it was called.
 
-**Migrating from 1.14.1:** nothing to do -- all four values default to `[]` and the default
-render is byte-identical. The one behaviour change is the new `pgdg`-in-`aptSources`
+**Migrating from 1.14.1:** nothing to do -- the four override values default to `[]`,
+`extensions.image.repository` defaults to `""`, and the default render is byte-identical. The one behaviour change is the new `pgdg`-in-`aptSources`
 rejection: a values file with such an entry now fails at render time instead of failing
 inside `apt-get update` on every pod start, so a release that was already broken this way
 surfaces at `helm upgrade`.

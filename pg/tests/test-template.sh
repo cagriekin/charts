@@ -597,6 +597,71 @@ assert_not_contains "#320: no apt proxy volume on the postgresql container" \
   "$(printf '%s\n' "${ext_proxy_res}" | sed -n '/name: postgresql$/,/^        - name: /p')" \
   "01proxy"
 
+# #320: the prebuilt-image path -- the one that takes the install off the pod-start path
+# entirely rather than just redirecting where it fetches from.
+ext_prebuilt_res=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-prebuilt.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#320: prebuilt path renders the copy-prebuilt-ext init container" "${ext_prebuilt_res}" "name: copy-prebuilt-ext"
+# {major} in the tag substitutes postgresql.majorVersion, same as in packages/aptLine -- an
+# extension .so built for the wrong major does not load at all, so the major must not have
+# to be repeated by hand in two places.
+assert_contains "#320: {major} substitutes in the prebuilt image tag" "${ext_prebuilt_res}" "registry.internal/pg-extensions:18-supabase"
+# The whole point: NO apt-get anywhere in the render. If this ever regresses, the feature
+# has silently stopped delivering the thing it exists for.
+assert_not_contains "#320: the prebuilt path runs no apt-get at all" "${ext_prebuilt_res}" "apt-get"
+# And no root: the apt path must REPLACE containerSecurityContext with runAsUser: 0 (dpkg
+# needs it), which a PSA-restricted namespace rejects outright. A plain cp does not, so this
+# path works where the apt path cannot run -- asserted by confining runAsUser: 0 to
+# fix-permissions (#162), which is present on the default render too.
+ext_prebuilt_root_containers=$(printf '%s\n' "${ext_prebuilt_res}" \
+  | awk '/^        - name: /{c=$NF} /runAsUser: 0/{print c}' | sort -u | tr '\n' ' ')
+assert_eq "#320: the prebuilt path adds no root container" "fix-permissions " "${ext_prebuilt_root_containers}"
+# -n (no-clobber) and LAST of the three: copy-base-ext populated ext-lib from the image that
+# actually RUNS the server, and this is an independent build that can sit on a different
+# point release -- an unconditional copy would overwrite a core lib (libpqwalreceiver.so)
+# with one the running postmaster never linked against (#302).
+# Substring chosen to avoid the glob: assert_contains uses shell pattern matching, so a
+# literal *.so* in the needle would match anything.
+assert_contains "#320: the prebuilt copy is no-clobber" "${ext_prebuilt_res}" "cp -n /usr/lib/postgresql/18/lib/"
+assert_contains "#320: the prebuilt copy also no-clobbers the extension control files" "${ext_prebuilt_res}" "cp -n /usr/share/postgresql/18/extension/"
+ext_prebuilt_order=$(printf '%s\n' "${ext_prebuilt_res}" | grep -n 'name: copy-' | tr '\n' ' ')
+assert_contains "#320: copy-prebuilt-ext runs after copy-base-ext" "${ext_prebuilt_order}" "copy-base-ext"
+ext_prebuilt_last=$(printf '%s\n' "${ext_prebuilt_res}" | grep 'name: copy-' | tail -1)
+assert_contains "#320: copy-prebuilt-ext is the last extension init container" "${ext_prebuilt_last}" "copy-prebuilt-ext"
+# extraLibs must work on this path too -- it names paths inside whichever container copies,
+# and that equivalence is what lets a values file move from packages to image unchanged.
+assert_contains "#320: extraLibs is copied from the prebuilt image" "${ext_prebuilt_res}" "cp -n /usr/lib/x86_64-linux-gnu/libsodium.so.23 /ext-extra-lib/"
+
+# #320: image and packages both populate the same volumes with a no-clobber copy, so which
+# build wins would be decided by init-container ORDER rather than by the values file -- a
+# version-pinned package could silently lose to whatever the image contains.
+ext_img_pkgs_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-prebuilt.yaml" \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_img_pkgs_rc=$?
+assert_eq "#320: image plus packages fails the render" "1" "${ext_img_pkgs_rc}"
+
+# #320: an untagged reference resolves to :latest, which for an extension image means the
+# .so files can change under a pod restart with nothing in the release changing.
+ext_img_untagged_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set postgresql.extensions.image.repository=registry.internal/pg-extensions \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_img_untagged_rc=$?
+assert_eq "#320: a prebuilt image with neither tag nor digest fails the render" "1" "${ext_img_untagged_rc}"
+
+# #320: a digest alone is a complete pin, so it must satisfy the same guard.
+ext_img_digest_res=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set postgresql.extensions.image.repository=registry.internal/pg-extensions \
+  --set postgresql.extensions.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#320: a digest alone satisfies the pin guard" "${ext_img_digest_res}" "@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
 # #320: with no packages there is no apt-get step at all, so a proxy/mount would be
 # silently ignored -- rejected at render time rather than leaving the operator to conclude
 # the proxy is in effect when it is not.

@@ -275,6 +275,17 @@ postgresql:
     # itself links are refused. See the pg chart README.
     extraLibs: []
       # - /usr/lib/x86_64-linux-gnu/libsodium.so.23
+    # #320: a PREBUILT extension image -- packages resolved once at build time, pods do a
+    # plain `cp` with no apt and no egress at pod start, and the container keeps the
+    # unprivileged securityContext (the apt path needs root, which PSA-restricted rejects).
+    # Build it from images/pg-extensions/ with your own package list. Mutually exclusive
+    # with packages/aptSources; `{major}` in tag substitutes postgresql.majorVersion.
+    # See the pg chart README.
+    image:
+      repository: ""
+      tag: ""
+      digest: ""
+      pullPolicy: IfNotPresent
     # Environment for the copy-ext/copy-base-ext init containers (#320) -- `http_proxy`
     # above all, so an install under a default-deny egress policy can go through an
     # in-cell mirror and open no external hosts. Both init containers, never the

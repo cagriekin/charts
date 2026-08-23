@@ -352,6 +352,32 @@ postgresql:
     # (pg.validateExtraLibs) for exactly that reason. Requires packages to be non-empty.
     extraLibs: []
       # - /usr/lib/x86_64-linux-gnu/libsodium.so.23
+    # #320: a PREBUILT extension image, so the packages are resolved once at build time and
+    # the pods do a plain `cp` instead of an apt-get on every (re)start. This is the option
+    # that takes the install off the pod-start path entirely -- `env`/`extraVolumes` above
+    # only redirect where the per-start install fetches from.
+    #
+    # Two things follow from it being a copy rather than a package-manager run. There is no
+    # egress at pod start at all (nothing to allow, per tenant, forever). And the container
+    # keeps postgresql.containerSecurityContext -- the apt path has to REPLACE it with
+    # runAsUser: 0 because dpkg needs root, which a namespace enforcing the PSA restricted
+    # profile rejects outright, so this path works where the apt path cannot run at all.
+    #
+    # Build it from images/pg-extensions/ with your own package list; there is no published
+    # tag because the useful set is per-deployment. `{major}` in tag is substituted with
+    # postgresql.majorVersion, same as in packages and aptLine.
+    #
+    # Mutually exclusive with packages/aptSources (refused at render time): two sources for
+    # the same extension is exactly the "which one wins" question nobody should have to
+    # answer at 3am. extraLibs still applies, reading from THIS image's filesystem, so
+    # switching a working values file from packages to image needs no other change.
+    image:
+      repository: ""
+      # tag: "{major}-v1"
+      tag: ""
+      # digest: ""    # optional; pins the exact build, recommended for production
+      digest: ""
+      pullPolicy: IfNotPresent
     # Environment for the copy-ext/copy-base-ext init containers (#320). The one thing
     # this exists for is `http_proxy`: apt honours it, so a cluster under a default-deny
     # egress policy can send the whole install through an in-cell mirror or proxy and open

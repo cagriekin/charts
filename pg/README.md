@@ -168,6 +168,10 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.extensions.enabled` | Enable extensions support | `false` |
 | `postgresql.extensions.packages` | Debian/PGDG packages to `apt-get install` before the copy step, so extensions absent from the donor image (`pg_cron`, `postgis`, …) install without a custom image; `{major}` substitutes `postgresql.majorVersion` (see [Installing extensions without a custom image](#installing-extensions-without-a-custom-image)) | `[]` |
 | `postgresql.extensions.aptSources` | Non-PGDG apt sources (e.g. Pigsty) to add before installing `packages`, for extensions PGDG doesn't package (see [Installing packages from a non-PGDG apt source](#installing-packages-from-a-non-pgdg-apt-source-310)) | `[]` |
+| `postgresql.extensions.image.repository` | Prebuilt extension image — packages resolved once at build time, so pods do a plain `cp` with no apt and no egress on the pod-start path (see [Taking the install off the pod-start path](#taking-the-install-off-the-pod-start-path-320)) | `""` |
+| `postgresql.extensions.image.tag` | Tag for the above; `{major}` substitutes `postgresql.majorVersion`. A tag or digest is required | `""` |
+| `postgresql.extensions.image.digest` | Digest pin for the above (recommended for production) | `""` |
+| `postgresql.extensions.image.pullPolicy` | Pull policy for the above | `IfNotPresent` |
 | `postgresql.extensions.env` | core-v1 `EnvVar` list for the two extension init containers — chiefly `http_proxy`, so the install goes through your own apt mirror and no external host needs opening (see [Pointing the extension install at an apt mirror or proxy](#pointing-the-extension-install-at-an-apt-mirror-or-proxy-320)) | `[]` |
 | `postgresql.extensions.envFrom` | Same as `env`, as core-v1 `EnvFromSource` — a ConfigMap/Secret of proxy settings shared across releases | `[]` |
 | `postgresql.extensions.extraVolumes` | core-v1 `Volume` list added to the pod for the extension init containers, for what `env` can't express: an `apt.conf.d` snippet or a replacement `sources.list` | `[]` |
@@ -299,6 +303,66 @@ postgresql:
 Each entry is dearmored to `/usr/share/keyrings/pgchart-<name>-keyring.gpg` and written to `/etc/apt/sources.list.d/pgchart-<name>.list` via `curl | gpg --dearmor` before `apt-get update` runs again — the `pgchart-` prefix means an entry can never collide with a source the image already owns (the `cagriekin/repmgr` image's own PGDG source is `postgresql-keyring.gpg`/`postgresql.list`); `name` must still be unique across your own `aptSources` entries, and both `keyUrl` and `aptLine` are restricted to a narrow character allowlist at render time (`pg.validateExtensionAptSources`), since both are interpolated into a shell command. An entry is rejected outright if `packages` is empty — `aptSources` exists only to make packages from that source installable, so it has nothing to do without at least one.
 
 `curl`/`gnupg`/`ca-certificates` are installed on demand (a no-op if already present, which the `cagriekin/repmgr` image already is) — only when at least one `aptSources` entry is set, so the default `packages`-only path incurs no extra apt-get calls. Pigsty serves over HTTPS (port 443), and the chart's default `networkPolicy` already opens 443/6443 with no destination restriction (S3 endpoints and cloud API servers need the same), so no `extraEgress` addition is needed for it — unlike `apt.postgresql.org`, which needs the port-80 addition above.
+
+### Taking the install off the pod-start path (#320)
+
+Everything above still installs on **every pod (re)start**: `ext-lib`, `ext-share` and
+`ext-extra-lib` are `emptyDir`s, so nothing is cached between restarts, and `env`/`extraVolumes`
+only change *where* that per-start install fetches from. `postgresql.extensions.image` removes
+it entirely — the packages are resolved once, at image build time, and the pods do a plain `cp`.
+
+```yaml
+postgresql:
+  majorVersion: "18"
+  extensions:
+    enabled: true
+    image:
+      repository: registry.internal/pg-extensions
+      tag: "{major}-supabase"      # {major} substitutes postgresql.majorVersion
+      # digest: sha256:...         # recommended for production
+    extraLibs:
+      - /usr/lib/x86_64-linux-gnu/libsodium.so.23
+```
+
+Build it from [`images/pg-extensions/`](../images/pg-extensions/) with your own package list.
+There is no published tag: the useful set is per-deployment — a Supabase-shaped set looks
+nothing like a PostGIS one — so build it in your own CI and push it to your own registry. That
+is also where the egress belongs, once at build time rather than on every pod start in every
+tenant namespace.
+
+Two consequences beyond speed, both of which matter more than the speed:
+
+- **No egress on the pod-start path at all.** Not redirected through a proxy — absent. Nothing
+  to allow, per tenant, permanently.
+- **No root, so no PSA exemption.** The apt path has to *replace*
+  `postgresql.containerSecurityContext` with `runAsUser: 0`, because dpkg needs it to write
+  `/var/lib/dpkg` and run maintainer scripts — and a namespace enforcing the PSA `restricted`
+  profile (or any `runAsNonRoot` admission policy) rejects that pod outright. A `cp` needs
+  none of it, so this path keeps the unprivileged context and **works where the apt path
+  cannot run at all**.
+
+`packages` and `aptSources` must be empty alongside `image`, and both combinations are refused
+at render time. They are not additive: both paths populate the same `ext-lib`/`ext-share`
+volumes with a no-clobber copy, so which build of an extension actually won would be decided by
+init-container order — an implementation detail of the template — rather than by anything in the
+values file. A version-pinned package silently losing to whatever the image happened to contain
+is not a trade worth allowing. A non-PGDG source belongs in the image build instead
+(`APT_SOURCE_*` build args).
+
+`extraLibs` **does** still apply, reading from the prebuilt image's own filesystem. That is
+deliberate: the same absolute paths work on either path, so a working values file moves from
+`packages` to `image` with no other edit.
+
+Either `tag` or `digest` is required — refused at render time otherwise. An untagged reference
+resolves to `:latest`, which for an extension image means the `.so` files can change under a pod
+restart with nothing in the release changing, and an extension built for the wrong major does not
+load at all.
+
+The copy runs in a third init container, `copy-prebuilt-ext`, **last** of the three and with
+`cp -n` (no-clobber) — same reason `copy-ext` is: `copy-base-ext` populated `ext-lib`/`ext-share`
+from the image that actually *runs* the server, and this is an independent build that can sit on
+a different postgres point release, so an unconditional copy would overwrite a core lib (e.g.
+`libpqwalreceiver.so`) with one the running postmaster never linked against (#302).
 
 ### Pointing the extension install at an apt mirror or proxy (#320)
 
