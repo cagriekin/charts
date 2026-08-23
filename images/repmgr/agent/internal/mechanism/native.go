@@ -124,8 +124,21 @@ func (n *Native) ensureInclude() error {
 		return fmt.Errorf("native: read %s: %w", confPath, err)
 	}
 	line := fmt.Sprintf("include '%s'", managedConfName)
+	// REPOSITION rather than skip when the line is already present (#288 review). The agent's
+	// fragment must be the LAST include so its replication settings win, and an
+	// append-only-if-absent check cannot maintain that: a native cluster created with no conf.d
+	// feature has the agent's include at the end, and enabling postgresql.configuration later
+	// makes the setup-config init container append include_dir AFTER it on the next pod start.
+	// From then on an operator's wal_log_hints or hot_standby would silently override the
+	// agent's -- removing the cheap pg_rewind rejoin path -- and the inverted file would be
+	// cloned verbatim to every standby. Stripping and re-appending converges on every boot.
 	if hasActiveDirective(string(b), line) {
-		return nil
+		if isLastActiveDirective(string(b), line) {
+			return nil
+		}
+		if err := os.WriteFile(confPath, []byte(stripActiveDirective(string(b), line)), 0o600); err != nil {
+			return fmt.Errorf("native: rewrite %s to move the managed include last: %w", confPath, err)
+		}
 	}
 	f, err := os.OpenFile(confPath, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -143,6 +156,33 @@ func (n *Native) ensureInclude() error {
 		return fmt.Errorf("native: close %s: %w", confPath, err)
 	}
 	return nil
+}
+
+// isLastActiveDirective reports whether line is the final non-comment, non-blank directive in
+// conf. PostgreSQL applies includes in file order, so "last" is what decides precedence (#288).
+func isLastActiveDirective(conf, line string) bool {
+	var last string
+	for _, l := range strings.Split(conf, "\n") {
+		t := strings.TrimSpace(l)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		last = t
+	}
+	return last == line
+}
+
+// stripActiveDirective removes every active occurrence of line, so the caller can re-append it
+// at the end (#288).
+func stripActiveDirective(conf, line string) string {
+	out := make([]string, 0, len(strings.Split(conf, "\n")))
+	for _, l := range strings.Split(conf, "\n") {
+		if strings.TrimSpace(l) == line {
+			continue
+		}
+		out = append(out, l)
+	}
+	return strings.Join(out, "\n")
 }
 
 // writeManagedConf writes the agent-owned fragment and makes sure PGDATA/postgresql.conf

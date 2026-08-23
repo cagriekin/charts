@@ -793,3 +793,36 @@ func TestNativeApplicationNameGuardComparesWholeTokens(t *testing.T) {
 		t.Errorf("pg-1 did not adopt its own application_name:\n%s", got)
 	}
 }
+
+// #288 review: the agent's include must end up LAST, because PostgreSQL applies includes in file
+// order and the agent's replication settings are meant to win. An append-only-if-absent check
+// could not maintain that: a native cluster created with no conf.d feature has the agent's
+// include at the end, and enabling postgresql.configuration later makes setup-config append
+// include_dir after it -- silently handing an operator's wal_log_hints precedence over the
+// agent's and cloning the inverted file to every standby.
+func TestNativeEnsureIncludeMovesItselfLast(t *testing.T) {
+	n, dataDir := newTestNative(t, &fakeRunner{})
+	confPath := filepath.Join(dataDir, "postgresql.conf")
+	// The agent's include already present, then conf.d appended after it (what setup-config does).
+	body := "# initial\n" + "include '" + managedConfName + "'\n" + "include_dir = '/etc/postgresql/conf.d'\n"
+	if err := os.WriteFile(confPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.GenerateConfig(context.Background(), NodeIdentity{DataDir: dataDir}, ConfigOpts{}); err != nil {
+		t.Fatalf("GenerateConfig: %v", err)
+	}
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	if n := strings.Count(got, "include '"+managedConfName+"'"); n != 1 {
+		t.Errorf("the managed include appears %d times, want 1:\n%s", n, got)
+	}
+	if !isLastActiveDirective(got, "include '"+managedConfName+"'") {
+		t.Errorf("the managed include is not last, so conf.d outranks the agent:\n%s", got)
+	}
+	if !strings.Contains(got, "include_dir = '/etc/postgresql/conf.d'") {
+		t.Errorf("the operator's include_dir was dropped:\n%s", got)
+	}
+}

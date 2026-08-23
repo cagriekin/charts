@@ -399,15 +399,23 @@ func (a *agent) boot(ctx context.Context) error {
 	if err := a.writePgpass(); err != nil {
 		return err
 	}
-	// Best-effort, for the same reason: on an empty PGDATA there is nothing to write the
-	// managed fragment into yet. The clone and initdb paths both regenerate it once the
-	// directory exists (Native.Clone -> Follow, and bootstrapInitdbNative), so a failure here
-	// must not abandon the rest of boot.
-	if err := a.mech.GenerateConfig(ctx, nid, mechanism.ConfigOpts{Failover: "manual", UseReplicationSlots: true}); err != nil {
-		if process.HasData(a.cfg.PGDATA) {
+	// SKIPPED ENTIRELY on an empty data directory (#288 review), not merely best-effort.
+	//
+	// Writing here does real damage. process.WipeDataDir removes PGDATA's ENTRIES and leaves the
+	// directory itself, so after a torn-clone discard the path exists and is empty -- and
+	// native's writeManagedConf then SUCCEEDS, leaving one file behind (only the following
+	// ensureInclude fails, for want of a postgresql.conf, and that error was swallowed). The next
+	// BootstrapClone runs `pg_basebackup -D $PGDATA` with no flag permitting a populated target,
+	// and pg_basebackup refuses: `directory "..." exists but is not empty` (verified against
+	// PostgreSQL 18). Every later tick and restart repeats it, so the standby is wedged for good
+	// -- the exact failure the clone marker exists to prevent, reached through its own recovery.
+	//
+	// Nothing is lost by waiting: both paths that create a data directory regenerate the config
+	// once it exists (Native.Clone ends in Follow, and finishInitdbNative calls GenerateConfig).
+	if process.HasData(a.cfg.PGDATA) {
+		if err := a.mech.GenerateConfig(ctx, nid, mechanism.ConfigOpts{Failover: "manual", UseReplicationSlots: true}); err != nil {
 			return err
 		}
-		a.log.Info("deferring config generation until the data directory exists", "err", err)
 	}
 	if !process.HasData(a.cfg.PGDATA) {
 		return nil
@@ -1060,6 +1068,16 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 	ictx, icancel := context.WithTimeout(ctx, initdbBudget)
 	defer icancel()
 	if out, err := a.prober.Exec.Run(ictx, nil, entrypointPath, "initdb"); err != nil {
+		// This path CAN leave a data directory behind (#288 review), so it needs the same
+		// cleanup as everything below. bootstrap_initdb runs initdb first and only then
+		// `pg_ctl -w start` and the role/database creation, so a failure at the start -- or a
+		// budget expiry, or an OOM kill -- leaves PGDATA fully initialized with NO repmgr role
+		// or database. bootstrap_initdb then no-ops on it forever, and the node comes up as a
+		// primary the agent can never authenticate against and no standby can clone from.
+		werr := a.discardFreshDataDir()
+		if werr != nil {
+			return fmt.Errorf("bootstrap initdb: %w: %s (and could not discard the partial data directory, delete the PVC to recover: %v)", err, strings.TrimSpace(out), werr)
+		}
 		return fmt.Errorf("bootstrap initdb: %w: %s", err, strings.TrimSpace(out))
 	}
 	nid := mechanism.NodeIdentity{
@@ -1254,6 +1272,15 @@ func (a *agent) discardTornClone(ctx context.Context) {
 		// clear the marker so a later boot does not reconsider.
 		a.log.Info("the base backup completed; keeping the data directory (a later step failed, #288)")
 		a.endClone()
+		return
+	} else if !process.ControlFileMissing(a.cfg.PGDATA) {
+		// pg_controldata failed for a reason OTHER than an absent control file -- the tool could
+		// not run at all (fork/OOM), or the PVC carries a different PG major after an image bump
+		// (#288 review). "Could not look" is not evidence of tornness, and a stale marker is
+		// reachable without any interrupted clone (endClone only WARNS when its remove fails),
+		// so wiping on this would destroy a healthy standby. Leave it and let the ordinary
+		// has-data paths report the real problem.
+		a.log.Warn("could not read pg_controldata; not discarding the data directory on that basis", "err", err)
 		return
 	}
 	a.log.Warn("discarding a data directory left by an interrupted base backup so it can be re-cloned (#288)",

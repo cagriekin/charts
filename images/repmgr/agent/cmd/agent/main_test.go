@@ -1615,3 +1615,54 @@ func TestEndCloneClearsTheMarker(t *testing.T) {
 		t.Error("a successfully cloned data directory was discarded on the next boot")
 	}
 }
+
+// #288 review: WipeDataDir removes PGDATA's ENTRIES and leaves the directory, so after a
+// torn-clone discard the path exists and is empty -- and native's writeManagedConf then succeeds,
+// leaving one file behind. pg_basebackup takes no flag permitting a populated target and refuses
+// with `directory "..." exists but is not empty` (verified against PostgreSQL 18), so the standby
+// would be wedged for good: the exact failure the clone marker exists to prevent, reached through
+// its own recovery path. boot() must write NOTHING into an empty data directory.
+func TestBootWritesNothingIntoAnEmptyDataDir(t *testing.T) {
+	a := newFollowTestAgent(t, &scriptedExec{})
+	a.cfg.Mechanism = config.MechanismNative
+	pgdata := filepath.Join(t.TempDir(), "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil { // exists and empty: post-wipe shape
+		t.Fatal(err)
+	}
+	a.cfg.PGDATA = pgdata
+	a.mech = mechanism.NewNative(pgdata, "/usr/lib/postgresql/18/bin", "pw", "pg_ha_slot_1", "pg-1")
+	_ = a.boot(context.Background()) // .pgpass may fail in a sandbox; the assertion is below
+	entries, err := os.ReadDir(pgdata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("boot left %v in an empty data directory; pg_basebackup will refuse the target forever", names)
+	}
+}
+
+// #288 review: bootstrap_initdb runs initdb BEFORE creating the repmgr role and database, so an
+// exec failure after that point leaves PGDATA initialized with no role -- and bootstrap_initdb
+// no-ops on a populated directory forever, so the node comes up as a primary the agent can never
+// authenticate against and no standby can clone from. That path needs the same cleanup as the
+// ones after it.
+func TestBootstrapInitdbNativeDiscardsAPartialDataDirOnExecFailure(t *testing.T) {
+	ex := &initdbExec{err: errors.New("exit status 1")}
+	a := newBootstrapTestAgentWithPM(t, ex, config.MechanismNative, &fakePostmaster{})
+	// What a failed bootstrap_initdb leaves: initdb ran, the roles never got created.
+	if err := os.WriteFile(filepath.Join(a.cfg.PGDATA, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.act(context.Background(),
+		reconcile.Decision{Action: reconcile.BootstrapInitdb},
+		reconcile.Observation{}); err == nil {
+		t.Fatal("a failed initdb reported success")
+	}
+	if process.HasData(a.cfg.PGDATA) {
+		t.Error("the partial cluster was left behind: bootstrap_initdb will no-op on it forever")
+	}
+}
