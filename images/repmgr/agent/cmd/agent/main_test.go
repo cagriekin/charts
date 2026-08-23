@@ -211,7 +211,7 @@ func newFollowTestAgentWithPM(t *testing.T, ex *scriptedExec, pm *fakePostmaster
 			RenewDeadline:   2 * time.Second,
 		},
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		dcs:    &fakeDCS{leader: true},
+		dcs:    &fakeDCS{},
 		mech:   m,
 		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
 		sup:    process.NewSupervisor(pm),
@@ -1536,5 +1536,64 @@ func TestFollowRetractsTopologyButKeepsSlotGauges(t *testing.T) {
 	}
 	if !strings.Contains(body, "pg_ha_agent_replication_slot_max_retained_wal_bytes 4096") {
 		t.Errorf("slot gauges were retracted on Follow; a standby pinning WAL must stay visible:\n%s", body)
+	}
+}
+
+// #288 review: an interrupted base backup leaves PG_VERSION behind, so HasData is true and
+// Decide never returns BootstrapClone again -- the pod tries to rejoin a torn directory every
+// tick forever, recoverable only by deleting the PVC. Under repmgr this could not happen:
+// init-repmgr.sh wiped PGDATA before each clone attempt. Moving the clone into the agent means
+// the agent owns that discard.
+func TestDiscardTornCloneRearmsBootstrapClone(t *testing.T) {
+	root := t.TempDir()
+	pgdata := filepath.Join(root, "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// What an interrupted pg_basebackup leaves: PG_VERSION written, nothing else usable.
+	if err := os.WriteFile(filepath.Join(pgdata, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &agent{
+		cfg: &config.Config{PGDATA: pgdata, PodName: "pg-1"},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	// The marker must live OUTSIDE PGDATA: pg_basebackup requires an empty target, so anything
+	// inside would be destroyed by the operation it tracks.
+	if dir := filepath.Dir(a.cloneMarkerPath()); dir == pgdata {
+		t.Fatalf("the clone marker is inside PGDATA (%s); the clone would destroy it", dir)
+	}
+	a.beginClone()
+	if process.HasData(pgdata) != true {
+		t.Fatal("test setup: PG_VERSION should make HasData true")
+	}
+	a.discardTornClone()
+	if process.HasData(pgdata) {
+		t.Error("the torn directory survived, so BootstrapClone stays disarmed and the pod is stuck")
+	}
+	if _, err := os.Stat(a.cloneMarkerPath()); !os.IsNotExist(err) {
+		t.Error("the clone marker survived the discard")
+	}
+}
+
+// A completed clone must leave no marker, or the next boot would discard a healthy standby.
+func TestEndCloneClearsTheMarker(t *testing.T) {
+	root := t.TempDir()
+	pgdata := filepath.Join(root, "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pgdata, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &agent{
+		cfg: &config.Config{PGDATA: pgdata, PodName: "pg-1"},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	a.beginClone()
+	a.endClone()
+	a.discardTornClone()
+	if !process.HasData(pgdata) {
+		t.Error("a successfully cloned data directory was discarded on the next boot")
 	}
 }

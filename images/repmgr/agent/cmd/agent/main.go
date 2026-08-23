@@ -380,6 +380,10 @@ func (a *agent) boot(ctx context.Context) error {
 		ReplUser: a.cfg.RepmgrUser,
 		ReplDB:   a.cfg.RepmgrDB,
 	}
+	// A base backup interrupted mid-flight leaves PG_VERSION behind, which makes HasData true
+	// and takes the node off the BootstrapClone path forever (#288 review). Discard it first, so
+	// everything below sees an honest picture of the directory.
+	a.discardTornClone()
 	// Streaming replication authenticates as the repmgr user via primary_conninfo,
 	// which is deliberately passwordless (the password is not stored in repmgr.conf
 	// -- the PR1 hardening). Without a credential the standby's walreceiver fails
@@ -674,6 +678,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 	switch dec.Action {
 	case reconcile.Promote, reconcile.StayPrimary:
 	case reconcile.Follow:
+		a.lastTopologyGap = ""
 		// Follow keeps the SLOT gauges: standbySlotsTick re-publishes them from a standby's own
 		// point of view, so a leftover slot pinning WAL on this node stays visible. Topology has
 		// no standby equivalent -- topologyTick reads the PRIMARY's connection list -- so it must
@@ -684,6 +689,10 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 	default:
 		a.metr.ClearSlots()
 		a.metr.ClearTopology()
+		// Reset the change-detection latch too (#288 review): it holds the gap string from this
+		// node's previous life as primary, so a demote/re-promote cycle with the same peer still
+		// off-stream would log nothing at all.
+		a.lastTopologyGap = ""
 	}
 	switch dec.Action {
 	case reconcile.Promote:
@@ -859,9 +868,13 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		return a.rejoinOnto(ctx, dec.Target)
 
 	case reconcile.BootstrapClone:
+		// Marker around the clone so an interrupted one is discarded on the next boot rather
+		// than stranding the pod with a torn PGDATA (#288 review).
+		a.beginClone()
 		if err := a.mech.Clone(ctx, a.peerMechConn(dec.Target)); err != nil {
 			return err
 		}
+		a.endClone()
 		a.dropRestoreRecord("the data directory was cloned from " + dec.Target)
 		return a.sup.Start(ctx)
 
@@ -1036,6 +1049,23 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 		ReplUser: a.cfg.RepmgrUser,
 		ReplDB:   a.cfg.RepmgrDB,
 	}
+	// From here on the data directory EXISTS, so every failure path -- and a lease flip -- must
+	// go through the same cleanup (#288 review). Returning early instead would leave PGDATA
+	// initialized with no marker written: HasData true forever, never eligible for
+	// BootstrapClone again, and rejected by assertSameCluster on every rejoin. That is the exact
+	// state the lease-loss branch below was added to prevent, reached by a different door.
+	if err := a.finishInitdbNative(ctx, nid); err != nil {
+		if werr := a.discardFreshDataDir(); werr != nil {
+			return fmt.Errorf("%w (and could not discard the fresh data directory, delete the PVC to recover: %v)", err, werr)
+		}
+		return err
+	}
+	return nil
+}
+
+// finishInitdbNative is everything that must happen after the cluster exists and before it
+// serves. Split out so a single cleanup path covers every failure (#288 review).
+func (a *agent) finishInitdbNative(ctx context.Context, nid mechanism.NodeIdentity) error {
 	if err := a.mech.GenerateConfig(ctx, nid, mechanism.ConfigOpts{Failover: "manual", UseReplicationSlots: true}); err != nil {
 		return fmt.Errorf("bootstrap initdb: generate config: %w", err)
 	}
@@ -1077,19 +1107,8 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 		// This branch created the directory milliseconds ago and it has never served a client,
 		// so removing it is safe and makes the pod eligible to clone from the winner instead.
 		// WipeDataDir refuses a live postmaster.pid, and nothing was started.
-		if !process.HasData(a.cfg.PGDATA) {
-			// The initdb did not get far enough to leave a cluster behind, so there is nothing
-			// to discard and nothing to strand. WipeDataDir would refuse this anyway (it
-			// requires PG_VERSION), and treating that refusal as an error would turn the
-			// harmless case into a loud one.
-			a.log.Warn("lost the lease during initdb; no cluster was created, nothing to discard (#288)")
-			return nil
-		}
 		a.log.Warn("lost the lease during initdb; discarding the fresh data directory so this node can clone from the new holder (#288)")
-		if err := process.WipeDataDir(a.cfg.PGDATA); err != nil {
-			return fmt.Errorf("bootstrap initdb: lost the lease and could not discard the fresh data directory (delete the PVC to recover): %w", err)
-		}
-		return nil
+		return a.discardFreshDataDir()
 	}
 	if err := a.sup.Start(ctx); err != nil {
 		return fmt.Errorf("bootstrap initdb: start: %w", err)
@@ -1103,6 +1122,76 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 	// the cluster" -- a once-per-cluster-lifetime event that a counter would describe poorly.
 	// The log line above is the record.
 	return nil
+}
+
+// discardFreshDataDir removes a data directory this branch just created, so the pod becomes
+// eligible to clone instead of being stranded (#288 review).
+//
+// Safe because the cluster was created milliseconds ago and has never served a client, and
+// WipeDataDir refuses a live postmaster.pid. An uninitialized directory is not an error: there
+// is nothing to discard and nothing to strand, and WipeDataDir would refuse it anyway (it
+// requires PG_VERSION), so treating that as a failure would make the harmless case loud.
+func (a *agent) discardFreshDataDir() error {
+	if !process.HasData(a.cfg.PGDATA) {
+		return nil
+	}
+	if err := process.WipeDataDir(a.cfg.PGDATA); err != nil {
+		return fmt.Errorf("discard the fresh data directory (delete the PVC to recover): %w", err)
+	}
+	return nil
+}
+
+// cloneMarkerPath is a sentinel recording that a base backup into PGDATA was started and has
+// not finished (#288 review).
+//
+// It lives in PGDATA's PARENT, not in PGDATA: pg_basebackup requires an empty target, so a
+// marker inside would be destroyed by the very operation it tracks.
+//
+// Why it is needed. An interrupted clone -- startup-probe kill, eviction, OOM, node reboot --
+// leaves PG_VERSION behind, so process.HasData reports true. reconcile.Decide only returns
+// BootstrapClone for `!HasData && !Running`, so the pod instead falls into the has-data branch
+// and tries to rejoin or rewind a torn directory, failing every tick forever; the only recovery
+// was deleting the PVC. Under repmgr this could not happen, because init-repmgr.sh did
+// `rm -rf "${PGDATA:?}"/*` before each of its five clone attempts. Moving the clone into the
+// agent means the agent has to own that discard too.
+func (a *agent) cloneMarkerPath() string {
+	return filepath.Join(filepath.Dir(filepath.Clean(a.cfg.PGDATA)), ".pg-ha-clone-in-progress")
+}
+
+// beginClone records that a base backup is starting. Best-effort: failing to write the marker
+// must not block the clone, it only costs the automatic discard if that clone is interrupted.
+func (a *agent) beginClone() {
+	if err := os.WriteFile(a.cloneMarkerPath(), []byte(a.cfg.PodName+"\n"), 0o600); err != nil {
+		a.log.Warn("write the clone-in-progress marker; an interrupted clone will need a manual PVC delete", "err", err)
+	}
+}
+
+// endClone clears the marker after a clone completes.
+func (a *agent) endClone() {
+	if err := os.Remove(a.cloneMarkerPath()); err != nil && !os.IsNotExist(err) {
+		a.log.Warn("remove the clone-in-progress marker", "err", err)
+	}
+}
+
+// discardTornClone wipes a data directory left behind by an interrupted base backup, so the
+// reconcile loop sees an empty PGDATA and re-arms BootstrapClone (#288 review). Called from
+// boot, before anything reads the directory's state.
+func (a *agent) discardTornClone() {
+	if _, err := os.Stat(a.cloneMarkerPath()); err != nil {
+		return // no interrupted clone
+	}
+	if !process.HasData(a.cfg.PGDATA) {
+		// The clone never got far enough to write PG_VERSION; nothing to discard.
+		a.endClone()
+		return
+	}
+	a.log.Warn("discarding a data directory left by an interrupted base backup so it can be re-cloned (#288)",
+		"pgdata", a.cfg.PGDATA)
+	if err := process.WipeDataDir(a.cfg.PGDATA); err != nil {
+		a.log.Error("could not discard the torn clone; delete the PVC to recover", "err", err)
+		return
+	}
+	a.endClone()
 }
 
 // confdDir is where the chart mounts the operator's postgresql.configuration / TLS / audit /
@@ -1512,14 +1601,17 @@ func (a *agent) topologyTick(ctx context.Context) {
 	// is stale on every pod that has not rolled yet (see orphanSlot).
 	live, liveErr := a.livePodOrdinals(ctx)
 	selfOrd, selfOK := podOrdinal(a.cfg.PodName)
-	var expected int64
 	if liveErr != nil {
-		// Publishing Expected: 0 silently would read as "nothing should be streaming" and
-		// quieten any expected-vs-streaming alert during an apiserver blip. slotsTick warns on
-		// the identical failure; match it.
-		a.log.Warn("list live pods for the topology view; expected count unavailable this tick", "err", liveErr)
+		// Leave the gauges at their PREVIOUS values rather than publishing Expected: 0 --
+		// exactly what observeSlots does on the same failure, and the earlier revision of this
+		// code got it backwards. A published zero reads as "nothing should be streaming", so an
+		// expected-vs-streaming alert goes quiet during precisely the apiserver blip an operator
+		// most wants to hear about.
+		a.log.Warn("list live pods for the topology view; leaving the gauges unchanged this tick", "err", liveErr)
+		return
 	}
-	if liveErr == nil {
+	var expected int64
+	{
 		for ord := range live {
 			if selfOK && ord == selfOrd {
 				continue // the primary does not stream from itself
@@ -1548,9 +1640,6 @@ func (a *agent) topologyTick(ctx context.Context) {
 
 	// One log line per CHANGE, not per tick: a rolling restart legitimately parks a pod
 	// off-stream for a while, and warning every 5s about it would bury everything else.
-	if liveErr != nil {
-		return
-	}
 	var missing []string
 	for ord := range live {
 		if selfOK && ord == selfOrd {

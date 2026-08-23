@@ -618,4 +618,28 @@ func TestReplicationTopologyQueryShape(t *testing.T) {
 	if strings.Contains(sql, "repmgr.nodes") {
 		t.Errorf("topology still reads repmgr.nodes, which #288 exists to retire: %s", sql)
 	}
+	// #288 review: pg_stat_replication has one row per WAL SENDER, logical decoding senders
+	// included. A subscription or Debezium would otherwise contribute rows that resolve to no
+	// pod -- inflating the streaming count and pinning `unidentified` above zero forever, which
+	// defeats the whole purpose of that gauge.
+	if !strings.Contains(sql, "s.slot_type = 'physical'") {
+		t.Errorf("the slot join is not restricted to physical slots: %s", sql)
+	}
+	if !strings.Contains(sql, "l.slot_type = 'logical'") {
+		t.Errorf("logical senders are not excluded, so they poison the topology view: %s", sql)
+	}
+}
+
+// A logical decoding sender must not appear as a replica at all.
+func TestReplicationTopologyExcludesLogicalSenders(t *testing.T) {
+	// The query filters them server-side, so the parser only ever sees physical rows; this
+	// pins the contract that an unresolvable row is COUNTED as unidentified rather than
+	// silently dropped, which is what makes the gauge meaningful.
+	rows, err := (&Prober{Exec: &slotExec{out: "some_subscription||streaming"}}).ReplicationTopology(context.Background(), ConnInfo{})
+	if err != nil {
+		t.Fatalf("ReplicationTopology: %v", err)
+	}
+	if len(rows) != 1 || rows[0].SlotName != "" {
+		t.Errorf("unexpected parse: %+v", rows)
+	}
 }

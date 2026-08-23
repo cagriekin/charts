@@ -366,6 +366,14 @@ func (r ReplicaRow) Streaming() bool { return r.State == "streaming" }
 // slot instead. Verified against real PostgreSQL 18 with both shapes streaming to one primary
 // at once: `pg-1|pg_ha_slot_1|streaming` alongside `walreceiver|pg_ha_slot_2|streaming`.
 //
+// PHYSICAL SENDERS ONLY. pg_stat_replication has one row per WAL sender, logical decoding
+// senders included, so a cluster with a subscription, Debezium or pg_recvlogical would otherwise
+// contribute rows whose application_name is the subscription name and whose slot is logical --
+// unresolvable to any pod, inflating the streaming count and pinning "unidentified" above zero
+// forever. That would defeat the whole point of that gauge, which is to say the topology view is
+// incomplete. The join is restricted to physical slots and any pid holding a logical slot is
+// excluded outright.
+//
 // PRIMARY-ONLY, and it must not become a promotion gate on its own. pg_stat_replication is the
 // mirror of the pg_stat_wal_receiver caveat above: a standby's row VANISHES the instant it
 // disconnects, which is exactly the failover moment when a promotion decision is being made.
@@ -374,7 +382,9 @@ func (p *Prober) ReplicationTopology(ctx context.Context, ci ConnInfo) ([]Replic
 	out, err := p.psql(ctx, ci,
 		"SELECT r.application_name, COALESCE(s.slot_name, ''), r.state "+
 			"FROM pg_stat_replication r "+
-			"LEFT JOIN pg_replication_slots s ON s.active_pid = r.pid "+
+			"LEFT JOIN pg_replication_slots s ON s.active_pid = r.pid AND s.slot_type = 'physical' "+
+			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots l "+
+			"WHERE l.active_pid = r.pid AND l.slot_type = 'logical') "+
 			"ORDER BY 1, 2;")
 	if err != nil {
 		return nil, err

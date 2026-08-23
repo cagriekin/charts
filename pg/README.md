@@ -359,6 +359,14 @@ This is **observe-only**. Nothing in the promotion decision consumes it, deliber
 
 **A native cluster has no repmgr extension and no `repmgr.nodes` at all.** The repmgr *database* and *role* do remain — the agent authenticates as that role for every probe and for `pg_basebackup`, and `primary_conninfo` carries `dbname=repmgr`. Renaming them out of the repmgr namespace is #291. The pre-agent stale-primary guard (`entrypoint.sh`'s `primary_safety_guard`) is likewise skipped under `native`: it rejoins and re-clones through the repmgr CLI on the strength of a peer scan that has no notion of the lease, and under native the agent owns both, never starting the postmaster before deciding.
 
+**One recovery path an operator has to know about.** If a native cluster loses the PVC of the
+node its highwater marker names, `Decide` returns `Wait` — "empty data with a marker present;
+settle before initdb (#170)" — which under repmgr was unreachable, because the entrypoint had
+already `initdb`'d by then. Under native nothing else can create the cluster, so the node waits
+indefinitely rather than forking a divergent one. That is the safe answer, but it needs a human:
+delete the `<fullname>-primary` ConfigMap to let the holder bootstrap again, after confirming no
+surviving node holds newer data.
+
 Remaining gaps before #294 can promote `native` to supported and flip the default:
 
 - **`cascadingReplication` is rejected at render time with `native`.** Slot ownership is primary-only, so a cascading child's slot would have no owner (#289). Making a standby-parent a legitimate slot owner is a design change to #289's ownership rules, tracked separately.

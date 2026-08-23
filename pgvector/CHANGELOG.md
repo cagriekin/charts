@@ -2,6 +2,8 @@
 
 ## 2.0.0 - 2026-08-10
 
+### Added
+
 - **Topology from `pg_stat_replication`; `repmgr.nodes` retired in native mode (#288).**
   Inherited from pg's symlinked templates and shared agent. `native` can now run a real
   multi-node cluster: the init container no longer polls `repmgr.nodes` (which nothing writes

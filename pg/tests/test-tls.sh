@@ -74,8 +74,8 @@ wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 60
 
 # A throwaway client pod (normal writable fs) with the client cert mounted; psql needs a
 # 0600 key owned by the running user, so copy + chmod out of the read-only Secret mount.
-kubectl run tlsclient -n "${NAMESPACE}" --image=postgres:17.10-trixie --restart=Never \
-  --overrides='{"spec":{"containers":[{"name":"tlsclient","image":"postgres:17.10-trixie","imagePullPolicy":"IfNotPresent","command":["sleep","3600"],"volumeMounts":[{"name":"c","mountPath":"/certs","readOnly":true}]}],"volumes":[{"name":"c","secret":{"secretName":"client-tls"}}]}}' >/dev/null 2>&1 || true
+kubectl run tlsclient -n "${NAMESPACE}" --image=postgres:18.1-trixie --restart=Never \
+  --overrides='{"spec":{"containers":[{"name":"tlsclient","image":"postgres:18.1-trixie","imagePullPolicy":"IfNotPresent","command":["sleep","3600"],"volumeMounts":[{"name":"c","mountPath":"/certs","readOnly":true}]}],"volumes":[{"name":"c","secret":{"secretName":"client-tls"}}]}}' >/dev/null 2>&1 || true
 kubectl wait --for=condition=Ready pod/tlsclient -n "${NAMESPACE}" --timeout=120s >/dev/null 2>&1
 kubectl exec -n "${NAMESPACE}" tlsclient -- bash -c 'cp /certs/* /tmp/ && chmod 600 /tmp/tls.key' >/dev/null 2>&1
 
