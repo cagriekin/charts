@@ -104,8 +104,15 @@ RUN if [ -n "$APT_SOURCE_NAME" ] || [ -n "$APT_SOURCE_KEY_URL" ] || [ -n "$APT_S
         echo "APT_SOURCE_NAME, APT_SOURCE_KEY_URL and APT_SOURCE_LINE must be set together" >&2; exit 1; \
       fi; \
       case "$APT_SOURCE_LINE" in \
-        *signed-by=*) : ;; \
-        *) echo "APT_SOURCE_LINE must carry signed-by=/usr/share/keyrings/${APT_SOURCE_NAME}-keyring.gpg -- an unsigned source makes the key fetch decorative" >&2; exit 1 ;; \
+        *"signed-by=/usr/share/keyrings/${APT_SOURCE_NAME}-keyring.gpg"*) : ;; \
+        *) echo "APT_SOURCE_LINE must carry signed-by=/usr/share/keyrings/${APT_SOURCE_NAME}-keyring.gpg (the exact path this build dearmors the key to) -- a bare signed-by= pointing elsewhere fails later inside apt-get update with NO_PUBKEY, and no signed-by at all makes the key fetch decorative" >&2; exit 1 ;; \
+      esac; \
+      # Refused for the same reason pg.validateExtensionAptSources refuses them in the chart:
+      # these make the key fetch above decorative and install unsigned or weakly-signed
+      # packages as root. A signed-by= alongside trusted=yes is not a signed source.
+      case "$APT_SOURCE_LINE" in \
+        *trusted=*|*allow-insecure=*|*allow-weak=*|*allow-downgrade-to-insecure=*) \
+          echo "APT_SOURCE_LINE sets an apt option that weakens or disables signature verification (trusted=/allow-insecure=/allow-weak=/allow-downgrade-to-insecure=) -- sign the source properly with signed-by= instead" >&2; exit 1 ;; \
       esac; \
       curl -fsSL --proto '=https' --proto-redir '=https' "$APT_SOURCE_KEY_URL" \
         | gpg --dearmor -o "/usr/share/keyrings/${APT_SOURCE_NAME}-keyring.gpg"; \

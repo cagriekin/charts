@@ -105,11 +105,29 @@
   not the entry name, so any `aptLine` pointing at `apt.postgresql.org` is caught regardless
   of what it was called.
 
-**Migrating from 1.14.1:** nothing to do -- the four override values default to `[]`,
-`extensions.image.repository` defaults to `""`, and the default render is byte-identical. The one behaviour change is the new `pgdg`-in-`aptSources`
-rejection: a values file with such an entry now fails at render time instead of failing
-inside `apt-get update` on every pod start, so a release that was already broken this way
-surfaces at `helm upgrade`.
+### Fixed
+
+- **A digest-only image pin rendered an unparseable reference.** `pg.image` built the
+  reference with an unconditional `printf "%s:%s"`, so a block with a `digest` and no `tag`
+  produced `repo:@sha256:...` -- which containerd rejects (`InvalidImageName`), so the
+  container never starts. That made the digest pin, which this chart recommends for
+  production, the broken configuration. It now renders `repo@digest`.
+
+**Migrating from 1.14.1:** for almost everyone, nothing to do -- the four override values
+default to `[]`, `extensions.image.repository` defaults to `""`, and the default render is
+byte-identical. Two changes can fail an upgrade that previously succeeded, both of them
+turning a runtime failure into a render-time one:
+
+- **Every image block now requires a tag or a digest, and a non-empty repository.**
+  `pg.image` is shared by every image in the chart (postgresql, repmgr, pgpool and its
+  exporter, busybox, the metrics exporter, mc, the pgbackrest CronJob), so a values file that
+  CLEARS a tag without setting a digest -- `postgresql.image.tag: ""`, `pgpool.image.tag: ""`
+  -- now fails at `helm upgrade`. It previously rendered `repo:`, which containerd rejected at
+  pod start anyway; the difference is that the failure now names the value instead of showing
+  up as `InvalidImageName` on a pod. Set a tag or a digest.
+- **A `pgdg` entry in `aptSources` is rejected.** A values file with one now fails at render
+  time instead of inside `apt-get update` on every pod start, so a release that was already
+  broken this way surfaces at `helm upgrade`.
 
 ## 1.14.1 - 2026-08-22
 

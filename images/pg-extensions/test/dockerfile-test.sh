@@ -74,10 +74,20 @@ fi
 # The chart refuses trusted=/allow-insecure= in aptSources for the same reason
 # (pg.validateExtensionAptSources): without signed-by, fetching and dearmoring the key is
 # decorative and the build installs unsigned packages as root.
-if grep -q 'signed-by=' "${DF}" && grep -q 'APT_SOURCE_LINE must carry signed-by' "${DF}"; then
-  ok "#320: an APT_SOURCE_LINE without signed-by fails the build"
+# The check must enforce the EXACT keyring path its own message names -- a bare `signed-by=`
+# substring let `signed-by=/usr/share/keyrings/typo.gpg` past, to fail later inside apt-get
+# update with NO_PUBKEY.
+if grep -qF 'signed-by=/usr/share/keyrings/${APT_SOURCE_NAME}-keyring.gpg"*)' "${DF}"; then
+  ok "#320: APT_SOURCE_LINE must carry the exact keyring path"
 else
-  bad "#320: APT_SOURCE_LINE is not required to be signed"
+  bad "#320: the signed-by check is a bare substring, weaker than its own error message"
+fi
+# And trusted=/allow-insecure= must be refused, as pg.validateExtensionAptSources refuses them:
+# a signed-by= alongside trusted=yes is not a signed source.
+if grep -q 'trusted=\*|\*allow-insecure=' "${DF}"; then
+  ok "#320: verification-weakening apt options fail the build"
+else
+  bad "#320: trusted=/allow-insecure= are not refused (the key fetch becomes decorative)"
 fi
 
 # --- the three APT_SOURCE_* args are all-or-nothing ---

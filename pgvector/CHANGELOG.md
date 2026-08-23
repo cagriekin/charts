@@ -22,7 +22,13 @@ Mutually exclusive with `packages`/`aptSources`; `extraLibs` still applies, read
 prebuilt image. See the [pg 1.15.0 changelog](../pg/CHANGELOG.md) and the
 [pg chart README](../pg/README.md#pointing-the-extension-install-at-an-apt-mirror-or-proxy-320).
 
-**Migrating from 1.14.1:** nothing to do; the default render is byte-identical.
+**Migrating from 1.14.1:** for almost everyone, nothing to do; the default render is
+byte-identical. Two inherited changes can fail an upgrade that previously succeeded, both
+turning a runtime failure into a render-time one: every image block now requires a tag or a
+digest and a non-empty repository (so a values file that clears a tag without setting a digest
+fails at `helm upgrade` instead of producing an `InvalidImageName` pod), and a `pgdg` entry in
+`aptSources` is rejected. A digest-only pin, which previously rendered the unparseable
+`repo:@sha256:...`, now works.
 
 ## 1.14.1 - 2026-08-22
 

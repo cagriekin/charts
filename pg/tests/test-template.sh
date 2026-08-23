@@ -756,6 +756,55 @@ for src in /usr/share/postgresql/18/extension /usr/lib/postgresql/18/lib; do
   assert_eq "#320: an extraVolumeMount over ${src} fails the render" "1" "${ext_mount_src_rc}"
 done
 
+# #320 review: a mount at or ABOVE an install path shadows it as completely as one at it --
+# /usr/share/postgresql/18 is the parent of the extension dir, and the copy then fails with
+# `cannot stat`, crash-looping the init container.
+for anc in /usr/share/postgresql/18 /usr/lib/postgresql/18; do
+  ext_mount_anc_rc=0
+  helm template test-pg "${CHART_DIR}" \
+    -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+    --set "postgresql.extensions.extraVolumeMounts[0].mountPath=${anc}" \
+    --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_mount_anc_rc=$?
+  assert_eq "#320: an extraVolumeMount over ${anc} (an install path's parent) fails" "1" "${ext_mount_anc_rc}"
+done
+
+# #320 review: with aptSources set, the install step WRITES its own source list and keyring, so
+# a read-only ConfigMap over either directory gets EROFS and aborts the && chain. The README
+# invites that mount, so the combination is likely rather than exotic -- and it must still be
+# allowed when aptSources is empty, which is exactly when replacing sources.list is the point.
+for apt_dir in /etc/apt/sources.list.d /usr/share/keyrings; do
+  ext_mount_apt_rc=0
+  helm template test-pg "${CHART_DIR}" \
+    --set postgresql.extensions.enabled=true \
+    --set postgresql.majorVersion=18 \
+    --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+    --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+    --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+    --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+    --set 'postgresql.extensions.extraVolumes[0].name=srcs' \
+    --set 'postgresql.extensions.extraVolumes[0].configMap.name=srcs' \
+    --set 'postgresql.extensions.extraVolumeMounts[0].name=srcs' \
+    --set "postgresql.extensions.extraVolumeMounts[0].mountPath=${apt_dir}" \
+    --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_mount_apt_rc=$?
+  assert_eq "#320: mounting over ${apt_dir} alongside aptSources fails the render" "1" "${ext_mount_apt_rc}"
+done
+ext_mount_apt_ok=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --set 'postgresql.extensions.extraVolumes[0].name=srcs' \
+  --set 'postgresql.extensions.extraVolumes[0].configMap.name=srcs' \
+  --set 'postgresql.extensions.extraVolumeMounts[0].name=srcs' \
+  --set 'postgresql.extensions.extraVolumeMounts[0].mountPath=/etc/apt/sources.list.d' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#320: replacing sources.list.d is allowed when aptSources is empty" "${ext_mount_apt_ok}" "mountPath: /etc/apt/sources.list.d"
+
+# #320 review: an empty repository renders ":tag", the same unparseable reference as the
+# empty-tag case.
+img_norepo_rc=0
+helm template test-pg "${CHART_DIR}" --set busyboxImage.repository="" >/dev/null 2>&1 || img_norepo_rc=$?
+assert_eq "#320: an image with an empty repository fails the render" "1" "${img_norepo_rc}"
+
 # #320 review: APT keys the Signed-By conflict on URI *and dist*, and the images configure only
 # <codename>-pgdg -- so a -pgdg-testing suite does not conflict and is a legitimate way to get a
 # newer extension build. Rejecting it left the operator with no route at all.

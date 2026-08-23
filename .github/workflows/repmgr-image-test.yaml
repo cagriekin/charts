@@ -133,8 +133,13 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: Build the extension image
+        # buildx --load, matching every other build in this repo (image-smoke,
+        # repmgr-image-publish, pg-test): explicit about loading the result into the local
+        # image store, which the next step's `docker run` needs. Plain `docker build` also
+        # lands it there today (it uses the docker driver, not the buildx container builder),
+        # but relying on that distinction is a trap for whoever edits this next.
         run: |
-          docker build -t pgext:${{ matrix.pg_major }} \
+          docker buildx build --load -t pgext:${{ matrix.pg_major }} \
             --build-arg PG_MAJOR=${{ matrix.pg_major }} \
             --build-arg PACKAGES="postgresql-${{ matrix.pg_major }}-cron" \
             images/pg-extensions
@@ -157,7 +162,7 @@ jobs:
         run: |
           # Grep the reason, not just the exit code: a non-zero exit satisfied by a base-image
           # pull or an apt hiccup would make this step pass while proving nothing.
-          if docker build --build-arg PG_MAJOR=${{ matrix.pg_major }} images/pg-extensions > /tmp/nopkg.log 2>&1; then
+          if docker buildx build --build-arg PG_MAJOR=${{ matrix.pg_major }} images/pg-extensions > /tmp/nopkg.log 2>&1; then
             echo "build succeeded with no PACKAGES -- it would produce an extension-less image" >&2
             exit 1
           fi

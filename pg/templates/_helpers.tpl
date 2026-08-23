@@ -132,6 +132,11 @@ annotation consumers -- #128.)
        So: digest alone is a complete reference; tag alone is the ordinary case; both together
        is legal and means "resolve this digest, the tag is decoration"; neither is an error. */ -}}
 {{- define "pg.image" -}}
+{{- if not .repository -}}
+{{- /* An empty repository renders ":tag" or "@sha256:..." -- unparseable, the same
+       InvalidImageName class as the empty-tag case below (#320 review). */ -}}
+{{- fail "an image block has an empty repository, which renders an unparseable reference (\":tag\"). Set the repository, or leave the whole image block at its chart default." -}}
+{{- end -}}
 {{- if and (not .tag) (not .digest) -}}
 {{- fail (printf "image %q has neither a tag nor a digest, which would deploy an implicit :latest -- unpinned across pod restarts, and on a StatefulSet with existing data a future :latest can be a different PostgreSQL major that refuses to start on it. Set a tag or a digest." (.repository | default "<empty repository>")) -}}
 {{- end -}}
@@ -758,6 +763,18 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- $installPaths = append $installPaths (printf "/usr/lib/postgresql/%s/lib" $srcMajor) -}}
   {{- $installPaths = append $installPaths (printf "/usr/share/postgresql/%s/extension" $srcMajor) -}}
 {{- end -}}
+{{- /* With aptSources set, the install step also WRITES
+       /etc/apt/sources.list.d/pgchart-<name>.list and
+       /usr/share/keyrings/pgchart-<name>-keyring.gpg (#320 review). A ConfigMap mounted over
+       either directory is read-only, so that `echo >` / `gpg -o` gets EROFS, the && chain
+       aborts, and copy-ext crash-loops -- and the README invites exactly that mount ("a
+       replacement sources.list pointing at an internal mirror"), so the combination is likely
+       rather than exotic. Only added when aptSources is in play: mounting a sources.list is
+       precisely the right move when it is NOT, which is the whole point of the feature. */ -}}
+{{- if (.Values.postgresql.extensions.aptSources | default list) -}}
+  {{- $installPaths = append $installPaths "/etc/apt/sources.list.d" -}}
+  {{- $installPaths = append $installPaths "/usr/share/keyrings" -}}
+{{- end -}}
 {{- $seenPaths := dict -}}
 {{- range $m := $mounts -}}
   {{- $n := $m.name | toString -}}
@@ -768,11 +785,13 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- if not $path -}}
     {{- fail (printf "postgresql.extensions.extraVolumeMounts[%s]: mountPath is required" $n) -}}
   {{- end -}}
-  {{- /* Prefix, not equality (#320 review): /ext-share/extension shadows the extension
-         tree just as completely as /ext-share does, and an equality check waved it
-         through. Compared with a trailing slash so /ext-libs-of-mine is not caught. */ -}}
+  {{- /* BOTH directions, not equality (#320 review). /ext-share/extension shadows the
+         extension tree just as completely as /ext-share does -- and so does its PARENT,
+         /usr/share/postgresql/<major>: the copy then fails with `cannot stat` and the init
+         container crash-loops. Compared with a trailing slash on both sides so
+         /ext-libs-of-mine and /usr/share/postgresql-other are not caught. */ -}}
   {{- range $ip := $installPaths -}}
-    {{- if or (eq $path $ip) (hasPrefix (printf "%s/" $ip) $path) -}}
+    {{- if or (eq $path $ip) (hasPrefix (printf "%s/" $ip) $path) (hasPrefix (printf "%s/" $path) $ip) -}}
       {{- fail (printf "postgresql.extensions.extraVolumeMounts[%s].mountPath is %q, which is at or inside %q -- where the install step copies the extension files it just built. Mounting over it shadows the tree this feature exists to populate: the copy writes into your volume (or fails outright, if it is read-only) and the postgresql container reads an empty one. Mount your apt configuration somewhere under /etc/apt instead." $n $path $ip) -}}
     {{- end -}}
   {{- end -}}
