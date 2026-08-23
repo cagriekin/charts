@@ -2916,6 +2916,25 @@ casc_standalone=$(helm template test-pg "${CHART_DIR}" \
 assert_not_contains "#29: standalone never gets CASCADE_REPLICATION (agent-only)" "${casc_standalone}" "CASCADE_REPLICATION"
 
 # ======================================================================
+# #288: MECHANISM must reach the INIT container, not just the postgresql one. Without it the
+# init container's shell gate can never fire, so native standbys keep polling repmgr.nodes for
+# a registration that never comes and sit in Init:CrashLoopBackOff forever. Occurrence count,
+# not presence: getting it onto one container only is exactly the bug.
+mech_native_res=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.agent.mechanism=native \
+  --set postgresql.majorVersion=18 \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_eq "#288: MECHANISM reaches both the init and postgresql containers" "2" \
+  "$(printf '%s\n' "${mech_native_res}" | grep -c 'name: MECHANISM')"
+# Specifically on repmgr-init, so a future refactor cannot satisfy the count with two copies
+# on the same container.
+mech_init_block=$(printf '%s\n' "${mech_native_res}" | sed -n '/name: repmgr-init/,/name: fix-permissions/p')
+assert_contains "#288: repmgr-init carries MECHANISM" "${mech_init_block}" "name: MECHANISM"
+# The default (repmgr) render must not gain the variable at all -- that is what keeps every
+# existing release byte-identical.
+mech_default_res=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#288: the repmgr-mode render carries no MECHANISM" "${mech_default_res}" "name: MECHANISM"
+
 # #287: experimental native HA mechanism selector. repmgr by default
 # (byte-stable); the agent gets MECHANISM only when set to a non-default
 # value, and only in agent mode (standalone has no agent to read it).

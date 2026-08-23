@@ -104,14 +104,23 @@ reclone_preserving_old() {
 # container-only restart (CrashLoopBackOff, OOM, liveness kill). Repmgr-managed
 # nodes only; no-op for standalone use of the image.
 #
-# Unconditionally repmgr-backed, with no MECHANISM awareness at all (#287): this shell
-# guard runs before the Go agent (or repmgrd) ever starts, so it cannot consult the
-# agent's config. Harmless for now -- it only acts when a peer is on a strictly newer
-# timeline, which cannot happen under native mode's only currently-supported shape (a
-# lone primary, no peers, per the EXPERIMENTAL warning) -- but this is exactly the kind
-# of pre-agent bootstrap path #288 (native topology) will need to make mechanism-aware
-# before native mode can run a real multi-node cluster.
+# Repmgr-mechanism only (#288). Its rejoin and re-clone paths shell out to `repmgr node
+# rejoin` and `repmgr standby clone`, which do not exist as concepts under native mode --
+# there the agent owns both (RejoinForceRewind via pg_rewind, Clone via pg_basebackup) and
+# does them from its own reconcile loop with the Lease as the authority for who is primary.
+# Running this first would rewind or wipe a data directory on the strength of a peer scan
+# that has no notion of the lease, which is exactly the divergence the agent exists to
+# prevent.
+#
+# Now that native mode can actually run a multi-node cluster, "harmless because native only
+# ever runs a lone primary" no longer holds, so the gate is explicit rather than relying on
+# repmgr.conf being absent (init-repmgr.sh does skip writing it under native, and the
+# file check below still stands as a second line of defence).
 primary_safety_guard() {
+    if [ "${MECHANISM:-repmgr}" = "native" ]; then
+        echo "stale-primary guard: skipped (MECHANISM=native; the agent owns rejoin and re-clone)"
+        return 0
+    fi
     [ -f /etc/repmgr/repmgr.conf ] || return 0
     [ -n "${HEADLESS_SERVICE:-}" ] || return 0
     [ -n "${REPMGR_PASSWORD:-}" ] || return 0
@@ -270,7 +279,22 @@ EOF
             psql -U postgres -d postgres -c "CREATE DATABASE ${REPMGR_DB};" 2>/dev/null || true
             psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER ${REPMGR_USER} WITH SUPERUSER PASSWORD '${REPMGR_PASSWORD}';" 2>/dev/null || true
             psql -U postgres -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE ${REPMGR_DB} TO ${REPMGR_USER};" 2>/dev/null || true
-            psql -U postgres -d ${REPMGR_DB} -c "CREATE EXTENSION IF NOT EXISTS repmgr;" 2>/dev/null || true
+            # The repmgr DATABASE and ROLE above are created under BOTH mechanisms, on purpose.
+            # #288 asked for native bootstrap to create none of the three, but the role and the
+            # database are load-bearing in native mode too: the agent connects as REPMGR_USER for
+            # every probe and for pg_basebackup, and primary_conninfo carries dbname=REPMGR_DB.
+            # Dropping them would break native outright. Renaming them out of the repmgr
+            # namespace is #291 (ha.* values), not this issue.
+            #
+            # The EXTENSION is the part native genuinely never uses -- it creates the repmgr
+            # schema and the nodes table this issue exists to stop reading. Skipping it means a
+            # native-mode cluster has no repmgr.nodes at all, so there is no stale cache for
+            # anything to fall back to by accident.
+            if [ "${MECHANISM:-repmgr}" != "native" ]; then
+                psql -U postgres -d ${REPMGR_DB} -c "CREATE EXTENSION IF NOT EXISTS repmgr;" 2>/dev/null || true
+            else
+                echo "MECHANISM=native: skipping CREATE EXTENSION repmgr (the nodes table is not a topology source any more, #288)"
+            fi
 
             pg_ctl -D "$PGDATA" -w stop
 

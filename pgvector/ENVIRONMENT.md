@@ -49,7 +49,7 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `POD_CIDR` | CIDR | yes | `repmgr.agent.podCidr` (`10.0.0.0/8`) | agent (hardened pg_hba: trusted pod network) |
 | `POSTGRESQL_PGHBA` | newline-list | no | `postgresql.pgHba` (joined) | agent (user pg_hba rules, above the catch-alls) |
 | `CASCADE_REPLICATION` | boolean | no | `repmgr.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
-| `MECHANISM` | enum | no | `repmgr.agent.mechanism` (`repmgr`/`native`) | agent (HA mechanics, #287, EXPERIMENTAL; emitted only when non-default) |
+| `MECHANISM` | enum | no | `repmgr.agent.mechanism` (`repmgr`/`native`) | agent (HA mechanics, #287, EXPERIMENTAL; emitted only when non-default), `init-repmgr.sh` and `entrypoint.sh` (#288 -- under `native` the init container skips repmgr.conf, the `repmgr.nodes` registration wait and the repmgr clone, and the stale-primary guard and `CREATE EXTENSION repmgr` are skipped) |
 
 Lease timings must satisfy `LEASE_DURATION > RENEW_DEADLINE > RETRY_PERIOD`
 (validated at boot). The agent also writes a `0600 ~/.pgpass` from `REPMGR_*` so a

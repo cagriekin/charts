@@ -400,6 +400,21 @@ spec:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
 {{- with (include "pg.pgMajorEnv" .) }}{{ . | nindent 12 }}{{- end }}
+            {{- /* #288: the init container needs MECHANISM too, not just the postgresql
+                   container. Its whole job -- write repmgr.conf, wait for a primary to appear
+                   in repmgr.nodes, clone with `repmgr standby clone` -- is repmgr-specific,
+                   and the middle step is what made native unusable with replicas: nothing
+                   ever registers under native, so the poll timed out and every standby sat in
+                   Init:CrashLoopBackOff forever. init-repmgr.sh now exits early on native and
+                   lets the agent clone (BootstrapClone -> pg_basebackup), but it can only do
+                   that if the value actually reaches it. Emitted only when non-default, same
+                   as on the postgresql container, so the repmgr-mode render does not move. */}}
+            {{- with (.Values.repmgr.agent).mechanism }}
+            {{- if ne . "repmgr" }}
+            - name: MECHANISM
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
             - name: POSTGRES_USER

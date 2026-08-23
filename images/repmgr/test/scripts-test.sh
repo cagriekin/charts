@@ -324,6 +324,72 @@ else
   bad "#269: Dockerfile does not assert per-major package availability"
 fi
 
+# --- #288: the native mechanism must bypass every repmgr-specific bootstrap step ---
+# The repmgr.nodes registration wait is what made native unusable with replicas: nothing ever
+# registers under native, so the poll burned its full ~240s and exited 1, leaving every standby
+# in Init:CrashLoopBackOff forever. The gate has to sit BEFORE the repmgr.conf heredoc, because
+# entrypoint.sh's stale-primary guard keys on that file existing.
+init_native_gate_line=$(grep -n 'MECHANISM:-repmgr' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
+init_conf_line=$(grep -n 'cat > /etc/repmgr/repmgr.conf' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
+init_poll_line=$(grep -n 'FROM repmgr.nodes' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
+if [ -n "${init_native_gate_line}" ] && [ -n "${init_conf_line}" ] && [ "${init_native_gate_line}" -lt "${init_conf_line}" ]; then
+  ok "#288: init-repmgr.sh gates on MECHANISM before writing repmgr.conf"
+else
+  bad "#288: init-repmgr.sh does not gate on MECHANISM before writing repmgr.conf (gate=${init_native_gate_line:-none} conf=${init_conf_line:-none})"
+fi
+if [ -n "${init_native_gate_line}" ] && [ -n "${init_poll_line}" ] && [ "${init_native_gate_line}" -lt "${init_poll_line}" ]; then
+  ok "#288: the native gate precedes the repmgr.nodes registration poll"
+else
+  bad "#288: the repmgr.nodes poll is still reachable under native (gate=${init_native_gate_line:-none} poll=${init_poll_line:-none})"
+fi
+
+# Behavioural, not just positional: run the script's own gate expression both ways.
+for m in native repmgr; do
+  got=$(MECHANISM="$m" bash -c 'if [ "${MECHANISM:-repmgr}" = "native" ]; then echo skip; else echo run; fi')
+  case "$m:$got" in
+    native:skip|repmgr:run) ok "#288: gate expression yields '${got}' for MECHANISM=${m}" ;;
+    *) bad "#288: gate expression yielded '${got}' for MECHANISM=${m}" ;;
+  esac
+done
+# An unset MECHANISM must behave as repmgr -- every existing release ships without it.
+got=$(bash -c 'unset MECHANISM; if [ "${MECHANISM:-repmgr}" = "native" ]; then echo skip; else echo run; fi')
+if [ "${got}" = "run" ]; then
+  ok "#288: an unset MECHANISM defaults to the repmgr path"
+else
+  bad "#288: an unset MECHANISM does not default to repmgr (got '${got}')"
+fi
+
+# --- #288: the stale-primary guard is repmgr-only ---
+# It shells out to `repmgr node rejoin` / `repmgr standby clone` before the agent starts; under
+# native the agent owns both, with the Lease as the authority for who is primary.
+if sed -n '/^primary_safety_guard()/,/^}/p' "${ROOT}/entrypoint.sh" | grep -q 'MECHANISM:-repmgr'; then
+  ok "#288: primary_safety_guard is gated on MECHANISM"
+else
+  bad "#288: primary_safety_guard still runs repmgr rejoin under native"
+fi
+
+# --- #288: the repmgr EXTENSION is skipped under native, but the DB and ROLE are NOT ---
+# The agent connects as REPMGR_USER for every probe and for pg_basebackup, and
+# primary_conninfo carries dbname=REPMGR_DB, so dropping those would break native outright.
+# Only the extension (which creates the nodes table this issue retires) is skipped.
+# Line-based: the CREATE EXTENSION must sit immediately inside the native gate, not merely
+# somewhere in the same file.
+ext_gate_line=$(grep -n '!= "native"' "${ROOT}/entrypoint.sh" | head -1 | cut -d: -f1)
+ext_line=$(grep -n 'CREATE EXTENSION IF NOT EXISTS repmgr' "${ROOT}/entrypoint.sh" | head -1 | cut -d: -f1)
+if [ -n "${ext_gate_line}" ] && [ -n "${ext_line}" ] && [ "${ext_line}" -gt "${ext_gate_line}" ] \
+   && [ $((ext_line - ext_gate_line)) -le 3 ]; then
+  ok "#288: CREATE EXTENSION repmgr is skipped under native"
+else
+  bad "#288: CREATE EXTENSION repmgr is not gated on MECHANISM (gate=${ext_gate_line:-none} ext=${ext_line:-none})"
+fi
+for keep in "CREATE DATABASE \${REPMGR_DB}" "CREATE USER \${REPMGR_USER}"; do
+  if grep -qF "${keep}" "${ROOT}/entrypoint.sh"; then
+    ok "#288: still creates ${keep} under both mechanisms (native needs it for replication auth)"
+  else
+    bad "#288: ${keep} was removed -- native connects as that role to that database"
+  fi
+done
+
 echo "----"
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
 exit "$fail"
