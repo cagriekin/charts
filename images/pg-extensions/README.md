@@ -87,6 +87,14 @@ anything in the values file.
 same absolute paths work on both paths, so a working values file moves from `packages` to
 `image` with no other edit.
 
+**Adds extensions; does not upgrade one the server image already ships.** The chart's copy is
+no-clobber and runs last, so anything the server images already placed in `ext-lib`/`ext-share`
+wins — silently. The pgvector chart's `postgresql.image` ships `vector.so`, so a build here
+carrying a newer pgvector is a no-op. Change the server image for that instead. Clobbering is
+not an option: the `.so` files would overwrite a core lib with a build the running postmaster
+never linked against (#302), and clobbering only the control files would split the SQL
+definitions from the `.so`.
+
 Either `tag` or `digest` is required. An untagged reference resolves to `:latest`, which for
 an extension image means the `.so` files can change under a pod restart with nothing in the
 release changing.

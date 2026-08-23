@@ -113,8 +113,19 @@ annotation consumers -- #128.)
 {{- /* Generic image reference (#26): pass an image dict {repository, tag, digest?};
        renders repository:tag, with @digest appended when set so a digest pin overrides
        the mutable tag. */ -}}
+{{- /* An empty tag must NOT render "repo:" (#320). With a digest and no tag the old form
+       produced `repo:@sha256:...`, which containerd rejects as an unparseable reference --
+       the container never starts (InvalidImageName) and the pod never comes up. That was
+       reachable: postgresql.extensions.image documents digest as the production pin and
+       accepts it without a tag, so the recommended configuration was the broken one. A
+       digest alone is a complete reference; a tag alone is the ordinary case; both together
+       is legal and means "resolve this digest, tag is decoration". */ -}}
 {{- define "pg.image" -}}
+{{- if .tag -}}
 {{- printf "%s:%s" .repository .tag -}}
+{{- else -}}
+{{- .repository -}}
+{{- end -}}
 {{- with .digest }}@{{ . }}{{- end -}}
 {{- end -}}
 
@@ -457,7 +468,13 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
            The install then fails before it starts, and nothing points at the aptSources
            entry as the cause. Omitting it is correct: PGDG packages already resolve from
            the image's own configuration, which is exactly what `packages` relies on. */ -}}
-    {{- if regexMatch "(?i)apt\\.postgresql\\.org" $substituted -}}
+    {{- /* Anchored on the URL AUTHORITY, not a bare substring (#320 review). A substring
+           match also rejects a mirror that merely has the upstream name in its PATH --
+           e.g. https://mirror.corp/apt.postgresql.org/pub/repos/apt -- which is exactly
+           the internal-mirror case this whole change exists to enable, and the failure
+           message would have told the operator to rely on "the image's own configuration",
+           which points at the public host they cannot reach. */ -}}
+    {{- if regexMatch "(?i)://([^/ ]*@)?apt\\.postgresql\\.org([:/ ]|$)" $substituted -}}
       {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine points at apt.postgresql.org (%q). Remove this entry: both the repmgr image and postgres:*-trixie already configure PGDG under their own keyring path, and adding a second entry for the same repo under this chart's keyring path makes apt reject the whole source list (\"E: Conflicting values set for option Signed-By regarding source http://apt.postgresql.org/pub/repos/apt/ ...\"), so the install fails before it starts. PGDG packages in postgresql.extensions.packages resolve from the image's own configuration -- aptSources is only for sources the images do NOT ship, e.g. repo.pigsty.io" $name $substituted) -}}
     {{- end -}}
     {{- $expectSignedBy := printf "signed-by=/usr/share/keyrings/pgchart-%s-keyring.gpg" $name -}}
@@ -664,6 +681,15 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
       {{- fail "postgresql.extensions.image.repository is set but neither tag nor digest is. An untagged reference resolves to :latest, which for an extension image means the extension .so files can change under a pod restart without anything in this release changing -- and an extension built for the wrong major does not load at all. Set a tag (\"{major}-v1\" substitutes postgresql.majorVersion) or a digest." -}}
     {{- end -}}
   {{- end -}}
+{{- else -}}
+  {{- /* #320 review: the whole image block is gated on repository, so a tag or digest set
+         without it renders NOTHING -- no prebuilt container, no error -- and an operator who
+         typoed the repository key concludes the prebuilt path is active while the pods are
+         still taking the plain-copy one. Same reasoning as the env/aptSources rejections
+         above: silently inert configuration in a values file is worse than a render error. */ -}}
+  {{- if or ($img.tag | default "" | toString) ($img.digest | default "" | toString) -}}
+    {{- fail "postgresql.extensions.image.tag/digest is set but postgresql.extensions.image.repository is empty, so no prebuilt-extension container is rendered at all and the setting is silently ignored. Set image.repository, or remove the tag/digest." -}}
+  {{- end -}}
 {{- end -}}
 {{- $env := $ext.env | default list -}}
 {{- $envFrom := $ext.envFrom | default list -}}
@@ -694,6 +720,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- $declared = set $declared $n true -}}
 {{- end -}}
 {{- $installPaths := list "/ext-lib" "/ext-share" "/ext-extra-lib" -}}
+{{- $seenPaths := dict -}}
 {{- range $m := $mounts -}}
   {{- $n := $m.name | toString -}}
   {{- if not (hasKey $declared $n) -}}
@@ -703,9 +730,21 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- if not $path -}}
     {{- fail (printf "postgresql.extensions.extraVolumeMounts[%s]: mountPath is required" $n) -}}
   {{- end -}}
-  {{- if has $path $installPaths -}}
-    {{- fail (printf "postgresql.extensions.extraVolumeMounts[%s].mountPath is %q, which is where the install step copies the extension files it just built. Mounting over it shadows the tree this feature exists to populate -- the copy writes into your volume (or fails outright, if it is read-only) and the postgresql container reads an empty one. Mount your apt configuration somewhere under /etc/apt instead." $n $path) -}}
+  {{- /* Prefix, not equality (#320 review): /ext-share/extension shadows the extension
+         tree just as completely as /ext-share does, and an equality check waved it
+         through. Compared with a trailing slash so /ext-libs-of-mine is not caught. */ -}}
+  {{- range $ip := $installPaths -}}
+    {{- if or (eq $path $ip) (hasPrefix (printf "%s/" $ip) $path) -}}
+      {{- fail (printf "postgresql.extensions.extraVolumeMounts[%s].mountPath is %q, which is at or inside %q -- where the install step copies the extension files it just built. Mounting over it shadows the tree this feature exists to populate: the copy writes into your volume (or fails outright, if it is read-only) and the postgresql container reads an empty one. Mount your apt configuration somewhere under /etc/apt instead." $n $path $ip) -}}
+    {{- end -}}
   {{- end -}}
+  {{- /* Duplicate mountPath is rejected by the API SERVER, not by helm
+         ("volumeMounts[n].mountPath: Invalid value: ... must be unique"), so it is the
+         same class of apply-time-only failure as the undeclared-volume check above. */ -}}
+  {{- if hasKey $seenPaths $path -}}
+    {{- fail (printf "postgresql.extensions.extraVolumeMounts: duplicate mountPath %q (volumes %q and %q). Kubernetes requires mountPaths to be unique within a container and rejects the pod at apply time, so helm has to catch it first." $path (get $seenPaths $path) $n) -}}
+  {{- end -}}
+  {{- $seenPaths = set $seenPaths $path $n -}}
 {{- end -}}
 {{- end }}
 

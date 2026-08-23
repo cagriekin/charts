@@ -14,6 +14,12 @@ on:
       # PR, which is why those workflows use a `changes` job and a self-passing gate
       # instead. Adding a filter to one of those would block merge forever.
       - 'images/pg-extensions/**'
+      # The pg-extensions checks assert a CONTRACT that spans two files: the Dockerfile's
+      # install paths and pg.extensionPrebuiltCopyCommand's copy paths. dockerfile-test.sh
+      # greps the helper, and pg-extensions-build runs the chart's copy command verbatim --
+      # so a PR that moves the copy paths in _helpers.tpl ALONE is the exact drift these
+      # checks exist to catch, and without this entry neither would run on it.
+      - 'pg/templates/_helpers.tpl'
       - '.github/workflows/repmgr-image-test.yaml'
 
 jobs:

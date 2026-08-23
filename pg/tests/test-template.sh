@@ -653,14 +653,83 @@ helm template test-pg "${CHART_DIR}" \
   --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_img_untagged_rc=$?
 assert_eq "#320: a prebuilt image with neither tag nor digest fails the render" "1" "${ext_img_untagged_rc}"
 
-# #320: a digest alone is a complete pin, so it must satisfy the same guard.
+# #320: a digest alone is a complete pin, so it must satisfy the same guard -- AND render a
+# valid reference. The whole rendered line is asserted, not just the @sha256 substring: the
+# original bug was `repo:@sha256:...` (an empty tag still emitting the colon), which containerd
+# rejects as unparseable -- InvalidImageName, the init container never starts, the pod never
+# comes up. A substring assertion passed on that broken output, which is exactly why this one
+# pins the full string.
 ext_img_digest_res=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.extensions.enabled=true \
   --set postgresql.majorVersion=18 \
   --set postgresql.extensions.image.repository=registry.internal/pg-extensions \
   --set postgresql.extensions.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
   --show-only templates/statefulset.yaml 2>&1)
-assert_contains "#320: a digest alone satisfies the pin guard" "${ext_img_digest_res}" "@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+assert_contains "#320: a digest alone renders a valid reference (no empty-tag colon)" "${ext_img_digest_res}" \
+  'image: "registry.internal/pg-extensions@sha256:0000000000000000000000000000000000000000000000000000000000000000"'
+assert_not_contains "#320: no empty-tag colon before the digest" "${ext_img_digest_res}" "pg-extensions:@sha256:"
+# Tag and digest together is legal and means "resolve this digest"; both must appear.
+ext_img_both_res=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set postgresql.extensions.image.repository=registry.internal/pg-extensions \
+  --set postgresql.extensions.image.tag=18-v1 \
+  --set postgresql.extensions.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#320: tag and digest together render tag@digest" "${ext_img_both_res}" \
+  'image: "registry.internal/pg-extensions:18-v1@sha256:0000000000000000000000000000000000000000000000000000000000000000"'
+
+# #320 review: a tag or digest with no repository renders NOTHING -- no prebuilt container and
+# no error -- so an operator who typoed the repository key believes the prebuilt path is live
+# while the pods still take the plain-copy one.
+ext_img_no_repo_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set postgresql.extensions.image.tag=18-v1 \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_img_no_repo_rc=$?
+assert_eq "#320: an image tag with no repository fails the render" "1" "${ext_img_no_repo_rc}"
+
+# #320 review: nulling the image map (what a values-file merge does when someone clears it)
+# must not produce a bare nil-pointer naming no value.
+ext_img_null_res=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set postgresql.extensions.image=null \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#320: a nulled image map does not nil-pointer" "${ext_img_null_res}" "nil pointer"
+
+# #320 review: the PGDG guard must key on the URL AUTHORITY. A mirror whose PATH merely
+# contains the upstream name is the internal-mirror case this whole change exists to enable,
+# and rejecting it would tell the operator to rely on the image's own configuration -- which
+# points at the public host they cannot reach.
+ext_pgdg_mirror_res=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --set 'postgresql.extensions.aptSources[0].name=mirror' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://mirror.corp/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-mirror-keyring.gpg] https://mirror.corp/apt.postgresql.org/pub/repos/apt trixie-pgdg main' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#320: a mirror with apt.postgresql.org in its PATH is allowed" "${ext_pgdg_mirror_res}" "mirror.corp/apt.postgresql.org"
+
+# #320 review: mounting INSIDE an install path shadows the tree as completely as mounting on
+# it, and Kubernetes rejects duplicate mountPaths at apply time -- both were render-clean.
+ext_mount_inside_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+  --set 'postgresql.extensions.extraVolumeMounts[0].mountPath=/ext-share/extension' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_mount_inside_rc=$?
+assert_eq "#320: an extraVolumeMount inside /ext-share fails the render" "1" "${ext_mount_inside_rc}"
+ext_mount_dup_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+  --set 'postgresql.extensions.extraVolumes[1].name=second' \
+  --set 'postgresql.extensions.extraVolumes[1].configMap.name=second' \
+  --set 'postgresql.extensions.extraVolumeMounts[1].name=second' \
+  --set 'postgresql.extensions.extraVolumeMounts[1].mountPath=/etc/apt/apt.conf.d/01proxy' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_mount_dup_rc=$?
+assert_eq "#320: a duplicate extraVolumeMount mountPath fails the render" "1" "${ext_mount_dup_rc}"
 
 # #320: with no packages there is no apt-get step at all, so a proxy/mount would be
 # silently ignored -- rejected at render time rather than leaving the operator to conclude

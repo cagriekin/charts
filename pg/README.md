@@ -358,6 +358,18 @@ resolves to `:latest`, which for an extension image means the `.so` files can ch
 restart with nothing in the release changing, and an extension built for the wrong major does not
 load at all.
 
+**It can add an extension, but it cannot upgrade one the server image already ships.** The
+copy is no-clobber and runs last, so anything `copy-base-ext`/`copy-ext` already put in
+`ext-lib`/`ext-share` wins — silently, with no render error and no log line. The concrete case
+is the **pgvector chart**, whose `postgresql.image` is `pgvector/pgvector` and therefore ships
+`vector.so`/`vector.control`: pointing `extensions.image` at a build carrying a *newer* pgvector
+is a complete no-op. Use this to add extensions the server images don't have; to change the
+version of one they do, change the server image.
+
+There is no safe way around it. Clobbering the `.so` files would overwrite a core lib with a
+build the running postmaster never linked against (#302), and clobbering only the control/SQL
+files would leave the SQL definitions and the `.so` at different versions — worse than either.
+
 The copy runs in a third init container, `copy-prebuilt-ext`, **last** of the three and with
 `cp -n` (no-clobber) — same reason `copy-ext` is: `copy-base-ext` populated `ext-lib`/`ext-share`
 from the image that actually *runs* the server, and this is an independent build that can sit on
@@ -410,7 +422,7 @@ All four values apply to **both** extension init containers and to **neither** t
 
 Two more render-time guards, both for failures that would otherwise surface only on a running pod. An `extraVolumes` entry reusing one of the chart's own volume names (`data`, `ext-lib`, `postgresql-config`, …) is refused: volume names are not merged — the later entry in the pod's list wins — so it would **replace** the data PVC or the extension tree with your ConfigMap. And an `extraVolumeMounts` entry is refused if it mounts over `/ext-lib`, `/ext-share` or `/ext-extra-lib` (the trees the install step copies into, which the mount would shadow), or if it names a volume absent from `extraVolumes` (the kubelet rejects that pod at apply time, so helm has to catch it first).
 
-This does not remove the repeated work — the install is still on the pod-start path. Resolving the packages once at build time and mounting the result is tracked separately.
+This redirects the per-start install; it does not remove it. To take the install off the pod-start path entirely, see [Taking the install off the pod-start path](#taking-the-install-off-the-pod-start-path-320) above.
 
 #### Don't declare a `pgdg` entry in `aptSources`
 

@@ -75,6 +75,15 @@
   copy would overwrite a core lib (e.g. `libpqwalreceiver.so`) with one the running postmaster
   never linked against (#302).
 
+  It **adds** extensions; it does not upgrade one the server image already ships. The copy is
+  no-clobber and runs last, so anything `copy-base-ext`/`copy-ext` already placed wins,
+  silently. Concretely: the pgvector chart's `postgresql.image` is `pgvector/pgvector`, which
+  ships `vector.so`, so a prebuilt image carrying a NEWER pgvector is a no-op -- change the
+  server image for that instead. There is no safe alternative: clobbering the `.so` files would
+  overwrite a core lib with a build the running postmaster never linked against (#302), and
+  clobbering only the control/SQL files would leave the SQL definitions and the `.so` at
+  different versions.
+
   The image build fails rather than producing a quietly useless artifact when `PACKAGES` is
   empty, the `APT_SOURCE_*` triple is partially set, `APT_SOURCE_LINE` carries no `signed-by=`,
   or the install leaves `/usr/share/postgresql/<major>/extension` empty -- that last one

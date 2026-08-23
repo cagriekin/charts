@@ -571,9 +571,14 @@ spec:
             {{- include "pg.initResources" . | nindent 12 }}
 {{- end }}
 {{- end }}
-{{- if and .Values.postgresql.extensions.enabled .Values.postgresql.extensions.image.repository }}
+{{- $extImgVals := .Values.postgresql.extensions.image | default dict }}
+{{- if and .Values.postgresql.extensions.enabled ($extImgVals.repository | default "") }}
 {{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
-{{- $extImg := dict "repository" .Values.postgresql.extensions.image.repository "tag" (.Values.postgresql.extensions.image.tag | toString | replace "{major}" ($pgMajor | toString)) "digest" .Values.postgresql.extensions.image.digest }}
+{{- /* default dict throughout (#320 review): `extensions.image: null` in a values file
+       otherwise produced a bare "nil pointer evaluating interface {}.repository" naming no
+       value at all -- and nulling a map is exactly what a values-file merge does when
+       someone tries to clear it. */}}
+{{- $extImg := dict "repository" $extImgVals.repository "tag" ($extImgVals.tag | default "" | toString | replace "{major}" ($pgMajor | toString)) "digest" ($extImgVals.digest | default "") }}
         {{- /* #320: the prebuilt-extension path. The packages were resolved ONCE, at image
                build time (images/pg-extensions/), so this container runs a plain `cp` --
                no apt-get, therefore no egress on the pod-start path and no root. That last
@@ -592,7 +597,7 @@ spec:
                is missing is the whole job. */}}
         - name: copy-prebuilt-ext
           image: {{ include "pg.image" $extImg | quote }}
-          imagePullPolicy: {{ .Values.postgresql.extensions.image.pullPolicy }}
+          imagePullPolicy: {{ $extImgVals.pullPolicy | default "IfNotPresent" }}
           command: ['sh', '-c', {{ include "pg.extensionPrebuiltCopyCommand" (dict "pgMajor" $pgMajor "extraLibs" .Values.postgresql.extensions.extraLibs) | quote }}]
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
@@ -1614,7 +1619,7 @@ spec:
        it separately from extraVolumeMounts would make a values file that sets both
        render a mount referencing a volume that does not exist -- which fails at APPLY
        time, not render time. Names colliding with the chart's own are refused by
-       pg.validateExtensionExtraVolumes. */}}
+       pg.validateExtensionInitOverrides. */}}
 {{- with .Values.postgresql.extensions.extraVolumes }}
         {{- toYaml . | nindent 8 }}
 {{- end }}
