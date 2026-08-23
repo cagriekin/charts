@@ -37,6 +37,14 @@ type OSExec struct{}
 func (OSExec) Run(ctx context.Context, env []string, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = append(os.Environ(), env...)
+	// WaitDelay bounds the gap between killing the process and Wait returning. Without it a
+	// cancelled context kills only the direct child, while Wait blocks forever on the stdout
+	// copy: any GRANDCHILD still holding the pipe keeps it from reaching EOF. That is not
+	// hypothetical here -- `entrypoint.sh initdb` runs `pg_ctl -w start`, which daemonizes a
+	// postmaster that inherits the pipe, so a deadline expiring mid-bootstrap would hang the
+	// caller indefinitely, holding opMu, stopping the reconcile heartbeat and preventing
+	// dcs.OnLost from ever fencing (#288 review).
+	cmd.WaitDelay = 10 * time.Second
 	out, err := cmd.Output()
 	return strings.TrimSpace(string(out)), withStderr(err)
 }

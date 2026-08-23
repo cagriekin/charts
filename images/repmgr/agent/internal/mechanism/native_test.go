@@ -740,3 +740,34 @@ func TestNativeApplicationNameIsNotAppendedTwice(t *testing.T) {
 		t.Errorf("application_name appears %d times after repeated boots, want 1:\n%s", n, string(b))
 	}
 }
+
+// #288 review: pg_rewind copies the SOURCE's managed fragment into the target PGDATA, so if the
+// agent dies after the rewind but before Follow finishes, the next boot feeds the source pod's
+// application_name back through currentPrimaryConninfo(). A presence-only guard would preserve
+// it forever: two senders would resolve to one pod, and the real pod would be reported as not
+// streaming indefinitely.
+func TestNativeApplicationNameSelfHealsAForeignValue(t *testing.T) {
+	n, dataDir := newTestNativeWithSlot(t, &fakeRunner{}, "pg_ha_slot_1")
+	n.NodeName = "pg-1"
+	// Stand in for a fragment inherited from pg-0 via pg_rewind.
+	if err := n.writeManagedConf("host=pg-0.hl port=5432 user=repmgr dbname=repmgr application_name=pg-0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.GenerateConfig(context.Background(), NodeIdentity{DataDir: dataDir}, ConfigOpts{}); err != nil {
+		t.Fatalf("GenerateConfig: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	if strings.Contains(got, "application_name=pg-0") {
+		t.Errorf("kept another node's application_name:\n%s", got)
+	}
+	if !strings.Contains(got, "application_name=pg-1") {
+		t.Errorf("did not adopt this node's own application_name:\n%s", got)
+	}
+	if n := strings.Count(got, "application_name="); n != 1 {
+		t.Errorf("application_name appears %d times, want 1:\n%s", n, got)
+	}
+}

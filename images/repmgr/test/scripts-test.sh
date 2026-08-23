@@ -461,6 +461,18 @@ else
   bad "#288: shared_preload_libraries=repmgr is not mechanism-gated (line=${spl_line:-none}, gates=${spl_gates})"
 fi
 
+# --- #288: the transient bootstrap postmaster must not be network-reachable ---
+# Between CREATE USER ${REPMGR_USER} and the stop at the end of bootstrap_initdb it would
+# otherwise be a reachable, authenticable primary reporting pg_is_in_recovery()=false -- and
+# under native a non-holder's next tick would BootstrapClone from it, inheriting the legacy
+# `host all all 0.0.0.0/0 md5` pg_hba for the pod's whole life (nothing on the clone path
+# rewrites pg_hba) plus a postgresql.conf with no include_dir.
+if sed -n '/^bootstrap_initdb() {/,/^}/p' "${ROOT}/entrypoint.sh" | grep -q "listen_addresses=''"; then
+  ok "#288: the bootstrap postmaster listens on no TCP address"
+else
+  bad "#288: the bootstrap postmaster is network-reachable during role creation"
+fi
+
 echo "----"
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
 exit "$fail"

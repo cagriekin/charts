@@ -730,12 +730,18 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			sctx, scancel := context.WithTimeout(wctx, a.fenceBudget()/2)
 			defer scancel()
 			a.slotsTick(sctx)
-			a.topologyTick(sctx)
 		}()
 		if tl, _, ok, _ := a.prober.PrimaryWALPosition(wctx, a.selfConn()); ok {
 			a.advanceMarker(wctx, tl, true, obs.Marker)
 		}
-		return a.assertPrimaryRouting(wctx, obs)
+		promoteRoutingErr := a.assertPrimaryRouting(wctx, obs)
+		// LAST, for the same reason as in StayPrimary (#288 review): purely observational, so it
+		// must never compete with the marker write or the routing switch. Sharing slotsTick's
+		// fenceBudget()/2 sub-context left it routinely under the probe's own 10s psql timeout,
+		// which logged a spurious warning on every promotion and put a second apiserver pod LIST
+		// on the promote critical path.
+		a.topologyTick(wctx)
+		return promoteRoutingErr
 
 	case reconcile.StayPrimary:
 		// Register this primary in repmgr.nodes. In agent mode there is no repmgrd
@@ -1141,7 +1147,8 @@ func (a *agent) finishInitdbNative(ctx context.Context, nid mechanism.NodeIdenti
 //
 // Nothing else does: the setup-config init container is guarded on postgresql.conf already
 // existing and runs before PGDATA does, and the only other writer is the postStart hook, whose
-// fixed ~30s pg_isready loop now has to cover lease acquisition AND a reconcile tick AND initdb.
+// fixed pg_isready loop (~90s on the agent-mode branch) now has to cover lease acquisition AND a
+// reconcile tick AND initdb.
 // If it overruns, the include is silently absent and every postgresql.configuration / TLS /
 // pgbackrest setting is missing -- and standbys clone that same config.
 //
@@ -1511,9 +1518,18 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 		return err
 	}
 	if err := a.mech.RejoinForceRewind(ctx, a.peerMechConn(target)); err != nil {
+		// Same marker as BootstrapClone (#288 review): ReclonePreserving runs the same
+		// pg_basebackup, so an interrupted one leaves an equally torn PGDATA. Without it
+		// discardTornClone is a no-op on the next boot, and recovery relies on the NEXT
+		// ReclonePreserving renaming the torn directory aside as another `.diverged.<ts>` --
+		// which nothing ever removes, so every interrupted attempt permanently consumes a full
+		// data directory's worth of PVC space.
+		a.beginClone()
 		if err := a.mech.ReclonePreserving(ctx, a.peerMechConn(target)); err != nil {
+			a.discardTornClone()
 			return err
 		}
+		a.endClone()
 		// A full re-clone: this directory's contents now come from the peer, not from
 		// whatever restore the record beside it describes.
 		a.dropRestoreRecord("the data directory was re-cloned from " + target)

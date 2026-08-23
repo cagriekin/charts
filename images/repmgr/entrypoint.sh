@@ -270,7 +270,18 @@ host    replication     all             0.0.0.0/0               md5
 host    all             all             0.0.0.0/0               md5
 EOF
 
-    pg_ctl -D "$PGDATA" -w start
+    # SOCKET-ONLY, deliberately (#288 review). This transient postmaster exists to create the
+    # app/repmgr roles and databases; between `CREATE USER ${REPMGR_USER}` below and the stop at
+    # the end of this function it would otherwise be a reachable, authenticable primary reporting
+    # pg_is_in_recovery() = false -- and under native a non-holder's very next tick would see it
+    # as the live primary and BootstrapClone from it. That standby would inherit the legacy
+    # pg_hba (`host all all 0.0.0.0/0 md5`, SUPERUSER-exposing) for the rest of the pod's life,
+    # because nothing on the clone path rewrites pg_hba, and its cloned postgresql.conf would
+    # have no include_dir, inverting the conf.d precedence too. Under repmgr the window did not
+    # exist: every standby was blocked until the primary registered in repmgr.nodes, which only
+    # happens after the real start. Listening on no TCP address closes it entirely -- the local
+    # psql calls below all use the unix socket.
+    pg_ctl -D "$PGDATA" -w start -o "-c listen_addresses=''"
 
     REPMGR_USER=${REPMGR_USER:-repmgr}
     REPMGR_PASSWORD=${REPMGR_PASSWORD:?REPMGR_PASSWORD is required}

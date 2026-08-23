@@ -174,8 +174,18 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 		// after four boots the GUC read `... application_name=pg-1 application_name=pg-1
 		// application_name=pg-1 application_name=pg-1`. libpq takes the last, so replication
 		// kept working while the value grew without bound.
-		if n.NodeName != "" && !strings.Contains(primaryConninfo, "application_name=") {
-			primaryConninfo = fmt.Sprintf("%s application_name=%s", primaryConninfo, n.NodeName)
+		if n.NodeName != "" {
+			// Keyed on THIS node's name, not on the presence of any application_name (#288
+			// review). pg_rewind copies the SOURCE's pg-ha-agent.conf into the target PGDATA, so
+			// if the agent dies after the rewind but before Follow finishes, the next boot feeds
+			// the source pod's name straight back through currentPrimaryConninfo(). A
+			// presence-only guard would preserve it forever: two senders would resolve to one
+			// pod, and the real pod would be logged as "not streaming" indefinitely while
+			// unidentified stayed 0. Strip any foreign value and write our own.
+			want := "application_name=" + n.NodeName
+			if !strings.Contains(primaryConninfo, want) {
+				primaryConninfo = stripApplicationName(primaryConninfo) + " " + want
+			}
 		}
 		// Single-quoted and escaped: a host or user containing a quote would otherwise break
 		// out of the GUC and corrupt the file, failing postmaster start.
@@ -210,6 +220,20 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 // needless replication gap). Follow remains the only place that CHANGES it.
 func (n *Native) GenerateConfig(ctx context.Context, id NodeIdentity, o ConfigOpts) error {
 	return n.writeManagedConf(n.currentPrimaryConninfo())
+}
+
+// stripApplicationName removes any application_name=<value> token from a conninfo, so the local
+// node's own can replace a value inherited from another node (#288 review).
+func stripApplicationName(conninfo string) string {
+	fields := strings.Fields(conninfo)
+	kept := fields[:0]
+	for _, f := range fields {
+		if strings.HasPrefix(f, "application_name=") {
+			continue
+		}
+		kept = append(kept, f)
+	}
+	return strings.Join(kept, " ")
 }
 
 // currentPrimaryConninfo reads back the primary_conninfo already on disk, or "" if the
