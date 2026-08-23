@@ -572,6 +572,101 @@ apt_line_comma_res=$(helm template test-pg "${CHART_DIR}" --set postgresql.major
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#310: aptLine with a comma (multi-arch syntax) renders" "${apt_line_comma_res}" 'arch=amd64,arm64'
 
+# #320: extensions.env/envFrom/extraVolumes/extraVolumeMounts point the apt steps at an
+# in-cell mirror or proxy, so an install under a default-deny egress policy needs no
+# external host opened at all. Rendered on BOTH init containers -- occurrence counts, not
+# just presence: getting it onto only one leaves half the install still going direct.
+ext_proxy_res=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_eq "#320: http_proxy env on both extension init containers" "2" \
+  "$(printf '%s\n' "${ext_proxy_res}" | grep -c 'value: http://apt-proxy.infra.svc:3142')"
+assert_eq "#320: envFrom on both extension init containers" "2" \
+  "$(printf '%s\n' "${ext_proxy_res}" | grep -c 'name: apt-proxy-env')"
+assert_eq "#320: extraVolumeMounts on both extension init containers" "2" \
+  "$(printf '%s\n' "${ext_proxy_res}" | grep -c 'mountPath: /etc/apt/apt.conf.d/01proxy')"
+# The volume itself must reach the POD, exactly once -- a mount naming a volume the pod
+# does not declare is rejected by the kubelet at apply time, not by helm.
+assert_eq "#320: extraVolumes reaches the pod exactly once" "1" \
+  "$(printf '%s\n' "${ext_proxy_res}" | grep -c '^        - configMap:')"
+# The postgresql container must NOT inherit any of it: an http_proxy in the postmaster's
+# own environment silently redirects anything else that reads it, and an apt.conf mount
+# there is meaningless. Asserted by counting the whole render -- 2 is both init
+# containers and nothing else.
+assert_not_contains "#320: no apt proxy volume on the postgresql container" \
+  "$(printf '%s\n' "${ext_proxy_res}" | sed -n '/name: postgresql$/,/^        - name: /p')" \
+  "01proxy"
+
+# #320: with no packages there is no apt-get step at all, so a proxy/mount would be
+# silently ignored -- rejected at render time rather than leaving the operator to conclude
+# the proxy is in effect when it is not.
+ext_proxy_nopkg_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.env[0].name=http_proxy' \
+  --set 'postgresql.extensions.env[0].value=http://p:3142' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_proxy_nopkg_rc=$?
+assert_eq "#320: env without packages fails the render" "1" "${ext_proxy_nopkg_rc}"
+
+# #320: volume names are not merged -- the later entry in the pod's volumes list wins, so
+# reusing a chart volume name would REPLACE the data PVC or the extension tree with a
+# ConfigMap and nothing would report it until the pod was running.
+ext_vol_reserved_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+  --set 'postgresql.extensions.extraVolumes[0].name=data' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_vol_reserved_rc=$?
+assert_eq "#320: an extraVolume reusing a chart volume name fails the render" "1" "${ext_vol_reserved_rc}"
+
+# #320: mounting over a path the install step copies INTO shadows the tree this whole
+# feature exists to populate.
+ext_mount_shadow_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+  --set 'postgresql.extensions.extraVolumeMounts[0].mountPath=/ext-lib' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_mount_shadow_rc=$?
+assert_eq "#320: an extraVolumeMount over /ext-lib fails the render" "1" "${ext_mount_shadow_rc}"
+
+# #320: a mount naming a volume that is not declared fails at APPLY time (the kubelet
+# rejects the pod), so it has to fail at render time instead.
+ext_mount_undeclared_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --set 'postgresql.extensions.extraVolumeMounts[0].name=nope' \
+  --set 'postgresql.extensions.extraVolumeMounts[0].mountPath=/etc/apt/apt.conf.d/01proxy' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_mount_undeclared_rc=$?
+assert_eq "#320: an extraVolumeMount naming an undeclared volume fails the render" "1" "${ext_mount_undeclared_rc}"
+
+# #320: a pgdg aptSources entry is always fatal at apply time (apt rejects the whole
+# source list on a conflicting Signed-By, since both images already configure PGDG under
+# their own keyring path) and the apt error names no values key -- so reject it at render
+# time, where the message can say what to do.
+ext_pgdg_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --set 'postgresql.extensions.aptSources[0].name=pgdg' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://apt.postgresql.org/pub/repos/apt/ACCC4CF8.asc' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-pgdg-keyring.gpg] http://apt.postgresql.org/pub/repos/apt/ trixie-pgdg main' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_pgdg_rc=$?
+assert_eq "#320: a pgdg aptSources entry fails the render" "1" "${ext_pgdg_rc}"
+
+# #320: a non-PGDG source is of course still allowed -- the guard must key on the PGDG
+# host, not on the entry name.
+ext_pigsty_ok=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.aptSources[0].name=pgdg' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-pgdg-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#320: the PGDG guard keys on the host, not the entry name" "${ext_pigsty_ok}" 'repo.pigsty.io/apt/pgsql/trixie'
+
 # #309: postgresql.extensions.extraLibs copies an exact path into the dedicated
 # ext-extra-lib volume (NOT ext-lib, review -- see below), for a package's own
 # shared-library dependency Debian installs outside the Postgres extension dir (e.g.

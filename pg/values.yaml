@@ -352,6 +352,58 @@ postgresql:
     # (pg.validateExtraLibs) for exactly that reason. Requires packages to be non-empty.
     extraLibs: []
       # - /usr/lib/x86_64-linux-gnu/libsodium.so.23
+    # Environment for the copy-ext/copy-base-ext init containers (#320). The one thing
+    # this exists for is `http_proxy`: apt honours it, so a cluster under a default-deny
+    # egress policy can send the whole install through an in-cell mirror or proxy and open
+    # NO external hosts at all -- instead of permanently allowing apt.postgresql.org,
+    # repo.pigsty.io and (for a transitive dep like libsodium23, which neither of those
+    # ships) deb.debian.org, per tenant, forever.
+    #
+    # Rendered on BOTH init containers, never on the postgresql container: this is
+    # package-install configuration, and a proxy variable leaking into the postmaster's
+    # environment would silently redirect anything else that reads it. Only applied while
+    # packages is non-empty -- the plain-copy path runs no apt at all, so env there would
+    # be inert and misleading.
+    #
+    # Standard core-v1 EnvVar list, so valueFrom (secretKeyRef/configMapKeyRef) works for
+    # a proxy URL carrying credentials -- do not inline those here, values files get
+    # committed.
+    env: []
+      # - name: http_proxy
+      #   value: http://apt-proxy.infra.svc:3142
+      # - name: https_proxy
+      #   value: http://apt-proxy.infra.svc:3142
+      # - name: no_proxy
+      #   value: .svc,.cluster.local,10.0.0.0/8
+    # Same as env above (#320), as core-v1 EnvFromSource -- a ConfigMap or Secret of proxy
+    # settings shared by every release in the namespace, so the values file carries a
+    # reference instead of a copy.
+    envFrom: []
+      # - configMapRef:
+      #     name: apt-proxy-env
+    # Extra pod volumes for the two init containers (#320), for what env cannot express:
+    # an /etc/apt/apt.conf.d/ snippet, or a replacement sources.list pointing at an
+    # internal mirror. `aptSources` only APPENDS source files and cannot rewrite the
+    # PGDG/base sources the images ship, so a mirror-only cluster needs a real file mount.
+    #
+    # Standard core-v1 Volume list, added to the pod alongside the chart's own. The
+    # chart's volume names are reserved and reusing one is refused at render time
+    # (pg.validateExtensionExtraVolumes) -- a silent collision would replace ext-lib or
+    # the data volume itself.
+    extraVolumes: []
+      # - name: apt-proxy-conf
+      #   configMap:
+      #     name: apt-proxy-conf     # key 01proxy -> Acquire::http::Proxy "http://...";
+    # Where extraVolumes land inside copy-ext/copy-base-ext (#320). Standard core-v1
+    # VolumeMount list, mounted on BOTH init containers and never on the postgresql
+    # container. Mounting over a path the install step itself writes (/ext-lib,
+    # /ext-share, /ext-extra-lib) is refused at render time: it would shadow the very
+    # trees this feature copies into.
+    extraVolumeMounts: []
+      # - name: apt-proxy-conf
+      #   mountPath: /etc/apt/apt.conf.d/01proxy
+      #   subPath: 01proxy
+      #   readOnly: true
     # Resources for the apt-get step, only rendered while packages is non-empty (the
     # plain-copy default path keeps using the shared, lighter pg.initResources). apt-get
     # update + install is a real package-manager run (repo metadata fetch + dependency

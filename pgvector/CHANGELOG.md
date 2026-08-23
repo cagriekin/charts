@@ -1,5 +1,22 @@
 # pgvector chart changelog
 
+## 1.15.0 - 2026-08-23
+
+Inherited from pg: same templates, same extension init containers. `postgresql.extensions`
+gains `env`, `envFrom`, `extraVolumes` and `extraVolumeMounts` (#320), so the `apt-get` steps
+in `copy-ext`/`copy-base-ext` can be pointed at an in-cell apt mirror or proxy -- under a
+default-deny egress policy the cost of the install is the external HOSTS it forces into the
+platform's baseline allow (`apt.postgresql.org`, `repo.pigsty.io`, and `deb.debian.org` for a
+single transitive `libsodium23`), and one `http_proxy` replaces all three. All four apply to
+both init containers and to neither the postgresql container, render only while `packages` is
+non-empty, and are rejected at render time when they would be silently inert or would shadow
+the chart's own volumes and install paths. A `pgdg` entry in `aptSources` is now refused too:
+both images already configure PGDG under their own keyring, so a second entry made apt reject
+the whole source list. See the [pg 1.15.0 changelog](../pg/CHANGELOG.md) and the
+[pg chart README](../pg/README.md#pointing-the-extension-install-at-an-apt-mirror-or-proxy-320).
+
+**Migrating from 1.14.1:** nothing to do; the default render is byte-identical.
+
 ## 1.14.1 - 2026-08-22
 
 Inherited from pg: same agent and image. See the [pg 1.14.1 changelog](../pg/CHANGELOG.md)

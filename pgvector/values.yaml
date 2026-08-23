@@ -275,6 +275,21 @@ postgresql:
     # itself links are refused. See the pg chart README.
     extraLibs: []
       # - /usr/lib/x86_64-linux-gnu/libsodium.so.23
+    # Environment for the copy-ext/copy-base-ext init containers (#320) -- `http_proxy`
+    # above all, so an install under a default-deny egress policy can go through an
+    # in-cell mirror and open no external hosts. Both init containers, never the
+    # postgresql container; only while packages is non-empty. See the pg chart README.
+    env: []
+      # - name: http_proxy
+      #   value: http://apt-proxy.infra.svc:3142
+    # Same as env, as core-v1 EnvFromSource (#320).
+    envFrom: []
+    # Extra pod volumes and their mounts for the two init containers (#320), for what env
+    # cannot express -- an /etc/apt/apt.conf.d/ snippet or a replacement sources.list,
+    # since aptSources only APPENDS source files. The chart's own volume names, and the
+    # install step's own paths, are refused at render time. See the pg chart README.
+    extraVolumes: []
+    extraVolumeMounts: []
     installResources:
       requests:
         cpu: 100m

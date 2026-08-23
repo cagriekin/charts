@@ -1,5 +1,64 @@
 # pg chart changelog
 
+## 1.15.0 - 2026-08-23
+
+### Added
+
+- **`postgresql.extensions.env` / `envFrom` / `extraVolumes` / `extraVolumeMounts`: point the
+  extension install at your own apt mirror or proxy (#320).** `copy-base-ext` and `copy-ext`
+  had no `env`, no `envFrom` and no volume beyond the three `emptyDir`s, so there was no
+  supported way to keep the `apt-get` steps off the public internet.
+
+  That matters under a per-namespace default-deny egress policy, where the cost is not the
+  repeated work but the HOSTS: every external host the install touches has to sit in the
+  platform's baseline allow, for every tenant, permanently. A Supabase-shaped package set
+  needs three -- `apt.postgresql.org`, `repo.pigsty.io`, and `deb.debian.org` (the
+  general-purpose Debian archive, for one 165 kB `libsodium23` that neither PGDG nor Pigsty
+  ships). A single `http_proxy` now replaces all three, since apt honours it and it needs no
+  source rewriting; `extraVolumes`/`extraVolumeMounts` cover what env cannot express -- an
+  `/etc/apt/apt.conf.d` snippet or a replacement `sources.list`, which `aptSources` cannot
+  provide because it only APPENDS source files and never rewrites the base sources the images
+  ship.
+
+  All four apply to **both** extension init containers and to **neither** the postgresql
+  container: an `http_proxy` in the postmaster's own environment would silently redirect
+  anything else that reads it, and an apt configuration mount there is meaningless. They
+  render only while `packages` is non-empty (the plain-copy path runs no apt at all), and
+  setting any of them with `packages` empty is **rejected at render time** rather than
+  silently ignored -- an operator who believes the proxy is in effect when it is not has a
+  worse problem than a failed render.
+
+  Two further guards, both for failures that would otherwise surface only on a running pod.
+  An `extraVolumes` entry reusing one of the chart's own volume names (`data`, `ext-lib`,
+  `postgresql-config`, ...) is refused: volume names are not merged -- the later entry in the
+  pod's list wins -- so it would REPLACE the data PVC or the extension tree with a ConfigMap.
+  An `extraVolumeMounts` entry is refused if it mounts over `/ext-lib`, `/ext-share` or
+  `/ext-extra-lib` (the trees the install step copies into, which the mount would shadow), or
+  if it names a volume absent from `extraVolumes` -- the kubelet rejects that pod at apply
+  time, so helm has to catch it first.
+
+  This does not take the install off the pod-start path; a chart-built extension image
+  (resolve the packages once, mount the result) remains the larger follow-up.
+
+- **A `pgdg` entry in `postgresql.extensions.aptSources` is now refused at render time
+  (#320).** It was always fatal and the failure named nothing useful. Both `postgres:*-trixie`
+  and the `cagriekin/repmgr` image already configure `apt.postgresql.org` under their OWN
+  keyring paths, and the chart derives its keyring path from the entry `name`
+  (`pgchart-<name>-keyring.gpg`) with no override -- so apt sees two entries for the same repo
+  with different `Signed-By` values and rejects the ENTIRE source list
+  (`E: Conflicting values set for option Signed-By regarding source
+  http://apt.postgresql.org/pub/repos/apt/ trixie-pgdg`), failing the install before it
+  starts. Omitting the entry is correct: PGDG packages in `packages` resolve from the image's
+  own configuration, which is what `packages` already relies on. The guard keys on the HOST,
+  not the entry name, so any `aptLine` pointing at `apt.postgresql.org` is caught regardless
+  of what it was called.
+
+**Migrating from 1.14.1:** nothing to do -- all four values default to `[]` and the default
+render is byte-identical. The one behaviour change is the new `pgdg`-in-`aptSources`
+rejection: a values file with such an entry now fails at render time instead of failing
+inside `apt-get update` on every pod start, so a release that was already broken this way
+surfaces at `helm upgrade`.
+
 ## 1.14.1 - 2026-08-22
 
 ### Changed

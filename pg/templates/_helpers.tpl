@@ -446,6 +446,20 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
     {{- if regexMatch "(?i)(trusted|allow-insecure|allow-weak|allow-downgrade-to-insecure) *=" $substituted -}}
       {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine: %q sets an apt option that weakens or disables signature verification (trusted=/allow-insecure=/allow-weak=/allow-downgrade-to-insecure=) -- this makes the curl/gpg key-verification step above decorative and installs unsigned or weakly-signed packages as root; sign the source properly with signed-by= instead" $name $substituted) -}}
     {{- end -}}
+    {{- /* #320: a PGDG source here is always fatal, and the failure gives no hint why.
+           Both postgres:*-trixie and the repmgr image already configure
+           apt.postgresql.org under their OWN keyring path, and this chart derives its
+           keyring path from the entry name (pgchart-<name>-keyring.gpg) with no way to
+           override it -- so apt sees two entries for the same repo with different
+           Signed-By values and rejects the ENTIRE source list:
+             E: Conflicting values set for option Signed-By regarding source
+                http://apt.postgresql.org/pub/repos/apt/ trixie-pgdg
+           The install then fails before it starts, and nothing points at the aptSources
+           entry as the cause. Omitting it is correct: PGDG packages already resolve from
+           the image's own configuration, which is exactly what `packages` relies on. */ -}}
+    {{- if regexMatch "(?i)apt\\.postgresql\\.org" $substituted -}}
+      {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine points at apt.postgresql.org (%q). Remove this entry: both the repmgr image and postgres:*-trixie already configure PGDG under their own keyring path, and adding a second entry for the same repo under this chart's keyring path makes apt reject the whole source list (\"E: Conflicting values set for option Signed-By regarding source http://apt.postgresql.org/pub/repos/apt/ ...\"), so the install fails before it starts. PGDG packages in postgresql.extensions.packages resolve from the image's own configuration -- aptSources is only for sources the images do NOT ship, e.g. repo.pigsty.io" $name $substituted) -}}
+    {{- end -}}
     {{- $expectSignedBy := printf "signed-by=/usr/share/keyrings/pgchart-%s-keyring.gpg" $name -}}
     {{- if not (contains $expectSignedBy $substituted) -}}
       {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine: %q must include %q -- without it apt has no way to know which key to trust and this fails later, at apply time, inside apt-get update (NO_PUBKEY), instead of at render time; keyUrl's key is dearmored to exactly that path" $name $substituted $expectSignedBy) -}}
@@ -571,6 +585,72 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- $cmdParts = append $cmdParts (printf "cp %s%s /ext-extra-lib/" $cpFlag $l) -}}
 {{- end -}}
 {{- printf "PGVER=$(dpkg-query -W postgresql-%s 2>/dev/null | cut -f2); %s" $pgMajor (join " && " $cmdParts) -}}
+{{- end }}
+
+{{- /* #320: postgresql.extensions.env / envFrom / extraVolumes / extraVolumeMounts exist so
+       an install under a default-deny egress policy can be pointed at an in-cell apt mirror
+       or proxy instead of permanently allowing apt.postgresql.org, repo.pigsty.io and
+       deb.debian.org per tenant. They are rendered on the copy-ext/copy-base-ext init
+       containers only, and only while packages is non-empty -- so the same
+       "set but nothing would ever use it" rejection aptSources gets applies here, for the
+       same reason: silently inert configuration in a values file is worse than a render
+       error, because the operator concludes the proxy is in effect when it is not.
+
+       extraVolumes names are checked against the chart's OWN volume names. A collision is
+       not a merge -- the later entry in the pod's volumes list wins, so reusing `data` or
+       `ext-lib` would replace the data volume or the extension tree with a ConfigMap, and
+       nothing would report it until the pod was running.
+
+       extraVolumeMounts mountPaths are checked against the three paths the install step
+       itself writes: mounting over one (a ConfigMap, or anything read-only) shadows the
+       tree this whole feature exists to populate, and the copy would either fail or write
+       into a mount nothing reads. Every mount must also name a volume declared in
+       extraVolumes, because a mount referencing an absent volume fails at APPLY time (the
+       kubelet rejects the pod) rather than at render time. */ -}}
+{{- define "pg.validateExtensionInitOverrides" -}}
+{{- $ext := .Values.postgresql.extensions -}}
+{{- $env := $ext.env | default list -}}
+{{- $envFrom := $ext.envFrom | default list -}}
+{{- $vols := $ext.extraVolumes | default list -}}
+{{- $mounts := $ext.extraVolumeMounts | default list -}}
+{{- $any := or (gt (len $env) 0) (gt (len $envFrom) 0) (gt (len $vols) 0) (gt (len $mounts) 0) -}}
+{{- if $any -}}
+  {{- if not $ext.enabled -}}
+    {{- fail "postgresql.extensions.env/envFrom/extraVolumes/extraVolumeMounts are set but postgresql.extensions.enabled is false, so the init containers they configure are never rendered and nothing would use them. Set postgresql.extensions.enabled=true." -}}
+  {{- end -}}
+  {{- if not ($ext.packages | default list) -}}
+    {{- fail "postgresql.extensions.env/envFrom/extraVolumes/extraVolumeMounts are set but postgresql.extensions.packages is empty. They configure the apt-get step (a proxy, a mirror sources.list), and with no packages there is no apt-get step -- the init containers take the plain-copy path and your proxy/mount would be silently ignored. Add at least one package, or remove these values." -}}
+  {{- end -}}
+{{- end -}}
+{{- $reserved := list "data" "pg-run" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib" "repmgr-config" "etcd-tls" "agent-control-tls" "pgbackrest" "pgbackrest-config" "pgbackrest-bootstrap-script" "service-updater-script" -}}
+{{- $declared := dict -}}
+{{- range $v := $vols -}}
+  {{- $n := $v.name | toString -}}
+  {{- if not $n -}}
+    {{- fail "postgresql.extensions.extraVolumes: every entry needs a name (it is what extraVolumeMounts references)" -}}
+  {{- end -}}
+  {{- if has $n $reserved -}}
+    {{- fail (printf "postgresql.extensions.extraVolumes: name %q is one of this chart's own volume names (%s). Volume names are not merged -- the later entry wins -- so this would REPLACE the chart's volume (e.g. the data PVC, or the extension tree) with yours, and nothing would report it until the pod was running. Pick a different name." $n (join ", " $reserved)) -}}
+  {{- end -}}
+  {{- if hasKey $declared $n -}}
+    {{- fail (printf "postgresql.extensions.extraVolumes: duplicate name %q -- the later entry would silently replace the earlier one" $n) -}}
+  {{- end -}}
+  {{- $declared = set $declared $n true -}}
+{{- end -}}
+{{- $installPaths := list "/ext-lib" "/ext-share" "/ext-extra-lib" -}}
+{{- range $m := $mounts -}}
+  {{- $n := $m.name | toString -}}
+  {{- if not (hasKey $declared $n) -}}
+    {{- fail (printf "postgresql.extensions.extraVolumeMounts references volume %q, which is not declared in postgresql.extensions.extraVolumes. A mount naming an absent volume is rejected by the kubelet at apply time, not by helm at render time, so the pod would simply never start." $n) -}}
+  {{- end -}}
+  {{- $path := $m.mountPath | toString | trimSuffix "/" -}}
+  {{- if not $path -}}
+    {{- fail (printf "postgresql.extensions.extraVolumeMounts[%s]: mountPath is required" $n) -}}
+  {{- end -}}
+  {{- if has $path $installPaths -}}
+    {{- fail (printf "postgresql.extensions.extraVolumeMounts[%s].mountPath is %q, which is where the install step copies the extension files it just built. Mounting over it shadows the tree this feature exists to populate -- the copy writes into your volume (or fails outright, if it is read-only) and the postgresql container reads an empty one. Mount your apt configuration somewhere under /etc/apt instead." $n $path) -}}
+  {{- end -}}
+{{- end -}}
 {{- end }}
 
 {{- /* #308: wal_level has exactly one authoritative source: postgresql.walLevel.

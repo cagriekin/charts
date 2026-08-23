@@ -4,6 +4,7 @@
 {{- include "pg.validateExtensionPackages" . }}
 {{- include "pg.validateExtensionAptSources" . }}
 {{- include "pg.validateExtraLibs" . }}
+{{- include "pg.validateExtensionInitOverrides" . }}
 {{- include "pg.validateWalLevel" . }}
 {{- include "pg.validateSyncReplicationSlotsMajor" . }}
 {{- include "pg.validateSyncReplicationSlotsWalLevel" . }}
@@ -428,6 +429,21 @@ spec:
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
 {{- end }}
+{{- if $pkgs }}
+          {{- /* #320: proxy/mirror settings for the apt steps. On the init containers
+                 ONLY -- never the postgresql container, where an http_proxy leaking into
+                 the postmaster's environment would silently redirect anything else that
+                 reads it. Gated on $pkgs for the same reason the install itself is: the
+                 plain-copy path runs no apt, so env there would be inert and misleading. */}}
+{{- with .Values.postgresql.extensions.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+{{- with .Values.postgresql.extensions.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+{{- end }}
           volumeMounts:
             - name: ext-lib
               mountPath: /ext-lib
@@ -436,6 +452,15 @@ spec:
 {{- if .Values.postgresql.extensions.extraLibs }}
             - name: ext-extra-lib
               mountPath: /ext-extra-lib
+{{- end }}
+{{- if $pkgs }}
+            {{- /* #320: an apt.conf.d snippet or a replacement sources.list -- what
+                   aptSources cannot express, since it only APPENDS source files and
+                   cannot rewrite the PGDG/base sources the images ship. Same $pkgs gate
+                   and same init-containers-only scope as env above. */}}
+{{- with .Values.postgresql.extensions.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
 {{- end }}
           resources:
 {{- if $pkgs }}
@@ -501,6 +526,21 @@ spec:
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
 {{- end }}
+{{- if $pkgs }}
+          {{- /* #320: proxy/mirror settings for the apt steps. On the init containers
+                 ONLY -- never the postgresql container, where an http_proxy leaking into
+                 the postmaster's environment would silently redirect anything else that
+                 reads it. Gated on $pkgs for the same reason the install itself is: the
+                 plain-copy path runs no apt, so env there would be inert and misleading. */}}
+{{- with .Values.postgresql.extensions.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+{{- with .Values.postgresql.extensions.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+{{- end }}
+{{- end }}
           volumeMounts:
             - name: ext-lib
               mountPath: /ext-lib
@@ -509,6 +549,15 @@ spec:
 {{- if .Values.postgresql.extensions.extraLibs }}
             - name: ext-extra-lib
               mountPath: /ext-extra-lib
+{{- end }}
+{{- if $pkgs }}
+            {{- /* #320: an apt.conf.d snippet or a replacement sources.list -- what
+                   aptSources cannot express, since it only APPENDS source files and
+                   cannot rewrite the PGDG/base sources the images ship. Same $pkgs gate
+                   and same init-containers-only scope as env above. */}}
+{{- with .Values.postgresql.extensions.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
 {{- end }}
           resources:
 {{- if $pkgs }}
@@ -1515,6 +1564,16 @@ spec:
         - name: ext-share
           emptyDir:
             sizeLimit: 1Gi
+{{- /* #320: operator-supplied volumes for the two init containers (an apt.conf.d
+       snippet, a mirror sources.list). Declared whenever extensions is enabled rather
+       than gated on packages: a pod-level volume nothing mounts is harmless, and gating
+       it separately from extraVolumeMounts would make a values file that sets both
+       render a mount referencing a volume that does not exist -- which fails at APPLY
+       time, not render time. Names colliding with the chart's own are refused by
+       pg.validateExtensionExtraVolumes. */}}
+{{- with .Values.postgresql.extensions.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+{{- end }}
 {{- if .Values.postgresql.extensions.extraLibs }}
         # Deliberately separate from ext-lib (review, #309/#302): ext-lib is also
         # populated by the unvalidated *.so* glob copy from either image, so
