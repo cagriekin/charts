@@ -1323,23 +1323,41 @@ func TestResolveReplicaPodUsesAppNameThenSlot(t *testing.T) {
 // streaming replica cannot be identified at all -- otherwise streaming-vs-expected alone would
 // read as healthy while the topology view is incomplete.
 func TestTopologyTickPublishesGaugesUnderBothMechanisms(t *testing.T) {
-	for _, mech := range []string{config.MechanismRepmgr, config.MechanismNative} {
-		ex := &slotExec{rows: "pg-1|pg_ha_slot_1|streaming\nwalreceiver||streaming\npg-9|pg_ha_slot_9|catchup\n"}
-		a := newSlotTestAgent(t, ex, mech)
-		a.base = "pg"
-		a.topologyTick(context.Background())
-		body := scrapeMetrics(t, a)
-		// Two streaming rows (the catchup one is not counted), one of them unidentifiable.
-		for _, want := range []string{
-			"pg_ha_agent_replicas_streaming 2",
-			"pg_ha_agent_replicas_unidentified 1",
-			// The fake apiserver holds pods 0 and 1; self is pg-0, so one peer is expected.
-			"pg_ha_agent_replicas_expected 1",
-		} {
-			if !strings.Contains(body, want) {
-				t.Errorf("mechanism %q: missing %q in:\n%s", mech, want, body)
-			}
+	// Two streaming rows (the catchup one is not counted), one of them unidentifiable.
+	const rows = "pg-1|pg_ha_slot_1|streaming\nwalreceiver||streaming\npg-9|pg_ha_slot_9|catchup\n"
+
+	// Native publishes the full picture: the expected/gap half needs the live pod set, and
+	// reconcileSlots is already making that apiserver LIST on this path.
+	ex := &slotExec{rows: rows}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.base = "pg"
+	a.topologyTick(context.Background())
+	body := scrapeMetrics(t, a)
+	for _, want := range []string{
+		"pg_ha_agent_replicas_streaming 2",
+		"pg_ha_agent_replicas_unidentified 1",
+		// The fake apiserver holds pods 0 and 1; self is pg-0, so one peer is expected.
+		"pg_ha_agent_replicas_expected 1",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("native: missing %q in:\n%s", want, body)
 		}
+	}
+
+	// Under repmgr only what the primary can see on its own is published. Charging every
+	// existing install a SECOND uncached pod LIST per tick for an observational gauge is not a
+	// trade worth making (#288 review) -- reconcileSlots returns before its own livePodOrdinals
+	// on that path, so the LIST would be new cost.
+	ex = &slotExec{rows: rows}
+	a = newSlotTestAgent(t, ex, config.MechanismRepmgr)
+	a.base = "pg"
+	a.topologyTick(context.Background())
+	body = scrapeMetrics(t, a)
+	if !strings.Contains(body, "pg_ha_agent_replicas_streaming 2") {
+		t.Errorf("repmgr: the streaming count must still be published:\n%s", body)
+	}
+	if !strings.Contains(body, "pg_ha_agent_replicas_expected 0") {
+		t.Errorf("repmgr: expected must stay 0 (no extra pod LIST on the default path):\n%s", body)
 	}
 }
 
@@ -1567,7 +1585,7 @@ func TestDiscardTornCloneRearmsBootstrapClone(t *testing.T) {
 	if process.HasData(pgdata) != true {
 		t.Fatal("test setup: PG_VERSION should make HasData true")
 	}
-	a.discardTornClone()
+	a.discardTornClone(context.Background())
 	if process.HasData(pgdata) {
 		t.Error("the torn directory survived, so BootstrapClone stays disarmed and the pod is stuck")
 	}
@@ -1592,7 +1610,7 @@ func TestEndCloneClearsTheMarker(t *testing.T) {
 	}
 	a.beginClone()
 	a.endClone()
-	a.discardTornClone()
+	a.discardTornClone(context.Background())
 	if !process.HasData(pgdata) {
 		t.Error("a successfully cloned data directory was discarded on the next boot")
 	}

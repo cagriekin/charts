@@ -182,8 +182,12 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 			// presence-only guard would preserve it forever: two senders would resolve to one
 			// pod, and the real pod would be logged as "not streaming" indefinitely while
 			// unidentified stayed 0. Strip any foreign value and write our own.
+			// TOKEN comparison, not a substring test (#288 review). `strings.Contains` for
+			// "application_name=pg-1" is satisfied by an inherited "application_name=pg-10", so
+			// with >=11 replicas the foreign value was kept -- exactly the case this guard
+			// exists to defeat, and invisible to a test using pg-0/pg-1.
 			want := "application_name=" + n.NodeName
-			if !strings.Contains(primaryConninfo, want) {
+			if !hasField(primaryConninfo, want) {
 				primaryConninfo = stripApplicationName(primaryConninfo) + " " + want
 			}
 		}
@@ -220,6 +224,16 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 // needless replication gap). Follow remains the only place that CHANGES it.
 func (n *Native) GenerateConfig(ctx context.Context, id NodeIdentity, o ConfigOpts) error {
 	return n.writeManagedConf(n.currentPrimaryConninfo())
+}
+
+// hasField reports whether conninfo contains want as a whole space-separated token.
+func hasField(conninfo, want string) bool {
+	for _, f := range strings.Fields(conninfo) {
+		if f == want {
+			return true
+		}
+	}
+	return false
 }
 
 // stripApplicationName removes any application_name=<value> token from a conninfo, so the local

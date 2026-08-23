@@ -383,7 +383,7 @@ func (a *agent) boot(ctx context.Context) error {
 	// A base backup interrupted mid-flight leaves PG_VERSION behind, which makes HasData true
 	// and takes the node off the BootstrapClone path forever (#288 review). Discard it first, so
 	// everything below sees an honest picture of the directory.
-	a.discardTornClone()
+	a.discardTornClone(ctx)
 	// Streaming replication authenticates as the repmgr user via primary_conninfo,
 	// which is deliberately passwordless (the password is not stored in repmgr.conf
 	// -- the PR1 hardening). Without a credential the standby's walreceiver fails
@@ -888,7 +888,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			// takes the has-data branch and fails every tick -- and discardTornClone only runs in
 			// boot(), so recovery would wait for the startup probe to kill the container (600s on
 			// defaults). Doing it now re-arms BootstrapClone on the very next tick.
-			a.discardTornClone()
+			a.discardTornClone(ctx)
 			return err
 		}
 		a.endClone()
@@ -1157,7 +1157,18 @@ func (a *agent) finishInitdbNative(ctx context.Context, nid mechanism.NodeIdenti
 // removal, and EnsureConfdInclude converges either way.
 func (a *agent) ensureConfdInclude() error {
 	entries, err := os.ReadDir(confdDir)
-	if err != nil || len(entries) == 0 {
+	if os.IsNotExist(err) {
+		return nil // the chart mounts this only when a conf.d feature is enabled
+	}
+	if err != nil {
+		// NOT the same as "the feature is off" (#288 review). A mount or permission problem here
+		// would otherwise bring the cluster up with no include_dir at all -- every
+		// postgresql.configuration / TLS / audit / archive_mode setting silently absent, cloned
+		// to every standby -- and the later repair appends include_dir AFTER the agent's own
+		// include, inverting the precedence this function is ordered to protect.
+		return fmt.Errorf("bootstrap initdb: read %s: %w", confdDir, err)
+	}
+	if len(entries) == 0 {
 		return nil
 	}
 	if err := pgconf.EnsureConfdInclude(filepath.Join(a.cfg.PGDATA, "postgresql.conf"), confdDir, true); err != nil {
@@ -1216,15 +1227,32 @@ func (a *agent) endClone() {
 	}
 }
 
-// discardTornClone wipes a data directory left behind by an interrupted base backup, so the
-// reconcile loop sees an empty PGDATA and re-arms BootstrapClone (#288 review). Called from
-// boot, before anything reads the directory's state.
-func (a *agent) discardTornClone() {
+// discardTornClone wipes a data directory left behind by an INTERRUPTED base backup, so the
+// reconcile loop sees an empty PGDATA and re-arms BootstrapClone (#288 review).
+//
+// The marker alone is not sufficient evidence, and treating it as such was destructive
+// (#288 review, round 4). Native.Clone ends by calling Follow, which makes a psql round-trip to
+// the upstream, and ReclonePreserving can fail at its rename or while removing its backup copy --
+// so a Clone error very often means "the base backup COMPLETED and something after it failed".
+// Wiping then would destroy a finished multi-hour backup over a transient blip, or throw away the
+// only copy of a diverged node's un-replicated data.
+//
+// pg_controldata is the discriminator: it reads pg_control, which pg_basebackup writes LAST
+// precisely so an interrupted copy is detectable. If it parses, the directory is a complete
+// cluster and must be kept whatever else failed; if it does not, the copy is torn and unusable.
+func (a *agent) discardTornClone(ctx context.Context) {
 	if _, err := os.Stat(a.cloneMarkerPath()); err != nil {
-		return // no interrupted clone
+		return // no clone was in flight
 	}
 	if !process.HasData(a.cfg.PGDATA) {
-		// The clone never got far enough to write PG_VERSION; nothing to discard.
+		// Never got as far as PG_VERSION; nothing to discard.
+		a.endClone()
+		return
+	}
+	if _, err := pg.ReadControlData(ctx, pg.OSExec{}, a.pgControlDataBin, a.cfg.PGDATA); err == nil {
+		// Complete cluster: the base backup finished and only a later step failed. Keep it and
+		// clear the marker so a later boot does not reconsider.
+		a.log.Info("the base backup completed; keeping the data directory (a later step failed, #288)")
 		a.endClone()
 		return
 	}
@@ -1526,7 +1554,7 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 		// data directory's worth of PVC space.
 		a.beginClone()
 		if err := a.mech.ReclonePreserving(ctx, a.peerMechConn(target)); err != nil {
-			a.discardTornClone()
+			a.discardTornClone(ctx)
 			return err
 		}
 		a.endClone()
@@ -1651,6 +1679,15 @@ func (a *agent) topologyTick(ctx context.Context) {
 	// on a perfectly healthy cluster, and the gap warning would never clear. The count is only
 	// meaningful in a star topology.
 	if a.cfg.CascadeReplication {
+		a.metr.SetTopology(observe.TopologyStats{Streaming: countStreamingReplicas(rows)})
+		return
+	}
+	// The expected count needs the live pod set, and that is an uncached apiserver LIST. Under
+	// the repmgr mechanism reconcileSlots returns before its own livePodOrdinals, so charging
+	// every existing install a second LIST per primary tick for a purely observational gauge is
+	// not a trade worth making (#288 review). Publish what the primary can see on its own; the
+	// expected/gap half is native-only, where the same LIST is already being made.
+	if a.cfg.Mechanism != config.MechanismNative {
 		a.metr.SetTopology(observe.TopologyStats{Streaming: countStreamingReplicas(rows)})
 		return
 	}

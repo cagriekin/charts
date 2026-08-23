@@ -2916,6 +2916,20 @@ casc_standalone=$(helm template test-pg "${CHART_DIR}" \
 assert_not_contains "#29: standalone never gets CASCADE_REPLICATION (agent-only)" "${casc_standalone}" "CASCADE_REPLICATION"
 
 # ======================================================================
+# #288: shared_preload_libraries must not carry repmgr under the native mechanism. These
+# fragments load via conf.d's include_dir, so they would OVERRIDE the entrypoint's native gate
+# and put repmgr.so back on a cluster that has no repmgr extension -- making every native
+# cluster unstartable the moment #290/#294 drop the package from the image.
+spl_native=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.agent.mechanism=native \
+  --set postgresql.majorVersion=18 \
+  --set postgresql.audit.enabled=true 2>&1)
+assert_contains "#288: native preloads pgaudit without repmgr" "${spl_native}" "shared_preload_libraries = 'pgaudit'"
+assert_not_contains "#288: native does not preload repmgr" "${spl_native}" "shared_preload_libraries = 'repmgr"
+# The default mechanism must be untouched.
+spl_repmgr=$(helm template test-pg "${CHART_DIR}" --set postgresql.audit.enabled=true 2>&1)
+assert_contains "#288: repmgr mode still preloads repmgr" "${spl_repmgr}" "shared_preload_libraries = 'repmgr,pgaudit'"
+
 # #288: MECHANISM must reach the INIT container, not just the postgresql one. Without it the
 # init container's shell gate can never fire, so native standbys keep polling repmgr.nodes for
 # a registration that never comes and sit in Init:CrashLoopBackOff forever. Occurrence count,

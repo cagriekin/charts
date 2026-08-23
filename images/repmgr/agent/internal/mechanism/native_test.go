@@ -771,3 +771,25 @@ func TestNativeApplicationNameSelfHealsAForeignValue(t *testing.T) {
 		t.Errorf("application_name appears %d times, want 1:\n%s", n, got)
 	}
 }
+
+// #288 review: the ordinal-collision case the pg-0/pg-1 test could not expose. A substring test
+// for "application_name=pg-1" is satisfied by an inherited "application_name=pg-10", so with 11+
+// replicas the foreign value was kept and pg-1 advertised itself as pg-10.
+func TestNativeApplicationNameGuardComparesWholeTokens(t *testing.T) {
+	n, dataDir := newTestNativeWithSlot(t, &fakeRunner{}, "pg_ha_slot_1")
+	n.NodeName = "pg-1"
+	if err := n.writeManagedConf("host=pg-0.hl user=repmgr dbname=repmgr application_name=pg-10"); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.GenerateConfig(context.Background(), NodeIdentity{DataDir: dataDir}, ConfigOpts{}); err != nil {
+		t.Fatalf("GenerateConfig: %v", err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	got := string(b)
+	if strings.Contains(got, "application_name=pg-10") {
+		t.Errorf("pg-1 kept pg-10's application_name (substring collision):\n%s", got)
+	}
+	if !strings.Contains(got, "application_name=pg-1\n") && !strings.Contains(got, "application_name=pg-1'") {
+		t.Errorf("pg-1 did not adopt its own application_name:\n%s", got)
+	}
+}
