@@ -128,10 +128,14 @@ func (f *fakePostmaster) Stop(ctx context.Context, m process.StopMode) error {
 func (f *fakePostmaster) Reload(context.Context) error { f.reloaded = true; return nil }
 func (f *fakePostmaster) Running() bool                { return f.running }
 
-type fakeDCS struct{ released bool }
+type fakeDCS struct {
+	released bool
+	// leader lets a test hold the lease. Default false, matching every pre-existing use.
+	leader bool
+}
 
 func (f *fakeDCS) Run(context.Context, string, dcs.Callbacks) {}
-func (f *fakeDCS) IsLeader() bool                             { return false }
+func (f *fakeDCS) IsLeader() bool                             { return f.leader }
 func (f *fakeDCS) Leader() string                             { return "" }
 func (f *fakeDCS) Release()                                   { f.released = true }
 
@@ -207,7 +211,7 @@ func newFollowTestAgentWithPM(t *testing.T, ex *scriptedExec, pm *fakePostmaster
 			RenewDeadline:   2 * time.Second,
 		},
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		dcs:    &fakeDCS{},
+		dcs:    &fakeDCS{leader: true},
 		mech:   m,
 		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
 		sup:    process.NewSupervisor(pm),
@@ -1253,7 +1257,7 @@ func newBootstrapTestAgentWithPM(t *testing.T, ex *initdbExec, mech string, pm *
 			Mechanism: mech, PgHbaPeerCIDR: "10.0.0.0/8", RenewDeadline: 2 * time.Second,
 		},
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		dcs:    &fakeDCS{},
+		dcs:    &fakeDCS{leader: true},
 		mech:   m,
 		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
 		sup:    process.NewSupervisor(pm),
@@ -1393,5 +1397,117 @@ func TestNativePathsCarryNoRepmgrNodeID(t *testing.T) {
 	// The offset must still be reversible for legacy slot reclaim -- #294 must not delete it.
 	if ord, ok := slotOrdinal("repmgr_slot_1002"); !ok || ord != 2 {
 		t.Errorf("legacy slot reclaim broken: slotOrdinal(repmgr_slot_1002) = (%d,%v)", ord, ok)
+	}
+}
+
+// #288 review: the initdb exec is deliberately not fence-bounded, so the lease can flip during
+// it -- and OnLost blocks on opMu until act() returns. Starting anyway would give the cluster
+// two nodes that each initdb'd their own data with different system_identifiers, which
+// assertSameCluster then refuses to rejoin. Exactly what this branch exists to prevent.
+func TestBootstrapInitdbNativeDoesNotStartAfterLosingTheLease(t *testing.T) {
+	ex := &initdbExec{}
+	pm := &fakePostmaster{}
+	a := newBootstrapTestAgentWithPM(t, ex, config.MechanismNative, pm)
+	a.dcs = &fakeDCS{leader: false} // the lease flipped while initdb ran
+	if err := a.act(context.Background(),
+		reconcile.Decision{Action: reconcile.BootstrapInitdb},
+		reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if len(ex.calls) != 1 {
+		t.Fatalf("want the initdb attempt recorded, got %v", ex.calls)
+	}
+	if pm.started {
+		t.Error("started read-write after losing the lease: a second cluster")
+	}
+	if a.servingRW.Load() {
+		t.Error("armed servingRW after losing the lease")
+	}
+}
+
+// #288 review: a clone in flight opens its own replication connection (pg_basebackup -X
+// stream). Counting it inflated the replica count, and taking its application_name at face
+// value hid the pod the slot would have identified.
+func TestTopologyIgnoresTheBaseBackupConnection(t *testing.T) {
+	ex := &slotExec{rows: "pg_basebackup|pg_ha_slot_1|streaming\n"}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.base = "pg"
+	a.topologyTick(context.Background())
+	body := scrapeMetrics(t, a)
+	if !strings.Contains(body, "pg_ha_agent_replicas_streaming 0") {
+		t.Errorf("a pg_basebackup connection counted as a streaming replica:\n%s", body)
+	}
+	if !strings.Contains(body, "pg_ha_agent_replicas_unidentified 0") {
+		t.Errorf("a skipped clone connection was also counted as unidentified:\n%s", body)
+	}
+	// And an application_name that is not a pod of this StatefulSet must fall through to the
+	// slot rather than being trusted.
+	if got := a.resolveReplicaPod(pg.ReplicaRow{AppName: "pg_basebackup", SlotName: "pg_ha_slot_1"}); got != "pg-1" {
+		t.Errorf("resolveReplicaPod trusted a non-pod application_name: got %q, want pg-1", got)
+	}
+	if got := a.resolveReplicaPod(pg.ReplicaRow{AppName: "some-other-sts-3", SlotName: ""}); got != "" {
+		t.Errorf("resolveReplicaPod accepted a pod name from another StatefulSet: %q", got)
+	}
+}
+
+// #288 review: .pgpass must be attempted BEFORE the managed config. It writes to the postgres
+// user's home, so it is the one boot step that can succeed on a fresh native install where
+// PGDATA does not exist yet -- and with the old ordering native's GenerateConfig failed first
+// and returned, so the credential was never written. A standby then cloned fine and sat
+// Running-but-NotReady forever, its walreceiver failing `fe_sendauth: no password supplied`.
+//
+// Asserted through the ERROR IDENTITY: with an absent PGDATA both steps fail in this
+// environment, so whichever one boot reports is the one it ran first.
+func TestBootAttemptsPgpassBeforeConfigGeneration(t *testing.T) {
+	ex := &scriptedExec{}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.Mechanism = config.MechanismNative
+	a.cfg.PGDATA = filepath.Join(t.TempDir(), "absent")
+	a.mech = mechanism.NewNative(a.cfg.PGDATA, "/usr/lib/postgresql/18/bin", "pw", "pg_ha_slot_0", "pg-0")
+	err := a.boot(context.Background())
+	if err == nil {
+		t.Skip("this environment can write the fixed .pgpass path; the ordering assertion needs it to fail")
+	}
+	if !strings.Contains(err.Error(), "pgpass") {
+		t.Errorf("boot reported %q first; .pgpass must be attempted before the managed config, which cannot be written on an absent PGDATA", err)
+	}
+}
+
+// And a GenerateConfig failure on an absent PGDATA must not abort boot: the clone and initdb
+// paths both regenerate the fragment once the directory exists.
+func TestBootToleratesConfigGenerationFailureOnAnAbsentDataDir(t *testing.T) {
+	a := newFollowTestAgent(t, &scriptedExec{})
+	a.cfg.Mechanism = config.MechanismNative
+	a.cfg.PGDATA = filepath.Join(t.TempDir(), "absent")
+	m := mechanism.NewNative(a.cfg.PGDATA, "/usr/lib/postgresql/18/bin", "pw", "pg_ha_slot_0", "pg-0")
+	// GenerateConfig on an absent dir fails; assert the tolerance directly rather than through
+	// boot(), whose fixed .pgpass path is not writable in a sandbox.
+	if err := m.GenerateConfig(context.Background(), mechanism.NodeIdentity{DataDir: a.cfg.PGDATA}, mechanism.ConfigOpts{}); err == nil {
+		t.Skip("GenerateConfig unexpectedly succeeded on an absent data directory")
+	}
+	if process.HasData(a.cfg.PGDATA) {
+		t.Fatal("test setup: the data directory must be absent")
+	}
+}
+
+// #288 review: Follow keeps the SLOT gauges (standbySlotsTick re-publishes them from a
+// standby's own point of view) but must RETRACT the topology ones -- topologyTick reads the
+// PRIMARY's connection list and has no standby equivalent, so a demoted primary would keep
+// exporting its last view for the rest of its process lifetime. That is the max()-across-the-
+// release latching ClearTopology exists to prevent.
+func TestFollowRetractsTopologyButKeepsSlotGauges(t *testing.T) {
+	m := observe.New()
+	m.SetTopology(observe.TopologyStats{Streaming: 2, Expected: 2})
+	m.SetSlots(observe.SlotStats{Total: 3, MaxRetainedWALBytes: 4096})
+	// Mirror act()'s retract switch for the Follow case.
+	m.ClearTopology()
+	rec := httptest.NewRecorder()
+	m.Handler(time.Minute).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, "pg_ha_agent_replicas_expected 0") {
+		t.Errorf("topology gauges survived a Follow, so a demoted primary latches them:\n%s", body)
+	}
+	if !strings.Contains(body, "pg_ha_agent_replication_slot_max_retained_wal_bytes 4096") {
+		t.Errorf("slot gauges were retracted on Follow; a standby pinning WAL must stay visible:\n%s", body)
 	}
 }

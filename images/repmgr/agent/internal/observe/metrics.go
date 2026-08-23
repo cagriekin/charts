@@ -37,18 +37,19 @@ type Metrics struct {
 	// max_slot_wal_keep_size = 4GB -- PostgreSQL invalidates it and the standby behind it
 	// can only recover by a full re-clone. Hence a metric and an alert, not just a log line.
 	// Zeroed on demotion (ClearSlots): only the primary observes slots.
-	// Replication topology as the primary last observed it (#288). Derived from
-	// pg_stat_replication, which replaced repmgr.nodes as the topology source: a departed pod
-	// is simply absent from the primary's connection list, so there is no stale row to strand
-	// the way #139's ghost records did.
-	topologyStreaming       atomic.Int64
-	topologyExpected        atomic.Int64
-	topologyUnidentified    atomic.Int64
 	slotsTotal              atomic.Int64
 	slotsInactive           atomic.Int64
 	slotsInvalidated        atomic.Int64
 	slotMaxRetainedWALBytes atomic.Int64
-	now                     func() time.Time
+	// Replication topology as the primary last observed it (#288), derived from
+	// pg_stat_replication -- which replaced repmgr.nodes as the topology source: a departed pod
+	// is simply absent from the primary's connection list, so there is no stale row to strand
+	// the way #139's ghost records did. Zeroed on demotion (ClearTopology): only the primary
+	// observes this, and topologyTick has no standby equivalent, so a Follow retracts it.
+	topologyStreaming    atomic.Int64
+	topologyExpected     atomic.Int64
+	topologyUnidentified atomic.Int64
+	now                  func() time.Time
 }
 
 // SlotStats is the aggregate slot picture the primary publishes each tick (#289).

@@ -380,15 +380,30 @@ func (a *agent) boot(ctx context.Context) error {
 		ReplUser: a.cfg.RepmgrUser,
 		ReplDB:   a.cfg.RepmgrDB,
 	}
-	if err := a.mech.GenerateConfig(ctx, nid, mechanism.ConfigOpts{Failover: "manual", UseReplicationSlots: true}); err != nil {
-		return err
-	}
 	// Streaming replication authenticates as the repmgr user via primary_conninfo,
 	// which is deliberately passwordless (the password is not stored in repmgr.conf
 	// -- the PR1 hardening). Without a credential the standby's walreceiver fails
 	// with "no password supplied", so write a 0600 ~/.pgpass libpq picks up.
+	//
+	// FIRST, before GenerateConfig (#288 review). It writes to the postgres user's home, not
+	// to PGDATA, so it is the one step here that always CAN succeed -- and on a fresh native
+	// install PGDATA does not exist yet, so native's GenerateConfig legitimately fails
+	// (writeManagedConf cannot create a temp file in a directory that is not there). With the
+	// old ordering that failure returned early and the credential was never written, so every
+	// native standby cloned successfully and then sat Running-but-NotReady forever with its
+	// walreceiver failing `fe_sendauth: no password supplied`.
 	if err := a.writePgpass(); err != nil {
 		return err
+	}
+	// Best-effort, for the same reason: on an empty PGDATA there is nothing to write the
+	// managed fragment into yet. The clone and initdb paths both regenerate it once the
+	// directory exists (Native.Clone -> Follow, and bootstrapInitdbNative), so a failure here
+	// must not abandon the rest of boot.
+	if err := a.mech.GenerateConfig(ctx, nid, mechanism.ConfigOpts{Failover: "manual", UseReplicationSlots: true}); err != nil {
+		if process.HasData(a.cfg.PGDATA) {
+			return err
+		}
+		a.log.Info("deferring config generation until the data directory exists", "err", err)
 	}
 	if !process.HasData(a.cfg.PGDATA) {
 		return nil
@@ -657,7 +672,15 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 	// new primary or been resolved outright. Retracting is a no-op on a node that never
 	// published any.
 	switch dec.Action {
-	case reconcile.Promote, reconcile.StayPrimary, reconcile.Follow:
+	case reconcile.Promote, reconcile.StayPrimary:
+	case reconcile.Follow:
+		// Follow keeps the SLOT gauges: standbySlotsTick re-publishes them from a standby's own
+		// point of view, so a leftover slot pinning WAL on this node stays visible. Topology has
+		// no standby equivalent -- topologyTick reads the PRIMARY's connection list -- so it must
+		// be retracted here, or a demoted primary would keep exporting the last view it had
+		// (#288 review). That is precisely the max()-across-the-release latching ClearTopology
+		// exists to prevent.
+		a.metr.ClearTopology()
 	default:
 		a.metr.ClearSlots()
 		a.metr.ClearTopology()
@@ -1019,6 +1042,16 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 	if err := a.writePgHba(); err != nil {
 		return fmt.Errorf("bootstrap initdb: write pg_hba: %w", err)
 	}
+	// Holdership re-check before going read-write (#288 review). The exec above is
+	// deliberately not fence-bounded -- initdb plus role/database creation is legitimately
+	// slower than a failover window -- but that means the lease can flip during it, and OnLost
+	// blocks on opMu until act() returns. Starting anyway would give the cluster two nodes that
+	// each initdb'd their own data with different system_identifiers, which assertSameCluster
+	// then refuses to rejoin: exactly the outcome this whole branch exists to prevent.
+	if !a.dcs.IsLeader() {
+		a.log.Warn("lost the lease during initdb; not starting read-write (#288)")
+		return nil
+	}
 	if err := a.sup.Start(ctx); err != nil {
 		return fmt.Errorf("bootstrap initdb: start: %w", err)
 	}
@@ -1334,7 +1367,7 @@ func newMechanism(cfg *config.Config, repmgrConf, pgBindir string, log *slog.Log
 		// #289 has landed: the agent now owns physical slot lifecycle in native mode
 		// (create before clone, reconcile against the live pod set on every primary tick,
 		// drop only inactive orphans). Topology (#288) is still the outstanding blocker.
-		log.Warn("using the EXPERIMENTAL native mechanism: topology still comes from repmgr.nodes (#288), so this is not yet usable for a real cluster",
+		log.Warn("using the EXPERIMENTAL native mechanism: runs a real multi-node cluster since #288 (topology from pg_stat_replication, agent-owned bootstrap), but cascadingReplication is unsupported and an existing repmgr cluster cannot be migrated in place yet (#292)",
 			"mechanism", cfg.Mechanism)
 		// PodName is passed twice by design: once derived into the slot name (#289) and once
 		// verbatim as application_name (#288). Both are this node's identity, but they land in
@@ -1427,6 +1460,12 @@ func (a *agent) topologyTick(ctx context.Context) {
 	live, liveErr := a.livePodOrdinals(ctx)
 	selfOrd, selfOK := podOrdinal(a.cfg.PodName)
 	var expected int64
+	if liveErr != nil {
+		// Publishing Expected: 0 silently would read as "nothing should be streaming" and
+		// quieten any expected-vs-streaming alert during an apiserver blip. slotsTick warns on
+		// the identical failure; match it.
+		a.log.Warn("list live pods for the topology view; expected count unavailable this tick", "err", liveErr)
+	}
 	if liveErr == nil {
 		for ord := range live {
 			if selfOK && ord == selfOrd {
@@ -1441,6 +1480,9 @@ func (a *agent) topologyTick(ctx context.Context) {
 	for _, r := range rows {
 		if !r.Streaming() {
 			continue // exists, but still catching up: not yet a usable replica
+		}
+		if isCloneConnection(r) {
+			continue // a base backup in flight, not a replica
 		}
 		streaming++
 		if pod := a.resolveReplicaPod(r); pod != "" {
@@ -1490,14 +1532,26 @@ func (a *agent) topologyTick(ctx context.Context) {
 // primary at once. Returns "" when neither source identifies the pod, which the caller counts
 // rather than hides.
 func (a *agent) resolveReplicaPod(r pg.ReplicaRow) string {
-	if n := r.AppName; n != "" && n != libpqDefaultAppName {
-		return n
+	// Only an application_name that actually names a pod of THIS StatefulSet is trusted. A
+	// clone in progress opens a second replication connection of its own -- pg_basebackup
+	// -X stream reports application_name='pg_basebackup' (#288 review) -- and taking that at
+	// face value both inflated the streaming count and hid the real pod, because the slot
+	// fallback that would have identified it was never consulted.
+	if ord, ok := podOrdinal(r.AppName); ok && r.AppName == fmt.Sprintf("%s-%d", a.base, ord) {
+		return r.AppName
 	}
 	if ord, ok := slotOrdinal(r.SlotName); ok {
 		return fmt.Sprintf("%s-%d", a.base, ord)
 	}
 	return ""
 }
+
+// isCloneConnection reports whether a pg_stat_replication row is a base backup rather than a
+// standby streaming WAL (#288 review). pg_basebackup -X stream shows up as a second streaming
+// connection for the duration of every clone -- fresh install, scale-up, re-clone -- and
+// counting it would inflate the replica count while the pod it belongs to is still not
+// replicating.
+func isCloneConnection(r pg.ReplicaRow) bool { return r.AppName == "pg_basebackup" }
 
 // libpqDefaultAppName is what a replication connection reports when primary_conninfo carries no
 // application_name -- i.e. any standby cloned before #288. It is a sentinel to fall back FROM,

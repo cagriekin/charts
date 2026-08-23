@@ -2928,8 +2928,16 @@ assert_eq "#288: MECHANISM reaches both the init and postgresql containers" "2" 
   "$(printf '%s\n' "${mech_native_res}" | grep -c 'name: MECHANISM')"
 # Specifically on repmgr-init, so a future refactor cannot satisfy the count with two copies
 # on the same container.
-mech_init_block=$(printf '%s\n' "${mech_native_res}" | sed -n '/name: repmgr-init/,/name: fix-permissions/p')
+# End anchor must render AFTER the start: fix-permissions is init container 1 and repmgr-init is
+# container 4, so `/repmgr-init/,/fix-permissions/` ran to EOF and swallowed the postgresql
+# container's MECHANISM too -- the assertion could not fail, which is the exact bug its own
+# comment claimed to guard against. `- name: postgresql` is the next container after the init
+# list, so it is a real terminator.
+mech_init_block=$(printf '%s\n' "${mech_native_res}" | sed -n '/name: repmgr-init/,/^        - name: postgresql$/p')
 assert_contains "#288: repmgr-init carries MECHANISM" "${mech_init_block}" "name: MECHANISM"
+# And prove the range is actually bounded: exactly one MECHANISM inside it, not both.
+assert_eq "#288: the repmgr-init range is bounded (one MECHANISM, not the whole render)" "1" \
+  "$(printf '%s\n' "${mech_init_block}" | grep -c 'name: MECHANISM')"
 # The default (repmgr) render must not gain the variable at all -- that is what keeps every
 # existing release byte-identical.
 mech_default_res=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1)

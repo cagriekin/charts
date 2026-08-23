@@ -87,6 +87,13 @@ postgresql:
   # WAL replay can take longer still, both of which can exceed the ~130s
   # liveness budget. failureThreshold x periodSeconds is the total startup
   # budget (600s here); keep the steady-state livenessProbe window tight.
+  # #288 NOTE for `repmgr.agent.mechanism: native`: a standby's FIRST clone moves from the
+  # init container (where no probe applies) into the main container, so it now runs inside this
+  # budget -- periodSeconds x failureThreshold. A pg_basebackup of a large existing cluster that
+  # exceeds it gets the container killed, and the restart finds a partially-written PGDATA
+  # (PG_VERSION present, so HasData is true) that PostgreSQL cannot start: a loop rather than a
+  # slow success. Raise failureThreshold for native installs whose base backup can outlast the
+  # default 600s.
   startupProbe:
     enabled: true
     periodSeconds: 10

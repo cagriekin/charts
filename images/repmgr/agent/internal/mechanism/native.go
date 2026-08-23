@@ -17,10 +17,13 @@ import (
 // timeline/LSN election, fencing and Service routing all live in reconcile, which imports
 // only the Mechanism interface. Only the mechanics differ -- that is what the seam is for.
 //
-// EXPERIMENTAL and not usable on its own: topology still comes from repmgr.nodes (#288),
-// so a standby has no upstream to choose. Replication slot ownership (#289) HAS landed --
-// this mechanism creates its own slot before every clone/rejoin and the primary reconciles
-// the set each tick -- so the WAL-recycling gap is closed. #294 promotes it to supported.
+// EXPERIMENTAL, but it runs a real multi-node cluster since #288: topology comes from
+// pg_stat_replication (identified by the application_name this mechanism writes into
+// primary_conninfo, or by the ordinal-named slot), and the bootstrap is the agent's -- the
+// lease holder initdbs, everyone else clones. Slot ownership (#289) creates this node's slot
+// before every clone/rejoin. Remaining gaps: cascadingReplication is render-rejected with this
+// mechanism, and an existing repmgr cluster cannot be migrated in place yet (#292). #294
+// promotes it to supported and flips the default.
 //
 // Every binary is resolved under PGBindir rather than PATH: the image ships exactly one
 // PostgreSQL major and the agent must exec that major's tools, not whatever PATH resolves
