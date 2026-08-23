@@ -130,6 +130,22 @@ assert_eq "a primary still serves after scale-down + cleanup" "t" "${serves}"
 agent_slots=$(pg_exec "${NAMESPACE}" "${P}" \
   "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
 if [ "$(chart_mechanism)" = "native" ]; then
+  # Wait on the RECLAIM, not on the stream stopping (#288 review). in_topology going to 0 under
+  # native only means pod-2's row left pg_stat_replication, which happens the instant its stream
+  # drops -- seconds before the primary's next slotsTick observes the shrunken live pod set and
+  # drops pg_ha_slot_2. Reading the slot counts straight after that loop raced the tick. Under
+  # repmgr the equivalent wait was on repmgr.nodes, i.e. on the primary tick itself having run.
+  echo "  Waiting for the primary to reclaim pg_ha_slot_2 (up to 120s)..."
+  reclaimed=0; elapsed=0
+  while [[ ${elapsed} -lt 120 ]]; do
+    left=$(pg_exec "${NAMESPACE}" "${P}" \
+      "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
+    if [[ "${left}" == "0" ]]; then reclaimed=1; break; fi
+    sleep 5; elapsed=$((elapsed + 5))
+  done
+  assert_eq "#289/#288: the primary reclaimed the departed ordinal's slot" "1" "${reclaimed}"
+  agent_slots=$(pg_exec "${NAMESPACE}" "${P}" \
+    "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
   # #288: the assertion inverts. Native owns its slots, so after scaling 3 -> 2 there must be
   # exactly one agent-minted slot -- ordinal 1, the surviving peer. The primary does not stream
   # from itself, and ordinal 2 is gone.
