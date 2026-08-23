@@ -448,7 +448,7 @@ tests:
         - /usr/lib/x86_64-linux-gnu/libsodium.so.23
     asserts:
       - failedTemplate:
-          errorMessage: "postgresql.extensions.extraLibs is set but postgresql.extensions.packages is empty -- extraLibs' copy step only runs alongside the packages apt-get install, so it has nothing to do without at least one package that needs it."
+          errorMessage: "postgresql.extensions.extraLibs is set but neither postgresql.extensions.packages nor postgresql.extensions.image.repository is -- extraLibs' copy step runs alongside one of those two (the apt-get install, or the prebuilt-image copy), so it has nothing to do without one of them."
 
   - it: extraLibs without extensions.enabled fails render
     templates:

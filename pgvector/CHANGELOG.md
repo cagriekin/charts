@@ -1,5 +1,35 @@
 # pgvector chart changelog
 
+## 1.15.0 - 2026-08-23
+
+Inherited from pg: same templates, same extension init containers. `postgresql.extensions`
+gains `env`, `envFrom`, `extraVolumes` and `extraVolumeMounts` (#320), so the `apt-get` steps
+in `copy-ext`/`copy-base-ext` can be pointed at an in-cell apt mirror or proxy -- under a
+default-deny egress policy the cost of the install is the external HOSTS it forces into the
+platform's baseline allow (`apt.postgresql.org`, `repo.pigsty.io`, and `deb.debian.org` for a
+single transitive `libsodium23`), and one `http_proxy` replaces all three. All four apply to
+both init containers and to neither the postgresql container, render only while `packages` is
+non-empty, and are rejected at render time when they would be silently inert or would shadow
+the chart's own volumes and install paths. A `pgdg` entry in `aptSources` is now refused too:
+both images already configure PGDG under their own keyring, so a second entry made apt reject
+the whole source list.
+
+`postgresql.extensions.image` goes further and takes the install off the pod-start path
+entirely: the packages are resolved once at build time (recipe in `images/pg-extensions/`) and
+a third init container does a plain `cp`, so there is no egress at pod start at all and no
+root -- which means it works in a PSA-`restricted` namespace, where the apt path cannot run.
+Mutually exclusive with `packages`/`aptSources`; `extraLibs` still applies, reading from the
+prebuilt image. See the [pg 1.15.0 changelog](../pg/CHANGELOG.md) and the
+[pg chart README](../pg/README.md#pointing-the-extension-install-at-an-apt-mirror-or-proxy-320).
+
+**Migrating from 1.14.1:** for almost everyone, nothing to do; the default render is
+byte-identical. Two inherited changes can fail an upgrade that previously succeeded, both
+turning a runtime failure into a render-time one: every image block now requires a tag or a
+digest and a non-empty repository (so a values file that clears a tag without setting a digest
+fails at `helm upgrade` instead of producing an `InvalidImageName` pod), and a `pgdg` entry in
+`aptSources` is rejected. A digest-only pin, which previously rendered the unparseable
+`repo:@sha256:...`, now works.
+
 ## 1.14.1 - 2026-08-22
 
 Inherited from pg: same agent and image. See the [pg 1.14.1 changelog](../pg/CHANGELOG.md)

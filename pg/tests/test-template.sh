@@ -572,6 +572,340 @@ apt_line_comma_res=$(helm template test-pg "${CHART_DIR}" --set postgresql.major
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#310: aptLine with a comma (multi-arch syntax) renders" "${apt_line_comma_res}" 'arch=amd64,arm64'
 
+# #320: extensions.env/envFrom/extraVolumes/extraVolumeMounts point the apt steps at an
+# in-cell mirror or proxy, so an install under a default-deny egress policy needs no
+# external host opened at all. Rendered on BOTH init containers -- occurrence counts, not
+# just presence: getting it onto only one leaves half the install still going direct.
+ext_proxy_res=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_eq "#320: http_proxy env on both extension init containers" "2" \
+  "$(printf '%s\n' "${ext_proxy_res}" | grep -c 'value: http://apt-proxy.infra.svc:3142')"
+assert_eq "#320: envFrom on both extension init containers" "2" \
+  "$(printf '%s\n' "${ext_proxy_res}" | grep -c 'name: apt-proxy-env')"
+assert_eq "#320: extraVolumeMounts on both extension init containers" "2" \
+  "$(printf '%s\n' "${ext_proxy_res}" | grep -c 'mountPath: /etc/apt/apt.conf.d/01proxy')"
+# The volume itself must reach the POD, exactly once -- a mount naming a volume the pod
+# does not declare is rejected by the kubelet at apply time, not by helm.
+assert_eq "#320: extraVolumes reaches the pod exactly once" "1" \
+  "$(printf '%s\n' "${ext_proxy_res}" | grep -c '^        - configMap:')"
+# The postgresql container must NOT inherit any of it: an http_proxy in the postmaster's
+# own environment silently redirects anything else that reads it, and an apt.conf mount
+# there is meaningless. Asserted by counting the whole render -- 2 is both init
+# containers and nothing else.
+assert_not_contains "#320: no apt proxy volume on the postgresql container" \
+  "$(printf '%s\n' "${ext_proxy_res}" | sed -n '/name: postgresql$/,/^        - name: /p')" \
+  "01proxy"
+
+# #320: the prebuilt-image path -- the one that takes the install off the pod-start path
+# entirely rather than just redirecting where it fetches from.
+ext_prebuilt_res=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-prebuilt.yaml" \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#320: prebuilt path renders the copy-prebuilt-ext init container" "${ext_prebuilt_res}" "name: copy-prebuilt-ext"
+# {major} in the tag substitutes postgresql.majorVersion, same as in packages/aptLine -- an
+# extension .so built for the wrong major does not load at all, so the major must not have
+# to be repeated by hand in two places.
+assert_contains "#320: {major} substitutes in the prebuilt image tag" "${ext_prebuilt_res}" "registry.internal/pg-extensions:18-supabase"
+# The whole point: NO apt-get anywhere in the render. If this ever regresses, the feature
+# has silently stopped delivering the thing it exists for.
+assert_not_contains "#320: the prebuilt path runs no apt-get at all" "${ext_prebuilt_res}" "apt-get"
+# And no root: the apt path must REPLACE containerSecurityContext with runAsUser: 0 (dpkg
+# needs it), which a PSA-restricted namespace rejects outright. A plain cp does not, so this
+# path works where the apt path cannot run -- asserted by confining runAsUser: 0 to
+# fix-permissions (#162), which is present on the default render too.
+ext_prebuilt_root_containers=$(printf '%s\n' "${ext_prebuilt_res}" \
+  | awk '/^        - name: /{c=$NF} /runAsUser: 0/{print c}' | sort -u | tr '\n' ' ')
+assert_eq "#320: the prebuilt path adds no root container" "fix-permissions " "${ext_prebuilt_root_containers}"
+# -n (no-clobber) and LAST of the three: copy-base-ext populated ext-lib from the image that
+# actually RUNS the server, and this is an independent build that can sit on a different
+# point release -- an unconditional copy would overwrite a core lib (libpqwalreceiver.so)
+# with one the running postmaster never linked against (#302).
+# Substring chosen to avoid the glob: assert_contains uses shell pattern matching, so a
+# literal *.so* in the needle would match anything.
+assert_contains "#320: the prebuilt copy is no-clobber" "${ext_prebuilt_res}" "cp -n /usr/lib/postgresql/18/lib/"
+assert_contains "#320: the prebuilt copy also no-clobbers the extension control files" "${ext_prebuilt_res}" "cp -n /usr/share/postgresql/18/extension/"
+ext_prebuilt_order=$(printf '%s\n' "${ext_prebuilt_res}" | grep -n 'name: copy-' | tr '\n' ' ')
+assert_contains "#320: copy-prebuilt-ext runs after copy-base-ext" "${ext_prebuilt_order}" "copy-base-ext"
+ext_prebuilt_last=$(printf '%s\n' "${ext_prebuilt_res}" | grep 'name: copy-' | tail -1)
+assert_contains "#320: copy-prebuilt-ext is the last extension init container" "${ext_prebuilt_last}" "copy-prebuilt-ext"
+# extraLibs must work on this path too -- it names paths inside whichever container copies,
+# and that equivalence is what lets a values file move from packages to image unchanged.
+assert_contains "#320: extraLibs is copied from the prebuilt image" "${ext_prebuilt_res}" "cp -n /usr/lib/x86_64-linux-gnu/libsodium.so.23 /ext-extra-lib/"
+
+# #320: image and packages both populate the same volumes with a no-clobber copy, so which
+# build wins would be decided by init-container ORDER rather than by the values file -- a
+# version-pinned package could silently lose to whatever the image contains.
+ext_img_pkgs_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-prebuilt.yaml" \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_img_pkgs_rc=$?
+assert_eq "#320: image plus packages fails the render" "1" "${ext_img_pkgs_rc}"
+
+# #320: an untagged reference resolves to :latest, which for an extension image means the
+# .so files can change under a pod restart with nothing in the release changing.
+ext_img_untagged_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set postgresql.extensions.image.repository=registry.internal/pg-extensions \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_img_untagged_rc=$?
+assert_eq "#320: a prebuilt image with neither tag nor digest fails the render" "1" "${ext_img_untagged_rc}"
+
+# #320: a digest alone is a complete pin, so it must satisfy the same guard -- AND render a
+# valid reference. The whole rendered line is asserted, not just the @sha256 substring: the
+# original bug was `repo:@sha256:...` (an empty tag still emitting the colon), which containerd
+# rejects as unparseable -- InvalidImageName, the init container never starts, the pod never
+# comes up. A substring assertion passed on that broken output, which is exactly why this one
+# pins the full string.
+ext_img_digest_res=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set postgresql.extensions.image.repository=registry.internal/pg-extensions \
+  --set postgresql.extensions.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#320: a digest alone renders a valid reference (no empty-tag colon)" "${ext_img_digest_res}" \
+  'image: "registry.internal/pg-extensions@sha256:0000000000000000000000000000000000000000000000000000000000000000"'
+assert_not_contains "#320: no empty-tag colon before the digest" "${ext_img_digest_res}" "pg-extensions:@sha256:"
+# Tag and digest together is legal and means "resolve this digest"; both must appear.
+ext_img_both_res=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set postgresql.extensions.image.repository=registry.internal/pg-extensions \
+  --set postgresql.extensions.image.tag=18-v1 \
+  --set postgresql.extensions.image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#320: tag and digest together render tag@digest" "${ext_img_both_res}" \
+  'image: "registry.internal/pg-extensions:18-v1@sha256:0000000000000000000000000000000000000000000000000000000000000000"'
+
+# #320 review: a tag or digest with no repository renders NOTHING -- no prebuilt container and
+# no error -- so an operator who typoed the repository key believes the prebuilt path is live
+# while the pods still take the plain-copy one.
+ext_img_no_repo_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set postgresql.extensions.image.tag=18-v1 \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_img_no_repo_rc=$?
+assert_eq "#320: an image tag with no repository fails the render" "1" "${ext_img_no_repo_rc}"
+
+# #320 review: nulling the image map (what a values-file merge does when someone clears it)
+# must not produce a bare nil-pointer naming no value.
+ext_img_null_res=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set postgresql.extensions.image=null \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#320: a nulled image map does not nil-pointer" "${ext_img_null_res}" "nil pointer"
+
+# #320 review: the PGDG guard must key on the URL AUTHORITY. A mirror whose PATH merely
+# contains the upstream name is the internal-mirror case this whole change exists to enable,
+# and rejecting it would tell the operator to rely on the image's own configuration -- which
+# points at the public host they cannot reach.
+ext_pgdg_mirror_res=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --set 'postgresql.extensions.aptSources[0].name=mirror' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://mirror.corp/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-mirror-keyring.gpg] https://mirror.corp/apt.postgresql.org/pub/repos/apt trixie-pgdg main' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#320: a mirror with apt.postgresql.org in its PATH is allowed" "${ext_pgdg_mirror_res}" "mirror.corp/apt.postgresql.org"
+
+# #320 review: an image with neither tag nor digest must FAIL, not quietly mean :latest. The
+# first fix for the digest-only bug dropped the colon whenever tag was falsy, which turned a
+# cleared tag (`tag:` with no value -- what a values-file merge produces) from a fast, visible
+# `repo:` failure into an implicit :latest. On a StatefulSet with existing PGDATA a future
+# :latest is a different PostgreSQL major that refuses to start on it. Every image in the chart
+# routes through pg.image, so this is asserted on postgresql.image, not the extension one.
+img_untagged_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false \
+  --set postgresql.replicaCount=0 \
+  --set postgresql.image.tag="" \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || img_untagged_rc=$?
+assert_eq "#320: an image with no tag and no digest fails the render" "1" "${img_untagged_rc}"
+# || true: the render is EXPECTED to fail here, and an unguarded command substitution that
+# exits non-zero aborts the whole suite under set -e.
+img_untagged_out=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 --set postgresql.image.tag="" 2>&1 || true)
+assert_contains "#320: the untagged-image failure names the implicit latest" "${img_untagged_out}" "implicit :latest"
+
+# #320 review: postgresql.extraVolumes lands in the SAME pod volumes list, so a shared name is
+# a duplicate the API server rejects -- the same apply-time-only class as the chart-volume
+# collision, just from the other operator-controlled list.
+ext_vol_userdup_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+  --set 'postgresql.extraVolumes[0].name=apt-proxy-conf' \
+  --set 'postgresql.extraVolumes[0].emptyDir.sizeLimit=1Mi' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_vol_userdup_rc=$?
+assert_eq "#320: an extraVolume colliding with postgresql.extraVolumes fails the render" "1" "${ext_vol_userdup_rc}"
+
+# #320 review: the guard must also protect the paths the copy READS FROM. Mounting over
+# /usr/share/postgresql/<major>/extension makes copy-ext copy the ConfigMap's contents into
+# ext-share instead of the installed extensions -- a silently extension-less cluster, visible
+# only at CREATE EXTENSION.
+for src in /usr/share/postgresql/18/extension /usr/lib/postgresql/18/lib; do
+  ext_mount_src_rc=0
+  helm template test-pg "${CHART_DIR}" \
+    -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+    --set "postgresql.extensions.extraVolumeMounts[0].mountPath=${src}" \
+    --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_mount_src_rc=$?
+  assert_eq "#320: an extraVolumeMount over ${src} fails the render" "1" "${ext_mount_src_rc}"
+done
+
+# #320 review: a mount at or ABOVE an install path shadows it as completely as one at it --
+# /usr/share/postgresql/18 is the parent of the extension dir, and the copy then fails with
+# `cannot stat`, crash-looping the init container.
+for anc in /usr/share/postgresql/18 /usr/lib/postgresql/18; do
+  ext_mount_anc_rc=0
+  helm template test-pg "${CHART_DIR}" \
+    -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+    --set "postgresql.extensions.extraVolumeMounts[0].mountPath=${anc}" \
+    --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_mount_anc_rc=$?
+  assert_eq "#320: an extraVolumeMount over ${anc} (an install path's parent) fails" "1" "${ext_mount_anc_rc}"
+done
+
+# #320 review: with aptSources set, the install step WRITES its own source list and keyring, so
+# a read-only ConfigMap over either directory gets EROFS and aborts the && chain. The README
+# invites that mount, so the combination is likely rather than exotic -- and it must still be
+# allowed when aptSources is empty, which is exactly when replacing sources.list is the point.
+for apt_dir in /etc/apt/sources.list.d /usr/share/keyrings; do
+  ext_mount_apt_rc=0
+  helm template test-pg "${CHART_DIR}" \
+    --set postgresql.extensions.enabled=true \
+    --set postgresql.majorVersion=18 \
+    --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+    --set 'postgresql.extensions.aptSources[0].name=pigsty' \
+    --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+    --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-pigsty-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+    --set 'postgresql.extensions.extraVolumes[0].name=srcs' \
+    --set 'postgresql.extensions.extraVolumes[0].configMap.name=srcs' \
+    --set 'postgresql.extensions.extraVolumeMounts[0].name=srcs' \
+    --set "postgresql.extensions.extraVolumeMounts[0].mountPath=${apt_dir}" \
+    --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_mount_apt_rc=$?
+  assert_eq "#320: mounting over ${apt_dir} alongside aptSources fails the render" "1" "${ext_mount_apt_rc}"
+done
+ext_mount_apt_ok=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --set 'postgresql.extensions.extraVolumes[0].name=srcs' \
+  --set 'postgresql.extensions.extraVolumes[0].configMap.name=srcs' \
+  --set 'postgresql.extensions.extraVolumeMounts[0].name=srcs' \
+  --set 'postgresql.extensions.extraVolumeMounts[0].mountPath=/etc/apt/sources.list.d' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#320: replacing sources.list.d is allowed when aptSources is empty" "${ext_mount_apt_ok}" "mountPath: /etc/apt/sources.list.d"
+
+# #320 review: an empty repository renders ":tag", the same unparseable reference as the
+# empty-tag case.
+img_norepo_rc=0
+helm template test-pg "${CHART_DIR}" --set busyboxImage.repository="" >/dev/null 2>&1 || img_norepo_rc=$?
+assert_eq "#320: an image with an empty repository fails the render" "1" "${img_norepo_rc}"
+
+# #320 review: APT keys the Signed-By conflict on URI *and dist*, and the images configure only
+# <codename>-pgdg -- so a -pgdg-testing suite does not conflict and is a legitimate way to get a
+# newer extension build. Rejecting it left the operator with no route at all.
+ext_pgdg_testing_res=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --set 'postgresql.extensions.aptSources[0].name=pgdgtest' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://apt.postgresql.org/pub/repos/apt/ACCC4CF8.asc' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-pgdgtest-keyring.gpg] http://apt.postgresql.org/pub/repos/apt trixie-pgdg-testing main' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#320: a -pgdg-testing suite on the PGDG host is allowed" "${ext_pgdg_testing_res}" "trixie-pgdg-testing"
+
+# #320 review: mounting INSIDE an install path shadows the tree as completely as mounting on
+# it, and Kubernetes rejects duplicate mountPaths at apply time -- both were render-clean.
+ext_mount_inside_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+  --set 'postgresql.extensions.extraVolumeMounts[0].mountPath=/ext-share/extension' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_mount_inside_rc=$?
+assert_eq "#320: an extraVolumeMount inside /ext-share fails the render" "1" "${ext_mount_inside_rc}"
+ext_mount_dup_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+  --set 'postgresql.extensions.extraVolumes[1].name=second' \
+  --set 'postgresql.extensions.extraVolumes[1].configMap.name=second' \
+  --set 'postgresql.extensions.extraVolumeMounts[1].name=second' \
+  --set 'postgresql.extensions.extraVolumeMounts[1].mountPath=/etc/apt/apt.conf.d/01proxy' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_mount_dup_rc=$?
+assert_eq "#320: a duplicate extraVolumeMount mountPath fails the render" "1" "${ext_mount_dup_rc}"
+
+# #320: with no packages there is no apt-get step at all, so a proxy/mount would be
+# silently ignored -- rejected at render time rather than leaving the operator to conclude
+# the proxy is in effect when it is not.
+ext_proxy_nopkg_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.env[0].name=http_proxy' \
+  --set 'postgresql.extensions.env[0].value=http://p:3142' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_proxy_nopkg_rc=$?
+assert_eq "#320: env without packages fails the render" "1" "${ext_proxy_nopkg_rc}"
+
+# #320: volume names are not merged -- the later entry in the pod's volumes list wins, so
+# reusing a chart volume name would REPLACE the data PVC or the extension tree with a
+# ConfigMap and nothing would report it until the pod was running.
+ext_vol_reserved_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+  --set 'postgresql.extensions.extraVolumes[0].name=data' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_vol_reserved_rc=$?
+assert_eq "#320: an extraVolume reusing a chart volume name fails the render" "1" "${ext_vol_reserved_rc}"
+
+# #320: mounting over a path the install step copies INTO shadows the tree this whole
+# feature exists to populate.
+ext_mount_shadow_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+  --set 'postgresql.extensions.extraVolumeMounts[0].mountPath=/ext-lib' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_mount_shadow_rc=$?
+assert_eq "#320: an extraVolumeMount over /ext-lib fails the render" "1" "${ext_mount_shadow_rc}"
+
+# #320: a mount naming a volume that is not declared fails at APPLY time (the kubelet
+# rejects the pod), so it has to fail at render time instead.
+ext_mount_undeclared_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --set 'postgresql.extensions.extraVolumeMounts[0].name=nope' \
+  --set 'postgresql.extensions.extraVolumeMounts[0].mountPath=/etc/apt/apt.conf.d/01proxy' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_mount_undeclared_rc=$?
+assert_eq "#320: an extraVolumeMount naming an undeclared volume fails the render" "1" "${ext_mount_undeclared_rc}"
+
+# #320: a pgdg aptSources entry is always fatal at apply time (apt rejects the whole
+# source list on a conflicting Signed-By, since both images already configure PGDG under
+# their own keyring path) and the apt error names no values key -- so reject it at render
+# time, where the message can say what to do.
+ext_pgdg_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --set 'postgresql.extensions.aptSources[0].name=pgdg' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://apt.postgresql.org/pub/repos/apt/ACCC4CF8.asc' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-pgdg-keyring.gpg] http://apt.postgresql.org/pub/repos/apt/ trixie-pgdg main' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_pgdg_rc=$?
+assert_eq "#320: a pgdg aptSources entry fails the render" "1" "${ext_pgdg_rc}"
+
+# #320: a non-PGDG source is of course still allowed -- the guard must key on the PGDG
+# host, not on the entry name.
+ext_pigsty_ok=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-pgsodium' \
+  --set 'postgresql.extensions.aptSources[0].name=pgdg' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://repo.pigsty.io/key' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-pgdg-keyring.gpg] https://repo.pigsty.io/apt/pgsql/trixie trixie main' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#320: the PGDG guard keys on the host, not the entry name" "${ext_pigsty_ok}" 'repo.pigsty.io/apt/pgsql/trixie'
+
 # #309: postgresql.extensions.extraLibs copies an exact path into the dedicated
 # ext-extra-lib volume (NOT ext-lib, review -- see below), for a package's own
 # shared-library dependency Debian installs outside the Postgres extension dir (e.g.

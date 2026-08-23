@@ -1,0 +1,14 @@
+# #320: the prebuilt-extension-image path -- packages resolved once at build time
+# (images/pg-extensions/), so the pods do a plain `cp` with no apt-get and no egress on the
+# pod-start path. Shared between test layers. extraLibs is deliberately kept here: it names
+# absolute paths inside whichever container copies, so it must work identically on this path
+# and on the packages path -- that equivalence is what lets a working values file switch.
+postgresql:
+  majorVersion: "18"
+  extensions:
+    enabled: true
+    image:
+      repository: registry.internal/pg-extensions
+      tag: "{major}-supabase"
+    extraLibs:
+      - /usr/lib/x86_64-linux-gnu/libsodium.so.23

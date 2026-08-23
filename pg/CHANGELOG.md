@@ -1,5 +1,134 @@
 # pg chart changelog
 
+## 1.15.0 - 2026-08-23
+
+### Added
+
+- **`postgresql.extensions.env` / `envFrom` / `extraVolumes` / `extraVolumeMounts`: point the
+  extension install at your own apt mirror or proxy (#320).** `copy-base-ext` and `copy-ext`
+  had no `env`, no `envFrom` and no volume beyond the three `emptyDir`s, so there was no
+  supported way to keep the `apt-get` steps off the public internet.
+
+  That matters under a per-namespace default-deny egress policy, where the cost is not the
+  repeated work but the HOSTS: every external host the install touches has to sit in the
+  platform's baseline allow, for every tenant, permanently. A Supabase-shaped package set
+  needs three -- `apt.postgresql.org`, `repo.pigsty.io`, and `deb.debian.org` (the
+  general-purpose Debian archive, for one 165 kB `libsodium23` that neither PGDG nor Pigsty
+  ships). A single `http_proxy` now replaces all three, since apt honours it and it needs no
+  source rewriting; `extraVolumes`/`extraVolumeMounts` cover what env cannot express -- an
+  `/etc/apt/apt.conf.d` snippet or a replacement `sources.list`, which `aptSources` cannot
+  provide because it only APPENDS source files and never rewrites the base sources the images
+  ship.
+
+  All four apply to **both** extension init containers and to **neither** the postgresql
+  container: an `http_proxy` in the postmaster's own environment would silently redirect
+  anything else that reads it, and an apt configuration mount there is meaningless. They
+  render only while `packages` is non-empty (the plain-copy path runs no apt at all), and
+  setting any of them with `packages` empty is **rejected at render time** rather than
+  silently ignored -- an operator who believes the proxy is in effect when it is not has a
+  worse problem than a failed render.
+
+  Two further guards, both for failures that would otherwise surface only on a running pod.
+  An `extraVolumes` entry reusing one of the chart's own volume names (`data`, `ext-lib`,
+  `postgresql-config`, ...) is refused: volume names are not merged -- the later entry in the
+  pod's list wins -- so it would REPLACE the data PVC or the extension tree with a ConfigMap.
+  An `extraVolumeMounts` entry is refused if it mounts over `/ext-lib`, `/ext-share` or
+  `/ext-extra-lib` (the trees the install step copies into, which the mount would shadow), or
+  if it names a volume absent from `extraVolumes` -- the kubelet rejects that pod at apply
+  time, so helm has to catch it first.
+
+  This does not take the install off the pod-start path; a chart-built extension image
+  (resolve the packages once, mount the result) remains the larger follow-up.
+
+- **`postgresql.extensions.image`: a prebuilt extension image, so the install leaves the
+  pod-start path entirely (#320).** The values above only redirect WHERE the per-start install
+  fetches from; this removes it. The packages are resolved once at image build time (new build
+  recipe in `images/pg-extensions/`) and a third init container, `copy-prebuilt-ext`, does a
+  plain `cp` from that image.
+
+  Two consequences matter more than the speed. There is **no egress on the pod-start path at
+  all** -- not proxied, absent, so there is nothing to allow per tenant permanently. And there
+  is **no root**: the apt path has to REPLACE `postgresql.containerSecurityContext` with
+  `runAsUser: 0` because dpkg needs it, and a namespace enforcing the PSA `restricted` profile
+  (or any `runAsNonRoot` admission policy) rejects that pod outright -- so this path works
+  where the apt path cannot run at all.
+
+  `packages` and `aptSources` are refused alongside `image`. They are not additive: both
+  populate the same `ext-lib`/`ext-share` volumes with a no-clobber copy, so which build of an
+  extension actually won would be decided by init-container order -- an implementation detail
+  of the template -- rather than by anything in the values file, and a version-pinned package
+  silently losing to whatever the image happened to contain is not a trade worth allowing. A
+  non-PGDG source belongs in the image build instead (`APT_SOURCE_*` build args). `extraLibs`
+  DOES still apply, reading from the prebuilt image's filesystem, so the same absolute paths
+  work on either path and a working values file moves across with no other edit.
+
+  Either `tag` or `digest` is required, refused at render time otherwise: an untagged
+  reference resolves to `:latest`, which for an extension image means the `.so` files can
+  change under a pod restart with nothing in the release changing, and an extension built for
+  the wrong major does not load at all. `{major}` in `tag` substitutes
+  `postgresql.majorVersion`, as in `packages` and `aptLine`.
+
+  `copy-prebuilt-ext` runs LAST of the three extension init containers and copies with `cp -n`
+  (no-clobber), for the same reason `copy-ext` does: `copy-base-ext` populated
+  `ext-lib`/`ext-share` from the image that actually RUNS the server, and this is an
+  independent build that can sit on a different postgres point release -- an unconditional
+  copy would overwrite a core lib (e.g. `libpqwalreceiver.so`) with one the running postmaster
+  never linked against (#302).
+
+  It **adds** extensions; it does not upgrade one the server image already ships. The copy is
+  no-clobber and runs last, so anything `copy-base-ext`/`copy-ext` already placed wins,
+  silently. Concretely: the pgvector chart's `postgresql.image` is `pgvector/pgvector`, which
+  ships `vector.so`, so a prebuilt image carrying a NEWER pgvector is a no-op -- change the
+  server image for that instead. There is no safe alternative: clobbering the `.so` files would
+  overwrite a core lib with a build the running postmaster never linked against (#302), and
+  clobbering only the control/SQL files would leave the SQL definitions and the `.so` at
+  different versions.
+
+  The image build fails rather than producing a quietly useless artifact when `PACKAGES` is
+  empty, the `APT_SOURCE_*` triple is partially set, `APT_SOURCE_LINE` carries no `signed-by=`,
+  or the install leaves `/usr/share/postgresql/<major>/extension` empty -- that last one
+  catching the mistake otherwise invisible until `CREATE EXTENSION` (a package name that
+  exists but installs nothing for this major). CI builds it for both supported majors and runs
+  the chart's own copy command verbatim against the result, so drift between the Dockerfile
+  and `pg.extensionPrebuiltCopyCommand` cannot go unnoticed.
+
+- **A `pgdg` entry in `postgresql.extensions.aptSources` is now refused at render time
+  (#320).** It was always fatal and the failure named nothing useful. Both `postgres:*-trixie`
+  and the `cagriekin/repmgr` image already configure `apt.postgresql.org` under their OWN
+  keyring paths, and the chart derives its keyring path from the entry `name`
+  (`pgchart-<name>-keyring.gpg`) with no override -- so apt sees two entries for the same repo
+  with different `Signed-By` values and rejects the ENTIRE source list
+  (`E: Conflicting values set for option Signed-By regarding source
+  http://apt.postgresql.org/pub/repos/apt/ trixie-pgdg`), failing the install before it
+  starts. Omitting the entry is correct: PGDG packages in `packages` resolve from the image's
+  own configuration, which is what `packages` already relies on. The guard keys on the HOST,
+  not the entry name, so any `aptLine` pointing at `apt.postgresql.org` is caught regardless
+  of what it was called.
+
+### Fixed
+
+- **A digest-only image pin rendered an unparseable reference.** `pg.image` built the
+  reference with an unconditional `printf "%s:%s"`, so a block with a `digest` and no `tag`
+  produced `repo:@sha256:...` -- which containerd rejects (`InvalidImageName`), so the
+  container never starts. That made the digest pin, which this chart recommends for
+  production, the broken configuration. It now renders `repo@digest`.
+
+**Migrating from 1.14.1:** for almost everyone, nothing to do -- the four override values
+default to `[]`, `extensions.image.repository` defaults to `""`, and the default render is
+byte-identical. Two changes can fail an upgrade that previously succeeded, both of them
+turning a runtime failure into a render-time one:
+
+- **Every image block now requires a tag or a digest, and a non-empty repository.**
+  `pg.image` is shared by every image in the chart (postgresql, repmgr, pgpool and its
+  exporter, busybox, the metrics exporter, mc, the pgbackrest CronJob), so a values file that
+  CLEARS a tag without setting a digest -- `postgresql.image.tag: ""`, `pgpool.image.tag: ""`
+  -- now fails at `helm upgrade`. It previously rendered `repo:`, which containerd rejected at
+  pod start anyway; the difference is that the failure now names the value instead of showing
+  up as `InvalidImageName` on a pod. Set a tag or a digest.
+- **A `pgdg` entry in `aptSources` is rejected.** A values file with one now fails at render
+  time instead of inside `apt-get update` on every pod start, so a release that was already
+  broken this way surfaces at `helm upgrade`.
+
 ## 1.14.1 - 2026-08-22
 
 ### Changed

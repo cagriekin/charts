@@ -1,0 +1,27 @@
+# #320: the shape an operator under a default-deny egress policy actually uses -- the whole
+# install pointed at an in-cell apt mirror/proxy so NO external host needs opening. Shared
+# by test-template.sh and any future suite; a values file rather than --set because the
+# core-v1 env/volume/volumeMount lists are nested structures --set cannot express cleanly.
+postgresql:
+  majorVersion: "18"
+  extensions:
+    enabled: true
+    packages:
+      - "postgresql-{major}-cron"
+    env:
+      - name: http_proxy
+        value: http://apt-proxy.infra.svc:3142
+      - name: no_proxy
+        value: .svc,.cluster.local
+    envFrom:
+      - configMapRef:
+          name: apt-proxy-env
+    extraVolumes:
+      - name: apt-proxy-conf
+        configMap:
+          name: apt-proxy-conf
+    extraVolumeMounts:
+      - name: apt-proxy-conf
+        mountPath: /etc/apt/apt.conf.d/01proxy
+        subPath: 01proxy
+        readOnly: true
