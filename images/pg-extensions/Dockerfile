@@ -121,13 +121,17 @@ RUN if [ -n "$APT_SOURCE_NAME" ] || [ -n "$APT_SOURCE_KEY_URL" ] || [ -n "$APT_S
 # docs-only package, the wrong major in the name) would otherwise build cleanly and produce
 # an image the chart copies nothing out of -- a silently extension-less cluster, which is the
 # failure mode this whole feature exists to avoid.
-RUN test -n "$PACKAGES" || { echo "PACKAGES is required (space-separated Debian package names)" >&2; exit 1; } \
- && apt-get update \
- && apt-get install -y --no-install-recommends $PACKAGES \
- && rm -rf /var/lib/apt/lists/* \
- && test -d "/usr/share/postgresql/$PG_MAJOR/extension" \
- && test -n "$(ls -A "/usr/share/postgresql/$PG_MAJOR/extension" 2>/dev/null)" \
- || { echo "no extension control files under /usr/share/postgresql/$PG_MAJOR/extension -- check PACKAGES names and that they match PG_MAJOR=$PG_MAJOR" >&2; exit 1; }
+# Each step reports its OWN failure. An `&&` chain with one trailing `||` would blame a
+# proxy/network/unsatisfiable-pin apt failure on "check PACKAGES names", which is the wrong
+# thing to go looking at.
+#
+# BOTH trees are verified, not just the extension dir: pg.extensionPrebuiltCopyCommand runs
+# `cp -n /usr/lib/postgresql/<major>/lib/*.so* /ext-lib/` FIRST and &&-chained, so a package
+# set with no .so at all (a SQL-only extension, and no postgresql-<major> dependency to pull
+# the server libs in) would build green and then crash-loop copy-prebuilt-ext with
+# `cp: cannot stat '/usr/lib/postgresql/18/lib/*.so*'` -- exactly the build-time-silent
+# failure this check exists to catch.
+RUN set -eu;     if [ -z "$PACKAGES" ]; then       echo "PACKAGES is required (space-separated Debian package names)" >&2; exit 1;     fi;     apt-get update;     apt-get install -y --no-install-recommends $PACKAGES;     rm -rf /var/lib/apt/lists/*;     for d in "/usr/share/postgresql/$PG_MAJOR/extension" "/usr/lib/postgresql/$PG_MAJOR/lib"; do       if [ ! -d "$d" ] || [ -z "$(ls -A "$d" 2>/dev/null)" ]; then         echo "nothing installed under $d -- the chart copies from BOTH /usr/share/postgresql/$PG_MAJOR/extension and /usr/lib/postgresql/$PG_MAJOR/lib, and its copy command fails on an empty one. Check the PACKAGES names, that they match PG_MAJOR=$PG_MAJOR, and that the set pulls in the server libs it needs." >&2;         exit 1;       fi;     done
 
 # Recorded so the built image can be inspected for what it actually contains, and so the
 # chart's copy step has a documented contract to read from.

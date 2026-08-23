@@ -39,20 +39,35 @@ fi
 # --- PACKAGES is required at build time ---
 # An image with no extensions is never what anyone wanted, and it is indistinguishable from
 # a working one until every pod comes up missing the extension it was supposed to gain.
-if grep -q 'test -n "$PACKAGES"' "${DF}"; then
+if grep -q 'if \[ -z "\$PACKAGES" \]' "${DF}" && grep -q 'PACKAGES is required' "${DF}"; then
   ok "#320: build fails when PACKAGES is empty"
 else
   bad "#320: build does not require PACKAGES"
 fi
 
-# --- the build verifies the extension directory is actually populated ---
-# A package name that exists but installs nothing under /usr/share/postgresql/<major>/
-# (a metapackage, a docs-only package, the wrong major in the name) would otherwise build
-# cleanly and produce an image the chart copies nothing out of.
-if grep -q 'test -n "$(ls -A "/usr/share/postgresql/$PG_MAJOR/extension"' "${DF}"; then
-  ok "#320: build verifies the extension directory is non-empty"
+# --- the build verifies BOTH trees the chart copies from are populated ---
+# A package name that exists but installs nothing for this major (a metapackage, a docs-only
+# package, the wrong major in the name) would otherwise build cleanly and produce an image the
+# chart copies nothing out of. Both directories matter, not just the extension one: the chart's
+# copy command reads /usr/lib/postgresql/<major>/lib FIRST and &&-chained, so an empty lib dir
+# crash-loops copy-prebuilt-ext with `cp: cannot stat`.
+missing_dir_check=0
+for d in '/usr/share/postgresql/$PG_MAJOR/extension' '/usr/lib/postgresql/$PG_MAJOR/lib'; do
+  grep -qF "${d}" "${DF}" || missing_dir_check=1
+done
+if [ "${missing_dir_check}" -eq 0 ] && grep -q 'ls -A' "${DF}"; then
+  ok "#320: build verifies both copied directories are non-empty"
 else
-  bad "#320: build does not verify the extension directory is populated"
+  bad "#320: build does not verify both /usr/share/postgresql/<major>/extension and /usr/lib/postgresql/<major>/lib"
+fi
+
+# --- each step reports its own failure ---
+# An `&&` chain with one trailing `||` blamed an apt/proxy/pin failure on "check PACKAGES
+# names", sending the operator to look at the wrong thing.
+if grep -q 'RUN set -eu' "${DF}"; then
+  ok "#320: the install step uses set -eu so each failure reports itself"
+else
+  bad "#320: the install step does not use set -eu (one trailing || would mask apt failures)"
 fi
 
 # --- an optional apt source must be signed ---
@@ -94,14 +109,23 @@ fi
 # --- the chart's copy paths match what the image populates ---
 # The contract between this Dockerfile and pg.extensionPrebuiltCopyCommand. If they drift,
 # the copy silently produces an empty ext-share and every pod comes up without extensions.
+# Scoped to the pg.extensionPrebuiltCopyCommand define, and matching the FULL cp literal.
+# An unscoped substring grep passed on pg.extensionInstallCommand's own copy lines, which
+# carry the same paths -- so a change to the prebuilt copy command alone, the exact drift the
+# workflow's pg/templates/_helpers.tpl paths entry was added to catch, went undetected.
 HELPERS="${ROOT}/../../pg/templates/_helpers.tpl"
-for path in '/usr/lib/postgresql/%s/lib' '/usr/share/postgresql/%s/extension'; do
-  if grep -q "${path}" "${HELPERS}"; then
-    ok "#320: chart copies from ${path}"
-  else
-    bad "#320: chart does not copy from ${path} -- drifted from this Dockerfile"
-  fi
-done
+PREBUILT=$(sed -n '/define "pg.extensionPrebuiltCopyCommand"/,/^{{- end }}/p' "${HELPERS}")
+if [ -z "${PREBUILT}" ]; then
+  bad "#320: pg.extensionPrebuiltCopyCommand not found in _helpers.tpl (renamed or removed)"
+else
+  for lit in 'cp -n /usr/lib/postgresql/%s/lib/*.so* /ext-lib/' 'cp -n /usr/share/postgresql/%s/extension/* /ext-share/'; do
+    if printf '%s\n' "${PREBUILT}" | grep -qF "${lit}"; then
+      ok "#320: prebuilt copy command still uses: ${lit}"
+    else
+      bad "#320: prebuilt copy command no longer matches this Dockerfile: expected ${lit}"
+    fi
+  done
+fi
 
 echo "----"
 if [ "${fail}" -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; fi

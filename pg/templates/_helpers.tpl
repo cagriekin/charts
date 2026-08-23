@@ -113,14 +113,28 @@ annotation consumers -- #128.)
 {{- /* Generic image reference (#26): pass an image dict {repository, tag, digest?};
        renders repository:tag, with @digest appended when set so a digest pin overrides
        the mutable tag. */ -}}
-{{- /* An empty tag must NOT render "repo:" (#320). With a digest and no tag the old form
-       produced `repo:@sha256:...`, which containerd rejects as an unparseable reference --
-       the container never starts (InvalidImageName) and the pod never comes up. That was
-       reachable: postgresql.extensions.image documents digest as the production pin and
-       accepts it without a tag, so the recommended configuration was the broken one. A
-       digest alone is a complete reference; a tag alone is the ordinary case; both together
-       is legal and means "resolve this digest, tag is decoration". */ -}}
+{{- /* An empty tag must not render "repo:" -- and must not render a bare "repo" either.
+
+       With a digest and no tag, `printf "%s:%s"` produced `repo:@sha256:...`, which containerd
+       rejects as unparseable (InvalidImageName): the container never starts. That was
+       reachable, because postgresql.extensions.image documents digest as the production pin
+       and accepts it without a tag (#320).
+
+       Dropping the colon whenever tag is falsy fixed that but introduced something worse
+       (#320 review): a values file that CLEARS a tag -- `tag:` with no value, which is what a
+       values-file merge produces -- then rendered a bare `repo`, i.e. an implicit :latest. On a
+       StatefulSet with an existing PGDATA a future :latest is a different PostgreSQL major and
+       the postmaster refuses to start; even on a fresh install the major is unpinned across
+       restarts. The previous `repo:` at least failed fast and visibly. Every image in the chart
+       routes through here, not just the extension one, so this is the wrong place to be
+       permissive: an unpinned image is refused outright.
+
+       So: digest alone is a complete reference; tag alone is the ordinary case; both together
+       is legal and means "resolve this digest, the tag is decoration"; neither is an error. */ -}}
 {{- define "pg.image" -}}
+{{- if and (not .tag) (not .digest) -}}
+{{- fail (printf "image %q has neither a tag nor a digest, which would deploy an implicit :latest -- unpinned across pod restarts, and on a StatefulSet with existing data a future :latest can be a different PostgreSQL major that refuses to start on it. Set a tag or a digest." (.repository | default "<empty repository>")) -}}
+{{- end -}}
 {{- if .tag -}}
 {{- printf "%s:%s" .repository .tag -}}
 {{- else -}}
@@ -474,7 +488,14 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
            the internal-mirror case this whole change exists to enable, and the failure
            message would have told the operator to rely on "the image's own configuration",
            which points at the public host they cannot reach. */ -}}
-    {{- if regexMatch "(?i)://([^/ ]*@)?apt\\.postgresql\\.org([:/ ]|$)" $substituted -}}
+    {{- /* Authority AND dist (#320 review). APT keys the Signed-By conflict on URI plus
+           DIST, and the images configure only `<codename>-pgdg` -- so `trixie-pgdg-testing`
+           or a `-pgdg-snapshot` suite does NOT conflict and is a legitimate way to install a
+           newer extension build. Matching the authority alone hard-failed those, and the
+           message told the operator to fall back on "the image's own configuration", which
+           does not carry that suite at all. The dist is the token after the URL; require it
+           to END in -pgdg. */ -}}
+    {{- if regexMatch "(?i)://([^/ ]*@)?apt\\.postgresql\\.org([:/][^ ]*)? +[a-z0-9.]+-pgdg( |$)" $substituted -}}
       {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine points at apt.postgresql.org (%q). Remove this entry: both the repmgr image and postgres:*-trixie already configure PGDG under their own keyring path, and adding a second entry for the same repo under this chart's keyring path makes apt reject the whole source list (\"E: Conflicting values set for option Signed-By regarding source http://apt.postgresql.org/pub/repos/apt/ ...\"), so the install fails before it starts. PGDG packages in postgresql.extensions.packages resolve from the image's own configuration -- aptSources is only for sources the images do NOT ship, e.g. repo.pigsty.io" $name $substituted) -}}
     {{- end -}}
     {{- $expectSignedBy := printf "signed-by=/usr/share/keyrings/pgchart-%s-keyring.gpg" $name -}}
@@ -705,6 +726,13 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- end -}}
 {{- end -}}
 {{- $reserved := list "data" "pg-run" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib" "repmgr-config" "etcd-tls" "agent-control-tls" "pgbackrest" "pgbackrest-config" "pgbackrest-bootstrap-script" "service-updater-script" -}}
+{{- /* postgresql.extraVolumes lands in the SAME pod volumes list (#320 review), so a name
+       shared with it is a duplicate the API server rejects ("volumes[n].name: Duplicate
+       value") -- the same apply-time-only failure class as the chart-volume collision
+       above, just from the other operator-controlled list. */ -}}
+{{- range $ov := (.Values.postgresql.extraVolumes | default list) -}}
+  {{- $reserved = append $reserved ($ov.name | toString) -}}
+{{- end -}}
 {{- $declared := dict -}}
 {{- range $v := $vols -}}
   {{- $n := $v.name | toString -}}
@@ -719,7 +747,17 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- end -}}
   {{- $declared = set $declared $n true -}}
 {{- end -}}
+{{- /* Destinations AND sources (#320 review). Mounting over /usr/share/postgresql/<major>/
+       extension shadows where apt-get INSTALLS and where the cp READS, so copy-ext dutifully
+       copies the ConfigMap's contents into ext-share instead of the extensions -- a silently
+       extension-less cluster, which is the exact failure this feature exists to prevent, and
+       it surfaces only at CREATE EXTENSION. */ -}}
 {{- $installPaths := list "/ext-lib" "/ext-share" "/ext-extra-lib" -}}
+{{- $srcMajor := .Values.postgresql.majorVersion | default "" | toString -}}
+{{- if $srcMajor -}}
+  {{- $installPaths = append $installPaths (printf "/usr/lib/postgresql/%s/lib" $srcMajor) -}}
+  {{- $installPaths = append $installPaths (printf "/usr/share/postgresql/%s/extension" $srcMajor) -}}
+{{- end -}}
 {{- $seenPaths := dict -}}
 {{- range $m := $mounts -}}
   {{- $n := $m.name | toString -}}

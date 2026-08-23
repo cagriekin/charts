@@ -155,8 +155,15 @@ jobs:
 
       - name: An empty PACKAGES must fail the build
         run: |
-          if docker build -q --build-arg PG_MAJOR=${{ matrix.pg_major }} images/pg-extensions >/dev/null 2>&1; then
+          # Grep the reason, not just the exit code: a non-zero exit satisfied by a base-image
+          # pull or an apt hiccup would make this step pass while proving nothing.
+          if docker build --build-arg PG_MAJOR=${{ matrix.pg_major }} images/pg-extensions > /tmp/nopkg.log 2>&1; then
             echo "build succeeded with no PACKAGES -- it would produce an extension-less image" >&2
             exit 1
           fi
-          echo "empty PACKAGES correctly fails the build"
+          grep -q "PACKAGES is required" /tmp/nopkg.log || {
+            echo "build failed, but not on the PACKAGES guard -- this step proves nothing:" >&2
+            tail -20 /tmp/nopkg.log >&2
+            exit 1
+          }
+          echo "empty PACKAGES correctly fails the build, on the guard"

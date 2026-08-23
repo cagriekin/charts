@@ -713,6 +713,62 @@ ext_pgdg_mirror_res=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#320: a mirror with apt.postgresql.org in its PATH is allowed" "${ext_pgdg_mirror_res}" "mirror.corp/apt.postgresql.org"
 
+# #320 review: an image with neither tag nor digest must FAIL, not quietly mean :latest. The
+# first fix for the digest-only bug dropped the colon whenever tag was falsy, which turned a
+# cleared tag (`tag:` with no value -- what a values-file merge produces) from a fast, visible
+# `repo:` failure into an implicit :latest. On a StatefulSet with existing PGDATA a future
+# :latest is a different PostgreSQL major that refuses to start on it. Every image in the chart
+# routes through pg.image, so this is asserted on postgresql.image, not the extension one.
+img_untagged_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false \
+  --set postgresql.replicaCount=0 \
+  --set postgresql.image.tag="" \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || img_untagged_rc=$?
+assert_eq "#320: an image with no tag and no digest fails the render" "1" "${img_untagged_rc}"
+# || true: the render is EXPECTED to fail here, and an unguarded command substitution that
+# exits non-zero aborts the whole suite under set -e.
+img_untagged_out=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 --set postgresql.image.tag="" 2>&1 || true)
+assert_contains "#320: the untagged-image failure names the implicit latest" "${img_untagged_out}" "implicit :latest"
+
+# #320 review: postgresql.extraVolumes lands in the SAME pod volumes list, so a shared name is
+# a duplicate the API server rejects -- the same apply-time-only class as the chart-volume
+# collision, just from the other operator-controlled list.
+ext_vol_userdup_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+  --set 'postgresql.extraVolumes[0].name=apt-proxy-conf' \
+  --set 'postgresql.extraVolumes[0].emptyDir.sizeLimit=1Mi' \
+  --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_vol_userdup_rc=$?
+assert_eq "#320: an extraVolume colliding with postgresql.extraVolumes fails the render" "1" "${ext_vol_userdup_rc}"
+
+# #320 review: the guard must also protect the paths the copy READS FROM. Mounting over
+# /usr/share/postgresql/<major>/extension makes copy-ext copy the ConfigMap's contents into
+# ext-share instead of the installed extensions -- a silently extension-less cluster, visible
+# only at CREATE EXTENSION.
+for src in /usr/share/postgresql/18/extension /usr/lib/postgresql/18/lib; do
+  ext_mount_src_rc=0
+  helm template test-pg "${CHART_DIR}" \
+    -f "${SCRIPT_DIR}/values-ext-proxy.yaml" \
+    --set "postgresql.extensions.extraVolumeMounts[0].mountPath=${src}" \
+    --show-only templates/statefulset.yaml >/dev/null 2>&1 || ext_mount_src_rc=$?
+  assert_eq "#320: an extraVolumeMount over ${src} fails the render" "1" "${ext_mount_src_rc}"
+done
+
+# #320 review: APT keys the Signed-By conflict on URI *and dist*, and the images configure only
+# <codename>-pgdg -- so a -pgdg-testing suite does not conflict and is a legitimate way to get a
+# newer extension build. Rejecting it left the operator with no route at all.
+ext_pgdg_testing_res=$(helm template test-pg "${CHART_DIR}" \
+  --set postgresql.extensions.enabled=true \
+  --set postgresql.majorVersion=18 \
+  --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
+  --set 'postgresql.extensions.aptSources[0].name=pgdgtest' \
+  --set 'postgresql.extensions.aptSources[0].keyUrl=https://apt.postgresql.org/pub/repos/apt/ACCC4CF8.asc' \
+  --set 'postgresql.extensions.aptSources[0].aptLine=deb [signed-by=/usr/share/keyrings/pgchart-pgdgtest-keyring.gpg] http://apt.postgresql.org/pub/repos/apt trixie-pgdg-testing main' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#320: a -pgdg-testing suite on the PGDG host is allowed" "${ext_pgdg_testing_res}" "trixie-pgdg-testing"
+
 # #320 review: mounting INSIDE an install path shadows the tree as completely as mounting on
 # it, and Kubernetes rejects duplicate mountPaths at apply time -- both were render-clean.
 ext_mount_inside_rc=0
