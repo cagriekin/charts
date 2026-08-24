@@ -839,7 +839,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// fenceBudget()/2 sub-context left it routinely under the probe's own 10s psql timeout,
 		// which logged a spurious warning on every promotion and put a second apiserver pod LIST
 		// on the promote critical path.
-		a.topologyTick(wctx)
+		a.topologyTick(ctx)
 		return promoteRoutingErr
 
 	case reconcile.StayPrimary:
@@ -879,7 +879,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// defaults, already contended by slotsTick) an extra query plus a pod LIST in FRONT of
 		// them could make a slow tick skip the marker write and the Service routing assertion,
 		// which is a write outage. Nothing here may cost that.
-		a.topologyTick(wctx)
+		a.topologyTick(ctx)
 		return routingErr
 
 	case reconcile.Follow:
@@ -930,7 +930,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// record and break a later promote. On a failed register, fall through to
 		// follow (which re-establishes the record, or errors so the next tick retries).
 		if regErr == nil && a.streamingFromTarget(ctx, dec.Target) {
-			a.followUpstream = dec.Target
+			a.latchFollow(dec.Target)
 			return nil
 		}
 		// Carry both the address and the node id: repmgr uses the id, a native mechanism
@@ -967,7 +967,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if err := a.sup.Reload(ctx); err != nil {
 			return fmt.Errorf("reload after follow: %w", err)
 		}
-		a.followUpstream = dec.Target
+		a.latchFollow(dec.Target)
 		return nil
 
 	case reconcile.DemoteFence:
@@ -1297,6 +1297,27 @@ func (a *agent) ensureConfdInclude() error {
 func (a *agent) discardFreshDataDir() error {
 	if !process.HasData(a.cfg.PGDATA) {
 		return nil
+	}
+	// Reap any postmaster the bootstrap left running BEFORE trying to wipe (#288 review).
+	// bootstrap_initdb starts a socket-only postmaster with `pg_ctl -w start`, which daemonizes
+	// a process the agent does not supervise. If the budget expires (or the exec is cut short)
+	// between that start and its matching stop, WaitDelay kills entrypoint.sh but NOT the
+	// detached postmaster -- and then WipeDataDir refuses on the live postmaster.pid, returning
+	// "delete the PVC to recover" while every later sup.Start fails on "postmaster.pid already
+	// exists". The pod wedges Running/NotReady for good: the startupProbe's `pg_isready` over
+	// the unix socket is SATISFIED by the orphan, so the startup grace stops protecting, while
+	// selfConn() dials 127.0.0.1 and can never reach a socket-only postmaster.
+	//
+	// Best-effort and on its OWN context: the usual trigger for this path is the parent budget
+	// having already expired, so reusing it would make the stop a guaranteed no-op.
+	sctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if out, err := a.prober.Exec.Run(sctx, nil, filepath.Join(a.pgBindir, "pg_ctl"),
+		"-D", a.cfg.PGDATA, "-m", "immediate", "-w", "stop"); err != nil {
+		// Nothing to stop is the common case (initdb failed before the start), and it is not an
+		// error worth failing the discard over -- WipeDataDir's own interlock is the authority.
+		a.log.Info("no bootstrap postmaster to stop before discarding the data directory",
+			"reason", strings.TrimSpace(out), "err", err)
 	}
 	if err := process.WipeDataDir(a.cfg.PGDATA); err != nil {
 		return fmt.Errorf("discard the fresh data directory (delete the PVC to recover): %w", err)
@@ -1659,6 +1680,14 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 	// its one consumer -- cascadeFollowTarget's stickiness -- re-checks cascadeQualifies).
 	// It removes a footgun for whoever later reads the latch earlier in the decision.
 	a.followUpstream = ""
+	// Reset the stall counter too (#288 review). Without this, StandbyStalled stays latched: the
+	// counter only clears on an observed streaming upstream, so a stall NOT caused by divergence
+	// (upstream out of max_wal_senders, an invalidated slot, replication auth failing) made
+	// Decide return RejoinForward on EVERY tick -- stopping, rewinding and restarting postgres
+	// every 5s instead of once. Worse, each attempt that falls through to ReclonePreserving
+	// leaves another .diverged.<ts> directory that nothing ever removes, so the PVC fills.
+	// Zeroing here means one rejoin per stall, and a genuine re-stall has to re-earn its ticks.
+	a.standbyNoReceiverTicks = 0
 	// Invariant 9: never rewind/reclone onto a different cluster. Checked before the
 	// demote so a healthy node is not stopped for a doomed rejoin.
 	if err := a.assertSameCluster(ctx, target); err != nil {
@@ -1797,8 +1826,37 @@ func (a *agent) cleanupGhostNodes(ctx context.Context) {
 //   - It runs under repmgr too, not only native. repmgr sets application_name to the node name
 //     itself, so the view is equally readable there, and publishing a gauge that only ever
 //     moves on the non-default mechanism is the mistake slotsTick's own comment argues against.
+//
+// topologyTick funds itself from its OWN budget rather than the caller's fence budget (#288 review).
+// wctx is fenceBudget() -- 5s on chart defaults -- and by the time topologyTick runs it has
+// already paid for RegisterPrimary, slotsTick, PrimaryWALPosition, advanceMarker and
+// assertPrimaryRouting. Exhausted, ReplicationTopology fails and topologyTick returns early,
+// LEAVING THE GAUGES AT THEIR PREVIOUS VALUES -- and on the promote path those were just zeroed
+// by ClearTopology, so a freshly promoted primary with healthy standbys exported
+// replicas_streaming = 0. Deriving from ctx keeps it observational: it cannot starve the marker
+// write or the routing switch, and it cannot be starved BY them either.
+// latchFollow records the upstream this node is now replicating from, and EXPIRES the restore
+// claim (#288 review).
+//
+// The claim exists to protect a restored volume's history until the cluster has adopted it: a
+// PITR rewinds this node, so ranking on LSN alone let a stale peer out-position it and promote
+// pre-restore data. That danger ends the moment this node is itself following a peer. Either the
+// upstream's history descends from the restore -- adopted, so the claim is moot -- or it does
+// not, in which case getting here required a rewind/re-clone, which already dropped the record.
+//
+// Without this bound the claim was PERMANENT, and permanent provenance is its own data-loss bug:
+// a node restored months ago, long since demoted cleanly and streaming happily, still outranked
+// a peer holding gigabytes more WAL. It would win the lease, skip that peer in its own election,
+// and promote with less WAL -- on every election for the life of the PVC.
+func (a *agent) latchFollow(target string) {
+	a.followUpstream = target
+	a.dropRestoreRecord("this node is now following " + target + ", so the cluster has moved past the restore")
+}
+
 func (a *agent) topologyTick(ctx context.Context) {
-	rows, err := a.prober.ReplicationTopology(ctx, a.selfConn())
+	tctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
+	defer cancel()
+	rows, err := a.prober.ReplicationTopology(tctx, a.selfConn())
 	if err != nil {
 		a.log.Warn("read replication topology", "err", err)
 		return

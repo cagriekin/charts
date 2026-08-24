@@ -88,6 +88,21 @@ while [[ ${elapsed} -lt 180 ]]; do
 done
 assert_eq "all 3 nodes in the topology before scale-down (incl. ordinal 2)" "1" "${pre}"
 
+# Capture the pre-scale primary and whether pg_ha_slot_2 actually exists on it (#288 review).
+# Under native the initial primary is decided by the LEASE RACE, not by ordinal, so pod-2 can be
+# the primary -- and the StatefulSet trims the top ordinal, i.e. the primary itself. A survivor
+# then promotes, and a newly promoted primary carries no physical slots from its standby life
+# (physical slots are not replicated), so pg_ha_slot_2 never exists on the node being polled and
+# every "the slot was reclaimed" assertion below passes VACUOUSLY. Record the evidence now so the
+# post-scale assertions can tell "reclaimed" apart from "never there".
+PRE_PRIMARY="${P:-$(find_primary 2)}"
+PRE_SLOT2=""
+if [ "$(chart_mechanism)" = "native" ]; then
+  PRE_SLOT2=$(pg_exec "${NAMESPACE}" "${PRE_PRIMARY}" \
+    "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
+  echo "  pre-scale: primary=${PRE_PRIMARY} pg_ha_slot_2_present=${PRE_SLOT2:-?}"
+fi
+
 # Scale down to 2 instances (replicaCount=1 -> ordinals 0,1). The StatefulSet trims the
 # top ordinal, so pod-2 (a standby) is removed; its repmgr.nodes row (node_id 1002) is
 # now a ghost the primary must unregister (#139).
@@ -135,6 +150,11 @@ if [ "$(chart_mechanism)" = "native" ]; then
   # drops -- seconds before the primary's next slotsTick observes the shrunken live pod set and
   # drops pg_ha_slot_2. Reading the slot counts straight after that loop raced the tick. Under
   # repmgr the equivalent wait was on repmgr.nodes, i.e. on the primary tick itself having run.
+  # Only assert the reclaim when there was something to reclaim. An honest SKIP beats a green
+  # assertion that never exercised the code path (#288 review).
+  if [ "${PRE_SLOT2}" != "1" ]; then
+    skip "#289/#288: slot reclaim not exercised (pg_ha_slot_2 was absent pre-scale; primary was ${PRE_PRIMARY}, so the trimmed ordinal owned no slot on it)"
+  fi
   echo "  Waiting for the primary to reclaim pg_ha_slot_2 (up to 120s)..."
   reclaimed=0; elapsed=0
   while [[ ${elapsed} -lt 120 ]]; do
@@ -143,7 +163,9 @@ if [ "$(chart_mechanism)" = "native" ]; then
     if [[ "${left}" == "0" ]]; then reclaimed=1; break; fi
     sleep 5; elapsed=$((elapsed + 5))
   done
-  assert_eq "#289/#288: the primary reclaimed the departed ordinal's slot" "1" "${reclaimed}"
+  if [ "${PRE_SLOT2}" = "1" ]; then
+    assert_eq "#289/#288: the primary reclaimed the departed ordinal's slot" "1" "${reclaimed}"
+  fi
   agent_slots=$(pg_exec "${NAMESPACE}" "${P}" \
     "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
   # #288: the assertion inverts. Native owns its slots, so after scaling 3 -> 2 there must be

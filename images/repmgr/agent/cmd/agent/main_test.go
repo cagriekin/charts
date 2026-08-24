@@ -1737,3 +1737,48 @@ type failingExec struct{}
 func (failingExec) Run(context.Context, []string, string, ...string) (string, error) {
 	return "", errors.New("exit status 2")
 }
+
+// #288 review: the restore claim must EXPIRE once this node follows a peer. It used to be
+// permanent, and permanent provenance is its own data-loss bug -- a node restored long ago, since
+// demoted cleanly and streaming happily, still outranked a peer holding far more WAL, would win
+// the lease, skip that peer in its own election, and promote with less WAL. Forever.
+func TestLatchFollowExpiresTheRestoreClaim(t *testing.T) {
+	dir := t.TempDir()
+	pgdata := filepath.Join(dir, "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a := &agent{
+		cfg: &config.Config{PGDATA: pgdata},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	rec := a.cfg.RestoreStatusPath()
+	if err := os.WriteFile(rec, []byte("exitCode=0\nrestoredAt=2026-08-24T12:00:00Z\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.latchFollow("pg-1")
+	if a.followUpstream != "pg-1" {
+		t.Errorf("follow latch not set: %q", a.followUpstream)
+	}
+	if _, err := os.Stat(rec); !os.IsNotExist(err) {
+		t.Errorf("the restore record must be gone once this node follows a peer (stat err=%v)", err)
+	}
+}
+
+// And it must be silent/harmless on the overwhelmingly common case: an ordinary standby that was
+// never restored has no record to drop.
+func TestLatchFollowWithoutARecordIsHarmless(t *testing.T) {
+	dir := t.TempDir()
+	pgdata := filepath.Join(dir, "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a := &agent{
+		cfg: &config.Config{PGDATA: pgdata},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	a.latchFollow("pg-1")
+	if a.followUpstream != "pg-1" {
+		t.Errorf("follow latch not set: %q", a.followUpstream)
+	}
+}
