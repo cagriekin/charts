@@ -142,7 +142,13 @@ template:
 {{- /* #323. This pod makes no apiserver call (its token is not even mounted), so the
        KUBECONFIG case does not apply here -- but the same list carries whatever else
        pgbackrest needs to reach the repository from this cluster (a proxy, a private CA),
-       and a restore that cannot reach S3 is the one moment that matters most. */}}
+       and a restore that cannot reach S3 is the one moment that matters most.
+
+       For the repository-route case this list is NOT sufficient on its own (#323 review):
+       archive_command runs pgbackrest in the POSTGRESQL container, which is deliberately not a
+       target here, so a proxy set only in pgbackrest.extraEnv gives working backups, restores
+       and validation while archive-push keeps failing and WAL accumulates in pg_wal until the
+       volume fills. Set it in postgresql.extraEnv as well. */}}
 {{- with .Values.pgbackrest.extraEnv }}
           {{- toYaml . | nindent 10 }}
 {{- end }}

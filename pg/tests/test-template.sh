@@ -4699,6 +4699,50 @@ helm template test-pg "${CHART_DIR}" \
   -f "${SCRIPT_DIR}/values-agent-control-restore.yaml" \
   --set-json 'pgbackrest.extraEnv=[{"name":"E","valueFrom":{"resourceFieldRef":{"resource":"limits.cpu"}}}]' >/dev/null 2>&1 || pb_pol_unpinnable_env_rc=$?
 assert_eq "#323/#279: an unpinnable extraEnv valueFrom fails the render" "1" "${pb_pol_unpinnable_env_rc}"
+# `emptyDir: {}` is the canonical spelling and an EMPTY MAP is falsy in Go templates, so a
+# truth test would send the one source needing no pin at all into the unpinnable-source fail
+# (#323 review). Every other fixture here writes emptyDir.sizeLimit, which is why this needs
+# its own case.
+pb_pol_emptydir_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  -f "${SCRIPT_DIR}/values-agent-control-restore.yaml" \
+  --set-json 'pgbackrest.extraVolumes=[{"name":"scratch","emptyDir":{}}]' >/dev/null 2>&1 || pb_pol_emptydir_rc=$?
+assert_eq "#323/#279: a bare emptyDir: {} extraVolume renders" "0" "${pb_pol_emptydir_rc}"
+
+# The shadow guards are prefix matches, so the path has to be absolute and normalized first --
+# otherwise the runtime resolves onto the very directory the guard just cleared (#323 review).
+for evil in relative/path //var/lib/postgresql/data /tmp/../var/lib/postgresql/data /var/lib/postgresql/./data; do
+  pb_norm_rc=0
+  helm template test-pg "${CHART_DIR}" \
+    -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+    --set 'pgbackrest.extraVolumes[0].name=k' \
+    --set 'pgbackrest.extraVolumes[0].emptyDir.sizeLimit=1Mi' \
+    --set 'pgbackrest.extraVolumeMounts[0].name=k' \
+    --set "pgbackrest.extraVolumeMounts[0].mountPath=${evil}" >/dev/null 2>&1 || pb_norm_rc=$?
+  assert_eq "#323: mountPath ${evil} fails the render" "1" "${pb_norm_rc}"
+done
+# The two messages must name the actual problem, not a shadowing verdict reached by accident.
+pb_rel_out=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set 'pgbackrest.extraVolumes[0].name=k' \
+  --set 'pgbackrest.extraVolumes[0].emptyDir.sizeLimit=1Mi' \
+  --set 'pgbackrest.extraVolumeMounts[0].name=k' \
+  --set 'pgbackrest.extraVolumeMounts[0].mountPath=relative/path' 2>&1 || true)
+assert_contains "#323: a relative mountPath says so" "${pb_rel_out}" "is not absolute"
+pb_dotdot_out=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set 'pgbackrest.extraVolumes[0].name=k' \
+  --set 'pgbackrest.extraVolumes[0].emptyDir.sizeLimit=1Mi' \
+  --set 'pgbackrest.extraVolumeMounts[0].name=k' \
+  --set 'pgbackrest.extraVolumeMounts[0].mountPath=/tmp/../var/lib/postgresql/data' 2>&1 || true)
+assert_contains "#323: an unnormalized mountPath says so" "${pb_dotdot_out}" "path segment"
+
+# Rule 16 denies configMapKeyRef by default, so when the release has declared one its own
+# message has to say so -- otherwise a denial sends the operator looking in the wrong place.
+assert_contains "#323/#279: the denial message names the admitted ConfigMaps" "${pb_pol2_res}" \
+  "ConfigMaps this release's pgbackrest.extraEnv names (proxy-cm)"
+
 # The passthrough's names now reach single-quoted CEL literals, so they go through the same
 # injection guard as every other interpolated value: `x' || true || '` would otherwise render a
 # syntactically valid, always-true pin that lints clean (#279).

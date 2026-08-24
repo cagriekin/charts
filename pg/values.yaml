@@ -1063,7 +1063,10 @@ pgbackrest:
   # restore Job, and the validation CronJob. extraVolumes is pod-level on each of those pods;
   # extraVolumeMounts and extraEnv land on the pgbackrest containers only -- never on the
   # postgresql container, which has postgresql.extraEnv/extraVolumeMounts of its own (that is
-  # also where archive_command's own pgbackrest invocation reads its environment).
+  # also where archive_command's own pgbackrest invocation reads its environment -- so if what
+  # you are routing is the S3 REPOSITORY rather than the apiserver, set it in both lists, or
+  # backups/restore/validation work while archive-push fails on every segment and WAL piles up
+  # in pg_wal).
   #
   # The case this exists for: the backup CronJob is an apiserver client -- it resolves the
   # current primary from EndpointSlices, which is what makes the schedule survive a failover --

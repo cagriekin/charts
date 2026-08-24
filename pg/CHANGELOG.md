@@ -59,6 +59,12 @@
   at admission during an incident. The names reach single-quoted CEL literals, so they go
   through the same injection guard as every other interpolated value.
 
+  `extraVolumeMounts` paths are normalized before those comparisons: a relative destination is
+  refused (the runtime rejects it, so the pod would stay in `CreateContainerError` with nothing
+  in the manifest to explain it), and `//var/lib/postgresql/data` or
+  `/tmp/../var/lib/postgresql/data` are refused rather than walking around a prefix test onto
+  the live data directory.
+
   No render change with the values unset.
 
 ## 1.15.0 - 2026-08-23

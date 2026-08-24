@@ -977,8 +977,14 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- range $ov := (.Values.postgresql.extraVolumes | default list) -}}
   {{- $chartVolumes = append $chartVolumes ($ov.name | default "" | toString) -}}
 {{- end -}}
+{{- /* Gated on enabled (#323 review): the extensions volumes render inside
+       `if .Values.postgresql.extensions.enabled`, so with extensions off a leftover entry in
+       the values file is inert and a collision against it would be a render failure citing a
+       duplicate that cannot occur. */ -}}
+{{- if ((.Values.postgresql.extensions).enabled) -}}
 {{- range $ov := ((.Values.postgresql.extensions).extraVolumes | default list) -}}
   {{- $chartVolumes = append $chartVolumes ($ov.name | default "" | toString) -}}
+{{- end -}}
 {{- end -}}
 {{- $volNames := list -}}
 {{- range $i, $v := $vols -}}
@@ -1018,7 +1024,21 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- if eq $rawPath "/" -}}
     {{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath is \"/\", which would mount over the container's entire root filesystem -- every binary the pgbackrest containers run included. Mount a specific directory instead." $i $n) -}}
   {{- end -}}
-  {{- $path := $rawPath | trimSuffix "/" -}}
+  {{- /* Absolute and normalized BEFORE the shadow comparisons below, which are prefix matches
+         and would otherwise be trivially bypassable (#323 review): "//var/lib/postgresql/data"
+         and "/tmp/../var/lib/postgresql/data" both miss the PGDATA guard as written, and the
+         runtime resolves both straight onto the live data directory. A relative destination is
+         refused outright -- runc rejects a non-absolute OCI mount destination, so the pod
+         sticks in CreateContainerError with nothing in the render to explain it. */ -}}
+  {{- if not (hasPrefix "/" $rawPath) -}}
+    {{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath %q is not absolute. A container mount destination must start with \"/\" -- the runtime rejects a relative one, so the pod would stay in CreateContainerError with nothing in the rendered manifest to explain it." $i $n $rawPath) -}}
+  {{- end -}}
+  {{- if regexMatch "(^|/)[.][.]?(/|$)" $rawPath -}}
+    {{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath %q contains a \".\" or \"..\" path segment. The chart compares this path against the directories the pgbackrest containers depend on, and an unnormalized path walks around those checks while the runtime still resolves it to the real target (e.g. /tmp/../var/lib/postgresql/data is PGDATA). Write the destination out in full." $i $n $rawPath) -}}
+  {{- end -}}
+  {{- /* Collapse repeated separators for the same reason: "//var/lib/postgresql/data" is the
+         data directory to the runtime and a non-match to a prefix test. */ -}}
+  {{- $path := regexReplaceAll "/+" $rawPath "/" | trimSuffix "/" -}}
   {{- if not (has $n $volNames) -}}
     {{- fail (printf "pgbackrest.extraVolumeMounts[%d]: no pgbackrest.extraVolumes entry named %q (declared: %s). Every extra mount needs a matching extra volume -- otherwise the kubelet rejects the pod at apply time with `volumeMounts[..].name: Not found`, so the CronJob renders, fires, and never runs. Check for a typo, or that you set extraVolumes (plural). Chart-managed volumes cannot be mounted here." $i $n (ternary "none" (join ", " $volNames) (empty $volNames))) -}}
   {{- end -}}

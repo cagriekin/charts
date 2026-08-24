@@ -1215,6 +1215,13 @@ which is also where `archive_command`'s own pgBackRest invocation reads its envi
 side effect of configuring backups. Keep the two lists separate even when they carry the same
 values.
 
+> **If you are routing the S3 repository** — a proxy, a private CA — rather than the apiserver,
+> `pgbackrest.extraEnv` alone is **not enough**. `archive_command` runs pgBackRest inside the
+> postgresql container, so it reads `postgresql.extraEnv`. Set it in both lists, or you get
+> working backups, restores and validation while `archive-push` fails on every segment and WAL
+> accumulates in `pg_wal` until the volume fills. The apiserver case (`KUBECONFIG`) is the
+> opposite: there the postgresql container must *not* get it.
+
 **`extraVolumes` reaches the database pods too**, since the sidecar and the bootstrap init
 container live there. A ConfigMap or Secret that does not exist yet therefore holds the
 **postgresql** pods in `ContainerCreating` on the next roll, not just the backups — create it

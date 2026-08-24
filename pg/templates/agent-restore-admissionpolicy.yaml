@@ -94,13 +94,16 @@
 {{- $extraVolPins := list }}
 {{- range $i, $v := (.Values.pgbackrest.extraVolumes | default list) }}
 {{- $vn := $v.name | toString }}
-{{- if $v.emptyDir }}
+{{- /* hasKey, not truthiness (#323 review): `emptyDir: {}` is the canonical spelling and an
+       empty map is FALSY in Go templates, so a truth test sends it to the fail below --
+       rejecting the one source that needs no pin at all. */}}
+{{- if hasKey $v "emptyDir" }}
 {{- /* already admitted by the emptyDir clause */}}
-{{- else if $v.configMap }}
+{{- else if hasKey $v "configMap" }}
 {{- $extraVolPins = append $extraVolPins (dict "kind" "configMap" "field" "name" "value" ($v.configMap.name | toString)) }}
-{{- else if $v.secret }}
+{{- else if hasKey $v "secret" }}
 {{- $extraVolPins = append $extraVolPins (dict "kind" "secret" "field" "secretName" "value" ($v.secret.secretName | toString)) }}
-{{- else if $v.persistentVolumeClaim }}
+{{- else if hasKey $v "persistentVolumeClaim" }}
 {{- $extraVolPins = append $extraVolPins (dict "kind" "persistentVolumeClaim" "field" "claimName" "value" ($v.persistentVolumeClaim.claimName | toString)) }}
 {{- else }}
 {{- fail (printf "pgbackrest.extraVolumes[%d] (%s) is a volume source this chart cannot pin in the restore admission policy (#279/#323): only emptyDir, configMap, secret and persistentVolumeClaim carry a name the policy can bind to, and admitting an unpinned source would let the agent's Jobs mount anything of that type. The restore Job would be denied at admission the moment the agent tried to create it. Use one of those four sources, or -- if you need this one -- disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $i $vn) }}
@@ -111,11 +114,11 @@
 {{- range $i, $e := (.Values.pgbackrest.extraEnv | default list) }}
 {{- $en := $e.name | toString }}
 {{- with $e.valueFrom }}
-{{- if .secretKeyRef }}
+{{- if hasKey . "secretKeyRef" }}
 {{- $extraSecretRefs = append $extraSecretRefs (.secretKeyRef.name | toString) }}
-{{- else if .configMapKeyRef }}
+{{- else if hasKey . "configMapKeyRef" }}
 {{- $extraCmRefs = append $extraCmRefs (.configMapKeyRef.name | toString) }}
-{{- else if not .fieldRef }}
+{{- else if not (hasKey . "fieldRef") }}
 {{- fail (printf "pgbackrest.extraEnv[%d] (%s) uses an env valueFrom source the restore admission policy cannot pin (#279/#323): only fieldRef, secretKeyRef and configMapKeyRef can be bound to a name there, so this Job would be denied at admission the moment the agent tried to create it. Use one of those three, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $i $en) }}
 {{- end }}
 {{- end }}
@@ -485,7 +488,7 @@ spec:
     - expression: >-
         variables.pod.containers.all(c, !has(c.envFrom) && (!has(c.env) || c.env.all(e,
         !has(e.valueFrom) || ({{ $valueFromRule }}))))
-      message: "the pg agent's Jobs may not use envFrom, and may reference only the downward API{{ with $allSecretRefs }} or this release's own Secrets ({{ join ", " . }}){{ end }} through env valueFrom"
+      message: "the pg agent's Jobs may not use envFrom, and may reference only the downward API{{ with $allSecretRefs }} or this release's own Secrets ({{ join ", " . }}){{ end }}{{ with $extraCmRefs }} or the ConfigMaps this release's pgbackrest.extraEnv names ({{ join ", " . }}){{ end }} through env valueFrom"
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1
