@@ -189,7 +189,23 @@ for _ in $(seq 1 30); do
   sleep 4
 done
 assert_eq "primary sees exactly 1 streaming standby" "1" "${repl_count}"
-standby_tl=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT timeline_id FROM pg_control_checkpoint()" "testuser" "testdb" 2>/dev/null | tr -d '[:space:]' || echo "")
+# Read the timeline the way the AGENT reads it (internal/pg/probe.go StandbyTimeline), and poll:
+# pg_control_checkpoint() alone is not sufficient and this assertion was relying on an accident.
+# A standby that has followed onto a higher timeline BY STREAMING has not necessarily
+# checkpointed yet, so its control-file timeline still reads the old value;
+# min_recovery_end_timeline is the durable record of the furthest timeline received during
+# recovery and advances as the switch is replayed. Under repmgr this passed because the init
+# container re-cloned from the restored primary, so the control file carried the new timeline
+# straight out of the base backup -- under native the agent rewinds and follows, so it lags until
+# the next restartpoint. GREATEST() is exactly what the agent uses, and for the same reason.
+standby_tl=""
+for _ in $(seq 1 30); do
+  standby_tl=$(pg_exec "${NAMESPACE}" "${STANDBY}" \
+    "SELECT GREATEST((SELECT timeline_id FROM pg_control_checkpoint()), COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0))" \
+    "testuser" "testdb" 2>/dev/null | tr -d '[:space:]' || echo "")
+  [ "${standby_tl}" = "${tl_after}" ] && break
+  sleep 4
+done
 assert_eq "standby is on the primary's post-restore timeline" "${tl_after}" "${standby_tl}"
 # repmgr's own view: one primary, one active standby -- no orphaned/duplicate rows after
 # the restore rewrote the primary's identity.
