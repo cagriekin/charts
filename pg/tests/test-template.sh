@@ -3214,7 +3214,7 @@ assert_contains "#276 restore.sh: atomic write via a temp file" "${ctl_restore_s
 # The record is a cross-language contract: restore.sh (bash) writes it and the agent's
 # internal/pgbackrest (Go) parses it. Assert every key the parser reads, so renaming one
 # on either side is caught here rather than silently reporting an empty lastRestore.
-for key in startedAt finishedAt stanza targetType target backupSet exitCode requestedBy clusterState checkpoint; do
+for key in startedAt finishedAt restoredAt stanza targetType target backupSet exitCode requestedBy clusterState checkpoint; do
   assert_contains "#276 restore.sh: records ${key}" "${ctl_restore_sh}" "${key}="
 done
 # The trap is installed AFTER the postmaster.pid interlock, so a refused attempt cannot
@@ -3227,6 +3227,13 @@ assert_contains "#276 restore.sh: reads the previous record on failure" "${ctl_r
 for key in attemptedTargetType attemptedTarget attemptedBackupSet; do
   assert_contains "#276 restore.sh: records ${key} on failure" "${ctl_restore_sh}" "${key}="
 done
+# #288: restoredAt is the volume's provenance and must OUTLIVE a failed attempt -- the agent
+# ranks it in a failover election, so if a mistyped retry (which copies nothing) reset it, a
+# stale peer could win the lease and promote pre-restore data. exitCode still marks the attempt.
+assert_contains "#288 restore.sh: carries restoredAt across a failed attempt" \
+  "${ctl_restore_sh}" 'restored="$(prev_field restoredAt)"'
+assert_contains "#288 restore.sh: a clean restore stamps restoredAt with its own finish time" \
+  "${ctl_restore_sh}" 'restored="${finished}"'
 
 # --- #279: the job-create grant and its admission-policy bound ---
 #

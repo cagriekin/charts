@@ -291,9 +291,27 @@ data:
         prev_started="$(prev_field startedAt)"
         [ -n "${prev_started}" ] && started="${prev_started}"
       fi
+      # restoredAt is the finishedAt of the last SUCCESSFUL restore, carried across failed
+      # attempts (#288 review). The agent ranks restore provenance in a failover election, and
+      # keying that off finishedAt+exitCode meant one failed retry -- which often copies nothing
+      # at all -- erased a genuine restore's authority and let a stale peer promote pre-restore
+      # data. exitCode still marks THIS attempt; restoredAt describes the data on the volume.
+      local finished restored
+      finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      if [ "${code}" = "0" ]; then
+        restored="${finished}"
+      else
+        restored="$(prev_field restoredAt)"
+        # Records written before this field existed carry provenance only in finishedAt, so
+        # fall back to it when the previous attempt was itself a clean restore.
+        if [ -z "${restored}" ] && [ "$(prev_field exitCode)" = "0" ]; then
+          restored="$(prev_field finishedAt)"
+        fi
+      fi
       {
         echo "startedAt=${started}"
-        echo "finishedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "finishedAt=${finished}"
+        echo "restoredAt=${restored}"
         echo "stanza=${PGBACKREST_STANZA}"
         echo "targetType=${tt}"
         echo "target=${tg}"

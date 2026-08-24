@@ -56,6 +56,9 @@ func d(a Action, target, reason string) Decision {
 // LocalState is the local node's state. Timeline comes from pg_controldata when the
 // node is not a running primary (so it is meaningful even for a stopped/standby node).
 type LocalState struct {
+	// RestoredAt is the FinishedAt of the last successful pgBackRest restore on this node's
+	// volume, "" if none (#288). See PeerState.RestoredAt for why it ranks.
+	RestoredAt string
 	HasData    bool
 	Running    bool
 	InRecovery bool
@@ -83,6 +86,12 @@ type PeerState struct {
 	// node's copy of that table. A registered, reachable peer is a safe hand-off target
 	// for an unregistered lease holder that must not promote (#297).
 	Registered bool
+	// RestoredAt is this peer's last successful restore, gossiped (#288). A peer that was
+	// restored more recently than this node carries the cluster's intended history even though
+	// a PITR restore leaves it BEHIND in LSN terms -- so it outranks on provenance, not
+	// position. Compared as an opaque string identity, newest-wins by lexical order because it
+	// is an RFC3339 timestamp.
+	RestoredAt string
 }
 
 // MarkerState is the durable highwater marker (<fullname>-primary).
@@ -544,6 +553,11 @@ func primaryNamed(o Observation, name string) *PeerState {
 	return nil
 }
 
+// restoredAfter reports whether restore identity a is strictly newer than b (#288). Both are
+// RFC3339 timestamps or "", so lexical order is chronological and "" is oldest -- a node that
+// was never restored is never newer than one that was.
+func restoredAfter(a, b string) bool { return a != "" && a > b }
+
 // moreAdvancedPeer returns the name of the peer strictly ahead of the local node
 // (higher timeline, or same timeline + higher LSN), or "", and whether that peer is
 // currently SQL-reachable. A reachable peer can actually take over (a real handoff
@@ -555,10 +569,49 @@ func moreAdvancedPeer(o Observation) (string, bool) {
 	bestReachable := false
 	var bestTL pg.Timeline
 	var bestLSN pg.LSN
+	bestRestoredAt := ""
 	for i := range o.Peers {
 		p := &o.Peers[i]
 		if !p.Reachable && !p.Gossip {
 			continue // no known position for this peer
+		}
+		// RESTORE AUTHORITY (#288), checked before position. A PITR restore intentionally
+		// rewinds the cluster, so the restored node is BEHIND its un-restored peers -- and
+		// ranking on LSN alone let a stale peer win the lease and promote its pre-restore data,
+		// discarding the restored history. Observed live: after a restore the surviving standby
+		// promoted, the restored primary followed IT, and the cluster churned to a third
+		// timeline. A peer whose volume was restored more recently than this node's carries the
+		// history the operator asked for, whatever the positions say.
+		//
+		// A comparison, deliberately, not a veto in unsafeToServe: a standby cloned FROM a
+		// restored primary has its own record dropped by design, so a veto would bar it from
+		// ever promoting again. Ranking cannot deadlock -- with no restore records anywhere
+		// this is byte-identical to the previous behaviour.
+		// Provenance authority requires REACHABILITY (#288 review). A gossip-only restored peer
+		// used to win here, which suppressed the position ranking below and left the caller's
+		// unreachable branch to fall through to a local promote -- so a lease-holding standby
+		// promoted with LESS WAL than a live peer, breaking invariant 8 and losing the restore
+		// too. An unreachable node cannot serve, so it gets no say in who does; when it comes
+		// back it either is the primary or gets rewound/re-cloned (which drops its record).
+		if p.Reachable && restoredAfter(p.RestoredAt, o.Local.RestoredAt) {
+			if best == "" || restoredAfter(p.RestoredAt, bestRestoredAt) ||
+				(p.RestoredAt == bestRestoredAt && ahead(p.Timeline, p.TimelineOK, p.LSN, p.LSNOK, bestTL, true, bestLSN, true)) {
+				best, bestReachable, bestTL, bestLSN, bestRestoredAt = p.Name, p.Reachable, p.Timeline, p.LSN, p.RestoredAt
+			}
+			continue
+		}
+		// A peer with an OLDER restore identity than ours never outranks us, however far ahead
+		// its LSN: its data predates the restore this node carries.
+		if restoredAfter(o.Local.RestoredAt, p.RestoredAt) {
+			continue
+		}
+		// A provenance winner already stands, so a peer that merely leads on POSITION cannot
+		// displace it -- on a 3-node cluster the restored peer and a stale-but-ahead peer are
+		// both candidates, and without this the stale one wins the ranking and we are back to
+		// promoting pre-restore data. It also makes the result independent of the order peers
+		// happen to be iterated in.
+		if bestRestoredAt != "" {
+			continue
 		}
 		if !peerAhead(*p, o.Local) {
 			continue

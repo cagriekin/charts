@@ -496,6 +496,27 @@ func (a *agent) tick(ctx context.Context) {
 	}
 }
 
+// localRestoredAt returns the FinishedAt of the last SUCCESSFUL restore on this volume, or ""
+// (#288). Best-effort: an unreadable record means "no claim", which is the safe direction --
+// it can only ever cause this node to rank lower, never to outrank a peer it should not.
+func (a *agent) localRestoredAt() string {
+	rec, err := a.pgbr.LastRestore()
+	if err != nil {
+		return ""
+	}
+	// Prefer restoredAt: write_status carries it across later FAILED attempts, so a mistyped
+	// retry no longer erases a genuine restore's authority (#288 review). Fall back to
+	// finishedAt for records written before that field existed, which is sound only when the
+	// record itself is a clean restore.
+	if rec.RestoredAt != "" {
+		return rec.RestoredAt
+	}
+	if rec.Succeeded() {
+		return rec.FinishedAt
+	}
+	return ""
+}
+
 func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	local := a.prober.Probe(ctx, a.selfConn())
 	ls := reconcile.LocalState{
@@ -506,6 +527,11 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		TimelineOK: local.TimelineOK,
 		LSN:        local.WriteLSN,
 		LSNOK:      local.LSNOK,
+		// #288: this volume's restore provenance, from the record restore.sh leaves on it.
+		// Only a SUCCEEDED restore counts -- an interrupted one must never claim authority
+		// over a peer's history -- and the record is dropped whenever the volume is re-cloned,
+		// so a standby cloned from a restored primary correctly reports none of its own.
+		RestoredAt: a.localRestoredAt(),
 	}
 	// When postgres is not running its timeline/role are unreadable via SQL. Fall
 	// back to pg_controldata so the forward-rejoin and highwater guards still apply
@@ -570,6 +596,13 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 				ps.Timeline, ps.TimelineOK = pg.Timeline(g.Timeline), g.TimelineOK
 				ps.LSN, ps.LSNOK = pg.LSN{Hi: g.LSNHi, Lo: g.LSNLo}, g.LSNOK
 			}
+		}
+		// The restore identity is taken from gossip whether or not the peer is REACHABLE
+		// (#288), unlike position above. It is durable provenance rather than a live reading,
+		// and the case that matters is a reachable stale peer needing to see that another node
+		// was restored -- ranking on position alone let it promote and discard that history.
+		if g, ok := gossip[name]; ok && a.gossipFresh(g) {
+			ps.RestoredAt = g.RestoredAt
 		}
 		o.Peers = append(o.Peers, ps)
 	}
@@ -1475,6 +1508,10 @@ func (a *agent) publishStatus(ctx context.Context, ls reconcile.LocalState) {
 	pos := k8s.NodeStatus{
 		Timeline: uint32(ls.Timeline), TimelineOK: ls.TimelineOK,
 		LSNHi: ls.LSN.Hi, LSNLo: ls.LSN.Lo, LSNOK: ls.LSNOK,
+		// #288: provenance, not position. A peer deciding whether to promote needs to know
+		// this volume was restored, because a PITR restore leaves it BEHIND on LSN while
+		// carrying the history the operator actually asked for.
+		RestoredAt: ls.RestoredAt,
 	}
 	now := time.Now()
 	heartbeat := 2 * a.cfg.ReconcileInterval // < the 4x freshness window readers use
@@ -1646,6 +1683,14 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 		// A full re-clone: this directory's contents now come from the peer, not from
 		// whatever restore the record beside it describes.
 		a.dropRestoreRecord("the data directory was re-cloned from " + target)
+	} else {
+		// A successful pg_rewind ALSO rewrites this node's history onto the target's, so the
+		// restore record beside PGDATA no longer describes these contents (#288 review).
+		// Without this the claim outlived the data it described: after a controlled switchover
+		// the rewound node kept its restore identity, so a later lease landing on it made it
+		// skip a peer holding more WAL and promote anyway -- data loss with no restore in
+		// flight. Only the node that still carries the restored history keeps the claim.
+		a.dropRestoreRecord("the data directory was rewound onto " + target)
 	}
 	return a.sup.Start(ctx)
 }

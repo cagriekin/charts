@@ -27,6 +27,16 @@ type NodeStatus struct {
 	LSNLo         uint64 `json:"lsnLo"`
 	LSNOK         bool   `json:"lsnOK"`
 	UpdatedAtUnix int64  `json:"ts"`
+	// RestoredAt is the FinishedAt of the last SUCCESSFUL pgBackRest restore on this node's
+	// data volume, or "" when the volume carries no such record (#288).
+	//
+	// It is the cross-node half of restore authority. A PITR restore deliberately rewinds the
+	// cluster, so the restored volume is BEHIND its un-restored peers in LSN terms -- and the
+	// LSN-based election, doing its job, would then let a stale peer win and discard the
+	// restored history. The restore record is durable on the volume that was restored and is
+	// dropped whenever that volume is re-cloned, which makes it exactly the right provenance
+	// to compare. Empty for every node that has never been restored, which is the norm.
+	RestoredAt string `json:"rst,omitempty"`
 	// SchemaVersion is the on-DCS data version (omitted/0 == legacy v1). Stamped on
 	// publish so a peer reading this can detect a newer agent mid-upgrade (Part H4).
 	SchemaVersion int `json:"v,omitempty"`

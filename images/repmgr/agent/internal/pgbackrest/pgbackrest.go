@@ -99,6 +99,10 @@ type RestoreRecord struct {
 	Present    bool   `json:"present"`
 	StartedAt  string `json:"startedAt,omitempty"`
 	FinishedAt string `json:"finishedAt,omitempty"`
+	// RestoredAt is the finishedAt of the last SUCCESSFUL restore on this volume, carried
+	// across later failed attempts by write_status (#288 review). Prefer it over
+	// FinishedAt+Succeeded() when asking "where did this data come from".
+	RestoredAt string `json:"restoredAt,omitempty"`
 	Stanza     string `json:"stanza,omitempty"`
 	TargetType string `json:"targetType,omitempty"`
 	Target     string `json:"target,omitempty"`
@@ -159,6 +163,8 @@ func (c Client) LastRestore() (RestoreRecord, error) {
 			r.StartedAt = v
 		case "finishedAt":
 			r.FinishedAt = v
+		case "restoredAt":
+			r.RestoredAt = v
 		case "stanza":
 			r.Stanza = v
 		case "targetType":

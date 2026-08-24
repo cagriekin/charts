@@ -245,3 +245,32 @@ func TestLastRestoreFailedAttemptKeepsProvenance(t *testing.T) {
 		t.Errorf("the attempt should be reported: %+v", r)
 	}
 }
+
+// #288 review: a failed attempt must not erase the volume's restore identity. write_status
+// carries restoredAt (the finishedAt of the last SUCCESSFUL restore) across failures, because
+// the agent ranks restore provenance in a failover election -- keying that off
+// finishedAt+exitCode meant one mistyped retry, which copies nothing at all, let a stale peer
+// win the lease and promote pre-restore data.
+func TestLastRestoreFailedAttemptKeepsRestoredAt(t *testing.T) {
+	c := Client{StatusPath: writeStatus(t, strings.Join([]string{
+		"startedAt=2026-07-30T09:00:00Z",
+		"finishedAt=2026-07-30T11:00:00Z", // the FAILED attempt's own finish time
+		"restoredAt=2026-07-30T09:05:00Z", // the real restore, preserved
+		"stanza=db",
+		"exitCode=32",
+		"",
+	}, "\n"))}
+	r, err := c.LastRestore()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.Succeeded() {
+		t.Error("exitCode=32 must not read as success")
+	}
+	if r.RestoredAt != "2026-07-30T09:05:00Z" {
+		t.Errorf("restoredAt must survive a failed attempt, got %q", r.RestoredAt)
+	}
+	if r.FinishedAt == r.RestoredAt {
+		t.Error("finishedAt describes the attempt, restoredAt the data -- they are distinct")
+	}
+}
