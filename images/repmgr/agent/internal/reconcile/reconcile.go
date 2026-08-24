@@ -113,6 +113,21 @@ type Observation struct {
 	// grace -- a frozen/wedged postmaster that Start cannot recover and the
 	// reconcile-loop liveness probe won't catch. It drives self-health failover.
 	LocalStuck bool
+	// StandbyStalled is set by the agent (a stateful, time-based signal, like LocalStuck) when
+	// this node has been a RUNNING standby with NO walreceiver for several consecutive ticks.
+	//
+	// It exists to catch a standby whose history diverged before the primary's fork point --
+	// after a PITR restore, say -- which can never catch up by streaming: PostgreSQL logs
+	// "new timeline N forked off current database system timeline M before current recovery
+	// point" and then waits for WAL that will never arrive. Following it forever is the wrong
+	// answer; it needs a rewind or re-clone.
+	//
+	// Not derivable from a newer-timeline peer alone. A standby legitimately sits on an older
+	// timeline right after a failover and follows onto the new one BY STREAMING, so escalating
+	// on the timeline gap by itself would re-clone a healthy standby on every failover. The
+	// absent walreceiver is what separates "lagging, will converge" from "stalled, cannot".
+	// The agent requires it to persist so a routine reconnect blip does not trip it.
+	StandbyStalled bool
 	// PeersPending is set by the agent only during the cold-boot window (shortly
 	// after agent start) while some peer is not yet SQL-reachable. The holder waits
 	// rather than promoting/resuming, so the most-advanced election runs against
@@ -318,6 +333,15 @@ func Decide(o Observation) Decision {
 		// the primary's WAL senders. cascadeFollowTarget returns the leader unless a
 		// verifiably-safe upstream standby qualifies, so this is byte-identical to
 		// following the lease holder when cascade is off or no safe upstream exists.
+		// A stalled standby on an older timeline cannot converge by following (see
+		// StandbyStalled): its history diverged before the newer timeline forked, so the WAL it
+		// is waiting for does not exist. Rejoin instead -- pg_rewind if the histories allow,
+		// re-clone otherwise. Both conditions are required: the timeline gap alone is the
+		// ordinary post-failover case, and a missing walreceiver alone is a standby whose
+		// upstream is merely down.
+		if newer != nil && o.StandbyStalled {
+			return d(RejoinForward, newer.Name, "standby stalled on an older timeline with no walreceiver; its history diverged before the newer timeline forked, so following can never converge -- rejoin")
+		}
 		if up := cascadeFollowTarget(o); up != o.LeaderIdentity {
 			return d(Follow, up, "standby; cascade-follow upstream "+up+" (offload primary)")
 		}

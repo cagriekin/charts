@@ -152,6 +152,12 @@ type agent struct {
 	// on any non-Follow action.
 	followUpstream string
 
+	// standbyNoReceiverTicks counts consecutive ticks on which this node was a running standby
+	// with no walreceiver. Feeds reconcile.Observation.StandbyStalled (#288 review): a diverged
+	// standby that can never converge must be rejoined, but a routine reconnect -- or an upstream
+	// that is briefly down -- looks identical for a tick or two, so the signal has to persist.
+	standbyNoReceiverTicks int
+
 	// lastTopologyGap is the comma-joined set of live peers not streaming, so topologyTick logs
 	// one line per CHANGE instead of one per tick (#288). A rolling restart legitimately parks a
 	// peer off-stream for a while, and warning every 5s about it would bury everything else.
@@ -592,6 +598,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// primary, so this node's own copy is exactly what repmgr itself would consult when
 	// asked to follow someone.
 	a.readRegistryForGate(ctx, &o)
+	a.observeStandbyStall(ctx, &o)
 	// Cascading replication (#29): when enabled, a standby may follow another standby
 	// (the pure cascadeFollowTarget decides; default off -> follow the primary).
 	o.Cascade = a.cfg.CascadeReplication
@@ -638,6 +645,49 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	o.PeersPending = o.Marker.Present && anyUnreachable && !allSeen && time.Since(a.bootAt) < a.bootstrapGrace()
 	return o
 }
+
+// observeStandbyStall sets Observation.StandbyStalled when this node has been a running standby
+// with no walreceiver for several consecutive ticks (#288 review).
+//
+// The failure it catches: a standby whose history diverged BEFORE the primary's timeline forked
+// -- the shape a PITR restore leaves behind -- logs "new timeline N forked off current database
+// system timeline M before current recovery point" and then waits forever for WAL that does not
+// exist. Decide would otherwise return Follow on every tick indefinitely. Under repmgr this never
+// surfaced because init-repmgr.sh compared timelines and re-cloned before the postmaster started;
+// native has no such step, so the agent has to notice.
+//
+// Both halves of the eventual condition matter, and this is the half that needs state. A standby
+// sitting on an older timeline is NORMAL right after a failover -- it follows onto the new one by
+// streaming -- so the timeline gap alone must never escalate. An absent walreceiver is the
+// distinguisher, and requiring it for stallTicks consecutive ticks keeps a reconnect blip, or a
+// briefly-unreachable upstream, from triggering a re-clone.
+func (a *agent) observeStandbyStall(ctx context.Context, o *reconcile.Observation) {
+	if !(o.Local.Running && o.Local.InRecovery) {
+		a.standbyNoReceiverTicks = 0
+		return
+	}
+	_, streaming, err := a.prober.StreamingUpstream(ctx, a.selfConn())
+	if err != nil {
+		// Could not look: not evidence of a stall. Hold the counter rather than advancing it.
+		return
+	}
+	if streaming {
+		a.standbyNoReceiverTicks = 0
+		o.StandbyStalled = false
+		return
+	}
+	a.standbyNoReceiverTicks++
+	o.StandbyStalled = a.standbyNoReceiverTicks >= standbyStallTicks
+	if o.StandbyStalled {
+		a.log.Warn("standby has had no walreceiver for several ticks; eligible for rejoin if a peer is on a newer timeline (#288)",
+			"ticks", a.standbyNoReceiverTicks)
+	}
+}
+
+// standbyStallTicks is how many consecutive receiver-less ticks make a standby "stalled". Six at
+// the default 5s interval is ~30s -- comfortably longer than a walreceiver reconnect or a brief
+// upstream restart, and far shorter than the startup probe's window.
+const standbyStallTicks = 6
 
 // readRegistryForGate populates the #297 promote-registration gate's inputs from repmgr.nodes.
 // Only for a promote candidate (holder, running, in recovery); every other node leaves

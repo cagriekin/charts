@@ -1666,3 +1666,74 @@ func TestBootstrapInitdbNativeDiscardsAPartialDataDirOnExecFailure(t *testing.T)
 		t.Error("the partial cluster was left behind: bootstrap_initdb will no-op on it forever")
 	}
 }
+
+// #288 review: the stall signal needs hysteresis. A walreceiver reconnect, or an upstream that is
+// briefly down, looks identical to a permanent divergence for a tick or two -- and escalating on
+// that would re-clone a healthy standby.
+func TestObserveStandbyStallRequiresPersistence(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""} // running standby, no walreceiver row
+	a := newFollowTestAgent(t, ex)
+	base := reconcile.Observation{Local: reconcile.LocalState{Running: true, InRecovery: true, HasData: true}}
+
+	for i := 1; i < standbyStallTicks; i++ {
+		o := base
+		a.observeStandbyStall(context.Background(), &o)
+		if o.StandbyStalled {
+			t.Fatalf("stalled after only %d tick(s); want at least %d", i, standbyStallTicks)
+		}
+	}
+	o := base
+	a.observeStandbyStall(context.Background(), &o)
+	if !o.StandbyStalled {
+		t.Errorf("not stalled after %d receiver-less ticks", standbyStallTicks)
+	}
+
+	// A single streaming tick must reset it: the standby recovered on its own.
+	ex.walRcv = "pg-0.h|streaming"
+	o = base
+	a.observeStandbyStall(context.Background(), &o)
+	if o.StandbyStalled || a.standbyNoReceiverTicks != 0 {
+		t.Errorf("streaming did not clear the stall latch (stalled=%v ticks=%d)", o.StandbyStalled, a.standbyNoReceiverTicks)
+	}
+}
+
+// Ceasing to be a running standby (promoted, stopped, demoted) must reset the latch, or a
+// later spell as a standby would inherit a stale count and escalate early.
+func TestObserveStandbyStallResetsWhenNotARunningStandby(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""}
+	a := newFollowTestAgent(t, ex)
+	for i := 0; i < standbyStallTicks; i++ {
+		o := reconcile.Observation{Local: reconcile.LocalState{Running: true, InRecovery: true, HasData: true}}
+		a.observeStandbyStall(context.Background(), &o)
+	}
+	// Now a primary.
+	o := reconcile.Observation{Local: reconcile.LocalState{Running: true, InRecovery: false, HasData: true}}
+	a.observeStandbyStall(context.Background(), &o)
+	if a.standbyNoReceiverTicks != 0 || o.StandbyStalled {
+		t.Errorf("latch survived the role change (ticks=%d stalled=%v)", a.standbyNoReceiverTicks, o.StandbyStalled)
+	}
+}
+
+// An unreadable probe is not evidence of a stall: hold the counter rather than advancing it, so a
+// psql blip cannot march a healthy standby toward a re-clone.
+func TestObserveStandbyStallHoldsOnAProbeError(t *testing.T) {
+	a := newFollowTestAgent(t, &scriptedExec{walRcv: ""})
+	for i := 0; i < 3; i++ {
+		o := reconcile.Observation{Local: reconcile.LocalState{Running: true, InRecovery: true, HasData: true}}
+		a.observeStandbyStall(context.Background(), &o)
+	}
+	before := a.standbyNoReceiverTicks
+	// Swap in a prober whose psql fails.
+	a.prober = &pg.Prober{Exec: &failingExec{}, Timeout: time.Second}
+	o := reconcile.Observation{Local: reconcile.LocalState{Running: true, InRecovery: true, HasData: true}}
+	a.observeStandbyStall(context.Background(), &o)
+	if a.standbyNoReceiverTicks != before {
+		t.Errorf("a probe error advanced the stall counter: %d -> %d", before, a.standbyNoReceiverTicks)
+	}
+}
+
+type failingExec struct{}
+
+func (failingExec) Run(context.Context, []string, string, ...string) (string, error) {
+	return "", errors.New("exit status 2")
+}

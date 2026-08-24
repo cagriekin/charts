@@ -334,3 +334,59 @@ func TestDecideCascadeWiring(t *testing.T) {
 		t.Errorf("cascade on: want Follow pg-2 (immediate upstream), got %v %q", on.Action, on.Target)
 	}
 }
+
+// #288 review: a standby whose history diverged BEFORE the primary's timeline forked -- the shape
+// a PITR restore leaves -- can never converge by following. PostgreSQL logs "new timeline N forked
+// off ... before current recovery point" and waits for WAL that does not exist, while Decide
+// returned Follow on every tick forever. Verified live: the pgbackrest-restore-ha native leg sat
+// in exactly that loop until the PVC was deleted by hand.
+func TestDecideRejoinsAStalledStandbyOnAnOlderTimeline(t *testing.T) {
+	o := Observation{
+		LeaderIdentity: "pg-0",
+		Local:          LocalState{HasData: true, Running: true, InRecovery: true, Timeline: 1, TimelineOK: true},
+		Peers: []PeerState{
+			{Name: "pg-0", Reachable: true, Role: pg.RolePrimary, Timeline: 2, TimelineOK: true},
+		},
+		StandbyStalled: true,
+	}
+	d := Decide(o)
+	if d.Action != RejoinForward {
+		t.Fatalf("got %v (%s), want RejoinForward", d.Action, d.Reason)
+	}
+	if d.Target != "pg-0" {
+		t.Errorf("target = %q, want pg-0", d.Target)
+	}
+}
+
+// The timeline gap ALONE must never escalate: a standby legitimately sits on an older timeline
+// right after a failover and follows onto the new one by streaming. Escalating here would re-clone
+// a healthy standby on every failover.
+func TestDecideFollowsALaggingButStreamingStandby(t *testing.T) {
+	o := Observation{
+		LeaderIdentity: "pg-0",
+		Local:          LocalState{HasData: true, Running: true, InRecovery: true, Timeline: 1, TimelineOK: true},
+		Peers: []PeerState{
+			{Name: "pg-0", Reachable: true, Role: pg.RolePrimary, Timeline: 2, TimelineOK: true},
+		},
+		StandbyStalled: false, // streaming, or not yet stalled long enough
+	}
+	if d := Decide(o); d.Action != Follow {
+		t.Fatalf("got %v (%s), want Follow -- a lagging standby converges by streaming", d.Action, d.Reason)
+	}
+}
+
+// A missing walreceiver ALONE must not escalate either: that is a standby whose upstream is
+// merely down, and re-cloning would be both destructive and pointless.
+func TestDecideDoesNotRejoinAStalledStandbyOnTheSameTimeline(t *testing.T) {
+	o := Observation{
+		LeaderIdentity: "pg-0",
+		Local:          LocalState{HasData: true, Running: true, InRecovery: true, Timeline: 2, TimelineOK: true},
+		Peers: []PeerState{
+			{Name: "pg-0", Reachable: true, Role: pg.RolePrimary, Timeline: 2, TimelineOK: true},
+		},
+		StandbyStalled: true,
+	}
+	if d := Decide(o); d.Action == RejoinForward {
+		t.Fatalf("re-cloned a same-timeline standby whose upstream is merely down: %s", d.Reason)
+	}
+}
