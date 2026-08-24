@@ -1085,13 +1085,25 @@ pgbackrest:
   #         mountPath: /etc/apiserver-proxy
   #         readOnly: true
   #
+  # Two consequences worth knowing before you set extraVolumes. It is pod-level on the
+  # POSTGRESQL pod too (that is where the sidecar and the bootstrap init container live), so a
+  # ConfigMap/Secret that does not exist yet now holds the DATABASE pods in ContainerCreating
+  # on the next roll, not just the backups -- create it first, or mark the source
+  # `optional: true`. And when repmgr.agent.control.restore is enabled, the #279 admission
+  # policy that bounds the agent's `create jobs` grant pins the restore Job's volume sources
+  # and env valueFrom names: the chart folds these values into those pins automatically, but
+  # only sources it can bind to a NAME (emptyDir, configMap, secret, persistentVolumeClaim,
+  # and fieldRef/secretKeyRef/configMapKeyRef for env) can be pinned -- anything else is a
+  # render failure rather than a restore that is refused at admission during an incident.
+  #
   # Validated at render time (see pg.validatePgbackrestPassthrough): each must be a LIST of
   # objects; setting any of them while pgbackrest.enabled is false is rejected rather than
   # silently ignored; extraVolumes names may not collide with a chart volume in any of those
   # pods (nor with postgresql.extraVolumes / postgresql.extensions.extraVolumes, which share
   # the postgresql pod's volume list); every extraVolumeMounts entry must reference a declared
-  # extraVolumes entry, must not shadow a path the containers depend on (PGDATA,
-  # /etc/pgbackrest/pgbackrest.conf, /scripts, /work, /tmp) and must not repeat a mountPath;
+  # extraVolumes entry, must not shadow a path the containers depend on (at/above/inside
+  # PGDATA, /scripts and /etc/pgbackrest/pgbackrest.conf; at/above /work, /tmp and
+  # /var/run/postgresql -- nesting inside those three is fine) and must not repeat a mountPath;
   # and extraEnv may not reuse a chart-set name (PGBACKREST_*, STANZA, TARGET, HOME, ...).
   extraEnv: []
   extraVolumes: []

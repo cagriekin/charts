@@ -4618,16 +4618,103 @@ for bad in /var/lib/postgresql/data /var/lib/postgresql/data/pgdata /etc/pgbackr
     --set "pgbackrest.extraVolumeMounts[0].mountPath=${bad}" >/dev/null 2>&1 || pb_shadow_rc=$?
   assert_eq "#323: an extraVolumeMount over ${bad} fails the render" "1" "${pb_shadow_rc}"
 done
-# ...and the guards must not be so wide that the feature is unusable: a path of the operator's
-# own, and a sibling of the mounted pgbackrest.conf (pgbackrest reads conf.d), both render.
-pb_ok_rc=0
-helm template test-pg "${CHART_DIR}" \
+# Nesting is refused only where nesting is itself broken (#323 review): /scripts is a READ-ONLY
+# configMap volume, so the kubelet cannot create a sub-mountpoint and the pod sticks in
+# CreateContainerError; PGDATA is the directory the restore writes; pgbackrest.conf is a file.
+for nested in /scripts/helpers /var/lib/postgresql/data/pgdata/x /etc/pgbackrest/pgbackrest.conf/x; do
+  pb_nest_rc=0
+  helm template test-pg "${CHART_DIR}" \
+    -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+    --set 'pgbackrest.extraVolumes[0].name=k' \
+    --set 'pgbackrest.extraVolumes[0].emptyDir.sizeLimit=1Mi' \
+    --set 'pgbackrest.extraVolumeMounts[0].name=k' \
+    --set "pgbackrest.extraVolumeMounts[0].mountPath=${nested}" >/dev/null 2>&1 || pb_nest_rc=$?
+  assert_eq "#323: an extraVolumeMount nested under ${nested%/*} fails the render" "1" "${pb_nest_rc}"
+done
+# mountPath: / must not be answered with "mountPath is required" -- trimSuffix would turn it
+# into the empty string, giving the most destructive input the least informative message.
+pb_root_out=$(helm template test-pg "${CHART_DIR}" \
   -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
   --set 'pgbackrest.extraVolumes[0].name=k' \
   --set 'pgbackrest.extraVolumes[0].emptyDir.sizeLimit=1Mi' \
   --set 'pgbackrest.extraVolumeMounts[0].name=k' \
-  --set 'pgbackrest.extraVolumeMounts[0].mountPath=/etc/pgbackrest/conf.d' >/dev/null 2>&1 || pb_ok_rc=$?
-assert_eq "#323: a conf.d sibling mount still renders" "0" "${pb_ok_rc}"
+  --set 'pgbackrest.extraVolumeMounts[0].mountPath=/' 2>&1 || true)
+assert_contains "#323: mountPath / is named, not reported as missing" "${pb_root_out}" \
+  "entire root filesystem"
+
+# ...and the guards must not be so wide that the feature is unusable. /work, /tmp and
+# /var/run/postgresql are writable emptyDirs, so nesting inside them is the NORMAL case -- a
+# kubeconfig at /tmp/kube has to render. So does a sibling of the mounted pgbackrest.conf
+# (pgbackrest reads conf.d), and a path of the operator's own.
+for good in /etc/pgbackrest/conf.d /tmp/kube /work/mine /etc/apiserver-proxy; do
+  pb_ok_rc=0
+  helm template test-pg "${CHART_DIR}" \
+    -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+    --set 'pgbackrest.extraVolumes[0].name=k' \
+    --set 'pgbackrest.extraVolumes[0].emptyDir.sizeLimit=1Mi' \
+    --set 'pgbackrest.extraVolumeMounts[0].name=k' \
+    --set "pgbackrest.extraVolumeMounts[0].mountPath=${good}" >/dev/null 2>&1 || pb_ok_rc=$?
+  assert_eq "#323: a mount at ${good} still renders" "0" "${pb_ok_rc}"
+done
+
+# #323 review x #279: the restore Job this passthrough now reaches is the SAME spec the agent
+# clones into the Job it creates (k8s.CloneCronJobToJob), and that Job is pinned by the
+# ValidatingAdmissionPolicy. Left out of the pins, an operator who added a kubeconfig to fix
+# backups would find POST /v1/restore denied at admission -- during an incident, with the
+# release itself looking correct. Assert the pins actually name the passthrough's sources.
+pb_pol_res=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  -f "${SCRIPT_DIR}/values-pgbackrest-extra.yaml" \
+  -f "${SCRIPT_DIR}/values-agent-control-restore.yaml" \
+  --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains "#323/#279: the volume pin names the extra configMap" "${pb_pol_res}" \
+  "v.configMap.name == 'apiserver-proxy-kubeconfig'"
+assert_contains "#323/#279: the env pin names the extra Secret" "${pb_pol_res}" \
+  "apiserver-proxy-token"
+# A secret volume and a configMapKeyRef are pinned by their own names too -- configMapKeyRef is
+# denied by default, and is admitted only because the release itself declared this one.
+pb_pol2_res=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  -f "${SCRIPT_DIR}/values-agent-control-restore.yaml" \
+  --set-json 'pgbackrest.extraVolumes=[{"name":"s","secret":{"secretName":"proxy-ca"}}]' \
+  --set-json 'pgbackrest.extraEnv=[{"name":"E","valueFrom":{"configMapKeyRef":{"name":"proxy-cm","key":"k"}}}]' \
+  --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains "#323/#279: a secret volume is pinned by secretName" "${pb_pol2_res}" \
+  "v.secret.secretName == 'proxy-ca'"
+# Brackets escaped: assert_contains is grep, so an unescaped [...] is a character class that
+# would match a single character and pass for the wrong reason.
+assert_contains "#323/#279: a declared configMapKeyRef is admitted by name" "${pb_pol2_res}" \
+  "e.valueFrom.configMapKeyRef.name in \\['proxy-cm'\\]"
+# A source the policy cannot bind to a name is a RENDER failure, not a silent widening
+# (admitting has(v.projected) would readmit arbitrary Secrets) and not a silent breakage.
+pb_pol_unpinnable_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  -f "${SCRIPT_DIR}/values-agent-control-restore.yaml" \
+  --set-json 'pgbackrest.extraVolumes=[{"name":"p","projected":{"sources":[]}}]' >/dev/null 2>&1 || pb_pol_unpinnable_rc=$?
+assert_eq "#323/#279: an unpinnable extraVolume source fails the render" "1" "${pb_pol_unpinnable_rc}"
+pb_pol_unpinnable_env_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  -f "${SCRIPT_DIR}/values-agent-control-restore.yaml" \
+  --set-json 'pgbackrest.extraEnv=[{"name":"E","valueFrom":{"resourceFieldRef":{"resource":"limits.cpu"}}}]' >/dev/null 2>&1 || pb_pol_unpinnable_env_rc=$?
+assert_eq "#323/#279: an unpinnable extraEnv valueFrom fails the render" "1" "${pb_pol_unpinnable_env_rc}"
+# The passthrough's names now reach single-quoted CEL literals, so they go through the same
+# injection guard as every other interpolated value: `x' || true || '` would otherwise render a
+# syntactically valid, always-true pin that lints clean (#279).
+pb_cel_out=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  -f "${SCRIPT_DIR}/values-agent-control-restore.yaml" \
+  --set-json "pgbackrest.extraVolumes=[{\"name\":\"v\",\"configMap\":{\"name\":\"x' || true || '\"}}]" 2>&1 || true)
+assert_contains "#323/#279: a passthrough name that would break CEL fails the render" \
+  "${pb_cel_out}" "cannot be embedded in the restore admission policy"
+
+# ...and only while the policy is in play: without it there is nothing to pin against.
+pb_pol_off_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set-json 'pgbackrest.extraVolumes=[{"name":"p","projected":{"sources":[]}}]' >/dev/null 2>&1 || pb_pol_off_rc=$?
+assert_eq "#323/#279: the same source renders when the policy is not enabled" "0" "${pb_pol_off_rc}"
 
 # pgvector inherits all of it from the symlinked templates -- assert the reach, since pgvector
 # has no KinD suites of its own and this is where a divergence would surface.

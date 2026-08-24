@@ -1215,6 +1215,21 @@ which is also where `archive_command`'s own pgBackRest invocation reads its envi
 side effect of configuring backups. Keep the two lists separate even when they carry the same
 values.
 
+**`extraVolumes` reaches the database pods too**, since the sidecar and the bootstrap init
+container live there. A ConfigMap or Secret that does not exist yet therefore holds the
+**postgresql** pods in `ContainerCreating` on the next roll, not just the backups — create it
+before the upgrade, or mark the source `optional: true`.
+
+**With `repmgr.agent.control.restore` enabled**, the `#279` ValidatingAdmissionPolicy that
+bounds the agent's `create jobs` grant pins the restore Job's volume sources and env
+`valueFrom` names. The chart folds these values into those pins automatically, so the
+agent-driven restore keeps working — but only sources it can bind to a *name* can be pinned
+(`emptyDir`, `configMap`, `secret`, `persistentVolumeClaim`; `fieldRef`, `secretKeyRef`,
+`configMapKeyRef` for env). Anything else (`projected`, `csi`, `hostPath`, `resourceFieldRef`)
+is a **render failure**, deliberately: admitting an unpinned source would reopen the door that
+policy exists to close, and leaving it out would surface as `POST /v1/restore` denied at
+admission during an incident.
+
 **Guarded at render time**, since every one of these failures is otherwise apply-time or
 run-time only:
 
@@ -1225,10 +1240,13 @@ run-time only:
   same postgresql pod volume list (a duplicate name is rejected by the API server).
 - Every `extraVolumeMounts` entry must reference a declared `extraVolumes` entry (the kubelet
   rejects the rest at apply time — the CronJob would render, fire, and never run), must not
-  repeat a `mountPath`, and must not shadow a path the containers depend on: PGDATA (at, above
-  **or inside** — these containers restore into it), `/etc/pgbackrest/pgbackrest.conf`,
-  `/scripts`, `/work`, `/tmp`, `/var/run/postgresql`. A sibling such as
-  `/etc/pgbackrest/conf.d` is fine.
+  repeat a `mountPath`, and must not shadow a path the containers depend on. At, above **or
+  inside** for PGDATA (a projection inside it shadows part of the directory the restore writes),
+  `/scripts` (a read-only configMap volume — the kubelet cannot create a nested mountpoint and
+  the pod sticks in `CreateContainerError`) and `/etc/pgbackrest/pgbackrest.conf` (a file). At
+  or above only for `/work`, `/tmp` and `/var/run/postgresql`, which are writable `emptyDir`s —
+  nesting inside them is the normal case, so `/tmp/kube` is fine. So is a sibling such as
+  `/etc/pgbackrest/conf.d`, and `mountPath: /` is refused by name.
 - `extraEnv` may not reuse a name the chart sets on any of the containers (`PGBACKREST_*`,
   `STANZA`, `TARGET`, `HOME`, …), including names only a currently-disabled feature emits — so
   a passthrough that works today cannot start silently shadowing a chart value after a later

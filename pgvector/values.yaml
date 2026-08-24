@@ -871,8 +871,11 @@ pgbackrest:
   # client (it resolves the primary from EndpointSlices) and therefore takes no backup -- and
   # never runs stanza-create, so archive_command fails from the start -- on a cluster whose
   # egress policy denies pod traffic to the apiserver. Set KUBECONFIG here and mount the
-  # kubeconfig, the same escape postgresql.extraEnv gives the agent (#317). Validated at render
-  # time (pg.validatePgbackrestPassthrough); see the pg chart README.
+  # kubeconfig, the same escape postgresql.extraEnv gives the agent (#317). extraVolumes is
+  # pod-level on the postgresql pod too, so a ConfigMap/Secret that does not exist yet holds
+  # the DATABASE pods in ContainerCreating on the next roll -- create it first, or mark the
+  # source optional. Validated at render time (pg.validatePgbackrestPassthrough); see the pg
+  # chart README.
   extraEnv: []
   extraVolumes: []
   extraVolumeMounts: []

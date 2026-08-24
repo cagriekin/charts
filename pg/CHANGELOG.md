@@ -45,6 +45,20 @@
   start shadowing a chart value after a later upgrade enables `repoEncryption` or switches
   `s3.keyType`.
 
+  Two consequences documented in the README rather than left to be discovered.
+  `extraVolumes` is pod-level on the **postgresql** pod as well (that is where the sidecar and
+  the bootstrap init container live), so a ConfigMap or Secret that does not exist yet holds
+  the database pods in `ContainerCreating` on the next roll, not just the backups. And with
+  `repmgr.agent.control.restore` enabled, the #279 ValidatingAdmissionPolicy that bounds the
+  agent's `create jobs` grant pins the restore Job's volume sources and env `valueFrom` names
+  -- the chart folds these values into those pins, so the agent-driven restore keeps working,
+  but only sources it can bind to a NAME (`emptyDir`, `configMap`, `secret`,
+  `persistentVolumeClaim`; `fieldRef`/`secretKeyRef`/`configMapKeyRef` for env) can be pinned.
+  Anything else is a render failure on purpose: admitting an unpinned source would reopen the
+  door that policy exists to close, and omitting it would surface as `POST /v1/restore` denied
+  at admission during an incident. The names reach single-quoted CEL literals, so they go
+  through the same injection guard as every other interpolated value.
+
   No render change with the values unset.
 
 ## 1.15.0 - 2026-08-23

@@ -72,7 +72,16 @@ the apiserver's own **certificate** (`server:` + `tls-server-name:`).
 
 | Variable | Type | Required | Default / source | Consumer |
 |----------|------|----------|------------------|----------|
-| `KUBECONFIG` | path(s) | no | operator-supplied via `postgresql.extraEnv`; unset by default | agent (mutation client **and** the Lease DCS), `kubectl` |
+| `KUBECONFIG` | path(s) | no | operator-supplied via `postgresql.extraEnv` (postgresql container) or `pgbackrest.extraEnv` (#323, every pgbackrest container); unset by default | agent (mutation client **and** the Lease DCS), `kubectl` — including the backup CronJob's |
+
+The two supply routes are separate lists on purpose and a cluster that needs this route
+needs it in both. `postgresql.extraEnv` reaches the postgresql container only; the
+pgBackRest backup CronJob runs in its own pod and is an apiserver client in its own right
+(it resolves the primary from EndpointSlices, then drives pgBackRest with `kubectl exec`),
+so it takes `KUBECONFIG` from `pgbackrest.extraEnv` instead — which also carries it to the
+`pgbackrest` sidecar, the `pgbackrest-bootstrap` init container, and the restore and
+validation workloads. Injecting it through `postgresql.extraEnv` would additionally
+redirect the entrypoint's stale-primary guard, which is why the chart keeps them apart.
 
 Set but unreadable/malformed/contextless is a startup failure naming the file, never a
 silent fall back to in-cluster. `~/.kube/config` is deliberately not consulted. The boot

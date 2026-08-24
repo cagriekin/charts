@@ -991,32 +991,45 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- $volNames = append $volNames $n -}}
 {{- end -}}
 {{- /* Mount destinations that would shadow something one of the five containers depends on.
-       Rejected when the mountPath IS one of these or CONTAINS it: a directory mount over
-       /etc/pgbackrest/pgbackrest.conf's parent hides the repository configuration (pgbackrest
-       then reports a missing stanza rather than a bad mount), over /scripts hides restore.sh /
-       validate.sh / bootstrap.sh (the container's whole command), over /work or /tmp replaces
-       a writable emptyDir with a read-only projection (pgbackrest's log/lock paths and
-       kubectl's HOME cache both live there, and the failure surfaces as EROFS mid-run). */ -}}
-{{- $shadow := list "/var/run/postgresql" "/etc/pgbackrest/pgbackrest.conf" "/scripts" "/work" "/tmp" -}}
-{{- $pgdata := "/var/lib/postgresql/data" -}}
+       Rejected when the mountPath IS one of these or CONTAINS it: over /work or /tmp it
+       replaces a writable emptyDir with a read-only projection (pgbackrest's log/lock paths
+       and kubectl's HOME cache both live there, and the failure surfaces as EROFS mid-run),
+       and over /var/run/postgresql it hides the socket directory the sidecar shares with the
+       postmaster. Nesting INSIDE these three is fine and is the normal case -- they are
+       emptyDirs, so the kubelet creates the sub-mountpoint (a kubeconfig at /tmp/kube is a
+       perfectly good place for it). */ -}}
+{{- $shadow := list "/var/run/postgresql" "/work" "/tmp" -}}
+{{- /* These get the strictest rule -- at, above, OR inside -- because nesting under them is
+       broken too (#323 review). /scripts is a READ-ONLY configMap volume carrying restore.sh /
+       validate.sh / bootstrap.sh, so the kubelet cannot create a nested mountpoint in it and
+       the pod sticks in CreateContainerError; /etc/pgbackrest/pgbackrest.conf is a subPath
+       FILE mount, so nothing can live under it; and PGDATA is the live data directory these
+       containers restore into and then read with pg_controldata, where a projection anywhere
+       inside is data corruption rather than a failed mount. */ -}}
+{{- $noNest := list "/var/lib/postgresql/data" "/scripts" "/etc/pgbackrest/pgbackrest.conf" -}}
 {{- $seenPaths := dict -}}
 {{- range $i, $m := $mounts -}}
   {{- $n := ($m.name | default "") | toString -}}
   {{- if not $n -}}{{- fail (printf "pgbackrest.extraVolumeMounts[%d]: name is required" $i) -}}{{- end -}}
-  {{- $path := ($m.mountPath | default "") | toString | trimSuffix "/" -}}
-  {{- if not $path -}}{{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath is required" $i $n) -}}{{- end -}}
+  {{- $rawPath := ($m.mountPath | default "") | toString -}}
+  {{- if not $rawPath -}}{{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath is required" $i $n) -}}{{- end -}}
+  {{- /* Checked BEFORE the trimSuffix below, which would turn "/" into "" and answer the most
+         destructive possible input with "mountPath is required" (#323 review). */ -}}
+  {{- if eq $rawPath "/" -}}
+    {{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath is \"/\", which would mount over the container's entire root filesystem -- every binary the pgbackrest containers run included. Mount a specific directory instead." $i $n) -}}
+  {{- end -}}
+  {{- $path := $rawPath | trimSuffix "/" -}}
   {{- if not (has $n $volNames) -}}
     {{- fail (printf "pgbackrest.extraVolumeMounts[%d]: no pgbackrest.extraVolumes entry named %q (declared: %s). Every extra mount needs a matching extra volume -- otherwise the kubelet rejects the pod at apply time with `volumeMounts[..].name: Not found`, so the CronJob renders, fires, and never runs. Check for a typo, or that you set extraVolumes (plural). Chart-managed volumes cannot be mounted here." $i $n (ternary "none" (join ", " $volNames) (empty $volNames))) -}}
   {{- end -}}
-  {{- /* The data directory gets the strictest rule -- at, above, OR inside. These containers
-         restore into PGDATA and read it with pg_controldata; a projection anywhere inside it
-         is data corruption rather than a failed mount. */ -}}
-  {{- if or (eq $path $pgdata) (hasPrefix (printf "%s/" $path) $pgdata) (hasPrefix (printf "%s/" $pgdata) $path) -}}
-    {{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath %q is at, above or inside %q -- the live data directory these containers restore into and read with pg_controldata. A volume projected there shadows PGDATA (or part of it) for the restore and for the postmaster that starts on it afterwards. Mount somewhere outside the data volume." $i $n $path $pgdata) -}}
+  {{- range $gp := $noNest -}}
+    {{- if or (eq $path $gp) (hasPrefix (printf "%s/" $path) $gp) (hasPrefix (printf "%s/" $gp) $path) -}}
+      {{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath %q is at, above or inside %q, which the pgbackrest containers depend on. Nesting under it does not work either: %q is the live data directory (a projection inside it shadows part of PGDATA for the restore and for the postmaster that starts on it), /scripts is a read-only configMap volume the kubelet cannot create a sub-mountpoint in (the pod sticks in CreateContainerError), and pgbackrest.conf is a file. Mount a path of your own instead -- e.g. /etc/apiserver-proxy for a kubeconfig." $i $n $path $gp "/var/lib/postgresql/data") -}}
+    {{- end -}}
   {{- end -}}
   {{- range $gp := $shadow -}}
     {{- if or (eq $path $gp) (hasPrefix (printf "%s/" $path) $gp) -}}
-      {{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath %q is at or above %q, which the pgbackrest containers already use. Mounting over it hides what is there (the repository config, the script the container runs, or a writable scratch volume) and the pod fails at RUN time, not at apply time. Mount a path of your own instead -- e.g. /etc/apiserver-proxy for a kubeconfig." $i $n $path $gp) -}}
+      {{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath %q is at or above %q, a writable scratch volume the pgbackrest containers already use (pgbackrest's log/lock paths, kubectl's HOME cache, the postmaster socket directory). Replacing it with a projection fails at RUN time, not at apply time. Mount a path of your own, or nest INSIDE it -- %q/mine is fine." $i $n $path $gp $gp) -}}
     {{- end -}}
   {{- end -}}
   {{- /* Duplicate mountPath is rejected by the API SERVER, not by helm
