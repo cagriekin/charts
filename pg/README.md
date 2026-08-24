@@ -1145,7 +1145,99 @@ Notes:
 - The boot log records which route was taken, so this is answerable without a debugger: `msg="starting pg-ha-agent" ... apiserver="kubeconfig /etc/apiserver-proxy/kubeconfig"` (or `apiserver=in-cluster`).
 - With `KUBECONFIG` unset — the default — behaviour is byte-identical to before: the in-cluster ServiceAccount plus `KUBERNETES_SERVICE_HOST`/`_PORT`. `~/.kube/config` is deliberately *not* consulted, so a stray file in the image or on a mounted home cannot silently redirect a production cluster.
 - The entrypoint's stale-primary guard (`#170`) shells out to `kubectl`, which honours `KUBECONFIG` natively, so it follows the same route with no extra wiring. It runs in the **postgresql** container (`entrypoint.sh` `postgres`/`agent` mode), which is where `postgresql.extraEnv`/`extraVolumeMounts` land; the `repmgr-init` init container makes no apiserver calls at all, so it needs none of this.
+- The pgBackRest **backup CronJob** is a separate apiserver client with a separate pod, and it
+  is not covered by `postgresql.extraEnv` — it has its own passthrough, `pgbackrest.extraEnv`
+  ([#323](#routing-the-backup-cronjobs-apiserver-traffic--pgbackrestextraenv-323)). A cluster
+  that needs this route needs it in both places.
 - **`kubectl` and the agent disagree on a *broken* kubeconfig.** The stale-primary guard's `kubectl` uses client-go's deferred loader, which *does* silently fall back to in-cluster when the merged kubeconfig is missing, empty, or has no current context — so on the very clusters this feature is for, a broken mount makes the guard time out and take its documented fail-open fast path (a single peer scan instead of the settle-retry) while the agent refuses to boot. The peer scan still refuses to `initdb` next to a reachable primary, so this narrows a safety margin rather than removing it, but it is the reason to mount the kubeconfig from a ConfigMap that cannot vanish and to check the `apiserver=` log line after the first roll.
+
+### Routing the backup CronJob's apiserver traffic — `pgbackrest.extraEnv` (#323)
+
+The pgBackRest **backup CronJob is an apiserver client**. It resolves the current primary at
+fire time by listing EndpointSlices and then drives pgBackRest with `kubectl exec` — which is
+what makes a schedule survive a failover, and what makes it fail on a cluster where the pod's
+route to `kubernetes.default.svc` is closed:
+
+```text
+couldn't get current server API group list: Get "https://10.96.0.1:443/api?timeout=32s":
+dial tcp 10.96.0.1:443: i/o timeout
+```
+
+The second-order damage is the one to watch for. That CronJob is also the **only** caller of
+`stanza-create` in the chart, so a blocked apiserver means the repository is never initialised
+and `archive_command` fails on every WAL segment from the moment the cluster starts —
+`archived_count 0, failed_count 196` within the hour, on a cluster whose pods, Services and
+policies all read as correctly configured.
+
+The escape is the one `postgresql.extraEnv` already gave the agent in
+[#317](#routing-the-agents-apiserver-traffic--kubeconfig-317), now available on the pgBackRest
+side too:
+
+```yaml
+pgbackrest:
+  extraEnv:
+    - name: KUBECONFIG
+      value: /etc/apiserver-proxy/kubeconfig
+  extraVolumes:
+    - name: apiserver-proxy
+      configMap:
+        name: apiserver-proxy-kubeconfig
+  extraVolumeMounts:
+    - name: apiserver-proxy
+      mountPath: /etc/apiserver-proxy
+      readOnly: true
+```
+
+Use the same kubeconfig shape as #317 (a different **address**, the apiserver's own
+certificate, `tls-server-name`, and the ServiceAccount's own token file — so RBAC is unchanged
+and there is no second credential to rotate).
+
+**What the three values reach.** All of them apply to every container that runs the pgBackRest
+binary or drives it, which is more than the CronJob:
+
+| | `pgbackrest.extraEnv` / `extraVolumeMounts` | `pgbackrest.extraVolumes` |
+|---|---|---|
+| `pgbackrest` sidecar (postgresql pod) | ✅ | pod-level ✅ |
+| `pgbackrest-bootstrap` init container (postgresql pod) | ✅ | same pod |
+| backup CronJobs (`full`, `diff`) | ✅ | ✅ |
+| restore Job / CronJob | ✅ | ✅ |
+| validation CronJob | ✅ | ✅ |
+| **postgresql container** | ❌ — use `postgresql.extraEnv` | — |
+
+The sidecar matters as much as the CronJob: `stanza-create` and `backup` actually execute
+*there*, via `kubectl exec` from the CronJob. A setting that reached the CronJob alone would
+route the `kubectl` call and leave the backup itself unchanged — so a proxy or a private CA for
+the S3 repository has to land on both, and it does.
+
+The **postgresql container is deliberately excluded**. It has `postgresql.extraEnv` of its own,
+which is also where `archive_command`'s own pgBackRest invocation reads its environment; and a
+`KUBECONFIG` injected there would redirect the entrypoint's stale-primary guard (#170) as a
+side effect of configuring backups. Keep the two lists separate even when they carry the same
+values.
+
+**Guarded at render time**, since every one of these failures is otherwise apply-time or
+run-time only:
+
+- Setting any of the three while `pgbackrest.enabled` is `false` is **refused**, not ignored —
+  silently inert backup configuration is precisely the failure mode above.
+- `extraVolumes` names are checked against the chart's own volumes in *all four* pods, and
+  against `postgresql.extraVolumes` / `postgresql.extensions.extraVolumes`, which land in the
+  same postgresql pod volume list (a duplicate name is rejected by the API server).
+- Every `extraVolumeMounts` entry must reference a declared `extraVolumes` entry (the kubelet
+  rejects the rest at apply time — the CronJob would render, fire, and never run), must not
+  repeat a `mountPath`, and must not shadow a path the containers depend on: PGDATA (at, above
+  **or inside** — these containers restore into it), `/etc/pgbackrest/pgbackrest.conf`,
+  `/scripts`, `/work`, `/tmp`, `/var/run/postgresql`. A sibling such as
+  `/etc/pgbackrest/conf.d` is fine.
+- `extraEnv` may not reuse a name the chart sets on any of the containers (`PGBACKREST_*`,
+  `STANZA`, `TARGET`, `HOME`, …), including names only a currently-disabled feature emits — so
+  a passthrough that works today cannot start silently shadowing a chart value after a later
+  `helm upgrade` enables `repoEncryption` or switches `s3.keyType`.
+
+If you are patching the rendered CronJobs in an operator today to inject this, these values
+replace that: a post-render patch matched on the `-pgbackrest` ServiceAccount breaks silently
+if the chart renames it, and "silently" there means a tenant with no backups and nothing wrong
+in its status.
 
 ### PGPool-II Parameters
 
@@ -1896,6 +1988,9 @@ helm install my-postgres cagriekin/pg \
 |-----------|-------------|---------|
 | `pgbackrest.enabled` | Enable pgBackRest | `false` |
 | `pgbackrest.stanza` | pgBackRest stanza name | `db` |
+| `pgbackrest.extraEnv` | Extra env vars for **every** pgBackRest container — the sidecar and `pgbackrest-bootstrap` init container in the postgresql pod, the backup CronJobs, the restore workload, the validation CronJob (supports `value` and `valueFrom`); may not reuse a chart-set name ([#323](#routing-the-backup-cronjobs-apiserver-traffic--pgbackrestextraenv-323)) | `[]` |
+| `pgbackrest.extraVolumes` | Extra pod-level volumes on each of those pods; names may not collide with a chart volume in any of them, nor with `postgresql.extraVolumes` | `[]` |
+| `pgbackrest.extraVolumeMounts` | Extra mounts on each of those containers; each must reference a `pgbackrest.extraVolumes` entry and may not shadow PGDATA, `/etc/pgbackrest/pgbackrest.conf`, `/scripts`, `/work` or `/tmp` | `[]` |
 | `pgbackrest.s3.endpoint` | S3-compatible endpoint URL | `""` |
 | `pgbackrest.s3.bucket` | S3 bucket name | `""` |
 | `pgbackrest.s3.region` | S3 region | `us-east-1` |

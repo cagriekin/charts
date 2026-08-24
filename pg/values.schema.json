@@ -203,6 +203,33 @@
     "pgbackrest": {
       "type": "object",
       "properties": {
+        "extraEnv": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": { "name": { "type": "string" } }
+          },
+          "description": "core-v1 EnvVar list added to EVERY pgbackrest container (#323) -- the sidecar and pgbackrest-bootstrap init container in the postgresql pod, the backup CronJobs, the restore Job, the validation CronJob. Chiefly KUBECONFIG, to route the backup CronJob's apiserver traffic (EndpointSlice lookup + kubectl exec) through an in-cluster proxy on a cluster whose egress policy denies the apiserver -- without it no backup runs, and stanza-create never runs either, so archive_command fails on every segment. May not reuse a chart-set name; enforced with the rest of the shape by pg.validatePgbackrestPassthrough, which also produces the render-time failure message this schema alone cannot."
+        },
+        "extraVolumes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": { "name": { "type": "string" } }
+          },
+          "description": "core-v1 Volume list added to the pod of every pgbackrest workload (#323): the postgresql pod, the backup CronJobs, the restore Job, the validation CronJob. Names may not collide with a chart volume in any of them, nor with postgresql.extraVolumes / postgresql.extensions.extraVolumes, which share the postgresql pod's volume list."
+        },
+        "extraVolumeMounts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "mountPath"],
+            "properties": { "name": { "type": "string" }, "mountPath": { "type": "string" } }
+          },
+          "description": "core-v1 VolumeMount list added to every pgbackrest container (#323). Each entry must reference a pgbackrest.extraVolumes entry and may not shadow a path the containers depend on (PGDATA, /etc/pgbackrest/pgbackrest.conf, /scripts, /work, /tmp) -- see pg.validatePgbackrestPassthrough."
+        },
         "s3": {
           "type": "object",
           "properties": {

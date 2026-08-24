@@ -934,6 +934,121 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end -}}
 {{- end }}
 
+{{- /* #323: pgbackrest.extraEnv / extraVolumes / extraVolumeMounts. Same shape and the same
+       reasoning as pg.validateExtraPassthrough (#262), but a WIDER blast radius: one list
+       feeds five containers across four pod templates (the pgbackrest sidecar and the
+       pgbackrest-bootstrap init container in the StatefulSet pod, the backup CronJob, the
+       restore Job, the validation CronJob). So every reserved-name list below is the UNION
+       over all of them -- a name that only collides in one of the five still breaks that one
+       pod, and an operator who set it once would have no reason to suspect the pod they were
+       not thinking about. */ -}}
+{{- define "pg.validatePgbackrestPassthrough" -}}
+{{- $pb := .Values.pgbackrest -}}
+{{- /* g1: shape. `with` is not used -- an explicitly-set map must reach the check. */ -}}
+{{- range $key := list "extraVolumes" "extraVolumeMounts" "extraEnv" -}}
+  {{- $val := index $pb $key -}}
+  {{- if and $val (not (kindIs "slice" $val)) -}}
+    {{- fail (printf "pgbackrest.%s must be a list of objects, got %s. Use a YAML sequence of entries, each with a name (e.g. `pgbackrest.%s: [{name: my-entry, ...}]`), not a map." $key (kindOf $val) $key) -}}
+  {{- end -}}
+{{- end -}}
+{{- $vols := $pb.extraVolumes | default list -}}
+{{- $mounts := $pb.extraVolumeMounts | default list -}}
+{{- $env := $pb.extraEnv | default list -}}
+{{- /* Silently inert configuration is worse than a render error (same call as #320's
+       env/aptSources gate): with pgbackrest disabled none of the five containers exists, so
+       a KUBECONFIG set here would look configured and do nothing -- and the symptom of that
+       is a tenant with no backups and nothing wrong in its status, which is exactly what
+       #323 reported. */ -}}
+{{- if and (or (gt (len $vols) 0) (gt (len $mounts) 0) (gt (len $env) 0)) (not $pb.enabled) -}}
+  {{- fail "pgbackrest.extraEnv/extraVolumes/extraVolumeMounts are set but pgbackrest.enabled is false, so none of the pgbackrest containers they configure is rendered and nothing would use them. Set pgbackrest.enabled=true, or remove these values." -}}
+{{- end -}}
+{{- /* Chart-managed volume names across all four pod templates. The StatefulSet's own list is
+       included in full -- pgbackrest.extraVolumes lands in that pod too (the sidecar and the
+       bootstrap init container live there), where a duplicate name is either rejected by the
+       API server or, for `data`, silently discarded in favour of the volumeClaimTemplate. */ -}}
+{{- $chartVolumes := list
+      "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib"
+      "repmgr-config" "etcd-tls" "agent-control-tls" "pg-run" "pgbackrest-config"
+      "pgbackrest-bootstrap-script" "service-updater-script"
+      "tmp" "work" "restore-script" "validate-script" -}}
+{{- /* The two other operator-controlled lists that reach the SAME pod volumes list. A name
+       shared with either is a duplicate the API server rejects at apply time
+       ("volumes[n].name: Duplicate value"), i.e. render-clean and pod-never-starts. */ -}}
+{{- range $ov := (.Values.postgresql.extraVolumes | default list) -}}
+  {{- $chartVolumes = append $chartVolumes ($ov.name | default "" | toString) -}}
+{{- end -}}
+{{- range $ov := ((.Values.postgresql.extensions).extraVolumes | default list) -}}
+  {{- $chartVolumes = append $chartVolumes ($ov.name | default "" | toString) -}}
+{{- end -}}
+{{- $volNames := list -}}
+{{- range $i, $v := $vols -}}
+  {{- $n := ($v.name | default "") | toString -}}
+  {{- if not $n -}}{{- fail (printf "pgbackrest.extraVolumes[%d]: name is required (it is what extraVolumeMounts references)" $i) -}}{{- end -}}
+  {{- if has $n $chartVolumes -}}
+    {{- fail (printf "pgbackrest.extraVolumes[%d]: %q is already a volume name in one of the pods these volumes are added to (reserved: %s). Volume names are not merged -- a duplicate is rejected by the API server, and a duplicate %q would replace the chart's own volume -- so the render fails here instead. Pick a distinct name." $i $n (join ", " $chartVolumes) $n) -}}
+  {{- end -}}
+  {{- if has $n $volNames -}}{{- fail (printf "pgbackrest.extraVolumes[%d]: duplicate volume name %q -- the later entry would silently replace the earlier one" $i $n) -}}{{- end -}}
+  {{- $volNames = append $volNames $n -}}
+{{- end -}}
+{{- /* Mount destinations that would shadow something one of the five containers depends on.
+       Rejected when the mountPath IS one of these or CONTAINS it: a directory mount over
+       /etc/pgbackrest/pgbackrest.conf's parent hides the repository configuration (pgbackrest
+       then reports a missing stanza rather than a bad mount), over /scripts hides restore.sh /
+       validate.sh / bootstrap.sh (the container's whole command), over /work or /tmp replaces
+       a writable emptyDir with a read-only projection (pgbackrest's log/lock paths and
+       kubectl's HOME cache both live there, and the failure surfaces as EROFS mid-run). */ -}}
+{{- $shadow := list "/var/run/postgresql" "/etc/pgbackrest/pgbackrest.conf" "/scripts" "/work" "/tmp" -}}
+{{- $pgdata := "/var/lib/postgresql/data" -}}
+{{- $seenPaths := dict -}}
+{{- range $i, $m := $mounts -}}
+  {{- $n := ($m.name | default "") | toString -}}
+  {{- if not $n -}}{{- fail (printf "pgbackrest.extraVolumeMounts[%d]: name is required" $i) -}}{{- end -}}
+  {{- $path := ($m.mountPath | default "") | toString | trimSuffix "/" -}}
+  {{- if not $path -}}{{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath is required" $i $n) -}}{{- end -}}
+  {{- if not (has $n $volNames) -}}
+    {{- fail (printf "pgbackrest.extraVolumeMounts[%d]: no pgbackrest.extraVolumes entry named %q (declared: %s). Every extra mount needs a matching extra volume -- otherwise the kubelet rejects the pod at apply time with `volumeMounts[..].name: Not found`, so the CronJob renders, fires, and never runs. Check for a typo, or that you set extraVolumes (plural). Chart-managed volumes cannot be mounted here." $i $n (ternary "none" (join ", " $volNames) (empty $volNames))) -}}
+  {{- end -}}
+  {{- /* The data directory gets the strictest rule -- at, above, OR inside. These containers
+         restore into PGDATA and read it with pg_controldata; a projection anywhere inside it
+         is data corruption rather than a failed mount. */ -}}
+  {{- if or (eq $path $pgdata) (hasPrefix (printf "%s/" $path) $pgdata) (hasPrefix (printf "%s/" $pgdata) $path) -}}
+    {{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath %q is at, above or inside %q -- the live data directory these containers restore into and read with pg_controldata. A volume projected there shadows PGDATA (or part of it) for the restore and for the postmaster that starts on it afterwards. Mount somewhere outside the data volume." $i $n $path $pgdata) -}}
+  {{- end -}}
+  {{- range $gp := $shadow -}}
+    {{- if or (eq $path $gp) (hasPrefix (printf "%s/" $path) $gp) -}}
+      {{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath %q is at or above %q, which the pgbackrest containers already use. Mounting over it hides what is there (the repository config, the script the container runs, or a writable scratch volume) and the pod fails at RUN time, not at apply time. Mount a path of your own instead -- e.g. /etc/apiserver-proxy for a kubeconfig." $i $n $path $gp) -}}
+    {{- end -}}
+  {{- end -}}
+  {{- /* Duplicate mountPath is rejected by the API SERVER, not by helm
+         ("volumeMounts[n].mountPath: Invalid value: ... must be unique"). */ -}}
+  {{- if hasKey $seenPaths $path -}}
+    {{- fail (printf "pgbackrest.extraVolumeMounts: duplicate mountPath %q (volumes %q and %q). Kubernetes requires mountPaths to be unique within a container and rejects the pod at apply time, so helm has to catch it first." $path (get $seenPaths $path) $n) -}}
+  {{- end -}}
+  {{- $seenPaths = set $seenPaths $path $n -}}
+{{- end -}}
+{{- /* Env names the chart sets on at least one of the five containers. Reserved
+       UNCONDITIONALLY -- including the ones only a currently-disabled feature emits
+       (repoEncryption, s3.keyType=shared) -- so a passthrough that works today cannot start
+       silently shadowing a chart value after a later `helm upgrade` enables that feature. */ -}}
+{{- $chartEnv := list
+      "NAMESPACE" "PRIMARY_SVC" "STANZA" "BACKUP_TYPE" "HOME"
+      "PGBACKREST_STANZA" "PGDATA" "PGBACKREST_PG1_PATH"
+      "PGBACKREST_LOG_PATH" "PGBACKREST_LOCK_PATH"
+      "TARGET_TYPE" "TARGET" "BACKUP_SET" "FORCE" "RESTORE_REQUESTED_BY"
+      "RECOVERY_TIMEOUT" "POSTGRES_USER" "POSTGRES_DB"
+      "PGBACKREST_REPO1_CIPHER_PASS" "PGBACKREST_REPO1_S3_KEY" "PGBACKREST_REPO1_S3_KEY_SECRET" -}}
+{{- $envNames := list -}}
+{{- range $i, $e := $env -}}
+  {{- $n := ($e.name | default "") | toString -}}
+  {{- if not $n -}}{{- fail (printf "pgbackrest.extraEnv[%d]: name is required" $i) -}}{{- end -}}
+  {{- if has $n $chartEnv -}}
+    {{- fail (printf "pgbackrest.extraEnv[%d]: %q is set by the chart on one or more of the pgbackrest containers and may not be overridden -- a duplicate env name is last-wins at runtime, so this would silently shadow the chart/Secret value (e.g. pointing a restore at the wrong stanza, or a backup at the wrong repository credentials). Use the chart's own value for this setting instead." $i $n) -}}
+  {{- end -}}
+  {{- if has $n $envNames -}}{{- fail (printf "pgbackrest.extraEnv[%d]: duplicate env name %q" $i $n) -}}{{- end -}}
+  {{- $envNames = append $envNames $n -}}
+{{- end -}}
+{{- end }}
+
 {{- define "pg.pgpoolAdminSecretName" -}}
 {{- if .Values.pgpool.admin.existingSecret.enabled }}
 {{- required "pgpool.admin.existingSecret.name is required when pgpool.admin.existingSecret.enabled is true" .Values.pgpool.admin.existingSecret.name }}

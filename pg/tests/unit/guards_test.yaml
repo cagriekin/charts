@@ -634,3 +634,205 @@ tests:
           content:
             name: LD_LIBRARY_PATH
           any: true
+
+  # --- Scenario: pgbackrest passthrough validation (#323) ---
+  # Same guard set as #262's, over a wider surface: one list feeds five containers across four
+  # pod templates, so every reserved-name list is the union over all of them. The two SHAPE
+  # cases (a map instead of a list, a mount with no mountPath) are not here: values.schema.json
+  # rejects both before any template renders, so the equivalent {{ fail }} messages are
+  # unreachable for helm-unittest to match. test-template.sh asserts those two by exit code.
+  # Silently inert configuration is the failure this feature exists to remove, so setting it
+  # with pgbackrest disabled is refused rather than ignored.
+  - it: pgbackrest passthrough set while pgbackrest is disabled fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-minimal.yaml
+    set:
+      pgbackrest.extraEnv:
+        - name: KUBECONFIG
+          value: /etc/apiserver-proxy/kubeconfig
+    asserts:
+      - failedTemplate:
+          errorMessage: "pgbackrest.extraEnv/extraVolumes/extraVolumeMounts are set but pgbackrest.enabled is false, so none of the pgbackrest containers they configure is rendered and nothing would use them. Set pgbackrest.enabled=true, or remove these values."
+
+  - it: pgbackrest.extraEnv reusing a chart-set name (PGBACKREST_STANZA) fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.extraEnv:
+        - name: PGBACKREST_STANZA
+          value: elsewhere
+    asserts:
+      - failedTemplate:
+          errorMessage: 'pgbackrest.extraEnv[0]: "PGBACKREST_STANZA" is set by the chart on one or more of the pgbackrest containers and may not be overridden -- a duplicate env name is last-wins at runtime, so this would silently shadow the chart/Secret value (e.g. pointing a restore at the wrong stanza, or a backup at the wrong repository credentials). Use the chart''s own value for this setting instead.'
+
+  # Reserved even though only the backup CronJob sets it, and only that one pod would break --
+  # the operator setting it has no reason to be thinking about that pod.
+  - it: pgbackrest.extraEnv reusing a single-pod env name (HOME) still fails
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.extraEnv:
+        - name: HOME
+          value: /somewhere-unwritable
+    asserts:
+      - failedTemplate: {}
+
+  # Reserved unconditionally: repoEncryption is off in this fixture, so this env name is not in
+  # today's render at all -- but enabling it later must not start silently shadowing the Secret.
+  - it: pgbackrest.extraEnv reusing a disabled-feature env name (cipher pass) still fails
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.extraEnv:
+        - name: PGBACKREST_REPO1_CIPHER_PASS
+          value: hunter2
+    asserts:
+      - failedTemplate: {}
+
+  - it: duplicate pgbackrest.extraEnv names fail render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.extraEnv:
+        - name: DUP
+          value: "1"
+        - name: DUP
+          value: "2"
+    asserts:
+      - failedTemplate:
+          errorMessage: 'pgbackrest.extraEnv[1]: duplicate env name "DUP"'
+
+  - it: pgbackrest.extraVolumes colliding with a chart volume fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.extraVolumes:
+        - name: pgbackrest-config
+          emptyDir: {}
+    asserts:
+      - failedTemplate: {}
+
+  # `tmp` only exists in the backup CronJob, and `work` only in the restore/validation pods --
+  # both are still reserved, for the same reason HOME is.
+  - it: pgbackrest.extraVolumes colliding with another pod's volume (work) fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.extraVolumes:
+        - name: work
+          emptyDir: {}
+    asserts:
+      - failedTemplate: {}
+
+  # postgresql.extraVolumes lands in the SAME pod volumes list, so a shared name is a duplicate
+  # the API server rejects -- render-clean, pod never starts.
+  - it: pgbackrest.extraVolumes colliding with postgresql.extraVolumes fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      postgresql.extraVolumes:
+        - name: shared-name
+          emptyDir: {}
+      pgbackrest.extraVolumes:
+        - name: shared-name
+          emptyDir: {}
+    asserts:
+      - failedTemplate: {}
+
+  - it: pgbackrest.extraVolumeMounts with no matching extraVolumes entry fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.extraVolumeMounts:
+        - name: apiserver-proxy
+          mountPath: /etc/apiserver-proxy
+    asserts:
+      - failedTemplate: {}
+
+  # A projection anywhere inside the data volume is corruption, not a failed mount: these
+  # containers restore INTO PGDATA and a postmaster starts on it afterwards.
+  - it: a pgbackrest.extraVolumeMounts entry inside PGDATA fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.extraVolumes:
+        - name: k
+          emptyDir: {}
+      pgbackrest.extraVolumeMounts:
+        - name: k
+          mountPath: /var/lib/postgresql/data/pgdata
+    asserts:
+      - failedTemplate: {}
+
+  # /tmp is the backup CronJob's writable emptyDir AND kubectl's HOME cache; replacing it with
+  # a read-only projection fails at run time, not at apply time.
+  - it: a pgbackrest.extraVolumeMounts entry over /tmp fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.extraVolumes:
+        - name: k
+          emptyDir: {}
+      pgbackrest.extraVolumeMounts:
+        - name: k
+          mountPath: /tmp
+    asserts:
+      - failedTemplate: {}
+
+  # Guarded on the FILE, not its directory: /etc/pgbackrest/conf.d is a legitimate mount, so
+  # only a mount at or above /etc/pgbackrest/pgbackrest.conf is refused.
+  - it: a pgbackrest.extraVolumeMounts entry over /etc/pgbackrest fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.extraVolumes:
+        - name: k
+          emptyDir: {}
+      pgbackrest.extraVolumeMounts:
+        - name: k
+          mountPath: /etc/pgbackrest
+    asserts:
+      - failedTemplate: {}
+
+  - it: duplicate pgbackrest.extraVolumeMounts mountPaths fail render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.extraVolumes:
+        - name: a
+          emptyDir: {}
+        - name: b
+          emptyDir: {}
+      pgbackrest.extraVolumeMounts:
+        - name: a
+          mountPath: /shared
+        - name: b
+          mountPath: /shared
+    asserts:
+      - failedTemplate: {}

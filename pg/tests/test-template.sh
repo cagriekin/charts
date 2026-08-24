@@ -4529,5 +4529,113 @@ helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.failoverMode=agent \
   --set repmgr.agent.control.enabled=true >/dev/null 2>&1 || pgv_ctl_rc=$?
 assert_eq "#276 pgvector: guards apply too" "1" "$([ "${pgv_ctl_rc}" -ne 0 ] && echo 1 || echo 0)"
 
+# --- #323: pgbackrest.extraEnv / extraVolumes / extraVolumeMounts ---
+# The reported failure was a pod that LOOKED configured: the backup CronJob is an apiserver
+# client (EndpointSlice lookup + `kubectl exec`), so where the egress policy denies the
+# apiserver it takes no backup AND never runs stanza-create -- and stanza-create has exactly
+# one caller in the chart, so archive_command then fails on every WAL segment for the life of
+# the cluster. Counted per workload, because "it rendered somewhere" is the thing that was
+# already true of postgresql.extraEnv and did not help.
+pb_extra_res=$(helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  -f "${SCRIPT_DIR}/values-pgbackrest-extra.yaml" 2>&1)
+# Six containers: the sidecar + pgbackrest-bootstrap init container (StatefulSet), two backup
+# CronJobs (full + diff), the restore workload, the validation CronJob.
+assert_eq "#323: KUBECONFIG reaches every pgbackrest container" "6" \
+  "$(printf '%s\n' "${pb_extra_res}" | grep -c 'value: /etc/apiserver-proxy/kubeconfig')"
+assert_eq "#323: the kubeconfig is mounted in every one of them" "6" \
+  "$(printf '%s\n' "${pb_extra_res}" | grep -c 'mountPath: /etc/apiserver-proxy')"
+# Five pods, so five pod-level volumes -- a mount naming a volume its pod does not declare is
+# rejected by the kubelet at apply time, not by helm.
+assert_eq "#323: the volume reaches all five pods" "5" \
+  "$(printf '%s\n' "${pb_extra_res}" | grep -c 'name: apiserver-proxy-kubeconfig')"
+# valueFrom must survive the passthrough: a proxy token or CA is normally a Secret.
+assert_contains "#323: extraEnv carries valueFrom, not just value" "${pb_extra_res}" \
+  "name: apiserver-proxy-token"
+# NOT the postgresql container. It has postgresql.extraEnv of its own, and a KUBECONFIG in the
+# postmaster's environment would also redirect the entrypoint's stale-primary guard (#170) --
+# a failover-path change made as a side effect of configuring backups.
+assert_not_contains "#323: no pgbackrest passthrough on the postgresql container" \
+  "$(printf '%s\n' "${pb_extra_res}" | sed -n '/^        - name: postgresql$/,/^        - name: /p')" \
+  "/etc/apiserver-proxy"
+
+# Shape guards. These two are rejected by values.schema.json before any template renders, so
+# unlike the rest of the #323 guard set their {{ fail }} messages are unreachable in normal
+# use and helm-unittest cannot match them -- the exit code is what an operator actually sees,
+# and the template checks stay behind the schema for a render that skips it.
+pb_map_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set-json 'pgbackrest.extraEnv={"FOO":"bar"}' >/dev/null 2>&1 || pb_map_rc=$?
+assert_eq "#323: a map-shaped extraEnv fails the render" "1" "${pb_map_rc}"
+pb_nopath_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set 'pgbackrest.extraVolumes[0].name=k' \
+  --set 'pgbackrest.extraVolumes[0].emptyDir.sizeLimit=1Mi' \
+  --set 'pgbackrest.extraVolumeMounts[0].name=k' >/dev/null 2>&1 || pb_nopath_rc=$?
+assert_eq "#323: an extraVolumeMount with no mountPath fails the render" "1" "${pb_nopath_rc}"
+
+# The remaining guards, by exit code AND by message -- each names a failure mode that is
+# apply-time or run-time only, which is the whole reason they are render-time here.
+pb_disabled_out=$(helm template test-pg "${CHART_DIR}" \
+  --set 'pgbackrest.extraEnv[0].name=KUBECONFIG' \
+  --set 'pgbackrest.extraEnv[0].value=/etc/apiserver-proxy/kubeconfig' 2>&1 || true)
+assert_contains "#323: passthrough with pgbackrest disabled is refused, not ignored" \
+  "${pb_disabled_out}" "pgbackrest.enabled is false"
+# Reserved across ALL the pods, not only the one being configured: `work` exists in the restore
+# and validation pods, `tmp` only in the backup CronJob.
+for vol in pgbackrest-config work tmp; do
+  pb_vol_rc=0
+  helm template test-pg "${CHART_DIR}" \
+    -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+    --set "pgbackrest.extraVolumes[0].name=${vol}" \
+    --set 'pgbackrest.extraVolumes[0].emptyDir.sizeLimit=1Mi' >/dev/null 2>&1 || pb_vol_rc=$?
+  assert_eq "#323: an extraVolume named ${vol} fails the render" "1" "${pb_vol_rc}"
+done
+# postgresql.extraVolumes and postgresql.extensions.extraVolumes land in the SAME pod volume
+# list, so a shared name is a duplicate the API server rejects.
+pb_userdup_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set 'postgresql.extraVolumes[0].name=shared-name' \
+  --set 'postgresql.extraVolumes[0].emptyDir.sizeLimit=1Mi' \
+  --set 'pgbackrest.extraVolumes[0].name=shared-name' \
+  --set 'pgbackrest.extraVolumes[0].emptyDir.sizeLimit=1Mi' >/dev/null 2>&1 || pb_userdup_rc=$?
+assert_eq "#323: an extraVolume colliding with postgresql.extraVolumes fails the render" "1" "${pb_userdup_rc}"
+# Shadowing guards. Each of these paths carries something one of the containers depends on:
+# PGDATA itself (restored into, then read by pg_controldata and the postmaster), the repository
+# config, the script the container runs, and the two writable scratch volumes that hold
+# pgbackrest's log/lock paths and kubectl's HOME cache.
+for bad in /var/lib/postgresql/data /var/lib/postgresql/data/pgdata /etc/pgbackrest \
+           /etc/pgbackrest/pgbackrest.conf /scripts /work /tmp /var/run/postgresql; do
+  pb_shadow_rc=0
+  helm template test-pg "${CHART_DIR}" \
+    -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+    --set 'pgbackrest.extraVolumes[0].name=k' \
+    --set 'pgbackrest.extraVolumes[0].emptyDir.sizeLimit=1Mi' \
+    --set 'pgbackrest.extraVolumeMounts[0].name=k' \
+    --set "pgbackrest.extraVolumeMounts[0].mountPath=${bad}" >/dev/null 2>&1 || pb_shadow_rc=$?
+  assert_eq "#323: an extraVolumeMount over ${bad} fails the render" "1" "${pb_shadow_rc}"
+done
+# ...and the guards must not be so wide that the feature is unusable: a path of the operator's
+# own, and a sibling of the mounted pgbackrest.conf (pgbackrest reads conf.d), both render.
+pb_ok_rc=0
+helm template test-pg "${CHART_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set 'pgbackrest.extraVolumes[0].name=k' \
+  --set 'pgbackrest.extraVolumes[0].emptyDir.sizeLimit=1Mi' \
+  --set 'pgbackrest.extraVolumeMounts[0].name=k' \
+  --set 'pgbackrest.extraVolumeMounts[0].mountPath=/etc/pgbackrest/conf.d' >/dev/null 2>&1 || pb_ok_rc=$?
+assert_eq "#323: a conf.d sibling mount still renders" "0" "${pb_ok_rc}"
+
+# pgvector inherits all of it from the symlinked templates -- assert the reach, since pgvector
+# has no KinD suites of its own and this is where a divergence would surface.
+pgv_pb_res=$(helm template test-pgv "${PGVECTOR_DIR}" \
+  -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  -f "${SCRIPT_DIR}/values-pgbackrest-extra.yaml" 2>&1)
+assert_eq "#323 pgvector: KUBECONFIG reaches every pgbackrest container" "6" \
+  "$(printf '%s\n' "${pgv_pb_res}" | grep -c 'value: /etc/apiserver-proxy/kubeconfig')"
+
 end_suite
 print_summary

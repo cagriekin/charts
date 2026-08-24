@@ -139,6 +139,13 @@ template:
                 name: {{ include "pg.pgbackrestS3SecretName" . }}
                 key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
 {{- end }}
+{{- /* #323. This pod makes no apiserver call (its token is not even mounted), so the
+       KUBECONFIG case does not apply here -- but the same list carries whatever else
+       pgbackrest needs to reach the repository from this cluster (a proxy, a private CA),
+       and a restore that cannot reach S3 is the one moment that matters most. */}}
+{{- with .Values.pgbackrest.extraEnv }}
+          {{- toYaml . | nindent 10 }}
+{{- end }}
         resources:
           {{- toYaml .Values.pgbackrest.restore.resources | nindent 10 }}
         volumeMounts:
@@ -158,6 +165,9 @@ template:
             readOnly: true
           - name: work
             mountPath: /work
+{{- with .Values.pgbackrest.extraVolumeMounts }}
+          {{- toYaml . | nindent 10 }}
+{{- end }}
     volumes:
       - name: data
         persistentVolumeClaim:
@@ -174,6 +184,9 @@ template:
               path: restore.sh
       - name: work
         emptyDir: {}
+{{- with .Values.pgbackrest.extraVolumes }}
+      {{- toYaml . | nindent 6 }}
+{{- end }}
 {{- end }}
 
 {{- if .Values.pgbackrest.restore.enabled }}

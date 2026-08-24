@@ -1,6 +1,7 @@
 {{- include "pg.validateResourceNames" . }}
 {{- include "pg.validateAudit" . }}
 {{- include "pg.validateExtraPassthrough" . }}
+{{- include "pg.validatePgbackrestPassthrough" . }}
 {{- include "pg.validateExtensionPackages" . }}
 {{- /* #320: BEFORE the aptSources/extraLibs guards below. Those two reject anything set
        while packages is empty -- which is the NORMAL state on the prebuilt-image path, so
@@ -346,6 +347,18 @@ spec:
                   name: {{ include "pg.pgbackrestS3SecretName" . }}
                   key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
 {{- end }}
+{{- /* #323: one operator list reaches every container that runs pgbackrest or drives it --
+       this init container and the sidecar below, plus the backup CronJobs, the restore
+       workload and the validation CronJob. Deliberately NOT the postgresql container: it has
+       postgresql.extraEnv of its own (also where archive_command's own pgbackrest invocation
+       reads its environment), and a KUBECONFIG injected there would redirect the entrypoint's
+       stale-primary guard (#170) as a side effect of configuring backups. Appended LAST so it
+       reads as an override in the manifest, though a collision with a chart-set name is
+       refused at render time rather than left last-wins
+       (pg.validatePgbackrestPassthrough). */}}
+{{- with .Values.pgbackrest.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
           resources:
             {{- toYaml .Values.pgbackrest.bootstrap.resources | nindent 12 }}
           volumeMounts:
@@ -360,6 +373,9 @@ spec:
             - name: pgbackrest-bootstrap-script
               mountPath: /scripts
               readOnly: true
+{{- with .Values.pgbackrest.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
 {{- end }}
 {{- if and .Values.postgresql.extensions.enabled .Values.repmgr.enabled }}
 {{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
@@ -1578,6 +1594,13 @@ spec:
                   name: {{ include "pg.pgbackrestS3SecretName" . }}
                   key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
 {{- end }}
+{{- /* #323, as on the bootstrap init container above. This one matters most: stanza-create
+       and backup actually EXECUTE here, via `kubectl exec` from the CronJob -- a value that
+       reached the CronJob alone would route the kubectl call and leave the backup itself
+       going direct. */}}
+{{- with .Values.pgbackrest.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
@@ -1587,6 +1610,9 @@ spec:
               mountPath: /etc/pgbackrest/pgbackrest.conf
               subPath: pgbackrest.conf
               readOnly: true
+{{- with .Values.pgbackrest.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
           resources:
             {{- toYaml .Values.pgbackrest.resources | nindent 12 }}
 {{- end }}
@@ -1675,6 +1701,17 @@ spec:
             items:
               - key: bootstrap.sh
                 path: bootstrap.sh
+{{- end }}
+{{- /* #323: pod-level, so it reaches the pgbackrest sidecar and the pgbackrest-bootstrap init
+       container. Declared whenever pgbackrest is enabled rather than gated on
+       extraVolumeMounts: a pod-level volume nothing mounts is harmless, and gating the two
+       separately would make a values file that sets both render a mount referencing a volume
+       that does not exist -- which fails at APPLY time, not render time. Names colliding with
+       this pod's own volumes (including postgresql.extraVolumes and
+       postgresql.extensions.extraVolumes, which land in the same list) are refused by
+       pg.validatePgbackrestPassthrough. */}}
+{{- with .Values.pgbackrest.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
 {{- end }}
 {{- end }}
 {{- with .Values.postgresql.extraVolumes }}

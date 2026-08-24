@@ -1,0 +1,30 @@
+# #323 fixture: the pgbackrest passthrough, in the shape the issue reported -- KUBECONFIG plus
+# the kubeconfig mount, for a cluster whose egress policy denies pod traffic to the apiserver.
+# Layered on top of values-pgbackrest.yaml, and enables validation/restore/bootstrap so all
+# FIVE pgbackrest containers render in one pass (the sidecar and the pgbackrest-bootstrap init
+# container in the postgresql pod, the backup CronJobs, the restore workload, the validation
+# CronJob) -- the point of the feature is that one list reaches every one of them.
+pgbackrest:
+  validation:
+    enabled: true
+  restore:
+    enabled: true
+  bootstrap:
+    enabled: true
+  extraEnv:
+    - name: KUBECONFIG
+      value: /etc/apiserver-proxy/kubeconfig
+    # valueFrom must survive the passthrough too -- a proxy CA or token is normally a Secret.
+    - name: PGBACKREST_EXTRA_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: apiserver-proxy-token
+          key: token
+  extraVolumes:
+    - name: apiserver-proxy
+      configMap:
+        name: apiserver-proxy-kubeconfig
+  extraVolumeMounts:
+    - name: apiserver-proxy
+      mountPath: /etc/apiserver-proxy
+      readOnly: true
