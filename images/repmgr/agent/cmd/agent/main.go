@@ -488,6 +488,15 @@ func (a *agent) tick(ctx context.Context) {
 	// leadership-critical writes for the fence-budget window) would only starve its psql.
 	if dec.Action == reconcile.Promote || dec.Action == reconcile.StayPrimary {
 		a.rehashManagedUsersOnce(ctx)
+		// Same reason, same place (#288 review, second pass). topologyTick is PURELY
+		// observational -- gauges only -- and it makes an apiserver pod LIST plus a psql query,
+		// both hangable. Inside act() it held opMu for its own fenceBudget() ON TOP of the
+		// branch's wctx, doubling the worst-case read-write hold to 2x the soft-fence window on
+		// every primary tick (10s vs a 5s budget and a 15s /healthz staleness threshold on chart
+		// defaults) -- so a hung LIST could starve the lost-leadership fence it must never
+		// delay. Out here it cannot, and its extra LIST no longer sits on the promote critical
+		// path either.
+		a.topologyTick(ctx)
 	}
 	// Publish what the control API serves. Gated on the API being enabled so a release
 	// without it does exactly the work it did before -- notably no extra replay probe.
@@ -710,7 +719,14 @@ func (a *agent) observeStandbyStall(ctx context.Context, o *reconcile.Observatio
 		return
 	}
 	a.standbyNoReceiverTicks++
-	o.StandbyStalled = a.standbyNoReceiverTicks >= standbyStallTicks
+	// A stall only escalates once this node has actually SETTLED on an upstream (#288 review).
+	// A standby freshly repointed at a just-promoted primary looks identical to a diverged one:
+	// Follow writes primary_conninfo and reloads, and the walreceiver may legitimately take a
+	// while to attach -- the new primary's first StayPrimary tick has not necessarily created
+	// the slot yet, sender slots can be momentarily exhausted, DNS may still be settling. Firing
+	// there stops, rewinds and possibly re-clones a perfectly healthy standby. Requiring the
+	// latch means the repoint has completed at least once before the counter can bite.
+	o.StandbyStalled = a.standbyNoReceiverTicks >= standbyStallTicks && a.followUpstream != ""
 	if o.StandbyStalled {
 		a.log.Warn("standby has had no walreceiver for several ticks; eligible for rejoin if a peer is on a newer timeline (#288)",
 			"ticks", a.standbyNoReceiverTicks)
@@ -832,14 +848,20 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		}()
 		if tl, _, ok, _ := a.prober.PrimaryWALPosition(wctx, a.selfConn()); ok {
 			a.advanceMarker(wctx, tl, true, obs.Marker)
+			// ADOPTION is what expires the restore claim (#288 review, second pass). This node
+			// promoted and the marker now records its history, so the cluster has taken the
+			// restored timeline as its own and the claim has done its job.
+			//
+			// Deliberately NOT on the Follow path, which was the first attempt: under native,
+			// Follow only writes primary_conninfo + standby.signal and reloads, with no rewind
+			// at all, so a DIVERGED standby reaches it too. A PITR lands on
+			// pgbackrest.restore.podOrdinal, which need not be the lease holder; that pod comes
+			// up read-write, takes DemoteFence then Follow, and would have dropped its claim
+			// ~10s after boot -- racing the holder's own tick, which needs that very record to
+			// decide to release the lease to it. Losing that race discards the restore.
+			a.dropRestoreRecord("this node promoted and the marker records its history, so the cluster adopted the restore")
 		}
 		promoteRoutingErr := a.assertPrimaryRouting(wctx, obs)
-		// LAST, for the same reason as in StayPrimary (#288 review): purely observational, so it
-		// must never compete with the marker write or the routing switch. Sharing slotsTick's
-		// fenceBudget()/2 sub-context left it routinely under the probe's own 10s psql timeout,
-		// which logged a spurious warning on every promotion and put a second apiserver pod LIST
-		// on the promote critical path.
-		a.topologyTick(ctx)
 		return promoteRoutingErr
 
 	case reconcile.StayPrimary:
@@ -878,8 +900,6 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// leadership-critical writes (#288 review). On the shared fence budget (5s on chart
 		// defaults, already contended by slotsTick) an extra query plus a pod LIST in FRONT of
 		// them could make a slow tick skip the marker write and the Service routing assertion,
-		// which is a write outage. Nothing here may cost that.
-		a.topologyTick(ctx)
 		return routingErr
 
 	case reconcile.Follow:
@@ -1245,6 +1265,23 @@ func (a *agent) finishInitdbNative(ctx context.Context, nid mechanism.NodeIdenti
 	// StartLocal's primary-state arming: this node is now a writer, and pre-arming only ever
 	// errs toward demoting a node that is becoming one.
 	a.servingRW.Store(true)
+	// Write the highwater marker NOW, not on the next StayPrimary tick (#288 review, second
+	// pass). The lease-loss branch above already reasons that an initialized PGDATA with no
+	// marker is unrecoverable; the success path left the same window open. If the agent dies
+	// (OOM, kill) between Start and its next tick, the lease expires, a peer acquires it and
+	// sees empty PGDATA, no marker and no REACHABLE primary -- this pod's postmaster is up but
+	// its container just restarted -- so it takes BootstrapInitdb and creates a SECOND cluster.
+	// Two system_identifiers then make assertSameCluster refuse every Follow/RejoinForward on
+	// both pods: both wedge Running/NotReady and only a PVC delete recovers.
+	//
+	// With the marker present, the peer takes the #170 "empty data with a marker present; settle
+	// before initdb" path instead and clones. Best-effort by design: advanceMarker logs and
+	// carries on, and a failure here is no worse than the previous behaviour.
+	if tl, _, ok, _ := a.prober.PrimaryWALPosition(ctx, a.selfConn()); ok {
+		// MarkerState zero value = absent, which is the truth for a cluster created seconds ago
+		// and makes shouldAdvanceMarker treat any readable timeline as an advance.
+		a.advanceMarker(ctx, tl, true, reconcile.MarkerState{})
+	}
 	// Deliberately no metric bump here. IncRecoveryStart counts read-only WAL-replay starts at
 	// cold boot, which this is the opposite of, and there is no existing counter for "created
 	// the cluster" -- a once-per-cluster-lifetime event that a counter would describe poorly.
@@ -1698,11 +1735,16 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 	}
 	if err := a.mech.RejoinForceRewind(ctx, a.peerMechConn(target)); err != nil {
 		// Same marker as BootstrapClone (#288 review): ReclonePreserving runs the same
-		// pg_basebackup, so an interrupted one leaves an equally torn PGDATA. Without it
-		// discardTornClone is a no-op on the next boot, and recovery relies on the NEXT
-		// ReclonePreserving renaming the torn directory aside as another `.diverged.<ts>` --
-		// which nothing ever removes, so every interrupted attempt permanently consumes a full
-		// data directory's worth of PVC space.
+		// pg_basebackup, so an interrupted one leaves an equally torn PGDATA, and without the
+		// marker discardTornClone is a no-op on the next boot.
+		//
+		// It does NOT bound PVC growth, which an earlier version of this comment claimed
+		// (#288 review, second pass): ReclonePreserving renames PGDATA aside to
+		// `.diverged.<ts>` and only removes it after the clone SUCCEEDS, so an interrupted
+		// attempt still leaves that copy behind and nothing ever reaps it. The marker reclaims
+		// the torn NEW copy; the preserved old one is a deliberate forensic artifact whose
+		// cleanup is an operator task -- it is the only surviving copy of a diverged history
+		// someone may need.
 		a.beginClone()
 		if err := a.mech.ReclonePreserving(ctx, a.peerMechConn(target)); err != nil {
 			a.discardTornClone(ctx)
@@ -1835,22 +1877,13 @@ func (a *agent) cleanupGhostNodes(ctx context.Context) {
 // by ClearTopology, so a freshly promoted primary with healthy standbys exported
 // replicas_streaming = 0. Deriving from ctx keeps it observational: it cannot starve the marker
 // write or the routing switch, and it cannot be starved BY them either.
-// latchFollow records the upstream this node is now replicating from, and EXPIRES the restore
-// claim (#288 review).
+// latchFollow records the upstream this node is now replicating from.
 //
-// The claim exists to protect a restored volume's history until the cluster has adopted it: a
-// PITR rewinds this node, so ranking on LSN alone let a stale peer out-position it and promote
-// pre-restore data. That danger ends the moment this node is itself following a peer. Either the
-// upstream's history descends from the restore -- adopted, so the claim is moot -- or it does
-// not, in which case getting here required a rewind/re-clone, which already dropped the record.
-//
-// Without this bound the claim was PERMANENT, and permanent provenance is its own data-loss bug:
-// a node restored months ago, long since demoted cleanly and streaming happily, still outranked
-// a peer holding gigabytes more WAL. It would win the lease, skip that peer in its own election,
-// and promote with less WAL -- on every election for the life of the PVC.
+// It deliberately does NOT expire the restore claim (#288 review, second pass): see the
+// adoption drop on the Promote path. Following a peer is not evidence the cluster adopted this
+// volume's restored history -- under native a diverged standby reaches Follow with no rewind.
 func (a *agent) latchFollow(target string) {
 	a.followUpstream = target
-	a.dropRestoreRecord("this node is now following " + target + ", so the cluster has moved past the restore")
 }
 
 func (a *agent) topologyTick(ctx context.Context) {
@@ -1874,7 +1907,14 @@ func (a *agent) topologyTick(ctx context.Context) {
 	// the repmgr mechanism reconcileSlots returns before its own livePodOrdinals, so charging
 	// every existing install a second LIST per primary tick for a purely observational gauge is
 	// not a trade worth making (#288 review). Publish what the primary can see on its own; the
-	// expected/gap half is native-only, where the same LIST is already being made.
+	// expected/gap half is native-only.
+	//
+	// To be accurate about the cost (#288 review, second pass): this is NOT free there either --
+	// livePodOrdinals issues its own uncached ListPodNames, and slotsTick already made one
+	// earlier in the same tick, so a native primary makes two per interval. What the review
+	// fixed is where it hurt: topologyTick now runs OUTSIDE opMu and the fence budget, so a slow
+	// LIST can no longer delay a marker write, a routing switch or a lost-leadership fence. The
+	// duplicate call is a gauge's cost, paid off the critical path.
 	if a.cfg.Mechanism != config.MechanismNative {
 		a.metr.SetTopology(observe.TopologyStats{Streaming: countStreamingReplicas(rows)})
 		return

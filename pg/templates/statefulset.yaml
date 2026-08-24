@@ -828,6 +828,18 @@ spec:
                           # split onto its own line by nindent, leaving it unexported.
                           export PGHOST="$PRIMARY_HOST"
                           {{- .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 26 }}
+                        else
+                          # Keep WAITING instead of breaking (#288 review). pg_isready has no -h,
+                          # so it is satisfied by a unix socket -- including the socket-only
+                          # postmaster bootstrap_initdb runs while CREATING the cluster, which no
+                          # pod is reachable over TCP during. Breaking here skipped the user's
+                          # additionalCommands SILENTLY, with no error and no retry, on every
+                          # fresh install (under the default repmgr mechanism too, since
+                          # bootstrap_initdb is shared). It also covers the pre-existing case
+                          # where no peer has promoted yet. The loop is bounded at 90s, and the
+                          # steps above it are idempotent, so retrying costs nothing.
+                          sleep 1
+                          continue
                         fi
                         {{- end }}
                         break

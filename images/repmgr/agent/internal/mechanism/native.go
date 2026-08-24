@@ -587,8 +587,9 @@ func (n *Native) ReclonePreserving(ctx context.Context, source Conn) error {
 //
 // They are no-ops rather than errors because reconcile calls them unconditionally as part of
 // role reconciliation, and native mode's answer is "nothing to do" rather than "that failed".
-// Until #288 moves topology onto pg_stat_replication, native mode therefore has NO topology
-// source -- which is precisely why the mechanism is experimental and #288 blocks its use.
+// #288 moved topology onto pg_stat_replication (see the agent's topologyTick), so native mode
+// no longer depends on repmgr.nodes for it; these three methods stay only while
+// mechanism.Repmgr is still selectable, and #294 deletes them with it.
 func (n *Native) RegisterPrimary(ctx context.Context) error { return nil }
 
 func (n *Native) RegisterStandby(ctx context.Context, upstreamNodeID int) error { return nil }
@@ -656,8 +657,27 @@ func writeFileAtomic(path, content string, mode os.FileMode) error {
 		tmp.Close()
 		return err
 	}
+	// fsync BEFORE the rename (#288 review). Rename gives name atomicity, not content
+	// durability: without this, a crash shortly after the rename can leave a zero-length file.
+	// ensureInclude now routes PGDATA/postgresql.conf through here, and a truncated
+	// postgresql.conf is a postmaster that will not start at all -- the very outcome the single
+	// atomic write was introduced to avoid, moved onto the file whose loss is fatal.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	// And fsync the DIRECTORY, so the rename itself survives a crash. Best-effort: some
+	// filesystems refuse an O_RDONLY directory sync, and failing the write here would be worse
+	// than a durability gap the next reconcile tick rewrites anyway.
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }

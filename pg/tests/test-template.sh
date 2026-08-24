@@ -3230,6 +3230,15 @@ done
 # #288: restoredAt is the volume's provenance and must OUTLIVE a failed attempt -- the agent
 # ranks it in a failover election, so if a mistyped retry (which copies nothing) reset it, a
 # stale peer could win the lease and promote pre-restore data. exitCode still marks the attempt.
+# #288: the postStart hook must RETRY when no primary is reachable, not break out. pg_isready
+# has no -h, so a socket-only postmaster (exactly what bootstrap_initdb runs while creating the
+# cluster) satisfies it while no pod is reachable over TCP -- breaking there skipped the user's
+# additionalCommands silently, with no error and no retry, on every fresh install.
+ps_hook=$(helm template test-pg "${CHART_DIR}" --set repmgr.enabled=true \
+  --set 'postgresql.lifecycle.postStart.additionalCommands=psql -c "SELECT 1"' 2>&1)
+assert_contains "#288 postStart: waits instead of skipping when no primary is reachable" \
+  "${ps_hook}" "continue"
+
 assert_contains "#288 restore.sh: carries restoredAt across a failed attempt" \
   "${ctl_restore_sh}" 'restored="$(prev_field restoredAt)"'
 assert_contains "#288 restore.sh: a clean restore stamps restoredAt with its own finish time" \

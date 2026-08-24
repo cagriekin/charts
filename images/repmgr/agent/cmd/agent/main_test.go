@@ -1194,11 +1194,27 @@ func TestBootstrapInitdbNativeInvokesTheEntrypointThenStarts(t *testing.T) {
 		reconcile.Observation{}); err != nil {
 		t.Fatalf("act: %v", err)
 	}
-	if len(ex.calls) != 1 || ex.calls[0][0] != entrypointPath || ex.calls[0][1] != "initdb" {
-		t.Fatalf("want one %s initdb call, got %v", entrypointPath, ex.calls)
+	if len(ex.calls) == 0 || ex.calls[0][0] != entrypointPath || ex.calls[0][1] != "initdb" {
+		t.Fatalf("want %s initdb as the FIRST call, got %v", entrypointPath, ex.calls)
 	}
 	if !pm.started {
 		t.Error("the cluster was created but never started")
+	}
+	// #288 review (second pass): the highwater marker must be written HERE, not deferred to the
+	// next StayPrimary tick. If the agent dies in that window the lease expires, a peer sees
+	// empty PGDATA with no marker and no reachable primary, and takes BootstrapInitdb -- a
+	// SECOND cluster with its own system_identifier, after which assertSameCluster refuses every
+	// rejoin on both pods and only a PVC delete recovers.
+	sawMarkerRead := false
+	for _, c := range ex.calls {
+		for _, arg := range c {
+			if strings.Contains(arg, "pg_walfile_name") {
+				sawMarkerRead = true
+			}
+		}
+	}
+	if !sawMarkerRead {
+		t.Errorf("expected the timeline read that feeds the highwater marker write, got %v", ex.calls)
 	}
 	// The lost-leadership fence must be armed before any tick observes this node as a writer.
 	if !a.servingRW.Load() {
@@ -1673,6 +1689,9 @@ func TestBootstrapInitdbNativeDiscardsAPartialDataDirOnExecFailure(t *testing.T)
 func TestObserveStandbyStallRequiresPersistence(t *testing.T) {
 	ex := &scriptedExec{walRcv: ""} // running standby, no walreceiver row
 	a := newFollowTestAgent(t, ex)
+	// A SETTLED standby: the repoint has completed at least once. Without the latch the
+	// escalation must not fire at all -- see the sibling test below.
+	a.followUpstream = "pg-0"
 	base := reconcile.Observation{Local: reconcile.LocalState{Running: true, InRecovery: true, HasData: true}}
 
 	for i := 1; i < standbyStallTicks; i++ {
@@ -1738,11 +1757,15 @@ func (failingExec) Run(context.Context, []string, string, ...string) (string, er
 	return "", errors.New("exit status 2")
 }
 
-// #288 review: the restore claim must EXPIRE once this node follows a peer. It used to be
-// permanent, and permanent provenance is its own data-loss bug -- a node restored long ago, since
-// demoted cleanly and streaming happily, still outranked a peer holding far more WAL, would win
-// the lease, skip that peer in its own election, and promote with less WAL. Forever.
-func TestLatchFollowExpiresTheRestoreClaim(t *testing.T) {
+// #288 review (second pass): following a peer must NOT expire the restore claim.
+//
+// The first attempt dropped it here, which is a race: under native, Follow only writes
+// primary_conninfo + standby.signal and reloads -- no rewind -- so a DIVERGED standby reaches it
+// too. A PITR lands on pgbackrest.restore.podOrdinal, which need not be the lease holder; that
+// pod comes up read-write, takes DemoteFence then Follow, and would drop its claim ~10s after
+// boot, racing the holder's tick which needs that record to decide to release the lease to it.
+// Expiry belongs on ADOPTION (promote + marker advance) instead.
+func TestLatchFollowPreservesTheRestoreClaim(t *testing.T) {
 	dir := t.TempDir()
 	pgdata := filepath.Join(dir, "pgdata")
 	if err := os.MkdirAll(pgdata, 0o700); err != nil {
@@ -1760,8 +1783,31 @@ func TestLatchFollowExpiresTheRestoreClaim(t *testing.T) {
 	if a.followUpstream != "pg-1" {
 		t.Errorf("follow latch not set: %q", a.followUpstream)
 	}
+	if _, err := os.Stat(rec); err != nil {
+		t.Errorf("the restore claim must SURVIVE a follow, or the holder's release-to-restored-node tick races it: %v", err)
+	}
+}
+
+// The adoption drop itself: once this node has promoted and the marker records its history, the
+// claim has done its job and must not outlive it (a permanent claim let a long-restored node
+// outrank a peer with far more WAL on every later election).
+func TestDropRestoreRecordRemovesTheClaim(t *testing.T) {
+	dir := t.TempDir()
+	pgdata := filepath.Join(dir, "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a := &agent{
+		cfg: &config.Config{PGDATA: pgdata},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	rec := a.cfg.RestoreStatusPath()
+	if err := os.WriteFile(rec, []byte("exitCode=0\nrestoredAt=2026-08-24T12:00:00Z\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.dropRestoreRecord("adopted")
 	if _, err := os.Stat(rec); !os.IsNotExist(err) {
-		t.Errorf("the restore record must be gone once this node follows a peer (stat err=%v)", err)
+		t.Errorf("the claim must be gone after adoption (stat err=%v)", err)
 	}
 }
 
@@ -1780,5 +1826,25 @@ func TestLatchFollowWithoutARecordIsHarmless(t *testing.T) {
 	a.latchFollow("pg-1")
 	if a.followUpstream != "pg-1" {
 		t.Errorf("follow latch not set: %q", a.followUpstream)
+	}
+}
+
+// #288 review (second pass): a standby that has NOT settled on an upstream must never escalate.
+// A freshly repointed standby is indistinguishable from a diverged one -- Follow writes
+// primary_conninfo and reloads, and the walreceiver can legitimately take tens of seconds to
+// attach (the new primary may not have created the slot yet, sender slots can be exhausted, DNS
+// may be settling). Escalating there stops, rewinds and possibly RE-CLONES a healthy standby.
+func TestObserveStandbyStallDoesNotFireBeforeTheFollowLatchIsSet(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""} // running standby, no walreceiver row
+	a := newFollowTestAgent(t, ex)
+	a.followUpstream = "" // not settled on any upstream yet
+	base := reconcile.Observation{Local: reconcile.LocalState{Running: true, InRecovery: true, HasData: true}}
+
+	for i := 0; i < standbyStallTicks*3; i++ {
+		o := base
+		a.observeStandbyStall(context.Background(), &o)
+		if o.StandbyStalled {
+			t.Fatalf("escalated on tick %d with no follow latch: a repointing standby would be rewound", i+1)
+		}
 	}
 }
