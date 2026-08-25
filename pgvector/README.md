@@ -299,6 +299,10 @@ Must satisfy `leaseDuration > renewDeadline > retryPeriod`; widen for managed cl
 
 The agent honours `KUBECONFIG` (repmgr image `trixie-5.5.0-33` or newer, pinned by this chart since 1.14.1), so its apiserver traffic can be sent through an in-cluster proxy on clusters whose egress policy denies pod traffic to the apiserver outright — where it otherwise never elects a leader and the cluster never gets a serving primary. No new value is involved: set the variable with `postgresql.extraEnv` and mount the kubeconfig with `postgresql.extraVolumes`/`extraVolumeMounts`. With it unset the in-cluster ServiceAccount path is used, unchanged. This chart shares pg's agent — see the [pg chart README](../pg/README.md#routing-the-agents-apiserver-traffic--kubeconfig-317) for the example kubeconfig, why `KUBERNETES_SERVICE_HOST` cannot express it, and the failure modes.
 
+### Routing the backup CronJob's apiserver traffic — `pgbackrest.extraEnv` (#323)
+
+The pgBackRest backup CronJob is an apiserver client too — it resolves the current primary from EndpointSlices and drives pgBackRest with `kubectl exec` — and it is *not* covered by `postgresql.extraEnv`, since it runs in its own pod. On a cluster whose egress policy denies pod traffic to the apiserver it therefore takes no backup, and because it is the only caller of `stanza-create` in the chart the repository is never initialised either, so `archive_command` fails on every WAL segment from the moment the cluster starts. `pgbackrest.extraEnv`/`extraVolumes`/`extraVolumeMounts` carry the same `KUBECONFIG` escape onto every pgBackRest container — the sidecar and `pgbackrest-bootstrap` init container in the postgresql pod, the backup CronJobs, the restore workload and the validation CronJob — and never onto the postgresql container. One consequence to know: `archive_command` runs pgBackRest *in* the postgresql container, so if what you are routing is the S3 repository (a proxy, a private CA) rather than the apiserver, set it in `postgresql.extraEnv` as well -- otherwise backups, restores and validation work while `archive-push` fails on every segment and WAL accumulates in `pg_wal`. Guarded at render time (shape, collisions with chart volumes, shadowed mount paths, reserved env names, and being set at all while `pgbackrest.enabled` is false). See the [pg chart README](../pg/README.md#routing-the-backup-cronjobs-apiserver-traffic--pgbackrestextraenv-323).
+
 ### PGPool-II Parameters
 
 | Parameter | Description | Default |
@@ -910,6 +914,9 @@ helm install my-pgvector cagriekin/pgvector \
 |-----------|-------------|---------|
 | `pgbackrest.enabled` | Enable pgBackRest | `false` |
 | `pgbackrest.stanza` | pgBackRest stanza name | `db` |
+| `pgbackrest.extraEnv` | Extra env vars for every pgBackRest container (sidecar, bootstrap init container, backup CronJobs, restore workload, validation CronJob); may not reuse a chart-set name (`#323`) | `[]` |
+| `pgbackrest.extraVolumes` | Extra pod-level volumes on each of those pods | `[]` |
+| `pgbackrest.extraVolumeMounts` | Extra mounts on each of those containers; each must reference a `pgbackrest.extraVolumes` entry | `[]` |
 | `pgbackrest.s3.endpoint` | S3-compatible endpoint URL | `""` |
 | `pgbackrest.s3.bucket` | S3 bucket name | `""` |
 | `pgbackrest.s3.region` | S3 region | `us-east-1` |

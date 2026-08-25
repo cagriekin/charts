@@ -1,5 +1,19 @@
 # pgvector chart changelog
 
+## 1.16.0 - 2026-08-25
+
+Inherited from pg: same templates. `pgbackrest` gains `extraEnv`, `extraVolumes` and
+`extraVolumeMounts` (#323), reaching every pgBackRest container -- the sidecar and
+`pgbackrest-bootstrap` init container in the postgresql pod, the backup CronJobs, the restore
+workload and the validation CronJob -- and deliberately not the postgresql container, which has
+`postgresql.extraEnv` of its own. The case it exists for: the backup CronJob is an apiserver
+client (EndpointSlice lookup + `kubectl exec`), so on a cluster whose egress policy denies pod
+traffic to the apiserver it takes no backup -- and, being the chart's only caller of
+`stanza-create`, leaves the repository uninitialised so `archive_command` fails on every WAL
+segment from the start. `KUBECONFIG` plus a mounted kubeconfig now escapes that here the way
+`postgresql.extraEnv` already did for the agent (#317). Validated at render time; no render
+change with the values unset. See the pg chart README.
+
 ## 1.15.0 - 2026-08-23
 
 Inherited from pg: same templates, same extension init containers. `postgresql.extensions`

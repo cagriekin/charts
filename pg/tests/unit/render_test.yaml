@@ -195,3 +195,114 @@ tests:
           path: spec.template.spec.containers[?(@.name=="postgresql")].volumeMounts[?(@.name=="pgsodium-key")]
       - notExists:
           path: spec.template.spec.containers[?(@.name=="postgresql")].env[?(@.name=="SOME_FLAG")]
+
+  # --- Scenario: pgbackrest passthrough (#323) ---
+  # One list, five containers. Asserted per-container rather than by occurrence count: the
+  # failure this feature fixes was a pod that LOOKED configured, so "it rendered somewhere"
+  # is not the property worth testing.
+  - it: pgbackrest.extraEnv/extraVolumeMounts reach the sidecar and the bootstrap init container
+    values:
+      - ../values-pgbackrest.yaml
+      - ../values-pgbackrest-extra.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="pgbackrest")].env[?(@.name=="KUBECONFIG")].value
+          value: /etc/apiserver-proxy/kubeconfig
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="pgbackrest")].env[?(@.name=="PGBACKREST_EXTRA_TOKEN")].valueFrom.secretKeyRef.name
+          value: apiserver-proxy-token
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="pgbackrest")].volumeMounts[?(@.name=="apiserver-proxy")].mountPath
+          value: /etc/apiserver-proxy
+      - equal:
+          path: spec.template.spec.initContainers[?(@.name=="pgbackrest-bootstrap")].env[?(@.name=="KUBECONFIG")].value
+          value: /etc/apiserver-proxy/kubeconfig
+      - equal:
+          path: spec.template.spec.initContainers[?(@.name=="pgbackrest-bootstrap")].volumeMounts[?(@.name=="apiserver-proxy")].mountPath
+          value: /etc/apiserver-proxy
+      # Pod-level, exactly once -- a mount naming a volume the pod does not declare is
+      # rejected by the kubelet at apply time, not by helm.
+      - equal:
+          path: spec.template.spec.volumes[?(@.name=="apiserver-proxy")].configMap.name
+          value: apiserver-proxy-kubeconfig
+
+  # The postgresql container is deliberately NOT a target: it has postgresql.extraEnv of its
+  # own, and that is also where archive_command's pgbackrest invocation reads its environment.
+  # Leaking a KUBECONFIG into the postmaster's environment would redirect the entrypoint's
+  # stale-primary guard as a side effect of configuring backups.
+  - it: pgbackrest.extraEnv does not leak onto the postgresql container
+    values:
+      - ../values-pgbackrest.yaml
+      - ../values-pgbackrest-extra.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env[?(@.name=="KUBECONFIG")]
+      - notExists:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].volumeMounts[?(@.name=="apiserver-proxy")]
+
+  # The backup CronJob is the one the issue was filed about: it lists EndpointSlices and
+  # drives pgbackrest with `kubectl exec`, and it is the ONLY thing that runs stanza-create.
+  - it: pgbackrest.extraEnv reaches the backup CronJob, the pod that talks to the apiserver
+    values:
+      - ../values-pgbackrest.yaml
+      - ../values-pgbackrest-extra.yaml
+    template: templates/pgbackrest-cronjob.yaml
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.containers[?(@.name=="pgbackrest")].env[?(@.name=="KUBECONFIG")].value
+          value: /etc/apiserver-proxy/kubeconfig
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.containers[?(@.name=="pgbackrest")].volumeMounts[?(@.name=="apiserver-proxy")].mountPath
+          value: /etc/apiserver-proxy
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.volumes[?(@.name=="apiserver-proxy")].configMap.name
+          value: apiserver-proxy-kubeconfig
+
+  - it: pgbackrest.extraEnv reaches the validation CronJob
+    values:
+      - ../values-pgbackrest.yaml
+      - ../values-pgbackrest-extra.yaml
+    template: templates/pgbackrest-validation-cronjob.yaml
+    asserts:
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.containers[?(@.name=="pgbackrest-validation")].env[?(@.name=="KUBECONFIG")].value
+          value: /etc/apiserver-proxy/kubeconfig
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.containers[?(@.name=="pgbackrest-validation")].volumeMounts[?(@.name=="apiserver-proxy")].mountPath
+          value: /etc/apiserver-proxy
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.volumes[?(@.name=="apiserver-proxy")].configMap.name
+          value: apiserver-proxy-kubeconfig
+
+  # restore.mode=job -- the Job body, which the cronjob mode wraps verbatim.
+  - it: pgbackrest.extraEnv reaches the restore Job
+    values:
+      - ../values-pgbackrest.yaml
+      - ../values-pgbackrest-extra.yaml
+    set:
+      pgbackrest.restore.mode: job
+    template: templates/pgbackrest-restore-job.yaml
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="pgbackrest-restore")].env[?(@.name=="KUBECONFIG")].value
+          value: /etc/apiserver-proxy/kubeconfig
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="pgbackrest-restore")].volumeMounts[?(@.name=="apiserver-proxy")].mountPath
+          value: /etc/apiserver-proxy
+      - equal:
+          path: spec.template.spec.volumes[?(@.name=="apiserver-proxy")].configMap.name
+          value: apiserver-proxy-kubeconfig
+
+  - it: no pgbackrest extra volumes, mounts or env by default
+    values:
+      - ../values-pgbackrest.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.volumes[?(@.name=="apiserver-proxy")]
+      - notExists:
+          path: spec.template.spec.containers[?(@.name=="pgbackrest")].env[?(@.name=="KUBECONFIG")]

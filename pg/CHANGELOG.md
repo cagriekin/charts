@@ -1,5 +1,72 @@
 # pg chart changelog
 
+## 1.16.0 - 2026-08-25
+
+### Added
+
+- **`pgbackrest.extraEnv` / `extraVolumes` / `extraVolumeMounts`: point the pgBackRest workloads
+  at a non-default apiserver route or repository route (#323).** `postgresql` has had all three
+  since #262; none of the pgBackRest workloads had any equivalent, and each carried one
+  hardcoded `env:` block.
+
+  That gap has teeth because the **backup CronJob is an apiserver client**: it resolves the
+  current primary at fire time by listing EndpointSlices and then drives pgBackRest with
+  `kubectl exec`, which is exactly what makes the schedule survive a failover. Where the pod's
+  default route to `kubernetes.default.svc` is closed -- a CNI policy denying the
+  `kube-apiserver` entity for a tenant namespace, say -- the schedule runs, `kubectl` times out,
+  and no backup is ever taken. The agent could already escape this with `KUBECONFIG` and
+  `postgresql.extraEnv` (#317); the CronJob could not.
+
+  The second-order damage is worse than the missed backup: that CronJob is the chart's **only**
+  caller of `stanza-create`, so the repository is never initialised and `archive_command` fails
+  on every WAL segment from the moment the cluster starts -- `archived_count 0,
+  failed_count 196` an hour into a database's life, on a cluster where every pod, Service and
+  policy reads as correctly configured.
+
+  All three reach **every** container that runs pgBackRest or drives it: the `pgbackrest`
+  sidecar and the `pgbackrest-bootstrap` init container in the postgresql pod, the `full`/`diff`
+  backup CronJobs, the restore Job/CronJob, and the validation CronJob. The sidecar is included
+  deliberately -- `stanza-create` and `backup` actually execute there, via `kubectl exec` from
+  the CronJob, so a value that reached the CronJob alone would route the `kubectl` call and
+  leave the backup itself unchanged. The **postgresql container is excluded**, equally
+  deliberately: it has `postgresql.extraEnv` of its own (also where `archive_command`'s
+  pgBackRest invocation reads its environment), and a `KUBECONFIG` injected there would
+  redirect the entrypoint's stale-primary guard (#170) as a side effect of configuring backups.
+
+  Guarded at render time by `pg.validatePgbackrestPassthrough`, since each of these failures is
+  otherwise apply-time or run-time only: setting any of the three while `pgbackrest.enabled` is
+  false is **refused** rather than silently ignored; `extraVolumes` names are checked against
+  the chart's own volumes in all four pods *and* against `postgresql.extraVolumes` /
+  `postgresql.extensions.extraVolumes`, which land in the same postgresql pod volume list; every
+  mount must reference a declared volume, must not repeat a `mountPath`, and must not shadow
+  PGDATA (at, above or inside), `/etc/pgbackrest/pgbackrest.conf`, `/scripts`, `/work`, `/tmp`
+  or `/var/run/postgresql`; and `extraEnv` may not reuse a chart-set name -- reserved as the
+  union over all five containers and unconditionally, so a passthrough that works today cannot
+  start shadowing a chart value after a later upgrade enables `repoEncryption` or switches
+  `s3.keyType`.
+
+  Two consequences documented in the README rather than left to be discovered.
+  `extraVolumes` is pod-level on the **postgresql** pod as well (that is where the sidecar and
+  the bootstrap init container live), so a ConfigMap or Secret that does not exist yet holds
+  the database pods in `ContainerCreating` on the next roll, not just the backups. And with
+  `repmgr.agent.control.restore` enabled, the #279 ValidatingAdmissionPolicy that bounds the
+  agent's `create jobs` grant pins the restore Job's volume sources and env `valueFrom` names
+  -- the chart folds these values into those pins, so the agent-driven restore keeps working,
+  but only sources it can bind to a NAME (`emptyDir`, `configMap`, `secret`,
+  `persistentVolumeClaim`; `fieldRef`/`secretKeyRef`/`configMapKeyRef` for env) can be pinned.
+  Anything else is a render failure on purpose: admitting an unpinned source would reopen the
+  door that policy exists to close, and omitting it would surface as `POST /v1/restore` denied
+  at admission during an incident. The names reach single-quoted CEL literals, so they go
+  through the same injection guard as every other interpolated value.
+
+  `extraVolumeMounts` paths are normalized before those comparisons: a relative destination is
+  refused (the runtime rejects it, so the pod would stay in `CreateContainerError` with nothing
+  in the manifest to explain it), and `//var/lib/postgresql/data` or
+  `/tmp/../var/lib/postgresql/data` are refused rather than walking around a prefix test onto
+  the live data directory.
+
+  No render change with the values unset.
+
 ## 1.15.0 - 2026-08-23
 
 ### Added

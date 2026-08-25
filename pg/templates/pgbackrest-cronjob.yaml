@@ -158,14 +158,30 @@ spec:
                 # writable /tmp emptyDir so the read-only root filesystem is enough (#117).
                 - name: HOME
                   value: /tmp
+{{- /* #323: this pod is an apiserver client -- it resolves the primary from EndpointSlices and
+       drives pgbackrest with `kubectl exec`. On a cluster whose egress policy denies pod
+       traffic to the apiserver, kubectl times out, the backup never runs AND stanza-create
+       never runs (this CronJob is the only thing that creates the stanza), so archive_command
+       fails on every WAL segment from the moment the cluster starts. `KUBECONFIG` plus a
+       mounted kubeconfig sends it through an in-cluster proxy instead -- the same escape the
+       agent got in #317, which had `postgresql.extraEnv` to use and this pod did not. */}}
+{{- with $root.Values.pgbackrest.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+{{- end }}
               resources:
                 {{- toYaml $root.Values.pgbackrest.cronjob.resources | nindent 16 }}
               volumeMounts:
                 - name: tmp
                   mountPath: /tmp
+{{- with $root.Values.pgbackrest.extraVolumeMounts }}
+                {{- toYaml . | nindent 16 }}
+{{- end }}
           volumes:
             - name: tmp
               emptyDir:
                 sizeLimit: 64Mi
+{{- with $root.Values.pgbackrest.extraVolumes }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
 {{- end }}
 {{- end }}

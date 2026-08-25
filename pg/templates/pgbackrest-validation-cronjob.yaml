@@ -125,6 +125,11 @@ spec:
                       name: {{ include "pg.pgbackrestS3SecretName" . }}
                       key: {{ .Values.pgbackrest.existingSecret.secretAccessKeyKey }}
 {{- end }}
+{{- /* #323. Like the restore Job this makes no apiserver call, but it restores from the
+       repository, so it needs the same route to it that a backup has. */}}
+{{- with .Values.pgbackrest.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+{{- end }}
               resources:
                 {{- toYaml .Values.pgbackrest.validation.resources | nindent 16 }}
               volumeMounts:
@@ -139,6 +144,9 @@ spec:
                   readOnly: true
                 - name: work
                   mountPath: /work
+{{- with .Values.pgbackrest.extraVolumeMounts }}
+                {{- toYaml . | nindent 16 }}
+{{- end }}
           volumes:
             - name: pgbackrest-config
               configMap:
@@ -157,4 +165,7 @@ spec:
               {{- else }}
               emptyDir: {}
               {{- end }}
+{{- with .Values.pgbackrest.extraVolumes }}
+            {{- toYaml . | nindent 12 }}
+{{- end }}
 {{- end }}

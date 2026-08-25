@@ -79,6 +79,50 @@
 {{- if .Values.pgbackrest.repoEncryption.enabled }}
 {{- $secretRefs = append $secretRefs .Values.pgbackrest.repoEncryption.existingSecret.name }}
 {{- end }}
+{{- /* #323 review: pgbackrest.extraEnv/extraVolumes reach the restore Job too, and this policy
+       pins the Job the AGENT creates by cloning that same spec (k8s.CloneCronJobToJob). Left
+       out of these rules, an operator who added a kubeconfig to fix backups would find
+       POST /v1/restore denied at admission -- during an incident, with the release itself
+       looking correct. So the passthrough's own sources are folded into the pins, by NAME and
+       by TYPE: the policy still refuses everything the release did not declare, which is the
+       property it exists for (the threat is a compromised agent, not the values file).
+
+       A source this cannot pin by name -- projected, csi, downwardAPI, hostPath, an env
+       resourceFieldRef -- is a RENDER failure rather than a silent widening or a silent
+       breakage: admitting `has(v.projected)` would readmit arbitrary Secrets through the
+       exact door rule 15 exists to close. */}}
+{{- $extraVolPins := list }}
+{{- range $i, $v := (.Values.pgbackrest.extraVolumes | default list) }}
+{{- $vn := $v.name | toString }}
+{{- /* hasKey, not truthiness (#323 review): `emptyDir: {}` is the canonical spelling and an
+       empty map is FALSY in Go templates, so a truth test sends it to the fail below --
+       rejecting the one source that needs no pin at all. */}}
+{{- if hasKey $v "emptyDir" }}
+{{- /* already admitted by the emptyDir clause */}}
+{{- else if hasKey $v "configMap" }}
+{{- $extraVolPins = append $extraVolPins (dict "kind" "configMap" "field" "name" "value" ($v.configMap.name | toString)) }}
+{{- else if hasKey $v "secret" }}
+{{- $extraVolPins = append $extraVolPins (dict "kind" "secret" "field" "secretName" "value" ($v.secret.secretName | toString)) }}
+{{- else if hasKey $v "persistentVolumeClaim" }}
+{{- $extraVolPins = append $extraVolPins (dict "kind" "persistentVolumeClaim" "field" "claimName" "value" ($v.persistentVolumeClaim.claimName | toString)) }}
+{{- else }}
+{{- fail (printf "pgbackrest.extraVolumes[%d] (%s) is a volume source this chart cannot pin in the restore admission policy (#279/#323): only emptyDir, configMap, secret and persistentVolumeClaim carry a name the policy can bind to, and admitting an unpinned source would let the agent's Jobs mount anything of that type. The restore Job would be denied at admission the moment the agent tried to create it. Use one of those four sources, or -- if you need this one -- disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $i $vn) }}
+{{- end }}
+{{- end }}
+{{- $extraSecretRefs := list }}
+{{- $extraCmRefs := list }}
+{{- range $i, $e := (.Values.pgbackrest.extraEnv | default list) }}
+{{- $en := $e.name | toString }}
+{{- with $e.valueFrom }}
+{{- if hasKey . "secretKeyRef" }}
+{{- $extraSecretRefs = append $extraSecretRefs (.secretKeyRef.name | toString) }}
+{{- else if hasKey . "configMapKeyRef" }}
+{{- $extraCmRefs = append $extraCmRefs (.configMapKeyRef.name | toString) }}
+{{- else if not (hasKey . "fieldRef") }}
+{{- fail (printf "pgbackrest.extraEnv[%d] (%s) uses an env valueFrom source the restore admission policy cannot pin (#279/#323): only fieldRef, secretKeyRef and configMapKeyRef can be bound to a name there, so this Job would be denied at admission the moment the agent tried to create it. Use one of those three, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $i $en) }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- /* Allowed env valueFrom sources. fieldRef (the downward API, which can read nothing
        but the pod's own metadata) is always permitted -- the restore's
        RESTORE_REQUESTED_BY comes from it -- and this release's own Secrets are added when
@@ -90,9 +134,15 @@
        rule phrased as a negation of secretKeyRef would then admit configMapKeyRef -- the
        opposite of what its message promises, in exactly the keyless configuration a
        cloud-workload-identity install uses. */}}
+{{- $allSecretRefs := concat $secretRefs $extraSecretRefs }}
 {{- $valueFromRule := "has(e.valueFrom.fieldRef)" }}
-{{- if $secretRefs }}
-{{- $valueFromRule = printf "has(e.valueFrom.fieldRef) || (has(e.valueFrom.secretKeyRef) && e.valueFrom.secretKeyRef.name in ['%s'])" (join "','" $secretRefs) }}
+{{- if $allSecretRefs }}
+{{- $valueFromRule = printf "%s || (has(e.valueFrom.secretKeyRef) && e.valueFrom.secretKeyRef.name in ['%s'])" $valueFromRule (join "','" $allSecretRefs) }}
+{{- end }}
+{{- /* configMapKeyRef stays denied unless the release itself declared one through
+       pgbackrest.extraEnv (#323) -- named, so an arbitrary ConfigMap is still out. */}}
+{{- if $extraCmRefs }}
+{{- $valueFromRule = printf "%s || (has(e.valueFrom.configMapKeyRef) && e.valueFrom.configMapKeyRef.name in ['%s'])" $valueFromRule (join "','" $extraCmRefs) }}
 {{- end }}
 {{- /* The pod-template labels the restore Job renders, read back from the same helper the
        Job template uses so the two cannot drift. Pinning these is not cosmetic: the
@@ -224,6 +274,15 @@
 {{- end }}
 {{- range $s := $secretRefs }}
 {{- $literals = append $literals (list "a pgbackrest Secret name (pgbackrest.existingSecret.name / pgbackrest.repoEncryption.existingSecret.name)" $s) }}
+{{- end }}
+{{- range $s := $extraSecretRefs }}
+{{- $literals = append $literals (list "a pgbackrest.extraEnv secretKeyRef name" $s) }}
+{{- end }}
+{{- range $c := $extraCmRefs }}
+{{- $literals = append $literals (list "a pgbackrest.extraEnv configMapKeyRef name" $c) }}
+{{- end }}
+{{- range $p := $extraVolPins }}
+{{- $literals = append $literals (list (printf "a pgbackrest.extraVolumes %s name" $p.kind) $p.value) }}
 {{- end }}
 {{- /* Every OTHER value that reaches a single-quoted CEL literal. Missing one is not
        cosmetic: `RuntimeDefault' || true || '` renders a syntactically valid, always-true
@@ -417,8 +476,11 @@ spec:
         !has(variables.pod.volumes) || variables.pod.volumes.all(v,
         has(v.emptyDir)
         || (has(v.configMap) && v.configMap.name == '{{ $fullname }}-pgbackrest')
-        || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'data-{{ $fullname }}-{{ .Values.pgbackrest.restore.podOrdinal }}'))
-      message: "the pg agent's Jobs may mount only this release's restore volumes: emptyDir, configMap {{ $fullname }}-pgbackrest, and PVC data-{{ $fullname }}-{{ .Values.pgbackrest.restore.podOrdinal }}"
+        || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'data-{{ $fullname }}-{{ .Values.pgbackrest.restore.podOrdinal }}')
+{{- range $p := $extraVolPins }}
+        || (has(v.{{ $p.kind }}) && v.{{ $p.kind }}.{{ $p.field }} == '{{ $p.value }}')
+{{- end }})
+      message: "the pg agent's Jobs may mount only this release's restore volumes: emptyDir, configMap {{ $fullname }}-pgbackrest, and PVC data-{{ $fullname }}-{{ .Values.pgbackrest.restore.podOrdinal }}{{ with $extraVolPins }}, plus this release's pgbackrest.extraVolumes ({{ range $i, $p := . }}{{ if $i }}, {{ end }}{{ $p.kind }} {{ $p.value }}{{ end }}){{ end }}"
       reason: Forbidden
     # 16. The same bound for env: envFrom pulls a whole Secret or ConfigMap, and
     #    secretKeyRef/configMapKeyRef pull a key from any of them. Only the downward API
@@ -426,7 +488,7 @@ spec:
     - expression: >-
         variables.pod.containers.all(c, !has(c.envFrom) && (!has(c.env) || c.env.all(e,
         !has(e.valueFrom) || ({{ $valueFromRule }}))))
-      message: "the pg agent's Jobs may not use envFrom, and may reference only the downward API{{ with $secretRefs }} or this release's own Secrets ({{ join ", " . }}){{ end }} through env valueFrom"
+      message: "the pg agent's Jobs may not use envFrom, and may reference only the downward API{{ with $allSecretRefs }} or this release's own Secrets ({{ join ", " . }}){{ end }}{{ with $extraCmRefs }} or the ConfigMaps this release's pgbackrest.extraEnv names ({{ join ", " . }}){{ end }} through env valueFrom"
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

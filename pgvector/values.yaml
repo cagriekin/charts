@@ -865,6 +865,21 @@ pgbackrest:
   enabled: false
   stanza: db
 
+  # Operator passthroughs for every pgbackrest container (#323): the sidecar and
+  # pgbackrest-bootstrap init container in the postgresql pod, the backup CronJobs, the restore
+  # Job and the validation CronJob. Chiefly for the backup CronJob, which is an apiserver
+  # client (it resolves the primary from EndpointSlices) and therefore takes no backup -- and
+  # never runs stanza-create, so archive_command fails from the start -- on a cluster whose
+  # egress policy denies pod traffic to the apiserver. Set KUBECONFIG here and mount the
+  # kubeconfig, the same escape postgresql.extraEnv gives the agent (#317). extraVolumes is
+  # pod-level on the postgresql pod too, so a ConfigMap/Secret that does not exist yet holds
+  # the DATABASE pods in ContainerCreating on the next roll -- create it first, or mark the
+  # source optional. Validated at render time (pg.validatePgbackrestPassthrough); see the pg
+  # chart README.
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
+
   s3:
     endpoint: ""
     bucket: ""

@@ -203,6 +203,33 @@
     "pgbackrest": {
       "type": "object",
       "properties": {
+        "extraEnv": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": { "name": { "type": "string" } }
+          },
+          "description": "core-v1 EnvVar list added to every pgbackrest container (#323) -- chiefly KUBECONFIG, to route the backup CronJob's apiserver traffic through an in-cluster proxy on a cluster whose egress policy denies the apiserver. May not reuse a chart-set name. See the pg chart README."
+        },
+        "extraVolumes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": { "name": { "type": "string" } }
+          },
+          "description": "core-v1 Volume list added to the pod of every pgbackrest workload (#323). Names may not collide with a chart volume in any of them."
+        },
+        "extraVolumeMounts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "mountPath"],
+            "properties": { "name": { "type": "string" }, "mountPath": { "type": "string" } }
+          },
+          "description": "core-v1 VolumeMount list added to every pgbackrest container (#323); each entry must reference a pgbackrest.extraVolumes entry."
+        },
         "s3": {
           "type": "object",
           "properties": {
