@@ -1848,3 +1848,179 @@ func TestObserveStandbyStallDoesNotFireBeforeTheFollowLatchIsSet(t *testing.T) {
 		}
 	}
 }
+
+// stallExec answers the two queries observeStandbyStall makes: the walreceiver lookup
+// (StreamingUpstream) and the position read (StandbyReceiveLSN). recvLSN is what the position
+// query returns, so a test can hold it still or advance it between ticks.
+type stallExec struct {
+	streaming bool
+	recvLSN   string
+}
+
+func (s *stallExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
+	joined := strings.Join(args, " ")
+	switch {
+	case name == "psql" && strings.Contains(joined, "pg_stat_wal_receiver"):
+		if s.streaming {
+			return "up-0|streaming", nil
+		}
+		return "", nil // no walreceiver row at all -- archive recovery, or genuinely stalled
+	case name == "psql" && strings.Contains(joined, "pg_last_wal_receive_lsn"):
+		return s.recvLSN, nil
+	}
+	return "", nil
+}
+
+func newStallTestAgent(t *testing.T, ex *stallExec) *agent {
+	t.Helper()
+	a := newSlotTestAgent(t, nil, config.MechanismNative)
+	a.prober = &pg.Prober{Exec: ex, Timeout: time.Second}
+	a.followUpstream = "pg-1" // pointed at an upstream, the precondition for a stall
+	return a
+}
+
+// A standby replaying from restore_command (pgbackrest archive-get) has NO pg_stat_wal_receiver
+// row for as long as it works through archived WAL. Counting those ticks as a stall made Decide
+// escalate to RejoinForward -- stopping, rewinding or re-cloning a node that was catching up
+// correctly. Forward progress in the replay position is what tells the two apart (#288 review).
+func TestObserveStandbyStallIgnoresArchiveCatchUp(t *testing.T) {
+	ex := &stallExec{streaming: false, recvLSN: "0/3000000"}
+	a := newStallTestAgent(t, ex)
+	standby := reconcile.LocalState{Running: true, InRecovery: true}
+
+	for i := 0; i < standbyStallTicks*2; i++ {
+		o := reconcile.Observation{Local: standby}
+		a.observeStandbyStall(context.Background(), &o)
+		if o.StandbyStalled {
+			t.Fatalf("tick %d: a standby making replay progress must never be reported stalled", i)
+		}
+		// Each tick replays a little more WAL, exactly as archive recovery does.
+		ex.recvLSN = fmt.Sprintf("0/%d000000", 4+i)
+	}
+}
+
+// The flip side: no walreceiver AND no forward progress is a genuinely wedged standby, which
+// must still earn StandbyStalled after stallTicks so a diverged node can be rejoined.
+func TestObserveStandbyStallStillFiresWhenNothingMoves(t *testing.T) {
+	ex := &stallExec{streaming: false, recvLSN: "0/3000000"}
+	a := newStallTestAgent(t, ex)
+	standby := reconcile.LocalState{Running: true, InRecovery: true}
+
+	var last reconcile.Observation
+	for i := 0; i < standbyStallTicks+1; i++ {
+		last = reconcile.Observation{Local: standby}
+		a.observeStandbyStall(context.Background(), &last)
+	}
+	if !last.StandbyStalled {
+		t.Fatalf("a standby with no walreceiver and no replay progress must be reported stalled after %d ticks", standbyStallTicks)
+	}
+}
+
+// An observed streaming upstream clears both the counter and the progress watermark, so a later
+// stall starts from scratch rather than comparing against a stale position.
+func TestObserveStandbyStallResetsOnStreaming(t *testing.T) {
+	ex := &stallExec{streaming: false, recvLSN: "0/3000000"}
+	a := newStallTestAgent(t, ex)
+	standby := reconcile.LocalState{Running: true, InRecovery: true}
+	for i := 0; i < standbyStallTicks+1; i++ {
+		o := reconcile.Observation{Local: standby}
+		a.observeStandbyStall(context.Background(), &o)
+	}
+	ex.streaming = true
+	o := reconcile.Observation{Local: standby}
+	a.observeStandbyStall(context.Background(), &o)
+	if o.StandbyStalled || a.standbyNoReceiverTicks != 0 || a.standbyLastProgressLSN != (pg.LSN{}) {
+		t.Fatalf("streaming must clear the stall state, got stalled=%v ticks=%d lsn=%v",
+			o.StandbyStalled, a.standbyNoReceiverTicks, a.standbyLastProgressLSN)
+	}
+}
+
+// noopExec answers every command with success and no output: enough for discardFreshDataDir's
+// best-effort `pg_ctl stop` on a directory whose postmaster is long gone.
+type noopExec struct{}
+
+func (noopExec) Run(_ context.Context, _ []string, _ string, _ ...string) (string, error) {
+	return "", nil
+}
+
+func newInitdbMarkerAgent(t *testing.T) *agent {
+	t.Helper()
+	root := t.TempDir()
+	pgdata := filepath.Join(root, "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// What a bootstrap that got as far as initdb leaves behind.
+	if err := os.WriteFile(filepath.Join(pgdata, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return &agent{
+		cfg:    &config.Config{PGDATA: pgdata, PodName: "pg-0"},
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		prober: &pg.Prober{Exec: noopExec{}, Timeout: time.Second},
+	}
+}
+
+// #288 review: bootstrap_initdb starts a postmaster halfway through, which satisfies the chart's
+// startupProbe and arms the liveness probe while act() still holds opMu and is not beating
+// /healthz -- so the kubelet can SIGKILL the container mid-bootstrap. No error is returned for
+// discardFreshDataDir to act on, and the result is unrecoverable by hand: PGDATA is initialized
+// but carries no repmgr role or database, bootstrap_initdb no-ops on it forever, and the pod
+// comes up as a primary the agent cannot authenticate against. Only a next-boot check recovers.
+func TestDiscardTornInitdbWipesAnUnfinishedBootstrap(t *testing.T) {
+	a := newInitdbMarkerAgent(t)
+	if dir := filepath.Dir(a.initdbMarkerPath()); dir == a.cfg.PGDATA {
+		t.Fatalf("the initdb marker is inside PGDATA (%s); initdb requires an empty target", dir)
+	}
+	a.beginInitdb()
+	a.discardTornInitdb(context.Background())
+	if process.HasData(a.cfg.PGDATA) {
+		t.Error("a half-bootstrapped data directory survived, so the pod stays wedged")
+	}
+	if _, err := os.Stat(a.initdbMarkerPath()); !os.IsNotExist(err) {
+		t.Error("the initdb marker survived the discard")
+	}
+}
+
+// The marker alone must NEVER justify wiping: endInitdb only warns when its remove fails, so a
+// stale marker is reachable over a bootstrap that DID finish -- and by the next boot that
+// directory can be a serving primary. bootstrap_initdb's completion sentinel is the evidence.
+func TestDiscardTornInitdbKeepsACompletedBootstrap(t *testing.T) {
+	a := newInitdbMarkerAgent(t)
+	a.beginInitdb()
+	if err := os.WriteFile(a.bootstrapCompletePath(), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.discardTornInitdb(context.Background())
+	if !process.HasData(a.cfg.PGDATA) {
+		t.Error("a completed bootstrap was discarded; that is data loss on a cluster that may already serve")
+	}
+	if _, err := os.Stat(a.initdbMarkerPath()); !os.IsNotExist(err) {
+		t.Error("the stale marker survived, so a later boot would reconsider a healthy directory")
+	}
+}
+
+// No marker means no bootstrap was ever in flight here -- e.g. a standby that cloned. Nothing
+// may be touched, sentinel or not (a clone from a pre-sentinel cluster carries none).
+func TestDiscardTornInitdbLeavesUnmarkedDirectoriesAlone(t *testing.T) {
+	a := newInitdbMarkerAgent(t)
+	a.discardTornInitdb(context.Background())
+	if !process.HasData(a.cfg.PGDATA) {
+		t.Error("a data directory with no in-progress marker was discarded")
+	}
+}
+
+// A successful bootstrap must leave no marker behind, or the next boot inspects a healthy
+// cluster for tornness.
+func TestEndInitdbClearsTheMarker(t *testing.T) {
+	a := newInitdbMarkerAgent(t)
+	a.beginInitdb()
+	a.endInitdb()
+	if _, err := os.Stat(a.initdbMarkerPath()); !os.IsNotExist(err) {
+		t.Fatal("endInitdb left the marker in place")
+	}
+	a.discardTornInitdb(context.Background())
+	if !process.HasData(a.cfg.PGDATA) {
+		t.Error("a bootstrapped data directory was discarded on the next boot")
+	}
+}

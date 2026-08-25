@@ -152,20 +152,27 @@ if [ "$(chart_mechanism)" = "native" ]; then
   # repmgr the equivalent wait was on repmgr.nodes, i.e. on the primary tick itself having run.
   # Only assert the reclaim when there was something to reclaim. An honest SKIP beats a green
   # assertion that never exercised the code path (#288 review).
-  if [ "${PRE_SLOT2}" != "1" ]; then
+  # skip() only records a skip, it does not return (helpers.sh), so the wait below has to be
+  # inside the branch rather than after it (#288 review): with nothing to reclaim, "wait until
+  # pg_ha_slot_2 is gone" is satisfied on its first poll and reports a reclaim that never
+  # happened.
+  if [ "${PRE_SLOT2}" = "1" ]; then
+    echo "  Waiting for the primary to reclaim pg_ha_slot_2 (up to 120s)..."
+    reclaimed=0; elapsed=0
+    while [[ ${elapsed} -lt 120 ]]; do
+      left=$(pg_exec "${NAMESPACE}" "${P}" \
+        "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
+      if [[ "${left}" == "0" ]]; then reclaimed=1; break; fi
+      sleep 5; elapsed=$((elapsed + 5))
+    done
+    assert_eq "#289/#288: the primary reclaimed the departed ordinal's slot" "1" "${reclaimed}"
+  else
     skip "#289/#288: slot reclaim not exercised (pg_ha_slot_2 was absent pre-scale; primary was ${PRE_PRIMARY}, so the trimmed ordinal owned no slot on it)"
   fi
-  echo "  Waiting for the primary to reclaim pg_ha_slot_2 (up to 120s)..."
-  reclaimed=0; elapsed=0
-  while [[ ${elapsed} -lt 120 ]]; do
-    left=$(pg_exec "${NAMESPACE}" "${P}" \
-      "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
-    if [[ "${left}" == "0" ]]; then reclaimed=1; break; fi
-    sleep 5; elapsed=$((elapsed + 5))
-  done
-  if [ "${PRE_SLOT2}" = "1" ]; then
-    assert_eq "#289/#288: the primary reclaimed the departed ordinal's slot" "1" "${reclaimed}"
-  fi
+  # The assertions below stand in BOTH cases: they are about the surviving cluster's steady
+  # state, not about the reclaim, and the "live ordinal N still in the topology" assertions
+  # above already waited for the survivor to be streaming -- which under native cannot happen
+  # without its slot existing on the primary (primary_slot_name is part of primary_conninfo).
   agent_slots=$(pg_exec "${NAMESPACE}" "${P}" \
     "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
   # #288: the assertion inverts. Native owns its slots, so after scaling 3 -> 2 there must be

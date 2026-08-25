@@ -158,6 +158,11 @@ type agent struct {
 	// that is briefly down -- looks identical for a tick or two, so the signal has to persist.
 	standbyNoReceiverTicks int
 
+	// standbyLastProgressLSN is the furthest WAL position seen while counting receiver-less
+	// ticks, so observeStandbyStall can tell a node that is still MAKING PROGRESS from a wedged
+	// one (#288 review). Zero value = nothing observed yet.
+	standbyLastProgressLSN pg.LSN
+
 	// lastTopologyGap is the comma-joined set of live peers not streaming, so topologyTick logs
 	// one line per CHANGE instead of one per tick (#288). A rolling restart legitimately parks a
 	// peer off-stream for a while, and warning every 5s about it would bury everything else.
@@ -390,6 +395,10 @@ func (a *agent) boot(ctx context.Context) error {
 	// and takes the node off the BootstrapClone path forever (#288 review). Discard it first, so
 	// everything below sees an honest picture of the directory.
 	a.discardTornClone(ctx)
+	// Same treatment for an interrupted bootstrap (#288 review). A clone and an initdb fail the
+	// same way -- PG_VERSION present, the directory unusable -- and neither is reachable through
+	// the ordinary has-data paths.
+	a.discardTornInitdb(ctx)
 	// Streaming replication authenticates as the repmgr user via primary_conninfo,
 	// which is deliberately passwordless (the password is not stored in repmgr.conf
 	// -- the PR1 hardening). Without a credential the standby's walreceiver fails
@@ -715,17 +724,45 @@ func (a *agent) observeStandbyStall(ctx context.Context, o *reconcile.Observatio
 	}
 	if streaming {
 		a.standbyNoReceiverTicks = 0
+		a.standbyLastProgressLSN = pg.LSN{}
 		o.StandbyStalled = false
 		return
 	}
+	// An absent walreceiver is NOT the same as a stuck node, and conflating them rewinds healthy
+	// standbys (#288 review). A standby replaying from restore_command -- pgbackrest archive-get,
+	// which the chart configures whenever pgbackrest is enabled -- has NO pg_stat_wal_receiver
+	// row at all while it works through archived WAL, and its local timeline is still the
+	// pre-fork one, so `newer != nil && StandbyStalled` both held and Decide escalated to
+	// RejoinForward: postgres stopped, pg_rewind or a full ReclonePreserving on a node that was
+	// catching up correctly and would have converged on its own. Archive catch-up after a
+	// failover is exactly when this fires, and it is not native-gated, so it reached the default
+	// repmgr mechanism too.
+	//
+	// Replay/receive position is the discriminator: archive recovery advances it, a wedged
+	// standby does not. Only ticks with NO forward progress count toward the stall.
+	if recv, ok, err := a.prober.StandbyReceiveLSN(ctx, a.selfConn()); err == nil && ok {
+		advanced := recv.Greater(a.standbyLastProgressLSN)
+		a.standbyLastProgressLSN = recv
+		if advanced {
+			// Progress without a walreceiver: archive recovery (or a very fresh restart). Hold
+			// the counter at zero -- this node needs no rejoin, it needs time.
+			a.standbyNoReceiverTicks = 0
+			o.StandbyStalled = false
+			return
+		}
+	}
 	a.standbyNoReceiverTicks++
-	// A stall only escalates once this node has actually SETTLED on an upstream (#288 review).
-	// A standby freshly repointed at a just-promoted primary looks identical to a diverged one:
-	// Follow writes primary_conninfo and reloads, and the walreceiver may legitimately take a
-	// while to attach -- the new primary's first StayPrimary tick has not necessarily created
-	// the slot yet, sender slots can be momentarily exhausted, DNS may still be settling. Firing
-	// there stops, rewinds and possibly re-clones a perfectly healthy standby. Requiring the
-	// latch means the repoint has completed at least once before the counter can bite.
+	// A stall only escalates once this node has actually been pointed at an upstream (#288
+	// review). A standby freshly repointed at a just-promoted primary looks identical to a
+	// diverged one: Follow writes primary_conninfo and reloads, and the walreceiver may
+	// legitimately take a while to attach -- the new primary's first StayPrimary tick has not
+	// necessarily created the slot yet, sender slots can be momentarily exhausted, DNS may still
+	// be settling. Firing there stops, rewinds and possibly re-clones a perfectly healthy
+	// standby.
+	//
+	// The latch is a PRECONDITION, not a delay: latchFollow runs at the end of the same Follow
+	// that writes primary_conninfo, so it is set on the first repoint tick. What buys the
+	// settling time is stallTicks plus the no-progress requirement above.
 	o.StandbyStalled = a.standbyNoReceiverTicks >= standbyStallTicks && a.followUpstream != ""
 	if o.StandbyStalled {
 		a.log.Warn("standby has had no walreceiver for several ticks; eligible for rejoin if a peer is on a newer timeline (#288)",
@@ -861,8 +898,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			// decide to release the lease to it. Losing that race discards the restore.
 			a.dropRestoreRecord("this node promoted and the marker records its history, so the cluster adopted the restore")
 		}
-		promoteRoutingErr := a.assertPrimaryRouting(wctx, obs)
-		return promoteRoutingErr
+		return a.assertPrimaryRouting(wctx, obs)
 
 	case reconcile.StayPrimary:
 		// Register this primary in repmgr.nodes. In agent mode there is no repmgrd
@@ -894,13 +930,11 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
-		routingErr := a.assertPrimaryRouting(wctx, obs)
-		// #288: publish the topology from pg_stat_replication. Observe-only -- see topologyTick
-		// for why nothing in Decide may consume it -- and therefore LAST, after the two
-		// leadership-critical writes (#288 review). On the shared fence budget (5s on chart
-		// defaults, already contended by slotsTick) an extra query plus a pod LIST in FRONT of
-		// them could make a slow tick skip the marker write and the Service routing assertion,
-		return routingErr
+		// The topology gauges are NOT published here. They were, and an extra query plus a pod
+		// LIST on this branch's already-contended fence budget could make a slow tick skip the
+		// marker write or the Service routing assertion above -- so topologyTick runs from
+		// tick(), outside opMu, once act() has returned (see its own comment).
+		return a.assertPrimaryRouting(wctx, obs)
 
 	case reconcile.Follow:
 		// #289 review: reclaim slots this node minted while it was the primary, and publish
@@ -1011,6 +1045,11 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			return err
 		}
 		a.endClone()
+		// A clone REPLACES whatever this volume was, so any initdb marker left by an earlier
+		// bootstrap attempt on this pod is now meaningless -- and actively dangerous, because a
+		// clone taken from a cluster created before the completion sentinel existed carries no
+		// sentinel either, which is exactly the shape discardTornInitdb wipes (#288 review).
+		a.endInitdb()
 		a.dropRestoreRecord("the data directory was cloned from " + dec.Target)
 		return a.sup.Start(ctx)
 
@@ -1167,15 +1206,18 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 //     inconsistency.
 func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 	a.log.Info("fresh install: initdb as the lease holder (#288)", "pgdata", a.cfg.PGDATA)
-	// Not bounded by the fence budget: initdb plus role/database creation is legitimately
-	// slower than a failover window, and this node is not serving anything yet, so there is
-	// no read-write exposure for a soft fence to race.
 	// Bounded, just not by the FENCE budget (#288 review). initdb plus role/database creation is
-	// legitimately slower than a failover window, but "not the fence budget" must not mean "no
-	// budget": bootstrap_initdb runs `pg_ctl -w start` and `pg_ctl -w stop`, and if either wait
-	// never returns -- or a failed stop leaves the postmaster holding the stdout pipe, which
-	// Cmd.Output waits on -- act() would hold opMu forever, the reconcile loop would stop
-	// beating, and dcs.OnLost (which also takes opMu) could never fence.
+	// legitimately slower than a failover window, and this node is not serving anything yet, so
+	// there is no read-write exposure for a soft fence to race -- but "not the fence budget"
+	// must not mean "no budget": bootstrap_initdb runs `pg_ctl -w start` and `pg_ctl -w stop`,
+	// and if either wait never returns -- or a failed stop leaves the postmaster holding the
+	// stdout pipe, which Cmd.Output waits on -- act() would hold opMu forever, the reconcile
+	// loop would stop beating, and dcs.OnLost (which also takes opMu) could never fence.
+	//
+	// The budget cannot be the only protection, because the failure that matters is the agent
+	// never returning from here at all: the kubelet can SIGKILL this container mid-bootstrap
+	// (see initdbMarkerPath). Hence the marker, which makes the next boot recover instead.
+	a.beginInitdb()
 	ictx, icancel := context.WithTimeout(ctx, initdbBudget)
 	defer icancel()
 	if out, err := a.prober.Exec.Run(ictx, nil, entrypointPath, "initdb"); err != nil {
@@ -1187,8 +1229,11 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 		// primary the agent can never authenticate against and no standby can clone from.
 		werr := a.discardFreshDataDir()
 		if werr != nil {
+			// Marker deliberately LEFT in place: the directory really is torn, so the next boot
+			// must still see it and retry the discard.
 			return fmt.Errorf("bootstrap initdb: %w: %s (and could not discard the partial data directory, delete the PVC to recover: %v)", err, strings.TrimSpace(out), werr)
 		}
+		a.endInitdb()
 		return fmt.Errorf("bootstrap initdb: %w: %s", err, strings.TrimSpace(out))
 	}
 	nid := mechanism.NodeIdentity{
@@ -1212,8 +1257,13 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 		if werr := a.discardFreshDataDir(); werr != nil {
 			return fmt.Errorf("%w (and could not discard the fresh data directory, delete the PVC to recover: %v)", err, werr)
 		}
+		a.endInitdb()
 		return err
 	}
+	// Cleared only once the directory is a finished cluster (bootstrap_initdb wrote its
+	// completion sentinel) or is gone again. Anything else leaves the marker standing on
+	// purpose, which is what makes the next boot's discardTornInitdb able to recover.
+	a.endInitdb()
 	return nil
 }
 
@@ -1392,6 +1442,90 @@ func (a *agent) endClone() {
 	if err := os.Remove(a.cloneMarkerPath()); err != nil && !os.IsNotExist(err) {
 		a.log.Warn("remove the clone-in-progress marker", "err", err)
 	}
+}
+
+// initdbMarkerPath is the initdb twin of cloneMarkerPath: a sentinel recording that the
+// multi-step cluster bootstrap was started and has not finished (#288 review).
+//
+// Beside PGDATA rather than inside it, for the same reason -- initdb requires an empty target,
+// so a marker within would be destroyed by the operation it tracks.
+//
+// Why the budget is not enough on its own. bootstrapInitdbNative bounds the exec with
+// initdbBudget, and every error return calls discardFreshDataDir, so a slow or failing
+// bootstrap already cleans up after itself. What neither covers is the agent not returning at
+// all: `pg_ctl -w start` inside bootstrap_initdb satisfies the chart's startupProbe (plain
+// `pg_isready`, answered over the unix socket), which retires the startup grace and arms the
+// liveness probe -- and /healthz goes stale after ~3x the reconcile interval because act() holds
+// opMu for the whole exec without beating. On a contended node the kubelet can therefore SIGKILL
+// the container mid-bootstrap, with the same effect as an OOM kill or a node reboot: PGDATA is
+// initialized but carries no repmgr role or database, bootstrap_initdb no-ops on it forever
+// (PG_VERSION exists), and the pod comes up as a primary the agent can never authenticate
+// against. No error is returned to clean up after, so only a next-boot check can recover it.
+func (a *agent) initdbMarkerPath() string {
+	return filepath.Join(filepath.Dir(filepath.Clean(a.cfg.PGDATA)), ".pg-ha-initdb-in-progress")
+}
+
+// bootstrapCompletePath is the positive evidence bootstrap_initdb writes as its LAST action.
+// The marker alone cannot justify wiping: endInitdb only WARNS when its remove fails, so a
+// stale marker is reachable over a bootstrap that DID complete -- and by the next boot that
+// directory may be a serving primary. pg_controldata is no help here (unlike the torn-clone
+// case, where pg_basebackup writes pg_control last on purpose): initdb writes a valid control
+// file immediately, so a half-bootstrapped directory parses perfectly.
+func (a *agent) bootstrapCompletePath() string {
+	return filepath.Join(a.cfg.PGDATA, ".pg-ha-bootstrap-complete")
+}
+
+// beginInitdb records that a cluster bootstrap is starting. Best-effort, like beginClone: a
+// missing marker costs only the automatic discard if that bootstrap is interrupted.
+func (a *agent) beginInitdb() {
+	if err := os.WriteFile(a.initdbMarkerPath(), []byte(a.cfg.PodName+"\n"), 0o600); err != nil {
+		a.log.Warn("write the initdb-in-progress marker; an interrupted bootstrap will need a manual PVC delete", "err", err)
+	}
+}
+
+// endInitdb clears the marker after a bootstrap completes.
+func (a *agent) endInitdb() {
+	if err := os.Remove(a.initdbMarkerPath()); err != nil && !os.IsNotExist(err) {
+		a.log.Warn("remove the initdb-in-progress marker", "err", err)
+	}
+}
+
+// discardTornInitdb wipes a data directory left behind by an INTERRUPTED cluster bootstrap, so
+// the reconcile loop sees an empty PGDATA and can bootstrap again (#288 review).
+//
+// Destructive only on positive evidence of tornness: the marker says a bootstrap was in flight,
+// and the absence of bootstrapCompletePath says it never finished. A directory that finished is
+// KEPT whatever else happened, and the marker is cleared so no later boot reconsiders it.
+//
+// Discarding is safe precisely because this is a bootstrap: the directory was created by this
+// pod moments earlier and has never served. The transient postmaster bootstrap_initdb runs is
+// socket-only, so no peer can have cloned from it either.
+func (a *agent) discardTornInitdb(ctx context.Context) {
+	if _, err := os.Stat(a.initdbMarkerPath()); err != nil {
+		return // no bootstrap was in flight
+	}
+	if !process.HasData(a.cfg.PGDATA) {
+		// Never got as far as PG_VERSION; nothing to discard.
+		a.endInitdb()
+		return
+	}
+	if _, err := os.Stat(a.bootstrapCompletePath()); err == nil {
+		a.log.Info("the cluster bootstrap completed; keeping the data directory (stale in-progress marker, #288)")
+		a.endInitdb()
+		return
+	} else if !os.IsNotExist(err) {
+		// Could not look. Not evidence of tornness -- leave the directory alone and let the
+		// ordinary has-data paths report whatever is really wrong.
+		a.log.Warn("could not read the bootstrap-complete sentinel; not discarding the data directory on that basis", "err", err)
+		return
+	}
+	a.log.Warn("discarding a data directory left by an interrupted cluster bootstrap so it can be created again (#288)",
+		"pgdata", a.cfg.PGDATA)
+	if err := a.discardFreshDataDir(); err != nil {
+		a.log.Error("could not discard the torn bootstrap; delete the PVC to recover", "err", err)
+		return
+	}
+	a.endInitdb()
 }
 
 // discardTornClone wipes a data directory left behind by an INTERRUPTED base backup, so the
@@ -1725,6 +1859,7 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 	// leaves another .diverged.<ts> directory that nothing ever removes, so the PVC fills.
 	// Zeroing here means one rejoin per stall, and a genuine re-stall has to re-earn its ticks.
 	a.standbyNoReceiverTicks = 0
+	a.standbyLastProgressLSN = pg.LSN{}
 	// Invariant 9: never rewind/reclone onto a different cluster. Checked before the
 	// demote so a healthy node is not stopped for a doomed rejoin.
 	if err := a.assertSameCluster(ctx, target); err != nil {
@@ -1849,6 +1984,15 @@ func (a *agent) cleanupGhostNodes(ctx context.Context) {
 	}
 }
 
+// latchFollow records the upstream this node is now replicating from.
+//
+// It deliberately does NOT expire the restore claim (#288 review, second pass): see the
+// adoption drop on the Promote path. Following a peer is not evidence the cluster adopted this
+// volume's restored history -- under native a diverged standby reaches Follow with no rewind.
+func (a *agent) latchFollow(target string) {
+	a.followUpstream = target
+}
+
 // topologyTick publishes the primary's replication topology from pg_stat_replication (#288).
 //
 // This is what replaced repmgr.nodes. That table was a CACHE of self-reported metadata:
@@ -1873,19 +2017,11 @@ func (a *agent) cleanupGhostNodes(ctx context.Context) {
 // wctx is fenceBudget() -- 5s on chart defaults -- and by the time topologyTick runs it has
 // already paid for RegisterPrimary, slotsTick, PrimaryWALPosition, advanceMarker and
 // assertPrimaryRouting. Exhausted, ReplicationTopology fails and topologyTick returns early,
-// LEAVING THE GAUGES AT THEIR PREVIOUS VALUES -- and on the promote path those were just zeroed
-// by ClearTopology, so a freshly promoted primary with healthy standbys exported
-// replicas_streaming = 0. Deriving from ctx keeps it observational: it cannot starve the marker
-// write or the routing switch, and it cannot be starved BY them either.
-// latchFollow records the upstream this node is now replicating from.
-//
-// It deliberately does NOT expire the restore claim (#288 review, second pass): see the
-// adoption drop on the Promote path. Following a peer is not evidence the cluster adopted this
-// volume's restored history -- under native a diverged standby reaches Follow with no rewind.
-func (a *agent) latchFollow(target string) {
-	a.followUpstream = target
-}
-
+// LEAVING THE GAUGES AT THEIR PREVIOUS VALUES -- which, for a node that had just demoted and
+// re-promoted, meant the zeroes ClearTopology wrote on the way through Follow: a freshly
+// promoted primary with healthy standbys exporting replicas_streaming = 0. Since it now runs
+// from tick() rather than from inside act(), it derives its own timeout from ctx: it cannot
+// starve the marker write or the routing switch, and it cannot be starved BY them either.
 func (a *agent) topologyTick(ctx context.Context) {
 	tctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
 	defer cancel()

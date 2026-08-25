@@ -473,6 +473,27 @@ else
   bad "#288: the bootstrap postmaster is network-reachable during role creation"
 fi
 
+# --- #288: bootstrap_initdb's completion sentinel is written LAST ---
+# The agent pairs an in-progress marker beside PGDATA with this sentinel inside it: marker
+# present and sentinel absent means the bootstrap was killed partway (the kubelet can do this --
+# the transient `pg_ctl start` satisfies the chart's startupProbe while the agent is inside the
+# exec and not beating /healthz) and the directory must be discarded. That inference only holds
+# if the sentinel is written after the LAST thing the bootstrap does, so a half-bootstrapped
+# directory can never carry it.
+sentinel_line=$(grep -n 'pg-ha-bootstrap-complete' "${ROOT}/entrypoint.sh" | head -1 | cut -d: -f1)
+if [ -z "$sentinel_line" ]; then
+  bad "#288: bootstrap_initdb writes no completion sentinel (the agent cannot tell a torn bootstrap from a finished one)"
+else
+  ok "#288: bootstrap_initdb writes a completion sentinel"
+  # Every step of the bootstrap must precede it: the role/database psql calls and the stop.
+  last_step=$(grep -n 'CREATE USER ${REPMGR_USER}\|pg_ctl -D "$PGDATA" -w stop' "${ROOT}/entrypoint.sh" | tail -1 | cut -d: -f1)
+  if [ -n "$last_step" ] && [ "$sentinel_line" -gt "$last_step" ]; then
+    ok "#288: the completion sentinel is written after the bootstrap's last step"
+  else
+    bad "#288: the completion sentinel is not last (sentinel=${sentinel_line}, last step=${last_step:-none}); a killed bootstrap could carry it"
+  fi
+fi
+
 echo "----"
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
 exit "$fail"

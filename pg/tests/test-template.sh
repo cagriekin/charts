@@ -3236,8 +3236,18 @@ done
 # additionalCommands silently, with no error and no retry, on every fresh install.
 ps_hook=$(helm template test-pg "${CHART_DIR}" --set repmgr.enabled=true \
   --set 'postgresql.lifecycle.postStart.additionalCommands=psql -c "SELECT 1"' 2>&1)
+# Scope the needle to the no-primary branch itself (#288 review). Grepping the whole render for
+# a bare "continue" passed on any chart containing that word anywhere -- including the comment
+# this change added -- so it could not fail. Take the `if [ -n "$PRIMARY_HOST" ]` block up to
+# its `fi` and assert the else arm retries rather than breaking out of the wait loop.
+ps_branch=$(printf '%s\n' "${ps_hook}" | sed -n '/if \[ -n "\$PRIMARY_HOST" \]; then/,/^ *fi$/p')
+assert_contains "#288 postStart: the no-primary branch is rendered at all" "${ps_branch}" "PRIMARY_HOST"
+# Anchored as whole statements: assert_contains greps a BRE, and the branch's own comment says
+# "instead of breaking", which a bare `break` needle matches.
 assert_contains "#288 postStart: waits instead of skipping when no primary is reachable" \
-  "${ps_hook}" "continue"
+  "${ps_branch}" "^ *continue$"
+assert_not_contains "#288 postStart: does not break out of the wait when no primary is reachable" \
+  "${ps_branch}" "^ *break$"
 
 assert_contains "#288 restore.sh: carries restoredAt across a failed attempt" \
   "${ctl_restore_sh}" 'restored="$(prev_field restoredAt)"'

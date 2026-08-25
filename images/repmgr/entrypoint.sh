@@ -328,6 +328,24 @@ EOF
 
     pg_ctl -D "$PGDATA" -w stop
 
+    # LAST action, and the only positive evidence that this multi-step bootstrap finished
+    # (#288 review). initdb writes a perfectly valid pg_control within its first second, so
+    # "the directory looks like a cluster" cannot tell a COMPLETE bootstrap apart from one
+    # killed between the postmaster start above and the role/database creation -- and that
+    # half-bootstrapped state is unrecoverable: bootstrap_initdb no-ops on it forever
+    # (PG_VERSION exists), while the agent can never authenticate as REPMGR_USER, so the pod
+    # comes up Running/NotReady until someone deletes the PVC. The kill is reachable because
+    # `pg_ctl start` above satisfies the chart's startupProbe (`pg_isready` with no -h is
+    # answered over the unix socket), which retires the startup grace and arms the liveness
+    # probe while the agent is still inside this exec and not beating /healthz.
+    #
+    # The agent pairs this with its own in-progress marker beside PGDATA: marker present and
+    # this file absent = torn, discard and start over. Written after the stop so it can never
+    # be mistaken for a state a running postmaster is still mutating. Cloned to standbys along
+    # with the rest of PGDATA, which is correct -- their directory did come from a completed
+    # bootstrap.
+    : > "$PGDATA/.pg-ha-bootstrap-complete"
+
     echo "PostgreSQL initialization complete"
 }
 
