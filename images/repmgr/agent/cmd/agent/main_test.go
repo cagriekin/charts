@@ -26,6 +26,7 @@ import (
 	"github.com/cagriekin/pg-ha-agent/internal/mechanism"
 	"github.com/cagriekin/pg-ha-agent/internal/observe"
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
+	"github.com/cagriekin/pg-ha-agent/internal/pgbackrest"
 	"github.com/cagriekin/pg-ha-agent/internal/process"
 	"github.com/cagriekin/pg-ha-agent/internal/reconcile"
 )
@@ -1806,9 +1807,10 @@ func TestLatchFollowPreservesTheRestoreClaim(t *testing.T) {
 	}
 }
 
-// The adoption drop itself: once this node has promoted and the marker records its history, the
-// claim has done its job and must not outlive it (a permanent claim let a long-restored node
-// outrank a peer with far more WAL on every later election).
+// dropRestoreRecord is for volumes whose CONTENTS stopped matching the record -- a clone, a
+// rewind, a wipe. Adoption no longer comes through here (it stamps adoptedAt instead, see
+// TestAdoptRestoreKeepsTheRecordAndExpiresTheClaim): expiring the claim by unlinking the file
+// destroyed the provenance GET /v1/status reports, permanently, on the restore that succeeded.
 func TestDropRestoreRecordRemovesTheClaim(t *testing.T) {
 	dir := t.TempDir()
 	pgdata := filepath.Join(dir, "pgdata")
@@ -2040,5 +2042,61 @@ func TestEndInitdbClearsTheMarker(t *testing.T) {
 	a.discardTornInitdb(context.Background())
 	if !process.HasData(a.cfg.PGDATA) {
 		t.Error("a bootstrapped data directory was discarded on the next boot")
+	}
+}
+
+// newRestoreClaimAgent wires an agent whose pgbackrest client reads/writes a real record file.
+func newRestoreClaimAgent(t *testing.T, body string) *agent {
+	t.Helper()
+	dir := t.TempDir()
+	pgdata := filepath.Join(dir, "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{PGDATA: pgdata}
+	if body != "" {
+		if err := os.WriteFile(cfg.RestoreStatusPath(), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return &agent{
+		cfg:  cfg,
+		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		pgbr: pgbackrest.Client{StatusPath: cfg.RestoreStatusPath()},
+	}
+}
+
+// #288 review, round 4: the documented restore procedure is scale to 0, restore into the target
+// ordinal's PVC, scale up -- and pgbackrest runs --target-action=promote, so that pod comes back
+// holding primary-state data and takes StartLocal, then StayPrimary. It never passes through
+// Promote, so a stamp only on the Promote branch left the claim in force FOREVER on the most
+// common restore path -- and a permanent claim vetoes every peer in moreAdvancedPeer, so this
+// node would later promote (or be handed the lease) over a peer holding more WAL.
+func TestAdoptRestoreKeepsTheRecordAndExpiresTheClaim(t *testing.T) {
+	a := newRestoreClaimAgent(t, "exitCode=0\nrestoredAt=2026-08-24T12:00:00Z\nbackupSet=20260824-110000F\n")
+	if got := a.localRestoredAt(); got != "2026-08-24T12:00:00Z" {
+		t.Fatalf("test setup: the claim should stand before adoption, got %q", got)
+	}
+	a.adoptRestoreIfServing(reconcile.Observation{Local: reconcile.LocalState{RestoredAt: a.localRestoredAt()}})
+
+	if got := a.localRestoredAt(); got != "" {
+		t.Errorf("the election claim survived adoption (%q); a permanent claim outranks peers with more WAL", got)
+	}
+	rec, err := a.pgbr.LastRestore()
+	if err != nil {
+		t.Fatalf("LastRestore: %v", err)
+	}
+	if !rec.Present || rec.BackupSet != "20260824-110000F" || rec.AdoptedAt == "" {
+		t.Errorf("provenance must survive adoption, stamped: %+v", rec)
+	}
+}
+
+// No claim, no write: an ordinary primary tick on a never-restored volume must not touch the
+// record path at all (this runs on every StayPrimary tick).
+func TestAdoptRestoreIsANoopWithoutAClaim(t *testing.T) {
+	a := newRestoreClaimAgent(t, "")
+	a.adoptRestoreIfServing(reconcile.Observation{Local: reconcile.LocalState{}})
+	if _, err := os.Stat(a.cfg.RestoreStatusPath()); !os.IsNotExist(err) {
+		t.Errorf("a record was created for a volume that was never restored (stat err=%v)", err)
 	}
 }

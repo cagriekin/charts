@@ -817,10 +817,19 @@ spec:
                         # non-loopback connection, so without PGPASSWORD both the
                         # discovery psql and the user psql fail auth and silently no-op.
                         export PGPASSWORD="$POSTGRES_PASSWORD"
+                        {{- /* Bound every probe (#288 review, round 4). Without a connect
+                               timeout, a peer whose IP routes but does not answer -- a NotReady
+                               node, a NetworkPolicy drop -- blocks psql for the kernel's TCP
+                               timeout (~130s), and the retry budget below counts ITERATIONS, so
+                               20 of those is minutes of the container being held out of Started
+                               (probes have not begun, the pod is in no Service, and Kubernetes
+                               applies no timeout of its own to an exec lifecycle hook). Scoped
+                               to the discovery probe rather than exported, so a user's own
+                               additionalCommands keep libpq's defaults. */}}
                         {{- /* StatefulSet runs replicaCount + 1 pods, ordinals 0..replicaCount */}}
                         for n in $(seq 0 {{ int .Values.postgresql.replicaCount }}); do
                           H="{{ include "pg.fullname" . }}-${n}.${HEADLESS}"
-                          if psql -h "$H" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | grep -q 'f'; then
+                          if PGCONNECT_TIMEOUT=3 psql -h "$H" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | grep -q 'f'; then
                             PRIMARY_HOST="$H"
                             break
                           fi

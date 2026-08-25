@@ -3255,6 +3255,10 @@ assert_contains "#288 postStart: the primary wait has its own, smaller budget" \
   "${ps_branch}" "primary_waits"
 assert_contains "#288 postStart: that budget gives up well before the outer loop" \
   "${ps_branch}" "primary_waits\" -ge 20"
+# ...and the budget is only meaningful if each probe is bounded: an unresponsive-but-routable
+# peer otherwise blocks psql for the kernel TCP timeout, making 20 iterations minutes long.
+assert_contains "#288 postStart: the primary probe has a connect timeout" \
+  "${ps_hook}" "PGCONNECT_TIMEOUT=3 psql -h" 
 # And nothing initialises the counter on a chart that renders no additionalCommands at all.
 noac=$(helm template test-pg "${CHART_DIR}" --set repmgr.enabled=true 2>&1)
 assert_not_contains "#288 postStart: no discovery counter when additionalCommands is empty" \

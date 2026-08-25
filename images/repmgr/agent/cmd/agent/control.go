@@ -135,21 +135,6 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 // Best effort by design: the rebuild has already happened by the time this runs, and a
 // misleading record is not worth failing a completed clone over. The warning names the
 // path so an operator can remove it by hand.
-// markRestoreAdopted expires the restore record's ELECTION claim while keeping the record
-// itself, for a volume whose restored history the cluster has just adopted (see the Promote
-// path). Best-effort: a failure only leaves the claim standing, which the position ranking
-// then has to out-argue -- strictly safer than losing the provenance.
-func (a *agent) markRestoreAdopted() {
-	ts := time.Now().UTC().Format(time.RFC3339)
-	if err := a.pgbr.MarkAdopted(ts); err != nil {
-		a.log.Warn("could not stamp the restore record as adopted; its election claim stays in force",
-			"path", a.cfg.RestoreStatusPath(), "err", err)
-		return
-	}
-	a.log.Info("stamped the restore record as adopted: this node promoted on the restored history",
-		"path", a.cfg.RestoreStatusPath(), "adoptedAt", ts)
-}
-
 func (a *agent) dropRestoreRecord(why string) {
 	p := a.cfg.RestoreStatusPath()
 	if err := os.Remove(p); err != nil {
@@ -162,6 +147,39 @@ func (a *agent) dropRestoreRecord(why string) {
 	}
 	a.log.Info("removed the restore record: it no longer describes this data directory",
 		"path", p, "reason", why)
+}
+
+// adoptRestoreIfServing stamps the restore record as adopted when this node is serving as
+// primary and still carries an unexpired claim (#288 review, round 4).
+//
+// obs.Local.RestoredAt IS the claim -- localRestoredAt returns "" once adoptedAt is set -- so it
+// both decides whether there is anything to do and makes the write happen once per restore
+// rather than on every primary tick.
+//
+// Serving as primary is the adoption event: the cluster is running on this volume's history,
+// which is what the claim existed to argue for. Deliberately not on Follow -- a restored pod
+// following another primary is still WAITING for the handoff the claim wins, and expiring it
+// there loses the restore (see the Promote path).
+func (a *agent) adoptRestoreIfServing(obs reconcile.Observation) {
+	if obs.Local.RestoredAt == "" {
+		return
+	}
+	a.markRestoreAdopted()
+}
+
+// markRestoreAdopted expires the restore record's ELECTION claim while keeping the record
+// itself, for a volume whose restored history the cluster has adopted. Best-effort: a failure
+// only leaves the claim standing, which the position ranking then has to out-argue -- strictly
+// safer than losing the provenance.
+func (a *agent) markRestoreAdopted() {
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if err := a.pgbr.MarkAdopted(ts); err != nil {
+		a.log.Warn("could not stamp the restore record as adopted; its election claim stays in force",
+			"path", a.cfg.RestoreStatusPath(), "err", err)
+		return
+	}
+	a.log.Info("stamped the restore record as adopted: this node is serving on the restored history",
+		"path", a.cfg.RestoreStatusPath(), "adoptedAt", ts)
 }
 
 // --- control.Node ---

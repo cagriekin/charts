@@ -936,7 +936,11 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			// earlier revision left GET /v1/status.lastRestore permanently empty after a
 			// SUCCESSFUL PITR -- the provenance #276 built the file for -- and silently erased
 			// that history on any ordinary failover promote months later.
-			a.markRestoreAdopted()
+			//
+			// Guarded on there BEING a claim, and mirrored on StayPrimary, because this branch
+			// alone never fires on the documented restore path (#288 review, round 4) -- see
+			// adoptRestoreIfServing and the StayPrimary comment.
+			a.adoptRestoreIfServing(obs)
 		}
 		return a.assertPrimaryRouting(wctx, obs)
 
@@ -970,6 +974,17 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
+		// THE path that expires a restore claim in practice (#288 review, round 4). The
+		// documented restore procedure is scale to 0, restore into the target ordinal's PVC,
+		// scale up -- and pgbackrest runs with --target-action=promote, so that pod comes back
+		// holding primary-state data. A lease-holding node with initialized, stopped data takes
+		// StartLocal ("lease holder, initialized but stopped") and StayPrimary forever after; it
+		// never passes through Promote at all. With the stamp only on the Promote branch a
+		// successful restore's claim never expired -- and a permanent claim VETOES every peer in
+		// moreAdvancedPeer, so months later this node promotes, or is handed the lease, over a
+		// reachable peer holding more WAL: invariant 8 violated and committed WAL discarded, with
+		// no restore anywhere in sight.
+		a.adoptRestoreIfServing(obs)
 		// The topology gauges are NOT published here. They were, and an extra query plus a pod
 		// LIST on this branch's already-contended fence budget could make a slow tick skip the
 		// marker write or the Service routing assertion above -- so topologyTick runs from
@@ -1260,7 +1275,18 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 	a.beginInitdb()
 	ictx, icancel := context.WithTimeout(ctx, initdbBudget)
 	defer icancel()
-	if out, err := a.prober.Exec.Run(ictx, nil, entrypointPath, "initdb"); err != nil {
+	out, err := a.prober.Exec.Run(ictx, nil, entrypointPath, "initdb")
+	// Log it on SUCCESS too (#288 review, round 4). Because the AGENT runs the bootstrap here
+	// rather than the container entrypoint, initdb's output, the transient postmaster's startup
+	// lines and "PostgreSQL initialization complete" are captured into this pipe instead of the
+	// pod log -- so a fresh native install left nothing behind but a one-line agent message,
+	// while the repmgr path still prints all of it. This is once per cluster lifetime.
+	if err == nil {
+		if trimmed := strings.TrimSpace(out); trimmed != "" {
+			a.log.Info("bootstrap initdb output", "out", trimmed)
+		}
+	}
+	if err != nil {
 		// This path CAN leave a data directory behind (#288 review), so it needs the same
 		// cleanup as everything below. bootstrap_initdb runs initdb first and only then
 		// `pg_ctl -w start` and the role/database creation, so a failure at the start -- or a
