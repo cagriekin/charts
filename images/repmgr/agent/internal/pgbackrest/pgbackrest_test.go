@@ -274,3 +274,54 @@ func TestLastRestoreFailedAttemptKeepsRestoredAt(t *testing.T) {
 		t.Error("finishedAt describes the attempt, restoredAt the data -- they are distinct")
 	}
 }
+
+// #288 review, round 2: adoption must expire the election CLAIM without destroying the
+// provenance record -- and it must not drop keys a newer restore.sh wrote, which is why the
+// stamp rewrites raw bytes instead of re-serialising the parsed struct.
+func TestMarkAdoptedKeepsEveryOtherFieldIncludingUnknownKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "restore-status")
+	body := "startedAt=2026-08-01T00:00:00Z\nfinishedAt=2026-08-01T00:05:00Z\n" +
+		"restoredAt=2026-08-01T00:05:00Z\nexitCode=0\nstanza=db\ntargetType=time\n" +
+		"target=2026-07-31 23:00:00\nbackupSet=20260731-220000F\nsomeFutureKey=keepme\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := Client{StatusPath: path}
+	if err := c.MarkAdopted("2026-08-02T10:00:00Z"); err != nil {
+		t.Fatalf("MarkAdopted: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "someFutureKey=keepme") {
+		t.Errorf("a key this agent does not model was dropped:\n%s", raw)
+	}
+	rec, err := c.LastRestore()
+	if err != nil {
+		t.Fatalf("LastRestore: %v", err)
+	}
+	if !rec.Present || !rec.Succeeded() || rec.BackupSet != "20260731-220000F" || rec.Target != "2026-07-31 23:00:00" {
+		t.Errorf("provenance did not survive adoption: %+v", rec)
+	}
+	if rec.AdoptedAt != "2026-08-02T10:00:00Z" {
+		t.Errorf("adoptedAt = %q, want the stamp", rec.AdoptedAt)
+	}
+	// Idempotent: a second promote on the same volume replaces the stamp, never appends one.
+	if err := c.MarkAdopted("2026-08-03T11:00:00Z"); err != nil {
+		t.Fatalf("MarkAdopted (second): %v", err)
+	}
+	raw, _ = os.ReadFile(path)
+	if got := strings.Count(string(raw), "adoptedAt="); got != 1 {
+		t.Errorf("adoptedAt appears %d times, want 1:\n%s", got, raw)
+	}
+}
+
+// A record with no file at all is not an error: nothing was restored on this volume.
+func TestMarkAdoptedOnAMissingRecordIsANoop(t *testing.T) {
+	c := Client{StatusPath: filepath.Join(t.TempDir(), "absent")}
+	if err := c.MarkAdopted("2026-08-02T10:00:00Z"); err != nil {
+		t.Fatalf("MarkAdopted on a missing record: %v", err)
+	}
+}

@@ -307,6 +307,18 @@ postgresql:
 
   lifecycle:
     postStart:
+      # Extra SQL/shell run once per pod start, against the cluster's PRIMARY (the hook
+      # discovers it and exports PGHOST). BEST EFFORT, deliberately (#288 review): the hook
+      # waits up to 90s for a reachable primary and then gives up SILENTLY, because a
+      # non-zero postStart exit makes the kubelet kill the container -- a crash-loop is a
+      # worse answer than a skipped convenience command. Two consequences worth knowing:
+      #   - A pod whose PostgreSQL is not serving within that window skips its commands.
+      #     Reachable in practice on a fresh standby under repmgr.agent.mechanism: native,
+      #     where the first clone runs in this container and can outlast 90s.
+      #   - Kubernetes does not consider a container started until postStart returns, so
+      #     while the hook waits, the startup/liveness probes have not begun yet.
+      # Use it for idempotent setup only, and put anything load-bearing in a Job or in
+      # postgresql.initdbScripts instead of here.
       additionalCommands: ""
 
 repmgr:

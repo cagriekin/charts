@@ -838,6 +838,14 @@ spec:
                           # bootstrap_initdb is shared). It also covers the pre-existing case
                           # where no peer has promoted yet. The loop is bounded at 90s, and the
                           # steps above it are idempotent, so retrying costs nothing.
+                          #
+                          # Exhausting the 90s still skips the commands silently, and that is
+                          # deliberate (#288 review, round 2): a non-zero postStart exit makes
+                          # the kubelet KILL the container, so failing loudly here turns a
+                          # skipped convenience command into a crash-loop. The remaining gap is
+                          # documented on the value itself -- including that a fresh native
+                          # standby's clone can outlast the budget, and that probes do not begin
+                          # until this hook returns.
                           sleep 1
                           continue
                         fi

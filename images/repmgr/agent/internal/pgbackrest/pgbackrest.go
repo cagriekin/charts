@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -115,6 +116,14 @@ type RestoreRecord struct {
 	// the first thing to look at when a restored cluster does not come up.
 	ClusterState string `json:"clusterState,omitempty"`
 	Checkpoint   string `json:"checkpoint,omitempty"`
+	// AdoptedAt is stamped by the AGENT, not by restore.sh, when this volume's restored
+	// history became the cluster's own -- i.e. when this node promoted on it (#288 review,
+	// round 2). It EXPIRES THE ELECTION CLAIM without erasing the record: the restored
+	// timeline is now what the highwater marker records, so later elections are decided by
+	// position alone, while GET /v1/status keeps reporting where this PGDATA came from. An
+	// earlier revision unlinked the file instead, which expired the claim by destroying the
+	// provenance #276 exists to preserve -- permanently, on the very restore that succeeded.
+	AdoptedAt string `json:"adoptedAt,omitempty"`
 	// RequestedBy is set when the restore was triggered through the control API,
 	// carrying the client identity that asked for it.
 	RequestedBy string `json:"requestedBy,omitempty"`
@@ -165,6 +174,8 @@ func (c Client) LastRestore() (RestoreRecord, error) {
 			r.FinishedAt = v
 		case "restoredAt":
 			r.RestoredAt = v
+		case "adoptedAt":
+			r.AdoptedAt = v
 		case "stanza":
 			r.Stanza = v
 		case "targetType":
@@ -192,6 +203,65 @@ func (c Client) LastRestore() (RestoreRecord, error) {
 		}
 	}
 	return r, nil
+}
+
+// MarkAdopted stamps adoptedAt on the restore record, expiring its election claim while
+// KEEPING every other field (#288 review, round 2).
+//
+// Rewrites the raw bytes rather than re-serialising the parsed struct: LastRestore ignores
+// unknown keys on purpose, so a restore.sh newer than this agent can add fields, and a
+// round-trip through RestoreRecord would silently drop them. Atomic, because this file is the
+// only record of the volume's provenance and a torn write loses it as surely as an unlink.
+// A missing file is not an error: nothing to adopt.
+func (c Client) MarkAdopted(ts string) error {
+	if c.StatusPath == "" {
+		return nil
+	}
+	b, err := readFileLimit(c.StatusPath, 16<<10)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read restore status %s: %w", c.StatusPath, err)
+	}
+	kept := make([]string, 0)
+	for _, line := range strings.Split(strings.TrimRight(string(b), "\n"), "\n") {
+		if k, _, ok := strings.Cut(strings.TrimSpace(line), "="); ok && strings.TrimSpace(k) == "adoptedAt" {
+			continue // idempotent: the newest stamp replaces an older one
+		}
+		kept = append(kept, line)
+	}
+	kept = append(kept, "adoptedAt="+ts)
+	dir := filepath.Dir(c.StatusPath)
+	tmp, err := os.CreateTemp(dir, filepath.Base(c.StatusPath)+".tmp*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.WriteString(strings.Join(kept, "\n") + "\n"); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, c.StatusPath); err != nil {
+		return err
+	}
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 func readFileLimit(path string, max int64) ([]byte, error) {

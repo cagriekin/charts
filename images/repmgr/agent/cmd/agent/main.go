@@ -495,7 +495,14 @@ func (a *agent) tick(ctx context.Context) {
 	// Run it OUTSIDE opMu and the fence budget: it is a local-socket SQL maintenance task
 	// that touches no postmaster/mechanism state, so holding opMu (and competing with the
 	// leadership-critical writes for the fence-budget window) would only starve its psql.
-	if dec.Action == reconcile.Promote || dec.Action == reconcile.StayPrimary {
+	// err == nil as well as the action (#288 review, round 2). The gate is on what the tick
+	// DECIDED, and a Promote that failed leaves this node a standby: topologyTick would then read
+	// an empty pg_stat_replication, compute expected from the live pod set and publish
+	// replicas_streaming=0 / replicas_expected=N -- plus a "live peers are not streaming from
+	// this primary" warning -- from a node that is not the primary, pointing an operator at the
+	// wrong pod mid-failover. rehashManagedUsersOnce is gated the same way for the same reason:
+	// it is a primary-only convergence step.
+	if err == nil && (dec.Action == reconcile.Promote || dec.Action == reconcile.StayPrimary) {
 		a.rehashManagedUsersOnce(ctx)
 		// Same reason, same place (#288 review, second pass). topologyTick is PURELY
 		// observational -- gauges only -- and it makes an apiserver pod LIST plus a psql query,
@@ -520,6 +527,14 @@ func (a *agent) tick(ctx context.Context) {
 func (a *agent) localRestoredAt() string {
 	rec, err := a.pgbr.LastRestore()
 	if err != nil {
+		return ""
+	}
+	// An ADOPTED restore has no claim left to make (#288 review, round 2). Once this volume's
+	// history became the cluster's -- this node promoted on it, and the highwater marker
+	// records that timeline -- later elections are decided by position alone, exactly as they
+	// were before any restore happened. The record itself stays on disk: it is the only
+	// provenance for where this PGDATA came from, and GET /v1/status still reports it.
+	if rec.AdoptedAt != "" {
 		return ""
 	}
 	// Prefer restoredAt: write_status carries it across later FAILED attempts, so a mistyped
@@ -896,7 +911,15 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			// up read-write, takes DemoteFence then Follow, and would have dropped its claim
 			// ~10s after boot -- racing the holder's own tick, which needs that very record to
 			// decide to release the lease to it. Losing that race discards the restore.
-			a.dropRestoreRecord("this node promoted and the marker records its history, so the cluster adopted the restore")
+			//
+			// STAMPED, not unlinked (#288 review, round 2). Expiring the claim and destroying
+			// the record are different things, and doing the second to achieve the first is a
+			// regression: dropRestoreRecord exists for volumes whose CONTENTS stopped matching
+			// the record (a clone, a rewind, a wipe), and a promotion changes no contents. The
+			// earlier revision left GET /v1/status.lastRestore permanently empty after a
+			// SUCCESSFUL PITR -- the provenance #276 built the file for -- and silently erased
+			// that history on any ordinary failover promote months later.
+			a.markRestoreAdopted()
 		}
 		return a.assertPrimaryRouting(wctx, obs)
 
@@ -2057,7 +2080,12 @@ func (a *agent) topologyTick(ctx context.Context) {
 	}
 	// The live pod set from the API, not NodeCount: that env var is baked in at render time and
 	// is stale on every pod that has not rolled yet (see orphanSlot).
-	live, liveErr := a.livePodOrdinals(ctx)
+	// tctx, not ctx (#288 review, round 2). tick()'s context is the run loop's -- no deadline --
+	// and this LIST is uncached, so an apiserver that blackholes it would block the reconcile
+	// goroutine indefinitely: no further metr.Beat(), /healthz stale after ~3x the interval, and
+	// the kubelet kills the container over a gauge. The doc above claims this cannot be starved
+	// BY the leadership writes; that only holds if the whole function is bounded.
+	live, liveErr := a.livePodOrdinals(tctx)
 	selfOrd, selfOK := podOrdinal(a.cfg.PodName)
 	if liveErr != nil {
 		// Leave the gauges at their PREVIOUS values rather than publishing Expected: 0 --
@@ -2087,13 +2115,19 @@ func (a *agent) topologyTick(ctx context.Context) {
 		if isCloneConnection(r) {
 			continue // a base backup in flight, not a replica
 		}
-		streaming++
 		if pod := a.resolveReplicaPod(r); pod != "" {
 			seen[pod] = true
 		} else {
 			unidentified++
 		}
 	}
+	// DISTINCT pods, not rows (#288 review, round 2). expected counts pods, so streaming has to
+	// as well or the two are not comparable: one pod can hold two streaming rows for a moment --
+	// an old walsender not yet reaped alongside its reconnect, or the two identity sources
+	// (application_name and slot ordinal) resolving the same pod during a rolling upgrade -- and
+	// a per-row tally then reports streaming > expected with nothing missing and nothing
+	// unidentified, which makes any `streaming != expected` alert flap on a healthy cluster.
+	streaming = int64(len(seen)) + unidentified
 	a.metr.SetTopology(observe.TopologyStats{Streaming: streaming, Expected: expected, Unidentified: unidentified})
 
 	// One log line per CHANGE, not per tick: a rolling restart legitimately parks a pod

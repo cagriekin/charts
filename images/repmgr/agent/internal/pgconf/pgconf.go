@@ -9,6 +9,7 @@ package pgconf
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -128,8 +129,54 @@ func EnsureConfdInclude(confPath, includeDir string, enabled bool) error {
 		content += "\n" + managed
 	}
 	content += "\n"
-	if err := os.WriteFile(confPath, []byte(content), 0o600); err != nil {
+	// ATOMIC, because the file is PGDATA/postgresql.conf (#288 review, round 2). A plain
+	// truncate-and-rewrite loses the whole config to a crash or ENOSPC mid-write, and a
+	// truncated postgresql.conf is a postmaster that will not start at all. Not theoretical
+	// here: this runs from finishInitdbNative, i.e. AFTER bootstrap_initdb wrote its completion
+	// sentinel, so discardTornInitdb would -- correctly, by its own contract -- KEEP the
+	// directory on the next boot, leaving the pod wedged on a truncated config with no automatic
+	// recovery. native.go's ensureInclude was moved off this exact pattern, on this exact file,
+	// for this exact reason.
+	if err := writeFileAtomic(confPath, content, 0o600); err != nil {
 		return fmt.Errorf("write %s: %w", confPath, err)
+	}
+	return nil
+}
+
+// writeFileAtomic writes content to path via a temp file in the same directory, fsynced before
+// the rename so the rename can never publish a zero-length file, with a best-effort directory
+// fsync after it so the rename itself survives a crash. Mirrors the mechanism package's writer
+// of the same name; deliberately duplicated rather than exported across packages, since each
+// exists to protect files its own package writes.
+func writeFileAtomic(path, content string, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return nil
 }
