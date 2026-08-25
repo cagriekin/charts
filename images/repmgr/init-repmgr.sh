@@ -81,6 +81,26 @@ find_current_primary() {
     return 1
 }
 
+# True when ANY peer answers as a live PostgreSQL node, primary or standby. On an EMPTY
+# data directory that is the difference between "nothing exists yet" and "a cluster exists
+# and this pod lost its disk": a reachable STANDBY is proof of an established cluster even
+# in the window where the primary itself is unreachable, and initdb'ing next to it forks a
+# divergent cluster. Only total silence from every peer is a genuine first install.
+any_peer_reachable() {
+    BASE_NAME="${HOSTNAME%-*}"
+    NODE_COUNT="${REPMGR_NODE_COUNT:-10}"
+    case "$NODE_COUNT" in ''|*[!0-9]*) NODE_COUNT=10 ;; esac
+    for i in $(seq 0 $((NODE_COUNT - 1))); do
+        [ "$i" = "$ORDINAL" ] && continue
+        PARTNER="${BASE_NAME}-${i}.${HEADLESS_SERVICE}"
+        if PGPASSWORD="${REPMGR_PASSWORD}" pg_isready -h "${PARTNER}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" > /dev/null 2>&1; then
+            REACHABLE_PEER="$PARTNER"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # A primary-state data directory (data present, no standby.signal) must NOT be
 # re-cloned here. The old ordinal-based path would, on a full-cluster restart
 # after a failover, clone a real primary's data (pod-1, newer timeline) onto a
@@ -93,13 +113,38 @@ if [ -s "${PGDATA}/PG_VERSION" ] && [ ! -f "${PGDATA}/standby.signal" ]; then
     exit 0
 fi
 
-if [ "$NODE_TYPE" = "master" ]; then
-    if [ ! -s "${PGDATA}/PG_VERSION" ]; then
+# An EMPTY data directory on ordinal 0 is not proof of a first install, and deciding it
+# from the ordinal alone was a dead end. In agent mode the primary is lease-elected and
+# podManagementPolicy is Parallel, so ordinal 0 is just another node: lose or recreate its
+# PVC while the lease sits on another pod and the old branch below declared "First boot,
+# postgres mode will initialize the database" and skipped the clone -- then entrypoint.sh's
+# primary_safety_guard correctly refused to initdb next to an active primary, leaving the
+# pod in CrashLoopBackOff with no automatic way out. Ordinal > 0 recovered from the same
+# PVC loss cleanly, via the standby path below, purely because of its name.
+#
+# So decide from the cluster, not the ordinal, and reuse that same standby path: it already
+# waits for a primary, waits for its repmgr registration and clones with retries. The
+# entrypoint guard stays the second line of defence -- it is the one that reads the durable
+# primary marker (this container has neither the marker env nor a reason to duplicate it),
+# so a correlated restart in which no peer has answered yet still ends in its marker-aware
+# settle-scan rather than in a divergent initdb here.
+if [ "$NODE_TYPE" = "master" ] && [ ! -s "${PGDATA}/PG_VERSION" ]; then
+    CURRENT_PRIMARY=$(find_current_primary) || true
+    if [ -n "$CURRENT_PRIMARY" ]; then
+        echo "Empty data directory while ${CURRENT_PRIMARY} is an active primary: PVC-loss recreate, not a first install; cloning as a standby"
+        NODE_TYPE="standby"
+    elif any_peer_reachable; then
+        echo "Empty data directory and peer ${REACHABLE_PEER} is live but no primary is visible yet; waiting for one instead of initializing a divergent cluster"
+        NODE_TYPE="standby"
+    else
         echo "First boot, postgres mode will initialize the database"
         exit 0
     fi
+fi
 
-    # Data exists. Check if another node was promoted while this one was down.
+if [ "$NODE_TYPE" = "master" ]; then
+    # Data exists (the empty case above either flipped this node to the standby path or
+    # exited). Check if another node was promoted while this one was down.
     echo "Data directory exists, checking for post-failover scenario..."
     CURRENT_PRIMARY=$(find_current_primary) || true
     if [ -n "$CURRENT_PRIMARY" ]; then
@@ -131,9 +176,11 @@ wait_for_primary() {
             echo "Primary found at ${PRIMARY_FQDN}"
             return 0
         fi
-        # Fall back to ordinal 0 on first boot
+        # Fall back to ordinal 0 on first boot -- but never when THIS pod is ordinal 0.
+        # Reachable now via the empty-data path above; probing our own not-yet-started
+        # postmaster would only burn the loop.
         FQDN_0="${BASE_NAME}-0.${HEADLESS_SERVICE}"
-        if PGPASSWORD="${REPMGR_PASSWORD}" pg_isready -h "${FQDN_0}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" > /dev/null 2>&1; then
+        if [ "$ORDINAL" != "0" ] && PGPASSWORD="${REPMGR_PASSWORD}" pg_isready -h "${FQDN_0}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" > /dev/null 2>&1; then
             if PGPASSWORD="${REPMGR_PASSWORD}" psql -h "${FQDN_0}" -p 5432 -U "${REPMGR_USER}" -d "${REPMGR_DB}" -c "SELECT 1;" > /dev/null 2>&1; then
                 PRIMARY_FQDN="$FQDN_0"
                 echo "Primary found at ${PRIMARY_FQDN}"

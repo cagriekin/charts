@@ -182,6 +182,86 @@ else
   skip "new primary is writable after cold boot (prior stage failed)"
 fi
 
+# --- disk loss on pod-0 while the lease sits elsewhere: the pod must CLONE itself back.
+# init-repmgr.sh used to derive its role from the ordinal alone, so an empty PGDATA on
+# ordinal 0 was reported as "First boot, postgres mode will initialize the database" and the
+# clone was skipped -- and entrypoint.sh's primary_safety_guard then (correctly) refused to
+# initdb next to an active primary, so the pod sat in CrashLoopBackOff with no automatic way
+# out. Ordinal > 0 recovered from the identical loss, purely by name.
+#
+# The data directory is emptied in place rather than by deleting the PVC: a `kubectl delete
+# pvc` on a volume a pod still uses only marks it Terminating, and the StatefulSet's
+# replacement pod re-binds that very volume -- the disk survives and the test passes without
+# ever exercising the empty-PGDATA path (observed). What the code under test keys on is an
+# empty PGDATA, so produce exactly that.
+#
+# The lease is parked off pod-0 first so the scenario is deterministic rather than a coin
+# flip on which pod the earlier failover left holding it. ---
+POD0="${FULLNAME}-0"
+POD1="${FULLNAME}-1"
+holder=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || echo "")
+
+if [[ "${holder}" == "${POD0}" ]]; then
+  echo "  Lease is on ${POD0}; moving it to ${POD1} first..."
+  kubectl delete pod "${POD0}" -n "${NAMESPACE}" --grace-period=10 --wait=false 2>/dev/null || true
+  for _ in $(seq 1 30); do
+    holder=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || echo "")
+    [[ "${holder}" == "${POD1}" ]] && break
+    sleep 5
+  done
+  wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 300 || true
+fi
+
+if [[ "${holder}" == "${POD1}" ]]; then
+  # Something only the surviving primary knows, so a divergent initdb cannot fake it.
+  DV="disk-loss-$(date +%s)"
+  pg_exec "${NAMESPACE}" "${POD1}" "INSERT INTO failover_test (value) VALUES ('${DV}')" "testuser" "testdb" 2>/dev/null || true
+
+  echo "  Emptying ${POD0}'s data directory (simulated disk loss)..."
+  left=$(kubectl exec "${POD0}" -n "${NAMESPACE}" -c postgresql -- \
+    bash -c 'rm -rf "${PGDATA:?}"/* "${PGDATA:?}"/.[!.]* 2>/dev/null; ls -A "${PGDATA}" | wc -l' 2>/dev/null | tr -d '[:space:]')
+  assert_eq "${POD0}'s data directory is really empty before the restart" "0" "${left}"
+  kubectl delete pod "${POD0}" -n "${NAMESPACE}" --grace-period=0 --force --wait=false 2>/dev/null || true
+
+  echo "  Waiting for ${POD0} to clone itself back (up to 420s)..."
+  recovered=""
+  for _ in $(seq 1 84); do
+    ready=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "")
+    if [[ "${ready}" == "true" ]]; then
+      recovered=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")
+      [[ "${recovered}" == "t" ]] && break
+    fi
+    sleep 5
+  done
+  assert_eq "${POD0} comes back as a standby after losing its data directory" "t" "${recovered}"
+
+  # The regression assertion: ordinal 0 must have taken the CLONE path, not "first boot".
+  # Without it the stage could pass on a pod whose disk was never actually lost.
+  init_log=$(kubectl logs "${POD0}" -n "${NAMESPACE}" -c repmgr-init 2>/dev/null || echo "")
+  assert_contains "${POD0}'s init cloned instead of claiming a first boot" "${init_log}" "cloning as a standby"
+  assert_not_contains "${POD0}'s init did not call an empty ordinal-0 disk a first boot" "${init_log}" "First boot"
+
+  streaming=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT status FROM pg_stat_wal_receiver" "testuser" "testdb" 2>/dev/null || echo "")
+  assert_eq "${POD0} is receiving WAL from the primary" "streaming" "${streaming}"
+
+  cloned=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT value FROM failover_test WHERE value='${DV}'" "testuser" "testdb" 2>/dev/null || echo "")
+  assert_eq "${POD0} carries data only the surviving primary had (it cloned, not initdb'd)" "${DV}" "${cloned}"
+
+  # A recreated empty pod-0 is never a promotion candidate.
+  holder_after=$(kubectl get lease "${LEASE}" -n "${NAMESPACE}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || echo "")
+  assert_eq "the lease stayed with ${POD1} throughout" "${POD1}" "${holder_after}"
+else
+  for t in "${POD0}'s data directory is really empty before the restart" \
+           "${POD0} comes back as a standby after losing its data directory" \
+           "${POD0}'s init cloned instead of claiming a first boot" \
+           "${POD0}'s init did not call an empty ordinal-0 disk a first boot" \
+           "${POD0} is receiving WAL from the primary" \
+           "${POD0} carries data only the surviving primary had (it cloned, not initdb'd)" \
+           "the lease stayed with ${POD1} throughout"; do
+    skip "${t} (lease could not be parked on ${POD1})"
+  done
+fi
+
 rm -f "${SCRIPT_DIR}/.agent_primary" "${SCRIPT_DIR}/.agent_standby"
 
 end_suite

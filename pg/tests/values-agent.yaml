@@ -45,10 +45,12 @@ postgresql:
       additionalCommands: ""
 
 repmgr:
-  image:
-    repository: cagriekin/repmgr
-    tag: trixie-5.5.0-27
-    pullPolicy: IfNotPresent
+  # No image pin on purpose. This suite is the one that exercises the image's own
+  # bootstrap shell (init-repmgr.sh / entrypoint.sh), and CI builds that image from
+  # source under the tag in pg/values.yaml. A fixture pin here silently sent the suite
+  # to an OLD published tag instead -- it stopped tracking the chart at trixie-5.5.0-27
+  # while the chart moved on, so every image-shell change since was untested by this
+  # suite. Inheriting the chart's tag keeps the two from drifting again.
 
   enabled: true
   failoverMode: agent
