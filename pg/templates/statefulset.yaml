@@ -650,6 +650,21 @@ spec:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
 {{- with (include "pg.pgMajorEnv" .) }}{{ . | nindent 12 }}{{- end }}
+            {{- /* #288: the init container needs MECHANISM too, not just the postgresql
+                   container. Its whole job -- write repmgr.conf, wait for a primary to appear
+                   in repmgr.nodes, clone with `repmgr standby clone` -- is repmgr-specific,
+                   and the middle step is what made native unusable with replicas: nothing
+                   ever registers under native, so the poll timed out and every standby sat in
+                   Init:CrashLoopBackOff forever. init-repmgr.sh now exits early on native and
+                   lets the agent clone (BootstrapClone -> pg_basebackup), but it can only do
+                   that if the value actually reaches it. Emitted only when non-default, same
+                   as on the postgresql container, so the repmgr-mode render does not move. */}}
+            {{- with (.Values.repmgr.agent).mechanism }}
+            {{- if ne . "repmgr" }}
+            - name: MECHANISM
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
             - name: POSTGRES_USER
@@ -891,8 +906,10 @@ spec:
             {{- /* Which replication mechanics the agent drives (#287). Emitted only when
                    set to a non-default value: the agent defaults to repmgr when MECHANISM is
                    absent, so a default render stays byte-identical to 1.x and an older image
-                   that predates the flag keeps working. EXPERIMENTAL -- `native` is not usable
-                   until #288 (topology) and #289 (replication slots) land. */}}
+                   that predates the flag keeps working. EXPERIMENTAL, but usable with replicas
+                   since #288 (topology from pg_stat_replication, agent-owned bootstrap) and
+                   #289 (slot ownership); `cascadingReplication` is still render-rejected with
+                   it, and #292 owns migrating an existing repmgr cluster in place. */}}
             {{- with (.Values.repmgr.agent).mechanism }}
             {{- if ne . "repmgr" }}
             - name: MECHANISM
@@ -1079,6 +1096,9 @@ spec:
                   - /bin/bash
                   - -c
                   - |
+{{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
+                    primary_waits=0
+{{- end }}
                     for i in {1..90}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
                         {{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
@@ -1101,10 +1121,19 @@ spec:
                         # non-loopback connection, so without PGPASSWORD both the
                         # discovery psql and the user psql fail auth and silently no-op.
                         export PGPASSWORD="$POSTGRES_PASSWORD"
+                        {{- /* Bound every probe (#288 review, round 4). Without a connect
+                               timeout, a peer whose IP routes but does not answer -- a NotReady
+                               node, a NetworkPolicy drop -- blocks psql for the kernel's TCP
+                               timeout (~130s), and the retry budget below counts ITERATIONS, so
+                               20 of those is minutes of the container being held out of Started
+                               (probes have not begun, the pod is in no Service, and Kubernetes
+                               applies no timeout of its own to an exec lifecycle hook). Scoped
+                               to the discovery probe rather than exported, so a user's own
+                               additionalCommands keep libpq's defaults. */}}
                         {{- /* StatefulSet runs replicaCount + 1 pods, ordinals 0..replicaCount */}}
                         for n in $(seq 0 {{ int .Values.postgresql.replicaCount }}); do
                           H="{{ include "pg.fullname" . }}-${n}.${HEADLESS}"
-                          if psql -h "$H" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | grep -q 'f'; then
+                          if PGCONNECT_TIMEOUT=3 psql -h "$H" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | grep -q 'f'; then
                             PRIMARY_HOST="$H"
                             break
                           fi
@@ -1115,6 +1144,38 @@ spec:
                           # split onto its own line by nindent, leaving it unexported.
                           export PGHOST="$PRIMARY_HOST"
                           {{- .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 26 }}
+                        else
+                          # Keep WAITING instead of breaking (#288 review). pg_isready has no -h,
+                          # so it is satisfied by a unix socket -- including the socket-only
+                          # postmaster bootstrap_initdb runs while CREATING the cluster, which no
+                          # pod is reachable over TCP during. Breaking here skipped the user's
+                          # additionalCommands SILENTLY, with no error and no retry, on every
+                          # fresh install (under the default repmgr mechanism too, since
+                          # bootstrap_initdb is shared). It also covers the pre-existing case
+                          # where no peer has promoted yet. The loop is bounded at 90s, and the
+                          # steps above it are idempotent, so retrying costs nothing.
+                          #
+                          # Exhausting the budget still skips the commands silently, and that is
+                          # deliberate (#288 review, round 2): a non-zero postStart exit makes
+                          # the kubelet KILL the container, so failing loudly here turns a
+                          # skipped convenience command into a crash-loop.
+                          #
+                          # But the WAIT FOR A PRIMARY gets its own, much smaller budget (#288
+                          # review, round 3), because Kubernetes does not consider a container
+                          # started until postStart returns: while this loop spins, the
+                          # startup/liveness/readiness probes have not begun and the pod is in
+                          # no Service. Spending the full 90s here delayed readiness by 90s on
+                          # every cold boot -- and on pgvector, whose default additionalCommands
+                          # is CREATE EXTENSION vector, that is the default path. 20s covers the
+                          # fresh-install window this retry was added for (bootstrap_initdb's
+                          # socket-only postmaster lasts seconds) without holding a pod out of
+                          # its Service while no peer has promoted yet.
+                          primary_waits=$((primary_waits + 1))
+                          if [ "$primary_waits" -ge 20 ]; then
+                            break
+                          fi
+                          sleep 1
+                          continue
                         fi
                         {{- end }}
                         break

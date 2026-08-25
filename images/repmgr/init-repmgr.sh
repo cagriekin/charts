@@ -37,6 +37,33 @@ NODE_FQDN="${HOSTNAME}.${HEADLESS_SERVICE}"
 
 echo "Node: ${HOSTNAME}, Ordinal: ${ORDINAL}, Type: ${NODE_TYPE}, ID: ${NODE_ID}"
 
+# #288: under the native mechanism this init container has nothing left to do, and
+# everything it WOULD do is actively harmful.
+#
+# It exists to (a) write repmgr.conf, (b) wait for a primary to register itself in
+# repmgr.nodes, and (c) perform the first clone with `repmgr standby clone`. Native mode has
+# no repmgr.conf, never writes repmgr.nodes, and clones with pg_basebackup from the agent.
+# Step (b) is what made native unusable with replicas: nothing ever registers, so the poll
+# below burned its full ~240s and exited 1, leaving every standby in Init:CrashLoopBackOff
+# forever while the primary came up fine.
+#
+# The clone is not lost by exiting here. The agent's reconcile loop already handles an empty
+# PGDATA on a standby -- reconcile.Decide returns BootstrapClone when the local node has no
+# data and is not running, and the handler calls Mechanism.Clone then starts the postmaster.
+# Under native that is pg_basebackup streaming through this node's own pre-created slot
+# (#289), which is strictly better than what this script did: it also creates the slot first,
+# so no WAL gap can open mid-clone.
+#
+# Deliberately BEFORE the repmgr.conf heredoc below, so native mode leaves no repmgr.conf on
+# the shared emptyDir at all. That is load-bearing for more than tidiness: entrypoint.sh's
+# primary_safety_guard is gated on that file existing, and its rejoin path shells out to
+# `repmgr node rejoin` before the agent starts.
+if [ "${MECHANISM:-repmgr}" = "native" ]; then
+    echo "MECHANISM=native: skipping repmgr.conf, the repmgr.nodes registration wait, and the repmgr clone."
+    echo "The agent clones an empty data directory itself (pg_basebackup via BootstrapClone, #288/#289)."
+    exit 0
+fi
+
 cat > /etc/repmgr/repmgr.conf << EOF
 node_id=${NODE_ID}
 node_name=${HOSTNAME}

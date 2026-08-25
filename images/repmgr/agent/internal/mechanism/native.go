@@ -17,10 +17,13 @@ import (
 // timeline/LSN election, fencing and Service routing all live in reconcile, which imports
 // only the Mechanism interface. Only the mechanics differ -- that is what the seam is for.
 //
-// EXPERIMENTAL and not usable on its own: topology still comes from repmgr.nodes (#288),
-// so a standby has no upstream to choose. Replication slot ownership (#289) HAS landed --
-// this mechanism creates its own slot before every clone/rejoin and the primary reconciles
-// the set each tick -- so the WAL-recycling gap is closed. #294 promotes it to supported.
+// EXPERIMENTAL, but it runs a real multi-node cluster since #288: topology comes from
+// pg_stat_replication (identified by the application_name this mechanism writes into
+// primary_conninfo, or by the ordinal-named slot), and the bootstrap is the agent's -- the
+// lease holder initdbs, everyone else clones. Slot ownership (#289) creates this node's slot
+// before every clone/rejoin. Remaining gaps: cascadingReplication is render-rejected with this
+// mechanism, and an existing repmgr cluster cannot be migrated in place yet (#292). #294
+// promotes it to supported and flips the default.
 //
 // Every binary is resolved under PGBindir rather than PATH: the image ships exactly one
 // PostgreSQL major and the agent must exec that major's tools, not whatever PATH resolves
@@ -39,6 +42,21 @@ type Native struct {
 	// use entirely (the pre-#289 behaviour), which keeps the mechanism usable in tests and
 	// for any caller that has no ordinal to derive a name from.
 	SlotName string
+	// NodeName is THIS node's pod name, written into primary_conninfo as
+	// application_name so the UPSTREAM can tell its standbys apart (#288).
+	//
+	// Without it every native standby shows up in the primary's pg_stat_replication as
+	// application_name = 'walreceiver' -- the libpq default -- so the primary can see HOW
+	// MANY standbys are streaming but not WHICH pods they are. That makes
+	// pg_stat_replication useless as a topology source, which is exactly what this issue
+	// needs it to be. repmgr mode does not have the problem because repmgr injects
+	// node_name itself during standby clone.
+	//
+	// Deliberately not added to Conn.conninfo(): that builder also feeds
+	// `repmgr node rejoin -d` and `pg_rewind --source-server`, which are ordinary client
+	// connections where an application_name would be noise, and touching it would move the
+	// repmgr-mode render. Empty omits the setting.
+	NodeName string
 	Now      Clock
 }
 
@@ -51,13 +69,16 @@ type Native struct {
 // ConfigMap and postgresql.auto.conf (which ALTER SYSTEM and pg_basebackup -R own).
 //
 // slotName is this node's own slot on its upstream (#289); "" disables slot use.
-func NewNative(dataDir, pgBindir, password, slotName string) *Native {
+// nodeName is this node's pod name, published to the upstream as application_name (#288);
+// "" omits it.
+func NewNative(dataDir, pgBindir, password, slotName, nodeName string) *Native {
 	return &Native{
 		Runner:   OSRunner{},
 		DataDir:  dataDir,
 		PGBindir: pgBindir,
 		Password: password,
 		SlotName: slotName,
+		NodeName: nodeName,
 		Now:      time.Now,
 	}
 }
@@ -103,25 +124,62 @@ func (n *Native) ensureInclude() error {
 		return fmt.Errorf("native: read %s: %w", confPath, err)
 	}
 	line := fmt.Sprintf("include '%s'", managedConfName)
-	if hasActiveDirective(string(b), line) {
+	const header = "# Managed by pg-ha-agent (native mechanism, #287)"
+	// REPOSITION rather than skip when the line is already present (#288 review). The agent's
+	// fragment must be the LAST include so its replication settings win, and an
+	// append-only-if-absent check cannot maintain that: a native cluster created with no conf.d
+	// feature has the agent's include at the end, and enabling postgresql.configuration later
+	// makes the setup-config init container append include_dir AFTER it on the next pod start.
+	// From then on an operator's wal_log_hints or hot_standby would silently override the
+	// agent's -- removing the cheap pg_rewind rejoin path -- and the inverted file would be
+	// cloned verbatim to every standby.
+	if hasActiveDirective(string(b), line) && isLastActiveDirective(string(b), line) {
 		return nil
 	}
-	f, err := os.OpenFile(confPath, os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("native: open %s: %w", confPath, err)
-	}
-	if _, err := f.WriteString("\n# Managed by pg-ha-agent (native mechanism, #287)\n" + line + "\n"); err != nil {
-		f.Close()
-		return fmt.Errorf("native: append include to %s: %w", confPath, err)
-	}
-	// Checked, not deferred-and-dropped: a close failure (e.g. a delayed write-back error
-	// surfacing only at close) means the include line's durability is not guaranteed even
-	// though the write above returned success, and a missing include silently drops
-	// wal_log_hints/hot_standby/primary_conninfo from postgresql.conf.
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("native: close %s: %w", confPath, err)
+	// ONE ATOMIC WRITE (#288 review). An earlier revision truncated the file and then re-appended
+	// in a second O_APPEND write, which is unsafe twice over: between the two writes
+	// postgresql.conf carries no include at all, and act() issues pg_reload_conf() after every
+	// successful Follow on a RUNNING standby (as does the chart's postStart hook) -- a reload
+	// landing in that window drops primary_conninfo, primary_slot_name, hot_standby and
+	// wal_log_hints and stops the walreceiver. A crash or ENOSPC mid-truncate also leaves a
+	// postgresql.conf the postmaster will not start on at all. writeFileAtomic exists in this
+	// file for exactly that reason.
+	body := stripActiveDirective(string(b), line)
+	// Drop the orphaned header the strip would otherwise leave behind, so repeated repositions
+	// do not accumulate them.
+	body = stripActiveDirective(body, header)
+	body = strings.TrimRight(body, "\n")
+	if err := writeFileAtomic(confPath, body+"\n\n"+header+"\n"+line+"\n", 0o600); err != nil {
+		return fmt.Errorf("native: rewrite %s with the managed include last: %w", confPath, err)
 	}
 	return nil
+}
+
+// isLastActiveDirective reports whether line is the final non-comment, non-blank directive in
+// conf. PostgreSQL applies includes in file order, so "last" is what decides precedence (#288).
+func isLastActiveDirective(conf, line string) bool {
+	var last string
+	for _, l := range strings.Split(conf, "\n") {
+		t := strings.TrimSpace(l)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		last = t
+	}
+	return last == line
+}
+
+// stripActiveDirective removes every active occurrence of line, so the caller can re-append it
+// at the end (#288).
+func stripActiveDirective(conf, line string) string {
+	out := make([]string, 0, len(strings.Split(conf, "\n")))
+	for _, l := range strings.Split(conf, "\n") {
+		if strings.TrimSpace(l) == line {
+			continue
+		}
+		out = append(out, l)
+	}
+	return strings.Join(out, "\n")
 }
 
 // writeManagedConf writes the agent-owned fragment and makes sure PGDATA/postgresql.conf
@@ -141,6 +199,35 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 	// what makes the readonly Service useful.
 	b.WriteString("hot_standby = on\n")
 	if primaryConninfo != "" {
+		// application_name identifies THIS node in the upstream's pg_stat_replication (#288),
+		// which is what makes that view a usable topology source -- see Native.NodeName. Appended
+		// to the conninfo rather than set as a separate GUC because primary_conninfo is what the
+		// walreceiver actually dials; a bare application_name GUC would name the postmaster's
+		// own sessions, not the replication connection.
+		// Idempotent: GenerateConfig feeds currentPrimaryConninfo() -- the value already on
+		// disk -- straight back in, so an unconditional append accumulated a copy on every
+		// agent boot (#288 review). A standby that is already streaming never re-enters Follow
+		// (the streamingFromTarget latch short-circuits it), so nothing rewrote it cleanly:
+		// after four boots the GUC read `... application_name=pg-1 application_name=pg-1
+		// application_name=pg-1 application_name=pg-1`. libpq takes the last, so replication
+		// kept working while the value grew without bound.
+		if n.NodeName != "" {
+			// Keyed on THIS node's name, not on the presence of any application_name (#288
+			// review). pg_rewind copies the SOURCE's pg-ha-agent.conf into the target PGDATA, so
+			// if the agent dies after the rewind but before Follow finishes, the next boot feeds
+			// the source pod's name straight back through currentPrimaryConninfo(). A
+			// presence-only guard would preserve it forever: two senders would resolve to one
+			// pod, and the real pod would be logged as "not streaming" indefinitely while
+			// unidentified stayed 0. Strip any foreign value and write our own.
+			// TOKEN comparison, not a substring test (#288 review). `strings.Contains` for
+			// "application_name=pg-1" is satisfied by an inherited "application_name=pg-10", so
+			// with >=11 replicas the foreign value was kept -- exactly the case this guard
+			// exists to defeat, and invisible to a test using pg-0/pg-1.
+			want := "application_name=" + n.NodeName
+			if !hasField(primaryConninfo, want) {
+				primaryConninfo = stripApplicationName(primaryConninfo) + " " + want
+			}
+		}
 		// Single-quoted and escaped: a host or user containing a quote would otherwise break
 		// out of the GUC and corrupt the file, failing postmaster start.
 		b.WriteString(fmt.Sprintf("primary_conninfo = '%s'\n", escapeSingleQuoted(primaryConninfo)))
@@ -174,6 +261,30 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 // needless replication gap). Follow remains the only place that CHANGES it.
 func (n *Native) GenerateConfig(ctx context.Context, id NodeIdentity, o ConfigOpts) error {
 	return n.writeManagedConf(n.currentPrimaryConninfo())
+}
+
+// hasField reports whether conninfo contains want as a whole space-separated token.
+func hasField(conninfo, want string) bool {
+	for _, f := range strings.Fields(conninfo) {
+		if f == want {
+			return true
+		}
+	}
+	return false
+}
+
+// stripApplicationName removes any application_name=<value> token from a conninfo, so the local
+// node's own can replace a value inherited from another node (#288 review).
+func stripApplicationName(conninfo string) string {
+	fields := strings.Fields(conninfo)
+	kept := fields[:0]
+	for _, f := range fields {
+		if strings.HasPrefix(f, "application_name=") {
+			continue
+		}
+		kept = append(kept, f)
+	}
+	return strings.Join(kept, " ")
 }
 
 // currentPrimaryConninfo reads back the primary_conninfo already on disk, or "" if the
@@ -476,8 +587,9 @@ func (n *Native) ReclonePreserving(ctx context.Context, source Conn) error {
 //
 // They are no-ops rather than errors because reconcile calls them unconditionally as part of
 // role reconciliation, and native mode's answer is "nothing to do" rather than "that failed".
-// Until #288 moves topology onto pg_stat_replication, native mode therefore has NO topology
-// source -- which is precisely why the mechanism is experimental and #288 blocks its use.
+// #288 moved topology onto pg_stat_replication (see the agent's topologyTick), so native mode
+// no longer depends on repmgr.nodes for it; these three methods stay only while
+// mechanism.Repmgr is still selectable, and #294 deletes them with it.
 func (n *Native) RegisterPrimary(ctx context.Context) error { return nil }
 
 // Both arguments are ignored: native mode keeps no registry at all (see RegisterPrimary).
@@ -549,8 +661,27 @@ func writeFileAtomic(path, content string, mode os.FileMode) error {
 		tmp.Close()
 		return err
 	}
+	// fsync BEFORE the rename (#288 review). Rename gives name atomicity, not content
+	// durability: without this, a crash shortly after the rename can leave a zero-length file.
+	// ensureInclude now routes PGDATA/postgresql.conf through here, and a truncated
+	// postgresql.conf is a postmaster that will not start at all -- the very outcome the single
+	// atomic write was introduced to avoid, moved onto the file whose loss is fatal.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	// And fsync the DIRECTORY, so the rename itself survives a crash. Best-effort: some
+	// filesystems refuse an O_RDONLY directory sync, and failing the write here would be worse
+	// than a durability gap the next reconcile tick rewrites anyway.
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }

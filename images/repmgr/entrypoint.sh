@@ -104,14 +104,23 @@ reclone_preserving_old() {
 # container-only restart (CrashLoopBackOff, OOM, liveness kill). Repmgr-managed
 # nodes only; no-op for standalone use of the image.
 #
-# Unconditionally repmgr-backed, with no MECHANISM awareness at all (#287): this shell
-# guard runs before the Go agent (or repmgrd) ever starts, so it cannot consult the
-# agent's config. Harmless for now -- it only acts when a peer is on a strictly newer
-# timeline, which cannot happen under native mode's only currently-supported shape (a
-# lone primary, no peers, per the EXPERIMENTAL warning) -- but this is exactly the kind
-# of pre-agent bootstrap path #288 (native topology) will need to make mechanism-aware
-# before native mode can run a real multi-node cluster.
+# Repmgr-mechanism only (#288). Its rejoin and re-clone paths shell out to `repmgr node
+# rejoin` and `repmgr standby clone`, which do not exist as concepts under native mode --
+# there the agent owns both (RejoinForceRewind via pg_rewind, Clone via pg_basebackup) and
+# does them from its own reconcile loop with the Lease as the authority for who is primary.
+# Running this first would rewind or wipe a data directory on the strength of a peer scan
+# that has no notion of the lease, which is exactly the divergence the agent exists to
+# prevent.
+#
+# Now that native mode can actually run a multi-node cluster, "harmless because native only
+# ever runs a lone primary" no longer holds, so the gate is explicit rather than relying on
+# repmgr.conf being absent (init-repmgr.sh does skip writing it under native, and the
+# file check below still stands as a second line of defence).
 primary_safety_guard() {
+    if [ "${MECHANISM:-repmgr}" = "native" ]; then
+        echo "stale-primary guard: skipped (MECHANISM=native; the agent owns rejoin and re-clone)"
+        return 0
+    fi
     [ -f /etc/repmgr/repmgr.conf ] || return 0
     [ -n "${HEADLESS_SERVICE:-}" ] || return 0
     [ -n "${REPMGR_PASSWORD:-}" ] || return 0
@@ -192,6 +201,172 @@ primary_safety_guard() {
     return 0
 }
 
+# bootstrap_initdb creates a brand-new cluster in an empty PGDATA: initdb, the base GUCs,
+# pg_hba, and the managed roles/databases. Extracted into a function so it has exactly ONE
+# implementation shared by both mechanisms (#288).
+#
+# WHO calls it differs, and that is the whole point. Under repmgr the postgres|agent branch
+# calls it inline, as it always did. Under native it must NOT run there: the init container
+# no longer clones, so every pod would reach it with an empty PGDATA and initdb its own
+# independent cluster -- each with a different system_identifier, which assertSameCluster
+# (invariant 9) then refuses to rejoin forever. The pod would be Running and never Ready,
+# holding a bogus database: strictly worse than the Init:CrashLoopBackOff it replaced.
+#
+# So under native the AGENT decides, and only the lease holder ever gets here -- via
+# `entrypoint.sh initdb` from the BootstrapInitdb action. Non-holders wait, then clone with
+# pg_basebackup once the holder is open (reconcile.Decide already encodes exactly this).
+bootstrap_initdb() {
+    # The emptiness check lives INSIDE the function so BOTH callers are protected. It was
+    # previously the caller's `if [ ! -s PG_VERSION ]`, and moving it out would have let a
+    # repmgr-mode boot initdb straight over an existing data directory.
+    if [ -s "$PGDATA/PG_VERSION" ]; then
+        return 0
+    fi
+    echo "Initializing PostgreSQL database..."
+    initdb -D "$PGDATA" --auth-local=trust --auth-host=md5
+
+    cat >> "$PGDATA/postgresql.conf" << EOF
+wal_level = replica
+max_wal_senders = 10
+wal_keep_size = 1GB
+hot_standby = on
+hot_standby_feedback = on
+listen_addresses = '*'
+wal_log_hints = on
+max_replication_slots = 10
+max_slot_wal_keep_size = 4GB
+EOF
+
+    # #288/#293: repmgr's shared library is preloaded only under the repmgr mechanism. A native
+    # cluster has no repmgr extension (the CREATE EXTENSION below is skipped), so preloading
+    # repmgr.so is pure liability -- and this line is baked into the primary's postgresql.conf
+    # and then cloned verbatim to every standby, so it would make every native cluster created
+    # by this code UNSTARTABLE ("could not access file \"repmgr\"") the moment #290/#294 drop
+    # the repmgr package from the image. Removing it from an EXISTING data directory, and the
+    # render-time guard, remain #293's half.
+    if [ "${MECHANISM:-repmgr}" != "native" ]; then
+        echo "shared_preload_libraries = 'repmgr'" >> "$PGDATA/postgresql.conf"
+    else
+        echo "MECHANISM=native: not preloading repmgr.so (no repmgr extension on this cluster, #288)"
+    fi
+
+    if [ "${PGBACKREST_ENABLED:-}" = "true" ]; then
+        cat >> "$PGDATA/postgresql.conf" << PGBR
+archive_mode = on
+archive_command = 'pgbackrest --stanza=${PGBACKREST_STANZA:-db} archive-push %p'
+restore_command = 'pgbackrest --stanza=${PGBACKREST_STANZA:-db} archive-get %f "%p"'
+PGBR
+    fi
+
+    cat > "$PGDATA/pg_hba.conf" << EOF
+local   all             all                                     trust
+local   replication     all                                     trust
+host    all             all             127.0.0.1/32            trust
+host    replication     all             127.0.0.1/32            trust
+host    all             all             ::1/128                 trust
+host    replication     all             10.0.0.0/8              scram-sha-256
+host    all             all             10.0.0.0/8              scram-sha-256
+host    replication     all             0.0.0.0/0               md5
+host    all             all             0.0.0.0/0               md5
+EOF
+
+
+    # Wire in the chart's conf.d include (when the chart mounted it) before this function's own
+    # pg_ctl start/stop below, not after. shared_preload_libraries is postmaster-only (no
+    # reload); the chart's merged value (repmgr + operator extras/pgaudit) lives in conf.d,
+    # previously only spliced in by the postStart hook once postgres was already accepting
+    # connections -- too late to take effect without a second restart, which nothing forced on a
+    # fresh install (the config checksum -> rolling restart wiring only helps a later
+    # `helm upgrade`, since there is no prior pod to roll on `helm install`) (#303). A directory
+    # check, not an env var, because it needs no chart-side signal: the mount is present here iff
+    # the chart rendered postgresql-configmap.yaml.
+    #
+    # Under native the agent ALSO ensures this line (ensureConfdInclude, #288) -- it has to,
+    # because on a native fresh install PGDATA does not exist when setup-config runs. Both are
+    # idempotent; this one keeps the repmgr path working exactly as it does on 1.x.
+    if [ -d /etc/postgresql/conf.d ]; then
+        echo "include_dir = '/etc/postgresql/conf.d'" >> "$PGDATA/postgresql.conf"
+    fi
+
+    # SOCKET-ONLY, deliberately (#288 review). This transient postmaster exists to create the
+    # app/repmgr roles and databases; between `CREATE USER ${REPMGR_USER}` below and the stop at
+    # the end of this function it would otherwise be a reachable, authenticable primary reporting
+    # pg_is_in_recovery() = false -- and under native a non-holder's very next tick would see it
+    # as the live primary and BootstrapClone from it. That standby would inherit the legacy
+    # pg_hba (`host all all 0.0.0.0/0 md5`, SUPERUSER-exposing) for the rest of the pod's life,
+    # because nothing on the clone path rewrites pg_hba, and its cloned postgresql.conf would
+    # have no include_dir, inverting the conf.d precedence too. Under repmgr the window did not
+    # exist: every standby was blocked until the primary registered in repmgr.nodes, which only
+    # happens after the real start. Listening on no TCP address closes it entirely -- the local
+    # psql calls below all use the unix socket.
+    pg_ctl -D "$PGDATA" -w start -o "-c listen_addresses=''"
+
+    REPMGR_USER=${REPMGR_USER:-repmgr}
+    REPMGR_PASSWORD=${REPMGR_PASSWORD:?REPMGR_PASSWORD is required}
+    REPMGR_DB=${REPMGR_DB:-repmgr}
+    POSTGRES_USER=${POSTGRES_USER:-postgres}
+    POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    POSTGRES_DB=${POSTGRES_DB:-postgres}
+
+    # initdb --auth-host=md5 (above) writes password_encryption=md5 into
+    # postgresql.conf, so a bare CREATE USER stores an MD5 secret. pg_hba.conf
+    # (written above) requires scram-sha-256 for the 10.0.0.0/8 pod network,
+    # and PostgreSQL never falls through on auth failure -- so an MD5-secret
+    # repmgr user is rejected with "does not have a valid SCRAM secret" the
+    # moment a standby clone or repmgrd connects over the pod network, before
+    # the chart's postStart md5->scram migration has had a chance to run. That
+    # is a startup race that crash-loops repmgrd / wedges the standby clone.
+    # Create the managed users with a SCRAM secret directly (a session-scoped
+    # SET applies to the CREATE/ALTER in that same psql -c session) -- the same end state the chart's
+    # fix_user_auth migration drives them to, but race-free from first boot.
+    # Legacy/app users keep the md5 default and the existing migration path.
+    psql -U postgres -d postgres -c "CREATE DATABASE ${POSTGRES_DB};" 2>/dev/null || true
+    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER ${POSTGRES_USER} WITH SUPERUSER PASSWORD '${POSTGRES_PASSWORD}';" 2>/dev/null || true
+    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; ALTER USER ${POSTGRES_USER} WITH PASSWORD '${POSTGRES_PASSWORD}';" 2>/dev/null || true
+
+    psql -U postgres -d postgres -c "CREATE DATABASE ${REPMGR_DB};" 2>/dev/null || true
+    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER ${REPMGR_USER} WITH SUPERUSER PASSWORD '${REPMGR_PASSWORD}';" 2>/dev/null || true
+    psql -U postgres -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE ${REPMGR_DB} TO ${REPMGR_USER};" 2>/dev/null || true
+    # The repmgr DATABASE and ROLE above are created under BOTH mechanisms, on purpose.
+    # #288 asked for native bootstrap to create none of the three, but the role and the
+    # database are load-bearing in native mode too: the agent connects as REPMGR_USER for
+    # every probe and for pg_basebackup, and primary_conninfo carries dbname=REPMGR_DB.
+    # Dropping them would break native outright. Renaming them out of the repmgr
+    # namespace is #291 (ha.* values), not this issue.
+    #
+    # The EXTENSION is the part native genuinely never uses -- it creates the repmgr
+    # schema and the nodes table this issue exists to stop reading. Skipping it means a
+    # native-mode cluster has no repmgr.nodes at all, so there is no stale cache for
+    # anything to fall back to by accident.
+    if [ "${MECHANISM:-repmgr}" != "native" ]; then
+        psql -U postgres -d ${REPMGR_DB} -c "CREATE EXTENSION IF NOT EXISTS repmgr;" 2>/dev/null || true
+    else
+        echo "MECHANISM=native: skipping CREATE EXTENSION repmgr (the nodes table is not a topology source any more, #288)"
+    fi
+
+    pg_ctl -D "$PGDATA" -w stop
+
+    # LAST action, and the only positive evidence that this multi-step bootstrap finished
+    # (#288 review). initdb writes a perfectly valid pg_control within its first second, so
+    # "the directory looks like a cluster" cannot tell a COMPLETE bootstrap apart from one
+    # killed between the postmaster start above and the role/database creation -- and that
+    # half-bootstrapped state is unrecoverable: bootstrap_initdb no-ops on it forever
+    # (PG_VERSION exists), while the agent can never authenticate as REPMGR_USER, so the pod
+    # comes up Running/NotReady until someone deletes the PVC. The kill is reachable because
+    # `pg_ctl start` above satisfies the chart's startupProbe (`pg_isready` with no -h is
+    # answered over the unix socket), which retires the startup grace and arms the liveness
+    # probe while the agent is still inside this exec and not beating /healthz.
+    #
+    # The agent pairs this with its own in-progress marker beside PGDATA: marker present and
+    # this file absent = torn, discard and start over. Written after the stop so it can never
+    # be mistaken for a state a running postmaster is still mutating. Cloned to standbys along
+    # with the rest of PGDATA, which is correct -- their directory did come from a completed
+    # bootstrap.
+    : > "$PGDATA/.pg-ha-bootstrap-complete"
+
+    echo "PostgreSQL initialization complete"
+}
+
 case "$SCRIPT_NAME" in
     "postgres"|"agent")
         require_pg_bindir || exit 1
@@ -205,90 +380,16 @@ case "$SCRIPT_NAME" in
 
         primary_safety_guard
 
-        if [ ! -s "$PGDATA/PG_VERSION" ]; then
-            echo "Initializing PostgreSQL database..."
-            initdb -D "$PGDATA" --auth-local=trust --auth-host=md5
-
-            cat >> "$PGDATA/postgresql.conf" << EOF
-wal_level = replica
-max_wal_senders = 10
-wal_keep_size = 1GB
-hot_standby = on
-hot_standby_feedback = on
-listen_addresses = '*'
-shared_preload_libraries = 'repmgr'
-wal_log_hints = on
-max_replication_slots = 10
-max_slot_wal_keep_size = 4GB
-EOF
-
-            # Wire in the chart's conf.d include (when the chart mounted it) before this
-            # function's own pg_ctl start/stop below, not after. shared_preload_libraries is
-            # postmaster-only (no reload); the chart's merged value (repmgr + operator
-            # extras/pgaudit) lives in conf.d, previously only spliced in by the postStart
-            # hook once postgres was already accepting connections -- too late to take
-            # effect without a second restart, which nothing forced on a fresh install
-            # (the config checksum -> rolling restart wiring only helps a later
-            # `helm upgrade`, since there is no prior pod to roll on `helm install`). A
-            # directory check, not an env var, because it needs no chart-side signal: the
-            # mount is present here iff the chart rendered postgresql-configmap.yaml.
-            if [ -d /etc/postgresql/conf.d ]; then
-                echo "include_dir = '/etc/postgresql/conf.d'" >> "$PGDATA/postgresql.conf"
-            fi
-
-            if [ "${PGBACKREST_ENABLED:-}" = "true" ]; then
-                cat >> "$PGDATA/postgresql.conf" << PGBR
-archive_mode = on
-archive_command = 'pgbackrest --stanza=${PGBACKREST_STANZA:-db} archive-push %p'
-restore_command = 'pgbackrest --stanza=${PGBACKREST_STANZA:-db} archive-get %f "%p"'
-PGBR
-            fi
-
-            cat > "$PGDATA/pg_hba.conf" << EOF
-local   all             all                                     trust
-local   replication     all                                     trust
-host    all             all             127.0.0.1/32            trust
-host    replication     all             127.0.0.1/32            trust
-host    all             all             ::1/128                 trust
-host    replication     all             10.0.0.0/8              scram-sha-256
-host    all             all             10.0.0.0/8              scram-sha-256
-host    replication     all             0.0.0.0/0               md5
-host    all             all             0.0.0.0/0               md5
-EOF
-
-            pg_ctl -D "$PGDATA" -w start
-
-            REPMGR_USER=${REPMGR_USER:-repmgr}
-            REPMGR_PASSWORD=${REPMGR_PASSWORD:?REPMGR_PASSWORD is required}
-            REPMGR_DB=${REPMGR_DB:-repmgr}
-            POSTGRES_USER=${POSTGRES_USER:-postgres}
-            POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
-            POSTGRES_DB=${POSTGRES_DB:-postgres}
-
-            # initdb --auth-host=md5 (above) writes password_encryption=md5 into
-            # postgresql.conf, so a bare CREATE USER stores an MD5 secret. pg_hba.conf
-            # (written above) requires scram-sha-256 for the 10.0.0.0/8 pod network,
-            # and PostgreSQL never falls through on auth failure -- so an MD5-secret
-            # repmgr user is rejected with "does not have a valid SCRAM secret" the
-            # moment a standby clone or repmgrd connects over the pod network, before
-            # the chart's postStart md5->scram migration has had a chance to run. That
-            # is a startup race that crash-loops repmgrd / wedges the standby clone.
-            # Create the managed users with a SCRAM secret directly (a session-scoped
-            # SET applies to the CREATE/ALTER in that same psql -c session) -- the same end state the chart's
-            # fix_user_auth migration drives them to, but race-free from first boot.
-            # Legacy/app users keep the md5 default and the existing migration path.
-            psql -U postgres -d postgres -c "CREATE DATABASE ${POSTGRES_DB};" 2>/dev/null || true
-            psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER ${POSTGRES_USER} WITH SUPERUSER PASSWORD '${POSTGRES_PASSWORD}';" 2>/dev/null || true
-            psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; ALTER USER ${POSTGRES_USER} WITH PASSWORD '${POSTGRES_PASSWORD}';" 2>/dev/null || true
-
-            psql -U postgres -d postgres -c "CREATE DATABASE ${REPMGR_DB};" 2>/dev/null || true
-            psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER ${REPMGR_USER} WITH SUPERUSER PASSWORD '${REPMGR_PASSWORD}';" 2>/dev/null || true
-            psql -U postgres -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE ${REPMGR_DB} TO ${REPMGR_USER};" 2>/dev/null || true
-            psql -U postgres -d ${REPMGR_DB} -c "CREATE EXTENSION IF NOT EXISTS repmgr;" 2>/dev/null || true
-
-            pg_ctl -D "$PGDATA" -w stop
-
-            echo "PostgreSQL initialization complete"
+        # repmgr mode initdbs inline exactly as before (the function no-ops when PGDATA
+        # already holds a cluster). Native mode must NOT: the init container no longer clones,
+        # so every pod would arrive here empty and create its own cluster with its own
+        # system_identifier, which assertSameCluster refuses to rejoin -- Running, never Ready,
+        # holding a bogus database. Under native the agent decides: the lease holder runs
+        # `entrypoint.sh initdb`, everyone else waits and then clones (#288).
+        if [ "${MECHANISM:-repmgr}" != "native" ]; then
+            bootstrap_initdb
+        elif [ ! -s "$PGDATA/PG_VERSION" ]; then
+            echo "MECHANISM=native: empty data directory; deferring to the agent (initdb if lease holder, else clone) (#288)"
         fi
 
         # agent mode: hand off to the Go HA agent as PID 1; it generates
@@ -303,12 +404,23 @@ EOF
         echo "Starting PostgreSQL..."
         exec postgres -D "$PGDATA"
         ;;
+    "initdb")
+        # Invoked by the agent under native mode (#288) for the lease holder only.
+        require_pg_bindir || exit 1
+        export PATH=$PATH:$PG_BINDIR
+        PGDATA=${PGDATA:-/var/lib/postgresql/data/pgdata}
+        export PGDATA
+        if [ "$(id -u)" = "0" ]; then
+            exec gosu postgres "$0" "$@"
+        fi
+        bootstrap_initdb
+        ;;
     "init")
         exec /usr/local/bin/init-repmgr.sh
         ;;
     *)
         # repmgrd / service-updater were removed with the repmgrd failover path (#286).
-        echo "Usage: $0 {postgres|agent|init}"
+        echo "Usage: $0 {postgres|agent|init|initdb}"
         exit 1
         ;;
 esac

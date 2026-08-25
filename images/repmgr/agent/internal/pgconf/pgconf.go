@@ -128,7 +128,15 @@ func EnsureConfdInclude(confPath, includeDir string, enabled bool) error {
 		content += "\n" + managed
 	}
 	content += "\n"
-	if err := os.WriteFile(confPath, []byte(content), 0o600); err != nil {
+	// ATOMIC, because the file is PGDATA/postgresql.conf (#288 review, round 2). A plain
+	// truncate-and-rewrite loses the whole config to a crash or ENOSPC mid-write, and a
+	// truncated postgresql.conf is a postmaster that will not start at all. Not theoretical
+	// here: this runs from finishInitdbNative, i.e. AFTER bootstrap_initdb wrote its completion
+	// sentinel, so discardTornInitdb would -- correctly, by its own contract -- KEEP the
+	// directory on the next boot, leaving the pod wedged on a truncated config with no automatic
+	// recovery. native.go's ensureInclude was moved off this exact pattern, on this exact file,
+	// for this exact reason.
+	if err := writeFileAtomic(confPath, []byte(content), 0o600); err != nil {
 		return fmt.Errorf("write %s: %w", confPath, err)
 	}
 	return nil

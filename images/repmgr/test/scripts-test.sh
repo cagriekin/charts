@@ -221,15 +221,6 @@ else
   bad "init-repmgr.sh does not honor REPMGR_FAILOVER"
 fi
 
-# --- #308: init-repmgr honors USE_REPLICATION_SLOTS (the chart sets it only in agent
-# mode, matching the agent's own regenerated repmgr.conf so a fresh standby's very
-# first clone gets a physical slot instead of only its second repmgr operation) ---
-if grep -qF 'use_replication_slots=${USE_REPLICATION_SLOTS:-0}' "${ROOT}/init-repmgr.sh"; then
-  ok "#308: init-repmgr.sh honors USE_REPLICATION_SLOTS"
-else
-  bad "#308: init-repmgr.sh does not honor USE_REPLICATION_SLOTS"
-fi
-
 # --- #269: the PG major must not be hardcoded anywhere in the shipped shell layer ---
 # The whole point of the PG_MAJOR build arg is that one image build can be PG17 or PG18.
 # A single re-hardcoded /usr/lib/postgresql/<major>/bin would send a PG17 image at a
@@ -331,6 +322,185 @@ if grep -qF 'apt-cache policy' "${ROOT}/Dockerfile" \
   ok "#269: Dockerfile asserts per-major package availability before install"
 else
   bad "#269: Dockerfile does not assert per-major package availability"
+fi
+
+# --- #288: the native mechanism must bypass every repmgr-specific bootstrap step ---
+# The repmgr.nodes registration wait is what made native unusable with replicas: nothing ever
+# registers under native, so the poll burned its full ~240s and exited 1, leaving every standby
+# in Init:CrashLoopBackOff forever. The gate has to sit BEFORE the repmgr.conf heredoc, because
+# entrypoint.sh's stale-primary guard keys on that file existing.
+init_native_gate_line=$(grep -n 'MECHANISM:-repmgr' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
+init_conf_line=$(grep -n 'cat > /etc/repmgr/repmgr.conf' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
+init_poll_line=$(grep -n 'FROM repmgr.nodes' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
+if [ -n "${init_native_gate_line}" ] && [ -n "${init_conf_line}" ] && [ "${init_native_gate_line}" -lt "${init_conf_line}" ]; then
+  ok "#288: init-repmgr.sh gates on MECHANISM before writing repmgr.conf"
+else
+  bad "#288: init-repmgr.sh does not gate on MECHANISM before writing repmgr.conf (gate=${init_native_gate_line:-none} conf=${init_conf_line:-none})"
+fi
+if [ -n "${init_native_gate_line}" ] && [ -n "${init_poll_line}" ] && [ "${init_native_gate_line}" -lt "${init_poll_line}" ]; then
+  ok "#288: the native gate precedes the repmgr.nodes registration poll"
+else
+  bad "#288: the repmgr.nodes poll is still reachable under native (gate=${init_native_gate_line:-none} poll=${init_poll_line:-none})"
+fi
+
+# NOT re-testing the gate expression by hand-copying it: `MECHANISM=x bash -c 'if [ ... ]'`
+# asserts that bash evaluates a literal this test wrote, which is true regardless of what the
+# shipped script says. The positional greps above carry the real weight, and bootstrap_initdb
+# is exercised behaviourally further down by sourcing the function out of entrypoint.sh.
+
+# --- #288: the stale-primary guard is repmgr-only ---
+# It shells out to `repmgr node rejoin` / `repmgr standby clone` before the agent starts; under
+# native the agent owns both, with the Lease as the authority for who is primary.
+if sed -n '/^primary_safety_guard()/,/^}/p' "${ROOT}/entrypoint.sh" | grep -q 'MECHANISM:-repmgr'; then
+  ok "#288: primary_safety_guard is gated on MECHANISM"
+else
+  bad "#288: primary_safety_guard still runs repmgr rejoin under native"
+fi
+
+# --- #288: the repmgr EXTENSION is skipped under native, but the DB and ROLE are NOT ---
+# The agent connects as REPMGR_USER for every probe and for pg_basebackup, and
+# primary_conninfo carries dbname=REPMGR_DB, so dropping those would break native outright.
+# Only the extension (which creates the nodes table this issue retires) is skipped.
+# Line-based: the CREATE EXTENSION must sit immediately inside the native gate, not merely
+# somewhere in the same file.
+# NEAREST-PRECEDING gate, not the first in the file: there is now more than one `!= "native"`
+# block (shared_preload_libraries has its own), and `head -1` picked the wrong one.
+ext_line=$(grep -n 'CREATE EXTENSION IF NOT EXISTS repmgr' "${ROOT}/entrypoint.sh" | head -1 | cut -d: -f1)
+ext_ok=no
+for g in $(grep -n '!= "native"' "${ROOT}/entrypoint.sh" | cut -d: -f1); do
+  if [ -n "${ext_line}" ] && [ "${ext_line}" -gt "${g}" ] && [ $((ext_line - g)) -le 3 ]; then ext_ok=yes; fi
+done
+if [ "${ext_ok}" = "yes" ]; then
+  ok "#288: CREATE EXTENSION repmgr is skipped under native"
+else
+  bad "#288: CREATE EXTENSION repmgr is not gated on MECHANISM (ext=${ext_line:-none})"
+fi
+for keep in "CREATE DATABASE \${REPMGR_DB}" "CREATE USER \${REPMGR_USER}"; do
+  if grep -qF "${keep}" "${ROOT}/entrypoint.sh"; then
+    ok "#288: still creates ${keep} under both mechanisms (native needs it for replication auth)"
+  else
+    bad "#288: ${keep} was removed -- native connects as that role to that database"
+  fi
+done
+
+# --- #288: initdb has exactly ONE call site, and native must not reach it inline ---
+# The regression this guards: with the init container no longer cloning under native, an
+# inline initdb on any empty PGDATA means every pod creates its own cluster with its own
+# system_identifier -- and assertSameCluster (invariant 9) then refuses to rejoin any of them,
+# so pods sit Running-but-never-Ready holding bogus databases. Strictly worse than the
+# Init:CrashLoopBackOff it replaced.
+if [ "$(grep -c 'initdb -D' "${ROOT}/entrypoint.sh")" = "1" ]; then
+  ok "#288: initdb has exactly one call site"
+else
+  bad "#288: initdb has $(grep -c 'initdb -D' "${ROOT}/entrypoint.sh") call sites; it must live only in bootstrap_initdb"
+fi
+if sed -n '/^bootstrap_initdb() {/,/^}/p' "${ROOT}/entrypoint.sh" | grep -q 'initdb -D'; then
+  ok "#288: the initdb call site is inside bootstrap_initdb"
+else
+  bad "#288: initdb is not inside bootstrap_initdb"
+fi
+# The function must refuse to touch a populated data directory, whichever caller invokes it.
+if sed -n '/^bootstrap_initdb() {/,/^}/p' "${ROOT}/entrypoint.sh" | grep -q 'if \[ -s "$PGDATA/PG_VERSION" \]'; then
+  ok "#288: bootstrap_initdb no-ops on an existing data directory"
+else
+  bad "#288: bootstrap_initdb would initdb over existing data"
+fi
+# Behavioural, against the SHIPPED function rather than a hand-copied expression: source it
+# out of the script and drive it with stubs, both ways round.
+_bi_tmp=$(mktemp -d)
+mkdir -p "${_bi_tmp}/pgdata"
+echo 18 > "${_bi_tmp}/pgdata/PG_VERSION"
+_bi_out=$(PGDATA="${_bi_tmp}/pgdata" bash -c '
+  source <(sed -n "/^bootstrap_initdb() {/,/^}/p" '"${ROOT}"'/entrypoint.sh)
+  initdb() { echo INITDB-RAN; }; pg_ctl() { :; }; psql() { :; }
+  bootstrap_initdb 2>/dev/null' || true)
+if printf '%s' "${_bi_out}" | grep -q INITDB-RAN; then
+  bad "#288: bootstrap_initdb ran initdb over a populated PGDATA"
+else
+  ok "#288: bootstrap_initdb skipped a populated PGDATA (behavioural)"
+fi
+rm -f "${_bi_tmp}/pgdata/PG_VERSION"
+_bi_out=$(PGDATA="${_bi_tmp}/pgdata" bash -c '
+  source <(sed -n "/^bootstrap_initdb() {/,/^}/p" '"${ROOT}"'/entrypoint.sh)
+  initdb() { echo INITDB-RAN; }; pg_ctl() { :; }; psql() { :; }
+  bootstrap_initdb 2>/dev/null' || true)
+if printf '%s' "${_bi_out}" | grep -q INITDB-RAN; then
+  ok "#288: bootstrap_initdb initdbs an empty PGDATA (behavioural)"
+else
+  bad "#288: bootstrap_initdb did not initdb an empty PGDATA"
+fi
+rm -rf "${_bi_tmp}"
+# The agent invokes it through a dispatch mode, so that mode must exist and be advertised.
+if grep -q '"initdb")' "${ROOT}/entrypoint.sh"; then
+  ok "#288: entrypoint.sh has an initdb dispatch mode for the agent"
+else
+  bad "#288: no initdb dispatch mode; the agent cannot bootstrap the lease holder"
+fi
+if grep -q 'postgres|agent|init|initdb' "${ROOT}/entrypoint.sh"; then
+  ok "#288: the usage string lists the initdb mode"
+else
+  bad "#288: the usage string does not list the initdb mode"
+fi
+
+# --- #288: repmgr.so is preloaded only under the repmgr mechanism ---
+# A native cluster has no repmgr extension, so preloading the library is pure liability -- and
+# the line is baked into the primary's postgresql.conf and cloned to every standby, which would
+# make every native cluster created by this code unstartable the moment #290/#294 drop repmgr
+# from the image.
+spl_line=$(grep -n "shared_preload_libraries = 'repmgr'" "${ROOT}/entrypoint.sh" | head -1 | cut -d: -f1)
+# Line-based, like the CREATE EXTENSION check: the nearest preceding native gate must be within
+# a couple of lines, i.e. the write really sits inside it.
+spl_gates=$(grep -n '!= "native"' "${ROOT}/entrypoint.sh" | cut -d: -f1)
+spl_ok=no
+for g in ${spl_gates}; do
+  if [ -n "${spl_line}" ] && [ "${spl_line}" -gt "${g}" ] && [ $((spl_line - g)) -le 2 ]; then spl_ok=yes; fi
+done
+if [ "${spl_ok}" = "yes" ]; then
+  ok "#288: shared_preload_libraries=repmgr is gated on the mechanism"
+else
+  bad "#288: shared_preload_libraries=repmgr is not mechanism-gated (line=${spl_line:-none}, gates=${spl_gates})"
+fi
+
+# --- #288: the transient bootstrap postmaster must not be network-reachable ---
+# Between CREATE USER ${REPMGR_USER} and the stop at the end of bootstrap_initdb it would
+# otherwise be a reachable, authenticable primary reporting pg_is_in_recovery()=false -- and
+# under native a non-holder's next tick would BootstrapClone from it, inheriting the legacy
+# `host all all 0.0.0.0/0 md5` pg_hba for the pod's whole life (nothing on the clone path
+# rewrites pg_hba) plus a postgresql.conf with no include_dir.
+if sed -n '/^bootstrap_initdb() {/,/^}/p' "${ROOT}/entrypoint.sh" | grep -q "listen_addresses=''"; then
+  ok "#288: the bootstrap postmaster listens on no TCP address"
+else
+  bad "#288: the bootstrap postmaster is network-reachable during role creation"
+fi
+
+# --- #288: bootstrap_initdb's completion sentinel is written LAST ---
+# The agent pairs an in-progress marker beside PGDATA with this sentinel inside it: marker
+# present and sentinel absent means the bootstrap was killed partway (the kubelet can do this --
+# the transient `pg_ctl start` satisfies the chart's startupProbe while the agent is inside the
+# exec and not beating /healthz) and the directory must be discarded. That inference only holds
+# if the sentinel is written after the LAST thing the bootstrap does, so a half-bootstrapped
+# directory can never carry it.
+sentinel_line=$(grep -n 'pg-ha-bootstrap-complete' "${ROOT}/entrypoint.sh" | head -1 | cut -d: -f1)
+if [ -z "$sentinel_line" ]; then
+  bad "#288: bootstrap_initdb writes no completion sentinel (the agent cannot tell a torn bootstrap from a finished one)"
+else
+  ok "#288: bootstrap_initdb writes a completion sentinel"
+  # Every step of the bootstrap must precede it: the role/database psql calls and the stop.
+  last_step=$(grep -n 'CREATE USER ${REPMGR_USER}\|pg_ctl -D "$PGDATA" -w stop' "${ROOT}/entrypoint.sh" | tail -1 | cut -d: -f1)
+  if [ -n "$last_step" ] && [ "$sentinel_line" -gt "$last_step" ]; then
+    ok "#288: the completion sentinel is written after the bootstrap's last step"
+  else
+    bad "#288: the completion sentinel is not last (sentinel=${sentinel_line}, last step=${last_step:-none}); a killed bootstrap could carry it"
+  fi
+fi
+
+# --- #308: init-repmgr honors USE_REPLICATION_SLOTS (the chart sets it only in agent
+# mode, matching the agent's own regenerated repmgr.conf so a fresh standby's very
+# first clone gets a physical slot instead of only its second repmgr operation) ---
+if grep -qF 'use_replication_slots=${USE_REPLICATION_SLOTS:-0}' "${ROOT}/init-repmgr.sh"; then
+  ok "#308: init-repmgr.sh honors USE_REPLICATION_SLOTS"
+else
+  bad "#308: init-repmgr.sh does not honor USE_REPLICATION_SLOTS"
 fi
 
 # --- #303 follow-up: conf.d must be wired in before the FIRST pg_ctl start ---

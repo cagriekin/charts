@@ -291,9 +291,39 @@ data:
         prev_started="$(prev_field startedAt)"
         [ -n "${prev_started}" ] && started="${prev_started}"
       fi
+      # restoredAt is the finishedAt of the last SUCCESSFUL restore, carried across failed
+      # attempts (#288 review). The agent ranks restore provenance in a failover election, and
+      # keying that off finishedAt+exitCode meant one failed retry -- which often copies nothing
+      # at all -- erased a genuine restore's authority and let a stale peer promote pre-restore
+      # data. exitCode still marks THIS attempt; restoredAt describes the data on the volume.
+      #
+      # adoptedAt rides along on the SAME reasoning (#288 review, round 3), and omitting it was
+      # a live hazard: the agent stamps adoptedAt once this volume's restored history became the
+      # cluster's own, which is what EXPIRES the election claim restoredAt carries. Rewriting the
+      # record without it resurrected an expired claim -- a failed attempt months later (typo'd
+      # --target, unreachable repo: copies nothing) would hand this node unconditional provenance
+      # authority at the next failover, so the lease could go to it over a reachable peer holding
+      # more WAL. A failure changes no contents, so it changes neither the provenance nor its
+      # adoption. A SUCCESSFUL restore deliberately drops it: new history, new claim.
+      local finished restored adopted
+      finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      if [ "${code}" = "0" ]; then
+        restored="${finished}"
+        adopted=""
+      else
+        restored="$(prev_field restoredAt)"
+        adopted="$(prev_field adoptedAt)"
+        # Records written before this field existed carry provenance only in finishedAt, so
+        # fall back to it when the previous attempt was itself a clean restore.
+        if [ -z "${restored}" ] && [ "$(prev_field exitCode)" = "0" ]; then
+          restored="$(prev_field finishedAt)"
+        fi
+      fi
       {
         echo "startedAt=${started}"
-        echo "finishedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "finishedAt=${finished}"
+        echo "restoredAt=${restored}"
+        [ -n "${adopted}" ] && echo "adoptedAt=${adopted}"
         echo "stanza=${PGBACKREST_STANZA}"
         echo "targetType=${tt}"
         echo "target=${tg}"

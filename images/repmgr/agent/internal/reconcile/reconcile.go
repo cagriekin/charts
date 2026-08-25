@@ -56,6 +56,9 @@ func d(a Action, target, reason string) Decision {
 // LocalState is the local node's state. Timeline comes from pg_controldata when the
 // node is not a running primary (so it is meaningful even for a stopped/standby node).
 type LocalState struct {
+	// RestoredAt is the FinishedAt of the last successful pgBackRest restore on this node's
+	// volume, "" if none (#288). See PeerState.RestoredAt for why it ranks.
+	RestoredAt string
 	HasData    bool
 	Running    bool
 	InRecovery bool
@@ -83,6 +86,12 @@ type PeerState struct {
 	// node's copy of that table. A registered, reachable peer is a safe hand-off target
 	// for an unregistered lease holder that must not promote (#297).
 	Registered bool
+	// RestoredAt is this peer's last successful restore, gossiped (#288). A peer that was
+	// restored more recently than this node carries the cluster's intended history even though
+	// a PITR restore leaves it BEHIND in LSN terms -- so it outranks on provenance, not
+	// position. Compared as an opaque string identity, newest-wins by lexical order because it
+	// is an RFC3339 timestamp.
+	RestoredAt string
 }
 
 // MarkerState is the durable highwater marker (<fullname>-primary).
@@ -113,6 +122,21 @@ type Observation struct {
 	// grace -- a frozen/wedged postmaster that Start cannot recover and the
 	// reconcile-loop liveness probe won't catch. It drives self-health failover.
 	LocalStuck bool
+	// StandbyStalled is set by the agent (a stateful, time-based signal, like LocalStuck) when
+	// this node has been a RUNNING standby with NO walreceiver for several consecutive ticks.
+	//
+	// It exists to catch a standby whose history diverged before the primary's fork point --
+	// after a PITR restore, say -- which can never catch up by streaming: PostgreSQL logs
+	// "new timeline N forked off current database system timeline M before current recovery
+	// point" and then waits for WAL that will never arrive. Following it forever is the wrong
+	// answer; it needs a rewind or re-clone.
+	//
+	// Not derivable from a newer-timeline peer alone. A standby legitimately sits on an older
+	// timeline right after a failover and follows onto the new one BY STREAMING, so escalating
+	// on the timeline gap by itself would re-clone a healthy standby on every failover. The
+	// absent walreceiver is what separates "lagging, will converge" from "stalled, cannot".
+	// The agent requires it to persist so a routine reconnect blip does not trip it.
+	StandbyStalled bool
 	// PeersPending is set by the agent only during the cold-boot window (shortly
 	// after agent start) while some peer is not yet SQL-reachable. The holder waits
 	// rather than promoting/resuming, so the most-advanced election runs against
@@ -135,20 +159,20 @@ type Observation struct {
 	// promote candidate (holder, running, in recovery), so a non-candidate leaves
 	// RegistryRead false and the #297 gate inert.
 	//
+	// REPMGR MODE ONLY (#288). The observer skips the read outright under the native
+	// mechanism, so RegistryRead is permanently false there and the gate never fires. That is
+	// deliberate and nothing replaces it: the gate protects against promoting a node no
+	// survivor can `repmgr standby follow`, which is a constraint of resolving an upstream by
+	// node_id out of this table. Native follows by conninfo -- the lease holder's identity
+	// plus the headless FQDN -- so a native primary is followable the moment it promotes.
+	// Earlier revisions of this comment said native's inertness came from the read always
+	// FAILING; it now comes from the read not happening.
+	//
 	// A node with no row of its own has never registered, so no survivor holds a record
 	// for it and none can follow it after it promotes -- the scale-up race that leaves a
 	// cluster with no serving primary. RegistryRead is required before acting on
 	// LocalRegistered: an unreadable table must not be mistaken for "not registered",
 	// which would refuse a legitimate promotion.
-	//
-	// This fail-open-on-unreadable design is also what keeps the #287 native mechanism's
-	// promote path working: native mode maintains no repmgr.nodes table at all (see
-	// mechanism.Native's RegisterPrimary/RegisterStandby, both no-ops), so RegisteredNodeIDs
-	// always errors under it and RegistryRead stays permanently false -- the gate at its
-	// call site in Decide is then always inert, and native promotes exactly as if this
-	// whole mechanism did not exist. Do not change this to fail closed (e.g. "unreadable
-	// counts as unregistered") without adding an equivalent topology source for native
-	// mode first (#288); that would silently make native mode unable to ever promote.
 	RegistryRead    bool
 	LocalRegistered bool
 	// Cascade enables cascading replication (#29): a standby may follow another
@@ -318,6 +342,15 @@ func Decide(o Observation) Decision {
 		// the primary's WAL senders. cascadeFollowTarget returns the leader unless a
 		// verifiably-safe upstream standby qualifies, so this is byte-identical to
 		// following the lease holder when cascade is off or no safe upstream exists.
+		// A stalled standby on an older timeline cannot converge by following (see
+		// StandbyStalled): its history diverged before the newer timeline forked, so the WAL it
+		// is waiting for does not exist. Rejoin instead -- pg_rewind if the histories allow,
+		// re-clone otherwise. Both conditions are required: the timeline gap alone is the
+		// ordinary post-failover case, and a missing walreceiver alone is a standby whose
+		// upstream is merely down.
+		if newer != nil && o.StandbyStalled {
+			return d(RejoinForward, newer.Name, "standby stalled on an older timeline with no walreceiver; its history diverged before the newer timeline forked, so following can never converge -- rejoin")
+		}
 		if up := cascadeFollowTarget(o); up != o.LeaderIdentity {
 			return d(Follow, up, "standby; cascade-follow upstream "+up+" (offload primary)")
 		}
@@ -520,6 +553,11 @@ func primaryNamed(o Observation, name string) *PeerState {
 	return nil
 }
 
+// restoredAfter reports whether restore identity a is strictly newer than b (#288). Both are
+// RFC3339 timestamps or "", so lexical order is chronological and "" is oldest -- a node that
+// was never restored is never newer than one that was.
+func restoredAfter(a, b string) bool { return a != "" && a > b }
+
 // moreAdvancedPeer returns the name of the peer strictly ahead of the local node
 // (higher timeline, or same timeline + higher LSN), or "", and whether that peer is
 // currently SQL-reachable. A reachable peer can actually take over (a real handoff
@@ -531,10 +569,49 @@ func moreAdvancedPeer(o Observation) (string, bool) {
 	bestReachable := false
 	var bestTL pg.Timeline
 	var bestLSN pg.LSN
+	bestRestoredAt := ""
 	for i := range o.Peers {
 		p := &o.Peers[i]
 		if !p.Reachable && !p.Gossip {
 			continue // no known position for this peer
+		}
+		// RESTORE AUTHORITY (#288), checked before position. A PITR restore intentionally
+		// rewinds the cluster, so the restored node is BEHIND its un-restored peers -- and
+		// ranking on LSN alone let a stale peer win the lease and promote its pre-restore data,
+		// discarding the restored history. Observed live: after a restore the surviving standby
+		// promoted, the restored primary followed IT, and the cluster churned to a third
+		// timeline. A peer whose volume was restored more recently than this node's carries the
+		// history the operator asked for, whatever the positions say.
+		//
+		// A comparison, deliberately, not a veto in unsafeToServe: a standby cloned FROM a
+		// restored primary has its own record dropped by design, so a veto would bar it from
+		// ever promoting again. Ranking cannot deadlock -- with no restore records anywhere
+		// this is byte-identical to the previous behaviour.
+		// Provenance authority requires REACHABILITY (#288 review). A gossip-only restored peer
+		// used to win here, which suppressed the position ranking below and left the caller's
+		// unreachable branch to fall through to a local promote -- so a lease-holding standby
+		// promoted with LESS WAL than a live peer, breaking invariant 8 and losing the restore
+		// too. An unreachable node cannot serve, so it gets no say in who does; when it comes
+		// back it either is the primary or gets rewound/re-cloned (which drops its record).
+		if p.Reachable && restoredAfter(p.RestoredAt, o.Local.RestoredAt) {
+			if best == "" || restoredAfter(p.RestoredAt, bestRestoredAt) ||
+				(p.RestoredAt == bestRestoredAt && ahead(p.Timeline, p.TimelineOK, p.LSN, p.LSNOK, bestTL, true, bestLSN, true)) {
+				best, bestReachable, bestTL, bestLSN, bestRestoredAt = p.Name, p.Reachable, p.Timeline, p.LSN, p.RestoredAt
+			}
+			continue
+		}
+		// A peer with an OLDER restore identity than ours never outranks us, however far ahead
+		// its LSN: its data predates the restore this node carries.
+		if restoredAfter(o.Local.RestoredAt, p.RestoredAt) {
+			continue
+		}
+		// A provenance winner already stands, so a peer that merely leads on POSITION cannot
+		// displace it -- on a 3-node cluster the restored peer and a stale-but-ahead peer are
+		// both candidates, and without this the stale one wins the ranking and we are back to
+		// promoting pre-restore data. It also makes the result independent of the order peers
+		// happen to be iterated in.
+		if bestRestoredAt != "" {
+			continue
 		}
 		if !peerAhead(*p, o.Local) {
 			continue

@@ -37,6 +37,14 @@ type OSExec struct{}
 func (OSExec) Run(ctx context.Context, env []string, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = append(os.Environ(), env...)
+	// WaitDelay bounds the gap between killing the process and Wait returning. Without it a
+	// cancelled context kills only the direct child, while Wait blocks forever on the stdout
+	// copy: any GRANDCHILD still holding the pipe keeps it from reaching EOF. That is not
+	// hypothetical here -- `entrypoint.sh initdb` runs `pg_ctl -w start`, which daemonizes a
+	// postmaster that inherits the pipe, so a deadline expiring mid-bootstrap would hang the
+	// caller indefinitely, holding opMu, stopping the reconcile heartbeat and preventing
+	// dcs.OnLost from ever fencing (#288 review).
+	cmd.WaitDelay = 10 * time.Second
 	out, err := cmd.Output()
 	return strings.TrimSpace(string(out)), withStderr(err)
 }
@@ -268,12 +276,18 @@ func (p *Prober) SystemIdentifier(ctx context.Context, ci ConnInfo) (id uint64, 
 // silent skip, so a broken table cannot read as "nobody is registered" and quietly
 // disable the gate.
 //
-// Under the #287 native mechanism there is no repmgr.nodes at all, so this always errors
-// and reconcile.Observation.RegistryRead stays false -- by design (see that field's doc):
-// the gate the caller drives from this is fail-open, so native mode promotes normally
-// instead of being silently blocked. Do not make this return an empty, error-free result
-// for a missing table; that would flip RegistryRead to true and make the gate fire on every
-// native-mode promote.
+// REPMGR MODE ONLY. Since #288 the caller does not invoke this under the native mechanism at
+// all -- native clusters have no repmgr extension, so the read could only ever fail, and it
+// was warning on every promote-candidate tick about a permanent condition. Nothing replaces it
+// there, and nothing needs to: the gate exists because repmgr addresses a follow target by
+// node_id out of this table, whereas native follows by conninfo, so a native primary is
+// followable the moment it promotes.
+//
+// Do not make this return an empty, error-free result for a missing table. It is still
+// reachable under repmgr against a genuinely broken table, and an empty-but-successful read
+// would flip reconcile.Observation.RegistryRead to true and fire the gate -- refusing a
+// legitimate promotion -- which is the opposite of the fail-open behaviour that field's doc
+// promises.
 func (p *Prober) RegisteredNodeIDs(ctx context.Context, ci ConnInfo) ([]int, error) {
 	out, err := p.psql(ctx, ci, "SELECT node_id FROM repmgr.nodes;")
 	if err != nil {
@@ -320,6 +334,92 @@ func (p *Prober) StandbyNodeIDs(ctx context.Context, ci ConnInfo) ([]int, error)
 		ids = append(ids, n)
 	}
 	return ids, nil
+}
+
+// ReplicaRow is one row of the primary's view of its streaming standbys (#288).
+//
+// Both identity fields are returned RAW and unresolved: mapping either to a pod name needs
+// the StatefulSet's base name and the slot-naming convention, which are the agent's business,
+// not this package's. See the resolution in cmd/agent.
+type ReplicaRow struct {
+	// AppName is pg_stat_replication.application_name. Under the native mechanism the agent
+	// writes the pod name here via primary_conninfo (#288). It is "walreceiver" -- libpq's
+	// default -- for any standby whose primary_conninfo predates that, which is the case the
+	// SlotName fallback exists for.
+	AppName string
+	// SlotName is the slot the standby is streaming through, recovered by joining
+	// pg_replication_slots on active_pid, or "" for a slotless stream. Because native names
+	// slots by pod ordinal (#289), this identifies the pod even when AppName does not.
+	SlotName string
+	// State is pg_stat_replication.state: "streaming", "catchup", "startup", "backup".
+	State string
+}
+
+// Streaming reports whether this replica is actually caught up and streaming, as opposed to
+// still catching up or backing up. Callers deciding topology should care about the
+// distinction: a "catchup" standby exists but cannot yet serve or be promoted safely.
+func (r ReplicaRow) Streaming() bool { return r.State == "streaming" }
+
+// ReplicationTopology reads the primary's own view of who is streaming from it (#288).
+//
+// This replaces repmgr.nodes as the topology source. That table was a CACHE of self-reported
+// metadata: nodes registered themselves into it, rows outlived the pods that wrote them (#139),
+// and it could disagree with both the lease and the observed positions. pg_stat_replication
+// cannot go stale in that way -- it is the primary's live connection list, so a departed pod is
+// simply absent and there is no row to strand.
+//
+// The join is what makes a row identifiable. application_name carries the pod name under
+// native mode, but a standby cloned before #288 still dials with libpq's default
+// ("walreceiver"), so pg_replication_slots.active_pid recovers the pod from the ordinal-named
+// slot instead. Verified against real PostgreSQL 18 with both shapes streaming to one primary
+// at once: `pg-1|pg_ha_slot_1|streaming` alongside `walreceiver|pg_ha_slot_2|streaming`.
+//
+// PHYSICAL SENDERS ONLY. pg_stat_replication has one row per WAL sender, logical decoding
+// senders included, so a cluster with a subscription, Debezium or pg_recvlogical would otherwise
+// contribute rows whose application_name is the subscription name and whose slot is logical --
+// unresolvable to any pod, inflating the streaming count and pinning "unidentified" above zero
+// forever. That would defeat the whole point of that gauge, which is to say the topology view is
+// incomplete. The join is restricted to physical slots and any pid holding a logical slot is
+// excluded outright.
+//
+// PRIMARY-ONLY, and it must not become a promotion gate on its own. pg_stat_replication is the
+// mirror of the pg_stat_wal_receiver caveat above: a standby's row VANISHES the instant it
+// disconnects, which is exactly the failover moment when a promotion decision is being made.
+// Absence here means "not streaming right now", never "this node does not exist".
+func (p *Prober) ReplicationTopology(ctx context.Context, ci ConnInfo) ([]ReplicaRow, error) {
+	out, err := p.psql(ctx, ci,
+		"SELECT r.application_name, COALESCE(s.slot_name, ''), r.state "+
+			"FROM pg_stat_replication r "+
+			"LEFT JOIN pg_replication_slots s ON s.active_pid = r.pid AND s.slot_type = 'physical' "+
+			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots l "+
+			"WHERE l.active_pid = r.pid AND l.slot_type = 'logical') "+
+			"ORDER BY 1, 2;")
+	if err != nil {
+		return nil, err
+	}
+	var rows []ReplicaRow
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "|")
+		if len(parts) < 3 {
+			return nil, fmt.Errorf("parse pg_stat_replication row %q: want at least 3 fields, got %d", line, len(parts))
+		}
+		// EXTRA separators belong to application_name, which is the FIRST column and the only
+		// operator-settable one (#288 review). pg_stat_replication is a cluster-wide view this
+		// chart does not control: one unrelated client whose application_name contains a '|' --
+		// third-party tooling sets it freely -- would otherwise fail the whole read and blind all
+		// three gauges on every tick. slot_name is restricted to [a-z0-9_] and state is a fixed
+		// enum, so the LAST two fields are unambiguous and everything before them is the name.
+		rows = append(rows, ReplicaRow{
+			AppName:  strings.TrimSpace(strings.Join(parts[:len(parts)-2], "|")),
+			SlotName: strings.TrimSpace(parts[len(parts)-2]),
+			State:    strings.TrimSpace(parts[len(parts)-1]),
+		})
+	}
+	return rows, nil
 }
 
 // SlotState is one physical replication slot as the primary sees it (#289).

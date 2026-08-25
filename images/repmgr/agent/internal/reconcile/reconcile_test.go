@@ -334,3 +334,208 @@ func TestDecideCascadeWiring(t *testing.T) {
 		t.Errorf("cascade on: want Follow pg-2 (immediate upstream), got %v %q", on.Action, on.Target)
 	}
 }
+
+// #288 review: a standby whose history diverged BEFORE the primary's timeline forked -- the shape
+// a PITR restore leaves -- can never converge by following. PostgreSQL logs "new timeline N forked
+// off ... before current recovery point" and waits for WAL that does not exist, while Decide
+// returned Follow on every tick forever. Verified live: the pgbackrest-restore-ha native leg sat
+// in exactly that loop until the PVC was deleted by hand.
+func TestDecideRejoinsAStalledStandbyOnAnOlderTimeline(t *testing.T) {
+	o := Observation{
+		LeaderIdentity: "pg-0",
+		Local:          LocalState{HasData: true, Running: true, InRecovery: true, Timeline: 1, TimelineOK: true},
+		Peers: []PeerState{
+			{Name: "pg-0", Reachable: true, Role: pg.RolePrimary, Timeline: 2, TimelineOK: true},
+		},
+		StandbyStalled: true,
+	}
+	d := Decide(o)
+	if d.Action != RejoinForward {
+		t.Fatalf("got %v (%s), want RejoinForward", d.Action, d.Reason)
+	}
+	if d.Target != "pg-0" {
+		t.Errorf("target = %q, want pg-0", d.Target)
+	}
+}
+
+// The timeline gap ALONE must never escalate: a standby legitimately sits on an older timeline
+// right after a failover and follows onto the new one by streaming. Escalating here would re-clone
+// a healthy standby on every failover.
+func TestDecideFollowsALaggingButStreamingStandby(t *testing.T) {
+	o := Observation{
+		LeaderIdentity: "pg-0",
+		Local:          LocalState{HasData: true, Running: true, InRecovery: true, Timeline: 1, TimelineOK: true},
+		Peers: []PeerState{
+			{Name: "pg-0", Reachable: true, Role: pg.RolePrimary, Timeline: 2, TimelineOK: true},
+		},
+		StandbyStalled: false, // streaming, or not yet stalled long enough
+	}
+	if d := Decide(o); d.Action != Follow {
+		t.Fatalf("got %v (%s), want Follow -- a lagging standby converges by streaming", d.Action, d.Reason)
+	}
+}
+
+// A missing walreceiver ALONE must not escalate either: that is a standby whose upstream is
+// merely down, and re-cloning would be both destructive and pointless.
+func TestDecideDoesNotRejoinAStalledStandbyOnTheSameTimeline(t *testing.T) {
+	o := Observation{
+		LeaderIdentity: "pg-0",
+		Local:          LocalState{HasData: true, Running: true, InRecovery: true, Timeline: 2, TimelineOK: true},
+		Peers: []PeerState{
+			{Name: "pg-0", Reachable: true, Role: pg.RolePrimary, Timeline: 2, TimelineOK: true},
+		},
+		StandbyStalled: true,
+	}
+	if d := Decide(o); d.Action == RejoinForward {
+		t.Fatalf("re-cloned a same-timeline standby whose upstream is merely down: %s", d.Reason)
+	}
+}
+
+// #288: restore authority. A PITR restore deliberately rewinds the cluster, so the restored node
+// is BEHIND its un-restored peers in LSN terms -- and ranking on position alone let a stale peer
+// win the lease and promote its pre-restore data, discarding the history the operator asked for.
+// Observed live: after a restore the surviving standby promoted, the restored primary followed
+// IT, and the cluster churned to a third timeline.
+func TestMoreAdvancedPeerPrefersARestoredPeerOverAFartherAheadStaleOne(t *testing.T) {
+	o := Observation{
+		HoldLease: true,
+		Local:     LocalState{HasData: true, Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x9000}, LSNOK: true},
+		Peers: []PeerState{{
+			Name: "pg-1", Reachable: true, Role: pg.RolePrimary,
+			// BEHIND on LSN -- that is what a PITR restore looks like -- but restored.
+			Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x1000}, LSNOK: true,
+			RestoredAt: "2026-08-24T12:00:00Z",
+		}},
+	}
+	got, _ := moreAdvancedPeer(o)
+	if got != "pg-1" {
+		t.Fatalf("got %q, want pg-1: a restored peer outranks a stale one that is farther ahead", got)
+	}
+}
+
+// The inverse: this node was restored, a peer is far ahead but predates the restore. It must NOT
+// outrank us, or the restore would be discarded from the other direction.
+func TestMoreAdvancedPeerIgnoresAStalePeerWhenThisNodeWasRestored(t *testing.T) {
+	o := Observation{
+		HoldLease: true,
+		Local:     LocalState{HasData: true, Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x1000}, LSNOK: true, RestoredAt: "2026-08-24T12:00:00Z"},
+		Peers: []PeerState{{
+			Name: "pg-1", Reachable: true, Role: pg.RoleStandby,
+			Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x9000}, LSNOK: true,
+		}},
+	}
+	if got, _ := moreAdvancedPeer(o); got != "" {
+		t.Fatalf("got %q, want none: a peer predating this node's restore must not outrank it", got)
+	}
+}
+
+// With no restore records anywhere -- every ordinary cluster -- ranking must be byte-identical
+// to before: pure position. This is what keeps the change from touching normal failover.
+func TestMoreAdvancedPeerUnchangedWithoutRestoreRecords(t *testing.T) {
+	o := Observation{
+		HoldLease: true,
+		Local:     LocalState{HasData: true, Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x1000}, LSNOK: true},
+		Peers: []PeerState{{
+			Name: "pg-1", Reachable: true, Role: pg.RoleStandby,
+			Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x9000}, LSNOK: true,
+		}},
+	}
+	if got, _ := moreAdvancedPeer(o); got != "pg-1" {
+		t.Fatalf("got %q, want pg-1: without restore records the LSN ranking must be unchanged", got)
+	}
+}
+
+// Two nodes from the SAME restore rank on position, as they always did -- the identity is equal,
+// so it cannot be a tiebreak.
+func TestMoreAdvancedPeerRanksOnPositionWithinTheSameRestore(t *testing.T) {
+	const r = "2026-08-24T12:00:00Z"
+	o := Observation{
+		HoldLease: true,
+		Local:     LocalState{HasData: true, Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x1000}, LSNOK: true, RestoredAt: r},
+		Peers: []PeerState{{
+			Name: "pg-1", Reachable: true, Role: pg.RoleStandby, RestoredAt: r,
+			Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x9000}, LSNOK: true,
+		}},
+	}
+	if got, _ := moreAdvancedPeer(o); got != "pg-1" {
+		t.Fatalf("got %q, want pg-1: peers from the same restore rank on position", got)
+	}
+}
+
+// A standby cloned FROM a restored primary has its own record dropped by design, so it reports
+// none. Ranking (not a veto) is what keeps that from barring it forever: with the primary
+// unreachable -- a real failover -- nothing outranks it and it can still be promoted.
+func TestRestoreAuthorityDoesNotBarPromotionWhenTheRestoredPeerIsGone(t *testing.T) {
+	o := Observation{
+		HoldLease: true,
+		Local:     LocalState{HasData: true, Timeline: 2, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x9000}, LSNOK: true},
+		Peers: []PeerState{{
+			Name: "pg-1", Reachable: false, Gossip: false, RestoredAt: "2026-08-24T12:00:00Z",
+		}},
+	}
+	if got, _ := moreAdvancedPeer(o); got != "" {
+		t.Fatalf("got %q: an unreachable, un-gossiping peer must not block promotion", got)
+	}
+}
+
+// Three nodes: local un-restored, one peer restored, one peer un-restored but AHEAD of local.
+// The restored peer must win regardless of the order peers are iterated in. Before the
+// bestRestoredAt guard the position branch overwrote the provenance winner, so pg-2 won when it
+// was visited second -- the exact "stale peer promotes pre-restore data" failure this rule
+// exists to prevent, invisible to the 2-node suite because it needs a THIRD node (#288).
+func TestMoreAdvancedPeerRestoredPeerSurvivesAFartherAheadStalePeer(t *testing.T) {
+	restored := PeerState{
+		Name: "pg-1", Reachable: true, Role: pg.RolePrimary,
+		Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x1000}, LSNOK: true,
+		RestoredAt: "2026-08-24T12:00:00Z",
+	}
+	stale := PeerState{
+		Name: "pg-2", Reachable: true, Role: pg.RoleStandby,
+		Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x9000}, LSNOK: true,
+	}
+	for _, tc := range []struct {
+		name  string
+		peers []PeerState
+	}{
+		{"restored first", []PeerState{restored, stale}},
+		{"stale first", []PeerState{stale, restored}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := Observation{
+				HoldLease: true,
+				Local:     LocalState{HasData: true, Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x5000}, LSNOK: true},
+				Peers:     tc.peers,
+			}
+			if got, _ := moreAdvancedPeer(o); got != "pg-1" {
+				t.Fatalf("got %q, want pg-1: provenance must outrank position for both orders", got)
+			}
+		})
+	}
+}
+
+// #288 review: a gossip-only restored peer must NOT suppress a reachable, position-ahead peer.
+// It used to win on provenance, which skipped the position ranking and returned an unreachable
+// winner -- the caller's gossip-only branch then fell through to a local promote, so this node
+// promoted with less WAL than a live peer (invariant 8) AND lost the restore. Expect the
+// reachable peer to be chosen for hand-off instead.
+func TestMoreAdvancedPeerUnreachableRestoredPeerDoesNotSuppressReachableAheadPeer(t *testing.T) {
+	o := Observation{
+		HoldLease: true,
+		Local:     LocalState{HasData: true, Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x5000}, LSNOK: true},
+		Peers: []PeerState{
+			{ // restored, but only gossiping -- cannot serve
+				Name: "pg-0", Reachable: false, Gossip: true, Role: pg.RolePrimary,
+				Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x1000}, LSNOK: true,
+				RestoredAt: "2026-08-24T12:00:00Z",
+			},
+			{ // live and ahead of us on the same timeline
+				Name: "pg-2", Reachable: true, Role: pg.RoleStandby,
+				Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x9000}, LSNOK: true,
+			},
+		},
+	}
+	got, reachable := moreAdvancedPeer(o)
+	if got != "pg-2" || !reachable {
+		t.Fatalf("got (%q, %v), want (pg-2, true): an unreachable restored peer must not suppress a live ahead peer", got, reachable)
+	}
+}
