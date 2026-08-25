@@ -163,6 +163,10 @@ type agent struct {
 	// one (#288 review). Zero value = nothing observed yet.
 	standbyLastProgressLSN pg.LSN
 
+	// initdbMarkerWaitOverride shortens the post-initdb wait for the postmaster to accept SQL.
+	// Zero means initdbMarkerWait; only tests set it.
+	initdbMarkerWaitOverride time.Duration
+
 	// lastTopologyGap is the comma-joined set of live peers not streaming, so topologyTick logs
 	// one line per CHANGE instead of one per tick (#288). A rolling restart legitimately parks a
 	// peer off-stream for a while, and warning every 5s about it would bury everything else.
@@ -785,10 +789,23 @@ func (a *agent) observeStandbyStall(ctx context.Context, o *reconcile.Observatio
 	}
 }
 
-// standbyStallTicks is how many consecutive receiver-less ticks make a standby "stalled". Six at
-// the default 5s interval is ~30s -- comfortably longer than a walreceiver reconnect or a brief
-// upstream restart, and far shorter than the startup probe's window.
-const standbyStallTicks = 6
+// standbyStallTicks is how many consecutive receiver-less, NO-PROGRESS ticks make a standby
+// "stalled". 36 at the default 5s interval is ~3 minutes.
+//
+// Raised from six (~30s) after review round 3. The no-progress rule in observeStandbyStall
+// distinguishes archive recovery from a wedge by watching the replay position ADVANCE, and that
+// leaves one gap: a single restore_command fetch -- `pgbackrest archive-get` pulling one 16MB
+// segment from a throttled or degraded S3 repository -- can itself take longer than the window,
+// freezing both LSNs with no walreceiver row. Post-failover archive catch-up is exactly when
+// this node also sees a peer on a newer timeline, so the escalation fired on a standby that was
+// converging correctly, stopping postgres to pg_rewind or fully re-clone it. Not native-gated
+// either: this reaches the default repmgr mechanism.
+//
+// The asymmetry is what sets the value. Escalating late costs a standby a few more minutes of
+// being behind, while nothing is down and no client is affected; escalating wrongly destroys a
+// healthy standby's data directory and can leave a .diverged.<ts> copy behind. So the window is
+// sized well past any plausible single-segment fetch rather than tight enough to be prompt.
+const standbyStallTicks = 36
 
 // readRegistryForGate populates the #297 promote-registration gate's inputs from repmgr.nodes.
 // Only for a promote candidate (holder, running, in recovery); every other node leaves
@@ -1350,10 +1367,23 @@ func (a *agent) finishInitdbNative(ctx context.Context, nid mechanism.NodeIdenti
 	// With the marker present, the peer takes the #170 "empty data with a marker present; settle
 	// before initdb" path instead and clones. Best-effort by design: advanceMarker logs and
 	// carries on, and a failure here is no worse than the previous behaviour.
-	if tl, _, ok, _ := a.prober.PrimaryWALPosition(ctx, a.selfConn()); ok {
+	//
+	// The read has to WAIT for the postmaster (#288 review, round 3). sup.Start is
+	// fire-and-forget -- ChildPostmaster.Start returns as soon as exec.Cmd.Start does -- so a
+	// single PrimaryWALPosition here dialled 127.0.0.1 microseconds later and was refused;
+	// connect_timeout bounds a connect, it does not retry one. ok was therefore false on
+	// essentially every fresh install, the marker was never written, and the window this block
+	// exists to close stayed open. Poll instead, briefly: the cluster was just stopped cleanly by
+	// bootstrap_initdb, so it has no recovery to replay and comes up in about a second.
+	if tl, ok := a.waitForPrimaryTimeline(ctx, a.markerWait()); ok {
 		// MarkerState zero value = absent, which is the truth for a cluster created seconds ago
 		// and makes shouldAdvanceMarker treat any readable timeline as an advance.
 		a.advanceMarker(ctx, tl, true, reconcile.MarkerState{})
+	} else {
+		// Not fatal: the next StayPrimary tick writes it. Logged because the gap between here
+		// and that tick is exactly the unrecoverable window described above.
+		a.log.Warn("could not read the new cluster's timeline in time to write the highwater marker; the next primary tick will",
+			"waited", a.markerWait())
 	}
 	// Deliberately no metric bump here. IncRecoveryStart counts read-only WAL-replay starts at
 	// cold boot, which this is the opposite of, and there is no existing counter for "created
@@ -1602,6 +1632,39 @@ func (a *agent) discardTornClone(ctx context.Context) {
 // initdb, a postmaster start/stop cycle and six psql calls on a possibly-contended node -- but
 // finite, so a wedged pg_ctl cannot deadlock the reconcile loop (#288 review).
 const initdbBudget = 5 * time.Minute
+
+// initdbMarkerWait bounds the poll for the newly created cluster to accept SQL, so the highwater
+// marker can be written before this function returns (#288 review, round 3). Short on purpose:
+// bootstrap_initdb stopped the cluster cleanly, so there is no recovery to replay -- and the
+// fallback (the next StayPrimary tick) costs one reconcile interval, not correctness.
+const initdbMarkerWait = 15 * time.Second
+
+// markerWait is initdbMarkerWait unless overridden (tests set it short so they do not spend the
+// full budget waiting for a postmaster that a fake exec will never start).
+func (a *agent) markerWait() time.Duration {
+	if a.initdbMarkerWaitOverride > 0 {
+		return a.initdbMarkerWaitOverride
+	}
+	return initdbMarkerWait
+}
+
+// waitForPrimaryTimeline polls the local postmaster until it answers as a read-write primary,
+// returning its timeline. Bounded by budget; false when the postmaster did not become readable
+// in time (or ctx ended first).
+func (a *agent) waitForPrimaryTimeline(ctx context.Context, budget time.Duration) (pg.Timeline, bool) {
+	wctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	for {
+		if tl, _, ok, _ := a.prober.PrimaryWALPosition(wctx, a.selfConn()); ok {
+			return tl, true
+		}
+		select {
+		case <-wctx.Done():
+			return 0, false
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
 
 // confdDir is where the chart mounts the operator's postgresql.configuration / TLS / audit /
 // pgbackrest fragments. Mounted only when one of those features is on, which is what makes its

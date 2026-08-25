@@ -1163,6 +1163,12 @@ func (e *initdbExec) Run(_ context.Context, _ []string, name string, args ...str
 	if e.err != nil {
 		return "boom", e.err
 	}
+	// Answer the post-initdb timeline read (#288 review, round 3): the marker write now POLLS
+	// for the postmaster to accept SQL, because sup.Start is fire-and-forget. A fake that never
+	// answers would make every one of these tests sit out the whole budget.
+	if name == "psql" && strings.Contains(strings.Join(args, " "), "pg_walfile_name") {
+		return "00000001|0/3000000", nil
+	}
 	return "", nil
 }
 
@@ -1215,6 +1221,12 @@ func TestBootstrapInitdbNativeInvokesTheEntrypointThenStarts(t *testing.T) {
 	}
 	if !sawMarkerRead {
 		t.Errorf("expected the timeline read that feeds the highwater marker write, got %v", ex.calls)
+	}
+	// And the write itself must land (#288 review, round 3). Asserting only the READ passed even
+	// when the read failed and advanceMarker never ran -- which is exactly what happened while
+	// this path made a single psql attempt against a postmaster that had just been exec'd.
+	if mk, err := a.kube.ReadMarker(context.Background(), a.cfg.MarkerName); err != nil || !mk.Present {
+		t.Errorf("the highwater marker was not written before returning (err=%v marker=%+v)", err, mk)
 	}
 	// The lost-leadership fence must be armed before any tick observes this node as a writer.
 	if !a.servingRW.Load() {
@@ -1271,13 +1283,19 @@ func newBootstrapTestAgentWithPM(t *testing.T, ex *initdbExec, mech string, pm *
 			PGDATA: dataDir, PodName: "pg-0", HeadlessService: "h",
 			RepmgrUser: "repmgr", RepmgrDB: "repmgr", RepmgrPassword: "pw",
 			Mechanism: mech, PgHbaPeerCIDR: "10.0.0.0/8", RenewDeadline: 2 * time.Second,
+			Namespace: "ns", MarkerName: "pg-primary",
 		},
-		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		dcs:    &fakeDCS{leader: true},
-		mech:   m,
+		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		dcs:  &fakeDCS{leader: true},
+		mech: m,
+		// A real k8s client over a fake apiserver, so the highwater marker write this path makes
+		// is observable rather than swallowed by a nil kube.
+		kube:   k8s.NewWithClient(k8sfake.NewSimpleClientset(), "ns"),
 		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
 		sup:    process.NewSupervisor(pm),
 		metr:   observe.New(),
+		// Tests must not sit out the production budget when a fake never starts a postmaster.
+		initdbMarkerWaitOverride: 200 * time.Millisecond,
 	}
 }
 

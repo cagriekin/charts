@@ -9,7 +9,14 @@
   multi-node cluster: the init container no longer polls `repmgr.nodes` (which nothing writes
   under native, so every standby used to sit in `Init:CrashLoopBackOff`), the lease holder
   `initdb`s and the rest clone via `pg_basebackup`, and a native cluster carries no repmgr
-  extension at all. Still EXPERIMENTAL. See the [pg 2.0.0 changelog](../pg/CHANGELOG.md).
+  extension at all. Still EXPERIMENTAL.
+
+  Four of #288's changes also reach `mechanism: repmgr` installs, i.e. every upgrade on the
+  default path: restore provenance became a failover tiebreaker ranked above LSN; a standby with
+  no walreceiver and a frozen replay position is now rewound or re-cloned automatically after ~3
+  minutes; the postStart hook retries for up to 20s instead of skipping `additionalCommands`
+  silently (which on this chart is `CREATE EXTENSION vector`); and the restore record gained
+  `restoredAt` / `adoptedAt`. See the [pg 2.0.0 changelog](../pg/CHANGELOG.md) for the detail.
 
 ### Removed (breaking)
 

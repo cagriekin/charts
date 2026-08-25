@@ -111,6 +111,32 @@
   is primary-only), and an existing repmgr cluster cannot be flipped in place yet (#292). CI now
   runs 8 suites against both mechanisms (56 legs, up from 40).
 
+  **Four of #288's changes reach `mechanism: repmgr` installs too**, i.e. every upgrade on the
+  default path, not just native ones:
+
+  - **Restore provenance is now a failover tiebreaker, ranked ABOVE LSN.** A volume restored
+    more recently than its peers wins the election even when a peer holds more WAL -- without
+    it, a PITR was routinely undone: the restored node is deliberately *behind*, so the stale
+    peer promoted and the restored history was discarded (observed live). The claim expires
+    once the restored node promotes and the highwater marker records its timeline, and a
+    rewind or re-clone removes the record outright. Requires reachability: an unreachable
+    restored peer gets no say in who serves.
+  - **A stalled standby is now rewound or re-cloned automatically.** A standby with no
+    walreceiver, no replay progress and a peer on a newer timeline is rejoined after ~3
+    minutes (`RejoinForward`), where previously nothing escalated a non-holder standby. This
+    is destructive by design -- it exists for a diverged standby that can never converge --
+    so the trigger requires *both* an absent walreceiver and a frozen replay position, which
+    is what tells a wedge apart from ordinary archive catch-up via `restore_command`.
+  - **The postStart hook retries instead of giving up** when no primary is reachable over TCP,
+    so `postgresql.lifecycle.postStart.additionalCommands` is no longer skipped silently on a
+    fresh install. It waits up to 20s for a primary; while it waits the container is not yet
+    Started, so probes have not begun and the pod is in no Service.
+  - **The restore record gained `restoredAt` and `adoptedAt`.** This file is a contract between
+    `restore.sh` and the agent: `restoredAt` survives a later *failed* attempt (a mistyped
+    retry copies nothing and must not erase provenance), `adoptedAt` is stamped by the agent
+    when the cluster adopts the restored history. Unknown keys are ignored on both sides, so a
+    newer image and an older agent interoperate.
+
 - **The agent owns physical replication slot lifecycle in native mode (#289).** Under the
   repmgr mechanism repmgr creates, names and attaches slots itself; native mode had nobody
   doing it, and an unowned slot is the most dangerous loose end in the exit -- an orphaned

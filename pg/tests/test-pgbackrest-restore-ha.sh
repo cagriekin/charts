@@ -90,6 +90,15 @@ if [ "${PRIMARY_ORD}" != "0" ]; then
       --set pgbackrest.restore.podOrdinal="${PRIMARY_ORD}" \
       --wait --timeout 10m
     PRIMARY=$(discover_primary "${NAMESPACE}" "${FULLNAME}" 2)
+    # Same guard as the baseline discovery above (#288 review, round 3): an empty PRIMARY makes
+    # PRIMARY_ORD empty, $(( 1 - PRIMARY_ORD )) silently evaluate to 1, and the next pg_exec run
+    # `kubectl exec ""` -- aborting the suite under set -euo pipefail with an opaque kubectl
+    # error rather than a legible failure.
+    if [ -z "${PRIMARY}" ]; then
+      fail "re-point: a primary exists after the second upgrade" "discover_primary returned nothing"
+      print_summary
+      exit 1
+    fi
     PRIMARY_ORD="${PRIMARY##*-}"
   fi
   STANDBY="${FULLNAME}-$(( 1 - PRIMARY_ORD ))"

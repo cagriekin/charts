@@ -3240,14 +3240,25 @@ ps_hook=$(helm template test-pg "${CHART_DIR}" --set repmgr.enabled=true \
 # a bare "continue" passed on any chart containing that word anywhere -- including the comment
 # this change added -- so it could not fail. Take the `if [ -n "$PRIMARY_HOST" ]` block up to
 # its `fi` and assert the else arm retries rather than breaking out of the wait loop.
-ps_branch=$(printf '%s\n' "${ps_hook}" | sed -n '/if \[ -n "\$PRIMARY_HOST" \]; then/,/^ *fi$/p')
+# End the range at the outer wait loop's `done`, not at the first `fi`: the else arm now nests
+# its own bounded-give-up `if`, and stopping at that `fi` truncated the region before `continue`.
+ps_branch=$(printf '%s\n' "${ps_hook}" | sed -n '/if \[ -n "\$PRIMARY_HOST" \]; then/,/^ *done$/p')
 assert_contains "#288 postStart: the no-primary branch is rendered at all" "${ps_branch}" "PRIMARY_HOST"
 # Anchored as whole statements: assert_contains greps a BRE, and the branch's own comment says
 # "instead of breaking", which a bare `break` needle matches.
 assert_contains "#288 postStart: waits instead of skipping when no primary is reachable" \
   "${ps_branch}" "^ *continue$"
-assert_not_contains "#288 postStart: does not break out of the wait when no primary is reachable" \
-  "${ps_branch}" "^ *break$"
+# The wait is bounded SEPARATELY from the outer pg_isready loop (#288 review, round 3): postStart
+# holds the container out of Started -- so out of every Service -- until it returns, and spending
+# the full 90s there delayed readiness on every cold boot, on pgvector's default path.
+assert_contains "#288 postStart: the primary wait has its own, smaller budget" \
+  "${ps_branch}" "primary_waits"
+assert_contains "#288 postStart: that budget gives up well before the outer loop" \
+  "${ps_branch}" "primary_waits\" -ge 20"
+# And nothing initialises the counter on a chart that renders no additionalCommands at all.
+noac=$(helm template test-pg "${CHART_DIR}" --set repmgr.enabled=true 2>&1)
+assert_not_contains "#288 postStart: no discovery counter when additionalCommands is empty" \
+  "${noac}" "primary_waits"
 
 assert_contains "#288 restore.sh: carries restoredAt across a failed attempt" \
   "${ctl_restore_sh}" 'restored="$(prev_field restoredAt)"'
