@@ -311,6 +311,18 @@ postgresql:
 
   lifecycle:
     postStart:
+      # Runs once per pod start, against the cluster's PRIMARY (the hook discovers it and
+      # exports PGHOST), which is why CREATE EXTENSION works here at all -- a standby is
+      # read-only, and the extension replicates to it from the primary.
+      #
+      # BEST EFFORT (#288 review): the hook waits up to 90s for a reachable primary and then
+      # gives up SILENTLY, because a non-zero postStart exit makes the kubelet kill the
+      # container. In practice the extension is created by whichever pod reaches the primary
+      # inside that window and is then cluster-wide, so a slow pod skipping its own run is
+      # harmless -- but a cluster where NO pod reaches a primary within 90s of starting comes
+      # up without the extension, and `CREATE EXTENSION vector` has to be run by hand. Note
+      # also that probes do not begin until this hook returns. See pg/values.yaml for the
+      # full note.
       additionalCommands: |
         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1
 
@@ -366,7 +378,10 @@ repmgr:
     # EXPERIMENTAL -- do not set in production yet (#287). Which replication mechanics the
     # agent drives: `repmgr` (default, the repmgr CLI) or `native` (pg_ctl promote,
     # pg_basebackup, pg_rewind, primary_conninfo directly). Policy is identical either way.
-    # `native` is NOT usable on its own yet -- topology still comes from repmgr.nodes (#288).
+    # `native` now runs a real multi-node cluster (#288): topology comes from
+    # pg_stat_replication, and the lease holder initdbs while the rest clone via
+    # pg_basebackup. Still EXPERIMENTAL -- cascadingReplication is render-rejected with it,
+    # and an existing repmgr cluster cannot be flipped in place yet (#292).
     # It does own its replication slots (#289). See the pg chart README.
     mechanism: repmgr
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the

@@ -243,3 +243,30 @@ print_summary() {
   fi
   return 0
 }
+
+# chart_mechanism echoes the HA mechanism this WORKING TREE is set to (#288), so a suite
+# branches off the tree rather than an env var a local run would forget to export. Set by
+# pg/tests/set-mechanism.sh; defaults to repmgr, which is also the chart default.
+chart_mechanism() {
+  local v
+  v=$(grep -m1 '^    mechanism: ' "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/values.yaml" 2>/dev/null | awk '{print $2}')
+  echo "${v:-repmgr}"
+}
+
+# discover_primary echoes the pod name that is currently NOT in recovery, or "" if none is
+# (#288). Under `repmgr.agent.mechanism: native` the initial primary is decided by the LEASE
+# RACE, not by ordinal: the lease holder is what runs initdb, and with podManagementPolicy
+# Parallel any pod can win it. Under repmgr, init-repmgr.sh hardcoded ordinal 0 as master, so
+# suites could assume pod-0 -- that assumption is a repmgr implementation detail and does not
+# hold on the native path.
+#
+# Usage: discover_primary <namespace> <fullname> <replica-count> [user] [db]
+discover_primary() {
+  local ns="$1" fullname="$2" count="$3" user="${4:-testuser}" db="${5:-testdb}"
+  local i rec
+  for i in $(seq 0 $((count - 1))); do
+    rec=$(pg_exec "${ns}" "${fullname}-${i}" "SELECT pg_is_in_recovery()" "${user}" "${db}" 2>/dev/null | tr -d '[:space:]')
+    if [ "${rec}" = "f" ]; then echo "${fullname}-${i}"; return 0; fi
+  done
+  echo ""
+}

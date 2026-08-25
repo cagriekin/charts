@@ -671,3 +671,202 @@ func TestNativeFollowFailsWhenTheSlotCannotBeEnsured(t *testing.T) {
 		t.Fatal("Follow reported success despite being unable to create the slot it points at")
 	}
 }
+
+// #288: primary_conninfo must publish this node's pod name as application_name, because that
+// is the only thing that makes the upstream's pg_stat_replication a usable topology source.
+// Without it every native standby is application_name = 'walreceiver' (the libpq default), so
+// the primary can count its standbys but cannot tell which pods they are. repmgr mode does not
+// have the problem: repmgr injects node_name itself during standby clone.
+func TestNativeFollowPublishesApplicationNameForTopology(t *testing.T) {
+	n, dataDir := newTestNativeWithSlot(t, &fakeRunner{}, "pg_ha_slot_1")
+	n.NodeName = "pg-1"
+	if err := n.Follow(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Follow: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	// Inside primary_conninfo, not as a standalone GUC: primary_conninfo is what the
+	// walreceiver actually dials, so a bare application_name would name the postmaster's own
+	// sessions rather than the replication connection.
+	if !strings.Contains(got, "application_name=pg-1") {
+		t.Errorf("primary_conninfo carries no application_name, so the upstream cannot identify this standby:\n%s", got)
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "application_name") {
+			t.Errorf("application_name written as its own GUC (%q) -- it must live inside primary_conninfo", line)
+		}
+		if strings.HasPrefix(line, "primary_conninfo") && !strings.Contains(line, "application_name=pg-1") {
+			t.Errorf("application_name is not inside primary_conninfo: %q", line)
+		}
+	}
+}
+
+// An empty NodeName omits the setting rather than emitting a dangling `application_name=`,
+// which libpq would reject and which would fail postmaster start.
+func TestNativeFollowOmitsApplicationNameWhenNodeNameIsEmpty(t *testing.T) {
+	n, dataDir := newTestNativeWithSlot(t, &fakeRunner{}, "pg_ha_slot_1")
+	if err := n.Follow(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Follow: %v", err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if strings.Contains(string(b), "application_name") {
+		t.Errorf("emitted application_name with no NodeName set:\n%s", string(b))
+	}
+}
+
+// #288 review: GenerateConfig re-reads the primary_conninfo already on disk and writes it back,
+// so an unconditional application_name append accumulated a copy on every agent boot. A standby
+// already streaming never re-enters Follow, so nothing ever rewrote it cleanly.
+func TestNativeApplicationNameIsNotAppendedTwice(t *testing.T) {
+	n, dataDir := newTestNativeWithSlot(t, &fakeRunner{}, "pg_ha_slot_1")
+	n.NodeName = "pg-1"
+	if err := n.Follow(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Follow: %v", err)
+	}
+	// Four more agent boots.
+	for i := 0; i < 4; i++ {
+		if err := n.GenerateConfig(context.Background(), NodeIdentity{DataDir: dataDir}, ConfigOpts{}); err != nil {
+			t.Fatalf("GenerateConfig: %v", err)
+		}
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(b), "application_name="); n != 1 {
+		t.Errorf("application_name appears %d times after repeated boots, want 1:\n%s", n, string(b))
+	}
+}
+
+// #288 review: pg_rewind copies the SOURCE's managed fragment into the target PGDATA, so if the
+// agent dies after the rewind but before Follow finishes, the next boot feeds the source pod's
+// application_name back through currentPrimaryConninfo(). A presence-only guard would preserve
+// it forever: two senders would resolve to one pod, and the real pod would be reported as not
+// streaming indefinitely.
+func TestNativeApplicationNameSelfHealsAForeignValue(t *testing.T) {
+	n, dataDir := newTestNativeWithSlot(t, &fakeRunner{}, "pg_ha_slot_1")
+	n.NodeName = "pg-1"
+	// Stand in for a fragment inherited from pg-0 via pg_rewind.
+	if err := n.writeManagedConf("host=pg-0.hl port=5432 user=repmgr dbname=repmgr application_name=pg-0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.GenerateConfig(context.Background(), NodeIdentity{DataDir: dataDir}, ConfigOpts{}); err != nil {
+		t.Fatalf("GenerateConfig: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	if strings.Contains(got, "application_name=pg-0") {
+		t.Errorf("kept another node's application_name:\n%s", got)
+	}
+	if !strings.Contains(got, "application_name=pg-1") {
+		t.Errorf("did not adopt this node's own application_name:\n%s", got)
+	}
+	if n := strings.Count(got, "application_name="); n != 1 {
+		t.Errorf("application_name appears %d times, want 1:\n%s", n, got)
+	}
+}
+
+// #288 review: the ordinal-collision case the pg-0/pg-1 test could not expose. A substring test
+// for "application_name=pg-1" is satisfied by an inherited "application_name=pg-10", so with 11+
+// replicas the foreign value was kept and pg-1 advertised itself as pg-10.
+func TestNativeApplicationNameGuardComparesWholeTokens(t *testing.T) {
+	n, dataDir := newTestNativeWithSlot(t, &fakeRunner{}, "pg_ha_slot_1")
+	n.NodeName = "pg-1"
+	if err := n.writeManagedConf("host=pg-0.hl user=repmgr dbname=repmgr application_name=pg-10"); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.GenerateConfig(context.Background(), NodeIdentity{DataDir: dataDir}, ConfigOpts{}); err != nil {
+		t.Fatalf("GenerateConfig: %v", err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dataDir, managedConfName))
+	got := string(b)
+	if strings.Contains(got, "application_name=pg-10") {
+		t.Errorf("pg-1 kept pg-10's application_name (substring collision):\n%s", got)
+	}
+	if !strings.Contains(got, "application_name=pg-1\n") && !strings.Contains(got, "application_name=pg-1'") {
+		t.Errorf("pg-1 did not adopt its own application_name:\n%s", got)
+	}
+}
+
+// #288 review: the agent's include must end up LAST, because PostgreSQL applies includes in file
+// order and the agent's replication settings are meant to win. An append-only-if-absent check
+// could not maintain that: a native cluster created with no conf.d feature has the agent's
+// include at the end, and enabling postgresql.configuration later makes setup-config append
+// include_dir after it -- silently handing an operator's wal_log_hints precedence over the
+// agent's and cloning the inverted file to every standby.
+func TestNativeEnsureIncludeMovesItselfLast(t *testing.T) {
+	n, dataDir := newTestNative(t, &fakeRunner{})
+	confPath := filepath.Join(dataDir, "postgresql.conf")
+	// The agent's include already present, then conf.d appended after it (what setup-config does).
+	body := "# initial\n" + "include '" + managedConfName + "'\n" + "include_dir = '/etc/postgresql/conf.d'\n"
+	if err := os.WriteFile(confPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.GenerateConfig(context.Background(), NodeIdentity{DataDir: dataDir}, ConfigOpts{}); err != nil {
+		t.Fatalf("GenerateConfig: %v", err)
+	}
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	if n := strings.Count(got, "include '"+managedConfName+"'"); n != 1 {
+		t.Errorf("the managed include appears %d times, want 1:\n%s", n, got)
+	}
+	if !isLastActiveDirective(got, "include '"+managedConfName+"'") {
+		t.Errorf("the managed include is not last, so conf.d outranks the agent:\n%s", got)
+	}
+	if !strings.Contains(got, "include_dir = '/etc/postgresql/conf.d'") {
+		t.Errorf("the operator's include_dir was dropped:\n%s", got)
+	}
+}
+
+// #288 review: the reposition must be ONE atomic write. An earlier revision truncated and then
+// re-appended, so between the two writes postgresql.conf carried no include at all -- and act()
+// issues pg_reload_conf() after every successful Follow on a RUNNING standby, so a reload landing
+// in that window would drop primary_conninfo/primary_slot_name/hot_standby/wal_log_hints and stop
+// the walreceiver. A crash mid-truncate also leaves a file the postmaster cannot start on.
+func TestNativeEnsureIncludeIsAtomicAndDoesNotAccumulateHeaders(t *testing.T) {
+	n, dataDir := newTestNative(t, &fakeRunner{})
+	confPath := filepath.Join(dataDir, "postgresql.conf")
+	body := "# initial\ninclude '" + managedConfName + "'\ninclude_dir = '/etc/postgresql/conf.d'\n"
+	if err := os.WriteFile(confPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Three repositions in a row: the file must converge, not grow.
+	for i := 0; i < 3; i++ {
+		if err := n.GenerateConfig(context.Background(), NodeIdentity{DataDir: dataDir}, ConfigOpts{}); err != nil {
+			t.Fatalf("GenerateConfig %d: %v", i, err)
+		}
+	}
+	b, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	if c := strings.Count(got, "include '"+managedConfName+"'"); c != 1 {
+		t.Errorf("the managed include appears %d times, want 1:\n%s", c, got)
+	}
+	if c := strings.Count(got, "# Managed by pg-ha-agent (native mechanism, #287)"); c != 1 {
+		t.Errorf("the managed header appears %d times, want 1 (orphans accumulating):\n%s", c, got)
+	}
+	if !isLastActiveDirective(got, "include '"+managedConfName+"'") {
+		t.Errorf("the managed include is not last:\n%s", got)
+	}
+	if !strings.Contains(got, "include_dir = '/etc/postgresql/conf.d'") {
+		t.Errorf("the operator's include_dir was dropped:\n%s", got)
+	}
+	// No temp file left behind by the atomic write.
+	entries, _ := os.ReadDir(dataDir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".") || strings.Contains(e.Name(), "tmp") {
+			t.Errorf("atomic write left %q behind", e.Name())
+		}
+	}
+}

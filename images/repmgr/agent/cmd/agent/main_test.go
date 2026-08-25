@@ -26,6 +26,7 @@ import (
 	"github.com/cagriekin/pg-ha-agent/internal/mechanism"
 	"github.com/cagriekin/pg-ha-agent/internal/observe"
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
+	"github.com/cagriekin/pg-ha-agent/internal/pgbackrest"
 	"github.com/cagriekin/pg-ha-agent/internal/process"
 	"github.com/cagriekin/pg-ha-agent/internal/reconcile"
 )
@@ -155,10 +156,14 @@ func (f *fakePostmaster) Reload(context.Context) error {
 }
 func (f *fakePostmaster) Running() bool { return f.running }
 
-type fakeDCS struct{ released bool }
+type fakeDCS struct {
+	released bool
+	// leader lets a test hold the lease. Default false, matching every pre-existing use.
+	leader bool
+}
 
 func (f *fakeDCS) Run(context.Context, string, dcs.Callbacks) {}
-func (f *fakeDCS) IsLeader() bool                             { return false }
+func (f *fakeDCS) IsLeader() bool                             { return f.leader }
 func (f *fakeDCS) Leader() string                             { return "" }
 func (f *fakeDCS) Release()                                   { f.released = true }
 
@@ -1481,5 +1486,954 @@ func TestFollowKeepsPublishingSlotGaugesWhileOtherActionsRetractThem(t *testing.
 		if kept != tc.want {
 			t.Errorf("action %v: gauges kept=%v, want %v", tc.action, kept, tc.want)
 		}
+	}
+}
+
+// initdbExec records what the bootstrap branch shells out to, so the sequencing can be
+// asserted without a real initdb.
+type initdbExec struct {
+	calls [][]string
+	err   error
+}
+
+func (e *initdbExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
+	e.calls = append(e.calls, append([]string{name}, args...))
+	if e.err != nil {
+		return "boom", e.err
+	}
+	// Answer the post-initdb timeline read (#288 review, round 3): the marker write now POLLS
+	// for the postmaster to accept SQL, because sup.Start is fire-and-forget. A fake that never
+	// answers would make every one of these tests sit out the whole budget.
+	if name == "psql" && strings.Contains(strings.Join(args, " "), "pg_walfile_name") {
+		return "00000001|0/3000000", nil
+	}
+	return "", nil
+}
+
+// #288: under repmgr the branch must stay inert -- the entrypoint initdbs inline before the
+// agent runs, and any behaviour change here would move the default path.
+func TestBootstrapInitdbIsInertUnderRepmgr(t *testing.T) {
+	ex := &initdbExec{}
+	a := newBootstrapTestAgent(t, ex, config.MechanismRepmgr)
+	if err := a.act(context.Background(),
+		reconcile.Decision{Action: reconcile.BootstrapInitdb},
+		reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if len(ex.calls) != 0 {
+		t.Errorf("repmgr mode shelled out to %v; the entrypoint owns initdb there", ex.calls)
+	}
+}
+
+// Under native the lease holder creates the cluster. Whether to initdb at all is a
+// cluster-wide decision, and the lease is the only thing that makes it happen exactly once --
+// without this, every pod arrives with an empty PGDATA and initdbs its own cluster, which
+// assertSameCluster then refuses to rejoin forever.
+func TestBootstrapInitdbNativeInvokesTheEntrypointThenStarts(t *testing.T) {
+	ex := &initdbExec{}
+	pm := &fakePostmaster{}
+	a := newBootstrapTestAgentWithPM(t, ex, config.MechanismNative, pm)
+	if err := a.act(context.Background(),
+		reconcile.Decision{Action: reconcile.BootstrapInitdb},
+		reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if len(ex.calls) == 0 || ex.calls[0][0] != entrypointPath || ex.calls[0][1] != "initdb" {
+		t.Fatalf("want %s initdb as the FIRST call, got %v", entrypointPath, ex.calls)
+	}
+	if !pm.started {
+		t.Error("the cluster was created but never started")
+	}
+	// #288 review (second pass): the highwater marker must be written HERE, not deferred to the
+	// next StayPrimary tick. If the agent dies in that window the lease expires, a peer sees
+	// empty PGDATA with no marker and no reachable primary, and takes BootstrapInitdb -- a
+	// SECOND cluster with its own system_identifier, after which assertSameCluster refuses every
+	// rejoin on both pods and only a PVC delete recovers.
+	sawMarkerRead := false
+	for _, c := range ex.calls {
+		for _, arg := range c {
+			if strings.Contains(arg, "pg_walfile_name") {
+				sawMarkerRead = true
+			}
+		}
+	}
+	if !sawMarkerRead {
+		t.Errorf("expected the timeline read that feeds the highwater marker write, got %v", ex.calls)
+	}
+	// And the write itself must land (#288 review, round 3). Asserting only the READ passed even
+	// when the read failed and advanceMarker never ran -- which is exactly what happened while
+	// this path made a single psql attempt against a postmaster that had just been exec'd.
+	if mk, err := a.kube.ReadMarker(context.Background(), a.cfg.MarkerName); err != nil || !mk.Present {
+		t.Errorf("the highwater marker was not written before returning (err=%v marker=%+v)", err, mk)
+	}
+	// The lost-leadership fence must be armed before any tick observes this node as a writer.
+	if !a.servingRW.Load() {
+		t.Error("servingRW not armed after creating a read-write primary")
+	}
+}
+
+// Never initdb over existing data, whatever the decision says. Decide should not produce this
+// combination, but the branch is the last line of defence before a destructive command.
+func TestBootstrapInitdbNativeRefusesWhenDataExists(t *testing.T) {
+	for _, obs := range []reconcile.Observation{
+		{Local: reconcile.LocalState{HasData: true}},
+		{Local: reconcile.LocalState{Running: true}},
+	} {
+		ex := &initdbExec{}
+		a := newBootstrapTestAgent(t, ex, config.MechanismNative)
+		if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.BootstrapInitdb}, obs); err != nil {
+			t.Fatalf("act: %v", err)
+		}
+		if len(ex.calls) != 0 {
+			t.Errorf("initdb attempted over existing data (obs=%+v): %v", obs.Local, ex.calls)
+		}
+	}
+}
+
+// A failed initdb must surface, not be swallowed: the node has no cluster, and a silent
+// success would let the next tick observe an empty PGDATA forever.
+func TestBootstrapInitdbNativePropagatesFailure(t *testing.T) {
+	ex := &initdbExec{err: errors.New("exit status 1")}
+	a := newBootstrapTestAgent(t, ex, config.MechanismNative)
+	if err := a.act(context.Background(),
+		reconcile.Decision{Action: reconcile.BootstrapInitdb},
+		reconcile.Observation{}); err == nil {
+		t.Fatal("a failed initdb reported success")
+	}
+}
+
+func newBootstrapTestAgent(t *testing.T, ex *initdbExec, mech string) *agent {
+	t.Helper()
+	return newBootstrapTestAgentWithPM(t, ex, mech, &fakePostmaster{})
+}
+
+func newBootstrapTestAgentWithPM(t *testing.T, ex *initdbExec, mech string, pm *fakePostmaster) *agent {
+	t.Helper()
+	dataDir := t.TempDir()
+	// native's GenerateConfig appends an include line to PGDATA/postgresql.conf, which a real
+	// initdb would have created; the fake exec does not, so seed it.
+	if err := os.WriteFile(filepath.Join(dataDir, "postgresql.conf"), []byte("# seeded\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := mechanism.NewNative(dataDir, "/usr/lib/postgresql/18/bin", "pw", "pg_ha_slot_0", "pg-0")
+	return &agent{
+		cfg: &config.Config{
+			PGDATA: dataDir, PodName: "pg-0", HeadlessService: "h",
+			RepmgrUser: "repmgr", RepmgrDB: "repmgr", RepmgrPassword: "pw",
+			Mechanism: mech, PgHbaPeerCIDR: "10.0.0.0/8", RenewDeadline: 2 * time.Second,
+			Namespace: "ns", MarkerName: "pg-primary",
+		},
+		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		dcs:  &fakeDCS{leader: true},
+		mech: m,
+		// A real k8s client over a fake apiserver, so the highwater marker write this path makes
+		// is observable rather than swallowed by a nil kube.
+		kube:   k8s.NewWithClient(k8sfake.NewSimpleClientset(), "ns"),
+		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
+		sup:    process.NewSupervisor(pm),
+		metr:   observe.New(),
+		// Tests must not sit out the production budget when a fake never starts a postmaster.
+		initdbMarkerWaitOverride: 200 * time.Millisecond,
+	}
+}
+
+// #288: no repmgr.nodes query may run under the native mechanism. A native cluster has no
+// repmgr extension at all now, so the read could only ever fail -- it was warning on every
+// promote-candidate tick about a permanent condition. The #297 gate it fed is repmgr-specific
+// (it guards against promoting a node no survivor can `repmgr standby follow`, which is a
+// node_id-resolution constraint); native follows by conninfo, so nothing replaces it.
+func TestObserveSkipsTheRegistryReadUnderNative(t *testing.T) {
+	for _, tc := range []struct {
+		mech        string
+		wantQueries int
+	}{
+		{config.MechanismNative, 0},
+		{config.MechanismRepmgr, 1},
+	} {
+		ex := &scriptedExec{nodes: "1000\n1001\n", walRcv: "pg-0.h|streaming"}
+		a := newFollowTestAgent(t, ex)
+		a.cfg.Mechanism = tc.mech
+		a.cfg.PodName = "pg-1"
+		// The one tick-state where the gate can fire: holder, running, in recovery.
+		o := reconcile.Observation{HoldLease: true}
+		o.Local = reconcile.LocalState{Running: true, InRecovery: true, HasData: true}
+		a.readRegistryForGate(context.Background(), &o)
+		if ex.nodesQueries != tc.wantQueries {
+			t.Errorf("mechanism %q: %d repmgr.nodes queries, want %d", tc.mech, ex.nodesQueries, tc.wantQueries)
+		}
+		if tc.mech == config.MechanismNative && o.RegistryRead {
+			t.Errorf("native mode set RegistryRead, which would arm the #297 gate")
+		}
+	}
+}
+
+// #288: identity resolution. application_name first (native writes the pod name there, repmgr
+// writes node_name, same string); the ordinal-named slot as fallback for any standby cloned
+// before #288, which still dials with libpq's default. Both shapes were verified streaming to
+// one real PostgreSQL 18 primary at once.
+func TestResolveReplicaPodUsesAppNameThenSlot(t *testing.T) {
+	a := &agent{base: "pg"}
+	for _, tc := range []struct {
+		row  pg.ReplicaRow
+		want string
+		why  string
+	}{
+		{pg.ReplicaRow{AppName: "pg-1", SlotName: "pg_ha_slot_1"}, "pg-1", "application_name wins"},
+		{pg.ReplicaRow{AppName: "walreceiver", SlotName: "pg_ha_slot_2"}, "pg-2", "libpq default falls back to the slot"},
+		{pg.ReplicaRow{AppName: "", SlotName: "pg_ha_slot_3"}, "pg-3", "empty app name falls back to the slot"},
+		{pg.ReplicaRow{AppName: "walreceiver", SlotName: "repmgr_slot_1004"}, "pg-4", "a legacy repmgr slot still resolves (mid-migration)"},
+		{pg.ReplicaRow{AppName: "walreceiver", SlotName: ""}, "", "slotless and unnamed: unidentifiable"},
+		{pg.ReplicaRow{AppName: "walreceiver", SlotName: "someone_elses_slot"}, "", "not a slot this agent mints"},
+	} {
+		if got := a.resolveReplicaPod(tc.row); got != tc.want {
+			t.Errorf("%s: resolveReplicaPod(%+v) = %q, want %q", tc.why, tc.row, got, tc.want)
+		}
+	}
+}
+
+// The gauges must count what the primary can actually see, and must report separately when a
+// streaming replica cannot be identified at all -- otherwise streaming-vs-expected alone would
+// read as healthy while the topology view is incomplete.
+func TestTopologyTickPublishesGaugesUnderBothMechanisms(t *testing.T) {
+	// Two streaming rows (the catchup one is not counted), one of them unidentifiable.
+	const rows = "pg-1|pg_ha_slot_1|streaming\nwalreceiver||streaming\npg-9|pg_ha_slot_9|catchup\n"
+
+	// Native publishes the full picture: the expected/gap half needs the live pod set, and
+	// reconcileSlots is already making that apiserver LIST on this path.
+	ex := &slotExec{rows: rows}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.base = "pg"
+	a.topologyTick(context.Background())
+	body := scrapeMetrics(t, a)
+	for _, want := range []string{
+		"pg_ha_agent_replicas_streaming 2",
+		"pg_ha_agent_replicas_unidentified 1",
+		// The fake apiserver holds pods 0 and 1; self is pg-0, so one peer is expected.
+		"pg_ha_agent_replicas_expected 1",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("native: missing %q in:\n%s", want, body)
+		}
+	}
+
+	// Under repmgr only what the primary can see on its own is published. Charging every
+	// existing install a SECOND uncached pod LIST per tick for an observational gauge is not a
+	// trade worth making (#288 review) -- reconcileSlots returns before its own livePodOrdinals
+	// on that path, so the LIST would be new cost.
+	ex = &slotExec{rows: rows}
+	a = newSlotTestAgent(t, ex, config.MechanismRepmgr)
+	a.base = "pg"
+	a.topologyTick(context.Background())
+	body = scrapeMetrics(t, a)
+	if !strings.Contains(body, "pg_ha_agent_replicas_streaming 2") {
+		t.Errorf("repmgr: the streaming count must still be published:\n%s", body)
+	}
+	if !strings.Contains(body, "pg_ha_agent_replicas_expected 0") {
+		t.Errorf("repmgr: expected must stay 0 (no extra pod LIST on the default path):\n%s", body)
+	}
+}
+
+// A catchup replica exists but cannot serve or be promoted safely, so it must not be counted
+// as streaming -- the distinction is the whole reason ReplicaRow carries State.
+func TestTopologyTickIgnoresCatchupReplicas(t *testing.T) {
+	ex := &slotExec{rows: "pg-1|pg_ha_slot_1|catchup\n"}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.base = "pg"
+	a.topologyTick(context.Background())
+	if body := scrapeMetrics(t, a); !strings.Contains(body, "pg_ha_agent_replicas_streaming 0") {
+		t.Errorf("a catchup replica counted as streaming:\n%s", body)
+	}
+}
+
+// The missing-peer warning is logged once per CHANGE, not once per tick: a rolling restart
+// legitimately parks a peer off-stream, and a 5s warning loop would bury everything else.
+func TestTopologyTickLogsTheGapOnlyOnChange(t *testing.T) {
+	var out bytes.Buffer
+	ex := &slotExec{rows: ""} // nothing streaming; the fake apiserver has a live peer pg-1
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.base = "pg"
+	a.log = slog.New(slog.NewTextHandler(&out, nil))
+	a.topologyTick(context.Background())
+	a.topologyTick(context.Background())
+	if n := strings.Count(out.String(), "live peers are not streaming"); n != 1 {
+		t.Errorf("gap warning logged %d times across two unchanged ticks, want 1:\n%s", n, out.String())
+	}
+	// And it must report recovery, so a resolved gap does not look like a silent stall.
+	ex.rows = "pg-1|pg_ha_slot_1|streaming\n"
+	a.topologyTick(context.Background())
+	if !strings.Contains(out.String(), "replication topology complete") {
+		t.Errorf("recovery from a topology gap was not logged:\n%s", out.String())
+	}
+}
+
+// #288 audit: no native code path may carry a repmgr node_id. The offset itself cannot be
+// deleted (slotOrdinal's legacy branch needs it to reclaim repmgr_slot_<node_id> orphans during
+// a repmgr->native migration), so the tightening is to stop propagating ids instead.
+func TestNativePathsCarryNoRepmgrNodeID(t *testing.T) {
+	a := &agent{cfg: &config.Config{PodName: "pg-3", Mechanism: config.MechanismNative}}
+	if got := a.repmgrNodeID(); got != 0 {
+		t.Errorf("native self node_id = %d, want 0", got)
+	}
+	if got := a.repmgrPeerNodeID("pg-5"); got != 0 {
+		t.Errorf("native peer node_id = %d, want 0", got)
+	}
+	a.cfg.Mechanism = config.MechanismRepmgr
+	if got := a.repmgrNodeID(); got != 1003 {
+		t.Errorf("repmgr self node_id = %d, want 1003", got)
+	}
+	if got := a.repmgrPeerNodeID("pg-5"); got != 1005 {
+		t.Errorf("repmgr peer node_id = %d, want 1005", got)
+	}
+	// The offset must still be reversible for legacy slot reclaim -- #294 must not delete it.
+	if ord, ok := slotOrdinal("repmgr_slot_1002"); !ok || ord != 2 {
+		t.Errorf("legacy slot reclaim broken: slotOrdinal(repmgr_slot_1002) = (%d,%v)", ord, ok)
+	}
+}
+
+// #288 review: the initdb exec is deliberately not fence-bounded, so the lease can flip during
+// it -- and OnLost blocks on opMu until act() returns. Starting anyway would give the cluster
+// two nodes that each initdb'd their own data with different system_identifiers, which
+// assertSameCluster then refuses to rejoin. Exactly what this branch exists to prevent.
+func TestBootstrapInitdbNativeDoesNotStartAfterLosingTheLease(t *testing.T) {
+	ex := &initdbExec{}
+	pm := &fakePostmaster{}
+	a := newBootstrapTestAgentWithPM(t, ex, config.MechanismNative, pm)
+	a.dcs = &fakeDCS{leader: false} // the lease flipped while initdb ran
+	if err := a.act(context.Background(),
+		reconcile.Decision{Action: reconcile.BootstrapInitdb},
+		reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if len(ex.calls) != 1 {
+		t.Fatalf("want the initdb attempt recorded, got %v", ex.calls)
+	}
+	if pm.started {
+		t.Error("started read-write after losing the lease: a second cluster")
+	}
+	if a.servingRW.Load() {
+		t.Error("armed servingRW after losing the lease")
+	}
+}
+
+// Refusing to start is necessary but not sufficient: the data directory is initialized and no
+// highwater marker exists yet, so this pod would sit HasData=true forever -- never eligible for
+// BootstrapClone again, and rejected by assertSameCluster on every rejoin because the new holder
+// created its own cluster with a different system_identifier. Only a PVC delete would recover
+// it. The directory has never served a client, so it must be discarded (#288 review).
+func TestBootstrapInitdbNativeDiscardsTheDataDirWhenTheLeaseIsLost(t *testing.T) {
+	ex := &initdbExec{}
+	pm := &fakePostmaster{}
+	a := newBootstrapTestAgentWithPM(t, ex, config.MechanismNative, pm)
+	a.dcs = &fakeDCS{leader: false}
+	// Stand in for what a real initdb leaves behind; WipeDataDir keys on PG_VERSION.
+	if err := os.WriteFile(filepath.Join(a.cfg.PGDATA, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.act(context.Background(),
+		reconcile.Decision{Action: reconcile.BootstrapInitdb},
+		reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if process.HasData(a.cfg.PGDATA) {
+		t.Error("the orphaned cluster was left on disk: this pod can now never clone or rejoin")
+	}
+	if pm.started {
+		t.Error("started read-write after losing the lease")
+	}
+}
+
+// #288 review: a clone in flight opens its own replication connection (pg_basebackup -X
+// stream). Counting it inflated the replica count, and taking its application_name at face
+// value hid the pod the slot would have identified.
+func TestTopologyIgnoresTheBaseBackupConnection(t *testing.T) {
+	ex := &slotExec{rows: "pg_basebackup|pg_ha_slot_1|streaming\n"}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.base = "pg"
+	a.topologyTick(context.Background())
+	body := scrapeMetrics(t, a)
+	if !strings.Contains(body, "pg_ha_agent_replicas_streaming 0") {
+		t.Errorf("a pg_basebackup connection counted as a streaming replica:\n%s", body)
+	}
+	if !strings.Contains(body, "pg_ha_agent_replicas_unidentified 0") {
+		t.Errorf("a skipped clone connection was also counted as unidentified:\n%s", body)
+	}
+	// And an application_name that is not a pod of this StatefulSet must fall through to the
+	// slot rather than being trusted.
+	if got := a.resolveReplicaPod(pg.ReplicaRow{AppName: "pg_basebackup", SlotName: "pg_ha_slot_1"}); got != "pg-1" {
+		t.Errorf("resolveReplicaPod trusted a non-pod application_name: got %q, want pg-1", got)
+	}
+	if got := a.resolveReplicaPod(pg.ReplicaRow{AppName: "some-other-sts-3", SlotName: ""}); got != "" {
+		t.Errorf("resolveReplicaPod accepted a pod name from another StatefulSet: %q", got)
+	}
+}
+
+// #288 review: .pgpass must be attempted BEFORE the managed config. It writes to the postgres
+// user's home, so it is the one boot step that can succeed on a fresh native install where
+// PGDATA does not exist yet -- and with the old ordering native's GenerateConfig failed first
+// and returned, so the credential was never written. A standby then cloned fine and sat
+// Running-but-NotReady forever, its walreceiver failing `fe_sendauth: no password supplied`.
+//
+// Asserted through the ERROR IDENTITY: with an absent PGDATA both steps fail in this
+// environment, so whichever one boot reports is the one it ran first.
+func TestBootAttemptsPgpassBeforeConfigGeneration(t *testing.T) {
+	ex := &scriptedExec{}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.Mechanism = config.MechanismNative
+	a.cfg.PGDATA = filepath.Join(t.TempDir(), "absent")
+	a.mech = mechanism.NewNative(a.cfg.PGDATA, "/usr/lib/postgresql/18/bin", "pw", "pg_ha_slot_0", "pg-0")
+	err := a.boot(context.Background())
+	if err == nil {
+		t.Skip("this environment can write the fixed .pgpass path; the ordering assertion needs it to fail")
+	}
+	if !strings.Contains(err.Error(), "pgpass") {
+		t.Errorf("boot reported %q first; .pgpass must be attempted before the managed config, which cannot be written on an absent PGDATA", err)
+	}
+}
+
+// And a GenerateConfig failure on an absent PGDATA must not abort boot: the clone and initdb
+// paths both regenerate the fragment once the directory exists.
+func TestBootToleratesConfigGenerationFailureOnAnAbsentDataDir(t *testing.T) {
+	a := newFollowTestAgent(t, &scriptedExec{})
+	a.cfg.Mechanism = config.MechanismNative
+	a.cfg.PGDATA = filepath.Join(t.TempDir(), "absent")
+	m := mechanism.NewNative(a.cfg.PGDATA, "/usr/lib/postgresql/18/bin", "pw", "pg_ha_slot_0", "pg-0")
+	// GenerateConfig on an absent dir fails; assert the tolerance directly rather than through
+	// boot(), whose fixed .pgpass path is not writable in a sandbox.
+	if err := m.GenerateConfig(context.Background(), mechanism.NodeIdentity{DataDir: a.cfg.PGDATA}, mechanism.ConfigOpts{}); err == nil {
+		t.Skip("GenerateConfig unexpectedly succeeded on an absent data directory")
+	}
+	if process.HasData(a.cfg.PGDATA) {
+		t.Fatal("test setup: the data directory must be absent")
+	}
+}
+
+// #288 review: Follow keeps the SLOT gauges (standbySlotsTick re-publishes them from a
+// standby's own point of view) but must RETRACT the topology ones -- topologyTick reads the
+// PRIMARY's connection list and has no standby equivalent, so a demoted primary would keep
+// exporting its last view for the rest of its process lifetime. That is the max()-across-the-
+// release latching ClearTopology exists to prevent.
+func TestFollowRetractsTopologyButKeepsSlotGauges(t *testing.T) {
+	m := observe.New()
+	m.SetTopology(observe.TopologyStats{Streaming: 2, Expected: 2})
+	m.SetSlots(observe.SlotStats{Total: 3, MaxRetainedWALBytes: 4096})
+	// Mirror act()'s retract switch for the Follow case.
+	m.ClearTopology()
+	rec := httptest.NewRecorder()
+	m.Handler(time.Minute).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, "pg_ha_agent_replicas_expected 0") {
+		t.Errorf("topology gauges survived a Follow, so a demoted primary latches them:\n%s", body)
+	}
+	if !strings.Contains(body, "pg_ha_agent_replication_slot_max_retained_wal_bytes 4096") {
+		t.Errorf("slot gauges were retracted on Follow; a standby pinning WAL must stay visible:\n%s", body)
+	}
+}
+
+// #288 review: an interrupted base backup leaves PG_VERSION behind, so HasData is true and
+// Decide never returns BootstrapClone again -- the pod tries to rejoin a torn directory every
+// tick forever, recoverable only by deleting the PVC. Under repmgr this could not happen:
+// init-repmgr.sh wiped PGDATA before each clone attempt. Moving the clone into the agent means
+// the agent owns that discard.
+func TestDiscardTornCloneRearmsBootstrapClone(t *testing.T) {
+	root := t.TempDir()
+	pgdata := filepath.Join(root, "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// What an interrupted pg_basebackup leaves: PG_VERSION written, nothing else usable.
+	if err := os.WriteFile(filepath.Join(pgdata, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &agent{
+		cfg: &config.Config{PGDATA: pgdata, PodName: "pg-1"},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	// The marker must live OUTSIDE PGDATA: pg_basebackup requires an empty target, so anything
+	// inside would be destroyed by the operation it tracks.
+	if dir := filepath.Dir(a.cloneMarkerPath()); dir == pgdata {
+		t.Fatalf("the clone marker is inside PGDATA (%s); the clone would destroy it", dir)
+	}
+	a.beginClone()
+	if process.HasData(pgdata) != true {
+		t.Fatal("test setup: PG_VERSION should make HasData true")
+	}
+	a.discardTornClone(context.Background())
+	if process.HasData(pgdata) {
+		t.Error("the torn directory survived, so BootstrapClone stays disarmed and the pod is stuck")
+	}
+	if _, err := os.Stat(a.cloneMarkerPath()); !os.IsNotExist(err) {
+		t.Error("the clone marker survived the discard")
+	}
+}
+
+// A completed clone must leave no marker, or the next boot would discard a healthy standby.
+func TestEndCloneClearsTheMarker(t *testing.T) {
+	root := t.TempDir()
+	pgdata := filepath.Join(root, "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pgdata, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &agent{
+		cfg: &config.Config{PGDATA: pgdata, PodName: "pg-1"},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	a.beginClone()
+	a.endClone()
+	a.discardTornClone(context.Background())
+	if !process.HasData(pgdata) {
+		t.Error("a successfully cloned data directory was discarded on the next boot")
+	}
+}
+
+// #288 review: WipeDataDir removes PGDATA's ENTRIES and leaves the directory, so after a
+// torn-clone discard the path exists and is empty -- and native's writeManagedConf then succeeds,
+// leaving one file behind. pg_basebackup takes no flag permitting a populated target and refuses
+// with `directory "..." exists but is not empty` (verified against PostgreSQL 18), so the standby
+// would be wedged for good: the exact failure the clone marker exists to prevent, reached through
+// its own recovery path. boot() must write NOTHING into an empty data directory.
+func TestBootWritesNothingIntoAnEmptyDataDir(t *testing.T) {
+	a := newFollowTestAgent(t, &scriptedExec{})
+	a.cfg.Mechanism = config.MechanismNative
+	pgdata := filepath.Join(t.TempDir(), "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil { // exists and empty: post-wipe shape
+		t.Fatal(err)
+	}
+	a.cfg.PGDATA = pgdata
+	a.mech = mechanism.NewNative(pgdata, "/usr/lib/postgresql/18/bin", "pw", "pg_ha_slot_1", "pg-1")
+	_ = a.boot(context.Background()) // .pgpass may fail in a sandbox; the assertion is below
+	entries, err := os.ReadDir(pgdata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("boot left %v in an empty data directory; pg_basebackup will refuse the target forever", names)
+	}
+}
+
+// #288 review: bootstrap_initdb runs initdb BEFORE creating the repmgr role and database, so an
+// exec failure after that point leaves PGDATA initialized with no role -- and bootstrap_initdb
+// no-ops on a populated directory forever, so the node comes up as a primary the agent can never
+// authenticate against and no standby can clone from. That path needs the same cleanup as the
+// ones after it.
+func TestBootstrapInitdbNativeDiscardsAPartialDataDirOnExecFailure(t *testing.T) {
+	ex := &initdbExec{err: errors.New("exit status 1")}
+	a := newBootstrapTestAgentWithPM(t, ex, config.MechanismNative, &fakePostmaster{})
+	// What a failed bootstrap_initdb leaves: initdb ran, the roles never got created.
+	if err := os.WriteFile(filepath.Join(a.cfg.PGDATA, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.act(context.Background(),
+		reconcile.Decision{Action: reconcile.BootstrapInitdb},
+		reconcile.Observation{}); err == nil {
+		t.Fatal("a failed initdb reported success")
+	}
+	if process.HasData(a.cfg.PGDATA) {
+		t.Error("the partial cluster was left behind: bootstrap_initdb will no-op on it forever")
+	}
+}
+
+// #288 review: the stall signal needs hysteresis. A walreceiver reconnect, or an upstream that is
+// briefly down, looks identical to a permanent divergence for a tick or two -- and escalating on
+// that would re-clone a healthy standby.
+func TestObserveStandbyStallRequiresPersistence(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""} // running standby, no walreceiver row
+	a := newFollowTestAgent(t, ex)
+	// A SETTLED standby: the repoint has completed at least once. Without the latch the
+	// escalation must not fire at all -- see the sibling test below.
+	a.followUpstream = "pg-0"
+	base := reconcile.Observation{Local: reconcile.LocalState{Running: true, InRecovery: true, HasData: true}}
+
+	for i := 1; i < standbyStallTicks; i++ {
+		o := base
+		a.observeStandbyStall(context.Background(), &o)
+		if o.StandbyStalled {
+			t.Fatalf("stalled after only %d tick(s); want at least %d", i, standbyStallTicks)
+		}
+	}
+	o := base
+	a.observeStandbyStall(context.Background(), &o)
+	if !o.StandbyStalled {
+		t.Errorf("not stalled after %d receiver-less ticks", standbyStallTicks)
+	}
+
+	// A single streaming tick must reset it: the standby recovered on its own.
+	ex.walRcv = "pg-0.h|streaming"
+	o = base
+	a.observeStandbyStall(context.Background(), &o)
+	if o.StandbyStalled || a.standbyNoReceiverTicks != 0 {
+		t.Errorf("streaming did not clear the stall latch (stalled=%v ticks=%d)", o.StandbyStalled, a.standbyNoReceiverTicks)
+	}
+}
+
+// Ceasing to be a running standby (promoted, stopped, demoted) must reset the latch, or a
+// later spell as a standby would inherit a stale count and escalate early.
+func TestObserveStandbyStallResetsWhenNotARunningStandby(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""}
+	a := newFollowTestAgent(t, ex)
+	for i := 0; i < standbyStallTicks; i++ {
+		o := reconcile.Observation{Local: reconcile.LocalState{Running: true, InRecovery: true, HasData: true}}
+		a.observeStandbyStall(context.Background(), &o)
+	}
+	// Now a primary.
+	o := reconcile.Observation{Local: reconcile.LocalState{Running: true, InRecovery: false, HasData: true}}
+	a.observeStandbyStall(context.Background(), &o)
+	if a.standbyNoReceiverTicks != 0 || o.StandbyStalled {
+		t.Errorf("latch survived the role change (ticks=%d stalled=%v)", a.standbyNoReceiverTicks, o.StandbyStalled)
+	}
+}
+
+// An unreadable probe is not evidence of a stall: hold the counter rather than advancing it, so a
+// psql blip cannot march a healthy standby toward a re-clone.
+func TestObserveStandbyStallHoldsOnAProbeError(t *testing.T) {
+	a := newFollowTestAgent(t, &scriptedExec{walRcv: ""})
+	for i := 0; i < 3; i++ {
+		o := reconcile.Observation{Local: reconcile.LocalState{Running: true, InRecovery: true, HasData: true}}
+		a.observeStandbyStall(context.Background(), &o)
+	}
+	before := a.standbyNoReceiverTicks
+	// Swap in a prober whose psql fails.
+	a.prober = &pg.Prober{Exec: &failingExec{}, Timeout: time.Second}
+	o := reconcile.Observation{Local: reconcile.LocalState{Running: true, InRecovery: true, HasData: true}}
+	a.observeStandbyStall(context.Background(), &o)
+	if a.standbyNoReceiverTicks != before {
+		t.Errorf("a probe error advanced the stall counter: %d -> %d", before, a.standbyNoReceiverTicks)
+	}
+}
+
+type failingExec struct{}
+
+func (failingExec) Run(context.Context, []string, string, ...string) (string, error) {
+	return "", errors.New("exit status 2")
+}
+
+// #288 review (second pass): following a peer must NOT expire the restore claim.
+//
+// The first attempt dropped it here, which is a race: under native, Follow only writes
+// primary_conninfo + standby.signal and reloads -- no rewind -- so a DIVERGED standby reaches it
+// too. A PITR lands on pgbackrest.restore.podOrdinal, which need not be the lease holder; that
+// pod comes up read-write, takes DemoteFence then Follow, and would drop its claim ~10s after
+// boot, racing the holder's tick which needs that record to decide to release the lease to it.
+// Expiry belongs on ADOPTION (promote + marker advance) instead.
+func TestLatchFollowPreservesTheRestoreClaim(t *testing.T) {
+	dir := t.TempDir()
+	pgdata := filepath.Join(dir, "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a := &agent{
+		cfg: &config.Config{PGDATA: pgdata},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	rec := a.cfg.RestoreStatusPath()
+	if err := os.WriteFile(rec, []byte("exitCode=0\nrestoredAt=2026-08-24T12:00:00Z\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.latchFollow("pg-1")
+	if a.followUpstream != "pg-1" {
+		t.Errorf("follow latch not set: %q", a.followUpstream)
+	}
+	if _, err := os.Stat(rec); err != nil {
+		t.Errorf("the restore claim must SURVIVE a follow, or the holder's release-to-restored-node tick races it: %v", err)
+	}
+}
+
+// dropRestoreRecord is for volumes whose CONTENTS stopped matching the record -- a clone, a
+// rewind, a wipe. Adoption no longer comes through here (it stamps adoptedAt instead, see
+// TestAdoptRestoreKeepsTheRecordAndExpiresTheClaim): expiring the claim by unlinking the file
+// destroyed the provenance GET /v1/status reports, permanently, on the restore that succeeded.
+func TestDropRestoreRecordRemovesTheClaim(t *testing.T) {
+	dir := t.TempDir()
+	pgdata := filepath.Join(dir, "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a := &agent{
+		cfg: &config.Config{PGDATA: pgdata},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	rec := a.cfg.RestoreStatusPath()
+	if err := os.WriteFile(rec, []byte("exitCode=0\nrestoredAt=2026-08-24T12:00:00Z\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.dropRestoreRecord("adopted")
+	if _, err := os.Stat(rec); !os.IsNotExist(err) {
+		t.Errorf("the claim must be gone after adoption (stat err=%v)", err)
+	}
+}
+
+// And it must be silent/harmless on the overwhelmingly common case: an ordinary standby that was
+// never restored has no record to drop.
+func TestLatchFollowWithoutARecordIsHarmless(t *testing.T) {
+	dir := t.TempDir()
+	pgdata := filepath.Join(dir, "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a := &agent{
+		cfg: &config.Config{PGDATA: pgdata},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	a.latchFollow("pg-1")
+	if a.followUpstream != "pg-1" {
+		t.Errorf("follow latch not set: %q", a.followUpstream)
+	}
+}
+
+// #288 review (second pass): a standby that has NOT settled on an upstream must never escalate.
+// A freshly repointed standby is indistinguishable from a diverged one -- Follow writes
+// primary_conninfo and reloads, and the walreceiver can legitimately take tens of seconds to
+// attach (the new primary may not have created the slot yet, sender slots can be exhausted, DNS
+// may be settling). Escalating there stops, rewinds and possibly RE-CLONES a healthy standby.
+func TestObserveStandbyStallDoesNotFireBeforeTheFollowLatchIsSet(t *testing.T) {
+	ex := &scriptedExec{walRcv: ""} // running standby, no walreceiver row
+	a := newFollowTestAgent(t, ex)
+	a.followUpstream = "" // not settled on any upstream yet
+	base := reconcile.Observation{Local: reconcile.LocalState{Running: true, InRecovery: true, HasData: true}}
+
+	for i := 0; i < standbyStallTicks*3; i++ {
+		o := base
+		a.observeStandbyStall(context.Background(), &o)
+		if o.StandbyStalled {
+			t.Fatalf("escalated on tick %d with no follow latch: a repointing standby would be rewound", i+1)
+		}
+	}
+}
+
+// stallExec answers the two queries observeStandbyStall makes: the walreceiver lookup
+// (StreamingUpstream) and the position read (StandbyReceiveLSN). recvLSN is what the position
+// query returns, so a test can hold it still or advance it between ticks.
+type stallExec struct {
+	streaming bool
+	recvLSN   string
+}
+
+func (s *stallExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
+	joined := strings.Join(args, " ")
+	switch {
+	case name == "psql" && strings.Contains(joined, "pg_stat_wal_receiver"):
+		if s.streaming {
+			return "up-0|streaming", nil
+		}
+		return "", nil // no walreceiver row at all -- archive recovery, or genuinely stalled
+	case name == "psql" && strings.Contains(joined, "pg_last_wal_receive_lsn"):
+		return s.recvLSN, nil
+	}
+	return "", nil
+}
+
+func newStallTestAgent(t *testing.T, ex *stallExec) *agent {
+	t.Helper()
+	a := newSlotTestAgent(t, nil, config.MechanismNative)
+	a.prober = &pg.Prober{Exec: ex, Timeout: time.Second}
+	a.followUpstream = "pg-1" // pointed at an upstream, the precondition for a stall
+	return a
+}
+
+// A standby replaying from restore_command (pgbackrest archive-get) has NO pg_stat_wal_receiver
+// row for as long as it works through archived WAL. Counting those ticks as a stall made Decide
+// escalate to RejoinForward -- stopping, rewinding or re-cloning a node that was catching up
+// correctly. Forward progress in the replay position is what tells the two apart (#288 review).
+func TestObserveStandbyStallIgnoresArchiveCatchUp(t *testing.T) {
+	ex := &stallExec{streaming: false, recvLSN: "0/3000000"}
+	a := newStallTestAgent(t, ex)
+	standby := reconcile.LocalState{Running: true, InRecovery: true}
+
+	for i := 0; i < standbyStallTicks*2; i++ {
+		o := reconcile.Observation{Local: standby}
+		a.observeStandbyStall(context.Background(), &o)
+		if o.StandbyStalled {
+			t.Fatalf("tick %d: a standby making replay progress must never be reported stalled", i)
+		}
+		// Each tick replays a little more WAL, exactly as archive recovery does.
+		ex.recvLSN = fmt.Sprintf("0/%d000000", 4+i)
+	}
+}
+
+// The flip side: no walreceiver AND no forward progress is a genuinely wedged standby, which
+// must still earn StandbyStalled after stallTicks so a diverged node can be rejoined.
+func TestObserveStandbyStallStillFiresWhenNothingMoves(t *testing.T) {
+	ex := &stallExec{streaming: false, recvLSN: "0/3000000"}
+	a := newStallTestAgent(t, ex)
+	standby := reconcile.LocalState{Running: true, InRecovery: true}
+
+	var last reconcile.Observation
+	for i := 0; i < standbyStallTicks+1; i++ {
+		last = reconcile.Observation{Local: standby}
+		a.observeStandbyStall(context.Background(), &last)
+	}
+	if !last.StandbyStalled {
+		t.Fatalf("a standby with no walreceiver and no replay progress must be reported stalled after %d ticks", standbyStallTicks)
+	}
+}
+
+// An observed streaming upstream clears both the counter and the progress watermark, so a later
+// stall starts from scratch rather than comparing against a stale position.
+func TestObserveStandbyStallResetsOnStreaming(t *testing.T) {
+	ex := &stallExec{streaming: false, recvLSN: "0/3000000"}
+	a := newStallTestAgent(t, ex)
+	standby := reconcile.LocalState{Running: true, InRecovery: true}
+	for i := 0; i < standbyStallTicks+1; i++ {
+		o := reconcile.Observation{Local: standby}
+		a.observeStandbyStall(context.Background(), &o)
+	}
+	ex.streaming = true
+	o := reconcile.Observation{Local: standby}
+	a.observeStandbyStall(context.Background(), &o)
+	if o.StandbyStalled || a.standbyNoReceiverTicks != 0 || a.standbyLastProgressLSN != (pg.LSN{}) {
+		t.Fatalf("streaming must clear the stall state, got stalled=%v ticks=%d lsn=%v",
+			o.StandbyStalled, a.standbyNoReceiverTicks, a.standbyLastProgressLSN)
+	}
+}
+
+// noopExec answers every command with success and no output: enough for discardFreshDataDir's
+// best-effort `pg_ctl stop` on a directory whose postmaster is long gone.
+type noopExec struct{}
+
+func (noopExec) Run(_ context.Context, _ []string, _ string, _ ...string) (string, error) {
+	return "", nil
+}
+
+func newInitdbMarkerAgent(t *testing.T) *agent {
+	t.Helper()
+	root := t.TempDir()
+	pgdata := filepath.Join(root, "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// What a bootstrap that got as far as initdb leaves behind.
+	if err := os.WriteFile(filepath.Join(pgdata, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return &agent{
+		cfg:    &config.Config{PGDATA: pgdata, PodName: "pg-0"},
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		prober: &pg.Prober{Exec: noopExec{}, Timeout: time.Second},
+	}
+}
+
+// #288 review: bootstrap_initdb starts a postmaster halfway through, which satisfies the chart's
+// startupProbe and arms the liveness probe while act() still holds opMu and is not beating
+// /healthz -- so the kubelet can SIGKILL the container mid-bootstrap. No error is returned for
+// discardFreshDataDir to act on, and the result is unrecoverable by hand: PGDATA is initialized
+// but carries no repmgr role or database, bootstrap_initdb no-ops on it forever, and the pod
+// comes up as a primary the agent cannot authenticate against. Only a next-boot check recovers.
+func TestDiscardTornInitdbWipesAnUnfinishedBootstrap(t *testing.T) {
+	a := newInitdbMarkerAgent(t)
+	if dir := filepath.Dir(a.initdbMarkerPath()); dir == a.cfg.PGDATA {
+		t.Fatalf("the initdb marker is inside PGDATA (%s); initdb requires an empty target", dir)
+	}
+	a.beginInitdb()
+	a.discardTornInitdb(context.Background())
+	if process.HasData(a.cfg.PGDATA) {
+		t.Error("a half-bootstrapped data directory survived, so the pod stays wedged")
+	}
+	if _, err := os.Stat(a.initdbMarkerPath()); !os.IsNotExist(err) {
+		t.Error("the initdb marker survived the discard")
+	}
+}
+
+// The marker alone must NEVER justify wiping: endInitdb only warns when its remove fails, so a
+// stale marker is reachable over a bootstrap that DID finish -- and by the next boot that
+// directory can be a serving primary. bootstrap_initdb's completion sentinel is the evidence.
+func TestDiscardTornInitdbKeepsACompletedBootstrap(t *testing.T) {
+	a := newInitdbMarkerAgent(t)
+	a.beginInitdb()
+	if err := os.WriteFile(a.bootstrapCompletePath(), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.discardTornInitdb(context.Background())
+	if !process.HasData(a.cfg.PGDATA) {
+		t.Error("a completed bootstrap was discarded; that is data loss on a cluster that may already serve")
+	}
+	if _, err := os.Stat(a.initdbMarkerPath()); !os.IsNotExist(err) {
+		t.Error("the stale marker survived, so a later boot would reconsider a healthy directory")
+	}
+}
+
+// No marker means no bootstrap was ever in flight here -- e.g. a standby that cloned. Nothing
+// may be touched, sentinel or not (a clone from a pre-sentinel cluster carries none).
+func TestDiscardTornInitdbLeavesUnmarkedDirectoriesAlone(t *testing.T) {
+	a := newInitdbMarkerAgent(t)
+	a.discardTornInitdb(context.Background())
+	if !process.HasData(a.cfg.PGDATA) {
+		t.Error("a data directory with no in-progress marker was discarded")
+	}
+}
+
+// A successful bootstrap must leave no marker behind, or the next boot inspects a healthy
+// cluster for tornness.
+func TestEndInitdbClearsTheMarker(t *testing.T) {
+	a := newInitdbMarkerAgent(t)
+	a.beginInitdb()
+	a.endInitdb()
+	if _, err := os.Stat(a.initdbMarkerPath()); !os.IsNotExist(err) {
+		t.Fatal("endInitdb left the marker in place")
+	}
+	a.discardTornInitdb(context.Background())
+	if !process.HasData(a.cfg.PGDATA) {
+		t.Error("a bootstrapped data directory was discarded on the next boot")
+	}
+}
+
+// newRestoreClaimAgent wires an agent whose pgbackrest client reads/writes a real record file.
+func newRestoreClaimAgent(t *testing.T, body string) *agent {
+	t.Helper()
+	dir := t.TempDir()
+	pgdata := filepath.Join(dir, "pgdata")
+	if err := os.MkdirAll(pgdata, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{PGDATA: pgdata}
+	if body != "" {
+		if err := os.WriteFile(cfg.RestoreStatusPath(), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return &agent{
+		cfg:  cfg,
+		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		pgbr: pgbackrest.Client{StatusPath: cfg.RestoreStatusPath()},
+	}
+}
+
+// #288 review, round 4: the documented restore procedure is scale to 0, restore into the target
+// ordinal's PVC, scale up -- and pgbackrest runs --target-action=promote, so that pod comes back
+// holding primary-state data and takes StartLocal, then StayPrimary. It never passes through
+// Promote, so a stamp only on the Promote branch left the claim in force FOREVER on the most
+// common restore path -- and a permanent claim vetoes every peer in moreAdvancedPeer, so this
+// node would later promote (or be handed the lease) over a peer holding more WAL.
+func TestAdoptRestoreKeepsTheRecordAndExpiresTheClaim(t *testing.T) {
+	a := newRestoreClaimAgent(t, "exitCode=0\nrestoredAt=2026-08-24T12:00:00Z\nbackupSet=20260824-110000F\n")
+	if got := a.localRestoredAt(); got != "2026-08-24T12:00:00Z" {
+		t.Fatalf("test setup: the claim should stand before adoption, got %q", got)
+	}
+	a.adoptRestoreIfServing(reconcile.Observation{Local: reconcile.LocalState{RestoredAt: a.localRestoredAt()}})
+
+	if got := a.localRestoredAt(); got != "" {
+		t.Errorf("the election claim survived adoption (%q); a permanent claim outranks peers with more WAL", got)
+	}
+	rec, err := a.pgbr.LastRestore()
+	if err != nil {
+		t.Fatalf("LastRestore: %v", err)
+	}
+	if !rec.Present || rec.BackupSet != "20260824-110000F" || rec.AdoptedAt == "" {
+		t.Errorf("provenance must survive adoption, stamped: %+v", rec)
+	}
+}
+
+// No claim, no write: an ordinary primary tick on a never-restored volume must not touch the
+// record path at all (this runs on every StayPrimary tick).
+func TestAdoptRestoreIsANoopWithoutAClaim(t *testing.T) {
+	a := newRestoreClaimAgent(t, "")
+	a.adoptRestoreIfServing(reconcile.Observation{Local: reconcile.LocalState{}})
+	if _, err := os.Stat(a.cfg.RestoreStatusPath()); !os.IsNotExist(err) {
+		t.Errorf("a record was created for a volume that was never restored (stat err=%v)", err)
 	}
 }

@@ -340,6 +340,13 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        Originally audit-only (pg.auditSharedPreloadLibraries); generalized because the
        audit-gated merge meant an operator-set value with audit OFF silently dropped
        repmgr and broke HA failover. */ -}}
+{{- /* #288: `repmgr` is prepended only under the repmgr MECHANISM, not merely when
+       repmgr.enabled. Under `native` there is no repmgr extension on the cluster, so preloading
+       repmgr.so is dead weight -- and because these fragments load via conf.d's include_dir they
+       would OVERRIDE the entrypoint's native gate, putting the library back on a cluster that
+       has nothing to use it. Benign only while the package is still in the image: it makes every
+       native cluster unstartable ("could not access file \"repmgr\"") the moment #290/#294 drop
+       it. Removing the line from an EXISTING data directory stays #293's half. */ -}}
 {{- define "pg.sharedPreloadLibraries" -}}
 {{- $libs := list -}}
 {{- $user := "" -}}
@@ -350,7 +357,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- $t := trim $l -}}
   {{- if and $t (not (has $t $libs)) -}}{{- $libs = append $libs $t -}}{{- end -}}
 {{- end -}}
-{{- if and .Values.repmgr.enabled (not (has "repmgr" $libs)) -}}{{- $libs = prepend $libs "repmgr" -}}{{- end -}}
+{{- if and .Values.repmgr.enabled (ne ((.Values.repmgr.agent).mechanism | default "repmgr") "native") (not (has "repmgr" $libs)) -}}{{- $libs = prepend $libs "repmgr" -}}{{- end -}}
 {{- if and .Values.postgresql.audit.enabled (not (has "pgaudit" $libs)) -}}{{- $libs = append $libs "pgaudit" -}}{{- end -}}
 {{- join "," $libs -}}
 {{- end -}}

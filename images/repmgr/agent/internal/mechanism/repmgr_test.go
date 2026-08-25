@@ -161,7 +161,9 @@ func TestCLICommands(t *testing.T) {
 			name string
 			run  func(r *Repmgr) error
 		}{
-			{"follow", func(r *Repmgr) error { return r.Follow(ctx, Conn{Host: upConn.Host, Port: upConn.Port, User: upConn.User, DB: upConn.DB, NodeID: 1001}) }},
+			{"follow", func(r *Repmgr) error {
+				return r.Follow(ctx, Conn{Host: upConn.Host, Port: upConn.Port, User: upConn.User, DB: upConn.DB, NodeID: 1001})
+			}},
 			{"register", func(r *Repmgr) error { return r.RegisterStandby(ctx, upConn, 1001) }},
 		} {
 			fr := &fakeRunner{}

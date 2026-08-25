@@ -624,3 +624,134 @@ func TestSetSynchronizedStandbySlotsRefusesUnexpectedSlotName(t *testing.T) {
 		t.Fatalf("expected no SQL at all, got %v", ex.calls)
 	}
 }
+
+// #288: the row shapes are the two verified against real PostgreSQL 18 with both kinds of
+// standby streaming to one primary at once -- a native standby publishing its pod name, and a
+// pre-#288 standby still dialling with libpq's default application_name whose identity has to
+// come from the ordinal-named slot instead.
+func TestReplicationTopologyParsesBothIdentitySources(t *testing.T) {
+	ex := &slotExec{out: "pg-1|pg_ha_slot_1|streaming\nwalreceiver|pg_ha_slot_2|streaming"}
+	rows, err := (&Prober{Exec: ex}).ReplicationTopology(context.Background(), ConnInfo{})
+	if err != nil {
+		t.Fatalf("ReplicationTopology: %v", err)
+	}
+	want := []ReplicaRow{
+		{AppName: "pg-1", SlotName: "pg_ha_slot_1", State: "streaming"},
+		{AppName: "walreceiver", SlotName: "pg_ha_slot_2", State: "streaming"},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("got %d rows, want %d: %+v", len(rows), len(want), rows)
+	}
+	for i := range want {
+		if rows[i] != want[i] {
+			t.Errorf("row %d: got %+v, want %+v", i, rows[i], want[i])
+		}
+	}
+	if !rows[0].Streaming() {
+		t.Error("a streaming row does not report Streaming()")
+	}
+}
+
+// A standby that exists but is still catching up must be distinguishable from one that is
+// caught up: it has a row, so it is present, but it cannot serve or be safely promoted yet.
+func TestReplicationTopologyDistinguishesCatchupFromStreaming(t *testing.T) {
+	ex := &slotExec{out: "pg-1|pg_ha_slot_1|catchup"}
+	rows, err := (&Prober{Exec: ex}).ReplicationTopology(context.Background(), ConnInfo{})
+	if err != nil {
+		t.Fatalf("ReplicationTopology: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Streaming() {
+		t.Errorf("a catchup replica reported as streaming: %+v", rows)
+	}
+}
+
+// A slotless stream is still a real replica -- it just cannot be identified by slot, so the
+// empty SlotName must survive rather than dropping the row.
+func TestReplicationTopologyKeepsSlotlessRows(t *testing.T) {
+	ex := &slotExec{out: "pg-1||streaming"}
+	rows, err := (&Prober{Exec: ex}).ReplicationTopology(context.Background(), ConnInfo{})
+	if err != nil {
+		t.Fatalf("ReplicationTopology: %v", err)
+	}
+	if len(rows) != 1 || rows[0].SlotName != "" || rows[0].AppName != "pg-1" {
+		t.Errorf("slotless row mishandled: %+v", rows)
+	}
+}
+
+// No standbys is a legitimate answer (a lone primary), not an error -- unlike the repmgr.nodes
+// reads this replaces, where an empty result meant "the table is missing" and had to be an
+// error to keep the #297 gate from firing.
+func TestReplicationTopologyEmptyIsNoReplicasNotAnError(t *testing.T) {
+	rows, err := (&Prober{Exec: &slotExec{out: ""}}).ReplicationTopology(context.Background(), ConnInfo{})
+	if err != nil || len(rows) != 0 {
+		t.Errorf("empty output: got rows=%+v err=%v, want none/nil", rows, err)
+	}
+}
+
+// Too FEW fields is still an error -- that is a genuinely unparseable row.
+func TestReplicationTopologyRejectsTruncatedRows(t *testing.T) {
+	if _, err := (&Prober{Exec: &slotExec{out: "pg-1|pg_ha_slot_1"}}).ReplicationTopology(context.Background(), ConnInfo{}); err == nil {
+		t.Fatal("want an error for a 2-field row")
+	}
+}
+
+// EXTRA fields belong to application_name, which is the first column and the only
+// operator-settable one (#288 review). pg_stat_replication is cluster-wide and this chart does
+// not control it: one unrelated client whose application_name contains a '|' would otherwise fail
+// the whole read and blind all three gauges on every tick. slot_name is [a-z0-9_] and state is a
+// fixed enum, so the last two fields are unambiguous.
+func TestReplicationTopologyToleratesSeparatorsInApplicationName(t *testing.T) {
+	rows, err := (&Prober{Exec: &slotExec{out: "some|third|party|tool|pg_ha_slot_1|streaming"}}).ReplicationTopology(context.Background(), ConnInfo{})
+	if err != nil {
+		t.Fatalf("a '|' in application_name blinded the whole topology view: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1: %+v", len(rows), rows)
+	}
+	want := ReplicaRow{AppName: "some|third|party|tool", SlotName: "pg_ha_slot_1", State: "streaming"}
+	if rows[0] != want {
+		t.Errorf("got %+v, want %+v", rows[0], want)
+	}
+}
+
+// The query must read the primary's live connection list and recover identity from the slot,
+// and must NOT fall back to repmgr.nodes -- retiring that table is the point of #288.
+func TestReplicationTopologyQueryShape(t *testing.T) {
+	ex := &slotExec{}
+	if _, err := (&Prober{Exec: ex}).ReplicationTopology(context.Background(), ConnInfo{}); err != nil {
+		t.Fatalf("ReplicationTopology: %v", err)
+	}
+	sql := ex.sqls[0]
+	for _, needle := range []string{"pg_stat_replication", "pg_replication_slots", "active_pid", "application_name"} {
+		if !strings.Contains(sql, needle) {
+			t.Errorf("query is missing %q: %s", needle, sql)
+		}
+	}
+	if strings.Contains(sql, "repmgr.nodes") {
+		t.Errorf("topology still reads repmgr.nodes, which #288 exists to retire: %s", sql)
+	}
+	// #288 review: pg_stat_replication has one row per WAL SENDER, logical decoding senders
+	// included. A subscription or Debezium would otherwise contribute rows that resolve to no
+	// pod -- inflating the streaming count and pinning `unidentified` above zero forever, which
+	// defeats the whole purpose of that gauge.
+	if !strings.Contains(sql, "s.slot_type = 'physical'") {
+		t.Errorf("the slot join is not restricted to physical slots: %s", sql)
+	}
+	if !strings.Contains(sql, "l.slot_type = 'logical'") {
+		t.Errorf("logical senders are not excluded, so they poison the topology view: %s", sql)
+	}
+}
+
+// A logical decoding sender must not appear as a replica at all.
+func TestReplicationTopologyExcludesLogicalSenders(t *testing.T) {
+	// The query filters them server-side, so the parser only ever sees physical rows; this
+	// pins the contract that an unresolvable row is COUNTED as unidentified rather than
+	// silently dropped, which is what makes the gauge meaningful.
+	rows, err := (&Prober{Exec: &slotExec{out: "some_subscription||streaming"}}).ReplicationTopology(context.Background(), ConnInfo{})
+	if err != nil {
+		t.Fatalf("ReplicationTopology: %v", err)
+	}
+	if len(rows) != 1 || rows[0].SlotName != "" {
+		t.Errorf("unexpected parse: %+v", rows)
+	}
+}

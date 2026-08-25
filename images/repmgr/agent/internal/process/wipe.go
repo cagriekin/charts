@@ -110,3 +110,14 @@ func processAlive(pid int) bool {
 	}
 	return errors.Is(err, syscall.EPERM)
 }
+
+// ControlFileMissing reports whether PGDATA has no global/pg_control at all (#288).
+//
+// pg_basebackup writes pg_control LAST, precisely so an interrupted copy is detectable, so its
+// absence is positive evidence that a base backup was cut short. Distinguished from
+// "pg_controldata failed" on purpose: that can mean the tool could not run, or that the data
+// directory belongs to a different PostgreSQL major, neither of which justifies destroying it.
+func ControlFileMissing(pgdata string) bool {
+	_, err := os.Stat(filepath.Join(pgdata, "global", "pg_control"))
+	return os.IsNotExist(err)
+}

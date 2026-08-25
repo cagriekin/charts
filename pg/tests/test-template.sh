@@ -3841,6 +3841,47 @@ casc_standalone=$(helm template test-pg "${CHART_DIR}" \
 assert_not_contains "#29: standalone never gets CASCADE_REPLICATION (agent-only)" "${casc_standalone}" "CASCADE_REPLICATION"
 
 # ======================================================================
+# #288: shared_preload_libraries must not carry repmgr under the native mechanism. These
+# fragments load via conf.d's include_dir, so they would OVERRIDE the entrypoint's native gate
+# and put repmgr.so back on a cluster that has no repmgr extension -- making every native
+# cluster unstartable the moment #290/#294 drop the package from the image.
+spl_native=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.agent.mechanism=native \
+  --set postgresql.majorVersion=18 \
+  --set postgresql.audit.enabled=true 2>&1)
+assert_contains "#288: native preloads pgaudit without repmgr" "${spl_native}" "shared_preload_libraries = 'pgaudit'"
+assert_not_contains "#288: native does not preload repmgr" "${spl_native}" "shared_preload_libraries = 'repmgr"
+# The default mechanism must be untouched.
+spl_repmgr=$(helm template test-pg "${CHART_DIR}" --set postgresql.audit.enabled=true 2>&1)
+assert_contains "#288: repmgr mode still preloads repmgr" "${spl_repmgr}" "shared_preload_libraries = 'repmgr,pgaudit'"
+
+# #288: MECHANISM must reach the INIT container, not just the postgresql one. Without it the
+# init container's shell gate can never fire, so native standbys keep polling repmgr.nodes for
+# a registration that never comes and sit in Init:CrashLoopBackOff forever. Occurrence count,
+# not presence: getting it onto one container only is exactly the bug.
+mech_native_res=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.agent.mechanism=native \
+  --set postgresql.majorVersion=18 \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_eq "#288: MECHANISM reaches both the init and postgresql containers" "2" \
+  "$(printf '%s\n' "${mech_native_res}" | grep -c 'name: MECHANISM')"
+# Specifically on repmgr-init, so a future refactor cannot satisfy the count with two copies
+# on the same container.
+# End anchor must render AFTER the start: fix-permissions is init container 1 and repmgr-init is
+# container 4, so `/repmgr-init/,/fix-permissions/` ran to EOF and swallowed the postgresql
+# container's MECHANISM too -- the assertion could not fail, which is the exact bug its own
+# comment claimed to guard against. `- name: postgresql` is the next container after the init
+# list, so it is a real terminator.
+mech_init_block=$(printf '%s\n' "${mech_native_res}" | sed -n '/name: repmgr-init/,/^        - name: postgresql$/p')
+assert_contains "#288: repmgr-init carries MECHANISM" "${mech_init_block}" "name: MECHANISM"
+# And prove the range is actually bounded: exactly one MECHANISM inside it, not both.
+assert_eq "#288: the repmgr-init range is bounded (one MECHANISM, not the whole render)" "1" \
+  "$(printf '%s\n' "${mech_init_block}" | grep -c 'name: MECHANISM')"
+# The default (repmgr) render must not gain the variable at all -- that is what keeps every
+# existing release byte-identical.
+mech_default_res=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#288: the repmgr-mode render carries no MECHANISM" "${mech_default_res}" "name: MECHANISM"
+
 # #287: experimental native HA mechanism selector. repmgr by default
 # (byte-stable); the agent gets MECHANISM only when set to a non-default
 # value, and only in agent mode (standalone has no agent to read it).
@@ -4098,7 +4139,7 @@ assert_contains "#276 restore.sh: atomic write via a temp file" "${ctl_restore_s
 # The record is a cross-language contract: restore.sh (bash) writes it and the agent's
 # internal/pgbackrest (Go) parses it. Assert every key the parser reads, so renaming one
 # on either side is caught here rather than silently reporting an empty lastRestore.
-for key in startedAt finishedAt stanza targetType target backupSet exitCode requestedBy clusterState checkpoint; do
+for key in startedAt finishedAt restoredAt stanza targetType target backupSet exitCode requestedBy clusterState checkpoint; do
   assert_contains "#276 restore.sh: records ${key}" "${ctl_restore_sh}" "${key}="
 done
 # The trap is installed AFTER the postmaster.pid interlock, so a refused attempt cannot
@@ -4111,6 +4152,47 @@ assert_contains "#276 restore.sh: reads the previous record on failure" "${ctl_r
 for key in attemptedTargetType attemptedTarget attemptedBackupSet; do
   assert_contains "#276 restore.sh: records ${key} on failure" "${ctl_restore_sh}" "${key}="
 done
+# #288: restoredAt is the volume's provenance and must OUTLIVE a failed attempt -- the agent
+# ranks it in a failover election, so if a mistyped retry (which copies nothing) reset it, a
+# stale peer could win the lease and promote pre-restore data. exitCode still marks the attempt.
+# #288: the postStart hook must RETRY when no primary is reachable, not break out. pg_isready
+# has no -h, so a socket-only postmaster (exactly what bootstrap_initdb runs while creating the
+# cluster) satisfies it while no pod is reachable over TCP -- breaking there skipped the user's
+# additionalCommands silently, with no error and no retry, on every fresh install.
+ps_hook=$(helm template test-pg "${CHART_DIR}" --set repmgr.enabled=true \
+  --set 'postgresql.lifecycle.postStart.additionalCommands=psql -c "SELECT 1"' 2>&1)
+# Scope the needle to the no-primary branch itself (#288 review). Grepping the whole render for
+# a bare "continue" passed on any chart containing that word anywhere -- including the comment
+# this change added -- so it could not fail. Take the `if [ -n "$PRIMARY_HOST" ]` block up to
+# its `fi` and assert the else arm retries rather than breaking out of the wait loop.
+# End the range at the outer wait loop's `done`, not at the first `fi`: the else arm now nests
+# its own bounded-give-up `if`, and stopping at that `fi` truncated the region before `continue`.
+ps_branch=$(printf '%s\n' "${ps_hook}" | sed -n '/if \[ -n "\$PRIMARY_HOST" \]; then/,/^ *done$/p')
+assert_contains "#288 postStart: the no-primary branch is rendered at all" "${ps_branch}" "PRIMARY_HOST"
+# Anchored as whole statements: assert_contains greps a BRE, and the branch's own comment says
+# "instead of breaking", which a bare `break` needle matches.
+assert_contains "#288 postStart: waits instead of skipping when no primary is reachable" \
+  "${ps_branch}" "^ *continue$"
+# The wait is bounded SEPARATELY from the outer pg_isready loop (#288 review, round 3): postStart
+# holds the container out of Started -- so out of every Service -- until it returns, and spending
+# the full 90s there delayed readiness on every cold boot, on pgvector's default path.
+assert_contains "#288 postStart: the primary wait has its own, smaller budget" \
+  "${ps_branch}" "primary_waits"
+assert_contains "#288 postStart: that budget gives up well before the outer loop" \
+  "${ps_branch}" "primary_waits\" -ge 20"
+# ...and the budget is only meaningful if each probe is bounded: an unresponsive-but-routable
+# peer otherwise blocks psql for the kernel TCP timeout, making 20 iterations minutes long.
+assert_contains "#288 postStart: the primary probe has a connect timeout" \
+  "${ps_hook}" "PGCONNECT_TIMEOUT=3 psql -h" 
+# And nothing initialises the counter on a chart that renders no additionalCommands at all.
+noac=$(helm template test-pg "${CHART_DIR}" --set repmgr.enabled=true 2>&1)
+assert_not_contains "#288 postStart: no discovery counter when additionalCommands is empty" \
+  "${noac}" "primary_waits"
+
+assert_contains "#288 restore.sh: carries restoredAt across a failed attempt" \
+  "${ctl_restore_sh}" 'restored="$(prev_field restoredAt)"'
+assert_contains "#288 restore.sh: a clean restore stamps restoredAt with its own finish time" \
+  "${ctl_restore_sh}" 'restored="${finished}"'
 
 # --- #279: the job-create grant and its admission-policy bound ---
 #
