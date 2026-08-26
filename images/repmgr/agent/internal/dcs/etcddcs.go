@@ -221,13 +221,19 @@ func (e *EtcdDCS) releaseSession(sess *concurrency.Session) {
 }
 
 // observe updates the last-seen leader identity from the election until ctx ends.
+//
+// NOTE: this cannot clear the cache when the leader key is deleted, so Leader() can
+// keep naming a node that is already gone (#326). Election.Observe never reports a
+// deletion: both of its send sites construct exactly one KV, and on a DELETE event it
+// sets keyDeleted, re-Gets, finds nothing, and blocks in a PUT-only watch without
+// sending. Clearing needs a different source -- a WithPrefix watch on cfg.Prefix for
+// DELETE events, or polling el.Leader(ctx) and treating ErrElectionNoLeader as
+// "clear" -- which is a separate change with its own etcd-backed test.
 func (e *EtcdDCS) observe(ctx context.Context, el *concurrency.Election) {
 	for resp := range el.Observe(ctx) {
-		kvs := make([][]byte, 0, len(resp.Kvs))
-		for _, kv := range resp.Kvs {
-			kvs = append(kvs, kv.Value)
+		if len(resp.Kvs) > 0 {
+			e.leader.Store(string(resp.Kvs[0].Value))
 		}
-		e.applyObserved(kvs)
 	}
 }
 
@@ -303,16 +309,4 @@ func campaignGuarded(ctx context.Context, sessDone <-chan struct{}, campaign fun
 	default:
 		return true
 	}
-}
-
-// applyObserved updates the cached leader from an election observation. An
-// observation carrying no keys means the election key is gone, so the cache MUST be
-// cleared: retaining the last-seen identity made a standby report a primary that had
-// been dead for two hours and keep following it instead of failing over (#326).
-func (e *EtcdDCS) applyObserved(kvs [][]byte) {
-	if len(kvs) > 0 {
-		e.leader.Store(string(kvs[0]))
-		return
-	}
-	e.leader.Store("")
 }

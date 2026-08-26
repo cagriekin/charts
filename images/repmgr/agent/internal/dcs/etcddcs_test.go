@@ -124,16 +124,3 @@ func TestCampaignGuardedGrantsLeadershipOnLiveSession(t *testing.T) {
 		t.Fatal("a campaign won on a live session must grant leadership")
 	}
 }
-
-// observe() must clear the cached leader when the election key is deleted, so
-// Leader() reports unknown rather than a node that is long dead (#326).
-func TestLeaderCacheClearedWhenKeyDeleted(t *testing.T) {
-	var e EtcdDCS
-	e.leader.Store("service-medusa-pg-1")
-
-	e.applyObserved(nil) // no kvs: the leader key is gone
-
-	if got := e.Leader(); got != "" {
-		t.Fatalf("stale leader retained after key deletion: got %q, want %q", got, "")
-	}
-}
