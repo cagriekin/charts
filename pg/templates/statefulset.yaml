@@ -14,6 +14,7 @@
 {{- include "pg.validateWalLevel" . }}
 {{- include "pg.validateSyncReplicationSlotsMajor" . }}
 {{- include "pg.validateSyncReplicationSlotsWalLevel" . }}
+{{- include "pg.validateSyncReplicationSlotsMechanism" . }}
 {{- include "pg.validateRemovedRepmgrdValues" . }}
 {{- /* #289: cascading replication makes a STANDBY an upstream for other standbys, but the
        agent's native-mode slot reconcile only ever runs on the lease-holding primary and
@@ -705,9 +706,9 @@ spec:
                    create one. #308's synchronized_standby_slots reconciliation is the
                    first thing that depends on that slot existing reliably from the
                    start, so align the initial clone with the agent's own default.
-                   repmgrd mode is deliberately untouched (retention there is
-                   wal_keep_size-based, not slot-based -- introducing slots there is an
-                   unrelated, unreviewed behavior change). */}}
+                   Written unconditionally since 2.0.0: repmgrd (whose retention was
+                   wal_keep_size-based, not slot-based) went with #286, so the agent is the
+                   only failover path and the only reader of this. */}}
             - name: USE_REPLICATION_SLOTS
               value: "1"
 {{- end }}

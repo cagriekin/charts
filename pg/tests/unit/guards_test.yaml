@@ -873,3 +873,28 @@ tests:
           mountPath: /shared
     asserts:
       - failedTemplate: {}
+
+  # --- #308 x #288 (rebase review): syncReplicationSlots is repmgr-mechanism only ---
+  # The synchronized_standby_slots reconcile resolves standbys from repmgr.nodes and names
+  # slots repmgr_slot_<node_id>; a native cluster has neither, so it would never run while
+  # every standby still enabled sync_replication_slots. Refuse instead of degrading quietly.
+  - it: syncReplicationSlots with mechanism native is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.agent.syncReplicationSlots: true
+      postgresql.walLevel: logical
+      repmgr.agent.mechanism: native
+    asserts:
+      - failedTemplate:
+          errorPattern: "not supported with repmgr.agent.mechanism: native"
+
+  - it: syncReplicationSlots under the default mechanism still renders
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.agent.syncReplicationSlots: true
+      postgresql.walLevel: logical
+    asserts:
+      - hasDocuments:
+          count: 1

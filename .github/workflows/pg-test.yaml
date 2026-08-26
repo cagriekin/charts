@@ -216,7 +216,8 @@ jobs:
       matrix:
         pg_major: ["18", "17"]
         # #288/#295: a real mechanism axis, tiered with `exclude` rather than fanned out
-        # blindly. A naive 2x would be 80 legs; this is 56.
+        # blindly. 21 suites x 2 majors x 2 mechanisms would be 84 legs; 13 exclusions x 2
+        # majors bring it to 58.
         #
         # It must be a REAL axis, not an `include:` addition. `mechanism` would not be an
         # original matrix key, so `{suite: agent, mechanism: native}` would ADD the key to the
@@ -269,6 +270,10 @@ jobs:
           # child's slot would have no owner. This is the one honest coverage gap; making a
           # standby-parent a legitimate slot owner is tracked separately.
           - { suite: cascading-replication, mechanism: native }
+          # RENDER-REJECTED with native (#308/#288): the synchronized_standby_slots reconcile
+          # reads repmgr.nodes and names slots repmgr_slot_<node_id>, neither of which exists
+          # under native, so pg.validateSyncReplicationSlotsMechanism refuses the combination.
+          - { suite: sync-replication-slots, mechanism: native }
           # pgBackRest mechanics are mechanism-independent; pgbackrest-restore-ha carries the
           # native leg because it also re-clones a standby.
           - { suite: backup-restore, mechanism: native }

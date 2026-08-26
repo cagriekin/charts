@@ -58,11 +58,29 @@ wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 3 60
 wait_for_deployment_ready "${NAMESPACE}" "${FULLNAME_TO}-pgpool" 300
 wait_for_deployment_ready "${NAMESPACE}" "${FULLNAME_TO}-postgres-exporter" 300
 
-# Test: all 3 pg pods running
+# Test: all 3 pg pods running AND READY.
+#
+# Readiness, not just phase: agent-mode readiness is replication-aware (#186), so a standby
+# that is Running but not streaming reads ready=false. Asserting only .status.phase let a
+# permanently-broken standby pass this suite -- pod-2 sat Running/ready=false, unable to
+# replicate, and the suite reported success (#297).
 for i in 0 1 2; do
   phase=$(kubectl get pod -n "${NAMESPACE}" "${FULLNAME_TO}-${i}" -o jsonpath='{.status.phase}')
   assert_eq "after upgrade: pod-${i} is Running" "Running" "${phase}"
+  ready=$(kubectl get pod -n "${NAMESPACE}" "${FULLNAME_TO}-${i}" -o jsonpath='{.status.containerStatuses[0].ready}')
+  assert_eq "after upgrade: pod-${i} is Ready (replication-aware, #186)" "true" "${ready}"
 done
+
+# Every node must agree on the topology: a node whose repmgr.nodes copy predates its own
+# registration cannot `repmgr standby follow` and never streams (#297). Assert each node
+# sees a row for itself. Repmgr-mechanism only -- a native cluster has no repmgr.nodes at
+# all (#288), and this suite runs the default mechanism.
+if [ "$(chart_mechanism 2>/dev/null || echo repmgr)" = "repmgr" ]; then
+  for i in 0 1 2; do
+    own=$(pg_exec "${NAMESPACE}" "${FULLNAME_TO}-${i}" "SELECT count(*) FROM repmgr.nodes WHERE node_id = $((1000 + i))" repmgr repmgr 2>/dev/null | xargs || echo "")
+    assert_eq "after upgrade: pod-${i} has its own repmgr.nodes row (#297)" "1" "${own}"
+  done
+fi
 
 # Test: pgpool running
 pgpool_pod=$(kubectl get pods -n "${NAMESPACE}" -l "app.kubernetes.io/component=pgpool" --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')

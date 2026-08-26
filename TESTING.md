@@ -79,8 +79,8 @@ git checkout -- pg/values.yaml            # restore
 Suites branch on `chart_mechanism()` (`pg/tests/helpers.sh`), reading the tree rather than an
 env var a local run would forget to export.
 
-**Tiering.** 20 suites x 2 majors x 2 mechanisms would be 80 legs; the matrix is **56**. A suite
-never *loses* its current mechanism -- repmgr is still the chart default, so all 40 pre-existing
+**Tiering.** 21 suites x 2 majors x 2 mechanisms would be 84 legs; the matrix is **58**. A suite
+never *loses* its current mechanism -- repmgr is still the chart default, so all 42 pre-existing
 legs stay byte-identical and native is added only where the mechanism's own verbs are exercised.
 
 | Both mechanisms (8) | Why |
@@ -94,7 +94,7 @@ legs stay byte-identical and native is added only where the mechanism's own verb
 | `pgbackrest-restore-ha` | archive/restore on a fresh native install, plus standby re-clone |
 | `databases-roles` | `replicaCount: 0` -- cheapest proof the agent-owned initdb built the app DB/role |
 
-| Default (repmgr) only (12) | Why |
+| Default (repmgr) only (13) | Why |
 |---|---|
 | `minimal` | `repmgr.enabled: false` -- no agent, so the axis is meaningless |
 | `agent-control`, `agent-control-restore` | the control API is orthogonal to the mechanism |
@@ -103,6 +103,7 @@ legs stay byte-identical and native is added only where the mechanism's own verb
 | `agent-etcd-tls` | etcd TLS is orthogonal; `agent-etcd` covers the DCS axis |
 | `tls` | PostgreSQL TLS is orthogonal to how replication is driven |
 | `cascading-replication` | **render-rejected** with native (#289: slot ownership is primary-only) -- the one honest gap |
+| `sync-replication-slots` | **render-rejected** with native (#308/#288: the reconcile reads `repmgr.nodes` and names slots `repmgr_slot_<node_id>`, neither of which exists there) |
 | `backup-restore`, `backup-concurrent`, `pgbackrest-restore`, `pgbackrest-bootstrap` | pgBackRest mechanics are mechanism-independent |
 
 The `mechanism` axis is a **real** matrix key, not an `include:` addition: `mechanism` would not

@@ -125,3 +125,23 @@ tests:
       repmgr.agent.mechanism: patroni
     asserts:
       - failedTemplate: {}
+
+  # --- #308 x #288 (rebase review): syncReplicationSlots is repmgr-mechanism only ---
+  # The synchronized_standby_slots reconcile resolves standbys from repmgr.nodes and names
+  # slots repmgr_slot_<node_id>; a native cluster has neither, so it would never run while
+  # every standby still enabled sync_replication_slots. Refuse instead of degrading quietly.
+  - it: syncReplicationSlots with mechanism native is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.agent.syncReplicationSlots: true
+      postgresql.walLevel: logical
+      repmgr.agent.mechanism: native
+    asserts:
+      - failedTemplate:
+          errorPattern: "not supported with repmgr.agent.mechanism: native"
+
+  # The positive (renders fine under the default mechanism) case lives in pg's suite and in
+  # pg/tests/test-template.sh: rendering pgvector's statefulset ALONE cannot resolve its
+  # postgresql-configmap include, which is a helm-unittest single-template limitation rather
+  # than anything chart-specific.

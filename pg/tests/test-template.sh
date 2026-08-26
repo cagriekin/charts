@@ -2647,6 +2647,26 @@ helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.agent.syncReplicationSlots=true >/dev/null 2>&1 || sync_slots_replica_rc=$?
 assert_gt "#308: syncReplicationSlots without walLevel=logical rejected at render time" "${sync_slots_replica_rc}" "0"
 
+# #308 x #288 (rebase review): syncReplicationSlots + mechanism: native must be REFUSED, not
+# silently inert. The reconcile resolves standbys from repmgr.nodes and names slots
+# repmgr_slot_<node_id>; native has neither, so it would never run while every standby still
+# enabled sync_replication_slots -- a logical slot's decode position could then advance past
+# the standby that needs it, exactly what #308 exists to prevent.
+sync_slots_native_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
+  --set repmgr.agent.mechanism=native >/dev/null 2>&1 || sync_slots_native_rc=$?
+assert_gt "#308/#288: syncReplicationSlots with mechanism native rejected at render time" "${sync_slots_native_rc}" "0"
+sync_slots_native_msg=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
+  --set repmgr.agent.mechanism=native 2>&1 || true)
+assert_contains "#308/#288: the native guard names both keys and the fix" "${sync_slots_native_msg}" "repmgr.agent.mechanism: native"
+# ...and the same combination under the default mechanism still renders.
+sync_slots_repmgr_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical >/dev/null 2>&1 || sync_slots_repmgr_rc=$?
+assert_eq "#308: syncReplicationSlots under the repmgr mechanism still renders" "0" "${sync_slots_repmgr_rc}"
+
 # The repmgrd-mode variants of these checks went with the mode itself (#286): failoverMode is
 # a REMOVED key on 2.0.0 and is rejected at render time, which guards_test.yaml pins.
 
