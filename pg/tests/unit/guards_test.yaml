@@ -874,31 +874,6 @@ tests:
     asserts:
       - failedTemplate: {}
 
-  # --- #308 x #288 (rebase review): syncReplicationSlots is repmgr-mechanism only ---
-  # The synchronized_standby_slots reconcile resolves standbys from repmgr.nodes and names
-  # slots repmgr_slot_<node_id>; a native cluster has neither, so it would never run while
-  # every standby still enabled sync_replication_slots. Refuse instead of degrading quietly.
-  - it: syncReplicationSlots with mechanism native is rejected
-    templates:
-      - templates/statefulset.yaml
-    set:
-      repmgr.agent.syncReplicationSlots: true
-      postgresql.walLevel: logical
-      repmgr.agent.mechanism: native
-    asserts:
-      - failedTemplate:
-          errorPattern: "not supported with repmgr.agent.mechanism: native"
-
-  - it: syncReplicationSlots under the default mechanism still renders
-    templates:
-      - templates/statefulset.yaml
-    set:
-      repmgr.agent.syncReplicationSlots: true
-      postgresql.walLevel: logical
-    asserts:
-      - hasDocuments:
-          count: 1
-
   # --- #293: repmgr must never be preloaded under the native mechanism ---
   # shared_preload_libraries is persisted INSIDE the data directory by the image entrypoint
   # and cloned to every standby, so once the repmgr-free image ships (#290) a cluster still
@@ -916,21 +891,25 @@ tests:
       - failedTemplate:
           errorPattern: 'includes "repmgr" \(got "repmgr,pgsodium"\)'
 
-  - it: an operator-preloaded repmgr under the default mechanism still renders
+  # The "legitimate under the repmgr mechanism" counterpart went with the mechanism (#294):
+  # there is no configuration in which the chart preloads repmgr, so asking for it is always
+  # the #290 hazard the guard exists for.
+  - it: an operator list without repmgr still renders
     templates:
       - templates/statefulset.yaml
     set:
-      postgresql.configuration.shared_preload_libraries: repmgr,pgsodium
-    asserts:
-      - hasDocuments:
-          count: 1
-
-  - it: native without repmgr in the operator list still renders
-    templates:
-      - templates/statefulset.yaml
-    set:
-      repmgr.agent.mechanism: native
       postgresql.configuration.shared_preload_libraries: pgsodium
     asserts:
       - hasDocuments:
           count: 1
+
+  # #294: the removed mechanism is refused by name, with a message that says it was REMOVED
+  # rather than mistyped -- values.schema.json still accepts the value so this speaks first.
+  - it: mechanism repmgr is rejected with a message naming the migration
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.agent.mechanism: repmgr
+    asserts:
+      - failedTemplate:
+          errorPattern: 'was removed in chart 2\.0\.0 \(#294\)'

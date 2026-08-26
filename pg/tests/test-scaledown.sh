@@ -126,6 +126,27 @@ while [[ ${elapsed} -lt 180 ]]; do
 done
 assert_eq "the departed ordinal 2 left the topology after scale-down (#139)" "1" "${gone}"
 
+# Wait for the SURVIVORS to re-converge before asserting on them (#294, live-run flake).
+# The loop above is not sufficient: under native, "ordinal 2 left the topology" is satisfied
+# on its very first poll, because the departed pod's pg_stat_replication row vanishes the
+# instant the pod dies -- it says nothing about whether a survivor is streaming yet. And this
+# scale-down is also a FAILOVER: the lease race consistently puts the primary on the trimmed
+# ordinal, so the same `helm upgrade` rolls both survivors in Parallel and the lease flaps
+# (observed: pod-0 -> pod-1 -> pod-0, converging after ~30s). Sampling inside that window made
+# the two assertions below fail on a cluster that then converged to exactly the asserted state.
+echo "  Waiting for the surviving standby to stream from the new primary (up to 180s)..."
+converged=0; elapsed=0
+while [[ ${elapsed} -lt 180 ]]; do
+  P=$(find_primary 1)
+  if [[ -n "${P}" ]]; then
+    st=$(pg_exec "${NAMESPACE}" "${P}" \
+      "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" repmgr repmgr 2>/dev/null | xargs || echo "")
+    [[ "${st}" == "1" ]] && { converged=1; break; }
+  fi
+  sleep 10; elapsed=$((elapsed + 10))
+done
+assert_eq "the surviving standby re-streams after the scale-down" "1" "${converged}"
+
 # The live nodes must NOT be unregistered (the discriminator is the ordinal, not
 # reachability -- a momentarily-down live node must never be treated as a ghost).
 P=$(find_primary 1)
@@ -201,11 +222,13 @@ fi
 # No physical slot may be left pinning WAL for a pod that no longer exists. Under repmgr mode
 # repmgr names them repmgr_slot_<node_id>, so the scaled-away node 1002's slot is the one to
 # look for; the native equivalent is asserted above (#288 made it possible to run at all).
-if [ "$(chart_mechanism)" != "native" ]; then
-  ghost_slot=$(pg_exec "${NAMESPACE}" "${P}" \
-    "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'repmgr_slot_1002'" repmgr repmgr 2>/dev/null | xargs || echo "")
-  assert_eq "#289: no replication slot left pinning WAL for the scaled-away node 1002" "0" "${ghost_slot}"
-fi
+# A LEGACY repmgr_slot_* left by a cluster that predates #294 must also be reclaimed -- that is
+# the one reader nodeIDBase still has (slotOrdinal's legacy branch). Asserted unconditionally now:
+# gating it on chart_mechanism made it dead, and the assertion is meaningful under native
+# precisely because such a slot can only arrive from a repmgr-created cluster.
+ghost_slot=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'repmgr_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
+assert_eq "#289/#294: no legacy repmgr_slot_* left pinning WAL after the scale-down" "0" "${ghost_slot}"
 
 # Cleanup.
 helm uninstall "${RELEASE}" -n "${NAMESPACE}" 2>/dev/null || true

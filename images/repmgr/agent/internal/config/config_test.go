@@ -87,15 +87,40 @@ func TestLoadRejectsBadSplitBrainAction(t *testing.T) {
 // #287: MECHANISM is an enum with a default. Absent must mean repmgr so an existing release
 // and an older env-less image keep their behaviour; an unrecognised value must fail at boot
 // rather than fall through to whichever branch the factory defaults to.
-func TestMechanismDefaultsToRepmgr(t *testing.T) {
+func TestMechanismDefaultsToNative(t *testing.T) {
 	m := fullEnv()
 	delete(m, "MECHANISM")
 	c, err := Load(getter(m))
 	if err != nil {
 		t.Fatalf("MECHANISM must be optional: %v", err)
 	}
-	if c.Mechanism != MechanismRepmgr {
-		t.Errorf("absent MECHANISM must default to %q, got %q", MechanismRepmgr, c.Mechanism)
+	if c.Mechanism != MechanismNative {
+		t.Errorf("absent MECHANISM must default to %q, got %q", MechanismNative, c.Mechanism)
+	}
+}
+
+func TestMechanismRepmgrIsRejectedByName(t *testing.T) {
+	// Rejected with a message that says the mechanism was REMOVED, not that the value was
+	// mistyped (#294): a pod carrying it is running a chart that still asks for repmgr, and
+	// conflating the two sends the operator looking for a spelling mistake.
+	m := fullEnv()
+	m["MECHANISM"] = MechanismRepmgr
+	_, err := Load(getter(m))
+	if err == nil {
+		t.Fatal("MECHANISM=repmgr must be rejected")
+	}
+	for _, want := range []string{"removed in chart 2.0.0", "#294", "#292", MechanismNative} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("message does not mention %q: %v", want, err)
+		}
+	}
+}
+
+func TestMechanismUnrecognisedValueIsRejected(t *testing.T) {
+	m := fullEnv()
+	m["MECHANISM"] = "patroni"
+	if _, err := Load(getter(m)); err == nil {
+		t.Fatal("an unrecognised MECHANISM must be rejected")
 	}
 }
 

@@ -92,11 +92,16 @@ postgresql:
   # WAL replay can take longer still, both of which can exceed the ~130s
   # liveness budget. failureThreshold x periodSeconds is the total startup
   # budget (600s here); keep the steady-state livenessProbe window tight.
+  # Bounds a standby's FIRST clone: since #288 the agent clones in this container, not in a
+  # probe-free init container, so periodSeconds x failureThreshold caps the pg_basebackup.
+  # #294 raised it from 600s to 1800s -- native is now the only mechanism, so the old "raise it
+  # for native installs" caveat would otherwise have shipped as everyone's default. Size it
+  # against your own base-backup time for very large databases. See the pg chart values.
   startupProbe:
     enabled: true
     periodSeconds: 10
     timeoutSeconds: 5
-    failureThreshold: 60
+    failureThreshold: 180
 
   affinity: {}
   # Hard topology spread for the postgresql pods (default none; the affinity above
@@ -376,15 +381,17 @@ repmgr:
     # postgresql.walLevel: logical. See the pg chart README for detail.
     syncReplicationSlots: false
 
-    # EXPERIMENTAL -- do not set in production yet (#287). Which replication mechanics the
-    # agent drives: `repmgr` (default, the repmgr CLI) or `native` (pg_ctl promote,
-    # pg_basebackup, pg_rewind, primary_conninfo directly). Policy is identical either way.
-    # `native` now runs a real multi-node cluster (#288): topology comes from
-    # pg_stat_replication, and the lease holder initdbs while the rest clone via
-    # pg_basebackup. Still EXPERIMENTAL -- cascadingReplication is render-rejected with it,
-    # and an existing repmgr cluster cannot be flipped in place yet (#292).
-    # It does own its replication slots (#289). See the pg chart README.
-    mechanism: repmgr
+    # Which replication mechanics the agent drives (#287). `native` is the only value since
+    # #294 removed the repmgr mechanism and its CLI dependency; setting `repmgr` is rejected
+    # at render time with a message naming the migration. Policy does not live here -- the
+    # Lease, the timeline/LSN election, fencing and routing are unchanged.
+    #
+    # Native drives PostgreSQL directly (pg_ctl promote, pg_basebackup, pg_rewind,
+    # primary_conninfo + standby.signal), takes topology from pg_stat_replication, owns
+    # physical slot lifecycle (#289), and supports syncReplicationSlots and
+    # cascadingReplication (#294). Remaining gap: an existing repmgr cluster cannot be
+    # flipped in place yet (#292). See the pg chart README.
+    mechanism: native
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
     # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane
     # outage no longer self-demotes the primary (only an etcd quorum loss does);

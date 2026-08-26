@@ -18,13 +18,14 @@ import (
 // PG_MAJOR build arg existed, which was always PostgreSQL 18.
 const defaultPGMajor = "18"
 
-// The HA mechanism the agent drives (#287). Optional -- absent means MechanismRepmgr, so an
-// existing release and an older env-less image both keep their current behaviour.
+// The HA mechanism the agent drives (#287). Optional -- absent means MechanismNative, which
+// is the only implementation since #294 deleted mechanism.Repmgr.
 //
-// MechanismNative is EXPERIMENTAL and not usable on its own: it makes the flag selectable,
-// but topology still comes from repmgr.nodes (#288) and nobody owns replication slots (#289).
-// Enabling it before those land yields a standby with no upstream to choose and a primary
-// that can recycle WAL a standby still needs. #294 promotes it to supported, then default.
+// MechanismRepmgr is kept as a named constant purely so an explicit `MECHANISM=repmgr` can be
+// REJECTED with a message that names the migration, rather than falling through the
+// unrecognised-value path and reading as a typo. A pod carrying that value is running a
+// release whose chart still sets it, and the operator needs to know the mechanism was removed
+// rather than mistyped.
 const (
 	MechanismRepmgr = "repmgr"
 	MechanismNative = "native"
@@ -62,10 +63,10 @@ type Config struct {
 	DCSBackend       string // "kubernetes" | "etcd"
 	SplitBrainAction string // "log" | "fence"
 
-	// Mechanism selects the replication mechanics the agent drives: MechanismRepmgr (the
-	// repmgr CLI) or MechanismNative (pg_ctl / pg_basebackup / pg_rewind directly). Policy
-	// -- the Lease, the timeline/LSN election, fencing, routing -- is identical either way;
-	// only the mechanics differ, which is the whole point of the Mechanism seam.
+	// Mechanism selects the replication mechanics the agent drives. MechanismNative
+	// (pg_ctl / pg_basebackup / pg_rewind directly) is the only implementation since #294;
+	// the field and the Mechanism interface behind it survive because that seam is what made
+	// the repmgr-to-native migration survivable one method at a time.
 	Mechanism string
 
 	// pg_hba assembly (agent mode owns pg_hba: hardened, SCRAM-only, no 0.0.0.0/0 md5).
@@ -299,15 +300,27 @@ func Load(get func(string) string) (*Config, error) {
 		l.invalid = append(l.invalid, fmt.Sprintf("PG_MAJOR=%q (want digits only, e.g. 17 or 18)", c.PGMajor))
 	}
 
-	// HA mechanism (#287). Optional -- absent means repmgr, so nothing changes for an
+	// HA mechanism (#287, #294). Optional -- absent means native, the only implementation for an
 	// existing release. Validated as an enum here rather than discovered at the first
 	// promote: an unrecognised value would otherwise silently fall through to whichever
 	// branch the factory happens to default to.
 	c.Mechanism = strings.TrimSpace(get("MECHANISM"))
-	if c.Mechanism == "" {
-		c.Mechanism = MechanismRepmgr
-	} else if c.Mechanism != MechanismRepmgr && c.Mechanism != MechanismNative {
-		l.invalid = append(l.invalid, fmt.Sprintf("MECHANISM=%q (want %s|%s)", c.Mechanism, MechanismRepmgr, MechanismNative))
+	switch c.Mechanism {
+	case "":
+		// Absent means native now (#294). An older env-less image is not a concern in the other
+		// direction: this binary only ships in an image whose chart sets the value or omits it.
+		c.Mechanism = MechanismNative
+	case MechanismNative:
+	case MechanismRepmgr:
+		// Named explicitly so the message can say what happened. Falling through to the
+		// unrecognised-value branch would read as a typo, when in fact the mechanism was
+		// removed and this pod is running a chart that still asks for it.
+		l.invalid = append(l.invalid, fmt.Sprintf(
+			"MECHANISM=%q was removed in chart 2.0.0 (#294): the repmgr mechanism and its CLI are gone, and %s is now the only one. "+
+				"Unset repmgr.agent.mechanism (or set it to %q) -- an existing repmgr cluster needs the in-place migration first (#292)",
+			MechanismRepmgr, MechanismNative, MechanismNative))
+	default:
+		l.invalid = append(l.invalid, fmt.Sprintf("MECHANISM=%q (want %s)", c.Mechanism, MechanismNative))
 	}
 
 	// Cross-field validation that the lease timings are internally consistent

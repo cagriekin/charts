@@ -116,7 +116,7 @@ spec:
             severity: warning
           annotations:
             summary: "A replication slot has no consumer ({{ include "pg.fullname" . }})"
-            description: "At least one physical replication slot has been reserving WAL with no active consumer for 1h. Slots that have reserved nothing yet (a slot minted ahead of its standby) are not counted, so this really is accumulation. Expected briefly while a standby restarts or re-clones; sustained means a standby is down or the slot is orphaned. Under repmgr.agent.mechanism: native the agent reclaims slots it owns automatically, so a persistent one is an operator-created slot or a standby needing attention; under the default repmgr mechanism the agent reclaims nothing and every sustained breach needs a human."
+            description: "At least one physical replication slot has been reserving WAL with no active consumer for 1h. Slots that have reserved nothing yet (a slot minted ahead of its standby) are not counted, so this really is accumulation. Expected briefly while a standby restarts or re-clones; sustained means a standby is down or the slot is orphaned. The agent reclaims slots it owns automatically, so a persistent one is an operator-created slot, or a standby that needs attention."
         - alert: PGHAAgentPausedTooLong
           expr: max(pg_ha_agent_is_paused{ {{ $m }} }) == 1
           for: 1h

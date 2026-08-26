@@ -14,27 +14,23 @@ import (
 // proceed; the caller falls back to ReclonePreserving (the #175 data-safe path).
 var ErrRewindDiverged = errors.New("mechanism: rewind diverged, reclone required")
 
-// Conn is how to reach a peer PostgreSQL node for clone/follow/rejoin. Password is
-// passed via PGPASSWORD, never on the command line or in logged argv.
+// Conn is how to reach a peer PostgreSQL node for clone/follow/rejoin: the address parts a
+// mechanism needs to write primary_conninfo or point a pg_basebackup at an upstream.
 //
-// NodeID is the peer's repmgr node_id, carried alongside the address so Follow takes one
-// parameter that either mechanism can read the parts it needs from: repmgr addresses an
-// upstream by node_id (it resolves the conninfo from repmgr.nodes), while a native
-// mechanism must write an actual host into primary_conninfo and has no use for the id.
-// Zero when the caller has no id to supply -- only repmgr requires it.
+// The credential is NOT here. It lives on the mechanism itself (Native.Password) and travels
+// via PGPASSWORD, never on a command line or in logged argv. Conn carried a Password field
+// until #294 that nothing ever set or read; it went with the NodeID field, which existed only
+// because repmgr addressed an upstream by node_id out of repmgr.nodes.
 type Conn struct {
-	NodeID         int
 	Host           string
 	Port           int
 	User           string
 	DB             string
-	Password       string
 	ConnectTimeout time.Duration
 }
 
 // NodeIdentity describes the local node for config generation.
 type NodeIdentity struct {
-	NodeID       int    // ordinal+1000, stable across restarts
 	NodeName     string // pod hostname
 	FQDN         string // <pod>.<headless> — the conninfo host
 	DataDir      string // PGDATA
@@ -50,38 +46,21 @@ type ConfigOpts struct {
 	UseReplicationSlots bool
 }
 
-// ErrLocalRecordMissing is returned by Follow when the mechanism cannot act because
-// THIS node has no record of itself in the metadata it reads.
-//
-// With repmgr that is "unable to retrieve record for local node N", and it identifies a
-// freshly-cloned standby precisely: its repmgr.nodes copy is a snapshot of the primary
-// taken BEFORE it registered, so it contains no row for itself. It cannot obtain the row
-// either -- receiving it requires replicating, and repointing replication is what needs
-// the row. A normal clone never hits this because clone -R writes primary_conninfo and it
-// streams without a follow; only a clone whose upstream changed underneath it must
-// repoint, and then it is stuck permanently (#297).
-//
-// This is deliberately distinct from a MISSING UPSTREAM record ("unable to find record for
-// intended upstream node"), which is the ordinary post-failover case where the target has
-// simply not promoted and registered YET, and where waiting is correct. Conflating the two
-// is not a theoretical concern: escalating on the upstream variant demotes a healthy node
-// and re-clones it over a transient condition.
-var ErrLocalRecordMissing = errors.New("mechanism: local node has no record in its own metadata copy")
-
 // Mechanism performs the Postgres replication mechanics. Each method is its own
 // scoped operation with its own wrapped error (no monolithic catch). The caller
 // (reconcile) has already decided, via the Lease and the timeline/LSN rules, that
 // the action is legitimate.
 type Mechanism interface {
-	// GenerateConfig writes the mechanism config (repmgr.conf) idempotently.
+	// GenerateConfig writes the mechanism config idempotently (native: the agent-owned
+	// fragment inside PGDATA).
 	GenerateConfig(ctx context.Context, n NodeIdentity, o ConfigOpts) error
 	// Promote turns the local standby into a read-write primary on a new timeline.
 	Promote(ctx context.Context) error
 	// Follow points the local standby at upstream and restarts replication. The whole Conn
-	// is passed, not just a node id: repmgr uses upstream.NodeID, while a native mechanism
-	// needs upstream.Host to write primary_conninfo (deriving the pod FQDN inside the
-	// mechanism would push the StatefulSet naming convention into a layer whose entire
-	// purpose is to know nothing about Kubernetes).
+	// is passed rather than a bare name: the mechanism needs upstream.Host to write
+	// primary_conninfo, and deriving the pod FQDN inside the mechanism would push the
+	// StatefulSet naming convention into a layer whose entire purpose is to know nothing
+	// about Kubernetes.
 	Follow(ctx context.Context, upstream Conn) error
 	// Clone builds the local PGDATA fresh from source (caller guarantees PGDATA is
 	// empty or moved aside).
@@ -93,16 +72,4 @@ type Mechanism interface {
 	// ReclonePreserving renames PGDATA aside to .diverged.<ts>, clones from source,
 	// and drops the backup only on success (#175 — never rm -rf before clone succeeds).
 	ReclonePreserving(ctx context.Context, source Conn) error
-	// RegisterPrimary / RegisterStandby reconcile repmgr.nodes toward the
-	// Lease-derived role. RegisterStandby takes the upstream's connection for the same
-	// reason Follow does: it must insert this node's record into the CURRENT primary's
-	// database, and the local metadata's idea of "the primary" can be stale (it names a
-	// node that is now a read-only standby, so the register fails "unable to connect to
-	// the primary database").
-	RegisterPrimary(ctx context.Context) error
-	RegisterStandby(ctx context.Context, upstream Conn, upstreamNodeID int) error
-	// Unregister removes a node's repmgr.nodes record (repmgr standby unregister
-	// --node-id), to clean up the ghost rows a replicaCount scale-down leaves
-	// behind (#139). Run on the primary for nodes the StatefulSet no longer hosts.
-	Unregister(ctx context.Context, nodeID int) error
 }

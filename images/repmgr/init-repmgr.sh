@@ -58,7 +58,15 @@ echo "Node: ${HOSTNAME}, Ordinal: ${ORDINAL}, Type: ${NODE_TYPE}, ID: ${NODE_ID}
 # the shared emptyDir at all. That is load-bearing for more than tidiness: entrypoint.sh's
 # primary_safety_guard is gated on that file existing, and its rejoin path shells out to
 # `repmgr node rejoin` before the agent starts.
-if [ "${MECHANISM:-repmgr}" = "native" ]; then
+# MECHANISM defaults to native, matching internal/config's own default (#294). It defaulted to
+# repmgr while that mechanism existed; leaving it there once the Go agent flipped would make the
+# two halves of the SAME container disagree, and this repo's release is deliberately two-step --
+# publish the image, then bump repmgr.image.tag. In that window a chart that omits MECHANISM
+# (any release before #294 emitted it only at a non-default value) would pair a native agent
+# with a repmgr shell: init-repmgr.sh would enter a repmgr.nodes registration poll nothing can
+# satisfy (~240s, then exit 1 -> Init:CrashLoopBackOff on every standby) and bootstrap_initdb
+# would bake the repmgr preload GUC into the primary's config and clone it everywhere.
+if [ "${MECHANISM:-native}" = "native" ]; then
     echo "MECHANISM=native: skipping repmgr.conf, the repmgr.nodes registration wait, and the repmgr clone."
     echo "The agent clones an empty data directory itself (pg_basebackup via BootstrapClone, #288/#289)."
     exit 0

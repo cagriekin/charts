@@ -206,7 +206,7 @@ jobs:
   # that suite's combination for both majors.
   # ---------------------------------------------------------------------------
   suite:
-    name: ${{ matrix.suite }} (pg${{ matrix.pg_major }}, ${{ matrix.mechanism }})
+    name: ${{ matrix.suite }} (pg${{ matrix.pg_major }})
     needs: [changes, build]
     if: needs.changes.outputs.pg == 'true'
     runs-on: ubuntu-latest
@@ -215,20 +215,11 @@ jobs:
       fail-fast: false
       matrix:
         pg_major: ["18", "17"]
-        # #288/#295: a real mechanism axis, tiered with `exclude` rather than fanned out
-        # blindly. 21 suites x 2 majors x 2 mechanisms would be 84 legs; 13 exclusions x 2
-        # majors bring it to 58.
-        #
-        # It must be a REAL axis, not an `include:` addition. `mechanism` would not be an
-        # original matrix key, so `{suite: agent, mechanism: native}` would ADD the key to the
-        # existing agent combinations instead of creating new ones -- silently converting the
-        # repmgr legs to native rather than adding to them.
-        #
-        # Tiering rule: a suite never LOSES its current mechanism. repmgr is still the default,
-        # so all 40 existing legs stay byte-identical and native is added only where the
-        # mechanism's own verbs are under test. Each exclusion carries its reason below; the
-        # same table is in TESTING.md.
-        mechanism: [repmgr, native]
+        # #294: the mechanism axis is GONE. It existed for the repmgr-to-native transition
+        # (#288/#295) and carried 11 exclusions to keep the fan-out honest; native is now the
+        # only mechanism, so 21 suites x 2 majors = 42 legs with no exclusions at all. Anything
+        # that reads as mechanism-conditional below is a leftover and should be deleted, not
+        # re-gated.
         suite:
           - minimal
           - agent
@@ -251,35 +242,6 @@ jobs:
           - pgbackrest-bootstrap
           - databases-roles
           - scaledown
-        exclude:
-          # repmgr.enabled: false -- no agent at all, so the mechanism is meaningless.
-          - { suite: minimal, mechanism: native }
-          # The control API is orthogonal to how replication is driven.
-          - { suite: agent-control, mechanism: native }
-          - { suite: agent-control-restore, mechanism: native }
-          # Broad smoke; the mechanism's verbs are covered by `agent` and `agent-rolling`.
-          - { suite: full, mechanism: native }
-          # Upgrades from an older PUBLISHED image, which is repmgr by construction. The
-          # native analogue is the in-place migration suite in #292.
-          - { suite: upgrade, mechanism: native }
-          # etcd TLS is orthogonal to the mechanism; `agent-etcd` covers the DCS axis.
-          - { suite: agent-etcd-tls, mechanism: native }
-          # PostgreSQL TLS is orthogonal to how replication is driven.
-          - { suite: tls, mechanism: native }
-          # RENDER-REJECTED with native (#289): slot ownership is primary-only, so a cascading
-          # child's slot would have no owner. This is the one honest coverage gap; making a
-          # standby-parent a legitimate slot owner is tracked separately.
-          - { suite: cascading-replication, mechanism: native }
-          # RENDER-REJECTED with native (#308/#288): the synchronized_standby_slots reconcile
-          # reads repmgr.nodes and names slots repmgr_slot_<node_id>, neither of which exists
-          # under native, so pg.validateSyncReplicationSlotsMechanism refuses the combination.
-          - { suite: sync-replication-slots, mechanism: native }
-          # pgBackRest mechanics are mechanism-independent; pgbackrest-restore-ha carries the
-          # native leg because it also re-clones a standby.
-          - { suite: backup-restore, mechanism: native }
-          - { suite: backup-concurrent, mechanism: native }
-          - { suite: pgbackrest-restore, mechanism: native }
-          - { suite: pgbackrest-bootstrap, mechanism: native }
         include:
           - { suite: agent, coldboot: "1" }
     steps:
@@ -332,16 +294,6 @@ jobs:
       - name: Target PostgreSQL ${{ matrix.pg_major }}
         run: bash pg/tests/set-pg-major.sh "${{ matrix.pg_major }}"
 
-      - name: Retarget the working tree at this mechanism
-        # #288: rewrites pg/values.yaml's mechanism and VERIFIES by rendering that MECHANISM
-        # reached both the postgresql and repmgr-init containers -- a leg where only the main
-        # container got it would still crash-loop its standbys while looking configured.
-        run: bash pg/tests/set-mechanism.sh "${{ matrix.mechanism }}"
-
-      # Run the suite; on a transient failure, drop the suite's namespaces for a
-      # clean slate and retry once. The suites are idempotent (each uninstalls +
-      # recreates its release), so a single retry absorbs the timing/transient
-      # flakes a contended runner produces without re-running the whole job.
       - name: Run ${{ matrix.suite }} suite (pg${{ matrix.pg_major }})
         env:
           AGENT_COLDBOOT: ${{ matrix.coldboot }}

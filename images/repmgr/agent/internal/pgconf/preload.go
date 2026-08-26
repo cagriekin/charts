@@ -265,3 +265,47 @@ func splitPreloadValue(s string) (value, trailing string) {
 	}
 	return "", ""
 }
+
+// recoveryGUCs are the settings that decide where a standby streams from. The agent owns them
+// in its own managed fragment; PostgreSQL reads postgresql.auto.conf AFTER every include, so a
+// copy there silently outranks the agent's and cannot be fixed by rewriting the fragment.
+var recoveryGUCs = []string{"primary_conninfo", "primary_slot_name"}
+
+// ForeignRecoveryConfig reports which recovery GUCs postgresql.auto.conf sets, if any.
+//
+// Under the native mechanism nothing should: the agent writes them into its managed fragment,
+// and the only ALTER SYSTEM the agent itself issues is synchronized_standby_slots (#308). A
+// value here therefore comes from outside -- either repmgr, which wrote primary_conninfo and
+// primary_slot_name = repmgr_slot_<node_id> into every standby's auto.conf, or an operator's
+// manual ALTER SYSTEM.
+//
+// Either way the effect is the same and it is silent (#294 review): Follow writes the fragment,
+// the reload reports success, and the walreceiver keeps using auto.conf's upstream and its slot
+// -- which under a repmgr-to-native upgrade no longer exists. streamingFromTarget then never
+// matches, so Follow re-runs every tick, and once the stall window elapses the node is rewound
+// and possibly re-cloned. That is why this is a startup refusal rather than a warning.
+//
+// A missing file is not an error: a fresh install has no auto.conf until the first ALTER SYSTEM.
+func ForeignRecoveryConfig(confPath string) ([]string, error) {
+	data, err := os.ReadFile(confPath)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", confPath, err)
+	}
+	var found []string
+	for _, guc := range recoveryGUCs {
+		re := regexp.MustCompile(`(?i)^[ \t]*` + guc + `(?:[ \t]*=|[ \t]+)`)
+		for _, ln := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(strings.TrimLeft(ln, " \t"), "#") {
+				continue
+			}
+			if re.MatchString(ln) {
+				found = append(found, guc)
+				break
+			}
+		}
+	}
+	return found, nil
+}

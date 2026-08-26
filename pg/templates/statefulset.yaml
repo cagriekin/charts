@@ -14,20 +14,8 @@
 {{- include "pg.validateWalLevel" . }}
 {{- include "pg.validateSyncReplicationSlotsMajor" . }}
 {{- include "pg.validateSyncReplicationSlotsWalLevel" . }}
-{{- include "pg.validateSyncReplicationSlotsMechanism" . }}
 {{- include "pg.validateNativePreloadRepmgr" . }}
 {{- include "pg.validateRemovedRepmgrdValues" . }}
-{{- /* #289: cascading replication makes a STANDBY an upstream for other standbys, but the
-       agent's native-mode slot reconcile only ever runs on the lease-holding primary and
-       only ever touches slots on its own connection -- so a cascading child's
-       primary_slot_name would name a slot that exists on the primary, not on the
-       standby-parent it actually streams from, and its walreceiver would fail outright with
-       "replication slot does not exist". Rejected at render time rather than shipping that
-       (loud, but only discoverable at runtime) combination. Both flags are independently
-       opt-in, so this forbids nothing that worked before. */}}
-{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.cascadingReplication (eq (.Values.repmgr.agent.mechanism | default "repmgr") "native") }}
-{{- fail "repmgr.agent.cascadingReplication is not supported with repmgr.agent.mechanism: native (#289): native mode's replication-slot ownership runs only on the primary, so a cascading standby's child would reference a slot that does not exist on its actual upstream and its walreceiver would refuse to start. Use mechanism: repmgr for cascading replication, or disable cascadingReplication" }}
-{{- end }}
 {{- if and (not .Values.repmgr.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
 {{- fail "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr" }}
 {{- end }}
@@ -653,20 +641,21 @@ spec:
           env:
 {{- with (include "pg.pgMajorEnv" .) }}{{ . | nindent 12 }}{{- end }}
             {{- /* #288: the init container needs MECHANISM too, not just the postgresql
-                   container. Its whole job -- write repmgr.conf, wait for a primary to appear
-                   in repmgr.nodes, clone with `repmgr standby clone` -- is repmgr-specific,
-                   and the middle step is what made native unusable with replicas: nothing
-                   ever registers under native, so the poll timed out and every standby sat in
-                   Init:CrashLoopBackOff forever. init-repmgr.sh now exits early on native and
-                   lets the agent clone (BootstrapClone -> pg_basebackup), but it can only do
-                   that if the value actually reaches it. Emitted only when non-default, same
-                   as on the postgresql container, so the repmgr-mode render does not move. */}}
-            {{- with (.Values.repmgr.agent).mechanism }}
-            {{- if ne . "repmgr" }}
+                   container. init-repmgr.sh's original job -- write repmgr.conf, wait for a
+                   primary to appear in repmgr.nodes, clone with `repmgr standby clone` -- was
+                   repmgr-specific, and the middle step is what made native unusable with
+                   replicas: nothing ever registers under native, so the poll timed out and
+                   every standby sat in Init:CrashLoopBackOff forever. It exits early on native
+                   and lets the agent clone (BootstrapClone -> pg_basebackup), but only if the
+                   value reaches it.
+                   Emitted UNCONDITIONALLY since #294. It used to be omitted at the default,
+                   which was repmgr and is what an env-less agent assumes; the default is now
+                   native, so relying on the absent-value default would silently run the OLD
+                   mechanism on any image built before #294 -- exactly the two-step
+                   image-then-chart release this repo does. Being explicit costs one env var
+                   and removes that trap. */}}
             - name: MECHANISM
-              value: {{ . | quote }}
-            {{- end }}
-            {{- end }}
+              value: {{ (.Values.repmgr.agent).mechanism | default "native" | quote }}
             - name: PGDATA
               value: /var/lib/postgresql/data/pgdata
             - name: POSTGRES_USER
@@ -905,19 +894,14 @@ spec:
             - name: SYNC_REPLICATION_SLOTS
               value: "true"
 {{- end }}
-            {{- /* Which replication mechanics the agent drives (#287). Emitted only when
-                   set to a non-default value: the agent defaults to repmgr when MECHANISM is
-                   absent, so a default render stays byte-identical to 1.x and an older image
-                   that predates the flag keeps working. EXPERIMENTAL, but usable with replicas
-                   since #288 (topology from pg_stat_replication, agent-owned bootstrap) and
-                   #289 (slot ownership); `cascadingReplication` is still render-rejected with
-                   it, and #292 owns migrating an existing repmgr cluster in place. */}}
-            {{- with (.Values.repmgr.agent).mechanism }}
-            {{- if ne . "repmgr" }}
+            {{- /* Which replication mechanics the agent drives (#287). Always emitted since
+                   #294 -- see the init container above for why: an image built before #294
+                   defaults to repmgr when MECHANISM is absent, and the chart default is now
+                   native, so omitting it at the default would run the removed mechanism on a
+                   not-yet-updated image. `native` is the only accepted value; `repmgr` is
+                   rejected at render time by pg.validateRemovedRepmgrdValues. */}}
             - name: MECHANISM
-              value: {{ . | quote }}
-            {{- end }}
-            {{- end }}
+              value: {{ (.Values.repmgr.agent).mechanism | default "native" | quote }}
             - name: MASTER_SERVICE
               value: {{ include "pg.fullname" . | quote }}
             - name: POD_SELECTOR
