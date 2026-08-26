@@ -329,7 +329,7 @@ fi
 # registers under native, so the poll burned its full ~240s and exited 1, leaving every standby
 # in Init:CrashLoopBackOff forever. The gate has to sit BEFORE the repmgr.conf heredoc, because
 # entrypoint.sh's stale-primary guard keys on that file existing.
-init_native_gate_line=$(grep -n 'MECHANISM:-repmgr' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
+init_native_gate_line=$(grep -nE 'MECHANISM:-(repmgr|native)' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
 init_conf_line=$(grep -n 'cat > /etc/repmgr/repmgr.conf' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
 init_poll_line=$(grep -n 'FROM repmgr.nodes' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
 if [ -n "${init_native_gate_line}" ] && [ -n "${init_conf_line}" ] && [ "${init_native_gate_line}" -lt "${init_conf_line}" ]; then
@@ -351,7 +351,7 @@ fi
 # --- #288: the stale-primary guard is repmgr-only ---
 # It shells out to `repmgr node rejoin` / `repmgr standby clone` before the agent starts; under
 # native the agent owns both, with the Lease as the authority for who is primary.
-if sed -n '/^primary_safety_guard()/,/^}/p' "${ROOT}/entrypoint.sh" | grep -q 'MECHANISM:-repmgr'; then
+if sed -n '/^primary_safety_guard()/,/^}/p' "${ROOT}/entrypoint.sh" | grep -qE 'MECHANISM:-(repmgr|native)'; then
   ok "#288: primary_safety_guard is gated on MECHANISM"
 else
   bad "#288: primary_safety_guard still runs repmgr rejoin under native"

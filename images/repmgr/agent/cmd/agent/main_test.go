@@ -18,7 +18,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	runtime "k8s.io/apimachinery/pkg/runtime"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/cagriekin/pg-ha-agent/internal/config"
 	"github.com/cagriekin/pg-ha-agent/internal/dcs"
@@ -234,11 +236,19 @@ func newFollowTestAgent(t *testing.T, ex *scriptedExec) *agent {
 // make Demote fail and exercise an EARLY return from rejoinOnto.
 func newFollowTestAgentWithPM(t *testing.T, ex *scriptedExec, pm *fakePostmaster) *agent {
 	t.Helper()
-	m := mechanism.NewRepmgr("/etc/repmgr/repmgr.conf", t.TempDir(), "pw")
+	// ONE temp dir shared by the mechanism and the config: Native writes its managed
+	// fragment into PGDATA and reads postgresql.conf from it, so two directories would make
+	// every Follow fail on a missing file. Seed the file the include-management reads --
+	// a real PGDATA always has one (initdb writes it).
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "postgresql.conf"), []byte("# test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := mechanism.NewNative(dir, "/usr/lib/postgresql/18/bin", "pw", "pg_ha_slot_0", "pg-0")
 	m.Runner = ex
 	return &agent{
 		cfg: &config.Config{
-			PGDATA:          t.TempDir(),
+			PGDATA:          dir,
 			HeadlessService: "h",
 			RepmgrUser:      "repmgr",
 			RepmgrDB:        "repmgr",
@@ -261,38 +271,16 @@ func newFollowTestAgentWithPM(t *testing.T, ex *scriptedExec, pm *fakePostmaster
 // repmgr so an existing release and an older env-less image are unaffected. Asserted on the
 // concrete type because picking the wrong mechanics is invisible until a promote or a clone
 // actually runs -- by which point it has already touched a data directory. An unrecognised
-// value must fail loudly, not silently fall back to repmgr (fail-fast, matching the rest of
-// this codebase's required-config posture) -- config.Load already rejects it at boot, so
-// this is a defense against the enum and this factory drifting apart in the future.
-func TestNewMechanismSelectsFromConfig(t *testing.T) {
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	for _, tc := range []struct {
-		name    string
-		set     string
-		want    string
-		wantErr bool
-	}{
-		{"absent -> repmgr (unchanged default)", "", "*mechanism.Repmgr", false},
-		{"explicit repmgr", config.MechanismRepmgr, "*mechanism.Repmgr", false},
-		{"native", config.MechanismNative, "*mechanism.Native", false},
-		{"unrecognised value fails loudly", "patroni", "", true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := &config.Config{PGDATA: t.TempDir(), Mechanism: tc.set}
-			m, err := newMechanism(cfg, "/etc/repmgr/repmgr.conf", "/usr/lib/postgresql/18/bin", log)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("mechanism %q: expected an error, got %T", tc.set, m)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("mechanism %q: unexpected error: %v", tc.set, err)
-			}
-			if got := fmt.Sprintf("%T", m); got != tc.want {
-				t.Errorf("mechanism %q selected %s, want %s", tc.set, got, tc.want)
-			}
-		})
+// / newMechanism has one implementation since #294 deleted mechanism.Repmgr. The assertion
+// worth keeping is that it is the native one -- the Mechanism INTERFACE survives (it is the
+// seam a second implementation would use), so a future addition that forgot to wire the
+// factory would otherwise only surface at runtime. Rejecting an unrecognised MECHANISM value
+// is config.Load's job, and config's own tests cover it.
+func TestNewMechanismBuildsTheNativeImplementation(t *testing.T) {
+	cfg := &config.Config{PGDATA: t.TempDir(), PodName: "pg-0", Mechanism: config.MechanismNative}
+	m := newMechanism(cfg, "/usr/lib/postgresql/18/bin")
+	if got := fmt.Sprintf("%T", m); got != "*mechanism.Native" {
+		t.Errorf("newMechanism built %s, want *mechanism.Native", got)
 	}
 }
 
@@ -311,20 +299,42 @@ func TestActFollowSkipsWhenAlreadyStreaming(t *testing.T) {
 	}
 }
 
-// A standby not yet streaming (or being repointed to a new upstream) must run
-// repmgr standby follow, then latch.
+// A standby not yet streaming (or being repointed to a new upstream) must actually follow,
+// then latch.
+//
+// Asserted on the OBSERVABLE EFFECT rather than a CLI call count (#294): the native mechanism
+// writes primary_conninfo into its managed fragment and relies on the caller's reload to make
+// the walreceiver pick it up, so "did a follow happen" is "does the config now point at the
+// target, and was the postmaster told". Counting `repmgr standby follow` invocations was only
+// ever meaningful for the deleted implementation.
 func TestActFollowRunsWhenNotStreaming(t *testing.T) {
 	ex := &scriptedExec{walRcv: ""} // no walreceiver row
-	a := newFollowTestAgent(t, ex)
+	pm := &fakePostmaster{}
+	a := newFollowTestAgentWithPM(t, ex, pm)
 	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
 	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
 		t.Fatalf("act: %v", err)
 	}
-	if ex.follows != 1 {
-		t.Fatalf("repmgr standby follow must run when not streaming, got %d calls", ex.follows)
+	assertFollowsTarget(t, a, "pg-0")
+	if !pm.reloaded {
+		t.Error("the postmaster must be reloaded, or the written conninfo never takes effect")
 	}
 	if a.followUpstream != "pg-0" {
 		t.Fatal("followUpstream must latch after a successful follow")
+	}
+}
+
+// assertFollowsTarget reads the agent-managed fragment in PGDATA and asserts primary_conninfo
+// points at target. This is the file native mode writes; postgresql.auto.conf holds only what
+// ALTER SYSTEM put there.
+func assertFollowsTarget(t *testing.T, a *agent, target string) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(a.cfg.PGDATA, "pg-ha-agent.conf"))
+	if err != nil {
+		t.Fatalf("the managed conf was never written: %v", err)
+	}
+	if !strings.Contains(string(b), a.fqdn(target)) {
+		t.Errorf("primary_conninfo does not point at %s:\n%s", target, b)
 	}
 }
 
@@ -500,25 +510,6 @@ func TestActFollowReloadsPostmasterAfterSuccess(t *testing.T) {
 	}
 }
 
-// #297: a standby absent from its OWN repmgr.nodes copy can never obtain the row, so
-// following is permanently impossible -- it would sit Running-but-never-Ready, silently not
-// replicating. Re-clone from the current primary, which replaces data and metadata together.
-func TestActFollowReclonesWhenLocalRecordMissing(t *testing.T) {
-	ex := &scriptedExec{walRcv: "", followOut: "ERROR: unable to retrieve record for local node 1002"}
-	a := newFollowTestAgent(t, ex)
-	a.followUpstream = "stale"
-	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-1"}
-	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
-		t.Fatalf("act must recover by re-cloning, got %v", err)
-	}
-	if ex.rejoins != 1 {
-		t.Fatalf("a missing local record must escalate to a rejoin/re-clone, got %d calls", ex.rejoins)
-	}
-	if a.followUpstream != "" {
-		t.Fatalf("the follow latch must reset after a re-clone, got %q", a.followUpstream)
-	}
-}
-
 // The follow latch is invalidated on ENTRY to rejoinOnto, so it is cleared even when the
 // rejoin fails before reconfiguring anything (here: Demote fails). Clearing it late would
 // leave a stale latch behind a failed rejoin. Nothing depends on that today -- the
@@ -526,64 +517,39 @@ func TestActFollowReclonesWhenLocalRecordMissing(t *testing.T) {
 // invariant "an attempt to rejoin invalidates the latch" is unconditional, and this pins it
 // so a future edit that reads the latch earlier cannot silently rely on a stale value.
 func TestRejoinOntoClearsFollowLatchEvenWhenItFailsEarly(t *testing.T) {
-	ex := &scriptedExec{walRcv: "", followOut: "ERROR: unable to retrieve record for local node 1002"}
+	// Driven through RejoinForward directly (#294). It used to arrive via act(Follow) ->
+	// ErrLocalRecordMissing -> rejoinOnto, but that escalation was repmgr-specific and went
+	// with mechanism.Repmgr; RejoinForward is the decision that reaches rejoinOnto now, and the
+	// invariant under test -- the latch is invalidated on ENTRY, not on success -- is unchanged.
+	ex := &scriptedExec{walRcv: ""}
 	pm := &fakePostmaster{stopErr: errors.New("stop failed")}
 	a := newFollowTestAgentWithPM(t, ex, pm)
 	a.followUpstream = "stale-upstream"
-	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-1"}
+	dec := reconcile.Decision{Action: reconcile.RejoinForward, Target: "pg-1"}
 	if err := a.act(context.Background(), dec, reconcile.Observation{}); err == nil {
 		t.Fatal("a rejoin whose demote fails must surface an error")
-	}
-	if ex.rejoins != 0 {
-		t.Fatalf("rejoin must not have reconfigured anything after a failed demote, got %d", ex.rejoins)
 	}
 	if a.followUpstream != "" {
 		t.Fatalf("the follow latch must be cleared on entry to a rejoin, got %q", a.followUpstream)
 	}
 }
 
-// ...but a missing UPSTREAM record must NOT re-clone. That is the ordinary post-failover
-// case (the target has not promoted yet) and waiting is correct; re-cloning there demotes a
-// healthy standby and destroys its data directory -- the #286 regression this guards.
-func TestActFollowDoesNotRecloneWhenUpstreamRecordMissing(t *testing.T) {
-	ex := &scriptedExec{walRcv: "", followOut: "ERROR: unable to find record for intended upstream node 1002"}
-	a := newFollowTestAgent(t, ex)
-	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-1"}
-	if err := a.act(context.Background(), dec, reconcile.Observation{}); err == nil {
-		t.Fatal("a missing upstream record must surface so the next tick retries")
-	}
-	if ex.rejoins != 0 {
-		t.Fatalf("a missing upstream record must NOT re-clone the node, got %d rejoins", ex.rejoins)
-	}
-}
-
 // Streaming from a DIFFERENT host than the target (a stale upstream after a leader
 // change) must NOT be mistaken for already-following: the agent repoints via follow.
 func TestActFollowRepointsWhenStreamingFromWrongUpstream(t *testing.T) {
-	ex := &scriptedExec{walRcv: "pg-9.h|streaming"} // streaming from the old leader
-	a := newFollowTestAgent(t, ex)
+	// Streaming, but from the OLD leader: the already-streaming shortcut must not fire, and the
+	// config must end up pointing at the new target (#294: asserted on the written conninfo
+	// rather than a CLI call count).
+	ex := &scriptedExec{walRcv: "pg-9.h|streaming"}
+	pm := &fakePostmaster{}
+	a := newFollowTestAgentWithPM(t, ex, pm)
 	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
 	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
 		t.Fatalf("act: %v", err)
 	}
-	if ex.follows != 1 {
-		t.Fatalf("a standby streaming from the wrong upstream must be repointed via follow, got %d calls", ex.follows)
-	}
-}
-
-// A freshly-cloned standby streams before it is registered in repmgr.nodes. If
-// RegisterStandby fails, the probe-skip must NOT latch (that would strand the node
-// without a record and break a later promote); it falls through to repmgr standby
-// follow, which re-establishes the record or errors so the next tick retries.
-func TestActFollowDoesNotSkipWhenRegisterFails(t *testing.T) {
-	ex := &scriptedExec{walRcv: "pg-0.h|streaming", regErr: errors.New("primary unreachable")}
-	a := newFollowTestAgent(t, ex)
-	dec := reconcile.Decision{Action: reconcile.Follow, Target: "pg-0"}
-	if err := a.act(context.Background(), dec, reconcile.Observation{}); err != nil {
-		t.Fatalf("act: %v", err)
-	}
-	if ex.follows != 1 {
-		t.Fatalf("a failed register must NOT skip follow (the probe bypasses repmgr's node-record check), got %d follow calls", ex.follows)
+	assertFollowsTarget(t, a, "pg-0")
+	if !pm.reloaded {
+		t.Error("a repoint must reload, or the standby keeps streaming from the old upstream")
 	}
 }
 
@@ -833,66 +799,11 @@ func TestShouldAdvanceMarker(t *testing.T) {
 	}
 }
 
-func TestNodeIDAndBaseName(t *testing.T) {
+func TestBaseName(t *testing.T) {
+	// nodeID's half of this test went with the offset's last propagating consumer (#294);
+	// nodeIDBase itself survives only inside slotOrdinal, which has its own tests.
 	if got := baseName("my-pg-0"); got != "my-pg" {
 		t.Errorf("baseName = %q, want my-pg", got)
-	}
-	if got := nodeID("my-pg-3"); got != 1003 {
-		t.Errorf("nodeID = %d, want 1003", got)
-	}
-}
-
-// ghostNodeIDs is the #139 scale-down discriminator: a repmgr.nodes row is a ghost
-// iff its ordinal (node_id - nodeIDBase) is >= the live pod count (live ordinals are
-// 0..nodeCount-1). It must be purely structural and must never flag a live node --
-// including the safety case of a zero/negative nodeCount, which must be a no-op.
-func TestGhostNodeIDs(t *testing.T) {
-	eq := func(a, b []int) bool {
-		if len(a) != len(b) {
-			return false
-		}
-		for i := range a {
-			if a[i] != b[i] {
-				return false
-			}
-		}
-		return true
-	}
-	cases := []struct {
-		name      string
-		ids       []int
-		nodeCount int
-		want      []int
-	}{
-		{"two ghosts above the live range", []int{1000, 1001, 1002, 1003, 1004}, 3, []int{1003, 1004}},
-		{"no ghosts when all in range", []int{1000, 1001, 1002}, 3, nil},
-		{"single-node cluster, one ghost", []int{1000, 1001}, 1, []int{1001}},
-		{"zero nodeCount is a no-op (never treat all as ghosts)", []int{1000, 1001}, 0, nil},
-		{"negative nodeCount is a no-op", []int{1000, 1001}, -1, nil},
-		{"ids below the base are never flagged", []int{999, 1000, 1001}, 1, []int{1001}},
-		{"empty input", nil, 3, nil},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := ghostNodeIDs(c.ids, c.nodeCount); !eq(got, c.want) {
-				t.Fatalf("ghostNodeIDs(%v, %d) = %v, want %v", c.ids, c.nodeCount, got, c.want)
-			}
-		})
-	}
-}
-
-// cleanupGhostNodes wires the real Prober.StandbyNodeIDs + ghostNodeIDs +
-// Repmgr.Unregister: the primary lists standby rows and unregisters only the ordinals
-// above the live range (#139). End-to-end over the same scriptedExec the Follow tests use.
-func TestCleanupGhostNodes(t *testing.T) {
-	// 3 registered nodes but NodeCount=2 (a scale-down from 3 pods to 2): node 1002
-	// (ordinal 2) is a ghost and must be unregistered; the live 1000/1001 must not.
-	ex := &scriptedExec{nodes: "1000\n1001\n1002\n"}
-	a := newFollowTestAgent(t, ex)
-	a.cfg.NodeCount = 2
-	a.cleanupGhostNodes(context.Background())
-	if len(ex.unregistered) != 1 || ex.unregistered[0] != 1002 {
-		t.Fatalf("expected only node 1002 unregistered, got %v", ex.unregistered)
 	}
 }
 
@@ -901,96 +812,9 @@ func TestCleanupGhostNodes(t *testing.T) {
 func TestAssertSyncStandbySlotsNoOpWhenDisabled(t *testing.T) {
 	ex := &scriptedExec{slots: "repmgr_slot_1001|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if len(ex.slotSyncSQL) != 0 {
 		t.Fatalf("expected no SQL when disabled, got %v", ex.slotSyncSQL)
-	}
-}
-
-// The desired set is registered, non-ghost standby node IDs intersected with slots
-// that actually exist -- not pg_replication_slots.active (see the function's doc
-// comment for why: that flapped on any blip). nodes and slots both need setting for a
-// standby to be reconciled in.
-func TestAssertSyncStandbySlotsReconciles(t *testing.T) {
-	ex := &scriptedExec{nodes: "1001\n1002\n", slots: "repmgr_slot_1001|t|0|reserved|t\nrepmgr_slot_1002|t|0|reserved|t\n"}
-	a := newFollowTestAgent(t, ex)
-	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
-	if len(ex.slotSyncSQL) != 2 {
-		t.Fatalf("expected ALTER SYSTEM + reload (2 calls), got %v", ex.slotSyncSQL)
-	}
-	if !strings.Contains(ex.slotSyncSQL[0], "repmgr_slot_1001,repmgr_slot_1002") {
-		t.Errorf("first call = %q, want the joined slot list", ex.slotSyncSQL[0])
-	}
-	if want := "repmgr_slot_1001,repmgr_slot_1002"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
-		t.Errorf("lastSyncStandbySlots = %v, want %q", a.lastSyncStandbySlots, want)
-	}
-}
-
-// repmgr.nodes has no ORDER BY, so StandbyNodeIDs' row order is not guaranteed stable
-// between calls even when the standby SET is unchanged. desired doubles as the cache
-// key (a bare string compare), so an unstable order would make the primary re-run ALTER
-// SYSTEM + reload every tick even in the steady state -- churn indistinguishable from a
-// real topology change. Two ticks with the same IDs in a DIFFERENT order must produce
-// byte-identical output and no second SQL call.
-func TestAssertSyncStandbySlotsOrderIndependent(t *testing.T) {
-	ex := &scriptedExec{nodes: "1002\n1001\n", slots: "repmgr_slot_1001|t|0|reserved|t\nrepmgr_slot_1002|t|0|reserved|t\n"}
-	a := newFollowTestAgent(t, ex)
-	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
-	if want := "repmgr_slot_1001,repmgr_slot_1002"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
-		t.Fatalf("lastSyncStandbySlots = %v, want %q (sorted regardless of repmgr.nodes row order)", a.lastSyncStandbySlots, want)
-	}
-	if len(ex.slotSyncSQL) != 2 {
-		t.Fatalf("first call: expected 2 SQL statements, got %v", ex.slotSyncSQL)
-	}
-	// Same standbys, rows returned in the OTHER order -- must be treated as unchanged.
-	ex.nodes = "1001\n1002\n"
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
-	if len(ex.slotSyncSQL) != 2 {
-		t.Fatalf("second call with the same standbys in a different row order must not issue more SQL, got %v", ex.slotSyncSQL)
-	}
-}
-
-// A registered standby whose walsender briefly drops (a restart, a rolling upgrade, a
-// network blip) must NOT be dropped from synchronized_standby_slots -- only genuine
-// ghosts (see the next test) and standbys with no physical slot at all are excluded.
-// PhysicalSlots (unlike the earlier active-filtered version) does not care whether the
-// slot is currently attached, only that it exists.
-func TestAssertSyncStandbySlotsSurvivesABlip(t *testing.T) {
-	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001|t|0|reserved|t\n"}
-	a := newFollowTestAgent(t, ex)
-	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
-	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
-		t.Errorf("lastSyncStandbySlots = %v, want %q", a.lastSyncStandbySlots, want)
-	}
-}
-
-// A ghost node (scaled down, per cleanupGhostNodes' own ordinal-vs-NodeCount
-// discriminator) must not appear in synchronized_standby_slots even though its slot
-// object may still exist momentarily.
-func TestAssertSyncStandbySlotsExcludesGhostNodes(t *testing.T) {
-	ex := &scriptedExec{nodes: "1001\n1002\n", slots: "repmgr_slot_1001|t|0|reserved|t\nrepmgr_slot_1002|t|0|reserved|t\n"}
-	a := newFollowTestAgent(t, ex)
-	a.cfg.SyncReplicationSlots = true
-	a.cfg.NodeCount = 2 // live ordinals 0-1 -> node_id 1002 (ordinal 2) is a ghost
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
-	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
-		t.Errorf("lastSyncStandbySlots = %v, want %q (1002 excluded as a ghost)", a.lastSyncStandbySlots, want)
-	}
-}
-
-// A standby registered a moment before its physical slot is created must not have a
-// nonexistent slot named in synchronized_standby_slots -- that is the exact "blocks all
-// logical decoding" failure this feature exists to prevent.
-func TestAssertSyncStandbySlotsExcludesUnslottedStandby(t *testing.T) {
-	ex := &scriptedExec{nodes: "1001\n1002\n", slots: "repmgr_slot_1001|t|0|reserved|t\n"} // 1002 has no slot yet
-	a := newFollowTestAgent(t, ex)
-	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
-	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
-		t.Errorf("lastSyncStandbySlots = %v, want %q (1002 excluded, no slot yet)", a.lastSyncStandbySlots, want)
 	}
 }
 
@@ -1003,7 +827,7 @@ func TestAssertSyncStandbySlotsFirstReconcileIsUnconditionalEvenWhenEmpty(t *tes
 	ex := &scriptedExec{}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if len(ex.slotSyncSQL) != 2 {
 		t.Fatalf("expected an unconditional first ALTER SYSTEM + reload even for an empty desired set, got %v", ex.slotSyncSQL)
 	}
@@ -1019,7 +843,7 @@ func TestActClearsLastSyncStandbySlotsWhenNotPrimary(t *testing.T) {
 	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if a.lastSyncStandbySlots == nil {
 		t.Fatal("expected a cached value after the first reconcile")
 	}
@@ -1037,41 +861,13 @@ func TestAssertSyncStandbySlotsSkipsWhenUnchanged(t *testing.T) {
 	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if len(ex.slotSyncSQL) != 2 {
 		t.Fatalf("first call: expected 2 SQL statements, got %v", ex.slotSyncSQL)
 	}
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if len(ex.slotSyncSQL) != 2 {
 		t.Fatalf("second call with an unchanged slot set must not issue more SQL, got %v", ex.slotSyncSQL)
-	}
-}
-
-func TestCleanupGhostNodesNoGhosts(t *testing.T) {
-	// Every registered node is within the live ordinal range: no unregister at all.
-	ex := &scriptedExec{nodes: "1000\n1001\n"}
-	a := newFollowTestAgent(t, ex)
-	a.cfg.NodeCount = 2
-	a.cleanupGhostNodes(context.Background())
-	if len(ex.unregistered) != 0 {
-		t.Fatalf("expected no unregister when there are no ghosts, got %v", ex.unregistered)
-	}
-}
-
-// #287: native mode has no repmgr.nodes at all (mechanism.Native's Unregister is a
-// no-op), so the query would error on every primary tick forever -- pure log noise with
-// nothing to retry. cleanupGhostNodes must skip the query entirely rather than warn.
-func TestCleanupGhostNodesSkippedUnderNativeMechanism(t *testing.T) {
-	ex := &scriptedExec{nodes: "1000\n1001\n1002\n"}
-	a := newFollowTestAgent(t, ex)
-	a.cfg.NodeCount = 2
-	a.cfg.Mechanism = config.MechanismNative
-	a.cleanupGhostNodes(context.Background())
-	if ex.nodesQueries != 0 {
-		t.Fatalf("expected no repmgr.nodes query under native mechanism, got %d", ex.nodesQueries)
-	}
-	if len(ex.unregistered) != 0 {
-		t.Fatalf("expected no unregister under native mechanism, got %v", ex.unregistered)
 	}
 }
 
@@ -1308,47 +1104,6 @@ func slotArg(sql string) string {
 	return rest[:j]
 }
 
-// #289: slot OBSERVATION runs under EVERY mechanism; slot MUTATION only under native.
-//
-// The split matters because the chart renders the two slot PrometheusRules for every
-// agent-mode release regardless of mechanism. If the gauges were published only in native
-// mode, those alerts would sit pinned at zero on the DEFAULT mechanism -- an alert that
-// cannot fire reads as coverage while providing none, which is worse than shipping none.
-// Mutation stays gated: under the repmgr mechanism repmgr owns slot lifecycle, and two
-// owners fighting over the same slots is worse than one.
-func TestSlotsTickObservesUnderEveryMechanismAndMutatesOnlyInNative(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		mechanism  string
-		wantMutate bool
-	}{
-		{"repmgr (absent, the default)", "", false},
-		{"repmgr (explicit)", config.MechanismRepmgr, false},
-		{"native", config.MechanismNative, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// One slot for a departed ordinal (2, outside the live pod set below), inactive
-			// and pinning WAL: reclaimable under native, untouchable under repmgr.
-			ex := &slotExec{rows: "pg_ha_slot_2|f|4096|reserved|t\n"}
-			a := newSlotTestAgent(t, ex, tc.mechanism)
-
-			a.slotsTick(context.Background())
-
-			if ex.listed == 0 {
-				t.Errorf("slots were never listed, so the gauges the shipped alerts read stay at zero")
-			}
-			if body := scrapeMetrics(t, a); !strings.Contains(body, "pg_ha_agent_replication_slot_max_retained_wal_bytes 4096") {
-				t.Errorf("retained-WAL gauge not published under mechanism %q: %s", tc.mechanism, body)
-			}
-			mutated := len(ex.created) > 0 || len(ex.dropped) > 0
-			if mutated != tc.wantMutate {
-				t.Errorf("mutated=%v (created=%v dropped=%v), want %v under mechanism %q",
-					mutated, ex.created, ex.dropped, tc.wantMutate, tc.mechanism)
-			}
-		})
-	}
-}
-
 // A failed slot list must not be read as "there are no slots": creating or dropping on that
 // basis is how a slot a standby still needs gets destroyed (#289).
 func TestSlotsTickMutatesNothingWhenTheSlotListFails(t *testing.T) {
@@ -1417,22 +1172,6 @@ func TestStandbySlotsTickReclaimsSlotsLeftBehindByADemotion(t *testing.T) {
 	}
 	if len(ex.created) != 0 {
 		t.Errorf("a standby created slots (%v): it is never an upstream under this mechanism", ex.created)
-	}
-}
-
-// Observation is mechanism-agnostic (a standby holding WAL back must be visible), mutation
-// is native-only -- under repmgr, repmgr owns slot lifecycle and two owners would fight.
-func TestStandbySlotsTickPublishesUnderRepmgrButReclaimsNothing(t *testing.T) {
-	ex := &slotExec{rows: "pg_ha_slot_1|f|16777216|reserved|t\n"}
-	a := newSlotTestAgent(t, ex, config.MechanismRepmgr)
-
-	a.standbySlotsTick(context.Background())
-
-	if len(ex.dropped) != 0 {
-		t.Errorf("reclaimed %v under the repmgr mechanism, where repmgr owns slot lifecycle", ex.dropped)
-	}
-	if body := scrapeMetrics(t, a); !strings.Contains(body, "pg_ha_agent_replication_slot_max_retained_wal_bytes 16777216") {
-		t.Errorf("a standby holding 16MiB of WAL back published nothing: %s", body)
 	}
 }
 
@@ -1508,21 +1247,6 @@ func (e *initdbExec) Run(_ context.Context, _ []string, name string, args ...str
 		return "00000001|0/3000000", nil
 	}
 	return "", nil
-}
-
-// #288: under repmgr the branch must stay inert -- the entrypoint initdbs inline before the
-// agent runs, and any behaviour change here would move the default path.
-func TestBootstrapInitdbIsInertUnderRepmgr(t *testing.T) {
-	ex := &initdbExec{}
-	a := newBootstrapTestAgent(t, ex, config.MechanismRepmgr)
-	if err := a.act(context.Background(),
-		reconcile.Decision{Action: reconcile.BootstrapInitdb},
-		reconcile.Observation{}); err != nil {
-		t.Fatalf("act: %v", err)
-	}
-	if len(ex.calls) != 0 {
-		t.Errorf("repmgr mode shelled out to %v; the entrypoint owns initdb there", ex.calls)
-	}
 }
 
 // Under native the lease holder creates the cluster. Whether to initdb at all is a
@@ -1637,36 +1361,6 @@ func newBootstrapTestAgentWithPM(t *testing.T, ex *initdbExec, mech string, pm *
 	}
 }
 
-// #288: no repmgr.nodes query may run under the native mechanism. A native cluster has no
-// repmgr extension at all now, so the read could only ever fail -- it was warning on every
-// promote-candidate tick about a permanent condition. The #297 gate it fed is repmgr-specific
-// (it guards against promoting a node no survivor can `repmgr standby follow`, which is a
-// node_id-resolution constraint); native follows by conninfo, so nothing replaces it.
-func TestObserveSkipsTheRegistryReadUnderNative(t *testing.T) {
-	for _, tc := range []struct {
-		mech        string
-		wantQueries int
-	}{
-		{config.MechanismNative, 0},
-		{config.MechanismRepmgr, 1},
-	} {
-		ex := &scriptedExec{nodes: "1000\n1001\n", walRcv: "pg-0.h|streaming"}
-		a := newFollowTestAgent(t, ex)
-		a.cfg.Mechanism = tc.mech
-		a.cfg.PodName = "pg-1"
-		// The one tick-state where the gate can fire: holder, running, in recovery.
-		o := reconcile.Observation{HoldLease: true}
-		o.Local = reconcile.LocalState{Running: true, InRecovery: true, HasData: true}
-		a.readRegistryForGate(context.Background(), &o)
-		if ex.nodesQueries != tc.wantQueries {
-			t.Errorf("mechanism %q: %d repmgr.nodes queries, want %d", tc.mech, ex.nodesQueries, tc.wantQueries)
-		}
-		if tc.mech == config.MechanismNative && o.RegistryRead {
-			t.Errorf("native mode set RegistryRead, which would arm the #297 gate")
-		}
-	}
-}
-
 // #288: identity resolution. application_name first (native writes the pod name there, repmgr
 // writes node_name, same string); the ordinal-named slot as fallback for any standby cloned
 // before #288, which still dials with libpq's default. Both shapes were verified streaming to
@@ -1694,12 +1388,15 @@ func TestResolveReplicaPodUsesAppNameThenSlot(t *testing.T) {
 // The gauges must count what the primary can actually see, and must report separately when a
 // streaming replica cannot be identified at all -- otherwise streaming-vs-expected alone would
 // read as healthy while the topology view is incomplete.
-func TestTopologyTickPublishesGaugesUnderBothMechanisms(t *testing.T) {
+func TestTopologyTickPublishesTheFullPicture(t *testing.T) {
+	// One mechanism since #294, so the expected/gap half is unconditional. It needs the live
+	// pod set, and reconcileSlots is already making that apiserver LIST on this path -- the
+	// second half of this test used to assert that the repmgr path published only what the
+	// primary could see on its own, precisely to avoid charging it a new LIST.
+	//
 	// Two streaming rows (the catchup one is not counted), one of them unidentifiable.
 	const rows = "pg-1|pg_ha_slot_1|streaming\nwalreceiver||streaming\npg-9|pg_ha_slot_9|catchup\n"
 
-	// Native publishes the full picture: the expected/gap half needs the live pod set, and
-	// reconcileSlots is already making that apiserver LIST on this path.
 	ex := &slotExec{rows: rows}
 	a := newSlotTestAgent(t, ex, config.MechanismNative)
 	a.base = "pg"
@@ -1712,24 +1409,8 @@ func TestTopologyTickPublishesGaugesUnderBothMechanisms(t *testing.T) {
 		"pg_ha_agent_replicas_expected 1",
 	} {
 		if !strings.Contains(body, want) {
-			t.Errorf("native: missing %q in:\n%s", want, body)
+			t.Errorf("missing %q in:\n%s", want, body)
 		}
-	}
-
-	// Under repmgr only what the primary can see on its own is published. Charging every
-	// existing install a SECOND uncached pod LIST per tick for an observational gauge is not a
-	// trade worth making (#288 review) -- reconcileSlots returns before its own livePodOrdinals
-	// on that path, so the LIST would be new cost.
-	ex = &slotExec{rows: rows}
-	a = newSlotTestAgent(t, ex, config.MechanismRepmgr)
-	a.base = "pg"
-	a.topologyTick(context.Background())
-	body = scrapeMetrics(t, a)
-	if !strings.Contains(body, "pg_ha_agent_replicas_streaming 2") {
-		t.Errorf("repmgr: the streaming count must still be published:\n%s", body)
-	}
-	if !strings.Contains(body, "pg_ha_agent_replicas_expected 0") {
-		t.Errorf("repmgr: expected must stay 0 (no extra pod LIST on the default path):\n%s", body)
 	}
 }
 
@@ -1763,30 +1444,6 @@ func TestTopologyTickLogsTheGapOnlyOnChange(t *testing.T) {
 	a.topologyTick(context.Background())
 	if !strings.Contains(out.String(), "replication topology complete") {
 		t.Errorf("recovery from a topology gap was not logged:\n%s", out.String())
-	}
-}
-
-// #288 audit: no native code path may carry a repmgr node_id. The offset itself cannot be
-// deleted (slotOrdinal's legacy branch needs it to reclaim repmgr_slot_<node_id> orphans during
-// a repmgr->native migration), so the tightening is to stop propagating ids instead.
-func TestNativePathsCarryNoRepmgrNodeID(t *testing.T) {
-	a := &agent{cfg: &config.Config{PodName: "pg-3", Mechanism: config.MechanismNative}}
-	if got := a.repmgrNodeID(); got != 0 {
-		t.Errorf("native self node_id = %d, want 0", got)
-	}
-	if got := a.repmgrPeerNodeID("pg-5"); got != 0 {
-		t.Errorf("native peer node_id = %d, want 0", got)
-	}
-	a.cfg.Mechanism = config.MechanismRepmgr
-	if got := a.repmgrNodeID(); got != 1003 {
-		t.Errorf("repmgr self node_id = %d, want 1003", got)
-	}
-	if got := a.repmgrPeerNodeID("pg-5"); got != 1005 {
-		t.Errorf("repmgr peer node_id = %d, want 1005", got)
-	}
-	// The offset must still be reversible for legacy slot reclaim -- #294 must not delete it.
-	if ord, ok := slotOrdinal("repmgr_slot_1002"); !ok || ord != 2 {
-		t.Errorf("legacy slot reclaim broken: slotOrdinal(repmgr_slot_1002) = (%d,%v)", ord, ok)
 	}
 }
 
@@ -2497,30 +2154,6 @@ func TestDropRepmgrPreloadStripsUnderNative(t *testing.T) {
 	}
 }
 
-func TestDropRepmgrPreloadLeavesARepmgrMechanismNodeAlone(t *testing.T) {
-	// The issue's explicit requirement: a node still on `mechanism: repmgr` never has its
-	// preload removed. Removing it there would gamble with the repmgr extension's own
-	// functions for no gain -- only native nodes can run the repmgr-free image (#293).
-	dir := t.TempDir()
-	original := "wal_level = replica\nshared_preload_libraries = 'repmgr'\n"
-	conf := writePGDATAConf(t, dir, original)
-	so := filepath.Join(dir, "repmgr.so")
-	if err := os.WriteFile(so, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	a := newPreloadTestAgent(t, config.MechanismRepmgr, dir, so)
-	if err := a.dropRepmgrPreload(); err != nil {
-		t.Fatal(err)
-	}
-	got, err := os.ReadFile(conf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != original {
-		t.Errorf("postgresql.conf was modified under the repmgr mechanism:\ngot:  %q\nwant: %q", got, original)
-	}
-}
-
 func TestDropRepmgrPreloadIsIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	conf := writePGDATAConf(t, dir, "shared_preload_libraries = 'repmgr'\n")
@@ -2689,5 +2322,361 @@ func TestPreflightPreloadNeedsNoDataDirectory(t *testing.T) {
 	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "absent.so"))
 	if err := a.preflightPreload(); err != nil {
 		t.Fatalf("an uninitialized PGDATA must not fail the preflight: %v", err)
+	}
+}
+
+// --- #294: synchronized_standby_slots under the NATIVE mechanism ---
+//
+// Before this, the reconcile resolved standbys from repmgr.nodes and named slots
+// repmgr_slot_<id>, so on a native cluster it errored every tick while the chart still
+// rendered sync_replication_slots = on -- #308's protection silently absent. The native path
+// consumes the slot set reconcileSlots already owns, so the creator and the waiter cannot
+// disagree.
+
+func newNativeSyncTestAgent(t *testing.T, ex *scriptedExec) *agent {
+	t.Helper()
+	a := newFollowTestAgent(t, ex)
+	a.cfg.Mechanism = config.MechanismNative
+	a.cfg.SyncReplicationSlots = true
+	return a
+}
+
+func TestAssertSyncStandbySlotsUsesTheAgentOwnedSetUnderNative(t *testing.T) {
+	ex := &scriptedExec{slots: "pg_ha_slot_1|t|0|reserved|t\npg_ha_slot_2|t|0|reserved|t\n"}
+	a := newNativeSyncTestAgent(t, ex)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), []string{"pg_ha_slot_1", "pg_ha_slot_2"}, true)
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("expected ALTER SYSTEM + reload, got %v", ex.slotSyncSQL)
+	}
+	if !strings.Contains(ex.slotSyncSQL[0], "pg_ha_slot_1,pg_ha_slot_2") {
+		t.Errorf("did not name the agent-owned slots: %q", ex.slotSyncSQL[0])
+	}
+	// repmgr.nodes must not be consulted at all: it does not exist on a native cluster, and
+	// reading it is what used to make this fail every tick.
+	if ex.nodesQueries != 0 {
+		t.Errorf("native path queried repmgr.nodes %d time(s)", ex.nodesQueries)
+	}
+	if a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != "pg_ha_slot_1,pg_ha_slot_2" {
+		t.Errorf("cache = %v", a.lastSyncStandbySlots)
+	}
+}
+
+func TestAssertSyncStandbySlotsUnderNativeNamesOnlySlotsThatExist(t *testing.T) {
+	// A slot reconcileSlots only just created is not in `existing` yet (that read happened
+	// first). Naming a missing slot in synchronized_standby_slots makes the primary hold WAL
+	// and log repeatedly, so it must wait a tick.
+	ex := &scriptedExec{slots: "pg_ha_slot_1|t|0|reserved|t\n"}
+	a := newNativeSyncTestAgent(t, ex)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), []string{"pg_ha_slot_1", "pg_ha_slot_2"}, true)
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("expected ALTER SYSTEM + reload, got %v", ex.slotSyncSQL)
+	}
+	if strings.Contains(ex.slotSyncSQL[0], "pg_ha_slot_2") {
+		t.Errorf("named a slot that does not exist yet: %q", ex.slotSyncSQL[0])
+	}
+	if !strings.Contains(ex.slotSyncSQL[0], "pg_ha_slot_1") {
+		t.Errorf("dropped the slot that does exist: %q", ex.slotSyncSQL[0])
+	}
+}
+
+func TestAssertSyncStandbySlotsUnderNativeReconcilesAnEmptySet(t *testing.T) {
+	// A single-node native cluster owns no standby slots. That is a real value, not a skip:
+	// it must clear whatever a previous topology left in the GUC.
+	ex := &scriptedExec{}
+	a := newNativeSyncTestAgent(t, ex)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("an empty desired set must still reconcile, got %v", ex.slotSyncSQL)
+	}
+	if a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != "" {
+		t.Errorf("cache = %v, want a pointer to \"\"", a.lastSyncStandbySlots)
+	}
+}
+
+func TestAssertSyncStandbySlotsUnderNativeIsStableAcrossTicks(t *testing.T) {
+	// reconcileSlots walks ordinals ascending, so the owned set is already ordered; an
+	// unchanged topology must not re-run ALTER SYSTEM every 5s.
+	ex := &scriptedExec{slots: "pg_ha_slot_1|t|0|reserved|t\npg_ha_slot_2|t|0|reserved|t\n"}
+	a := newNativeSyncTestAgent(t, ex)
+	owned := []string{"pg_ha_slot_1", "pg_ha_slot_2"}
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), owned, true)
+	first := len(ex.slotSyncSQL)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), owned, true)
+	if len(ex.slotSyncSQL) != first {
+		t.Errorf("steady-state tick re-ran the GUC write: %v", ex.slotSyncSQL)
+	}
+}
+
+func TestReconcileSlotsReportsTheSlotsItOwns(t *testing.T) {
+	// The contract the native sync path depends on: reconcileSlots reports the slots PRESENT
+	// on this node that back a live standby, ascending by ordinal, excluding the primary's
+	// own. Present, not merely expected -- naming a slot that does not exist makes the
+	// primary refuse to release WAL.
+	ex := &slotExec{}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	observed := []pg.SlotState{
+		{Name: "pg_ha_slot_1", Active: true, Reserving: true},
+		{Name: "pg_ha_slot_0", Active: false, Reserving: true}, // the primary's own: never waited on
+		{Name: "operator_slot", Active: true, Reserving: true}, // not ours to touch or wait on
+	}
+	owned, ownedOK := a.reconcileSlots(context.Background(), observed)
+	if !ownedOK {
+		t.Fatal("the owned set must be trustworthy when the pod list succeeds")
+	}
+	if len(owned) != 1 || owned[0] != "pg_ha_slot_1" {
+		t.Fatalf("owned = %v, want [pg_ha_slot_1] (pod-0 is self, operator_slot is not ours)", owned)
+	}
+}
+
+func TestReconcileSlotsReportsNothingItCannotSee(t *testing.T) {
+	// A slot the create pass only just minted is not in the observed list yet, and must not be
+	// named until a later tick confirms it exists.
+	ex := &slotExec{}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	if owned, _ := a.reconcileSlots(context.Background(), nil); len(owned) != 0 {
+		t.Errorf("owned = %v, want none when nothing is observed yet", owned)
+	}
+}
+
+func TestReconcileSlotsSkipsPreCreationUnderCascade(t *testing.T) {
+	// Cascading: a standby streams from a PEER, so its slot belongs on that peer. A slot
+	// minted here would sit inactive forever, retaining WAL until max_slot_wal_keep_size
+	// invalidates it -- the #289 failure, on a healthy cluster. Followers self-provision via
+	// ensureSlotOnUpstream, so skipping creation loses nothing (#294).
+	ex := &slotExec{}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	a.cfg.CascadeReplication = true
+	a.reconcileSlots(context.Background(), nil)
+	if len(ex.created) != 0 {
+		t.Errorf("pre-created %v under cascading replication", ex.created)
+	}
+}
+
+func TestReconcileSlotsStillPreCreatesWithoutCascade(t *testing.T) {
+	// The star topology keeps its pre-creation: it is what covers the tick of latency between
+	// a pod appearing and its own Clone/Follow ensuring the slot.
+	ex := &slotExec{}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	a.reconcileSlots(context.Background(), nil)
+	if len(ex.created) == 0 {
+		t.Error("expected the star topology to pre-create the expected standby's slot")
+	}
+}
+
+func TestStandbyReclaimIsCascadeAware(t *testing.T) {
+	// Without cascade a standby cannot be anyone's upstream, so every agent-minted slot found
+	// locally is a leftover. With cascade on, its children's slots live here and must survive
+	// -- reclaiming them every tick would delete exactly what cascading depends on (#294).
+	a := &agent{cfg: &config.Config{PodName: "pg-0"}}
+	live := map[int]bool{1: true, 2: true}
+
+	a.cfg.CascadeReplication = false
+	if !a.reclaimableOnStandby("pg_ha_slot_1", nil) {
+		t.Error("without cascade a standby's agent-minted slot is a leftover")
+	}
+
+	a.cfg.CascadeReplication = true
+	if a.reclaimableOnStandby("pg_ha_slot_1", live) {
+		t.Error("with cascade on, a live child's slot must not be reclaimed")
+	}
+	if !a.reclaimableOnStandby("pg_ha_slot_7", live) {
+		t.Error("with cascade on, a slot whose pod is gone is still reclaimable")
+	}
+	// This node's own slot is never used by anyone locally, on either setting.
+	if !a.reclaimableOnStandby("pg_ha_slot_0", live) {
+		t.Error("self's own slot is always reclaimable locally")
+	}
+	// An operator's slot stays out of reach regardless.
+	if a.reclaimableOnStandby("operator_slot", live) {
+		t.Error("an operator's slot must never be reclaimable")
+	}
+}
+
+func TestReleaseSlotOnFormerUpstream(t *testing.T) {
+	// #294 live-cluster finding: a cascaded standby clones from the PRIMARY (provisioning its
+	// slot there) and then re-homes onto an intermediate, leaving an inactive WAL-retaining
+	// slot on the primary that the primary's own conservative policy will never reclaim. The
+	// owner releases it, because only the owner knows it stopped using it.
+	newAgent := func(cascade bool) (*agent, *slotExec) {
+		ex := &slotExec{}
+		a := newSlotTestAgent(t, ex, config.MechanismNative)
+		a.cfg.CascadeReplication = cascade
+		return a, ex
+	}
+
+	// Re-homed under cascade: the old upstream's copy of this node's slot goes.
+	a, ex := newAgent(true)
+	a.releaseSlotOnFormerUpstream(context.Background(), "pg-1", "pg-2")
+	if len(ex.dropped) != 1 || ex.dropped[0] != slotNameFor(a.cfg.PodName) {
+		t.Errorf("dropped = %v, want [%s]", ex.dropped, slotNameFor(a.cfg.PodName))
+	}
+
+	// Without cascade a re-home is a failover: the old upstream is the demoted ex-primary,
+	// standbySlotsTick already reclaims there, and reaching for a dying node would add a
+	// timeout to every failover.
+	a, ex = newAgent(false)
+	a.releaseSlotOnFormerUpstream(context.Background(), "pg-1", "pg-2")
+	if len(ex.dropped) != 0 {
+		t.Errorf("dropped %v without cascading replication", ex.dropped)
+	}
+
+	// No-ops that must not issue a drop at all.
+	for _, tc := range []struct{ name, former, target string }{
+		{"first follow (no former upstream)", "", "pg-2"},
+		{"same upstream re-confirmed", "pg-1", "pg-1"},
+		{"former upstream is self", "pg-0", "pg-2"},
+	} {
+		a, ex = newAgent(true)
+		a.releaseSlotOnFormerUpstream(context.Background(), tc.former, tc.target)
+		if len(ex.dropped) != 0 {
+			t.Errorf("%s: dropped %v, want none", tc.name, ex.dropped)
+		}
+	}
+}
+
+func TestBootstrapCloneLatchesTheCloneSourceAsUpstream(t *testing.T) {
+	// #294, second live finding: Clone provisions this node's slot ON THE SOURCE (always the
+	// lease holder). Under cascading replication the node then re-homes onto an intermediate,
+	// stranding that slot -- and releaseSlotOnFormerUpstream can only reclaim it if the clone
+	// source was latched, because it reads followUpstream. Observed live: a node whose FIRST
+	// post-clone Follow was already the cascade hop left an inactive slot on the primary,
+	// while one that transited the leader first was cleaned up.
+	ex := &scriptedExec{}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.PodName = "pg-2"
+	a.followUpstream = "" // act() clears it for every non-Follow action, including BootstrapClone
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.BootstrapClone, Target: "pg-0"}, reconcile.Observation{}); err != nil {
+		t.Fatalf("bootstrap clone: %v", err)
+	}
+	if a.followUpstream != "pg-0" {
+		t.Errorf("followUpstream = %q after cloning from pg-0, want \"pg-0\" -- the release path reads this", a.followUpstream)
+	}
+}
+
+func TestLatchFollowRestartsTheStallWindow(t *testing.T) {
+	// #294 review: the counter used to carry across a repoint, so the ordinary failover
+	// sequence -- primary dies, this standby climbs past standbyStallTicks while no peer is on
+	// a newer timeline, then a peer promotes -- armed StandbyStalled on the very FIRST tick
+	// after the Follow, turning a standby that would have streamed seconds later into a
+	// pg_rewind and possibly a full re-clone.
+	a := &agent{cfg: &config.Config{}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	a.standbyNoReceiverTicks = standbyStallTicks + 5
+	a.standbyLastProgressLSN = pg.LSN{Hi: 1, Lo: 2}
+	a.latchFollow("pg-1")
+	if a.standbyNoReceiverTicks != 0 {
+		t.Errorf("standbyNoReceiverTicks = %d after a repoint, want 0", a.standbyNoReceiverTicks)
+	}
+	if a.standbyLastProgressLSN != (pg.LSN{}) {
+		t.Errorf("standbyLastProgressLSN = %v after a repoint, want zero", a.standbyLastProgressLSN)
+	}
+	if a.followUpstream != "pg-1" {
+		t.Errorf("followUpstream = %q, want pg-1", a.followUpstream)
+	}
+}
+
+func TestSlotsTickFailsClosedWhenThePodListFails(t *testing.T) {
+	// #294 review: reconcileSlots returned a bare nil when livePodOrdinals failed, which
+	// syncSlotCandidates could not tell apart from "this primary owns no standby slots" -- so a
+	// single apiserver blip on a healthy 3-node cluster ran
+	// `ALTER SYSTEM SET synchronized_standby_slots = ''` plus a reload, dropping #308's
+	// guarantee and reinstating it the next tick. The pre-#294 code failed closed here.
+	ex := &slotExec{rows: "pg_ha_slot_1|t|0|reserved|t\n"}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	cs := k8sfake.NewSimpleClientset()
+	cs.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("apiserver unavailable")
+	})
+	a.kube = k8s.NewWithClient(cs, "ns")
+
+	_, owned, ok := a.slotsTick(context.Background())
+	if ok {
+		t.Fatal("slotsTick must report the owned set as untrustworthy when the pod list fails")
+	}
+	if owned != nil {
+		t.Errorf("owned = %v, want nil", owned)
+	}
+}
+
+func TestAssertSyncStandbySlotsLeavesTheGUCAloneOnAnUntrustworthyInput(t *testing.T) {
+	// The other half of the same fix: an untrustworthy owned set must not be written.
+	ex := &scriptedExec{}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.Mechanism = config.MechanismNative
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background(), nil, nil, false)
+	if len(ex.slotSyncSQL) != 0 {
+		t.Errorf("wrote synchronized_standby_slots on an untrustworthy input: %v", ex.slotSyncSQL)
+	}
+	if a.lastSyncStandbySlots != nil {
+		t.Error("the cache must not be updated from an input that was never applied")
+	}
+}
+
+func TestAssertNoForeignRecoveryConfig(t *testing.T) {
+	// #294 review: a 1.x data directory carries repmgr's primary_conninfo and
+	// primary_slot_name in postgresql.auto.conf, which outranks the agent's fragment. The chart
+	// cannot detect it (1.x had no mechanism key at all), so this refusal is the only thing
+	// between that upgrade and a standby that silently never streams.
+	dir := t.TempDir()
+	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "repmgr.so"))
+
+	// No auto.conf: a fresh install must boot.
+	if err := a.assertNoForeignRecoveryConfig(); err != nil {
+		t.Fatalf("a fresh install must not be refused: %v", err)
+	}
+
+	// Only the agent's own ALTER SYSTEM: still fine.
+	auto := filepath.Join(dir, "postgresql.auto.conf")
+	if err := os.WriteFile(auto, []byte("synchronized_standby_slots = 'pg_ha_slot_1'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.assertNoForeignRecoveryConfig(); err != nil {
+		t.Fatalf("the agent's own ALTER SYSTEM must not be refused: %v", err)
+	}
+
+	// repmgr-shaped: refused, with a message naming the migration rather than the symptom.
+	if err := os.WriteFile(auto, []byte("primary_conninfo = 'host=pg-0'\nprimary_slot_name = 'repmgr_slot_1001'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := a.assertNoForeignRecoveryConfig()
+	if err == nil {
+		t.Fatal("a repmgr-shaped auto.conf must be refused")
+	}
+	for _, want := range []string{"primary_conninfo", "primary_slot_name", "#292", "FRESH installs", "ALTER SYSTEM RESET"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("message does not mention %q: %v", want, err)
+		}
+	}
+}
+
+func TestPausedAgentKeepsTheSlotGauges(t *testing.T) {
+	// #294 review: pause routes through Decide's NoOp, which fell into act()'s retract branch
+	// and cleared the slot gauges every tick -- silencing all three slot alerts and resetting
+	// their `for:` clocks on a paused primary that is still serving and still retaining WAL.
+	ex := &slotExec{rows: "pg_ha_slot_1|f|4194304|reserved|t\n"}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	a.sup = process.NewSupervisor(&fakePostmaster{})
+	a.dcs = &fakeDCS{}
+
+	// Publish a slot observation, then take the NoOp path.
+	if _, ok := a.observeSlots(context.Background()); !ok {
+		t.Fatal("observeSlots failed")
+	}
+	before := scrapeMetrics(t, a)
+	if !strings.Contains(before, "pg_ha_agent_replication_slots 1") {
+		t.Fatalf("slot gauge was not published:\n%s", before)
+	}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.NoOp}, reconcile.Observation{}); err != nil {
+		t.Fatalf("act(NoOp): %v", err)
+	}
+	after := scrapeMetrics(t, a)
+	if !strings.Contains(after, "pg_ha_agent_replication_slots 1") {
+		t.Errorf("a pause retracted the slot gauges:\n%s", after)
 	}
 }

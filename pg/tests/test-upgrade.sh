@@ -67,12 +67,29 @@ done
 
 # Every node must agree on the topology: a node whose repmgr.nodes copy predates its own
 # registration cannot `repmgr standby follow` and never streams (#297). Assert each node
-# sees a row for itself. Repmgr-mechanism only -- a native cluster has no repmgr.nodes at
-# all (#288), and this suite runs the default mechanism.
-if [ "$(chart_mechanism 2>/dev/null || echo repmgr)" = "repmgr" ]; then
+# is actually replicating. The original check read each node's own repmgr.nodes row; #294 removed
+# repmgr.nodes, and gating it on chart_mechanism left it permanently skipped -- silently undoing
+# the coverage restored for exactly this race. The native equivalent asks the question directly of
+# the primary's live connection list: every standby must be present AND streaming, which is
+# strictly stronger than "a row exists for itself".
+NEW_PRIMARY=$(discover_primary "${NAMESPACE}" "${FULLNAME_TO}" 3 repmgr repmgr)
+assert_not_eq "after upgrade: a primary is discoverable" "" "${NEW_PRIMARY}"
+if [ -n "${NEW_PRIMARY}" ]; then
+  streaming=""; s=0
+  while [ "${s}" -lt 120 ]; do
+    streaming=$(pg_exec "${NAMESPACE}" "${NEW_PRIMARY}" \
+      "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" repmgr repmgr 2>/dev/null | xargs || echo "")
+    [ "${streaming}" = "2" ] && break
+    sleep 5; s=$((s + 5))
+  done
+  assert_eq "after upgrade: the primary sees both standbys streaming (#297)" "2" "${streaming}"
+  # And each standby individually, so "2 streaming" cannot be satisfied by one pod twice.
   for i in 0 1 2; do
-    own=$(pg_exec "${NAMESPACE}" "${FULLNAME_TO}-${i}" "SELECT count(*) FROM repmgr.nodes WHERE node_id = $((1000 + i))" repmgr repmgr 2>/dev/null | xargs || echo "")
-    assert_eq "after upgrade: pod-${i} has its own repmgr.nodes row (#297)" "1" "${own}"
+    pod="${FULLNAME_TO}-${i}"
+    [ "${pod}" = "${NEW_PRIMARY}" ] && continue
+    seen=$(pg_exec "${NAMESPACE}" "${NEW_PRIMARY}" \
+      "SELECT count(*) FROM pg_stat_replication WHERE application_name='${pod}' AND state='streaming'" repmgr repmgr 2>/dev/null | xargs || echo "")
+    assert_eq "after upgrade: ${pod} is streaming from the primary (#297)" "1" "${seen}"
   done
 fi
 

@@ -330,7 +330,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        the standalone behaviour: the operator's value passes through custom.conf. This does
        not move the default (repmgr) render. */ -}}
 {{- define "pg.chartOwnsSharedPreloadLibraries" -}}
-{{- if or .Values.postgresql.audit.enabled (and .Values.repmgr.enabled (ne ((.Values.repmgr.agent).mechanism | default "repmgr") "native") (eq (include "pg.userSetSharedPreloadLibraries" .) "true")) -}}true{{- end -}}
+{{- if or .Values.postgresql.audit.enabled (and .Values.repmgr.enabled (ne ((.Values.repmgr.agent).mechanism | default "native") "native") (eq (include "pg.userSetSharedPreloadLibraries" .) "true")) -}}true{{- end -}}
 {{- end -}}
 
 {{- /* The authoritative shared_preload_libraries value. Rendered into a conf.d file that
@@ -364,7 +364,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- $t := trim $l -}}
   {{- if and $t (not (has $t $libs)) -}}{{- $libs = append $libs $t -}}{{- end -}}
 {{- end -}}
-{{- if and .Values.repmgr.enabled (ne ((.Values.repmgr.agent).mechanism | default "repmgr") "native") (not (has "repmgr" $libs)) -}}{{- $libs = prepend $libs "repmgr" -}}{{- end -}}
+{{- if and .Values.repmgr.enabled (ne ((.Values.repmgr.agent).mechanism | default "native") "native") (not (has "repmgr" $libs)) -}}{{- $libs = prepend $libs "repmgr" -}}{{- end -}}
 {{- if and .Values.postgresql.audit.enabled (not (has "pgaudit" $libs)) -}}{{- $libs = append $libs "pgaudit" -}}{{- end -}}
 {{- join "," $libs -}}
 {{- end -}}
@@ -869,26 +869,6 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end }}
 {{- end }}
 
-{{- /* #308 x #288: syncReplicationSlots is repmgr-MECHANISM only, and must fail rather than
-       degrade quietly under native. assertSyncStandbySlots resolves the standby set from
-       repmgr.nodes and names slots repmgr_slot_<node_id>; a native cluster has no repmgr
-       extension and no repmgr.nodes at all, and its slots are pg_ha_slot_<ordinal>. So the
-       reconcile errors on every primary tick, synchronized_standby_slots is never set -- while
-       the chart still renders sync_replication_slots = on for every standby. The visible result
-       is one repeating log warning; the real result is that a logical failover slot's decode
-       position can advance past the standby that will need it, which is precisely the hazard
-       #308 exists to prevent. Refusing at render time is the same treatment cascadingReplication
-       gets with native, for the same reason: a feature that silently does nothing is worse than
-       one that will not install. Teaching the reconcile to use the native slot names is its own
-       change, not a validation. */}}
-{{- define "pg.validateSyncReplicationSlotsMechanism" -}}
-{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
-{{- if eq ((.Values.repmgr.agent).mechanism | default "repmgr") "native" }}
-{{- fail "repmgr.agent.syncReplicationSlots is not supported with repmgr.agent.mechanism: native (#308/#288): the synchronized_standby_slots reconcile resolves standbys from repmgr.nodes and names slots repmgr_slot_<node_id>, neither of which exists under native, so it would silently never run while every standby still enabled sync_replication_slots. Set repmgr.agent.mechanism to \"repmgr\", or set repmgr.agent.syncReplicationSlots to false." }}
-{{- end }}
-{{- end }}
-{{- end }}
-
 {{- /* #293: refuse `repmgr` in shared_preload_libraries under the native mechanism.
 
        A native cluster has no repmgr extension, so the library is dead weight -- but it is
@@ -908,7 +888,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        requested module is genuinely absent; this stops it being requested in the first
        place. */ -}}
 {{- define "pg.validateNativePreloadRepmgr" -}}
-{{- if and (eq (include "pg.agentMode" .) "true") (eq ((.Values.repmgr.agent).mechanism | default "repmgr") "native") }}
+{{- if and (eq (include "pg.agentMode" .) "true") (eq ((.Values.repmgr.agent).mechanism | default "native") "native") }}
 {{- /* Match the way PostgreSQL resolves an entry, not the literal string: `repmgr`,
        `repmgr.so`, `$libdir/repmgr` and an absolute path to repmgr.so all load the same
        library, because PostgreSQL supplies `$libdir/` and `.so` itself when they are
@@ -929,7 +909,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- range $k, $v := (.Values.postgresql.configuration | default dict) }}
   {{- if eq (lower ($k | toString)) "shared_preload_libraries" }}{{- $user = $v | toString }}{{- end }}
 {{- end }}
-{{- fail (printf "postgresql.configuration.shared_preload_libraries includes \"repmgr\" (got %q) but repmgr.agent.mechanism is \"native\": a native cluster has no repmgr extension, and this value loads via conf.d's include_dir so it OVERRIDES the image's native gate and preloads repmgr.so anyway. That makes the cluster unstartable (\"could not access file \\\"repmgr\\\"\") as soon as the repmgr-free image ships (#290/#293), on every pod at once, and helm rollback cannot fix it because the line is cloned into each data directory. Fix: drop \"repmgr\" from the list (the chart adds nothing under native, so an empty list means: omit the key), or set repmgr.agent.mechanism to \"repmgr\"." $user) }}
+{{- fail (printf "postgresql.configuration.shared_preload_libraries includes \"repmgr\" (got %q) but repmgr.agent.mechanism is \"native\": a native cluster has no repmgr extension, and this value loads via conf.d's include_dir so it OVERRIDES the image's native gate and preloads repmgr.so anyway. That makes the cluster unstartable (\"could not access file \\\"repmgr\\\"\") as soon as the repmgr-free image ships (#290/#293), on every pod at once, and helm rollback cannot fix it because the line is cloned into each data directory. Fix: drop \"repmgr\" from the list -- the chart adds nothing to it any more, so if repmgr was the only entry, omit the key entirely. There is no mechanism to switch back to: #294 removed the repmgr one." $user) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -1408,6 +1388,14 @@ volumes:
 {{- end -}}
 {{- if hasKey .Values.pgpool "autoFailback" -}}
 {{- fail "pgpool.autoFailback was removed in chart 2.0.0: it rendered PGPool's auto_failback, which only applied to the repmgrd failover flow. The agent fronts the Services and re-points them itself, so PGPool never fails a backend over. Delete this key." -}}
+{{- end -}}
+{{- /* #294: the repmgr MECHANISM is gone, not merely non-default. Rejected here rather than
+       by narrowing the values.schema.json enum, so the operator gets this message instead of
+       a generic "value must be one of [native]" -- helm validates the schema before rendering,
+       so a narrowed enum would win the race and say nothing useful. The key itself survives
+       (see values.yaml) precisely so a stale value fails loudly rather than being ignored. */ -}}
+{{- if eq ((.Values.repmgr.agent).mechanism | default "native") "repmgr" -}}
+{{- fail "repmgr.agent.mechanism: repmgr was removed in chart 2.0.0 (#294): the repmgr mechanism drove the repmgr CLI (standby clone/follow/promote, node rejoin) and depended on repmgr.nodes, and both are gone -- `native` is now the only implementation, and it is the default. Delete this key (or set it to \"native\"). IMPORTANT: a cluster created by a 1.x release is still repmgr-shaped on disk; migrating it in place is #292, and until that ships native is for FRESH installs. Read the 2.0.0 upgrade note in CHANGELOG.md before upgrading an existing HA cluster." -}}
 {{- end -}}
 {{- end -}}
 

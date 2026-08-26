@@ -478,11 +478,20 @@ func (s SlotState) Invalidated() bool { return s.WALStatus == "lost" }
 // Logical slots are excluded (slot_type='physical'): those belong to the operator's
 // subscriptions, the agent never creates or drops them, and enumerating them here
 // would invite a caller to treat one as an orphan.
+//
+// The reference LSN uses GREATEST(receive, replay) in recovery, not receive alone (#294
+// review). pg_last_wal_receive_lsn() is NULL until streaming starts in THIS postmaster
+// lifetime, so on a demoted ex-primary that never reattached -- precisely the node
+// standbySlotsTick exists for, holding leftover pg_ha_slot_* with no walreceiver -- the whole
+// expression collapsed to 0 and every slot reported no retained WAL. That made
+// PGHAReplicationSlotRetainingWAL unable to fire on the one case it was written for. The outer
+// GREATEST(..., 0) additionally clamps the negative a post-rewind restart_lsn ahead of the
+// local end-of-WAL produces, which slotMetrics' max would otherwise carry silently.
 func (p *Prober) PhysicalSlots(ctx context.Context, ci ConnInfo) ([]SlotState, error) {
 	out, err := p.psql(ctx, ci,
-		"SELECT slot_name, active, COALESCE(pg_wal_lsn_diff("+
-			"CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_lsn() END, "+
-			"restart_lsn), 0)::bigint, "+
+		"SELECT slot_name, active, GREATEST(COALESCE(pg_wal_lsn_diff("+
+			"CASE WHEN pg_is_in_recovery() THEN GREATEST(COALESCE(pg_last_wal_receive_lsn(), '0/0'), COALESCE(pg_last_wal_replay_lsn(), '0/0')) ELSE pg_current_wal_lsn() END, "+
+			"restart_lsn), 0), 0)::bigint, "+
 			"COALESCE(wal_status, ''), (restart_lsn IS NOT NULL) "+
 			"FROM pg_replication_slots WHERE slot_type = 'physical' ORDER BY slot_name;")
 	if err != nil {

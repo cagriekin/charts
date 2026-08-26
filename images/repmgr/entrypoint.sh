@@ -117,7 +117,15 @@ reclone_preserving_old() {
 # repmgr.conf being absent (init-repmgr.sh does skip writing it under native, and the
 # file check below still stands as a second line of defence).
 primary_safety_guard() {
-    if [ "${MECHANISM:-repmgr}" = "native" ]; then
+    # MECHANISM defaults to native, matching internal/config's own default (#294). It defaulted to
+    # repmgr while that mechanism existed; leaving it there once the Go agent flipped would make the
+    # two halves of the SAME container disagree, and this repo's release is deliberately two-step --
+    # publish the image, then bump repmgr.image.tag. In that window a chart that omits MECHANISM
+    # (any release before #294 emitted it only at a non-default value) would pair a native agent
+    # with a repmgr shell: init-repmgr.sh would enter a repmgr.nodes registration poll nothing can
+    # satisfy (~240s, then exit 1 -> Init:CrashLoopBackOff on every standby) and bootstrap_initdb
+    # would bake the repmgr preload GUC into the primary's config and clone it everywhere.
+    if [ "${MECHANISM:-native}" = "native" ]; then
         echo "stale-primary guard: skipped (MECHANISM=native; the agent owns rejoin and re-clone)"
         return 0
     fi
@@ -244,7 +252,7 @@ EOF
     # by this code UNSTARTABLE ("could not access file \"repmgr\"") the moment #290/#294 drop
     # the repmgr package from the image. Removing it from an EXISTING data directory, and the
     # render-time guard, remain #293's half.
-    if [ "${MECHANISM:-repmgr}" != "native" ]; then
+    if [ "${MECHANISM:-native}" != "native" ]; then
         echo "shared_preload_libraries = 'repmgr'" >> "$PGDATA/postgresql.conf"
     else
         echo "MECHANISM=native: not preloading repmgr.so (no repmgr extension on this cluster, #288)"
@@ -338,10 +346,37 @@ EOF
     # schema and the nodes table this issue exists to stop reading. Skipping it means a
     # native-mode cluster has no repmgr.nodes at all, so there is no stale cache for
     # anything to fall back to by accident.
-    if [ "${MECHANISM:-repmgr}" != "native" ]; then
+    if [ "${MECHANISM:-native}" != "native" ]; then
         psql -U postgres -d ${REPMGR_DB} -c "CREATE EXTENSION IF NOT EXISTS repmgr;" 2>/dev/null || true
     else
         echo "MECHANISM=native: skipping CREATE EXTENSION repmgr (the nodes table is not a topology source any more, #288)"
+    fi
+
+    # Verify the bootstrap actually produced the load-bearing objects, while the postmaster is
+    # still UP to be asked (#294 review). Every role/database step above ends in
+    # `2>/dev/null || true` -- deliberately, so a re-run over an existing object is not fatal --
+    # which makes a genuine failure indistinguishable from an idempotent no-op. The completion
+    # sentinel written after the stop below then told discardTornInitdb "this bootstrap
+    # completed", so it KEPT a data directory with no repmgr role: bootstrap_initdb no-ops on it
+    # forever (PG_VERSION exists) while the agent can never authenticate -- exactly the
+    # Running/NotReady-until-someone-deletes-the-PVC state that sentinel exists to prevent.
+    #
+    # Only the two load-bearing objects are checked: the agent connects as REPMGR_USER for every
+    # probe and for pg_basebackup, and primary_conninfo carries dbname=REPMGR_DB. Failing here
+    # exits before the sentinel is written, so the next boot discards the torn directory and
+    # starts over -- a loud crash-loop naming the cause, rather than a silent wedge.
+    bootstrap_ok=yes
+    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname = '${REPMGR_USER}'" 2>/dev/null | grep -q 1; then
+        echo "FATAL: bootstrap did not create the ${REPMGR_USER} role." >&2
+        bootstrap_ok=no
+    fi
+    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '${REPMGR_DB}'" 2>/dev/null | grep -q 1; then
+        echo "FATAL: bootstrap did not create the ${REPMGR_DB} database." >&2
+        bootstrap_ok=no
+    fi
+    if [ "$bootstrap_ok" != "yes" ]; then
+        echo "FATAL: not marking the bootstrap complete; this data directory will be discarded and re-bootstrapped on the next start. If it repeats, check POSTGRES_PASSWORD / REPMGR_PASSWORD for characters that break the SQL above (a literal single quote is the usual culprit) and the postgres server log for the swallowed error." >&2
+        exit 1
     fi
 
     pg_ctl -D "$PGDATA" -w stop
@@ -386,7 +421,7 @@ case "$SCRIPT_NAME" in
         # system_identifier, which assertSameCluster refuses to rejoin -- Running, never Ready,
         # holding a bogus database. Under native the agent decides: the lease holder runs
         # `entrypoint.sh initdb`, everyone else waits and then clones (#288).
-        if [ "${MECHANISM:-repmgr}" != "native" ]; then
+        if [ "${MECHANISM:-native}" != "native" ]; then
             bootstrap_initdb
         elif [ ! -s "$PGDATA/PG_VERSION" ]; then
             echo "MECHANISM=native: empty data directory; deferring to the agent (initdb if lease holder, else clone) (#288)"

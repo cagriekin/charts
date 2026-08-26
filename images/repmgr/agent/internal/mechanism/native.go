@@ -21,9 +21,11 @@ import (
 // pg_stat_replication (identified by the application_name this mechanism writes into
 // primary_conninfo, or by the ordinal-named slot), and the bootstrap is the agent's -- the
 // lease holder initdbs, everyone else clones. Slot ownership (#289) creates this node's slot
-// before every clone/rejoin. Remaining gaps: cascadingReplication is render-rejected with this
-// mechanism, and an existing repmgr cluster cannot be migrated in place yet (#292). #294
-// promotes it to supported and flips the default.
+// before every clone/rejoin -- on whichever upstream this node actually points at, which is
+// what makes cascadingReplication work here since #294 (the reclaim policy on both sides is
+// cascade-aware, and syncReplicationSlots resolves standbys from the owned slot set rather
+// than repmgr.nodes). Remaining gap: an existing repmgr cluster cannot be migrated in place
+// yet (#292). #294 also flips the default.
 //
 // Every binary is resolved under PGBindir rather than PATH: the image ships exactly one
 // PostgreSQL major and the agent must exec that major's tools, not whatever PATH resolves
@@ -348,7 +350,7 @@ func (n *Native) Follow(ctx context.Context, upstream Conn) error {
 	if upstream.Host == "" {
 		// A native follow cannot be addressed by node_id: without a host there is nothing
 		// to write into primary_conninfo. Fail loudly rather than write a broken conninfo.
-		return fmt.Errorf("native: follow needs upstream.Host (node_id %d is not addressable)", upstream.NodeID)
+		return fmt.Errorf("native: follow needs upstream.Host to write primary_conninfo, and it is empty")
 	}
 	// #289: ensure this node's slot exists on the upstream BEFORE pointing at it, the same
 	// way Clone and RejoinForceRewind do -- this was the one slot-using path that did not.
@@ -382,18 +384,16 @@ func (n *Native) Follow(ctx context.Context, upstream Conn) error {
 // Clone builds the local PGDATA fresh from source. The caller guarantees PGDATA is empty or
 // has been moved aside (ReclonePreserving does the moving).
 //
-// -R writes primary_conninfo and standby.signal into the new data directory, so the clone
-// streams as soon as it starts without a separate Follow call from the caller -- the #181
-// failure mode was a standby that came up after a cutover and never re-established
-// streaming. -X stream copies WAL concurrently so the backup is self-consistent without
-// depending on WAL still being retained on the primary when the copy finishes.
+// -X stream copies WAL concurrently, so the backup is self-consistent without depending on WAL
+// still being retained on the primary when the copy finishes.
 //
 // Deliberately NOT pg_basebackup -R: that writes primary_conninfo/standby.signal into
-// postgresql.auto.conf, a SECOND place recovery config can live besides the managed
-// fragment Follow writes to. postgresql.auto.conf is included last (initdb appends it to
-// the end of postgresql.conf), so it would silently outrank any later Follow -- a standby
-// cloned once and later re-pointed to a new upstream would keep streaming from the
-// original source. Calling Follow here instead keeps exactly one authoritative place.
+// postgresql.auto.conf, a SECOND place recovery config can live besides the managed fragment
+// Follow writes to. auto.conf is read last, so it would silently outrank any later Follow -- a
+// standby cloned once and re-pointed to a new upstream would keep streaming from the original
+// source. Calling Follow here instead keeps exactly one authoritative place. (The agent now also
+// REFUSES to start on a data directory whose auto.conf already sets those GUCs, which is how a
+// 1.x repmgr volume is caught -- see assertNoForeignRecoveryConfig, #294.)
 // #289: the backup streams through this node's own named slot, created on the source
 // FIRST so no WAL gap can open between the base backup starting and the walreceiver
 // attaching. Without a slot the source may recycle a segment the new standby still needs
@@ -581,24 +581,6 @@ func (n *Native) ReclonePreserving(ctx context.Context, source Conn) error {
 	}
 	return nil
 }
-
-// RegisterPrimary / RegisterStandby / Unregister are no-ops in native mode: repmgr.nodes is
-// repmgr's own bookkeeping, and native mode does not maintain it.
-//
-// They are no-ops rather than errors because reconcile calls them unconditionally as part of
-// role reconciliation, and native mode's answer is "nothing to do" rather than "that failed".
-// #288 moved topology onto pg_stat_replication (see the agent's topologyTick), so native mode
-// no longer depends on repmgr.nodes for it; these three methods stay only while
-// mechanism.Repmgr is still selectable, and #294 deletes them with it.
-func (n *Native) RegisterPrimary(ctx context.Context) error { return nil }
-
-// Both arguments are ignored: native mode keeps no registry at all (see RegisterPrimary).
-// The signature matches repmgr's so the Mechanism interface stays one shape.
-func (n *Native) RegisterStandby(ctx context.Context, upstream Conn, upstreamNodeID int) error {
-	return nil
-}
-
-func (n *Native) Unregister(ctx context.Context, nodeID int) error { return nil }
 
 // isConnectionFailure recognises pg_rewind/libpq output that means "could not reach the
 // source", as opposed to "histories diverged beyond repair". Keeping these apart is what
