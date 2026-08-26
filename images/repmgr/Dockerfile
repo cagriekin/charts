@@ -14,12 +14,12 @@ COPY agent/ ./
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH GOFLAGS=-mod=vendor GOPROXY=off \
     go build -trimpath -ldflags="-s -w" -o /out/pg-ha-agent ./cmd/agent
 
-# --- Stage 2: the runtime image (PostgreSQL + repmgr + pgbackrest + agent) ---
+# --- Stage 2: the runtime image (PostgreSQL + pgaudit + pgbackrest + the Go agent) ---
 # Digest-pinned (manifest-list digest, multi-arch). Refresh with:
 #   docker buildx imagetools inspect debian:trixie-slim
 FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e
 
-# PostgreSQL major to build against (#269). In repmgr mode the chart runs the server
+# PostgreSQL major to build against (#269). The chart runs the server
 # binaries from THIS image, so this arg -- not postgresql.image -- decides the cluster's
 # major. The default MUST stay 18: the unsuffixed published tag is built without a
 # --build-arg and every existing chart pin resolves to it. Explicit per-major tags
@@ -44,7 +44,7 @@ RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmo
 
 RUN echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/postgresql.list
 
-# Install PostgreSQL and repmgr for PG_MAJOR. postgresql-<major>-pgaudit ships the
+# Install PostgreSQL for PG_MAJOR. postgresql-<major>-pgaudit ships the
 # pgaudit extension used by the chart's opt-in compliance audit logging (#219); it is
 # inert unless the chart adds it to shared_preload_libraries, so it costs nothing when
 # audit is off.
@@ -56,7 +56,7 @@ RUN echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.
 # SILENTLY ABSENT audit logs at runtime instead of a loud build failure. No gap is
 # currently known for 17 or 18 -- this guards the failure MODE, not its likelihood.
 RUN apt-get update && \
-    for pkg in postgresql-${PG_MAJOR} postgresql-${PG_MAJOR}-repmgr postgresql-${PG_MAJOR}-pgaudit; do \
+    for pkg in postgresql-${PG_MAJOR} postgresql-${PG_MAJOR}-pgaudit; do \
         apt-cache policy "$pkg" | grep -qE '^[[:space:]]*Candidate: [0-9]' || { \
             echo "FATAL: no installation candidate for ${pkg} (PG_MAJOR=${PG_MAJOR}) in the PGDG repository for $(lsb_release -cs)" >&2; \
             exit 1; \
@@ -64,15 +64,14 @@ RUN apt-get update && \
     done && \
     apt-get install -y \
     postgresql-${PG_MAJOR} \
-    postgresql-${PG_MAJOR}-repmgr \
     postgresql-${PG_MAJOR}-pgaudit \
     pgbackrest \
     cron \
     && rm -rf /var/lib/apt/lists/*
 
-# Publish the major to the runtime: repmgr-common.sh derives PG_BINDIR from it for the
-# shell entrypoints, and the Go agent reads it to locate postgres/pg_controldata. Both
-# fall back to 18 when unset, so an older image without this ENV still works.
+# Publish the major to the runtime: pg-common.sh derives PG_BINDIR from it for the shell
+# entrypoint, and the Go agent reads it to locate postgres/pg_controldata. Both fall back to
+# 18 when unset, so an older image without this ENV still works.
 ENV PG_MAJOR=${PG_MAJOR}
 
 # NOTE: kubectl is deliberately NOT installed. It existed only for the repmgrd-mode
@@ -80,26 +79,21 @@ ENV PG_MAJOR=${PG_MAJOR}
 # API server through client-go in its own binary, and the pgbackrest CronJobs run
 # kubectl from their own alpine/k8s image -- so nothing in this image shells out to it.
 
-# Create repmgr user and directories
-RUN useradd -r -s /bin/bash repmgr && \
-    mkdir -p /var/lib/postgresql/data && \
-    mkdir -p /var/log/repmgr && \
-    mkdir -p /etc/repmgr && \
-    chown -R postgres:postgres /var/lib/postgresql && \
-    chown -R repmgr:repmgr /var/log/repmgr && \
-    chown -R postgres:postgres /etc/repmgr
+# The data directory. The `repmgr` OS user, /etc/repmgr and /var/log/repmgr went with the
+# package (#290): nothing in this image reads a repmgr.conf or writes a repmgr log any more.
+# The `repmgr` DATABASE and ROLE inside PostgreSQL are a different thing and still exist --
+# the agent authenticates as that role for replication (renaming them is #291).
+RUN mkdir -p /var/lib/postgresql/data && \
+    chown -R postgres:postgres /var/lib/postgresql
 
 # Copy configuration and scripts
-COPY repmgr.conf /etc/repmgr/repmgr.conf.template
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY init-repmgr.sh /usr/local/bin/init-repmgr.sh
-# Sourced (not executed) by entrypoint.sh + init-repmgr.sh -- shared timeline/topology
-# helpers, single definition for the image's shell scripts (#177). No +x needed.
-COPY repmgr-common.sh /usr/local/bin/repmgr-common.sh
+# Sourced (not executed) by entrypoint.sh -- PG_BINDIR / require_pg_bindir (#269). Replaced
+# repmgr-common.sh, whose topology/timeline helpers only the deleted repmgr paths used. No +x.
+COPY pg-common.sh /usr/local/bin/pg-common.sh
 
 # Make scripts executable
-RUN chmod +x /usr/local/bin/entrypoint.sh \
-    /usr/local/bin/init-repmgr.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Go HA agent binary (used by the entrypoint "agent" failover mode)
 COPY --from=agent-build /out/pg-ha-agent /usr/local/bin/pg-ha-agent
@@ -108,7 +102,7 @@ RUN chmod +x /usr/local/bin/pg-ha-agent
 # Set working directory
 WORKDIR /var/lib/postgresql
 
-# Expose repmgr ports
+# PostgreSQL
 EXPOSE 5432
 
 # Default entrypoint (can be overridden for different use cases)

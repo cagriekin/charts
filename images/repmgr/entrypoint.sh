@@ -3,212 +3,20 @@ set -e
 
 SCRIPT_NAME=${1:-default}
 
-# Shared topology/timeline helpers (tl_to_int, remote_node_timeline_int,
-# local_node_timeline_int): one definition for the image's shell scripts so a fix
-# can't land in only some copies (#177).
-source /usr/local/bin/repmgr-common.sh
+# PG_BINDIR / require_pg_bindir (#269). The repmgr topology and timeline helpers this file
+# used to source alongside them went with the mechanism (#290) -- their only callers were the
+# repmgr paths removed below.
+source /usr/local/bin/pg-common.sh
 
-# Scan sibling StatefulSet pods for an active primary and the newest timeline
-# seen. Sets REACHED_ANY/FOUND_PRIMARY/NEWEST_TLI/NEWEST_PEER. Timeline comes
-# from the WAL insert position (pg_walfile_name(pg_current_wal_lsn())), which
-# reflects a fast promotion immediately -- pg_control_checkpoint() keeps the
-# pre-promotion timeline until the spread end-of-recovery checkpoint completes
-# (minutes under load), which would let a stale primary slip through.
-scan_peers() {
-    REACHED_ANY=0; FOUND_PRIMARY=0; NEWEST_TLI=0; NEWEST_PEER=""
-    local ru="${REPMGR_USER:-repmgr}" rd="${REPMGR_DB:-repmgr}"
-    local ordinal="${HOSTNAME##*-}" base="${HOSTNAME%-*}"
-    local node_count="${REPMGR_NODE_COUNT:-10}"
-    case "$node_count" in ''|*[!0-9]*) node_count=10 ;; esac
-    local i peer in_recovery remote_tli
-    for i in $(seq 0 $((node_count - 1))); do
-        [ "$i" = "$ordinal" ] && continue
-        peer="${base}-${i}.${HEADLESS_SERVICE}"
-        PGPASSWORD="$REPMGR_PASSWORD" pg_isready -t 3 -h "$peer" -p 5432 -U "$ru" -d "$rd" >/dev/null 2>&1 || continue
-        REACHED_ANY=1
-        in_recovery=$(PGPASSWORD="$REPMGR_PASSWORD" psql -tAX -h "$peer" -p 5432 -U "$ru" -d "$rd" -c "SELECT pg_is_in_recovery();" 2>/dev/null) || in_recovery=""
-        [ "$in_recovery" = "f" ] || continue
-        FOUND_PRIMARY=1
-        remote_tli=$(remote_node_timeline_int "$peer")
-        [ -n "$remote_tli" ] || continue
-        if [ "$remote_tli" -gt "$NEWEST_TLI" ]; then NEWEST_TLI="$remote_tli"; NEWEST_PEER="$peer"; fi
-    done
-    return 0
-}
-
-# True when a primary was already recorded for this cluster, i.e. the durable
-# #125 primary-marker ConfigMap exists. Distinguishes a genuine first install
-# (no marker -> safe to initialize after one fast scan) from a PVC-loss recreate
-# of an empty pod while a cluster already exists (marker present -> settle before
-# concluding, so a briefly-unreachable primary is not missed and we don't initdb
-# a divergent cluster, #170). Needs kubectl + the marker name/namespace; if
-# either is absent (non-repmgr use, or kubectl/API unavailable) it returns
-# false, preserving the prior single-scan behavior so a first install never
-# pays the settle latency.
-cluster_was_established() {
-    [ -n "${PRIMARY_MARKER:-}" ] && [ -n "${NAMESPACE:-}" ] || return 1
-    # Bounded: this runs before initdb on every fresh boot, so a throttled or
-    # unreachable API (the same client-go rate limiting that stalls installs on
-    # starved nodes) must not hang the guard. --request-timeout caps the API
-    # call; the outer `timeout` caps DNS/dial hangs. On any timeout/error we
-    # return non-zero -> fast single-scan path, never a stall before initdb.
-    timeout 5 kubectl get configmap "$PRIMARY_MARKER" -n "$NAMESPACE" --request-timeout=3s >/dev/null 2>&1
-}
-
-# Bounded settle for the empty-data path: re-scan peers until an active primary
-# is found (caller then refuses to initdb) or the attempts are exhausted. Unlike
-# the existing-data path it must NOT stop early just because some peer is
-# reachable -- on an EMPTY data dir a reachable standby is not proof the primary
-# is gone, and the primary may be transiently unreachable in any single scan
-# window; stopping there would initdb a divergent cluster (#170). Sets the same
-# FOUND_PRIMARY/NEWEST_PEER globals scan_peers does.
-settle_scan_for_primary() {
-    local attempts="${REPMGR_STALE_CHECK_ATTEMPTS:-5}" attempt
-    case "$attempts" in ''|*[!0-9]*) attempts=5 ;; esac
-    for attempt in $(seq 1 "$attempts"); do
-        scan_peers
-        [ "$FOUND_PRIMARY" = "1" ] && break
-        [ "$attempt" -lt "$attempts" ] && { echo "stale-primary guard (empty data, primary marker present): no active primary found yet (attempt ${attempt}/${attempts}); settling 3s" >&2; sleep 3; }
-    done
-}
-
-# Re-clone PGDATA from $1 (primary host) WITHOUT destroying the current data
-# until the clone succeeds. rm -rf'ing PGDATA before the clone leaves an empty
-# data dir with no recoverable copy if every clone attempt fails (#175). Instead
-# move the contents to a sibling backup on the same volume (a fast rename),
-# clone into the emptied PGDATA, drop the backup only after a successful clone,
-# and keep it for manual recovery on failure. Returns 0 on success, 1 on
-# failure. Costs up to ~2x PGDATA disk during the re-clone.
-reclone_preserving_old() {
-    local primary="$1"
-    local ru="${REPMGR_USER:-repmgr}" rd="${REPMGR_DB:-repmgr}"
-    local backup="${PGDATA%/}.diverged.$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$backup"
-    ( shopt -s dotglob nullglob; mv "${PGDATA}"/* "$backup"/ 2>/dev/null ) || true
-    local a
-    for a in $(seq 1 5); do
-        if PGPASSWORD="$REPMGR_PASSWORD" repmgr -h "$primary" -U "$ru" -d "$rd" -f /etc/repmgr/repmgr.conf standby clone --force; then
-            rm -rf "$backup"
-            return 0
-        fi
-        echo "stale-primary guard: clone attempt ${a} from ${primary} failed; retrying in 5s" >&2
-        sleep 5
-    done
-    echo "stale-primary guard: re-clone from ${primary} failed; diverged data preserved at ${backup} for manual recovery" >&2
-    return 1
-}
-
-# Prevent a former primary from resuming read-write on a stale timeline after a
-# standby was promoted while this node's CONTAINER (not pod) was down -- the
-# init container, which holds the re-clone logic, does not re-run on a
-# container-only restart (CrashLoopBackOff, OOM, liveness kill). Repmgr-managed
-# nodes only; no-op for standalone use of the image.
+# The repmgr-only helpers that lived here are gone (#290): scan_peers,
+# cluster_was_established, settle_scan_for_primary, reclone_preserving_old and
+# primary_safety_guard. Every one of them existed to drive `repmgr node rejoin` /
+# `repmgr standby clone` from the shell BEFORE the agent started, and every one was already
+# skipped under the native mechanism. The agent owns all of it now: it decides bootstrap vs
+# clone vs rejoin from the lease and the timeline (reconcile.Decide), clones with
+# pg_basebackup and rewinds with pg_rewind, and it does so as a supervised child rather than
+# from a pre-start shell that could not be fenced.
 #
-# Repmgr-mechanism only (#288). Its rejoin and re-clone paths shell out to `repmgr node
-# rejoin` and `repmgr standby clone`, which do not exist as concepts under native mode --
-# there the agent owns both (RejoinForceRewind via pg_rewind, Clone via pg_basebackup) and
-# does them from its own reconcile loop with the Lease as the authority for who is primary.
-# Running this first would rewind or wipe a data directory on the strength of a peer scan
-# that has no notion of the lease, which is exactly the divergence the agent exists to
-# prevent.
-#
-# Now that native mode can actually run a multi-node cluster, "harmless because native only
-# ever runs a lone primary" no longer holds, so the gate is explicit rather than relying on
-# repmgr.conf being absent (init-repmgr.sh does skip writing it under native, and the
-# file check below still stands as a second line of defence).
-primary_safety_guard() {
-    # MECHANISM defaults to native, matching internal/config's own default (#294). It defaulted to
-    # repmgr while that mechanism existed; leaving it there once the Go agent flipped would make the
-    # two halves of the SAME container disagree, and this repo's release is deliberately two-step --
-    # publish the image, then bump repmgr.image.tag. In that window a chart that omits MECHANISM
-    # (any release before #294 emitted it only at a non-default value) would pair a native agent
-    # with a repmgr shell: init-repmgr.sh would enter a repmgr.nodes registration poll nothing can
-    # satisfy (~240s, then exit 1 -> Init:CrashLoopBackOff on every standby) and bootstrap_initdb
-    # would bake the repmgr preload GUC into the primary's config and clone it everywhere.
-    if [ "${MECHANISM:-native}" = "native" ]; then
-        echo "stale-primary guard: skipped (MECHANISM=native; the agent owns rejoin and re-clone)"
-        return 0
-    fi
-    [ -f /etc/repmgr/repmgr.conf ] || return 0
-    [ -n "${HEADLESS_SERVICE:-}" ] || return 0
-    [ -n "${REPMGR_PASSWORD:-}" ] || return 0
-    [ -f "$PGDATA/standby.signal" ] && return 0   # already a standby; init/repmgrd own recovery
-
-    local ru="${REPMGR_USER:-repmgr}" rd="${REPMGR_DB:-repmgr}"
-
-    if [ ! -s "$PGDATA/PG_VERSION" ]; then
-        # Empty data dir. Initializing here while a peer is already primary forks
-        # a divergent cluster (#125), so refuse if any peer is primary. A genuine
-        # first install has no marker yet -> a single fast scan keeps install
-        # latency low (the common path is unchanged). Only when the durable
-        # primary marker shows a cluster was already established -- i.e. this
-        # empty pod is a PVC-loss recreate -- do we settle/retry the scan, so a
-        # briefly-unreachable primary is not missed in one scan window (#170).
-        # The settle therefore never delays a first install. (If an operator has
-        # deleted the marker to deliberately accept data loss, this falls to the
-        # fast path -- the documented escape hatch.)
-        if cluster_was_established; then
-            settle_scan_for_primary
-        else
-            scan_peers
-        fi
-        if [ "$FOUND_PRIMARY" = "1" ]; then
-            echo "FATAL: data directory is empty but ${NEWEST_PEER:-a peer} is an active primary; refusing to initialize a divergent database. Recreate this pod with persistent storage, or clone it manually." >&2
-            exit 1
-        fi
-        return 0
-    fi
-
-    # Existing data that would start read-write. Settle only while NO peer is
-    # reachable (correlated restart): if peers answer and none is a newer
-    # primary, this node is healthy and starts immediately (no latency added).
-    local attempts="${REPMGR_STALE_CHECK_ATTEMPTS:-5}" attempt
-    case "$attempts" in ''|*[!0-9]*) attempts=5 ;; esac
-    for attempt in $(seq 1 "$attempts"); do
-        scan_peers
-        [ "$NEWEST_TLI" -gt 0 ] && break
-        [ "$REACHED_ANY" = "1" ] && break
-        [ "$attempt" -lt "$attempts" ] && { echo "stale-primary guard: no peer reachable yet (attempt ${attempt}/${attempts}); settling 3s" >&2; sleep 3; }
-    done
-
-    local local_tli
-    local_tli=$(local_node_timeline_int "$PGDATA")
-    case "$local_tli" in
-        ''|*[!0-9]*)
-            if [ "$NEWEST_TLI" -gt 0 ]; then
-                echo "FATAL: cannot read local timeline while ${NEWEST_PEER} is an active primary on timeline ${NEWEST_TLI}; refusing to start read-write" >&2
-                exit 1
-            fi
-            return 0 ;;
-    esac
-
-    if [ "$NEWEST_TLI" -gt "$local_tli" ]; then
-        echo "stale-primary guard: ${NEWEST_PEER} is primary on timeline ${NEWEST_TLI}, local timeline is ${local_tli}; rejoining as standby" >&2
-        local conninfo="host=${NEWEST_PEER} port=5432 user=${ru} dbname=${rd} connect_timeout=10"
-        # node rejoin needs a dormant node and rewinds via pg_rewind (PG18
-        # initdb enables data checksums, so pg_rewind is available). It starts
-        # the node to verify it attaches; stop it afterward so the postmaster
-        # can run as the container's main process via the exec below.
-        #
-        # repmgr opens a SEPARATE replication connection to the rejoin target for
-        # the rewind; a password inlined in the -d conninfo does not carry into it,
-        # so the rewind fails with "unable to establish a replication connection to
-        # the rejoin target node" and the guard always fell back to a full re-clone
-        # (#178). Supply the credential via PGPASSWORD (libpq uses it for every
-        # connection, including the replication one and pg_rewind's source-server),
-        # exactly as the clone path above does -- and keep the secret out of argv.
-        if PGPASSWORD="$REPMGR_PASSWORD" repmgr -f /etc/repmgr/repmgr.conf node rejoin -d "$conninfo" --force-rewind --config-files=postgresql.conf,pg_hba.conf; then
-            pg_ctl -D "$PGDATA" -m fast -w stop >/dev/null 2>&1 || true
-            echo "stale-primary guard: rejoin complete; starting as standby" >&2
-        else
-            echo "stale-primary guard: pg_rewind rejoin failed; falling back to full re-clone from ${NEWEST_PEER}" >&2
-            pg_ctl -D "$PGDATA" -m immediate -w stop >/dev/null 2>&1 || true
-            reclone_preserving_old "$NEWEST_PEER" || { echo "FATAL: re-clone failed after rejoin failure" >&2; exit 1; }
-        fi
-    fi
-    return 0
-}
-
 # bootstrap_initdb creates a brand-new cluster in an empty PGDATA: initdb, the base GUCs,
 # pg_hba, and the managed roles/databases. Extracted into a function so it has exactly ONE
 # implementation shared by both mechanisms (#288).
@@ -245,18 +53,13 @@ max_replication_slots = 10
 max_slot_wal_keep_size = 4GB
 EOF
 
-    # #288/#293: repmgr's shared library is preloaded only under the repmgr mechanism. A native
-    # cluster has no repmgr extension (the CREATE EXTENSION below is skipped), so preloading
-    # repmgr.so is pure liability -- and this line is baked into the primary's postgresql.conf
-    # and then cloned verbatim to every standby, so it would make every native cluster created
-    # by this code UNSTARTABLE ("could not access file \"repmgr\"") the moment #290/#294 drop
-    # the repmgr package from the image. Removing it from an EXISTING data directory, and the
-    # render-time guard, remain #293's half.
-    if [ "${MECHANISM:-native}" != "native" ]; then
-        echo "shared_preload_libraries = 'repmgr'" >> "$PGDATA/postgresql.conf"
-    else
-        echo "MECHANISM=native: not preloading repmgr.so (no repmgr extension on this cluster, #288)"
-    fi
+    # No shared_preload_libraries line at all (#290). This used to append
+    # `shared_preload_libraries = 'repmgr'` here, which #293 then had to strip back out of every
+    # existing data directory -- because the line is baked into the primary's postgresql.conf and
+    # cloned verbatim to every standby, so it outlives any chart change and any helm rollback.
+    # The image no longer ships repmgr.so, so writing it would make every cluster this code
+    # creates unstartable ("could not access file \"repmgr\""). The agent still strips it from
+    # inherited directories; nothing writes it any more.
 
     if [ "${PGBACKREST_ENABLED:-}" = "true" ]; then
         cat >> "$PGDATA/postgresql.conf" << PGBR
@@ -342,15 +145,10 @@ EOF
     # Dropping them would break native outright. Renaming them out of the repmgr
     # namespace is #291 (ha.* values), not this issue.
     #
-    # The EXTENSION is the part native genuinely never uses -- it creates the repmgr
-    # schema and the nodes table this issue exists to stop reading. Skipping it means a
-    # native-mode cluster has no repmgr.nodes at all, so there is no stale cache for
-    # anything to fall back to by accident.
-    if [ "${MECHANISM:-native}" != "native" ]; then
-        psql -U postgres -d ${REPMGR_DB} -c "CREATE EXTENSION IF NOT EXISTS repmgr;" 2>/dev/null || true
-    else
-        echo "MECHANISM=native: skipping CREATE EXTENSION repmgr (the nodes table is not a topology source any more, #288)"
-    fi
+    # No CREATE EXTENSION repmgr (#290): the extension does not exist in this image, and the
+    # nodes table it created stopped being a topology source in #288. A cluster inherited from a
+    # 1.x release still HAS the extension -- dropping it is the operator's opt-in cleanup step
+    # (#292), never something an upgrade does on its own.
 
     # Verify the bootstrap actually produced the load-bearing objects, while the postmaster is
     # still UP to be asked (#294 review). Every role/database step above ends in
@@ -413,24 +211,18 @@ case "$SCRIPT_NAME" in
             exec gosu postgres "$0" "$@"
         fi
 
-        primary_safety_guard
-
-        # repmgr mode initdbs inline exactly as before (the function no-ops when PGDATA
-        # already holds a cluster). Native mode must NOT: the init container no longer clones,
-        # so every pod would arrive here empty and create its own cluster with its own
-        # system_identifier, which assertSameCluster refuses to rejoin -- Running, never Ready,
-        # holding a bogus database. Under native the agent decides: the lease holder runs
-        # `entrypoint.sh initdb`, everyone else waits and then clones (#288).
-        if [ "${MECHANISM:-native}" != "native" ]; then
-            bootstrap_initdb
-        elif [ ! -s "$PGDATA/PG_VERSION" ]; then
-            echo "MECHANISM=native: empty data directory; deferring to the agent (initdb if lease holder, else clone) (#288)"
+        # This shell never initdbs any more (#290). The agent decides: only the lease holder
+        # bootstraps, via `entrypoint.sh initdb` from the BootstrapInitdb action, and every other
+        # pod waits and then clones with pg_basebackup (#288). Doing it here would give each pod
+        # its own cluster with its own system_identifier, which assertSameCluster (invariant 9)
+        # then refuses to rejoin forever -- Running, never Ready, holding a bogus database.
+        if [ ! -s "$PGDATA/PG_VERSION" ]; then
+            echo "empty data directory; deferring to the agent (initdb if lease holder, else clone) (#288)"
         fi
 
-        # agent mode: hand off to the Go HA agent as PID 1; it generates
-        # repmgr.conf (failover=manual), starts/supervises PostgreSQL, and runs the
-        # lease-based failover loop. postgres mode runs the postmaster directly
-        # (repmgrd-mode path).
+        # agent mode: hand off to the Go HA agent as PID 1; it writes its own config, starts and
+        # supervises PostgreSQL, and runs the lease-based failover loop. postgres mode runs the
+        # postmaster directly (used by the standalone, non-HA path).
         if [ "$SCRIPT_NAME" = "agent" ]; then
             echo "Starting pg-ha-agent (PID 1; the agent manages PostgreSQL)..."
             exec /usr/local/bin/pg-ha-agent
@@ -451,7 +243,17 @@ case "$SCRIPT_NAME" in
         bootstrap_initdb
         ;;
     "init")
-        exec /usr/local/bin/init-repmgr.sh
+        # The init container (#290). init-repmgr.sh is gone: everything past its
+        # `MECHANISM=native` early-exit was repmgr work -- writing repmgr.conf, polling
+        # repmgr.nodes for a registered primary, cloning with `repmgr standby clone` -- and the
+        # agent does all of it now, from inside the postgresql container where it can be fenced.
+        #
+        # What remains is worth keeping as its own container: fail the pod HERE, in Init, when
+        # PG_MAJOR names a major this image does not bundle. Reaching the main container first
+        # would surface the same mismatch as `initdb: command not found` or a clone loop (#269).
+        require_pg_bindir || exit 1
+        echo "init: PostgreSQL ${PG_MAJOR} binaries present at ${PG_BINDIR}; the agent owns bootstrap and cloning (#288/#290)."
+        exit 0
         ;;
     *)
         # repmgrd / service-updater were removed with the repmgrd failover path (#286).
