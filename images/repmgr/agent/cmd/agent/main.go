@@ -960,10 +960,12 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// query would consume the whole budget and the promote would finish WITHOUT its
 		// routing switch -- a write outage until the next tick, which is strictly worse than
 		// the WAL gap this call exists to prevent. Half the budget keeps the cutover funded.
+		var promoteSlots []pg.SlotState
+		var promoteSlotsRead bool
 		func() {
 			sctx, scancel := context.WithTimeout(wctx, a.fenceBudget()/2)
 			defer scancel()
-			a.slotsTick(sctx)
+			promoteSlots, promoteSlotsRead = a.slotsTick(sctx)
 		}()
 		if tl, _, ok, _ := a.prober.PrimaryWALPosition(wctx, a.selfConn()); ok {
 			a.advanceMarker(wctx, tl, true, obs.Marker)
@@ -999,7 +1001,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// LAST, not ahead of routing (a hung slot query must not starve the assertion that
 		// actually matters for correctness this tick).
 		routingErr := a.assertPrimaryRouting(wctx, obs)
-		a.assertSyncStandbySlots(wctx)
+		a.assertSyncStandbySlots(wctx, promoteSlots, promoteSlotsRead)
 		return routingErr
 
 	case reconcile.StayPrimary:
@@ -1028,7 +1030,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// scale-down or a repmgr->native migration left pinning WAL. Bounded by the same
 		// fence-budget context. Only the mutation half is mechanism-gated -- the gauges the
 		// shipped alerts read must be truthful under repmgr too (see slotsTick).
-		a.slotsTick(wctx)
+		staySlots, staySlotsRead := a.slotsTick(wctx)
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
@@ -1050,7 +1052,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		routingErr := a.assertPrimaryRouting(wctx, obs)
 		// #308: keep synchronized_standby_slots current as standbys scale up/down. After the
 		// routing switch, not before -- same fence-budget priority as the Promote case.
-		a.assertSyncStandbySlots(wctx)
+		a.assertSyncStandbySlots(wctx, staySlots, staySlotsRead)
 		return routingErr
 
 	case reconcile.Follow:
@@ -1111,7 +1113,8 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// Master's structure is kept deliberately over #287's early `return nil` on the
 		// already-streaming shortcut: the #308 dbname convergence below MUST run on that path
 		// too (its own comment explains why), and an early return here skipped it.
-		if regErr != nil || !a.streamingFromTarget(ctx, dec.Target) {
+		followRan := regErr != nil || !a.streamingFromTarget(ctx, dec.Target)
+		if followRan {
 			if err := a.mech.Follow(ctx, upConn); err != nil {
 				// #297: this node has no row in its own metadata copy -- a freshly-cloned standby
 				// whose upstream changed before it registered. It can never obtain the row (that
@@ -1167,8 +1170,15 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// sufficient to make the walreceiver reconnect to the new upstream). Skipping
 		// this would leave native mode's Follow silently inert: the file changes, but
 		// nothing tells the running postmaster to pick it up (#287).
-		if err := a.sup.Reload(ctx); err != nil {
-			return fmt.Errorf("reload after follow: %w", err)
+		//
+		// Gated on a Follow having actually RUN (rebase review): neither parent reloaded on the
+		// already-streaming shortcut, and doing so SIGHUPs a healthy standby for nothing --
+		// worse, a failing reload there returns an error without latching, so the branch
+		// re-enters every tick with nothing to apply. It also double-reloaded on the #308 path.
+		if followRan {
+			if err := a.sup.Reload(ctx); err != nil {
+				return fmt.Errorf("reload after follow: %w", err)
+			}
 		}
 		a.latchFollow(dec.Target)
 		return nil
@@ -2065,8 +2075,18 @@ func (a *agent) assertPrimaryRouting(ctx context.Context, obs reconcile.Observat
 // to prevent, so a registered-but-not-yet-slotted standby is excluded until its slot
 // shows up (typically the same tick, since the clone/follow path that registers a
 // standby is also what creates its slot).
-func (a *agent) assertSyncStandbySlots(ctx context.Context) {
+// existing is the slot list slotsTick already read this tick, and read says whether that read
+// succeeded (#289 widened PhysicalSlots from []string to []SlotState; this caller needs only
+// existence). Passed in rather than re-queried: both run inside the same fenceBudget() window on
+// a read-write node, and a second round-trip there competes with the marker write and the
+// routing switch. An empty-but-successful read is NOT a skip -- see the unconditional first
+// reconcile below.
+func (a *agent) assertSyncStandbySlots(ctx context.Context, existing []pg.SlotState, read bool) {
 	if !a.cfg.SyncReplicationSlots {
+		return
+	}
+	if !read {
+		a.log.Warn("could not read the physical slots this tick; skipping the synchronized_standby_slots reconcile")
 		return
 	}
 	standbyIDs, err := a.prober.StandbyNodeIDs(ctx, a.selfConn())
@@ -2074,13 +2094,6 @@ func (a *agent) assertSyncStandbySlots(ctx context.Context) {
 		a.log.Warn("list repmgr.nodes for synchronized_standby_slots", "err", err)
 		return
 	}
-	existing, err := a.prober.PhysicalSlots(ctx, a.selfConn())
-	if err != nil {
-		a.log.Warn("read physical slots for synchronized_standby_slots", "err", err)
-		return
-	}
-	// #289 widened PhysicalSlots from []string to []SlotState (it also reports active,
-	// wal_status and retained WAL for the slot gauges). This caller only needs existence.
 	existingSet := make(map[string]bool, len(existing))
 	for _, s := range existing {
 		existingSet[s.Name] = true
@@ -2502,12 +2515,18 @@ func isCloneConnection(r pg.ReplicaRow) bool { return r.AppName == "pg_basebacku
 // Mutation stays native-only: under the repmgr mechanism repmgr owns slot lifecycle (it
 // creates/attaches slots during standby clone/follow), so two owners would fight over the
 // same objects.
-func (a *agent) slotsTick(ctx context.Context) {
+// The returned slice is what observeSlots read, so a caller needing the same list (#308's
+// assertSyncStandbySlots) reuses it instead of issuing a second psql on the same fence budget.
+// The bool reports whether the read SUCCEEDED, which nil cannot: a primary with no slots at
+// all returns an empty slice legitimately, and #308's first reconcile of a term must still run
+// on that (desired=="" is a real value, not a skip).
+func (a *agent) slotsTick(ctx context.Context) ([]pg.SlotState, bool) {
 	slots, ok := a.observeSlots(ctx)
 	if !ok {
-		return
+		return nil, false
 	}
 	a.reconcileSlots(ctx, slots)
+	return slots, true
 }
 
 // standbySlotsTick is the slot pass for a node running as a STANDBY (#289 review).

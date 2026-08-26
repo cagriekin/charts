@@ -835,10 +835,11 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        freeform string (no schema enum), so nothing else catches
        syncReplicationSlots=true paired with an older major before it reaches a running
        cluster; fail at render time instead. Scoped to agent mode, matching the
-       postgresql-configmap.yaml/statefulset.yaml render condition -- the value is
-       already a no-op outside agent mode (see repmgr.agent.cascadingReplication for the
-       same pattern), so it should not block an unrelated repmgrd-mode/older-major
-       install that merely left the value set from a prior config. */}}
+       postgresql-configmap.yaml/statefulset.yaml render condition. That scoping is
+       vestigial since 2.0.0 -- #286 made the agent the only failover path, so
+       pg.agentMode is true whenever repmgr.enabled is -- but it is kept because it still
+       distinguishes a standalone (repmgr.enabled: false) install, which renders none of
+       this and must not be blocked by a leftover value. */}}
 {{- define "pg.validateSyncReplicationSlotsMajor" -}}
 {{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
 {{- if lt (atoi (toString .Values.postgresql.majorVersion)) 17 }}
@@ -857,6 +858,26 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
 {{- if ne (.Values.postgresql.walLevel | default "replica") "logical" }}
 {{- fail (printf "repmgr.agent.syncReplicationSlots requires postgresql.walLevel: logical (the sync_replication_slots worker it enables on every standby fails its own startup validation below that, and PostgreSQL restarts it forever, logging the failure on a fixed interval), but postgresql.walLevel=%q. Set postgresql.walLevel to \"logical\", or set repmgr.agent.syncReplicationSlots to false." (.Values.postgresql.walLevel | default "replica")) }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- /* #308 x #288: syncReplicationSlots is repmgr-MECHANISM only, and must fail rather than
+       degrade quietly under native. assertSyncStandbySlots resolves the standby set from
+       repmgr.nodes and names slots repmgr_slot_<node_id>; a native cluster has no repmgr
+       extension and no repmgr.nodes at all, and its slots are pg_ha_slot_<ordinal>. So the
+       reconcile errors on every primary tick, synchronized_standby_slots is never set -- while
+       the chart still renders sync_replication_slots = on for every standby. The visible result
+       is one repeating log warning; the real result is that a logical failover slot's decode
+       position can advance past the standby that will need it, which is precisely the hazard
+       #308 exists to prevent. Refusing at render time is the same treatment cascadingReplication
+       gets with native, for the same reason: a feature that silently does nothing is worse than
+       one that will not install. Teaching the reconcile to use the native slot names is its own
+       change, not a validation. */}}
+{{- define "pg.validateSyncReplicationSlotsMechanism" -}}
+{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
+{{- if eq ((.Values.repmgr.agent).mechanism | default "repmgr") "native" }}
+{{- fail "repmgr.agent.syncReplicationSlots is not supported with repmgr.agent.mechanism: native (#308/#288): the synchronized_standby_slots reconcile resolves standbys from repmgr.nodes and names slots repmgr_slot_<node_id>, neither of which exists under native, so it would silently never run while every standby still enabled sync_replication_slots. Set repmgr.agent.mechanism to \"repmgr\", or set repmgr.agent.syncReplicationSlots to false." }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -898,8 +919,8 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
       "REPMGR_USER" "REPMGR_PASSWORD" "REPMGR_DB" "REPMGR_NODE_COUNT" "HEADLESS_SERVICE"
       "NAMESPACE" "PRIMARY_MARKER" "POD_NAME" "POD_SELECTOR" "POD_CIDR" "MASTER_SERVICE"
       "LEASE_NAME" "LEASE_DURATION" "RENEW_DEADLINE" "RETRY_PERIOD" "RECONCILE_INTERVAL"
-      "CASCADE_REPLICATION" "SYNC_REPLICATION_SLOTS" "POSTGRESQL_PGHBA" "TLS_REQUIRE_SSL" "TLS_CLIENT_CERT_AUTH"
-      "CASCADE_REPLICATION" "MECHANISM" "POSTGRESQL_PGHBA" "TLS_REQUIRE_SSL" "TLS_CLIENT_CERT_AUTH"
+      "CASCADE_REPLICATION" "SYNC_REPLICATION_SLOTS" "MECHANISM" "POSTGRESQL_PGHBA"
+      "TLS_REQUIRE_SSL" "TLS_CLIENT_CERT_AUTH"
       "MONITORING_USER" "MIGRATE_LEGACY_MD5_USERS" "SPLIT_BRAIN_ACTION"
       "DCS_BACKEND" "ETCD_ENDPOINTS" "ETCD_PREFIX" "ETCD_TLS_CERT" "ETCD_TLS_KEY" "ETCD_TLS_CA"
       "PGBACKREST_ENABLED" "PGBACKREST_STANZA" "PGBACKREST_REPO1_CIPHER_PASS"

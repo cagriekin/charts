@@ -901,7 +901,7 @@ func TestCleanupGhostNodes(t *testing.T) {
 func TestAssertSyncStandbySlotsNoOpWhenDisabled(t *testing.T) {
 	ex := &scriptedExec{slots: "repmgr_slot_1001|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
-	a.assertSyncStandbySlots(context.Background())
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
 	if len(ex.slotSyncSQL) != 0 {
 		t.Fatalf("expected no SQL when disabled, got %v", ex.slotSyncSQL)
 	}
@@ -915,7 +915,7 @@ func TestAssertSyncStandbySlotsReconciles(t *testing.T) {
 	ex := &scriptedExec{nodes: "1001\n1002\n", slots: "repmgr_slot_1001|t|0|reserved|t\nrepmgr_slot_1002|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background())
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
 	if len(ex.slotSyncSQL) != 2 {
 		t.Fatalf("expected ALTER SYSTEM + reload (2 calls), got %v", ex.slotSyncSQL)
 	}
@@ -937,7 +937,7 @@ func TestAssertSyncStandbySlotsOrderIndependent(t *testing.T) {
 	ex := &scriptedExec{nodes: "1002\n1001\n", slots: "repmgr_slot_1001|t|0|reserved|t\nrepmgr_slot_1002|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background())
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
 	if want := "repmgr_slot_1001,repmgr_slot_1002"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
 		t.Fatalf("lastSyncStandbySlots = %v, want %q (sorted regardless of repmgr.nodes row order)", a.lastSyncStandbySlots, want)
 	}
@@ -946,7 +946,7 @@ func TestAssertSyncStandbySlotsOrderIndependent(t *testing.T) {
 	}
 	// Same standbys, rows returned in the OTHER order -- must be treated as unchanged.
 	ex.nodes = "1001\n1002\n"
-	a.assertSyncStandbySlots(context.Background())
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
 	if len(ex.slotSyncSQL) != 2 {
 		t.Fatalf("second call with the same standbys in a different row order must not issue more SQL, got %v", ex.slotSyncSQL)
 	}
@@ -961,7 +961,7 @@ func TestAssertSyncStandbySlotsSurvivesABlip(t *testing.T) {
 	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background())
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
 	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
 		t.Errorf("lastSyncStandbySlots = %v, want %q", a.lastSyncStandbySlots, want)
 	}
@@ -975,7 +975,7 @@ func TestAssertSyncStandbySlotsExcludesGhostNodes(t *testing.T) {
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
 	a.cfg.NodeCount = 2 // live ordinals 0-1 -> node_id 1002 (ordinal 2) is a ghost
-	a.assertSyncStandbySlots(context.Background())
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
 	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
 		t.Errorf("lastSyncStandbySlots = %v, want %q (1002 excluded as a ghost)", a.lastSyncStandbySlots, want)
 	}
@@ -988,7 +988,7 @@ func TestAssertSyncStandbySlotsExcludesUnslottedStandby(t *testing.T) {
 	ex := &scriptedExec{nodes: "1001\n1002\n", slots: "repmgr_slot_1001|t|0|reserved|t\n"} // 1002 has no slot yet
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background())
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
 	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
 		t.Errorf("lastSyncStandbySlots = %v, want %q (1002 excluded, no slot yet)", a.lastSyncStandbySlots, want)
 	}
@@ -1003,7 +1003,7 @@ func TestAssertSyncStandbySlotsFirstReconcileIsUnconditionalEvenWhenEmpty(t *tes
 	ex := &scriptedExec{}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background())
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
 	if len(ex.slotSyncSQL) != 2 {
 		t.Fatalf("expected an unconditional first ALTER SYSTEM + reload even for an empty desired set, got %v", ex.slotSyncSQL)
 	}
@@ -1019,7 +1019,7 @@ func TestActClearsLastSyncStandbySlotsWhenNotPrimary(t *testing.T) {
 	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background())
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
 	if a.lastSyncStandbySlots == nil {
 		t.Fatal("expected a cached value after the first reconcile")
 	}
@@ -1037,11 +1037,11 @@ func TestAssertSyncStandbySlotsSkipsWhenUnchanged(t *testing.T) {
 	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background())
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
 	if len(ex.slotSyncSQL) != 2 {
 		t.Fatalf("first call: expected 2 SQL statements, got %v", ex.slotSyncSQL)
 	}
-	a.assertSyncStandbySlots(context.Background())
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
 	if len(ex.slotSyncSQL) != 2 {
 		t.Fatalf("second call with an unchanged slot set must not issue more SQL, got %v", ex.slotSyncSQL)
 	}
@@ -2436,4 +2436,16 @@ func TestAdoptRestoreIsANoopWithoutAClaim(t *testing.T) {
 	if _, err := os.Stat(a.cfg.RestoreStatusPath()); !os.IsNotExist(err) {
 		t.Errorf("a record was created for a volume that was never restored (stat err=%v)", err)
 	}
+}
+
+// mustSlots reads the physical slot list the way a primary tick does, so the #308 tests exercise
+// assertSyncStandbySlots with exactly what slotsTick would hand it (rebase review: the function
+// takes the list instead of re-querying inside the fence budget).
+func mustSlots(t *testing.T, a *agent) []pg.SlotState {
+	t.Helper()
+	slots, err := a.prober.PhysicalSlots(context.Background(), a.selfConn())
+	if err != nil {
+		t.Fatalf("PhysicalSlots: %v", err)
+	}
+	return slots
 }
