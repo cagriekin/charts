@@ -2912,3 +2912,22 @@ func TestReleaseSlotOnFormerUpstream(t *testing.T) {
 		}
 	}
 }
+
+func TestBootstrapCloneLatchesTheCloneSourceAsUpstream(t *testing.T) {
+	// #294, second live finding: Clone provisions this node's slot ON THE SOURCE (always the
+	// lease holder). Under cascading replication the node then re-homes onto an intermediate,
+	// stranding that slot -- and releaseSlotOnFormerUpstream can only reclaim it if the clone
+	// source was latched, because it reads followUpstream. Observed live: a node whose FIRST
+	// post-clone Follow was already the cascade hop left an inactive slot on the primary,
+	// while one that transited the leader first was cleaned up.
+	ex := &scriptedExec{}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.PodName = "pg-2"
+	a.followUpstream = "" // act() clears it for every non-Follow action, including BootstrapClone
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.BootstrapClone, Target: "pg-0"}, reconcile.Observation{}); err != nil {
+		t.Fatalf("bootstrap clone: %v", err)
+	}
+	if a.followUpstream != "pg-0" {
+		t.Errorf("followUpstream = %q after cloning from pg-0, want \"pg-0\" -- the release path reads this", a.followUpstream)
+	}
+}

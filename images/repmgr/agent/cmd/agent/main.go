@@ -1246,6 +1246,24 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if _, err := a.ensurePrimaryConninfoDBName(); err != nil {
 			a.log.Warn("ensure dbname in primary_conninfo", "err", err)
 		}
+		// Latch the CLONE SOURCE as this node's upstream (#294, second live-cluster finding).
+		//
+		// Factually true -- Native.Clone ends by writing primary_conninfo pointing at the
+		// source, so this node streams from it the moment Start returns -- and load-bearing for
+		// releaseSlotOnFormerUpstream. Clone provisions this node's slot ON THE SOURCE, which is
+		// always the lease holder, so under cascading replication that slot is stranded the
+		// instant the node re-homes onto an intermediate. Without this latch, followUpstream is
+		// still "" on that first post-clone Follow, the release returns at its own guard, and
+		// nothing reclaims the slot: the primary's drop pass deliberately keeps any slot whose
+		// ordinal has a live pod. Observed live -- a node whose first Follow was already the
+		// cascade hop left an inactive slot on the primary, while a node that transited the
+		// leader first was cleaned up correctly. Whichever branch a node takes is a race on
+		// whether its cascade parent already qualifies, so the leaky path is the LIKELIER one
+		// for later ordinals.
+		//
+		// Safe for the stickiness logic in cascadeFollowTarget: it only honours a latched
+		// upstream that is not the leader, and this one always is.
+		a.latchFollow(dec.Target)
 		return a.sup.Start(ctx)
 
 	case reconcile.ReleaseLease:

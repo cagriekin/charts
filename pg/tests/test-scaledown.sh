@@ -126,6 +126,27 @@ while [[ ${elapsed} -lt 180 ]]; do
 done
 assert_eq "the departed ordinal 2 left the topology after scale-down (#139)" "1" "${gone}"
 
+# Wait for the SURVIVORS to re-converge before asserting on them (#294, live-run flake).
+# The loop above is not sufficient: under native, "ordinal 2 left the topology" is satisfied
+# on its very first poll, because the departed pod's pg_stat_replication row vanishes the
+# instant the pod dies -- it says nothing about whether a survivor is streaming yet. And this
+# scale-down is also a FAILOVER: the lease race consistently puts the primary on the trimmed
+# ordinal, so the same `helm upgrade` rolls both survivors in Parallel and the lease flaps
+# (observed: pod-0 -> pod-1 -> pod-0, converging after ~30s). Sampling inside that window made
+# the two assertions below fail on a cluster that then converged to exactly the asserted state.
+echo "  Waiting for the surviving standby to stream from the new primary (up to 180s)..."
+converged=0; elapsed=0
+while [[ ${elapsed} -lt 180 ]]; do
+  P=$(find_primary 1)
+  if [[ -n "${P}" ]]; then
+    st=$(pg_exec "${NAMESPACE}" "${P}" \
+      "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" repmgr repmgr 2>/dev/null | xargs || echo "")
+    [[ "${st}" == "1" ]] && { converged=1; break; }
+  fi
+  sleep 10; elapsed=$((elapsed + 10))
+done
+assert_eq "the surviving standby re-streams after the scale-down" "1" "${converged}"
+
 # The live nodes must NOT be unregistered (the discriminator is the ordinal, not
 # reachability -- a momentarily-down live node must never be treated as a ghost).
 P=$(find_primary 1)
