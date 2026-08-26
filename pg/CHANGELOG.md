@@ -4,6 +4,47 @@
 
 ### Removed (breaking)
 
+- **`native` is now the only replication mechanism, and the default** (#294). The `repmgr`
+  mechanism -- which shelled out to the repmgr CLI for `standby clone`, `standby follow`,
+  `standby promote` and `node rejoin`, and depended on the `repmgr.nodes` table -- is gone.
+
+  `repmgr.agent.mechanism` was introduced in this same unreleased major (#287) and was never
+  published, so **no released values file can be pinning it**. The key survives rather than
+  being deleted, so a stale `repmgr` copied from a pre-release branch fails the render with a
+  message naming the migration instead of being silently ignored, and so the `Mechanism` seam
+  stays addressable if a second implementation is ever wanted.
+
+  **This changes what a fresh install does.** The agent now drives PostgreSQL directly:
+  `pg_ctl promote`, `pg_basebackup`, `pg_rewind`, and `primary_conninfo` + `standby.signal`.
+  Topology comes from `pg_stat_replication` rather than a self-reported catalog, the bootstrap
+  is the agent's (the lease holder runs `initdb`; every other pod waits, then clones through
+  its own pre-created replication slot), and the agent owns physical slot lifecycle. Policy is
+  untouched: the Lease is still the sole authority for who is primary, and the timeline/LSN
+  election, fencing and Service routing are unchanged.
+
+  A native cluster has no `repmgr` extension and no `repmgr.nodes` at all. The `repmgr`
+  database and role remain, because the agent authenticates as that role for replication;
+  renaming them is #291.
+
+  **An existing 1.x cluster is still repmgr-shaped on disk and cannot be flipped in place
+  yet** (#292). Until that ships, `native` is for fresh installs — read the upgrade note
+  before upgrading a live HA cluster.
+
+  Removed with the mechanism: the `#297` promote-registration gate (its premise was a repmgr
+  metadata requirement), the `#139` `repmgr.nodes` ghost-row cleanup (there is no registry to
+  strand rows in — the *slot* residue a scale-down leaves is still reclaimed), `RegisterPrimary`
+  / `RegisterStandby` / `Unregister` from the `Mechanism` interface, the reclone-on-missing-
+  local-record escalation (`repmgr standby follow` needed a row it could not obtain without
+  replication; native has no equivalent deadlock), and the node-id offset's last propagating
+  consumers. The offset itself stays, for exactly one reader: reclaiming
+  `repmgr_slot_<node_id>` orphans a repmgr-created cluster leaves behind.
+
+  `pg_ha_agent_replicas_expected` is now measured on every install rather than only under
+  `native`; its help text changed accordingly.
+
+  CI drops the mechanism axis with it: 21 suites x 2 majors = 42 legs, no exclusions, down
+  from 62 with 11.
+
 - **`repmgr.failoverMode: repmgrd` and the repmgrd + service-updater sidecars are gone**
   (#286). The lease-based Go agent has been the default since `1.0.0` and `values.yaml`
   marked repmgrd deprecated "for one major cycle"; that cycle is over. The agent is now

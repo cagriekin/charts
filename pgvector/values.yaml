@@ -376,16 +376,17 @@ repmgr:
     # postgresql.walLevel: logical. See the pg chart README for detail.
     syncReplicationSlots: false
 
-    # EXPERIMENTAL -- do not set in production yet (#287). Which replication mechanics the
-    # agent drives: `repmgr` (default, the repmgr CLI) or `native` (pg_ctl promote,
-    # pg_basebackup, pg_rewind, primary_conninfo directly). Policy is identical either way.
-    # `native` now runs a real multi-node cluster (#288): topology comes from
-    # pg_stat_replication, and the lease holder initdbs while the rest clone via
-    # pg_basebackup. It owns its replication slots (#289), and #294 closed the last two
-    # feature gaps: syncReplicationSlots and cascadingReplication both work with it.
-    # An existing repmgr cluster cannot be flipped in place yet (#292), so it is for fresh
-    # installs. See the pg chart README.
-    mechanism: repmgr
+    # Which replication mechanics the agent drives (#287). `native` is the only value since
+    # #294 removed the repmgr mechanism and its CLI dependency; setting `repmgr` is rejected
+    # at render time with a message naming the migration. Policy does not live here -- the
+    # Lease, the timeline/LSN election, fencing and routing are unchanged.
+    #
+    # Native drives PostgreSQL directly (pg_ctl promote, pg_basebackup, pg_rewind,
+    # primary_conninfo + standby.signal), takes topology from pg_stat_replication, owns
+    # physical slot lifecycle (#289), and supports syncReplicationSlots and
+    # cascadingReplication (#294). Remaining gap: an existing repmgr cluster cannot be
+    # flipped in place yet (#292). See the pg chart README.
+    mechanism: native
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
     # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane
     # outage no longer self-demotes the primary (only an etcd quorum loss does);

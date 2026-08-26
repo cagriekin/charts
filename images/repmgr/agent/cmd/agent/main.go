@@ -11,7 +11,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -291,10 +290,7 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 	if err != nil {
 		return nil, err
 	}
-	mech, err := newMechanism(cfg, repmgrConf, pgBindir, log)
-	if err != nil {
-		return nil, err
-	}
+	mech := newMechanism(cfg, pgBindir)
 	return &agent{
 		cfg:    cfg,
 		log:    log,
@@ -439,10 +435,6 @@ func (a *agent) run() {
 // before the agent starts, or by the reconcile loop's clone path).
 func (a *agent) boot(ctx context.Context) error {
 	nid := mechanism.NodeIdentity{
-		// 0 under native (#288 audit): only Repmgr.GenerateConfig reads this, and carrying a
-		// repmgr node_id through a native path is how a future change accidentally starts
-		// depending on one.
-		NodeID:   a.repmgrNodeID(),
 		NodeName: a.cfg.PodName,
 		FQDN:     a.fqdn(a.cfg.PodName),
 		DataDir:  a.cfg.PGDATA,
@@ -494,7 +486,7 @@ func (a *agent) boot(ctx context.Context) error {
 	// and re-expose the WAL-recycling gap #289 closed. Reachable in repmgr mode via an
 	// interrupted ReclonePreserving: discardTornClone wipes PGDATA, HasData goes false, and the
 	// skip would then persist.
-	if a.cfg.Mechanism != config.MechanismNative || process.HasData(a.cfg.PGDATA) {
+	if process.HasData(a.cfg.PGDATA) {
 		if err := a.mech.GenerateConfig(ctx, nid, mechanism.ConfigOpts{Failover: "manual", UseReplicationSlots: true}); err != nil {
 			return err
 		}
@@ -735,7 +727,6 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// gate is inert. The read is against the LOCAL node: repmgr.nodes replicates from the
 	// primary, so this node's own copy is exactly what repmgr itself would consult when
 	// asked to follow someone.
-	a.readRegistryForGate(ctx, &o)
 	a.observeStandbyStall(ctx, &o)
 	// Cascading replication (#29): when enabled, a standby may follow another standby
 	// (the pure cascadeFollowTarget decides; default off -> follow the primary).
@@ -875,45 +866,6 @@ func (a *agent) observeStandbyStall(ctx context.Context, o *reconcile.Observatio
 // sized well past any plausible single-segment fetch rather than tight enough to be prompt.
 const standbyStallTicks = 36
 
-// readRegistryForGate populates the #297 promote-registration gate's inputs from repmgr.nodes.
-// Only for a promote candidate (holder, running, in recovery); every other node leaves
-// RegistryRead false, which keeps the gate inert.
-//
-// Native mode skips the read entirely (#288), the same treatment cleanupGhostNodes gets.
-// The gate's premise is a repmgr METADATA requirement: an unregistered promoted primary is
-// one no survivor can `repmgr standby follow`, because repmgr resolves an upstream by
-// node_id out of repmgr.nodes. Native has no such dependency -- act() builds the follow
-// target from the lease holder's identity plus the headless FQDN, and Native.Follow needs
-// only upstream.Host, so a native primary is followable by DNS the moment it promotes
-// (with the survivors' slots already created ahead of the routing switch, #289).
-// Skipping it is also what makes "no repmgr.nodes query runs under native" literally true:
-// a native cluster has no repmgr extension at all now, so this read could only ever fail,
-// and it was logging a warning on every promote-candidate tick about a permanent condition.
-func (a *agent) readRegistryForGate(ctx context.Context, o *reconcile.Observation) {
-	if !(o.HoldLease && o.Local.Running && o.Local.InRecovery) {
-		return
-	}
-	if a.cfg.Mechanism == config.MechanismNative {
-		return
-	}
-	ids, rerr := a.prober.RegisteredNodeIDs(ctx, a.selfConn())
-	if rerr != nil {
-		// Unreadable: leave RegistryRead false so the gate cannot fire on a failed read
-		// (that would refuse a legitimate promotion). Warn, do not block.
-		a.log.Warn("read repmgr.nodes for the promote registration gate", "err", rerr)
-		return
-	}
-	o.RegistryRead = true
-	registered := make(map[int]bool, len(ids))
-	for _, id := range ids {
-		registered[id] = true
-	}
-	o.LocalRegistered = registered[nodeID(a.cfg.PodName)]
-	for i := range o.Peers {
-		o.Peers[i].Registered = registered[nodeID(o.Peers[i].Name)]
-	}
-}
-
 func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.Observation) error {
 	// Any action other than Follow changes (or ends) this node's standby identity, so
 	// the next Follow must re-register + repoint.
@@ -968,12 +920,10 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// bookkeeping -- repmgr register, the WAL re-probe, and the marker + routing
 		// apiserver writes -- under the fence budget, sharing one context so the total
 		// opMu hold cannot exceed the soft-fence window and starve a lost-leadership
-		// OnLost demote while this node is still RW (the register is repmgr->local PG,
-		// bounded only by connect_timeout otherwise; a post-connect query hang would
-		// hold opMu unbounded). H3 order: promote PG -> advance marker -> assert routing.
+		// OnLost demote while this node is still RW. H3 order: promote PG -> advance
+		// marker -> assert routing.
 		wctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
 		defer cancel()
-		_ = a.mech.RegisterPrimary(wctx)
 		// #289: give every surviving standby a slot BEFORE routing switches to this node.
 		// They will follow this new primary within a tick, and a Follow that arrives before
 		// its slot exists streams slotless -- leaving this primary free to recycle WAL that
@@ -1038,24 +988,17 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// command is idempotent (--force) and self-healing; the standby clone needs
 		// only that the primary is registered, so a best-effort per-tick reconcile is
 		// fine (it succeeds within a tick or two of the primary opening).
-		// The node is read-write here, so bound the register + marker + routing under
-		// one fence-budget context (see Promote): a hung register/apiserver write must
-		// not hold opMu past the soft-fence window and starve a lost-leadership fence.
+		// The node is read-write here, so bound the marker + routing under one
+		// fence-budget context (see Promote): a hung apiserver write must not hold opMu
+		// past the soft-fence window and starve a lost-leadership fence.
 		wctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
 		defer cancel()
-		if err := a.mech.RegisterPrimary(wctx); err != nil {
-			a.log.Warn("register primary in repmgr.nodes", "err", err)
-		}
-		// Drop repmgr.nodes records for pods a scale-down removed (#139). Bounded by
-		// the same fence-budget context as the register above: a hung psql/unregister
-		// must not hold opMu past the soft-fence window. Best-effort -- it resumes next
-		// tick if cut short, and only ever targets ordinals above the live range.
-		a.cleanupGhostNodes(wctx)
-		// The slot-side twin of the ghost cleanup above (#289): publish the slot gauges,
-		// then (native only) create slots for expected standbys and reclaim orphans a
-		// scale-down or a repmgr->native migration left pinning WAL. Bounded by the same
-		// fence-budget context. Only the mutation half is mechanism-gated -- the gauges the
-		// shipped alerts read must be truthful under repmgr too (see slotsTick).
+		// #139's repmgr.nodes ghost cleanup went with mechanism.Repmgr (#294): there is no
+		// registry to leave ghosts in. The slot residue a scale-down leaves is real though,
+		// and that is what this handles (#289): publish the slot gauges, create slots for
+		// expected standbys, and reclaim orphans a scale-down or a repmgr->native migration
+		// left pinning WAL. Bounded by the same fence-budget context -- a hung psql must not
+		// hold opMu past the soft-fence window -- and best-effort, resuming next tick.
 		staySlots, stayOwned, staySlotsRead := a.slotsTick(wctx)
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
@@ -1105,59 +1048,32 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if err := a.assertSameCluster(ctx, dec.Target); err != nil {
 			return err
 		}
-		// 0 under native (#288 audit): repmgr addresses a follow target by node_id out of
-		// repmgr.nodes; native writes upstream.Host into primary_conninfo and has no use for
-		// an id. RegisterStandby is already a no-op under native.
-		up := a.repmgrPeerNodeID(dec.Target)
-		// The upstream's conninfo, not just its id: on a scale-up the new pod can win the Lease
-		// before it ever registered, so no surviving node holds a repmgr.nodes record for it and
-		// a metadata-resolved register fails permanently (#286/#297). The Lease holder's pod name
-		// is always current.
+		// The upstream's conninfo: the native mechanism writes upstream.Host into
+		// primary_conninfo, and the Lease holder's pod name is always current.
 		upConn := a.peerMechConn(dec.Target)
-		regErr := a.mech.RegisterStandby(ctx, upConn, up)
-		if regErr != nil {
-			a.log.Warn("register standby in repmgr.nodes", "err", regErr)
-		}
-		// #182: a healthy standby is already streaming from the lease holder before
-		// this first Follow runs -- a repmgrd->agent migration keeps primary_conninfo
-		// across the roll, and a post-failover rejoin attaches before Follow. repmgr
-		// standby follow then exits non-zero (slot already active), which, left
-		// unlatched, repeats every tick. Skip the command when already streaming from
-		// the target; repointing to a NEW upstream (sender_host differs, or no
-		// walreceiver yet) still falls through to Follow.
+		// #182: a healthy standby may already be streaming from the lease holder before
+		// this first Follow runs -- a post-failover rejoin attaches before Follow does.
+		// Skip the command when already streaming from the target; repointing to a NEW
+		// upstream (sender_host differs, or no walreceiver yet) still falls through.
 		//
-		// Gate the skip on a successful register: the follow it replaces implicitly
-		// requires the repmgr.nodes record (repmgr fails "unable to retrieve node
-		// record" -- NOT the benign exit -- and retries when it is missing), but the
-		// probe bypasses that check. A freshly-cloned standby streams before it is ever
-		// registered, so skipping here on a failed register would strand it without a
-		// record and break a later promote. On a failed register, fall through to
-		// follow (which re-establishes the record, or errors so the next tick retries).
-		// Carry the node id INSIDE the connection (#287): repmgr addresses the upstream by
-		// node_id, while the native mechanism needs the host to write primary_conninfo.
-		upConn.NodeID = up
-		// Master's structure is kept deliberately over #287's early `return nil` on the
-		// already-streaming shortcut: the #308 dbname convergence below MUST run on that path
-		// too (its own comment explains why), and an early return here skipped it.
-		followRan := regErr != nil || !a.streamingFromTarget(ctx, dec.Target)
+		// The register-failure half of this gate went with mechanism.Repmgr (#294): it
+		// existed because `repmgr standby follow` implicitly required this node's
+		// repmgr.nodes record, so skipping the follow on a failed register could strand a
+		// freshly-cloned standby without one. Native keeps no registry at all, so
+		// streaming from the target is now the whole question.
+		//
+		// The structure -- a followRan flag rather than an early return -- stays: the #308
+		// dbname convergence below MUST run on the already-streaming path too (its own
+		// comment explains why), and an early return here skipped it.
+		followRan := !a.streamingFromTarget(ctx, dec.Target)
 		if followRan {
 			if err := a.mech.Follow(ctx, upConn); err != nil {
-				// #297: this node has no row in its own metadata copy -- a freshly-cloned standby
-				// whose upstream changed before it registered. It can never obtain the row (that
-				// needs replication, which is what it is trying to establish), so it would retry
-				// forever, Running but never Ready, silently not replicating. Re-clone from the
-				// current primary: that replaces both its data AND its metadata copy, and a
-				// standby in this state has no writes of its own to lose.
-				//
-				// Scoped narrowly on purpose. It fires ONLY on the local-record error, never on a
-				// missing UPSTREAM record -- that one is the ordinary post-failover case where the
-				// target simply has not promoted yet, and escalating there demotes and re-clones a
-				// healthy standby (a mistake made and reverted on #286).
-				if errors.Is(err, mechanism.ErrLocalRecordMissing) {
-					a.log.Warn("this node is absent from its own repmgr.nodes copy; re-cloning from the current primary",
-						"target", dec.Target, "err", err)
-					return a.rejoinOnto(ctx, dec.Target)
-				}
+				// #297's reclone-on-missing-local-record escalation went with mechanism.Repmgr
+				// (#294). It existed because `repmgr standby follow` needed this node's own
+				// repmgr.nodes row and could never obtain one without replication -- a deadlock
+				// only a re-clone broke. Native keeps no registry, so Follow has no equivalent
+				// unrecoverable state: it writes primary_conninfo and standby.signal, and a
+				// failure here is transient and retried on the next tick.
 				return err
 			}
 		}
@@ -1380,9 +1296,6 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// holder with empty data, no reachable primary and no highwater marker -- i.e. a
 		// genuine fresh install. Non-holders get Wait, then BootstrapClone once this node is
 		// open, and clone with pg_basebackup through their own pre-created slot (#289).
-		if a.cfg.Mechanism != config.MechanismNative {
-			return nil
-		}
 		if obs.Local.HasData || obs.Local.Running {
 			// Belt and braces: never initdb over anything. The shell function refuses too.
 			return nil
@@ -1461,10 +1374,6 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 		return fmt.Errorf("bootstrap initdb: %w: %s", err, strings.TrimSpace(out))
 	}
 	nid := mechanism.NodeIdentity{
-		// 0 under native (#288 audit): only Repmgr.GenerateConfig reads this, and carrying a
-		// repmgr node_id through a native path is how a future change accidentally starts
-		// depending on one.
-		NodeID:   a.repmgrNodeID(),
 		NodeName: a.cfg.PodName,
 		FQDN:     a.fqdn(a.cfg.PodName),
 		DataDir:  a.cfg.PGDATA,
@@ -2000,9 +1909,6 @@ func (a *agent) preflightPreload() error {
 // An empty PGDATA needs no special case: postgresql.conf does not exist yet, and
 // EnsureNoPreloadLibrary treats that as nothing to do.
 func (a *agent) dropRepmgrPreload() error {
-	if a.cfg.Mechanism != config.MechanismNative {
-		return nil
-	}
 	// BOTH files, not just postgresql.conf (#293 review). postgresql.auto.conf also lives in
 	// PGDATA, is read LAST -- so it wins over postgresql.conf and every conf.d fragment --
 	// and is precisely where `ALTER SYSTEM SET shared_preload_libraries` lands. Cleaning only
@@ -2298,10 +2204,7 @@ func (a *agent) assertSyncStandbySlots(ctx context.Context, existing []pg.SlotSt
 	for _, s := range existing {
 		existingSet[s.Name] = true
 	}
-	candidates, ok := a.syncSlotCandidates(ctx, owned)
-	if !ok {
-		return
-	}
+	candidates := a.syncSlotCandidates(owned)
 	// Only slots that ACTUALLY EXIST may be named. synchronized_standby_slots pointing at a
 	// missing slot makes the primary refuse to release WAL and log repeatedly, so a slot that
 	// was only just created this tick waits for the next one -- `existing` was read before
@@ -2330,48 +2233,18 @@ func (a *agent) assertSyncStandbySlots(ctx context.Context, existing []pg.SlotSt
 // syncSlotCandidates returns the slot names #308 should wait on, in a STABLE order, and
 // whether the answer is trustworthy enough to act on.
 //
-// Under native the answer is already computed: reconcileSlots owns one slot per live standby
-// pod and hands back exactly that set (#294). That is strictly better than the repmgr path
-// below -- it is the same authority that CREATES the slots, so the two cannot disagree, and it
-// needs neither repmgr.nodes nor the ghost-row filtering that a self-reported catalog forces.
-// It is also what makes syncReplicationSlots work under native at all: before this the
-// reconcile resolved standbys from repmgr.nodes and named slots repmgr_slot_<id>, so on a
-// native cluster it errored every tick while the chart still rendered
-// sync_replication_slots = on -- #308's protection silently absent (#294).
+// The answer is already computed: reconcileSlots owns one slot per live standby pod and hands
+// back exactly that set (#294). That is the same authority that CREATES the slots, so the two
+// cannot disagree -- unlike the repmgr path this replaced, which resolved standbys from
+// repmgr.nodes and named slots repmgr_slot_<id>, and therefore errored on every tick of a
+// native cluster while the chart still rendered sync_replication_slots = on.
 //
-// ord ASC is inherent to reconcileSlots' loop, so no sort is needed on that path; the repmgr
-// path must sort explicitly (see below). Order matters because the caller uses the joined
-// string as a change-detection key.
-func (a *agent) syncSlotCandidates(ctx context.Context, owned []string) ([]string, bool) {
-	if a.cfg.Mechanism == config.MechanismNative {
-		// nil is a legitimate answer (a single-node cluster owns no standby slots) and must
-		// still reconcile -- desired=="" clears a stale GUC from a previous topology.
-		return owned, true
-	}
-	standbyIDs, err := a.prober.StandbyNodeIDs(ctx, a.selfConn())
-	if err != nil {
-		a.log.Warn("list repmgr.nodes for synchronized_standby_slots", "err", err)
-		return nil, false
-	}
-	ghosts := make(map[int]bool)
-	for _, id := range ghostNodeIDs(standbyIDs, a.cfg.NodeCount) {
-		ghosts[id] = true
-	}
-	// Sorted: standbyIDs comes from `SELECT node_id FROM repmgr.nodes WHERE type =
-	// 'standby'` with no ORDER BY, so its row order is not guaranteed stable between calls
-	// even when the standby SET is unchanged. The caller's joined string doubles as a cache
-	// key (a bare string compare, not a set compare), so an unstable order would make the
-	// primary re-run ALTER SYSTEM + reload every tick even in the common steady state --
-	// churn indistinguishable from a real topology change.
-	sort.Ints(standbyIDs)
-	names := make([]string, 0, len(standbyIDs))
-	for _, id := range standbyIDs {
-		if ghosts[id] {
-			continue
-		}
-		names = append(names, fmt.Sprintf("%s%d", legacySlotPrefix, id))
-	}
-	return names, true
+// Ordinal order comes free from reconcileSlots”' own loop, and matters because the caller uses
+// the joined string as a change-detection key.
+func (a *agent) syncSlotCandidates(owned []string) []string {
+	// nil is a legitimate answer (a single-node cluster owns no standby slots) and must still
+	// reconcile -- desired=="" clears a stale GUC left by a previous topology.
+	return owned
 }
 
 // desiredRoleLabels builds the pg-role map the primary publishes each tick (the
@@ -2468,38 +2341,19 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 	return a.sup.Start(ctx)
 }
 
-// newMechanism selects the replication mechanics from config (#287). Policy is identical
-// either way -- the Lease, the election, fencing and routing all live in reconcile, which
-// holds only the Mechanism interface -- so this is the single place the two differ.
+// newMechanism builds the replication mechanics (#287, #294).
 //
-// config.Load already rejects any value that is neither repmgr nor native at boot, so the
-// error return here is unreachable for a config that went through Load -- but this fails
-// loudly rather than silently defaulting to repmgr, matching the fail-fast posture the rest
-// of this codebase takes on required config (no ||/?? fallbacks). Without that, a future
-// mechanism value added to the enum without a case here would silently run repmgr with only
-// this function's own log line as a hint, rather than surfacing the drift.
-//
-// "" (distinct from an unrecognised value) is accepted alongside MechanismRepmgr: it is
-// what an older, pre-#287 image or a config built without going through Load's own
-// empty->repmgr normalization looks like, and must keep behaving exactly as it always has.
-func newMechanism(cfg *config.Config, repmgrConf, pgBindir string, log *slog.Logger) (mechanism.Mechanism, error) {
-	switch cfg.Mechanism {
-	case config.MechanismNative:
-		// #289 has landed: the agent now owns physical slot lifecycle in native mode
-		// (create before clone, reconcile against the live pod set on every primary tick,
-		// drop only inactive orphans). Topology (#288) is still the outstanding blocker.
-		log.Warn("using the native mechanism: a real multi-node cluster since #288 (topology from pg_stat_replication, agent-owned bootstrap), with syncReplicationSlots and cascadingReplication supported since #294; an existing repmgr cluster still cannot be migrated in place (#292), so this is for fresh installs",
-			"mechanism", cfg.Mechanism)
-		// PodName is passed twice by design: once derived into the slot name (#289) and once
-		// verbatim as application_name (#288). Both are this node's identity, but they land in
-		// different places -- pg_replication_slots and pg_stat_replication -- and the topology
-		// probe reads whichever is available.
-		return mechanism.NewNative(cfg.PGDATA, pgBindir, cfg.RepmgrPassword, slotNameFor(cfg.PodName), cfg.PodName), nil
-	case config.MechanismRepmgr, "":
-		return mechanism.NewRepmgr(repmgrConf, cfg.PGDATA, cfg.RepmgrPassword), nil
-	default:
-		return nil, fmt.Errorf("newMechanism: unrecognised MECHANISM %q (want %s|%s)", cfg.Mechanism, config.MechanismRepmgr, config.MechanismNative)
-	}
+// One implementation since #294 deleted mechanism.Repmgr. The Mechanism INTERFACE stays --
+// policy (the Lease, the election, fencing, routing) lives in reconcile, which holds only the
+// interface, and that seam is what made the repmgr-to-native migration survivable one method
+// at a time. A rejected MECHANISM value is caught in config.Load, so this cannot silently run
+// something other than what the operator asked for.
+func newMechanism(cfg *config.Config, pgBindir string) mechanism.Mechanism {
+	// PodName is passed twice by design: once derived into the slot name (#289) and once
+	// verbatim as application_name (#288). Both are this node's identity, but they land in
+	// different places -- pg_replication_slots and pg_stat_replication -- and the topology
+	// probe reads whichever is available.
+	return mechanism.NewNative(cfg.PGDATA, pgBindir, cfg.RepmgrPassword, slotNameFor(cfg.PodName), cfg.PodName)
 }
 
 func (a *agent) selfConn() pg.ConnInfo {
@@ -2515,41 +2369,6 @@ func (a *agent) peerMechConn(name string) mechanism.Conn {
 }
 
 func (a *agent) fqdn(name string) string { return name + "." + a.cfg.HeadlessService }
-
-// cleanupGhostNodes unregisters repmgr.nodes records for pods the StatefulSet no
-// longer runs (ordinal >= NodeCount), left behind by a replicaCount scale-down
-// (#139). Primary-only -- the agent calls it while holding the lease as primary, the
-// single owner of repmgr.nodes, so there is no cross-node race. Best-effort and
-// idempotent: it lists the STANDBY node_ids and unregisters only those above the live
-// ordinal range, so a momentarily-unreachable live node is never touched and a row
-// already gone just yields a warning the next tick retries. It lists only standby rows
-// (StandbyNodeIDs) so a scaled-down ex-primary -- which `repmgr standby unregister`
-// cannot remove -- is left for an operator rather than re-attempted (and re-warned)
-// every tick. A non-positive NodeCount is a no-op via ghostNodeIDs, so this can never
-// unregister a live node.
-//
-// Skipped entirely under the #287 native mechanism: it has no repmgr.nodes (native's
-// Unregister is a no-op, see mechanism.Native), so StandbyNodeIDs would error on every
-// primary tick forever. That is harmless (RegistryRead-style fail-open elsewhere), but
-// here it is pure log noise with no cleanup to retry -- skip the call rather than warn
-// on a known, permanent condition.
-func (a *agent) cleanupGhostNodes(ctx context.Context) {
-	if a.cfg.Mechanism == config.MechanismNative {
-		return
-	}
-	ids, err := a.prober.StandbyNodeIDs(ctx, a.selfConn())
-	if err != nil {
-		a.log.Warn("list repmgr.nodes for ghost cleanup", "err", err)
-		return
-	}
-	for _, id := range ghostNodeIDs(ids, a.cfg.NodeCount) {
-		if err := a.mech.Unregister(ctx, id); err != nil {
-			a.log.Warn("unregister ghost repmgr node", "node_id", id, "err", err)
-			continue
-		}
-		a.log.Info("unregistered ghost repmgr node left by a scale-down", "node_id", id)
-	}
-}
 
 // latchFollow records the upstream this node is now replicating from.
 //
@@ -2662,10 +2481,6 @@ func (a *agent) topologyTick(ctx context.Context) {
 	// fixed is where it hurt: topologyTick now runs OUTSIDE opMu and the fence budget, so a slow
 	// LIST can no longer delay a marker write, a routing switch or a lost-leadership fence. The
 	// duplicate call is a gauge's cost, paid off the critical path.
-	if a.cfg.Mechanism != config.MechanismNative {
-		a.metr.SetTopology(observe.TopologyStats{Streaming: countStreamingReplicas(rows)})
-		return
-	}
 	// The live pod set from the API, not NodeCount: that env var is baked in at render time and
 	// is stale on every pod that has not rolled yet (see orphanSlot).
 	// tctx, not ctx (#288 review, round 2). tick()'s context is the run loop's -- no deadline --
@@ -2860,9 +2675,6 @@ func (a *agent) standbySlotsTick(ctx context.Context) {
 	if !ok {
 		return
 	}
-	if a.cfg.Mechanism != config.MechanismNative {
-		return
-	}
 	var live map[int]bool
 	if a.cfg.CascadeReplication {
 		var err error
@@ -2964,9 +2776,6 @@ func (a *agent) observeSlots(ctx context.Context) ([]pg.SlotState, bool) {
 // rest, because a single unreachable/locked slot must not block reclaiming the others --
 // and the whole point is that an unreclaimed slot silently fills the volume.
 func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) []string {
-	if a.cfg.Mechanism != config.MechanismNative {
-		return nil
-	}
 	if a.cfg.NodeCount <= 0 {
 		return nil
 	}
@@ -3231,76 +3040,19 @@ func baseName(pod string) string {
 	return pod
 }
 
-// nodeIDBase is the repmgr node_id of ordinal 0 (node_id = nodeIDBase + ordinal),
-// matching init-repmgr.sh and nodeID().
-// #288 audit. Every consumer of the +1000 offset, and which of them must outlive
-// mechanism.Repmgr:
+// nodeIDBase is the repmgr node_id of ordinal 0 (node_id = nodeIDBase + ordinal), as
+// init-repmgr.sh assigned them.
 //
-//   - nodeID() -> NodeIdentity.NodeID, read only by Repmgr.GenerateConfig (node_id= in
-//     repmgr.conf). Repmgr-only; native's GenerateConfig discards NodeIdentity entirely.
-//   - nodeID() -> the #297 registry gate mapping in readRegistryForGate. Repmgr-only since
-//     #288: that whole read is skipped under native.
-//   - nodeID() -> RegisterStandby + Conn.NodeID in the Follow branch. Repmgr-only;
-//     Native.Follow reads upstream.Host and mentions NodeID only in an error string.
-//   - ghostNodeIDs(), from cleanupGhostNodes. Repmgr-only; already native-skipped.
-//   - slotOrdinal()'s legacy branch. **This one must survive #294's deletion of
-//     mechanism.Repmgr**: it reverses the offset to reclaim repmgr_slot_<node_id> orphans
-//     left behind by a repmgr->native migration (#292). Deleting nodeIDBase with the repmgr
-//     mechanism would silently strand those slots, pinning WAL forever.
+// #288's audit of this offset listed every consumer and which had to outlive
+// mechanism.Repmgr. #294 settled it: nodeID(), ghostNodeIDs(), NodeIdentity.NodeID,
+// Conn.NodeID and the #297 registry gate are all gone with the mechanism that read them, and
+// exactly one consumer survives -- slotOrdinal()'s legacy branch, which reverses the offset to
+// reclaim repmgr_slot_<node_id> orphans a repmgr-created cluster leaves behind (#292). Deleting
+// the constant with the mechanism would silently strand those slots, pinning WAL forever, so it
+// stays for as long as a cluster can carry one.
 //
-// So the offset is NOT removable while mechanism: repmgr is selectable (#288 lists that as a
-// non-goal), and even afterwards slotOrdinal keeps needing it. What #288 does instead is stop
-// PROPAGATING a node id on native code paths, so no native path carries a repmgr identity.
-// podOrdinal (below) and reconcile.podOrdinal are not repmgr-specific and stay.
+// podOrdinal (below) and reconcile.podOrdinal were never repmgr-specific and stay.
 const nodeIDBase = 1000
-
-// repmgrNodeID is this node's repmgr node_id, or 0 under the native mechanism (#288 audit).
-func (a *agent) repmgrNodeID() int {
-	if a.cfg.Mechanism == config.MechanismNative {
-		return 0
-	}
-	return nodeID(a.cfg.PodName)
-}
-
-// repmgrPeerNodeID is pod's repmgr node_id, or 0 under the native mechanism (#288 audit).
-func (a *agent) repmgrPeerNodeID(pod string) int {
-	if a.cfg.Mechanism == config.MechanismNative {
-		return 0
-	}
-	return nodeID(pod)
-}
-
-// nodeID maps a pod name to its repmgr node_id (ordinal + nodeIDBase), matching
-// init-repmgr.sh. Shares podOrdinal with the slot naming (#289) so the pod-name ->
-// ordinal convention has exactly one implementation; 0 when the name carries none.
-func nodeID(pod string) int {
-	ord, ok := podOrdinal(pod)
-	if !ok {
-		return 0
-	}
-	return ord + nodeIDBase
-}
-
-// ghostNodeIDs returns the registered node_ids whose pods the StatefulSet no longer
-// runs -- ordinal (node_id - nodeIDBase) >= nodeCount, since the live set is ordinals
-// 0..nodeCount-1. These are the rows a replicaCount scale-down strands in repmgr.nodes
-// (#139). The discriminator is purely structural (the StatefulSet always trims from the
-// top ordinal), never reachability, so a live-but-momentarily-unreachable node is never
-// flagged. Returns nil when nodeCount is not positive -- a misconfigured/zero count must
-// never make every node look like a ghost -- and ignores ids below the base (an unknown
-// numbering scheme this agent did not assign).
-func ghostNodeIDs(ids []int, nodeCount int) []int {
-	if nodeCount <= 0 {
-		return nil
-	}
-	var ghosts []int
-	for _, id := range ids {
-		if ord := id - nodeIDBase; ord >= nodeCount {
-			ghosts = append(ghosts, id)
-		}
-	}
-	return ghosts
-}
 
 // slotPrefix names the agent's own physical replication slots (#289): slotPrefix +
 // pod ordinal, e.g. pg_ha_slot_1.

@@ -9,22 +9,18 @@ import (
 	"time"
 )
 
-// This file is the shared scenario table across BOTH Mechanism implementations
-// (#287/#13). The reconcile loop and main.go's act() hold only the Mechanism
-// interface (see iface_assert.go) -- they cannot tell which implementation they are
-// driving, so any contract asserted here must hold identically for both.
+// The scenario table for the Mechanism interface (#287/#13). The reconcile loop and
+// main.go's act() hold only the interface (see iface_assert.go) -- they cannot tell which
+// implementation they are driving, so any contract asserted here must hold for any of them.
 //
-// Not every method belongs in this file. Repmgr shells out to a CLI whose own output
-// dictates some behavior (e.g. #182's "already following" no-op, #297's local-vs-
-// upstream record distinction) that Native has no equivalent surface for at all --
-// forcing those into a shared table would assert a false equivalence. What genuinely
-// IS shared, because the Mechanism interface's own doc comments promise it regardless
-// of backend, is data-safety and idempotency: ReclonePreserving must never lose data
-// (#175), and GenerateConfig must be safe to call every reconcile tick.
-//
-// Each mechanism supplies its own failure trigger (repmgr's CLI argv vocabulary and
-// native's binary argv vocabulary are unrelated), but the scenario name and the
-// assertion function are the same call for both -- that is what "one table" means here.
+// It covered two implementations until #294 deleted mechanism.Repmgr; the table shape is
+// kept rather than inlined into native_test.go, because it is the only place that states
+// which guarantees are the INTERFACE'S rather than one backend's, and it is what a second
+// implementation would be dropped into. What belongs here, because the interface's own doc
+// comments promise it regardless of backend: data-safety and idempotency --
+// ReclonePreserving must never lose data (#175), and GenerateConfig must be safe to call on
+// every reconcile tick. Behaviour dictated by one backend's own output (repmgr's #182
+// "already following" no-op, its #297 local-vs-upstream record distinction) never did.
 
 // mechCase builds a fresh Mechanism against dataDir for one scenario. failing selects
 // whether the underlying Runner should fail the operation under test.
@@ -35,14 +31,6 @@ type mechCase struct {
 
 func mechCases() []mechCase {
 	return []mechCase{
-		{"repmgr", func(t *testing.T, dataDir string, failing bool, now Clock) Mechanism {
-			failOn := ""
-			if failing {
-				failOn = "clone" // repmgr's Clone runs `repmgr standby clone ...`
-			}
-			return &Repmgr{Runner: &fakeRunner{failOn: failOn}, Bin: "repmgr",
-				ConfPath: filepath.Join(dataDir, "repmgr.conf"), DataDir: dataDir, Now: now}
-		}},
 		{"native", func(t *testing.T, dataDir string, failing bool, now Clock) Mechanism {
 			failOn := ""
 			if failing {
@@ -110,7 +98,7 @@ func TestSharedGenerateConfigIsIdempotent(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			dataDir := t.TempDir()
 			m := c.build(t, dataDir, false, time.Now)
-			id := NodeIdentity{NodeID: 1000, NodeName: "pg-0", FQDN: "pg-0.h", DataDir: dataDir,
+			id := NodeIdentity{NodeName: "pg-0", FQDN: "pg-0.h", DataDir: dataDir,
 				PGBindir: "/usr/lib/postgresql/18/bin", ReplUser: "repmgr", ReplDB: "repmgr", ReplPassword: "pw"}
 			opts := ConfigOpts{Failover: "manual", UseReplicationSlots: true}
 			if err := m.GenerateConfig(context.Background(), id, opts); err != nil {

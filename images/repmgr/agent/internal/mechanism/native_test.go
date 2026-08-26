@@ -97,7 +97,7 @@ func TestNativePromote(t *testing.T) {
 
 func TestNativeFollowRequiresHost(t *testing.T) {
 	n, _ := newTestNative(t, &fakeRunner{})
-	err := n.Follow(context.Background(), Conn{NodeID: 1001})
+	err := n.Follow(context.Background(), Conn{Port: 5432})
 	if err == nil {
 		t.Fatal("Follow with no Host must fail loudly rather than write a broken conninfo")
 	}
@@ -244,23 +244,6 @@ func TestNativeReclonePreservingDropsBackupOnSuccess(t *testing.T) {
 	backup := strings.TrimRight(dataDir, "/") + ".diverged.20260615T120000Z"
 	if _, statErr := os.Stat(backup); !os.IsNotExist(statErr) {
 		t.Errorf("backup should be removed on clone success, stat err = %v", statErr)
-	}
-}
-
-// RegisterPrimary/RegisterStandby/Unregister are no-ops in native mode (no repmgr.nodes
-// to maintain, #288) -- reconcile calls them unconditionally, so "nothing to do" must
-// never surface as an error.
-func TestNativeRegistrationMethodsAreNoOps(t *testing.T) {
-	n, _ := newTestNative(t, &fakeRunner{})
-	ctx := context.Background()
-	if err := n.RegisterPrimary(ctx); err != nil {
-		t.Errorf("RegisterPrimary must be a no-op, got %v", err)
-	}
-	if err := n.RegisterStandby(ctx, Conn{Host: "pg-0.h"}, 1001); err != nil {
-		t.Errorf("RegisterStandby must be a no-op, got %v", err)
-	}
-	if err := n.Unregister(ctx, 1001); err != nil {
-		t.Errorf("Unregister must be a no-op, got %v", err)
 	}
 }
 

@@ -909,7 +909,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- range $k, $v := (.Values.postgresql.configuration | default dict) }}
   {{- if eq (lower ($k | toString)) "shared_preload_libraries" }}{{- $user = $v | toString }}{{- end }}
 {{- end }}
-{{- fail (printf "postgresql.configuration.shared_preload_libraries includes \"repmgr\" (got %q) but repmgr.agent.mechanism is \"native\": a native cluster has no repmgr extension, and this value loads via conf.d's include_dir so it OVERRIDES the image's native gate and preloads repmgr.so anyway. That makes the cluster unstartable (\"could not access file \\\"repmgr\\\"\") as soon as the repmgr-free image ships (#290/#293), on every pod at once, and helm rollback cannot fix it because the line is cloned into each data directory. Fix: drop \"repmgr\" from the list (the chart adds nothing under native, so an empty list means: omit the key), or set repmgr.agent.mechanism to \"repmgr\"." $user) }}
+{{- fail (printf "postgresql.configuration.shared_preload_libraries includes \"repmgr\" (got %q) but repmgr.agent.mechanism is \"native\": a native cluster has no repmgr extension, and this value loads via conf.d's include_dir so it OVERRIDES the image's native gate and preloads repmgr.so anyway. That makes the cluster unstartable (\"could not access file \\\"repmgr\\\"\") as soon as the repmgr-free image ships (#290/#293), on every pod at once, and helm rollback cannot fix it because the line is cloned into each data directory. Fix: drop \"repmgr\" from the list -- the chart adds nothing to it any more, so if repmgr was the only entry, omit the key entirely. There is no mechanism to switch back to: #294 removed the repmgr one." $user) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -1388,6 +1388,14 @@ volumes:
 {{- end -}}
 {{- if hasKey .Values.pgpool "autoFailback" -}}
 {{- fail "pgpool.autoFailback was removed in chart 2.0.0: it rendered PGPool's auto_failback, which only applied to the repmgrd failover flow. The agent fronts the Services and re-points them itself, so PGPool never fails a backend over. Delete this key." -}}
+{{- end -}}
+{{- /* #294: the repmgr MECHANISM is gone, not merely non-default. Rejected here rather than
+       by narrowing the values.schema.json enum, so the operator gets this message instead of
+       a generic "value must be one of [native]" -- helm validates the schema before rendering,
+       so a narrowed enum would win the race and say nothing useful. The key itself survives
+       (see values.yaml) precisely so a stale value fails loudly rather than being ignored. */ -}}
+{{- if eq ((.Values.repmgr.agent).mechanism | default "native") "repmgr" -}}
+{{- fail "repmgr.agent.mechanism: repmgr was removed in chart 2.0.0 (#294): the repmgr mechanism drove the repmgr CLI (standby clone/follow/promote, node rejoin) and depended on repmgr.nodes, and both are gone -- `native` is now the only implementation, and it is the default. Delete this key (or set it to \"native\"). IMPORTANT: a cluster created by a 1.x release is still repmgr-shaped on disk; migrating it in place is #292, and until that ships native is for FRESH installs. Read the 2.0.0 upgrade note in CHANGELOG.md before upgrading an existing HA cluster." -}}
 {{- end -}}
 {{- end -}}
 

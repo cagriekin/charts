@@ -350,7 +350,7 @@ func (n *Native) Follow(ctx context.Context, upstream Conn) error {
 	if upstream.Host == "" {
 		// A native follow cannot be addressed by node_id: without a host there is nothing
 		// to write into primary_conninfo. Fail loudly rather than write a broken conninfo.
-		return fmt.Errorf("native: follow needs upstream.Host (node_id %d is not addressable)", upstream.NodeID)
+		return fmt.Errorf("native: follow needs upstream.Host to write primary_conninfo, and it is empty")
 	}
 	// #289: ensure this node's slot exists on the upstream BEFORE pointing at it, the same
 	// way Clone and RejoinForceRewind do -- this was the one slot-using path that did not.
@@ -583,24 +583,6 @@ func (n *Native) ReclonePreserving(ctx context.Context, source Conn) error {
 	}
 	return nil
 }
-
-// RegisterPrimary / RegisterStandby / Unregister are no-ops in native mode: repmgr.nodes is
-// repmgr's own bookkeeping, and native mode does not maintain it.
-//
-// They are no-ops rather than errors because reconcile calls them unconditionally as part of
-// role reconciliation, and native mode's answer is "nothing to do" rather than "that failed".
-// #288 moved topology onto pg_stat_replication (see the agent's topologyTick), so native mode
-// no longer depends on repmgr.nodes for it; these three methods stay only while
-// mechanism.Repmgr is still selectable, and #294 deletes them with it.
-func (n *Native) RegisterPrimary(ctx context.Context) error { return nil }
-
-// Both arguments are ignored: native mode keeps no registry at all (see RegisterPrimary).
-// The signature matches repmgr's so the Mechanism interface stays one shape.
-func (n *Native) RegisterStandby(ctx context.Context, upstream Conn, upstreamNodeID int) error {
-	return nil
-}
-
-func (n *Native) Unregister(ctx context.Context, nodeID int) error { return nil }
 
 // isConnectionFailure recognises pg_rewind/libpq output that means "could not reach the
 // source", as opposed to "histories diverged beyond repair". Keeping these apart is what

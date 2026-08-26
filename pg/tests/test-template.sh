@@ -2647,26 +2647,19 @@ helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.agent.syncReplicationSlots=true >/dev/null 2>&1 || sync_slots_replica_rc=$?
 assert_gt "#308: syncReplicationSlots without walLevel=logical rejected at render time" "${sync_slots_replica_rc}" "0"
 
-# #294: syncReplicationSlots now WORKS under the native mechanism, so the render-time refusal
-# that #288 needed is gone. The reconcile used to resolve standbys from repmgr.nodes and name
-# slots repmgr_slot_<node_id>, neither of which exists under native; it now consumes the slot
-# set reconcileSlots already owns (pg_ha_slot_<ordinal>), so the creator and the waiter are the
-# same authority. Both mechanisms must render.
-for spl_mech in repmgr native; do
-  sync_slots_mech_rc=0
-  helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-    --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
-    --set "repmgr.agent.mechanism=${spl_mech}" >/dev/null 2>&1 || sync_slots_mech_rc=$?
-  assert_eq "#294: syncReplicationSlots renders under mechanism ${spl_mech}" "0" "${sync_slots_mech_rc}"
-done
-# The standbys must still be told to use it, on either mechanism -- the GUC is what makes a
-# standby wait, and rendering it only on one would be the silent half-feature #308 warned about.
-for spl_mech in repmgr native; do
-  sync_slots_render=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-    --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
-    --set "repmgr.agent.mechanism=${spl_mech}" 2>&1)
-  assert_contains "#294: sync_replication_slots is enabled under mechanism ${spl_mech}" "${sync_slots_render}" "sync_replication_slots = on"
-done
+# #294: syncReplicationSlots works under native, which is now the only mechanism. The reconcile
+# used to resolve standbys from repmgr.nodes and name slots repmgr_slot_<node_id>, neither of
+# which exists under native; it consumes the slot set reconcileSlots already owns
+# (pg_ha_slot_<ordinal>), so the creator and the waiter are the same authority.
+sync_slots_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical >/dev/null 2>&1 || sync_slots_rc=$?
+assert_eq "#294: syncReplicationSlots renders (native is the default)" "0" "${sync_slots_rc}"
+# The standbys must still be TOLD to use it -- the GUC is what makes a standby wait, and
+# reconciling the primary's list without it would be the silent half-feature #308 warned about.
+sync_slots_render=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical 2>&1)
+assert_contains "#294: sync_replication_slots is enabled on the standbys" "${sync_slots_render}" "sync_replication_slots = on"
 
 # The repmgrd-mode variants of these checks went with the mode itself (#286): failoverMode is
 # a REMOVED key on 2.0.0 and is rejected at render time, which guards_test.yaml pins.
@@ -2837,7 +2830,9 @@ pg17_audit=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.image.majorVersion=17 \
   --set repmgr.image.tag=trixie-5.5.0-29-pg17 \
   --show-only templates/postgresql-configmap.yaml 2>&1)
-assert_contains "#269: audit on PG17 preloads pgaudit" "${pg17_audit}" "shared_preload_libraries = 'repmgr,pgaudit'"
+# pgaudit alone: #294 made native the only mechanism, and native has no repmgr extension to
+# preserve, so the chart merges nothing into the operator's list.
+assert_contains "#269: audit on PG17 preloads pgaudit" "${pg17_audit}" "shared_preload_libraries = 'pgaudit'"
 
 # --- #269 review: the TAG is what actually selects the major, so check it too ---
 
@@ -3852,9 +3847,8 @@ spl_native=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.audit.enabled=true 2>&1)
 assert_contains "#288: native preloads pgaudit without repmgr" "${spl_native}" "shared_preload_libraries = 'pgaudit'"
 assert_not_contains "#288: native does not preload repmgr" "${spl_native}" "shared_preload_libraries = 'repmgr"
-# The default mechanism must be untouched.
-spl_repmgr=$(helm template test-pg "${CHART_DIR}" --set postgresql.audit.enabled=true 2>&1)
-assert_contains "#288: repmgr mode still preloads repmgr" "${spl_repmgr}" "shared_preload_libraries = 'repmgr,pgaudit'"
+# The former "repmgr mode still preloads repmgr" counterpart went with the mechanism (#294):
+# native is the only one, so there is no other render to hold to a different rule.
 
 # #288: MECHANISM must reach the INIT container, not just the postgresql one. Without it the
 # init container's shell gate can never fire, so native standbys keep polling repmgr.nodes for
@@ -3878,30 +3872,38 @@ assert_contains "#288: repmgr-init carries MECHANISM" "${mech_init_block}" "name
 # And prove the range is actually bounded: exactly one MECHANISM inside it, not both.
 assert_eq "#288: the repmgr-init range is bounded (one MECHANISM, not the whole render)" "1" \
   "$(printf '%s\n' "${mech_init_block}" | grep -c 'name: MECHANISM')"
-# The default (repmgr) render must not gain the variable at all -- that is what keeps every
-# existing release byte-identical.
+# The default render carries it now (#294): native is the default, and an image built before
+# #294 assumes repmgr when the variable is absent, so omitting it would run the removed
+# mechanism during a two-step image-then-chart release.
 mech_default_res=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1)
-assert_not_contains "#288: the repmgr-mode render carries no MECHANISM" "${mech_default_res}" "name: MECHANISM"
+assert_contains "#294: the default render carries MECHANISM=native" "${mech_default_res}" 'value: "native"'
 
 # #287: experimental native HA mechanism selector. repmgr by default
 # (byte-stable); the agent gets MECHANISM only when set to a non-default
 # value, and only in agent mode (standalone has no agent to read it).
 # ======================================================================
-mech_off=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+# #294: MECHANISM is emitted UNCONDITIONALLY now. It used to be omitted at the default, which
+# was repmgr -- the same value an env-less agent assumes. The default is native, so relying on
+# the absent-value default would silently run the REMOVED mechanism on any image built before
+# #294, which is exactly the image-then-chart release sequence this repo uses.
+mech_default=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --show-only templates/statefulset.yaml 2>&1)
-assert_not_contains "#287 default: no MECHANISM env" "${mech_off}" "MECHANISM"
-mech_repmgr_explicit=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.agent.mechanism=repmgr \
-  --show-only templates/statefulset.yaml 2>&1)
-assert_not_contains "#287: explicit repmgr (the default) still emits no env (byte-stable)" "${mech_repmgr_explicit}" "MECHANISM"
-mech_native=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.agent.mechanism=native \
-  --show-only templates/statefulset.yaml 2>&1)
-assert_contains "#287: agent gets MECHANISM=native env" "${mech_native}" 'name: MECHANISM
+assert_contains "#294 default: MECHANISM=native is emitted explicitly" "${mech_default}" 'name: MECHANISM
               value: "native"'
+# Both containers, not just the postgresql one: the init container's gate cannot fire without it.
+assert_eq "#294: MECHANISM reaches both the init and postgresql containers" "2" "$(echo "${mech_default}" | grep -c 'name: MECHANISM')"
+# And the removed value is refused, with a message naming the migration rather than a bare enum
+# error -- values.schema.json deliberately still accepts it so this validator speaks first.
+mech_repmgr_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.mechanism=repmgr >/dev/null 2>&1 || mech_repmgr_rc=$?
+assert_gt "#294: mechanism repmgr is rejected at render time" "${mech_repmgr_rc}" "0"
+mech_repmgr_msg=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.mechanism=repmgr 2>&1 || true)
+assert_contains "#294: the rejection says the mechanism was REMOVED" "${mech_repmgr_msg}" "was removed in chart 2.0.0"
+assert_contains "#294: the rejection points at the in-place migration" "${mech_repmgr_msg}" "#292"
 mech_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.enabled=false --set postgresql.replicaCount=0 \
-  --set repmgr.agent.mechanism=native \
   --show-only templates/statefulset.yaml 2>&1)
 assert_not_contains "#287: standalone never gets MECHANISM (agent-only)" "${mech_standalone}" "MECHANISM"
 
@@ -3912,23 +3914,17 @@ assert_not_contains "#287: standalone never gets MECHANISM (agent-only)" "${mech
 # live ordinal (useless, and WAL-retaining, for a child that streams from a peer) and a standby
 # reclaimed every agent-minted slot it found (deleting exactly its children's slots). Both are
 # now cascade-aware, so every combination of the two flags must render.
-for mech in repmgr native; do
-  for casc in false true; do
-    mech_casc_rc=0
-    helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-      --set "repmgr.agent.mechanism=${mech}" --set "repmgr.agent.cascadingReplication=${casc}" \
-      >/dev/null 2>&1 || mech_casc_rc=$?
-    assert_eq "#294: mechanism ${mech} + cascadingReplication ${casc} renders" "0" "${mech_casc_rc}"
-  done
+for casc in false true; do
+  mech_casc_rc=0
+  helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+    --set "repmgr.agent.cascadingReplication=${casc}" >/dev/null 2>&1 || mech_casc_rc=$?
+  assert_eq "#294: cascadingReplication ${casc} renders under native" "0" "${mech_casc_rc}"
 done
-# CASCADE_REPLICATION must reach the container on both mechanisms -- the agent's topology
-# choice is what the flag drives, and rendering it on only one would be a silent half-feature.
-for mech in repmgr native; do
-  mech_casc_env=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-    --set "repmgr.agent.mechanism=${mech}" --set repmgr.agent.cascadingReplication=true \
-    --show-only templates/statefulset.yaml 2>&1)
-  assert_contains "#294: CASCADE_REPLICATION reaches the pod under mechanism ${mech}" "${mech_casc_env}" "CASCADE_REPLICATION"
-done
+# CASCADE_REPLICATION must reach the container -- it is what the agent's topology choice reads.
+mech_casc_env=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.cascadingReplication=true \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#294: CASCADE_REPLICATION reaches the pod" "${mech_casc_env}" "CASCADE_REPLICATION"
 
 # ======================================================================
 # #262: postgresql.extraVolumes / extraVolumeMounts / extraEnv passthrough,
@@ -3981,20 +3977,28 @@ guard_fails "#262 guard: extraEnv reusing POSTGRES_PASSWORD fails" --set-json 'p
 guard_fails "#262 guard: extraEnv reusing a disabled-feature name (REPMGR_DB) fails" --set-json 'postgresql.extraEnv=[{"name":"REPMGR_DB","value":"x"}]'
 guard_fails "#262 guard: duplicate extraEnv name fails"         --set-json 'postgresql.extraEnv=[{"name":"A","value":"1"},{"name":"A","value":"2"}]'
 
-# --- shared_preload_libraries: repmgr must survive an operator-set value with audit OFF ---
-spl_repmgr=$(helm template test-pg "${CHART_DIR}" \
+# --- shared_preload_libraries: what the chart merges into an operator-set value ---
+#
+# #262's original subject was "repmgr must survive an operator value", because a bare value in
+# custom.conf loaded via include_dir AFTER the image's own postgresql.conf and silently
+# overrode `shared_preload_libraries = 'repmgr'`, disabling failover. #294 removed the repmgr
+# mechanism, so there is no longer anything to preserve: HA mode now behaves like standalone
+# and the operator's value passes straight through. What #262 still guards is that the value is
+# emitted exactly once, from one authoritative place.
+spl_ha=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.enabled=true --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
   --set-string postgresql.configuration.shared_preload_libraries=pgsodium \
   --show-only templates/postgresql-configmap.yaml 2>&1)
-assert_contains "#262 preload: audit off keeps repmgr (merged)" "${spl_repmgr}" "shared_preload_libraries = 'repmgr,pgsodium'"
-assert_not_contains "#262 preload: bare operator value is not left in custom.conf" "${spl_repmgr}" "shared_preload_libraries = 'pgsodium'"
-# audit ON: unchanged behaviour (pgaudit.conf stays authoritative)
+assert_contains "#262/#294 preload: HA passes the operator value through" "${spl_ha}" "shared_preload_libraries = 'pgsodium'"
+assert_not_contains "#262/#294 preload: nothing merges repmgr in any more" "${spl_ha}" "repmgr,pgsodium"
+assert_not_contains "#262/#294 preload: no repmgr-preload.conf is emitted" "${spl_ha}" "repmgr-preload.conf"
+# audit ON: pgaudit.conf stays authoritative and appends only pgaudit.
 spl_audit=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.enabled=true --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
   --set postgresql.audit.enabled=true \
   --set-string postgresql.configuration.shared_preload_libraries=pgsodium \
   --show-only templates/postgresql-configmap.yaml 2>&1)
-assert_contains "#262 preload: audit on merges repmgr + operator + pgaudit" "${spl_audit}" "shared_preload_libraries = 'repmgr,pgsodium,pgaudit'"
+assert_contains "#262/#294 preload: audit merges the operator value + pgaudit" "${spl_audit}" "shared_preload_libraries = 'pgsodium,pgaudit'"
 # standalone: nothing to preserve, operator value passes through untouched
 spl_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.enabled=false --set postgresql.replicaCount=0 \
@@ -4025,7 +4029,10 @@ spl_guard=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.agent.mechanism=native \
   --set-string 'postgresql.configuration.shared_preload_libraries=repmgr\,pgsodium' 2>&1 || true)
 assert_contains "#293 guard: names the offending value" "${spl_guard}" 'got "repmgr,pgsodium"'
-assert_contains "#293 guard: names the mechanism fix" "${spl_guard}" 'set repmgr.agent.mechanism to "repmgr"'
+# The remediation must NOT offer "switch back to the repmgr mechanism" any more -- #294 removed
+# it, so that advice would send the operator into a second render failure.
+assert_contains "#293 guard: names the real fix" "${spl_guard}" 'drop "repmgr" from the list'
+assert_not_contains "#293 guard: does not offer the removed mechanism as a way out" "${spl_guard}" 'set repmgr.agent.mechanism to "repmgr"'
 
 # A directory-qualified or .so-suffixed entry is the SAME library to PostgreSQL, which
 # supplies `$libdir/` and `.so` itself when absent. Matching the bare string only let
@@ -4045,17 +4052,14 @@ for spl_ok in 'my_repmgr' '$libdir/repmgr_extra' '"pgaudit"'; do
   assert_eq "#293 guard: native accepts the unrelated '${spl_ok}'" "0" "${spl_ok_rc}"
 done
 
-# The same value under the default mechanism is legitimate and must still render.
-spl_repmgr_ok=$(helm template test-pg "${CHART_DIR}" \
-  --set-string 'postgresql.configuration.shared_preload_libraries=repmgr\,pgsodium' \
-  --show-only templates/postgresql-configmap.yaml 2>&1)
-assert_contains "#293: repmgr mechanism still accepts an operator-preloaded repmgr" "${spl_repmgr_ok}" "shared_preload_libraries = 'repmgr,pgsodium'"
+# The "legitimate under the repmgr mechanism" counterpart is gone with the mechanism (#294):
+# there is no configuration in which the chart preloads repmgr any more, so an operator asking
+# for it in HA mode is always the #290 hazard this guard exists for.
 
 # Under native the chart no longer OWNS the value: there is no repmgr to preserve, so the
 # operator's value passes through custom.conf and no repmgr-preload.conf is emitted at all --
 # a file whose only job is re-adding repmgr would be a lie under that name.
 spl_native_own=$(helm template test-pg "${CHART_DIR}" \
-  --set repmgr.agent.mechanism=native \
   --set-string postgresql.configuration.shared_preload_libraries=pgsodium \
   --show-only templates/postgresql-configmap.yaml 2>&1)
 assert_contains "#293: native passes the operator value through custom.conf" "${spl_native_own}" "custom.conf"
