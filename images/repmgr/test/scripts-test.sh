@@ -406,11 +406,15 @@ fi
 # The empty-data path treats "no peer answered at all" as a genuine first install, so this
 # is the function that decides whether an empty pod-0 initdb's. Exercise it for real with a
 # stubbed pg_isready rather than trusting the grep above.
-sed -n '/^any_peer_reachable() {/,/^}/p' "${ROOT}/init-repmgr.sh" > /tmp/.apr_fn.sh
-if [ ! -s /tmp/.apr_fn.sh ]; then bad "extract any_peer_reachable from init-repmgr.sh"; else
+# mktemp, not a fixed /tmp path: this file is sourced, so a predictable name lets a local
+# user pre-create it (or a symlink) and have their code executed by whoever runs the suite.
+apr_fn=$(mktemp "${TMPDIR:-/tmp}/apr_fn.XXXXXX")
+trap 'rm -f "${apr_fn}"' EXIT
+sed -n '/^any_peer_reachable() {/,/^}/p' "${ROOT}/init-repmgr.sh" > "${apr_fn}"
+if [ ! -s "${apr_fn}" ]; then bad "extract any_peer_reachable from init-repmgr.sh"; else
   ok "extract any_peer_reachable from init-repmgr.sh"
   # shellcheck disable=SC1091
-  source /tmp/.apr_fn.sh
+  source "${apr_fn}"
   HOSTNAME=pg-0 ; ORDINAL=0 ; HEADLESS_SERVICE=h ; REPMGR_USER=u ; REPMGR_PASSWORD=p
   REPMGR_DB=d ; REPMGR_NODE_COUNT=3
   # LIVE_PEER is the one host the stub answers for; empty means nothing answers.
@@ -437,7 +441,7 @@ if [ ! -s /tmp/.apr_fn.sh ]; then bad "extract any_peer_reachable from init-repm
   fi
   unset -f pg_isready
 fi
-rm -f /tmp/.apr_fn.sh
+rm -f "${apr_fn}"
 
 echo "----"
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
