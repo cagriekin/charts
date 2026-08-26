@@ -124,3 +124,34 @@ func TestCampaignGuardedGrantsLeadershipOnLiveSession(t *testing.T) {
 		t.Fatal("a campaign won on a live session must grant leadership")
 	}
 }
+
+// The guard must NOT wait for Campaign to unwind once the session has lapsed.
+// etcd's cancel path calls Resign on the CLIENT context -- which has no deadline and
+// is only cancelled by Client.Close() -- and clientv3 defaults to WaitForReady(true),
+// so that Txn blocks for the entire remainder of an etcd outage. Blocking on it would
+// stop runElection returning and keep the Run loop from starting a fresh iteration,
+// which is precisely what the guard exists to guarantee (#326).
+func TestCampaignGuardedDoesNotWaitForCampaignUnwind(t *testing.T) {
+	sessDone := make(chan struct{})
+	unwind := make(chan struct{}) // never closed during the assertion: Resign is stuck
+
+	campaign := func(ctx context.Context) error {
+		<-unwind
+		return ctx.Err()
+	}
+
+	got := make(chan bool, 1)
+	go func() { got <- campaignGuarded(context.Background(), sessDone, campaign) }()
+
+	close(sessDone) // lease lapses mid-campaign, mid-partition
+
+	select {
+	case won := <-got:
+		if won {
+			t.Fatal("won leadership on a lapsed session")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("guard blocked waiting for Campaign to unwind; the Run loop cannot re-contend")
+	}
+	close(unwind)
+}
