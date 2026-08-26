@@ -869,26 +869,6 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end }}
 {{- end }}
 
-{{- /* #308 x #288: syncReplicationSlots is repmgr-MECHANISM only, and must fail rather than
-       degrade quietly under native. assertSyncStandbySlots resolves the standby set from
-       repmgr.nodes and names slots repmgr_slot_<node_id>; a native cluster has no repmgr
-       extension and no repmgr.nodes at all, and its slots are pg_ha_slot_<ordinal>. So the
-       reconcile errors on every primary tick, synchronized_standby_slots is never set -- while
-       the chart still renders sync_replication_slots = on for every standby. The visible result
-       is one repeating log warning; the real result is that a logical failover slot's decode
-       position can advance past the standby that will need it, which is precisely the hazard
-       #308 exists to prevent. Refusing at render time is the same treatment cascadingReplication
-       gets with native, for the same reason: a feature that silently does nothing is worse than
-       one that will not install. Teaching the reconcile to use the native slot names is its own
-       change, not a validation. */}}
-{{- define "pg.validateSyncReplicationSlotsMechanism" -}}
-{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
-{{- if eq ((.Values.repmgr.agent).mechanism | default "repmgr") "native" }}
-{{- fail "repmgr.agent.syncReplicationSlots is not supported with repmgr.agent.mechanism: native (#308/#288): the synchronized_standby_slots reconcile resolves standbys from repmgr.nodes and names slots repmgr_slot_<node_id>, neither of which exists under native, so it would silently never run while every standby still enabled sync_replication_slots. Set repmgr.agent.mechanism to \"repmgr\", or set repmgr.agent.syncReplicationSlots to false." }}
-{{- end }}
-{{- end }}
-{{- end }}
-
 {{- /* #293: refuse `repmgr` in shared_preload_libraries under the native mechanism.
 
        A native cluster has no repmgr extension, so the library is dead weight -- but it is

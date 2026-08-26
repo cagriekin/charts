@@ -14,7 +14,6 @@
 {{- include "pg.validateWalLevel" . }}
 {{- include "pg.validateSyncReplicationSlotsMajor" . }}
 {{- include "pg.validateSyncReplicationSlotsWalLevel" . }}
-{{- include "pg.validateSyncReplicationSlotsMechanism" . }}
 {{- include "pg.validateNativePreloadRepmgr" . }}
 {{- include "pg.validateRemovedRepmgrdValues" . }}
 {{- /* #289: cascading replication makes a STANDBY an upstream for other standbys, but the

@@ -901,7 +901,7 @@ func TestCleanupGhostNodes(t *testing.T) {
 func TestAssertSyncStandbySlotsNoOpWhenDisabled(t *testing.T) {
 	ex := &scriptedExec{slots: "repmgr_slot_1001|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if len(ex.slotSyncSQL) != 0 {
 		t.Fatalf("expected no SQL when disabled, got %v", ex.slotSyncSQL)
 	}
@@ -915,7 +915,7 @@ func TestAssertSyncStandbySlotsReconciles(t *testing.T) {
 	ex := &scriptedExec{nodes: "1001\n1002\n", slots: "repmgr_slot_1001|t|0|reserved|t\nrepmgr_slot_1002|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if len(ex.slotSyncSQL) != 2 {
 		t.Fatalf("expected ALTER SYSTEM + reload (2 calls), got %v", ex.slotSyncSQL)
 	}
@@ -937,7 +937,7 @@ func TestAssertSyncStandbySlotsOrderIndependent(t *testing.T) {
 	ex := &scriptedExec{nodes: "1002\n1001\n", slots: "repmgr_slot_1001|t|0|reserved|t\nrepmgr_slot_1002|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if want := "repmgr_slot_1001,repmgr_slot_1002"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
 		t.Fatalf("lastSyncStandbySlots = %v, want %q (sorted regardless of repmgr.nodes row order)", a.lastSyncStandbySlots, want)
 	}
@@ -946,7 +946,7 @@ func TestAssertSyncStandbySlotsOrderIndependent(t *testing.T) {
 	}
 	// Same standbys, rows returned in the OTHER order -- must be treated as unchanged.
 	ex.nodes = "1001\n1002\n"
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if len(ex.slotSyncSQL) != 2 {
 		t.Fatalf("second call with the same standbys in a different row order must not issue more SQL, got %v", ex.slotSyncSQL)
 	}
@@ -961,7 +961,7 @@ func TestAssertSyncStandbySlotsSurvivesABlip(t *testing.T) {
 	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
 		t.Errorf("lastSyncStandbySlots = %v, want %q", a.lastSyncStandbySlots, want)
 	}
@@ -975,7 +975,7 @@ func TestAssertSyncStandbySlotsExcludesGhostNodes(t *testing.T) {
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
 	a.cfg.NodeCount = 2 // live ordinals 0-1 -> node_id 1002 (ordinal 2) is a ghost
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
 		t.Errorf("lastSyncStandbySlots = %v, want %q (1002 excluded as a ghost)", a.lastSyncStandbySlots, want)
 	}
@@ -988,7 +988,7 @@ func TestAssertSyncStandbySlotsExcludesUnslottedStandby(t *testing.T) {
 	ex := &scriptedExec{nodes: "1001\n1002\n", slots: "repmgr_slot_1001|t|0|reserved|t\n"} // 1002 has no slot yet
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if want := "repmgr_slot_1001"; a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != want {
 		t.Errorf("lastSyncStandbySlots = %v, want %q (1002 excluded, no slot yet)", a.lastSyncStandbySlots, want)
 	}
@@ -1003,7 +1003,7 @@ func TestAssertSyncStandbySlotsFirstReconcileIsUnconditionalEvenWhenEmpty(t *tes
 	ex := &scriptedExec{}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if len(ex.slotSyncSQL) != 2 {
 		t.Fatalf("expected an unconditional first ALTER SYSTEM + reload even for an empty desired set, got %v", ex.slotSyncSQL)
 	}
@@ -1019,7 +1019,7 @@ func TestActClearsLastSyncStandbySlotsWhenNotPrimary(t *testing.T) {
 	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if a.lastSyncStandbySlots == nil {
 		t.Fatal("expected a cached value after the first reconcile")
 	}
@@ -1037,11 +1037,11 @@ func TestAssertSyncStandbySlotsSkipsWhenUnchanged(t *testing.T) {
 	ex := &scriptedExec{nodes: "1001\n", slots: "repmgr_slot_1001|t|0|reserved|t\n"}
 	a := newFollowTestAgent(t, ex)
 	a.cfg.SyncReplicationSlots = true
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if len(ex.slotSyncSQL) != 2 {
 		t.Fatalf("first call: expected 2 SQL statements, got %v", ex.slotSyncSQL)
 	}
-	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), true)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
 	if len(ex.slotSyncSQL) != 2 {
 		t.Fatalf("second call with an unchanged slot set must not issue more SQL, got %v", ex.slotSyncSQL)
 	}
@@ -2689,5 +2689,110 @@ func TestPreflightPreloadNeedsNoDataDirectory(t *testing.T) {
 	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "absent.so"))
 	if err := a.preflightPreload(); err != nil {
 		t.Fatalf("an uninitialized PGDATA must not fail the preflight: %v", err)
+	}
+}
+
+// --- #294: synchronized_standby_slots under the NATIVE mechanism ---
+//
+// Before this, the reconcile resolved standbys from repmgr.nodes and named slots
+// repmgr_slot_<id>, so on a native cluster it errored every tick while the chart still
+// rendered sync_replication_slots = on -- #308's protection silently absent. The native path
+// consumes the slot set reconcileSlots already owns, so the creator and the waiter cannot
+// disagree.
+
+func newNativeSyncTestAgent(t *testing.T, ex *scriptedExec) *agent {
+	t.Helper()
+	a := newFollowTestAgent(t, ex)
+	a.cfg.Mechanism = config.MechanismNative
+	a.cfg.SyncReplicationSlots = true
+	return a
+}
+
+func TestAssertSyncStandbySlotsUsesTheAgentOwnedSetUnderNative(t *testing.T) {
+	ex := &scriptedExec{slots: "pg_ha_slot_1|t|0|reserved|t\npg_ha_slot_2|t|0|reserved|t\n"}
+	a := newNativeSyncTestAgent(t, ex)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), []string{"pg_ha_slot_1", "pg_ha_slot_2"}, true)
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("expected ALTER SYSTEM + reload, got %v", ex.slotSyncSQL)
+	}
+	if !strings.Contains(ex.slotSyncSQL[0], "pg_ha_slot_1,pg_ha_slot_2") {
+		t.Errorf("did not name the agent-owned slots: %q", ex.slotSyncSQL[0])
+	}
+	// repmgr.nodes must not be consulted at all: it does not exist on a native cluster, and
+	// reading it is what used to make this fail every tick.
+	if ex.nodesQueries != 0 {
+		t.Errorf("native path queried repmgr.nodes %d time(s)", ex.nodesQueries)
+	}
+	if a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != "pg_ha_slot_1,pg_ha_slot_2" {
+		t.Errorf("cache = %v", a.lastSyncStandbySlots)
+	}
+}
+
+func TestAssertSyncStandbySlotsUnderNativeNamesOnlySlotsThatExist(t *testing.T) {
+	// A slot reconcileSlots only just created is not in `existing` yet (that read happened
+	// first). Naming a missing slot in synchronized_standby_slots makes the primary hold WAL
+	// and log repeatedly, so it must wait a tick.
+	ex := &scriptedExec{slots: "pg_ha_slot_1|t|0|reserved|t\n"}
+	a := newNativeSyncTestAgent(t, ex)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), []string{"pg_ha_slot_1", "pg_ha_slot_2"}, true)
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("expected ALTER SYSTEM + reload, got %v", ex.slotSyncSQL)
+	}
+	if strings.Contains(ex.slotSyncSQL[0], "pg_ha_slot_2") {
+		t.Errorf("named a slot that does not exist yet: %q", ex.slotSyncSQL[0])
+	}
+	if !strings.Contains(ex.slotSyncSQL[0], "pg_ha_slot_1") {
+		t.Errorf("dropped the slot that does exist: %q", ex.slotSyncSQL[0])
+	}
+}
+
+func TestAssertSyncStandbySlotsUnderNativeReconcilesAnEmptySet(t *testing.T) {
+	// A single-node native cluster owns no standby slots. That is a real value, not a skip:
+	// it must clear whatever a previous topology left in the GUC.
+	ex := &scriptedExec{}
+	a := newNativeSyncTestAgent(t, ex)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), nil, true)
+	if len(ex.slotSyncSQL) != 2 {
+		t.Fatalf("an empty desired set must still reconcile, got %v", ex.slotSyncSQL)
+	}
+	if a.lastSyncStandbySlots == nil || *a.lastSyncStandbySlots != "" {
+		t.Errorf("cache = %v, want a pointer to \"\"", a.lastSyncStandbySlots)
+	}
+}
+
+func TestAssertSyncStandbySlotsUnderNativeIsStableAcrossTicks(t *testing.T) {
+	// reconcileSlots walks ordinals ascending, so the owned set is already ordered; an
+	// unchanged topology must not re-run ALTER SYSTEM every 5s.
+	ex := &scriptedExec{slots: "pg_ha_slot_1|t|0|reserved|t\npg_ha_slot_2|t|0|reserved|t\n"}
+	a := newNativeSyncTestAgent(t, ex)
+	owned := []string{"pg_ha_slot_1", "pg_ha_slot_2"}
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), owned, true)
+	first := len(ex.slotSyncSQL)
+	a.assertSyncStandbySlots(context.Background(), mustSlots(t, a), owned, true)
+	if len(ex.slotSyncSQL) != first {
+		t.Errorf("steady-state tick re-ran the GUC write: %v", ex.slotSyncSQL)
+	}
+}
+
+func TestReconcileSlotsReportsTheSlotsItOwns(t *testing.T) {
+	// The contract the native sync path depends on: reconcileSlots returns one name per live
+	// standby ordinal, ascending, excluding the primary's own.
+	ex := &slotExec{}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	owned := a.reconcileSlots(context.Background(), nil)
+	if len(owned) != 1 || owned[0] != "pg_ha_slot_1" {
+		t.Fatalf("owned = %v, want [pg_ha_slot_1] (pod-0 is self)", owned)
+	}
+}
+
+func TestReconcileSlotsReportsNothingUnderRepmgr(t *testing.T) {
+	// Slot lifecycle belongs to repmgr there, so the agent owns nothing to wait on and the
+	// sync path must fall back to repmgr.nodes rather than trusting an empty set.
+	ex := &slotExec{}
+	a := newSlotTestAgent(t, ex, config.MechanismRepmgr)
+	a.cfg.NodeCount = 2
+	if owned := a.reconcileSlots(context.Background(), nil); owned != nil {
+		t.Errorf("owned = %v, want nil under the repmgr mechanism", owned)
 	}
 }

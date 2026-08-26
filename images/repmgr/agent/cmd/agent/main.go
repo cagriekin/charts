@@ -986,11 +986,12 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// routing switch -- a write outage until the next tick, which is strictly worse than
 		// the WAL gap this call exists to prevent. Half the budget keeps the cutover funded.
 		var promoteSlots []pg.SlotState
+		var promoteOwned []string
 		var promoteSlotsRead bool
 		func() {
 			sctx, scancel := context.WithTimeout(wctx, a.fenceBudget()/2)
 			defer scancel()
-			promoteSlots, promoteSlotsRead = a.slotsTick(sctx)
+			promoteSlots, promoteOwned, promoteSlotsRead = a.slotsTick(sctx)
 		}()
 		if tl, _, ok, _ := a.prober.PrimaryWALPosition(wctx, a.selfConn()); ok {
 			a.advanceMarker(wctx, tl, true, obs.Marker)
@@ -1026,7 +1027,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// LAST, not ahead of routing (a hung slot query must not starve the assertion that
 		// actually matters for correctness this tick).
 		routingErr := a.assertPrimaryRouting(wctx, obs)
-		a.assertSyncStandbySlots(wctx, promoteSlots, promoteSlotsRead)
+		a.assertSyncStandbySlots(wctx, promoteSlots, promoteOwned, promoteSlotsRead)
 		return routingErr
 
 	case reconcile.StayPrimary:
@@ -1055,7 +1056,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// scale-down or a repmgr->native migration left pinning WAL. Bounded by the same
 		// fence-budget context. Only the mutation half is mechanism-gated -- the gauges the
 		// shipped alerts read must be truthful under repmgr too (see slotsTick).
-		staySlots, staySlotsRead := a.slotsTick(wctx)
+		staySlots, stayOwned, staySlotsRead := a.slotsTick(wctx)
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
@@ -1077,7 +1078,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		routingErr := a.assertPrimaryRouting(wctx, obs)
 		// #308: keep synchronized_standby_slots current as standbys scale up/down. After the
 		// routing switch, not before -- same fence-budget priority as the Promote case.
-		a.assertSyncStandbySlots(wctx, staySlots, staySlotsRead)
+		a.assertSyncStandbySlots(wctx, staySlots, stayOwned, staySlotsRead)
 		return routingErr
 
 	case reconcile.Follow:
@@ -2263,7 +2264,7 @@ func (a *agent) assertPrimaryRouting(ctx context.Context, obs reconcile.Observat
 // a read-write node, and a second round-trip there competes with the marker write and the
 // routing switch. An empty-but-successful read is NOT a skip -- see the unconditional first
 // reconcile below.
-func (a *agent) assertSyncStandbySlots(ctx context.Context, existing []pg.SlotState, read bool) {
+func (a *agent) assertSyncStandbySlots(ctx context.Context, existing []pg.SlotState, owned []string, read bool) {
 	if !a.cfg.SyncReplicationSlots {
 		return
 	}
@@ -2271,32 +2272,20 @@ func (a *agent) assertSyncStandbySlots(ctx context.Context, existing []pg.SlotSt
 		a.log.Warn("could not read the physical slots this tick; skipping the synchronized_standby_slots reconcile")
 		return
 	}
-	standbyIDs, err := a.prober.StandbyNodeIDs(ctx, a.selfConn())
-	if err != nil {
-		a.log.Warn("list repmgr.nodes for synchronized_standby_slots", "err", err)
-		return
-	}
 	existingSet := make(map[string]bool, len(existing))
 	for _, s := range existing {
 		existingSet[s.Name] = true
 	}
-	ghosts := make(map[int]bool)
-	for _, id := range ghostNodeIDs(standbyIDs, a.cfg.NodeCount) {
-		ghosts[id] = true
+	candidates, ok := a.syncSlotCandidates(ctx, owned)
+	if !ok {
+		return
 	}
-	// Sorted: standbyIDs comes from `SELECT node_id FROM repmgr.nodes WHERE type =
-	// 'standby'` with no ORDER BY, so its row order is not guaranteed stable between
-	// calls even when the standby SET is unchanged. desired below doubles as the cache
-	// key (a bare string compare, not a set compare), so an unstable order would make
-	// the primary re-run ALTER SYSTEM + reload every tick even in the common steady
-	// state -- churn indistinguishable from a real topology change.
-	sort.Ints(standbyIDs)
+	// Only slots that ACTUALLY EXIST may be named. synchronized_standby_slots pointing at a
+	// missing slot makes the primary refuse to release WAL and log repeatedly, so a slot that
+	// was only just created this tick waits for the next one -- `existing` was read before
+	// the create pass ran. Cheap: one extra tick of a standby not yet being waited on.
 	var slots []string
-	for _, id := range standbyIDs {
-		if ghosts[id] {
-			continue
-		}
-		name := fmt.Sprintf("repmgr_slot_%d", id)
+	for _, name := range candidates {
 		if existingSet[name] {
 			slots = append(slots, name)
 		}
@@ -2314,6 +2303,53 @@ func (a *agent) assertSyncStandbySlots(ctx context.Context, existing []pg.SlotSt
 	}
 	a.lastSyncStandbySlots = &desired
 	a.log.Info("reconciled synchronized_standby_slots", "slots", desired)
+}
+
+// syncSlotCandidates returns the slot names #308 should wait on, in a STABLE order, and
+// whether the answer is trustworthy enough to act on.
+//
+// Under native the answer is already computed: reconcileSlots owns one slot per live standby
+// pod and hands back exactly that set (#294). That is strictly better than the repmgr path
+// below -- it is the same authority that CREATES the slots, so the two cannot disagree, and it
+// needs neither repmgr.nodes nor the ghost-row filtering that a self-reported catalog forces.
+// It is also what makes syncReplicationSlots work under native at all: before this the
+// reconcile resolved standbys from repmgr.nodes and named slots repmgr_slot_<id>, so on a
+// native cluster it errored every tick while the chart still rendered
+// sync_replication_slots = on -- #308's protection silently absent (#294).
+//
+// ord ASC is inherent to reconcileSlots' loop, so no sort is needed on that path; the repmgr
+// path must sort explicitly (see below). Order matters because the caller uses the joined
+// string as a change-detection key.
+func (a *agent) syncSlotCandidates(ctx context.Context, owned []string) ([]string, bool) {
+	if a.cfg.Mechanism == config.MechanismNative {
+		// nil is a legitimate answer (a single-node cluster owns no standby slots) and must
+		// still reconcile -- desired=="" clears a stale GUC from a previous topology.
+		return owned, true
+	}
+	standbyIDs, err := a.prober.StandbyNodeIDs(ctx, a.selfConn())
+	if err != nil {
+		a.log.Warn("list repmgr.nodes for synchronized_standby_slots", "err", err)
+		return nil, false
+	}
+	ghosts := make(map[int]bool)
+	for _, id := range ghostNodeIDs(standbyIDs, a.cfg.NodeCount) {
+		ghosts[id] = true
+	}
+	// Sorted: standbyIDs comes from `SELECT node_id FROM repmgr.nodes WHERE type =
+	// 'standby'` with no ORDER BY, so its row order is not guaranteed stable between calls
+	// even when the standby SET is unchanged. The caller's joined string doubles as a cache
+	// key (a bare string compare, not a set compare), so an unstable order would make the
+	// primary re-run ALTER SYSTEM + reload every tick even in the common steady state --
+	// churn indistinguishable from a real topology change.
+	sort.Ints(standbyIDs)
+	names := make([]string, 0, len(standbyIDs))
+	for _, id := range standbyIDs {
+		if ghosts[id] {
+			continue
+		}
+		names = append(names, fmt.Sprintf("%s%d", legacySlotPrefix, id))
+	}
+	return names, true
 }
 
 // desiredRoleLabels builds the pg-role map the primary publishes each tick (the
@@ -2702,13 +2738,12 @@ func isCloneConnection(r pg.ReplicaRow) bool { return r.AppName == "pg_basebacku
 // The bool reports whether the read SUCCEEDED, which nil cannot: a primary with no slots at
 // all returns an empty slice legitimately, and #308's first reconcile of a term must still run
 // on that (desired=="" is a real value, not a skip).
-func (a *agent) slotsTick(ctx context.Context) ([]pg.SlotState, bool) {
+func (a *agent) slotsTick(ctx context.Context) ([]pg.SlotState, []string, bool) {
 	slots, ok := a.observeSlots(ctx)
 	if !ok {
-		return nil, false
+		return nil, nil, false
 	}
-	a.reconcileSlots(ctx, slots)
-	return slots, true
+	return slots, a.reconcileSlots(ctx, slots), true
 }
 
 // standbySlotsTick is the slot pass for a node running as a STANDBY (#289 review).
@@ -2821,13 +2856,19 @@ func (a *agent) observeSlots(ctx context.Context) ([]pg.SlotState, bool) {
 // Best-effort per slot: a failure is logged and retried next tick rather than aborting the
 // rest, because a single unreachable/locked slot must not block reclaiming the others --
 // and the whole point is that an unreclaimed slot silently fills the volume.
-func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) {
+func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) []string {
 	if a.cfg.Mechanism != config.MechanismNative {
-		return
+		return nil
 	}
 	if a.cfg.NodeCount <= 0 {
-		return
+		return nil
 	}
+	// The names this primary expects to back a live standby, returned for #308's
+	// synchronized_standby_slots reconcile. Computed HERE rather than recomputed there
+	// because it is the same question -- "which slots does this primary own for live
+	// standbys?" -- and the inputs (livePodOrdinals, NodeCount, self's ordinal) cost an
+	// uncached pod LIST that slotsTick already pays for once.
+	var desired []string
 	self := a.selfConn()
 	have := make(map[string]pg.SlotState, len(slots))
 	for _, s := range slots {
@@ -2865,6 +2906,7 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) {
 			continue
 		}
 		name := slotPrefix + strconv.Itoa(ord)
+		desired = append(desired, name)
 		if _, ok := have[name]; ok {
 			continue
 		}
@@ -2876,7 +2918,7 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) {
 	}
 
 	if liveErr != nil {
-		return
+		return desired
 	}
 	for _, s := range slots {
 		if !orphanSlot(s.Name, a.cfg.PodName, live) {
@@ -2892,6 +2934,7 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) {
 				"slot", s.Name, "retained_wal_bytes", s.RetainedWALBytes)
 		}
 	}
+	return desired
 }
 
 // livePodOrdinals reads the StatefulSet's actual pod set from the API and returns the set

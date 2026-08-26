@@ -2647,25 +2647,26 @@ helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.agent.syncReplicationSlots=true >/dev/null 2>&1 || sync_slots_replica_rc=$?
 assert_gt "#308: syncReplicationSlots without walLevel=logical rejected at render time" "${sync_slots_replica_rc}" "0"
 
-# #308 x #288 (rebase review): syncReplicationSlots + mechanism: native must be REFUSED, not
-# silently inert. The reconcile resolves standbys from repmgr.nodes and names slots
-# repmgr_slot_<node_id>; native has neither, so it would never run while every standby still
-# enabled sync_replication_slots -- a logical slot's decode position could then advance past
-# the standby that needs it, exactly what #308 exists to prevent.
-sync_slots_native_rc=0
-helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
-  --set repmgr.agent.mechanism=native >/dev/null 2>&1 || sync_slots_native_rc=$?
-assert_gt "#308/#288: syncReplicationSlots with mechanism native rejected at render time" "${sync_slots_native_rc}" "0"
-sync_slots_native_msg=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
-  --set repmgr.agent.mechanism=native 2>&1 || true)
-assert_contains "#308/#288: the native guard names both keys and the fix" "${sync_slots_native_msg}" "repmgr.agent.mechanism: native"
-# ...and the same combination under the default mechanism still renders.
-sync_slots_repmgr_rc=0
-helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical >/dev/null 2>&1 || sync_slots_repmgr_rc=$?
-assert_eq "#308: syncReplicationSlots under the repmgr mechanism still renders" "0" "${sync_slots_repmgr_rc}"
+# #294: syncReplicationSlots now WORKS under the native mechanism, so the render-time refusal
+# that #288 needed is gone. The reconcile used to resolve standbys from repmgr.nodes and name
+# slots repmgr_slot_<node_id>, neither of which exists under native; it now consumes the slot
+# set reconcileSlots already owns (pg_ha_slot_<ordinal>), so the creator and the waiter are the
+# same authority. Both mechanisms must render.
+for spl_mech in repmgr native; do
+  sync_slots_mech_rc=0
+  helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+    --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
+    --set "repmgr.agent.mechanism=${spl_mech}" >/dev/null 2>&1 || sync_slots_mech_rc=$?
+  assert_eq "#294: syncReplicationSlots renders under mechanism ${spl_mech}" "0" "${sync_slots_mech_rc}"
+done
+# The standbys must still be told to use it, on either mechanism -- the GUC is what makes a
+# standby wait, and rendering it only on one would be the silent half-feature #308 warned about.
+for spl_mech in repmgr native; do
+  sync_slots_render=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+    --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
+    --set "repmgr.agent.mechanism=${spl_mech}" 2>&1)
+  assert_contains "#294: sync_replication_slots is enabled under mechanism ${spl_mech}" "${sync_slots_render}" "sync_replication_slots = on"
+done
 
 # The repmgrd-mode variants of these checks went with the mode itself (#286): failoverMode is
 # a REMOVED key on 2.0.0 and is rejected at render time, which guards_test.yaml pins.
