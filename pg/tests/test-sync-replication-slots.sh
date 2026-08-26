@@ -18,6 +18,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 source "${SCRIPT_DIR}/helpers.sh"
 
+# Mechanism-aware naming (#294). Slot names and the file the agent writes primary_conninfo
+# into both differ by mechanism, and this suite hardcoded the repmgr answers -- so on the
+# native leg it asserted the OLD names against correct output and failed six ways while the
+# feature worked. test-scaledown.sh and test-agent-rolling.sh already branch on
+# chart_mechanism; this suite was the one left stranded, and it is the suite that is supposed
+# to prove #308 works.
+MECH="$(chart_mechanism 2>/dev/null || echo repmgr)"
+if [ "${MECH}" = "native" ]; then
+  # The agent owns one slot per live standby pod, named by ORDINAL (#289).
+  SLOT_PREFIX="pg_ha_slot_"
+  slot_for_ordinal() { echo "pg_ha_slot_$1"; }
+  # Native writes its managed fragment, not postgresql.auto.conf (which holds only what
+  # ALTER SYSTEM put there -- e.g. synchronized_standby_slots itself).
+  CONNINFO_FILE="/var/lib/postgresql/data/pgdata/pg-ha-agent.conf"
+else
+  # repmgr names slots by node_id, which is nodeIDBase(1000) + ordinal.
+  SLOT_PREFIX="repmgr_slot_"
+  slot_for_ordinal() { echo "repmgr_slot_$((1000 + $1))"; }
+  CONNINFO_FILE="/var/lib/postgresql/data/pgdata/postgresql.auto.conf"
+fi
+echo "  mechanism=${MECH}: slots ${SLOT_PREFIX}*, primary_conninfo in ${CONNINFO_FILE}"
+
 NAMESPACE="${NAMESPACE:-pg-test-sync-slots}"
 RELEASE="${RELEASE:-pgsyncslots}"
 FULLNAME=$(resolve_fullname "${RELEASE}" "${CHART_DIR}" "${SCRIPT_DIR}/values-agent.yaml")
@@ -63,7 +85,7 @@ assert_eq "primary: sync_replication_slots = on" "on" "${sync_worker}"
 # --- 1b: dbname present in every standby's primary_conninfo (patched post-clone) ---
 for standby in "${STANDBYS[@]}"; do
   conninfo=$(kubectl exec -n "${NAMESPACE}" "${standby}" -c postgresql -- \
-    sh -c "grep primary_conninfo /var/lib/postgresql/data/pgdata/postgresql.auto.conf" 2>/dev/null || echo "")
+    sh -c "grep primary_conninfo '${CONNINFO_FILE}'" 2>/dev/null || echo "")
   assert_contains "${standby}: primary_conninfo carries dbname after initial clone" "${conninfo}" "dbname="
 done
 
@@ -73,11 +95,11 @@ want_count=${#STANDBYS[@]}
 s=0; slots=""
 while [[ ${s} -lt 60 ]]; do
   slots=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SHOW synchronized_standby_slots" "testuser" "testdb" 2>/dev/null || echo "")
-  got=$(echo "${slots}" | tr ',' '\n' | grep -c "repmgr_slot_" || true)
+  got=$(echo "${slots}" | tr ',' '\n' | grep -c "${SLOT_PREFIX}" || true)
   [[ "${got}" -ge "${want_count}" ]] && break
   sleep 5; s=$((s + 5))
 done
-assert_eq "primary: synchronized_standby_slots names both standby slots" "${want_count}" "$(echo "${slots}" | tr ',' '\n' | grep -c "repmgr_slot_" || true)"
+assert_eq "primary: synchronized_standby_slots names both standby slots" "${want_count}" "$(echo "${slots}" | tr ',' '\n' | grep -c "${SLOT_PREFIX}" || true)"
 
 # --- 2: forced failover -- delete the primary, wait for a standby to promote ---
 OLD_PRIMARY="${PRIMARY}"
@@ -106,7 +128,7 @@ while [[ ${s} -lt 60 ]]; do
   [[ -n "${new_slots}" ]] && break
   sleep 5; s=$((s + 5))
 done
-assert_gt "new primary: synchronized_standby_slots is non-empty after failover" "$(echo "${new_slots}" | tr ',' '\n' | grep -c "repmgr_slot_" || true)" "0"
+assert_gt "new primary: synchronized_standby_slots is non-empty after failover" "$(echo "${new_slots}" | tr ',' '\n' | grep -c "${SLOT_PREFIX}" || true)" "0"
 
 # --- 2b: the rejoined ex-primary (now a standby) has dbname in its fresh primary_conninfo ---
 echo "  Waiting for the rejoined ex-primary to become a standby again (up to 120s)..."
@@ -118,7 +140,7 @@ while [[ ${s} -lt 120 ]]; do
 done
 assert_eq "ex-primary rejoined as a standby" "true" "${rejoined}"
 rejoin_conninfo=$(kubectl exec -n "${NAMESPACE}" "${OLD_PRIMARY}" -c postgresql -- \
-  sh -c "grep primary_conninfo /var/lib/postgresql/data/pgdata/postgresql.auto.conf" 2>/dev/null || echo "")
+  sh -c "grep primary_conninfo '${CONNINFO_FILE}'" 2>/dev/null || echo "")
 assert_contains "rejoined ex-primary: primary_conninfo carries dbname" "${rejoin_conninfo}" "dbname="
 
 # --- 3: scale down to 1 standby -- the departed standby's slot must be dropped ---
@@ -142,7 +164,7 @@ for p in "${FULLNAME}-0" "${FULLNAME}-1"; do
   [[ "${p}" != "${CURRENT_PRIMARY}" ]] && REMAINING_STANDBY="${p}"
 done
 STANDBY_ORDINAL="${REMAINING_STANDBY##*-}"
-EXPECTED_SLOT="repmgr_slot_$((1000 + STANDBY_ORDINAL))"
+EXPECTED_SLOT="$(slot_for_ordinal "${STANDBY_ORDINAL}")"
 
 echo "  Waiting for synchronized_standby_slots to name exactly ${EXPECTED_SLOT} (up to 60s)..."
 s=0; shrunk_slots=""

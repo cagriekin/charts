@@ -1206,6 +1206,10 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 				return fmt.Errorf("reload after follow: %w", err)
 			}
 		}
+		// Release this node's slot on the upstream it just LEFT (#294, live-cluster finding).
+		// Ordered after the reload so the walreceiver is already attached to the new upstream
+		// through the new slot -- the old one is then provably unused by this node.
+		a.releaseSlotOnFormerUpstream(ctx, a.followUpstream, dec.Target)
 		a.latchFollow(dec.Target)
 		return nil
 
@@ -2536,6 +2540,50 @@ func (a *agent) cleanupGhostNodes(ctx context.Context) {
 // volume's restored history -- under native a diverged standby reaches Follow with no rewind.
 func (a *agent) latchFollow(target string) {
 	a.followUpstream = target
+}
+
+// releaseSlotOnFormerUpstream drops THIS node's slot on the upstream it just stopped
+// streaming from (#294).
+//
+// Found on a live cascade, not in review: every standby's first clone comes from the PRIMARY
+// (BootstrapClone targets the lease holder), so it provisions its slot there -- and then
+// cascade re-homes it onto an intermediate standby. The slot on the primary is dead the
+// moment that re-home completes, but nothing reclaimed it: the primary's own reclaim pass
+// keeps any slot whose ordinal has a live pod, precisely so it cannot delete a child's slot
+// while that child is briefly disconnected. So a HEALTHY three-tier cluster accumulated one
+// inactive, WAL-retaining slot per cascaded node on its primary, until
+// max_slot_wal_keep_size invalidated them and PGHAReplicationSlotInvalidated paged someone.
+//
+// The owner cleaning up after itself is the one solution that needs no cluster-wide view:
+// this node knows both upstreams, and it knows it is no longer using the old slot. The
+// upstream cannot know -- it cannot distinguish "my child moved" from "my child is
+// restarting", which is exactly why its own policy has to be the conservative one.
+//
+// Cascade-only. Without cascading, a re-home means a FAILOVER, where the old upstream is the
+// demoted (often unreachable) ex-primary; standbySlotsTick already reclaims everything there,
+// and reaching for a dying node here would only add a timeout to every failover.
+//
+// Best-effort by design: DropPhysicalSlotIfInactive refuses an active slot, an unreachable
+// old upstream just logs, and either way the upstream's own bounded policy remains the
+// backstop. It must never fail the Follow that already succeeded.
+func (a *agent) releaseSlotOnFormerUpstream(ctx context.Context, former, target string) {
+	if !a.cfg.CascadeReplication {
+		return
+	}
+	if former == "" || former == target || former == a.cfg.PodName {
+		return
+	}
+	name := slotNameFor(a.cfg.PodName)
+	dropped, err := a.prober.DropPhysicalSlotIfInactive(ctx, a.peerConn(former), name)
+	if err != nil {
+		a.log.Warn("release this node's slot on the upstream it left; its own reclaim pass is the backstop",
+			"slot", name, "former_upstream", former, "new_upstream", target, "err", err)
+		return
+	}
+	if dropped {
+		a.log.Info("released this node's slot on the upstream it left",
+			"slot", name, "former_upstream", former, "new_upstream", target)
+	}
 }
 
 // topologyTick publishes the primary's replication topology from pg_stat_replication (#288).

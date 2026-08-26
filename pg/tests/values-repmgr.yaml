@@ -51,11 +51,15 @@ postgresql:
 repmgr:
   # The generic HA fixture: repmgr.enabled with one replica and persistence. It pinned
   # failoverMode: repmgrd until #286 removed that path; the agent is now the only mode.
-  image:
-    repository: cagriekin/repmgr
-    tag: trixie-5.5.0-27
-    pullPolicy: IfNotPresent
-
+  #
+  # NO image pin (#294). It pinned trixie-5.5.0-27, six tags behind the chart default, and
+  # unlike a local run CI is NOT saved by set-pg-major.sh here: that script rewrites the tag
+  # it finds, so the fixture kept overriding the image the build step had just produced from
+  # images/repmgr. test-scaledown loads this fixture, and its native assertions (no repmgr
+  # extension, no repmgr.nodes, exactly one pg_ha_slot_* left after a scale-down) therefore
+  # ran against a PUBLISHED pre-#288 image that has no MECHANISM handling at all -- so they
+  # failed while the real image passes every one of them. Inheriting the chart default is
+  # what makes the built image the thing under test. See values-agent.yaml for the same fix.
   enabled: true
 
   username: repmgr

@@ -2870,3 +2870,45 @@ func TestStandbyReclaimIsCascadeAware(t *testing.T) {
 		t.Error("an operator's slot must never be reclaimable")
 	}
 }
+
+func TestReleaseSlotOnFormerUpstream(t *testing.T) {
+	// #294 live-cluster finding: a cascaded standby clones from the PRIMARY (provisioning its
+	// slot there) and then re-homes onto an intermediate, leaving an inactive WAL-retaining
+	// slot on the primary that the primary's own conservative policy will never reclaim. The
+	// owner releases it, because only the owner knows it stopped using it.
+	newAgent := func(cascade bool) (*agent, *slotExec) {
+		ex := &slotExec{}
+		a := newSlotTestAgent(t, ex, config.MechanismNative)
+		a.cfg.CascadeReplication = cascade
+		return a, ex
+	}
+
+	// Re-homed under cascade: the old upstream's copy of this node's slot goes.
+	a, ex := newAgent(true)
+	a.releaseSlotOnFormerUpstream(context.Background(), "pg-1", "pg-2")
+	if len(ex.dropped) != 1 || ex.dropped[0] != slotNameFor(a.cfg.PodName) {
+		t.Errorf("dropped = %v, want [%s]", ex.dropped, slotNameFor(a.cfg.PodName))
+	}
+
+	// Without cascade a re-home is a failover: the old upstream is the demoted ex-primary,
+	// standbySlotsTick already reclaims there, and reaching for a dying node would add a
+	// timeout to every failover.
+	a, ex = newAgent(false)
+	a.releaseSlotOnFormerUpstream(context.Background(), "pg-1", "pg-2")
+	if len(ex.dropped) != 0 {
+		t.Errorf("dropped %v without cascading replication", ex.dropped)
+	}
+
+	// No-ops that must not issue a drop at all.
+	for _, tc := range []struct{ name, former, target string }{
+		{"first follow (no former upstream)", "", "pg-2"},
+		{"same upstream re-confirmed", "pg-1", "pg-1"},
+		{"former upstream is self", "pg-0", "pg-2"},
+	} {
+		a, ex = newAgent(true)
+		a.releaseSlotOnFormerUpstream(context.Background(), tc.former, tc.target)
+		if len(ex.dropped) != 0 {
+			t.Errorf("%s: dropped %v, want none", tc.name, ex.dropped)
+		}
+	}
+}
