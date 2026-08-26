@@ -14,21 +14,18 @@ import (
 // proceed; the caller falls back to ReclonePreserving (the #175 data-safe path).
 var ErrRewindDiverged = errors.New("mechanism: rewind diverged, reclone required")
 
-// Conn is how to reach a peer PostgreSQL node for clone/follow/rejoin. Password is
-// passed via PGPASSWORD, never on the command line or in logged argv.
+// Conn is how to reach a peer PostgreSQL node for clone/follow/rejoin: the address parts a
+// mechanism needs to write primary_conninfo or point a pg_basebackup at an upstream.
 //
-// (NodeID was dropped in #294 with mechanism.Repmgr -- nothing addresses a peer by id.)
-// The peer's address, carried so Follow takes one
-// parameter that either mechanism can read the parts it needs from: repmgr addresses an
-// upstream by node_id (it resolves the conninfo from repmgr.nodes), while a native
-// mechanism must write an actual host into primary_conninfo and has no use for the id.
-// Zero when the caller has no id to supply -- only repmgr requires it.
+// The credential is NOT here. It lives on the mechanism itself (Native.Password) and travels
+// via PGPASSWORD, never on a command line or in logged argv. Conn carried a Password field
+// until #294 that nothing ever set or read; it went with the NodeID field, which existed only
+// because repmgr addressed an upstream by node_id out of repmgr.nodes.
 type Conn struct {
 	Host           string
 	Port           int
 	User           string
 	DB             string
-	Password       string
 	ConnectTimeout time.Duration
 }
 

@@ -222,11 +222,13 @@ fi
 # No physical slot may be left pinning WAL for a pod that no longer exists. Under repmgr mode
 # repmgr names them repmgr_slot_<node_id>, so the scaled-away node 1002's slot is the one to
 # look for; the native equivalent is asserted above (#288 made it possible to run at all).
-if [ "$(chart_mechanism)" != "native" ]; then
-  ghost_slot=$(pg_exec "${NAMESPACE}" "${P}" \
-    "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'repmgr_slot_1002'" repmgr repmgr 2>/dev/null | xargs || echo "")
-  assert_eq "#289: no replication slot left pinning WAL for the scaled-away node 1002" "0" "${ghost_slot}"
-fi
+# A LEGACY repmgr_slot_* left by a cluster that predates #294 must also be reclaimed -- that is
+# the one reader nodeIDBase still has (slotOrdinal's legacy branch). Asserted unconditionally now:
+# gating it on chart_mechanism made it dead, and the assertion is meaningful under native
+# precisely because such a slot can only arrive from a repmgr-created cluster.
+ghost_slot=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'repmgr_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
+assert_eq "#289/#294: no legacy repmgr_slot_* left pinning WAL after the scale-down" "0" "${ghost_slot}"
 
 # Cleanup.
 helm uninstall "${RELEASE}" -n "${NAMESPACE}" 2>/dev/null || true

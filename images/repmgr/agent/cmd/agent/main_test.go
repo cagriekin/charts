@@ -18,7 +18,9 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	runtime "k8s.io/apimachinery/pkg/runtime"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/cagriekin/pg-ha-agent/internal/config"
 	"github.com/cagriekin/pg-ha-agent/internal/dcs"
@@ -2418,7 +2420,10 @@ func TestReconcileSlotsReportsTheSlotsItOwns(t *testing.T) {
 		{Name: "pg_ha_slot_0", Active: false, Reserving: true}, // the primary's own: never waited on
 		{Name: "operator_slot", Active: true, Reserving: true}, // not ours to touch or wait on
 	}
-	owned := a.reconcileSlots(context.Background(), observed)
+	owned, ownedOK := a.reconcileSlots(context.Background(), observed)
+	if !ownedOK {
+		t.Fatal("the owned set must be trustworthy when the pod list succeeds")
+	}
 	if len(owned) != 1 || owned[0] != "pg_ha_slot_1" {
 		t.Fatalf("owned = %v, want [pg_ha_slot_1] (pod-0 is self, operator_slot is not ours)", owned)
 	}
@@ -2430,7 +2435,7 @@ func TestReconcileSlotsReportsNothingItCannotSee(t *testing.T) {
 	ex := &slotExec{}
 	a := newSlotTestAgent(t, ex, config.MechanismNative)
 	a.cfg.NodeCount = 2
-	if owned := a.reconcileSlots(context.Background(), nil); len(owned) != 0 {
+	if owned, _ := a.reconcileSlots(context.Background(), nil); len(owned) != 0 {
 		t.Errorf("owned = %v, want none when nothing is observed yet", owned)
 	}
 }
@@ -2549,5 +2554,129 @@ func TestBootstrapCloneLatchesTheCloneSourceAsUpstream(t *testing.T) {
 	}
 	if a.followUpstream != "pg-0" {
 		t.Errorf("followUpstream = %q after cloning from pg-0, want \"pg-0\" -- the release path reads this", a.followUpstream)
+	}
+}
+
+func TestLatchFollowRestartsTheStallWindow(t *testing.T) {
+	// #294 review: the counter used to carry across a repoint, so the ordinary failover
+	// sequence -- primary dies, this standby climbs past standbyStallTicks while no peer is on
+	// a newer timeline, then a peer promotes -- armed StandbyStalled on the very FIRST tick
+	// after the Follow, turning a standby that would have streamed seconds later into a
+	// pg_rewind and possibly a full re-clone.
+	a := &agent{cfg: &config.Config{}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	a.standbyNoReceiverTicks = standbyStallTicks + 5
+	a.standbyLastProgressLSN = pg.LSN{Hi: 1, Lo: 2}
+	a.latchFollow("pg-1")
+	if a.standbyNoReceiverTicks != 0 {
+		t.Errorf("standbyNoReceiverTicks = %d after a repoint, want 0", a.standbyNoReceiverTicks)
+	}
+	if a.standbyLastProgressLSN != (pg.LSN{}) {
+		t.Errorf("standbyLastProgressLSN = %v after a repoint, want zero", a.standbyLastProgressLSN)
+	}
+	if a.followUpstream != "pg-1" {
+		t.Errorf("followUpstream = %q, want pg-1", a.followUpstream)
+	}
+}
+
+func TestSlotsTickFailsClosedWhenThePodListFails(t *testing.T) {
+	// #294 review: reconcileSlots returned a bare nil when livePodOrdinals failed, which
+	// syncSlotCandidates could not tell apart from "this primary owns no standby slots" -- so a
+	// single apiserver blip on a healthy 3-node cluster ran
+	// `ALTER SYSTEM SET synchronized_standby_slots = ''` plus a reload, dropping #308's
+	// guarantee and reinstating it the next tick. The pre-#294 code failed closed here.
+	ex := &slotExec{rows: "pg_ha_slot_1|t|0|reserved|t\n"}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	cs := k8sfake.NewSimpleClientset()
+	cs.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("apiserver unavailable")
+	})
+	a.kube = k8s.NewWithClient(cs, "ns")
+
+	_, owned, ok := a.slotsTick(context.Background())
+	if ok {
+		t.Fatal("slotsTick must report the owned set as untrustworthy when the pod list fails")
+	}
+	if owned != nil {
+		t.Errorf("owned = %v, want nil", owned)
+	}
+}
+
+func TestAssertSyncStandbySlotsLeavesTheGUCAloneOnAnUntrustworthyInput(t *testing.T) {
+	// The other half of the same fix: an untrustworthy owned set must not be written.
+	ex := &scriptedExec{}
+	a := newFollowTestAgent(t, ex)
+	a.cfg.Mechanism = config.MechanismNative
+	a.cfg.SyncReplicationSlots = true
+	a.assertSyncStandbySlots(context.Background(), nil, nil, false)
+	if len(ex.slotSyncSQL) != 0 {
+		t.Errorf("wrote synchronized_standby_slots on an untrustworthy input: %v", ex.slotSyncSQL)
+	}
+	if a.lastSyncStandbySlots != nil {
+		t.Error("the cache must not be updated from an input that was never applied")
+	}
+}
+
+func TestAssertNoForeignRecoveryConfig(t *testing.T) {
+	// #294 review: a 1.x data directory carries repmgr's primary_conninfo and
+	// primary_slot_name in postgresql.auto.conf, which outranks the agent's fragment. The chart
+	// cannot detect it (1.x had no mechanism key at all), so this refusal is the only thing
+	// between that upgrade and a standby that silently never streams.
+	dir := t.TempDir()
+	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "repmgr.so"))
+
+	// No auto.conf: a fresh install must boot.
+	if err := a.assertNoForeignRecoveryConfig(); err != nil {
+		t.Fatalf("a fresh install must not be refused: %v", err)
+	}
+
+	// Only the agent's own ALTER SYSTEM: still fine.
+	auto := filepath.Join(dir, "postgresql.auto.conf")
+	if err := os.WriteFile(auto, []byte("synchronized_standby_slots = 'pg_ha_slot_1'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.assertNoForeignRecoveryConfig(); err != nil {
+		t.Fatalf("the agent's own ALTER SYSTEM must not be refused: %v", err)
+	}
+
+	// repmgr-shaped: refused, with a message naming the migration rather than the symptom.
+	if err := os.WriteFile(auto, []byte("primary_conninfo = 'host=pg-0'\nprimary_slot_name = 'repmgr_slot_1001'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := a.assertNoForeignRecoveryConfig()
+	if err == nil {
+		t.Fatal("a repmgr-shaped auto.conf must be refused")
+	}
+	for _, want := range []string{"primary_conninfo", "primary_slot_name", "#292", "FRESH installs", "ALTER SYSTEM RESET"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("message does not mention %q: %v", want, err)
+		}
+	}
+}
+
+func TestPausedAgentKeepsTheSlotGauges(t *testing.T) {
+	// #294 review: pause routes through Decide's NoOp, which fell into act()'s retract branch
+	// and cleared the slot gauges every tick -- silencing all three slot alerts and resetting
+	// their `for:` clocks on a paused primary that is still serving and still retaining WAL.
+	ex := &slotExec{rows: "pg_ha_slot_1|f|4194304|reserved|t\n"}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	a.sup = process.NewSupervisor(&fakePostmaster{})
+	a.dcs = &fakeDCS{}
+
+	// Publish a slot observation, then take the NoOp path.
+	if _, ok := a.observeSlots(context.Background()); !ok {
+		t.Fatal("observeSlots failed")
+	}
+	before := scrapeMetrics(t, a)
+	if !strings.Contains(before, "pg_ha_agent_replication_slots 1") {
+		t.Fatalf("slot gauge was not published:\n%s", before)
+	}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.NoOp}, reconcile.Observation{}); err != nil {
+		t.Fatalf("act(NoOp): %v", err)
+	}
+	after := scrapeMetrics(t, a)
+	if !strings.Contains(after, "pg_ha_agent_replication_slots 1") {
+		t.Errorf("a pause retracted the slot gauges:\n%s", after)
 	}
 }

@@ -92,11 +92,16 @@ postgresql:
   # WAL replay can take longer still, both of which can exceed the ~130s
   # liveness budget. failureThreshold x periodSeconds is the total startup
   # budget (600s here); keep the steady-state livenessProbe window tight.
+  # Bounds a standby's FIRST clone: since #288 the agent clones in this container, not in a
+  # probe-free init container, so periodSeconds x failureThreshold caps the pg_basebackup.
+  # #294 raised it from 600s to 1800s -- native is now the only mechanism, so the old "raise it
+  # for native installs" caveat would otherwise have shipped as everyone's default. Size it
+  # against your own base-backup time for very large databases. See the pg chart values.
   startupProbe:
     enabled: true
     periodSeconds: 10
     timeoutSeconds: 5
-    failureThreshold: 60
+    failureThreshold: 180
 
   affinity: {}
   # Hard topology spread for the postgresql pods (default none; the affinity above

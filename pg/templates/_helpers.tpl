@@ -330,7 +330,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        the standalone behaviour: the operator's value passes through custom.conf. This does
        not move the default (repmgr) render. */ -}}
 {{- define "pg.chartOwnsSharedPreloadLibraries" -}}
-{{- if or .Values.postgresql.audit.enabled (and .Values.repmgr.enabled (ne ((.Values.repmgr.agent).mechanism | default "repmgr") "native") (eq (include "pg.userSetSharedPreloadLibraries" .) "true")) -}}true{{- end -}}
+{{- if or .Values.postgresql.audit.enabled (and .Values.repmgr.enabled (ne ((.Values.repmgr.agent).mechanism | default "native") "native") (eq (include "pg.userSetSharedPreloadLibraries" .) "true")) -}}true{{- end -}}
 {{- end -}}
 
 {{- /* The authoritative shared_preload_libraries value. Rendered into a conf.d file that
@@ -364,7 +364,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- $t := trim $l -}}
   {{- if and $t (not (has $t $libs)) -}}{{- $libs = append $libs $t -}}{{- end -}}
 {{- end -}}
-{{- if and .Values.repmgr.enabled (ne ((.Values.repmgr.agent).mechanism | default "repmgr") "native") (not (has "repmgr" $libs)) -}}{{- $libs = prepend $libs "repmgr" -}}{{- end -}}
+{{- if and .Values.repmgr.enabled (ne ((.Values.repmgr.agent).mechanism | default "native") "native") (not (has "repmgr" $libs)) -}}{{- $libs = prepend $libs "repmgr" -}}{{- end -}}
 {{- if and .Values.postgresql.audit.enabled (not (has "pgaudit" $libs)) -}}{{- $libs = append $libs "pgaudit" -}}{{- end -}}
 {{- join "," $libs -}}
 {{- end -}}
@@ -888,7 +888,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        requested module is genuinely absent; this stops it being requested in the first
        place. */ -}}
 {{- define "pg.validateNativePreloadRepmgr" -}}
-{{- if and (eq (include "pg.agentMode" .) "true") (eq ((.Values.repmgr.agent).mechanism | default "repmgr") "native") }}
+{{- if and (eq (include "pg.agentMode" .) "true") (eq ((.Values.repmgr.agent).mechanism | default "native") "native") }}
 {{- /* Match the way PostgreSQL resolves an entry, not the literal string: `repmgr`,
        `repmgr.so`, `$libdir/repmgr` and an absolute path to repmgr.so all load the same
        library, because PostgreSQL supplies `$libdir/` and `.so` itself when they are

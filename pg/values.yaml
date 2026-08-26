@@ -87,19 +87,26 @@ postgresql:
   # WAL replay can take longer still, both of which can exceed the ~130s
   # liveness budget. failureThreshold x periodSeconds is the total startup
   # budget (600s here); keep the steady-state livenessProbe window tight.
-  # #288 NOTE for `repmgr.agent.mechanism: native`: a standby's FIRST clone moves from the
-  # init container (where no probe applies) into the main container, so it now runs inside this
-  # budget -- periodSeconds x failureThreshold. A pg_basebackup of a large existing cluster that
-  # exceeds it gets the container killed. The agent detects the torn copy on the next boot and
-  # re-clones from scratch (a clone-in-progress marker plus a pg_controldata check), so this is a
-  # retry loop rather than a wedged pod -- but a base backup that cannot finish inside the budget
-  # will never finish. Raise failureThreshold for native installs whose base backup can outlast
-  # the default 600s.
+  # THIS BUDGET BOUNDS A STANDBY'S FIRST CLONE. Since #288 the clone runs in the main container
+  # (the agent does it) rather than in a probe-free init container, so periodSeconds x
+  # failureThreshold is the wall-clock limit on a pg_basebackup of your existing database. Exceed
+  # it and the kubelet kills the container; the agent detects the torn copy on the next boot and
+  # re-clones from scratch, so it is a retry loop rather than a wedged pod -- but a base backup
+  # that cannot finish inside the budget will never finish, and each attempt re-provisions a
+  # WAL-retaining slot on the primary.
+  #
+  # #294 raised failureThreshold from 60 (600s) to 180 (1800s): the note here used to say "raise
+  # it for native installs", which was reasonable while native was opt-in and is not now that it
+  # is the only mechanism -- the caveat would have shipped as the default for every consumer.
+  # 30 minutes covers an ordinary clone comfortably; it is NOT enough for a multi-terabyte one, so
+  # size it against your own base-backup time if that is you. Raising it costs only how long a
+  # genuinely stuck first boot stays unnoticed, since the steady-state livenessProbe below is
+  # what watches a running server.
   startupProbe:
     enabled: true
     periodSeconds: 10
     timeoutSeconds: 5
-    failureThreshold: 60
+    failureThreshold: 180
 
   affinity: {}
   # Hard topology spread for the postgresql pods (default none; the affinity above
@@ -189,13 +196,12 @@ postgresql:
   #   postgresql.configuration:
   #     shared_preload_libraries: pgsodium
   #     pgsodium.getkey_script: /etc/postgresql/pgsodium/getkey.sh
-  # Under repmgr.agent.mechanism: repmgr (the default) the chart merges `repmgr` into
-  # shared_preload_libraries for you (a bare value there would otherwise override the
-  # image's preload and silently disable failover), so declare only your own libraries.
-  # Under mechanism: native there is nothing to merge, and declaring `repmgr` yourself is
-  # REJECTED at render time (#293): the value loads via include_dir, so it would override
-  # the image's native gate and preload repmgr.so onto a cluster that has no repmgr
-  # extension -- an every-pod crash-loop once the repmgr-free image ships (#290).
+  # The chart merges nothing into shared_preload_libraries any more (#294 removed the repmgr
+  # mechanism, which was the only thing there was to preserve), so your value passes through as
+  # written -- declare exactly the libraries you want. Declaring `repmgr` is REJECTED at render
+  # time (#293): it loads via include_dir, so it would override the image's own gate and preload
+  # repmgr.so onto a cluster with no repmgr extension -- an every-pod crash-loop once the
+  # repmgr-free image ships (#290).
   extraVolumes: []
     # - name: pgsodium-key
     #   secret:
@@ -772,6 +778,10 @@ repmgr:
   username: repmgr
   database: repmgr
 
+  # NOT CONSUMED by anything (#294 review). These sized the repmgrd sidecar, which #286
+  # deleted; `grep Values.repmgr.resources pg/templates/` is empty. Kept only so an existing
+  # values file does not fail on an unknown key -- raising them does nothing. The PostgreSQL
+  # container's own budget is postgresql.resources, and the agent runs inside it.
   resources:
     requests:
       cpu: 50m
@@ -780,9 +790,10 @@ repmgr:
       cpu: 500m
       memory: 512Mi
 
-  # Resources for the repmgr-init init container, which runs `repmgr standby clone`
-  # (a full pg_basebackup of the database) -- heavier than the other init containers,
-  # so it is overridable here (#153). Raise the limits for large databases.
+  # Resources for the repmgr-init init container. Under native it no longer clones -- the agent
+  # does that from the POSTGRESQL container (#288), so postgresql.resources and the startupProbe
+  # are what bound a large clone now, not these. This container is down to permissions/directory
+  # prep, so the modest defaults below are ample (#153, #294).
   initContainerResources:
     requests:
       cpu: 100m
@@ -793,10 +804,17 @@ repmgr:
 
   terminationGracePeriodSeconds: 120
 
-  # What the agent does when it finds itself read-write without holding the lease:
-  #   log   — record it and demote
-  #   fence — demote and refuse to serve until the lease is reacquired
-  # Both are handled locally by the agent via pg_ctl; neither needs pod-delete RBAC.
+  # What the agent records when it finds itself read-write without holding the lease.
+  #
+  # HONEST STATUS (#294 review): the two values do not currently differ. The agent ALWAYS
+  # demotes on lease loss -- that is the fence, and it is unconditional (see the DCS OnLost
+  # callback) -- so `fence` buys nothing that `log` does not already do. The behaviour the two
+  # used to select lived in handle_split_brain() in the service-updater sidecar, which #286
+  # deleted; SPLIT_BRAIN_ACTION is still injected and validated, but no code reads it.
+  #
+  # Left in place rather than removed because the demote it names is real and the key is a
+  # plausible home for a genuine distinction later (e.g. refusing to serve reads while fenced).
+  # Do not set `fence` expecting stronger protection than `log`: you already have the demote.
   splitBrainDetection:
     action: log
 

@@ -358,6 +358,13 @@ func (a *agent) run() {
 		a.log.Error("preload preflight", "err", err)
 		os.Exit(1)
 	}
+	// Same placement, same reasoning: a data directory whose postgresql.auto.conf still carries
+	// recovery GUCs is one this agent cannot steer, and no amount of reconciling fixes it
+	// (#294 review).
+	if err := a.assertNoForeignRecoveryConfig(); err != nil {
+		a.log.Error("recovery-config preflight", "err", err)
+		os.Exit(1)
+	}
 
 	// Leadership: OnLost demotes synchronously (the fence-ordering guarantee)
 	// before the lock can be re-acquired by anyone.
@@ -840,7 +847,9 @@ func (a *agent) observeStandbyStall(ctx context.Context, o *reconcile.Observatio
 	//
 	// The latch is a PRECONDITION, not a delay: latchFollow runs at the end of the same Follow
 	// that writes primary_conninfo, so it is set on the first repoint tick. What buys the
-	// settling time is stallTicks plus the no-progress requirement above.
+	// settling time is stallTicks plus the no-progress requirement above -- and latchFollow
+	// ZEROES the counter, so the window genuinely restarts at each repoint rather than carrying
+	// a count earned while the old upstream was down (#294 review).
 	o.StandbyStalled = a.standbyNoReceiverTicks >= standbyStallTicks && a.followUpstream != ""
 	if o.StandbyStalled {
 		a.log.Warn("standby has had no walreceiver for several ticks; eligible for rejoin if a peer is on a newer timeline (#288)",
@@ -892,6 +901,23 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		a.metr.ClearTopology()
 		// #308's cache goes too: this node has stopped being primary, and
 		// synchronized_standby_slots is a primary-side reconcile.
+		a.lastSyncStandbySlots = nil
+	case reconcile.NoOp:
+		// Pause is NOT a demotion (#294 review). Decide returns NoOp for maintenance mode, which
+		// used to fall into the retract branch below and ClearSlots() every tick -- so on a
+		// PAUSED PRIMARY, still serving and still holding slots, all three slot alerts went
+		// silent and their `for:` clocks (5m/15m/1h) reset on every tick. A pause is the state
+		// most likely to accumulate slot WAL, and the chart ships PGHAAgentPausedTooLong for
+		// hour-long pauses, so that was a long blind window over a real hazard.
+		//
+		// The slot gauges are therefore LEFT STANDING. Nothing refreshes them while paused
+		// (slotsTick runs from the primary/standby branches, which NoOp skips), so they hold
+		// their last observed value -- truthful for a paused node, and the alternative is
+		// silence. Topology is still retracted, for the reason the Follow branch gives: it is
+		// the PRIMARY's connection list, it has no standby equivalent, and a stale one latched
+		// under max() is worse than none.
+		a.metr.ClearTopology()
+		a.lastTopologyGap = ""
 		a.lastSyncStandbySlots = nil
 	default:
 		a.metr.ClearSlots()
@@ -1033,7 +1059,14 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// upstream, which is exactly the steady state a demoted ex-primary settles into.
 		// Anything placed after it would run once and never again -- so the leftover slots
 		// would keep reserving WAL on this node's own volume for the rest of its life.
-		a.standbySlotsTick(ctx)
+		// Fence-bounded (#294 review). This runs inside act(), i.e. under opMu, and does an
+		// uncached apiserver LIST plus psql; tick()'s own context has no deadline, so a hung
+		// call would hold opMu past the soft-fence window and starve the dcs.OnLost demote,
+		// which cannot take opMu. topologyTick was moved out of act() and given exactly this
+		// budget in this same change, for exactly this reason.
+		sctx, scancel := context.WithTimeout(ctx, a.fenceBudget())
+		a.standbySlotsTick(sctx)
+		scancel()
 		// Ensure this standby has a repmgr.nodes record. In agent mode no repmgrd
 		// sidecar registers it, and without the record BOTH repmgr standby follow and
 		// a later promote fail ("unable to retrieve node record"). Registration must
@@ -1125,7 +1158,13 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// Release this node's slot on the upstream it just LEFT (#294, live-cluster finding).
 		// Ordered after the reload so the walreceiver is already attached to the new upstream
 		// through the new slot -- the old one is then provably unused by this node.
-		a.releaseSlotOnFormerUpstream(ctx, a.followUpstream, dec.Target)
+		// Fence-bounded, and this one needs it most (#294 review): it deliberately dials the
+		// FORMER upstream, which under cascade is often the node that just died, so its 10s
+		// connect_timeout alone would stall the reconcile goroutine against a /healthz staleness
+		// threshold of 3x the interval -- while holding opMu.
+		rctx, rcancel := context.WithTimeout(ctx, a.fenceBudget())
+		a.releaseSlotOnFormerUpstream(rctx, a.followUpstream, dec.Target)
+		rcancel()
 		a.latchFollow(dec.Target)
 		return nil
 
@@ -1872,12 +1911,60 @@ func (a *agent) writePgHba() error {
 // in the server's module directory.
 const repmgrPreloadLib = "repmgr"
 
+// assertNoForeignRecoveryConfig refuses to start when postgresql.auto.conf sets the GUCs that
+// decide where this standby streams from (#294 review).
+//
+// This guards the one upgrade path 2.0.0 otherwise fails SILENTLY: a cluster created by a 1.x
+// release. 1.x had no `repmgr.agent.mechanism`, so nothing in the chart can detect it --
+// pg.validateRemovedRepmgrdValues sees no stale key, MECHANISM: "native" renders clean, and the
+// release installs. But repmgr already wrote primary_conninfo and
+// primary_slot_name = repmgr_slot_<node_id> into every standby's auto.conf; PostgreSQL reads
+// auto.conf AFTER every include, so those outrank the agent's managed fragment -- the same
+// precedence Native.Clone avoids `pg_basebackup -R` to stay clear of. Nothing strips them, and
+// EnsurePrimaryConninfoDBName only patches dbname INTO whatever it finds, actively preserving
+// the stale value.
+//
+// The failure was invisible: Follow writes the fragment, Reload succeeds, and the walreceiver
+// keeps the old upstream through a slot that no longer exists. streamingFromTarget never
+// matches, Follow re-runs every tick, and the stall window then escalates to pg_rewind and
+// possibly a full re-clone. Both the CHANGELOG and the chart say this path needs #292's in-place
+// migration first; invariant 4 says that has to be enforced, not merely documented.
+//
+// Stripping the lines instead would be worse: sequencing it against the catalog and the slots is
+// exactly what #292 is for, and a half-migration is harder to reason about than a pod that will
+// not start with a message naming the issue.
+func (a *agent) assertNoForeignRecoveryConfig() error {
+	autoConf := filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf")
+	found, err := pgconf.ForeignRecoveryConfig(autoConf)
+	if err != nil {
+		// Unreadable is not evidence. Refusing on it would be its own outage -- the same
+		// asymmetry as the module-directory check above.
+		a.log.Warn("could not read postgresql.auto.conf; skipping the recovery-config check", "path", autoConf, "err", err)
+		return nil
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	return fmt.Errorf("refusing to start: %s sets %s, which PostgreSQL reads AFTER the agent's own config and therefore overrides it. "+
+		"This agent writes those settings into %s, and it cannot steer a standby whose auto.conf overrules them: Follow would report success on every tick while the walreceiver kept the old upstream (and, after a repmgr cluster, a replication slot that no longer exists). "+
+		"If this data directory was created by a chart 1.x release it is repmgr-shaped and needs the in-place migration (#292) before it can run the native mechanism -- 2.0.0 native is for FRESH installs. "+
+		"If you set these by hand, undo them with `ALTER SYSTEM RESET <setting>` and restart the pod",
+		autoConf, strings.Join(found, " and "), "the agent-managed fragment in PGDATA")
+}
+
 // preflightPreload is run()'s single #293 entry point: strip, then verify. The order is
 // what makes a direct 1.x -> repmgr-free-image jump survivable -- the strip removes the
 // request before the check looks for it.
 func (a *agent) preflightPreload() error {
+	// The strip is NOT fatal (#294 review). Only assertPreloadedLibsPresent earns the exit: its
+	// condition -- a library the image does not ship -- is a postmaster that will never start.
+	// A failed strip is a different animal: it means a transient read/write problem (EIO, a
+	// read-only remount, ENOSPC on the atomic temp write), and repmgr.so is still shipped today,
+	// so leaving the line in place breaks nothing. Exiting there would CrashLoopBackOff a cluster
+	// that would otherwise have run fine, before leader election, on a node that only needed the
+	// next tick. The check below still catches it if the library really is missing.
 	if err := a.dropRepmgrPreload(); err != nil {
-		return err
+		a.log.Warn("could not strip the repmgr preload from PGDATA; continuing (the presence check below is the backstop)", "err", err)
 	}
 	return a.assertPreloadedLibsPresent()
 }
@@ -2197,7 +2284,11 @@ func (a *agent) assertSyncStandbySlots(ctx context.Context, existing []pg.SlotSt
 		return
 	}
 	if !read {
-		a.log.Warn("could not read the physical slots this tick; skipping the synchronized_standby_slots reconcile")
+		// Covers BOTH "the slot query failed" and "the live pod set was unreadable, so the owned
+		// set is a guess" (#294 review). Either way this fails CLOSED: the GUC keeps whatever it
+		// holds. Clearing it on an unreadable input would drop #308's guarantee on a healthy
+		// cluster over one apiserver blip.
+		a.log.Warn("could not establish this primary's owned slot set this tick; leaving synchronized_standby_slots as it is")
 		return
 	}
 	existingSet := make(map[string]bool, len(existing))
@@ -2377,6 +2468,22 @@ func (a *agent) fqdn(name string) string { return name + "." + a.cfg.HeadlessSer
 // volume's restored history -- under native a diverged standby reaches Follow with no rewind.
 func (a *agent) latchFollow(target string) {
 	a.followUpstream = target
+	// Restart the stall window on every repoint (#294 review). The counter only cleared on an
+	// OBSERVED streaming walreceiver or inside rejoinOnto, so it carried straight across a
+	// Follow -- and the comment on StandbyStalled claiming "stallTicks buys the settling time"
+	// was false whenever the counter was already at the threshold when the repoint arrived.
+	//
+	// That is the ordinary failover, not an edge case: the primary dies, this standby loses its
+	// walreceiver and climbs past standbyStallTicks (~3 min) while `newer == nil` suppresses
+	// escalation, then a peer promotes. On the very next tick after this latch the counter is
+	// already over, the new walreceiver has not attached yet and replay has not moved -- so
+	// StandbyStalled fires, `newer` is now non-nil, and Decide returns RejoinForward: postgres
+	// stopped, pg_rewind, possibly a full ReclonePreserving leaving a .diverged.<ts> copy, on a
+	// standby that would have been streaming seconds later.
+	//
+	// A repoint is exactly the event the window is meant to time, so it starts here.
+	a.standbyNoReceiverTicks = 0
+	a.standbyLastProgressLSN = pg.LSN{}
 }
 
 // releaseSlotOnFormerUpstream drops THIS node's slot on the upstream it just stopped
@@ -2624,7 +2731,10 @@ func (a *agent) slotsTick(ctx context.Context) ([]pg.SlotState, []string, bool) 
 	if !ok {
 		return nil, nil, false
 	}
-	return slots, a.reconcileSlots(ctx, slots), true
+	// ownedOK is folded into the returned read flag on purpose: #308's reconcile needs BOTH the
+	// slot list and a trustworthy owned set, and it has one skip path for "could not look".
+	owned, ownedOK := a.reconcileSlots(ctx, slots)
+	return slots, owned, ownedOK
 }
 
 // standbySlotsTick is the slot pass for a node running as a STANDBY (#289 review).
@@ -2775,9 +2885,9 @@ func (a *agent) observeSlots(ctx context.Context) ([]pg.SlotState, bool) {
 // Best-effort per slot: a failure is logged and retried next tick rather than aborting the
 // rest, because a single unreachable/locked slot must not block reclaiming the others --
 // and the whole point is that an unreclaimed slot silently fills the volume.
-func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) []string {
+func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) ([]string, bool) {
 	if a.cfg.NodeCount <= 0 {
-		return nil
+		return nil, false
 	}
 	self := a.selfConn()
 	have := make(map[string]pg.SlotState, len(slots))
@@ -2840,10 +2950,13 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) []stri
 	}
 
 	if liveErr != nil {
-		// No trustworthy live set: nothing is reclaimed, and #308 gets no answer rather than a
-		// guessed one. Naming slots resolved from a stale pod view is how the primary ends up
-		// waiting on a slot that should be gone.
-		return nil
+		// No trustworthy live set: nothing is reclaimed, and #308 gets NO ANSWER rather than a
+		// guessed one -- hence the false. Returning a bare nil here made "could not tell" and
+		// "owns no standby slots" the same value, so one apiserver blip on a healthy 3-node
+		// cluster cleared synchronized_standby_slots entirely and reinstated it the next tick:
+		// the exact guarantee #308 exists for, dropped, with GUC churn per blip (#294 review).
+		// The pre-#294 code failed CLOSED here; this restores that.
+		return nil, false
 	}
 	for _, s := range slots {
 		if !orphanSlot(s.Name, a.cfg.PodName, live) {
@@ -2859,7 +2972,7 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) []stri
 				"slot", s.Name, "retained_wal_bytes", s.RetainedWALBytes)
 		}
 	}
-	return a.ownedStandbySlots(slots, live)
+	return a.ownedStandbySlots(slots, live), true
 }
 
 // ownedStandbySlots reduces the slots observed on this node to the ones it maintains for a

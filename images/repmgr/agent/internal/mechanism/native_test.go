@@ -105,7 +105,7 @@ func TestNativeFollowRequiresHost(t *testing.T) {
 
 func TestNativeFollowWritesConninfoAndStandbySignal(t *testing.T) {
 	n, dataDir := newTestNative(t, &fakeRunner{})
-	upstream := Conn{Host: "pg-0.headless", Port: 5432, User: "repmgr", Password: "s3cret"}
+	upstream := Conn{Host: "pg-0.headless", Port: 5432, User: "repmgr"}
 	if err := n.Follow(context.Background(), upstream); err != nil {
 		t.Fatal(err)
 	}

@@ -384,18 +384,16 @@ func (n *Native) Follow(ctx context.Context, upstream Conn) error {
 // Clone builds the local PGDATA fresh from source. The caller guarantees PGDATA is empty or
 // has been moved aside (ReclonePreserving does the moving).
 //
-// -R writes primary_conninfo and standby.signal into the new data directory, so the clone
-// streams as soon as it starts without a separate Follow call from the caller -- the #181
-// failure mode was a standby that came up after a cutover and never re-established
-// streaming. -X stream copies WAL concurrently so the backup is self-consistent without
-// depending on WAL still being retained on the primary when the copy finishes.
+// -X stream copies WAL concurrently, so the backup is self-consistent without depending on WAL
+// still being retained on the primary when the copy finishes.
 //
 // Deliberately NOT pg_basebackup -R: that writes primary_conninfo/standby.signal into
-// postgresql.auto.conf, a SECOND place recovery config can live besides the managed
-// fragment Follow writes to. postgresql.auto.conf is included last (initdb appends it to
-// the end of postgresql.conf), so it would silently outrank any later Follow -- a standby
-// cloned once and later re-pointed to a new upstream would keep streaming from the
-// original source. Calling Follow here instead keeps exactly one authoritative place.
+// postgresql.auto.conf, a SECOND place recovery config can live besides the managed fragment
+// Follow writes to. auto.conf is read last, so it would silently outrank any later Follow -- a
+// standby cloned once and re-pointed to a new upstream would keep streaming from the original
+// source. Calling Follow here instead keeps exactly one authoritative place. (The agent now also
+// REFUSES to start on a data directory whose auto.conf already sets those GUCs, which is how a
+// 1.x repmgr volume is caught -- see assertNoForeignRecoveryConfig, #294.)
 // #289: the backup streams through this node's own named slot, created on the source
 // FIRST so no WAL gap can open between the base backup starting and the walreceiver
 // attaching. Without a slot the source may recycle a segment the new standby still needs

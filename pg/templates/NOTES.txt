@@ -22,7 +22,7 @@ Credentials:
 
 Failover mode: AGENT (lease-based). The Go agent holds the Lease
 "{{ include "pg.fullname" . }}-leader" as the sole authority for which pod is
-primary, and drives repmgr as a mechanism (no repmgrd). Inspect:
+primary, and drives PostgreSQL directly (pg_ctl / pg_basebackup / pg_rewind). Inspect:
 
   kubectl -n {{ .Release.Namespace }} get lease {{ include "pg.fullname" . }}-leader \
     -o jsonpath='{.spec.holderIdentity}'   # the current primary pod
