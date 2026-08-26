@@ -2601,3 +2601,25 @@ func TestAssertPreloadedLibsPresentDoesNotRefuseOnAWrongModuleDirectory(t *testi
 		t.Fatalf("a missing module DIRECTORY must not refuse the boot: %v", err)
 	}
 }
+
+func TestPreflightPreloadStripsThenVerifies(t *testing.T) {
+	// The order run() depends on: the strip removes the request before the check looks for
+	// it, which is what makes a direct 1.x -> repmgr-free-image jump survivable rather than
+	// a refusal on the very cluster the strip would have fixed (#293 review).
+	dir := t.TempDir()
+	writePGDATAConf(t, dir, "shared_preload_libraries = 'repmgr'\n")
+	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "absent.so"))
+	if err := a.preflightPreload(); err != nil {
+		t.Fatalf("strip must precede the check: %v", err)
+	}
+}
+
+func TestPreflightPreloadNeedsNoDataDirectory(t *testing.T) {
+	// It runs before boot()'s HasData gate now, so an empty PGDATA must be a clean no-op
+	// rather than a fatal read error.
+	dir := t.TempDir()
+	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "absent.so"))
+	if err := a.preflightPreload(); err != nil {
+		t.Fatalf("an uninitialized PGDATA must not fail the preflight: %v", err)
+	}
+}

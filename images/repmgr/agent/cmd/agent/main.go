@@ -342,6 +342,27 @@ func (a *agent) run() {
 		}
 	}
 
+	// #293 preload preflight, deliberately BEFORE leader election. It strips repmgr from
+	// PGDATA's shared_preload_libraries under native, then refuses to continue if any
+	// configuration still asks for a shared library this image does not ship.
+	//
+	// The refusal is fatal because it is not a degraded state the reconcile loop can work
+	// around: every postmaster start will fail, forever, and letting the loop proceed would
+	// bury the one message that explains why under PostgreSQL's own `could not access file
+	// "repmgr"`. Exiting puts the actionable text in the agent's log and the pod's restart
+	// reason instead -- the same reasoning as the control-API failure above.
+	//
+	// And it runs HERE, not after boot(), precisely so os.Exit cannot strand the lease. Past
+	// a.dcs.Run this node can hold leadership -- boot() legitimately takes minutes when it
+	// clones -- and exiting from there skips the only release path (the tick loop's ctx.Done
+	// branch), so healthy peers would wait out the full LeaseDuration before promoting, once
+	// per CrashLoopBackOff restart (#293 review). Nothing here needs leadership: it is local
+	// file surgery on PGDATA plus a stat.
+	if err := a.preflightPreload(); err != nil {
+		a.log.Error("preload preflight", "err", err)
+		os.Exit(1)
+	}
+
 	// Leadership: OnLost demotes synchronously (the fence-ordering guarantee)
 	// before the lock can be re-acquired by anyone.
 	go a.dcs.Run(ctx, a.cfg.PodName, dcs.Callbacks{
@@ -375,18 +396,6 @@ func (a *agent) run() {
 
 	if err := a.boot(ctx); err != nil {
 		a.log.Error("boot", "err", err)
-	}
-
-	// AFTER boot(), so the strip above has already had its chance, and FATAL, unlike
-	// boot()'s own error (#293). A configuration that asks for a shared library this image
-	// does not ship is not a degraded state the reconcile loop can work around: every
-	// postmaster start will fail, forever, and letting the loop proceed would bury the one
-	// message that explains why under PostgreSQL's own `could not access file "repmgr"`.
-	// Exiting puts the actionable text in the agent's log and the pod's restart reason
-	// instead -- the same reasoning as the control-API construction failure above.
-	if err := a.assertPreloadedLibsPresent(); err != nil {
-		a.log.Error("preload check", "err", err)
-		os.Exit(1)
 	}
 
 	ticker := time.NewTicker(a.cfg.ReconcileInterval)
@@ -503,10 +512,6 @@ func (a *agent) boot(ctx context.Context) error {
 	// md5-fallback awk, which raced this write and left rejoined standbys SCRAM-only
 	// (#199). Written every boot (idempotent); a clone/rejoin inherits the source's.
 	if err := a.writePgHba(); err != nil {
-		return err
-	}
-	// Strip repmgr from shared_preload_libraries in PGDATA, before any start (#293).
-	if err := a.dropRepmgrPreload(); err != nil {
 		return err
 	}
 	// Only bring up data that is safe to start regardless of holdership: a
@@ -1935,10 +1940,18 @@ func (a *agent) writePgHba() error {
 // in the server's module directory.
 const repmgrPreloadLib = "repmgr"
 
+// preflightPreload is run()'s single #293 entry point: strip, then verify. The order is
+// what makes a direct 1.x -> repmgr-free-image jump survivable -- the strip removes the
+// request before the check looks for it.
+func (a *agent) preflightPreload() error {
+	if err := a.dropRepmgrPreload(); err != nil {
+		return err
+	}
+	return a.assertPreloadedLibsPresent()
+}
+
 // dropRepmgrPreload removes `shared_preload_libraries = 'repmgr'` from PGDATA under the
-// native mechanism (#293). The companion refusal for a library this image does not ship at
-// all lives in assertPreloadedLibsPresent, which run() calls after this -- separately,
-// because it has to be FATAL and boot()'s errors are only logged.
+// native mechanism (#293).
 //
 // The line is written INTO THE DATA DIRECTORY by images/repmgr/entrypoint.sh at initdb
 // time and cloned verbatim to every standby, so it outlives any chart change and any helm
@@ -1952,14 +1965,17 @@ const repmgrPreloadLib = "repmgr"
 // because the repmgr extension's own functions are what we would be gambling with and
 // there is nothing to gain by touching it (#293).
 //
-// One call site is enough. This runs from boot(), which every pod start passes through
-// before ReadControlData and before any sup.Start, so:
-//   - A native standby cloned from a still-dirty source inherits the line and carries it
-//     until its next restart. Harmless -- repmgr.so is present in every release before
-//     #290 -- and stripped on that pod's next boot, so the cluster converges without
-//     chasing the ~10 sup.Start call sites.
+// One call site is enough. run() calls this from preflightPreload before leader election,
+// so it precedes boot() and therefore every sup.Start, and:
+//   - A native standby cloned (or restored) from a still-dirty source inherits the line and
+//     carries it until its next restart. Harmless -- repmgr.so is present in every release
+//     before #290 -- and stripped on that pod's next start, so the cluster converges
+//     without chasing the ~10 sup.Start call sites.
 //   - A cluster that skips this release entirely and jumps straight to the repmgr-free
 //     image is still rescued: the strip runs before that pod's first start.
+//
+// An empty PGDATA needs no special case: postgresql.conf does not exist yet, and
+// EnsureNoPreloadLibrary treats that as nothing to do.
 func (a *agent) dropRepmgrPreload() error {
 	confPath := filepath.Join(a.cfg.PGDATA, "postgresql.conf")
 	if a.cfg.Mechanism == config.MechanismNative {

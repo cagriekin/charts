@@ -909,8 +909,19 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        place. */ -}}
 {{- define "pg.validateNativePreloadRepmgr" -}}
 {{- if and (eq (include "pg.agentMode" .) "true") (eq ((.Values.repmgr.agent).mechanism | default "repmgr") "native") }}
-{{- $libs := splitList "," (include "pg.sharedPreloadLibraries" .) }}
-{{- if has "repmgr" $libs }}
+{{- /* Match the way PostgreSQL resolves an entry, not the literal string: `repmgr`,
+       `repmgr.so`, `$libdir/repmgr` and an absolute path to repmgr.so all load the same
+       library, because PostgreSQL supplies `$libdir/` and `.so` itself when they are
+       absent. Comparing the bare name only let `$libdir/repmgr` slip past this guard, the
+       agent's strip AND the agent's absent-module refusal simultaneously -- delivering
+       exactly the crash-loop all three exist to prevent (#293 review). The agent's
+       preloadEntryNames applies the same normalisation, and the two must stay in step. */ -}}
+{{- $found := false }}
+{{- range $l := splitList "," (include "pg.sharedPreloadLibraries" .) }}
+  {{- $n := trimSuffix ".so" (base (trim $l)) }}
+  {{- if eq $n "repmgr" }}{{- $found = true }}{{- end }}
+{{- end }}
+{{- if $found }}
 {{- $user := "" }}
 {{- range $k, $v := (.Values.postgresql.configuration | default dict) }}
   {{- if eq (lower ($k | toString)) "shared_preload_libraries" }}{{- $user = $v | toString }}{{- end }}

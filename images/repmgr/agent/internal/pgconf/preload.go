@@ -3,6 +3,8 @@ package pgconf
 import (
 	"fmt"
 	"os"
+	"path"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -15,13 +17,13 @@ const preloadGUC = "shared_preload_libraries"
 // preloadAssignRe matches an ACTIVE shared_preload_libraries assignment, capturing the
 // leading indentation and everything after the `=`. Commented-out lines are excluded by
 // the caller, not here, so that initdb's own stock
-// `#shared_preload_libraries = ''	# (change requires restart)` is never touched.
+// `#shared_preload_libraries = ”	# (change requires restart)` is never touched.
 var preloadAssignRe = regexp.MustCompile(`(?i)^([ \t]*)` + preloadGUC + `[ \t]*=[ \t]*(.*)$`)
 
 // EnsureNoPreloadLibrary removes lib from every shared_preload_libraries assignment in
 // confPath, preserving the other libraries and their order, and reports whether the file
 // changed. When lib was the only entry the assignment line is dropped entirely rather than
-// left as an empty string: an empty `shared_preload_libraries = ''` and no setting at all
+// left as an empty string: an empty `shared_preload_libraries = ”` and no setting at all
 // are equivalent to the postmaster, and dropping the line lets PostgreSQL's own default
 // apply instead of pinning it.
 //
@@ -37,6 +39,14 @@ var preloadAssignRe = regexp.MustCompile(`(?i)^([ \t]*)` + preloadGUC + `[ \t]*=
 // which line a later editor happens to append after.
 func EnsureNoPreloadLibrary(confPath, lib string) (changed bool, err error) {
 	data, err := os.ReadFile(confPath)
+	// A missing postgresql.conf is not this function's problem to escalate. It happens on a
+	// torn clone or restore that left PG_VERSION behind (so the caller's HasData check
+	// passes) without the config, and boot()'s later ReadControlData already handles that
+	// gracefully -- it warns and defers the start to the reconcile loop. Erroring here would
+	// abort boot() one step earlier and skip that recovery path entirely.
+	if os.IsNotExist(err) {
+		return false, nil
+	}
 	if err != nil {
 		return false, fmt.Errorf("read %s: %w", confPath, err)
 	}
@@ -110,14 +120,23 @@ func preloadRequests(content, lib string) bool {
 	return false
 }
 
-// filterOutLib returns libs without lib. Comparison is exact: shared_preload_libraries
-// entries are resolved as FILENAMES (`repmgr` -> repmgr.so), so unlike the GUC name itself
-// they are case-sensitive on any filesystem that is, and folding case here could strip an
-// unrelated library that merely differs in case.
+// filterOutLib returns libs without lib.
+//
+// An entry may be directory-qualified and may carry the shared-object suffix -- PostgreSQL
+// accepts `repmgr`, `$libdir/repmgr`, `repmgr.so` and `/usr/lib/postgresql/18/lib/repmgr.so`
+// as the same library, adding `$libdir/` and `.so` itself when they are absent. Matching the
+// bare name only would let `$libdir/repmgr` slip past every layer of #293 at once: the strip
+// would leave it, the diagnostic would stay silent about it, and the render guard would
+// accept it -- delivering exactly the bare `could not access file "repmgr"` crash-loop all
+// three exist to prevent.
+//
+// Case is NOT folded. These entries resolve as filenames, so unlike the GUC name they are
+// case-sensitive wherever the filesystem is, and folding could strip an unrelated library
+// that merely differs in case. Non-matching entries are kept verbatim, never normalised.
 func filterOutLib(libs []string, lib string) []string {
 	kept := make([]string, 0, len(libs))
 	for _, l := range libs {
-		if l == lib {
+		if preloadEntryNames(l, lib) {
 			continue
 		}
 		kept = append(kept, l)
@@ -125,11 +144,25 @@ func filterOutLib(libs []string, lib string) []string {
 	return kept
 }
 
+// preloadEntryNames reports whether a shared_preload_libraries entry refers to lib,
+// tolerating a directory prefix and a .so suffix. Kept in one place so the strip and the
+// read-only predicate cannot drift apart.
+func preloadEntryNames(entry, lib string) bool {
+	e := strings.TrimSpace(entry)
+	if e == "" {
+		return false
+	}
+	// path.Base collapses `$libdir/repmgr` and any absolute path to the bare name; ToSlash
+	// first so a backslash-separated value cannot hide one.
+	e = path.Base(filepath.ToSlash(e))
+	return e == lib || e == lib+".so"
+}
+
 // parsePreloadAssignment splits one postgresql.conf line into its indentation, the library
 // list, and whatever followed the value (a trailing comment, usually). ok is false for any
 // line that is not an active shared_preload_libraries assignment -- including a
 // commented-out one, which must survive verbatim: initdb writes
-// `#shared_preload_libraries = ''` into every data directory, and "fixing" that would turn
+// `#shared_preload_libraries = ”` into every data directory, and "fixing" that would turn
 // a stock default into an explicit pin.
 //
 // The value is either a single-quoted string (embedded quotes doubled, per

@@ -212,11 +212,55 @@ func TestEnsureNoPreloadLibraryWritesAtomicallyAndConverges(t *testing.T) {
 	}
 }
 
-func TestEnsureNoPreloadLibraryErrorsOnAMissingFile(t *testing.T) {
-	// PGDATA/postgresql.conf always exists once the directory is initialized, so its
-	// absence is a real problem and must not be swallowed.
-	if _, err := EnsureNoPreloadLibrary(filepath.Join(t.TempDir(), "nope.conf"), "repmgr"); err == nil {
-		t.Fatal("expected an error for a missing file")
+func TestEnsureNoPreloadLibraryToleratesAMissingFile(t *testing.T) {
+	// A torn clone or restore can leave PG_VERSION behind (so the caller's HasData check
+	// passes) without postgresql.conf. Erroring here would abort boot() one step before
+	// ReadControlData, which already handles that case gracefully by deferring the start to
+	// the reconcile loop -- so escalating would REMOVE a recovery path, not add safety.
+	changed, err := EnsureNoPreloadLibrary(filepath.Join(t.TempDir(), "nope.conf"), "repmgr")
+	if err != nil {
+		t.Fatalf("a missing postgresql.conf must not be an error: %v", err)
+	}
+	if changed {
+		t.Error("a missing file cannot have changed")
+	}
+}
+
+func TestPreloadEntryIsMatchedWhenDirectoryQualifiedOrSuffixed(t *testing.T) {
+	// PostgreSQL accepts all of these as the same library, adding `$libdir/` and `.so`
+	// itself when absent. Matching only the bare name let `$libdir/repmgr` slip past the
+	// strip, the diagnostic AND the render guard simultaneously -- delivering exactly the
+	// crash-loop all three exist to prevent (#293 review).
+	for _, entry := range []string{
+		"repmgr",
+		"repmgr.so",
+		"$libdir/repmgr",
+		"$libdir/repmgr.so",
+		"/usr/lib/postgresql/18/lib/repmgr.so",
+		" $libdir/repmgr ",
+	} {
+		in := "shared_preload_libraries = '" + entry + ",pgaudit'\n"
+		out, changed := stripPreloadLibrary(in, "repmgr")
+		if !changed {
+			t.Errorf("entry %q was not recognised as repmgr: %q", entry, out)
+			continue
+		}
+		if got := strings.TrimSpace(out); got != "shared_preload_libraries = 'pgaudit'" {
+			t.Errorf("entry %q: got %q", entry, got)
+		}
+		if !preloadRequests(in, "repmgr") {
+			t.Errorf("entry %q was not reported as requesting repmgr", entry)
+		}
+	}
+	// ...and a library that merely ends in the same characters is NOT repmgr.
+	for _, entry := range []string{"my_repmgr", "$libdir/repmgr_extra", "repmgrd"} {
+		in := "shared_preload_libraries = '" + entry + "'\n"
+		if _, changed := stripPreloadLibrary(in, "repmgr"); changed {
+			t.Errorf("entry %q must not be treated as repmgr", entry)
+		}
+		if preloadRequests(in, "repmgr") {
+			t.Errorf("entry %q must not be reported as requesting repmgr", entry)
+		}
 	}
 }
 
