@@ -3905,24 +3905,30 @@ mech_standalone=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/statefulset.yaml 2>&1)
 assert_not_contains "#287: standalone never gets MECHANISM (agent-only)" "${mech_standalone}" "MECHANISM"
 
-# #289: cascading replication makes a STANDBY an upstream, but native-mode slot ownership
-# only ever runs on the primary -- so a cascading child would reference a slot that does
-# not exist on its actual upstream and its walreceiver would refuse to start. Rejected at
-# render time rather than shipping a combination that only breaks at runtime.
-helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.agent.mechanism=native --set repmgr.agent.cascadingReplication=true \
-  >/dev/null 2>&1 && mech_cascade_rc=0 || mech_cascade_rc=$?
-assert_eq "#289: native + cascadingReplication fails the render" "1" "${mech_cascade_rc}"
-mech_cascade_err=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.agent.mechanism=native --set repmgr.agent.cascadingReplication=true 2>&1 || true)
-assert_contains "#289: the error names both values and the fix" "${mech_cascade_err}" "cascadingReplication is not supported with repmgr.agent.mechanism: native"
-# Neither flag alone may be affected -- this must forbid nothing that worked before.
-helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.agent.mechanism=native >/dev/null 2>&1 && native_alone_rc=0 || native_alone_rc=$?
-assert_eq "#289: native alone still renders" "0" "${native_alone_rc}"
-helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.agent.cascadingReplication=true >/dev/null 2>&1 && cascade_alone_rc=0 || cascade_alone_rc=$?
-assert_eq "#289: cascadingReplication alone (repmgr mode) still renders" "0" "${cascade_alone_rc}"
+# #294: cascading replication now WORKS under native, so the render-time refusal #289 needed is
+# gone. Creation was never the problem -- every slot-using native path (Clone, Follow,
+# RejoinForceRewind) calls ensureSlotOnUpstream, so a follower provisions its own slot on
+# whichever upstream it points at. The reclaim policy was: the primary pre-created a slot per
+# live ordinal (useless, and WAL-retaining, for a child that streams from a peer) and a standby
+# reclaimed every agent-minted slot it found (deleting exactly its children's slots). Both are
+# now cascade-aware, so every combination of the two flags must render.
+for mech in repmgr native; do
+  for casc in false true; do
+    mech_casc_rc=0
+    helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+      --set "repmgr.agent.mechanism=${mech}" --set "repmgr.agent.cascadingReplication=${casc}" \
+      >/dev/null 2>&1 || mech_casc_rc=$?
+    assert_eq "#294: mechanism ${mech} + cascadingReplication ${casc} renders" "0" "${mech_casc_rc}"
+  done
+done
+# CASCADE_REPLICATION must reach the container on both mechanisms -- the agent's topology
+# choice is what the flag drives, and rendering it on only one would be a silent half-feature.
+for mech in repmgr native; do
+  mech_casc_env=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+    --set "repmgr.agent.mechanism=${mech}" --set repmgr.agent.cascadingReplication=true \
+    --show-only templates/statefulset.yaml 2>&1)
+  assert_contains "#294: CASCADE_REPLICATION reaches the pod under mechanism ${mech}" "${mech_casc_env}" "CASCADE_REPLICATION"
+done
 
 # ======================================================================
 # #262: postgresql.extraVolumes / extraVolumeMounts / extraEnv passthrough,

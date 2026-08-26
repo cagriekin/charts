@@ -21,9 +21,11 @@ import (
 // pg_stat_replication (identified by the application_name this mechanism writes into
 // primary_conninfo, or by the ordinal-named slot), and the bootstrap is the agent's -- the
 // lease holder initdbs, everyone else clones. Slot ownership (#289) creates this node's slot
-// before every clone/rejoin. Remaining gaps: cascadingReplication is render-rejected with this
-// mechanism, and an existing repmgr cluster cannot be migrated in place yet (#292). #294
-// promotes it to supported and flips the default.
+// before every clone/rejoin -- on whichever upstream this node actually points at, which is
+// what makes cascadingReplication work here since #294 (the reclaim policy on both sides is
+// cascade-aware, and syncReplicationSlots resolves standbys from the owned slot set rather
+// than repmgr.nodes). Remaining gap: an existing repmgr cluster cannot be migrated in place
+// yet (#292). #294 also flips the default.
 //
 // Every binary is resolved under PGBindir rather than PATH: the image ships exactly one
 // PostgreSQL major and the agent must exec that major's tools, not whatever PATH resolves

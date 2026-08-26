@@ -381,9 +381,10 @@ repmgr:
     # pg_basebackup, pg_rewind, primary_conninfo directly). Policy is identical either way.
     # `native` now runs a real multi-node cluster (#288): topology comes from
     # pg_stat_replication, and the lease holder initdbs while the rest clone via
-    # pg_basebackup. Still EXPERIMENTAL -- cascadingReplication is render-rejected with it,
-    # and an existing repmgr cluster cannot be flipped in place yet (#292).
-    # It does own its replication slots (#289). See the pg chart README.
+    # pg_basebackup. It owns its replication slots (#289), and #294 closed the last two
+    # feature gaps: syncReplicationSlots and cascadingReplication both work with it.
+    # An existing repmgr cluster cannot be flipped in place yet (#292), so it is for fresh
+    # installs. See the pg chart README.
     mechanism: repmgr
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
     # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane

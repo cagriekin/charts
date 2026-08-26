@@ -216,9 +216,10 @@ jobs:
       matrix:
         pg_major: ["18", "17"]
         # #288/#295: a real mechanism axis, tiered with `exclude` rather than fanned out
-        # blindly. 21 suites x 2 majors x 2 mechanisms would be 84 legs; 12 exclusions x 2
-        # majors bring it to 60. sync-replication-slots regained its native leg in #294, when
-        # the reconcile learned the native slot names.
+        # blindly. 21 suites x 2 majors x 2 mechanisms would be 84 legs; 11 exclusions x 2
+        # majors bring it to 62. sync-replication-slots and cascading-replication both regained
+        # their native legs in #294, which taught the slot reconcile the native names and made
+        # the reclaim policy cascade-aware.
         #
         # It must be a REAL axis, not an `include:` addition. `mechanism` would not be an
         # original matrix key, so `{suite: agent, mechanism: native}` would ADD the key to the
@@ -267,10 +268,6 @@ jobs:
           - { suite: agent-etcd-tls, mechanism: native }
           # PostgreSQL TLS is orthogonal to how replication is driven.
           - { suite: tls, mechanism: native }
-          # RENDER-REJECTED with native (#289): slot ownership is primary-only, so a cascading
-          # child's slot would have no owner. This is the one honest coverage gap; making a
-          # standby-parent a legitimate slot owner is tracked separately.
-          - { suite: cascading-replication, mechanism: native }
           # pgBackRest mechanics are mechanism-independent; pgbackrest-restore-ha carries the
           # native leg because it also re-clones a standby.
           - { suite: backup-restore, mechanism: native }

@@ -16,17 +16,6 @@
 {{- include "pg.validateSyncReplicationSlotsWalLevel" . }}
 {{- include "pg.validateNativePreloadRepmgr" . }}
 {{- include "pg.validateRemovedRepmgrdValues" . }}
-{{- /* #289: cascading replication makes a STANDBY an upstream for other standbys, but the
-       agent's native-mode slot reconcile only ever runs on the lease-holding primary and
-       only ever touches slots on its own connection -- so a cascading child's
-       primary_slot_name would name a slot that exists on the primary, not on the
-       standby-parent it actually streams from, and its walreceiver would fail outright with
-       "replication slot does not exist". Rejected at render time rather than shipping that
-       (loud, but only discoverable at runtime) combination. Both flags are independently
-       opt-in, so this forbids nothing that worked before. */}}
-{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.cascadingReplication (eq (.Values.repmgr.agent.mechanism | default "repmgr") "native") }}
-{{- fail "repmgr.agent.cascadingReplication is not supported with repmgr.agent.mechanism: native (#289): native mode's replication-slot ownership runs only on the primary, so a cascading standby's child would reference a slot that does not exist on its actual upstream and its walreceiver would refuse to start. Use mechanism: repmgr for cascading replication, or disable cascadingReplication" }}
-{{- end }}
 {{- if and (not .Values.repmgr.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
 {{- fail "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr" }}
 {{- end }}
@@ -909,8 +898,9 @@ spec:
                    absent, so a default render stays byte-identical to 1.x and an older image
                    that predates the flag keeps working. EXPERIMENTAL, but usable with replicas
                    since #288 (topology from pg_stat_replication, agent-owned bootstrap) and
-                   #289 (slot ownership); `cascadingReplication` is still render-rejected with
-                   it, and #292 owns migrating an existing repmgr cluster in place. */}}
+                   #289 (slot ownership). #294 closed the last two gaps -- `syncReplicationSlots`
+                   and `cascadingReplication` both work with it now -- leaving #292, which owns
+                   migrating an existing repmgr cluster in place. */}}
             {{- with (.Values.repmgr.agent).mechanism }}
             {{- if ne . "repmgr" }}
             - name: MECHANISM

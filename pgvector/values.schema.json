@@ -103,7 +103,7 @@
             },
             "mechanism": {
               "enum": ["repmgr", "native"],
-              "description": "EXPERIMENTAL (#287). Replication mechanics: repmgr (default, the repmgr CLI) or native (pg_ctl/pg_basebackup/pg_rewind). Policy is identical either way. native runs a real multi-node cluster since #288 (topology from pg_stat_replication, agent-owned bootstrap) and owns replication slot lifecycle (#289). Still EXPERIMENTAL: cascadingReplication is render-rejected with it, and an existing repmgr cluster cannot be migrated in place yet (#292)."
+              "description": "EXPERIMENTAL (#287). Replication mechanics: repmgr (default, the repmgr CLI) or native (pg_ctl/pg_basebackup/pg_rewind). Policy is identical either way. native runs a real multi-node cluster since #288 (topology from pg_stat_replication, agent-owned bootstrap) and owns replication slot lifecycle (#289). syncReplicationSlots and cascadingReplication both work with it since #294. An existing repmgr cluster cannot be migrated in place yet (#292), so it is for fresh installs."
             },
             "monitoring": {
               "type": "object",

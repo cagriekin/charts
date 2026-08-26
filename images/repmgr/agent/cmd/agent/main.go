@@ -2466,7 +2466,7 @@ func newMechanism(cfg *config.Config, repmgrConf, pgBindir string, log *slog.Log
 		// #289 has landed: the agent now owns physical slot lifecycle in native mode
 		// (create before clone, reconcile against the live pod set on every primary tick,
 		// drop only inactive orphans). Topology (#288) is still the outstanding blocker.
-		log.Warn("using the EXPERIMENTAL native mechanism: runs a real multi-node cluster since #288 (topology from pg_stat_replication, agent-owned bootstrap), but cascadingReplication is unsupported and an existing repmgr cluster cannot be migrated in place yet (#292)",
+		log.Warn("using the native mechanism: a real multi-node cluster since #288 (topology from pg_stat_replication, agent-owned bootstrap), with syncReplicationSlots and cascadingReplication supported since #294; an existing repmgr cluster still cannot be migrated in place (#292), so this is for fresh installs",
 			"mechanism", cfg.Mechanism)
 		// PodName is passed twice by design: once derived into the slot name (#289) and once
 		// verbatim as application_name (#288). Both are this node's identity, but they land in
@@ -2758,13 +2758,34 @@ func (a *agent) slotsTick(ctx context.Context) ([]pg.SlotState, []string, bool) 
 // It also does not self-heal on a later re-promotion: by then those ordinals have live pods
 // again, so the primary reconcile classifies them as live peers' slots and leaves them.
 //
-// The reclaim policy here is simpler than the primary's, and deliberately so: under native a
-// standby has NO legitimate downstream at all. Its own slot lives on its upstream, not
-// locally, and cascadingReplication + native is rejected at render time precisely because
-// slot reconcile is primary-only -- so there is no configuration in which a standby is
-// someone's upstream. Every agent-minted slot found locally is therefore a leftover, with no
-// pod set to consult. The atomic `AND NOT active` in the drop is still what makes it safe:
-// anything genuinely streaming through one survives regardless of what this decides.
+// The reclaim policy depends on whether a standby can legitimately BE an upstream, i.e. on
+// cascadingReplication (#294).
+//
+// With cascade OFF the policy is the simpler one, and deliberately so: a standby has no
+// legitimate downstream at all. Its own slot lives on its upstream, not locally, so every
+// agent-minted slot found here is a leftover, with no pod set to consult.
+//
+// With cascade ON that premise is false -- a standby is the upstream for its own children, and
+// their slots live HERE. Reclaiming every agent-minted slot would delete exactly the slots
+// cascading depends on, every tick, on the node that owns them: a child whose walreceiver
+// happens to be reconnecting is inactive for that instant, and `AND NOT active` would then let
+// the drop through. So the primary's own predicate is used instead, which keeps any slot whose
+// ordinal still has a live pod and reclaims only the ones whose pod is gone. That needs the
+// live pod set, which is an uncached apiserver LIST -- paid only when cascade is on, and only
+// on a standby, where nothing else in the tick needs it.
+//
+// The cost of that looser predicate, stated plainly: a DEMOTED primary running with cascade on
+// keeps the slots it minted for peers that now stream from the new primary, because their pods
+// are still live. Those slots go inactive and hold WAL on this node -- the very leak the
+// paragraph above describes. It is bounded, not unbounded: the entrypoint sets
+// max_slot_wal_keep_size = 4GB at initdb, so PostgreSQL invalidates such a slot rather than
+// filling the volume, and PGHAReplicationSlotInvalidated reports it. Distinguishing "this
+// child is momentarily disconnected" from "this peer moved to another upstream" needs a
+// cluster-wide view of who follows whom, which no single node has; given the choice, holding
+// bounded WAL beats dropping a slot a returning child still needs, because that costs it a
+// re-clone.
+//
+// A failure to read the pod set means nothing is reclaimed this tick, for the same reason.
 //
 // Observation runs under every mechanism (the gauges must be truthful about a standby
 // holding WAL back too); mutation is native-only, same as the primary path.
@@ -2776,8 +2797,17 @@ func (a *agent) standbySlotsTick(ctx context.Context) {
 	if a.cfg.Mechanism != config.MechanismNative {
 		return
 	}
+	var live map[int]bool
+	if a.cfg.CascadeReplication {
+		var err error
+		live, err = a.livePodOrdinals(ctx)
+		if err != nil {
+			a.log.Warn("list live pods for the standby slot reclaim; skipping it this tick (cascading replication makes this node a legitimate upstream)", "err", err)
+			return
+		}
+	}
 	for _, sl := range slots {
-		if !leftoverStandbySlot(sl.Name) {
+		if !a.reclaimableOnStandby(sl.Name, live) {
 			continue
 		}
 		dropped, err := a.prober.DropPhysicalSlotIfInactive(ctx, a.selfConn(), sl.Name)
@@ -2792,8 +2822,19 @@ func (a *agent) standbySlotsTick(ctx context.Context) {
 	}
 }
 
+// reclaimableOnStandby applies the right reclaim predicate for this node's topology (#294).
+// live is nil when cascading is off, in which case the ordinal carries no information and
+// every agent-minted slot is a leftover.
+func (a *agent) reclaimableOnStandby(name string, live map[int]bool) bool {
+	if !a.cfg.CascadeReplication {
+		return leftoverStandbySlot(name)
+	}
+	return orphanSlot(name, a.cfg.PodName, live)
+}
+
 // leftoverStandbySlot reports whether a slot found on a STANDBY is one this agent may
-// reclaim (#289 review): any name it can prove it minted, plus any legacy repmgr slot.
+// reclaim when it cannot be anyone's upstream (#289 review): any name it can prove it
+// minted, plus any legacy repmgr slot.
 //
 // No ordinal or pod-set test, unlike orphanSlot: a standby is never an upstream under this
 // mechanism (see standbySlotsTick), so the ordinal a leftover names says nothing about
@@ -2863,12 +2904,6 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) []stri
 	if a.cfg.NodeCount <= 0 {
 		return nil
 	}
-	// The names this primary expects to back a live standby, returned for #308's
-	// synchronized_standby_slots reconcile. Computed HERE rather than recomputed there
-	// because it is the same question -- "which slots does this primary own for live
-	// standbys?" -- and the inputs (livePodOrdinals, NodeCount, self's ordinal) cost an
-	// uncached pod LIST that slotsTick already pays for once.
-	var desired []string
 	self := a.selfConn()
 	have := make(map[string]pg.SlotState, len(slots))
 	for _, s := range slots {
@@ -2892,7 +2927,20 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) []stri
 	}
 
 	selfOrd, selfOK := podOrdinal(a.cfg.PodName)
-	for ord := 0; ord < a.cfg.NodeCount; ord++ {
+	// Under cascading replication the primary must NOT pre-create a slot per live ordinal
+	// (#294). A cascaded standby streams from a PEER, so its slot belongs on that peer, and the
+	// one minted here would sit inactive forever -- retaining WAL on the primary until
+	// max_slot_wal_keep_size invalidates it, which is precisely the failure #289 exists to
+	// prevent, and it would fire the invalidated-slot alert on a perfectly healthy cluster.
+	//
+	// Nothing is lost by skipping it: every slot-using path in the native mechanism (Clone,
+	// Follow, RejoinForceRewind) calls ensureSlotOnUpstream first, so a follower provisions its
+	// own slot on whichever upstream it actually points at, before pointing at it. Pre-creation
+	// is belt-and-braces for the star topology, not the mechanism that makes slots work.
+	//
+	// The reclaim pass below still runs, and still governs both topologies.
+	preCreate := !a.cfg.CascadeReplication
+	for ord := 0; preCreate && ord < a.cfg.NodeCount; ord++ {
 		if selfOK && ord == selfOrd {
 			continue // the primary does not stream from itself
 		}
@@ -2906,7 +2954,6 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) []stri
 			continue
 		}
 		name := slotPrefix + strconv.Itoa(ord)
-		desired = append(desired, name)
 		if _, ok := have[name]; ok {
 			continue
 		}
@@ -2918,7 +2965,10 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) []stri
 	}
 
 	if liveErr != nil {
-		return desired
+		// No trustworthy live set: nothing is reclaimed, and #308 gets no answer rather than a
+		// guessed one. Naming slots resolved from a stale pod view is how the primary ends up
+		// waiting on a slot that should be gone.
+		return nil
 	}
 	for _, s := range slots {
 		if !orphanSlot(s.Name, a.cfg.PodName, live) {
@@ -2934,7 +2984,47 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) []stri
 				"slot", s.Name, "retained_wal_bytes", s.RetainedWALBytes)
 		}
 	}
-	return desired
+	return a.ownedStandbySlots(slots, live)
+}
+
+// ownedStandbySlots reduces the slots observed on this node to the ones it maintains for a
+// live standby, in ordinal order -- the answer #308's synchronized_standby_slots reconcile
+// needs (#294).
+//
+// Derived from what is ACTUALLY PRESENT rather than from the create loop's expectations, for
+// two reasons. It is correct under cascading replication, where the primary pre-creates
+// nothing at all and its direct children self-provision, so an expectation-driven list would
+// be empty and would clear the GUC on a healthy chain. And it cannot name a slot that does not
+// exist, which is the one thing synchronized_standby_slots must never do: the primary then
+// refuses to release WAL and logs about it every checkpoint.
+//
+// Ordinal order, because the caller joins the result into a string and uses it as a
+// change-detection key -- an unstable order would rewrite the GUC every tick.
+func (a *agent) ownedStandbySlots(slots []pg.SlotState, live map[int]bool) []string {
+	type owned struct {
+		ord  int
+		name string
+	}
+	var found []owned
+	for _, s := range slots {
+		// Same predicate as the reclaim pass, inverted: anything it would keep, this waits on.
+		// Sharing orphanSlot is what stops the two drifting into disagreement about which
+		// slots belong to a live standby.
+		if orphanSlot(s.Name, a.cfg.PodName, live) {
+			continue
+		}
+		ord, ok := slotOrdinal(s.Name)
+		if !ok || !strings.HasPrefix(s.Name, slotPrefix) {
+			continue // an operator's slot, or a legacy repmgr one: not ours to wait on
+		}
+		found = append(found, owned{ord, s.Name})
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].ord < found[j].ord })
+	names := make([]string, 0, len(found))
+	for _, f := range found {
+		names = append(names, f.name)
+	}
+	return names
 }
 
 // livePodOrdinals reads the StatefulSet's actual pod set from the API and returns the set

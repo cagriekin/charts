@@ -79,11 +79,11 @@ git checkout -- pg/values.yaml            # restore
 Suites branch on `chart_mechanism()` (`pg/tests/helpers.sh`), reading the tree rather than an
 env var a local run would forget to export.
 
-**Tiering.** 21 suites x 2 majors x 2 mechanisms would be 84 legs; the matrix is **60**. A suite
+**Tiering.** 21 suites x 2 majors x 2 mechanisms would be 84 legs; the matrix is **62**. A suite
 never *loses* its current mechanism -- repmgr is still the chart default, so all 42 pre-existing
 legs stay byte-identical and native is added only where the mechanism's own verbs are exercised.
 
-| Both mechanisms (9) | Why |
+| Both mechanisms (10) | Why |
 |---|---|
 | `agent` | install, failover, cold boot |
 | `agent-etcd` | the lease now gates initdb ordering |
@@ -94,8 +94,9 @@ legs stay byte-identical and native is added only where the mechanism's own verb
 | `pgbackrest-restore-ha` | archive/restore on a fresh native install, plus standby re-clone |
 | `databases-roles` | `replicaCount: 0` -- cheapest proof the agent-owned initdb built the app DB/role |
 | `sync-replication-slots` | #308's `synchronized_standby_slots` reconcile, which #294 taught the native slot names (`pg_ha_slot_<ordinal>`, from the same pass that creates them) |
+| `cascading-replication` | a standby is an upstream, so #294 made the slot reclaim cascade-aware on both the primary (no useless pre-creation) and the standby (its children's slots must survive) |
 
-| Default (repmgr) only (12) | Why |
+| Default (repmgr) only (11) | Why |
 |---|---|
 | `minimal` | `repmgr.enabled: false` -- no agent, so the axis is meaningless |
 | `agent-control`, `agent-control-restore` | the control API is orthogonal to the mechanism |
@@ -103,7 +104,6 @@ legs stay byte-identical and native is added only where the mechanism's own verb
 | `upgrade` | upgrades from an older *published* image, repmgr by construction; the native analogue is #292's in-place migration |
 | `agent-etcd-tls` | etcd TLS is orthogonal; `agent-etcd` covers the DCS axis |
 | `tls` | PostgreSQL TLS is orthogonal to how replication is driven |
-| `cascading-replication` | **render-rejected** with native (#289: slot ownership is primary-only) -- the one honest gap |
 | `backup-restore`, `backup-concurrent`, `pgbackrest-restore`, `pgbackrest-bootstrap` | pgBackRest mechanics are mechanism-independent |
 
 The `mechanism` axis is a **real** matrix key, not an `include:` addition: `mechanism` would not

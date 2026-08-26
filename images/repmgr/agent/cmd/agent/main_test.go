@@ -2775,14 +2775,59 @@ func TestAssertSyncStandbySlotsUnderNativeIsStableAcrossTicks(t *testing.T) {
 }
 
 func TestReconcileSlotsReportsTheSlotsItOwns(t *testing.T) {
-	// The contract the native sync path depends on: reconcileSlots returns one name per live
-	// standby ordinal, ascending, excluding the primary's own.
+	// The contract the native sync path depends on: reconcileSlots reports the slots PRESENT
+	// on this node that back a live standby, ascending by ordinal, excluding the primary's
+	// own. Present, not merely expected -- naming a slot that does not exist makes the
+	// primary refuse to release WAL.
 	ex := &slotExec{}
 	a := newSlotTestAgent(t, ex, config.MechanismNative)
 	a.cfg.NodeCount = 2
-	owned := a.reconcileSlots(context.Background(), nil)
+	observed := []pg.SlotState{
+		{Name: "pg_ha_slot_1", Active: true, Reserving: true},
+		{Name: "pg_ha_slot_0", Active: false, Reserving: true}, // the primary's own: never waited on
+		{Name: "operator_slot", Active: true, Reserving: true}, // not ours to touch or wait on
+	}
+	owned := a.reconcileSlots(context.Background(), observed)
 	if len(owned) != 1 || owned[0] != "pg_ha_slot_1" {
-		t.Fatalf("owned = %v, want [pg_ha_slot_1] (pod-0 is self)", owned)
+		t.Fatalf("owned = %v, want [pg_ha_slot_1] (pod-0 is self, operator_slot is not ours)", owned)
+	}
+}
+
+func TestReconcileSlotsReportsNothingItCannotSee(t *testing.T) {
+	// A slot the create pass only just minted is not in the observed list yet, and must not be
+	// named until a later tick confirms it exists.
+	ex := &slotExec{}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	if owned := a.reconcileSlots(context.Background(), nil); len(owned) != 0 {
+		t.Errorf("owned = %v, want none when nothing is observed yet", owned)
+	}
+}
+
+func TestReconcileSlotsSkipsPreCreationUnderCascade(t *testing.T) {
+	// Cascading: a standby streams from a PEER, so its slot belongs on that peer. A slot
+	// minted here would sit inactive forever, retaining WAL until max_slot_wal_keep_size
+	// invalidates it -- the #289 failure, on a healthy cluster. Followers self-provision via
+	// ensureSlotOnUpstream, so skipping creation loses nothing (#294).
+	ex := &slotExec{}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	a.cfg.CascadeReplication = true
+	a.reconcileSlots(context.Background(), nil)
+	if len(ex.created) != 0 {
+		t.Errorf("pre-created %v under cascading replication", ex.created)
+	}
+}
+
+func TestReconcileSlotsStillPreCreatesWithoutCascade(t *testing.T) {
+	// The star topology keeps its pre-creation: it is what covers the tick of latency between
+	// a pod appearing and its own Clone/Follow ensuring the slot.
+	ex := &slotExec{}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	a.reconcileSlots(context.Background(), nil)
+	if len(ex.created) == 0 {
+		t.Error("expected the star topology to pre-create the expected standby's slot")
 	}
 }
 
@@ -2794,5 +2839,34 @@ func TestReconcileSlotsReportsNothingUnderRepmgr(t *testing.T) {
 	a.cfg.NodeCount = 2
 	if owned := a.reconcileSlots(context.Background(), nil); owned != nil {
 		t.Errorf("owned = %v, want nil under the repmgr mechanism", owned)
+	}
+}
+
+func TestStandbyReclaimIsCascadeAware(t *testing.T) {
+	// Without cascade a standby cannot be anyone's upstream, so every agent-minted slot found
+	// locally is a leftover. With cascade on, its children's slots live here and must survive
+	// -- reclaiming them every tick would delete exactly what cascading depends on (#294).
+	a := &agent{cfg: &config.Config{PodName: "pg-0"}}
+	live := map[int]bool{1: true, 2: true}
+
+	a.cfg.CascadeReplication = false
+	if !a.reclaimableOnStandby("pg_ha_slot_1", nil) {
+		t.Error("without cascade a standby's agent-minted slot is a leftover")
+	}
+
+	a.cfg.CascadeReplication = true
+	if a.reclaimableOnStandby("pg_ha_slot_1", live) {
+		t.Error("with cascade on, a live child's slot must not be reclaimed")
+	}
+	if !a.reclaimableOnStandby("pg_ha_slot_7", live) {
+		t.Error("with cascade on, a slot whose pod is gone is still reclaimable")
+	}
+	// This node's own slot is never used by anyone locally, on either setting.
+	if !a.reclaimableOnStandby("pg_ha_slot_0", live) {
+		t.Error("self's own slot is always reclaimable locally")
+	}
+	// An operator's slot stays out of reach regardless.
+	if a.reclaimableOnStandby("operator_slot", live) {
+		t.Error("an operator's slot must never be reclaimable")
 	}
 }

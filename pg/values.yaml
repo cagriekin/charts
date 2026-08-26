@@ -551,9 +551,14 @@ repmgr:
     # repmgr.nodes at all -- the repmgr DATABASE and ROLE remain, because the agent
     # authenticates as that role for replication (renaming them is #291).
     #
-    # Still EXPERIMENTAL, and still not the default. Remaining gaps:
-    #   - cascadingReplication is rejected at render time with native (slot ownership is
-    #     primary-only, so a cascading child's slot would have no owner)
+    # #294 closed the last two feature gaps, so `native` is now at parity on the values
+    # surface: syncReplicationSlots resolves standbys from the slot set the primary already
+    # owns (pg_ha_slot_<ordinal>) instead of repmgr.nodes, and cascadingReplication works
+    # because the slot reclaim is cascade-aware on both sides -- the primary stops
+    # pre-creating slots for children that stream from a peer, and a standby stops reclaiming
+    # the slots its own children depend on.
+    #
+    # Still not the default. Remaining gap:
     #   - an EXISTING repmgr cluster cannot be flipped in place yet (#292); native is for
     #     fresh installs until that lands
     #   - #294 owns marking native supported and flipping the default
