@@ -218,18 +218,33 @@ if [[ "${holder}" == "${POD1}" ]]; then
   pg_exec "${NAMESPACE}" "${POD1}" "INSERT INTO failover_test (value) VALUES ('${DV}')" "testuser" "testdb" 2>/dev/null || true
 
   echo "  Emptying ${POD0}'s data directory (simulated disk loss)..."
+  # `|| echo ""` like every other capture in this file: the preceding readiness wait is
+  # explicitly tolerant (`|| true`), so kubectl exec can legitimately fail here. Without
+  # the guard, `set -euo pipefail` aborts the whole suite before end_suite -- CI would get
+  # a bare non-zero exit with no assertion summary instead of one failed assertion.
   left=$(kubectl exec "${POD0}" -n "${NAMESPACE}" -c postgresql -- \
-    bash -c 'rm -rf "${PGDATA:?}"/* "${PGDATA:?}"/.[!.]* 2>/dev/null; ls -A "${PGDATA}" | wc -l' 2>/dev/null | tr -d '[:space:]')
+    bash -c 'rm -rf "${PGDATA:?}"/* "${PGDATA:?}"/.[!.]* 2>/dev/null; ls -A "${PGDATA}" | wc -l' 2>/dev/null | tr -d '[:space:]' || echo "")
   assert_eq "${POD0}'s data directory is really empty before the restart" "0" "${left}"
+
+  # Pin the instance we are deleting. `rm -rf` on an open PGDATA does not stop the running
+  # postmaster (unlinked files survive via open fds), so the OLD pod keeps reporting
+  # ready=true and answering pg_is_in_recovery() = t. With `--wait=false` the poll below
+  # would otherwise satisfy its break condition on the very first iteration against that
+  # pre-delete instance, and then read the ORIGINAL boot's init log -- which says
+  # "First boot" -- reporting a regression that never happened.
+  old_uid=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
   kubectl delete pod "${POD0}" -n "${NAMESPACE}" --grace-period=0 --force --wait=false 2>/dev/null || true
 
   echo "  Waiting for ${POD0} to clone itself back (up to 420s)..."
   recovered=""
   for _ in $(seq 1 84); do
-    ready=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "")
-    if [[ "${ready}" == "true" ]]; then
-      recovered=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")
-      [[ "${recovered}" == "t" ]] && break
+    uid=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
+    if [[ -n "${uid}" && "${uid}" != "${old_uid}" ]]; then
+      ready=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "")
+      if [[ "${ready}" == "true" ]]; then
+        recovered=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")
+        [[ "${recovered}" == "t" ]] && break
+      fi
     fi
     sleep 5
   done
@@ -237,8 +252,15 @@ if [[ "${holder}" == "${POD1}" ]]; then
 
   # The regression assertion: ordinal 0 must have taken the CLONE path, not "first boot".
   # Without it the stage could pass on a pod whose disk was never actually lost.
+  #
+  # Match the line both new branches share. "cloning as a standby" is only logged by the
+  # find_current_primary branch; when the primary is not visible in that one scan window
+  # the any_peer_reachable branch runs instead and logs "waiting for one instead of
+  # initializing a divergent cluster". Pod-0 recovers correctly either way, so asserting
+  # on the first string alone fails whenever the second branch -- the one that exists for
+  # exactly that race -- is the one taken.
   init_log=$(kubectl logs "${POD0}" -n "${NAMESPACE}" -c repmgr-init 2>/dev/null || echo "")
-  assert_contains "${POD0}'s init cloned instead of claiming a first boot" "${init_log}" "cloning as a standby"
+  assert_contains "${POD0}'s init cloned instead of claiming a first boot" "${init_log}" "Empty data directory"
   assert_not_contains "${POD0}'s init did not call an empty ordinal-0 disk a first boot" "${init_log}" "First boot"
 
   streaming=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT status FROM pg_stat_wal_receiver" "testuser" "testdb" 2>/dev/null || echo "")

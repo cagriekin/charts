@@ -142,9 +142,23 @@ if [ "$NODE_TYPE" = "master" ] && [ ! -s "${PGDATA}/PG_VERSION" ]; then
     fi
 fi
 
+# Data carrying standby.signal is standby-state, whatever the ordinal says. Without this
+# flip ordinal 0 fell through to the master block below, which rm -rf's PGDATA and takes a
+# full base backup: the "Primary-state data directory present" guard above does not exit
+# (it requires NO standby.signal) and the empty-data branch does not apply (data is
+# present), so NODE_TYPE was still "master". That fired on EVERY restart of a healthy
+# pod-0 standby -- the steady state this fix makes normal -- while an ordinal > 0 in the
+# identical state reached the standby path and skipped the clone on the timeline compare.
+# It is also unrecoverable if every clone attempt fails, because it deletes before it
+# clones (unlike entrypoint.sh's reclone_preserving_old, which moves the data aside).
+if [ -f "${PGDATA}/standby.signal" ]; then
+    NODE_TYPE="standby"
+fi
+
 if [ "$NODE_TYPE" = "master" ]; then
-    # Data exists (the empty case above either flipped this node to the standby path or
-    # exited). Check if another node was promoted while this one was down.
+    # Primary-state data (no standby.signal; the empty case above either flipped this node
+    # to the standby path or exited). Check if another node was promoted while this one was
+    # down.
     echo "Data directory exists, checking for post-failover scenario..."
     CURRENT_PRIMARY=$(find_current_primary) || true
     if [ -n "$CURRENT_PRIMARY" ]; then

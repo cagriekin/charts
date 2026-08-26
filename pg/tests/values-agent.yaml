@@ -45,12 +45,19 @@ postgresql:
       additionalCommands: ""
 
 repmgr:
-  # No image pin on purpose. This suite is the one that exercises the image's own
-  # bootstrap shell (init-repmgr.sh / entrypoint.sh), and CI builds that image from
-  # source under the tag in pg/values.yaml. A fixture pin here silently sent the suite
-  # to an OLD published tag instead -- it stopped tracking the chart at trixie-5.5.0-27
-  # while the chart moved on, so every image-shell change since was untested by this
-  # suite. Inheriting the chart's tag keeps the two from drifting again.
+  # No image pin on purpose. This suite exercises the image's own bootstrap shell
+  # (init-repmgr.sh / entrypoint.sh), which only makes sense against the image CI built
+  # from source, so inherit the tag from pg/values.yaml rather than naming one here.
+  #
+  # The pin was redundant rather than harmful: pg/tests/set-pg-major.sh globs every
+  # pg/tests/values-*.yaml and rewrites the repmgr tag from pg/values.yaml before each
+  # suite leg runs, so CI resolved the freshly-built tag whatever this file said. Dropping
+  # it removes a value that had to be hand-bumped to stay honest.
+  #
+  # Local runs that skip set-pg-major.sh now resolve pg/values.yaml's tag, which is a
+  # PUBLISHED image -- so a stage testing an unreleased image-shell change fails locally
+  # until that tag is published. Run set-pg-major.sh (or build and pin by hand) to
+  # exercise those against a locally built image.
 
   enabled: true
   failoverMode: agent

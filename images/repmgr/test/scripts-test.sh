@@ -386,6 +386,22 @@ else
   bad "init-repmgr.sh lets ordinal 0 probe itself in the wait_for_primary fallback"
 fi
 
+
+# --- ordinal 0 holding STANDBY data must not take the destructive master path ---
+# A data directory carrying standby.signal is not primary-state, so the "Primary-state
+# data directory present" guard does not exit, and the empty-data branch does not apply
+# either. NODE_TYPE was still "master", so ordinal 0 fell into the master block, which
+# rm -rf's PGDATA and full-clones. That fires on EVERY restart of a healthy pod-0 standby
+# -- the steady state this fix creates -- while ordinal >0 in the identical state takes
+# the timeline-compare fast path further down and skips the clone entirely. It is also
+# unrecoverable when every clone attempt fails, since it deletes before it clones.
+signal_flip=$(awk '/standby[.]signal/{c=NR} /NODE_TYPE="standby"/{if (c && NR-c<=2) {print c; exit}}' "${ROOT}/init-repmgr.sh")
+master_block=$(grep -n '^if \[ "\$NODE_TYPE" = "master" \]; then' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
+if [ -n "$signal_flip" ] && [ -n "$master_block" ] && [ "$signal_flip" -lt "$master_block" ]; then
+  ok "init-repmgr.sh routes standby-state data to the standby path before the master block"
+else
+  bad "init-repmgr.sh lets ordinal 0 with standby.signal reach the rm -rf master path (flip=${signal_flip:-none} master=${master_block:-none})"
+fi
 # --- any_peer_reachable: a live STANDBY is proof a cluster exists ---
 # The empty-data path treats "no peer answered at all" as a genuine first install, so this
 # is the function that decides whether an empty pod-0 initdb's. Exercise it for real with a
