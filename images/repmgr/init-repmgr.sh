@@ -209,7 +209,26 @@ wait_for_primary() {
     done
 }
 
-wait_for_primary
+# A standby that cannot see a primary must DEFER, not kill the init container. With set -e
+# a bare `wait_for_primary` returning 1 exits 1, and the standby.signal flip above now routes
+# ordinal 0 here too -- which would remove the one escape a cold boot had. Previously ordinal
+# 0 in this state fell into the master block, printed "No other primary found" and exited 0.
+#
+# Existing data has somewhere to go: entrypoint.sh's primary_safety_guard returns early for
+# standby-state data ("[ -f standby.signal ] && return 0"), so postgres starts in recovery and
+# streams as soon as a primary appears, and in agent mode the agent's cold-boot election needs
+# this node UP to rank its timeline at all. Hard-failing instead deadlocks the cluster under
+# OrderedReady: pod-0 is recreated alone and blocks pod-1, so it waits ~240s for a primary that
+# cannot exist, exits, and repeats forever while the real primary is never created. Only an
+# EMPTY directory has nothing to start from and must still fail.
+if ! wait_for_primary; then
+    if [ -s "${PGDATA}/PG_VERSION" ]; then
+        echo "No primary reachable yet; deferring to the entrypoint guard so this standby starts in recovery"
+        exit 0
+    fi
+    echo "ERROR: Timed out waiting for a primary and there is no local data to start from"
+    exit 1
+fi
 PRIMARY_FQDN=${PRIMARY_FQDN:?PRIMARY_FQDN must be set by wait_for_primary}
 
 echo "Waiting for primary to be registered in repmgr..."

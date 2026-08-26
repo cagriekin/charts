@@ -402,6 +402,26 @@ if [ -n "$signal_flip" ] && [ -n "$master_block" ] && [ "$signal_flip" -lt "$mas
 else
   bad "init-repmgr.sh lets ordinal 0 with standby.signal reach the rm -rf master path (flip=${signal_flip:-none} master=${master_block:-none})"
 fi
+
+# --- a standby that cannot find a primary must DEFER, not kill the init container ---
+# The standby.signal flip above routes ordinal 0 onto the standby path, which is right for
+# the re-clone problem but must not remove ordinal 0's only escape from a cold boot. With
+# `set -e`, a bare `wait_for_primary` that returns 1 exits the init container. Existing data
+# has somewhere to go -- entrypoint.sh returns early for standby-state data
+# ("[ -f standby.signal ] && return 0"), so postgres starts in recovery and streams as soon
+# as a primary appears, exactly as the old master-block path did. Only an EMPTY directory
+# has nothing to fall back on and should hard-fail.
+#
+# Without this, a full restart with pod-0 in standby state deadlocks the cluster: under
+# OrderedReady pod-0 is recreated alone and blocks pod-1, so pod-0 waits ~240s for a primary
+# that cannot exist, exits 1, and repeats forever while the real primary is never created.
+if grep -q 'if ! wait_for_primary; then' "${ROOT}/init-repmgr.sh" && \
+   awk '/if ! wait_for_primary; then/,/^fi$/' "${ROOT}/init-repmgr.sh" | grep -q 'PG_VERSION' && \
+   awk '/if ! wait_for_primary; then/,/^fi$/' "${ROOT}/init-repmgr.sh" | grep -q 'exit 0'; then
+  ok "init-repmgr.sh defers instead of failing when a standby with data finds no primary"
+else
+  bad "init-repmgr.sh hard-fails a data-bearing standby that finds no primary (cold-boot deadlock)"
+fi
 # --- any_peer_reachable: a live STANDBY is proof a cluster exists ---
 # The empty-data path treats "no peer answered at all" as a genuine first install, so this
 # is the function that decides whether an empty pod-0 initdb's. Exercise it for real with a
