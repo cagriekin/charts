@@ -377,6 +377,18 @@ func (a *agent) run() {
 		a.log.Error("boot", "err", err)
 	}
 
+	// AFTER boot(), so the strip above has already had its chance, and FATAL, unlike
+	// boot()'s own error (#293). A configuration that asks for a shared library this image
+	// does not ship is not a degraded state the reconcile loop can work around: every
+	// postmaster start will fail, forever, and letting the loop proceed would bury the one
+	// message that explains why under PostgreSQL's own `could not access file "repmgr"`.
+	// Exiting puts the actionable text in the agent's log and the pod's restart reason
+	// instead -- the same reasoning as the control-API construction failure above.
+	if err := a.assertPreloadedLibsPresent(); err != nil {
+		a.log.Error("preload check", "err", err)
+		os.Exit(1)
+	}
+
 	ticker := time.NewTicker(a.cfg.ReconcileInterval)
 	defer ticker.Stop()
 	for {
@@ -1924,8 +1936,9 @@ func (a *agent) writePgHba() error {
 const repmgrPreloadLib = "repmgr"
 
 // dropRepmgrPreload removes `shared_preload_libraries = 'repmgr'` from PGDATA under the
-// native mechanism, and refuses to start a node whose configuration asks for a library
-// this image does not ship (#293).
+// native mechanism (#293). The companion refusal for a library this image does not ship at
+// all lives in assertPreloadedLibsPresent, which run() calls after this -- separately,
+// because it has to be FATAL and boot()'s errors are only logged.
 //
 // The line is written INTO THE DATA DIRECTORY by images/repmgr/entrypoint.sh at initdb
 // time and cloned verbatim to every standby, so it outlives any chart change and any helm
@@ -1959,7 +1972,7 @@ func (a *agent) dropRepmgrPreload() error {
 				"path", confPath)
 		}
 	}
-	return a.assertPreloadedLibsPresent()
+	return nil
 }
 
 // assertPreloadedLibsPresent fails the boot when the configuration still requests repmgr
@@ -1986,6 +1999,19 @@ func (a *agent) assertPreloadedLibsPresent() error {
 		// A stat that fails for any other reason (permissions, a broken mount) is not
 		// evidence of absence, and refusing to boot on it would be its own outage.
 		a.log.Warn("could not stat the repmgr module; skipping the preload presence check", "path", soPath, "err", err)
+		return nil
+	}
+	// Require positive evidence that we are looking in the RIGHT place before refusing to
+	// start anything. This check's false positive is catastrophic and asymmetric: a wrong
+	// module directory would make every repmgr-mechanism pod refuse to boot on a cluster
+	// where repmgr.so is present and working -- far worse than the crash-loop it exists to
+	// explain. An absent module directory is evidence of a bad path (a distro layout change,
+	// a PG_MAJOR the image was not built for), not of an absent library, so downgrade to a
+	// warning there. The directory existing but not holding repmgr.so is the real signal.
+	moduleDir := filepath.Dir(soPath)
+	if _, err := os.Stat(moduleDir); err != nil {
+		a.log.Warn("the server module directory is not readable; skipping the preload presence check",
+			"dir", moduleDir, "err", err)
 		return nil
 	}
 	paths := []string{

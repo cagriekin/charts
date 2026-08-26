@@ -2550,7 +2550,7 @@ func TestDropRepmgrPreloadRefusesToStartWhenTheModuleIsAbsent(t *testing.T) {
 	dir := t.TempDir()
 	writePGDATAConf(t, dir, "shared_preload_libraries = 'repmgr'\n")
 	a := newPreloadTestAgent(t, config.MechanismRepmgr, dir, filepath.Join(dir, "absent.so"))
-	err := a.dropRepmgrPreload()
+	err := a.assertPreloadedLibsPresent()
 	if err == nil {
 		t.Fatal("expected a refusal when the requested module is absent")
 	}
@@ -2568,7 +2568,7 @@ func TestDropRepmgrPreloadStartsCleanlyWhenNothingRequestsTheAbsentModule(t *tes
 	dir := t.TempDir()
 	writePGDATAConf(t, dir, "wal_level = replica\nshared_preload_libraries = 'pgaudit'\n")
 	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "absent.so"))
-	if err := a.dropRepmgrPreload(); err != nil {
+	if err := a.assertPreloadedLibsPresent(); err != nil {
 		t.Fatalf("a clean cluster on a repmgr-free image must boot: %v", err)
 	}
 }
@@ -2579,7 +2579,25 @@ func TestDropRepmgrPreloadStripThenPassesItsOwnPresenceCheck(t *testing.T) {
 	dir := t.TempDir()
 	writePGDATAConf(t, dir, "shared_preload_libraries = 'repmgr'\n")
 	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "absent.so"))
+	// The order run() uses: boot() strips, then the fatal check runs.
 	if err := a.dropRepmgrPreload(); err != nil {
-		t.Fatalf("the strip must run before the presence check: %v", err)
+		t.Fatalf("strip: %v", err)
+	}
+	if err := a.assertPreloadedLibsPresent(); err != nil {
+		t.Fatalf("the strip must leave nothing for the presence check to refuse: %v", err)
+	}
+}
+
+func TestAssertPreloadedLibsPresentDoesNotRefuseOnAWrongModuleDirectory(t *testing.T) {
+	// The asymmetric false positive: if the module directory itself is missing, that is
+	// evidence the PATH is wrong (a distro layout change, a PG_MAJOR the image was not built
+	// for), not that repmgr.so is absent. Refusing there would take down every
+	// repmgr-mechanism pod on a cluster whose repmgr.so is present and working -- strictly
+	// worse than the crash-loop this check exists to explain.
+	dir := t.TempDir()
+	writePGDATAConf(t, dir, "shared_preload_libraries = 'repmgr'\n")
+	a := newPreloadTestAgent(t, config.MechanismRepmgr, dir, filepath.Join(dir, "no-such-dir", "repmgr.so"))
+	if err := a.assertPreloadedLibsPresent(); err != nil {
+		t.Fatalf("a missing module DIRECTORY must not refuse the boot: %v", err)
 	}
 }
