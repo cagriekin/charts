@@ -435,6 +435,14 @@ func FromEnv() (*Config, error) { return Load(os.Getenv) }
 // (postgres, pg_ctl, pg_controldata), which Debian installs per major.
 func (c Config) PGBindir() string { return "/usr/lib/postgresql/" + c.PGMajor + "/bin" }
 
+// PGLibdir is the versioned directory holding this image's server MODULES -- the
+// shared_preload_libraries search path (repmgr.so, pgaudit.so), which Debian installs per
+// major alongside the binaries. Used to tell "the data directory asks for a library that
+// is genuinely not in this image" apart from "the library is there and simply unused"
+// (#293): the former is a postmaster that will not start, and deserves a message naming
+// the migration rather than PostgreSQL's bare `could not access file`.
+func (c Config) PGLibdir() string { return "/usr/lib/postgresql/" + c.PGMajor + "/lib" }
+
 // String renders the config with the repmgr password redacted, so logging the
 // config (e.g. at startup) never leaks the secret. fmt uses this for %v/%s/%+v.
 func (c Config) String() string {

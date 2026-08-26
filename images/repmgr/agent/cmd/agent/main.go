@@ -145,6 +145,9 @@ type agent struct {
 	// from cfg.PGMajor at boot (#269) rather than hardcoded to one major.
 	pgBindir         string
 	pgControlDataBin string
+	// repmgrModulePath is where repmgr.so would be if this image shipped it. A field
+	// rather than a call so the #293 presence check is testable without a real install.
+	repmgrModulePath string
 	base             string    // StatefulSet name (pod name without the ordinal)
 	bootAt           time.Time // agent start; the cold-boot grace fallback for PeersPending is measured from here
 	// peersSeen latches which peers have been SQL-reachable at least once this
@@ -306,6 +309,7 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 		health:           &selfHealthTracker{grace: cfg.LeaseDuration},
 		pgBindir:         pgBindir,
 		pgControlDataBin: pgBindir + "/pg_controldata",
+		repmgrModulePath: filepath.Join(cfg.PGLibdir(), repmgrPreloadLib+".so"),
 		base:             baseName(cfg.PodName),
 		bootAt:           time.Now(),
 		peersSeen:        map[string]bool{},
@@ -487,6 +491,10 @@ func (a *agent) boot(ctx context.Context) error {
 	// md5-fallback awk, which raced this write and left rejoined standbys SCRAM-only
 	// (#199). Written every boot (idempotent); a clone/rejoin inherits the source's.
 	if err := a.writePgHba(); err != nil {
+		return err
+	}
+	// Strip repmgr from shared_preload_libraries in PGDATA, before any start (#293).
+	if err := a.dropRepmgrPreload(); err != nil {
 		return err
 	}
 	// Only bring up data that is safe to start regardless of holdership: a
@@ -1909,6 +1917,99 @@ func (a *agent) writePgHba() error {
 		MD5Fallback:     true,
 	})
 	return pgconf.WritePgHba(filepath.Join(a.cfg.PGDATA, "pg_hba.conf"), content)
+}
+
+// repmgrPreloadLib is the shared_preload_libraries entry #293 removes. It names repmgr.so
+// in the server's module directory.
+const repmgrPreloadLib = "repmgr"
+
+// dropRepmgrPreload removes `shared_preload_libraries = 'repmgr'` from PGDATA under the
+// native mechanism, and refuses to start a node whose configuration asks for a library
+// this image does not ship (#293).
+//
+// The line is written INTO THE DATA DIRECTORY by images/repmgr/entrypoint.sh at initdb
+// time and cloned verbatim to every standby, so it outlives any chart change and any helm
+// rollback -- the fix has to come from inside the running node. Once the repmgr package
+// leaves the image (#290) a data directory still requesting repmgr.so is not a degraded
+// cluster but a postmaster that refuses to start, on every pod at once.
+//
+// NATIVE ONLY, deliberately. A cluster running the repmgr-free image is native by
+// definition (#294 deletes mechanism.Repmgr), so cleaning native nodes is sufficient to
+// make that image safe -- while a node still on `mechanism: repmgr` keeps its preload,
+// because the repmgr extension's own functions are what we would be gambling with and
+// there is nothing to gain by touching it (#293).
+//
+// One call site is enough. This runs from boot(), which every pod start passes through
+// before ReadControlData and before any sup.Start, so:
+//   - A native standby cloned from a still-dirty source inherits the line and carries it
+//     until its next restart. Harmless -- repmgr.so is present in every release before
+//     #290 -- and stripped on that pod's next boot, so the cluster converges without
+//     chasing the ~10 sup.Start call sites.
+//   - A cluster that skips this release entirely and jumps straight to the repmgr-free
+//     image is still rescued: the strip runs before that pod's first start.
+func (a *agent) dropRepmgrPreload() error {
+	confPath := filepath.Join(a.cfg.PGDATA, "postgresql.conf")
+	if a.cfg.Mechanism == config.MechanismNative {
+		changed, err := pgconf.EnsureNoPreloadLibrary(confPath, repmgrPreloadLib)
+		if err != nil {
+			return fmt.Errorf("boot: remove the repmgr preload from postgresql.conf: %w", err)
+		}
+		if changed {
+			a.log.Info("removed repmgr from shared_preload_libraries in PGDATA; this cluster no longer needs repmgr.so (#293)",
+				"path", confPath)
+		}
+	}
+	return a.assertPreloadedLibsPresent()
+}
+
+// assertPreloadedLibsPresent fails the boot when the configuration still requests repmgr
+// while the image does not ship repmgr.so (#293 acceptance).
+//
+// Without this the operator sees PostgreSQL's own `FATAL: could not access file "repmgr":
+// No such file or directory` in a crash-loop, on every pod simultaneously, with nothing
+// naming the cause or the fix -- and `helm rollback` does not help, because the offending
+// line is in the data directory rather than the release. Ungated by mechanism: the trigger
+// is "requested but genuinely absent", which is fatal either way.
+//
+// The scan covers the three places a preload can still come from after the strip above:
+// postgresql.conf (a repmgr-mechanism node, or one the strip could not parse),
+// postgresql.auto.conf (ALTER SYSTEM), and each conf.d fragment (the chart's own
+// postgresql.configuration passthrough, which loads via include_dir and therefore
+// OVERRIDES whatever postgresql.conf says). Modelled on the PG_MAJOR/postgres-binary
+// mismatch check in newAgent, which fails startup for the same reason: a misconfiguration
+// the pod cannot recover from is better reported than discovered.
+func (a *agent) assertPreloadedLibsPresent() error {
+	soPath := a.repmgrModulePath
+	if _, err := os.Stat(soPath); err == nil {
+		return nil // the library is here; whether anything uses it is not this check's business
+	} else if !os.IsNotExist(err) {
+		// A stat that fails for any other reason (permissions, a broken mount) is not
+		// evidence of absence, and refusing to boot on it would be its own outage.
+		a.log.Warn("could not stat the repmgr module; skipping the preload presence check", "path", soPath, "err", err)
+		return nil
+	}
+	paths := []string{
+		filepath.Join(a.cfg.PGDATA, "postgresql.conf"),
+		filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf"),
+	}
+	fragments, err := filepath.Glob(filepath.Join(confdDir, "*.conf"))
+	if err != nil {
+		return fmt.Errorf("boot: list %s: %w", confdDir, err)
+	}
+	paths = append(paths, fragments...)
+	for _, p := range paths {
+		requested, err := pgconf.PreloadsLibrary(p, repmgrPreloadLib)
+		if err != nil {
+			return fmt.Errorf("boot: check shared_preload_libraries: %w", err)
+		}
+		if requested {
+			return fmt.Errorf("refusing to start: %s sets shared_preload_libraries to include %q, but this image does not ship %s. "+
+				"This is the #293 migration step: the line was written into the DATA DIRECTORY at initdb time by an older image, so it survives a chart downgrade and a helm rollback. "+
+				"Fix: remove %q from shared_preload_libraries (in postgresql.configuration if the chart put it there, or from %s directly), then restart the pod -- shared_preload_libraries is a postmaster parameter",
+				p, repmgrPreloadLib, soPath, repmgrPreloadLib, p)
+		}
+	}
+	return nil
 }
 
 // ensurePrimaryConninfoDBName patches dbname=<repmgr db> into primary_conninfo in

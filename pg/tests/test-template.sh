@@ -3996,6 +3996,55 @@ spl_standalone=$(helm template test-pg "${CHART_DIR}" \
 assert_contains "#262 preload: standalone passes the value through" "${spl_standalone}" "shared_preload_libraries = 'pgsodium'"
 assert_not_contains "#262 preload: standalone adds no repmgr" "${spl_standalone}" "repmgr,pgsodium"
 
+# --- #293: repmgr must never be preloaded under the native mechanism ---
+#
+# The line is persisted INSIDE the data directory by the image entrypoint and cloned to every
+# standby, so once #290 drops repmgr.so a cluster still asking for it crash-loops every pod at
+# once and helm rollback cannot fix it. #288 stopped the chart emitting it under native; these
+# assertions cover the two remaining chart-side paths.
+
+# The operator can still smuggle it in via postgresql.configuration, and that value loads via
+# conf.d's include_dir -- so it OVERRIDES the entrypoint's native gate. Refused at render time.
+# NOT via guard_fails: that helper renders with values-minimal.yaml, which is standalone
+# (repmgr.enabled=false), and the guard is deliberately scoped to agent mode -- standalone runs
+# the stock postgres image, which never had repmgr in the first place. Chart defaults instead.
+spl_guard_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set repmgr.agent.mechanism=native \
+  --set-string 'postgresql.configuration.shared_preload_libraries=repmgr\,pgsodium' >/dev/null 2>&1 || spl_guard_rc=$?
+assert_eq "#293 guard: native + operator-preloaded repmgr fails" "1" "$([ "${spl_guard_rc}" -ne 0 ] && echo 1 || echo 0)"
+# The message must name the offending value and both fixes, not just the key (invariant 4).
+spl_guard=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.agent.mechanism=native \
+  --set-string 'postgresql.configuration.shared_preload_libraries=repmgr\,pgsodium' 2>&1 || true)
+assert_contains "#293 guard: names the offending value" "${spl_guard}" 'got "repmgr,pgsodium"'
+assert_contains "#293 guard: names the mechanism fix" "${spl_guard}" 'set repmgr.agent.mechanism to "repmgr"'
+
+# The same value under the default mechanism is legitimate and must still render.
+spl_repmgr_ok=$(helm template test-pg "${CHART_DIR}" \
+  --set-string 'postgresql.configuration.shared_preload_libraries=repmgr\,pgsodium' \
+  --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#293: repmgr mechanism still accepts an operator-preloaded repmgr" "${spl_repmgr_ok}" "shared_preload_libraries = 'repmgr,pgsodium'"
+
+# Under native the chart no longer OWNS the value: there is no repmgr to preserve, so the
+# operator's value passes through custom.conf and no repmgr-preload.conf is emitted at all --
+# a file whose only job is re-adding repmgr would be a lie under that name.
+spl_native_own=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.agent.mechanism=native \
+  --set-string postgresql.configuration.shared_preload_libraries=pgsodium \
+  --show-only templates/postgresql-configmap.yaml 2>&1)
+assert_contains "#293: native passes the operator value through custom.conf" "${spl_native_own}" "custom.conf"
+assert_not_contains "#293: native emits no repmgr-preload.conf" "${spl_native_own}" "repmgr-preload.conf"
+assert_not_contains "#293: native never adds repmgr to the list" "${spl_native_own}" "repmgr,pgsodium"
+
+# Standalone is deliberately out of scope: it runs the stock postgres image, which never
+# bundled repmgr, so an operator asking for it there is their own (already broken) choice and
+# not the #290 migration hazard this guard exists for.
+spl_standalone_native=$(helm template test-pg "${CHART_DIR}" \
+  --set repmgr.enabled=false --set postgresql.replicaCount=0 \
+  --set-string 'postgresql.configuration.shared_preload_libraries=repmgr\,pgsodium' 2>&1 || true)
+assert_not_contains "#293: standalone is not caught by the native guard" "${spl_standalone_native}" "repmgr.agent.mechanism is"
+
 # --- pgvector parity (symlinked templates + its own values defaults) ---
 pgv_xv=$(helm template test-pgv "${PGVECTOR_DIR}" "${xv_args[@]}" \
   --show-only templates/statefulset.yaml 2>&1)

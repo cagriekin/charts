@@ -145,3 +145,22 @@ tests:
   # pg/tests/test-template.sh: rendering pgvector's statefulset ALONE cannot resolve its
   # postgresql-configmap include, which is a helm-unittest single-template limitation rather
   # than anything chart-specific.
+
+  # --- #293: repmgr must never be preloaded under the native mechanism ---
+  # shared_preload_libraries is persisted INSIDE the data directory by the image entrypoint
+  # and cloned to every standby, so once the repmgr-free image ships (#290) a cluster still
+  # asking for repmgr.so crash-loops every pod at once -- and helm rollback cannot fix it,
+  # because the line is in PGDATA, not the release. An operator-declared value is the one
+  # remaining path: it loads via conf.d's include_dir and OVERRIDES the image's native gate.
+  - it: an operator-preloaded repmgr under mechanism native is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.agent.mechanism: native
+      postgresql.configuration.shared_preload_libraries: repmgr,pgsodium
+    asserts:
+      - failedTemplate:
+          errorPattern: 'includes "repmgr" \(got "repmgr,pgsodium"\)'
+
+  # The positive (renders fine) cases live in pg's suite and in pg/tests/test-template.sh, for
+  # the single-template include reason noted above.
