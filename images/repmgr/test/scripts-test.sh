@@ -230,10 +230,6 @@ else
   bad "#303: entrypoint.sh does not wire conf.d in before the bootstrap pg_ctl start"
 fi
 
-echo "----"
-[ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
-exit "$fail"
-
 # --- #290: the image is repmgr-free, and stays that way ---
 # Structural guards on the shipped layer. The runtime proof (`docker run <image> repmgr`
 # failing, no repmgr.so, no repmgr user or dirs) belongs to the image-smoke test; these are
@@ -304,8 +300,12 @@ if grep -q 'require_pg_bindir' <<<"$init_block" && grep -q 'exit 0' <<<"$init_bl
 else
   bad "#290: init mode is not the reduced major check"
 fi
-if grep -qE 'pg_basebackup|repmgr|pg_ctl' <<<"$init_block"; then
+if grep -vE '^[[:space:]]*#' <<<"$init_block" | grep -qE 'pg_basebackup|repmgr|pg_ctl'; then
   bad "#290: init mode still does bootstrap work; the agent owns clone and initdb"
 else
   ok "#290: init mode does no bootstrap work"
 fi
+
+echo "----"
+[ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
+exit "$fail"

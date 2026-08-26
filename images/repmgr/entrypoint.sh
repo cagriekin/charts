@@ -216,18 +216,31 @@ case "$SCRIPT_NAME" in
         # pod waits and then clones with pg_basebackup (#288). Doing it here would give each pod
         # its own cluster with its own system_identifier, which assertSameCluster (invariant 9)
         # then refuses to rejoin forever -- Running, never Ready, holding a bogus database.
-        if [ ! -s "$PGDATA/PG_VERSION" ]; then
-            echo "empty data directory; deferring to the agent (initdb if lease holder, else clone) (#288)"
-        fi
-
         # agent mode: hand off to the Go HA agent as PID 1; it writes its own config, starts and
-        # supervises PostgreSQL, and runs the lease-based failover loop. postgres mode runs the
-        # postmaster directly (used by the standalone, non-HA path).
+        # supervises PostgreSQL, and runs the lease-based failover loop.
+        #
+        # It must NOT initdb here (#288/#290): the agent decides, and only the lease holder
+        # bootstraps -- via `entrypoint.sh initdb` from the BootstrapInitdb action -- while every
+        # other pod waits and then clones with pg_basebackup. Doing it in this shell would give
+        # each pod its own cluster with its own system_identifier, which assertSameCluster
+        # (invariant 9) then refuses to rejoin forever: Running, never Ready, holding a bogus
+        # database.
         if [ "$SCRIPT_NAME" = "agent" ]; then
+            if [ ! -s "$PGDATA/PG_VERSION" ]; then
+                echo "empty data directory; deferring to the agent (initdb if lease holder, else clone) (#288)"
+            fi
             echo "Starting pg-ha-agent (PID 1; the agent manages PostgreSQL)..."
             exec /usr/local/bin/pg-ha-agent
         fi
 
+        # postgres mode: a plain single-node postmaster, for running this image directly with no
+        # agent and no HA. It DOES bootstrap its own cluster, because nothing else will (#290
+        # review): the shared bootstrap_initdb used to run for every mode, and moving it under
+        # the agent's control left this branch exec'ing a postmaster at an empty data directory,
+        # which exits immediately. The chart never reaches here -- its own `postgres` command is
+        # inside an agent-mode guard and therefore unreachable -- so this is purely for direct
+        # image users, which is exactly who has no agent to do it for them.
+        bootstrap_initdb
         echo "Starting PostgreSQL..."
         exec postgres -D "$PGDATA"
         ;;

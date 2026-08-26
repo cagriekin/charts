@@ -51,16 +51,25 @@ for pod in "${POD_1}" "${POD_2}"; do
   assert_eq "data replicated to ${pod}" "${REPL_VALUE}" "${val}"
 done
 
-# Test: repmgr sees all 3 nodes (retry -- node registration may lag pod readiness)
-node_count="0"
+# Test: the primary sees both standbys streaming (retry -- attachment lags pod readiness).
+#
+# This read repmgr.nodes until #290. That table can no longer exist: #288 stopped creating the
+# extension under native, #294 made native the only mechanism, and #290 removed the package
+# from the image entirely -- so the assertion was heading for a guaranteed failure the moment
+# the chart's image tag was bumped. pg_stat_replication is the equivalent and a stronger one:
+# a repmgr.nodes row proved only that a node had registered, whereas this proves it is actually
+# replicating.
+PRIMARY=$(discover_primary "${NAMESPACE}" "${FULLNAME}" 3 repmgr repmgr)
+assert_not_eq "a primary is discoverable" "" "${PRIMARY}"
+streaming="0"
 for i in $(seq 1 12); do
-  node_count=$(pg_exec "${NAMESPACE}" "${POD_0}" "SELECT count(*) FROM repmgr.nodes" "repmgr" "repmgr")
-  if [[ "${node_count}" == "3" ]]; then
+  streaming=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" "repmgr" "repmgr" 2>/dev/null | xargs || echo "0")
+  if [[ "${streaming}" == "2" ]]; then
     break
   fi
   sleep 5
 done
-assert_eq "repmgr sees 3 nodes" "3" "${node_count}"
+assert_eq "the primary sees both standbys streaming" "2" "${streaming}"
 
 # --- PGPool tests ---
 echo ""

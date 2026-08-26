@@ -758,16 +758,15 @@ spec:
 {{- if .Values.repmgr.enabled }}
           image: "{{ include "pg.repmgrImage" . }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
-          # The image entrypoint runs a stale-primary guard before starting
-          # read-write: on a container-only restart (which does not re-run the
-          # init container) it detects a peer promoted to a newer timeline and
-          # rejoins this node as a standby via pg_rewind instead of resuming as
-          # a second primary. See repmgr-docker entrypoint.sh.
-          {{- if eq (include "pg.agentMode" .) "true" }}
+          # Always agent mode. pg.agentMode IS repmgr.enabled, and this whole block already
+          # sits inside `if .Values.repmgr.enabled`, so the `postgres` alternative that used to
+          # be rendered here was unreachable -- removed in #290 rather than left as a branch
+          # nobody can take. The image still has a `postgres` mode for direct, non-chart use.
+          #
+          # The stale-primary guard this comment used to describe is gone too (#290): it drove
+          # `repmgr node rejoin` from the shell before the agent started. The agent does the
+          # equivalent from its own reconcile loop, where it can be fenced.
           command: ["/usr/local/bin/entrypoint.sh", "agent"]
-          {{- else }}
-          command: ["/usr/local/bin/entrypoint.sh", "postgres"]
-          {{- end }}
 {{- else }}
           image: {{ include "pg.image" .Values.postgresql.image | quote }}
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}

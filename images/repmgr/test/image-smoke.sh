@@ -15,9 +15,13 @@ set -uo pipefail
 IMAGE="${1:?usage: image-smoke.sh <image-ref> <expected-pg-major>}"
 WANT_MAJOR="${2:?usage: image-smoke.sh <image-ref> <expected-pg-major>}"
 
-# The repmgr version this used to derive from the tag is gone with the package (#290). The
-# tag scheme no longer encodes one -- it is keyed on the PostgreSQL major instead, which is
-# the thing the image actually bundles.
+# The repmgr version this used to derive from the tag is gone with the package (#290): there
+# is no repmgr to hold to a version.
+#
+# The TAG SCHEME itself has not changed yet -- repmgr-image-publish.yaml still requires
+# trixie-<semver>-<n>, so a published tag still advertises a repmgr version the image no
+# longer contains. Retiring that (and the repo rename to cagriekin/pg-ha) is the remaining
+# half of #290; this file simply stopped asserting a version it cannot check.
 
 fail=0
 ok()  { echo "PASS: $1"; }
@@ -49,7 +53,7 @@ echo "PG_CONTROLDATA=$([ -x "$BINDIR/pg_controldata" ] && echo yes || echo MISSI
 echo "REPMGR_RESOLVED=$(PATH="$IMAGE_PATH" command -v repmgr 2>/dev/null || echo MISSING)"
 echo "REPMGR_SO=$([ -f "/usr/lib/postgresql/${PG_MAJOR:-unset}/lib/repmgr.so" ] && echo PRESENT || echo ABSENT)"
 echo "REPMGR_USER=$(id -u repmgr 2>/dev/null || echo ABSENT)"
-REPMGR_DIRS_FOUND=$(ls -d /etc/repmgr /var/log/repmgr 2>/dev/null)
+REPMGR_DIRS_FOUND=$(ls -d /etc/repmgr /var/log/repmgr 2>/dev/null | tr "\n" "," | sed "s/,$//")
 echo "REPMGR_DIRS=${REPMGR_DIRS_FOUND:-ABSENT}"
 echo "PGBACKREST_VERSION=$(pgbackrest version 2>&1 | head -1)"
 echo "JQ=$(command -v jq || echo MISSING)"
@@ -57,6 +61,13 @@ echo "GOSU=$(command -v gosu || echo MISSING)"
 echo "CRON=$(command -v cron || echo MISSING)"
 echo "KUBECTL=$(command -v kubectl 2>/dev/null || echo ABSENT)"
 echo "AGENT=$([ -x /usr/local/bin/pg-ha-agent ] && echo yes || echo MISSING)"
+# The postgres uid/gid are load-bearing OUTSIDE this image: the chart chowns PGDATA to a
+# literal 101:103 and pins runAsUser/runAsGroup to the same. They are allocated by the apt
+# run, so any change to the package set can move them (#290 dropped a package) -- and the
+# failure would surface only after a tag bump, as "data directory has invalid permissions"
+# on every pod, with nothing in CI having looked.
+echo "POSTGRES_UID=$(id -u postgres 2>/dev/null || echo MISSING)"
+echo "POSTGRES_GID=$(id -g postgres 2>/dev/null || echo MISSING)"
 echo "PGAUDIT_SO=$([ -f "/usr/lib/postgresql/${PG_MAJOR:-unset}/lib/pgaudit.so" ] && echo yes || echo MISSING)"
 
 # pgaudit must LOAD, not merely be installed: the chart adds it to
@@ -172,6 +183,18 @@ for probe_key in REPMGR_SO REPMGR_USER REPMGR_DIRS; do
     ABSENT) ok "#290: ${probe_key} is absent" ;;
     *) bad "#290: ${probe_key} is still present (${got})" ;;
   esac
+done
+
+# The chart hardcodes these two numbers (pg/values.yaml runAsUser/runAsGroup and the
+# statefulset's `chown -R 101:103`), so the image has to keep its side of the bargain.
+for pair in "POSTGRES_UID=101" "POSTGRES_GID=103"; do
+  probe_key="${pair%%=*}"; want="${pair##*=}"
+  got=$(val "$probe_key")
+  if [ "$got" = "$want" ]; then
+    ok "${probe_key} is ${want}, matching what the chart chowns PGDATA to"
+  else
+    bad "${probe_key} is ${got}, but the chart chowns PGDATA to 101:103 and pins runAsUser/runAsGroup -- every pod would fail at postmaster start with \"data directory has invalid permissions\"" "an apt package-set change can move a system uid; update the chart and this assertion together, deliberately"
+  fi
 done
 
 pgbr=$(val PGBACKREST_VERSION)
