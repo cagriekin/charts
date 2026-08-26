@@ -1,5 +1,66 @@
 # pg chart changelog
 
+## 1.17.0 - 2026-08-26
+
+Ships repmgr image `trixie-5.5.0-34`. Two HA-availability fixes, both of which could
+leave a cluster with no serving primary and no automatic way back.
+
+### Fixed
+
+- **The etcd DCS no longer produces zombie candidates or phantom leadership (#326, #327).**
+  `EtcdDCS.runElection` called `Election.Campaign` unguarded. etcd's `Campaign` puts a
+  lease-bound candidate key and then blocks in `waitDeletes()` watching only lower-revision
+  keys; session expiry is not one of its exits (documented upstream, unchanged between
+  v3.5.12 and the vendored v3.5.31, so there is nothing upstream to adopt).
+
+  Two failures followed. If the lease lapsed mid-campaign, etcd deleted the node's candidate
+  key while `Campaign` stayed blocked forever: the node held no lease and no key, was absent
+  from the election, and the `Run` loop never re-contended. A standby in that state cannot
+  take over, so the cluster silently has **no failover**. And when the leader's key was
+  eventually deleted, `waitDeletes` returned nil, so `Campaign` returned "you are leader"
+  while the node held nothing — the agent then acted as leader concurrently with the peer
+  holding the real lease.
+
+  Observed in the field: a two-node cluster whose primary self-fenced on a transient etcd
+  blip, with the standby already a zombie candidate. No peer took over for two hours, and
+  the eventual double-leadership drove a rejoin that emptied the standby's data directory.
+
+  The campaign is now bound to the session: it is cancelled when the lease lapses, so the
+  `Run` loop starts a fresh iteration, and liveness is re-checked before leadership is
+  reported. The lapse path deliberately does not wait for `Campaign` to unwind — its cancel
+  path calls `Resign` on the client context, which carries no deadline and defaults to
+  `WaitForReady(true)`, so it can block for the whole outage.
+
+  `k8sdcs` is unaffected: client-go `leaderelection` owns renewal and cannot reach this state.
+
+- **An empty data directory on ordinal 0 now clones instead of crash-looping (#325).** The
+  init container derived its role from the pod ordinal, so a pod-0 that lost or recreated its
+  PVC declared "First boot" and skipped the clone; the entrypoint guard then correctly refused
+  to `initdb` next to an active primary, leaving the pod in CrashLoopBackOff with no automatic
+  way out. An ordinal > 0 recovered from the identical failure, purely because of its name.
+  The role is now decided from the cluster — probe for a primary, then for any live peer —
+  and reuses the existing standby clone path.
+
+- **Data carrying `standby.signal` is treated as standby-state whatever the ordinal (#325).**
+  Otherwise ordinal 0 fell through to the master block, which `rm -rf`s PGDATA and takes a full
+  base backup — on every restart of a healthy pod-0 standby, and unrecoverable if every clone
+  attempt failed, since it deletes before it clones.
+
+- **A standby that cannot reach a primary defers instead of failing (#325).** With `set -e`, a
+  bare `wait_for_primary` returning 1 exits the init container. Now that ordinal 0 can reach
+  that path, hard-failing would deadlock a cold boot: under `OrderedReady` pod-0 is recreated
+  alone and blocks pod-1, so it waits ~240s for a primary that cannot exist, exits, and repeats
+  while the real primary is never created. Existing data now defers to the entrypoint guard and
+  starts in recovery, as the master block did. Only an empty directory still fails.
+
+### Known gaps
+
+- `Leader()` can still name a node that has already gone, and the `observe` loop does not
+  restart after a watch disruption. `Election.Observe` never reports a deletion, so clearing
+  the cache needs a prefix watch for DELETE events or `el.Leader()` polling. Tracked on #326.
+- A repeatedly failing etcd session is not logged and the client is not redialled, so a wedged
+  etcd client is invisible. Tracked on #326.
+
 ## 1.16.0 - 2026-08-25
 
 ### Added
