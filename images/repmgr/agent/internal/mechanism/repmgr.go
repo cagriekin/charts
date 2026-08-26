@@ -230,9 +230,19 @@ func (r *Repmgr) GenerateConfig(ctx context.Context, n NodeIdentity, o ConfigOpt
 }
 
 // ReclonePreserving moves the diverged PGDATA to a sibling .diverged.<ts> backup,
-// clones fresh from source, and removes the backup ONLY on clone success. On
-// failure the backup is kept and an error returned — diverged data is never
-// destroyed before a successful clone (#175).
+// clones fresh from source, and removes the backup ONLY on clone success. Diverged
+// data is never destroyed before a successful clone (#175).
+//
+// On clone failure PGDATA is RESTORED from the backup, so a failed reclone is a
+// no-op rather than a destructive act (#326). Keeping the data only under the
+// .diverged.<ts> name was not enough: the node was left owning no data directory at
+// all, so it could not start, serve, or be elected, and a transient failure -- the
+// clone source going away mid-flight, which is exactly what a peer self-fencing does
+// -- became a permanent outage needing manual recovery. Restoring returns the node
+// to its pre-reclone state, where the ordinary rejoin/re-clone paths can retry it.
+//
+// If the restore itself fails the backup is deliberately left in place and named in
+// the error: that is the only case where an operator must intervene by hand.
 func (r *Repmgr) ReclonePreserving(ctx context.Context, source Conn) error {
 	if r.DataDir == "" {
 		return fmt.Errorf("reclone: DataDir not set")
@@ -246,8 +256,15 @@ func (r *Repmgr) ReclonePreserving(ctx context.Context, source Conn) error {
 		return fmt.Errorf("reclone: move PGDATA aside to %s: %w", backup, err)
 	}
 	if err := r.Clone(ctx, source); err != nil {
-		// Keep the backup; the operator (or a later retry) can recover from it.
-		return fmt.Errorf("reclone: clone failed, diverged data preserved at %s: %w", backup, err)
+		// Put the node back exactly as it was. Clone may have created a partial PGDATA
+		// before failing, so clear it before renaming the original back into place.
+		if rmErr := os.RemoveAll(r.DataDir); rmErr != nil {
+			return fmt.Errorf("reclone: clone failed (%w); could not clear partial PGDATA, original data preserved at %s: %v", err, backup, rmErr)
+		}
+		if mvErr := os.Rename(backup, r.DataDir); mvErr != nil {
+			return fmt.Errorf("reclone: clone failed (%w); could not restore PGDATA, original data preserved at %s: %v", err, backup, mvErr)
+		}
+		return fmt.Errorf("reclone: clone failed, PGDATA restored: %w", err)
 	}
 	if err := os.RemoveAll(backup); err != nil {
 		// Clone succeeded; a leftover backup is harmless but noisy.

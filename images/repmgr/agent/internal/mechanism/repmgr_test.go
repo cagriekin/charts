@@ -251,29 +251,6 @@ func TestGenerateConfig(t *testing.T) {
 	}
 }
 
-func TestReclonePreservingKeepsDataOnCloneFailure(t *testing.T) {
-	dir := t.TempDir()
-	dataDir := filepath.Join(dir, "pgdata")
-	if err := os.MkdirAll(dataDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	sentinel := filepath.Join(dataDir, "PG_VERSION")
-	if err := os.WriteFile(sentinel, []byte("18"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	fixed := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
-	r := &Repmgr{Runner: &fakeRunner{failOn: "clone"}, Bin: "repmgr", ConfPath: "x", DataDir: dataDir, Now: func() time.Time { return fixed }}
-
-	err := r.ReclonePreserving(context.Background(), Conn{Host: "src", User: "u", DB: "d"})
-	if err == nil {
-		t.Fatal("expected clone failure to surface")
-	}
-	backup := dataDir + ".diverged.20260615T120000Z"
-	if _, statErr := os.Stat(filepath.Join(backup, "PG_VERSION")); statErr != nil {
-		t.Errorf("diverged data not preserved at %s: %v", backup, statErr)
-	}
-}
-
 func TestReclonePreservingDropsBackupOnSuccess(t *testing.T) {
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "pgdata")
@@ -295,5 +272,36 @@ func TestReclonePreservingDropsBackupOnSuccess(t *testing.T) {
 	// the immediate stop must run before the data dir is moved aside
 	if len(fr.calls) == 0 || fr.calls[0].name != "pg_ctl" || strings.Join(fr.calls[0].args, " ") != "-D "+dataDir+" -m immediate -w stop" {
 		t.Errorf("expected an immediate pg_ctl stop first, calls = %+v", fr.calls)
+	}
+}
+
+// A failed reclone must be a no-op, not a destructive act. Moving PGDATA aside and
+// returning on clone failure leaves the node with NO data directory at all: it cannot
+// start, cannot serve, and cannot be elected, so a transient failure (the clone source
+// going away mid-flight) becomes a permanent outage. Restore PGDATA instead (#326).
+func TestReclonePreservingRestoresDataDirOnCloneFailure(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "pgdata")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "PG_VERSION"), []byte("18"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixed := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	r := &Repmgr{Runner: &fakeRunner{failOn: "clone"}, Bin: "repmgr", ConfPath: "x", DataDir: dataDir, Now: func() time.Time { return fixed }}
+
+	if err := r.ReclonePreserving(context.Background(), Conn{Host: "src", User: "u", DB: "d"}); err == nil {
+		t.Fatal("expected clone failure to surface")
+	}
+
+	// The node must still own its data directory.
+	if _, err := os.Stat(filepath.Join(dataDir, "PG_VERSION")); err != nil {
+		t.Errorf("PGDATA not restored after a failed clone: %v", err)
+	}
+	// And not be left with a stray copy filling the volume.
+	backup := dataDir + ".diverged.20260615T120000Z"
+	if _, err := os.Stat(backup); !os.IsNotExist(err) {
+		t.Errorf("backup should be gone once PGDATA is restored, stat err = %v", err)
 	}
 }

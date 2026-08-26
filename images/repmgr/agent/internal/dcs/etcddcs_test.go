@@ -1,6 +1,7 @@
 package dcs
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -54,3 +55,85 @@ func TestEtcdRetryPeriodDefault(t *testing.T) {
 
 // EtcdDCS must satisfy the DCS interface (compile-time check).
 var _ DCS = (*EtcdDCS)(nil)
+
+// A session that lapses while Campaign is still blocked must NOT yield leadership.
+// etcd's Election.Campaign does not abort on session expiry (it only watches lower
+// revisions and the ctx), and it returns nil once those keys are gone -- so an
+// unguarded caller declares leadership holding no lease and no key (#326).
+func TestCampaignGuardedRejectsWinOnLapsedSession(t *testing.T) {
+	sessDone := make(chan struct{})
+	release := make(chan struct{})
+
+	// Campaign blocks (as waitDeletes does), then returns nil "you are leader"
+	// AFTER the session has already lapsed.
+	campaign := func(ctx context.Context) error {
+		<-release
+		return nil
+	}
+
+	got := make(chan bool, 1)
+	go func() { got <- campaignGuarded(context.Background(), sessDone, campaign) }()
+
+	close(sessDone) // lease expires while campaigning
+	close(release)  // waitDeletes then returns nil
+
+	select {
+	case won := <-got:
+		if won {
+			t.Fatal("declared leadership on a lapsed session: no lease, no key, not leader")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("campaignGuarded did not return")
+	}
+}
+
+// The session lapsing must unblock a campaign that would otherwise wait forever,
+// so the Run loop can start a fresh iteration instead of becoming a zombie
+// candidate (blocked in Campaign, key already deleted by etcd) (#326).
+func TestCampaignGuardedCancelsCampaignWhenSessionLapses(t *testing.T) {
+	sessDone := make(chan struct{})
+	campaignCtxDone := make(chan struct{}, 1)
+
+	campaign := func(ctx context.Context) error {
+		<-ctx.Done() // must be cancelled by the session lapsing
+		campaignCtxDone <- struct{}{}
+		return ctx.Err()
+	}
+
+	got := make(chan bool, 1)
+	go func() { got <- campaignGuarded(context.Background(), sessDone, campaign) }()
+
+	close(sessDone)
+
+	select {
+	case <-campaignCtxDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session lapse did not cancel the campaign context (zombie candidate)")
+	}
+	if won := <-got; won {
+		t.Fatal("won leadership despite a lapsed session")
+	}
+}
+
+// The normal path: campaign wins while the session is alive -> leadership granted.
+func TestCampaignGuardedGrantsLeadershipOnLiveSession(t *testing.T) {
+	sessDone := make(chan struct{}) // never closed: session stays alive
+	campaign := func(ctx context.Context) error { return nil }
+
+	if !campaignGuarded(context.Background(), sessDone, campaign) {
+		t.Fatal("a campaign won on a live session must grant leadership")
+	}
+}
+
+// observe() must clear the cached leader when the election key is deleted, so
+// Leader() reports unknown rather than a node that is long dead (#326).
+func TestLeaderCacheClearedWhenKeyDeleted(t *testing.T) {
+	var e EtcdDCS
+	e.leader.Store("service-medusa-pg-1")
+
+	e.applyObserved(nil) // no kvs: the leader key is gone
+
+	if got := e.Leader(); got != "" {
+		t.Fatalf("stale leader retained after key deletion: got %q, want %q", got, "")
+	}
+}

@@ -171,9 +171,13 @@ func (e *EtcdDCS) runElection(ctx context.Context, identity string, cb Callbacks
 	// this node wins. Stops when ctx (the iteration) is cancelled.
 	go e.observe(ctx, el)
 
-	// Campaign blocks until this node is leader, or ctx is cancelled, or the session
-	// is lost -- all of which return an error here (we did NOT become leader).
-	if err := el.Campaign(ctx, identity); err != nil {
+	// Campaign blocks until this node is leader or ctx is cancelled. Session loss is
+	// NOT one of its exits, so it must be guarded explicitly -- see campaignGuarded
+	// for why an unguarded call yields zombie candidates and phantom leadership
+	// (#326).
+	if !campaignGuarded(ctx, sess.Done(), func(c context.Context) error {
+		return el.Campaign(c, identity)
+	}) {
 		return
 	}
 	e.isLeader.Store(true)
@@ -219,9 +223,11 @@ func (e *EtcdDCS) releaseSession(sess *concurrency.Session) {
 // observe updates the last-seen leader identity from the election until ctx ends.
 func (e *EtcdDCS) observe(ctx context.Context, el *concurrency.Election) {
 	for resp := range el.Observe(ctx) {
-		if len(resp.Kvs) > 0 {
-			e.leader.Store(string(resp.Kvs[0].Value))
+		kvs := make([][]byte, 0, len(resp.Kvs))
+		for _, kv := range resp.Kvs {
+			kvs = append(kvs, kv.Value)
 		}
+		e.applyObserved(kvs)
 	}
 }
 
@@ -252,4 +258,61 @@ func (e *EtcdDCS) retryPeriod() time.Duration {
 		return 2 * time.Second
 	}
 	return e.cfg.RetryPeriod
+}
+
+// campaignGuarded runs campaign and reports whether leadership was genuinely won,
+// i.e. won while the session lease was still alive.
+//
+// etcd's Election.Campaign does NOT abort when the session lapses: it puts a
+// lease-bound candidate key, then blocks in waitDeletes() watching only keys with a
+// LOWER revision, returning on ctx cancel or once those keys are gone. Session expiry
+// is not a termination condition (documented upstream, and identical in v3.5.12 and
+// the vendored v3.5.31 -- there is no upstream fix to adopt). Two failures follow
+// from calling it unguarded (#326):
+//
+//   - The lease expires mid-campaign, so etcd deletes this node's candidate key while
+//     Campaign stays blocked forever. The node becomes a zombie candidate -- no lease,
+//     no key, absent from the election -- and the Run loop never re-contends.
+//   - When the leader's key is eventually deleted, waitDeletes returns nil, so
+//     Campaign returns nil ("you are leader") while this node holds no lease and no
+//     key. Acting on that is phantom leadership, concurrent with the peer that holds
+//     the real lease and is correctly leader.
+//
+// So: cancel the campaign when the session lapses (freeing the Run loop to start a
+// fresh iteration), and re-check liveness before reporting a win.
+func campaignGuarded(ctx context.Context, sessDone <-chan struct{}, campaign func(context.Context) error) bool {
+	campCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-sessDone:
+			cancel() // lease lapsed: unblock Campaign instead of hanging in waitDeletes
+		case <-campCtx.Done():
+		}
+	}()
+
+	if err := campaign(campCtx); err != nil {
+		return false
+	}
+
+	// Campaign reported a win, but it can do so after the lease is already gone.
+	// Leadership is valid only while the session still holds the lock.
+	select {
+	case <-sessDone:
+		return false
+	default:
+		return true
+	}
+}
+
+// applyObserved updates the cached leader from an election observation. An
+// observation carrying no keys means the election key is gone, so the cache MUST be
+// cleared: retaining the last-seen identity made a standby report a primary that had
+// been dead for two hours and keep following it instead of failing over (#326).
+func (e *EtcdDCS) applyObserved(kvs [][]byte) {
+	if len(kvs) > 0 {
+		e.leader.Store(string(kvs[0]))
+		return
+	}
+	e.leader.Store("")
 }
