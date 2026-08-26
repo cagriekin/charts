@@ -22,11 +22,11 @@ Required/optional is from the consuming process's perspective at runtime. Secret
 
 | Variable | Type | Required | Default / source | Consumer |
 |----------|------|----------|------------------|----------|
-| `REPMGR_USER` | string | yes | `repmgr.username` | entrypoint, init-repmgr, agent |
-| `REPMGR_PASSWORD` | string | yes | secret (`repmgr-password`) | entrypoint, init-repmgr, agent |
-| `REPMGR_DB` | string | yes | `repmgr.database` | entrypoint, init-repmgr, agent |
-| `HEADLESS_SERVICE` | string | yes | `<fullname>-headless.<ns>.svc.cluster.local` | init-repmgr, agent (peer FQDNs) |
-| `REPMGR_NODE_COUNT` | number | yes | `postgresql.replicaCount + 1` | init-repmgr, agent (peer enumeration) |
+| `REPMGR_USER` | string | yes | `repmgr.username` | entrypoint (creates the role), agent (replication auth) |
+| `REPMGR_PASSWORD` | string | yes | secret (`repmgr-password`) | entrypoint (creates the role), agent (replication auth) |
+| `REPMGR_DB` | string | yes | `repmgr.database` | entrypoint (creates the database), agent (`dbname` in `primary_conninfo`) |
+| `HEADLESS_SERVICE` | string | yes | `<fullname>-headless.<ns>.svc.cluster.local` | agent (peer FQDNs) |
+| `REPMGR_NODE_COUNT` | number | yes | `postgresql.replicaCount + 1` | agent (peer enumeration) |
 | `NAMESPACE` | string | yes | fieldRef `metadata.namespace` | guard, agent |
 | `PRIMARY_MARKER` | string | yes | `<fullname>-primary` | guard, agent (#125 highwater) |
 
@@ -52,7 +52,7 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `CASCADE_REPLICATION` | boolean | no | `repmgr.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
 | `SYNC_REPLICATION_SLOTS` | boolean | no | `repmgr.agent.syncReplicationSlots` (`false`) | agent (logical failover slot sync, #308; emitted only when true) |
 | `USE_REPLICATION_SLOTS` | boolean | no | `"1"` (always; agent is the only failover path since 2.0.0) | repmgr-init (initial `standby clone`, #308; matches the agent's own regenerated `repmgr.conf`) |
-| `MECHANISM` | enum | no | `repmgr.agent.mechanism` (`native` only) | agent (HA mechanics, #287). **Always emitted since #294** -- `native` is the default, and an agent built before #294 assumes `repmgr` when this is absent, so omitting it would run the removed mechanism during a two-step image-then-chart release. Also read by `init-repmgr.sh` and `entrypoint.sh` (#288). An explicit `repmgr` is rejected at render time |
+| `MECHANISM` | enum | no | `repmgr.agent.mechanism` (`native` only) | agent (HA mechanics, #287). **Always emitted since #294** -- `native` is the default, and an agent built before #294 assumes `repmgr` when this is absent, so omitting it would run the removed mechanism during a two-step image-then-chart release. The shell no longer reads it -- the repmgr paths it gated are gone (#290). An explicit `repmgr` is rejected at render time |
 
 Lease timings must satisfy `LEASE_DURATION > RENEW_DEADLINE > RETRY_PERIOD`
 (validated at boot). The agent also writes a `0600 ~/.pgpass` from `REPMGR_*` so a
@@ -113,7 +113,7 @@ these variables. Nothing injects or reads them any more:
 |----------|-----------------|-------------|
 | `MONITORING_HISTORY_DAYS` | repmgrd sidecar (`repmgr cluster cleanup`) | none — only repmgrd wrote `repmgr.monitoring_history` |
 | `PGPOOL_DEPLOYMENT` / `PGPOOL_SERVICE` / `PGPOOL_PORT` | service-updater (pgpool restart on failover) | none — PGPool-II follows the Services the agent re-points |
-| `REPMGR_FAILOVER` | `init-repmgr.sh` (`automatic`/`manual`) | none — the agent always writes `failover=manual` into `repmgr.conf` at boot |
+| `REPMGR_FAILOVER` | `init-repmgr.sh` (`automatic`/`manual`) | none — there is no repmgr and no `repmgr.conf`; the agent is the only failover path (#290) |
 
 `MASTER_SERVICE` and `SPLIT_BRAIN_ACTION` were listed here too; both survive and are
 consumed by the agent (see the HA table above).

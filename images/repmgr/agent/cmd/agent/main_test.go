@@ -2751,3 +2751,25 @@ func TestMigratedOrdinalsIgnoresLegacyAndForeignSlots(t *testing.T) {
 		t.Errorf("migratedOrdinals = %v, want only ordinal 1", m)
 	}
 }
+
+func TestDemotedPrimaryReclaimsLegacySlotsUnderCascade(t *testing.T) {
+	// #290 review: routing legacy slots through orphanSlot's migration gate pinned them forever
+	// on a demoted ex-primary with cascade on. The gate asks whether the ordinal's new-scheme
+	// slot is active HERE; the child has moved to the new primary, so it never is -- and repmgr
+	// is gone, so nothing can be streaming through a legacy slot on this node anyway.
+	a := &agent{cfg: &config.Config{PodName: "pg-0", CascadeReplication: true}}
+	live := map[int]bool{0: true, 1: true}
+	if !a.reclaimableOnStandby("repmgr_slot_1001", live, map[int]bool{}) {
+		t.Error("a demoted primary must reclaim its leftover legacy slots even with cascade on")
+	}
+	// Cascade off behaves the same -- the point is that the two settings agree here.
+	a.cfg.CascadeReplication = false
+	if !a.reclaimableOnStandby("repmgr_slot_1001", live, map[int]bool{}) {
+		t.Error("legacy slots are leftovers on a standby regardless of cascade")
+	}
+	// The agent-minted path keeps its cascade-aware protection: a live child's slot survives.
+	a.cfg.CascadeReplication = true
+	if a.reclaimableOnStandby("pg_ha_slot_1", live, map[int]bool{}) {
+		t.Error("a live cascade child's own slot must still be protected on its upstream")
+	}
+}

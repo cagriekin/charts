@@ -32,9 +32,19 @@ source /usr/local/bin/pg-common.sh
 # `entrypoint.sh initdb` from the BootstrapInitdb action. Non-holders wait, then clone with
 # pg_basebackup once the holder is open (reconcile.Decide already encodes exactly this).
 bootstrap_initdb() {
+    # Required credentials are validated FIRST, before initdb touches the volume (#290 review).
+    # They used to be resolved after the transient postmaster started, so `docker run <img>
+    # postgres` with neither set ran initdb, appended the GUCs, started a postmaster and only
+    # THEN died on the unset-parameter check -- leaving PG_VERSION present, no completion
+    # sentinel, and a postmaster killed uncleanly with the container. The next run then no-op'd
+    # the bootstrap and served a cluster with no application roles and no passwords. Failing
+    # before the first write means a missing variable costs nothing but the error message.
+    : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required to bootstrap a new cluster}"
+    : "${REPMGR_PASSWORD:?REPMGR_PASSWORD is required to bootstrap a new cluster (the replication role)}"
+
     # The emptiness check lives INSIDE the function so BOTH callers are protected. It was
     # previously the caller's `if [ ! -s PG_VERSION ]`, and moving it out would have let a
-    # repmgr-mode boot initdb straight over an existing data directory.
+    # boot initdb straight over an existing data directory.
     if [ -s "$PGDATA/PG_VERSION" ]; then
         return 0
     fi
@@ -211,11 +221,6 @@ case "$SCRIPT_NAME" in
             exec gosu postgres "$0" "$@"
         fi
 
-        # This shell never initdbs any more (#290). The agent decides: only the lease holder
-        # bootstraps, via `entrypoint.sh initdb` from the BootstrapInitdb action, and every other
-        # pod waits and then clones with pg_basebackup (#288). Doing it here would give each pod
-        # its own cluster with its own system_identifier, which assertSameCluster (invariant 9)
-        # then refuses to rejoin forever -- Running, never Ready, holding a bogus database.
         # agent mode: hand off to the Go HA agent as PID 1; it writes its own config, starts and
         # supervises PostgreSQL, and runs the lease-based failover loop.
         #

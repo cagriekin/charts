@@ -42,7 +42,6 @@ import (
 
 const (
 	metricsAddr = ":9200"
-	repmgrConf  = "/etc/repmgr/repmgr.conf"
 )
 
 func main() {
@@ -1961,30 +1960,19 @@ func (a *agent) migrateForeignRecoveryConfig() error {
 	//     all, and the effective upstream is preserved either way -- the agent derives it from
 	//     the lease, not from the file being removed.
 	//
-	// The identity check is the real guard. A migration that silently changed which cluster this
-	// volume belongs to would be unrecoverable, so the system identifier and timeline are read
-	// before and compared after; a mismatch aborts rather than starting the node.
-	before, cdErr := pg.ReadControlData(context.Background(), pg.OSExec{}, a.pgControlDataBin, a.cfg.PGDATA)
+	// NO identity check here, deliberately (#290 review). An earlier cut read pg_controldata
+	// before and after and compared SystemID/Timeline -- but RemoveRecoveryConfig only rewrites
+	// postgresql.auto.conf and cannot touch pg_control, so neither branch was reachable. It was
+	// false assurance, and it cost two unbounded pg_controldata execs on every boot, before
+	// leader election, where a stalled one would hang startup.
+	//
+	// What actually makes this safe is the operation's scope: configuration only, no data, no
+	// slots, no catalog, no timeline. The identity guarantees that DO matter -- refusing to
+	// follow or rewind onto a different cluster -- are enforced by assertSameCluster on the
+	// paths that move data, where a mismatch is possible.
 	removed, err := pgconf.RemoveRecoveryConfig(autoConf)
 	if err != nil {
 		return fmt.Errorf("in-place migration (#292): clear the repmgr recovery config from %s: %w", autoConf, err)
-	}
-	if cdErr == nil {
-		after, err := pg.ReadControlData(context.Background(), pg.OSExec{}, a.pgControlDataBin, a.cfg.PGDATA)
-		switch {
-		case err != nil:
-			a.log.Warn("in-place migration: could not re-read pg_controldata to confirm identity", "err", err)
-		case after.SystemID != before.SystemID:
-			return fmt.Errorf("in-place migration (#292) ABORTED: the data directory's system identifier changed during the migration (%d -> %d). Nothing was destroyed -- postgresql.auto.conf lost only its recovery settings -- but this node will not start until that is explained",
-				before.SystemID, after.SystemID)
-		case before.TimelineOK && after.TimelineOK && after.Timeline != before.Timeline:
-			return fmt.Errorf("in-place migration (#292) ABORTED: the data directory's timeline changed during the migration (%v -> %v)",
-				before.Timeline, after.Timeline)
-		}
-	} else {
-		// No baseline to compare against. Not fatal: the migration itself does not touch the
-		// control file, and refusing here would block the upgrade over a missing sanity check.
-		a.log.Warn("in-place migration: could not read pg_controldata for the identity check; proceeding (the migration does not touch the control file)", "err", cdErr)
 	}
 	a.log.Info("in-place migration (#292): cleared the repmgr recovery config; the agent's own fragment is now authoritative",
 		"path", autoConf, "removed", strings.Join(removed, ","),
@@ -2855,6 +2843,18 @@ func (a *agent) standbySlotsTick(ctx context.Context) {
 // live is nil when cascading is off, in which case the ordinal carries no information and
 // every agent-minted slot is a leftover.
 func (a *agent) reclaimableOnStandby(name string, live map[int]bool, migrated map[int]bool) bool {
+	// A LEGACY repmgr_slot_* found on a standby is always a leftover, on either setting
+	// (#290 review). repmgr is gone, so nothing can be streaming through one; on this node it can
+	// only be residue from a term as primary. Routing it through orphanSlot's migration gate was
+	// a regression: that gate asks "has this ordinal's new-scheme slot gone active HERE", and on
+	// a demoted ex-primary the child has moved to the NEW primary, so the answer is permanently
+	// no -- pinning WAL on the ex-primary's volume until max_slot_wal_keep_size invalidates it.
+	//
+	// The migration window the gate protects is on the PRIMARY, which is where a migrating
+	// standby's legacy slot actually lives (its upstream's volume). That path still has it.
+	if strings.HasPrefix(name, legacySlotPrefix) {
+		return leftoverStandbySlot(name)
+	}
 	if !a.cfg.CascadeReplication {
 		return leftoverStandbySlot(name)
 	}

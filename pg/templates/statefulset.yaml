@@ -654,59 +654,16 @@ spec:
                    mechanism on any image built before #294 -- exactly the two-step
                    image-then-chart release this repo does. Being explicit costs one env var
                    and removes that trap. */}}
-            - name: MECHANISM
-              value: {{ (.Values.repmgr.agent).mechanism | default "native" | quote }}
-            - name: PGDATA
-              value: /var/lib/postgresql/data/pgdata
-            - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretUsernameKey" . }}
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretPasswordKey" . }}
-            - name: POSTGRES_DB
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretDatabaseKey" . }}
-            - name: REPMGR_USER
-              value: {{ .Values.repmgr.username | quote }}
-            - name: REPMGR_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretRepmgrPasswordKey" . }}
-            - name: REPMGR_DB
-              value: {{ .Values.repmgr.database | quote }}
-            - name: HEADLESS_SERVICE
-              value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
-            - name: REPMGR_NODE_COUNT
-              value: {{ add .Values.postgresql.replicaCount 1 | quote }}
-{{- if eq (include "pg.agentMode" .) "true" }}
-            {{- /* #308: the agent's own repmgr.conf (regenerated every boot, see
-                   images/repmgr/agent/cmd/agent's boot()) has always used
-                   use_replication_slots=1 for standbys -- this predates #308. The
-                   initial clone below, run from THIS init container's repmgr.conf, did
-                   not, so a fresh standby's first-ever streaming connection carried no
-                   physical slot until an unrelated later repmgr operation happened to
-                   create one. #308's synchronized_standby_slots reconciliation is the
-                   first thing that depends on that slot existing reliably from the
-                   start, so align the initial clone with the agent's own default.
-                   Written unconditionally since 2.0.0: repmgrd (whose retention was
-                   wal_keep_size-based, not slot-based) went with #286, so the agent is the
-                   only failover path and the only reader of this. */}}
-            - name: USE_REPLICATION_SLOTS
-              value: "1"
-{{- end }}
+            {{- /* The reduced `init` mode reads NOTHING but PG_MAJOR (#290). It used to write
+                   repmgr.conf, poll repmgr.nodes and clone, which needed the credentials, the
+                   headless service and the node count; now it stats a binary and exits. Every
+                   one of those env vars is removed rather than left inert -- mounting the
+                   release Secret into a container that cannot use it is needless credential
+                   surface, and USE_REPLICATION_SLOTS in particular is now read by nothing in
+                   the image at all. PG_MAJOR arrives via pg.pgMajorEnv above. */}}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-            - name: repmgr-config
-              mountPath: /etc/repmgr
           resources:
             {{- toYaml .Values.repmgr.initContainerResources | nindent 12 }}
 {{- end }}
@@ -1290,8 +1247,6 @@ spec:
               mountPath: /var/run/postgresql
 {{- end }}
 {{- if .Values.repmgr.enabled }}
-            - name: repmgr-config
-              mountPath: /etc/repmgr
 {{- end }}
 {{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.repmgr.agent.dcs.etcd).tls).secretName) }}
             - name: etcd-tls
@@ -1411,11 +1366,6 @@ spec:
           emptyDir:
             sizeLimit: 1Gi
 {{- end }}
-{{- end }}
-{{- if .Values.repmgr.enabled }}
-        - name: repmgr-config
-          emptyDir:
-            sizeLimit: 16Mi
 {{- end }}
 {{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.repmgr.agent.dcs.etcd).tls).secretName) }}
         - name: etcd-tls

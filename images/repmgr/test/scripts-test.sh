@@ -43,10 +43,13 @@ fi
 # A single re-hardcoded /usr/lib/postgresql/<major>/bin would send a PG17 image at a
 # bindir that does not exist -- so scan every shipped file rather than the ones that
 # happened to need fixing.
+# repmgr.conf was in this list until #290 deleted it. `2>/dev/null || true` meant grep's
+# exit-2 for the missing file was swallowed, so the scan silently covered one file fewer than
+# the assertion claimed -- and would equally have hidden a real grep failure.
 hardcoded=$(grep -rn '/usr/lib/postgresql/1[0-9]' \
-  "${ROOT}"/*.sh "${ROOT}/repmgr.conf" "${ROOT}/Dockerfile" 2>/dev/null || true)
+  "${ROOT}"/*.sh "${ROOT}/Dockerfile" 2>/dev/null || true)
 if [ -z "$hardcoded" ]; then
-  ok "#269: no hardcoded versioned bindir in the shipped scripts/conf"
+  ok "#269: no hardcoded versioned bindir in the shipped scripts or Dockerfile"
 else
   bad "#269: hardcoded versioned bindir found" "$hardcoded"
 fi
@@ -142,7 +145,7 @@ fi
 _bi_tmp=$(mktemp -d)
 mkdir -p "${_bi_tmp}/pgdata"
 echo 18 > "${_bi_tmp}/pgdata/PG_VERSION"
-_bi_out=$(PGDATA="${_bi_tmp}/pgdata" bash -c '
+_bi_out=$(PGDATA="${_bi_tmp}/pgdata" POSTGRES_PASSWORD=x REPMGR_PASSWORD=y bash -c '
   source <(sed -n "/^bootstrap_initdb() {/,/^}/p" '"${ROOT}"'/entrypoint.sh)
   initdb() { echo INITDB-RAN; }; pg_ctl() { :; }; psql() { :; }
   bootstrap_initdb 2>/dev/null' || true)
@@ -152,7 +155,7 @@ else
   ok "#288: bootstrap_initdb skipped a populated PGDATA (behavioural)"
 fi
 rm -f "${_bi_tmp}/pgdata/PG_VERSION"
-_bi_out=$(PGDATA="${_bi_tmp}/pgdata" bash -c '
+_bi_out=$(PGDATA="${_bi_tmp}/pgdata" POSTGRES_PASSWORD=x REPMGR_PASSWORD=y bash -c '
   source <(sed -n "/^bootstrap_initdb() {/,/^}/p" '"${ROOT}"'/entrypoint.sh)
   initdb() { echo INITDB-RAN; }; pg_ctl() { :; }; psql() { :; }
   bootstrap_initdb 2>/dev/null' || true)
@@ -305,6 +308,31 @@ if grep -vE '^[[:space:]]*#' <<<"$init_block" | grep -qE 'pg_basebackup|repmgr|p
 else
   ok "#290: init mode does no bootstrap work"
 fi
+
+
+# --- #290: bootstrap_initdb validates credentials BEFORE touching the volume ---
+# It used to resolve them after starting the transient postmaster, so `docker run <img>
+# postgres` with neither set ran initdb, appended GUCs, started a postmaster and only then
+# died on the unset-parameter check -- leaving PG_VERSION present, no completion sentinel, and
+# a postmaster killed with the container. The next run then no-op'd the bootstrap and served a
+# cluster with no application roles.
+_cred_tmp=$(mktemp -d)
+mkdir -p "${_cred_tmp}/pgdata"
+_cred_out=$(PGDATA="${_cred_tmp}/pgdata" bash -c '
+  source <(sed -n "/^bootstrap_initdb() {/,/^}/p" '"${ROOT}"'/entrypoint.sh)
+  initdb() { echo INITDB-RAN; }; pg_ctl() { echo PGCTL-RAN; }; psql() { :; }
+  bootstrap_initdb' 2>&1 || true)
+if printf '%s' "${_cred_out}" | grep -qE 'INITDB-RAN|PGCTL-RAN'; then
+  bad "#290: bootstrap_initdb wrote to the volume before validating credentials" "${_cred_out}"
+else
+  ok "#290: bootstrap_initdb refuses before initdb when a password is unset"
+fi
+if printf '%s' "${_cred_out}" | grep -q 'POSTGRES_PASSWORD is required'; then
+  ok "#290: the refusal names the missing variable"
+else
+  bad "#290: the refusal does not name the missing variable" "${_cred_out}"
+fi
+rm -rf "${_cred_tmp}"
 
 echo "----"
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"

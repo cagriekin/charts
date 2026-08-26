@@ -271,6 +271,17 @@ func splitPreloadValue(s string) (value, trailing string) {
 // copy there silently outranks the agent's and cannot be fixed by rewriting the fragment.
 var recoveryGUCs = []string{"primary_conninfo", "primary_slot_name"}
 
+// recoveryGUCRes are the compiled matchers for recoveryGUCs, built once. Both
+// ForeignRecoveryConfig and RemoveRecoveryConfig walk every line of auto.conf on every boot,
+// and RemoveRecoveryConfig used to compile these inside its per-line x per-GUC loop.
+var recoveryGUCRes = func() []*regexp.Regexp {
+	res := make([]*regexp.Regexp, len(recoveryGUCs))
+	for i, guc := range recoveryGUCs {
+		res[i] = regexp.MustCompile(`(?i)^[ \t]*` + guc + `(?:[ \t]*=|[ \t]+)`)
+	}
+	return res
+}()
+
 // ForeignRecoveryConfig reports which recovery GUCs postgresql.auto.conf sets, if any.
 //
 // Under the native mechanism nothing should: the agent writes them into its managed fragment,
@@ -295,14 +306,13 @@ func ForeignRecoveryConfig(confPath string) ([]string, error) {
 		return nil, fmt.Errorf("read %s: %w", confPath, err)
 	}
 	var found []string
-	for _, guc := range recoveryGUCs {
-		re := regexp.MustCompile(`(?i)^[ \t]*` + guc + `(?:[ \t]*=|[ \t]+)`)
+	for i, re := range recoveryGUCRes {
 		for _, ln := range strings.Split(string(data), "\n") {
 			if strings.HasPrefix(strings.TrimLeft(ln, " \t"), "#") {
 				continue
 			}
 			if re.MatchString(ln) {
-				found = append(found, guc)
+				found = append(found, recoveryGUCs[i])
 				break
 			}
 		}
@@ -343,9 +353,9 @@ func RemoveRecoveryConfig(confPath string) ([]string, error) {
 	for _, ln := range strings.Split(string(data), "\n") {
 		matched := ""
 		if !strings.HasPrefix(strings.TrimSpace(ln), "#") {
-			for _, guc := range recoveryGUCs {
-				if regexp.MustCompile(`(?i)^[ \t]*` + guc + `(?:[ \t]*=|[ \t]+)`).MatchString(ln) {
-					matched = guc
+			for i, re := range recoveryGUCRes {
+				if re.MatchString(ln) {
+					matched = recoveryGUCs[i]
 					break
 				}
 			}
