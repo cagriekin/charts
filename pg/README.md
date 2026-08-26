@@ -254,7 +254,7 @@ postgresql:
 
 Declaring `postgres` (or whatever `postgresql.database` is) under `postgresql.databases[]` works because the databases-roles hook Job's `CREATE DATABASE` is already conditional (`WHERE NOT EXISTS ... \gexec`) — it no-ops when the database already exists — and the extension/grant step then runs against that database by name regardless of whether the Job created it. This is preferable to `postgresql.lifecycle.postStart.additionalCommands` for this case: it's already regex-validated (no injection surface) and runs once via a proper Helm hook Job rather than raw shell on every pod boot.
 
-In repmgr mode, `shared_preload_libraries: pg_cron` is merged with `repmgr` (and `pgaudit`, if audit is on) automatically — declare only your own libraries, per [Mounting an extra file on every replica](#mounting-an-extra-file-on-every-replica) below.
+Under `repmgr.agent.mechanism: repmgr` (the default), `shared_preload_libraries: pg_cron` is merged with `repmgr` (and `pgaudit`, if audit is on) automatically — declare only your own libraries, per [Mounting an extra file on every replica](#mounting-an-extra-file-on-every-replica) below. Under `mechanism: native` the chart merges nothing (a native cluster has no repmgr extension), so your value passes through as written.
 
 **Version pinning.** Append `=version` in apt syntax, e.g. `"postgresql-{major}-cron=1.6.4-1"`. `{major}` is substituted with `postgresql.majorVersion` at render time, so a package list survives a later major bump without editing (confirm the new major has a PGDG build of the same extension before bumping, though).
 
@@ -492,7 +492,9 @@ postgresql:
     pgsodium.getkey_script: /etc/postgresql/pgsodium/getkey.sh
 ```
 
-In repmgr mode the chart merges `repmgr` into `shared_preload_libraries` for you — declare only your own libraries. (A bare value in `configuration` is loaded via `include_dir` *after* the image's own `postgresql.conf`, so without that merge it would override the image's `shared_preload_libraries = 'repmgr'` and silently disable failover.)
+Under `repmgr.agent.mechanism: repmgr` (the default) the chart merges `repmgr` into `shared_preload_libraries` for you — declare only your own libraries. (A bare value in `configuration` is loaded via `include_dir` *after* the image's own `postgresql.conf`, so without that merge it would override the image's `shared_preload_libraries = 'repmgr'` and silently disable failover.)
+
+Under `mechanism: native` there is nothing to merge — a native cluster has no repmgr extension — so your value passes through unchanged, and **declaring `repmgr` yourself now fails the render** (#293). That is deliberate: because the value loads via `include_dir`, it would override the image's own native gate and preload `repmgr.so` onto a cluster with nothing to use it, which becomes an every-pod crash-loop the moment the repmgr-free image ships. The message names the value and the fix. `$libdir/repmgr` and `repmgr.so` are rejected the same way — PostgreSQL resolves all three to the same library.
 
 `postgresql.extraEnv` does the same for environment variables and accepts both `value` and `valueFrom`.
 
@@ -1714,7 +1716,8 @@ postgresql:
 ```
 
 **What the chart does when enabled:** adds `pgaudit` to `shared_preload_libraries`
-(preserving `repmgr` and any libraries you set in `postgresql.configuration` —
+(preserving `repmgr` under `repmgr.agent.mechanism: repmgr` — native has no repmgr
+extension to preserve (#293) — and any libraries you set in `postgresql.configuration` —
 they are merged), renders the `pgaudit.*` GUCs into the postgresql ConfigMap, and
 creates the extension idempotently on the primary via a post-install/upgrade hook Job.
 

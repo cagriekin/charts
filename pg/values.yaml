@@ -189,9 +189,13 @@ postgresql:
   #   postgresql.configuration:
   #     shared_preload_libraries: pgsodium
   #     pgsodium.getkey_script: /etc/postgresql/pgsodium/getkey.sh
-  # In repmgr mode the chart merges `repmgr` into shared_preload_libraries for you (a
-  # bare value there would otherwise override the image's preload and silently disable
-  # failover), so declare only your own libraries.
+  # Under repmgr.agent.mechanism: repmgr (the default) the chart merges `repmgr` into
+  # shared_preload_libraries for you (a bare value there would otherwise override the
+  # image's preload and silently disable failover), so declare only your own libraries.
+  # Under mechanism: native there is nothing to merge, and declaring `repmgr` yourself is
+  # REJECTED at render time (#293): the value loads via include_dir, so it would override
+  # the image's native gate and preload repmgr.so onto a cluster that has no repmgr
+  # extension -- an every-pod crash-loop once the repmgr-free image ships (#290).
   extraVolumes: []
     # - name: pgsodium-key
     #   secret:
@@ -244,7 +248,8 @@ postgresql:
   #
   # shared_preload_libraries is a postmaster parameter: enabling audit triggers a
   # controlled rolling restart via the StatefulSet's config-checksum annotation. The
-  # chart keeps repmgr in shared_preload_libraries (replication depends on it) and adds
+  # chart keeps repmgr in shared_preload_libraries (replication depends on it -- under the
+  # repmgr mechanism only; native has no repmgr extension to preserve, #293) and adds
   # pgaudit. pgaudit writes to the PostgreSQL server log (stderr -> `kubectl logs`);
   # tamper-evident retention is your platform's job -- ship the logs to Loki/ELK/
   # CloudWatch. Runtime `ALTER SYSTEM`/session GUC changes are NOT persisted; this

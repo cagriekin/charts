@@ -2449,3 +2449,245 @@ func mustSlots(t *testing.T, a *agent) []pg.SlotState {
 	}
 	return slots
 }
+
+// --- #293: repmgr preload removal + presence check ---
+
+// newPreloadTestAgent builds the minimum agent the #293 helpers touch: a PGDATA on disk,
+// a mechanism, and a repmgr.so location the test controls.
+func newPreloadTestAgent(t *testing.T, mech, pgdata, modulePath string) *agent {
+	t.Helper()
+	return &agent{
+		cfg:              &config.Config{PGDATA: pgdata, Mechanism: mech},
+		log:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		repmgrModulePath: modulePath,
+	}
+}
+
+// writePGDATAConf lays down a PGDATA/postgresql.conf and returns its path.
+func writePGDATAConf(t *testing.T, dir, content string) string {
+	t.Helper()
+	p := filepath.Join(dir, "postgresql.conf")
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestDropRepmgrPreloadStripsUnderNative(t *testing.T) {
+	dir := t.TempDir()
+	conf := writePGDATAConf(t, dir, "wal_level = replica\nshared_preload_libraries = 'repmgr,pgaudit'\n")
+	// The module is present, so the presence check must not fire on the way out.
+	so := filepath.Join(dir, "repmgr.so")
+	if err := os.WriteFile(so, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := newPreloadTestAgent(t, config.MechanismNative, dir, so)
+	if err := a.dropRepmgrPreload(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), "repmgr") {
+		t.Errorf("repmgr survived in PGDATA under native:\n%s", got)
+	}
+	if !strings.Contains(string(got), "shared_preload_libraries = 'pgaudit'") {
+		t.Errorf("the other libraries were not preserved:\n%s", got)
+	}
+}
+
+func TestDropRepmgrPreloadLeavesARepmgrMechanismNodeAlone(t *testing.T) {
+	// The issue's explicit requirement: a node still on `mechanism: repmgr` never has its
+	// preload removed. Removing it there would gamble with the repmgr extension's own
+	// functions for no gain -- only native nodes can run the repmgr-free image (#293).
+	dir := t.TempDir()
+	original := "wal_level = replica\nshared_preload_libraries = 'repmgr'\n"
+	conf := writePGDATAConf(t, dir, original)
+	so := filepath.Join(dir, "repmgr.so")
+	if err := os.WriteFile(so, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := newPreloadTestAgent(t, config.MechanismRepmgr, dir, so)
+	if err := a.dropRepmgrPreload(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Errorf("postgresql.conf was modified under the repmgr mechanism:\ngot:  %q\nwant: %q", got, original)
+	}
+}
+
+func TestDropRepmgrPreloadIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	conf := writePGDATAConf(t, dir, "shared_preload_libraries = 'repmgr'\n")
+	so := filepath.Join(dir, "repmgr.so")
+	if err := os.WriteFile(so, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := newPreloadTestAgent(t, config.MechanismNative, dir, so)
+	for i := 0; i < 3; i++ {
+		if err := a.dropRepmgrPreload(); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	got, err := os.ReadFile(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), "repmgr") {
+		t.Errorf("repmgr survived:\n%s", got)
+	}
+}
+
+func TestDropRepmgrPreloadRefusesToStartWhenTheModuleIsAbsent(t *testing.T) {
+	// A repmgr-mechanism node on an image that no longer ships repmgr.so: the strip does
+	// not run, so the presence check is the only thing between the operator and an opaque
+	// `could not access file "repmgr"` crash-loop on every pod at once.
+	dir := t.TempDir()
+	writePGDATAConf(t, dir, "shared_preload_libraries = 'repmgr'\n")
+	a := newPreloadTestAgent(t, config.MechanismRepmgr, dir, filepath.Join(dir, "absent.so"))
+	err := a.assertPreloadedLibsPresent()
+	if err == nil {
+		t.Fatal("expected a refusal when the requested module is absent")
+	}
+	// The message must name the value, the file, and the migration -- the whole point of
+	// preferring it to PostgreSQL's own error.
+	for _, want := range []string{"shared_preload_libraries", "repmgr", "#293", "postgresql.conf"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("message does not mention %q: %v", want, err)
+		}
+	}
+	// And on a repmgr-MECHANISM node it must NOT advise dropping the library: that is exactly
+	// what pg.sharedPreloadLibraries exists to prevent, because it starts the postmaster
+	// without the repmgr extension's functions and silently disables failover (#293 review).
+	if !strings.Contains(err.Error(), "do NOT just drop the library") {
+		t.Errorf("repmgr-mechanism remediation must not be 'drop the library': %v", err)
+	}
+	if !strings.Contains(err.Error(), "mechanism: native") {
+		t.Errorf("repmgr-mechanism remediation must point at native: %v", err)
+	}
+}
+
+func TestAssertPreloadedLibsPresentAdvisesRemovalOnANativeNode(t *testing.T) {
+	// Under native the library genuinely is dead weight, so removing it IS the fix -- the
+	// opposite advice from the repmgr-mechanism case above.
+	dir := t.TempDir()
+	writePGDATAConf(t, dir, "shared_preload_libraries = 'repmgr'\n")
+	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "absent.so"))
+	err := a.assertPreloadedLibsPresent()
+	if err == nil {
+		t.Fatal("expected a refusal")
+	}
+	if !strings.Contains(err.Error(), "restart the pod") {
+		t.Errorf("native remediation should say to remove it and restart: %v", err)
+	}
+}
+
+func TestDropRepmgrPreloadAlsoCleansPostgresqlAutoConf(t *testing.T) {
+	// postgresql.auto.conf is read LAST, so it beats postgresql.conf and every conf.d
+	// fragment, and it is where ALTER SYSTEM lands. Leaving it while the presence check
+	// treats it as fatal turns one admin ALTER SYSTEM into an unremediable CrashLoopBackOff
+	// on the repmgr-free image (#293 review).
+	dir := t.TempDir()
+	writePGDATAConf(t, dir, "wal_level = replica\n")
+	auto := filepath.Join(dir, "postgresql.auto.conf")
+	if err := os.WriteFile(auto, []byte("# Do not edit this file manually!\nshared_preload_libraries = 'repmgr,pgaudit'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "absent.so"))
+	// preflightPreload must now come up clean: the strip covers the file the check scans.
+	if err := a.preflightPreload(); err != nil {
+		t.Fatalf("auto.conf must be stripped before the check refuses it: %v", err)
+	}
+	got, err := os.ReadFile(auto)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), "repmgr") {
+		t.Errorf("repmgr survived in postgresql.auto.conf:\n%s", got)
+	}
+	if !strings.Contains(string(got), "shared_preload_libraries = 'pgaudit'") {
+		t.Errorf("auto.conf lost its other libraries:\n%s", got)
+	}
+	if !strings.Contains(string(got), "Do not edit this file manually") {
+		t.Errorf("auto.conf's header was dropped:\n%s", got)
+	}
+}
+
+func TestAssertPreloadedLibsPresentIsDisarmedByDynamicLibraryPath(t *testing.T) {
+	// PostgreSQL resolves an unqualified entry against dynamic_library_path, so a cluster
+	// loading repmgr.so from an extra directory has a working library the pkglibdir stat
+	// cannot see. Refusing there would hard-exit every pod over a library that loads fine --
+	// the asymmetric false positive this check is built to avoid (#293 review).
+	dir := t.TempDir()
+	writePGDATAConf(t, dir, "dynamic_library_path = '$libdir:/opt/pg/lib'\nshared_preload_libraries = 'repmgr'\n")
+	a := newPreloadTestAgent(t, config.MechanismRepmgr, dir, filepath.Join(dir, "absent.so"))
+	if err := a.assertPreloadedLibsPresent(); err != nil {
+		t.Fatalf("an overridden dynamic_library_path must disarm the refusal: %v", err)
+	}
+}
+
+func TestDropRepmgrPreloadStartsCleanlyWhenNothingRequestsTheAbsentModule(t *testing.T) {
+	// The #290 end state: no repmgr.so in the image and no configuration asking for it.
+	dir := t.TempDir()
+	writePGDATAConf(t, dir, "wal_level = replica\nshared_preload_libraries = 'pgaudit'\n")
+	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "absent.so"))
+	if err := a.assertPreloadedLibsPresent(); err != nil {
+		t.Fatalf("a clean cluster on a repmgr-free image must boot: %v", err)
+	}
+}
+
+func TestDropRepmgrPreloadStripThenPassesItsOwnPresenceCheck(t *testing.T) {
+	// The sequence that makes a direct 1.x -> #290 jump survivable: the strip runs first,
+	// so the presence check it feeds finds nothing requesting the missing module.
+	dir := t.TempDir()
+	writePGDATAConf(t, dir, "shared_preload_libraries = 'repmgr'\n")
+	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "absent.so"))
+	// The order run() uses: boot() strips, then the fatal check runs.
+	if err := a.dropRepmgrPreload(); err != nil {
+		t.Fatalf("strip: %v", err)
+	}
+	if err := a.assertPreloadedLibsPresent(); err != nil {
+		t.Fatalf("the strip must leave nothing for the presence check to refuse: %v", err)
+	}
+}
+
+func TestAssertPreloadedLibsPresentDoesNotRefuseOnAWrongModuleDirectory(t *testing.T) {
+	// The asymmetric false positive: if the module directory itself is missing, that is
+	// evidence the PATH is wrong (a distro layout change, a PG_MAJOR the image was not built
+	// for), not that repmgr.so is absent. Refusing there would take down every
+	// repmgr-mechanism pod on a cluster whose repmgr.so is present and working -- strictly
+	// worse than the crash-loop this check exists to explain.
+	dir := t.TempDir()
+	writePGDATAConf(t, dir, "shared_preload_libraries = 'repmgr'\n")
+	a := newPreloadTestAgent(t, config.MechanismRepmgr, dir, filepath.Join(dir, "no-such-dir", "repmgr.so"))
+	if err := a.assertPreloadedLibsPresent(); err != nil {
+		t.Fatalf("a missing module DIRECTORY must not refuse the boot: %v", err)
+	}
+}
+
+func TestPreflightPreloadStripsThenVerifies(t *testing.T) {
+	// The order run() depends on: the strip removes the request before the check looks for
+	// it, which is what makes a direct 1.x -> repmgr-free-image jump survivable rather than
+	// a refusal on the very cluster the strip would have fixed (#293 review).
+	dir := t.TempDir()
+	writePGDATAConf(t, dir, "shared_preload_libraries = 'repmgr'\n")
+	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "absent.so"))
+	if err := a.preflightPreload(); err != nil {
+		t.Fatalf("strip must precede the check: %v", err)
+	}
+}
+
+func TestPreflightPreloadNeedsNoDataDirectory(t *testing.T) {
+	// It runs before boot()'s HasData gate now, so an empty PGDATA must be a clean no-op
+	// rather than a fatal read error.
+	dir := t.TempDir()
+	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "absent.so"))
+	if err := a.preflightPreload(); err != nil {
+		t.Fatalf("an uninitialized PGDATA must not fail the preflight: %v", err)
+	}
+}

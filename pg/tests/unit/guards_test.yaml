@@ -898,3 +898,39 @@ tests:
     asserts:
       - hasDocuments:
           count: 1
+
+  # --- #293: repmgr must never be preloaded under the native mechanism ---
+  # shared_preload_libraries is persisted INSIDE the data directory by the image entrypoint
+  # and cloned to every standby, so once the repmgr-free image ships (#290) a cluster still
+  # asking for repmgr.so crash-loops every pod at once -- and helm rollback cannot fix it,
+  # because the line is in PGDATA, not the release. #288 stopped the chart emitting it under
+  # native; this guard closes the one remaining path, an operator-declared value, which loads
+  # via conf.d's include_dir and therefore OVERRIDES the image's own native gate.
+  - it: an operator-preloaded repmgr under mechanism native is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.agent.mechanism: native
+      postgresql.configuration.shared_preload_libraries: repmgr,pgsodium
+    asserts:
+      - failedTemplate:
+          errorPattern: 'includes "repmgr" \(got "repmgr,pgsodium"\)'
+
+  - it: an operator-preloaded repmgr under the default mechanism still renders
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.configuration.shared_preload_libraries: repmgr,pgsodium
+    asserts:
+      - hasDocuments:
+          count: 1
+
+  - it: native without repmgr in the operator list still renders
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.agent.mechanism: native
+      postgresql.configuration.shared_preload_libraries: pgsodium
+    asserts:
+      - hasDocuments:
+          count: 1

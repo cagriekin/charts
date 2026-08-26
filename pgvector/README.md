@@ -523,7 +523,8 @@ postgresql:
     role: ""   # optional pgaudit.role for object-level auditing
 ```
 
-When enabled, the chart adds `pgaudit` to `shared_preload_libraries` (preserving `repmgr`),
+When enabled, the chart adds `pgaudit` to `shared_preload_libraries` (preserving `repmgr`
+under `repmgr.agent.mechanism: repmgr`; native has no repmgr extension to preserve, #293),
 renders the `pgaudit.*` GUCs, and creates the extension idempotently on the primary via a
 post-install/upgrade hook Job.
 

@@ -57,6 +57,52 @@
 
 ### Fixed
 
+- **`shared_preload_libraries = 'repmgr'` is now removed from an existing data directory
+  under `repmgr.agent.mechanism: native`** (#293), and a node whose configuration asks for a
+  library this image does not ship refuses to start with a message naming the migration.
+
+  The line is appended to `$PGDATA/postgresql.conf` by the image entrypoint at initdb time
+  and then cloned verbatim to every standby, so **every cluster any 1.x chart installed
+  carries it inside the data directory**. That matters because `shared_preload_libraries` is
+  a postmaster parameter living on the PVC, not in the release: when the repmgr-free image
+  arrives (#290) a cluster still requesting `repmgr.so` does not degrade, it refuses to
+  start — on every pod simultaneously — and `helm rollback` cannot fix it, because the
+  offending line is not in anything Helm owns. The removal therefore has to ship, and take
+  effect, a release *before* the image that makes it mandatory.
+
+  The agent now strips `repmgr` from that list on every boot, before it starts the
+  postmaster, preserving any other libraries and their load order and dropping the
+  assignment entirely when `repmgr` was the only entry. It converges rather than requiring
+  orchestration: a standby cloned from a not-yet-cleaned source is cleaned on its own next
+  restart, and a cluster that skips this release and jumps straight to the repmgr-free image
+  is still cleaned before its first start.
+
+  **Only native nodes are touched, deliberately.** A cluster that can run the repmgr-free
+  image is native by definition (#294 removes the repmgr mechanism), so cleaning native
+  nodes is sufficient — while a node still on `mechanism: repmgr` keeps its preload, because
+  the repmgr extension's own functions are what would be at stake there and nothing is
+  gained by removing it. Verified on a live cluster: the preload is a repmgrd requirement,
+  and every repmgr verb the agent drives (`standby clone`, `standby follow`, `standby
+  promote`, `primary register`) works without it — but native-only makes that finding moot
+  rather than load-bearing, which is the safer place for it to be.
+
+  Two guards come with it. `postgresql.configuration.shared_preload_libraries` containing
+  `repmgr` under `mechanism: native` is now **refused at render time**: that value reaches
+  the postmaster through `conf.d`'s `include_dir`, so it overrides the image's own native
+  gate and would put the library back on a cluster that has nothing to use it. And if any
+  configuration still requests `repmgr` while `repmgr.so` is genuinely absent, the agent
+  fails startup naming this migration step instead of leaving PostgreSQL to emit
+  `could not access file "repmgr"` in an unexplained crash-loop.
+
+  `wal_log_hints`, `max_replication_slots` and `max_slot_wal_keep_size` — written by the
+  same initdb block — are untouched: `pg_rewind` needs the first and agent-owned slots
+  (#289) build on the others.
+
+  Also under `mechanism: native`, an operator-declared `shared_preload_libraries` now passes
+  through `custom.conf` instead of being re-emitted from `repmgr-preload.conf`. That file
+  exists solely to preserve `repmgr` across an operator value, which native has nothing to
+  preserve. The default (repmgr) render is unchanged.
+
 - **A scale-up could wedge the cluster with no serving primary** (#286). Adding a replica to
   a live HA cluster (`postgresql.replicaCount` N → N+1) could leave the former primary
   unable to rejoin, so nothing served writes until it was manually repaired.

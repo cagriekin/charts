@@ -321,9 +321,16 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        custom.conf. That is the case whenever a library must be preserved across an
        operator-declared value: repmgr (replication) and/or pgaudit (#219). In standalone
        mode with audit off there is nothing to preserve, so the operator's value passes
-       through custom.conf untouched. */ -}}
+       through custom.conf untouched.
+       #293: the repmgr clause is gated on the MECHANISM, not merely repmgr.enabled. Its
+       whole purpose is preserving `repmgr` across an operator-declared value, and under
+       native pg.sharedPreloadLibraries no longer emits repmgr at all (#288) -- so keeping
+       the clause there would render a repmgr-preload.conf that merely restates the
+       operator's own value, under a filename that is now a lie. Native falls through to
+       the standalone behaviour: the operator's value passes through custom.conf. This does
+       not move the default (repmgr) render. */ -}}
 {{- define "pg.chartOwnsSharedPreloadLibraries" -}}
-{{- if or .Values.postgresql.audit.enabled (and .Values.repmgr.enabled (eq (include "pg.userSetSharedPreloadLibraries" .) "true")) -}}true{{- end -}}
+{{- if or .Values.postgresql.audit.enabled (and .Values.repmgr.enabled (ne ((.Values.repmgr.agent).mechanism | default "repmgr") "native") (eq (include "pg.userSetSharedPreloadLibraries" .) "true")) -}}true{{- end -}}
 {{- end -}}
 
 {{- /* The authoritative shared_preload_libraries value. Rendered into a conf.d file that
@@ -878,6 +885,51 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
 {{- if eq ((.Values.repmgr.agent).mechanism | default "repmgr") "native" }}
 {{- fail "repmgr.agent.syncReplicationSlots is not supported with repmgr.agent.mechanism: native (#308/#288): the synchronized_standby_slots reconcile resolves standbys from repmgr.nodes and names slots repmgr_slot_<node_id>, neither of which exists under native, so it would silently never run while every standby still enabled sync_replication_slots. Set repmgr.agent.mechanism to \"repmgr\", or set repmgr.agent.syncReplicationSlots to false." }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- /* #293: refuse `repmgr` in shared_preload_libraries under the native mechanism.
+
+       A native cluster has no repmgr extension, so the library is dead weight -- but it is
+       not merely wasteful, it is a scheduled outage. The chart stopped emitting it under
+       native in #288, so the only way it still gets there is an operator-declared
+       postgresql.configuration.shared_preload_libraries; and because that value reaches
+       the postmaster through conf.d's include_dir, it OVERRIDES the entrypoint's native
+       gate and puts the library back on a cluster that has nothing to use it. Benign only
+       while the package is still in the image: the moment #290/#294 drop repmgr.so, every
+       pod of that release refuses to start with `could not access file "repmgr"`, all at
+       once -- and helm rollback does not fix it, because by then the line has been cloned
+       into every data directory.
+
+       This is the guard that makes the #290 image swap safe to perform blind, which is why
+       it is a render-time fail rather than a warning (invariant 4). The agent removes the
+       line from an EXISTING data directory under native and refuses to boot when a
+       requested module is genuinely absent; this stops it being requested in the first
+       place. */ -}}
+{{- define "pg.validateNativePreloadRepmgr" -}}
+{{- if and (eq (include "pg.agentMode" .) "true") (eq ((.Values.repmgr.agent).mechanism | default "repmgr") "native") }}
+{{- /* Match the way PostgreSQL resolves an entry, not the literal string: `repmgr`,
+       `repmgr.so`, `$libdir/repmgr` and an absolute path to repmgr.so all load the same
+       library, because PostgreSQL supplies `$libdir/` and `.so` itself when they are
+       absent. Comparing the bare name only let `$libdir/repmgr` slip past this guard, the
+       agent's strip AND the agent's absent-module refusal simultaneously -- delivering
+       exactly the crash-loop all three exist to prevent (#293 review). The agent's
+       preloadEntryNames applies the same normalisation, and the two must stay in step. */ -}}
+{{- $found := false }}
+{{- range $l := splitList "," (include "pg.sharedPreloadLibraries" .) }}
+  {{- /* Also unwrap DOUBLE quotes: PostgreSQL parses the list with SplitDirectoriesString,
+         which strips them, so `"repmgr"` loads repmgr (verified against a real postmaster).
+         The agent's preloadEntryNames does the same. */ -}}
+  {{- $n := trimSuffix ".so" (base (trimSuffix "\"" (trimPrefix "\"" (trim $l)))) }}
+  {{- if eq $n "repmgr" }}{{- $found = true }}{{- end }}
+{{- end }}
+{{- if $found }}
+{{- $user := "" }}
+{{- range $k, $v := (.Values.postgresql.configuration | default dict) }}
+  {{- if eq (lower ($k | toString)) "shared_preload_libraries" }}{{- $user = $v | toString }}{{- end }}
+{{- end }}
+{{- fail (printf "postgresql.configuration.shared_preload_libraries includes \"repmgr\" (got %q) but repmgr.agent.mechanism is \"native\": a native cluster has no repmgr extension, and this value loads via conf.d's include_dir so it OVERRIDES the image's native gate and preloads repmgr.so anyway. That makes the cluster unstartable (\"could not access file \\\"repmgr\\\"\") as soon as the repmgr-free image ships (#290/#293), on every pod at once, and helm rollback cannot fix it because the line is cloned into each data directory. Fix: drop \"repmgr\" from the list (the chart adds nothing under native, so an empty list means: omit the key), or set repmgr.agent.mechanism to \"repmgr\"." $user) }}
 {{- end }}
 {{- end }}
 {{- end }}
