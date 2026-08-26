@@ -10,13 +10,7 @@ RELEASE="${RELEASE:-pg-upgrade}"
 FULLNAME_FROM=$(resolve_fullname "${RELEASE}" "${CHART_DIR}" "${SCRIPT_DIR}/values-upgrade-from.yaml")
 FULLNAME_TO=$(resolve_fullname "${RELEASE}" "${CHART_DIR}" "${SCRIPT_DIR}/values-upgrade-to.yaml")
 
-# COVERAGE NOTE (#297): this suite used to scale 2 -> 3 nodes across the upgrade. Both
-# fixtures now install 3 nodes, so it covers the upgrade itself -- adding pgpool and the
-# exporter, rolling the pods, and preserving data -- but NOT a scale-up. Agent-mode scale-up
-# has a live race that can leave the cluster with no serving primary (#297); scaling here
-# would fail the suite for that reason rather than for anything this suite is about. #297
-# restores the scale-up.
-begin_suite "Upgrade (repmgr 3-node, add pgpool + exporter)"
+begin_suite "Upgrade (repmgr 2-node -> 3-node with pgpool + exporter)"
 
 # Start from a clean namespace. Previous runs on a long-lived cluster leave
 # behind a release whose Service selector is owned by the service-updater's
@@ -26,14 +20,14 @@ begin_suite "Upgrade (repmgr 3-node, add pgpool + exporter)"
 kubectl delete namespace "${NAMESPACE}" --ignore-not-found --wait=true --timeout=5m
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
-# Step 1: Install with repmgr (3 pods, persistence enabled)
-echo "  Step 1: Installing repmgr (3 nodes)..."
+# Step 1: Install with repmgr (2 replicas, persistence enabled)
+echo "  Step 1: Installing repmgr (2 nodes)..."
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
   -n "${NAMESPACE}" \
   -f "${SCRIPT_DIR}/values-upgrade-from.yaml" \
   --wait --timeout 10m
 
-wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 3 600
+wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 600
 
 POD_0="${FULLNAME_FROM}-0"
 result=$(pg_exec "${NAMESPACE}" "${POD_0}" "SELECT 1" "testuser" "testdb")
@@ -44,9 +38,9 @@ UPGRADE_VALUE="pre-upgrade-$(date +%s)"
 pg_exec "${NAMESPACE}" "${POD_0}" "CREATE TABLE IF NOT EXISTS upgrade_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
 pg_exec "${NAMESPACE}" "${POD_0}" "INSERT INTO upgrade_test (value) VALUES ('${UPGRADE_VALUE}')" "testuser" "testdb"
 
-# Step 2: Upgrade to full (pgpool + exporter added; node count unchanged, see #297)
+# Step 2: Upgrade to full (3 replicas + pgpool + exporter, same persistence)
 echo ""
-echo "  Step 2: Upgrading to full (adding pgpool + exporter)..."
+echo "  Step 2: Upgrading to full (3 nodes + pgpool + exporter)..."
 helm upgrade "${RELEASE}" "${CHART_DIR}" \
   -n "${NAMESPACE}" \
   -f "${SCRIPT_DIR}/values-upgrade-to.yaml" \

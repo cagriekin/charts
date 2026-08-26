@@ -51,9 +51,9 @@ postgresql:
       additionalCommands: ""
 
 repmgr:
-  # This suite tests the legacy in-place component upgrade (repmgrd 2->3 + pgpool);
-  # the repmgrd->agent migration is covered by test-migrate-agent. Pin repmgrd so
-  # the 1.0.0 default flip does not turn this into an agent-mode upgrade.
+  # This suite tests the in-place component upgrade (2 -> 3 nodes + pgpool + exporter).
+  # #286 removed failoverMode entirely, so there is no repmgrd pin here any more and this
+  # runs agent mode -- which is the point: the scale-up race it covers is agent-specific.
   image:
     repository: cagriekin/repmgr
     tag: trixie-5.5.0-27
