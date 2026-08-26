@@ -356,6 +356,113 @@ else
   bad "#303: entrypoint.sh does not wire conf.d in before the bootstrap pg_ctl start"
 fi
 
+# --- an empty PGDATA on ordinal 0 must be decided from the CLUSTER, not the ordinal ---
+# Regression guard for the PVC-loss dead end: init-repmgr.sh derived NODE_TYPE from the
+# ordinal, so an empty data directory on pod-0 printed "First boot, postgres mode will
+# initialize the database" and skipped the clone; entrypoint.sh's primary_safety_guard then
+# refused to initdb next to the active primary, so the pod crash-looped with no way out.
+# The empty-data branch must therefore consult the cluster BEFORE it can conclude "first
+# boot", and it must be able to reach the standby clone path from ordinal 0.
+empty_branch=$(grep -n 'if \[ "\$NODE_TYPE" = "master" \] && \[ ! -s "\${PGDATA}/PG_VERSION" \]; then' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
+first_boot_line=$(grep -n 'First boot, postgres mode will initialize the database' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
+probe_line=$(grep -n 'CURRENT_PRIMARY=$(find_current_primary)' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
+if [ -n "$empty_branch" ] && [ -n "$probe_line" ] && [ -n "$first_boot_line" ] && \
+   [ "$probe_line" -gt "$empty_branch" ] && [ "$probe_line" -lt "$first_boot_line" ]; then
+  ok "init-repmgr.sh probes for an existing primary before declaring an empty pod-0 a first boot"
+else
+  bad "init-repmgr.sh can still declare an empty pod-0 a first boot without probing the cluster (empty=${empty_branch:-none} probe=${probe_line:-none} first_boot=${first_boot_line:-none})"
+fi
+if grep -q 'NODE_TYPE="standby"' "${ROOT}/init-repmgr.sh"; then
+  ok "init-repmgr.sh can route an empty ordinal-0 pod onto the standby clone path"
+else
+  bad "init-repmgr.sh has no way to route an empty ordinal-0 pod onto the standby clone path"
+fi
+
+# The ordinal-0 fallback inside wait_for_primary must never probe the pod running it:
+# ordinal 0 can now reach that loop, and its own postmaster is not up yet.
+if grep -q 'if \[ "\$ORDINAL" != "0" \] && PGPASSWORD="\${REPMGR_PASSWORD}" pg_isready -h "\${FQDN_0}"' "${ROOT}/init-repmgr.sh"; then
+  ok "init-repmgr.sh does not let ordinal 0 wait on its own postmaster"
+else
+  bad "init-repmgr.sh lets ordinal 0 probe itself in the wait_for_primary fallback"
+fi
+
+
+# --- ordinal 0 holding STANDBY data must not take the destructive master path ---
+# A data directory carrying standby.signal is not primary-state, so the "Primary-state
+# data directory present" guard does not exit, and the empty-data branch does not apply
+# either. NODE_TYPE was still "master", so ordinal 0 fell into the master block, which
+# rm -rf's PGDATA and full-clones. That fires on EVERY restart of a healthy pod-0 standby
+# -- the steady state this fix creates -- while ordinal >0 in the identical state takes
+# the timeline-compare fast path further down and skips the clone entirely. It is also
+# unrecoverable when every clone attempt fails, since it deletes before it clones.
+signal_flip=$(awk '/standby[.]signal/{c=NR} /NODE_TYPE="standby"/{if (c && NR-c<=2) {print c; exit}}' "${ROOT}/init-repmgr.sh")
+master_block=$(grep -n '^if \[ "\$NODE_TYPE" = "master" \]; then' "${ROOT}/init-repmgr.sh" | head -1 | cut -d: -f1)
+if [ -n "$signal_flip" ] && [ -n "$master_block" ] && [ "$signal_flip" -lt "$master_block" ]; then
+  ok "init-repmgr.sh routes standby-state data to the standby path before the master block"
+else
+  bad "init-repmgr.sh lets ordinal 0 with standby.signal reach the rm -rf master path (flip=${signal_flip:-none} master=${master_block:-none})"
+fi
+
+# --- a standby that cannot find a primary must DEFER, not kill the init container ---
+# The standby.signal flip above routes ordinal 0 onto the standby path, which is right for
+# the re-clone problem but must not remove ordinal 0's only escape from a cold boot. With
+# `set -e`, a bare `wait_for_primary` that returns 1 exits the init container. Existing data
+# has somewhere to go -- entrypoint.sh returns early for standby-state data
+# ("[ -f standby.signal ] && return 0"), so postgres starts in recovery and streams as soon
+# as a primary appears, exactly as the old master-block path did. Only an EMPTY directory
+# has nothing to fall back on and should hard-fail.
+#
+# Without this, a full restart with pod-0 in standby state deadlocks the cluster: under
+# OrderedReady pod-0 is recreated alone and blocks pod-1, so pod-0 waits ~240s for a primary
+# that cannot exist, exits 1, and repeats forever while the real primary is never created.
+if grep -q 'if ! wait_for_primary; then' "${ROOT}/init-repmgr.sh" && \
+   awk '/if ! wait_for_primary; then/,/^fi$/' "${ROOT}/init-repmgr.sh" | grep -q 'PG_VERSION' && \
+   awk '/if ! wait_for_primary; then/,/^fi$/' "${ROOT}/init-repmgr.sh" | grep -q 'exit 0'; then
+  ok "init-repmgr.sh defers instead of failing when a standby with data finds no primary"
+else
+  bad "init-repmgr.sh hard-fails a data-bearing standby that finds no primary (cold-boot deadlock)"
+fi
+# --- any_peer_reachable: a live STANDBY is proof a cluster exists ---
+# The empty-data path treats "no peer answered at all" as a genuine first install, so this
+# is the function that decides whether an empty pod-0 initdb's. Exercise it for real with a
+# stubbed pg_isready rather than trusting the grep above.
+# mktemp, not a fixed /tmp path: this file is sourced, so a predictable name lets a local
+# user pre-create it (or a symlink) and have their code executed by whoever runs the suite.
+apr_fn=$(mktemp "${TMPDIR:-/tmp}/apr_fn.XXXXXX")
+trap 'rm -f "${apr_fn}"' EXIT
+sed -n '/^any_peer_reachable() {/,/^}/p' "${ROOT}/init-repmgr.sh" > "${apr_fn}"
+if [ ! -s "${apr_fn}" ]; then bad "extract any_peer_reachable from init-repmgr.sh"; else
+  ok "extract any_peer_reachable from init-repmgr.sh"
+  # shellcheck disable=SC1091
+  source "${apr_fn}"
+  HOSTNAME=pg-0 ; ORDINAL=0 ; HEADLESS_SERVICE=h ; REPMGR_USER=u ; REPMGR_PASSWORD=p
+  REPMGR_DB=d ; REPMGR_NODE_COUNT=3
+  # LIVE_PEER is the one host the stub answers for; empty means nothing answers.
+  # pg_isready is called as: pg_isready -h <host> -p 5432 -U <user> -d <db>
+  pg_isready() { [ -n "${LIVE_PEER:-}" ] && [ "$2" = "${LIVE_PEER}" ]; }
+  LIVE_PEER="pg-1.h" ; REACHABLE_PEER=""
+  if any_peer_reachable && [ "$REACHABLE_PEER" = "pg-1.h" ]; then
+    ok "any_peer_reachable finds a live peer and reports which one"
+  else
+    bad "any_peer_reachable missed a live peer (REACHABLE_PEER='${REACHABLE_PEER:-}')"
+  fi
+  LIVE_PEER="" ; REACHABLE_PEER=""
+  if any_peer_reachable; then
+    bad "any_peer_reachable claims a peer is live when none answers"
+  else
+    ok "any_peer_reachable reports no peer when the cluster is silent (a genuine first install)"
+  fi
+  # Its own ordinal must be skipped, or pod-0 would find "itself" and never initdb.
+  LIVE_PEER="pg-0.h" ; REACHABLE_PEER=""
+  if any_peer_reachable; then
+    bad "any_peer_reachable counted the local node as a peer"
+  else
+    ok "any_peer_reachable skips the local node"
+  fi
+  unset -f pg_isready
+fi
+rm -f "${apr_fn}"
+
 echo "----"
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
 exit "$fail"
