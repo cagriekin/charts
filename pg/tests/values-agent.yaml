@@ -45,11 +45,13 @@ postgresql:
       additionalCommands: ""
 
 repmgr:
-  image:
-    repository: cagriekin/repmgr
-    tag: trixie-5.5.0-27
-    pullPolicy: IfNotPresent
-
+  # NO image pin (#293). This fixture used to pin trixie-5.5.0-27, six releases behind the
+  # chart default. CI is unaffected -- set-pg-major.sh rewrites every fixture's repmgr tag to
+  # the chart's own before any suite runs, so CI always tested the freshly built image -- but
+  # a LOCAL run does not go through that script, so `make -C pg test-agent-rolling` silently
+  # pulled a stale RELEASED image and asserted agent behaviour against last quarter's agent.
+  # That is exactly how this suite's #293 assertions would have passed while testing nothing.
+  # Inheriting the chart default keeps the local and CI subject the same image.
   enabled: true
 
   username: repmgr
