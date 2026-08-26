@@ -15,15 +15,22 @@ import (
 const preloadGUC = "shared_preload_libraries"
 
 // preloadAssignRe matches an ACTIVE shared_preload_libraries assignment, capturing the
-// leading indentation and everything after the `=`. Commented-out lines are excluded by
-// the caller, not here, so that initdb's own stock
-// `#shared_preload_libraries = ”	# (change requires restart)` is never touched.
-var preloadAssignRe = regexp.MustCompile(`(?i)^([ \t]*)` + preloadGUC + `[ \t]*=[ \t]*(.*)$`)
+// leading indentation and everything after the name. Commented-out lines are excluded by
+// the caller, not here, so that initdb's own stock commented default (an empty value plus a
+// "change requires restart" note) is never touched.
+//
+// The `=` is OPTIONAL because postgresql.conf makes it optional -- `shared_preload_libraries
+// 'repmgr'` is a valid assignment and a real postmaster loads it (verified). Requiring it let
+// that spelling evade the strip, the diagnostic and the render guard at once (#293 review).
+// The `=` alternative is listed first so it is preferred over consuming the space alone, and
+// one of the two is REQUIRED so a longer parameter that merely starts with this name
+// (`shared_preload_libraries_foo = x`) cannot match.
+var preloadAssignRe = regexp.MustCompile(`(?i)^([ \t]*)` + preloadGUC + `(?:[ \t]*=|[ \t]+)[ \t]*(.*)$`)
 
 // EnsureNoPreloadLibrary removes lib from every shared_preload_libraries assignment in
 // confPath, preserving the other libraries and their order, and reports whether the file
 // changed. When lib was the only entry the assignment line is dropped entirely rather than
-// left as an empty string: an empty `shared_preload_libraries = ”` and no setting at all
+// left as an empty string: an empty shared_preload_libraries value and no setting at all
 // are equivalent to the postmaster, and dropping the line lets PostgreSQL's own default
 // apply instead of pinning it.
 //
@@ -75,6 +82,38 @@ func PreloadsLibrary(confPath, lib string) (bool, error) {
 		return false, fmt.Errorf("read %s: %w", confPath, err)
 	}
 	return preloadRequests(string(data), lib), nil
+}
+
+// dynamicLibraryPathRe matches an active dynamic_library_path assignment, with the same
+// optional-`=` shape as preloadAssignRe.
+var dynamicLibraryPathRe = regexp.MustCompile(`(?i)^[ \t]*dynamic_library_path(?:[ \t]*=|[ \t]+)[ \t]*.*$`)
+
+// SetsDynamicLibraryPath reports whether confPath actively sets dynamic_library_path.
+//
+// It exists purely to disarm the absent-module refusal. PostgreSQL resolves an unqualified
+// shared_preload_libraries entry against dynamic_library_path, not against pkglibdir alone,
+// so a cluster that legitimately loads repmgr.so from an extra directory has a present,
+// working library that a bare pkglibdir stat cannot see. Refusing there would hard-exit
+// every pod over a library that loads fine -- exactly the asymmetric false positive the
+// refusal is built to avoid (#293 review). A missing file is not an error, for the same
+// reason as PreloadsLibrary.
+func SetsDynamicLibraryPath(confPath string) (bool, error) {
+	data, err := os.ReadFile(confPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", confPath, err)
+	}
+	for _, ln := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(strings.TrimLeft(ln, " \t"), "#") {
+			continue
+		}
+		if dynamicLibraryPathRe.MatchString(ln) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // stripPreloadLibrary is the pure transform behind EnsureNoPreloadLibrary.
@@ -152,6 +191,12 @@ func preloadEntryNames(entry, lib string) bool {
 	if e == "" {
 		return false
 	}
+	// PostgreSQL parses the list with SplitDirectoriesString, which strips DOUBLE quotes
+	// around an entry -- so '"repmgr"' loads repmgr, and comparing the quoted text would
+	// have missed it (#293 review, verified against a real postmaster).
+	if len(e) >= 2 && e[0] == '"' && e[len(e)-1] == '"' {
+		e = strings.TrimSpace(e[1 : len(e)-1])
+	}
 	// path.Base collapses `$libdir/repmgr` and any absolute path to the bare name; ToSlash
 	// first so a backslash-separated value cannot hide one.
 	e = path.Base(filepath.ToSlash(e))
@@ -162,7 +207,8 @@ func preloadEntryNames(entry, lib string) bool {
 // list, and whatever followed the value (a trailing comment, usually). ok is false for any
 // line that is not an active shared_preload_libraries assignment -- including a
 // commented-out one, which must survive verbatim: initdb writes
-// `#shared_preload_libraries = ”` into every data directory, and "fixing" that would turn
+// a commented-out shared_preload_libraries with an empty value into every data directory,
+// and "fixing" that would turn
 // a stock default into an explicit pin.
 //
 // The value is either a single-quoted string (embedded quotes doubled, per

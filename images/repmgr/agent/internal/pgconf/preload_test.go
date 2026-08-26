@@ -275,3 +275,88 @@ func TestPreloadsLibraryTreatsAMissingFileAsAbsent(t *testing.T) {
 		t.Error("a missing file must not report the library as requested")
 	}
 }
+
+func TestPreloadHandlesTheSpellingsPostgresAcceptsButWeAlmostMissed(t *testing.T) {
+	// Both forms below were verified against a real postmaster in this image: it starts and
+	// SHOW reports the library as loaded. Missing them meant the strip, the diagnostic and
+	// the render guard all passed the value straight through to a crash-loop (#293 review).
+	cases := []struct{ name, in, want string }{
+		// SplitDirectoriesString strips double quotes around an entry.
+		{"double-quoted entry", `shared_preload_libraries = '"repmgr"'` + "\n", ""},
+		{"double-quoted among others", `shared_preload_libraries = '"repmgr",pgaudit'` + "\n", "shared_preload_libraries = 'pgaudit'"},
+		// postgresql.conf makes the equals sign optional.
+		{"no equals sign", "shared_preload_libraries 'repmgr'\n", ""},
+		{"no equals sign among others", "shared_preload_libraries 'repmgr,pgaudit'\n", "shared_preload_libraries = 'pgaudit'"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out, changed := stripPreloadLibrary(c.in, "repmgr")
+			if !changed {
+				t.Fatalf("not recognised: %q", c.in)
+			}
+			if got := strings.TrimRight(out, "\n"); got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+			if !preloadRequests(c.in, "repmgr") {
+				t.Errorf("not reported as requesting repmgr: %q", c.in)
+			}
+		})
+	}
+}
+
+func TestPreloadAssignmentDoesNotMatchALongerParameterName(t *testing.T) {
+	// Making the equals sign optional risks swallowing any parameter that merely starts with
+	// this name, so one of {whitespace, =} is required after it.
+	for _, in := range []string{
+		"shared_preload_libraries_foo = 'repmgr'\n",
+		"shared_preload_libraries2 = 'repmgr'\n",
+	} {
+		if _, changed := stripPreloadLibrary(in, "repmgr"); changed {
+			t.Errorf("a different parameter was rewritten: %q", in)
+		}
+		if preloadRequests(in, "repmgr") {
+			t.Errorf("a different parameter was read as the preload list: %q", in)
+		}
+	}
+}
+
+func TestSetsDynamicLibraryPath(t *testing.T) {
+	dir := t.TempDir()
+	write := func(body string) string {
+		p := filepath.Join(dir, "c.conf")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	for _, body := range []string{
+		"dynamic_library_path = '$libdir:/opt/pg/lib'\n",
+		"dynamic_library_path '$libdir'\n",
+		"Dynamic_Library_Path = '$libdir'\n",
+	} {
+		got, err := SetsDynamicLibraryPath(write(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got {
+			t.Errorf("expected detection for %q", body)
+		}
+	}
+	for _, body := range []string{
+		"",
+		"# dynamic_library_path = '$libdir'\n",
+		"wal_level = replica\n",
+		"dynamic_library_path_extra = '/x'\n",
+	} {
+		got, err := SetsDynamicLibraryPath(write(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got {
+			t.Errorf("unexpected detection for %q", body)
+		}
+	}
+	if got, err := SetsDynamicLibraryPath(filepath.Join(dir, "absent.conf")); err != nil || got {
+		t.Errorf("a missing file must be (false, nil), got (%v, %v)", got, err)
+	}
+}

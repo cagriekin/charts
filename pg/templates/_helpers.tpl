@@ -918,7 +918,10 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        preloadEntryNames applies the same normalisation, and the two must stay in step. */ -}}
 {{- $found := false }}
 {{- range $l := splitList "," (include "pg.sharedPreloadLibraries" .) }}
-  {{- $n := trimSuffix ".so" (base (trim $l)) }}
+  {{- /* Also unwrap DOUBLE quotes: PostgreSQL parses the list with SplitDirectoriesString,
+         which strips them, so `"repmgr"` loads repmgr (verified against a real postmaster).
+         The agent's preloadEntryNames does the same. */ -}}
+  {{- $n := trimSuffix ".so" (base (trimSuffix "\"" (trimPrefix "\"" (trim $l)))) }}
   {{- if eq $n "repmgr" }}{{- $found = true }}{{- end }}
 {{- end }}
 {{- if $found }}

@@ -1977,11 +1977,23 @@ func (a *agent) preflightPreload() error {
 // An empty PGDATA needs no special case: postgresql.conf does not exist yet, and
 // EnsureNoPreloadLibrary treats that as nothing to do.
 func (a *agent) dropRepmgrPreload() error {
-	confPath := filepath.Join(a.cfg.PGDATA, "postgresql.conf")
-	if a.cfg.Mechanism == config.MechanismNative {
+	if a.cfg.Mechanism != config.MechanismNative {
+		return nil
+	}
+	// BOTH files, not just postgresql.conf (#293 review). postgresql.auto.conf also lives in
+	// PGDATA, is read LAST -- so it wins over postgresql.conf and every conf.d fragment --
+	// and is precisely where `ALTER SYSTEM SET shared_preload_libraries` lands. Cleaning only
+	// postgresql.conf while the presence check below still treats auto.conf as fatal would
+	// turn an admin's one-off ALTER SYSTEM into the exact outage this exists to prevent: an
+	// unremediable CrashLoopBackOff on the repmgr-free image, fixable only by hand-editing a
+	// file on the PVC of a pod that will not start. EnsurePrimaryConninfoDBName (#308) already
+	// rewrites auto.conf from here, so this is an established file to own -- and the preflight
+	// runs before any postmaster start, so nothing is competing for it.
+	for _, name := range []string{"postgresql.conf", "postgresql.auto.conf"} {
+		confPath := filepath.Join(a.cfg.PGDATA, name)
 		changed, err := pgconf.EnsureNoPreloadLibrary(confPath, repmgrPreloadLib)
 		if err != nil {
-			return fmt.Errorf("boot: remove the repmgr preload from postgresql.conf: %w", err)
+			return fmt.Errorf("remove the repmgr preload from %s: %w", name, err)
 		}
 		if changed {
 			a.log.Info("removed repmgr from shared_preload_libraries in PGDATA; this cluster no longer needs repmgr.so (#293)",
@@ -2039,16 +2051,43 @@ func (a *agent) assertPreloadedLibsPresent() error {
 		return fmt.Errorf("boot: list %s: %w", confdDir, err)
 	}
 	paths = append(paths, fragments...)
+	// An operator-set dynamic_library_path disarms the refusal entirely. PostgreSQL resolves
+	// an unqualified entry against THAT path, not against pkglibdir alone, so a cluster
+	// loading repmgr.so from an extra directory has a present, working library that the stat
+	// above cannot see -- and refusing would hard-exit every pod over a library that loads
+	// fine (#293 review). Same asymmetry as the missing-directory case: the cost of a false
+	// refusal dwarfs the cost of falling back to PostgreSQL's own error message.
+	for _, p := range paths {
+		overridden, err := pgconf.SetsDynamicLibraryPath(p)
+		if err != nil {
+			return fmt.Errorf("check dynamic_library_path: %w", err)
+		}
+		if overridden {
+			a.log.Warn("dynamic_library_path is set, so the module search path is not just pkglibdir; skipping the preload presence check",
+				"path", p, "module", soPath)
+			return nil
+		}
+	}
 	for _, p := range paths {
 		requested, err := pgconf.PreloadsLibrary(p, repmgrPreloadLib)
 		if err != nil {
-			return fmt.Errorf("boot: check shared_preload_libraries: %w", err)
+			return fmt.Errorf("check shared_preload_libraries: %w", err)
 		}
 		if requested {
+			// The remediation is mechanism-specific, and getting it wrong here is actively
+			// harmful (#293 review). Telling a repmgr-MECHANISM node to drop the library is
+			// the one thing pg.sharedPreloadLibraries exists to prevent: it starts the
+			// postmaster without the repmgr extension's functions and silently disables
+			// failover. Such a node needs a different image or a different mechanism, not a
+			// shorter preload list.
+			fix := fmt.Sprintf("remove %q from shared_preload_libraries (in postgresql.configuration if the chart put it there, or from %s directly), then restart the pod", repmgrPreloadLib, p)
+			if a.cfg.Mechanism != config.MechanismNative {
+				fix = fmt.Sprintf("this node runs MECHANISM=%s, which still drives the repmgr CLI, so do NOT just drop the library -- move it to repmgr.agent.mechanism: native, or run an image that ships %s", a.cfg.Mechanism, soPath)
+			}
 			return fmt.Errorf("refusing to start: %s sets shared_preload_libraries to include %q, but this image does not ship %s. "+
 				"This is the #293 migration step: the line was written into the DATA DIRECTORY at initdb time by an older image, so it survives a chart downgrade and a helm rollback. "+
-				"Fix: remove %q from shared_preload_libraries (in postgresql.configuration if the chart put it there, or from %s directly), then restart the pod -- shared_preload_libraries is a postmaster parameter",
-				p, repmgrPreloadLib, soPath, repmgrPreloadLib, p)
+				"Fix: %s -- shared_preload_libraries is a postmaster parameter",
+				p, repmgrPreloadLib, soPath, fix)
 		}
 	}
 	return nil

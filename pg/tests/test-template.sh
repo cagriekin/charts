@@ -4024,14 +4024,14 @@ assert_contains "#293 guard: names the mechanism fix" "${spl_guard}" 'set repmgr
 # supplies `$libdir/` and `.so` itself when absent. Matching the bare string only let
 # `$libdir/repmgr` evade this guard, the agent's strip and the agent's absent-module refusal
 # all at once -- straight to the crash-loop the three of them exist to prevent (#293 review).
-for spl_variant in 'repmgr' '$libdir/repmgr' 'repmgr.so' '$libdir/repmgr.so' '/usr/lib/postgresql/18/lib/repmgr.so'; do
+for spl_variant in 'repmgr' '$libdir/repmgr' 'repmgr.so' '$libdir/repmgr.so' '/usr/lib/postgresql/18/lib/repmgr.so' '"repmgr"' '"$libdir/repmgr"'; do
   spl_v_rc=0
   helm template test-pg "${CHART_DIR}" --set repmgr.agent.mechanism=native \
     --set-string "postgresql.configuration.shared_preload_libraries=${spl_variant}" >/dev/null 2>&1 || spl_v_rc=$?
   assert_eq "#293 guard: native rejects the '${spl_variant}' spelling" "1" "$([ "${spl_v_rc}" -ne 0 ] && echo 1 || echo 0)"
 done
 # ...and a library that merely ends in the same characters must still render.
-for spl_ok in 'my_repmgr' '$libdir/repmgr_extra'; do
+for spl_ok in 'my_repmgr' '$libdir/repmgr_extra' '"pgaudit"'; do
   spl_ok_rc=0
   helm template test-pg "${CHART_DIR}" --set repmgr.agent.mechanism=native \
     --set-string "postgresql.configuration.shared_preload_libraries=${spl_ok}" >/dev/null 2>&1 || spl_ok_rc=$?
