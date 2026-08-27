@@ -4886,8 +4886,15 @@ done
 # `fail` would fire on every legitimate alias use or none. Pin the behaviour instead: if the
 # merge direction is ever flipped, this fails rather than silently changing what a released
 # values file resolves to.
-prec_dir="${SCRIPT_DIR}/../../.prec-tmp-291"
-mkdir -p "${prec_dir}"
+# mktemp + trap, not a repo-root scratch dir: this suite runs under `set -euo pipefail`, and
+# any unexpected non-zero between here and the cleanup would leave an untracked directory in
+# the working tree -- the exact `git add -A` hazard .git/info/exclude exists to document.
+# One EXIT trap for every scratch dir this suite makes: a second `trap ... EXIT` REPLACES the
+# first rather than adding to it, so per-block traps would silently leak all but the last.
+TMP_SCRATCH=()
+cleanup_scratch() { [ ${#TMP_SCRATCH[@]} -gt 0 ] && rm -rf "${TMP_SCRATCH[@]}"; return 0; }
+trap cleanup_scratch EXIT
+prec_dir="$(mktemp -d)"; TMP_SCRATCH+=("${prec_dir}")
 printf 'repmgr:\n  agent:\n    leaseDuration: 15s\n' > "${prec_dir}/legacy.yaml"
 printf 'ha:\n  agent:\n    leaseDuration: 30s\n' > "${prec_dir}/canonical.yaml"
 lease_of() { printf '%s\n' "$1" | grep -A1 'name: LEASE_DURATION' | grep 'value:' | head -1 | sed -E 's/.*value: "?([^"]*)"?.*/\1/'; }
@@ -4908,7 +4915,6 @@ assert_eq "#291: repmgr.* wins with the canonical file first" "15s" "$(lease_of 
 prec_only=$(helm template test-pg "${CHART_DIR}" -f "${prec_dir}/canonical.yaml" 2>&1)
 assert_eq "#291: ha.* alone lands (guards the three assertions above against vacuity)" "30s" \
   "$(lease_of "${prec_only}")"
-rm -rf "${prec_dir}"
 
 # The docs must actually state the rule, in every place an operator could reasonably look.
 assert_contains "#291: the README documents the cross-source precedence" \
@@ -4919,6 +4925,63 @@ for prec_chart in pg pgvector; do
   assert_contains "#291 ${prec_chart}: values.yaml warns about it too" \
     "$(cat "${SCRIPT_DIR}/../../${prec_chart}/values.yaml")" "MOVE"
 done
+
+# #291 review: the lease triple is cross-validated by client-go, and nothing checked it at
+# render time -- so an alias mixture could produce leaseDuration=15s renewDeadline=20s from two
+# values files that are each individually fine, render clean, and CrashLoopBackOff every pod.
+lease_dir="$(mktemp -d)"; TMP_SCRATCH+=("${lease_dir}")
+printf 'repmgr:\n  agent:\n    leaseDuration: 15s\n' > "${lease_dir}/legacy.yaml"
+
+# The chart's own cloud overlay was the most reachable instance of the trap.
+lease_mix=$(helm template test-pg "${CHART_DIR}" \
+  -f "${lease_dir}/legacy.yaml" -f "${CHART_DIR}/values-cloud.yaml" 2>&1 || true)
+assert_contains "#291: an alias-mixed lease triple fails the render" \
+  "${lease_mix}" "leaseDuration > renewDeadline > retryPeriod"
+assert_contains "#291: ...and the message names the offending values" "${lease_mix}" "leaseDuration=15s"
+assert_contains "#291: ...and points at the alias mixture as the cause" "${lease_mix}" "MIXTURE"
+
+# Each source alone is valid -- which is the whole point: neither file is wrong.
+lease_legacy_rc=0
+helm template test-pg "${CHART_DIR}" -f "${lease_dir}/legacy.yaml" >/dev/null 2>&1 || lease_legacy_rc=$?
+assert_eq "#291: the legacy file alone renders (the mixture is the defect, not the file)" "0" "${lease_legacy_rc}"
+lease_cloud_rc=0
+helm template test-pg "${CHART_DIR}" -f "${CHART_DIR}/values-cloud.yaml" >/dev/null 2>&1 || lease_cloud_rc=$?
+assert_eq "#291: values-cloud.yaml alone renders" "0" "${lease_cloud_rc}"
+
+# Direct violations, and the boundary: equal is not greater.
+for bad_triple in "5s:10s:2s" "15s:20s:4s" "10s:10s:2s" "20s:5s:5s"; do
+  IFS=: read -r bt_ld bt_rd bt_rp <<<"${bad_triple}"
+  bt_rc=0
+  helm template test-pg "${CHART_DIR}" --set "ha.agent.leaseDuration=${bt_ld}" \
+    --set "ha.agent.renewDeadline=${bt_rd}" --set "ha.agent.retryPeriod=${bt_rp}" >/dev/null 2>&1 \
+    || bt_rc=$?
+  assert_gt "#291: lease triple ${bad_triple} is rejected" "${bt_rc}" 0
+done
+
+# ...and valid triples across units must still render, or the guard is just an outage.
+for ok_triple in "15s:10s:2s" "30s:20s:4s" "1m:30s:5s" "1500ms:1000ms:200ms"; do
+  IFS=: read -r ot_ld ot_rd ot_rp <<<"${ok_triple}"
+  ot_rc=0
+  helm template test-pg "${CHART_DIR}" --set "ha.agent.leaseDuration=${ot_ld}" \
+    --set "ha.agent.renewDeadline=${ot_rd}" --set "ha.agent.retryPeriod=${ot_rp}" >/dev/null 2>&1 \
+    || ot_rc=$?
+  assert_eq "#291: lease triple ${ok_triple} renders" "0" "${ot_rc}"
+done
+
+# A duration shape the template parser does not handle must SKIP validation, not fail: the
+# agent's time.ParseDuration accepts compound forms, and rejecting input the agent would have
+# accepted would be a new bug rather than a guard.
+for exotic in "2h45m" "1.5h"; do
+  ex_rc=0
+  helm template test-pg "${CHART_DIR}" --set "ha.agent.leaseDuration=${exotic}" >/dev/null 2>&1 || ex_rc=$?
+  assert_eq "#291: an unparseable-by-template duration (${exotic}) is skipped, not rejected" "0" "${ex_rc}"
+done
+
+# pgvector shares the templates but has its own values-cloud.yaml, so assert the reach there too.
+pgv_lease=$(helm template test-pgv "${PGVECTOR_DIR}" \
+  -f "${lease_dir}/legacy.yaml" -f "${PGVECTOR_DIR}/values-cloud.yaml" 2>&1 || true)
+assert_contains "#291 pgvector: the same alias-mixed triple fails" \
+  "${pgv_lease}" "leaseDuration > renewDeadline > retryPeriod"
 
 end_suite
 print_summary

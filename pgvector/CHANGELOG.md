@@ -76,6 +76,26 @@
     (the etcd DCS walkthrough among them), so following the file the chart treats as the
     authority on its input surface tripped the deprecation notice the same change adds.
 
+  Third review round:
+
+  - **`ha.agent` lease timings are now validated at render time.** client-go requires
+    `leaseDuration > renewDeadline > retryPeriod` and the agent refuses to start otherwise, but
+    nothing checked it before the API server, so a violating triple rendered cleanly and then
+    CrashLoopBackOff'd every postgresql pod at once with no primary. The reachable path is not
+    three bad numbers typed by hand -- it is MIXING the `repmgr.agent.*` alias with `ha.agent.*`
+    across two values files: these keys are cross-validated, so one timing from a 1.x file plus
+    two from a newer `-f` yields a triple neither file contains. The chart's own
+    `values-cloud.yaml` was the most reachable instance. The guard skips (rather than fails) a
+    duration shape it cannot parse, because `time.ParseDuration` accepts compound forms and
+    rejecting input the agent would have accepted would be a new bug, not a guard.
+  - `release.yaml` now excludes `pg-ha-*`. The new image tag `pg-ha-X.Y.Z` matches the chart
+    release glob, which the old dot-free `pg-ha-<n>` did not -- that is why only `trixie-*` was
+    excluded. Pushing `pg-ha-2.0.0` would have fired the chart release workflow too, which
+    resolves `chart="pg-ha"` and dies on the missing Chart.yaml.
+  - `set-pg-major.sh` derives the leftover scanners' repository alternation from the chart
+    instead of hardcoding the two Docker Hub names, so pointing `ha.image.repository` at a
+    mirror or fork cannot make the scanners match nothing and report a silent green.
+
 - **The HA image is versioned with the chart** (#290/#291). Tags are now
   `cagriekin/pg-ha:<chart-version>-pg<major>` (e.g. `2.0.0-pg18`, `2.0.0-pg17`), published from
   the git tag `pg-ha-<version>`, replacing `cagriekin/repmgr:trixie-<repmgr>-<n>`. The old

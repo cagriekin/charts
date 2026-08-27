@@ -34,24 +34,32 @@ esac
 # unsuffixed image tag holds, so only this major resolves without a -pgNN suffix.
 DEFAULT_MAJOR="18"
 
-# Base repmgr tag as the chart ships it (same resolution the CI build step uses, so the
-# rewritten tag names an image that was actually built).
-# Accepts BOTH block spellings: #291 renamed the block to `ha:` and keeps `repmgr:` working
-# as a values alias, so this tree can legitimately carry either. Anchoring on one of them is
-# not a soft failure -- the [ -n ] guard below exits 1, which takes down every KinD leg.
+# The HA image coordinates as the chart ships them (same resolution the CI build step uses, so
+# the rewritten reference names an image that was actually built).
+#
+# Both accept EITHER block spelling: #291 renamed the block to `ha:` and keeps `repmgr:` working
+# as a values alias, so this tree can legitimately carry either. Anchoring on one is not a soft
+# failure -- the [ -n ] guards exit 1, which takes down every KinD leg before a suite runs.
 BASE_TAG=$(awk '/^(repmgr|ha):/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' "$VALUES")
+[ -n "$BASE_TAG" ] || { echo "could not resolve the HA image tag from ${VALUES} (looked for tag: under the ha:/repmgr: block)" >&2; exit 1; }
+
 # The REPOSITORY is read from the chart for the same reason as the tag (#291 review): #290
 # renames the image cagriekin/repmgr -> cagriekin/pg-ha in a two-step (publish, then bump the
-# pin), and every leftover-scanner and render check below matches on the repository. Hardcoding
+# pin), and every leftover scanner and render check below matches on the repository. Hardcoding
 # it meant step 2 ended in `FATAL: rendered StatefulSet does not use cagriekin/repmgr:...` --
-# a total KinD outage triggered by a one-line values bump, which is exactly the trap the tag
-# alternation was added to avoid. Both names are ALSO scanned for leftovers, because fixtures
-# cross over one at a time and a fixture left on the old repository must still be caught.
+# a total KinD outage triggered by a one-line values bump, exactly the trap the tag alternation
+# was added to avoid.
 HA_REPO=$(awk '/^(repmgr|ha):/{r=1} r&&/^    repository:/{gsub(/"/,"",$2); print $2; exit}' "$VALUES")
-[ -n "$HA_REPO" ] || { echo "could not resolve the HA image repository from ${VALUES}" >&2; exit 1; }
-# Alternation for the scanners: whichever the chart points at today, plus the other one.
-HA_REPO_RE='(cagriekin/repmgr|cagriekin/pg-ha)' 
-[ -n "$BASE_TAG" ] || { echo "could not resolve HA image tag from ${VALUES} (looked for the tag under the ha:/repmgr: block)" >&2; exit 1; }
+[ -n "$HA_REPO" ] || { echo "could not resolve the HA image repository from ${VALUES} (looked for repository: under the ha:/repmgr: block)" >&2; exit 1; }
+
+# Alternation for the leftover scanners: the two published names PLUS whatever the chart points
+# at now. The chart's own value has to be in here (#291 review): fixtures cross over one at a
+# time, so both published names must stay scannable -- but if ha.image.repository is ever
+# pointed at a private mirror or a fork, a hardcoded-only alternation matches NOTHING and the
+# scanners report "no leftovers" instead of failing. Silent green is the one outcome the
+# scanners exist to prevent, so the set is derived, not fixed.
+HA_REPO_RE="(cagriekin/repmgr|cagriekin/pg-ha|${HA_REPO})"
+
 # Two tag shapes are accepted, because #290 changed the scheme and the chart pin moves to it
 # only once the new image is actually published (the documented two-step: publish, then bump).
 # Handling both here means that bump needs no change to this script or to CI.
@@ -63,10 +71,9 @@ HA_REPO_RE='(cagriekin/repmgr|cagriekin/pg-ha)'
 # arm below does NOT classify as new: it would fall to the legacy arm, where the `%-pg[0-9]*`
 # trim reduces it to bare `trixie` and CI would build `repo:trixie` / `repo:trixie-pg17`.
 # Nothing published uses that shape, so it was never live breakage -- but a table describing a
-# scheme the code rejects is exactly the desync the note below warns about, so it is corrected
-# rather than left as harmless.
+# scheme the code rejects is exactly the desync the note below warns about.
 #
-# Keyed on a LEADING
+# The new scheme is keyed on a LEADING
 # semver, which is what separates it from the old `trixie-<repmgr>-<n>[-pgNN]` -- both end in
 # -pg<digits>, so a trailing-suffix test would misclassify the legacy suffixed form. This
 # pattern is shared verbatim between .github/workflows/pg-test.yaml and

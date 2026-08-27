@@ -1366,6 +1366,69 @@ volumes:
 {{- end }}
 {{- end }}
 
+{{- /*
+pg.durationMs -- a Go duration string as a number of milliseconds, or "" when the string is
+not one this parser handles. Exists only for pg.validateLeaseTimings below.
+
+Deliberately narrow: time.ParseDuration (what the agent actually uses) accepts compound and
+fractional forms like "2h45m" and "1.5h", and a template-side reimplementation of that would
+be more likely to be wrong than the thing it guards. So this handles the single-unit shape
+`<number><unit>` and reports "" for anything else, and the caller SKIPS validation rather
+than failing when it cannot parse. A guard that is silent on exotic input is honest; one that
+rejects input the agent would have accepted is a new bug.
+
+Suffix order matters: "ms", "ns" and "us" must be tested before "s", or 15ms parses as 15
+followed by a stray "m".
+*/ -}}
+{{- define "pg.durationMs" -}}
+{{- $d := . | toString | trim | lower -}}
+{{- if regexMatch "^[0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h)$" $d -}}
+{{- if hasSuffix "ms" $d -}}{{ mulf (float64 (trimSuffix "ms" $d)) 1.0 }}
+{{- else if hasSuffix "ns" $d -}}{{ mulf (float64 (trimSuffix "ns" $d)) 0.000001 }}
+{{- else if hasSuffix "us" $d -}}{{ mulf (float64 (trimSuffix "us" $d)) 0.001 }}
+{{- else if hasSuffix "h" $d -}}{{ mulf (float64 (trimSuffix "h" $d)) 3600000.0 }}
+{{- else if hasSuffix "m" $d -}}{{ mulf (float64 (trimSuffix "m" $d)) 60000.0 }}
+{{- else if hasSuffix "s" $d -}}{{ mulf (float64 (trimSuffix "s" $d)) 1000.0 }}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+pg.validateLeaseTimings -- client-go's leaderelection requires
+leaseDuration > renewDeadline > retryPeriod, and the agent enforces it in config.Load. Until
+now nothing checked it at RENDER time, so a violating triple produced a clean `helm template`
+and then a hard boot refusal in every postgresql pod at once: CrashLoopBackOff across the
+whole StatefulSet, with no primary and no failover. That is precisely the apply-time failure
+invariant 4 exists to prevent (#291 review).
+
+The reachable path is not an operator typing three bad numbers -- it is MIXING the `repmgr.*`
+alias with `ha.*` across two values files. These three keys are cross-validated, so taking one
+of them from a legacy file and the other two from a newer source yields a combination neither
+source contains. The chart's own values-cloud.yaml overlay was exactly this trap: an operator
+with `repmgr.agent.leaseDuration: 15s` in a 1.x file who added `-f values-cloud.yaml` (which
+sets the canonical spelling of all three) kept 15s for the first and took 20s/4s for the other
+two -- and 15s > 20s is false.
+
+So this guard is not really about the lease at all: it closes the general class of "an alias
+mixture produces a combination that is individually valid and jointly impossible", of which
+the lease triple is the instance with teeth. Any future group of cross-validated ha.* keys
+wants the same treatment.
+*/ -}}
+{{- define "pg.validateLeaseTimings" -}}
+{{- $agent := .Values.ha.agent | default dict -}}
+{{- $ldRaw := $agent.leaseDuration | default "15s" -}}
+{{- $rdRaw := $agent.renewDeadline | default "10s" -}}
+{{- $rpRaw := $agent.retryPeriod | default "2s" -}}
+{{- $ld := include "pg.durationMs" $ldRaw -}}
+{{- $rd := include "pg.durationMs" $rdRaw -}}
+{{- $rp := include "pg.durationMs" $rpRaw -}}
+{{- if and (ne $ld "") (ne $rd "") (ne $rp "") -}}
+{{- if not (and (gt (float64 $ld) (float64 $rd)) (gt (float64 $rd) (float64 $rp))) -}}
+{{- fail (printf "ha.agent lease timings must satisfy leaseDuration > renewDeadline > retryPeriod, but got leaseDuration=%s renewDeadline=%s retryPeriod=%s. client-go's leader election requires it and the agent refuses to start otherwise, so this would render cleanly and then CrashLoopBackOff every postgresql pod at once with no primary. If these came from two different values files, check for a MIXTURE of the deprecated repmgr.agent.* spelling and the canonical ha.agent.* one: where a key is set under both names the repmgr.* value wins, so one timing can come from a 1.x file while the other two come from a newer -f, producing a triple neither file contains. Set all three under the same name (ha.agent.*), or delete the repmgr.agent.* copies." $ldRaw $rdRaw $rpRaw) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- /* The repmgrd failover path was removed in 2.0.0 (#286): the lease-based Go agent has
        been the default since 1.0.0 and repmgrd was deprecated for one major cycle. The keys
        that only ever configured repmgrd are gone, and a values file still carrying them

@@ -144,3 +144,24 @@ tests:
 
   # The positive (renders fine) cases live in pg's suite and in pg/tests/test-template.sh, for
   # the single-template include reason noted above.
+
+  # #291 review: client-go needs leaseDuration > renewDeadline > retryPeriod, and until 2.0.0
+  # nothing checked it at render time -- so an alias mixture across two values files could
+  # render clean and then CrashLoopBackOff every pod at once.
+  - it: a lease triple that violates the client-go ordering fails fast
+    set:
+      ha.agent.leaseDuration: 15s
+      ha.agent.renewDeadline: 20s
+      ha.agent.retryPeriod: 4s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'leaseDuration > renewDeadline > retryPeriod'
+
+  # Equal is not greater -- the boundary case client-go also rejects.
+  - it: equal leaseDuration and renewDeadline fails fast
+    set:
+      ha.agent.leaseDuration: 10s
+      ha.agent.renewDeadline: 10s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'leaseDuration > renewDeadline > retryPeriod'
