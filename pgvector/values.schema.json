@@ -276,7 +276,7 @@
                 "repmgr",
                 "native"
               ],
-              "description": "Replication mechanics the agent drives. native (the default, and since #294 the only implementation) drives PostgreSQL directly: pg_ctl promote, pg_basebackup, pg_rewind, primary_conninfo + standby.signal. It takes topology from pg_stat_replication, owns replication slot lifecycle (#289), and supports syncReplicationSlots and cascadingReplication (#294). The repmgr mechanism and its CLI dependency were removed in 2.0.0; repmgr is still accepted by this enum ONLY so the render-time validator can reject it with a message naming the migration, rather than this schema failing first with a generic enum error. An existing repmgr cluster cannot be migrated in place yet (#292)."
+              "description": "Replication mechanics the agent drives. native (the default, and since #294 the only implementation) drives PostgreSQL directly: pg_ctl promote, pg_basebackup, pg_rewind, primary_conninfo + standby.signal. It takes topology from pg_stat_replication, owns replication slot lifecycle (#289), and supports syncReplicationSlots and cascadingReplication (#294). The repmgr mechanism and its CLI dependency were removed in 2.0.0; repmgr is still accepted by this enum ONLY so the render-time validator can reject it with a message naming the migration, rather than this schema failing first with a generic enum error. An existing 1.x repmgr cluster is migrated in place on upgrade (#292) -- see the 2.0.0 CHANGELOG and the README migration runbook."
             },
             "monitoring": {
               "type": "object",
@@ -639,7 +639,7 @@
                 "repmgr",
                 "native"
               ],
-              "description": "Replication mechanics the agent drives. native (the default, and since #294 the only implementation) drives PostgreSQL directly: pg_ctl promote, pg_basebackup, pg_rewind, primary_conninfo + standby.signal. It takes topology from pg_stat_replication, owns replication slot lifecycle (#289), and supports syncReplicationSlots and cascadingReplication (#294). The repmgr mechanism and its CLI dependency were removed in 2.0.0; repmgr is still accepted by this enum ONLY so the render-time validator can reject it with a message naming the migration, rather than this schema failing first with a generic enum error. An existing repmgr cluster cannot be migrated in place yet (#292)."
+              "description": "Replication mechanics the agent drives. native (the default, and since #294 the only implementation) drives PostgreSQL directly: pg_ctl promote, pg_basebackup, pg_rewind, primary_conninfo + standby.signal. It takes topology from pg_stat_replication, owns replication slot lifecycle (#289), and supports syncReplicationSlots and cascadingReplication (#294). The repmgr mechanism and its CLI dependency were removed in 2.0.0; repmgr is still accepted by this enum ONLY so the render-time validator can reject it with a message naming the migration, rather than this schema failing first with a generic enum error. An existing 1.x repmgr cluster is migrated in place on upgrade (#292) -- see the 2.0.0 CHANGELOG and the README migration runbook."
             },
             "monitoring": {
               "type": "object",

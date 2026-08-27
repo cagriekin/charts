@@ -220,7 +220,7 @@ tests:
     set:
       etcd.enabled: true
       ha.agent.dcs.backend: etcd
-      ha.image.tag: 2.0.0-pg18
+      ha.image.tag: 2.1.0-pg18
     asserts:
       - failedTemplate:
           errorPattern: 'must match ha.image'

@@ -1541,7 +1541,7 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
        so a narrowed enum would win the race and say nothing useful. The key itself survives
        (see values.yaml) precisely so a stale value fails loudly rather than being ignored. */ -}}
 {{- if eq ((.Values.ha.agent).mechanism | default "native") "repmgr" -}}
-{{- fail "ha.agent.mechanism: repmgr was removed in chart 2.0.0 (#294): the repmgr mechanism drove the repmgr CLI (standby clone/follow/promote, node rejoin) and depended on repmgr.nodes, and both are gone -- `native` is now the only implementation, and it is the default. Delete this key (or set it to \"native\"). IMPORTANT: a cluster created by a 1.x release is still repmgr-shaped on disk; migrating it in place is #292, and until that ships native is for FRESH installs. Read the 2.0.0 upgrade note in CHANGELOG.md before upgrading an existing HA cluster." -}}
+{{- fail "ha.agent.mechanism: repmgr was removed in chart 2.0.0 (#294): the repmgr mechanism drove the repmgr CLI (standby clone/follow/promote, node rejoin) and depended on repmgr.nodes, and both are gone -- `native` is now the only implementation, and it is the default. Delete this key (or set it to \"native\"). A cluster created by a 1.x release is migrated in place on upgrade (#292): no re-clone, timeline and system identifier preserved. Read the 2.0.0 upgrade note in CHANGELOG.md and the README migration runbook before upgrading an existing HA cluster." -}}
 {{- end -}}
 {{- end -}}
 
