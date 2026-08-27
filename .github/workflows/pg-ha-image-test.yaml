@@ -6,7 +6,7 @@ permissions:
 on:
   pull_request:
     paths:
-      - 'images/repmgr/**'
+      - 'images/pg-ha/**'
       # #320: images/pg-extensions/ is the prebuilt-extension image build recipe the
       # pg/pgvector charts point at via postgresql.extensions.image. A paths filter is
       # safe HERE (unlike pg-test/kafka-test/redis-test/lint) because nothing in this
@@ -20,7 +20,7 @@ on:
       # so a PR that moves the copy paths in _helpers.tpl ALONE is the exact drift these
       # checks exist to catch, and without this entry neither would run on it.
       - 'pg/templates/_helpers.tpl'
-      - '.github/workflows/repmgr-image-test.yaml'
+      - '.github/workflows/pg-ha-image-test.yaml'
 
 jobs:
   scripts-test:
@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Run script tests
-        run: bash images/repmgr/test/scripts-test.sh
+        run: bash images/pg-ha/test/scripts-test.sh
 
   # Build the image for each supported PostgreSQL major and assert the artifact really
   # is that major (#269). scripts-test covers the shell logic; this covers the build:
@@ -60,10 +60,10 @@ jobs:
             --build-arg PG_MAJOR=${{ matrix.pg_major }} \
             --cache-from type=gha,scope=repmgr-smoke-pg${{ matrix.pg_major }} \
             --cache-to type=gha,mode=max,scope=repmgr-smoke-pg${{ matrix.pg_major }} \
-            -t "repmgr:smoke-pg${{ matrix.pg_major }}" images/repmgr
+            -t "repmgr:smoke-pg${{ matrix.pg_major }}" images/pg-ha
 
       - name: Smoke-test the image
-        run: bash images/repmgr/test/image-smoke.sh "repmgr:smoke-pg${{ matrix.pg_major }}" "${{ matrix.pg_major }}"
+        run: bash images/pg-ha/test/image-smoke.sh "repmgr:smoke-pg${{ matrix.pg_major }}" "${{ matrix.pg_major }}"
 
   go-test:
     runs-on: ubuntu-latest
@@ -77,24 +77,24 @@ jobs:
           go-version: '1.25.13'
 
       - name: vet + test the agent module
-        working-directory: images/repmgr/agent
+        working-directory: images/pg-ha/agent
         run: |
           go vet ./...
           go test ./...
 
       - name: verify module checksums (supply chain)
-        working-directory: images/repmgr/agent
+        working-directory: images/pg-ha/agent
         run: go mod verify
 
       - name: hermetic vendored build (no network)
-        working-directory: images/repmgr/agent
+        working-directory: images/pg-ha/agent
         env:
           GOFLAGS: -mod=vendor
           GOPROXY: "off"
         run: go build ./...
 
       - name: govulncheck (pinned)
-        working-directory: images/repmgr/agent
+        working-directory: images/pg-ha/agent
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           "$(go env GOPATH)/bin/govulncheck" ./...
@@ -134,7 +134,7 @@ jobs:
 
       - name: Build the extension image
         # buildx --load, matching every other build in this repo (image-smoke,
-        # repmgr-image-publish, pg-test): explicit about loading the result into the local
+        # pg-ha-image-publish, pg-test): explicit about loading the result into the local
         # image store, which the next step's `docker run` needs. Plain `docker build` also
         # lands it there today (it uses the docker driver, not the buildx container builder),
         # but relying on that distinction is a trap for whoever edits this next.

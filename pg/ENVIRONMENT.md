@@ -22,13 +22,13 @@ Required/optional is from the consuming process's perspective at runtime. Secret
 
 | Variable | Type | Required | Default / source | Consumer |
 |----------|------|----------|------------------|----------|
-| `REPMGR_USER` | string | yes | `repmgr.username` | entrypoint, init-repmgr, agent |
-| `REPMGR_PASSWORD` | string | yes | secret (`repmgr-password`) | entrypoint, init-repmgr, agent |
-| `REPMGR_DB` | string | yes | `repmgr.database` | entrypoint, init-repmgr, agent |
-| `HEADLESS_SERVICE` | string | yes | `<fullname>-headless.<ns>.svc.cluster.local` | init-repmgr, agent (peer FQDNs) |
-| `REPMGR_NODE_COUNT` | number | yes | `postgresql.replicaCount + 1` | init-repmgr, agent (peer enumeration) |
-| `NAMESPACE` | string | yes | fieldRef `metadata.namespace` | guard, agent |
-| `PRIMARY_MARKER` | string | yes | `<fullname>-primary` | guard, agent (#125 highwater) |
+| `REPMGR_USER` | string | yes | `repmgr.username` | entrypoint (creates the role), agent (replication auth) |
+| `REPMGR_PASSWORD` | string | yes | secret (`repmgr-password`) | entrypoint (creates the role), agent (replication auth) |
+| `REPMGR_DB` | string | yes | `repmgr.database` | entrypoint (creates the database), agent (`dbname` in `primary_conninfo`) |
+| `HEADLESS_SERVICE` | string | yes | `<fullname>-headless.<ns>.svc.cluster.local` | agent (peer FQDNs) |
+| `REPMGR_NODE_COUNT` | number | yes | `postgresql.replicaCount + 1` | agent (peer enumeration) |
+| `NAMESPACE` | string | yes | fieldRef `metadata.namespace` | agent |
+| `PRIMARY_MARKER` | string | yes | `<fullname>-primary` | agent (#125 highwater) |
 
 ## HA only (`repmgr.enabled=true`)
 
@@ -51,8 +51,8 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `POSTGRESQL_PGHBA` | newline-list | no | `postgresql.pgHba` (joined) | agent (user pg_hba rules, above the catch-alls) |
 | `CASCADE_REPLICATION` | boolean | no | `repmgr.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
 | `SYNC_REPLICATION_SLOTS` | boolean | no | `repmgr.agent.syncReplicationSlots` (`false`) | agent (logical failover slot sync, #308; emitted only when true) |
-| `USE_REPLICATION_SLOTS` | boolean | no | `"1"` (always; agent is the only failover path since 2.0.0) | repmgr-init (initial `standby clone`, #308; matches the agent's own regenerated `repmgr.conf`) |
-| `MECHANISM` | enum | no | `repmgr.agent.mechanism` (`native` only) | agent (HA mechanics, #287). **Always emitted since #294**, not only at a non-default value: `native` is now the default, and an agent built before #294 assumes `repmgr` when this is absent, so omitting it would run the removed mechanism during a two-step image-then-chart release. Also read by `init-repmgr.sh` and `entrypoint.sh` (#288 -- under `native` the init container skips repmgr.conf, the `repmgr.nodes` registration wait and the repmgr clone, and the stale-primary guard and `CREATE EXTENSION repmgr` are skipped). An explicit `repmgr` is rejected at render time |
+| ~~`USE_REPLICATION_SLOTS`~~ | — | — | **removed in 2.0.0 (#290)** | Nothing. It configured the init container's `repmgr standby clone`; the agent owns cloning and always uses a slot |
+| `MECHANISM` | enum | no | `repmgr.agent.mechanism` (`native` only) | agent (HA mechanics, #287). **Always emitted since #294**, not only at a non-default value: `native` is the default, and an agent built before #294 assumes `repmgr` when this is absent, so omitting it would run the removed mechanism during a two-step image-then-chart release. The shell no longer reads it -- the repmgr paths it used to gate are gone (#290). An explicit `repmgr` is rejected at render time |
 | `PG_MAJOR` | digits | no | image `ENV` from the Dockerfile's `ARG PG_MAJOR` (`18`) | agent (versioned bindir `/usr/lib/postgresql/<major>/bin`, #269) |
 | `PGBACKREST_ENABLED` | boolean | no | `"true"` when `pgbackrest.enabled` | agent (control API backup routes) |
 | `PGBACKREST_STANZA` | string | no | `pgbackrest.stanza` | agent (`pgbackrest info`), archive_command |
@@ -64,7 +64,7 @@ passwordless `primary_conninfo` can authenticate streaming replication.
 ### Not injected by the chart: `KUBECONFIG` (#317)
 
 `KUBECONFIG` is the one variable the agent reads that the chart never sets. When it
-is present the agent (and the entrypoint's `kubectl` stale-primary guard) reaches the
+is present the agent reaches the
 apiserver through that kubeconfig instead of the in-cluster ServiceAccount; when it is
 absent — the default — the in-cluster path is used exactly as before. It exists so a
 cluster whose egress policy denies pod traffic to the apiserver can route the agent
@@ -81,8 +81,8 @@ pgBackRest backup CronJob runs in its own pod and is an apiserver client in its 
 (it resolves the primary from EndpointSlices, then drives pgBackRest with `kubectl exec`),
 so it takes `KUBECONFIG` from `pgbackrest.extraEnv` instead — which also carries it to the
 `pgbackrest` sidecar, the `pgbackrest-bootstrap` init container, and the restore and
-validation workloads. Injecting it through `postgresql.extraEnv` would additionally
-redirect the entrypoint's stale-primary guard, which is why the chart keeps them apart.
+validation workloads. The chart keeps the two `extraEnv` surfaces apart so a KUBECONFIG meant
+for pgBackRest cannot silently redirect the agent's own API client.
 
 Set but unreadable/malformed/contextless is a startup failure naming the file, never a
 silent fall back to in-cluster. `~/.kube/config` is deliberately not consulted. The boot
@@ -168,10 +168,13 @@ these variables. Nothing injects or reads them any more:
 |----------|-----------------|-------------|
 | `MONITORING_HISTORY_DAYS` | repmgrd sidecar (`repmgr cluster cleanup`) | none — only repmgrd wrote `repmgr.monitoring_history` |
 | `PGPOOL_DEPLOYMENT` / `PGPOOL_SERVICE` / `PGPOOL_PORT` | service-updater (pgpool restart on failover) | none — PGPool-II follows the Services the agent re-points |
-| `REPMGR_FAILOVER` | `init-repmgr.sh` (`automatic`/`manual`) | none — the agent always writes `failover=manual` into `repmgr.conf` at boot |
+| `REPMGR_FAILOVER` | `init-repmgr.sh` (`automatic`/`manual`) | none — there is no repmgr and no `repmgr.conf`; the agent is the only failover path (#290) |
+| `USE_REPLICATION_SLOTS` | `init-repmgr.sh` (initial `standby clone`) | none — the agent owns cloning and always streams through a slot it pre-created (#289/#290) |
 
-`MASTER_SERVICE` and `SPLIT_BRAIN_ACTION` were listed here too; both survive and are
-consumed by the agent (see the HA table above).
+`MASTER_SERVICE` survives and is consumed by the agent (see the HA table above).
+`SPLIT_BRAIN_ACTION` is still injected and validated, but **no code reads it**: the behaviour
+its two values used to select lived in the service-updater's `handle_split_brain()`, and the
+agent demotes on lease loss unconditionally. See `repmgr.splitBrainDetection` in values.yaml.
 
 ## pgbackrest (when `pgbackrest.enabled=true`)
 

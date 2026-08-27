@@ -2,7 +2,7 @@ package pg
 
 import "testing"
 
-// Parity with the shell tl_to_int unit tests (images/repmgr/test/scripts-test.sh):
+// Parity with the shell tl_to_int unit tests (images/pg-ha/test/scripts-test.sh):
 // the timeline is hex; a decimal parse errors at 0x0A and is wrong from 0x10.
 func TestParseTimeline(t *testing.T) {
 	cases := []struct {

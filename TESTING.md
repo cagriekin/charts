@@ -82,5 +82,5 @@ Two leftovers you may still meet:
   inert. Each correctly takes its native side, but they are dead weight -- collapse them rather
   than re-gating them.
 - A fixture pinning an older published `repmgr.image.tag` tests that published image instead of
-  the one built from `images/repmgr`. `values-agent.yaml` and `values-repmgr.yaml` were unpinned
+  the one built from `images/pg-ha`. `values-agent.yaml` and `values-repmgr.yaml` were unpinned
   when this silently broke the native legs; eleven other fixtures still carry a pin.

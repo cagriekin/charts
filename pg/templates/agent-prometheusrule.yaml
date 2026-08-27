@@ -80,7 +80,7 @@ spec:
                retracts them), so max() picks the primary's view without a role label.
 
                The FIRST alert below is the one that matters on chart defaults. The image
-               sets max_slot_wal_keep_size = 4GB at initdb (images/repmgr/entrypoint.sh), so
+               sets max_slot_wal_keep_size = 4GB at initdb (images/pg-ha/entrypoint.sh), so
                PostgreSQL does not let a slot fill the volume -- it INVALIDATES the slot
                instead (wal_status = 'lost'), and the standby behind it can then only recover
                by a full re-clone. Verified against PostgreSQL 18: invalidation also nulls

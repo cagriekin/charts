@@ -73,7 +73,13 @@ done
 # the primary's live connection list: every standby must be present AND streaming, which is
 # strictly stronger than "a row exists for itself".
 NEW_PRIMARY=$(discover_primary "${NAMESPACE}" "${FULLNAME_TO}" 3 repmgr repmgr)
-assert_not_eq "after upgrade: a primary is discoverable" "" "${NEW_PRIMARY}"
+# See test-full.sh: assert_not_eq fails on an empty operand by design, so a literal "" here
+# made the assertion fail unconditionally.
+if [ -z "${NEW_PRIMARY}" ]; then
+  fail "after upgrade: a primary is discoverable" "discover_primary returned nothing"
+else
+  pass "after upgrade: a primary is discoverable (${NEW_PRIMARY})"
+fi
 if [ -n "${NEW_PRIMARY}" ]; then
   streaming=""; s=0
   while [ "${s}" -lt 120 ]; do

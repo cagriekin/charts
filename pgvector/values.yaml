@@ -348,12 +348,15 @@ repmgr:
     # at render time unless postgresql.majorVersion matches this. Bump this and
     # tag together when moving to a repmgr image built for a new PG major.
     #
-    # The image is published per major (#269): the tag above (unsuffixed) is
-    # PostgreSQL 18, and <tag>-pg18 / <tag>-pg17 select one explicitly. To run
-    # PostgreSQL 17, set BOTH majorVersion values to "17", this tag to <tag>-pg17,
-    # AND postgresql.image.tag to pg17-trixie -- this chart copies the vector
-    # extension out of the pgvector image, so that image must be the same major.
-    # See pgvector/README.md "Choosing the PostgreSQL major".
+    # The image is published per major (#269), and since #290 the major is IN the tag:
+    # cagriekin/pg-ha:trixie-pg18-<n> and :trixie-pg17-<n>, with no unsuffixed
+    # "default major" alias. To run PostgreSQL 17, set BOTH majorVersion values to "17",
+    # this tag to a trixie-pg17-<n>, AND postgresql.image.tag to pg17-trixie -- this
+    # chart copies the vector extension out of the pgvector image, so that image must be
+    # the same major. See pgvector/README.md "Choosing the PostgreSQL major".
+    #
+    # The pin above is still the OLD cagriekin/repmgr scheme: the chart moves to pg-ha
+    # once that image is published (publish the image, then bump repository+tag here).
     majorVersion: "18"
 
   # Enable HA: the lease-based Go agent runs as PID 1 and drives failover. false is

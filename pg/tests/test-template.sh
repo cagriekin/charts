@@ -2822,7 +2822,7 @@ assert_contains "#269: PG17 extension share path" "${pg17_ext}" "/usr/share/post
 assert_not_contains "#269: no PG18 paths remain under a PG17 selection" "${pg17_ext}" "postgresql/18/"
 
 # audit.enabled=true on PG17 must preload pgaudit exactly as on 18 -- the image asserts
-# postgresql-17-pgaudit at build time (see images/repmgr/Dockerfile), so the chart side
+# postgresql-17-pgaudit at build time (see images/pg-ha/Dockerfile), so the chart side
 # must not gate the preload on a major.
 pg17_audit=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.audit.enabled=true \
@@ -3850,28 +3850,26 @@ assert_not_contains "#288: native does not preload repmgr" "${spl_native}" "shar
 # The former "repmgr mode still preloads repmgr" counterpart went with the mechanism (#294):
 # native is the only one, so there is no other render to hold to a different rule.
 
-# #288: MECHANISM must reach the INIT container, not just the postgresql one. Without it the
-# init container's shell gate can never fire, so native standbys keep polling repmgr.nodes for
-# a registration that never comes and sit in Init:CrashLoopBackOff forever. Occurrence count,
-# not presence: getting it onto one container only is exactly the bug.
+# #290: MECHANISM reaches the postgresql container ONLY. It had to reach repmgr-init as well
+# while init-repmgr.sh gated on it -- without it, native standbys polled repmgr.nodes for a
+# registration that never came and sat in Init:CrashLoopBackOff. That script is gone: the
+# reduced `init` mode reads nothing but PG_MAJOR, so passing MECHANISM (or the credentials, the
+# headless service, the node count) into that container would be dead config, and the Secret in
+# particular is credential surface a container that only stats a binary has no use for.
 mech_native_res=$(helm template test-pg "${CHART_DIR}" \
-  --set repmgr.agent.mechanism=native \
   --set postgresql.majorVersion=18 \
   --show-only templates/statefulset.yaml 2>&1)
-assert_eq "#288: MECHANISM reaches both the init and postgresql containers" "2" \
+assert_eq "#290: MECHANISM reaches exactly one container (postgresql)" "1" \
   "$(printf '%s\n' "${mech_native_res}" | grep -c 'name: MECHANISM')"
-# Specifically on repmgr-init, so a future refactor cannot satisfy the count with two copies
-# on the same container.
-# End anchor must render AFTER the start: fix-permissions is init container 1 and repmgr-init is
-# container 4, so `/repmgr-init/,/fix-permissions/` ran to EOF and swallowed the postgresql
-# container's MECHANISM too -- the assertion could not fail, which is the exact bug its own
-# comment claimed to guard against. `- name: postgresql` is the next container after the init
-# list, so it is a real terminator.
+# And it is the postgresql one, not the init one. End anchor must render AFTER the start:
+# `- name: postgresql` is the next container after the init list, so it is a real terminator.
 mech_init_block=$(printf '%s\n' "${mech_native_res}" | sed -n '/name: repmgr-init/,/^        - name: postgresql$/p')
-assert_contains "#288: repmgr-init carries MECHANISM" "${mech_init_block}" "name: MECHANISM"
-# And prove the range is actually bounded: exactly one MECHANISM inside it, not both.
-assert_eq "#288: the repmgr-init range is bounded (one MECHANISM, not the whole render)" "1" \
-  "$(printf '%s\n' "${mech_init_block}" | grep -c 'name: MECHANISM')"
+assert_not_contains "#290: repmgr-init carries no MECHANISM" "${mech_init_block}" "name: MECHANISM"
+# Nor any credential: the reduced init container must not mount the release Secret.
+assert_not_contains "#290: repmgr-init carries no REPMGR_PASSWORD" "${mech_init_block}" "REPMGR_PASSWORD"
+assert_not_contains "#290: repmgr-init carries no POSTGRES_PASSWORD" "${mech_init_block}" "POSTGRES_PASSWORD"
+# ...and no /etc/repmgr emptyDir, which nothing writes or reads any more.
+assert_not_contains "#290: no repmgr-config volume is mounted" "${mech_native_res}" "repmgr-config"
 # The default render carries it now (#294): native is the default, and an image built before
 # #294 assumes repmgr when the variable is absent, so omitting it would run the removed
 # mechanism during a two-step image-then-chart release.
@@ -3890,8 +3888,8 @@ mech_default=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-age
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#294 default: MECHANISM=native is emitted explicitly" "${mech_default}" 'name: MECHANISM
               value: "native"'
-# Both containers, not just the postgresql one: the init container's gate cannot fire without it.
-assert_eq "#294: MECHANISM reaches both the init and postgresql containers" "2" "$(echo "${mech_default}" | grep -c 'name: MECHANISM')"
+# One container: the reduced init container has no gate to fire (#290).
+assert_eq "#290: MECHANISM reaches exactly one container in the default render" "1" "$(echo "${mech_default}" | grep -c 'name: MECHANISM')"
 # And the removed value is refused, with a message naming the migration rather than a bare enum
 # error -- values.schema.json deliberately still accepts it so this validator speaks first.
 mech_repmgr_rc=0

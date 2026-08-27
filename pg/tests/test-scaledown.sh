@@ -43,8 +43,7 @@ helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
 
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 3 600
 
-# Find the primary (not in recovery) among the live ordinals and count a node_id in
-# repmgr.nodes there (the primary owns the table; the count replicates to standbys).
+# Find the primary (not in recovery) among the live ordinals.
 find_primary() {
   local max="$1" i rec
   for i in $(seq 0 "${max}"); do
@@ -53,10 +52,6 @@ find_primary() {
   done
   echo ""
 }
-node_count() { # node_count <primary-pod> <node_id>
-  pg_exec "${NAMESPACE}" "$1" "SELECT count(*) FROM repmgr.nodes WHERE node_id=$2" repmgr repmgr 2>/dev/null | xargs || echo ""
-}
-
 # #288: the native equivalent of "is node N in the topology". There is no repmgr.nodes to
 # consult -- a native cluster has neither the extension nor the table -- so the question becomes
 # "is that pod streaming from the primary", which is the primary's own live connection list.
@@ -70,9 +65,12 @@ node_streaming() { # node_streaming <primary-pod> <ordinal>
     repmgr repmgr 2>/dev/null | xargs || echo ""
 }
 
-# in_topology dispatches on the mechanism so the three checks below read the same either way.
+# in_topology is node_streaming now (#290). It used to dispatch on the mechanism, with a
+# node_count that read repmgr.nodes -- a table that can no longer exist: the extension stopped
+# being created under native (#288), native became the only mechanism (#294), and the package
+# left the image (#290).
 in_topology() { # in_topology <primary-pod> <ordinal>
-  if [ "$(chart_mechanism)" = "native" ]; then node_streaming "$1" "$2"; else node_count "$1" "$((1000 + $2))"; fi
+  node_streaming "$1" "$2"
 }
 
 # Precondition: all three nodes registered (so the scaled node 1002 exists first --

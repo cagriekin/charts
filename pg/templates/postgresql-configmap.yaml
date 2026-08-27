@@ -57,7 +57,7 @@ data:
   # configmap checksum annotation on the StatefulSet triggers.
   #
   # max_wal_senders is deliberately NOT set here: it used to be hardcoded to the same
-  # value images/repmgr/entrypoint.sh already sets at initdb, which meant this file
+  # value images/pg-ha/entrypoint.sh already sets at initdb, which meant this file
   # clobbered any larger postgresql.configuration.max_wal_senders for no reason
   # (nothing else needs it re-asserted). Removed; the value now simply flows from
   # postgresql.configuration (via custom.conf) or the initdb default, uncontested.
@@ -77,7 +77,7 @@ data:
   # configured; wal_level and archive_mode are unrelated concerns that a prior
   # revision of this file wrongly coupled. Only rendered when non-default, so the
   # default render (and this ConfigMap's existence at all, for installs that touch
-  # nothing else here) stays byte-stable -- images/repmgr/entrypoint.sh's own
+  # nothing else here) stays byte-stable -- images/pg-ha/entrypoint.sh's own
   # initdb-time default already sets this GUC to the same default, so there is
   # nothing to add when the value is left unchanged. This file sorts after custom.conf and
   # pgbackrest-archive.conf under conf.d's include_dir either way, so it would win

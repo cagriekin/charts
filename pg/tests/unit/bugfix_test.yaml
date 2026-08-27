@@ -8,7 +8,7 @@ tests:
   # md5->scram re-hash now (single author of pg_hba, #199) and preserves the same
   # invariant -- the password reaches psql through REHASH_TGT_PASS + \getenv, never on
   # argv. That is asserted where the code now lives:
-  #   images/repmgr/agent/internal/pg/rehash_test.go (TestRehashMd5UserInvocation)
+  #   images/pg-ha/agent/internal/pg/rehash_test.go (TestRehashMd5UserInvocation)
 
   - it: pgbackrest cronjob validates the read-write primary before backing up
     values:

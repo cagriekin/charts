@@ -30,37 +30,62 @@ for pod in "${POD_0}" "${POD_1}" "${POD_2}"; do
   assert_eq "pod ${pod} is Running" "Running" "${pod_phase}"
 done
 
-# Test: primary identification
-is_primary=$(pg_exec "${NAMESPACE}" "${POD_0}" "SELECT NOT pg_is_in_recovery()" "testuser" "testdb")
-assert_eq "pod-0 is primary" "t" "${is_primary}"
+# Test: exactly one primary, and the other two are replicas.
+#
+# DISCOVERED, not assumed to be pod-0 (#290 review). Agent mode renders
+# podManagementPolicy: Parallel and the initial primary is whoever wins the lease race, so
+# asserting pod-0 flaked whenever pod-1 or pod-2 won. Everything below writes through
+# ${PRIMARY} for the same reason -- a write to a standby fails read-only.
+PRIMARY=$(discover_primary "${NAMESPACE}" "${FULLNAME}" 3 testuser testdb)
+# NOT assert_not_eq with a literal "": that helper fails when EITHER operand is empty (#279,
+# so a vacuous uniqueness check cannot pass silently), which made this fail on every run.
+if [ -z "${PRIMARY}" ]; then
+  fail "a primary is discoverable" "discover_primary returned nothing"
+  end_suite
+  print_summary
+  exit 1
+fi
+pass "a primary is discoverable (${PRIMARY})"
 
-for pod in "${POD_1}" "${POD_2}"; do
+replicas=0
+for pod in "${POD_0}" "${POD_1}" "${POD_2}"; do
+  [ "${pod}" = "${PRIMARY}" ] && continue
   is_replica=$(pg_exec "${NAMESPACE}" "${pod}" "SELECT pg_is_in_recovery()" "testuser" "testdb")
   assert_eq "${pod} is replica" "t" "${is_replica}"
+  [ "${is_replica}" = "t" ] && replicas=$((replicas + 1))
 done
+assert_eq "exactly two replicas alongside the primary" "2" "${replicas}"
 
 # Test: replication across all nodes
 REPL_VALUE="full-replicated-$(date +%s)"
-pg_exec "${NAMESPACE}" "${POD_0}" "CREATE TABLE IF NOT EXISTS full_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
-pg_exec "${NAMESPACE}" "${POD_0}" "INSERT INTO full_test (value) VALUES ('${REPL_VALUE}')" "testuser" "testdb"
+pg_exec "${NAMESPACE}" "${PRIMARY}" "CREATE TABLE IF NOT EXISTS full_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
+pg_exec "${NAMESPACE}" "${PRIMARY}" "INSERT INTO full_test (value) VALUES ('${REPL_VALUE}')" "testuser" "testdb"
 
 sleep 3
 
-for pod in "${POD_1}" "${POD_2}"; do
+for pod in "${POD_0}" "${POD_1}" "${POD_2}"; do
+  [ "${pod}" = "${PRIMARY}" ] && continue
   val=$(pg_exec "${NAMESPACE}" "${pod}" "SELECT value FROM full_test WHERE value='${REPL_VALUE}'" "testuser" "testdb")
   assert_eq "data replicated to ${pod}" "${REPL_VALUE}" "${val}"
 done
 
-# Test: repmgr sees all 3 nodes (retry -- node registration may lag pod readiness)
-node_count="0"
+# Test: the primary sees both standbys streaming (retry -- attachment lags pod readiness).
+#
+# This read repmgr.nodes until #290. That table can no longer exist: #288 stopped creating the
+# extension under native, #294 made native the only mechanism, and #290 removed the package
+# from the image entirely -- so the assertion was heading for a guaranteed failure the moment
+# the chart's image tag was bumped. pg_stat_replication is the equivalent and a stronger one:
+# a repmgr.nodes row proved only that a node had registered, whereas this proves it is actually
+# replicating.
+streaming="0"
 for i in $(seq 1 12); do
-  node_count=$(pg_exec "${NAMESPACE}" "${POD_0}" "SELECT count(*) FROM repmgr.nodes" "repmgr" "repmgr")
-  if [[ "${node_count}" == "3" ]]; then
+  streaming=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" "repmgr" "repmgr" 2>/dev/null | xargs || echo "0")
+  if [[ "${streaming}" == "2" ]]; then
     break
   fi
   sleep 5
 done
-assert_eq "repmgr sees 3 nodes" "3" "${node_count}"
+assert_eq "the primary sees both standbys streaming" "2" "${streaming}"
 
 # --- PGPool tests ---
 echo ""
@@ -82,15 +107,15 @@ PG_PASSWORD=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.
 
 # Test: connect through pgpool
 pgpool_svc="${FULLNAME}-pgpool.${NAMESPACE}.svc.cluster.local"
-pgpool_result=$(kubectl exec -n "${NAMESPACE}" "${POD_0}" -c postgresql -- \
+pgpool_result=$(kubectl exec -n "${NAMESPACE}" "${PRIMARY}" -c postgresql -- \
   bash -c "PGPASSWORD='${PG_PASSWORD}' psql -h '${pgpool_svc}' -p 9999 -U testuser -d testdb -t -A -c 'SELECT 1'" 2>/dev/null)
 assert_eq "can query through pgpool" "1" "${pgpool_result}"
 
 # Test: write through pgpool reaches primary
 PGPOOL_VALUE="via-pgpool-$(date +%s)"
-kubectl exec -n "${NAMESPACE}" "${POD_0}" -c postgresql -- \
+kubectl exec -n "${NAMESPACE}" "${PRIMARY}" -c postgresql -- \
   bash -c "PGPASSWORD='${PG_PASSWORD}' psql -h '${pgpool_svc}' -p 9999 -U testuser -d testdb -c \"INSERT INTO full_test (value) VALUES ('${PGPOOL_VALUE}')\"" 2>/dev/null
-pgpool_write_val=$(pg_exec "${NAMESPACE}" "${POD_0}" "SELECT value FROM full_test WHERE value='${PGPOOL_VALUE}'" "testuser" "testdb")
+pgpool_write_val=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT value FROM full_test WHERE value='${PGPOOL_VALUE}'" "testuser" "testdb")
 assert_eq "write through pgpool persisted on primary" "${PGPOOL_VALUE}" "${pgpool_write_val}"
 
 # Test: pgpool metrics sidecar

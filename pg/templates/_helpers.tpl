@@ -440,7 +440,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        name is rendered as `pgchart-<name>-keyring.gpg` / `pgchart-<name>.list`, not the
        bare name, so it can never collide with a source the image itself already owns
        (the repmgr image's own PGDG source is postgresql-keyring.gpg/postgresql.list,
-       images/repmgr/Dockerfile) -- duplicate *entries* within aptSources itself still
+       images/pg-ha/Dockerfile) -- duplicate *entries* within aptSources itself still
        fail, since that's always a typo, never intentional. Pointless (and therefore
        rejected) without postgresql.extensions.packages: aptSources' only consumer is
        the apt-get install step gated on packages being non-empty -- see

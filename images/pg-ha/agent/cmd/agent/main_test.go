@@ -928,15 +928,16 @@ func TestOrphanSlotReclaimsOnlyDepartedOrdinalsAndSelf(t *testing.T) {
 		{"highest live peer", "pg_ha_slot_2", live3, false, "pod-2 exists"},
 		// The primary does not stream from itself, so its own slot is unused.
 		{"own slot while primary", "pg_ha_slot_0", live3, true, "self ordinal"},
-		// Legacy repmgr slots are reclaimable regardless of liveness: native never streams
-		// through one, so every one is dead weight the moment the cluster is on this
-		// mechanism. Scoping them to departed ordinals left a repmgr->native migration
-		// (#292) with a permanent orphan per surviving node -- the exact case it cleans up.
-		// The atomic `AND NOT active` in the drop, not the pod set, is what protects a slot
-		// still carrying a stream mid-migration.
+		// Legacy repmgr slots: reclaimable when the pod is DEPARTED or the ordinal has MIGRATED
+		// (its new-scheme slot is active, proving the standby moved). An earlier round made them
+		// unconditional, reasoning that scoping to departed ordinals leaves a permanent orphan
+		// per surviving node -- true, and answered by the migrated signal rather than by
+		// reverting. `AND NOT active` alone is NOT sufficient protection: mid-restart the old
+		// slot is inactive and the new one may not exist yet, so dropping it there costs the
+		// re-clone #292 exists to avoid.
 		{"legacy slot, departed ordinal", "repmgr_slot_1003", live3, true, "no pod-3 exists"},
-		{"legacy slot, LIVE ordinal", "repmgr_slot_1001", live3, true, "native never streams through it; NOT active guards a live stream"},
-		{"legacy slot for self", "repmgr_slot_1000", live3, true, "native never streams through it"},
+		{"legacy slot, live ordinal, not yet migrated", "repmgr_slot_1001", live3, false, "pod-1 may still be mid-restart; dropping now risks a WAL gap"},
+		{"legacy slot for self", "repmgr_slot_1000", live3, true, "nobody streams from a node to itself"},
 		// Anything the agent did not mint is left strictly alone.
 		{"operator's own slot", "my_own_slot", live3, false, "not agent-minted"},
 		{"logical-looking slot", "debezium_cdc", live3, false, "not agent-minted"},
@@ -947,10 +948,10 @@ func TestOrphanSlotReclaimsOnlyDepartedOrdinalsAndSelf(t *testing.T) {
 		// standby's slot as orphaned because the API read came back empty.
 		{"empty pod list, peer slot", "pg_ha_slot_1", map[int]bool{}, false, "no authoritative pod set"},
 		{"empty pod list, ghost slot", "pg_ha_slot_9", map[int]bool{}, false, "no authoritative pod set"},
-		{"empty pod list, legacy slot", "repmgr_slot_1009", map[int]bool{}, true, "legacy slots do not depend on the pod set"},
+		{"empty pod list, legacy slot", "repmgr_slot_1009", map[int]bool{}, false, "no authoritative pod set and no migration proof"},
 		{"empty pod list, own slot", "pg_ha_slot_0", map[int]bool{}, true, "self is unused regardless of the pod set"},
 	} {
-		if got := orphanSlot(tc.slot, self, tc.live); got != tc.want {
+		if got := orphanSlot(tc.slot, self, tc.live, nil); got != tc.want {
 			t.Errorf("%s: orphanSlot(%q, %q, %v) = %v, want %v (%s)",
 				tc.name, tc.slot, self, tc.live, got, tc.want, tc.why)
 		}
@@ -966,7 +967,7 @@ func TestOrphanSlotReclaimsOnlyDepartedOrdinalsAndSelf(t *testing.T) {
 func TestOrphanSlotSurvivesAScaleUpWithAStalePrimaryNodeCount(t *testing.T) {
 	// Scaled 2 -> 3: pod-2 now exists, but the primary still believes NodeCount == 2.
 	live := map[int]bool{0: true, 1: true, 2: true}
-	if orphanSlot("pg_ha_slot_2", "pg-0", live) {
+	if orphanSlot("pg_ha_slot_2", "pg-0", live, nil) {
 		t.Error("pg_ha_slot_2 reclaimed during a scale-up: a live standby's slot must never be dropped, even when the primary's NodeCount is stale")
 	}
 }
@@ -975,10 +976,10 @@ func TestOrphanSlotSurvivesAScaleUpWithAStalePrimaryNodeCount(t *testing.T) {
 // follows whoever currently holds the lease, so the set shifts on failover.
 func TestOrphanSlotSelfSlotFollowsTheCurrentPrimary(t *testing.T) {
 	live := map[int]bool{0: true, 1: true, 2: true}
-	if !orphanSlot("pg_ha_slot_1", "pg-1", live) {
+	if !orphanSlot("pg_ha_slot_1", "pg-1", live, nil) {
 		t.Error("pg-1 as primary should reclaim its own slot pg_ha_slot_1")
 	}
-	if orphanSlot("pg_ha_slot_0", "pg-1", live) {
+	if orphanSlot("pg_ha_slot_0", "pg-1", live, nil) {
 		t.Error("pg-1 as primary must NOT reclaim pg-0's slot -- pg-0 is a live standby streaming through it")
 	}
 }
@@ -2475,23 +2476,23 @@ func TestStandbyReclaimIsCascadeAware(t *testing.T) {
 	live := map[int]bool{1: true, 2: true}
 
 	a.cfg.CascadeReplication = false
-	if !a.reclaimableOnStandby("pg_ha_slot_1", nil) {
+	if !a.reclaimableOnStandby("pg_ha_slot_1", nil, nil, false) {
 		t.Error("without cascade a standby's agent-minted slot is a leftover")
 	}
 
 	a.cfg.CascadeReplication = true
-	if a.reclaimableOnStandby("pg_ha_slot_1", live) {
+	if a.reclaimableOnStandby("pg_ha_slot_1", live, nil, false) {
 		t.Error("with cascade on, a live child's slot must not be reclaimed")
 	}
-	if !a.reclaimableOnStandby("pg_ha_slot_7", live) {
+	if !a.reclaimableOnStandby("pg_ha_slot_7", live, nil, false) {
 		t.Error("with cascade on, a slot whose pod is gone is still reclaimable")
 	}
 	// This node's own slot is never used by anyone locally, on either setting.
-	if !a.reclaimableOnStandby("pg_ha_slot_0", live) {
+	if !a.reclaimableOnStandby("pg_ha_slot_0", live, nil, false) {
 		t.Error("self's own slot is always reclaimable locally")
 	}
 	// An operator's slot stays out of reach regardless.
-	if a.reclaimableOnStandby("operator_slot", live) {
+	if a.reclaimableOnStandby("operator_slot", live, nil, false) {
 		t.Error("an operator's slot must never be reclaimable")
 	}
 }
@@ -2617,41 +2618,66 @@ func TestAssertSyncStandbySlotsLeavesTheGUCAloneOnAnUntrustworthyInput(t *testin
 	}
 }
 
-func TestAssertNoForeignRecoveryConfig(t *testing.T) {
-	// #294 review: a 1.x data directory carries repmgr's primary_conninfo and
-	// primary_slot_name in postgresql.auto.conf, which outranks the agent's fragment. The chart
-	// cannot detect it (1.x had no mechanism key at all), so this refusal is the only thing
-	// between that upgrade and a standby that silently never streams.
+func TestMigrateForeignRecoveryConfig(t *testing.T) {
+	// #292: a 1.x volume carries repmgr's primary_conninfo and primary_slot_name in
+	// postgresql.auto.conf, which PostgreSQL reads after every include and which therefore
+	// outranks the agent's fragment. #294 could only refuse to start on it; this migrates it.
 	dir := t.TempDir()
 	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "repmgr.so"))
 
-	// No auto.conf: a fresh install must boot.
-	if err := a.assertNoForeignRecoveryConfig(); err != nil {
-		t.Fatalf("a fresh install must not be refused: %v", err)
+	// A fresh install has no auto.conf at all.
+	if err := a.migrateForeignRecoveryConfig(); err != nil {
+		t.Fatalf("a fresh install must not be touched: %v", err)
 	}
 
-	// Only the agent's own ALTER SYSTEM: still fine.
+	// Only the agent's own ALTER SYSTEM (#308): nothing to migrate, nothing lost.
 	auto := filepath.Join(dir, "postgresql.auto.conf")
-	if err := os.WriteFile(auto, []byte("synchronized_standby_slots = 'pg_ha_slot_1'\n"), 0o600); err != nil {
+	own := "synchronized_standby_slots = 'pg_ha_slot_1'\n"
+	if err := os.WriteFile(auto, []byte(own), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.assertNoForeignRecoveryConfig(); err != nil {
-		t.Fatalf("the agent's own ALTER SYSTEM must not be refused: %v", err)
+	if err := a.migrateForeignRecoveryConfig(); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustRead(t, auto); got != own {
+		t.Errorf("the agent's own ALTER SYSTEM was disturbed: %q", got)
 	}
 
-	// repmgr-shaped: refused, with a message naming the migration rather than the symptom.
-	if err := os.WriteFile(auto, []byte("primary_conninfo = 'host=pg-0'\nprimary_slot_name = 'repmgr_slot_1001'\n"), 0o600); err != nil {
+	// The real case: repmgr-shaped. Both settings go; the agent's own survives.
+	if err := os.WriteFile(auto, []byte(own+
+		"primary_conninfo = 'host=''pg-0.h'' user=repmgr'\n"+
+		"primary_slot_name = 'repmgr_slot_1001'\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := a.assertNoForeignRecoveryConfig()
-	if err == nil {
-		t.Fatal("a repmgr-shaped auto.conf must be refused")
+	if err := a.migrateForeignRecoveryConfig(); err != nil {
+		t.Fatalf("the migration must succeed on a repmgr-shaped volume: %v", err)
 	}
-	for _, want := range []string{"primary_conninfo", "primary_slot_name", "#292", "FRESH installs", "ALTER SYSTEM RESET"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("message does not mention %q: %v", want, err)
+	got := mustRead(t, auto)
+	for _, gone := range []string{"primary_conninfo", "primary_slot_name"} {
+		if strings.Contains(got, gone) {
+			t.Errorf("%s survived the migration:\n%s", gone, got)
 		}
 	}
+	if !strings.Contains(got, "synchronized_standby_slots") {
+		t.Errorf("the agent's own ALTER SYSTEM was lost:\n%s", got)
+	}
+
+	// Idempotent: booting again finds nothing to do.
+	if err := a.migrateForeignRecoveryConfig(); err != nil {
+		t.Fatalf("second boot: %v", err)
+	}
+	if after := mustRead(t, auto); after != got {
+		t.Error("a second boot rewrote the file")
+	}
+}
+
+func mustRead(t *testing.T, p string) string {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 func TestPausedAgentKeepsTheSlotGauges(t *testing.T) {
@@ -2678,5 +2704,105 @@ func TestPausedAgentKeepsTheSlotGauges(t *testing.T) {
 	after := scrapeMetrics(t, a)
 	if !strings.Contains(after, "pg_ha_agent_replication_slots 1") {
 		t.Errorf("a pause retracted the slot gauges:\n%s", after)
+	}
+}
+
+func TestLegacySlotReclaimWaitsForMigrationProof(t *testing.T) {
+	// #292: the migration window is the dangerous moment. A live standby's legacy slot must
+	// survive until its new-scheme slot is ACTIVE -- proof it moved -- because in between the
+	// old slot is inactive and the new one may not exist, and dropping there lets the primary
+	// recycle WAL the standby still needs.
+	live := map[int]bool{0: true, 1: true}
+
+	// Mid-restart: nothing proves pod-1 moved yet.
+	if orphanSlot("repmgr_slot_1001", "pg-0", live, map[int]bool{}) {
+		t.Error("a live standby's legacy slot must not be reclaimed before it has migrated")
+	}
+	// The new slot exists but is not yet carrying a stream (reconcileSlots pre-creates it), so
+	// presence alone is not proof.
+	notYet := migratedOrdinals([]pg.SlotState{{Name: "pg_ha_slot_1", Active: false, Reserving: true}})
+	if orphanSlot("repmgr_slot_1001", "pg-0", live, notYet) {
+		t.Error("a pre-created but inactive new slot is not proof of migration")
+	}
+	// Streaming through the new slot: the legacy one is provably finished with.
+	moved := migratedOrdinals([]pg.SlotState{{Name: "pg_ha_slot_1", Active: true, Reserving: true}})
+	if !orphanSlot("repmgr_slot_1001", "pg-0", live, moved) {
+		t.Error("once the new slot is active the legacy one must be reclaimed")
+	}
+	// A departed pod needs no proof at all.
+	if !orphanSlot("repmgr_slot_1009", "pg-0", live, map[int]bool{}) {
+		t.Error("a legacy slot whose pod is gone must be reclaimed")
+	}
+	// And the primary's own legacy slot is always dead weight -- nobody streams from a node to
+	// itself, so it can never earn migration proof and must not wait for any.
+	if !orphanSlot("repmgr_slot_1000", "pg-0", live, map[int]bool{}) {
+		t.Error("self's own legacy slot must be reclaimable without migration proof")
+	}
+}
+
+func TestMigratedOrdinalsIgnoresLegacyAndForeignSlots(t *testing.T) {
+	m := migratedOrdinals([]pg.SlotState{
+		{Name: "pg_ha_slot_1", Active: true},
+		{Name: "repmgr_slot_1002", Active: true}, // legacy: never evidence of migration
+		{Name: "my_own_slot", Active: true},      // an operator's: not ours to read
+		{Name: "pg_ha_slot_abc", Active: true},   // unparseable ordinal
+	})
+	if len(m) != 1 || !m[1] {
+		t.Errorf("migratedOrdinals = %v, want only ordinal 1", m)
+	}
+}
+
+func TestDemotedPrimaryReclaimsLegacySlotsUnderCascade(t *testing.T) {
+	// #290 review: routing legacy slots through orphanSlot's migration gate pinned them forever
+	// on a demoted ex-primary with cascade on. The gate asks whether the ordinal's new-scheme
+	// slot is active HERE; the child has moved to the new primary, so it never is. The
+	// discriminator is isUpstream=false -- nothing streams from this node, so a legacy slot on it
+	// cannot be in use. (Round 2 corrected the overcorrection: declaring ALL legacy slots residue
+	// broke the cascade-upstream case, which TestCascadeUpstreamKeepsAGrandchildsLegacySlot
+	// pins.)
+	a := &agent{cfg: &config.Config{PodName: "pg-0", CascadeReplication: true}}
+	live := map[int]bool{0: true, 1: true}
+	if !a.reclaimableOnStandby("repmgr_slot_1001", live, map[int]bool{}, false) {
+		t.Error("a demoted primary must reclaim its leftover legacy slots even with cascade on")
+	}
+	// Cascade off behaves the same -- the point is that the two settings agree here.
+	a.cfg.CascadeReplication = false
+	if !a.reclaimableOnStandby("repmgr_slot_1001", live, map[int]bool{}, false) {
+		t.Error("legacy slots are leftovers on a standby regardless of cascade")
+	}
+	// The agent-minted path keeps its cascade-aware protection: a live child's slot survives.
+	a.cfg.CascadeReplication = true
+	if a.reclaimableOnStandby("pg_ha_slot_1", live, map[int]bool{}, false) {
+		t.Error("a live cascade child's own slot must still be protected on its upstream")
+	}
+}
+
+func TestCascadeUpstreamKeepsAGrandchildsLegacySlot(t *testing.T) {
+	// #290 review, round 2: with cascade on, a legacy slot on a standby has two possible owners
+	// and they must not be conflated.
+	a := &agent{cfg: &config.Config{PodName: "pg-1", CascadeReplication: true}}
+	live := map[int]bool{0: true, 1: true, 2: true}
+
+	// A cascade UPSTREAM: something streams from here, so a grandchild's repmgr_slot_<id> may be
+	// the slot it is actually using mid-migration. Dropping it forces the re-clone the migration
+	// exists to avoid.
+	if a.reclaimableOnStandby("repmgr_slot_1002", live, map[int]bool{}, true) {
+		t.Error("a cascade upstream must keep a live, unmigrated grandchild's legacy slot")
+	}
+	// Once that grandchild is provably streaming through its NEW slot, the legacy one goes.
+	moved := migratedOrdinals([]pg.SlotState{{Name: "pg_ha_slot_2", Active: true}})
+	if !a.reclaimableOnStandby("repmgr_slot_1002", live, moved, true) {
+		t.Error("a migrated grandchild's legacy slot must be reclaimed")
+	}
+	// A DEMOTED ex-primary: nothing streams from here, so every legacy slot is residue --
+	// otherwise it sits inactive pinning WAL on this volume forever.
+	if !a.reclaimableOnStandby("repmgr_slot_1002", live, map[int]bool{}, false) {
+		t.Error("a demoted ex-primary must reclaim its leftover legacy slots")
+	}
+	// And a departed pod needs no reasoning at all, either way.
+	for _, up := range []bool{true, false} {
+		if !a.reclaimableOnStandby("repmgr_slot_1009", live, map[int]bool{}, up) {
+			t.Errorf("isUpstream=%v: a legacy slot whose pod is gone must be reclaimed", up)
+		}
 	}
 }
