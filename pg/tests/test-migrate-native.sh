@@ -36,6 +36,9 @@ FULLNAME=$(resolve_fullname "${RELEASE}" "${CHART_DIR}" "${VALUES}")
 LEASE="${FULLNAME}-leader"
 NODES=3
 PGDATA_DIR="/var/lib/postgresql/data/pgdata"
+# pg_controldata is NOT on PATH in the container -- the image keeps the server binaries in the
+# versioned bindir, which is why the agent has a PGBindir() helper at all. Call it by full path.
+PG_BINDIR_FMT="/usr/lib/postgresql/%s/bin"
 SENTINEL="${PGDATA_DIR}/.migrate-native-sentinel"
 
 # The released chart to migrate FROM. Pinned rather than "latest" so the suite tests a known
@@ -59,6 +62,8 @@ PG_MAJOR=$(awk '/^(repmgr|ha):/{r=1} r&&/^    majorVersion:/{gsub(/"/,"",$2); pr
 # append would produce trixie-5.5.0-32-pg18-pg18. Strip then append, so both a clean checkout
 # and a switched tree land on the same tag.
 FROM_IMAGE_TAG="${FROM_IMAGE_BASE%-pg[0-9]*}-pg${PG_MAJOR}"
+PG_BINDIR=$(printf "${PG_BINDIR_FMT}" "${PG_MAJOR}")
+CONTROLDATA="${PG_BINDIR}/pg_controldata"
 
 begin_suite "Migration: live repmgr cluster -> native, in place, no re-clone (#292)"
 
@@ -119,14 +124,14 @@ pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" \
   "INSERT INTO migrate_native (value) VALUES ('${MV}')" "testuser" "testdb" >/dev/null
 pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" "CHECKPOINT" "postgres" "postgres" >/dev/null 2>&1 || true
 
-declare -A SYSID_BEFORE TLI_BEFORE
+declare -A SYSID_BEFORE TLI_BEFORE TLI_AFTER
 for i in $(seq 0 $((NODES - 1))); do
   pod="${FULLNAME}-${i}"
   # The sentinel is the direct evidence: pg_basebackup empties the target directory, so if this
   # file is still here afterwards the standby was not re-cloned. No log scraping, no timing.
   kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- \
     sh -c "printf '%s\n' '${MV}' > '${SENTINEL}'"
-  ctl=$(kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- pg_controldata "${PGDATA_DIR}")
+  ctl=$(kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- "${CONTROLDATA}" "${PGDATA_DIR}")
   SYSID_BEFORE[$i]=$(printf '%s\n' "${ctl}" | awk -F: '/Database system identifier/{gsub(/ /,"",$2); print $2}')
   TLI_BEFORE[$i]=$(printf '%s\n' "${ctl}" | awk -F: '/Latest checkpoint.s TimeLineID/{gsub(/ /,"",$2); print $2}')
   [ -n "${SYSID_BEFORE[$i]}" ] || { echo "FATAL: no system identifier for ${pod}" >&2; exit 1; }
@@ -183,11 +188,24 @@ for i in $(seq 0 $((NODES - 1))); do
     cat "${SENTINEL}" 2>/dev/null | tr -d '[:space:]' || echo "")
   assert_eq "post ${pod}: PGDATA sentinel survived (no re-clone)" "${MV}" "${sent}"
 
-  ctl=$(kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- pg_controldata "${PGDATA_DIR}")
+  ctl=$(kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- "${CONTROLDATA}" "${PGDATA_DIR}")
   sysid=$(printf '%s\n' "${ctl}" | awk -F: '/Database system identifier/{gsub(/ /,"",$2); print $2}')
   tli=$(printf '%s\n' "${ctl}" | awk -F: '/Latest checkpoint.s TimeLineID/{gsub(/ /,"",$2); print $2}')
   assert_eq "post ${pod}: system identifier unchanged (no re-initdb)" "${SYSID_BEFORE[$i]}" "${sysid}"
-  assert_eq "post ${pod}: timeline unchanged (no promote/rewind)" "${TLI_BEFORE[$i]}" "${tli}"
+  # NOT "timeline unchanged". That was this suite's first assertion and it was simply wrong:
+  # a rolling upgrade replaces the PRIMARY's pod too, so the lease has to move and whoever
+  # takes it promotes, which bumps the timeline by definition. Observed on the first live run:
+  # TLI 1 -> 3 across the roll (two handoffs, since the pod that first took the lease was
+  # itself still pending an update), with all three nodes ending consistent.
+  #
+  # What the issue actually needs from the timeline is that nobody was REWOUND or re-cloned to
+  # get there, and that no node is stranded on an older one. The system identifier above covers
+  # re-initdb, the sentinel covers re-clone, the .diverged check covers pg_rewind -- and the
+  # cross-node consistency check after this loop covers stranding, which is the failure a
+  # per-node "unchanged" test cannot see anyway.
+  TLI_AFTER[$i]="${tli}"
+  assert_eq "post ${pod}: timeline did not go backwards" "yes" \
+    "$([ "${tli}" -ge "${TLI_BEFORE[$i]}" ] && echo yes || echo no)"
 
   # pg_rewind and a failed clone both leave these behind.
   # native.go names it "<datadir>.diverged.<ts>" -- a SIBLING of PGDATA, not a dotfile inside
@@ -196,6 +214,34 @@ for i in $(seq 0 $((NODES - 1))); do
   diverged=$(kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- \
     sh -c "ls -d ${PGDATA_DIR}.diverged.* 2>/dev/null | wc -l" | tr -d '[:space:]')
   assert_eq "post ${pod}: no .diverged.* directory" "0" "${diverged}"
+done
+
+# Nobody stranded on an older timeline -- the failure a per-node "unchanged" check cannot see,
+# because a standby that cannot follow the new timeline is one that will eventually need the
+# re-clone this whole migration exists to avoid.
+#
+# Measured with pg_stat_wal_receiver.received_tli, NOT pg_controldata. This suite first compared
+# pg_controldata across nodes and failed with "got: 1 2" on a perfectly healthy cluster:
+# "Latest checkpoint's TimeLineID" is as of the last CHECKPOINT, so a standby that has switched
+# timelines but not yet checkpointed still reports the old one. Live proof from that run --
+# pod-2 read checkpoint_tli=2 while received_tli=4 and the primary listed it as streaming. The
+# receiver's view is the authoritative "what timeline am I actually following".
+primary_tli=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT timeline_id FROM pg_control_checkpoint()" | tr -d '[:space:]')
+assert_eq "post: the primary's timeline is resolvable" "yes" \
+  "$([ -n "${primary_tli}" ] && echo yes || echo no)"
+for i in $(seq 0 $((NODES - 1))); do
+  pod="${FULLNAME}-${i}"
+  [ "${pod}" = "${PRIMARY}" ] && continue
+  # The receiver row appears only once streaming is established, which the assertion below
+  # waits for; retry briefly so this does not race it.
+  rtli=""; waited=0
+  while [ ${waited} -lt 120 ]; do
+    rtli=$(pg_exec "${NAMESPACE}" "${pod}" "SELECT received_tli FROM pg_stat_wal_receiver" | tr -d '[:space:]')
+    [ -n "${rtli}" ] && break
+    sleep 5; waited=$((waited + 5))
+  done
+  assert_eq "post ${pod}: follows the primary's timeline (${primary_tli}), not stranded" \
+    "${primary_tli}" "${rtli}"
 done
 
 # #293: the preload line must be gone from PGDATA, on every node -- not merely absent from the
@@ -267,7 +313,7 @@ PRIMARY2=$(discover_primary "${NAMESPACE}" "${FULLNAME}" "${NODES}")
 [ -n "${PRIMARY2}" ] || { echo "FATAL: no primary after the second roll" >&2; exit 1; }
 for i in $(seq 0 $((NODES - 1))); do
   pod="${FULLNAME}-${i}"
-  ctl=$(kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- pg_controldata "${PGDATA_DIR}")
+  ctl=$(kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- "${CONTROLDATA}" "${PGDATA_DIR}")
   sysid=$(printf '%s\n' "${ctl}" | awk -F: '/Database system identifier/{gsub(/ /,"",$2); print $2}')
   assert_eq "re-roll ${pod}: system identifier still unchanged" "${SYSID_BEFORE[$i]}" "${sysid}"
   sent=$(kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- \

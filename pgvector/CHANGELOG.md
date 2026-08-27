@@ -24,6 +24,25 @@
   the preload strip), and the opt-in `DROP EXTENSION` snippet with an explicit warning against
   dropping the role or database, both of which the agent still depends on.
 
+  Verified on a real cluster: 44/44, released 1.17.0 on trixie-5.5.0-32-pg18 (which still
+  contains repmgr) upgraded in place to the local chart on the repmgr-free image.
+
+  Three things the live runs corrected, all in the suite rather than the chart:
+  `pg_controldata` is not on `PATH` in the image (the server binaries live in the versioned
+  bindir, which is why the agent has a `PGBindir()` helper), and "timeline unchanged" was the
+  wrong assertion -- a rolling upgrade replaces the primary's pod, so the lease must move and
+  whoever takes it promotes. The observed roll went TLI 1 -> 3, two handoffs, with all three
+  nodes ending consistent. What the suite asserts now is that no node went BACKWARDS and that
+  no node is stranded on an older timeline -- the failure that matters, since a standby that
+  cannot follow eventually needs the very re-clone this avoids. No-rewind and no-re-clone stay
+  covered by the system identifier, the sentinel and the `.diverged` check.
+
+  Third: that stranding check must read `pg_stat_wal_receiver.received_tli`, not
+  `pg_controldata`. "Latest checkpoint's TimeLineID" is as of the last CHECKPOINT, so a standby
+  that has switched timelines but not yet checkpointed still reports the old one -- the check
+  failed with "got: 1 2" on a healthy cluster where the lagging node read checkpoint_tli=2 while
+  received_tli=4 and the primary listed it as streaming.
+
   New KinD suite `test-migrate-native` (`make -C pg test-migrate-native`, and a matrix leg on
   both majors): installs the released 1.17.0 chart on an older released image that still contains
   repmgr, proves the starting state really is repmgr-shaped, then upgrades to the local chart and
