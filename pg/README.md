@@ -555,6 +555,14 @@ grants no pod-delete permission. For production, 3+ nodes still reduce partition
 
 All three are multi-arch (amd64/arm64), SBOM- and provenance-attested, and cosign-signed exactly like the unsuffixed tag.
 
+> **Changing with the next image release (#290).** The image no longer contains repmgr, so the
+> tag scheme stops being keyed on a repmgr version. The new image is `cagriekin/pg-ha`, published
+> as `trixie-pg18-<n>` and `trixie-pg17-<n>` — the major is **in** the tag, and there is no
+> unsuffixed "default major" alias, so a pin always names the major it wants and
+> `repmgr.image.majorVersion` cross-checks it. The table above describes the image this chart
+> pins **today**; `cagriekin/repmgr` stays published and frozen at its last tag, so existing
+> digest pins keep resolving. The chart moves in a separate step, after the new image exists.
+
 Three values move **together**; the chart refuses to render if the two majors disagree (in either direction), because a mismatch would silently run one major while building extension paths for another:
 
 ```yaml
