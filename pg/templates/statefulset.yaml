@@ -640,20 +640,6 @@ spec:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
 {{- with (include "pg.pgMajorEnv" .) }}{{ . | nindent 12 }}{{- end }}
-            {{- /* #288: the init container needs MECHANISM too, not just the postgresql
-                   container. init-repmgr.sh's original job -- write repmgr.conf, wait for a
-                   primary to appear in repmgr.nodes, clone with `repmgr standby clone` -- was
-                   repmgr-specific, and the middle step is what made native unusable with
-                   replicas: nothing ever registers under native, so the poll timed out and
-                   every standby sat in Init:CrashLoopBackOff forever. It exits early on native
-                   and lets the agent clone (BootstrapClone -> pg_basebackup), but only if the
-                   value reaches it.
-                   Emitted UNCONDITIONALLY since #294. It used to be omitted at the default,
-                   which was repmgr and is what an env-less agent assumes; the default is now
-                   native, so relying on the absent-value default would silently run the OLD
-                   mechanism on any image built before #294 -- exactly the two-step
-                   image-then-chart release this repo does. Being explicit costs one env var
-                   and removes that trap. */}}
             {{- /* The reduced `init` mode reads NOTHING but PG_MAJOR (#290). It used to write
                    repmgr.conf, poll repmgr.nodes and clone, which needed the credentials, the
                    headless service and the node count; now it stats a binary and exits. Every
@@ -1245,8 +1231,6 @@ spec:
               readOnly: true
             - name: pg-run
               mountPath: /var/run/postgresql
-{{- end }}
-{{- if .Values.repmgr.enabled }}
 {{- end }}
 {{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.repmgr.agent.dcs.etcd).tls).secretName) }}
             - name: etcd-tls

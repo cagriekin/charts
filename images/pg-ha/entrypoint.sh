@@ -32,22 +32,30 @@ source /usr/local/bin/pg-common.sh
 # `entrypoint.sh initdb` from the BootstrapInitdb action. Non-holders wait, then clone with
 # pg_basebackup once the holder is open (reconcile.Decide already encodes exactly this).
 bootstrap_initdb() {
-    # Required credentials are validated FIRST, before initdb touches the volume (#290 review).
-    # They used to be resolved after the transient postmaster started, so `docker run <img>
-    # postgres` with neither set ran initdb, appended the GUCs, started a postmaster and only
-    # THEN died on the unset-parameter check -- leaving PG_VERSION present, no completion
-    # sentinel, and a postmaster killed uncleanly with the container. The next run then no-op'd
-    # the bootstrap and served a cluster with no application roles and no passwords. Failing
-    # before the first write means a missing variable costs nothing but the error message.
-    : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required to bootstrap a new cluster}"
-    : "${REPMGR_PASSWORD:?REPMGR_PASSWORD is required to bootstrap a new cluster (the replication role)}"
-
     # The emptiness check lives INSIDE the function so BOTH callers are protected. It was
     # previously the caller's `if [ ! -s PG_VERSION ]`, and moving it out would have let a
     # boot initdb straight over an existing data directory.
     if [ -s "$PGDATA/PG_VERSION" ]; then
         return 0
     fi
+
+    # Credentials are validated here: AFTER the "already bootstrapped" return, and BEFORE the
+    # first write to the volume (#290 review, both rounds).
+    #
+    # They used to be resolved after the transient postmaster started, so `docker run <img>
+    # postgres` with neither set ran initdb, appended the GUCs, started a postmaster and only
+    # THEN died on the unset-parameter check -- leaving PG_VERSION present, no completion
+    # sentinel, and a postmaster killed uncleanly with the container; the next run then no-op'd
+    # the bootstrap and served a cluster with no application roles.
+    #
+    # Hoisting them above the emptiness check overcorrected: it made an ALREADY-BOOTSTRAPPED
+    # directory refuse to start without the passwords, breaking the upstream postgres image
+    # contract that a password is required only on first init -- `docker start` on an existing
+    # volume, or a compose file whose .env is absent on a later run, would die on a cluster that
+    # needs no bootstrap. Here, nothing has touched the volume yet and there IS a bootstrap to
+    # do, so the check is both safe and necessary.
+    : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required to bootstrap a new cluster}"
+    : "${REPMGR_PASSWORD:?REPMGR_PASSWORD is required to bootstrap a new cluster (the replication role)}"
     echo "Initializing PostgreSQL database..."
     initdb -D "$PGDATA" --auth-local=trust --auth-host=md5
 

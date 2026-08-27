@@ -148,8 +148,14 @@ jobs:
           # Getting this wrong is quiet, not loud: building the PG18 image under a "-pg17" name
           # while set-pg-major points the PG17 fixtures at that name makes every PG17 leg run
           # PostgreSQL 18 and pass.
+          # ONE pattern, shared verbatim with pg/tests/set-pg-major.sh (#290 review). They had
+          # diverged -- CI matched only a `trixie` prefix while the script also accepted any
+          # other -- so a pin like `deb13-pg18-1` was classified legacy here and major-in-tag
+          # there, which is precisely the silent failure both comments warn about: CI builds the
+          # PG18 image as <tag>-pg17 while the script points the PG17 fixtures at that name, and
+          # every PG17 leg runs PostgreSQL 18 and passes.
           case "$tag" in
-            trixie-pg[0-9]*-[0-9]*) scheme=major-in-tag ;;
+            *pg[0-9]*-[0-9]*) scheme=major-in-tag ;;
             *) scheme=legacy
                base=${tag%-pg[0-9]*}
                if [ "$base" != "$tag" ]; then

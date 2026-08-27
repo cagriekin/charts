@@ -2814,6 +2814,7 @@ func (a *agent) standbySlotsTick(ctx context.Context) {
 		return
 	}
 	var live map[int]bool
+	isUpstream := false
 	if a.cfg.CascadeReplication {
 		var err error
 		live, err = a.livePodOrdinals(ctx)
@@ -2821,10 +2822,29 @@ func (a *agent) standbySlotsTick(ctx context.Context) {
 			a.log.Warn("list live pods for the standby slot reclaim; skipping it this tick (cascading replication makes this node a legitimate upstream)", "err", err)
 			return
 		}
+		// Is anything actually streaming FROM this node right now? That single fact separates the
+		// two cascade cases a legacy slot here can belong to (#290 review):
+		//
+		//   - A DEMOTED ex-primary: its former children have moved to the new primary, so nothing
+		//     streams from it. Its repmgr_slot_* are pure residue and must be reclaimed, or they
+		//     sit inactive pinning WAL on its volume forever.
+		//   - A cascade UPSTREAM mid-migration: a grandchild really does stream from here, and its
+		//     repmgr_slot_<id> is the slot it is using. Dropping that is the full re-clone the
+		//     migration gate exists to prevent.
+		//
+		// An unreadable topology is treated as "might be an upstream", which is the conservative
+		// direction: holding bounded WAL beats destroying a slot in use.
+		rows, err := a.prober.ReplicationTopology(ctx, a.selfConn())
+		if err != nil {
+			a.log.Warn("read this node's downstreams for the standby slot reclaim; assuming it is an upstream", "err", err)
+			isUpstream = true
+		} else {
+			isUpstream = len(rows) > 0
+		}
 	}
 	migrated := migratedOrdinals(slots)
 	for _, sl := range slots {
-		if !a.reclaimableOnStandby(sl.Name, live, migrated) {
+		if !a.reclaimableOnStandby(sl.Name, live, migrated, isUpstream) {
 			continue
 		}
 		dropped, err := a.prober.DropPhysicalSlotIfInactive(ctx, a.selfConn(), sl.Name)
@@ -2842,21 +2862,23 @@ func (a *agent) standbySlotsTick(ctx context.Context) {
 // reclaimableOnStandby applies the right reclaim predicate for this node's topology (#294).
 // live is nil when cascading is off, in which case the ordinal carries no information and
 // every agent-minted slot is a leftover.
-func (a *agent) reclaimableOnStandby(name string, live map[int]bool, migrated map[int]bool) bool {
-	// A LEGACY repmgr_slot_* found on a standby is always a leftover, on either setting
-	// (#290 review). repmgr is gone, so nothing can be streaming through one; on this node it can
-	// only be residue from a term as primary. Routing it through orphanSlot's migration gate was
-	// a regression: that gate asks "has this ordinal's new-scheme slot gone active HERE", and on
-	// a demoted ex-primary the child has moved to the NEW primary, so the answer is permanently
-	// no -- pinning WAL on the ex-primary's volume until max_slot_wal_keep_size invalidates it.
-	//
-	// The migration window the gate protects is on the PRIMARY, which is where a migrating
-	// standby's legacy slot actually lives (its upstream's volume). That path still has it.
-	if strings.HasPrefix(name, legacySlotPrefix) {
-		return leftoverStandbySlot(name)
-	}
+func (a *agent) reclaimableOnStandby(name string, live map[int]bool, migrated map[int]bool, isUpstream bool) bool {
+	// Without cascade this node cannot be anyone's upstream, so every agent-minted or legacy slot
+	// found locally is a leftover -- its own slot lives on its upstream, not here.
 	if !a.cfg.CascadeReplication {
 		return leftoverStandbySlot(name)
+	}
+	// With cascade on, a LEGACY repmgr_slot_* here has two possible owners, and `isUpstream`
+	// distinguishes them (#290 review, round 2). An earlier cut declared all of them residue,
+	// which was right for a demoted ex-primary and wrong for a cascade upstream: a grandchild
+	// mid-migration really is streaming through its repmgr_slot_<id> on this node, and dropping
+	// it forces the re-clone the whole migration exists to avoid.
+	if strings.HasPrefix(name, legacySlotPrefix) {
+		if !isUpstream {
+			return true // nothing streams from here: residue from a term as primary
+		}
+		// Something does stream from here, so fall through to the conservative per-ordinal rule
+		// below -- keep it while its pod is live and unmigrated.
 	}
 	return orphanSlot(name, a.cfg.PodName, live, migrated)
 }

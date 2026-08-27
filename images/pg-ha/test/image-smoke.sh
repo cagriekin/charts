@@ -18,10 +18,9 @@ WANT_MAJOR="${2:?usage: image-smoke.sh <image-ref> <expected-pg-major>}"
 # The repmgr version this used to derive from the tag is gone with the package (#290): there
 # is no repmgr to hold to a version.
 #
-# The TAG SCHEME itself has not changed yet -- pg-ha-image-publish.yaml still requires
-# trixie-<semver>-<n>, so a published tag still advertises a repmgr version the image no
-# longer contains. Retiring that (and the repo rename to cagriekin/pg-ha) is the remaining
-# half of #290; this file simply stopped asserting a version it cannot check.
+# The TAG SCHEME changed with it: pg-ha-image-publish.yaml now takes a git tag `pg-ha-<n>` and
+# publishes cagriekin/pg-ha:trixie-pg<major>-<n>, keyed on the PostgreSQL major -- the thing one
+# build actually bundles -- rather than on a repmgr version the image no longer contains.
 
 fail=0
 ok()  { echo "PASS: $1"; }

@@ -44,8 +44,10 @@ BASE_TAG=$(awk '/^repmgr:/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}'
 #
 #   NEW (#290):  trixie-pg<major>-<n>   -- the major is IN the tag; substitute it
 #   OLD:         trixie-<repmgr>-<n>    -- unsuffixed meant the default major; append -pgNN
+# Pattern shared verbatim with .github/workflows/pg-test.yaml -- they must agree, or a pin one
+# classifies as new-scheme and the other as legacy silently runs the wrong major (#290 review).
 case "$BASE_TAG" in
-  *-pg[0-9]*-[0-9]*|trixie-pg[0-9]*-[0-9]*)
+  *pg[0-9]*-[0-9]*)
     # New scheme: rewrite whichever major it names to the requested one.
     REPMGR_TAG=$(printf '%s' "$BASE_TAG" | sed -E "s/(^|-)pg[0-9]+-/\1pg${MAJOR}-/")
     ;;

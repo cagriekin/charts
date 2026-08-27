@@ -540,22 +540,24 @@ See the [pg chart README](../pg/README.md#audit-logging-pgaudit) for full detail
 
 ## Replication Management
 
-Repmgr manages replication automatically. To check cluster status:
+The agent manages replication automatically; there is no `repmgr` CLI to consult (#290). Who is
+primary comes from the Lease, and what is streaming comes from PostgreSQL:
 
 ```bash
-kubectl exec -it my-pgvector-0 -- repmgr -f /etc/repmgr/repmgr.conf cluster show
+kubectl get lease my-pgvector-leader -o jsonpath='{.spec.holderIdentity}'
+kubectl exec -it my-pgvector-0 -- psql -U repmgr -d repmgr \
+  -c "SELECT application_name, state, sync_state, replay_lag FROM pg_stat_replication"
 ```
 
 ### Scaling down
 
-Scaling `postgresql.replicaCount` **down** removes the highest-ordinal pods. The primary
-now **automatically unregisters** the removed nodes from `repmgr.nodes` (#139), so
-`repmgr cluster show` no longer lists them as failed and failover elections do not retry
-the gone DNS names. Reconciliation is keyed on the ordinal (node id = `ordinal + 1000`),
-never on reachability, so a momentarily-down live node is never unregistered; cleanup
-completes within ~a minute of the rolled pods settling. If the removed node was the
-*current primary*, unregister it by hand (`repmgr standby unregister` refuses primary
-rows). See the [pg chart README — Scaling down](../pg/README.md#scaling-down) for detail.
+Scaling `postgresql.replicaCount` **down** removes the highest-ordinal pods. There is no
+`repmgr.nodes` registry to strand rows in; what remains is a replication slot, and the primary
+reclaims the departed ordinal's once its pod is gone (#289) — keyed on the ordinal, never on
+reachability, so a momentarily-down live node is never affected.
+
+See the [pg chart README](../pg/README.md#replication-management) for the full queries and the
+metrics that cover the same ground.
 
 ## PGPool-II Connection Pooling and Load Balancing
 
@@ -1239,7 +1241,7 @@ Node IDs follow the StatefulSet ordinals: node 0 is `my-pgvector-0`, node 1 is `
 | Column | Meaning |
 |--------|---------|
 | `status` | `up`: attached, receives traffic. `waiting`: attached, no connection established yet. `down`: detached after `pgpool.healthCheck.maxRetries` consecutive health check failures; no traffic is routed to it. |
-| `role` | `primary` or `standby` as detected by the streaming replication check. If this disagrees with `repmgr cluster show`, restart PGPool-II. |
+| `role` | `primary` or `standby` as detected by the streaming replication check. If this disagrees with the Lease holder, restart PGPool-II. |
 | `replication_delay` | Standby lag in bytes. |
 | `select_cnt` | SELECT queries routed to the node; confirms load balancing is working. |
 

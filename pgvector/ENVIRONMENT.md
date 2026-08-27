@@ -27,8 +27,8 @@ Required/optional is from the consuming process's perspective at runtime. Secret
 | `REPMGR_DB` | string | yes | `repmgr.database` | entrypoint (creates the database), agent (`dbname` in `primary_conninfo`) |
 | `HEADLESS_SERVICE` | string | yes | `<fullname>-headless.<ns>.svc.cluster.local` | agent (peer FQDNs) |
 | `REPMGR_NODE_COUNT` | number | yes | `postgresql.replicaCount + 1` | agent (peer enumeration) |
-| `NAMESPACE` | string | yes | fieldRef `metadata.namespace` | guard, agent |
-| `PRIMARY_MARKER` | string | yes | `<fullname>-primary` | guard, agent (#125 highwater) |
+| `NAMESPACE` | string | yes | fieldRef `metadata.namespace` | agent |
+| `PRIMARY_MARKER` | string | yes | `<fullname>-primary` | agent (#125 highwater) |
 
 ## HA only (`repmgr.enabled=true`)
 
@@ -51,7 +51,7 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `POSTGRESQL_PGHBA` | newline-list | no | `postgresql.pgHba` (joined) | agent (user pg_hba rules, above the catch-alls) |
 | `CASCADE_REPLICATION` | boolean | no | `repmgr.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
 | `SYNC_REPLICATION_SLOTS` | boolean | no | `repmgr.agent.syncReplicationSlots` (`false`) | agent (logical failover slot sync, #308; emitted only when true) |
-| `USE_REPLICATION_SLOTS` | boolean | no | `"1"` (always; agent is the only failover path since 2.0.0) | repmgr-init (initial `standby clone`, #308; matches the agent's own regenerated `repmgr.conf`) |
+| ~~`USE_REPLICATION_SLOTS`~~ | — | — | **removed in 2.0.0 (#290)** | Nothing. It configured the init container's `repmgr standby clone`; the agent owns cloning and always uses a slot |
 | `MECHANISM` | enum | no | `repmgr.agent.mechanism` (`native` only) | agent (HA mechanics, #287). **Always emitted since #294** -- `native` is the default, and an agent built before #294 assumes `repmgr` when this is absent, so omitting it would run the removed mechanism during a two-step image-then-chart release. The shell no longer reads it -- the repmgr paths it gated are gone (#290). An explicit `repmgr` is rejected at render time |
 
 Lease timings must satisfy `LEASE_DURATION > RENEW_DEADLINE > RETRY_PERIOD`
@@ -79,7 +79,8 @@ pgBackRest backup CronJob runs in its own pod and is an apiserver client in its 
 so it takes `KUBECONFIG` from `pgbackrest.extraEnv` instead — which also carries it to the
 `pgbackrest` sidecar, the `pgbackrest-bootstrap` init container, and the restore and
 validation workloads. Injecting it through `postgresql.extraEnv` would additionally
-redirect the entrypoint's stale-primary guard, which is why the chart keeps them apart.
+keep the two `extraEnv` surfaces apart so a KUBECONFIG meant for pgBackRest cannot silently
+redirect the agent's own API client.
 
 Set but unreadable/malformed/contextless is a startup failure naming the file, never a
 silent fall back to in-cluster. `~/.kube/config` is deliberately not consulted. The boot

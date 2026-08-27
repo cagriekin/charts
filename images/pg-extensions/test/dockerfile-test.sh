@@ -29,7 +29,7 @@ fi
 # server never runs, and PostgreSQL rejects the .so at CREATE EXTENSION time -- long after
 # the build looked fine.
 ext_major=$(grep -oE '^ARG PG_MAJOR=[0-9]+' "${DF}" | head -1 | cut -d= -f2)
-repmgr_major=$(grep -oE '^ARG PG_MAJOR=[0-9]+' "${ROOT}/../repmgr/Dockerfile" | head -1 | cut -d= -f2)
+repmgr_major=$(grep -oE '^ARG PG_MAJOR=[0-9]+' "${ROOT}/../pg-ha/Dockerfile" | head -1 | cut -d= -f2)
 if [ -n "${ext_major}" ] && [ "${ext_major}" = "${repmgr_major}" ]; then
   ok "#320: ARG PG_MAJOR default (${ext_major}) matches the repmgr image"
 else

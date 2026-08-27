@@ -37,8 +37,15 @@ done
 # asserting pod-0 flaked whenever pod-1 or pod-2 won. Everything below writes through
 # ${PRIMARY} for the same reason -- a write to a standby fails read-only.
 PRIMARY=$(discover_primary "${NAMESPACE}" "${FULLNAME}" 3 testuser testdb)
-assert_not_eq "a primary is discoverable" "" "${PRIMARY}"
-[ -n "${PRIMARY}" ] || { end_suite; print_summary; }
+# NOT assert_not_eq with a literal "": that helper fails when EITHER operand is empty (#279,
+# so a vacuous uniqueness check cannot pass silently), which made this fail on every run.
+if [ -z "${PRIMARY}" ]; then
+  fail "a primary is discoverable" "discover_primary returned nothing"
+  end_suite
+  print_summary
+  exit 1
+fi
+pass "a primary is discoverable (${PRIMARY})"
 
 replicas=0
 for pod in "${POD_0}" "${POD_1}" "${POD_2}"; do

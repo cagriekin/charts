@@ -19,11 +19,15 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH GOFLAGS=-mod=vendor GOPROXY=off 
 #   docker buildx imagetools inspect debian:trixie-slim
 FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e
 
-# PostgreSQL major to build against (#269). The chart runs the server
-# binaries from THIS image, so this arg -- not postgresql.image -- decides the cluster's
-# major. The default MUST stay 18: the unsuffixed published tag is built without a
-# --build-arg and every existing chart pin resolves to it. Explicit per-major tags
-# (<tag>-pg17 / <tag>-pg18) are published alongside it; see images/pg-ha/README.md.
+# PostgreSQL major to build against (#269). The chart runs the server binaries from THIS
+# image, so this arg -- not postgresql.image -- decides the cluster's major.
+#
+# The default is a CONVENIENCE now, not a contract (#290). It had to stay 18 because the
+# unsuffixed published tag was built without a --build-arg and every chart pin resolved to it;
+# under the new scheme there is no unsuffixed tag and every publish leg passes --build-arg
+# explicitly, so nothing published depends on this value. It still sets what a bare
+# `docker build` produces, and what an env-less runtime assumes, so keep it in step with the
+# major the docs call default. See images/pg-ha/README.md.
 ARG PG_MAJOR=18
 
 # Install system dependencies. `apt-get upgrade` first so the digest-pinned base

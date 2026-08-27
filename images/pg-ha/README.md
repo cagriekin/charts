@@ -1,8 +1,8 @@
-# PostgreSQL Repmgr Docker Image
+# pg-ha: PostgreSQL HA Image
 
 > Consolidated into this monorepo at `images/pg-ha/` on 2026-06-15 (formerly the standalone
 > `repmgr-docker` repository, retained as the historical archive). Published from here via
-> `.github/workflows/pg-ha-image-publish.yaml` on `trixie-*` tags; the pg/pgvector chart CI
+> `.github/workflows/pg-ha-image-publish.yaml` on `pg-ha-*` tags; the pg/pgvector chart CI
 > builds the image from this source (`pg-test.yaml`) rather than pulling it.
 
 PostgreSQL with pgBackRest, pgaudit, cron and the Go HA agent, on Debian Trixie. Designed for Kubernetes StatefulSet deployments with automatic failover and WAL-based incremental backups.
@@ -71,13 +71,13 @@ inside the main container where it can be fenced.
 
 ### init mode
 
+Reads exactly one variable (#290). It used to need the credentials, the headless service and the
+node count to write `repmgr.conf`, poll `repmgr.nodes` and clone; it now verifies the bundled
+PostgreSQL major and exits.
+
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `HEADLESS_SERVICE` | Yes | Headless service FQDN for node discovery |
-| `REPMGR_PASSWORD` | Yes | Repmgr password |
-| `REPMGR_USER` | No | Repmgr user (default: `repmgr`) |
-| `REPMGR_DB` | No | Repmgr database (default: `repmgr`) |
-| `PGDATA` | No | Data directory (default: `/var/lib/postgresql/data/pgdata`) |
+| `PG_MAJOR` | No | PostgreSQL major to expect (default: the image's own `ENV PG_MAJOR`). Mismatch fails the pod in `Init` rather than later as `initdb: command not found` |
 
 ### Removed modes
 
@@ -132,7 +132,7 @@ re-points the Services itself.
   the primary pre-creates so no WAL gap can open before the clone attaches.
 - **Scale down**: the primary reclaims the departed ordinal's replication slot once its pod is
   gone, so nothing is left pinning WAL. There is no `repmgr.nodes` to strand rows in.
-- **Scale back up with stale PVC**: init container compares local timeline with primary's timeline, re-clones on mismatch
+- **Scale back up with stale PVC**: the agent compares its timeline against the primary's and rewinds with `pg_rewind`, re-cloning only if that cannot proceed (#290: the init container no longer does this)
 
 ## Volumes
 

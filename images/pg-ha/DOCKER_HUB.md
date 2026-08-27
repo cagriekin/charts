@@ -19,9 +19,13 @@ Each release publishes one multi-arch (amd64/arm64) manifest per PostgreSQL majo
 
 | Tag | PostgreSQL |
 |-----|------------|
-| `trixie-<repmgr>-<n>` | 18 — the default major; what unsuffixed pins resolve to |
-| `trixie-<repmgr>-<n>-pg18` | 18, named explicitly |
-| `trixie-<repmgr>-<n>-pg17` | 17 |
+| `trixie-pg18-<n>` | 18 |
+| `trixie-pg17-<n>` | 17 |
+
+The major is **in** the tag, and there is no unsuffixed "default major" alias: a pin always names
+the major it wants. (The previous scheme was `trixie-<repmgr-version>-<n>` under
+`cagriekin/repmgr`, keyed on a package this image no longer contains. That repository stays
+published and frozen at its last tag, so existing digest pins keep resolving.)
 
 A container announces its own major as `PG_MAJOR`, and the server binaries live in `/usr/lib/postgresql/$PG_MAJOR/bin`:
 
@@ -30,8 +34,6 @@ docker run --rm cagriekin/pg-ha:trixie-pg17-1 printenv PG_MAJOR   # -> 17
 ```
 
 **The major is fixed at build time and cannot be changed for an existing data directory** — a PostgreSQL 18 server refuses to start on a PG17 `PGDATA`. Choose the major when you create the cluster.
-
-One major per tag: the unsuffixed tag is PostgreSQL 18, and `-pg18` / `-pg17` name one explicitly.
 
 ## Multi-Mode Architecture
 
@@ -72,12 +74,13 @@ and it re-points the Services itself.
 
 ### init mode
 
+Reads exactly one variable: it verifies the bundled PostgreSQL major and exits. It used to need
+the credentials and the headless service to write `repmgr.conf`, poll for a registered primary
+and clone; the agent owns all of that now.
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `HEADLESS_SERVICE` | Yes | - | Headless service FQDN for node discovery |
-| `REPMGR_USER` | No | `repmgr` | Repmgr database user |
-| `REPMGR_DB` | No | `repmgr` | Repmgr metadata database |
-| `PGDATA` | No | `/var/lib/postgresql/data/pgdata` | Data directory path |
+| `PG_MAJOR` | No | the image's own `ENV PG_MAJOR` | Major to expect. A mismatch fails the pod in `Init`, rather than later as `initdb: command not found` |
 
 ## Volumes
 

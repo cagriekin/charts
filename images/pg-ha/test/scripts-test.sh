@@ -89,10 +89,12 @@ else
   bad "#269: entrypoint.sh does not call require_pg_bindir"
 fi
 
-# --- #269: the unsuffixed published image tag must keep meaning PG18 ---
-# Existing chart pins (repmgr.image.tag without a -pgNN suffix) resolve to the image
-# built with no --build-arg, so flipping this default would silently move every
-# existing installation to another major on the next image refresh.
+# --- #269/#290: the ARG default must stay in step with the documented default major ---
+# It used to be load-bearing: the unsuffixed published tag was built with no --build-arg, so
+# flipping this silently moved every existing installation to another major on the next image
+# refresh. Under the new tag scheme there is no unsuffixed tag and every publish leg passes
+# --build-arg explicitly, so nothing PUBLISHED depends on it -- but it still decides what a bare
+# `docker build` and an env-less runtime get, and the docs name 18, so the two must agree.
 if grep -qE '^ARG PG_MAJOR=18$' "${ROOT}/Dockerfile"; then
   ok "#269: Dockerfile defaults ARG PG_MAJOR to 18"
 else
@@ -333,6 +335,27 @@ else
   bad "#290: the refusal does not name the missing variable" "${_cred_out}"
 fi
 rm -rf "${_cred_tmp}"
+
+# ...and an ALREADY-BOOTSTRAPPED directory must start WITHOUT them (#290 review, round 2). The
+# first cut of the fix hoisted the checks above the emptiness guard, which broke the upstream
+# postgres image contract: a password is required only on first init, so `docker start` on an
+# existing volume (or a compose run with no .env) died on a cluster needing no bootstrap.
+_done_tmp=$(mktemp -d)
+mkdir -p "${_done_tmp}/pgdata"
+echo 18 > "${_done_tmp}/pgdata/PG_VERSION"
+_done_rc=0
+PGDATA="${_done_tmp}/pgdata" bash -c '
+  source <(sed -n "/^bootstrap_initdb() {/,/^}/p" '"${ROOT}"'/entrypoint.sh)
+  initdb() { echo INITDB-RAN; }; pg_ctl() { :; }; psql() { :; }
+  bootstrap_initdb' >/dev/null 2>&1 || _done_rc=$?
+if [ "${_done_rc}" -eq 0 ]; then
+  ok "#290: an already-bootstrapped PGDATA starts with no passwords set"
+else
+  bad "#290: an already-bootstrapped PGDATA was refused without passwords (rc=${_done_rc})"
+fi
+rm -rf "${_done_tmp}"
+
+
 
 echo "----"
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
