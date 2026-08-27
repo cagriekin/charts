@@ -52,6 +52,30 @@
     default. Harmless while both said `cagriekin/repmgr`; under the new tag scheme it names a
     coordinate that cannot exist. Both halves are pinned now.
 
+  Second review round, all documentation/behavioural-surprise rather than logic:
+
+  - **`repmgr.*` beats `ha.*` from ANY source, including `--set`** -- Helm collapses defaults,
+    every `-f` and every `--set` into one map before the chart runs, so the merge cannot tell
+    an operator's value from a chart default and always prefers the deprecated spelling. So
+    `-f legacy.yaml --set ha.agent.leaseDuration=30s` renders the legacy value, discarding a
+    `--set` that Helm normally ranks highest. This cannot be caught at render time (a template
+    gets no provenance, so a `fail` would fire on every legitimate alias use or none), so it is
+    documented in the README, NOTES.txt and both values.yaml, with the instruction stated as
+    MOVE a key rather than duplicate it -- and pinned by tests, so flipping the merge direction
+    fails loudly instead of silently changing what a released values file resolves to.
+  - The README rename runbook gave `helm get values` without `-o yaml`, the exact command
+    NOTES.txt warns against (the default output prefixes `USER-SUPPLIED VALUES:`, which the
+    deliberately-open `additionalProperties` then accepts in silence).
+  - NOTES.txt is byte-identical across both charts, so its cross-reference now names the pg
+    chart README explicitly; the section it points at does not exist in pgvector's.
+  - The tag-scheme comment tables in `set-pg-major.sh` and the pg-test workflow described
+    `trixie-pg<major>-<n>` as the new scheme, which the classifier below them rejects -- it
+    keys on a leading semver, so that shape would fall to the legacy arm and reduce to bare
+    `trixie`. Not live breakage, but exactly the desync those comments exist to prevent.
+  - Both values.yaml files still instructed the deprecated spelling in their own how-to prose
+    (the etcd DCS walkthrough among them), so following the file the chart treats as the
+    authority on its input surface tripped the deprecation notice the same change adds.
+
 - **The HA image is versioned with the chart** (#290/#291). Tags are now
   `cagriekin/pg-ha:<chart-version>-pg<major>` (e.g. `2.0.0-pg18`, `2.0.0-pg17`), published from
   the git tag `pg-ha-<version>`, replacing `cagriekin/repmgr:trixie-<repmgr>-<n>`. The old

@@ -146,8 +146,10 @@ jobs:
           # moves to the new scheme only after the new image is published, so both must work or
           # that bump breaks CI silently.
           #
-          #   NEW: trixie-pg<major>-<n>  -- substitute the major
-          #   OLD: trixie-<repmgr>-<n>   -- unsuffixed is PG18, others take -pgNN
+          #   NEW: <chart-version>-pg<major>   e.g. 2.0.0-pg18 -- substitute the major
+          #   OLD: trixie-<repmgr>-<n>         unsuffixed is PG18, others take -pgNN
+          # (This table said `trixie-pg<major>-<n>` for NEW until #291 review; the classifier
+          #  below keys on a LEADING semver and would have sent that shape to the legacy arm.)
           #
           # Getting this wrong is quiet, not loud: building the PG18 image under a "-pg17" name
           # while set-pg-major points the PG17 fixtures at that name makes every PG17 leg run

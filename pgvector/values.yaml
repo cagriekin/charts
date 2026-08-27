@@ -16,11 +16,11 @@ postgresql:
   image:
     repository: pgvector/pgvector
     # Pinned to the pgvector build bundling postgres 18.4, matching the
-    # repmgr.image default below (also 18.4), instead of the floating
+    # ha.image default below (also 18.4), instead of the floating
     # `pg18-trixie` tag (#302). copy-ext's `cp -n` no longer lets this image
     # clobber the server's own libs regardless, but a matching point release is
     # still what makes `CREATE EXTENSION vector` (built against 18.4's headers)
-    # safe to load into an 18.4 backend. Bump only in lockstep with repmgr.image.
+    # safe to load into an 18.4 backend. Bump only in lockstep with ha.image.
     tag: 0.8.5-pg18-trixie
     digest: ""
     pullPolicy: IfNotPresent
@@ -203,8 +203,8 @@ postgresql:
   # ISO 27001) that require a per-object record of who did what. Off by default:
   # audit.enabled=false renders manifests identically to a chart with no audit block.
   #
-  # Requires repmgr.enabled=true -- the cagriekin/repmgr image bundles the pgaudit
-  # extension. Standalone mode (repmgr.enabled=false) uses the stock postgres image,
+  # Requires ha.enabled=true -- the cagriekin/repmgr image bundles the pgaudit
+  # extension. Standalone mode (ha.enabled=false) uses the stock postgres image,
   # which has no pgaudit, so audit + standalone fails a render guard (a bare
   # shared_preload_libraries=pgaudit would crash-loop the postmaster). To audit in
   # standalone mode, supply a postgresql.image that ships pgaudit.
@@ -236,7 +236,7 @@ postgresql:
     # Empty disables object auditing (session logging via `log` still applies).
     role: ""
 
-  # When repmgr.enabled is true, re-hash any managed user (POSTGRES_USER,
+  # When ha.enabled is true, re-hash any managed user (POSTGRES_USER,
   # REPMGR_USER) whose stored password is still MD5 to SCRAM at pod startup.
   # Idempotent (no-op once everyone is SCRAM-hashed, and auto-skipped on
   # PG < 14 since md5->scram pg_hba auto-promotion only exists in PG14+).
@@ -338,8 +338,10 @@ postgresql:
 # RENAMED from repmgr.* in 2.0.0 (#291): the old namespace named a component this chart no
 # longer installs. `repmgr.*` still works as a deprecated alias for one major cycle -- it is
 # merged key-by-key OVER these defaults, so where a key appears under both names the `repmgr:`
-# one wins (it is the one you wrote). An existing values file keeps working, and you can move
-# one key at a time -- delete each old key as you move it, or the old value stays in effect.
+# one wins -- even over a `--set`, which Helm normally ranks highest, because the chart cannot
+# tell your value from its own defaults by then. MOVE each key rather than duplicating it:
+# delete the old one in the same edit, or the old value stays in effect and the new spelling
+# looks like it did nothing.
 # Removed keys (failoverMode, serviceUpdater.*, monitoringHistoryDays) are rejected under
 # BOTH names. See the pg chart values for the full reasoning.
 # ==========================================================================================
@@ -373,7 +375,7 @@ ha:
   # Enable HA: the lease-based Go agent runs as PID 1 and drives failover. false is
   # standalone mode -- one stock-postgres pod, no replication, replicaCount must be 0.
   # The repmgrd sidecar path was removed in 2.0.0 (#286); the agent, default since
-  # 1.0.0, is now the only failover path and repmgr.failoverMode is rejected at render.
+  # 1.0.0, is now the only failover path and failoverMode is rejected at render under either spelling.
   enabled: true
 
   # Agent tunables. Defaults suit a stable control plane; raise for managed clouds
@@ -1170,7 +1172,7 @@ networkPolicy:
     #       from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]
     extraIngress: []
     extraEgress: []
-  # The agent control API port (repmgr.agent.control.port, default 9201) gets NO
+  # The agent control API port (ha.agent.control.port, default 9201) gets NO
   # ingress rule of its own: this policy is an explicit allowlist, so the absence of a
   # rule IS deny-by-default -- unlike the 9200 metrics port, which admits every
   # same-namespace pod so scrapes work. Nothing can reach the control port until you
@@ -1188,9 +1190,9 @@ global:
   annotations: {}
 
 # Bundled etcd subchart (conditional dependency). Turn on ONLY for a self-contained
-# install that has no external etcd: set both repmgr.agent.dcs.backend=etcd AND
+# install that has no external etcd: set both ha.agent.dcs.backend=etcd AND
 # etcd.enabled=true; the agent then auto-targets the bundled <release>-etcd:2379
-# (leave repmgr.agent.dcs.etcd.endpoints empty). For several databases, prefer one
+# (leave ha.agent.dcs.etcd.endpoints empty). For several databases, prefer one
 # shared/BYO etcd (set endpoints, leave etcd.enabled=false). See the etcd subchart's
 # values for tuning (replicaCount, resources, persistence). Adds 3 stateful pods.
 etcd:

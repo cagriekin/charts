@@ -4879,5 +4879,46 @@ for overlay_chart in "${CHART_DIR}" "${PGVECTOR_DIR}"; do
   assert_eq "#291: $(basename "${overlay_chart}")/values-cloud.yaml still renders" "0" "${overlay_rc}"
 done
 
+# #291 review: the alias beats Helm's OWN precedence, including --set. That is deliberate (the
+# `ha:` side of the merge holds chart defaults, so preferring it would let a default beat an
+# operator value), it is counter-intuitive enough that README/NOTES/values.yaml all call it out,
+# and it cannot be guarded at render time -- Helm gives templates no provenance, so a chart-side
+# `fail` would fire on every legitimate alias use or none. Pin the behaviour instead: if the
+# merge direction is ever flipped, this fails rather than silently changing what a released
+# values file resolves to.
+prec_dir="${SCRIPT_DIR}/../../.prec-tmp-291"
+mkdir -p "${prec_dir}"
+printf 'repmgr:\n  agent:\n    leaseDuration: 15s\n' > "${prec_dir}/legacy.yaml"
+printf 'ha:\n  agent:\n    leaseDuration: 30s\n' > "${prec_dir}/canonical.yaml"
+lease_of() { printf '%s\n' "$1" | grep -A1 'name: LEASE_DURATION' | grep 'value:' | head -1 | sed -E 's/.*value: "?([^"]*)"?.*/\1/'; }
+
+prec_set=$(helm template test-pg "${CHART_DIR}" -f "${prec_dir}/legacy.yaml" \
+  --set ha.agent.leaseDuration=30s 2>&1)
+assert_eq "#291: --set ha.* loses to a repmgr.* value from -f (documented, not a bug)" "15s" \
+  "$(lease_of "${prec_set}")"
+
+# ...and order-independent, in both directions, so the docs' "order does not matter" holds.
+prec_ab=$(helm template test-pg "${CHART_DIR}" -f "${prec_dir}/legacy.yaml" -f "${prec_dir}/canonical.yaml" 2>&1)
+assert_eq "#291: repmgr.* wins with the canonical file last" "15s" "$(lease_of "${prec_ab}")"
+prec_ba=$(helm template test-pg "${CHART_DIR}" -f "${prec_dir}/canonical.yaml" -f "${prec_dir}/legacy.yaml" 2>&1)
+assert_eq "#291: repmgr.* wins with the canonical file first" "15s" "$(lease_of "${prec_ba}")"
+
+# The canonical spelling alone must of course still land -- otherwise the assertions above
+# would pass on a chart that ignored ha.* entirely.
+prec_only=$(helm template test-pg "${CHART_DIR}" -f "${prec_dir}/canonical.yaml" 2>&1)
+assert_eq "#291: ha.* alone lands (guards the three assertions above against vacuity)" "30s" \
+  "$(lease_of "${prec_only}")"
+rm -rf "${prec_dir}"
+
+# The docs must actually state the rule, in every place an operator could reasonably look.
+assert_contains "#291: the README documents the cross-source precedence" \
+  "$(cat "${SCRIPT_DIR}/../README.md")" "wins over"
+assert_contains "#291: NOTES.txt warns about it where an affected operator sees it" \
+  "$(cat "${CHART_DIR}/templates/NOTES.txt")" "even over a --set"
+for prec_chart in pg pgvector; do
+  assert_contains "#291 ${prec_chart}: values.yaml warns about it too" \
+    "$(cat "${SCRIPT_DIR}/../../${prec_chart}/values.yaml")" "MOVE"
+done
+
 end_suite
 print_summary

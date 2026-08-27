@@ -2645,18 +2645,49 @@ repmgr:                            ha:
 
 **Nothing is required of you in 2.0.0.** Every `repmgr.*` key still works: `pg.normalizeValues`
 merges the `repmgr:` block over the `ha:` defaults key by key, so an untouched 1.x values file
-installs unchanged, `--set repmgr.agent.leaseDuration=20s` still lands, and mixing the two
-spellings in one file resolves per key with the `repmgr.*` value winning (it is the one you set;
-the `ha.*` side is chart defaults). Both spellings are schema-validated, so a typo or a bad enum
-still fails the render either way. `helm upgrade` prints a notice when it sees the old block.
+installs unchanged and `--set repmgr.agent.leaseDuration=20s` still lands. Both spellings are
+schema-validated, so a typo or a bad enum still fails the render either way, and keys that were
+*removed* rather than renamed fail under either name. `helm upgrade` prints a notice when it
+sees the old block.
+
+#### The one rule that will surprise you: `repmgr.*` wins, from any source
+
+Where the same key is set under **both** spellings, the `repmgr.*` value wins — and it wins over
+Helm's own precedence order, not within it. By the time the chart runs, Helm has already
+collapsed chart defaults, every `-f` and every `--set` into one map, so the merge cannot tell an
+operator's value from a chart default. It only sees two spellings and always prefers the
+deprecated one, because that is the only rule that keeps a released 1.x file working — the `ha.*`
+side is where the chart's own defaults live, so preferring it would let a default silently beat a
+value you set.
+
+The consequence, spelled out because it is genuinely counter-intuitive:
+
+```bash
+# legacy.yaml still has  repmgr.agent.leaseDuration: 15s
+helm upgrade r cagriekin/pg -f legacy.yaml --set ha.agent.leaseDuration=30s   # renders 15s, NOT 30s
+```
+
+A `--set`, which Helm normally gives the highest precedence of all, is discarded here. The same
+applies to a later `-f` — order does not matter, the old spelling wins either way. This cannot be
+caught at render time: detecting it needs to know which of the two values you actually supplied,
+and Helm exposes no provenance to a template, so a chart-side `fail` would either fire on every
+legitimate alias use or not at all.
+
+**So migrate a key by *moving* it, never by adding the new spelling alongside the old one.**
+Delete each `repmgr.*` key in the same edit that adds its `ha.*` replacement, and the surprise
+cannot arise. Renaming the whole block at once — the fastest route, below — sidesteps it entirely.
 
 The alias exists so this rename is not a second breaking change stacked on 2.0.0's real one.
 **It is removed in the next major** — rename the block before then:
 
 ```bash
-helm get values -n <namespace> <release> > values.yaml
+helm get values -o yaml -n <namespace> <release> > values.yaml   # -o yaml is not optional
 # change the top-level "repmgr:" key to "ha:"; leave everything under it alone
 ```
+
+`-o yaml` matters: the default output prefixes a `USER-SUPPLIED VALUES:` line, and the schema
+deliberately leaves `additionalProperties` open, so that stray top-level key is accepted in
+silence rather than rejected.
 
 Why rename at all: after #290 the image contains no repmgr — no binary, no extension, no
 `repmgr.conf` — and the agent replicates through `pg_stat_replication` and its own slots. A block

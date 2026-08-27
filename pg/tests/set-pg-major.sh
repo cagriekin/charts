@@ -56,9 +56,17 @@ HA_REPO_RE='(cagriekin/repmgr|cagriekin/pg-ha)'
 # only once the new image is actually published (the documented two-step: publish, then bump).
 # Handling both here means that bump needs no change to this script or to CI.
 #
-#   NEW (#290):  trixie-pg<major>-<n>   -- the major is IN the tag; substitute it
-#   OLD:         trixie-<repmgr>-<n>    -- unsuffixed meant the default major; append -pgNN
-# The new-scheme shape is `<chart-version>-pg<major>` (e.g. 2.0.0-pg18). Keyed on a LEADING
+#   NEW (#290/#291):  <chart-version>-pg<major>   e.g. 2.0.0-pg18 -- substitute the major
+#   OLD:              trixie-<repmgr>-<n>[-pgNN]  unsuffixed meant the default major
+#
+# An earlier draft of this table said the new shape was `trixie-pg<major>-<n>`, which the case
+# arm below does NOT classify as new: it would fall to the legacy arm, where the `%-pg[0-9]*`
+# trim reduces it to bare `trixie` and CI would build `repo:trixie` / `repo:trixie-pg17`.
+# Nothing published uses that shape, so it was never live breakage -- but a table describing a
+# scheme the code rejects is exactly the desync the note below warns about, so it is corrected
+# rather than left as harmless.
+#
+# Keyed on a LEADING
 # semver, which is what separates it from the old `trixie-<repmgr>-<n>[-pgNN]` -- both end in
 # -pg<digits>, so a trailing-suffix test would misclassify the legacy suffixed form. This
 # pattern is shared verbatim between .github/workflows/pg-test.yaml and

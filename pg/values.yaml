@@ -246,8 +246,8 @@ postgresql:
   # ISO 27001) that require a per-object record of who did what. Off by default:
   # audit.enabled=false renders manifests identically to a chart with no audit block.
   #
-  # Requires repmgr.enabled=true -- the cagriekin/repmgr image bundles the pgaudit
-  # extension. Standalone mode (repmgr.enabled=false) uses the stock postgres image,
+  # Requires ha.enabled=true -- the cagriekin/repmgr image bundles the pgaudit
+  # extension. Standalone mode (ha.enabled=false) uses the stock postgres image,
   # which has no pgaudit, so audit + standalone fails a render guard (a bare
   # shared_preload_libraries=pgaudit would crash-loop the postmaster). To audit in
   # standalone mode, supply a postgresql.image that ships pgaudit.
@@ -279,7 +279,7 @@ postgresql:
     # Empty disables object auditing (session logging via `log` still applies).
     role: ""
 
-  # When repmgr.enabled is true, re-hash any managed user (POSTGRES_USER,
+  # When ha.enabled is true, re-hash any managed user (POSTGRES_USER,
   # REPMGR_USER) whose stored password is still MD5 to SCRAM at pod startup.
   # Idempotent (no-op once everyone is SCRAM-hashed, and auto-skipped on
   # PG < 14 since md5->scram pg_hba auto-promotion only exists in PG14+).
@@ -462,7 +462,7 @@ postgresql:
     # plain-copy default path keeps using the shared, lighter pg.initResources). apt-get
     # update + install is a real package-manager run (repo metadata fetch + dependency
     # resolution + dpkg unpack), not a `cp`, so it gets its own, values-overridable
-    # budget -- same precedent as repmgr.initContainerResources for the standby-clone
+    # budget -- same precedent as ha.initContainerResources for the standby-clone
     # init container.
     installResources:
       requests:
@@ -480,7 +480,7 @@ postgresql:
       # non-zero postStart exit makes the kubelet kill the container -- a crash-loop is a
       # worse answer than a skipped convenience command. Two consequences worth knowing:
       #   - A pod whose PostgreSQL is not serving within that window skips its commands.
-      #     Reachable in practice on a fresh standby under repmgr.agent.mechanism: native,
+      #     Reachable in practice on a fresh standby under ha.agent.mechanism: native,
       #     where the first clone runs in this container and can outlast 90s.
       #   - Kubernetes does not consider a container started until postStart returns, so
       #     while the hook waits, the startup/liveness probes have not begun yet.
@@ -496,11 +496,17 @@ postgresql:
 #
 # `repmgr.*` STILL WORKS. It is a deprecated alias for one major cycle: every key below is
 # merged key-by-key with anything you set under `repmgr:`, and where a key appears under BOTH
-# names the `repmgr:` one wins -- it is the one you wrote, whereas the `ha:` side also holds
-# the chart defaults you see below. So an existing values file keeps working unchanged, and
-# you can move one key at a time; just delete each old key as you move it, because until you
-# do, the old value is the one in effect. That is what makes this rename additive rather than
-# a break; dropping the aliases is the break, and it belongs to the next major.
+# names the `repmgr:` one wins. That is not merely "the file's own order" -- it beats Helm's
+# precedence outright, including a --set, because by the time this chart runs Helm has already
+# collapsed defaults, every -f and every --set into one map, so the merge cannot tell your
+# value from the defaults you see below. Preferring `repmgr:` is the only rule that keeps a
+# released 1.x file working.
+#
+# The practical instruction, therefore: MOVE a key, never duplicate it. Delete the `repmgr:`
+# key in the same edit that adds its `ha:` replacement -- otherwise the old value stays in
+# effect and `--set ha....` looks like it did nothing. Renaming the whole block at once avoids
+# the question entirely. That is what makes this rename additive rather than a break; dropping
+# the aliases is the break, and it belongs to the next major.
 #
 # Keys that were REMOVED rather than renamed -- failoverMode, serviceUpdater.* and
 # monitoringHistoryDays -- are rejected at render time with a message naming the fix, not
@@ -538,7 +544,7 @@ ha:
   # Enable HA: the lease-based Go agent runs as PID 1 and drives failover. false is
   # standalone mode -- one stock-postgres pod, no replication, replicaCount must be 0.
   # The repmgrd sidecar path was removed in 2.0.0 (#286); the agent, default since
-  # 1.0.0, is now the only failover path and repmgr.failoverMode is rejected at render.
+  # 1.0.0, is now the only failover path and failoverMode is rejected at render under either spelling.
   enabled: true
 
   # Agent tunables. Defaults suit a stable control plane; raise for managed clouds
@@ -804,7 +810,7 @@ ha:
   database: repmgr
 
   # NOT CONSUMED by anything (#294 review). These sized the repmgrd sidecar, which #286
-  # deleted; `grep Values.repmgr.resources pg/templates/` is empty. Kept only so an existing
+  # deleted; `grep -r Values.ha.resources pg/templates/` is empty. Kept only so an existing
   # values file does not fail on an unknown key -- raising them does nothing. The PostgreSQL
   # container's own budget is postgresql.resources, and the agent runs inside it.
   resources:
@@ -1198,7 +1204,7 @@ pgbackrest:
   # POSTGRESQL pod too (that is where the sidecar and the bootstrap init container live), so a
   # ConfigMap/Secret that does not exist yet now holds the DATABASE pods in ContainerCreating
   # on the next roll, not just the backups -- create it first, or mark the source
-  # `optional: true`. And when repmgr.agent.control.restore is enabled, the #279 admission
+  # `optional: true`. And when ha.agent.control.restore is enabled, the #279 admission
   # policy that bounds the agent's `create jobs` grant pins the restore Job's volume sources
   # and env valueFrom names: the chart folds these values into those pins automatically, but
   # only sources it can bind to a NAME (emptyDir, configMap, secret, persistentVolumeClaim,
@@ -1470,7 +1476,7 @@ networkPolicy:
     #       from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]
     extraIngress: []
     extraEgress: []
-  # The agent control API port (repmgr.agent.control.port, default 9201) gets NO
+  # The agent control API port (ha.agent.control.port, default 9201) gets NO
   # ingress rule of its own: this policy is an explicit allowlist, so the absence of a
   # rule IS deny-by-default -- unlike the 9200 metrics port, which admits every
   # same-namespace pod so scrapes work. Nothing can reach the control port until you
@@ -1488,9 +1494,9 @@ global:
   annotations: {}
 
 # Bundled etcd subchart (conditional dependency). Turn on ONLY for a self-contained
-# install that has no external etcd: set both repmgr.agent.dcs.backend=etcd AND
+# install that has no external etcd: set both ha.agent.dcs.backend=etcd AND
 # etcd.enabled=true; the agent then auto-targets the bundled <release>-etcd:2379
-# (leave repmgr.agent.dcs.etcd.endpoints empty). For several databases, prefer one
+# (leave ha.agent.dcs.etcd.endpoints empty). For several databases, prefer one
 # shared/BYO etcd (set endpoints, leave etcd.enabled=false). See the etcd subchart's
 # values for tuning (replicaCount, resources, persistence). Adds 3 stateful pods.
 etcd:

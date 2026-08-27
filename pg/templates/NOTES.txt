@@ -41,13 +41,18 @@ to "ha:" -- the name no longer matches what runs, since the failover agent is na
 repmgr is gone from the image (#290, #291). Every "repmgr.*" key still works for now: each
 one is merged over its "ha.*" counterpart, so this release needs no values change from you.
 
-Rename the block to "ha:" before the next major, which drops the alias:
+One rule to know while both names work: where a key is set under BOTH spellings, the
+"repmgr:" one wins -- even over a --set, which Helm normally ranks highest. The chart cannot
+tell your value from its own default by then, and preferring "repmgr:" is what keeps a 1.x
+file working. So MOVE each key (delete the old one in the same edit) rather than adding the
+new spelling next to it, or rename the whole block at once:
 
   helm get values -o yaml -n {{ .Release.Namespace }} {{ .Release.Name }} > values.yaml
   # then change the top-level "repmgr:" key to "ha:" -- nothing nested changes
   # (-o yaml matters: the default output prefixes "USER-SUPPLIED VALUES:", and the schema
   #  leaves additionalProperties open, so that stray key would be accepted in silence)
 
-See "Renamed values: repmgr.* -> ha.*" under Upgrade and migration in the chart README.
+See "Renamed values: repmgr.* -> ha.*" under Upgrade and migration in the pg chart README
+(pgvector shares pg's templates and defers to it for the migration detail).
 Keys that were REMOVED rather than renamed still fail the render under either name.
 {{- end }}
