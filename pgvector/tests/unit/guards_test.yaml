@@ -21,7 +21,7 @@ tests:
       repmgr.failoverMode: repmgrd
     asserts:
       - failedTemplate:
-          errorPattern: "repmgr.failoverMode was removed in chart 2.0.0"
+          errorPattern: 'failoverMode \(ha\.failoverMode / repmgr\.failoverMode\) was removed in chart 2\.0\.0'
 
   - it: standalone with replicaCount 0 renders
     set:

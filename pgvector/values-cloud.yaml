@@ -31,7 +31,9 @@ postgresql:
     # failure). Set your cluster's zonal SC name here.
     storageClass: ""
 
-repmgr:
+# Renamed from `repmgr:` in 2.0.0 (#291). The alias still works, but a chart-shipped
+# example must not be the thing that trips its own deprecation notice.
+ha:
   agent:
     # Managed-cloud lease timing: a routine control-plane blip (apiserver upgrade,
     # etc.) under the on-prem 15/10/2 would trip an unnecessary self-demote. Wider

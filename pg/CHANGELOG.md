@@ -30,6 +30,28 @@
   values rename -- deliberately out of scope here. `REPMGR_*` env vars are likewise unchanged;
   `pg/ENVIRONMENT.md` records which of them the agent still reads and which are now inert.
 
+  Review follow-ups on the rename itself, each a defect the first pass shipped:
+
+  - The removed-key guards (`failoverMode`, `serviceUpdater.*`, `monitoringHistoryDays`) now
+    fire under **both** spellings. Reading only `repmgr.*` made them skippable by taking the
+    very rename the upgrade notice recommends: a 1.x file carrying `failoverMode: repmgrd`,
+    with its block renamed to `ha:`, rendered clean and deployed an agent cluster to an
+    operator who believed repmgrd was running -- straight into the immutable
+    `podManagementPolicy` trap the guard exists to warn about.
+  - Three templates (`networkpolicy.yaml`, `service-headless.yaml`, `databases-roles-job.yaml`)
+    read `.Values.ha` transitively without normalizing first. In a full render this worked only
+    because `statefulset.yaml` sorts earlier and mutates `.Values` for every later file; rendered
+    alone, as helm-unittest does, they ignored the alias entirely.
+  - `set-pg-major.sh` and the pg-test workflow both resolved the HA image from `pg/values.yaml`
+    by anchoring on `^repmgr:`, and hard-exit when that misses. Both accept either spelling now.
+    The same scripts hardcoded the image *repository*, so the #290 rename would have ended in
+    `FATAL: rendered StatefulSet does not use cagriekin/repmgr:...`; the repository is read from
+    the chart and rewritten in fixtures alongside the tag, and the two-step is verified end to
+    end under both majors.
+  - `etcd.rbac.bootstrapImage` pinned only the tag, leaving the repository on the etcd subchart's
+    default. Harmless while both said `cagriekin/repmgr`; under the new tag scheme it names a
+    coordinate that cannot exist. Both halves are pinned now.
+
 - **The HA image is versioned with the chart** (#290/#291). Tags are now
   `cagriekin/pg-ha:<chart-version>-pg<major>` (e.g. `2.0.0-pg18`, `2.0.0-pg17`), published from
   the git tag `pg-ha-<version>`, replacing `cagriekin/repmgr:trixie-<repmgr>-<n>`. The old

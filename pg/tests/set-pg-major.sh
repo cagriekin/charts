@@ -40,6 +40,17 @@ DEFAULT_MAJOR="18"
 # as a values alias, so this tree can legitimately carry either. Anchoring on one of them is
 # not a soft failure -- the [ -n ] guard below exits 1, which takes down every KinD leg.
 BASE_TAG=$(awk '/^(repmgr|ha):/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' "$VALUES")
+# The REPOSITORY is read from the chart for the same reason as the tag (#291 review): #290
+# renames the image cagriekin/repmgr -> cagriekin/pg-ha in a two-step (publish, then bump the
+# pin), and every leftover-scanner and render check below matches on the repository. Hardcoding
+# it meant step 2 ended in `FATAL: rendered StatefulSet does not use cagriekin/repmgr:...` --
+# a total KinD outage triggered by a one-line values bump, which is exactly the trap the tag
+# alternation was added to avoid. Both names are ALSO scanned for leftovers, because fixtures
+# cross over one at a time and a fixture left on the old repository must still be caught.
+HA_REPO=$(awk '/^(repmgr|ha):/{r=1} r&&/^    repository:/{gsub(/"/,"",$2); print $2; exit}' "$VALUES")
+[ -n "$HA_REPO" ] || { echo "could not resolve the HA image repository from ${VALUES}" >&2; exit 1; }
+# Alternation for the scanners: whichever the chart points at today, plus the other one.
+HA_REPO_RE='(cagriekin/repmgr|cagriekin/pg-ha)' 
 [ -n "$BASE_TAG" ] || { echo "could not resolve HA image tag from ${VALUES} (looked for the tag under the ha:/repmgr: block)" >&2; exit 1; }
 # Two tag shapes are accepted, because #290 changed the scheme and the chart pin moves to it
 # only once the new image is actually published (the documented two-step: publish, then bump).
@@ -72,7 +83,7 @@ RENDER_SUITE="${SCRIPT_DIR}/test-template.sh"
 render_suite_before=$(cksum "$RENDER_SUITE")
 
 echo "=== set-pg-major: PostgreSQL ${MAJOR} ==="
-echo "  repmgr image tag : ${REPMGR_TAG}"
+echo "  HA image         : ${HA_REPO}:${REPMGR_TAG}"
 echo "  postgres image   : postgres:${PG_IMAGE_TAG}"
 
 grep -qxF "postgres:${PG_IMAGE_TAG}" "$BASE_IMAGES" || {
@@ -143,6 +154,15 @@ apply "HA image tag" \
   '(trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?|[0-9]+\.[0-9]+\.[0-9]+-pg[0-9]+)' \
   's/(trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?|[0-9]+\.[0-9]+\.[0-9]+-pg[0-9]+)/'"${REPMGR_TAG}"'/g'
 
+# HA image REPOSITORY. Eleven fixtures pin it explicitly, so the #290 rename is not a
+# one-line values bump unless they are retargeted too: the tag rule above would happily
+# rewrite them to <old-repo>:<new-scheme-tag> -- a coordinate that will never exist, since
+# cagriekin/repmgr is frozen at its last trixie- tag. The leftover scanner catches it, but
+# as a FATAL the operator then has to fix by hand; rewriting is the actual fix.
+apply "HA image repository" \
+  '^([[:space:]]+)repository: (cagriekin/repmgr|cagriekin/pg-ha)[[:space:]]*$' \
+  's#^([[:space:]]+)repository: (cagriekin/repmgr|cagriekin/pg-ha)[[:space:]]*$#\1repository: '"${HA_REPO}"'#'
+
 # postgres image tags (postgresql.image.tag + the TLS suite's client pod). Deliberately
 # broader than the tags in the tree today -- `postgres:17-trixie` (major-only) and the
 # bookworm variants are equally valid pins, and one left behind would put a PG18 server
@@ -197,11 +217,11 @@ leftovers=""
 #    --image=...). Matched on the repository, so an unrecognised tag SHAPE cannot slip by.
 for f in "${SUITES[@]}"; do
   refs=$(grep -vE '^[[:space:]]*#' "$f" | grep -v "$KEEP_MARK" \
-    | grep -oE '(cagriekin/repmgr|postgres)[:=][A-Za-z0-9._-]+' || true)
+    | grep -oE "(${HA_REPO_RE}|postgres)[:=][A-Za-z0-9._-]+" || true)
   while IFS= read -r ref; do
     [ -n "$ref" ] || continue
     case "$ref" in
-      *"cagriekin/repmgr:${REPMGR_TAG}") continue ;;
+      *"${HA_REPO}:${REPMGR_TAG}") continue ;;
       *"postgres:${PG_IMAGE_TAG}") continue ;;
     esac
     leftovers="${leftovers}"$'\n'"  $(basename "$f"): ${ref}"
@@ -223,10 +243,10 @@ if command -v helm >/dev/null 2>&1; then
       # loop above.
       [ -n "$img" ] || continue
       case "$img" in
-        "cagriekin/repmgr:${REPMGR_TAG}"|"postgres:${PG_IMAGE_TAG}") continue ;;
+        "${HA_REPO}:${REPMGR_TAG}"|"postgres:${PG_IMAGE_TAG}") continue ;;
       esac
       leftovers="${leftovers}"$'\n'"  $(basename "$fx") renders: ${img}"
-    done <<<"$(grep -oE '(cagriekin/repmgr|postgres):[A-Za-z0-9._-]+' <<<"$out" | sort -u)"
+    done <<<"$(grep -oE "(${HA_REPO_RE}|postgres):[A-Za-z0-9._-]+" <<<"$out" | sort -u)"
   done
   [ -n "$skipped" ] && echo "  note: fixtures that do not render standalone were not image-checked:${skipped}"
 fi
@@ -249,8 +269,8 @@ fi
 # Prove the render followed, so a rule that matched the wrong thing cannot pass silently.
 if command -v helm >/dev/null 2>&1; then
   rendered=$(helm template verify "$CHART_DIR" --show-only templates/statefulset.yaml)
-  if ! grep -qF "cagriekin/repmgr:${REPMGR_TAG}" <<<"$rendered"; then
-    echo "FATAL: rendered StatefulSet does not use cagriekin/repmgr:${REPMGR_TAG}" >&2
+  if ! grep -qF "${HA_REPO}:${REPMGR_TAG}" <<<"$rendered"; then
+    echo "FATAL: rendered StatefulSet does not use ${HA_REPO}:${REPMGR_TAG}" >&2
     exit 1
   fi
   ext=$(helm template verify "$CHART_DIR" --set postgresql.extensions.enabled=true \
@@ -259,7 +279,7 @@ if command -v helm >/dev/null 2>&1; then
     echo "FATAL: rendered extension paths are not /usr/lib/postgresql/${MAJOR}/lib" >&2
     exit 1
   fi
-  echo "  verified: render uses cagriekin/repmgr:${REPMGR_TAG} and PG${MAJOR} extension paths"
+  echo "  verified: render uses ${HA_REPO}:${REPMGR_TAG} and PG${MAJOR} extension paths"
 else
   echo "  (helm not found: skipping the render verification)"
 fi

@@ -132,12 +132,16 @@ jobs:
       - name: Build repmgr images from source (one per PG major)
         run: |
           set -euo pipefail
-          tag=$(awk '/^repmgr:/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
-          if [ -z "$tag" ]; then echo "could not resolve repmgr image tag from pg/values.yaml" >&2; exit 1; fi
+          # Matches BOTH block spellings, same as pg/tests/set-pg-major.sh: #291 renamed the
+          # block to `ha:` and keeps `repmgr:` as a values alias, so the tree can carry either.
+          # Anchoring on one is a hard CI outage, not a soft miss -- the -z guards below exit 1
+          # and every leg of both majors dies before a single suite runs.
+          tag=$(awk '/^(repmgr|ha):/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
+          if [ -z "$tag" ]; then echo "could not resolve the HA image tag from pg/values.yaml (looked for tag: under the ha:/repmgr: block)" >&2; exit 1; fi
           # The image REPOSITORY comes from the chart too, so this keeps building whatever the
           # chart points at across the #290 rename (cagriekin/repmgr -> cagriekin/pg-ha).
-          repo=$(awk '/^repmgr:/{r=1} r&&/^    repository:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
-          if [ -z "$repo" ]; then echo "could not resolve repmgr image repository from pg/values.yaml" >&2; exit 1; fi
+          repo=$(awk '/^(repmgr|ha):/{r=1} r&&/^    repository:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
+          if [ -z "$repo" ]; then echo "could not resolve the HA image repository from pg/values.yaml (looked for repository: under the ha:/repmgr: block)" >&2; exit 1; fi
           # Two tag shapes, exactly as pg/tests/set-pg-major.sh accepts (#290): the chart pin
           # moves to the new scheme only after the new image is published, so both must work or
           # that bump breaks CI silently.

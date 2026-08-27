@@ -19,7 +19,7 @@ tests:
       repmgr.failoverMode: repmgrd
     asserts:
       - failedTemplate:
-          errorPattern: "repmgr.failoverMode was removed in chart 2.0.0.*IMMUTABLE"
+          errorPattern: 'failoverMode \(ha\.failoverMode / repmgr\.failoverMode\) was removed in chart 2\.0\.0.*IMMUTABLE'
 
   - it: repmgr.failoverMode=agent is rejected as a no-op key
     templates:
@@ -28,7 +28,7 @@ tests:
       repmgr.failoverMode: agent
     asserts:
       - failedTemplate:
-          errorPattern: "repmgr.failoverMode was removed in chart 2.0.0"
+          errorPattern: 'failoverMode \(ha\.failoverMode / repmgr\.failoverMode\) was removed in chart 2\.0\.0'
 
   - it: repmgr.serviceUpdater is rejected
     templates:
@@ -37,7 +37,7 @@ tests:
       repmgr.serviceUpdater.resources.requests.cpu: 50m
     asserts:
       - failedTemplate:
-          errorPattern: "repmgr.serviceUpdater.* was removed in chart 2.0.0"
+          errorPattern: 'serviceUpdater\.\* \(ha\.serviceUpdater / repmgr\.serviceUpdater\) was removed in chart 2\.0\.0'
 
   - it: repmgr.monitoringHistoryDays is rejected
     templates:
@@ -46,7 +46,7 @@ tests:
       repmgr.monitoringHistoryDays: 7
     asserts:
       - failedTemplate:
-          errorPattern: "repmgr.monitoringHistoryDays was removed in chart 2.0.0"
+          errorPattern: 'monitoringHistoryDays \(ha\.monitoringHistoryDays / repmgr\.monitoringHistoryDays\) was removed in chart 2\.0\.0'
 
   - it: pgpool.autoFailback is rejected
     templates:

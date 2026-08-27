@@ -43,8 +43,11 @@ one is merged over its "ha.*" counterpart, so this release needs no values chang
 
 Rename the block to "ha:" before the next major, which drops the alias:
 
-  helm get values -n {{ .Release.Namespace }} {{ .Release.Name }} > values.yaml
+  helm get values -o yaml -n {{ .Release.Namespace }} {{ .Release.Name }} > values.yaml
   # then change the top-level "repmgr:" key to "ha:" -- nothing nested changes
+  # (-o yaml matters: the default output prefixes "USER-SUPPLIED VALUES:", and the schema
+  #  leaves additionalProperties open, so that stray key would be accepted in silence)
 
-See the "Migrating from 1.x to 2.0" section of the chart README for the full diff.
+See "Renamed values: repmgr.* -> ha.*" under Upgrade and migration in the chart README.
+Keys that were REMOVED rather than renamed still fail the render under either name.
 {{- end }}

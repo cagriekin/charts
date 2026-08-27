@@ -495,13 +495,17 @@ postgresql:
 # longer installs -- the agent replaced repmgr, and the image no longer contains it.
 #
 # `repmgr.*` STILL WORKS. It is a deprecated alias for one major cycle: every key below is
-# merged key-by-key with anything you set under `repmgr:`, with `ha:` winning, so an existing
-# values file keeps working unchanged and you can move one key at a time. That is what makes
-# this rename additive rather than a break; dropping the aliases is the break, and it belongs
-# to the major that also removes the last of the repmgr scaffolding.
+# merged key-by-key with anything you set under `repmgr:`, and where a key appears under BOTH
+# names the `repmgr:` one wins -- it is the one you wrote, whereas the `ha:` side also holds
+# the chart defaults you see below. So an existing values file keeps working unchanged, and
+# you can move one key at a time; just delete each old key as you move it, because until you
+# do, the old value is the one in effect. That is what makes this rename additive rather than
+# a break; dropping the aliases is the break, and it belongs to the next major.
 #
-# Two keys that were REMOVED rather than renamed -- failoverMode and serviceUpdater.* -- are
-# rejected at render time with a message naming the fix, not silently ignored.
+# Keys that were REMOVED rather than renamed -- failoverMode, serviceUpdater.* and
+# monitoringHistoryDays -- are rejected at render time with a message naming the fix, not
+# silently ignored, and that check looks under BOTH names: renaming the block does not
+# smuggle a removed key past it.
 # ==========================================================================================
 ha:
   image:
@@ -1491,10 +1495,19 @@ global:
 # values for tuning (replicaCount, resources, persistence). Adds 3 stateful pods.
 etcd:
   enabled: false
-  # The bundled etcd's RBAC-bootstrap Job runs the pg-ha-agent (repmgr) image, so keep
-  # this in lockstep with repmgr.image.tag above; the subchart's own default can lag.
+  # The bundled etcd's RBAC-bootstrap Job runs the HA image, so keep this in lockstep with
+  # ha.image above; the subchart's own default can lag.
   # The subchart reads it at rbac.bootstrapImage -- a top-level etcd.bootstrapImage is
   # silently ignored, which left the Job on the subchart's older default (#269 review).
+  #
+  # The REPOSITORY is pinned here too, not just the tag (#291 review). Only the tag was
+  # overridden before, so it tracked ha.image.tag while the repository stayed on the
+  # subchart's default -- fine while both said cagriekin/repmgr, but the #290 rename makes
+  # that pair a coordinate that does not exist (cagriekin/repmgr is frozen at its last
+  # trixie- tag, and the new tag scheme only ever appears under cagriekin/pg-ha). It failed
+  # exactly this way in a simulated two-step: the etcd-TLS fixture rendered
+  # cagriekin/repmgr:2.0.0-pg17. Both halves move together or neither does.
   rbac:
     bootstrapImage:
+      repository: cagriekin/repmgr
       tag: trixie-5.5.0-33

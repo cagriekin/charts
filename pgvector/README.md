@@ -282,7 +282,7 @@ A Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a
 | `ha.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
 | `ha.agent.reconcileInterval` | Reconcile tick interval | `5s` |
 | `ha.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
-| `ha.agent.mechanism` | **EXPERIMENTAL (#287), do not set in production yet.** `repmgr` or `native` (drives `pg_ctl`/`pg_basebackup`/`pg_rewind` directly instead of the repmgr CLI). It owns its physical replication slots (#289) and, since #288, runs a real multi-node cluster: topology comes from `pg_stat_replication` and the lease holder initdbs while every other pod clones via `pg_basebackup`. `syncReplicationSlots` and `cascadingReplication` both work with it since #294; an existing repmgr cluster still cannot be migrated in place (#292), so it is for fresh installs -- see the [pg chart README](../pg/README.md#replication-mechanics-experimental-287) for the full detail. | `repmgr` |
+| `ha.agent.mechanism` | `native` — the agent drives `pg_ctl`/`pg_basebackup`/`pg_rewind` and writes `primary_conninfo`/`standby.signal` itself, taking topology from `pg_stat_replication` and owning its physical replication slots (#288/#289). The only accepted value: the `repmgr` mechanism was removed in 2.0.0 (#294) and is **rejected at render time**. An existing 1.x cluster cannot be migrated in place yet (#292), so upgrading a live HA cluster needs the runbook — see the [pg chart README](../pg/README.md#replication-mechanics-experimental-287). | `native` |
 
 Must satisfy `leaseDuration > renewDeadline > retryPeriod`; widen for managed clouds (e.g. `30s/20s/4s`). This chart shares pg's templates and agent — see the [pg chart README](../pg/README.md#failover-the-lease-based-agent) for the full agent behaviour and the **2.0.0 migration runbook** (a release that pinned `failoverMode: repmgrd` needs a one-time `kubectl delete statefulset --cascade=orphan` + `helm upgrade`, because `podManagementPolicy` is immutable). See `ENVIRONMENT.md` for the injected-variable catalog.
 
@@ -524,7 +524,7 @@ postgresql:
 ```
 
 When enabled, the chart adds `pgaudit` to `shared_preload_libraries` (preserving `repmgr`
-under `ha.agent.mechanism: repmgr`; native has no repmgr extension to preserve, #293),
+for the 1.x repmgr mechanism; native has no repmgr extension to preserve, #293),
 renders the `pgaudit.*` GUCs, and creates the extension idempotently on the primary via a
 post-install/upgrade hook Job.
 

@@ -1372,20 +1372,33 @@ volumes:
        would otherwise deploy an agent cluster while its author believes repmgrd is running
        -- silence here is the dangerous outcome, so fail at render time (invariant 4). */ -}}
 {{- define "pg.validateRemovedRepmgrdValues" -}}
-{{- $alias := .Values.repmgr | default dict -}}
+{{- /* Checked in BOTH namespaces, and that is the whole point (#291 review). Reading only
+       .Values.repmgr made every guard below silently skippable by taking the rename NOTES.txt
+       itself recommends: rename the top-level key to `ha:` on a 1.x file that still carries
+       `failoverMode: repmgrd`, and the render went clean -- handing the operator an agent
+       cluster while they believed repmgrd was running, straight into the immutable
+       podManagementPolicy trap this validator exists to warn about.
+
+       Reading only .Values.ha would be just as wrong in the other direction (it would miss
+       every un-renamed 1.x file), and the normalizer cannot help: it merges the alias INTO
+       .Values.ha, so a removed key arrives there indistinguishable from a canonical one --
+       which is fine here, because none of these keys exists under ha: in values.yaml, so any
+       presence in either namespace is operator input. The union is therefore exact, not
+       merely conservative. */ -}}
+{{- $alias := mergeOverwrite (deepCopy (.Values.ha | default dict)) (deepCopy (.Values.repmgr | default dict)) -}}
 {{- if hasKey $alias "failoverMode" -}}
 {{- $m := $alias.failoverMode | toString -}}
 {{- if eq $m "agent" -}}
-{{- fail "repmgr.failoverMode was removed in chart 2.0.0: the lease-based agent is now the only failover path, so `failoverMode: agent` no longer means anything. Delete this key -- nothing else changes for you, and the agent is still tuned under ha.agent.*." -}}
+{{- fail "failoverMode (ha.failoverMode / repmgr.failoverMode) was removed in chart 2.0.0: the lease-based agent is now the only failover path, so `failoverMode: agent` no longer means anything. Delete this key -- nothing else changes for you, and the agent is still tuned under ha.agent.*." -}}
 {{- else -}}
-{{- fail (printf "repmgr.failoverMode was removed in chart 2.0.0 (got %q): repmgrd and its service-updater sidecar are gone, and the lease-based agent is now the only failover path. Deleting this key switches this release to the agent -- which also flips the StatefulSet's podManagementPolicy from OrderedReady to Parallel, and that field is IMMUTABLE. Read the 2.0.0 upgrade note in CHANGELOG.md before upgrading: the StatefulSet has to be recreated with `kubectl delete sts <name> --cascade=orphan`." $m) -}}
+{{- fail (printf "failoverMode (ha.failoverMode / repmgr.failoverMode) was removed in chart 2.0.0 (got %q): repmgrd and its service-updater sidecar are gone, and the lease-based agent is now the only failover path. Deleting this key switches this release to the agent -- which also flips the StatefulSet's podManagementPolicy from OrderedReady to Parallel, and that field is IMMUTABLE. Read the 2.0.0 upgrade note in CHANGELOG.md before upgrading: the StatefulSet has to be recreated with `kubectl delete sts <name> --cascade=orphan`." $m) -}}
 {{- end -}}
 {{- end -}}
 {{- if hasKey $alias "serviceUpdater" -}}
-{{- fail "repmgr.serviceUpdater.* was removed in chart 2.0.0: the service-updater sidecar only existed to reconcile PGPool backends after a repmgrd failover, and the agent does that itself. Delete this key." -}}
+{{- fail "serviceUpdater.* (ha.serviceUpdater / repmgr.serviceUpdater) was removed in chart 2.0.0: the service-updater sidecar only existed to reconcile PGPool backends after a repmgrd failover, and the agent does that itself. Delete this key." -}}
 {{- end -}}
 {{- if hasKey $alias "monitoringHistoryDays" -}}
-{{- fail "repmgr.monitoringHistoryDays was removed in chart 2.0.0: it pruned repmgr.monitoring_history, which only repmgrd ever wrote. Delete this key." -}}
+{{- fail "monitoringHistoryDays (ha.monitoringHistoryDays / repmgr.monitoringHistoryDays) was removed in chart 2.0.0: it pruned repmgr.monitoring_history, which only repmgrd ever wrote. Delete this key." -}}
 {{- end -}}
 {{- if hasKey .Values.pgpool "autoFailback" -}}
 {{- fail "pgpool.autoFailback was removed in chart 2.0.0: it rendered PGPool's auto_failback, which only applied to the repmgrd failover flow. The agent fronts the Services and re-points them itself, so PGPool never fails a backend over. Delete this key." -}}
@@ -1538,10 +1551,20 @@ false
        what makes that true.
 
        Additive on purpose, which is what keeps the rename a minor rather than a break: every
-       released 1.x values file still works. `ha.*` wins key-by-key (mergeOverwrite, not a
+       released 1.x values file still works. `repmgr.*` wins key-by-key (mergeOverwrite, not a
        whole-block replacement) so an operator can adopt the new name for one setting without
-       restating the rest. Dropping the aliases is the break, and belongs to the major that also
-       deletes mechanism.Repmgr and renames the image.
+       restating the rest.
+
+       That direction is deliberate and easy to get backwards -- an earlier draft of this
+       comment did. The `ha:` side of the merge is where the CHART DEFAULTS live (values.yaml
+       ships the block under that name), so making `ha.*` win would let a default beat a value
+       the operator actually set: `repmgr.agent.mechanism: repmgr` would be silently ignored
+       rather than rejected. `repmgr.*` is only ever non-empty because someone wrote it, so it
+       is the operator's input and it wins. The consequence to state plainly, because it is
+       counter-intuitive: a file carrying BOTH spellings of one key gets the `repmgr.*` value,
+       so a half-finished migration keeps the OLD value until the old key is deleted.
+
+       Dropping the aliases is the break, and belongs to the major that also renames the image.
 
        Implemented as ONE mutation of .Values rather than a coalescing accessor per key: there
        are ~39 keys and 13 templates, and scattering `or .Values.ha.x .Values.ha.x` through
@@ -1563,19 +1586,6 @@ false
 {{- $_ := set .Values "ha" (mergeOverwrite $ha $alias) -}}
 {{- end -}}
 
-{{- /* True when the operator is still using the deprecated `repmgr.*` namespace, so the NOTES
-       can tell them which keys to move. Deliberately not a `fail`: the whole point of the alias
-       window is that an existing values file keeps working. Removed keys (failoverMode,
-       serviceUpdater.*) are a different matter and still fail -- see
-       pg.validateRemovedRepmgrdValues.
-
-       PRECONDITION, and it is load-bearing: this is a PRESENCE test, so it is only meaningful
-       once the chart's own defaults live under `ha:` in values.yaml. While they still ship under
-       `repmgr:`, Helm merges them in before any template runs and this returns true on every
-       install -- including one that sets nothing but `ha.*` -- which would make the notice pure
-       noise (#290 review). A template cannot tell an operator-set value from a chart default,
-       so there is no way to fix that here; moving the defaults is the fix, and it is the next
-       step of #291. NO CALLERS until then, on purpose. */ -}}
 {{- /*
 pg.usesDeprecatedRepmgrValues -- true when the operator's values file still spells the HA
 block "repmgr:" rather than "ha:" (#291). Drives the deprecation notice in NOTES.txt.

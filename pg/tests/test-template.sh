@@ -4823,5 +4823,61 @@ assert_contains "#291 pgvector: the repmgr.* alias reaches the render" "${pgv_al
 pgv_alias_new=$(helm template test-pgv "${PGVECTOR_DIR}" --set ha.username=newuser 2>&1)
 assert_contains "#291 pgvector: ha.* reaches the render" "${pgv_alias_new}" 'newuser'
 
+# #291 review: the removed-key guards must fire under BOTH spellings. Reading only the alias
+# namespace made them skippable by taking the very rename NOTES.txt recommends -- a 1.x file
+# with `failoverMode: repmgrd` renamed to `ha:` rendered clean and deployed an agent cluster
+# to an operator who believed repmgrd was running, into the immutable podManagementPolicy trap.
+for removed_spelling in repmgr ha; do
+  for removed_key in failoverMode=repmgrd serviceUpdater.enabled=true monitoringHistoryDays=7; do
+    rm_rc=0
+    helm template test-pg "${CHART_DIR}" --set "${removed_spelling}.${removed_key}" >/dev/null 2>&1 \
+      || rm_rc=$?
+    assert_gt "#291: ${removed_spelling}.${removed_key%%=*} is still rejected" "${rm_rc}" 0
+  done
+done
+
+# ...and `failoverMode: agent` too, which has its own gentler message and is the spelling a
+# 1.x file on the default would carry.
+fm_agent=$(helm template test-pg "${CHART_DIR}" --set ha.failoverMode=agent 2>&1 || true)
+assert_contains "#291: ha.failoverMode=agent is rejected with the delete-the-key message" \
+  "${fm_agent}" "no longer means anything"
+
+# Templates that read .Values.ha transitively must normalize themselves rather than relying on
+# statefulset.yaml having sorted earlier and mutated .Values -- helm-unittest renders per file,
+# so an alias-driven assertion on one of these would otherwise pass vacuously (#291 review).
+for lone_tpl in networkpolicy service-headless databases-roles-job; do
+  norm_hits=$(grep -c 'pg.normalizeValues' "${CHART_DIR}/templates/${lone_tpl}.yaml" || true)
+  assert_gt "#291: templates/${lone_tpl}.yaml normalizes before reading .Values.ha" \
+    "${norm_hits}" 0
+done
+
+# The behavioural half of the same point: rendered ALONE, the alias still decides.
+# `|| true`: with HA off this template renders nothing and helm exits non-zero ("could not
+# find template"), which under set -e would kill the suite. Absence IS the expected result.
+lone_off=$(helm template test-pg "${CHART_DIR}" \
+  --show-only templates/service-headless.yaml --set repmgr.enabled=false 2>&1 || true)
+assert_not_contains "#291: a lone-rendered template honours the repmgr.* alias" \
+  "${lone_off}" "agent-metrics"
+lone_on=$(helm template test-pg "${CHART_DIR}" --show-only templates/service-headless.yaml 2>&1)
+assert_contains "#291: ...and still renders the agent port by default" "${lone_on}" "agent-metrics"
+
+# The chart's own example overlays must not trip the deprecation notice they exist to precede.
+#
+# Asserted on the FILE, not on a render: NOTES.txt is not part of `helm template` output at
+# all (only `helm install --dry-run` renders it), so an assert_not_contains "DEPRECATED VALUES"
+# against a render would pass no matter what the overlay contained. That vacuous form was
+# written here first and caught by checking it against a values file known to be deprecated.
+# The notice's own logic is covered by pg.usesDeprecatedRepmgrValues; what this guards is that
+# a chart-shipped example does not use the deprecated spelling.
+for overlay_chart in "${CHART_DIR}" "${PGVECTOR_DIR}"; do
+  overlay_file="${overlay_chart}/values-cloud.yaml"
+  assert_eq "#291: $(basename "${overlay_chart}")/values-cloud.yaml has no repmgr: block" "0" \
+    "$(grep -c '^repmgr:' "${overlay_file}" || true)"
+  # ...and it must still be a values file the chart actually accepts.
+  overlay_rc=0
+  helm template test-o "${overlay_chart}" -f "${overlay_file}" >/dev/null 2>&1 || overlay_rc=$?
+  assert_eq "#291: $(basename "${overlay_chart}")/values-cloud.yaml still renders" "0" "${overlay_rc}"
+done
+
 end_suite
 print_summary

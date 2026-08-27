@@ -337,8 +337,11 @@ postgresql:
 #
 # RENAMED from repmgr.* in 2.0.0 (#291): the old namespace named a component this chart no
 # longer installs. `repmgr.*` still works as a deprecated alias for one major cycle -- it is
-# merged key-by-key over these defaults, so an existing values file keeps working and you can
-# move one key at a time. See the pg chart values for the full reasoning.
+# merged key-by-key OVER these defaults, so where a key appears under both names the `repmgr:`
+# one wins (it is the one you wrote). An existing values file keeps working, and you can move
+# one key at a time -- delete each old key as you move it, or the old value stays in effect.
+# Removed keys (failoverMode, serviceUpdater.*, monitoringHistoryDays) are rejected under
+# BOTH names. See the pg chart values for the full reasoning.
 # ==========================================================================================
 ha:
   image:
@@ -1192,10 +1195,19 @@ global:
 # values for tuning (replicaCount, resources, persistence). Adds 3 stateful pods.
 etcd:
   enabled: false
-  # The bundled etcd's RBAC-bootstrap Job runs the pg-ha-agent (repmgr) image, so keep
-  # this in lockstep with repmgr.image.tag above; the subchart's own default can lag.
+  # The bundled etcd's RBAC-bootstrap Job runs the HA image, so keep this in lockstep with
+  # ha.image above; the subchart's own default can lag.
   # The subchart reads it at rbac.bootstrapImage -- a top-level etcd.bootstrapImage is
   # silently ignored, which left the Job on the subchart's older default (#269 review).
+  #
+  # The REPOSITORY is pinned here too, not just the tag (#291 review). Only the tag was
+  # overridden before, so it tracked ha.image.tag while the repository stayed on the
+  # subchart's default -- fine while both said cagriekin/repmgr, but the #290 rename makes
+  # that pair a coordinate that does not exist (cagriekin/repmgr is frozen at its last
+  # trixie- tag, and the new tag scheme only ever appears under cagriekin/pg-ha). It failed
+  # exactly this way in a simulated two-step: the etcd-TLS fixture rendered
+  # cagriekin/repmgr:2.0.0-pg17. Both halves move together or neither does.
   rbac:
     bootstrapImage:
+      repository: cagriekin/repmgr
       tag: trixie-5.5.0-33
