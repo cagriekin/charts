@@ -508,8 +508,8 @@ These three values are validated at render time, so a mistake fails `helm instal
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `ha.enabled` | Enable HA (the lease-based agent + replication). `false` is standalone: one stock-postgres pod, `replicaCount` must be `0` | `true` |
-| `ha.image.repository` | HA image repository — the PostgreSQL + failover-agent image. Moving to `cagriekin/pg-ha` once that image is published (#290); `cagriekin/repmgr` stays published and frozen so existing pins keep resolving | `cagriekin/repmgr` |
-| `ha.image.tag` | HA image tag. Unsuffixed = the default major (18); `-pg18` / `-pg17` select one explicitly | `trixie-5.5.0-34` |
+| `ha.image.repository` | HA image repository — the PostgreSQL + failover-agent image. `cagriekin/pg-ha` since 2.0.0 (#290); `cagriekin/repmgr` stays published and frozen at its last `trixie-` tag so existing 1.x pins keep resolving | `cagriekin/pg-ha` |
+| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.0.0-pg18` |
 | `ha.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `ha.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `ha.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
@@ -570,7 +570,7 @@ postgresql:
     tag: 17.10-trixie      # only used in standalone mode / for the extension copy
 repmgr:
   image:
-    tag: trixie-5.5.0-34-pg17
+    tag: 2.0.0-pg17
     majorVersion: "17"
 ```
 

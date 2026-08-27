@@ -173,7 +173,7 @@ matching `prefix`.
 | `rbac.adminSecret` | admin client cert Secret (CN must be `root`) | `""` |
 | `rbac.healthCheckCN` | CN of the read-only health user; the server cert's CN must equal it | `etcd-healthcheck` |
 | `rbac.tenants` | per-tenant grants (`[{commonName, prefix}]`) | `[]` |
-| `rbac.bootstrapImage` | image running `pg-ha-agent rbac-bootstrap` (etcd image has no shell) | `cagriekin/repmgr:trixie-5.5.0-24` |
+| `rbac.bootstrapImage` | image running `pg-ha-agent rbac-bootstrap` (etcd image has no shell) | `cagriekin/pg-ha:2.0.0-pg18` |
 | `rbac.resources` | bootstrap Job container resources | small requests/limits |
 | `networkPolicy.enabled` | ingress lockdown (needs a NP-enforcing CNI) | `true` |
 | `networkPolicy.allowedClients` | cross-namespace client allow-list for a shared etcd (`[{namespace, podSelector?}]`) | `[]` |

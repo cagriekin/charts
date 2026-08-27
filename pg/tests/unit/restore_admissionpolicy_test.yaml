@@ -168,7 +168,7 @@ tests:
           pattern: "ephemeralContainers"
       - matchRegex:
           path: spec.validations[8].expression
-          pattern: "c\\.image == 'cagriekin/repmgr:trixie-5\\.5\\.0-34'"
+          pattern: "c\\.image == 'cagriekin/pg-ha:2\\.0\\.0-pg18'"
 
   # The pod's OWN labels, which validation #2 (the Job object's label) says nothing about.
   # A restore pod carrying component=postgresql joins the write Service's endpoints, and a

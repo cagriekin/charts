@@ -377,6 +377,7 @@ pkg_major19=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.extensions.enabled=true \
   --set postgresql.majorVersion=19 \
   --set repmgr.image.majorVersion=19 \
+  --set repmgr.image.tag=2.0.0-pg19 \
   --set 'postgresql.extensions.packages[0]=postgresql-{major}-cron' \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#303: {major}=19 substitutes into the package name" "${pkg_major19}" "postgresql-19-cron"
@@ -1802,7 +1803,7 @@ assert_contains "etcd RBAC: bootstrap Job renders" "${etcd_rbac}" "kind: Job"
 assert_contains "etcd RBAC: runs as a post-install/upgrade hook" "${etcd_rbac}" "post-install,post-upgrade"
 # the etcd image is distroless, so the Job runs the agent subcommand, not a shell/etcdctl
 assert_contains "etcd RBAC: runs pg-ha-agent rbac-bootstrap" "${etcd_rbac}" "rbac-bootstrap"
-assert_contains "etcd RBAC: uses the agent (repmgr) image, not the etcd image" "${etcd_rbac}" "cagriekin/repmgr:"
+assert_contains "etcd RBAC: uses the agent (HA) image, not the etcd image" "${etcd_rbac}" "cagriekin/pg-ha:"
 # tenants travel as a JSON env (commonName/prefix); the value is YAML-quoted, so
 # match on the unescaped tokens rather than the escaped-quote punctuation.
 assert_contains "etcd RBAC: tenants env is JSON" "${etcd_rbac}" "ETCD_RBAC_TENANTS"
@@ -2120,7 +2121,7 @@ assert_contains "#38: script strips the unmountable include_dir to avoid a start
 assert_contains "#38: script puts the PG bin dir on PATH (pg_ctl/psql are not on the default PATH)" "${pgbr_script}" "/usr/lib/postgresql"
 # Runs from the repmgr image (has pgbackrest + matching PG major), as the repmgr SA
 # (workload identity for keyType=auto), with no API token.
-assert_contains "#38: uses the repmgr image" "${pgbr_val}" "cagriekin/repmgr"
+assert_contains "#38: uses the HA image" "${pgbr_val}" "cagriekin/pg-ha"
 assert_contains "#38: reuses the postgresql/repmgr ServiceAccount (workload identity)" "${pgbr_val}" "serviceAccountName: test-pg-repmgr"
 assert_contains "#38: makes no API calls (no SA token)" "${pgbr_val}" "automountServiceAccountToken: false"
 assert_contains "#38: keyType=shared wires the static S3 key from the secret" "${pgbr_val}" "name: PGBACKREST_REPO1_S3_KEY"
@@ -2167,7 +2168,7 @@ assert_contains "#226: PGDATA is the live data directory" "${pgbr_res}" "value: 
 assert_contains "#226: runs the mounted restore.sh" "${pgbr_res}" "/scripts/restore.sh"
 assert_contains "#226: mounts restore.sh from the configmap" "${pgbr_res}" "key: restore.sh"
 # Identity + security context inherited from the chart (the #38 plumbing).
-assert_contains "#226: uses the repmgr image" "${pgbr_res}" "cagriekin/repmgr"
+assert_contains "#226: uses the HA image" "${pgbr_res}" "cagriekin/pg-ha"
 assert_contains "#226: reuses the postgresql/repmgr ServiceAccount (workload identity)" "${pgbr_res}" "serviceAccountName: test-pg-repmgr"
 assert_contains "#226: makes no API calls (no SA token)" "${pgbr_res}" "automountServiceAccountToken: false"
 assert_contains "#226: postgresql pod securityContext (fsGroup 103)" "${pgbr_res}" "fsGroup: 103"
@@ -2781,6 +2782,7 @@ assert_eq "major pin: default 18==18 renders (#133)" "0" "${major_default_rc}"
 major_rebump=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set repmgr.image.majorVersion=17 \
+  --set repmgr.image.tag=2.0.0-pg17 \
   --show-only templates/statefulset.yaml 2>&1) && major_rebump_rc=0 || major_rebump_rc=$?
 assert_eq "major pin: matched repmgr.image.majorVersion rebump renders (#133)" "0" "${major_rebump_rc}"
 
@@ -2802,10 +2804,10 @@ pg17_full=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set postgresql.image.tag=17.10-trixie \
   --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=trixie-5.5.0-29-pg17 \
+  --set repmgr.image.tag=2.0.0-pg17 \
   --show-only templates/statefulset.yaml 2>&1) && pg17_full_rc=0 || pg17_full_rc=$?
 assert_eq "#269: PG17 selection renders" "0" "${pg17_full_rc}"
-assert_contains "#269: PG17 selection uses the -pg17 repmgr image" "${pg17_full}" "cagriekin/repmgr:trixie-5.5.0-29-pg17"
+assert_contains "#269: PG17 selection uses the -pg17 HA image" "${pg17_full}" "cagriekin/pg-ha:2.0.0-pg17"
 
 # Extensions are where a wrong major becomes a crash-looping init container: the copy
 # paths are built from postgresql.majorVersion, so they must follow the selection with no
@@ -3256,6 +3258,7 @@ extpaths_19=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repm
   --set postgresql.extensions.enabled=true \
   --set postgresql.majorVersion=19 \
   --set repmgr.image.majorVersion=19 \
+  --set repmgr.image.tag=2.0.0-pg19 \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "majorVersion=19: ext-lib mountPath uses /usr/lib/postgresql/19/lib" "${extpaths_19}" "mountPath: /usr/lib/postgresql/19/lib"
 assert_contains "majorVersion=19: ext-share mountPath uses /usr/share/postgresql/19/extension" "${extpaths_19}" "mountPath: /usr/share/postgresql/19/extension"
@@ -5080,7 +5083,7 @@ assert_eq "#291: a valid reconcileInterval renders (guards the loop above)" "0" 
 # next image bump would silently reintroduce the drift.
 etcd_boot_args=(--set etcd.enabled=true --set ha.agent.dcs.backend=etcd)
 etcd_drift=$(helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
-  --set ha.image.tag=2.0.0-pg18 2>&1 || true)
+  --set ha.image.tag=2.1.0-pg18 2>&1 || true)
 assert_contains "#291: an etcd bootstrapImage that drifts from ha.image fails the render" \
   "${etcd_drift}" "must match ha.image"
 etcd_lock_rc=0

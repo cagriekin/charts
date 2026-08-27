@@ -203,7 +203,7 @@ postgresql:
   # ISO 27001) that require a per-object record of who did what. Off by default:
   # audit.enabled=false renders manifests identically to a chart with no audit block.
   #
-  # Requires ha.enabled=true -- the cagriekin/repmgr image bundles the pgaudit
+  # Requires ha.enabled=true -- the cagriekin/pg-ha image bundles the pgaudit
   # extension. Standalone mode (ha.enabled=false) uses the stock postgres image,
   # which has no pgaudit, so audit + standalone fails a render guard (a bare
   # shared_preload_libraries=pgaudit would crash-loop the postmaster). To audit in
@@ -347,19 +347,19 @@ postgresql:
 # ==========================================================================================
 ha:
   image:
-    repository: cagriekin/repmgr
-    tag: trixie-5.5.0-34
+    repository: cagriekin/pg-ha
+    tag: 2.0.0-pg18
     # Optional digest pin (e.g. "sha256:..."). When set it is appended as
     # repository:tag@digest, so the cosign-signed / provenance-attested image is
     # pinned at deploy time and a mutable-tag repush cannot silently change it.
     # Empty = pull by tag only. Refresh with: docker buildx imagetools inspect <ref>
     digest: ""
     pullPolicy: IfNotPresent
-    # PostgreSQL major version bundled in the repmgr image. The image ships
-    # exactly one PG major and always runs that server, so in repmgr mode the
+    # PostgreSQL major version bundled in the HA image. The image ships
+    # exactly one PG major and always runs that server, so in HA mode the
     # cluster runs this version regardless of postgresql.image. The chart fails
     # at render time unless postgresql.majorVersion matches this. Bump this and
-    # tag together when moving to a repmgr image built for a new PG major.
+    # tag together when moving to an HA image built for a new PG major.
     #
     # The image is published per major (#269), and since #290 the major is IN the tag:
     # cagriekin/pg-ha:<version>-pg18 and :<version>-pg17, with no unsuffixed
@@ -368,8 +368,9 @@ ha:
     # chart copies the vector extension out of the pgvector image, so that image must be
     # the same major. See pgvector/README.md "Choosing the PostgreSQL major".
     #
-    # The pin above is still the OLD cagriekin/repmgr scheme: the chart moves to pg-ha
-    # once that image is published (publish the image, then bump repository+tag here).
+    # cagriekin/repmgr is frozen at its last trixie- tag; 2.x builds are published only
+    # under cagriekin/pg-ha -- an image bump moves repository+tag here and the two
+    # etcd.rbac.bootstrapImage keys below (render-enforced) in one edit.
     majorVersion: "18"
 
   # Enable HA: the lease-based Go agent runs as PID 1 and drives failover. false is
@@ -1214,5 +1215,5 @@ etcd:
   # ha.image.repository/tag and these two -- not the two the two-step used to name.
   rbac:
     bootstrapImage:
-      repository: cagriekin/repmgr
-      tag: trixie-5.5.0-34
+      repository: cagriekin/pg-ha
+      tag: 2.0.0-pg18

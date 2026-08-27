@@ -228,8 +228,8 @@ When `ha.enabled` is true, `additionalCommands` automatically discover the curre
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `ha.enabled` | Enable HA (the lease-based agent + replication). `false` is standalone: one stock-postgres pod, `replicaCount` must be `0` | `true` |
-| `ha.image.repository` | HA image repository — the PostgreSQL + failover-agent image. Moving to `cagriekin/pg-ha` once that image is published (#290); `cagriekin/repmgr` stays published and frozen so existing pins keep resolving | `cagriekin/repmgr` |
-| `ha.image.tag` | HA image tag. Unsuffixed = the default major (18); `-pg18` / `-pg17` select one explicitly | `trixie-5.5.0-34` |
+| `ha.image.repository` | HA image repository — the PostgreSQL + failover-agent image. `cagriekin/pg-ha` since 2.0.0 (#290); `cagriekin/repmgr` stays published and frozen at its last `trixie-` tag so existing 1.x pins keep resolving | `cagriekin/pg-ha` |
+| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.0.0-pg18` |
 | `ha.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `ha.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `ha.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
@@ -261,7 +261,7 @@ postgresql:
     tag: pg17-trixie           # the pgvector image for the SAME major
 repmgr:
   image:
-    tag: trixie-5.5.0-34-pg17
+    tag: 2.0.0-pg17
     majorVersion: "17"
 ```
 
@@ -1180,7 +1180,7 @@ helm repo update
 helm upgrade my-pgvector cagriekin/pgvector   # add -f your-values.yaml
 ```
 
-`pgvector` tracks `pg` in lockstep — same version, image, and agent; the earlier 0.6.x ↔ 0.5.x split unified at `1.0.0` (current: `2.0.0`, image `trixie-5.5.0-34`). Within a major line `helm upgrade` rolls the pods once and needs no manual step. **2.0.0 removes the legacy repmgrd path** (#286): if you pinned `repmgr.failoverMode: repmgrd` the upgrade needs a one-time `--cascade=orphan` recreate; if you were on the default (agent, since `1.0.0`) just delete the key and upgrade normally. Read the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. **2.0.0 also renames the `repmgr:` values block to `ha:`** (#291) — nothing nested changed, and every `repmgr.*` key still works for this major because it is merged over its `ha.*` counterpart, so no values change is required of you now; the alias goes away in the next major. For the **compatibility matrix, the version model, the `repmgr.*` → `ha.*` diff, and the full 0.x → 1.x migration runbook**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
+`pgvector` tracks `pg` in lockstep — same version, image, and agent; the earlier 0.6.x ↔ 0.5.x split unified at `1.0.0` (current: `2.0.0`, image `cagriekin/pg-ha:2.0.0`). Within a major line `helm upgrade` rolls the pods once and needs no manual step. **2.0.0 removes the legacy repmgrd path** (#286): if you pinned `repmgr.failoverMode: repmgrd` the upgrade needs a one-time `--cascade=orphan` recreate; if you were on the default (agent, since `1.0.0`) just delete the key and upgrade normally. Read the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. **2.0.0 also renames the `repmgr:` values block to `ha:`** (#291) — nothing nested changed, and every `repmgr.*` key still works for this major because it is merged over its `ha.*` counterpart, so no values change is required of you now; the alias goes away in the next major. For the **compatibility matrix, the version model, the `repmgr.*` → `ha.*` diff, and the full 0.x → 1.x migration runbook**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
 
 ## pgvector Resources
 

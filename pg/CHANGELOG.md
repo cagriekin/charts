@@ -266,7 +266,8 @@
   rebuild, so the two can legitimately differ by a patch. `cagriekin/repmgr` stays published
   and frozen at its last tag, so existing pins keep resolving. There is no unsuffixed
   "default major" alias -- a pin names its major, and `ha.image.majorVersion` cross-checks it
-  at render time.
+  at render time. The default pin is `cagriekin/pg-ha:2.0.0-pg18` (`ha.image` and
+  `etcd.rbac.bootstrapImage` moved together), published from git tag `pg-ha-2.0.0`.
 
 ### Removed (breaking)
 

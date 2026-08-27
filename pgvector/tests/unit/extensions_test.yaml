@@ -29,7 +29,7 @@ tests:
     asserts:
       - matchRegex:
           path: spec.template.spec.initContainers[?(@.name=="copy-base-ext")].image
-          pattern: "^cagriekin/repmgr:"
+          pattern: "^cagriekin/pg-ha:"
 
   - it: ext-lib and ext-share are emptyDir volumes shared into the postgresql container
     asserts:
