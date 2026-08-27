@@ -86,11 +86,12 @@ jobs:
         working-directory: images/pg-ha/agent
         run: go mod verify
 
-      - name: hermetic vendored build (no network)
+      - name: build the agent
         working-directory: images/pg-ha/agent
         env:
-          GOFLAGS: -mod=vendor
-          GOPROXY: "off"
+          # go1.16+ default, explicit because it is the check: a build that would need a
+          # go.mod edit fails here rather than resolving a dependency nobody pinned (#333).
+          GOFLAGS: -mod=readonly
         run: go build ./...
 
       - name: govulncheck (pinned)
