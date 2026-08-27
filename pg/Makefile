@@ -4,7 +4,7 @@ TESTS_DIR := tests
 MAKEFLAGS += --output-sync=target
 
 .PHONY: test test-template test-cluster test-minimal test-full test-upgrade \
-        test-agent test-agent-control test-agent-control-restore test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-sync-replication-slots test-scaledown test-agent-rolling test-config test-backup-restore test-backup-concurrent test-pgbackrest-restore test-pgbackrest-restore-ha test-pgbackrest-bootstrap test-databases-roles test-special-chars byte-stable cluster-create cluster-delete cluster-exists clean help
+        test-agent test-agent-control test-agent-control-restore test-agent-etcd test-agent-etcd-tls test-tls test-pgpool-failover test-config-failover test-cascading-replication test-sync-replication-slots test-scaledown test-agent-rolling test-config test-backup-restore test-backup-concurrent test-pgbackrest-restore test-pgbackrest-restore-ha test-pgbackrest-bootstrap test-databases-roles test-special-chars test-migrate-native byte-stable cluster-create cluster-delete cluster-exists clean help
 
 help:
 	@echo "Targets:"
@@ -24,6 +24,7 @@ help:
 	@echo "  test-cascading-replication - Run cascading-replication chain + re-homing test (standalone, opt-in)"
 	@echo "  test-sync-replication-slots - Run logical replication slot sync test (#308, standalone, opt-in)"
 	@echo "  test-upgrade    - Run upgrade path tests"
+	@echo "  test-migrate-native - Migrate a live repmgr cluster to native, in place (#292)"
 	@echo "  test-config     - Run postgresql configuration tests (standalone)"
 	@echo "  test-backup-restore - Run backup and restore integration tests"
 	@echo "  test-backup-concurrent - Run concurrent pgbackrest backup + WAL archiving test"
@@ -135,6 +136,11 @@ test-full: cluster-exists
 
 test-upgrade: cluster-exists
 	@bash $(TESTS_DIR)/test-upgrade.sh
+
+# Not in test-cluster: this suite pulls a RELEASED chart and a RELEASED image from the network,
+# so it is the one suite that is not hermetic against the local tree (#292).
+test-migrate-native: cluster-exists
+	@bash $(TESTS_DIR)/test-migrate-native.sh
 
 test-config: cluster-exists
 	@bash $(TESTS_DIR)/test-config.sh

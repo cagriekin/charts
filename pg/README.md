@@ -621,7 +621,7 @@ The agent also fronts the read/write split: `pgpool` (if enabled) points at the 
 
 The `repmgr` mechanic — which shelled out to the repmgr CLI and depended on the `repmgr.nodes` table — is gone, along with repmgr itself ([upstream development had stalled](https://github.com/EnterpriseDB/repmgr)); the image no longer contains it (#290). `ha.agent.mechanism: repmgr` is rejected at render time rather than deleted, so a values file copied from 1.x fails with a message naming the migration. The `Mechanism` interface it was driven through (`images/pg-ha/agent/internal/mechanism`) remains, and the reconcile loop still imports only that interface, so a second implementation stays addressable.
 
-**An existing 1.x cluster is repmgr-shaped on disk and cannot be flipped in place yet (#292).** Until that ships, upgrading a live HA cluster needs the runbook below.
+**An existing 1.x cluster is repmgr-shaped on disk, and `helm upgrade` migrates it in place — no re-clone (#292).** See [Migrating a live repmgr cluster to native](#migrating-a-live-repmgr-cluster-to-native-292) for the runbook, including how to verify each node and how to roll back.
 
 The Lease, the timeline/LSN election, fencing, and Service routing are unchanged from 1.x — policy was never mechanism-specific, which is what made the swap possible.
 
@@ -650,10 +650,10 @@ indefinitely rather than forking a divergent one. That is the safe answer, but i
 delete the `<fullname>-primary` ConfigMap to let the holder bootstrap again, after confirming no
 surviving node holds newer data.
 
-Remaining gaps before #294 can promote `native` to supported and flip the default:
+Two things that were gaps while `native` was experimental, both closed:
 
 - **`cascadingReplication` works with `native` since #294.** Creation was never the gap: every slot-using native path (`Clone`, `Follow`, `RejoinForceRewind`) ensures this node's slot on whichever upstream it actually points at, so a cascading child self-provisions on its parent. The *reclaim* policy was the gap, and it is now cascade-aware on both sides — see the slot-ownership section below.
-- **An existing repmgr cluster cannot be flipped in place yet (#292).** `native` is for fresh installs until that lands.
+- **An existing repmgr cluster migrates in place since #292** — `helm upgrade`, no re-clone, timeline and system identifier preserved. Runbook: [Migrating a live repmgr cluster to native](#migrating-a-live-repmgr-cluster-to-native-292).
 
 The `#297` scale-up-race protection is a good example of a repmgr-mode safety behaviour that needs no native equivalent: it refuses to promote a node with no `repmgr.nodes` record, because repmgr resolves a follow target by `node_id` out of that table and an unregistered primary is one no survivor could follow. Native follows by conninfo — the lease holder's identity plus the headless FQDN — so a native primary is followable the moment it promotes, and the gate is skipped rather than replaced.
 
@@ -2706,6 +2706,222 @@ values file fails the upgrade rather than silently deploying something else:
 | `repmgr.serviceUpdater.*` | The sidecar it sized is gone | Delete the key |
 | `repmgr.monitoringHistoryDays` | Pruned `repmgr.monitoring_history`, which only repmgrd wrote | Delete the key |
 | `pgpool.autoFailback` | Rendered PGPool's `auto_failback`, which only applied to the repmgrd failover flow | Delete the key |
+
+### Migrating a live repmgr cluster to native (#292)
+
+Every cluster any 1.x release created is repmgr-shaped on disk. `helm upgrade` to 2.0.0 migrates
+it **in place**: no re-clone, no switchover, timeline and system identifier preserved. That
+matters at size — a re-clone of a multi-terabyte cluster is hours of degraded HA and a real RPO
+window, so "it converges eventually" is not the same thing as "it migrated".
+
+#### What is actually on disk, and what happens to it
+
+| State a 1.x cluster carries | What 2.0.0 does |
+|---|---|
+| `shared_preload_libraries = 'repmgr'` **inside PGDATA** | Stripped on first boot, before the postmaster starts (#293). This one is load-bearing: the 2.0.0 image has no `repmgr.so`, and the line lives in the data directory, so without the strip every pod crash-loops at once and `helm rollback` does **not** recover it |
+| `primary_conninfo` / `primary_slot_name` in `postgresql.auto.conf` | Removed, so the agent's own `conf.d` fragment becomes authoritative. `auto.conf` is read *after* every include, so leaving it would outrank the agent |
+| active `repmgr_slot_<node_id>` slots pinning WAL | Left alone while still streaming; dropped only once that standby has provably attached to its `pg_ha_slot_<ordinal>` replacement. The drop carries `AND NOT active`, so a slot still carrying a stream cannot be dropped — that is what makes it safe rather than merely ordered |
+| `repmgr` database, role, extension, `repmgr.nodes` rows | **Left in place.** The agent authenticates as that role, and dropping the rest is irreversible — see [Cleaning up the repmgr catalog](#cleaning-up-the-repmgr-catalog-opt-in) below |
+| `/etc/repmgr/repmgr.conf`, the `repmgr` OS user | Gone with the image. Nothing reads them; no data is deleted as part of an upgrade |
+
+#### Preconditions
+
+Refuse to start on a degraded cluster — that is the one situation where a mistake is not
+recoverable. Check all three:
+
+```bash
+NS=<namespace>; REL=<release>; FULLNAME=<fullname>   # usually <release>-pg
+
+# 1. Every pod Ready (agent readiness is replication-aware, so Ready implies streaming)
+kubectl get pods -n "$NS" -l app.kubernetes.io/component=postgresql
+
+# 2. One primary, and it is the lease holder. Capture it -- the primary is NOT ordinal-bound
+#    (the initial one is decided by the lease race, and any failover moves it), so every command
+#    below that must run "on the primary" uses this variable rather than -0.
+PRIMARY=$(kubectl get lease -n "$NS" "$FULLNAME-leader" -o jsonpath='{.spec.holderIdentity}')
+echo "primary: $PRIMARY"
+
+# 3. Every standby streaming, and no slot already orphaned -- on the PRIMARY, since that is
+#    where pg_stat_replication and the primary's slots live. Run this against a standby by
+#    mistake and both queries come back empty, which reads like "nothing wrong".
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- \
+  psql -U repmgr -d repmgr -Atc \
+  "SELECT application_name, state FROM pg_stat_replication ORDER BY 1"
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- \
+  psql -U repmgr -d repmgr -Atc \
+  "SELECT slot_name, active FROM pg_replication_slots ORDER BY 1"
+```
+
+Take a backup first regardless. If pgBackRest is enabled, confirm a recent full backup exists
+rather than assuming it.
+
+#### The upgrade
+
+```bash
+helm upgrade "$REL" cagriekin/pg -n "$NS" -f your-values.yaml --wait --timeout 20m
+```
+
+Nothing else is required — no `--cascade=orphan` recreate (that was the repmgrd→agent migration,
+a different and now-removed path), and no mechanism flag: `native` is the only mechanism in 2.0.0.
+The StatefulSet rolls highest ordinal first, which is standbys-before-primary already.
+
+If your values file still spells the block `repmgr:`, it keeps working — see
+[Renamed values](#renamed-values-repmgr--ha-291). Rename it in a **separate** commit from this
+upgrade, not the same one: if something does go wrong you want one variable changed, not two.
+
+#### Verifying each node migrated
+
+```bash
+# pg_controldata is not on PATH -- the image keeps the server binaries in the versioned bindir.
+PGMAJOR=18   # or 17, matching ha.image.majorVersion
+CTL="/usr/lib/postgresql/$PGMAJOR/bin/pg_controldata"
+
+for i in 0 1 2; do
+  POD="$FULLNAME-$i"; echo "== $POD"
+  # the system identifier must be what it was before the upgrade -- that is what proves no
+  # re-initdb. Do NOT expect the TIMELINE to be unchanged: the rollout replaces the primary's
+  # pod too, so the lease moves and whoever takes it promotes, which advances the timeline by
+  # design. What matters is that no node is left BEHIND on an older one, checked further down.
+  kubectl exec -n "$NS" "$POD" -c postgresql -- "$CTL" /var/lib/postgresql/data/pgdata \
+    | grep -E "system identifier|Latest checkpoint.s TimeLineID"
+  # the preload must be gone from PGDATA, not merely from the running config
+  kubectl exec -n "$NS" "$POD" -c postgresql -- \
+    grep -c "shared_preload_libraries.*repmgr" /var/lib/postgresql/data/pgdata/postgresql.conf || echo "0 (good)"
+  # a re-clone or a rewind would have left this behind
+  kubectl exec -n "$NS" "$POD" -c postgresql -- \
+    sh -c 'ls -d /var/lib/postgresql/data/pgdata.diverged.* 2>/dev/null | wc -l'
+done
+
+# Nobody stranded: every standby must be following the primary's timeline. GREATEST of the three
+# sources, because each one lags in a different situation -- the control file is as of the last
+# CHECKPOINT (a just-switched standby still shows the old timeline), and a just-promoted primary
+# has only REQUESTED its checkpoint.
+TLQ="SELECT GREATEST((SELECT timeline_id FROM pg_control_checkpoint()),
+                     COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0),
+                     COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0))"
+PRIMARY=$(kubectl get lease -n "$NS" "$FULLNAME-leader" -o jsonpath='{.spec.holderIdentity}')
+for i in 0 1 2; do
+  POD="$FULLNAME-$i"
+  echo "$POD tl=$(kubectl exec -n "$NS" "$POD" -c postgresql -- psql -U repmgr -d repmgr -Atc "$TLQ")"
+done   # all three must print the same number
+
+# Slots -- on EVERY node, not only the primary. Legacy repmgr_slot_* only ever existed on the
+# 1.x primary, and the rollout usually moves the primary elsewhere, so checking the current
+# primary alone would miss residue left on the DEMOTED node's own volume.
+# Branch on pg_is_in_recovery(): pg_current_wal_lsn() raises "recovery is in progress" on a
+# standby, so an unbranched query returns nothing but an error on the two nodes this loop most
+# needs to check -- a demoted ex-primary is exactly where legacy residue would sit. On a standby
+# the last RECEIVED LSN is the right reference instead.
+for i in 0 1 2; do
+  POD="$FULLNAME-$i"; echo "== $POD"
+  kubectl exec -n "$NS" "$POD" -c postgresql -- psql -U repmgr -d repmgr -Atc "
+    SELECT slot_name, active,
+           pg_size_pretty(pg_wal_lsn_diff(
+             CASE WHEN pg_is_in_recovery()
+                  THEN pg_last_wal_receive_lsn()
+                  ELSE pg_current_wal_lsn() END,
+             restart_lsn)) AS retained
+      FROM pg_replication_slots ORDER BY 1"
+done
+```
+
+A surviving `repmgr_slot_*` is the one result that needs action rather than patience: it means
+some standby never attached to its native slot. It is retained WAL growing on the primary's
+volume, and it raises no error until the disk fills. The
+`PGHAReplicationSlotInactive` alert covers it if you run the PrometheusRule.
+
+To hold the cluster steady while you inspect a node, use the pause marker. It is a
+**cluster-wide** switch on the marker ConfigMap, not a per-pod one, and it suspends automatic
+promote/demote/fence/self-health while the Lease keeps being renewed — so a node you are staring
+at will not be failed over underneath you:
+
+```bash
+kubectl annotate configmap -n "$NS" "$FULLNAME-primary" pg-ha/pause=true --overwrite
+# ...and to resume
+kubectl annotate configmap -n "$NS" "$FULLNAME-primary" pg-ha/pause- --overwrite
+```
+
+Pausing does not stop the StatefulSet rollout — it stops failover *decisions*. To hold the roll
+itself, use `kubectl rollout pause statefulset "$FULLNAME" -n "$NS"` and resume when satisfied.
+
+#### Rolling back
+
+The cluster stays repmgr-shaped until you run the opt-in cleanup below — that is deliberate, and
+it is what makes rollback possible. Once the cleanup has dropped the extension, rollback is no
+longer available; that is the reason the cleanup is a separate step.
+
+**Pass `--force-conflicts`.** A plain `helm rollback` fails on an agent-mode release:
+
+```
+Rollback failed: conflict occurred while applying object .../Service:
+  conflict with "pg-ha-agent" using v1: .spec.selector
+```
+
+The agent owns `Service.spec.selector` — it patches the selector to point at the current primary
+— and Helm 4 applies server-side, so Helm and the agent contend for that field. `--force-conflicts`
+tells the API server to hand the field back to Helm; the agent re-patches it on its next tick.
+Do **not** reach for `--force` / `--force-replace`: it is deprecated, it is rejected outright
+alongside server-side apply ("cannot use server-side apply and force replace together"), and
+replacement of a StatefulSet is not something you want mid-incident. This applies to any
+`helm rollback` of an agent-mode release, not only this migration.
+
+```bash
+helm rollback "$REL" -n "$NS" --force-conflicts --wait --timeout 12m
+# or, to a specific version: helm upgrade "$REL" cagriekin/pg --version 1.17.0 \
+#   -n "$NS" -f your-values.yaml --force-conflicts --wait --timeout 12m
+```
+
+**You do not need to restore `shared_preload_libraries`.** An earlier draft of this runbook told
+you to re-add `repmgr` with `ALTER SYSTEM` before rolling back. That was wrong twice over, and
+both halves are worth knowing:
+
+- It would not have stuck. `ALTER SYSTEM` writes `postgresql.auto.conf`, which is inside PGDATA,
+  and 2.0.0's agent strips repmgr from **both** `postgresql.conf` and `postgresql.auto.conf` on
+  every boot before the postmaster starts. Any restart of a still-2.0.0 pod in between — a
+  liveness restart, an eviction, an aborted rollback — silently reverted it.
+- It was not needed. Verified by rolling a migrated 3-node cluster back to 1.17.0 with the
+  preload absent: all three pods came up Ready, one primary with both standbys streaming, data
+  intact, `repmgr.nodes` queryable, and `repmgr cluster show` listing all three nodes with the
+  right roles. `shared_preload_libraries = 'repmgr'` was only ever required by **repmgrd**, the
+  daemon removed in 2.0.0 (#286); the extension's SQL and the repmgr CLI do not need it.
+
+After the rollback, confirm the cluster is on the old chart and healthy:
+
+```bash
+helm list -n "$NS"     # chart should read pg-1.x
+kubectl get pods -n "$NS" -l app.kubernetes.io/component=postgresql
+PRIMARY=$(kubectl get lease -n "$NS" "$FULLNAME-leader" -o jsonpath='{.spec.holderIdentity}')
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- psql -U repmgr -d repmgr -Atc \
+  "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'"
+```
+
+#### Cleaning up the repmgr catalog (opt-in)
+
+**Never run this as part of the upgrade.** `DROP EXTENSION` / `DROP DATABASE` is irreversible and
+it is what closes off rollback. Run it only after the cluster has been healthy on native long
+enough that you are satisfied — days, not minutes.
+
+Keep the **role**: the agent authenticates as `repmgr` for every probe and for `pg_basebackup`,
+and `primary_conninfo` carries `dbname=repmgr`. Renaming those is out of scope for 2.0.0 (it
+rewrites a live cluster's credentials). So the cleanup is the extension and its rows only:
+
+```bash
+# On the PRIMARY only -- it replicates to the standbys. Resolve it from the lease; the primary
+# is not ordinal-bound, and running a DROP against a standby fails rather than doing nothing.
+PRIMARY=$(kubectl get lease -n "$NS" "$FULLNAME-leader" -o jsonpath='{.spec.holderIdentity}')
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- psql -U repmgr -d repmgr -c '
+  DROP EXTENSION IF EXISTS repmgr CASCADE;
+'
+```
+
+That drops `repmgr.nodes`, `repmgr.monitoring_history` and the rest of the schema. Verify:
+
+```bash
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- psql -U repmgr -d repmgr -Atc \
+  "SELECT count(*) FROM pg_extension WHERE extname='repmgr'"    # expect 0
+```
+
+Do **not** `DROP DATABASE repmgr` or `DROP ROLE repmgr`: both are live dependencies of the agent.
 
 ### Crossing the 0.x → 1.x boundary
 
