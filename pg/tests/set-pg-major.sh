@@ -212,7 +212,11 @@ for f in "${TARGETS[@]}"; do
   n=$(grep -c "$KEEP_MARK" "$f" || true)
   [ "$n" -gt 0 ] || continue
   keep_hits=$((keep_hits + n))
-  sed -i -E "/${KEEP_MARK}/ s/(trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+)(-pg[0-9]+)?/\1-pg${MAJOR}/g" "$f"
+  # Both tag schemes, same alternation as every other rule here: the #290 pin move is a pending
+  # two-step, so a keep-marked pin can legitimately be on either shape. Matching only the legacy
+  # one would silently stop normalizing the moment the from-image moved -- and print
+  # "normalized" anyway, since keep_hits counts the LINE, not the substitution (#292 review).
+  sed -i -E "/${KEEP_MARK}/ s/(trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+|[0-9]+\.[0-9]+\.[0-9]+)(-pg[0-9]+)?/\1-pg${MAJOR}/g" "$f"
 done
 [ "$keep_hits" -gt 0 ] && echo "  deliberate older-release pins: ${keep_hits} normalized to -pg${MAJOR}"
 

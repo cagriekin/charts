@@ -284,7 +284,7 @@ jobs:
           - migrate-native
         include:
           - { suite: agent, coldboot: "1" }
-          - { suite: migrate-native, timeout_minutes: 55 }
+          - { suite: migrate-native, timeout_minutes: 50, no_retry: "1" }
     steps:
       - name: Free up runner disk space
         run: |
@@ -357,11 +357,19 @@ jobs:
       - name: Run ${{ matrix.suite }} suite (pg${{ matrix.pg_major }})
         env:
           AGENT_COLDBOOT: ${{ matrix.coldboot }}
+          NO_RETRY: ${{ matrix.no_retry }}
         run: |
           set +e
           run() { make -C pg test-${{ matrix.suite }}; }
           run; rc=$?
-          if [ "$rc" -ne 0 ]; then
+          # NO_RETRY legs opt out of the second attempt (#292 review): timeout-minutes is a JOB
+          # budget, so a retry halves what each attempt gets. migrate-native is the longest
+          # suite in the matrix and would end up with LESS per attempt than every shorter leg,
+          # killed mid-run with no diagnosis -- the exact outcome the per-leg budget exists to
+          # avoid. Its own convergence waits already absorb the churn a retry was papering over.
+          if [ "$rc" -ne 0 ] && [ -n "${NO_RETRY:-}" ]; then
+            echo "::notice title=no-retry::test-${{ matrix.suite }} (pg${{ matrix.pg_major }}) failed (rc=${rc}); this leg does not retry"
+          elif [ "$rc" -ne 0 ]; then
             echo "::warning title=suite-retry::test-${{ matrix.suite }} (pg${{ matrix.pg_major }}) failed (rc=${rc}); cleaning namespaces and retrying once"
             kubectl get ns -o name 2>/dev/null | sed 's#namespace/##' | grep '^pg-test' \
               | xargs -r -I{} kubectl delete ns {} --ignore-not-found --wait=true --timeout=180s || true

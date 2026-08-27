@@ -2766,7 +2766,7 @@ a different and now-removed path), and no mechanism flag: `native` is the only m
 The StatefulSet rolls highest ordinal first, which is standbys-before-primary already.
 
 If your values file still spells the block `repmgr:`, it keeps working — see
-[Renamed values](#renamed-values-repmgr---ha-291). Rename it in a **separate** commit from this
+[Renamed values](#renamed-values-repmgr--ha-291). Rename it in a **separate** commit from this
 upgrade, not the same one: if something does go wrong you want one variable changed, not two.
 
 #### Verifying each node migrated
@@ -2808,11 +2808,20 @@ done   # all three must print the same number
 # Slots -- on EVERY node, not only the primary. Legacy repmgr_slot_* only ever existed on the
 # 1.x primary, and the rollout usually moves the primary elsewhere, so checking the current
 # primary alone would miss residue left on the DEMOTED node's own volume.
+# Branch on pg_is_in_recovery(): pg_current_wal_lsn() raises "recovery is in progress" on a
+# standby, so an unbranched query returns nothing but an error on the two nodes this loop most
+# needs to check -- a demoted ex-primary is exactly where legacy residue would sit. On a standby
+# the last RECEIVED LSN is the right reference instead.
 for i in 0 1 2; do
   POD="$FULLNAME-$i"; echo "== $POD"
-  kubectl exec -n "$NS" "$POD" -c postgresql -- psql -U repmgr -d repmgr -Atc \
-    "SELECT slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
-       FROM pg_replication_slots ORDER BY 1"
+  kubectl exec -n "$NS" "$POD" -c postgresql -- psql -U repmgr -d repmgr -Atc "
+    SELECT slot_name, active,
+           pg_size_pretty(pg_wal_lsn_diff(
+             CASE WHEN pg_is_in_recovery()
+                  THEN pg_last_wal_receive_lsn()
+                  ELSE pg_current_wal_lsn() END,
+             restart_lsn)) AS retained
+      FROM pg_replication_slots ORDER BY 1"
 done
 ```
 
@@ -2841,40 +2850,50 @@ The cluster stays repmgr-shaped until you run the opt-in cleanup below — that 
 it is what makes rollback possible. Once the cleanup has dropped the extension, rollback is no
 longer available; that is the reason the cleanup is a separate step.
 
-**Order matters, and it is not the order you would guess.** Rollback restores the chart and the
-image, but it does **not** restore the `shared_preload_libraries` line — that lived in the data
-directory, not the release, and 2.0.0 stripped it. A 1.x image running the repmgr *mechanism*
-needs it, so it has to go back **before** the pods come up on the old image, not after.
+**Pass `--force-conflicts`.** A plain `helm rollback` fails on an agent-mode release:
 
-**Step 1 — re-add the preload on every node, while still on 2.0.0.** Preserve whatever else is
-already in the list; a bare `= 'repmgr'` would silently drop `pgaudit` (and any library you
-declared yourself), because `ALTER SYSTEM` writes to `postgresql.auto.conf`, which PostgreSQL
-reads *after* the chart's own `conf.d` fragment and therefore overrides it:
-
-```bash
-for i in 0 1 2; do
-  POD="$FULLNAME-$i"
-  CUR=$(kubectl exec -n "$NS" "$POD" -c postgresql -- \
-    psql -U postgres -Atc "SHOW shared_preload_libraries")
-  case ",$CUR," in
-    *,repmgr,*) NEW="$CUR" ;;                                  # already there
-    *) NEW=$([ -n "$CUR" ] && echo "repmgr,$CUR" || echo "repmgr") ;;
-  esac
-  echo "$POD: '$CUR' -> '$NEW'"
-  kubectl exec -n "$NS" "$POD" -c postgresql -- \
-    psql -U postgres -c "ALTER SYSTEM SET shared_preload_libraries = '$NEW'"
-done
+```
+Rollback failed: conflict occurred while applying object .../Service:
+  conflict with "pg-ha-agent" using v1: .spec.selector
 ```
 
-**Step 2 — roll back the release**, which restarts the pods and picks the line up:
+The agent owns `Service.spec.selector` — it patches the selector to point at the current primary
+— and Helm 4 applies server-side, so Helm and the agent contend for that field. `--force-conflicts`
+tells the API server to hand the field back to Helm; the agent re-patches it on its next tick.
+Do **not** reach for `--force` / `--force-replace`: it is deprecated, it is rejected outright
+alongside server-side apply ("cannot use server-side apply and force replace together"), and
+replacement of a StatefulSet is not something you want mid-incident. This applies to any
+`helm rollback` of an agent-mode release, not only this migration.
 
 ```bash
-helm rollback "$REL" -n "$NS"     # or: helm upgrade --version 1.17.0 -f your-values.yaml ...
+helm rollback "$REL" -n "$NS" --force-conflicts --wait --timeout 12m
+# or, to a specific version: helm upgrade "$REL" cagriekin/pg --version 1.17.0 \
+#   -n "$NS" -f your-values.yaml --force-conflicts --wait --timeout 12m
 ```
 
-`shared_preload_libraries` is a postmaster parameter, so it takes effect only on that restart —
-which is exactly why step 1 comes first. Verify afterwards that every pod is Ready and that
-`SHOW shared_preload_libraries` lists `repmgr` plus anything it listed before.
+**You do not need to restore `shared_preload_libraries`.** An earlier draft of this runbook told
+you to re-add `repmgr` with `ALTER SYSTEM` before rolling back. That was wrong twice over, and
+both halves are worth knowing:
+
+- It would not have stuck. `ALTER SYSTEM` writes `postgresql.auto.conf`, which is inside PGDATA,
+  and 2.0.0's agent strips repmgr from **both** `postgresql.conf` and `postgresql.auto.conf` on
+  every boot before the postmaster starts. Any restart of a still-2.0.0 pod in between — a
+  liveness restart, an eviction, an aborted rollback — silently reverted it.
+- It was not needed. Verified by rolling a migrated 3-node cluster back to 1.17.0 with the
+  preload absent: all three pods came up Ready, one primary with both standbys streaming, data
+  intact, `repmgr.nodes` queryable, and `repmgr cluster show` listing all three nodes with the
+  right roles. `shared_preload_libraries = 'repmgr'` was only ever required by **repmgrd**, the
+  daemon removed in 2.0.0 (#286); the extension's SQL and the repmgr CLI do not need it.
+
+After the rollback, confirm the cluster is on the old chart and healthy:
+
+```bash
+helm list -n "$NS"     # chart should read pg-1.x
+kubectl get pods -n "$NS" -l app.kubernetes.io/component=postgresql
+PRIMARY=$(kubectl get lease -n "$NS" "$FULLNAME-leader" -o jsonpath='{.spec.holderIdentity}')
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- psql -U repmgr -d repmgr -Atc \
+  "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'"
+```
 
 #### Cleaning up the repmgr catalog (opt-in)
 

@@ -67,6 +67,23 @@
   avoid. Left alone, each of the 3 KinD workers would pull it anonymously from Docker Hub
   mid-suite.
 
+  The runbook's rollback section was rewritten against a tested rollback rather than a guess, and
+  both of its claims turned out to be wrong:
+
+  - **`helm rollback` needs `--force-conflicts` on any agent-mode release.** A plain rollback
+    fails with a field-manager conflict on `Service.spec.selector`: the agent owns that field (it
+    points the Service at the current primary) and Helm 4 applies server-side, so the two
+    contend. `--force` / `--force-replace` is not the answer -- it is deprecated AND rejected
+    outright alongside server-side apply. This is not specific to the migration; it applies to
+    rolling back any agent-mode release, and it was previously only a comment in a test suite.
+  - **Restoring `shared_preload_libraries` before rolling back is neither possible nor needed.**
+    `ALTER SYSTEM` writes `postgresql.auto.conf`, which is inside PGDATA and which 2.0.0's agent
+    strips on every boot -- so any restart of a still-2.0.0 pod silently reverted it. And it is
+    unnecessary: a migrated 3-node cluster rolled back to 1.17.0 with the preload absent came up
+    with all pods Ready, one primary, both standbys streaming, data intact, `repmgr.nodes`
+    queryable and `repmgr cluster show` correct. The GUC was only ever required by repmgrd, the
+    daemon 2.0.0 removed -- which incidentally answers the question #293 left open.
+
   The runbook had four defects that would have misled an operator: bare `pg_controldata` (not on
   PATH -- the image keeps server binaries in the versioned bindir), `<fullname>-0` hardcoded as
   the primary in five places (the primary is not ordinal-bound, so the checks would have reported
@@ -77,7 +94,7 @@
   New KinD suite `test-migrate-native` (`make -C pg test-migrate-native`, and a matrix leg on
   both majors): installs the released 1.17.0 chart on an older released image that still contains
   repmgr, proves the starting state really is repmgr-shaped, then upgrades to the local chart and
-  asserts no re-clone, unchanged timeline and system identifier, data intact, every standby
+  asserts no re-clone, an unchanged system identifier, no node stranded on an older timeline, data intact, every standby
   streaming, native slots active, no legacy slot left pinning WAL, the catalog untouched, and
   that a second roll is a no-op. "No re-clone" is proved by a sentinel file written into each
   PGDATA -- `pg_basebackup` wipes the target directory, so a surviving sentinel is direct

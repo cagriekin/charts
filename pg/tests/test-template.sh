@@ -5185,9 +5185,21 @@ for mig_need in "Migrating a live repmgr cluster to native" \
                 "Cleaning up the repmgr catalog" \
                 "DROP EXTENSION IF EXISTS repmgr" \
                 "pg-ha/pause" \
-                "Rolling back"; do
+                "Rolling back" \
+                "force-conflicts" \
+                "pg_last_wal_receive_lsn"; do
   assert_contains "#292: the runbook covers '${mig_need}'" "${mig_readme}" "${mig_need}"
 done
+# The rollback section must not resurrect the ALTER SYSTEM step: it was verified unnecessary
+# (a migrated cluster rolled back to 1.17.0 with the preload absent came up healthy, repmgr CLI
+# included) and it would not have persisted anyway, since the agent rewrites postgresql.auto.conf
+# on every boot (#292 review).
+assert_not_contains "#292: the runbook does not tell anyone to ALTER SYSTEM the preload back" \
+  "$(awk '/^#### Rolling back/,/^#### Cleaning up/' "${CHART_DIR}/README.md")" \
+  "ALTER SYSTEM SET shared_preload_libraries"
+# ...and it must warn off --force / --force-replace, which Helm rejects alongside server-side apply.
+assert_contains "#292: the runbook warns off --force-replace" \
+  "$(cat "${CHART_DIR}/README.md")" "force-replace"
 # It must NOT tell anyone to drop the role or database: the agent authenticates as that role and
 # primary_conninfo carries dbname=repmgr, so either drop breaks a working cluster.
 assert_contains "#292: the runbook warns off dropping the role/database" \

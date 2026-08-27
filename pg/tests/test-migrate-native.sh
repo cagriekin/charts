@@ -105,7 +105,7 @@ echo "  primary (1.x): ${PRIMARY_BEFORE}"
 # quickly it gets there, so waiting costs nothing and removes a flake that would fire in CI.
 nodes_rows=""; waited=0
 while [ ${waited} -lt 300 ]; do
-  nodes_rows=$(pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" "SELECT count(*) FROM repmgr.nodes" "repmgr" "repmgr" | tr -d '[:space:]')
+  nodes_rows=$(pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" "SELECT count(*) FROM repmgr.nodes" "repmgr" "repmgr" | tr -d '[:space:]' || echo "")
   [ "${nodes_rows}" = "${NODES}" ] && break
   sleep 10; waited=$((waited + 10))
 done
@@ -115,7 +115,7 @@ assert_eq "1.x: repmgr.nodes is populated (${NODES} rows)" "${NODES}" "${nodes_r
 legacy_slots=0; waited=0
 while [ ${waited} -lt 300 ]; do
   legacy_slots=$(pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" \
-    "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'repmgr_slot_%' AND active" | tr -d '[:space:]')
+    "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'repmgr_slot_%' AND active" | tr -d '[:space:]' || echo "")
   [ "${legacy_slots}" = "$((NODES - 1))" ] && break
   sleep 10; waited=$((waited + 10))
 done
@@ -159,7 +159,7 @@ done
 streaming_before=0; waited=0
 while [ ${waited} -lt 300 ]; do
   streaming_before=$(pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" \
-    "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" | tr -d '[:space:]')
+    "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" | tr -d '[:space:]' || echo "")
   [ "${streaming_before}" = "$((NODES - 1))" ] && break
   sleep 10; waited=$((waited + 10))
 done
@@ -195,7 +195,7 @@ assert_eq "post: the primary is the lease holder" "${HOLDER}" "${PRIMARY}"
 # Exactly one writer.
 writers=0
 for i in $(seq 0 $((NODES - 1))); do
-  rec=$(pg_exec "${NAMESPACE}" "${FULLNAME}-${i}" "SELECT pg_is_in_recovery()" | tr -d '[:space:]')
+  rec=$(pg_exec "${NAMESPACE}" "${FULLNAME}-${i}" "SELECT pg_is_in_recovery()" | tr -d '[:space:]' || echo "")
   [ "${rec}" = "f" ] && writers=$((writers + 1))
 done
 assert_eq "post: exactly one writer (no split brain through the migration)" "1" "${writers}"
@@ -233,7 +233,7 @@ for i in $(seq 0 $((NODES - 1))); do
   # its parent. An earlier draft globbed ${PGDATA_DIR}/../.diverged.*, which matches nothing and
   # would have asserted 0 forever.
   diverged=$(kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- \
-    sh -c "ls -d ${PGDATA_DIR}.diverged.* 2>/dev/null | wc -l" | tr -d '[:space:]')
+    sh -c "ls -d ${PGDATA_DIR}.diverged.* 2>/dev/null | wc -l" | tr -d '[:space:]' || echo "")
   assert_eq "post ${pod}: no .diverged.* directory" "0" "${diverged}"
 done
 
@@ -256,7 +256,7 @@ done
 tl_expr="SELECT GREATEST((SELECT timeline_id FROM pg_control_checkpoint()), COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0), COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0))"
 primary_tli=""
 for _ in $(seq 1 30); do
-  primary_tli=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "${tl_expr}" | tr -d '[:space:]')
+  primary_tli=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "${tl_expr}" | tr -d '[:space:]' || echo "")
   [ -n "${primary_tli}" ] && [ "${primary_tli}" != "0" ] && break
   sleep 4
 done
@@ -267,7 +267,7 @@ for i in $(seq 0 $((NODES - 1))); do
   [ "${pod}" = "${PRIMARY}" ] && continue
   node_tli=""
   for _ in $(seq 1 30); do
-    node_tli=$(pg_exec "${NAMESPACE}" "${pod}" "${tl_expr}" | tr -d '[:space:]')
+    node_tli=$(pg_exec "${NAMESPACE}" "${pod}" "${tl_expr}" | tr -d '[:space:]' || echo "")
     [ "${node_tli}" = "${primary_tli}" ] && break
     sleep 4
   done
@@ -280,10 +280,10 @@ done
 for i in $(seq 0 $((NODES - 1))); do
   pod="${FULLNAME}-${i}"
   left=$(kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- \
-    sh -c "grep -c \"^[[:space:]]*shared_preload_libraries.*repmgr\" ${PGDATA_DIR}/postgresql.conf 2>/dev/null || true" | tr -d '[:space:]')
+    sh -c "grep -c \"^[[:space:]]*shared_preload_libraries.*repmgr\" ${PGDATA_DIR}/postgresql.conf 2>/dev/null || true" | tr -d '[:space:]' || echo "")
   assert_eq "post ${pod}: repmgr stripped from PGDATA's postgresql.conf (#293)" "0" "${left:-0}"
   auto_left=$(kubectl exec -n "${NAMESPACE}" "${pod}" -c postgresql -- \
-    sh -c "grep -c \"^[[:space:]]*\\(primary_conninfo\\|primary_slot_name\\)\" ${PGDATA_DIR}/postgresql.auto.conf 2>/dev/null || true" | tr -d '[:space:]')
+    sh -c "grep -c \"^[[:space:]]*\\(primary_conninfo\\|primary_slot_name\\)\" ${PGDATA_DIR}/postgresql.auto.conf 2>/dev/null || true" | tr -d '[:space:]' || echo "")
   assert_eq "post ${pod}: repmgr recovery config cleared from auto.conf (#292)" "0" "${auto_left:-0}"
 done
 
@@ -292,18 +292,18 @@ assert_not_contains "post: the running config no longer preloads repmgr" "${runn
 
 # Data survived, and the cluster still accepts writes.
 rows=$(pg_exec "${NAMESPACE}" "${PRIMARY}" \
-  "SELECT count(*) FROM migrate_native WHERE value='${MV}'" "testuser" "testdb" | tr -d '[:space:]')
+  "SELECT count(*) FROM migrate_native WHERE value='${MV}'" "testuser" "testdb" | tr -d '[:space:]' || echo "")
 assert_eq "post: pre-migration data is present" "1" "${rows}"
 pg_exec "${NAMESPACE}" "${PRIMARY}" \
   "INSERT INTO migrate_native (value) VALUES ('post-${MV}')" "testuser" "testdb" >/dev/null
-post_rows=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT count(*) FROM migrate_native" "testuser" "testdb" | tr -d '[:space:]')
+post_rows=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT count(*) FROM migrate_native" "testuser" "testdb" | tr -d '[:space:]' || echo "")
 assert_eq "post: the migrated primary accepts writes" "2" "${post_rows}"
 
 # Replication re-established on every standby, through the NATIVE naming.
 streaming=0; waited=0
 while [ ${waited} -lt 480 ]; do
   streaming=$(pg_exec "${NAMESPACE}" "${PRIMARY}" \
-    "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" | tr -d '[:space:]')
+    "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" | tr -d '[:space:]' || echo "")
   [ "${streaming}" = "$((NODES - 1))" ] && break
   sleep 10; waited=$((waited + 10))
 done
@@ -313,7 +313,7 @@ assert_eq "post: every standby is streaming again" "$((NODES - 1))" "${streaming
 # legacy slot that is merely INACTIVE is the dangerous residue -- it pins WAL forever and
 # raises no error until the volume fills.
 native_active=$(pg_exec "${NAMESPACE}" "${PRIMARY}" \
-  "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%' AND active" | tr -d '[:space:]')
+  "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%' AND active" | tr -d '[:space:]' || echo "")
 assert_eq "post: a native slot is active for every standby" "$((NODES - 1))" "${native_active}"
 
 # Legacy-slot residue is checked on EVERY node, not just the current primary -- and that is the
@@ -328,30 +328,35 @@ for i in $(seq 0 $((NODES - 1))); do
   # Reclaim happens on the owning node's own tick, so give it a few cycles rather than racing it.
   while [ ${waited} -lt 180 ]; do
     slot_legacy=$(pg_exec "${NAMESPACE}" "${pod}" \
-      "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'repmgr_slot_%'" | tr -d '[:space:]')
+      "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'repmgr_slot_%'" | tr -d '[:space:]' || echo "")
     [ "${slot_legacy}" = "0" ] && break
     sleep 10; waited=$((waited + 10))
   done
   assert_eq "post ${pod}: no legacy repmgr slot survived (no orphan pinning WAL)" "0" "${slot_legacy}"
-  slot_inactive=$(pg_exec "${NAMESPACE}" "${pod}" \
-    "SELECT count(*) FROM pg_replication_slots WHERE NOT active" | tr -d '[:space:]')
+  slot_inactive=""; waited=0
+  while [ ${waited} -lt 180 ]; do
+    slot_inactive=$(pg_exec "${NAMESPACE}" "${pod}" \
+      "SELECT count(*) FROM pg_replication_slots WHERE NOT active" | tr -d '[:space:]' || echo "")
+    [ "${slot_inactive}" = "0" ] && break
+    sleep 10; waited=$((waited + 10))
+  done
   assert_eq "post ${pod}: no inactive slot" "0" "${slot_inactive}"
 done
 
 # ...and explicitly on the node that WAS the 1.x primary, named rather than inferred, so the
 # coverage cannot be lost to a future refactor of the loop above.
 exprimary_legacy=$(pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" \
-  "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'repmgr_slot_%'" | tr -d '[:space:]')
+  "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'repmgr_slot_%'" | tr -d '[:space:]' || echo "")
 assert_eq "post: the 1.x primary (${PRIMARY_BEFORE}) kept no legacy slot" "0" "${exprimary_legacy}"
 
 # The catalog is deliberately NOT cleaned up by the upgrade: dropping the extension, database
 # and role is irreversible and must stay an operator decision (#292). Assert it is still there,
 # so an accidental automatic cleanup would fail this suite rather than surprise a consumer.
 ext_left=$(pg_exec "${NAMESPACE}" "${PRIMARY}" \
-  "SELECT count(*) FROM pg_extension WHERE extname='repmgr'" "repmgr" "repmgr" | tr -d '[:space:]')
+  "SELECT count(*) FROM pg_extension WHERE extname='repmgr'" "repmgr" "repmgr" | tr -d '[:space:]' || echo "")
 assert_eq "post: the repmgr extension is left in place (cleanup is opt-in)" "1" "${ext_left}"
 role_left=$(pg_exec "${NAMESPACE}" "${PRIMARY}" \
-  "SELECT count(*) FROM pg_roles WHERE rolname='repmgr'" | tr -d '[:space:]')
+  "SELECT count(*) FROM pg_roles WHERE rolname='repmgr'" | tr -d '[:space:]' || echo "")
 assert_eq "post: the repmgr role is left in place (the agent authenticates as it)" "1" "${role_left}"
 
 # Idempotence: the migration runs on every boot, so a second roll must be a no-op rather than a
@@ -373,7 +378,7 @@ for i in $(seq 0 $((NODES - 1))); do
     cat "${SENTINEL}" 2>/dev/null | tr -d '[:space:]' || echo "")
   assert_eq "re-roll ${pod}: sentinel still present (still no re-clone)" "${MV}" "${sent}"
 done
-rows2=$(pg_exec "${NAMESPACE}" "${PRIMARY2}" "SELECT count(*) FROM migrate_native" "testuser" "testdb" | tr -d '[:space:]')
+rows2=$(pg_exec "${NAMESPACE}" "${PRIMARY2}" "SELECT count(*) FROM migrate_native" "testuser" "testdb" | tr -d '[:space:]' || echo "")
 assert_eq "re-roll: data intact" "2" "${rows2}"
 
 end_suite
