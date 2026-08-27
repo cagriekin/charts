@@ -7,11 +7,14 @@ FROM --platform=$BUILDPLATFORM golang:1.25-bookworm@sha256:ea341baa9bd5ba6784f6d
 ARG TARGETARCH
 WORKDIR /src/agent
 COPY agent/go.mod agent/go.sum ./
-COPY agent/vendor ./vendor
+# Deps come from the module proxy, authenticated against go.sum -- which is what pins them;
+# the vendor/ tree this replaced only changed where the bytes were stored (#333). Its own
+# layer, before the source copy, so an agent code change reuses the cached download.
+# -mod=readonly is the go1.16+ default, set explicitly because it is load-bearing here: a
+# build that would need a go.mod edit fails instead of quietly resolving something new.
+RUN GOFLAGS=-mod=readonly go mod download
 COPY agent/ ./
-# Hermetic, air-gappable build: vendored deps only, no module downloads
-# (GOPROXY=off). -mod=vendor also fails if vendor/ drifts from go.mod.
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH GOFLAGS=-mod=vendor GOPROXY=off \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH GOFLAGS=-mod=readonly \
     go build -trimpath -ldflags="-s -w" -o /out/pg-ha-agent ./cmd/agent
 
 # --- Stage 2: the runtime image (PostgreSQL + pgaudit + pgbackrest + the Go agent) ---
