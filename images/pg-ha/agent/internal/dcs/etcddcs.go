@@ -171,9 +171,13 @@ func (e *EtcdDCS) runElection(ctx context.Context, identity string, cb Callbacks
 	// this node wins. Stops when ctx (the iteration) is cancelled.
 	go e.observe(ctx, el)
 
-	// Campaign blocks until this node is leader, or ctx is cancelled, or the session
-	// is lost -- all of which return an error here (we did NOT become leader).
-	if err := el.Campaign(ctx, identity); err != nil {
+	// Campaign blocks until this node is leader or ctx is cancelled. Session loss is
+	// NOT one of its exits, so it must be guarded explicitly -- see campaignGuarded
+	// for why an unguarded call yields zombie candidates and phantom leadership
+	// (#326).
+	if !campaignGuarded(ctx, sess.Done(), func(c context.Context) error {
+		return el.Campaign(c, identity)
+	}) {
 		return
 	}
 	e.isLeader.Store(true)
@@ -217,6 +221,25 @@ func (e *EtcdDCS) releaseSession(sess *concurrency.Session) {
 }
 
 // observe updates the last-seen leader identity from the election until ctx ends.
+//
+// NOTE: two known gaps here, both tracked on #326 and both needing an etcd-backed
+// test, so neither is addressed in the campaign-guard change.
+//
+//  1. It cannot clear the cache when the leader key is deleted, so Leader() can keep
+//     naming a node that is already gone. Election.Observe never reports a deletion:
+//     both of its send sites construct exactly one KV, and on a DELETE event it sets
+//     keyDeleted, re-Gets, finds nothing, and blocks in a PUT-only watch without
+//     sending. Clearing needs a different source -- a WithPrefix watch on cfg.Prefix
+//     for DELETE events, or polling el.Leader(ctx) and treating ErrElectionNoLeader
+//     as "clear".
+//  2. This loop never restarts. Election.observe does `defer close(ch)` and returns
+//     on ANY client.Get error, and its watch loop returns on channel closure without
+//     even checking wr.Err() -- so a single disruption (e.g. "required revision has
+//     been compacted") ends the range below permanently. A standby that never wins
+//     stays inside one runElection iteration indefinitely, so e.leader then freezes
+//     for the life of the process: with 3+ replicas, a node whose watch broke keeps
+//     reporting a leader that lost the lease hours ago and never re-targets. The fix
+//     is to re-enter Observe until ctx ends, not to exit on first closure.
 func (e *EtcdDCS) observe(ctx context.Context, el *concurrency.Election) {
 	for resp := range el.Observe(ctx) {
 		if len(resp.Kvs) > 0 {
@@ -252,4 +275,60 @@ func (e *EtcdDCS) retryPeriod() time.Duration {
 		return 2 * time.Second
 	}
 	return e.cfg.RetryPeriod
+}
+
+// campaignGuarded runs campaign and reports whether leadership was genuinely won,
+// i.e. won while the session lease was still alive.
+//
+// etcd's Election.Campaign does NOT abort when the session lapses: it puts a
+// lease-bound candidate key, then blocks in waitDeletes() watching only keys with a
+// LOWER revision, returning on ctx cancel or once those keys are gone. Session expiry
+// is not a termination condition (documented upstream, and identical in v3.5.12 and
+// the vendored v3.5.31 -- there is no upstream fix to adopt). Two failures follow
+// from calling it unguarded (#326):
+//
+//   - The lease expires mid-campaign, so etcd deletes this node's candidate key while
+//     Campaign stays blocked forever. The node becomes a zombie candidate -- no lease,
+//     no key, absent from the election -- and the Run loop never re-contends.
+//   - When the leader's key is eventually deleted, waitDeletes returns nil, so
+//     Campaign returns nil ("you are leader") while this node holds no lease and no
+//     key. Acting on that is phantom leadership, concurrent with the peer that holds
+//     the real lease and is correctly leader.
+//
+// So: stop waiting on the campaign the moment the session lapses, and re-check
+// liveness before reporting a win.
+//
+// The lapse path deliberately does NOT wait for the campaign to unwind. Cancelling
+// campCtx makes Campaign's waitDeletes return a ctx error, but Campaign then calls
+// Resign on the CLIENT context -- which carries no deadline and is only cancelled by
+// Client.Close() -- and clientv3 defaults to WaitForReady(true), so that Txn blocks
+// for the entire remainder of an etcd outage. Since the lapse is normally *caused* by
+// that outage, waiting would keep runElection from returning and defeat the very
+// guarantee this guard exists to provide. Returning immediately lets the Run loop
+// re-contend; the campaign goroutine unwinds on its own once etcd is reachable, and
+// its result goes to a buffered channel so it cannot block or leak.
+func campaignGuarded(ctx context.Context, sessDone <-chan struct{}, campaign func(context.Context) error) bool {
+	campCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- campaign(campCtx) }()
+
+	select {
+	case <-sessDone:
+		return false // lease gone: not leader, and do not block on the unwind
+	case err := <-done:
+		if err != nil {
+			return false
+		}
+	}
+
+	// Campaign reported a win, but it can do so after the lease is already gone.
+	// Leadership is valid only while the session still holds the lock.
+	select {
+	case <-sessDone:
+		return false
+	default:
+		return true
+	}
 }

@@ -56,7 +56,7 @@ repmgr:
   # runs agent mode -- which is the point: the scale-up race it covers is agent-specific.
   image:
     repository: cagriekin/repmgr
-    tag: trixie-5.5.0-33
+    tag: trixie-5.5.0-34
     pullPolicy: IfNotPresent
 
   enabled: true

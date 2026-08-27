@@ -229,7 +229,7 @@ When `ha.enabled` is true, `additionalCommands` automatically discover the curre
 |-----------|-------------|---------|
 | `ha.enabled` | Enable HA (the lease-based agent + replication). `false` is standalone: one stock-postgres pod, `replicaCount` must be `0` | `true` |
 | `ha.image.repository` | HA image repository — the PostgreSQL + failover-agent image. Moving to `cagriekin/pg-ha` once that image is published (#290); `cagriekin/repmgr` stays published and frozen so existing pins keep resolving | `cagriekin/repmgr` |
-| `ha.image.tag` | HA image tag. Unsuffixed = the default major (18); `-pg18` / `-pg17` select one explicitly | `trixie-5.5.0-33` |
+| `ha.image.tag` | HA image tag. Unsuffixed = the default major (18); `-pg18` / `-pg17` select one explicitly | `trixie-5.5.0-34` |
 | `ha.image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `ha.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `ha.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
 | `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
@@ -261,7 +261,7 @@ postgresql:
     tag: pg17-trixie           # the pgvector image for the SAME major
 repmgr:
   image:
-    tag: trixie-5.5.0-33-pg17
+    tag: trixie-5.5.0-34-pg17
     majorVersion: "17"
 ```
 
@@ -288,7 +288,7 @@ Must satisfy `leaseDuration > renewDeadline > retryPeriod` — **enforced at ren
 
 ### Routing the agent's apiserver traffic — `KUBECONFIG` (#317)
 
-The agent honours `KUBECONFIG` (repmgr image `trixie-5.5.0-33` or newer, pinned by this chart since 1.14.1), so its apiserver traffic can be sent through an in-cluster proxy on clusters whose egress policy denies pod traffic to the apiserver outright — where it otherwise never elects a leader and the cluster never gets a serving primary. No new value is involved: set the variable with `postgresql.extraEnv` and mount the kubeconfig with `postgresql.extraVolumes`/`extraVolumeMounts`. With it unset the in-cluster ServiceAccount path is used, unchanged. This chart shares pg's agent — see the [pg chart README](../pg/README.md#routing-the-agents-apiserver-traffic--kubeconfig-317) for the example kubeconfig, why `KUBERNETES_SERVICE_HOST` cannot express it, and the failure modes.
+The agent honours `KUBECONFIG` (repmgr image `trixie-5.5.0-34` or newer, pinned by this chart since 1.14.1), so its apiserver traffic can be sent through an in-cluster proxy on clusters whose egress policy denies pod traffic to the apiserver outright — where it otherwise never elects a leader and the cluster never gets a serving primary. No new value is involved: set the variable with `postgresql.extraEnv` and mount the kubeconfig with `postgresql.extraVolumes`/`extraVolumeMounts`. With it unset the in-cluster ServiceAccount path is used, unchanged. This chart shares pg's agent — see the [pg chart README](../pg/README.md#routing-the-agents-apiserver-traffic--kubeconfig-317) for the example kubeconfig, why `KUBERNETES_SERVICE_HOST` cannot express it, and the failure modes.
 
 ### Routing the backup CronJob's apiserver traffic — `pgbackrest.extraEnv` (#323)
 
@@ -1180,7 +1180,7 @@ helm repo update
 helm upgrade my-pgvector cagriekin/pgvector   # add -f your-values.yaml
 ```
 
-`pgvector` tracks `pg` in lockstep — same version, image, and agent; the earlier 0.6.x ↔ 0.5.x split unified at `1.0.0` (current: `2.0.0`, image `trixie-5.5.0-33`). Within a major line `helm upgrade` rolls the pods once and needs no manual step. **2.0.0 removes the legacy repmgrd path** (#286): if you pinned `repmgr.failoverMode: repmgrd` the upgrade needs a one-time `--cascade=orphan` recreate; if you were on the default (agent, since `1.0.0`) just delete the key and upgrade normally. Read the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. **2.0.0 also renames the `repmgr:` values block to `ha:`** (#291) — nothing nested changed, and every `repmgr.*` key still works for this major because it is merged over its `ha.*` counterpart, so no values change is required of you now; the alias goes away in the next major. For the **compatibility matrix, the version model, the `repmgr.*` → `ha.*` diff, and the full 0.x → 1.x migration runbook**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
+`pgvector` tracks `pg` in lockstep — same version, image, and agent; the earlier 0.6.x ↔ 0.5.x split unified at `1.0.0` (current: `2.0.0`, image `trixie-5.5.0-34`). Within a major line `helm upgrade` rolls the pods once and needs no manual step. **2.0.0 removes the legacy repmgrd path** (#286): if you pinned `repmgr.failoverMode: repmgrd` the upgrade needs a one-time `--cascade=orphan` recreate; if you were on the default (agent, since `1.0.0`) just delete the key and upgrade normally. Read the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. **2.0.0 also renames the `repmgr:` values block to `ha:`** (#291) — nothing nested changed, and every `repmgr.*` key still works for this major because it is merged over its `ha.*` counterpart, so no values change is required of you now; the alias goes away in the next major. For the **compatibility matrix, the version model, the `repmgr.*` → `ha.*` diff, and the full 0.x → 1.x migration runbook**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
 
 ## pgvector Resources
 
