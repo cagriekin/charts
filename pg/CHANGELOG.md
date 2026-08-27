@@ -2,6 +2,115 @@
 
 ## 2.0.0 - unreleased
 
+### Added
+
+- **In-place migration of a live repmgr cluster to the native mechanism (#292).** `helm upgrade`
+  from any 1.x release now migrates an existing cluster without a re-clone: timeline and system
+  identifier preserved, no switchover, no `--cascade=orphan` recreate. At size this is the
+  difference between a rolling restart and hours of degraded HA with a real RPO window.
+
+  What happens to the repmgr state a 1.x cluster carries on disk: the
+  `shared_preload_libraries = 'repmgr'` line inside PGDATA is stripped before the postmaster
+  starts (#293 -- load-bearing, since the 2.0.0 image has no `repmgr.so` and the line survives a
+  `helm rollback` because it lives in the data directory); `primary_conninfo` /
+  `primary_slot_name` are cleared from `postgresql.auto.conf` so the agent's own fragment becomes
+  authoritative; legacy `repmgr_slot_<node_id>` slots are left alone while streaming and dropped
+  only once that standby has attached to its `pg_ha_slot_<ordinal>` replacement, under
+  `AND NOT active`. The repmgr database, role and extension are **left in place** -- dropping
+  them is irreversible and is what closes off rollback, so it stays an opt-in operator step.
+
+  New runbook in `pg/README.md`: preconditions, the upgrade, per-node verification, the
+  cluster-wide `pg-ha/pause` marker, rollback (including the one thing rollback does not undo --
+  the preload strip), and the opt-in `DROP EXTENSION` snippet with an explicit warning against
+  dropping the role or database, both of which the agent still depends on.
+
+  Verified on a real cluster: 49/49, released 1.17.0 on trixie-5.5.0-32-pg18 (which still
+  contains repmgr) upgraded in place to the local chart on the repmgr-free image.
+
+  Every defect the live runs and review rounds surfaced was in the SUITE, not the chart -- the
+  migration code was correct from the start and the work went into making the proof trustworthy:
+  `pg_controldata` is not on `PATH` in the image (the server binaries live in the versioned
+  bindir, which is why the agent has a `PGBindir()` helper), and "timeline unchanged" was the
+  wrong assertion -- a rolling upgrade replaces the primary's pod, so the lease must move and
+  whoever takes it promotes. The observed roll went TLI 1 -> 3, two handoffs, with all three
+  nodes ending consistent. What the suite asserts now is that no node went BACKWARDS and that
+  no node is stranded on an older timeline -- the failure that matters, since a standby that
+  cannot follow eventually needs the very re-clone this avoids. No-rewind and no-re-clone stay
+  covered by the system identifier, the sentinel and the `.diverged` check.
+
+  Third: that stranding check must read `pg_stat_wal_receiver.received_tli`, not
+  `pg_controldata`. "Latest checkpoint's TimeLineID" is as of the last CHECKPOINT, so a standby
+  that has switched timelines but not yet checkpointed still reports the old one -- the check
+  failed with "got: 1 2" on a healthy cluster where the lagging node read checkpoint_tli=2 while
+  received_tli=4 and the primary listed it as streaming.
+
+
+  Two assertions were vacuous in the case that mattered. The legacy-slot check ("no orphan
+  pinning WAL") queried only the POST-migration primary -- but legacy `repmgr_slot_*` only ever
+  existed on the 1.x primary, and the roll moves the lease, so it ran on a node that never had
+  one and passed by construction while a demoted ex-primary could still hold inactive slots
+  pinning WAL on its own volume. It now covers every node plus an explicitly named check on the
+  1.x primary. And the stranding check read the primary from `pg_control_checkpoint()` while
+  reading standbys from `received_tli` for the very reason the control file lags: a just-promoted
+  primary has only REQUESTED its checkpoint, so it can report the old timeline and fail every
+  standby on a healthy cluster. Both sides now use the `GREATEST()` of all three sources.
+
+  The phase-1 preconditions polled nothing and raced: `repmgr.nodes` read 1 row of 3 on one run,
+  because registration is asynchronous relative to pod READINESS (agent readiness is
+  replication-aware, not registration-aware). All three now converge before asserting.
+
+  CI wiring: the leg gets `timeout_minutes: 55` -- it installs a released chart, upgrades, rolls
+  again, and the run step retries once, which cannot fit the shared 30-minute cap, and a timeout
+  kills the required check with no diagnosis. The released from-image is pre-pulled on the runner
+  for this leg only rather than added to `ci-base-images.txt`, which is bundled into every leg:
+  that would ship ~200MB to all 44 legs to serve 2, the waste the per-major bundles exist to
+  avoid. Left alone, each of the 3 KinD workers would pull it anonymously from Docker Hub
+  mid-suite.
+
+  The runbook's rollback section was rewritten against a tested rollback rather than a guess, and
+  both of its claims turned out to be wrong:
+
+  - **`helm rollback` needs `--force-conflicts` on any agent-mode release.** A plain rollback
+    fails with a field-manager conflict on `Service.spec.selector`: the agent owns that field (it
+    points the Service at the current primary) and Helm 4 applies server-side, so the two
+    contend. `--force` / `--force-replace` is not the answer -- it is deprecated AND rejected
+    outright alongside server-side apply. This is not specific to the migration; it applies to
+    rolling back any agent-mode release, and it was previously only a comment in a test suite.
+  - **Restoring `shared_preload_libraries` before rolling back is neither possible nor needed.**
+    `ALTER SYSTEM` writes `postgresql.auto.conf`, which is inside PGDATA and which 2.0.0's agent
+    strips on every boot -- so any restart of a still-2.0.0 pod silently reverted it. And it is
+    unnecessary: a migrated 3-node cluster rolled back to 1.17.0 with the preload absent came up
+    with all pods Ready, one primary, both standbys streaming, data intact, `repmgr.nodes`
+    queryable and `repmgr cluster show` correct. The GUC was only ever required by repmgrd, the
+    daemon 2.0.0 removed -- which incidentally answers the question #293 left open.
+
+  The runbook had four defects that would have misled an operator: bare `pg_controldata` (not on
+  PATH -- the image keeps server binaries in the versioned bindir), `<fullname>-0` hardcoded as
+  the primary in five places (the primary is not ordinal-bound, so the checks would have reported
+  a false clean bill), the rollback steps ordered against their own "do this BEFORE rolling back"
+  instruction, and a bare `ALTER SYSTEM SET shared_preload_libraries = 'repmgr'` that silently
+  drops `pgaudit` (auto.conf is read after the chart's fragment and overrides it).
+
+  New KinD suite `test-migrate-native` (`make -C pg test-migrate-native`, and a matrix leg on
+  both majors): installs the released 1.17.0 chart on an older released image that still contains
+  repmgr, proves the starting state really is repmgr-shaped, then upgrades to the local chart and
+  asserts no re-clone, an unchanged system identifier, no node stranded on an older timeline, data intact, every standby
+  streaming, native slots active, no legacy slot left pinning WAL, the catalog untouched, and
+  that a second roll is a no-op. "No re-clone" is proved by a sentinel file written into each
+  PGDATA -- `pg_basebackup` wipes the target directory, so a surviving sentinel is direct
+  evidence rather than an inference from logs or timing.
+
+### Fixed
+
+- `pg/tests/set-pg-major.sh` normalized deliberate older-release image pins (`set-pg-major: keep`)
+  asymmetrically: untouched on the default major, but rewritten to the freshly-built tag on a
+  non-default one, on the premise that "a non-default major has no older PUBLISHED image". That
+  premise expired with #269's per-major publishing -- every release from `trixie-5.5.0-29` onward
+  exists as both `-pg17` and `-pg18` -- so the rule destroyed the coverage it was protecting: on a
+  PG17 leg the migration suite would have started from the repmgr-FREE image, making its "install
+  a 1.x cluster" phase not a repmgr cluster at all. Keep-marked pins now keep their base and move
+  only the major suffix, on every major, which is idempotent and needs no staleness check.
+
 ### Changed (breaking)
 
 - **The `repmgr:` values block is now `ha:`** (#291). Nothing nested moved -- only the block's

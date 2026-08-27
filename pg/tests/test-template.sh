@@ -5107,5 +5107,113 @@ helm template test-pg "${CHART_DIR}" --set ha.agent.dcs.backend=etcd \
   || etcd_ext_rc=$?
 assert_eq "#291: an external etcd does not enforce the bootstrapImage lockstep" "0" "${etcd_ext_rc}"
 
+# ==========================================================================================
+# #292: the in-place repmgr -> native migration suite. It is the ONLY suite that starts from a
+# released chart and a released image, so the things that would silently un-wire it -- or turn
+# its "install a 1.x cluster" phase into something that is not a 1.x cluster -- are asserted
+# here, where they cost a second, rather than discovered by a 30-minute KinD leg passing
+# vacuously.
+# ==========================================================================================
+mig_suite="${SCRIPT_DIR}/test-migrate-native.sh"
+mig_fixture="${SCRIPT_DIR}/values-migrate-native.yaml"
+assert_eq "#292: the migration suite exists and is executable" "yes" \
+  "$([ -x "${mig_suite}" ] && echo yes || echo no)"
+assert_eq "#292: it is wired into the chart Makefile" "1" \
+  "$(grep -c '^test-migrate-native:' "${CHART_DIR}/Makefile" || true)"
+assert_eq "#292: it is wired into the CI suite matrix" "1" \
+  "$(grep -c '^          - migrate-native$' "${SCRIPT_DIR}/../../.github/workflows/pg-test.yaml" || true)"
+
+mig_src="$(cat "${mig_suite}")"
+
+# The "from" image must be an OLDER RELEASED tag: it has to CONTAIN repmgr (the #290 image does
+# not), so if it ever equals the tag the chart pins -- which is the tag CI builds and loads into
+# KinD -- phase 1 would run the repmgr-free image and the suite would prove nothing.
+#
+# Compared on the BASE, with any -pgNN suffix stripped from both sides: set-pg-major.sh
+# normalizes the keep-marked pin to <base>-pg<major>, so a raw string compare would differ by
+# the suffix alone and pass even when the bases had converged. An earlier version of this
+# assertion did exactly that -- it extracted "-trixie-5.5.0-33" (a stray leading dash from
+# `sed 's/.*://'` on the `:-` expansion) and compared it to "trixie-5.5.0-33", which is never
+# equal, so it passed on a tree where the from-image HAD been dragged onto the chart's tag.
+mig_from=$(printf '%s\n' "${mig_src}" | grep -oE 'FROM_IMAGE_BASE:-[^}]+' | head -1 | sed 's/^FROM_IMAGE_BASE:-//')
+mig_from_base="${mig_from%-pg[0-9]*}"
+mig_chart_tag=$(awk '/^(repmgr|ha):/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' "${CHART_DIR}/values.yaml")
+mig_chart_base="${mig_chart_tag%-pg[0-9]*}"
+# Explicit non-empty checks, NOT assert_not_eq "" ...: the helper rejects an empty operand by
+# design (#279's anti-vacuity guard), so that form always fails regardless of the value.
+assert_eq "#292: the from-image base is resolvable" "yes" \
+  "$([ -n "${mig_from_base}" ] && echo yes || echo no)"
+assert_eq "#292: the chart's own image tag is resolvable" "yes" \
+  "$([ -n "${mig_chart_base}" ] && echo yes || echo no)"
+assert_eq "#292: the from-image differs from the chart's own pin (else phase 1 is not 1.x)" \
+  "differ" "$([ "${mig_from_base}" = "${mig_chart_base}" ] && echo same || echo differ)"
+
+# ...and the keep mark is what stops set-pg-major.sh dragging it forward, so it has to be on the
+# line that carries the literal -- not on a line that merely derives from it.
+assert_eq "#292: the keep mark is on the from-image literal's own line" "1" \
+  "$(grep -c 'FROM_IMAGE_BASE:-.*set-pg-major: keep' "${mig_suite}" || true)"
+
+# The fixture is handed to BOTH the released 1.x chart and this one, so it must use the
+# deprecated spelling: 1.x has never heard of `ha:`. That also makes the suite the only live
+# proof that #291's alias survives a chart UPGRADE, not just a fresh install.
+assert_eq "#292: the fixture uses the repmgr: spelling both charts accept" "1" \
+  "$(grep -c '^repmgr:' "${mig_fixture}" || true)"
+assert_eq "#292: ...and no ha: block, which the 1.x chart would reject" "0" \
+  "$(grep -c '^ha:' "${mig_fixture}" || true)"
+# No image pin in the fixture: it would fall under set-pg-major.sh's tag rewrite (fixtures are
+# not keep-marked) and be dragged to the chart's tag, destroying the from-image premise.
+assert_eq "#292: the fixture pins no HA image" "0" \
+  "$(grep -c 'cagriekin/' "${mig_fixture}" || true)"
+# Persistence is load-bearing: the repmgr state being migrated lives in PGDATA, so an emptyDir
+# would make every no-re-clone assertion vacuous.
+#
+# Scoped to the persistence BLOCK, not a whole-file grep. The first version of this assertion
+# searched the file for "enabled: true", which four unrelated keys also satisfy
+# (repmgr.enabled, both probes, service) -- so flipping persistence.enabled to false, the exact
+# change it exists to catch, still passed (#292 review).
+mig_persist=$(awk '/^  persistence:/{f=1;next} f&&/^  [a-zA-Z]/{f=0} f' "${mig_fixture}" \
+  | grep -E '^\s+enabled:' | head -1 | awk '{print $2}')
+assert_eq "#292: the fixture enables persistence" "true" "${mig_persist}"
+mig_fx_rc=0
+helm template test-mig "${CHART_DIR}" -f "${mig_fixture}" >/dev/null 2>&1 || mig_fx_rc=$?
+assert_eq "#292: the fixture renders against the current chart" "0" "${mig_fx_rc}"
+
+# The suite proves the migration works; the runbook is the only thing that tells an operator how
+# to verify it and how to get back. Both halves have to exist.
+mig_readme="$(cat "${CHART_DIR}/README.md")"
+for mig_need in "Migrating a live repmgr cluster to native" \
+                "Cleaning up the repmgr catalog" \
+                "DROP EXTENSION IF EXISTS repmgr" \
+                "pg-ha/pause" \
+                "Rolling back" \
+                "force-conflicts" \
+                "pg_last_wal_receive_lsn"; do
+  assert_contains "#292: the runbook covers '${mig_need}'" "${mig_readme}" "${mig_need}"
+done
+# The rollback section must not resurrect the ALTER SYSTEM step: it was verified unnecessary
+# (a migrated cluster rolled back to 1.17.0 with the preload absent came up healthy, repmgr CLI
+# included) and it would not have persisted anyway, since the agent rewrites postgresql.auto.conf
+# on every boot (#292 review).
+assert_not_contains "#292: the runbook does not tell anyone to ALTER SYSTEM the preload back" \
+  "$(awk '/^#### Rolling back/,/^#### Cleaning up/' "${CHART_DIR}/README.md")" \
+  "ALTER SYSTEM SET shared_preload_libraries"
+# ...and it must warn off --force / --force-replace, which Helm rejects alongside server-side apply.
+assert_contains "#292: the runbook warns off --force-replace" \
+  "$(cat "${CHART_DIR}/README.md")" "force-replace"
+# It must NOT tell anyone to drop the role or database: the agent authenticates as that role and
+# primary_conninfo carries dbname=repmgr, so either drop breaks a working cluster.
+assert_contains "#292: the runbook warns off dropping the role/database" \
+  "${mig_readme}" "both are live dependencies of the agent"
+# The pause control is on the marker ConfigMap, not a pod -- an earlier draft of the runbook said
+# `kubectl annotate pod`, which silently does nothing.
+assert_contains "#292: the runbook pauses via the marker ConfigMap" \
+  "${mig_readme}" "annotate configmap"
+# And the .diverged directory is a SIBLING of PGDATA (native.go names it <datadir>.diverged.<ts>),
+# so a check globbing inside PGDATA's parent for a dotfile would assert 0 forever.
+assert_contains "#292: the runbook looks for the diverged dir at the right path" \
+  "${mig_readme}" "pgdata.diverged."
+assert_contains "#292: the suite looks for the diverged dir at the right path" \
+  "${mig_src}" '${PGDATA_DIR}.diverged.'
+
 end_suite
 print_summary
