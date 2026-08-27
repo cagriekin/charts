@@ -2735,14 +2735,19 @@ NS=<namespace>; REL=<release>; FULLNAME=<fullname>   # usually <release>-pg
 # 1. Every pod Ready (agent readiness is replication-aware, so Ready implies streaming)
 kubectl get pods -n "$NS" -l app.kubernetes.io/component=postgresql
 
-# 2. One primary, and it is the lease holder
-kubectl get lease -n "$NS" "$FULLNAME-leader" -o jsonpath='{.spec.holderIdentity}{"\n"}'
+# 2. One primary, and it is the lease holder. Capture it -- the primary is NOT ordinal-bound
+#    (the initial one is decided by the lease race, and any failover moves it), so every command
+#    below that must run "on the primary" uses this variable rather than -0.
+PRIMARY=$(kubectl get lease -n "$NS" "$FULLNAME-leader" -o jsonpath='{.spec.holderIdentity}')
+echo "primary: $PRIMARY"
 
-# 3. Every standby streaming, and no slot already orphaned
-kubectl exec -n "$NS" "$FULLNAME-0" -c postgresql -- \
+# 3. Every standby streaming, and no slot already orphaned -- on the PRIMARY, since that is
+#    where pg_stat_replication and the primary's slots live. Run this against a standby by
+#    mistake and both queries come back empty, which reads like "nothing wrong".
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- \
   psql -U repmgr -d repmgr -Atc \
   "SELECT application_name, state FROM pg_stat_replication ORDER BY 1"
-kubectl exec -n "$NS" "$FULLNAME-0" -c postgresql -- \
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- \
   psql -U repmgr -d repmgr -Atc \
   "SELECT slot_name, active FROM pg_replication_slots ORDER BY 1"
 ```
@@ -2767,23 +2772,48 @@ upgrade, not the same one: if something does go wrong you want one variable chan
 #### Verifying each node migrated
 
 ```bash
+# pg_controldata is not on PATH -- the image keeps the server binaries in the versioned bindir.
+PGMAJOR=18   # or 17, matching ha.image.majorVersion
+CTL="/usr/lib/postgresql/$PGMAJOR/bin/pg_controldata"
+
 for i in 0 1 2; do
   POD="$FULLNAME-$i"; echo "== $POD"
-  # timeline and system identifier must be what they were before the upgrade
-  kubectl exec -n "$NS" "$POD" -c postgresql -- pg_controldata /var/lib/postgresql/data/pgdata \
+  # the system identifier must be what it was before the upgrade -- that is what proves no
+  # re-initdb. Do NOT expect the TIMELINE to be unchanged: the rollout replaces the primary's
+  # pod too, so the lease moves and whoever takes it promotes, which advances the timeline by
+  # design. What matters is that no node is left BEHIND on an older one, checked further down.
+  kubectl exec -n "$NS" "$POD" -c postgresql -- "$CTL" /var/lib/postgresql/data/pgdata \
     | grep -E "system identifier|Latest checkpoint.s TimeLineID"
   # the preload must be gone from PGDATA, not merely from the running config
   kubectl exec -n "$NS" "$POD" -c postgresql -- \
     grep -c "shared_preload_libraries.*repmgr" /var/lib/postgresql/data/pgdata/postgresql.conf || echo "0 (good)"
-  # a re-clone would have left this behind
+  # a re-clone or a rewind would have left this behind
   kubectl exec -n "$NS" "$POD" -c postgresql -- \
     sh -c 'ls -d /var/lib/postgresql/data/pgdata.diverged.* 2>/dev/null | wc -l'
 done
 
-# and on the primary: native slots active, no legacy slot left pinning WAL
-kubectl exec -n "$NS" "$FULLNAME-0" -c postgresql -- psql -U repmgr -d repmgr -Atc \
-  "SELECT slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
-     FROM pg_replication_slots ORDER BY 1"
+# Nobody stranded: every standby must be following the primary's timeline. GREATEST of the three
+# sources, because each one lags in a different situation -- the control file is as of the last
+# CHECKPOINT (a just-switched standby still shows the old timeline), and a just-promoted primary
+# has only REQUESTED its checkpoint.
+TLQ="SELECT GREATEST((SELECT timeline_id FROM pg_control_checkpoint()),
+                     COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0),
+                     COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0))"
+PRIMARY=$(kubectl get lease -n "$NS" "$FULLNAME-leader" -o jsonpath='{.spec.holderIdentity}')
+for i in 0 1 2; do
+  POD="$FULLNAME-$i"
+  echo "$POD tl=$(kubectl exec -n "$NS" "$POD" -c postgresql -- psql -U repmgr -d repmgr -Atc "$TLQ")"
+done   # all three must print the same number
+
+# Slots -- on EVERY node, not only the primary. Legacy repmgr_slot_* only ever existed on the
+# 1.x primary, and the rollout usually moves the primary elsewhere, so checking the current
+# primary alone would miss residue left on the DEMOTED node's own volume.
+for i in 0 1 2; do
+  POD="$FULLNAME-$i"; echo "== $POD"
+  kubectl exec -n "$NS" "$POD" -c postgresql -- psql -U repmgr -d repmgr -Atc \
+    "SELECT slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+       FROM pg_replication_slots ORDER BY 1"
+done
 ```
 
 A surviving `repmgr_slot_*` is the one result that needs action rather than patience: it means
@@ -2808,25 +2838,43 @@ itself, use `kubectl rollout pause statefulset "$FULLNAME" -n "$NS"` and resume 
 #### Rolling back
 
 The cluster stays repmgr-shaped until you run the opt-in cleanup below — that is deliberate, and
-it is what makes rollback possible. Pin the previous chart **and** the previous image together:
+it is what makes rollback possible. Once the cleanup has dropped the extension, rollback is no
+longer available; that is the reason the cleanup is a separate step.
+
+**Order matters, and it is not the order you would guess.** Rollback restores the chart and the
+image, but it does **not** restore the `shared_preload_libraries` line — that lived in the data
+directory, not the release, and 2.0.0 stripped it. A 1.x image running the repmgr *mechanism*
+needs it, so it has to go back **before** the pods come up on the old image, not after.
+
+**Step 1 — re-add the preload on every node, while still on 2.0.0.** Preserve whatever else is
+already in the list; a bare `= 'repmgr'` would silently drop `pgaudit` (and any library you
+declared yourself), because `ALTER SYSTEM` writes to `postgresql.auto.conf`, which PostgreSQL
+reads *after* the chart's own `conf.d` fragment and therefore overrides it:
 
 ```bash
-helm rollback "$REL" -n "$NS"     # or: helm upgrade --version 1.17.0 ...
+for i in 0 1 2; do
+  POD="$FULLNAME-$i"
+  CUR=$(kubectl exec -n "$NS" "$POD" -c postgresql -- \
+    psql -U postgres -Atc "SHOW shared_preload_libraries")
+  case ",$CUR," in
+    *,repmgr,*) NEW="$CUR" ;;                                  # already there
+    *) NEW=$([ -n "$CUR" ] && echo "repmgr,$CUR" || echo "repmgr") ;;
+  esac
+  echo "$POD: '$CUR' -> '$NEW'"
+  kubectl exec -n "$NS" "$POD" -c postgresql -- \
+    psql -U postgres -c "ALTER SYSTEM SET shared_preload_libraries = '$NEW'"
+done
 ```
 
-One thing rollback does not undo: the `shared_preload_libraries` strip, because that line was in
-the data directory rather than the release. A 1.x image does not need it (the repmgr extension is
-only required by the repmgr *mechanism*, which 1.x uses) — so if you roll back, re-add it before
-the pods restart under the old mechanism:
+**Step 2 — roll back the release**, which restarts the pods and picks the line up:
 
 ```bash
-kubectl exec -n "$NS" "$POD" -c postgresql -- \
-  psql -U postgres -c "ALTER SYSTEM SET shared_preload_libraries = 'repmgr'"
+helm rollback "$REL" -n "$NS"     # or: helm upgrade --version 1.17.0 -f your-values.yaml ...
 ```
 
-Do this **before** rolling back, on every node, and restart the pods afterwards. Once the opt-in
-cleanup has dropped the extension, rollback is no longer available — which is the reason the
-cleanup is separate.
+`shared_preload_libraries` is a postmaster parameter, so it takes effect only on that restart —
+which is exactly why step 1 comes first. Verify afterwards that every pod is Ready and that
+`SHOW shared_preload_libraries` lists `repmgr` plus anything it listed before.
 
 #### Cleaning up the repmgr catalog (opt-in)
 
@@ -2839,8 +2887,10 @@ and `primary_conninfo` carries `dbname=repmgr`. Renaming those is out of scope f
 rewrites a live cluster's credentials). So the cleanup is the extension and its rows only:
 
 ```bash
-# On the PRIMARY only -- it replicates to the standbys.
-kubectl exec -n "$NS" "$FULLNAME-0" -c postgresql -- psql -U repmgr -d repmgr -c '
+# On the PRIMARY only -- it replicates to the standbys. Resolve it from the lease; the primary
+# is not ordinal-bound, and running a DROP against a standby fails rather than doing nothing.
+PRIMARY=$(kubectl get lease -n "$NS" "$FULLNAME-leader" -o jsonpath='{.spec.holderIdentity}')
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- psql -U repmgr -d repmgr -c '
   DROP EXTENSION IF EXISTS repmgr CASCADE;
 '
 ```
@@ -2848,7 +2898,7 @@ kubectl exec -n "$NS" "$FULLNAME-0" -c postgresql -- psql -U repmgr -d repmgr -c
 That drops `repmgr.nodes`, `repmgr.monitoring_history` and the rest of the schema. Verify:
 
 ```bash
-kubectl exec -n "$NS" "$FULLNAME-0" -c postgresql -- psql -U repmgr -d repmgr -Atc \
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- psql -U repmgr -d repmgr -Atc \
   "SELECT count(*) FROM pg_extension WHERE extname='repmgr'"    # expect 0
 ```
 

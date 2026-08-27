@@ -24,10 +24,11 @@
   the preload strip), and the opt-in `DROP EXTENSION` snippet with an explicit warning against
   dropping the role or database, both of which the agent still depends on.
 
-  Verified on a real cluster: 44/44, released 1.17.0 on trixie-5.5.0-32-pg18 (which still
+  Verified on a real cluster: 49/49, released 1.17.0 on trixie-5.5.0-32-pg18 (which still
   contains repmgr) upgraded in place to the local chart on the repmgr-free image.
 
-  Three things the live runs corrected, all in the suite rather than the chart:
+  Every defect the live runs and review rounds surfaced was in the SUITE, not the chart -- the
+  migration code was correct from the start and the work went into making the proof trustworthy:
   `pg_controldata` is not on `PATH` in the image (the server binaries live in the versioned
   bindir, which is why the agent has a `PGBindir()` helper), and "timeline unchanged" was the
   wrong assertion -- a rolling upgrade replaces the primary's pod, so the lease must move and
@@ -42,6 +43,36 @@
   that has switched timelines but not yet checkpointed still reports the old one -- the check
   failed with "got: 1 2" on a healthy cluster where the lagging node read checkpoint_tli=2 while
   received_tli=4 and the primary listed it as streaming.
+
+
+  Two assertions were vacuous in the case that mattered. The legacy-slot check ("no orphan
+  pinning WAL") queried only the POST-migration primary -- but legacy `repmgr_slot_*` only ever
+  existed on the 1.x primary, and the roll moves the lease, so it ran on a node that never had
+  one and passed by construction while a demoted ex-primary could still hold inactive slots
+  pinning WAL on its own volume. It now covers every node plus an explicitly named check on the
+  1.x primary. And the stranding check read the primary from `pg_control_checkpoint()` while
+  reading standbys from `received_tli` for the very reason the control file lags: a just-promoted
+  primary has only REQUESTED its checkpoint, so it can report the old timeline and fail every
+  standby on a healthy cluster. Both sides now use the `GREATEST()` of all three sources.
+
+  The phase-1 preconditions polled nothing and raced: `repmgr.nodes` read 1 row of 3 on one run,
+  because registration is asynchronous relative to pod READINESS (agent readiness is
+  replication-aware, not registration-aware). All three now converge before asserting.
+
+  CI wiring: the leg gets `timeout_minutes: 55` -- it installs a released chart, upgrades, rolls
+  again, and the run step retries once, which cannot fit the shared 30-minute cap, and a timeout
+  kills the required check with no diagnosis. The released from-image is pre-pulled on the runner
+  for this leg only rather than added to `ci-base-images.txt`, which is bundled into every leg:
+  that would ship ~200MB to all 44 legs to serve 2, the waste the per-major bundles exist to
+  avoid. Left alone, each of the 3 KinD workers would pull it anonymously from Docker Hub
+  mid-suite.
+
+  The runbook had four defects that would have misled an operator: bare `pg_controldata` (not on
+  PATH -- the image keeps server binaries in the versioned bindir), `<fullname>-0` hardcoded as
+  the primary in five places (the primary is not ordinal-bound, so the checks would have reported
+  a false clean bill), the rollback steps ordered against their own "do this BEFORE rolling back"
+  instruction, and a bare `ALTER SYSTEM SET shared_preload_libraries = 'repmgr'` that silently
+  drops `pgaudit` (auto.conf is read after the chart's fragment and overrides it).
 
   New KinD suite `test-migrate-native` (`make -C pg test-migrate-native`, and a matrix leg on
   both majors): installs the released 1.17.0 chart on an older released image that still contains

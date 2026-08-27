@@ -123,12 +123,12 @@ TARGETS=("$VALUES" "${FIXTURES[@]}" "${SUITES[@]}")
 # regression they guard ("... under PG18 + cagriekin/repmgr:trixie-5.5.0-11"), and
 # rewriting that history would make the comment claim something untrue.
 #
-# So are lines marked `set-pg-major: keep` -- a deliberate pin on an OLDER RELEASED image
-# (the migration suite's pre-agent "from" image, the TLS suite's repmgrd release). Those
-# tags are the test's subject, not an incidental reference: rewriting them to the chart's
-# own tag makes the migration suite upgrade an image to itself, silently deleting the
-# "adopt agent mode from a published image" coverage. See KEEP_PASS below for how a
-# non-default major, which has no older published image to migrate from, is handled.
+# Lines marked `set-pg-major: keep` are handled separately -- a deliberate pin on an OLDER
+# RELEASED image (today: test-migrate-native.sh's "from" image, the only one left in the tree).
+# Those tags are the test's SUBJECT, not an incidental reference: rewriting one to the chart's
+# own tag makes the migration suite upgrade an image to itself, silently deleting the "migrate
+# from a released 1.x cluster" coverage. They are normalized to <base>-pg<MAJOR> further down,
+# keeping the deliberate base and moving only the major suffix.
 KEEP_MARK='set-pg-major: keep'
 
 apply() {

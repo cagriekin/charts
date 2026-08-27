@@ -241,7 +241,11 @@ jobs:
     needs: [changes, build]
     if: needs.changes.outputs.pg == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Per-leg, because migrate-native is in a different class: it installs a RELEASED chart,
+    # upgrades in place, then rolls the StatefulSet a second time to prove idempotence, and the
+    # run step below retries the whole suite once on failure. 30 minutes cannot hold that, and a
+    # timeout kills the required check with no diagnosis (#292 review).
+    timeout-minutes: ${{ matrix.timeout_minutes || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -280,6 +284,7 @@ jobs:
           - migrate-native
         include:
           - { suite: agent, coldboot: "1" }
+          - { suite: migrate-native, timeout_minutes: 55 }
     steps:
       - name: Free up runner disk space
         run: |
@@ -322,6 +327,25 @@ jobs:
           for tarball in /tmp/kind-images/*.tar; do
             kind load image-archive "$tarball" --name pg-test
           done
+
+      # migrate-native alone starts from an older RELEASED image, and it is deliberately NOT in
+      # pg/tests/ci-base-images.txt: that list is bundled into every leg, so adding a ~200MB
+      # image there would ship it to all 44 legs to serve 2 -- the same waste the per-major
+      # image bundles exist to avoid. Pull it here, on the runner, once, and kind-load it: with
+      # pullPolicy IfNotPresent the alternative is each of the 3 kind workers pulling it
+      # anonymously from Docker Hub mid-suite, which is both slower and rate-limitable (#292
+      # review). The tag is derived exactly as the suite derives it, so the two cannot drift.
+      - name: Pre-load the released from-image (migrate-native only)
+        if: matrix.suite == 'migrate-native'
+        run: |
+          set -euo pipefail
+          base=$(grep -oE 'FROM_IMAGE_BASE:-[^}]+' pg/tests/test-migrate-native.sh | head -1 \
+            | sed 's/^FROM_IMAGE_BASE:-//')
+          [ -n "$base" ] || { echo "could not resolve FROM_IMAGE_BASE from the suite" >&2; exit 1; }
+          ref="cagriekin/repmgr:${base%-pg[0-9]*}-pg${{ matrix.pg_major }}"
+          echo "pre-loading $ref"
+          docker pull "$ref"
+          kind load docker-image "$ref" --name pg-test
 
       # Point the chart defaults and every fixture at this leg's major (#269). Both
       # majors' images are already loaded, so this only decides which one the suite

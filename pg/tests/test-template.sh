@@ -5166,8 +5166,14 @@ assert_eq "#292: the fixture pins no HA image" "0" \
   "$(grep -c 'cagriekin/' "${mig_fixture}" || true)"
 # Persistence is load-bearing: the repmgr state being migrated lives in PGDATA, so an emptyDir
 # would make every no-re-clone assertion vacuous.
-assert_contains "#292: the fixture enables persistence" \
-  "$(cat "${mig_fixture}")" "enabled: true"
+#
+# Scoped to the persistence BLOCK, not a whole-file grep. The first version of this assertion
+# searched the file for "enabled: true", which four unrelated keys also satisfy
+# (repmgr.enabled, both probes, service) -- so flipping persistence.enabled to false, the exact
+# change it exists to catch, still passed (#292 review).
+mig_persist=$(awk '/^  persistence:/{f=1;next} f&&/^  [a-zA-Z]/{f=0} f' "${mig_fixture}" \
+  | grep -E '^\s+enabled:' | head -1 | awk '{print $2}')
+assert_eq "#292: the fixture enables persistence" "true" "${mig_persist}"
 mig_fx_rc=0
 helm template test-mig "${CHART_DIR}" -f "${mig_fixture}" >/dev/null 2>&1 || mig_fx_rc=$?
 assert_eq "#292: the fixture renders against the current chart" "0" "${mig_fx_rc}"

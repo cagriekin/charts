@@ -98,12 +98,28 @@ echo "  primary (1.x): ${PRIMARY_BEFORE}"
 # Prove the starting state really is repmgr-shaped. Without these the suite could pass on a
 # cluster that was never repmgr in the first place, which is the failure mode that matters:
 # a green run that proves nothing.
-nodes_rows=$(pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" "SELECT count(*) FROM repmgr.nodes" "repmgr" "repmgr" | tr -d '[:space:]')
+# Polled, not sampled once. Registration in repmgr.nodes is asynchronous relative to pod
+# READINESS -- agent readiness is replication-aware, not registration-aware -- so a single read
+# right after `helm --wait` is a race. It lost once, reading 1 row of 3 (#292 review); every
+# other run read 3. The starting state being repmgr-shaped is the point of these checks, not how
+# quickly it gets there, so waiting costs nothing and removes a flake that would fire in CI.
+nodes_rows=""; waited=0
+while [ ${waited} -lt 300 ]; do
+  nodes_rows=$(pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" "SELECT count(*) FROM repmgr.nodes" "repmgr" "repmgr" | tr -d '[:space:]')
+  [ "${nodes_rows}" = "${NODES}" ] && break
+  sleep 10; waited=$((waited + 10))
+done
 assert_eq "1.x: repmgr.nodes is populated (${NODES} rows)" "${NODES}" "${nodes_rows}"
 
-legacy_slots=$(pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" \
-  "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'repmgr_slot_%' AND active" | tr -d '[:space:]')
-assert_gt "1.x: legacy repmgr slots are active" "${legacy_slots}" 0
+# Same race: a slot is created when the standby attaches, which trails readiness.
+legacy_slots=0; waited=0
+while [ ${waited} -lt 300 ]; do
+  legacy_slots=$(pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" \
+    "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'repmgr_slot_%' AND active" | tr -d '[:space:]')
+  [ "${legacy_slots}" = "$((NODES - 1))" ] && break
+  sleep 10; waited=$((waited + 10))
+done
+assert_eq "1.x: a legacy repmgr slot is active for every standby" "$((NODES - 1))" "${legacy_slots}"
 
 preload_before=$(pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" "SHOW shared_preload_libraries")
 assert_contains "1.x: shared_preload_libraries includes repmgr" "${preload_before}" "repmgr"
@@ -140,8 +156,13 @@ done
 
 # Every standby must be streaming before we touch anything: the migration refuses a degraded
 # cluster, and starting from one would make a failure ambiguous.
-streaming_before=$(pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" \
-  "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" | tr -d '[:space:]')
+streaming_before=0; waited=0
+while [ ${waited} -lt 300 ]; do
+  streaming_before=$(pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" \
+    "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" | tr -d '[:space:]')
+  [ "${streaming_before}" = "$((NODES - 1))" ] && break
+  sleep 10; waited=$((waited + 10))
+done
 assert_eq "1.x: every standby is streaming before the migration" "$((NODES - 1))" "${streaming_before}"
 
 # ---------------------------------------------------------------------------
@@ -226,22 +247,32 @@ done
 # timelines but not yet checkpointed still reports the old one. Live proof from that run --
 # pod-2 read checkpoint_tli=2 while received_tli=4 and the primary listed it as streaming. The
 # receiver's view is the authoritative "what timeline am I actually following".
-primary_tli=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT timeline_id FROM pg_control_checkpoint()" | tr -d '[:space:]')
+# Both sides use the same GREATEST() of the three timeline sources, the pattern
+# test-pgbackrest-restore-ha.sh already established. Reading the primary from
+# pg_control_checkpoint() alone was wrong for exactly the reason the standby side avoids it: on
+# promotion PostgreSQL writes XLOG_END_OF_RECOVERY and only REQUESTS the checkpoint, so a
+# just-promoted primary can still report the pre-promotion TLI while every standby correctly
+# reports the new one -- which would fail every standby on a healthy cluster.
+tl_expr="SELECT GREATEST((SELECT timeline_id FROM pg_control_checkpoint()), COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0), COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0))"
+primary_tli=""
+for _ in $(seq 1 30); do
+  primary_tli=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "${tl_expr}" | tr -d '[:space:]')
+  [ -n "${primary_tli}" ] && [ "${primary_tli}" != "0" ] && break
+  sleep 4
+done
 assert_eq "post: the primary's timeline is resolvable" "yes" \
-  "$([ -n "${primary_tli}" ] && echo yes || echo no)"
+  "$([ -n "${primary_tli}" ] && [ "${primary_tli}" != "0" ] && echo yes || echo no)"
 for i in $(seq 0 $((NODES - 1))); do
   pod="${FULLNAME}-${i}"
   [ "${pod}" = "${PRIMARY}" ] && continue
-  # The receiver row appears only once streaming is established, which the assertion below
-  # waits for; retry briefly so this does not race it.
-  rtli=""; waited=0
-  while [ ${waited} -lt 120 ]; do
-    rtli=$(pg_exec "${NAMESPACE}" "${pod}" "SELECT received_tli FROM pg_stat_wal_receiver" | tr -d '[:space:]')
-    [ -n "${rtli}" ] && break
-    sleep 5; waited=$((waited + 5))
+  node_tli=""
+  for _ in $(seq 1 30); do
+    node_tli=$(pg_exec "${NAMESPACE}" "${pod}" "${tl_expr}" | tr -d '[:space:]')
+    [ "${node_tli}" = "${primary_tli}" ] && break
+    sleep 4
   done
   assert_eq "post ${pod}: follows the primary's timeline (${primary_tli}), not stranded" \
-    "${primary_tli}" "${rtli}"
+    "${primary_tli}" "${node_tli}"
 done
 
 # #293: the preload line must be gone from PGDATA, on every node -- not merely absent from the
@@ -284,12 +315,34 @@ assert_eq "post: every standby is streaming again" "$((NODES - 1))" "${streaming
 native_active=$(pg_exec "${NAMESPACE}" "${PRIMARY}" \
   "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%' AND active" | tr -d '[:space:]')
 assert_eq "post: a native slot is active for every standby" "$((NODES - 1))" "${native_active}"
-legacy_left=$(pg_exec "${NAMESPACE}" "${PRIMARY}" \
+
+# Legacy-slot residue is checked on EVERY node, not just the current primary -- and that is the
+# whole point of the check. Legacy repmgr_slot_* slots only ever existed on the 1.x PRIMARY, and
+# the roll necessarily moves the lease, so the post-migration primary is usually a node that
+# never had one. Querying it alone made "no legacy slot survived" pass by construction while a
+# DEMOTED ex-primary could still hold inactive repmgr_slot_* pinning WAL on its own volume --
+# which is precisely the residue reclaimableOnStandby() exists to clear (#292 review).
+for i in $(seq 0 $((NODES - 1))); do
+  pod="${FULLNAME}-${i}"
+  slot_legacy=""; waited=0
+  # Reclaim happens on the owning node's own tick, so give it a few cycles rather than racing it.
+  while [ ${waited} -lt 180 ]; do
+    slot_legacy=$(pg_exec "${NAMESPACE}" "${pod}" \
+      "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'repmgr_slot_%'" | tr -d '[:space:]')
+    [ "${slot_legacy}" = "0" ] && break
+    sleep 10; waited=$((waited + 10))
+  done
+  assert_eq "post ${pod}: no legacy repmgr slot survived (no orphan pinning WAL)" "0" "${slot_legacy}"
+  slot_inactive=$(pg_exec "${NAMESPACE}" "${pod}" \
+    "SELECT count(*) FROM pg_replication_slots WHERE NOT active" | tr -d '[:space:]')
+  assert_eq "post ${pod}: no inactive slot" "0" "${slot_inactive}"
+done
+
+# ...and explicitly on the node that WAS the 1.x primary, named rather than inferred, so the
+# coverage cannot be lost to a future refactor of the loop above.
+exprimary_legacy=$(pg_exec "${NAMESPACE}" "${PRIMARY_BEFORE}" \
   "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'repmgr_slot_%'" | tr -d '[:space:]')
-assert_eq "post: no legacy repmgr slot survived (no orphan pinning WAL)" "0" "${legacy_left}"
-inactive=$(pg_exec "${NAMESPACE}" "${PRIMARY}" \
-  "SELECT count(*) FROM pg_replication_slots WHERE NOT active" | tr -d '[:space:]')
-assert_eq "post: no inactive slot at all" "0" "${inactive}"
+assert_eq "post: the 1.x primary (${PRIMARY_BEFORE}) kept no legacy slot" "0" "${exprimary_legacy}"
 
 # The catalog is deliberately NOT cleaned up by the upgrade: dropping the extension, database
 # and role is irreversible and must stay an operator decision (#292). Assert it is still there,
