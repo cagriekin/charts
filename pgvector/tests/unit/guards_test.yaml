@@ -165,3 +165,26 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: 'leaseDuration > renewDeadline > retryPeriod'
+
+  # #291 review: skipping validation on an unparseable duration was the original bug -- Go's
+  # time.ParseDuration rejects a unit-less value, so the agent refuses to start and every pod
+  # CrashLoopBackOffs after a clean render.
+  - it: a leaseDuration with no unit fails fast
+    set:
+      ha.agent.leaseDuration: "15"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # The etcd lease TTL is whole seconds, so config.go imposes a 5s floor the ordering check
+  # alone does not catch.
+  - it: an etcd DCS lease below the 5s floor fails fast
+    set:
+      etcd.enabled: true
+      ha.agent.dcs.backend: etcd
+      ha.agent.leaseDuration: 3s
+      ha.agent.renewDeadline: 2s
+      ha.agent.retryPeriod: 1s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'requires at least 5s'

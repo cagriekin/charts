@@ -1368,28 +1368,39 @@ volumes:
 
 {{- /*
 pg.durationMs -- a Go duration string as a number of milliseconds, or "" when the string is
-not one this parser handles. Exists only for pg.validateLeaseTimings below.
+not a Go duration at all. Exists only for pg.validateLeaseTimings below.
 
-Deliberately narrow: time.ParseDuration (what the agent actually uses) accepts compound and
-fractional forms like "2h45m" and "1.5h", and a template-side reimplementation of that would
-be more likely to be wrong than the thing it guards. So this handles the single-unit shape
-`<number><unit>` and reports "" for anything else, and the caller SKIPS validation rather
-than failing when it cannot parse. A guard that is silent on exotic input is honest; one that
-rejects input the agent would have accepted is a new bug.
+Handles the COMPOUND forms too (1m30s, 2h45m, 1.5h), by validating the whole string as one or
+more <number><unit> pairs and then summing the pairs. An earlier version accepted only a single
+pair and returned "" for everything else, which made the caller skip validation on input that
+was merely exotic -- and, far worse, skip it on input that is not a duration at all. `15` and
+`20 s` both took that path: time.ParseDuration rejects them outright, so config.Load fail-fasts
+and every pod CrashLoopBackOffs, which is exactly the render-clean/apply-broken outcome the
+caller exists to prevent (#291 review).
 
-Suffix order matters: "ms", "ns" and "us" must be tested before "s", or 15ms parses as 15
-followed by a stray "m".
+So "" now means "not a duration", and the caller FAILS on it rather than shrugging. The one
+thing still not modelled is Go's `µs` spelling of microseconds, which is accepted below as an
+alternative to `us`; a lease timing in microseconds is not a real configuration, and the
+overall-shape check means an unrecognised unit fails loudly instead of being skipped.
 */ -}}
 {{- define "pg.durationMs" -}}
 {{- $d := . | toString | trim | lower -}}
-{{- if regexMatch "^[0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h)$" $d -}}
-{{- if hasSuffix "ms" $d -}}{{ mulf (float64 (trimSuffix "ms" $d)) 1.0 }}
-{{- else if hasSuffix "ns" $d -}}{{ mulf (float64 (trimSuffix "ns" $d)) 0.000001 }}
-{{- else if hasSuffix "us" $d -}}{{ mulf (float64 (trimSuffix "us" $d)) 0.001 }}
-{{- else if hasSuffix "h" $d -}}{{ mulf (float64 (trimSuffix "h" $d)) 3600000.0 }}
-{{- else if hasSuffix "m" $d -}}{{ mulf (float64 (trimSuffix "m" $d)) 60000.0 }}
-{{- else if hasSuffix "s" $d -}}{{ mulf (float64 (trimSuffix "s" $d)) 1000.0 }}
+{{- $pair := "[0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h)" -}}
+{{- if regexMatch (printf "^(%s)+$" $pair) $d -}}
+{{- $total := 0.0 -}}
+{{- range $tok := regexFindAll $pair $d -1 -}}
+{{- $mult := 0.0 -}}
+{{- if hasSuffix "ms" $tok -}}{{- $mult = 1.0 -}}
+{{- else if hasSuffix "ns" $tok -}}{{- $mult = 0.000001 -}}
+{{- else if or (hasSuffix "us" $tok) (hasSuffix "\u00b5s" $tok) -}}{{- $mult = 0.001 -}}
+{{- else if hasSuffix "h" $tok -}}{{- $mult = 3600000.0 -}}
+{{- else if hasSuffix "m" $tok -}}{{- $mult = 60000.0 -}}
+{{- else if hasSuffix "s" $tok -}}{{- $mult = 1000.0 -}}
 {{- end -}}
+{{- $num := regexFind "^[0-9]+(\\.[0-9]+)?" $tok -}}
+{{- $total = addf $total (mulf (float64 $num) $mult) -}}
+{{- end -}}
+{{- $total -}}
 {{- end -}}
 {{- end -}}
 
@@ -1416,16 +1427,32 @@ wants the same treatment.
 */ -}}
 {{- define "pg.validateLeaseTimings" -}}
 {{- $agent := .Values.ha.agent | default dict -}}
-{{- $ldRaw := $agent.leaseDuration | default "15s" -}}
-{{- $rdRaw := $agent.renewDeadline | default "10s" -}}
-{{- $rpRaw := $agent.retryPeriod | default "2s" -}}
-{{- $ld := include "pg.durationMs" $ldRaw -}}
-{{- $rd := include "pg.durationMs" $rdRaw -}}
-{{- $rp := include "pg.durationMs" $rpRaw -}}
-{{- if and (ne $ld "") (ne $rd "") (ne $rp "") -}}
-{{- if not (and (gt (float64 $ld) (float64 $rd)) (gt (float64 $rd) (float64 $rp))) -}}
+{{- $triple := list
+      (list "leaseDuration" ($agent.leaseDuration | default "15s"))
+      (list "renewDeadline" ($agent.renewDeadline | default "10s"))
+      (list "retryPeriod"   ($agent.retryPeriod   | default "2s")) -}}
+{{- /* First: is each one a duration at all? A non-duration is a HARD failure, not a skip --
+       time.ParseDuration rejects `15` and `20 s`, so the agent would refuse to start and every
+       pod would CrashLoopBackOff after a clean render (#291 review). */ -}}
+{{- range $entry := $triple -}}
+{{- if eq (include "pg.durationMs" (index $entry 1)) "" -}}
+{{- fail (printf "ha.agent.%s is %q, which is not a Go duration: it needs a unit and no spaces, e.g. \"15s\", \"500ms\", \"1m30s\". The agent parses this with time.ParseDuration and refuses to start if it fails, so an unparseable value renders cleanly and then CrashLoopBackOffs every postgresql pod with no primary." (index $entry 0) (index $entry 1)) -}}
+{{- end -}}
+{{- end -}}
+{{- $ldRaw := index (index $triple 0) 1 -}}
+{{- $rdRaw := index (index $triple 1) 1 -}}
+{{- $rpRaw := index (index $triple 2) 1 -}}
+{{- $ld := float64 (include "pg.durationMs" $ldRaw) -}}
+{{- $rd := float64 (include "pg.durationMs" $rdRaw) -}}
+{{- $rp := float64 (include "pg.durationMs" $rpRaw) -}}
+{{- if not (and (gt $ld $rd) (gt $rd $rp)) -}}
 {{- fail (printf "ha.agent lease timings must satisfy leaseDuration > renewDeadline > retryPeriod, but got leaseDuration=%s renewDeadline=%s retryPeriod=%s. client-go's leader election requires it and the agent refuses to start otherwise, so this would render cleanly and then CrashLoopBackOff every postgresql pod at once with no primary. If these came from two different values files, check for a MIXTURE of the deprecated repmgr.agent.* spelling and the canonical ha.agent.* one: where a key is set under both names the repmgr.* value wins, so one timing can come from a 1.x file while the other two come from a newer -f, producing a triple neither file contains. Set all three under the same name (ha.agent.*), or delete the repmgr.agent.* copies." $ldRaw $rdRaw $rpRaw) -}}
 {{- end -}}
+{{- /* The etcd backend adds a floor of its own: its lease TTL is whole seconds, so config.go
+       requires LEASE_DURATION >= 5s there. Same failure shape as above -- valid ordering, clean
+       render, refused boot -- so it belongs in the same guard (#291 review). */ -}}
+{{- if and (eq (($agent.dcs).backend | default "kubernetes") "etcd") (lt $ld 5000.0) -}}
+{{- fail (printf "ha.agent.leaseDuration is %s, but the etcd DCS backend requires at least 5s: its lease TTL is expressed in whole seconds, so the agent refuses to start below that (and would CrashLoopBackOff every pod after a clean render). Raise leaseDuration to 5s or more -- keeping leaseDuration > renewDeadline > retryPeriod -- or use ha.agent.dcs.backend: kubernetes." $ldRaw) -}}
 {{- end -}}
 {{- end -}}
 

@@ -174,9 +174,13 @@ apply "HA image tag" \
 # rewrite them to <old-repo>:<new-scheme-tag> -- a coordinate that will never exist, since
 # cagriekin/repmgr is frozen at its last trixie- tag. The leftover scanner catches it, but
 # as a FATAL the operator then has to fix by hand; rewriting is the actual fix.
+# Uses HA_REPO_RE, not a hardcoded pair (#291 review): `apply` exits 1 when a rule matches
+# nothing, so a fork or mirror that has consistently retargeted values.yaml AND its fixtures
+# would otherwise hit "rule 'HA image repository' matched nothing" and take down every KinD
+# leg -- the same reason the scanners' alternation is derived rather than fixed.
 apply "HA image repository" \
-  '^([[:space:]]+)repository: (cagriekin/repmgr|cagriekin/pg-ha)[[:space:]]*$' \
-  's#^([[:space:]]+)repository: (cagriekin/repmgr|cagriekin/pg-ha)[[:space:]]*$#\1repository: '"${HA_REPO}"'#'
+  "^([[:space:]]+)repository: ${HA_REPO_RE}[[:space:]]*\$" \
+  "s#^([[:space:]]+)repository: ${HA_REPO_RE}[[:space:]]*\$#\\1repository: ${HA_REPO}#"
 
 # postgres image tags (postgresql.image.tag + the TLS suite's client pod). Deliberately
 # broader than the tags in the tree today -- `postgres:17-trixie` (major-only) and the

@@ -31,8 +31,21 @@ postgresql:
     # failure). Set your cluster's zonal SC name here.
     storageClass: ""
 
-# Renamed from `repmgr:` in 2.0.0 (#291). The alias still works, but a chart-shipped
-# example must not be the thing that trips its own deprecation notice.
+# Renamed from `repmgr:` in 2.0.0 (#291); the alias still works, but a chart-shipped example
+# must not be the thing that trips its own deprecation notice.
+#
+# LAYERING NOTE. This overlay sets the three lease timings, which the chart
+# cross-validates (leaseDuration > renewDeadline > retryPeriod). While `repmgr.*` remains a
+# deprecated alias it WINS over `ha.*` key by key, whatever the -f order -- so if your own
+# values file still spells the block `repmgr:` AND sets any of these three, layering this
+# overlay on top produces a mixture: your value for that key, this file's for the other two.
+# The render REJECTS that rather than deploying it (the agent would refuse to start and every
+# pod would CrashLoopBackOff), so you will see a message naming the three values.
+#
+# The fix is the rename you need before the next major anyway: change the top-level `repmgr:`
+# key in your file to `ha:`. This overlay is deliberately NOT dual-spelled -- a chart-shipped
+# example that carries the deprecated block would trip the very deprecation notice it should be
+# demonstrating the absence of, and would teach both spellings at once.
 ha:
   agent:
     # Managed-cloud lease timing: a routine control-plane blip (apiserver upgrade,

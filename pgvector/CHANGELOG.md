@@ -96,6 +96,37 @@
     instead of hardcoding the two Docker Hub names, so pointing `ha.image.repository` at a
     mirror or fork cannot make the scanners match nothing and report a silent green.
 
+  Fourth review round, all on the lease guard added in the third:
+
+  - **An unparseable duration skipped validation instead of failing it.** `ha.agent.leaseDuration:
+    15` or `"20 s"` is not a Go duration -- `time.ParseDuration` rejects it, so `config.Load`
+    fail-fasts and every pod CrashLoopBackOffs -- but the guard's parser returned "" for it and
+    the caller shrugged, reproducing the exact render-clean/apply-broken outcome the guard was
+    added to close. `""` now means "not a duration" and is a hard failure; the parser also
+    handles the COMPOUND forms it previously skipped (`1m30s`, `2h45m`) by summing their pairs,
+    so nothing valid is rejected and nothing invalid is waved through. The doc comment claiming
+    `1.5h` was unparseable was wrong (the optional fraction already matched it), which meant one
+    test was passing on the ordering result rather than on the skip it claimed to assert.
+  - **The etcd DCS lease floor is now checked at render time.** `config.go` requires
+    `LEASE_DURATION >= 5s` under `ha.agent.dcs.backend: etcd` because the lease TTL is whole
+    seconds; a triple like 3s/2s/1s satisfies the ordering, rendered clean, and refused to boot.
+  - `values-cloud.yaml` gained a layering note. Because `repmgr.*` wins key by key, an operator
+    whose own file still spells the block `repmgr:` and sets any of the three timings gets a
+    mixture when they add `-f values-cloud.yaml` -- now rejected loudly with the fix named,
+    where before this PR it silently resolved to the overlay's values. The overlay is
+    deliberately NOT dual-spelled: shipping the deprecated block in an example would trip the
+    very notice it should demonstrate the absence of.
+  - `set-pg-major.sh`'s repository-rewrite rule now uses the derived alternation like the
+    scanners do, so a fork or mirror that retargeted values.yaml and its fixtures no longer hits
+    `rule 'HA image repository' matched nothing`. Verified against a simulated private registry.
+
+  Not changed: the `mechanism != native` branches in `pg.chartOwnsSharedPreloadLibraries` and
+  `pg.sharedPreloadLibraries`. They are unreachable in a real render for the same reason as the
+  agent branch this PR deleted, but the two are not equivalent -- the agent branch emitted
+  *wrong remediation advice*, which is worse than dead, while these two produce correct behaviour
+  for a state that can no longer occur. Deleting them would touch the subtle #262/#293 preload
+  logic for no behavioural gain.
+
 - **The HA image is versioned with the chart** (#290/#291). Tags are now
   `cagriekin/pg-ha:<chart-version>-pg<major>` (e.g. `2.0.0-pg18`, `2.0.0-pg17`), published from
   the git tag `pg-ha-<version>`, replacing `cagriekin/repmgr:trixie-<repmgr>-<n>`. The old

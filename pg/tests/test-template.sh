@@ -4968,14 +4968,48 @@ for ok_triple in "15s:10s:2s" "30s:20s:4s" "1m:30s:5s" "1500ms:1000ms:200ms"; do
   assert_eq "#291: lease triple ${ok_triple} renders" "0" "${ot_rc}"
 done
 
-# A duration shape the template parser does not handle must SKIP validation, not fail: the
-# agent's time.ParseDuration accepts compound forms, and rejecting input the agent would have
-# accepted would be a new bug rather than a guard.
-for exotic in "2h45m" "1.5h"; do
-  ex_rc=0
-  helm template test-pg "${CHART_DIR}" --set "ha.agent.leaseDuration=${exotic}" >/dev/null 2>&1 || ex_rc=$?
-  assert_eq "#291: an unparseable-by-template duration (${exotic}) is skipped, not rejected" "0" "${ex_rc}"
+# Compound and fractional durations are what time.ParseDuration accepts, so the parser handles
+# them rather than skipping -- the first version of this block asserted a "skip" for 1.5h that
+# never happened (the regex's optional fraction already matched it), so it was passing on the
+# ordering result, not on the skip. Each of these is > the 10s renewDeadline default, so a
+# correct parse renders and a mis-parse does not.
+for compound in "2h45m" "1.5h" "1m30s" "90s"; do
+  cp_rc=0
+  helm template test-pg "${CHART_DIR}" --set "ha.agent.leaseDuration=${compound}" >/dev/null 2>&1 || cp_rc=$?
+  assert_eq "#291: compound/fractional duration ${compound} parses and renders" "0" "${cp_rc}"
 done
+
+# A value that is NOT a Go duration must FAIL, not be skipped. Skipping was the original bug:
+# time.ParseDuration rejects `15` and `20 s`, so config.Load fail-fasts and every pod
+# CrashLoopBackOffs -- render clean, apply broken, the invariant-4 outcome the guard exists for.
+for notdur in "15" "20 s" "bogus" "s"; do
+  nd_out=$(helm template test-pg "${CHART_DIR}" --set "ha.agent.leaseDuration=${notdur}" 2>&1 || true)
+  assert_contains "#291: a non-duration leaseDuration (${notdur}) is rejected" \
+    "${nd_out}" "is not a Go duration"
+done
+
+# ...and the same check covers the other two keys, not just the first.
+for nd_key in renewDeadline retryPeriod; do
+  nd_out=$(helm template test-pg "${CHART_DIR}" --set "ha.agent.${nd_key}=7" 2>&1 || true)
+  assert_contains "#291: a non-duration ${nd_key} is rejected too" "${nd_out}" "is not a Go duration"
+done
+
+# The etcd backend has a floor of its own (whole-second lease TTL), enforced in config.go and
+# until now not at render time: a valid ORDERING below 5s rendered clean and refused to boot.
+etcd_low=$(helm template test-pg "${CHART_DIR}" --set ha.agent.dcs.backend=etcd \
+  --set etcd.enabled=true --set ha.agent.leaseDuration=3s --set ha.agent.renewDeadline=2s \
+  --set ha.agent.retryPeriod=1s 2>&1 || true)
+assert_contains "#291: etcd DCS below the 5s lease floor is rejected" \
+  "${etcd_low}" "requires at least 5s"
+etcd_ok_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.agent.dcs.backend=etcd --set etcd.enabled=true \
+  >/dev/null 2>&1 || etcd_ok_rc=$?
+assert_eq "#291: etcd DCS on the default 15s lease renders" "0" "${etcd_ok_rc}"
+# ...and the floor is etcd-only -- it must not fire on the kubernetes backend.
+k8s_low_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.agent.leaseDuration=3s \
+  --set ha.agent.renewDeadline=2s --set ha.agent.retryPeriod=1s >/dev/null 2>&1 || k8s_low_rc=$?
+assert_eq "#291: a sub-5s lease is fine on the kubernetes backend" "0" "${k8s_low_rc}"
 
 # pgvector shares the templates but has its own values-cloud.yaml, so assert the reach there too.
 pgv_lease=$(helm template test-pgv "${PGVECTOR_DIR}" \
