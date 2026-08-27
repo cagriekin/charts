@@ -5017,5 +5017,95 @@ pgv_lease=$(helm template test-pgv "${PGVECTOR_DIR}" \
 assert_contains "#291 pgvector: the same alias-mixed triple fails" \
   "${pgv_lease}" "leaseDuration > renewDeadline > retryPeriod"
 
+# #291 review round 5: the duration guard diverged from time.ParseDuration in BOTH directions,
+# and each direction is its own bug -- too permissive means the render-clean/CrashLoopBackOff
+# outcome the guard exists to stop happens anyway; too strict turns a working 1.x value into a
+# hard failure on upgrade. These cases were checked against real time.ParseDuration output.
+
+# Valid Go durations the guard must ACCEPT (paired with a valid ordering so only the shape
+# check is under test). ".5s"/"5.s" omit a side of the decimal point, "+15s" carries Go's
+# optional sign, and both µ spellings (U+00B5, U+03BC) are units Go takes.
+while IFS='|' read -r dg_ld dg_rd dg_rp dg_why; do
+  [ -n "${dg_ld}" ] || continue
+  dg_rc=0
+  helm template test-pg "${CHART_DIR}" --set-string "ha.agent.leaseDuration=${dg_ld}" \
+    --set-string "ha.agent.renewDeadline=${dg_rd}" --set-string "ha.agent.retryPeriod=${dg_rp}" \
+    >/dev/null 2>&1 || dg_rc=$?
+  assert_eq "#291: ${dg_why} (${dg_ld}/${dg_rd}/${dg_rp}) renders" "0" "${dg_rc}"
+done <<'DURATIONS_OK'
+5.s|2.s|1.s|a trailing decimal point
+.5s|.2s|.1s|a leading decimal point
++15s|+10s|+2s|Go's optional leading sign
+1m30s|60s|2s|a compound duration
+15µs|10µs|2µs|microseconds spelled U+00B5
+15μs|10μs|2μs|microseconds spelled U+03BC
+DURATIONS_OK
+
+# Values time.ParseDuration REJECTS. Each renders cleanly and then refuses the agent's boot, so
+# each must fail the render instead. "15S"/"1M30S" are the case-sensitivity hole (a `lower` in
+# the parser used to accept them); "" is the default-substitution hole (`| default "15s"`
+# validated the default while the StatefulSet emitted the empty string).
+for dg_key in leaseDuration renewDeadline retryPeriod reconcileInterval; do
+  while IFS= read -r dg_bad; do
+    [ -n "${dg_bad}" ] || continue
+    dg_out=$(helm template test-pg "${CHART_DIR}" --set-string "ha.agent.${dg_key}=${dg_bad}" 2>&1 || true)
+    assert_contains "#291: ha.agent.${dg_key}=${dg_bad} is rejected as a non-duration" \
+      "${dg_out}" "is not a Go duration"
+  done <<'DURATIONS_BAD'
+15S
+1M30S
+15
+20 s
+bogus
+DURATIONS_BAD
+done
+
+# The empty string needs its own case: --set-string with an empty value, checked per key.
+for dg_key in leaseDuration renewDeadline retryPeriod reconcileInterval; do
+  dg_empty=$(helm template test-pg "${CHART_DIR}" --set-string "ha.agent.${dg_key}=" 2>&1 || true)
+  assert_contains "#291: an explicitly empty ha.agent.${dg_key} is rejected" \
+    "${dg_empty}" "is not a Go duration"
+done
+
+# reconcileInterval is not part of the ordering comparison, but config.Load parses it with the
+# same helper -- so a VALID value must still render, or the loop above would be passing for the
+# wrong reason.
+dg_ri_rc=0
+helm template test-pg "${CHART_DIR}" --set-string "ha.agent.reconcileInterval=7s" >/dev/null 2>&1 \
+  || dg_ri_rc=$?
+assert_eq "#291: a valid reconcileInterval renders (guards the loop above)" "0" "${dg_ri_rc}"
+
+# #291 review round 5: the bundled etcd's RBAC-bootstrap Job runs the agent binary, so its
+# image must track ha.image. values.yaml pinned both halves but nothing enforced it, so the
+# next image bump would silently reintroduce the drift.
+etcd_boot_args=(--set etcd.enabled=true --set ha.agent.dcs.backend=etcd)
+etcd_drift=$(helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
+  --set ha.image.tag=2.0.0-pg18 2>&1 || true)
+assert_contains "#291: an etcd bootstrapImage that drifts from ha.image fails the render" \
+  "${etcd_drift}" "must match ha.image"
+etcd_lock_rc=0
+helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
+  --set ha.image.repository=cagriekin/pg-ha --set ha.image.tag=2.0.0-pg18 \
+  --set etcd.rbac.bootstrapImage.repository=cagriekin/pg-ha \
+  --set etcd.rbac.bootstrapImage.tag=2.0.0-pg18 >/dev/null 2>&1 || etcd_lock_rc=$?
+assert_eq "#291: moving both halves together renders" "0" "${etcd_lock_rc}"
+# ...and exactly one image reaches the manifests in that case.
+etcd_lock_imgs=$(helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
+  --set ha.image.repository=cagriekin/pg-ha --set ha.image.tag=2.0.0-pg18 \
+  --set etcd.rbac.bootstrapImage.repository=cagriekin/pg-ha \
+  --set etcd.rbac.bootstrapImage.tag=2.0.0-pg18 2>/dev/null \
+  | grep -oE 'cagriekin/[^"[:space:]]*' | sort -u | wc -l)
+assert_eq "#291: the lockstep render uses exactly one cagriekin image" "1" "${etcd_lock_imgs}"
+# The default (bundled etcd, untouched pins) must be in lockstep already.
+etcd_def_rc=0
+helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" >/dev/null 2>&1 || etcd_def_rc=$?
+assert_eq "#291: the shipped etcd pins are already in lockstep" "0" "${etcd_def_rc}"
+# With an EXTERNAL etcd the Job never renders, so a stale pin there is inert, not an error.
+etcd_ext_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.agent.dcs.backend=etcd \
+  --set 'ha.agent.dcs.etcd.endpoints[0]=e:2379' --set ha.image.tag=2.0.0-pg18 >/dev/null 2>&1 \
+  || etcd_ext_rc=$?
+assert_eq "#291: an external etcd does not enforce the bootstrapImage lockstep" "0" "${etcd_ext_rc}"
+
 end_suite
 print_summary

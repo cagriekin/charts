@@ -18,6 +18,7 @@
 {{- include "pg.validateNativePreloadRepmgr" . }}
 {{- include "pg.validateRemovedRepmgrdValues" . }}
 {{- include "pg.validateLeaseTimings" . }}
+{{- include "pg.validateEtcdBootstrapImage" . }}
 {{- if and (not .Values.ha.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
 {{- fail "postgresql.replicaCount > 0 requires ha.enabled=true: with HA disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode, or ha.enabled=true" }}
 {{- end }}

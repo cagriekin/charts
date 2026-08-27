@@ -127,6 +127,28 @@
   for a state that can no longer occur. Deleting them would touch the subtle #262/#293 preload
   logic for no behavioural gain.
 
+  Fifth review round -- the duration guard diverged from time.ParseDuration in BOTH directions,
+  and each direction was its own bug:
+
+  - **Too permissive (three holes, each reproducing the outage the guard exists to prevent).**
+    The parser lower-cased its input, so `15S` and `1M30S` passed -- Go's units are
+    case-SENSITIVE and both are errors. `| default "15s"` collapsed an explicitly empty value
+    into the default, so an empty `leaseDuration` validated as 15s while the StatefulSet emitted
+    `value: ""`, which Go also rejects. And `reconcileInterval` was not checked at all, though
+    `config.Load` parses it with the same helper. All three rendered cleanly and then refused the
+    agent's boot on every pod.
+  - **Too strict (turning working 1.x values into upgrade failures).** `.5s`, `5.s` and `+15s`
+    are valid Go durations and were rejected, as was microseconds spelled U+03BC. The grammar now
+    mirrors `time.ParseDuration`: optional leading sign, one or more `<number><unit>` pairs with
+    either side of the decimal point omissible, and all three microsecond spellings.
+  - **`etcd.rbac.bootstrapImage` must now match `ha.image` at render time.** The bundled etcd's
+    RBAC-bootstrap Job runs `pg-ha-agent rbac-bootstrap`, so a mismatch has one agent build
+    writing the etcd RBAC that a different build then authenticates against. This change pinned
+    both halves by hand but nothing enforced the lockstep, so the next image bump would have
+    silently reintroduced the drift. Adopting a new image is therefore a FOUR-key edit per chart,
+    now stated in `images/pg-ha/README.md` and enforced by `pg.validateEtcdBootstrapImage`.
+    Only checked when the bundled etcd is enabled -- with an external etcd the Job never renders.
+
 - **The HA image is versioned with the chart** (#290/#291). Tags are now
   `cagriekin/pg-ha:<chart-version>-pg<major>` (e.g. `2.0.0-pg18`, `2.0.0-pg17`), published from
   the git tag `pg-ha-<version>`, replacing `cagriekin/repmgr:trixie-<repmgr>-<n>`. The old

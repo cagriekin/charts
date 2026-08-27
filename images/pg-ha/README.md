@@ -20,6 +20,8 @@ docker build --build-arg PG_MAJOR=17 -t cagriekin/pg-ha:2.0.0-pg17 .
 
 Published tags per release: `cagriekin/pg-ha:2.0.0-pg18` and `cagriekin/pg-ha:2.0.0-pg17`, from a single git tag `pg-ha-2.0.0` (#290).
 
+Adopting a new image in the charts is a **four-key** edit in each of `pg/values.yaml` and `pgvector/values.yaml`, not two: `ha.image.repository`, `ha.image.tag`, `etcd.rbac.bootstrapImage.repository` and `etcd.rbac.bootstrapImage.tag`. The bundled etcd's RBAC-bootstrap Job runs `pg-ha-agent rbac-bootstrap` from that second pin, so a two-key edit leaves one agent build writing the etcd RBAC that a different build then authenticates against. `pg.validateEtcdBootstrapImage` fails the render when they disagree, so the omission is caught rather than shipped (#291).
+
 The scheme changed with the repmgr removal. It was `trixie-<repmgr-version>-<n>` under
 `cagriekin/repmgr`, keyed on a package this image no longer contains -- so a published tag
 advertised a version that was not in it. It is now keyed on the PostgreSQL major, which is what

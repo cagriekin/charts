@@ -1513,6 +1513,9 @@ etcd:
   # trixie- tag, and the new tag scheme only ever appears under cagriekin/pg-ha). It failed
   # exactly this way in a simulated two-step: the etcd-TLS fixture rendered
   # cagriekin/repmgr:2.0.0-pg17. Both halves move together or neither does.
+  # ENFORCED at render time since #291: pg.validateEtcdBootstrapImage fails the render when
+  # these two disagree with ha.image, so the image bump is a FOUR-key change --
+  # ha.image.repository/tag and these two -- not the two the two-step used to name.
   rbac:
     bootstrapImage:
       repository: cagriekin/repmgr

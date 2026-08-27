@@ -188,3 +188,39 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: 'requires at least 5s'
+
+  # #291 review: Go's duration units are case-SENSITIVE, and a `lower` in the parser used to
+  # let "15S" through -- clean render, then time.ParseDuration fails and every pod dies.
+  - it: an upper-case duration unit fails fast
+    set:
+      ha.agent.leaseDuration: "15S"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # `| default "15s"` validated the default while the StatefulSet emitted the empty string.
+  - it: an explicitly empty duration fails fast
+    set:
+      ha.agent.renewDeadline: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # reconcileInterval is parsed by the same config.Load helper but is not in the ordering check.
+  - it: an unparseable reconcileInterval fails fast
+    set:
+      ha.agent.reconcileInterval: "15"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # The bundled etcd's RBAC-bootstrap Job runs the agent binary, so its image must track
+  # ha.image or one build writes the RBAC another build authenticates against.
+  - it: an etcd bootstrapImage drifting from ha.image fails fast
+    set:
+      etcd.enabled: true
+      ha.agent.dcs.backend: etcd
+      ha.image.tag: 2.0.0-pg18
+    asserts:
+      - failedTemplate:
+          errorPattern: 'must match ha.image'

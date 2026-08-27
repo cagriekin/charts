@@ -1367,81 +1367,123 @@ volumes:
 {{- end }}
 
 {{- /*
-pg.durationMs -- a Go duration string as a number of milliseconds, or "" when the string is
-not a Go duration at all. Exists only for pg.validateLeaseTimings below.
+pg.validateEtcdBootstrapImage -- the bundled etcd's RBAC-bootstrap Job runs `pg-ha-agent
+rbac-bootstrap`, so it must run the SAME image as the database pods. pg/values.yaml pins
+etcd.rbac.bootstrapImage to match ha.image and its comment says to keep them in lockstep --
+but nothing enforced it, so the next image bump would silently reintroduce the drift this
+change fixed by hand (#291 review). Verified drift: setting ha.image to
+cagriekin/pg-ha:2.0.0-pg18 rendered the database pods on the new image and the bootstrap Job
+still on cagriekin/repmgr:trixie-5.5.0-33 -- one agent build writing the etcd RBAC that a
+different build then authenticates against.
 
-Handles the COMPOUND forms too (1m30s, 2h45m, 1.5h), by validating the whole string as one or
-more <number><unit> pairs and then summing the pairs. An earlier version accepted only a single
-pair and returned "" for everything else, which made the caller skip validation on input that
-was merely exotic -- and, far worse, skip it on input that is not a duration at all. `15` and
-`20 s` both took that path: time.ParseDuration rejects them outright, so config.Load fail-fasts
-and every pod CrashLoopBackOffs, which is exactly the render-clean/apply-broken outcome the
-caller exists to prevent (#291 review).
-
-So "" now means "not a duration", and the caller FAILS on it rather than shrugging. The one
-thing still not modelled is Go's `µs` spelling of microseconds, which is accepted below as an
-alternative to `us`; a lease timing in microseconds is not a real configuration, and the
-overall-shape check means an unrecognised unit fails loudly instead of being skipped.
+Only checked when the bundled etcd is enabled: with an external etcd the Job never renders and
+a stale pin there is inert. A mismatch fails rather than auto-following, because silently
+overriding a subchart value the operator set is worse than naming the two keys that disagree --
+and a legitimate BYO case (an air-gapped mirror holding only one of the two) has to be theirs
+to acknowledge, not the chart's to assume.
 */ -}}
-{{- define "pg.durationMs" -}}
-{{- $d := . | toString | trim | lower -}}
-{{- $pair := "[0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|ms|s|m|h)" -}}
-{{- if regexMatch (printf "^(%s)+$" $pair) $d -}}
-{{- $total := 0.0 -}}
-{{- range $tok := regexFindAll $pair $d -1 -}}
-{{- $mult := 0.0 -}}
-{{- if hasSuffix "ms" $tok -}}{{- $mult = 1.0 -}}
-{{- else if hasSuffix "ns" $tok -}}{{- $mult = 0.000001 -}}
-{{- else if or (hasSuffix "us" $tok) (hasSuffix "\u00b5s" $tok) -}}{{- $mult = 0.001 -}}
-{{- else if hasSuffix "h" $tok -}}{{- $mult = 3600000.0 -}}
-{{- else if hasSuffix "m" $tok -}}{{- $mult = 60000.0 -}}
-{{- else if hasSuffix "s" $tok -}}{{- $mult = 1000.0 -}}
+{{- define "pg.validateEtcdBootstrapImage" -}}
+{{- if (.Values.etcd).enabled -}}
+{{- $ha := .Values.ha.image | default dict -}}
+{{- $boot := ((.Values.etcd).rbac).bootstrapImage | default dict -}}
+{{- $haRef := printf "%s:%s" ($ha.repository | default "") ($ha.tag | default "") -}}
+{{- $bootRef := printf "%s:%s" ($boot.repository | default "") ($boot.tag | default "") -}}
+{{- if ne $haRef $bootRef -}}
+{{- fail (printf "etcd.rbac.bootstrapImage (%s) must match ha.image (%s): the bundled etcd's RBAC-bootstrap Job runs `pg-ha-agent rbac-bootstrap` from that image, so a mismatch has one agent build writing the etcd RBAC that a different build then authenticates against. Set etcd.rbac.bootstrapImage.repository and .tag to the same values as ha.image.repository and .tag -- both move together on every image bump. If you genuinely need different images (an air-gapped mirror holding only one), use an external etcd instead: leave etcd.enabled=false and point ha.agent.dcs.etcd.endpoints at your own cluster." $bootRef $haRef) -}}
 {{- end -}}
-{{- $num := regexFind "^[0-9]+(\\.[0-9]+)?" $tok -}}
-{{- $total = addf $total (mulf (float64 $num) $mult) -}}
-{{- end -}}
-{{- $total -}}
 {{- end -}}
 {{- end -}}
 
 {{- /*
-pg.validateLeaseTimings -- client-go's leaderelection requires
-leaseDuration > renewDeadline > retryPeriod, and the agent enforces it in config.Load. Until
-now nothing checked it at RENDER time, so a violating triple produced a clean `helm template`
-and then a hard boot refusal in every postgresql pod at once: CrashLoopBackOff across the
-whole StatefulSet, with no primary and no failover. That is precisely the apply-time failure
-invariant 4 exists to prevent (#291 review).
+pg.durationMs -- a Go duration string as a number of milliseconds, or "" when the string is not
+a Go duration. Exists only for pg.validateLeaseTimings below.
 
-The reachable path is not an operator typing three bad numbers -- it is MIXING the `repmgr.*`
-alias with `ha.*` across two values files. These three keys are cross-validated, so taking one
-of them from a legacy file and the other two from a newer source yields a combination neither
-source contains. The chart's own values-cloud.yaml overlay was exactly this trap: an operator
-with `repmgr.agent.leaseDuration: 15s` in a 1.x file who added `-f values-cloud.yaml` (which
-sets the canonical spelling of all three) kept 15s for the first and took 20s/4s for the other
-two -- and 15s > 20s is false.
+The grammar mirrors time.ParseDuration deliberately, because BOTH directions of divergence are
+bugs and this helper has now had one of each (#291 review):
 
-So this guard is not really about the lease at all: it closes the general class of "an alias
-mixture produces a combination that is individually valid and jointly impossible", of which
-the lease triple is the instance with teeth. Any future group of cross-validated ha.* keys
-wants the same treatment.
+  - too permissive => the guard skips input the agent will reject, and the render-clean /
+    CrashLoopBackOff outcome the guard exists to prevent happens anyway. `lower` was here once,
+    which made "15S" and "1M30S" parse; Go's units are case-SENSITIVE, so both are errors.
+  - too strict => the guard rejects input the agent accepts, turning a working 1.x value into a
+    hard render failure on upgrade. ".5s" and "+15s" are valid Go durations and were refused.
+
+So: an optional leading sign (Go allows one, at the front only), then one or more
+<number><unit> pairs, where the number may omit either side of the decimal point (".5", "5.",
+"5.5", "5") and the unit is one of Go's, including both spellings of microseconds -- "us",
+U+00B5 "µs" and U+03BC "μs", all three of which time.ParseDuration takes.
+
+An empty string is NOT a duration ("" is an error in Go), and reporting "" for it is correct
+here -- but the caller must be careful not to have replaced it with a default first.
 */ -}}
+{{- define "pg.durationMs" -}}
+{{- $d := . | toString | trim -}}
+{{- $num := "([0-9]+(\\.[0-9]*)?|\\.[0-9]+)" -}}
+{{- $unit := "(ns|us|µs|μs|ms|s|m|h)" -}}
+{{- $pair := printf "%s%s" $num $unit -}}
+{{- if regexMatch (printf "^[+-]?(%s)+$" $pair) $d -}}
+{{- $sign := 1.0 -}}
+{{- $body := $d -}}
+{{- if hasPrefix "-" $d -}}{{- $sign = -1.0 -}}{{- $body = trimPrefix "-" $d -}}
+{{- else if hasPrefix "+" $d -}}{{- $body = trimPrefix "+" $d -}}
+{{- end -}}
+{{- $total := 0.0 -}}
+{{- range $tok := regexFindAll $pair $body -1 -}}
+{{- $mult := 0.0 -}}
+{{- if hasSuffix "ms" $tok -}}{{- $mult = 1.0 -}}
+{{- else if hasSuffix "ns" $tok -}}{{- $mult = 0.000001 -}}
+{{- else if or (hasSuffix "us" $tok) (hasSuffix "µs" $tok) (hasSuffix "μs" $tok) -}}{{- $mult = 0.001 -}}
+{{- else if hasSuffix "h" $tok -}}{{- $mult = 3600000.0 -}}
+{{- else if hasSuffix "m" $tok -}}{{- $mult = 60000.0 -}}
+{{- else if hasSuffix "s" $tok -}}{{- $mult = 1000.0 -}}
+{{- end -}}
+{{- $n := regexFind (printf "^%s" $num) $tok -}}
+{{- /* float64 cannot cast "5." or ".5" -- Go's duration grammar allows either side of the
+       point to be omitted, so pad both ends before casting. Without this, "5.s" (a valid 5s)
+       cast to 0 and then failed the ORDERING check, which is a confusing error for a value
+       that is not actually wrong. */ -}}
+{{- if hasPrefix "." $n -}}{{- $n = printf "0%s" $n -}}{{- end -}}
+{{- if hasSuffix "." $n -}}{{- $n = printf "%s0" $n -}}{{- end -}}
+{{- $total = addf $total (mulf (float64 $n) $mult) -}}
+{{- end -}}
+{{- mulf $total $sign -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+pg.haAgentDuration -- the effective value of one ha.agent duration key, WITHOUT collapsing an
+explicitly-set empty string into the chart default. `$agent.x | default "15s"` does collapse it,
+which is how an empty leaseDuration used to be validated as 15s while statefulset.yaml emitted
+`value: ""` -- and Go rejects "", so config.Load fail-fasts and every pod CrashLoopBackOffs
+after a clean render (#291 review). hasKey is the distinction `default` cannot make.
+*/ -}}
+{{- define "pg.haAgentDuration" -}}
+{{- $agent := index . 0 -}}
+{{- $key := index . 1 -}}
+{{- if hasKey $agent $key -}}{{- index $agent $key | toString -}}{{- else -}}{{- index . 2 -}}{{- end -}}
+{{- end -}}
+
 {{- define "pg.validateLeaseTimings" -}}
 {{- $agent := .Values.ha.agent | default dict -}}
-{{- $triple := list
-      (list "leaseDuration" ($agent.leaseDuration | default "15s"))
-      (list "renewDeadline" ($agent.renewDeadline | default "10s"))
-      (list "retryPeriod"   ($agent.retryPeriod   | default "2s")) -}}
+{{- /* Every ha.agent key the agent parses with time.ParseDuration, not just the ordering
+       triple: config.Load treats them all the same way, so an unparseable reconcileInterval
+       refuses the boot exactly like an unparseable leaseDuration (#291 review). Defaults here
+       must match values.yaml. */ -}}
+{{- $durations := list
+      (list "leaseDuration"     (include "pg.haAgentDuration" (list $agent "leaseDuration"     "15s")))
+      (list "renewDeadline"     (include "pg.haAgentDuration" (list $agent "renewDeadline"     "10s")))
+      (list "retryPeriod"       (include "pg.haAgentDuration" (list $agent "retryPeriod"       "2s")))
+      (list "reconcileInterval" (include "pg.haAgentDuration" (list $agent "reconcileInterval" "5s"))) -}}
 {{- /* First: is each one a duration at all? A non-duration is a HARD failure, not a skip --
-       time.ParseDuration rejects `15` and `20 s`, so the agent would refuse to start and every
-       pod would CrashLoopBackOff after a clean render (#291 review). */ -}}
-{{- range $entry := $triple -}}
+       time.ParseDuration rejects `15`, `20 s`, `15S` and ``, so the agent would refuse to start
+       and every pod would CrashLoopBackOff after a clean render (#291 review). */ -}}
+{{- range $entry := $durations -}}
 {{- if eq (include "pg.durationMs" (index $entry 1)) "" -}}
-{{- fail (printf "ha.agent.%s is %q, which is not a Go duration: it needs a unit and no spaces, e.g. \"15s\", \"500ms\", \"1m30s\". The agent parses this with time.ParseDuration and refuses to start if it fails, so an unparseable value renders cleanly and then CrashLoopBackOffs every postgresql pod with no primary." (index $entry 0) (index $entry 1)) -}}
+{{- fail (printf "ha.agent.%s is %q, which is not a Go duration: it needs a unit, no spaces, and lower-case units, e.g. \"15s\", \"500ms\", \"1m30s\". Note the units are case-SENSITIVE (\"15S\" is an error) and an empty value is not a duration either. The agent parses this with time.ParseDuration and refuses to start if it fails, so an unparseable value renders cleanly and then CrashLoopBackOffs every postgresql pod with no primary." (index $entry 0) (index $entry 1)) -}}
 {{- end -}}
 {{- end -}}
-{{- $ldRaw := index (index $triple 0) 1 -}}
-{{- $rdRaw := index (index $triple 1) 1 -}}
-{{- $rpRaw := index (index $triple 2) 1 -}}
+{{- $ldRaw := index (index $durations 0) 1 -}}
+{{- $rdRaw := index (index $durations 1) 1 -}}
+{{- $rpRaw := index (index $durations 2) 1 -}}
 {{- $ld := float64 (include "pg.durationMs" $ldRaw) -}}
 {{- $rd := float64 (include "pg.durationMs" $rdRaw) -}}
 {{- $rp := float64 (include "pg.durationMs" $rpRaw) -}}
