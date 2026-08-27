@@ -36,8 +36,11 @@ DEFAULT_MAJOR="18"
 
 # Base repmgr tag as the chart ships it (same resolution the CI build step uses, so the
 # rewritten tag names an image that was actually built).
-BASE_TAG=$(awk '/^repmgr:/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' "$VALUES")
-[ -n "$BASE_TAG" ] || { echo "could not resolve repmgr image tag from ${VALUES}" >&2; exit 1; }
+# Accepts BOTH block spellings: #291 renamed the block to `ha:` and keeps `repmgr:` working
+# as a values alias, so this tree can legitimately carry either. Anchoring on one of them is
+# not a soft failure -- the [ -n ] guard below exits 1, which takes down every KinD leg.
+BASE_TAG=$(awk '/^(repmgr|ha):/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' "$VALUES")
+[ -n "$BASE_TAG" ] || { echo "could not resolve HA image tag from ${VALUES} (looked for the tag under the ha:/repmgr: block)" >&2; exit 1; }
 # Two tag shapes are accepted, because #290 changed the scheme and the chart pin moves to it
 # only once the new image is actually published (the documented two-step: publish, then bump).
 # Handling both here means that bump needs no change to this script or to CI.
@@ -129,9 +132,16 @@ apply "majorVersion" \
 # repmgr image tags: repmgr.image.tag, etcd.bootstrapImage.tag, and the tags a few suites
 # pin inline (test-tls's repmgrd release, test-migrate-agent's "from" image -- which must
 # be the same major, or the migration would restart a PG17 PGDATA under a PG18 server).
-apply "repmgr image tag" \
-  'trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?' \
-  's/trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?/'"${REPMGR_TAG}"'/g'
+# Both tag schemes are matched in one alternation for the same reason the case statement
+# above accepts both: the chart pin crosses from cagriekin/repmgr:trixie-<repmgr>-<n> to
+# cagriekin/pg-ha:<chart-version>-pg<major> in a two-step (publish the image, then bump the
+# pin), and the fixtures cross over one at a time. A rule matching only the old shape would
+# hit `apply`'s FATAL the moment the last legacy tag left the tree -- and, worse, a rule
+# matching only the new shape would silently stop retargeting the fixtures still on the old
+# one, leaving a "PG17" leg running PG18 and reporting green.
+apply "HA image tag" \
+  '(trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?|[0-9]+\.[0-9]+\.[0-9]+-pg[0-9]+)' \
+  's/(trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?|[0-9]+\.[0-9]+\.[0-9]+-pg[0-9]+)/'"${REPMGR_TAG}"'/g'
 
 # postgres image tags (postgresql.image.tag + the TLS suite's client pod). Deliberately
 # broader than the tags in the tree today -- `postgres:17-trixie` (major-only) and the

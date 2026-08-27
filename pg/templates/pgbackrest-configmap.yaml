@@ -450,7 +450,7 @@ data:
     # Reached only when PGDATA is empty (the checks above returned early otherwise), so a pod
     # rescheduled with an intact volume never depends on the repository being reachable.
     #
-    # jq parses that JSON. It ships in the repmgr image, but repmgr.image is a values-configurable
+    # jq parses that JSON. It ships in the repmgr image, but ha.image is a values-configurable
     # input, so check explicitly: without this, a missing jq makes the fallbacks below yield
     # code 99 and the failure reads "cannot determine the state of the repository", sending an
     # operator to debug S3 during a perfectly healthy first install. Checked HERE rather than at
@@ -458,7 +458,7 @@ data:
     # intact data directory must still start on an image that lacks it.
     if ! command -v jq >/dev/null 2>&1; then
       echo "FATAL: jq is required to read 'pgbackrest info' output but was not found on PATH." >&2
-      echo "       The repmgr image ships it; a custom repmgr.image must provide it too." >&2
+      echo "       The repmgr image ships it; a custom ha.image must provide it too." >&2
       echo "       (Refusing to guess the repository state: initializing an empty cluster now could discard a recoverable database.)" >&2
       exit 1
     fi

@@ -132,7 +132,7 @@ tests:
       postgresql.replicaCount: 0
     asserts:
       - failedTemplate:
-          errorMessage: "postgresql.audit.enabled requires repmgr.enabled=true: audit logging needs the cagriekin/repmgr image, which bundles pgaudit. Standalone mode uses the stock postgres image (no pgaudit) and would fail to start on shared_preload_libraries. To audit in standalone mode, build a postgresql.image that ships pgaudit."
+          errorMessage: "postgresql.audit.enabled requires ha.enabled=true: audit logging needs the HA image (ha.image), which bundles pgaudit. Standalone mode uses the stock postgres image (no pgaudit) and would fail to start on shared_preload_libraries. To audit in standalone mode, build a postgresql.image that ships pgaudit."
 
   - it: g2 an invalid audit class fails fast
     template: templates/statefulset.yaml

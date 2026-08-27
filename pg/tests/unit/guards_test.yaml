@@ -66,7 +66,7 @@ tests:
       postgresql.replicaCount: 1
     asserts:
       - failedTemplate:
-          errorMessage: "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr"
+          errorMessage: "postgresql.replicaCount > 0 requires ha.enabled=true: with HA disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode, or ha.enabled=true"
 
   - it: standalone with replicaCount 0 renders
     templates:
@@ -89,7 +89,7 @@ tests:
       postgresql.replicaCount: 0
     asserts:
       - failedTemplate:
-          errorMessage: "pgbackrest.enabled requires repmgr.enabled=true: the pgbackrest binary and the archive_command run inside the postgresql container, which in standalone mode is the official postgres image without pgbackrest. WAL archiving would fail on every segment (unbounded WAL growth) and backups would time out. Enable repmgr, or disable pgbackrest"
+          errorMessage: "pgbackrest.enabled requires ha.enabled=true: the pgbackrest binary and the archive_command run inside the postgresql container, which in standalone mode is the official postgres image without pgbackrest. WAL archiving would fail on every segment (unbounded WAL growth) and backups would time out. Set ha.enabled=true, or disable pgbackrest"
 
   # --- Scenario 12: pgbackrest S3 secret name is required on every ref (#213) ---
   - it: empty pgbackrest.existingSecret.name with keyType=shared fails render

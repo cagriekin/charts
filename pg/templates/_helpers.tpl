@@ -19,7 +19,7 @@ clear hint instead of a confusing API rejection at apply / first scheduled run.
 Small default resources for the lightweight init containers (chown, cp, config-gen).
 Init containers without requests/limits make every pod Forbidden in ResourceQuota-
 enforced namespaces (#153). repmgr-init (the standby clone) is heavier and uses its own
-values-overridable repmgr.initContainerResources instead.
+values-overridable ha.initContainerResources instead.
 */}}
 {{- define "pg.initResources" -}}
 requests:
@@ -106,7 +106,7 @@ annotation consumers -- #128.)
 {{- define "pg.pgMajorEnv" -}}
 {{- if .Values.ha.enabled -}}
 - name: PG_MAJOR
-  value: {{ required "repmgr.image.majorVersion is required" .Values.ha.image.majorVersion | quote }}
+  value: {{ required "ha.image.majorVersion is required" .Values.ha.image.majorVersion | quote }}
 {{- end -}}
 {{- end -}}
 
@@ -322,7 +322,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        operator-declared value: repmgr (replication) and/or pgaudit (#219). In standalone
        mode with audit off there is nothing to preserve, so the operator's value passes
        through custom.conf untouched.
-       #293: the repmgr clause is gated on the MECHANISM, not merely repmgr.enabled. Its
+       #293: the repmgr clause is gated on the MECHANISM, not merely ha.enabled. Its
        whole purpose is preserving `repmgr` across an operator-declared value, and under
        native pg.sharedPreloadLibraries no longer emits repmgr at all (#288) -- so keeping
        the clause there would render a repmgr-preload.conf that merely restates the
@@ -336,7 +336,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- /* The authoritative shared_preload_libraries value. Rendered into a conf.d file that
        sorts after custom.conf under include_dir and therefore wins -- so it MUST
        reassemble the FULL list, not just the chart's own libraries.
-         - repmgr is kept whenever repmgr.enabled: replication and the repmgr GUCs depend
+         - repmgr is kept whenever ha.enabled: replication and the repmgr GUCs depend
            on the preload, and the repmgr image entrypoint writes
            `shared_preload_libraries = 'repmgr'` into PGDATA/postgresql.conf, which any
            conf.d value overrides. Dropping it disables failover (#262 review).
@@ -348,7 +348,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        audit-gated merge meant an operator-set value with audit OFF silently dropped
        repmgr and broke HA failover. */ -}}
 {{- /* #288: `repmgr` is prepended only under the repmgr MECHANISM, not merely when
-       repmgr.enabled. Under `native` there is no repmgr extension on the cluster, so preloading
+       ha.enabled. Under `native` there is no repmgr extension on the cluster, so preloading
        repmgr.so is dead weight -- and because these fragments load via conf.d's include_dir they
        would OVERRIDE the entrypoint's native gate, putting the library back on a cluster that
        has nothing to use it. Benign only while the package is still in the image: it makes every
@@ -379,7 +379,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- define "pg.validateAudit" -}}
 {{- if .Values.postgresql.audit.enabled -}}
   {{- if not .Values.ha.enabled -}}
-    {{- fail "postgresql.audit.enabled requires repmgr.enabled=true: audit logging needs the cagriekin/repmgr image, which bundles pgaudit. Standalone mode uses the stock postgres image (no pgaudit) and would fail to start on shared_preload_libraries. To audit in standalone mode, build a postgresql.image that ships pgaudit." -}}
+    {{- fail "postgresql.audit.enabled requires ha.enabled=true: audit logging needs the HA image (ha.image), which bundles pgaudit. Standalone mode uses the stock postgres image (no pgaudit) and would fail to start on shared_preload_libraries. To audit in standalone mode, build a postgresql.image that ships pgaudit." -}}
   {{- end -}}
   {{- $allowed := list "read" "write" "function" "role" "ddl" "misc" "misc_set" "all" -}}
   {{- $log := .Values.postgresql.audit.log | default "" | toString -}}
@@ -844,13 +844,13 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        cluster; fail at render time instead. Scoped to agent mode, matching the
        postgresql-configmap.yaml/statefulset.yaml render condition. That scoping is
        vestigial since 2.0.0 -- #286 made the agent the only failover path, so
-       pg.agentMode is true whenever repmgr.enabled is -- but it is kept because it still
-       distinguishes a standalone (repmgr.enabled: false) install, which renders none of
+       pg.agentMode is true whenever ha.enabled is -- but it is kept because it still
+       distinguishes a standalone (ha.enabled: false) install, which renders none of
        this and must not be blocked by a leftover value. */}}
 {{- define "pg.validateSyncReplicationSlotsMajor" -}}
 {{- if and (eq (include "pg.agentMode" .) "true") .Values.ha.agent.syncReplicationSlots }}
 {{- if lt (atoi (toString .Values.postgresql.majorVersion)) 17 }}
-{{- fail (printf "repmgr.agent.syncReplicationSlots requires PostgreSQL 17+ (synchronized_standby_slots and the sync_replication_slots worker were introduced in 17), but postgresql.majorVersion=%q. Set postgresql.majorVersion to \"17\" or \"18\", or set repmgr.agent.syncReplicationSlots to false." (toString .Values.postgresql.majorVersion)) }}
+{{- fail (printf "ha.agent.syncReplicationSlots requires PostgreSQL 17+ (synchronized_standby_slots and the sync_replication_slots worker were introduced in 17), but postgresql.majorVersion=%q. Set postgresql.majorVersion to \"17\" or \"18\", or set ha.agent.syncReplicationSlots to false." (toString .Values.postgresql.majorVersion)) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -864,7 +864,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- define "pg.validateSyncReplicationSlotsWalLevel" -}}
 {{- if and (eq (include "pg.agentMode" .) "true") .Values.ha.agent.syncReplicationSlots }}
 {{- if ne (.Values.postgresql.walLevel | default "replica") "logical" }}
-{{- fail (printf "repmgr.agent.syncReplicationSlots requires postgresql.walLevel: logical (the sync_replication_slots worker it enables on every standby fails its own startup validation below that, and PostgreSQL restarts it forever, logging the failure on a fixed interval), but postgresql.walLevel=%q. Set postgresql.walLevel to \"logical\", or set repmgr.agent.syncReplicationSlots to false." (.Values.postgresql.walLevel | default "replica")) }}
+{{- fail (printf "ha.agent.syncReplicationSlots requires postgresql.walLevel: logical (the sync_replication_slots worker it enables on every standby fails its own startup validation below that, and PostgreSQL restarts it forever, logging the failure on a fixed interval), but postgresql.walLevel=%q. Set postgresql.walLevel to \"logical\", or set ha.agent.syncReplicationSlots to false." (.Values.postgresql.walLevel | default "replica")) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -909,7 +909,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- range $k, $v := (.Values.postgresql.configuration | default dict) }}
   {{- if eq (lower ($k | toString)) "shared_preload_libraries" }}{{- $user = $v | toString }}{{- end }}
 {{- end }}
-{{- fail (printf "postgresql.configuration.shared_preload_libraries includes \"repmgr\" (got %q) but repmgr.agent.mechanism is \"native\": a native cluster has no repmgr extension, and this value loads via conf.d's include_dir so it OVERRIDES the image's native gate and preloads repmgr.so anyway. That makes the cluster unstartable (\"could not access file \\\"repmgr\\\"\") as soon as the repmgr-free image ships (#290/#293), on every pod at once, and helm rollback cannot fix it because the line is cloned into each data directory. Fix: drop \"repmgr\" from the list -- the chart adds nothing to it any more, so if repmgr was the only entry, omit the key entirely. There is no mechanism to switch back to: #294 removed the repmgr one." $user) }}
+{{- fail (printf "postgresql.configuration.shared_preload_libraries includes \"repmgr\" (got %q) but ha.agent.mechanism is \"native\": a native cluster has no repmgr extension, and this value loads via conf.d's include_dir so it OVERRIDES the image's native gate and preloads repmgr.so anyway. That makes the cluster unstartable (\"could not access file \\\"repmgr\\\"\") as soon as the repmgr-free image ships (#290/#293), on every pod at once, and helm rollback cannot fix it because the line is cloned into each data directory. Fix: drop \"repmgr\" from the list -- the chart adds nothing to it any more, so if repmgr was the only entry, omit the key entirely. There is no mechanism to switch back to: #294 removed the repmgr one." $user) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -1376,7 +1376,7 @@ volumes:
 {{- if hasKey $alias "failoverMode" -}}
 {{- $m := $alias.failoverMode | toString -}}
 {{- if eq $m "agent" -}}
-{{- fail "repmgr.failoverMode was removed in chart 2.0.0: the lease-based agent is now the only failover path, so `failoverMode: agent` no longer means anything. Delete this key -- nothing else changes for you, and the agent is still tuned under repmgr.agent.*." -}}
+{{- fail "repmgr.failoverMode was removed in chart 2.0.0: the lease-based agent is now the only failover path, so `failoverMode: agent` no longer means anything. Delete this key -- nothing else changes for you, and the agent is still tuned under ha.agent.*." -}}
 {{- else -}}
 {{- fail (printf "repmgr.failoverMode was removed in chart 2.0.0 (got %q): repmgrd and its service-updater sidecar are gone, and the lease-based agent is now the only failover path. Deleting this key switches this release to the agent -- which also flips the StatefulSet's podManagementPolicy from OrderedReady to Parallel, and that field is IMMUTABLE. Read the 2.0.0 upgrade note in CHANGELOG.md before upgrading: the StatefulSet has to be recreated with `kubectl delete sts <name> --cascade=orphan`." $m) -}}
 {{- end -}}
@@ -1396,7 +1396,7 @@ volumes:
        so a narrowed enum would win the race and say nothing useful. The key itself survives
        (see values.yaml) precisely so a stale value fails loudly rather than being ignored. */ -}}
 {{- if eq ((.Values.ha.agent).mechanism | default "native") "repmgr" -}}
-{{- fail "repmgr.agent.mechanism: repmgr was removed in chart 2.0.0 (#294): the repmgr mechanism drove the repmgr CLI (standby clone/follow/promote, node rejoin) and depended on repmgr.nodes, and both are gone -- `native` is now the only implementation, and it is the default. Delete this key (or set it to \"native\"). IMPORTANT: a cluster created by a 1.x release is still repmgr-shaped on disk; migrating it in place is #292, and until that ships native is for FRESH installs. Read the 2.0.0 upgrade note in CHANGELOG.md before upgrading an existing HA cluster." -}}
+{{- fail "ha.agent.mechanism: repmgr was removed in chart 2.0.0 (#294): the repmgr mechanism drove the repmgr CLI (standby clone/follow/promote, node rejoin) and depended on repmgr.nodes, and both are gone -- `native` is now the only implementation, and it is the default. Delete this key (or set it to \"native\"). IMPORTANT: a cluster created by a 1.x release is still repmgr-shaped on disk; migrating it in place is #292, and until that ships native is for FRESH installs. Read the 2.0.0 upgrade note in CHANGELOG.md before upgrading an existing HA cluster." -}}
 {{- end -}}
 {{- end -}}
 
@@ -1404,7 +1404,7 @@ volumes:
 pg.agentMode renders the string "true"/"false". Call sites gate with:
   {{- if eq (include "pg.agentMode" .) "true" }}
 Since 2.0.0 the agent is the only failover path, so this is exactly "HA is enabled"
-(repmgr.enabled=false is the standalone, single-node, stock-postgres-image mode). The
+(ha.enabled=false is the standalone, single-node, stock-postgres-image mode). The
 helper is kept rather than inlined so the ~20 call sites keep reading as a mode check.
 */}}
 {{- define "pg.agentMode" -}}
@@ -1416,7 +1416,7 @@ helper is kept rather than inlined so the ~20 call sites keep reading as a mode 
        checksum annotation, the postgresql-config volume mount (twice, for postStart
        include_dir wiring on two different code paths), and the volume definition itself
        -- and duplicating the raw boolean expression at each site is exactly how the
-       postgresql.walLevel / repmgr.agent.syncReplicationSlots additions below ended up
+       postgresql.walLevel / ha.agent.syncReplicationSlots additions below ended up
        missed at first: the ConfigMap's own guard was updated but the volume MOUNT guard
        was not, so the rendered ConfigMap existed but was never attached to the pod (a
        live KinD suite run caught it -- wal_level and sync_replication_slots silently
@@ -1515,12 +1515,12 @@ true
 {{- $label := index $pair 0 -}}
 {{- $value := index $pair 1 | toString -}}
 {{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._:/@-]*$" $value) -}}
-{{- fail (printf "%s is %q, which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $label $value) -}}
+{{- fail (printf "%s is %q, which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $label $value) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 
-{{- /* True in agent mode when the leadership backend is etcd (repmgr.agent.dcs.backend
+{{- /* True in agent mode when the leadership backend is etcd (ha.agent.dcs.backend
        == "etcd"), false otherwise. Nil-safe at every level so a partial overlay does
        not nil-pointer; defaults to the kubernetes backend. */ -}}
 {{- define "pg.agentEtcdMode" -}}
@@ -1576,6 +1576,17 @@ false
        noise (#290 review). A template cannot tell an operator-set value from a chart default,
        so there is no way to fix that here; moving the defaults is the fix, and it is the next
        step of #291. NO CALLERS until then, on purpose. */ -}}
+{{- /*
+pg.usesDeprecatedRepmgrValues -- true when the operator's values file still spells the HA
+block "repmgr:" rather than "ha:" (#291). Drives the deprecation notice in NOTES.txt.
+
+Reads .Values.repmgr on purpose, and it is safe to call at any point: pg.normalizeValues
+merges the alias INTO .Values.ha but never deletes .Values.repmgr, so the raw operator
+input survives normalization and stays distinguishable from the chart's own ha: defaults.
+Reading .Values.ha here would be useless in two ways at once -- it is always populated by
+values.yaml, and the merge has already folded the alias into it, so the answer would be
+"true" for every install. A blanket rename did exactly that once; hence this note.
+*/ -}}
 {{- define "pg.usesDeprecatedRepmgrValues" -}}
-{{- if .Values.ha -}}true{{- end -}}
+{{- if .Values.repmgr -}}true{{- end -}}
 {{- end -}}

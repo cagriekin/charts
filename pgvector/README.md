@@ -1,6 +1,6 @@
 # PostgreSQL with pgvector
 
-PostgreSQL Helm chart with pgvector extension for vector similarity search, repmgr for automatic failover and replication management, optional PGPool-II for connection pooling and read/write splitting.
+PostgreSQL Helm chart with pgvector extension for vector similarity search, native streaming replication with a lease-based Go failover agent, optional PGPool-II for connection pooling and read/write splitting.
 
 This chart shares all templates with the [pg chart](../pg/) via symlinks. The only differences are the default image (`pgvector/pgvector`) and automatic `CREATE EXTENSION IF NOT EXISTS vector` on startup.
 
@@ -105,7 +105,7 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 | `busyboxImage.digest` | Optional digest pin (`sha256:...`), appended as `repository:tag@digest` | `""` |
 
 > **Pinning images by digest (#26).** Every image block — `postgresql.image`,
-> `repmgr.image`, `pgpool.image`, `pgpool.metrics.image`, `prometheusExporter.image`,
+> `ha.image`, `pgpool.image`, `pgpool.metrics.image`, `prometheusExporter.image`,
 > `busyboxImage`, `backup.mc.image`, and `pgbackrest.cronjob.image` — accepts an
 > optional `digest` (e.g. `sha256:…`). When set, the image is rendered as
 > `repository:tag@digest` so a mutable-tag repush cannot silently change what runs.
@@ -116,10 +116,10 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `postgresql.image.repository` | PostgreSQL image repository | `pgvector/pgvector` |
-| `postgresql.image.tag` | PostgreSQL image tag. Must bundle the same PostgreSQL point release as `repmgr.image.tag` (#302) — `copy-ext`'s no-clobber copy keeps a drifted image from corrupting the running server, but `CREATE EXTENSION vector` still needs a matching point release to load safely. Bump only in lockstep with `repmgr.image`. | `0.8.5-pg18-trixie` |
+| `postgresql.image.tag` | PostgreSQL image tag. Must bundle the same PostgreSQL point release as `ha.image.tag` (#302) — `copy-ext`'s no-clobber copy keeps a drifted image from corrupting the running server, but `CREATE EXTENSION vector` still needs a matching point release to load safely. Bump only in lockstep with `ha.image`. | `0.8.5-pg18-trixie` |
 | `postgresql.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `postgresql.majorVersion` | PostgreSQL major version in `image.tag`; builds the extension paths (`/usr/lib/postgresql/<major>/lib`, `/usr/share/postgresql/<major>/extension`) when `extensions.enabled=true`. In repmgr mode the server runs from the repmgr image and follows `repmgr.image.majorVersion` regardless of `postgresql.image`; the chart fails to render if the two majors differ. Set both to `"17"` (with a `-pg17` repmgr tag) to run PostgreSQL 17 — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
-| `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1); values > 0 require `repmgr.enabled=true` | `1` |
+| `postgresql.majorVersion` | PostgreSQL major version in `image.tag`; builds the extension paths (`/usr/lib/postgresql/<major>/lib`, `/usr/share/postgresql/<major>/extension`) when `extensions.enabled=true`. In repmgr mode the server runs from the repmgr image and follows `ha.image.majorVersion` regardless of `postgresql.image`; the chart fails to render if the two majors differ. Set both to `"17"` (with a `-pg17` repmgr tag) to run PostgreSQL 17 — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
+| `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1); values > 0 require `ha.enabled=true` | `1` |
 | `postgresql.database` | Database name | `postgres` |
 | `postgresql.username` | Database username | `postgres` |
 | `postgresql.resources.requests.cpu` | CPU request | `100m` |
@@ -221,28 +221,28 @@ postgresql:
         psql -U postgres -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1
 ```
 
-When `repmgr.enabled` is true, `additionalCommands` automatically discover the current primary and execute against it, so DDL statements like `CREATE EXTENSION` work correctly regardless of which pod the hook runs on (including standbys after a failover).
+When `ha.enabled` is true, `additionalCommands` automatically discover the current primary and execute against it, so DDL statements like `CREATE EXTENSION` work correctly regardless of which pod the hook runs on (including standbys after a failover).
 
 ### Repmgr Parameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `repmgr.enabled` | Enable repmgr | `true` |
-| `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
-| `repmgr.image.tag` | Repmgr image tag. Unsuffixed = the default major (18); `-pg18` / `-pg17` select one explicitly | `trixie-5.5.0-33` |
-| `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `repmgr.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `repmgr.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
-| `repmgr.username` | Repmgr database user | `repmgr` |
-| `repmgr.database` | Repmgr database name | `repmgr` |
-| `repmgr.terminationGracePeriodSeconds` | Time allowed for graceful shutdown and failover | `120` |
-| `repmgr.resources.requests.cpu` | CPU request | `50m` |
-| `repmgr.resources.requests.memory` | Memory request | `128Mi` |
-| `repmgr.resources.limits.cpu` | CPU limit | `500m` |
-| `repmgr.resources.limits.memory` | Memory limit | `512Mi` |
-| `repmgr.initContainerResources` | Resources for the `repmgr-init` standby-clone init container (raise for large databases) | `requests: 100m/128Mi, limits: 1/1Gi` |
-| `repmgr.splitBrainDetection.action` | Action on split-brain: `log` (alert only) or `fence` (terminate stale primary) | `log` |
+| `ha.enabled` | Enable repmgr | `true` |
+| `ha.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
+| `ha.image.tag` | HA image tag. Unsuffixed = the default major (18); `-pg18` / `-pg17` select one explicitly | `trixie-5.5.0-33` |
+| `ha.image.pullPolicy` | Image pull policy | `IfNotPresent` |
+| `ha.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `ha.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
+| `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
+| `ha.database` | Database the agent connects to for those probes. Named `repmgr` for the same continuity reason as `ha.username` | `repmgr` |
+| `ha.terminationGracePeriodSeconds` | Time allowed for graceful shutdown and failover | `120` |
+| `ha.resources.requests.cpu` | CPU request | `50m` |
+| `ha.resources.requests.memory` | Memory request | `128Mi` |
+| `ha.resources.limits.cpu` | CPU limit | `500m` |
+| `ha.resources.limits.memory` | Memory limit | `512Mi` |
+| `ha.initContainerResources` | Resources for the `repmgr-init` standby-clone init container (raise for large databases) | `requests: 100m/128Mi, limits: 1/1Gi` |
+| `ha.splitBrainDetection.action` | Action on split-brain: `log` (alert only) or `fence` (terminate stale primary) | `log` |
 
-There is **no preStop hook** in HA mode. The agent runs as PID 1 and owns SIGTERM: it releases the Lease first, then stops its PostgreSQL child. `repmgr.terminationGracePeriodSeconds` controls how long Kubernetes waits for that shutdown.
+There is **no preStop hook** in HA mode. The agent runs as PID 1 and owns SIGTERM: it releases the Lease first, then stops its PostgreSQL child. `ha.terminationGracePeriodSeconds` controls how long Kubernetes waits for that shutdown.
 
 When repmgr is enabled there are **no HA sidecars**:
 
@@ -267,7 +267,7 @@ repmgr:
 
 **`postgresql.image.tag` matters here even in repmgr mode** — unlike in the `pg` chart. This chart ships `postgresql.extensions.enabled=true`, and the `copy-ext` init container copies `/usr/lib/postgresql/<major>/lib` and `/usr/share/postgresql/<major>/extension` **out of the pgvector image** into the server container, which is how `vector` reaches a server that runs from the repmgr image. Those paths are built from `postgresql.majorVersion`, so the pgvector image must be the matching major (`pgvector/pgvector:pg17-trixie`) or the copy finds nothing and `CREATE EXTENSION vector` fails.
 
-As in the `pg` chart, a `-pgNN` tag that disagrees with `repmgr.image.majorVersion` fails the render, and `PG_MAJOR` is passed to the containers running the repmgr image so an unsuffixed-tag mismatch is refused at startup rather than running the wrong major.
+As in the `pg` chart, a `-pgNN` tag that disagrees with `ha.image.majorVersion` fails the render, and `PG_MAJOR` is passed to the containers running the repmgr image so an unsuffixed-tag mismatch is refused at startup rather than running the wrong major.
 
 This is a **create-time** choice: the chart has no in-place major upgrade, so moving an existing cluster between majors means a logical dump/restore into a fresh release. Note that repmgr 5.5.0's upstream install requirements list PostgreSQL 13–17, not 18 — select 17 if you need an upstream-sanctioned pairing. For the full rationale, the tag table, and the `pg_dump` considerations, see the [pg chart README — Choosing the PostgreSQL major](../pg/README.md#choosing-the-postgresql-major).
 
@@ -277,12 +277,12 @@ A Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `repmgr.agent.leaseDuration` | Lease TTL | `15s` |
-| `repmgr.agent.renewDeadline` | Holder self-demotes if it cannot renew within this | `10s` |
-| `repmgr.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
-| `repmgr.agent.reconcileInterval` | Reconcile tick interval | `5s` |
-| `repmgr.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
-| `repmgr.agent.mechanism` | **EXPERIMENTAL (#287), do not set in production yet.** `repmgr` or `native` (drives `pg_ctl`/`pg_basebackup`/`pg_rewind` directly instead of the repmgr CLI). It owns its physical replication slots (#289) and, since #288, runs a real multi-node cluster: topology comes from `pg_stat_replication` and the lease holder initdbs while every other pod clones via `pg_basebackup`. `syncReplicationSlots` and `cascadingReplication` both work with it since #294; an existing repmgr cluster still cannot be migrated in place (#292), so it is for fresh installs -- see the [pg chart README](../pg/README.md#replication-mechanics-experimental-287) for the full detail. | `repmgr` |
+| `ha.agent.leaseDuration` | Lease TTL | `15s` |
+| `ha.agent.renewDeadline` | Holder self-demotes if it cannot renew within this | `10s` |
+| `ha.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
+| `ha.agent.reconcileInterval` | Reconcile tick interval | `5s` |
+| `ha.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
+| `ha.agent.mechanism` | **EXPERIMENTAL (#287), do not set in production yet.** `repmgr` or `native` (drives `pg_ctl`/`pg_basebackup`/`pg_rewind` directly instead of the repmgr CLI). It owns its physical replication slots (#289) and, since #288, runs a real multi-node cluster: topology comes from `pg_stat_replication` and the lease holder initdbs while every other pod clones via `pg_basebackup`. `syncReplicationSlots` and `cascadingReplication` both work with it since #294; an existing repmgr cluster still cannot be migrated in place (#292), so it is for fresh installs -- see the [pg chart README](../pg/README.md#replication-mechanics-experimental-287) for the full detail. | `repmgr` |
 
 Must satisfy `leaseDuration > renewDeadline > retryPeriod`; widen for managed clouds (e.g. `30s/20s/4s`). This chart shares pg's templates and agent — see the [pg chart README](../pg/README.md#failover-the-lease-based-agent) for the full agent behaviour and the **2.0.0 migration runbook** (a release that pinned `failoverMode: repmgrd` needs a one-time `kubectl delete statefulset --cascade=orphan` + `helm upgrade`, because `podManagementPolicy` is immutable). See `ENVIRONMENT.md` for the injected-variable catalog.
 
@@ -524,11 +524,11 @@ postgresql:
 ```
 
 When enabled, the chart adds `pgaudit` to `shared_preload_libraries` (preserving `repmgr`
-under `repmgr.agent.mechanism: repmgr`; native has no repmgr extension to preserve, #293),
+under `ha.agent.mechanism: repmgr`; native has no repmgr extension to preserve, #293),
 renders the `pgaudit.*` GUCs, and creates the extension idempotently on the primary via a
 post-install/upgrade hook Job.
 
-- **Requires `repmgr.enabled: true`** — the `cagriekin/repmgr` image bundles pgaudit;
+- **Requires `ha.enabled: true`** — the `cagriekin/repmgr` image bundles pgaudit;
   standalone mode uses the stock `postgres` image (no pgaudit) and fails a render guard.
 - **Enabling audit restarts PostgreSQL** (`shared_preload_libraries` is a postmaster
   parameter) via the config-checksum rolling restart — no manual step.
@@ -876,7 +876,7 @@ directly there (`mc ls s3/pgvector-backups/backups/`), and delete them manually 
 
 pgBackRest provides WAL-based incremental backups for point-in-time recovery. When enabled, WAL segments are continuously archived from the primary to S3, and scheduled full/differential backups run automatically. This allows restoring the database to any point in time within the retention window.
 
-Requires `repmgr.enabled: true` (pgBackRest is installed in the repmgr image).
+Requires `ha.enabled: true` (pgBackRest is installed in the repmgr image).
 
 ### Enable pgBackRest
 
@@ -1180,7 +1180,7 @@ helm repo update
 helm upgrade my-pgvector cagriekin/pgvector   # add -f your-values.yaml
 ```
 
-`pgvector` tracks `pg` in lockstep — same version, image, and agent; the earlier 0.6.x ↔ 0.5.x split unified at `1.0.0` (current: `2.0.0`, image `trixie-5.5.0-33`). Within a major line `helm upgrade` rolls the pods once and needs no manual step. **2.0.0 removes the legacy repmgrd path** (#286): if you pinned `repmgr.failoverMode: repmgrd` the upgrade needs a one-time `--cascade=orphan` recreate; if you were on the default (agent, since `1.0.0`) just delete the key and upgrade normally. Read the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. For the **compatibility matrix, the version model, and the full 0.x → 1.x migration runbook**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
+`pgvector` tracks `pg` in lockstep — same version, image, and agent; the earlier 0.6.x ↔ 0.5.x split unified at `1.0.0` (current: `2.0.0`, image `trixie-5.5.0-33`). Within a major line `helm upgrade` rolls the pods once and needs no manual step. **2.0.0 removes the legacy repmgrd path** (#286): if you pinned `repmgr.failoverMode: repmgrd` the upgrade needs a one-time `--cascade=orphan` recreate; if you were on the default (agent, since `1.0.0`) just delete the key and upgrade normally. Read the `Migrating from X.Y.Z` entries in [`CHANGELOG.md`](CHANGELOG.md) between your version and the target. **2.0.0 also renames the `repmgr:` values block to `ha:`** (#291) — nothing nested changed, and every `repmgr.*` key still works for this major because it is merged over its `ha.*` counterpart, so no values change is required of you now; the alias goes away in the next major. For the **compatibility matrix, the version model, the `repmgr.*` → `ha.*` diff, and the full 0.x → 1.x migration runbook**, see the [pg chart README — Upgrade and migration](../pg/README.md#upgrade-and-migration) (this chart shares pg's templates and agent).
 
 ## pgvector Resources
 

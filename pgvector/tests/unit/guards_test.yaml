@@ -12,7 +12,7 @@ tests:
       postgresql.replicaCount: 1
     asserts:
       - failedTemplate:
-          errorMessage: "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr"
+          errorMessage: "postgresql.replicaCount > 0 requires ha.enabled=true: with HA disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode, or ha.enabled=true"
 
   # #286: repmgrd is gone from pgvector too (the templates are symlinks into pg, so the
   # guard is literally the same code); the removed key must fail rather than be ignored.

@@ -2497,7 +2497,7 @@ pgbackrest_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.replicaCount=0 \
   --show-only templates/statefulset.yaml 2>&1) && pgbr_sa_rc=0 || pgbr_sa_rc=$?
 assert_eq "#142: pgbackrest without repmgr fails fast" "1" "${pgbr_sa_rc}"
-assert_contains "#142: error names the repmgr requirement" "${pgbackrest_standalone}" "pgbackrest.enabled requires repmgr.enabled=true"
+assert_contains "#142: error names the ha.enabled requirement" "${pgbackrest_standalone}" "pgbackrest.enabled requires ha.enabled=true"
 
 # pgBackRest: coexists with the HA agent
 assert_contains "pgbackrest+repmgr: sidecar present" "${pgbackrest_sts}" "name: pgbackrest"
@@ -2748,7 +2748,7 @@ standalone_replicas=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.enabled=false \
   --set postgresql.replicaCount=1 2>&1) && standalone_replicas_rc=0 || standalone_replicas_rc=$?
 assert_eq "standalone replicas: render fails when repmgr disabled with replicaCount > 0" "1" "${standalone_replicas_rc}"
-assert_contains "standalone replicas: error names the constraint" "${standalone_replicas}" "requires repmgr.enabled=true"
+assert_contains "standalone replicas: error names the constraint" "${standalone_replicas}" "requires ha.enabled=true"
 
 # Test: rendering fails with default replicaCount (1) when only repmgr is disabled
 standalone_default=$(helm template test-pg "${CHART_DIR}" \
@@ -2771,7 +2771,7 @@ major_mismatch=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set postgresql.image.tag=pg17 2>&1) && major_mismatch_rc=0 || major_mismatch_rc=$?
 assert_eq "major pin: render fails when postgresql.majorVersion != repmgr image major (#133)" "1" "${major_mismatch_rc}"
-assert_contains "major pin: error names both values (#133)" "${major_mismatch}" "does not match repmgr.image.majorVersion"
+assert_contains "major pin: error names both values (#133)" "${major_mismatch}" "does not match ha.image.majorVersion"
 
 # default (18 == 18) renders
 major_default=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1) && major_default_rc=0 || major_default_rc=$?
@@ -2792,7 +2792,7 @@ major_mismatch_rev=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.image.majorVersion=17 \
   --set repmgr.image.tag=trixie-5.5.0-29-pg17 2>&1) && major_mismatch_rev_rc=0 || major_mismatch_rev_rc=$?
 assert_eq "major pin: render fails when repmgr.image.majorVersion moves alone (#269)" "1" "${major_mismatch_rev_rc}"
-assert_contains "major pin: reverse mismatch names both values (#269)" "${major_mismatch_rev}" "does not match repmgr.image.majorVersion"
+assert_contains "major pin: reverse mismatch names both values (#269)" "${major_mismatch_rev}" "does not match ha.image.majorVersion"
 
 # --- #269: PG17 is a first-class selection, not just a render that does not fail ---
 
@@ -4746,6 +4746,82 @@ pgv_pb_res=$(helm template test-pgv "${PGVECTOR_DIR}" \
   -f "${SCRIPT_DIR}/values-pgbackrest-extra.yaml" 2>&1)
 assert_eq "#323 pgvector: KUBECONFIG reaches every pgbackrest container" "6" \
   "$(printf '%s\n' "${pgv_pb_res}" | grep -c 'value: /etc/apiserver-proxy/kubeconfig')"
+
+# ==========================================================================================
+# #291: repmgr.* -> ha.* rename, with the repmgr.* spelling kept as a merge-time alias.
+#
+# The alias is the whole risk surface of this change: get the merge direction wrong and an
+# operator-set key is silently overridden by a chart default, which is worse than a hard
+# error because the render still succeeds. Every case below is one way that can go wrong.
+# ==========================================================================================
+
+# Baseline: with neither spelling set, the ha: defaults are what render. If the normalizer
+# ever merged an empty alias destructively, this is what would break first.
+alias_default=$(helm template test-pg "${CHART_DIR}" 2>&1)
+assert_contains "#291: default renders the ha.* username" "${alias_default}" 'value: "repmgr"'
+
+# The deprecated spelling still lands. This is the promise the CHANGELOG makes to every
+# existing 1.x values file.
+alias_old=$(helm template test-pg "${CHART_DIR}" --set repmgr.username=legacyuser 2>&1)
+assert_contains "#291: repmgr.username still reaches the render" "${alias_old}" 'legacyuser'
+
+# The canonical spelling lands too, obviously -- but assert it, because a normalizer that
+# read the alias last would clobber ha.* with the (absent) repmgr.* value.
+alias_new=$(helm template test-pg "${CHART_DIR}" --set ha.username=newuser 2>&1)
+assert_contains "#291: ha.username reaches the render" "${alias_new}" 'newuser'
+
+# THE regression that a blanket rename produces: setting one aliased key must not wipe its
+# siblings' defaults. mergeOverwrite is key-by-key, not block-for-block -- if it ever became
+# the latter, mechanism would come back empty here rather than "native".
+alias_sib=$(helm template test-pg "${CHART_DIR}" --set repmgr.agent.leaseDuration=20s 2>&1)
+assert_contains "#291: the aliased key itself lands" "${alias_sib}" 'value: "20s"'
+assert_eq "#291: an aliased key leaves sibling ha.* defaults intact" "native" \
+  "$(printf '%s\n' "${alias_sib}" | grep -A1 'name: MECHANISM' | grep 'value:' \
+     | head -1 | sed -E 's/.*value: "?([^"]*)"?.*/\1/')"
+
+# ...and the same in the other direction: a canonical key must not wipe the alias block's
+# siblings either.
+alias_sib2=$(helm template test-pg "${CHART_DIR}" --set ha.agent.leaseDuration=20s 2>&1)
+assert_contains "#291: the canonical key itself lands" "${alias_sib2}" 'value: "20s"'
+assert_eq "#291: a canonical key leaves sibling defaults intact" "native" \
+  "$(printf '%s\n' "${alias_sib2}" | grep -A1 'name: MECHANISM' | grep 'value:' \
+     | head -1 | sed -E 's/.*value: "?([^"]*)"?.*/\1/')"
+
+# Validation must not be bypassable by choosing the old spelling. Both schemas carry the same
+# shape for exactly this reason, and the removed-value validators read the alias namespace.
+alias_bad_rc=0
+helm template test-pg "${CHART_DIR}" --set repmgr.agent.mechanism=bogus >/dev/null 2>&1 \
+  || alias_bad_rc=$?
+assert_gt "#291: a bogus mechanism is rejected under the repmgr.* spelling" "${alias_bad_rc}" 0
+alias_bad2_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.agent.mechanism=bogus >/dev/null 2>&1 \
+  || alias_bad2_rc=$?
+assert_gt "#291: a bogus mechanism is rejected under the ha.* spelling" "${alias_bad2_rc}" 0
+
+# The two schema shapes are generated from one source and must stay identical, or the alias
+# window quietly becomes a validation hole for whichever spelling drifted.
+for schema_chart in pg pgvector; do
+  shape_same=$(python3 -c "
+import json,copy,sys
+d=json.load(open('${SCRIPT_DIR}/../../${schema_chart}/values.schema.json'))
+a=copy.deepcopy(d['properties']['ha']); b=copy.deepcopy(d['properties']['repmgr'])
+a.pop('description',None); b.pop('description',None)
+print('same' if a==b else 'DRIFTED')")
+  assert_eq "#291 ${schema_chart}: ha and repmgr schema shapes are identical" "same" "${shape_same}"
+done
+
+# The removed keys are removed, not aliased -- #286's validators must still fire on the
+# spelling a 1.x values file actually uses.
+alias_removed=$(helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=repmgrd 2>&1 || true)
+assert_contains "#291: a removed key still fails under the repmgr.* spelling" \
+  "${alias_removed}" "failoverMode"
+
+# pgvector shares the templates but has its own values.yaml and schema, so the rename has to
+# be asserted there independently -- it has no KinD coverage of its own.
+pgv_alias=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.username=legacyuser 2>&1)
+assert_contains "#291 pgvector: the repmgr.* alias reaches the render" "${pgv_alias}" 'legacyuser'
+pgv_alias_new=$(helm template test-pgv "${PGVECTOR_DIR}" --set ha.username=newuser 2>&1)
+assert_contains "#291 pgvector: ha.* reaches the render" "${pgv_alias_new}" 'newuser'
 
 end_suite
 print_summary

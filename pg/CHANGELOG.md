@@ -2,6 +2,44 @@
 
 ## 2.0.0 - unreleased
 
+### Changed (breaking)
+
+- **The `repmgr:` values block is now `ha:`** (#291). Nothing nested moved -- only the block's
+  own name. Every `repmgr.*` key still works for the whole 2.0.0 line: `pg.normalizeValues`
+  merges the `repmgr:` block over the `ha:` defaults key by key, so an untouched 1.x values
+  file installs unchanged, `--set repmgr.agent.leaseDuration=20s` still lands, and a file
+  mixing the two spellings resolves per key with the `repmgr.*` value winning -- it is the one
+  the operator set; the `ha.*` side is chart defaults. Both spellings are schema-validated
+  (the `repmgr` schema is generated from the `ha` shape and asserted identical), so a bad enum
+  or a wrong type still fails the render whichever name is used. `helm upgrade` prints a
+  deprecation notice when it sees the old block.
+
+  Marked breaking because the values API's canonical name changed, and because **the alias is
+  removed in the next major** -- rename the top-level key before then. It is a rename and not
+  a break *today*, which is the point: 2.0.0 already carries one real break (repmgrd removal)
+  and stacking a mandatory values edit on top of it buys nothing.
+
+  Why rename at all: after #290 the image contains no repmgr -- no binary, no extension, no
+  `repmgr.conf` -- and the agent replicates through `pg_stat_replication` and slots it owns.
+  A block named `repmgr` was sizing the resources of, and holding the credentials for,
+  something no longer installed.
+
+  Three names keep the word on purpose, because they identify real PostgreSQL objects rather
+  than the tool: `ha.username`, `ha.database`, and the `repmgr-password` Secret key. Renaming
+  those rewrites a live cluster's role and credential, which is a data-plane migration, not a
+  values rename -- deliberately out of scope here. `REPMGR_*` env vars are likewise unchanged;
+  `pg/ENVIRONMENT.md` records which of them the agent still reads and which are now inert.
+
+- **The HA image is versioned with the chart** (#290/#291). Tags are now
+  `cagriekin/pg-ha:<chart-version>-pg<major>` (e.g. `2.0.0-pg18`, `2.0.0-pg17`), published from
+  the git tag `pg-ha-<version>`, replacing `cagriekin/repmgr:trixie-<repmgr>-<n>`. The old
+  scheme was keyed on a repmgr version the image no longer contains. The version an image
+  carries is the chart version it shipped with; a chart-only patch does not force an image
+  rebuild, so the two can legitimately differ by a patch. `cagriekin/repmgr` stays published
+  and frozen at its last tag, so existing pins keep resolving. There is no unsuffixed
+  "default major" alias -- a pin names its major, and `ha.image.majorVersion` cross-checks it
+  at render time.
+
 ### Removed (breaking)
 
 - **`native` is now the only replication mechanism, and the default** (#294). The `repmgr`

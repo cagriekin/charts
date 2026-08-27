@@ -83,7 +83,7 @@ rules:
   # release's image running this release's restore command, its security contexts, volumes
   # and Secrets, and a single pod. It renders under the same pg.controlRestoreEnabled
   # condition as this grant, and dropping it requires setting
-  # repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded=true, which the
+  # ha.agent.control.restore.admissionPolicy.acknowledgeUnbounded=true, which the
   # render otherwise refuses.
   #
   # So this rule CAN still exist without that policy -- deliberately, for clusters below
@@ -94,9 +94,9 @@ rules:
   # do not infer it from the presence of this rule.
   #
   # Narrowing it further: the grant is rendered ONLY under
-  # repmgr.agent.control.restore.enabled (default false, so a normal install's Role is
+  # ha.agent.control.restore.enabled (default false, so a normal install's Role is
   # unchanged), the API additionally requires a client certificate whose CN is on
-  # repmgr.agent.control.restore.allowedClientCNs, and the Job the agent creates is a
+  # ha.agent.control.restore.allowedClientCNs, and the Job the agent creates is a
   # verbatim clone of the CronJob below rather than a spec it composes. The equivalent
   # kubectl path (`kubectl create job --from=cronjob/...`) needs none of this.
   #
