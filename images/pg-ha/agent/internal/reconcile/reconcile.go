@@ -567,8 +567,16 @@ func restoredAfter(a, b string) bool { return a != "" && a > b }
 func moreAdvancedPeer(o Observation) (string, bool) {
 	best := ""
 	bestReachable := false
+	// The incumbent best's TimelineOK/LSNOK travel WITH its position rather than
+	// being hardcoded true at the comparison sites (#298 review): peerAhead admits a
+	// peer whose timeline query failed transiently (TimelineOK false, LSN known), and
+	// comparing later candidates against that peer's zero-valued timeline "as known"
+	// let a timeline-known peer with LESS WAL displace it -- the holder then handed
+	// the lease to the lower-WAL node (invariant 8 inverted).
 	var bestTL pg.Timeline
+	var bestTLok bool
 	var bestLSN pg.LSN
+	var bestLSNok bool
 	bestRestoredAt := ""
 	for i := range o.Peers {
 		p := &o.Peers[i]
@@ -595,8 +603,8 @@ func moreAdvancedPeer(o Observation) (string, bool) {
 		// back it either is the primary or gets rewound/re-cloned (which drops its record).
 		if p.Reachable && restoredAfter(p.RestoredAt, o.Local.RestoredAt) {
 			if best == "" || restoredAfter(p.RestoredAt, bestRestoredAt) ||
-				(p.RestoredAt == bestRestoredAt && ahead(p.Timeline, p.TimelineOK, p.LSN, p.LSNOK, bestTL, true, bestLSN, true)) {
-				best, bestReachable, bestTL, bestLSN, bestRestoredAt = p.Name, p.Reachable, p.Timeline, p.LSN, p.RestoredAt
+				(p.RestoredAt == bestRestoredAt && ahead(p.Timeline, p.TimelineOK, p.LSN, p.LSNOK, bestTL, bestTLok, bestLSN, bestLSNok)) {
+				best, bestReachable, bestTL, bestTLok, bestLSN, bestLSNok, bestRestoredAt = p.Name, p.Reachable, p.Timeline, p.TimelineOK, p.LSN, p.LSNOK, p.RestoredAt
 			}
 			continue
 		}
@@ -616,8 +624,8 @@ func moreAdvancedPeer(o Observation) (string, bool) {
 		if !peerAhead(*p, o.Local) {
 			continue
 		}
-		if best == "" || ahead(p.Timeline, p.TimelineOK, p.LSN, p.LSNOK, bestTL, true, bestLSN, true) {
-			best, bestReachable, bestTL, bestLSN = p.Name, p.Reachable, p.Timeline, p.LSN
+		if best == "" || ahead(p.Timeline, p.TimelineOK, p.LSN, p.LSNOK, bestTL, bestTLok, bestLSN, bestLSNok) {
+			best, bestReachable, bestTL, bestTLok, bestLSN, bestLSNok = p.Name, p.Reachable, p.Timeline, p.TimelineOK, p.LSN, p.LSNOK
 		}
 	}
 	return best, bestReachable

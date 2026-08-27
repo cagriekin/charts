@@ -66,6 +66,20 @@ func TestLoadRejectsInconsistentTimings(t *testing.T) {
 	}
 }
 
+// The jitter bound (#298 review): client-go's NewLeaderElector requires
+// RenewDeadline > 1.2 x RetryPeriod, and rejecting it there is silent and
+// unretryable -- so Load must catch it at boot.
+func TestLoadRejectsRenewDeadlineWithinRetryJitter(t *testing.T) {
+	m := fullEnv()
+	m["LEASE_DURATION"] = "15s"
+	m["RENEW_DEADLINE"] = "5s"
+	m["RETRY_PERIOD"] = "4500ms" // ordering holds, but 5s <= 1.2 x 4.5s
+	_, err := Load(getter(m))
+	if err == nil || !strings.Contains(err.Error(), "jitter") {
+		t.Errorf("expected jitter-bound validation error, got %v", err)
+	}
+}
+
 func TestLoadRejectsBadDCSBackend(t *testing.T) {
 	m := fullEnv()
 	m["DCS_BACKEND"] = "consul"

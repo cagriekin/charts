@@ -593,6 +593,12 @@ func isConnectionFailure(out string) bool {
 		"could not translate host name",
 		"no route to host",
 		"connection timed out",
+		// libpq's own connect_timeout expiry says "timeout expired", NOT "connection
+		// timed out" (that is the kernel ETIMEDOUT strerror, which conninfo()'s
+		// connect_timeout preempts) -- so the most common transient outage during a
+		// rewind was misclassified as divergence and re-cloned (#298 review).
+		"timeout expired",
+		"network is unreachable", // ENETUNREACH: routing down, not divergence
 		"server closed the connection unexpectedly",
 		"terminating connection due to administrator command",
 	} {

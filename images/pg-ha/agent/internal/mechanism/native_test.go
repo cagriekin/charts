@@ -279,6 +279,10 @@ func TestIsConnectionFailure(t *testing.T) {
 		{"connection refused", "could not connect to server: Connection refused", true},
 		{"no route to host", "could not connect to server: No route to host", true},
 		{"timeout", "connection timed out", true},
+		// libpq's connect_timeout expiry (#298 review): the message is "timeout
+		// expired", not the kernel's "connection timed out" strerror.
+		{"libpq connect_timeout", `connection to server at "pg-0" (10.0.0.5), port 5432 failed: timeout expired`, true},
+		{"enetunreach", `connection to server at "pg-0" (10.0.0.5), port 5432 failed: Network is unreachable`, true},
 		{"admin shutdown", "terminating connection due to administrator command", true},
 		{"genuine divergence", "target server needs to exit backup mode", false},
 		{"generic pg_rewind failure", "source and target cluster are on the same timeline", false},

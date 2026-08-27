@@ -814,14 +814,22 @@ spec:
                   fieldPath: metadata.name
             - name: LEASE_NAME
               value: {{ printf "%s-leader" (include "pg.fullname" .) | quote }}
+            {{- /* Rendered through pg.haAgentDuration -- the SAME helper the
+                   pg.validateLeaseTimings guard reads -- so the emitted value can never
+                   diverge from the validated one (#298 review): `--set
+                   ha.agent.leaseDuration=null` DELETES the key, the validator then
+                   checks the default, but the raw `.Values` render emitted `value: ""`,
+                   which config.Load refuses -- every pod CrashLoopBackOffed after a
+                   clean render, the exact failure class the #291 validator exists to
+                   prevent. Defaults must match values.yaml. */}}
             - name: LEASE_DURATION
-              value: {{ .Values.ha.agent.leaseDuration | quote }}
+              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "leaseDuration" "15s") | quote }}
             - name: RENEW_DEADLINE
-              value: {{ .Values.ha.agent.renewDeadline | quote }}
+              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "renewDeadline" "10s") | quote }}
             - name: RETRY_PERIOD
-              value: {{ .Values.ha.agent.retryPeriod | quote }}
+              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "retryPeriod" "2s") | quote }}
             - name: RECONCILE_INTERVAL
-              value: {{ .Values.ha.agent.reconcileInterval | quote }}
+              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "reconcileInterval" "5s") | quote }}
 {{- if .Values.ha.agent.cascadingReplication }}
             {{- /* Cascading replication (#29): a standby may follow another standby to
                    offload the primary's WAL senders. The agent picks a safe upstream and

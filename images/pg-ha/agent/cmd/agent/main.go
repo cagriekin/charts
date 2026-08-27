@@ -11,6 +11,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -550,7 +551,20 @@ func (a *agent) tick(ctx context.Context) {
 	// demotes, so gating on it could skip a real fence). Postgres stays read-write
 	// until demoted, so a tick during the loss window still sees RW -> fence fires.
 	// The Promote act also sets it synchronously, closing the promote->next-tick gap.
-	a.servingRW.Store(obs.Local.Running && !obs.Local.InRecovery)
+	//
+	// Cleared only on positive evidence (#298 review). Running is SQL reachability,
+	// not process liveness: a wedged/overloaded read-write postmaster fails the probe
+	// while still being a writer, and clearing the latch on that uncertainty made
+	// OnLost skip the fence ("not read-write; no fence needed") for exactly the node
+	// that most needs it -- a second writer once it thaws. Fail-safe is to demote on
+	// uncertainty: hold the last known value until the probe answers again or the
+	// postmaster process is actually gone.
+	switch {
+	case obs.Local.Running:
+		a.servingRW.Store(!obs.Local.InRecovery)
+	case !obs.LocalProcessAlive:
+		a.servingRW.Store(false) // process gone: nothing left to fence
+	}
 	a.publishStatus(ctx, obs.Local)
 	dec := reconcile.Decide(obs)
 	observe.Audit(a.log, obs.HoldLease, dec.Action.String(), dec.Target, dec.Reason)
@@ -664,7 +678,15 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// non-holders skip the per-tick List. Best-effort: a read failure means no gossip.
 	var gossip map[string]k8s.NodeStatus
 	if o.HoldLease {
-		g, gerr := a.kube.ReadPeerStatuses(ctx, a.cfg.PodSelector, a.cfg.PodName)
+		// Bounded like topologyTick/slotsTick (#298 review): the REST config sets no
+		// client Timeout, so an unbounded apiserver call on the reconcile goroutine can
+		// hang on a blackholed connection, stopping metr.Beat() until /healthz goes
+		// stale and the kubelet kills PID 1 -- and the postmaster it supervises --
+		// exactly when the apiserver is unreachable. Best-effort: a deadline miss means
+		// no gossip this tick.
+		gctx, gcancel := context.WithTimeout(ctx, a.fenceBudget())
+		g, gerr := a.kube.ReadPeerStatuses(gctx, a.cfg.PodSelector, a.cfg.PodName)
+		gcancel()
 		if gerr != nil {
 			a.log.Warn("read peer statuses (gossip)", "err", gerr)
 		}
@@ -709,7 +731,11 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		}
 		o.Peers = append(o.Peers, ps)
 	}
-	m, err := a.kube.ReadMarker(ctx, a.cfg.MarkerName)
+	// Bounded for the same reason as the gossip read above (#298 review); the marker
+	// is re-read every tick, so a deadline miss self-heals.
+	mctx, mcancel := context.WithTimeout(ctx, a.fenceBudget())
+	m, err := a.kube.ReadMarker(mctx, a.cfg.MarkerName)
+	mcancel()
 	if err != nil {
 		a.log.Warn("read marker", "err", err)
 	}
@@ -1221,45 +1247,67 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		return a.sup.Start(ctx)
 
 	case reconcile.ReleaseLease:
-		// Step down: release the Lease so a peer can take over (stale-winner handoff
-		// at cold boot, or self-health failover). Only stop postgres if we were
-		// serving read-write; a standby is already read-only, so releasing the Lease
-		// is enough and we avoid churning its postmaster.
-		a.dcs.Release()
+		// Step down: demote/stop the local writer FIRST, then release the Lease so a
+		// peer can take over (stale-winner handoff at cold boot, or self-health
+		// failover). The ordering is load-bearing on the K8s backend (#298 review):
+		// client-go's ReleaseOnCancel empties the Lease record BEFORE OnStoppedLeading
+		// runs, so a standby can acquire the freed Lease and promote within
+		// ~RetryPeriod of Release() -- while a slow demote or the SIGQUIT->SIGKILL
+		// escalation on a frozen postmaster can take up to RenewDeadline. Releasing
+		// first therefore opened a two-writer window; holding the Lease through the
+		// stop fences it (no peer can win a Lease we still hold), and only a COMPLETED
+		// demote/stop is followed by the release. On a demote/stop error we keep the
+		// Lease and let the next tick (or the OnLost fence at lease expiry) retry --
+		// releasing with a possibly-live writer up is the one unrecoverable ordering.
+		// Only stop postgres if we were serving read-write; a standby is already
+		// read-only, so releasing the Lease is enough and we avoid churning its
+		// postmaster.
 		switch {
 		case obs.Local.Running && !obs.Local.InRecovery:
 			a.metr.IncDemote()
-			return a.sup.Demote(ctx, false)
+			if err := a.sup.Demote(ctx, false); err != nil {
+				return err
+			}
 		case obs.LocalStuck && !obs.Local.InRecovery:
 			// Self-health failover: a primary-state postmaster that is wedged/frozen
-			// (SQL unreachable, so Running is false and the OnLost fence -- gated on the
-			// already-cleared servingRW -- would NOT demote it). The agent owns this
-			// PID-1 child, so force-stop it (SIGQUIT->SIGKILL on timeout) BEFORE the
-			// released lease lets a standby promote: a frozen primary that later
-			// unfreezes would be a second writer. Harmless if it is already down.
+			// (SQL unreachable, so Running is false). The agent owns this PID-1 child,
+			// so force-stop it (SIGQUIT->SIGKILL on timeout) while we still hold the
+			// Lease: a frozen primary that later unfreezes would be a second writer.
+			// Harmless if it is already down.
 			a.metr.IncDemote()
 			rctx, cancel := context.WithTimeout(ctx, a.cfg.RenewDeadline)
 			defer cancel()
-			return a.sup.Stop(rctx, process.Immediate)
+			if err := a.sup.Stop(rctx, process.Immediate); err != nil {
+				return err
+			}
 		}
+		a.dcs.Release()
 		return nil
 
 	case reconcile.Switchover:
 		// Controlled handoff (Part H2): the decision guard already confirmed the
 		// target is a caught-up, same-timeline standby. Clear the request FIRST so a
 		// later unrelated failover cannot re-trigger a handoff to the same pod; only
-		// on a successful clear do we step down (release the Lease + graceful/fast
-		// demote, which flushes WAL to the connected, caught-up target). The target,
-		// being caught up, then wins the freed Lease and promotes. If the clear fails
-		// we do NOT step down -- the request persists, so the next tick retries.
+		// on a successful clear do we step down (graceful/fast demote, THEN release
+		// the Lease). The target, being caught up, then wins the freed Lease and
+		// promotes. If the clear fails we do NOT step down -- the request persists,
+		// so the next tick retries.
 		if err := a.kube.ClearSwitchoverTarget(ctx, a.cfg.MarkerName); err != nil {
 			return err
 		}
-		a.dcs.Release()
+		// Demote BEFORE releasing (same two-writer reasoning as ReleaseLease above,
+		// #298 review): the graceful demote flushes WAL to the connected, caught-up
+		// target while we still hold the Lease; only then is the Lease freed for the
+		// target to win. On a demote error the handoff is abandoned (the request was
+		// already cleared; the operator re-requests) rather than releasing with a
+		// possibly-live writer up.
 		if obs.Local.Running && !obs.Local.InRecovery {
 			a.metr.IncDemote()
-			return a.sup.Demote(ctx, false)
+			if err := a.sup.Demote(ctx, false); err != nil {
+				return err
+			}
 		}
+		a.dcs.Release()
 		return nil
 
 	case reconcile.StartLocal:
@@ -2171,7 +2219,12 @@ func (a *agent) publishStatus(ctx context.Context, ls reconcile.LocalState) {
 	}
 	st := pos
 	st.UpdatedAtUnix = now.Unix()
-	if err := a.kube.PublishStatus(ctx, a.cfg.PodName, st); err != nil {
+	// Bounded like the observe()-side reads (#298 review): this patch runs on the
+	// reconcile goroutine every tick; unbounded it can stall the loop into a
+	// liveness kill during an apiserver partition.
+	pctx, pcancel := context.WithTimeout(ctx, a.fenceBudget())
+	defer pcancel()
+	if err := a.kube.PublishStatus(pctx, a.cfg.PodName, st); err != nil {
 		a.log.Warn("publish status (gossip)", "err", err)
 		return
 	}
@@ -2419,6 +2472,16 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 		return err
 	}
 	if err := a.mech.RejoinForceRewind(ctx, a.peerMechConn(target)); err != nil {
+		// Escalate to a full re-clone ONLY on genuine divergence (#298 review).
+		// RejoinForceRewind already classifies its failures -- ErrRewindDiverged for
+		// "pg_rewind cannot proceed", a plain error for the transient ones (source
+		// unreachable, slot provisioning, recovery-config write) whose contract is
+		// "the caller retries next tick" -- but this caller escalated on ANY error,
+		// paying a full re-clone plus a preserved .diverged.<ts> copy of PGDATA for a
+		// network blip: exactly the #178 escalation the classifier exists to prevent.
+		if !errors.Is(err, mechanism.ErrRewindDiverged) {
+			return err
+		}
 		// Same marker as BootstrapClone (#288 review): ReclonePreserving runs the same
 		// pg_basebackup, so an interrupted one leaves an equally torn PGDATA, and without the
 		// marker discardTornClone is a no-op on the next boot.

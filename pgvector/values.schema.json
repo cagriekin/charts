@@ -260,6 +260,10 @@
     "repmgr": {
       "type": "object",
       "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "HA on/off is load-bearing for ~20 template gates, and a non-boolean truthy value (the classic quoted \"false\", or 1) used to render a hybrid manifest: `if` gates fired while `eq (include \"pg.agentMode\" .) \"true\"` gates did not, dropping the agent's lease env after a clean render (#298 review). Typed here so the accident fails at render time."
+        },
         "agent": {
           "type": "object",
           "properties": {
@@ -619,6 +623,10 @@
     "ha": {
       "type": "object",
       "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "HA on/off is load-bearing for ~20 template gates, and a non-boolean truthy value (the classic quoted \"false\", or 1) used to render a hybrid manifest: `if` gates fired while `eq (include \"pg.agentMode\" .) \"true\"` gates did not, dropping the agent's lease env after a clean render (#298 review). Typed here so the accident fails at render time."
+        },
         "agent": {
           "type": "object",
           "properties": {

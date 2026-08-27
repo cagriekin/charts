@@ -3,6 +3,7 @@ package dcs
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -130,7 +131,14 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 		le, err := leaderelection.NewLeaderElector(lec)
 		if err != nil {
 			cancel()
-			return // config error (timings invalid); nothing to retry
+			// Nothing to retry (the elector is only rejected for invalid config), but
+			// never exit silently: this goroutine is fire-and-forget, so a silent return
+			// left a healthy-looking agent that ticks forever yet never contends for
+			// leadership, with no line anywhere naming the cause (#298 review).
+			// config.Load pre-validates the client-go bounds (including the 1.2x jitter
+			// rule), so reaching this is a should-never-happen.
+			slog.Error("leader election disabled: client-go rejected the election config", "err", err)
+			return
 		}
 		le.Run(elerCtx) // blocks: acquire -> lead -> lose (or Release cancels), then returns
 		cancel()

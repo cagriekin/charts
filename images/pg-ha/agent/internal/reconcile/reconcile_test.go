@@ -429,6 +429,27 @@ func TestMoreAdvancedPeerIgnoresAStalePeerWhenThisNodeWasRestored(t *testing.T) 
 	}
 }
 
+// A peer that qualified with an UNKNOWN timeline (transient StandbyTimeline failure,
+// LSN known) must not be displaced by a timeline-known peer with LESS WAL (#298
+// review): the incumbent's zero timeline was compared "as known" (hardcoded true), so
+// tl=1 beat tl=0 regardless of LSN and the holder handed the lease to the lower-WAL
+// node -- invariant 8 inverted.
+func TestMoreAdvancedPeerKeepsHigherWALPeerWithUnknownTimeline(t *testing.T) {
+	o := Observation{
+		HoldLease: true,
+		Local:     LocalState{HasData: true, Running: true, InRecovery: true, Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x1000}, LSNOK: true},
+		Peers: []PeerState{
+			// Iterated first: far ahead on LSN, timeline unknown.
+			{Name: "pg-1", Reachable: true, Role: pg.RoleStandby, TimelineOK: false, LSN: pg.LSN{Hi: 0, Lo: 0x9000}, LSNOK: true},
+			// Iterated second: timeline known, but LESS WAL than pg-1.
+			{Name: "pg-2", Reachable: true, Role: pg.RoleStandby, Timeline: 1, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x2000}, LSNOK: true},
+		},
+	}
+	if got, _ := moreAdvancedPeer(o); got != "pg-1" {
+		t.Fatalf("got %q, want pg-1: a timeline-known peer with less WAL must not displace the higher-WAL incumbent", got)
+	}
+}
+
 // With no restore records anywhere -- every ordinary cluster -- ranking must be byte-identical
 // to before: pure position. This is what keeps the change from touching normal failover.
 func TestMoreAdvancedPeerUnchangedWithoutRestoreRecords(t *testing.T) {

@@ -329,6 +329,14 @@ func Load(get func(string) string) (*Config, error) {
 		if !(c.LeaseDuration > c.RenewDeadline && c.RenewDeadline > c.RetryPeriod) {
 			l.invalid = append(l.invalid, fmt.Sprintf("lease timings must satisfy LeaseDuration(%s) > RenewDeadline(%s) > RetryPeriod(%s)",
 				c.LeaseDuration, c.RenewDeadline, c.RetryPeriod))
+		} else if float64(c.RenewDeadline) <= float64(c.RetryPeriod)*1.2 {
+			// client-go's NewLeaderElector additionally requires
+			// RenewDeadline > RetryPeriod*JitterFactor (1.2) and rejects the elector at
+			// construction -- a failure K8sDCS.Run cannot retry, so without this bound a
+			// Load-clean config produced an agent that ticks forever yet never contends
+			// for leadership (#298 review). Fail the boot with the real bound instead.
+			l.invalid = append(l.invalid, fmt.Sprintf("lease timings must satisfy RenewDeadline(%s) > 1.2 x RetryPeriod(%s) (client-go leader-election jitter bound); raise RENEW_DEADLINE or lower RETRY_PERIOD",
+				c.RenewDeadline, c.RetryPeriod))
 		}
 	}
 	// Validate enums only when present (an empty value is already a "missing" error).

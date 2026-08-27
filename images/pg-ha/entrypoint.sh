@@ -149,12 +149,22 @@ EOF
     # SET applies to the CREATE/ALTER in that same psql -c session) -- the same end state the chart's
     # fix_user_auth migration drives them to, but race-free from first boot.
     # Legacy/app users keep the md5 default and the existing migration path.
+    # SQL-quote the passwords (#298 review): a literal single quote in POSTGRES_PASSWORD /
+    # REPMGR_PASSWORD ended the SQL string, the `2>/dev/null || true` swallowed the syntax
+    # error, and -- because the verification below only asked about the repmgr objects -- a
+    # POSTGRES_USER left with NO password was sealed in by the completion sentinel: initdb
+    # ran with no --pwfile, pg_hba requires scram from the network, so application auth was
+    # broken forever while the bootstrap never re-ran. Doubling the quote is the SQL escape;
+    # the extended verification below still backstops anything else that slips through.
+    pg_pw_sql=${POSTGRES_PASSWORD//\'/\'\'}
+    repmgr_pw_sql=${REPMGR_PASSWORD//\'/\'\'}
+
     psql -U postgres -d postgres -c "CREATE DATABASE ${POSTGRES_DB};" 2>/dev/null || true
-    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER ${POSTGRES_USER} WITH SUPERUSER PASSWORD '${POSTGRES_PASSWORD}';" 2>/dev/null || true
-    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; ALTER USER ${POSTGRES_USER} WITH PASSWORD '${POSTGRES_PASSWORD}';" 2>/dev/null || true
+    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER ${POSTGRES_USER} WITH SUPERUSER PASSWORD '${pg_pw_sql}';" 2>/dev/null || true
+    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; ALTER USER ${POSTGRES_USER} WITH PASSWORD '${pg_pw_sql}';" 2>/dev/null || true
 
     psql -U postgres -d postgres -c "CREATE DATABASE ${REPMGR_DB};" 2>/dev/null || true
-    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER ${REPMGR_USER} WITH SUPERUSER PASSWORD '${REPMGR_PASSWORD}';" 2>/dev/null || true
+    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER ${REPMGR_USER} WITH SUPERUSER PASSWORD '${repmgr_pw_sql}';" 2>/dev/null || true
     psql -U postgres -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE ${REPMGR_DB} TO ${REPMGR_USER};" 2>/dev/null || true
     # The repmgr DATABASE and ROLE above are created under BOTH mechanisms, on purpose.
     # #288 asked for native bootstrap to create none of the three, but the role and the
@@ -177,8 +187,9 @@ EOF
     # forever (PG_VERSION exists) while the agent can never authenticate -- exactly the
     # Running/NotReady-until-someone-deletes-the-PVC state that sentinel exists to prevent.
     #
-    # Only the two load-bearing objects are checked: the agent connects as REPMGR_USER for every
-    # probe and for pg_basebackup, and primary_conninfo carries dbname=REPMGR_DB. Failing here
+    # Every load-bearing object is checked: the agent connects as REPMGR_USER for every
+    # probe and for pg_basebackup, primary_conninfo carries dbname=REPMGR_DB, and the
+    # POSTGRES_USER/POSTGRES_DB pair is what applications authenticate against. Failing here
     # exits before the sentinel is written, so the next boot discards the torn directory and
     # starts over -- a loud crash-loop naming the cause, rather than a silent wedge.
     bootstrap_ok=yes
@@ -188,6 +199,18 @@ EOF
     fi
     if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '${REPMGR_DB}'" 2>/dev/null | grep -q 1; then
         echo "FATAL: bootstrap did not create the ${REPMGR_DB} database." >&2
+        bootstrap_ok=no
+    fi
+    # The POSTGRES side is load-bearing too (#298 review): the superuser must end up WITH a
+    # password -- initdb ran with no --pwfile, so a swallowed CREATE/ALTER USER left it NULL
+    # and every network login dead -- and the app database must exist. pg_authid, not
+    # pg_roles: pg_roles.rolpassword always reads as NULL, even for superusers.
+    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_authid WHERE rolname = '${POSTGRES_USER}' AND rolpassword IS NOT NULL" 2>/dev/null | grep -q 1; then
+        echo "FATAL: bootstrap did not leave the ${POSTGRES_USER} role with a password." >&2
+        bootstrap_ok=no
+    fi
+    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '${POSTGRES_DB}'" 2>/dev/null | grep -q 1; then
+        echo "FATAL: bootstrap did not create the ${POSTGRES_DB} database." >&2
         bootstrap_ok=no
     fi
     if [ "$bootstrap_ok" != "yes" ]; then

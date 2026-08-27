@@ -1553,7 +1553,16 @@ Since 2.0.0 the agent is the only failover path, so this is exactly "HA is enabl
 helper is kept rather than inlined so the ~20 call sites keep reading as a mode check.
 */}}
 {{- define "pg.agentMode" -}}
-{{- .Values.ha.enabled -}}
+{{- /* Coerced to a canonical "true"/"false" rather than echoing the raw value (#298
+       review): call sites compare `eq ... "true"` while plain `if .Values.ha.enabled`
+       gates elsewhere use template truthiness. A non-bool truthy value (the classic
+       `ha.enabled: "false"` quoting accident, or `1`) split the two -- every `if`
+       branch fired while every agentMode gate did not, rendering a clean-looking
+       hybrid manifest with the agent command but none of its lease env, so every pod
+       CrashLoopBackOffed. The schema now types ha.enabled as boolean too; the
+       coercion keeps the helper safe even for renders that skip schema validation
+       (--set-string bypasses nothing here). */ -}}
+{{- if .Values.ha.enabled -}}true{{- else -}}false{{- end -}}
 {{- end -}}
 
 {{- /* The single condition under which postgresql-configmap.yaml renders a ConfigMap at
