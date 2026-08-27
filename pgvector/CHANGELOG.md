@@ -2,6 +2,48 @@
 
 ## 2.0.0 - unreleased
 
+### Added
+
+- **In-place migration of a live repmgr cluster to the native mechanism (#292).** `helm upgrade`
+  from any 1.x release now migrates an existing cluster without a re-clone: timeline and system
+  identifier preserved, no switchover, no `--cascade=orphan` recreate. At size this is the
+  difference between a rolling restart and hours of degraded HA with a real RPO window.
+
+  What happens to the repmgr state a 1.x cluster carries on disk: the
+  `shared_preload_libraries = 'repmgr'` line inside PGDATA is stripped before the postmaster
+  starts (#293 -- load-bearing, since the 2.0.0 image has no `repmgr.so` and the line survives a
+  `helm rollback` because it lives in the data directory); `primary_conninfo` /
+  `primary_slot_name` are cleared from `postgresql.auto.conf` so the agent's own fragment becomes
+  authoritative; legacy `repmgr_slot_<node_id>` slots are left alone while streaming and dropped
+  only once that standby has attached to its `pg_ha_slot_<ordinal>` replacement, under
+  `AND NOT active`. The repmgr database, role and extension are **left in place** -- dropping
+  them is irreversible and is what closes off rollback, so it stays an opt-in operator step.
+
+  New runbook in `pg/README.md`: preconditions, the upgrade, per-node verification, the
+  cluster-wide `pg-ha/pause` marker, rollback (including the one thing rollback does not undo --
+  the preload strip), and the opt-in `DROP EXTENSION` snippet with an explicit warning against
+  dropping the role or database, both of which the agent still depends on.
+
+  New KinD suite `test-migrate-native` (`make -C pg test-migrate-native`, and a matrix leg on
+  both majors): installs the released 1.17.0 chart on an older released image that still contains
+  repmgr, proves the starting state really is repmgr-shaped, then upgrades to the local chart and
+  asserts no re-clone, unchanged timeline and system identifier, data intact, every standby
+  streaming, native slots active, no legacy slot left pinning WAL, the catalog untouched, and
+  that a second roll is a no-op. "No re-clone" is proved by a sentinel file written into each
+  PGDATA -- `pg_basebackup` wipes the target directory, so a surviving sentinel is direct
+  evidence rather than an inference from logs or timing.
+
+### Fixed
+
+- `pg/tests/set-pg-major.sh` normalized deliberate older-release image pins (`set-pg-major: keep`)
+  asymmetrically: untouched on the default major, but rewritten to the freshly-built tag on a
+  non-default one, on the premise that "a non-default major has no older PUBLISHED image". That
+  premise expired with #269's per-major publishing -- every release from `trixie-5.5.0-29` onward
+  exists as both `-pg17` and `-pg18` -- so the rule destroyed the coverage it was protecting: on a
+  PG17 leg the migration suite would have started from the repmgr-FREE image, making its "install
+  a 1.x cluster" phase not a repmgr cluster at all. Keep-marked pins now keep their base and move
+  only the major suffix, on every major, which is idempotent and needs no staleness check.
+
 ### Changed (breaking)
 
 - **The `repmgr:` values block is now `ha:`** (#291). Nothing nested moved -- only the block's

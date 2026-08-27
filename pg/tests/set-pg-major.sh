@@ -190,40 +190,31 @@ apply "postgres image tag" \
   '[0-9]+(\.[0-9]+)?-(trixie|bookworm)' \
   's/[0-9]+(\.[0-9]+)?-(trixie|bookworm)/'"${PG_IMAGE_TAG}"'/g'
 
-# On the default major the keep-marked pins are left alone -- but a PREVIOUS non-default run
-# in this same tree will have rewritten them to a -pgNN tag, and this run skips them, so the
-# tree would be left half-switched with no other check looking at those lines. That only
-# happens when the tree is not a clean checkout, which is exactly when silence misleads.
-if [ "$MAJOR" = "$DEFAULT_MAJOR" ]; then
-  for f in "${TARGETS[@]}"; do
-    [ -f "$f" ] || continue
-    stale=$(grep "$KEEP_MARK" "$f" | grep -oE 'trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-pg[0-9]+' || true)
-    [ -z "$stale" ] && continue
-    echo "FATAL: $(basename "$f") has a '${KEEP_MARK}' pin left on ${stale} by an earlier non-default run" >&2
-    echo "       this tree is half-switched; restore it first: git checkout -- pg/values.yaml pg/tests" >&2
-    exit 1
-  done
-fi
-
-# A non-default major has no older PUBLISHED image to migrate from -- only the -pgNN build
-# CI just made exists -- so on those legs the keep-marked pins must move after all, or the
-# migration suite would start a PG18 server on a PG17 PGDATA and fail for the wrong reason.
-# Say so loudly: on this leg those suites no longer test "upgrade from an older release",
-# and the default-major leg is what preserves that coverage.
-if [ "$MAJOR" != "$DEFAULT_MAJOR" ]; then
-  keep_hits=0
-  for f in "${TARGETS[@]}"; do
-    [ -f "$f" ] || continue
-    n=$(grep -c "$KEEP_MARK" "$f" || true)
-    [ "$n" -gt 0 ] || continue
-    keep_hits=$((keep_hits + n))
-    sed -i -E "/${KEEP_MARK}/ s/trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?/${REPMGR_TAG}/g" "$f"
-    echo "  note: retargeted ${n} deliberate older-release pin(s) in $(basename "$f") to ${REPMGR_TAG}"
-  done
-  if [ "$keep_hits" -gt 0 ]; then
-    echo "  note: PG${MAJOR} has no older published image, so 'upgrade from an older release' is NOT covered on this leg (the PG${DEFAULT_MAJOR} legs cover it)"
-  fi
-fi
+# Keep-marked pins name a deliberate OLDER RELEASED image, and they are normalized to
+# <base>-pg<MAJOR> on EVERY major rather than being left alone or dragged to the chart's tag.
+#
+# This used to be two asymmetric branches: left untouched on the default major (with a FATAL if
+# an earlier non-default run had suffixed them), and rewritten to the freshly-built tag on a
+# non-default one, "because a non-default major has no older PUBLISHED image to migrate from".
+# That premise expired with #269: per-major publishing means every release from trixie-5.5.0-29
+# onward exists as -pg17 AND -pg18, so an older per-major image is available on both legs. The
+# old rule therefore destroyed the coverage it was protecting -- on a PG17 leg the migration
+# suite would have started from the freshly built repmgr-FREE image instead of a released
+# repmgr one, so its "install a 1.x cluster" phase was not a repmgr cluster at all.
+#
+# Normalizing keeps the BASE (the deliberate older release) and moves only the major suffix,
+# which is idempotent and round-trips cleanly, so no staleness FATAL is needed either. A
+# keep-marked pin on a base older than -29 would have no per-major build; there are none in the
+# tree, and one added later would fail its own suite loudly on the image pull.
+keep_hits=0
+for f in "${TARGETS[@]}"; do
+  [ -f "$f" ] || continue
+  n=$(grep -c "$KEEP_MARK" "$f" || true)
+  [ "$n" -gt 0 ] || continue
+  keep_hits=$((keep_hits + n))
+  sed -i -E "/${KEEP_MARK}/ s/(trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+)(-pg[0-9]+)?/\1-pg${MAJOR}/g" "$f"
+done
+[ "$keep_hits" -gt 0 ] && echo "  deliberate older-release pins: ${keep_hits} normalized to -pg${MAJOR}"
 
 # Nothing may be left pointing at another major. The per-rule counters above only prove a
 # rule fired somewhere; these two checks prove no target still names a different image,

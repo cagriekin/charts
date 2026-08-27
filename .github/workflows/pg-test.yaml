@@ -273,6 +273,11 @@ jobs:
           - pgbackrest-bootstrap
           - databases-roles
           - scaledown
+          # #292: starts from the released 1.x chart + an older released image, so unlike every
+          # other leg it is not hermetic against the local tree. It is in the matrix anyway
+          # because the in-place migration is the one path every existing consumer takes, and
+          # a suite that only runs by hand is a suite that rots.
+          - migrate-native
         include:
           - { suite: agent, coldboot: "1" }
     steps:
