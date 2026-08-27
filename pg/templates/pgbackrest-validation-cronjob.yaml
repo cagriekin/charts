@@ -1,3 +1,4 @@
+{{- include "pg.normalizeValues" . -}}
 {{- if and .Values.pgbackrest.enabled .Values.pgbackrest.validation.enabled }}
 {{- /* targetType's allowed values are enforced by the values.schema.json enum (portable
        across helm versions). The dependent "target is required when targetType is set"
@@ -65,7 +66,7 @@ spec:
           containers:
             - name: pgbackrest-validation
               image: "{{ include "pg.repmgrImage" . }}"
-              imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+              imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
               securityContext:
                 {{- toYaml .Values.postgresql.containerSecurityContext | nindent 16 }}
               # The restore-and-validate program lives in the pgbackrest ConfigMap

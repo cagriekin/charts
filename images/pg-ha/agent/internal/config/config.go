@@ -317,7 +317,7 @@ func Load(get func(string) string) (*Config, error) {
 		// removed and this pod is running a chart that still asks for it.
 		l.invalid = append(l.invalid, fmt.Sprintf(
 			"MECHANISM=%q was removed in chart 2.0.0 (#294): the repmgr mechanism and its CLI are gone, and %s is now the only one. "+
-				"Unset repmgr.agent.mechanism (or set it to %q) -- an existing repmgr cluster needs the in-place migration first (#292)",
+				"Unset ha.agent.mechanism (or set it to %q) -- an existing repmgr cluster needs the in-place migration first (#292)",
 			MechanismRepmgr, MechanismNative, MechanismNative))
 	default:
 		l.invalid = append(l.invalid, fmt.Sprintf("MECHANISM=%q (want %s)", c.Mechanism, MechanismNative))

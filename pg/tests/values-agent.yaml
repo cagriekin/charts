@@ -44,7 +44,11 @@ postgresql:
     postStart:
       additionalCommands: ""
 
-repmgr:
+# Spelled `ha:` on purpose (#291), while every other fixture stays on the deprecated
+# `repmgr:` alias. This fixture feeds nine KinD suites, so the split gives the canonical
+# name real cluster coverage and leaves the alias exercised everywhere else -- otherwise the
+# name operators are told to migrate to would be the only one no live suite ever renders.
+ha:
   # NO image pin (#293). This fixture used to pin trixie-5.5.0-27, six releases behind the
   # chart default. CI is unaffected -- set-pg-major.sh rewrites every fixture's repmgr tag to
   # the chart's own before any suite runs, so CI always tested the freshly built image -- but

@@ -1,5 +1,6 @@
+{{- include "pg.normalizeValues" . -}}
 {{- if eq (include "pg.controlRestoreEnabled" .) "true" }}
-{{- if .Values.repmgr.agent.control.restore.admissionPolicy.enabled }}
+{{- if .Values.ha.agent.control.restore.admissionPolicy.enabled }}
 {{- /* Bound the restore Job-create grant by CONTENT, not just by verb (#279).
 
        rbac.yaml has to hand the database pods' ServiceAccount `create` on `batch/jobs`,
@@ -63,7 +64,7 @@
        cluster without the API renders clean and then aborts mid-apply with "no matches for
        kind ValidatingAdmissionPolicy", leaving the release in a failed state. */}}
 {{- if not (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1") }}
-{{- fail (printf "repmgr.agent.control.restore needs admissionregistration.k8s.io/v1 for the ValidatingAdmissionPolicy that bounds its `create jobs` grant, and this cluster does not expose it -- it is GA from Kubernetes 1.30 (this cluster reports %s), and can also be disabled by --runtime-config (#279). Upgrade or enable the API, or set repmgr.agent.control.restore.admissionPolicy.enabled=false together with acknowledgeUnbounded=true to run the feature with an unbounded grant deliberately" .Capabilities.KubeVersion.Version) }}
+{{- fail (printf "ha.agent.control.restore needs admissionregistration.k8s.io/v1 for the ValidatingAdmissionPolicy that bounds its `create jobs` grant, and this cluster does not expose it -- it is GA from Kubernetes 1.30 (this cluster reports %s), and can also be disabled by --runtime-config (#279). Upgrade or enable the API, or set ha.agent.control.restore.admissionPolicy.enabled=false together with acknowledgeUnbounded=true to run the feature with an unbounded grant deliberately" .Capabilities.KubeVersion.Version) }}
 {{- end }}
 {{- $fullname := include "pg.fullname" . }}
 {{- $guard := include "pg.restoreGuardName" . }}
@@ -106,7 +107,7 @@
 {{- else if hasKey $v "persistentVolumeClaim" }}
 {{- $extraVolPins = append $extraVolPins (dict "kind" "persistentVolumeClaim" "field" "claimName" "value" ($v.persistentVolumeClaim.claimName | toString)) }}
 {{- else }}
-{{- fail (printf "pgbackrest.extraVolumes[%d] (%s) is a volume source this chart cannot pin in the restore admission policy (#279/#323): only emptyDir, configMap, secret and persistentVolumeClaim carry a name the policy can bind to, and admitting an unpinned source would let the agent's Jobs mount anything of that type. The restore Job would be denied at admission the moment the agent tried to create it. Use one of those four sources, or -- if you need this one -- disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $i $vn) }}
+{{- fail (printf "pgbackrest.extraVolumes[%d] (%s) is a volume source this chart cannot pin in the restore admission policy (#279/#323): only emptyDir, configMap, secret and persistentVolumeClaim carry a name the policy can bind to, and admitting an unpinned source would let the agent's Jobs mount anything of that type. The restore Job would be denied at admission the moment the agent tried to create it. Use one of those four sources, or -- if you need this one -- disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $i $vn) }}
 {{- end }}
 {{- end }}
 {{- $extraSecretRefs := list }}
@@ -119,7 +120,7 @@
 {{- else if hasKey . "configMapKeyRef" }}
 {{- $extraCmRefs = append $extraCmRefs (.configMapKeyRef.name | toString) }}
 {{- else if not (hasKey . "fieldRef") }}
-{{- fail (printf "pgbackrest.extraEnv[%d] (%s) uses an env valueFrom source the restore admission policy cannot pin (#279/#323): only fieldRef, secretKeyRef and configMapKeyRef can be bound to a name there, so this Job would be denied at admission the moment the agent tried to create it. Use one of those three, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $i $en) }}
+{{- fail (printf "pgbackrest.extraEnv[%d] (%s) uses an env valueFrom source the restore admission policy cannot pin (#279/#323): only fieldRef, secretKeyRef and configMapKeyRef can be bound to a name there, so this Job would be denied at admission the moment the agent tried to create it. Use one of those three, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $i $en) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -268,7 +269,7 @@
 {{- end }}
 {{- /* Every value interpolated into a CEL string literal below, checked at render time for
        characters that would break the expression or turn it into a tautology. */}}
-{{- $literals := list (list "the release namespace" .Release.Namespace) (list "the release fullname" $fullname) (list "repmgr.image (pg.repmgrImage)" (include "pg.repmgrImage" .)) }}
+{{- $literals := list (list "the release namespace" .Release.Namespace) (list "the release fullname" $fullname) (list "ha.image (pg.repmgrImage)" (include "pg.repmgrImage" .)) }}
 {{- range $k, $v := $podLabels }}
 {{- $literals = append $literals (list (printf "the restore pod label %s" $k) $v) }}
 {{- end }}
@@ -358,7 +359,7 @@ spec:
     #    admission runs, so object.metadata.name is the final name (a mutating webhook, by
     #    contrast, would see it empty). A generated name never equals the pinned one.
     - expression: "object.metadata.name == '{{ $fullname }}-pgbackrest-restore-api'"
-      message: "the pg agent may create only the Job {{ $fullname }}-pgbackrest-restore-api (repmgr.agent.control.restore, #279)"
+      message: "the pg agent may create only the Job {{ $fullname }}-pgbackrest-restore-api (ha.agent.control.restore, #279)"
       reason: Forbidden
     # 2. Provenance, and it is why the CronJob's jobTemplate carries this label: the agent
     #    copies jobTemplate labels onto the Job it clones, so a Job without it did not come

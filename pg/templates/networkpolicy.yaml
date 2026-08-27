@@ -1,3 +1,9 @@
+{{- /* Normalize FIRST (#291 review): this file reads .Values.ha transitively (pg.agentMode
+       and friends), and in a full `helm template` it only works by accident -- statefulset.yaml
+       sorts earlier and mutates .Values for every file after it. Rendering this template alone,
+       which helm-unittest does per-file, would read the raw ha: defaults and ignore the
+       repmgr.* alias entirely, so an alias-driven assertion here would pass vacuously. */ -}}
+{{- include "pg.normalizeValues" . -}}
 {{- if .Values.networkPolicy.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

@@ -1,5 +1,6 @@
+{{- include "pg.normalizeValues" . -}}
 {{- $primaryPod := printf "%s-0" (include "pg.fullname" .) }}
-{{- if .Values.repmgr.enabled }}
+{{- if .Values.ha.enabled }}
 {{- /* Preserve the live primary selector across upgrades: the agent repoints
        pod-name after failover, and re-rendering the hardcoded pod-0 would
        route writes to a read-only standby until the next reconcile tick

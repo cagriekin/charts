@@ -12,7 +12,7 @@ tests:
       postgresql.replicaCount: 1
     asserts:
       - failedTemplate:
-          errorMessage: "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr"
+          errorMessage: "postgresql.replicaCount > 0 requires ha.enabled=true: with HA disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode, or ha.enabled=true"
 
   # #286: repmgrd is gone from pgvector too (the templates are symlinks into pg, so the
   # guard is literally the same code); the removed key must fail rather than be ignored.
@@ -21,7 +21,7 @@ tests:
       repmgr.failoverMode: repmgrd
     asserts:
       - failedTemplate:
-          errorPattern: "repmgr.failoverMode was removed in chart 2.0.0"
+          errorPattern: 'failoverMode \(ha\.failoverMode / repmgr\.failoverMode\) was removed in chart 2\.0\.0'
 
   - it: standalone with replicaCount 0 renders
     set:
@@ -144,3 +144,83 @@ tests:
 
   # The positive (renders fine) cases live in pg's suite and in pg/tests/test-template.sh, for
   # the single-template include reason noted above.
+
+  # #291 review: client-go needs leaseDuration > renewDeadline > retryPeriod, and until 2.0.0
+  # nothing checked it at render time -- so an alias mixture across two values files could
+  # render clean and then CrashLoopBackOff every pod at once.
+  - it: a lease triple that violates the client-go ordering fails fast
+    set:
+      ha.agent.leaseDuration: 15s
+      ha.agent.renewDeadline: 20s
+      ha.agent.retryPeriod: 4s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'leaseDuration > renewDeadline > retryPeriod'
+
+  # Equal is not greater -- the boundary case client-go also rejects.
+  - it: equal leaseDuration and renewDeadline fails fast
+    set:
+      ha.agent.leaseDuration: 10s
+      ha.agent.renewDeadline: 10s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'leaseDuration > renewDeadline > retryPeriod'
+
+  # #291 review: skipping validation on an unparseable duration was the original bug -- Go's
+  # time.ParseDuration rejects a unit-less value, so the agent refuses to start and every pod
+  # CrashLoopBackOffs after a clean render.
+  - it: a leaseDuration with no unit fails fast
+    set:
+      ha.agent.leaseDuration: "15"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # The etcd lease TTL is whole seconds, so config.go imposes a 5s floor the ordering check
+  # alone does not catch.
+  - it: an etcd DCS lease below the 5s floor fails fast
+    set:
+      etcd.enabled: true
+      ha.agent.dcs.backend: etcd
+      ha.agent.leaseDuration: 3s
+      ha.agent.renewDeadline: 2s
+      ha.agent.retryPeriod: 1s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'requires at least 5s'
+
+  # #291 review: Go's duration units are case-SENSITIVE, and a `lower` in the parser used to
+  # let "15S" through -- clean render, then time.ParseDuration fails and every pod dies.
+  - it: an upper-case duration unit fails fast
+    set:
+      ha.agent.leaseDuration: "15S"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # `| default "15s"` validated the default while the StatefulSet emitted the empty string.
+  - it: an explicitly empty duration fails fast
+    set:
+      ha.agent.renewDeadline: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # reconcileInterval is parsed by the same config.Load helper but is not in the ordering check.
+  - it: an unparseable reconcileInterval fails fast
+    set:
+      ha.agent.reconcileInterval: "15"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # The bundled etcd's RBAC-bootstrap Job runs the agent binary, so its image must track
+  # ha.image or one build writes the RBAC another build authenticates against.
+  - it: an etcd bootstrapImage drifting from ha.image fails fast
+    set:
+      etcd.enabled: true
+      ha.agent.dcs.backend: etcd
+      ha.image.tag: 2.0.0-pg18
+    asserts:
+      - failedTemplate:
+          errorPattern: 'must match ha.image'

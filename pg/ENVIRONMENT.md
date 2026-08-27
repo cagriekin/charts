@@ -18,19 +18,19 @@ Required/optional is from the consuming process's perspective at runtime. Secret
 | `POSTGRES_DB` | string | yes | secret (`database`) | entrypoint |
 | `LD_LIBRARY_PATH` | string | no | `/usr/lib/postgresql/<major>/extra-lib` | dynamic linker (`postgresql.extensions.extraLibs`, #309; emitted only when non-empty) |
 
-## repmgr (both failover modes, when `repmgr.enabled=true`)
+## repmgr (both failover modes, when `ha.enabled=true`)
 
 | Variable | Type | Required | Default / source | Consumer |
 |----------|------|----------|------------------|----------|
-| `REPMGR_USER` | string | yes | `repmgr.username` | entrypoint (creates the role), agent (replication auth) |
+| `REPMGR_USER` | string | yes | `ha.username` | entrypoint (creates the role), agent (replication auth) |
 | `REPMGR_PASSWORD` | string | yes | secret (`repmgr-password`) | entrypoint (creates the role), agent (replication auth) |
-| `REPMGR_DB` | string | yes | `repmgr.database` | entrypoint (creates the database), agent (`dbname` in `primary_conninfo`) |
+| `REPMGR_DB` | string | yes | `ha.database` | entrypoint (creates the database), agent (`dbname` in `primary_conninfo`) |
 | `HEADLESS_SERVICE` | string | yes | `<fullname>-headless.<ns>.svc.cluster.local` | agent (peer FQDNs) |
 | `REPMGR_NODE_COUNT` | number | yes | `postgresql.replicaCount + 1` | agent (peer enumeration) |
 | `NAMESPACE` | string | yes | fieldRef `metadata.namespace` | agent |
 | `PRIMARY_MARKER` | string | yes | `<fullname>-primary` | agent (#125 highwater) |
 
-## HA only (`repmgr.enabled=true`)
+## HA only (`ha.enabled=true`)
 
 The lease-based Go agent (`pg-ha-agent`, PID 1 in the postgresql container) reads
 these; `config.Load` fail-fasts at boot if any is missing.
@@ -39,20 +39,20 @@ these; `config.Load` fail-fasts at boot if any is missing.
 |----------|------|----------|------------------|----------|
 | `POD_NAME` | string | yes | fieldRef `metadata.name` (the Lease holder identity) | agent |
 | `LEASE_NAME` | string | yes | `<fullname>-leader` | agent (leadership Lease) |
-| `LEASE_DURATION` | duration | yes | `repmgr.agent.leaseDuration` (15s) | agent (leaderelection) |
-| `RENEW_DEADLINE` | duration | yes | `repmgr.agent.renewDeadline` (10s) | agent |
-| `RETRY_PERIOD` | duration | yes | `repmgr.agent.retryPeriod` (2s) | agent |
-| `RECONCILE_INTERVAL` | duration | yes | `repmgr.agent.reconcileInterval` (5s) | agent (tick) |
+| `LEASE_DURATION` | duration | yes | `ha.agent.leaseDuration` (15s) | agent (leaderelection) |
+| `RENEW_DEADLINE` | duration | yes | `ha.agent.renewDeadline` (10s) | agent |
+| `RETRY_PERIOD` | duration | yes | `ha.agent.retryPeriod` (2s) | agent |
+| `RECONCILE_INTERVAL` | duration | yes | `ha.agent.reconcileInterval` (5s) | agent (tick) |
 | `MASTER_SERVICE` | string | yes | `<fullname>` (write Service whose selector the agent patches) | agent |
 | `POD_SELECTOR` | string | yes | chart selector labels + `component=postgresql` | agent (pg-role labeling) |
-| `DCS_BACKEND` | enum | yes | `repmgr.agent.dcs.backend` (`kubernetes`/`etcd`) | agent (leadership store) |
-| `SPLIT_BRAIN_ACTION` | enum | yes | `repmgr.splitBrainDetection.action` (`log`/`fence`) | agent |
-| `POD_CIDR` | CIDR | yes | `repmgr.agent.podCidr` (`10.0.0.0/8`) | agent (hardened pg_hba: trusted pod network) |
+| `DCS_BACKEND` | enum | yes | `ha.agent.dcs.backend` (`kubernetes`/`etcd`) | agent (leadership store) |
+| `SPLIT_BRAIN_ACTION` | enum | yes | `ha.splitBrainDetection.action` (`log`/`fence`) | agent |
+| `POD_CIDR` | CIDR | yes | `ha.agent.podCidr` (`10.0.0.0/8`) | agent (hardened pg_hba: trusted pod network) |
 | `POSTGRESQL_PGHBA` | newline-list | no | `postgresql.pgHba` (joined) | agent (user pg_hba rules, above the catch-alls) |
-| `CASCADE_REPLICATION` | boolean | no | `repmgr.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
-| `SYNC_REPLICATION_SLOTS` | boolean | no | `repmgr.agent.syncReplicationSlots` (`false`) | agent (logical failover slot sync, #308; emitted only when true) |
+| `CASCADE_REPLICATION` | boolean | no | `ha.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
+| `SYNC_REPLICATION_SLOTS` | boolean | no | `ha.agent.syncReplicationSlots` (`false`) | agent (logical failover slot sync, #308; emitted only when true) |
 | ~~`USE_REPLICATION_SLOTS`~~ | — | — | **removed in 2.0.0 (#290)** | Nothing. It configured the init container's `repmgr standby clone`; the agent owns cloning and always uses a slot |
-| `MECHANISM` | enum | no | `repmgr.agent.mechanism` (`native` only) | agent (HA mechanics, #287). **Always emitted since #294**, not only at a non-default value: `native` is the default, and an agent built before #294 assumes `repmgr` when this is absent, so omitting it would run the removed mechanism during a two-step image-then-chart release. The shell no longer reads it -- the repmgr paths it used to gate are gone (#290). An explicit `repmgr` is rejected at render time |
+| `MECHANISM` | enum | no | `ha.agent.mechanism` (`native` only) | agent (HA mechanics, #287). **Always emitted since #294**, not only at a non-default value: `native` is the default, and an agent built before #294 assumes `repmgr` when this is absent, so omitting it would run the removed mechanism during a two-step image-then-chart release. The shell no longer reads it -- the repmgr paths it used to gate are gone (#290). An explicit `repmgr` is rejected at render time |
 | `PG_MAJOR` | digits | no | image `ENV` from the Dockerfile's `ARG PG_MAJOR` (`18`) | agent (versioned bindir `/usr/lib/postgresql/<major>/bin`, #269) |
 | `PGBACKREST_ENABLED` | boolean | no | `"true"` when `pgbackrest.enabled` | agent (control API backup routes) |
 | `PGBACKREST_STANZA` | string | no | `pgbackrest.stanza` | agent (`pgbackrest info`), archive_command |
@@ -93,7 +93,7 @@ fail-open fast path while the agent refuses to boot. Only the postgresql contain
 involved either way; the `repmgr-init` init container makes no apiserver calls. See the
 chart README section *Routing the agent's apiserver traffic* for the kubeconfig to mount.
 
-### control API only (`repmgr.agent.control.enabled=true`)
+### control API only (`ha.agent.control.enabled=true`)
 
 Emitted only when the control REST API (#276) is on, and validated at boot: enabling it
 without all three TLS files, or restore without an allowlist, is a single fail-fast error
@@ -101,18 +101,18 @@ without all three TLS files, or restore without an allowlist, is a single fail-f
 
 | Variable | Type | Required | Default / source | Consumer |
 |----------|------|----------|------------------|----------|
-| `CONTROL_ENABLED` | boolean | no | `"true"` when `repmgr.agent.control.enabled` | agent (control listener) |
-| `CONTROL_ADDR` | host:port | no | `:<repmgr.agent.control.port>` (`:9201`) | agent (never the 9200 metrics port) |
+| `CONTROL_ENABLED` | boolean | no | `"true"` when `ha.agent.control.enabled` | agent (control listener) |
+| `CONTROL_ADDR` | host:port | no | `:<ha.agent.control.port>` (`:9201`) | agent (never the 9200 metrics port) |
 | `CONTROL_TLS_CERT` | path | yes¹ | `/etc/agent-control-tls/tls.crt` | agent (server identity) |
 | `CONTROL_TLS_KEY` | path | yes¹ | `/etc/agent-control-tls/tls.key` | agent |
 | `CONTROL_TLS_CA` | path | yes¹ | `/etc/agent-control-tls/ca.crt` | agent (verifies CLIENT certificates) |
-| `CONTROL_ALLOWED_CNS` | csv | no | `repmgr.agent.control.allowedClientCNs` | agent (empty = any cert the CA signed) |
-| `CONTROL_RESTORE_ENABLED` | boolean | no | `repmgr.agent.control.restore.enabled` | agent (`POST /v1/restore`) |
-| `CONTROL_RESTORE_ALLOWED_CNS` | csv | yes² | `repmgr.agent.control.restore.allowedClientCNs` | agent (separate authz verb; empty denies everyone) |
+| `CONTROL_ALLOWED_CNS` | csv | no | `ha.agent.control.allowedClientCNs` | agent (empty = any cert the CA signed) |
+| `CONTROL_RESTORE_ENABLED` | boolean | no | `ha.agent.control.restore.enabled` | agent (`POST /v1/restore`) |
+| `CONTROL_RESTORE_ALLOWED_CNS` | csv | yes² | `ha.agent.control.restore.allowedClientCNs` | agent (separate authz verb; empty denies everyone) |
 | `CONTROL_RESTORE_CRONJOB` | string | yes² | `<fullname>-pgbackrest-restore` | agent (the jobTemplate it clones) |
 | `CONTROL_RESTORE_JOB_NAME` | string | yes² | `<fullname>-pgbackrest-restore-api` | agent (deterministic, so RBAC get/delete can be resourceName-scoped) |
 | `CONTROL_RESTORE_POD_ORDINAL` | integer | yes² | `pgbackrest.restore.podOrdinal` | agent (confirm-only: the request may echo it, never change it) |
-| `CONTROL_RESTORE_READ_POD_LOGS` | boolean | no | `repmgr.agent.control.restore.readPodLogs` (`false`) | agent (live copy progress; adds namespace-wide `get pods/log`) |
+| `CONTROL_RESTORE_READ_POD_LOGS` | boolean | no | `ha.agent.control.restore.readPodLogs` (`false`) | agent (live copy progress; adds namespace-wide `get pods/log`) |
 
 ¹ Required when `CONTROL_ENABLED` — mTLS is the only authentication mode, so the agent
 refuses to boot rather than open an unauthenticated mutating port.
@@ -141,7 +141,7 @@ Two runtime behaviours worth knowing before an incident:
   cluster can be serving with no control surface, so alert on
   `pg_ha_agent_control_requests_total` going flat if you automate against the API.
 
-### etcd backend only (`repmgr.agent.dcs.backend=etcd`)
+### etcd backend only (`ha.agent.dcs.backend=etcd`)
 
 Required only when the leadership store is etcd; `config.Load` fail-fasts on a
 missing endpoint/prefix in that mode. With the bundled etcd subchart
@@ -149,8 +149,8 @@ missing endpoint/prefix in that mode. With the bundled etcd subchart
 
 | Variable | Type | Required | Default / source | Consumer |
 |----------|------|----------|------------------|----------|
-| `ETCD_ENDPOINTS` | csv | yes (etcd) | `repmgr.agent.dcs.etcd.endpoints`, or the bundled `<release>-etcd:2379` | agent (etcd client) |
-| `ETCD_PREFIX` | string | yes (etcd) | `repmgr.agent.dcs.etcd.prefix` or `/pg-ha/<release>/` | agent (election key prefix) |
+| `ETCD_ENDPOINTS` | csv | yes (etcd) | `ha.agent.dcs.etcd.endpoints`, or the bundled `<release>-etcd:2379` | agent (etcd client) |
+| `ETCD_PREFIX` | string | yes (etcd) | `ha.agent.dcs.etcd.prefix` or `/pg-ha/<release>/` | agent (election key prefix) |
 | `ETCD_TLS_CERT` | path | no | `/etc/etcd-tls/tls.crt` when `dcs.etcd.tls.secretName` set | agent (mutual TLS) |
 | `ETCD_TLS_KEY` | path | no | `/etc/etcd-tls/tls.key` when `dcs.etcd.tls.secretName` set | agent (mutual TLS) |
 | `ETCD_TLS_CA` | path | no | `/etc/etcd-tls/ca.crt` when `dcs.etcd.tls.secretName` set | agent (mutual TLS) |
@@ -174,7 +174,7 @@ these variables. Nothing injects or reads them any more:
 `MASTER_SERVICE` survives and is consumed by the agent (see the HA table above).
 `SPLIT_BRAIN_ACTION` is still injected and validated, but **no code reads it**: the behaviour
 its two values used to select lived in the service-updater's `handle_split_brain()`, and the
-agent demotes on lease loss unconditionally. See `repmgr.splitBrainDetection` in values.yaml.
+agent demotes on lease loss unconditionally. See `ha.splitBrainDetection` in values.yaml.
 
 ## pgbackrest (when `pgbackrest.enabled=true`)
 
