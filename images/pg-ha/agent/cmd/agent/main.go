@@ -1916,7 +1916,7 @@ const repmgrPreloadLib = "repmgr"
 // #294 added this as a REFUSAL, because there was no migration to offer; #292 makes it act.
 //
 // This guards the one upgrade path 2.0.0 otherwise fails SILENTLY: a cluster created by a 1.x
-// release. 1.x had no `repmgr.agent.mechanism`, so nothing in the chart can detect it --
+// release. 1.x had no `ha.agent.mechanism`, so nothing in the chart can detect it --
 // pg.validateRemovedRepmgrdValues sees no stale key, MECHANISM: "native" renders clean, and the
 // release installs. But repmgr already wrote primary_conninfo and
 // primary_slot_name = repmgr_slot_<node_id> into every standby's auto.conf; PostgreSQL reads
@@ -2118,16 +2118,15 @@ func (a *agent) assertPreloadedLibsPresent() error {
 			return fmt.Errorf("check shared_preload_libraries: %w", err)
 		}
 		if requested {
-			// The remediation is mechanism-specific, and getting it wrong here is actively
-			// harmful (#293 review). Telling a repmgr-MECHANISM node to drop the library is
-			// the one thing pg.sharedPreloadLibraries exists to prevent: it starts the
-			// postmaster without the repmgr extension's functions and silently disables
-			// failover. Such a node needs a different image or a different mechanism, not a
-			// shorter preload list.
+			// #293 review made this remediation mechanism-specific, because telling a
+			// repmgr-MECHANISM node to drop the library would have started the postmaster
+			// without the repmgr extension's functions and silently disabled failover.
+			// That branch is gone rather than renamed: #294 made MECHANISM=repmgr a hard
+			// config.Load error, so a non-native mechanism can never reach this code -- the
+			// agent exits before it is constructed. Dropping the library is now the only
+			// correct advice, and a stale conditional here would be untested advice that
+			// merely looks careful.
 			fix := fmt.Sprintf("remove %q from shared_preload_libraries (in postgresql.configuration if the chart put it there, or from %s directly), then restart the pod", repmgrPreloadLib, p)
-			if a.cfg.Mechanism != config.MechanismNative {
-				fix = fmt.Sprintf("this node runs MECHANISM=%s, which still drives the repmgr CLI, so do NOT just drop the library -- move it to repmgr.agent.mechanism: native, or run an image that ships %s", a.cfg.Mechanism, soPath)
-			}
 			return fmt.Errorf("refusing to start: %s sets shared_preload_libraries to include %q, but this image does not ship %s. "+
 				"This is the #293 migration step: the line was written into the DATA DIRECTORY at initdb time by an older image, so it survives a chart downgrade and a helm rollback. "+
 				"Fix: %s -- shared_preload_libraries is a postmaster parameter",

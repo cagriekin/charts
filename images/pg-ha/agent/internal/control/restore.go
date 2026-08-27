@@ -37,7 +37,7 @@ func (s *Server) featureGate(next http.HandlerFunc) http.HandlerFunc {
 		}
 		if !s.o.Backups.RestoreEnabled() {
 			refuse("restore triggering is not enabled",
-				"set repmgr.agent.control.restore.enabled=true (it is a separate opt-in from the control API: it grants the pods Job-creation RBAC)",
+				"set ha.agent.control.restore.enabled=true (it is a separate opt-in from the control API: it grants the pods Job-creation RBAC)",
 				"restore triggering disabled")
 			return
 		}
