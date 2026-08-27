@@ -35,7 +35,7 @@ var preloadAssignRe = regexp.MustCompile(`(?i)^([ \t]*)` + preloadGUC + `(?:[ \t
 // apply instead of pinning it.
 //
 // This exists because `shared_preload_libraries = 'repmgr'` is persisted INSIDE the data
-// directory -- images/repmgr/entrypoint.sh appends it at initdb time, and every standby
+// directory -- images/pg-ha/entrypoint.sh appends it at initdb time, and every standby
 // clones it verbatim -- so it survives any chart change and any helm rollback (#293). Once
 // the repmgr package leaves the image (#290) a data directory still asking for repmgr.so
 // is a postmaster that will not start, on every pod simultaneously. Removing it has to

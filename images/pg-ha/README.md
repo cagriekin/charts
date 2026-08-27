@@ -1,8 +1,8 @@
 # PostgreSQL Repmgr Docker Image
 
-> Consolidated into this monorepo at `images/repmgr/` on 2026-06-15 (formerly the standalone
+> Consolidated into this monorepo at `images/pg-ha/` on 2026-06-15 (formerly the standalone
 > `repmgr-docker` repository, retained as the historical archive). Published from here via
-> `.github/workflows/repmgr-image-publish.yaml` on `trixie-*` tags; the pg/pgvector chart CI
+> `.github/workflows/pg-ha-image-publish.yaml` on `trixie-*` tags; the pg/pgvector chart CI
 > builds the image from this source (`pg-test.yaml`) rather than pulling it.
 
 PostgreSQL with pgBackRest, pgaudit, cron and the Go HA agent, on Debian Trixie. Designed for Kubernetes StatefulSet deployments with automatic failover and WAL-based incremental backups.
@@ -14,11 +14,19 @@ PostgreSQL with pgBackRest, pgaudit, cron and the Go HA agent, on Debian Trixie.
 The major is a **build argument**, defaulting to 18, and one build ships exactly one major (`postgresql-<major>` and `-pgaudit` from PGDG). Supported: **18** (default) and **17**.
 
 ```bash
-docker build -t cagriekin/repmgr:trixie-5.5.0-31 .                       # PostgreSQL 18
-docker build --build-arg PG_MAJOR=17 -t cagriekin/repmgr:trixie-5.5.0-31-pg17 .
+docker build -t cagriekin/pg-ha:trixie-pg18-1 .                        # PostgreSQL 18
+docker build --build-arg PG_MAJOR=17 -t cagriekin/pg-ha:trixie-pg17-1 .
 ```
 
-Published tags per release: `trixie-<repmgr>-<n>` (the **default** major, 18), plus `-pg18` and `-pg17`. The unsuffixed tag is what chart pins resolve to, so `ARG PG_MAJOR`'s default and the publish workflow's `default_major` must stay in step — `test/scripts-test.sh` asserts the `ARG` default is 18 for exactly that reason.
+Published tags per release: `cagriekin/pg-ha:trixie-pg18-<n>` and `cagriekin/pg-ha:trixie-pg17-<n>`, from a single git tag `pg-ha-<n>` (#290).
+
+The scheme changed with the repmgr removal. It was `trixie-<repmgr-version>-<n>` under
+`cagriekin/repmgr`, keyed on a package this image no longer contains -- so a published tag
+advertised a version that was not in it. It is now keyed on the PostgreSQL major, which is what
+one build actually bundles, and that major is **in** the tag rather than in an optional suffix.
+There is no unsuffixed "default major" alias any more: a pin has to say which major it wants,
+and the chart's own `majorVersion` guard cross-checks it. `cagriekin/repmgr` stays published and
+frozen at its last tag -- nothing is retagged or deleted, because consumers pin those by digest.
 
 At runtime the major is exported as `ENV PG_MAJOR`, which is how the shell layer (`pg-common.sh` derives `PG_BINDIR` from it) and the Go agent (`config.PGMajor` → `PGBindir()`) find the versioned `/usr/lib/postgresql/<major>/bin`. Nothing hardcodes a major; the agent refuses to start if the bindir its `PG_MAJOR` implies holds no `postgres` binary.
 
@@ -27,7 +35,7 @@ The build **fails** if any per-major package has no installation candidate (chec
 Both majors are verified by `test/image-smoke.sh <image-ref> <major>`, which starts the built image and asserts the server version, that `pgaudit` actually loads via `shared_preload_libraries`, that the `postgres` uid/gid are the 101:103 the chart chowns PGDATA to, and that repmgr is genuinely **absent** (binary, `repmgr.so`, OS user and directories):
 
 ```bash
-bash test/image-smoke.sh cagriekin/repmgr:trixie-5.5.0-31-pg17 17
+bash test/image-smoke.sh cagriekin/pg-ha:trixie-pg17-1 17
 ```
 
 ## Execution Modes
@@ -148,8 +156,8 @@ pgBackRest configuration (`/etc/pgbackrest/pgbackrest.conf`) and S3 credentials 
 ## Building
 
 ```bash
-docker build -t cagriekin/repmgr:trixie-5.5.0-31 .                       # PostgreSQL 18 (default)
-docker build --build-arg PG_MAJOR=17 -t cagriekin/repmgr:trixie-5.5.0-31-pg17 .
+docker build -t cagriekin/pg-ha:trixie-pg18-1 .                        # PostgreSQL 18
+docker build --build-arg PG_MAJOR=17 -t cagriekin/pg-ha:trixie-pg17-1 .
 ```
 
 ## Compatibility

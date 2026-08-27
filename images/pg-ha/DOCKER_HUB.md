@@ -6,7 +6,7 @@ High-availability PostgreSQL image with automatic failover for Kubernetes Statef
 
 ## Quick Reference
 
-- **Source**: [GitHub](https://github.com/cagriekin/charts/tree/master/images/repmgr)
+- **Source**: [GitHub](https://github.com/cagriekin/charts/tree/master/images/pg-ha)
 - **Base image**: `debian:trixie-slim`
 - **PostgreSQL**: 18 (default) or 17 — one major per tag, see [Tags](#tags)
 - **pgaudit**: bundled (`postgresql-<major>-pgaudit`; opt-in audit logging)
@@ -26,7 +26,7 @@ Each release publishes one multi-arch (amd64/arm64) manifest per PostgreSQL majo
 A container announces its own major as `PG_MAJOR`, and the server binaries live in `/usr/lib/postgresql/$PG_MAJOR/bin`:
 
 ```bash
-docker run --rm cagriekin/repmgr:trixie-5.5.0-31-pg17 printenv PG_MAJOR   # -> 17
+docker run --rm cagriekin/pg-ha:trixie-pg17-1 printenv PG_MAJOR   # -> 17
 ```
 
 **The major is fixed at build time and cannot be changed for an existing data directory** — a PostgreSQL 18 server refuses to start on a PG17 `PGDATA`. Choose the major when you create the cluster.

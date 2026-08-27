@@ -8,8 +8,8 @@
 # succeed, ship a working PG17 server, and still be unusable because a per-major
 # package resolved to a different version than the tag advertises.
 #
-# Usage: bash images/repmgr/test/image-smoke.sh <image-ref> <expected-pg-major>
-#   bash images/repmgr/test/image-smoke.sh cagriekin/repmgr:trixie-5.5.0-31-pg17 17
+# Usage: bash images/pg-ha/test/image-smoke.sh <image-ref> <expected-pg-major>
+#   bash images/pg-ha/test/image-smoke.sh cagriekin/pg-ha:trixie-pg17-1 17
 set -uo pipefail
 
 IMAGE="${1:?usage: image-smoke.sh <image-ref> <expected-pg-major>}"
@@ -18,7 +18,7 @@ WANT_MAJOR="${2:?usage: image-smoke.sh <image-ref> <expected-pg-major>}"
 # The repmgr version this used to derive from the tag is gone with the package (#290): there
 # is no repmgr to hold to a version.
 #
-# The TAG SCHEME itself has not changed yet -- repmgr-image-publish.yaml still requires
+# The TAG SCHEME itself has not changed yet -- pg-ha-image-publish.yaml still requires
 # trixie-<semver>-<n>, so a published tag still advertises a repmgr version the image no
 # longer contains. Retiring that (and the repo rename to cagriekin/pg-ha) is the remaining
 # half of #290; this file simply stopped asserting a version it cannot check.

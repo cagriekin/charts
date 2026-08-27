@@ -1,15 +1,15 @@
-name: Build and publish repmgr image
+name: Build and publish pg-ha image
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Base image tag (e.g., trixie-5.5.0-29). Published as <tag> (default major) plus <tag>-pg18 / <tag>-pg17'
+        description: 'Release tag (e.g., pg-ha-1). Published as trixie-pg18-<n> and trixie-pg17-<n>'
         required: true
         type: string
   push:
     tags:
-      - 'trixie-*'
+      - 'pg-ha-*'
 
 permissions:
   contents: read
@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   # Gate the publish on the same tests the PR/master workflow runs, because a
-  # `trixie-*` tag push does NOT trigger repmgr-image-test.yaml -- without this an
+  # `trixie-*` tag push does NOT trigger pg-ha-image-test.yaml -- without this an
   # untested image could be built, signed, and pushed.
   test:
     runs-on: ubuntu-latest
@@ -26,7 +26,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Run script tests
-        run: bash images/repmgr/test/scripts-test.sh
+        run: bash images/pg-ha/test/scripts-test.sh
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -34,7 +34,7 @@ jobs:
           go-version: '1.25.13'
 
       - name: vet + test + verify + hermetic build + govulncheck
-        working-directory: images/repmgr/agent
+        working-directory: images/pg-ha/agent
         run: |
           go vet ./...
           go test ./...
@@ -54,8 +54,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { pg_major: "18", default_major: "true" }
-          - { pg_major: "17", default_major: "false" }
+          # No default_major any more (#290): with the major in the tag there is no
+          # unsuffixed alias for one of them to own.
+          - { pg_major: "18" }
+          - { pg_major: "17" }
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -71,7 +73,6 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
           PG_MAJOR: ${{ matrix.pg_major }}
-          DEFAULT_MAJOR: ${{ matrix.default_major }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -83,36 +84,29 @@ jobs:
             echo "Could not resolve an image tag" >&2
             exit 1
           fi
-          # Only the exact shape the tag scheme allows, ANCHORED at both ends. A glob cannot
-          # express that ("trixie-*-[0-9]*" still matches trixie-5.5.0-30-pg17 via the
-          # trailing wildcard), and both rejections matter: a major-suffixed base tag would
-          # publish the PostgreSQL 18 build as ...-pg17 -- a signed image whose name states
-          # the wrong major, which the chart's tag guard would then trust -- and shell
-          # metacharacters must never reach a later step in a job that holds id-token: write.
-          if [[ ! "$tag" =~ ^trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]; then
-            echo "Refusing to publish from '${tag}': expected an UNSUFFIXED trixie-<repmgr-version>-<n>, e.g. trixie-5.5.0-30 (each leg appends its own -pgNN)" >&2
+          # #290: the tag scheme is `pg-ha-<n>` in git, published as trixie-pg<major>-<n>.
+          #
+          # It was trixie-<repmgr-version>-<n>, keyed on a package this image no longer
+          # contains -- so every published tag advertised a repmgr version that was not in it.
+          # The new scheme is keyed on the PostgreSQL major, which is the thing one build
+          # actually bundles, and it puts that major IN the tag rather than in an optional
+          # suffix. That deletes a whole class of hazard the old guards existed for: there is
+          # no unsuffixed "default major" tag, so no tag can state the wrong major and no
+          # chart pin can silently resolve to a major it did not ask for.
+          #
+          # Anchored at both ends, and a glob cannot express it, so this stays a regex. Shell
+          # metacharacters must never reach a later step in a job holding id-token: write.
+          if [[ ! "$tag" =~ ^pg-ha-[0-9]+$ ]]; then
+            echo "Refusing to publish from '${tag}': expected pg-ha-<n>, e.g. pg-ha-1. Each leg publishes trixie-pg<major>-<n> from it." >&2
             exit 1
           fi
-          # The base tag must NOT carry a major suffix: the suffix is appended per matrix
-          # leg, so `trixie-5.5.0-30-pg17` would publish the PostgreSQL 18 build as
-          # ...-pg17 (and the 17 build as ...-pg17-pg17) -- a signed image whose name
-          # states the wrong major, which the chart's tag guard would then trust.
-          case "$tag" in
-            *-pg[0-9]*)
-              echo "Refusing to publish from ${tag}: pass the UNSUFFIXED base tag (e.g. trixie-5.5.0-30); each leg appends its own -pgNN" >&2
-              exit 1
-              ;;
-          esac
+          n="${tag#pg-ha-}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          # Tag list for this major. The default major additionally publishes the
-          # UNSUFFIXED tag -- that is the contract every existing chart pin relies on,
-          # and it is why Dockerfile's ARG PG_MAJOR default must stay in step with
-          # default_major here.
-          tags="cagriekin/repmgr:${tag}-pg${PG_MAJOR}"
-          if [ "$DEFAULT_MAJOR" = "true" ]; then
-            tags="cagriekin/repmgr:${tag},${tags}"
-          fi
+          # ONE tag per leg, naming its own major. No unsuffixed alias: a pin must say which
+          # major it wants, and the chart's own majorVersion guard then cross-checks it.
+          tags="cagriekin/pg-ha:trixie-pg${PG_MAJOR}-${n}"
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "n=${n}" >> "$GITHUB_OUTPUT"
           echo "Publishing PG${PG_MAJOR} as: ${tags}"
 
       - name: Set up QEMU
@@ -128,7 +122,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # Build this major for amd64 and START it before anything is pushed: a tag push does
-      # not run repmgr-image-test.yaml, so without this a per-major regression (a missing
+      # not run pg-ha-image-test.yaml, so without this a per-major regression (a missing
       # postgresql-<major>-pgaudit, a bindir the scripts cannot find) could be published and
       # signed. Deliberately inside the publish leg, not a separate job: as its own job it
       # gated BOTH legs, so a PG17-only failure would withhold the unsuffixed default-major
@@ -140,21 +134,21 @@ jobs:
           PG_MAJOR: ${{ matrix.pg_major }}
         run: |
           set -euo pipefail
-          ref="cagriekin/repmgr:${TAG}-pg${PG_MAJOR}"
+          ref="cagriekin/pg-ha:trixie-pg${PG_MAJOR}-${TAG#pg-ha-}"
           docker buildx build --load \
             --build-arg "PG_MAJOR=${PG_MAJOR}" \
-            --cache-from "type=gha,scope=repmgr-publish-pg${PG_MAJOR}" \
-            --cache-to "type=gha,mode=max,scope=repmgr-publish-pg${PG_MAJOR}" \
-            -t "$ref" images/repmgr
-          # Named with the real tag so image-smoke.sh derives the repmgr version the tag
-          # advertises and holds the artifact to it.
-          bash images/repmgr/test/image-smoke.sh "$ref" "$PG_MAJOR"
+            --cache-from "type=gha,scope=pg-ha-publish-pg${PG_MAJOR}" \
+            --cache-to "type=gha,mode=max,scope=pg-ha-publish-pg${PG_MAJOR}" \
+            -t "$ref" images/pg-ha
+          # Named with the real tag so image-smoke.sh checks the artifact under the name it
+          # will be published as.
+          bash images/pg-ha/test/image-smoke.sh "$ref" "$PG_MAJOR"
 
       - name: Build and push Docker image
         id: build
         uses: docker/build-push-action@v7
         with:
-          context: images/repmgr
+          context: images/pg-ha
           push: true
           platforms: linux/amd64,linux/arm64
           build-args: |
@@ -164,8 +158,8 @@ jobs:
           provenance: mode=max
           # Per-major cache scope: the two majors share only the layers above the apt
           # install, so one scope would evict the other on every run.
-          cache-from: type=gha,scope=repmgr-publish-pg${{ matrix.pg_major }}
-          cache-to: type=gha,mode=max,scope=repmgr-publish-pg${{ matrix.pg_major }}
+          cache-from: type=gha,scope=pg-ha-publish-pg${{ matrix.pg_major }}
+          cache-to: type=gha,mode=max,scope=pg-ha-publish-pg${{ matrix.pg_major }}
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
@@ -175,4 +169,4 @@ jobs:
       - name: Sign the image (keyless, OIDC)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "cagriekin/repmgr@${DIGEST}"
+        run: cosign sign --yes "cagriekin/pg-ha@${DIGEST}"

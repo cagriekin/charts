@@ -2000,7 +2000,7 @@ func (a *agent) preflightPreload() error {
 // dropRepmgrPreload removes `shared_preload_libraries = 'repmgr'` from PGDATA under the
 // native mechanism (#293).
 //
-// The line is written INTO THE DATA DIRECTORY by images/repmgr/entrypoint.sh at initdb
+// The line is written INTO THE DATA DIRECTORY by images/pg-ha/entrypoint.sh at initdb
 // time and cloned verbatim to every standby, so it outlives any chart change and any helm
 // rollback -- the fix has to come from inside the running node. Once the repmgr package
 // leaves the image (#290) a data directory still requesting repmgr.so is not a degraded

@@ -394,7 +394,7 @@ spec:
           # this image's normal extension directories and the unmodified cp then
           # picks up both the repmgr image's original extensions and anything just
           # installed. The repmgr image configures the PGDG apt repo at build time
-          # (images/repmgr/Dockerfile), so this is the reliable install path in
+          # (images/pg-ha/Dockerfile), so this is the reliable install path in
           # repmgr mode.
           #
           # Pin postgresql-{{ $pgMajor }} to whatever's already installed before naming any

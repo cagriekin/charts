@@ -23,7 +23,7 @@ FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a
 # binaries from THIS image, so this arg -- not postgresql.image -- decides the cluster's
 # major. The default MUST stay 18: the unsuffixed published tag is built without a
 # --build-arg and every existing chart pin resolves to it. Explicit per-major tags
-# (<tag>-pg17 / <tag>-pg18) are published alongside it; see images/repmgr/README.md.
+# (<tag>-pg17 / <tag>-pg18) are published alongside it; see images/pg-ha/README.md.
 ARG PG_MAJOR=18
 
 # Install system dependencies. `apt-get upgrade` first so the digest-pinned base

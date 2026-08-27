@@ -2822,7 +2822,7 @@ assert_contains "#269: PG17 extension share path" "${pg17_ext}" "/usr/share/post
 assert_not_contains "#269: no PG18 paths remain under a PG17 selection" "${pg17_ext}" "postgresql/18/"
 
 # audit.enabled=true on PG17 must preload pgaudit exactly as on 18 -- the image asserts
-# postgresql-17-pgaudit at build time (see images/repmgr/Dockerfile), so the chart side
+# postgresql-17-pgaudit at build time (see images/pg-ha/Dockerfile), so the chart side
 # must not gate the preload on a major.
 pg17_audit=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.audit.enabled=true \

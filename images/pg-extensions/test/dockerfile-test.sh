@@ -13,7 +13,7 @@ bad() { echo "FAIL: $1"; fail=1; }
 
 [ -f "${DF}" ] || { echo "FAIL: no Dockerfile at ${DF}"; exit 1; }
 
-# --- the base is digest-pinned, like images/repmgr/Dockerfile ---
+# --- the base is digest-pinned, like images/pg-ha/Dockerfile ---
 # A floating debian:trixie-slim would let the C runtime under the extension .so files move
 # without anything in this repo changing -- the exact ABI drift #302 is about, except here
 # it would arrive via a rebuild rather than a chart change.
@@ -23,7 +23,7 @@ else
   bad "#320: base image is not digest-pinned (FROM debian:trixie-slim@sha256:...)"
 fi
 
-# --- ARG PG_MAJOR default matches images/repmgr/Dockerfile ---
+# --- ARG PG_MAJOR default matches images/pg-ha/Dockerfile ---
 # The two images are copied into the SAME ext-lib/ext-share volumes. If their majors can
 # differ by default, a build that omits --build-arg produces extensions for a major the
 # server never runs, and PostgreSQL rejects the .so at CREATE EXTENSION time -- long after

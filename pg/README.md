@@ -611,7 +611,7 @@ The agent also fronts the read/write split: `pgpool` (if enabled) points at the 
 
 ### Replication Mechanics (EXPERIMENTAL, #287)
 
-repmgr ([upstream development has stalled](https://github.com/EnterpriseDB/repmgr)) is the agent's only supported replication mechanic today, but the `Mechanism` interface it is driven through (`images/repmgr/agent/internal/mechanism`) is swappable, and the reconcile loop imports only that interface — never repmgr directly. `repmgr.agent.mechanism: native` selects an alternative that drives PostgreSQL's own tools instead: `pg_ctl promote`, `pg_basebackup`, `pg_rewind`, and `primary_conninfo`/`standby.signal` written directly into an agent-owned config fragment inside `PGDATA`.
+repmgr ([upstream development has stalled](https://github.com/EnterpriseDB/repmgr)) is the agent's only supported replication mechanic today, but the `Mechanism` interface it is driven through (`images/pg-ha/agent/internal/mechanism`) is swappable, and the reconcile loop imports only that interface — never repmgr directly. `repmgr.agent.mechanism: native` selects an alternative that drives PostgreSQL's own tools instead: `pg_ctl promote`, `pg_basebackup`, `pg_rewind`, and `primary_conninfo`/`standby.signal` written directly into an agent-owned config fragment inside `PGDATA`.
 
 **`native` runs a real multi-node cluster as of #288, and is still EXPERIMENTAL — do not set it in production.** The Lease, the timeline/LSN election, fencing, and Service routing are unchanged and identical either way; that is the entire point of the `Mechanism` seam.
 

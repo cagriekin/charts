@@ -12,7 +12,7 @@ import (
 // pin, so every test below asserts it survives verbatim.
 const initdbStockPreload = "#shared_preload_libraries = ''\t# (change requires restart)"
 
-// entrypointPreload is what images/repmgr/entrypoint.sh appends at initdb time -- the
+// entrypointPreload is what images/pg-ha/entrypoint.sh appends at initdb time -- the
 // exact line #293 exists to remove.
 const entrypointPreload = "shared_preload_libraries = 'repmgr'"
 
