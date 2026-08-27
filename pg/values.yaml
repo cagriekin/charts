@@ -488,7 +488,22 @@ postgresql:
       # postgresql.initdbScripts instead of here.
       additionalCommands: ""
 
-repmgr:
+# ==========================================================================================
+# ha.*  --  everything HA: the failover agent, the image it runs in, replication identity.
+#
+# RENAMED from repmgr.* in 2.0.0 (#291). The old namespace named a component this chart no
+# longer installs -- the agent replaced repmgr, and the image no longer contains it.
+#
+# `repmgr.*` STILL WORKS. It is a deprecated alias for one major cycle: every key below is
+# merged key-by-key with anything you set under `repmgr:`, with `ha:` winning, so an existing
+# values file keeps working unchanged and you can move one key at a time. That is what makes
+# this rename additive rather than a break; dropping the aliases is the break, and it belongs
+# to the major that also removes the last of the repmgr scaffolding.
+#
+# Two keys that were REMOVED rather than renamed -- failoverMode and serviceUpdater.* -- are
+# rejected at render time with a message naming the fix, not silently ignored.
+# ==========================================================================================
+ha:
   image:
     repository: cagriekin/repmgr
     tag: trixie-5.5.0-33
@@ -505,10 +520,10 @@ repmgr:
     # tag together when moving to a repmgr image built for a new PG major.
     #
     # The image is published per major (#269), and since #290 the major is IN the tag:
-    # cagriekin/pg-ha:trixie-pg18-<n> and :trixie-pg17-<n>. There is no unsuffixed
+    # cagriekin/pg-ha:<version>-pg18 and :<version>-pg17. There is no unsuffixed
     # "default major" alias any more -- a pin has to name the major it wants, and this
     # value cross-checks it at render time. To run PostgreSQL 17, set BOTH majorVersion
-    # values to "17" and the tag to a trixie-pg17-<n> -- see pg/README.md "Choosing the
+    # values to "17" and the tag to a <version>-pg17 tag -- see pg/README.md "Choosing the
     # PostgreSQL major".
     #
     # The pin above is still the OLD cagriekin/repmgr scheme: the chart moves to pg-ha

@@ -44,12 +44,16 @@ BASE_TAG=$(awk '/^repmgr:/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}'
 #
 #   NEW (#290):  trixie-pg<major>-<n>   -- the major is IN the tag; substitute it
 #   OLD:         trixie-<repmgr>-<n>    -- unsuffixed meant the default major; append -pgNN
-# Pattern shared verbatim with .github/workflows/pg-test.yaml -- they must agree, or a pin one
-# classifies as new-scheme and the other as legacy silently runs the wrong major (#290 review).
+# The new-scheme shape is `<chart-version>-pg<major>` (e.g. 2.0.0-pg18). Keyed on a LEADING
+# semver, which is what separates it from the old `trixie-<repmgr>-<n>[-pgNN]` -- both end in
+# -pg<digits>, so a trailing-suffix test would misclassify the legacy suffixed form. This
+# pattern is shared verbatim between .github/workflows/pg-test.yaml and
+# pg/tests/set-pg-major.sh: if they disagree, CI builds one major under the other's name and
+# every leg of the mismatched major passes while running the wrong server.
 case "$BASE_TAG" in
-  *pg[0-9]*-[0-9]*)
-    # New scheme: rewrite whichever major it names to the requested one.
-    REPMGR_TAG=$(printf '%s' "$BASE_TAG" | sed -E "s/(^|-)pg[0-9]+-/\1pg${MAJOR}-/")
+  [0-9]*.[0-9]*.[0-9]*-pg[0-9]*)
+    # New scheme: rewrite the trailing major to the requested one.
+    REPMGR_TAG=$(printf '%s' "$BASE_TAG" | sed -E "s/-pg[0-9]+$/-pg${MAJOR}/")
     ;;
   *)
     BASE_TAG="${BASE_TAG%-pg[0-9]*}"   # tolerate a tree already switched to another major

@@ -1,3 +1,4 @@
+{{- include "pg.normalizeValues" . -}}
 {{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
 apiVersion: v1
 kind: ConfigMap
@@ -114,7 +115,7 @@ data:
     pgaudit.role = '{{ .Values.postgresql.audit.role | toString | replace "'" "''" }}'
 {{- end }}
 {{- end }}
-{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
+{{- if and (eq (include "pg.agentMode" .) "true") .Values.ha.agent.syncReplicationSlots }}
   # Logical failover slot sync (#308), PostgreSQL 17+. sync_replication_slots is a plain
   # boolean, not topology-dependent (unlike synchronized_standby_slots below, which the
   # agent reconciles per-tick on the primary via ALTER SYSTEM as the standby set changes),

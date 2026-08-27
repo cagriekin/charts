@@ -1,3 +1,4 @@
+{{- include "pg.normalizeValues" . -}}
 {{- if .Values.pgpool.enabled }}
 apiVersion: v1
 kind: ConfigMap
@@ -47,7 +48,7 @@ data:
     backend_flag1 = 'DISALLOW_TO_FAILOVER'
     backend_application_name1 = 'readonly'
 {{- end }}
-{{- else if .Values.repmgr.enabled }}
+{{- else if .Values.ha.enabled }}
     {{- range $i := until (int (add .Values.postgresql.replicaCount 1)) }}
     backend_hostname{{ $i }} = '{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local'
     backend_port{{ $i }} = 5432
@@ -123,7 +124,7 @@ data:
 
     backend_clustering_mode = 'streaming_replication'
 
-{{- if .Values.repmgr.enabled }}
+{{- if .Values.ha.enabled }}
     sr_check_period = 10
     detach_false_primary = off
 {{- else }}

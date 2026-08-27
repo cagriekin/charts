@@ -1,3 +1,4 @@
+{{- include "pg.normalizeValues" . -}}
 {{- include "pg.validateResourceNames" . }}
 {{- include "pg.validateAudit" . }}
 {{- include "pg.validateExtraPassthrough" . }}
@@ -16,7 +17,7 @@
 {{- include "pg.validateSyncReplicationSlotsWalLevel" . }}
 {{- include "pg.validateNativePreloadRepmgr" . }}
 {{- include "pg.validateRemovedRepmgrdValues" . }}
-{{- if and (not .Values.repmgr.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
+{{- if and (not .Values.ha.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
 {{- fail "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr" }}
 {{- end }}
 {{- /* Client TLS validation (#110) */}}
@@ -60,7 +61,7 @@
        an unauthenticated mutating port), and discovering that from a CrashLoopBackOff
        is a much worse experience than a failed `helm upgrade`. Mirrors the
        postgresql.tls.existingSecret guard above. */}}
-{{- $control := .Values.repmgr.agent.control }}
+{{- $control := .Values.ha.agent.control }}
 {{- if $control.enabled }}
 {{- if ne (include "pg.agentMode" .) "true" }}
 {{- fail "repmgr.agent.control.enabled requires repmgr.enabled=true: the control API is served by the Go agent, and standalone mode runs no agent." }}
@@ -104,10 +105,10 @@
 {{- if and $control.restore.readPodLogs (not $control.restore.enabled) }}
 {{- fail "repmgr.agent.control.restore.readPodLogs requires repmgr.agent.control.restore.enabled (it only affects reading a restore Job's log)" }}
 {{- end }}
-{{- if .Values.repmgr.enabled }}
-{{- $repmgrMajor := required "repmgr.image.majorVersion is required (the PostgreSQL major bundled in the repmgr image)" .Values.repmgr.image.majorVersion }}
+{{- if .Values.ha.enabled }}
+{{- $repmgrMajor := required "repmgr.image.majorVersion is required (the PostgreSQL major bundled in the repmgr image)" .Values.ha.image.majorVersion }}
 {{- if ne (toString .Values.postgresql.majorVersion) (toString $repmgrMajor) }}
-{{- fail (printf "postgresql.majorVersion=%q does not match repmgr.image.majorVersion=%q. In repmgr mode the PostgreSQL server runs from the repmgr image (%s), which bundles only PostgreSQL %s and always runs that server regardless of postgresql.image; a mismatch crash-loops the extension init container or silently runs the wrong major. Set postgresql.majorVersion=%q (with a matching postgresql.image), or point repmgr.image at an image built for PostgreSQL %s and set repmgr.image.majorVersion to match" (toString .Values.postgresql.majorVersion) (toString $repmgrMajor) .Values.repmgr.image.repository (toString $repmgrMajor) (toString $repmgrMajor) (toString .Values.postgresql.majorVersion)) }}
+{{- fail (printf "postgresql.majorVersion=%q does not match repmgr.image.majorVersion=%q. In repmgr mode the PostgreSQL server runs from the repmgr image (%s), which bundles only PostgreSQL %s and always runs that server regardless of postgresql.image; a mismatch crash-loops the extension init container or silently runs the wrong major. Set postgresql.majorVersion=%q (with a matching postgresql.image), or point repmgr.image at an image built for PostgreSQL %s and set repmgr.image.majorVersion to match" (toString .Values.postgresql.majorVersion) (toString $repmgrMajor) .Values.ha.image.repository (toString $repmgrMajor) (toString $repmgrMajor) (toString .Values.postgresql.majorVersion)) }}
 {{- end }}
 {{- /* The two majorVersion values above are hand-typed claims; the image TAG is what
        actually decides the major (#269). The published per-major tags carry a -pgNN
@@ -117,15 +118,15 @@
        with extensions off, a silently wrong major. An unsuffixed tag carries no major to
        compare, which is why the container also gets PG_MAJOR from majorVersion: the
        entrypoint and agent then refuse to start an image that lacks that major. */}}
-{{- $tagMajor := regexFind "-pg[0-9]+$" (toString .Values.repmgr.image.tag) }}
+{{- $tagMajor := regexFind "-pg[0-9]+$" (toString .Values.ha.image.tag) }}
 {{- if $tagMajor }}
 {{- $tagMajor = trimPrefix "-pg" $tagMajor }}
 {{- if ne $tagMajor (toString $repmgrMajor) }}
-{{- fail (printf "repmgr.image.tag=%q is built for PostgreSQL %s, but repmgr.image.majorVersion=%q. The tag decides which major actually runs, so these must agree: set repmgr.image.majorVersion=%q and postgresql.majorVersion=%q, or change the tag suffix to -pg%s" (toString .Values.repmgr.image.tag) $tagMajor (toString $repmgrMajor) $tagMajor $tagMajor (toString $repmgrMajor)) }}
+{{- fail (printf "repmgr.image.tag=%q is built for PostgreSQL %s, but repmgr.image.majorVersion=%q. The tag decides which major actually runs, so these must agree: set repmgr.image.majorVersion=%q and postgresql.majorVersion=%q, or change the tag suffix to -pg%s" (toString .Values.ha.image.tag) $tagMajor (toString $repmgrMajor) $tagMajor $tagMajor (toString $repmgrMajor)) }}
 {{- end }}
 {{- end }}
 {{- end }}
-{{- if and .Values.pgbackrest.enabled (not .Values.repmgr.enabled) }}
+{{- if and .Values.pgbackrest.enabled (not .Values.ha.enabled) }}
 {{- fail "pgbackrest.enabled requires repmgr.enabled=true: the pgbackrest binary and the archive_command run inside the postgresql container, which in standalone mode is the official postgres image without pgbackrest. WAL archiving would fail on every segment (unbounded WAL growth) and backups would time out. Enable repmgr, or disable pgbackrest" }}
 {{- end }}
 {{- /* Bootstrap-from-backup (#266) prerequisites. Fail fast rather than rendering an init
@@ -147,7 +148,7 @@
 {{- if ne (include "pg.agentEtcdMode" .) "true" }}
 {{- fail "etcd.enabled=true deploys a bundled etcd cluster, but the agent etcd backend is not active (it would be left unused). Set repmgr.enabled=true and repmgr.agent.dcs.backend=etcd, or set etcd.enabled=false" }}
 {{- end }}
-{{- if (.Values.repmgr.agent.dcs.etcd).endpoints }}
+{{- if (.Values.ha.agent.dcs.etcd).endpoints }}
 {{- fail "etcd.enabled=true (bundled etcd) and repmgr.agent.dcs.etcd.endpoints (external etcd) are both set; the agent would target the external endpoints and leave the bundled cluster unused. Pick one: enable the bundle OR set endpoints" }}
 {{- end }}
 {{- end }}
@@ -218,17 +219,17 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if not .Values.repmgr.enabled }}
+      {{- if not .Values.ha.enabled }}
       # Standalone (no repmgr): the agent that needs the API token is not present,
       # so don't mount one (#166). In repmgr mode the token is required.
       automountServiceAccountToken: false
       {{- end }}
-      {{- if .Values.repmgr.enabled }}
-      terminationGracePeriodSeconds: {{ .Values.repmgr.terminationGracePeriodSeconds | default 120 }}
+      {{- if .Values.ha.enabled }}
+      terminationGracePeriodSeconds: {{ .Values.ha.terminationGracePeriodSeconds | default 120 }}
       {{- end }}
       securityContext:
         {{- toYaml .Values.postgresql.podSecurityContext | nindent 8 }}
-      {{- if .Values.repmgr.enabled }}
+      {{- if .Values.ha.enabled }}
       {{- /* No shareProcessNamespace: it existed so repmgrd could signal postgres across
              containers. The agent is PID 1 in the postgresql container and owns its child
              directly, so the pods no longer share a PID namespace (#286). */}}
@@ -307,7 +308,7 @@ spec:
         # what makes it safe to leave enabled across ordinary restarts and rollouts.
         - name: pgbackrest-bootstrap
           image: "{{ include "pg.repmgrImage" . }}"
-          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           command: ["/bin/bash", "/scripts/bootstrap.sh"]
@@ -377,7 +378,7 @@ spec:
             {{- toYaml . | nindent 12 }}
 {{- end }}
 {{- end }}
-{{- if and .Values.postgresql.extensions.enabled .Values.repmgr.enabled }}
+{{- if and .Values.postgresql.extensions.enabled .Values.ha.enabled }}
 {{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
 {{- $pkgs := list }}
 {{- range $p := (.Values.postgresql.extensions.packages | default list) }}
@@ -385,7 +386,7 @@ spec:
 {{- end }}
         - name: copy-base-ext
           image: "{{ include "pg.repmgrImage" . }}"
-          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
 {{- if $pkgs }}
           # #303: apt-get install into THIS container's own filesystem before the copy
           # below -- neither ext-lib nor ext-share is mounted at the real
@@ -631,10 +632,10 @@ spec:
                    package-manager run -- which is the entire point of the prebuilt path. */}}
             {{- include "pg.initResources" . | nindent 12 }}
 {{- end }}
-{{- if .Values.repmgr.enabled }}
+{{- if .Values.ha.enabled }}
         - name: repmgr-init
           image: "{{ include "pg.repmgrImage" . }}"
-          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
           command: ["/usr/local/bin/entrypoint.sh", "init"]
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
@@ -651,7 +652,7 @@ spec:
             - name: data
               mountPath: /var/lib/postgresql/data
           resources:
-            {{- toYaml .Values.repmgr.initContainerResources | nindent 12 }}
+            {{- toYaml .Values.ha.initContainerResources | nindent 12 }}
 {{- end }}
         - name: setup-config
           image: {{ include "pg.image" .Values.busyboxImage | quote }}
@@ -698,11 +699,11 @@ spec:
             {{- include "pg.initResources" . | nindent 12 }}
       containers:
         - name: postgresql
-{{- if .Values.repmgr.enabled }}
+{{- if .Values.ha.enabled }}
           image: "{{ include "pg.repmgrImage" . }}"
-          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
           # Always agent mode. pg.agentMode IS repmgr.enabled, and this whole block already
-          # sits inside `if .Values.repmgr.enabled`, so the `postgres` alternative that used to
+          # sits inside `if .Values.ha.enabled`, so the `postgres` alternative that used to
           # be rendered here was unreachable -- removed in #290 rather than left as a branch
           # nobody can take. The image still has a `postgres` mode for direct, non-chart use.
           #
@@ -777,16 +778,16 @@ spec:
             - name: LD_LIBRARY_PATH
               value: /usr/lib/postgresql/{{ $pgMajor }}/extra-lib
 {{- end }}
-{{- if .Values.repmgr.enabled }}
+{{- if .Values.ha.enabled }}
             - name: REPMGR_USER
-              value: {{ .Values.repmgr.username | quote }}
+              value: {{ .Values.ha.username | quote }}
             - name: REPMGR_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretRepmgrPasswordKey" . }}
             - name: REPMGR_DB
-              value: {{ .Values.repmgr.database | quote }}
+              value: {{ .Values.ha.database | quote }}
             - name: HEADLESS_SERVICE
               value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
             - name: REPMGR_NODE_COUNT
@@ -804,7 +805,7 @@ spec:
 {{- if eq (include "pg.agentMode" .) "true" }}
             {{- /* fail fast with a clear message if an overlay nulls out the agent
                    block, rather than a raw nil-pointer on .leaseDuration below */}}
-            {{- $_ := required "repmgr.agent is required when repmgr.enabled=true" .Values.repmgr.agent }}
+            {{- $_ := required "repmgr.agent is required when repmgr.enabled=true" .Values.ha.agent }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -812,21 +813,21 @@ spec:
             - name: LEASE_NAME
               value: {{ printf "%s-leader" (include "pg.fullname" .) | quote }}
             - name: LEASE_DURATION
-              value: {{ .Values.repmgr.agent.leaseDuration | quote }}
+              value: {{ .Values.ha.agent.leaseDuration | quote }}
             - name: RENEW_DEADLINE
-              value: {{ .Values.repmgr.agent.renewDeadline | quote }}
+              value: {{ .Values.ha.agent.renewDeadline | quote }}
             - name: RETRY_PERIOD
-              value: {{ .Values.repmgr.agent.retryPeriod | quote }}
+              value: {{ .Values.ha.agent.retryPeriod | quote }}
             - name: RECONCILE_INTERVAL
-              value: {{ .Values.repmgr.agent.reconcileInterval | quote }}
-{{- if .Values.repmgr.agent.cascadingReplication }}
+              value: {{ .Values.ha.agent.reconcileInterval | quote }}
+{{- if .Values.ha.agent.cascadingReplication }}
             {{- /* Cascading replication (#29): a standby may follow another standby to
                    offload the primary's WAL senders. The agent picks a safe upstream and
                    falls back to the primary, so a failed upstream never strands a node. */}}
             - name: CASCADE_REPLICATION
               value: "true"
 {{- end }}
-{{- if .Values.repmgr.agent.syncReplicationSlots }}
+{{- if .Values.ha.agent.syncReplicationSlots }}
             {{- /* Logical failover slot sync (#308): the primary reconciles
                    synchronized_standby_slots to its current standby's physical slot(s)
                    on every tick. Requires postgresql.walLevel: logical -- enforced by
@@ -843,7 +844,7 @@ spec:
                    not-yet-updated image. `native` is the only accepted value; `repmgr` is
                    rejected at render time by pg.validateRemovedRepmgrdValues. */}}
             - name: MECHANISM
-              value: {{ (.Values.repmgr.agent).mechanism | default "native" | quote }}
+              value: {{ (.Values.ha.agent).mechanism | default "native" | quote }}
             - name: MASTER_SERVICE
               value: {{ include "pg.fullname" . | quote }}
             - name: POD_SELECTOR
@@ -852,7 +853,7 @@ spec:
                    pg_hba trusting POD_CIDR (no legacy 0.0.0.0/0 md5), with the user's
                    postgresql.pgHba inserted above the network catch-alls. */}}
             - name: POD_CIDR
-              value: {{ required "repmgr.agent.podCidr is required in agent mode (the pod network trusted by the hardened pg_hba)" .Values.repmgr.agent.podCidr | quote }}
+              value: {{ required "repmgr.agent.podCidr is required in agent mode (the pod network trusted by the hardened pg_hba)" .Values.ha.agent.podCidr | quote }}
 {{- with .Values.postgresql.pgHba }}
             - name: POSTGRESQL_PGHBA
               value: {{ join "\n" . | quote }}
@@ -875,9 +876,9 @@ spec:
             - name: MIGRATE_LEGACY_MD5_USERS
               value: {{ .Values.postgresql.migrateLegacyMd5Users | quote }}
             - name: DCS_BACKEND
-              value: {{ (.Values.repmgr.agent.dcs).backend | default "kubernetes" | quote }}
+              value: {{ (.Values.ha.agent.dcs).backend | default "kubernetes" | quote }}
 {{- if eq (include "pg.agentEtcdMode" .) "true" }}
-            {{- $etcd := required "repmgr.agent.dcs.etcd is required when dcs.backend=etcd" .Values.repmgr.agent.dcs.etcd }}
+            {{- $etcd := required "repmgr.agent.dcs.etcd is required when dcs.backend=etcd" .Values.ha.agent.dcs.etcd }}
             {{- $endpoints := $etcd.endpoints }}
             {{- /* No explicit endpoints + the bundled etcd subchart enabled: target the
                    bundled cluster's client Service (<release>-etcd:<clientPort>). The
@@ -909,7 +910,7 @@ spec:
 {{- end }}
 {{- end }}
             - name: SPLIT_BRAIN_ACTION
-              value: {{ .Values.repmgr.splitBrainDetection.action | quote }}
+              value: {{ .Values.ha.splitBrainDetection.action | quote }}
 {{- if $control.enabled }}
             {{- /* Control API (#276). The agent validates all of this at boot and
                    refuses to start if the mTLS material is incomplete -- the render
@@ -980,7 +981,7 @@ spec:
 {{- with .Values.postgresql.extraEnv }}
             {{- toYaml . | nindent 12 }}
 {{- end }}
-{{- if not .Values.repmgr.enabled }}
+{{- if not .Values.ha.enabled }}
           lifecycle:
             postStart:
               exec:
@@ -1232,7 +1233,7 @@ spec:
             - name: pg-run
               mountPath: /var/run/postgresql
 {{- end }}
-{{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.repmgr.agent.dcs.etcd).tls).secretName) }}
+{{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.ha.agent.dcs.etcd).tls).secretName) }}
             - name: etcd-tls
               mountPath: /etc/etcd-tls
               readOnly: true
@@ -1256,7 +1257,7 @@ spec:
         # in the CronJobs, not here.
         - name: pgbackrest
           image: "{{ include "pg.repmgrImage" . }}"
-          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
           command: ["/bin/bash", "-c", "exec sleep infinity"]
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
@@ -1304,7 +1305,7 @@ spec:
           resources:
             {{- toYaml .Values.pgbackrest.resources | nindent 12 }}
 {{- end }}
-{{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.repmgr.enabled .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.extraVolumes (not .Values.postgresql.persistence.enabled) (eq (include "pg.postgresqlConfigRenders" .) "true") }}
+{{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.ha.enabled .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.extraVolumes (not .Values.postgresql.persistence.enabled) (eq (include "pg.postgresqlConfigRenders" .) "true") }}
       volumes:
 {{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
         - name: postgresql-config
@@ -1351,10 +1352,10 @@ spec:
             sizeLimit: 1Gi
 {{- end }}
 {{- end }}
-{{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.repmgr.agent.dcs.etcd).tls).secretName) }}
+{{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.ha.agent.dcs.etcd).tls).secretName) }}
         - name: etcd-tls
           secret:
-            secretName: {{ .Values.repmgr.agent.dcs.etcd.tls.secretName | quote }}
+            secretName: {{ .Values.ha.agent.dcs.etcd.tls.secretName | quote }}
             defaultMode: 0400
 {{- end }}
 {{- if $control.enabled }}

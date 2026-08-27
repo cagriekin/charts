@@ -1,5 +1,6 @@
+{{- include "pg.normalizeValues" . -}}
 {{- if eq (include "pg.controlRestoreEnabled" .) "true" }}
-{{- if .Values.repmgr.agent.control.restore.admissionPolicy.enabled }}
+{{- if .Values.ha.agent.control.restore.admissionPolicy.enabled }}
 {{- /* Bound the restore Job-create grant by CONTENT, not just by verb (#279).
 
        rbac.yaml has to hand the database pods' ServiceAccount `create` on `batch/jobs`,

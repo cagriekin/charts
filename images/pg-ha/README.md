@@ -14,11 +14,11 @@ PostgreSQL with pgBackRest, pgaudit, cron and the Go HA agent, on Debian Trixie.
 The major is a **build argument**, defaulting to 18, and one build ships exactly one major (`postgresql-<major>` and `-pgaudit` from PGDG). Supported: **18** (default) and **17**.
 
 ```bash
-docker build -t cagriekin/pg-ha:trixie-pg18-1 .                        # PostgreSQL 18
-docker build --build-arg PG_MAJOR=17 -t cagriekin/pg-ha:trixie-pg17-1 .
+docker build -t cagriekin/pg-ha:2.0.0-pg18 .                        # PostgreSQL 18
+docker build --build-arg PG_MAJOR=17 -t cagriekin/pg-ha:2.0.0-pg17 .
 ```
 
-Published tags per release: `cagriekin/pg-ha:trixie-pg18-<n>` and `cagriekin/pg-ha:trixie-pg17-<n>`, from a single git tag `pg-ha-<n>` (#290).
+Published tags per release: `cagriekin/pg-ha:2.0.0-pg18` and `cagriekin/pg-ha:2.0.0-pg17`, from a single git tag `pg-ha-2.0.0` (#290).
 
 The scheme changed with the repmgr removal. It was `trixie-<repmgr-version>-<n>` under
 `cagriekin/repmgr`, keyed on a package this image no longer contains -- so a published tag
@@ -35,7 +35,7 @@ The build **fails** if any per-major package has no installation candidate (chec
 Both majors are verified by `test/image-smoke.sh <image-ref> <major>`, which starts the built image and asserts the server version, that `pgaudit` actually loads via `shared_preload_libraries`, that the `postgres` uid/gid are the 101:103 the chart chowns PGDATA to, and that repmgr is genuinely **absent** (binary, `repmgr.so`, OS user and directories):
 
 ```bash
-bash test/image-smoke.sh cagriekin/pg-ha:trixie-pg17-1 17
+bash test/image-smoke.sh cagriekin/pg-ha:2.0.0-pg17 17
 ```
 
 ## Execution Modes
@@ -156,8 +156,8 @@ pgBackRest configuration (`/etc/pgbackrest/pgbackrest.conf`) and S3 credentials 
 ## Building
 
 ```bash
-docker build -t cagriekin/pg-ha:trixie-pg18-1 .                        # PostgreSQL 18
-docker build --build-arg PG_MAJOR=17 -t cagriekin/pg-ha:trixie-pg17-1 .
+docker build -t cagriekin/pg-ha:2.0.0-pg18 .                        # PostgreSQL 18
+docker build --build-arg PG_MAJOR=17 -t cagriekin/pg-ha:2.0.0-pg17 .
 ```
 
 ## Compatibility

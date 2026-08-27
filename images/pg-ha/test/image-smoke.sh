@@ -9,7 +9,7 @@
 # package resolved to a different version than the tag advertises.
 #
 # Usage: bash images/pg-ha/test/image-smoke.sh <image-ref> <expected-pg-major>
-#   bash images/pg-ha/test/image-smoke.sh cagriekin/pg-ha:trixie-pg17-1 17
+#   bash images/pg-ha/test/image-smoke.sh cagriekin/pg-ha:2.0.0-pg17 17
 set -uo pipefail
 
 IMAGE="${1:?usage: image-smoke.sh <image-ref> <expected-pg-major>}"
@@ -18,9 +18,10 @@ WANT_MAJOR="${2:?usage: image-smoke.sh <image-ref> <expected-pg-major>}"
 # The repmgr version this used to derive from the tag is gone with the package (#290): there
 # is no repmgr to hold to a version.
 #
-# The TAG SCHEME changed with it: pg-ha-image-publish.yaml now takes a git tag `pg-ha-<n>` and
-# publishes cagriekin/pg-ha:trixie-pg<major>-<n>, keyed on the PostgreSQL major -- the thing one
-# build actually bundles -- rather than on a repmgr version the image no longer contains.
+# The TAG SCHEME changed with it: pg-ha-image-publish.yaml takes a git tag `pg-ha-<version>` and
+# publishes cagriekin/pg-ha:<version>-pg<major>. The version tracks the CHART release the image
+# shipped with -- the number a consumer already reasons about -- and the PostgreSQL major stays
+# in the tag because one build bundles exactly one.
 
 fail=0
 ok()  { echo "PASS: $1"; }

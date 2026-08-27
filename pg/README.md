@@ -557,7 +557,7 @@ All three are multi-arch (amd64/arm64), SBOM- and provenance-attested, and cosig
 
 > **Changing with the next image release (#290).** The image no longer contains repmgr, so the
 > tag scheme stops being keyed on a repmgr version. The new image is `cagriekin/pg-ha`, published
-> as `trixie-pg18-<n>` and `trixie-pg17-<n>` — the major is **in** the tag, and there is no
+> as `<version>-pg18` and `<version>-pg17` — the major is **in** the tag, and there is no
 > unsuffixed "default major" alias, so a pin always names the major it wants and
 > `repmgr.image.majorVersion` cross-checks it. The table above describes the image this chart
 > pins **today**; `cagriekin/repmgr` stays published and frozen at its last tag, so existing

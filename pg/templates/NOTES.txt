@@ -1,8 +1,9 @@
+{{- include "pg.normalizeValues" . -}}
 {{ include "pg.fullname" . }} ({{ .Chart.Name }}-{{ .Chart.Version }}) installed in namespace {{ .Release.Namespace }}.
 
 Connect (read/write -> current primary):
   {{ include "pg.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:5432
-{{- if .Values.repmgr.enabled }}
+{{- if .Values.ha.enabled }}
 Read-only (standbys):
   {{ include "pg.fullname" . }}-readonly.{{ .Release.Namespace }}.svc.cluster.local:5432
 {{- end }}

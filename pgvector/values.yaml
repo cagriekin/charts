@@ -332,7 +332,15 @@ postgresql:
       additionalCommands: |
         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1
 
-repmgr:
+# ==========================================================================================
+# ha.*  --  everything HA: the failover agent, the image it runs in, replication identity.
+#
+# RENAMED from repmgr.* in 2.0.0 (#291): the old namespace named a component this chart no
+# longer installs. `repmgr.*` still works as a deprecated alias for one major cycle -- it is
+# merged key-by-key over these defaults, so an existing values file keeps working and you can
+# move one key at a time. See the pg chart values for the full reasoning.
+# ==========================================================================================
+ha:
   image:
     repository: cagriekin/repmgr
     tag: trixie-5.5.0-33
@@ -349,9 +357,9 @@ repmgr:
     # tag together when moving to a repmgr image built for a new PG major.
     #
     # The image is published per major (#269), and since #290 the major is IN the tag:
-    # cagriekin/pg-ha:trixie-pg18-<n> and :trixie-pg17-<n>, with no unsuffixed
+    # cagriekin/pg-ha:<version>-pg18 and :<version>-pg17, with no unsuffixed
     # "default major" alias. To run PostgreSQL 17, set BOTH majorVersion values to "17",
-    # this tag to a trixie-pg17-<n>, AND postgresql.image.tag to pg17-trixie -- this
+    # this tag to a <version>-pg17, AND postgresql.image.tag to pg17-trixie -- this
     # chart copies the vector extension out of the pgvector image, so that image must be
     # the same major. See pgvector/README.md "Choosing the PostgreSQL major".
     #

@@ -1,4 +1,5 @@
-{{- if .Values.repmgr.enabled }}
+{{- include "pg.normalizeValues" . -}}
+{{- if .Values.ha.enabled }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -113,7 +114,7 @@ rules:
     resources: ["jobs"]
     resourceNames: ["{{ include "pg.fullname" . }}-pgbackrest-restore-api"]
     verbs: ["get", "delete"]
-{{- if .Values.repmgr.agent.control.restore.readPodLogs }}
+{{- if .Values.ha.agent.control.restore.readPodLogs }}
   # Live file-copy progress by tailing the restore pod's log. The Job's pod name is
   # generated, so this cannot be resourceName-scoped either: it grants log read for
   # EVERY pod in the namespace, and logs are where other workloads leak secrets. Off
