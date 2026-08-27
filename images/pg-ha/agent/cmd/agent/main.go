@@ -42,7 +42,6 @@ import (
 
 const (
 	metricsAddr = ":9200"
-	repmgrConf  = "/etc/repmgr/repmgr.conf"
 )
 
 func main() {
@@ -361,7 +360,7 @@ func (a *agent) run() {
 	// Same placement, same reasoning: a data directory whose postgresql.auto.conf still carries
 	// recovery GUCs is one this agent cannot steer, and no amount of reconciling fixes it
 	// (#294 review).
-	if err := a.assertNoForeignRecoveryConfig(); err != nil {
+	if err := a.migrateForeignRecoveryConfig(); err != nil {
 		a.log.Error("recovery-config preflight", "err", err)
 		os.Exit(1)
 	}
@@ -1911,8 +1910,10 @@ func (a *agent) writePgHba() error {
 // in the server's module directory.
 const repmgrPreloadLib = "repmgr"
 
-// assertNoForeignRecoveryConfig refuses to start when postgresql.auto.conf sets the GUCs that
-// decide where this standby streams from (#294 review).
+// migrateForeignRecoveryConfig clears the GUCs that decide where this standby streams from out
+// of postgresql.auto.conf, so the agent's own fragment becomes authoritative (#292).
+//
+// #294 added this as a REFUSAL, because there was no migration to offer; #292 makes it act.
 //
 // This guards the one upgrade path 2.0.0 otherwise fails SILENTLY: a cluster created by a 1.x
 // release. 1.x had no `repmgr.agent.mechanism`, so nothing in the chart can detect it --
@@ -1933,7 +1934,7 @@ const repmgrPreloadLib = "repmgr"
 // Stripping the lines instead would be worse: sequencing it against the catalog and the slots is
 // exactly what #292 is for, and a half-migration is harder to reason about than a pod that will
 // not start with a message naming the issue.
-func (a *agent) assertNoForeignRecoveryConfig() error {
+func (a *agent) migrateForeignRecoveryConfig() error {
 	autoConf := filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf")
 	found, err := pgconf.ForeignRecoveryConfig(autoConf)
 	if err != nil {
@@ -1945,11 +1946,38 @@ func (a *agent) assertNoForeignRecoveryConfig() error {
 	if len(found) == 0 {
 		return nil
 	}
-	return fmt.Errorf("refusing to start: %s sets %s, which PostgreSQL reads AFTER the agent's own config and therefore overrides it. "+
-		"This agent writes those settings into %s, and it cannot steer a standby whose auto.conf overrules them: Follow would report success on every tick while the walreceiver kept the old upstream (and, after a repmgr cluster, a replication slot that no longer exists). "+
-		"If this data directory was created by a chart 1.x release it is repmgr-shaped and needs the in-place migration (#292) before it can run the native mechanism -- 2.0.0 native is for FRESH installs. "+
-		"If you set these by hand, undo them with `ALTER SYSTEM RESET <setting>` and restart the pod",
-		autoConf, strings.Join(found, " and "), "the agent-managed fragment in PGDATA")
+	// #292 turns what #294 could only refuse into a migration. The settings are REMOVED rather
+	// than rewritten: whole lines, so the agent's own fragment becomes the single definition of
+	// where this node streams from.
+	//
+	// Why this is safe to do automatically, when the catalog cleanup deliberately is not:
+	//   - It touches configuration only. No data, no slots, no catalog, no timeline.
+	//   - It is reversible. Pin the previous chart and image and repmgr's own `standby follow`
+	//     rewrites both settings on its next run; nothing has been destroyed.
+	//   - It runs with the postmaster STOPPED, from the startup preflight, so it cannot race
+	//     PostgreSQL's own wholesale rewrite of auto.conf.
+	//   - The alternative is worse: refusing leaves every 1.x consumer with no upgrade path at
+	//     all, and the effective upstream is preserved either way -- the agent derives it from
+	//     the lease, not from the file being removed.
+	//
+	// NO identity check here, deliberately (#290 review). An earlier cut read pg_controldata
+	// before and after and compared SystemID/Timeline -- but RemoveRecoveryConfig only rewrites
+	// postgresql.auto.conf and cannot touch pg_control, so neither branch was reachable. It was
+	// false assurance, and it cost two unbounded pg_controldata execs on every boot, before
+	// leader election, where a stalled one would hang startup.
+	//
+	// What actually makes this safe is the operation's scope: configuration only, no data, no
+	// slots, no catalog, no timeline. The identity guarantees that DO matter -- refusing to
+	// follow or rewind onto a different cluster -- are enforced by assertSameCluster on the
+	// paths that move data, where a mismatch is possible.
+	removed, err := pgconf.RemoveRecoveryConfig(autoConf)
+	if err != nil {
+		return fmt.Errorf("in-place migration (#292): clear the repmgr recovery config from %s: %w", autoConf, err)
+	}
+	a.log.Info("in-place migration (#292): cleared the repmgr recovery config; the agent's own fragment is now authoritative",
+		"path", autoConf, "removed", strings.Join(removed, ","),
+		"note", "the legacy repmgr_slot_* on the upstream is reclaimed once this node is streaming through its own slot; the repmgr database, role and extension are left alone (opt-in cleanup)")
+	return nil
 }
 
 // preflightPreload is run()'s single #293 entry point: strip, then verify. The order is
@@ -1972,7 +2000,7 @@ func (a *agent) preflightPreload() error {
 // dropRepmgrPreload removes `shared_preload_libraries = 'repmgr'` from PGDATA under the
 // native mechanism (#293).
 //
-// The line is written INTO THE DATA DIRECTORY by images/repmgr/entrypoint.sh at initdb
+// The line is written INTO THE DATA DIRECTORY by images/pg-ha/entrypoint.sh at initdb
 // time and cloned verbatim to every standby, so it outlives any chart change and any helm
 // rollback -- the fix has to come from inside the running node. Once the repmgr package
 // leaves the image (#290) a data directory still requesting repmgr.so is not a degraded
@@ -2786,6 +2814,7 @@ func (a *agent) standbySlotsTick(ctx context.Context) {
 		return
 	}
 	var live map[int]bool
+	isUpstream := false
 	if a.cfg.CascadeReplication {
 		var err error
 		live, err = a.livePodOrdinals(ctx)
@@ -2793,9 +2822,29 @@ func (a *agent) standbySlotsTick(ctx context.Context) {
 			a.log.Warn("list live pods for the standby slot reclaim; skipping it this tick (cascading replication makes this node a legitimate upstream)", "err", err)
 			return
 		}
+		// Is anything actually streaming FROM this node right now? That single fact separates the
+		// two cascade cases a legacy slot here can belong to (#290 review):
+		//
+		//   - A DEMOTED ex-primary: its former children have moved to the new primary, so nothing
+		//     streams from it. Its repmgr_slot_* are pure residue and must be reclaimed, or they
+		//     sit inactive pinning WAL on its volume forever.
+		//   - A cascade UPSTREAM mid-migration: a grandchild really does stream from here, and its
+		//     repmgr_slot_<id> is the slot it is using. Dropping that is the full re-clone the
+		//     migration gate exists to prevent.
+		//
+		// An unreadable topology is treated as "might be an upstream", which is the conservative
+		// direction: holding bounded WAL beats destroying a slot in use.
+		rows, err := a.prober.ReplicationTopology(ctx, a.selfConn())
+		if err != nil {
+			a.log.Warn("read this node's downstreams for the standby slot reclaim; assuming it is an upstream", "err", err)
+			isUpstream = true
+		} else {
+			isUpstream = len(rows) > 0
+		}
 	}
+	migrated := migratedOrdinals(slots)
 	for _, sl := range slots {
-		if !a.reclaimableOnStandby(sl.Name, live) {
+		if !a.reclaimableOnStandby(sl.Name, live, migrated, isUpstream) {
 			continue
 		}
 		dropped, err := a.prober.DropPhysicalSlotIfInactive(ctx, a.selfConn(), sl.Name)
@@ -2813,11 +2862,25 @@ func (a *agent) standbySlotsTick(ctx context.Context) {
 // reclaimableOnStandby applies the right reclaim predicate for this node's topology (#294).
 // live is nil when cascading is off, in which case the ordinal carries no information and
 // every agent-minted slot is a leftover.
-func (a *agent) reclaimableOnStandby(name string, live map[int]bool) bool {
+func (a *agent) reclaimableOnStandby(name string, live map[int]bool, migrated map[int]bool, isUpstream bool) bool {
+	// Without cascade this node cannot be anyone's upstream, so every agent-minted or legacy slot
+	// found locally is a leftover -- its own slot lives on its upstream, not here.
 	if !a.cfg.CascadeReplication {
 		return leftoverStandbySlot(name)
 	}
-	return orphanSlot(name, a.cfg.PodName, live)
+	// With cascade on, a LEGACY repmgr_slot_* here has two possible owners, and `isUpstream`
+	// distinguishes them (#290 review, round 2). An earlier cut declared all of them residue,
+	// which was right for a demoted ex-primary and wrong for a cascade upstream: a grandchild
+	// mid-migration really is streaming through its repmgr_slot_<id> on this node, and dropping
+	// it forces the re-clone the whole migration exists to avoid.
+	if strings.HasPrefix(name, legacySlotPrefix) {
+		if !isUpstream {
+			return true // nothing streams from here: residue from a term as primary
+		}
+		// Something does stream from here, so fall through to the conservative per-ordinal rule
+		// below -- keep it while its pod is live and unmigrated.
+	}
+	return orphanSlot(name, a.cfg.PodName, live, migrated)
 }
 
 // leftoverStandbySlot reports whether a slot found on a STANDBY is one this agent may
@@ -2958,8 +3021,9 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) ([]str
 		// The pre-#294 code failed CLOSED here; this restores that.
 		return nil, false
 	}
+	migrated := migratedOrdinals(slots)
 	for _, s := range slots {
-		if !orphanSlot(s.Name, a.cfg.PodName, live) {
+		if !orphanSlot(s.Name, a.cfg.PodName, live, migrated) {
 			continue
 		}
 		dropped, err := a.prober.DropPhysicalSlotIfInactive(ctx, self, s.Name)
@@ -2998,7 +3062,9 @@ func (a *agent) ownedStandbySlots(slots []pg.SlotState, live map[int]bool) []str
 		// Same predicate as the reclaim pass, inverted: anything it would keep, this waits on.
 		// Sharing orphanSlot is what stops the two drifting into disagreement about which
 		// slots belong to a live standby.
-		if orphanSlot(s.Name, a.cfg.PodName, live) {
+		// migrated is irrelevant here: the legacy-slot branch it feeds cannot be reached, because
+		// the slotPrefix filter below already excludes every legacy name from the waited-on set.
+		if orphanSlot(s.Name, a.cfg.PodName, live, nil) {
 			continue
 		}
 		ord, ok := slotOrdinal(s.Name)
@@ -3253,26 +3319,62 @@ func podOrdinal(pod string) (int, bool) {
 // Everything else -- an unrecognised name, or a live peer's agent-minted slot -- is left
 // alone. An empty liveOrdinals reclaims nothing but self and legacy slots: a failed or
 // empty pod list must never make every standby's slot look orphaned.
-func orphanSlot(name, selfPod string, liveOrdinals map[int]bool) bool {
+func orphanSlot(name, selfPod string, liveOrdinals map[int]bool, migratedOrdinals map[int]bool) bool {
 	selfOrd, selfOK := podOrdinal(selfPod)
 
 	ord, ok := slotOrdinal(name)
 	if !ok {
 		return false // not a name this agent minted, and not a legacy repmgr slot
 	}
-	// A legacy repmgr slot is never used by native mode; the NOT active guard in the drop
-	// is what protects one still carrying a stream mid-migration.
-	if strings.HasPrefix(name, legacySlotPrefix) {
-		return true
-	}
-	// This pod's own slot: unused while it is the primary, regardless of liveness.
+	// This pod's own slot, either naming scheme: nobody streams from a node to itself, so it is
+	// unused regardless of liveness or migration state. Checked FIRST -- putting it after the
+	// legacy branch below left a migrated primary's own repmgr_slot_<self> standing forever,
+	// because a primary never has an active new-scheme slot for its own ordinal to prove it.
 	if selfOK && ord == selfOrd {
 		return true
+	}
+	// A legacy repmgr_slot_<node_id> is never USED by native mode, but "unused" is not the same
+	// as "safe to drop yet" (#292). During an in-place migration the standby that owns one is
+	// mid-restart: the old slot has gone inactive and its new pg_ha_slot_<ordinal> may not exist
+	// yet, so `AND NOT active` alone lets the drop through -- and if the primary then recycles
+	// WAL before that standby reattaches, it needs exactly the full re-clone #292 exists to
+	// avoid.
+	//
+	// An earlier round made these unconditionally reclaimable, on the grounds that scoping them
+	// to departed ordinals leaves a permanent orphan per surviving node. That objection is
+	// answered rather than reverted: reclaim on departed OR MIGRATED, where migrated means the
+	// ordinal's new-scheme slot is present and ACTIVE -- positive proof the standby is streaming
+	// through the new one and finished with the old. So the orphan is still cleaned up, just not
+	// during the window where dropping it costs a re-clone.
+	if strings.HasPrefix(name, legacySlotPrefix) {
+		if len(liveOrdinals) > 0 && !liveOrdinals[ord] {
+			return true // the pod is gone; nothing can be relying on it
+		}
+		return migratedOrdinals[ord]
 	}
 	if len(liveOrdinals) == 0 {
 		return false
 	}
 	return !liveOrdinals[ord]
+}
+
+// migratedOrdinals returns the ordinals whose NEW-SCHEME slot is present and active, i.e. the
+// standbys provably streaming through the native naming (#292). That is the only positive signal
+// a primary has that a legacy repmgr slot for the same ordinal is finished with.
+//
+// Active, not merely present: reconcileSlots pre-creates a slot before its standby arrives, so
+// presence alone would clear the legacy slot while the standby was still using it.
+func migratedOrdinals(slots []pg.SlotState) map[int]bool {
+	m := map[int]bool{}
+	for _, s := range slots {
+		if !s.Active || !strings.HasPrefix(s.Name, slotPrefix) {
+			continue
+		}
+		if ord, ok := slotOrdinal(s.Name); ok {
+			m[ord] = true
+		}
+	}
+	return m
 }
 
 // slotOrdinal extracts the pod ordinal from a slot name the agent recognises as ownable --

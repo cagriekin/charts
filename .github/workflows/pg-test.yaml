@@ -55,7 +55,7 @@ jobs:
               render_files=$(printf '%s\n' "$render_files" | grep -vxE 'pg/Chart\.yaml' || true)
             fi
           fi
-          if printf '%s\n' "$render_files" | grep -qE '^(pg/|images/repmgr/|etcd/|\.github/workflows/pg-test\.yaml)'; then
+          if printf '%s\n' "$render_files" | grep -qE '^(pg/|images/pg-ha/|etcd/|\.github/workflows/pg-test\.yaml)'; then
             echo "pg=true" >> "$GITHUB_OUTPUT"
           else
             echo "pg=false" >> "$GITHUB_OUTPUT"
@@ -118,7 +118,7 @@ jobs:
             docker save "$image" -o "/tmp/base-images/${safe}.tar"
           done
 
-      # The repmgr image is built from source (images/repmgr) so an image change
+      # The repmgr image is built from source (images/pg-ha) so an image change
       # ships and is tested with the chart in one PR. The tag is read from
       # pg/values.yaml so the loaded image satisfies the chart's IfNotPresent pull
       # policy. buildx + the gha cache keeps the apt-heavy build off the critical
@@ -134,24 +134,50 @@ jobs:
           set -euo pipefail
           tag=$(awk '/^repmgr:/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
           if [ -z "$tag" ]; then echo "could not resolve repmgr image tag from pg/values.yaml" >&2; exit 1; fi
-          # Normalise away a -pgNN suffix, exactly as pg/tests/set-pg-major.sh does when it
-          # rewrites the fixtures. Without this a tree whose chart tag is already suffixed
-          # (someone testing PG17 locally, or a future default flip) would build the PG18
-          # image as "...-pg17" while the switch script points the PG17 fixtures at that
-          # same name -- every PG17 leg would run PostgreSQL 18 and pass.
-          base=${tag%-pg[0-9]*}
-          if [ "$base" != "$tag" ]; then
-            echo "::notice title=pg-major::chart tag ${tag} is major-suffixed; using base ${base} for the per-major builds"
-            tag="$base"
-          fi
+          # The image REPOSITORY comes from the chart too, so this keeps building whatever the
+          # chart points at across the #290 rename (cagriekin/repmgr -> cagriekin/pg-ha).
+          repo=$(awk '/^repmgr:/{r=1} r&&/^    repository:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
+          if [ -z "$repo" ]; then echo "could not resolve repmgr image repository from pg/values.yaml" >&2; exit 1; fi
+          # Two tag shapes, exactly as pg/tests/set-pg-major.sh accepts (#290): the chart pin
+          # moves to the new scheme only after the new image is published, so both must work or
+          # that bump breaks CI silently.
+          #
+          #   NEW: trixie-pg<major>-<n>  -- substitute the major
+          #   OLD: trixie-<repmgr>-<n>   -- unsuffixed is PG18, others take -pgNN
+          #
+          # Getting this wrong is quiet, not loud: building the PG18 image under a "-pg17" name
+          # while set-pg-major points the PG17 fixtures at that name makes every PG17 leg run
+          # PostgreSQL 18 and pass.
+          # ONE pattern, shared verbatim with pg/tests/set-pg-major.sh (#290 review). They had
+          # diverged -- CI matched only a `trixie` prefix while the script also accepted any
+          # other -- so a pin like `deb13-pg18-1` was classified legacy here and major-in-tag
+          # there, which is precisely the silent failure both comments warn about: CI builds the
+          # PG18 image as <tag>-pg17 while the script points the PG17 fixtures at that name, and
+          # every PG17 leg runs PostgreSQL 18 and passes.
+          case "$tag" in
+            *pg[0-9]*-[0-9]*) scheme=major-in-tag ;;
+            *) scheme=legacy
+               base=${tag%-pg[0-9]*}
+               if [ "$base" != "$tag" ]; then
+                 echo "::notice title=pg-major::chart tag ${tag} is major-suffixed; using base ${base} for the per-major builds"
+                 tag="$base"
+               fi ;;
+          esac
+          echo "::notice title=pg-major::tag scheme=${scheme} repo=${repo} base=${tag}"
           for major in 18 17; do
-            if [ "$major" = "18" ]; then ref="cagriekin/repmgr:${tag}"; else ref="cagriekin/repmgr:${tag}-pg${major}"; fi
-            echo "Building ${ref} (PG_MAJOR=${major}) from images/repmgr"
+            if [ "$scheme" = "major-in-tag" ]; then
+              ref="${repo}:$(printf '%s' "$tag" | sed -E "s/(^|-)pg[0-9]+-/\1pg${major}-/")"
+            elif [ "$major" = "18" ]; then
+              ref="${repo}:${tag}"
+            else
+              ref="${repo}:${tag}-pg${major}"
+            fi
+            echo "Building ${ref} (PG_MAJOR=${major}) from images/pg-ha"
             docker buildx build --load \
               --build-arg "PG_MAJOR=${major}" \
-              --cache-from type=gha,scope=repmgr-image-pg${major} \
-              --cache-to type=gha,mode=max,scope=repmgr-image-pg${major} \
-              -t "$ref" images/repmgr
+              --cache-from type=gha,scope=pg-ha-image-pg${major} \
+              --cache-to type=gha,mode=max,scope=pg-ha-image-pg${major} \
+              -t "$ref" images/pg-ha
             # Own artifact per major (~190MB each): a suite leg needs exactly one, and
             # with 46 legs bundling both would download a spare 190MB 46 times.
             mkdir -p "/tmp/kind-images-pg${major}"

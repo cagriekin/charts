@@ -59,13 +59,13 @@
 # time, because two sources for the same extension is exactly the "which one wins" question
 # nobody should have to answer at 3am.
 
-# Digest-pinned (manifest-list digest, multi-arch), matching images/repmgr/Dockerfile.
+# Digest-pinned (manifest-list digest, multi-arch), matching images/pg-ha/Dockerfile.
 # Refresh with: docker buildx imagetools inspect debian:trixie-slim
 FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e
 
 # PostgreSQL major the extensions are built for. Must match the chart's
 # postgresql.majorVersion: an extension .so is built against one major's server ABI and
-# will not load into another. Default 18, matching images/repmgr/Dockerfile's ARG PG_MAJOR
+# will not load into another. Default 18, matching images/pg-ha/Dockerfile's ARG PG_MAJOR
 # so the two images' defaults cannot drift apart silently.
 ARG PG_MAJOR=18
 
@@ -79,7 +79,7 @@ ARG APT_SOURCE_NAME=""
 ARG APT_SOURCE_KEY_URL=""
 ARG APT_SOURCE_LINE=""
 
-# `apt-get upgrade` first, for the same reason images/repmgr/Dockerfile does it: the
+# `apt-get upgrade` first, for the same reason images/pg-ha/Dockerfile does it: the
 # digest-pinned base is a snapshot, and without this the image ships whatever Debian
 # security updates landed after it as stale pre-installed versions.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
@@ -89,7 +89,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# PGDG, configured exactly as images/repmgr/Dockerfile does -- the extension packages this
+# PGDG, configured exactly as images/pg-ha/Dockerfile does -- the extension packages this
 # image exists to install come from here.
 RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
       | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg \

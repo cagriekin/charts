@@ -394,7 +394,7 @@ spec:
           # this image's normal extension directories and the unmodified cp then
           # picks up both the repmgr image's original extensions and anything just
           # installed. The repmgr image configures the PGDG apt repo at build time
-          # (images/repmgr/Dockerfile), so this is the reliable install path in
+          # (images/pg-ha/Dockerfile), so this is the reliable install path in
           # repmgr mode.
           #
           # Pin postgresql-{{ $pgMajor }} to whatever's already installed before naming any
@@ -640,73 +640,16 @@ spec:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
 {{- with (include "pg.pgMajorEnv" .) }}{{ . | nindent 12 }}{{- end }}
-            {{- /* #288: the init container needs MECHANISM too, not just the postgresql
-                   container. init-repmgr.sh's original job -- write repmgr.conf, wait for a
-                   primary to appear in repmgr.nodes, clone with `repmgr standby clone` -- was
-                   repmgr-specific, and the middle step is what made native unusable with
-                   replicas: nothing ever registers under native, so the poll timed out and
-                   every standby sat in Init:CrashLoopBackOff forever. It exits early on native
-                   and lets the agent clone (BootstrapClone -> pg_basebackup), but only if the
-                   value reaches it.
-                   Emitted UNCONDITIONALLY since #294. It used to be omitted at the default,
-                   which was repmgr and is what an env-less agent assumes; the default is now
-                   native, so relying on the absent-value default would silently run the OLD
-                   mechanism on any image built before #294 -- exactly the two-step
-                   image-then-chart release this repo does. Being explicit costs one env var
-                   and removes that trap. */}}
-            - name: MECHANISM
-              value: {{ (.Values.repmgr.agent).mechanism | default "native" | quote }}
-            - name: PGDATA
-              value: /var/lib/postgresql/data/pgdata
-            - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretUsernameKey" . }}
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretPasswordKey" . }}
-            - name: POSTGRES_DB
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretDatabaseKey" . }}
-            - name: REPMGR_USER
-              value: {{ .Values.repmgr.username | quote }}
-            - name: REPMGR_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretRepmgrPasswordKey" . }}
-            - name: REPMGR_DB
-              value: {{ .Values.repmgr.database | quote }}
-            - name: HEADLESS_SERVICE
-              value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
-            - name: REPMGR_NODE_COUNT
-              value: {{ add .Values.postgresql.replicaCount 1 | quote }}
-{{- if eq (include "pg.agentMode" .) "true" }}
-            {{- /* #308: the agent's own repmgr.conf (regenerated every boot, see
-                   images/repmgr/agent/cmd/agent's boot()) has always used
-                   use_replication_slots=1 for standbys -- this predates #308. The
-                   initial clone below, run from THIS init container's repmgr.conf, did
-                   not, so a fresh standby's first-ever streaming connection carried no
-                   physical slot until an unrelated later repmgr operation happened to
-                   create one. #308's synchronized_standby_slots reconciliation is the
-                   first thing that depends on that slot existing reliably from the
-                   start, so align the initial clone with the agent's own default.
-                   Written unconditionally since 2.0.0: repmgrd (whose retention was
-                   wal_keep_size-based, not slot-based) went with #286, so the agent is the
-                   only failover path and the only reader of this. */}}
-            - name: USE_REPLICATION_SLOTS
-              value: "1"
-{{- end }}
+            {{- /* The reduced `init` mode reads NOTHING but PG_MAJOR (#290). It used to write
+                   repmgr.conf, poll repmgr.nodes and clone, which needed the credentials, the
+                   headless service and the node count; now it stats a binary and exits. Every
+                   one of those env vars is removed rather than left inert -- mounting the
+                   release Secret into a container that cannot use it is needless credential
+                   surface, and USE_REPLICATION_SLOTS in particular is now read by nothing in
+                   the image at all. PG_MAJOR arrives via pg.pgMajorEnv above. */}}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-            - name: repmgr-config
-              mountPath: /etc/repmgr
           resources:
             {{- toYaml .Values.repmgr.initContainerResources | nindent 12 }}
 {{- end }}
@@ -758,16 +701,15 @@ spec:
 {{- if .Values.repmgr.enabled }}
           image: "{{ include "pg.repmgrImage" . }}"
           imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
-          # The image entrypoint runs a stale-primary guard before starting
-          # read-write: on a container-only restart (which does not re-run the
-          # init container) it detects a peer promoted to a newer timeline and
-          # rejoins this node as a standby via pg_rewind instead of resuming as
-          # a second primary. See repmgr-docker entrypoint.sh.
-          {{- if eq (include "pg.agentMode" .) "true" }}
+          # Always agent mode. pg.agentMode IS repmgr.enabled, and this whole block already
+          # sits inside `if .Values.repmgr.enabled`, so the `postgres` alternative that used to
+          # be rendered here was unreachable -- removed in #290 rather than left as a branch
+          # nobody can take. The image still has a `postgres` mode for direct, non-chart use.
+          #
+          # The stale-primary guard this comment used to describe is gone too (#290): it drove
+          # `repmgr node rejoin` from the shell before the agent started. The agent does the
+          # equivalent from its own reconcile loop, where it can be fenced.
           command: ["/usr/local/bin/entrypoint.sh", "agent"]
-          {{- else }}
-          command: ["/usr/local/bin/entrypoint.sh", "postgres"]
-          {{- end }}
 {{- else }}
           image: {{ include "pg.image" .Values.postgresql.image | quote }}
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
@@ -1290,10 +1232,6 @@ spec:
             - name: pg-run
               mountPath: /var/run/postgresql
 {{- end }}
-{{- if .Values.repmgr.enabled }}
-            - name: repmgr-config
-              mountPath: /etc/repmgr
-{{- end }}
 {{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.repmgr.agent.dcs.etcd).tls).secretName) }}
             - name: etcd-tls
               mountPath: /etc/etcd-tls
@@ -1412,11 +1350,6 @@ spec:
           emptyDir:
             sizeLimit: 1Gi
 {{- end }}
-{{- end }}
-{{- if .Values.repmgr.enabled }}
-        - name: repmgr-config
-          emptyDir:
-            sizeLimit: 16Mi
 {{- end }}
 {{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.repmgr.agent.dcs.etcd).tls).secretName) }}
         - name: etcd-tls

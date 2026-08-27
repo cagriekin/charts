@@ -38,12 +38,28 @@ DEFAULT_MAJOR="18"
 # rewritten tag names an image that was actually built).
 BASE_TAG=$(awk '/^repmgr:/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' "$VALUES")
 [ -n "$BASE_TAG" ] || { echo "could not resolve repmgr image tag from ${VALUES}" >&2; exit 1; }
-BASE_TAG="${BASE_TAG%-pg[0-9]*}"   # tolerate a tree already switched to another major
-if [ "$MAJOR" = "$DEFAULT_MAJOR" ]; then
-  REPMGR_TAG="${BASE_TAG}"
-else
-  REPMGR_TAG="${BASE_TAG}-pg${MAJOR}"
-fi
+# Two tag shapes are accepted, because #290 changed the scheme and the chart pin moves to it
+# only once the new image is actually published (the documented two-step: publish, then bump).
+# Handling both here means that bump needs no change to this script or to CI.
+#
+#   NEW (#290):  trixie-pg<major>-<n>   -- the major is IN the tag; substitute it
+#   OLD:         trixie-<repmgr>-<n>    -- unsuffixed meant the default major; append -pgNN
+# Pattern shared verbatim with .github/workflows/pg-test.yaml -- they must agree, or a pin one
+# classifies as new-scheme and the other as legacy silently runs the wrong major (#290 review).
+case "$BASE_TAG" in
+  *pg[0-9]*-[0-9]*)
+    # New scheme: rewrite whichever major it names to the requested one.
+    REPMGR_TAG=$(printf '%s' "$BASE_TAG" | sed -E "s/(^|-)pg[0-9]+-/\1pg${MAJOR}-/")
+    ;;
+  *)
+    BASE_TAG="${BASE_TAG%-pg[0-9]*}"   # tolerate a tree already switched to another major
+    if [ "$MAJOR" = "$DEFAULT_MAJOR" ]; then
+      REPMGR_TAG="${BASE_TAG}"
+    else
+      REPMGR_TAG="${BASE_TAG}-pg${MAJOR}"
+    fi
+    ;;
+esac
 
 RENDER_SUITE="${SCRIPT_DIR}/test-template.sh"
 render_suite_before=$(cksum "$RENDER_SUITE")

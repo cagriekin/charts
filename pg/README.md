@@ -555,6 +555,14 @@ grants no pod-delete permission. For production, 3+ nodes still reduce partition
 
 All three are multi-arch (amd64/arm64), SBOM- and provenance-attested, and cosign-signed exactly like the unsuffixed tag.
 
+> **Changing with the next image release (#290).** The image no longer contains repmgr, so the
+> tag scheme stops being keyed on a repmgr version. The new image is `cagriekin/pg-ha`, published
+> as `trixie-pg18-<n>` and `trixie-pg17-<n>` — the major is **in** the tag, and there is no
+> unsuffixed "default major" alias, so a pin always names the major it wants and
+> `repmgr.image.majorVersion` cross-checks it. The table above describes the image this chart
+> pins **today**; `cagriekin/repmgr` stays published and frozen at its last tag, so existing
+> digest pins keep resolving. The chart moves in a separate step, after the new image exists.
+
 Three values move **together**; the chart refuses to render if the two majors disagree (in either direction), because a mismatch would silently run one major while building extension paths for another:
 
 ```yaml
@@ -611,7 +619,7 @@ The agent also fronts the read/write split: `pgpool` (if enabled) points at the 
 
 ### Replication Mechanics (EXPERIMENTAL, #287)
 
-repmgr ([upstream development has stalled](https://github.com/EnterpriseDB/repmgr)) is the agent's only supported replication mechanic today, but the `Mechanism` interface it is driven through (`images/repmgr/agent/internal/mechanism`) is swappable, and the reconcile loop imports only that interface — never repmgr directly. `repmgr.agent.mechanism: native` selects an alternative that drives PostgreSQL's own tools instead: `pg_ctl promote`, `pg_basebackup`, `pg_rewind`, and `primary_conninfo`/`standby.signal` written directly into an agent-owned config fragment inside `PGDATA`.
+repmgr ([upstream development has stalled](https://github.com/EnterpriseDB/repmgr)) is the agent's only supported replication mechanic today, but the `Mechanism` interface it is driven through (`images/pg-ha/agent/internal/mechanism`) is swappable, and the reconcile loop imports only that interface — never repmgr directly. `repmgr.agent.mechanism: native` selects an alternative that drives PostgreSQL's own tools instead: `pg_ctl promote`, `pg_basebackup`, `pg_rewind`, and `primary_conninfo`/`standby.signal` written directly into an agent-owned config fragment inside `PGDATA`.
 
 **`native` runs a real multi-node cluster as of #288, and is still EXPERIMENTAL — do not set it in production.** The Lease, the timeline/LSN election, fencing, and Service routing are unchanged and identical either way; that is the entire point of the `Mechanism` seam.
 
@@ -1749,32 +1757,45 @@ creates the extension idempotently on the primary via a post-install/upgrade hoo
 
 ## Replication Management
 
-Repmgr manages replication automatically. To check cluster status:
+The agent manages replication automatically. There is no `repmgr` CLI to consult any more
+(#290) — inspect the cluster through PostgreSQL itself and the Lease.
+
+Who is primary, authoritatively:
 
 ```bash
-kubectl exec -it my-postgres-pg-0 -- repmgr -f /etc/repmgr/repmgr.conf cluster show
+kubectl get lease my-postgres-pg-leader -o jsonpath='{.spec.holderIdentity}'
 ```
+
+Who is streaming, from the primary's own connection list:
+
+```bash
+kubectl exec -it my-postgres-pg-0 -- psql -U repmgr -d repmgr \
+  -c "SELECT application_name, state, sync_state, replay_lag FROM pg_stat_replication"
+```
+
+Replication slots and the WAL each is holding:
+
+```bash
+kubectl exec -it my-postgres-pg-0 -- psql -U repmgr -d repmgr \
+  -c "SELECT slot_name, active, wal_status, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained FROM pg_replication_slots"
+```
+
+The agent also exports this as metrics — `pg_ha_agent_replicas_streaming`,
+`pg_ha_agent_replicas_expected`, `pg_ha_agent_replication_slots` and the slot-WAL gauges — with
+shipped PrometheusRules, which is the better place to watch it from than a shell.
 
 ### Scaling down
 
-Scaling `postgresql.replicaCount` **down** removes the highest-ordinal pods. The
-primary now **automatically unregisters** the removed nodes from `repmgr.nodes` (#139),
-so `repmgr cluster show` no longer reports them as permanently failed and failover
-elections do not retry the gone DNS names. The primary reconciles `repmgr.nodes` against
-the live ordinal range on each tick (the lease-holding primary's agent), keyed on the
-ordinal (node id = `ordinal + 1000`),
-never on reachability — so a momentarily-down *live* node is never unregistered. Cleanup
-typically completes within a minute of the rolled pods settling; verify with:
+Scaling `postgresql.replicaCount` **down** removes the highest-ordinal pods. There is no
+`repmgr.nodes` registry to strand rows in; what a scale-down leaves behind is a **replication
+slot**, and the primary reclaims the departed ordinal's slot once its pod is gone (#289). The
+discriminator is the ordinal, never reachability, so a momentarily-down *live* node never has its
+slot dropped. Verify with the slot query above — no slot should remain for a removed ordinal.
 
-```bash
-kubectl exec -it my-postgres-pg-0 -- repmgr -f /etc/repmgr/repmgr.conf cluster show
-```
-
-> The removed pods' PVCs are retained (StatefulSet does not delete them); reclaim them
-> manually if desired. If the node being removed is the *current primary* (possible when
-> a prior failover left the primary on a high ordinal), `repmgr standby unregister`
-> refuses to drop a primary row — unregister it by hand after the cluster settles:
-> `kubectl exec -it my-postgres-pg-0 -- repmgr -f /etc/repmgr/repmgr.conf standby unregister --node-id=$((N + 1000))`.
+> The removed pods' PVCs are retained (StatefulSet does not delete them); reclaim them manually
+> if desired. If the node being removed is the *current primary* (possible when a prior failover
+> left the primary on a high ordinal), the StatefulSet still removes it and the remaining nodes
+> elect a new primary through the Lease — no manual unregistration step exists or is needed.
 
 ## PGPool-II Connection Pooling and Load Balancing
 
@@ -2494,7 +2515,7 @@ No action required if repmgr is enabled. The sequence is:
 Verify with:
 ```bash
 kubectl get lease <release>-pg-leader -n <namespace> -o jsonpath='{.spec.holderIdentity}'
-kubectl exec -n <namespace> <pod> -c postgresql -- repmgr cluster show
+kubectl exec -n <namespace> <pod> -c postgresql -- psql -U repmgr -d repmgr -c "SELECT application_name, state FROM pg_stat_replication"
 ```
 
 ### Rejoin Failed Primary as Standby
@@ -2678,7 +2699,7 @@ Node IDs follow the StatefulSet ordinals: node 0 is `my-postgres-pg-0`, node 1 i
 | Column | Meaning |
 |--------|---------|
 | `status` | `up`: attached, receives traffic. `waiting`: attached, no connection established yet. `down`: detached after `pgpool.healthCheck.maxRetries` consecutive health check failures; no traffic is routed to it. |
-| `role` | `primary` or `standby` as detected by the streaming replication check. If this disagrees with `repmgr cluster show`, restart PGPool-II. |
+| `role` | `primary` or `standby` as detected by the streaming replication check. If this disagrees with the Lease holder, restart PGPool-II. |
 | `replication_delay` | Standby lag in bytes. |
 | `select_cnt` | SELECT queries routed to the node; confirms load balancing is working. |
 

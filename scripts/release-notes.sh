@@ -23,10 +23,10 @@ tag="${2:?usage: release-notes.sh <chart> <tag>}"
 repo="${GITHUB_REPOSITORY:-cagriekin/charts}"
 
 # Paths whose changes belong in this chart's notes. Kept in step with Chart.yaml dependencies
-# and with images/repmgr, which pg/pgvector pin by tag rather than vendor.
+# and with images/pg-ha, which pg/pgvector pin by tag rather than vendor.
 paths=("${chart}/" "common/")
 case "${chart}" in
-  pg|pgvector) paths+=("etcd/" "images/repmgr/") ;;
+  pg|pgvector) paths+=("etcd/" "images/pg-ha/") ;;
 esac
 
 # The previous tag for THIS chart, by commit date. Tags are matched as <chart>-<semver> so

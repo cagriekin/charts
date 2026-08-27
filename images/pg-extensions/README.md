@@ -52,7 +52,7 @@ docker build -t registry.internal/pg-extensions:18-supabase \
 
 | Build arg | Required | Notes |
 |---|---|---|
-| `PG_MAJOR` | no (default `18`) | Must match the chart's `postgresql.majorVersion` — an extension `.so` is built against one major's server ABI and will not load into another. The default deliberately matches `images/repmgr/Dockerfile`'s so the two cannot drift apart silently |
+| `PG_MAJOR` | no (default `18`) | Must match the chart's `postgresql.majorVersion` — an extension `.so` is built against one major's server ABI and will not load into another. The default deliberately matches `images/pg-ha/Dockerfile`'s so the two cannot drift apart silently |
 | `PACKAGES` | **yes** | Space-separated Debian package names. `=version` pins work as in the chart's `packages` |
 | `APT_SOURCE_NAME` / `_KEY_URL` / `_LINE` | no | All three together or none. `APT_SOURCE_LINE` must carry `signed-by=` — without it the key fetch is decorative and the build installs unsigned packages as root |
 
@@ -133,4 +133,4 @@ bash images/pg-extensions/test/dockerfile-test.sh    # static, no build
 ```
 
 CI additionally builds the image for both supported majors and runs the chart's own copy
-command verbatim against the result (`.github/workflows/repmgr-image-test.yaml`).
+command verbatim against the result (`.github/workflows/pg-ha-image-test.yaml`).

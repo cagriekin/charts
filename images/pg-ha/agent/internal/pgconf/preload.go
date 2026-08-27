@@ -35,7 +35,7 @@ var preloadAssignRe = regexp.MustCompile(`(?i)^([ \t]*)` + preloadGUC + `(?:[ \t
 // apply instead of pinning it.
 //
 // This exists because `shared_preload_libraries = 'repmgr'` is persisted INSIDE the data
-// directory -- images/repmgr/entrypoint.sh appends it at initdb time, and every standby
+// directory -- images/pg-ha/entrypoint.sh appends it at initdb time, and every standby
 // clones it verbatim -- so it survives any chart change and any helm rollback (#293). Once
 // the repmgr package leaves the image (#290) a data directory still asking for repmgr.so
 // is a postmaster that will not start, on every pod simultaneously. Removing it has to
@@ -271,6 +271,17 @@ func splitPreloadValue(s string) (value, trailing string) {
 // copy there silently outranks the agent's and cannot be fixed by rewriting the fragment.
 var recoveryGUCs = []string{"primary_conninfo", "primary_slot_name"}
 
+// recoveryGUCRes are the compiled matchers for recoveryGUCs, built once. Both
+// ForeignRecoveryConfig and RemoveRecoveryConfig walk every line of auto.conf on every boot,
+// and RemoveRecoveryConfig used to compile these inside its per-line x per-GUC loop.
+var recoveryGUCRes = func() []*regexp.Regexp {
+	res := make([]*regexp.Regexp, len(recoveryGUCs))
+	for i, guc := range recoveryGUCs {
+		res[i] = regexp.MustCompile(`(?i)^[ \t]*` + guc + `(?:[ \t]*=|[ \t]+)`)
+	}
+	return res
+}()
+
 // ForeignRecoveryConfig reports which recovery GUCs postgresql.auto.conf sets, if any.
 //
 // Under the native mechanism nothing should: the agent writes them into its managed fragment,
@@ -295,17 +306,72 @@ func ForeignRecoveryConfig(confPath string) ([]string, error) {
 		return nil, fmt.Errorf("read %s: %w", confPath, err)
 	}
 	var found []string
-	for _, guc := range recoveryGUCs {
-		re := regexp.MustCompile(`(?i)^[ \t]*` + guc + `(?:[ \t]*=|[ \t]+)`)
+	for i, re := range recoveryGUCRes {
 		for _, ln := range strings.Split(string(data), "\n") {
 			if strings.HasPrefix(strings.TrimLeft(ln, " \t"), "#") {
 				continue
 			}
 			if re.MatchString(ln) {
-				found = append(found, guc)
+				found = append(found, recoveryGUCs[i])
 				break
 			}
 		}
 	}
 	return found, nil
+}
+
+// RemoveRecoveryConfig deletes every active primary_conninfo / primary_slot_name assignment from
+// confPath and reports which it removed. This is the migration half of ForeignRecoveryConfig
+// (#292): that function detects the state, this one clears it.
+//
+// It exists for one job -- upgrading a cluster created by a chart 1.x release. repmgr's
+// `standby clone` / `standby follow` wrote those two settings into postgresql.auto.conf, which
+// PostgreSQL reads after every include and which therefore outranks the fragment the native
+// mechanism writes. Until they are gone the agent cannot steer the standby at all: Follow appears
+// to succeed while the walreceiver keeps the old upstream and the old slot.
+//
+// Whole lines go, not just the values: an empty primary_conninfo is not the same as an absent one
+// (an empty string is a valid setting meaning "do not stream"), so blanking them would leave a
+// standby that never connects. Removing them lets the agent's fragment become the only definition.
+//
+// SAFE TO EDIT auto.conf here only because the caller runs with the postmaster STOPPED -- from the
+// startup preflight, before anything is started. PostgreSQL rewrites this file wholesale on every
+// ALTER SYSTEM, so an edit racing a running server would be lost or would lose the server's own
+// write. #308's EnsurePrimaryConninfoDBName edits the same file under the same rule.
+//
+// Idempotent: a second call on a cleared file reports nothing removed and rewrites nothing.
+func RemoveRecoveryConfig(confPath string) ([]string, error) {
+	data, err := os.ReadFile(confPath)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", confPath, err)
+	}
+	var removed []string
+	kept := make([]string, 0)
+	for _, ln := range strings.Split(string(data), "\n") {
+		matched := ""
+		if !strings.HasPrefix(strings.TrimSpace(ln), "#") {
+			for i, re := range recoveryGUCRes {
+				if re.MatchString(ln) {
+					matched = recoveryGUCs[i]
+					break
+				}
+			}
+		}
+		if matched != "" {
+			removed = append(removed, matched)
+			continue
+		}
+		kept = append(kept, ln)
+	}
+	if len(removed) == 0 {
+		return nil, nil
+	}
+	content := strings.TrimRight(strings.Join(kept, "\n"), "\n") + "\n"
+	if err := writeFileAtomic(confPath, []byte(content), 0o600); err != nil {
+		return nil, fmt.Errorf("write %s: %w", confPath, err)
+	}
+	return removed, nil
 }

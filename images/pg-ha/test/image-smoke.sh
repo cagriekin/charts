@@ -1,29 +1,26 @@
 #!/bin/bash
-# Smoke-test a BUILT repmgr image: assert it really bundles the PostgreSQL major it
-# claims, and that everything the chart depends on is present and runnable (#269).
+# Smoke-test a BUILT pg-ha image: assert it really bundles the PostgreSQL major it claims,
+# that everything the chart depends on is present and runnable (#269), and that repmgr is
+# genuinely gone (#290).
 #
 # scripts-test.sh checks the shell logic without a container; this checks the artifact.
 # The two together are what make `--build-arg PG_MAJOR=17` trustworthy: a build can
 # succeed, ship a working PG17 server, and still be unusable because a per-major
 # package resolved to a different version than the tag advertises.
 #
-# Usage: bash images/repmgr/test/image-smoke.sh <image-ref> <expected-pg-major>
-#   bash images/repmgr/test/image-smoke.sh cagriekin/repmgr:trixie-5.5.0-31-pg17 17
+# Usage: bash images/pg-ha/test/image-smoke.sh <image-ref> <expected-pg-major>
+#   bash images/pg-ha/test/image-smoke.sh cagriekin/pg-ha:trixie-pg17-1 17
 set -uo pipefail
 
 IMAGE="${1:?usage: image-smoke.sh <image-ref> <expected-pg-major>}"
 WANT_MAJOR="${2:?usage: image-smoke.sh <image-ref> <expected-pg-major>}"
 
-# repmgr version to expect, DERIVED from the image tag (trixie-<repmgr>-<n>[-pgNN]) rather
-# than hardcoded. PGDG packages repmgr per major and the Dockerfile pins no repmgr version,
-# so 17 and 18 could carry different ones -- which would make the tag a lie. Deriving keeps
-# the assertion meaningful when PGDG moves on: a tag claiming 5.5.0 that ships 5.6.0 fails
-# with an obvious remedy (publish trixie-5.6.0-N), whereas a hardcoded expectation would
-# block every build and every PR until the test file was edited. Tags that do not encode a
-# version (local `repmgr:smoke-pg17` builds) fall back to the looser cross-check below.
-if [ -z "${WANT_REPMGR:-}" ]; then
-  WANT_REPMGR=$(printf '%s' "${IMAGE##*:}" | sed -nE 's/^trixie-([0-9]+\.[0-9]+\.[0-9]+)-.*/\1/p')
-fi
+# The repmgr version this used to derive from the tag is gone with the package (#290): there
+# is no repmgr to hold to a version.
+#
+# The TAG SCHEME changed with it: pg-ha-image-publish.yaml now takes a git tag `pg-ha-<n>` and
+# publishes cagriekin/pg-ha:trixie-pg<major>-<n>, keyed on the PostgreSQL major -- the thing one
+# build actually bundles -- rather than on a repmgr version the image no longer contains.
 
 fail=0
 ok()  { echo "PASS: $1"; }
@@ -31,7 +28,7 @@ bad() { echo "FAIL: $1"; [ -n "${2:-}" ] && echo "      $2"; fail=1; }
 
 command -v docker >/dev/null 2>&1 || { echo "docker is required to smoke-test an image" >&2; exit 1; }
 
-echo "=== SMOKE: ${IMAGE} (expecting PostgreSQL ${WANT_MAJOR}, repmgr ${WANT_REPMGR:-<derived from the running image>}) ==="
+echo "=== SMOKE: ${IMAGE} (expecting PostgreSQL ${WANT_MAJOR}, and NO repmgr) ==="
 
 # One container run collects everything as KEY=value lines, so the assertions below are
 # named and independent while paying the container startup cost once. Each probe falls
@@ -49,19 +46,27 @@ echo "BINDIR_EXISTS=$([ -d "$BINDIR" ] && echo yes || echo no)"
 echo "POSTGRES_VERSION=$("$BINDIR/postgres" --version 2>&1 | head -1)"
 echo "PG_CTL=$([ -x "$BINDIR/pg_ctl" ] && echo yes || echo MISSING)"
 echo "PG_CONTROLDATA=$([ -x "$BINDIR/pg_controldata" ] && echo yes || echo MISSING)"
-# The agent repmgr mechanism invokes repmgr bare (no PATH manipulation), so resolve it the
-# same way -- via the default PATH. repmgrd is no longer probed: nothing runs it since the
-# repmgrd failover path was removed (#286); the binary still ships only because it comes in
-# the same PGDG package as the repmgr CLI.
+# #290: repmgr must be ABSENT. Probed exactly as a container that never extends PATH would
+# resolve it, plus the library, OS user and directories the package created.
 # NOTE: this whole block is a single-quoted bash -c string. No apostrophes, no backticks.
 echo "REPMGR_RESOLVED=$(PATH="$IMAGE_PATH" command -v repmgr 2>/dev/null || echo MISSING)"
-echo "REPMGR_VERSION=$(repmgr --version 2>&1 | head -1)"
+echo "REPMGR_SO=$([ -f "/usr/lib/postgresql/${PG_MAJOR:-unset}/lib/repmgr.so" ] && echo PRESENT || echo ABSENT)"
+echo "REPMGR_USER=$(id -u repmgr 2>/dev/null || echo ABSENT)"
+REPMGR_DIRS_FOUND=$(ls -d /etc/repmgr /var/log/repmgr 2>/dev/null | tr "\n" "," | sed "s/,$//")
+echo "REPMGR_DIRS=${REPMGR_DIRS_FOUND:-ABSENT}"
 echo "PGBACKREST_VERSION=$(pgbackrest version 2>&1 | head -1)"
 echo "JQ=$(command -v jq || echo MISSING)"
 echo "GOSU=$(command -v gosu || echo MISSING)"
 echo "CRON=$(command -v cron || echo MISSING)"
 echo "KUBECTL=$(command -v kubectl 2>/dev/null || echo ABSENT)"
 echo "AGENT=$([ -x /usr/local/bin/pg-ha-agent ] && echo yes || echo MISSING)"
+# The postgres uid/gid are load-bearing OUTSIDE this image: the chart chowns PGDATA to a
+# literal 101:103 and pins runAsUser/runAsGroup to the same. They are allocated by the apt
+# run, so any change to the package set can move them (#290 dropped a package) -- and the
+# failure would surface only after a tag bump, as "data directory has invalid permissions"
+# on every pod, with nothing in CI having looked.
+echo "POSTGRES_UID=$(id -u postgres 2>/dev/null || echo MISSING)"
+echo "POSTGRES_GID=$(id -g postgres 2>/dev/null || echo MISSING)"
 echo "PGAUDIT_SO=$([ -f "/usr/lib/postgresql/${PG_MAJOR:-unset}/lib/pgaudit.so" ] && echo yes || echo MISSING)"
 
 # pgaudit must LOAD, not merely be installed: the chart adds it to
@@ -160,37 +165,36 @@ for probe_key in JQ GOSU CRON; do
   esac
 done
 
-# The agent shells out to `repmgr` with no PATH manipulation, so bare resolution must
-# work for whichever major is installed.
+# #290: repmgr must be genuinely ABSENT, not merely unused. This is the acceptance criterion
+# the issue states as `docker run <image> repmgr` failing -- an image that still carries the
+# binary would let a re-introduced code path work in testing and fail only where the package
+# was actually dropped.
 for probe_key in REPMGR_RESOLVED; do
   got=$(val "$probe_key")
   case "$got" in
-    /*) ok "${probe_key} resolves on the default PATH (${got})" ;;
-    *)  bad "${probe_key} does not resolve on the default PATH; the agent's repmgr mechanism would fail" "got ${got}" ;;
+    MISSING) ok "#290: repmgr does not resolve on the default PATH (absent)" ;;
+    *) bad "#290: repmgr is still installed at ${got}; the image is supposed to be repmgr-free" ;;
+  esac
+done
+for probe_key in REPMGR_SO REPMGR_USER REPMGR_DIRS; do
+  got=$(val "$probe_key")
+  case "$got" in
+    ABSENT) ok "#290: ${probe_key} is absent" ;;
+    *) bad "#290: ${probe_key} is still present (${got})" ;;
   esac
 done
 
-# A different repmgr version per major would make the trixie-<repmgr>-<n> tag scheme
-# misleading, and puts the cluster on a version the chart was never tested against.
-repmgr_v=$(val REPMGR_VERSION)
-if [ -n "$WANT_REPMGR" ]; then
-  # The tag names a version, so hold the image to it: a mismatch means the tag lies, and
-  # the remedy is to publish under the version PGDG now ships.
-  for probe_key in REPMGR_VERSION; do
-    got=$(val "$probe_key")
-    case "$got" in
-      *"${WANT_REPMGR}"*) ok "${probe_key} is ${WANT_REPMGR} (${got})" ;;
-      *) bad "${probe_key} is not ${WANT_REPMGR} as the tag ${IMAGE##*:} advertises; publish under the version PGDG now ships (or pass WANT_REPMGR)" "$got" ;;
-    esac
-  done
-else
-  # Untagged/local build: no version to hold it to, but the binary must still report one.
-  case "$repmgr_v" in
-    "repmgr "[0-9]*) ok "repmgr reports a version (${repmgr_v})" ;;
-    *) bad "repmgr did not report a version" "$repmgr_v" ;;
-  esac
-  echo "note: ${IMAGE##*:} encodes no repmgr version, so the exact-version check was skipped"
-fi
+# The chart hardcodes these two numbers (pg/values.yaml runAsUser/runAsGroup and the
+# statefulset's `chown -R 101:103`), so the image has to keep its side of the bargain.
+for pair in "POSTGRES_UID=101" "POSTGRES_GID=103"; do
+  probe_key="${pair%%=*}"; want="${pair##*=}"
+  got=$(val "$probe_key")
+  if [ "$got" = "$want" ]; then
+    ok "${probe_key} is ${want}, matching what the chart chowns PGDATA to"
+  else
+    bad "${probe_key} is ${got}, but the chart chowns PGDATA to 101:103 and pins runAsUser/runAsGroup -- every pod would fail at postmaster start with \"data directory has invalid permissions\"" "an apt package-set change can move a system uid; update the chart and this assertion together, deliberately"
+  fi
+done
 
 pgbr=$(val PGBACKREST_VERSION)
 case "$pgbr" in
