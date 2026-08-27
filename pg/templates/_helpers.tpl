@@ -19,7 +19,7 @@ clear hint instead of a confusing API rejection at apply / first scheduled run.
 Small default resources for the lightweight init containers (chown, cp, config-gen).
 Init containers without requests/limits make every pod Forbidden in ResourceQuota-
 enforced namespaces (#153). repmgr-init (the standby clone) is heavier and uses its own
-values-overridable repmgr.initContainerResources instead.
+values-overridable ha.initContainerResources instead.
 */}}
 {{- define "pg.initResources" -}}
 requests:
@@ -91,8 +91,8 @@ annotation consumers -- #128.)
 {{- /* repmgr image reference: repository:tag, with @digest appended when set so a
        digest pin (supply-chain) overrides the mutable tag. */ -}}
 {{- define "pg.repmgrImage" -}}
-{{- printf "%s:%s" .Values.repmgr.image.repository .Values.repmgr.image.tag -}}
-{{- with .Values.repmgr.image.digest }}@{{ . }}{{- end -}}
+{{- printf "%s:%s" .Values.ha.image.repository .Values.ha.image.tag -}}
+{{- with .Values.ha.image.digest }}@{{ . }}{{- end -}}
 {{- end -}}
 
 {{- /* PG_MAJOR for every container that runs the repmgr image (#269). The image sets
@@ -104,9 +104,9 @@ annotation consumers -- #128.)
        unsuffixed PG18 tag) would run the wrong major silently. Repmgr mode only: in
        standalone mode the server is the official postgres image, which ignores it. */ -}}
 {{- define "pg.pgMajorEnv" -}}
-{{- if .Values.repmgr.enabled -}}
+{{- if .Values.ha.enabled -}}
 - name: PG_MAJOR
-  value: {{ required "repmgr.image.majorVersion is required" .Values.repmgr.image.majorVersion | quote }}
+  value: {{ required "ha.image.majorVersion is required" .Values.ha.image.majorVersion | quote }}
 {{- end -}}
 {{- end -}}
 
@@ -250,7 +250,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- /* Reserve the chart-internal identifiers UNCONDITIONALLY (even when repmgr / the
        monitoring user are currently disabled): a declared role colliding with one that a
        later `helm upgrade` enables would produce conflicting role management. */ -}}
-{{- $reserved := list "postgres" "template0" "template1" .Values.postgresql.username .Values.repmgr.username .Values.prometheusExporter.monitoringUser.username -}}
+{{- $reserved := list "postgres" "template0" "template1" .Values.postgresql.username .Values.ha.username .Values.prometheusExporter.monitoringUser.username -}}
 {{- /* Precompute the declared role names and the databases a grant may target (declared
        databases + the primary database) so memberOf/grant refs can be checked at render
        time -- they may reference an entry declared later in the list. */ -}}
@@ -322,7 +322,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        operator-declared value: repmgr (replication) and/or pgaudit (#219). In standalone
        mode with audit off there is nothing to preserve, so the operator's value passes
        through custom.conf untouched.
-       #293: the repmgr clause is gated on the MECHANISM, not merely repmgr.enabled. Its
+       #293: the repmgr clause is gated on the MECHANISM, not merely ha.enabled. Its
        whole purpose is preserving `repmgr` across an operator-declared value, and under
        native pg.sharedPreloadLibraries no longer emits repmgr at all (#288) -- so keeping
        the clause there would render a repmgr-preload.conf that merely restates the
@@ -330,13 +330,13 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        the standalone behaviour: the operator's value passes through custom.conf. This does
        not move the default (repmgr) render. */ -}}
 {{- define "pg.chartOwnsSharedPreloadLibraries" -}}
-{{- if or .Values.postgresql.audit.enabled (and .Values.repmgr.enabled (ne ((.Values.repmgr.agent).mechanism | default "native") "native") (eq (include "pg.userSetSharedPreloadLibraries" .) "true")) -}}true{{- end -}}
+{{- if or .Values.postgresql.audit.enabled (and .Values.ha.enabled (ne ((.Values.ha.agent).mechanism | default "native") "native") (eq (include "pg.userSetSharedPreloadLibraries" .) "true")) -}}true{{- end -}}
 {{- end -}}
 
 {{- /* The authoritative shared_preload_libraries value. Rendered into a conf.d file that
        sorts after custom.conf under include_dir and therefore wins -- so it MUST
        reassemble the FULL list, not just the chart's own libraries.
-         - repmgr is kept whenever repmgr.enabled: replication and the repmgr GUCs depend
+         - repmgr is kept whenever ha.enabled: replication and the repmgr GUCs depend
            on the preload, and the repmgr image entrypoint writes
            `shared_preload_libraries = 'repmgr'` into PGDATA/postgresql.conf, which any
            conf.d value overrides. Dropping it disables failover (#262 review).
@@ -348,7 +348,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        audit-gated merge meant an operator-set value with audit OFF silently dropped
        repmgr and broke HA failover. */ -}}
 {{- /* #288: `repmgr` is prepended only under the repmgr MECHANISM, not merely when
-       repmgr.enabled. Under `native` there is no repmgr extension on the cluster, so preloading
+       ha.enabled. Under `native` there is no repmgr extension on the cluster, so preloading
        repmgr.so is dead weight -- and because these fragments load via conf.d's include_dir they
        would OVERRIDE the entrypoint's native gate, putting the library back on a cluster that
        has nothing to use it. Benign only while the package is still in the image: it makes every
@@ -364,7 +364,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- $t := trim $l -}}
   {{- if and $t (not (has $t $libs)) -}}{{- $libs = append $libs $t -}}{{- end -}}
 {{- end -}}
-{{- if and .Values.repmgr.enabled (ne ((.Values.repmgr.agent).mechanism | default "native") "native") (not (has "repmgr" $libs)) -}}{{- $libs = prepend $libs "repmgr" -}}{{- end -}}
+{{- if and .Values.ha.enabled (ne ((.Values.ha.agent).mechanism | default "native") "native") (not (has "repmgr" $libs)) -}}{{- $libs = prepend $libs "repmgr" -}}{{- end -}}
 {{- if and .Values.postgresql.audit.enabled (not (has "pgaudit" $libs)) -}}{{- $libs = append $libs "pgaudit" -}}{{- end -}}
 {{- join "," $libs -}}
 {{- end -}}
@@ -378,8 +378,8 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        GUC in pgaudit.conf. */ -}}
 {{- define "pg.validateAudit" -}}
 {{- if .Values.postgresql.audit.enabled -}}
-  {{- if not .Values.repmgr.enabled -}}
-    {{- fail "postgresql.audit.enabled requires repmgr.enabled=true: audit logging needs the cagriekin/repmgr image, which bundles pgaudit. Standalone mode uses the stock postgres image (no pgaudit) and would fail to start on shared_preload_libraries. To audit in standalone mode, build a postgresql.image that ships pgaudit." -}}
+  {{- if not .Values.ha.enabled -}}
+    {{- fail "postgresql.audit.enabled requires ha.enabled=true: audit logging needs the HA image (ha.image), which bundles pgaudit. Standalone mode uses the stock postgres image (no pgaudit) and would fail to start on shared_preload_libraries. To audit in standalone mode, build a postgresql.image that ships pgaudit." -}}
   {{- end -}}
   {{- $allowed := list "read" "write" "function" "role" "ddl" "misc" "misc_set" "all" -}}
   {{- $log := .Values.postgresql.audit.log | default "" | toString -}}
@@ -844,13 +844,13 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        cluster; fail at render time instead. Scoped to agent mode, matching the
        postgresql-configmap.yaml/statefulset.yaml render condition. That scoping is
        vestigial since 2.0.0 -- #286 made the agent the only failover path, so
-       pg.agentMode is true whenever repmgr.enabled is -- but it is kept because it still
-       distinguishes a standalone (repmgr.enabled: false) install, which renders none of
+       pg.agentMode is true whenever ha.enabled is -- but it is kept because it still
+       distinguishes a standalone (ha.enabled: false) install, which renders none of
        this and must not be blocked by a leftover value. */}}
 {{- define "pg.validateSyncReplicationSlotsMajor" -}}
-{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
+{{- if and (eq (include "pg.agentMode" .) "true") .Values.ha.agent.syncReplicationSlots }}
 {{- if lt (atoi (toString .Values.postgresql.majorVersion)) 17 }}
-{{- fail (printf "repmgr.agent.syncReplicationSlots requires PostgreSQL 17+ (synchronized_standby_slots and the sync_replication_slots worker were introduced in 17), but postgresql.majorVersion=%q. Set postgresql.majorVersion to \"17\" or \"18\", or set repmgr.agent.syncReplicationSlots to false." (toString .Values.postgresql.majorVersion)) }}
+{{- fail (printf "ha.agent.syncReplicationSlots requires PostgreSQL 17+ (synchronized_standby_slots and the sync_replication_slots worker were introduced in 17), but postgresql.majorVersion=%q. Set postgresql.majorVersion to \"17\" or \"18\", or set ha.agent.syncReplicationSlots to false." (toString .Values.postgresql.majorVersion)) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -862,9 +862,9 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        forever, so every standby logs a repeating "wal_level" error. Same agent-mode
        scoping as pg.validateSyncReplicationSlotsMajor. */}}
 {{- define "pg.validateSyncReplicationSlotsWalLevel" -}}
-{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
+{{- if and (eq (include "pg.agentMode" .) "true") .Values.ha.agent.syncReplicationSlots }}
 {{- if ne (.Values.postgresql.walLevel | default "replica") "logical" }}
-{{- fail (printf "repmgr.agent.syncReplicationSlots requires postgresql.walLevel: logical (the sync_replication_slots worker it enables on every standby fails its own startup validation below that, and PostgreSQL restarts it forever, logging the failure on a fixed interval), but postgresql.walLevel=%q. Set postgresql.walLevel to \"logical\", or set repmgr.agent.syncReplicationSlots to false." (.Values.postgresql.walLevel | default "replica")) }}
+{{- fail (printf "ha.agent.syncReplicationSlots requires postgresql.walLevel: logical (the sync_replication_slots worker it enables on every standby fails its own startup validation below that, and PostgreSQL restarts it forever, logging the failure on a fixed interval), but postgresql.walLevel=%q. Set postgresql.walLevel to \"logical\", or set ha.agent.syncReplicationSlots to false." (.Values.postgresql.walLevel | default "replica")) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -888,7 +888,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        requested module is genuinely absent; this stops it being requested in the first
        place. */ -}}
 {{- define "pg.validateNativePreloadRepmgr" -}}
-{{- if and (eq (include "pg.agentMode" .) "true") (eq ((.Values.repmgr.agent).mechanism | default "native") "native") }}
+{{- if and (eq (include "pg.agentMode" .) "true") (eq ((.Values.ha.agent).mechanism | default "native") "native") }}
 {{- /* Match the way PostgreSQL resolves an entry, not the literal string: `repmgr`,
        `repmgr.so`, `$libdir/repmgr` and an absolute path to repmgr.so all load the same
        library, because PostgreSQL supplies `$libdir/` and `.so` itself when they are
@@ -909,7 +909,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- range $k, $v := (.Values.postgresql.configuration | default dict) }}
   {{- if eq (lower ($k | toString)) "shared_preload_libraries" }}{{- $user = $v | toString }}{{- end }}
 {{- end }}
-{{- fail (printf "postgresql.configuration.shared_preload_libraries includes \"repmgr\" (got %q) but repmgr.agent.mechanism is \"native\": a native cluster has no repmgr extension, and this value loads via conf.d's include_dir so it OVERRIDES the image's native gate and preloads repmgr.so anyway. That makes the cluster unstartable (\"could not access file \\\"repmgr\\\"\") as soon as the repmgr-free image ships (#290/#293), on every pod at once, and helm rollback cannot fix it because the line is cloned into each data directory. Fix: drop \"repmgr\" from the list -- the chart adds nothing to it any more, so if repmgr was the only entry, omit the key entirely. There is no mechanism to switch back to: #294 removed the repmgr one." $user) }}
+{{- fail (printf "postgresql.configuration.shared_preload_libraries includes \"repmgr\" (got %q) but ha.agent.mechanism is \"native\": a native cluster has no repmgr extension, and this value loads via conf.d's include_dir so it OVERRIDES the image's native gate and preloads repmgr.so anyway. That makes the cluster unstartable (\"could not access file \\\"repmgr\\\"\") as soon as the repmgr-free image ships (#290/#293), on every pod at once, and helm rollback cannot fix it because the line is cloned into each data directory. Fix: drop \"repmgr\" from the list -- the chart adds nothing to it any more, so if repmgr was the only entry, omit the key entirely. There is no mechanism to switch back to: #294 removed the repmgr one." $user) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -1366,25 +1366,171 @@ volumes:
 {{- end }}
 {{- end }}
 
+{{- /*
+pg.validateEtcdBootstrapImage -- the bundled etcd's RBAC-bootstrap Job runs `pg-ha-agent
+rbac-bootstrap`, so it must run the SAME image as the database pods. pg/values.yaml pins
+etcd.rbac.bootstrapImage to match ha.image and its comment says to keep them in lockstep --
+but nothing enforced it, so the next image bump would silently reintroduce the drift this
+change fixed by hand (#291 review). Verified drift: setting ha.image to
+cagriekin/pg-ha:2.0.0-pg18 rendered the database pods on the new image and the bootstrap Job
+still on cagriekin/repmgr:trixie-5.5.0-33 -- one agent build writing the etcd RBAC that a
+different build then authenticates against.
+
+Only checked when the bundled etcd is enabled: with an external etcd the Job never renders and
+a stale pin there is inert. A mismatch fails rather than auto-following, because silently
+overriding a subchart value the operator set is worse than naming the two keys that disagree --
+and a legitimate BYO case (an air-gapped mirror holding only one of the two) has to be theirs
+to acknowledge, not the chart's to assume.
+*/ -}}
+{{- define "pg.validateEtcdBootstrapImage" -}}
+{{- if (.Values.etcd).enabled -}}
+{{- $ha := .Values.ha.image | default dict -}}
+{{- $boot := ((.Values.etcd).rbac).bootstrapImage | default dict -}}
+{{- $haRef := printf "%s:%s" ($ha.repository | default "") ($ha.tag | default "") -}}
+{{- $bootRef := printf "%s:%s" ($boot.repository | default "") ($boot.tag | default "") -}}
+{{- if ne $haRef $bootRef -}}
+{{- fail (printf "etcd.rbac.bootstrapImage (%s) must match ha.image (%s): the bundled etcd's RBAC-bootstrap Job runs `pg-ha-agent rbac-bootstrap` from that image, so a mismatch has one agent build writing the etcd RBAC that a different build then authenticates against. Set etcd.rbac.bootstrapImage.repository and .tag to the same values as ha.image.repository and .tag -- both move together on every image bump. If you genuinely need different images (an air-gapped mirror holding only one), use an external etcd instead: leave etcd.enabled=false and point ha.agent.dcs.etcd.endpoints at your own cluster." $bootRef $haRef) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+pg.durationMs -- a Go duration string as a number of milliseconds, or "" when the string is not
+a Go duration. Exists only for pg.validateLeaseTimings below.
+
+The grammar mirrors time.ParseDuration deliberately, because BOTH directions of divergence are
+bugs and this helper has now had one of each (#291 review):
+
+  - too permissive => the guard skips input the agent will reject, and the render-clean /
+    CrashLoopBackOff outcome the guard exists to prevent happens anyway. `lower` was here once,
+    which made "15S" and "1M30S" parse; Go's units are case-SENSITIVE, so both are errors.
+  - too strict => the guard rejects input the agent accepts, turning a working 1.x value into a
+    hard render failure on upgrade. ".5s" and "+15s" are valid Go durations and were refused.
+
+So: an optional leading sign (Go allows one, at the front only), then one or more
+<number><unit> pairs, where the number may omit either side of the decimal point (".5", "5.",
+"5.5", "5") and the unit is one of Go's, including both spellings of microseconds -- "us",
+U+00B5 "µs" and U+03BC "μs", all three of which time.ParseDuration takes.
+
+An empty string is NOT a duration ("" is an error in Go), and reporting "" for it is correct
+here -- but the caller must be careful not to have replaced it with a default first.
+*/ -}}
+{{- define "pg.durationMs" -}}
+{{- $d := . | toString | trim -}}
+{{- $num := "([0-9]+(\\.[0-9]*)?|\\.[0-9]+)" -}}
+{{- $unit := "(ns|us|µs|μs|ms|s|m|h)" -}}
+{{- $pair := printf "%s%s" $num $unit -}}
+{{- if regexMatch (printf "^[+-]?(%s)+$" $pair) $d -}}
+{{- $sign := 1.0 -}}
+{{- $body := $d -}}
+{{- if hasPrefix "-" $d -}}{{- $sign = -1.0 -}}{{- $body = trimPrefix "-" $d -}}
+{{- else if hasPrefix "+" $d -}}{{- $body = trimPrefix "+" $d -}}
+{{- end -}}
+{{- $total := 0.0 -}}
+{{- range $tok := regexFindAll $pair $body -1 -}}
+{{- $mult := 0.0 -}}
+{{- if hasSuffix "ms" $tok -}}{{- $mult = 1.0 -}}
+{{- else if hasSuffix "ns" $tok -}}{{- $mult = 0.000001 -}}
+{{- else if or (hasSuffix "us" $tok) (hasSuffix "µs" $tok) (hasSuffix "μs" $tok) -}}{{- $mult = 0.001 -}}
+{{- else if hasSuffix "h" $tok -}}{{- $mult = 3600000.0 -}}
+{{- else if hasSuffix "m" $tok -}}{{- $mult = 60000.0 -}}
+{{- else if hasSuffix "s" $tok -}}{{- $mult = 1000.0 -}}
+{{- end -}}
+{{- $n := regexFind (printf "^%s" $num) $tok -}}
+{{- /* float64 cannot cast "5." or ".5" -- Go's duration grammar allows either side of the
+       point to be omitted, so pad both ends before casting. Without this, "5.s" (a valid 5s)
+       cast to 0 and then failed the ORDERING check, which is a confusing error for a value
+       that is not actually wrong. */ -}}
+{{- if hasPrefix "." $n -}}{{- $n = printf "0%s" $n -}}{{- end -}}
+{{- if hasSuffix "." $n -}}{{- $n = printf "%s0" $n -}}{{- end -}}
+{{- $total = addf $total (mulf (float64 $n) $mult) -}}
+{{- end -}}
+{{- mulf $total $sign -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+pg.haAgentDuration -- the effective value of one ha.agent duration key, WITHOUT collapsing an
+explicitly-set empty string into the chart default. `$agent.x | default "15s"` does collapse it,
+which is how an empty leaseDuration used to be validated as 15s while statefulset.yaml emitted
+`value: ""` -- and Go rejects "", so config.Load fail-fasts and every pod CrashLoopBackOffs
+after a clean render (#291 review). hasKey is the distinction `default` cannot make.
+*/ -}}
+{{- define "pg.haAgentDuration" -}}
+{{- $agent := index . 0 -}}
+{{- $key := index . 1 -}}
+{{- if hasKey $agent $key -}}{{- index $agent $key | toString -}}{{- else -}}{{- index . 2 -}}{{- end -}}
+{{- end -}}
+
+{{- define "pg.validateLeaseTimings" -}}
+{{- $agent := .Values.ha.agent | default dict -}}
+{{- /* Every ha.agent key the agent parses with time.ParseDuration, not just the ordering
+       triple: config.Load treats them all the same way, so an unparseable reconcileInterval
+       refuses the boot exactly like an unparseable leaseDuration (#291 review). Defaults here
+       must match values.yaml. */ -}}
+{{- $durations := list
+      (list "leaseDuration"     (include "pg.haAgentDuration" (list $agent "leaseDuration"     "15s")))
+      (list "renewDeadline"     (include "pg.haAgentDuration" (list $agent "renewDeadline"     "10s")))
+      (list "retryPeriod"       (include "pg.haAgentDuration" (list $agent "retryPeriod"       "2s")))
+      (list "reconcileInterval" (include "pg.haAgentDuration" (list $agent "reconcileInterval" "5s"))) -}}
+{{- /* First: is each one a duration at all? A non-duration is a HARD failure, not a skip --
+       time.ParseDuration rejects `15`, `20 s`, `15S` and ``, so the agent would refuse to start
+       and every pod would CrashLoopBackOff after a clean render (#291 review). */ -}}
+{{- range $entry := $durations -}}
+{{- if eq (include "pg.durationMs" (index $entry 1)) "" -}}
+{{- fail (printf "ha.agent.%s is %q, which is not a Go duration: it needs a unit, no spaces, and lower-case units, e.g. \"15s\", \"500ms\", \"1m30s\". Note the units are case-SENSITIVE (\"15S\" is an error) and an empty value is not a duration either. The agent parses this with time.ParseDuration and refuses to start if it fails, so an unparseable value renders cleanly and then CrashLoopBackOffs every postgresql pod with no primary." (index $entry 0) (index $entry 1)) -}}
+{{- end -}}
+{{- end -}}
+{{- $ldRaw := index (index $durations 0) 1 -}}
+{{- $rdRaw := index (index $durations 1) 1 -}}
+{{- $rpRaw := index (index $durations 2) 1 -}}
+{{- $ld := float64 (include "pg.durationMs" $ldRaw) -}}
+{{- $rd := float64 (include "pg.durationMs" $rdRaw) -}}
+{{- $rp := float64 (include "pg.durationMs" $rpRaw) -}}
+{{- if not (and (gt $ld $rd) (gt $rd $rp)) -}}
+{{- fail (printf "ha.agent lease timings must satisfy leaseDuration > renewDeadline > retryPeriod, but got leaseDuration=%s renewDeadline=%s retryPeriod=%s. client-go's leader election requires it and the agent refuses to start otherwise, so this would render cleanly and then CrashLoopBackOff every postgresql pod at once with no primary. If these came from two different values files, check for a MIXTURE of the deprecated repmgr.agent.* spelling and the canonical ha.agent.* one: where a key is set under both names the repmgr.* value wins, so one timing can come from a 1.x file while the other two come from a newer -f, producing a triple neither file contains. Set all three under the same name (ha.agent.*), or delete the repmgr.agent.* copies." $ldRaw $rdRaw $rpRaw) -}}
+{{- end -}}
+{{- /* The etcd backend adds a floor of its own: its lease TTL is whole seconds, so config.go
+       requires LEASE_DURATION >= 5s there. Same failure shape as above -- valid ordering, clean
+       render, refused boot -- so it belongs in the same guard (#291 review). */ -}}
+{{- if and (eq (($agent.dcs).backend | default "kubernetes") "etcd") (lt $ld 5000.0) -}}
+{{- fail (printf "ha.agent.leaseDuration is %s, but the etcd DCS backend requires at least 5s: its lease TTL is expressed in whole seconds, so the agent refuses to start below that (and would CrashLoopBackOff every pod after a clean render). Raise leaseDuration to 5s or more -- keeping leaseDuration > renewDeadline > retryPeriod -- or use ha.agent.dcs.backend: kubernetes." $ldRaw) -}}
+{{- end -}}
+{{- end -}}
+
 {{- /* The repmgrd failover path was removed in 2.0.0 (#286): the lease-based Go agent has
        been the default since 1.0.0 and repmgrd was deprecated for one major cycle. The keys
        that only ever configured repmgrd are gone, and a values file still carrying them
        would otherwise deploy an agent cluster while its author believes repmgrd is running
        -- silence here is the dangerous outcome, so fail at render time (invariant 4). */ -}}
 {{- define "pg.validateRemovedRepmgrdValues" -}}
-{{- if hasKey .Values.repmgr "failoverMode" -}}
-{{- $m := .Values.repmgr.failoverMode | toString -}}
+{{- /* Checked in BOTH namespaces, and that is the whole point (#291 review). Reading only
+       .Values.repmgr made every guard below silently skippable by taking the rename NOTES.txt
+       itself recommends: rename the top-level key to `ha:` on a 1.x file that still carries
+       `failoverMode: repmgrd`, and the render went clean -- handing the operator an agent
+       cluster while they believed repmgrd was running, straight into the immutable
+       podManagementPolicy trap this validator exists to warn about.
+
+       Reading only .Values.ha would be just as wrong in the other direction (it would miss
+       every un-renamed 1.x file), and the normalizer cannot help: it merges the alias INTO
+       .Values.ha, so a removed key arrives there indistinguishable from a canonical one --
+       which is fine here, because none of these keys exists under ha: in values.yaml, so any
+       presence in either namespace is operator input. The union is therefore exact, not
+       merely conservative. */ -}}
+{{- $alias := mergeOverwrite (deepCopy (.Values.ha | default dict)) (deepCopy (.Values.repmgr | default dict)) -}}
+{{- if hasKey $alias "failoverMode" -}}
+{{- $m := $alias.failoverMode | toString -}}
 {{- if eq $m "agent" -}}
-{{- fail "repmgr.failoverMode was removed in chart 2.0.0: the lease-based agent is now the only failover path, so `failoverMode: agent` no longer means anything. Delete this key -- nothing else changes for you, and the agent is still tuned under repmgr.agent.*." -}}
+{{- fail "failoverMode (ha.failoverMode / repmgr.failoverMode) was removed in chart 2.0.0: the lease-based agent is now the only failover path, so `failoverMode: agent` no longer means anything. Delete this key -- nothing else changes for you, and the agent is still tuned under ha.agent.*." -}}
 {{- else -}}
-{{- fail (printf "repmgr.failoverMode was removed in chart 2.0.0 (got %q): repmgrd and its service-updater sidecar are gone, and the lease-based agent is now the only failover path. Deleting this key switches this release to the agent -- which also flips the StatefulSet's podManagementPolicy from OrderedReady to Parallel, and that field is IMMUTABLE. Read the 2.0.0 upgrade note in CHANGELOG.md before upgrading: the StatefulSet has to be recreated with `kubectl delete sts <name> --cascade=orphan`." $m) -}}
+{{- fail (printf "failoverMode (ha.failoverMode / repmgr.failoverMode) was removed in chart 2.0.0 (got %q): repmgrd and its service-updater sidecar are gone, and the lease-based agent is now the only failover path. Deleting this key switches this release to the agent -- which also flips the StatefulSet's podManagementPolicy from OrderedReady to Parallel, and that field is IMMUTABLE. Read the 2.0.0 upgrade note in CHANGELOG.md before upgrading: the StatefulSet has to be recreated with `kubectl delete sts <name> --cascade=orphan`." $m) -}}
 {{- end -}}
 {{- end -}}
-{{- if hasKey .Values.repmgr "serviceUpdater" -}}
-{{- fail "repmgr.serviceUpdater.* was removed in chart 2.0.0: the service-updater sidecar only existed to reconcile PGPool backends after a repmgrd failover, and the agent does that itself. Delete this key." -}}
+{{- if hasKey $alias "serviceUpdater" -}}
+{{- fail "serviceUpdater.* (ha.serviceUpdater / repmgr.serviceUpdater) was removed in chart 2.0.0: the service-updater sidecar only existed to reconcile PGPool backends after a repmgrd failover, and the agent does that itself. Delete this key." -}}
 {{- end -}}
-{{- if hasKey .Values.repmgr "monitoringHistoryDays" -}}
-{{- fail "repmgr.monitoringHistoryDays was removed in chart 2.0.0: it pruned repmgr.monitoring_history, which only repmgrd ever wrote. Delete this key." -}}
+{{- if hasKey $alias "monitoringHistoryDays" -}}
+{{- fail "monitoringHistoryDays (ha.monitoringHistoryDays / repmgr.monitoringHistoryDays) was removed in chart 2.0.0: it pruned repmgr.monitoring_history, which only repmgrd ever wrote. Delete this key." -}}
 {{- end -}}
 {{- if hasKey .Values.pgpool "autoFailback" -}}
 {{- fail "pgpool.autoFailback was removed in chart 2.0.0: it rendered PGPool's auto_failback, which only applied to the repmgrd failover flow. The agent fronts the Services and re-points them itself, so PGPool never fails a backend over. Delete this key." -}}
@@ -1394,8 +1540,8 @@ volumes:
        a generic "value must be one of [native]" -- helm validates the schema before rendering,
        so a narrowed enum would win the race and say nothing useful. The key itself survives
        (see values.yaml) precisely so a stale value fails loudly rather than being ignored. */ -}}
-{{- if eq ((.Values.repmgr.agent).mechanism | default "native") "repmgr" -}}
-{{- fail "repmgr.agent.mechanism: repmgr was removed in chart 2.0.0 (#294): the repmgr mechanism drove the repmgr CLI (standby clone/follow/promote, node rejoin) and depended on repmgr.nodes, and both are gone -- `native` is now the only implementation, and it is the default. Delete this key (or set it to \"native\"). IMPORTANT: a cluster created by a 1.x release is still repmgr-shaped on disk; migrating it in place is #292, and until that ships native is for FRESH installs. Read the 2.0.0 upgrade note in CHANGELOG.md before upgrading an existing HA cluster." -}}
+{{- if eq ((.Values.ha.agent).mechanism | default "native") "repmgr" -}}
+{{- fail "ha.agent.mechanism: repmgr was removed in chart 2.0.0 (#294): the repmgr mechanism drove the repmgr CLI (standby clone/follow/promote, node rejoin) and depended on repmgr.nodes, and both are gone -- `native` is now the only implementation, and it is the default. Delete this key (or set it to \"native\"). IMPORTANT: a cluster created by a 1.x release is still repmgr-shaped on disk; migrating it in place is #292, and until that ships native is for FRESH installs. Read the 2.0.0 upgrade note in CHANGELOG.md before upgrading an existing HA cluster." -}}
 {{- end -}}
 {{- end -}}
 
@@ -1403,11 +1549,11 @@ volumes:
 pg.agentMode renders the string "true"/"false". Call sites gate with:
   {{- if eq (include "pg.agentMode" .) "true" }}
 Since 2.0.0 the agent is the only failover path, so this is exactly "HA is enabled"
-(repmgr.enabled=false is the standalone, single-node, stock-postgres-image mode). The
+(ha.enabled=false is the standalone, single-node, stock-postgres-image mode). The
 helper is kept rather than inlined so the ~20 call sites keep reading as a mode check.
 */}}
 {{- define "pg.agentMode" -}}
-{{- .Values.repmgr.enabled -}}
+{{- .Values.ha.enabled -}}
 {{- end -}}
 
 {{- /* The single condition under which postgresql-configmap.yaml renders a ConfigMap at
@@ -1415,7 +1561,7 @@ helper is kept rather than inlined so the ~20 call sites keep reading as a mode 
        checksum annotation, the postgresql-config volume mount (twice, for postStart
        include_dir wiring on two different code paths), and the volume definition itself
        -- and duplicating the raw boolean expression at each site is exactly how the
-       postgresql.walLevel / repmgr.agent.syncReplicationSlots additions below ended up
+       postgresql.walLevel / ha.agent.syncReplicationSlots additions below ended up
        missed at first: the ConfigMap's own guard was updated but the volume MOUNT guard
        was not, so the rendered ConfigMap existed but was never attached to the pod (a
        live KinD suite run caught it -- wal_level and sync_replication_slots silently
@@ -1429,7 +1575,7 @@ helper is kept rather than inlined so the ~20 call sites keep reading as a mode 
        of "true" and every `eq (include ...) "true"` call site would always be false.
        `if` properly coerces any type's truthiness and lets this emit a literal "true"
        or empty string, matching what those call sites actually compare against. */ -}}
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled (ne (.Values.postgresql.walLevel | default "replica") "replica") (and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots) -}}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled (ne (.Values.postgresql.walLevel | default "replica") "replica") (and (eq (include "pg.agentMode" .) "true") .Values.ha.agent.syncReplicationSlots) -}}
 true
 {{- end -}}
 {{- end -}}
@@ -1440,7 +1586,7 @@ true
        drift apart -- a Role that carries the escalation primitive without the policy that
        bounds it is the failure mode #279 exists to prevent. */ -}}
 {{- define "pg.controlRestoreEnabled" -}}
-{{- and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.control.restore.enabled -}}
+{{- and (eq (include "pg.agentMode" .) "true") .Values.ha.agent.control.restore.enabled -}}
 {{- end -}}
 
 {{- /* Name of the ValidatingAdmissionPolicy (and its binding) that bounds the restore
@@ -1514,20 +1660,75 @@ true
 {{- $label := index $pair 0 -}}
 {{- $value := index $pair 1 | toString -}}
 {{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._:/@-]*$" $value) -}}
-{{- fail (printf "%s is %q, which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $label $value) -}}
+{{- fail (printf "%s is %q, which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $label $value) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 
-{{- /* True in agent mode when the leadership backend is etcd (repmgr.agent.dcs.backend
+{{- /* True in agent mode when the leadership backend is etcd (ha.agent.dcs.backend
        == "etcd"), false otherwise. Nil-safe at every level so a partial overlay does
        not nil-pointer; defaults to the kubernetes backend. */ -}}
 {{- define "pg.agentEtcdMode" -}}
 {{- if eq (include "pg.agentMode" .) "true" -}}
-{{- $agent := .Values.repmgr.agent | default dict -}}
+{{- $agent := .Values.ha.agent | default dict -}}
 {{- $dcs := $agent.dcs | default dict -}}
 {{- eq ($dcs.backend | default "kubernetes") "etcd" -}}
 {{- else -}}
 false
 {{- end -}}
+{{- end -}}
+
+{{- /* #291: `ha.*` is the values namespace for everything HA; `repmgr.*` is its deprecated
+       alias. The chart reads ONE namespace internally -- .Values.ha -- and this normalizer is
+       what makes that true.
+
+       Additive on purpose, which is what keeps the rename a minor rather than a break: every
+       released 1.x values file still works. `repmgr.*` wins key-by-key (mergeOverwrite, not a
+       whole-block replacement) so an operator can adopt the new name for one setting without
+       restating the rest.
+
+       That direction is deliberate and easy to get backwards -- an earlier draft of this
+       comment did. The `ha:` side of the merge is where the CHART DEFAULTS live (values.yaml
+       ships the block under that name), so making `ha.*` win would let a default beat a value
+       the operator actually set: `repmgr.agent.mechanism: repmgr` would be silently ignored
+       rather than rejected. `repmgr.*` is only ever non-empty because someone wrote it, so it
+       is the operator's input and it wins. The consequence to state plainly, because it is
+       counter-intuitive: a file carrying BOTH spellings of one key gets the `repmgr.*` value,
+       so a half-finished migration keeps the OLD value until the old key is deleted.
+
+       Dropping the aliases is the break, and belongs to the major that also renames the image.
+
+       Implemented as ONE mutation of .Values rather than a coalescing accessor per key: there
+       are ~39 keys and 13 templates, and scattering `or .Values.ha.x .Values.ha.x` through
+       them is how half of them end up reading only one namespace. Templates call this on their
+       first line and then read .Values.ha.* with no further ceremony.
+
+       deepCopy before merging: mergeOverwrite mutates its first argument, and .Values.ha is
+       the operator's own map -- corrupting it would make the deprecation warning below report
+       the merged shape instead of what they actually wrote.
+
+       Idempotent, because Helm renders each file separately and several include this more than
+       once transitively. */ -}}
+{{- define "pg.normalizeValues" -}}
+{{- $ha := deepCopy (.Values.ha | default dict) -}}
+{{- /* THE ONE PLACE that must read .Values.repmgr -- a blanket rename swept this to
+       .Values.ha once, which made both operands identical and silently disabled every
+       alias. The probe caught it; this comment is here so it cannot happen twice. */ -}}
+{{- $alias := deepCopy (.Values.repmgr | default dict) -}}
+{{- $_ := set .Values "ha" (mergeOverwrite $ha $alias) -}}
+{{- end -}}
+
+{{- /*
+pg.usesDeprecatedRepmgrValues -- true when the operator's values file still spells the HA
+block "repmgr:" rather than "ha:" (#291). Drives the deprecation notice in NOTES.txt.
+
+Reads .Values.repmgr on purpose, and it is safe to call at any point: pg.normalizeValues
+merges the alias INTO .Values.ha but never deletes .Values.repmgr, so the raw operator
+input survives normalization and stays distinguishable from the chart's own ha: defaults.
+Reading .Values.ha here would be useless in two ways at once -- it is always populated by
+values.yaml, and the merge has already folded the alias into it, so the answer would be
+"true" for every install. A blanket rename did exactly that once; hence this note.
+*/ -}}
+{{- define "pg.usesDeprecatedRepmgrValues" -}}
+{{- if .Values.repmgr -}}true{{- end -}}
 {{- end -}}

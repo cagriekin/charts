@@ -2497,7 +2497,7 @@ pgbackrest_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.replicaCount=0 \
   --show-only templates/statefulset.yaml 2>&1) && pgbr_sa_rc=0 || pgbr_sa_rc=$?
 assert_eq "#142: pgbackrest without repmgr fails fast" "1" "${pgbr_sa_rc}"
-assert_contains "#142: error names the repmgr requirement" "${pgbackrest_standalone}" "pgbackrest.enabled requires repmgr.enabled=true"
+assert_contains "#142: error names the ha.enabled requirement" "${pgbackrest_standalone}" "pgbackrest.enabled requires ha.enabled=true"
 
 # pgBackRest: coexists with the HA agent
 assert_contains "pgbackrest+repmgr: sidecar present" "${pgbackrest_sts}" "name: pgbackrest"
@@ -2748,7 +2748,7 @@ standalone_replicas=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.enabled=false \
   --set postgresql.replicaCount=1 2>&1) && standalone_replicas_rc=0 || standalone_replicas_rc=$?
 assert_eq "standalone replicas: render fails when repmgr disabled with replicaCount > 0" "1" "${standalone_replicas_rc}"
-assert_contains "standalone replicas: error names the constraint" "${standalone_replicas}" "requires repmgr.enabled=true"
+assert_contains "standalone replicas: error names the constraint" "${standalone_replicas}" "requires ha.enabled=true"
 
 # Test: rendering fails with default replicaCount (1) when only repmgr is disabled
 standalone_default=$(helm template test-pg "${CHART_DIR}" \
@@ -2771,7 +2771,7 @@ major_mismatch=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set postgresql.image.tag=pg17 2>&1) && major_mismatch_rc=0 || major_mismatch_rc=$?
 assert_eq "major pin: render fails when postgresql.majorVersion != repmgr image major (#133)" "1" "${major_mismatch_rc}"
-assert_contains "major pin: error names both values (#133)" "${major_mismatch}" "does not match repmgr.image.majorVersion"
+assert_contains "major pin: error names both values (#133)" "${major_mismatch}" "does not match ha.image.majorVersion"
 
 # default (18 == 18) renders
 major_default=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1) && major_default_rc=0 || major_default_rc=$?
@@ -2792,7 +2792,7 @@ major_mismatch_rev=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.image.majorVersion=17 \
   --set repmgr.image.tag=trixie-5.5.0-29-pg17 2>&1) && major_mismatch_rev_rc=0 || major_mismatch_rev_rc=$?
 assert_eq "major pin: render fails when repmgr.image.majorVersion moves alone (#269)" "1" "${major_mismatch_rev_rc}"
-assert_contains "major pin: reverse mismatch names both values (#269)" "${major_mismatch_rev}" "does not match repmgr.image.majorVersion"
+assert_contains "major pin: reverse mismatch names both values (#269)" "${major_mismatch_rev}" "does not match ha.image.majorVersion"
 
 # --- #269: PG17 is a first-class selection, not just a render that does not fail ---
 
@@ -4746,6 +4746,366 @@ pgv_pb_res=$(helm template test-pgv "${PGVECTOR_DIR}" \
   -f "${SCRIPT_DIR}/values-pgbackrest-extra.yaml" 2>&1)
 assert_eq "#323 pgvector: KUBECONFIG reaches every pgbackrest container" "6" \
   "$(printf '%s\n' "${pgv_pb_res}" | grep -c 'value: /etc/apiserver-proxy/kubeconfig')"
+
+# ==========================================================================================
+# #291: repmgr.* -> ha.* rename, with the repmgr.* spelling kept as a merge-time alias.
+#
+# The alias is the whole risk surface of this change: get the merge direction wrong and an
+# operator-set key is silently overridden by a chart default, which is worse than a hard
+# error because the render still succeeds. Every case below is one way that can go wrong.
+# ==========================================================================================
+
+# Baseline: with neither spelling set, the ha: defaults are what render. If the normalizer
+# ever merged an empty alias destructively, this is what would break first.
+alias_default=$(helm template test-pg "${CHART_DIR}" 2>&1)
+assert_contains "#291: default renders the ha.* username" "${alias_default}" 'value: "repmgr"'
+
+# The deprecated spelling still lands. This is the promise the CHANGELOG makes to every
+# existing 1.x values file.
+alias_old=$(helm template test-pg "${CHART_DIR}" --set repmgr.username=legacyuser 2>&1)
+assert_contains "#291: repmgr.username still reaches the render" "${alias_old}" 'legacyuser'
+
+# The canonical spelling lands too, obviously -- but assert it, because a normalizer that
+# read the alias last would clobber ha.* with the (absent) repmgr.* value.
+alias_new=$(helm template test-pg "${CHART_DIR}" --set ha.username=newuser 2>&1)
+assert_contains "#291: ha.username reaches the render" "${alias_new}" 'newuser'
+
+# THE regression that a blanket rename produces: setting one aliased key must not wipe its
+# siblings' defaults. mergeOverwrite is key-by-key, not block-for-block -- if it ever became
+# the latter, mechanism would come back empty here rather than "native".
+alias_sib=$(helm template test-pg "${CHART_DIR}" --set repmgr.agent.leaseDuration=20s 2>&1)
+assert_contains "#291: the aliased key itself lands" "${alias_sib}" 'value: "20s"'
+assert_eq "#291: an aliased key leaves sibling ha.* defaults intact" "native" \
+  "$(printf '%s\n' "${alias_sib}" | grep -A1 'name: MECHANISM' | grep 'value:' \
+     | head -1 | sed -E 's/.*value: "?([^"]*)"?.*/\1/')"
+
+# ...and the same in the other direction: a canonical key must not wipe the alias block's
+# siblings either.
+alias_sib2=$(helm template test-pg "${CHART_DIR}" --set ha.agent.leaseDuration=20s 2>&1)
+assert_contains "#291: the canonical key itself lands" "${alias_sib2}" 'value: "20s"'
+assert_eq "#291: a canonical key leaves sibling defaults intact" "native" \
+  "$(printf '%s\n' "${alias_sib2}" | grep -A1 'name: MECHANISM' | grep 'value:' \
+     | head -1 | sed -E 's/.*value: "?([^"]*)"?.*/\1/')"
+
+# Validation must not be bypassable by choosing the old spelling. Both schemas carry the same
+# shape for exactly this reason, and the removed-value validators read the alias namespace.
+alias_bad_rc=0
+helm template test-pg "${CHART_DIR}" --set repmgr.agent.mechanism=bogus >/dev/null 2>&1 \
+  || alias_bad_rc=$?
+assert_gt "#291: a bogus mechanism is rejected under the repmgr.* spelling" "${alias_bad_rc}" 0
+alias_bad2_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.agent.mechanism=bogus >/dev/null 2>&1 \
+  || alias_bad2_rc=$?
+assert_gt "#291: a bogus mechanism is rejected under the ha.* spelling" "${alias_bad2_rc}" 0
+
+# The two schema shapes are generated from one source and must stay identical, or the alias
+# window quietly becomes a validation hole for whichever spelling drifted.
+for schema_chart in pg pgvector; do
+  shape_same=$(python3 -c "
+import json,copy,sys
+d=json.load(open('${SCRIPT_DIR}/../../${schema_chart}/values.schema.json'))
+a=copy.deepcopy(d['properties']['ha']); b=copy.deepcopy(d['properties']['repmgr'])
+a.pop('description',None); b.pop('description',None)
+print('same' if a==b else 'DRIFTED')")
+  assert_eq "#291 ${schema_chart}: ha and repmgr schema shapes are identical" "same" "${shape_same}"
+done
+
+# The removed keys are removed, not aliased -- #286's validators must still fire on the
+# spelling a 1.x values file actually uses.
+alias_removed=$(helm template test-pg "${CHART_DIR}" --set repmgr.failoverMode=repmgrd 2>&1 || true)
+assert_contains "#291: a removed key still fails under the repmgr.* spelling" \
+  "${alias_removed}" "failoverMode"
+
+# pgvector shares the templates but has its own values.yaml and schema, so the rename has to
+# be asserted there independently -- it has no KinD coverage of its own.
+pgv_alias=$(helm template test-pgv "${PGVECTOR_DIR}" --set repmgr.username=legacyuser 2>&1)
+assert_contains "#291 pgvector: the repmgr.* alias reaches the render" "${pgv_alias}" 'legacyuser'
+pgv_alias_new=$(helm template test-pgv "${PGVECTOR_DIR}" --set ha.username=newuser 2>&1)
+assert_contains "#291 pgvector: ha.* reaches the render" "${pgv_alias_new}" 'newuser'
+
+# #291 review: the removed-key guards must fire under BOTH spellings. Reading only the alias
+# namespace made them skippable by taking the very rename NOTES.txt recommends -- a 1.x file
+# with `failoverMode: repmgrd` renamed to `ha:` rendered clean and deployed an agent cluster
+# to an operator who believed repmgrd was running, into the immutable podManagementPolicy trap.
+for removed_spelling in repmgr ha; do
+  for removed_key in failoverMode=repmgrd serviceUpdater.enabled=true monitoringHistoryDays=7; do
+    rm_rc=0
+    helm template test-pg "${CHART_DIR}" --set "${removed_spelling}.${removed_key}" >/dev/null 2>&1 \
+      || rm_rc=$?
+    assert_gt "#291: ${removed_spelling}.${removed_key%%=*} is still rejected" "${rm_rc}" 0
+  done
+done
+
+# ...and `failoverMode: agent` too, which has its own gentler message and is the spelling a
+# 1.x file on the default would carry.
+fm_agent=$(helm template test-pg "${CHART_DIR}" --set ha.failoverMode=agent 2>&1 || true)
+assert_contains "#291: ha.failoverMode=agent is rejected with the delete-the-key message" \
+  "${fm_agent}" "no longer means anything"
+
+# Templates that read .Values.ha transitively must normalize themselves rather than relying on
+# statefulset.yaml having sorted earlier and mutated .Values -- helm-unittest renders per file,
+# so an alias-driven assertion on one of these would otherwise pass vacuously (#291 review).
+for lone_tpl in networkpolicy service-headless databases-roles-job; do
+  norm_hits=$(grep -c 'pg.normalizeValues' "${CHART_DIR}/templates/${lone_tpl}.yaml" || true)
+  assert_gt "#291: templates/${lone_tpl}.yaml normalizes before reading .Values.ha" \
+    "${norm_hits}" 0
+done
+
+# The behavioural half of the same point: rendered ALONE, the alias still decides.
+# `|| true`: with HA off this template renders nothing and helm exits non-zero ("could not
+# find template"), which under set -e would kill the suite. Absence IS the expected result.
+lone_off=$(helm template test-pg "${CHART_DIR}" \
+  --show-only templates/service-headless.yaml --set repmgr.enabled=false 2>&1 || true)
+assert_not_contains "#291: a lone-rendered template honours the repmgr.* alias" \
+  "${lone_off}" "agent-metrics"
+lone_on=$(helm template test-pg "${CHART_DIR}" --show-only templates/service-headless.yaml 2>&1)
+assert_contains "#291: ...and still renders the agent port by default" "${lone_on}" "agent-metrics"
+
+# The chart's own example overlays must not trip the deprecation notice they exist to precede.
+#
+# Asserted on the FILE, not on a render: NOTES.txt is not part of `helm template` output at
+# all (only `helm install --dry-run` renders it), so an assert_not_contains "DEPRECATED VALUES"
+# against a render would pass no matter what the overlay contained. That vacuous form was
+# written here first and caught by checking it against a values file known to be deprecated.
+# The notice's own logic is covered by pg.usesDeprecatedRepmgrValues; what this guards is that
+# a chart-shipped example does not use the deprecated spelling.
+for overlay_chart in "${CHART_DIR}" "${PGVECTOR_DIR}"; do
+  overlay_file="${overlay_chart}/values-cloud.yaml"
+  assert_eq "#291: $(basename "${overlay_chart}")/values-cloud.yaml has no repmgr: block" "0" \
+    "$(grep -c '^repmgr:' "${overlay_file}" || true)"
+  # ...and it must still be a values file the chart actually accepts.
+  overlay_rc=0
+  helm template test-o "${overlay_chart}" -f "${overlay_file}" >/dev/null 2>&1 || overlay_rc=$?
+  assert_eq "#291: $(basename "${overlay_chart}")/values-cloud.yaml still renders" "0" "${overlay_rc}"
+done
+
+# #291 review: the alias beats Helm's OWN precedence, including --set. That is deliberate (the
+# `ha:` side of the merge holds chart defaults, so preferring it would let a default beat an
+# operator value), it is counter-intuitive enough that README/NOTES/values.yaml all call it out,
+# and it cannot be guarded at render time -- Helm gives templates no provenance, so a chart-side
+# `fail` would fire on every legitimate alias use or none. Pin the behaviour instead: if the
+# merge direction is ever flipped, this fails rather than silently changing what a released
+# values file resolves to.
+# mktemp + trap, not a repo-root scratch dir: this suite runs under `set -euo pipefail`, and
+# any unexpected non-zero between here and the cleanup would leave an untracked directory in
+# the working tree -- the exact `git add -A` hazard .git/info/exclude exists to document.
+# One EXIT trap for every scratch dir this suite makes: a second `trap ... EXIT` REPLACES the
+# first rather than adding to it, so per-block traps would silently leak all but the last.
+TMP_SCRATCH=()
+cleanup_scratch() { [ ${#TMP_SCRATCH[@]} -gt 0 ] && rm -rf "${TMP_SCRATCH[@]}"; return 0; }
+trap cleanup_scratch EXIT
+prec_dir="$(mktemp -d)"; TMP_SCRATCH+=("${prec_dir}")
+printf 'repmgr:\n  agent:\n    leaseDuration: 15s\n' > "${prec_dir}/legacy.yaml"
+printf 'ha:\n  agent:\n    leaseDuration: 30s\n' > "${prec_dir}/canonical.yaml"
+lease_of() { printf '%s\n' "$1" | grep -A1 'name: LEASE_DURATION' | grep 'value:' | head -1 | sed -E 's/.*value: "?([^"]*)"?.*/\1/'; }
+
+prec_set=$(helm template test-pg "${CHART_DIR}" -f "${prec_dir}/legacy.yaml" \
+  --set ha.agent.leaseDuration=30s 2>&1)
+assert_eq "#291: --set ha.* loses to a repmgr.* value from -f (documented, not a bug)" "15s" \
+  "$(lease_of "${prec_set}")"
+
+# ...and order-independent, in both directions, so the docs' "order does not matter" holds.
+prec_ab=$(helm template test-pg "${CHART_DIR}" -f "${prec_dir}/legacy.yaml" -f "${prec_dir}/canonical.yaml" 2>&1)
+assert_eq "#291: repmgr.* wins with the canonical file last" "15s" "$(lease_of "${prec_ab}")"
+prec_ba=$(helm template test-pg "${CHART_DIR}" -f "${prec_dir}/canonical.yaml" -f "${prec_dir}/legacy.yaml" 2>&1)
+assert_eq "#291: repmgr.* wins with the canonical file first" "15s" "$(lease_of "${prec_ba}")"
+
+# The canonical spelling alone must of course still land -- otherwise the assertions above
+# would pass on a chart that ignored ha.* entirely.
+prec_only=$(helm template test-pg "${CHART_DIR}" -f "${prec_dir}/canonical.yaml" 2>&1)
+assert_eq "#291: ha.* alone lands (guards the three assertions above against vacuity)" "30s" \
+  "$(lease_of "${prec_only}")"
+
+# The docs must actually state the rule, in every place an operator could reasonably look.
+assert_contains "#291: the README documents the cross-source precedence" \
+  "$(cat "${SCRIPT_DIR}/../README.md")" "wins over"
+assert_contains "#291: NOTES.txt warns about it where an affected operator sees it" \
+  "$(cat "${CHART_DIR}/templates/NOTES.txt")" "even over a --set"
+for prec_chart in pg pgvector; do
+  assert_contains "#291 ${prec_chart}: values.yaml warns about it too" \
+    "$(cat "${SCRIPT_DIR}/../../${prec_chart}/values.yaml")" "MOVE"
+done
+
+# #291 review: the lease triple is cross-validated by client-go, and nothing checked it at
+# render time -- so an alias mixture could produce leaseDuration=15s renewDeadline=20s from two
+# values files that are each individually fine, render clean, and CrashLoopBackOff every pod.
+lease_dir="$(mktemp -d)"; TMP_SCRATCH+=("${lease_dir}")
+printf 'repmgr:\n  agent:\n    leaseDuration: 15s\n' > "${lease_dir}/legacy.yaml"
+
+# The chart's own cloud overlay was the most reachable instance of the trap.
+lease_mix=$(helm template test-pg "${CHART_DIR}" \
+  -f "${lease_dir}/legacy.yaml" -f "${CHART_DIR}/values-cloud.yaml" 2>&1 || true)
+assert_contains "#291: an alias-mixed lease triple fails the render" \
+  "${lease_mix}" "leaseDuration > renewDeadline > retryPeriod"
+assert_contains "#291: ...and the message names the offending values" "${lease_mix}" "leaseDuration=15s"
+assert_contains "#291: ...and points at the alias mixture as the cause" "${lease_mix}" "MIXTURE"
+
+# Each source alone is valid -- which is the whole point: neither file is wrong.
+lease_legacy_rc=0
+helm template test-pg "${CHART_DIR}" -f "${lease_dir}/legacy.yaml" >/dev/null 2>&1 || lease_legacy_rc=$?
+assert_eq "#291: the legacy file alone renders (the mixture is the defect, not the file)" "0" "${lease_legacy_rc}"
+lease_cloud_rc=0
+helm template test-pg "${CHART_DIR}" -f "${CHART_DIR}/values-cloud.yaml" >/dev/null 2>&1 || lease_cloud_rc=$?
+assert_eq "#291: values-cloud.yaml alone renders" "0" "${lease_cloud_rc}"
+
+# Direct violations, and the boundary: equal is not greater.
+for bad_triple in "5s:10s:2s" "15s:20s:4s" "10s:10s:2s" "20s:5s:5s"; do
+  IFS=: read -r bt_ld bt_rd bt_rp <<<"${bad_triple}"
+  bt_rc=0
+  helm template test-pg "${CHART_DIR}" --set "ha.agent.leaseDuration=${bt_ld}" \
+    --set "ha.agent.renewDeadline=${bt_rd}" --set "ha.agent.retryPeriod=${bt_rp}" >/dev/null 2>&1 \
+    || bt_rc=$?
+  assert_gt "#291: lease triple ${bad_triple} is rejected" "${bt_rc}" 0
+done
+
+# ...and valid triples across units must still render, or the guard is just an outage.
+for ok_triple in "15s:10s:2s" "30s:20s:4s" "1m:30s:5s" "1500ms:1000ms:200ms"; do
+  IFS=: read -r ot_ld ot_rd ot_rp <<<"${ok_triple}"
+  ot_rc=0
+  helm template test-pg "${CHART_DIR}" --set "ha.agent.leaseDuration=${ot_ld}" \
+    --set "ha.agent.renewDeadline=${ot_rd}" --set "ha.agent.retryPeriod=${ot_rp}" >/dev/null 2>&1 \
+    || ot_rc=$?
+  assert_eq "#291: lease triple ${ok_triple} renders" "0" "${ot_rc}"
+done
+
+# Compound and fractional durations are what time.ParseDuration accepts, so the parser handles
+# them rather than skipping -- the first version of this block asserted a "skip" for 1.5h that
+# never happened (the regex's optional fraction already matched it), so it was passing on the
+# ordering result, not on the skip. Each of these is > the 10s renewDeadline default, so a
+# correct parse renders and a mis-parse does not.
+for compound in "2h45m" "1.5h" "1m30s" "90s"; do
+  cp_rc=0
+  helm template test-pg "${CHART_DIR}" --set "ha.agent.leaseDuration=${compound}" >/dev/null 2>&1 || cp_rc=$?
+  assert_eq "#291: compound/fractional duration ${compound} parses and renders" "0" "${cp_rc}"
+done
+
+# A value that is NOT a Go duration must FAIL, not be skipped. Skipping was the original bug:
+# time.ParseDuration rejects `15` and `20 s`, so config.Load fail-fasts and every pod
+# CrashLoopBackOffs -- render clean, apply broken, the invariant-4 outcome the guard exists for.
+for notdur in "15" "20 s" "bogus" "s"; do
+  nd_out=$(helm template test-pg "${CHART_DIR}" --set "ha.agent.leaseDuration=${notdur}" 2>&1 || true)
+  assert_contains "#291: a non-duration leaseDuration (${notdur}) is rejected" \
+    "${nd_out}" "is not a Go duration"
+done
+
+# ...and the same check covers the other two keys, not just the first.
+for nd_key in renewDeadline retryPeriod; do
+  nd_out=$(helm template test-pg "${CHART_DIR}" --set "ha.agent.${nd_key}=7" 2>&1 || true)
+  assert_contains "#291: a non-duration ${nd_key} is rejected too" "${nd_out}" "is not a Go duration"
+done
+
+# The etcd backend has a floor of its own (whole-second lease TTL), enforced in config.go and
+# until now not at render time: a valid ORDERING below 5s rendered clean and refused to boot.
+etcd_low=$(helm template test-pg "${CHART_DIR}" --set ha.agent.dcs.backend=etcd \
+  --set etcd.enabled=true --set ha.agent.leaseDuration=3s --set ha.agent.renewDeadline=2s \
+  --set ha.agent.retryPeriod=1s 2>&1 || true)
+assert_contains "#291: etcd DCS below the 5s lease floor is rejected" \
+  "${etcd_low}" "requires at least 5s"
+etcd_ok_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.agent.dcs.backend=etcd --set etcd.enabled=true \
+  >/dev/null 2>&1 || etcd_ok_rc=$?
+assert_eq "#291: etcd DCS on the default 15s lease renders" "0" "${etcd_ok_rc}"
+# ...and the floor is etcd-only -- it must not fire on the kubernetes backend.
+k8s_low_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.agent.leaseDuration=3s \
+  --set ha.agent.renewDeadline=2s --set ha.agent.retryPeriod=1s >/dev/null 2>&1 || k8s_low_rc=$?
+assert_eq "#291: a sub-5s lease is fine on the kubernetes backend" "0" "${k8s_low_rc}"
+
+# pgvector shares the templates but has its own values-cloud.yaml, so assert the reach there too.
+pgv_lease=$(helm template test-pgv "${PGVECTOR_DIR}" \
+  -f "${lease_dir}/legacy.yaml" -f "${PGVECTOR_DIR}/values-cloud.yaml" 2>&1 || true)
+assert_contains "#291 pgvector: the same alias-mixed triple fails" \
+  "${pgv_lease}" "leaseDuration > renewDeadline > retryPeriod"
+
+# #291 review round 5: the duration guard diverged from time.ParseDuration in BOTH directions,
+# and each direction is its own bug -- too permissive means the render-clean/CrashLoopBackOff
+# outcome the guard exists to stop happens anyway; too strict turns a working 1.x value into a
+# hard failure on upgrade. These cases were checked against real time.ParseDuration output.
+
+# Valid Go durations the guard must ACCEPT (paired with a valid ordering so only the shape
+# check is under test). ".5s"/"5.s" omit a side of the decimal point, "+15s" carries Go's
+# optional sign, and both µ spellings (U+00B5, U+03BC) are units Go takes.
+while IFS='|' read -r dg_ld dg_rd dg_rp dg_why; do
+  [ -n "${dg_ld}" ] || continue
+  dg_rc=0
+  helm template test-pg "${CHART_DIR}" --set-string "ha.agent.leaseDuration=${dg_ld}" \
+    --set-string "ha.agent.renewDeadline=${dg_rd}" --set-string "ha.agent.retryPeriod=${dg_rp}" \
+    >/dev/null 2>&1 || dg_rc=$?
+  assert_eq "#291: ${dg_why} (${dg_ld}/${dg_rd}/${dg_rp}) renders" "0" "${dg_rc}"
+done <<'DURATIONS_OK'
+5.s|2.s|1.s|a trailing decimal point
+.5s|.2s|.1s|a leading decimal point
++15s|+10s|+2s|Go's optional leading sign
+1m30s|60s|2s|a compound duration
+15µs|10µs|2µs|microseconds spelled U+00B5
+15μs|10μs|2μs|microseconds spelled U+03BC
+DURATIONS_OK
+
+# Values time.ParseDuration REJECTS. Each renders cleanly and then refuses the agent's boot, so
+# each must fail the render instead. "15S"/"1M30S" are the case-sensitivity hole (a `lower` in
+# the parser used to accept them); "" is the default-substitution hole (`| default "15s"`
+# validated the default while the StatefulSet emitted the empty string).
+for dg_key in leaseDuration renewDeadline retryPeriod reconcileInterval; do
+  while IFS= read -r dg_bad; do
+    [ -n "${dg_bad}" ] || continue
+    dg_out=$(helm template test-pg "${CHART_DIR}" --set-string "ha.agent.${dg_key}=${dg_bad}" 2>&1 || true)
+    assert_contains "#291: ha.agent.${dg_key}=${dg_bad} is rejected as a non-duration" \
+      "${dg_out}" "is not a Go duration"
+  done <<'DURATIONS_BAD'
+15S
+1M30S
+15
+20 s
+bogus
+DURATIONS_BAD
+done
+
+# The empty string needs its own case: --set-string with an empty value, checked per key.
+for dg_key in leaseDuration renewDeadline retryPeriod reconcileInterval; do
+  dg_empty=$(helm template test-pg "${CHART_DIR}" --set-string "ha.agent.${dg_key}=" 2>&1 || true)
+  assert_contains "#291: an explicitly empty ha.agent.${dg_key} is rejected" \
+    "${dg_empty}" "is not a Go duration"
+done
+
+# reconcileInterval is not part of the ordering comparison, but config.Load parses it with the
+# same helper -- so a VALID value must still render, or the loop above would be passing for the
+# wrong reason.
+dg_ri_rc=0
+helm template test-pg "${CHART_DIR}" --set-string "ha.agent.reconcileInterval=7s" >/dev/null 2>&1 \
+  || dg_ri_rc=$?
+assert_eq "#291: a valid reconcileInterval renders (guards the loop above)" "0" "${dg_ri_rc}"
+
+# #291 review round 5: the bundled etcd's RBAC-bootstrap Job runs the agent binary, so its
+# image must track ha.image. values.yaml pinned both halves but nothing enforced it, so the
+# next image bump would silently reintroduce the drift.
+etcd_boot_args=(--set etcd.enabled=true --set ha.agent.dcs.backend=etcd)
+etcd_drift=$(helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
+  --set ha.image.tag=2.0.0-pg18 2>&1 || true)
+assert_contains "#291: an etcd bootstrapImage that drifts from ha.image fails the render" \
+  "${etcd_drift}" "must match ha.image"
+etcd_lock_rc=0
+helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
+  --set ha.image.repository=cagriekin/pg-ha --set ha.image.tag=2.0.0-pg18 \
+  --set etcd.rbac.bootstrapImage.repository=cagriekin/pg-ha \
+  --set etcd.rbac.bootstrapImage.tag=2.0.0-pg18 >/dev/null 2>&1 || etcd_lock_rc=$?
+assert_eq "#291: moving both halves together renders" "0" "${etcd_lock_rc}"
+# ...and exactly one image reaches the manifests in that case.
+etcd_lock_imgs=$(helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
+  --set ha.image.repository=cagriekin/pg-ha --set ha.image.tag=2.0.0-pg18 \
+  --set etcd.rbac.bootstrapImage.repository=cagriekin/pg-ha \
+  --set etcd.rbac.bootstrapImage.tag=2.0.0-pg18 2>/dev/null \
+  | grep -oE 'cagriekin/[^"[:space:]]*' | sort -u | wc -l)
+assert_eq "#291: the lockstep render uses exactly one cagriekin image" "1" "${etcd_lock_imgs}"
+# The default (bundled etcd, untouched pins) must be in lockstep already.
+etcd_def_rc=0
+helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" >/dev/null 2>&1 || etcd_def_rc=$?
+assert_eq "#291: the shipped etcd pins are already in lockstep" "0" "${etcd_def_rc}"
+# With an EXTERNAL etcd the Job never renders, so a stale pin there is inert, not an error.
+etcd_ext_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.agent.dcs.backend=etcd \
+  --set 'ha.agent.dcs.etcd.endpoints[0]=e:2379' --set ha.image.tag=2.0.0-pg18 >/dev/null 2>&1 \
+  || etcd_ext_rc=$?
+assert_eq "#291: an external etcd does not enforce the bootstrapImage lockstep" "0" "${etcd_ext_rc}"
 
 end_suite
 print_summary

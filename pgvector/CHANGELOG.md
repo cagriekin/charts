@@ -2,6 +2,163 @@
 
 ## 2.0.0 - unreleased
 
+### Changed (breaking)
+
+- **The `repmgr:` values block is now `ha:`** (#291). Nothing nested moved -- only the block's
+  own name. Every `repmgr.*` key still works for the whole 2.0.0 line: `pg.normalizeValues`
+  merges the `repmgr:` block over the `ha:` defaults key by key, so an untouched 1.x values
+  file installs unchanged, `--set repmgr.agent.leaseDuration=20s` still lands, and a file
+  mixing the two spellings resolves per key with the `repmgr.*` value winning -- it is the one
+  the operator set; the `ha.*` side is chart defaults. Both spellings are schema-validated
+  (the `repmgr` schema is generated from the `ha` shape and asserted identical), so a bad enum
+  or a wrong type still fails the render whichever name is used. `helm upgrade` prints a
+  deprecation notice when it sees the old block.
+
+  Marked breaking because the values API's canonical name changed, and because **the alias is
+  removed in the next major** -- rename the top-level key before then. It is a rename and not
+  a break *today*, which is the point: 2.0.0 already carries one real break (repmgrd removal)
+  and stacking a mandatory values edit on top of it buys nothing.
+
+  Why rename at all: after #290 the image contains no repmgr -- no binary, no extension, no
+  `repmgr.conf` -- and the agent replicates through `pg_stat_replication` and slots it owns.
+  A block named `repmgr` was sizing the resources of, and holding the credentials for,
+  something no longer installed.
+
+  Three names keep the word on purpose, because they identify real PostgreSQL objects rather
+  than the tool: `ha.username`, `ha.database`, and the `repmgr-password` Secret key. Renaming
+  those rewrites a live cluster's role and credential, which is a data-plane migration, not a
+  values rename -- deliberately out of scope here. `REPMGR_*` env vars are likewise unchanged;
+  `pg/ENVIRONMENT.md` records which of them the agent still reads and which are now inert.
+
+  Review follow-ups on the rename itself, each a defect the first pass shipped:
+
+  - The removed-key guards (`failoverMode`, `serviceUpdater.*`, `monitoringHistoryDays`) now
+    fire under **both** spellings. Reading only `repmgr.*` made them skippable by taking the
+    very rename the upgrade notice recommends: a 1.x file carrying `failoverMode: repmgrd`,
+    with its block renamed to `ha:`, rendered clean and deployed an agent cluster to an
+    operator who believed repmgrd was running -- straight into the immutable
+    `podManagementPolicy` trap the guard exists to warn about.
+  - Three templates (`networkpolicy.yaml`, `service-headless.yaml`, `databases-roles-job.yaml`)
+    read `.Values.ha` transitively without normalizing first. In a full render this worked only
+    because `statefulset.yaml` sorts earlier and mutates `.Values` for every later file; rendered
+    alone, as helm-unittest does, they ignored the alias entirely.
+  - `set-pg-major.sh` and the pg-test workflow both resolved the HA image from `pg/values.yaml`
+    by anchoring on `^repmgr:`, and hard-exit when that misses. Both accept either spelling now.
+    The same scripts hardcoded the image *repository*, so the #290 rename would have ended in
+    `FATAL: rendered StatefulSet does not use cagriekin/repmgr:...`; the repository is read from
+    the chart and rewritten in fixtures alongside the tag, and the two-step is verified end to
+    end under both majors.
+  - `etcd.rbac.bootstrapImage` pinned only the tag, leaving the repository on the etcd subchart's
+    default. Harmless while both said `cagriekin/repmgr`; under the new tag scheme it names a
+    coordinate that cannot exist. Both halves are pinned now.
+
+  Second review round, all documentation/behavioural-surprise rather than logic:
+
+  - **`repmgr.*` beats `ha.*` from ANY source, including `--set`** -- Helm collapses defaults,
+    every `-f` and every `--set` into one map before the chart runs, so the merge cannot tell
+    an operator's value from a chart default and always prefers the deprecated spelling. So
+    `-f legacy.yaml --set ha.agent.leaseDuration=30s` renders the legacy value, discarding a
+    `--set` that Helm normally ranks highest. This cannot be caught at render time (a template
+    gets no provenance, so a `fail` would fire on every legitimate alias use or none), so it is
+    documented in the README, NOTES.txt and both values.yaml, with the instruction stated as
+    MOVE a key rather than duplicate it -- and pinned by tests, so flipping the merge direction
+    fails loudly instead of silently changing what a released values file resolves to.
+  - The README rename runbook gave `helm get values` without `-o yaml`, the exact command
+    NOTES.txt warns against (the default output prefixes `USER-SUPPLIED VALUES:`, which the
+    deliberately-open `additionalProperties` then accepts in silence).
+  - NOTES.txt is byte-identical across both charts, so its cross-reference now names the pg
+    chart README explicitly; the section it points at does not exist in pgvector's.
+  - The tag-scheme comment tables in `set-pg-major.sh` and the pg-test workflow described
+    `trixie-pg<major>-<n>` as the new scheme, which the classifier below them rejects -- it
+    keys on a leading semver, so that shape would fall to the legacy arm and reduce to bare
+    `trixie`. Not live breakage, but exactly the desync those comments exist to prevent.
+  - Both values.yaml files still instructed the deprecated spelling in their own how-to prose
+    (the etcd DCS walkthrough among them), so following the file the chart treats as the
+    authority on its input surface tripped the deprecation notice the same change adds.
+
+  Third review round:
+
+  - **`ha.agent` lease timings are now validated at render time.** client-go requires
+    `leaseDuration > renewDeadline > retryPeriod` and the agent refuses to start otherwise, but
+    nothing checked it before the API server, so a violating triple rendered cleanly and then
+    CrashLoopBackOff'd every postgresql pod at once with no primary. The reachable path is not
+    three bad numbers typed by hand -- it is MIXING the `repmgr.agent.*` alias with `ha.agent.*`
+    across two values files: these keys are cross-validated, so one timing from a 1.x file plus
+    two from a newer `-f` yields a triple neither file contains. The chart's own
+    `values-cloud.yaml` was the most reachable instance. The guard skips (rather than fails) a
+    duration shape it cannot parse, because `time.ParseDuration` accepts compound forms and
+    rejecting input the agent would have accepted would be a new bug, not a guard.
+  - `release.yaml` now excludes `pg-ha-*`. The new image tag `pg-ha-X.Y.Z` matches the chart
+    release glob, which the old dot-free `pg-ha-<n>` did not -- that is why only `trixie-*` was
+    excluded. Pushing `pg-ha-2.0.0` would have fired the chart release workflow too, which
+    resolves `chart="pg-ha"` and dies on the missing Chart.yaml.
+  - `set-pg-major.sh` derives the leftover scanners' repository alternation from the chart
+    instead of hardcoding the two Docker Hub names, so pointing `ha.image.repository` at a
+    mirror or fork cannot make the scanners match nothing and report a silent green.
+
+  Fourth review round, all on the lease guard added in the third:
+
+  - **An unparseable duration skipped validation instead of failing it.** `ha.agent.leaseDuration:
+    15` or `"20 s"` is not a Go duration -- `time.ParseDuration` rejects it, so `config.Load`
+    fail-fasts and every pod CrashLoopBackOffs -- but the guard's parser returned "" for it and
+    the caller shrugged, reproducing the exact render-clean/apply-broken outcome the guard was
+    added to close. `""` now means "not a duration" and is a hard failure; the parser also
+    handles the COMPOUND forms it previously skipped (`1m30s`, `2h45m`) by summing their pairs,
+    so nothing valid is rejected and nothing invalid is waved through. The doc comment claiming
+    `1.5h` was unparseable was wrong (the optional fraction already matched it), which meant one
+    test was passing on the ordering result rather than on the skip it claimed to assert.
+  - **The etcd DCS lease floor is now checked at render time.** `config.go` requires
+    `LEASE_DURATION >= 5s` under `ha.agent.dcs.backend: etcd` because the lease TTL is whole
+    seconds; a triple like 3s/2s/1s satisfies the ordering, rendered clean, and refused to boot.
+  - `values-cloud.yaml` gained a layering note. Because `repmgr.*` wins key by key, an operator
+    whose own file still spells the block `repmgr:` and sets any of the three timings gets a
+    mixture when they add `-f values-cloud.yaml` -- now rejected loudly with the fix named,
+    where before this PR it silently resolved to the overlay's values. The overlay is
+    deliberately NOT dual-spelled: shipping the deprecated block in an example would trip the
+    very notice it should demonstrate the absence of.
+  - `set-pg-major.sh`'s repository-rewrite rule now uses the derived alternation like the
+    scanners do, so a fork or mirror that retargeted values.yaml and its fixtures no longer hits
+    `rule 'HA image repository' matched nothing`. Verified against a simulated private registry.
+
+  Not changed: the `mechanism != native` branches in `pg.chartOwnsSharedPreloadLibraries` and
+  `pg.sharedPreloadLibraries`. They are unreachable in a real render for the same reason as the
+  agent branch this PR deleted, but the two are not equivalent -- the agent branch emitted
+  *wrong remediation advice*, which is worse than dead, while these two produce correct behaviour
+  for a state that can no longer occur. Deleting them would touch the subtle #262/#293 preload
+  logic for no behavioural gain.
+
+  Fifth review round -- the duration guard diverged from time.ParseDuration in BOTH directions,
+  and each direction was its own bug:
+
+  - **Too permissive (three holes, each reproducing the outage the guard exists to prevent).**
+    The parser lower-cased its input, so `15S` and `1M30S` passed -- Go's units are
+    case-SENSITIVE and both are errors. `| default "15s"` collapsed an explicitly empty value
+    into the default, so an empty `leaseDuration` validated as 15s while the StatefulSet emitted
+    `value: ""`, which Go also rejects. And `reconcileInterval` was not checked at all, though
+    `config.Load` parses it with the same helper. All three rendered cleanly and then refused the
+    agent's boot on every pod.
+  - **Too strict (turning working 1.x values into upgrade failures).** `.5s`, `5.s` and `+15s`
+    are valid Go durations and were rejected, as was microseconds spelled U+03BC. The grammar now
+    mirrors `time.ParseDuration`: optional leading sign, one or more `<number><unit>` pairs with
+    either side of the decimal point omissible, and all three microsecond spellings.
+  - **`etcd.rbac.bootstrapImage` must now match `ha.image` at render time.** The bundled etcd's
+    RBAC-bootstrap Job runs `pg-ha-agent rbac-bootstrap`, so a mismatch has one agent build
+    writing the etcd RBAC that a different build then authenticates against. This change pinned
+    both halves by hand but nothing enforced the lockstep, so the next image bump would have
+    silently reintroduced the drift. Adopting a new image is therefore a FOUR-key edit per chart,
+    now stated in `images/pg-ha/README.md` and enforced by `pg.validateEtcdBootstrapImage`.
+    Only checked when the bundled etcd is enabled -- with an external etcd the Job never renders.
+
+- **The HA image is versioned with the chart** (#290/#291). Tags are now
+  `cagriekin/pg-ha:<chart-version>-pg<major>` (e.g. `2.0.0-pg18`, `2.0.0-pg17`), published from
+  the git tag `pg-ha-<version>`, replacing `cagriekin/repmgr:trixie-<repmgr>-<n>`. The old
+  scheme was keyed on a repmgr version the image no longer contains. The version an image
+  carries is the chart version it shipped with; a chart-only patch does not force an image
+  rebuild, so the two can legitimately differ by a patch. `cagriekin/repmgr` stays published
+  and frozen at its last tag, so existing pins keep resolving. There is no unsuffixed
+  "default major" alias -- a pin names its major, and `ha.image.majorVersion` cross-checks it
+  at render time.
+
 ### Added
 
 - **Topology from `pg_stat_replication`; `repmgr.nodes` retired in native mode (#288).**

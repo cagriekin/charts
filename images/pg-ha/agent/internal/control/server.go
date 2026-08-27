@@ -335,13 +335,13 @@ func (s *Server) authnMW(next http.Handler) http.Handler {
 // allowlist" would send the operator to edit the wrong one.
 func (s *Server) allowed(id Identity, verb Verb) (bool, string) {
 	if len(s.o.AllowedCNs) > 0 && !containsFold(s.o.AllowedCNs, id.CN) {
-		return false, "the client certificate CN is not on repmgr.agent.control.allowedClientCNs, which gates every control route"
+		return false, "the client certificate CN is not on ha.agent.control.allowedClientCNs, which gates every control route"
 	}
 	if verb == VerbRestore {
 		// No "allow all" reading of an empty restore list: naming nobody denies
 		// everybody, so forgetting the list cannot open the most destructive verb.
 		if !containsFold(s.o.RestoreAllowedCNs, id.CN) {
-			return false, "the client certificate CN is not on repmgr.agent.control.restore.allowedClientCNs (restore is a separate verb; a client must be on BOTH that list and allowedClientCNs)"
+			return false, "the client certificate CN is not on ha.agent.control.restore.allowedClientCNs (restore is a separate verb; a client must be on BOTH that list and allowedClientCNs)"
 		}
 	}
 	return true, ""

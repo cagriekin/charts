@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g., pg-ha-1). Published as trixie-pg18-<n> and trixie-pg17-<n>'
+        description: 'Release tag (e.g., pg-ha-2.0.0). Published as <version>-pg18 and <version>-pg17'
         required: true
         type: string
   push:
@@ -84,29 +84,31 @@ jobs:
             echo "Could not resolve an image tag" >&2
             exit 1
           fi
-          # #290: the tag scheme is `pg-ha-<n>` in git, published as trixie-pg<major>-<n>.
+          # The tag scheme is `pg-ha-<version>` in git, published as <version>-pg<major>.
           #
-          # It was trixie-<repmgr-version>-<n>, keyed on a package this image no longer
-          # contains -- so every published tag advertised a repmgr version that was not in it.
-          # The new scheme is keyed on the PostgreSQL major, which is the thing one build
-          # actually bundles, and it puts that major IN the tag rather than in an optional
-          # suffix. That deletes a whole class of hazard the old guards existed for: there is
-          # no unsuffixed "default major" tag, so no tag can state the wrong major and no
-          # chart pin can silently resolve to a major it did not ask for.
+          # It was `trixie-<repmgr-version>-<n>`, keyed on a package this image no longer
+          # contains, so every published tag advertised a version that was not in it (#290). The
+          # version now tracks the CHART release the image shipped with, which is the number a
+          # consumer already reasons about, and the PostgreSQL major stays IN the tag because one
+          # build bundles exactly one -- a tag that does not say which is the hazard #290 removed.
+          #
+          # Equality with the chart version is not enforced, deliberately: a chart-only patch
+          # needs no new image, and it keeps pinning the last one rather than publishing a
+          # byte-identical rebuild. The version says "this image shipped with that chart line".
           #
           # Anchored at both ends, and a glob cannot express it, so this stays a regex. Shell
           # metacharacters must never reach a later step in a job holding id-token: write.
-          if [[ ! "$tag" =~ ^pg-ha-[0-9]+$ ]]; then
-            echo "Refusing to publish from '${tag}': expected pg-ha-<n>, e.g. pg-ha-1. Each leg publishes trixie-pg<major>-<n> from it." >&2
+          if [[ ! "$tag" =~ ^pg-ha-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Refusing to publish from '${tag}': expected pg-ha-<major>.<minor>.<patch>, e.g. pg-ha-2.0.0 (matching the chart version this image ships with). Each leg publishes <version>-pg<major> from it." >&2
             exit 1
           fi
-          n="${tag#pg-ha-}"
+          version="${tag#pg-ha-}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           # ONE tag per leg, naming its own major. No unsuffixed alias: a pin must say which
           # major it wants, and the chart's own majorVersion guard then cross-checks it.
-          tags="cagriekin/pg-ha:trixie-pg${PG_MAJOR}-${n}"
+          tags="cagriekin/pg-ha:${version}-pg${PG_MAJOR}"
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
-          echo "n=${n}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "Publishing PG${PG_MAJOR} as: ${tags}"
 
       - name: Set up QEMU
@@ -134,7 +136,7 @@ jobs:
           PG_MAJOR: ${{ matrix.pg_major }}
         run: |
           set -euo pipefail
-          ref="cagriekin/pg-ha:trixie-pg${PG_MAJOR}-${TAG#pg-ha-}"
+          ref="cagriekin/pg-ha:${TAG#pg-ha-}-pg${PG_MAJOR}"
           docker buildx build --load \
             --build-arg "PG_MAJOR=${PG_MAJOR}" \
             --cache-from "type=gha,scope=pg-ha-publish-pg${PG_MAJOR}" \

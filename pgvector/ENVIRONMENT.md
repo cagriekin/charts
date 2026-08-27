@@ -18,19 +18,19 @@ Required/optional is from the consuming process's perspective at runtime. Secret
 | `POSTGRES_DB` | string | yes | secret (`database`) | entrypoint |
 | `LD_LIBRARY_PATH` | string | no | `/usr/lib/postgresql/<major>/extra-lib` | dynamic linker (`postgresql.extensions.extraLibs`, #309; emitted only when non-empty) |
 
-## repmgr (both failover modes, when `repmgr.enabled=true`)
+## repmgr (both failover modes, when `ha.enabled=true`)
 
 | Variable | Type | Required | Default / source | Consumer |
 |----------|------|----------|------------------|----------|
-| `REPMGR_USER` | string | yes | `repmgr.username` | entrypoint (creates the role), agent (replication auth) |
+| `REPMGR_USER` | string | yes | `ha.username` | entrypoint (creates the role), agent (replication auth) |
 | `REPMGR_PASSWORD` | string | yes | secret (`repmgr-password`) | entrypoint (creates the role), agent (replication auth) |
-| `REPMGR_DB` | string | yes | `repmgr.database` | entrypoint (creates the database), agent (`dbname` in `primary_conninfo`) |
+| `REPMGR_DB` | string | yes | `ha.database` | entrypoint (creates the database), agent (`dbname` in `primary_conninfo`) |
 | `HEADLESS_SERVICE` | string | yes | `<fullname>-headless.<ns>.svc.cluster.local` | agent (peer FQDNs) |
 | `REPMGR_NODE_COUNT` | number | yes | `postgresql.replicaCount + 1` | agent (peer enumeration) |
 | `NAMESPACE` | string | yes | fieldRef `metadata.namespace` | agent |
 | `PRIMARY_MARKER` | string | yes | `<fullname>-primary` | agent (#125 highwater) |
 
-## HA only (`repmgr.enabled=true`)
+## HA only (`ha.enabled=true`)
 
 The lease-based Go agent (`pg-ha-agent`, PID 1 in the postgresql container) reads
 these; `config.Load` fail-fasts at boot if any is missing.
@@ -39,20 +39,20 @@ these; `config.Load` fail-fasts at boot if any is missing.
 |----------|------|----------|------------------|----------|
 | `POD_NAME` | string | yes | fieldRef `metadata.name` (the Lease holder identity) | agent |
 | `LEASE_NAME` | string | yes | `<fullname>-leader` | agent (leadership Lease) |
-| `LEASE_DURATION` | duration | yes | `repmgr.agent.leaseDuration` (15s) | agent (leaderelection) |
-| `RENEW_DEADLINE` | duration | yes | `repmgr.agent.renewDeadline` (10s) | agent |
-| `RETRY_PERIOD` | duration | yes | `repmgr.agent.retryPeriod` (2s) | agent |
-| `RECONCILE_INTERVAL` | duration | yes | `repmgr.agent.reconcileInterval` (5s) | agent (tick) |
+| `LEASE_DURATION` | duration | yes | `ha.agent.leaseDuration` (15s) | agent (leaderelection) |
+| `RENEW_DEADLINE` | duration | yes | `ha.agent.renewDeadline` (10s) | agent |
+| `RETRY_PERIOD` | duration | yes | `ha.agent.retryPeriod` (2s) | agent |
+| `RECONCILE_INTERVAL` | duration | yes | `ha.agent.reconcileInterval` (5s) | agent (tick) |
 | `MASTER_SERVICE` | string | yes | `<fullname>` (write Service whose selector the agent patches) | agent |
 | `POD_SELECTOR` | string | yes | chart selector labels + `component=postgresql` | agent (pg-role labeling) |
-| `DCS_BACKEND` | enum | yes | `repmgr.agent.dcs.backend` (`kubernetes`/`etcd`) | agent (leadership store) |
-| `SPLIT_BRAIN_ACTION` | enum | yes | `repmgr.splitBrainDetection.action` (`log`/`fence`) | agent |
-| `POD_CIDR` | CIDR | yes | `repmgr.agent.podCidr` (`10.0.0.0/8`) | agent (hardened pg_hba: trusted pod network) |
+| `DCS_BACKEND` | enum | yes | `ha.agent.dcs.backend` (`kubernetes`/`etcd`) | agent (leadership store) |
+| `SPLIT_BRAIN_ACTION` | enum | yes | `ha.splitBrainDetection.action` (`log`/`fence`) | agent |
+| `POD_CIDR` | CIDR | yes | `ha.agent.podCidr` (`10.0.0.0/8`) | agent (hardened pg_hba: trusted pod network) |
 | `POSTGRESQL_PGHBA` | newline-list | no | `postgresql.pgHba` (joined) | agent (user pg_hba rules, above the catch-alls) |
-| `CASCADE_REPLICATION` | boolean | no | `repmgr.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
-| `SYNC_REPLICATION_SLOTS` | boolean | no | `repmgr.agent.syncReplicationSlots` (`false`) | agent (logical failover slot sync, #308; emitted only when true) |
+| `CASCADE_REPLICATION` | boolean | no | `ha.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
+| `SYNC_REPLICATION_SLOTS` | boolean | no | `ha.agent.syncReplicationSlots` (`false`) | agent (logical failover slot sync, #308; emitted only when true) |
 | ~~`USE_REPLICATION_SLOTS`~~ | — | — | **removed in 2.0.0 (#290)** | Nothing. It configured the init container's `repmgr standby clone`; the agent owns cloning and always uses a slot |
-| `MECHANISM` | enum | no | `repmgr.agent.mechanism` (`native` only) | agent (HA mechanics, #287). **Always emitted since #294** -- `native` is the default, and an agent built before #294 assumes `repmgr` when this is absent, so omitting it would run the removed mechanism during a two-step image-then-chart release. The shell no longer reads it -- the repmgr paths it gated are gone (#290). An explicit `repmgr` is rejected at render time |
+| `MECHANISM` | enum | no | `ha.agent.mechanism` (`native` only) | agent (HA mechanics, #287). **Always emitted since #294** -- `native` is the default, and an agent built before #294 assumes `repmgr` when this is absent, so omitting it would run the removed mechanism during a two-step image-then-chart release. The shell no longer reads it -- the repmgr paths it gated are gone (#290). An explicit `repmgr` is rejected at render time |
 
 Lease timings must satisfy `LEASE_DURATION > RENEW_DEADLINE > RETRY_PERIOD`
 (validated at boot). The agent also writes a `0600 ~/.pgpass` from `REPMGR_*` so a
@@ -91,15 +91,15 @@ fail-open fast path while the agent refuses to boot. Only the postgresql contain
 involved either way; the `repmgr-init` init container makes no apiserver calls. See the
 chart README section *Routing the agent's apiserver traffic* for the kubeconfig to mount.
 
-### etcd backend only (`repmgr.agent.dcs.backend=etcd`)
+### etcd backend only (`ha.agent.dcs.backend=etcd`)
 
 Required only when the leadership store is etcd; with the bundled etcd subchart
 (`etcd.enabled=true`) the chart fills `ETCD_ENDPOINTS` automatically.
 
 | Variable | Type | Required | Default / source | Consumer |
 |----------|------|----------|------------------|----------|
-| `ETCD_ENDPOINTS` | csv | yes (etcd) | `repmgr.agent.dcs.etcd.endpoints`, or the bundled `<release>-etcd:2379` | agent (etcd client) |
-| `ETCD_PREFIX` | string | yes (etcd) | `repmgr.agent.dcs.etcd.prefix` or `/pg-ha/<release>/` | agent (election key prefix) |
+| `ETCD_ENDPOINTS` | csv | yes (etcd) | `ha.agent.dcs.etcd.endpoints`, or the bundled `<release>-etcd:2379` | agent (etcd client) |
+| `ETCD_PREFIX` | string | yes (etcd) | `ha.agent.dcs.etcd.prefix` or `/pg-ha/<release>/` | agent (election key prefix) |
 | `ETCD_TLS_CERT` / `ETCD_TLS_KEY` / `ETCD_TLS_CA` | path | no | `/etc/etcd-tls/{tls.crt,tls.key,ca.crt}` when `dcs.etcd.tls.secretName` set | agent (mutual TLS) |
 
 `LEASE_DURATION` must be `>= 5s` in etcd mode (the etcd lease TTL is whole

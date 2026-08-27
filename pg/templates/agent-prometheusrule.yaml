@@ -1,4 +1,5 @@
-{{- if and (eq (include "pg.agentMode" .) "true") (dig "prometheusRule" "enabled" false (.Values.repmgr.agent.monitoring | default dict)) }}
+{{- include "pg.normalizeValues" . -}}
+{{- if and (eq (include "pg.agentMode" .) "true") (dig "prometheusRule" "enabled" false (.Values.ha.agent.monitoring | default dict)) }}
 {{- /*
 Alert rules over the pg-ha-agent's metrics (scraped by the agent
 ServiceMonitor). Scoped to this release by namespace + the headless Service label
@@ -14,7 +15,7 @@ metadata:
   name: {{ include "pg.fullname" . }}-agent
   labels:
     {{- include "pg.labels" . | nindent 4 }}
-    {{- with .Values.repmgr.agent.monitoring.prometheusRule.additionalLabels }}
+    {{- with .Values.ha.agent.monitoring.prometheusRule.additionalLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
   {{- with (include "pg.annotations" .) }}
@@ -102,13 +103,13 @@ spec:
             summary: "A replication slot was invalidated ({{ include "pg.fullname" . }})"
             description: "PostgreSQL dropped a physical replication slot's WAL reservation because it exceeded max_slot_wal_keep_size (4GB in this image). The WAL the standby behind it needs is gone, so that standby cannot resume streaming and requires a full re-clone -- delete its PVC and let the agent re-clone it, or trigger a rejoin. Identify it with: SELECT slot_name, active, wal_status, restart_lsn FROM pg_replication_slots WHERE wal_status = 'lost'; -- note the retained-WAL gauge reads ZERO for these, because invalidation nulls restart_lsn."
         - alert: PGHAReplicationSlotRetainingWAL
-          expr: max(pg_ha_agent_replication_slot_max_retained_wal_bytes{ {{ $m }} }) > {{ int64 (dig "prometheusRule" "slotRetainedWALBytes" 3221225472 (.Values.repmgr.agent.monitoring | default dict)) }}
+          expr: max(pg_ha_agent_replication_slot_max_retained_wal_bytes{ {{ $m }} }) > {{ int64 (dig "prometheusRule" "slotRetainedWALBytes" 3221225472 (.Values.ha.agent.monitoring | default dict)) }}
           for: 15m
           labels:
             severity: critical
           annotations:
             summary: "A replication slot is retaining too much WAL ({{ include "pg.fullname" . }})"
-            description: "Some physical replication slot has held back more than {{ int64 (dig "prometheusRule" "slotRetainedWALBytes" 3221225472 (.Values.repmgr.agent.monitoring | default dict)) }} bytes of WAL for 15m. This is the early warning before max_slot_wal_keep_size (4GB) is reached: past that PostgreSQL invalidates the slot, this gauge drops back to zero, and the standby behind it needs a full re-clone. Find it with: SELECT slot_name, active, wal_status, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots ORDER BY 4 DESC; -- then reattach its consumer, or drop the slot if that consumer is gone for good (pg_drop_replication_slot)."
+            description: "Some physical replication slot has held back more than {{ int64 (dig "prometheusRule" "slotRetainedWALBytes" 3221225472 (.Values.ha.agent.monitoring | default dict)) }} bytes of WAL for 15m. This is the early warning before max_slot_wal_keep_size (4GB) is reached: past that PostgreSQL invalidates the slot, this gauge drops back to zero, and the standby behind it needs a full re-clone. Find it with: SELECT slot_name, active, wal_status, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots ORDER BY 4 DESC; -- then reattach its consumer, or drop the slot if that consumer is gone for good (pg_drop_replication_slot)."
         - alert: PGHAReplicationSlotInactive
           expr: max(pg_ha_agent_replication_slots_inactive{ {{ $m }} }) > 0
           for: 1h

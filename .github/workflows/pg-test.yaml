@@ -132,30 +132,35 @@ jobs:
       - name: Build repmgr images from source (one per PG major)
         run: |
           set -euo pipefail
-          tag=$(awk '/^repmgr:/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
-          if [ -z "$tag" ]; then echo "could not resolve repmgr image tag from pg/values.yaml" >&2; exit 1; fi
+          # Matches BOTH block spellings, same as pg/tests/set-pg-major.sh: #291 renamed the
+          # block to `ha:` and keeps `repmgr:` as a values alias, so the tree can carry either.
+          # Anchoring on one is a hard CI outage, not a soft miss -- the -z guards below exit 1
+          # and every leg of both majors dies before a single suite runs.
+          tag=$(awk '/^(repmgr|ha):/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
+          if [ -z "$tag" ]; then echo "could not resolve the HA image tag from pg/values.yaml (looked for tag: under the ha:/repmgr: block)" >&2; exit 1; fi
           # The image REPOSITORY comes from the chart too, so this keeps building whatever the
           # chart points at across the #290 rename (cagriekin/repmgr -> cagriekin/pg-ha).
-          repo=$(awk '/^repmgr:/{r=1} r&&/^    repository:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
-          if [ -z "$repo" ]; then echo "could not resolve repmgr image repository from pg/values.yaml" >&2; exit 1; fi
+          repo=$(awk '/^(repmgr|ha):/{r=1} r&&/^    repository:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
+          if [ -z "$repo" ]; then echo "could not resolve the HA image repository from pg/values.yaml (looked for repository: under the ha:/repmgr: block)" >&2; exit 1; fi
           # Two tag shapes, exactly as pg/tests/set-pg-major.sh accepts (#290): the chart pin
           # moves to the new scheme only after the new image is published, so both must work or
           # that bump breaks CI silently.
           #
-          #   NEW: trixie-pg<major>-<n>  -- substitute the major
-          #   OLD: trixie-<repmgr>-<n>   -- unsuffixed is PG18, others take -pgNN
+          #   NEW: <chart-version>-pg<major>   e.g. 2.0.0-pg18 -- substitute the major
+          #   OLD: trixie-<repmgr>-<n>         unsuffixed is PG18, others take -pgNN
+          # (This table said `trixie-pg<major>-<n>` for NEW until #291 review; the classifier
+          #  below keys on a LEADING semver and would have sent that shape to the legacy arm.)
           #
           # Getting this wrong is quiet, not loud: building the PG18 image under a "-pg17" name
           # while set-pg-major points the PG17 fixtures at that name makes every PG17 leg run
           # PostgreSQL 18 and pass.
-          # ONE pattern, shared verbatim with pg/tests/set-pg-major.sh (#290 review). They had
-          # diverged -- CI matched only a `trixie` prefix while the script also accepted any
-          # other -- so a pin like `deb13-pg18-1` was classified legacy here and major-in-tag
-          # there, which is precisely the silent failure both comments warn about: CI builds the
-          # PG18 image as <tag>-pg17 while the script points the PG17 fixtures at that name, and
-          # every PG17 leg runs PostgreSQL 18 and passes.
+          # Shape `<chart-version>-pg<major>` (e.g. 2.0.0-pg18), keyed on a LEADING semver --
+          # both it and the old trixie-<repmgr>-<n>-pgNN end in -pg<digits>, so a trailing test
+          # would misclassify the legacy suffixed form. Shared verbatim with
+          # pg/tests/set-pg-major.sh; if the two disagree, CI builds one major under the other's
+          # name and every leg of the mismatched major passes while running the wrong server.
           case "$tag" in
-            *pg[0-9]*-[0-9]*) scheme=major-in-tag ;;
+            [0-9]*.[0-9]*.[0-9]*-pg[0-9]*) scheme=major-in-tag ;;
             *) scheme=legacy
                base=${tag%-pg[0-9]*}
                if [ "$base" != "$tag" ]; then
@@ -166,7 +171,7 @@ jobs:
           echo "::notice title=pg-major::tag scheme=${scheme} repo=${repo} base=${tag}"
           for major in 18 17; do
             if [ "$scheme" = "major-in-tag" ]; then
-              ref="${repo}:$(printf '%s' "$tag" | sed -E "s/(^|-)pg[0-9]+-/\1pg${major}-/")"
+              ref="${repo}:$(printf '%s' "$tag" | sed -E "s/-pg[0-9]+$/-pg${major}/")"
             elif [ "$major" = "18" ]; then
               ref="${repo}:${tag}"
             else

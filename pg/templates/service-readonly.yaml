@@ -1,4 +1,5 @@
-{{- if .Values.repmgr.enabled }}
+{{- include "pg.normalizeValues" . -}}
+{{- if .Values.ha.enabled }}
 {{- /* Service selectors are equality-only, so "every pod except the primary"
        cannot be expressed against pod-name. Instead a pg-role label
        (primary/standby) is maintained on all postgresql pods each reconciliation

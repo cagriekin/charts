@@ -2178,12 +2178,12 @@ func TestDropRepmgrPreloadIsIdempotent(t *testing.T) {
 }
 
 func TestDropRepmgrPreloadRefusesToStartWhenTheModuleIsAbsent(t *testing.T) {
-	// A repmgr-mechanism node on an image that no longer ships repmgr.so: the strip does
-	// not run, so the presence check is the only thing between the operator and an opaque
-	// `could not access file "repmgr"` crash-loop on every pod at once.
+	// An image that no longer ships repmgr.so while PGDATA still requests it: the presence
+	// check is the only thing between the operator and an opaque `could not access file
+	// "repmgr"` crash-loop on every pod at once.
 	dir := t.TempDir()
 	writePGDATAConf(t, dir, "shared_preload_libraries = 'repmgr'\n")
-	a := newPreloadTestAgent(t, config.MechanismRepmgr, dir, filepath.Join(dir, "absent.so"))
+	a := newPreloadTestAgent(t, config.MechanismNative, dir, filepath.Join(dir, "absent.so"))
 	err := a.assertPreloadedLibsPresent()
 	if err == nil {
 		t.Fatal("expected a refusal when the requested module is absent")
@@ -2195,14 +2195,34 @@ func TestDropRepmgrPreloadRefusesToStartWhenTheModuleIsAbsent(t *testing.T) {
 			t.Errorf("message does not mention %q: %v", want, err)
 		}
 	}
-	// And on a repmgr-MECHANISM node it must NOT advise dropping the library: that is exactly
-	// what pg.sharedPreloadLibraries exists to prevent, because it starts the postmaster
-	// without the repmgr extension's functions and silently disables failover (#293 review).
-	if !strings.Contains(err.Error(), "do NOT just drop the library") {
-		t.Errorf("repmgr-mechanism remediation must not be 'drop the library': %v", err)
+}
+
+// This test used to assert a second, mechanism-specific remediation ("do NOT just drop the
+// library") for a repmgr-MECHANISM node. That branch was removed with #291's rename sweep
+// because it is unreachable: config.Load rejects MECHANISM=repmgr outright, so no agent can
+// be constructed with a non-native mechanism. Asserting unreachability directly is what keeps
+// the deletion honest -- if Load ever starts accepting it again, the remediation has to come
+// back, and this is the test that will say so.
+func TestConfigLoadRejectsTheRepmgrMechanism(t *testing.T) {
+	load := func(mechanism string) error {
+		_, err := config.Load(func(k string) string {
+			if k == "MECHANISM" {
+				return mechanism
+			}
+			return ""
+		})
+		return err
 	}
-	if !strings.Contains(err.Error(), "mechanism: native") {
-		t.Errorf("repmgr-mechanism remediation must point at native: %v", err)
+	// Load also fails on every other missing required variable, so "it returned an error" is
+	// no evidence at all -- the assertion has to be on the repmgr-specific sentence. The
+	// native control below is what proves the marker is not simply always present.
+	const marker = "was removed in chart 2.0.0"
+	err := load(config.MechanismRepmgr)
+	if err == nil || !strings.Contains(err.Error(), marker) {
+		t.Fatalf("config.Load must reject MECHANISM=repmgr with the removal notice (%q); the mechanism-specific preload remediation in assertPreloadedLibsPresent would be reachable again and must be restored. got: %v", marker, err)
+	}
+	if nerr := load(config.MechanismNative); nerr != nil && strings.Contains(nerr.Error(), marker) {
+		t.Fatalf("the removal notice fires under MECHANISM=native too, so the assertion above proves nothing: %v", nerr)
 	}
 }
 
