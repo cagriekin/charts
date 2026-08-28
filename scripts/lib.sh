@@ -41,3 +41,44 @@ verdict() {
   fi
   return "${rc}"
 }
+
+# chart_profiles <chart-dir>
+# Emits one line per render profile: "<label> <values-file>..." (space separated; fixture paths
+# contain no spaces). The first is always the chart's DEFAULT render with no values file.
+#
+# Why the gates need this at all (#298 review): kubeconform and kube-linter were both validating
+# only each chart's default render -- 9 resources for pg. Every optional component was therefore
+# unchecked by both gates: pgpool, the metrics exporter, pgBackRest's five containers, TLS,
+# the etcd DCS, the restore workload, the hook Jobs. That is the wrong half to skip. A schema or
+# policy violation in a default-on object gets caught by a hundred other things; one in an
+# optional object ships, and the charts' own `tests/values-*.yaml` already describe exactly those
+# configurations.
+#
+# pgvector and etcd ship no fixtures, so they get defaults only. For pgvector that is acceptable
+# rather than a gap: its templates are byte-identical to pg's by invariant (`diff -r` is a gate),
+# so pg's profiles exercise the same template code.
+chart_profiles() {
+  local chart="$1" f name base
+  echo "defaults"
+  for f in "${chart}"/tests/values-*.yaml; do
+    [ -e "${f}" ] || continue
+    name="$(basename "${f}" .yaml)"
+    base="$(fixture_base "${chart}" "$(basename "${f}")")"
+    echo "${name} ${base}${base:+ }${f}"
+  done
+}
+
+# fixture_base <chart-dir> <fixture-basename>
+# Some fixtures are deliberately a LAYER over another rather than a standalone configuration,
+# and rendering them alone fails a render-time validator by design. They are declared here so a
+# fixture that fails to render for any OTHER reason is a gate failure rather than a silent skip
+# -- skipping quietly is the same vacuous-pass shape these gates were just fixed for.
+fixture_base() {
+  local chart="$1" fixture="$2"
+  case "${chart}/${fixture}" in
+    # #323's passthrough fixture sets pgbackrest.extraEnv/extraVolumes without enabling
+    # pgbackrest; standalone it hits the "set but pgbackrest.enabled is false" validator.
+    pg/values-pgbackrest-extra.yaml) echo "${chart}/tests/values-pgbackrest.yaml" ;;
+    *) echo "" ;;
+  esac
+}

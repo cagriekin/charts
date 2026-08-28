@@ -18,6 +18,21 @@ The charts are tested in layers, fast to slow. The first three run on every PR (
 | --- | --- | --- |
 | **kube-linter** | The mandatory documented Helm standards as policy-as-code: resource requests/limits, and liveness/readiness probes. Config: `.kube-linter.yaml` (only these checks; legitimate exceptions are waived per-object with an `ignore-check.kube-linter.io/<check>` annotation). | `bash scripts/kube-linter-charts.sh` |
 
+Both gates render **every profile**, not just each chart's defaults (#298 review): the chart's
+own `tests/values-*.yaml` fixtures are enumerated and rendered in turn, so pgpool, the metrics
+exporter, pgBackRest's five containers, TLS, the etcd DCS, the restore workload and the hook
+Jobs are all checked. Defaults-only was the wrong half to cover -- a violation in a default-on
+object is caught by a dozen other things; one in an optional object ships. Widening it
+immediately found two: the etcd `rbac-bootstrap` Job was missing the one-shot probe waiver every
+sibling Job already had, and the idle `pgbackrest` sidecar had none either.
+
+A profile that renders **nothing** fails both gates. kube-linter prints
+`Warning: no valid objects found.` and exits zero, and kubeconform reports `0 resources found`
+and exits zero, so without that guard a chart which stopped rendering would report a clean gate
+having examined nothing. If a fixture is deliberately a *layer* over another (rendering it alone
+trips a render-time validator), declare its base in `fixture_base()` in `scripts/lib.sh` rather
+than letting it be skipped.
+
 ## 3. Integration (real cluster — KinD)
 
 The `<chart>/tests/test-*.sh` suites (driven by each chart's `Makefile`) cover what the

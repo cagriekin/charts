@@ -104,6 +104,24 @@
 
 ### Testing
 
+- **Both render gates only ever checked each chart's DEFAULT render (#298 review).** kubeconform
+  validated 9 resources for `pg`; kube-linter has no values flag at all, so directory mode could
+  not see anything else. Every optional component was therefore unchecked by both: pgpool, the
+  metrics exporter, pgBackRest's five containers, TLS, the etcd DCS, the restore workload, the
+  hook Jobs. That is the wrong half to skip -- a violation in a default-on object is caught by a
+  dozen other things, one in an optional object ships. Both gates now enumerate each chart's own
+  `tests/values-*.yaml` fixtures and render every one (44 profiles across the five charts, ~13s).
+  Widening it immediately found two real policy violations, both fixed here:
+  - the **etcd `rbac-bootstrap` Job** was missing the one-shot probe waiver that every sibling
+    hook Job in `pg/templates` already carried. It only renders under `dcs.backend: etcd`, so the
+    gate had never seen it. (etcd subchart `0.1.6` → `0.1.7`, re-vendored into both consumers.)
+  - the **idle `pgbackrest` sidecar** had no probes and no waiver. The waiver added for it is
+    gated on `pgbackrest.enabled` rather than unconditional, because kube-linter waives per
+    OBJECT: an unconditional annotation would also stop the gate noticing if the `postgresql`
+    container ever lost its own probes. Verified in both directions -- the default render carries
+    no waiver and still catches missing `postgresql` probes.
+  A profile that renders nothing now fails both gates, and a fixture that is deliberately a
+  *layer* over another declares its base in `fixture_base()` rather than being silently skipped.
 - **The policy gate could report a clean pass while linting nothing (#298 review).**
   `kube-linter lint <chart-dir>` renders the chart itself, and when that yields no objects it
   prints `Warning: no valid objects found.` and exits **zero** -- so a chart that stops rendering

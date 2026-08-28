@@ -41,31 +41,37 @@ fi
 
 rc=0
 failed=0
+profiles=0
 for chart in "${charts[@]}"; do
-  echo "==> kubeconform: ${chart}"
-  out=""
-  if ! out=$(helm template "${chart}" "${chart}" \
-      | kubeconform \
-          -strict \
-          -ignore-missing-schemas \
-          -kubernetes-version "${KUBE_VERSION}" \
-          -schema-location default \
-          -schema-location "${CRD_CATALOG}" \
-          -summary 2>&1); then
-    rc=1
-    failed=$((failed + 1))
-  fi
-  printf '%s\n' "${out}"
-  # Same vacuous-pass guard as the kube-linter gate (#298 review): kubeconform validates what it
-  # is given, so an empty render is "0 resources found ... Valid: 0" and exit ZERO. Require the
-  # summary to report at least one resource, so a chart that renders nothing fails here instead
-  # of reporting a clean schema gate.
-  found=$(printf '%s' "${out}" | sed -nE 's/^Summary: ([0-9]+) resources found.*/\1/p' | head -1)
-  if [ -z "${found}" ] || [ "${found}" -eq 0 ]; then
-    echo "FATAL: kubeconform validated NO resources from ${chart} (summary: ${found:-absent})." >&2
-    echo "       A gate that examines nothing must fail, not pass." >&2
-    rc=1
-    failed=$((failed + 1))
-  fi
+  while read -r label vfiles; do
+    args=()
+    for v in ${vfiles}; do args+=(-f "${v}"); done
+    echo "==> kubeconform: ${chart} [${label}]"
+    profiles=$((profiles + 1))
+    out=""
+    if ! out=$(helm template "${chart}" "${chart}" "${args[@]}" \
+        | kubeconform \
+            -strict \
+            -ignore-missing-schemas \
+            -kubernetes-version "${KUBE_VERSION}" \
+            -schema-location default \
+            -schema-location "${CRD_CATALOG}" \
+            -summary 2>&1); then
+      rc=1
+      failed=$((failed + 1))
+    fi
+    printf '%s\n' "${out}"
+    # Vacuous-pass guard (#298 review): kubeconform validates what it is given, so an empty
+    # render is "0 resources found ... Valid: 0" and exit ZERO. Require at least one resource,
+    # so a chart or profile that renders nothing fails here instead of reporting a clean gate.
+    found=$(printf '%s' "${out}" | sed -nE 's/^Summary: ([0-9]+) resources found.*/\1/p' | head -1)
+    if [ -z "${found}" ] || [ "${found}" -eq 0 ]; then
+      echo "FATAL: kubeconform validated NO resources from ${chart} [${label}] (summary: ${found:-absent})." >&2
+      echo "       A gate that examines nothing must fail, not pass. If this fixture is a LAYER" >&2
+      echo "       over another, declare its base in fixture_base() in scripts/lib.sh." >&2
+      rc=1
+      failed=$((failed + 1))
+    fi
+  done < <(chart_profiles "${chart}")
 done
-verdict "kubeconform" "$rc" "$( [ "$rc" -eq 0 ] && echo "${#charts[@]} charts, k8s ${KUBE_VERSION}" || echo "${failed} of ${#charts[@]} charts" )"
+verdict "kubeconform" "$rc" "$( [ "$rc" -eq 0 ] && echo "${#charts[@]} charts, ${profiles} profiles, k8s ${KUBE_VERSION}" || echo "${failed} of ${profiles} profiles" )"

@@ -162,8 +162,22 @@ metadata:
   labels:
     {{- include "pg.labels" . | nindent 4 }}
     app.kubernetes.io/component: postgresql
-  {{- if or .Values.global.annotations .Values.postgresql.annotations }}
+  {{- /* The kube-linter probe waiver is GATED on pgbackrest.enabled (#298 review), not
+         unconditional. kube-linter waives per OBJECT, not per container, so an unconditional
+         annotation here would also stop the gate from ever noticing that the `postgresql`
+         container had lost its liveness/readiness probes -- the one container in this pod where
+         those probes are load-bearing. Gating it means every profile that does not enable
+         pgbackrest (including the default render) keeps full enforcement on this StatefulSet,
+         and only the pgbackrest-enabled renders carry the waiver. The waived container is an
+         idle `exec sleep infinity` holder: the CronJobs `kubectl exec` into it, nothing serves
+         from it, and there is no state a probe could observe -- if it dies the kubelet restarts
+         it. Widening the gate past the DEFAULT render is what surfaced this at all. */ -}}
+  {{- if or .Values.global.annotations .Values.postgresql.annotations .Values.pgbackrest.enabled }}
   annotations:
+    {{- if .Values.pgbackrest.enabled }}
+    ignore-check.kube-linter.io/no-liveness-probe: "the pgbackrest sidecar is an idle `sleep infinity` holder the CronJobs exec into"
+    ignore-check.kube-linter.io/no-readiness-probe: "the pgbackrest sidecar is an idle `sleep infinity` holder the CronJobs exec into"
+    {{- end }}
     {{- with .Values.global.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

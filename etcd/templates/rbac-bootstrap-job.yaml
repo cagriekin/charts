@@ -13,6 +13,12 @@ metadata:
   labels:
     {{- include "etcd.labels" . | nindent 4 }}
   annotations:
+    # one-shot hook Job: liveness/readiness probes do not apply (kube-linter waiver). Missing
+    # until #298's review widened the policy gate past each chart's DEFAULT render -- this Job
+    # only renders under `dcs.backend: etcd`, so the gate had never seen it, while every sibling
+    # one-shot Job in pg/templates already carried the pair.
+    ignore-check.kube-linter.io/no-liveness-probe: "one-shot etcd rbac-bootstrap hook Job"
+    ignore-check.kube-linter.io/no-readiness-probe: "one-shot etcd rbac-bootstrap hook Job"
     # Run after the cluster is up on install AND upgrade; the bootstrap is idempotent
     # (existence-checked + auth-enable guarded), so re-running reconciles the tenants.
     "helm.sh/hook": post-install,post-upgrade
