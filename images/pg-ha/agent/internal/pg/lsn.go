@@ -45,19 +45,3 @@ func (a LSN) Greater(b LSN) bool {
 	}
 	return a.Lo > b.Lo
 }
-
-// LSNGreater compares two raw LSN strings with the exact semantics of the shell
-// lsn_gt used in split-brain survivor selection: an empty or unreadable b loses to
-// any a (a wins); an empty or unreadable a loses to a readable b; a malformed
-// value is the loser. This keeps survivor ranking bit-identical to the bash oracle.
-func LSNGreater(a, b string) bool {
-	bl, bok := ParseLSN(b)
-	if !bok {
-		return true // nothing (or garbage) on the b side: a wins
-	}
-	al, aok := ParseLSN(a)
-	if !aok {
-		return false // a unreadable but b readable: b wins
-	}
-	return al.Greater(bl)
-}

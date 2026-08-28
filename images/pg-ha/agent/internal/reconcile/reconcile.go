@@ -10,10 +10,9 @@
 package reconcile
 
 import (
-	"strconv"
-	"strings"
-
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
+
+	"github.com/cagriekin/pg-ha-agent/internal/podname"
 )
 
 // Action is what the agent should do this tick.
@@ -703,17 +702,12 @@ func cascadeQualifies(o Observation, p PeerState, selfDist, lead int) bool {
 }
 
 // podOrdinal extracts the StatefulSet ordinal from a pod name (<base>-<ordinal>),
-// returning -1 if absent or unparseable.
+// returning -1 if absent or unparseable. A thin adapter over the one parser the codebase
+// has (#298 review): the -1 sentinel is local to this file, where the ordinal is arithmetic
+// (promote distance) rather than a branch, but the PARSING is shared -- two parsers meant
+// the same name could be an ordinal to the slot-reclaim code and unparseable here.
 func podOrdinal(pod string) int {
-	i := strings.LastIndex(pod, "-")
-	if i < 0 || i == len(pod)-1 {
-		return -1
-	}
-	n, err := strconv.Atoi(pod[i+1:])
-	if err != nil || n < 0 {
-		return -1
-	}
-	return n
+	return podname.OrdinalOr(pod, -1)
 }
 
 func absInt(x int) int {

@@ -37,6 +37,7 @@ import (
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
 	"github.com/cagriekin/pg-ha-agent/internal/pgbackrest"
 	"github.com/cagriekin/pg-ha-agent/internal/pgconf"
+	"github.com/cagriekin/pg-ha-agent/internal/podname"
 	"github.com/cagriekin/pg-ha-agent/internal/process"
 	"github.com/cagriekin/pg-ha-agent/internal/reconcile"
 )
@@ -314,7 +315,7 @@ func newAgent(cfg *config.Config, log *slog.Logger) (*agent, error) {
 		pgBindir:         pgBindir,
 		pgControlDataBin: pgBindir + "/pg_controldata",
 		repmgrModulePath: filepath.Join(cfg.PGLibdir(), repmgrPreloadLib+".so"),
-		base:             baseName(cfg.PodName),
+		base:             podname.Base(cfg.PodName),
 		bootAt:           time.Now(),
 		peersSeen:        map[string]bool{},
 		// One slot: a second concurrent node-local operation waits on the channel rather
@@ -2754,7 +2755,7 @@ func (a *agent) topologyTick(ctx context.Context) {
 	// the kubelet kills the container over a gauge. The doc above claims this cannot be starved
 	// BY the leadership writes; that only holds if the whole function is bounded.
 	live, liveErr := a.livePodOrdinals(tctx)
-	selfOrd, selfOK := podOrdinal(a.cfg.PodName)
+	selfOrd, selfOK := podname.Ordinal(a.cfg.PodName)
 	if liveErr != nil {
 		// Leave the gauges at their PREVIOUS values rather than publishing Expected: 0 --
 		// exactly what observeSlots does on the same failure, and the earlier revision of this
@@ -2851,7 +2852,7 @@ func (a *agent) resolveReplicaPod(r pg.ReplicaRow) string {
 	// -X stream reports application_name='pg_basebackup' (#288 review) -- and taking that at
 	// face value both inflated the streaming count and hid the real pod, because the slot
 	// fallback that would have identified it was never consulted.
-	if ord, ok := podOrdinal(r.AppName); ok && r.AppName == fmt.Sprintf("%s-%d", a.base, ord) {
+	if ord, ok := podname.Ordinal(r.AppName); ok && r.AppName == fmt.Sprintf("%s-%d", a.base, ord) {
 		return r.AppName
 	}
 	if ord, ok := slotOrdinal(r.SlotName); ok {
@@ -3104,7 +3105,7 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) ([]str
 		a.log.Warn("list live pods for slot reconcile; creating from NodeCount and skipping the drop pass this tick", "err", liveErr)
 	}
 
-	selfOrd, selfOK := podOrdinal(a.cfg.PodName)
+	selfOrd, selfOK := podname.Ordinal(a.cfg.PodName)
 	// Under cascading replication the primary must NOT pre-create a slot per live ordinal
 	// (#294). A cascaded standby streams from a PEER, so its slot belongs on that peer, and the
 	// one minted here would sit inactive forever -- retaining WAL on the primary until
@@ -3225,7 +3226,7 @@ func (a *agent) livePodOrdinals(ctx context.Context) (map[int]bool, error) {
 	}
 	live := make(map[int]bool, len(names))
 	for _, n := range names {
-		if ord, ok := podOrdinal(n); ok {
+		if ord, ok := podname.Ordinal(n); ok {
 			live[ord] = true
 		}
 	}
@@ -3341,14 +3342,6 @@ func (h *selfHealthTracker) stuck(shouldServe, running bool, now time.Time) bool
 	return now.Sub(h.unhealthyAt) >= h.grace
 }
 
-// baseName strips the trailing -<ordinal> from a StatefulSet pod name.
-func baseName(pod string) string {
-	if i := strings.LastIndex(pod, "-"); i > 0 {
-		return pod[:i]
-	}
-	return pod
-}
-
 // nodeIDBase is the repmgr node_id of ordinal 0 (node_id = nodeIDBase + ordinal), as
 // init-repmgr.sh assigned them.
 //
@@ -3388,24 +3381,11 @@ const legacySlotPrefix = "repmgr_slot_"
 // parseable ordinal (nothing to derive a stable name from -- better no slot than an
 // unstable one that strands a new slot on every restart).
 func slotNameFor(pod string) string {
-	ord, ok := podOrdinal(pod)
+	ord, ok := podname.Ordinal(pod)
 	if !ok {
 		return ""
 	}
 	return slotPrefix + strconv.Itoa(ord)
-}
-
-// podOrdinal extracts the StatefulSet ordinal from a pod name.
-func podOrdinal(pod string) (int, bool) {
-	i := strings.LastIndex(pod, "-")
-	if i < 0 {
-		return 0, false
-	}
-	n, err := strconv.Atoi(pod[i+1:])
-	if err != nil || n < 0 {
-		return 0, false
-	}
-	return n, true
 }
 
 // orphanSlot decides whether the primary may drop slot on the strength of its NAME and
@@ -3450,7 +3430,7 @@ func podOrdinal(pod string) (int, bool) {
 // alone. An empty liveOrdinals reclaims nothing but self and legacy slots: a failed or
 // empty pod list must never make every standby's slot look orphaned.
 func orphanSlot(name, selfPod string, liveOrdinals map[int]bool, migratedOrdinals map[int]bool) bool {
-	selfOrd, selfOK := podOrdinal(selfPod)
+	selfOrd, selfOK := podname.Ordinal(selfPod)
 
 	ord, ok := slotOrdinal(name)
 	if !ok {

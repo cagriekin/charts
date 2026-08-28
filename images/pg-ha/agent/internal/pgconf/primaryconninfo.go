@@ -3,8 +3,9 @@ package pgconf
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
+
+	"github.com/cagriekin/pg-ha-agent/internal/atomicfile"
 )
 
 // EnsurePrimaryConninfoDBName reads confPath (PGDATA/postgresql.auto.conf, where repmgr's
@@ -25,53 +26,10 @@ func EnsurePrimaryConninfoDBName(confPath, db string) (changed bool, err error) 
 		}
 		return false, nil
 	}
-	if err := writeFileAtomic(confPath, []byte(updated), 0o600); err != nil {
+	if err := atomicfile.Write(confPath, []byte(updated), 0o600); err != nil {
 		return false, fmt.Errorf("write %s: %w", confPath, err)
 	}
 	return true, nil
-}
-
-// writeFileAtomic replaces path's content via write-temp-fsync-rename-fsync-dir,
-// matching PostgreSQL's own discipline for this specific file: postgresql.auto.conf is
-// rewritten by PostgreSQL itself on every ALTER SYSTEM (including #308's own
-// SetSynchronizedStandbySlots), which fsyncs the temp file before the rename and fsyncs
-// the containing directory after it, so the replacement survives a crash right at that
-// moment. A plain truncating os.WriteFile could also interleave with one of those and
-// leave a half-written file, which is a config syntax error the next postmaster start
-// (or SIGHUP) refuses to parse. The temp file is created in the same directory as path
-// so the rename is same-filesystem (atomic, not a copy).
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer func() { _ = os.Remove(tmpPath) }() // no-op once the rename below succeeds
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return err
-	}
-	dirFile, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = dirFile.Close() }()
-	return dirFile.Sync()
 }
 
 // addDBNameToPrimaryConninfo is the pure transform behind EnsurePrimaryConninfoDBName.

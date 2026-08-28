@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/cagriekin/pg-ha-agent/internal/atomicfile"
 )
 
 // Native drives PostgreSQL's own tools as the HA mechanism instead of the repmgr CLI
@@ -175,7 +177,7 @@ func (n *Native) ensureInclude() error {
 	// do not accumulate them.
 	body = stripActiveDirective(body, header)
 	body = strings.TrimRight(body, "\n")
-	if err := writeFileAtomic(confPath, body+"\n\n"+header+"\n"+line+"\n", 0o600); err != nil {
+	if err := atomicfile.WriteString(confPath, body+"\n\n"+header+"\n"+line+"\n", 0o600); err != nil {
 		return fmt.Errorf("native: rewrite %s with the managed include last: %w", confPath, err)
 	}
 	return nil
@@ -274,7 +276,7 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 			b.WriteString(fmt.Sprintf("primary_slot_name = '%s'\n", escapeSingleQuoted(n.SlotName)))
 		}
 	}
-	if err := writeFileAtomic(n.managedConfPath(), b.String(), 0o600); err != nil {
+	if err := atomicfile.WriteString(n.managedConfPath(), b.String(), 0o600); err != nil {
 		return fmt.Errorf("native: write %s: %w", n.managedConfPath(), err)
 	}
 	return n.ensureInclude()
@@ -416,7 +418,7 @@ func (n *Native) Follow(ctx context.Context, upstream Conn) error {
 	// standby.signal starts a SECOND read-write primary -- the two-writer risk. Creating it is
 	// idempotent, so the reload path (already Running && InRecovery) is unaffected.
 	sig := filepath.Join(n.DataDir, "standby.signal")
-	if err := writeFileAtomic(sig, "", 0o600); err != nil {
+	if err := atomicfile.WriteString(sig, "", 0o600); err != nil {
 		return fmt.Errorf("native: create standby.signal: %w", err)
 	}
 	if err := n.ensureSlotOnUpstream(ctx, upstream); err != nil {
@@ -758,47 +760,4 @@ func hasActiveDirective(conf, directive string) bool {
 		}
 	}
 	return false
-}
-
-// writeFileAtomic writes via a temp file + rename so a crash mid-write cannot leave the
-// postmaster reading a half-written config (which would fail its next start).
-func writeFileAtomic(path, content string, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.WriteString(content); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		return err
-	}
-	// fsync BEFORE the rename (#288 review). Rename gives name atomicity, not content
-	// durability: without this, a crash shortly after the rename can leave a zero-length file.
-	// ensureInclude now routes PGDATA/postgresql.conf through here, and a truncated
-	// postgresql.conf is a postmaster that will not start at all -- the very outcome the single
-	// atomic write was introduced to avoid, moved onto the file whose loss is fatal.
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	// And fsync the DIRECTORY, so the rename itself survives a crash. Best-effort: some
-	// filesystems refuse an O_RDONLY directory sync, and failing the write here would be worse
-	// than a durability gap the next reconcile tick rewrites anyway.
-	if d, derr := os.Open(dir); derr == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
-	return nil
 }

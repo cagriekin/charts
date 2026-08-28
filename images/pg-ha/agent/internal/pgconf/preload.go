@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/cagriekin/pg-ha-agent/internal/atomicfile"
 )
 
 // preloadGUC is the parameter this file edits. PostgreSQL GUC names are
@@ -64,7 +66,7 @@ func EnsureNoPreloadLibrary(confPath, lib string) (changed bool, err error) {
 	// ATOMIC, for the same reason EnsureConfdInclude is: this is PGDATA/postgresql.conf,
 	// and a truncated or half-written copy is not a degraded config but a postmaster that
 	// refuses to start at all, with no automatic recovery.
-	if err := writeFileAtomic(confPath, []byte(updated), 0o600); err != nil {
+	if err := atomicfile.Write(confPath, []byte(updated), 0o600); err != nil {
 		return false, fmt.Errorf("write %s: %w", confPath, err)
 	}
 	return true, nil
@@ -370,7 +372,7 @@ func RemoveRecoveryConfig(confPath string) ([]string, error) {
 		return nil, nil
 	}
 	content := strings.TrimRight(strings.Join(kept, "\n"), "\n") + "\n"
-	if err := writeFileAtomic(confPath, []byte(content), 0o600); err != nil {
+	if err := atomicfile.Write(confPath, []byte(content), 0o600); err != nil {
 		return nil, fmt.Errorf("write %s: %w", confPath, err)
 	}
 	return removed, nil

@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/cagriekin/pg-ha-agent/internal/atomicfile"
 )
 
 // PgHbaOptions describes the agent-assembled pg_hba.conf.
@@ -136,7 +138,7 @@ func EnsureConfdInclude(confPath, includeDir string, enabled bool) error {
 	// directory on the next boot, leaving the pod wedged on a truncated config with no automatic
 	// recovery. native.go's ensureInclude was moved off this exact pattern, on this exact file,
 	// for this exact reason.
-	if err := writeFileAtomic(confPath, []byte(content), 0o600); err != nil {
+	if err := atomicfile.Write(confPath, []byte(content), 0o600); err != nil {
 		return fmt.Errorf("write %s: %w", confPath, err)
 	}
 	return nil

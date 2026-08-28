@@ -36,30 +36,48 @@ func TestRehashMd5UserInvocation(t *testing.T) {
 			t.Errorf("args missing %q: %v", want, f.args)
 		}
 	}
-	// The password must travel in the environment, NEVER on argv.
+	// The plaintext must not appear on argv, in the environment, or in the SQL: what travels
+	// is a SCRAM verifier, and only via the environment (#298 review).
 	if strings.Contains(argline, "s3cr3t") {
 		t.Errorf("password leaked onto argv: %v", f.args)
 	}
-	found := false
+	if strings.Contains(f.stdin, "s3cr3t") {
+		t.Errorf("password leaked into the SQL, where statement logging would capture it:\n%s", f.stdin)
+	}
+	secret := ""
 	for _, e := range f.env {
-		if e == "REHASH_TGT_PASS="+pw {
-			found = true
+		if v, ok := strings.CutPrefix(e, "REHASH_TGT_SECRET="); ok {
+			secret = v
+		}
+		if strings.Contains(e, "s3cr3t") {
+			t.Errorf("plaintext password passed in the environment: %v", e)
 		}
 	}
-	if !found {
-		t.Errorf("password not passed via REHASH_TGT_PASS env: %v", f.env)
+	if !strings.HasPrefix(secret, "SCRAM-SHA-256$4096:") {
+		t.Errorf("expected a SCRAM verifier in REHASH_TGT_SECRET, got %q (env %v)", secret, f.env)
 	}
 	// The SQL guards PG<14 and re-hashes only md5-stored passwords, via \getenv + format.
 	for _, want := range []string{
-		`\getenv tgt_pass REHASH_TGT_PASS`,
+		`\getenv tgt_secret REHASH_TGT_SECRET`,
 		"server_version_num",
 		"rolpassword LIKE 'md5%'",
-		"password_encryption = 'scram-sha-256'",
 		"ALTER USER %I WITH PASSWORD %L",
 	} {
 		if !strings.Contains(f.stdin, want) {
 			t.Errorf("SQL missing %q:\n%s", want, f.stdin)
 		}
+	}
+	// password_encryption is no longer set: a verifier is stored verbatim, so consulting it
+	// would be misleading rather than merely redundant.
+	if strings.Contains(f.stdin, "password_encryption") {
+		t.Errorf("password_encryption has no role once a verifier is sent:\n%s", f.stdin)
+	}
+	// Statement logging must be lowered BEFORE anything carrying the verifier is sent --
+	// a SET issued first would be logged under the operator's original log_statement.
+	iLog := strings.Index(f.stdin, "SET log_statement = 'none';")
+	iSecret := strings.Index(f.stdin, "myvars.tgt_secret = :'tgt_secret'")
+	if iLog < 0 || iSecret < 0 || iLog > iSecret {
+		t.Errorf("log suppression must precede the verifier-bearing SET (log at %d, secret at %d):\n%s", iLog, iSecret, f.stdin)
 	}
 }
 

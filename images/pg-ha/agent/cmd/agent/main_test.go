@@ -29,6 +29,7 @@ import (
 	"github.com/cagriekin/pg-ha-agent/internal/observe"
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
 	"github.com/cagriekin/pg-ha-agent/internal/pgbackrest"
+	"github.com/cagriekin/pg-ha-agent/internal/podname"
 	"github.com/cagriekin/pg-ha-agent/internal/process"
 	"github.com/cagriekin/pg-ha-agent/internal/reconcile"
 )
@@ -806,7 +807,7 @@ func TestShouldAdvanceMarker(t *testing.T) {
 func TestBaseName(t *testing.T) {
 	// nodeID's half of this test went with the offset's last propagating consumer (#294);
 	// nodeIDBase itself survives only inside slotOrdinal, which has its own tests.
-	if got := baseName("my-pg-0"); got != "my-pg" {
+	if got := podname.Base("my-pg-0"); got != "my-pg" {
 		t.Errorf("baseName = %q, want my-pg", got)
 	}
 }
