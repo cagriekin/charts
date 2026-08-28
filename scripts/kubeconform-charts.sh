@@ -80,6 +80,11 @@ for chart in "${charts[@]}"; do
     # "FAILED (2 of 44 profiles)", or 3 of 44 if it also rendered nothing. `failed` could
     # even exceed `profiles`. Latch it here and add ONE at the end of the profile.
     profile_failed=0
+    # Same shape for the skip tally (#298 review): the two k8s versions skip the SAME
+    # resources, so summing inside the loop double-counted every one of them in the
+    # verdict's "N unvalidated" -- inflating the number in exactly the situation the
+    # counter exists to report. Take the worst single version and add it once.
+    profile_skips=0
     for kv in "${KUBE_VERSION}" "${KUBE_VERSION_MAX}"; do
       if ! out=$(printf '%s' "${rendered}" \
           | kubeconform \
@@ -112,9 +117,10 @@ for chart in "${charts[@]}"; do
           | kubeconform -ignore-missing-schemas -kubernetes-version "${kv}" \
               -schema-location default -schema-location "${CRD_CATALOG}" -verbose 2>&1 \
           | awk '/skipped$/{print "        - " $3 " " $4}' | sort -u >&2 || true
-        skips=$((skips + skipped))
+        if [ "${skipped}" -gt "${profile_skips}" ]; then profile_skips=${skipped}; fi
       fi
     done
+    skips=$((skips + profile_skips))
     # Vacuous-pass guard (#298 review): kubeconform validates what it is given, so an empty
     # render is "0 resources found ... Valid: 0" and exit ZERO. Require at least one resource,
     # so a chart or profile that renders nothing fails here instead of reporting a clean gate.

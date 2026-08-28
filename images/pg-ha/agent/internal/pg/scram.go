@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 )
 
@@ -47,12 +48,22 @@ func ScramVerifier(password string) (string, error) {
 // vector can be asserted. Hand-rolling SCRAM is only defensible if it is checked against the
 // spec's own numbers rather than against itself.
 func scramVerifierWithSalt(password string, salt []byte) (string, error) {
-	// SaltedPassword := Hi(Normalize(password), salt, i). Normalize is SASLprep; PostgreSQL
-	// skips it for a password that is not valid UTF-8 and applies it otherwise. Passing the
-	// bytes through unchanged matches the server for the ASCII passwords the chart generates
-	// and for every password that needs no normalisation, which is the case that matters here:
-	// a mismatch cannot produce a WRONG secret silently, it produces one the user's own
-	// password fails against, and the rehash is idempotent and re-runnable.
+	// SaltedPassword := Hi(Normalize(password), salt, i). Normalize is SASLprep (RFC 4013),
+	// which this package does NOT implement -- so it refuses to mint a verifier for any
+	// password SASLprep could change (ErrNeedsSASLprep, see needsSASLprep).
+	//
+	// Skipping it silently was a lockout, not a cosmetic gap (#298 review). The server's own
+	// scram_build_secret SASLpreps before hashing and libpq SASLpreps before computing
+	// ClientProof, so for a password carrying any non-ASCII byte -- NFKC-normalisable
+	// characters, a non-ASCII space, a soft hyphen -- the verifier written here is one the
+	// user's own password can never match. And it is not recoverable by retrying: rehashSQL
+	// is gated on `rolpassword LIKE 'md5%'`, which stops matching the moment the bad verifier
+	// lands, so the superuser and the replication user are locked out for good and streaming
+	// replication stops cluster-wide. Refusing instead leaves the md5 hash in place, which the
+	// agent's own md5-above-scram pg_hba line still authenticates.
+	if needsSASLprep(password) {
+		return "", ErrNeedsSASLprep
+	}
 	salted, err := pbkdf2.Key(sha256.New, password, salt, scramIterations, sha256.Size)
 	if err != nil {
 		return "", fmt.Errorf("scram: pbkdf2: %w", err)
@@ -63,6 +74,28 @@ func scramVerifierWithSalt(password string, salt []byte) (string, error) {
 	b64 := base64.StdEncoding.EncodeToString
 	return fmt.Sprintf("SCRAM-SHA-256$%d:%s$%s:%s",
 		scramIterations, b64(salt), b64(storedKey[:]), b64(serverKey)), nil
+}
+
+// ErrNeedsSASLprep is returned when a password cannot be hashed here because SASLprep
+// might change it and this package does not implement SASLprep. The caller skips the
+// re-hash for that user rather than storing a verifier nobody can authenticate against.
+var ErrNeedsSASLprep = errors.New("scram: password needs SASLprep normalisation, which this agent does not implement")
+
+// needsSASLprep reports whether SASLprep could change password.
+//
+// A password made only of printable ASCII (0x21-0x7E plus space) is a SASLprep fixed
+// point: NFKC is the identity on it, none of its characters are in the mapped-to-space
+// or mapped-to-nothing tables, and none are prohibited. Anything else -- a non-ASCII byte,
+// or an ASCII control character (which PostgreSQL's pg_saslprep rejects, then falls back to
+// the raw bytes for, a fallback this code would have to mirror exactly) -- is treated as
+// "cannot prove it is a fixed point" and refused.
+func needsSASLprep(password string) bool {
+	for i := 0; i < len(password); i++ {
+		if c := password[i]; c < 0x20 || c > 0x7e {
+			return true
+		}
+	}
+	return false
 }
 
 func scramHMAC(key []byte, msg string) []byte {

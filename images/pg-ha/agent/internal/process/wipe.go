@@ -164,8 +164,16 @@ func ClearDebrisDataDir(dir string) ([]string, error) {
 	if !fi.IsDir() {
 		return nil, fmt.Errorf("refusing to clear %q: not a directory", clean)
 	}
+	// FAIL CLOSED on any stat error that is not "absent". Only os.IsNotExist proves
+	// PG_VERSION is genuinely missing; EIO on a degraded volume, ESTALE on an NFS-backed
+	// PV or ELOOP all mean "cannot tell", and reading those as absence let this function
+	// os.RemoveAll an initialized PGDATA -- the exact directory the guard exists to
+	// protect, on the BootstrapClone path that runs it in front of pg_basebackup. The
+	// sibling WipeDataDir already refuses on any error; match it.
 	if _, serr := os.Stat(filepath.Join(clean, "PG_VERSION")); serr == nil {
 		return nil, fmt.Errorf("refusing to clear %q: PG_VERSION present, this is an initialized data directory (WipeDataDir is the destructive path for those)", clean)
+	} else if !os.IsNotExist(serr) {
+		return nil, fmt.Errorf("refusing to clear %q: cannot determine whether PG_VERSION is present: %w", clean, serr)
 	}
 	if err := checkNoLivePostmaster(clean); err != nil {
 		return nil, err

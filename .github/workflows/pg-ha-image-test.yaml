@@ -1,4 +1,4 @@
-name: Test repmgr image scripts
+name: Test pg-ha image scripts
 
 permissions:
   contents: read

@@ -401,7 +401,15 @@ func (a *agent) run() {
 			dctx, cancel := context.WithTimeout(context.Background(), a.cfg.RenewDeadline)
 			defer cancel()
 			if err := a.sup.Demote(dctx, true); err != nil {
-				a.log.Error("fence demote failed", "err", err)
+				// KEEP the latch set (#298 review). Clearing it on a FAILED demote is the one
+				// direction tick()'s own rule forbids -- "cleared only on positive evidence",
+				// fail-safe is to demote on uncertainty -- and a failed Stop is precisely the
+				// case where a read-write postmaster may still be up. With the latch cleared,
+				// the next lease loss takes the "not read-write; no fence needed" branch and
+				// skips the fence on the one node that most needs it. The tick loop re-derives
+				// it from the observed role either way, so holding it costs nothing.
+				a.log.Error("fence demote failed; keeping this node marked read-write so a later lease loss still fences", "err", err)
+				return
 			}
 			a.servingRW.Store(false)
 		},
@@ -1276,7 +1284,9 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// Marker around the clone so an interrupted one is discarded on the next boot rather
 		// than stranding the pod with a torn PGDATA (#288 review).
 		a.beginClone()
-		if err := a.mech.Clone(ctx, a.peerMechConn(dec.Target)); err != nil {
+		// beatDuring: a base backup runs for as long as the database takes to copy, and the
+		// reconcile loop cannot beat while it holds opMu (#298 review).
+		if err := a.beatDuring(func() error { return a.mech.Clone(ctx, a.peerMechConn(dec.Target)) }); err != nil {
 			// Discard here, not only at the next boot (#288 review). If pg_basebackup's child is
 			// killed while the agent survives, PGDATA is left with PG_VERSION present, so Decide
 			// takes the has-data branch and fails every tick -- and discardTornClone only runs in
@@ -1548,7 +1558,15 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 	a.beginInitdb()
 	ictx, icancel := context.WithTimeout(ctx, initdbBudget)
 	defer icancel()
-	out, err := a.prober.Exec.Run(ictx, nil, entrypointPath, "initdb")
+	// beatDuring: initdbBudget is five minutes, twenty times the /healthz staleness
+	// threshold, and the marker this branch writes only helps AFTER a liveness kill (#298
+	// review).
+	var out string
+	err := a.beatDuring(func() error {
+		var rerr error
+		out, rerr = a.prober.Exec.Run(ictx, nil, entrypointPath, "initdb")
+		return rerr
+	})
 	// Log it on SUCCESS too (#288 review, round 4). Because the AGENT runs the bootstrap here
 	// rather than the container entrypoint, initdb's output, the transient postmaster's startup
 	// lines and "PostgreSQL initialization complete" are captured into this pipe instead of the
@@ -2046,6 +2064,17 @@ func (a *agent) rehashManagedUsersOnce(ctx context.Context) {
 		}
 		// Connect as the superuser over the local socket (pg_hba `local all all trust`).
 		if err := pg.RehashMd5User(rctx, pg.OSExec{}, a.cfg.PostgresUser, a.cfg.PostgresDB, u.name, u.pass); err != nil {
+			// A password this agent cannot SASLprep is a PERMANENT skip, not a retry: no
+			// later tick can produce a verifier the client would match, and the md5 line the
+			// agent writes above each scram rule keeps the user authenticating exactly as it
+			// does today. Retrying would only log the same warning every 5s forever, and
+			// blocking the latch would keep the OTHER user's converged re-hash from ever
+			// being recorded (#298 review).
+			if errors.Is(err, pg.ErrNeedsSASLprep) {
+				a.log.Warn("md5->scram re-hash skipped: this password needs SASLprep normalisation, which the agent does not implement; the md5 hash is kept and the pg_hba md5 fallback keeps it working",
+					"user", u.name)
+				continue
+			}
 			a.log.Warn("md5->scram re-hash failed (retries next primary tick)", "user", u.name, "err", err)
 			ok = false
 		}
@@ -2411,6 +2440,62 @@ func (a *agent) fenceBudget() time.Duration {
 	return b
 }
 
+// beatDuring keeps the reconcile-loop heartbeat alive for the duration of one long
+// mechanism operation (#298 review).
+//
+// The heartbeat is otherwise struck exactly once per tick, at the top of tick(), while every
+// mechanism operation runs inside act() with opMu held -- so for as long as one of them runs,
+// nothing beats. That is fine for the bounded ones (every apiserver call is under
+// fenceBudget, every demote under RenewDeadline), and fatal for the unbounded ones:
+// pg_basebackup legitimately runs for as long as the database takes to copy. /healthz goes
+// stale at reconcileInterval*3 (15s on chart defaults) and the liveness probe gives up after
+// failureThreshold x periodSeconds (10 x 10s), so the kubelet SIGKILLs the container -- and
+// the postmaster it supervises -- roughly 115 seconds into any clone.
+//
+// The concrete failure: RejoinForward escalating to ReclonePreserving on a pod whose
+// startupProbe has long since passed (so nothing holds liveness off) is killed mid-backup on
+// every attempt, leaving another `.diverged.<ts>` copy that nothing reaps until the PVC
+// fills. BootstrapClone is only spared while the startupProbe is still gating -- 180 x 10s --
+// so a database that takes over half an hour to copy can never finish a first clone either.
+//
+// Deliberately NOT a free-running heartbeat goroutine: /healthz has to keep meaning "the
+// reconcile loop is progressing", so the beat is armed only around a call the agent knows is
+// legitimately long. A wedge anywhere else still goes stale and still gets restarted. The
+// residual cost is that a genuinely hung pg_basebackup now looks alive; that is the right
+// trade against killing every real one, and the clone marker plus discardTornClone already
+// exist to recover the interrupted directory.
+func (a *agent) beatDuring(fn func() error) error {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Floored: config.Load requires a positive interval, but a zero value reaches here
+		// from a hand-built Config (tests), and NewTicker PANICS on one -- which for PID 1
+		// is a crash-loop over the postmaster it supervises.
+		every := a.cfg.ReconcileInterval
+		if every <= 0 {
+			every = time.Second
+		}
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				a.metr.Beat()
+			}
+		}
+	}()
+	err := fn()
+	close(stop)
+	<-done
+	// One final beat, so the window between the last tick of the helper and the next real
+	// tick cannot itself go stale on a long-running operation that finished just after a beat.
+	a.metr.Beat()
+	return err
+}
+
 // assertSameCluster enforces invariant 9: never use a peer of a DIFFERENT
 // PostgreSQL cluster as a follow/rewind/reclone source (a stale or misrouted pod on
 // the shared headless Service, a leftover, or a DR-restored cluster with a fresh
@@ -2598,7 +2683,8 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 	if derr != nil {
 		return derr
 	}
-	if err := a.mech.RejoinForceRewind(ctx, a.peerMechConn(target)); err != nil {
+	// beatDuring: pg_rewind copies as much as it has to, unbounded (#298 review).
+	if err := a.beatDuring(func() error { return a.mech.RejoinForceRewind(ctx, a.peerMechConn(target)) }); err != nil {
 		// Escalate to a full re-clone ONLY on genuine divergence (#298 review).
 		// RejoinForceRewind already classifies its failures -- ErrRewindDiverged for
 		// "pg_rewind cannot proceed", a plain error for the transient ones (source
@@ -2637,7 +2723,7 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 		// cleanup is an operator task -- it is the only surviving copy of a diverged history
 		// someone may need.
 		a.beginClone()
-		if err := a.mech.ReclonePreserving(ctx, a.peerMechConn(target)); err != nil {
+		if err := a.beatDuring(func() error { return a.mech.ReclonePreserving(ctx, a.peerMechConn(target)) }); err != nil {
 			a.discardTornClone(ctx)
 			return err
 		}

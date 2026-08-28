@@ -515,11 +515,11 @@ These three values are validated at render time, so a mistake fails `helm instal
 | `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
 | `ha.database` | Database the agent connects to for those probes. Named `repmgr` for the same continuity reason as `ha.username` | `repmgr` |
 | `ha.terminationGracePeriodSeconds` | Time allowed for graceful shutdown and failover | `120` |
-| `ha.resources.requests.cpu` | CPU request | `50m` |
-| `ha.resources.requests.memory` | Memory request | `128Mi` |
-| `ha.resources.limits.cpu` | CPU limit | `500m` |
-| `ha.resources.limits.memory` | Memory limit | `512Mi` |
-| `ha.initContainerResources` | Resources for the `repmgr-init` standby-clone init container (heavier than the shared init default; raise for large databases) | `requests: 100m/128Mi, limits: 1/1Gi` |
+| `ha.resources.requests.cpu` | **Not consumed since #286.** The agent runs inside the `postgresql` container, so its CPU/memory come from `postgresql.resources`; these four keys are kept only so an existing values file still renders | `50m` |
+| `ha.resources.requests.memory` | **Not consumed since #286** — see above | `128Mi` |
+| `ha.resources.limits.cpu` | **Not consumed since #286** — see above | `500m` |
+| `ha.resources.limits.memory` | **Not consumed since #286** — see above. Size the database container with `postgresql.resources.limits.memory` instead | `512Mi` |
+| `ha.initContainerResources` | Resources for the `repmgr-init` init container. It **no longer clones** in 2.0.0 — the agent does that from the `postgresql` container (#288) — so it only runs `entrypoint.sh init`. A large first clone is bounded by `postgresql.resources` and `postgresql.startupProbe.failureThreshold`, not by this | `requests: 100m/128Mi, limits: 1/1Gi` |
 
 There is **no preStop hook** in HA mode. The agent runs as PID 1 and owns SIGTERM: it releases
 the Lease first, then stops its PostgreSQL child. A preStop `pg_ctl stop` would race that

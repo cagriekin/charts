@@ -101,6 +101,51 @@
 
 ### Fixed
 
+- **A long clone or rewind no longer gets the pod killed mid-copy (#298 review).** The reconcile
+  heartbeat was struck once per tick, at the top of `tick()`, while `pg_basebackup`, `pg_rewind`
+  and `initdb` all run inside `act()` holding the loop's mutex -- so nothing beat for as long as
+  one of them ran. `/healthz` goes stale at three reconcile intervals (15s on chart defaults) and
+  the agent's liveness probe gives up after 10 failures at 10s spacing, so the kubelet SIGKILLed
+  the container -- and the postmaster it supervises -- about 115 seconds into any clone. A
+  `RejoinForward` that escalated to a preserving re-clone on a pod past its startupProbe was
+  killed on every attempt, each one leaving another `.diverged.<ts>` copy that nothing reaps
+  until the volume fills; a first clone of a database that takes longer than the startupProbe
+  budget could never finish either. The heartbeat is now kept alive around exactly those four
+  long operations -- deliberately not a free-running one, so a wedge anywhere else still goes
+  stale and still gets restarted.
+
+- **A rewind that cannot reach its target no longer leaves the node with no recovery config
+  (#298 review).** `RejoinForceRewind` ran a fallible remote slot-ensure *before* `Follow`, on a
+  data directory `pg_rewind` had just left in primary shape. A momentary blip against the
+  freshly-promoted target -- the likeliest moment for one -- returned with the rewind done but
+  neither `standby.signal` nor `primary_conninfo` written, and the next tick started a
+  postmaster with no recovery configuration at all. `Follow` already ensures the slot, after
+  creating `standby.signal`, which is the whole point of that ordering.
+
+- **A password needing SASLprep is left as md5 rather than rehashed into a lockout (#298
+  review).** The SCRAM verifier is built without SASLprep normalisation, which the server and
+  libpq both apply -- so for a password carrying any non-ASCII byte the verifier written was one
+  the user's own password could never match, and because the re-hash is gated on
+  `rolpassword LIKE 'md5%'` it stopped matching the moment the bad verifier landed: the
+  superuser and replication user locked out for good, streaming replication stopped
+  cluster-wide. Such a password is now skipped with a warning, keeping the md5 hash that the
+  agent's own md5-above-scram `pg_hba` line still authenticates. Chart-generated passwords are
+  ASCII and unaffected.
+
+- **`pg_hba.conf` keeps mode 0600 when `postgresql.pgHba` is set (#298 review).** The insert
+  finished with `mv`, which replaces the inode, so the file listing every auth rule inherited
+  0644 from the redirect instead of initdb's 0600.
+
+- **`postgresql.extraEnv` can no longer shadow `PG_MAJOR` or the control-API variables (#298
+  review).** `pg.validateExtraPassthrough`'s reserved list was missing both, so
+  `extraEnv: [{name: PG_MAJOR, value: "17"}]` rendered clean and pointed the entrypoint's
+  `require_pg_bindir` and the agent's boot check at a major the image does not bundle.
+
+- **`ClearDebrisDataDir` fails closed on an unreadable `PG_VERSION` (#298 review).** Only
+  "absent" proves absence; EIO on a degraded volume, ESTALE on an NFS-backed PV or ELOOP all
+  read as "not present" and let it delete an initialized data directory -- the one it exists to
+  protect, on the path that runs it in front of `pg_basebackup`.
+
 - **Every demote is now bounded, so a wedged postmaster cannot strand the Lease (#298 review).**
   `ChildPostmaster.Stop` escalates to `SIGKILL` only when its context expires, and four demote
   call sites -- the `DemoteFence` soft fence, `ReleaseLease`, `Switchover`, and `rejoinOnto`'s

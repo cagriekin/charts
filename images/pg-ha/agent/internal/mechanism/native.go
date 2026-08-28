@@ -618,19 +618,20 @@ func (n *Native) RejoinForceRewind(ctx context.Context, target Conn) error {
 		out, err = n.runConn(ctx, target, n.bin("pg_rewind"), base...)
 	}
 	if err == nil {
-		// Same reasoning as Clone (#289): make sure this node's slot exists on the target
-		// BEFORE it starts streaming. The rewind path had been relying on the new primary's
-		// own reconcile having already created it -- true almost always (reconcileSlots runs
-		// in the same tick as Promote, ahead of the routing switch, while a rejoin is paced
-		// by the reconcile interval), but "almost always" is the wrong guarantee for the one
-		// thing standing between a standby and a WAL gap. Idempotent, so the overwhelmingly
-		// common case where the slot is already there costs one cheap query.
-		if err := n.ensureSlotOnUpstream(ctx, target); err != nil {
-			return err
-		}
 		// pg_rewind leaves the node needing standby.signal + primary_conninfo to come back
 		// as a standby; write them now so the supervisor's Start attaches it to the target
 		// rather than booting a second read-write primary (the two-writer risk).
+		//
+		// Follow -- not a bare ensureSlotOnUpstream in front of it (#298 review). Follow
+		// already ensures this node's slot on the upstream (#289, same reasoning as Clone:
+		// the slot must exist before the stream opens or the primary is free to recycle WAL
+		// this node still needs), and it does so AFTER creating standby.signal, which is the
+		// whole point of that ordering. Calling the slot ensure here instead put the one
+		// fallible remote query AHEAD of standby.signal on a directory pg_rewind has just
+		// left in primary shape: a momentary blip against the freshly-promoted target -- the
+		// single likeliest moment for one -- returned before any recovery config was written,
+		// and the next tick then took the StartLocal "standby-state data, stopped" branch and
+		// started a postmaster with neither standby.signal nor primary_conninfo.
 		if ferr := n.Follow(ctx, target); ferr != nil {
 			return fmt.Errorf("native: rewind ok but could not configure recovery: %w", ferr)
 		}

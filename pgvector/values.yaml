@@ -972,9 +972,10 @@ pgbackrest:
 
   # CronJob runner: schedules backups via Kubernetes-native CronJobs. Each job
   # finds the current primary via the headless primary service endpoints
-  # (kept fresh by the service-updater sidecar) and execs into the pgbackrest
-  # sidecar to perform the backup. Failover is handled automatically because
-  # the primary is resolved at job-fire time.
+  # (repointed by the agent on every promotion since 2.0.0 -- the
+  # service-updater sidecar that used to do it went with repmgrd, #294) and
+  # execs into the pgbackrest sidecar to perform the backup. Failover is
+  # handled automatically because the primary is resolved at job-fire time.
   cronjob:
     image:
       repository: alpine/k8s

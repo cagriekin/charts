@@ -191,16 +191,20 @@ tests:
           emptyDir: {}
     asserts:
       - failedTemplate:
-          errorMessage: 'postgresql.extraVolumes[0]: "data" is a chart-managed volume name and may not be reused (reserved: data, postgresql-config, postgresql-tls, ext-lib, ext-share, ext-extra-lib, repmgr-config, etcd-tls, pg-run, pgbackrest-config). With persistence enabled a "data" volume is silently discarded in favour of the volumeClaimTemplate; with persistence disabled the duplicate name is rejected by the API server. Pick a distinct name.'
+          errorMessage: 'postgresql.extraVolumes[0]: "data" is a chart-managed volume name and may not be reused (reserved: data, postgresql-config, postgresql-tls, ext-lib, ext-share, ext-extra-lib, etcd-tls, pg-run, pgbackrest-config). With persistence enabled a "data" volume is silently discarded in favour of the volumeClaimTemplate; with persistence disabled the duplicate name is rejected by the API server. Pick a distinct name.'
 
-  - it: extraVolumes colliding with an internal volume (repmgr-config) fails render
+  # postgresql-config, not repmgr-config (#298 review): the repmgr-config volume went with
+  # repmgrd, so reserving its name refused an operator a name no render can collide with.
+  # The guard still has to cover a NON-data internal volume, hence a name the chart really
+  # does mount.
+  - it: extraVolumes colliding with an internal volume (postgresql-config) fails render
     templates:
       - templates/statefulset.yaml
     values:
       - ../values-minimal.yaml
     set:
       postgresql.extraVolumes:
-        - name: repmgr-config
+        - name: postgresql-config
           emptyDir: {}
     asserts:
       - failedTemplate: {}

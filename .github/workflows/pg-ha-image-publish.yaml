@@ -43,10 +43,10 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           "$(go env GOPATH)/bin/govulncheck" ./...
 
-  # One leg per PostgreSQL major (#269). The DEFAULT major also claims the unsuffixed
-  # tag, so every existing chart pin keeps resolving to it; the -pgNN tags let a user
-  # select a major explicitly. Both tags in a leg are one push, hence one digest and
-  # one signature.
+  # One leg per PostgreSQL major (#269). Since #290 the major is IN the tag and there is
+  # no unsuffixed alias at all -- a leg publishes exactly `<version>-pgNN`, so one push,
+  # one digest, one signature. (pg/templates/_helpers.tpl hard-fails on an unsuffixed
+  # 1.x-shaped pin, so there is nothing left for such an alias to serve.)
   build-and-publish:
     needs: test
     runs-on: ubuntu-latest
@@ -127,9 +127,9 @@ jobs:
       # not run pg-ha-image-test.yaml, so without this a per-major regression (a missing
       # postgresql-<major>-pgaudit, a bindir the scripts cannot find) could be published and
       # signed. Deliberately inside the publish leg, not a separate job: as its own job it
-      # gated BOTH legs, so a PG17-only failure would withhold the unsuffixed default-major
-      # tag that every existing chart pin resolves to. The multi-arch build below reuses
-      # this leg's layer cache, so the extra wall-clock is small.
+      # gated BOTH legs, so a PG17-only failure would withhold the PG18 tag as well. The
+      # multi-arch build below reuses this leg's layer cache, so the extra wall-clock is
+      # small.
       - name: Build and smoke-test PG${{ matrix.pg_major }} (amd64) before publishing
         env:
           TAG: ${{ steps.meta.outputs.tag }}
@@ -166,8 +166,8 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
-      # One digest per leg (both tags of the default major point at the same manifest),
-      # so one signature covers every tag this leg published.
+      # One digest per leg -- a leg publishes a single `<version>-pgNN` tag -- so one
+      # signature covers everything it pushed.
       - name: Sign the image (keyless, OIDC)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}

@@ -91,6 +91,8 @@ func RehashMd5User(ctx context.Context, ex StdinExec, superUser, db, targetUser,
 	}
 	secret, err := ScramVerifier(targetPass)
 	if err != nil {
+		// ErrNeedsSASLprep is passed through UNWRAPPED-but-matchable so the caller can tell a
+		// permanent skip from a transient failure; see rehashManagedUsersOnce.
 		return fmt.Errorf("rehash %s: %w", targetUser, err)
 	}
 	return ex.RunStdin(ctx,

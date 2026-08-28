@@ -336,7 +336,22 @@ bootstrap_or_discard_torn() {
     if [ -f "$initdb_marker" ] && [ ! -f "$PGDATA/.pg-ha-bootstrap-complete" ] &&
         { [ -s "$PGDATA/PG_VERSION" ] || [ -n "$(ls -A "$PGDATA" 2>/dev/null)" ]; }; then
         echo "WARNING: discarding a data directory left by an interrupted bootstrap (completion sentinel absent) so it can be created again (#298)" >&2
+        # The `|| true` is for the globs, not for rm's errors: on a directory that is empty
+        # (or holds only entries one glob misses) the unmatched pattern reaches rm as a
+        # literal and it exits non-zero under `set -e` for nothing. It therefore also
+        # swallows a REAL failure -- EPERM on a root-owned file a 1.x init container left
+        # behind, EROFS on a remounted volume -- so the result is VERIFIED below rather than
+        # assumed (#298 review). Without that check the discard silently removed nothing,
+        # bootstrap_initdb then ran `initdb -D` against a still-populated directory, and the
+        # container crash-looped forever on `directory "..." exists but is not empty` with the
+        # actual cause (the rm that failed) printed nowhere. `ls -A` is the check rather than
+        # the globs' own success, because `.[!.]*` also misses a `..`-prefixed entry.
         rm -rf "${PGDATA:?}"/* "${PGDATA:?}"/.[!.]* 2>/dev/null || true
+        if [ -n "$(ls -A "$PGDATA" 2>/dev/null)" ]; then
+            echo "FATAL: could not empty ${PGDATA} to re-run the interrupted bootstrap; these entries survived the discard (check ownership/permissions on the data volume -- a 1.x release ran its init container as root):" >&2
+            ls -A "$PGDATA" >&2
+            exit 1
+        fi
     fi
     if [ ! -s "$PGDATA/PG_VERSION" ]; then
         mkdir -p "$pgdata_parent"

@@ -311,16 +311,6 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end -}}
 {{- end }}
 
-{{- /* True when the operator declared shared_preload_libraries in
-       postgresql.configuration (matched case-insensitively -- PostgreSQL GUC names are
-       case-insensitive, so a value under e.g. `Shared_Preload_Libraries` must still be
-       found or it would be silently dropped from the merge). */ -}}
-{{- define "pg.userSetSharedPreloadLibraries" -}}
-{{- range $k, $v := (.Values.postgresql.configuration | default dict) -}}
-  {{- if eq (lower ($k | toString)) "shared_preload_libraries" -}}true{{- end -}}
-{{- end -}}
-{{- end -}}
-
 {{- /* True when the chart -- not custom.conf -- owns shared_preload_libraries, i.e. the
        merged value is emitted from an authoritative conf.d file that sorts after
        custom.conf. That is the case whenever a library must be preserved across an
@@ -337,7 +327,10 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        -- which reduced to `not X and X`. Both deleted. Dead template branches in a
        render-time-validated chart are worse than dead code: they read as coverage for a
        mode that no longer exists, and the tests asserting the file is absent
-       (test-template.sh, audit_test.yaml) were passing vacuously. */ -}}
+       (test-template.sh, audit_test.yaml) were passing vacuously.
+       pg.userSetSharedPreloadLibraries went with it (#298 review): that clause was its only
+       caller, so the helper was left defined and called by nothing -- the same "reads as
+       coverage for a mode that no longer exists" this paragraph argues against. */ -}}
 {{- define "pg.chartOwnsSharedPreloadLibraries" -}}
 {{- if .Values.postgresql.audit.enabled -}}true{{- end -}}
 {{- end -}}
@@ -752,7 +745,11 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
     {{- fail "postgresql.extensions.env/envFrom/extraVolumes/extraVolumeMounts are set but postgresql.extensions.packages is empty. They configure the apt-get step (a proxy, a mirror sources.list), and with no packages there is no apt-get step -- the init containers take the plain-copy path and your proxy/mount would be silently ignored. Add at least one package, or remove these values." -}}
   {{- end -}}
 {{- end -}}
-{{- $reserved := list "data" "pg-run" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib" "repmgr-config" "etcd-tls" "agent-control-tls" "pgbackrest" "pgbackrest-config" "pgbackrest-bootstrap-script" "service-updater-script" -}}
+{{- /* repmgr-config and service-updater-script are NOT here (#298): both volumes went with
+       repmgrd and the service-updater sidecar, so reserving them refused an operator a name no
+       render can collide with -- a fail message citing "a chart-managed volume" that does not
+       exist. Reserving a name the chart does not use is not free caution; it is a wrong error. */ -}}
+{{- $reserved := list "data" "pg-run" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib" "etcd-tls" "agent-control-tls" "pgbackrest" "pgbackrest-config" "pgbackrest-bootstrap-script" -}}
 {{- /* postgresql.extraVolumes lands in the SAME pod volumes list (#320 review), so a name
        shared with it is a duplicate the API server rejects ("volumes[n].name: Duplicate
        value") -- the same apply-time-only failure class as the chart-volume collision
@@ -949,11 +946,17 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
              would silently win over the chart/Secret value -- pointing the postmaster at
              the wrong data directory or breaking auth cluster-wide. */ -}}
 {{- define "pg.validateExtraPassthrough" -}}
-{{- $chartVolumes := list "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib" "repmgr-config" "etcd-tls" "pg-run" "pgbackrest-config" -}}
+{{- $chartVolumes := list "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib" "etcd-tls" "pg-run" "pgbackrest-config" -}}
 {{- /* Env vars the chart sets on the postgresql container (see statefulset.yaml). Reserved
        UNCONDITIONALLY -- including the ones only a currently-disabled feature emits -- so a
        passthrough that works today cannot start silently shadowing a chart value after a
-       later `helm upgrade` enables that feature. */ -}}
+       later `helm upgrade` enables that feature.
+       PG_MAJOR and the CONTROL_* block were missing until #298's review. PG_MAJOR is the
+       worst of them: extraEnv is appended AFTER the chart's block, last-wins, so
+       `postgresql.extraEnv: [{name: PG_MAJOR, value: "17"}]` rendered clean and pointed both
+       the entrypoint's require_pg_bindir and the agent's boot-time bindir check at a
+       PostgreSQL the image does not bundle -- exactly the silent shadowing (g5) exists to
+       catch. */ -}}
 {{- $chartEnv := list
       "PGDATA" "POSTGRES_USER" "POSTGRES_PASSWORD" "POSTGRES_DB"
       "REPMGR_USER" "REPMGR_PASSWORD" "REPMGR_DB" "REPMGR_NODE_COUNT" "HEADLESS_SERVICE"
@@ -962,6 +965,11 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
       "CASCADE_REPLICATION" "SYNC_REPLICATION_SLOTS" "MECHANISM" "POSTGRESQL_PGHBA"
       "TLS_REQUIRE_SSL" "TLS_CLIENT_CERT_AUTH"
       "MONITORING_USER" "MIGRATE_LEGACY_MD5_USERS"
+      "PG_MAJOR"
+      "CONTROL_ENABLED" "CONTROL_ADDR" "CONTROL_TLS_CERT" "CONTROL_TLS_KEY" "CONTROL_TLS_CA"
+      "CONTROL_ALLOWED_CNS" "CONTROL_RESTORE_ENABLED" "CONTROL_RESTORE_ALLOWED_CNS"
+      "CONTROL_RESTORE_CRONJOB" "CONTROL_RESTORE_JOB_NAME" "CONTROL_RESTORE_POD_ORDINAL"
+      "CONTROL_RESTORE_READ_POD_LOGS"
       "DCS_BACKEND" "ETCD_ENDPOINTS" "ETCD_PREFIX" "ETCD_TLS_CERT" "ETCD_TLS_KEY" "ETCD_TLS_CA"
       "PGBACKREST_ENABLED" "PGBACKREST_STANZA" "PGBACKREST_REPO1_CIPHER_PASS"
       "PGBACKREST_REPO1_S3_KEY" "PGBACKREST_REPO1_S3_KEY_SECRET" "LD_LIBRARY_PATH" -}}
@@ -1036,8 +1044,8 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        API server or, for `data`, silently discarded in favour of the volumeClaimTemplate. */ -}}
 {{- $chartVolumes := list
       "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib"
-      "repmgr-config" "etcd-tls" "agent-control-tls" "pg-run" "pgbackrest-config"
-      "pgbackrest-bootstrap-script" "service-updater-script"
+      "etcd-tls" "agent-control-tls" "pg-run" "pgbackrest-config"
+      "pgbackrest-bootstrap-script"
       "tmp" "work" "restore-script" "validate-script" -}}
 {{- /* The two other operator-controlled lists that reach the SAME pod volumes list. A name
        shared with either is a duplicate the API server rejects at apply time
@@ -1440,7 +1448,7 @@ to acknowledge, not the chart's to assume.
 {{- if $haDigest -}}{{- $haRef = printf "%s@%s" $haRef $haDigest -}}{{- end -}}
 {{- if $bootDigest -}}{{- $bootRef = printf "%s@%s" $bootRef $bootDigest -}}{{- end -}}
 {{- if ne $haRef $bootRef -}}
-{{- fail (printf "etcd.rbac.bootstrapImage (%s) must match ha.image (%s): the bundled etcd's RBAC-bootstrap Job runs `pg-ha-agent rbac-bootstrap` from that image, so a mismatch has one agent build writing the etcd RBAC that a different build then authenticates against. Set etcd.rbac.bootstrapImage.repository and .tag to the same values as ha.image.repository and .tag -- both move together on every image bump. If you genuinely need different images (an air-gapped mirror holding only one), use an external etcd instead: leave etcd.enabled=false and point ha.agent.dcs.etcd.endpoints at your own cluster." $bootRef $haRef) -}}
+{{- fail (printf "etcd.rbac.bootstrapImage (%s) must match ha.image (%s): the bundled etcd's RBAC-bootstrap Job runs `pg-ha-agent rbac-bootstrap` from that image, so a mismatch has one agent build writing the etcd RBAC that a different build then authenticates against. Set etcd.rbac.bootstrapImage.repository, .tag AND .digest to the same values as ha.image.repository, .tag and .digest -- all three move together on every image bump, and the digest is part of this comparison (a digest pinned on one side and left empty on the other is a mismatch even when repository and tag are identical). If you genuinely need different images (an air-gapped mirror holding only one), use an external etcd instead: leave etcd.enabled=false and point ha.agent.dcs.etcd.endpoints at your own cluster." $bootRef $haRef) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

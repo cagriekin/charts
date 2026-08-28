@@ -235,11 +235,11 @@ When `ha.enabled` is true, `additionalCommands` automatically discover the curre
 | `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
 | `ha.database` | Database the agent connects to for those probes. Named `repmgr` for the same continuity reason as `ha.username` | `repmgr` |
 | `ha.terminationGracePeriodSeconds` | Time allowed for graceful shutdown and failover | `120` |
-| `ha.resources.requests.cpu` | CPU request | `50m` |
-| `ha.resources.requests.memory` | Memory request | `128Mi` |
-| `ha.resources.limits.cpu` | CPU limit | `500m` |
-| `ha.resources.limits.memory` | Memory limit | `512Mi` |
-| `ha.initContainerResources` | Resources for the `repmgr-init` standby-clone init container (the clone init container keeps its 1.x name; raise for large databases) | `requests: 100m/128Mi, limits: 1/1Gi` |
+| `ha.resources.requests.cpu` | **Not consumed since #286.** The agent runs inside the `postgresql` container, so its CPU/memory come from `postgresql.resources`; these four keys are kept only so an existing values file still renders | `50m` |
+| `ha.resources.requests.memory` | **Not consumed since #286** — see above | `128Mi` |
+| `ha.resources.limits.cpu` | **Not consumed since #286** — see above | `500m` |
+| `ha.resources.limits.memory` | **Not consumed since #286** — see above. Size the database container with `postgresql.resources.limits.memory` instead | `512Mi` |
+| `ha.initContainerResources` | Resources for the `repmgr-init` init container (it keeps its 1.x name). It **no longer clones** in 2.0.0 — the agent does that from the `postgresql` container (#288) — so it only runs `entrypoint.sh init`. A large first clone is bounded by `postgresql.resources` and `postgresql.startupProbe.failureThreshold`, not by this | `requests: 100m/128Mi, limits: 1/1Gi` |
 
 There is **no preStop hook** in HA mode. The agent runs as PID 1 and owns SIGTERM: it releases the Lease first, then stops its PostgreSQL child. `ha.terminationGracePeriodSeconds` controls how long Kubernetes waits for that shutdown.
 
@@ -272,7 +272,7 @@ This is a **create-time** choice: the chart has no in-place major upgrade, so mo
 
 ### Failover: the lease-based agent
 
-A Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a Kubernetes `coordination.k8s.io/v1` Lease (`<fullname>-leader`) as the **sole authority** for which pod is primary, driving repmgr as a pure mechanism (`failover=manual`). This is the only failover path since **2.0.0**; the legacy repmgrd + service-updater sidecars were removed and `repmgr.failoverMode` is now rejected at render time (#286).
+A Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a Kubernetes `coordination.k8s.io/v1` Lease (`<fullname>-leader`) as the **sole authority** for which pod is primary, driving PostgreSQL directly (`pg_ctl promote`, `pg_basebackup`, `pg_rewind`). This is the only failover path since **2.0.0**; repmgr, the legacy repmgrd + service-updater sidecars and `repmgr.failoverMode` were all removed and the last of those is now rejected at render time (#286, #294).
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|

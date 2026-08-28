@@ -4045,7 +4045,9 @@ guard_fails "#262 guard: extraEnv as a map fails fast"          --set-json 'post
 guard_fails "#262 guard: extraVolumes as a map fails fast"      --set-json 'postgresql.extraVolumes={"name":"x"}'
 guard_fails "#262 guard: extraVolumes without a name fails"     --set-json 'postgresql.extraVolumes=[{"emptyDir":{}}]'
 guard_fails "#262 guard: extraVolumes colliding with data fails" --set-json 'postgresql.extraVolumes=[{"name":"data","emptyDir":{}}]'
-guard_fails "#262 guard: extraVolumes colliding with repmgr-config fails" --set-json 'postgresql.extraVolumes=[{"name":"repmgr-config","emptyDir":{}}]'
+# postgresql-config, not repmgr-config (#298 review): that volume no longer exists, so
+# reserving its name was a fail message citing a chart-managed volume no render emits.
+guard_fails "#262 guard: extraVolumes colliding with postgresql-config fails" --set-json 'postgresql.extraVolumes=[{"name":"postgresql-config","emptyDir":{}}]'
 guard_fails "#262 guard: duplicate extraVolumes name fails"     --set-json 'postgresql.extraVolumes=[{"name":"a","emptyDir":{}},{"name":"a","emptyDir":{}}]'
 guard_fails "#262 guard: dangling extraVolumeMounts fails"      --set-json 'postgresql.extraVolumeMounts=[{"name":"typo","mountPath":"/x"}]'
 guard_fails "#262 guard: extraVolumeMounts without mountPath fails" --set-json 'postgresql.extraVolumes=[{"name":"a","emptyDir":{}}]' --set-json 'postgresql.extraVolumeMounts=[{"name":"a"}]'

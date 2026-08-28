@@ -1076,7 +1076,16 @@ spec:
                                 }
                                 { print }
                                 END { if (!done) exit 3 }' "$HBA_FILE" > "${HBA_FILE}.pgchart.tmp"; then
-                            mv "${HBA_FILE}.pgchart.tmp" "$HBA_FILE"
+                            {{- /* cp + rm, NOT mv (#298 review). mv replaces the INODE, so
+                                   pg_hba.conf would inherit the awk redirect's mode -- 0644
+                                   under the default umask -- instead of initdb's 0600, making
+                                   the file that lists every auth rule world-readable inside the
+                                   container and on the volume from the first pod start with
+                                   postgresql.pgHba set. cp onto the existing file preserves the
+                                   destination's mode, which is why the deleted repmgrd branch
+                                   used it. */}}
+                            cp "${HBA_FILE}.pgchart.tmp" "$HBA_FILE"
+                            rm -f "${HBA_FILE}.pgchart.tmp"
                           else
                             rm -f "${HBA_FILE}.pgchart.tmp"
                             echo "postStart: no non-loopback host rule in $HBA_FILE to anchor on; NOT applying the postgresql.pgHba entries" >&2

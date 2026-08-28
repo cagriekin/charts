@@ -75,6 +75,9 @@ chart_profiles() {
 # -- skipping quietly is the same vacuous-pass shape these gates were just fixed for.
 fixture_base() {
   local chart="$1" fixture="$2"
+  # The case labels are "<chart-dir>/<fixture-basename>", NOT a repo path -- the fixtures
+  # themselves live under <chart-dir>/tests/. Pasting the real path here silently matches
+  # nothing, and the resulting FATAL points right back at this function (#298 review).
   case "${chart}/${fixture}" in
     # #323's passthrough fixture sets pgbackrest.extraEnv/extraVolumes without enabling
     # pgbackrest; standalone it hits the "set but pgbackrest.enabled is false" validator.
