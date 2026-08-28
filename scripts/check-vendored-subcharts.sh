@@ -7,6 +7,11 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${repo_root}"
+# shellcheck source=scripts/lib.sh
+source "${repo_root}/scripts/lib.sh"
+
+require_tool helm "https://helm.sh/docs/intro/install/"
+require_tool tar "your distribution's coreutils/tar package"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "${tmp}"' EXIT
@@ -55,4 +60,4 @@ for src in "${sources[@]}"; do
   done
 done
 
-exit "${fail}"
+verdict "vendored-subcharts" "${fail}"

@@ -9,19 +9,40 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
+# shellcheck source=scripts/lib.sh
+source "${REPO_ROOT}/scripts/lib.sh"
+
+require_tool helm "https://helm.sh/docs/intro/install/"
+# The plugin, not a binary: `command -v` cannot see it, so ask helm.
+if ! helm plugin list 2>/dev/null | awk '{print $1}' | grep -qx unittest; then
+  echo "FATAL: the helm-unittest plugin is not installed, so this gate did NOT run." >&2
+  echo "       install: helm plugin install https://github.com/helm-unittest/helm-unittest" >&2
+  echo "       Treat this as a FAILED gate, not a passed one." >&2
+  exit 127
+fi
 
 rc=0
 ran=0
+charts=0
+failed=0
 for chart_yaml in */Chart.yaml; do
   dir="$(dirname "$chart_yaml")"
   if compgen -G "${dir}/tests/unit/*_test.yaml" >/dev/null; then
     echo "==> helm unittest: ${dir}"
     ran=1
-    helm unittest -f 'tests/unit/*_test.yaml' "${dir}" || rc=1
+    charts=$((charts + 1))
+    if ! helm unittest -f 'tests/unit/*_test.yaml' "${dir}"; then
+      rc=1
+      failed=$((failed + 1))
+    fi
   fi
 done
 
+# No suites found is a FAILURE, not a quiet note (#298 review). This gate exists to run tests;
+# "there were none" means the glob or the layout moved, and reporting success would mean the
+# gate passes loudest exactly when it has stopped testing anything.
 if [ "$ran" -eq 0 ]; then
-  echo "No tests/unit/*_test.yaml suites found" >&2
+  echo "FATAL: no tests/unit/*_test.yaml suites found -- this gate tested NOTHING." >&2
+  rc=1
 fi
-exit "$rc"
+verdict "helm-unittest" "$rc" "$( [ "$rc" -eq 0 ] && echo "${charts} charts" || echo "${failed} of ${charts} charts" )"

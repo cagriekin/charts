@@ -7,6 +7,11 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
+# shellcheck source=scripts/lib.sh
+source "${REPO_ROOT}/scripts/lib.sh"
+
+require_tool helm "https://helm.sh/docs/intro/install/"
+require_tool kubeconform "https://github.com/yannh/kubeconform/releases (CI pins v0.6.7)"
 
 # Kubernetes API version whose schemas the manifests are validated against. Bump
 # deliberately (kept in step with the charts' documented minimum).
@@ -35,17 +40,32 @@ if [ ${#charts[@]} -eq 0 ]; then
 fi
 
 rc=0
+failed=0
 for chart in "${charts[@]}"; do
   echo "==> kubeconform: ${chart}"
-  if ! helm template "${chart}" "${chart}" \
+  out=""
+  if ! out=$(helm template "${chart}" "${chart}" \
       | kubeconform \
           -strict \
           -ignore-missing-schemas \
           -kubernetes-version "${KUBE_VERSION}" \
           -schema-location default \
           -schema-location "${CRD_CATALOG}" \
-          -summary; then
+          -summary 2>&1); then
     rc=1
+    failed=$((failed + 1))
+  fi
+  printf '%s\n' "${out}"
+  # Same vacuous-pass guard as the kube-linter gate (#298 review): kubeconform validates what it
+  # is given, so an empty render is "0 resources found ... Valid: 0" and exit ZERO. Require the
+  # summary to report at least one resource, so a chart that renders nothing fails here instead
+  # of reporting a clean schema gate.
+  found=$(printf '%s' "${out}" | sed -nE 's/^Summary: ([0-9]+) resources found.*/\1/p' | head -1)
+  if [ -z "${found}" ] || [ "${found}" -eq 0 ]; then
+    echo "FATAL: kubeconform validated NO resources from ${chart} (summary: ${found:-absent})." >&2
+    echo "       A gate that examines nothing must fail, not pass." >&2
+    rc=1
+    failed=$((failed + 1))
   fi
 done
-exit "$rc"
+verdict "kubeconform" "$rc" "$( [ "$rc" -eq 0 ] && echo "${#charts[@]} charts, k8s ${KUBE_VERSION}" || echo "${failed} of ${#charts[@]} charts" )"

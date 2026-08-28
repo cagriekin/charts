@@ -104,6 +104,27 @@
 
 ### Testing
 
+- **The policy gate could report a clean pass while linting nothing (#298 review).**
+  `kube-linter lint <chart-dir>` renders the chart itself, and when that yields no objects it
+  prints `Warning: no valid objects found.` and exits **zero** -- so a chart that stops rendering
+  for kube-linter reports a clean policy gate while examining not one container. Found by
+  building a throwaway chart whose container had no resources and no probes: it passed the gate,
+  while the same manifest piped to `kube-linter lint -` produced all four violations. Both gates
+  now fail when they examined nothing (kubeconform's equivalent is a `0 resources found`
+  summary). Verified in both directions: a real chart with its resources removed is caught and
+  reported as `FAILED (1 of 5 charts)`.
+- **The gate scripts now fail fast on a missing tool, and always print a verdict line.** A
+  missing `kube-linter`/`kubeconform` produced one `command not found` per chart and exit 1 --
+  correct, but at a glance indistinguishable from real violations. They now stop immediately with
+  an install hint and exit 127. Each gate also ends with a single `=== <gate>: OK|FAILED ===`
+  line, because the exit status is the only unambiguous signal and it is the easiest thing for a
+  caller to discard: piping a gate through `tail` and reading `$?` reports *tail's* status, which
+  is how these gates were once reported as passing when they had not run at all. Shared helpers
+  live in `scripts/lib.sh`.
+- **An empty helm-unittest run is now a failure.** `scripts/helm-unittest-charts.sh` printed
+  "No tests/unit/*_test.yaml suites found" to stderr and exited 0. A gate whose job is to run
+  tests must not pass loudest at the moment it has stopped testing anything.
+
 - **The `failoverMode: repmgrd` → 2.0.0 upgrade now has a KinD suite (#298 review).** It was the
   only 2.0.0 path that recreates a live StatefulSet, the one every remaining repmgrd consumer
   must follow, and the only one that can lose a cluster if it goes wrong -- and nothing tested
