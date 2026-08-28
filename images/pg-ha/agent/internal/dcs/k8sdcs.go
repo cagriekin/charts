@@ -108,25 +108,34 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 	}
 
 	for ctx.Err() == nil {
-		// Respect a step-down cooldown so a peer wins a just-released lease before
-		// this node re-contends.
+		// A per-iteration context so Release can cancel just this election (releasing
+		// the lease via ReleaseOnCancel) without tearing down the agent.
+		//
+		// Installed BEFORE the cooldown is consulted, not after (#298 review). The old
+		// order left a window in which a step-down was silently dropped: the loop read
+		// cooldownUntil (still zero), and a Release arriving before stepDown was assigned
+		// armed the cooldown but found `cancel == nil` and cancelled nothing -- so this node
+		// walked straight into le.Run and could re-win the very Lease it was handing over,
+		// with the cooldown it had just armed already read and discarded. Assigning first
+		// means every Release either cancels a live election or lands in the one remaining
+		// gap (between clearing stepDown and the next iteration's assignment), which the
+		// re-read below covers.
+		elerCtx, cancel := context.WithCancel(ctx)
 		k.mu.Lock()
+		k.stepDown = cancel
 		until := k.cooldownUntil
 		k.mu.Unlock()
+		// Respect a step-down cooldown so a peer wins a just-released lease before
+		// this node re-contends. A Release DURING this wait cancels elerCtx, so le.Run
+		// returns at once and the next iteration re-reads the newly armed cooldown.
 		if d := time.Until(until); d > 0 {
 			select {
 			case <-ctx.Done():
+				cancel()
 				return
 			case <-time.After(d):
 			}
 		}
-
-		// A per-iteration context so Release can cancel just this election (releasing
-		// the lease via ReleaseOnCancel) without tearing down the agent.
-		elerCtx, cancel := context.WithCancel(ctx)
-		k.mu.Lock()
-		k.stepDown = cancel
-		k.mu.Unlock()
 
 		le, err := leaderelection.NewLeaderElector(lec)
 		if err != nil {

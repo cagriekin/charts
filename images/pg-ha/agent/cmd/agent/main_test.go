@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -3011,6 +3012,83 @@ func TestOrphanSlotLeavesOutOfRangeLegacyNamesAlone(t *testing.T) {
 		}
 		if orphanSlot(name, "pg-0", live, map[int]bool{8999: true, 1000: true}) {
 			t.Errorf("%s must stay out of reach even with migration proof for the mapped ordinal", name)
+		}
+	}
+}
+
+// blockingExec makes every probe take real time and reports the peer unreachable, which is
+// the scenario that made sequential probing dangerous: a dead peer costs a full connect
+// timeout. Its own type rather than scriptedExec, which mutates counters without a lock and
+// would race under a fan-out.
+type blockingExec struct{ onProbe func() }
+
+func (b *blockingExec) Run(_ context.Context, _ []string, _ string, _ ...string) (string, error) {
+	if b.onProbe != nil {
+		b.onProbe()
+	}
+	return "", errors.New("connection to server failed")
+}
+
+// #298 review: peers are probed concurrently, and the resulting slice must still be ordered
+// by ordinal. Sequential probing made a tick cost (dead peers) x (connect timeout), which on
+// a partitioned cluster exceeded the /healthz staleness window and got the agent
+// liveness-killed. Both properties are asserted together because fixing the first by
+// appending results as they arrive would silently break the second, and peer ORDER feeds the
+// promote-distance ranking -- two identical clusters must not disagree about it.
+func TestObservePeersAreProbedConcurrentlyAndStayOrdered(t *testing.T) {
+	const peers = 4
+	var mu sync.Mutex
+	inFlight, maxInFlight := 0, 0
+	ex := &blockingExec{onProbe: func() {
+		mu.Lock()
+		inFlight++
+		if inFlight > maxInFlight {
+			maxInFlight = inFlight
+		}
+		mu.Unlock()
+		time.Sleep(60 * time.Millisecond) // stands in for a connect that will time out
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+	}}
+	a := &agent{
+		cfg: &config.Config{
+			PGDATA: t.TempDir(), HeadlessService: "h", PodName: "pg-0", NodeCount: peers + 1,
+			RepmgrUser: "repmgr", RepmgrDB: "repmgr", RenewDeadline: 2 * time.Second,
+		},
+		base:   "pg",
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		dcs:    &fakeDCS{}, // not the holder, so the gossip read is skipped entirely
+		kube:   k8s.NewWithClient(k8sfake.NewSimpleClientset(), "ns"),
+		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
+		sup:    process.NewSupervisor(&fakePostmaster{}),
+		metr:   observe.New(),
+		health: &selfHealthTracker{grace: 15 * time.Second},
+	}
+
+	start := time.Now()
+	o := a.observe(context.Background())
+	elapsed := time.Since(start)
+
+	if maxInFlight < 2 {
+		t.Errorf("probes ran sequentially (max in flight = %d); a partitioned cluster would spend peers x connect-timeout per tick", maxInFlight)
+	}
+	// Four 60ms probes plus the local one: ~120ms concurrent, ~300ms sequential. Loose on
+	// purpose -- the assertion above is the precise one.
+	if elapsed > 250*time.Millisecond {
+		t.Errorf("observe took %v for %d peers; concurrent probing should be about one probe deep", elapsed, peers)
+	}
+	var got []string
+	for _, p := range o.Peers {
+		got = append(got, p.Name)
+	}
+	want := []string{"pg-1", "pg-2", "pg-3", "pg-4"}
+	if len(got) != len(want) {
+		t.Fatalf("peers = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("peer order = %v, want %v (ordinal order, not completion order)", got, want)
 		}
 	}
 }

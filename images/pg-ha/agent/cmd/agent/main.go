@@ -711,16 +711,46 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 			}
 		}
 	}
+	// Peers are probed CONCURRENTLY (#298 review). They used to be probed one after another,
+	// and each probe is a psql connect bounded only by PGCONNECT_TIMEOUT -- so the cost of a
+	// tick was (unreachable peers) x (connect timeout), serially, inside the reconcile loop.
+	// On a 5-node cluster that has just lost its network, that is ~40s of a tick whose
+	// interval is 5s: /healthz goes stale at reconcileInterval*3, so the agent could be
+	// liveness-killed for the crime of having dead peers -- the pathology that made every
+	// peer-addressed command take an explicit connect timeout in the first place. The probes
+	// are independent reads with no shared state, so the fan-out needs no coordination beyond
+	// writing each result to its own slot.
+	//
+	// Results land by INDEX, not by append order, so o.Peers stays deterministic: the
+	// promote-distance and role-label logic downstream reads this slice, and a peer order that
+	// varied with which probe returned first would make two identical clusters disagree.
+	type peerProbe struct {
+		ps  reconcile.PeerState
+		set bool
+	}
+	probes := make([]peerProbe, a.cfg.NodeCount)
+	var pwg sync.WaitGroup
 	for i := 0; i < a.cfg.NodeCount; i++ {
 		name := a.base + "-" + strconv.Itoa(i)
 		if name == a.cfg.PodName {
 			continue
 		}
-		ns := a.prober.Probe(ctx, a.peerConn(name))
-		ps := reconcile.PeerState{
-			Name: name, Reachable: ns.Reachable, Role: ns.Role,
-			Timeline: ns.Timeline, TimelineOK: ns.TimelineOK, LSN: ns.WriteLSN, LSNOK: ns.LSNOK,
+		pwg.Add(1)
+		go func(i int, name string) {
+			defer pwg.Done()
+			ns := a.prober.Probe(ctx, a.peerConn(name))
+			probes[i] = peerProbe{set: true, ps: reconcile.PeerState{
+				Name: name, Reachable: ns.Reachable, Role: ns.Role,
+				Timeline: ns.Timeline, TimelineOK: ns.TimelineOK, LSN: ns.WriteLSN, LSNOK: ns.LSNOK,
+			}}
+		}(i, name)
+	}
+	pwg.Wait()
+	for _, pr := range probes {
+		if !pr.set {
+			continue
 		}
+		name, ps := pr.ps.Name, pr.ps
 		// An unreachable peer with fresh gossip contributes its self-reported
 		// position to the election (it is never a rewind/follow target -- only the
 		// release/handoff decision uses it).

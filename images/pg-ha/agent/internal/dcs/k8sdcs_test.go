@@ -120,3 +120,47 @@ func TestK8sDCSStartsAsFollower(t *testing.T) {
 		t.Errorf("Leader() = %q, want empty before Run", k.Leader())
 	}
 }
+
+// #298 review: a Release that lands while Run is WAITING OUT a cooldown must still be
+// honoured. The old order read cooldownUntil at the top of the loop and only then installed
+// the cancel hook, so a Release arriving in between (the cooldown wait is the wide part of
+// that window) armed a new cooldown that had already been read and discarded, and found no
+// cancel to call -- so the node walked into the election and could re-win the very Lease it
+// was handing over. Single node, so any acquisition is immediate absent a cooldown: if the
+// second Release is dropped this node is leader as soon as the FIRST cooldown expires.
+func TestK8sDCSReleaseDuringCooldownIsNotDropped(t *testing.T) {
+	const cooldown = 2 * time.Second
+	k := NewK8sDCSWithClient(K8sConfig{
+		Namespace: "ns", LeaseName: "pg-leader",
+		LeaseDuration: 2 * time.Second, RenewDeadline: 1 * time.Second, RetryPeriod: 200 * time.Millisecond,
+		StepDownCooldown: cooldown,
+	}, fake.NewSimpleClientset())
+
+	// Arm cooldown #1 before Run, so the loop's first act is to wait it out.
+	k.Release()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	start := time.Now()
+	go k.Run(ctx, "pod-0", Callbacks{})
+
+	// Land cooldown #2 halfway through cooldown #1's wait: it must extend the suppression.
+	time.Sleep(cooldown / 2)
+	k.Release()
+	secondExpiry := time.Now().Add(cooldown)
+
+	// After #1 expires but comfortably before #2 does, this node must still not be leader.
+	time.Sleep(time.Until(start.Add(cooldown).Add(400 * time.Millisecond)))
+	if k.IsLeader() {
+		t.Fatalf("re-won leadership %v in, while the second cooldown had until %v: the Release during the wait was dropped",
+			time.Since(start), time.Until(secondExpiry))
+	}
+
+	// And it must eventually contend again -- a suppression that never lifts is its own bug.
+	for i := 0; i < 100; i++ {
+		if k.IsLeader() {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatal("never re-acquired leadership after both cooldowns expired")
+}

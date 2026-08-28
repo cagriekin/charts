@@ -124,22 +124,26 @@ func (e *EtcdDCS) Leader() string {
 // before any re-acquire (the fence-ordering guarantee, symmetric with K8sDCS).
 func (e *EtcdDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 	for ctx.Err() == nil {
-		// Respect a step-down cooldown so a peer wins a just-released key.
+		// The resign hook is installed BEFORE the cooldown is consulted, symmetric with
+		// K8sDCS and for the same reason (#298 review): reading cooldownUntil first left a
+		// window where a Release armed the cooldown, found `resign == nil`, cancelled
+		// nothing, and this node campaigned immediately for the key it was handing over.
+		iterCtx, cancel := context.WithCancel(ctx)
 		e.mu.Lock()
+		e.resign = cancel
 		until := e.cooldownUntil
 		e.mu.Unlock()
+		// Respect a step-down cooldown so a peer wins a just-released key. A Release during
+		// this wait cancels iterCtx, so runElection returns at once and the next iteration
+		// re-reads the newly armed cooldown.
 		if d := time.Until(until); d > 0 {
 			select {
 			case <-ctx.Done():
+				cancel()
 				return
 			case <-time.After(d):
 			}
 		}
-
-		iterCtx, cancel := context.WithCancel(ctx)
-		e.mu.Lock()
-		e.resign = cancel
-		e.mu.Unlock()
 
 		e.runElection(iterCtx, identity, cb)
 

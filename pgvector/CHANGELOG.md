@@ -102,6 +102,21 @@
 
 ### Fixed
 
+- **A step-down could be silently dropped, letting a node re-win the Lease it was handing
+  over (#298 review).** Both DCS backends read the step-down cooldown at the top of the
+  election loop and only then installed the cancel hook, so a `Release()` arriving in between
+  -- and the cooldown wait is the wide part of that window -- armed a cooldown that had
+  already been read and discarded, and found no cancel to call. The node then walked straight
+  into the election. The hook is now installed before the cooldown is consulted, so every
+  `Release()` either cancels a live election or lands in a gap the next iteration's re-read
+  covers. Fixed symmetrically in the Kubernetes and etcd backends.
+- **Peers are probed concurrently (#298 review).** Each probe is a `psql` connect bounded only
+  by `PGCONNECT_TIMEOUT`, and they ran one after another -- so a tick cost (unreachable peers)
+  × (connect timeout). On a 5-node cluster that just lost its network that is ~40s inside a
+  loop whose interval is 5s, and `/healthz` goes stale at three intervals: the agent could be
+  liveness-killed, taking its postmaster with it, precisely when peers were unreachable. The
+  results are collected by ordinal, so peer order stays deterministic for the promote-distance
+  ranking.
 - **The md5→scram re-hash no longer sends a plaintext password to the server (#298 review).**
   It already kept the secret off argv, but it set it as a SQL literal
   (`SET myvars.tgt_pass = ...`), and a top-level `SET` is logged verbatim under
