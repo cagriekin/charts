@@ -4,8 +4,8 @@ PostgreSQL Helm chart with native streaming replication and a lease-based Go fai
 
 ## Features
 
-- PostgreSQL 18.1 with configurable version
-- Lease-based HA agent (`pg-ha-agent`, PID 1 in the postgresql container) for automatic failover, replication management, and primary Service selector updates — no sidecars
+- PostgreSQL 18 with configurable major (18 or 17)
+- Lease-based HA agent (`pg-ha-agent`, PID 1 in the postgresql container) for automatic failover, replication management, and primary Service selector updates — no HA sidecars (the `repmgrd` and `service-updater` sidecars were removed in 2.0.0; the pgBackRest and metrics-exporter sidecars are unaffected)
 - Stale-primary protection: a crashed primary that restarts after a standby was promoted rejoins as a standby (via pg_rewind) instead of resuming read-write on a divergent timeline
 - Read-only `<fullname>-readonly` service targeting standby pods for read scaling (repmgr mode)
 - Optional PGPool-II for connection pooling and read/write splitting
@@ -593,8 +593,15 @@ Both majors run the **whole** live test suite in CI (failover, pgBackRest restor
 
 A Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a Kubernetes
 `coordination.k8s.io/v1` Lease (`<fullname>-leader`) as the **sole authority** for which pod is
-primary, driving repmgr as a pure mechanism (`failover=manual`). The Lease is what makes
-split-brain structurally impossible rather than something to detect and repair.
+primary, driving PostgreSQL directly (`pg_ctl promote`, `pg_basebackup`, `pg_rewind`).
+
+What the Lease guarantees precisely: **two pods can never hold it at once**, so there is never
+more than one node the cluster considers primary. It does not instantly stop a node that has
+already lost it from serving writes. Under an asymmetric partition a former holder can stay
+read-write for the window between losing the Lease and noticing — bounded by `renewDeadline`,
+after which the agent demotes and fences itself (see the fencing note below). So the Lease
+removes the *ambiguity* that makes split-brain unrecoverable; the fence is what closes the
+write window.
 
 This is the only failover path. It has been the default since `1.0.0`; the legacy repmgrd +
 service-updater sidecars were removed in **2.0.0**, and `repmgr.failoverMode` is now rejected at
@@ -710,9 +717,11 @@ field is **immutable** on an existing StatefulSet, so a release that was pinned 
 # 1. Healthy cluster + a fresh backup first. GitOps: disable auto-sync for these steps.
 # 2. Orphan-delete the StatefulSet (keeps pods + PVCs running; Helm re-adopts them):
 kubectl delete statefulset <release>-pg -n <ns> --cascade=orphan
-# 3. Remove `repmgr.failoverMode` from your values (2.0.0 rejects it), then upgrade.
-#    This recreates the STS as Parallel and adopts the orphaned pods:
-helm upgrade <release> cagriekin/pg -n <ns>   # + your -f values, minus failoverMode
+# 3. Remove every key 2.0.0 rejects -- `repmgr.failoverMode`, `repmgr.serviceUpdater.*`,
+#    `repmgr.monitoringHistoryDays`, `repmgr.splitBrainDetection.*`, `pgpool.autoFailback`.
+#    Any one left behind fails the render, not just the first (#298 review). Then upgrade;
+#    this recreates the STS as Parallel and adopts the orphaned pods:
+helm upgrade <release> cagriekin/pg -n <ns>   # + your -f values, minus the removed keys
 # 4. Verify:
 kubectl get lease <release>-pg-leader -n <ns> -o jsonpath='{.spec.holderIdentity}'  # == the primary pod
 kubectl get endpoints <release>-pg -n <ns>                                          # points at it
@@ -2584,9 +2593,14 @@ Each chart is tagged `<chart>-<version>` (e.g. `pg-1.1.0`); `pg` and `pgvector` 
 
 ### Compatibility matrix
 
-| `pg` / `pgvector` | repmgr image | PostgreSQL | Kubernetes |
-|-------------------|--------------|-----------|-----------|
-| 1.17.0 *(current)* | `trixie-5.5.0-34` (`-pg18` / `-pg17`) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+The HA image changed name and tag scheme in 2.0.0 (#290): `cagriekin/pg-ha:<chart-version>-pg<major>`
+replaces `cagriekin/repmgr:trixie-<repmgr>-<n>`. Rows at 1.x keep the old scheme, and
+`cagriekin/repmgr` stays published and frozen at its last tag so existing 1.x pins keep resolving.
+
+| `pg` / `pgvector` | HA image | PostgreSQL | Kubernetes |
+|-------------------|----------|-----------|-----------|
+| 2.0.0 *(current)* | `cagriekin/pg-ha:2.0.0-pg18` / `:2.0.0-pg17` | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.17.0 | `trixie-5.5.0-34` (`-pg18` / `-pg17`) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
 | 1.13.1 – 1.14.0 | `trixie-5.5.0-32` | 18.x (default) or 17.x | as above |
 | 1.11.0 – 1.13.0 | `trixie-5.5.0-31` | 18.x (default) or 17.x | as above |
 | 1.10.1 – 1.10.2 | `trixie-5.5.0-30` | 18.x (default) or 17.x | as above |
@@ -3009,7 +3023,11 @@ Failover history lives in the agent's structured audit log on the PostgreSQL pod
 `PrimaryChanged` core/v1 Events that the service-updater used to emit went away with it in 2.0.0):
 
 ```bash
-kubectl logs my-postgres-pg-0 -c postgresql | grep -i 'promote\|demote\|lease'
+# Every PostgreSQL pod, not just ordinal 0: the transitions that matter are written by whichever
+# agent made them, so the promote is in the NEW primary's log and the demote in the old one's.
+# Reading pod-0 alone shows one side of a failover, and none of it if pod-0 was not involved.
+kubectl logs -l app.kubernetes.io/component=postgresql -c postgresql --prefix --tail=-1 \
+  | grep -i 'promote\|demote\|lease'
 kubectl describe service my-postgres-pg
 ```
 

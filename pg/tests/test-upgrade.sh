@@ -58,10 +58,15 @@ wait_for_deployment_ready "${NAMESPACE}" "${FULLNAME_TO}-postgres-exporter" 300
 # that is Running but not streaming reads ready=false. Asserting only .status.phase let a
 # permanently-broken standby pass this suite -- pod-2 sat Running/ready=false, unable to
 # replicate, and the suite reported success (#297).
+# The postgresql container is selected BY NAME, not by index (#298 review). This step's upgrade
+# adds the exporter sidecar, so index 0 is no longer guaranteed to be postgresql -- and a sidecar
+# with no readiness probe reports ready=true, so an index that resolved to it would report Ready
+# while the replication-aware postgresql probe was still failing. That is the same false pass
+# #297 describes, reintroduced by the assertion meant to catch it.
 for i in 0 1 2; do
   phase=$(kubectl get pod -n "${NAMESPACE}" "${FULLNAME_TO}-${i}" -o jsonpath='{.status.phase}')
   assert_eq "after upgrade: pod-${i} is Running" "Running" "${phase}"
-  ready=$(kubectl get pod -n "${NAMESPACE}" "${FULLNAME_TO}-${i}" -o jsonpath='{.status.containerStatuses[0].ready}')
+  ready=$(kubectl get pod -n "${NAMESPACE}" "${FULLNAME_TO}-${i}" -o jsonpath='{.status.containerStatuses[?(@.name=="postgresql")].ready}')
   assert_eq "after upgrade: pod-${i} is Ready (replication-aware, #186)" "true" "${ready}"
 done
 

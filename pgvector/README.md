@@ -7,7 +7,7 @@ This chart shares all templates with the [pg chart](../pg/) via symlinks. The on
 ## Features
 
 - PostgreSQL 18 with pgvector extension for vector similarity search
-- Lease-based HA agent (`pg-ha-agent`, PID 1 in the postgresql container) for automatic failover, replication management, and primary Service selector updates — no sidecars
+- Lease-based HA agent (`pg-ha-agent`, PID 1 in the postgresql container) for automatic failover, replication management, and primary Service selector updates — no HA sidecars (the `repmgrd` and `service-updater` sidecars were removed in 2.0.0; the pgBackRest and metrics-exporter sidecars are unaffected)
 - Stale-primary protection: a crashed primary that restarts after a standby was promoted rejoins as a standby (via pg_rewind) instead of resuming read-write on a divergent timeline
 - Read-only `<fullname>-readonly` service targeting standby pods for read scaling (repmgr mode)
 - Optional PGPool-II for connection pooling and read/write splitting
@@ -1263,7 +1263,11 @@ kubectl rollout restart deployment my-pgvector-pgpool
 Failover history lives in the agent's structured audit log on the PostgreSQL pods (the `PrimaryChanged` core/v1 Events that the service-updater used to emit went away with it in 2.0.0):
 
 ```bash
-kubectl logs my-pgvector-0 -c postgresql | grep -i 'promote\|demote\|lease'
+# Every PostgreSQL pod, not just ordinal 0: the transitions that matter are written by whichever
+# agent made them, so the promote is in the NEW primary's log and the demote in the old one's.
+# Reading pod-0 alone shows one side of a failover, and none of it if pod-0 was not involved.
+kubectl logs -l app.kubernetes.io/component=postgresql -c postgresql --prefix --tail=-1 \
+  | grep -i 'promote\|demote\|lease'
 kubectl describe service my-pgvector
 ```
 

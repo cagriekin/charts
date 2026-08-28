@@ -102,6 +102,17 @@
 
 ### Fixed
 
+- **`config` and `special-chars` suites now run in CI (#298 review).** Both existed in
+  `pg/Makefile` and in no matrix leg, so they only ran when someone remembered. `special-chars`
+  is the pointed one: it covers identifiers and passwords with characters that break SQL, which
+  is exactly the class of defect #298 found in `bootstrap_initdb`.
+- **Two KinD readiness checks could pass while PostgreSQL was failing (#298 review).**
+  `test-upgrade.sh` and `test-agent-failover.sh` read `containerStatuses[0].ready`, and index 0
+  is not guaranteed to be the `postgresql` container -- a sidecar with no readiness probe
+  reports `ready=true`. Both now select the container by name.
+- **`appVersion` no longer claims a PostgreSQL minor the chart cannot guarantee.** `pg` pinned
+  `"18.1"` while the HA image tag floats with upstream, the same reason `pgvector` was relaxed
+  to `"18"` in #164. The `postgresql.image.tag` default is unchanged.
 - **A step-down could be silently dropped, letting a node re-win the Lease it was handing
   over (#298 review).** Both DCS backends read the step-down cooldown at the top of the
   election loop and only then installed the cancel hook, so a `Release()` arriving in between
@@ -652,9 +663,12 @@ if you set it explicitly, then `helm upgrade` normally. Your StatefulSet is alre
 ```bash
 # 1. Healthy cluster + a fresh backup first. GitOps: disable auto-sync for these steps.
 kubectl delete statefulset <release>-pgvector -n <ns> --cascade=orphan
-# 2. Remove repmgr.failoverMode from your values, then upgrade (recreates the STS as
+# 2. Remove every removed key from your values, then upgrade (recreates the STS as
 #    Parallel and adopts the orphaned pods):
-helm upgrade <release> cagriekin/pgvector -n <ns>   # + your -f values, minus failoverMode
+#    Every key 2.0.0 rejects has to go, not just this one (#298 review) -- a leftover
+#    repmgr.serviceUpdater.*, repmgr.monitoringHistoryDays, repmgr.splitBrainDetection.* or
+#    pgpool.autoFailback fails the render just as hard. See the "Removed values" table above.
+helm upgrade <release> cagriekin/pgvector -n <ns>   # + your -f values, minus the removed keys
 # 3. Verify:
 kubectl get lease <release>-pgvector-leader -n <ns> -o jsonpath='{.spec.holderIdentity}'
 kubectl get endpoints <release>-pgvector -n <ns>

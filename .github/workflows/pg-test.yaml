@@ -277,6 +277,13 @@ jobs:
           - pgbackrest-bootstrap
           - databases-roles
           - scaledown
+          # #298 review: both of these existed in pg/Makefile and in no matrix leg, so they ran
+          # only when somebody remembered to. special-chars is the pointed one -- it covers
+          # identifiers and passwords with characters that break SQL, which is exactly the class
+          # of bug #298 found in bootstrap_initdb (an uppercase POSTGRES_USER made the bootstrap
+          # unpassable), and the suite that would have caught it was not wired in.
+          - config
+          - special-chars
           # #292: starts from the released 1.x chart + an older released image, so unlike every
           # other leg it is not hermetic against the local tree. It is in the matrix anyway
           # because the in-place migration is the one path every existing consumer takes, and

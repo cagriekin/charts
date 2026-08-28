@@ -263,7 +263,9 @@ if [[ "${holder}" == "${POD1}" ]]; then
   for _ in $(seq 1 84); do
     uid=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
     if [[ -n "${uid}" && "${uid}" != "${old_uid}" ]]; then
-      ready=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "")
+      # By NAME, not index (#298 review): a probe-less sidecar reports ready=true, so an index
+      # that lands on one turns this convergence wait into an immediate pass.
+      ready=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.status.containerStatuses[?(@.name=="postgresql")].ready}' 2>/dev/null || echo "")
       if [[ "${ready}" == "true" ]]; then
         recovered=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")
         [[ "${recovered}" == "t" ]] && break
