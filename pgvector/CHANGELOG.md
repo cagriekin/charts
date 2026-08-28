@@ -592,13 +592,13 @@ if you set it explicitly, then `helm upgrade` normally. Your StatefulSet is alre
 
 ```bash
 # 1. Healthy cluster + a fresh backup first. GitOps: disable auto-sync for these steps.
-kubectl delete statefulset <release>-pg -n <ns> --cascade=orphan
+kubectl delete statefulset <release>-pgvector -n <ns> --cascade=orphan
 # 2. Remove repmgr.failoverMode from your values, then upgrade (recreates the STS as
 #    Parallel and adopts the orphaned pods):
-helm upgrade <release> cagriekin/pg -n <ns>   # + your -f values, minus failoverMode
+helm upgrade <release> cagriekin/pgvector -n <ns>   # + your -f values, minus failoverMode
 # 3. Verify:
-kubectl get lease <release>-pg-leader -n <ns> -o jsonpath='{.spec.holderIdentity}'
-kubectl get endpoints <release>-pg -n <ns>
+kubectl get lease <release>-pgvector-leader -n <ns> -o jsonpath='{.spec.holderIdentity}'
+kubectl get endpoints <release>-pgvector -n <ns>
 ```
 
 Rollback is to chart `1.x` with `failoverMode: repmgrd` restored and the same
