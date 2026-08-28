@@ -102,6 +102,23 @@
 
 ### Fixed
 
+- **The md5→scram re-hash no longer sends a plaintext password to the server (#298 review).**
+  It already kept the secret off argv, but it set it as a SQL literal
+  (`SET myvars.tgt_pass = ...`), and a top-level `SET` is logged verbatim under
+  `log_statement = 'all'` or `log_min_duration_statement = 0` -- so any cluster with statement
+  logging on wrote the superuser and replication passwords into the PostgreSQL log in cleartext
+  and shipped them wherever those logs go. The agent now computes the SCRAM-SHA-256 verifier
+  itself and sends only that, which PostgreSQL stores verbatim, so the plaintext never leaves
+  the agent process. The verifier builder is asserted against the RFC 7677 known-answer vector.
+  As defence in depth the session also lowers `log_statement` / `log_min_duration_statement` /
+  `log_min_error_statement` before anything carrying the verifier is sent.
+- **Dead template branches removed: `repmgr-preload.conf` could not render (#298 review).**
+  `pg.chartOwnsSharedPreloadLibraries` still carried a `mechanism != native` clause, and no
+  render can satisfy it -- `repmgr` survives in the schema enum only so the removed-value
+  validator can reject it by name. The clause was therefore unreachable, and so was the whole
+  `repmgr-preload.conf` block, whose guard reduced to `not X and X`. The `repmgr` prepend in
+  `pg.sharedPreloadLibraries` is deleted for the same reason. No render moves; the tests
+  asserting the file is absent were passing vacuously and now pass for the right reason.
 - **The bootstrap `pg_hba.conf` no longer offers `md5` to the network (#298 review).** Both
   `0.0.0.0/0` catch-all rules now require `scram-sha-256`. `bootstrap_initdb` runs only against an
   EMPTY data directory and creates every role under `password_encryption = 'scram-sha-256'`, so

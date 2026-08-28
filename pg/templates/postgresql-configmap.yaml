@@ -33,25 +33,6 @@ data:
     {{ $key }} = '{{ index $.Values.postgresql.configuration $key | toString | replace "'" "''" }}'
     {{- end }}
 {{- end }}
-{{- if and (not .Values.postgresql.audit.enabled) (eq (include "pg.chartOwnsSharedPreloadLibraries" .) "true") }}
-  # repmgr MECHANISM with an operator-declared shared_preload_libraries. custom.conf is
-  # loaded via conf.d's include_dir at the END of PGDATA/postgresql.conf, so a bare operator
-  # value there would override the repmgr image entrypoint's
-  # `shared_preload_libraries = 'repmgr'` and start the postmaster WITHOUT the repmgr
-  # library -- replication and the repmgr GUCs lose their functions and failover silently
-  # stops working (#262 review). This file sorts after custom.conf, so its merged value
-  # (repmgr + the operator's libraries) wins.
-  #
-  # Not rendered under `mechanism: native` (#293): there is no repmgr extension to preserve
-  # there, so the operator's value passes through custom.conf untouched and this file --
-  # whose whole job is re-adding repmgr -- would be a lie under its own name. A native
-  # release that still asks for repmgr is refused at render time by
-  # pg.validateNativePreloadRepmgr instead.
-  # shared_preload_libraries is a postmaster parameter: a change here rolls the pods via the
-  # StatefulSet's checksum/postgresql-config annotation.
-  repmgr-preload.conf: |
-    shared_preload_libraries = '{{ include "pg.sharedPreloadLibraries" . }}'
-{{- end }}
 {{- if .Values.pgbackrest.enabled }}
   # Required for pgbackrest WAL archiving. archive_mode is a postmaster
   # parameter so it only takes effect after a postgres restart, which the

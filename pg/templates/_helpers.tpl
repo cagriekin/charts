@@ -319,41 +319,45 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- /* True when the chart -- not custom.conf -- owns shared_preload_libraries, i.e. the
        merged value is emitted from an authoritative conf.d file that sorts after
        custom.conf. That is the case whenever a library must be preserved across an
-       operator-declared value: repmgr (replication) and/or pgaudit (#219). In standalone
-       mode with audit off there is nothing to preserve, so the operator's value passes
+       operator-declared value. Since 2.0.0 that means pgaudit and nothing else (#219).
+       With audit off there is nothing to preserve, so the operator's value passes
        through custom.conf untouched.
-       #293: the repmgr clause is gated on the MECHANISM, not merely ha.enabled. Its
-       whole purpose is preserving `repmgr` across an operator-declared value, and under
-       native pg.sharedPreloadLibraries no longer emits repmgr at all (#288) -- so keeping
-       the clause there would render a repmgr-preload.conf that merely restates the
-       operator's own value, under a filename that is now a lie. Native falls through to
-       the standalone behaviour: the operator's value passes through custom.conf. This does
-       not move the default (repmgr) render. */ -}}
+       #298 review: the repmgr clause is GONE, not merely gated. It read
+       `ne mechanism "native"`, and mechanism can no longer be anything else at render
+       time -- `repmgr` survives in values.schema.json's enum ONLY so
+       pg.validateRemovedRepmgrdValues can reject it with a message naming the migration
+       instead of the schema failing first with a generic enum error. So the clause was
+       unreachable, and with it the whole repmgr-preload.conf block in
+       postgresql-configmap.yaml, whose guard was `and (not audit.enabled) (ownsPreload)`
+       -- which reduced to `not X and X`. Both deleted. Dead template branches in a
+       render-time-validated chart are worse than dead code: they read as coverage for a
+       mode that no longer exists, and the tests asserting the file is absent
+       (test-template.sh, audit_test.yaml) were passing vacuously. */ -}}
 {{- define "pg.chartOwnsSharedPreloadLibraries" -}}
-{{- if or .Values.postgresql.audit.enabled (and .Values.ha.enabled (ne ((.Values.ha.agent).mechanism | default "native") "native") (eq (include "pg.userSetSharedPreloadLibraries" .) "true")) -}}true{{- end -}}
+{{- if .Values.postgresql.audit.enabled -}}true{{- end -}}
 {{- end -}}
 
 {{- /* The authoritative shared_preload_libraries value. Rendered into a conf.d file that
        sorts after custom.conf under include_dir and therefore wins -- so it MUST
        reassemble the FULL list, not just the chart's own libraries.
-         - repmgr is kept whenever ha.enabled: replication and the repmgr GUCs depend
-           on the preload, and the repmgr image entrypoint writes
-           `shared_preload_libraries = 'repmgr'` into PGDATA/postgresql.conf, which any
-           conf.d value overrides. Dropping it disables failover (#262 review).
          - pgaudit is appended when audit.enabled (#219).
          - Libraries the operator declared in postgresql.configuration are merged in
            (comma-split, trimmed, de-duplicated) so the chart never silently drops a
            preload the operator asked for.
        Originally audit-only (pg.auditSharedPreloadLibraries); generalized because the
        audit-gated merge meant an operator-set value with audit OFF silently dropped
-       repmgr and broke HA failover. */ -}}
-{{- /* #288: `repmgr` is prepended only under the repmgr MECHANISM, not merely when
-       ha.enabled. Under `native` there is no repmgr extension on the cluster, so preloading
-       repmgr.so is dead weight -- and because these fragments load via conf.d's include_dir they
-       would OVERRIDE the entrypoint's native gate, putting the library back on a cluster that
-       has nothing to use it. Benign only while the package is still in the image: it makes every
-       native cluster unstartable ("could not access file \"repmgr\"") the moment #290/#294 drop
-       it. Removing the line from an EXISTING data directory stays #293's half. */ -}}
+       repmgr and broke HA failover -- back when repmgr existed.
+       #298 review: the `repmgr` prepend is DELETED, not gated. It was conditioned on
+       `ne mechanism "native"`, and no render can reach it: `repmgr` is accepted by
+       values.schema.json's enum only so pg.validateRemovedRepmgrdValues can reject it with
+       a message naming the migration. #288 had already narrowed it from `ha.enabled` to the
+       mechanism for the right reason -- these fragments load via conf.d's include_dir and
+       therefore OVERRIDE the entrypoint's own native gate, so a stray prepend would put
+       repmgr.so back on a cluster that has nothing to use it and, since #290 dropped the
+       package, could not start at all. With the mechanism axis gone the condition is simply
+       never true, so the line is removed rather than left to read as live protection.
+       A native release that still ASKS for repmgr is refused by
+       pg.validateNativePreloadRepmgr; that guard is the live one. */ -}}
 {{- define "pg.sharedPreloadLibraries" -}}
 {{- $libs := list -}}
 {{- $user := "" -}}
@@ -364,7 +368,6 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- $t := trim $l -}}
   {{- if and $t (not (has $t $libs)) -}}{{- $libs = append $libs $t -}}{{- end -}}
 {{- end -}}
-{{- if and .Values.ha.enabled (ne ((.Values.ha.agent).mechanism | default "native") "native") (not (has "repmgr" $libs)) -}}{{- $libs = prepend $libs "repmgr" -}}{{- end -}}
 {{- if and .Values.postgresql.audit.enabled (not (has "pgaudit" $libs)) -}}{{- $libs = append $libs "pgaudit" -}}{{- end -}}
 {{- join "," $libs -}}
 {{- end -}}
