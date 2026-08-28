@@ -128,18 +128,27 @@ fi
 # system_identifier -- and assertSameCluster (invariant 9) then refuses to rejoin any of them,
 # so pods sit Running-but-never-Ready holding bogus databases. Strictly worse than the
 # Init:CrashLoopBackOff it replaced.
+# bootstrap_initdb's body, captured ONCE for the greps below. Not `sed ... | grep -q` per
+# check (#298 review): with `pipefail`, `grep -q` exits on its first match while sed keeps
+# writing, so once the function outgrows the pipe buffer sed takes SIGPIPE and the pipeline
+# reports failure even though the pattern matched -- an assertion that inverts itself purely
+# because the function got longer. The body is ~15KB against a 64KB buffer today, so nothing
+# fails yet; a here-string takes the pipeline out of the picture entirely instead of relying
+# on that margin holding.
+_bi_body=$(sed -n '/^bootstrap_initdb() {/,/^}/p' "${ROOT}/entrypoint.sh")
+
 if [ "$(grep -c 'initdb -D' "${ROOT}/entrypoint.sh")" = "1" ]; then
   ok "#288: initdb has exactly one call site"
 else
   bad "#288: initdb has $(grep -c 'initdb -D' "${ROOT}/entrypoint.sh") call sites; it must live only in bootstrap_initdb"
 fi
-if sed -n '/^bootstrap_initdb() {/,/^}/p' "${ROOT}/entrypoint.sh" | grep -q 'initdb -D'; then
+if grep -q 'initdb -D' <<<"${_bi_body}"; then
   ok "#288: the initdb call site is inside bootstrap_initdb"
 else
   bad "#288: initdb is not inside bootstrap_initdb"
 fi
 # The function must refuse to touch a populated data directory, whichever caller invokes it.
-if sed -n '/^bootstrap_initdb() {/,/^}/p' "${ROOT}/entrypoint.sh" | grep -q 'if \[ -s "$PGDATA/PG_VERSION" \]'; then
+if grep -q 'if \[ -s "$PGDATA/PG_VERSION" \]' <<<"${_bi_body}"; then
   ok "#288: bootstrap_initdb no-ops on an existing data directory"
 else
   bad "#288: bootstrap_initdb would initdb over existing data"
@@ -187,7 +196,7 @@ fi
 # under native a non-holder's next tick would BootstrapClone from it, inheriting the legacy
 # `host all all 0.0.0.0/0 md5` pg_hba for the pod's whole life (nothing on the clone path
 # rewrites pg_hba) plus a postgresql.conf with no include_dir.
-if sed -n '/^bootstrap_initdb() {/,/^}/p' "${ROOT}/entrypoint.sh" | grep -q "listen_addresses=''"; then
+if grep -q "listen_addresses=''" <<<"${_bi_body}"; then
   ok "#288: the bootstrap postmaster listens on no TCP address"
 else
   bad "#288: the bootstrap postmaster is network-reachable during role creation"

@@ -135,7 +135,10 @@
 - A non-divergence `pg_rewind` failure that never clears no longer wedges a node out of the
   cluster: after three consecutive such failures against the same target, `rejoinOnto` escalates
   to the data-preserving re-clone. Fail-safe classification needs this backstop -- retry the
-  cheap thing a few times, then pay for the expensive one that always converges.
+  cheap thing a few times, then pay for the expensive one that always converges. The streak is
+  per-target and now also clears on a SUCCESSFUL rewind: without that, two failures followed by
+  a success left the counter armed, so the next unrelated blip against the same primary read as
+  the third consecutive failure and bought a full re-clone for a transient error.
 - **`standby.signal` is now written before the fallible steps of a follow.** A slot-create blip
   after a COMPLETED multi-hour clone left the directory in primary shape (the source's
   "in production" `pg_control`, no `standby.signal`), which the next tick read as a diverged

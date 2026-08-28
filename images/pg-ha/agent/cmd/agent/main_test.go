@@ -2867,3 +2867,108 @@ func TestActPromoteStillClearsTheFollowLatch(t *testing.T) {
 		t.Errorf("a primary-role action must clear the follow latch, got %q", a.followUpstream)
 	}
 }
+
+// rewindStubMech drives rejoinOnto's escalation branch: RejoinForceRewind returns the
+// scripted errors in order (nil once the script runs out), and ReclonePreserving only
+// records that it ran. A stub rather than Native-over-scriptedExec because what is under
+// test is the CALLER's consecutive-failure accounting, not pg_rewind's classification --
+// which native_test.go already covers against real pg_rewind output.
+type rewindStubMech struct {
+	rejoinErrs []error
+	rejoins    int
+	reclones   int
+}
+
+func (m *rewindStubMech) GenerateConfig(context.Context, mechanism.NodeIdentity, mechanism.ConfigOpts) error {
+	return nil
+}
+func (m *rewindStubMech) Promote(context.Context) error                { return nil }
+func (m *rewindStubMech) Follow(context.Context, mechanism.Conn) error { return nil }
+func (m *rewindStubMech) Clone(context.Context, mechanism.Conn) error  { return nil }
+func (m *rewindStubMech) ReclonePreserving(context.Context, mechanism.Conn) error {
+	m.reclones++
+	return nil
+}
+func (m *rewindStubMech) RejoinForceRewind(context.Context, mechanism.Conn) error {
+	i := m.rejoins
+	m.rejoins++
+	if i < len(m.rejoinErrs) {
+		return m.rejoinErrs[i]
+	}
+	return nil
+}
+
+// #298 review: a rewind that SUCCEEDS ends the non-divergence failure streak. Two failures
+// then a success left the counter at 2, so the next unrelated blip against the same primary
+// read as the third consecutive failure and bought a full ReclonePreserving -- the backstop
+// firing for a transient error, which is precisely what the fail-safe classification exists
+// to avoid. Six ticks here (fail, fail, ok, fail, fail, ok) must re-clone zero times.
+func TestRejoinRewindBackstopResetsAfterASuccess(t *testing.T) {
+	transient := errors.New("connection to server failed")
+	m := &rewindStubMech{rejoinErrs: []error{transient, transient, nil, transient, transient, nil}}
+	a := newFollowTestAgentWithPM(t, &scriptedExec{walRcv: ""}, &fakePostmaster{})
+	a.mech = m
+	for i, wantErr := range []bool{true, true, false, true, true, false} {
+		err := a.rejoinOnto(context.Background(), "pg-1")
+		if wantErr && err == nil {
+			t.Fatalf("tick %d: a failed rewind must surface an error", i)
+		}
+		if !wantErr && err != nil {
+			t.Fatalf("tick %d: rejoin: %v", i, err)
+		}
+	}
+	if m.reclones != 0 {
+		t.Fatalf("no streak reached %d consecutive failures, so nothing may re-clone; got %d re-clones", rewindFailureLimit, m.reclones)
+	}
+	if a.rewindFailures != 0 || a.rewindFailureTarget != "" {
+		t.Fatalf("a successful rewind must clear the streak, got %d against %q", a.rewindFailures, a.rewindFailureTarget)
+	}
+}
+
+// The backstop still fires when the failures really are consecutive: three in a row against
+// one target escalates to a data-preserving re-clone rather than retrying forever, and the
+// counter resets so the next stall starts a fresh streak.
+func TestRejoinRewindBackstopFiresOnThreeConsecutiveFailures(t *testing.T) {
+	transient := errors.New("pg_rewind: error: something permanent but not divergence")
+	m := &rewindStubMech{rejoinErrs: []error{transient, transient, transient}}
+	a := newFollowTestAgentWithPM(t, &scriptedExec{walRcv: ""}, &fakePostmaster{})
+	a.mech = m
+	for i := 0; i < 2; i++ {
+		if err := a.rejoinOnto(context.Background(), "pg-1"); err == nil {
+			t.Fatalf("tick %d: a failed rewind must surface an error", i)
+		}
+		if m.reclones != 0 {
+			t.Fatalf("tick %d: escalated before %d failures", i, rewindFailureLimit)
+		}
+	}
+	if err := a.rejoinOnto(context.Background(), "pg-1"); err != nil {
+		t.Fatalf("the escalating tick must recover, got %v", err)
+	}
+	if m.reclones != 1 {
+		t.Fatalf("the %dth consecutive failure must re-clone once, got %d", rewindFailureLimit, m.reclones)
+	}
+	if a.rewindFailures != 0 || a.rewindFailureTarget != "" {
+		t.Fatalf("escalating must clear the streak, got %d against %q", a.rewindFailures, a.rewindFailureTarget)
+	}
+}
+
+// A failure against a DIFFERENT target restarts the count: the streak is per-target, so a
+// leader change mid-stall must not let two unrelated primaries' failures add up to an
+// escalation neither of them earned.
+func TestRejoinRewindBackstopIsPerTarget(t *testing.T) {
+	transient := errors.New("connection to server failed")
+	m := &rewindStubMech{rejoinErrs: []error{transient, transient, transient, transient}}
+	a := newFollowTestAgentWithPM(t, &scriptedExec{walRcv: ""}, &fakePostmaster{})
+	a.mech = m
+	for _, target := range []string{"pg-1", "pg-1", "pg-2", "pg-2"} {
+		if err := a.rejoinOnto(context.Background(), target); err == nil {
+			t.Fatalf("target %s: a failed rewind must surface an error", target)
+		}
+	}
+	if m.reclones != 0 {
+		t.Fatalf("two failures against each of two targets must not escalate, got %d re-clones", m.reclones)
+	}
+	if a.rewindFailures != 2 || a.rewindFailureTarget != "pg-2" {
+		t.Fatalf("the streak must follow the latest target, got %d against %q", a.rewindFailures, a.rewindFailureTarget)
+	}
+}

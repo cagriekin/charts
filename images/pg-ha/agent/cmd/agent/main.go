@@ -2565,6 +2565,12 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 		// whatever restore the record beside it describes.
 		a.dropRestoreRecord("the data directory was re-cloned from " + target)
 	} else {
+		// A rewind that worked ends the streak (#298 review). Without this the counter only
+		// ever cleared on the escalation itself, so two failed attempts followed by a SUCCESS
+		// left it at 2: the next unrelated blip against the same primary counted as the third
+		// consecutive failure and bought a full ReclonePreserving for a single transient error.
+		// The backstop is for a refusal that is PERSISTENT, and a success proves it was not.
+		a.rewindFailures, a.rewindFailureTarget = 0, ""
 		// A successful pg_rewind ALSO rewrites this node's history onto the target's, so the
 		// restore record beside PGDATA no longer describes these contents (#288 review).
 		// Without this the claim outlived the data it described: after a controlled switchover
