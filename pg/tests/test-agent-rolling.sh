@@ -154,7 +154,10 @@ assert_conf_readable() { # name, pod
 
 if [[ "${post_ok}" != "true" ]]; then
   skip "#293: preload handling (did not settle post-restart)"
-elif [[ "$(chart_mechanism)" == "native" ]]; then
+else
+  # #298 review: was `elif chart_mechanism == native`, which is now always true (#294) -- the
+  # repmgr arm it guarded against no longer exists.
+  #
   # A native install never wrote the line, so plant one to stand in for a data directory
   # inherited from a 1.x cluster. `repmgr` alone, matching what the entrypoint actually wrote:
   # the whole assignment must then be dropped, so the restarted postmaster is asking for
@@ -188,12 +191,6 @@ elif [[ "$(chart_mechanism)" == "native" ]]; then
     sleep 5; s=$((s + 5))
   done
   assert_eq "#293 native: the standby still streams after the strip" "streaming" "${restream}"
-else
-  # The entrypoint wrote it at initdb, and the rolling restart above already ran every node
-  # through boot(). It must still be there.
-  assert_conf_readable "#293 repmgr mechanism: postgresql.conf is readable" "${STANDBY}"
-  kept=$(active_preload "${STANDBY}")
-  assert_contains "#293 repmgr mechanism: the preload is left untouched" "${kept}" "repmgr"
 fi
 
 # Cleanup.

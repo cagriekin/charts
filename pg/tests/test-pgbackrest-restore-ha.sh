@@ -297,21 +297,18 @@ for _ in $(seq 1 30); do
   sleep 4
 done
 assert_eq "standby is on the primary's post-restore timeline" "${tl_after}" "${standby_tl}"
-# repmgr's own view: one primary, one active standby -- no orphaned/duplicate rows after
-# the restore rewrote the primary's identity.
-if [ "$(chart_mechanism)" = "native" ]; then
-  # #288: a native cluster has no repmgr extension and no repmgr.nodes, so the same
-  # "one primary, one active standby, no orphans after the restore rewrote the primary's
-  # identity" property is asserted against the primary's own connection list instead.
-  streaming=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" "repmgr" "repmgr" 2>/dev/null | tr -d '[:space:]' || echo "")
-  assert_eq "#288: the restored primary sees exactly one streaming standby" "1" "${streaming}"
-  ext=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT count(*) FROM pg_extension WHERE extname='repmgr'" "repmgr" "repmgr" 2>/dev/null | tr -d '[:space:]' || echo "")
-  assert_eq "#288: the restored native cluster has no repmgr extension" "0" "${ext}"
-else
-  repmgr_rows=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT type, active FROM repmgr.nodes ORDER BY node_id" "repmgr" "repmgr" 2>/dev/null || echo "")
-  assert_contains "repmgr sees the restored primary" "${repmgr_rows}" "primary|t"
-  assert_contains "repmgr sees an active standby" "${repmgr_rows}" "standby|t"
-fi
+# One primary, one active standby -- no orphans or duplicates after the restore rewrote the
+# primary's identity.
+#
+# The `if native` gate is gone (#298 review): native is the only mechanism since #294, so the
+# else branch, which read the same property out of repmgr.nodes, could never run.
+# #288: a native cluster has no repmgr extension and no repmgr.nodes, so the same
+# "one primary, one active standby, no orphans after the restore rewrote the primary's
+# identity" property is asserted against the primary's own connection list instead.
+streaming=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" "repmgr" "repmgr" 2>/dev/null | tr -d '[:space:]' || echo "")
+assert_eq "#288: the restored primary sees exactly one streaming standby" "1" "${streaming}"
+ext=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT count(*) FROM pg_extension WHERE extname='repmgr'" "repmgr" "repmgr" 2>/dev/null | tr -d '[:space:]' || echo "")
+assert_eq "#288: the restored native cluster has no repmgr extension" "0" "${ext}"
 
 # --- new writes replicate: the cluster is functional, not just structurally present ---
 echo "  write test starts at $(date -u +%H:%M:%SZ) (primary=${PRIMARY} standby=${STANDBY})"
@@ -347,7 +344,7 @@ if [ "${replicated}" != "42" ]; then
   # the standby did not receive it. Dump both ends before the namespace is torn down, otherwise
   # a CI failure here is unactionable (the pods are gone by the time anyone looks).
   echo "  --- replication diagnostics (standby did not receive the write) ---"
-  echo "  primary=${PRIMARY} standby=${STANDBY} mechanism=$(chart_mechanism)"
+  echo "  primary=${PRIMARY} standby=${STANDBY}"
   echo "  primary pg_stat_replication:"
   pg_exec "${NAMESPACE}" "${PRIMARY}" \
     "SELECT application_name, state, sync_state, sent_lsn, write_lsn, replay_lsn FROM pg_stat_replication" \

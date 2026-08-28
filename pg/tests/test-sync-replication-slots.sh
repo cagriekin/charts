@@ -24,21 +24,15 @@ source "${SCRIPT_DIR}/helpers.sh"
 # feature worked. test-scaledown.sh and test-agent-rolling.sh already branch on
 # chart_mechanism; this suite was the one left stranded, and it is the suite that is supposed
 # to prove #308 works.
-MECH="$(chart_mechanism 2>/dev/null || echo repmgr)"
-if [ "${MECH}" = "native" ]; then
-  # The agent owns one slot per live standby pod, named by ORDINAL (#289).
-  SLOT_PREFIX="pg_ha_slot_"
-  slot_for_ordinal() { echo "pg_ha_slot_$1"; }
-  # Native writes its managed fragment, not postgresql.auto.conf (which holds only what
-  # ALTER SYSTEM put there -- e.g. synchronized_standby_slots itself).
-  CONNINFO_FILE="/var/lib/postgresql/data/pgdata/pg-ha-agent.conf"
-else
-  # repmgr names slots by node_id, which is nodeIDBase(1000) + ordinal.
-  SLOT_PREFIX="repmgr_slot_"
-  slot_for_ordinal() { echo "repmgr_slot_$((1000 + $1))"; }
-  CONNINFO_FILE="/var/lib/postgresql/data/pgdata/postgresql.auto.conf"
-fi
-echo "  mechanism=${MECH}: slots ${SLOT_PREFIX}*, primary_conninfo in ${CONNINFO_FILE}"
+# The mechanism fork is gone (#298 review): native is the only mechanism since #294, so the
+# repmgr half -- repmgr_slot_<1000+ordinal> in postgresql.auto.conf -- could never be selected.
+# The agent owns one slot per live standby pod, named by ORDINAL (#289), and writes its managed
+# fragment rather than postgresql.auto.conf (which holds only what ALTER SYSTEM put there --
+# e.g. synchronized_standby_slots itself).
+SLOT_PREFIX="pg_ha_slot_"
+slot_for_ordinal() { echo "pg_ha_slot_$1"; }
+CONNINFO_FILE="/var/lib/postgresql/data/pgdata/pg-ha-agent.conf"
+echo "  slots ${SLOT_PREFIX}*, primary_conninfo in ${CONNINFO_FILE}"
 
 NAMESPACE="${NAMESPACE:-pg-test-sync-slots}"
 RELEASE="${RELEASE:-pgsyncslots}"

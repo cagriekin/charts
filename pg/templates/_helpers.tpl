@@ -88,14 +88,19 @@ annotation consumers -- #128.)
 {{- end }}
 {{- end }}
 
-{{- /* repmgr image reference: repository:tag, with @digest appended when set so a
-       digest pin (supply-chain) overrides the mutable tag. */ -}}
-{{- define "pg.repmgrImage" -}}
+{{- /* HA image reference: repository:tag, with @digest appended when set so a digest pin
+       (supply-chain) overrides the mutable tag.
+       Named pg.haImage since #298's review; it was pg.repmgrImage, which had been a lie since
+       #290 renamed the image to cagriekin/pg-ha and #294 deleted repmgr from it -- the helper
+       resolves .Values.ha.image and always did. Renamed rather than left alone because this is
+       the one helper every workload's `image:` goes through, so a reader checking which image a
+       container runs met the wrong name first. Pure rename: the rendered output is unchanged. */ -}}
+{{- define "pg.haImage" -}}
 {{- printf "%s:%s" .Values.ha.image.repository .Values.ha.image.tag -}}
 {{- with .Values.ha.image.digest }}@{{ . }}{{- end -}}
 {{- end -}}
 
-{{- /* PG_MAJOR for every container that runs the repmgr image (#269). The image sets
+{{- /* PG_MAJOR for every container that runs the HA image (#269). The image sets
        this ENV itself from its build arg; declaring it here makes the CHART's claim
        authoritative instead, so a values file that asks for a major the image does not
        bundle fails loudly -- the entrypoint's require_pg_bindir and the agent's boot
@@ -373,7 +378,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end -}}
 
 {{- /* #219: validate postgresql.audit. Guards: (g1) audit requires repmgr mode -- the
-       cagriekin/repmgr image bundles pgaudit; standalone uses the stock postgres image
+       cagriekin/pg-ha image bundles pgaudit; standalone uses the stock postgres image
        (no pgaudit) and a bare shared_preload_libraries=pgaudit would crash-loop the
        postmaster. (g2) log must be non-empty and every class in the allowlist (negatable
        with a leading -). (g3) role, if set, must be a valid identifier. Class + role
@@ -442,7 +447,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        needed for the standard multi-arch option syntax, e.g. `[arch=amd64,arm64]`).
        name is rendered as `pgchart-<name>-keyring.gpg` / `pgchart-<name>.list`, not the
        bare name, so it can never collide with a source the image itself already owns
-       (the repmgr image's own PGDG source is postgresql-keyring.gpg/postgresql.list,
+       (the HA image's own PGDG source is postgresql-keyring.gpg/postgresql.list,
        images/pg-ha/Dockerfile) -- duplicate *entries* within aptSources itself still
        fail, since that's always a typo, never intentional. Pointless (and therefore
        rejected) without postgresql.extensions.packages: aptSources' only consumer is
@@ -494,7 +499,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
       {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine: %q sets an apt option that weakens or disables signature verification (trusted=/allow-insecure=/allow-weak=/allow-downgrade-to-insecure=) -- this makes the curl/gpg key-verification step above decorative and installs unsigned or weakly-signed packages as root; sign the source properly with signed-by= instead" $name $substituted) -}}
     {{- end -}}
     {{- /* #320: a PGDG source here is always fatal, and the failure gives no hint why.
-           Both postgres:*-trixie and the repmgr image already configure
+           Both postgres:*-trixie and the HA image already configure
            apt.postgresql.org under their OWN keyring path, and this chart derives its
            keyring path from the entry name (pgchart-<name>-keyring.gpg) with no way to
            override it -- so apt sees two entries for the same repo with different
@@ -518,7 +523,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
            does not carry that suite at all. The dist is the token after the URL; require it
            to END in -pgdg. */ -}}
     {{- if regexMatch "(?i)://([^/ ]*@)?apt\\.postgresql\\.org([:/][^ ]*)? +[a-z0-9.]+-pgdg( |$)" $substituted -}}
-      {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine points at apt.postgresql.org (%q). Remove this entry: both the repmgr image and postgres:*-trixie already configure PGDG under their own keyring path, and adding a second entry for the same repo under this chart's keyring path makes apt reject the whole source list (\"E: Conflicting values set for option Signed-By regarding source http://apt.postgresql.org/pub/repos/apt/ ...\"), so the install fails before it starts. PGDG packages in postgresql.extensions.packages resolve from the image's own configuration -- aptSources is only for sources the images do NOT ship, e.g. repo.pigsty.io" $name $substituted) -}}
+      {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine points at apt.postgresql.org (%q). Remove this entry: both the HA image and postgres:*-trixie already configure PGDG under their own keyring path, and adding a second entry for the same repo under this chart's keyring path makes apt reject the whole source list (\"E: Conflicting values set for option Signed-By regarding source http://apt.postgresql.org/pub/repos/apt/ ...\"), so the install fails before it starts. PGDG packages in postgresql.extensions.packages resolve from the image's own configuration -- aptSources is only for sources the images do NOT ship, e.g. repo.pigsty.io" $name $substituted) -}}
     {{- end -}}
     {{- $expectSignedBy := printf "signed-by=/usr/share/keyrings/pgchart-%s-keyring.gpg" $name -}}
     {{- if not (contains $expectSignedBy $substituted) -}}
@@ -543,7 +548,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        search order, and confirmed-empirically neither carries a RUNPATH/RPATH, so
        without both halves of this fix the copied dependency is simply never found.
        Explicit and values-driven, not an automatic `ldd`-and-copy-everything walk:
-       copy-base-ext (repmgr image) and copy-ext (postgresql.image) can be different
+       copy-base-ext (HA image) and copy-ext (postgresql.image) can be different
        image builds, so blindly copying a resolved dependency's transitive closure risks
        silently shadowing the RUNNING container's own libc/libstdc++/etc. with a build
        from the OTHER image -- an ABI hazard, not a convenience. The denylist below
@@ -554,7 +559,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        unvalidated *.so* glob copy, which this validator has no visibility into.
 
        Denylist is `ldd /usr/lib/postgresql/<major>/bin/postgres` (verified live against
-       the debian:trixie-based postgres/repmgr images this chart ships by default) plus
+       the debian:trixie-based postgres/pg-ha images this chart ships by default) plus
        libpq (the dependency of libpqwalreceiver.so, the exact #302 ABI hazard) -- i.e.
        the full set of libraries the postmaster itself resolves, not just the historical
        libc family (review: an earlier, narrower list missed libzstd/liblz4/libxml2/
@@ -622,7 +627,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        itself -- a strict superset of the old match, so safe unconditionally -- but is
        NOT what makes a multiarch-path dependency like libsodium.so.23 work; extraLibs
        (above) plus LD_LIBRARY_PATH is. noClobber selects copy-ext's `cp -n` (#302): it
-       must never overwrite a lib copy-base-ext already placed from the repmgr image.
+       must never overwrite a lib copy-base-ext already placed from the HA image.
        curl is pinned to https (review): keyUrl's own character allowlist already
        forces the scheme, but -L would otherwise still follow a same-origin
        https->http redirect and silently fetch the key in plaintext. */ -}}

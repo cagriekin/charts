@@ -1,3 +1,8 @@
+# HA-mode counterpart to values-config.yaml (which is standalone): the postgresql.configuration
+# / pgHba / postStart surface rendered with ha.enabled, where the agent owns pg_hba and the
+# conf.d include. Named values-config-repmgr.yaml until #298's review -- the chart has had no
+# repmgr mechanism since #294, and a fixture whose name claims one sends a reader looking for a
+# mode that does not exist.
 postgresql:
   image:
     repository: postgres

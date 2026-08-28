@@ -77,9 +77,9 @@ template:
       {{- toYaml .Values.postgresql.podSecurityContext | nindent 6 }}
     containers:
       - name: pgbackrest-restore
-        # The repmgr image ships pgbackrest and the matching PostgreSQL major, so the
+        # The HA image ships pgbackrest and the matching PostgreSQL major, so the
         # restore runs under the same binaries that wrote the backup.
-        image: "{{ include "pg.repmgrImage" . }}"
+        image: "{{ include "pg.haImage" . }}"
         imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
         securityContext:
           {{- toYaml .Values.postgresql.containerSecurityContext | nindent 10 }}

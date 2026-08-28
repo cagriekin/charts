@@ -269,7 +269,7 @@
 {{- end }}
 {{- /* Every value interpolated into a CEL string literal below, checked at render time for
        characters that would break the expression or turn it into a tautology. */}}
-{{- $literals := list (list "the release namespace" .Release.Namespace) (list "the release fullname" $fullname) (list "ha.image (pg.repmgrImage)" (include "pg.repmgrImage" .)) }}
+{{- $literals := list (list "the release namespace" .Release.Namespace) (list "the release fullname" $fullname) (list "ha.image (pg.haImage)" (include "pg.haImage" .)) }}
 {{- range $k, $v := $podLabels }}
 {{- $literals = append $literals (list (printf "the restore pod label %s" $k) $v) }}
 {{- end }}
@@ -418,8 +418,8 @@ spec:
     - expression: "size(variables.pod.containers) == 1 && (!has(variables.pod.initContainers) || size(variables.pod.initContainers) == 0) && (!has(variables.pod.ephemeralContainers) || size(variables.pod.ephemeralContainers) == 0)"
       message: "the pg agent's Jobs must have exactly one container and no init or ephemeral containers"
       reason: Forbidden
-    - expression: "variables.pod.containers.all(c, c.image == '{{ include "pg.repmgrImage" . }}')"
-      message: "the pg agent's Jobs may only run this release's repmgr image ({{ include "pg.repmgrImage" . }})"
+    - expression: "variables.pod.containers.all(c, c.image == '{{ include "pg.haImage" . }}')"
+      message: "the pg agent's Jobs may only run this release's HA image ({{ include "pg.haImage" . }})"
       reason: Forbidden
     # 10. The command, pinned to the release's own restore entrypoint (pg.restoreCommandJSON,
     #    the same definition the jobTemplate renders, converted to CEL quoting). The image

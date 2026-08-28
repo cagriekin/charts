@@ -220,7 +220,7 @@ assert_contains "VAP: hostNetwork is denied" \
 assert_contains "VAP: hostPID is denied" \
   "$(admit '.spec.template.spec.hostPID=true')" "hostNetwork, hostPID, hostIPC"
 assert_contains "VAP: another image is denied" \
-  "$(admit '.spec.template.spec.containers[0].image="attacker/img:1"')" "may only run this release's repmgr image"
+  "$(admit '.spec.template.spec.containers[0].image="attacker/img:1"')" "may only run this release's HA image"
 assert_contains "VAP: a second container is denied" \
   "$(admit '.spec.template.spec.containers += [{"name":"x","image":"busybox"}]')" "exactly one container"
 assert_contains "VAP: an init container is denied" \

@@ -56,7 +56,7 @@ spec:
           # from S3 and runs a local PostgreSQL), so its token is not mounted.
           serviceAccountName: {{ include "pg.fullname" . }}-repmgr
           automountServiceAccountToken: false
-          # Runs pgbackrest restore + a throwaway postgres from the repmgr image, whose
+          # Runs pgbackrest restore + a throwaway postgres from the HA image, whose
           # postgres user is uid 101 -- so reuse the postgresql pods' security contexts
           # (uid 101, gid 103, fsGroup 103) rather than the official-image uid 999 the
           # pg_dump validation uses. The image ships the matching PG major, so the
@@ -65,7 +65,7 @@ spec:
             {{- toYaml .Values.postgresql.podSecurityContext | nindent 12 }}
           containers:
             - name: pgbackrest-validation
-              image: "{{ include "pg.repmgrImage" . }}"
+              image: "{{ include "pg.haImage" . }}"
               imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
               securityContext:
                 {{- toYaml .Values.postgresql.containerSecurityContext | nindent 16 }}

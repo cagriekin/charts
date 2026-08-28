@@ -102,11 +102,9 @@ assert_eq "all 3 nodes in the topology before scale-down (incl. ordinal 2)" "1" 
 # post-scale assertions can tell "reclaimed" apart from "never there".
 PRE_PRIMARY="${P:-$(find_primary 2)}"
 PRE_SLOT2=""
-if [ "$(chart_mechanism)" = "native" ]; then
-  PRE_SLOT2=$(pg_exec "${NAMESPACE}" "${PRE_PRIMARY}" \
-    "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
-  echo "  pre-scale: primary=${PRE_PRIMARY} pg_ha_slot_2_present=${PRE_SLOT2:-?}"
-fi
+PRE_SLOT2=$(pg_exec "${NAMESPACE}" "${PRE_PRIMARY}" \
+  "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
+echo "  pre-scale: primary=${PRE_PRIMARY} pg_ha_slot_2_present=${PRE_SLOT2:-?}"
 
 # Scale down to 2 instances (replicaCount=1 -> ordinals 0,1). The StatefulSet trims the
 # top ordinal, so pod-2 (a standby) is removed; its repmgr.nodes row (node_id 1002) is
@@ -170,59 +168,59 @@ assert_eq "a primary still serves after scale-down + cleanup" "t" "${serves}"
 # the same resource -- and, worse, its orphan rule would start dropping repmgr's slots.
 agent_slots=$(pg_exec "${NAMESPACE}" "${P}" \
   "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
-if [ "$(chart_mechanism)" = "native" ]; then
-  # Wait on the RECLAIM, not on the stream stopping (#288 review). in_topology going to 0 under
-  # native only means pod-2's row left pg_stat_replication, which happens the instant its stream
-  # drops -- seconds before the primary's next slotsTick observes the shrunken live pod set and
-  # drops pg_ha_slot_2. Reading the slot counts straight after that loop raced the tick. Under
-  # repmgr the equivalent wait was on repmgr.nodes, i.e. on the primary tick itself having run.
-  # Only assert the reclaim when there was something to reclaim. An honest SKIP beats a green
-  # assertion that never exercised the code path (#288 review).
-  # skip() only records a skip, it does not return (helpers.sh), so the wait below has to be
-  # inside the branch rather than after it (#288 review): with nothing to reclaim, "wait until
-  # pg_ha_slot_2 is gone" is satisfied on its first poll and reports a reclaim that never
-  # happened.
-  if [ "${PRE_SLOT2}" = "1" ]; then
-    echo "  Waiting for the primary to reclaim pg_ha_slot_2 (up to 120s)..."
-    reclaimed=0; elapsed=0
-    while [[ ${elapsed} -lt 120 ]]; do
-      left=$(pg_exec "${NAMESPACE}" "${P}" \
-        "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
-      if [[ "${left}" == "0" ]]; then reclaimed=1; break; fi
-      sleep 5; elapsed=$((elapsed + 5))
-    done
-    assert_eq "#289/#288: the primary reclaimed the departed ordinal's slot" "1" "${reclaimed}"
-  else
-    skip "#289/#288: slot reclaim not exercised (pg_ha_slot_2 was absent pre-scale; primary was ${PRE_PRIMARY}, so the trimmed ordinal owned no slot on it)"
-  fi
-  # The assertions below stand in BOTH cases: they are about the surviving cluster's steady
-  # state, not about the reclaim, and the "live ordinal N still in the topology" assertions
-  # above already waited for the survivor to be streaming -- which under native cannot happen
-  # without its slot existing on the primary (primary_slot_name is part of primary_conninfo).
-  agent_slots=$(pg_exec "${NAMESPACE}" "${P}" \
-    "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
-  # #288: the assertion inverts. Native owns its slots, so after scaling 3 -> 2 there must be
-  # exactly one agent-minted slot -- ordinal 1, the surviving peer. The primary does not stream
-  # from itself, and ordinal 2 is gone.
-  assert_eq "#289/#288: native leaves exactly one agent slot for the surviving standby" "1" "${agent_slots}"
-  ghost_agent=$(pg_exec "${NAMESPACE}" "${P}" \
-    "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
-  assert_eq "#289/#288: no agent slot left pinning WAL for the scaled-away ordinal 2" "0" "${ghost_agent}"
-  # #288's own acceptance line: a native cluster carries no repmgr metadata at all, so there is
-  # no stale cache for anything to fall back to by accident.
-  ext=$(pg_exec "${NAMESPACE}" "${P}" \
-    "SELECT count(*) FROM pg_extension WHERE extname='repmgr'" repmgr repmgr 2>/dev/null | xargs || echo "")
-  assert_eq "#288: a native cluster has no repmgr extension" "0" "${ext}"
-  nodes_rel=$(pg_exec "${NAMESPACE}" "${P}" \
-    "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='repmgr' AND c.relname='nodes'" repmgr repmgr 2>/dev/null | xargs || echo "")
-  assert_eq "#288: a native cluster has no repmgr.nodes relation" "0" "${nodes_rel}"
-  # And the topology the agent publishes must agree with the surviving pod set.
-  streaming=$(pg_exec "${NAMESPACE}" "${P}" \
-    "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" repmgr repmgr 2>/dev/null | xargs || echo "")
-  assert_eq "#288: the primary sees exactly one streaming standby after the scale-down" "1" "${streaming}"
+# The `if native` gate is gone (#298 review): native is the only mechanism since #294, so the
+# branch always took this side and the `else` asserted a repmgr-mode property against a cluster
+# that has no repmgr.nodes to assert it about.
+#
+# Wait on the RECLAIM, not on the stream stopping (#288 review). in_topology going to 0 under
+# native only means pod-2's row left pg_stat_replication, which happens the instant its stream
+# drops -- seconds before the primary's next slotsTick observes the shrunken live pod set and
+# drops pg_ha_slot_2. Reading the slot counts straight after that loop raced the tick. Under
+# repmgr the equivalent wait was on repmgr.nodes, i.e. on the primary tick itself having run.
+# Only assert the reclaim when there was something to reclaim. An honest SKIP beats a green
+# assertion that never exercised the code path (#288 review).
+# skip() only records a skip, it does not return (helpers.sh), so the wait below has to be
+# inside the branch rather than after it (#288 review): with nothing to reclaim, "wait until
+# pg_ha_slot_2 is gone" is satisfied on its first poll and reports a reclaim that never
+# happened.
+if [ "${PRE_SLOT2}" = "1" ]; then
+  echo "  Waiting for the primary to reclaim pg_ha_slot_2 (up to 120s)..."
+  reclaimed=0; elapsed=0
+  while [[ ${elapsed} -lt 120 ]]; do
+    left=$(pg_exec "${NAMESPACE}" "${P}" \
+      "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
+    if [[ "${left}" == "0" ]]; then reclaimed=1; break; fi
+    sleep 5; elapsed=$((elapsed + 5))
+  done
+  assert_eq "#289/#288: the primary reclaimed the departed ordinal's slot" "1" "${reclaimed}"
 else
-  assert_eq "#289: the agent creates no slots under the repmgr mechanism (repmgr owns them)" "0" "${agent_slots}"
+  skip "#289/#288: slot reclaim not exercised (pg_ha_slot_2 was absent pre-scale; primary was ${PRE_PRIMARY}, so the trimmed ordinal owned no slot on it)"
 fi
+# The assertions below stand in BOTH cases: they are about the surviving cluster's steady
+# state, not about the reclaim, and the "live ordinal N still in the topology" assertions
+# above already waited for the survivor to be streaming -- which under native cannot happen
+# without its slot existing on the primary (primary_slot_name is part of primary_conninfo).
+agent_slots=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
+# #288: the assertion inverts. Native owns its slots, so after scaling 3 -> 2 there must be
+# exactly one agent-minted slot -- ordinal 1, the surviving peer. The primary does not stream
+# from itself, and ordinal 2 is gone.
+assert_eq "#289/#288: native leaves exactly one agent slot for the surviving standby" "1" "${agent_slots}"
+ghost_agent=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
+assert_eq "#289/#288: no agent slot left pinning WAL for the scaled-away ordinal 2" "0" "${ghost_agent}"
+# #288's own acceptance line: a native cluster carries no repmgr metadata at all, so there is
+# no stale cache for anything to fall back to by accident.
+ext=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_extension WHERE extname='repmgr'" repmgr repmgr 2>/dev/null | xargs || echo "")
+assert_eq "#288: a native cluster has no repmgr extension" "0" "${ext}"
+nodes_rel=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='repmgr' AND c.relname='nodes'" repmgr repmgr 2>/dev/null | xargs || echo "")
+assert_eq "#288: a native cluster has no repmgr.nodes relation" "0" "${nodes_rel}"
+# And the topology the agent publishes must agree with the surviving pod set.
+streaming=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" repmgr repmgr 2>/dev/null | xargs || echo "")
+assert_eq "#288: the primary sees exactly one streaming standby after the scale-down" "1" "${streaming}"
 
 # No physical slot may be left pinning WAL for a pod that no longer exists. Under repmgr mode
 # repmgr names them repmgr_slot_<node_id>, so the scaled-away node 1002's slot is the one to

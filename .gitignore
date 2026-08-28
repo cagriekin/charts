@@ -5,3 +5,8 @@ values-full.yaml
 # helm-unittest auto-creates an (empty) snapshot dir per chart even when no suite uses
 # matchSnapshot; the committed suites assert on parsed paths, so these are artifacts.
 **/tests/unit/__snapshot__/
+
+# Handoff files between test-agent.sh and test-agent-failover.sh (#298 review). Cleaned up by
+# the failover suite, but left behind whenever it fails midway -- and they were committable.
+pg/tests/.agent_primary
+pg/tests/.agent_standby

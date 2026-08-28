@@ -44,7 +44,6 @@
   failed with "got: 1 2" on a healthy cluster where the lagging node read checkpoint_tli=2 while
   received_tli=4 and the primary listed it as streaming.
 
-
   Two assertions were vacuous in the case that mattered. The legacy-slot check ("no orphan
   pinning WAL") queried only the POST-migration primary -- but legacy `repmgr_slot_*` only ever
   existed on the 1.x primary, and the roll moves the lease, so it ran on a node that never had
@@ -102,8 +101,17 @@
 
 ### Fixed
 
-### Testing
-
+- **`initdb` no longer requests md5 (#298 review).** `--auth-host=md5` does two things: it writes
+  the method into initdb's own `pg_hba` (which the entrypoint overwrites, so that half was moot)
+  **and** it sets `password_encryption` in `postgresql.conf` -- which decides how every password
+  stored on the cluster afterwards is hashed: an operator's `CREATE USER`, the databases-roles
+  hook Job's roles, any later `ALTER USER ... PASSWORD`. A brand-new 2.0.0 cluster therefore
+  defaulted to a hash deprecated since PostgreSQL 10, and the chart's own md5→scram migration
+  existed to undo a default this line had just chosen. Now `--auth-host=scram-sha-256`. Safe by
+  construction: `bootstrap_initdb` only runs against an EMPTY data directory, so no existing
+  md5-hashed role is stranded, and 1.x clusters keep their roles and their migration path
+  (the agent's re-hash is unaffected). The managed users' explicit per-statement
+  `password_encryption` is kept as belt-and-braces, no longer as compensation for the default.
 - **`postgresql.pgHba` was a silent no-op in standalone mode (#298 review).** The postStart hook
   inserted each entry with `sed -i '/host all all all scram-sha-256/i ...'`, and no `pg_hba.conf`
   this chart produces has ever contained that line -- the entrypoint writes column-aligned rules
@@ -118,68 +126,6 @@
   which is true whether or not the insert can ever fire, and a comment in the suite claimed that
   case covered the insert. It is now checked behaviourally -- the awk program is run against the
   real bootstrap `pg_hba.conf` and the rule's position is asserted.
-- **Both render gates only ever checked each chart's DEFAULT render (#298 review).** kubeconform
-  validated 9 resources for `pg`; kube-linter has no values flag at all, so directory mode could
-  not see anything else. Every optional component was therefore unchecked by both: pgpool, the
-  metrics exporter, pgBackRest's five containers, TLS, the etcd DCS, the restore workload, the
-  hook Jobs. That is the wrong half to skip -- a violation in a default-on object is caught by a
-  dozen other things, one in an optional object ships. Both gates now enumerate each chart's own
-  `tests/values-*.yaml` fixtures and render every one (44 profiles across the five charts, ~13s).
-  It also validates at **two** Kubernetes versions, because the documented minimum cannot
-  validate kinds that did not exist yet: `ValidatingAdmissionPolicy` and its Binding -- the
-  admission control guarding the destructive restore Job, the single most security-relevant
-  object these charts emit -- were being SKIPPED at 1.29 with the skip invisible, since
-  `-ignore-missing-schemas` treats an unknown core kind exactly like an uncataloged CRD. At 1.30
-  both validate. Skips are now always reported by kind, so an unvalidated resource can never be
-  silent again.
-  Widening it immediately found two real policy violations, both fixed here:
-  - the **etcd `rbac-bootstrap` Job** was missing the one-shot probe waiver that every sibling
-    hook Job in `pg/templates` already carried. It only renders under `dcs.backend: etcd`, so the
-    gate had never seen it. (etcd subchart `0.1.6` → `0.1.7`, re-vendored into both consumers.)
-  - the **idle `pgbackrest` sidecar** had no probes and no waiver. The waiver added for it is
-    gated on `pgbackrest.enabled` rather than unconditional, because kube-linter waives per
-    OBJECT: an unconditional annotation would also stop the gate noticing if the `postgresql`
-    container ever lost its own probes. Verified in both directions -- the default render carries
-    no waiver and still catches missing `postgresql` probes.
-  A profile that renders nothing now fails both gates, and a fixture that is deliberately a
-  *layer* over another declares its base in `fixture_base()` rather than being silently skipped.
-- **The policy gate could report a clean pass while linting nothing (#298 review).**
-  `kube-linter lint <chart-dir>` renders the chart itself, and when that yields no objects it
-  prints `Warning: no valid objects found.` and exits **zero** -- so a chart that stops rendering
-  for kube-linter reports a clean policy gate while examining not one container. Found by
-  building a throwaway chart whose container had no resources and no probes: it passed the gate,
-  while the same manifest piped to `kube-linter lint -` produced all four violations. Both gates
-  now fail when they examined nothing (kubeconform's equivalent is a `0 resources found`
-  summary). Verified in both directions: a real chart with its resources removed is caught and
-  reported as `FAILED (1 of 5 charts)`.
-- **The gate scripts now fail fast on a missing tool, and always print a verdict line.** A
-  missing `kube-linter`/`kubeconform` produced one `command not found` per chart and exit 1 --
-  correct, but at a glance indistinguishable from real violations. They now stop immediately with
-  an install hint and exit 127. Each gate also ends with a single `=== <gate>: OK|FAILED ===`
-  line, because the exit status is the only unambiguous signal and it is the easiest thing for a
-  caller to discard: piping a gate through `tail` and reading `$?` reports *tail's* status, which
-  is how these gates were once reported as passing when they had not run at all. Shared helpers
-  live in `scripts/lib.sh`.
-- **An empty helm-unittest run is now a failure.** `scripts/helm-unittest-charts.sh` printed
-  "No tests/unit/*_test.yaml suites found" to stderr and exited 0. A gate whose job is to run
-  tests must not pass loudest at the moment it has stopped testing anything.
-
-- **The `failoverMode: repmgrd` → 2.0.0 upgrade now has a KinD suite (#298 review).** It was the
-  only 2.0.0 path that recreates a live StatefulSet, the one every remaining repmgrd consumer
-  must follow, and the only one that can lose a cluster if it goes wrong -- and nothing tested
-  it. `test-migrate-native.sh` covers agent(1.x) → agent(2.0.0) and says so in its own comments,
-  so the gap read as covered from the suite list alone. `pg/tests/test-migrate-repmgrd.sh`
-  installs the released 1.17.0 chart with `failoverMode: repmgrd` and an older published image
-  (both sidecars, `OrderedReady`), then walks the documented runbook and asserts what no data
-  check can: the orphaned pods are **adopted** by the recreated StatefulSet rather than rebuilt
-  (pod UIDs across the recreate), the PVCs keep their identity, the database keeps serving during
-  the orphan window, `podManagementPolicy` flips to `Parallel`, both sidecars go, the Lease
-  appears and its holder is the primary, no node was re-cloned or re-initdb'd, and lease-based
-  failover then works on the migrated cluster with the ex-primary rejoining. It also asserts the
-  runbook's first step is enforced -- all five removed keys refuse to render -- before touching
-  anything, so an operator who skips it finds out with their cluster intact. 46 assertions;
-  wired into the `pg-test` matrix with the same 50-minute no-retry budget as `migrate-native`.
-
 - **README triage: removed the prose describing repmgr as a live mode (#298 review).** #294
   deleted the mechanism but left the documentation describing it, and the README is the authority
   on values for a published chart. Three claims were not merely stale but wrong: the extensions
@@ -196,14 +142,6 @@
   deliberately -- the `repmgr` role, database and `repmgr-password` Secret key keep their names
   (renaming them rewrites live clusters), as do the `repmgr-init` init container and the
   `-repmgr` ServiceAccount, and the migration and frozen-image compatibility notes are correct.
-- **`config` and `special-chars` suites now run in CI (#298 review).** Both existed in
-  `pg/Makefile` and in no matrix leg, so they only ran when someone remembered. `special-chars`
-  is the pointed one: it covers identifiers and passwords with characters that break SQL, which
-  is exactly the class of defect #298 found in `bootstrap_initdb`.
-- **Two KinD readiness checks could pass while PostgreSQL was failing (#298 review).**
-  `test-upgrade.sh` and `test-agent-failover.sh` read `containerStatuses[0].ready`, and index 0
-  is not guaranteed to be the `postgresql` container -- a sidecar with no readiness probe
-  reports `ready=true`. Both now select the container by name.
 - **`appVersion` no longer claims a PostgreSQL minor the chart cannot guarantee.** `pg` pinned
   `"18.1"` while the HA image tag floats with upstream, the same reason `pgvector` was relaxed
   to `"18"` in #164. The `postgresql.image.tag` default is unchanged.
@@ -341,6 +279,99 @@
   And that whole validator is now HA-only, matching its siblings: standalone renders no agent, so
   a leftover `ha.agent.*` timing there -- a bare int from a 1.x file, say -- no longer blocks the
   install.
+
+### Changed
+
+- **`pg.repmgrImage` is now `pg.haImage`.** The helper resolves `.Values.ha.image` and always
+  did; the name had been a lie since #290 renamed the image to `cagriekin/pg-ha` and #294 deleted
+  repmgr from it. It is the helper every workload's `image:` goes through, so a reader checking
+  which image a container runs met the wrong name first. Renamed across all 10 call sites, along
+  with ~35 comments and two operator-facing messages that still said "the repmgr image" --
+  including the major-mismatch `fail`, which told operators the server "runs from the repmgr
+  image". Renders are byte-identical apart from one intended admission-policy message.
+- **Test-suite cleanup: the inert mechanism branches are gone.** `chart_mechanism()` always
+  answered `native` after #294, so five suites carried `if native` gates whose `else` arms
+  asserted repmgr-mode properties (`repmgr.nodes` rows) against clusters that have no such table
+  -- unreachable code that read as coverage. The gates, the dead arms and the helper itself are
+  deleted. `values-config-repmgr.yaml` is now `values-config-ha.yaml` for the same reason.
+- **pgvector's unit suite no longer carries same-named copies of pg's.** `guards_test.yaml` there
+  held a reworded subset of pg's cases (24 of 76) under pg's filename: it read as a mirror while
+  being free to drift, and nothing checked. pg and pgvector templates are byte-identical by gate
+  and pgvector's are symlinks into pg's, so pg's suite already covers the shared template logic;
+  what belongs in pgvector is chart-specific. The two files are renamed `pgvector_*`, and
+  `scripts/helm-unittest-charts.sh` now REFUSES a pgvector unit file that shares a name with a pg
+  one without being a symlink to it.
+
+### Testing
+
+- **Both render gates only ever checked each chart's DEFAULT render (#298 review).** kubeconform
+  validated 9 resources for `pg`; kube-linter has no values flag at all, so directory mode could
+  not see anything else. Every optional component was therefore unchecked by both: pgpool, the
+  metrics exporter, pgBackRest's five containers, TLS, the etcd DCS, the restore workload, the
+  hook Jobs. That is the wrong half to skip -- a violation in a default-on object is caught by a
+  dozen other things, one in an optional object ships. Both gates now enumerate each chart's own
+  `tests/values-*.yaml` fixtures and render every one (44 profiles across the five charts, ~13s).
+  It also validates at **two** Kubernetes versions, because the documented minimum cannot
+  validate kinds that did not exist yet: `ValidatingAdmissionPolicy` and its Binding -- the
+  admission control guarding the destructive restore Job, the single most security-relevant
+  object these charts emit -- were being SKIPPED at 1.29 with the skip invisible, since
+  `-ignore-missing-schemas` treats an unknown core kind exactly like an uncataloged CRD. At 1.30
+  both validate. Skips are now always reported by kind, so an unvalidated resource can never be
+  silent again.
+  Widening it immediately found two real policy violations, both fixed here:
+  - the **etcd `rbac-bootstrap` Job** was missing the one-shot probe waiver that every sibling
+    hook Job in `pg/templates` already carried. It only renders under `dcs.backend: etcd`, so the
+    gate had never seen it. (etcd subchart `0.1.6` → `0.1.7`, re-vendored into both consumers.)
+  - the **idle `pgbackrest` sidecar** had no probes and no waiver. The waiver added for it is
+    gated on `pgbackrest.enabled` rather than unconditional, because kube-linter waives per
+    OBJECT: an unconditional annotation would also stop the gate noticing if the `postgresql`
+    container ever lost its own probes. Verified in both directions -- the default render carries
+    no waiver and still catches missing `postgresql` probes.
+  A profile that renders nothing now fails both gates, and a fixture that is deliberately a
+  *layer* over another declares its base in `fixture_base()` rather than being silently skipped.
+- **The policy gate could report a clean pass while linting nothing (#298 review).**
+  `kube-linter lint <chart-dir>` renders the chart itself, and when that yields no objects it
+  prints `Warning: no valid objects found.` and exits **zero** -- so a chart that stops rendering
+  for kube-linter reports a clean policy gate while examining not one container. Found by
+  building a throwaway chart whose container had no resources and no probes: it passed the gate,
+  while the same manifest piped to `kube-linter lint -` produced all four violations. Both gates
+  now fail when they examined nothing (kubeconform's equivalent is a `0 resources found`
+  summary). Verified in both directions: a real chart with its resources removed is caught and
+  reported as `FAILED (1 of 5 charts)`.
+- **The gate scripts now fail fast on a missing tool, and always print a verdict line.** A
+  missing `kube-linter`/`kubeconform` produced one `command not found` per chart and exit 1 --
+  correct, but at a glance indistinguishable from real violations. They now stop immediately with
+  an install hint and exit 127. Each gate also ends with a single `=== <gate>: OK|FAILED ===`
+  line, because the exit status is the only unambiguous signal and it is the easiest thing for a
+  caller to discard: piping a gate through `tail` and reading `$?` reports *tail's* status, which
+  is how these gates were once reported as passing when they had not run at all. Shared helpers
+  live in `scripts/lib.sh`.
+- **An empty helm-unittest run is now a failure.** `scripts/helm-unittest-charts.sh` printed
+  "No tests/unit/*_test.yaml suites found" to stderr and exited 0. A gate whose job is to run
+  tests must not pass loudest at the moment it has stopped testing anything.
+- **The `failoverMode: repmgrd` → 2.0.0 upgrade now has a KinD suite (#298 review).** It was the
+  only 2.0.0 path that recreates a live StatefulSet, the one every remaining repmgrd consumer
+  must follow, and the only one that can lose a cluster if it goes wrong -- and nothing tested
+  it. `test-migrate-native.sh` covers agent(1.x) → agent(2.0.0) and says so in its own comments,
+  so the gap read as covered from the suite list alone. `pg/tests/test-migrate-repmgrd.sh`
+  installs the released 1.17.0 chart with `failoverMode: repmgrd` and an older published image
+  (both sidecars, `OrderedReady`), then walks the documented runbook and asserts what no data
+  check can: the orphaned pods are **adopted** by the recreated StatefulSet rather than rebuilt
+  (pod UIDs across the recreate), the PVCs keep their identity, the database keeps serving during
+  the orphan window, `podManagementPolicy` flips to `Parallel`, both sidecars go, the Lease
+  appears and its holder is the primary, no node was re-cloned or re-initdb'd, and lease-based
+  failover then works on the migrated cluster with the ex-primary rejoining. It also asserts the
+  runbook's first step is enforced -- all five removed keys refuse to render -- before touching
+  anything, so an operator who skips it finds out with their cluster intact. 46 assertions;
+  wired into the `pg-test` matrix with the same 50-minute no-retry budget as `migrate-native`.
+- **`config` and `special-chars` suites now run in CI (#298 review).** Both existed in
+  `pg/Makefile` and in no matrix leg, so they only ran when someone remembered. `special-chars`
+  is the pointed one: it covers identifiers and passwords with characters that break SQL, which
+  is exactly the class of defect #298 found in `bootstrap_initdb`.
+- **Two KinD readiness checks could pass while PostgreSQL was failing (#298 review).**
+  `test-upgrade.sh` and `test-agent-failover.sh` read `containerStatuses[0].ready`, and index 0
+  is not guaranteed to be the `postgresql` container -- a sidecar with no readiness probe
+  reports `ready=true`. Both now select the container by name.
 - **The `#182` no-thrash regression assertion was vacuous.** It grepped the agent log for
   `repmgr standby follow:`, a string that survives only in Go comments and is emitted by nothing,
   so the check could never fail and per-tick follow churn went unguarded. It now samples the
@@ -3116,8 +3147,6 @@ Bugfix for agent mode (the 1.0.0 default). Image moves to `trixie-5.5.0-17`.
   genuinely frozen primary is unaffected. Regression coverage: reconcile
   decision-table cases, plus `test-agent-failover` / `test-migrate-agent` now assert
   the rejoined standby is actively streaming (`pg_stat_replication`).
-
-
 
 First major release. The lease-based Go agent (`pg-ha-agent`) is now the
 **default** failover mode, and the `pg` and `pgvector` charts move to a single,

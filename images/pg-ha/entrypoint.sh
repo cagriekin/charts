@@ -57,7 +57,22 @@ bootstrap_initdb() {
     : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required to bootstrap a new cluster}"
     : "${REPMGR_PASSWORD:?REPMGR_PASSWORD is required to bootstrap a new cluster (the replication role)}"
     echo "Initializing PostgreSQL database..."
-    initdb -D "$PGDATA" --auth-local=trust --auth-host=md5
+    # --auth-host=scram-sha-256, not md5 (#298 review). initdb's --auth-host both writes the
+    # method into its own pg_hba (which this function overwrites a few lines below, so that half
+    # is moot) AND sets `password_encryption` in postgresql.conf -- which is the half that
+    # outlives the bootstrap and decides how EVERY password stored on this cluster afterwards is
+    # hashed: an operator's `CREATE USER`, the databases-roles hook Job's roles, a later
+    # `ALTER USER ... PASSWORD`. Leaving it at md5 meant a brand-new 2.0.0 cluster defaulted to a
+    # hash deprecated since PostgreSQL 10, and the chart's md5->scram migration then existed to
+    # undo a default this same line had just chosen. The managed users already forced
+    # scram-sha-256 per statement (below) precisely because this was wrong; that stays as an
+    # explicit belt-and-braces, but it is no longer compensating for the default.
+    #
+    # Safe by construction: this function only ever runs against an EMPTY data directory, so
+    # there is no existing md5-hashed role for the change to strand. Clusters created by 1.x keep
+    # their md5 roles and their migration path -- the agent's md5->scram re-hash is unaffected
+    # and still runs there.
+    initdb -D "$PGDATA" --auth-local=trust --auth-host=scram-sha-256
 
     cat >> "$PGDATA/postgresql.conf" << EOF
 wal_level = replica
@@ -156,18 +171,17 @@ EOF
     POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     POSTGRES_DB=${POSTGRES_DB:-postgres}
 
-    # initdb --auth-host=md5 (above) writes password_encryption=md5 into
-    # postgresql.conf, so a bare CREATE USER stores an MD5 secret. pg_hba.conf
-    # (written above) requires scram-sha-256 for the 10.0.0.0/8 pod network,
-    # and PostgreSQL never falls through on auth failure -- so an MD5-secret
-    # repmgr user is rejected with "does not have a valid SCRAM secret" the
-    # moment a standby clone or repmgrd connects over the pod network, before
-    # the chart's postStart md5->scram migration has had a chance to run. That
-    # is a startup race that crash-loops repmgrd / wedges the standby clone.
-    # Create the managed users with a SCRAM secret directly (a session-scoped
-    # SET applies to the CREATE/ALTER in that same psql -c session) -- the same end state the chart's
-    # fix_user_auth migration drives them to, but race-free from first boot.
-    # Legacy/app users keep the md5 default and the existing migration path.
+    # The managed users force scram-sha-256 per statement (a session-scoped SET applies to the
+    # CREATE/ALTER in that same `psql -c` session). Since #298 changed initdb's --auth-host to
+    # scram-sha-256 this agrees with the cluster default rather than overriding it, and it is
+    # kept deliberately: the rule it protects is load-bearing and cheap to state twice.
+    #
+    # What it protects: pg_hba (written above) requires scram-sha-256 from the pod network, and
+    # PostgreSQL never falls through on auth failure -- so a role holding an MD5 secret is
+    # rejected with "does not have a valid SCRAM secret" the moment a standby clone connects,
+    # before any migration could run. That was a startup race that wedged the clone. Stating the
+    # encryption at the point of creation means the managed roles cannot acquire the wrong hash
+    # even if the cluster default were ever changed back.
     # SQL-quote the passwords (#298 review): a literal single quote in POSTGRES_PASSWORD /
     # REPMGR_PASSWORD ended the SQL string, the `2>/dev/null || true` swallowed the syntax
     # error, and -- because the verification below only asked about the repmgr objects -- a

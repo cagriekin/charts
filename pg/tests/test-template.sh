@@ -308,7 +308,7 @@ assert_contains "#153: repmgr-init declares its (heavier) clone resources" "${re
 # #302: copy-ext must never clobber copy-base-ext's libs. copy-base-ext (repmgr
 # image, runs first) populates ext-lib/ext-share; copy-ext (postgresql.image) only
 # adds what copy-base-ext didn't provide, so its cp must stay no-clobber -- a plain
-# cp would silently overwrite the repmgr image's core libs (e.g. libpqwalreceiver.so)
+# cp would silently overwrite the HA image's core libs (e.g. libpqwalreceiver.so)
 # if postgresql.image and repmgr.image drift to different postgres point releases.
 copy_base_ext=$(printf '%s\n' "${init_res}" | sed -n '/name: copy-base-ext/,/name: copy-ext/p')
 assert_contains "#302: copy-base-ext copies plainly (it runs first, nothing to preserve yet)" "${copy_base_ext}" "cp /usr/lib/postgresql/18/lib/\*.so\* /ext-lib/"
@@ -344,7 +344,7 @@ assert_contains "#303: copy-base-ext installs the {major}-substituted package" "
 assert_contains "#303: copy-ext installs the {major}-substituted package too" "${pkg_ext}" "postgresql-18-cron"
 # the copy step must still follow the apt-get in the same command, and copy-ext
 # must still be -n (#302) even with packages set -- installing a package is not a
-# license to start clobbering the repmgr image's core libs.
+# license to start clobbering the HA image's core libs.
 assert_contains "#303: copy-base-ext still copies plainly after apt-get" "${pkg_base_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+\\"postgresql-18=$PGVER\\"} postgresql-18-cron && cp /usr/lib/postgresql/18/lib/\*.so\* /ext-lib/'
 assert_contains "#303: copy-ext still uses cp -n after apt-get" "${pkg_ext}" 'apt-get install -y --no-install-recommends ${PGVER:+\\"postgresql-18=$PGVER\\"} postgresql-18-cron && cp -n /usr/lib/postgresql/18/lib/\*.so\* /ext-lib/'
 
@@ -1245,7 +1245,7 @@ lint_output=$(helm lint "${CHART_DIR}" -f "${SCRIPT_DIR}/values-config.yaml" 2>&
 assert_eq "helm lint with config values passes" "0" "${lint_rc}"
 
 # Test: helm lint with config+repmgr values
-lint_output=$(helm lint "${CHART_DIR}" -f "${SCRIPT_DIR}/values-config-repmgr.yaml" 2>&1) && lint_rc=0 || lint_rc=$?
+lint_output=$(helm lint "${CHART_DIR}" -f "${SCRIPT_DIR}/values-config-ha.yaml" 2>&1) && lint_rc=0 || lint_rc=$?
 assert_eq "helm lint with config+repmgr values passes" "0" "${lint_rc}"
 
 # Render standalone config template
@@ -1276,24 +1276,24 @@ assert_not_contains "config standalone: no 10.0.0.0/8 trust injection" "${config
 assert_not_contains "minimal: no 10.0.0.0/8 trust injection" "${minimal}" "10.0.0.0/8 trust"
 
 # Render repmgr config template
-config_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-config-repmgr.yaml" 2>&1)
+config_ha=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-config-ha.yaml" 2>&1)
 
 # Config repmgr: ConfigMap is created
-assert_contains "config repmgr: postgresql-config configmap created" "${config_repmgr}" "test-pg-postgresql-config"
-assert_contains "config repmgr: work_mem in configmap" "${config_repmgr}" "work_mem = '64MB'"
+assert_contains "config HA: postgresql-config configmap created" "${config_ha}" "test-pg-postgresql-config"
+assert_contains "config HA: work_mem in configmap" "${config_ha}" "work_mem = '64MB'"
 
 # Config repmgr: setup-config init container present
-assert_contains "config repmgr: setup-config init container present" "${config_repmgr}" "name: setup-config"
-assert_contains "config repmgr: include_dir in setup-config" "${config_repmgr}" "include_dir = '/etc/postgresql/conf.d'"
+assert_contains "config HA: setup-config init container present" "${config_ha}" "name: setup-config"
+assert_contains "config HA: include_dir in setup-config" "${config_ha}" "include_dir = '/etc/postgresql/conf.d'"
 
 # Config repmgr: volume mount present
-assert_contains "config repmgr: conf.d volume mount present" "${config_repmgr}" "/etc/postgresql/conf.d"
+assert_contains "config HA: conf.d volume mount present" "${config_ha}" "/etc/postgresql/conf.d"
 
 # Config repmgr: checksum annotation present
-assert_contains "config repmgr: checksum annotation present" "${config_repmgr}" "checksum/postgresql-config"
+assert_contains "config HA: checksum annotation present" "${config_ha}" "checksum/postgresql-config"
 
 # Config repmgr: pgHba entries in postStart
-assert_contains "config repmgr: pgHba entry in postStart" "${config_repmgr}" "host all all 10.244.0.0/16 md5"
+assert_contains "config HA: pgHba entry in postStart" "${config_ha}" "host all all 10.244.0.0/16 md5"
 
 # #144: the repmgr-branch postStart pg_hba insert (user entries spliced above the
 # image's broad 10.0.0.0/8 and 0.0.0.0/0 catch-alls) went with repmgrd (#286). The agent
@@ -1358,9 +1358,9 @@ assert_not_contains "no config: no checksum annotation" "${no_config}" "checksum
 assert_not_contains "no config: no conf.d volume mount" "${no_config}" "mountPath: /etc/postgresql/conf.d"
 
 # Test: repmgr defaults (no configuration set) also render the cleanup
-no_config_repmgr=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" 2>&1)
-assert_not_contains "no config repmgr: no postgresql-config configmap" "${no_config_repmgr}" "postgresql-config"
-assert_contains "no config repmgr: setup-config strips stale include_dir" "${no_config_repmgr}" 'grep -v "include_dir'
+no_config_ha=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" 2>&1)
+assert_not_contains "no config HA: no postgresql-config configmap" "${no_config_ha}" "postgresql-config"
+assert_contains "no config HA: setup-config strips stale include_dir" "${no_config_ha}" 'grep -v "include_dir'
 
 # Test: enabled render appends and never strips
 assert_not_contains "config standalone: no include_dir strip when enabled" "${config_standalone}" 'grep -v "include_dir'
@@ -1445,7 +1445,7 @@ assert_not_contains "repmgr: nothing targets a standby on shutdown" "${repmgr_no
 
 # Test: repmgr with configuration still renders postStart
 repmgr_config=$(helm template test-pg "${CHART_DIR}" \
-  -f "${SCRIPT_DIR}/values-config-repmgr.yaml" \
+  -f "${SCRIPT_DIR}/values-config-ha.yaml" \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "repmgr+config: postStart hook present" "${repmgr_config}" "postStart:"
 
@@ -2161,7 +2161,7 @@ assert_contains "#38: script disables archive_mode so the throwaway never pollut
 assert_contains "#38: script polls until recovery promotes to read-write" "${pgbr_script}" "pg_is_in_recovery()"
 assert_contains "#38: script strips the unmountable include_dir to avoid a startup FATAL" "${pgbr_script}" "include_dir = '/etc/postgresql/conf.d'"
 assert_contains "#38: script puts the PG bin dir on PATH (pg_ctl/psql are not on the default PATH)" "${pgbr_script}" "/usr/lib/postgresql"
-# Runs from the repmgr image (has pgbackrest + matching PG major), as the repmgr SA
+# Runs from the HA image (has pgbackrest + matching PG major), as the repmgr SA
 # (workload identity for keyType=auto), with no API token.
 assert_contains "#38: uses the HA image" "${pgbr_val}" "cagriekin/pg-ha"
 assert_contains "#38: reuses the postgresql/repmgr ServiceAccount (workload identity)" "${pgbr_val}" "serviceAccountName: test-pg-repmgr"
@@ -2730,7 +2730,7 @@ assert_contains "pgbackrest: postgresql-config volume present" "${pgbackrest_sts
 assert_contains "pgbackrest: include_dir wired in postStart" "${pgbackrest_sts}" "include_dir = '/etc/postgresql/conf.d'"
 
 # #132: disabling pgbackrest after it was enabled at install must neutralize the
-# archive settings the repmgr image entrypoint persisted into PGDATA's
+# archive settings the HA image entrypoint persisted into PGDATA's
 # postgresql.conf. Otherwise archive_mode stays on with a now-failing
 # archive_command (pgbackrest config + S3 creds gone), pg_wal is never recycled,
 # and the data PVC fills until the postmaster PANICs. The strip lives in
@@ -2806,21 +2806,21 @@ assert_eq "standalone replicas: render passes with replicaCount=0" "0" "${standa
 
 # --- #133: repmgr-mode PostgreSQL major pinning Tests ---
 
-# In repmgr mode the server runs from the repmgr image, which bundles exactly
+# In repmgr mode the server runs from the HA image, which bundles exactly
 # one PG major; postgresql.majorVersion/image.tag overrides cannot change it.
 # The chart must fail fast on a mismatch instead of crash-looping the extension
 # init container (extensions on) or silently running the wrong major (off).
 major_mismatch=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set postgresql.image.tag=pg17 2>&1) && major_mismatch_rc=0 || major_mismatch_rc=$?
-assert_eq "major pin: render fails when postgresql.majorVersion != repmgr image major (#133)" "1" "${major_mismatch_rc}"
+assert_eq "major pin: render fails when postgresql.majorVersion != HA image major (#133)" "1" "${major_mismatch_rc}"
 assert_contains "major pin: error names both values (#133)" "${major_mismatch}" "does not match ha.image.majorVersion"
 
 # default (18 == 18) renders
 major_default=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1) && major_default_rc=0 || major_default_rc=$?
 assert_eq "major pin: default 18==18 renders (#133)" "0" "${major_default_rc}"
 
-# a matched rebump to a PG17 repmgr image renders (a supported selection since #269)
+# a matched rebump to a PG17 HA image renders (a supported selection since #269)
 major_rebump=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set repmgr.image.majorVersion=17 \
@@ -2830,7 +2830,7 @@ assert_eq "major pin: matched repmgr.image.majorVersion rebump renders (#133)" "
 
 # The OTHER direction of the mismatch. #133 only ever tested moving
 # postgresql.majorVersion; the guard has to be symmetric, or parameterising the image
-# (#269) could leave "repmgr image says 17, chart still thinks 18" -- which silently runs
+# (#269) could leave "HA image says 17, chart still thinks 18" -- which silently runs
 # a PG17 server while every extension path the chart builds points at /18/.
 major_mismatch_rev=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.image.majorVersion=17 \
@@ -2912,7 +2912,7 @@ major_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set postgresql.image.tag=pg17 \
   --show-only templates/statefulset.yaml 2>&1) && major_standalone_rc=0 || major_standalone_rc=$?
-assert_eq "major pin: standalone is unconstrained by repmgr image major (#133)" "0" "${major_standalone_rc}"
+assert_eq "major pin: standalone is unconstrained by HA image major (#133)" "0" "${major_standalone_rc}"
 
 # --- Primary Service selector Tests ---
 
@@ -3295,7 +3295,7 @@ assert_eq "majorVersion default: three /usr/share/postgresql/18/extension occurr
 
 # Test: overriding majorVersion swaps every extension path, leaving no /18/.
 # In repmgr mode the major pin (#133) requires repmgr.image.majorVersion to move
-# in lockstep, so set both to model a repmgr image rebuilt for the new major.
+# in lockstep, so set both to model a HA image rebuilt for the new major.
 extpaths_19=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --set postgresql.extensions.enabled=true \
   --set postgresql.majorVersion=19 \
@@ -3323,7 +3323,7 @@ assert_eq "majorVersion empty: render fails when extensions enabled" "1" "${extp
 assert_contains "majorVersion empty: error names postgresql.majorVersion" "${extpaths_empty}" "postgresql.majorVersion is required"
 
 # Test: empty majorVersion is ignored while extensions stay disabled (standalone;
-# in repmgr mode the major pin requires it to match the repmgr image major)
+# in repmgr mode the major pin requires it to match the HA image major)
 helm template test-pg "${CHART_DIR}" \
   --set repmgr.enabled=false \
   --set postgresql.replicaCount=0 \
@@ -3439,7 +3439,7 @@ assert_not_contains "#286: Role grants no events create (agent uses an audit log
 assert_not_contains "#286: Role has no unscoped configmaps get/create/patch rule" "${ro_role_events}" 'verbs: \["get", "create", "patch"\]'
 
 # --- Stale-Primary Guard Wiring Tests (issue #123) ---
-# The guard itself lives in the repmgr image entrypoint (so it runs on every
+# The guard itself lives in the HA image entrypoint (so it runs on every
 # container start, including container-only restarts the init container
 # misses). The chart's job is only to invoke the entrypoint cleanly and pass
 # the cluster size the peer scan needs.

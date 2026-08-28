@@ -21,6 +21,25 @@ if ! helm plugin list 2>/dev/null | awk '{print $1}' | grep -qx unittest; then
   exit 127
 fi
 
+# pgvector's unit tests must never be a COPY of a pg one under the same name (#298 review).
+# pg/templates and pgvector/templates are byte-identical by gate and pgvector's are symlinks INTO
+# pg's, so pg's suite already covers every line of shared template logic. A same-named copy in
+# pgvector reads as a mirror while being free to drift, and nothing noticed that guards_test.yaml
+# there held a reworded subset of pg's cases -- 24 of 76. So: share it by SYMLINK, or give it a
+# pgvector-scoped name. Never a same-named copy.
+if [ -d pgvector/tests/unit ] && [ -d pg/tests/unit ]; then
+  for f in pgvector/tests/unit/*_test.yaml; do
+    [ -e "${f}" ] || continue
+    base="$(basename "${f}")"
+    if [ -e "pg/tests/unit/${base}" ] && [ ! -L "${f}" ]; then
+      echo "FATAL: pgvector/tests/unit/${base} is a COPY of pg's file of the same name." >&2
+      echo "       Symlink it (ln -sf ../../../pg/tests/unit/${base} ${f}) if the cases are shared," >&2
+      echo "       or rename it to pgvector_${base} if they are pgvector-specific." >&2
+      exit 1
+    fi
+  done
+fi
+
 rc=0
 ran=0
 charts=0

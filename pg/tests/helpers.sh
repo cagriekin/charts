@@ -244,17 +244,6 @@ print_summary() {
   return 0
 }
 
-# chart_mechanism echoes the HA mechanism this WORKING TREE is set to (#288).
-#
-# Vestigial since #294: native is the only mechanism, so this always answers "native" and every
-# caller's branch is inert. Kept only because several suites still read it; the default moved to
-# native so it cannot answer with a value the chart now rejects. pg/tests/set-mechanism.sh, which
-# used to flip the tree, is gone. Collapse the remaining callers rather than re-gating them.
-chart_mechanism() {
-  local v
-  v=$(grep -m1 '^    mechanism: ' "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/values.yaml" 2>/dev/null | awk '{print $2}')
-  echo "${v:-native}"
-}
 
 # discover_primary echoes the pod name that is currently NOT in recovery, or "" if none is
 # (#288). Under `repmgr.agent.mechanism: native` the initial primary is decided by the LEASE

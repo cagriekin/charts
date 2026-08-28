@@ -155,7 +155,7 @@ apply "majorVersion" \
   '^([[:space:]]+)majorVersion: "[0-9]+"' \
   's/^([[:space:]]+)majorVersion: "[0-9]+"/\1majorVersion: "'"${MAJOR}"'"/'
 
-# repmgr image tags: repmgr.image.tag, etcd.bootstrapImage.tag, and the tags a few suites
+# HA image tags: repmgr.image.tag, etcd.bootstrapImage.tag, and the tags a few suites
 # pin inline (test-tls's repmgrd release, test-migrate-agent's "from" image -- which must
 # be the same major, or the migration would restart a PG17 PGDATA under a PG18 server).
 # Both tag schemes are matched in one alternation for the same reason the case statement

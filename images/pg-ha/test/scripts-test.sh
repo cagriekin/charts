@@ -15,7 +15,23 @@ for s in entrypoint.sh pg-common.sh; do
 done
 
 # --- managed users (postgres, repmgr) must be created with a SCRAM secret ---
-# initdb --auth-host=md5 sets password_encryption=md5, but pg_hba requires
+# #298: initdb must not request md5. --auth-host writes password_encryption into
+# postgresql.conf, so md5 there meant every password stored on a brand-new cluster afterwards --
+# an operator's CREATE USER, the databases-roles Job's roles -- defaulted to a hash deprecated
+# since PostgreSQL 10, and the chart's own md5->scram migration existed to undo it.
+if grep -qE 'initdb .*--auth-host=scram-sha-256' "${ROOT}/entrypoint.sh"; then
+  ok "#298: initdb requests scram-sha-256 for host auth"
+else
+  bad "#298: initdb does not request scram-sha-256" "$(grep -n 'initdb -D' "${ROOT}/entrypoint.sh")"
+fi
+if grep -qE 'initdb .*--auth-host=md5' "${ROOT}/entrypoint.sh"; then
+  bad "#298: initdb still requests md5 host auth"
+else
+  ok "#298: initdb requests no md5 host auth"
+fi
+
+# The per-statement SET is kept as belt-and-braces even though it now agrees with the default:
+# pg_hba requires
 # scram-sha-256 for the pod network -- so a bare CREATE USER stores an MD5 secret
 # that the scram rule rejects ("does not have a valid SCRAM secret"), a startup
 # race that wedges repmgrd / the standby clone. The CREATE/ALTER USER for the

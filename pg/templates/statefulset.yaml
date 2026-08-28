@@ -109,9 +109,9 @@
 {{- fail "ha.agent.control.restore.readPodLogs requires ha.agent.control.restore.enabled (it only affects reading a restore Job's log)" }}
 {{- end }}
 {{- if .Values.ha.enabled }}
-{{- $repmgrMajor := required "ha.image.majorVersion is required (the PostgreSQL major bundled in the repmgr image)" .Values.ha.image.majorVersion }}
-{{- if ne (toString .Values.postgresql.majorVersion) (toString $repmgrMajor) }}
-{{- fail (printf "postgresql.majorVersion=%q does not match ha.image.majorVersion=%q. In repmgr mode the PostgreSQL server runs from the repmgr image (%s), which bundles only PostgreSQL %s and always runs that server regardless of postgresql.image; a mismatch crash-loops the extension init container or silently runs the wrong major. Set postgresql.majorVersion=%q (with a matching postgresql.image), or point ha.image at an image built for PostgreSQL %s and set ha.image.majorVersion to match" (toString .Values.postgresql.majorVersion) (toString $repmgrMajor) .Values.ha.image.repository (toString $repmgrMajor) (toString $repmgrMajor) (toString .Values.postgresql.majorVersion)) }}
+{{- $haMajor := required "ha.image.majorVersion is required (the PostgreSQL major bundled in the HA image)" .Values.ha.image.majorVersion }}
+{{- if ne (toString .Values.postgresql.majorVersion) (toString $haMajor) }}
+{{- fail (printf "postgresql.majorVersion=%q does not match ha.image.majorVersion=%q. With ha.enabled the PostgreSQL server runs from the HA image (%s), which bundles only PostgreSQL %s and always runs that server regardless of postgresql.image; a mismatch crash-loops the extension init container or silently runs the wrong major. Set postgresql.majorVersion=%q (with a matching postgresql.image), or point ha.image at an image built for PostgreSQL %s and set ha.image.majorVersion to match" (toString .Values.postgresql.majorVersion) (toString $haMajor) .Values.ha.image.repository (toString $haMajor) (toString $haMajor) (toString .Values.postgresql.majorVersion)) }}
 {{- end }}
 {{- /* The two majorVersion values above are hand-typed claims; the image TAG is what
        actually decides the major (#269). The published per-major tags carry a -pgNN
@@ -124,8 +124,8 @@
 {{- $tagMajor := regexFind "-pg[0-9]+$" (toString .Values.ha.image.tag) }}
 {{- if $tagMajor }}
 {{- $tagMajor = trimPrefix "-pg" $tagMajor }}
-{{- if ne $tagMajor (toString $repmgrMajor) }}
-{{- fail (printf "ha.image.tag=%q is built for PostgreSQL %s, but ha.image.majorVersion=%q. The tag decides which major actually runs, so these must agree: set ha.image.majorVersion=%q and postgresql.majorVersion=%q, or change the tag suffix to -pg%s" (toString .Values.ha.image.tag) $tagMajor (toString $repmgrMajor) $tagMajor $tagMajor (toString $repmgrMajor)) }}
+{{- if ne $tagMajor (toString $haMajor) }}
+{{- fail (printf "ha.image.tag=%q is built for PostgreSQL %s, but ha.image.majorVersion=%q. The tag decides which major actually runs, so these must agree: set ha.image.majorVersion=%q and postgresql.majorVersion=%q, or change the tag suffix to -pg%s" (toString .Values.ha.image.tag) $tagMajor (toString $haMajor) $tagMajor $tagMajor (toString $haMajor)) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -324,7 +324,7 @@ spec:
         # It refuses to touch an already-initialized directory (see bootstrap.sh), which is
         # what makes it safe to leave enabled across ordinary restarts and rollouts.
         - name: pgbackrest-bootstrap
-          image: "{{ include "pg.repmgrImage" . }}"
+          image: "{{ include "pg.haImage" . }}"
           imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
@@ -402,7 +402,7 @@ spec:
 {{- $pkgs = append $pkgs ($p | toString | replace "{major}" ($pgMajor | toString)) }}
 {{- end }}
         - name: copy-base-ext
-          image: "{{ include "pg.repmgrImage" . }}"
+          image: "{{ include "pg.haImage" . }}"
           imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
 {{- if $pkgs }}
           # #303: apt-get install into THIS container's own filesystem before the copy
@@ -410,8 +410,8 @@ spec:
           # /usr/lib(share)/postgresql/{{ $pgMajor }}/... paths here (only the main
           # postgresql container mounts them there), so dpkg unpacks straight into
           # this image's normal extension directories and the unmodified cp then
-          # picks up both the repmgr image's original extensions and anything just
-          # installed. The repmgr image configures the PGDG apt repo at build time
+          # picks up both the HA image's original extensions and anything just
+          # installed. The HA image configures the PGDG apt repo at build time
           # (images/pg-ha/Dockerfile), so this is the reliable install path in
           # repmgr mode.
           #
@@ -520,7 +520,7 @@ spec:
 {{- if $pkgs }}
           # #303: apt-get install before the copy below, same reasoning as
           # copy-base-ext. Still -n (no-clobber, #302) on the copy: in repmgr mode
-          # copy-base-ext already populated ext-lib/ext-share from the repmgr image,
+          # copy-base-ext already populated ext-lib/ext-share from the HA image,
           # which is what actually runs the server, so this container's job (with or
           # without packages) is to ADD what's missing, never overwrite a core lib
           # with this image's build. PGDG apt-source availability in
@@ -554,7 +554,7 @@ spec:
                 - MKNOD
 {{- else }}
           # -n (no-clobber, #302): copy-base-ext (when repmgr is enabled) already
-          # populated ext-lib/ext-share from the repmgr image, which is what actually
+          # populated ext-lib/ext-share from the HA image, which is what actually
           # runs the server. This container only ADDS what's missing (e.g. vector.so)
           # -- it must never overwrite a core lib (e.g. libpqwalreceiver.so) with this
           # image's build. The two images can drift to different postgres point
@@ -651,7 +651,7 @@ spec:
 {{- end }}
 {{- if .Values.ha.enabled }}
         - name: repmgr-init
-          image: "{{ include "pg.repmgrImage" . }}"
+          image: "{{ include "pg.haImage" . }}"
           imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
           command: ["/usr/local/bin/entrypoint.sh", "init"]
           securityContext:
@@ -695,7 +695,7 @@ spec:
               fi
 {{- end }}
 {{- if not .Values.pgbackrest.enabled }}
-              # pgbackrest disabled: the repmgr image entrypoint persisted
+              # pgbackrest disabled: the HA image entrypoint persisted
               # archive_mode=on + a pgbackrest archive_command into PGDATA's
               # postgresql.conf at initdb (#132). With the pgbackrest config and
               # S3 credentials now gone, every archive_command fails and WAL is
@@ -717,7 +717,7 @@ spec:
       containers:
         - name: postgresql
 {{- if .Values.ha.enabled }}
-          image: "{{ include "pg.repmgrImage" . }}"
+          image: "{{ include "pg.haImage" . }}"
           imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
           # Always agent mode. pg.agentMode IS ha.enabled, and this whole block already
           # sits inside `if .Values.ha.enabled`, so the `postgres` alternative that used to
@@ -1303,7 +1303,7 @@ spec:
         # into this container to perform the actual backup. Scheduling lives
         # in the CronJobs, not here.
         - name: pgbackrest
-          image: "{{ include "pg.repmgrImage" . }}"
+          image: "{{ include "pg.haImage" . }}"
           imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
           command: ["/bin/bash", "-c", "exec sleep infinity"]
           securityContext:
