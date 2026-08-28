@@ -280,6 +280,40 @@ EOF
     echo "PostgreSQL initialization complete"
 }
 
+# bootstrap_or_discard_torn wraps bootstrap_initdb for `postgres` mode, where a torn bootstrap
+# used to seal in permanently (#298 review). bootstrap_initdb no-ops on any PGDATA that already
+# has PG_VERSION, so an initdb that ran and then died before writing the completion sentinel --
+# the FATAL verification exit inside the function, a SIGKILL mid-bootstrap, a container lost
+# between the two -- left a cluster with no application role and no application database, which
+# every later start then served happily and forever. In agent mode the agent's discardTornInitdb
+# already recovers exactly this; nothing in `postgres` mode read the sentinel at all.
+#
+# The agent's evidence rule is mirrored deliberately, including its safety property: the
+# IN-PROGRESS marker is REQUIRED, not merely an absent completion sentinel. A data directory
+# created by an older image has PG_VERSION, no sentinel and no marker, and must never be wiped on
+# that basis -- "I cannot see proof it finished" is not proof that it did not. Both marker paths
+# match the agent's (initdbMarkerPath / bootstrapCompletePath) so the two modes cannot disagree
+# about what torn means.
+#
+# The in-progress marker lives BESIDE PGDATA rather than inside it, for two reasons: initdb
+# refuses a target directory that is not empty, and it has to survive the discard below.
+bootstrap_or_discard_torn() {
+    pgdata_parent=$(dirname "$PGDATA")
+    initdb_marker="${pgdata_parent}/.pg-ha-initdb-in-progress"
+    if [ -s "$PGDATA/PG_VERSION" ] && [ -f "$initdb_marker" ] && [ ! -f "$PGDATA/.pg-ha-bootstrap-complete" ]; then
+        echo "WARNING: discarding a data directory left by an interrupted bootstrap (PG_VERSION present, completion sentinel absent) so it can be created again (#298)" >&2
+        rm -rf "${PGDATA:?}"/* "${PGDATA:?}"/.[!.]* 2>/dev/null || true
+    fi
+    if [ ! -s "$PGDATA/PG_VERSION" ]; then
+        mkdir -p "$pgdata_parent"
+        : > "$initdb_marker"
+    fi
+    bootstrap_initdb
+    # Cleared only after bootstrap_initdb RETURNS. It exits non-zero on a failed verification,
+    # so the marker survives exactly the case it exists for.
+    rm -f "$initdb_marker"
+}
+
 case "$SCRIPT_NAME" in
     "postgres"|"agent")
         require_pg_bindir || exit 1
@@ -315,7 +349,7 @@ case "$SCRIPT_NAME" in
         # which exits immediately. The chart never reaches here -- its own `postgres` command is
         # inside an agent-mode guard and therefore unreachable -- so this is purely for direct
         # image users, which is exactly who has no agent to do it for them.
-        bootstrap_initdb
+        bootstrap_or_discard_torn
         echo "Starting PostgreSQL..."
         exec postgres -D "$PGDATA"
         ;;

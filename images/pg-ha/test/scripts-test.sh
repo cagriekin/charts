@@ -449,5 +449,71 @@ rm -rf "${_q_tmp}"
 
 
 echo "----"
+
+
+# --- #298 review: postgres mode must not seal in a torn bootstrap ---
+# Behavioural, against the SHIPPED function: source bootstrap_or_discard_torn out of the script
+# with a stub bootstrap_initdb that records whether it was asked to build a cluster, and drive
+# the three states that matter. The seal-in this guards was invisible for exactly one reason --
+# bootstrap_initdb returns 0 on an existing PGDATA, so the failure looked like success.
+_bd_fn=$(sed -n '/^bootstrap_or_discard_torn() {/,/^}/p' "${ROOT}/entrypoint.sh")
+_bd_run() { # $1=scenario dir setup already done; echoes "initdb=<yes|no> pgversion=<yes|no>"
+  (
+    set +e
+    PGDATA="$1/pgdata"
+    export PGDATA
+    eval "${_bd_fn}"
+    # Records whether it actually BUILT a cluster, not whether it was called: the real
+    # bootstrap_initdb is invoked unconditionally and returns 0 on an existing PGDATA, and
+    # mistaking that no-op for work is precisely how the seal-in stayed invisible.
+    bootstrap_initdb() { if [ ! -s "$PGDATA/PG_VERSION" ]; then _bd_called=yes; mkdir -p "$PGDATA"; echo 18 > "$PGDATA/PG_VERSION"; : > "$PGDATA/.pg-ha-bootstrap-complete"; fi; }
+    _bd_called=no
+    bootstrap_or_discard_torn >/dev/null 2>&1
+    echo "initdb=${_bd_called}"
+  )
+}
+
+# 1. A TORN directory (PG_VERSION + in-progress marker + no sentinel) must be discarded and rebuilt.
+_bd1=$(mktemp -d); mkdir -p "${_bd1}/pgdata"
+echo 18 > "${_bd1}/pgdata/PG_VERSION"; echo "user data" > "${_bd1}/pgdata/torn-evidence"
+: > "${_bd1}/.pg-ha-initdb-in-progress"
+_bd1_out=$(_bd_run "${_bd1}")
+if [ "${_bd1_out}" = "initdb=yes" ] && [ ! -f "${_bd1}/pgdata/torn-evidence" ] && [ -f "${_bd1}/pgdata/.pg-ha-bootstrap-complete" ]; then
+  ok "#298: postgres mode discards a torn bootstrap and rebuilds it"
+else
+  bad "#298: a torn bootstrap sealed in" "${_bd1_out}; torn-evidence present=$([ -f "${_bd1}/pgdata/torn-evidence" ] && echo yes || echo no)"
+fi
+
+# 2. A COMPLETE directory must be left strictly alone -- no discard, no initdb.
+_bd2=$(mktemp -d); mkdir -p "${_bd2}/pgdata"
+echo 18 > "${_bd2}/pgdata/PG_VERSION"; echo "real data" > "${_bd2}/pgdata/user-table"
+: > "${_bd2}/pgdata/.pg-ha-bootstrap-complete"; : > "${_bd2}/.pg-ha-initdb-in-progress"
+_bd2_out=$(_bd_run "${_bd2}")
+if [ "${_bd2_out}" = "initdb=no" ] && [ -f "${_bd2}/pgdata/user-table" ]; then
+  ok "#298: a completed bootstrap is never discarded"
+else
+  bad "#298: a completed bootstrap was touched" "${_bd2_out}; user-table present=$([ -f "${_bd2}/pgdata/user-table" ] && echo yes || echo no)"
+fi
+
+# 3. THE SAFETY CASE: a directory from an older image -- PG_VERSION, no sentinel, and no
+# in-progress marker -- must be left alone. Absence of proof that the bootstrap finished is not
+# proof that it did not, and this is the one scenario where guessing wrong destroys real data.
+_bd3=$(mktemp -d); mkdir -p "${_bd3}/pgdata"
+echo 18 > "${_bd3}/pgdata/PG_VERSION"; echo "years of data" > "${_bd3}/pgdata/user-table"
+_bd3_out=$(_bd_run "${_bd3}")
+if [ "${_bd3_out}" = "initdb=no" ] && [ -f "${_bd3}/pgdata/user-table" ]; then
+  ok "#298: a pre-marker data directory is never discarded (no in-progress marker = no evidence)"
+else
+  bad "#298: a pre-marker data directory was destroyed" "${_bd3_out}; user-table present=$([ -f "${_bd3}/pgdata/user-table" ] && echo yes || echo no)"
+fi
+
+# 4. The in-progress marker must be cleared on success, so the NEXT start has no false evidence.
+if [ ! -f "${_bd1}/.pg-ha-initdb-in-progress" ] && [ ! -f "${_bd2}/.pg-ha-initdb-in-progress" ]; then
+  ok "#298: the in-progress marker is cleared once bootstrap_initdb returns"
+else
+  bad "#298: a stale in-progress marker survived a successful bootstrap"
+fi
+rm -rf "${_bd1}" "${_bd2}" "${_bd3}"
+
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
 exit "$fail"

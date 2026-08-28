@@ -119,6 +119,17 @@
   `repmgr-preload.conf` block, whose guard reduced to `not X and X`. The `repmgr` prepend in
   `pg.sharedPreloadLibraries` is deleted for the same reason. No render moves; the tests
   asserting the file is absent were passing vacuously and now pass for the right reason.
+- **`postgres` mode sealed in a torn bootstrap forever (#298 review).** `bootstrap_initdb`
+  no-ops on any PGDATA that already carries `PG_VERSION`, so an initdb that ran and then died
+  before writing its completion sentinel -- the function's own FATAL verification exit, a
+  SIGKILL mid-bootstrap, a container lost between the two -- left a cluster with no application
+  role and no application database that every later start served happily. Agent mode already
+  recovered this (`discardTornInitdb`); nothing in `postgres` mode read the sentinel. It now
+  mirrors the agent's rule exactly, including the safety property that matters most: the
+  IN-PROGRESS marker is required evidence, so a data directory created by an older image
+  (`PG_VERSION`, no sentinel, no marker) is never touched -- absence of proof that a bootstrap
+  finished is not proof that it did not. Only affects running the image directly; the chart
+  never reaches this branch.
 - **The bootstrap `pg_hba.conf` no longer offers `md5` to the network (#298 review).** Both
   `0.0.0.0/0` catch-all rules now require `scram-sha-256`. `bootstrap_initdb` runs only against an
   EMPTY data directory and creates every role under `password_encryption = 'scram-sha-256'`, so
