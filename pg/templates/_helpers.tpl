@@ -1425,8 +1425,20 @@ to acknowledge, not the chart's to assume.
 {{- if (.Values.etcd).enabled -}}
 {{- $ha := .Values.ha.image | default dict -}}
 {{- $boot := ((.Values.etcd).rbac).bootstrapImage | default dict -}}
+{{- /* The DIGEST is part of the reference (#298 review). Both dicts carry one, pg.haImage
+       renders it, and etcd/templates/rbac-bootstrap-job.yaml renders it too -- so comparing
+       repository:tag alone let the exact supply-chain pin the digest exists for slip through:
+       ha.image.digest set and etcd.rbac.bootstrapImage.digest left empty renders CLEAN while
+       the database pods run the pinned build and the bootstrap Job runs whatever the mutable
+       tag currently resolves to. That is precisely "one agent build writing the etcd RBAC that
+       a different build then authenticates against", reached through the guard rather than
+       around it. Same shape in reverse when only the bootstrap image is pinned. */ -}}
+{{- $haDigest := ($ha.digest | default "") | toString -}}
+{{- $bootDigest := ($boot.digest | default "") | toString -}}
 {{- $haRef := printf "%s:%s" ($ha.repository | default "") ($ha.tag | default "") -}}
 {{- $bootRef := printf "%s:%s" ($boot.repository | default "") ($boot.tag | default "") -}}
+{{- if $haDigest -}}{{- $haRef = printf "%s@%s" $haRef $haDigest -}}{{- end -}}
+{{- if $bootDigest -}}{{- $bootRef = printf "%s@%s" $bootRef $bootDigest -}}{{- end -}}
 {{- if ne $haRef $bootRef -}}
 {{- fail (printf "etcd.rbac.bootstrapImage (%s) must match ha.image (%s): the bundled etcd's RBAC-bootstrap Job runs `pg-ha-agent rbac-bootstrap` from that image, so a mismatch has one agent build writing the etcd RBAC that a different build then authenticates against. Set etcd.rbac.bootstrapImage.repository and .tag to the same values as ha.image.repository and .tag -- both move together on every image bump. If you genuinely need different images (an air-gapped mirror holding only one), use an external etcd instead: leave etcd.enabled=false and point ha.agent.dcs.etcd.endpoints at your own cluster." $bootRef $haRef) -}}
 {{- end -}}

@@ -218,7 +218,17 @@ func (c Client) MarkAdopted(ts string) error {
 	if c.StatusPath == "" {
 		return nil
 	}
-	b, err := readFileLimit(c.StatusPath, 16<<10)
+	// UNBOUNDED read here, unlike LastRestore's (#298 review). readFileLimit TRUNCATES
+	// silently at its cap, which is fine for a reader -- LastRestore just parses fewer keys --
+	// but this is a read-MODIFY-WRITE: feeding a truncated buffer into the rewrite below would
+	// persist the truncation, destroying every key past the cap and very likely leaving a
+	// half-written `key=val` as the last kept line for LastRestore to misparse. That would
+	// silently discard the provenance record this function exists to PRESERVE (it is stamped,
+	// not unlinked, for exactly that reason), on the one path a successful restore always
+	// takes. The file is a handful of key=value lines written by restore.sh on a volume the
+	// agent already owns, so reading it whole is not a resource concern; ReadFile is used
+	// rather than a larger cap so no future field can reintroduce the cliff.
+	b, err := os.ReadFile(c.StatusPath) //nolint:gosec // path is agent config, not request input
 	if os.IsNotExist(err) {
 		return nil
 	}

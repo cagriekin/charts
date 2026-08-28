@@ -138,6 +138,17 @@ jobs:
     steps:
       - name: Aggregate result
         run: |
+          # The no-op arm requires `changes` to have SUCCEEDED (#298 review). `if: always()`
+          # runs this gate even when `changes` failed or was cancelled -- and a job that did
+          # not finish has EMPTY outputs, so `!= "true"` held and the required check went
+          # GREEN having run nothing at all. A required check that reports success without
+          # examining anything is strictly worse than one that never reports: the latter
+          # blocks the merge, this one waves it through. Same vacuous-pass shape the gate
+          # scripts in this change closed.
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "kafka gate FAILED: the changes job did not succeed (result=${{ needs.changes.result }}), so relevance is unknown"
+            exit 1
+          fi
           if [ "${{ needs.changes.outputs.kafka }}" != "true" ]; then
             echo "kafka unchanged — gate passes (no-op)"; exit 0
           fi

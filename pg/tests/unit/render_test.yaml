@@ -318,3 +318,26 @@ tests:
           path: spec.template.spec.volumes[?(@.name=="apiserver-proxy")]
       - notExists:
           path: spec.template.spec.containers[?(@.name=="pgbackrest")].env[?(@.name=="KUBECONFIG")]
+
+  # --- #298 review: the compensating check for the object-scoped kube-linter waiver ---
+  #
+  # statefulset.yaml annotates the OBJECT with
+  # ignore-check.kube-linter.io/no-{liveness,readiness}-probe whenever pgbackrest is enabled,
+  # for the idle `sleep infinity` pgbackrest holder container. kube-linter waives per OBJECT,
+  # not per container, so in every pgbackrest-enabled profile -- the production shape -- the
+  # policy gate can no longer see that the `postgresql` container has its probes. A values file
+  # with pgbackrest.enabled and postgresql.readinessProbe.enabled=false would render a database
+  # container with no readiness probe (so a still-cloning standby joins the write Service
+  # endpoints) and pass the required kube-linter gate silently. These assertions are what the
+  # gate can no longer do: the database container keeps both probes with the waiver in force.
+  - it: the postgresql container keeps both probes even where the kube-linter waiver applies
+    values:
+      - ../values-pgbackrest.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - exists:
+          path: metadata.annotations["ignore-check.kube-linter.io/no-readiness-probe"]
+      - exists:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].livenessProbe
+      - exists:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].readinessProbe

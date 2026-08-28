@@ -1,7 +1,11 @@
-// Package mechanism is the swappable HA mechanism the agent drives. The reconcile
-// loop never imports repmgr directly — only this interface — so repmgr can later be
-// replaced by native pg_* calls without touching policy. Today the only
-// implementation is repmgr-backed (Repmgr).
+// Package mechanism is the swappable HA mechanism the agent drives. The reconcile loop
+// never imports an implementation — only this interface — which is what made replacing
+// repmgr with native pg_* calls survivable one method at a time (#287).
+//
+// Since #294 there is exactly ONE implementation: Native (pg_ctl / pg_basebackup /
+// pg_rewind, plus primary_conninfo + standby.signal). Repmgr is deleted, and config.Load
+// rejects MECHANISM=repmgr outright. The interface stays because the seam — policy in
+// reconcile, mechanics here — is what keeps the failover rules testable without a cluster.
 package mechanism
 
 import (

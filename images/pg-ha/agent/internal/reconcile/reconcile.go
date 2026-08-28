@@ -349,13 +349,17 @@ func Decide(o Observation) Decision {
 			// another node already holding the lease: come up READ-ONLY (standby.signal)
 			// so the holder can rank our true position. With NO leader yet, the lease is
 			// merely settling (acquisition is async) -- a fresh or sole primary that will
-			// win it. Do NOT enter recovery mode then: a fresh master has no repmgr
-			// record, so it could never promote back out, deadlocking the bootstrap
-			// (the standby's clone waits for this node to become a registered primary).
+			// win it within a tick or two and then resume read-write through StartLocal.
+			// Do NOT enter recovery mode then. The original reason was repmgr-specific (a
+			// fresh master had no repmgr.nodes record, so it could never promote back out)
+			// and died with the mechanism in #294; the branch survives on its own terms.
+			// Bringing the node up READ-ONLY first buys nothing -- there is no holder to
+			// rank it for -- and costs a stop/start cycle plus, on a single-node install,
+			// a window in which the only node serves nothing at all. One Wait tick is free.
 			if o.LeaderIdentity != "" {
 				return d(StartRecovery, "", "stopped primary-state data, another node holds the lease; start read-only (recovery mode) so its true position is observable for the election")
 			}
-			return d(Wait, "", "stopped primary-state data, no leader yet; wait to acquire the lease (a fresh/sole primary must not enter recovery mode -- it has no repmgr record to promote out of)")
+			return d(Wait, "", "stopped primary-state data, no leader yet; wait to acquire the lease (with no holder there is no election to be observable for, and starting read-only would only delay resuming read-write)")
 		}
 		return d(StartLocal, "", "standby-state data, stopped: start as a standby")
 	}

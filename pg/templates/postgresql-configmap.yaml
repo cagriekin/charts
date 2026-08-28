@@ -12,8 +12,10 @@ metadata:
     {{- . | nindent 4 }}
   {{- end }}
 data:
-{{- /* When the chart owns shared_preload_libraries (repmgr and/or pgaudit must be
-       preserved), the merged value is emitted from an authoritative file below that sorts
+{{- /* When the chart owns shared_preload_libraries (pgaudit must be preserved -- the
+       repmgr prepend went with the mechanism in #294, and #293's
+       pg.validateNativePreloadRepmgr now REFUSES any render that asks for it), the merged
+       value is emitted from an authoritative file below that sorts
        after custom.conf under conf.d's include_dir; emitting it here too would be a dead
        duplicate that file overrides, so skip it. Matched case-insensitively -- PostgreSQL
        GUC names are case-insensitive, and the merge helper reads the key the same way, so
@@ -85,7 +87,10 @@ data:
   # ConfigMap's checksum, which the StatefulSet's checksum/postgresql-config annotation
   # turns into a controlled rolling restart. This file sorts after custom.conf under
   # conf.d's include_dir, so its shared_preload_libraries is authoritative; the helper
-  # keeps repmgr (replication) and any operator-declared libraries and adds pgaudit.
+  # keeps any operator-declared libraries and adds pgaudit. It adds nothing else: the
+  # `repmgr` prepend was deleted in #294 with the mechanism, and asking for repmgr here is
+  # now a hard render failure (pg.validateNativePreloadRepmgr) because this image ships no
+  # repmgr.so -- a preload of it would make every pod unstartable.
   pgaudit.conf: |
     shared_preload_libraries = '{{ include "pg.sharedPreloadLibraries" . }}'
     pgaudit.log = '{{ .Values.postgresql.audit.log | toString | replace "'" "''" }}'

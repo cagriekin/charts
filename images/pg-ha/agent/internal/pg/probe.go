@@ -623,6 +623,3 @@ func (p *Prober) SetSynchronizedStandbySlots(ctx context.Context, ci ConnInfo, s
 	}
 	return nil
 }
-
-// Probe classifies a node by its actual role and reads the WAL position relevant
-// to that role. An unreachable node returns NodeState{Host, Reachable:false}.

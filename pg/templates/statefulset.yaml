@@ -1035,7 +1035,22 @@ spec:
                                which places them above the catch-alls itself -- #144.)
                                Before, not after: pg_hba is FIRST-match-wins, so an appended rule
                                sits behind the network catch-alls and is never consulted. The
-                               `local ... trust` lines stay above it, which local psql needs.
+                               `local ... trust` lines stay above it, which local psql needs --
+                               and so do the LOOPBACK host rules (#298 review). The anchor is the
+                               first non-loopback host rule, not simply the first host rule:
+                               initdb writes `host all all 127.0.0.1/32 trust` and its ::1 twin
+                               ahead of every network rule, so anchoring on the first `host`
+                               inserted the operator's list ABOVE them. A catch-all entry that
+                               also matches loopback (`host all all all reject`, a
+                               `clientcert=verify-ca` catch-all, a broad scram rule) then beat
+                               `127.0.0.1/32 trust` and broke every in-pod TCP client --
+                               `kubectl port-forward` + psql, which NOTES.txt tells users to
+                               run, first among them. Both other authorities on this ordering
+                               agree: 1.x's awk carried the same `$4 != 127.0.0.1/32 && $4 !=
+                               ::1/128` predicate, and the agent's own pgconf.AssemblePgHba
+                               emits the two loopback rules before the user block. Without the
+                               exclusion the SAME values file ordered rules differently in
+                               standalone and agent mode, silently.
                                Temp file + mv, and a loud message rather than a silent skip if
                                there is no host rule to anchor on. */}}
                         {{- /* ONE awk pass for the whole list, not one per entry (#298 review).
@@ -1055,7 +1070,7 @@ spec:
                         {{- end }}
                         if [ -s "$PGCHART_INS" ]; then
                           if awk -v insfile="$PGCHART_INS" '
-                                /^[[:space:]]*host/ && !done {
+                                !done && $1 ~ /^host(ssl|nossl)?$/ && $4 != "127.0.0.1/32" && $4 != "::1/128" {
                                   while ((getline l < insfile) > 0) print l
                                   close(insfile); done=1
                                 }
@@ -1064,7 +1079,7 @@ spec:
                             mv "${HBA_FILE}.pgchart.tmp" "$HBA_FILE"
                           else
                             rm -f "${HBA_FILE}.pgchart.tmp"
-                            echo "postStart: no host rule in $HBA_FILE to anchor on; NOT applying the postgresql.pgHba entries" >&2
+                            echo "postStart: no non-loopback host rule in $HBA_FILE to anchor on; NOT applying the postgresql.pgHba entries" >&2
                           fi
                         fi
                         rm -f "$PGCHART_INS"

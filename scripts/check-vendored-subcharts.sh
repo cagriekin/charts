@@ -17,6 +17,14 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "${tmp}"' EXIT
 
 fail=0
+# Vacuous-pass guard (#298 review), the same one helm-unittest / kube-linter / kubeconform
+# gained in this change and this script did not. BOTH skip paths below are silent: a missing
+# source directory (`[ -d "${src}" ] || continue`) and a consumer with no matching archive
+# (`[ ${#present[@]} -gt 0 ] || continue`). Rename or move common/ or etcd/, or drop a
+# consumer's charts/ directory, and the pair simply vanishes from the check -- with every
+# pair gone, `fail` stays 0 and the verdict prints OK having compared nothing. That is the
+# exact shape of the vacuous passes this PR set out to close.
+checked=0
 
 # Source subcharts vendored via file:// (name == source directory).
 sources=(common etcd)
@@ -55,6 +63,7 @@ for src in "${sources[@]}"; do
     vend_extract="${tmp}/x-vend-${consumer}-${src}"
     mkdir -p "${vend_extract}"
     tar xzf "${vendored}" -C "${vend_extract}"
+    checked=$((checked + 1))
 
     if diff -r "${fresh_extract}" "${vend_extract}" >/dev/null; then
       echo "OK: ${vendored} matches ${src}/"
@@ -66,4 +75,12 @@ for src in "${sources[@]}"; do
   done
 done
 
-verdict "vendored-subcharts" "${fail}"
+if [ "${checked}" -eq 0 ]; then
+  echo "FATAL: compared NO vendored archives (sources: ${sources[*]}; consumers: ${consumers[*]})." >&2
+  echo "       A gate that examines nothing must fail, not pass. Either a source chart" >&2
+  echo "       directory was renamed/moved, or no consumer still vendors one -- fix the" >&2
+  echo "       sources/consumers lists above." >&2
+  fail=1
+fi
+
+verdict "vendored-subcharts" "${fail}" "${checked} archives"

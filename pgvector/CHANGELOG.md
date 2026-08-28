@@ -114,7 +114,19 @@
   its own insert pass anchored on the first `host` rule -- which, after the first insert, *is* the
   entry just inserted, so the list came out reversed. `pg_hba` is first-match-wins, so this was
   not cosmetic: `["host all admin ... trust", "host all all ... reject"]` put the reject above the
-  trust and locked the admin role out. One ordered pass now inserts the whole block.
+  trust and locked the admin role out. One ordered pass now inserts the whole block, and it anchors
+  on the first NON-LOOPBACK `host` rule so initdb's `127.0.0.1/32` and `::1/128` trust lines stay
+  above the operator's -- otherwise a catch-all that also matches loopback (`host all all all
+  reject`) beat them and broke in-pod TCP clients, `kubectl port-forward` + psql among them. That
+  matches both other authorities on this ordering: the 1.x template and the agent's own
+  `AssemblePgHba`.
+
+- **`etcd.rbac.bootstrapImage` must match `ha.image` by DIGEST too (#298 review).** The guard
+  compared `repository:tag` only, while both image dicts carry a `digest` and both render it --
+  so pinning `ha.image.digest` and leaving the bootstrap image's empty passed cleanly with the
+  database pods on the pinned build and the RBAC-bootstrap Job on whatever the mutable tag
+  resolved to. That is the exact "one agent build writes the etcd RBAC a different build then
+  authenticates against" drift the guard exists to prevent, reached *through* it.
 
 - **The postStart primary-discovery budget is the 20 seconds it always claimed (#298 review).** It
   counted 20 *iterations*, each probing every peer at `PGCONNECT_TIMEOUT=3`, so peers that

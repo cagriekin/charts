@@ -74,6 +74,12 @@ for chart in "${charts[@]}"; do
       continue
     fi
     out=""
+    # PER-PROFILE, not per invocation (#298 review). `failed` is compared against `profiles`
+    # in the verdict line, and incrementing it inside this two-iteration k8s-version loop --
+    # and again in the vacuous guard below -- made one broken profile report
+    # "FAILED (2 of 44 profiles)", or 3 of 44 if it also rendered nothing. `failed` could
+    # even exceed `profiles`. Latch it here and add ONE at the end of the profile.
+    profile_failed=0
     for kv in "${KUBE_VERSION}" "${KUBE_VERSION_MAX}"; do
       if ! out=$(printf '%s' "${rendered}" \
           | kubeconform \
@@ -84,7 +90,7 @@ for chart in "${charts[@]}"; do
               -schema-location "${CRD_CATALOG}" \
               -summary 2>&1); then
         rc=1
-        failed=$((failed + 1))
+        profile_failed=1
       fi
       printf 'k8s %s: %s\n' "${kv}" "${out}"
       # A SKIP is never silent again. -ignore-missing-schemas is there for genuinely uncataloged
@@ -94,10 +100,18 @@ for chart in "${charts[@]}"; do
       skipped=$(printf '%s' "${out}" | sed -nE 's/.*Skipped: ([0-9]+).*/\1/p' | head -1)
       if [ -n "${skipped}" ] && [ "${skipped}" -gt 0 ]; then
         echo "  NOTE: ${skipped} resource(s) NOT validated at k8s ${kv} (no schema):" >&2
+        # `|| true` is load-bearing under `set -euo pipefail` (#298 review). This second
+        # kubeconform run is a DIAGNOSTIC -- rc is already decided by the -strict run above --
+        # but it exits non-zero whenever the profile also contains an INVALID resource, and
+        # pipefail carries that past awk/sort straight into set -e. The gate then died here,
+        # mid-loop: every remaining profile went unvalidated and `verdict` never printed, so
+        # the run ended with NOTE lines and no FAILED line -- exactly the silent-pass
+        # misreading the verdict line exists to prevent. Every profile with a skip and a
+        # failure at once hits it, and pg [values-agent-control-restore] always has skips.
         printf '%s' "${rendered}" \
           | kubeconform -ignore-missing-schemas -kubernetes-version "${kv}" \
               -schema-location default -schema-location "${CRD_CATALOG}" -verbose 2>&1 \
-          | awk '/skipped$/{print "        - " $3 " " $4}' | sort -u >&2
+          | awk '/skipped$/{print "        - " $3 " " $4}' | sort -u >&2 || true
         skips=$((skips + skipped))
       fi
     done
@@ -110,8 +124,9 @@ for chart in "${charts[@]}"; do
       echo "       A gate that examines nothing must fail, not pass. If this fixture is a LAYER" >&2
       echo "       over another, declare its base in fixture_base() in scripts/lib.sh." >&2
       rc=1
-      failed=$((failed + 1))
+      profile_failed=1
     fi
+    [ "${profile_failed}" -eq 0 ] || failed=$((failed + 1))
   done < <(chart_profiles "${chart}")
 done
 verdict "kubeconform" "$rc" "$( [ "$rc" -eq 0 ] && echo "${#charts[@]} charts, ${profiles} profiles x k8s ${KUBE_VERSION}+${KUBE_VERSION_MAX}, ${skips} unvalidated" || echo "${failed} of ${profiles} profiles" )"

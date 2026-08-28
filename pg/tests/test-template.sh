@@ -1320,8 +1320,16 @@ hba_render=$(helm template t "${CHART_DIR}" --set ha.enabled=false --set postgre
 # carries warnings about, and this assertion walked into it on the first try.
 assert_contains "#298: the pgHba insert uses awk, not the unmatchable sed anchor" \
   "${hba_render}" "awk -v insfile="
-assert_contains "#298: the insert fires once, at the first host rule" \
+assert_contains "#298: the insert fires once, at the first non-loopback host rule" \
   "${hba_render}" "done=1"
+# The ANCHOR excludes the loopback rules (#298 review). Anchoring on the first `host` line put
+# the operator's entries above `host all all 127.0.0.1/32 trust`, so a catch-all entry that also
+# matches loopback beat it -- and standalone then ordered the same values differently from agent
+# mode, whose AssemblePgHba emits both loopback rules before the user block.
+assert_contains "#298: the anchor skips the IPv4 loopback rule" \
+  "${hba_render}" '$4 != "127.0.0.1/32"'
+assert_contains "#298: the anchor skips the IPv6 loopback rule" \
+  "${hba_render}" '$4 != "::1/128"'
 assert_not_contains "#298: the unmatchable sed anchor is gone" \
   "${hba_render}" "host all all all scram-sha-256"
 # ONE awk pass for the whole list (#298 review, round 2). A pass per entry anchored on the first
@@ -1337,7 +1345,7 @@ sed -n '/cat > "$PGDATA\/pg_hba.conf"/,/^EOF$/p' "${CHART_DIR}/../images/pg-ha/e
   | grep -vE '^cat |^EOF$' > "${_hba_tmp}/pg_hba.conf"
 printf '%s\n' 'host all admin 10.1.0.0/16 scram-sha-256' 'host all all 10.1.0.0/16 reject' > "${_hba_tmp}/ins"
 awk -v insfile="${_hba_tmp}/ins" '
-      /^[[:space:]]*host/ && !done {
+      !done && $1 ~ /^host(ssl|nossl)?$/ && $4 != "127.0.0.1/32" && $4 != "::1/128" {
         while ((getline l < insfile) > 0) print l
         close(insfile); done=1
       }
@@ -1360,6 +1368,15 @@ assert_eq "#298: it lands ABOVE the network catch-all (first-match-wins)" "yes" 
 _first_local=$(grep -n "^local" "${_hba_tmp}/pg_hba.conf" | head -1 | cut -d: -f1)
 assert_eq "#298: the local trust rules stay above the inserted entry" "yes" \
   "$([ -n "${_first_local}" ] && [ "${_first_local}" -lt "${_ins_line}" ] && echo yes || echo no)"
+# ...and so do the LOOPBACK host rules (#298 review). This assertion is the one the earlier
+# version of this block was missing, which is how the first-`host` anchor shipped: every other
+# check here still passed with the operator's rules sitting above `127.0.0.1/32 trust`, so a
+# catch-all entry silently outranked loopback and broke in-pod TCP clients (port-forward + psql).
+_lo4_line=$(grep -n "127.0.0.1/32" "${_hba_tmp}/pg_hba.conf" | head -1 | cut -d: -f1)
+_lo6_line=$(grep -n "::1/128" "${_hba_tmp}/pg_hba.conf" | head -1 | cut -d: -f1)
+assert_eq "#298: the loopback host rules stay above the inserted entry" "yes" \
+  "$([ -n "${_lo4_line}" ] && [ -n "${_lo6_line}" ] && [ "${_lo4_line}" -lt "${_ins_line}" ] \
+     && [ "${_lo6_line}" -lt "${_ins_line}" ] && echo yes || echo no)"
 rm -rf "${_hba_tmp}"
 
 # postStart sed insert, covered by the "config standalone: pgHba entry in postStart" case.
@@ -5242,6 +5259,31 @@ helm template test-pg "${CHART_DIR}" --set ha.agent.dcs.backend=etcd \
   --set 'ha.agent.dcs.etcd.endpoints[0]=e:2379' --set ha.image.tag=2.0.0-pg18 >/dev/null 2>&1 \
   || etcd_ext_rc=$?
 assert_eq "#291: an external etcd does not enforce the bootstrapImage lockstep" "0" "${etcd_ext_rc}"
+# The DIGEST is part of the reference (#298 review). Both image dicts carry one and both are
+# rendered (pg.haImage, and etcd/templates/rbac-bootstrap-job.yaml's own `{{ with .digest }}`),
+# so a guard comparing repository:tag alone let the exact supply-chain pin the digest exists for
+# through: ha.image.digest set with the bootstrap image's left empty renders CLEAN while the
+# database pods run the pinned build and the Job runs whatever the mutable tag resolves to.
+etcd_dig_one_rc=0
+helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
+  --set ha.image.digest=sha256:aaa >/dev/null 2>&1 || etcd_dig_one_rc=$?
+assert_eq "#298: ha.image.digest without a matching bootstrapImage.digest fails the render" "1" \
+  "${etcd_dig_one_rc}"
+etcd_dig_rev_rc=0
+helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
+  --set etcd.rbac.bootstrapImage.digest=sha256:bbb >/dev/null 2>&1 || etcd_dig_rev_rc=$?
+assert_eq "#298: a bootstrapImage.digest without a matching ha.image.digest fails the render" "1" \
+  "${etcd_dig_rev_rc}"
+etcd_dig_diff_rc=0
+helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
+  --set ha.image.digest=sha256:aaa --set etcd.rbac.bootstrapImage.digest=sha256:bbb \
+  >/dev/null 2>&1 || etcd_dig_diff_rc=$?
+assert_eq "#298: two DIFFERENT digests fail the render" "1" "${etcd_dig_diff_rc}"
+etcd_dig_lock_rc=0
+helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
+  --set ha.image.digest=sha256:aaa --set etcd.rbac.bootstrapImage.digest=sha256:aaa \
+  >/dev/null 2>&1 || etcd_dig_lock_rc=$?
+assert_eq "#298: matching digests on both halves render" "0" "${etcd_dig_lock_rc}"
 
 # ==========================================================================================
 # #292: the in-place repmgr -> native migration suite. It is the ONLY suite that starts from a
