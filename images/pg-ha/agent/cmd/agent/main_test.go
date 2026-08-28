@@ -2972,3 +2972,44 @@ func TestRejoinRewindBackstopIsPerTarget(t *testing.T) {
 		t.Fatalf("the streak must follow the latest target, got %d against %q", a.rewindFailures, a.rewindFailureTarget)
 	}
 }
+
+// #298 review: the legacy slot name -> ordinal mapping is bounded at the top, not just the
+// bottom. Unbounded, an operator's hand-made `repmgr_slot_9999` mapped to ordinal 8999 --
+// an ordinal no pod can ever hold, so orphanSlot read it as a DEPARTED node and made someone
+// else's slot reclaimable. "Self-healing" is no comfort when the healing is a dropped slot.
+func TestSlotOrdinalBoundsTheLegacyMapping(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want int
+		ok   bool
+		why  string
+	}{
+		{"repmgr_slot_1000", 0, true, "the first node_id the chart mints"},
+		{"repmgr_slot_1009", 9, true, "a plausible ordinal"},
+		{"repmgr_slot_1999", 999, true, "the largest representable ordinal"},
+		{"repmgr_slot_2000", 0, false, "past the base range: node_ids would stop being unique"},
+		{"repmgr_slot_9999", 0, false, "somebody else's slot, not ordinal 8999"},
+		{"repmgr_slot_999", 0, false, "below the base: not a node_id this chart mints"},
+		{"pg_ha_slot_7", 7, true, "the native scheme is ordinal-native and needs no offset"},
+		{"my_own_slot", 0, false, "not a name this agent minted"},
+	} {
+		got, ok := slotOrdinal(tc.name)
+		if ok != tc.ok || (ok && got != tc.want) {
+			t.Errorf("slotOrdinal(%q) = (%d, %v), want (%d, %v) -- %s", tc.name, got, ok, tc.want, tc.ok, tc.why)
+		}
+	}
+}
+
+// The bound has to hold through orphanSlot, which is where an out-of-range mapping did damage:
+// a stranger's slot must never look departed, whatever the live pod set says.
+func TestOrphanSlotLeavesOutOfRangeLegacyNamesAlone(t *testing.T) {
+	live := map[int]bool{0: true, 1: true}
+	for _, name := range []string{"repmgr_slot_9999", "repmgr_slot_2000"} {
+		if orphanSlot(name, "pg-0", live, nil) {
+			t.Errorf("%s is not this chart's slot and must never be reclaimable", name)
+		}
+		if orphanSlot(name, "pg-0", live, map[int]bool{8999: true, 1000: true}) {
+			t.Errorf("%s must stay out of reach even with migration proof for the mapped ordinal", name)
+		}
+	}
+}

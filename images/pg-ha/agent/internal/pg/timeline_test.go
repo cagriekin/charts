@@ -11,9 +11,9 @@ func TestParseTimeline(t *testing.T) {
 		ok   bool
 	}{
 		{"00000001", 1, true},
-		{"00000009", 9, true},     // last timeline where hex == decimal
-		{"0000000A", 10, true},    // a ::int cast ERRORS here (#168)
-		{"00000010", 16, true},    // a ::int cast yields 10 here (#168)
+		{"00000009", 9, true},  // last timeline where hex == decimal
+		{"0000000A", 10, true}, // a ::int cast ERRORS here (#168)
+		{"00000010", 16, true}, // a ::int cast yields 10 here (#168)
 		{"000000FF", 255, true},
 		{"0000ABCD", 43981, true},
 		{"FFFFFFFF", 4294967295, true}, // max 32-bit timeline

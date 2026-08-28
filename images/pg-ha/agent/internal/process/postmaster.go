@@ -48,8 +48,8 @@ type ChildPostmaster struct {
 
 	mu     sync.Mutex
 	cmd    *exec.Cmd
-	exited chan error   // single waiter delivers the child's exit here
-	done   atomic.Bool  // true once the child's Wait has returned (race-free liveness)
+	exited chan error  // single waiter delivers the child's exit here
+	done   atomic.Bool // true once the child's Wait has returned (race-free liveness)
 }
 
 // NewChildPostmaster builds a ChildPostmaster (PostgresBin e.g. /usr/lib/postgresql/18/bin/postgres).

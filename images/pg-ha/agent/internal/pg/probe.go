@@ -350,6 +350,12 @@ func (p *Prober) ReplicationTopology(ctx context.Context, ci ConnInfo) ([]Replic
 			"LEFT JOIN pg_replication_slots s ON s.active_pid = r.pid AND s.slot_type = 'physical' "+
 			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots l "+
 			"WHERE l.active_pid = r.pid AND l.slot_type = 'logical') "+
+			// ORDER BY is not load-bearing for any caller -- every consumer indexes the rows by
+			// application_name (#298 review asked whether it meant something). It is here so the
+			// row order is stable: pg_stat_replication's natural order follows walsender
+			// start-up, so an unordered read made this probe's log lines and the peer list it
+			// feeds reshuffle on every reconnect, and a topology diff between two ticks showed
+			// churn that had not happened.
 			"ORDER BY 1, 2;")
 	if err != nil {
 		return nil, err

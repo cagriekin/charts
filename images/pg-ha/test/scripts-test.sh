@@ -194,12 +194,27 @@ fi
 # Between CREATE USER ${REPMGR_USER} and the stop at the end of bootstrap_initdb it would
 # otherwise be a reachable, authenticable primary reporting pg_is_in_recovery()=false -- and
 # under native a non-holder's next tick would BootstrapClone from it, inheriting the legacy
-# `host all all 0.0.0.0/0 md5` pg_hba for the pod's whole life (nothing on the clone path
+# `host all all 0.0.0.0/0` pg_hba for the pod's whole life (nothing on the clone path
 # rewrites pg_hba) plus a postgresql.conf with no include_dir.
 if grep -q "listen_addresses=''" <<<"${_bi_body}"; then
   ok "#288: the bootstrap postmaster listens on no TCP address"
 else
   bad "#288: the bootstrap postmaster is network-reachable during role creation"
+fi
+
+# #298 review: the bootstrap pg_hba must not offer md5 to the network. It only ever runs on an
+# empty PGDATA whose roles are created with password_encryption='scram-sha-256', so an md5 rule
+# bought no compatibility (PostgreSQL uses SCRAM anyway when the stored secret is a verifier)
+# while advertising a deprecated method -- and in `postgres` mode nothing ever rewrites it.
+if grep -qE '^host.*[[:space:]]md5[[:space:]]*$' <<<"${_bi_body}"; then
+  bad "#298: bootstrap_initdb still writes an md5 host rule" "$(grep -E '^host.*md5' <<<"${_bi_body}")"
+else
+  ok "#298: the bootstrap pg_hba offers no md5 host rule"
+fi
+if [ "$(grep -cE "^host[[:space:]]+(all|replication)[[:space:]]+all[[:space:]]+0\.0\.0\.0/0[[:space:]]+scram-sha-256$" <<<"${_bi_body}")" = "2" ]; then
+  ok "#298: both bootstrap catch-all rules require scram-sha-256"
+else
+  bad "#298: the bootstrap catch-all rules are not both scram-sha-256"
 fi
 
 # --- #288: bootstrap_initdb's completion sentinel is written LAST ---

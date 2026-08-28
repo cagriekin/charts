@@ -223,6 +223,14 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 	b.WriteString("wal_log_hints = on\n")
 	// hot_standby so a standby is queryable -- also how the agent observes its position and
 	// what makes the readonly Service useful.
+	//
+	// Written on a PRIMARY too, where PostgreSQL ignores it (#298 review flagged this as
+	// cosmetic; it is deliberate). hot_standby is postmaster-only, so a node that acquires it
+	// only when it becomes a standby needs a RESTART to apply it -- and the moment that matters
+	// is a demote, where the agent stops, reconfigures and starts a node that must come up
+	// queryable immediately or the readonly Service has a hole in it. Keeping the fragment
+	// role-independent also means demote/promote never rewrite this file, so a reload can never
+	// race a role change over it.
 	b.WriteString("hot_standby = on\n")
 	if primaryConninfo != "" {
 		// application_name identifies THIS node in the upstream's pg_stat_replication (#288),

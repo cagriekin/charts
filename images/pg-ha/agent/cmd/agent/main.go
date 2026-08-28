@@ -3521,7 +3521,16 @@ func slotOrdinal(name string) (int, bool) {
 	}
 	if rest, ok := strings.CutPrefix(name, legacySlotPrefix); ok {
 		n, err := strconv.Atoi(rest)
-		if err != nil || n < nodeIDBase {
+		// Bounded at BOTH ends (#298 review). The lower bound rejects a number that cannot be
+		// one of this chart's node_ids at all; the upper one rejects a number that could only
+		// be someone else's. The chart mints node_id = nodeIDBase + ordinal, so an ordinal is
+		// only representable while it stays below nodeIDBase -- past that the ids would run
+		// into a second base range and stop being unique. Without the upper bound an operator's
+		// own hand-made `repmgr_slot_9999` mapped to ordinal 8999, which no live pod can ever
+		// claim, so it read as a DEPARTED node and became reclaimable: the one outcome the
+		// name-based gate exists to prevent. Self-healing is not good enough when the healing
+		// is "the slot is already gone".
+		if err != nil || n < nodeIDBase || n-nodeIDBase >= nodeIDBase {
 			return 0, false
 		}
 		return n - nodeIDBase, true

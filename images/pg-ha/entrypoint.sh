@@ -87,6 +87,24 @@ restore_command = 'pgbackrest --stanza=${PGBACKREST_STANZA:-db} archive-get %f "
 PGBR
     fi
 
+    # The catch-all rules authenticate with scram-sha-256, not md5 (#298 review). Two reasons
+    # this is safe to tighten rather than a compatibility risk:
+    #
+    #   - This function only ever runs against an EMPTY data directory, and it sets
+    #     password_encryption = 'scram-sha-256' before creating any role, so every password
+    #     that can be presented against these rules is stored as a SCRAM verifier. There is no
+    #     md5-hashed role for an md5 rule to be needed by -- that case belongs to clusters
+    #     initdb'd by chart 1.x, and their pg_hba is the AGENT's to write (it deliberately
+    #     emits an md5-first compat form for exactly those roles; see pgconf.AssemblePgHba).
+    #   - md5 here was actively worse than useless: PostgreSQL falls back to SCRAM anyway when
+    #     the stored secret is a verifier, so the md5 method bought no compatibility on a fresh
+    #     cluster while advertising a deprecated one to the network.
+    #
+    # In agent mode this file is overwritten by writePgHba before the first real start, so the
+    # rules below are load-bearing only for `postgres` mode -- a direct image user with no agent,
+    # which is precisely the caller that never gets a hardening pass and so should not be handed
+    # md5. The transient bootstrap postmaster in this function listens on no TCP address at all
+    # (listen_addresses=''), so no `host` rule here is reachable while it runs.
     cat > "$PGDATA/pg_hba.conf" << EOF
 local   all             all                                     trust
 local   replication     all                                     trust
@@ -95,8 +113,8 @@ host    replication     all             127.0.0.1/32            trust
 host    all             all             ::1/128                 trust
 host    replication     all             10.0.0.0/8              scram-sha-256
 host    all             all             10.0.0.0/8              scram-sha-256
-host    replication     all             0.0.0.0/0               md5
-host    all             all             0.0.0.0/0               md5
+host    replication     all             0.0.0.0/0               scram-sha-256
+host    all             all             0.0.0.0/0               scram-sha-256
 EOF
 
 
@@ -122,7 +140,8 @@ EOF
     # the end of this function it would otherwise be a reachable, authenticable primary reporting
     # pg_is_in_recovery() = false -- and under native a non-holder's very next tick would see it
     # as the live primary and BootstrapClone from it. That standby would inherit the legacy
-    # pg_hba (`host all all 0.0.0.0/0 md5`, SUPERUSER-exposing) for the rest of the pod's life,
+    # pg_hba (`host all all 0.0.0.0/0`, SUPERUSER-exposing -- md5 until #298 tightened it to
+    # scram-sha-256, which narrows the method but not the exposure) for the rest of the pod's life,
     # because nothing on the clone path rewrites pg_hba, and its cloned postgresql.conf would
     # have no include_dir, inverting the conf.d precedence too. Under repmgr the window did not
     # exist: every standby was blocked until the primary registered in repmgr.nodes, which only

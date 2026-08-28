@@ -102,6 +102,22 @@
 
 ### Fixed
 
+- **The bootstrap `pg_hba.conf` no longer offers `md5` to the network (#298 review).** Both
+  `0.0.0.0/0` catch-all rules now require `scram-sha-256`. `bootstrap_initdb` runs only against an
+  EMPTY data directory and creates every role under `password_encryption = 'scram-sha-256'`, so
+  there was no md5-hashed role for an md5 rule to serve -- and PostgreSQL negotiates SCRAM anyway
+  once the stored secret is a verifier, so the rule bought no compatibility while advertising a
+  deprecated method. Matters most for `postgres` mode (running the image directly, no agent): in
+  agent mode the file is overwritten by the agent's own hardened `pg_hba` before the first real
+  start, which is exactly why that mode was never the one at risk. Clusters initdb'd by chart 1.x
+  are unaffected -- their md5-first compatibility rules are the agent's to write, and it still
+  does.
+- **A stranger's `repmgr_slot_*` could be reclaimed as a departed node (#298 review).** The
+  legacy slot-name to ordinal mapping was bounded below but not above, so an operator's own
+  hand-made `repmgr_slot_9999` mapped to ordinal 8999 -- an ordinal no pod can ever hold, which
+  therefore read as DEPARTED and made the slot droppable. Now bounded at both ends: a number is
+  only this chart's `node_id` while `node_id - 1000` stays under 1000, past which the ids would
+  run into a second base range and stop being unique.
 - **A blackholed upstream could get the agent liveness-killed.** `pg_basebackup`, `pg_rewind` and
   the slot-create `psql` addressed their peer with `-h/-p/-U`, which carries no `connect_timeout`,
   and libpq's default is unlimited -- so a dead node whose pod had not been evicted (address still
