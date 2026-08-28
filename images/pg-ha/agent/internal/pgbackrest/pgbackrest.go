@@ -12,10 +12,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/cagriekin/pg-ha-agent/internal/atomicfile"
 )
 
 // Runner runs an external command and returns its trimmed stdout. Structurally
@@ -232,34 +233,11 @@ func (c Client) MarkAdopted(ts string) error {
 		kept = append(kept, line)
 	}
 	kept = append(kept, "adoptedAt="+ts)
-	dir := filepath.Dir(c.StatusPath)
-	tmp, err := os.CreateTemp(dir, filepath.Base(c.StatusPath)+".tmp*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.WriteString(strings.Join(kept, "\n") + "\n"); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, c.StatusPath); err != nil {
-		return err
-	}
-	if d, derr := os.Open(dir); derr == nil {
-		_ = d.Sync()
-		_ = d.Close()
+	// atomicfile, not a fourth hand-rolled temp+fsync+rename: that duplication is exactly
+	// what the package was extracted to end (#298 review), and two of the three earlier
+	// copies had already drifted on whether the parent-directory fsync was mandatory.
+	if err := atomicfile.WriteString(c.StatusPath, strings.Join(kept, "\n")+"\n", 0o600); err != nil {
+		return fmt.Errorf("write restore status %s: %w", c.StatusPath, err)
 	}
 	return nil
 }

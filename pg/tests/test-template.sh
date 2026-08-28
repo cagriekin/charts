@@ -1312,28 +1312,45 @@ assert_contains "config HA: pgHba entry in postStart" "${config_ha}" "host all a
 # catch-all (pg_hba is first-match-wins, so below it would never be consulted).
 hba_render=$(helm template t "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 \
   --set 'postgresql.pgHba[0]=host all admin 10.1.0.0/16 scram-sha-256' \
+  --set 'postgresql.pgHba[1]=host all all 10.1.0.0/16 reject' \
   --show-only templates/statefulset.yaml 2>/dev/null)
 # Needles kept free of regex metacharacters on purpose: assert_contains greps, it does not
 # match literally, so an anchor pattern containing `^` or `[[:space:]]` can never match its own
 # text and the assertion silently inverts. That is the #279/CodeRabbit trap this file already
 # carries warnings about, and this assertion walked into it on the first try.
 assert_contains "#298: the pgHba insert uses awk, not the unmatchable sed anchor" \
-  "${hba_render}" "awk -v ins="
+  "${hba_render}" "awk -v insfile="
 assert_contains "#298: the insert fires once, at the first host rule" \
   "${hba_render}" "done=1"
 assert_not_contains "#298: the unmatchable sed anchor is gone" \
   "${hba_render}" "host all all all scram-sha-256"
+# ONE awk pass for the whole list (#298 review, round 2). A pass per entry anchored on the first
+# host rule, which after the first insert IS the entry just inserted -- so the operator's list
+# came out reversed, and in a first-match-wins file that inverts its meaning. Exactly one awk
+# invocation must be rendered however many entries there are.
+assert_eq "#298: one awk pass regardless of how many pgHba entries there are" "1" \
+  "$(printf '%s\n' "${hba_render}" | grep -c 'awk -v insfile=')"
 
 
 _hba_tmp=$(mktemp -d)
 sed -n '/cat > "$PGDATA\/pg_hba.conf"/,/^EOF$/p' "${CHART_DIR}/../images/pg-ha/entrypoint.sh" \
   | grep -vE '^cat |^EOF$' > "${_hba_tmp}/pg_hba.conf"
-awk -v ins='host all admin 10.1.0.0/16 scram-sha-256' '
-      /^[[:space:]]*host/ && !done { print ins; done=1 }
+printf '%s\n' 'host all admin 10.1.0.0/16 scram-sha-256' 'host all all 10.1.0.0/16 reject' > "${_hba_tmp}/ins"
+awk -v insfile="${_hba_tmp}/ins" '
+      /^[[:space:]]*host/ && !done {
+        while ((getline l < insfile) > 0) print l
+        close(insfile); done=1
+      }
       { print }
       END { if (!done) exit 3 }' "${_hba_tmp}/pg_hba.conf" > "${_hba_tmp}/out" \
   && mv "${_hba_tmp}/out" "${_hba_tmp}/pg_hba.conf"
 _ins_line=$(grep -n "host all admin 10.1.0.0/16" "${_hba_tmp}/pg_hba.conf" | head -1 | cut -d: -f1)
+# ORDER IS PRESERVED: the operator's first entry must stay above the second. Reversal is the
+# whole bug -- ["... admin ... scram-sha-256", "... all ... reject"] with the reject on top
+# locks the admin role out of a first-match-wins file.
+_reject_line=$(grep -n "host all all 10.1.0.0/16 reject" "${_hba_tmp}/pg_hba.conf" | head -1 | cut -d: -f1)
+assert_eq "#298: the pgHba entries keep the operator's declared order" "yes" \
+  "$([ -n "${_ins_line}" ] && [ -n "${_reject_line}" ] && [ "${_ins_line}" -lt "${_reject_line}" ] && echo yes || echo no)"
 _catchall_line=$(grep -n "0.0.0.0/0" "${_hba_tmp}/pg_hba.conf" | head -1 | cut -d: -f1)
 assert_eq "#298: the pgHba entry is inserted into the real bootstrap pg_hba" "yes" \
   "$([ -n "${_ins_line}" ] && echo yes || echo no)"
@@ -4298,9 +4315,14 @@ assert_contains "#288 postStart: waits instead of skipping when no primary is re
 # holds the container out of Started -- so out of every Service -- until it returns, and spending
 # the full 90s there delayed readiness on every cold boot, on pgvector's default path.
 assert_contains "#288 postStart: the primary wait has its own, smaller budget" \
-  "${ps_branch}" "primary_waits"
-assert_contains "#288 postStart: that budget gives up well before the outer loop" \
-  "${ps_branch}" "primary_waits\" -ge 20"
+  "${ps_branch}" "primary_wait_deadline"
+# WALL CLOCK, not an iteration count (#298 review): each iteration probes every peer with
+# PGCONNECT_TIMEOUT=3, so `-ge 20` iterations was up to ~260s on a black-holed 4-pod cluster,
+# not the 20s the comment and values.yaml promise.
+assert_contains "#288 postStart: that budget is a 20s wall-clock deadline, not 20 iterations" \
+  "${ps_branch}" "primary_wait_deadline:=\$((SECONDS + 20))"
+assert_contains "#288 postStart: the deadline is what ends the wait" \
+  "${ps_branch}" "SECONDS\" -ge \"\$primary_wait_deadline"
 # ...and the budget is only meaningful if each probe is bounded: an unresponsive-but-routable
 # peer otherwise blocks psql for the kernel TCP timeout, making 20 iterations minutes long.
 assert_contains "#288 postStart: the primary probe has a connect timeout" \
@@ -4308,7 +4330,7 @@ assert_contains "#288 postStart: the primary probe has a connect timeout" \
 # And nothing initialises the counter on a chart that renders no additionalCommands at all.
 noac=$(helm template test-pg "${CHART_DIR}" --set repmgr.enabled=true 2>&1)
 assert_not_contains "#288 postStart: no discovery counter when additionalCommands is empty" \
-  "${noac}" "primary_waits"
+  "${noac}" "primary_wait_deadline"
 
 assert_contains "#288 restore.sh: carries restoredAt across a failed attempt" \
   "${ctl_restore_sh}" 'restored="$(prev_field restoredAt)"'

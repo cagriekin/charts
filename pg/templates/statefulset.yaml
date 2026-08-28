@@ -1038,19 +1038,36 @@ spec:
                                `local ... trust` lines stay above it, which local psql needs.
                                Temp file + mv, and a loud message rather than a silent skip if
                                there is no host rule to anchor on. */}}
+                        {{- /* ONE awk pass for the whole list, not one per entry (#298 review).
+                               Per-entry passes each anchored on the FIRST host rule -- and after
+                               the first insert, that first host rule IS the entry just inserted,
+                               so every later entry landed ABOVE its predecessor and the
+                               operator's list came out REVERSED. pg_hba is first-match-wins, so
+                               reversal is not cosmetic: pgHba: ["host all admin ... trust",
+                               "host all all ... reject"] rendered the reject above the trust and
+                               locked the admin role out. Collect the missing entries in order,
+                               then insert them as a block. (Agent mode never had this: the agent
+                               places the whole POSTGRESQL_PGHBA list itself, in order.) */}}
+                        PGCHART_INS="${HBA_FILE}.pgchart.ins"
+                        : > "$PGCHART_INS"
                         {{- range .Values.postgresql.pgHba }}
-                        if ! grep -qF '{{ . }}' "$HBA_FILE"; then
-                          if awk -v ins='{{ . }}' '
-                                /^[[:space:]]*host/ && !done { print ins; done=1 }
+                        grep -qF '{{ . }}' "$HBA_FILE" || printf '%s\n' '{{ . }}' >> "$PGCHART_INS"
+                        {{- end }}
+                        if [ -s "$PGCHART_INS" ]; then
+                          if awk -v insfile="$PGCHART_INS" '
+                                /^[[:space:]]*host/ && !done {
+                                  while ((getline l < insfile) > 0) print l
+                                  close(insfile); done=1
+                                }
                                 { print }
                                 END { if (!done) exit 3 }' "$HBA_FILE" > "${HBA_FILE}.pgchart.tmp"; then
                             mv "${HBA_FILE}.pgchart.tmp" "$HBA_FILE"
                           else
                             rm -f "${HBA_FILE}.pgchart.tmp"
-                            echo "postStart: no host rule in $HBA_FILE to anchor on; NOT applying pg_hba entry: {{ . }}" >&2
+                            echo "postStart: no host rule in $HBA_FILE to anchor on; NOT applying the postgresql.pgHba entries" >&2
                           fi
                         fi
-                        {{- end }}
+                        rm -f "$PGCHART_INS"
                         {{- end }}
                         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
@@ -1073,7 +1090,12 @@ spec:
                   - -c
                   - |
 {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
-                    primary_waits=0
+                    {{- /* Empty, not 0: the primary-wait budget is a wall-clock DEADLINE armed
+                           on the first no-primary iteration (#298 review), so it must not start
+                           counting while the outer loop is still waiting for pg_isready --
+                           doing so would burn the whole budget before postgres even opens and
+                           skip the operator's commands on every cold boot. */}}
+                    primary_wait_deadline=""
 {{- end }}
                     for i in {1..90}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
@@ -1146,8 +1168,17 @@ spec:
                           # fresh-install window this retry was added for (bootstrap_initdb's
                           # socket-only postmaster lasts seconds) without holding a pod out of
                           # its Service while no peer has promoted yet.
-                          primary_waits=$((primary_waits + 1))
-                          if [ "$primary_waits" -ge 20 ]; then
+                          {{- /* A WALL-CLOCK deadline, not an iteration count (#298 review).
+                                 The 20 here was 20 iterations, and each iteration probes every
+                                 peer with PGCONNECT_TIMEOUT=3 -- so on a cold boot where peers
+                                 black-hole rather than refuse (NotReady node, NetworkPolicy
+                                 drop) a 4-pod cluster spent 20 x (4x3s + 1s) ~= 260s here, not
+                                 the 20s this comment and pg/values.yaml both promise, with the
+                                 container held out of Started the whole time. SECONDS is bash's
+                                 own monotonic counter, so the budget is now the documented one
+                                 however slow an individual probe round turns out to be. */}}
+                          : "${primary_wait_deadline:=$((SECONDS + 20))}"
+                          if [ "$SECONDS" -ge "$primary_wait_deadline" ]; then
                             break
                           fi
                           sleep 1
@@ -1352,7 +1383,15 @@ spec:
           resources:
             {{- toYaml .Values.pgbackrest.resources | nindent 12 }}
 {{- end }}
-{{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.ha.enabled .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.extraVolumes (not .Values.postgresql.persistence.enabled) (eq (include "pg.postgresqlConfigRenders" .) "true") }}
+{{- /* The disjuncts are the conditions that actually CONTRIBUTE a volume (#298 review).
+       `.Values.ha.enabled` used to stand in for agent mode, but the only volume it ever
+       gated by itself was repmgr-config, which this release deletes -- so on the chart
+       DEFAULT (ha on, persistence on, everything else off) this emitted a `volumes:` key
+       with no items, i.e. `volumes: null` in the pod spec. The two agent-mode volumes that
+       really exist are named explicitly instead, so the key appears exactly when there is
+       something to put under it and cannot silently lose one either. */}}
+{{- $needsVolumes := or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.extraVolumes (not .Values.postgresql.persistence.enabled) (eq (include "pg.postgresqlConfigRenders" .) "true") (and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.ha.agent.dcs.etcd).tls).secretName)) $control.enabled -}}
+{{- if $needsVolumes }}
       volumes:
 {{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
         - name: postgresql-config

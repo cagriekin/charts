@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify the vendored subchart archives (pg/charts/*.tgz, pgvector/charts/*.tgz)
+# Verify the vendored subchart archives (pg/, pgvector/, redis/, kafka/ charts/*.tgz)
 # match their in-repo source charts. Catches a source edit that was never
 # re-vendored with `helm dependency build`. Compares EXTRACTED contents, not raw
 # .tgz bytes, because gzip embeds an mtime that changes on every repack.
@@ -20,7 +20,13 @@ fail=0
 
 # Source subcharts vendored via file:// (name == source directory).
 sources=(common etcd)
-consumers=(pg pgvector redis)
+# EVERY chart that vendors one, kafka included (#298 review). kafka was missing here, and
+# the version-drift arm cannot substitute for it: common/ was edited without a version bump,
+# so kafka/charts/common-0.1.0.tgz kept the right NAME while its contents went stale (it had
+# lost the annotations support and the #161 one-of minAvailable/maxUnavailable PDB fix), and
+# this gate printed OK. A chart absent from this list is a chart whose vendored artifacts are
+# not gated at all -- add new consumers here when they gain a charts/ directory.
+consumers=(pg pgvector redis kafka)
 
 for src in "${sources[@]}"; do
   [ -d "${src}" ] || continue

@@ -267,6 +267,17 @@ EOF
         bootstrap_ok=no
     fi
     if [ "$bootstrap_ok" != "yes" ]; then
+        # STOP the transient postmaster before exiting (#298 review). `pg_ctl -w start`
+        # above daemonizes a postmaster that inherits this script's stdout, and in agent
+        # mode this script IS a captured child (`entrypoint.sh initdb`, run through
+        # Cmd.Output). Exiting with it alive leaves the agent blocked on a stdout pipe
+        # that cannot reach EOF while the orphan holds it -- act() keeps opMu, the
+        # reconcile loop stops beating and dcs.OnLost cannot fence until the whole
+        # initdbBudget expires -- and discardFreshDataDir would then be trying to wipe
+        # PGDATA under a live server. Immediate, because this cluster is about to be
+        # discarded anyway; best-effort, because a failure here must not mask the FATAL
+        # diagnosis below.
+        pg_ctl -D "$PGDATA" -m immediate -w stop || true
         echo "FATAL: not marking the bootstrap complete; this data directory will be discarded and re-bootstrapped on the next start. If it repeats, check POSTGRES_PASSWORD / REPMGR_PASSWORD and the user/database NAMES for characters that break the SQL above, and the postgres server log for the swallowed error." >&2
         exit 1
     fi
@@ -314,8 +325,17 @@ EOF
 bootstrap_or_discard_torn() {
     pgdata_parent=$(dirname "$PGDATA")
     initdb_marker="${pgdata_parent}/.pg-ha-initdb-in-progress"
-    if [ -s "$PGDATA/PG_VERSION" ] && [ -f "$initdb_marker" ] && [ ! -f "$PGDATA/.pg-ha-bootstrap-complete" ]; then
-        echo "WARNING: discarding a data directory left by an interrupted bootstrap (PG_VERSION present, completion sentinel absent) so it can be created again (#298)" >&2
+    # PG_VERSION present OR merely non-empty (#298 review). Requiring PG_VERSION left a
+    # hole: a bootstrap SIGKILLed while initdb was still laying out subdirectories, or a
+    # previous discard whose `rm -rf` partly failed (the failure is swallowed just below),
+    # leaves PGDATA non-empty with no PG_VERSION -- and initdb refuses a non-empty
+    # target, so bootstrap_initdb's own emptiness check passes it straight through to a
+    # permanent "directory exists but is not empty" crash-loop with no path out. The
+    # IN-PROGRESS MARKER is still required, so this can never fire on a directory some
+    # older image created; and with no PG_VERSION there is by definition no cluster to lose.
+    if [ -f "$initdb_marker" ] && [ ! -f "$PGDATA/.pg-ha-bootstrap-complete" ] &&
+        { [ -s "$PGDATA/PG_VERSION" ] || [ -n "$(ls -A "$PGDATA" 2>/dev/null)" ]; }; then
+        echo "WARNING: discarding a data directory left by an interrupted bootstrap (completion sentinel absent) so it can be created again (#298)" >&2
         rm -rf "${PGDATA:?}"/* "${PGDATA:?}"/.[!.]* 2>/dev/null || true
     fi
     if [ ! -s "$PGDATA/PG_VERSION" ]; then

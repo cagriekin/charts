@@ -728,7 +728,11 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		ps  reconcile.PeerState
 		set bool
 	}
-	probes := make([]peerProbe, a.cfg.NodeCount)
+	// max(0, NodeCount): config.Load only requires REPMGR_NODE_COUNT to PARSE, so a
+	// negative value reaches here, and `make` with a negative length PANICS -- which for
+	// PID 1 is a crash-loop over the postmaster it supervises. The old serial loop simply
+	// did not execute; keep that behaviour (#298 review).
+	probes := make([]peerProbe, max(0, a.cfg.NodeCount))
 	var pwg sync.WaitGroup
 	for i := 0; i < a.cfg.NodeCount; i++ {
 		name := a.base + "-" + strconv.Itoa(i)
@@ -1243,7 +1247,15 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 
 	case reconcile.DemoteFence:
 		a.metr.IncDemote()
-		return a.sup.Demote(ctx, true)
+		// Bounded, like the OnLost fence it mirrors (#298 review). This is the SOFT
+		// fence -- a read-write node that no longer holds the Lease -- so it is the
+		// demote that most needs to finish, and ChildPostmaster.Stop escalates
+		// SIGQUIT -> SIGKILL only when its context expires. On tick()'s deadline-less
+		// context a frozen postmaster meant no escalation at all: act() blocked with
+		// opMu held, the heartbeat stopped, and the second writer stayed up.
+		dctx, dcancel := context.WithTimeout(ctx, a.cfg.RenewDeadline)
+		defer dcancel()
+		return a.sup.Demote(dctx, true)
 
 	case reconcile.RejoinForward:
 		return a.rejoinOnto(ctx, dec.Target)
@@ -1332,7 +1344,19 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		switch {
 		case obs.Local.Running && !obs.Local.InRecovery:
 			a.metr.IncDemote()
-			if err := a.sup.Demote(ctx, false); err != nil {
+			// BOUNDED, and the bound is what makes the reordering above safe (#298
+			// review). ChildPostmaster.Stop escalates SIGINT -> SIGKILL only on
+			// ctx.Done(), and tick()'s context carries no deadline -- so a fast
+			// shutdown that never completes (a wedged checkpoint, a backend stuck in
+			// the kernel) would block here forever with opMu held: no further
+			// metr.Beat(), no OnLost fence, and -- now that the release follows the
+			// demote -- a Lease that is never released, so no peer can take over
+			// either. RenewDeadline, matching the OnLost fence and the sibling
+			// LocalStuck branch below.
+			dctx, dcancel := context.WithTimeout(ctx, a.cfg.RenewDeadline)
+			err := a.sup.Demote(dctx, false)
+			dcancel()
+			if err != nil {
 				return err
 			}
 		case obs.LocalStuck && !obs.Local.InRecovery:
@@ -1370,7 +1394,14 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// possibly-live writer up.
 		if obs.Local.Running && !obs.Local.InRecovery {
 			a.metr.IncDemote()
-			if err := a.sup.Demote(ctx, false); err != nil {
+			// Bounded for the reason the ReleaseLease branch above gives: the SIGKILL
+			// escalation in ChildPostmaster.Stop fires only on ctx.Done(), and with the
+			// release now sequenced AFTER the demote an unbounded hang here holds opMu
+			// and the Lease indefinitely.
+			dctx, dcancel := context.WithTimeout(ctx, a.cfg.RenewDeadline)
+			err := a.sup.Demote(dctx, false)
+			dcancel()
+			if err != nil {
 				return err
 			}
 		}
@@ -1496,6 +1527,22 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 	// The budget cannot be the only protection, because the failure that matters is the agent
 	// never returning from here at all: the kubelet can SIGKILL this container mid-bootstrap
 	// (see initdbMarkerPath). Hence the marker, which makes the next boot recover instead.
+	// Same pre-flight as BootstrapClone, for the same reason (#298 review): `initdb -D`
+	// refuses a target that is not byte-empty, while the caller's emptiness test is
+	// HasData (PG_VERSION). A bootstrap SIGKILLed while initdb was still laying out
+	// subdirectories -- or a core dump the kernel wrote into a dying postmaster's cwd --
+	// leaves PGDATA non-empty with no PG_VERSION, and every later tick then decides
+	// BootstrapInitdb and fails on "directory exists but is not empty", forever.
+	// discardTornInitdb cannot help: its no-PG_VERSION branch only clears the marker.
+	// With PG_VERSION absent the entries are debris by definition, and ClearDebrisDataDir
+	// refuses an initialized directory and a live postmaster on its own.
+	if !process.HasData(a.cfg.PGDATA) {
+		if removed, derr := process.ClearDebrisDataDir(a.cfg.PGDATA); derr != nil {
+			return fmt.Errorf("clear pre-initdb debris from %s: %w", a.cfg.PGDATA, derr)
+		} else if len(removed) > 0 {
+			a.log.Warn("cleared non-database debris from PGDATA before initdb", "removed", removed)
+		}
+	}
 	a.beginInitdb()
 	ictx, icancel := context.WithTimeout(ctx, initdbBudget)
 	defer icancel()
@@ -2442,13 +2489,17 @@ func (a *agent) assertSyncStandbySlots(ctx context.Context, existing []pg.SlotSt
 	for _, s := range existing {
 		existingSet[s.Name] = true
 	}
-	candidates := a.syncSlotCandidates(owned)
+	// `owned` IS the candidate set: reconcileSlots maintains exactly one slot per live
+	// standby pod and returns them in ordinal order, and it is the same authority that
+	// CREATES them, so the two cannot disagree (#294). nil is a legitimate answer -- a
+	// single-node cluster owns no standby slots -- and must still reconcile, because
+	// desired=="" is what clears a GUC left by a previous topology.
 	// Only slots that ACTUALLY EXIST may be named. synchronized_standby_slots pointing at a
 	// missing slot makes the primary refuse to release WAL and log repeatedly, so a slot that
 	// was only just created this tick waits for the next one -- `existing` was read before
 	// the create pass ran. Cheap: one extra tick of a standby not yet being waited on.
 	var slots []string
-	for _, name := range candidates {
+	for _, name := range owned {
 		if existingSet[name] {
 			slots = append(slots, name)
 		}
@@ -2466,23 +2517,6 @@ func (a *agent) assertSyncStandbySlots(ctx context.Context, existing []pg.SlotSt
 	}
 	a.lastSyncStandbySlots = &desired
 	a.log.Info("reconciled synchronized_standby_slots", "slots", desired)
-}
-
-// syncSlotCandidates returns the slot names #308 should wait on, in a STABLE order, and
-// whether the answer is trustworthy enough to act on.
-//
-// The answer is already computed: reconcileSlots owns one slot per live standby pod and hands
-// back exactly that set (#294). That is the same authority that CREATES the slots, so the two
-// cannot disagree -- unlike the repmgr path this replaced, which resolved standbys from
-// repmgr.nodes and named slots repmgr_slot_<id>, and therefore errored on every tick of a
-// native cluster while the chart still rendered sync_replication_slots = on.
-//
-// Ordinal order comes free from reconcileSlots”' own loop, and matters because the caller uses
-// the joined string as a change-detection key.
-func (a *agent) syncSlotCandidates(owned []string) []string {
-	// nil is a legitimate answer (a single-node cluster owns no standby slots) and must still
-	// reconcile -- desired=="" clears a stale GUC left by a previous topology.
-	return owned
 }
 
 // desiredRoleLabels builds the pg-role map the primary publishes each tick (the
@@ -2545,8 +2579,15 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 	if err := a.assertSameCluster(ctx, target); err != nil {
 		return err
 	}
-	if err := a.sup.Demote(ctx, true); err != nil {
-		return err
+	// Bounded, same reason as the fence branches in act() (#298 review): the
+	// SIGQUIT -> SIGKILL escalation in ChildPostmaster.Stop is driven purely by the
+	// context, so an unbounded one on a wedged postmaster hangs the rejoin -- and with
+	// it opMu and the reconcile heartbeat -- rather than force-stopping and continuing.
+	dctx, dcancel := context.WithTimeout(ctx, a.cfg.RenewDeadline)
+	derr := a.sup.Demote(dctx, true)
+	dcancel()
+	if derr != nil {
+		return derr
 	}
 	if err := a.mech.RejoinForceRewind(ctx, a.peerMechConn(target)); err != nil {
 		// Escalate to a full re-clone ONLY on genuine divergence (#298 review).

@@ -153,10 +153,14 @@ fi
 # on that margin holding.
 _bi_body=$(sed -n '/^bootstrap_initdb() {/,/^}/p' "${ROOT}/entrypoint.sh")
 
-if [ "$(grep -c 'initdb -D' "${ROOT}/entrypoint.sh")" = "1" ]; then
+# COMMENTS EXCLUDED (#298 review): this counted every occurrence of the string, so a comment
+# that merely mentions the command failed the gate -- an assertion about call sites has to
+# count code.
+_initdb_sites=$(grep -v '^[[:space:]]*#' "${ROOT}/entrypoint.sh" | grep -c 'initdb -D')
+if [ "${_initdb_sites}" = "1" ]; then
   ok "#288: initdb has exactly one call site"
 else
-  bad "#288: initdb has $(grep -c 'initdb -D' "${ROOT}/entrypoint.sh") call sites; it must live only in bootstrap_initdb"
+  bad "#288: initdb has ${_initdb_sites} call sites; it must live only in bootstrap_initdb"
 fi
 if grep -q 'initdb -D' <<<"${_bi_body}"; then
   ok "#288: the initdb call site is inside bootstrap_initdb"

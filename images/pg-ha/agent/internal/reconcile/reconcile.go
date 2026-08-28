@@ -433,20 +433,6 @@ func unsafeToServe(o Observation) (bool, string) {
 	return false, ""
 }
 
-// peerNotBehind reports whether p is at least as current as the local node: same timeline
-// and an LSN no lower. Both positions must be KNOWN -- an unreadable timeline or LSN on
-// either side means the comparison cannot be made, and an unprovable candidate is not a
-// safe hand-off target (the caller then promotes the local node instead).
-func peerNotBehind(p PeerState, l LocalState) bool {
-	if !p.TimelineOK || !l.TimelineOK || p.Timeline != l.Timeline {
-		return false
-	}
-	if !p.LSNOK || !l.LSNOK {
-		return false
-	}
-	return !l.LSN.Greater(p.LSN)
-}
-
 // newestPrimaryAbove returns the reachable live primary on the highest timeline
 // strictly above the local timeline, or nil. Used for forward-only rejoin.
 func newestPrimaryAbove(o Observation) *PeerState {

@@ -101,8 +101,14 @@ func emitRule(b *strings.Builder, line string, md5Fallback bool) {
 }
 
 // WritePgHba writes pg_hba.conf at path (0600).
+//
+// ATOMIC, for the same reason EnsureConfdInclude and native.ensureInclude are (#298
+// review): a truncated pg_hba.conf is not a degraded config but a postmaster that
+// refuses to start ("could not load pg_hba.conf"), and this file is rewritten on the
+// boot path immediately before sup.Start -- so a crash or ENOSPC mid-write leaves the
+// pod unable to come up on the very config it was repairing.
 func WritePgHba(path, content string) error {
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	if err := atomicfile.Write(path, []byte(content), 0o600); err != nil {
 		return fmt.Errorf("write pg_hba.conf: %w", err)
 	}
 	return nil

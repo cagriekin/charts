@@ -101,6 +101,48 @@
 
 ### Fixed
 
+- **Every demote is now bounded, so a wedged postmaster cannot strand the Lease (#298 review).**
+  `ChildPostmaster.Stop` escalates to `SIGKILL` only when its context expires, and four demote
+  call sites -- the `DemoteFence` soft fence, `ReleaseLease`, `Switchover`, and `rejoinOnto`'s
+  pre-rewind stop -- passed the reconcile tick's deadline-less context. A fast shutdown that
+  never completed (a wedged checkpoint, a backend stuck in the kernel) therefore never escalated:
+  `act()` blocked with `opMu` held, the heartbeat stopped, `OnLost` could not fence, and the
+  Lease was never released either -- so **no peer could take over at all** until the kubelet
+  killed the container. All four are now bounded by `RenewDeadline`, matching the `OnLost` fence.
+
+- **`postgresql.pgHba` entries keep the order they were written in (#298 review).** Each entry got
+  its own insert pass anchored on the first `host` rule -- which, after the first insert, *is* the
+  entry just inserted, so the list came out reversed. `pg_hba` is first-match-wins, so this was
+  not cosmetic: `["host all admin ... trust", "host all all ... reject"]` put the reject above the
+  trust and locked the admin role out. One ordered pass now inserts the whole block.
+
+- **The postStart primary-discovery budget is the 20 seconds it always claimed (#298 review).** It
+  counted 20 *iterations*, each probing every peer at `PGCONNECT_TIMEOUT=3`, so peers that
+  black-hole rather than refuse (a NotReady node, a NetworkPolicy drop) cost a 4-pod cluster
+  ~260s -- with the container held out of `Started` and every Service the whole time. Now a real
+  wall-clock deadline, armed on the first no-primary iteration so it never eats the `pg_isready`
+  wait.
+
+- **A bootstrap killed mid-`initdb` can recover (#298 review).** `initdb` refuses a target that is
+  not byte-empty while the caller's emptiness test is `PG_VERSION`, so a SIGKILL while initdb was
+  still laying out subdirectories left PGDATA non-empty with no `PG_VERSION` -- and every later
+  attempt failed on "directory exists but is not empty", forever. The agent now clears
+  pre-`initdb` debris the way the clone path already did, and the entrypoint's torn-bootstrap
+  discard accepts "non-empty" as well as `PG_VERSION` (still gated on the in-progress marker, so
+  it can never touch a directory an older image created). Relatedly, a failed bootstrap now stops
+  its transient postmaster before exiting: in agent mode the script's stdout is captured, and an
+  orphan holding that pipe open blocked the agent for the whole five-minute bootstrap budget.
+
+- **`pg_hba.conf` is written atomically (#298 review).** The boot path rewrote it with a plain
+  truncating write immediately before starting the postmaster; a crash or ENOSPC mid-write left a
+  pod unable to start on the very file it was repairing. It now goes through the same
+  temp+fsync+rename helper as every other PGDATA config write.
+
+- **The default render no longer emits an empty `volumes:` key (#298 review).** Its guard still
+  listed `ha.enabled`, whose only volume (`repmgr-config`) this release deletes, so the chart
+  default produced `volumes: null` in the pod spec. The guard now names the conditions that
+  actually contribute a volume.
+
 - **`initdb` no longer requests md5 (#298 review).** `--auth-host=md5` does two things: it writes
   the method into initdb's own `pg_hba` (which the entrypoint overwrites, so that half was moot)
   **and** it sets `password_encryption` in `postgresql.conf` -- which decides how every password

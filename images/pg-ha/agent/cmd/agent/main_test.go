@@ -1240,12 +1240,24 @@ func TestFollowKeepsPublishingSlotGaugesWhileOtherActionsRetractThem(t *testing.
 type initdbExec struct {
 	calls [][]string
 	err   error
+	// dataDir lets the fake do what a real `entrypoint.sh initdb` does: LEAVE A CLUSTER
+	// BEHIND. It used to be seeded up front by the fixture instead, which no longer models
+	// the branch -- bootstrapInitdbNative now clears non-database debris from a
+	// PG_VERSION-less PGDATA before shelling out (#298 review), exactly as BootstrapClone
+	// does, so anything staged before the call is debris by that same definition.
+	dataDir string
 }
 
 func (e *initdbExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
 	e.calls = append(e.calls, append([]string{name}, args...))
 	if e.err != nil {
 		return "boom", e.err
+	}
+	// A successful bootstrap leaves PG_VERSION and a postgresql.conf for the agent's own
+	// GenerateConfig/ensureInclude to append to.
+	if e.dataDir != "" && name == entrypointPath && len(args) > 0 && args[0] == "initdb" {
+		_ = os.WriteFile(filepath.Join(e.dataDir, "PG_VERSION"), []byte("18\n"), 0o600)
+		_ = os.WriteFile(filepath.Join(e.dataDir, "postgresql.conf"), []byte("# seeded\n"), 0o600)
 	}
 	// Answer the post-initdb timeline read (#288 review, round 3): the marker write now POLLS
 	// for the postmaster to accept SQL, because sup.Start is fire-and-forget. A fake that never
@@ -1341,11 +1353,10 @@ func newBootstrapTestAgent(t *testing.T, ex *initdbExec, mech string) *agent {
 func newBootstrapTestAgentWithPM(t *testing.T, ex *initdbExec, mech string, pm *fakePostmaster) *agent {
 	t.Helper()
 	dataDir := t.TempDir()
-	// native's GenerateConfig appends an include line to PGDATA/postgresql.conf, which a real
-	// initdb would have created; the fake exec does not, so seed it.
-	if err := os.WriteFile(filepath.Join(dataDir, "postgresql.conf"), []byte("# seeded\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	// The fake exec creates PGDATA's contents when `entrypoint.sh initdb` is "run", the way a
+	// real bootstrap does -- not up front, which the pre-initdb debris clear would (correctly)
+	// wipe.
+	ex.dataDir = dataDir
 	m := mechanism.NewNative(dataDir, "/usr/lib/postgresql/18/bin", "pw", "pg_ha_slot_0", "pg-0")
 	return &agent{
 		cfg: &config.Config{
@@ -1468,8 +1479,11 @@ func TestBootstrapInitdbNativeDoesNotStartAfterLosingTheLease(t *testing.T) {
 		reconcile.Observation{}); err != nil {
 		t.Fatalf("act: %v", err)
 	}
-	if len(ex.calls) != 1 {
-		t.Fatalf("want the initdb attempt recorded, got %v", ex.calls)
+	// The initdb attempt is recorded; anything after it belongs to the discard the sibling
+	// test asserts (the fake now leaves a real PG_VERSION behind, so discardFreshDataDir
+	// reaps the bootstrap postmaster first). What must NOT appear is a start.
+	if len(ex.calls) == 0 || ex.calls[0][0] != entrypointPath || ex.calls[0][1] != "initdb" {
+		t.Fatalf("want the initdb attempt recorded first, got %v", ex.calls)
 	}
 	if pm.started {
 		t.Error("started read-write after losing the lease: a second cluster")
