@@ -23,6 +23,13 @@ tests:
       - failedTemplate:
           errorPattern: 'failoverMode \(ha\.failoverMode / repmgr\.failoverMode\) was removed in chart 2\.0\.0'
 
+  - it: repmgr.splitBrainDetection is rejected as a removed key
+    set:
+      repmgr.splitBrainDetection.action: fence
+    asserts:
+      - failedTemplate:
+          errorPattern: 'splitBrainDetection \(ha\.splitBrainDetection / repmgr\.splitBrainDetection\) was removed in chart 2\.0\.0'
+
   - it: standalone with replicaCount 0 renders
     set:
       repmgr.enabled: false

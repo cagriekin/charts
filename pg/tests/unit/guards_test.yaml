@@ -48,6 +48,15 @@ tests:
       - failedTemplate:
           errorPattern: 'monitoringHistoryDays \(ha\.monitoringHistoryDays / repmgr\.monitoringHistoryDays\) was removed in chart 2\.0\.0'
 
+  - it: repmgr.splitBrainDetection is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.splitBrainDetection.action: fence
+    asserts:
+      - failedTemplate:
+          errorPattern: 'splitBrainDetection \(ha\.splitBrainDetection / repmgr\.splitBrainDetection\) was removed in chart 2\.0\.0'
+
   - it: pgpool.autoFailback is rejected
     templates:
       - templates/statefulset.yaml

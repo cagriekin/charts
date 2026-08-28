@@ -46,7 +46,6 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `MASTER_SERVICE` | string | yes | `<fullname>` (write Service whose selector the agent patches) | agent |
 | `POD_SELECTOR` | string | yes | chart selector labels + `component=postgresql` | agent (pg-role labeling) |
 | `DCS_BACKEND` | enum | yes | `ha.agent.dcs.backend` (`kubernetes`/`etcd`) | agent (leadership store) |
-| `SPLIT_BRAIN_ACTION` | enum | yes | `ha.splitBrainDetection.action` (`log`/`fence`) | agent |
 | `POD_CIDR` | CIDR | yes | `ha.agent.podCidr` (`10.0.0.0/8`) | agent (hardened pg_hba: trusted pod network) |
 | `POSTGRESQL_PGHBA` | newline-list | no | `postgresql.pgHba` (joined) | agent (user pg_hba rules, above the catch-alls) |
 | `CASCADE_REPLICATION` | boolean | no | `ha.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
@@ -170,11 +169,9 @@ these variables. Nothing injects or reads them any more:
 | `PGPOOL_DEPLOYMENT` / `PGPOOL_SERVICE` / `PGPOOL_PORT` | service-updater (pgpool restart on failover) | none — PGPool-II follows the Services the agent re-points |
 | `REPMGR_FAILOVER` | `init-repmgr.sh` (`automatic`/`manual`) | none — there is no repmgr and no `repmgr.conf`; the agent is the only failover path (#290) |
 | `USE_REPLICATION_SLOTS` | `init-repmgr.sh` (initial `standby clone`) | none — the agent owns cloning and always streams through a slot it pre-created (#289/#290) |
+| `SPLIT_BRAIN_ACTION` | service-updater (`handle_split_brain()`) | none — the agent demotes on lease loss unconditionally, so `log`/`fence` selected the same behaviour; the env, its `ha.splitBrainDetection` value, and the agent's dead validation were all removed |
 
 `MASTER_SERVICE` survives and is consumed by the agent (see the HA table above).
-`SPLIT_BRAIN_ACTION` is still injected and validated, but **no code reads it**: the behaviour
-its two values used to select lived in the service-updater's `handle_split_brain()`, and the
-agent demotes on lease loss unconditionally. See `ha.splitBrainDetection` in values.yaml.
 
 ## pgbackrest (when `pgbackrest.enabled=true`)
 

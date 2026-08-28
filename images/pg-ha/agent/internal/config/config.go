@@ -60,8 +60,7 @@ type Config struct {
 	// itself here rather than the agent assuming a major.
 	PGMajor string
 
-	DCSBackend       string // "kubernetes" | "etcd"
-	SplitBrainAction string // "log" | "fence"
+	DCSBackend string // "kubernetes" | "etcd"
 
 	// Mechanism selects the replication mechanics the agent drives. MechanismNative
 	// (pg_ctl / pg_basebackup / pg_rewind directly) is the only implementation since #294;
@@ -258,7 +257,6 @@ func Load(get func(string) string) (*Config, error) {
 		RepmgrPassword:    l.str("REPMGR_PASSWORD"),
 		PGDATA:            l.str("PGDATA"),
 		DCSBackend:        l.str("DCS_BACKEND"),
-		SplitBrainAction:  l.str("SPLIT_BRAIN_ACTION"),
 		PgHbaPeerCIDR:     l.str("POD_CIDR"),
 	}
 	// User pg_hba rules (optional), newline-separated; the agent places them above
@@ -342,9 +340,6 @@ func Load(get func(string) string) (*Config, error) {
 	// Validate enums only when present (an empty value is already a "missing" error).
 	if c.DCSBackend != "" && c.DCSBackend != "kubernetes" && c.DCSBackend != "etcd" {
 		l.invalid = append(l.invalid, fmt.Sprintf("DCS_BACKEND=%q (want kubernetes|etcd)", c.DCSBackend))
-	}
-	if c.SplitBrainAction != "" && c.SplitBrainAction != "log" && c.SplitBrainAction != "fence" {
-		l.invalid = append(l.invalid, fmt.Sprintf("SPLIT_BRAIN_ACTION=%q (want log|fence)", c.SplitBrainAction))
 	}
 	// POD_CIDR is interpolated raw into pg_hba.conf; a malformed value would corrupt
 	// the whole file and fail Postgres start. Validate the CIDR form up front.
@@ -470,14 +465,14 @@ func (c Config) String() string {
 	return fmt.Sprintf("Config{PodName:%s Namespace:%s LeaseName:%s "+
 		"LeaseDuration:%s RenewDeadline:%s RetryPeriod:%s ReconcileInterval:%s "+
 		"HeadlessService:%s NodeCount:%d MasterService:%s MarkerName:%s PodSelector:%q "+
-		"RepmgrUser:%s RepmgrDB:%s RepmgrPassword:*** PGDATA:%s PGMajor:%s Mechanism:%s DCSBackend:%s SplitBrainAction:%s "+
+		"RepmgrUser:%s RepmgrDB:%s RepmgrPassword:*** PGDATA:%s PGMajor:%s Mechanism:%s DCSBackend:%s "+
 		"EtcdEndpoints:%v EtcdPrefix:%s EtcdTLS:%t PgHbaPeerCIDR:%s PgHbaRules:%d "+
 		"Control:%t ControlAddr:%s ControlMTLS:%t ControlAllowedCNs:%d "+
 		"ControlRestore:%t ControlRestoreAllowedCNs:%d ControlRestoreReadPodLogs:%t}",
 		c.PodName, c.Namespace, c.LeaseName,
 		c.LeaseDuration, c.RenewDeadline, c.RetryPeriod, c.ReconcileInterval,
 		c.HeadlessService, c.NodeCount, c.MasterService, c.MarkerName, c.PodSelector,
-		c.RepmgrUser, c.RepmgrDB, c.PGDATA, c.PGMajor, c.Mechanism, c.DCSBackend, c.SplitBrainAction,
+		c.RepmgrUser, c.RepmgrDB, c.PGDATA, c.PGMajor, c.Mechanism, c.DCSBackend,
 		c.EtcdEndpoints, c.EtcdPrefix, c.EtcdCertFile != "", c.PgHbaPeerCIDR, len(c.PgHbaRules),
 		c.ControlEnabled, c.ControlAddr, c.ControlCertFile != "", len(c.ControlAllowedCNs),
 		c.ControlRestoreEnabled, len(c.ControlRestoreAllowedCNs), c.ControlRestoreReadPodLogs)

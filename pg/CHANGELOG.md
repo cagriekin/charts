@@ -271,6 +271,13 @@
 
 ### Removed (breaking)
 
+- **Removed `ha.splitBrainDetection` (and the `repmgr.splitBrainDetection` alias).** The
+  `log`/`fence` choice selected between behaviours that were already identical: the code that
+  distinguished them was the service-updater's `handle_split_brain()`, deleted with repmgrd
+  (#286), and the agent always demotes itself when it is read-write without holding the lease.
+  The key, the `SPLIT_BRAIN_ACTION` env it rendered, and the agent's dead validation of it are
+  gone; a values file still setting either spelling fails at render time with a message naming
+  the fix. The protection itself is unchanged -- the demote is unconditional.
 - **`native` is now the only replication mechanism, and the default** (#294). The `repmgr`
   mechanism -- which shelled out to the repmgr CLI for `standby clone`, `standby follow`,
   `standby promote` and `node rejoin`, and depended on the `repmgr.nodes` table -- is gone.

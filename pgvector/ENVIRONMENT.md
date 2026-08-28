@@ -46,7 +46,6 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `MASTER_SERVICE` | string | yes | `<fullname>` (write Service whose selector the agent patches) | agent |
 | `POD_SELECTOR` | string | yes | chart selector labels + `component=postgresql` | agent (pg-role labeling) |
 | `DCS_BACKEND` | enum | yes | `ha.agent.dcs.backend` (`kubernetes`/`etcd`) | agent (leadership store) |
-| `SPLIT_BRAIN_ACTION` | enum | yes | `ha.splitBrainDetection.action` (`log`/`fence`) | agent |
 | `POD_CIDR` | CIDR | yes | `ha.agent.podCidr` (`10.0.0.0/8`) | agent (hardened pg_hba: trusted pod network) |
 | `POSTGRESQL_PGHBA` | newline-list | no | `postgresql.pgHba` (joined) | agent (user pg_hba rules, above the catch-alls) |
 | `CASCADE_REPLICATION` | boolean | no | `ha.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
@@ -115,9 +114,10 @@ these variables. Nothing injects or reads them any more:
 | `MONITORING_HISTORY_DAYS` | repmgrd sidecar (`repmgr cluster cleanup`) | none — only repmgrd wrote `repmgr.monitoring_history` |
 | `PGPOOL_DEPLOYMENT` / `PGPOOL_SERVICE` / `PGPOOL_PORT` | service-updater (pgpool restart on failover) | none — PGPool-II follows the Services the agent re-points |
 | `REPMGR_FAILOVER` | `init-repmgr.sh` (`automatic`/`manual`) | none — there is no repmgr and no `repmgr.conf`; the agent is the only failover path (#290) |
+| `SPLIT_BRAIN_ACTION` | service-updater (`handle_split_brain()`) | none — the agent demotes on lease loss unconditionally, so `log`/`fence` selected the same behaviour; the env and its `ha.splitBrainDetection` value were removed |
 
-`MASTER_SERVICE` and `SPLIT_BRAIN_ACTION` were listed here too; both survive and are
-consumed by the agent (see the HA table above).
+`MASTER_SERVICE` was listed here too; it survives and is consumed by the agent (see
+the HA table above).
 
 ## pgbackrest (when `pgbackrest.enabled=true`)
 

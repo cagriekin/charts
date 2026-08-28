@@ -240,7 +240,6 @@ When `ha.enabled` is true, `additionalCommands` automatically discover the curre
 | `ha.resources.limits.cpu` | CPU limit | `500m` |
 | `ha.resources.limits.memory` | Memory limit | `512Mi` |
 | `ha.initContainerResources` | Resources for the `repmgr-init` standby-clone init container (raise for large databases) | `requests: 100m/128Mi, limits: 1/1Gi` |
-| `ha.splitBrainDetection.action` | Action on split-brain: `log` (alert only) or `fence` (terminate stale primary) | `log` |
 
 There is **no preStop hook** in HA mode. The agent runs as PID 1 and owns SIGTERM: it releases the Lease first, then stops its PostgreSQL child. `ha.terminationGracePeriodSeconds` controls how long Kubernetes waits for that shutdown.
 

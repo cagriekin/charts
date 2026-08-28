@@ -919,8 +919,6 @@ spec:
               value: /etc/etcd-tls/ca.crt
 {{- end }}
 {{- end }}
-            - name: SPLIT_BRAIN_ACTION
-              value: {{ .Values.ha.splitBrainDetection.action | quote }}
 {{- if $control.enabled }}
             {{- /* Control API (#276). The agent validates all of this at boot and
                    refuses to start if the mTLS material is incomplete -- the render

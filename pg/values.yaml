@@ -835,19 +835,6 @@ ha:
 
   terminationGracePeriodSeconds: 120
 
-  # What the agent records when it finds itself read-write without holding the lease.
-  #
-  # HONEST STATUS (#294 review): the two values do not currently differ. The agent ALWAYS
-  # demotes on lease loss -- that is the fence, and it is unconditional (see the DCS OnLost
-  # callback) -- so `fence` buys nothing that `log` does not already do. The behaviour the two
-  # used to select lived in handle_split_brain() in the service-updater sidecar, which #286
-  # deleted; SPLIT_BRAIN_ACTION is still injected and validated, but no code reads it.
-  #
-  # Left in place rather than removed because the demote it names is real and the key is a
-  # plausible home for a genuine distinction later (e.g. refusing to serve reads while fenced).
-  # Do not set `fence` expecting stronger protection than `log`: you already have the demote.
-  splitBrainDetection:
-    action: log
 
 pgpool:
   enabled: false

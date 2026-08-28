@@ -41,8 +41,8 @@ rules:
          arbitrary namespace pods. There is deliberately no `delete`: it was only ever
          granted to the repmgrd-mode service-updater for split-brain fencing (#154), and
          with repmgrd gone (#286) nothing in the chart deletes a pod -- the agent
-         soft-fences locally via pg_ctl. splitBrainDetection.action needs no pod-delete RBAC either (see values.yaml for its honest status) and
-         still needs no pod-delete privilege. */}}
+         soft-fences locally via pg_ctl. (ha.splitBrainDetection, which once named a
+         log/fence choice here, was removed in 2.0.0 -- the demote is unconditional.) */}}
   - apiGroups: [""]
     resources: ["pods"]
     resourceNames:

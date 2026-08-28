@@ -953,7 +953,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
       "LEASE_NAME" "LEASE_DURATION" "RENEW_DEADLINE" "RETRY_PERIOD" "RECONCILE_INTERVAL"
       "CASCADE_REPLICATION" "SYNC_REPLICATION_SLOTS" "MECHANISM" "POSTGRESQL_PGHBA"
       "TLS_REQUIRE_SSL" "TLS_CLIENT_CERT_AUTH"
-      "MONITORING_USER" "MIGRATE_LEGACY_MD5_USERS" "SPLIT_BRAIN_ACTION"
+      "MONITORING_USER" "MIGRATE_LEGACY_MD5_USERS"
       "DCS_BACKEND" "ETCD_ENDPOINTS" "ETCD_PREFIX" "ETCD_TLS_CERT" "ETCD_TLS_KEY" "ETCD_TLS_CA"
       "PGBACKREST_ENABLED" "PGBACKREST_STANZA" "PGBACKREST_REPO1_CIPHER_PASS"
       "PGBACKREST_REPO1_S3_KEY" "PGBACKREST_REPO1_S3_KEY_SECRET" "LD_LIBRARY_PATH" -}}
@@ -1531,6 +1531,9 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
 {{- end -}}
 {{- if hasKey $alias "monitoringHistoryDays" -}}
 {{- fail "monitoringHistoryDays (ha.monitoringHistoryDays / repmgr.monitoringHistoryDays) was removed in chart 2.0.0: it pruned repmgr.monitoring_history, which only repmgrd ever wrote. Delete this key." -}}
+{{- end -}}
+{{- if hasKey $alias "splitBrainDetection" -}}
+{{- fail "splitBrainDetection (ha.splitBrainDetection / repmgr.splitBrainDetection) was removed in chart 2.0.0: the log/fence distinction lived in the repmgrd service-updater's handle_split_brain(), which #286 deleted, so both values selected the same behaviour. Delete this key -- the protection it named still happens, unconditionally: the agent always demotes itself when it is read-write without holding the lease (a local pg_ctl operation; no pod-delete RBAC)." -}}
 {{- end -}}
 {{- if hasKey .Values.pgpool "autoFailback" -}}
 {{- fail "pgpool.autoFailback was removed in chart 2.0.0: it rendered PGPool's auto_failback, which only applied to the repmgrd failover flow. The agent fronts the Services and re-points them itself, so PGPool never fails a backend over. Delete this key." -}}

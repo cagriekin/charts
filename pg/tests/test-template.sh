@@ -92,14 +92,14 @@ assert_contains "#154: pods list rule is unscoped" "${pods_rules_log}" "pods ver
 assert_contains "#154: pods get/patch scoped to pod names" "${pods_rules_log}" "pods verbs=get,patch scoped=yes"
 assert_contains "#154: scoped rule names the StatefulSet pods" "${pods_rules_log}" "test-pg-0"
 assert_not_contains "#154: no pods delete in default (log) mode" "${pods_rules_log}" "delete"
-# #286: the pods `delete` verb is gone entirely. It was only ever granted to the
-# repmgrd service-updater for split-brain fencing; the agent soft-fences locally via
-# pg_ctl, so fence mode must NOT re-introduce a pod-delete grant.
-repmgr_role_fence=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
-  --set repmgr.splitBrainDetection.action=fence --show-only templates/rbac.yaml 2>&1)
-pods_rules_fence=$(printf '%s' "${repmgr_role_fence}" | python3 -c "${pods_rules_fmt}")
-assert_contains "#286: fence mode still scopes get/patch to pod names" "${pods_rules_fence}" "pods verbs=get,patch scoped=yes"
-assert_not_contains "#286: fence mode grants no pod delete (agent soft-fences)" "${pods_rules_fence}" "delete"
+# splitBrainDetection was removed outright: its log/fence choice selected between
+# identical behaviours (the agent always demotes when read-write without the lease),
+# so a values file still setting it fails the render with the delete-the-key message
+# rather than implying a fencing mode that never existed.
+sbd_removed=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
+  --set repmgr.splitBrainDetection.action=fence 2>&1 || true)
+assert_contains "splitBrainDetection: removed key is rejected at render" \
+  "${sbd_removed}" "splitBrainDetection (ha.splitBrainDetection / repmgr.splitBrainDetection) was removed in chart 2.0.0"
 
 # #286: the pgpool Deployment get/patch grant existed so the service-updater could
 # restart pgpool after a repmgrd failover. The agent re-points the Services instead.
@@ -1423,8 +1423,9 @@ assert_not_contains "#286: no service-updater heartbeat file" "${repmgr_no_addcm
 assert_not_contains "#286: no split-brain shell handler" "${repmgr}" "handle_split_brain"
 assert_not_contains "#286: no shell ghost-node cleanup" "${repmgr}" "cleanup_ghost_nodes"
 
-# Test: SPLIT_BRAIN_ACTION env var in statefulset
-assert_contains "repmgr: SPLIT_BRAIN_ACTION env var in statefulset" "${repmgr_no_addcmd}" "SPLIT_BRAIN_ACTION"
+# SPLIT_BRAIN_ACTION went with the ha.splitBrainDetection key: no code read it since
+# #286 deleted handle_split_brain(), and the agent's demote-on-lease-loss is unconditional.
+assert_not_contains "no SPLIT_BRAIN_ACTION env var (removed with ha.splitBrainDetection)" "${repmgr_no_addcmd}" "SPLIT_BRAIN_ACTION"
 
 # Test: split-brain handling not present when repmgr disabled
 assert_not_contains "minimal: no split-brain handling" "${minimal}" "handle_split_brain"
@@ -1510,7 +1511,7 @@ assert_not_contains "standalone: no POD_CIDR env (agent-only pg_hba ownership)" 
 agent_env_missing=""
 for v in POD_NAME NAMESPACE LEASE_NAME LEASE_DURATION RENEW_DEADLINE RETRY_PERIOD \
   RECONCILE_INTERVAL HEADLESS_SERVICE REPMGR_NODE_COUNT MASTER_SERVICE PRIMARY_MARKER \
-  POD_SELECTOR REPMGR_USER REPMGR_DB REPMGR_PASSWORD PGDATA DCS_BACKEND SPLIT_BRAIN_ACTION; do
+  POD_SELECTOR REPMGR_USER REPMGR_DB REPMGR_PASSWORD PGDATA DCS_BACKEND; do
   grep -q "name: ${v}$" <<< "${agent_pg_cont}" || agent_env_missing="${agent_env_missing} ${v}"
 done
 assert_eq "agent: all required agent env vars present (Load fail-fast)" "" "${agent_env_missing}"
@@ -1547,14 +1548,9 @@ assert_not_contains "agent rbac: no pods delete in log mode" "${agent_rbac}" '"d
 # agent mode records decisions in a structured audit log, not core/v1 Events, so
 # the events:create grant (service-updater only) must be dropped (least privilege)
 assert_not_contains "agent rbac: no events grant (agent emits no Events)" "${agent_rbac}" 'resources: ["events"]'
-# Agent mode NEVER grants pods delete, even in fence mode: the agent soft-fences
-# locally via pg_ctl and never calls pods.Delete. Since #286 removed the repmgrd
-# service-updater -- the only thing that ever used it -- the verb is gone entirely.
-agent_rbac_fence=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.splitBrainDetection.action=fence --show-only templates/rbac.yaml 2>&1)
-assert_not_contains "agent rbac: fence mode still grants NO pods delete (soft fence is local)" "${agent_rbac_fence}" '"delete"'
-# #286: there is no longer ANY mode that grants pods delete -- the repmgrd
-# service-updater was the only consumer of that verb.
+# There is no fence "mode" to re-check here: ha.splitBrainDetection was removed
+# (see the rejection assert near the #154 RBAC checks), and no remaining mode grants
+# pods delete -- the repmgrd service-updater was the only consumer of that verb (#286).
 
 # agent pgpool backends front the RW/RO Services, failover off, health checks on
 agent_pgpool=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent-pgpool.yaml" \
@@ -4831,7 +4827,8 @@ assert_contains "#291 pgvector: ha.* reaches the render" "${pgv_alias_new}" 'new
 # with `failoverMode: repmgrd` renamed to `ha:` rendered clean and deployed an agent cluster
 # to an operator who believed repmgrd was running, into the immutable podManagementPolicy trap.
 for removed_spelling in repmgr ha; do
-  for removed_key in failoverMode=repmgrd serviceUpdater.enabled=true monitoringHistoryDays=7; do
+  for removed_key in failoverMode=repmgrd serviceUpdater.enabled=true monitoringHistoryDays=7 \
+    splitBrainDetection.action=log; do
     rm_rc=0
     helm template test-pg "${CHART_DIR}" --set "${removed_spelling}.${removed_key}" >/dev/null 2>&1 \
       || rm_rc=$?

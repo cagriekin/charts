@@ -589,12 +589,6 @@ ha:
 
   terminationGracePeriodSeconds: 120
 
-  # What the agent does when it finds itself read-write without holding the lease:
-  #   log   — record it and demote
-  #   fence — demote and refuse to serve until the lease is reacquired
-  # Both are handled locally by the agent via pg_ctl; neither needs pod-delete RBAC.
-  splitBrainDetection:
-    action: log
 
   resources:
     requests:

@@ -25,7 +25,6 @@ func fullEnv() map[string]string {
 		"REPMGR_PASSWORD":    "secret",
 		"PGDATA":             "/var/lib/postgresql/data/pgdata",
 		"DCS_BACKEND":        "kubernetes",
-		"SPLIT_BRAIN_ACTION": "log",
 		"POD_CIDR":           "10.0.0.0/8",
 	}
 }
@@ -86,15 +85,6 @@ func TestLoadRejectsBadDCSBackend(t *testing.T) {
 	_, err := Load(getter(m))
 	if err == nil || !strings.Contains(err.Error(), "DCS_BACKEND") {
 		t.Errorf("expected DCS_BACKEND validation error, got %v", err)
-	}
-}
-
-func TestLoadRejectsBadSplitBrainAction(t *testing.T) {
-	m := fullEnv()
-	m["SPLIT_BRAIN_ACTION"] = "nuke"
-	_, err := Load(getter(m))
-	if err == nil || !strings.Contains(err.Error(), "SPLIT_BRAIN_ACTION") {
-		t.Errorf("expected SPLIT_BRAIN_ACTION validation error, got %v", err)
 	}
 }
 

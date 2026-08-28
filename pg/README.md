@@ -519,7 +519,6 @@ These three values are validated at render time, so a mistake fails `helm instal
 | `ha.resources.requests.memory` | Memory request | `128Mi` |
 | `ha.resources.limits.cpu` | CPU limit | `500m` |
 | `ha.resources.limits.memory` | Memory limit | `512Mi` |
-| `ha.splitBrainDetection.action` | What the agent does when it is read-write without holding the lease: `log` (record and demote) or `fence` (demote and refuse to serve until the lease is reacquired). Both act locally via `pg_ctl`; neither needs pod-delete RBAC | `log` |
 | `ha.initContainerResources` | Resources for the `repmgr-init` standby-clone init container (heavier than the shared init default; raise for large databases) | `requests: 100m/128Mi, limits: 1/1Gi` |
 
 There is **no preStop hook** in HA mode. The agent runs as PID 1 and owns SIGTERM: it releases
@@ -536,10 +535,11 @@ do this were removed in **2.0.0** (#286); see
 [Upgrading to 2.0.0](#upgrading-to-200-repmgrd-removed).
 
 **Split-brain handling**: leadership is a Kubernetes Lease, so two pods cannot both hold it. If a
-pod finds itself read-write *without* the Lease — the window a partition can open — it acts on
-`ha.splitBrainDetection.action`: `log` records the condition and demotes; `fence` demotes and
-refuses to serve until the Lease is reacquired. Both are local operations (`pg_ctl`), so the Role
-grants no pod-delete permission. For production, 3+ nodes still reduce partition risk.
+pod finds itself read-write *without* the Lease — the window a partition can open — it records the
+condition and demotes itself, unconditionally. That is a local operation (`pg_ctl`), so the Role
+grants no pod-delete permission. (`ha.splitBrainDetection.action` once named a `log`/`fence` choice
+here and was removed in 2.0.0: the behaviours it selected between were already identical.) For
+production, 3+ nodes still reduce partition risk.
 
 ### Choosing the PostgreSQL major
 
@@ -2546,9 +2546,8 @@ point-in-time target values, and the agent-mode leadership cleanup.
 
 There is no split-brain recovery runbook, because leadership is a Kubernetes Lease and two pods
 cannot hold it at once. If a pod ever finds itself read-write without the Lease — the window an
-asymmetric partition can open — the agent acts on `ha.splitBrainDetection.action`: `log`
-records it and demotes, `fence` demotes and refuses to serve until the Lease is reacquired.
-Both are local (`pg_ctl`) operations that need no manual step.
+asymmetric partition can open — the agent records the condition and demotes itself. That is a
+local (`pg_ctl`) operation that needs no manual step.
 
 Confirm which pod legitimately holds leadership with:
 ```bash
@@ -2705,6 +2704,7 @@ values file fails the upgrade rather than silently deploying something else:
 | `repmgr.failoverMode` | Only one failover path remains | Delete the key |
 | `repmgr.serviceUpdater.*` | The sidecar it sized is gone | Delete the key |
 | `repmgr.monitoringHistoryDays` | Pruned `repmgr.monitoring_history`, which only repmgrd wrote | Delete the key |
+| `repmgr.splitBrainDetection.*` | The `log`/`fence` choice lived in the service-updater's `handle_split_brain()`; the agent always demotes when read-write without the lease, so both values did the same thing | Delete the key |
 | `pgpool.autoFailback` | Rendered PGPool's `auto_failback`, which only applied to the repmgrd failover flow | Delete the key |
 
 ### Migrating a live repmgr cluster to native (#292)
