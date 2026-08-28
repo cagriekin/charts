@@ -5,7 +5,9 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fail=0
 ok()   { echo "PASS: $1"; }
-bad()  { echo "FAIL: $1"; fail=1; }
+# $2 is the optional detail line (what was expected vs seen); printing it is the whole
+# point of passing it, and it was being dropped (#298 review). Same shape as image-smoke.sh.
+bad()  { echo "FAIL: $1"; [ -n "${2:-}" ] && echo "      $2"; fail=1; }
 
 # --- syntax check every shipped script ---
 for s in entrypoint.sh pg-common.sh; do
@@ -18,13 +20,13 @@ done
 # that the scram rule rejects ("does not have a valid SCRAM secret"), a startup
 # race that wedges repmgrd / the standby clone. The CREATE/ALTER USER for the
 # managed users must force scram-sha-256 in-session.
-create_repmgr_line=$(grep -E "CREATE USER \\\$\{REPMGR_USER\}" "${ROOT}/entrypoint.sh")
+create_repmgr_line=$(grep -E 'CREATE USER \\"\$\{repmgr_user_id\}\\"' "${ROOT}/entrypoint.sh")
 if printf '%s' "${create_repmgr_line}" | grep -q "password_encryption='scram-sha-256'"; then
   ok "entrypoint.sh creates the repmgr user with a SCRAM secret"
 else
   bad "entrypoint.sh creates the repmgr user with a SCRAM secret"
 fi
-create_pg_line=$(grep -E "CREATE USER \\\$\{POSTGRES_USER\}" "${ROOT}/entrypoint.sh")
+create_pg_line=$(grep -E 'CREATE USER \\"\$\{pg_user_id\}\\"' "${ROOT}/entrypoint.sh")
 if printf '%s' "${create_pg_line}" | grep -q "password_encryption='scram-sha-256'"; then
   ok "entrypoint.sh creates the postgres user with a SCRAM secret"
 else
@@ -204,7 +206,7 @@ if [ -z "$sentinel_line" ]; then
 else
   ok "#288: bootstrap_initdb writes a completion sentinel"
   # Every step of the bootstrap must precede it: the role/database psql calls and the stop.
-  last_step=$(grep -n 'CREATE USER ${REPMGR_USER}\|pg_ctl -D "$PGDATA" -w stop' "${ROOT}/entrypoint.sh" | tail -1 | cut -d: -f1)
+  last_step=$(grep -nE 'CREATE USER .."\$\{repmgr_user_id\}|pg_ctl -D "\$PGDATA" -w stop' "${ROOT}/entrypoint.sh" | tail -1 | cut -d: -f1)
   if [ -n "$last_step" ] && [ "$sentinel_line" -gt "$last_step" ]; then
     ok "#288: the completion sentinel is written after the bootstrap's last step"
   else
@@ -290,8 +292,8 @@ if grep -vE '^[[:space:]]*#' "${ROOT}/entrypoint.sh" | grep -q 'CREATE EXTENSION
 else
   ok "#290: entrypoint.sh does not create the repmgr extension"
 fi
-for keep in 'CREATE DATABASE \${REPMGR_DB}' 'CREATE USER \${REPMGR_USER}'; do
-  if grep -qE "$keep" "${ROOT}/entrypoint.sh"; then
+for keep in 'CREATE DATABASE \"${repmgr_db_id}\"' 'CREATE USER \"${repmgr_user_id}\"'; do
+  if grep -qF "$keep" "${ROOT}/entrypoint.sh"; then
     ok "#290: still creates ${keep} (native needs the role and database for replication auth)"
   else
     bad "#290: ${keep} was removed; the agent cannot authenticate for replication without it"
@@ -355,6 +357,71 @@ else
 fi
 rm -rf "${_done_tmp}"
 
+# --- #298 review: bootstrap identifiers are QUOTED, and verified under the same case ---
+# Unquoted, PostgreSQL folds an identifier to lower case: POSTGRES_USER=MyApp created role
+# `myapp` while the verification asked pg_authid for rolname = 'MyApp', so the bootstrap could
+# never pass -- it exited before the sentinel and the agent discarded and re-bootstrapped the
+# fresh directory forever. Folding is wrong independently of the check, too: libpq sends
+# `-U MyApp` verbatim and the server compares it exactly, so a folded role cannot be logged in
+# as at all.
+for pair in 'CREATE DATABASE:pg_db_id' 'CREATE USER:pg_user_id' 'ALTER USER:pg_user_id' \
+            'CREATE DATABASE:repmgr_db_id' 'CREATE USER:repmgr_user_id'; do
+  stmt=${pair%%:*}; var=${pair##*:}
+  # The needle carries the BACKSLASHES too: these statements live inside a double-quoted
+  # shell string in entrypoint.sh, so the file literally contains \"${var}\".
+  if grep -qF "${stmt} "'\"'"\${${var}}"'\"' "${ROOT}/entrypoint.sh"; then
+    ok "#298: ${stmt} quotes its identifier (\${${var}})"
+  else
+    bad "#298: ${stmt} interpolates an UNQUOTED identifier; PostgreSQL would fold it to lower case"
+  fi
+done
+# Nothing may interpolate the raw env vars into SQL any more -- those are the unescaped values.
+if grep -E 'psql .*(CREATE|ALTER|GRANT)' "${ROOT}/entrypoint.sh" \
+     | grep -qE '\$\{(POSTGRES_USER|POSTGRES_DB|REPMGR_USER|REPMGR_DB)\}'; then
+  bad "#298: a bootstrap SQL statement still interpolates a raw name env var instead of its escaped copy"
+else
+  ok "#298: bootstrap SQL uses only the escaped identifier/literal copies"
+fi
+# GRANT names both, and both must be quoted.
+if grep -qF 'GRANT ALL PRIVILEGES ON DATABASE \"${repmgr_db_id}\" TO \"${repmgr_user_id}\"' "${ROOT}/entrypoint.sh"; then
+  ok "#298: the repmgr GRANT quotes both identifiers"
+else
+  bad "#298: the repmgr GRANT does not quote both identifiers"
+fi
+# The verification queries compare the SAME names as string literals, so they need the
+# single-quote-escaped copies rather than the raw env values.
+for lit in pg_user_lit pg_db_lit repmgr_user_lit repmgr_db_lit; do
+  if grep -qF "= '\${${lit}}'" "${ROOT}/entrypoint.sh"; then
+    ok "#298: bootstrap verification compares \${${lit}} as an escaped literal"
+  else
+    bad "#298: bootstrap verification does not use the escaped literal \${${lit}}"
+  fi
+done
+# End to end: an uppercase name must survive a bootstrap. Roles/databases are faked, but the
+# SQL text the entrypoint would run is captured, so folding shows up as a lower-case identifier.
+_q_tmp=$(mktemp -d)
+mkdir -p "${_q_tmp}/pgdata"
+_q_sql="${_q_tmp}/sql.log"
+PGDATA="${_q_tmp}/pgdata" POSTGRES_USER=MyApp POSTGRES_DB=MyDB POSTGRES_PASSWORD=pw \
+REPMGR_USER=RepMgr REPMGR_DB=RepMgrDB REPMGR_PASSWORD=pw Q_SQL="${_q_sql}" bash -c '
+  source <(sed -n "/^bootstrap_initdb() {/,/^}/p" '"${ROOT}"'/entrypoint.sh)
+  initdb() { mkdir -p "$PGDATA"; echo 18 > "$PGDATA/PG_VERSION"; }
+  pg_ctl() { :; }
+  # Record every -c payload, and answer the verification SELECTs affirmatively.
+  psql() { for a in "$@"; do :; done; local sql=""; while [ $# -gt 0 ]; do [ "$1" = "-c" ] && sql=$2; [ "$1" = "-tAc" ] && sql=$2; shift; done
+           printf "%s\n" "$sql" >> "$Q_SQL"; case "$sql" in SELECT*) echo 1;; esac; }
+  bootstrap_initdb' >/dev/null 2>&1 || true
+if grep -qF 'CREATE USER "MyApp"' "${_q_sql}" 2>/dev/null && grep -qF 'CREATE USER "RepMgr"' "${_q_sql}" 2>/dev/null; then
+  ok "#298: an uppercase POSTGRES_USER/REPMGR_USER keeps its case in the CREATE statements"
+else
+  bad "#298: an uppercase user name was folded (or no SQL captured)" "$(head -8 "${_q_sql}" 2>/dev/null)"
+fi
+if grep -qF "rolname = 'MyApp'" "${_q_sql}" 2>/dev/null; then
+  ok "#298: verification asks for the same case it created"
+else
+  bad "#298: verification does not query the created case" "$(grep rolname "${_q_sql}" 2>/dev/null | head -3)"
+fi
+rm -rf "${_q_tmp}"
 
 
 echo "----"

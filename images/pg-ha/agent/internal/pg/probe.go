@@ -265,49 +265,6 @@ func (p *Prober) SystemIdentifier(ctx context.Context, ci ConnInfo) (id uint64, 
 	return n, true, nil
 }
 
-// RegisteredNodeIDs returns every node_id present in repmgr.nodes, read from whichever
-// copy ci points at. Unlike StandbyNodeIDs this includes the primary row and is meant to
-// be run against the LOCAL node: repmgr.nodes replicates from the primary, so a standby's
-// own copy tells it which nodes the cluster has a record for.
-//
-// That is the signal behind the #297 promote gate. A node whose own row is absent has
-// never registered, so no survivor can `repmgr standby follow` it -- promoting it would
-// leave the cluster with no serving primary. A malformed row is an error rather than a
-// silent skip, so a broken table cannot read as "nobody is registered" and quietly
-// disable the gate.
-//
-// REPMGR MODE ONLY. Since #288 the caller does not invoke this under the native mechanism at
-// all -- native clusters have no repmgr extension, so the read could only ever fail, and it
-// was warning on every promote-candidate tick about a permanent condition. Nothing replaces it
-// there, and nothing needs to: the gate exists because repmgr addresses a follow target by
-// node_id out of this table, whereas native follows by conninfo, so a native primary is
-// followable the moment it promotes.
-//
-// Do not make this return an empty, error-free result for a missing table. It is still
-// reachable under repmgr against a genuinely broken table, and an empty-but-successful read
-// would flip reconcile.Observation.RegistryRead to true and fire the gate -- refusing a
-// legitimate promotion -- which is the opposite of the fail-open behaviour that field's doc
-// promises.
-func (p *Prober) RegisteredNodeIDs(ctx context.Context, ci ConnInfo) ([]int, error) {
-	out, err := p.psql(ctx, ci, "SELECT node_id FROM repmgr.nodes;")
-	if err != nil {
-		return nil, err
-	}
-	var ids []int
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		n, perr := strconv.Atoi(line)
-		if perr != nil {
-			return nil, fmt.Errorf("parse repmgr.nodes node_id %q: %w", line, perr)
-		}
-		ids = append(ids, n)
-	}
-	return ids, nil
-}
-
 // StandbyNodeIDs returns the node_ids of the STANDBY rows in repmgr.nodes, queried on
 // the repmgr database (ci must point at it). The primary uses this to find ghost records
 // left by a replicaCount scale-down (#139). It excludes the primary row deliberately: a

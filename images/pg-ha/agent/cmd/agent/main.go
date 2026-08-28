@@ -753,12 +753,6 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// This pod's name, compared against Marker.Primary so an empty-data lease holder
 	// can recognize it is not the recorded primary and release the lease (#186).
 	o.LocalNode = a.cfg.PodName
-	// #297: read repmgr.nodes ONLY for a promote candidate -- the holder, running and in
-	// recovery, i.e. the one tick-state where the gate can fire. Every other node skips
-	// the query, so this adds no steady-state cost, and RegistryRead stays false so the
-	// gate is inert. The read is against the LOCAL node: repmgr.nodes replicates from the
-	// primary, so this node's own copy is exactly what repmgr itself would consult when
-	// asked to follow someone.
 	a.observeStandbyStall(ctx, &o)
 	// Cascading replication (#29): when enabled, a standby may follow another standby
 	// (the pure cascadeFollowTarget decides; default off -> follow the primary).
@@ -903,7 +897,22 @@ const standbyStallTicks = 36
 func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.Observation) error {
 	// Any action other than Follow changes (or ends) this node's standby identity, so
 	// the next Follow must re-register + repoint.
-	if dec.Action != reconcile.Follow {
+	//
+	// Wait and NoOp are exempt, because neither changes it (#298 review). Both are explicitly
+	// "observe again, touch nothing" -- Decide's own reason for the reachable-standby Wait is
+	// "standby but no known leader; KEEP the current upstream", and NoOp is maintenance pause --
+	// so clearing the latch there erased a fact that was still true. Two things depended on it:
+	//
+	//   - releaseSlotOnFormerUpstream needs the former upstream's name to drop this node's slot
+	//     there after a cascade re-home. One no-leader Wait tick mid-failover (routine: the
+	//     lease is briefly empty after ReleaseOnCancel) blanked it, so the next Follow called
+	//     that helper with "" and returned at its guard -- leaking an inactive, WAL-pinning slot
+	//     on the old intermediate until max_slot_wal_keep_size invalidated it and paged someone.
+	//     Nothing else reclaims it: the upstream's own pass deliberately keeps any slot whose
+	//     ordinal has a live pod.
+	//   - cascadeFollowTarget's #29 anti-thrash stickiness reads the latch, so it lost its
+	//     hysteresis on every Wait tick.
+	if dec.Action != reconcile.Follow && dec.Action != reconcile.Wait && dec.Action != reconcile.NoOp {
 		a.followUpstream = ""
 	}
 	// #289: only the primary and standby steady-state branches observe slots, so any other

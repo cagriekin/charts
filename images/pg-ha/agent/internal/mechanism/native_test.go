@@ -188,11 +188,55 @@ func TestNativeRejoinForceRewindClassifiesConnectionFailure(t *testing.T) {
 }
 
 func TestNativeRejoinForceRewindClassifiesDivergence(t *testing.T) {
-	fr := &fakeRunner{failOn: "--restore-target-wal", failOut: "target server needs to exit backup mode"}
+	// pg_rewind's actual divergence diagnostic, and the ONLY thing that may escalate to the
+	// destructive reclone path (#175).
+	fr := &fakeRunner{failOn: "--restore-target-wal",
+		failOut: "pg_rewind: error: could not find common ancestor of the source and target cluster's timelines"}
 	n, _ := newTestNative(t, fr)
 	err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.h", User: "repmgr", DB: "repmgr"})
 	if !errors.Is(err, ErrRewindDiverged) {
 		t.Errorf("a genuine rewind failure must be ErrRewindDiverged so the caller falls back to ReclonePreserving (#175), got %v", err)
+	}
+}
+
+// #298 review: divergence is detected POSITIVELY, so a rewind failure that is neither a
+// connection blip nor a divergence must NOT escalate. This used to be "anything not on the
+// transient whitelist is divergence", which moved PGDATA aside and re-cloned a healthy node
+// over a rotated password, a missing pg_hba entry, a starting server or a full connection
+// pool -- inverting the #178 contract this classifier exists to uphold.
+func TestNativeRejoinForceRewindDoesNotEscalateUnclassifiedFailures(t *testing.T) {
+	for _, out := range []string{
+		"pg_rewind: error: could not connect to server: FATAL:  password authentication failed for user \"repmgr\"",
+		"pg_rewind: error: no pg_hba.conf entry for host \"10.1.2.3\"",
+		"pg_rewind: error: FATAL:  the database system is starting up",
+		"pg_rewind: error: FATAL:  sorry, too many clients already",
+		"pg_rewind: error: target server must be shut down cleanly",
+		"pg_rewind: error: target server needs to use either data checksums or \"wal_log_hints = on\"",
+		"pg_rewind: error: target server needs to exit backup mode",
+	} {
+		fr := &fakeRunner{failOn: "--restore-target-wal", failOut: out}
+		n, _ := newTestNative(t, fr)
+		err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.h", User: "repmgr", DB: "repmgr"})
+		if err == nil {
+			t.Fatalf("expected an error for %q", out)
+		}
+		if errors.Is(err, ErrRewindDiverged) {
+			t.Errorf("must NOT be classified as divergence (no reclone): %q -> %v", out, err)
+		}
+	}
+}
+
+// libpq's own connect_timeout expiry reports "timeout expired", not the kernel's "connection
+// timed out" -- the commonest transient outage during a rewind, and it must read as transient.
+func TestNativeRejoinForceRewindTreatsLibpqTimeoutAsTransient(t *testing.T) {
+	fr := &fakeRunner{failOn: "--restore-target-wal", failOut: "pg_rewind: error: connection to server failed: timeout expired"}
+	n, _ := newTestNative(t, fr)
+	err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.h", User: "repmgr", DB: "repmgr"})
+	if errors.Is(err, ErrRewindDiverged) {
+		t.Errorf("a libpq connect timeout must not be divergence, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "transient") {
+		t.Errorf("expected the transient wording for a connect timeout, got %v", err)
 	}
 }
 
@@ -855,5 +899,75 @@ func TestNativeEnsureIncludeIsAtomicAndDoesNotAccumulateHeaders(t *testing.T) {
 		if strings.HasPrefix(e.Name(), ".") || strings.Contains(e.Name(), "tmp") {
 			t.Errorf("atomic write left %q behind", e.Name())
 		}
+	}
+}
+
+// #298 review: every command that connects to a PEER must carry PGCONNECT_TIMEOUT. libpq's
+// default connect_timeout is unlimited, so a blackholed upstream (a dead node whose pod has
+// not been evicted, so the address resolves and nothing answers) held the reconcile
+// goroutine for the kernel's ~127s of SYN retries with opMu taken and no heartbeat -- long
+// enough for the liveness probe to SIGKILL an agent supervising a healthy postmaster.
+func TestNativePeerCommandsCarryConnectTimeout(t *testing.T) {
+	peer := Conn{Host: "pg-0.h", User: "repmgr", DB: "repmgr", ConnectTimeout: 7 * time.Second}
+	run := map[string]func(*Native) error{
+		"pg_basebackup": func(n *Native) error { return n.Clone(context.Background(), peer) },
+		"pg_rewind":     func(n *Native) error { return n.RejoinForceRewind(context.Background(), peer) },
+		"psql":          func(n *Native) error { return n.Follow(context.Background(), peer) },
+	}
+	for bin, call := range run {
+		fr := &fakeRunner{}
+		n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+		if err := call(n); err != nil {
+			t.Fatalf("%s path: %v", bin, err)
+		}
+		found := false
+		for _, c := range fr.calls {
+			if !strings.HasSuffix(c.name, bin) {
+				continue
+			}
+			found = true
+			var got string
+			for _, e := range c.env {
+				if strings.HasPrefix(e, "PGCONNECT_TIMEOUT=") {
+					got = e
+				}
+			}
+			if got != "PGCONNECT_TIMEOUT=7" {
+				t.Errorf("%s ran without the peer's connect timeout: env=%v", bin, c.env)
+			}
+		}
+		if !found {
+			t.Errorf("%s was never invoked", bin)
+		}
+	}
+}
+
+// An unset ConnectTimeout must still be bounded -- 10s, matching conninfo()'s default and
+// the prober's. "Unset" is the shape every caller that builds a bare Conn produces.
+func TestNativeConnectTimeoutDefaultsWhenUnset(t *testing.T) {
+	fr := &fakeRunner{}
+	n, _ := newTestNative(t, fr)
+	if err := n.Follow(context.Background(), Conn{Host: "pg-0.h", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := (Conn{}).connectTimeoutSecs(); got != 10 {
+		t.Errorf("connectTimeoutSecs() with no value = %d, want the 10s default", got)
+	}
+}
+
+// #298 review: standby.signal must be written BEFORE the fallible slot ensure. Without that
+// ordering, a slot-create blip after a COMPLETED multi-hour pg_basebackup left the directory
+// in primary shape (source pg_control says "in production", no standby.signal), which the next
+// tick read as a diverged ex-primary -- pg_rewind refuses a target that was not shut down
+// cleanly, so the finished clone was moved aside and the whole base backup re-run.
+func TestNativeFollowWritesStandbySignalEvenWhenSlotEnsureFails(t *testing.T) {
+	fr := &fakeRunner{failOn: "pg_create_physical_replication_slot"}
+	n, dataDir := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	err := n.Follow(context.Background(), Conn{Host: "pg-0.h", User: "repmgr", DB: "repmgr"})
+	if err == nil {
+		t.Fatal("expected Follow to fail when the slot ensure fails")
+	}
+	if _, serr := os.Stat(filepath.Join(dataDir, "standby.signal")); serr != nil {
+		t.Errorf("standby.signal must exist even though Follow failed later: %v", serr)
 	}
 }

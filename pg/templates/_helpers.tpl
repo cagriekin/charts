@@ -1367,6 +1367,37 @@ volumes:
 {{- end }}
 
 {{- /*
+pg.validateHaImageGeneration -- refuse a 1.x HA image pin on a 2.0.0 chart (#298 review).
+
+Chart 2.0.0 and the HA image are versioned together and are NOT interchangeable across the
+major. The chart's repmgr-init container now passes only PG_MAJOR, because 2.x's
+`entrypoint.sh init` reads only that; a 1.x image's init mode execs init-repmgr.sh, which begins
+with ${HEADLESS_SERVICE:?} and ${REPMGR_PASSWORD:?} and so exits non-zero on the unset-variable
+expansion. The result is Init:CrashLoopBackOff on every pod at once -- the whole cluster down,
+after an upgrade helm accepted silently.
+
+That combination is reachable rather than hypothetical: ha.image keeps honouring the repmgr.*
+alias, and the 2.0.0 CHANGELOG says the frozen cagriekin/repmgr pins keep resolving -- true of
+the REGISTRY, but not of this chart. Nothing cross-checked the artifact's generation against the
+chart's expectations, which is exactly the apply-time failure invariant 4 says to convert into a
+render-time one.
+
+Detected on the 1.x tag SCHEME, `trixie-<repmgr-version>-<n>`, the only shape ever published for
+those images and one that cannot collide with the current `<chart-version>-pg<major>` scheme.
+Deliberately narrow: a private mirror with arbitrary tags is not second-guessed (nothing
+distinguishes a mirrored 2.x tag from anything else), and a digest pin is not inspected either.
+This catches the mistake an upgrade actually makes -- carrying the old values file forward.
+*/ -}}
+{{- define "pg.validateHaImageGeneration" -}}
+{{- if .Values.ha.enabled -}}
+{{- $tag := (.Values.ha.image).tag | default "" | toString -}}
+{{- if hasPrefix "trixie-" $tag -}}
+{{- fail (printf "ha.image.tag=%q is a 1.x image tag (the `trixie-<repmgr-version>-<n>` scheme), and chart 2.0.0 cannot run it: the repmgr-init container passes only PG_MAJOR, while a 1.x image's `entrypoint.sh init` runs init-repmgr.sh and hard-fails on the unset HEADLESS_SERVICE and REPMGR_PASSWORD -- every pod would go Init:CrashLoopBackOff at once. Pin the 2.x HA image instead: ha.image.repository=cagriekin/pg-ha and ha.image.tag=<chart-version>-pg<major> (e.g. 2.0.0-pg18, matching ha.image.majorVersion), and move etcd.rbac.bootstrapImage to the same reference. If you are pinning a private mirror of the 2.x image, retag it without the `trixie-` prefix." $tag) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
 pg.validateEtcdBootstrapImage -- the bundled etcd's RBAC-bootstrap Job runs `pg-ha-agent
 rbac-bootstrap`, so it must run the SAME image as the database pods. pg/values.yaml pins
 etcd.rbac.bootstrapImage to match ha.image and its comment says to keep them in lockstep --
@@ -1463,6 +1494,16 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
 {{- end -}}
 
 {{- define "pg.validateLeaseTimings" -}}
+{{- /* HA mode only, matching pg.validateSyncReplicationSlots* (#298 review). Standalone
+       (ha.enabled=false) renders no agent at all -- no Lease, no leaderelection, no env
+       carrying these values -- so a leftover ha.agent.* timing there configures nothing and
+       must not block the install. It did: a 1.x values file switching to standalone while
+       still carrying `repmgr.agent.leaseDuration: 15` (a bare int -- inert and accepted on 1.x,
+       which had no such validator) failed the render outright, a hard upgrade blocker over a
+       key no rendered object reads. The sibling validators state this scoping rule explicitly;
+       this one simply predated it. */ -}}
+{{- if ne (include "pg.agentMode" .) "true" -}}
+{{- else -}}
 {{- $agent := .Values.ha.agent | default dict -}}
 {{- /* Every ha.agent key the agent parses with time.ParseDuration, not just the ordering
        triple: config.Load treats them all the same way, so an unparseable reconcileInterval
@@ -1487,14 +1528,23 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
 {{- $ld := float64 (include "pg.durationMs" $ldRaw) -}}
 {{- $rd := float64 (include "pg.durationMs" $rdRaw) -}}
 {{- $rp := float64 (include "pg.durationMs" $rpRaw) -}}
+{{- /* Ordering first, then client-go's JitterFactor bound -- the same precedence config.Load
+       uses, so a triple that breaks both gets the message for the commoner mistake (#298
+       review). The jitter bound is NOT implied by the ordering: leaderelection requires
+       renewDeadline > 1.2 * retryPeriod, so 15s/12s/10s passed this validator, rendered clean,
+       and then CrashLoopBackOffed every postgresql pod at once with no primary -- precisely the
+       class this guard exists to prevent, on the one inequality it did not carry. */ -}}
 {{- if not (and (gt $ld $rd) (gt $rd $rp)) -}}
 {{- fail (printf "ha.agent lease timings must satisfy leaseDuration > renewDeadline > retryPeriod, but got leaseDuration=%s renewDeadline=%s retryPeriod=%s. client-go's leader election requires it and the agent refuses to start otherwise, so this would render cleanly and then CrashLoopBackOff every postgresql pod at once with no primary. If these came from two different values files, check for a MIXTURE of the deprecated repmgr.agent.* spelling and the canonical ha.agent.* one: where a key is set under both names the repmgr.* value wins, so one timing can come from a 1.x file while the other two come from a newer -f, producing a triple neither file contains. Set all three under the same name (ha.agent.*), or delete the repmgr.agent.* copies." $ldRaw $rdRaw $rpRaw) -}}
+{{- else if le $rd (mulf $rp 1.2) -}}
+{{- fail (printf "ha.agent.renewDeadline is %s and ha.agent.retryPeriod is %s, but client-go's leader election requires renewDeadline > 1.2 x retryPeriod -- it reserves a jitter margin on every renewal attempt -- so the agent refuses to start even though the ordering above is satisfied. Raise renewDeadline above %s, or lower retryPeriod below %s (keeping leaseDuration > renewDeadline > retryPeriod)." $rdRaw $rpRaw (printf "%.0fms" (mulf $rp 1.2)) (printf "%.0fms" (divf $rd 1.2))) -}}
 {{- end -}}
 {{- /* The etcd backend adds a floor of its own: its lease TTL is whole seconds, so config.go
        requires LEASE_DURATION >= 5s there. Same failure shape as above -- valid ordering, clean
        render, refused boot -- so it belongs in the same guard (#291 review). */ -}}
 {{- if and (eq (($agent.dcs).backend | default "kubernetes") "etcd") (lt $ld 5000.0) -}}
 {{- fail (printf "ha.agent.leaseDuration is %s, but the etcd DCS backend requires at least 5s: its lease TTL is expressed in whole seconds, so the agent refuses to start below that (and would CrashLoopBackOff every pod after a clean render). Raise leaseDuration to 5s or more -- keeping leaseDuration > renewDeadline > retryPeriod -- or use ha.agent.dcs.backend: kubernetes." $ldRaw) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 

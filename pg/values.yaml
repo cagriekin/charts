@@ -595,8 +595,9 @@ ha:
     # silently ignored, and so the Mechanism seam stays addressable if a second
     # implementation is ever wanted.
     #
-    # Remaining gap: an EXISTING repmgr cluster cannot be flipped in place yet (#292).
-    # A 1.x cluster upgrading to 2.0.0 needs that migration.
+    # An existing 1.x repmgr cluster IS migrated in place on `helm upgrade` (#292): the
+    # preload is stripped from PGDATA before the postmaster starts, no re-clone, timeline and
+    # system identifier preserved. See the 2.0.0 CHANGELOG and the README migration runbook.
     mechanism: native
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
     # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane

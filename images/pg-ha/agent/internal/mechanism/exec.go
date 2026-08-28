@@ -26,6 +26,19 @@ type OSRunner struct{}
 func (OSRunner) Run(ctx context.Context, env []string, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = append(os.Environ(), env...)
+	// WaitDelay bounds the gap between killing the process and Wait returning, exactly as
+	// pg.OSExec does and for the same reason (#288 review, mirrored here by #298's): a
+	// cancelled context kills only the direct child, while Wait blocks on the output pipe
+	// reaching EOF -- which any GRANDCHILD still holding it prevents. pg_basebackup -X stream
+	// forks a WAL receiver that inherits this pipe, so a cancelled clone could hang Wait
+	// forever with opMu held, starving dcs.OnLost's demote until the kubelet's SIGKILL. That
+	// is the #288 fencing hazard, on the one exec path that had not been given the fix.
+	//
+	// Not shared with pg.OSExec despite the near-duplication: that one returns stdout ONLY
+	// (its callers parse query output, so diagnostics must not be mixed in), while a
+	// mechanism's callers want the failing CLI's own message, hence CombinedOutput. Folding
+	// them together would force one caller class to take the wrong output shape.
+	cmd.WaitDelay = 10 * time.Second
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
@@ -55,9 +68,18 @@ func (c Conn) database() string {
 // conninfo builds a libpq conninfo string WITHOUT the password (that goes via
 // PGPASSWORD), so it never lands in argv or logs.
 func (c Conn) conninfo() string {
-	ct := int(c.ConnectTimeout.Seconds())
-	if ct <= 0 {
-		ct = 10
+	return fmt.Sprintf("host=%s port=%d user=%s dbname=%s connect_timeout=%d", c.Host, c.port(), c.User, c.DB, c.connectTimeoutSecs())
+}
+
+// connectTimeoutSecs is the libpq connect_timeout to use for this peer, in whole seconds,
+// defaulting to 10 when the caller left it unset.
+//
+// Used both in conninfo() (for the tools that take a conninfo string) and as PGCONNECT_TIMEOUT
+// (for the ones addressed with -h/-p/-U, which would otherwise inherit libpq's default of NO
+// timeout at all -- see runConn, #298 review).
+func (c Conn) connectTimeoutSecs() int {
+	if ct := int(c.ConnectTimeout.Seconds()); ct > 0 {
+		return ct
 	}
-	return fmt.Sprintf("host=%s port=%d user=%s dbname=%s connect_timeout=%d", c.Host, c.port(), c.User, c.DB, ct)
+	return 10
 }

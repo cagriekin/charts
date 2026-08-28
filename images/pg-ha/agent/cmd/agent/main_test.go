@@ -2830,3 +2830,40 @@ func TestCascadeUpstreamKeepsAGrandchildsLegacySlot(t *testing.T) {
 		}
 	}
 }
+
+// #298 review: a Wait or NoOp tick must NOT erase the follow latch. Both are "observe again,
+// touch nothing" -- Decide's own reason for the reachable-standby Wait is "keep the current
+// upstream" -- yet act() cleared followUpstream on every non-Follow action. One routine
+// no-leader Wait tick mid-failover (the lease is briefly empty after ReleaseOnCancel) was
+// enough to blank it, after which releaseSlotOnFormerUpstream had no former upstream to drop
+// this node's slot on: an inactive, WAL-pinning slot stayed on the old cascade intermediate
+// until max_slot_wal_keep_size invalidated it. cascadeFollowTarget's anti-thrash stickiness
+// reads the same field and lost its hysteresis the same way.
+func TestActWaitAndNoOpKeepTheFollowLatch(t *testing.T) {
+	for _, action := range []reconcile.Action{reconcile.Wait, reconcile.NoOp} {
+		ex := &scriptedExec{walRcv: "pg-0.h|streaming"}
+		a := newFollowTestAgent(t, ex)
+		a.followUpstream = "pg-1"
+		if err := a.act(context.Background(), reconcile.Decision{Action: action}, reconcile.Observation{}); err != nil {
+			t.Fatalf("act(%s): %v", action, err)
+		}
+		if a.followUpstream != "pg-1" {
+			t.Errorf("act(%s) cleared the follow latch: got %q, want it kept as pg-1", action, a.followUpstream)
+		}
+	}
+}
+
+// ...while an action that genuinely ends this node's standby identity still clears it, so the
+// next Follow re-points and re-registers rather than trusting a stale upstream.
+func TestActPromoteStillClearsTheFollowLatch(t *testing.T) {
+	ex := &scriptedExec{walRcv: "pg-0.h|streaming"}
+	a := newFollowTestAgent(t, ex)
+	a.followUpstream = "pg-1"
+	// RestartLocal is the cheapest such action to drive against this fixture: it only stops
+	// and starts the supervised (fake) postmaster, needing no apiserver client, and it is
+	// unambiguously not a standby-preserving action.
+	_ = a.act(context.Background(), reconcile.Decision{Action: reconcile.RestartLocal}, reconcile.Observation{})
+	if a.followUpstream != "" {
+		t.Errorf("a primary-role action must clear the follow latch, got %q", a.followUpstream)
+	}
+}

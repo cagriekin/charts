@@ -2668,14 +2668,14 @@ sync_slots_pg16_rc=0
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
   --set postgresql.majorVersion=16 --set repmgr.image.majorVersion=16 \
-  --set repmgr.image.tag=trixie-5.5.0-27-pg16 >/dev/null 2>&1 || sync_slots_pg16_rc=$?
+  --set repmgr.image.tag=2.0.0-pg16 >/dev/null 2>&1 || sync_slots_pg16_rc=$?
 assert_gt "#308: syncReplicationSlots on PG16 rejected at render time (agent mode)" "${sync_slots_pg16_rc}" "0"
 # walLevel=logical isolates this to the MAJOR-version guard specifically (both guards
 # would otherwise fire on the default walLevel, and a bare non-zero rc cannot tell which).
 sync_slots_pg16_msg=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical \
   --set postgresql.majorVersion=16 --set repmgr.image.majorVersion=16 \
-  --set repmgr.image.tag=trixie-5.5.0-27-pg16 2>&1 || true)
+  --set repmgr.image.tag=2.0.0-pg16 2>&1 || true)
 assert_contains "#308: PG16 guard message names the version requirement" "${sync_slots_pg16_msg}" "requires PostgreSQL 17+"
 # Statefulset must mount the postgresql-config volume even when
 # postgresql.configuration is empty, so the archive snippet is delivered.
@@ -2788,7 +2788,7 @@ assert_eq "major pin: matched repmgr.image.majorVersion rebump renders (#133)" "
 # a PG17 server while every extension path the chart builds points at /18/.
 major_mismatch_rev=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=trixie-5.5.0-29-pg17 2>&1) && major_mismatch_rev_rc=0 || major_mismatch_rev_rc=$?
+  --set repmgr.image.tag=2.0.0-pg17 2>&1) && major_mismatch_rev_rc=0 || major_mismatch_rev_rc=$?
 assert_eq "major pin: render fails when repmgr.image.majorVersion moves alone (#269)" "1" "${major_mismatch_rev_rc}"
 assert_contains "major pin: reverse mismatch names both values (#269)" "${major_mismatch_rev}" "does not match ha.image.majorVersion"
 
@@ -2813,7 +2813,7 @@ pg17_ext=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 \
   --set postgresql.image.tag=17.10-trixie \
   --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=trixie-5.5.0-29-pg17 \
+  --set repmgr.image.tag=2.0.0-pg17 \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#269: PG17 extension lib path" "${pg17_ext}" "/usr/lib/postgresql/17/lib"
 assert_contains "#269: PG17 extension share path" "${pg17_ext}" "/usr/share/postgresql/17/extension"
@@ -2826,7 +2826,7 @@ pg17_audit=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.audit.enabled=true \
   --set postgresql.majorVersion=17 \
   --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=trixie-5.5.0-29-pg17 \
+  --set repmgr.image.tag=2.0.0-pg17 \
   --show-only templates/postgresql-configmap.yaml 2>&1)
 # pgaudit alone: #294 made native the only mechanism, and native has no repmgr extension to
 # preserve, so the chart merges nothing into the operator's list.
@@ -2837,7 +2837,7 @@ assert_contains "#269: audit on PG17 preloads pgaudit" "${pg17_audit}" "shared_p
 # The two majorVersion values are hand-typed claims; the -pgNN suffix is the artifact. A
 # values file that moves one and not the other must fail at render, not run the wrong major.
 tag_mismatch=$(helm template test-pg "${CHART_DIR}" \
-  --set repmgr.image.tag=trixie-5.5.0-29-pg17 2>&1) && tag_mismatch_rc=0 || tag_mismatch_rc=$?
+  --set repmgr.image.tag=2.0.0-pg17 2>&1) && tag_mismatch_rc=0 || tag_mismatch_rc=$?
 assert_eq "#269: render fails when the -pg17 tag disagrees with majorVersion" "1" "${tag_mismatch_rc}"
 assert_contains "#269: tag mismatch names the tag and the major" "${tag_mismatch}" "is built for PostgreSQL 17"
 
@@ -2846,7 +2846,7 @@ assert_contains "#269: tag mismatch names the tag and the major" "${tag_mismatch
 # entrypoint's require_pg_bindir and the agent then refuse to start the wrong image.
 pgmajor_env=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.majorVersion=17 --set repmgr.image.majorVersion=17 \
-  --set repmgr.image.tag=trixie-5.5.0-29-pg17 \
+  --set repmgr.image.tag=2.0.0-pg17 \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#269: PG_MAJOR env follows repmgr.image.majorVersion" "${pgmajor_env}" "value: \"17\""
 pgmajor_count=$(grep -c "name: PG_MAJOR" <<< "${pgmajor_env}")
@@ -5005,6 +5005,74 @@ etcd_ok_rc=0
 helm template test-pg "${CHART_DIR}" --set ha.agent.dcs.backend=etcd --set etcd.enabled=true \
   >/dev/null 2>&1 || etcd_ok_rc=$?
 assert_eq "#291: etcd DCS on the default 15s lease renders" "0" "${etcd_ok_rc}"
+# #298 review: client-go's JitterFactor bound is NOT implied by the ordering rule.
+# leaderelection requires renewDeadline > 1.2 x retryPeriod and config.Load enforces it, so
+# 15s/12s/10s passed the ordering check, rendered clean, and then CrashLoopBackOffed every pod.
+jitter_out=$(helm template test-pg "${CHART_DIR}" --set ha.agent.renewDeadline=12s \
+  --set ha.agent.retryPeriod=10s 2>&1 || true)
+assert_contains "#298: renewDeadline <= 1.2 x retryPeriod is rejected" \
+  "${jitter_out}" "requires renewDeadline > 1.2 x retryPeriod"
+assert_contains "#298: ...and the message names both offending values" "${jitter_out}" "12s"
+# The boundary is exclusive: exactly 1.2x must fail, just above it must render.
+jb_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.agent.renewDeadline=12s --set ha.agent.retryPeriod=10s \
+  >/dev/null 2>&1 || jb_rc=$?
+assert_gt "#298: exactly 1.2 x retryPeriod is rejected (the bound is exclusive)" "${jb_rc}" 0
+jb_ok_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.agent.renewDeadline=12100ms --set ha.agent.retryPeriod=10s \
+  >/dev/null 2>&1 || jb_ok_rc=$?
+assert_eq "#298: just above 1.2 x retryPeriod renders" "0" "${jb_ok_rc}"
+# A triple that breaks BOTH rules reports the ordering one -- the commoner mistake, and the
+# precedence config.Load itself uses.
+both_out=$(helm template test-pg "${CHART_DIR}" --set ha.agent.renewDeadline=1s \
+  --set ha.agent.retryPeriod=10s 2>&1 || true)
+assert_contains "#298: a triple breaking both rules reports the ordering rule" \
+  "${both_out}" "must satisfy leaseDuration > renewDeadline > retryPeriod"
+
+# #298 review: the whole lease-timing guard is HA-only. Standalone renders no agent -- no Lease,
+# no leaderelection, no env carrying these -- so a leftover ha.agent.* timing configures nothing
+# and must not block the install. A 1.x file switching to standalone while still carrying a bare
+# int (inert and accepted on 1.x, which had no such validator) failed the render outright.
+sa_lease_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 \
+  --set repmgr.agent.leaseDuration=15 >/dev/null 2>&1 || sa_lease_rc=$?
+assert_eq "#298: standalone ignores a non-duration leftover ha.agent.leaseDuration" "0" "${sa_lease_rc}"
+sa_bad_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 \
+  --set ha.agent.leaseDuration=5s --set ha.agent.renewDeadline=10s --set ha.agent.retryPeriod=2s \
+  >/dev/null 2>&1 || sa_bad_rc=$?
+assert_eq "#298: standalone ignores an out-of-order leftover lease triple" "0" "${sa_bad_rc}"
+# ...and the guard still fires in HA mode, which is the point of scoping rather than deleting.
+ha_bad_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.agent.leaseDuration=5s >/dev/null 2>&1 || ha_bad_rc=$?
+assert_gt "#298: the same triple is still rejected with ha.enabled=true" "${ha_bad_rc}" 0
+
+# --- #298 review: a 1.x HA image pin cannot run chart 2.0.0 ---
+# The repmgr-init container passes only PG_MAJOR; a 1.x image's `entrypoint.sh init` runs
+# init-repmgr.sh, which hard-fails on the unset HEADLESS_SERVICE/REPMGR_PASSWORD, so every pod
+# goes Init:CrashLoopBackOff after an upgrade helm accepted silently. ha.image keeps honouring
+# the repmgr.* alias, so carrying a 1.x values file forward is exactly how this is reached.
+legacy_img=$(helm template test-pg "${CHART_DIR}" --set repmgr.image.tag=trixie-5.5.0-33 2>&1 || true)
+assert_contains "#298: a 1.x trixie-* HA image tag is rejected" "${legacy_img}" "is a 1.x image tag"
+assert_contains "#298: ...the message names the offending tag" "${legacy_img}" "trixie-5.5.0-33"
+assert_contains "#298: ...and names the 2.x pin to use instead" "${legacy_img}" "cagriekin/pg-ha"
+# Under the canonical ha.* spelling too.
+legacy_img_ha=$(helm template test-pg "${CHART_DIR}" --set ha.image.tag=trixie-5.5.0-34 2>&1 || true)
+assert_contains "#298: rejected under the ha.image spelling as well" "${legacy_img_ha}" "is a 1.x image tag"
+# The current scheme renders, and so does any tag that is merely unfamiliar -- the guard is
+# narrow on purpose (a private mirror's tags are not second-guessed).
+for good_tag in "2.0.0-pg18" "2.1.0-pg18" "internal-build-42"; do
+  gt_rc=0
+  helm template test-pg "${CHART_DIR}" --set ha.image.tag="${good_tag}" \
+    --set etcd.rbac.bootstrapImage.tag="${good_tag}" >/dev/null 2>&1 || gt_rc=$?
+  assert_eq "#298: HA image tag ${good_tag} renders" "0" "${gt_rc}"
+done
+# Standalone uses the stock postgres image and never runs repmgr-init, so the guard must skip.
+sa_img_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 \
+  --set ha.image.tag=trixie-5.5.0-33 >/dev/null 2>&1 || sa_img_rc=$?
+assert_eq "#298: standalone ignores a stale ha.image.tag" "0" "${sa_img_rc}"
+
 # ...and the floor is etcd-only -- it must not fire on the kubernetes backend.
 k8s_low_rc=0
 helm template test-pg "${CHART_DIR}" --set ha.agent.leaseDuration=3s \

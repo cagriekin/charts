@@ -158,14 +158,34 @@ EOF
     # the extended verification below still backstops anything else that slips through.
     pg_pw_sql=${POSTGRES_PASSWORD//\'/\'\'}
     repmgr_pw_sql=${REPMGR_PASSWORD//\'/\'\'}
+    # QUOTE the identifiers, and quote them everywhere (#298 review). Unquoted, PostgreSQL folds
+    # an identifier to lower case: POSTGRES_USER=MyApp created role `myapp`, while the
+    # verification below asks pg_authid for rolname = 'MyApp' -- so it failed, exited before the
+    # sentinel, and the agent discarded the fresh directory and re-bootstrapped with the same
+    # env: a permanent loop whose FATAL hint blames password quoting. (1.x had the identical
+    # unquoted CREATEs but no verification, so the same values booted; this was a 2.0.0
+    # regression.) Folding is wrong on its own terms too: libpq sends `-U MyApp` verbatim and the
+    # server compares it exactly, so a folded role could never be logged into, and
+    # primary_conninfo's dbname=REPMGR_DB has the same problem. Double any embedded double quote,
+    # which is the identifier escape, so a name cannot terminate the quoted identifier.
+    # ...and single-quote-escaped copies for the VERIFICATION queries below, where the same
+    # names appear as string literals rather than identifiers.
+    pg_user_lit=${POSTGRES_USER//\'/\'\'}
+    pg_db_lit=${POSTGRES_DB//\'/\'\'}
+    repmgr_user_lit=${REPMGR_USER//\'/\'\'}
+    repmgr_db_lit=${REPMGR_DB//\'/\'\'}
+    pg_user_id=${POSTGRES_USER//\"/\"\"}
+    pg_db_id=${POSTGRES_DB//\"/\"\"}
+    repmgr_user_id=${REPMGR_USER//\"/\"\"}
+    repmgr_db_id=${REPMGR_DB//\"/\"\"}
 
-    psql -U postgres -d postgres -c "CREATE DATABASE ${POSTGRES_DB};" 2>/dev/null || true
-    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER ${POSTGRES_USER} WITH SUPERUSER PASSWORD '${pg_pw_sql}';" 2>/dev/null || true
-    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; ALTER USER ${POSTGRES_USER} WITH PASSWORD '${pg_pw_sql}';" 2>/dev/null || true
+    psql -U postgres -d postgres -c "CREATE DATABASE \"${pg_db_id}\";" 2>/dev/null || true
+    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER \"${pg_user_id}\" WITH SUPERUSER PASSWORD '${pg_pw_sql}';" 2>/dev/null || true
+    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; ALTER USER \"${pg_user_id}\" WITH PASSWORD '${pg_pw_sql}';" 2>/dev/null || true
 
-    psql -U postgres -d postgres -c "CREATE DATABASE ${REPMGR_DB};" 2>/dev/null || true
-    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER ${REPMGR_USER} WITH SUPERUSER PASSWORD '${repmgr_pw_sql}';" 2>/dev/null || true
-    psql -U postgres -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE ${REPMGR_DB} TO ${REPMGR_USER};" 2>/dev/null || true
+    psql -U postgres -d postgres -c "CREATE DATABASE \"${repmgr_db_id}\";" 2>/dev/null || true
+    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER \"${repmgr_user_id}\" WITH SUPERUSER PASSWORD '${repmgr_pw_sql}';" 2>/dev/null || true
+    psql -U postgres -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE \"${repmgr_db_id}\" TO \"${repmgr_user_id}\";" 2>/dev/null || true
     # The repmgr DATABASE and ROLE above are created under BOTH mechanisms, on purpose.
     # #288 asked for native bootstrap to create none of the three, but the role and the
     # database are load-bearing in native mode too: the agent connects as REPMGR_USER for
@@ -193,11 +213,11 @@ EOF
     # exits before the sentinel is written, so the next boot discards the torn directory and
     # starts over -- a loud crash-loop naming the cause, rather than a silent wedge.
     bootstrap_ok=yes
-    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname = '${REPMGR_USER}'" 2>/dev/null | grep -q 1; then
+    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname = '${repmgr_user_lit}'" 2>/dev/null | grep -q 1; then
         echo "FATAL: bootstrap did not create the ${REPMGR_USER} role." >&2
         bootstrap_ok=no
     fi
-    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '${REPMGR_DB}'" 2>/dev/null | grep -q 1; then
+    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '${repmgr_db_lit}'" 2>/dev/null | grep -q 1; then
         echo "FATAL: bootstrap did not create the ${REPMGR_DB} database." >&2
         bootstrap_ok=no
     fi
@@ -205,16 +225,16 @@ EOF
     # password -- initdb ran with no --pwfile, so a swallowed CREATE/ALTER USER left it NULL
     # and every network login dead -- and the app database must exist. pg_authid, not
     # pg_roles: pg_roles.rolpassword always reads as NULL, even for superusers.
-    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_authid WHERE rolname = '${POSTGRES_USER}' AND rolpassword IS NOT NULL" 2>/dev/null | grep -q 1; then
+    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_authid WHERE rolname = '${pg_user_lit}' AND rolpassword IS NOT NULL" 2>/dev/null | grep -q 1; then
         echo "FATAL: bootstrap did not leave the ${POSTGRES_USER} role with a password." >&2
         bootstrap_ok=no
     fi
-    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '${POSTGRES_DB}'" 2>/dev/null | grep -q 1; then
+    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '${pg_db_lit}'" 2>/dev/null | grep -q 1; then
         echo "FATAL: bootstrap did not create the ${POSTGRES_DB} database." >&2
         bootstrap_ok=no
     fi
     if [ "$bootstrap_ok" != "yes" ]; then
-        echo "FATAL: not marking the bootstrap complete; this data directory will be discarded and re-bootstrapped on the next start. If it repeats, check POSTGRES_PASSWORD / REPMGR_PASSWORD for characters that break the SQL above (a literal single quote is the usual culprit) and the postgres server log for the swallowed error." >&2
+        echo "FATAL: not marking the bootstrap complete; this data directory will be discarded and re-bootstrapped on the next start. If it repeats, check POSTGRES_PASSWORD / REPMGR_PASSWORD and the user/database NAMES for characters that break the SQL above, and the postgres server log for the swallowed error." >&2
         exit 1
     fi
 

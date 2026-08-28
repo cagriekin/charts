@@ -107,6 +107,30 @@ func (n *Native) run(ctx context.Context, name string, args ...string) (string, 
 	return n.Runner.Run(ctx, env, name, args...)
 }
 
+// runConn invokes a binary that connects to peer c, with PGPASSWORD and -- crucially --
+// PGCONNECT_TIMEOUT set.
+//
+// libpq's default connect_timeout is UNLIMITED: it waits out the kernel's SYN retries, ~127s
+// on Linux's default tcp_syn_retries=6. Every command here addressed its peer with -h/-p/-U
+// rather than a conninfo string, so none of them carried the connect_timeout that Conn already
+// specifies, and a blackholed upstream (a dead node whose pod has not been evicted yet, so the
+// address still resolves and nothing answers) blocked the reconcile goroutine for those two
+// minutes with opMu held and no heartbeat. /healthz goes stale at reconcileInterval*3 = 15s and
+// the liveness probe gives up after 10 failures at 10s spacing (~115s), so the kubelet SIGKILLs
+// an agent that is PID 1 over a perfectly healthy postmaster -- taking the standby down, and
+// repeating for as long as the partition lasts (#298 review).
+//
+// Every OTHER remote call on this goroutine is already bounded for exactly this reason: the
+// prober sets both PGCONNECT_TIMEOUT and a per-call ctx deadline, and the apiserver calls run
+// under fenceBudget. These were the exceptions.
+func (n *Native) runConn(ctx context.Context, c Conn, name string, args ...string) (string, error) {
+	env := []string{fmt.Sprintf("PGCONNECT_TIMEOUT=%d", c.connectTimeoutSecs())}
+	if n.Password != "" {
+		env = append(env, "PGPASSWORD="+n.Password)
+	}
+	return n.Runner.Run(ctx, env, name, args...)
+}
+
 // managedConfPath is the agent-owned fragment inside PGDATA.
 func (n *Native) managedConfPath() string {
 	return filepath.Join(n.DataDir, managedConfName)
@@ -366,17 +390,32 @@ func (n *Native) Follow(ctx context.Context, upstream Conn) error {
 	// primary_slot_name pointing at a slot that does not exist the standby cannot stream
 	// either way, so a loud error the agent logs and retries beats a "successful" repoint
 	// whose only symptom is a walreceiver looping in the postmaster log.
+	// standby.signal is what makes the postmaster start in recovery, and it is created FIRST
+	// -- ahead of the fallible slot ensure and conf write -- because it is the only step whose
+	// ABSENCE is dangerous (#298 review).
+	//
+	// Clone calls Follow on a directory that pg_basebackup just filled from a running primary:
+	// its pg_control says "in production" and it has no standby.signal, so until this file
+	// exists the data reads as primary-state. A transient failure below therefore used to
+	// leave a COMPLETED clone (kept deliberately -- discardTornClone's no-marker branch) in
+	// primary shape, and the next tick took it for a diverged ex-primary: pg_rewind refuses a
+	// target that was not shut down cleanly, which escalated to ReclonePreserving and re-ran
+	// the entire multi-hour base backup. Same shape after a rewind, where the node genuinely
+	// was a primary moments ago.
+	//
+	// Ordering it first is safe in the other direction too: standby.signal without
+	// primary_conninfo starts a standby that simply waits for WAL, whereas conninfo without
+	// standby.signal starts a SECOND read-write primary -- the two-writer risk. Creating it is
+	// idempotent, so the reload path (already Running && InRecovery) is unaffected.
+	sig := filepath.Join(n.DataDir, "standby.signal")
+	if err := writeFileAtomic(sig, "", 0o600); err != nil {
+		return fmt.Errorf("native: create standby.signal: %w", err)
+	}
 	if err := n.ensureSlotOnUpstream(ctx, upstream); err != nil {
 		return err
 	}
 	if err := n.writeManagedConf(upstream.conninfo()); err != nil {
 		return err
-	}
-	// standby.signal is what makes the postmaster start in recovery. Creating it is
-	// idempotent, and it must exist BEFORE the caller restarts the server.
-	sig := filepath.Join(n.DataDir, "standby.signal")
-	if err := writeFileAtomic(sig, "", 0o600); err != nil {
-		return fmt.Errorf("native: create standby.signal: %w", err)
 	}
 	return nil
 }
@@ -424,11 +463,20 @@ func (n *Native) Clone(ctx context.Context, source Conn) error {
 	if n.SlotName != "" {
 		args = append(args, "--slot", n.SlotName)
 	}
-	if out, err := n.run(ctx, n.bin("pg_basebackup"), args...); err != nil {
+	// runConn, not run: pg_basebackup is addressed with -h/-p/-U, so without PGCONNECT_TIMEOUT
+	// its connect phase is unbounded (#298 review). No ctx deadline, deliberately -- a base
+	// backup of a large cluster legitimately runs for hours, and the connect bound is what this
+	// path actually needed.
+	if out, err := n.runConn(ctx, source, n.bin("pg_basebackup"), args...); err != nil {
 		return fmt.Errorf("native: pg_basebackup from %s: %w: %s", source.Host, err, strings.TrimSpace(out))
 	}
 	return n.Follow(ctx, source)
 }
+
+// slotEnsureTimeout is the total budget for the slot-create query, generous enough that a
+// merely slow upstream is not failed (the connect bound is the tighter one at 10s) but far
+// inside the ~115s in which the liveness probe would kill the agent.
+const slotEnsureTimeout = 30 * time.Second
 
 // ensureSlotOnUpstream idempotently creates THIS node's slot on the upstream before a
 // clone (#289).
@@ -459,7 +507,16 @@ func (n *Native) ensureSlotOnUpstream(ctx context.Context, source Conn) error {
 		"-d", source.database(),
 		"-tAc", sql,
 	}
-	if out, err := n.run(ctx, n.bin("psql"), args...); err != nil {
+	// Two bounds, because they cover different hangs (#298 review). PGCONNECT_TIMEOUT (via
+	// runConn) bounds the CONNECT phase, which is what a blackholed peer stalls on; the ctx
+	// deadline bounds the total call, for a server that completes the TCP handshake and then
+	// never answers -- an upstream wedged on an exclusive lock, or one whose backend start is
+	// blocked. One cheap query has no business taking longer than this, and the whole point is
+	// that it runs under opMu on the reconcile goroutine, where an unbounded wait is a
+	// liveness-probe kill rather than a slow tick.
+	ctx, cancel := context.WithTimeout(ctx, slotEnsureTimeout)
+	defer cancel()
+	if out, err := n.runConn(ctx, source, n.bin("psql"), args...); err != nil {
 		// Losing a create/create race means the slot now EXISTS, which is exactly what this
 		// call is for -- so it is success, not failure. The WHERE NOT EXISTS guard above is
 		// not atomic (verified: 40 of 40 concurrent pairs race on PostgreSQL 18), and there
@@ -530,7 +587,9 @@ func (n *Native) RejoinForceRewind(ctx context.Context, target Conn) error {
 		"--restore-target-wal",
 		"--progress",
 	}
-	out, err := n.run(ctx, n.bin("pg_rewind"), args...)
+	// --source-server carries connect_timeout already; PGCONNECT_TIMEOUT (via runConn) is
+	// belt-and-braces so every peer-addressed command in this file is bounded the same way.
+	out, err := n.runConn(ctx, target, n.bin("pg_rewind"), args...)
 	if err == nil {
 		// Same reasoning as Clone (#289): make sure this node's slot exists on the target
 		// BEFORE it starts streaming. The rewind path had been relying on the new primary's
@@ -550,13 +609,23 @@ func (n *Native) RejoinForceRewind(ctx context.Context, target Conn) error {
 		}
 		return nil
 	}
+	if isRewindDivergence(out) {
+		return fmt.Errorf("%w: native: pg_rewind onto %s: %v: %s", ErrRewindDiverged, target.Host, err, strings.TrimSpace(out))
+	}
 	if isConnectionFailure(out) {
 		// Transient: the caller retries next tick. Reporting ErrRewindDiverged here would
 		// trigger a needless full re-clone of a node whose history is probably fine (#178).
 		return fmt.Errorf("native: pg_rewind onto %s: could not connect (transient, not divergence): %w: %s",
 			target.Host, err, strings.TrimSpace(out))
 	}
-	return fmt.Errorf("%w: native: pg_rewind onto %s: %v: %s", ErrRewindDiverged, target.Host, err, strings.TrimSpace(out))
+	// Anything else is NOT divergence either. The default matters more than either list: this
+	// used to be `return ErrRewindDiverged`, so every failure mode absent from the
+	// connection-failure whitelist -- rotated credentials ("password authentication failed"),
+	// a missing pg_hba entry, "the database system is starting up", "too many connections", a
+	// restore_command error -- moved PGDATA aside and re-cloned a node whose history was fine,
+	// which inverts the contract #178 established (see this function's doc comment).
+	return fmt.Errorf("native: pg_rewind onto %s failed for a reason that is not divergence, so the data directory is left alone; retrying: %w: %s",
+		target.Host, err, strings.TrimSpace(out))
 }
 
 // ReclonePreserving renames PGDATA aside to .diverged.<ts>, clones from source, and drops
@@ -582,9 +651,44 @@ func (n *Native) ReclonePreserving(ctx context.Context, source Conn) error {
 	return nil
 }
 
+// isRewindDivergence recognises the ONE thing pg_rewind says when the two histories cannot be
+// reconciled: it could not find a common ancestor of the source and target timelines. That, and
+// only that, is what ErrRewindDiverged means to the caller, and the caller's response is
+// destructive -- ReclonePreserving moves PGDATA aside and re-clones from scratch.
+//
+// Positive detection, rather than "anything not on the transient list" (#298 review). The
+// asymmetry is the whole argument, and it is the same one standbyStallTicks is sized by:
+//
+//   - Calling a NON-divergence failure divergence destroys a healthy standby's data directory,
+//     leaves a .diverged.<ts> copy nothing removes (so repeated attempts fill the PVC), and
+//     re-runs a full base backup. Cost: hours of degraded HA for a node that needed a retry.
+//   - Failing to recognise a GENUINE divergence leaves a standby that keeps retrying the rewind
+//     every stall window (~3 minutes) and logging pg_rewind's own message verbatim. Cost: that
+//     standby stays behind until an operator reads the log; nothing is destroyed, nothing else
+//     in the cluster is affected, and the alerts for a non-streaming standby already exist.
+//
+// So an unrecognised message must fall on the second side, which means the divergence list --
+// not the transient list -- is the one that has to be exact.
+//
+// Deliberately NOT treated as divergence: "target server must be shut down cleanly" (a state
+// error the caller can fix, and #298's standby.signal-first ordering in Follow stops it
+// arising), "wal_log_hints"/data-checksums complaints (a config problem a reclone would
+// reproduce), and "from different systems" (a DIFFERENT cluster -- invariant 9's
+// assertSameCluster refuses before the rewind, and cloning from it would be the real disaster).
+func isRewindDivergence(out string) bool {
+	// pg_rewind: "could not find common ancestor of the source and target cluster's timelines".
+	// Matched on the distinctive fragment so a wording change across majors, or a prefix from
+	// the surrounding progress output, still classifies.
+	return strings.Contains(strings.ToLower(out), "could not find common ancestor")
+}
+
 // isConnectionFailure recognises pg_rewind/libpq output that means "could not reach the
 // source", as opposed to "histories diverged beyond repair". Keeping these apart is what
 // stops a transient blip from escalating into a full re-clone (#178).
+//
+// Since #298 this list no longer decides whether to reclone -- isRewindDivergence does, and
+// everything unrecognised is retried rather than escalated. It survives because the message it
+// produces is the accurate one for the common case, and because the caller logs it.
 func isConnectionFailure(out string) bool {
 	s := strings.ToLower(out)
 	for _, m := range []string{

@@ -57,6 +57,38 @@ tests:
       - failedTemplate:
           errorPattern: 'splitBrainDetection \(ha\.splitBrainDetection / repmgr\.splitBrainDetection\) was removed in chart 2\.0\.0'
 
+  - it: renewDeadline <= 1.2x retryPeriod is rejected (client-go jitter bound)
+    templates:
+      - templates/statefulset.yaml
+    set:
+      ha.agent.renewDeadline: 12s
+      ha.agent.retryPeriod: 10s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'requires renewDeadline > 1\.2 x retryPeriod'
+
+  - it: standalone is not blocked by a leftover lease timing
+    templates:
+      - templates/statefulset.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+      ha.agent.leaseDuration: 5s
+      ha.agent.renewDeadline: 10s
+      ha.agent.retryPeriod: 2s
+    asserts:
+      - hasDocuments:
+          count: 1
+
+  - it: a 1.x trixie-* HA image tag is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      ha.image.tag: trixie-5.5.0-33
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is a 1\.x image tag .*chart 2\.0\.0 cannot run it'
+
   - it: pgpool.autoFailback is rejected
     templates:
       - templates/statefulset.yaml

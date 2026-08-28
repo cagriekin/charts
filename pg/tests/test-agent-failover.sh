@@ -113,19 +113,29 @@ if [[ "${promoted}" == "true" ]]; then
     done
     assert_eq "#181: rejoined standby is actively streaming (pg_stat_replication)" "streaming" "${stream_state}"
 
-    # #182 regression: a healthy, already-streaming standby must NOT re-run repmgr
-    # standby follow every reconcile tick. Sample several steady-state ticks of the
-    # rejoined standby's agent log (the agent is PID 1 of the postgresql container)
-    # and assert no `act action=Follow` failure surfaced -- the follow is skipped or
-    # latched after attach, never re-forked + logged ERROR each tick.
-    sleep 20
-    follow_errs=$(kubectl logs "${PRIMARY}" -c postgresql -n "${NAMESPACE}" --since=25s 2>/dev/null | grep "repmgr standby follow:" || echo "")
-    assert_not_contains "#182: steady-state standby does not re-run/err on repmgr standby follow" "${follow_errs}" "repmgr standby follow:"
+    # #182 regression: a healthy, already-streaming standby must NOT be re-followed every
+    # reconcile tick. Asserted on REPLICATION STATE, not on log text (#298 review): this
+    # grepped the agent log for "repmgr standby follow:", a string that exists only in Go
+    # comments and is emitted by nothing, so it could never match and the check passed
+    # vacuously -- exactly the regression class it was written to catch went unguarded, and
+    # the native mechanism has no such CLI line to look for in the first place.
+    #
+    # backend_start is the right observable and is mechanism-independent: a re-follow
+    # rewrites primary_conninfo and reloads, which makes the standby's walreceiver
+    # reconnect, which gives the primary a NEW walsender backend and therefore a new
+    # backend_start. Steady state must hold it constant across several ticks.
+    bs_before=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT backend_start FROM pg_stat_replication WHERE application_name='${PRIMARY}'" "testuser" "testdb" 2>/dev/null || echo "")
+    # Non-empty first, so this assertion can never go vacuous the way the old one did.
+    assert_not_eq "#182: the standby's walsender row is observable (guards against a vacuous check)" "" "${bs_before}"
+    sleep 25
+    bs_after=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT backend_start FROM pg_stat_replication WHERE application_name='${PRIMARY}'" "testuser" "testdb" 2>/dev/null || echo "")
+    assert_eq "#182: steady-state standby is not re-followed each tick (walsender backend_start unchanged over ~5 ticks)" "${bs_before}" "${bs_after}"
   else
     skip "demoted ex-primary rejects writes (soft fence) (rejoin did not complete)"
     skip "rejoined standby caught up post-failover data (rejoin did not complete)"
     skip "#181: rejoined standby is actively streaming (rejoin did not complete)"
-    skip "#182: steady-state standby does not re-run/err on repmgr standby follow (rejoin did not complete)"
+    skip "#182: the standby's walsender row is observable (rejoin did not complete)"
+    skip "#182: steady-state standby is not re-followed each tick (rejoin did not complete)"
   fi
 else
   skip "ex-primary rejoins as a standby (in recovery) (failover did not complete)"
@@ -133,7 +143,8 @@ else
   skip "demoted ex-primary rejects writes (soft fence) (failover did not complete)"
   skip "rejoined standby caught up post-failover data (failover did not complete)"
   skip "#181: rejoined standby is actively streaming (failover did not complete)"
-  skip "#182: steady-state standby does not re-run/err on repmgr standby follow (failover did not complete)"
+  skip "#182: the standby's walsender row is observable (failover did not complete)"
+  skip "#182: steady-state standby is not re-followed each tick (failover did not complete)"
 fi
 
 # --- cold boot: full-cluster restart. Both pods come up at once (Parallel); the

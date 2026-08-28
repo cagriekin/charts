@@ -23,6 +23,21 @@ tests:
       - failedTemplate:
           errorPattern: 'failoverMode \(ha\.failoverMode / repmgr\.failoverMode\) was removed in chart 2\.0\.0'
 
+  - it: a 1.x trixie-* HA image tag is rejected
+    set:
+      ha.image.tag: trixie-5.5.0-33
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is a 1\.x image tag .*chart 2\.0\.0 cannot run it'
+
+  - it: renewDeadline <= 1.2x retryPeriod is rejected (client-go jitter bound)
+    set:
+      ha.agent.renewDeadline: 12s
+      ha.agent.retryPeriod: 10s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'requires renewDeadline > 1\.2 x retryPeriod'
+
   - it: repmgr.splitBrainDetection is rejected as a removed key
     set:
       repmgr.splitBrainDetection.action: fence

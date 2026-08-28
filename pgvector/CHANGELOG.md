@@ -102,6 +102,69 @@
 
 ### Fixed
 
+- **A blackholed upstream could get the agent liveness-killed.** `pg_basebackup`, `pg_rewind` and
+  the slot-create `psql` addressed their peer with `-h/-p/-U`, which carries no `connect_timeout`,
+  and libpq's default is unlimited -- so a dead node whose pod had not been evicted (address still
+  resolving, nothing answering) held the reconcile goroutine for the kernel's ~127s of SYN retries
+  with `opMu` taken and no heartbeat. `/healthz` goes stale after `reconcileInterval*3`, so the
+  kubelet SIGKILLed an agent that was PID 1 over a healthy postmaster, and repeated for as long as
+  the partition lasted. All three now carry `PGCONNECT_TIMEOUT` from the peer's own
+  `ConnectTimeout`, and the slot-create query additionally has a 30s total deadline for a server
+  that connects and then never answers. `pg_basebackup` deliberately keeps no total deadline: a
+  large base backup legitimately runs for hours.
+- **A transient `pg_rewind` failure re-cloned a healthy standby.** Divergence was inferred by
+  exclusion -- anything not on an 8-entry connection-failure whitelist became
+  `ErrRewindDiverged` -- so a rotated password, a missing `pg_hba` entry, "the database system is
+  starting up", an exhausted connection pool or a `restore_command` error moved `PGDATA` aside and
+  re-ran a full base backup on a node whose history was fine, leaving another `.diverged.<ts>`
+  copy each time. Divergence is now detected positively (pg_rewind's own "could not find common
+  ancestor of the source and target cluster's timelines") and everything unrecognised is retried
+  instead of escalated: a genuinely stuck node stays behind and logs pg_rewind's message verbatim,
+  which is the recoverable side of the trade.
+- **`standby.signal` is now written before the fallible steps of a follow.** A slot-create blip
+  after a COMPLETED multi-hour clone left the directory in primary shape (the source's
+  "in production" `pg_control`, no `standby.signal`), which the next tick read as a diverged
+  ex-primary: `pg_rewind` refuses a target that was not shut down cleanly, so the finished clone
+  was moved aside and the entire base backup re-run. Ordering it first is also the safer failure
+  in the other direction -- `standby.signal` without `primary_conninfo` waits for WAL, whereas
+  `primary_conninfo` without `standby.signal` starts a second read-write primary.
+- **A `Wait` tick leaked a WAL-pinning replication slot in cascade topologies.** `act()` cleared
+  the follow latch on every action other than `Follow`, including `Wait` and `NoOp` -- both of
+  which are "observe again, touch nothing", and one of which Decide labels "keep the current
+  upstream". A single no-leader `Wait` (routine after `ReleaseOnCancel` empties the Lease) blanked
+  the former upstream, so the next `Follow` could not drop this node's slot on the intermediate it
+  had left, and the inactive slot pinned WAL there until `max_slot_wal_keep_size` invalidated it.
+  The same field carries `cascadeFollowTarget`'s anti-thrash stickiness, which lost its hysteresis
+  the same way. `Wait` and `NoOp` no longer clear it.
+- **An uppercase character in a user or database name made the bootstrap unpassable.** The
+  `CREATE USER`/`CREATE DATABASE`/`GRANT` statements used unquoted identifiers, which PostgreSQL
+  folds to lower case, while #294's verification step compared `pg_authid.rolname` against the raw
+  env value -- so `POSTGRES_USER=MyApp` created `myapp`, failed verification, exited before the
+  completion sentinel, and the agent discarded and re-bootstrapped the fresh directory forever
+  (with a FATAL hint that blamed password quoting). Folding was wrong on its own terms too: libpq
+  sends `-U MyApp` verbatim and the server compares it exactly. Identifiers are now quoted (with
+  embedded quotes doubled) and the verification queries use single-quote-escaped literals. 1.x had
+  the same unquoted statements but no verification, so this was a 2.0.0 regression.
+- **`mechanism.OSRunner` now sets `WaitDelay`,** matching `pg.OSExec`. Without it a cancelled
+  command's grandchild holding the output pipe (`pg_basebackup -X stream` forks exactly such a WAL
+  receiver) blocked `Wait` forever with `opMu` held, starving `dcs.OnLost`'s demote until the
+  kubelet's SIGKILL -- the #288 fencing hazard, on the one exec path that had not been given the
+  fix.
+- **Render-time guards for three upgrade traps** (invariant 4). A 1.x `trixie-*` HA image tag is
+  now rejected: chart 2.0.0's `repmgr-init` passes only `PG_MAJOR`, while a 1.x image's
+  `entrypoint.sh init` hard-fails on the unset `HEADLESS_SERVICE`/`REPMGR_PASSWORD`, so every pod
+  went `Init:CrashLoopBackOff` after an upgrade helm accepted silently. `pg.validateLeaseTimings`
+  now also enforces client-go's `renewDeadline > 1.2 x retryPeriod` jitter bound, which the plain
+  ordering rule does not imply (15s/12s/10s rendered clean and then refused to boot on every pod).
+  And that whole validator is now HA-only, matching its siblings: standalone renders no agent, so
+  a leftover `ha.agent.*` timing there -- a bare int from a 1.x file, say -- no longer blocks the
+  install.
+- **The `#182` no-thrash regression assertion was vacuous.** It grepped the agent log for
+  `repmgr standby follow:`, a string that survives only in Go comments and is emitted by nothing,
+  so the check could never fail and per-tick follow churn went unguarded. It now samples the
+  standby's walsender `backend_start` across ~5 steady-state ticks -- mechanism-independent, and
+  guarded by a non-empty assertion so it cannot go vacuous again.
+
 - `pg/tests/set-pg-major.sh` normalized deliberate older-release image pins (`set-pg-major: keep`)
   asymmetrically: untouched on the default major, but rewritten to the freshly-built tag on a
   non-default one, on the premise that "a non-default major has no older PUBLISHED image". That
@@ -287,6 +350,12 @@
 
 ### Removed (breaking)
 
+- **Removed the provably-inert `#297` promote gate.** It read `repmgr.nodes` to refuse promoting a
+  node no survivor could `repmgr standby follow`; nothing populated its inputs once #294 deleted
+  the repmgr mechanism, so it was unreachable code claiming to guard a promotion path (with eight
+  test cases asserting behaviour on inputs no observer could produce). Native follows by conninfo,
+  so a native primary is followable the moment it promotes. `Prober.RegisteredNodeIDs`,
+  `Observation.RegistryRead`/`LocalRegistered` and `PeerState.Registered` went with it.
 - **Removed `ha.splitBrainDetection` (and the `repmgr.splitBrainDetection` alias).** The
   `log`/`fence` choice selected between behaviours that were already identical: the code that
   distinguished them was the service-updater's `handle_split_brain()`, deleted with repmgrd

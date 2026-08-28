@@ -82,10 +82,6 @@ type PeerState struct {
 	TimelineOK bool
 	LSN        pg.LSN
 	LSNOK      bool
-	// Registered reports that this peer has a row in repmgr.nodes, as seen from the local
-	// node's copy of that table. A registered, reachable peer is a safe hand-off target
-	// for an unregistered lease holder that must not promote (#297).
-	Registered bool
 	// RestoredAt is this peer's last successful restore, gossiped (#288). A peer that was
 	// restored more recently than this node carries the cluster's intended history even though
 	// a PITR restore leaves it BEHIND in LSN terms -- so it outranks on provenance, not
@@ -154,27 +150,6 @@ type Observation struct {
 	// replaying WAL toward consistency is alive but not yet SQL-ready. The agent
 	// must not act on a starting node's stale on-disk role (#181).
 	LocalProcessAlive bool
-	// RegistryRead reports that repmgr.nodes was read successfully this tick, and
-	// LocalRegistered that this node's own row was present in it. Populated only for a
-	// promote candidate (holder, running, in recovery), so a non-candidate leaves
-	// RegistryRead false and the #297 gate inert.
-	//
-	// REPMGR MODE ONLY (#288). The observer skips the read outright under the native
-	// mechanism, so RegistryRead is permanently false there and the gate never fires. That is
-	// deliberate and nothing replaces it: the gate protects against promoting a node no
-	// survivor can `repmgr standby follow`, which is a constraint of resolving an upstream by
-	// node_id out of this table. Native follows by conninfo -- the lease holder's identity
-	// plus the headless FQDN -- so a native primary is followable the moment it promotes.
-	// Earlier revisions of this comment said native's inertness came from the read always
-	// FAILING; it now comes from the read not happening.
-	//
-	// A node with no row of its own has never registered, so no survivor holds a record
-	// for it and none can follow it after it promotes -- the scale-up race that leaves a
-	// cluster with no serving primary. RegistryRead is required before acting on
-	// LocalRegistered: an unreadable table must not be mistaken for "not registered",
-	// which would refuse a legitimate promotion.
-	RegistryRead    bool
-	LocalRegistered bool
 	// Cascade enables cascading replication (#29): a standby may follow another
 	// standby instead of the primary, to offload the primary's WAL senders. Default
 	// false -> every standby follows the lease holder (byte-stable). Even when true,
@@ -259,21 +234,15 @@ func Decide(o Observation) Decision {
 			if o.PeersPending {
 				return d(Wait, "", "cold boot: waiting for peers to report their position before promoting (recovery-mode makes stopped primary-state peers observable)")
 			}
-			// #297: never promote a node that has no repmgr.nodes row while a registered,
-			// reachable peer could serve instead. A scale-up can hand the Lease to a pod
-			// that cloned and started but has not yet registered; if it promotes, the
-			// survivors hold no record for it, `repmgr standby follow` can never resolve
-			// it, and the cluster is left with no serving primary until an operator
-			// intervenes. Handing the Lease to a registered peer is always recoverable --
-			// this node registers as its standby on a later tick and can promote then.
-			//
-			// Deliberately conservative: it fires ONLY when the registry was actually
-			// read AND a registered reachable peer exists. An unreadable table, or a
-			// cluster where nobody is registered, falls through and promotes -- serving
-			// with degraded metadata beats refusing to serve at all.
-			if t := registeredPeerToServe(o); t != "" {
-				return d(ReleaseLease, t, "refuse to promote: this node has no repmgr.nodes record, so no peer could follow it; release so registered peer "+t+" serves instead (#297)")
-			}
+			// #297's "unregistered holder must not promote" gate stood here until #298's
+			// review. It read repmgr.nodes to refuse promoting a node no survivor could
+			// `repmgr standby follow`, which is a constraint of resolving a follow target by
+			// node_id out of that table. Native follows by conninfo -- the lease holder's
+			// identity plus the headless FQDN -- so a native primary is followable the moment
+			// it promotes, and with the repmgr mechanism deleted in #294 nothing populated the
+			// gate's inputs any more: it was provably unreachable code claiming to guard a
+			// promotion path. Removed rather than left inert, so the promote branch reads as
+			// what it now is.
 			return d(Promote, "", "standby holds lease, caught up and most-advanced: promote")
 
 		case o.Local.Running && !o.Local.InRecovery:
@@ -463,37 +432,6 @@ func unsafeToServe(o Observation) (bool, string) {
 		}
 	}
 	return false, ""
-}
-
-// registeredPeerToServe returns a peer that is a SAFE substitute for promoting this node
-// when this node has no repmgr.nodes record, or "" when the gate must not fire. Guarding
-// promotion on this is the #297 fix: an unregistered primary is one no survivor can follow.
-//
-// A candidate must be reachable, registered, AND positionally safe -- same valid timeline
-// and an LSN at least as high as this node's. The position requirement is not a nicety:
-// this gate runs only after the invariant-8 check has established that no reachable peer is
-// AHEAD, so any candidate here is equal or behind. Handing the Lease to a node that is
-// behind is doubly wrong. It flaps -- the peer acquires, its own moreAdvancedPeer check sees
-// this node ahead and reachable, and it releases straight back, forever -- and it parks
-// leadership on a node with less WAL, so if this node then dies the peer promotes and those
-// transactions are gone. Equal position is fine and is the case this gate exists for.
-//
-// Returns "" -- allowing the promotion -- whenever the answer is not certain: the registry
-// was not read this tick, this node is registered, or no reachable peer is both registered
-// and current. Availability wins over metadata tidiness, and promoting the most-advanced
-// node is never a durability regression; the only case worth blocking is the one where a
-// demonstrably safe alternative exists.
-func registeredPeerToServe(o Observation) string {
-	if !o.RegistryRead || o.LocalRegistered {
-		return ""
-	}
-	for i := range o.Peers {
-		p := &o.Peers[i]
-		if p.Reachable && p.Registered && peerNotBehind(*p, o.Local) {
-			return p.Name
-		}
-	}
-	return ""
 }
 
 // peerNotBehind reports whether p is at least as current as the local node: same timeline
