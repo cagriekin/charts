@@ -153,6 +153,14 @@ type agent struct {
 	// lifetime. Once all have, the cold-boot wait never applies again -- so a
 	// steady-state failover is not delayed by a recent agent/pod restart.
 	peersSeen map[string]bool
+	// rewindFailures counts CONSECUTIVE non-divergence pg_rewind failures against
+	// rewindFailureTarget, so a persistently unrewindable node still recovers (#298 review).
+	// Classification is fail-safe -- anything that is not provably divergence is retried
+	// rather than escalated -- which on its own turns a permanent, non-divergent refusal into
+	// a node that never rejoins. This counter is the other half: retry the cheap thing a few
+	// times, then pay for the expensive one that always works.
+	rewindFailures      int
+	rewindFailureTarget string
 	// followUpstream is the leader this standby is currently registered/configured
 	// to follow, so repmgr standby follow (which reconfigures and can restart the
 	// server) runs only when the upstream actually changes, not every tick. Reset
@@ -2472,6 +2480,16 @@ func desiredRoleLabels(self string, peers []reconcile.PeerState) map[string]stri
 // directory (#175). Shared by the RejoinForward decision and by the Follow path when this
 // node is absent from its own repmgr.nodes copy (#297); the remedy is the same, namely take
 // this node's data and metadata from the current primary.
+// rewindFailureLimit is how many consecutive non-divergence pg_rewind failures against one
+// target are tolerated before rejoinOnto escalates to ReclonePreserving.
+//
+// Three, because the two failure shapes it has to separate live on very different timescales.
+// A transient blip (source restarting, credentials mid-rotation, connections exhausted) clears
+// within a tick or two, so three attempts paced by the rejoin path cost nothing and almost
+// always avoid the re-clone. A permanent refusal never clears, and every extra attempt is
+// another interval with this node out of the cluster -- so the limit stays small.
+const rewindFailureLimit = 3
+
 func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 	// Invalidate the follow latch on ENTRY, not after the rejoin succeeds. Either point is
 	// defensible -- the latch caches which upstream replication is actually pointed at, so
@@ -2508,8 +2526,24 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 		// paying a full re-clone plus a preserved .diverged.<ts> copy of PGDATA for a
 		// network blip: exactly the #178 escalation the classifier exists to prevent.
 		if !errors.Is(err, mechanism.ErrRewindDiverged) {
-			return err
+			// Not divergence, so the data directory is not touched -- but count it. A refusal
+			// that is permanent and non-divergent (pg_rewind wanting a config the target does
+			// not have, say) would otherwise retry forever and leave this node out of the
+			// cluster indefinitely, which is the failure mode the fail-safe classification
+			// buys at the price of needing a backstop. After rewindFailureLimit consecutive
+			// failures against the SAME target, re-clone: strictly slower and it preserves the
+			// old directory (#175), but it always converges.
+			if target != a.rewindFailureTarget {
+				a.rewindFailureTarget, a.rewindFailures = target, 0
+			}
+			a.rewindFailures++
+			if a.rewindFailures < rewindFailureLimit {
+				return err
+			}
+			a.log.Warn("pg_rewind has failed repeatedly for a non-divergence reason; escalating to a data-preserving re-clone",
+				"target", target, "attempts", a.rewindFailures, "last_err", err)
 		}
+		a.rewindFailures, a.rewindFailureTarget = 0, ""
 		// Same marker as BootstrapClone (#288 review): ReclonePreserving runs the same
 		// pg_basebackup, so an interrupted one leaves an equally torn PGDATA, and without the
 		// marker discardTornClone is a no-op on the next boot.

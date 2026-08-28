@@ -971,3 +971,54 @@ func TestNativeFollowWritesStandbySignalEvenWhenSlotEnsureFails(t *testing.T) {
 		t.Errorf("standby.signal must exist even though Follow failed later: %v", serr)
 	}
 }
+
+// #298 review, found live: --restore-target-wal is a REQUEST that pg_rewind refuses outright
+// when the target has no restore_command, before doing any work. The chart sets restore_command
+// only with pgbackrest enabled, so on every other cluster this failed EVERY rejoin -- and the
+// old classifier read that as divergence, so the caller "recovered" by re-cloning the whole
+// node. The rewind path had therefore never run in native mode without pgbackrest.
+func TestNativeRejoinRetriesWithoutRestoreTargetWalWhenUnsupported(t *testing.T) {
+	fr := &fakeRunner{failOn: "--restore-target-wal",
+		failOut: `pg_rewind: error: "restore_command" is not set in the target cluster`}
+	n, dataDir := newTestNative(t, fr)
+	if err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.h", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("the rewind must succeed on the retry without the flag: %v", err)
+	}
+	var withFlag, withoutFlag int
+	for _, c := range fr.calls {
+		if !strings.HasSuffix(c.name, "pg_rewind") {
+			continue
+		}
+		if strings.Contains(strings.Join(c.args, " "), "--restore-target-wal") {
+			withFlag++
+		} else {
+			withoutFlag++
+		}
+	}
+	if withFlag != 1 || withoutFlag != 1 {
+		t.Errorf("expected one attempt with the flag then one without, got with=%d without=%d", withFlag, withoutFlag)
+	}
+	// The retry is a real rewind, so it must still leave the node configured as a standby.
+	if _, err := os.Stat(filepath.Join(dataDir, "standby.signal")); err != nil {
+		t.Errorf("standby.signal not created after the fallback rewind: %v", err)
+	}
+}
+
+// The fallback is triggered by that ONE diagnostic, not by any failure carrying the flag: a
+// second blind attempt would double the cost of every genuine failure.
+func TestNativeRejoinDoesNotRetryOtherFailures(t *testing.T) {
+	fr := &fakeRunner{failOn: "--restore-target-wal", failOut: "pg_rewind: error: could not connect to server"}
+	n, _ := newTestNative(t, fr)
+	if err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.h", User: "repmgr", DB: "repmgr"}); err == nil {
+		t.Fatal("expected the failure to propagate")
+	}
+	rewinds := 0
+	for _, c := range fr.calls {
+		if strings.HasSuffix(c.name, "pg_rewind") {
+			rewinds++
+		}
+	}
+	if rewinds != 1 {
+		t.Errorf("expected exactly one pg_rewind attempt, got %d", rewinds)
+	}
+}

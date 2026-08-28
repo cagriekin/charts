@@ -581,15 +581,32 @@ func (n *Native) RejoinForceRewind(ctx context.Context, target Conn) error {
 	if target.Host == "" {
 		return fmt.Errorf("native: rewind needs target.Host")
 	}
-	args := []string{
+	base := []string{
 		"--target-pgdata=" + n.DataDir,
 		"--source-server=" + target.conninfo(),
-		"--restore-target-wal",
 		"--progress",
 	}
 	// --source-server carries connect_timeout already; PGCONNECT_TIMEOUT (via runConn) is
 	// belt-and-braces so every peer-addressed command in this file is bounded the same way.
-	out, err := n.runConn(ctx, target, n.bin("pg_rewind"), args...)
+	out, err := n.runConn(ctx, target, n.bin("pg_rewind"), append([]string{"--restore-target-wal"}, base...)...)
+	// --restore-target-wal is a REQUEST that pg_rewind refuses outright when the target has no
+	// restore_command, and it refuses before doing any work: `pg_rewind: error:
+	// "restore_command" is not set in the target cluster`. The chart only sets restore_command
+	// when pgbackrest is enabled, so on a cluster without it EVERY rejoin failed here -- and
+	// the old classifier called that failure divergence, so the caller "recovered" by
+	// re-cloning the whole node. The rewind path had therefore never actually run in native
+	// mode without pgbackrest; a graceful failover paid a full base backup to bring the
+	// ex-primary back (#298 review, observed live in the failover suite).
+	//
+	// Retried without the flag rather than gated on a chart value: pg_rewind's own diagnostic is
+	// the authority on whether the target can fetch archived WAL, it stays correct if
+	// restore_command appears or disappears later, and the mechanism layer has no business
+	// knowing which chart feature configures archiving. Without the flag pg_rewind reads what it
+	// needs from the target's pg_wal, which is enough whenever the needed segments have not been
+	// recycled -- the overwhelmingly common case for a node that was primary moments ago.
+	if err != nil && strings.Contains(out, `"restore_command" is not set in the target cluster`) {
+		out, err = n.runConn(ctx, target, n.bin("pg_rewind"), base...)
+	}
 	if err == nil {
 		// Same reasoning as Clone (#289): make sure this node's slot exists on the target
 		// BEFORE it starts streaming. The rewind path had been relying on the new primary's

@@ -126,7 +126,10 @@ if [[ "${promoted}" == "true" ]]; then
     # backend_start. Steady state must hold it constant across several ticks.
     bs_before=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT backend_start FROM pg_stat_replication WHERE application_name='${PRIMARY}'" "testuser" "testdb" 2>/dev/null || echo "")
     # Non-empty first, so this assertion can never go vacuous the way the old one did.
-    assert_not_eq "#182: the standby's walsender row is observable (guards against a vacuous check)" "" "${bs_before}"
+    # Spelled as an explicit -n test, NOT assert_not_eq "" ...: the helper rejects an empty
+    # operand by design (#279's anti-vacuity guard), so that form fails whatever the value is.
+    assert_eq "#182: the standby's walsender row is observable (guards against a vacuous check)" \
+      "yes" "$([ -n "${bs_before}" ] && echo yes || echo no)"
     sleep 25
     bs_after=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT backend_start FROM pg_stat_replication WHERE application_name='${PRIMARY}'" "testuser" "testdb" 2>/dev/null || echo "")
     assert_eq "#182: steady-state standby is not re-followed each tick (walsender backend_start unchanged over ~5 ticks)" "${bs_before}" "${bs_after}"

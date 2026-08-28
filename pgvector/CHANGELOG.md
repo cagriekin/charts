@@ -121,6 +121,21 @@
   ancestor of the source and target cluster's timelines") and everything unrecognised is retried
   instead of escalated: a genuinely stuck node stays behind and logs pg_rewind's message verbatim,
   which is the recoverable side of the trade.
+- **`pg_rewind` had never actually run in native mode without pgBackRest, so every graceful
+  failover paid a full base backup.** `RejoinForceRewind` passed `--restore-target-wal`
+  unconditionally, and that is a request pg_rewind refuses outright -- before doing any work --
+  when the target has no `restore_command`, which the chart sets only when pgbackrest is enabled:
+  `pg_rewind: error: "restore_command" is not set in the target cluster`. The old classifier read
+  that refusal as divergence, so the caller "recovered" by re-cloning the entire node, and the
+  rewind path looked healthy while never executing. Found live in the failover suite once the
+  classification above stopped hiding it. pg_rewind is now retried without the flag when it
+  reports exactly that, using its own diagnostic rather than a chart value as the authority --
+  so it stays right if `restore_command` appears or disappears later. Measured on KinD: an
+  ex-primary now rejoins in ONE reconcile tick instead of a full `pg_basebackup`.
+- A non-divergence `pg_rewind` failure that never clears no longer wedges a node out of the
+  cluster: after three consecutive such failures against the same target, `rejoinOnto` escalates
+  to the data-preserving re-clone. Fail-safe classification needs this backstop -- retry the
+  cheap thing a few times, then pay for the expensive one that always converges.
 - **`standby.signal` is now written before the fallible steps of a follow.** A slot-create blip
   after a COMPLETED multi-hour clone left the directory in primary shape (the source's
   "in production" `pg_control`, no `standby.signal`), which the next tick read as a diverged
