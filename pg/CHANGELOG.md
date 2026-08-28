@@ -102,6 +102,22 @@
 
 ### Fixed
 
+- **README triage: removed the prose describing repmgr as a live mode (#298 review).** #294
+  deleted the mechanism but left the documentation describing it, and the README is the authority
+  on values for a published chart. Three claims were not merely stale but wrong: the extensions
+  section named `cagriekin/repmgr` as the image `copy-base-ext` runs from (it is `cagriekin/pg-ha`
+  since #290, across seven passages); the apiserver-routing section told operators `KUBECONFIG`
+  reaches an entrypoint stale-primary guard that shells out to `kubectl`, and 2.0.0 removed both
+  the guard and `kubectl` from the image; and the PostgreSQL-major section presented the
+  `trixie-<repmgr>-<n>` tag table as current with a note about a scheme change "with the next
+  image release" that had already happened. Also corrected: `postgresql.audit.enabled` and
+  `ha.image.majorVersion` describing "repmgr mode"; the `#297` promote gate, which 2.0.0 deleted
+  rather than kept inert; the slot-alerting section, which explained repmgr-mode slot behaviour at
+  length; `ALWAYS_PRIMARY` documented as conditional when it is not; and the repmgr-upstream
+  PostgreSQL 13–17 caveat, moot once repmgr went. Mentions that are still accurate are kept
+  deliberately -- the `repmgr` role, database and `repmgr-password` Secret key keep their names
+  (renaming them rewrites live clusters), as do the `repmgr-init` init container and the
+  `-repmgr` ServiceAccount, and the migration and frozen-image compatibility notes are correct.
 - **`config` and `special-chars` suites now run in CI (#298 review).** Both existed in
   `pg/Makefile` and in no matrix leg, so they only ran when someone remembered. `special-chars`
   is the pointed one: it covers identifiers and passwords with characters that break SQL, which
