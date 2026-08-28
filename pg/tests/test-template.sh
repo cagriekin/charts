@@ -1299,6 +1299,52 @@ assert_contains "config repmgr: pgHba entry in postStart" "${config_repmgr}" "ho
 # image's broad 10.0.0.0/8 and 0.0.0.0/0 catch-alls) went with repmgrd (#286). The agent
 # is the single author of pg_hba now and receives user entries via POSTGRESQL_PGHBA --
 # asserted in the "#199 + #144" block further down. Standalone still uses its own
+# --- #298 review: the pgHba insert must actually LAND, not merely be interpolated ---
+# The two assertions above (and this line's former claim to cover the insert) only proved the
+# entry appears in the rendered postStart script. That is true whether or not the insert can
+# fire, and it could not: the old form was
+# `sed -i '/host all all all scram-sha-256/i ...'`, and no pg_hba this chart produces has ever
+# contained that line -- the entrypoint writes column-aligned rules. So a documented value was a
+# silent no-op in standalone mode and the test suite reported it covered.
+#
+# Behavioural, against the REAL bootstrap pg_hba: extract the awk program from the render and run
+# it on the file a standalone pod actually has, then assert the rule landed ABOVE the network
+# catch-all (pg_hba is first-match-wins, so below it would never be consulted).
+hba_render=$(helm template t "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 \
+  --set 'postgresql.pgHba[0]=host all admin 10.1.0.0/16 scram-sha-256' \
+  --show-only templates/statefulset.yaml 2>/dev/null)
+# Needles kept free of regex metacharacters on purpose: assert_contains greps, it does not
+# match literally, so an anchor pattern containing `^` or `[[:space:]]` can never match its own
+# text and the assertion silently inverts. That is the #279/CodeRabbit trap this file already
+# carries warnings about, and this assertion walked into it on the first try.
+assert_contains "#298: the pgHba insert uses awk, not the unmatchable sed anchor" \
+  "${hba_render}" "awk -v ins="
+assert_contains "#298: the insert fires once, at the first host rule" \
+  "${hba_render}" "done=1"
+assert_not_contains "#298: the unmatchable sed anchor is gone" \
+  "${hba_render}" "host all all all scram-sha-256"
+
+
+_hba_tmp=$(mktemp -d)
+sed -n '/cat > "$PGDATA\/pg_hba.conf"/,/^EOF$/p' "${CHART_DIR}/../images/pg-ha/entrypoint.sh" \
+  | grep -vE '^cat |^EOF$' > "${_hba_tmp}/pg_hba.conf"
+awk -v ins='host all admin 10.1.0.0/16 scram-sha-256' '
+      /^[[:space:]]*host/ && !done { print ins; done=1 }
+      { print }
+      END { if (!done) exit 3 }' "${_hba_tmp}/pg_hba.conf" > "${_hba_tmp}/out" \
+  && mv "${_hba_tmp}/out" "${_hba_tmp}/pg_hba.conf"
+_ins_line=$(grep -n "host all admin 10.1.0.0/16" "${_hba_tmp}/pg_hba.conf" | head -1 | cut -d: -f1)
+_catchall_line=$(grep -n "0.0.0.0/0" "${_hba_tmp}/pg_hba.conf" | head -1 | cut -d: -f1)
+assert_eq "#298: the pgHba entry is inserted into the real bootstrap pg_hba" "yes" \
+  "$([ -n "${_ins_line}" ] && echo yes || echo no)"
+assert_eq "#298: it lands ABOVE the network catch-all (first-match-wins)" "yes" \
+  "$([ -n "${_ins_line}" ] && [ -n "${_catchall_line}" ] && [ "${_ins_line}" -lt "${_catchall_line}" ] && echo yes || echo no)"
+# ...and the local trust lines stay first, which local psql (the agent, the entrypoint) needs.
+_first_local=$(grep -n "^local" "${_hba_tmp}/pg_hba.conf" | head -1 | cut -d: -f1)
+assert_eq "#298: the local trust rules stay above the inserted entry" "yes" \
+  "$([ -n "${_first_local}" ] && [ "${_first_local}" -lt "${_ins_line}" ] && echo yes || echo no)"
+rm -rf "${_hba_tmp}"
+
 # postStart sed insert, covered by the "config standalone: pgHba entry in postStart" case.
 
 # Test: configuration disabled still renders setup-config, which strips a

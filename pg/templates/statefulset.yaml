@@ -1022,9 +1022,33 @@ spec:
                         {{- end }}
                         {{- if .Values.postgresql.pgHba }}
                         HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
+                        {{- /* Anchored on the FIRST host rule, whatever it says (#298 review).
+                               This was `sed -i '/host all all all scram-sha-256/i ...'`, and no
+                               pg_hba this chart produces has ever contained that line -- the
+                               entrypoint writes column-aligned rules ending in
+                               `host    all    all    0.0.0.0/0    scram-sha-256`. So the insert
+                               matched nothing and postgresql.pgHba was a SILENT no-op in
+                               standalone mode, on a documented value. It went unnoticed because
+                               the only test asserted the entry appears in the rendered postStart
+                               script, which is true whether or not the insert can ever fire.
+                               (Agent mode was never affected: there the rules go to the agent,
+                               which places them above the catch-alls itself -- #144.)
+                               Before, not after: pg_hba is FIRST-match-wins, so an appended rule
+                               sits behind the network catch-alls and is never consulted. The
+                               `local ... trust` lines stay above it, which local psql needs.
+                               Temp file + mv, and a loud message rather than a silent skip if
+                               there is no host rule to anchor on. */}}
                         {{- range .Values.postgresql.pgHba }}
                         if ! grep -qF '{{ . }}' "$HBA_FILE"; then
-                          sed -i '/host all all all scram-sha-256/i {{ . }}' "$HBA_FILE"
+                          if awk -v ins='{{ . }}' '
+                                /^[[:space:]]*host/ && !done { print ins; done=1 }
+                                { print }
+                                END { if (!done) exit 3 }' "$HBA_FILE" > "${HBA_FILE}.pgchart.tmp"; then
+                            mv "${HBA_FILE}.pgchart.tmp" "$HBA_FILE"
+                          else
+                            rm -f "${HBA_FILE}.pgchart.tmp"
+                            echo "postStart: no host rule in $HBA_FILE to anchor on; NOT applying pg_hba entry: {{ . }}" >&2
+                          fi
                         fi
                         {{- end }}
                         {{- end }}

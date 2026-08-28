@@ -104,6 +104,20 @@
 
 ### Testing
 
+- **`postgresql.pgHba` was a silent no-op in standalone mode (#298 review).** The postStart hook
+  inserted each entry with `sed -i '/host all all all scram-sha-256/i ...'`, and no `pg_hba.conf`
+  this chart produces has ever contained that line -- the entrypoint writes column-aligned rules
+  ending in `host    all    all    0.0.0.0/0    scram-sha-256`. So the insert matched nothing and
+  a documented value did nothing, in the only mode where that hook runs. It now anchors on the
+  first `host` rule whatever it says, writes via a temp file and `mv`, and prints a message
+  naming the entry rather than skipping in silence when there is no rule to anchor on. Inserted
+  *above* the catch-alls because pg_hba is first-match-wins, and below the `local ... trust`
+  lines that local `psql` depends on. **Agent mode was never affected** -- there the rules go to
+  the agent, which places them above the catch-alls itself (#144). The reason this survived is
+  worth recording: the only test asserted the entry *appears in the rendered postStart script*,
+  which is true whether or not the insert can ever fire, and a comment in the suite claimed that
+  case covered the insert. It is now checked behaviourally -- the awk program is run against the
+  real bootstrap `pg_hba.conf` and the rule's position is asserted.
 - **Both render gates only ever checked each chart's DEFAULT render (#298 review).** kubeconform
   validated 9 resources for `pg`; kube-linter has no values flag at all, so directory mode could
   not see anything else. Every optional component was therefore unchecked by both: pgpool, the
@@ -111,6 +125,13 @@
   hook Jobs. That is the wrong half to skip -- a violation in a default-on object is caught by a
   dozen other things, one in an optional object ships. Both gates now enumerate each chart's own
   `tests/values-*.yaml` fixtures and render every one (44 profiles across the five charts, ~13s).
+  It also validates at **two** Kubernetes versions, because the documented minimum cannot
+  validate kinds that did not exist yet: `ValidatingAdmissionPolicy` and its Binding -- the
+  admission control guarding the destructive restore Job, the single most security-relevant
+  object these charts emit -- were being SKIPPED at 1.29 with the skip invisible, since
+  `-ignore-missing-schemas` treats an unknown core kind exactly like an uncataloged CRD. At 1.30
+  both validate. Skips are now always reported by kind, so an unvalidated resource can never be
+  silent again.
   Widening it immediately found two real policy violations, both fixed here:
   - the **etcd `rbac-bootstrap` Job** was missing the one-shot probe waiver that every sibling
     hook Job in `pg/templates` already carried. It only renders under `dcs.backend: etcd`, so the
