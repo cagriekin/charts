@@ -289,9 +289,16 @@ jobs:
           # because the in-place migration is the one path every existing consumer takes, and
           # a suite that only runs by hand is a suite that rots.
           - migrate-native
+          # #298 review: the failoverMode:repmgrd -> 2.0.0 upgrade, which is the only path in
+          # this release that recreates a live StatefulSet (--cascade=orphan) and the one every
+          # remaining repmgrd consumer must follow. It had no coverage at all -- migrate-native
+          # covers agent->agent and says so in its own comments. Same class as migrate-native:
+          # not hermetic (pulls a released chart + image) and long, so it gets the same budget.
+          - migrate-repmgrd
         include:
           - { suite: agent, coldboot: "1" }
           - { suite: migrate-native, timeout_minutes: 50, no_retry: "1" }
+          - { suite: migrate-repmgrd, timeout_minutes: 50, no_retry: "1" }
     steps:
       - name: Free up runner disk space
         run: |
@@ -335,18 +342,18 @@ jobs:
             kind load image-archive "$tarball" --name pg-test
           done
 
-      # migrate-native alone starts from an older RELEASED image, and it is deliberately NOT in
+      # The two migration suites alone start from an older RELEASED image, and it is deliberately NOT in
       # pg/tests/ci-base-images.txt: that list is bundled into every leg, so adding a ~200MB
-      # image there would ship it to all 44 legs to serve 2 -- the same waste the per-major
+      # image there would ship it to every leg to serve two suites -- the same waste the per-major
       # image bundles exist to avoid. Pull it here, on the runner, once, and kind-load it: with
       # pullPolicy IfNotPresent the alternative is each of the 3 kind workers pulling it
       # anonymously from Docker Hub mid-suite, which is both slower and rate-limitable (#292
       # review). The tag is derived exactly as the suite derives it, so the two cannot drift.
-      - name: Pre-load the released from-image (migrate-native only)
-        if: matrix.suite == 'migrate-native'
+      - name: Pre-load the released from-image (migration suites only)
+        if: matrix.suite == 'migrate-native' || matrix.suite == 'migrate-repmgrd'
         run: |
           set -euo pipefail
-          base=$(grep -oE 'FROM_IMAGE_BASE:-[^}]+' pg/tests/test-migrate-native.sh | head -1 \
+          base=$(grep -oE 'FROM_IMAGE_BASE:-[^}]+' "pg/tests/test-${{ matrix.suite }}.sh" | head -1 \
             | sed 's/^FROM_IMAGE_BASE:-//')
           [ -n "$base" ] || { echo "could not resolve FROM_IMAGE_BASE from the suite" >&2; exit 1; }
           ref="cagriekin/repmgr:${base%-pg[0-9]*}-pg${{ matrix.pg_major }}"

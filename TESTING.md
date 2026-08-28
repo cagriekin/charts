@@ -22,8 +22,22 @@ The charts are tested in layers, fast to slow. The first three run on every PR (
 
 The `<chart>/tests/test-*.sh` suites (driven by each chart's `Makefile`) cover what the
 static and policy layers cannot: failover, rolling restart, TLS, backup/restore, and the
-**behavioral tests of rendered shell scripts** (e.g. the pg entrypoint's stale-primary guard
-and the pgbackrest CronJob's primary discovery). See `<chart>/Makefile` for targets.
+**behavioral tests of rendered shell scripts** (e.g. the pgbackrest CronJob's primary
+discovery). See `<chart>/Makefile` for targets.
+
+Two suites are **not hermetic** against the local tree, and are the only ones that are not:
+`test-migrate-native.sh` and `test-migrate-repmgrd.sh` install a RELEASED chart and a RELEASED
+image from the network before upgrading to the local one, because an upgrade path can only be
+tested from a real starting state. They cover the two migrations a 1.x consumer can be on:
+
+| Suite | From | Recreate | What it proves |
+|-------|------|----------|----------------|
+| `test-migrate-native` | 1.x default (agent) | none — `Parallel` in both | in-place, no re-clone (#292) |
+| `test-migrate-repmgrd` | 1.x `failoverMode: repmgrd` | `--cascade=orphan`, `OrderedReady` → `Parallel` | the orphaned pods are ADOPTED, not rebuilt (#298) |
+
+If you add a third, give it the same treatment: pin the from-version and use an older published
+image tag that CI does not build locally, or the freshly built image shadows it and the "old"
+phase silently runs the new code, making the whole suite assert nothing.
 
 ## Known coverage gaps
 
@@ -32,6 +46,11 @@ Recorded here so a gap is a decision rather than a surprise:
 - **Agent-mode scale-up of a live cluster** (`postgresql.replicaCount` N → N+1) is not
   exercised by any suite. The `upgrade` suite covered it only while it ran in repmgrd mode;
   agent mode hits the race in #297, which restores the coverage as part of its fix.
+- ~~**The `failoverMode: repmgrd` → 2.0.0 upgrade**, the only path in 2.0.0 that recreates a
+  live StatefulSet and the one every remaining repmgrd consumer must follow, had no coverage at
+  all.~~ Closed by `test-migrate-repmgrd.sh` (#298 review). Worth keeping visible as the shape
+  of gap that hides best: `test-migrate-native.sh` existed, was named for migration, and
+  covered a different one — so the gap read as covered from the suite list alone.
 
 ## Per-chart test layout
 

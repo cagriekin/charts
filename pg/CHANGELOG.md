@@ -102,6 +102,24 @@
 
 ### Fixed
 
+### Testing
+
+- **The `failoverMode: repmgrd` → 2.0.0 upgrade now has a KinD suite (#298 review).** It was the
+  only 2.0.0 path that recreates a live StatefulSet, the one every remaining repmgrd consumer
+  must follow, and the only one that can lose a cluster if it goes wrong -- and nothing tested
+  it. `test-migrate-native.sh` covers agent(1.x) → agent(2.0.0) and says so in its own comments,
+  so the gap read as covered from the suite list alone. `pg/tests/test-migrate-repmgrd.sh`
+  installs the released 1.17.0 chart with `failoverMode: repmgrd` and an older published image
+  (both sidecars, `OrderedReady`), then walks the documented runbook and asserts what no data
+  check can: the orphaned pods are **adopted** by the recreated StatefulSet rather than rebuilt
+  (pod UIDs across the recreate), the PVCs keep their identity, the database keeps serving during
+  the orphan window, `podManagementPolicy` flips to `Parallel`, both sidecars go, the Lease
+  appears and its holder is the primary, no node was re-cloned or re-initdb'd, and lease-based
+  failover then works on the migrated cluster with the ex-primary rejoining. It also asserts the
+  runbook's first step is enforced -- all five removed keys refuse to render -- before touching
+  anything, so an operator who skips it finds out with their cluster intact. 46 assertions;
+  wired into the `pg-test` matrix with the same 50-minute no-retry budget as `migrate-native`.
+
 - **README triage: removed the prose describing repmgr as a live mode (#298 review).** #294
   deleted the mechanism but left the documentation describing it, and the README is the authority
   on values for a published chart. Three claims were not merely stale but wrong: the extensions

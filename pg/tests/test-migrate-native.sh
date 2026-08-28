@@ -169,9 +169,10 @@ assert_eq "1.x: every standby is streaming before the migration" "$((NODES - 1))
 # Phase 2: THE MIGRATION -- helm upgrade to the local chart.
 #
 # podManagementPolicy is Parallel in both (agent has been the 1.x default since 1.0.0), so no
-# --cascade=orphan recreate is needed here; that is the repmgrd->agent migration, a different
-# and already-removed path. The StatefulSet rolls pods highest-ordinal first, which is the
-# standbys-before-primary order the issue asks for, for free.
+# --cascade=orphan recreate is needed here; that is the repmgrd->agent migration, covered by
+# test-migrate-repmgrd.sh (#298 review -- it had no coverage at all until then). The StatefulSet
+# rolls pods highest-ordinal first, which is the standbys-before-primary order the issue asks
+# for, for free.
 # ---------------------------------------------------------------------------
 echo ""
 echo "  Phase 2: helm upgrade to the local chart (native mechanism, repmgr-free image)..."

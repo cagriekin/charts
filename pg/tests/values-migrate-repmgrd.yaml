@@ -1,0 +1,90 @@
+# Fixture for test-migrate-repmgrd.sh (#298 review): the documented 1.x `failoverMode: repmgrd`
+# -> 2.0.0 upgrade, which is the ONE path in this release that recreates a live StatefulSet.
+#
+# Deliberately spelled `repmgr:`, not `ha:`, and shared by BOTH phases -- the released 1.x chart
+# has never heard of `ha:`, so the old spelling is the only one both accept. Same reasoning as
+# values-migrate-native.yaml, which this file is otherwise a sibling of.
+#
+# `repmgr.failoverMode` is NOT set here even though the 1.x phase needs `repmgrd`. It cannot be:
+# 2.0.0 rejects the key at render time, and this same file is passed to the 2.0.0 upgrade. The
+# suite sets it with --set for the 1.x install only, which also mirrors what the runbook asks an
+# operator to do -- delete the key from your values, then upgrade.
+#
+# No image pin here either: the suite sets an older RELEASED tag for the 1.x phase (it must
+# contain repmgrd and the service-updater scripts, which the 2.0.0 image does not) and lets the
+# chart's own pin apply to the upgrade. Pinning here would put the tag under set-pg-major.sh's
+# rewrite and drag the "from" image forward to the chart's own, destroying the premise.
+postgresql:
+  image:
+    repository: postgres
+    tag: 17.10-trixie
+    pullPolicy: IfNotPresent
+
+  # Two standbys, not one. The recreate has to adopt EVERY orphaned pod, and with a single
+  # standby "all pods adopted" and "the primary was adopted" are the same assertion -- so a
+  # recreate that silently rebuilt the standby would still pass.
+  replicaCount: 2
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # The whole claim under test is "zero data loss -- pods and PVCs are kept", so persistence is
+  # mandatory: on an emptyDir the suite would assert nothing.
+  persistence:
+    enabled: true
+    storageClass: standard
+    size: 1Gi
+
+  database: testdb
+  username: testuser
+
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 6
+
+  affinity: {}
+
+  # Off deliberately: an orphan-delete + recreate moves pods through NotReady, and a PDB has no
+  # role in a flow the operator drives by hand. Leaving it on would only add a variable.
+  podDisruptionBudget:
+    enabled: false
+
+repmgr:
+  enabled: true
+  username: repmgr
+  database: repmgr
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+pgpool:
+  enabled: false
+
+prometheusExporter:
+  enabled: false
+
+backup:
+  enabled: false
+
+service:
+  type: ClusterIP
+  port: 5432
