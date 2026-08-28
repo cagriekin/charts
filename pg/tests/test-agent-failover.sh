@@ -259,18 +259,15 @@ if [[ "${holder}" == "${POD1}" ]]; then
   done
   assert_eq "${POD0} comes back as a standby after losing its data directory" "t" "${recovered}"
 
-  # The regression assertion: ordinal 0 must have taken the CLONE path, not "first boot".
-  # Without it the stage could pass on a pod whose disk was never actually lost.
-  #
-  # Match the line both new branches share. "cloning as a standby" is only logged by the
-  # find_current_primary branch; when the primary is not visible in that one scan window
-  # the any_peer_reachable branch runs instead and logs "waiting for one instead of
-  # initializing a divergent cluster". Pod-0 recovers correctly either way, so asserting
-  # on the first string alone fails whenever the second branch -- the one that exists for
-  # exactly that race -- is the one taken.
-  init_log=$(kubectl logs "${POD0}" -n "${NAMESPACE}" -c repmgr-init 2>/dev/null || echo "")
-  assert_contains "${POD0}'s init cloned instead of claiming a first boot" "${init_log}" "Empty data directory"
-  assert_not_contains "${POD0}'s init did not call an empty ordinal-0 disk a first boot" "${init_log}" "First boot"
+  # The regression assertions: ordinal 0 must have taken the CLONE path, not initdb'd a
+  # divergent cluster. Without them the stage could pass on a pod whose disk was never
+  # actually lost. Since #288 the entrypoint no longer clones -- it logs the deferral and
+  # hands the empty directory to the agent, whose reconcile loop decides BootstrapClone
+  # (never BootstrapInitdb: an empty non-holder is not a first boot). Assert both halves:
+  # the entrypoint saw a genuinely empty directory, and the agent never chose initdb.
+  init_log=$(kubectl logs "${POD0}" -n "${NAMESPACE}" -c postgresql 2>/dev/null || echo "")
+  assert_contains "${POD0}'s entrypoint deferred the empty directory to the agent (#288)" "${init_log}" "empty data directory; deferring to the agent"
+  assert_not_contains "${POD0}'s agent never initdb'd the recreated ordinal-0 disk" "${init_log}" "action=BootstrapInitdb"
 
   streaming=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT status FROM pg_stat_wal_receiver" "testuser" "testdb" 2>/dev/null || echo "")
   assert_eq "${POD0} is receiving WAL from the primary" "streaming" "${streaming}"
@@ -284,8 +281,8 @@ if [[ "${holder}" == "${POD1}" ]]; then
 else
   for t in "${POD0}'s data directory is really empty before the restart" \
            "${POD0} comes back as a standby after losing its data directory" \
-           "${POD0}'s init cloned instead of claiming a first boot" \
-           "${POD0}'s init did not call an empty ordinal-0 disk a first boot" \
+           "${POD0}'s entrypoint deferred the empty directory to the agent (#288)" \
+           "${POD0}'s agent never initdb'd the recreated ordinal-0 disk" \
            "${POD0} is receiving WAL from the primary" \
            "${POD0} carries data only the surviving primary had (it cloned, not initdb'd)" \
            "the lease stayed with ${POD1} throughout"; do

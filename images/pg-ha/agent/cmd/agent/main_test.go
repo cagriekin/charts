@@ -239,9 +239,13 @@ func newFollowTestAgentWithPM(t *testing.T, ex *scriptedExec, pm *fakePostmaster
 	// ONE temp dir shared by the mechanism and the config: Native writes its managed
 	// fragment into PGDATA and reads postgresql.conf from it, so two directories would make
 	// every Follow fail on a missing file. Seed the file the include-management reads --
-	// a real PGDATA always has one (initdb writes it).
+	// a real PGDATA always has one (initdb writes it) -- and PG_VERSION, without which the
+	// directory reads as pre-clone debris and BootstrapClone's clear empties it (#298 review).
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "postgresql.conf"), []byte("# test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	m := mechanism.NewNative(dir, "/usr/lib/postgresql/18/bin", "pw", "pg_ha_slot_0", "pg-0")

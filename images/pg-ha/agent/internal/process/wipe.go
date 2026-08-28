@@ -121,3 +121,66 @@ func ControlFileMissing(pgdata string) bool {
 	_, err := os.Stat(filepath.Join(pgdata, "global", "pg_control"))
 	return os.IsNotExist(err)
 }
+
+// ClearDebrisDataDir empties a data directory that is NOT an initialized cluster --
+// entries present but no PG_VERSION -- and reports what it removed. It is the
+// complement of WipeDataDir, which refuses exactly this shape.
+//
+// Why it exists (#298 review, observed live): pg_basebackup demands a byte-empty
+// target, while the reconcile loop's "empty data" is HasData, i.e. PG_VERSION. Any
+// stray entry in a database-less PGDATA -- a core dump the kernel wrote into a dying
+// postmaster's cwd, a clone interrupted before PG_VERSION was written (that shape has
+// no complete-marker for discardTornClone to act on), lost+found -- parks the node in
+// a permanent loop: every tick decides BootstrapClone, every pg_basebackup refuses
+// `directory exists but is not empty`. Nothing here is a database (that is what the
+// absent PG_VERSION means), so clearing the entries loses only debris; the removed
+// names are returned so the caller can log what was thrown away.
+//
+// Guards mirror WipeDataDir's, inverted where the shape differs: absolute and >=2
+// segments deep; must currently exist and be a directory; PG_VERSION must be ABSENT
+// (an initialized cluster is WipeDataDir's territory and is refused here); and no
+// LIVE postmaster may own the directory -- unlikely without PG_VERSION, but "cannot
+// prove it is stale" stays a refusal, not permission.
+//
+// A missing directory is a NO-OP, deliberately unlike WipeDataDir: on a fresh native
+// install PGDATA does not exist until pg_basebackup -D creates it, and that is the very
+// clone this runs in front of -- erroring here would block every first clone. (An absent
+// volume mount fails a moment later in pg_basebackup, with its own message.)
+func ClearDebrisDataDir(dir string) ([]string, error) {
+	if !filepath.IsAbs(dir) {
+		return nil, fmt.Errorf("refusing to clear %q: not an absolute path", dir)
+	}
+	clean := filepath.Clean(dir)
+	if depth := len(strings.Split(strings.Trim(clean, "/"), "/")); clean == "/" || depth < 2 {
+		return nil, fmt.Errorf("refusing to clear %q: too close to the filesystem root to be a data directory", clean)
+	}
+	fi, err := os.Stat(clean)
+	if os.IsNotExist(err) {
+		return nil, nil // nothing there yet; pg_basebackup -D creates it
+	}
+	if err != nil {
+		return nil, fmt.Errorf("refusing to clear %q: %w", clean, err)
+	}
+	if !fi.IsDir() {
+		return nil, fmt.Errorf("refusing to clear %q: not a directory", clean)
+	}
+	if _, serr := os.Stat(filepath.Join(clean, "PG_VERSION")); serr == nil {
+		return nil, fmt.Errorf("refusing to clear %q: PG_VERSION present, this is an initialized data directory (WipeDataDir is the destructive path for those)", clean)
+	}
+	if err := checkNoLivePostmaster(clean); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(clean)
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", clean, err)
+	}
+	removed := make([]string, 0, len(entries))
+	for _, e := range entries {
+		p := filepath.Join(clean, e.Name())
+		if rerr := os.RemoveAll(p); rerr != nil {
+			return removed, fmt.Errorf("remove %q: %w", p, rerr)
+		}
+		removed = append(removed, e.Name())
+	}
+	return removed, nil
+}

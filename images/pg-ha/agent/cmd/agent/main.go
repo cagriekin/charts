@@ -1201,6 +1201,25 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		return a.rejoinOnto(ctx, dec.Target)
 
 	case reconcile.BootstrapClone:
+		// pg_basebackup demands a byte-empty target, but Decide's "empty data" is HasData
+		// (PG_VERSION) -- so a stray entry in a database-less PGDATA parks the node in a
+		// permanent BootstrapClone/`exists but is not empty` loop. Observed live (#298
+		// review): the disk-loss suite emptied PGDATA under a running postmaster, the dying
+		// postmaster's core dump landed in its cwd, and the replacement pod wedged for good.
+		// A clone interrupted before PG_VERSION reaches the same state (discardTornClone's
+		// no-PG_VERSION branch clears only the marker). PG_VERSION is absent on this path,
+		// so the entries are debris by definition; clear them here, on every attempt, and
+		// name what was thrown away.
+		// Guarded on HasData: only a database-less directory is debris. PG_VERSION present
+		// here would mean Decide and the filesystem disagree -- leave it alone and let
+		// pg_basebackup refuse loudly rather than delete anything that claims to be a cluster.
+		if !process.HasData(a.cfg.PGDATA) {
+			if removed, derr := process.ClearDebrisDataDir(a.cfg.PGDATA); derr != nil {
+				return fmt.Errorf("clear pre-clone debris from %s: %w", a.cfg.PGDATA, derr)
+			} else if len(removed) > 0 {
+				a.log.Warn("cleared non-database debris from PGDATA before cloning", "removed", removed)
+			}
+		}
 		// Marker around the clone so an interrupted one is discarded on the next boot rather
 		// than stranding the pod with a torn PGDATA (#288 review).
 		a.beginClone()

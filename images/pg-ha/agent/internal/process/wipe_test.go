@@ -184,3 +184,96 @@ func TestWipeDataDirRefusesUnreadablePidFile(t *testing.T) {
 		}
 	}
 }
+
+// --- ClearDebrisDataDir (#298 review): the pre-clone debris path ---
+
+// The wedge this exists for: entries present, PG_VERSION absent -- pg_basebackup would
+// refuse the directory forever while Decide keeps choosing BootstrapClone.
+func TestClearDebrisDataDirRemovesDebrisAndNamesIt(t *testing.T) {
+	dir := t.TempDir()
+	for _, f := range []string{"core.89", "lost+found"} {
+		if err := os.MkdirAll(filepath.Join(dir, f), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed, err := ClearDebrisDataDir(dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(removed) != 2 {
+		t.Fatalf("expected 2 removed entries, got %v", removed)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("directory should be empty, still has %d entries", len(entries))
+	}
+	// The directory itself must survive: it is a volume mount (or inside one).
+	if fi, serr := os.Stat(dir); serr != nil || !fi.IsDir() {
+		t.Fatalf("the data directory itself must remain: %v", serr)
+	}
+}
+
+// An initialized cluster is WipeDataDir's territory; this must never touch one.
+func TestClearDebrisDataDirRefusesInitializedCluster(t *testing.T) {
+	dir := initDataDir(t)
+	_, err := ClearDebrisDataDir(dir)
+	if err == nil {
+		t.Fatal("PG_VERSION present must block the clear")
+	}
+	if !strings.Contains(err.Error(), "PG_VERSION") {
+		t.Errorf("error should name PG_VERSION: %v", err)
+	}
+	if !HasData(dir) {
+		t.Error("nothing may have been removed")
+	}
+}
+
+// A missing PGDATA is the normal fresh-install shape: pg_basebackup -D creates it, so
+// erroring here would block every first clone.
+func TestClearDebrisDataDirMissingPathIsANoOp(t *testing.T) {
+	removed, err := ClearDebrisDataDir(filepath.Join(t.TempDir(), "not-created-yet"))
+	if err != nil {
+		t.Fatalf("a missing directory must be a no-op, got: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Errorf("nothing to remove from a missing directory, got %v", removed)
+	}
+}
+
+// An empty directory is equally a no-op (the common re-clone shape after a wipe).
+func TestClearDebrisDataDirEmptyDirIsANoOp(t *testing.T) {
+	removed, err := ClearDebrisDataDir(t.TempDir())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Errorf("expected no removals, got %v", removed)
+	}
+}
+
+// "Cannot prove it is stale" stays a refusal even on this path.
+func TestClearDebrisDataDirRefusesALivePidFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "postmaster.pid"),
+		[]byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ClearDebrisDataDir(dir); err == nil {
+		t.Fatal("a live postmaster.pid must block the clear")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "postmaster.pid")); err != nil {
+		t.Error("nothing may have been removed")
+	}
+}
+
+// The path-shape guards hold on this entry point too.
+func TestClearDebrisDataDirRefusesShallowOrRelativePaths(t *testing.T) {
+	for _, p := range []string{"/", "/var", "relative/path"} {
+		if _, err := ClearDebrisDataDir(p); err == nil {
+			t.Errorf("expected refusal for %q", p)
+		}
+	}
+}
