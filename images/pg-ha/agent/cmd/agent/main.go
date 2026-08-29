@@ -609,8 +609,7 @@ func (a *agent) tick(ctx context.Context) {
 		// branch's wctx, doubling the worst-case read-write hold to 2x the soft-fence window on
 		// every primary tick (10s vs a 5s budget and a 15s /healthz staleness threshold on chart
 		// defaults) -- so a hung LIST could starve the lost-leadership fence it must never
-		// delay. Out here it cannot, and its extra LIST no longer sits on the promote critical
-		// path either.
+		// delay. Out here it cannot, and its extra LIST stays off the promote critical path.
 		a.topologyTick(ctx)
 	}
 	// Publish what the control API serves. Gated on the API being enabled so a release
@@ -717,9 +716,9 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 			}
 		}
 	}
-	// Peers are probed CONCURRENTLY (#298 review). They used to be probed one after another,
-	// and each probe is a psql connect bounded only by PGCONNECT_TIMEOUT -- so the cost of a
-	// tick was (unreachable peers) x (connect timeout), serially, inside the reconcile loop.
+	// Peers are probed CONCURRENTLY (#298). Each probe is a psql connect bounded only by
+	// PGCONNECT_TIMEOUT, so probing serially costs (unreachable peers) x (connect timeout)
+	// inside the reconcile loop.
 	// On a 5-node cluster that has just lost its network, that is ~40s of a tick whose
 	// interval is 5s: /healthz goes stale at reconcileInterval*3, so the agent could be
 	// liveness-killed for the crime of having dead peers -- the pathology that made every
@@ -734,10 +733,9 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		ps  reconcile.PeerState
 		set bool
 	}
-	// max(0, NodeCount): config.Load only requires REPMGR_NODE_COUNT to PARSE, so a
-	// negative value reaches here, and `make` with a negative length PANICS -- which for
-	// PID 1 is a crash-loop over the postmaster it supervises. The old serial loop simply
-	// did not execute; keep that behaviour (#298 review).
+	// max(0, NodeCount): config.Load only requires REPMGR_NODE_COUNT to PARSE, so a negative
+	// value reaches here and `make` with a negative length PANICS -- which for PID 1 is a
+	// crash-loop over the postmaster it supervises. Probe nothing instead (#298).
 	probes := make([]peerProbe, max(0, a.cfg.NodeCount))
 	var pwg sync.WaitGroup
 	for i := 0; i < a.cfg.NodeCount; i++ {
@@ -986,10 +984,10 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// synchronized_standby_slots is a primary-side reconcile.
 		a.lastSyncStandbySlots = nil
 	case reconcile.NoOp:
-		// Pause is NOT a demotion (#294 review). Decide returns NoOp for maintenance mode, which
-		// used to fall into the retract branch below and ClearSlots() every tick -- so on a
-		// PAUSED PRIMARY, still serving and still holding slots, all three slot alerts went
-		// silent and their `for:` clocks (5m/15m/1h) reset on every tick. A pause is the state
+		// Pause is NOT a demotion (#294 review). Decide returns NoOp for maintenance mode, and
+		// it must not reach the retract branch below: on a PAUSED PRIMARY, still serving and
+		// still holding slots, ClearSlots() every tick silences all three slot alerts and
+		// resets their `for:` clocks (5m/15m/1h) on every tick. A pause is the state
 		// most likely to accumulate slot WAL, and the chart ships PGHAAgentPausedTooLong for
 		// hour-long pauses, so that was a long blind window over a real hazard.
 		//
@@ -1148,9 +1146,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		scancel()
 		// Repoint only when the upstream actually CHANGES. Follow rewrites
 		// primary_conninfo and reloads the postmaster, so running it on every tick of a
-		// healthy standby would SIGHUP it for nothing. (The registration step this latch
-		// used to share the branch with is gone: #294 deleted repmgr.nodes with the
-		// mechanism, and a native standby needs no catalog row to follow or to promote.)
+		// healthy standby would SIGHUP it for nothing.
 		if a.followUpstream == dec.Target {
 			return nil
 		}
@@ -1166,24 +1162,17 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// Skip the command when already streaming from the target; repointing to a NEW
 		// upstream (sender_host differs, or no walreceiver yet) still falls through.
 		//
-		// The register-failure half of this gate went with mechanism.Repmgr (#294): it
-		// existed because `repmgr standby follow` implicitly required this node's
-		// repmgr.nodes record, so skipping the follow on a failed register could strand a
-		// freshly-cloned standby without one. Native keeps no registry at all, so
-		// streaming from the target is now the whole question.
+		// There is no registry to consult: a standby resolves its upstream from the lease
+		// holder plus the headless FQDN, so streaming from the target is the whole question.
 		//
-		// The structure -- a followRan flag rather than an early return -- stays: the #308
-		// dbname convergence below MUST run on the already-streaming path too (its own
-		// comment explains why), and an early return here skipped it.
+		// A followRan flag rather than an early return: the #308 dbname convergence below
+		// MUST run on the already-streaming path too (its own comment explains why).
 		followRan := !a.streamingFromTarget(ctx, dec.Target)
 		if followRan {
 			if err := a.mech.Follow(ctx, upConn); err != nil {
-				// #297's reclone-on-missing-local-record escalation went with mechanism.Repmgr
-				// (#294). It existed because `repmgr standby follow` needed this node's own
-				// repmgr.nodes row and could never obtain one without replication -- a deadlock
-				// only a re-clone broke. Native keeps no registry, so Follow has no equivalent
-				// unrecoverable state: it writes primary_conninfo and standby.signal, and a
-				// failure here is transient and retried on the next tick.
+				// Follow needs no registry row, so it has no unrecoverable state: it writes
+				// primary_conninfo and standby.signal, and a failure here is transient,
+				// retried on the next tick.
 				return err
 			}
 		}
@@ -1466,8 +1455,8 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		return a.sup.Start(ctx)
 
 	case reconcile.BootstrapInitdb:
-		// The entrypoint deliberately does NOT initdb on the agent path (#288). It cannot: the init
-		// container no longer clones, so every pod would arrive with an empty PGDATA and
+		// The entrypoint deliberately does NOT initdb on the agent path (#288). It cannot: the
+		// init container does not clone, so every pod would arrive with an empty PGDATA and
 		// create its own cluster with its own system_identifier -- and assertSameCluster
 		// (invariant 9) then refuses to rejoin any of them, leaving pods Running, never
 		// Ready, holding bogus databases. Whether to initdb is a CLUSTER-WIDE decision, and
@@ -2199,9 +2188,9 @@ func (a *agent) preflightPreload() error {
 // One call site is enough. run() calls this from preflightPreload before leader election,
 // so it precedes boot() and therefore every sup.Start, and:
 //   - A native standby cloned (or restored) from a still-dirty source inherits the line and
-//     carries it until its next restart. Harmless -- repmgr.so is present in every release
-//     before #290 -- and stripped on that pod's next start, so the cluster converges
-//     without chasing the ~10 sup.Start call sites.
+//     carries it until its next restart. Harmless while repmgr.so is present, and stripped
+//     on that pod's next start, so the cluster converges without chasing the ~10 sup.Start
+//     call sites.
 //   - A cluster that skips this release entirely and jumps straight to the repmgr-free
 //     image is still rescued: the strip runs before that pod's first start.
 //
@@ -2608,9 +2597,7 @@ func desiredRoleLabels(self string, peers []reconcile.PeerState) map[string]stri
 
 // rejoinOnto brings this node back under target: rewind forward onto it, or -- when the
 // histories diverged too far for pg_rewind -- re-clone while preserving the old data
-// directory (#175). Reached from the RejoinForward decision. (It was also shared with a
-// Follow-path escalation for a node missing from its own repmgr.nodes copy (#297); that
-// path went with the mechanism in #294 -- native Follow has no catalog to be absent from.)
+// directory (#175). Reached from the RejoinForward decision.
 // rewindFailureLimit is how many consecutive non-divergence pg_rewind failures against one
 // target are tolerated before rejoinOnto escalates to ReclonePreserving.
 //
@@ -2873,7 +2860,7 @@ func (a *agent) topologyTick(ctx context.Context) {
 	// To be accurate about the cost (#288 review): it is NOT free -- livePodOrdinals issues its
 	// own uncached ListPodNames, and slotsTick already made one earlier in the same tick, so a
 	// primary makes two per interval. What the review fixed is where it hurt: topologyTick runs
-	// OUTSIDE opMu and the fence budget, so a slow LIST can no longer delay a marker write, a
+	// OUTSIDE opMu and the fence budget, so a slow LIST cannot delay a marker write, a
 	// routing switch or a lost-leadership fence. The duplicate call is a gauge's cost, paid off
 	// the critical path.
 	// The live pod set from the API, not NodeCount: that env var is baked in at render time and

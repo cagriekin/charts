@@ -745,10 +745,9 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
     {{- fail "postgresql.extensions.env/envFrom/extraVolumes/extraVolumeMounts are set but postgresql.extensions.packages is empty. They configure the apt-get step (a proxy, a mirror sources.list), and with no packages there is no apt-get step -- the init containers take the plain-copy path and your proxy/mount would be silently ignored. Add at least one package, or remove these values." -}}
   {{- end -}}
 {{- end -}}
-{{- /* repmgr-config and service-updater-script are NOT here (#298): both volumes went with
-       repmgrd and the service-updater sidecar, so reserving them refused an operator a name no
-       render can collide with -- a fail message citing "a chart-managed volume" that does not
-       exist. Reserving a name the chart does not use is not free caution; it is a wrong error. */ -}}
+{{- /* Only names a render actually emits belong here (#298). Reserving one the chart does not
+       use is not free caution -- it refuses an operator a name nothing can collide with, under
+       a fail message citing "a chart-managed volume" that does not exist. */ -}}
 {{- $reserved := list "data" "pg-run" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib" "etcd-tls" "agent-control-tls" "pgbackrest" "pgbackrest-config" "pgbackrest-bootstrap-script" -}}
 {{- /* postgresql.extraVolumes lands in the SAME pod volumes list (#320 review), so a name
        shared with it is a duplicate the API server rejects ("volumes[n].name: Duplicate
@@ -1413,8 +1412,8 @@ volumes:
       # files are owned root:root; the exporter runs as a non-root UID with no fsGroup,
       # so the previous 0400 left ca.crt unreadable (sslmode=verify-* scrapes failed with
       # "permission denied", pg_up=0). The exporter verifies the server cert with ca.crt
-      # only -- it needs neither tls.crt nor the server private key tls.key, so they are
-      # no longer mounted.
+      # only -- it needs neither tls.crt nor the server private key tls.key, so neither is
+      # mounted.
       items:
         - key: ca.crt
           path: ca.crt

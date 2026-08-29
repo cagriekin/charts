@@ -406,9 +406,9 @@ func (n *Native) Follow(ctx context.Context, upstream Conn) error {
 	//
 	// Clone calls Follow on a directory that pg_basebackup just filled from a running primary:
 	// its pg_control says "in production" and it has no standby.signal, so until this file
-	// exists the data reads as primary-state. A transient failure below therefore used to
-	// leave a COMPLETED clone (kept deliberately -- discardTornClone's no-marker branch) in
-	// primary shape, and the next tick took it for a diverged ex-primary: pg_rewind refuses a
+	// exists the data reads as primary-state. A transient failure below would otherwise leave
+	// a COMPLETED clone (kept deliberately -- discardTornClone's no-marker branch) in primary
+	// shape, and the next tick would take it for a diverged ex-primary: pg_rewind refuses a
 	// target that was not shut down cleanly, which escalated to ReclonePreserving and re-ran
 	// the entire multi-hour base backup. Same shape after a rewind, where the node genuinely
 	// was a primary moments ago.
@@ -646,12 +646,12 @@ func (n *Native) RejoinForceRewind(ctx context.Context, target Conn) error {
 		return fmt.Errorf("native: pg_rewind onto %s: could not connect (transient, not divergence): %w: %s",
 			target.Host, err, strings.TrimSpace(out))
 	}
-	// Anything else is NOT divergence either. The default matters more than either list: this
-	// used to be `return ErrRewindDiverged`, so every failure mode absent from the
+	// Anything else is NOT divergence either, and the DEFAULT matters more than either list.
+	// Defaulting to ErrRewindDiverged would send every failure absent from the
 	// connection-failure whitelist -- rotated credentials ("password authentication failed"),
 	// a missing pg_hba entry, "the database system is starting up", "too many connections", a
-	// restore_command error -- moved PGDATA aside and re-cloned a node whose history was fine,
-	// which inverts the contract #178 established (see this function's doc comment).
+	// restore_command error -- through a PGDATA move and a re-clone of a node whose history is
+	// fine, inverting the contract #178 established (see this function's doc comment).
 	return fmt.Errorf("native: pg_rewind onto %s failed for a reason that is not divergence, so the data directory is left alone; retrying: %w: %s",
 		target.Host, err, strings.TrimSpace(out))
 }
@@ -714,9 +714,9 @@ func isRewindDivergence(out string) bool {
 // source", as opposed to "histories diverged beyond repair". Keeping these apart is what
 // stops a transient blip from escalating into a full re-clone (#178).
 //
-// Since #298 this list no longer decides whether to reclone -- isRewindDivergence does, and
-// everything unrecognised is retried rather than escalated. It survives because the message it
-// produces is the accurate one for the common case, and because the caller logs it.
+// This list does NOT decide whether to reclone -- isRewindDivergence does, and everything
+// unrecognised is retried rather than escalated. It exists for the message, which is the
+// accurate one for the common case and is what the caller logs.
 func isConnectionFailure(out string) bool {
 	s := strings.ToLower(out)
 	for _, m := range []string{

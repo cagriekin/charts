@@ -3,9 +3,7 @@ set -e
 
 SCRIPT_NAME=${1:-default}
 
-# PG_BINDIR / require_pg_bindir (#269). The repmgr topology and timeline helpers this file
-# used to source alongside them went with the mechanism (#290) -- their only callers were the
-# repmgr paths removed below.
+# PG_BINDIR / require_pg_bindir (#269).
 source /usr/local/bin/pg-common.sh
 
 # The repmgr-only helpers that lived here are gone (#290): scan_peers,
@@ -21,9 +19,8 @@ source /usr/local/bin/pg-common.sh
 # pg_hba, and the managed roles/databases. Extracted into a function so it has exactly ONE
 # implementation shared by both mechanisms (#288).
 #
-# WHO calls it differs, and that is the whole point. Under repmgr the postgres|agent branch
-# calls it inline, as it always did. Under native it must NOT run there: the init container
-# no longer clones, so every pod would reach it with an empty PGDATA and initdb its own
+# WHO calls it matters: it must NOT run in the postgres|agent branch, because the init
+# container does not clone, so every pod would reach it with an empty PGDATA and initdb its own
 # independent cluster -- each with a different system_identifier, which assertSameCluster
 # (invariant 9) then refuses to rejoin forever. The pod would be Running and never Ready,
 # holding a bogus database: strictly worse than the Init:CrashLoopBackOff it replaced.
@@ -32,9 +29,8 @@ source /usr/local/bin/pg-common.sh
 # `entrypoint.sh initdb` from the BootstrapInitdb action. Non-holders wait, then clone with
 # pg_basebackup once the holder is open (reconcile.Decide already encodes exactly this).
 bootstrap_initdb() {
-    # The emptiness check lives INSIDE the function so BOTH callers are protected. It was
-    # previously the caller's `if [ ! -s PG_VERSION ]`, and moving it out would have let a
-    # boot initdb straight over an existing data directory.
+    # The emptiness check lives INSIDE the function so BOTH callers are protected: in the
+    # caller it would let a boot initdb straight over an existing data directory.
     if [ -s "$PGDATA/PG_VERSION" ]; then
         return 0
     fi
@@ -42,9 +38,9 @@ bootstrap_initdb() {
     # Credentials are validated here: AFTER the "already bootstrapped" return, and BEFORE the
     # first write to the volume (#290 review, both rounds).
     #
-    # They used to be resolved after the transient postmaster started, so `docker run <img>
-    # postgres` with neither set ran initdb, appended the GUCs, started a postmaster and only
-    # THEN died on the unset-parameter check -- leaving PG_VERSION present, no completion
+    # Resolved BEFORE the transient postmaster starts: after it, `docker run <img> postgres`
+    # with neither set runs initdb, appends the GUCs, starts a postmaster and only THEN dies
+    # on the unset-parameter check -- leaving PG_VERSION present, no completion
     # sentinel, and a postmaster killed uncleanly with the container; the next run then no-op'd
     # the bootstrap and served a cluster with no application roles.
     #
@@ -102,13 +98,12 @@ max_replication_slots = 10
 max_slot_wal_keep_size = 4GB
 EOF
 
-    # No shared_preload_libraries line at all (#290). This used to append
-    # `shared_preload_libraries = 'repmgr'` here, which #293 then had to strip back out of every
-    # existing data directory -- because the line is baked into the primary's postgresql.conf and
-    # cloned verbatim to every standby, so it outlives any chart change and any helm rollback.
-    # The image no longer ships repmgr.so, so writing it would make every cluster this code
-    # creates unstartable ("could not access file \"repmgr\""). The agent still strips it from
-    # inherited directories; nothing writes it any more.
+    # No shared_preload_libraries line at all (#290/#293). Anything written here is baked into
+    # the primary's postgresql.conf and cloned verbatim to every standby, so it outlives any
+    # chart change and any helm rollback -- and can only be removed by rewriting each PGDATA.
+    # The image ships no repmgr.so, so writing it would make every cluster this code creates
+    # unstartable ("could not access file \"repmgr\""). The agent strips it from inherited
+    # directories; nothing here writes it.
 
     if [ "${PGBACKREST_ENABLED:-}" = "true" ]; then
         cat >> "$PGDATA/postgresql.conf" << PGBR
@@ -151,9 +146,9 @@ EOF
 
     # Wire in the chart's conf.d include (when the chart mounted it) before this function's own
     # pg_ctl start/stop below, not after. shared_preload_libraries is postmaster-only (no
-    # reload); the chart's merged value (repmgr + operator extras/pgaudit) lives in conf.d,
-    # previously only spliced in by the postStart hook once postgres was already accepting
-    # connections -- too late to take effect without a second restart, which nothing forced on a
+    # reload); the chart's merged value (operator extras/pgaudit) lives in conf.d, and the
+    # postStart hook alone would splice it in only once postgres is already accepting
+    # connections -- too late to take effect without a second restart, which nothing forces on a
     # fresh install (the config checksum -> rolling restart wiring only helps a later
     # `helm upgrade`, since there is no prior pod to roll on `helm install`) (#303). A directory
     # check, not an env var, because it needs no chart-side signal: the mount is present here iff
@@ -319,7 +314,7 @@ EOF
 }
 
 # bootstrap_or_discard_torn wraps bootstrap_initdb for `postgres` mode, where a torn bootstrap
-# used to seal in permanently (#298 review). bootstrap_initdb no-ops on any PGDATA that already
+# would otherwise seal in permanently (#298). bootstrap_initdb no-ops on any PGDATA that already
 # has PG_VERSION, so an initdb that ran and then died before writing the completion sentinel --
 # the FATAL verification exit inside the function, a SIGKILL mid-bootstrap, a container lost
 # between the two -- left a cluster with no application role and no application database, which
@@ -405,10 +400,10 @@ case "$SCRIPT_NAME" in
         fi
 
         # postgres mode: a plain single-node postmaster, for running this image directly with no
-        # agent and no HA. It DOES bootstrap its own cluster, because nothing else will (#290
-        # review): the shared bootstrap_initdb used to run for every mode, and moving it under
-        # the agent's control left this branch exec'ing a postmaster at an empty data directory,
-        # which exits immediately. The chart never reaches here -- its own `postgres` command is
+        # agent and no HA. It DOES bootstrap its own cluster, because nothing else will (#290):
+        # bootstrap_initdb is otherwise the agent's to call, which would leave this branch
+        # exec'ing a postmaster at an empty data directory, exiting immediately. The chart never
+        # reaches here -- its own `postgres` command is
         # inside an agent-mode guard and therefore unreachable -- so this is purely for direct
         # image users, which is exactly who has no agent to do it for them.
         bootstrap_or_discard_torn

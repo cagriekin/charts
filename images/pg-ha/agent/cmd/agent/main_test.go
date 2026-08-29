@@ -523,9 +523,7 @@ func TestActFollowReloadsPostmasterAfterSuccess(t *testing.T) {
 // invariant "an attempt to rejoin invalidates the latch" is unconditional, and this pins it
 // so a future edit that reads the latch earlier cannot silently rely on a stale value.
 func TestRejoinOntoClearsFollowLatchEvenWhenItFailsEarly(t *testing.T) {
-	// Driven through RejoinForward directly (#294). It used to arrive via act(Follow) ->
-	// ErrLocalRecordMissing -> rejoinOnto, but that escalation was repmgr-specific and went
-	// with mechanism.Repmgr; RejoinForward is the decision that reaches rejoinOnto now, and the
+	// Driven through RejoinForward directly: it is the decision that reaches rejoinOnto, and the
 	// invariant under test -- the latch is invalidated on ENTRY, not on success -- is unchanged.
 	ex := &scriptedExec{walRcv: ""}
 	pm := &fakePostmaster{stopErr: errors.New("stop failed")}
@@ -806,8 +804,7 @@ func TestShouldAdvanceMarker(t *testing.T) {
 }
 
 func TestBaseName(t *testing.T) {
-	// nodeID's half of this test went with the offset's last propagating consumer (#294);
-	// nodeIDBase itself survives only inside slotOrdinal, which has its own tests.
+	// nodeIDBase lives only inside slotOrdinal, which has its own tests.
 	if got := podname.Base("my-pg-0"); got != "my-pg" {
 		t.Errorf("baseName = %q, want my-pg", got)
 	}
@@ -1241,9 +1238,9 @@ type initdbExec struct {
 	calls [][]string
 	err   error
 	// dataDir lets the fake do what a real `entrypoint.sh initdb` does: LEAVE A CLUSTER
-	// BEHIND. It used to be seeded up front by the fixture instead, which no longer models
-	// the branch -- bootstrapInitdbNative now clears non-database debris from a
-	// PG_VERSION-less PGDATA before shelling out (#298 review), exactly as BootstrapClone
+	// BEHIND. Seeding it up front in the fixture would not model the branch --
+	// bootstrapInitdbNative clears non-database debris from a PG_VERSION-less PGDATA before
+	// shelling out (#298), exactly as BootstrapClone
 	// does, so anything staged before the call is debris by that same definition.
 	dataDir string
 }
@@ -1407,10 +1404,8 @@ func TestResolveReplicaPodUsesAppNameThenSlot(t *testing.T) {
 // streaming replica cannot be identified at all -- otherwise streaming-vs-expected alone would
 // read as healthy while the topology view is incomplete.
 func TestTopologyTickPublishesTheFullPicture(t *testing.T) {
-	// One mechanism since #294, so the expected/gap half is unconditional. It needs the live
-	// pod set, and reconcileSlots is already making that apiserver LIST on this path -- the
-	// second half of this test used to assert that the repmgr path published only what the
-	// primary could see on its own, precisely to avoid charging it a new LIST.
+	// The expected/gap half is unconditional. It needs the live pod set, and reconcileSlots is
+	// already making that apiserver LIST on this path, so it costs nothing extra.
 	//
 	// Two streaming rows (the catchup one is not counted), one of them unidentifiable.
 	const rows = "pg-1|pg_ha_slot_1|streaming\nwalreceiver||streaming\npg-9|pg_ha_slot_9|catchup\n"
@@ -1823,7 +1818,7 @@ func TestLatchFollowPreservesTheRestoreClaim(t *testing.T) {
 }
 
 // dropRestoreRecord is for volumes whose CONTENTS stopped matching the record -- a clone, a
-// rewind, a wipe. Adoption no longer comes through here (it stamps adoptedAt instead, see
+// rewind, a wipe. Adoption does NOT come through here (it stamps adoptedAt instead, see
 // TestAdoptRestoreKeepsTheRecordAndExpiresTheClaim): expiring the claim by unlinking the file
 // destroyed the provenance GET /v1/status reports, permanently, on the restore that succeeded.
 func TestDropRestoreRecordRemovesTheClaim(t *testing.T) {
@@ -2217,9 +2212,9 @@ func TestDropRepmgrPreloadRefusesToStartWhenTheModuleIsAbsent(t *testing.T) {
 	}
 }
 
-// This test used to assert a second, mechanism-specific remediation ("do NOT just drop the
-// library") for a repmgr-MECHANISM node. That branch was removed with #291's rename sweep
-// because it is unreachable: config.Load rejects MECHANISM=repmgr outright, so no agent can
+// There is deliberately no second, mechanism-specific remediation ("do NOT just drop the
+// library") for a repmgr-MECHANISM node: it would be unreachable, because config.Load rejects
+// MECHANISM=repmgr outright, so no agent can
 // be constructed with a non-native mechanism. Asserting unreachability directly is what keeps
 // the deletion honest -- if Load ever starts accepting it again, the remediation has to come
 // back, and this is the test that will say so.
@@ -2393,7 +2388,7 @@ func TestAssertSyncStandbySlotsUsesTheAgentOwnedSetUnderNative(t *testing.T) {
 		t.Errorf("did not name the agent-owned slots: %q", ex.slotSyncSQL[0])
 	}
 	// repmgr.nodes must not be consulted at all: it does not exist on a native cluster, and
-	// reading it is what used to make this fail every tick.
+	// reading it fails every tick.
 	if ex.nodesQueries != 0 {
 		t.Errorf("native path queried repmgr.nodes %d time(s)", ex.nodesQueries)
 	}
@@ -2599,9 +2594,9 @@ func TestBootstrapCloneLatchesTheCloneSourceAsUpstream(t *testing.T) {
 }
 
 func TestLatchFollowRestartsTheStallWindow(t *testing.T) {
-	// #294 review: the counter used to carry across a repoint, so the ordinary failover
+	// #294 review: a counter that carries across a repoint makes the ordinary failover
 	// sequence -- primary dies, this standby climbs past standbyStallTicks while no peer is on
-	// a newer timeline, then a peer promotes -- armed StandbyStalled on the very FIRST tick
+	// a newer timeline, then a peer promotes -- arm StandbyStalled on the very FIRST tick
 	// after the Follow, turning a standby that would have streamed seconds later into a
 	// pg_rewind and possibly a full re-clone.
 	a := &agent{cfg: &config.Config{}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}

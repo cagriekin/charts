@@ -98,9 +98,8 @@ else
   bad "#269: require_pg_bindir message is not actionable" "$bogus"
 fi
 
-# The entrypoint must CALL it -- an unused guard is no guard. One script now, not two:
-# init-repmgr.sh went with the mechanism (#290) and its major check moved into the
-# entrypoint's own `init` mode.
+# The entrypoint must CALL it -- an unused guard is no guard. One script, not two: the major
+# check lives in the entrypoint's own `init` mode (#290).
 if grep -q 'require_pg_bindir' "${ROOT}/entrypoint.sh"; then
   ok "#269: entrypoint.sh calls require_pg_bindir"
 else
@@ -108,9 +107,7 @@ else
 fi
 
 # --- #269/#290: the ARG default must stay in step with the documented default major ---
-# It used to be load-bearing: the unsuffixed published tag was built with no --build-arg, so
-# flipping this silently moved every existing installation to another major on the next image
-# refresh. Under the new tag scheme there is no unsuffixed tag and every publish leg passes
+# There is no unsuffixed tag and every publish leg passes
 # --build-arg explicitly, so nothing PUBLISHED depends on it -- but it still decides what a bare
 # `docker build` and an env-less runtime get, and the docs name 18, so the two must agree.
 if grep -qE '^ARG PG_MAJOR=18$' "${ROOT}/Dockerfile"; then
@@ -139,8 +136,8 @@ else
 fi
 
 # --- #288: initdb has exactly ONE call site, and native must not reach it inline ---
-# The regression this guards: with the init container no longer cloning under native, an
-# inline initdb on any empty PGDATA means every pod creates its own cluster with its own
+# The regression this guards: the init container does not clone, so an inline initdb on any
+# empty PGDATA means every pod creates its own cluster with its own
 # system_identifier -- and assertSameCluster (invariant 9) then refuses to rejoin any of them,
 # so pods sit Running-but-never-Ready holding bogus databases. Strictly worse than the
 # Init:CrashLoopBackOff it replaced.
@@ -260,9 +257,9 @@ fi
 
 # --- #303 follow-up: conf.d must be wired in before the FIRST pg_ctl start ---
 # shared_preload_libraries is postmaster-only (no reload). The chart's merged value
-# (repmgr + operator extras/pgaudit) lives in conf.d; previously only the chart's
-# postStart hook spliced in the include_dir line, after postgres was already
-# accepting connections -- too late for a postmaster-only GUC, and nothing forces a
+# (operator extras/pgaudit) lives in conf.d, and the chart's postStart hook alone would
+# splice in the include_dir line only after postgres is already accepting
+# connections -- too late for a postmaster-only GUC, and nothing forces a
 # second restart on a fresh `helm install` (the config-checksum rolling restart only
 # helps a later `helm upgrade`). entrypoint.sh must wire it in at initdb time,
 # before its own bootstrap pg_ctl start below, so the merged preload list is active
@@ -359,9 +356,9 @@ fi
 
 
 # --- #290: bootstrap_initdb validates credentials BEFORE touching the volume ---
-# It used to resolve them after starting the transient postmaster, so `docker run <img>
-# postgres` with neither set ran initdb, appended GUCs, started a postmaster and only then
-# died on the unset-parameter check -- leaving PG_VERSION present, no completion sentinel, and
+# Resolving them after starting the transient postmaster means `docker run <img> postgres`
+# with neither set runs initdb, appends GUCs, starts a postmaster and only then dies on the
+# unset-parameter check -- leaving PG_VERSION present, no completion sentinel, and
 # a postmaster killed with the container. The next run then no-op'd the bootstrap and served a
 # cluster with no application roles.
 _cred_tmp=$(mktemp -d)
@@ -419,7 +416,7 @@ for pair in 'CREATE DATABASE:pg_db_id' 'CREATE USER:pg_user_id' 'ALTER USER:pg_u
     bad "#298: ${stmt} interpolates an UNQUOTED identifier; PostgreSQL would fold it to lower case"
   fi
 done
-# Nothing may interpolate the raw env vars into SQL any more -- those are the unescaped values.
+# Nothing may interpolate the raw env vars into SQL -- those are the unescaped values.
 if grep -E 'psql .*(CREATE|ALTER|GRANT)' "${ROOT}/entrypoint.sh" \
      | grep -qE '\$\{(POSTGRES_USER|POSTGRES_DB|REPMGR_USER|REPMGR_DB)\}'; then
   bad "#298: a bootstrap SQL statement still interpolates a raw name env var instead of its escaped copy"

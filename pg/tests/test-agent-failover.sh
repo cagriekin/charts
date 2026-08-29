@@ -154,14 +154,8 @@ fi
 # cluster must re-elect a single primary with data intact. This exercises the
 # recovery-mode path (a former primary comes up read-only via standby.signal so the
 # lease holder can rank it) and promote-from-recovery, plus the marker highwater.
-# Runs unconditionally (#298 review). It used to be opt-in behind AGENT_COLDBOOT=1,
-# because promote-from-recovery had a not-yet-live-validated repmgr-catalog interaction
-# (a former primary brought up in recovery mode was still type=primary in repmgr.nodes).
-# #294 deleted the repmgr mechanism and the image no longer creates that catalog, so the
-# hazard the gate deferred cannot occur any more -- and the gate had drifted into making
-# a LOCAL run report three skips for a stage CI was running all along (the matrix set
-# coldboot: "1" for this suite), with a message that blamed a prior-stage failure that
-# had not happened. A full-cluster restart is core HA behaviour; local and CI now agree. ---
+# Runs unconditionally: a full-cluster restart is core HA behaviour, and the stage must be
+# the same locally as in CI (#298). ---
 if [[ "${promoted}" == "true" && "${rejoined}" == "true" ]]; then
   echo "  Cold boot: deleting BOTH pods (full-cluster restart)..."
   kubectl delete pod "${PRIMARY}" "${STANDBY}" -n "${NAMESPACE}" --grace-period=10 --wait=false 2>/dev/null || true
@@ -281,8 +275,8 @@ if [[ "${holder}" == "${POD1}" ]]; then
 
   # The regression assertions: ordinal 0 must have taken the CLONE path, not initdb'd a
   # divergent cluster. Without them the stage could pass on a pod whose disk was never
-  # actually lost. Since #288 the entrypoint no longer clones -- it logs the deferral and
-  # hands the empty directory to the agent, whose reconcile loop decides BootstrapClone
+  # actually lost. The entrypoint does not clone -- it logs the deferral and hands the empty
+  # directory to the agent, whose reconcile loop decides BootstrapClone
   # (never BootstrapInitdb: an empty non-holder is not a first boot). Assert both halves:
   # the entrypoint saw a genuinely empty directory, and the agent never chose initdb.
   init_log=$(kubectl logs "${POD0}" -n "${NAMESPACE}" -c postgresql 2>/dev/null || echo "")

@@ -5,9 +5,7 @@ set -euo pipefail
 # repmgr.nodes. The primary reconciles repmgr.nodes against the live ordinal range and
 # unregisters records for pods the StatefulSet no longer runs.
 #
-# Ported to agent mode in #286: this used to pin failoverMode: repmgrd for a deterministic
-# standby ghost, and the service-updater on the master did the unregistering. repmgrd is
-# gone, so the agent's own cleanupGhostNodes now runs it on the lease holder each tick,
+# The agent's own cleanupGhostNodes runs on the lease holder each tick,
 # bounded by REPMGR_NODE_COUNT (which the scale-down `helm upgrade` re-renders). Keeping
 # this suite is the point of the port -- it is the only end-to-end #139 regression, and
 # the Go unit tests cover ghostNodeIDs' arithmetic but not the live unregister.
@@ -72,10 +70,8 @@ node_streaming() { # node_streaming <primary-pod> <ordinal>
     repmgr repmgr 2>/dev/null | xargs || echo ""
 }
 
-# in_topology is node_streaming now (#290). It used to dispatch on the mechanism, with a
-# node_count that read repmgr.nodes -- a table that can no longer exist: the extension stopped
-# being created under native (#288), native became the only mechanism (#294), and the package
-# left the image (#290).
+# in_topology is node_streaming (#290): repmgr.nodes cannot exist -- the extension is never
+# created, and the package is not in the image.
 in_topology() { # in_topology <primary-pod> <ordinal>
   node_streaming "$1" "$2"
 }
@@ -215,9 +211,7 @@ streaming=$(pg_exec "${NAMESPACE}" "${P}" \
   "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" repmgr repmgr 2>/dev/null | xargs || echo "")
 assert_eq "#288: the primary sees exactly one streaming standby after the scale-down" "1" "${streaming}"
 
-# No physical slot may be left pinning WAL for a pod that no longer exists. Under repmgr mode
-# repmgr names them repmgr_slot_<node_id>, so the scaled-away node 1002's slot is the one to
-# look for; the native equivalent is asserted above (#288 made it possible to run at all).
+# No physical slot may be left pinning WAL for a pod that does not exist; asserted above.
 # A LEGACY repmgr_slot_* left by a cluster that predates #294 must also be reclaimed -- that is
 # the one reader nodeIDBase still has (slotOrdinal's legacy branch). Asserted unconditionally now:
 # gating it on chart_mechanism made it dead, and the assertion is meaningful under native

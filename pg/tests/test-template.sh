@@ -1152,9 +1152,8 @@ assert_not_contains "netpol minimal: no exporter policy" "${netpol_minimal}" "te
 assert_contains "netpol: egress allows 443" "${netpol}" "port: 443"
 assert_contains "netpol: egress allows 6443" "${netpol}" "port: 6443"
 
-# #129/#286: the postgresql policy used to egress to pgpool's backend port (9999) so the
-# service-updater could health-check it. That sidecar is gone and nothing in the postgresql
-# pods connects to pgpool, so the rule was dropped -- traffic only flows pgpool ->
+# #129/#286: nothing in the postgresql pods connects to pgpool, so the policy carries no
+# egress rule for its backend port (9999) -- traffic only flows pgpool ->
 # postgresql. The pgpool policy's own ingress still allows 9999, so isolate the postgresql
 # policy's egress block to prove the removal is on the egress side specifically.
 pg_egress=$(printf '%s\n' "${netpol}" | awk '
@@ -1295,10 +1294,8 @@ assert_contains "config HA: checksum annotation present" "${config_ha}" "checksu
 # Config repmgr: pgHba entries in postStart
 assert_contains "config HA: pgHba entry in postStart" "${config_ha}" "host all all 10.244.0.0/16 md5"
 
-# #144: the repmgr-branch postStart pg_hba insert (user entries spliced above the
-# image's broad 10.0.0.0/8 and 0.0.0.0/0 catch-alls) went with repmgrd (#286). The agent
-# is the single author of pg_hba now and receives user entries via POSTGRESQL_PGHBA --
-# asserted in the "#199 + #144" block further down. Standalone still uses its own
+# #144: in HA the agent is the single author of pg_hba and receives user entries via
+# POSTGRESQL_PGHBA -- asserted in the "#199 + #144" block further down. Standalone uses its own
 # --- #298 review: the pgHba insert must actually LAND, not merely be interpolated ---
 # The two assertions above (and this line's former claim to cover the insert) only proved the
 # entry appears in the rendered postStart script. That is true whether or not the insert can
@@ -1463,8 +1460,7 @@ assert_not_contains "repmgr no additionalCommands: no PGHOST in postStart" "${re
 
 # #286: the HA arm renders NO preStop hook. The agent is PID 1 and owns SIGTERM
 # (release the Lease, then stop its postgres child); a preStop `pg_ctl stop` would race
-# the supervisor and stop postgres before the Lease was released. The repmgrd-tuned
-# preStop that used to render here went with repmgrd.
+# the supervisor and stop postgres before the Lease was released, so no preStop is rendered.
 assert_not_contains "#286: HA renders no preStop hook" "${repmgr_no_addcmd}" "preStop:"
 assert_contains "repmgr: terminationGracePeriodSeconds present" "${repmgr_no_addcmd}" "terminationGracePeriodSeconds: 120"
 
@@ -1499,8 +1495,8 @@ assert_not_contains "#286: no service-updater heartbeat file" "${repmgr_no_addcm
 assert_not_contains "#286: no split-brain shell handler" "${repmgr}" "handle_split_brain"
 assert_not_contains "#286: no shell ghost-node cleanup" "${repmgr}" "cleanup_ghost_nodes"
 
-# SPLIT_BRAIN_ACTION went with the ha.splitBrainDetection key: no code read it since
-# #286 deleted handle_split_brain(), and the agent's demote-on-lease-loss is unconditional.
+# SPLIT_BRAIN_ACTION belongs to the removed ha.splitBrainDetection key: nothing reads it, and
+# the agent's demote-on-lease-loss is unconditional (#286).
 assert_not_contains "no SPLIT_BRAIN_ACTION env var (removed with ha.splitBrainDetection)" "${repmgr_no_addcmd}" "SPLIT_BRAIN_ACTION"
 
 # Test: split-brain handling not present when repmgr disabled
@@ -2108,10 +2104,9 @@ assert_not_contains "#166: repmgr StatefulSet keeps its SA token (agent needs th
 sts_standalone166=$(helm template test-pg "${CHART_DIR}" --set repmgr.enabled=false --set postgresql.replicaCount=0 --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#166: standalone StatefulSet disables SA token automount" "${sts_standalone166}" "automountServiceAccountToken: false"
 
-# #199: the agent is the SINGLE author of pg_hba.conf -- the md5-first compat layer and
-# the md5->scram re-hash live in the agent. The postStart md5 blocks that used to do this
-# in repmgrd mode (and raced the agent, leaving rejoined standbys SCRAM-only) went with
-# repmgrd itself (#286), so they must not appear in any render.
+# #199: the agent is the SINGLE author of pg_hba.conf -- the md5-first compat layer and the
+# md5->scram re-hash live there. A postStart md5 block doing the same thing would race the
+# agent and leave rejoined standbys SCRAM-only, so none may appear in any render (#286).
 assert_not_contains "#199: no postStart md5-fallback awk" "${sts_agent166}" "md5 fallback applied"
 assert_not_contains "#199: no postStart md5->scram re-hash" "${sts_agent166}" "fix_user_auth"
 assert_contains "#199: MIGRATE_LEGACY_MD5_USERS reaches the agent" "${sts_agent166}" "MIGRATE_LEGACY_MD5_USERS"
@@ -2670,8 +2665,7 @@ walevel_default_no_cm_rc=0
 helm template test-pg "${CHART_DIR}" --show-only templates/postgresql-configmap.yaml >/dev/null 2>&1 || walevel_default_no_cm_rc=$?
 assert_gt "#308: default walLevel renders no configmap at all (byte-stable)" "${walevel_default_no_cm_rc}" "0"
 
-# Custom max_wal_senders must survive now that pgbackrest-archive.conf no longer
-# re-asserts its own value.
+# Custom max_wal_senders must survive: pgbackrest-archive.conf does not re-assert its own.
 maxsenders_custom=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
   --set-string postgresql.configuration.max_wal_senders=20 --show-only templates/postgresql-configmap.yaml 2>&1)
 assert_contains "#308: custom max_wal_senders survives with pgbackrest on" "${maxsenders_custom}" "max_wal_senders = '20'"
@@ -2720,9 +2714,7 @@ helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set repmgr.agent.syncReplicationSlots=true >/dev/null 2>&1 || sync_slots_replica_rc=$?
 assert_gt "#308: syncReplicationSlots without walLevel=logical rejected at render time" "${sync_slots_replica_rc}" "0"
 
-# #294: syncReplicationSlots works under native, which is now the only mechanism. The reconcile
-# used to resolve standbys from repmgr.nodes and name slots repmgr_slot_<node_id>, neither of
-# which exists under native; it consumes the slot set reconcileSlots already owns
+# #294: syncReplicationSlots consumes the slot set reconcileSlots already owns
 # (pg_ha_slot_<ordinal>), so the creator and the waiter are the same authority.
 sync_slots_rc=0
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
@@ -2734,8 +2726,7 @@ sync_slots_render=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/value
   --set repmgr.agent.syncReplicationSlots=true --set postgresql.walLevel=logical 2>&1)
 assert_contains "#294: sync_replication_slots is enabled on the standbys" "${sync_slots_render}" "sync_replication_slots = on"
 
-# The repmgrd-mode variants of these checks went with the mode itself (#286): failoverMode is
-# a REMOVED key on 2.0.0 and is rejected at render time, which guards_test.yaml pins.
+# failoverMode is a REMOVED key on 2.0.0, rejected at render time -- guards_test.yaml pins it.
 
 # The pg.validateSyncReplicationSlotsMajor guard: synchronized_standby_slots and the
 # sync_replication_slots worker do not exist before PostgreSQL 17 -- an unrecognized
@@ -2962,7 +2953,7 @@ assert_contains "service selector: pod-0 in standalone mode" "${svc_selector_sta
 
 # The StatefulSet runs replicaCount + 1 pods (ordinals 0..replicaCount), so the postStart
 # discovery loop must reach ordinal replicaCount; replicaCount=2 disambiguates from the
-# old off-by-one bound (#177). The repmgrd peer scan this used to also cover is gone (#286).
+# old off-by-one bound (#177).
 discovery_sts=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.replicaCount=2 \
   --set postgresql.lifecycle.postStart.additionalCommands="echo noop" \
@@ -3462,7 +3453,7 @@ assert_contains "readonly: rbac grants pods list for role labeling" "${ro_role}"
 # #286: the convergent pg-role labeling and the core/v1 PrimaryChanged audit Event were
 # both service-updater shell. The agent does the labeling through the API (internal/k8s,
 # Go tests) and records failover decisions in a structured audit log rather than Events --
-# so the Role must no longer carry an `events` create grant at all.
+# so the Role carries no `events` create grant at all.
 ro_role_events=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-repmgr.yaml" \
   --show-only templates/rbac.yaml 2>&1)
 assert_not_contains "#286: Role grants no events create (agent uses an audit log)" "${ro_role_events}" 'resources: \["events"\]'
@@ -3663,9 +3654,9 @@ assert_contains "K8S-5: backup CronJob has no-liveness-probe waiver" "${bk_waive
 assert_contains "K8S-5: backup CronJob has no-readiness-probe waiver" "${bk_waiver}" "ignore-check.kube-linter.io/no-readiness-probe"
 
 # --- #128: global.annotations render as metadata.annotations, not labels ---
-# global.annotations used to be spliced into pg.labels and rendered under
-# metadata.labels on every resource: non-label-safe values (spaces, URLs, >63
-# chars) broke apply, and annotation consumers never saw them. They must render
+# Splicing global.annotations into pg.labels would render them under metadata.labels, where
+# non-label-safe values (spaces, URLs, >63 chars) break apply and annotation consumers never
+# see them. They must render
 # under metadata.annotations on every resource (including common-lib resources).
 gann=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-full-test.yaml" \
   --set prometheusExporter.serviceMonitor.enabled=true \
@@ -3922,8 +3913,6 @@ spl_native=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.audit.enabled=true 2>&1)
 assert_contains "#288: native preloads pgaudit without repmgr" "${spl_native}" "shared_preload_libraries = 'pgaudit'"
 assert_not_contains "#288: native does not preload repmgr" "${spl_native}" "shared_preload_libraries = 'repmgr"
-# The former "repmgr mode still preloads repmgr" counterpart went with the mechanism (#294):
-# native is the only one, so there is no other render to hold to a different rule.
 
 # #290: MECHANISM reaches the postgresql container ONLY. It had to reach repmgr-init as well
 # while init-repmgr.sh gated on it -- without it, native standbys polled repmgr.nodes for a
@@ -3943,7 +3932,7 @@ assert_not_contains "#290: repmgr-init carries no MECHANISM" "${mech_init_block}
 # Nor any credential: the reduced init container must not mount the release Secret.
 assert_not_contains "#290: repmgr-init carries no REPMGR_PASSWORD" "${mech_init_block}" "REPMGR_PASSWORD"
 assert_not_contains "#290: repmgr-init carries no POSTGRES_PASSWORD" "${mech_init_block}" "POSTGRES_PASSWORD"
-# ...and no /etc/repmgr emptyDir, which nothing writes or reads any more.
+# ...and no /etc/repmgr emptyDir, which nothing writes or reads.
 assert_not_contains "#290: no repmgr-config volume is mounted" "${mech_native_res}" "repmgr-config"
 # The default render carries it now (#294): native is the default, and an image built before
 # #294 assumes repmgr when the variable is absent, so omitting it would run the removed
@@ -3955,10 +3944,9 @@ assert_contains "#294: the default render carries MECHANISM=native" "${mech_defa
 # (byte-stable); the agent gets MECHANISM only when set to a non-default
 # value, and only in agent mode (standalone has no agent to read it).
 # ======================================================================
-# #294: MECHANISM is emitted UNCONDITIONALLY now. It used to be omitted at the default, which
-# was repmgr -- the same value an env-less agent assumes. The default is native, so relying on
+# #294: MECHANISM is emitted UNCONDITIONALLY. An env-less agent assumes repmgr, so relying on
 # the absent-value default would silently run the REMOVED mechanism on any image built before
-# #294, which is exactly the image-then-chart release sequence this repo uses.
+# #294 -- exactly the image-then-chart release sequence this repo uses.
 mech_default=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#294 default: MECHANISM=native is emitted explicitly" "${mech_default}" 'name: MECHANISM
@@ -4041,8 +4029,8 @@ guard_fails "#262 guard: extraEnv as a map fails fast"          --set-json 'post
 guard_fails "#262 guard: extraVolumes as a map fails fast"      --set-json 'postgresql.extraVolumes={"name":"x"}'
 guard_fails "#262 guard: extraVolumes without a name fails"     --set-json 'postgresql.extraVolumes=[{"emptyDir":{}}]'
 guard_fails "#262 guard: extraVolumes colliding with data fails" --set-json 'postgresql.extraVolumes=[{"name":"data","emptyDir":{}}]'
-# postgresql-config, not repmgr-config (#298 review): that volume no longer exists, so
-# reserving its name was a fail message citing a chart-managed volume no render emits.
+# postgresql-config, not repmgr-config (#298): the reserved name has to be one a render
+# actually emits, or the fail message cites a chart-managed volume that does not exist.
 guard_fails "#262 guard: extraVolumes colliding with postgresql-config fails" --set-json 'postgresql.extraVolumes=[{"name":"postgresql-config","emptyDir":{}}]'
 # Reserved UNCONDITIONALLY, including the volumes only a currently-disabled feature emits
 # (#298 review). Both of these were missing from the reserved list while the sibling
@@ -4065,9 +4053,9 @@ guard_fails "#262 guard: duplicate extraEnv name fails"         --set-json 'post
 #
 # #262's original subject was "repmgr must survive an operator value", because a bare value in
 # custom.conf loaded via include_dir AFTER the image's own postgresql.conf and silently
-# overrode `shared_preload_libraries = 'repmgr'`, disabling failover. #294 removed the repmgr
-# mechanism, so there is no longer anything to preserve: HA mode now behaves like standalone
-# and the operator's value passes straight through. What #262 still guards is that the value is
+# overrode `shared_preload_libraries = 'repmgr'`, disabling failover. With nothing to preserve,
+# HA mode behaves like standalone and the operator's value passes straight through. What #262
+# guards is that the value is
 # emitted exactly once, from one authoritative place.
 spl_ha=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.enabled=true --set repmgr.image.majorVersion=18 --set postgresql.majorVersion=18 \
@@ -4113,8 +4101,8 @@ spl_guard=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.agent.mechanism=native \
   --set-string 'postgresql.configuration.shared_preload_libraries=repmgr\,pgsodium' 2>&1 || true)
 assert_contains "#293 guard: names the offending value" "${spl_guard}" 'got "repmgr,pgsodium"'
-# The remediation must NOT offer "switch back to the repmgr mechanism" any more -- #294 removed
-# it, so that advice would send the operator into a second render failure.
+# The remediation must NOT offer "switch back to the repmgr mechanism": there is none, so that
+# advice would send the operator into a second render failure.
 assert_contains "#293 guard: names the real fix" "${spl_guard}" 'drop "repmgr" from the list'
 assert_not_contains "#293 guard: does not offer the removed mechanism as a way out" "${spl_guard}" 'set repmgr.agent.mechanism to "repmgr"'
 
@@ -4136,13 +4124,11 @@ for spl_ok in 'my_repmgr' '$libdir/repmgr_extra' '"pgaudit"'; do
   assert_eq "#293 guard: native accepts the unrelated '${spl_ok}'" "0" "${spl_ok_rc}"
 done
 
-# The "legitimate under the repmgr mechanism" counterpart is gone with the mechanism (#294):
-# there is no configuration in which the chart preloads repmgr any more, so an operator asking
-# for it in HA mode is always the #290 hazard this guard exists for.
+# No configuration preloads repmgr, so an operator asking for it in HA mode is always the #290
+# hazard this guard exists for.
 
-# Under native the chart no longer OWNS the value: there is no repmgr to preserve, so the
-# operator's value passes through custom.conf and no repmgr-preload.conf is emitted at all --
-# a file whose only job is re-adding repmgr would be a lie under that name.
+# The chart does not OWN the value: with no repmgr to preserve, the operator's value passes
+# through custom.conf and no repmgr-preload.conf is emitted at all.
 spl_native_own=$(helm template test-pg "${CHART_DIR}" \
   --set-string postgresql.configuration.shared_preload_libraries=pgsodium \
   --show-only templates/postgresql-configmap.yaml 2>&1)
@@ -4527,7 +4513,7 @@ assert_contains "#279: a values-set privileged container widens the pin, not den
 # With cloud workload identity the release reads no Secret at all. The rule must stay an
 # ALLOWLIST of sources (fieldRef only) rather than degrading into "no secretKeyRef", which
 # would ADMIT configMapKeyRef in exactly the keyless configuration -- the opposite of what
-# its own message promises, and the branch CI never used to render.
+# its own message promises.
 assert_contains "#279 keyType=auto: only the downward API is permitted" "${ctl_vap}" \
   '!has(e.valueFrom) || (has(e.valueFrom.fieldRef))'
 assert_not_contains "#279 keyType=auto: configMapKeyRef is not admitted by a bare negation" \
@@ -5203,8 +5189,8 @@ DURATIONS_OK
 
 # Values time.ParseDuration REJECTS. Each renders cleanly and then refuses the agent's boot, so
 # each must fail the render instead. "15S"/"1M30S" are the case-sensitivity hole (a `lower` in
-# the parser used to accept them); "" is the default-substitution hole (`| default "15s"`
-# validated the default while the StatefulSet emitted the empty string).
+# the parser would accept them); "" is the default-substitution hole (`| default "15s"`
+# validates the default while the StatefulSet emits the empty string).
 for dg_key in leaseDuration renewDeadline retryPeriod reconcileInterval; do
   while IFS= read -r dg_bad; do
     [ -n "${dg_bad}" ] || continue

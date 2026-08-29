@@ -275,7 +275,7 @@ var recoveryGUCs = []string{"primary_conninfo", "primary_slot_name"}
 
 // recoveryGUCRes are the compiled matchers for recoveryGUCs, built once. Both
 // ForeignRecoveryConfig and RemoveRecoveryConfig walk every line of auto.conf on every boot,
-// and RemoveRecoveryConfig used to compile these inside its per-line x per-GUC loop.
+// compiling them per line x per GUC would be quadratic on every boot.
 var recoveryGUCRes = func() []*regexp.Regexp {
 	res := make([]*regexp.Regexp, len(recoveryGUCs))
 	for i, guc := range recoveryGUCs {
@@ -294,7 +294,7 @@ var recoveryGUCRes = func() []*regexp.Regexp {
 //
 // Either way the effect is the same and it is silent (#294 review): Follow writes the fragment,
 // the reload reports success, and the walreceiver keeps using auto.conf's upstream and its slot
-// -- which under a repmgr-to-native upgrade no longer exists. streamingFromTarget then never
+// -- which after an upgrade from repmgr does not exist. streamingFromTarget then never
 // matches, so Follow re-runs every tick, and once the stall window elapses the node is rewound
 // and possibly re-cloned. That is why this is a startup refusal rather than a warning.
 //

@@ -235,13 +235,10 @@ func Decide(o Observation) Decision {
 			}
 			// #297's "unregistered holder must not promote" gate stood here until #298's
 			// review. It read repmgr.nodes to refuse promoting a node no survivor could
-			// `repmgr standby follow`, which is a constraint of resolving a follow target by
-			// node_id out of that table. Native follows by conninfo -- the lease holder's
-			// identity plus the headless FQDN -- so a native primary is followable the moment
-			// it promotes, and with the repmgr mechanism deleted in #294 nothing populated the
-			// gate's inputs any more: it was provably unreachable code claiming to guard a
-			// promotion path. Removed rather than left inert, so the promote branch reads as
-			// what it now is.
+			// `repmgr standby follow`, a constraint of resolving a follow target by node_id
+			// out of that table. Follows resolve by conninfo instead -- the lease holder's
+			// identity plus the headless FQDN -- so a primary is followable the moment it
+			// promotes, and no registration gates the promote branch.
 			return d(Promote, "", "standby holds lease, caught up and most-advanced: promote")
 
 		case o.Local.Running && !o.Local.InRecovery:
@@ -520,12 +517,13 @@ func moreAdvancedPeer(o Observation) (string, bool) {
 		//
 		// A comparison, deliberately, not a veto in unsafeToServe: a standby cloned FROM a
 		// restored primary has its own record dropped by design, so a veto would bar it from
-		// ever promoting again. Ranking cannot deadlock -- with no restore records anywhere
-		// this is byte-identical to the previous behaviour.
-		// Provenance authority requires REACHABILITY (#288 review). A gossip-only restored peer
-		// used to win here, which suppressed the position ranking below and left the caller's
+		// ever promoting again. Ranking cannot deadlock -- with no restore records anywhere it
+		// is a no-op.
+		//
+		// Provenance authority requires REACHABILITY (#288 review). Letting a gossip-only
+		// restored peer win suppresses the position ranking below and leaves the caller's
 		// unreachable branch to fall through to a local promote -- so a lease-holding standby
-		// promoted with LESS WAL than a live peer, breaking invariant 8 and losing the restore
+		// promotes with LESS WAL than a live peer, breaking invariant 8 and losing the restore
 		// too. An unreachable node cannot serve, so it gets no say in who does; when it comes
 		// back it either is the primary or gets rewound/re-cloned (which drops its record).
 		if p.Reachable && restoredAfter(p.RestoredAt, o.Local.RestoredAt) {

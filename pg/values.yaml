@@ -95,9 +95,8 @@ postgresql:
   # that cannot finish inside the budget will never finish, and each attempt re-provisions a
   # WAL-retaining slot on the primary.
   #
-  # #294 raised failureThreshold from 60 (600s) to 180 (1800s): the note here used to say "raise
-  # it for native installs", which was reasonable while native was opt-in and is not now that it
-  # is the only mechanism -- the caveat would have shipped as the default for every consumer.
+  # failureThreshold is 180 (1800s) because the agent clones from THIS container: the budget
+  # has to cover a full pg_basebackup of your largest database, not just a postmaster start.
   # 30 minutes covers an ordinary clone comfortably; it is NOT enough for a multi-terabyte one, so
   # size it against your own base-backup time if that is you. Raising it costs only how long a
   # genuinely stuck first boot stays unnoticed, since the steady-state livenessProbe below is
@@ -196,8 +195,7 @@ postgresql:
   #   postgresql.configuration:
   #     shared_preload_libraries: pgsodium
   #     pgsodium.getkey_script: /etc/postgresql/pgsodium/getkey.sh
-  # The chart merges nothing into shared_preload_libraries any more (#294 removed the repmgr
-  # mechanism, which was the only thing there was to preserve), so your value passes through as
+  # The chart merges nothing into shared_preload_libraries, so your value passes through as
   # written -- declare exactly the libraries you want. Declaring `repmgr` is REJECTED at render
   # time (#293): it loads via include_dir, so it would override the image's own gate and preload
   # repmgr.so onto a cluster with no repmgr extension -- an every-pod crash-loop once the
@@ -255,9 +253,9 @@ postgresql:
   # shared_preload_libraries is a postmaster parameter: enabling audit triggers a
   # controlled rolling restart via the StatefulSet's config-checksum annotation. The chart
   # preserves whatever you declare in postgresql.configuration.shared_preload_libraries and
-  # adds pgaudit. It adds nothing of its own: replication no longer needs a preloaded
-  # library (#294 removed repmgr), and listing "repmgr" there is now a hard render failure --
-  # the image ships no repmgr.so, so preloading it would make every pod unstartable (#293). pgaudit writes to the PostgreSQL server log (stderr -> `kubectl logs`);
+  # adds pgaudit. It adds nothing of its own: replication needs no preloaded library, and
+  # listing "repmgr" is a hard render failure -- the image ships no repmgr.so, so preloading
+  # it would make every pod unstartable (#293). pgaudit writes to the PostgreSQL server log (stderr -> `kubectl logs`);
   # tamper-evident retention is your platform's job -- ship the logs to Loki/ELK/
   # CloudWatch. Runtime `ALTER SYSTEM`/session GUC changes are NOT persisted; this
   # declarative config is the source of truth.
@@ -530,9 +528,9 @@ ha:
     # at render time unless postgresql.majorVersion matches this. Bump this and
     # tag together when moving to an HA image built for a new PG major.
     #
-    # The image is published per major (#269), and since #290 the major is IN the tag:
+    # The image is published per major (#269), with the major IN the tag:
     # cagriekin/pg-ha:<version>-pg18 and :<version>-pg17. There is no unsuffixed
-    # "default major" alias any more -- a pin has to name the major it wants, and this
+    # "default major" alias -- a pin has to name the major it wants, and this
     # value cross-checks it at render time. To run PostgreSQL 17, set BOTH majorVersion
     # values to "17" and the tag to a <version>-pg17 tag -- see pg/README.md "Choosing the
     # PostgreSQL major".
@@ -602,7 +600,7 @@ ha:
     mechanism: native
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
     # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane
-    # outage no longer self-demotes the primary (only an etcd quorum loss does);
+    # outage does not self-demote the primary (only an etcd quorum loss does);
     # routing still needs the apiserver but only at failover time. With etcd,
     # leaseDuration must be >= 5s (the etcd lease TTL is whole seconds).
     dcs:
@@ -828,9 +826,9 @@ ha:
       cpu: 500m
       memory: 512Mi
 
-  # Resources for the repmgr-init init container. Under native it no longer clones -- the agent
-  # does that from the POSTGRESQL container (#288), so postgresql.resources and the startupProbe
-  # are what bound a large clone now, not these. This container is down to permissions/directory
+  # Resources for the init container. It does NOT clone -- the agent does that from the
+  # POSTGRESQL container (#288), so postgresql.resources and the startupProbe are what bound a
+  # large clone, not these. This container is down to permissions/directory
   # prep, so the modest defaults below are ample (#153, #294).
   initContainerResources:
     requests:
@@ -1276,8 +1274,7 @@ pgbackrest:
 
   # CronJob runner: schedules backups via Kubernetes-native CronJobs. Each job
   # finds the current primary via the headless primary service endpoints
-  # (repointed by the agent on every promotion since 2.0.0 -- the
-  # service-updater sidecar that used to do it went with repmgrd, #294) and
+  # (repointed by the agent on every promotion) and
   # execs into the pgbackrest sidecar to perform the backup. Failover is
   # handled automatically because the primary is resolved at job-fire time.
   cronjob:
@@ -1512,8 +1509,8 @@ etcd:
   # exactly this way in a simulated two-step: the etcd-TLS fixture rendered
   # cagriekin/repmgr:2.0.0-pg17. Both halves move together or neither does.
   # ENFORCED at render time since #291: pg.validateEtcdBootstrapImage fails the render when
-  # these two disagree with ha.image, so the image bump is a FOUR-key change --
-  # ha.image.repository/tag and these two -- not the two the two-step used to name.
+  # these two disagree with ha.image, so an image bump is a FOUR-key change:
+  # ha.image.repository/tag plus these two.
   rbac:
     bootstrapImage:
       repository: cagriekin/pg-ha

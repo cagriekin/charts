@@ -193,11 +193,9 @@ apply "postgres image tag" \
 # Keep-marked pins name a deliberate OLDER RELEASED image, and they are normalized to
 # <base>-pg<MAJOR> on EVERY major rather than being left alone or dragged to the chart's tag.
 #
-# This used to be two asymmetric branches: left untouched on the default major (with a FATAL if
-# an earlier non-default run had suffixed them), and rewritten to the freshly-built tag on a
-# non-default one, "because a non-default major has no older PUBLISHED image to migrate from".
-# That premise expired with #269: per-major publishing means every release from trixie-5.5.0-29
-# onward exists as -pg17 AND -pg18, so an older per-major image is available on both legs. The
+# Symmetric on purpose. Per-major publishing (#269) means every release from trixie-5.5.0-29
+# onward exists as -pg17 AND -pg18, so an older per-major image is available on both legs --
+# there is no major that needs special-casing for lack of one. The
 # old rule therefore destroyed the coverage it was protecting -- on a PG17 leg the migration
 # suite would have started from the freshly built repmgr-FREE image instead of a released
 # repmgr one, so its "install a 1.x cluster" phase was not a repmgr cluster at all.

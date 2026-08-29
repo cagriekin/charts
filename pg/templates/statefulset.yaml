@@ -659,10 +659,9 @@ spec:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
 {{- with (include "pg.pgMajorEnv" .) }}{{ . | nindent 12 }}{{- end }}
-            {{- /* The reduced `init` mode reads NOTHING but PG_MAJOR (#290). It used to write
-                   repmgr.conf, poll repmgr.nodes and clone, which needed the credentials, the
-                   headless service and the node count; now it stats a binary and exits. Every
-                   one of those env vars is removed rather than left inert -- mounting the
+            {{- /* The reduced `init` mode reads NOTHING but PG_MAJOR (#290): it stats a binary
+                   and exits. The credentials, headless service and node count a cloning init
+                   container needed are removed rather than left inert -- mounting the
                    release Secret into a container that cannot use it is needless credential
                    surface, and USE_REPLICATION_SLOTS in particular is now read by nothing in
                    the image at all. PG_MAJOR arrives via pg.pgMajorEnv above. */}}
@@ -720,14 +719,10 @@ spec:
 {{- if .Values.ha.enabled }}
           image: "{{ include "pg.haImage" . }}"
           imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
-          # Always agent mode. pg.agentMode IS ha.enabled, and this whole block already
-          # sits inside `if .Values.ha.enabled`, so the `postgres` alternative that used to
-          # be rendered here was unreachable -- removed in #290 rather than left as a branch
-          # nobody can take. The image still has a `postgres` mode for direct, non-chart use.
-          #
-          # The stale-primary guard this comment used to describe is gone too (#290): it drove
-          # `repmgr node rejoin` from the shell before the agent started. The agent does the
-          # equivalent from its own reconcile loop, where it can be fenced.
+          # Always agent mode. pg.agentMode IS ha.enabled and this block already sits inside
+          # `if .Values.ha.enabled`, so a `postgres` alternative here would be unreachable
+          # (#290). The image still has a `postgres` mode for direct, non-chart use, and the
+          # stale-primary rejoin belongs to the agent's reconcile loop, where it can be fenced.
           command: ["/usr/local/bin/entrypoint.sh", "agent"]
 {{- else }}
           image: {{ include "pg.image" .Values.postgresql.image | quote }}
@@ -863,12 +858,11 @@ spec:
             - name: SYNC_REPLICATION_SLOTS
               value: "true"
 {{- end }}
-            {{- /* Which replication mechanics the agent drives (#287). Always emitted since
-                   #294 -- see the init container above for why: an image built before #294
-                   defaults to repmgr when MECHANISM is absent, and the chart default is now
-                   native, so omitting it at the default would run the removed mechanism on a
-                   not-yet-updated image. `native` is the only accepted value; `repmgr` is
-                   rejected at render time by pg.validateRemovedRepmgrdValues. */}}
+            {{- /* Which replication mechanics the agent drives (#287). ALWAYS emitted, never
+                   omitted at the default: an image predating #294 falls back to repmgr when
+                   MECHANISM is absent, so a chart that leaves it out would run the removed
+                   mechanism on a not-yet-updated image. `native` is the only accepted value;
+                   `repmgr` is rejected by pg.validateRemovedRepmgrdValues. */}}
             - name: MECHANISM
               value: {{ (.Values.ha.agent).mechanism | default "native" | quote }}
             - name: MASTER_SERVICE
