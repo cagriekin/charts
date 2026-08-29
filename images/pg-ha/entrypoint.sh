@@ -56,6 +56,28 @@ bootstrap_initdb() {
     # do, so the check is both safe and necessary.
     : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required to bootstrap a new cluster}"
     : "${REPMGR_PASSWORD:?REPMGR_PASSWORD is required to bootstrap a new cluster (the replication role)}"
+
+    # REPMGR_USER must be a role of its OWN, checked before the first write (#298 review).
+    #
+    # Every CREATE/ALTER below is deliberately swallowed with `2>/dev/null || true`, and the
+    # verification block at the end only asks whether the replication ROLE EXISTS -- the
+    # password half was hardened for POSTGRES_USER (pg_authid.rolpassword IS NOT NULL) and not
+    # for this one. So a name that collides with POSTGRES_USER, or with initdb's own bootstrap
+    # superuser `postgres`, makes `CREATE USER "<repmgr>"` fail as "role already exists", leaves
+    # that role holding the OTHER password (or none at all), and still reports bootstrap_ok=yes.
+    # The completion sentinel then seals it in: bootstrap_initdb no-ops forever once PG_VERSION
+    # exists, while the agent -- which authenticates as REPMGR_USER for every probe and for
+    # pg_basebackup -- can never connect. The pod is Running/NotReady for good, recoverable only
+    # by deleting the PVC, which is exactly the outcome the verification block exists to prevent.
+    #
+    # Refusing here costs nothing on the normal path and turns that silent wedge into a loud,
+    # named failure before anything has touched the volume.
+    _bootstrap_pg_user=${POSTGRES_USER:-postgres}
+    _bootstrap_repmgr_user=${REPMGR_USER:-repmgr}
+    if [ "$_bootstrap_repmgr_user" = "$_bootstrap_pg_user" ] || [ "$_bootstrap_repmgr_user" = "postgres" ]; then
+        echo "FATAL: REPMGR_USER=\"${_bootstrap_repmgr_user}\" must be a role of its own: it may not equal POSTGRES_USER (\"${_bootstrap_pg_user}\") or initdb's bootstrap superuser \"postgres\". Sharing the name leaves the replication role holding a different password, which the HA agent can never authenticate with -- set ha.username (chart) / REPMGR_USER (direct image use) to a distinct name." >&2
+        exit 1
+    fi
     echo "Initializing PostgreSQL database..."
     # --auth-host=scram-sha-256, not md5 (#298 review). initdb's --auth-host both writes the
     # method into its own pg_hba (which this function overwrites a few lines below, so that half
@@ -282,7 +304,20 @@ EOF
         exit 1
     fi
 
-    pg_ctl -D "$PGDATA" -w stop
+    # Never leave the transient postmaster running, even on a failed shutdown (#298 review).
+    # It was daemonized by the `pg_ctl -w start` above and inherits this script's stdout, which
+    # in agent mode is a pipe Cmd.Output reads to EOF -- so an orphan holds act() (and opMu, and
+    # the reconcile heartbeat) until initdbBudget expires, and discardFreshDataDir then has to
+    # reap it before it can wipe. Bare under `set -e` this exited with the postmaster still up:
+    # `pg_ctl -w stop` fails on PGCTLTIMEOUT (60s by default) on a contended node long before
+    # the cluster is actually down. The FATAL arm above escalates for exactly this reason; the
+    # success path needs it too. Exiting non-zero without the sentinel is still the right
+    # outcome -- the next start discards the directory and re-creates it.
+    if ! pg_ctl -D "$PGDATA" -w stop; then
+        pg_ctl -D "$PGDATA" -m immediate -w stop || true
+        echo "FATAL: could not stop the transient bootstrap postmaster; not marking the bootstrap complete, so this data directory will be discarded and re-created on the next start." >&2
+        exit 1
+    fi
 
     # LAST action, and the only positive evidence that this multi-step bootstrap finished
     # (#288 review). initdb writes a perfectly valid pg_control within its first second, so

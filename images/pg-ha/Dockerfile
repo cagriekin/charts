@@ -73,13 +73,19 @@ RUN apt-get update && \
     postgresql-${PG_MAJOR} \
     postgresql-${PG_MAJOR}-pgaudit \
     pgbackrest \
-    cron \
     && rm -rf /var/lib/apt/lists/*
 
 # Publish the major to the runtime: pg-common.sh derives PG_BINDIR from it for the shell
 # entrypoint, and the Go agent reads it to locate postgres/pg_controldata. Both fall back to
 # 18 when unset, so an older image without this ENV still works.
 ENV PG_MAJOR=${PG_MAJOR}
+
+# NOTE: cron is deliberately NOT installed either (#298 review). It came in with the upstream
+# repmgr-docker image, where a cron job pruned repmgr's monitoring_history; that table went with
+# the mechanism (#294) and nothing in this image or in pg/templates runs cron or crontab any
+# more. The chart's own scheduled work (pgbackrest backups, backup validation) is Kubernetes
+# CronJobs, which never enter this container's init system. Same argument as kubectl below: an
+# installed daemon nothing invokes is CVE surface for nothing.
 
 # NOTE: kubectl is deliberately NOT installed. It existed only for the repmgrd-mode
 # service-updater sidecar, which went away with repmgrd (#286). The agent talks to the

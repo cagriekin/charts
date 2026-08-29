@@ -808,6 +808,11 @@ ha:
         # transaction timestamp after scale-up, and lastRestore reports the outcome.
         readPodLogs: false
 
+  # Must be a role of its OWN -- distinct from postgresql.username and never "postgres"
+  # (#298 review). The entrypoint creates the superuser first, so a shared name makes this
+  # CREATE USER fail as "role already exists" and the replication role silently keeps the
+  # other password; the agent then cannot authenticate for probes or pg_basebackup. The
+  # chart refuses the collision at render time.
   username: repmgr
   database: repmgr
 
@@ -1009,6 +1014,9 @@ prometheusExporter:
   # the existing secret must also carry a `monitoring-password` key.
   monitoringUser:
     enabled: true
+    # Distinct from postgresql.username and ha.username (#298 review): the hook Job runs
+    # `ALTER ROLE ... WITH LOGIN PASSWORD` unconditionally, so a shared name overwrites that
+    # role's password minutes after install. The chart refuses the collision at render time.
     username: monitoring
 
   podSecurityContext:

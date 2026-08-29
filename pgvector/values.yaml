@@ -407,8 +407,10 @@ ha:
     # Native drives PostgreSQL directly (pg_ctl promote, pg_basebackup, pg_rewind,
     # primary_conninfo + standby.signal), takes topology from pg_stat_replication, owns
     # physical slot lifecycle (#289), and supports syncReplicationSlots and
-    # cascadingReplication (#294). Remaining gap: an existing repmgr cluster cannot be
-    # flipped in place yet (#292). See the pg chart README.
+    # cascadingReplication (#294). An existing 1.x repmgr cluster IS migrated in place on
+    # `helm upgrade` (#292): the preload is stripped from PGDATA before the postmaster
+    # starts, no re-clone, timeline and system identifier preserved. See the 2.0.0
+    # CHANGELOG and the pg chart README migration runbook.
     mechanism: native
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
     # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane
@@ -585,6 +587,11 @@ ha:
         # transaction timestamp after scale-up, and lastRestore reports the outcome.
         readPodLogs: false
 
+  # Must be a role of its OWN -- distinct from postgresql.username and never "postgres"
+  # (#298 review). The entrypoint creates the superuser first, so a shared name makes this
+  # CREATE USER fail as "role already exists" and the replication role silently keeps the
+  # other password; the agent then cannot authenticate for probes or pg_basebackup. The
+  # chart refuses the collision at render time.
   username: repmgr
   database: repmgr
 
@@ -768,6 +775,9 @@ prometheusExporter:
   # the existing secret must also carry a `monitoring-password` key.
   monitoringUser:
     enabled: true
+    # Distinct from postgresql.username and ha.username (#298 review): the hook Job runs
+    # `ALTER ROLE ... WITH LOGIN PASSWORD` unconditionally, so a shared name overwrites that
+    # role's password minutes after install. The chart refuses the collision at render time.
     username: monitoring
 
   podSecurityContext:

@@ -467,6 +467,43 @@ else
 fi
 rm -rf "${_q_tmp}"
 
+# --- #298 review: REPMGR_USER may not collide with POSTGRES_USER or the bootstrap superuser ---
+# Every CREATE/ALTER is swallowed with `2>/dev/null || true` and the verification only asks
+# whether the replication ROLE EXISTS, so a colliding name leaves that role holding the other
+# password while bootstrap_ok stays yes and the completion sentinel seals it in: the agent can
+# never authenticate as REPMGR_USER, bootstrap_initdb no-ops forever, and only a PVC delete
+# recovers. The refusal has to come BEFORE initdb, so nothing has touched the volume.
+for _collide in 'same' 'superuser'; do
+  _c_tmp=$(mktemp -d)
+  mkdir -p "${_c_tmp}/pgdata"
+  if [ "${_collide}" = "same" ]; then _c_pg=shared; _c_rm=shared; else _c_pg=myapp; _c_rm=postgres; fi
+  _c_rc=0
+  PGDATA="${_c_tmp}/pgdata" POSTGRES_USER="${_c_pg}" POSTGRES_DB=app POSTGRES_PASSWORD=pw \
+  REPMGR_USER="${_c_rm}" REPMGR_DB=repmgr REPMGR_PASSWORD=pw bash -c '
+    source <(sed -n "/^bootstrap_initdb() {/,/^}/p" '"${ROOT}"'/entrypoint.sh)
+    initdb() { echo INITDB-RAN > "$PGDATA/ran"; }
+    pg_ctl() { :; }; psql() { :; }
+    bootstrap_initdb' >/dev/null 2>&1 || _c_rc=$?
+  if [ "${_c_rc}" -ne 0 ] && [ ! -f "${_c_tmp}/pgdata/ran" ]; then
+    ok "#298: a colliding REPMGR_USER (${_collide}) is refused before initdb runs"
+  else
+    bad "#298: a colliding REPMGR_USER (${_collide}) was accepted" "rc=${_c_rc} initdb-ran=$([ -f "${_c_tmp}/pgdata/ran" ] && echo yes || echo no)"
+  fi
+  rm -rf "${_c_tmp}"
+done
+
+# --- #298 review: the transient bootstrap postmaster is never left running ---
+# `pg_ctl -w stop` fails on PGCTLTIMEOUT (60s) on a contended node, and bare under `set -e` that
+# exited with the daemonized postmaster still holding this script's stdout -- which in agent mode
+# is the pipe Cmd.Output reads to EOF, so act() keeps opMu and the reconcile loop stops beating
+# until initdbBudget expires. Escalate to an immediate stop, then fail.
+if grep -qF 'if ! pg_ctl -D "$PGDATA" -w stop; then' "${ROOT}/entrypoint.sh" &&
+   grep -qF 'pg_ctl -D "$PGDATA" -m immediate -w stop || true' "${ROOT}/entrypoint.sh"; then
+  ok "#298: a failed smart shutdown escalates to an immediate stop instead of orphaning the postmaster"
+else
+  bad "#298: bootstrap_initdb still runs a bare 'pg_ctl -w stop' under set -e"
+fi
+
 
 echo "----"
 

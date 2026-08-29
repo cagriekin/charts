@@ -919,6 +919,47 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end }}
 {{- end }}
 
+{{- /* The three chart-managed role names must be DISTINCT, and none of them may be
+       initdb's bootstrap superuser except the superuser itself (#298 review).
+
+       Each role is created by a different component that assumes it owns the name, and every
+       collision is silent at render and destructive at runtime:
+
+        - ha.username == postgresql.username (or "postgres"): the entrypoint's second
+          `CREATE USER` fails as "role already exists" -- swallowed, like every statement in
+          that block -- so the replication role keeps the OTHER password while the bootstrap
+          still reports success and seals in the completion sentinel. The agent authenticates
+          as this role for every probe and for pg_basebackup, so the pod is Running/NotReady
+          for good, recoverable only by deleting the PVC. The image refuses this too; the
+          chart must refuse it FIRST, at render, per the fail-at-render-time rule.
+
+        - monitoringUser.username colliding with either: monitoring-user-job.yaml runs
+          `ALTER ROLE %I WITH LOGIN PASSWORD` UNCONDITIONALLY, so the post-install hook
+          overwrites the superuser's Secret-held password, or the replication role's --
+          breaking auth cluster-wide, or streaming replication on every standby at once,
+          minutes after a successful install.
+
+       Reserved-name coverage is deliberately asymmetric: postgresql.username MAY be
+       "postgres" (that is the default and initdb creates it), while the other two may not,
+       because for them "already exists" is the failure. */ -}}
+{{- define "pg.validateRoleNames" -}}
+{{- $pgUser := .Values.postgresql.username | default "postgres" -}}
+{{- $haUser := .Values.ha.username | default "repmgr" -}}
+{{- if eq $haUser $pgUser -}}
+{{- fail (printf "ha.username and postgresql.username are both %q: the replication role must be a role of its own. The entrypoint creates the superuser first, so the second CREATE USER fails as \"role already exists\" and the replication role silently keeps the superuser's password -- the HA agent then cannot authenticate for probes or pg_basebackup and every pod stays Running/NotReady, recoverable only by deleting the PVC. Fix: set ha.username to a distinct name (default \"repmgr\")." $haUser) -}}
+{{- end -}}
+{{- if eq $haUser "postgres" -}}
+{{- fail (printf "ha.username is %q, which is initdb's bootstrap superuser and therefore always already exists: the entrypoint's CREATE USER for the replication role fails, the role keeps the superuser's password, and the HA agent can never authenticate with REPMGR_PASSWORD. Fix: set ha.username to a distinct name (default \"repmgr\")." $haUser) -}}
+{{- end -}}
+{{- /* Gated exactly as monitoring-user-job.yaml is: no Job, no ALTER ROLE, no collision. */ -}}
+{{- if and (.Values.prometheusExporter).enabled (((.Values.prometheusExporter).monitoringUser).enabled) -}}
+{{- $monUser := ((.Values.prometheusExporter).monitoringUser).username | default "" -}}
+{{- if and $monUser (or (eq $monUser $pgUser) (eq $monUser $haUser) (eq $monUser "postgres")) -}}
+{{- fail (printf "prometheusExporter.monitoringUser.username is %q, which collides with %s: the monitoring-user hook Job runs `ALTER ROLE ... WITH LOGIN PASSWORD` unconditionally, so it would OVERWRITE that role's password minutes after install -- breaking superuser auth cluster-wide, or streaming replication on every standby at once. Fix: give the monitoring role a distinct name (default \"monitoring\"), or set prometheusExporter.monitoringUser.enabled=false to let the exporter use the superuser." $monUser (ternary (printf "postgresql.username (%q)" $pgUser) (ternary (printf "ha.username (%q)" $haUser) "initdb's bootstrap superuser \"postgres\"" (eq $monUser $haUser)) (eq $monUser $pgUser))) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- /* #262: validate the postgresql.extraVolumes / extraVolumeMounts / extraEnv
        passthrough. These are spliced verbatim into the pod spec, so without guards a
        plausible mistake becomes a silent runtime failure or an apply-time apiserver
@@ -946,7 +987,20 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
              would silently win over the chart/Secret value -- pointing the postmaster at
              the wrong data directory or breaking auth cluster-wide. */ -}}
 {{- define "pg.validateExtraPassthrough" -}}
-{{- $chartVolumes := list "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib" "etcd-tls" "pg-run" "pgbackrest-config" -}}
+{{- /* EVERY volume the postgresql pod can carry, not just the ones a default render emits
+       (#298 review). `agent-control-tls` and `pgbackrest-bootstrap-script` were missing, so a
+       `postgresql.extraVolumes` entry using either name rendered CLEAN and produced two pod
+       volumes with the same name -- verified: the apiserver then rejects the StatefulSet with
+       `spec.template.spec.volumes[1].name: Duplicate value: "agent-control-tls"`, which is the
+       apply-time failure (g3) exists to convert into a render-time one. The list is reserved
+       UNCONDITIONALLY, like $chartEnv below, so a passthrough that works today cannot start
+       colliding after a later upgrade enables control.enabled or pgbackrest.bootstrap.enabled.
+       pg.validatePgbackrestPassthrough already carried the complete list for the same pod;
+       these two are what kept the two guards from agreeing. */ -}}
+{{- $chartVolumes := list
+      "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib"
+      "etcd-tls" "agent-control-tls" "pg-run" "pgbackrest-config"
+      "pgbackrest-bootstrap-script" -}}
 {{- /* Env vars the chart sets on the postgresql container (see statefulset.yaml). Reserved
        UNCONDITIONALLY -- including the ones only a currently-disabled feature emits -- so a
        passthrough that works today cannot start silently shadowing a chart value after a

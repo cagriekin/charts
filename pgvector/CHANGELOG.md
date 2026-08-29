@@ -2,6 +2,255 @@
 
 ## 2.0.0 - unreleased
 
+### Changed (breaking)
+
+- **The `repmgr:` values block is now `ha:`** (#291). Nothing nested moved -- only the block's
+  own name. Every `repmgr.*` key still works for the whole 2.0.0 line: `pg.normalizeValues`
+  merges the `repmgr:` block over the `ha:` defaults key by key, so an untouched 1.x values
+  file installs unchanged, `--set repmgr.agent.leaseDuration=20s` still lands, and a file
+  mixing the two spellings resolves per key with the `repmgr.*` value winning -- it is the one
+  the operator set; the `ha.*` side is chart defaults. Both spellings are schema-validated
+  (the `repmgr` schema is generated from the `ha` shape and asserted identical), so a bad enum
+  or a wrong type still fails the render whichever name is used. `helm upgrade` prints a
+  deprecation notice when it sees the old block.
+
+  Marked breaking because the values API's canonical name changed, and because **the alias is
+  removed in the next major** -- rename the top-level key before then. It is a rename and not
+  a break *today*, which is the point: 2.0.0 already carries one real break (repmgrd removal)
+  and stacking a mandatory values edit on top of it buys nothing.
+
+  Why rename at all: after #290 the image contains no repmgr -- no binary, no extension, no
+  `repmgr.conf` -- and the agent replicates through `pg_stat_replication` and slots it owns.
+  A block named `repmgr` was sizing the resources of, and holding the credentials for,
+  something no longer installed.
+
+  Three names keep the word on purpose, because they identify real PostgreSQL objects rather
+  than the tool: `ha.username`, `ha.database`, and the `repmgr-password` Secret key. Renaming
+  those rewrites a live cluster's role and credential, which is a data-plane migration, not a
+  values rename -- deliberately out of scope here. `REPMGR_*` env vars are likewise unchanged;
+  `pg/ENVIRONMENT.md` records which of them the agent still reads and which are now inert.
+
+  Review follow-ups on the rename itself, each a defect the first pass shipped:
+
+  - The removed-key guards (`failoverMode`, `serviceUpdater.*`, `monitoringHistoryDays`) now
+    fire under **both** spellings. Reading only `repmgr.*` made them skippable by taking the
+    very rename the upgrade notice recommends: a 1.x file carrying `failoverMode: repmgrd`,
+    with its block renamed to `ha:`, rendered clean and deployed an agent cluster to an
+    operator who believed repmgrd was running -- straight into the immutable
+    `podManagementPolicy` trap the guard exists to warn about.
+  - Three templates (`networkpolicy.yaml`, `service-headless.yaml`, `databases-roles-job.yaml`)
+    read `.Values.ha` transitively without normalizing first. In a full render this worked only
+    because `statefulset.yaml` sorts earlier and mutates `.Values` for every later file; rendered
+    alone, as helm-unittest does, they ignored the alias entirely.
+  - `set-pg-major.sh` and the pg-test workflow both resolved the HA image from `pg/values.yaml`
+    by anchoring on `^repmgr:`, and hard-exit when that misses. Both accept either spelling now.
+    The same scripts hardcoded the image *repository*, so the #290 rename would have ended in
+    `FATAL: rendered StatefulSet does not use cagriekin/repmgr:...`; the repository is read from
+    the chart and rewritten in fixtures alongside the tag, and the two-step is verified end to
+    end under both majors.
+  - `etcd.rbac.bootstrapImage` pinned only the tag, leaving the repository on the etcd subchart's
+    default. Harmless while both said `cagriekin/repmgr`; under the new tag scheme it names a
+    coordinate that cannot exist. Both halves are pinned now.
+
+  Second review round, all documentation/behavioural-surprise rather than logic:
+
+  - **`repmgr.*` beats `ha.*` from ANY source, including `--set`** -- Helm collapses defaults,
+    every `-f` and every `--set` into one map before the chart runs, so the merge cannot tell
+    an operator's value from a chart default and always prefers the deprecated spelling. So
+    `-f legacy.yaml --set ha.agent.leaseDuration=30s` renders the legacy value, discarding a
+    `--set` that Helm normally ranks highest. This cannot be caught at render time (a template
+    gets no provenance, so a `fail` would fire on every legitimate alias use or none), so it is
+    documented in the README, NOTES.txt and both values.yaml, with the instruction stated as
+    MOVE a key rather than duplicate it -- and pinned by tests, so flipping the merge direction
+    fails loudly instead of silently changing what a released values file resolves to.
+  - The README rename runbook gave `helm get values` without `-o yaml`, the exact command
+    NOTES.txt warns against (the default output prefixes `USER-SUPPLIED VALUES:`, which the
+    deliberately-open `additionalProperties` then accepts in silence).
+  - NOTES.txt is byte-identical across both charts, so its cross-reference now names the pg
+    chart README explicitly; the section it points at does not exist in pgvector's.
+  - The tag-scheme comment tables in `set-pg-major.sh` and the pg-test workflow described
+    `trixie-pg<major>-<n>` as the new scheme, which the classifier below them rejects -- it
+    keys on a leading semver, so that shape would fall to the legacy arm and reduce to bare
+    `trixie`. Not live breakage, but exactly the desync those comments exist to prevent.
+  - Both values.yaml files still instructed the deprecated spelling in their own how-to prose
+    (the etcd DCS walkthrough among them), so following the file the chart treats as the
+    authority on its input surface tripped the deprecation notice the same change adds.
+
+  Third review round:
+
+  - **`ha.agent` lease timings are now validated at render time.** client-go requires
+    `leaseDuration > renewDeadline > retryPeriod` and the agent refuses to start otherwise, but
+    nothing checked it before the API server, so a violating triple rendered cleanly and then
+    CrashLoopBackOff'd every postgresql pod at once with no primary. The reachable path is not
+    three bad numbers typed by hand -- it is MIXING the `repmgr.agent.*` alias with `ha.agent.*`
+    across two values files: these keys are cross-validated, so one timing from a 1.x file plus
+    two from a newer `-f` yields a triple neither file contains. The chart's own
+    `values-cloud.yaml` was the most reachable instance. The guard skips (rather than fails) a
+    duration shape it cannot parse, because `time.ParseDuration` accepts compound forms and
+    rejecting input the agent would have accepted would be a new bug, not a guard.
+  - `release.yaml` now excludes `pg-ha-*`. The new image tag `pg-ha-X.Y.Z` matches the chart
+    release glob, which the old dot-free `pg-ha-<n>` did not -- that is why only `trixie-*` was
+    excluded. Pushing `pg-ha-2.0.0` would have fired the chart release workflow too, which
+    resolves `chart="pg-ha"` and dies on the missing Chart.yaml.
+  - `set-pg-major.sh` derives the leftover scanners' repository alternation from the chart
+    instead of hardcoding the two Docker Hub names, so pointing `ha.image.repository` at a
+    mirror or fork cannot make the scanners match nothing and report a silent green.
+
+  Fourth review round, all on the lease guard added in the third:
+
+  - **An unparseable duration skipped validation instead of failing it.** `ha.agent.leaseDuration:
+    15` or `"20 s"` is not a Go duration -- `time.ParseDuration` rejects it, so `config.Load`
+    fail-fasts and every pod CrashLoopBackOffs -- but the guard's parser returned "" for it and
+    the caller shrugged, reproducing the exact render-clean/apply-broken outcome the guard was
+    added to close. `""` now means "not a duration" and is a hard failure; the parser also
+    handles the COMPOUND forms it previously skipped (`1m30s`, `2h45m`) by summing their pairs,
+    so nothing valid is rejected and nothing invalid is waved through. The doc comment claiming
+    `1.5h` was unparseable was wrong (the optional fraction already matched it), which meant one
+    test was passing on the ordering result rather than on the skip it claimed to assert.
+  - **The etcd DCS lease floor is now checked at render time.** `config.go` requires
+    `LEASE_DURATION >= 5s` under `ha.agent.dcs.backend: etcd` because the lease TTL is whole
+    seconds; a triple like 3s/2s/1s satisfies the ordering, rendered clean, and refused to boot.
+  - `values-cloud.yaml` gained a layering note. Because `repmgr.*` wins key by key, an operator
+    whose own file still spells the block `repmgr:` and sets any of the three timings gets a
+    mixture when they add `-f values-cloud.yaml` -- now rejected loudly with the fix named,
+    where before this PR it silently resolved to the overlay's values. The overlay is
+    deliberately NOT dual-spelled: shipping the deprecated block in an example would trip the
+    very notice it should demonstrate the absence of.
+  - `set-pg-major.sh`'s repository-rewrite rule now uses the derived alternation like the
+    scanners do, so a fork or mirror that retargeted values.yaml and its fixtures no longer hits
+    `rule 'HA image repository' matched nothing`. Verified against a simulated private registry.
+
+  Not changed: the `mechanism != native` branches in `pg.chartOwnsSharedPreloadLibraries` and
+  `pg.sharedPreloadLibraries`. They are unreachable in a real render for the same reason as the
+  agent branch this PR deleted, but the two are not equivalent -- the agent branch emitted
+  *wrong remediation advice*, which is worse than dead, while these two produce correct behaviour
+  for a state that can no longer occur. Deleting them would touch the subtle #262/#293 preload
+  logic for no behavioural gain.
+
+  Fifth review round -- the duration guard diverged from time.ParseDuration in BOTH directions,
+  and each direction was its own bug:
+
+  - **Too permissive (three holes, each reproducing the outage the guard exists to prevent).**
+    The parser lower-cased its input, so `15S` and `1M30S` passed -- Go's units are
+    case-SENSITIVE and both are errors. `| default "15s"` collapsed an explicitly empty value
+    into the default, so an empty `leaseDuration` validated as 15s while the StatefulSet emitted
+    `value: ""`, which Go also rejects. And `reconcileInterval` was not checked at all, though
+    `config.Load` parses it with the same helper. All three rendered cleanly and then refused the
+    agent's boot on every pod.
+  - **Too strict (turning working 1.x values into upgrade failures).** `.5s`, `5.s` and `+15s`
+    are valid Go durations and were rejected, as was microseconds spelled U+03BC. The grammar now
+    mirrors `time.ParseDuration`: optional leading sign, one or more `<number><unit>` pairs with
+    either side of the decimal point omissible, and all three microsecond spellings.
+  - **`etcd.rbac.bootstrapImage` must now match `ha.image` at render time.** The bundled etcd's
+    RBAC-bootstrap Job runs `pg-ha-agent rbac-bootstrap`, so a mismatch has one agent build
+    writing the etcd RBAC that a different build then authenticates against. This change pinned
+    both halves by hand but nothing enforced the lockstep, so the next image bump would have
+    silently reintroduced the drift. Adopting a new image is therefore a FOUR-key edit per chart,
+    now stated in `images/pg-ha/README.md` and enforced by `pg.validateEtcdBootstrapImage`.
+    Only checked when the bundled etcd is enabled -- with an external etcd the Job never renders.
+
+- **The HA image is versioned with the chart** (#290/#291). Tags are now
+  `cagriekin/pg-ha:<chart-version>-pg<major>` (e.g. `2.0.0-pg18`, `2.0.0-pg17`), published from
+  the git tag `pg-ha-<version>`, replacing `cagriekin/repmgr:trixie-<repmgr>-<n>`. The old
+  scheme was keyed on a repmgr version the image no longer contains. The version an image
+  carries is the chart version it shipped with; a chart-only patch does not force an image
+  rebuild, so the two can legitimately differ by a patch. `cagriekin/repmgr` stays published
+  and frozen at its last tag, so existing pins keep resolving. There is no unsuffixed
+  "default major" alias -- a pin names its major, and `ha.image.majorVersion` cross-checks it
+  at render time. The default pin is `cagriekin/pg-ha:2.0.0-pg18` (`ha.image` and
+  `etcd.rbac.bootstrapImage` moved together), published from git tag `pg-ha-2.0.0`.
+
+### Removed (breaking)
+
+- **Removed the provably-inert `#297` promote gate.** It read `repmgr.nodes` to refuse promoting a
+  node no survivor could `repmgr standby follow`; nothing populated its inputs once #294 deleted
+  the repmgr mechanism, so it was unreachable code claiming to guard a promotion path (with eight
+  test cases asserting behaviour on inputs no observer could produce). Native follows by conninfo,
+  so a native primary is followable the moment it promotes. `Prober.RegisteredNodeIDs`,
+  `Observation.RegistryRead`/`LocalRegistered` and `PeerState.Registered` went with it.
+- **Removed `ha.splitBrainDetection` (and the `repmgr.splitBrainDetection` alias).** The
+  `log`/`fence` choice selected between behaviours that were already identical: the code that
+  distinguished them was the service-updater's `handle_split_brain()`, deleted with repmgrd
+  (#286), and the agent always demotes itself when it is read-write without holding the lease.
+  The key, the `SPLIT_BRAIN_ACTION` env it rendered, and the agent's dead validation of it are
+  gone; a values file still setting either spelling fails at render time with a message naming
+  the fix. The protection itself is unchanged -- the demote is unconditional.
+- **`native` is now the only replication mechanism, and the default** (#294). The `repmgr`
+  mechanism -- which shelled out to the repmgr CLI for `standby clone`, `standby follow`,
+  `standby promote` and `node rejoin`, and depended on the `repmgr.nodes` table -- is gone.
+
+  `repmgr.agent.mechanism` was introduced in this same unreleased major (#287) and was never
+  published, so **no released values file can be pinning it**. The key survives rather than
+  being deleted, so a stale `repmgr` copied from a pre-release branch fails the render with a
+  message naming the migration instead of being silently ignored, and so the `Mechanism` seam
+  stays addressable if a second implementation is ever wanted.
+
+  **This changes what a fresh install does.** The agent now drives PostgreSQL directly:
+  `pg_ctl promote`, `pg_basebackup`, `pg_rewind`, and `primary_conninfo` + `standby.signal`.
+  Topology comes from `pg_stat_replication` rather than a self-reported catalog, the bootstrap
+  is the agent's (the lease holder runs `initdb`; every other pod waits, then clones through
+  its own pre-created replication slot), and the agent owns physical slot lifecycle. Policy is
+  untouched: the Lease is still the sole authority for who is primary, and the timeline/LSN
+  election, fencing and Service routing are unchanged.
+
+  A native cluster has no `repmgr` extension and no `repmgr.nodes` at all. The `repmgr`
+  database and role remain, because the agent authenticates as that role for replication;
+  renaming them is #291.
+
+  **An existing 1.x cluster is still repmgr-shaped on disk and cannot be flipped in place
+  yet** (#292). Until that ships, `native` is for fresh installs — read the upgrade note
+  before upgrading a live HA cluster.
+
+  Removed with the mechanism: the `#297` promote-registration gate (its premise was a repmgr
+  metadata requirement), the `#139` `repmgr.nodes` ghost-row cleanup (there is no registry to
+  strand rows in — the *slot* residue a scale-down leaves is still reclaimed), `RegisterPrimary`
+  / `RegisterStandby` / `Unregister` from the `Mechanism` interface, the reclone-on-missing-
+  local-record escalation (`repmgr standby follow` needed a row it could not obtain without
+  replication; native has no equivalent deadlock), and the node-id offset's last propagating
+  consumers. The offset itself stays, for exactly one reader: reclaiming
+  `repmgr_slot_<node_id>` orphans a repmgr-created cluster leaves behind.
+
+  `pg_ha_agent_replicas_expected` is now measured on every install rather than only under
+  `native`; its help text changed accordingly.
+
+  CI drops the mechanism axis with it: 21 suites x 2 majors = 42 legs, no exclusions, down
+  from 62 with 11.
+
+- **`repmgr.failoverMode: repmgrd` and the repmgrd + service-updater sidecars are gone**
+  (#286). The lease-based Go agent has been the default since `1.0.0` and `values.yaml`
+  marked repmgrd deprecated "for one major cycle"; that cycle is over. The agent is now
+  the only failover path.
+
+  What this removes: the `repmgrd` container, the `service-updater` container and the
+  ConfigMap carrying its script, `repmgrd-entrypoint.sh` and `service-updater.sh` from the
+  image, kubectl from the image (the service-updater was its only consumer — the pgbackrest
+  CronJobs run kubectl from their own `alpine/k8s` image), and `shareProcessNamespace` from
+  the pod (it existed so repmgrd could signal postgres across containers).
+
+  The Role loses two grants with them. `pods` **`delete`** is gone entirely — it was only
+  ever granted under `splitBrainDetection.action=fence` for the service-updater's
+  split-brain net (#154), and the agent soft-fences locally via `pg_ctl`; `fence` still
+  works and still needs no pod-delete privilege. The pgpool `deployments` get/patch grant
+  is gone too: the service-updater restarted pgpool on failover, whereas the agent
+  re-points the Services that pgpool already targets. The `events` create grant follows —
+  the agent records failover decisions in a structured audit log, so the `PrimaryChanged`
+  core/v1 Events are no longer emitted.
+
+  The postgresql **NetworkPolicy** loses its egress rule to pgpool's backend port (9999).
+  It existed only so the service-updater could health-check pgpool from the database pods
+  (#129); nothing in those pods connects to pgpool now, and traffic only flows the other
+  way. The pgpool policy's own ingress is unchanged.
+
+  **Removed values.** Each is rejected at render time with a message naming the fix, so a
+  stale values file fails the upgrade instead of silently deploying something else:
+
+  | Removed | Why |
+  |---------|-----|
+  | `repmgr.failoverMode` | Only one failover path remains |
+  | `repmgr.serviceUpdater.*` | The sidecar it sized no longer exists |
+  | `repmgr.monitoringHistoryDays` | Pruned `repmgr.monitoring_history`, which only repmgrd wrote |
+  | `pgpool.autoFailback` | Rendered PGPool's `auto_failback`, which only applied to the repmgrd failover flow |
+
 ### Added
 
 - **In-place migration of a live repmgr cluster to the native mechanism (#292).** `helm upgrade`
@@ -99,7 +348,126 @@
   PGDATA -- `pg_basebackup` wipes the target directory, so a surviving sentinel is direct
   evidence rather than an inference from logs or timing.
 
+
+- **Topology from `pg_stat_replication`; `repmgr.nodes` retired in native mode (#288).**
+  Inherited from pg's symlinked templates and shared agent. `native` can now run a real
+  multi-node cluster: the init container no longer polls `repmgr.nodes` (which nothing writes
+  under native, so every standby used to sit in `Init:CrashLoopBackOff`), the lease holder
+  `initdb`s and the rest clone via `pg_basebackup`, and a native cluster carries no repmgr
+  extension at all. Still EXPERIMENTAL.
+
+  Four of #288's changes also reach `mechanism: repmgr` installs, i.e. every upgrade on the
+  default path: restore provenance became a failover tiebreaker ranked above LSN; a standby with
+  no walreceiver and a frozen replay position is now rewound or re-cloned automatically after ~3
+  minutes; the postStart hook retries for up to 20s instead of skipping `additionalCommands`
+  silently (which on this chart is `CREATE EXTENSION vector`); and the restore record gained
+  `restoredAt` / `adoptedAt`. See the [pg 2.0.0 changelog](../pg/CHANGELOG.md) for the detail.
+
+
+- **The agent owns physical replication slot lifecycle in native mode (#289).** Inherited
+  from pg's symlinked agent/templates. repmgr mode is untouched (repmgr keeps owning slots
+  there). Under `mechanism: native` the agent creates `pg_ha_slot_<ordinal>` on the upstream
+  before every clone and rejoin (so `pg_basebackup`/`pg_rewind` stream through it and no WAL
+  gap can open), reconciles slots on every primary tick, and drops orphans -- never an
+  active one, never one belonging to a pod that still exists (decided from the live
+  Kubernetes pod list, not the render-time `REPMGR_NODE_COUNT`, which is stale on a
+  not-yet-rolled pod during a scale-up), and never while paused. `cascadingReplication` is
+  rejected at render time together with `native`. Three new metrics plus two `PrometheusRule`
+  alerts (`PGHAReplicationSlotRetainingWAL`, `PGHAReplicationSlotInactive`) make an
+  orphaned slot -- which otherwise pins WAL and fills the volume with no error until the
+  disk is full -- alertable. Those are **not** native-only: ownership is, but the gauges
+  they read are published under `repmgr` too (where the agent reports slots and never
+  reclaims them), because an alert that can only fire under an experimental flag reads as
+  coverage while providing none. New value:
+  `repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes` (default **3Gi**).
+
+  A third alert, `PGHAReplicationSlotInvalidated`, is the one that fires on chart defaults:
+  the image caps slots with `max_slot_wal_keep_size = 4GB`, so PostgreSQL invalidates a
+  neglected slot rather than letting it fill the volume -- and invalidation nulls
+  `restart_lsn`, so the retained-WAL gauge collapses to zero at exactly that moment. The
+  retained-WAL threshold is therefore the early warning and must stay below the 4GB cap. See
+  the [pg chart README](../pg/README.md#replication-slot-ownership-289) for the full second
+  review pass (stderr-blind error matching, stale gauges on a demoted primary, create/drop
+  oscillation, legacy-slot reclaim scope, `Follow` slot ensure, promote sub-budget, and a
+  demoted primary reclaiming the slots it minted -- which also needed a standby-safe slot
+  query, since `pg_current_wal_lsn()` raises `recovery is in progress` on a standby).
+
+- **`repmgr.agent.mechanism`: an experimental native HA mechanism, alongside repmgr
+  (#287).** Inherited from pg's symlinked agent/templates. Off by default
+  (`mechanism: repmgr`); `native` drives PostgreSQL's own tools directly instead of the
+  repmgr CLI. **EXPERIMENTAL -- do not set in production, and only at
+  `postgresql.replicaCount: 0` until `#288` lands** (verified live: any replicas leave every
+  standby permanently `Init:CrashLoopBackOff`, since the shared `repmgr-init` init container
+  has no `MECHANISM` awareness). See the
+  [pg chart README](../pg/README.md#replication-mechanics-experimental-287) for the full
+  detail, including three review-follow-up bug fixes to `Follow`/`Clone`/`GenerateConfig`.
+
+### Changed
+
+- **`pg.repmgrImage` is now `pg.haImage`.** The helper resolves `.Values.ha.image` and always
+  did; the name had been a lie since #290 renamed the image to `cagriekin/pg-ha` and #294 deleted
+  repmgr from it. It is the helper every workload's `image:` goes through, so a reader checking
+  which image a container runs met the wrong name first. Renamed across all 10 call sites, along
+  with ~35 comments and two operator-facing messages that still said "the repmgr image" --
+  including the major-mismatch `fail`, which told operators the server "runs from the repmgr
+  image". Renders are byte-identical apart from one intended admission-policy message.
+- **Test-suite cleanup: the inert mechanism branches are gone.** `chart_mechanism()` always
+  answered `native` after #294, so five suites carried `if native` gates whose `else` arms
+  asserted repmgr-mode properties (`repmgr.nodes` rows) against clusters that have no such table
+  -- unreachable code that read as coverage. The gates, the dead arms and the helper itself are
+  deleted. `values-config-repmgr.yaml` is now `values-config-ha.yaml` for the same reason.
+- **pgvector's unit suite no longer carries same-named copies of pg's.** `guards_test.yaml` there
+  held a reworded subset of pg's cases (24 of 76) under pg's filename: it read as a mirror while
+  being free to drift, and nothing checked. pg and pgvector templates are byte-identical by gate
+  and pgvector's are symlinks into pg's, so pg's suite already covers the shared template logic;
+  what belongs in pgvector is chart-specific. The two files are renamed `pgvector_*`, and
+  `scripts/helm-unittest-charts.sh` now REFUSES a pgvector unit file that shares a name with a pg
+  one without being a symlink to it.
+
+
+- `test-scaledown` (the #139 ghost-node regression) was ported from repmgrd mode to the
+  agent; the agent's `cleanupGhostNodes` runs the same `repmgr standby unregister` on the
+  lease holder. The `repmgr-failover`, `repmgr-chaos`, `config-repmgr` and `migrate-agent`
+  suites were removed with the mode they tested.
+- The `upgrade` suite no longer scales the cluster up across the upgrade: both of its fixtures
+  install 3 nodes, so it covers the upgrade itself (adding pgpool and the exporter, rolling the
+  pods, preserving data) but not a scale-up. Moving it from repmgrd to the agent surfaced a
+  **pre-existing** agent-mode race in which a new pod can win the Lease before it has
+  registered in `repmgr.nodes`, after which no survivor can follow it and the cluster is left
+  with no serving primary. That is tracked in #297, which restores the scale-up as part of its
+  fix. **Known coverage gap, stated rather than hidden:** no suite currently exercises an
+  agent-mode scale-up of a live cluster, and the race affects every 1.x release in agent mode
+  (a backport decision is recorded on #297).
+- `scripts/check-repmgrd-byte-stable.sh` is now `scripts/check-byte-stable.sh` and diffs the
+  default render (there is no second mode to pin). Across the 1.x → 2.0.0 boundary it diffs
+  heavily by design; compare against a 2.x ref for a meaningful result.
+
 ### Fixed
+
+- **`postgresql.extraVolumes` may no longer reuse `agent-control-tls` or
+  `pgbackrest-bootstrap-script` (#298 review).** Both are real volumes in the postgresql pod,
+  but neither was in `pg.validateExtraPassthrough`'s reserved list -- so
+  `postgresql.extraVolumes: [{name: agent-control-tls, ...}]` rendered CLEAN and emitted the
+  same volume name twice, and the API server then rejected the StatefulSet at apply time with
+  `spec.template.spec.volumes[1].name: Duplicate value`. That is the render-clean /
+  apply-broken class the guard exists to eliminate, and the sibling
+  `pg.validatePgbackrestPassthrough` already carried the complete list for the same pod. Both
+  names are now reserved unconditionally, so the reservation holds before a later upgrade
+  enables `ha.agent.control.enabled` or `pgbackrest.bootstrap.enabled`.
+
+- **The three chart-managed role names must now be distinct (#298 review).** `ha.username`
+  equal to `postgresql.username` (or to `postgres`) made the entrypoint's second `CREATE USER`
+  fail as "role already exists" -- swallowed, like every statement in that block -- so the
+  replication role silently kept the superuser's password while the bootstrap still reported
+  success and wrote its completion sentinel. The HA agent authenticates as that role for every
+  probe and for `pg_basebackup`, so the cluster came up Running/NotReady with no path out but
+  deleting the PVC. `prometheusExporter.monitoringUser.username` colliding with either was
+  worse still: the monitoring hook Job runs `ALTER ROLE ... WITH LOGIN PASSWORD`
+  unconditionally, so it OVERWROTE a working superuser or replication password minutes after a
+  successful install, breaking auth cluster-wide or streaming replication on every standby at
+  once. All four collisions now fail at render. `postgresql.username` may still be `postgres`
+  -- that is the default and initdb creates it; for the other two, "already exists" is the
+  failure.
 
 - **A long clone or rewind no longer gets the pod killed mid-copy (#298 review).** The reconcile
   heartbeat was struck once per tick, at the top of `tick()`, while `pg_basebackup`, `pg_rewind`
@@ -379,27 +747,87 @@
   a leftover `ha.agent.*` timing there -- a bare int from a 1.x file, say -- no longer blocks the
   install.
 
-### Changed
 
-- **`pg.repmgrImage` is now `pg.haImage`.** The helper resolves `.Values.ha.image` and always
-  did; the name had been a lie since #290 renamed the image to `cagriekin/pg-ha` and #294 deleted
-  repmgr from it. It is the helper every workload's `image:` goes through, so a reader checking
-  which image a container runs met the wrong name first. Renamed across all 10 call sites, along
-  with ~35 comments and two operator-facing messages that still said "the repmgr image" --
-  including the major-mismatch `fail`, which told operators the server "runs from the repmgr
-  image". Renders are byte-identical apart from one intended admission-policy message.
-- **Test-suite cleanup: the inert mechanism branches are gone.** `chart_mechanism()` always
-  answered `native` after #294, so five suites carried `if native` gates whose `else` arms
-  asserted repmgr-mode properties (`repmgr.nodes` rows) against clusters that have no such table
-  -- unreachable code that read as coverage. The gates, the dead arms and the helper itself are
-  deleted. `values-config-repmgr.yaml` is now `values-config-ha.yaml` for the same reason.
-- **pgvector's unit suite no longer carries same-named copies of pg's.** `guards_test.yaml` there
-  held a reworded subset of pg's cases (24 of 76) under pg's filename: it read as a mirror while
-  being free to drift, and nothing checked. pg and pgvector templates are byte-identical by gate
-  and pgvector's are symlinks into pg's, so pg's suite already covers the shared template logic;
-  what belongs in pgvector is chart-specific. The two files are renamed `pgvector_*`, and
-  `scripts/helm-unittest-charts.sh` now REFUSES a pgvector unit file that shares a name with a pg
-  one without being a symlink to it.
+- **`shared_preload_libraries = 'repmgr'` is now removed from an existing data directory
+  under `repmgr.agent.mechanism: native`** (#293), and a node whose configuration asks for a
+  library this image does not ship refuses to start with a message naming the migration.
+
+  The line is appended to `$PGDATA/postgresql.conf` by the image entrypoint at initdb time
+  and then cloned verbatim to every standby, so **every cluster any 1.x chart installed
+  carries it inside the data directory**. That matters because `shared_preload_libraries` is
+  a postmaster parameter living on the PVC, not in the release: when the repmgr-free image
+  arrives (#290) a cluster still requesting `repmgr.so` does not degrade, it refuses to
+  start — on every pod simultaneously — and `helm rollback` cannot fix it, because the
+  offending line is not in anything Helm owns. The removal therefore has to ship, and take
+  effect, a release *before* the image that makes it mandatory.
+
+  The agent now strips `repmgr` from that list on every boot, before it starts the
+  postmaster, preserving any other libraries and their load order and dropping the
+  assignment entirely when `repmgr` was the only entry. It converges rather than requiring
+  orchestration: a standby cloned from a not-yet-cleaned source is cleaned on its own next
+  restart, and a cluster that skips this release and jumps straight to the repmgr-free image
+  is still cleaned before its first start.
+
+  **Only native nodes are touched, deliberately.** A cluster that can run the repmgr-free
+  image is native by definition (#294 removes the repmgr mechanism), so cleaning native
+  nodes is sufficient — while a node still on `mechanism: repmgr` keeps its preload, because
+  the repmgr extension's own functions are what would be at stake there and nothing is
+  gained by removing it. Verified on a live cluster: the preload is a repmgrd requirement,
+  and every repmgr verb the agent drives (`standby clone`, `standby follow`, `standby
+  promote`, `primary register`) works without it — but native-only makes that finding moot
+  rather than load-bearing, which is the safer place for it to be.
+
+  Two guards come with it. `postgresql.configuration.shared_preload_libraries` containing
+  `repmgr` under `mechanism: native` is now **refused at render time**: that value reaches
+  the postmaster through `conf.d`'s `include_dir`, so it overrides the image's own native
+  gate and would put the library back on a cluster that has nothing to use it. And if any
+  configuration still requests `repmgr` while `repmgr.so` is genuinely absent, the agent
+  fails startup naming this migration step instead of leaving PostgreSQL to emit
+  `could not access file "repmgr"` in an unexplained crash-loop.
+
+  `wal_log_hints`, `max_replication_slots` and `max_slot_wal_keep_size` — written by the
+  same initdb block — are untouched: `pg_rewind` needs the first and agent-owned slots
+  (#289) build on the others.
+
+  Also under `mechanism: native`, an operator-declared `shared_preload_libraries` now passes
+  through `custom.conf` instead of being re-emitted from `repmgr-preload.conf`. That file
+  exists solely to preserve `repmgr` across an operator value, which native has nothing to
+  preserve. The default (repmgr) render is unchanged.
+
+- **A scale-up could wedge the cluster with no serving primary** (#286). Adding a replica to
+  a live HA cluster (`postgresql.replicaCount` N → N+1) could leave the former primary
+  unable to rejoin, so nothing served writes until it was manually repaired.
+
+  The new pod can win the Lease before it has ever registered as a standby — it is created
+  concurrently with the rolling restart the `REPMGR_NODE_COUNT` change triggers, so there is
+  a window where no other pod holds the Lease. Once it promotes, the surviving nodes hold no
+  `repmgr.nodes` record for it, and the agent drove repmgr by node id alone:
+
+  ```
+  action=Follow target=pg-2  reason="standby; follow the lease holder"
+  ERROR repmgr standby follow: unable to find record for intended upstream node 1002
+  WARN  repmgr standby register: unable to connect to the primary database
+  ```
+
+  Both failures are the same root cause: repmgr resolved the upstream through this node's
+  own copy of `repmgr.nodes`, which is only as fresh as its replication and during a
+  scale-up predates the current primary entirely. The register failed too, because that copy
+  still named a former primary that is now read-only — so the node could not even record
+  itself, and retried forever.
+
+  `Follow` and `RegisterStandby` now take the upstream's **connection**, derived from the
+  Lease holder's pod name, and address it with `-h/-p/-U/-d`. The Lease is always current, so
+  repmgr talks to the real primary instead of consulting stale metadata. The password still
+  travels via `PGPASSWORD` only, never argv (#167) — asserted by a test.
+
+  This bug predates 2.0.0 and affects every 1.x release in agent mode; it went unnoticed
+  because the only suite that scales a live cluster up ran in repmgrd mode (`OrderedReady`,
+  which serialises pod creation and closes the window). Moving that suite to the agent as
+  part of this change is what surfaced it, and it is now the regression test.
+
+  **Release prerequisite:** this fix is in the agent binary, so `repmgr.image.tag` must be
+  republished and bumped past `trixie-5.5.0-29` before 2.0.0 ships. CI builds the image from
+  source, so the suites exercise the fix on this branch regardless.
 
 ### Testing
 
@@ -486,394 +914,6 @@
   a 1.x cluster" phase not a repmgr cluster at all. Keep-marked pins now keep their base and move
   only the major suffix, on every major, which is idempotent and needs no staleness check.
 
-### Changed (breaking)
-
-- **The `repmgr:` values block is now `ha:`** (#291). Nothing nested moved -- only the block's
-  own name. Every `repmgr.*` key still works for the whole 2.0.0 line: `pg.normalizeValues`
-  merges the `repmgr:` block over the `ha:` defaults key by key, so an untouched 1.x values
-  file installs unchanged, `--set repmgr.agent.leaseDuration=20s` still lands, and a file
-  mixing the two spellings resolves per key with the `repmgr.*` value winning -- it is the one
-  the operator set; the `ha.*` side is chart defaults. Both spellings are schema-validated
-  (the `repmgr` schema is generated from the `ha` shape and asserted identical), so a bad enum
-  or a wrong type still fails the render whichever name is used. `helm upgrade` prints a
-  deprecation notice when it sees the old block.
-
-  Marked breaking because the values API's canonical name changed, and because **the alias is
-  removed in the next major** -- rename the top-level key before then. It is a rename and not
-  a break *today*, which is the point: 2.0.0 already carries one real break (repmgrd removal)
-  and stacking a mandatory values edit on top of it buys nothing.
-
-  Why rename at all: after #290 the image contains no repmgr -- no binary, no extension, no
-  `repmgr.conf` -- and the agent replicates through `pg_stat_replication` and slots it owns.
-  A block named `repmgr` was sizing the resources of, and holding the credentials for,
-  something no longer installed.
-
-  Three names keep the word on purpose, because they identify real PostgreSQL objects rather
-  than the tool: `ha.username`, `ha.database`, and the `repmgr-password` Secret key. Renaming
-  those rewrites a live cluster's role and credential, which is a data-plane migration, not a
-  values rename -- deliberately out of scope here. `REPMGR_*` env vars are likewise unchanged;
-  `pg/ENVIRONMENT.md` records which of them the agent still reads and which are now inert.
-
-  Review follow-ups on the rename itself, each a defect the first pass shipped:
-
-  - The removed-key guards (`failoverMode`, `serviceUpdater.*`, `monitoringHistoryDays`) now
-    fire under **both** spellings. Reading only `repmgr.*` made them skippable by taking the
-    very rename the upgrade notice recommends: a 1.x file carrying `failoverMode: repmgrd`,
-    with its block renamed to `ha:`, rendered clean and deployed an agent cluster to an
-    operator who believed repmgrd was running -- straight into the immutable
-    `podManagementPolicy` trap the guard exists to warn about.
-  - Three templates (`networkpolicy.yaml`, `service-headless.yaml`, `databases-roles-job.yaml`)
-    read `.Values.ha` transitively without normalizing first. In a full render this worked only
-    because `statefulset.yaml` sorts earlier and mutates `.Values` for every later file; rendered
-    alone, as helm-unittest does, they ignored the alias entirely.
-  - `set-pg-major.sh` and the pg-test workflow both resolved the HA image from `pg/values.yaml`
-    by anchoring on `^repmgr:`, and hard-exit when that misses. Both accept either spelling now.
-    The same scripts hardcoded the image *repository*, so the #290 rename would have ended in
-    `FATAL: rendered StatefulSet does not use cagriekin/repmgr:...`; the repository is read from
-    the chart and rewritten in fixtures alongside the tag, and the two-step is verified end to
-    end under both majors.
-  - `etcd.rbac.bootstrapImage` pinned only the tag, leaving the repository on the etcd subchart's
-    default. Harmless while both said `cagriekin/repmgr`; under the new tag scheme it names a
-    coordinate that cannot exist. Both halves are pinned now.
-
-  Second review round, all documentation/behavioural-surprise rather than logic:
-
-  - **`repmgr.*` beats `ha.*` from ANY source, including `--set`** -- Helm collapses defaults,
-    every `-f` and every `--set` into one map before the chart runs, so the merge cannot tell
-    an operator's value from a chart default and always prefers the deprecated spelling. So
-    `-f legacy.yaml --set ha.agent.leaseDuration=30s` renders the legacy value, discarding a
-    `--set` that Helm normally ranks highest. This cannot be caught at render time (a template
-    gets no provenance, so a `fail` would fire on every legitimate alias use or none), so it is
-    documented in the README, NOTES.txt and both values.yaml, with the instruction stated as
-    MOVE a key rather than duplicate it -- and pinned by tests, so flipping the merge direction
-    fails loudly instead of silently changing what a released values file resolves to.
-  - The README rename runbook gave `helm get values` without `-o yaml`, the exact command
-    NOTES.txt warns against (the default output prefixes `USER-SUPPLIED VALUES:`, which the
-    deliberately-open `additionalProperties` then accepts in silence).
-  - NOTES.txt is byte-identical across both charts, so its cross-reference now names the pg
-    chart README explicitly; the section it points at does not exist in pgvector's.
-  - The tag-scheme comment tables in `set-pg-major.sh` and the pg-test workflow described
-    `trixie-pg<major>-<n>` as the new scheme, which the classifier below them rejects -- it
-    keys on a leading semver, so that shape would fall to the legacy arm and reduce to bare
-    `trixie`. Not live breakage, but exactly the desync those comments exist to prevent.
-  - Both values.yaml files still instructed the deprecated spelling in their own how-to prose
-    (the etcd DCS walkthrough among them), so following the file the chart treats as the
-    authority on its input surface tripped the deprecation notice the same change adds.
-
-  Third review round:
-
-  - **`ha.agent` lease timings are now validated at render time.** client-go requires
-    `leaseDuration > renewDeadline > retryPeriod` and the agent refuses to start otherwise, but
-    nothing checked it before the API server, so a violating triple rendered cleanly and then
-    CrashLoopBackOff'd every postgresql pod at once with no primary. The reachable path is not
-    three bad numbers typed by hand -- it is MIXING the `repmgr.agent.*` alias with `ha.agent.*`
-    across two values files: these keys are cross-validated, so one timing from a 1.x file plus
-    two from a newer `-f` yields a triple neither file contains. The chart's own
-    `values-cloud.yaml` was the most reachable instance. The guard skips (rather than fails) a
-    duration shape it cannot parse, because `time.ParseDuration` accepts compound forms and
-    rejecting input the agent would have accepted would be a new bug, not a guard.
-  - `release.yaml` now excludes `pg-ha-*`. The new image tag `pg-ha-X.Y.Z` matches the chart
-    release glob, which the old dot-free `pg-ha-<n>` did not -- that is why only `trixie-*` was
-    excluded. Pushing `pg-ha-2.0.0` would have fired the chart release workflow too, which
-    resolves `chart="pg-ha"` and dies on the missing Chart.yaml.
-  - `set-pg-major.sh` derives the leftover scanners' repository alternation from the chart
-    instead of hardcoding the two Docker Hub names, so pointing `ha.image.repository` at a
-    mirror or fork cannot make the scanners match nothing and report a silent green.
-
-  Fourth review round, all on the lease guard added in the third:
-
-  - **An unparseable duration skipped validation instead of failing it.** `ha.agent.leaseDuration:
-    15` or `"20 s"` is not a Go duration -- `time.ParseDuration` rejects it, so `config.Load`
-    fail-fasts and every pod CrashLoopBackOffs -- but the guard's parser returned "" for it and
-    the caller shrugged, reproducing the exact render-clean/apply-broken outcome the guard was
-    added to close. `""` now means "not a duration" and is a hard failure; the parser also
-    handles the COMPOUND forms it previously skipped (`1m30s`, `2h45m`) by summing their pairs,
-    so nothing valid is rejected and nothing invalid is waved through. The doc comment claiming
-    `1.5h` was unparseable was wrong (the optional fraction already matched it), which meant one
-    test was passing on the ordering result rather than on the skip it claimed to assert.
-  - **The etcd DCS lease floor is now checked at render time.** `config.go` requires
-    `LEASE_DURATION >= 5s` under `ha.agent.dcs.backend: etcd` because the lease TTL is whole
-    seconds; a triple like 3s/2s/1s satisfies the ordering, rendered clean, and refused to boot.
-  - `values-cloud.yaml` gained a layering note. Because `repmgr.*` wins key by key, an operator
-    whose own file still spells the block `repmgr:` and sets any of the three timings gets a
-    mixture when they add `-f values-cloud.yaml` -- now rejected loudly with the fix named,
-    where before this PR it silently resolved to the overlay's values. The overlay is
-    deliberately NOT dual-spelled: shipping the deprecated block in an example would trip the
-    very notice it should demonstrate the absence of.
-  - `set-pg-major.sh`'s repository-rewrite rule now uses the derived alternation like the
-    scanners do, so a fork or mirror that retargeted values.yaml and its fixtures no longer hits
-    `rule 'HA image repository' matched nothing`. Verified against a simulated private registry.
-
-  Not changed: the `mechanism != native` branches in `pg.chartOwnsSharedPreloadLibraries` and
-  `pg.sharedPreloadLibraries`. They are unreachable in a real render for the same reason as the
-  agent branch this PR deleted, but the two are not equivalent -- the agent branch emitted
-  *wrong remediation advice*, which is worse than dead, while these two produce correct behaviour
-  for a state that can no longer occur. Deleting them would touch the subtle #262/#293 preload
-  logic for no behavioural gain.
-
-  Fifth review round -- the duration guard diverged from time.ParseDuration in BOTH directions,
-  and each direction was its own bug:
-
-  - **Too permissive (three holes, each reproducing the outage the guard exists to prevent).**
-    The parser lower-cased its input, so `15S` and `1M30S` passed -- Go's units are
-    case-SENSITIVE and both are errors. `| default "15s"` collapsed an explicitly empty value
-    into the default, so an empty `leaseDuration` validated as 15s while the StatefulSet emitted
-    `value: ""`, which Go also rejects. And `reconcileInterval` was not checked at all, though
-    `config.Load` parses it with the same helper. All three rendered cleanly and then refused the
-    agent's boot on every pod.
-  - **Too strict (turning working 1.x values into upgrade failures).** `.5s`, `5.s` and `+15s`
-    are valid Go durations and were rejected, as was microseconds spelled U+03BC. The grammar now
-    mirrors `time.ParseDuration`: optional leading sign, one or more `<number><unit>` pairs with
-    either side of the decimal point omissible, and all three microsecond spellings.
-  - **`etcd.rbac.bootstrapImage` must now match `ha.image` at render time.** The bundled etcd's
-    RBAC-bootstrap Job runs `pg-ha-agent rbac-bootstrap`, so a mismatch has one agent build
-    writing the etcd RBAC that a different build then authenticates against. This change pinned
-    both halves by hand but nothing enforced the lockstep, so the next image bump would have
-    silently reintroduced the drift. Adopting a new image is therefore a FOUR-key edit per chart,
-    now stated in `images/pg-ha/README.md` and enforced by `pg.validateEtcdBootstrapImage`.
-    Only checked when the bundled etcd is enabled -- with an external etcd the Job never renders.
-
-- **The HA image is versioned with the chart** (#290/#291). Tags are now
-  `cagriekin/pg-ha:<chart-version>-pg<major>` (e.g. `2.0.0-pg18`, `2.0.0-pg17`), published from
-  the git tag `pg-ha-<version>`, replacing `cagriekin/repmgr:trixie-<repmgr>-<n>`. The old
-  scheme was keyed on a repmgr version the image no longer contains. The version an image
-  carries is the chart version it shipped with; a chart-only patch does not force an image
-  rebuild, so the two can legitimately differ by a patch. `cagriekin/repmgr` stays published
-  and frozen at its last tag, so existing pins keep resolving. There is no unsuffixed
-  "default major" alias -- a pin names its major, and `ha.image.majorVersion` cross-checks it
-  at render time. The default pin is `cagriekin/pg-ha:2.0.0-pg18` (`ha.image` and
-  `etcd.rbac.bootstrapImage` moved together), published from git tag `pg-ha-2.0.0`.
-
-### Added
-
-- **Topology from `pg_stat_replication`; `repmgr.nodes` retired in native mode (#288).**
-  Inherited from pg's symlinked templates and shared agent. `native` can now run a real
-  multi-node cluster: the init container no longer polls `repmgr.nodes` (which nothing writes
-  under native, so every standby used to sit in `Init:CrashLoopBackOff`), the lease holder
-  `initdb`s and the rest clone via `pg_basebackup`, and a native cluster carries no repmgr
-  extension at all. Still EXPERIMENTAL.
-
-  Four of #288's changes also reach `mechanism: repmgr` installs, i.e. every upgrade on the
-  default path: restore provenance became a failover tiebreaker ranked above LSN; a standby with
-  no walreceiver and a frozen replay position is now rewound or re-cloned automatically after ~3
-  minutes; the postStart hook retries for up to 20s instead of skipping `additionalCommands`
-  silently (which on this chart is `CREATE EXTENSION vector`); and the restore record gained
-  `restoredAt` / `adoptedAt`. See the [pg 2.0.0 changelog](../pg/CHANGELOG.md) for the detail.
-
-### Removed (breaking)
-
-- **Removed the provably-inert `#297` promote gate.** It read `repmgr.nodes` to refuse promoting a
-  node no survivor could `repmgr standby follow`; nothing populated its inputs once #294 deleted
-  the repmgr mechanism, so it was unreachable code claiming to guard a promotion path (with eight
-  test cases asserting behaviour on inputs no observer could produce). Native follows by conninfo,
-  so a native primary is followable the moment it promotes. `Prober.RegisteredNodeIDs`,
-  `Observation.RegistryRead`/`LocalRegistered` and `PeerState.Registered` went with it.
-- **Removed `ha.splitBrainDetection` (and the `repmgr.splitBrainDetection` alias).** The
-  `log`/`fence` choice selected between behaviours that were already identical: the code that
-  distinguished them was the service-updater's `handle_split_brain()`, deleted with repmgrd
-  (#286), and the agent always demotes itself when it is read-write without holding the lease.
-  The key, the `SPLIT_BRAIN_ACTION` env it rendered, and the agent's dead validation of it are
-  gone; a values file still setting either spelling fails at render time with a message naming
-  the fix. The protection itself is unchanged -- the demote is unconditional.
-- **`native` is now the only replication mechanism, and the default** (#294). The `repmgr`
-  mechanism -- which shelled out to the repmgr CLI for `standby clone`, `standby follow`,
-  `standby promote` and `node rejoin`, and depended on the `repmgr.nodes` table -- is gone.
-
-  `repmgr.agent.mechanism` was introduced in this same unreleased major (#287) and was never
-  published, so **no released values file can be pinning it**. The key survives rather than
-  being deleted, so a stale `repmgr` copied from a pre-release branch fails the render with a
-  message naming the migration instead of being silently ignored, and so the `Mechanism` seam
-  stays addressable if a second implementation is ever wanted.
-
-  **This changes what a fresh install does.** The agent now drives PostgreSQL directly:
-  `pg_ctl promote`, `pg_basebackup`, `pg_rewind`, and `primary_conninfo` + `standby.signal`.
-  Topology comes from `pg_stat_replication` rather than a self-reported catalog, the bootstrap
-  is the agent's (the lease holder runs `initdb`; every other pod waits, then clones through
-  its own pre-created replication slot), and the agent owns physical slot lifecycle. Policy is
-  untouched: the Lease is still the sole authority for who is primary, and the timeline/LSN
-  election, fencing and Service routing are unchanged.
-
-  A native cluster has no `repmgr` extension and no `repmgr.nodes` at all. The `repmgr`
-  database and role remain, because the agent authenticates as that role for replication;
-  renaming them is #291.
-
-  **An existing 1.x cluster is still repmgr-shaped on disk and cannot be flipped in place
-  yet** (#292). Until that ships, `native` is for fresh installs — read the upgrade note
-  before upgrading a live HA cluster.
-
-  Removed with the mechanism: the `#297` promote-registration gate (its premise was a repmgr
-  metadata requirement), the `#139` `repmgr.nodes` ghost-row cleanup (there is no registry to
-  strand rows in — the *slot* residue a scale-down leaves is still reclaimed), `RegisterPrimary`
-  / `RegisterStandby` / `Unregister` from the `Mechanism` interface, the reclone-on-missing-
-  local-record escalation (`repmgr standby follow` needed a row it could not obtain without
-  replication; native has no equivalent deadlock), and the node-id offset's last propagating
-  consumers. The offset itself stays, for exactly one reader: reclaiming
-  `repmgr_slot_<node_id>` orphans a repmgr-created cluster leaves behind.
-
-  `pg_ha_agent_replicas_expected` is now measured on every install rather than only under
-  `native`; its help text changed accordingly.
-
-  CI drops the mechanism axis with it: 21 suites x 2 majors = 42 legs, no exclusions, down
-  from 62 with 11.
-
-- **`repmgr.failoverMode: repmgrd` and the repmgrd + service-updater sidecars are gone**
-  (#286). The lease-based Go agent has been the default since `1.0.0` and `values.yaml`
-  marked repmgrd deprecated "for one major cycle"; that cycle is over. The agent is now
-  the only failover path.
-
-  What this removes: the `repmgrd` container, the `service-updater` container and the
-  ConfigMap carrying its script, `repmgrd-entrypoint.sh` and `service-updater.sh` from the
-  image, kubectl from the image (the service-updater was its only consumer — the pgbackrest
-  CronJobs run kubectl from their own `alpine/k8s` image), and `shareProcessNamespace` from
-  the pod (it existed so repmgrd could signal postgres across containers).
-
-  The Role loses two grants with them. `pods` **`delete`** is gone entirely — it was only
-  ever granted under `splitBrainDetection.action=fence` for the service-updater's
-  split-brain net (#154), and the agent soft-fences locally via `pg_ctl`; `fence` still
-  works and still needs no pod-delete privilege. The pgpool `deployments` get/patch grant
-  is gone too: the service-updater restarted pgpool on failover, whereas the agent
-  re-points the Services that pgpool already targets. The `events` create grant follows —
-  the agent records failover decisions in a structured audit log, so the `PrimaryChanged`
-  core/v1 Events are no longer emitted.
-
-  The postgresql **NetworkPolicy** loses its egress rule to pgpool's backend port (9999).
-  It existed only so the service-updater could health-check pgpool from the database pods
-  (#129); nothing in those pods connects to pgpool now, and traffic only flows the other
-  way. The pgpool policy's own ingress is unchanged.
-
-  **Removed values.** Each is rejected at render time with a message naming the fix, so a
-  stale values file fails the upgrade instead of silently deploying something else:
-
-  | Removed | Why |
-  |---------|-----|
-  | `repmgr.failoverMode` | Only one failover path remains |
-  | `repmgr.serviceUpdater.*` | The sidecar it sized no longer exists |
-  | `repmgr.monitoringHistoryDays` | Pruned `repmgr.monitoring_history`, which only repmgrd wrote |
-  | `pgpool.autoFailback` | Rendered PGPool's `auto_failback`, which only applied to the repmgrd failover flow |
-
-### Fixed
-
-- **`shared_preload_libraries = 'repmgr'` is now removed from an existing data directory
-  under `repmgr.agent.mechanism: native`** (#293), and a node whose configuration asks for a
-  library this image does not ship refuses to start with a message naming the migration.
-
-  The line is appended to `$PGDATA/postgresql.conf` by the image entrypoint at initdb time
-  and then cloned verbatim to every standby, so **every cluster any 1.x chart installed
-  carries it inside the data directory**. That matters because `shared_preload_libraries` is
-  a postmaster parameter living on the PVC, not in the release: when the repmgr-free image
-  arrives (#290) a cluster still requesting `repmgr.so` does not degrade, it refuses to
-  start — on every pod simultaneously — and `helm rollback` cannot fix it, because the
-  offending line is not in anything Helm owns. The removal therefore has to ship, and take
-  effect, a release *before* the image that makes it mandatory.
-
-  The agent now strips `repmgr` from that list on every boot, before it starts the
-  postmaster, preserving any other libraries and their load order and dropping the
-  assignment entirely when `repmgr` was the only entry. It converges rather than requiring
-  orchestration: a standby cloned from a not-yet-cleaned source is cleaned on its own next
-  restart, and a cluster that skips this release and jumps straight to the repmgr-free image
-  is still cleaned before its first start.
-
-  **Only native nodes are touched, deliberately.** A cluster that can run the repmgr-free
-  image is native by definition (#294 removes the repmgr mechanism), so cleaning native
-  nodes is sufficient — while a node still on `mechanism: repmgr` keeps its preload, because
-  the repmgr extension's own functions are what would be at stake there and nothing is
-  gained by removing it. Verified on a live cluster: the preload is a repmgrd requirement,
-  and every repmgr verb the agent drives (`standby clone`, `standby follow`, `standby
-  promote`, `primary register`) works without it — but native-only makes that finding moot
-  rather than load-bearing, which is the safer place for it to be.
-
-  Two guards come with it. `postgresql.configuration.shared_preload_libraries` containing
-  `repmgr` under `mechanism: native` is now **refused at render time**: that value reaches
-  the postmaster through `conf.d`'s `include_dir`, so it overrides the image's own native
-  gate and would put the library back on a cluster that has nothing to use it. And if any
-  configuration still requests `repmgr` while `repmgr.so` is genuinely absent, the agent
-  fails startup naming this migration step instead of leaving PostgreSQL to emit
-  `could not access file "repmgr"` in an unexplained crash-loop.
-
-  `wal_log_hints`, `max_replication_slots` and `max_slot_wal_keep_size` — written by the
-  same initdb block — are untouched: `pg_rewind` needs the first and agent-owned slots
-  (#289) build on the others.
-
-  Also under `mechanism: native`, an operator-declared `shared_preload_libraries` now passes
-  through `custom.conf` instead of being re-emitted from `repmgr-preload.conf`. That file
-  exists solely to preserve `repmgr` across an operator value, which native has nothing to
-  preserve. The default (repmgr) render is unchanged.
-
-- **A scale-up could wedge the cluster with no serving primary** (#286). Adding a replica to
-  a live HA cluster (`postgresql.replicaCount` N → N+1) could leave the former primary
-  unable to rejoin, so nothing served writes until it was manually repaired.
-
-  The new pod can win the Lease before it has ever registered as a standby — it is created
-  concurrently with the rolling restart the `REPMGR_NODE_COUNT` change triggers, so there is
-  a window where no other pod holds the Lease. Once it promotes, the surviving nodes hold no
-  `repmgr.nodes` record for it, and the agent drove repmgr by node id alone:
-
-  ```
-  action=Follow target=pg-2  reason="standby; follow the lease holder"
-  ERROR repmgr standby follow: unable to find record for intended upstream node 1002
-  WARN  repmgr standby register: unable to connect to the primary database
-  ```
-
-  Both failures are the same root cause: repmgr resolved the upstream through this node's
-  own copy of `repmgr.nodes`, which is only as fresh as its replication and during a
-  scale-up predates the current primary entirely. The register failed too, because that copy
-  still named a former primary that is now read-only — so the node could not even record
-  itself, and retried forever.
-
-  `Follow` and `RegisterStandby` now take the upstream's **connection**, derived from the
-  Lease holder's pod name, and address it with `-h/-p/-U/-d`. The Lease is always current, so
-  repmgr talks to the real primary instead of consulting stale metadata. The password still
-  travels via `PGPASSWORD` only, never argv (#167) — asserted by a test.
-
-  This bug predates 2.0.0 and affects every 1.x release in agent mode; it went unnoticed
-  because the only suite that scales a live cluster up ran in repmgrd mode (`OrderedReady`,
-  which serialises pod creation and closes the window). Moving that suite to the agent as
-  part of this change is what surfaced it, and it is now the regression test.
-
-  **Release prerequisite:** this fix is in the agent binary, so `repmgr.image.tag` must be
-  republished and bumped past `trixie-5.5.0-29` before 2.0.0 ships. CI builds the image from
-  source, so the suites exercise the fix on this branch regardless.
-
-### Added
-
-- **The agent owns physical replication slot lifecycle in native mode (#289).** Inherited
-  from pg's symlinked agent/templates. repmgr mode is untouched (repmgr keeps owning slots
-  there). Under `mechanism: native` the agent creates `pg_ha_slot_<ordinal>` on the upstream
-  before every clone and rejoin (so `pg_basebackup`/`pg_rewind` stream through it and no WAL
-  gap can open), reconciles slots on every primary tick, and drops orphans -- never an
-  active one, never one belonging to a pod that still exists (decided from the live
-  Kubernetes pod list, not the render-time `REPMGR_NODE_COUNT`, which is stale on a
-  not-yet-rolled pod during a scale-up), and never while paused. `cascadingReplication` is
-  rejected at render time together with `native`. Three new metrics plus two `PrometheusRule`
-  alerts (`PGHAReplicationSlotRetainingWAL`, `PGHAReplicationSlotInactive`) make an
-  orphaned slot -- which otherwise pins WAL and fills the volume with no error until the
-  disk is full -- alertable. Those are **not** native-only: ownership is, but the gauges
-  they read are published under `repmgr` too (where the agent reports slots and never
-  reclaims them), because an alert that can only fire under an experimental flag reads as
-  coverage while providing none. New value:
-  `repmgr.agent.monitoring.prometheusRule.slotRetainedWALBytes` (default **3Gi**).
-
-  A third alert, `PGHAReplicationSlotInvalidated`, is the one that fires on chart defaults:
-  the image caps slots with `max_slot_wal_keep_size = 4GB`, so PostgreSQL invalidates a
-  neglected slot rather than letting it fill the volume -- and invalidation nulls
-  `restart_lsn`, so the retained-WAL gauge collapses to zero at exactly that moment. The
-  retained-WAL threshold is therefore the early warning and must stay below the 4GB cap. See
-  the [pg chart README](../pg/README.md#replication-slot-ownership-289) for the full second
-  review pass (stderr-blind error matching, stale gauges on a demoted primary, create/drop
-  oscillation, legacy-slot reclaim scope, `Follow` slot ensure, promote sub-budget, and a
-  demoted primary reclaiming the slots it minted -- which also needed a standby-safe slot
-  query, since `pg_current_wal_lsn()` raises `recovery is in progress` on a standby).
-
-- **`repmgr.agent.mechanism`: an experimental native HA mechanism, alongside repmgr
-  (#287).** Inherited from pg's symlinked agent/templates. Off by default
-  (`mechanism: repmgr`); `native` drives PostgreSQL's own tools directly instead of the
-  repmgr CLI. **EXPERIMENTAL -- do not set in production, and only at
-  `postgresql.replicaCount: 0` until `#288` lands** (verified live: any replicas leave every
-  standby permanently `Init:CrashLoopBackOff`, since the shared `repmgr-init` init container
-  has no `MECHANISM` awareness). See the
-  [pg chart README](../pg/README.md#replication-mechanics-experimental-287) for the full
-  detail, including three review-follow-up bug fixes to `Follow`/`Clone`/`GenerateConfig`.
-
 ### Migrating from 1.x
 
 **If you were on the default (agent):** delete `repmgr.failoverMode: agent` from your values
@@ -906,24 +946,6 @@ SCRAM `pg_hba.conf` with **no implicit `0.0.0.0/0 md5` catch-all** (add explicit
 `postgresql.pgHba` rules first if you relied on it), and failover history moves from
 `PrimaryChanged` Events to the agent's audit log and the `pg_ha_agent_*` metrics.
 
-### Changed
-
-- `test-scaledown` (the #139 ghost-node regression) was ported from repmgrd mode to the
-  agent; the agent's `cleanupGhostNodes` runs the same `repmgr standby unregister` on the
-  lease holder. The `repmgr-failover`, `repmgr-chaos`, `config-repmgr` and `migrate-agent`
-  suites were removed with the mode they tested.
-- The `upgrade` suite no longer scales the cluster up across the upgrade: both of its fixtures
-  install 3 nodes, so it covers the upgrade itself (adding pgpool and the exporter, rolling the
-  pods, preserving data) but not a scale-up. Moving it from repmgrd to the agent surfaced a
-  **pre-existing** agent-mode race in which a new pod can win the Lease before it has
-  registered in `repmgr.nodes`, after which no survivor can follow it and the cluster is left
-  with no serving primary. That is tracked in #297, which restores the scale-up as part of its
-  fix. **Known coverage gap, stated rather than hidden:** no suite currently exercises an
-  agent-mode scale-up of a live cluster, and the race affects every 1.x release in agent mode
-  (a backport decision is recorded on #297).
-- `scripts/check-repmgrd-byte-stable.sh` is now `scripts/check-byte-stable.sh` and diffs the
-  default render (there is no second mode to pin). Across the 1.x → 2.0.0 boundary it diffs
-  heavily by design; compare against a 2.x ref for a meaningful result.
 ## 1.17.0 - 2026-08-26
 
 Ships repmgr image `trixie-5.5.0-34`. Two HA-availability fixes, both of which could

@@ -58,7 +58,6 @@ echo "REPMGR_DIRS=${REPMGR_DIRS_FOUND:-ABSENT}"
 echo "PGBACKREST_VERSION=$(pgbackrest version 2>&1 | head -1)"
 echo "JQ=$(command -v jq || echo MISSING)"
 echo "GOSU=$(command -v gosu || echo MISSING)"
-echo "CRON=$(command -v cron || echo MISSING)"
 echo "KUBECTL=$(command -v kubectl 2>/dev/null || echo ABSENT)"
 echo "AGENT=$([ -x /usr/local/bin/pg-ha-agent ] && echo yes || echo MISSING)"
 # The postgres uid/gid are load-bearing OUTSIDE this image: the chart chowns PGDATA to a
@@ -158,7 +157,7 @@ for probe_key in PG_CTL PG_CONTROLDATA AGENT PGAUDIT_SO; do
     || bad "${probe_key} missing from the image" "got ${got}"
 done
 
-for probe_key in JQ GOSU CRON; do
+for probe_key in JQ GOSU; do
   got=$(val "$probe_key")
   case "$got" in
     /*) ok "${probe_key} on PATH (${got})" ;;

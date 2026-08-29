@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     # Two apt-heavy image builds (one per major, separate cache scopes so each is cold on
     # its first run), two docker saves and three artifact uploads. A timeout here cancels
-    # the job, which skips all 46 suite legs and fails the required gate with no test
+    # the job, which skips all 50 suite legs and fails the required gate with no test
     # signal at all, so it is sized for the cold case rather than the cached one.
     timeout-minutes: 50
     steps:
@@ -252,7 +252,7 @@ jobs:
         pg_major: ["18", "17"]
         # #294: the mechanism axis is GONE. It existed for the repmgr-to-native transition
         # (#288/#295) and carried 11 exclusions to keep the fan-out honest; native is now the
-        # only mechanism, so 21 suites x 2 majors = 42 legs with no exclusions at all. Anything
+        # only mechanism, so 25 suites x 2 majors = 50 legs with no exclusions at all. Anything
         # that reads as mechanism-conditional below is a leftover and should be deleted, not
         # re-gated.
         suite:

@@ -4048,6 +4048,15 @@ guard_fails "#262 guard: extraVolumes colliding with data fails" --set-json 'pos
 # postgresql-config, not repmgr-config (#298 review): that volume no longer exists, so
 # reserving its name was a fail message citing a chart-managed volume no render emits.
 guard_fails "#262 guard: extraVolumes colliding with postgresql-config fails" --set-json 'postgresql.extraVolumes=[{"name":"postgresql-config","emptyDir":{}}]'
+# Reserved UNCONDITIONALLY, including the volumes only a currently-disabled feature emits
+# (#298 review). Both of these were missing from the reserved list while the sibling
+# pgbackrest guard already carried them, so `postgresql.extraVolumes: [{name: agent-control-tls}]`
+# rendered CLEAN and emitted the same volume name twice -- the apiserver then rejects the
+# StatefulSet with `volumes[1].name: Duplicate value`, which is the apply-time failure this
+# guard exists to convert into a render-time one. The feature is deliberately left OFF here:
+# the reservation must hold before a later upgrade turns it on.
+guard_fails "#298 guard: extraVolumes colliding with agent-control-tls fails" --set-json 'postgresql.extraVolumes=[{"name":"agent-control-tls","emptyDir":{}}]'
+guard_fails "#298 guard: extraVolumes colliding with pgbackrest-bootstrap-script fails" --set-json 'postgresql.extraVolumes=[{"name":"pgbackrest-bootstrap-script","emptyDir":{}}]'
 guard_fails "#262 guard: duplicate extraVolumes name fails"     --set-json 'postgresql.extraVolumes=[{"name":"a","emptyDir":{}},{"name":"a","emptyDir":{}}]'
 guard_fails "#262 guard: dangling extraVolumeMounts fails"      --set-json 'postgresql.extraVolumeMounts=[{"name":"typo","mountPath":"/x"}]'
 guard_fails "#262 guard: extraVolumeMounts without mountPath fails" --set-json 'postgresql.extraVolumes=[{"name":"a","emptyDir":{}}]' --set-json 'postgresql.extraVolumeMounts=[{"name":"a"}]'
@@ -5286,6 +5295,39 @@ helm template test-pg "${CHART_DIR}" "${etcd_boot_args[@]}" \
   --set ha.image.digest=sha256:aaa --set etcd.rbac.bootstrapImage.digest=sha256:aaa \
   >/dev/null 2>&1 || etcd_dig_lock_rc=$?
 assert_eq "#298: matching digests on both halves render" "0" "${etcd_dig_lock_rc}"
+
+# #298 review: the three chart-managed role names must be distinct. Every collision here is
+# silent at render and destructive at runtime -- a replication role holding the superuser's
+# password (pod Running/NotReady with no path out but deleting the PVC), or the monitoring
+# hook Job's unconditional `ALTER ROLE ... PASSWORD` overwriting a working credential minutes
+# after a successful install.
+role_ha_eq_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.username=myuser --set postgresql.username=myuser \
+  >/dev/null 2>&1 || role_ha_eq_rc=$?
+assert_eq "#298: ha.username equal to postgresql.username fails the render" "1" "${role_ha_eq_rc}"
+role_ha_eq_msg=$(helm template test-pg "${CHART_DIR}" --set ha.username=myuser \
+  --set postgresql.username=myuser 2>&1 || true)
+assert_contains "#298: the collision message names the offending value" "both .myuser." "${role_ha_eq_msg}"
+role_ha_pg_rc=0
+helm template test-pg "${CHART_DIR}" --set postgresql.username=admin --set ha.username=postgres \
+  >/dev/null 2>&1 || role_ha_pg_rc=$?
+assert_eq "#298: ha.username=postgres fails even when the superuser is renamed" "1" "${role_ha_pg_rc}"
+role_mon_pg_rc=0
+helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true \
+  --set prometheusExporter.monitoringUser.username=postgres >/dev/null 2>&1 || role_mon_pg_rc=$?
+assert_eq "#298: a monitoring role named like the superuser fails the render" "1" "${role_mon_pg_rc}"
+role_mon_ha_rc=0
+helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true \
+  --set prometheusExporter.monitoringUser.username=repmgr >/dev/null 2>&1 || role_mon_ha_rc=$?
+assert_eq "#298: a monitoring role named like the replication role fails the render" "1" "${role_mon_ha_rc}"
+role_ok_rc=0
+helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true >/dev/null 2>&1 || role_ok_rc=$?
+assert_eq "#298: the default three role names render cleanly" "0" "${role_ok_rc}"
+role_mon_off_rc=0
+helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true \
+  --set prometheusExporter.monitoringUser.enabled=false \
+  --set prometheusExporter.monitoringUser.username=postgres >/dev/null 2>&1 || role_mon_off_rc=$?
+assert_eq "#298: no collision when the monitoring Job is disabled (it never ALTERs)" "0" "${role_mon_off_rc}"
 
 # ==========================================================================================
 # #292: the in-place repmgr -> native migration suite. It is the ONLY suite that starts from a
