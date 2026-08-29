@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/cagriekin/pg-ha-agent/internal/childenv"
 )
 
 // Exec runs an external command and returns its trimmed stdout. It is an
@@ -36,7 +38,9 @@ type OSExec struct{}
 // diagnostics must not be mixed into it the way CombinedOutput would.
 func (OSExec) Run(ctx context.Context, env []string, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Env = append(os.Environ(), env...)
+	// Strip the agent's own credential env from what psql inherits (#298 security
+	// review): it authenticates via the PGPASSWORD in env, never the raw agent secrets.
+	cmd.Env = childenv.Filtered(os.Environ(), env)
 	// WaitDelay bounds the gap between killing the process and Wait returning. Without it a
 	// cancelled context kills only the direct child, while Wait blocks forever on the stdout
 	// copy: any GRANDCHILD still holding the pipe keeps it from reaching EOF. That is not

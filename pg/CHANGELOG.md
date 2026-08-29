@@ -1033,6 +1033,69 @@
   republished and bumped past `trixie-5.5.0-29` before 2.0.0 ships. CI builds the image from
   source, so the suites exercise the fix on this branch regardless.
 
+### Security
+
+Findings from a security-only review of the 2.0.0 line (#298), fixed here. All are hardening;
+the highest-impact require an attacker who already holds the agent's ServiceAccount token (a
+compromised pg pod), which the agent's own RBAC scopes to the release's pods/marker/lease.
+
+- **A forged peer restore timestamp can no longer promote a stale node.** The agent ranks a
+  peer's gossiped `RestoredAt` (a pod annotation) ahead of WAL position, so a far-future value
+  written onto a behind-but-reachable peer's annotation could hand it the lease and discard
+  committed WAL. The value is now rejected unless it is a parseable RFC3339 timestamp no more
+  than an hour ahead of now; anything else contributes no restore authority.
+
+- **The lease holder identity is validated before it becomes a replication conninfo.** A
+  follower built `host=<leader>.<headless>` straight from the Lease `holderIdentity`, so a
+  value like `evil.svc port=5432 sslmode=disable x` injected libpq keywords and made the
+  standby dial an attacker host with the replication password set. The identity, and every
+  follow/clone/rejoin target, must now match this cluster's `<name>-<ordinal>` pod grammar.
+
+- **A tampered primary marker is now detected and alarmed.** The marker ConfigMap's timeline
+  is trusted as the promotion highwater; a forged or unparseable value freezes promotions
+  cluster-wide. The agent keeps failing closed (the safe response) but now logs and increments
+  a new `pg_ha_agent_marker_tamper_suspected_total` counter when the marker is unparseable or
+  implausibly far above every observed node, so a tamper-induced outage is diagnosable.
+
+- **Maintenance mode is no longer silent.** Entering/leaving pause (an in-namespace kill switch
+  for automatic failover) is now logged on the transition. The lease-loss fence is unaffected
+  by pause, so a paused primary that loses its lease still demotes.
+
+- **Bootstrap passwords are no longer passed on a psql command line.** `CREATE/ALTER USER ...
+  PASSWORD` ran via `psql -c`, exposing the app and replication passwords in `/proc/<pid>/cmdline`
+  during bootstrap; they now go in on stdin.
+
+- **Child processes no longer inherit the agent's raw credential env.** psql, pg_basebackup,
+  pg_rewind and pgbackrest authenticate via `PGPASSWORD`/`PGPASSFILE`, so `REPMGR_PASSWORD` /
+  `POSTGRES_PASSWORD` (and anything else carrying `PASSWORD`) are now stripped from their
+  environment.
+
+- **Role names are validated before reaching pg_hba.conf.** `REPMGR_USER` / `POSTGRES_USER` /
+  `MONITORING_USER` are interpolated into pg_hba lines; a value with whitespace or a newline
+  now fails at boot, matching the existing `POD_CIDR` check.
+
+- **`PGBACKREST_STANZA` is validated before the archive_command GUC.** A single quote would
+  close the GUC string and hand the rest to the archiver's shell; the stanza must now match
+  `[A-Za-z0-9_-]+` or the boot fails.
+
+- **`postgresql.pgHba` entries are validated at render time.** A quote or newline would corrupt
+  the postStart hook (crash-looping the pod) or mangle pg_hba.conf; both are now rejected by
+  `values.schema.json` and a `{{ fail }}` guard.
+
+- **Security keys may no longer be set via the deprecated `repmgr.*` alias.** Because the alias
+  overwrites `ha.*` even over `--set`, a stale value could silently downgrade a control:
+  `ha.agent.podCidr`, `ha.agent.control.allowedClientCNs`, `ha.agent.control.restore.allowedClientCNs`
+  and `ha.agent.control.restore.admissionPolicy.{enabled,acknowledgeUnbounded}` must now be set
+  under `ha.*`; the render fails if they appear on `repmgr.*`.
+
+- **The etcd RBAC-bootstrap Job drops its ServiceAccount token.** It talks only to etcd, so it
+  now sets `automountServiceAccountToken: false` like every sibling one-shot Job (etcd 0.1.8).
+
+- **Image supply-chain hardening.** The PGDG apt source and key fetch use HTTPS with a protocol
+  pin (`--proto '=https'`); the pg-extensions build's `trusted=`/`allow-insecure=` guard is now
+  case-insensitive and rejects a multi-line `APT_SOURCE_LINE`; and the five non-GitHub actions
+  in the pg-ha publish workflow are pinned to commit SHAs.
+
 ### Testing
 
 - **The cold-boot stage of the agent failover suite now always runs (#298 review).** A

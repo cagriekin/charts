@@ -348,6 +348,21 @@ func Load(get func(string) string) (*Config, error) {
 			l.invalid = append(l.invalid, fmt.Sprintf("POD_CIDR=%q is not a valid CIDR: %v", c.PgHbaPeerCIDR, err))
 		}
 	}
+	// The role names are interpolated raw into pg_hba.conf lines too (pgconf.AssemblePgHba),
+	// so a value carrying whitespace or a newline would split a rule or inject an extra one
+	// -- the same class of corruption POD_CIDR is validated against, given the same check
+	// here rather than left asymmetric (#298 security review). A PostgreSQL role name has no
+	// legitimate need for either. "" is allowed: MONITORING_USER empty means "no monitoring
+	// rule", and the missing-required check already covers the others.
+	for _, u := range []struct{ name, val string }{
+		{"REPMGR_USER", c.RepmgrUser},
+		{"POSTGRES_USER", c.PostgresUser},
+		{"MONITORING_USER", c.MonitoringUser},
+	} {
+		if strings.ContainsAny(u.val, " \t\r\n") {
+			l.invalid = append(l.invalid, fmt.Sprintf("%s=%q must not contain whitespace: it is written verbatim into pg_hba.conf", u.name, u.val))
+		}
+	}
 	// etcd backend config is required only when DCS_BACKEND=etcd, so a kubernetes
 	// install needs none of it. TLS is optional (all-or-none, enforced in dcs).
 	if c.DCSBackend == "etcd" {

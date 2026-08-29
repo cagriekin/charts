@@ -261,6 +261,7 @@ func newFollowTestAgentWithPM(t *testing.T, ex *scriptedExec, pm *fakePostmaster
 			RepmgrPassword:  "pw",
 			RenewDeadline:   2 * time.Second,
 		},
+		base:   "pg", // production sets this from podname.Base(cfg.PodName); the target guard needs it
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		dcs:    &fakeDCS{},
 		mech:   m,
@@ -1362,6 +1363,7 @@ func newBootstrapTestAgentWithPM(t *testing.T, ex *initdbExec, mech string, pm *
 			Mechanism: mech, PgHbaPeerCIDR: "10.0.0.0/8", RenewDeadline: 2 * time.Second,
 			Namespace: "ns", MarkerName: "pg-primary",
 		},
+		base: "pg", // production sets this from podname.Base(cfg.PodName); the target guard needs it
 		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 		dcs:  &fakeDCS{leader: true},
 		mech: m,

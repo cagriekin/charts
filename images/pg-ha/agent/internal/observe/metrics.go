@@ -24,6 +24,10 @@ type Metrics struct {
 	reconcileErrors atomic.Int64
 	recoveryStarts  atomic.Int64 // recovery-mode (read-only WAL replay) entries
 	lastBeatUnixNs  atomic.Int64 // last reconcile-loop heartbeat
+	// markerTamper counts ticks on which the primary marker looked forged or corrupt
+	// (#298 security review): an implausible/unparseable highwater freezes promotions
+	// via unsafeToServe, so this makes a tamper-induced write outage alertable.
+	markerTamper atomic.Int64
 	// Control API (#276). Counted here so the control plane is observable from the
 	// SAME read-only surface Prometheus already scrapes -- a denied or failing control
 	// call must be alertable without opening the control port to the scraper.
@@ -94,6 +98,7 @@ func (m *Metrics) IncDemote()         { m.demotes.Add(1) }
 func (m *Metrics) IncFence()          { m.fences.Add(1) }
 func (m *Metrics) IncReconcileError() { m.reconcileErrors.Add(1) }
 func (m *Metrics) IncRecoveryStart()  { m.recoveryStarts.Add(1) }
+func (m *Metrics) IncMarkerTamper()   { m.markerTamper.Add(1) }
 
 // Control-API counters. IncControlRequest counts every authenticated request,
 // IncControlRejected every one refused by authn/authz, IncControlIntent every
@@ -196,6 +201,7 @@ func (m *Metrics) write(w io.Writer) {
 		{"pg_ha_agent_fences_total", "Soft fences performed.", "counter", m.fences.Load()},
 		{"pg_ha_agent_reconcile_errors_total", "Reconcile-loop errors.", "counter", m.reconcileErrors.Load()},
 		{"pg_ha_agent_recovery_starts_total", "Recovery-mode (read-only WAL replay) starts at cold boot.", "counter", m.recoveryStarts.Load()},
+		{"pg_ha_agent_marker_tamper_suspected_total", "Ticks on which the primary marker looked forged or corrupt (implausible/unparseable highwater); a non-zero rate means automatic promotion may be frozen.", "counter", m.markerTamper.Load()},
 		{"pg_ha_agent_control_requests_total", "Authenticated control-API requests.", "counter", m.controlRequests.Load()},
 		{"pg_ha_agent_control_rejected_total", "Control-API requests refused by authentication or authorization.", "counter", m.controlRejected.Load()},
 		{"pg_ha_agent_control_intents_total", "Node-local control-API operations handed to the reconcile loop.", "counter", m.controlIntents.Load()},

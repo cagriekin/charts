@@ -1038,3 +1038,45 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: 'must match ha.image'
+
+  # --- #298 security review: new fail-fast guards ---
+  # postgresql.pgHba entries are inserted verbatim into a shell postStart hook and pg_hba.conf;
+  # a single quote or newline corrupts the hook or mangles the file. Rejected at render time
+  # (the schema forbids the quote too; pg.validatePgHba is the authoritative backstop).
+  - it: a postgresql.pgHba entry with a single quote is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.pgHba:
+        - "host all all 10.0.0.0/8 scram-sha-256' -- x"
+    asserts:
+      - failedTemplate: {}
+
+  # Security keys may not be carried on the deprecated repmgr.* alias: it overwrites ha.*
+  # even over --set, so a stale value would silently downgrade the control.
+  - it: podCidr via the repmgr.* alias is refused
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.agent.podCidr: 10.0.0.0/8
+    asserts:
+      - failedTemplate:
+          errorPattern: 'repmgr\.agent\.podCidr is set via the deprecated repmgr\.\* alias'
+
+  - it: control.restore.admissionPolicy.enabled via the repmgr.* alias is refused
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.agent.control.restore.admissionPolicy.enabled: false
+    asserts:
+      - failedTemplate:
+          errorPattern: 'set via the deprecated repmgr\.\* alias'
+
+  # The same key under ha.* renders (the canonical path).
+  - it: podCidr under ha.* renders
+    templates:
+      - templates/statefulset.yaml
+    set:
+      ha.agent.podCidr: 10.0.0.0/8
+    asserts:
+      - notFailedTemplate: {}

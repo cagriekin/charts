@@ -2,6 +2,7 @@
 {{- include "pg.validateResourceNames" . }}
 {{- include "pg.validateAudit" . }}
 {{- include "pg.validateRoleNames" . }}
+{{- include "pg.validatePgHba" . }}
 {{- include "pg.validateExtraPassthrough" . }}
 {{- include "pg.validatePgbackrestPassthrough" . }}
 {{- include "pg.validateExtensionPackages" . }}

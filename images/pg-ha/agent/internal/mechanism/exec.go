@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"time"
+
+	"github.com/cagriekin/pg-ha-agent/internal/childenv"
 )
 
 // Command execution and connection-string plumbing shared by every Mechanism
@@ -25,7 +27,10 @@ type OSRunner struct{}
 
 func (OSRunner) Run(ctx context.Context, env []string, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Env = append(os.Environ(), env...)
+	// Strip the agent's own credential env from what pg_basebackup/pg_rewind inherit
+	// (#298 security review): they authenticate via the PGPASSWORD in env, never the
+	// raw agent secrets, so those should not sit in a child's /proc/<pid>/environ.
+	cmd.Env = childenv.Filtered(os.Environ(), env)
 	// WaitDelay bounds the gap between killing the process and Wait returning, exactly as
 	// pg.OSExec does and for the same reason (#288 review, mirrored here by #298's): a
 	// cancelled context kills only the direct child, while Wait blocks on the output pipe

@@ -91,9 +91,9 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 
 # PGDG, configured exactly as images/pg-ha/Dockerfile does -- the extension packages this
 # image exists to install come from here.
-RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+RUN curl -fsSL --proto '=https' --proto-redir '=https' https://www.postgresql.org/media/keys/ACCC4CF8.asc \
       | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg \
- && echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+ && echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
       > /etc/apt/sources.list.d/postgresql.list
 
 # The optional extra source, keyed under its own name so it can never collide with the PGDG
@@ -107,10 +107,20 @@ RUN if [ -n "$APT_SOURCE_NAME" ] || [ -n "$APT_SOURCE_KEY_URL" ] || [ -n "$APT_S
         *"signed-by=/usr/share/keyrings/${APT_SOURCE_NAME}-keyring.gpg"*) : ;; \
         *) echo "APT_SOURCE_LINE must carry signed-by=/usr/share/keyrings/${APT_SOURCE_NAME}-keyring.gpg (the exact path this build dearmors the key to) -- a bare signed-by= pointing elsewhere fails later inside apt-get update with NO_PUBKEY, and no signed-by at all makes the key fetch decorative" >&2; exit 1 ;; \
       esac; \
+      # Reject an embedded newline first (#298 security review): a multi-line value would
+      # smuggle a second, unchecked `deb` line past the single-line globs below and past the
+      # signed-by check above -- `echo "$APT_SOURCE_LINE" >` would write it verbatim.
+      if [ "$(printf '%s\n' "$APT_SOURCE_LINE" | grep -c .)" -gt 1 ]; then \
+        echo "APT_SOURCE_LINE must be a single line -- an embedded newline could smuggle a second, unchecked apt source past these checks" >&2; exit 1; \
+      fi; \
       # Refused for the same reason pg.validateExtensionAptSources refuses them in the chart:
       # these make the key fetch above decorative and install unsigned or weakly-signed
-      # packages as root. A signed-by= alongside trusted=yes is not a signed source.
-      case "$APT_SOURCE_LINE" in \
+      # packages as root. A signed-by= alongside trusted=yes is not a signed source. Matched
+      # case-INSENSITIVELY (#298 security review): apt source options are case-insensitive, so
+      # a Trusted=yes / ALLOW-INSECURE=yes would slip past a case-sensitive glob and disable
+      # verification. Lower-case the value before the globs.
+      apt_source_lc=$(printf '%s' "$APT_SOURCE_LINE" | tr 'A-Z' 'a-z'); \
+      case "$apt_source_lc" in \
         *trusted=*|*allow-insecure=*|*allow-weak=*|*allow-downgrade-to-insecure=*) \
           echo "APT_SOURCE_LINE sets an apt option that weakens or disables signature verification (trusted=/allow-insecure=/allow-weak=/allow-downgrade-to-insecure=) -- sign the source properly with signed-by= instead" >&2; exit 1 ;; \
       esac; \

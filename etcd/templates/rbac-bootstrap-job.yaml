@@ -35,6 +35,12 @@ spec:
         {{- include "etcd.selectorLabels" . | nindent 8 }}
     spec:
       restartPolicy: Never
+      # The bootstrap talks only to etcd (via the mounted root-CN admin cert), never to
+      # the Kubernetes API, so it needs no ServiceAccount token -- and mounting one next to
+      # the etcd superuser credential only gives a compromised bootstrap image a second
+      # identity for free (#298 security review). Every sibling one-shot Job in pg/templates
+      # already sets this; this Job was the lone omission.
+      automountServiceAccountToken: false
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:

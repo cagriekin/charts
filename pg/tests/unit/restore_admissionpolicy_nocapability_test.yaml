@@ -35,8 +35,8 @@ tests:
     values:
       - ../values-agent-control-restore.yaml
     set:
-      repmgr.agent.control.restore.admissionPolicy.enabled: false
-      repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
+      ha.agent.control.restore.admissionPolicy.enabled: false
+      ha.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
     templates:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
@@ -49,8 +49,8 @@ tests:
     values:
       - ../values-agent-control-restore.yaml
     set:
-      repmgr.agent.control.restore.admissionPolicy.enabled: false
-      repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
+      ha.agent.control.restore.admissionPolicy.enabled: false
+      ha.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
     templates:
       - templates/rbac.yaml
     documentIndex: 1

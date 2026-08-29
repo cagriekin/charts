@@ -254,6 +254,14 @@
             "logical"
           ],
           "description": "replica (default) or logical, for a logical-replication subscriber (#308). The only place to set wal_level -- setting it in postgresql.configuration instead is rejected at render time."
+        },
+        "pgHba": {
+          "type": "array",
+          "description": "Extra pg_hba.conf lines inserted above the network catch-alls. Each entry is one line; a single quote or newline is rejected (it is interpolated into a shell postStart hook and pg_hba.conf).",
+          "items": {
+            "type": "string",
+            "pattern": "^[^'\r\n]*$"
+          }
         }
       }
     },

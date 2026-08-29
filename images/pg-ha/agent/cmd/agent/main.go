@@ -234,6 +234,13 @@ type agent struct {
 	// window before the next tick); fail-safe is to demote on uncertainty.
 	servingRW atomic.Bool
 
+	// Transition latches for the two tamper/maintenance alarms (#298 security review),
+	// touched only from the single reconcile goroutine so they need no synchronisation.
+	// They keep the Error/Warn log to the moment the state flips rather than every tick;
+	// the metrics counter/gauge carries the steady-state signal for alerting.
+	pausedLatched       bool
+	markerTamperLatched bool
+
 	// Control API (#276), present only when it is enabled. intents carries node-local
 	// operations from HTTP handlers to the reconcile goroutine (which owns the
 	// postmaster); snap is the per-tick state the API serves, so a request costs no
@@ -648,6 +655,86 @@ func (a *agent) localRestoredAt() string {
 	return ""
 }
 
+// maxRestoreClockSkew bounds how far ahead of now a peer's gossiped restore
+// timestamp may sit before it is rejected as forged/corrupt (#298 security review).
+// A restore's FinishedAt is always in the past by the time a peer gossips and this
+// node reads it; a far-future value (e.g. "9999-01-01T00:00:00Z") would sort
+// lexically above every real timestamp in reconcile.restoredAfter and hand the lease
+// to a node with LESS WAL, discarding committed history. The window is generous
+// enough to absorb any realistic NTP skew between pods.
+const maxRestoreClockSkew = time.Hour
+
+// validRestoreProvenance returns rst when it is a parseable RFC3339 timestamp no
+// further ahead than maxRestoreClockSkew, else "" (no provenance). Empty stays
+// empty. This guards only gossip-sourced (peer) values, which a namespace writer can
+// forge onto a pod annotation; the local record comes from this node's own volume and
+// is trusted. Dropping to "" is the safe direction -- it can only lower a peer's rank,
+// never raise it.
+func validRestoreProvenance(rst string, now time.Time) string {
+	if rst == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339, rst)
+	if err != nil || t.After(now.Add(maxRestoreClockSkew)) {
+		return ""
+	}
+	return rst
+}
+
+// validPeerName reports whether name is one of THIS cluster's StatefulSet pods
+// (<base>-<ordinal>), the only strings safe to build a libpq conninfo host from
+// (#298 security review). dcs.Leader() and the switchover-target annotation are
+// DCS/ConfigMap values a namespace writer can forge; an unvalidated value such as
+// "evil.svc port=5432 sslmode=disable x" would inject libpq conninfo keywords
+// (fqdn appends ".<headless>") and make this node dial an attacker host with the
+// replication PGPASSWORD set. Peer names the agent derives itself (a.base-<n>) are
+// already safe; this gates the ones that arrive over the wire.
+func (a *agent) validPeerName(name string) bool {
+	if name == "" {
+		return false
+	}
+	ord, ok := podname.Ordinal(name)
+	return ok && name == fmt.Sprintf("%s-%d", a.base, ord)
+}
+
+// markerTimelineSaneDelta is how many timelines above the highest OBSERVED node
+// timeline the marker highwater may sit before it is treated as implausible (#298
+// security review). A timeline advances by one per promotion, so even a long cold
+// boot leaves the marker at most a handful ahead of what nodes report; a gap of
+// hundreds cannot be a real cluster and is the signature of a forged/corrupt marker.
+// The threshold is deliberately generous so ordinary cold-boot skew never trips it.
+const markerTimelineSaneDelta pg.Timeline = 100
+
+// markerTamperSuspected reports whether the primary marker looks forged or corrupt:
+// unparseable, or a timeline implausibly far above every node's observed timeline.
+// Detection only -- unsafeToServe still fails closed on these -- so this never
+// changes a failover decision; it only makes a forced write-outage diagnosable.
+func markerTamperSuspected(o reconcile.Observation) (bool, string) {
+	if !o.Marker.Present {
+		return false, ""
+	}
+	if o.Marker.Malformed {
+		return true, "marker timeline is unparseable"
+	}
+	maxTL := pg.Timeline(0)
+	haveObs := false
+	if o.Local.TimelineOK {
+		maxTL, haveObs = o.Local.Timeline, true
+	}
+	for _, p := range o.Peers {
+		if p.TimelineOK && (!haveObs || p.Timeline > maxTL) {
+			maxTL, haveObs = p.Timeline, true
+		}
+	}
+	// Only judge against reality when SOME node's timeline is readable; with none we
+	// cannot tell a legitimate cold-boot-ahead marker from a forged one. The subtraction
+	// is guarded by the `>` so it cannot underflow the unsigned Timeline.
+	if haveObs && o.Marker.Timeline > maxTL && o.Marker.Timeline-maxTL > markerTimelineSaneDelta {
+		return true, "marker timeline is implausibly far above every observed node"
+	}
+	return false, ""
+}
+
 func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	local := a.prober.Probe(ctx, a.selfConn())
 	ls := reconcile.LocalState{
@@ -677,9 +764,20 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 			ls.LSN, ls.LSNOK = cd.LSN, cd.LSNOK // checkpoint LSN: position for gossip ranking while stopped
 		}
 	}
+	// The Lease holderIdentity is DCS state a namespace writer can forge, and it flows
+	// into a libpq conninfo host for a follower (Follow -> peerMechConn -> conninfo).
+	// Reject any value that is not one of THIS cluster's pod names before it can inject
+	// conninfo keywords or redirect replication to an attacker host (#298 security
+	// review). An unknown leader is safer than a forged one: the standby waits rather
+	// than dialing it.
+	leader := a.dcs.Leader()
+	if leader != "" && !a.validPeerName(leader) {
+		a.log.Error("ignoring lease holder identity that is not a valid cluster pod name (possible tampering)", "holder", leader)
+		leader = ""
+	}
 	o := reconcile.Observation{
 		HoldLease:      a.dcs.IsLeader(),
-		LeaderIdentity: a.dcs.Leader(),
+		LeaderIdentity: leader,
 		Local:          ls,
 		// Process liveness (alive, not SQL-ready): a starting/recovering node is
 		// alive but Running (SQL) is false; the decider waits instead of acting on
@@ -774,7 +872,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		// and the case that matters is a reachable stale peer needing to see that another node
 		// was restored -- ranking on position alone let it promote and discard that history.
 		if g, ok := gossip[name]; ok && a.gossipFresh(g) {
-			ps.RestoredAt = g.RestoredAt
+			ps.RestoredAt = validRestoreProvenance(g.RestoredAt, time.Now())
 		}
 		o.Peers = append(o.Peers, ps)
 	}
@@ -797,6 +895,21 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 		Timeline:  pg.Timeline(m.Timeline),
 		Primary:   m.Primary,
 	}
+	// Cross-check the marker highwater against observed reality (#298 security review).
+	// The marker is a ConfigMap a namespace writer can forge, and unsafeToServe trusts
+	// its timeline: a wildly-high (or unparseable) value trips the guard on every node
+	// and freezes all promotions -- a write outage. We keep failing closed there (an
+	// untrusted highwater is not safe to serve on), but a marker that cannot possibly be
+	// real is surfaced loudly and counted so the outage reads as tampering, not silence.
+	if suspect, why := markerTamperSuspected(o); suspect {
+		a.metr.IncMarkerTamper()
+		if !a.markerTamperLatched {
+			a.log.Error("primary marker looks tampered or corrupt; automatic promotion may be frozen until it is corrected (possible tampering)", "reason", why, "markerTimeline", uint32(o.Marker.Timeline))
+			a.markerTamperLatched = true
+		}
+	} else {
+		a.markerTamperLatched = false
+	}
 	// This pod's name, compared against Marker.Primary so an empty-data lease holder
 	// can recognize it is not the recorded primary and release the lease (#186).
 	o.LocalNode = a.cfg.PodName
@@ -812,6 +925,18 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// agent keeps renewing the Lease and serving.
 	o.Paused = m.Paused
 	a.metr.SetPaused(m.Paused)
+	// Maintenance mode is an in-namespace kill switch for automatic failover, so make
+	// entering/leaving it non-silent (#298 security review): log on the transition (the
+	// gauge above carries steady state). The lease-loss fence in dcs.OnLost is NOT gated
+	// by pause, so a paused primary that loses its lease still demotes -- pause suspends
+	// automatic promotion/self-health, not the split-brain fence.
+	if m.Paused && !a.pausedLatched {
+		a.log.Warn("maintenance mode active: automatic promotion/demotion/self-health suspended (the lease-loss fence still applies)")
+		a.pausedLatched = true
+	} else if !m.Paused && a.pausedLatched {
+		a.log.Info("maintenance mode cleared: automatic failover resumed")
+		a.pausedLatched = false
+	}
 	// Controlled switchover (Part H2): the requested handoff target, if any.
 	o.SwitchoverTarget = m.SwitchoverTarget
 	// Self-health (stateful/time-based, so computed here, not in the pure Decide):
@@ -1150,6 +1275,13 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if a.followUpstream == dec.Target {
 			return nil
 		}
+		// Never dial a target that is not one of this cluster's pods (#298 security
+		// review): belt-and-suspenders behind the LeaderIdentity sanitisation in observe(),
+		// so no forged DCS value can reach a conninfo even if a future caller sets Target
+		// from another source.
+		if !a.validPeerName(dec.Target) {
+			return fmt.Errorf("refusing to follow %q: not a valid cluster pod name (possible tampering)", dec.Target)
+		}
 		// Invariant 9: never follow an upstream from a different cluster.
 		if err := a.assertSameCluster(ctx, dec.Target); err != nil {
 			return err
@@ -1247,6 +1379,12 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		return a.rejoinOnto(ctx, dec.Target)
 
 	case reconcile.BootstrapClone:
+		// Never clone from a target that is not one of this cluster's pods (#298
+		// security review): the clone source becomes primary_conninfo and dials with the
+		// replication PGPASSWORD set.
+		if !a.validPeerName(dec.Target) {
+			return fmt.Errorf("refusing to clone from %q: not a valid cluster pod name (possible tampering)", dec.Target)
+		}
 		// pg_basebackup demands a byte-empty target, but Decide's "empty data" is HasData
 		// (PG_VERSION) -- so a stray entry in a database-less PGDATA parks the node in a
 		// permanent BootstrapClone/`exists but is not empty` loop. Observed live (#298
@@ -2609,6 +2747,12 @@ func desiredRoleLabels(self string, peers []reconcile.PeerState) map[string]stri
 const rewindFailureLimit = 3
 
 func (a *agent) rejoinOnto(ctx context.Context, target string) error {
+	// Never rewind/re-clone onto a target that is not one of this cluster's pods
+	// (#298 security review): rejoinOnto builds conninfos to it and dials with the
+	// replication PGPASSWORD set.
+	if !a.validPeerName(target) {
+		return fmt.Errorf("refusing to rejoin onto %q: not a valid cluster pod name (possible tampering)", target)
+	}
 	// Invalidate the follow latch on ENTRY, not after the rejoin succeeds. Either point is
 	// defensible -- the latch caches which upstream replication is actually pointed at, so
 	// keeping it through a failed rejoin is arguably the more truthful state -- but clearing

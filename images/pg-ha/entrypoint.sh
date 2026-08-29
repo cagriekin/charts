@@ -106,6 +106,17 @@ EOF
     # directories; nothing here writes it.
 
     if [ "${PGBACKREST_ENABLED:-}" = "true" ]; then
+        # Validate the stanza before it is interpolated into the single-quoted
+        # archive_command/restore_command GUCs (#298 security review): a value containing a
+        # single quote would close the GUC string and hand the remainder to the archiver's
+        # /bin/sh. pgBackRest stanza names are alphanumeric plus dash/underscore, so reject
+        # anything else at boot rather than write an injectable postgresql.conf.
+        case "${PGBACKREST_STANZA:-db}" in
+            *[!A-Za-z0-9_-]*)
+                echo "FATAL: PGBACKREST_STANZA=\"${PGBACKREST_STANZA}\" contains characters outside [A-Za-z0-9_-]; it is written into the archive_command/restore_command GUCs and must be a plain pgBackRest stanza name. Set pgbackrest.stanza (chart) / PGBACKREST_STANZA (direct image use) to a name matching that pattern." >&2
+                exit 1
+                ;;
+        esac
         cat >> "$PGDATA/postgresql.conf" << PGBR
 archive_mode = on
 archive_command = 'pgbackrest --stanza=${PGBACKREST_STANZA:-db} archive-push %p'
@@ -217,12 +228,25 @@ EOF
     repmgr_user_id=${REPMGR_USER//\"/\"\"}
     repmgr_db_id=${REPMGR_DB//\"/\"\"}
 
+    # The password-bearing statements go in on STDIN, not `psql -c` (#298 security review):
+    # a `-c "... PASSWORD '...'"` argument puts the cleartext password in the process's argv,
+    # readable from /proc/<pid>/cmdline by any same-uid process or a `ps` on the node for the
+    # life of the call. A heredoc keeps it off argv. psql does not stop on error by default
+    # (no ON_ERROR_STOP), so combining CREATE and the password-resetting ALTER in one session
+    # keeps the prior behaviour: a CREATE that fails because the role already exists still
+    # lets the ALTER reset the password. Statements with no secret stay as -c.
     psql -U postgres -d postgres -c "CREATE DATABASE \"${pg_db_id}\";" 2>/dev/null || true
-    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER \"${pg_user_id}\" WITH SUPERUSER PASSWORD '${pg_pw_sql}';" 2>/dev/null || true
-    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; ALTER USER \"${pg_user_id}\" WITH PASSWORD '${pg_pw_sql}';" 2>/dev/null || true
+    psql -U postgres -d postgres 2>/dev/null <<SQL || true
+SET password_encryption='scram-sha-256';
+CREATE USER "${pg_user_id}" WITH SUPERUSER PASSWORD '${pg_pw_sql}';
+ALTER USER "${pg_user_id}" WITH PASSWORD '${pg_pw_sql}';
+SQL
 
     psql -U postgres -d postgres -c "CREATE DATABASE \"${repmgr_db_id}\";" 2>/dev/null || true
-    psql -U postgres -d postgres -c "SET password_encryption='scram-sha-256'; CREATE USER \"${repmgr_user_id}\" WITH SUPERUSER PASSWORD '${repmgr_pw_sql}';" 2>/dev/null || true
+    psql -U postgres -d postgres 2>/dev/null <<SQL || true
+SET password_encryption='scram-sha-256';
+CREATE USER "${repmgr_user_id}" WITH SUPERUSER PASSWORD '${repmgr_pw_sql}';
+SQL
     psql -U postgres -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE \"${repmgr_db_id}\" TO \"${repmgr_user_id}\";" 2>/dev/null || true
     # The repmgr DATABASE and ROLE above are created under BOTH mechanisms, on purpose.
     # #288 asked for native bootstrap to create none of the three, but the role and the

@@ -4096,6 +4096,43 @@ helm template test-pg "${CHART_DIR}" \
   --set repmgr.agent.mechanism=native \
   --set-string 'postgresql.configuration.shared_preload_libraries=repmgr\,pgsodium' >/dev/null 2>&1 || spl_guard_rc=$?
 assert_eq "#293 guard: native + operator-preloaded repmgr fails" "1" "$([ "${spl_guard_rc}" -ne 0 ] && echo 1 || echo 0)"
+
+# --- #298 security review: postgresql.pgHba entries with a quote/newline are refused ---
+# They are inserted verbatim into a shell postStart hook and pg_hba.conf; a quote or newline
+# crash-loops the pod or mangles the file. The schema pattern catches it, and pg.validatePgHba
+# is the render-time backstop; either failing the render is the pass condition here.
+pghba_guard_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set-string "postgresql.pgHba[0]=host all all 10.0.0.0/8 scram-sha-256' -- x" >/dev/null 2>&1 || pghba_guard_rc=$?
+assert_eq "#298 guard: postgresql.pgHba with a single quote fails" "1" "$([ "${pghba_guard_rc}" -ne 0 ] && echo 1 || echo 0)"
+# A plain rule must still render.
+pghba_ok_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set-string "postgresql.pgHba[0]=host all all 10.0.0.0/8 scram-sha-256" >/dev/null 2>&1 || pghba_ok_rc=$?
+assert_eq "#298: a plain postgresql.pgHba rule renders" "0" "${pghba_ok_rc}"
+
+# --- #298 security review: security keys may not be set via the deprecated repmgr.* alias ---
+# The alias overwrites ha.* key-by-key even over --set, and Helm has already merged the ha.*
+# defaults by render time, so "both set" cannot be detected -- the deterministic rule is that
+# these security keys must be on ha.*, not the alias. Any such key on repmgr.* fails the render.
+alias_cidr_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set repmgr.agent.podCidr=10.0.0.0/8 >/dev/null 2>&1 || alias_cidr_rc=$?
+assert_eq "#298 guard: podCidr via the repmgr.* alias fails" "1" "$([ "${alias_cidr_rc}" -ne 0 ] && echo 1 || echo 0)"
+alias_adm_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set repmgr.agent.control.restore.admissionPolicy.enabled=false >/dev/null 2>&1 || alias_adm_rc=$?
+assert_eq "#298 guard: admissionPolicy.enabled via the repmgr.* alias fails" "1" "$([ "${alias_adm_rc}" -ne 0 ] && echo 1 || echo 0)"
+alias_cns_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set 'repmgr.agent.control.allowedClientCNs={a}' >/dev/null 2>&1 || alias_cns_rc=$?
+assert_eq "#298 guard: control.allowedClientCNs via the repmgr.* alias fails" "1" "$([ "${alias_cns_rc}" -ne 0 ] && echo 1 || echo 0)"
+# The SAME key on ha.* must render (the canonical path), and a NON-security repmgr.* alias key
+# (e.g. control.enabled) still works -- only the security keys are refused on the alias.
+alias_ok_rc=0
+helm template test-pg "${CHART_DIR}" \
+  --set ha.agent.podCidr=10.0.0.0/8 >/dev/null 2>&1 || alias_ok_rc=$?
+assert_eq "#298: podCidr under ha.* renders" "0" "${alias_ok_rc}"
 # The message must name the offending value and both fixes, not just the key (invariant 4).
 spl_guard=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.agent.mechanism=native \
@@ -4221,7 +4258,7 @@ assert_contains "#276 custom port: CONTROL_ADDR" "${ctl_port}" '":9301"'
 # CN allowlist passes through as a comma-separated list.
 ctl_cns=$(helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
   --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls \
-  --set 'repmgr.agent.control.allowedClientCNs={ops-admin,ci-bot}' \
+  --set 'ha.agent.control.allowedClientCNs={ops-admin,ci-bot}' \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#276 allowlist: CNs joined" "${ctl_cns}" "ops-admin,ci-bot"
 
@@ -4230,7 +4267,7 @@ assert_contains "#276 allowlist: CNs joined" "${ctl_cns}" "ops-admin,ci-bot"
 ctl_restore_args=("${ctl_base[@]}"
   --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls
   --set repmgr.agent.control.restore.enabled=true
-  --set 'repmgr.agent.control.restore.allowedClientCNs={dba-break-glass}'
+  --set 'ha.agent.control.restore.allowedClientCNs={dba-break-glass}'
   --set pgbackrest.enabled=true --set pgbackrest.s3.endpoint=https://s3 --set pgbackrest.s3.bucket=b
   --set pgbackrest.s3.keyType=auto)
 
@@ -4240,7 +4277,7 @@ for guard in \
   "--set repmgr.agent.control.enabled=false:control disabled" \
   "--set pgbackrest.restore.enabled=false:restore Job not rendered" \
   "--set pgbackrest.restore.mode=job:mode=job has no CronJob to clone" \
-  "--set repmgr.agent.control.restore.allowedClientCNs=null:empty allowlist denies everyone"
+  "--set ha.agent.control.restore.allowedClientCNs=null:empty allowlist denies everyone"
 do
   flag="${guard%%:*}"; why="${guard##*:}"
   rc=0
@@ -4388,12 +4425,12 @@ assert_not_contains "#279: the binding has no objectSelector" "${ctl_restore}" "
 # The grant cannot be rendered without the bound unless the trade is stated in values.
 ctl_vap_rc=0
 helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
-  --set repmgr.agent.control.restore.admissionPolicy.enabled=false >/dev/null 2>&1 || ctl_vap_rc=$?
+  --set ha.agent.control.restore.admissionPolicy.enabled=false >/dev/null 2>&1 || ctl_vap_rc=$?
 assert_eq "#279 guard: disabling the policy without acknowledging it fails to render" "1" \
   "$([ "${ctl_vap_rc}" -ne 0 ] && echo 1 || echo 0)"
 ctl_vap_ack=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
-  --set repmgr.agent.control.restore.admissionPolicy.enabled=false \
-  --set repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded=true 2>&1)
+  --set ha.agent.control.restore.admissionPolicy.enabled=false \
+  --set ha.agent.control.restore.admissionPolicy.acknowledgeUnbounded=true 2>&1)
 assert_not_contains "#279 opt-out: acknowledged, so no policy is rendered" "${ctl_vap_ack}" "kind: ValidatingAdmissionPolicy"
 assert_contains "#279 opt-out: the grant itself is unchanged" "${ctl_vap_ack}" 'resources: \["jobs"\]'
 
@@ -4548,7 +4585,7 @@ assert_eq "#279: a value that cannot be embedded in a CEL literal fails the rend
 ctl_vap_shared=$(helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
   --set repmgr.agent.control.enabled=true --set repmgr.agent.control.tls.existingSecret=ctl-tls \
   --set repmgr.agent.control.restore.enabled=true \
-  --set 'repmgr.agent.control.restore.allowedClientCNs={dba}' \
+  --set 'ha.agent.control.restore.allowedClientCNs={dba}' \
   --set pgbackrest.enabled=true --set pgbackrest.s3.endpoint=https://s3 --set pgbackrest.s3.bucket=b \
   --set pgbackrest.s3.keyType=shared --set pgbackrest.existingSecret.name=s3creds \
   --set pgbackrest.repoEncryption.enabled=true --set pgbackrest.repoEncryption.existingSecret.name=cipher \

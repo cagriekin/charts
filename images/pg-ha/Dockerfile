@@ -46,10 +46,14 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     gosu \
     && rm -rf /var/lib/apt/lists/*
 
-# Add PostgreSQL APT repository
-RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg
+# Add PostgreSQL APT repository. --proto '=https' --proto-redir '=https' pins the key
+# fetch to HTTPS end to end (#298 security review): this keyring is the root of trust for
+# every package installed below, so an HTTPS->HTTP redirect must never be able to fetch it
+# over cleartext. The apt source is HTTPS too -- integrity is enforced by signed-by either
+# way, but HTTP would let an on-path observer see package selection and serve stale indexes.
+RUN curl -fsSL --proto '=https' --proto-redir '=https' https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg
 
-RUN echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/postgresql.list
+RUN echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/postgresql.list
 
 # Install PostgreSQL for PG_MAJOR. postgresql-<major>-pgaudit ships the
 # pgaudit extension used by the chart's opt-in compliance audit logging (#219); it is

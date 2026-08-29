@@ -88,6 +88,29 @@ func TestLoadRejectsBadDCSBackend(t *testing.T) {
 	}
 }
 
+// #298 security review: role names are interpolated raw into pg_hba.conf, so a value with
+// whitespace/newline would split or inject a rule. Reject at boot, symmetric with POD_CIDR.
+func TestLoadRejectsWhitespaceInRoleNames(t *testing.T) {
+	for _, key := range []string{"REPMGR_USER", "POSTGRES_USER", "MONITORING_USER"} {
+		m := fullEnv()
+		m["POSTGRES_USER"] = "app"
+		m[key] = "evil all 0.0.0.0/0 trust\nhost"
+		_, err := Load(getter(m))
+		if err == nil || !strings.Contains(err.Error(), key) {
+			t.Errorf("%s with a newline must fail validation, got %v", key, err)
+		}
+	}
+}
+
+func TestLoadAllowsEmptyMonitoringUser(t *testing.T) {
+	m := fullEnv()
+	m["POSTGRES_USER"] = "app"
+	delete(m, "MONITORING_USER") // "" means no monitoring rule, must not error
+	if _, err := Load(getter(m)); err != nil {
+		t.Errorf("empty MONITORING_USER must be allowed, got %v", err)
+	}
+}
+
 // #287: MECHANISM is an enum with a default. Absent must mean repmgr so an existing release
 // and an older env-less image keep their behaviour; an unrecognised value must fail at boot
 // rather than fall through to whichever branch the factory defaults to.

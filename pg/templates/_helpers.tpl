@@ -951,6 +951,26 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end -}}
 {{- end -}}
 
+{{- /* #298 security review: postgresql.pgHba entries are inserted verbatim into the
+       standalone postStart hook -- into single-quoted shell (printf '%s' '<rule>' and
+       grep -qF '<rule>') and then into pg_hba.conf. A single quote closes that quoting and
+       a newline breaks the YAML block scalar, so a malformed rule renders clean and then
+       crash-loops the container (the kubelet kills the pod on the failing postStart) or
+       silently mangles the file. values.schema.json also forbids the quote, but the schema
+       is advisory (additionalProperties is open); this fail is the authoritative guard, in
+       the fail-at-render-not-apply convention. A pg_hba line never legitimately needs
+       either character. */ -}}
+{{- define "pg.validatePgHba" -}}
+{{- range $i, $rule := .Values.postgresql.pgHba -}}
+{{- if not (kindIs "string" $rule) -}}
+{{- fail (printf "postgresql.pgHba[%d] must be a string (one pg_hba.conf line), got %s" $i (kindOf $rule)) -}}
+{{- end -}}
+{{- if or (contains "'" $rule) (contains "\n" $rule) -}}
+{{- fail (printf "postgresql.pgHba[%d]=%q contains a single quote or newline. These entries are inserted verbatim into a shell postStart hook and into pg_hba.conf; a quote or newline corrupts the hook (crash-looping the pod) or mangles the file. Fix: write each rule as one plain line, e.g. \"host all all 10.0.0.0/8 scram-sha-256\"." $i $rule) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- /* #262: validate the postgresql.extraVolumes / extraVolumeMounts / extraEnv
        passthrough. These are spliced verbatim into the pod spec, so without guards a
        plausible mistake becomes a silent runtime failure or an apply-time apiserver
@@ -1844,7 +1864,37 @@ false
        .Values.ha once, which made both operands identical and silently disabled every
        alias. The probe caught it; this comment is here so it cannot happen twice. */ -}}
 {{- $alias := deepCopy (.Values.repmgr | default dict) -}}
+{{- /* #298 security review: the alias below overwrites ha.* key-by-key, even over --set.
+       For a handful of SECURITY keys that silent precedence is a downgrade -- a stale 1.x
+       repmgr.* value quietly winning over the ha.* an operator set (e.g. a leftover
+       repmgr.agent.control.restore.admissionPolicy.enabled:false defeating --set ha...enabled=
+       true, leaving the namespace-wide `create jobs` grant unbounded). Helm has already merged
+       the chart defaults into ha.* by the time any template runs, so "operator set ha.* too"
+       cannot be told apart from the default here -- which makes a "set under both, differing"
+       check unsound (the dangerous case sets ha.enabled=true, equal to the default). So the
+       rule is simpler and deterministic: these security keys may NOT be carried on the
+       deprecated repmgr.* alias at all; set them under ha.*. Checked before the merge, the only
+       place the raw alias tree is visible. The sentinel marks "absent". */ -}}
+{{- $sentinel := "__pgchart_unset__" -}}
+{{- include "pg.aliasSecurityKeyRefused" (dict "sentinel" $sentinel "a" (dig "agent" "podCidr" $sentinel $alias) "key" "podCidr") -}}
+{{- include "pg.aliasSecurityKeyRefused" (dict "sentinel" $sentinel "a" (dig "agent" "control" "allowedClientCNs" $sentinel $alias) "key" "control.allowedClientCNs") -}}
+{{- include "pg.aliasSecurityKeyRefused" (dict "sentinel" $sentinel "a" (dig "agent" "control" "restore" "allowedClientCNs" $sentinel $alias) "key" "control.restore.allowedClientCNs") -}}
+{{- include "pg.aliasSecurityKeyRefused" (dict "sentinel" $sentinel "a" (dig "agent" "control" "restore" "admissionPolicy" "enabled" $sentinel $alias) "key" "control.restore.admissionPolicy.enabled") -}}
+{{- include "pg.aliasSecurityKeyRefused" (dict "sentinel" $sentinel "a" (dig "agent" "control" "restore" "admissionPolicy" "acknowledgeUnbounded" $sentinel $alias) "key" "control.restore.admissionPolicy.acknowledgeUnbounded") -}}
 {{- $_ := set .Values "ha" (mergeOverwrite $ha $alias) -}}
+{{- end -}}
+
+{{- /* Refuse one security key on the deprecated repmgr.* alias (#298 security review). .a is
+       the value dug from the alias tree, .sentinel the "absent" marker, .key the dotted suffix
+       under agent.* for the message. Presence is checked type-safely: `ne .a .sentinel` is only
+       evaluated when .a is a string (Go templates do not short-circuit and cannot compare a
+       list/map against a string), and a non-string kind means dig returned a real value. */ -}}
+{{- define "pg.aliasSecurityKeyRefused" -}}
+{{- $present := false -}}
+{{- if ne (kindOf .a) "string" -}}{{- $present = true -}}{{- else if ne .a .sentinel -}}{{- $present = true -}}{{- end -}}
+{{- if $present -}}
+{{- fail (printf "repmgr.agent.%s is set via the deprecated repmgr.* alias. The alias overwrites ha.* key-by-key (even over --set), so a stale value here would silently override -- and downgrade -- this security control. Set it under ha.agent.%s instead and remove it from repmgr.*." .key .key) -}}
+{{- end -}}
 {{- end -}}
 
 {{- /*
