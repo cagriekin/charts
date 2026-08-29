@@ -2477,7 +2477,7 @@ make cluster-create
 make test-minimal           # standalone postgres, no HA
 make test-full              # HA + pgpool + prometheus exporter
 make test-upgrade           # upgrade path with data persistence
-make test-agent             # lease-based agent: install + failover (AGENT_COLDBOOT=1 adds cold boot)
+make test-agent             # lease-based agent: install + failover + cold boot (full-cluster restart)
 make test-agent-etcd        # agent with the bundled etcd DCS backend
 make test-scaledown         # #139 ghost-node cleanup after a replicaCount scale-down
 make cluster-delete

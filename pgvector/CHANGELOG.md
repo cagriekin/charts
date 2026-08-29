@@ -831,6 +831,17 @@
 
 ### Testing
 
+- **The cold-boot stage of the agent failover suite now always runs (#298 review).** A
+  full-cluster restart -- both pods deleted at once, the cluster re-electing a single primary
+  with data intact -- was gated behind `AGENT_COLDBOOT=1`, deferred when promote-from-recovery
+  still had an unvalidated interaction with the repmgr catalog (a former primary brought up in
+  recovery mode was left `type=primary` in `repmgr.nodes`). #294 deleted that mechanism and the
+  image no longer creates the catalog, so the reason had evaporated while the gate stayed. It
+  also made local and CI disagree -- the matrix set the flag, a developer's run did not -- and
+  the three skips it produced were labelled "prior stage failed" even though the prior stages
+  had passed, which is exactly how a stale gate goes unnoticed. Verified passing before the
+  gate came out: 22/22, primary and lease holder re-settled in 10s.
+
 - **Both render gates only ever checked each chart's DEFAULT render (#298 review).** kubeconform
   validated 9 resources for `pg`; kube-linter has no values flag at all, so directory mode could
   not see anything else. Every optional component was therefore unchecked by both: pgpool, the

@@ -296,7 +296,6 @@ jobs:
           # not hermetic (pulls a released chart + image) and long, so it gets the same budget.
           - migrate-repmgrd
         include:
-          - { suite: agent, coldboot: "1" }
           - { suite: migrate-native, timeout_minutes: 50, no_retry: "1" }
           - { suite: migrate-repmgrd, timeout_minutes: 50, no_retry: "1" }
     steps:
@@ -370,7 +369,6 @@ jobs:
 
       - name: Run ${{ matrix.suite }} suite (pg${{ matrix.pg_major }})
         env:
-          AGENT_COLDBOOT: ${{ matrix.coldboot }}
           NO_RETRY: ${{ matrix.no_retry }}
         run: |
           set +e

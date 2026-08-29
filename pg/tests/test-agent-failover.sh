@@ -154,11 +154,15 @@ fi
 # cluster must re-elect a single primary with data intact. This exercises the
 # recovery-mode path (a former primary comes up read-only via standby.signal so the
 # lease holder can rank it) and promote-from-recovery, plus the marker highwater.
-# Opt-in (AGENT_COLDBOOT=1): promote-from-recovery has a not-yet-live-validated
-# repmgr-catalog interaction (a former primary brought up in recovery mode is still
-# type=primary in repmgr.nodes), so it is off by default to keep CI green until
-# verified. The graceful-failover path above is the validated core. ---
-if [[ "${AGENT_COLDBOOT:-0}" == "1" && "${promoted}" == "true" && "${rejoined}" == "true" ]]; then
+# Runs unconditionally (#298 review). It used to be opt-in behind AGENT_COLDBOOT=1,
+# because promote-from-recovery had a not-yet-live-validated repmgr-catalog interaction
+# (a former primary brought up in recovery mode was still type=primary in repmgr.nodes).
+# #294 deleted the repmgr mechanism and the image no longer creates that catalog, so the
+# hazard the gate deferred cannot occur any more -- and the gate had drifted into making
+# a LOCAL run report three skips for a stage CI was running all along (the matrix set
+# coldboot: "1" for this suite), with a message that blamed a prior-stage failure that
+# had not happened. A full-cluster restart is core HA behaviour; local and CI now agree. ---
+if [[ "${promoted}" == "true" && "${rejoined}" == "true" ]]; then
   echo "  Cold boot: deleting BOTH pods (full-cluster restart)..."
   kubectl delete pod "${PRIMARY}" "${STANDBY}" -n "${NAMESPACE}" --grace-period=10 --wait=false 2>/dev/null || true
   wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 600
