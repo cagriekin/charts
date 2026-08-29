@@ -85,15 +85,9 @@ bootstrap_initdb() {
     # outlives the bootstrap and decides how EVERY password stored on this cluster afterwards is
     # hashed: an operator's `CREATE USER`, the databases-roles hook Job's roles, a later
     # `ALTER USER ... PASSWORD`. Leaving it at md5 meant a brand-new 2.0.0 cluster defaulted to a
-    # hash deprecated since PostgreSQL 10, and the chart's md5->scram migration then existed to
-    # undo a default this same line had just chosen. The managed users already forced
-    # scram-sha-256 per statement (below) precisely because this was wrong; that stays as an
-    # explicit belt-and-braces, but it is no longer compensating for the default.
-    #
-    # Safe by construction: this function only ever runs against an EMPTY data directory, so
-    # there is no existing md5-hashed role for the change to strand. Clusters created by 1.x keep
-    # their md5 roles and their migration path -- the agent's md5->scram re-hash is unaffected
-    # and still runs there.
+    # hash deprecated since PostgreSQL 10. Safe by construction: this function only ever runs
+    # against an EMPTY data directory, so no existing md5-hashed role is stranded, and 1.x
+    # clusters keep their roles and the agent's md5->scram re-hash.
     initdb -D "$PGDATA" --auth-local=trust --auth-host=scram-sha-256
 
     cat >> "$PGDATA/postgresql.conf" << EOF
@@ -193,17 +187,11 @@ EOF
     POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     POSTGRES_DB=${POSTGRES_DB:-postgres}
 
-    # The managed users force scram-sha-256 per statement (a session-scoped SET applies to the
-    # CREATE/ALTER in that same `psql -c` session). Since #298 changed initdb's --auth-host to
-    # scram-sha-256 this agrees with the cluster default rather than overriding it, and it is
-    # kept deliberately: the rule it protects is load-bearing and cheap to state twice.
-    #
-    # What it protects: pg_hba (written above) requires scram-sha-256 from the pod network, and
-    # PostgreSQL never falls through on auth failure -- so a role holding an MD5 secret is
-    # rejected with "does not have a valid SCRAM secret" the moment a standby clone connects,
-    # before any migration could run. That was a startup race that wedged the clone. Stating the
-    # encryption at the point of creation means the managed roles cannot acquire the wrong hash
-    # even if the cluster default were ever changed back.
+    # Force scram-sha-256 per statement, belt-and-braces over the cluster default. pg_hba
+    # requires scram from the pod network and PostgreSQL never falls through on auth failure,
+    # so a role holding an MD5 secret is rejected with "does not have a valid SCRAM secret"
+    # the moment a standby clone connects -- a startup race that wedged the clone. Stating it
+    # at creation keeps that true even if the default were changed back.
     # SQL-quote the passwords (#298 review): a literal single quote in POSTGRES_PASSWORD /
     # REPMGR_PASSWORD ended the SQL string, the `2>/dev/null || true` swallowed the syntax
     # error, and -- because the verification below only asked about the repmgr objects -- a
@@ -289,30 +277,20 @@ EOF
         bootstrap_ok=no
     fi
     if [ "$bootstrap_ok" != "yes" ]; then
-        # STOP the transient postmaster before exiting (#298 review). `pg_ctl -w start`
-        # above daemonizes a postmaster that inherits this script's stdout, and in agent
-        # mode this script IS a captured child (`entrypoint.sh initdb`, run through
-        # Cmd.Output). Exiting with it alive leaves the agent blocked on a stdout pipe
-        # that cannot reach EOF while the orphan holds it -- act() keeps opMu, the
-        # reconcile loop stops beating and dcs.OnLost cannot fence until the whole
-        # initdbBudget expires -- and discardFreshDataDir would then be trying to wipe
-        # PGDATA under a live server. Immediate, because this cluster is about to be
-        # discarded anyway; best-effort, because a failure here must not mask the FATAL
-        # diagnosis below.
+        # STOP the transient postmaster before exiting (#298). `pg_ctl -w start` daemonizes
+        # one that inherits this script's stdout, and in agent mode this script is a captured
+        # child (Cmd.Output) -- so an orphan holds that pipe open past EOF and blocks act()
+        # with opMu held, for the whole initdbBudget. Immediate, since this cluster is about
+        # to be discarded; best-effort, so a failure here cannot mask the FATAL below.
         pg_ctl -D "$PGDATA" -m immediate -w stop || true
         echo "FATAL: not marking the bootstrap complete; this data directory will be discarded and re-bootstrapped on the next start. If it repeats, check POSTGRES_PASSWORD / REPMGR_PASSWORD and the user/database NAMES for characters that break the SQL above, and the postgres server log for the swallowed error." >&2
         exit 1
     fi
 
-    # Never leave the transient postmaster running, even on a failed shutdown (#298 review).
-    # It was daemonized by the `pg_ctl -w start` above and inherits this script's stdout, which
-    # in agent mode is a pipe Cmd.Output reads to EOF -- so an orphan holds act() (and opMu, and
-    # the reconcile heartbeat) until initdbBudget expires, and discardFreshDataDir then has to
-    # reap it before it can wipe. Bare under `set -e` this exited with the postmaster still up:
-    # `pg_ctl -w stop` fails on PGCTLTIMEOUT (60s by default) on a contended node long before
-    # the cluster is actually down. The FATAL arm above escalates for exactly this reason; the
-    # success path needs it too. Exiting non-zero without the sentinel is still the right
-    # outcome -- the next start discards the directory and re-creates it.
+    # Escalate rather than exit with it still up -- same orphan hazard as the FATAL arm above
+    # (#298). Bare under `set -e` this could exit with the postmaster alive, because
+    # `pg_ctl -w stop` fails on PGCTLTIMEOUT (60s) on a contended node long before the cluster
+    # is down. Exiting without the sentinel is right: the next start discards and re-creates.
     if ! pg_ctl -D "$PGDATA" -w stop; then
         pg_ctl -D "$PGDATA" -m immediate -w stop || true
         echo "FATAL: could not stop the transient bootstrap postmaster; not marking the bootstrap complete, so this data directory will be discarded and re-created on the next start." >&2

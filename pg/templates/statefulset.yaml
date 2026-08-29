@@ -1023,47 +1023,26 @@ spec:
                         {{- end }}
                         {{- if .Values.postgresql.pgHba }}
                         HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
-                        {{- /* Anchored on the FIRST host rule, whatever it says (#298 review).
-                               This was `sed -i '/host all all all scram-sha-256/i ...'`, and no
-                               pg_hba this chart produces has ever contained that line -- the
-                               entrypoint writes column-aligned rules ending in
-                               `host    all    all    0.0.0.0/0    scram-sha-256`. So the insert
-                               matched nothing and postgresql.pgHba was a SILENT no-op in
-                               standalone mode, on a documented value. It went unnoticed because
-                               the only test asserted the entry appears in the rendered postStart
-                               script, which is true whether or not the insert can ever fire.
-                               (Agent mode was never affected: there the rules go to the agent,
-                               which places them above the catch-alls itself -- #144.)
-                               Before, not after: pg_hba is FIRST-match-wins, so an appended rule
-                               sits behind the network catch-alls and is never consulted. The
-                               `local ... trust` lines stay above it, which local psql needs --
-                               and so do the LOOPBACK host rules (#298 review). The anchor is the
-                               first non-loopback host rule, not simply the first host rule:
-                               initdb writes `host all all 127.0.0.1/32 trust` and its ::1 twin
-                               ahead of every network rule, so anchoring on the first `host`
-                               inserted the operator's list ABOVE them. A catch-all entry that
-                               also matches loopback (`host all all all reject`, a
-                               `clientcert=verify-ca` catch-all, a broad scram rule) then beat
-                               `127.0.0.1/32 trust` and broke every in-pod TCP client --
-                               `kubectl port-forward` + psql, which NOTES.txt tells users to
-                               run, first among them. Both other authorities on this ordering
-                               agree: 1.x's awk carried the same `$4 != 127.0.0.1/32 && $4 !=
-                               ::1/128` predicate, and the agent's own pgconf.AssemblePgHba
-                               emits the two loopback rules before the user block. Without the
-                               exclusion the SAME values file ordered rules differently in
-                               standalone and agent mode, silently.
-                               Temp file + mv, and a loud message rather than a silent skip if
-                               there is no host rule to anchor on. */}}
-                        {{- /* ONE awk pass for the whole list, not one per entry (#298 review).
-                               Per-entry passes each anchored on the FIRST host rule -- and after
-                               the first insert, that first host rule IS the entry just inserted,
-                               so every later entry landed ABOVE its predecessor and the
-                               operator's list came out REVERSED. pg_hba is first-match-wins, so
-                               reversal is not cosmetic: pgHba: ["host all admin ... trust",
-                               "host all all ... reject"] rendered the reject above the trust and
-                               locked the admin role out. Collect the missing entries in order,
-                               then insert them as a block. (Agent mode never had this: the agent
-                               places the whole POSTGRESQL_PGHBA list itself, in order.) */}}
+                        {{- /* Insert the operator's rules as ONE ordered block, anchored on the
+                               first NON-LOOPBACK host rule (#298).
+
+                               pg_hba is first-match-wins, which fixes all three properties here:
+                                - BEFORE the network catch-alls, or the rule is never consulted;
+                                - AFTER initdb's `local ... trust` and its `127.0.0.1/32` /
+                                  `::1/128` host rules, or a catch-all that also matches loopback
+                                  (`host all all all reject`) beats them and breaks in-pod TCP
+                                  clients -- `kubectl port-forward` + psql among them;
+                                - in the operator's own order, so a `trust` written before a
+                                  `reject` still wins. One pass, not one per entry: per-entry
+                                  passes re-anchor on the previous insert and reverse the list.
+
+                               The agent path is unaffected -- pgconf.AssemblePgHba places the
+                               whole list itself, in order, with loopback first (#144).
+
+                               cp onto the existing file, not mv: mv replaces the inode and the
+                               file would inherit the redirect's 0644 instead of initdb's 0600.
+                               A loud message rather than a silent skip if there is no host rule
+                               to anchor on. */}}
                         PGCHART_INS="${HBA_FILE}.pgchart.ins"
                         : > "$PGCHART_INS"
                         {{- range .Values.postgresql.pgHba }}
@@ -1077,14 +1056,6 @@ spec:
                                 }
                                 { print }
                                 END { if (!done) exit 3 }' "$HBA_FILE" > "${HBA_FILE}.pgchart.tmp"; then
-                            {{- /* cp + rm, NOT mv (#298 review). mv replaces the INODE, so
-                                   pg_hba.conf would inherit the awk redirect's mode -- 0644
-                                   under the default umask -- instead of initdb's 0600, making
-                                   the file that lists every auth rule world-readable inside the
-                                   container and on the volume from the first pod start with
-                                   postgresql.pgHba set. cp onto the existing file preserves the
-                                   destination's mode, which is why the deleted repmgrd branch
-                                   used it. */}}
                             cp "${HBA_FILE}.pgchart.tmp" "$HBA_FILE"
                             rm -f "${HBA_FILE}.pgchart.tmp"
                           else

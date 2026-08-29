@@ -919,29 +919,21 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end }}
 {{- end }}
 
-{{- /* The three chart-managed role names must be DISTINCT, and none of them may be
-       initdb's bootstrap superuser except the superuser itself (#298 review).
+{{- /* The three chart-managed role names must be DISTINCT (#298). Each is created by a
+       different component that assumes it owns the name, and every collision is silent at
+       render and destructive at runtime:
 
-       Each role is created by a different component that assumes it owns the name, and every
-       collision is silent at render and destructive at runtime:
+        - ha.username colliding: the entrypoint's `CREATE USER` fails as "role already
+          exists" -- swallowed like every statement in that block -- so the replication role
+          keeps the other password while the bootstrap reports success and seals in its
+          sentinel. The agent authenticates as that role, so the pod is Running/NotReady for
+          good, recoverable only by deleting the PVC.
+        - monitoringUser.username colliding: monitoring-user-job.yaml runs `ALTER ROLE ...
+          WITH LOGIN PASSWORD` unconditionally, overwriting a working superuser or
+          replication password minutes after install.
 
-        - ha.username == postgresql.username (or "postgres"): the entrypoint's second
-          `CREATE USER` fails as "role already exists" -- swallowed, like every statement in
-          that block -- so the replication role keeps the OTHER password while the bootstrap
-          still reports success and seals in the completion sentinel. The agent authenticates
-          as this role for every probe and for pg_basebackup, so the pod is Running/NotReady
-          for good, recoverable only by deleting the PVC. The image refuses this too; the
-          chart must refuse it FIRST, at render, per the fail-at-render-time rule.
-
-        - monitoringUser.username colliding with either: monitoring-user-job.yaml runs
-          `ALTER ROLE %I WITH LOGIN PASSWORD` UNCONDITIONALLY, so the post-install hook
-          overwrites the superuser's Secret-held password, or the replication role's --
-          breaking auth cluster-wide, or streaming replication on every standby at once,
-          minutes after a successful install.
-
-       Reserved-name coverage is deliberately asymmetric: postgresql.username MAY be
-       "postgres" (that is the default and initdb creates it), while the other two may not,
-       because for them "already exists" is the failure. */ -}}
+       Asymmetric on purpose: postgresql.username MAY be "postgres" (initdb creates it),
+       while for the other two "already exists" IS the failure. */ -}}
 {{- define "pg.validateRoleNames" -}}
 {{- $pgUser := .Values.postgresql.username | default "postgres" -}}
 {{- $haUser := .Values.ha.username | default "repmgr" -}}
@@ -988,15 +980,9 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
              the wrong data directory or breaking auth cluster-wide. */ -}}
 {{- define "pg.validateExtraPassthrough" -}}
 {{- /* EVERY volume the postgresql pod can carry, not just the ones a default render emits
-       (#298 review). `agent-control-tls` and `pgbackrest-bootstrap-script` were missing, so a
-       `postgresql.extraVolumes` entry using either name rendered CLEAN and produced two pod
-       volumes with the same name -- verified: the apiserver then rejects the StatefulSet with
-       `spec.template.spec.volumes[1].name: Duplicate value: "agent-control-tls"`, which is the
-       apply-time failure (g3) exists to convert into a render-time one. The list is reserved
-       UNCONDITIONALLY, like $chartEnv below, so a passthrough that works today cannot start
-       colliding after a later upgrade enables control.enabled or pgbackrest.bootstrap.enabled.
-       pg.validatePgbackrestPassthrough already carried the complete list for the same pod;
-       these two are what kept the two guards from agreeing. */ -}}
+       (#298) -- and reserved UNCONDITIONALLY, like $chartEnv below, so a passthrough that
+       works today cannot start colliding once a later upgrade enables the feature that
+       contributes the volume. Keep in step with pg.validatePgbackrestPassthrough. */ -}}
 {{- $chartVolumes := list
       "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib"
       "etcd-tls" "agent-control-tls" "pg-run" "pgbackrest-config"

@@ -137,13 +137,9 @@ jobs:
     steps:
       - name: Aggregate result
         run: |
-          # The no-op arm requires `changes` to have SUCCEEDED (#298 review). `if: always()`
-          # runs this gate even when `changes` failed or was cancelled -- and a job that did
-          # not finish has EMPTY outputs, so `!= "true"` held and the required check went
-          # GREEN having run nothing at all. A required check that reports success without
-          # examining anything is strictly worse than one that never reports: the latter
-          # blocks the merge, this one waves it through. Same vacuous-pass shape the gate
-          # scripts in this change closed.
+          # `changes` must have SUCCEEDED before its output can mean "untouched" -- an
+          # unfinished job has empty outputs and would pass this gate having run nothing.
+          # See pg-test.yaml for the full reasoning (#298).
           if [ "${{ needs.changes.result }}" != "success" ]; then
             echo "redis gate FAILED: the changes job did not succeed (result=${{ needs.changes.result }}), so relevance is unknown"
             exit 1

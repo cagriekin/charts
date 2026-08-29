@@ -22,8 +22,7 @@ fail=0
 # source directory (`[ -d "${src}" ] || continue`) and a consumer with no matching archive
 # (`[ ${#present[@]} -gt 0 ] || continue`). Rename or move common/ or etcd/, or drop a
 # consumer's charts/ directory, and the pair simply vanishes from the check -- with every
-# pair gone, `fail` stays 0 and the verdict prints OK having compared nothing. That is the
-# exact shape of the vacuous passes this PR set out to close.
+# pair gone, `fail` stays 0 and the verdict prints OK having compared nothing.
 checked=0
 
 # Source subcharts vendored via file:// (name == source directory).

@@ -1090,19 +1090,17 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		return routingErr
 
 	case reconcile.StayPrimary:
-		// The steady-state primary tick. There is no registration step any more: repmgr's
-		// `standby register` / `primary register` went with mechanism.Repmgr (#294), and a
-		// native standby resolves its upstream from the lease holder's identity plus the
-		// headless FQDN, so nothing has to be published to a catalog first.
+		// The steady-state primary tick. A standby resolves its upstream from the lease
+		// holder's identity plus the headless FQDN, so there is no catalog to publish to
+		// and no registration step.
 		//
 		// The node is read-write here, so bound the marker + routing under one
 		// fence-budget context (see Promote): a hung apiserver write must not hold opMu
 		// past the soft-fence window and starve a lost-leadership fence.
 		wctx, cancel := context.WithTimeout(ctx, a.fenceBudget())
 		defer cancel()
-		// #139's repmgr.nodes ghost cleanup went with mechanism.Repmgr (#294): there is no
-		// registry to leave ghosts in. The slot residue a scale-down leaves is real though,
-		// and that is what this handles (#289): publish the slot gauges, create slots for
+		// A scale-down leaves no registry ghosts, but it does leave slot residue, and that
+		// is what this handles (#289): publish the slot gauges, create slots for
 		// expected standbys, and reclaim orphans a scale-down or a repmgr->native migration
 		// left pinning WAL. Bounded by the same fence-budget context -- a hung psql must not
 		// hold opMu past the soft-fence window -- and best-effort, resuming next tick.
@@ -1248,12 +1246,10 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 
 	case reconcile.DemoteFence:
 		a.metr.IncDemote()
-		// Bounded, like the OnLost fence it mirrors (#298 review). This is the SOFT
-		// fence -- a read-write node that no longer holds the Lease -- so it is the
-		// demote that most needs to finish, and ChildPostmaster.Stop escalates
-		// SIGQUIT -> SIGKILL only when its context expires. On tick()'s deadline-less
-		// context a frozen postmaster meant no escalation at all: act() blocked with
-		// opMu held, the heartbeat stopped, and the second writer stayed up.
+		// Every demote is bounded (#298 review): ChildPostmaster.Stop escalates to SIGKILL
+		// only when its context expires, and tick()'s carries no deadline -- so a frozen
+		// postmaster would block act() with opMu held, stopping the heartbeat and leaving
+		// the second writer up. RenewDeadline, matching the OnLost fence.
 		dctx, dcancel := context.WithTimeout(ctx, a.cfg.RenewDeadline)
 		defer dcancel()
 		return a.sup.Demote(dctx, true)
@@ -1284,8 +1280,6 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// Marker around the clone so an interrupted one is discarded on the next boot rather
 		// than stranding the pod with a torn PGDATA (#288 review).
 		a.beginClone()
-		// beatDuring: a base backup runs for as long as the database takes to copy, and the
-		// reconcile loop cannot beat while it holds opMu (#298 review).
 		if err := a.beatDuring(func() error { return a.mech.Clone(ctx, a.peerMechConn(dec.Target)) }); err != nil {
 			// Discard here, not only at the next boot (#288 review). If pg_basebackup's child is
 			// killed while the agent survives, PGDATA is left with PG_VERSION present, so Decide
@@ -1347,15 +1341,9 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		switch {
 		case obs.Local.Running && !obs.Local.InRecovery:
 			a.metr.IncDemote()
-			// BOUNDED, and the bound is what makes the reordering above safe (#298
-			// review). ChildPostmaster.Stop escalates SIGINT -> SIGKILL only on
-			// ctx.Done(), and tick()'s context carries no deadline -- so a fast
-			// shutdown that never completes (a wedged checkpoint, a backend stuck in
-			// the kernel) would block here forever with opMu held: no further
-			// metr.Beat(), no OnLost fence, and -- now that the release follows the
-			// demote -- a Lease that is never released, so no peer can take over
-			// either. RenewDeadline, matching the OnLost fence and the sibling
-			// LocalStuck branch below.
+			// Bounded (see DemoteFence). Here the bound is also what makes demoting
+			// before releasing safe: an unbounded hang would hold the Lease forever,
+			// so no peer could take over either.
 			dctx, dcancel := context.WithTimeout(ctx, a.cfg.RenewDeadline)
 			err := a.sup.Demote(dctx, false)
 			dcancel()
@@ -1410,10 +1398,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// possibly-live writer up.
 		if obs.Local.Running && !obs.Local.InRecovery {
 			a.metr.IncDemote()
-			// Bounded for the reason the ReleaseLease branch above gives: the SIGKILL
-			// escalation in ChildPostmaster.Stop fires only on ctx.Done(), and with the
-			// release now sequenced AFTER the demote an unbounded hang here holds opMu
-			// and the Lease indefinitely.
+			// Bounded (see DemoteFence), for the reason ReleaseLease gives.
 			dctx, dcancel := context.WithTimeout(ctx, a.cfg.RenewDeadline)
 			err := a.sup.Demote(dctx, false)
 			dcancel()
@@ -1558,9 +1543,6 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 	a.beginInitdb()
 	ictx, icancel := context.WithTimeout(ctx, initdbBudget)
 	defer icancel()
-	// beatDuring: initdbBudget is five minutes, twenty times the /healthz staleness
-	// threshold, and the marker this branch writes only helps AFTER a liveness kill (#298
-	// review).
 	var out string
 	err := a.beatDuring(func() error {
 		var rerr error
@@ -2440,30 +2422,20 @@ func (a *agent) fenceBudget() time.Duration {
 	return b
 }
 
-// beatDuring keeps the reconcile-loop heartbeat alive for the duration of one long
-// mechanism operation (#298 review).
+// beatDuring keeps the reconcile-loop heartbeat alive across one long mechanism
+// operation (#298).
 //
-// The heartbeat is otherwise struck exactly once per tick, at the top of tick(), while every
-// mechanism operation runs inside act() with opMu held -- so for as long as one of them runs,
-// nothing beats. That is fine for the bounded ones (every apiserver call is under
-// fenceBudget, every demote under RenewDeadline), and fatal for the unbounded ones:
-// pg_basebackup legitimately runs for as long as the database takes to copy. /healthz goes
-// stale at reconcileInterval*3 (15s on chart defaults) and the liveness probe gives up after
-// failureThreshold x periodSeconds (10 x 10s), so the kubelet SIGKILLs the container -- and
-// the postmaster it supervises -- roughly 115 seconds into any clone.
+// The heartbeat is otherwise struck once per tick, at the top of tick(), while mechanism
+// operations run inside act() under opMu -- so nothing beats while one runs. Fine for the
+// bounded calls; fatal for pg_basebackup and pg_rewind, which legitimately take as long as
+// the data takes to copy. /healthz goes stale at reconcileInterval*3 (15s on chart
+// defaults) and liveness gives up after 10 x 10s, so the kubelet SIGKILLs the container --
+// and the postmaster under it -- about 115s into any clone, on every retry.
 //
-// The concrete failure: RejoinForward escalating to ReclonePreserving on a pod whose
-// startupProbe has long since passed (so nothing holds liveness off) is killed mid-backup on
-// every attempt, leaving another `.diverged.<ts>` copy that nothing reaps until the PVC
-// fills. BootstrapClone is only spared while the startupProbe is still gating -- 180 x 10s --
-// so a database that takes over half an hour to copy can never finish a first clone either.
-//
-// Deliberately NOT a free-running heartbeat goroutine: /healthz has to keep meaning "the
-// reconcile loop is progressing", so the beat is armed only around a call the agent knows is
-// legitimately long. A wedge anywhere else still goes stale and still gets restarted. The
-// residual cost is that a genuinely hung pg_basebackup now looks alive; that is the right
-// trade against killing every real one, and the clone marker plus discardTornClone already
-// exist to recover the interrupted directory.
+// Deliberately NOT a free-running goroutine: /healthz must keep meaning "the reconcile loop
+// is progressing", so the beat is armed only around a call known to be long, and a wedge
+// anywhere else still goes stale and still gets restarted. The residual cost is that a hung
+// pg_basebackup looks alive; the clone marker and discardTornClone recover that directory.
 func (a *agent) beatDuring(fn func() error) error {
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -2673,17 +2645,13 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 	if err := a.assertSameCluster(ctx, target); err != nil {
 		return err
 	}
-	// Bounded, same reason as the fence branches in act() (#298 review): the
-	// SIGQUIT -> SIGKILL escalation in ChildPostmaster.Stop is driven purely by the
-	// context, so an unbounded one on a wedged postmaster hangs the rejoin -- and with
-	// it opMu and the reconcile heartbeat -- rather than force-stopping and continuing.
+	// Bounded (see DemoteFence).
 	dctx, dcancel := context.WithTimeout(ctx, a.cfg.RenewDeadline)
 	derr := a.sup.Demote(dctx, true)
 	dcancel()
 	if derr != nil {
 		return derr
 	}
-	// beatDuring: pg_rewind copies as much as it has to, unbounded (#298 review).
 	if err := a.beatDuring(func() error { return a.mech.RejoinForceRewind(ctx, a.peerMechConn(target)) }); err != nil {
 		// Escalate to a full re-clone ONLY on genuine divergence (#298 review).
 		// RejoinForceRewind already classifies its failures -- ErrRewindDiverged for

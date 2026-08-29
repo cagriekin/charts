@@ -1322,20 +1322,17 @@ assert_contains "#298: the pgHba insert uses awk, not the unmatchable sed anchor
   "${hba_render}" "awk -v insfile="
 assert_contains "#298: the insert fires once, at the first non-loopback host rule" \
   "${hba_render}" "done=1"
-# The ANCHOR excludes the loopback rules (#298 review). Anchoring on the first `host` line put
-# the operator's entries above `host all all 127.0.0.1/32 trust`, so a catch-all entry that also
-# matches loopback beat it -- and standalone then ordered the same values differently from agent
-# mode, whose AssemblePgHba emits both loopback rules before the user block.
+# The ANCHOR excludes the loopback rules (#298): above `127.0.0.1/32 trust`, a catch-all that
+# also matches loopback beats it, and standalone would order the same values differently from
+# agent mode.
 assert_contains "#298: the anchor skips the IPv4 loopback rule" \
   "${hba_render}" '$4 != "127.0.0.1/32"'
 assert_contains "#298: the anchor skips the IPv6 loopback rule" \
   "${hba_render}" '$4 != "::1/128"'
 assert_not_contains "#298: the unmatchable sed anchor is gone" \
   "${hba_render}" "host all all all scram-sha-256"
-# ONE awk pass for the whole list (#298 review, round 2). A pass per entry anchored on the first
-# host rule, which after the first insert IS the entry just inserted -- so the operator's list
-# came out reversed, and in a first-match-wins file that inverts its meaning. Exactly one awk
-# invocation must be rendered however many entries there are.
+# ONE awk pass for the whole list (#298): a pass per entry re-anchors on the previous insert
+# and reverses the list. Exactly one awk invocation, however many entries there are.
 assert_eq "#298: one awk pass regardless of how many pgHba entries there are" "1" \
   "$(printf '%s\n' "${hba_render}" | grep -c 'awk -v insfile=')"
 
@@ -1368,9 +1365,8 @@ assert_eq "#298: it lands ABOVE the network catch-all (first-match-wins)" "yes" 
 _first_local=$(grep -n "^local" "${_hba_tmp}/pg_hba.conf" | head -1 | cut -d: -f1)
 assert_eq "#298: the local trust rules stay above the inserted entry" "yes" \
   "$([ -n "${_first_local}" ] && [ "${_first_local}" -lt "${_ins_line}" ] && echo yes || echo no)"
-# ...and so do the LOOPBACK host rules (#298 review). This assertion is the one the earlier
-# version of this block was missing, which is how the first-`host` anchor shipped: every other
-# check here still passed with the operator's rules sitting above `127.0.0.1/32 trust`, so a
+# ...and so do the LOOPBACK host rules (#298). Without this assertion every other check here
+# still passes with the operator's rules sitting above `127.0.0.1/32 trust`, so a
 # catch-all entry silently outranked loopback and broke in-pod TCP clients (port-forward + psql).
 _lo4_line=$(grep -n "127.0.0.1/32" "${_hba_tmp}/pg_hba.conf" | head -1 | cut -d: -f1)
 _lo6_line=$(grep -n "::1/128" "${_hba_tmp}/pg_hba.conf" | head -1 | cut -d: -f1)

@@ -74,16 +74,12 @@ for chart in "${charts[@]}"; do
       continue
     fi
     out=""
-    # PER-PROFILE, not per invocation (#298 review). `failed` is compared against `profiles`
-    # in the verdict line, and incrementing it inside this two-iteration k8s-version loop --
-    # and again in the vacuous guard below -- made one broken profile report
-    # "FAILED (2 of 44 profiles)", or 3 of 44 if it also rendered nothing. `failed` could
-    # even exceed `profiles`. Latch it here and add ONE at the end of the profile.
+    # PER-PROFILE, not per invocation (#298): `failed` is compared against `profiles`, so
+    # counting inside this two-version loop could report more failures than there are
+    # profiles. Latch here, add ONE at the end of the profile.
     profile_failed=0
-    # Same shape for the skip tally (#298 review): the two k8s versions skip the SAME
-    # resources, so summing inside the loop double-counted every one of them in the
-    # verdict's "N unvalidated" -- inflating the number in exactly the situation the
-    # counter exists to report. Take the worst single version and add it once.
+    # Same for the skip tally: both versions skip the SAME resources, so summing inside the
+    # loop double-counts them. Take the worst single version and add it once.
     profile_skips=0
     for kv in "${KUBE_VERSION}" "${KUBE_VERSION_MAX}"; do
       if ! out=$(printf '%s' "${rendered}" \
@@ -105,14 +101,11 @@ for chart in "${charts[@]}"; do
       skipped=$(printf '%s' "${out}" | sed -nE 's/.*Skipped: ([0-9]+).*/\1/p' | head -1)
       if [ -n "${skipped}" ] && [ "${skipped}" -gt 0 ]; then
         echo "  NOTE: ${skipped} resource(s) NOT validated at k8s ${kv} (no schema):" >&2
-        # `|| true` is load-bearing under `set -euo pipefail` (#298 review). This second
-        # kubeconform run is a DIAGNOSTIC -- rc is already decided by the -strict run above --
-        # but it exits non-zero whenever the profile also contains an INVALID resource, and
-        # pipefail carries that past awk/sort straight into set -e. The gate then died here,
-        # mid-loop: every remaining profile went unvalidated and `verdict` never printed, so
-        # the run ended with NOTE lines and no FAILED line -- exactly the silent-pass
-        # misreading the verdict line exists to prevent. Every profile with a skip and a
-        # failure at once hits it, and pg [values-agent-control-restore] always has skips.
+        # `|| true` is load-bearing under `set -euo pipefail` (#298). This run is a
+        # DIAGNOSTIC -- rc is already decided by the -strict run above -- but it exits
+        # non-zero when the profile also holds an INVALID resource, and pipefail would carry
+        # that into set -e: the gate died mid-loop, leaving the rest unvalidated and never
+        # printing `verdict`. Any profile with a skip and a failure at once hits it.
         printf '%s' "${rendered}" \
           | kubeconform -ignore-missing-schemas -kubernetes-version "${kv}" \
               -schema-location default -schema-location "${CRD_CATALOG}" -verbose 2>&1 \

@@ -1,15 +1,8 @@
-# pgvector-SCOPED, not a mirror of pg's suite of the same name (#298 review).
-#
-# It carried pg's filename and a reworded subset of pg's cases -- 24 of 76 -- which read as a
-# mirror while being free to drift, and nothing checked. It is not a mirror and should not be:
-# pg/templates and pgvector/templates are byte-identical by gate (`diff -r`) and pgvector's
-# templates are symlinks INTO pg's, so pg's suite already exercises every line of shared
-# template logic. What belongs here is what is chart-SPECIFIC: pgvector's own defaults, its
-# image, and that the shared validators fire under pgvector's values.
-#
-# Renamed so the filename cannot imply a mirror. The rule is now enforced in
-# scripts/helm-unittest-charts.sh: a pgvector unit file sharing a name with a pg one must be a
-# SYMLINK to it (audit_test.yaml and pgpool_deployment_test.yaml already are), never a copy.
+# pgvector-SCOPED, not a mirror of pg's suite (#298). pgvector's templates are symlinks into
+# pg's and byte-identical by gate, so pg's suite already covers the shared logic; what belongs
+# here is chart-SPECIFIC -- pgvector's defaults, its image, and the shared validators firing
+# under pgvector's values+schema. The name keeps it from reading as a mirror, and
+# scripts/helm-unittest-charts.sh enforces the rule: same-named means SYMLINK, never a copy.
 suite: pgvector fail-fast guards
 templates:
   - templates/statefulset.yaml

@@ -47,9 +47,8 @@ for chart in "${charts[@]}"; do
     # Per-object `ignore-check.kube-linter.io/*` waivers are annotations, so they travel in the
     # rendered manifest and keep working identically.
     out=""
-    # PER-PROFILE, not per check (#298 review). `failed` is printed against `profiles` in the
-    # verdict line, and a profile that BOTH fails the lint and renders nothing incremented it
-    # twice -- so one broken profile read as "FAILED (2 of 44 profiles)". Latch, then add one.
+    # PER-PROFILE, not per check (#298): `failed` is printed against `profiles`, and a
+    # profile that both fails the lint and renders nothing would count twice. Latch, add one.
     profile_failed=0
     if ! out=$( { helm template "${chart}" "${chart}" "${args[@]}" \
         | kube-linter lint - --config "${CONFIG}"; } 2>&1 ); then

@@ -24,14 +24,10 @@ git -C "${root}" worktree add -q --detach "${wt}" "${ref}"
 
 filt() { grep -vE '^[[:space:]]+(password|repmgr-password):'; }
 
-# render writes chart's default manifest to out_file, or fails LOUDLY (#298 review).
-#
-# The previous form was `helm template ... 2>/dev/null | filt > file`, which under
-# `set -euo pipefail` turned a render failure into a SILENT exit: helm's diagnostic went to
-# /dev/null, filt (a grep) saw empty input and exited 1, pipefail propagated it, and set -e
-# killed the script before it printed anything at all -- while the EXIT trap quietly removed
-# the worktree. `make -C pg byte-stable REF=<ref>` then looked exactly like "no drift".
-# Capture helm's status and its stderr explicitly, and only filter output we know we got.
+# render writes the chart's default manifest to out_file, or fails LOUDLY (#298). Capture
+# helm's status and stderr explicitly rather than piping through a filter: discarding stderr
+# and letting pipefail carry the filter's exit made a render failure indistinguishable from
+# "no drift" -- the script died silently and the EXIT trap removed the worktree.
 render() {
   local chart_dir="$1" out_file="$2" raw
   if ! raw="$(helm template rel "${chart_dir}" 2>"${tmp}/render.err")"; then

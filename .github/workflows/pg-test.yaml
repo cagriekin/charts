@@ -421,13 +421,11 @@ jobs:
     steps:
       - name: Aggregate result
         run: |
-          # The no-op arm requires `changes` to have SUCCEEDED (#298 review). `if: always()`
-          # runs this gate even when `changes` failed or was cancelled -- and a job that did
-          # not finish has EMPTY outputs, so `!= "true"` held and the required check went
-          # GREEN having run nothing at all. A required check that reports success without
-          # examining anything is strictly worse than one that never reports: the latter
-          # blocks the merge, this one waves it through. Same vacuous-pass shape the gate
-          # scripts in this change closed.
+          # The no-op arm requires `changes` to have SUCCEEDED (#298). `if: always()` runs this
+          # gate even when `changes` failed or was cancelled, and an unfinished job has EMPTY
+          # outputs -- so `!= "true"` held and the required check went GREEN having examined
+          # nothing. That is worse than never reporting: a missing check blocks the merge,
+          # this one waved it through. (Same guard in kafka-test.yaml and redis-test.yaml.)
           if [ "${{ needs.changes.result }}" != "success" ]; then
             echo "pg gate FAILED: the changes job did not succeed (result=${{ needs.changes.result }}), so relevance is unknown"
             exit 1

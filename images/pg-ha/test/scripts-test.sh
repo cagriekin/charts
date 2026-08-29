@@ -468,11 +468,8 @@ fi
 rm -rf "${_q_tmp}"
 
 # --- #298 review: REPMGR_USER may not collide with POSTGRES_USER or the bootstrap superuser ---
-# Every CREATE/ALTER is swallowed with `2>/dev/null || true` and the verification only asks
-# whether the replication ROLE EXISTS, so a colliding name leaves that role holding the other
-# password while bootstrap_ok stays yes and the completion sentinel seals it in: the agent can
-# never authenticate as REPMGR_USER, bootstrap_initdb no-ops forever, and only a PVC delete
-# recovers. The refusal has to come BEFORE initdb, so nothing has touched the volume.
+# See bootstrap_initdb for why a collision is unrecoverable. The refusal has to come BEFORE
+# initdb, so nothing has touched the volume.
 for _collide in 'same' 'superuser'; do
   _c_tmp=$(mktemp -d)
   mkdir -p "${_c_tmp}/pgdata"

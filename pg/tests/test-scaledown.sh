@@ -168,15 +168,10 @@ assert_eq "a primary still serves after scale-down + cleanup" "t" "${serves}"
 # the same resource -- and, worse, its orphan rule would start dropping repmgr's slots.
 agent_slots=$(pg_exec "${NAMESPACE}" "${P}" \
   "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
-# The `if native` gate is gone (#298 review): native is the only mechanism since #294, so the
-# branch always took this side and the `else` asserted a repmgr-mode property against a cluster
-# that has no repmgr.nodes to assert it about.
-#
-# Wait on the RECLAIM, not on the stream stopping (#288 review). in_topology going to 0 under
-# native only means pod-2's row left pg_stat_replication, which happens the instant its stream
-# drops -- seconds before the primary's next slotsTick observes the shrunken live pod set and
-# drops pg_ha_slot_2. Reading the slot counts straight after that loop raced the tick. Under
-# repmgr the equivalent wait was on repmgr.nodes, i.e. on the primary tick itself having run.
+# Wait on the RECLAIM, not on the stream stopping (#288). in_topology reaching 0 only means
+# pod-2's row left pg_stat_replication, which happens the instant its stream drops -- seconds
+# before the primary's next slotsTick observes the shrunken pod set and drops pg_ha_slot_2.
+# Reading the slot counts straight after that loop raced the tick.
 # Only assert the reclaim when there was something to reclaim. An honest SKIP beats a green
 # assertion that never exercised the code path (#288 review).
 # skip() only records a skip, it does not return (helpers.sh), so the wait below has to be
@@ -209,8 +204,6 @@ assert_eq "#289/#288: native leaves exactly one agent slot for the surviving sta
 ghost_agent=$(pg_exec "${NAMESPACE}" "${P}" \
   "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
 assert_eq "#289/#288: no agent slot left pinning WAL for the scaled-away ordinal 2" "0" "${ghost_agent}"
-# #288's own acceptance line: a native cluster carries no repmgr metadata at all, so there is
-# no stale cache for anything to fall back to by accident.
 ext=$(pg_exec "${NAMESPACE}" "${P}" \
   "SELECT count(*) FROM pg_extension WHERE extname='repmgr'" repmgr repmgr 2>/dev/null | xargs || echo "")
 assert_eq "#288: a native cluster has no repmgr extension" "0" "${ext}"

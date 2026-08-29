@@ -48,19 +48,9 @@ func ScramVerifier(password string) (string, error) {
 // vector can be asserted. Hand-rolling SCRAM is only defensible if it is checked against the
 // spec's own numbers rather than against itself.
 func scramVerifierWithSalt(password string, salt []byte) (string, error) {
-	// SaltedPassword := Hi(Normalize(password), salt, i). Normalize is SASLprep (RFC 4013),
-	// which this package does NOT implement -- so it refuses to mint a verifier for any
-	// password SASLprep could change (ErrNeedsSASLprep, see needsSASLprep).
-	//
-	// Skipping it silently was a lockout, not a cosmetic gap (#298 review). The server's own
-	// scram_build_secret SASLpreps before hashing and libpq SASLpreps before computing
-	// ClientProof, so for a password carrying any non-ASCII byte -- NFKC-normalisable
-	// characters, a non-ASCII space, a soft hyphen -- the verifier written here is one the
-	// user's own password can never match. And it is not recoverable by retrying: rehashSQL
-	// is gated on `rolpassword LIKE 'md5%'`, which stops matching the moment the bad verifier
-	// lands, so the superuser and the replication user are locked out for good and streaming
-	// replication stops cluster-wide. Refusing instead leaves the md5 hash in place, which the
-	// agent's own md5-above-scram pg_hba line still authenticates.
+	// SaltedPassword := Hi(Normalize(password), salt, i). Normalize is SASLprep, which this
+	// package does not implement -- so refuse rather than mint a verifier nobody can match
+	// (see needsSASLprep).
 	if needsSASLprep(password) {
 		return "", ErrNeedsSASLprep
 	}
@@ -76,9 +66,11 @@ func scramVerifierWithSalt(password string, salt []byte) (string, error) {
 		scramIterations, b64(salt), b64(storedKey[:]), b64(serverKey)), nil
 }
 
-// ErrNeedsSASLprep is returned when a password cannot be hashed here because SASLprep
-// might change it and this package does not implement SASLprep. The caller skips the
-// re-hash for that user rather than storing a verifier nobody can authenticate against.
+// ErrNeedsSASLprep is returned for a password SASLprep might change. The caller skips the
+// re-hash for that user, leaving the md5 hash the pg_hba md5 fallback still authenticates.
+// Storing the verifier instead is a permanent lockout: the server and libpq both SASLprep,
+// so the user's own password would never match it, and the re-hash is gated on
+// `rolpassword LIKE 'md5%'` -- which stops matching the moment the bad verifier lands.
 var ErrNeedsSASLprep = errors.New("scram: password needs SASLprep normalisation, which this agent does not implement")
 
 // needsSASLprep reports whether SASLprep could change password.
