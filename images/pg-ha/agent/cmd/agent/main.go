@@ -33,6 +33,7 @@ import (
 	"github.com/cagriekin/pg-ha-agent/internal/dcs"
 	"github.com/cagriekin/pg-ha-agent/internal/k8s"
 	"github.com/cagriekin/pg-ha-agent/internal/kubecfg"
+	"github.com/cagriekin/pg-ha-agent/internal/logging"
 	"github.com/cagriekin/pg-ha-agent/internal/mechanism"
 	"github.com/cagriekin/pg-ha-agent/internal/observe"
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
@@ -48,7 +49,7 @@ const (
 )
 
 func main() {
-	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	log := logging.New(os.Stdout)
 
 	// One-shot subcommand: provision etcd RBAC and enable auth. The bundled etcd
 	// image is distroless (no shell), so this runs in the pg-ha image via the etcd

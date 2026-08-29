@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cagriekin/pg-ha-agent/internal/logging"
 )
 
 // Request/body/concurrency bounds. The control server shares a process with PID 1
@@ -97,7 +99,7 @@ func New(o Options) (*Server, error) {
 		return nil, errors.New("control: Cluster and Node are required")
 	}
 	if o.Log == nil {
-		o.Log = slog.New(slog.NewTextHandler(os.Stdout, nil))
+		o.Log = logging.New(os.Stdout)
 	}
 	if o.Metrics == nil {
 		o.Metrics = Nop{}
