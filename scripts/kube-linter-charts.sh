@@ -34,6 +34,12 @@ failed=0
 profiles=0
 for chart in "${charts[@]}"; do
   while read -r label vfiles; do
+    # Expanded below as ${args[@]+"${args[@]}"}, not "${args[@]}": bash only stopped
+    # treating an empty array as UNSET in 4.4, and the `defaults` profile always has zero
+    # entries -- so under `set -u` on macOS's system bash 3.2 this gate aborted on its very
+    # first profile with `args[@]: unbound variable`, which reads as a chart failure rather
+    # than a shell-version problem (#298 review). These scripts are documented as runnable
+    # locally.
     args=()
     for v in ${vfiles}; do args+=(-f "${v}"); done
     echo "==> kube-linter: ${chart} [${label}]"
@@ -50,7 +56,7 @@ for chart in "${charts[@]}"; do
     # PER-PROFILE, not per check (#298): `failed` is printed against `profiles`, and a
     # profile that both fails the lint and renders nothing would count twice. Latch, add one.
     profile_failed=0
-    if ! out=$( { helm template "${chart}" "${chart}" "${args[@]}" \
+    if ! out=$( { helm template "${chart}" "${chart}" ${args[@]+"${args[@]}"} \
         | kube-linter lint - --config "${CONFIG}"; } 2>&1 ); then
       rc=1
       profile_failed=1

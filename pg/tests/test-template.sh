@@ -1187,6 +1187,39 @@ netpol_extra=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/networkpolicy.yaml 2>&1)
 assert_contains "#148: extraIngress recipe re-allows scoped direct-5432 clients" "${netpol_extra}" "app: my-read-client"
 
+# #298 review: every hook Job that psql's to 5432 needs its own ingress rule, because the
+# default allowExternal=true masks their absence behind a `podSelector: {}` that matches
+# everything. Under allowExternal=false a default-deny CNI drops the Job, it burns its 60x5s
+# pg_isready wait, exits non-zero, and helm install/upgrade FAILS on the hook -- leaving the
+# release `failed` with no declared role, database, or pgaudit extension.
+netpol_hooks=$(helm template test-pg "${CHART_DIR}" \
+  --set networkPolicy.enabled=true \
+  --set networkPolicy.postgresql.allowExternal=false \
+  --set postgresql.audit.enabled=true \
+  --set prometheusExporter.enabled=true \
+  --set "postgresql.databases[0].name=app" \
+  --set "postgresql.roles[0].name=app_rw" \
+  --set "postgresql.roles[0].password=pw" \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "#298: the databases-roles hook Job is allowed to reach 5432" "${netpol_hooks}" "app.kubernetes.io/component: databases-roles"
+assert_contains "#298: the audit-extension hook Job is allowed to reach 5432" "${netpol_hooks}" "app.kubernetes.io/component: audit-extension"
+assert_contains "#298: ...alongside the monitoring-user Job rule that already existed" "${netpol_hooks}" "app.kubernetes.io/component: monitoring-user"
+assert_not_contains "#298: ...and allowExternal=false really is off (no blanket rule)" "${netpol_hooks}" "- podSelector: {}"
+# The rules are conditional on the feature that creates the Job: no declared databases/roles
+# and no audit means no Job to allow, and a rule for a pod that never exists is noise.
+netpol_no_hooks=$(helm template test-pg "${CHART_DIR}" \
+  --set networkPolicy.enabled=true --set networkPolicy.postgresql.allowExternal=false \
+  --show-only templates/networkpolicy.yaml 2>&1)
+assert_not_contains "#298: no databases-roles rule when nothing declares one" "${netpol_no_hooks}" "component: databases-roles"
+assert_not_contains "#298: no audit-extension rule when audit is off" "${netpol_no_hooks}" "component: audit-extension"
+
+# #298 review: nulling the agent block must fail with the guard's own message, not a raw
+# nil-pointer from whichever validator dereferences it first (the guard used to sit ~800 lines
+# into the file, below pg.validateSyncReplicationSlotsMajor's read of the same map).
+agent_null_out=$(helm template test-pg "${CHART_DIR}" --set ha.agent=null 2>&1 || true)
+assert_contains "#298: a nulled ha.agent fails with the guard message" "${agent_null_out}" "ha.agent is required when ha.enabled=true"
+assert_not_contains "#298: ...not with a raw nil-pointer" "${agent_null_out}" "nil pointer evaluating"
+
 # #147: the exporter NetworkPolicy now has an extraIngress escape hatch so a Prometheus
 # in another namespace can scrape 9116 (the default 9116 ingress is same-namespace only).
 netpol_exporter_extra=$(helm template test-pg "${CHART_DIR}" \

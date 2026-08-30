@@ -352,13 +352,33 @@ jobs:
         if: matrix.suite == 'migrate-native' || matrix.suite == 'migrate-repmgrd'
         run: |
           set -euo pipefail
+          # `|| true` is load-bearing: under `set -euo pipefail` a grep that matches nothing
+          # makes the whole pipeline (and therefore the assignment) exit 1, so `set -e` killed
+          # the step BEFORE the guard below could print its message -- the one case it was
+          # written for, e.g. someone renaming FROM_IMAGE_BASE in the suite (#298 review).
           base=$(grep -oE 'FROM_IMAGE_BASE:-[^}]+' "pg/tests/test-${{ matrix.suite }}.sh" | head -1 \
-            | sed 's/^FROM_IMAGE_BASE:-//')
+            | sed 's/^FROM_IMAGE_BASE:-//' || true)
           [ -n "$base" ] || { echo "could not resolve FROM_IMAGE_BASE from the suite" >&2; exit 1; }
           ref="cagriekin/repmgr:${base%-pg[0-9]*}-pg${{ matrix.pg_major }}"
           echo "pre-loading $ref"
-          docker pull "$ref"
-          kind load docker-image "$ref" --name pg-test
+          # Retried, because this is the ONLY image in the required path that is not delivered
+          # by download-artifact, and these two legs carry no_retry: "1" (#298 review). A
+          # GitHub-hosted runner shares its egress IP, so an anonymous Docker Hub pull can come
+          # back TOOMANYREQUESTS -- and an unretried failure here reds `pg-tests-passed` on a PR
+          # that changed nothing related. Three attempts with backoff; if they all fail we still
+          # let the leg proceed, since pullPolicy IfNotPresent means the kind workers will try
+          # the pull themselves and the suite fails with its own diagnosis rather than this one.
+          pulled=""
+          for attempt in 1 2 3; do
+            if docker pull "$ref"; then pulled=1; break; fi
+            echo "docker pull $ref failed (attempt $attempt); retrying"
+            sleep $((attempt * 15))
+          done
+          if [ -n "$pulled" ]; then
+            kind load docker-image "$ref" --name pg-test
+          else
+            echo "::warning::could not pre-load $ref; the kind workers will pull it in-cluster"
+          fi
 
       # Point the chart defaults and every fixture at this leg's major (#269). Both
       # majors' images are already loaded, so this only decides which one the suite

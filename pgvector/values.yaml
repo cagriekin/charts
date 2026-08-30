@@ -87,11 +87,10 @@ postgresql:
 
   # Suspends the liveness and readiness probes until PostgreSQL first accepts
   # connections, so a slow start is not killed mid-startup by the liveness
-  # probe: the repmgr stale-primary guard's settle loop runs before postgres
-  # opens (up to ~147s if REPMGR_NODE_COUNT falls back to 10) and crash-recovery
-  # WAL replay can take longer still, both of which can exceed the ~130s
-  # liveness budget. failureThreshold x periodSeconds is the total startup
-  # budget (600s here); keep the steady-state livenessProbe window tight.
+  # probe: the agent has to acquire the lease and decide bootstrap-vs-clone before
+  # postgres opens at all, and crash-recovery WAL replay can take longer still, both
+  # of which can exceed the ~130s liveness budget. failureThreshold x periodSeconds is
+  # the total startup budget (1800s here); keep the steady-state livenessProbe window tight.
   # Bounds a standby's FIRST clone: since #288 the agent clones in this container, not in a
   # probe-free init container, so periodSeconds x failureThreshold caps the pg_basebackup.
   # #294 raised it from 600s to 1800s -- native is now the only mechanism, so the old "raise it
@@ -462,9 +461,10 @@ ha:
         # past that cap PostgreSQL invalidates the slot instead of filling the volume, the
         # standby behind it then needs a full re-clone, and this gauge collapses to zero at
         # that moment -- so this is the early warning and PGHAReplicationSlotInvalidated
-        # catches the outcome. Not limited to mechanism: native -- slot ownership is
-        # native-only, but the gauges these alerts read are published under `repmgr` too
-        # (where the agent reports slots but never reclaims them). See the pg chart README.
+        # catches the outcome. The agent reclaims its own slots every primary tick, so a
+        # sustained breach means a slot it does not own (an operator's, a logical slot, or
+        # a legacy repmgr_slot_* still active mid-migration) or a long-down standby. See
+        # the pg chart README.
         slotRetainedWALBytes: 3221225472
 
     # Authenticated control REST API (#276), agent mode only. OFF by default: with
@@ -610,8 +610,9 @@ ha:
       cpu: 500m
       memory: 512Mi
 
-  # Resources for the repmgr-init init container (runs `repmgr standby clone`, a full
-  # pg_basebackup) -- heavier than the other init containers, overridable here (#153).
+  # Resources for the init container. It does NOT clone -- the agent does that from the
+  # POSTGRESQL container (#288), so postgresql.resources and the startupProbe are what bound a
+  # large clone, not these. Overridable here (#153, #294).
   initContainerResources:
     requests:
       cpu: 100m
@@ -1102,7 +1103,7 @@ pgbackrest:
     # have confirmed every postgresql pod is gone.
     force: false
     # Ordinal of the replica whose PVC (data-<fullname>-<ordinal>) is restored into.
-    # Leave 0: replica 0 becomes the restored primary and repmgr re-clones the standbys.
+    # Leave 0: replica 0 becomes the restored primary and the agent re-clones the standbys.
     podOrdinal: 0
     # mode: job only -- appended to the Job name so a second attempt does not collide with
     # the completed first one (Jobs are immutable). Ignored in cronjob mode, where the name

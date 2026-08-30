@@ -529,6 +529,16 @@
   `[A-Za-z0-9_-]` was rejected only after the cluster had been created, leaving `PG_VERSION`
   present with no completion sentinel. It is now checked before the first write to the volume.
 
+- **The `databases`/`roles` and audit-extension hook Jobs are allowed through the
+  NetworkPolicy (#298 review).** Both `psql` to 5432 over the write Service exactly like the
+  monitoring-user Job, and both were the only client components with no ingress rule of their
+  own. The default `networkPolicy.postgresql.allowExternal: true` masked it behind a blanket
+  `podSelector: {}`, so with `allowExternal: false` plus declared `postgresql.databases` /
+  `postgresql.roles` (or `postgresql.audit.enabled`) a default-deny CNI dropped the Job: it
+  burned its 60x5s `pg_isready` wait, exited non-zero, and `helm install`/`upgrade` failed on
+  the hook, leaving the release `failed` with no declared role, database, or pgaudit extension.
+  Each rule is gated on the feature that creates the Job.
+
 - **A planned step-down is no longer counted or logged as a split-brain fence (#298 review,
   agent).** `dcs.OnLost` fires for a voluntary `Release()` too -- only `OnRenewFailure` is
   filtered to involuntary loss -- and it gates solely on the read-write latch, which neither

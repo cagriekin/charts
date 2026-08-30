@@ -82,11 +82,10 @@ postgresql:
 
   # Suspends the liveness and readiness probes until PostgreSQL first accepts
   # connections, so a slow start is not killed mid-startup by the liveness
-  # probe: the repmgr stale-primary guard's settle loop runs before postgres
-  # opens (up to ~147s if REPMGR_NODE_COUNT falls back to 10) and crash-recovery
-  # WAL replay can take longer still, both of which can exceed the ~130s
-  # liveness budget. failureThreshold x periodSeconds is the total startup
-  # budget (600s here); keep the steady-state livenessProbe window tight.
+  # probe: the agent has to acquire the lease and decide bootstrap-vs-clone before
+  # postgres opens at all, and crash-recovery WAL replay can take longer still, both
+  # of which can exceed the ~130s liveness budget. failureThreshold x periodSeconds is
+  # the total startup budget (1800s here); keep the steady-state livenessProbe window tight.
   # THIS BUDGET BOUNDS A STANDBY'S FIRST CLONE. Since #288 the clone runs in the main container
   # (the agent does it) rather than in a probe-free init container, so periodSeconds x
   # failureThreshold is the wall-clock limit on a pg_basebackup of your existing database. Exceed
@@ -659,15 +658,12 @@ ha:
         # that cannot fire reads as coverage while providing none. Raise this only if you
         # also raise max_slot_wal_keep_size via postgresql.configuration.
         #
-        # These alerts are NOT limited to mechanism: native. Slot ownership is native-only,
-        # but the primary publishes the slot gauges under `repmgr` too: repmgr mode has
-        # slots as well (repmgr_slot_*), they fail identically, and this rule renders for
-        # every agent-mode release -- a gauge that only moved under native would ship an
-        # alert that can never fire. Under native the agent reconciles its OWN slots away on
-        # every primary tick, so a sustained breach there means a slot it does not own (an
-        # operator's, or a logical slot for a subscription) or a standby down long enough to
-        # fall far behind. Under repmgr the agent reclaims nothing, so any sustained breach
-        # needs a human.
+        # The agent reconciles its OWN slots away on every primary tick, so a sustained
+        # breach means a slot it does not own -- an operator's, a logical slot for a
+        # subscription, or a legacy repmgr_slot_* still held ACTIVE by a standby part-way
+        # through the #292 in-place migration -- or a standby that has been down long
+        # enough to fall far behind. Any of those needs a human; none of them clears on
+        # its own.
         slotRetainedWALBytes: 3221225472
 
     # Authenticated control REST API (#276), agent mode only. OFF by default: with
@@ -1396,7 +1392,7 @@ pgbackrest:
     # have confirmed every postgresql pod is gone.
     force: false
     # Ordinal of the replica whose PVC (data-<fullname>-<ordinal>) is restored into.
-    # Leave 0: replica 0 becomes the restored primary and repmgr re-clones the standbys.
+    # Leave 0: replica 0 becomes the restored primary and the agent re-clones the standbys.
     podOrdinal: 0
     # mode: job only -- appended to the Job name so a second attempt does not collide with
     # the completed first one (Jobs are immutable). Ignored in cronjob mode, where the name

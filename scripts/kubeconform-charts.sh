@@ -56,6 +56,12 @@ profiles=0
 skips=0
 for chart in "${charts[@]}"; do
   while read -r label vfiles; do
+    # Expanded below as ${args[@]+"${args[@]}"}, not "${args[@]}": bash only stopped
+    # treating an empty array as UNSET in 4.4, and the `defaults` profile always has zero
+    # entries -- so under `set -u` on macOS's system bash 3.2 this gate aborted on its very
+    # first profile with `args[@]: unbound variable`, which reads as a chart failure rather
+    # than a shell-version problem (#298 review). These scripts are documented as runnable
+    # locally.
     args=()
     for v in ${vfiles}; do args+=(-f "${v}"); done
     echo "==> kubeconform: ${chart} [${label}]"
@@ -65,7 +71,7 @@ for chart in "${charts[@]}"; do
     # `level=INFO msg="found symbolic link..."` line per template file -- so those lines landed
     # inside the YAML and kubeconform reported `error unmarshalling resource` on every pgvector
     # profile. Keep stderr in its own file: needed for the diagnostic below, never for the input.
-    if ! rendered="$(helm template "${chart}" "${chart}" "${args[@]}" 2>"${err_file}")"; then
+    if ! rendered="$(helm template "${chart}" "${chart}" ${args[@]+"${args[@]}"} 2>"${err_file}")"; then
       echo "FATAL: ${chart} [${label}] failed to render:" >&2
       cat "${err_file}" >&2
       echo "       If this fixture is a LAYER over another, declare its base in fixture_base()" >&2

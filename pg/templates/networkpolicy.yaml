@@ -62,6 +62,30 @@ default-deny CNI drops it and the helm hook fails the release.
               {{- include "pg.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: backup
 {{- end }}
+{{- if or .Values.postgresql.databases .Values.postgresql.roles }}
+{{- /*
+The #218 declarative databases/roles post-install/post-upgrade hook Job connects to
+5432 over the write Service, exactly like the monitoring-user Job above -- and was the
+one client component with no rule of its own (#298 review). Under
+networkPolicy.postgresql.allowExternal=false a default-deny CNI drops it, the Job spins
+its 60x5s pg_isready wait and exits non-zero, and helm install/upgrade FAILS on the hook,
+leaving the release in `failed` with no declared role or database created. The default
+allowExternal=true masked it behind the `podSelector: {}` rule below, which is why no
+suite caught it.
+*/}}
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: databases-roles
+{{- end }}
+{{- if .Values.postgresql.audit.enabled }}
+{{- /* Same shape, same failure: the #219 audit-extension hook Job psql's to the write
+       Service to CREATE EXTENSION pgaudit, and a failed hook fails the release. */}}
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: audit-extension
+{{- end }}
 {{- if .Values.networkPolicy.postgresql.allowExternal }}
         - podSelector: {}
 {{- end }}

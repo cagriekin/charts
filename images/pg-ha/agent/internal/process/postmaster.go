@@ -75,8 +75,7 @@ func (p *ChildPostmaster) Start(_ context.Context) error {
 		// Running()==false, Decide routes to StartLocal, and Start found an EMPTY channel:
 		// it took the default arm and returned nil, reporting a successful start with no
 		// postmaster running. done is the same flag Running() answers from, so the two can
-		// no longer disagree; the receive that follows is blocking, and safe because done
-		// is only ever set immediately before that send.
+		// no longer disagree.
 		if !p.done.Load() {
 			return nil // still running
 		}
@@ -85,6 +84,10 @@ func (p *ChildPostmaster) Start(_ context.Context) error {
 		// Stop that had already taken the single queued value (but not yet reached its own
 		// mu-taking clear()) would deadlock the two. opMu serialises every caller today, so
 		// that cannot happen -- this just declines to depend on it.
+		//
+		// Reaching this on the default arm -- done set, send not yet executed -- is exactly
+		// why the Wait goroutine below sends on its OWN captured channel rather than reading
+		// p.exited at send time (see there).
 		select {
 		case <-p.exited:
 		default:
@@ -104,13 +107,25 @@ func (p *ChildPostmaster) Start(_ context.Context) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start postgres: %w", err)
 	}
+	// The waiter sends on THIS channel value, captured here, never on p.exited read at
+	// send time (#298 review). Reading the field would be both a data race (the field is
+	// mu-guarded; the goroutine holds nothing) and a misdelivery: the drain above clears
+	// p.exited on its default arm, i.e. after done is set but before the send has run, so a
+	// preempted waiter would resume and push the OLD child's exit into the NEW child's
+	// channel. The next Stop then returns "stopped" immediately and clear()s p.cmd while a
+	// read-write postmaster is still alive -- Running() goes false, tick() drops servingRW,
+	// and the lost-leadership fence is disarmed for the one node that is still a writer.
+	// (If clear() had run instead, p.exited is nil and the send blocks forever, leaking the
+	// waiter.) A captured channel is delivered to nobody once its owner is gone, which is
+	// the correct outcome for a stale exit.
+	exited := make(chan error, 1)
 	p.cmd = cmd
-	p.exited = make(chan error, 1)
+	p.exited = exited
 	p.done.Store(false)
 	go func() { // the single Wait owner (also reaps the child)
 		err := cmd.Wait()
 		p.done.Store(true) // set before the channel send so Running() never reports a dead child as alive
-		p.exited <- err
+		exited <- err
 	}()
 	return nil
 }

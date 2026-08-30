@@ -1,4 +1,14 @@
 {{- include "pg.normalizeValues" . -}}
+{{- /* An overlay that nulls the whole agent block must fail with THIS message rather than a
+       raw nil-pointer, and the check therefore has to precede the WHOLE validator chain
+       (#298 review). It used to sit beside the env block it was written for, ~800 lines
+       below, which made it unreachable: pg.validateSyncReplicationSlotsMajor already reads
+       .Values.ha.agent.syncReplicationSlots, so `--set ha.agent=null` died at line 18 with
+       `nil pointer evaluating interface {}.syncReplicationSlots` -- exactly the message the
+       guard exists to replace. */}}
+{{- if eq (include "pg.agentMode" .) "true" }}
+{{- $_ := required "ha.agent is required when ha.enabled=true" .Values.ha.agent }}
+{{- end }}
 {{- include "pg.validateResourceNames" . }}
 {{- include "pg.validateAudit" . }}
 {{- include "pg.validateRoleNames" . }}
@@ -817,9 +827,6 @@ spec:
             - name: PRIMARY_MARKER
               value: {{ printf "%s-primary" (include "pg.fullname" .) | quote }}
 {{- if eq (include "pg.agentMode" .) "true" }}
-            {{- /* fail fast with a clear message if an overlay nulls out the agent
-                   block, rather than a raw nil-pointer on .leaseDuration below */}}
-            {{- $_ := required "ha.agent is required when ha.enabled=true" .Values.ha.agent }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:
