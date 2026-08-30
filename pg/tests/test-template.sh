@@ -1687,6 +1687,40 @@ for m in ${pr_metrics}; do
   grep -q "\"${m}\"" "${metrics_go}" || missing_metrics="${missing_metrics} ${m}"
 done
 assert_eq "agent monitoring: every alerted metric is published by the agent" "" "${missing_metrics}"
+agent_pr_scope='namespace="default",service="test-pg-headless"'
+
+# #298: the two alerts added for metrics the agent published but nothing watched. Both cover
+# states that are otherwise entirely silent -- the cluster keeps serving and every probe stays
+# green -- so the rules ARE the detection, and a rule that quietly stops rendering is the whole
+# failure.
+assert_contains "#298: PrometheusRule has the marker-tamper alert" "${agent_pr}" "PGHAAgentMarkerTamperSuspected"
+assert_contains "#298: marker-tamper alert rates the tamper counter" "${agent_pr}" "pg_ha_agent_marker_tamper_suspected_total"
+assert_contains "#298: PrometheusRule has the replicas-not-streaming alert" "${agent_pr}" "PGHAReplicasNotStreaming"
+# unidentified must be SUBTRACTED from streaming, not ignored: replicas_streaming INCLUDES the
+# rows that resolve to no pod, so a bare `streaming < expected` lets one unidentified connection
+# mask one genuinely missing replica -- silencing the alert exactly when the topology view has
+# stopped being trustworthy.
+assert_contains "#298: replicas alert discounts the unidentified rows" "${agent_pr}" \
+  "max(pg_ha_agent_replicas_streaming{ ${agent_pr_scope} }) - max(pg_ha_agent_replicas_unidentified{ ${agent_pr_scope} })"
+assert_contains "#298: replicas alert compares against the expected count" "${agent_pr}" \
+  "< max(pg_ha_agent_replicas_expected{ ${agent_pr_scope} })"
+# max() on both sides, never min(): only the PRIMARY publishes non-zero topology gauges (a
+# demoted node calls ClearTopology), so a min() would take a standby's 0 and fire forever.
+assert_not_contains "#298: replicas alert does not aggregate with min()" "${agent_pr}" "min(pg_ha_agent_replicas"
+# Under cascadingReplication the agent deliberately leaves replicas_expected unmeasured (0),
+# because a cascaded child streams from a PEER and never appears in this primary's
+# pg_stat_replication. The comparison would then read `N < 0` -- never true. An alert that
+# cannot fire reads as coverage while providing none (#289's 16Gi threshold was exactly that),
+# so the rule must be ABSENT from the file rather than present and inert.
+agent_pr_cascade=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set ha.agent.monitoring.prometheusRule.enabled=true \
+  --set ha.agent.cascadingReplication=true \
+  --show-only templates/agent-prometheusrule.yaml 2>&1)
+assert_not_contains "#298: replicas alert omitted under cascadingReplication" "${agent_pr_cascade}" "PGHAReplicasNotStreaming"
+assert_not_contains "#298: no expected-count series under cascadingReplication" "${agent_pr_cascade}" "pg_ha_agent_replicas_expected"
+# The rest of the file is unaffected by that gate -- it removes one rule, not the group.
+assert_contains "#298: cascading render keeps the marker-tamper alert" "${agent_pr_cascade}" "PGHAAgentMarkerTamperSuspected"
+assert_contains "#298: cascading render keeps the no-leader alert" "${agent_pr_cascade}" "PGHAAgentNoLeader"
 
 # #289: the replication-slot alerts. An orphaned slot pins WAL and fills the volume with
 # no error until the disk is full, so these two rules are the only thing that turns that

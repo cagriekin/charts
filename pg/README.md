@@ -1167,17 +1167,46 @@ Progress, honestly:
 
 ### Monitoring the agent (agent mode)
 
-The agent serves read-only Prometheus metrics on port `9200` (`pg_ha_agent_is_leader`, `_is_paused`, `_renew_failures_total`, `_promotions_total`, `_demotes_total`, `_fences_total`, `_reconcile_errors_total`, `_recovery_starts_total`). With the Prometheus Operator installed:
+The agent serves read-only Prometheus metrics on port `9200` (`pg_ha_agent_is_leader`, `_is_paused`, `_renew_failures_total`, `_promotions_total`, `_demotes_total`, `_fences_total`, `_reconcile_errors_total`, `_recovery_starts_total`, `_marker_tamper_suspected_total`, the `_replicas_*` topology gauges and the `_replication_slot*` gauges). With the Prometheus Operator installed:
 
 ```yaml
 repmgr:
   agent:
     monitoring:
       serviceMonitor: { enabled: true }   # scrape the agent metrics off the headless Service
-      prometheusRule: { enabled: true }   # example alerts (no-leader, split-brain, renew-failure, flapping, agent-down, paused-too-long)
+      prometheusRule: { enabled: true }   # example alerts (no-leader, split-brain, renew-failure, flapping, agent-down, paused-too-long, marker-tamper, replicas-not-streaming, slot health)
 ```
 
 The bundled `PrometheusRule` covers leadership/fencing health only; row-level **replication lag** alerts come from the PostgreSQL exporter (`prometheusExporter.enabled`).
+
+Two of the rules are worth calling out, because what they catch is otherwise **silent** — the
+cluster keeps serving, every probe stays green, and nothing in the logs of a healthy pod says
+anything is wrong:
+
+- `PGHAAgentMarkerTamperSuspected` (critical, 5m) — an agent has judged the primary marker's
+  recorded timeline impossible: implausibly high, or unparseable. The marker is a ConfigMap any
+  namespace writer can forge and `unsafeToServe` trusts its timeline, so such a value trips that
+  guard on **every** node and **freezes automatic failover** cluster-wide. The agent keeps failing
+  closed (an untrusted highwater is not safe to serve on) and counts the tick; without this rule
+  the frozen failover surfaces for the first time when the primary dies and nothing takes over.
+  Compare the ConfigMap's timeline against `SELECT timeline_id FROM pg_control_checkpoint()` on the
+  primary — and review who can write ConfigMaps in that namespace, because a forged value is the
+  case this exists for.
+- `PGHAReplicasNotStreaming` (warning, 15m) — the primary sees fewer *identified* streaming
+  standbys than there are live peer pods. Redundancy is reduced (a failover has fewer candidates,
+  or none) and synchronous commit blocks if it is configured against a standby that is not there.
+  `pg_ha_agent_replicas_unidentified` is **subtracted** in the expression, because
+  `_replicas_streaming` includes it: a streaming connection that maps to no pod would otherwise
+  mask a genuinely missing replica one-for-one, silencing the alert at exactly the moment the
+  topology view stopped being trustworthy. 15m rides out a rolling restart. An apiserver blip
+  cannot fire it either — when the live-pod list fails, the agent leaves the gauges at their
+  previous values rather than publishing a zero.
+
+  **This rule is not rendered when `ha.agent.cascadingReplication` is on.** There a child streams
+  from a peer and never appears in this primary's `pg_stat_replication`, so the agent deliberately
+  does not measure the expected count, and the comparison could never be true. An alert that cannot
+  fire reads as coverage while providing none, so it is left out of the file rather than shipped
+  inert.
 
 ### Leadership backend: Kubernetes Lease (default) or etcd (agent mode)
 

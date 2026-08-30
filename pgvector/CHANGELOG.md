@@ -253,6 +253,32 @@
 
 ### Added
 
+- **Two agent alerts for failures that were published but unwatched (#298).** The agent exports 21
+  metric series; the bundled `PrometheusRule` rated or thresholded only nine of them, so the rest
+  were graphable but never paged on. Two of those gaps hid conditions that are otherwise entirely
+  silent -- the cluster keeps serving, every probe stays green, and nothing in a healthy pod's log
+  mentions them:
+
+  - `PGHAAgentMarkerTamperSuspected` (critical, 5m) on `pg_ha_agent_marker_tamper_suspected_total`.
+    The primary marker is a ConfigMap any namespace writer can forge, and `unsafeToServe` trusts
+    its recorded timeline: an implausible or unparseable highwater trips that guard on **every**
+    node and freezes automatic promotion cluster-wide. The agent already failed closed there and
+    counted the tick; nothing turned that counter into a page, so a frozen failover would surface
+    for the first time when the primary died and no standby took over.
+  - `PGHAReplicasNotStreaming` (warning, 15m) on the `pg_ha_agent_replicas_*` gauges: the primary
+    sees fewer *identified* streaming standbys than there are live peer pods.
+    `_replicas_unidentified` is subtracted, because `_replicas_streaming` includes it -- a
+    streaming connection that maps to no pod would otherwise mask a genuinely missing replica
+    one-for-one, silencing the alert at exactly the moment the topology view stopped being
+    trustworthy. The 15m window rides out a rolling restart, and an apiserver blip cannot fire it
+    because a failed pod list leaves the gauges unchanged rather than publishing a zero.
+
+    This rule is **omitted from the rendered file** when `ha.agent.cascadingReplication` is on: a
+    cascaded child streams from a peer and never reaches this primary's `pg_stat_replication`, so
+    the agent does not measure the expected count there and the comparison could never be true.
+    An alert that cannot fire reads as coverage while providing none -- the same failure mode
+    #289's 16Gi slot threshold had -- so it is left out rather than shipped inert.
+
 - **In-place migration of a live repmgr cluster to the native mechanism (#292).** `helm upgrade`
   from any 1.x release now migrates an existing cluster without a re-clone: timeline and system
   identifier preserved, no switchover, no `--cascade=orphan` recreate. At size this is the

@@ -449,7 +449,11 @@ ha:
         additionalLabels: {}
       # Example alert rules over the agent metrics (no-leader, split-brain,
       # renew-failure, reconcile-error, flapping, agent-down, paused-too-long,
-      # replication-slot retained WAL).
+      # marker-tamper, replicas-not-streaming, replication-slot retained WAL).
+      # The replicas-not-streaming rule is omitted when cascadingReplication is on:
+      # a cascaded child streams from a peer and never reaches this primary's
+      # pg_stat_replication, so the agent does not measure the expected count there
+      # and the rule could never fire.
       prometheusRule:
         enabled: false
         additionalLabels: {}

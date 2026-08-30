@@ -74,6 +74,27 @@ spec:
           annotations:
             summary: "pg-ha-agent fencing repeatedly ({{ include "pg.fullname" . }})"
             description: "More than 2 fences in 15m suggests instability (intermittent apiserver/node slowness or a flapping primary)."
+        {{- /* #298 security review. The primary marker is a ConfigMap any namespace writer
+               can forge, and unsafeToServe trusts its recorded timeline: an implausibly high
+               or unparseable highwater trips that guard on EVERY node and freezes automatic
+               promotion cluster-wide. The agent keeps failing closed there -- an untrusted
+               highwater is not safe to serve on -- and counts the tick, which is the ONLY
+               evidence the state exists. Nothing else changes: the primary keeps serving reads
+               and writes, every probe stays green, and the frozen failover surfaces for the
+               first time when the primary dies and no standby takes over. That is precisely
+               the shape that needs a page rather than a gauge nobody is watching.
+
+               The counter advances once per tick while the condition holds and simply stops
+               when the marker is corrected (it is re-read every tick), so a sustained rate is
+               the signal and no clearing logic is needed. */}}
+        - alert: PGHAAgentMarkerTamperSuspected
+          expr: rate(pg_ha_agent_marker_tamper_suspected_total{ {{ $m }} }[5m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "pg-ha-agent primary marker looks forged or corrupt ({{ include "pg.fullname" . }})"
+            description: "An agent has judged the primary marker's recorded timeline impossible (implausibly high, or unparseable) on every tick for 5m. AUTOMATIC FAILOVER IS FROZEN while this holds: the cluster keeps serving, but no standby will be promoted if the primary dies. Inspect the marker with: kubectl get configmap {{ include "pg.fullname" . }}-primary -o yaml; and compare its timeline against the real one: kubectl exec <primary-pod> -c postgresql -- psql -U postgres -tAc 'SELECT timeline_id FROM pg_control_checkpoint()'. The agent rewrites the marker itself once a node legitimately serves, so correcting the ConfigMap clears this -- but review who can write ConfigMaps in this namespace first, because a forged value is the case this alert exists for."
         {{- /* #289: the slot alerts. A neglected physical replication slot fails silently
                in one of two ways, and nothing else in the stack reports either.
                Scoped to the primary implicitly: only the lease holder publishes non-zero
@@ -118,6 +139,39 @@ spec:
           annotations:
             summary: "A replication slot has no consumer ({{ include "pg.fullname" . }})"
             description: "At least one physical replication slot has been reserving WAL with no active consumer for 1h. Slots that have reserved nothing yet (a slot minted ahead of its standby) are not counted, so this really is accumulation. Expected briefly while a standby restarts or re-clones; sustained means a standby is down or the slot is orphaned. The agent reclaims slots it owns automatically, so a persistent one is an operator-created slot, or a standby that needs attention."
+{{- if not .Values.ha.agent.cascadingReplication }}
+        {{- /* #288 topology. Rendered ONLY in a star topology, deliberately: under
+               cascadingReplication a child streams from a PEER and never appears in this
+               primary's pg_stat_replication, so topologyTick publishes replicas_expected as 0
+               there. The comparison below would then read `N < 0` -- never true. An alert that
+               cannot fire is not a weak alert, it is a dead one that reads as coverage while
+               providing none, which is the failure #289 and #298 each shipped once. Better
+               absent from the rule file than inert inside it (same reasoning as #335's
+               TLS alert).
+
+               max() on both sides for the reason the slot alerts use it: only the primary
+               publishes non-zero topology gauges (a demoted node calls ClearTopology), so max
+               picks the primary's view without needing a role label. min() would take a
+               standby's 0 and fire forever.
+
+               unidentified is SUBTRACTED because replicas_streaming INCLUDES it: a streaming
+               row that resolves to no pod -- by neither application_name nor slot ordinal --
+               would otherwise mask a genuinely missing replica one-for-one, silencing this
+               alert at exactly the moment the topology view stopped being trustworthy.
+
+               15m because a rolling restart legitimately parks a pod off-stream for a while;
+               the agent logs the same gap only on CHANGE for the same reason. An apiserver
+               blip cannot fire this either: when the live-pod LIST fails, topologyTick leaves
+               the gauges at their previous values rather than publishing a zero. */}}
+        - alert: PGHAReplicasNotStreaming
+          expr: (max(pg_ha_agent_replicas_streaming{ {{ $m }} }) - max(pg_ha_agent_replicas_unidentified{ {{ $m }} })) < max(pg_ha_agent_replicas_expected{ {{ $m }} })
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Fewer standbys are streaming than this cluster has pods ({{ include "pg.fullname" . }})"
+            description: "For 15m the primary has seen fewer identified streaming standbys than there are live peer pods. Redundancy is reduced -- a failover now has fewer candidates, or none -- and synchronous commit will block if synchronous replication is configured against a standby that is not there. Expected briefly during a rolling restart or while a standby re-clones; sustained means a standby is down, wedged, or was invalidated behind a lost replication slot (see PGHAReplicationSlotInvalidated). Check with: kubectl exec <primary-pod> -c postgresql -- psql -U postgres -c 'SELECT application_name, client_addr, state, sync_state FROM pg_stat_replication'; then read the agent log on whichever pod is missing from that list."
+{{- end }}
         - alert: PGHAAgentPausedTooLong
           expr: max(pg_ha_agent_is_paused{ {{ $m }} }) == 1
           for: 1h
