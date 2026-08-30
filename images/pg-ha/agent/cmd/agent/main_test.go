@@ -3118,3 +3118,98 @@ func TestObservePeersAreProbedConcurrentlyAndStayOrdered(t *testing.T) {
 		}
 	}
 }
+
+// --- #335: server TLS is verified from the postmaster, not from the rendered config ---
+
+// tlsExec answers `SHOW ssl` with a scripted value (or a failure) and counts the calls, so a
+// test can assert both the verdict and that the throttle actually throttles.
+type tlsExec struct {
+	ssl   string
+	err   error
+	calls int
+}
+
+func (e *tlsExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
+	if name == "psql" && strings.Contains(strings.Join(args, " "), "SHOW ssl") {
+		e.calls++
+		return e.ssl, e.err
+	}
+	return "", nil
+}
+
+func newTLSTestAgent(ex *tlsExec, tlsEnabled bool) *agent {
+	return &agent{
+		cfg: &config.Config{
+			PodName: "pg-0", Namespace: "ns", TLSEnabled: tlsEnabled,
+			RepmgrUser: "repmgr", RepmgrDB: "repmgr", RepmgrPassword: "pw",
+		},
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
+		metr:   observe.New(),
+	}
+}
+
+// The whole point of #335 is that a server reporting `ssl = off` while the operator asked for
+// TLS must become loud. The gauge is the channel an alert can page on.
+func TestVerifyTLSActiveRaisesTheGaugeOnPlaintext(t *testing.T) {
+	a := newTLSTestAgent(&tlsExec{ssl: "off"}, true)
+	a.verifyTLSActive(context.Background())
+	if !strings.Contains(scrapeMetrics(t, a), "pg_ha_agent_tls_inactive 1") {
+		t.Errorf("a plaintext server must publish tls_inactive=1:\n%s", scrapeMetrics(t, a))
+	}
+}
+
+func TestVerifyTLSActiveClearsTheGaugeWhenTLSIsOn(t *testing.T) {
+	a := newTLSTestAgent(&tlsExec{ssl: "on"}, true)
+	a.verifyTLSActive(context.Background())
+	if !strings.Contains(scrapeMetrics(t, a), "pg_ha_agent_tls_inactive 0") {
+		t.Errorf("a TLS server must publish tls_inactive=0:\n%s", scrapeMetrics(t, a))
+	}
+}
+
+// A failed query is uncertainty, not evidence of plaintext. Treating it as evidence would fire
+// the alarm every time the server is busy or mid-restart, which is how an alarm stops meaning
+// anything -- so the previous verdict must survive it.
+func TestVerifyTLSActiveKeepsThePreviousVerdictOnAQueryFailure(t *testing.T) {
+	ex := &tlsExec{ssl: "off"}
+	a := newTLSTestAgent(ex, true)
+	a.verifyTLSActive(context.Background())
+	ex.err = errors.New("server closed the connection")
+	a.tlsCheckedAt = time.Time{} // re-arm the throttle
+	a.verifyTLSActive(context.Background())
+	if !strings.Contains(scrapeMetrics(t, a), "pg_ha_agent_tls_inactive 1") {
+		t.Errorf("an unreachable server must not clear a standing TLS alarm:\n%s", scrapeMetrics(t, a))
+	}
+}
+
+// Nothing at all when TLS was never requested: no probe, and a gauge that stays 0 so a
+// release without TLS cannot contribute to an alert that aggregates across the fleet.
+func TestVerifyTLSActiveIsInertWhenTLSWasNeverRequested(t *testing.T) {
+	ex := &tlsExec{ssl: "off"}
+	a := newTLSTestAgent(ex, false)
+	a.verifyTLSActive(context.Background())
+	if ex.calls != 0 {
+		t.Errorf("calls = %d, want no probe at all when postgresql.tls.enabled is unset", ex.calls)
+	}
+	if !strings.Contains(scrapeMetrics(t, a), "pg_ha_agent_tls_inactive 0") {
+		t.Errorf("tls_inactive must stay 0 when TLS was never requested:\n%s", scrapeMetrics(t, a))
+	}
+}
+
+// tick() calls this on every reconcile (5s on chart defaults); the throttle is what keeps that
+// from being a psql per tick forever, for a value that only changes across a reload.
+func TestVerifyTLSActiveThrottlesRepeatedProbes(t *testing.T) {
+	ex := &tlsExec{ssl: "on"}
+	a := newTLSTestAgent(ex, true)
+	for i := 0; i < 5; i++ {
+		a.verifyTLSActive(context.Background())
+	}
+	if ex.calls != 1 {
+		t.Errorf("calls = %d, want 1 within one tlsVerifyInterval", ex.calls)
+	}
+	a.tlsCheckedAt = time.Now().Add(-2 * tlsVerifyInterval)
+	a.verifyTLSActive(context.Background())
+	if ex.calls != 2 {
+		t.Errorf("calls = %d, want a re-probe once the interval has elapsed", ex.calls)
+	}
+}

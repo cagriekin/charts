@@ -648,6 +648,42 @@
 
 ### Fixed
 
+- **Requested server TLS is now verified against the running server, and fails closed
+  (#335).** `postgresql.tls.enabled=true` could leave a pod serving plaintext with nothing
+  reporting an error: the release goes Ready, the certificate is mounted, the ConfigMap
+  contains `ssl = on`, and `SHOW ssl` returns `off`. Every signal an operator can read
+  describes the configuration that was *rendered*; none of them describe the one the
+  postmaster actually *loaded*. The reported trigger was a first-boot pod whose
+  `postgresql.conf` never picked up the chart's `conf.d` include, but an `ssl` set through
+  `postgresql.configuration`, or an `ALTER SYSTEM`, produces the identical silent outcome --
+  so this checks the outcome rather than any one of the inputs.
+
+  The readiness probe now asks the server itself and refuses readiness on a definitive
+  `ssl = off`, in **both** agent and standalone mode. A not-ready pod leaves the
+  client-facing Services, so nothing keeps talking plaintext to it, and a `RollingUpdate`
+  stalls there rather than rolling the whole cluster into the broken state; replication and
+  the agent's peer probes are unaffected, because the headless Service publishes not-ready
+  addresses. An *unanswerable* probe is deliberately treated as uncertainty rather than as
+  evidence of plaintext -- failing on it would turn a transient blip into a write outage.
+
+  In agent mode the agent additionally verifies this from the postmaster once a minute and
+  publishes **`pg_ha_agent_tls_inactive`** (`0`/`1` gauge, always `0` where TLS was never
+  requested) plus an Error naming the cause and the fix, so the condition is alertable
+  instead of being discovered from a client-side `server refused TLS connection`. A
+  **`PGHAServerTLSInactive`** rule (critical, `for: 5m`) ships with
+  `ha.agent.monitoring.prometheusRule`, rendered only where TLS was requested. It carries
+  the new `TLS_ENABLED` env var, which is the operator's intent: it cannot be inferred from
+  `TLS_REQUIRE_SSL`, whose `false` is indistinguishable from absent.
+
+  Detection only, on purpose: the agent does **not** rewrite the `conf.d` include at runtime.
+  Three writers already converge that line (the entrypoint at `initdb`, `finishInitdbNative`
+  on a fresh native install, and the `setup-config` init container on every later boot), and
+  appending `include_dir` to a running native node would place it after the agent's own
+  `include`, handing an operator-declared `wal_log_hints`/`hot_standby` precedence over the
+  agent's until the next config generation.
+
+  No rendered change where `postgresql.tls.enabled` is unset.
+
 - **`postgresql.extraVolumes` may no longer reuse `agent-control-tls` or
   `pgbackrest-bootstrap-script` (#298 review).** Both are real volumes in the postgresql pod,
   but neither was in `pg.validateExtraPassthrough`'s reserved list -- so

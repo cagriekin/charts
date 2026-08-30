@@ -554,3 +554,32 @@ func TestStringSummarisesControlWithoutCNs(t *testing.T) {
 		t.Errorf("String() should summarise the allowlist by count, not spell out identities: %s", s)
 	}
 }
+
+// #335: the agent needs the operator's TLS INTENT, and it cannot be derived from
+// TLS_REQUIRE_SSL -- `require` defaults to false, so an absent variable and a deliberate
+// `require: false` are indistinguishable. TLS_ENABLED is that separate signal, and it must
+// default to off so a release without TLS behaves exactly as it did before.
+func TestLoadReadsTLSEnabledIndependentlyOfRequire(t *testing.T) {
+	e := fullEnv()
+	e["TLS_ENABLED"] = "true"
+	c, err := Load(getter(e))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !c.TLSEnabled {
+		t.Error("TLS_ENABLED=true must set TLSEnabled")
+	}
+	if c.TLSRequireSSL {
+		t.Error("TLSRequireSSL must stay false: TLS being on says nothing about clients being forced onto it")
+	}
+}
+
+func TestLoadDefaultsTLSEnabledOff(t *testing.T) {
+	c, err := Load(getter(fullEnv()))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.TLSEnabled {
+		t.Error("TLSEnabled must default to false when the chart mounted no server TLS")
+	}
+}

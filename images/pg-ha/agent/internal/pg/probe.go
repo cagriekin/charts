@@ -627,3 +627,30 @@ func (p *Prober) SetSynchronizedStandbySlots(ctx context.Context, ci ConnInfo, s
 	}
 	return nil
 }
+
+// SSLActive reports what the RUNNING postmaster answers for `SHOW ssl`, which is the only
+// ground truth for "is this server actually speaking TLS" (#335).
+//
+// Every other signal an operator has -- the rendered ConfigMap, the mounted Secret, the values
+// file -- describes INTENT, and #335 is precisely the case where intent and reality diverge in
+// silence: the conf.d include never reached postgresql.conf, so `ssl = on` was written, mounted,
+// and never read. `SHOW` reports the value the postmaster is running with, after every include,
+// ALTER SYSTEM and command-line override, so it cannot be fooled by any of them.
+//
+// A non-boolean answer is reported as an error rather than as false: this drives a fail-closed
+// readiness/alerting path, and "the query did not work" must not be indistinguishable from
+// "TLS is off" -- the caller retries the former and escalates the latter.
+func (p *Prober) SSLActive(ctx context.Context, ci ConnInfo) (bool, error) {
+	out, err := p.psql(ctx, ci, "SHOW ssl;")
+	if err != nil {
+		return false, err
+	}
+	switch strings.TrimSpace(out) {
+	case "on":
+		return true, nil
+	case "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("unexpected `SHOW ssl` result %q", out)
+	}
+}

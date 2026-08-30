@@ -205,6 +205,44 @@ wait_for_pods_ready "${NS3}" "app.kubernetes.io/component=postgresql" 1 300
 ssl_s=$(pg_exec "${NS3}" "${F3}-0" "SHOW ssl" "testuser" "testdb" 2>/dev/null || echo "")
 assert_eq "#110 standalone: server TLS works with no repmgr (ssl = on)" "on" "${ssl_s}"
 
+# ======================================================================
+# #335: a server that stops speaking TLS must stop serving clients.
+# ======================================================================
+# The reported failure was silent -- Ready pod, mounted certificate, `ssl = off`. The remedy
+# is a readiness probe that asks the server itself, so this drives the server to the broken
+# state and asserts the pod actually leaves the Services. Run here, on the STANDALONE release:
+# it is a single pod with no replication and no `require`, so turning ssl off cannot wedge a
+# cluster mid-suite the way it would on the HA pair above (there, `require` renders hostssl
+# rules that would reject the standby's own replication connection). ALTER SYSTEM + reload,
+# not an image or values change, because `ssl` is a sighup parameter -- no restart, and the
+# same one-line undo puts it back.
+SA_POD="${F3}-0"
+pod_ready() {
+  kubectl get pod "$1" -n "$2" -o jsonpath='{.status.containerStatuses[?(@.name=="postgresql")].ready}' 2>/dev/null || echo ""
+}
+kubectl exec -n "${NS3}" "${SA_POD}" -c postgresql -- \
+  psql -U postgres -d postgres -c "ALTER SYSTEM SET ssl = off" >/dev/null 2>&1 || true
+kubectl exec -n "${NS3}" "${SA_POD}" -c postgresql -- \
+  psql -U postgres -d postgres -c "SELECT pg_reload_conf()" >/dev/null 2>&1 || true
+# periodSeconds 10 x failureThreshold 6 on chart defaults, so allow generously past 60s.
+went_notready=false; e=0
+while [[ ${e} -lt 150 ]]; do
+  [[ "$(pod_ready "${SA_POD}" "${NS3}")" == "false" ]] && { went_notready=true; break; }
+  sleep 5; e=$((e + 5))
+done
+assert_eq "#335: a server serving plaintext is taken out of the Services" "true" "${went_notready}"
+# ...and recovers on its own once TLS is back, so the gate cannot strand a repaired cluster.
+kubectl exec -n "${NS3}" "${SA_POD}" -c postgresql -- \
+  psql -U postgres -d postgres -c "ALTER SYSTEM RESET ssl" >/dev/null 2>&1 || true
+kubectl exec -n "${NS3}" "${SA_POD}" -c postgresql -- \
+  psql -U postgres -d postgres -c "SELECT pg_reload_conf()" >/dev/null 2>&1 || true
+recovered=false; e=0
+while [[ ${e} -lt 120 ]]; do
+  [[ "$(pod_ready "${SA_POD}" "${NS3}")" == "true" ]] && { recovered=true; break; }
+  sleep 5; e=$((e + 5))
+done
+assert_eq "#335: readiness returns once the server speaks TLS again" "true" "${recovered}"
+
 # Coverage boundary (logged, not silently skipped): pgpool.tls.backendClientCert is
 # render-verified (PGSSLCERT/PGSSLKEY env + staged cert) but not exercised end-to-end
 # here -- routing a NON-exempt user through PGPool would need that user in pgpool's

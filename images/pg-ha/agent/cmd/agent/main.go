@@ -242,6 +242,12 @@ type agent struct {
 	pausedLatched       bool
 	markerTamperLatched bool
 
+	// Server-TLS verification state (#335), same single-goroutine ownership as the latches
+	// above. tlsCheckedAt throttles the probe to tlsVerifyInterval rather than running it on
+	// every tick, and tlsInactiveLatched keeps the Error to the transition.
+	tlsCheckedAt       time.Time
+	tlsInactiveLatched bool
+
 	// Control API (#276), present only when it is enabled. intents carries node-local
 	// operations from HTTP handlers to the reconcile goroutine (which owns the
 	// postmaster); snap is the per-tick state the API serves, so a request costs no
@@ -594,6 +600,13 @@ func (a *agent) tick(ctx context.Context) {
 		a.servingRW.Store(!obs.Local.InRecovery)
 	case !obs.LocalProcessAlive:
 		a.servingRW.Store(false) // process gone: nothing left to fence
+	}
+	// Verify server TLS from the postmaster itself while it is answering (#335). Gated on
+	// Running because `SHOW ssl` needs a connection: on a cloning or recovering node the probe
+	// would fail for a reason that has nothing to do with TLS, and the throttle would then
+	// spend its interval on a question that could not be asked.
+	if obs.Local.Running {
+		a.verifyTLSActive(ctx)
 	}
 	a.publishStatus(ctx, obs.Local)
 	dec := reconcile.Decide(obs)
@@ -2466,6 +2479,75 @@ func (a *agent) assertPreloadedLibsPresent() error {
 		}
 	}
 	return nil
+}
+
+// tlsVerifyInterval throttles the #335 `SHOW ssl` probe. Not every tick: this is a
+// configuration property that changes only across a reload or a restart, so a per-tick psql
+// (5s on chart defaults) would buy nothing and add a connection to every tick forever. Not
+// once-per-boot either -- the gauge must be able to clear on its own after an operator fixes
+// the config and reloads, and to re-arm if someone turns `ssl` off underneath a running server.
+const tlsVerifyInterval = time.Minute
+
+// verifyTLSActive alarms when the operator asked for server TLS and the RUNNING postmaster is
+// serving plaintext (#335).
+//
+// The failure this exists for is silent by construction: the chart renders `ssl = on` into the
+// conf.d ConfigMap, mounts the certificate Secret, and the release goes Ready -- every signal an
+// operator can read says TLS is on, while `SHOW ssl` says off and clients connect in the clear.
+// #335 reported it as a missing conf.d include on a first-boot pod, but the include is only one
+// of the ways to get here (an operator-declared `ssl` in postgresql.configuration, ALTER SYSTEM,
+// an unreadable key) and the cost is identical in all of them. So this checks the OUTCOME, from
+// the postmaster itself, rather than any of the inputs.
+//
+// Deliberately detection-only: it does NOT try to repair the include. Three writers already
+// converge that line -- the entrypoint at initdb (both mechanisms), finishInitdbNative on a
+// fresh native install, and the setup-config init container on every later boot -- so a missing
+// include is repaired by the next pod start anyway, and appending `include_dir` here would put
+// it AFTER the agent's own `include 'pg-ha-agent.conf'` on a running native node, silently
+// handing an operator's wal_log_hints/hot_standby precedence over the agent's until the next
+// GenerateConfig repositions it (the exact inversion Native.ensureInclude exists to prevent).
+// Repairing the one cause that self-heals, at the price of a real regression in the others, is
+// a bad trade; being loud is the fix #335 actually asks for.
+//
+// The loudness has three channels, because each reaches a different reader: the gauge
+// (pg_ha_agent_tls_inactive) is what an alert can page on, the Error log names the cause and the
+// remedy for whoever opens `kubectl logs`, and the readiness probe -- rendered by the chart, not
+// here -- takes the pod out of the client-facing Services so nothing keeps talking plaintext to
+// it. The headless Service sets publishNotReadyAddresses, so replication and the agent's own
+// peer probes are unaffected by that.
+func (a *agent) verifyTLSActive(ctx context.Context) {
+	if !a.cfg.TLSEnabled {
+		return
+	}
+	now := time.Now()
+	if !a.tlsCheckedAt.IsZero() && now.Sub(a.tlsCheckedAt) < tlsVerifyInterval {
+		return
+	}
+	a.tlsCheckedAt = now
+	vctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	on, err := a.prober.SSLActive(vctx, a.selfConn())
+	if err != nil {
+		// A failed query is NOT evidence of plaintext, and treating it as such would raise a
+		// TLS alarm every time the server is merely busy or mid-restart -- the alarm would then
+		// mean nothing when it mattered. Leave the gauge where it is and retry next interval.
+		a.log.Warn("could not verify that server TLS is active; leaving the previous verdict in place", "err", err)
+		return
+	}
+	a.metr.SetTLSInactive(!on)
+	switch {
+	case on && a.tlsInactiveLatched:
+		a.tlsInactiveLatched = false
+		a.log.Info("server TLS is active again", "ssl", "on")
+	case !on && !a.tlsInactiveLatched:
+		a.tlsInactiveLatched = true
+		a.log.Error("postgresql.tls.enabled is set but this server reports `ssl = off` -- clients are being served in PLAINTEXT. "+
+			"The usual cause is that PGDATA/postgresql.conf carries no `include_dir` for the chart's conf.d, so tls.conf was never read (#335); "+
+			"an `ssl` set in postgresql.configuration or via ALTER SYSTEM does the same. "+
+			"Fix: check `SHOW config_file` and that the file ends with include_dir = '"+confdDir+"', then reload -- `ssl` is a sighup parameter. "+
+			"This pod is failing its readiness probe until then, so it serves no client traffic",
+			"confd", confdDir)
+	}
 }
 
 // ensurePrimaryConninfoDBName patches dbname=<repmgr db> into primary_conninfo in

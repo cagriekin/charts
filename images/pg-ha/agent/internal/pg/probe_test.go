@@ -712,3 +712,40 @@ func TestReplicationTopologyExcludesLogicalSenders(t *testing.T) {
 		t.Errorf("unexpected parse: %+v", rows)
 	}
 }
+
+// #335: SSLActive must report what the RUNNING postmaster answers, and must distinguish
+// "off" from "the query did not work" -- the caller escalates the first and retries the
+// second, so collapsing them would either page on a busy server or stay silent on plaintext.
+func TestSSLActiveReadsShowSSL(t *testing.T) {
+	for _, c := range []struct {
+		ret  string
+		want bool
+	}{{"on", true}, {"off", false}, {" on \n", true}} {
+		e := &sqlCaptureExec{ret: c.ret}
+		p := &Prober{Exec: e}
+		got, err := p.SSLActive(context.Background(), ConnInfo{Host: "x"})
+		if err != nil {
+			t.Fatalf("ret %q: err = %v", c.ret, err)
+		}
+		if got != c.want {
+			t.Errorf("ret %q: SSLActive = %v, want %v", c.ret, got, c.want)
+		}
+		if !strings.Contains(e.lastSQL, "SHOW ssl") {
+			t.Errorf("ret %q: sql = %q, want a SHOW ssl", c.ret, e.lastSQL)
+		}
+	}
+}
+
+func TestSSLActiveRejectsANonBooleanAnswer(t *testing.T) {
+	p := &Prober{Exec: &sqlCaptureExec{ret: "ERROR"}}
+	if _, err := p.SSLActive(context.Background(), ConnInfo{Host: "x"}); err == nil {
+		t.Fatal("a non-boolean `SHOW ssl` answer must be an error, not a silent false")
+	}
+}
+
+func TestSSLActivePropagatesAQueryFailure(t *testing.T) {
+	p := &Prober{Exec: &fakeExec{err: errors.New("connection refused")}}
+	if _, err := p.SSLActive(context.Background(), ConnInfo{Host: "x"}); err == nil {
+		t.Fatal("an unreachable server must be an error, not a report of plaintext")
+	}
+}

@@ -28,6 +28,12 @@ type Metrics struct {
 	// (#298 security review): an implausible/unparseable highwater freezes promotions
 	// via unsafeToServe, so this makes a tamper-induced write outage alertable.
 	markerTamper atomic.Int64
+	// tlsInactive is 1 while the operator asked for server TLS and the RUNNING postmaster
+	// reports `ssl = off` (#335). A gauge, not a counter: this is a CURRENT state an operator
+	// must be paged on and see clear again, and its whole reason to exist is that the broken
+	// state is otherwise silent -- the ConfigMap, the mounted Secret and the values file all
+	// still say TLS is on.
+	tlsInactive atomic.Int64
 	// Control API (#276). Counted here so the control plane is observable from the
 	// SAME read-only surface Prometheus already scrapes -- a denied or failing control
 	// call must be alertable without opening the control port to the scraper.
@@ -90,15 +96,18 @@ func b2i(b bool) int64 {
 	return 0
 }
 
-func (m *Metrics) SetLeader(v bool)   { m.isLeader.Store(b2i(v)) }
-func (m *Metrics) SetPaused(v bool)   { m.isPaused.Store(b2i(v)) }
-func (m *Metrics) IncRenewFailure()   { m.renewFailures.Add(1) }
-func (m *Metrics) IncPromotion()      { m.promotions.Add(1) }
-func (m *Metrics) IncDemote()         { m.demotes.Add(1) }
-func (m *Metrics) IncFence()          { m.fences.Add(1) }
-func (m *Metrics) IncReconcileError() { m.reconcileErrors.Add(1) }
-func (m *Metrics) IncRecoveryStart()  { m.recoveryStarts.Add(1) }
-func (m *Metrics) IncMarkerTamper()   { m.markerTamper.Add(1) }
+func (m *Metrics) SetLeader(v bool) { m.isLeader.Store(b2i(v)) }
+func (m *Metrics) SetPaused(v bool) { m.isPaused.Store(b2i(v)) }
+
+// SetTLSInactive publishes whether requested server TLS is actually absent (#335).
+func (m *Metrics) SetTLSInactive(v bool) { m.tlsInactive.Store(b2i(v)) }
+func (m *Metrics) IncRenewFailure()      { m.renewFailures.Add(1) }
+func (m *Metrics) IncPromotion()         { m.promotions.Add(1) }
+func (m *Metrics) IncDemote()            { m.demotes.Add(1) }
+func (m *Metrics) IncFence()             { m.fences.Add(1) }
+func (m *Metrics) IncReconcileError()    { m.reconcileErrors.Add(1) }
+func (m *Metrics) IncRecoveryStart()     { m.recoveryStarts.Add(1) }
+func (m *Metrics) IncMarkerTamper()      { m.markerTamper.Add(1) }
 
 // Control-API counters. IncControlRequest counts every authenticated request,
 // IncControlRejected every one refused by authn/authz, IncControlIntent every
@@ -202,6 +211,7 @@ func (m *Metrics) write(w io.Writer) {
 		{"pg_ha_agent_reconcile_errors_total", "Reconcile-loop errors.", "counter", m.reconcileErrors.Load()},
 		{"pg_ha_agent_recovery_starts_total", "Recovery-mode (read-only WAL replay) starts at cold boot.", "counter", m.recoveryStarts.Load()},
 		{"pg_ha_agent_marker_tamper_suspected_total", "Ticks on which the primary marker looked forged or corrupt (implausible/unparseable highwater); a non-zero rate means automatic promotion may be frozen.", "counter", m.markerTamper.Load()},
+		{"pg_ha_agent_tls_inactive", "1 while postgresql.tls.enabled is set and the running postmaster reports `ssl = off` -- clients are being served in plaintext. Always 0 when TLS was never requested.", "gauge", m.tlsInactive.Load()},
 		{"pg_ha_agent_control_requests_total", "Authenticated control-API requests.", "counter", m.controlRequests.Load()},
 		{"pg_ha_agent_control_rejected_total", "Control-API requests refused by authentication or authorization.", "counter", m.controlRejected.Load()},
 		{"pg_ha_agent_control_intents_total", "Node-local control-API operations handed to the reconcile loop.", "counter", m.controlIntents.Load()},

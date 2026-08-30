@@ -48,6 +48,7 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `DCS_BACKEND` | enum | yes | `ha.agent.dcs.backend` (`kubernetes`/`etcd`) | agent (leadership store) |
 | `POD_CIDR` | CIDR | yes | `ha.agent.podCidr` (`10.0.0.0/8`) | agent (hardened pg_hba: trusted pod network) |
 | `POSTGRESQL_PGHBA` | newline-list | no | `postgresql.pgHba` (joined) | agent (user pg_hba rules, above the catch-alls) |
+| `TLS_ENABLED` | boolean | no | `"true"` when `postgresql.tls.enabled` (emitted only then) | agent (#335: verifies from the running postmaster that `SHOW ssl` is actually `on`, and publishes `pg_ha_agent_tls_inactive` when it is not) |
 | `CASCADE_REPLICATION` | boolean | no | `ha.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
 | `SYNC_REPLICATION_SLOTS` | boolean | no | `ha.agent.syncReplicationSlots` (`false`) | agent (logical failover slot sync, #308; emitted only when true) |
 | ~~`USE_REPLICATION_SLOTS`~~ | — | — | **removed in 2.0.0 (#290)** | Nothing. It configured the init container's `repmgr standby clone`; the agent owns cloning and always uses a slot |

@@ -3768,6 +3768,44 @@ tls_req_noenable_rc=0
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set postgresql.tls.require=true >/dev/null 2>&1 || tls_req_noenable_rc=$?
 assert_eq "#110 C2: require without tls.enabled fails fast" "1" "$([ "${tls_req_noenable_rc}" -ne 0 ] && echo 1 || echo 0)"
+
+# --- #335: requested TLS is verified against the RUNNING server, and fails closed ---
+# The reported failure was a server that served plaintext while the ConfigMap, the mounted
+# Secret and the values file all said TLS was on. Both halves of the remedy are render-gated
+# on tls.enabled, so a release without TLS must be byte-identical to before.
+assert_not_contains "#335 off: no TLS_ENABLED env" "${tls_off}" "TLS_ENABLED"
+assert_not_contains "#335 off: readiness does not query ssl" "${tls_off}" "SHOW ssl"
+assert_contains "#335: TLS_ENABLED env present when tls.enabled" "${tls_sts}" 'name: TLS_ENABLED
+              value: "true"'
+assert_contains "#335: readiness asserts the running server reports ssl" "${tls_sts}" 'SHOW ssl'
+assert_contains "#335: readiness refuses rather than serving plaintext" "${tls_sts}" "refusing readiness rather than serving clients in plaintext"
+# Only a DEFINITIVE off fails: an empty answer is a psql that did not run, and failing on it
+# would turn a transient blip into a write outage.
+assert_contains "#335: readiness fails only on a definitive off" "${tls_sts}" '"SHOW ssl" 2>/dev/null)" = "off" ]'
+# Standalone has no agent, so the readiness gate is the ONLY channel there -- it must render
+# in that branch too, which previously carried a bare one-line pg_isready.
+tls_sa_ready=$(helm template test-pg "${CHART_DIR}" \
+  --set ha.enabled=false --set postgresql.replicaCount=0 \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#335 standalone: readiness asserts ssl" "${tls_sa_ready}" "SHOW ssl"
+assert_contains "#335 standalone: readiness still checks pg_isready first" "${tls_sa_ready}" 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 || exit 1'
+sa_notls=$(helm template test-pg "${CHART_DIR}" \
+  --set ha.enabled=false --set postgresql.replicaCount=0 \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_not_contains "#335 standalone off: readiness unchanged" "${sa_notls}" "SHOW ssl"
+# The alert is the channel that makes the gauge useful, and it renders only where TLS was
+# asked for -- an inert rule is still a rule an operator has to reason about.
+tls_rule=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --set ha.agent.monitoring.prometheusRule.enabled=true \
+  --show-only templates/agent-prometheusrule.yaml 2>&1)
+assert_contains "#335: PGHAServerTLSInactive alert renders under tls.enabled" "${tls_rule}" "alert: PGHAServerTLSInactive"
+assert_contains "#335: the alert fires on the agent gauge" "${tls_rule}" "pg_ha_agent_tls_inactive"
+notls_rule=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set ha.agent.monitoring.prometheusRule.enabled=true \
+  --show-only templates/agent-prometheusrule.yaml 2>&1)
+assert_not_contains "#335: no TLS alert where TLS was never requested" "${notls_rule}" "PGHAServerTLSInactive"
 # fail-fast: require/mTLS need the agent-assembled pg_hba, so standalone rejects them
 # (the stock image's md5-fallback line would bypass a hostssl rule).
 tls_standalone_rc=0

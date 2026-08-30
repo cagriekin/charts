@@ -126,4 +126,18 @@ spec:
           annotations:
             summary: "pg-ha-agent left in maintenance mode ({{ include "pg.fullname" . }})"
             description: "Maintenance mode (pg-ha/pause) has been active for 1h -- automatic failover is suspended. Resume with: kubectl annotate configmap {{ include "pg.fullname" . }}-primary pg-ha/pause-"
+{{- if .Values.postgresql.tls.enabled }}
+        {{- /* #335: only rendered where TLS was actually requested. The gauge is 0 on a
+               release without TLS, so the alert would be inert there anyway -- but an
+               inert alert in a rule file is a thing an operator has to reason about, and
+               this one's whole purpose is to remove exactly that kind of noise. */}}
+        - alert: PGHAServerTLSInactive
+          expr: max(pg_ha_agent_tls_inactive{ {{ $m }} }) == 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "PostgreSQL is serving plaintext although TLS is enabled ({{ include "pg.fullname" . }})"
+            description: "postgresql.tls.enabled is set, but the running postmaster reports ssl = off, so clients are connecting in the clear -- while the rendered ConfigMap, the mounted Secret and the values file all still say TLS is on (#335). The pod is failing its readiness probe, so it serves no client traffic until this clears. Check with: kubectl exec <pod> -c postgresql -- psql -U postgres -tAc 'SHOW ssl'; then confirm PGDATA/postgresql.conf ends with include_dir = '/etc/postgresql/conf.d' (SHOW config_file gives the path) and that nothing in postgresql.configuration or ALTER SYSTEM sets ssl. ssl is a sighup parameter, so a reload is enough once the config is right."
+{{- end }}
 {{- end }}

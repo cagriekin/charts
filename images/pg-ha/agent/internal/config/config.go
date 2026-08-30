@@ -73,6 +73,13 @@ type Config struct {
 	PgHbaRules    []string // POSTGRESQL_PGHBA: user rules, placed above the catch-alls
 
 	// Client TLS pg_hba (issue #110). All optional; default off (TLS disabled).
+	//
+	// TLSEnabled is the operator's INTENT (postgresql.tls.enabled), carried separately from
+	// TLSRequireSSL because the two answer different questions and #335 needs the first one.
+	// Presence of TLS_REQUIRE_SSL cannot stand in for it: `require` defaults to false, so an
+	// absent variable and a deliberate `require: false` produce the identical value, and the
+	// agent could not tell "TLS is off" from "TLS is on but not mandatory for clients".
+	TLSEnabled        bool   // TLS_ENABLED: the chart mounted server TLS; `ssl` must end up on
 	TLSRequireSSL     bool   // TLS_REQUIRE_SSL: peer-CIDR client rule -> hostssl
 	TLSClientCertAuth bool   // TLS_CLIENT_CERT_AUTH: app users need a client cert (mTLS)
 	PostgresUser      string // POSTGRES_USER: superuser, exempt from clientcert
@@ -269,6 +276,7 @@ func Load(get func(string) string) (*Config, error) {
 
 	// Client TLS pg_hba inputs (issue #110). Optional -- absent/empty means off, so
 	// existing installs are unchanged; no "missing" error.
+	c.TLSEnabled = boolEnv(get("TLS_ENABLED"))
 	c.TLSRequireSSL = boolEnv(get("TLS_REQUIRE_SSL"))
 	c.TLSClientCertAuth = boolEnv(get("TLS_CLIENT_CERT_AUTH"))
 	c.PostgresUser = strings.TrimSpace(get("POSTGRES_USER"))

@@ -883,6 +883,14 @@ spec:
             {{- /* Client TLS pg_hba (#110): the agent emits hostssl on the pod CIDR
                    when require/clientCertAuth, exempting the internal service users
                    (repmgr/postgres/monitoring) from the client-cert requirement. */}}
+            {{- /* TLS_ENABLED carries the INTENT, which the agent cannot infer from the two
+                   variables below: `require` defaults to false, so an absent TLS_REQUIRE_SSL and
+                   a deliberate `require: false` are the same value. The agent needs the intent
+                   to run its #335 check -- verify from the postmaster (`SHOW ssl`) that the
+                   server really is speaking TLS, because every other signal an operator can
+                   read describes the config that was rendered, not the one that was loaded. */}}
+            - name: TLS_ENABLED
+              value: "true"
             - name: TLS_REQUIRE_SSL
               value: {{ .Values.postgresql.tls.require | quote }}
             - name: TLS_CLIENT_CERT_AUTH
@@ -1239,6 +1247,27 @@ spec:
                 - -c
                 - |
                   pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 || exit 1
+                  {{- if .Values.postgresql.tls.enabled }}
+                  {{- /* Fail closed when requested server TLS is not actually on (#335).
+                         `SHOW ssl` is the only signal that reports what the postmaster
+                         LOADED; the ConfigMap, the mounted Secret and the values file all
+                         describe what was rendered, and #335 is exactly the case where the
+                         two disagree in silence -- the release goes Ready, the certificate
+                         is mounted, and the server accepts only plaintext.
+                         A NotReady pod leaves the client-facing Services, so nothing keeps
+                         talking plaintext to it, while the headless Service
+                         (publishNotReadyAddresses) keeps replication and the agent's peer
+                         probes working -- and a RollingUpdate stalls here rather than
+                         rolling the whole cluster into the broken state.
+                         Only a DEFINITIVE "off" fails. An empty answer is a psql that did
+                         not run, which is uncertainty rather than evidence of plaintext;
+                         failing on it would turn a transient blip into a write outage. The
+                         agent alarms on that case separately (pg_ha_agent_tls_inactive). */}}
+                  if [ "$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SHOW ssl" 2>/dev/null)" = "off" ]; then
+                    echo "postgresql.tls.enabled is set but this server reports ssl=off: refusing readiness rather than serving clients in plaintext (#335)" >&2
+                    exit 1
+                  fi
+{{- end }}
                   rec=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()" 2>/dev/null)
                   if [ "$rec" = "f" ]; then exit 0; fi
                   if [ "$rec" = "t" ]; then
@@ -1251,7 +1280,30 @@ spec:
               command:
                 - /bin/bash
                 - -c
-                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+                - |
+                  pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 || exit 1
+                  {{- if .Values.postgresql.tls.enabled }}
+                  {{- /* Fail closed when requested server TLS is not actually on (#335).
+                         `SHOW ssl` is the only signal that reports what the postmaster
+                         LOADED; the ConfigMap, the mounted Secret and the values file all
+                         describe what was rendered, and #335 is exactly the case where the
+                         two disagree in silence -- the release goes Ready, the certificate
+                         is mounted, and the server accepts only plaintext.
+                         A NotReady pod leaves the client-facing Services, so nothing keeps
+                         talking plaintext to it, while the headless Service
+                         (publishNotReadyAddresses) keeps replication and the agent's peer
+                         probes working -- and a RollingUpdate stalls here rather than
+                         rolling the whole cluster into the broken state.
+                         Only a DEFINITIVE "off" fails. An empty answer is a psql that did
+                         not run, which is uncertainty rather than evidence of plaintext;
+                         failing on it would turn a transient blip into a write outage. The
+                         agent alarms on that case separately (pg_ha_agent_tls_inactive). */}}
+                  if [ "$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SHOW ssl" 2>/dev/null)" = "off" ]; then
+                    echo "postgresql.tls.enabled is set but this server reports ssl=off: refusing readiness rather than serving clients in plaintext (#335)" >&2
+                    exit 1
+                  fi
+{{- end }}
+                  exit 0
 {{- end }}
             initialDelaySeconds: {{ .Values.postgresql.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.postgresql.readinessProbe.periodSeconds }}

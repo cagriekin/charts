@@ -1690,6 +1690,21 @@ superuser, and the monitoring user) are **exempted** from the client-cert requir
 the HA agent, the exporter, and PGPool keep working; under `require` those
 components reach the server over TLS via libpq's default negotiation.
 
+**TLS is verified against the running server, and fails closed (#335).** Every other signal
+an operator can read — the rendered ConfigMap, the mounted Secret, the values file — describes
+the configuration that was *rendered*, not the one the postmaster *loaded*, and a pod whose
+`postgresql.conf` never picked up the chart's `conf.d` include serves plaintext while all three
+still say TLS is on. So the readiness probe asks the server itself (`SHOW ssl`) and refuses
+readiness on a definitive `off`: the pod leaves the client-facing Services rather than serving
+anyone in the clear, a `RollingUpdate` stalls instead of rolling the whole cluster into that
+state, and replication is unaffected (the headless Service publishes not-ready addresses). In
+agent mode the agent additionally publishes `pg_ha_agent_tls_inactive` (a `0`/`1` gauge, always
+`0` when TLS was never requested) and logs the cause and the fix, so the condition is alertable
+rather than something you discover from a client error — `ha.agent.monitoring.prometheusRule`
+ships a `PGHAServerTLSInactive` rule for it. An unanswerable probe is treated as
+uncertainty, not as evidence of plaintext, so a transient blip cannot take the primary out of
+rotation.
+
 When `require` is on, the exporter and the PGPool backend must also speak TLS
 (`prometheusExporter.sslmode >= require`, `pgpool.tls.backendSslmode >= require`); under
 `clientCertAuth` with PGPool, PGPool needs a backend client cert
