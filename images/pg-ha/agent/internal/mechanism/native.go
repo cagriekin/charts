@@ -3,6 +3,7 @@ package mechanism
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -296,7 +297,18 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 // working standby's upstream on every restart, self-healing only after the next Follow (a
 // needless replication gap). Follow remains the only place that CHANGES it.
 func (n *Native) GenerateConfig(ctx context.Context, id NodeIdentity, o ConfigOpts) error {
-	return n.writeManagedConf(n.currentPrimaryConninfo())
+	cur, err := n.currentPrimaryConninfo()
+	if err != nil {
+		// Only ENOENT means "fresh node, or a primary that never followed". Any OTHER read
+		// error (EIO, EACCES, a half-mounted volume) used to collapse to the same "" and be
+		// COMMITTED: writeManagedConf then rewrote the fragment with no primary_conninfo and no
+		// primary_slot_name, so a working standby lost its upstream. boot() calls this before
+		// starting the postmaster, so the node comes up in recovery attached to nobody until
+		// the first Follow repoints it. Refusing preserves the documented contract that Follow
+		// is the only thing that CHANGES this value (#298 review).
+		return fmt.Errorf("native: generate config: could not read the managed fragment, so the current upstream cannot be preserved: %w", err)
+	}
+	return n.writeManagedConf(cur)
 }
 
 // hasField reports whether conninfo contains want as a whole space-separated token.
@@ -325,20 +337,26 @@ func stripApplicationName(conninfo string) string {
 
 // currentPrimaryConninfo reads back the primary_conninfo already on disk, or "" if the
 // managed fragment does not exist yet (fresh node) or carries none (primary).
-func (n *Native) currentPrimaryConninfo() string {
+//
+// A MISSING file is "" with no error -- that is the fresh-node case. Every other read error
+// is returned, because the caller commits this value and "" means "clear the upstream".
+func (n *Native) currentPrimaryConninfo() (string, error) {
 	b, err := os.ReadFile(n.managedConfPath())
+	if os.IsNotExist(err) {
+		return "", nil
+	}
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("native: read %s: %w", n.managedConfPath(), err)
 	}
 	const prefix = "primary_conninfo = '"
 	for _, line := range strings.Split(string(b), "\n") {
 		if rest, ok := strings.CutPrefix(line, prefix); ok {
 			if v, ok := strings.CutSuffix(rest, "'"); ok {
-				return unescapeSingleQuoted(v)
+				return unescapeSingleQuoted(v), nil
 			}
 		}
 	}
-	return ""
+	return "", nil
 }
 
 // Promote turns the local standby into a read-write primary on a new timeline.
@@ -510,7 +528,14 @@ func (n *Native) ensureSlotOnUpstream(ctx context.Context, source Conn) error {
 		"SELECT pg_create_physical_replication_slot('%s') "+
 			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '%s');",
 		n.SlotName, n.SlotName)
+	// --no-psqlrc, for the reason Prober.psql and RehashMd5User both pass it (#298 review):
+	// PSQLRC reaches this process through postgresql.extraEnv (childenv.Filtered strips only
+	// *PASSWORD*) and the agent writes into the postgres home, so ~/.psqlrc is reachable too.
+	// A startup file that errors makes psql exit non-zero on a query that in fact succeeded,
+	// and isDuplicateSlot does not match its message -- so an otherwise healthy clone aborts
+	// over the slot it was creating.
 	args := []string{
+		"--no-psqlrc",
 		"-h", source.Host,
 		"-p", strconv.Itoa(source.port()),
 		"-U", source.User,
@@ -584,13 +609,48 @@ func validSlotName(name string) error {
 // pg_rewind needs the source running and this node stopped; the caller has already demoted.
 // --restore-target-wal lets it fetch any WAL it needs via restore_command rather than
 // failing when the segment has already been recycled locally.
-func (n *Native) RejoinForceRewind(ctx context.Context, target Conn) error {
+func (n *Native) RejoinForceRewind(ctx context.Context, target Conn) (rerr error) {
 	if n.DataDir == "" {
 		return fmt.Errorf("native: DataDir not set")
 	}
 	if target.Host == "" {
 		return fmt.Errorf("native: rewind needs target.Host")
 	}
+	// standby.signal has to come OUT before pg_rewind runs, or the cheap rewind path is dead
+	// for every standby-originated rejoin (#298 review).
+	//
+	// rejoinOnto always demotes with fence=true, i.e. Immediate/SIGQUIT, so the target (this
+	// node's own PGDATA) is left in DB_IN_ARCHIVE_RECOVERY -- not cleanly shut down. Since
+	// PG13, pg_rewind handles that by running `postgres --single` on the target to finish
+	// crash recovery, unless --no-ensure-shutdown is passed (it is not, anywhere). And
+	// readRecoverySignalFile refuses single-user mode outright when standby.signal exists:
+	// `FATAL: standby mode is not supported by single-user servers`, so pg_rewind aborts with
+	// `postgres single-user mode in target cluster failed`.
+	//
+	// That message is neither a divergence nor a connection failure, so RejoinForward returned
+	// a plain error every time, rejoinOnto counted three of them and escalated to
+	// ReclonePreserving: a full base backup plus a .diverged.<ts> copy nothing reaps, on every
+	// ordinary "standby on an older timeline" rejoin. Deterministic, not racy.
+	//
+	// Restored on ANY error, including a rewind that worked but whose Follow did not. The
+	// asymmetry is Follow's own: standby.signal without primary_conninfo is a standby waiting
+	// for WAL, while its absence on a rewound directory is a SECOND read-write primary.
+	sig := filepath.Join(n.DataDir, "standby.signal")
+	hadSignal := false
+	if _, serr := os.Stat(sig); serr == nil {
+		if err := os.Remove(sig); err != nil {
+			return fmt.Errorf("native: rewind: could not move standby.signal aside for pg_rewind's crash-recovery step: %w", err)
+		}
+		hadSignal = true
+	}
+	defer func() {
+		if rerr == nil || !hadSignal {
+			return // success: Follow below re-created it
+		}
+		if werr := atomicfile.WriteString(sig, "", 0o600); werr != nil {
+			rerr = fmt.Errorf("%w (and could not restore standby.signal, so this node must not be started read-write: %v)", rerr, werr)
+		}
+	}()
 	base := []string{
 		"--target-pgdata=" + n.DataDir,
 		"--source-server=" + target.conninfo(),
@@ -674,7 +734,16 @@ func (n *Native) ReclonePreserving(ctx context.Context, source Conn) error {
 		return fmt.Errorf("native: reclone: clone failed, diverged data preserved at %s: %w", backup, err)
 	}
 	if err := os.RemoveAll(backup); err != nil {
-		return fmt.Errorf("native: reclone: clone ok but could not remove backup %s: %w", backup, err)
+		// Logged, NOT returned (#298 review). The node is fully re-cloned and configured by
+		// this point; only the cleanup of the preserved copy failed -- reachable on any store
+		// that silly-renames open files (NFS leaves .nfsXXXX entries, so RemoveAll returns
+		// ENOTEMPTY). rejoinOnto treats ANY error here as a failed rejoin: it calls
+		// discardTornClone and returns without sup.Start, so a healthy fresh clone is left
+		// stopped and the next tick re-runs the whole rejoin -- demote, three pg_rewind
+		// attempts, another multi-hour base backup, and a SECOND .diverged.<ts> copy on the
+		// same PVC. Leaving one stale directory behind for an operator is strictly cheaper.
+		slog.Warn("native: reclone: clone succeeded but the preserved copy could not be removed; remove it by hand once you no longer need it",
+			"path", backup, "err", err)
 	}
 	return nil
 }
@@ -699,8 +768,10 @@ func (n *Native) ReclonePreserving(ctx context.Context, source Conn) error {
 // not the transient list -- is the one that has to be exact.
 //
 // Deliberately NOT treated as divergence: "target server must be shut down cleanly" (a state
-// error the caller can fix, and #298's standby.signal-first ordering in Follow stops it
-// arising), "wal_log_hints"/data-checksums complaints (a config problem a reclone would
+// error the caller can fix -- pg_rewind's own `postgres --single` step normally handles it,
+// which is why RejoinForceRewind takes standby.signal out of the way first; Follow's
+// signal-first ordering makes the ABSENCE of that file safe, it does not make the file
+// compatible with single-user recovery), "wal_log_hints"/data-checksums complaints (a config problem a reclone would
 // reproduce), and "from different systems" (a DIFFERENT cluster -- invariant 9's
 // assertSameCluster refuses before the rewind, and cloning from it would be the real disaster).
 func isRewindDivergence(out string) bool {

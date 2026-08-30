@@ -132,7 +132,15 @@ func (p *Prober) psql(ctx context.Context, ci ConnInfo, sql string) (string, err
 		"PGPASSWORD=" + ci.Password,
 		fmt.Sprintf("PGCONNECT_TIMEOUT=%d", int(to.Seconds())),
 	}
-	args := []string{"-h", ci.Host, "-p", strconv.Itoa(ci.Port), "-U", ci.User, "-d", ci.DB, "-tAc", sql}
+	// --no-psqlrc, as RehashMd5User already passes (#298 review). Every caller here parses
+	// psql's OUTPUT SHAPE -- `strings.Cut(out, "|")`, an exact "t"/"f", a bare LSN for
+	// ParseLSN -- and a startup file can change all of it (`\pset fieldsep`, `\pset null`,
+	// a banner) while psql still exits 0. PSQLRC reaches this process through
+	// postgresql.extraEnv and childenv.Filtered strips only *PASSWORD*, and the agent itself
+	// writes into the postgres home (writePgpass), so ~/.psqlrc is reachable too. The failure
+	// is silent and cluster-wide: LSNOK false on every node, so survivor ranking has no
+	// positions to compare and the failover simply never happens.
+	args := []string{"--no-psqlrc", "-h", ci.Host, "-p", strconv.Itoa(ci.Port), "-U", ci.User, "-d", ci.DB, "-tAc", sql}
 	return p.Exec.Run(ctx, env, "psql", args...)
 }
 

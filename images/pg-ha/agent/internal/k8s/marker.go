@@ -128,6 +128,21 @@ func (c *Client) WriteMarker(ctx context.Context, name, primary string, timeline
 	if err != nil {
 		return fmt.Errorf("get marker %s: %w", name, err)
 	}
+	// Monotonicity is enforced HERE as well as by the callers, because this Get already
+	// holds the recorded highwater and the callers' own guard can be fed a lie. Every
+	// advanceMarker call site decides from Observation.Marker, which observe() leaves at
+	// its ZERO VALUE (Present=false, i.e. "no constraint") whenever the fence-bounded
+	// ReadMarker missed its deadline -- and finishInitdbNative passes MarkerState{}
+	// outright. So one apiserver blip on a node whose PGDATA was just rebuilt is enough
+	// for shouldAdvanceMarker to wave through timeline 1 over a recorded 7, which defeats
+	// the unsafeToServe highwater guard on every stale node in the cluster. A read-modify-
+	// write that refuses to lower it costs nothing and cannot be fooled that way. An
+	// unparseable recorded value is treated as no constraint, matching shouldAdvanceMarker.
+	if cur, ok := cm.Data["timeline"]; ok {
+		if v, perr := strconv.ParseUint(cur, 10, 32); perr == nil && timeline < uint32(v) {
+			return fmt.Errorf("refusing to lower the highwater marker %s from timeline %d to %d: it is monotonic (#125)", name, v, timeline)
+		}
+	}
 	// Merge our keys into the existing Data rather than replacing the whole map, so
 	// any other keys on the marker ConfigMap (operator annotations-as-data, future
 	// schema fields) survive a marker advance.

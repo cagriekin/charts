@@ -5,6 +5,13 @@
 # Refresh with: docker buildx imagetools inspect golang:1.25-bookworm
 FROM --platform=$BUILDPLATFORM golang:1.25-bookworm@sha256:ea341baa9bd5ba6784f6d7161ace70544349a6242d54d34a0fbfd2c4d51c9d58 AS agent-build
 ARG TARGETARCH
+# The digest pin above is only binding while THIS toolchain is the one that builds. With
+# GOPROXY=off gone (#333), Go's default GOTOOLCHAIN=auto would silently download and run a
+# newer toolchain over the network the moment go.mod's `go`/`toolchain` directive is bumped
+# past 1.25.0, or a dependency requires one -- linking a stdlib nobody pinned or reviewed,
+# and quietly retiring the patched-stdlib claim in the header comment above. `local` makes
+# that a hard build failure instead, which is what the vendored build used to get for free.
+ENV GOTOOLCHAIN=local
 WORKDIR /src/agent
 COPY agent/go.mod agent/go.sum ./
 # Deps come from the module proxy, authenticated against go.sum -- which is what pins them;

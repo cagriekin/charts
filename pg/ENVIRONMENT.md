@@ -49,6 +49,10 @@ these; `config.Load` fail-fasts at boot if any is missing.
 | `POD_CIDR` | CIDR | yes | `ha.agent.podCidr` (`10.0.0.0/8`) | agent (hardened pg_hba: trusted pod network) |
 | `POSTGRESQL_PGHBA` | newline-list | no | `postgresql.pgHba` (joined) | agent (user pg_hba rules, above the catch-alls) |
 | `TLS_ENABLED` | boolean | no | `"true"` when `postgresql.tls.enabled` (emitted only then) | agent (#335: verifies from the running postmaster that `SHOW ssl` is actually `on`, and publishes `pg_ha_agent_tls_inactive` when it is not) |
+| `TLS_REQUIRE_SSL` | boolean | no | `postgresql.tls.require` (emitted only under `postgresql.tls.enabled`) | agent (pg_hba: `hostssl` instead of `host` on the pod CIDR) |
+| `TLS_CLIENT_CERT_AUTH` | boolean | no | `postgresql.tls.clientCertAuth` (emitted only under `postgresql.tls.enabled`) | agent (pg_hba: `clientcert=verify-ca` on the app catch-all, with per-user exemptions for the replication/superuser/monitoring roles) |
+| `MONITORING_USER` | string | no | `prometheusExporter.monitoringUser.username` (emitted only when the exporter and its managed user are enabled, under `postgresql.tls.enabled`) | agent (pg_hba: exempts the exporter's role from `clientcert=verify-ca`, which it cannot present) |
+| `MIGRATE_LEGACY_MD5_USERS` | boolean | no | `postgresql.migrateLegacyMd5Users` (always emitted) | agent (#199: re-hashes the managed users md5 -> scram-sha-256 once this node is serving read-write, replacing the postStart hook that never ran on an in-process promotion) |
 | `CASCADE_REPLICATION` | boolean | no | `ha.agent.cascadingReplication` (`false`) | agent (cascading replication, #29; emitted only when true) |
 | `SYNC_REPLICATION_SLOTS` | boolean | no | `ha.agent.syncReplicationSlots` (`false`) | agent (logical failover slot sync, #308; emitted only when true) |
 | ~~`USE_REPLICATION_SLOTS`~~ | — | — | **removed in 2.0.0 (#290)** | Nothing. It configured the init container's `repmgr standby clone`; the agent owns cloning and always uses a slot |

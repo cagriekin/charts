@@ -201,6 +201,17 @@ func (l *loader) dur(key string) time.Duration {
 	d, err := time.ParseDuration(v)
 	if err != nil {
 		l.invalid = append(l.invalid, fmt.Sprintf("%s=%q (%v)", key, v, err))
+		return d
+	}
+	// Zero and negative PARSE cleanly, and every cross-field check below is gated on
+	// `> 0` -- so without this the most broken values are exactly the ones that skip
+	// validation. RECONCILE_INTERVAL=0s reached time.NewTicker in run(), which PANICS on a
+	// non-positive interval: PID 1 crash-loops on every pod at once, over a value the chart
+	// renders happily (its own validator only checks parseability). LEASE_DURATION=-1s
+	// bypassed all three ordering checks and the etcd >= 5s floor the same way. All four
+	// durations this loads are intervals; none has a meaningful zero.
+	if d <= 0 {
+		l.invalid = append(l.invalid, fmt.Sprintf("%s=%q must be a POSITIVE duration (got %s)", key, v, d))
 	}
 	return d
 }
@@ -369,6 +380,28 @@ func Load(get func(string) string) (*Config, error) {
 	} {
 		if strings.ContainsAny(u.val, " \t\r\n") {
 			l.invalid = append(l.invalid, fmt.Sprintf("%s=%q must not contain whitespace: it is written verbatim into pg_hba.conf", u.name, u.val))
+		}
+		// Whitespace is not the only way this field is structured. pg_hba's user column is a
+		// COMMA-SEPARATED list with reserved forms (`all`, `+role`, `@file`, and a quoted
+		// name), and AssemblePgHba emits the per-user exemption lines ABOVE the
+		// clientcert=verify-ca catch-all -- pg_hba being first-match-wins. So POSTGRES_USER=all
+		// renders `hostssl all all <cidr> scram-sha-256`, which shadows the catch-all and turns
+		// postgresql.tls.clientCertAuth into a silent no-op for every application user;
+		// `app,ops` exempts two. The chart cannot catch it: POSTGRES_USER arrives by
+		// secretKeyRef, so under postgresql.existingSecret the value never passes through Helm.
+		// `,` and `"` are structural ANYWHERE in the token -- the comma splits the list and
+		// pg_hba's tokenizer flips in_quote on any double quote it meets. `+` and `@` are
+		// reserved only in the FIRST position (hba.c tests role[0] for the +role membership
+		// form, and applies file inclusion to a token starting with @), so they are anchored
+		// rather than banned outright: `app@corp` is a legal PostgreSQL role name that names
+		// exactly itself in pg_hba, and rejecting it here would crash-loop every pod of an
+		// existing release on upgrade -- POSTGRES_USER arrives by secretKeyRef, so under
+		// postgresql.existingSecret nothing upstream of the agent could have warned about it.
+		if strings.ContainsAny(u.val, `,"`) || strings.HasPrefix(u.val, "+") || strings.HasPrefix(u.val, "@") {
+			l.invalid = append(l.invalid, fmt.Sprintf("%s=%q must not contain , or \" and must not START with + or @: pg_hba.conf reads that column as a comma-separated list with reserved +role/@file/quoted forms, so such a value silently changes which rules match", u.name, u.val))
+		}
+		if strings.EqualFold(u.val, "all") {
+			l.invalid = append(l.invalid, fmt.Sprintf("%s=%q is the pg_hba.conf wildcard: a per-user rule naming it matches EVERY role and shadows the catch-all below it (with clientCertAuth on, that disables the client-certificate requirement cluster-wide)", u.name, u.val))
 		}
 	}
 	// etcd backend config is required only when DCS_BACKEND=etcd, so a kubernetes

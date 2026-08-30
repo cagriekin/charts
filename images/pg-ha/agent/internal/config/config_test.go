@@ -102,6 +102,34 @@ func TestLoadRejectsWhitespaceInRoleNames(t *testing.T) {
 	}
 }
 
+// The pg_hba user column is structured, and the two halves of that structure have
+// DIFFERENT scopes: `,` and `"` are meaningful anywhere in the token, while `+role` and
+// `@file` are reserved only in the first position. Anchoring matters both ways -- an
+// unanchored ban rejects `app@corp`, a legal role name that arrives by secretKeyRef and
+// would crash-loop every pod at boot, and a missing ban lets `all` or `a,b` silently
+// widen which rules match.
+func TestLoadRoleNameStructureIsAnchoredWhereItShouldBe(t *testing.T) {
+	rejected := []string{"all", "ALL", "a,b", `ab"cd`, "+role", "@file"}
+	for _, key := range []string{"REPMGR_USER", "POSTGRES_USER", "MONITORING_USER"} {
+		for _, v := range rejected {
+			m := fullEnv()
+			m["POSTGRES_USER"] = "app"
+			m[key] = v
+			if _, err := Load(getter(m)); err == nil || !strings.Contains(err.Error(), key) {
+				t.Errorf("%s=%q must fail validation, got %v", key, v, err)
+			}
+		}
+		for _, v := range []string{"app@corp", "team+ops", "user@host.example"} {
+			m := fullEnv()
+			m["POSTGRES_USER"] = "app"
+			m[key] = v
+			if _, err := Load(getter(m)); err != nil {
+				t.Errorf("%s=%q names exactly itself in pg_hba and must be allowed, got %v", key, v, err)
+			}
+		}
+	}
+}
+
 func TestLoadAllowsEmptyMonitoringUser(t *testing.T) {
 	m := fullEnv()
 	m["POSTGRES_USER"] = "app"

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -166,6 +167,16 @@ func (e *EtcdDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 func (e *EtcdDCS) runElection(ctx context.Context, identity string, cb Callbacks) {
 	sess, err := concurrency.NewSession(e.client, concurrency.WithTTL(e.cfg.TTLSeconds), concurrency.WithContext(ctx))
 	if err != nil {
+		// Never return SILENTLY, for the reason the K8s backend logs its own election-config
+		// rejection (#298 review): a PERMANENT failure here -- etcd auth enabled with no grant
+		// for this release's client-cert CN, a CA mismatch, a wrong prefix -- retries forever
+		// at retryPeriod, so no node ever campaigns, no node ever promotes, and the cluster
+		// sits leaderless while /healthz stays green (the tick loop keeps beating) with not one
+		// line naming the cause. A transient etcd outage logs the same way and self-heals.
+		if ctx.Err() == nil {
+			slog.Warn("etcd DCS: could not open a session (no leader can be elected until this clears)",
+				"endpoints", e.cfg.Endpoints, "prefix", e.cfg.Prefix, "ttlSeconds", e.cfg.TTLSeconds, "err", err)
+		}
 		return // etcd unreachable; retry next iteration (leadership unchanged)
 	}
 	defer e.releaseSession(sess) // frees the lease+key on the way out (runs after OnLost)

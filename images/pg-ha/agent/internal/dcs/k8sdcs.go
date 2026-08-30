@@ -92,7 +92,27 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 		RetryPeriod:     k.cfg.RetryPeriod,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(c context.Context) {
-				k.isLeader.Store(true)
+				// client-go runs THIS callback on its own goroutine (`go
+				// OnStartedLeading(ctx)` in LeaderElector.Run) while OnStoppedLeading is a
+				// plain defer, so the two stores are unordered: a Release that cancels the
+				// election before this goroutine is scheduled lets it land AFTER the loop
+				// below has already stored false and client-go has emptied the Lease --
+				// latching isLeader true on a node that holds nothing. observe() feeds
+				// IsLeader() straight into Observation.HoldLease, so the node would then
+				// take a holder branch (Promote, read-write StartLocal) against a peer that
+				// genuinely holds the Lease. Gate on the iteration's own context under the
+				// same mutex the loop takes when it clears the flag: cancel() propagates to
+				// this child synchronously, so the callback either wins the lock first (and
+				// the loop's store(false) follows it) or sees c already cancelled.
+				k.mu.Lock()
+				live := c.Err() == nil
+				if live {
+					k.isLeader.Store(true)
+				}
+				k.mu.Unlock()
+				if !live {
+					return
+				}
 				if cb.OnAcquired != nil {
 					cb.OnAcquired(c)
 				}
@@ -162,11 +182,16 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 			return
 		}
 		le.Run(elerCtx) // blocks: acquire -> lead -> lose (or Release cancels), then returns
+		// cancel() FIRST, and clear the flag under the mutex: both halves pair with the
+		// OnStartedLeading guard above. cancel() marks this iteration's context dead
+		// (synchronously, including the child client-go handed the callback), so a
+		// still-unscheduled OnStartedLeading can no longer set the flag; taking mu around
+		// the store makes the two mutually exclusive rather than merely unlikely.
 		cancel()
 		k.mu.Lock()
 		k.stepDown = nil
-		k.mu.Unlock()
 		k.isLeader.Store(false)
+		k.mu.Unlock()
 
 		select {
 		case <-ctx.Done():

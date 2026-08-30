@@ -253,7 +253,15 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) (int, str
 	// postmaster.pid remains for pgBackRest's interlock to trip over. The API never
 	// sets the Job's FORCE flag, so that interlock stays armed: if a pid file survives
 	// this stop, something else is on the volume and the restore must refuse.
-	ictx, cancel := contextWithTimeout(r, s.o.IntentTimeout)
+	// Detached from the client for the SAME reason the Job creation below is (#298 review),
+	// and it has to start HERE rather than after the stop. Submit's own contract is that "if
+	// ctx expires after the intent was accepted, the loop still performs it" -- so a
+	// port-forward dropping while the postmaster is shutting down cancels only the WAIT, not
+	// the stop. Bound to r.Context() this handler then returned "could not stop postgres:
+	// context canceled" with the hint "no restore Job was created", while the loop went on to
+	// stop PostgreSQL anyway: exactly the paused-cluster-down-with-no-Job outcome the detach
+	// below exists to prevent, reached one step earlier.
+	ictx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.o.IntentTimeout)
 	defer cancel()
 	s.o.Metrics.IncControlIntent()
 	if err := s.o.Node.Submit(ictx, IntentStop); err != nil {
@@ -270,7 +278,17 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) (int, str
 
 	id := identityFrom(r.Context())
 	s.o.Metrics.IncControlRestoreRequest()
-	v, err := s.o.Backups.Restore(r.Context(), req, id)
+	// PAST THE POINT OF NO RETURN, so this half must not die with the client (#298 review).
+	// The Submit above has already stopped the postmaster; creating the Job is what makes that
+	// recoverable. r.Context() is cancelled on client disconnect -- a port-forward dropping
+	// mid-incident is the ordinary case, and a clean stop can legitimately take tens of
+	// seconds -- and the cancellation would surface as `context canceled` from
+	// CloneCronJobToJob, leaving the cluster paused, PostgreSQL down and NO Job running, with
+	// the operator's only signal a client-side connection error. Detach from cancellation but
+	// keep a bound, so the flow either completes or reports honestly.
+	jctx, jcancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.o.IntentTimeout)
+	defer jcancel()
+	v, err := s.o.Backups.Restore(jctx, req, id)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "could not create the restore Job: "+err.Error(),
 			"postgres on this pod has already been STOPPED; POST /v1/restart to bring it back, or retry the restore")

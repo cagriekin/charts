@@ -50,6 +50,11 @@ const (
 
 func main() {
 	log := logging.New(os.Stdout)
+	// Package-level slog calls (internal/dcs's should-never-happen election error, the
+	// mechanism's reclone-cleanup warning) would otherwise go to slog's own default handler --
+	// stderr, in a different format from every other line the agent emits, which is exactly
+	// how a message that matters gets missed. One line makes them all the agent's format.
+	slog.SetDefault(log)
 
 	// One-shot subcommand: provision etcd RBAC and enable auth. The bundled etcd
 	// image is distroless (no shell), so this runs in the pg-ha image via the etcd

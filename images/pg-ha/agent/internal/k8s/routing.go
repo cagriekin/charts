@@ -2,8 +2,10 @@ package k8s
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 )
@@ -38,6 +40,14 @@ func (c *Client) ReconcilePodLabels(ctx context.Context, labelSelector string, d
 	if err != nil {
 		return fmt.Errorf("list pods: %w", err)
 	}
+	// One failed patch must not abandon the pods after it (#298 review). Returning inside the
+	// loop made convergence depend on WHICH pod failed: a 429 under load, an admission webhook,
+	// or a 409 on a pod being rewritten concurrently left every later pod on its stale pg-role,
+	// and service-readonly.yaml selects on exactly that label -- so a failover in which pg-0's
+	// patch fails leaves pg-1 and beyond out of (or wrongly in) the read-only Service until a
+	// later tick happens to succeed on the same first pod. Patch what can be patched, report
+	// what could not, and let the caller's per-tick retry converge the rest in one pass.
+	var errs []error
 	for i := range pods.Items {
 		p := &pods.Items[i]
 		want, ok := desired[p.Name]
@@ -49,8 +59,13 @@ func (c *Client) ReconcilePodLabels(ctx context.Context, labelSelector string, d
 		}
 		patch := fmt.Sprintf(`{"metadata":{"labels":{"pg-role":%q}}}`, want)
 		if _, err := c.cs.CoreV1().Pods(c.namespace).Patch(ctx, p.Name, types.MergePatchType, []byte(patch), metav1.PatchOptions{}); err != nil {
-			return fmt.Errorf("label pod %s: %w", p.Name, err)
+			// A pod that vanished between the List and the Patch is not an error: it holds no
+			// label anyone can read, and the next tick lists without it.
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			errs = append(errs, fmt.Errorf("label pod %s: %w", p.Name, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }

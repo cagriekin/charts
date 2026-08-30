@@ -1045,7 +1045,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
       "NAMESPACE" "PRIMARY_MARKER" "POD_NAME" "POD_SELECTOR" "POD_CIDR" "MASTER_SERVICE"
       "LEASE_NAME" "LEASE_DURATION" "RENEW_DEADLINE" "RETRY_PERIOD" "RECONCILE_INTERVAL"
       "CASCADE_REPLICATION" "SYNC_REPLICATION_SLOTS" "MECHANISM" "POSTGRESQL_PGHBA"
-      "TLS_REQUIRE_SSL" "TLS_CLIENT_CERT_AUTH"
+      "TLS_ENABLED" "TLS_REQUIRE_SSL" "TLS_CLIENT_CERT_AUTH"
       "MONITORING_USER" "MIGRATE_LEGACY_MD5_USERS"
       "PG_MAJOR"
       "CONTROL_ENABLED" "CONTROL_ADDR" "CONTROL_TLS_CERT" "CONTROL_TLS_KEY" "CONTROL_TLS_CA"
@@ -1291,6 +1291,37 @@ decides (http 80, anything else 443).
 {{- else -}}
 443
 {{- end -}}
+{{- end }}
+
+{{- /*
+pg.agentEtcdPorts: the client ports the agent's etcd DCS actually dials, comma-joined and
+deduplicated, for the NetworkPolicy egress rule (#298 review).
+
+The rule used to hardcode 2379 while the endpoint the StatefulSet builds honours
+`etcd.clientPort` -- and a BYO endpoint carries its own port in the URL. Set either to
+anything else and every agent's etcd dial is dropped by the CNI: no node ever wins the
+lease, the cluster comes up with no primary and no write-Service endpoint, and the only
+symptom is a connection timeout in the agent log. Derive the ports from the same two
+sources the endpoints come from so the policy cannot disagree with what is dialed.
+*/ -}}
+{{- define "pg.agentEtcdPorts" -}}
+{{- $ports := list -}}
+{{- $etcd := (.Values.ha).agent | default dict -}}
+{{- $endpoints := (($etcd.dcs).etcd).endpoints | default list -}}
+{{- if $endpoints -}}
+{{- range $endpoints -}}
+{{- $hostport := regexReplaceAll "^[a-zA-Z][a-zA-Z0-9+.-]*://" . "" -}}
+{{- $hostport = splitList "/" $hostport | first -}}
+{{- if regexMatch ":[0-9]+$" $hostport -}}
+{{- $ports = append $ports (splitList ":" $hostport | last | int) -}}
+{{- else -}}
+{{- $ports = append $ports 2379 -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- $ports = append $ports ((.Values.etcd).clientPort | default 2379 | int) -}}
+{{- end -}}
+{{- uniq $ports | join "," -}}
 {{- end }}
 
 {{- define "pg.exporterPodSpec" -}}

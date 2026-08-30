@@ -494,6 +494,21 @@ func (s *Server) handleIntent(kind IntentKind) func(http.ResponseWriter, *http.R
 		if status, detail, ok := s.checkNode(w, req.Node); !ok {
 			return status, detail
 		}
+		// A restart STARTS the postmaster on this data directory, so it is subject to the
+		// same in-flight-restore interlock as resume and reinitialize. It was the one
+		// destructive local verb without it, and the gap is reachable through the documented
+		// path rather than by misuse: POST /v1/restore stops the postmaster and only then
+		// creates the Job, and its own failure hint tells the operator to "POST /v1/restart
+		// to bring it back". runIntent starts Postgres explicitly (so it works while paused,
+		// which a restore requires), and pgBackRest has already cleared its postmaster.pid
+		// interlock by then -- so the restart brings a second writer up on a directory the
+		// Job is mid-rewrite and both corrupt it. Reload is exempt: it writes nothing and
+		// starts nothing.
+		if kind == IntentRestart {
+			if status, detail, ok := s.checkNoRestoreInFlight(w, r, "restart"); !ok {
+				return status, detail
+			}
+		}
 		snap := s.o.Node.Snapshot()
 		// Restarting the serving primary is a write outage. Require an explicit force
 		// so it cannot be the result of a fat-fingered pod name plus a default.
