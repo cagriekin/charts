@@ -1670,6 +1670,23 @@ agent_pr_standalone=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.enabled=false --set postgresql.replicaCount=0 \
   --set repmgr.agent.monitoring.prometheusRule.enabled=true --show-only templates/agent-prometheusrule.yaml 2>&1 || true)
 assert_not_contains "agent monitoring: PrometheusRule not in standalone mode" "${agent_pr_standalone}" "kind: PrometheusRule"
+# Every pg_ha_agent_* series an alert rates or thresholds must actually be PUBLISHED by
+# the agent. An alert on a metric no code path exports is not a weak alert, it is a dead
+# one: the rule evaluates to an empty vector forever, Prometheus reports no error, and
+# the scrape stays green. This branch shipped that twice -- #289's slot alert had no
+# gauge behind it, and #298's review found pg_ha_agent_renew_failures_total with nothing
+# incrementing it. The agent's exposition list is the authority, so diff against it.
+agent_pr_all=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set repmgr.agent.monitoring.prometheusRule.enabled=true \
+  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
+  --show-only templates/agent-prometheusrule.yaml 2>&1)
+metrics_go="${CHART_DIR}/../images/pg-ha/agent/internal/observe/metrics.go"
+pr_metrics=$(printf '%s\n' "${agent_pr_all}" | grep -o 'pg_ha_agent_[a-z_]*' | sort -u)
+missing_metrics=""
+for m in ${pr_metrics}; do
+  grep -q "\"${m}\"" "${metrics_go}" || missing_metrics="${missing_metrics} ${m}"
+done
+assert_eq "agent monitoring: every alerted metric is published by the agent" "" "${missing_metrics}"
 
 # #289: the replication-slot alerts. An orphaned slot pins WAL and fills the volume with
 # no error until the disk is full, so these two rules are the only thing that turns that
@@ -1744,6 +1761,41 @@ agent_etcd_np=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-ag
   --set 'repmgr.agent.dcs.backend=etcd' --set 'repmgr.agent.dcs.etcd.endpoints={https://e1:2379}' \
   --set networkPolicy.enabled=true --show-only templates/networkpolicy.yaml 2>&1)
 assert_contains "agent etcd: NetworkPolicy egress to etcd 2379" "${agent_etcd_np}" "port: 2379"
+# #298 review: the egress port is DERIVED from the same two sources ETCD_ENDPOINTS is
+# built from, not the literal 2379 it used to be. A non-default port left every agent's
+# etcd dial dropped by the CNI -- no node wins the lease, the release comes up with no
+# primary and no write-Service endpoint, and the only symptom is a connection timeout.
+# BYO endpoint on a non-default port.
+etcd_np_byo_port=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'ha.agent.dcs.backend=etcd' --set 'ha.agent.dcs.etcd.endpoints={https://e1:2382}' \
+  --set networkPolicy.enabled=true --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "agent etcd NP: BYO endpoint port is opened" "${etcd_np_byo_port}" "port: 2382"
+assert_not_contains "agent etcd NP: no stale 2379 when the endpoint says otherwise" "${etcd_np_byo_port}" "port: 2379"
+# Bundled etcd on a non-default clientPort: the StatefulSet dials it, so the policy must
+# open it. Asserted against the rendered ETCD_ENDPOINTS so the two cannot drift apart.
+etcd_np_bundled_port=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'ha.agent.dcs.backend=etcd' --set 'etcd.enabled=true' --set 'etcd.clientPort=2384' \
+  --set networkPolicy.enabled=true --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "agent etcd NP: bundled etcd.clientPort is opened" "${etcd_np_bundled_port}" "port: 2384"
+assert_not_contains "agent etcd NP: bundled custom port does not also open 2379" "${etcd_np_bundled_port}" "port: 2379"
+etcd_sts_bundled_port=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'ha.agent.dcs.backend=etcd' --set 'etcd.enabled=true' --set 'etcd.clientPort=2384' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "agent etcd NP: the dialed endpoint carries the same port" "${etcd_sts_bundled_port}" "test-pg-etcd:2384"
+# Several endpoints on several ports: every one is opened, and duplicates collapse.
+etcd_np_multi=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'ha.agent.dcs.backend=etcd' \
+  --set 'ha.agent.dcs.etcd.endpoints={https://e1:2379,https://e2:2379,https://e3:2400}' \
+  --set networkPolicy.enabled=true --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "agent etcd NP: multi-port endpoints open the first port" "${etcd_np_multi}" "port: 2379"
+assert_contains "agent etcd NP: multi-port endpoints open the second port" "${etcd_np_multi}" "port: 2400"
+etcd_np_dupes=$(printf '%s\n' "${etcd_np_multi}" | grep -c "port: 2379")
+assert_eq "agent etcd NP: duplicate endpoint ports are deduplicated" "1" "${etcd_np_dupes}"
+# A portless endpoint falls back to etcd's own default rather than rendering an empty port.
+etcd_np_noport=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'ha.agent.dcs.backend=etcd' --set 'ha.agent.dcs.etcd.endpoints={https://e1}' \
+  --set networkPolicy.enabled=true --show-only templates/networkpolicy.yaml 2>&1)
+assert_contains "agent etcd NP: a portless endpoint defaults to 2379" "${etcd_np_noport}" "port: 2379"
 etcd_noeps_rc=0
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set 'repmgr.agent.dcs.backend=etcd' --show-only templates/statefulset.yaml >/dev/null 2>&1 || etcd_noeps_rc=$?
@@ -4090,6 +4142,26 @@ guard_fails "#262 guard: extraEnv reusing PGDATA fails"         --set-json 'post
 guard_fails "#262 guard: extraEnv reusing POSTGRES_PASSWORD fails" --set-json 'postgresql.extraEnv=[{"name":"POSTGRES_PASSWORD","value":"x"}]'
 guard_fails "#262 guard: extraEnv reusing a disabled-feature name (REPMGR_DB) fails" --set-json 'postgresql.extraEnv=[{"name":"REPMGR_DB","value":"x"}]'
 guard_fails "#262 guard: duplicate extraEnv name fails"         --set-json 'postgresql.extraEnv=[{"name":"A","value":"1"},{"name":"A","value":"2"}]'
+# #298 review: the reservation is UNCONDITIONAL -- it must hold on a release where the
+# feature is off, so a later `helm upgrade` that turns it on cannot land on a shadowed
+# name. TLS_ENABLED was missing from the list while its two siblings were present, so
+# extraEnv could shadow it (appended after the chart's block, last-wins) and silently
+# disable the #335 postmaster TLS verification while the release still looked fully
+# TLS-enabled. PG_MAJOR is the same shape and the worst of them: it points both the
+# entrypoint's require_pg_bindir and the agent's bindir check at a PostgreSQL the image
+# does not bundle.
+guard_fails "#298 guard: extraEnv reusing TLS_ENABLED fails (tls off)" --set-json 'postgresql.extraEnv=[{"name":"TLS_ENABLED","value":"false"}]'
+guard_fails "#298 guard: extraEnv reusing TLS_REQUIRE_SSL fails" --set-json 'postgresql.extraEnv=[{"name":"TLS_REQUIRE_SSL","value":"false"}]'
+guard_fails "#298 guard: extraEnv reusing TLS_CLIENT_CERT_AUTH fails" --set-json 'postgresql.extraEnv=[{"name":"TLS_CLIENT_CERT_AUTH","value":"false"}]'
+guard_fails "#298 guard: extraEnv reusing PG_MAJOR fails" --set-json 'postgresql.extraEnv=[{"name":"PG_MAJOR","value":"17"}]'
+guard_fails "#298 guard: extraEnv reusing MONITORING_USER fails" --set-json 'postgresql.extraEnv=[{"name":"MONITORING_USER","value":"x"}]'
+guard_fails "#298 guard: extraEnv reusing MIGRATE_LEGACY_MD5_USERS fails" --set-json 'postgresql.extraEnv=[{"name":"MIGRATE_LEGACY_MD5_USERS","value":"false"}]'
+guard_fails "#298 guard: extraEnv reusing CONTROL_ALLOWED_CNS fails" --set-json 'postgresql.extraEnv=[{"name":"CONTROL_ALLOWED_CNS","value":"eve"}]'
+# The fail message has to NAME the offending variable, or an operator with a long
+# extraEnv list has nothing to act on.
+tls_env_guard_msg=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-minimal.yaml" \
+  --set-json 'postgresql.extraEnv=[{"name":"TLS_ENABLED","value":"false"}]' 2>&1 || true)
+assert_contains "#298 guard: the extraEnv refusal names TLS_ENABLED" "${tls_env_guard_msg}" "TLS_ENABLED"
 
 # --- shared_preload_libraries: what the chart merges into an operator-set value ---
 #

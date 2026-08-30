@@ -277,3 +277,51 @@ func TestClearDebrisDataDirRefusesShallowOrRelativePaths(t *testing.T) {
 		}
 	}
 }
+
+// ControlFileMissing is positive evidence that a base backup was cut short:
+// pg_basebackup writes global/pg_control LAST, precisely so an interrupted copy is
+// detectable. It is deliberately distinguished from "pg_controldata failed", which can
+// mean the tool could not run OR that the directory belongs to a different PostgreSQL
+// major -- neither of which justifies destroying it (#288).
+func TestControlFileMissingDetectsATornClone(t *testing.T) {
+	dir := t.TempDir()
+	// A clone interrupted after the data files but before pg_control.
+	if err := os.MkdirAll(filepath.Join(dir, "global"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "PG_VERSION"), []byte("18\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !ControlFileMissing(dir) {
+		t.Error("a PGDATA with global/ but no pg_control is a torn clone and must be reported as such")
+	}
+	// The complete article.
+	if err := os.WriteFile(filepath.Join(dir, "global", "pg_control"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ControlFileMissing(dir) {
+		t.Error("a PGDATA carrying pg_control must NOT be reported as torn: the caller's response is destructive")
+	}
+}
+
+// A PGDATA that does not exist at all reports missing too -- the caller's other guards
+// decide what that means; conflating it with "present" would be the dangerous direction.
+func TestControlFileMissingOnAnAbsentDirectory(t *testing.T) {
+	if !ControlFileMissing(filepath.Join(t.TempDir(), "never-created")) {
+		t.Error("an absent data directory has no pg_control")
+	}
+}
+
+// global/ being a FILE rather than a directory is not "missing": Stat fails with
+// ENOTDIR, not ENOENT, and treating an unreadable path as positive evidence of a torn
+// clone would license the destructive path on a directory nobody has established is
+// broken.
+func TestControlFileMissingDoesNotGuessOnAnUnreadablePath(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "global"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if ControlFileMissing(dir) {
+		t.Error("ENOTDIR is not ENOENT: only a genuinely absent pg_control is evidence of a torn clone")
+	}
+}

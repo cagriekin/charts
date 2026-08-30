@@ -2,6 +2,15 @@ package dcs
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -154,4 +163,112 @@ func TestCampaignGuardedDoesNotWaitForCampaignUnwind(t *testing.T) {
 		t.Fatal("guard blocked waiting for Campaign to unwind; the Run loop cannot re-contend")
 	}
 	close(unwind)
+}
+
+// A CA file that exists but holds no PEM certificate must be an error, not an empty
+// pool: an empty RootCAs silently fails every handshake later, at dial time, in a retry
+// loop -- which is the leaderless-behind-a-green-healthz shape the session-failure log
+// line exists for. Catch it at boot instead.
+func TestEtcdTLSConfigRejectsACAWithNoCertificates(t *testing.T) {
+	dir := t.TempDir()
+	cert, key, ca := filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key"), filepath.Join(dir, "ca.crt")
+	certPEM, keyPEM := selfSignedPair(t)
+	for path, body := range map[string][]byte{cert: certPEM, key: keyPEM, ca: []byte("not a certificate\n")} {
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := EtcdConfig{CertFile: cert, KeyFile: key, CAFile: ca}.tlsConfig()
+	if err == nil {
+		t.Fatal("a CA file with no parseable certificate must not produce an empty trust pool")
+	}
+	if !strings.Contains(err.Error(), "no certificates parsed") {
+		t.Errorf("error should say what was wrong with the CA: %v", err)
+	}
+}
+
+// A valid triplet produces a config pinned to TLS 1.2 or better and carrying both
+// halves: the client certificate (etcd authenticates the agent by its CN under
+// --client-cert-auth) and the CA pool.
+func TestEtcdTLSConfigBuildsAMutualTLSConfig(t *testing.T) {
+	dir := t.TempDir()
+	cert, key, ca := filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key"), filepath.Join(dir, "ca.crt")
+	certPEM, keyPEM := selfSignedPair(t)
+	for path, body := range map[string][]byte{cert: certPEM, key: keyPEM, ca: certPEM} {
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tc, err := EtcdConfig{CertFile: cert, KeyFile: key, CAFile: ca}.tlsConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tc.Certificates) != 1 {
+		t.Errorf("no client certificate: etcd's --client-cert-auth would reject the agent")
+	}
+	if tc.RootCAs == nil {
+		t.Error("no CA pool: the agent would trust the platform roots for an internal etcd")
+	}
+	if tc.MinVersion < tls.VersionTLS12 {
+		t.Errorf("MinVersion = %x, want TLS 1.2 or better", tc.MinVersion)
+	}
+}
+
+// A fresh EtcdDCS holds no leadership and names no leader. Leader() in particular must
+// return "" rather than panic on the un-stored atomic.Value -- observe() publishes into
+// it asynchronously, so the accessor is read before the first write on every boot.
+func TestEtcdDCSAccessorsBeforeAnyElection(t *testing.T) {
+	e := &EtcdDCS{}
+	if e.IsLeader() {
+		t.Error("a DCS that has never campaigned must not report leadership")
+	}
+	if got := e.Leader(); got != "" {
+		t.Errorf("Leader() = %q before any observation, want empty", got)
+	}
+}
+
+// RBACBootstrap validates its inputs before dialling: both are rendered from chart
+// values, and a missing one is a configuration error the Job must report by name
+// rather than as an etcd connection timeout.
+func TestRBACBootstrapValidatesItsInputs(t *testing.T) {
+	ctx := context.Background()
+	if err := RBACBootstrap(ctx, nil, "", "", "", "root", "", nil); err == nil ||
+		!strings.Contains(err.Error(), "ETCD_ENDPOINTS") {
+		t.Errorf("no endpoints should name ETCD_ENDPOINTS, got %v", err)
+	}
+	if err := RBACBootstrap(ctx, []string{"https://e:2379"}, "", "", "", "", "", nil); err == nil ||
+		!strings.Contains(err.Error(), "ETCD_RBAC_ROOT_CN") {
+		t.Errorf("no root CN should name ETCD_RBAC_ROOT_CN, got %v", err)
+	}
+	// A half-set TLS triplet is refused here too, before any dial.
+	if err := RBACBootstrap(ctx, []string{"https://e:2379"}, "/c", "", "", "root", "", nil); err == nil ||
+		!strings.Contains(err.Error(), "together") {
+		t.Errorf("a partial TLS triplet should be refused all-or-none, got %v", err)
+	}
+}
+
+// selfSignedPair returns a throwaway cert/key PEM pair, so the TLS tests exercise the
+// real x509 loader rather than a stub.
+func selfSignedPair(t *testing.T) (certPEM, keyPEM []byte) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "pg-0"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	return certPEM, keyPEM
 }

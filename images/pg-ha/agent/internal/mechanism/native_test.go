@@ -1022,3 +1022,189 @@ func TestNativeRejoinDoesNotRetryOtherFailures(t *testing.T) {
 		t.Errorf("expected exactly one pg_rewind attempt, got %d", rewinds)
 	}
 }
+
+// --- #298 review: standby.signal must be out of the way for pg_rewind ---
+
+// rejoinOnto always demotes with fence=true (Immediate/SIGQUIT), so the target -- this
+// node's own PGDATA -- is left in DB_IN_ARCHIVE_RECOVERY, not cleanly shut down. Since
+// PG13 pg_rewind handles that by running `postgres --single` on the target to finish
+// crash recovery (we never pass --no-ensure-shutdown), and readRecoverySignalFile
+// refuses single-user mode outright when standby.signal exists:
+// `FATAL: standby mode is not supported by single-user servers`. That message is
+// neither a divergence nor a connection failure, so RejoinForward returned a plain
+// error EVERY time, rejoinOnto counted three and escalated to ReclonePreserving -- a
+// full base backup plus an unreaped .diverged.<ts> on every ordinary rejoin.
+func TestNativeRejoinForceRewindClearsStandbySignalForTheRewind(t *testing.T) {
+	fr := &fakeRunner{}
+	n, dataDir := newTestNative(t, fr)
+	sig := filepath.Join(dataDir, "standby.signal")
+	if err := os.WriteFile(sig, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sawRewind := false
+	fr.onCall = func(name string, _ []string) {
+		if !strings.HasSuffix(name, "pg_rewind") {
+			return
+		}
+		sawRewind = true
+		if _, err := os.Stat(sig); err == nil {
+			t.Error("standby.signal was still present when pg_rewind ran: its `postgres --single` step refuses standby mode")
+		}
+	}
+	if err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.h", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatal(err)
+	}
+	if !sawRewind {
+		t.Fatal("pg_rewind was never invoked")
+	}
+	// Follow re-creates it on the success path: a rewound directory with no
+	// standby.signal is a SECOND read-write primary.
+	if _, err := os.Stat(sig); err != nil {
+		t.Errorf("standby.signal missing after a successful rejoin: %v", err)
+	}
+}
+
+// Restored on ANY error, including a rewind that worked but whose Follow did not. The
+// asymmetry is Follow's own: standby.signal without primary_conninfo is a standby
+// waiting for WAL, while its ABSENCE on a rewound directory is a second writer.
+func TestNativeRejoinForceRewindRestoresStandbySignalOnFailure(t *testing.T) {
+	fr := &fakeRunner{failOn: "--target-pgdata"}
+	n, dataDir := newTestNative(t, fr)
+	sig := filepath.Join(dataDir, "standby.signal")
+	if err := os.WriteFile(sig, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.h", User: "repmgr", DB: "repmgr"}); err == nil {
+		t.Fatal("expected the rewind failure to surface")
+	}
+	if _, err := os.Stat(sig); err != nil {
+		t.Errorf("standby.signal not restored after a failed rewind, so this node could be started READ-WRITE: %v", err)
+	}
+}
+
+// A node that had no standby.signal (a fenced ex-primary) must not acquire one from a
+// failed rewind: the restore is a restore, not a demotion.
+func TestNativeRejoinForceRewindInventsNoStandbySignal(t *testing.T) {
+	fr := &fakeRunner{failOn: "--target-pgdata"}
+	n, dataDir := newTestNative(t, fr)
+	if err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.h", User: "repmgr", DB: "repmgr"}); err == nil {
+		t.Fatal("expected the rewind failure to surface")
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "standby.signal")); !os.IsNotExist(err) {
+		t.Errorf("standby.signal must not be created by a failed rewind on a node that had none: %v", err)
+	}
+}
+
+// --- #298 review: GenerateConfig must not silently clear a working upstream ---
+
+// currentPrimaryConninfo swallowed EVERY read error and collapsed it to "", which
+// writeManagedConf then COMMITTED: the fragment was rewritten with no primary_conninfo
+// and no primary_slot_name, so a working standby lost its upstream. boot() calls this
+// before starting the postmaster, so the node would come up in recovery attached to
+// nobody until the first Follow repointed it. A directory in the fragment's place
+// reproduces the class (EISDIR) without depending on the test user's privileges.
+func TestNativeGenerateConfigRefusesWhenTheFragmentCannotBeRead(t *testing.T) {
+	n, dataDir := newTestNative(t, &fakeRunner{})
+	if err := os.Mkdir(filepath.Join(dataDir, managedConfName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(dataDir, "postgresql.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = n.GenerateConfig(context.Background(), NodeIdentity{}, ConfigOpts{})
+	if err == nil {
+		t.Fatal("an unreadable managed fragment must not be treated as an empty one")
+	}
+	if !strings.Contains(err.Error(), "upstream") {
+		t.Errorf("error should say what is at stake (the preserved upstream): %v", err)
+	}
+	after, _ := os.ReadFile(filepath.Join(dataDir, "postgresql.conf"))
+	if string(after) != string(before) {
+		t.Errorf("postgresql.conf was modified despite the refusal:\n%s", after)
+	}
+}
+
+// The one read failure that IS "" with no error: a fresh node, whose fragment does not
+// exist yet. Regressing this would make the first GenerateConfig of every new pod fail.
+func TestNativeGenerateConfigTreatsAMissingFragmentAsFresh(t *testing.T) {
+	n, dataDir := newTestNative(t, &fakeRunner{})
+	if _, err := os.Stat(filepath.Join(dataDir, managedConfName)); !os.IsNotExist(err) {
+		t.Fatalf("precondition: the fragment should not exist yet (%v)", err)
+	}
+	if err := n.GenerateConfig(context.Background(), NodeIdentity{}, ConfigOpts{}); err != nil {
+		t.Fatalf("a fresh node must generate config without error: %v", err)
+	}
+}
+
+// --- #298 review: a failed cleanup is not a failed reclone ---
+
+// rejoinOnto treats ANY error from ReclonePreserving as a failed rejoin: it calls
+// discardTornClone and returns WITHOUT sup.Start, so a healthy fresh clone is left
+// stopped and the next tick re-runs the whole rejoin -- demote, three pg_rewind
+// attempts, another multi-hour base backup, and a second .diverged.<ts> on the same
+// PVC. Reachable on any store that silly-renames open files (NFS leaves .nfsXXXX
+// entries, so RemoveAll returns ENOTEMPTY). One stale directory is strictly cheaper.
+func TestNativeReclonePreservingSucceedsWhenOnlyTheCleanupFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory permissions this uses to make RemoveAll fail")
+	}
+	n, dataDir := newTestNative(t, &fakeRunner{})
+	fixed := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	n.Now = func() time.Time { return fixed }
+
+	// A subdirectory whose contents cannot be unlinked: RemoveAll reaches the child and
+	// fails with EACCES, exactly where the NFS case fails with ENOTEMPTY.
+	stuck := filepath.Join(dataDir, "stuck")
+	if err := os.Mkdir(stuck, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stuck, "f"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stuck, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	backup := strings.TrimRight(dataDir, "/") + ".diverged.20260615T120000Z"
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(backup, "stuck"), 0o700) })
+
+	if err := n.ReclonePreserving(context.Background(), Conn{Host: "src", User: "u", DB: "d"}); err != nil {
+		t.Fatalf("the clone succeeded; only the cleanup failed, so this must not be reported as a failed rejoin: %v", err)
+	}
+	// The fresh clone is in place -- that is what the caller is about to start.
+	if _, err := os.Stat(filepath.Join(dataDir, "postgresql.conf")); err != nil {
+		t.Errorf("re-cloned PGDATA is not usable: %v", err)
+	}
+	// And the copy that could not be removed is still there for an operator.
+	if _, err := os.Stat(backup); err != nil {
+		t.Errorf("the preserved copy should be left behind, not silently lost: %v", err)
+	}
+}
+
+// --- #298 review: the slot-create psql needs the same startup-file guard ---
+
+// PSQLRC reaches this process through postgresql.extraEnv (childenv.Filtered strips
+// only *PASSWORD*) and the agent writes into the postgres home, so ~/.psqlrc is
+// reachable too. A startup file that errors makes psql exit NON-ZERO on a query that
+// in fact succeeded, and isDuplicateSlot does not match its message -- so an otherwise
+// healthy clone aborts over the slot it was creating.
+func TestNativeSlotCreateDisablesTheStartupFile(t *testing.T) {
+	fr := &fakeRunner{}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	if err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatal(err)
+	}
+	saw := false
+	for _, c := range fr.calls {
+		if !strings.HasSuffix(c.name, "psql") {
+			continue
+		}
+		saw = true
+		if len(c.args) == 0 || c.args[0] != "--no-psqlrc" {
+			t.Errorf("slot-create psql argv must start with --no-psqlrc, got %v", c.args)
+		}
+	}
+	if !saw {
+		t.Fatal("Clone ran no psql call")
+	}
+}

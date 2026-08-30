@@ -498,3 +498,63 @@ func mustStat(t *testing.T, p string) os.FileInfo {
 	}
 	return fi
 }
+
+// PreloadsLibrary is the read-only half of the #293 migration check, and callers scan
+// SEVERAL optional paths with it -- postgresql.auto.conf and each conf.d fragment, any
+// of which legitimately may not exist. A missing file must therefore be false-with-no-
+// error: turning it into an error would fail the boot of every ordinary pod.
+func TestPreloadsLibraryOnAMissingFileIsFalseNotAnError(t *testing.T) {
+	got, err := PreloadsLibrary(filepath.Join(t.TempDir(), "absent.conf"), "repmgr")
+	if err != nil {
+		t.Fatalf("a missing optional file must not be an error: %v", err)
+	}
+	if got {
+		t.Error("a missing file cannot request a library")
+	}
+}
+
+func TestPreloadsLibraryReadsActiveAssignmentsOnly(t *testing.T) {
+	for _, c := range []struct {
+		name, body string
+		lib        string
+		want       bool
+	}{
+		{"sole library", "shared_preload_libraries = 'repmgr'\n", "repmgr", true},
+		{"one of several", "shared_preload_libraries = 'pgaudit,repmgr,pg_stat_statements'\n", "repmgr", true},
+		{"absent from the list", "shared_preload_libraries = 'pgaudit'\n", "repmgr", false},
+		// A commented-out line is not in effect, and treating it as one would refuse a
+		// boot over a library nothing asks for.
+		{"commented out", "#shared_preload_libraries = 'repmgr'\n", "repmgr", false},
+		{"no assignment at all", "wal_log_hints = on\n", "repmgr", false},
+		// Substring safety: a longer name that merely contains the short one is a
+		// different library.
+		{"not a substring match", "shared_preload_libraries = 'repmgrx'\n", "repmgr", false},
+	} {
+		path := filepath.Join(t.TempDir(), "postgresql.conf")
+		if err := os.WriteFile(path, []byte(c.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := PreloadsLibrary(path, c.lib)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got != c.want {
+			t.Errorf("%s: PreloadsLibrary(%q) = %v, want %v", c.name, c.body, got, c.want)
+		}
+	}
+}
+
+// An unreadable file IS an error: the caller is deciding whether a library the
+// postmaster needs is genuinely absent, and "I could not look" must not be reported as
+// "it does not ask for it".
+func TestPreloadsLibraryReportsAReadFailure(t *testing.T) {
+	dir := t.TempDir()
+	// A directory where a file is expected reproduces the class (EISDIR) without
+	// depending on the test user's privileges.
+	if err := os.Mkdir(filepath.Join(dir, "postgresql.conf"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PreloadsLibrary(filepath.Join(dir, "postgresql.conf"), "repmgr"); err == nil {
+		t.Fatal("an unreadable file must not be reported as `does not preload`")
+	}
+}

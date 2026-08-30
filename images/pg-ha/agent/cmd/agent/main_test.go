@@ -3213,3 +3213,198 @@ func TestVerifyTLSActiveThrottlesRepeatedProbes(t *testing.T) {
 		t.Errorf("calls = %d, want a re-probe once the interval has elapsed", ex.calls)
 	}
 }
+
+// --- #288: what the streaming-replica count may and may not include ---
+
+// pg_basebackup -X stream opens a SECOND streaming connection for the whole duration
+// of every clone -- fresh install, scale-up, re-clone -- and counting it inflates
+// pg_ha_agent_replicas_streaming while the pod it belongs to is not replicating at all.
+// The gauge feeds a replica-shortfall alert, so an inflated count is the direction that
+// hides a real problem.
+func TestCountStreamingReplicasExcludesCloneConnections(t *testing.T) {
+	rows := []pg.ReplicaRow{
+		{AppName: "pg-1", SlotName: "pg_ha_slot_1", State: "streaming"},
+		{AppName: "pg-2", SlotName: "pg_ha_slot_2", State: "streaming"},
+		// The clone in progress: streaming, but not a standby.
+		{AppName: "pg_basebackup", SlotName: "pg_ha_slot_3", State: "streaming"},
+	}
+	if got := countStreamingReplicas(rows); got != 2 {
+		t.Errorf("countStreamingReplicas = %d, want 2 (the base backup is not a replica)", got)
+	}
+}
+
+// Only "streaming" counts. A standby in catchup exists but cannot yet serve or be
+// promoted safely, and a backup/startup row is not a standby at all -- treating any of
+// them as caught up would report a redundancy the cluster does not have.
+func TestCountStreamingReplicasCountsOnlyTheStreamingState(t *testing.T) {
+	rows := []pg.ReplicaRow{
+		{AppName: "pg-1", State: "streaming"},
+		{AppName: "pg-2", State: "catchup"},
+		{AppName: "pg-3", State: "startup"},
+		{AppName: "pg-4", State: "backup"},
+		{AppName: "pg-5", State: ""},
+	}
+	if got := countStreamingReplicas(rows); got != 1 {
+		t.Errorf("countStreamingReplicas = %d, want 1", got)
+	}
+	if got := countStreamingReplicas(nil); got != 0 {
+		t.Errorf("countStreamingReplicas(nil) = %d, want 0", got)
+	}
+}
+
+// --- gossip freshness ---
+
+// A peer's gossiped status is only usable while it is RECENT: survivor ranking reads
+// LSNs from it, and acting on a stale position is how a node that has since fallen
+// behind gets promoted. The window is 4 reconcile intervals, wide enough that one
+// missed tick does not blind the leader.
+func TestGossipFreshWindow(t *testing.T) {
+	a := newTestAgent(t, &fakePostmaster{}, &fakeDCS{})
+	a.cfg.ReconcileInterval = 5 * time.Second
+	a.cfg.RenewDeadline = 10 * time.Second
+	now := time.Now().Unix()
+	for _, c := range []struct {
+		why   string
+		at    int64
+		fresh bool
+	}{
+		{"just published", now, true},
+		{"one interval old", now - 5, true},
+		{"at the edge of the window", now - 20, true},
+		{"past the window", now - 21, false},
+		{"long stale", now - 3600, false},
+		// A pod that has never gossiped carries the zero value, which must never be
+		// read as "published at the epoch and therefore ancient-but-parseable".
+		{"never published", 0, false},
+	} {
+		if got := a.gossipFresh(k8s.NodeStatus{UpdatedAtUnix: c.at}); got != c.fresh {
+			t.Errorf("%s: gossipFresh = %v, want %v", c.why, got, c.fresh)
+		}
+	}
+}
+
+// Pod clocks drift, and a peer whose clock runs slightly ahead publishes a timestamp
+// in the FUTURE. That must stay usable within the renew deadline -- discarding it
+// would blind the leader to the very peer it is ranking -- but a wildly future stamp
+// (a badly wrong clock, or a forged annotation) must not be trusted indefinitely.
+func TestGossipFreshToleratesBoundedClockSkew(t *testing.T) {
+	a := newTestAgent(t, &fakePostmaster{}, &fakeDCS{})
+	a.cfg.ReconcileInterval = 5 * time.Second
+	a.cfg.RenewDeadline = 10 * time.Second
+	now := time.Now().Unix()
+	if !a.gossipFresh(k8s.NodeStatus{UpdatedAtUnix: now + 5}) {
+		t.Error("a peer whose clock is a few seconds ahead must still be readable")
+	}
+	if a.gossipFresh(k8s.NodeStatus{UpdatedAtUnix: now + 3600}) {
+		t.Error("an hour into the future is not clock skew; it must not be trusted")
+	}
+}
+
+// --- assertPrimaryRouting: both halves, and what a partial failure leaves behind ---
+
+// assertPrimaryRouting is what makes a promotion visible to clients: the write Service
+// selector moves to this pod, and every pod's pg-role label is republished so
+// service-readonly.yaml selects the right set. It is called on both Promote and
+// StayPrimary, so it must be idempotent and self-healing.
+func TestAssertPrimaryRoutingMovesTheWriteSelectorAndEveryLabel(t *testing.T) {
+	mkPod := func(name, role string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: "ns",
+			Labels: map[string]string{"app.kubernetes.io/component": "postgresql", "pg-role": role},
+		}}
+	}
+	cs := k8sfake.NewSimpleClientset(
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: "pg", Namespace: "ns"},
+			Spec:       corev1.ServiceSpec{Selector: map[string]string{"statefulset.kubernetes.io/pod-name": "pg-1"}},
+		},
+		mkPod("pg-0", "standby"), mkPod("pg-1", "primary"), mkPod("pg-2", "standby"),
+	)
+	a := newTestAgent(t, &fakePostmaster{}, &fakeDCS{})
+	a.kube = k8s.NewWithClient(cs, "ns")
+	a.cfg.MasterService = "pg"
+	a.cfg.PodName = "pg-0"
+	a.cfg.PodSelector = "app.kubernetes.io/component=postgresql"
+
+	obs := reconcile.Observation{Peers: []reconcile.PeerState{
+		{Name: "pg-1", Reachable: true, Role: pg.RoleStandby},
+		{Name: "pg-2", Reachable: true, Role: pg.RoleStandby},
+	}}
+	if err := a.assertPrimaryRouting(context.Background(), obs); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	svc, _ := cs.CoreV1().Services("ns").Get(ctx, "pg", metav1.GetOptions{})
+	if got := svc.Spec.Selector["statefulset.kubernetes.io/pod-name"]; got != "pg-0" {
+		t.Errorf("write Service still points at %q: writes go to the old primary", got)
+	}
+	for name, want := range map[string]string{"pg-0": "primary", "pg-1": "standby", "pg-2": "standby"} {
+		p, _ := cs.CoreV1().Pods("ns").Get(ctx, name, metav1.GetOptions{})
+		if got := p.Labels["pg-role"]; got != want {
+			t.Errorf("%s pg-role = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// The write selector moves FIRST, and a failure there returns before any label is
+// touched: publishing "pg-0 is primary" on the pods while the write Service still
+// points elsewhere advertises a primary that receives no writes.
+func TestAssertPrimaryRoutingStopsWhenTheWriteSelectorCannotMove(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset(
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: "pg", Namespace: "ns"},
+			Spec:       corev1.ServiceSpec{Selector: map[string]string{"statefulset.kubernetes.io/pod-name": "pg-1"}},
+		},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: "pg-0", Namespace: "ns",
+			Labels: map[string]string{"app.kubernetes.io/component": "postgresql", "pg-role": "standby"},
+		}},
+	)
+	cs.PrependReactor("patch", "services", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("injected apiserver failure")
+	})
+	a := newTestAgent(t, &fakePostmaster{}, &fakeDCS{})
+	a.kube = k8s.NewWithClient(cs, "ns")
+	a.cfg.MasterService = "pg"
+	a.cfg.PodName = "pg-0"
+	a.cfg.PodSelector = "app.kubernetes.io/component=postgresql"
+
+	if err := a.assertPrimaryRouting(context.Background(), reconcile.Observation{}); err == nil {
+		t.Fatal("a failed write-selector patch must be reported")
+	}
+	p, _ := cs.CoreV1().Pods("ns").Get(context.Background(), "pg-0", metav1.GetOptions{})
+	if p.Labels["pg-role"] == "primary" {
+		t.Error("this pod was labelled primary while the write Service still points elsewhere")
+	}
+}
+
+// An unreachable peer is OMITTED rather than classified, so ReconcilePodLabels leaves
+// its label untouched: the primary cannot tell a node it cannot reach from a node that
+// is fine but partitioned from it, and churning the label either way moves real client
+// traffic on a guess.
+func TestAssertPrimaryRoutingLeavesAnUnreachablePeerAlone(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset(
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: "pg", Namespace: "ns"},
+			Spec:       corev1.ServiceSpec{Selector: map[string]string{"statefulset.kubernetes.io/pod-name": "pg-0"}},
+		},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: "pg-1", Namespace: "ns",
+			Labels: map[string]string{"app.kubernetes.io/component": "postgresql", "pg-role": "standby"},
+		}},
+	)
+	a := newTestAgent(t, &fakePostmaster{}, &fakeDCS{})
+	a.kube = k8s.NewWithClient(cs, "ns")
+	a.cfg.MasterService = "pg"
+	a.cfg.PodName = "pg-0"
+	a.cfg.PodSelector = "app.kubernetes.io/component=postgresql"
+
+	obs := reconcile.Observation{Peers: []reconcile.PeerState{{Name: "pg-1", Reachable: false}}}
+	if err := a.assertPrimaryRouting(context.Background(), obs); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := cs.CoreV1().Pods("ns").Get(context.Background(), "pg-1", metav1.GetOptions{})
+	if got := p.Labels["pg-role"]; got != "standby" {
+		t.Errorf("an unreachable peer's label was rewritten to %q", got)
+	}
+}

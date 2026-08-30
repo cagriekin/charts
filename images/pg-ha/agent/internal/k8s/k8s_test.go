@@ -6,8 +6,11 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 const ns = "ns"
@@ -315,5 +318,168 @@ func TestClearSwitchoverTargetCleansOrphanRequester(t *testing.T) {
 	}
 	if _, ok := markerAnnotations(t, cs)[SwitchoverRequestedByAnnotation]; ok {
 		t.Error("an orphaned requester annotation must be removed")
+	}
+}
+
+// --- #298 review: ReconcilePodLabels must converge every pod it can ---
+
+// mkPod is the shape ReconcilePodLabels lists over.
+func mkRolePod(name, role string) *corev1.Pod {
+	labels := map[string]string{"app.kubernetes.io/component": "postgresql"}
+	if role != "" {
+		labels["pg-role"] = role
+	}
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: labels}}
+}
+
+// Returning inside the patch loop made convergence depend on WHICH pod failed: a 429
+// under load, an admission webhook, or a 409 on a pod being rewritten concurrently
+// left every LATER pod on its stale pg-role, and service-readonly.yaml selects on
+// exactly that label. A failover in which pg-0's patch fails would leave pg-1 and
+// beyond wrongly in (or out of) the read-only Service until a later tick happened to
+// succeed on the same first pod.
+func TestReconcilePodLabelsConvergesPastAFailedPatch(t *testing.T) {
+	cs := fake.NewSimpleClientset(mkRolePod("pg-0", "standby"), mkRolePod("pg-1", "primary"), mkRolePod("pg-2", "primary"))
+	cs.PrependReactor("patch", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if a.(k8stesting.PatchAction).GetName() == "pg-0" {
+			return true, nil, apierrors.NewTooManyRequestsError("injected")
+		}
+		return false, nil, nil
+	})
+	c := NewWithClient(cs, ns)
+	ctx := context.Background()
+
+	desired := map[string]string{"pg-0": "primary", "pg-1": "standby", "pg-2": "standby"}
+	err := c.ReconcilePodLabels(ctx, "app.kubernetes.io/component=postgresql", desired)
+	if err == nil {
+		t.Fatal("the failed patch must still be reported")
+	}
+	if !strings.Contains(err.Error(), "pg-0") {
+		t.Errorf("error should name the pod that could not be labelled: %v", err)
+	}
+	get := func(name string) string {
+		p, _ := cs.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+		return p.Labels["pg-role"]
+	}
+	// The point of the fix: the pods AFTER the failure are converged in the same pass.
+	if get("pg-1") != "standby" || get("pg-2") != "standby" {
+		t.Errorf("pods after the failed one were abandoned: pg-1=%q pg-2=%q", get("pg-1"), get("pg-2"))
+	}
+	if get("pg-0") != "standby" {
+		t.Errorf("pg-0's label should be untouched by a failed patch, got %q", get("pg-0"))
+	}
+}
+
+// Every failure is reported, not just the first: an operator reading the log needs to
+// know the blast radius, and errors.Join keeps them all.
+func TestReconcilePodLabelsReportsEveryFailure(t *testing.T) {
+	cs := fake.NewSimpleClientset(mkRolePod("pg-0", "standby"), mkRolePod("pg-1", "standby"))
+	cs.PrependReactor("patch", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewTooManyRequestsError("injected")
+	})
+	err := NewWithClient(cs, ns).ReconcilePodLabels(context.Background(),
+		"app.kubernetes.io/component=postgresql", map[string]string{"pg-0": "primary", "pg-1": "primary"})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range []string{"pg-0", "pg-1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should name %s: %v", want, err)
+		}
+	}
+}
+
+// A pod that vanished between the List and the Patch is not an error: it holds no
+// label anyone can read, and the next tick lists without it. Reporting it would make
+// an ordinary scale-down or eviction look like a routing failure.
+func TestReconcilePodLabelsIgnoresAVanishedPod(t *testing.T) {
+	cs := fake.NewSimpleClientset(mkRolePod("pg-0", "standby"), mkRolePod("pg-1", "standby"))
+	cs.PrependReactor("patch", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if a.(k8stesting.PatchAction).GetName() == "pg-1" {
+			return true, nil, apierrors.NewNotFound(corev1.Resource("pods"), "pg-1")
+		}
+		return false, nil, nil
+	})
+	c := NewWithClient(cs, ns)
+	ctx := context.Background()
+	if err := c.ReconcilePodLabels(ctx, "app.kubernetes.io/component=postgresql",
+		map[string]string{"pg-0": "primary", "pg-1": "standby"}); err != nil {
+		t.Fatalf("a NotFound patch must not surface as an error: %v", err)
+	}
+	p, _ := cs.CoreV1().Pods(ns).Get(ctx, "pg-0", metav1.GetOptions{})
+	if p.Labels["pg-role"] != "primary" {
+		t.Errorf("pg-0 = %q, want primary", p.Labels["pg-role"])
+	}
+}
+
+// --- #298 review: the highwater marker is monotonic in WriteMarker itself ---
+
+// Monotonicity was enforced only by the callers, and the callers can be fed a lie:
+// every advanceMarker call site decides from Observation.Marker, which observe()
+// leaves at its ZERO VALUE (Present=false, i.e. "no constraint") whenever the
+// fence-bounded ReadMarker missed its deadline -- and finishInitdbNative passes
+// MarkerState{} outright. One apiserver blip on a node whose PGDATA was just rebuilt
+// was then enough to record timeline 1 over a recorded 7, defeating the unsafeToServe
+// highwater guard on every stale node in the cluster.
+func TestWriteMarkerRefusesToLowerTheTimeline(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	c := NewWithClient(cs, ns)
+	ctx := context.Background()
+	if err := c.WriteMarker(ctx, "pg-primary", "pg-0", 7); err != nil {
+		t.Fatal(err)
+	}
+	err := c.WriteMarker(ctx, "pg-primary", "pg-1", 1)
+	if err == nil {
+		t.Fatal("lowering the recorded timeline must be refused")
+	}
+	// Both numbers belong in the message: which highwater, and what tried to replace it.
+	for _, want := range []string{"7", "1", "monotonic"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q: %v", want, err)
+		}
+	}
+	m, _ := c.ReadMarker(ctx, "pg-primary")
+	if m.Timeline != 7 || m.Primary != "pg-0" {
+		t.Errorf("marker was mutated by the refused write: %+v", m)
+	}
+}
+
+// The guard is `<`, not `<=`: a primary re-recording its own timeline (a new holder on
+// the SAME timeline, a periodic refresh) is the ordinary case and must still land.
+func TestWriteMarkerAllowsTheSameTimelineAndHigher(t *testing.T) {
+	c := NewWithClient(fake.NewSimpleClientset(), ns)
+	ctx := context.Background()
+	if err := c.WriteMarker(ctx, "pg-primary", "pg-0", 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.WriteMarker(ctx, "pg-primary", "pg-1", 7); err != nil {
+		t.Fatalf("same-timeline primary change must be allowed: %v", err)
+	}
+	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.Primary != "pg-1" {
+		t.Errorf("primary = %q, want pg-1", m.Primary)
+	}
+	if err := c.WriteMarker(ctx, "pg-primary", "pg-1", 8); err != nil {
+		t.Fatalf("advancing must be allowed: %v", err)
+	}
+	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.Timeline != 8 {
+		t.Errorf("timeline = %d, want 8", m.Timeline)
+	}
+}
+
+// An unparseable recorded value is treated as no constraint, matching
+// shouldAdvanceMarker -- otherwise a hand-edited or corrupted ConfigMap would wedge
+// the marker permanently, with no way for the agent to repair it.
+func TestWriteMarkerTreatsAnUnparseableTimelineAsNoConstraint(t *testing.T) {
+	cs := fake.NewSimpleClientset(&corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "pg-primary", Namespace: ns},
+		Data:       map[string]string{"primary": "pg-0", "timeline": "not-a-number"},
+	})
+	c := NewWithClient(cs, ns)
+	ctx := context.Background()
+	if err := c.WriteMarker(ctx, "pg-primary", "pg-1", 3); err != nil {
+		t.Fatalf("a corrupt recorded timeline must not wedge the marker: %v", err)
+	}
+	if m, _ := c.ReadMarker(ctx, "pg-primary"); m.Timeline != 3 {
+		t.Errorf("timeline = %d, want 3", m.Timeline)
 	}
 }

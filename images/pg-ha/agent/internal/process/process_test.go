@@ -140,3 +140,133 @@ func TestHasData(t *testing.T) {
 		t.Error("dir with PG_VERSION should have data")
 	}
 }
+
+// Running() is PROCESS liveness, deliberately distinct from SQL readiness: a
+// postmaster replaying WAL toward consistency is Running()=true but still rejects
+// connections. The reconcile loop keys on it so a starting standby is not
+// misclassified as stopped and needlessly restarted or re-cloned (#181).
+func TestChildPostmasterRunningTracksTheProcessNotReadiness(t *testing.T) {
+	dir := t.TempDir()
+	p := NewChildPostmaster(writeFakePG(t, dir, "exec sleep 30"), dir)
+	if p.Running() {
+		t.Error("a postmaster that was never started must not report Running")
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Alive but accepting nothing: still Running.
+	if !p.Running() {
+		t.Error("a started postmaster must report Running even before it accepts connections")
+	}
+	if err := p.Stop(context.Background(), Immediate); err != nil {
+		t.Fatal(err)
+	}
+	if p.Running() {
+		t.Error("a stopped postmaster must not report Running")
+	}
+}
+
+// A process that exits on its own (crash, OOM kill) must stop reporting Running
+// without anyone calling Stop -- otherwise the reconcile loop believes a dead node is
+// serving and never restarts it.
+func TestChildPostmasterRunningGoesFalseOnSelfExit(t *testing.T) {
+	dir := t.TempDir()
+	p := NewChildPostmaster(writeFakePG(t, dir, "exit 1"), dir)
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for p.Running() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if p.Running() {
+		t.Fatal("a self-exited postmaster still reports Running: the loop would never restart it")
+	}
+}
+
+// Exited() is how the main loop learns about an unexpected crash. It must be nil
+// before the first start (there is nothing to wait on) and must deliver the exit
+// afterwards.
+func TestChildPostmasterExitedChannel(t *testing.T) {
+	dir := t.TempDir()
+	p := NewChildPostmaster(writeFakePG(t, dir, "exit 3"), dir)
+	if p.Exited() != nil {
+		t.Error("Exited() must be nil before the first Start, or a select would fire on a closed nil-case")
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-p.Exited():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the child's exit was never delivered")
+	}
+}
+
+// Reload is a SIGHUP, which is only meaningful against a live process. On a stopped
+// postmaster it must ERROR rather than silently succeed: `ssl` and pg_hba are
+// SIGHUP-context, so a caller that believes a reload happened would report a config
+// as applied when nothing read it.
+func TestChildPostmasterReloadRequiresARunningProcess(t *testing.T) {
+	dir := t.TempDir()
+	p := NewChildPostmaster(writeFakePG(t, dir, "exec sleep 30"), dir)
+	if err := p.Reload(context.Background()); err == nil {
+		t.Error("reloading a postmaster that was never started must not report success")
+	}
+	if err := p.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// The fake ignores SIGHUP (the default disposition would kill it, so the script
+	// traps nothing); what matters is that signalling a live process succeeds.
+	if err := p.Reload(context.Background()); err != nil {
+		t.Errorf("reloading a running postmaster: %v", err)
+	}
+	_ = p.Stop(context.Background(), Immediate)
+	if err := p.Reload(context.Background()); err == nil {
+		t.Error("reloading after Stop must not report success")
+	}
+}
+
+// Stop on a postmaster that is not running is a no-op, not an error: the reconcile
+// loop calls it on paths where the node may already be down (a crash that raced the
+// decision), and an error there would be counted as a failed action and retried.
+func TestChildPostmasterStopOnAStoppedProcessIsANoOp(t *testing.T) {
+	dir := t.TempDir()
+	p := NewChildPostmaster(writeFakePG(t, dir, "exec sleep 30"), dir)
+	if err := p.Stop(context.Background(), Fast); err != nil {
+		t.Errorf("stopping a never-started postmaster must be a no-op: %v", err)
+	}
+}
+
+// The Supervisor is a thin pass-through, and each verb must reach its own Postmaster
+// method: a mis-wired Start/Reload would look correct in review and leave the agent
+// signalling a reload where it meant to boot the server.
+func TestSupervisorPassesEachVerbThrough(t *testing.T) {
+	f := &fakePostmaster{}
+	s := NewSupervisor(f)
+	ctx := context.Background()
+	if s.Running() {
+		t.Error("Running must reflect the wrapped postmaster, which has not started")
+	}
+	if err := s.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !f.started {
+		t.Error("Start did not reach the postmaster")
+	}
+	if !s.Running() {
+		t.Error("Running did not reflect the started postmaster")
+	}
+	if err := s.Reload(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !f.reloaded {
+		t.Error("Reload did not reach the postmaster")
+	}
+	if err := s.Stop(ctx, Fast); err != nil {
+		t.Fatal(err)
+	}
+	if f.stopCalls != 1 || f.stopMode != Fast {
+		t.Errorf("Stop reached the postmaster %d times with mode %v", f.stopCalls, f.stopMode)
+	}
+}

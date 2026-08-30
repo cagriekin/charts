@@ -346,3 +346,43 @@ func TestCloneStampsRequesterOnThePodTemplate(t *testing.T) {
 		t.Errorf("job annotation = %q, want the requester", got)
 	}
 }
+
+// WaitJobGone exists because a Foreground delete RETURNS while the object is still
+// present behind its finalizer, and the agent re-creates the same deterministic name --
+// so without the wait the create races the delete and fails with AlreadyExists on a Job
+// that is on its way out.
+func TestWaitJobGoneReturnsOnceTheJobIsAbsent(t *testing.T) {
+	c := NewWithClient(fake.NewSimpleClientset(), ns)
+	if err := c.WaitJobGone(context.Background(), "pg-restore", 2*time.Second); err != nil {
+		t.Errorf("an already-absent Job must return immediately: %v", err)
+	}
+}
+
+// A Job that never goes away has to surface as a NAMED error rather than an
+// indefinite block: the caller is a control-API handler with its own deadline, and
+// "still terminating" is the operator-actionable answer.
+func TestWaitJobGoneTimesOutWithAnActionableMessage(t *testing.T) {
+	stuck := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "pg-restore", Namespace: ns}}
+	c := NewWithClient(fake.NewSimpleClientset(stuck), ns)
+	err := c.WaitJobGone(context.Background(), "pg-restore", 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("a Job that never disappears must not block forever")
+	}
+	for _, want := range []string{"pg-restore", "terminating"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %q: %v", want, err)
+		}
+	}
+}
+
+// A cancelled context unwinds promptly: the handler's client has gone, and continuing
+// to poll the apiserver for the rest of the timeout serves nobody.
+func TestWaitJobGoneHonoursContextCancellation(t *testing.T) {
+	stuck := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "pg-restore", Namespace: ns}}
+	c := NewWithClient(fake.NewSimpleClientset(stuck), ns)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.WaitJobGone(ctx, "pg-restore", time.Minute); err == nil {
+		t.Fatal("a cancelled context must unwind the wait")
+	}
+}

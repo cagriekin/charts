@@ -261,3 +261,75 @@ func TestEnsureConfdIncludeIdempotentToggle(t *testing.T) {
 		t.Errorf("managed include should be removed when disabled:\n%s", b)
 	}
 }
+
+// WritePgHba is ATOMIC for the same reason EnsureConfdInclude and native.ensureInclude
+// are (#298 review): a truncated pg_hba.conf is not a degraded config but a postmaster
+// that refuses to start ("could not load pg_hba.conf"), and this file is rewritten on
+// the boot path immediately before sup.Start -- so a crash or ENOSPC mid-write would
+// leave the pod unable to come up on the very config it was repairing.
+func TestWritePgHbaIsAtomicAndPrivate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pg_hba.conf")
+	if err := WritePgHba(path, "host all all 10.0.0.0/8 scram-sha-256\n"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "host all all 10.0.0.0/8 scram-sha-256\n" {
+		t.Errorf("content = %q", b)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// pg_hba.conf describes who may authenticate how; PostgreSQL itself refuses a
+	// group- or world-readable one in some configurations, and it is not ours to widen.
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("mode = %04o, want 0600", perm)
+	}
+	// No temporary file survives the write -- a leftover would accumulate on the PVC
+	// once per boot.
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 1 {
+		names := make([]string, 0, len(ents))
+		for _, e := range ents {
+			names = append(names, e.Name())
+		}
+		t.Errorf("directory holds %v, want only pg_hba.conf", names)
+	}
+}
+
+// Rewritten on EVERY boot, so it has to replace the previous content wholesale rather
+// than append or merge: a stale rule left behind is an authentication path nobody
+// intended.
+func TestWritePgHbaReplacesPreviousContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pg_hba.conf")
+	if err := WritePgHba(path, "host all olduser 0.0.0.0/0 trust\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := WritePgHba(path, "host all all 10.0.0.0/8 scram-sha-256\n"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	if strings.Contains(string(b), "olduser") || strings.Contains(string(b), "trust") {
+		t.Errorf("the previous rules survived the rewrite: %q", b)
+	}
+}
+
+// The error names the file, because the caller logs it on the boot path where the pod
+// is about to fail its first start and the operator has nothing else to go on.
+func TestWritePgHbaErrorNamesTheFile(t *testing.T) {
+	// A path whose parent does not exist: the same class as a wrong PGDATA mount.
+	err := WritePgHba(filepath.Join(t.TempDir(), "no-such-dir", "pg_hba.conf"), "x\n")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "pg_hba.conf") {
+		t.Errorf("error should name the file: %v", err)
+	}
+}

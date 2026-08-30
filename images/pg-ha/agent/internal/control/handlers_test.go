@@ -77,8 +77,14 @@ type fakeNode struct {
 	liveLeaseHit int
 	// hang makes Submit block until the caller's context expires, standing in for a
 	// reconcile loop that is busy with a long action.
-	hang  bool
-	order *[]string
+	hang bool
+	// onSubmit runs inside Submit, before its context is consulted, and afterSubmit
+	// once the intent has been accepted. Together they place a client disconnect on
+	// either side of the stop, which is what separates the two independent context
+	// detaches in handleRestore (#298 review).
+	onSubmit    func()
+	afterSubmit func()
+	order       *[]string
 }
 
 func (f *fakeNode) Snapshot() Snapshot { return f.snap }
@@ -96,12 +102,23 @@ func (f *fakeNode) Submit(ctx context.Context, kind IntentKind) error {
 		<-ctx.Done()
 		return ctx.Err()
 	}
+	if f.onSubmit != nil {
+		f.onSubmit()
+	}
+	// The real Submit hands the intent to the reconcile loop and waits; a context that
+	// expires during that wait surfaces as an error to the handler.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if f.submitErr != nil {
 		return f.submitErr
 	}
 	f.submitted = append(f.submitted, kind)
 	if f.order != nil {
 		*f.order = append(*f.order, "intent:"+kind.String())
+	}
+	if f.afterSubmit != nil {
+		f.afterSubmit()
 	}
 	return nil
 }
@@ -124,7 +141,12 @@ func (f *fakeBackups) RestoreStatus(context.Context) (RestoreView, error) {
 	return f.status, f.statusErr
 }
 
-func (f *fakeBackups) Restore(_ context.Context, req RestoreRequest, id Identity) (RestoreView, error) {
+func (f *fakeBackups) Restore(ctx context.Context, req RestoreRequest, id Identity) (RestoreView, error) {
+	// CloneCronJobToJob is an apiserver call: a cancelled context surfaces as
+	// `context canceled` rather than as a created Job.
+	if err := ctx.Err(); err != nil {
+		return RestoreView{}, err
+	}
 	if f.createErr != nil {
 		return RestoreView{}, f.createErr
 	}
@@ -215,11 +237,17 @@ func newHarness(t *testing.T, tweak func(*Options, *harness)) *harness {
 // do issues a request through the full chain except authn, injecting an already
 // authenticated identity the way the TLS middleware would.
 func (h *harness) do(method, path, body, cn string) *httptest.ResponseRecorder {
+	return h.doCtx(context.Background(), method, path, body, cn)
+}
+
+// doCtx is do with a caller-supplied request context, so a test can model the client
+// going away mid-request (a dropped port-forward) rather than only a clean one.
+func (h *harness) doCtx(ctx context.Context, method, path, body, cn string) *httptest.ResponseRecorder {
 	var r io.Reader
 	if body != "" {
 		r = strings.NewReader(body)
 	}
-	req := httptest.NewRequest(method, path, r)
+	req := httptest.NewRequest(method, path, r).WithContext(ctx)
 	req = req.WithContext(withIdentity(req.Context(), Identity{CN: cn, Fingerprint: "ab12", Serial: "1"}))
 	rec := httptest.NewRecorder()
 	h.srv.recoverMW(h.srv.limitMW(h.srv.routes())).ServeHTTP(rec, req)
@@ -1063,3 +1091,65 @@ func (c *countingMetrics) IncControlRequest()        { c.requests++ }
 func (c *countingMetrics) IncControlRejected()       { c.rejected++ }
 func (c *countingMetrics) IncControlIntent()         { c.intents++ }
 func (c *countingMetrics) IncControlRestoreRequest() { c.restores++ }
+
+// --- #298 review: restart is subject to the in-flight-restore interlock ---
+
+// A restart STARTS the postmaster on this data directory, so it is subject to the same
+// interlock as resume and reinitialize. It was the one destructive local verb without
+// it, and the gap is reachable through the DOCUMENTED path rather than by misuse:
+// POST /v1/restore stops the postmaster and only then creates the Job, and its own
+// failure hint tells the operator to "POST /v1/restart to bring it back". runIntent
+// starts Postgres explicitly (so it works while paused, which a restore requires), and
+// pgBackRest has already cleared its postmaster.pid interlock by then -- so the restart
+// brings a second writer up on a directory the Job is mid-rewrite, and both corrupt it.
+func TestRestartRefusedWhileARestoreIsInFlight(t *testing.T) {
+	for _, phase := range []string{"pending", "running"} {
+		h := newHarness(t, nil)
+		h.bk.status = RestoreView{Phase: phase, JobName: "pg-pgbackrest-restore-api"}
+		rec := h.do("POST", "/v1/restart", `{"node":"pg-0","force":true}`, "ops")
+		wantCode(t, rec, 409)
+		if len(h.nd.submitted) != 0 {
+			t.Errorf("phase %s: restart was submitted anyway: %v", phase, h.nd.submitted)
+		}
+		// force must NOT bypass it: this is data corruption, not a write outage the
+		// operator can choose to accept.
+		if !strings.Contains(rec.Body.String(), "pg-pgbackrest-restore-api") {
+			t.Errorf("phase %s: the refusal should name the Job: %s", phase, rec.Body.String())
+		}
+	}
+}
+
+// A finished restore is not in flight: the restart the failure hint recommends has to
+// work, or the documented recovery path is a dead end.
+func TestRestartAllowedOnceTheRestoreHasFinished(t *testing.T) {
+	for _, phase := range []string{"none", "succeeded", "failed"} {
+		h := newHarness(t, nil)
+		h.bk.status = RestoreView{Phase: phase, JobName: "pg-pgbackrest-restore-api"}
+		wantCode(t, h.do("POST", "/v1/restart", `{"node":"pg-0","force":true}`, "ops"), 200)
+		if len(h.nd.submitted) != 1 {
+			t.Errorf("phase %s: submitted = %v", phase, h.nd.submitted)
+		}
+	}
+}
+
+// Reload is exempt: it writes nothing and starts nothing, so gating it would refuse a
+// harmless verb during the window an operator most wants to inspect configuration.
+func TestReloadIsNotGatedOnAnInFlightRestore(t *testing.T) {
+	h := newHarness(t, nil)
+	h.bk.status = RestoreView{Phase: "running", JobName: "pg-pgbackrest-restore-api"}
+	wantCode(t, h.do("POST", "/v1/reload", `{"node":"pg-0"}`, "ops"), 200)
+}
+
+// The interlock is only meaningful when restore triggering is ON: the Job it looks for
+// is the one the API creates, and the `get jobs` grant that reads it is rendered only
+// under control.restore.enabled. Consulting it otherwise would fail closed on an RBAC
+// error and break restart outright for every release with restore off.
+func TestRestartNotGatedWhenRestoreIsDisabled(t *testing.T) {
+	h := newHarness(t, nil)
+	h.bk.enabled = false
+	h.bk.statusErr = errors.New("jobs is forbidden")
+	wantCode(t, h.do("POST", "/v1/restart", `{"node":"pg-0","force":true}`, "ops"), 200)
+	if len(h.nd.submitted) != 1 {
+		t.Errorf("submitted = %v", h.nd.submitted)
+	}
+}

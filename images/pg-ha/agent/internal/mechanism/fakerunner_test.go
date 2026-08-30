@@ -21,10 +21,18 @@ type fakeRunner struct {
 	calls   []recordedCall
 	failOn  string // if a call's args contain this substring, it errors
 	failOut string // combined output returned alongside the error on a failing call
+	// onCall observes the filesystem AT the moment of a call, which is the only way to
+	// assert on state a function sets up and tears down around one exec -- e.g. that
+	// RejoinForceRewind takes standby.signal out of the way for pg_rewind and puts it
+	// back afterwards (#298 review).
+	onCall func(name string, args []string)
 }
 
 func (f *fakeRunner) Run(_ context.Context, env []string, name string, args ...string) (string, error) {
 	f.calls = append(f.calls, recordedCall{name: name, env: env, args: args})
+	if f.onCall != nil {
+		f.onCall(name, args)
+	}
 	if f.failOn != "" && strings.Contains(strings.Join(args, " "), f.failOn) {
 		out := "simulated failure"
 		if f.failOut != "" {

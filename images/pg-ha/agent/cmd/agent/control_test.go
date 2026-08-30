@@ -18,6 +18,9 @@ import (
 	"github.com/cagriekin/pg-ha-agent/internal/pg"
 	"github.com/cagriekin/pg-ha-agent/internal/process"
 	"github.com/cagriekin/pg-ha-agent/internal/reconcile"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 // FORCE bypasses pgBackRest's postmaster.pid interlock -- the last guard against
@@ -485,5 +488,151 @@ func TestRestoreEnvOverridesOnlyWhatTheRequestSpecified(t *testing.T) {
 		if _, ok := m["FORCE"]; ok {
 			t.Errorf("FORCE must never be overridden: %v", m)
 		}
+	}
+}
+
+// --- the control API's cluster adapter, end to end against a fake apiserver ---
+
+// clusterAPI is what /v1/pause, /v1/resume and /v1/switchover write through, and every
+// one of those verbs is an operator action taken during an incident. The adapter is
+// thin, which is exactly why a mis-wired field is invisible in review: it would compile,
+// return no error, and quietly write the wrong marker key.
+func TestClusterAPIRoundTripsThroughTheMarker(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	a := &agent{
+		cfg:  &config.Config{MarkerName: "pg-primary", PodName: "pg-0"},
+		kube: k8s.NewWithClient(cs, "ns"),
+	}
+	c := clusterAPI{a: a}
+	ctx := context.Background()
+
+	// Nothing written yet: absent is a legitimate state, not an error.
+	m, err := c.Marker(ctx)
+	if err != nil {
+		t.Fatalf("an absent marker must not be an error: %v", err)
+	}
+	if m.Present {
+		t.Error("no marker has been written yet")
+	}
+
+	// Pausing annotates the marker the cluster recorded when it first elected a
+	// primary; there is nothing to annotate before that, which the adapter reports
+	// rather than inventing.
+	if err := c.SetPause(ctx, true, "dba"); err == nil {
+		t.Error("pausing a cluster that has never recorded a primary must be refused, not silently no-op")
+	}
+	if err := a.kube.WriteMarker(ctx, "pg-primary", "pg-0", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.SetPause(ctx, true, "dba"); err != nil {
+		t.Fatal(err)
+	}
+	m, err = c.Marker(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.Paused {
+		t.Error("the pause did not reach the marker: automatic failover would still run")
+	}
+	// PausedBy is what the audit trail and the resume warning both read.
+	if m.PausedBy != "dba" {
+		t.Errorf("PausedBy = %q, want dba", m.PausedBy)
+	}
+
+	if err := c.SetSwitchoverTarget(ctx, "pg-1", "dba"); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ = c.Marker(ctx); m.SwitchoverTarget != "pg-1" {
+		t.Errorf("SwitchoverTarget = %q, want pg-1", m.SwitchoverTarget)
+	}
+
+	if err := c.ClearSwitchoverTarget(ctx); err != nil {
+		t.Fatal(err)
+	}
+	m, _ = c.Marker(ctx)
+	if m.SwitchoverTarget != "" {
+		t.Errorf("SwitchoverTarget = %q after the clear, want empty: the handoff would repeat every tick", m.SwitchoverTarget)
+	}
+	// Clearing the switchover must not clear the pause: they are independent operator
+	// decisions on the same object, and a merge that replaced the map would drop one.
+	if !m.Paused {
+		t.Error("clearing the switchover target also cleared the pause")
+	}
+
+	if err := c.SetPause(ctx, false, "dba"); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ = c.Marker(ctx); m.Paused {
+		t.Error("resume did not clear the pause")
+	}
+}
+
+// An apiserver failure must SURFACE rather than read as "no marker": the handlers gate
+// destructive verbs on Paused, and a swallowed error would present an unpaused cluster
+// as safe to restore.
+func TestClusterAPIMarkerReportsAReadFailure(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	cs.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("injected apiserver failure")
+	})
+	c := clusterAPI{a: &agent{
+		cfg:  &config.Config{MarkerName: "pg-primary"},
+		kube: k8s.NewWithClient(cs, "ns"),
+	}}
+	if _, err := c.Marker(context.Background()); err == nil {
+		t.Fatal("an unreadable marker must not be reported as an absent one")
+	}
+}
+
+// HoldsLeaseNow reads the LIVE DCS rather than the snapshot, because the control
+// listener accepts requests before the first tick has published anything -- and the
+// restart interlock keys on it. A snapshot-based answer would be false during exactly
+// the window an unforced restart of the serving primary must be refused.
+func TestNodeAPIHoldsLeaseNowReadsTheLiveDCS(t *testing.T) {
+	d := &fakeDCS{}
+	a := &agent{cfg: &config.Config{PodName: "pg-0"}, dcs: d}
+	n := nodeAPI{a: a}
+	if n.HoldsLeaseNow() {
+		t.Error("a node that holds nothing must not report the lease")
+	}
+	d.leader = true
+	if !n.HoldsLeaseNow() {
+		t.Error("HoldsLeaseNow did not follow the live DCS")
+	}
+	// And it is NOT reading the snapshot, which is still unpublished.
+	if s := n.Snapshot(); s.HoldsLease {
+		t.Error("the snapshot should still be empty; HoldsLeaseNow must not be sourced from it")
+	}
+}
+
+// Before the first tick the snapshot reports IDENTITY ONLY -- every position field zero
+// and ObservedAt zero -- rather than inventing state. The API surfaces that zero
+// ObservedAt as the "has not completed its first reconcile tick" case, which several
+// interlocks fail closed on.
+func TestNodeAPISnapshotBeforeTheFirstTick(t *testing.T) {
+	n := nodeAPI{a: &agent{cfg: &config.Config{PodName: "pg-0", PGMajor: "18"}}}
+	s := n.Snapshot()
+	if s.Node != "pg-0" || s.PGMajor != "18" {
+		t.Errorf("identity missing from the pre-tick snapshot: %+v", s)
+	}
+	if !s.ObservedAt.IsZero() {
+		t.Error("ObservedAt must stay zero until a tick publishes, or the interlocks read stale state as fresh")
+	}
+	if s.Local.Running || s.Local.Role != "" || s.LeaseHolder != "" {
+		t.Errorf("the pre-tick snapshot invented state: %+v", s)
+	}
+}
+
+// RestoreEnabled mirrors the chart's control.restore.enabled. It gates both the restore
+// verb and the in-flight-restore interlock, and the interlock is skipped entirely when
+// it is false -- because the `get jobs` grant that reads the Job is rendered only under
+// the same value, so consulting it otherwise would fail closed on an RBAC error.
+func TestBackupAPIRestoreEnabledFollowsTheRenderedValue(t *testing.T) {
+	if (backupAPI{a: &agent{cfg: &config.Config{}}}).RestoreEnabled() {
+		t.Error("restore must be off unless the chart turned it on")
+	}
+	if !(backupAPI{a: &agent{cfg: &config.Config{ControlRestoreEnabled: true}}}).RestoreEnabled() {
+		t.Error("RestoreEnabled did not follow the config")
 	}
 }

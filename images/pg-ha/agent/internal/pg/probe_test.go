@@ -749,3 +749,57 @@ func TestSSLActivePropagatesAQueryFailure(t *testing.T) {
 		t.Fatal("an unreachable server must be an error, not a report of plaintext")
 	}
 }
+
+// argCaptureExec records the full argv of every invocation.
+type argCaptureExec struct {
+	calls [][]string
+	ret   string
+}
+
+func (e *argCaptureExec) Run(_ context.Context, _ []string, _ string, args ...string) (string, error) {
+	e.calls = append(e.calls, args)
+	return e.ret, nil
+}
+
+// #298 review: every Prober query parses psql's OUTPUT SHAPE -- strings.Cut(out, "|"),
+// an exact "t"/"f", a bare LSN for ParseLSN -- and a startup file can change all of it
+// (\pset fieldsep, \pset null, a banner) while psql still exits 0. PSQLRC reaches this
+// process through postgresql.extraEnv (childenv.Filtered strips only *PASSWORD*), and
+// the agent itself writes into the postgres home (writePgpass), so ~/.psqlrc is
+// reachable too. The failure would be silent and cluster-wide: LSNOK false on every
+// node, so survivor ranking has no positions to compare and the failover simply never
+// happens. Assert it on the whole surface, not one query, so a new probe cannot be
+// added without it.
+func TestEveryProberQueryDisablesTheStartupFile(t *testing.T) {
+	ci := ConnInfo{Host: "h", Port: 5432, User: "repmgr", DB: "repmgr"}
+	ctx := context.Background()
+	for name, run := range map[string]func(*Prober){
+		"InRecovery":                  func(p *Prober) { p.InRecovery(ctx, ci) },
+		"PrimaryWALPosition":          func(p *Prober) { p.PrimaryWALPosition(ctx, ci) },
+		"StandbyReceiveLSN":           func(p *Prober) { p.StandbyReceiveLSN(ctx, ci) },
+		"StandbyTimeline":             func(p *Prober) { p.StandbyTimeline(ctx, ci) },
+		"StreamingUpstream":           func(p *Prober) { p.StreamingUpstream(ctx, ci) },
+		"SystemIdentifier":            func(p *Prober) { p.SystemIdentifier(ctx, ci) },
+		"ReplicationTopology":         func(p *Prober) { p.ReplicationTopology(ctx, ci) },
+		"PhysicalSlots":               func(p *Prober) { p.PhysicalSlots(ctx, ci) },
+		"CreatePhysicalSlot":          func(p *Prober) { p.CreatePhysicalSlot(ctx, ci, "pg_ha_pg_1") },
+		"DropPhysicalSlotIfInactive":  func(p *Prober) { p.DropPhysicalSlotIfInactive(ctx, ci, "pg_ha_pg_1") },
+		"SetSynchronizedStandbySlots": func(p *Prober) { p.SetSynchronizedStandbySlots(ctx, ci, []string{"pg_ha_pg_1"}) },
+		"SSLActive":                   func(p *Prober) { p.SSLActive(ctx, ci) },
+		"Probe":                       func(p *Prober) { p.Probe(ctx, ci) },
+	} {
+		e := &argCaptureExec{ret: "on"}
+		// Return values and errors are irrelevant here: the assertion is about argv, and
+		// each of these parses the fixed output differently.
+		run(&Prober{Exec: e})
+		if len(e.calls) == 0 {
+			t.Errorf("%s ran no psql call", name)
+			continue
+		}
+		for _, argv := range e.calls {
+			if argv[0] != "--no-psqlrc" {
+				t.Errorf("%s: psql argv must start with --no-psqlrc, got %v", name, argv)
+			}
+		}
+	}
+}

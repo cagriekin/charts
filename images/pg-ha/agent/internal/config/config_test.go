@@ -1,6 +1,8 @@
 package config
 
 import (
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -609,5 +611,115 @@ func TestLoadDefaultsTLSEnabledOff(t *testing.T) {
 	}
 	if c.TLSEnabled {
 		t.Error("TLSEnabled must default to false when the chart mounted no server TLS")
+	}
+}
+
+// #298 review: zero and negative durations PARSE cleanly, and every cross-field
+// ordering check in Load is gated on `> 0` -- so without an explicit sign check the
+// most broken values are exactly the ones that skip validation. RECONCILE_INTERVAL=0s
+// reached time.NewTicker in run(), which panics on a non-positive interval: PID 1
+// crash-loops on every pod at once, over a value the chart renders happily.
+func TestLoadRejectsNonPositiveDurations(t *testing.T) {
+	for _, c := range []struct{ key, val string }{
+		{"RECONCILE_INTERVAL", "0s"},
+		{"RECONCILE_INTERVAL", "-5s"},
+		{"LEASE_DURATION", "0s"},
+		{"LEASE_DURATION", "-1s"},
+		{"RENEW_DEADLINE", "0s"},
+		{"RETRY_PERIOD", "-2s"},
+	} {
+		m := fullEnv()
+		m[c.key] = c.val
+		_, err := Load(getter(m))
+		if err == nil {
+			t.Errorf("%s=%s was accepted", c.key, c.val)
+			continue
+		}
+		// The message has to name the offending key AND say what was wrong with it:
+		// "0s" parses, so a bare "invalid duration" would send an operator hunting a
+		// typo that is not there.
+		if !strings.Contains(err.Error(), c.key) || !strings.Contains(err.Error(), "POSITIVE") {
+			t.Errorf("%s=%s: error should name the key and require a positive value: %v", c.key, c.val, err)
+		}
+	}
+}
+
+// A non-positive duration must not ALSO be reported as an ordering violation: the
+// cross-field checks compare against a value that was never valid, and a second
+// derived complaint just buries the real one.
+func TestLoadNonPositiveDurationIsReportedOnce(t *testing.T) {
+	m := fullEnv()
+	m["LEASE_DURATION"] = "-1s"
+	_, err := Load(getter(m))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "RENEW_DEADLINE <") || strings.Contains(err.Error(), "LEASE_DURATION >= 5s") {
+		t.Errorf("a negative LEASE_DURATION should not also trip the ordering/floor checks: %v", err)
+	}
+}
+
+// PGBindir and PGLibdir both derive from PG_MAJOR, and they are used for opposite
+// judgements: the first says "run THIS image's postgres", the second answers "is the
+// library this data directory asks for genuinely absent from this image" (#293). A
+// wrong path makes the first fail loudly and the second fail SILENTLY -- it would
+// report every library as missing, or none.
+func TestVersionedPathsTrackPGMajor(t *testing.T) {
+	c, err := Load(getter(fullEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PGMajor == "" {
+		t.Fatal("PG_MAJOR did not load; the paths below would be meaningless")
+	}
+	wantBin := "/usr/lib/postgresql/" + c.PGMajor + "/bin"
+	if c.PGBindir() != wantBin {
+		t.Errorf("PGBindir() = %q, want %q", c.PGBindir(), wantBin)
+	}
+	wantLib := "/usr/lib/postgresql/" + c.PGMajor + "/lib"
+	if c.PGLibdir() != wantLib {
+		t.Errorf("PGLibdir() = %q, want %q", c.PGLibdir(), wantLib)
+	}
+	if c.PGBindir() == c.PGLibdir() {
+		t.Error("binaries and modules live in different directories; conflating them makes the #293 diagnostic meaningless")
+	}
+}
+
+// The restore status record lives BESIDE PGDATA, not inside it: a restore must never
+// write into the directory it is restoring, and the record has to survive on the PVC
+// after the Job is gone.
+func TestRestoreStatusPathSitsBesidePGDATA(t *testing.T) {
+	c, err := Load(getter(fullEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := c.RestoreStatusPath()
+	if strings.HasPrefix(got, strings.TrimRight(c.PGDATA, "/")+"/") {
+		t.Errorf("%q is INSIDE PGDATA %q: a restore would write into the directory it is rewriting", got, c.PGDATA)
+	}
+	if filepath.Dir(got) != filepath.Dir(c.PGDATA) {
+		t.Errorf("%q is not beside PGDATA %q, so it would not survive on the same PVC", got, c.PGDATA)
+	}
+}
+
+// String is what a startup log line renders. The repmgr password must never appear in
+// it -- a past code-scanning alert was exactly this.
+func TestStringRedactsTheRepmgrPassword(t *testing.T) {
+	m := fullEnv()
+	m["REPMGR_PASSWORD"] = "hunter2-do-not-log"
+	c, err := Load(getter(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := c.String()
+	if strings.Contains(s, "hunter2-do-not-log") {
+		t.Fatalf("the repmgr password reached the rendered config: %s", s)
+	}
+	if !strings.Contains(s, "RepmgrPassword:***") {
+		t.Errorf("the redaction marker is missing, so a future field could leak unnoticed: %s", s)
+	}
+	// fmt must route through it: a %v on the struct is the shape a log call takes.
+	if v := fmt.Sprintf("%v", c); strings.Contains(v, "hunter2-do-not-log") {
+		t.Errorf("%%v bypassed String(): %s", v)
 	}
 }

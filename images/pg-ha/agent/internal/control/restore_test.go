@@ -1,10 +1,12 @@
 package control
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 // pausedHarness is the state a restore is allowed from: the cluster paused, no
@@ -504,5 +506,76 @@ func TestRestoreStatusIsFeatureGated(t *testing.T) {
 	wantCode(t, rec, 501)
 	if !strings.Contains(rec.Body.String(), "control.restore.enabled") {
 		t.Errorf("should name the values key: %s", rec.Body.String())
+	}
+}
+
+// --- #298 review: past the point of no return, the flow must not die with the client ---
+
+// The Submit(IntentStop) has already stopped the postmaster; creating the Job is what
+// makes that recoverable. r.Context() is cancelled on client disconnect -- a
+// port-forward dropping mid-incident is the ORDINARY case, and a clean stop can
+// legitimately take tens of seconds. Bound to it, the handler returned
+// "could not stop postgres: context canceled" with the hint "no restore Job was
+// created" while Submit's own contract ("if ctx expires after the intent was accepted,
+// the loop still performs it") meant the loop stopped PostgreSQL anyway: a paused
+// cluster, down, with no Job, and the operator's only signal a client-side connection
+// error.
+func TestRestoreSurvivesAClientDisconnectDuringTheStop(t *testing.T) {
+	h := pausedHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The client goes away while the postmaster is shutting down.
+	h.nd.onSubmit = cancel
+
+	rec := h.doCtx(ctx, "POST", "/v1/restore", goodRestore, "dba")
+	wantCode(t, rec, 202)
+	want := []string{"intent:stop", "createJob"}
+	if len(h.order) != len(want) {
+		t.Fatalf("side effects = %v, want %v", h.order, want)
+	}
+	for i := range want {
+		if h.order[i] != want[i] {
+			t.Fatalf("side effects = %v, want %v", h.order, want)
+		}
+	}
+	if h.bk.created == nil {
+		t.Error("the restore Job was not created, so the stopped postmaster has nothing to recover it")
+	}
+}
+
+// The same detach on the Job half alone: the stop completes cleanly and the client
+// drops before the Job is created. Without it, CloneCronJobToJob returns
+// `context canceled` and the cluster is left paused and down with no Job.
+func TestRestoreJobIsCreatedAfterTheClientGoesAway(t *testing.T) {
+	h := pausedHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Cancel only once the stop has been ACCEPTED, so this isolates the second detach:
+	// with the first one in place and this one missing, the handler still reaches
+	// Backups.Restore -- with a context the client has already killed.
+	h.nd.afterSubmit = cancel
+	wantCode(t, h.doCtx(ctx, "POST", "/v1/restore", goodRestore, "dba"), 202)
+	if h.bk.created == nil {
+		t.Fatal("no restore Job was created after the client disconnected")
+	}
+}
+
+// The detach must keep a BOUND, not become unbounded: a reconcile loop that never
+// accepts the stop has to surface as an honest error rather than hanging the handler.
+// (TestRestoreStopTimeoutCreatesNoJob pins the no-Job half; this pins that the deadline
+// still comes from IntentTimeout and not from the -- now detached -- client.)
+func TestRestoreStopStillHonoursTheIntentTimeoutAfterTheDetach(t *testing.T) {
+	h := pausedHarness(t)
+	h.nd.hang = true
+	start := time.Now()
+	rec := h.doCtx(context.Background(), "POST", "/v1/restore", goodRestore, "dba")
+	if rec.Code != 502 && rec.Code != 504 {
+		t.Fatalf("status = %d, want a gateway error; body: %s", rec.Code, rec.Body.String())
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("the detached stop waited %v: the IntentTimeout bound was lost", elapsed)
+	}
+	if h.bk.created != nil {
+		t.Error("no Job may be created when the stop did not complete")
 	}
 }

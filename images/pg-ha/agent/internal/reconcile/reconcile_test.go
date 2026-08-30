@@ -534,3 +534,42 @@ func TestMoreAdvancedPeerGossipOnlyPeerDoesNotMaskReachableAheadPeer(t *testing.
 		t.Fatalf("Decide = %v target %q, want ReleaseLease to pg-2 (invariant 8)", d.Action, d.Target)
 	}
 }
+
+// Action.String indexes a literal array by the Action's own value, so a new action
+// appended to the const block without a matching entry PANICS the reconcile loop the
+// first time it is decided -- in the audit log line, after the decision, on the path
+// that was about to promote or fence. Assert the two lists line up.
+func TestEveryActionRendersItsOwnName(t *testing.T) {
+	want := []string{"NoOp", "Wait", "BootstrapInitdb", "BootstrapClone", "Promote",
+		"StayPrimary", "Follow", "DemoteFence", "RejoinForward", "ReleaseLease",
+		"StartLocal", "RestartLocal", "StartRecovery", "Switchover"}
+	// Switchover is the last declared action; anything added after it must extend the
+	// table above and the one in String().
+	if int(Switchover) != len(want)-1 {
+		t.Fatalf("Switchover = %d but the name table holds %d entries: String() will panic on the new action", Switchover, len(want))
+	}
+	seen := map[string]bool{}
+	for i, w := range want {
+		got := Action(i).String()
+		if got != w {
+			t.Errorf("Action(%d) = %q, want %q", i, got, w)
+		}
+		if seen[got] {
+			t.Errorf("duplicate action name %q: the audit trail cannot distinguish them", got)
+		}
+		seen[got] = true
+	}
+	// The named constants must agree with their positions, not just the count -- a
+	// reordered const block silently remaps every persisted decision string.
+	for _, c := range []struct {
+		a    Action
+		name string
+	}{
+		{NoOp, "NoOp"}, {Promote, "Promote"}, {DemoteFence, "DemoteFence"},
+		{RejoinForward, "RejoinForward"}, {Switchover, "Switchover"},
+	} {
+		if c.a.String() != c.name {
+			t.Errorf("%s renders as %q", c.name, c.a.String())
+		}
+	}
+}
