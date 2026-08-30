@@ -55,8 +55,11 @@ verdict() {
 # configurations.
 #
 # pgvector and etcd ship no fixtures, so they get defaults only. For pgvector that is acceptable
-# rather than a gap: its templates are byte-identical to pg's by invariant (`diff -r` is a gate),
-# so pg's profiles exercise the same template code.
+# rather than a gap: its templates are byte-identical to pg's by invariant, so pg's profiles
+# exercise the same template code. That invariant is enforced by scripts/check-template-parity.sh,
+# which lint.yaml runs -- it was cited here as "a gate" for a while before it was actually wired
+# up as one (#298 review), which is precisely the shape of hole this defaults-only shortcut opens
+# if the diff is ever left unrun.
 chart_profiles() {
   local chart="$1" f name base
   echo "defaults"

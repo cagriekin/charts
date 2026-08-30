@@ -184,7 +184,7 @@ jobs:
               --cache-to type=gha,mode=max,scope=pg-ha-image-pg${major} \
               -t "$ref" images/pg-ha
             # Own artifact per major (~190MB each): a suite leg needs exactly one, and
-            # with 46 legs bundling both would download a spare 190MB 46 times.
+            # with 50 legs bundling both would download a spare 190MB 50 times.
             mkdir -p "/tmp/kind-images-pg${major}"
             docker save "$ref" -o "/tmp/kind-images-pg${major}/repmgr.tar"
           done

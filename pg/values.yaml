@@ -184,8 +184,10 @@ postgresql:
   # extraVolumes are pod-level; extraVolumeMounts and extraEnv land on the postgresql
   # container. Validated at render time (see pg.validateExtraPassthrough): each must be
   # a LIST of objects, extraVolumes names may not collide with a chart-managed volume
-  # (data, postgresql-config, postgresql-tls, ext-lib, ext-share, repmgr-config,
-  # etcd-tls, pg-run, pgbackrest-config), every
+  # (data, postgresql-config, postgresql-tls, ext-lib, ext-share, ext-extra-lib,
+  # etcd-tls, agent-control-tls, pg-run, pgbackrest-config, pgbackrest-bootstrap-script
+  # -- the list is reserved UNCONDITIONALLY, so a name that is free today cannot start
+  # colliding once a later upgrade enables the feature that mounts it), every
   # extraVolumeMounts entry must reference a declared extraVolumes entry, and extraEnv
   # may not reuse a chart-set env name (PGDATA, POSTGRES_*, REPMGR_*, ...) -- each of
   # those is a silent-shadowing or apply-time failure, so the chart fails the render.

@@ -674,6 +674,49 @@
 
 ### Fixed
 
+- **A 1.x `ha.image.repository` is now refused at render time (#298 review).** The 2.0.0
+  generation guard checked only the image TAG (`trixie-*`), and the commonest half-carried pin
+  sets only the repository: a values file with `repmgr.image: {repository: cagriekin/repmgr,
+  pullPolicy: Always}` merged through the alias while `ha.image.tag` stayed at the 2.0.0 default,
+  and the render was clean -- every workload came out as `cagriekin/repmgr:2.0.0-pg18`, a
+  coordinate that has never existed (that registry is frozen at its last `trixie-` tag), so every
+  pod went ImagePullBackOff after an upgrade Helm had accepted. With the bundled etcd it was
+  worse: the only error was `pg.validateEtcdBootstrapImage` telling the operator to point
+  `etcd.rbac.bootstrapImage` at the same reference, which pinned *both* workloads to the missing
+  image. Matched on the repository's last path segment, so a mirror is caught too; retag a
+  private mirror of the 2.x image to something other than `.../repmgr`.
+
+- **`ha.agent.cascadingReplication` is typed in `values.schema.json` (#298 review).** Its sibling
+  `syncReplicationSlots` was; this was not, and `additionalProperties` is deliberately open. A
+  quoted `"false"` (or a `--set-string`) is a non-empty string and therefore truthy to a Go
+  template, so it silently enabled the cascading branch in the StatefulSet *and* dropped the
+  `PGHAReplicasNotStreaming` alert, which is omitted under cascading because `replicas_expected`
+  is 0 there. Both spellings (`ha.*` and the `repmgr.*` alias) are typed.
+
+- **The dead HA arm in `pgpool-configmap.yaml` is gone (#298 review).** `pg.agentMode` is defined
+  as `.Values.ha.enabled`, so the `{{ else if .Values.ha.enabled }}` that rendered the old
+  per-pod `backend_hostname{0..N}` list could never be reached. The render is byte-identical; the
+  branch is removed rather than left to read as coverage a maintainer would edit to no effect.
+
+- **The `PGBACKREST_STANZA` guard runs before `initdb` (#298 review, image).** It sat beside the
+  `archive_command` it protects, i.e. after the cluster had already been created and the base
+  GUCs written -- so a stanza outside `[A-Za-z0-9_-]` left `PG_VERSION` present with no
+  completion sentinel, and in the image's `postgres` mode the torn-bootstrap discard then re-ran
+  the whole `initdb` on every restart. It is now checked with the credentials, before the first
+  write to the volume.
+
+- **A planned step-down is no longer counted or logged as a split-brain fence (#298 review,
+  agent).** `dcs.OnLost` fires for a voluntary `Release()` too -- only `OnRenewFailure` is
+  filtered to involuntary loss -- and it gates solely on the read-write latch, which neither
+  `ReleaseLease` nor `Switchover` cleared before releasing. Every controlled switchover and
+  self-health handoff therefore incremented `pg_ha_agent_fences_total` and logged "lost
+  leadership; demoting (fence)": three of them in one maintenance window tripped the chart's
+  `PGHAAgentFlapping` page for work an operator had asked for, and the log told whoever read it
+  mid-incident that the node had been fenced. The latch is now cleared where -- and only where --
+  a demote or force-stop has just returned nil; on the paths where nothing was stopped it stays
+  armed, because an unreachable SQL probe on a live postmaster is exactly the uncertainty the
+  fence exists for.
+
 - **`postgresql.extensions.extraVolumes` no longer refuses the name `pgbackrest` (#298).** The
   reserved-name validator listed it among the chart's own volumes, but `pgbackrest` is the idle
   sidecar *container*'s name -- Kubernetes keeps container and volume names in separate

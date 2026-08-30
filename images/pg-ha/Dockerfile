@@ -129,5 +129,17 @@ WORKDIR /var/lib/postgresql
 # PostgreSQL
 EXPOSE 5432
 
+# SIGINT, not the Docker default SIGTERM (#298 review), matching the upstream `postgres`
+# image. In `postgres` mode entrypoint.sh ends in `exec postgres -D "$PGDATA"`, so the
+# postmaster really is PID 1 -- and to a postmaster SIGTERM means SMART shutdown: it waits for
+# every client session to disconnect. `docker stop` on a container with one idle psql attached
+# therefore hangs the full stop timeout, gets SIGKILLed, and the next start does crash
+# recovery. SIGINT is FAST shutdown: disconnect clients, checkpoint, exit cleanly.
+#
+# The chart is unaffected either way -- it runs `agent`, where PID 1 is the Go agent, which
+# handles SIGTERM itself and stops its postgres child. This is for direct image use, which
+# entrypoint.sh's postgres branch documents as a supported surface.
+STOPSIGNAL SIGINT
+
 # Default entrypoint (can be overridden for different use cases)
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

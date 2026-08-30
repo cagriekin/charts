@@ -68,12 +68,28 @@ func (p *ChildPostmaster) Start(_ context.Context) error {
 		// spurious error) from one that has already exited on its own (a crashed
 		// postgres -- clear the stale handle and start fresh, so the next reconcile
 		// tick actually recovers it instead of looping on "already started").
-		select {
-		case <-p.exited:
-			p.cmd, p.exited = nil, nil // exited on its own; fall through to a fresh start
-		default:
+		//
+		// Keyed on p.done, NOT on a non-blocking receive from p.exited (#298 review). The
+		// Wait goroutine publishes the exit in two steps -- done.Store(true), then the
+		// channel send -- and Running() reads only the first. Between them a tick sees
+		// Running()==false, Decide routes to StartLocal, and Start found an EMPTY channel:
+		// it took the default arm and returned nil, reporting a successful start with no
+		// postmaster running. done is the same flag Running() answers from, so the two can
+		// no longer disagree; the receive that follows is blocking, and safe because done
+		// is only ever set immediately before that send.
+		if !p.done.Load() {
 			return nil // still running
 		}
+		// Drain non-blockingly: done is the authority, the channel value is only being
+		// reaped. A blocking receive here would hold p.mu while waiting, and a concurrent
+		// Stop that had already taken the single queued value (but not yet reached its own
+		// mu-taking clear()) would deadlock the two. opMu serialises every caller today, so
+		// that cannot happen -- this just declines to depend on it.
+		select {
+		case <-p.exited:
+		default:
+		}
+		p.cmd, p.exited = nil, nil // exited on its own; fall through to a fresh start
 	}
 	cmd := exec.Command(p.PostgresBin, "-D", p.DataDir)
 	// Strip the agent's credential env from the postmaster (#298 security review):

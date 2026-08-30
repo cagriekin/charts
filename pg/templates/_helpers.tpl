@@ -1527,6 +1527,22 @@ This catches the mistake an upgrade actually makes -- carrying the old values fi
 {{- define "pg.validateHaImageGeneration" -}}
 {{- if .Values.ha.enabled -}}
 {{- $tag := (.Values.ha.image).tag | default "" | toString -}}
+{{- /* The REPOSITORY is checked as well as the tag (#298 review), because the commonest
+       half-carried pin sets only the repository. `repmgr.image: {repository: cagriekin/repmgr,
+       pullPolicy: Always}` -- an air-gapped mirror path, or any 1.x values file that never
+       pinned a tag -- merges through the alias into ha.image.repository while ha.image.tag
+       stays at the 2.0.0 default, and the render was CLEAN: every workload came out as
+       `cagriekin/repmgr:2.0.0-pg18`, a coordinate that has never existed and never will
+       (cagriekin/repmgr is frozen at its last trixie- tag), so every pod goes ImagePullBackOff
+       after an upgrade helm accepted. With the bundled etcd it was worse: the only error was
+       pg.validateEtcdBootstrapImage saying "set etcd.rbac.bootstrapImage to the same values as
+       ha.image", and following that remediation pinned BOTH workloads to the missing image.
+       Matched on the repository's last path segment so a mirror (registry.internal/foo/repmgr)
+       is caught too; the escape hatch is the same one the tag check offers -- retag. */ -}}
+{{- $repo := (.Values.ha.image).repository | default "" | toString -}}
+{{- if regexMatch "(^|/)repmgr$" $repo -}}
+{{- fail (printf "ha.image.repository=%q is the 1.x image (cagriekin/repmgr), and chart 2.0.0 cannot run it: the repmgr-init container passes only PG_MAJOR, while a 1.x image's `entrypoint.sh init` runs init-repmgr.sh and hard-fails on the unset HEADLESS_SERVICE and REPMGR_PASSWORD -- every pod would go Init:CrashLoopBackOff at once. That registry is also frozen at its last `trixie-` tag, so leaving the repository behind while ha.image.tag moves to the 2.x scheme renders %s:%s, an image that does not exist, and every pod goes ImagePullBackOff instead. Pin the 2.x HA image: ha.image.repository=cagriekin/pg-ha and ha.image.tag=<chart-version>-pg<major> (e.g. 2.0.0-pg18, matching ha.image.majorVersion), and move etcd.rbac.bootstrapImage to the same reference. If you are pinning a private mirror of the 2.x image, name it something other than `.../repmgr`." $repo $repo ($tag | default "<unset>")) -}}
+{{- end -}}
 {{- if hasPrefix "trixie-" $tag -}}
 {{- fail (printf "ha.image.tag=%q is a 1.x image tag (the `trixie-<repmgr-version>-<n>` scheme), and chart 2.0.0 cannot run it: the repmgr-init container passes only PG_MAJOR, while a 1.x image's `entrypoint.sh init` runs init-repmgr.sh and hard-fails on the unset HEADLESS_SERVICE and REPMGR_PASSWORD -- every pod would go Init:CrashLoopBackOff at once. Pin the 2.x HA image instead: ha.image.repository=cagriekin/pg-ha and ha.image.tag=<chart-version>-pg<major> (e.g. 2.0.0-pg18, matching ha.image.majorVersion), and move etcd.rbac.bootstrapImage to the same reference. If you are pinning a private mirror of the 2.x image, retag it without the `trixie-` prefix." $tag) -}}
 {{- end -}}

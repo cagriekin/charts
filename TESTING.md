@@ -100,7 +100,7 @@ the behavioral and cross-render coverage. Both share the `tests/values-*.yaml` f
 There was one, from #288/#295, while the repmgr-to-native transition was in flight: a real
 `mechanism: [repmgr, native]` matrix key with 11 exclusions, 62 legs, and a
 `pg/tests/set-mechanism.sh` that retargeted the working tree. All of it is gone. `native` is the
-only mechanism, so the matrix is **21 suites x 2 majors = 42 legs, no exclusions**, and the chart
+only mechanism, so the matrix is **25 suites x 2 majors = 50 legs, no exclusions**, and the chart
 emits `MECHANISM` unconditionally rather than only at a non-default value -- an image built before
 #294 assumes repmgr when the variable is absent, so omitting it at the new default would run the
 removed mechanism during the image-then-chart release this repo does.
@@ -108,13 +108,15 @@ removed mechanism during the image-then-chart release this repo does.
 The `pg-tests-passed` gate needed no change: for a matrix job `needs.suite.result` is success
 only when every leg succeeded.
 
-Two leftovers you may still meet:
+One leftover you may still meet:
 
-- `chart_mechanism()` in `pg/tests/helpers.sh` reads the tree's `repmgr.agent.mechanism` and now
-  always answers `native`, so the branches in `test-scaledown.sh`, `test-agent-rolling.sh`,
-  `test-sync-replication-slots.sh`, `test-upgrade.sh` and `test-pgbackrest-restore-ha.sh` are
-  inert. Each correctly takes its native side, but they are dead weight -- collapse them rather
-  than re-gating them.
-- A fixture pinning an older published `repmgr.image.tag` tests that published image instead of
-  the one built from `images/pg-ha`. `values-agent.yaml` and `values-repmgr.yaml` were unpinned
-  when this silently broke the native legs; eleven other fixtures still carry a pin.
+- A fixture pinning an older published HA image tag tests that published image instead of the
+  one built from `images/pg-ha`. `values-agent.yaml` and `values-repmgr.yaml` were unpinned when
+  this silently broke the native legs. CI is not exposed to it either way --
+  `pg/tests/set-pg-major.sh` rewrites every fixture's tag to the chart's own before any suite
+  runs -- but a LOCAL `make -C pg test-<suite>` is, so a pin there asserts against last
+  quarter's image.
+
+(`chart_mechanism()` was the other one; it and its inert branches in `test-scaledown.sh`,
+`test-agent-rolling.sh`, `test-sync-replication-slots.sh`, `test-upgrade.sh` and
+`test-pgbackrest-restore-ha.sh` have since been collapsed, as this section recommended.)

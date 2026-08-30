@@ -620,6 +620,17 @@ if PGDATA="${_sz}/bad" POSTGRES_USER=app POSTGRES_DB=app POSTGRES_PASSWORD=pw \
 else
   ok "#298: a PGBACKREST_STANZA carrying a quote is refused before the GUC write"
 fi
+# ...and refused BEFORE the volume is touched (#298 review). The guard used to sit beside the
+# GUC append, i.e. after initdb had already created the cluster: PG_VERSION was then present
+# with no completion sentinel, and in `postgres` mode bootstrap_or_discard_torn discards and
+# re-runs the whole initdb on every restart -- a full-initdb-per-boot crash loop instead of a
+# refusal that never wrote anything. The stub initdb above creates PG_VERSION, so its ABSENCE
+# is the direct evidence that the refusal preceded it.
+if [ ! -e "${_sz}/bad/PG_VERSION" ]; then
+  ok "#298: the stanza refusal happens before initdb writes the volume"
+else
+  bad "#298: the stanza was refused only after initdb had already written the data directory"
+fi
 # A plain stanza must NOT trip the guard (it may fail later for unrelated reasons; assert only
 # that the archive_command it would write carries the clean name).
 if PGDATA="${_sz}/good" POSTGRES_USER=app POSTGRES_DB=app POSTGRES_PASSWORD=pw \

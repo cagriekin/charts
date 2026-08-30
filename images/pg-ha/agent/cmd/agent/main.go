@@ -966,7 +966,27 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// This pod's name, compared against Marker.Primary so an empty-data lease holder
 	// can recognize it is not the recorded primary and release the lease (#186).
 	o.LocalNode = a.cfg.PodName
-	a.observeStandbyStall(ctx, &o)
+	// Pause-gated, exactly like LocalStuck below (#298 review). Both are stateful,
+	// time-based signals computed here rather than in the pure Decide, and both feed a
+	// DESTRUCTIVE branch -- LocalStuck a self-health ReleaseLease, StandbyStalled a
+	// RejoinForward that stops postgres, runs pg_rewind, and on divergence leaves an
+	// unreaped .diverged.<ts> copy. Only one of the two was suppressed while paused.
+	//
+	// A pause is expected to be long (the chart ships PGHAAgentPausedTooLong for HOUR-long
+	// ones), and it is exactly when a standby legitimately loses its walreceiver: the
+	// operator restarts the primary, drains its node, or runs the documented in-place PITR.
+	// The counter climbed past standbyStallTicks during all of that -- Decide returns NoOp
+	// while paused, so nothing happened yet -- and then the settling window the counter
+	// exists to provide was already spent: on the FIRST unpaused tick `newer != nil &&
+	// StandbyStalled` held and Decide short-circuited to RejoinForward before the Follow
+	// branch that would have reattached the standby in seconds. Treat a resume as a start,
+	// not as a continuation.
+	if m.Paused {
+		a.standbyNoReceiverTicks = 0
+		a.standbyLastProgressLSN = pg.LSN{}
+	} else {
+		a.observeStandbyStall(ctx, &o)
+	}
 	// Cascading replication (#29): when enabled, a standby may follow another standby
 	// (the pure cascadeFollowTarget decides; default off -> follow the primary).
 	o.Cascade = a.cfg.CascadeReplication
@@ -1119,6 +1139,25 @@ func (a *agent) observeStandbyStall(ctx context.Context, o *reconcile.Observatio
 // sized well past any plausible single-segment fetch rather than tight enough to be prompt.
 const standbyStallTicks = 36
 
+// clearServingRWForPlannedStepDown drops the read-write latch on a step-down this agent
+// performed DELIBERATELY and completed successfully.
+//
+// dcs.OnLost fires for a voluntary Release() too -- k8sdcs and etcddcs both invoke it
+// unconditionally, and only OnRenewFailure is filtered to involuntary loss -- and it gates
+// solely on servingRW. Left set through a planned handoff, the release that follows counted
+// a metr.IncFence() and logged "lost leadership; demoting (fence)": three switchovers or
+// self-health handoffs in one maintenance window tripped the chart's PGHAAgentFlapping page
+// (increase(pg_ha_agent_fences_total[15m]) > 2, "suggests instability"), and the log told
+// whoever was reading it mid-incident that the node had been fenced when it had in fact
+// stepped down on request (#298 review).
+//
+// Call this ONLY where a demote or stop has just returned nil. That is the positive evidence
+// tick() requires: clearing on anything weaker -- an unreachable SQL probe on a postmaster
+// that is still alive -- disarms the fence for the one node that most needs it.
+func (a *agent) clearServingRWForPlannedStepDown() {
+	a.servingRW.Store(false)
+}
+
 func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.Observation) error {
 	// Any action other than Follow changes (or ends) this node's standby identity, so
 	// the next Follow must re-register + repoint.
@@ -1194,7 +1233,16 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 	case reconcile.Promote:
 		// The node is already running as a standby (the reconcile guard); promote
 		// acts on the running postmaster — do NOT Start it (that would error).
-		if err := a.mech.Promote(ctx); err != nil {
+		//
+		// beatDuring, like every other long mechanism call (#298 review). Native.Promote
+		// runs `pg_ctl -w promote`, which waits for the promotion to finish: a standby with
+		// a large backlog of received-but-unreplayed WAL -- the ordinary failover case --
+		// can sit here for up to PGCTLTIMEOUT (60s, and nothing in this image lowers it),
+		// holding opMu with no metr.Beat(). /healthz goes stale at reconcileInterval*3 (15s
+		// on chart defaults), and a concurrent dcs.OnLost fence blocks on opMu for the same
+		// span. Clone, the initdb path, RejoinForceRewind and ReclonePreserving are all
+		// wrapped for exactly this; Promote was the one that was not.
+		if err := a.beatDuring(func() error { return a.mech.Promote(ctx) }); err != nil {
 			return err
 		}
 		a.metr.IncPromotion()
@@ -1530,6 +1578,7 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			if err != nil {
 				return err
 			}
+			a.clearServingRWForPlannedStepDown()
 		case obs.LocalStuck && !obs.Local.InRecovery:
 			// Self-health failover: a primary-state postmaster that is wedged/frozen
 			// (SQL unreachable, so Running is false). The agent owns this PID-1 child,
@@ -1542,7 +1591,14 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			if err := a.sup.Stop(rctx, process.Immediate); err != nil {
 				return err
 			}
+			a.clearServingRWForPlannedStepDown()
 		}
+		// NOTE the clears live INSIDE the two arms above, not here (#298 review). Falling
+		// through this switch means neither arm ran -- a node whose SQL probe is failing
+		// while its postmaster is still alive and not yet past the stuck grace, which is
+		// exactly the "uncertain, may still be a writer" state tick() refuses to clear the
+		// latch on. Clearing it here would release the Lease AND disarm the OnLost fence for
+		// that node, so a peer promotes while a possibly-live writer is still up.
 		a.dcs.Release()
 		return nil
 
@@ -1585,6 +1641,9 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			if err != nil {
 				return err
 			}
+			// Same as ReleaseLease, and inside the guard for the same reason: only a
+			// COMPLETED demote is proof this node is no longer a writer (#298 review).
+			a.clearServingRWForPlannedStepDown()
 		}
 		a.dcs.Release()
 		return nil

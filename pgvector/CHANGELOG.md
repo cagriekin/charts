@@ -470,6 +470,38 @@
 
 ### Fixed
 
+- **A 1.x `ha.image.repository` is now refused at render time (#298 review).** The 2.0.0
+  generation guard checked only the image TAG (`trixie-*`), so a values file pinning only
+  `repmgr.image.repository: cagriekin/repmgr` rendered cleanly as `cagriekin/repmgr:2.0.0-pg18`
+  -- an image that has never existed -- and every pod went ImagePullBackOff after an upgrade Helm
+  had accepted. Shares pg's templates; see the [pg CHANGELOG](../pg/CHANGELOG.md) for the full
+  reasoning.
+
+- **`ha.agent.cascadingReplication` is typed in `values.schema.json` (#298 review).** A quoted
+  `"false"` is truthy to a Go template, so it silently enabled cascading replication *and*
+  dropped the `PGHAReplicasNotStreaming` alert. Both spellings (`ha.*` and the `repmgr.*` alias)
+  are typed.
+
+- **The dead HA arm in `pgpool-configmap.yaml` is gone (#298 review).** `pg.agentMode` is defined
+  as `.Values.ha.enabled`, so the `{{ else if .Values.ha.enabled }}` branch was unreachable. The
+  render is byte-identical.
+
+- **The `PGBACKREST_STANZA` guard runs before `initdb` (#298 review, image).** A stanza outside
+  `[A-Za-z0-9_-]` was rejected only after the cluster had been created, leaving `PG_VERSION`
+  present with no completion sentinel. It is now checked before the first write to the volume.
+
+- **A planned step-down is no longer counted or logged as a split-brain fence (#298 review,
+  agent).** `dcs.OnLost` fires for a voluntary `Release()` too -- only `OnRenewFailure` is
+  filtered to involuntary loss -- and it gates solely on the read-write latch, which neither
+  `ReleaseLease` nor `Switchover` cleared before releasing. Every controlled switchover and
+  self-health handoff therefore incremented `pg_ha_agent_fences_total` and logged "lost
+  leadership; demoting (fence)": three of them in one maintenance window tripped the chart's
+  `PGHAAgentFlapping` page for work an operator had asked for, and the log told whoever read it
+  mid-incident that the node had been fenced. The latch is now cleared where -- and only where --
+  a demote or force-stop has just returned nil; on the paths where nothing was stopped it stays
+  armed, because an unreachable SQL probe on a live postmaster is exactly the uncertainty the
+  fence exists for.
+
 - **`postgresql.extensions.extraVolumes` no longer refuses the name `pgbackrest` (#298).** The
   reserved-name validator listed it among the chart's own volumes, but `pgbackrest` is the idle
   sidecar *container*'s name -- Kubernetes keeps container and volume names in separate

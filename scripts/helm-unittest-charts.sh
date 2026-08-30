@@ -22,7 +22,8 @@ if ! helm plugin list 2>/dev/null | awk '{print $1}' | grep -qx unittest; then
 fi
 
 # pgvector's unit tests must never be a COPY of a pg one under the same name (#298 review).
-# pg/templates and pgvector/templates are byte-identical by gate and pgvector's are symlinks INTO
+# pg/templates and pgvector/templates are byte-identical (enforced by
+# scripts/check-template-parity.sh, run from lint.yaml) and pgvector's are symlinks INTO
 # pg's, so pg's suite already covers every line of shared template logic. A same-named copy in
 # pgvector reads as a mirror while being free to drift, and nothing noticed that guards_test.yaml
 # there held a reworded subset of pg's cases -- 24 of 76. So: share it by SYMLINK, or give it a

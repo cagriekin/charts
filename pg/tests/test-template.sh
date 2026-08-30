@@ -173,6 +173,35 @@ pgpool_agent_primary=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled
 assert_not_contains "#207: agent mode primary-only omits RO backend1" "${pgpool_agent_primary}" "backend_hostname1"
 assert_contains "#207: agent mode primary-only weights the sole primary 1" "${pgpool_agent_primary}" "backend_weight0 = 1"
 
+# #298 review: HA pgpool has exactly TWO backends, and never the per-pod headless list.
+# A dead `{{ else if .Values.ha.enabled }}` arm used to render backend_hostname{0..N} against
+# <fullname>-<i>.<fullname>-headless -- the repmgrd layout, where pgpool tracked every node
+# because repmgrd moved the primary role between them. It could not be reached (pg.agentMode IS
+# .Values.ha.enabled, so the agent arm above consumed every ha.enabled render), which is exactly
+# why it survived: it read as the HA layout to anyone editing this file. Pin the real one.
+assert_not_contains "#298: HA pgpool has no third backend" "${pgpool_agent_ro}" "backend_hostname2"
+assert_not_contains "#298: HA pgpool never points at the per-pod headless DNS" "${pgpool_agent_ro}" "-headless"
+assert_contains "#298: HA pgpool backend0 is the RW Service" "${pgpool_agent_ro}" "backend_hostname0 = 'test-pg.default.svc"
+# ...while STANDALONE is the layout that legitimately names a pod through the headless Service:
+# there is no RW Service to front, so pgpool talks to pg-0 directly.
+pgpool_standalone=$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set ha.enabled=false --set postgresql.replicaCount=0 --show-only templates/pgpool-configmap.yaml 2>&1)
+assert_contains "#298: standalone pgpool still addresses pg-0 via the headless Service" "${pgpool_standalone}" "backend_hostname0 = 'test-pg-0.test-pg-headless"
+
+# #298 review: ha.agent.cascadingReplication is TYPED in values.schema.json. It is read as plain
+# Go-template truthiness, so a quoted "false" is a non-empty string and therefore ON -- which
+# both renders the cascading branch in the StatefulSet and drops the PGHAReplicasNotStreaming
+# alert (omitted under cascading because replicas_expected is 0 there). Its sibling
+# syncReplicationSlots was typed and this was not.
+casc_str_rc=0
+helm template test-pg "${CHART_DIR}" --set-string ha.agent.cascadingReplication=false >/dev/null 2>&1 || casc_str_rc=$?
+assert_gt "#298: a quoted cascadingReplication is refused by the schema" "${casc_str_rc}" 0
+casc_str_alias_rc=0
+helm template test-pg "${CHART_DIR}" --set-string repmgr.agent.cascadingReplication=false >/dev/null 2>&1 || casc_str_alias_rc=$?
+assert_gt "#298: ...under the repmgr.* alias too" "${casc_str_alias_rc}" 0
+casc_bool_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.agent.cascadingReplication=true >/dev/null 2>&1 || casc_bool_rc=$?
+assert_eq "#298: a real boolean cascadingReplication renders" "0" "${casc_bool_rc}"
+
 # #156: env values must be quoted (k8s EnvVar.value is a string; a numeric/bool-looking
 # value renders as a YAML scalar the API server rejects with an unmarshal error).
 numericenv=$(helm template test-pg "${CHART_DIR}" --set repmgr.database=12345 --show-only templates/statefulset.yaml 2>&1)
@@ -5330,6 +5359,27 @@ for good_tag in "2.0.0-pg18" "2.1.0-pg18" "internal-build-42"; do
     --set etcd.rbac.bootstrapImage.tag="${good_tag}" >/dev/null 2>&1 || gt_rc=$?
   assert_eq "#298: HA image tag ${good_tag} renders" "0" "${gt_rc}"
 done
+# The REPOSITORY half of the same pin (#298 review). The commonest half-carried values file
+# sets only the repository -- `repmgr.image: {repository: cagriekin/repmgr, pullPolicy: Always}`
+# from an air-gapped mirror setup, or any 1.x file that never pinned a tag -- and the tag then
+# stays at the 2.0.0 default. That rendered CLEAN as cagriekin/repmgr:2.0.0-pg18, a coordinate
+# that has never existed (the 1.x registry is frozen at its last trixie- tag), so every pod went
+# ImagePullBackOff after an upgrade helm accepted.
+legacy_repo=$(helm template test-pg "${CHART_DIR}" --set repmgr.image.repository=cagriekin/repmgr 2>&1 || true)
+assert_contains "#298: a 1.x ha.image.repository is rejected" "${legacy_repo}" "is the 1.x image"
+assert_contains "#298: ...the message names the offending repository" "${legacy_repo}" "cagriekin/repmgr"
+assert_contains "#298: ...and names the 2.x repository to use instead" "${legacy_repo}" "cagriekin/pg-ha"
+# Matched on the last path segment, so a private mirror of the 1.x image is caught too.
+legacy_repo_mirror=$(helm template test-pg "${CHART_DIR}" --set ha.image.repository=registry.internal/mirrors/repmgr 2>&1 || true)
+assert_contains "#298: a mirrored 1.x repository is rejected too" "${legacy_repo_mirror}" "is the 1.x image"
+# ...and the guard is narrow: a 2.x repository, mirrored or not, renders.
+for good_repo in "cagriekin/pg-ha" "registry.internal/mirrors/pg-ha" "registry.internal/repmgr-ha"; do
+  gr_rc=0
+  helm template test-pg "${CHART_DIR}" --set ha.image.repository="${good_repo}" \
+    --set etcd.rbac.bootstrapImage.repository="${good_repo}" >/dev/null 2>&1 || gr_rc=$?
+  assert_eq "#298: HA image repository ${good_repo} renders" "0" "${gr_rc}"
+done
+
 # Standalone uses the stock postgres image and never runs repmgr-init, so the guard must skip.
 sa_img_rc=0
 helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 \

@@ -131,6 +131,20 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 						cb.OnRenewFailure()
 					}
 				}
+				// No longer leader, so stop naming ourselves as the holder. OnNewLeader is
+				// the only other writer of k.leader, and no elector runs during the
+				// step-down cooldown -- so without this a released node kept reporting
+				// ITSELF from Leader() for the whole cooldown (~3x retryPeriod on
+				// defaults, and until the apiserver returns after an involuntary loss).
+				// That value is not inert: observe() feeds it to Observation.LeaderIdentity,
+				// where validPeerName accepts it (it IS a cluster pod name), so Decide's
+				// standby branch returns Follow(self) instead of taking the
+				// LeaderIdentity=="" -> Wait branch that exists for exactly this. The
+				// ex-primary then releases its slot on the REAL primary and repoints
+				// primary_conninfo at itself until a later tick corrects it. Cleared with a
+				// CAS so a successor OnNewLeader already observed is preserved -- the same
+				// shape (and now genuinely symmetric with) EtcdDCS's clear in etcddcs.go.
+				k.leader.CompareAndSwap(identity, "")
 				if cb.OnLost != nil {
 					cb.OnLost() // synchronous: must finish demoting before we re-contend
 				}

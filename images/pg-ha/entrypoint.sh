@@ -53,6 +53,28 @@ bootstrap_initdb() {
     : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required to bootstrap a new cluster}"
     : "${REPMGR_PASSWORD:?REPMGR_PASSWORD is required to bootstrap a new cluster (the replication role)}"
 
+    # PGBACKREST_STANZA is validated HERE, with the other inputs, and not beside the
+    # archive_command it feeds (#298 review). Same rule as the credentials above: every check
+    # that can reject the bootstrap must run BEFORE the first write to the volume. Down at the
+    # GUC append it ran after initdb had already created the cluster and the base GUCs were
+    # written, so a bad stanza left PG_VERSION present with no completion sentinel -- and in
+    # `postgres` mode bootstrap_or_discard_torn then discards and re-runs the whole initdb on
+    # every restart, turning a one-line input error into a full-initdb-per-boot crash loop
+    # instead of a refusal that never touches the volume.
+    #
+    # Why it is rejected at all: the value is interpolated into the single-quoted
+    # archive_command/restore_command GUCs, so a single quote would close the GUC string and
+    # hand the remainder to the archiver's /bin/sh. pgBackRest stanza names are alphanumeric
+    # plus dash/underscore, so anything else is refused (#298 security review).
+    if [ "${PGBACKREST_ENABLED:-}" = "true" ]; then
+        case "${PGBACKREST_STANZA:-db}" in
+            *[!A-Za-z0-9_-]*)
+                echo "FATAL: PGBACKREST_STANZA=\"${PGBACKREST_STANZA}\" contains characters outside [A-Za-z0-9_-]; it is written into the archive_command/restore_command GUCs and must be a plain pgBackRest stanza name. Set pgbackrest.stanza (chart) / PGBACKREST_STANZA (direct image use) to a name matching that pattern." >&2
+                exit 1
+                ;;
+        esac
+    fi
+
     # REPMGR_USER must be a role of its OWN, checked before the first write (#298 review).
     #
     # Every CREATE/ALTER below is deliberately swallowed with `2>/dev/null || true`, and the
@@ -106,17 +128,8 @@ EOF
     # directories; nothing here writes it.
 
     if [ "${PGBACKREST_ENABLED:-}" = "true" ]; then
-        # Validate the stanza before it is interpolated into the single-quoted
-        # archive_command/restore_command GUCs (#298 security review): a value containing a
-        # single quote would close the GUC string and hand the remainder to the archiver's
-        # /bin/sh. pgBackRest stanza names are alphanumeric plus dash/underscore, so reject
-        # anything else at boot rather than write an injectable postgresql.conf.
-        case "${PGBACKREST_STANZA:-db}" in
-            *[!A-Za-z0-9_-]*)
-                echo "FATAL: PGBACKREST_STANZA=\"${PGBACKREST_STANZA}\" contains characters outside [A-Za-z0-9_-]; it is written into the archive_command/restore_command GUCs and must be a plain pgBackRest stanza name. Set pgbackrest.stanza (chart) / PGBACKREST_STANZA (direct image use) to a name matching that pattern." >&2
-                exit 1
-                ;;
-        esac
+        # The stanza was validated at the top of this function, before initdb -- see the
+        # comment there for why the check cannot live here, next to the value it guards.
         cat >> "$PGDATA/postgresql.conf" << PGBR
 archive_mode = on
 archive_command = 'pgbackrest --stanza=${PGBACKREST_STANZA:-db} archive-push %p'

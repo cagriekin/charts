@@ -696,6 +696,88 @@ func TestActReleaseLeaseLeavesStandbyRunning(t *testing.T) {
 	}
 }
 
+// #298 review: a PLANNED step-down must not read as a split-brain fence. dcs.OnLost fires for
+// a voluntary Release() too and gates only on servingRW, so a latch left set here counted an
+// IncFence() and logged "lost leadership; demoting (fence)" -- three switchovers in a
+// maintenance window trip the chart's PGHAAgentFlapping page for work an operator asked for.
+func TestActReleaseLeaseClearsServingRWAfterACompletedDemote(t *testing.T) {
+	pm := &fakePostmaster{}
+	d := &fakeDCS{}
+	a := newTestAgent(t, pm, d)
+	a.servingRW.Store(true)
+	obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: true, InRecovery: false}}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.ReleaseLease}, obs); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if !pm.stopped {
+		t.Fatal("a read-write primary must be demoted before the lease is released")
+	}
+	if a.servingRW.Load() {
+		t.Fatal("a completed demote is proof this node is no longer a writer: the fence latch must be clear before Release")
+	}
+}
+
+// The self-health arm is the same: the force-stop returned nil, so the node is provably down.
+func TestActReleaseLeaseClearsServingRWAfterAForceStop(t *testing.T) {
+	pm := &fakePostmaster{}
+	a := newTestAgent(t, pm, &fakeDCS{})
+	a.servingRW.Store(true)
+	obs := reconcile.Observation{LocalStuck: true, Local: reconcile.LocalState{HasData: true, Running: false, InRecovery: false}}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.ReleaseLease}, obs); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if a.servingRW.Load() {
+		t.Fatal("a completed force-stop must clear the fence latch")
+	}
+}
+
+// ...but the clear is NOT unconditional, and this is the case that makes it matter. Local.Running
+// is SQL reachability, not process liveness: a read-write postmaster that is wedged (or merely
+// slow) fails the probe while still being a writer, and until it passes the stuck grace
+// LocalStuck is false too -- so NEITHER arm runs and nothing stopped it. Decide still reaches
+// ReleaseLease here via the highwater guard on stopped primary-state data. Clearing the latch on
+// that uncertainty would release the Lease AND disarm the OnLost fence for the one node that
+// most needs it, letting a peer promote beside a writer that may thaw. tick() refuses to clear
+// on the same evidence; so must this.
+func TestActReleaseLeaseKeepsServingRWWhenNothingWasStopped(t *testing.T) {
+	pm := &fakePostmaster{}
+	d := &fakeDCS{}
+	a := newTestAgent(t, pm, d)
+	a.servingRW.Store(true)
+	obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: false, InRecovery: false}}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.ReleaseLease}, obs); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if pm.stopped {
+		t.Fatal("neither arm applies here; nothing should have been stopped")
+	}
+	if !d.released {
+		t.Fatal("lease must still be released")
+	}
+	if !a.servingRW.Load() {
+		t.Fatal("no demote or stop ran, so this node may still be a writer: the fence latch must stay armed")
+	}
+}
+
+// Switchover clears it too -- the demote above it succeeded -- so a controlled handoff is not
+// counted as a fence either.
+func TestActSwitchoverClearsServingRWAfterTheDemote(t *testing.T) {
+	pm := &fakePostmaster{}
+	a := newTestAgent(t, pm, &fakeDCS{})
+	a.kube = k8s.NewWithClient(k8sfake.NewSimpleClientset(), "ns")
+	a.servingRW.Store(true)
+	obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: true, InRecovery: false}}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.Switchover, Target: "pg-1"}, obs); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if !pm.stopped {
+		t.Fatal("the handoff must demote before releasing")
+	}
+	if a.servingRW.Load() {
+		t.Fatal("a controlled switchover must not leave the node looking read-write to OnLost")
+	}
+}
+
 func TestDesiredRoleLabels(t *testing.T) {
 	peers := []reconcile.PeerState{
 		{Name: "pg-1", Reachable: true, Role: pg.RoleStandby},  // -> standby (joins read-only Service)

@@ -36,6 +36,13 @@ Thumbs.db
 agent/vendor/
 core.*
 **/core.*
+# ...but never a Go SOURCE file that happens to be called core.go. The sibling
+# images/pg-ha/agent/.gitignore carries the same escape hatch for the same reason (#298
+# review): without it a future agent/internal/<pkg>/core.go compiles locally and under
+# `go test ./...`, but is silently absent from the build context, so the Docker build fails
+# at `go build` with an "undefined:" error naming a symbol that does exist on disk.
+!core.go
+!**/core.go
 
 # The image's own test scripts run from the checkout, never from inside the image.
 test/
