@@ -674,6 +674,45 @@
 
 ### Fixed
 
+- **`pg.haImage` resolves through `pg.image` instead of its own `printf` (#298 review).** It is the
+  helper every HA workload's `image:` goes through -- the `postgresql` container, `repmgr-init`,
+  the pgBackRest sidecar and bootstrap init container, the restore Job, the pgBackRest validation
+  CronJob, and the CEL image pin in the restore admission policy -- and it carried a private copy
+  of the exact `printf "%s:%s" repo tag` that `pg.image`'s own comment documents as broken. A
+  cleared `ha.image.tag` (`tag:` with no value, which is what a values-file merge produces)
+  rendered `cagriekin/pg-ha:%!s(<nil>)`, and clearing it while keeping the documented
+  `ha.image.digest` supply-chain pin rendered `cagriekin/pg-ha:@sha256:...`; containerd rejects
+  both as `InvalidImageName`, so every pod of the release failed to start on a render Helm had
+  accepted. Delegating picks up `pg.image`'s guards -- an empty repository is refused, neither
+  tag nor digest is refused (an implicit `:latest` on a StatefulSet that already holds a
+  PostgreSQL major), and a digest-only pin renders `repository@digest`. Output is byte-identical
+  for every input that worked before.
+
+- **An empty `primary_conninfo` is left alone (#298 review, agent).** An empty value is a setting
+  -- "do not stream" -- and it is the one `RemoveRecoveryConfig` refuses to overwrite for exactly
+  that reason. The #308 `dbname` patch had no guard for it, so it produced a non-empty conninfo
+  carrying no host, port or user, which libpq resolves over the local unix socket -- the
+  standby's WAL receiver dialing its own postmaster -- and `changed=true` made the Follow branch
+  reload it. Reachable after boot, since the strip is a one-time preflight: an operator pausing
+  replication with `ALTER SYSTEM SET primary_conninfo = ''` had it silently un-paused into a
+  self-connect loop, permanently, because the `dbname` check then matched and the line was never
+  revisited.
+
+- **`WaitJobGone` retries a transient apiserver error instead of giving up on it (#298 review,
+  agent).** Only `IsNotFound` should end a wait loop; every other error now retries until the
+  deadline and is named in the failure. One 500 in the window between the delete and the
+  re-create aborted the wait, the error reached the control-API caller, and the operator's
+  natural retry then hit "restore Job ... already exists: delete it first" -- leaving them to
+  clean up by hand a Job the agent was already removing.
+
+- **The etcd RBAC bootstrap probes every endpoint, and its backoff honours cancellation (#298
+  review, agent).** It health-checked `endpoints[0]` only, so in the shared-etcd topology a
+  healthy quorum looked dead whenever that one member was the one still forming: the post-install
+  hook burned its full 90s and failed the release against a cluster answering fine on the other
+  two. Every RBAC call afterwards goes through the balanced client, so any member answering is
+  sufficient. The retry slept unconditionally, which also meant `helm upgrade --timeout` could
+  not interrupt it.
+
 - **A 1.x `ha.image.repository` is now refused at render time (#298 review).** The 2.0.0
   generation guard checked only the image TAG (`trixie-*`), and the commonest half-carried pin
   sets only the repository: a values file with `repmgr.image: {repository: cagriekin/repmgr,

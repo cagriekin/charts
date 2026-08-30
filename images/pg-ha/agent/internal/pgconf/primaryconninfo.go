@@ -104,6 +104,20 @@ func addDBNameToLine(line, db string) (updated string, ok bool, malformed bool) 
 	}
 	prefix, quoted, suffix := line[:i+1], line[i+1:j], line[j:]
 	raw := strings.ReplaceAll(quoted, "''", "'") // undo postgresql.conf's outer doubling
+	// An EMPTY value is a setting, not a gap to fill (#298 review). `primary_conninfo = ''`
+	// means "do not stream" -- the same meaning RemoveRecoveryConfig's own comment relies on
+	// when it refuses to blank these GUCs ("an empty string is a valid setting meaning 'do not
+	// stream', so blanking them would leave a standby that never connects"). Appending dbname
+	// to it produced `primary_conninfo = ' dbname=''repmgr'''`: a NON-empty conninfo with no
+	// host, port or user, so libpq falls back to the local unix socket and the walreceiver
+	// dials its own postmaster -- and the Follow branch reloads it, because changed=true.
+	// Reachable after boot (RemoveRecoveryConfig is a one-time preflight): an operator who
+	// pauses replication with `ALTER SYSTEM SET primary_conninfo = ''` had it silently
+	// un-paused into a self-connect loop on the next tick, permanently -- hasDBNameKeyword
+	// then matched, so the line was never revisited.
+	if strings.TrimSpace(raw) == "" {
+		return line, false, false
+	}
 	if hasDBNameKeyword(raw) {
 		return line, false, false
 	}

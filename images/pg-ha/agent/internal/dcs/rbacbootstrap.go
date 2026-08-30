@@ -40,7 +40,7 @@ func RBACBootstrap(ctx context.Context, endpoints []string, certFile, keyFile, c
 	}
 	defer cli.Close()
 
-	if err := waitHealthy(ctx, cli, endpoints[0]); err != nil {
+	if err := waitHealthy(ctx, cli, endpoints); err != nil {
 		return err
 	}
 
@@ -117,21 +117,44 @@ func RBACBootstrap(ctx context.Context, endpoints []string, certFile, keyFile, c
 	return nil
 }
 
-// waitHealthy blocks until a Status call succeeds (etcd may still be forming when
-// the post-install hook runs), up to ~90s.
-func waitHealthy(ctx context.Context, cli *clientv3.Client, endpoint string) error {
+// waitHealthy blocks until a Status call against ANY endpoint succeeds (etcd may still be
+// forming when the post-install hook runs), up to ~90s.
+//
+// Every endpoint, not just endpoints[0] (#298 review). In the shared-etcd topology the list
+// is the three members, and the bootstrap only needs the CLUSTER to be serving -- every RBAC
+// call below goes through the balanced client, which picks its own member. Probing one fixed
+// member made a healthy quorum look dead whenever that particular member was the one still
+// forming (or simply down): the post-install hook burned the full 90s and failed the release
+// with "etcd not reachable within deadline" against a cluster that was answering fine on the
+// other two.
+//
+// The backoff selects on ctx too, instead of time.Sleep. An unconditional sleep ignores
+// cancellation, so `helm upgrade --timeout` could not interrupt this loop -- it kept probing
+// for the rest of the 90s after the caller had already given up.
+func waitHealthy(ctx context.Context, cli *clientv3.Client, endpoints []string) error {
+	if len(endpoints) == 0 {
+		return fmt.Errorf("rbac-bootstrap: no etcd endpoints to probe")
+	}
 	deadline := time.Now().Add(90 * time.Second)
+	var lastErr error
 	for {
-		sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err := cli.Status(sctx, endpoint)
-		cancel()
-		if err == nil {
-			return nil
+		for _, ep := range endpoints {
+			sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			_, err := cli.Status(sctx, ep)
+			cancel()
+			if err == nil {
+				return nil
+			}
+			lastErr = err
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("rbac-bootstrap: etcd not reachable within deadline: %w", err)
+			return fmt.Errorf("rbac-bootstrap: etcd not reachable within deadline (tried %v): %w", endpoints, lastErr)
 		}
-		time.Sleep(3 * time.Second)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
 	}
 }
 

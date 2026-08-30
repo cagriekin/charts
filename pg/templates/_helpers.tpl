@@ -94,10 +94,24 @@ annotation consumers -- #128.)
        #290 renamed the image to cagriekin/pg-ha and #294 deleted repmgr from it -- the helper
        resolves .Values.ha.image and always did. Renamed rather than left alone because this is
        the one helper every workload's `image:` goes through, so a reader checking which image a
-       container runs met the wrong name first. Pure rename: the rendered output is unchanged. */ -}}
+       container runs met the wrong name first.
+
+       DELEGATES to pg.image rather than repeating its printf (#298 review). It had its own
+       `printf "%s:%s" repo tag` copy, which is precisely the code pg.image's own comment
+       documents as broken -- and being the helper EVERY HA workload's `image:` goes through
+       (postgresql, repmgr-init, the pgbackrest sidecar and bootstrap init, the restore Job,
+       the validation CronJob, and the CEL pin in the restore admission policy) made it the
+       worst place to carry the copy:
+         - `ha.image.tag: ` with no value -- what a values-file merge produces when someone
+           clears a key -- rendered `cagriekin/pg-ha:%!s(<nil>)`, a reference containerd
+           rejects as InvalidImageName, so every pod of the release fails to start;
+         - clearing the tag while keeping the documented `ha.image.digest` supply-chain pin
+           rendered `cagriekin/pg-ha:@sha256:...`, unparseable for the same reason.
+       pg.image refuses an empty repository, refuses "neither tag nor digest" (an implicit
+       :latest on a StatefulSet with existing data), and emits `repo@digest` for a
+       digest-only pin. Output is byte-identical for every input that worked before. */ -}}
 {{- define "pg.haImage" -}}
-{{- printf "%s:%s" .Values.ha.image.repository .Values.ha.image.tag -}}
-{{- with .Values.ha.image.digest }}@{{ . }}{{- end -}}
+{{- include "pg.image" .Values.ha.image -}}
 {{- end -}}
 
 {{- /* PG_MAJOR for every container that runs the HA image (#269). The image sets

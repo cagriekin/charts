@@ -768,6 +768,35 @@ img_untagged_out=$(helm template test-pg "${CHART_DIR}" \
   --set repmgr.enabled=false --set postgresql.replicaCount=0 --set postgresql.image.tag="" 2>&1 || true)
 assert_contains "#320: the untagged-image failure names the implicit latest" "${img_untagged_out}" "implicit :latest"
 
+# #298 review: pg.haImage must go through pg.image, not carry its own `printf "%s:%s"` copy.
+# It is the helper EVERY HA workload's `image:` resolves through -- the postgresql container,
+# repmgr-init, the pgbackrest sidecar and bootstrap init container, the restore Job, the
+# pgbackrest validation CronJob, and the CEL image pin in the restore admission policy -- so
+# the duplicated printf was the worst place in the chart to carry the exact defect pg.image's
+# own comment documents. A cleared `ha.image.tag` (`tag:` with no value, which is what a
+# values-file merge produces) rendered `cagriekin/pg-ha:%!s(<nil>)`, and clearing it while
+# keeping the documented ha.image.digest supply-chain pin rendered `cagriekin/pg-ha:@sha256:...`
+# -- both unparseable, so every pod of the release goes InvalidImageName and never starts.
+ha_img_nil_out=$(helm template test-pg "${CHART_DIR}" --set ha.image.tag=null --set ha.image.digest=sha256:aaa 2>&1 || true)
+assert_not_contains "#298: a cleared ha.image.tag never renders a Go format error into the image ref" \
+  "${ha_img_nil_out}" "%!s("
+assert_not_contains "#298: a cleared ha.image.tag never renders an empty tag before the digest" \
+  "${ha_img_nil_out}" ":@sha256:"
+assert_contains "#298: ha.image with a digest and no tag renders repository@digest" \
+  "${ha_img_nil_out}" "cagriekin/pg-ha@sha256:aaa"
+# ...and with neither, it must FAIL the same way every other image in the chart does, rather
+# than deploying an implicit :latest onto a StatefulSet that already holds a PostgreSQL major.
+ha_img_untagged_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.image.tag="" >/dev/null 2>&1 || ha_img_untagged_rc=$?
+assert_eq "#298: ha.image with no tag and no digest fails the render" "1" "${ha_img_untagged_rc}"
+ha_img_untagged_out=$(helm template test-pg "${CHART_DIR}" --set ha.image.tag="" 2>&1 || true)
+assert_contains "#298: the untagged ha.image failure names the implicit latest" \
+  "${ha_img_untagged_out}" "implicit :latest"
+# The default render is unchanged -- this is a pure delegation, not a new reference shape.
+ha_img_default_out=$(helm template test-pg "${CHART_DIR}" --show-only templates/statefulset.yaml 2>&1)
+assert_contains "#298: the default HA image reference is unchanged by the delegation" \
+  "${ha_img_default_out}" "cagriekin/pg-ha:"
+
 # #320 review: postgresql.extraVolumes lands in the SAME pod volumes list, so a shared name is
 # a duplicate the API server rejects -- the same apply-time-only class as the chart-volume
 # collision, just from the other operator-controlled list.

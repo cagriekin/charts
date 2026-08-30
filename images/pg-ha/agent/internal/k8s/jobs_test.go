@@ -2,14 +2,18 @@ package k8s
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 var testNow = time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
@@ -384,5 +388,47 @@ func TestWaitJobGoneHonoursContextCancellation(t *testing.T) {
 	cancel()
 	if err := c.WaitJobGone(ctx, "pg-restore", time.Minute); err == nil {
 		t.Fatal("a cancelled context must unwind the wait")
+	}
+}
+
+// #298 review: a wait loop that gives up on the first transient Get error is not a wait loop.
+// One apiserver 500 in the window between DeleteJob and the re-create aborted the wait, the
+// error reached the control-API caller, and the operator's natural retry then hit
+// CloneCronJobToJob's IsAlreadyExists path ("restore Job ... already exists: delete it
+// first") -- leaving them to clean up by hand a Job the agent was already removing. Only
+// IsNotFound ends the wait; everything else is retried until the deadline.
+func TestWaitJobGoneRetriesTransientErrors(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	calls := 0
+	cs.PrependReactor("get", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		calls++
+		if calls == 1 {
+			return true, nil, apierrors.NewInternalError(errors.New("apiserver hiccup"))
+		}
+		return true, nil, apierrors.NewNotFound(batchv1.Resource("jobs"), "j")
+	})
+	c := NewWithClient(cs, ns)
+	if err := c.WaitJobGone(context.Background(), "j", 30*time.Second); err != nil {
+		t.Fatalf("a transient Get error must be retried, not returned: %v", err)
+	}
+	if calls < 2 {
+		t.Fatalf("expected a retry after the transient error, got %d call(s)", calls)
+	}
+}
+
+// A genuinely permanent error still surfaces -- at the deadline rather than immediately --
+// and names itself, instead of being replaced by a bare "still exists" that explains nothing.
+func TestWaitJobGoneReportsAPersistentError(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	cs.PrependReactor("get", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(batchv1.Resource("jobs"), "j", errors.New("no RBAC"))
+	})
+	c := NewWithClient(cs, ns)
+	err := c.WaitJobGone(context.Background(), "j", time.Millisecond)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "no RBAC") {
+		t.Errorf("the underlying failure must be named, got: %v", err)
 	}
 }

@@ -226,15 +226,27 @@ func jobView(j *batchv1.Job) JobView {
 // the agent re-creates the same deterministic name.
 func (c *Client) WaitJobGone(ctx context.Context, name string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	// Only IsNotFound ends the wait successfully; every OTHER error is RETRIED until the
+	// deadline rather than returned on the spot (#298 review). Returning on the first
+	// transient Get failure defeats the one thing a wait loop exists to do: a single
+	// apiserver 500 or timeout in the window between DeleteJob and the re-create aborted
+	// the wait, the error propagated to the control-API caller, and the operator's natural
+	// retry then hit CloneCronJobToJob's IsAlreadyExists path ("restore Job ... already
+	// exists: delete it first") -- leaving them to clean up by hand a Job the agent was
+	// already in the middle of removing. A genuinely permanent error (RBAC) still surfaces,
+	// just at the deadline instead of immediately, and it is reported rather than replaced
+	// by a bare "still exists" that names nothing.
+	var lastErr error
 	for {
 		_, err := c.cs.BatchV1().Jobs(c.namespace).Get(ctx, name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			return nil
 		}
-		if err != nil {
-			return fmt.Errorf("wait for Job %s to be deleted: %w", name, err)
-		}
+		lastErr = err
 		if time.Now().After(deadline) {
+			if lastErr != nil {
+				return fmt.Errorf("wait for Job %s to be deleted: still failing after %s: %w", name, timeout, lastErr)
+			}
 			return fmt.Errorf("Job %s still exists %s after deletion was requested; its pods may still be terminating", name, timeout)
 		}
 		select {
