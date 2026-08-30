@@ -470,6 +470,15 @@
 
 ### Fixed
 
+- **`postgresql.extensions.extraVolumes` no longer refuses the name `pgbackrest` (#298).** The
+  reserved-name validator listed it among the chart's own volumes, but `pgbackrest` is the idle
+  sidecar *container*'s name -- Kubernetes keeps container and volume names in separate
+  namespaces, and no render emits a volume by that name. So the refusal denied an operator a
+  name that collides with nothing, under a message citing "a chart-managed volume" that does not
+  exist, and did it asymmetrically: `postgresql.extraVolumes` accepted the same name, and the
+  pgbackrest passthrough validator never reserved it. Every name the chart does emit is still
+  refused, at render time as before.
+
 - **Requested server TLS is now verified against the running server, and fails closed
   (#335).** `postgresql.tls.enabled=true` could leave a pod serving plaintext with nothing
   reporting an error: the release goes Ready, the certificate is mounted, the ConfigMap

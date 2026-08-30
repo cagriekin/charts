@@ -247,6 +247,20 @@ type agent struct {
 	pausedLatched       bool
 	markerTamperLatched bool
 
+	// lastMarker is the most recent SUCCESSFUL marker read, carried forward when a later
+	// read fails (#298 review). Same single-goroutine ownership as the latches above.
+	//
+	// The zero Marker is not a safe substitute for "could not read it": Paused=false,
+	// Present=false and SwitchoverTarget="" are all legitimate VALUES, so a five-second
+	// apiserver hiccup used to read as "nobody paused this cluster and no highwater was
+	// ever recorded" -- which un-paused a maintenance window for one tick (Decide's pause
+	// interlock is the ONLY thing keeping the reconcile loop from starting a postmaster
+	// under a restore Job that is mid-rewrite of PGDATA) and disarmed the #125 highwater
+	// guard at the same time. A stale marker is strictly better: it errs towards staying
+	// paused and towards keeping the highwater armed, and it is re-read every tick.
+	lastMarker   k8s.Marker
+	lastMarkerOK bool
+
 	// Server-TLS verification state (#335), same single-goroutine ownership as the latches
 	// above. tlsCheckedAt throttles the probe to tlsVerifyInterval rather than running it on
 	// every tick, and tlsInactiveLatched keeps the Error to the transition.
@@ -908,7 +922,20 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	m, err := a.kube.ReadMarker(mctx, a.cfg.MarkerName)
 	mcancel()
 	if err != nil {
-		a.log.Warn("read marker", "err", err)
+		// FAIL CLOSED, do not fall through to the zero Marker (#298 review) -- see the
+		// lastMarker field comment for what the zero value silently asserts. A genuinely
+		// ABSENT marker is not this path: ReadMarker returns Marker{Present:false} with a
+		// nil error for NotFound, so deleting the ConfigMap (a documented recovery step)
+		// still reaches Decide as the real observation it is.
+		if a.lastMarkerOK {
+			a.log.Warn("read marker failed; reusing the last successful read for this tick", "err", err)
+			m = a.lastMarker
+		} else {
+			a.log.Warn("read marker failed and no earlier read is available; this tick will take no action", "err", err)
+			o.MarkerUnreadable = true
+		}
+	} else {
+		a.lastMarker, a.lastMarkerOK = m, true
 	}
 	if m.SchemaVersion > k8s.SchemaVersion {
 		// A newer agent (mid rolling-upgrade) wrote the marker. v1 fields are stable,

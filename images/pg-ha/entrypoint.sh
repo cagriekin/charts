@@ -275,8 +275,22 @@ SQL
     # exits before the sentinel is written, so the next boot discards the torn directory and
     # starts over -- a loud crash-loop naming the cause, rather than a silent wedge.
     bootstrap_ok=yes
-    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname = '${repmgr_user_lit}'" 2>/dev/null | grep -q 1; then
-        echo "FATAL: bootstrap did not create the ${REPMGR_USER} role." >&2
+    # pg_authid + `rolpassword IS NOT NULL`, symmetrically with the POSTGRES_USER arm below
+    # (#298 review). Existence alone is not the property the agent needs: it authenticates as
+    # this role over TCP for every probe and for pg_basebackup, so a role that exists WITHOUT
+    # a password is as dead to it as one that was never created.
+    #
+    # The case that gets here is a REPMGR_USER colliding with a role initdb already made. The
+    # guard at the top of bootstrap_initdb catches the two names it can name (POSTGRES_USER and
+    # `postgres`), but PostgreSQL reserves the whole `pg_` prefix -- pg_monitor,
+    # pg_read_all_data, pg_signal_backend and friends all exist in a fresh cluster and are
+    # NOLOGIN with no password. `CREATE USER "pg_monitor" ...` fails ("role name pg_monitor is
+    # reserved"), the failure is swallowed by the deliberate `2>/dev/null || true`, and an
+    # existence-only check then reports bootstrap_ok=yes -- sealing the completion sentinel over
+    # a cluster the agent can never log in to. pg_roles.rolpassword always reads NULL, hence
+    # pg_authid.
+    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_authid WHERE rolname = '${repmgr_user_lit}' AND rolpassword IS NOT NULL" 2>/dev/null | grep -q 1; then
+        echo "FATAL: bootstrap did not leave the ${REPMGR_USER} role with a password (a name PostgreSQL already owns -- anything starting with 'pg_' is reserved -- cannot be created as the replication role; pick a different ha.username / REPMGR_USER)." >&2
         bootstrap_ok=no
     fi
     if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '${repmgr_db_lit}'" 2>/dev/null | grep -q 1; then

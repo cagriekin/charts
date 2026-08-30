@@ -6,6 +6,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/cagriekin/pg-ha-agent/internal/atomicfile"
@@ -308,8 +309,11 @@ func ForeignRecoveryConfig(confPath string) ([]string, error) {
 		return nil, fmt.Errorf("read %s: %w", confPath, err)
 	}
 	var found []string
+	// Split ONCE, outside the per-GUC loop: re-splitting the whole file per GUC is the
+	// quadratic walk the precompiled matchers above were introduced to avoid (#298 review).
+	lines := strings.Split(string(data), "\n")
 	for i, re := range recoveryGUCRes {
-		for _, ln := range strings.Split(string(data), "\n") {
+		for _, ln := range lines {
 			if strings.HasPrefix(strings.TrimLeft(ln, " \t"), "#") {
 				continue
 			}
@@ -363,7 +367,13 @@ func RemoveRecoveryConfig(confPath string) ([]string, error) {
 			}
 		}
 		if matched != "" {
-			removed = append(removed, matched)
+			// One entry per GUC, not per LINE (#298 review). auto.conf can legitimately carry
+			// the same setting twice -- repmgr rewrote it across a clone and a later follow, and
+			// PostgreSQL takes the last -- and the caller LOGS this slice for the operator, so a
+			// duplicate reads as two different things having been cleared.
+			if !slices.Contains(removed, matched) {
+				removed = append(removed, matched)
+			}
 			continue
 		}
 		kept = append(kept, ln)

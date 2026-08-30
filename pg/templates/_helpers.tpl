@@ -748,7 +748,14 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- /* Only names a render actually emits belong here (#298). Reserving one the chart does not
        use is not free caution -- it refuses an operator a name nothing can collide with, under
        a fail message citing "a chart-managed volume" that does not exist. */ -}}
-{{- $reserved := list "data" "pg-run" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib" "etcd-tls" "agent-control-tls" "pgbackrest" "pgbackrest-config" "pgbackrest-bootstrap-script" -}}
+{{- /* "pgbackrest" is deliberately ABSENT (#298 review): it is the idle sidecar CONTAINER's
+       name (statefulset.yaml), and Kubernetes keeps container and volume names in separate
+       namespaces -- no render emits a VOLUME by that name. Listing it refused an operator a
+       name that collides with nothing, under a message naming a chart volume that does not
+       exist, and did so asymmetrically: postgresql.extraVolumes accepts it, and
+       pg.validatePgbackrestPassthrough -- which enumerates volumes across all four pgbackrest
+       pod templates -- omits it too. */ -}}
+{{- $reserved := list "data" "pg-run" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib" "etcd-tls" "agent-control-tls" "pgbackrest-config" "pgbackrest-bootstrap-script" -}}
 {{- /* postgresql.extraVolumes lands in the SAME pod volumes list (#320 review), so a name
        shared with it is a duplicate the API server rejects ("volumes[n].name: Duplicate
        value") -- the same apply-time-only failure class as the chart-volume collision

@@ -291,7 +291,13 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) (int, str
 	v, err := s.o.Backups.Restore(jctx, req, id)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "could not create the restore Job: "+err.Error(),
-			"postgres on this pod has already been STOPPED; POST /v1/restart to bring it back, or retry the restore")
+			// The restart gate is fail-closed on a lease holder whose role is not POSITIVELY
+			// "standby", and a STOPPED postmaster publishes Role="unknown" -- so on the usual
+			// restore target (ordinal 0, which is usually also the holder) the plain restart
+			// this hint names comes back 409 "its last local probe failed". Name the force flag
+			// here rather than loosening that gate: the stop was deliberate and the operator
+			// issuing it knows the node is not serving (#298 review).
+			`postgres on this pod has already been STOPPED; POST /v1/restart with {"force":true} to bring it back (a stopped postmaster reads as an unknown role, which the unforced restart gate refuses on a lease holder), or retry the restore`)
 		return http.StatusBadGateway, "create failed"
 	}
 	s.annotateRestoreView(&v)

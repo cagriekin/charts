@@ -103,12 +103,21 @@ type MarkerState struct {
 
 // Observation is the full input to a decision.
 type Observation struct {
-	HoldLease      bool
-	Paused         bool   // maintenance mode (Part H1): suspend automatic promote/demote/fence
-	LeaderIdentity string // current lease holder (for followers); "" if unknown
-	Local          LocalState
-	Peers          []PeerState
-	Marker         MarkerState
+	HoldLease bool
+	Paused    bool // maintenance mode (Part H1): suspend automatic promote/demote/fence
+	// MarkerUnreadable is set by the agent when the marker ConfigMap could not be read
+	// at all AND no earlier read is available to carry forward (#298 review). Every
+	// other field the marker feeds -- Paused, Marker.Present/Timeline, SwitchoverTarget
+	// -- would otherwise arrive as its ZERO value, which is indistinguishable from
+	// "not paused, no highwater recorded, no switchover pending": a single apiserver
+	// hiccup would run a full automatic-failover tick against a cluster an operator had
+	// deliberately paused, and disarm the #125 highwater guard while doing it. Every
+	// other "could not look" in this agent fails closed; so does this one.
+	MarkerUnreadable bool
+	LeaderIdentity   string // current lease holder (for followers); "" if unknown
+	Local            LocalState
+	Peers            []PeerState
+	Marker           MarkerState
 	// LocalNode is this pod's name, compared against Marker.Primary so an empty-data
 	// lease holder can tell it is NOT the recorded primary and step aside (#186).
 	LocalNode string
@@ -167,6 +176,12 @@ type Observation struct {
 
 // Decide maps an Observation to the single action to take.
 func Decide(o Observation) Decision {
+	// Checked BEFORE Paused, because an unreadable marker is exactly the case in which
+	// Paused cannot be trusted to be accurate (#298 review): both of them come out of the
+	// same ConfigMap read.
+	if o.MarkerUnreadable {
+		return d(NoOp, "", "primary marker unreadable and no earlier read to fall back on; skipping this tick rather than acting on defaults (pause and the timeline highwater both live there)")
+	}
 	if o.Paused {
 		return d(NoOp, "", "paused: automatic failover suspended (maintenance mode)")
 	}

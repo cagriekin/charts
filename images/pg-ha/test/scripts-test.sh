@@ -511,6 +511,20 @@ for _collide in 'same' 'superuser'; do
   rm -rf "${_c_tmp}"
 done
 
+# --- #298 review: the bootstrap verification asks the repmgr role for a PASSWORD ---
+# Existence alone is not the property the agent needs -- it authenticates as this role over TCP
+# for every probe and for pg_basebackup. The guard above can only name the two collisions it
+# knows (POSTGRES_USER and `postgres`), while PostgreSQL reserves the whole `pg_` prefix, so a
+# REPMGR_USER of pg_monitor / pg_read_all_data / ... fails CREATE USER, has the failure swallowed
+# by the deliberate `2>/dev/null || true`, and passes an existence-only check -- sealing the
+# completion sentinel over a cluster the agent can never log in to. pg_authid, not pg_roles:
+# pg_roles.rolpassword always reads NULL.
+if grep -qF "FROM pg_authid WHERE rolname = '\${repmgr_user_lit}' AND rolpassword IS NOT NULL" "${ROOT}/entrypoint.sh"; then
+  ok "#298: the repmgr role verification requires a password, symmetrically with POSTGRES_USER"
+else
+  bad "#298: the repmgr role verification checks existence only" "a pre-existing reserved role (pg_monitor, ...) would pass it"
+fi
+
 # --- #298 review: the transient bootstrap postmaster is never left running ---
 # `pg_ctl -w stop` fails on PGCTLTIMEOUT (60s) on a contended node, and bare under `set -e` that
 # exited with the daemonized postmaster still holding this script's stdout -- which in agent mode

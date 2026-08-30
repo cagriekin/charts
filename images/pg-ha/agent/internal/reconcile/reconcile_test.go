@@ -41,6 +41,12 @@ func TestDecide(t *testing.T) {
 		wantTarget string
 	}{
 		{"paused suspends everything", Observation{Paused: true, HoldLease: true, Local: localPrimary}, NoOp, ""},
+		// #298 review: an unreadable marker must not read as "not paused, no highwater".
+		// Both cases below would otherwise ACT -- the first would StartLocal a postmaster on a
+		// directory a restore Job may be rewriting, the second would promote past a highwater
+		// the marker was the only record of.
+		{"unreadable marker suspends everything (stopped holder)", Observation{MarkerUnreadable: true, HoldLease: true, Local: LocalState{HasData: true}}, NoOp, ""},
+		{"unreadable marker outranks a promotable standby", Observation{MarkerUnreadable: true, HoldLease: true, Local: LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: pg.LSN{Lo: 0x200}, LSNOK: true}}, NoOp, ""},
 
 		{"holder + empty + no peers -> initdb", Observation{HoldLease: true, Local: emptyData}, BootstrapInitdb, ""},
 		{"holder + empty + marker present (no primary named) -> wait/settle", Observation{HoldLease: true, Local: emptyData, Marker: MarkerState{Present: true, Timeline: tl(5)}}, Wait, ""},
