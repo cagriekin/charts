@@ -634,6 +634,35 @@ func TestRestartOfServingPrimaryNeedsForce(t *testing.T) {
 	}
 }
 
+// #298 review: one failed local probe on the serving primary publishes
+// Running=false / Role="unknown" while ObservedAt keeps advancing -- postgres may
+// well still be accepting writes (probe timeout under load, max_connections
+// exhausted). The interlock must FAIL CLOSED on that ambiguity, not read it as
+// "not a running primary".
+func TestRestartAfterFailedProbeOnLeaseHolderStillNeedsForce(t *testing.T) {
+	h := newHarness(t, nil)
+	h.nd.snap.Local.Running = false
+	h.nd.snap.Local.Role = "unknown"
+	rec := h.do("POST", "/v1/restart", `{"node":"pg-0"}`, "ops")
+	wantCode(t, rec, 409)
+	if len(h.nd.submitted) != 0 {
+		t.Error("no unforced restart while the lease is held and the role is ambiguous")
+	}
+	// With force it proceeds.
+	wantCode(t, h.do("POST", "/v1/restart", `{"node":"pg-0","force":true}`, "ops"), 200)
+}
+
+// The positive showing that DOES skip force on a lease holder: a running standby
+// (the mid-demotion window -- lease not yet released, postgres already demoted).
+func TestRestartLeaseHoldingStandbyNeedsNoForce(t *testing.T) {
+	h := newHarness(t, nil)
+	h.nd.snap.Local.Role = "standby"
+	wantCode(t, h.do("POST", "/v1/restart", `{"node":"pg-0"}`, "ops"), 200)
+	if len(h.nd.submitted) != 1 {
+		t.Errorf("submitted = %v", h.nd.submitted)
+	}
+}
+
 // A standby needs no force: restarting it costs no writes.
 func TestRestartStandbyNeedsNoForce(t *testing.T) {
 	h := newHarness(t, nil)

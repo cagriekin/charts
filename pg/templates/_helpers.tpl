@@ -936,17 +936,40 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- define "pg.validateRoleNames" -}}
 {{- $pgUser := .Values.postgresql.username | default "postgres" -}}
 {{- $haUser := .Values.ha.username | default "repmgr" -}}
+{{- /* The ha.* checks are HA-mode only (#298 review), for the same reason
+       pg.validateLeaseTimings is: standalone (ha.enabled=false) renders no REPMGR_* env,
+       no entrypoint CREATE USER for the replication role and no agent, so a leftover
+       ha.username there configures nothing and must not block the install -- a 1.x
+       standalone release with postgresql.username=repmgr rendered fine and must keep
+       doing so across the 2.0.0 upgrade. */ -}}
+{{- if .Values.ha.enabled -}}
+{{- /* Validate what statefulset.yaml EMITS, not the default (#298 review): REPMGR_USER
+       and REPMGR_DB carry the RAW values, so an explicitly empty (or whitespace, or
+       null) ha.username slipped past the defaulted comparisons below, rendered clean,
+       and then config.Load refused the empty env on every pod at once --
+       CrashLoopBackOff after a clean render. Same validate-the-default-but-emit-raw
+       divergence pg.haAgentDuration closed for the lease timings (#291 review). */ -}}
+{{- if or (not .Values.ha.username) (eq (trim (.Values.ha.username | toString)) "") -}}
+{{- fail (printf "ha.username is %q: statefulset.yaml emits this raw value as REPMGR_USER, and the agent's config loader treats an empty value as missing, so every postgresql pod crash-loops after a clean render. Fix: set ha.username to a non-empty role name (default \"repmgr\"), or drop the override to use the default." (.Values.ha.username | toString)) -}}
+{{- end -}}
+{{- if or (not .Values.ha.database) (eq (trim (.Values.ha.database | toString)) "") -}}
+{{- fail (printf "ha.database is %q: statefulset.yaml emits this raw value as REPMGR_DB, and the agent's config loader treats an empty value as missing, so every postgresql pod crash-loops after a clean render. Fix: set ha.database to a non-empty database name (default \"repmgr\"), or drop the override to use the default." (.Values.ha.database | toString)) -}}
+{{- end -}}
 {{- if eq $haUser $pgUser -}}
 {{- fail (printf "ha.username and postgresql.username are both %q: the replication role must be a role of its own. The entrypoint creates the superuser first, so the second CREATE USER fails as \"role already exists\" and the replication role silently keeps the superuser's password -- the HA agent then cannot authenticate for probes or pg_basebackup and every pod stays Running/NotReady, recoverable only by deleting the PVC. Fix: set ha.username to a distinct name (default \"repmgr\")." $haUser) -}}
 {{- end -}}
 {{- if eq $haUser "postgres" -}}
 {{- fail (printf "ha.username is %q, which is initdb's bootstrap superuser and therefore always already exists: the entrypoint's CREATE USER for the replication role fails, the role keeps the superuser's password, and the HA agent can never authenticate with REPMGR_PASSWORD. Fix: set ha.username to a distinct name (default \"repmgr\")." $haUser) -}}
 {{- end -}}
-{{- /* Gated exactly as monitoring-user-job.yaml is: no Job, no ALTER ROLE, no collision. */ -}}
+{{- end -}}
+{{- /* Gated exactly as monitoring-user-job.yaml is: no Job, no ALTER ROLE, no collision.
+       The ha.username comparison additionally requires ha.enabled -- standalone has no
+       replication role for the monitoring name to collide with. */ -}}
 {{- if and (.Values.prometheusExporter).enabled (((.Values.prometheusExporter).monitoringUser).enabled) -}}
 {{- $monUser := ((.Values.prometheusExporter).monitoringUser).username | default "" -}}
-{{- if and $monUser (or (eq $monUser $pgUser) (eq $monUser $haUser) (eq $monUser "postgres")) -}}
-{{- fail (printf "prometheusExporter.monitoringUser.username is %q, which collides with %s: the monitoring-user hook Job runs `ALTER ROLE ... WITH LOGIN PASSWORD` unconditionally, so it would OVERWRITE that role's password minutes after install -- breaking superuser auth cluster-wide, or streaming replication on every standby at once. Fix: give the monitoring role a distinct name (default \"monitoring\"), or set prometheusExporter.monitoringUser.enabled=false to let the exporter use the superuser." $monUser (ternary (printf "postgresql.username (%q)" $pgUser) (ternary (printf "ha.username (%q)" $haUser) "initdb's bootstrap superuser \"postgres\"" (eq $monUser $haUser)) (eq $monUser $pgUser))) -}}
+{{- $haCollides := and .Values.ha.enabled (eq $monUser $haUser) -}}
+{{- if and $monUser (or (eq $monUser $pgUser) $haCollides (eq $monUser "postgres")) -}}
+{{- fail (printf "prometheusExporter.monitoringUser.username is %q, which collides with %s: the monitoring-user hook Job runs `ALTER ROLE ... WITH LOGIN PASSWORD` unconditionally, so it would OVERWRITE that role's password minutes after install -- breaking superuser auth cluster-wide, or streaming replication on every standby at once. Fix: give the monitoring role a distinct name (default \"monitoring\"), or set prometheusExporter.monitoringUser.enabled=false to let the exporter use the superuser." $monUser (ternary (printf "postgresql.username (%q)" $pgUser) (ternary (printf "ha.username (%q)" $haUser) "initdb's bootstrap superuser \"postgres\"" $haCollides) (eq $monUser $pgUser))) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

@@ -502,3 +502,35 @@ func TestMoreAdvancedPeerUnreachableRestoredPeerDoesNotSuppressReachableAheadPee
 		t.Fatalf("got (%q, %v), want (pg-2, true): an unreachable restored peer must not suppress a live ahead peer", got, reachable)
 	}
 }
+
+// #298 review: the POSITION ranking has the same masking hazard the provenance ranking had
+// above. Steady state, primary just died: its gossip annotation (fresh for ~4x the reconcile
+// interval, exactly the failover window) reports the highest LSN; a REACHABLE standby is also
+// ahead of the lease-holding local standby. A single-best ranking returned the corpse
+// (reachable=false) and the caller's steady-state branch promoted LOCALLY -- discarding the
+// reachable standby's extra committed WAL on rewind. The reachable ahead peer must win.
+func TestMoreAdvancedPeerGossipOnlyPeerDoesNotMaskReachableAheadPeer(t *testing.T) {
+	o := Observation{
+		HoldLease: true,
+		Local:     LocalState{HasData: true, Timeline: 5, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x100}, LSNOK: true},
+		Peers: []PeerState{
+			{ // the just-dead primary: gossip-only, furthest ahead
+				Name: "pg-0", Reachable: false, Gossip: true, Role: pg.RolePrimary,
+				Timeline: 5, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x200}, LSNOK: true,
+			},
+			{ // live standby, ahead of local, behind the corpse
+				Name: "pg-2", Reachable: true, Role: pg.RoleStandby,
+				Timeline: 5, TimelineOK: true, LSN: pg.LSN{Hi: 0, Lo: 0x150}, LSNOK: true,
+			},
+		},
+	}
+	got, reachable := moreAdvancedPeer(o)
+	if got != "pg-2" || !reachable {
+		t.Fatalf("got (%q, %v), want (pg-2, true): a gossip-only corpse must not mask the live handoff target", got, reachable)
+	}
+	// And end to end: the holder-standby branch must hand off, not promote.
+	o.Local.Running, o.Local.InRecovery = true, true
+	if d := Decide(o); d.Action != ReleaseLease || d.Target != "pg-2" {
+		t.Fatalf("Decide = %v target %q, want ReleaseLease to pg-2 (invariant 8)", d.Action, d.Target)
+	}
+}

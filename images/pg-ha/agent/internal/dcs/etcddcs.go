@@ -191,10 +191,17 @@ func (e *EtcdDCS) runElection(ctx context.Context, identity string, cb Callbacks
 	}
 
 	// Hold until leadership ends: the session lease lapses (etcd unreachable past
-	// TTL) or a Release/shutdown cancels the iteration.
+	// TTL) or a Release/shutdown cancels the iteration. A lapse with the iteration
+	// still live is the involuntary loss the renew-failure counter exists for
+	// (#298 review) -- symmetric with K8sDCS's RenewDeadline expiry.
+	lapsed := false
 	select {
 	case <-sess.Done():
+		lapsed = ctx.Err() == nil
 	case <-ctx.Done():
+	}
+	if lapsed && cb.OnRenewFailure != nil {
+		cb.OnRenewFailure()
 	}
 	e.isLeader.Store(false)
 	// No longer leader. observe() stops when the iteration ctx cancels, so on a

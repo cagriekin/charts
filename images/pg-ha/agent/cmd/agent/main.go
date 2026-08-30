@@ -391,6 +391,13 @@ func (a *agent) run() {
 			a.metr.SetLeader(true)
 			a.log.Info("acquired leadership")
 		},
+		// Involuntary loss only (never Release or shutdown): the chart's
+		// PGHAAgentLeaseRenewFailing alert rates this counter, and until it was wired
+		// here nothing incremented it, so the alert could never fire (#298 review).
+		OnRenewFailure: func() {
+			a.metr.IncRenewFailure()
+			a.log.Warn("lease lost involuntarily: renew/keepalive lapsed (DCS unreachable?)")
+		},
 		OnLost: func() {
 			a.metr.SetLeader(false)
 			a.opMu.Lock()
@@ -1671,10 +1678,23 @@ func (a *agent) bootstrapInitdbNative(ctx context.Context) error {
 	a.beginInitdb()
 	ictx, icancel := context.WithTimeout(ctx, initdbBudget)
 	defer icancel()
+	// Exec.Run hands every child a credential-stripped environment (#298 security
+	// review), but bootstrap_initdb is the one child that legitimately NEEDS the
+	// cluster passwords -- it creates the superuser and the replication role, and its
+	// first act is `: "${POSTGRES_PASSWORD:?}"` / `: "${REPMGR_PASSWORD:?}"`. Hand
+	// them back through the unfiltered extra slice; relying on inheritance here made
+	// a fresh native install die on that guard, discard the (empty) directory and
+	// retry the same failure every tick, forever (#298 review). An unset
+	// PostgresPassword stays unset so the entrypoint's diagnostic names the missing
+	// variable instead of failing later in SQL.
+	bootstrapEnv := []string{"REPMGR_PASSWORD=" + a.cfg.RepmgrPassword}
+	if a.cfg.PostgresPassword != "" {
+		bootstrapEnv = append(bootstrapEnv, "POSTGRES_PASSWORD="+a.cfg.PostgresPassword)
+	}
 	var out string
 	err := a.beatDuring(func() error {
 		var rerr error
-		out, rerr = a.prober.Exec.Run(ictx, nil, entrypointPath, "initdb")
+		out, rerr = a.prober.Exec.Run(ictx, bootstrapEnv, entrypointPath, "initdb")
 		return rerr
 	})
 	// Log it on SUCCESS too (#288 review, round 4). Because the AGENT runs the bootstrap here

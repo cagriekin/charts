@@ -156,14 +156,6 @@ assert_eq "live ordinal 1 still in the topology" "1" "$(in_topology "${P}" 1)"
 serves=$(pg_exec "${NAMESPACE}" "${P}" "SELECT NOT pg_is_in_recovery()" repmgr repmgr 2>/dev/null || echo "")
 assert_eq "a primary still serves after scale-down + cleanup" "t" "${serves}"
 
-# #289: this suite runs the repmgr mechanism, where repmgr -- not the agent -- owns
-# replication slots. The agent's slot reconcile is gated on MECHANISM=native and must be
-# completely inert here, so no agent-minted slot may exist. This is the regression guard
-# for that gate: if reconcileSlots ever ran under repmgr mode it would create
-# pg_ha_slot_<ordinal> alongside repmgr's own repmgr_slot_<node_id>, giving two owners for
-# the same resource -- and, worse, its orphan rule would start dropping repmgr's slots.
-agent_slots=$(pg_exec "${NAMESPACE}" "${P}" \
-  "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
 # Wait on the RECLAIM, not on the stream stopping (#288). in_topology reaching 0 only means
 # pod-2's row left pg_stat_replication, which happens the instant its stream drops -- seconds
 # before the primary's next slotsTick observes the shrunken pod set and drops pg_ha_slot_2.

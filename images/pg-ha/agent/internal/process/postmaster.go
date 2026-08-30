@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+
+	"github.com/cagriekin/pg-ha-agent/internal/childenv"
 )
 
 // StopMode selects the PostgreSQL shutdown signal.
@@ -74,6 +76,13 @@ func (p *ChildPostmaster) Start(_ context.Context) error {
 		}
 	}
 	cmd := exec.Command(p.PostgresBin, "-D", p.DataDir)
+	// Strip the agent's credential env from the postmaster (#298 security review):
+	// postgres authenticates nothing from its environment (roles live in pg_authid),
+	// but every archive_command/restore_command child it forks inherits this env --
+	// pgBackRest in particular parses all of it -- so REPMGR_PASSWORD/POSTGRES_PASSWORD
+	// must not reach the longest-lived child of all. The PGBACKREST_* config vars
+	// (STANZA, CIPHER_PASS, S3_KEY_SECRET) carry no "PASSWORD" substring and pass through.
+	cmd.Env = childenv.Filtered(os.Environ(), nil)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {

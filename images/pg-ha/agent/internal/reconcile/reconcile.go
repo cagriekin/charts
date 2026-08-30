@@ -225,7 +225,10 @@ func Decide(o Observation) Decision {
 				// mode, so wait for it. In steady state it is almost always the
 				// just-dead primary whose annotation is still fresh -- a corpse that can
 				// never reacquire, so handing off to it would only flap the lease and
-				// delay failover. Do not hand off; fall through to promote.
+				// delay failover. Do not hand off; fall through to promote. Safe only
+				// because moreAdvancedPeer prefers a reachable ahead peer over the
+				// gossip-only one (#298 review): this promote runs solely when local is
+				// the most-advanced node that can actually serve.
 				if o.PeersPending {
 					return d(Wait, "", "cold boot: a gossip-only peer reports more WAL; wait for it to become observable before promoting (it may promote to a newer timeline)")
 				}
@@ -488,6 +491,14 @@ func restoredAfter(a, b string) bool { return a != "" && a > b }
 // target); an unreachable, gossip-only peer cannot -- it may be the just-dead
 // primary whose annotation is still fresh, so handing the lease to it would never
 // complete. The caller distinguishes the two (see the holder-standby branch).
+//
+// A gossip-only peer must therefore never MASK a reachable one (#298 review): with a
+// reachable standby ahead of local and the just-dead primary's still-fresh annotation
+// further ahead, a single-best ranking returned the corpse (reachable=false), the
+// caller's steady-state branch fell through to a LOCAL promote, and the reachable
+// standby's extra WAL was discarded on its rewind onto the new timeline -- invariant 8
+// broken by the very ranking that exists to uphold it. The best reachable-ahead peer
+// is tracked separately and preferred whenever the overall best cannot take over.
 func moreAdvancedPeer(o Observation) (string, bool) {
 	best := ""
 	bestReachable := false
@@ -502,6 +513,12 @@ func moreAdvancedPeer(o Observation) (string, bool) {
 	var bestLSN pg.LSN
 	var bestLSNok bool
 	bestRestoredAt := ""
+	// Most advanced peer that is BOTH ahead of local and reachable (see above).
+	bestReach := ""
+	var bestReachTL pg.Timeline
+	var bestReachTLok bool
+	var bestReachLSN pg.LSN
+	var bestReachLSNok bool
 	for i := range o.Peers {
 		p := &o.Peers[i]
 		if !p.Reachable && !p.Gossip {
@@ -552,6 +569,15 @@ func moreAdvancedPeer(o Observation) (string, bool) {
 		if best == "" || ahead(p.Timeline, p.TimelineOK, p.LSN, p.LSNOK, bestTL, bestTLok, bestLSN, bestLSNok) {
 			best, bestReachable, bestTL, bestTLok, bestLSN, bestLSNok = p.Name, p.Reachable, p.Timeline, p.TimelineOK, p.LSN, p.LSNOK
 		}
+		if p.Reachable && (bestReach == "" || ahead(p.Timeline, p.TimelineOK, p.LSN, p.LSNOK, bestReachTL, bestReachTLok, bestReachLSN, bestReachLSNok)) {
+			bestReach, bestReachTL, bestReachTLok, bestReachLSN, bestReachLSNok = p.Name, p.Timeline, p.TimelineOK, p.LSN, p.LSNOK
+		}
+	}
+	// The overall best is gossip-only, but a reachable peer is also ahead of local:
+	// hand off to the node that can actually serve rather than promoting under it.
+	// (A provenance winner is reachable by construction and never reaches this.)
+	if best != "" && !bestReachable && bestReach != "" {
+		return bestReach, true
 	}
 	return best, bestReachable
 }

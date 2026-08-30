@@ -30,4 +30,10 @@ type DCS interface {
 type Callbacks struct {
 	OnAcquired func(ctx context.Context)
 	OnLost     func()
+	// OnRenewFailure fires, before OnLost, when leadership is lost INVOLUNTARILY --
+	// the K8s Lease could not be renewed within RenewDeadline, or the etcd session
+	// lease lapsed -- and not on a voluntary Release or a shutdown. It exists to feed
+	// pg_ha_agent_renew_failures_total: the chart alerts on that counter's rate, and
+	// with nothing incrementing it the alert could never fire (#298 review). Optional.
+	OnRenewFailure func()
 }

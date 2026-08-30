@@ -497,23 +497,28 @@ func (s *Server) handleIntent(kind IntentKind) func(http.ResponseWriter, *http.R
 		snap := s.o.Node.Snapshot()
 		// Restarting the serving primary is a write outage. Require an explicit force
 		// so it cannot be the result of a fat-fingered pod name plus a default.
-		// The lease is read LIVE, and the rest of the condition must not be able to skip
-		// the interlock just because the snapshot has not been published yet: before the
-		// first tick Running is false and Role is "", so an all-zero snapshot would let an
-		// unforced restart through on the serving primary -- exactly what this prevents.
-		// So while the lease is held, require force unless the snapshot POSITIVELY shows
-		// this node is not a running primary.
-		if kind == IntentRestart && !req.Force && s.o.Node.HoldsLeaseNow() {
-			roleUnknown := snap.ObservedAt.IsZero()
-			if roleUnknown || (snap.Local.Running && snap.Local.Role == "primary") {
-				hint := `pass {"force":true} to proceed, and consider POST /v1/pause first so the restart is not read as a failure`
-				msg := "this pod is the serving primary: restarting it interrupts writes"
-				if roleUnknown {
-					msg = "this pod holds the leader lease and has not completed its first reconcile tick, so it may be the serving primary"
-				}
-				writeErr(w, http.StatusConflict, msg, hint)
-				return http.StatusConflict, "primary without force"
+		// The lease is read LIVE, and while it is held the gate FAILS CLOSED: force is
+		// required unless the snapshot POSITIVELY shows a running standby ("standby" is
+		// the one role localRole only reports for a running non-primary). Keying the
+		// gate on Running && Role == "primary" instead let a single failed local probe
+		// on the serving primary -- a probe timeout under load, max_connections
+		// exhausted; postgres still accepting writes -- publish Running=false /
+		// Role="unknown" and wave an unforced restart through (#298 review). The
+		// pre-first-tick all-zero snapshot (ObservedAt zero, Role "") fails the same
+		// test, which is exactly right: ambiguity is not a positive showing.
+		if kind == IntentRestart && !req.Force && s.o.Node.HoldsLeaseNow() && snap.Local.Role != "standby" {
+			hint := `pass {"force":true} to proceed, and consider POST /v1/pause first so the restart is not read as a failure`
+			var msg string
+			switch {
+			case snap.ObservedAt.IsZero():
+				msg = "this pod holds the leader lease and has not completed its first reconcile tick, so it may be the serving primary"
+			case snap.Local.Running && snap.Local.Role == "primary":
+				msg = "this pod is the serving primary: restarting it interrupts writes"
+			default:
+				msg = "this pod holds the leader lease and its last local probe failed, so it may still be the serving primary"
 			}
+			writeErr(w, http.StatusConflict, msg, hint)
+			return http.StatusConflict, "primary without force"
 		}
 		ctx, cancel := contextWithTimeout(r, s.o.IntentTimeout)
 		defer cancel()

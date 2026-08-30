@@ -1972,7 +1972,11 @@ assert_contains "su #125: rbac grants configmaps verbs" "${rbac_repmgr}" "config
 # The marker stays runtime-owned (the agent creates/updates it through the API), not a
 # helm template, so a helm upgrade / ArgoCD sync cannot reset the highwater. The write
 # path is Go now -- internal/k8s/marker.go, covered by its own tests.
-assert_not_contains "#286: no marker ConfigMap rendered by helm" "${repmgr}" "test-pg-primary\n"
+# Anchored with $, not a literal \n (#298 review fix): grep's BRE treats \n as the letter n,
+# so the old needle "test-pg-primary\n" could never match anything and the guard was dead --
+# a template regression rendering the runtime-owned marker (letting a helm upgrade / ArgoCD
+# sync reset the timeline highwater, the #125/#286 hazard) would have passed unnoticed.
+assert_not_contains "#286: no marker ConfigMap rendered by helm" "${repmgr}" "name: test-pg-primary$"
 
 # --- #171/#173/#174/#138/#140: behaviour that moved into the agent with #286 ---
 # These were behavioural unit tests of shell functions extracted from the rendered
@@ -5326,7 +5330,10 @@ helm template test-pg "${CHART_DIR}" --set ha.username=myuser --set postgresql.u
 assert_eq "#298: ha.username equal to postgresql.username fails the render" "1" "${role_ha_eq_rc}"
 role_ha_eq_msg=$(helm template test-pg "${CHART_DIR}" --set ha.username=myuser \
   --set postgresql.username=myuser 2>&1 || true)
-assert_contains "#298: the collision message names the offending value" "both .myuser." "${role_ha_eq_msg}"
+# Arguments in (haystack, needle) order (#298 review fix): they were swapped, and grep with the
+# multi-line helm output as the PATTERN matched everything via its empty line -- the assertion
+# could never fail, whatever the message said.
+assert_contains "#298: the collision message names the offending value" "${role_ha_eq_msg}" "both .myuser."
 role_ha_pg_rc=0
 helm template test-pg "${CHART_DIR}" --set postgresql.username=admin --set ha.username=postgres \
   >/dev/null 2>&1 || role_ha_pg_rc=$?
@@ -5347,6 +5354,31 @@ helm template test-pg "${CHART_DIR}" --set prometheusExporter.enabled=true \
   --set prometheusExporter.monitoringUser.enabled=false \
   --set prometheusExporter.monitoringUser.username=postgres >/dev/null 2>&1 || role_mon_off_rc=$?
 assert_eq "#298: no collision when the monitoring Job is disabled (it never ALTERs)" "0" "${role_mon_off_rc}"
+
+# #298 review: validate what statefulset.yaml EMITS, not the default. REPMGR_USER/REPMGR_DB
+# carry the raw values, so an explicitly empty ha.username rendered clean (the defaulted
+# comparison saw "repmgr") and then config.Load refused the empty env on every pod at once.
+role_ha_empty_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.username= >/dev/null 2>&1 || role_ha_empty_rc=$?
+assert_eq "#298: an explicitly empty ha.username fails the render (it is emitted raw)" "1" "${role_ha_empty_rc}"
+role_ha_empty_msg=$(helm template test-pg "${CHART_DIR}" --set ha.username= 2>&1 || true)
+assert_contains "#298: the empty-ha.username message names REPMGR_USER" "${role_ha_empty_msg}" "REPMGR_USER"
+role_db_empty_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.database= >/dev/null 2>&1 || role_db_empty_rc=$?
+assert_eq "#298: an explicitly empty ha.database fails the render (it is emitted raw)" "1" "${role_db_empty_rc}"
+
+# #298 review: the ha.* role checks are HA-mode only, like pg.validateLeaseTimings. Standalone
+# renders no REPMGR_* env and creates no replication role, so a 1.x standalone release with
+# postgresql.username=repmgr rendered fine and must not become a 2.0.0 upgrade blocker.
+role_standalone_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 \
+  --set postgresql.username=repmgr >/dev/null 2>&1 || role_standalone_rc=$?
+assert_eq "#298: standalone with postgresql.username=repmgr renders (no replication role exists)" "0" "${role_standalone_rc}"
+role_standalone_mon_rc=0
+helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 \
+  --set prometheusExporter.enabled=true \
+  --set prometheusExporter.monitoringUser.username=repmgr >/dev/null 2>&1 || role_standalone_mon_rc=$?
+assert_eq "#298: standalone monitoring role named repmgr renders (nothing to collide with)" "0" "${role_standalone_mon_rc}"
 
 # ==========================================================================================
 # #292: the in-place repmgr -> native migration suite. It is the ONLY suite that starts from a

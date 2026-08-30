@@ -2660,12 +2660,22 @@ repmgr:                            ha:
     mechanism: native                  mechanism: native
 ```
 
-**Nothing is required of you in 2.0.0.** Every `repmgr.*` key still works: `pg.normalizeValues`
-merges the `repmgr:` block over the `ha:` defaults key by key, so an untouched 1.x values file
-installs unchanged and `--set repmgr.agent.leaseDuration=20s` still lands. Both spellings are
-schema-validated, so a typo or a bad enum still fails the render either way, and keys that were
-*removed* rather than renamed fail under either name. `helm upgrade` prints a notice when it
-sees the old block.
+**Almost nothing is required of you in 2.0.0.** Every `repmgr.*` key except the five security
+keys below still works: `pg.normalizeValues` merges the `repmgr:` block over the `ha:` defaults
+key by key, so an untouched 1.x values file installs unchanged and
+`--set repmgr.agent.leaseDuration=20s` still lands. Both spellings are schema-validated, so a
+typo or a bad enum still fails the render either way, and keys that were *removed* rather than
+renamed fail under either name. `helm upgrade` prints a notice when it sees the old block.
+
+The exception (#298 security review): `repmgr.agent.podCidr`,
+`repmgr.agent.control.allowedClientCNs`, `repmgr.agent.control.restore.allowedClientCNs`,
+`repmgr.agent.control.restore.admissionPolicy.enabled` and
+`repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded` **fail the render under the
+old spelling** -- the alias wins key-by-key even over `--set`, so a stale alias value would
+silently override (and downgrade) a security control; refusing it is the only safe answer.
+Move these five to `ha.agent.*` before upgrading. `podCidr` is the one most 1.x files carry: it
+is a required customization on CNIs outside `10.0.0.0/8` (Calico's default range among them),
+so a file that sets it does need that one edit for 2.0.0.
 
 #### The one rule that will surprise you: `repmgr.*` wins, from any source
 

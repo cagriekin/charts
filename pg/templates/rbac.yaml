@@ -127,13 +127,16 @@ rules:
 {{- end }}
 {{- if ne (include "pg.agentEtcdMode" .) "true" }}
   # Lease <fullname>-leader is the sole leadership authority (client-go
-  # leaderelection): get/update/patch scoped to that name, create unscoped. With the
-  # etcd DCS backend leadership lives in etcd, not the apiserver, so this grant is
-  # dropped (least privilege); routing still uses the services/pods grants above.
+  # leaderelection): get/update scoped to that name, create unscoped. No "patch":
+  # client-go's LeaseLock renews/adopts with Get+Update only, so the verb was pure
+  # attack surface on the token mounted beside a PostgreSQL that runs user SQL
+  # (#298 review). With the etcd DCS backend leadership lives in etcd, not the
+  # apiserver, so this grant is dropped (least privilege); routing still uses the
+  # services/pods grants above.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     resourceNames: ["{{ include "pg.fullname" . }}-leader"]
-    verbs: ["get", "update", "patch"]
+    verbs: ["get", "update"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["create"]

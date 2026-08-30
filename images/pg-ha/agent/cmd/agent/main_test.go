@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1238,6 +1239,10 @@ func TestFollowKeepsPublishingSlotGaugesWhileOtherActionsRetractThem(t *testing.
 type initdbExec struct {
 	calls [][]string
 	err   error
+	// initdbEnv records the extra env of the `entrypoint.sh initdb` call. Exec.Run strips
+	// every *PASSWORD* variable from the inherited environment (#298 security review), so
+	// the passwords bootstrap_initdb hard-requires reach it ONLY through this slice.
+	initdbEnv []string
 	// dataDir lets the fake do what a real `entrypoint.sh initdb` does: LEAVE A CLUSTER
 	// BEHIND. Seeding it up front in the fixture would not model the branch --
 	// bootstrapInitdbNative clears non-database debris from a PG_VERSION-less PGDATA before
@@ -1246,8 +1251,11 @@ type initdbExec struct {
 	dataDir string
 }
 
-func (e *initdbExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
+func (e *initdbExec) Run(_ context.Context, env []string, name string, args ...string) (string, error) {
 	e.calls = append(e.calls, append([]string{name}, args...))
+	if name == entrypointPath && len(args) > 0 && args[0] == "initdb" {
+		e.initdbEnv = env
+	}
 	if e.err != nil {
 		return "boom", e.err
 	}
@@ -1281,6 +1289,13 @@ func TestBootstrapInitdbNativeInvokesTheEntrypointThenStarts(t *testing.T) {
 	}
 	if len(ex.calls) == 0 || ex.calls[0][0] != entrypointPath || ex.calls[0][1] != "initdb" {
 		t.Fatalf("want %s initdb as the FIRST call, got %v", entrypointPath, ex.calls)
+	}
+	// The passwords must ride the explicit extra-env slice: Exec.Run strips every
+	// *PASSWORD* variable from the inherited environment (#298 security review), and
+	// bootstrap_initdb's first act is `: "${REPMGR_PASSWORD:?}"` -- inherited-only
+	// passwords made every fresh native install fail that guard forever.
+	if !slices.Contains(ex.initdbEnv, "REPMGR_PASSWORD=pw") {
+		t.Errorf("initdb env %v lacks REPMGR_PASSWORD=pw", ex.initdbEnv)
 	}
 	if !pm.started {
 		t.Error("the cluster was created but never started")

@@ -99,6 +99,18 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 			},
 			OnStoppedLeading: func() {
 				k.isLeader.Store(false)
+				// Involuntary loss means client-go could not renew within RenewDeadline.
+				// The two voluntary exits are distinguishable without new state: Release
+				// arms the step-down cooldown BEFORE cancelling the election, and a
+				// shutdown cancels the outer ctx (#298 review).
+				if cb.OnRenewFailure != nil && ctx.Err() == nil {
+					k.mu.Lock()
+					voluntary := time.Now().Before(k.cooldownUntil)
+					k.mu.Unlock()
+					if !voluntary {
+						cb.OnRenewFailure()
+					}
+				}
 				if cb.OnLost != nil {
 					cb.OnLost() // synchronous: must finish demoting before we re-contend
 				}

@@ -38,8 +38,16 @@ StatefulSet has to be recreated with --cascade=orphan.
 
 DEPRECATED VALUES: your values file still uses the "repmgr:" block. Chart 2.0.0 renamed it
 to "ha:" -- the name no longer matches what runs, since the failover agent is native and
-repmgr is gone from the image (#290, #291). Every "repmgr.*" key still works for now: each
-one is merged over its "ha.*" counterpart, so this release needs no values change from you.
+repmgr is gone from the image (#290, #291). Almost every "repmgr.*" key still works for now:
+each one is merged over its "ha.*" counterpart, so most 1.x files need no values change.
+
+The exception (#298 security review): five security keys REFUSE the old spelling outright,
+because a stale alias would silently override -- and downgrade -- a security control. If your
+file sets any of these under "repmgr.agent.", the render fails until they move to "ha.agent.":
+podCidr, control.allowedClientCNs, control.restore.allowedClientCNs,
+control.restore.admissionPolicy.enabled, control.restore.admissionPolicy.acknowledgeUnbounded.
+podCidr in particular is a required customization on CNIs outside 10.0.0.0/8, so a 1.x file
+carrying it needs that one edit before this upgrade.
 
 One rule to know while both names work: where a key is set under BOTH spellings, the
 "repmgr:" one wins -- even over a --set, which Helm normally ranks highest. The chart cannot

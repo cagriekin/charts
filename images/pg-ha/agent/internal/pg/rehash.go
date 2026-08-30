@@ -6,6 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
+
+	"github.com/cagriekin/pg-ha-agent/internal/childenv"
 )
 
 // StdinExec runs an external command with data piped to stdin. The md5->scram
@@ -15,11 +18,19 @@ type StdinExec interface {
 	RunStdin(ctx context.Context, env []string, stdin, name string, args ...string) error
 }
 
-// RunStdin executes name with args and stdin piped in, appending env to the current
-// environment. Combined output is folded into the error for diagnostics.
+// RunStdin executes name with args and stdin piped in, handing the child the
+// credential-stripped environment plus env. Combined output is folded into the
+// error for diagnostics.
 func (OSExec) RunStdin(ctx context.Context, env []string, stdin, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Env = append(os.Environ(), env...)
+	// Strip the agent's own credential env from what psql inherits, exactly as
+	// OSExec.Run does (#298 security review): the child reads only the explicit
+	// extras (REHASH_TGT_SECRET here), never REPMGR_PASSWORD/POSTGRES_PASSWORD --
+	// this path was missed when the filter was introduced.
+	cmd.Env = childenv.Filtered(os.Environ(), env)
+	// Same rationale as OSExec.Run (#288 review): bound Wait after a kill so a
+	// grandchild still holding the output pipe cannot hang the caller.
+	cmd.WaitDelay = 10 * time.Second
 	cmd.Stdin = strings.NewReader(stdin)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

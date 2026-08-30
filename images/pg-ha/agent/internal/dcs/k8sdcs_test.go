@@ -2,11 +2,15 @@ package dcs
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 // Drives the real client-go leaderelection against a fake clientset: a single
@@ -69,8 +73,11 @@ func TestK8sDCSReleaseHandsOff(t *testing.T) {
 	defer cancel()
 
 	lost := make(chan string, 2)
-	go a.Run(ctx, "pod-0", Callbacks{OnLost: func() { lost <- "pod-0" }})
-	go b.Run(ctx, "pod-1", Callbacks{OnLost: func() { lost <- "pod-1" }})
+	// A voluntary Release is a step-down, not an apiserver problem: it must never
+	// count toward pg_ha_agent_renew_failures_total (#298 review).
+	renewFailed := func() { t.Error("voluntary release fired OnRenewFailure") }
+	go a.Run(ctx, "pod-0", Callbacks{OnLost: func() { lost <- "pod-0" }, OnRenewFailure: renewFailed})
+	go b.Run(ctx, "pod-1", Callbacks{OnLost: func() { lost <- "pod-1" }, OnRenewFailure: renewFailed})
 
 	leaderOf := func() *K8sDCS {
 		for i := 0; i < 150; i++ {
@@ -163,4 +170,54 @@ func TestK8sDCSReleaseDuringCooldownIsNotDropped(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("never re-acquired leadership after both cooldowns expired")
+}
+
+// #298 review: the chart's PGHAAgentLeaseRenewFailing alert rates
+// pg_ha_agent_renew_failures_total, and until OnRenewFailure was wired nothing ever
+// incremented it -- the alert could not fire. An INVOLUNTARY loss (the apiserver
+// refusing renew writes past RenewDeadline) must fire the callback.
+func TestK8sDCSRenewFailureFiresOnInvoluntaryLoss(t *testing.T) {
+	cs := fake.NewSimpleClientset()
+	var failing atomic.Bool
+	cs.PrependReactor("update", "leases", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if failing.Load() {
+			return true, nil, errors.New("apiserver unreachable (injected)")
+		}
+		return false, nil, nil
+	})
+	k := NewK8sDCSWithClient(K8sConfig{
+		Namespace: "ns", LeaseName: "pg-leader",
+		LeaseDuration: 2 * time.Second, RenewDeadline: 1 * time.Second, RetryPeriod: 200 * time.Millisecond,
+	}, cs)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	acquired := make(chan struct{}, 1)
+	renewFailed := make(chan struct{}, 1)
+	go k.Run(ctx, "pod-0", Callbacks{
+		OnAcquired: func(context.Context) {
+			select {
+			case acquired <- struct{}{}:
+			default:
+			}
+		},
+		OnRenewFailure: func() {
+			select {
+			case renewFailed <- struct{}{}:
+			default:
+			}
+		},
+	})
+
+	select {
+	case <-acquired:
+	case <-time.After(15 * time.Second):
+		t.Fatal("never acquired leadership")
+	}
+	failing.Store(true) // every renew write now fails; RenewDeadline expires
+	select {
+	case <-renewFailed:
+	case <-time.After(15 * time.Second):
+		t.Fatal("involuntary lease loss never fired OnRenewFailure")
+	}
 }

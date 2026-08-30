@@ -60,7 +60,7 @@ passwordless `primary_conninfo` can authenticate streaming replication.
 ### Not injected by the chart: `KUBECONFIG` (#317)
 
 `KUBECONFIG` is the one variable the agent reads that the chart never sets. When it
-is present the agent (and the entrypoint's `kubectl` stale-primary guard) reaches the
+is present the agent reaches the
 apiserver through that kubeconfig instead of the in-cluster ServiceAccount; when it is
 absent — the default — the in-cluster path is used exactly as before. It exists so a
 cluster whose egress policy denies pod traffic to the apiserver can route the agent
@@ -85,8 +85,9 @@ Set but unreadable/malformed/contextless is a startup failure naming the file, n
 silent fall back to in-cluster. `~/.kube/config` is deliberately not consulted. The boot
 log's `apiserver=` field records which route was taken. Note that `kubectl` is *not* as
 strict — its deferred loader does fall back to in-cluster on an empty or contextless
-kubeconfig — so a broken mount degrades the entrypoint's `#170` settle guard to its
-fail-open fast path while the agent refuses to boot. Only the postgresql container is
+kubeconfig — so the backup CronJob's `kubectl exec` may silently take the in-cluster route
+while the agent refuses to boot. The entrypoint itself makes no apiserver calls any more
+(#290 removed its `kubectl` settle guard). Only the postgresql container is
 involved either way; the `repmgr-init` init container makes no apiserver calls. See the
 chart README section *Routing the agent's apiserver traffic* for the kubeconfig to mount.
 
