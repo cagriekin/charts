@@ -4,6 +4,19 @@
 
 ### Changed (breaking)
 
+- **An unquoted image tag is now refused; quote every `image.tag` (#298).** Any `image.tag` (or
+  `image.digest`) that YAML parses as a number is rejected at render time instead of coerced. This
+  **breaks values files that wrote `tag: 18` unquoted**, which rendered correctly in 1.x -- the
+  fix is one character per site: `tag: "18"`. On the command line, shell quotes do not help
+  (`--set x.tag="18"` is still typed as a number); use `--set-string`.
+
+  The reason it cannot simply keep working: YAML parses `18`, `18.0` and `2.10` to the *same*
+  `float64` values a template sees, so `18.0` arrives indistinguishable from `18` and `2.10` from
+  `2.1`. A coercing chart therefore renders `repo:18` for a pin written `18.0`, and `repo:2.1`
+  for `2.10` -- a render-clean manifest deploying an image the values file never named. There is
+  no way to tell the safe case from the lossy one after parsing, so the chart refuses the whole
+  class and says how to fix it. Affects `pg`, `pgvector` and `etcd`.
+
 - **The `repmgr:` values block is now `ha:`** (#291). Nothing nested moved -- only the block's
   own name. Every `repmgr.*` key still works for the whole 2.0.0 line: `pg.normalizeValues`
   merges the `repmgr:` block over the `ha:` defaults key by key, so an untouched 1.x values
@@ -686,17 +699,26 @@
   paired `ALTER USER` are refused (`Cannot alter reserved roles`), so `rolpassword` stays NULL
   and the password arm already caught that case.
 
-- **A non-string image tag is now refused at render time (#298 review).** An unquoted YAML tag
+- **A non-string image tag is now refused at render time (#298 review, etcd 0.1.14).** An unquoted YAML tag
   (`tag: 18.0`) is a number, not text, and this took three rounds to get right: `printf "%s:%s"`
   rendered Go's error verb (`repo:%!s(float64=18)`), which at least failed loudly at the kubelet;
   `| toString` then made it *silent and wrong*, because Go renders a float in canonical form --
   `18.0` became `repo:18`, a floating patch instead of the pin that was written, and `2.10`
   became `repo:2.1`, a different tag that may well exist. A render-clean manifest deploying an
   image the values file never named is precisely the apply-time hazard the chart's render-time
-  guards exist to pull forward, so `pg.image` and `etcd.image` now refuse a non-string tag or
-  digest and name the fix (quote it). `pg.validateEtcdBootstrapImage` keeps its coercion: it only
-  builds the two strings its mismatch message prints, and the render fails on the type guard
-  regardless.
+  guards exist to pull forward, so `pg.image`, `etcd.image` and `pg.validateEtcdBootstrapImage`
+  now refuse a non-string tag or digest outright. The refusal names the offending key and the
+  shape of the fix -- quote it in a values file, and use `--set-string` on the command line,
+  where shell quotes do not help because helm types `--set x.tag=18` as a number regardless --
+  but never echoes the *coerced* value back as that fix: `18.0` reaches the chart already
+  truncated to `18`, so "quote it as \"18\"" would have prescribed exactly the wrong pin. The
+  bootstrap-image guard had to refuse rather than coerce because it renders ahead of every
+  `pg.image` call: with `toString` there, the only thing an unquoted `ha.image.tag: 2.0` produced
+  was its MISMATCH message naming `cagriekin/pg-ha:2`, a coordinate no values file ever wrote,
+  and instructing the operator to copy it onto `etcd.rbac.bootstrapImage` -- the same
+  wrong-remediation trap `pg.validateHaImageGeneration` documents. Only the repository is still
+  coerced, in both helpers: it is the one half no guard types, and unlike a tag a numeric
+  repository cannot silently name a different image that exists.
 
 - **`postgresql.pgHba` entries no longer invert their order across pod starts (#298 review,
   standalone).** The postStart insert was made a single awk pass so the whole list lands in the
@@ -755,7 +777,6 @@
   and `render_test.yaml` now pins the bootstrap Job's digest-only render too, which was the fix
   that shipped first and had no render test at all.
 
-
   ...and the printf that consolidation introduced dropped a shape the expression it replaced
   handled (#298 review, etcd 0.1.12). `printf "%s:%s"` renders Go's `%!s(...)` error verb for a
   NON-STRING tag, while the old `{{ with .tag }}:{{ . }}{{ end }}` printed any scalar --
@@ -765,10 +786,12 @@
   `quay.io/coreos/etcd:%!s(float64=3.5)`. That is a render-CLEAN manifest the kubelet then
   rejects as `InvalidImageName` -- exactly the failure both `etcd.image` and `pg.image` exist to
   pull forward to render time, reached through the guard rather than around it. Both helpers now
-  `toString` the tag (and the repository), `etcd/tests/unit/render_test.yaml` pins the
-  non-string-tag render, and `pg/tests/test-template.sh` asserts no `%!s(` ever reaches an
-  `image:` line. `etcd/README.md` also now states the tag/digest rules on the
-  `rbac.bootstrapImage` row, not only on the server `image` one.
+  REFUSE a non-string tag or digest (`toString` was the first attempt and is documented as a
+  defect of its own under 2.0.0 above -- it made the failure silent and wrong),
+  `etcd/tests/unit/render_test.yaml` pins the non-string-tag refusal, and
+  `pg/tests/test-template.sh` asserts no `%!s(` ever reaches an `image:` line.
+  `etcd/README.md` also now states the tag/digest rules on the `rbac.bootstrapImage` row, not
+  only on the server `image` one.
 
 - **`ha.agent: null` in standalone mode gave a raw nil pointer instead of the named error (#298
   review).** The `ha.agent is required when ha.enabled=true` guard was added for exactly this,

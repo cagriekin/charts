@@ -819,12 +819,25 @@ assert_not_contains "#298: a non-string image tag never renders a Go format erro
 # file never named. A tag is text; the fix is to refuse a non-string and say so.
 assert_contains "#298: a non-string image tag is refused at render time" \
   "${img_float_tag_out}" "is a float64, not a string"
-assert_contains "#298: ...and the refusal says to quote it" "${img_float_tag_out}" "Quote it: tag:"
+assert_contains "#298: ...and the refusal says to quote it" "${img_float_tag_out}" "Quote the tag you actually meant"
+# `--set` types the value, so shell quotes do not help: the remedy has to name --set-string.
+img_int_tag_out=$(helm template test-pg "${CHART_DIR}" --set busyboxImage.tag=18 2>&1 || true)
+assert_contains "#298: an int tag from --set is refused too" "${img_int_tag_out}" "not a string"
+assert_contains "#298: ...and the refusal names --set-string, which is the only fix there" \
+  "${img_int_tag_out}" "--set-string"
+assert_contains "#298: ...and --set-string renders the tag verbatim" \
+  "$(helm template test-pg "${CHART_DIR}" --set-string busyboxImage.tag=18 2>&1 || true)" 'image: "busybox:18"'
 # The canonical-form trap itself: 18.0 must never silently become the 18 tag.
 img_float_trunc_out=$(helm template test-pg "${CHART_DIR}" \
   --set-json 'busyboxImage={"repository":"busybox","tag":18.0,"digest":"","pullPolicy":"IfNotPresent"}' 2>&1 || true)
 assert_not_contains "#298: a trailing-zero tag never renders as the truncated image" \
   "${img_float_trunc_out}" "busybox:18\""
+# ...and the refusal must not hand the truncation back as the REMEDY (#298 review). The value
+# has already lost digits by the time the helper sees it, so echoing it -- `Quote it: tag: "18"`
+# -- told an operator who wrote `tag: 18.0` to pin `"18"`, i.e. instructed exactly the wrong
+# image the refusal exists to prevent. The message names the shape, never the coerced value.
+assert_not_contains "#298: ...and the refusal never echoes the truncated value as the fix" \
+  "${img_float_trunc_out}" 'tag: "18"'
 
 # #320 review: postgresql.extraVolumes lands in the SAME pod volumes list, so a shared name is
 # a duplicate the API server rejects -- the same apply-time-only class as the chart-volume
@@ -5617,21 +5630,22 @@ ha_bad_rc=0
 helm template test-pg "${CHART_DIR}" --set ha.agent.leaseDuration=5s >/dev/null 2>&1 || ha_bad_rc=$?
 assert_gt "#298: the same triple is still rejected with ha.enabled=true" "${ha_bad_rc}" 0
 
-# #298 review: the etcd bootstrap-image MISMATCH MESSAGE must name the real values, not Go's
-# format verb. pg.image and etcd.image got `toString` on both halves of the reference;
-# pg.validateEtcdBootstrapImage builds its two comparison refs with its own printf and did not.
-# values.schema.json types no image.tag, so an unquoted YAML scalar arrives as float64 and the
-# remediation message -- whose whole job is to name the two keys that disagree -- read
-# `cagriekin/pg-ha:%!s(float64=2)`. --set-json, not --set: helm's strvals parser converts
-# integers but leaves a float a string, so a plain --set would pass with the bug present.
+# #298 review: a non-string tag must be REFUSED BY NAME before the etcd bootstrap-image
+# comparison, not coerced into it. This guard renders from statefulset.yaml well ahead of any
+# pg.image call, so while it built its two refs with `toString` the first (and only) thing an
+# operator with an unquoted `ha.image.tag: 2.0` saw was the MISMATCH message printing
+# `cagriekin/pg-ha:2` -- a coordinate no values file ever wrote -- telling them to copy it onto
+# etcd.rbac.bootstrapImage. That is the wrong-remediation trap pg.validateHaImageGeneration
+# exists to document: obey it and BOTH workloads end up pinned to a tag that was never theirs.
+# --set-json, not --set: helm's strvals parser types an integer but leaves a float a string, so
+# a plain --set would not reach the float path at all.
 etcd_boot_float=$(helm template test-pg "${CHART_DIR}" --set etcd.enabled=true \
   --set-json 'ha={"enabled":true,"image":{"repository":"cagriekin/pg-ha","tag":2.0,"pullPolicy":"IfNotPresent","majorVersion":"18"}}' 2>&1 || true)
-assert_contains "#298: the etcd bootstrap-image mismatch still fires on a float tag" "${etcd_boot_float}" "must match ha.image"
-assert_not_contains "#298: ...and names the tag rather than a Go format verb" "${etcd_boot_float}" '%!s('
-# The float tag is now refused outright by pg.image's type guard, so this render fails either
-# way -- what matters is that whichever message the operator gets names real values, never a
-# format verb (asserted above).
-assert_contains "#298: ...and a float tag is refused somewhere in the chain" "${etcd_boot_float}" "must match ha.image"
+assert_contains "#298: a float ha.image.tag is refused by name, ahead of the mismatch compare" \
+  "${etcd_boot_float}" "ha.image.tag is 2, a float64 and not a string"
+assert_not_contains "#298: ...and no message ever shows a Go format verb" "${etcd_boot_float}" '%!s('
+assert_not_contains "#298: ...and the mismatch message never fires against a coerced tag" \
+  "${etcd_boot_float}" "must match ha.image"
 
 # --- #298 review: a 1.x HA image pin cannot run chart 2.0.0 ---
 # The repmgr-init container passes only PG_MAJOR; a 1.x image's `entrypoint.sh init` runs

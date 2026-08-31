@@ -87,14 +87,16 @@ tests:
   # in opposite wrong directions: `printf "%s:%s"` rendered Go's error verb, and `| toString`
   # then made it silent and wrong -- a float renders in canonical form, so `tag: 18.0` becomes
   # `:18` and `tag: 2.10` becomes `:2.1`, a different image the values file never named. Failing
-  # here is what invariant 4 asks for; the remedy is to quote the tag.
+  # here is what invariant 4 asks for; the remedy is to quote the tag -- and the message must
+  # NOT echo the coerced value back as that remedy ("Quote it: tag: \"18\"" told an operator who
+  # wrote 18.0 to pin the truncated tag), which is why it names the shape instead.
   - it: a non-string image tag is refused rather than coerced
     template: templates/statefulset.yaml
     set:
       image.tag: 18.0
     asserts:
       - failedTemplate:
-          errorMessage: 'etcd: image tag 18 for repository quay.io/coreos/etcd is a float64, not a string: YAML reads an unquoted 18.0 as a number and a tag is text, so it would render as "18" -- a different image, or none. Quote it: tag: "18".'
+          errorMessage: 'etcd: image tag 18 for repository quay.io/coreos/etcd is a float64, not a string: an image tag is text, and an unquoted YAML scalar is a number -- `tag: 18.0` arrives here as 18 and `tag: 2.10` as 2.1, so the value printed above may ALREADY have lost digits, and rendering it would deploy a different image or none at all. Quote the tag you actually meant in the values file (tag: "..."); on the command line shell quotes are not enough (helm types `--set x.tag=18` as a number regardless) -- use --set-string.'
 
   - it: plaintext default uses httpGet readiness and tcpSocket liveness
     template: templates/statefulset.yaml

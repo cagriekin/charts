@@ -160,10 +160,10 @@ annotation consumers -- #128.)
        manifest deploying an image the values file never named is exactly the apply-time hazard
        invariant 4 says to catch at render time, so fail here and say how to fix it. */ -}}
 {{- if and .tag (not (kindIs "string" .tag)) -}}
-{{- fail (printf "image tag %v for repository %v is a %s, not a string: YAML reads an unquoted 18.0 as a number and a tag is text, so it would render as \"18\" -- a different image, or none. Quote it: tag: \"%v\"." .tag .repository (kindOf .tag) .tag) -}}
+{{- fail (printf "image tag %v for repository %v is a %s, not a string: an image tag is text, and an unquoted YAML scalar is a number -- `tag: 18.0` arrives here as 18 and `tag: 2.10` as 2.1, so the value printed above may ALREADY have lost digits, and rendering it would deploy a different image or none at all. Quote the tag you actually meant in the values file (tag: \"...\"); on the command line shell quotes are not enough (helm types `--set x.tag=18` as a number regardless) -- use --set-string." .tag (.repository | toString) (kindOf .tag)) -}}
 {{- end -}}
 {{- if and .digest (not (kindIs "string" .digest)) -}}
-{{- fail (printf "image digest %v for repository %v is a %s, not a string: quote it." .digest .repository (kindOf .digest)) -}}
+{{- fail (printf "image digest %v for repository %v is a %s, not a string: quote it in the values file, or pass --set-string on the command line." .digest (.repository | toString) (kindOf .digest)) -}}
 {{- end -}}
 {{- if not .repository -}}
 {{- /* An empty repository renders ":tag" or "@sha256:..." -- unparseable, the same
@@ -171,20 +171,20 @@ annotation consumers -- #128.)
 {{- fail "an image block has an empty repository, which renders an unparseable reference (\":tag\"). Set the repository, or leave the whole image block at its chart default." -}}
 {{- end -}}
 {{- if and (not .tag) (not .digest) -}}
-{{- fail (printf "image %q has neither a tag nor a digest, which would deploy an implicit :latest -- unpinned across pod restarts, and on a StatefulSet with existing data a future :latest can be a different PostgreSQL major that refuses to start on it. Set a tag or a digest." (.repository | default "<empty repository>")) -}}
+{{- fail (printf "image %q has neither a tag nor a digest, which would deploy an implicit :latest -- unpinned across pod restarts, and on a StatefulSet with existing data a future :latest can be a different PostgreSQL major that refuses to start on it. Set a tag or a digest." (.repository | default "<empty repository>" | toString)) -}}
 {{- end -}}
-{{- /* toString on both halves, because %s on a NON-STRING renders Go's error verb instead of
-       the value (#298 review). values.schema.json does not type any image.tag, and an
-       unquoted YAML scalar is a tag an operator writes by accident: `busyboxImage.tag: 1.37`
-       or `pgpool.image.tag: 4.6` arrives as float64 and rendered
-       `busybox:%!s(float64=1.37)`, which the kubelet rejects as InvalidImageName -- a
-       render-clean manifest that ImagePullBackOffs, the outcome the guards above exist to
-       move to render time. The pre-#320 `{{ . }}` form printed any scalar correctly, so this
-       is a regression the printf introduced, not a pre-existing hole. */ -}}
+{{- /* toString on the REPOSITORY, and only there: the tag and the digest are already known to
+       be strings (refused above), but %s on a non-string renders Go's error verb rather than
+       the value, and the repository is the one half no guard types -- `%s` on it would emit
+       `%!s(float64=1.37):tag`, a render-CLEAN manifest the kubelet then rejects as
+       InvalidImageName. Coerced rather than refused because, unlike a tag, a numeric
+       repository cannot silently name a DIFFERENT image that exists: the pre-#320
+       `{{ .repository }}` form printed it correctly and there is no canonical-form trap to
+       walk into. */ -}}
 {{- if .tag -}}
-{{- printf "%s:%s" .repository .tag -}}
+{{- printf "%s:%s" (.repository | toString) .tag -}}
 {{- else -}}
-{{- .repository -}}
+{{- .repository | toString -}}
 {{- end -}}
 {{- with .digest }}@{{ . }}{{- end -}}
 {{- end -}}
@@ -1615,12 +1615,23 @@ to acknowledge, not the chart's to assume.
        around it. Same shape in reverse when only the bootstrap image is pinned. */ -}}
 {{- $haDigest := ($ha.digest | default "") | toString -}}
 {{- $bootDigest := ($boot.digest | default "") | toString -}}
-{{- /* toString on every half, as pg.image and etcd.image now do (#298 review): values.schema.json
-       types no image.tag, so an unquoted YAML scalar (`tag: 2.0`) arrives as float64 and `%s`
-       renders Go's error verb -- the mismatch message this guard exists to hand the operator
-       then reads `cagriekin/pg-ha:%!s(float64=2)` and names neither key's real value. */ -}}
-{{- $haRef := printf "%s:%s" ($ha.repository | default "" | toString) ($ha.tag | default "" | toString) -}}
-{{- $bootRef := printf "%s:%s" ($boot.repository | default "" | toString) ($boot.tag | default "" | toString) -}}
+{{- /* A NON-STRING tag or digest is refused HERE, before the comparison, not left to pg.image
+       (#298 review). This guard renders from statefulset.yaml line 34, ahead of every
+       pg.image call, so coercing the halves and comparing anyway made an unquoted
+       `ha.image.tag: 2.0` come out as the mismatch message printing `cagriekin/pg-ha:2` -- a
+       coordinate no values file ever wrote -- and instructing the operator to copy it onto
+       etcd.rbac.bootstrapImage. That is the same wrong-remediation trap
+       pg.validateHaImageGeneration was added for: the operator obeys, pins BOTH workloads to a
+       tag that was never theirs, and only then meets pg.image's type refusal. Name the real
+       defect first. Sorted key order out of `dict` keeps the message deterministic. */ -}}
+{{- range $imgKey, $imgVal := dict "ha.image.tag" $ha.tag "ha.image.digest" $ha.digest "etcd.rbac.bootstrapImage.tag" $boot.tag "etcd.rbac.bootstrapImage.digest" $boot.digest -}}
+{{- if and $imgVal (not (kindIs "string" $imgVal)) -}}
+{{- fail (printf "%s is %v, a %s and not a string: an image reference is text, and an unquoted YAML scalar is a number -- `2.0` arrives here as 2 and `2.10` as 2.1, so the value printed above may ALREADY have lost digits. Quote the value you actually meant (%s: \"...\"); on the command line shell quotes are not enough (helm types `--set %s=2` as a number regardless) -- use --set-string." $imgKey $imgVal (kindOf $imgVal) $imgKey $imgKey) -}}
+{{- end -}}
+{{- end -}}
+{{- /* Both halves are strings by here; `default ""` still covers an absent key. */ -}}
+{{- $haRef := printf "%s:%s" ($ha.repository | default "" | toString) ($ha.tag | default "") -}}
+{{- $bootRef := printf "%s:%s" ($boot.repository | default "" | toString) ($boot.tag | default "") -}}
 {{- if $haDigest -}}{{- $haRef = printf "%s@%s" $haRef $haDigest -}}{{- end -}}
 {{- if $bootDigest -}}{{- $bootRef = printf "%s@%s" $bootRef $bootDigest -}}{{- end -}}
 {{- if ne $haRef $bootRef -}}

@@ -27,6 +27,6 @@ dependencies:
     version: 0.1.0
     repository: file://../common
   - name: etcd
-    version: 0.1.13
+    version: 0.1.14
     repository: file://../etcd
     condition: etcd.enabled

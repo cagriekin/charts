@@ -90,10 +90,10 @@ app.kubernetes.io/component: etcd
        manifest deploying an image the values file never named is exactly the apply-time hazard
        invariant 4 says to catch at render time, so fail here and say how to fix it. */ -}}
 {{- if and .tag (not (kindIs "string" .tag)) -}}
-{{- fail (printf "etcd: image tag %v for repository %v is a %s, not a string: YAML reads an unquoted 18.0 as a number and a tag is text, so it would render as \"18\" -- a different image, or none. Quote it: tag: \"%v\"." .tag .repository (kindOf .tag) .tag) -}}
+{{- fail (printf "etcd: image tag %v for repository %v is a %s, not a string: an image tag is text, and an unquoted YAML scalar is a number -- `tag: 18.0` arrives here as 18 and `tag: 2.10` as 2.1, so the value printed above may ALREADY have lost digits, and rendering it would deploy a different image or none at all. Quote the tag you actually meant in the values file (tag: \"...\"); on the command line shell quotes are not enough (helm types `--set x.tag=18` as a number regardless) -- use --set-string." .tag (.repository | toString) (kindOf .tag)) -}}
 {{- end -}}
 {{- if and .digest (not (kindIs "string" .digest)) -}}
-{{- fail (printf "etcd: image digest %v for repository %v is a %s, not a string: quote it." .digest .repository (kindOf .digest)) -}}
+{{- fail (printf "etcd: image digest %v for repository %v is a %s, not a string: quote it in the values file, or pass --set-string on the command line." .digest (.repository | toString) (kindOf .digest)) -}}
 {{- end -}}
 
 {{- if not .repository -}}
@@ -102,17 +102,16 @@ app.kubernetes.io/component: etcd
 {{- if and (not .tag) (not .digest) -}}
 {{- fail (printf "etcd: image %q has neither a tag nor a digest, which would deploy an implicit :latest -- unpinned across pod restarts, so a future build silently replaces the one this release was tested with (for the etcd SERVER that is a new major landing on an existing member's data directory, which it refuses to start on; for rbac.bootstrapImage it is one agent build writing the etcd RBAC that another then authenticates against). Set image.tag, or image.digest alone (a digest is a complete pin on its own)." (.repository | toString)) -}}
 {{- end -}}
-{{- /* toString on the tag, because %s on a NON-STRING renders Go's error verb rather than
-       the value (#298 review). The expression this helper replaced was `{{ with .tag }}:{{ . }}{{ end }}`,
-       which prints any scalar; values.schema.json does not type image.tag, so an unquoted
-       YAML scalar is reachable -- `--set image.tag=3` or `tag: 3.5` in a values file arrives
-       as int64/float64 and rendered `quay.io/coreos/etcd:%!s(float64=3.5)`, an InvalidImageName
-       at the kubelet: exactly the failure this helper exists to move to render time. The fail
-       message above already does this to .repository; the reference itself has to as well. */ -}}
+{{- /* toString on the REPOSITORY, and only there, exactly as pg.image does: the tag and the
+       digest are already known to be strings (refused above), but %s on a non-string renders
+       Go's error verb rather than the value, and the repository is the one half no guard types
+       -- `%s` on it would emit `%!s(float64=3.5):tag`, a render-CLEAN manifest the kubelet
+       then rejects as InvalidImageName. Coerced rather than refused because, unlike a tag, a
+       numeric repository cannot silently name a DIFFERENT image that exists. */ -}}
 {{- if .tag -}}
-{{- printf "%s:%s" .repository .tag -}}
+{{- printf "%s:%s" (.repository | toString) .tag -}}
 {{- else -}}
-{{- .repository -}}
+{{- .repository | toString -}}
 {{- end -}}
 {{- with .digest }}@{{ . }}{{- end -}}
 {{- end -}}
