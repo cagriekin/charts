@@ -61,14 +61,37 @@ assert_not_eq() {
   fi
 }
 
+# `grep -q --`, not `grep -q` (#298 review). Without the terminator a needle that begins with
+# a dash is parsed as an OPTION: grep exits 2 having matched nothing, so assert_contains reported
+# a spurious failure and -- far worse -- assert_not_contains reported a spurious PASS. Any
+# assertion of the form `- alert: X` (the natural way to test that a PrometheusRule rule is or is
+# not rendered) was silently vacuous. Regex semantics are deliberately preserved: existing
+# assertions rely on them, and `--` only stops option parsing.
 assert_contains() {
   local description="$1"
   local haystack="$2"
   local needle="$3"
-  if grep -q "${needle}" <<< "${haystack}"; then
+  if grep -q -- "${needle}" <<< "${haystack}"; then
     pass "${description}"
   else
     fail "${description}" "output does not contain '${needle}'"
+  fi
+}
+
+# Fixed-string variant, for needles that are literal YAML or PromQL rather than patterns
+# (#298 review). assert_contains is a REGEX match and stays that way -- existing assertions
+# depend on it -- but a PromQL needle like `rate(x{...}[15m]) > 0` contains `[15m]`, which BRE
+# reads as a character class matching one of `1`, `5`, `m`. It therefore does not match the very
+# text it was copied from, and the assertion fails for a reason that has nothing to do with the
+# render. Use this whenever the needle is text to be found verbatim.
+assert_contains_literal() {
+  local description="$1"
+  local haystack="$2"
+  local needle="$3"
+  if grep -qF -- "${needle}" <<< "${haystack}"; then
+    pass "${description}"
+  else
+    fail "${description}" "output does not contain (literal) '${needle}'"
   fi
 }
 
@@ -76,7 +99,7 @@ assert_not_contains() {
   local description="$1"
   local haystack="$2"
   local needle="$3"
-  if grep -q "${needle}" <<< "${haystack}"; then
+  if grep -q -- "${needle}" <<< "${haystack}"; then
     fail "${description}" "output should not contain '${needle}'"
   else
     pass "${description}"

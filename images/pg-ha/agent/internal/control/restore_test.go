@@ -601,3 +601,27 @@ func TestRestoreStopStillHonoursTheIntentTimeoutAfterTheDetach(t *testing.T) {
 		t.Error("no Job may be created when the stop did not complete")
 	}
 }
+
+// #298 review: the response-write deadline must cover the DETACHED delete leg too.
+// backupAPI.DeleteRestore runs on context.WithoutCancel with its own budget, so RequestTimeout
+// does not bound it -- while the marker and status reads before it are bounded by RequestTimeout
+// and can consume most of it on a slow apiserver. With the delete leg missing from the sum, a
+// replace-restore over a Job whose pod uses its full termination grace did every step and then
+// failed to write the 202: the operator got a dropped connection instead of the Job name.
+func TestWriteTimeoutCoversTheDetachedLegs(t *testing.T) {
+	s := &Server{o: Options{
+		RequestTimeout:  120 * time.Second,
+		IntentTimeout:   30 * time.Second,
+		DetachedTimeout: 105 * time.Second,
+	}}
+	// Everything a replace-restore can spend in series before the response is written.
+	worst := 120*time.Second + 105*time.Second + 2*30*time.Second
+	if got := s.writeTimeout(); got < worst {
+		t.Errorf("writeTimeout() = %s, must be at least the serial worst case %s", got, worst)
+	}
+	// A release with no detached leg configured must not be given a needlessly wide deadline.
+	s2 := &Server{o: Options{RequestTimeout: 60 * time.Second, IntentTimeout: 15 * time.Second}}
+	if s2.writeTimeout() >= s.writeTimeout() {
+		t.Errorf("a server with no detached leg should get a tighter deadline, got %s vs %s", s2.writeTimeout(), s.writeTimeout())
+	}
+}

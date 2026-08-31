@@ -75,6 +75,13 @@ type Options struct {
 	// node-local intent may wait for the reconcile loop before the caller gets a 504.
 	RequestTimeout time.Duration
 	IntentTimeout  time.Duration
+	// DetachedTimeout is the budget of the widest operation a handler runs on a context
+	// DETACHED from the request (context.WithoutCancel) -- today the restore Job delete and
+	// its wait. RequestTimeout does not bound such a leg, so writeTimeout has to be told
+	// about it explicitly or the response deadline can expire mid-handler (#298 review).
+	// Supplied by the caller that owns the constant, rather than mirrored here, so the two
+	// cannot drift. Zero means "no detached leg".
+	DetachedTimeout time.Duration
 }
 
 // Server is the mTLS control API.
@@ -260,8 +267,17 @@ func (s *Server) Serve(ctx context.Context) error {
 // previous Job whose pod uses its full termination grace did all three steps and then failed
 // to write the 202 -- leaving the operator with a dropped connection instead of the jobName
 // and nextSteps, which is exactly the outcome those detach comments exist to prevent.
+//
+// The DELETE leg is summed EXPLICITLY rather than assumed to fit inside RequestTimeout (#298
+// review). It runs on context.WithoutCancel with its own budget -- reported as DetachedTimeout
+// by the caller that owns the constant -- so
+// RequestTimeout does not bound it -- while everything BEFORE it (the marker read, the restore
+// status read) IS bounded by RequestTimeout and can legitimately consume most of it on a slow
+// apiserver. Deriving the sum from the constant the detached leg actually uses keeps the two in
+// step: raise restoreDeleteTimeout and this widens with it, instead of quietly going back to
+// dropping the 202 it exists to deliver.
 func (s *Server) writeTimeout() time.Duration {
-	if d := s.o.RequestTimeout + 2*s.o.IntentTimeout + 30*time.Second; d > writeTO {
+	if d := s.o.RequestTimeout + s.o.DetachedTimeout + 2*s.o.IntentTimeout + 30*time.Second; d > writeTO {
 		return d
 	}
 	return writeTO

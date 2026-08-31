@@ -744,6 +744,49 @@
   the whole `initdb` on every restart. It is now checked with the credentials, before the first
   write to the volume.
 
+- **`PGHAReplicationSlotInvalidated` could no longer fire for the case it was written for, so a
+  new alert covers it (#298 review).** The invalidated-slot recycle observes `wal_status='lost'`
+  and repairs the slot in the *same* tick, so the gauge is 1 for at most one scrape and 0
+  thereafter -- the rule's `for: 5m` never elapses. That is the dead-alert failure this chart has
+  shipped more than once, so the recycle now increments a counter,
+  `pg_ha_agent_replication_slots_recycled_total`, and a new `PGHAReplicationSlotRecycled` rule
+  alerts on its rate (the same shape the marker-tamper rule uses, for the same reason: the event
+  is a transition and needs no clearing logic). The gauge rule stays, because an *active*
+  invalidated slot, or one whose ordinal has no live pod, is never recycled. The new alert states
+  the part that matters operationally: recycling restores the SLOT, not the STANDBY, which still
+  needs a full re-clone -- the recycle only removes the dead slot that would have made the
+  re-clone itself fail.
+
+- **A failed slot recycle no longer points `synchronized_standby_slots` at a slot that does not
+  exist (#298 review, agent).** The drop and the create are two statements in one call and
+  `pg_drop_replication_slot` is not transactional, so a deadline, a dropped connection or an
+  exhausted `max_replication_slots` between them removes the slot and returns an error -- while
+  #308's owned-slot set is derived from the pre-pass snapshot, which still lists the name. Naming
+  a nonexistent slot in that GUC is the one thing it must never do: the primary then refuses to
+  release WAL and logs about it every checkpoint until the next tick re-reads the real list. Such
+  a name is now dropped from the snapshot.
+
+- **The control API's response-write deadline covers its detached work (#298 review, agent).** The
+  restore-Job delete runs on a context detached from the request with its own budget, so the
+  per-request ceiling does not bound it, while the reads *before* it are bounded by that ceiling
+  and can consume most of it on a slow apiserver. The budget is now supplied by the caller that
+  owns the constant rather than assumed to fit, so the two cannot drift.
+
+### Testing
+
+- **Two assertion helpers were silently vacuous, in all three charts' shell suites (#298
+  review).** `assert_contains` / `assert_not_contains` passed the needle to `grep -q` without a
+  `--` terminator, so any needle beginning with a dash was parsed as an OPTION: grep matched
+  nothing and exited non-zero, which made `assert_contains` fail spuriously and -- far worse --
+  made `assert_not_contains` **pass unconditionally**. Every assertion of the natural form
+  `- alert: X` (does this PrometheusRule rule render?) proved nothing. Fixed in `pg`, `kafka` and
+  `redis`; fixing it immediately exposed one over-broad pg assertion that had never really run
+  (it looked for a blanket `podSelector` anywhere in the NetworkPolicy, when the flag it tested
+  governs only the 5432 ingress -- the agent metrics rule carries a deliberate one), now replaced
+  with a comparison between the two renders. A new `assert_contains_literal` covers needles that
+  are verbatim PromQL or YAML rather than patterns, since `[15m]` reads as a character class to a
+  regex match.
+
 - **An invalidated replication slot is now recycled instead of accepted (#298 review, agent).**
   `wal_status = 'lost'` means PostgreSQL destroyed the reservation because the slot passed
   `max_slot_wal_keep_size` (4GB in this image), and such a slot can never be acquired again --
@@ -757,7 +800,12 @@
   dropped the slot by hand. Both paths now drop the dead reservation first, guarded on `NOT
   active` so only a slot nothing holds is ever removed -- and the primary's own create pass
   counts an invalidated slot as ABSENT, so it actually reaches that recycle instead of
-  skipping the create because a (dead) slot by that name exists.
+  skipping the create because a (dead) slot by that name exists. A recycle whose create leg
+  FAILS also drops the slot from the owned set the same pass returns: the drop and the create
+  are one statement pair and `pg_drop_replication_slot` is not transactional, so a failure
+  between them removes the slot -- and `synchronized_standby_slots` (#308) is reconciled from
+  the pre-pass snapshot, which would otherwise keep naming it, which is the one thing that GUC
+  must never do.
 
 - **The cross-cluster guard will still work after 2038 (#298 review, agent).**
   `pg_control_system()` exposes `system_identifier` as a signed `int8` -- PostgreSQL has no

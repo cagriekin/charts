@@ -1204,7 +1204,26 @@ netpol_hooks=$(helm template test-pg "${CHART_DIR}" \
 assert_contains "#298: the databases-roles hook Job is allowed to reach 5432" "${netpol_hooks}" "app.kubernetes.io/component: databases-roles"
 assert_contains "#298: the audit-extension hook Job is allowed to reach 5432" "${netpol_hooks}" "app.kubernetes.io/component: audit-extension"
 assert_contains "#298: ...alongside the monitoring-user Job rule that already existed" "${netpol_hooks}" "app.kubernetes.io/component: monitoring-user"
-assert_not_contains "#298: ...and allowExternal=false really is off (no blanket rule)" "${netpol_hooks}" "- podSelector: {}"
+# Counted, not searched for anywhere in the document (#298 review). The first version of this
+# assertion looked for `- podSelector: {}` in the whole NetworkPolicy and was WRONG: the agent
+# metrics rule (port 9200) carries a deliberate namespace-open selector that
+# networkPolicy.postgresql.allowExternal has no bearing on. It only ever passed because a needle
+# starting with a dash silently defeated grep -- see the helper. What the flag actually controls
+# is the blanket rule on the 5432 ingress, so compare the two renders: turning it off must remove
+# exactly one.
+netpol_hooks_open=$(helm template test-pg "${CHART_DIR}" \
+  --set networkPolicy.enabled=true \
+  --set networkPolicy.postgresql.allowExternal=true \
+  --set postgresql.audit.enabled=true \
+  --set prometheusExporter.enabled=true \
+  --set "postgresql.databases[0].name=app" \
+  --set "postgresql.roles[0].name=app_rw" \
+  --set "postgresql.roles[0].password=pw" \
+  --show-only templates/networkpolicy.yaml 2>&1)
+netpol_blanket_off=$(grep -cF -- "- podSelector: {}" <<< "${netpol_hooks}" || true)
+netpol_blanket_on=$(grep -cF -- "- podSelector: {}" <<< "${netpol_hooks_open}" || true)
+assert_eq "#298: allowExternal=false drops exactly the 5432 blanket rule" "$((netpol_blanket_on - 1))" "${netpol_blanket_off}"
+assert_gt "#298: ...and allowExternal=true really does add one" "${netpol_blanket_on}" "${netpol_blanket_off}"
 # The rules are conditional on the feature that creates the Job: no declared databases/roles
 # and no audit means no Job to allow, and a rule for a pod that never exists is noise.
 netpol_no_hooks=$(helm template test-pg "${CHART_DIR}" \
@@ -1807,7 +1826,25 @@ agent_pr_cascade=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values
   --set ha.agent.monitoring.prometheusRule.enabled=true \
   --set ha.agent.cascadingReplication=true \
   --show-only templates/agent-prometheusrule.yaml 2>&1)
-assert_not_contains "#298: replicas alert omitted under cascadingReplication" "${agent_pr_cascade}" "PGHAReplicasNotStreaming"
+# #298 review: the recycle alert exists BECAUSE the invalidated gauge cannot catch a slot the
+# agent repairs -- slotsTick observes wal_status='lost' and recycles in the same tick, so the
+# gauge is 1 for at most one scrape and PGHAReplicationSlotInvalidated's `for: 5m` never elapses.
+# A counter plus rate() is the shape that survives that, same as the marker-tamper rule.
+assert_contains "#298: the slot-recycle alert is rendered" "${agent_pr}" "- alert: PGHAReplicationSlotRecycled"
+assert_contains_literal "#298: the recycle alert rates the recycle counter" "${agent_pr}" "rate(pg_ha_agent_replication_slots_recycled_total{ ${agent_pr_scope} }[15m]) > 0"
+# The gauge rule stays: an ACTIVE invalidated slot, or one whose ordinal has no live pod, is
+# never recycled, so both rules have a case only they can catch.
+assert_contains "#298: the invalidated-gauge alert is still rendered alongside it" "${agent_pr}" "- alert: PGHAReplicationSlotInvalidated"
+# ...and the recycle alert must say the standby still needs a re-clone: recycling restores the
+# SLOT, not the STANDBY, and an operator who reads "recycled" as "repaired" stops looking.
+assert_contains "#298: the recycle alert names the re-clone the standby still needs" "${agent_pr}" "STILL NEEDS A FULL RE-CLONE"
+
+# Matched on the rule DEFINITION, not the bare name (#298 review): another alert's description
+# legitimately cross-references this one by name, and a substring test on the name alone made
+# that prose fail the gate. `- alert: <name>` is what "the rule is not rendered" actually means,
+# and it still catches the regression this guards -- the companion assertion below (no
+# pg_ha_agent_replicas_expected series) independently pins the expression's absence.
+assert_not_contains "#298: replicas alert omitted under cascadingReplication" "${agent_pr_cascade}" "- alert: PGHAReplicasNotStreaming"
 assert_not_contains "#298: no expected-count series under cascadingReplication" "${agent_pr_cascade}" "pg_ha_agent_replicas_expected"
 # The rest of the file is unaffected by that gate -- it removes one rule, not the group.
 assert_contains "#298: cascading render keeps the marker-tamper alert" "${agent_pr_cascade}" "PGHAAgentMarkerTamperSuspected"

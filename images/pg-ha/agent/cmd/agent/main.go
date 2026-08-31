@@ -1267,13 +1267,14 @@ func (a *agent) clearServingRWForPlannedStepDown() {
 // before clearing servingRW, so a bump observed after the store means the false either has
 // landed or is about to, and re-asserting it here is correct in both orders.
 func (a *agent) deriveServingRW(gen uint64, obs reconcile.Observation) {
-	overtaken := func() bool {
+	// msg is the caller's, because the two checks report DIFFERENT events and an operator reading
+	// the fence path must be able to tell them apart: the pre-store check discards a sample that
+	// never reached the latch, the post-store one corrects a value that already did.
+	overtaken := func(msg string) bool {
 		if a.fenceGen.Load() == gen {
 			return false
 		}
-		// A demote completed while observe() was in flight, so this sample predates it. Leave
-		// the latch where the demote put it; the next tick re-derives from scratch.
-		a.log.Info("discarding a read-write observation a demote overtook: this node was demoted while the tick was observing")
+		a.log.Info(msg)
 		return true
 	}
 	switch {
@@ -1282,11 +1283,13 @@ func (a *agent) deriveServingRW(gen uint64, obs reconcile.Observation) {
 			a.servingRW.Store(false) // a standby: the safe direction is never gated
 			return
 		}
-		if overtaken() {
+		// A demote completed while observe() was in flight, so this sample predates it. Leave
+		// the latch where the demote put it; the next tick re-derives from scratch.
+		if overtaken("discarding a read-write observation a demote overtook: this node was demoted while the tick was observing") {
 			return
 		}
 		a.servingRW.Store(true)
-		if overtaken() {
+		if overtaken("re-asserting a demote's read-only state over a read-write observation it overtook: the demote landed between this tick's generation check and its store") {
 			a.servingRW.Store(false)
 		}
 	case !obs.LocalProcessAlive:
@@ -3849,6 +3852,10 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) ([]str
 	//
 	// The reclaim pass below still runs, and still governs both topologies.
 	preCreate := !a.cfg.CascadeReplication
+	// Names whose invalidated-slot RECYCLE failed after the drop had already taken effect, so
+	// the pre-pass snapshot below over-reports them as present (#298 review; see the create
+	// loop's error branch).
+	recycleFailed := map[string]bool{}
 	for ord := 0; preCreate && ord < a.cfg.NodeCount; ord++ {
 		if selfOK && ord == selfOrd {
 			continue // the primary does not stream from itself
@@ -3883,10 +3890,32 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) ([]str
 		}
 		if err := a.prober.CreatePhysicalSlot(ctx, self, name); err != nil {
 			a.log.Warn("create replication slot", "slot", name, "err", err)
+			if dead {
+				// A FAILED recycle may have left the name GONE (#298 review). The drop and the
+				// create are two statements in one psql call and pg_drop_replication_slot is not
+				// transactional, so a statement/context deadline, a dropped connection or an
+				// exhausted max_replication_slots between them removes the slot and returns an
+				// error. ownedStandbySlots derives #308's synchronized_standby_slots from the
+				// PRE-PASS snapshot, which still lists it -- and naming a slot that does not
+				// exist is the one thing that GUC must never do: the primary then refuses to
+				// release WAL and logs about it every checkpoint until the next tick re-reads
+				// the real slot list. Drop it from the snapshot instead.
+				recycleFailed[name] = true
+			}
 			continue
 		}
 		if dead {
-			a.log.Info("recycled an invalidated replication slot for a live standby", "slot", name)
+			// Warn, not Info: the slot is usable again but the standby behind it still needs a
+			// full re-clone, and the recycle itself clears the invalidated gauge -- so the
+			// PGHAReplicationSlotInvalidated alert (for: 5m) can no longer catch this. The log
+			// line is the operator's remaining trace of it.
+			// Counted as well as logged (#298 review): the recycle clears the invalidated
+			// GAUGE in the same tick that observed it, so PGHAReplicationSlotInvalidated's
+			// `for: 5m` can never elapse for a slot the agent repairs. The counter is what
+			// PGHAReplicationSlotRecycled alerts on, and it is the only durable signal that
+			// the standby behind this ordinal needs a re-clone.
+			a.metr.IncSlotRecycled()
+			a.log.Warn("recycled an invalidated replication slot for a live standby; the standby behind it still needs a full re-clone", "slot", name)
 			continue
 		}
 		a.log.Info("created replication slot for an expected standby", "slot", name)
@@ -3915,6 +3944,19 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) ([]str
 			a.log.Info("dropped orphaned replication slot",
 				"slot", s.Name, "retained_wal_bytes", s.RetainedWALBytes)
 		}
+	}
+	// Filtered here rather than in ownedStandbySlots: the drop pass above still wants the full
+	// observed list (a name it cannot see is a name it cannot reclaim), and assertSyncStandbySlots
+	// intersects the owned set with the same snapshot -- so removing the name from `owned` is
+	// enough to keep the GUC off a slot that no longer exists.
+	if len(recycleFailed) > 0 {
+		kept := make([]pg.SlotState, 0, len(slots))
+		for _, s := range slots {
+			if !recycleFailed[s.Name] {
+				kept = append(kept, s)
+			}
+		}
+		slots = kept
 	}
 	return a.ownedStandbySlots(slots, live), true
 }

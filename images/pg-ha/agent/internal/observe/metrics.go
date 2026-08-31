@@ -47,9 +47,19 @@ type Metrics struct {
 	// max_slot_wal_keep_size = 4GB -- PostgreSQL invalidates it and the standby behind it
 	// can only recover by a full re-clone. Hence a metric and an alert, not just a log line.
 	// Zeroed on demotion (ClearSlots): only the primary observes slots.
-	slotsTotal              atomic.Int64
-	slotsInactive           atomic.Int64
-	slotsInvalidated        atomic.Int64
+	slotsTotal       atomic.Int64
+	slotsInactive    atomic.Int64
+	slotsInvalidated atomic.Int64
+	// slotsRecycled counts invalidated replication slots the agent dropped and re-created so
+	// a live standby's ordinal has a usable slot again (#298 review).
+	//
+	// A COUNTER is required here, not just the gauge above: the recycle happens in the same
+	// tick that observes the invalidation, so slotsInvalidated is 1 for at most one scrape and
+	// 0 thereafter -- PGHAReplicationSlotInvalidated's `for: 5m` can never elapse for exactly
+	// the case it was written for. Recycling restores the SLOT; it does not restore the
+	// STANDBY, which still needs a full re-clone, so the event has to leave a durable trace
+	// that survives the gauge being cleared.
+	slotsRecycled           atomic.Int64
 	slotMaxRetainedWALBytes atomic.Int64
 	// Replication topology as the primary last observed it (#288), derived from
 	// pg_stat_replication -- which replaced repmgr.nodes as the topology source: a departed pod
@@ -108,6 +118,7 @@ func (m *Metrics) IncFence()             { m.fences.Add(1) }
 func (m *Metrics) IncReconcileError()    { m.reconcileErrors.Add(1) }
 func (m *Metrics) IncRecoveryStart()     { m.recoveryStarts.Add(1) }
 func (m *Metrics) IncMarkerTamper()      { m.markerTamper.Add(1) }
+func (m *Metrics) IncSlotRecycled()      { m.slotsRecycled.Add(1) }
 
 // Control-API counters. IncControlRequest counts every authenticated request,
 // IncControlRejected every one refused by authn/authz, IncControlIntent every
@@ -222,6 +233,7 @@ func (m *Metrics) write(w io.Writer) {
 		{"pg_ha_agent_replication_slots", "Physical replication slots on this primary.", "gauge", m.slotsTotal.Load()},
 		{"pg_ha_agent_replication_slots_inactive", "Physical replication slots reserving WAL with no active consumer.", "gauge", m.slotsInactive.Load()},
 		{"pg_ha_agent_replication_slots_invalidated", "Physical replication slots PostgreSQL invalidated for exceeding max_slot_wal_keep_size; the standby behind each needs a full re-clone.", "gauge", m.slotsInvalidated.Load()},
+		{"pg_ha_agent_replication_slots_recycled_total", "Invalidated replication slots the agent dropped and re-created for a live standby. The slot is usable again; the standby behind it still needs a full re-clone.", "counter", m.slotsRecycled.Load()},
 		{"pg_ha_agent_replication_slot_max_retained_wal_bytes", "Largest WAL volume retained by any one physical replication slot.", "gauge", m.slotMaxRetainedWALBytes.Load()},
 	} {
 		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n%s %d\n", x.name, x.help, x.name, x.typ, x.name, x.val)

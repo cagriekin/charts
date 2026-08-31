@@ -1368,6 +1368,10 @@ type slotExec struct {
 	listed  int
 	created []string
 	dropped []string
+	// createErr fails the create statement. The recycle path needs it: its drop and its create
+	// are one psql call and the drop is not transactional, so "the create failed" and "the slot
+	// may now be gone" are the same state.
+	createErr error
 }
 
 func (s *slotExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
@@ -1375,7 +1379,7 @@ func (s *slotExec) Run(_ context.Context, _ []string, name string, args ...strin
 	switch {
 	case name == "psql" && strings.Contains(joined, "pg_create_physical_replication_slot"):
 		s.created = append(s.created, slotArg(joined))
-		return "", nil
+		return "", s.createErr
 	case name == "psql" && strings.Contains(joined, "pg_drop_replication_slot"):
 		s.dropped = append(s.dropped, slotArg(joined))
 		return slotArg(joined), nil
@@ -2888,6 +2892,37 @@ func TestReconcileSlotsLeavesAnActiveInvalidatedSlotAlone(t *testing.T) {
 	a.reconcileSlots(context.Background(), observed)
 	if len(ex.created) != 0 {
 		t.Errorf("created = %v, want none: the slot is held", ex.created)
+	}
+}
+
+// A recycle whose CREATE fails must not leave the slot in the owned set (#298 review). The
+// recycle's drop and create are two statements in one psql call and pg_drop_replication_slot is
+// not transactional, so a failure between them removes the slot -- while ownedStandbySlots
+// derives #308's synchronized_standby_slots from the PRE-PASS snapshot, which still lists it.
+// Naming a slot that does not exist is the one thing that GUC must never do: the primary then
+// refuses to release WAL and logs about it every checkpoint.
+func TestReconcileSlotsDropsAFailedRecycleFromTheOwnedSet(t *testing.T) {
+	observed := []pg.SlotState{{Name: "pg_ha_slot_1", Active: false, WALStatus: "lost"}}
+
+	ex := &slotExec{createErr: errors.New("all replication slots are in use")}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	owned, ok := a.reconcileSlots(context.Background(), observed)
+	if !ok {
+		t.Fatal("the live pod set is readable here; reconcileSlots must still return an answer")
+	}
+	if len(owned) != 0 {
+		t.Errorf("owned = %v, want none: the failed recycle may have removed the slot", owned)
+	}
+
+	// ...and the filter is not over-broad: a recycle that SUCCEEDED leaves a usable slot, which
+	// must stay in the owned set or the GUC churns off a live standby every time one is repaired.
+	okEx := &slotExec{}
+	b := newSlotTestAgent(t, okEx, config.MechanismNative)
+	b.cfg.NodeCount = 2
+	owned, ok = b.reconcileSlots(context.Background(), observed)
+	if !ok || len(owned) != 1 || owned[0] != "pg_ha_slot_1" {
+		t.Errorf("owned = %v (ok=%v), want [pg_ha_slot_1] after a successful recycle", owned, ok)
 	}
 }
 

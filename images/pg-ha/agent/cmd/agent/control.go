@@ -568,6 +568,9 @@ func (a *agent) startControl(ctx context.Context) error {
 		// still reaches the client. maxConcurrent (16) is what bounds concurrency; this is
 		// only a per-request ceiling on an mTLS, CN-allowlisted surface.
 		RequestTimeout: restoreDeleteTimeout + 30*time.Second,
+		// The detached delete leg, so writeTimeout can include a budget RequestTimeout does
+		// not bound (#298 review). Same expression DeleteRestore builds its context from.
+		DetachedTimeout: restoreDeleteTimeout + 15*time.Second,
 	})
 	if err != nil {
 		return err

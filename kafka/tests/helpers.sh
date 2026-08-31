@@ -45,11 +45,16 @@ assert_eq() {
   fi
 }
 
+# `grep -q --`, not `grep -q` (#298 review). Without the terminator a needle that begins with a
+# dash is parsed as an OPTION, so grep matches nothing and exits non-zero: assert_contains then
+# reports a spurious failure, and -- far worse -- assert_not_contains reports a spurious PASS. Any
+# assertion whose needle starts with `-` (`- alert: X`, `-headless`, `-exporter`) was silently
+# vacuous. Regex semantics are deliberately preserved; `--` only stops option parsing.
 assert_contains() {
   local description="$1"
   local haystack="$2"
   local needle="$3"
-  if grep -q "${needle}" <<< "${haystack}"; then
+  if grep -q -- "${needle}" <<< "${haystack}"; then
     pass "${description}"
   else
     fail "${description}" "output does not contain '${needle}'"
@@ -60,7 +65,7 @@ assert_not_contains() {
   local description="$1"
   local haystack="$2"
   local needle="$3"
-  if grep -q "${needle}" <<< "${haystack}"; then
+  if grep -q -- "${needle}" <<< "${haystack}"; then
     fail "${description}" "output should not contain '${needle}'"
   else
     pass "${description}"

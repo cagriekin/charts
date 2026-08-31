@@ -123,6 +123,30 @@ spec:
           annotations:
             summary: "A replication slot was invalidated ({{ include "pg.fullname" . }})"
             description: "PostgreSQL dropped a physical replication slot's WAL reservation because it exceeded max_slot_wal_keep_size (4GB in this image). The WAL the standby behind it needs is gone, so that standby cannot resume streaming and requires a full re-clone -- delete its PVC and let the agent re-clone it, or trigger a rejoin. Identify it with: SELECT slot_name, active, wal_status, restart_lsn FROM pg_replication_slots WHERE wal_status = 'lost'; -- note the retained-WAL gauge reads ZERO for these, because invalidation nulls restart_lsn."
+        {{- /* #298 review. The gauge above cannot catch a slot the AGENT repairs: since the
+               invalidated-slot recycle, slotsTick observes wal_status='lost' and drops+recreates
+               the slot in the SAME tick, so the gauge is 1 for at most one scrape and 0 after --
+               `for: 5m` never elapses. The rule above still earns its place (an ACTIVE invalidated
+               slot, or one whose ordinal has no live pod, is never recycled), but the commonest
+               case had silently stopped being alertable. That is the dead-alert failure this file
+               has shipped twice already, so it gets a counter and a rate rather than a gauge.
+
+               Recycling restores the SLOT, not the STANDBY: the WAL that standby needed is gone
+               either way and it still requires a full re-clone. So this is a real page, not an
+               informational one -- what the recycle bought is that the ordinal has a usable slot
+               again, so the agent's own re-clone can proceed instead of failing on a dead slot.
+
+               rate() over the counter, for the reason the marker-tamper rule gives: the event is
+               a transition, the counter simply stops advancing once the standby is healthy again,
+               and no clearing logic is needed. */}}
+        - alert: PGHAReplicationSlotRecycled
+          expr: rate(pg_ha_agent_replication_slots_recycled_total{ {{ $m }} }[15m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "A replication slot was invalidated and recycled ({{ include "pg.fullname" . }})"
+            description: "PostgreSQL invalidated a physical replication slot for exceeding max_slot_wal_keep_size (4GB in this image) and the agent dropped and re-created it so the ordinal has a usable slot again. THE STANDBY BEHIND IT STILL NEEDS A FULL RE-CLONE: the WAL it was missing is gone regardless, and the recycle only removes the dead slot that would have made the re-clone itself fail. Watch that the standby comes back -- see PGHAReplicasNotStreaming -- and if it does not, delete its PVC and let the agent re-clone it. This alert exists because the recycle clears pg_ha_agent_replication_slots_invalidated in the same tick that observes it, so PGHAReplicationSlotInvalidated cannot fire for a slot the agent repairs."
         - alert: PGHAReplicationSlotRetainingWAL
           expr: max(pg_ha_agent_replication_slot_max_retained_wal_bytes{ {{ $m }} }) > {{ int64 (dig "prometheusRule" "slotRetainedWALBytes" 3221225472 (.Values.ha.agent.monitoring | default dict)) }}
           for: 15m
