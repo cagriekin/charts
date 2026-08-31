@@ -318,6 +318,25 @@ func (p *Prober) SystemIdentifier(ctx context.Context, ci ConnInfo) (id uint64, 
 	return uint64(n), true, nil
 }
 
+// Restartpoint forces a restartpoint on a STANDBY (a plain CHECKPOINT, which on a standby
+// performs a restartpoint) so the control file records the timeline the node is actually
+// streaming.
+//
+// It exists because the promotion guards read DURABLE state (#298, found by the first live run of
+// the repmgrd->2.0.0 migration). A standby's control-file timeline only advances at a
+// restartpoint -- up to checkpoint_timeout later, 5 minutes on chart defaults -- so a node that
+// has followed a promotion is streaming the new timeline while pg_control still records the old
+// one. StandbyTimeline papers over that WHILE the walreceiver is attached, because it takes the
+// GREATEST including received_tli; but that term vanishes the instant the upstream dies, which is
+// exactly the moment promotion is decided. The node then reads as below the marker highwater and
+// refuses to promote (#125) -- observed as a migrated cluster that could not fail over at all
+// until something forced a checkpoint. Making the durable value current while the node is still
+// streaming is what closes that window.
+func (p *Prober) Restartpoint(ctx context.Context, ci ConnInfo) error {
+	_, err := p.psql(ctx, ci, "CHECKPOINT;")
+	return err
+}
+
 // ReplicaRow is one row of the primary's view of its streaming standbys (#288).
 //
 // Both identity fields are returned RAW and unresolved: mapping either to a pod name needs

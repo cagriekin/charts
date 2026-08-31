@@ -281,6 +281,12 @@ type agent struct {
 	tlsCheckedAt       time.Time
 	tlsInactiveLatched bool
 
+	// durableTLCheckedAt throttles the restartpoint that keeps a standby's control-file
+	// timeline current (#298). Same shape as tlsCheckedAt: the check costs a pg_controldata
+	// exec plus a SQL round trip, and the condition it repairs changes only when this node
+	// follows a new timeline.
+	durableTLCheckedAt time.Time
+
 	// Control API (#276), present only when it is enabled. intents carries node-local
 	// operations from HTTP handlers to the reconcile goroutine (which owns the
 	// postmaster); snap is the per-tick state the API serves, so a request costs no
@@ -740,6 +746,11 @@ func (a *agent) tick(ctx context.Context) {
 	// spend its interval on a question that could not be asked.
 	if obs.Local.Running {
 		a.verifyTLSActive(ctx)
+		// Only a standby has a restartpoint to force, and only one that is actually streaming
+		// has a newer timeline to record (#298).
+		if obs.Local.InRecovery {
+			a.ensureDurableTimeline(ctx)
+		}
 	}
 	a.publishStatus(ctx, obs.Local)
 	dec := reconcile.Decide(obs)
@@ -2969,6 +2980,48 @@ func (a *agent) assertPreloadedLibsPresent() error {
 // once-per-boot either -- the gauge must be able to clear on its own after an operator fixes
 // the config and reloads, and to re-arm if someone turns `ssl` off underneath a running server.
 const tlsVerifyInterval = time.Minute
+
+// durableTLInterval throttles the restartpoint check. Generous, because the condition it
+// repairs arises only when this node starts following a new timeline.
+const durableTLInterval = 60 * time.Second
+
+// ensureDurableTimeline forces a restartpoint when this standby's DURABLE timeline lags the one
+// it is streaming (#298, found by the first live run of the repmgrd->2.0.0 migration).
+//
+// The promotion guards read durable state. A standby's control-file timeline advances only at a
+// restartpoint, so after following a promotion it can stream the new timeline for up to
+// checkpoint_timeout (5 minutes on chart defaults) while pg_control still records the old one.
+// StandbyTimeline hides that WHILE the walreceiver is attached -- it takes the GREATEST including
+// received_tli -- but that term disappears the instant the upstream dies, which is exactly when
+// promotion is decided: the node then reads below the marker highwater and refuses (#125). On a
+// freshly migrated cluster every standby is in that state at once, so the cluster could not fail
+// over at all until something forced a checkpoint. Recording the timeline while the node is still
+// streaming is what closes the window.
+//
+// Best-effort and throttled: a failed checkpoint is not an incident, it just leaves the node in
+// the state it was already in, and the next tick past the interval tries again.
+func (a *agent) ensureDurableTimeline(ctx context.Context) {
+	if !a.durableTLCheckedAt.IsZero() && time.Since(a.durableTLCheckedAt) < durableTLInterval {
+		return
+	}
+	a.durableTLCheckedAt = time.Now()
+	cd, err := a.readControlData(ctx)
+	if err != nil || !cd.TimelineOK {
+		return
+	}
+	self := a.selfConn()
+	reported, ok, rerr := a.prober.StandbyTimeline(ctx, self)
+	if rerr != nil || !ok || reported <= pg.Timeline(cd.Timeline) {
+		return
+	}
+	if cerr := a.prober.Restartpoint(ctx, self); cerr != nil {
+		a.log.Warn("could not force a restartpoint to record the streamed timeline; this node may refuse to promote until one happens on its own",
+			"durableTimeline", cd.Timeline, "streamedTimeline", uint32(reported), "err", cerr)
+		return
+	}
+	a.log.Info("forced a restartpoint so the control file records the timeline this standby is streaming (#298)",
+		"was", cd.Timeline, "now", uint32(reported))
+}
 
 // verifyTLSActive alarms when the operator asked for server TLS and the RUNNING postmaster is
 // serving plaintext (#335).

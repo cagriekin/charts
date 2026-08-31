@@ -376,9 +376,60 @@ assert_eq "post: the write Service points at the primary (the agent took the upd
 # A migration that lands a cluster which cannot fail over has moved the problem, not solved it,
 # and nothing above would notice -- every check so far describes a cluster at rest.
 # ---------------------------------------------------------------------------
+# WAIT FOR THE STANDBYS TO BE PROMOTABLE FIRST (#298, found by the first live run). "Streaming"
+# is not the same as "eligible to promote": the highwater guard refuses a node whose timeline is
+# below the one recorded in the primary marker, and a standby that has just been rolled reports
+# the timeline from its CONTROL FILE plus what its walreceiver has received -- which lags the
+# marker until it has actually caught up. Deleting the primary before then produced a legitimate
+# `refuse to promote: timeline below recorded highwater (#125)` on every standby, the old pod
+# came back and reclaimed the lease, and this stage failed against a cluster whose failover works
+# perfectly a few seconds later (verified by hand: the promotion then takes ~5s).
+#
+# The query is the agent's own timeline expression, so the test waits on exactly what the guard
+# reads rather than on a proxy.
+marker_tl=$(kubectl get cm "${FULLNAME}-primary" -n "${NAMESPACE}" -o jsonpath='{.data.timeline}' 2>/dev/null || echo "")
+# STABLE for three consecutive samples, not merely true once (#298, found by the first live run).
+# The roll leaves the cluster settling: a standby that has just restarted reports the timeline
+# from its control file, which lags the marker until its first restartpoint, and it correctly
+# refuses to promote on the #125 highwater guard in that window. Sampling once caught a moment
+# when every standby happened to be caught up, then the failover stage fired while one of them was
+# still coming back -- and the ex-primary, whose PGDATA is intact, restarted in seconds and
+# reclaimed the Lease before any standby cleared its guard. Requiring the condition to hold across
+# three samples is what makes this stage test failover rather than a race.
+settled=0; waited=0
+while [ ${waited} -lt 300 ]; do
+  ready_now=1
+  for i in $(seq 0 $((NODES - 1))); do
+    pod="${FULLNAME}-${i}"
+    [ "${pod}" = "${PRIMARY}" ] && continue
+    rdy=$(kubectl get pod "${pod}" -n "${NAMESPACE}" \
+      -o jsonpath='{.status.containerStatuses[?(@.name=="postgresql")].ready}' 2>/dev/null || echo "")
+    tl=$(pg_exec "${NAMESPACE}" "${pod}" \
+      "SELECT GREATEST((SELECT timeline_id FROM pg_control_checkpoint()), COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0), COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0))" \
+      | tr -d '[:space:]' || echo "0")
+    if [ "${rdy}" != "true" ] || [ -z "${tl}" ] || [ -z "${marker_tl}" ] || ! [ "${tl}" -ge "${marker_tl}" ] 2>/dev/null; then
+      ready_now=0
+    fi
+  done
+  if [ "${ready_now}" = "1" ]; then settled=$((settled + 1)); else settled=0; fi
+  [ "${settled}" -ge 3 ] && break
+  sleep 10; waited=$((waited + 10))
+done
+assert_gt "post: every standby is Ready and at the marker highwater, stably (promotable)" "${settled}" 2
+
 echo ""
 echo "  Post-migration: deleting the primary to prove agent failover works on a migrated cluster..."
-kubectl delete pod "${PRIMARY}" -n "${NAMESPACE}" --wait=false
+# --grace-period=30, matching test-agent-failover.sh's graceful handoff (#298, found by the first
+# live run). A hard delete races the guards rather than exercising them: the ex-primary's endpoint
+# is still answering while the pod terminates, so a standby that acquires the freed Lease sees a
+# reachable peer still reporting the primary role on the same timeline and correctly refuses on
+# the #171 equal-timeline guard -- and on a freshly migrated cluster EVERY node sits on the
+# marker's timeline, so that guard is armed for all of them. Its PGDATA is intact, so the pod
+# restarts in seconds and reclaims the Lease before any standby clears the guard. Nothing is
+# broken there; the assertion was simply demanding a promotion the design does not owe for a
+# primary that merely bounced. With the grace period the agent handles SIGTERM: it releases the
+# Lease and stops postgres, so the peer stops being a reachable primary and the standby promotes.
+kubectl delete pod "${PRIMARY}" -n "${NAMESPACE}" --grace-period=30 --wait=false
 
 NEW_PRIMARY=""; waited=0
 while [ ${waited} -lt 300 ]; do
