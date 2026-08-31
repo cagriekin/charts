@@ -60,7 +60,7 @@ func (s *Server) routes() http.Handler {
 	for _, rt := range table {
 		h := s.guard(rt.verb, rt.h)
 		if rt.featureGated {
-			h = s.featureGate(h)
+			h = s.featureGate(rt.verb, h)
 		}
 		mux.HandleFunc(rt.method+" "+rt.path, h)
 	}

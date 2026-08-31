@@ -249,8 +249,19 @@ func (s *Server) Serve(ctx context.Context) error {
 
 // writeTimeout is the response-write budget: always wider than the whole request budget,
 // with writeTO as a floor for short requests.
+//
+// The two IntentTimeout legs are part of the sum (#298 review). net/http arms this deadline
+// when the request header is read, and handleRestore's flow runs THREE detached budgets in
+// series -- DeleteRestore (restoreDeleteTimeout+15s, from which RequestTimeout is derived),
+// then Submit(IntentStop), then Backups.Restore, the last two each bounded by IntentTimeout
+// and both deliberately context.WithoutCancel so a dropped client cannot leave the cluster
+// paused with PostgreSQL down and no Job. RequestTimeout alone did not cover them: on chart
+// defaults 105s + 30s + 30s exceeds a 150s write deadline, so a replace-restore over a
+// previous Job whose pod uses its full termination grace did all three steps and then failed
+// to write the 202 -- leaving the operator with a dropped connection instead of the jobName
+// and nextSteps, which is exactly the outcome those detach comments exist to prevent.
 func (s *Server) writeTimeout() time.Duration {
-	if d := s.o.RequestTimeout + 30*time.Second; d > writeTO {
+	if d := s.o.RequestTimeout + 2*s.o.IntentTimeout + 30*time.Second; d > writeTO {
 		return d
 	}
 	return writeTO

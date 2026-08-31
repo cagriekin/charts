@@ -16,18 +16,33 @@ func contextWithTimeout(r *http.Request, d time.Duration) (context.Context, cont
 // routes. Without it, a release that never enabled restore would answer 403 (the
 // restore allowlist is empty by construction), sending the operator to look for a
 // certificate problem instead of a values flag.
-// It sits OUTSIDE guard, so it short-circuits the authorization check -- deliberately, so
+// It sits OUTSIDE guard, so it short-circuits the RESTORE allowlist -- deliberately, so
 // an operator who simply forgot the values flag gets an actionable 501 instead of a 403 for
-// an allowlist that is empty by construction while the feature is off. Because guard is
-// therefore skipped, this must emit the audit line and the rejection counter itself:
-// otherwise probing of the most destructive routes would leave no trace in either the audit
-// log or pg_ha_agent_control_rejected_total.
-func (s *Server) featureGate(next http.HandlerFunc) http.HandlerFunc {
+// an allowlist that is empty by construction while the feature is off. It does NOT
+// short-circuit the general one: an unrecognised CN falls through to guard for its 403
+// (#298 review). Because guard is otherwise skipped, this must emit the audit line and the
+// rejection counter itself, with the ROUTE's verb: otherwise probing of the most
+// destructive routes would leave no trace in either the audit log or
+// pg_ha_agent_control_rejected_total.
+func (s *Server) featureGate(verb Verb, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		refuse := func(msg, hint, detail string) {
 			s.o.Metrics.IncControlRejected()
-			s.audit(r, identityFrom(r.Context()), VerbRestore, "not-configured", detail)
+			s.audit(r, identityFrom(r.Context()), verb, "not-configured", detail)
 			writeErr(w, http.StatusNotImplemented, msg, hint)
+		}
+		// The GENERAL allowlist still gates these routes (#298 review). Because this
+		// middleware sits outside guard it also skipped s.allowed, so AllowedCNs -- which
+		// values.yaml documents as gating EVERY control route -- was not consulted on the
+		// three restore paths: a certificate the control CA signed but whose CN is not on
+		// the list got a 501 naming the release's pgbackrest/restore configuration, where
+		// every other route answers 403. Falling through to guard for that case restores
+		// the invariant (and the denied audit line + rejection counter that come with it)
+		// while keeping the deliberate 501-before-403 behaviour for a client that IS
+		// authorized and merely hit a release with the feature off.
+		if len(s.o.AllowedCNs) > 0 && !containsFold(s.o.AllowedCNs, identityFrom(r.Context()).CN) {
+			next(w, r)
+			return
 		}
 		if s.o.Backups == nil {
 			refuse("pgBackRest is not enabled for this release",

@@ -270,11 +270,22 @@ func (p *Prober) SystemIdentifier(ctx context.Context, ci ConnInfo) (id uint64, 
 	if err != nil {
 		return 0, false, err
 	}
-	n, perr := strconv.ParseUint(strings.TrimSpace(out), 10, 64)
+	// ParseInt, not ParseUint (#298 review). pg_control_system() exposes
+	// system_identifier as int8 (PostgreSQL has no unsigned types), so once the high
+	// bit is set the column renders as a NEGATIVE decimal -- while pg_controldata,
+	// which ReadControlData parses for the LOCAL id, prints the same 64 bits with
+	// UINT64_FORMAT. initdb builds the identifier as ((uint64) tv.tv_sec) << 32 | ...,
+	// so every cluster initdb'd from 2038-01-19 on has that bit set. ParseUint rejected
+	// the negative rendering, ok came back false for EVERY peer, and assertSameCluster
+	// -- which is fail-open on !ok -- stopped enforcing invariant 9 entirely: a
+	// misrouted pod from a different cluster would no longer be refused as a
+	// clone/rewind source. Reinterpreting the signed value as uint64 reproduces
+	// pg_controldata's rendering for all inputs, so the two sides compare equal.
+	n, perr := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
 	if perr != nil {
 		return 0, false, nil
 	}
-	return n, true, nil
+	return uint64(n), true, nil
 }
 
 // ReplicaRow is one row of the primary's view of its streaming standbys (#288).
@@ -511,11 +522,29 @@ func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name strin
 	// WITHOUT the words "already exists") makes the squatter fatal while a genuine
 	// physical/physical race still raises PostgreSQL's own phrase and is still treated as
 	// success below -- which is the one case that IS success.
+	// An INVALIDATED slot is recycled, not accepted (#298 review). wal_status = 'lost'
+	// means PostgreSQL destroyed the reservation because the slot passed
+	// max_slot_wal_keep_size (4GB in this image), and such a slot can never be acquired
+	// again -- SlotState.Invalidated() and PGHAReplicationSlotInvalidated already model
+	// exactly this state, and probe.go documents the remedy as a full re-clone. But the
+	// existence guard below is satisfied by it, so the create was skipped with a nil
+	// error and every recovery path wedged: Follow wrote primary_slot_name at a slot the
+	// walreceiver cannot acquire, and the escalation to ReclonePreserving passed the same
+	// name to `pg_basebackup --slot`, which fails at its WAL-stream connect -- after
+	// PGDATA had already been renamed aside to an unreaped .diverged.<ts>. Nothing else
+	// reclaimed it either: orphanSlot deliberately keeps any slot whose ordinal has a
+	// live pod. Dropping the dead reservation here lets the create below mint a usable
+	// one, which is the whole point of an idempotent ensure.
+	//
+	// Guarded on NOT active, so this can only ever remove a reservation nothing holds.
 	out, err := p.psql(ctx, ci, fmt.Sprintf(
 		"DO $do$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots "+
 			"WHERE slot_name = '%[1]s' AND slot_type <> 'physical') THEN "+
 			"RAISE EXCEPTION 'replication slot %[1]s is not a physical slot, so it cannot be "+
-			"used for streaming replication: drop it or free the name'; END IF; END $do$; "+
+			"used for streaming replication: drop it or free the name'; END IF; "+
+			"IF EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '%[1]s' "+
+			"AND slot_type = 'physical' AND wal_status = 'lost' AND NOT active) THEN "+
+			"PERFORM pg_drop_replication_slot('%[1]s'); END IF; END $do$; "+
 			"SELECT pg_create_physical_replication_slot('%[1]s') "+
 			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots "+
 			"WHERE slot_name = '%[1]s' AND slot_type = 'physical');", name))

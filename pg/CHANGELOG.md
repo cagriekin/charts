@@ -744,6 +744,38 @@
   the whole `initdb` on every restart. It is now checked with the credentials, before the first
   write to the volume.
 
+- **An invalidated replication slot is now recycled instead of accepted (#298 review, agent).**
+  `wal_status = 'lost'` means PostgreSQL destroyed the reservation because the slot passed
+  `max_slot_wal_keep_size` (4GB in this image), and such a slot can never be acquired again --
+  but the existence guard in both slot-ensure paths was satisfied by it, so the create was
+  skipped with no error and every recovery route wedged: `Follow` pointed `primary_slot_name` at
+  a slot the walreceiver cannot acquire, and the stall escalation handed the same name to
+  `pg_basebackup --slot`, which fails at its WAL-stream connect *after* the data directory has
+  been renamed aside to an unreaped `.diverged.<ts>` copy. The primary's reclaim pass could not
+  help either, since it deliberately keeps any slot whose ordinal still has a live pod -- so the
+  standby stayed out of the cluster, burning one preserved copy per attempt, until an operator
+  dropped the slot by hand. Both paths now drop the dead reservation first, guarded on `NOT
+  active` so only a slot nothing holds is ever removed.
+
+- **The cross-cluster guard will still work after 2038 (#298 review, agent).**
+  `pg_control_system()` exposes `system_identifier` as a signed `int8` -- PostgreSQL has no
+  unsigned types -- while `pg_controldata`, which the agent parses for the *local* identifier,
+  prints the same 64 bits unsigned. `initdb` builds the identifier from `tv_sec << 32`, so every
+  cluster created from 2038-01-19 on has the high bit set and renders negative over SQL. The
+  peer-side parse rejected that, reported "unknown" for every peer, and `assertSameCluster` is
+  fail-open on unknown -- so invariant 9 would have silently stopped refusing a misrouted pod
+  from a different cluster as a clone or rewind source.
+
+- **Two control-API fixes (#298 review, agent).** `allowedClientCNs` is documented as gating
+  every route, but the restore feature-gate middleware sits outside the authorization check and
+  so skipped it: a certificate the control CA signed whose CN is *not* on the list got a 501
+  naming the release's pgbackrest configuration, where every other route answers 403 -- and the
+  denied audit line and rejection counter never fired. Unrecognised CNs now fall through for
+  their 403, while an authorized client still gets the actionable "not configured" answer. And
+  the response-write deadline now covers the two detached intent legs a `replace` restore runs in
+  series after the delete wait; on chart defaults their sum exceeded it, so the operator got a
+  dropped connection instead of the Job name and next steps.
+
 - **A read-write observation a demote overtook no longer resurrects the fence latch (#298
   review, agent).** The reconcile tick samples the local role with a multi-second, network-bound
   probe and then stores the derived value outside `opMu`, while the lost-leadership fence demotes

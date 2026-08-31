@@ -186,6 +186,26 @@ func TestSystemIdentifierUnreachable(t *testing.T) {
 	}
 }
 
+// pg_control_system() exposes system_identifier as int8, so a cluster whose identifier has
+// the high bit set (any initdb from 2038-01-19 on -- initdb builds it from tv_sec << 32)
+// renders NEGATIVE over SQL while pg_controldata prints the same bits unsigned. ParseUint
+// rejected that, ok came back false for every peer, and assertSameCluster -- fail-open on
+// !ok -- stopped enforcing invariant 9 altogether (#298 review).
+func TestSystemIdentifierAcceptsTheSignedRenderingOfAHighBitID(t *testing.T) {
+	// -6874000000000000000 as int8 is the same 64 bits pg_controldata prints as
+	// 11572744073709551616.
+	const signed = "-6874000000000000000"
+	const want = uint64(18446744073709551615 - 6874000000000000000 + 1)
+	p := proberWith(fakeExec{sysID: signed})
+	id, ok, err := p.SystemIdentifier(context.Background(), ConnInfo{Host: "pod-1"})
+	if err != nil || !ok {
+		t.Fatalf("a negative (high-bit) system_identifier must parse: ok=%v err=%v", ok, err)
+	}
+	if id != want {
+		t.Errorf("id = %d, want %d (the unsigned reinterpretation pg_controldata prints)", id, want)
+	}
+}
+
 func TestSystemIdentifierUnparseable(t *testing.T) {
 	p := proberWith(fakeExec{sysID: "not-a-number"})
 	if _, ok, err := p.SystemIdentifier(context.Background(), ConnInfo{Host: "x"}); ok || err != nil {
@@ -312,6 +332,29 @@ func TestCreatePhysicalSlotIsIdempotentInSQL(t *testing.T) {
 	}
 	if !strings.Contains(sql, "WHERE NOT EXISTS") {
 		t.Errorf("create is not guarded against an existing slot: %s", sql)
+	}
+}
+
+// An INVALIDATED slot (wal_status = 'lost') satisfies the existence guard but can never be
+// acquired again, so accepting it wedged the standby behind it forever: Follow wrote
+// primary_slot_name at a dead slot and the ReclonePreserving escalation handed the same name
+// to pg_basebackup --slot after renaming PGDATA aside (#298 review). Recycle it instead.
+func TestCreatePhysicalSlotRecyclesAnInvalidatedSlot(t *testing.T) {
+	ex := &slotExec{}
+	p := &Prober{Exec: ex}
+	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err != nil {
+		t.Fatalf("CreatePhysicalSlot: %v", err)
+	}
+	sql := ex.sqls[0]
+	if !strings.Contains(sql, "wal_status = 'lost'") {
+		t.Errorf("an invalidated slot is not detected: %s", sql)
+	}
+	if !strings.Contains(sql, "pg_drop_replication_slot('pg_ha_slot_1')") {
+		t.Errorf("an invalidated slot is not dropped before the create: %s", sql)
+	}
+	// The drop must never be able to take a slot something is streaming through.
+	if !strings.Contains(sql, "wal_status = 'lost' AND NOT active") {
+		t.Errorf("the invalidated-slot drop is not guarded on NOT active: %s", sql)
 	}
 }
 

@@ -539,11 +539,27 @@ func (n *Native) ensureSlotOnUpstream(ctx context.Context, source Conn) error {
 	// words "already exists") makes the squatter fatal, while a genuine physical/physical
 	// race still raises PostgreSQL's own phrase and stays success. Mirrors
 	// Prober.CreatePhysicalSlot.
+	//
+	// An INVALIDATED slot is recycled rather than accepted, mirroring
+	// Prober.CreatePhysicalSlot (#298 review). wal_status = 'lost' means PostgreSQL
+	// destroyed the reservation at max_slot_wal_keep_size (4GB in this image) and the slot
+	// can never be acquired again -- yet the existence guard below is satisfied by it, so
+	// the create was skipped with a nil error and BOTH recovery paths wedged: Follow wrote
+	// primary_slot_name at a slot the walreceiver cannot acquire, and the stall escalation
+	// through ReclonePreserving handed the same name to `pg_basebackup --slot`, which fails
+	// at its WAL-stream connect after PGDATA has already been renamed aside to an unreaped
+	// .diverged.<ts>. The primary's own reclaim pass cannot help either -- orphanSlot
+	// deliberately keeps any slot whose ordinal still has a live pod -- so the standby
+	// stayed out of the cluster until an operator dropped the slot by hand. Guarded on NOT
+	// active, so only a reservation nothing holds is ever removed.
 	sql := fmt.Sprintf(
 		"DO $do$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots "+
 			"WHERE slot_name = '%[1]s' AND slot_type <> 'physical') THEN "+
 			"RAISE EXCEPTION 'replication slot %[1]s is not a physical slot, so it cannot be "+
-			"used for streaming replication: drop it or free the name'; END IF; END $do$; "+
+			"used for streaming replication: drop it or free the name'; END IF; "+
+			"IF EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '%[1]s' "+
+			"AND slot_type = 'physical' AND wal_status = 'lost' AND NOT active) THEN "+
+			"PERFORM pg_drop_replication_slot('%[1]s'); END IF; END $do$; "+
 			"SELECT pg_create_physical_replication_slot('%[1]s') "+
 			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots "+
 			"WHERE slot_name = '%[1]s' AND slot_type = 'physical');",

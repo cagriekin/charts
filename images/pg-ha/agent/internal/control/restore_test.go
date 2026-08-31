@@ -330,6 +330,28 @@ func TestControlAllowlistRestrictsEveryVerb(t *testing.T) {
 	wantCode(t, h.do("POST", "/v1/restore", goodRestore, "dba"), 403)
 }
 
+// The general allowlist gates the restore routes even when the FEATURE is off (#298
+// review). featureGate sits outside guard, so it used to answer 501 -- naming this
+// release's pgbackrest/restore configuration -- to any certificate the control CA signed,
+// including a CN that allowedClientCNs excludes, while every other route answered 403.
+func TestControlAllowlistGatesRestoreRoutesEvenWhenTheFeatureIsOff(t *testing.T) {
+	h := newHarness(t, func(o *Options, hh *harness) {
+		o.AllowedCNs = []string{"ops-admin"}
+		o.RestoreAllowedCNs = []string{"ops-admin"}
+		hh.bk.enabled = false // restore triggering not enabled for this release
+	})
+	h.cl.marker.Paused = true
+	for _, m := range []string{"GET", "POST", "DELETE"} {
+		body := ""
+		if m == "POST" {
+			body = goodRestore
+		}
+		wantCode(t, h.do(m, "/v1/restore", body, "stranger"), 403)
+	}
+	// An AUTHORIZED client still gets the actionable "not configured" answer.
+	wantCode(t, h.do("GET", "/v1/restore", "", "ops-admin"), 501)
+}
+
 // CN matching is case-insensitive and tolerates surrounding whitespace in values.
 func TestAllowlistMatchingIsCaseInsensitive(t *testing.T) {
 	h := newHarness(t, func(o *Options, _ *harness) { o.AllowedCNs = []string{" Ops-Admin "} })

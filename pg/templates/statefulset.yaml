@@ -249,8 +249,8 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- if not .Values.ha.enabled }}
-      # Standalone (no repmgr): the agent that needs the API token is not present,
-      # so don't mount one (#166). In repmgr mode the token is required.
+      # Standalone (ha.enabled=false): the agent that needs the API token is not
+      # present, so don't mount one (#166). In HA mode the agent needs it.
       automountServiceAccountToken: false
       {{- end }}
       {{- if .Values.ha.enabled }}
@@ -425,7 +425,7 @@ spec:
           # picks up both the HA image's original extensions and anything just
           # installed. The HA image configures the PGDG apt repo at build time
           # (images/pg-ha/Dockerfile), so this is the reliable install path in
-          # repmgr mode.
+          # HA mode.
           #
           # Pin postgresql-{{ $pgMajor }} to whatever's already installed before naming any
           # extension package on the same apt-get install line (review, #303): an
@@ -531,7 +531,7 @@ spec:
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
 {{- if $pkgs }}
           # #303: apt-get install before the copy below, same reasoning as
-          # copy-base-ext. Still -n (no-clobber, #302) on the copy: in repmgr mode
+          # copy-base-ext. Still -n (no-clobber, #302) on the copy: in HA mode
           # copy-base-ext already populated ext-lib/ext-share from the HA image,
           # which is what actually runs the server, so this container's job (with or
           # without packages) is to ADD what's missing, never overwrite a core lib
@@ -565,7 +565,7 @@ spec:
                 - SETFCAP
                 - MKNOD
 {{- else }}
-          # -n (no-clobber, #302): copy-base-ext (when repmgr is enabled) already
+          # -n (no-clobber, #302): copy-base-ext (when ha.enabled) already
           # populated ext-lib/ext-share from the HA image, which is what actually
           # runs the server. This container only ADDS what's missing (e.g. vector.so)
           # -- it must never overwrite a core lib (e.g. libpqwalreceiver.so) with this
@@ -1208,10 +1208,15 @@ spec:
                     done
 {{- end }}
 {{- if .Values.postgresql.startupProbe.enabled }}
-          # Holds off liveness/readiness until postgres first accepts
-          # connections, so the repmgr stale-primary guard's settle loop and
-          # crash-recovery WAL replay cannot be killed mid-startup by the
-          # liveness probe (#172). Steady-state liveness stays tight below.
+          # Holds off liveness/readiness until postgres first accepts connections, so a
+          # slow first start cannot be killed mid-flight by the liveness probe (#172).
+          # THIS BUDGET (periodSeconds x failureThreshold) BOUNDS A STANDBY'S FIRST CLONE:
+          # since #288 the agent runs pg_basebackup from THIS container, not from a
+          # probe-free init container, so lowering the threshold caps how long a clone of
+          # your existing database may take. Exceed it and the kubelet kills the container
+          # and the clone restarts from scratch. See postgresql.startupProbe in values.yaml
+          # before tuning it. (The repmgr stale-primary settle loop this comment used to
+          # cite went away with the repmgr helpers.) Steady-state liveness stays tight below.
           startupProbe:
             exec:
               command:

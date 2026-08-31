@@ -624,6 +624,36 @@ func TestNativeSlotCreateRaisesOnANonPhysicalSquatter(t *testing.T) {
 	}
 }
 
+// An INVALIDATED slot passes the existence guard but can never be acquired again, so
+// ensureSlotOnUpstream reported success on a slot Follow would then point primary_slot_name
+// at, and the ReclonePreserving escalation handed the same name to pg_basebackup --slot after
+// renaming PGDATA aside to an unreaped .diverged.<ts> -- with orphanSlot deliberately keeping
+// it for as long as the ordinal has a live pod, so nothing converged (#298 review).
+func TestNativeSlotCreateRecyclesAnInvalidatedSlot(t *testing.T) {
+	fr := &fakeRunner{}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	if err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	var sql string
+	for _, c := range fr.calls {
+		joined := strings.Join(c.args, " ")
+		if strings.Contains(joined, "pg_create_physical_replication_slot") {
+			sql = joined
+			break
+		}
+	}
+	if sql == "" {
+		t.Fatal("no slot create was issued")
+	}
+	if !strings.Contains(sql, "wal_status = 'lost' AND NOT active") {
+		t.Errorf("an invalidated slot is not detected (or the drop is not guarded on NOT active): %s", sql)
+	}
+	if !strings.Contains(sql, "pg_drop_replication_slot('pg_ha_slot_1')") {
+		t.Errorf("an invalidated slot is not dropped before the create: %s", sql)
+	}
+}
+
 // A slot-create failure must abort the clone: proceeding without the slot silently
 // reintroduces the WAL gap the slot exists to prevent.
 func TestNativeCloneFailsWhenSlotCreateFails(t *testing.T) {
