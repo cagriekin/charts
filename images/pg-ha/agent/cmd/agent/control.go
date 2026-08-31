@@ -28,6 +28,10 @@ const (
 	// How long to wait for a deleted restore Job to disappear. Its pods get the default
 	// 30s termination grace, so this allows for that plus apiserver latency.
 	restoreDeleteTimeout = 90 * time.Second
+	// minIntentStopBudget is the smallest graceful-shutdown window runIntent will give the
+	// postmaster, however stale the request deadline it inherited is (#298 review). See the
+	// floor in runIntent for why a raw past deadline is a zero-grace SIGKILL.
+	minIntentStopBudget = 15 * time.Second
 )
 
 // intentRequest is a control-API operation waiting for the reconcile loop. done is
@@ -61,7 +65,23 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 	// bounding them would add nothing but a way to fail.
 	stopCtx, cancelStop := parent, context.CancelFunc(func() {})
 	if !req.deadline.IsZero() {
-		stopCtx, cancelStop = context.WithDeadline(parent, req.deadline)
+		// FLOORED, not used raw (#298 review). req.deadline is copied from the HTTP request
+		// context and the request deliberately stays queued after the caller gives up ("if
+		// ctx expires after the intent was accepted, the loop still performs it") -- so by
+		// the time the loop dequeues it, the deadline is routinely in the PAST. A past
+		// deadline makes context.WithDeadline return an already-cancelled context, and
+		// ChildPostmaster.Stop then takes its `case <-ctx.Done()` arm on the first select:
+		// SIGKILL immediately after the SIGINT, with zero grace. An operator POSTing
+		// /v1/node/restart while act() sits in a 60s pg_ctl promote therefore got a 504 and,
+		// a moment later, a SIGKILLed read-write primary forced into crash recovery -- on the
+		// restart they asked to be graceful. IntentStop likewise reported a failure nobody
+		// saw. The floor keeps the wedge bounded (which is all the deadline is for) while
+		// guaranteeing a real shutdown attempt.
+		budget := time.Until(req.deadline)
+		if budget < minIntentStopBudget {
+			budget = minIntentStopBudget
+		}
+		stopCtx, cancelStop = context.WithTimeout(parent, budget)
 	}
 	defer cancelStop()
 	switch kind {
@@ -376,11 +396,23 @@ func (b backupAPI) view(ctx context.Context, jv k8s.JobView, pod k8s.PodView) (c
 // (delete-then-create of the same deterministic name) hits AlreadyExists -- after the
 // handler has already stopped PostgreSQL, leaving the operator with a stopped database
 // and a 502 mid-incident.
+// DETACHED from the caller's context and given its own budget (#298 review), the same way
+// handleRestore's own point-of-no-return calls are. Both callers pass r.Context(), which
+// control.limitMW has already capped at RequestTimeout -- 60s on chart defaults, since the
+// IntentTimeout+15s floor is 45s there -- so the 90s wait below could never run to completion:
+// WaitJobGone took its `case <-ctx.Done()` arm at ~60s and returned a bare
+// "context deadline exceeded", discarding the real reason. That made a slow-terminating Job an
+// intermittent 502 on DELETE /v1/restore and on {"replace":true}, and made WaitJobGone's own
+// "still failing after ...: %w" message (which exists to name a permanent failure such as
+// missing RBAC) unreachable on this path.
 func (b backupAPI) DeleteRestore(ctx context.Context) error {
-	if err := b.a.kube.DeleteJob(ctx, b.a.cfg.ControlRestoreJobName); err != nil {
+	// +15s so the budget covers the delete call itself, not only the wait.
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreDeleteTimeout+15*time.Second)
+	defer cancel()
+	if err := b.a.kube.DeleteJob(dctx, b.a.cfg.ControlRestoreJobName); err != nil {
 		return err
 	}
-	return b.a.kube.WaitJobGone(ctx, b.a.cfg.ControlRestoreJobName, restoreDeleteTimeout)
+	return b.a.kube.WaitJobGone(dctx, b.a.cfg.ControlRestoreJobName, restoreDeleteTimeout)
 }
 
 // restorePhase collapses Job status plus pod state into one word. A Job whose pod has
@@ -527,6 +559,15 @@ func (a *agent) startControl(ctx context.Context) error {
 		// the operation itself; scale the budget with the interval so a slow (cloud
 		// preset) cluster does not report spurious timeouts.
 		IntentTimeout: intentBudget(a.cfg.ReconcileInterval),
+		// Set explicitly rather than left to defaultRequestTO (#298 review). DeleteRestore
+		// is the widest operation the API performs -- restoreDeleteTimeout (90s) for the
+		// deleted Job's pods to finish their 30s termination grace, plus apiserver latency --
+		// and the whole-request cap has to be wider than it or the wait is cut short and the
+		// real error replaced by "context deadline exceeded". It also sets the response-write
+		// budget (Server.writeTimeout = this + 30s), so the reply to a genuinely slow delete
+		// still reaches the client. maxConcurrent (16) is what bounds concurrency; this is
+		// only a per-request ceiling on an mTLS, CN-allowlisted surface.
+		RequestTimeout: restoreDeleteTimeout + 30*time.Second,
 	})
 	if err != nil {
 		return err

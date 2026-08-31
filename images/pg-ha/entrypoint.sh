@@ -97,15 +97,23 @@ bootstrap_initdb() {
         exit 1
     fi
     echo "Initializing PostgreSQL database..."
-    # --auth-host=scram-sha-256, not md5 (#298 review). initdb's --auth-host both writes the
-    # method into its own pg_hba (which this function overwrites a few lines below, so that half
-    # is moot) AND sets `password_encryption` in postgresql.conf -- which is the half that
-    # outlives the bootstrap and decides how EVERY password stored on this cluster afterwards is
-    # hashed: an operator's `CREATE USER`, the databases-roles hook Job's roles, a later
-    # `ALTER USER ... PASSWORD`. Leaving it at md5 meant a brand-new 2.0.0 cluster defaulted to a
-    # hash deprecated since PostgreSQL 10. Safe by construction: this function only ever runs
-    # against an EMPTY data directory, so no existing md5-hashed role is stranded, and 1.x
-    # clusters keep their roles and the agent's md5->scram re-hash.
+    # --auth-host=scram-sha-256, not md5 (#298 review). What it changes is the METHOD initdb
+    # writes into its own pg_hba -- which this function overwrites a few lines below, so the
+    # lasting effect is on the `postgres` mode window before that rewrite and on anyone reading
+    # the directory afterwards.
+    #
+    # It does NOT set `password_encryption` in postgresql.conf: verified against
+    # postgres:18-trixie, initdb leaves that line commented at the built-in default whichever
+    # --auth-host is passed (an earlier revision of this comment claimed otherwise). That
+    # default has been scram-sha-256 since PostgreSQL 14, i.e. on every major this image can
+    # bundle, and the role creations below additionally `SET password_encryption` per session --
+    # so every password stored on a cluster this function creates is a SCRAM verifier either
+    # way. Passing md5 here was therefore not a weaker hash but a deprecated method advertised
+    # to the network for nothing.
+    #
+    # Safe by construction: this function only ever runs against an EMPTY data directory, so no
+    # existing md5-hashed role is stranded, and 1.x clusters keep their roles and the agent's
+    # md5->scram re-hash.
     initdb -D "$PGDATA" --auth-local=trust --auth-host=scram-sha-256
 
     cat >> "$PGDATA/postgresql.conf" << EOF
@@ -140,9 +148,10 @@ PGBR
     # The catch-all rules authenticate with scram-sha-256, not md5 (#298 review). Two reasons
     # this is safe to tighten rather than a compatibility risk:
     #
-    #   - This function only ever runs against an EMPTY data directory, and it sets
-    #     password_encryption = 'scram-sha-256' before creating any role, so every password
-    #     that can be presented against these rules is stored as a SCRAM verifier. There is no
+    #   - This function only ever runs against an EMPTY data directory, and every role it
+    #     creates is created under an explicit `SET password_encryption='scram-sha-256'` (which
+    #     is also the cluster default on every major this image bundles -- PostgreSQL 14+), so
+    #     every password that can be presented against these rules is a SCRAM verifier. There is no
     #     md5-hashed role for an md5 rule to be needed by -- that case belongs to clusters
     #     initdb'd by chart 1.x, and their pg_hba is the AGENT's to write (it deliberately
     #     emits an md5-first compat form for exactly those roles; see pgconf.AssemblePgHba).

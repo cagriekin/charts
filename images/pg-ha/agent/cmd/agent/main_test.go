@@ -540,6 +540,55 @@ func TestRejoinOntoClearsFollowLatchEvenWhenItFailsEarly(t *testing.T) {
 	}
 }
 
+// #298 review: a rejoin that SUCCEEDS must re-latch the upstream it just pointed replication
+// at. The latch is invalidated on entry, and leaving it empty leaks a slot: both rejoin
+// outcomes provision this node's slot on the target, so the next tick that re-homes the node
+// calls releaseSlotOnFormerUpstream with an EMPTY former and returns at its guard -- an
+// inactive slot then pins WAL on the rejoin target until max_slot_wal_keep_size invalidates it.
+// It also re-arms observeStandbyStall, which requires a non-empty latch.
+func TestRejoinOntoRelatchesTheFollowUpstreamOnSuccess(t *testing.T) {
+	a := newFollowTestAgentWithPM(t, &scriptedExec{walRcv: ""}, &fakePostmaster{})
+	a.mech = &rewindStubMech{} // an empty script: the rewind succeeds
+	a.followUpstream = "stale-upstream"
+	if err := a.rejoinOnto(context.Background(), "pg-1"); err != nil {
+		t.Fatalf("rejoin: %v", err)
+	}
+	if a.followUpstream != "pg-1" {
+		t.Fatalf("a successful rejoin must latch its target as the upstream, got %q", a.followUpstream)
+	}
+}
+
+// #298 review: RestartLocal must not report success when it could not prove the postmaster is
+// dead. Stop has a documented path that leaves the child supervised -- SIGKILL is undeliverable
+// to a process in uninterruptible sleep, so on a wedged PV it gives up without clearing its
+// handle -- and Start then returns nil ("still running"). With the error discarded, act()
+// returned nil: no IncReconcileError, no log, and a single-node primary on a hung volume
+// reported a successful restart every tick while the database was down.
+func TestActRestartLocalFailsWhenTheStopCouldNotBeProven(t *testing.T) {
+	pm := &fakePostmaster{running: true, stopErr: fmt.Errorf("postmaster did not exit after SIGKILL (PGDATA I/O wedged?): %w", context.DeadlineExceeded)}
+	a := newTestAgent(t, pm, &fakeDCS{})
+	err := a.act(context.Background(), reconcile.Decision{Action: reconcile.RestartLocal}, reconcile.Observation{})
+	if err == nil {
+		t.Fatal("a restart whose stop left the postmaster supervised must surface an error, not report success")
+	}
+	if !strings.Contains(err.Error(), "could not prove the postmaster is dead") {
+		t.Errorf("the error must say what could not be established, got %v", err)
+	}
+}
+
+// ...but the ORDINARY escalation -- deadline hit, killed, reaped -- is not a failure: the child
+// is provably gone, so the restart proceeds.
+func TestActRestartLocalProceedsWhenTheKillWasReaped(t *testing.T) {
+	pm := &fakePostmaster{running: true, stopErr: context.DeadlineExceeded, deadOnStop: true}
+	a := newTestAgent(t, pm, &fakeDCS{})
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.RestartLocal}, reconcile.Observation{}); err != nil {
+		t.Fatalf("a killed-and-reaped stop must not fail the restart: %v", err)
+	}
+	if !pm.started {
+		t.Fatal("the postmaster must be started back up")
+	}
+}
+
 // Streaming from a DIFFERENT host than the target (a stale upstream after a leader
 // change) must NOT be mistaken for already-following: the agent repoints via follow.
 func TestActFollowRepointsWhenStreamingFromWrongUpstream(t *testing.T) {
@@ -1294,6 +1343,57 @@ func TestSlotsTickMutatesNothingWhenTheSlotListFails(t *testing.T) {
 
 // newSlotTestAgent wires a real Prober over ex plus a fake apiserver holding pods 0 and 1,
 // so the live-pod-set half of the reconcile is exercised rather than stubbed.
+// #298 review: a promote that outlives the lease must not claim the routing. `pg_ctl -w
+// promote` is bounded only by PGCTLTIMEOUT (60s) while the default LeaseDuration is 15s, so on
+// the ordinary failover case -- a standby with a large unreplayed backlog -- the lease can lapse
+// and be won by a peer mid-promote. OnLost cannot correct it first: it blocks on opMu, which
+// tick() holds for all of act(). Continuing anyway pointed the write Service selector and the
+// pg-role=primary label at a pod that no longer held the lease, on top of the genuine new
+// primary. servingRW stays armed (this node really is read-write) -- the fence is OnLost's job.
+func TestActPromoteDoesNotClaimRoutingAfterLosingTheLease(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset(
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pg-0", Namespace: "ns", Labels: map[string]string{"app": "pg"}}},
+	)
+	a := &agent{
+		cfg: &config.Config{
+			PodName: "pg-0", PGDATA: t.TempDir(), HeadlessService: "h",
+			RepmgrUser: "repmgr", RepmgrDB: "repmgr", RepmgrPassword: "pw",
+			Namespace: "ns", MarkerName: "pg-primary",
+			LeaseDuration: 15 * time.Second, RenewDeadline: 10 * time.Second, RetryPeriod: 2 * time.Second,
+		},
+		base:   "pg",
+		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		dcs:    &fakeDCS{leader: false}, // the lease lapsed while pg_ctl was still promoting
+		mech:   &rewindStubMech{},       // Promote succeeds
+		prober: &pg.Prober{Exec: &slotExec{}, Timeout: time.Second},
+		sup:    process.NewSupervisor(&fakePostmaster{running: true}),
+		kube:   k8s.NewWithClient(cs, "ns"),
+		metr:   observe.New(),
+	}
+	obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: true, InRecovery: true, Timeline: 7, TimelineOK: true}}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.Promote}, obs); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	// The highwater marker is the durable half of the claim: writing it from a node that no
+	// longer holds the lease advances the cluster's recorded timeline on the strength of a
+	// promotion nobody asked this node to publish.
+	if _, err := cs.CoreV1().ConfigMaps("ns").Get(context.Background(), "pg-primary", metav1.GetOptions{}); err == nil {
+		t.Error("a node that lost the lease mid-promote must not advance the highwater marker")
+	}
+	// The label is the live half: it is what the write Service selects on.
+	pod, err := cs.CoreV1().Pods("ns").Get(context.Background(), "pg-0", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Labels["pg-role"] == "primary" {
+		t.Error("a node that lost the lease mid-promote must not claim the write Service")
+	}
+	// It IS read-write, though, so the fence must still be armed for OnLost.
+	if !a.servingRW.Load() {
+		t.Error("the node really did promote: servingRW must stay armed so OnLost fences it")
+	}
+}
+
 func newSlotTestAgent(t *testing.T, ex *slotExec, mech string) *agent {
 	t.Helper()
 	cs := k8sfake.NewSimpleClientset(
@@ -3119,6 +3219,52 @@ func TestRejoinRewindBackstopResetsAfterASuccess(t *testing.T) {
 	}
 	if a.rewindFailures != 0 || a.rewindFailureTarget != "" {
 		t.Fatalf("a successful rewind must clear the streak, got %d against %q", a.rewindFailures, a.rewindFailureTarget)
+	}
+}
+
+// #298 review: an UNREACHABLE target is exempt from the backstop entirely. Escalating on it
+// converges on nothing -- ReclonePreserving dials the same target with the same credentials, so
+// it fails where the rewind just failed to connect, after renaming PGDATA aside and leaving an
+// unreaped .diverged.<ts> copy on the PVC. Ten ticks of "could not connect" (a target at
+// max_connections, a rotated credential, a primary still starting up) must re-clone zero times.
+func TestRejoinRewindBackstopExemptsAnUnreachableTarget(t *testing.T) {
+	unreachable := fmt.Errorf("%w: could not connect to server: Connection refused", mechanism.ErrRewindUnreachable)
+	errs := make([]error, 10)
+	for i := range errs {
+		errs[i] = unreachable
+	}
+	m := &rewindStubMech{rejoinErrs: errs}
+	a := newFollowTestAgentWithPM(t, &scriptedExec{walRcv: ""}, &fakePostmaster{})
+	a.mech = m
+	for i := range errs {
+		if err := a.rejoinOnto(context.Background(), "pg-1"); err == nil {
+			t.Fatalf("tick %d: an unreachable target must still surface an error", i)
+		}
+		if m.reclones != 0 {
+			t.Fatalf("tick %d: escalated on an unreachable target; a re-clone cannot reach it either", i)
+		}
+	}
+	// And the streak is not silently accumulating either -- an unreachable tick is no evidence
+	// about a local refusal, so it must not push a later genuine one over the limit.
+	if a.rewindFailures != 0 {
+		t.Fatalf("unreachable ticks must not accumulate toward the backstop, got %d", a.rewindFailures)
+	}
+	// A genuine non-divergence refusal after all that still needs its full three ticks.
+	local := errors.New("pg_rewind: error: something permanent but not divergence")
+	m.rejoinErrs = append(m.rejoinErrs, local, local, local)
+	for i := 0; i < 2; i++ {
+		if err := a.rejoinOnto(context.Background(), "pg-1"); err == nil {
+			t.Fatalf("local refusal tick %d: expected an error", i)
+		}
+		if m.reclones != 0 {
+			t.Fatalf("local refusal tick %d: escalated before %d failures", i, rewindFailureLimit)
+		}
+	}
+	if err := a.rejoinOnto(context.Background(), "pg-1"); err != nil {
+		t.Fatalf("the escalating tick must recover, got %v", err)
+	}
+	if m.reclones != 1 {
+		t.Fatalf("a genuine streak of %d must still escalate once, got %d", rewindFailureLimit, m.reclones)
 	}
 }
 

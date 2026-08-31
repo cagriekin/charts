@@ -744,6 +744,43 @@
   the whole `initdb` on every restart. It is now checked with the credentials, before the first
   write to the volume.
 
+- **A promote that outlives the lease no longer claims the write Service (#298 review, agent).**
+  `pg_ctl -w promote` is bounded only by `PGCTLTIMEOUT` (60s) while the default `LeaseDuration`
+  is 15s, so on the ordinary failover case -- a standby with a large unreplayed backlog -- the
+  lease can lapse and be won by a peer mid-promote. The branch then still advanced the highwater
+  marker and pointed the write Service selector and `pg-role=primary` at a pod that no longer
+  held the lease, on top of the genuine new primary; `OnLost` could not correct it first because
+  it blocks on `opMu`, which is held for the whole reconcile action. Holdership is now re-checked
+  before either claim, the same way the initdb path already did. The node stays marked
+  read-write, so the lost-leadership fence still demotes it.
+
+- **An unreachable rewind target no longer escalates to a full re-clone (#298 review, agent).**
+  `RejoinForceRewind` classified "could not connect" as transient and then discarded the
+  classification, so three consecutive ticks -- ~15s on chart defaults -- of a target at
+  `max_connections`, a rotated credential, or a primary still starting up escalated a healthy,
+  non-diverged standby to `ReclonePreserving`: a multi-hour base backup plus an unreaped
+  `.diverged.<ts>` copy on the PVC. Unreachability is now a distinct sentinel that is exempt from
+  the backstop, because a re-clone dials the same target with the same credentials and cannot
+  succeed where the rewind just failed to connect. A genuinely local, permanent refusal still
+  escalates after its three ticks.
+
+- **Four smaller agent fixes (#298 review).** A restart that could not prove the postmaster is
+  dead now reports an error instead of `nil` -- on a wedged PV, `Stop` deliberately leaves the
+  child supervised and `Start` then returns "still running", so a single-node primary reported a
+  successful restart every tick while the database was down. A successful rejoin re-latches its
+  upstream, without which the next re-homing tick skipped `releaseSlotOnFormerUpstream` and left
+  an inactive slot pinning WAL on the rejoin target. `ensureSlotOnUpstream`'s existence guard is
+  scoped to `slot_type = 'physical'`, mirroring the same fix in `Prober.CreatePhysicalSlot`. And
+  a queued control intent floors its inherited request deadline, which was routinely already in
+  the past by the time the loop dequeued it -- making a graceful `/v1/node/restart` a zero-grace
+  SIGKILL of a read-write primary.
+
+- **`DELETE /v1/restore` can now actually wait out a slow-terminating Job (#298 review, agent).**
+  Both callers passed the HTTP request context, which the control API had already capped at 60s,
+  so the declared 90s wait was cut short and the real reason replaced by a bare
+  `context deadline exceeded` -- an intermittent 502 on the delete and on `{"replace": true}`.
+  The wait is detached with its own budget and the per-request ceiling is set explicitly above it.
+
 - **Five ways a second writer could appear, closed (#298 review, agent).** (1) `boot()` and
   `StartLocal`'s standby arm now *assert* `standby.signal` from the control-file state instead
   of trusting the file to be there: `InRecovery` is derived from `pg_controldata` alone, so the

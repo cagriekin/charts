@@ -249,7 +249,7 @@ When `ha.enabled` is true there are **no HA sidecars**:
 
 ### Choosing the PostgreSQL major
 
-**PostgreSQL 18 is the default. PostgreSQL 17 is selectable.** With `ha.enabled` the server binaries come from the HA image (shared with the `pg` chart), so the major is decided by which HA image you run — `postgresql.image` has no effect on the running server. The image is published unsuffixed (= 18) plus `-pg18` / `-pg17`; all are multi-arch, attested and cosign-signed.
+**PostgreSQL 18 is the default. PostgreSQL 17 is selectable.** With `ha.enabled` the server binaries come from the HA image (shared with the `pg` chart), so the major is decided by which HA image you run — `postgresql.image` has no effect on the running server. Since 2.0.0 (#290) the major is always **in** the tag — `2.0.0-pg18` / `2.0.0-pg17`, with no unsuffixed alias; both are multi-arch, attested and cosign-signed.
 
 Four values move together, and the chart refuses to render if the two majors disagree in either direction:
 
@@ -258,15 +258,23 @@ postgresql:
   majorVersion: "17"
   image:
     tag: pg17-trixie           # the pgvector image for the SAME major
-repmgr:
+ha:
   image:
     tag: 2.0.0-pg17
     majorVersion: "17"
+# ONLY when the bundled etcd is enabled (etcd.enabled=true): its RBAC-bootstrap Job runs the
+# HA image, and the render FAILS unless this reference matches ha.image exactly -- see the pg
+# chart README section linked below.
+etcd:
+  rbac:
+    bootstrapImage:
+      repository: cagriekin/pg-ha
+      tag: 2.0.0-pg17
 ```
 
-**`postgresql.image.tag` matters here even with `ha.enabled`** — unlike in the `pg` chart. This chart ships `postgresql.extensions.enabled=true`, and the `copy-ext` init container copies `/usr/lib/postgresql/<major>/lib` and `/usr/share/postgresql/<major>/extension` **out of the pgvector image** into the server container, which is how `vector` reaches a server that runs from the repmgr image. Those paths are built from `postgresql.majorVersion`, so the pgvector image must be the matching major (`pgvector/pgvector:pg17-trixie`) or the copy finds nothing and `CREATE EXTENSION vector` fails.
+**`postgresql.image.tag` matters here even with `ha.enabled`** — unlike in the `pg` chart. This chart ships `postgresql.extensions.enabled=true`, and the `copy-ext` init container copies `/usr/lib/postgresql/<major>/lib` and `/usr/share/postgresql/<major>/extension` **out of the pgvector image** into the server container, which is how `vector` reaches a server that runs from the HA image. Those paths are built from `postgresql.majorVersion`, so the pgvector image must be the matching major (`pgvector/pgvector:pg17-trixie`) or the copy finds nothing and `CREATE EXTENSION vector` fails.
 
-As in the `pg` chart, a `-pgNN` tag that disagrees with `ha.image.majorVersion` fails the render, and `PG_MAJOR` is passed to the containers running the HA image so an unsuffixed-tag mismatch is refused at startup rather than running the wrong major.
+As in the `pg` chart, a `-pgNN` tag that disagrees with `ha.image.majorVersion` fails the render, and `PG_MAJOR` is passed to the containers running the HA image so a mismatch behind a tag carrying no `-pgNN` suffix (a private mirror) is refused at startup rather than running the wrong major.
 
 This is a **create-time** choice: the chart has no in-place major upgrade, so moving an existing cluster between majors means a logical dump/restore into a fresh release. Through 1.x there was a caveat here — repmgr 5.5.0's upstream install requirements list PostgreSQL 13–17, not 18 — which 2.0.0 removed along with repmgr itself; the agent uses only PostgreSQL's own tooling. For the full rationale, the tag table, and the `pg_dump` considerations, see the [pg chart README — Choosing the PostgreSQL major](../pg/README.md#choosing-the-postgresql-major).
 

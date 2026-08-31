@@ -18,6 +18,22 @@ import (
 // proceed; the caller falls back to ReclonePreserving (the #175 data-safe path).
 var ErrRewindDiverged = errors.New("mechanism: rewind diverged, reclone required")
 
+// ErrRewindUnreachable is returned by RejoinForceRewind when pg_rewind could not CONNECT to
+// the target at all. It is a strictly narrower claim than "not divergence": the rewind never
+// examined this node's history, so nothing is known about it either way.
+//
+// The caller must not count it toward the re-clone backstop (#298 review). That backstop
+// exists for a refusal that is permanent AND local -- pg_rewind wanting a configuration the
+// target does not have, say -- which would otherwise retry forever and leave the node out of
+// the cluster; escalating converges. Unreachability is the one class where escalating
+// converges on NOTHING: ReclonePreserving connects to the same target with the same
+// credentials, so it cannot succeed where the rewind just failed to connect. All the
+// escalation buys is a PGDATA rename, a failed pg_basebackup, and an unreaped
+// `.diverged.<ts>` copy on the PVC -- for a target at max_connections, a rotated credential,
+// or a primary that is still starting up. Retrying is not a stall here: the node stays a
+// stopped standby and rejoins on the first tick that can reach the target.
+var ErrRewindUnreachable = errors.New("mechanism: rewind target unreachable, retry")
+
 // Conn is how to reach a peer PostgreSQL node for clone/follow/rejoin: the address parts a
 // mechanism needs to write primary_conninfo or point a pg_basebackup at an upstream.
 //

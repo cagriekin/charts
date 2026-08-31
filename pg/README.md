@@ -562,20 +562,30 @@ pin always names the major it wants, and `ha.image.majorVersion` cross-checks it
 > `cagriekin/repmgr` stays published and frozen at its last tag, so existing digest pins keep
 > resolving — but it receives no further builds, including security updates.
 
-Three values move **together**; the chart refuses to render if the two majors disagree (in either direction), because a mismatch would silently run one major while building extension paths for another:
+These values move **together**; the chart refuses to render if the two majors disagree (in either direction), because a mismatch would silently run one major while building extension paths for another:
 
 ```yaml
 postgresql:
   majorVersion: "17"
   image:
     tag: 17.10-trixie      # only used in standalone mode / for the extension copy
-repmgr:
+ha:
   image:
     tag: 2.0.0-pg17
     majorVersion: "17"
+# ONLY when the bundled etcd is enabled (etcd.enabled=true): its RBAC-bootstrap Job runs
+# `pg-ha-agent rbac-bootstrap` from the HA image, so pg.validateEtcdBootstrapImage FAILS THE
+# RENDER unless this reference matches ha.image exactly -- repository, tag AND digest. Moving
+# the major therefore touches this pin too; with an external etcd
+# (ha.agent.dcs.etcd.endpoints) the Job never renders and this block is unnecessary.
+etcd:
+  rbac:
+    bootstrapImage:
+      repository: cagriekin/pg-ha
+      tag: 2.0.0-pg17
 ```
 
-The chart checks the claim rather than trusting it: a `-pgNN` tag that disagrees with `ha.image.majorVersion` **fails the render**, and `PG_MAJOR` is passed to every container running the HA image — so if the majors are moved while the tag is left on the unsuffixed default (which carries no suffix to compare), the entrypoint and the agent refuse to start, naming both the requested and the bundled major. A wrong-major cluster is therefore a loud failure at install time, not a discovery months later.
+The chart checks the claim rather than trusting it: a `-pgNN` tag that disagrees with `ha.image.majorVersion` **fails the render**, and `PG_MAJOR` is passed to every container running the HA image — so if the majors are moved while the tag is left on a private-mirror tag that carries no `-pgNN` suffix to compare, the entrypoint and the agent refuse to start, naming both the requested and the bundled major. (There is no *published* unsuffixed tag since #290; a 1.x-shaped `trixie-` tag, or a repository still ending in `/repmgr`, is refused outright by `pg.validateHaImageGeneration`.) A wrong-major cluster is therefore a loud failure at install time, not a discovery months later.
 
 Standalone mode (`ha.enabled=false`) is unconstrained: there is no HA image in play, so `postgresql.image` alone decides the major.
 
@@ -777,7 +787,7 @@ position, or *why* the agent is not doing what you expected.
 The optional control API closes both gaps. It is off by default:
 
 ```yaml
-repmgr:
+ha:
   agent:
     control:
       enabled: true
@@ -934,7 +944,7 @@ recover to an arbitrary timestamp during an incident with one call. The kubectl
 off and use the kubectl path, which needs none of the RBAC above.
 
 ```yaml
-repmgr:
+ha:
   agent:
     control:
       restore:
@@ -1024,7 +1034,7 @@ cannot be separated by accident: **rendering the RBAC without the policy fails t
 unless you acknowledge the trade in values.
 
 ```yaml
-repmgr:
+ha:
   agent:
     control:
       restore:
@@ -1170,7 +1180,7 @@ Progress, honestly:
 The agent serves read-only Prometheus metrics on port `9200` (`pg_ha_agent_is_leader`, `_is_paused`, `_renew_failures_total`, `_promotions_total`, `_demotes_total`, `_fences_total`, `_reconcile_errors_total`, `_recovery_starts_total`, `_marker_tamper_suspected_total`, the `_replicas_*` topology gauges and the `_replication_slot*` gauges). With the Prometheus Operator installed:
 
 ```yaml
-repmgr:
+ha:
   agent:
     monitoring:
       serviceMonitor: { enabled: true }   # scrape the agent metrics off the headless Service
@@ -1213,7 +1223,7 @@ anything is wrong:
 By default the leader Lease lives in the Kubernetes apiserver. A sustained control-plane outage longer than `renewDeadline` therefore causes a write outage by itself (the healthy primary self-demotes on losing apiserver contact, and no standby can acquire until the control plane returns). To decouple leadership from the control plane, point the agent at an existing **etcd** cluster:
 
 ```yaml
-repmgr:
+ha:
   agent:
     leaseDuration: 15s            # must be >= 5s for etcd (the lease TTL is whole seconds)
     dcs:

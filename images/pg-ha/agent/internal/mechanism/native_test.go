@@ -185,6 +185,25 @@ func TestNativeRejoinForceRewindClassifiesConnectionFailure(t *testing.T) {
 	if errors.Is(err, ErrRewindDiverged) {
 		t.Errorf("a connection failure must NOT be classified as divergence (#178), got %v", err)
 	}
+	// #298 review: and it must be TAGGED, not merely worded differently. rejoinOnto reads this
+	// sentinel to keep an unreachable target out of the re-clone backstop -- a ReclonePreserving
+	// dials the same target with the same credentials, so escalating converges on nothing but a
+	// renamed PGDATA and an unreaped .diverged.<ts> copy.
+	if !errors.Is(err, ErrRewindUnreachable) {
+		t.Errorf("a connection failure must be ErrRewindUnreachable so the caller does not count it toward the reclone backstop, got %v", err)
+	}
+}
+
+// The two sentinels are mutually exclusive: the caller branches on Unreachable FIRST, so a
+// divergence that somehow also matched would silently stop escalating.
+func TestNativeRewindSentinelsAreDisjoint(t *testing.T) {
+	fr := &fakeRunner{failOn: "--restore-target-wal",
+		failOut: "pg_rewind: error: could not find common ancestor of the source and target cluster's timelines"}
+	n, _ := newTestNative(t, fr)
+	err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.h", User: "repmgr", DB: "repmgr"})
+	if errors.Is(err, ErrRewindUnreachable) {
+		t.Errorf("a divergence must not also be ErrRewindUnreachable, or it would never escalate: %v", err)
+	}
 }
 
 func TestNativeRejoinForceRewindClassifiesDivergence(t *testing.T) {

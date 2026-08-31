@@ -524,9 +524,17 @@ func (n *Native) ensureSlotOnUpstream(ctx context.Context, source Conn) error {
 	if err := validSlotName(n.SlotName); err != nil {
 		return fmt.Errorf("native: clone slot: %w", err)
 	}
+	// slot_type = 'physical' in the guard, mirroring Prober.CreatePhysicalSlot (#298 review).
+	// Unscoped, a LOGICAL slot squatting on this ordinal's name suppressed the create
+	// SILENTLY: the statement returns zero rows with a nil error, so this reports success and
+	// Follow then writes primary_slot_name pointing at it. The walreceiver loops forever on
+	// "cannot use a logical replication slot for physical replication" and no layer of the
+	// agent says why. Scoped, the create actually runs and PostgreSQL's own "already exists"
+	// surfaces the collision (isDuplicateSlot only swallows a physical/physical race).
 	sql := fmt.Sprintf(
 		"SELECT pg_create_physical_replication_slot('%s') "+
-			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '%s');",
+			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots "+
+			"WHERE slot_name = '%s' AND slot_type = 'physical');",
 		n.SlotName, n.SlotName)
 	// --no-psqlrc, for the reason Prober.psql and RehashMd5User both pass it (#298 review):
 	// PSQLRC reaches this process through postgresql.extraEnv (childenv.Filtered strips only
@@ -703,8 +711,16 @@ func (n *Native) RejoinForceRewind(ctx context.Context, target Conn) (rerr error
 	if isConnectionFailure(out) {
 		// Transient: the caller retries next tick. Reporting ErrRewindDiverged here would
 		// trigger a needless full re-clone of a node whose history is probably fine (#178).
-		return fmt.Errorf("native: pg_rewind onto %s: could not connect (transient, not divergence): %w: %s",
-			target.Host, err, strings.TrimSpace(out))
+		//
+		// Tagged ErrRewindUnreachable rather than left a plain error (#298 review). The
+		// classification was computed here and then thrown away -- only the message differed --
+		// so rejoinOnto counted a connection refusal toward rewindFailureLimit like any other
+		// non-divergence failure: three ticks (~15s on chart defaults) of "could not connect"
+		// against a target at max_connections, or with a rotated credential, escalated a
+		// healthy non-diverged standby to ReclonePreserving. See the sentinel's own comment for
+		// why escalating on THIS class converges on nothing.
+		return fmt.Errorf("%w: native: pg_rewind onto %s: could not connect (transient, not divergence): %w: %s",
+			ErrRewindUnreachable, target.Host, err, strings.TrimSpace(out))
 	}
 	// Anything else is NOT divergence either, and the DEFAULT matters more than either list.
 	// Defaulting to ErrRewindDiverged would send every failure absent from the

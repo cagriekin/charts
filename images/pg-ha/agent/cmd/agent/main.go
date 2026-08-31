@@ -1319,6 +1319,25 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			return err
 		}
 		a.metr.IncPromotion()
+		// Holdership re-check before publishing this node as the primary, exactly as
+		// finishInitdbNative does after its own unbounded exec (#298 review). `pg_ctl -w
+		// promote` is bounded only by PGCTLTIMEOUT (60s; nothing in this image lowers it) and
+		// the chart's default LeaseDuration is 15s, so on the ordinary failover case -- a
+		// standby with a large unreplayed backlog -- the lease can lapse and be acquired by a
+		// peer while this call is still running. OnLost cannot correct it first: it blocks on
+		// opMu, which tick() holds for the whole of act(). Continuing anyway ran advanceMarker
+		// and assertPrimaryRouting, pointing the write Service selector and the
+		// pg-role=primary label at a pod that no longer holds the lease -- on top of the
+		// genuine new primary.
+		//
+		// servingRW stays ARMED and nothing is demoted here: this node really is read-write
+		// now, and the fence is OnLost's job (it runs the moment act() releases opMu). All
+		// this branch must not do is claim the routing.
+		if !a.dcs.IsLeader() {
+			a.log.Warn("lost the lease during promote; not advancing the highwater marker or claiming the write Service -- the lost-leadership fence will demote this node (#298)",
+				"node", a.cfg.PodName)
+			return nil
+		}
 		// After promotion the node is read-write. Bound ALL the post-promote
 		// bookkeeping -- the slot pass, the WAL re-probe, and the marker + routing
 		// apiserver writes -- under the fence budget, sharing one context so the total
@@ -1801,8 +1820,27 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// postmaster ignores the signal) and start fresh.
 		a.metr.IncDemote()
 		rctx, cancel := context.WithTimeout(ctx, a.cfg.RenewDeadline)
-		_ = a.sup.Stop(rctx, process.Immediate)
+		serr := a.sup.Stop(rctx, process.Immediate)
 		cancel()
+		// The Stop error is INSPECTED, not discarded (#298 review), with the same distinction
+		// runIntent draws. Stop has a documented path where it gives up and deliberately
+		// leaves the child supervised: SIGKILL is undeliverable to a process in
+		// uninterruptible sleep, so on a wedged PV it returns "postmaster did not exit ...
+		// after SIGKILL (PGDATA I/O wedged?); leaving it supervised" without clearing its
+		// handle. Start then sees a live handle and returns nil ("still running"), so act()
+		// returned nil: no IncReconcileError, no error log, nothing -- every 5s tick reported
+		// a successful restart while the single-node database was down and the only signal
+		// was an IncDemote claiming a demote had happened.
+		//
+		// context.DeadlineExceeded ALONE is the normal escalation (killed and reaped), so it
+		// is not fatal -- but the "left supervised" error wraps ctx.Err() too, which is why
+		// Running() is part of the test.
+		if serr != nil {
+			if !errors.Is(serr, context.DeadlineExceeded) || a.sup.Running() {
+				return fmt.Errorf("restart local: could not prove the postmaster is dead, so not reporting a restart: %w", serr)
+			}
+			a.log.Warn("restart local: the postmaster did not exit before the stop deadline and was killed; starting it back up", "err", serr)
+		}
 		return a.sup.Start(ctx)
 
 	case reconcile.BootstrapInitdb:
@@ -3109,6 +3147,19 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 		// "the caller retries next tick" -- but this caller escalated on ANY error,
 		// paying a full re-clone plus a preserved .diverged.<ts> copy of PGDATA for a
 		// network blip: exactly the #178 escalation the classifier exists to prevent.
+		if errors.Is(err, mechanism.ErrRewindUnreachable) {
+			// Could not CONNECT to the target: retry, and do NOT count it toward the backstop
+			// below (#298 review). The backstop converges a permanent LOCAL refusal by
+			// escalating; a target this node cannot reach is the one class where escalating
+			// converges on nothing, because ReclonePreserving dials the same target with the
+			// same credentials and fails the same way -- after renaming PGDATA aside and
+			// leaving an unreaped .diverged.<ts> copy behind. Counting it turned three ticks
+			// (~15s on chart defaults) of a target at max_connections, or a rotated
+			// credential, into a multi-hour base backup of a standby whose history was fine.
+			// The streak is left ALONE rather than reset: an unreachable tick is no evidence
+			// about a genuine local refusal that was already accumulating against this target.
+			return err
+		}
 		if !errors.Is(err, mechanism.ErrRewindDiverged) {
 			// Not divergence, so the data directory is not touched -- but count it. A refusal
 			// that is permanent and non-divergent (pg_rewind wanting a config the target does
@@ -3171,6 +3222,18 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 	if _, err := a.ensurePrimaryConninfoDBName(); err != nil {
 		a.log.Warn("ensure dbname in primary_conninfo", "err", err)
 	}
+	// RE-LATCH the upstream this rejoin just pointed replication at (#298 review). The latch
+	// is invalidated on entry above, and leaving it empty leaks a slot: BOTH rejoin outcomes
+	// provision THIS node's slot on `target` (RejoinForceRewind ends in Native.Follow ->
+	// ensureSlotOnUpstream, and ReclonePreserving -> Clone -> ensureSlotOnUpstream), so when
+	// the next tick re-homes this node -- which cascadeFollowTarget routinely does -- act()
+	// calls releaseSlotOnFormerUpstream with an EMPTY former and returns at its `former == ""`
+	// guard. orphanSlot deliberately keeps any slot whose ordinal has a live pod, so nothing
+	// else reclaims it and an inactive slot pins WAL on the rejoin target until
+	// max_slot_wal_keep_size invalidates it. This is the same reason BootstrapClone latches
+	// dec.Target after its own clone. It also re-arms observeStandbyStall, which requires a
+	// non-empty latch, so a standby that stalls right after a rejoin can escalate again.
+	a.latchFollow(target)
 	return a.sup.Start(ctx)
 }
 
