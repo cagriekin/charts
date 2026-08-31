@@ -59,6 +59,31 @@ tests:
       - matchRegex:
           path: spec.template.spec.containers[0].image
           pattern: ^quay\.io/coreos/etcd@sha256:[0-9a-f]{64}$
+
+  # ...and the RBAC-bootstrap Job's image line, which is the one the digest-only fix landed on
+  # FIRST and the one that had no render test at all (#298 review). Both now go through
+  # etcd.image, so this is what pins the second caller: pg.validateEtcdBootstrapImage tells the
+  # operator to set this image to the same repository/tag/digest as ha.image, and ha.image
+  # (through pg.image) accepts a tag-less digest pin -- so following that advice must not render
+  # `cagriekin/pg-ha:@sha256:...` and take the Job to InvalidImageName, which leaves etcd auth
+  # and the per-release tenants unprovisioned.
+  - it: a digest-only bootstrapImage pin renders no empty tag separator
+    template: templates/rbac-bootstrap-job.yaml
+    set:
+      tls.enabled: true
+      tls.existingSecret: etcd-tls
+      rbac.enabled: true
+      rbac.adminSecret: etcd-root
+      rbac.tenants:
+        - commonName: pg-agent
+          prefix: /pg/
+      rbac.bootstrapImage.tag: ""
+      rbac.bootstrapImage.digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: cagriekin/pg-ha@sha256:1111111111111111111111111111111111111111111111111111111111111111
+
   - it: plaintext default uses httpGet readiness and tcpSocket liveness
     template: templates/statefulset.yaml
     asserts:

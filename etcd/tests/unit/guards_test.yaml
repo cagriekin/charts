@@ -40,3 +40,54 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "at '/image/pullPolicy': value must be one of"
+
+  # An image with NEITHER a tag NOR a digest fails at RENDER time, not at the kubelet (#298
+  # review). Omitting an empty tag is what makes the digest-only pin work, and it also turned
+  # `tag: "" digest: ""` from a loud InvalidImageName into a bare `quay.io/coreos/etcd`: an
+  # implicit :latest, unpinned across pod restarts, and for the DCS that means a future etcd
+  # MAJOR landing on an existing member's data directory, which it refuses to start on -- all
+  # three pods down, no lease, no primary, and nothing said so at install time. values.yaml
+  # invites half of it ("Set to \"\" to pull by tag only" on the digest). pg.image refuses the
+  # same shape; etcd.image is where that rule now lives for both of this chart's images.
+  - it: an image with neither tag nor digest is refused at render time
+    templates:
+      - templates/statefulset.yaml
+    set:
+      image.tag: ""
+      image.digest: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: 'image "quay.io/coreos/etcd" has neither a tag nor a digest'
+
+  # ...and the bootstrap Job's image, which the pg chart's own guard cannot cover in a
+  # STANDALONE etcd install: pg.validateEtcdBootstrapImage only runs when the etcd subchart is
+  # bundled, and it is what forces this image to equal ha.image (which pg.image already refuses
+  # to leave unpinned). Installed on its own, this chart is the only thing that can say no.
+  - it: a bootstrapImage with neither tag nor digest is refused at render time
+    templates:
+      - templates/rbac-bootstrap-job.yaml
+    set:
+      rbac.enabled: true
+      tls.enabled: true
+      tls.existingSecret: etcd-tls
+      rbac.adminSecret: etcd-root
+      rbac.tenants:
+        - commonName: pg-agent
+          prefix: /pg/
+      rbac.bootstrapImage.tag: ""
+      rbac.bootstrapImage.digest: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: 'image "cagriekin/pg-ha" has neither a tag nor a digest'
+
+  # An EMPTY repository is refused too, rather than rendering ":v3.5.16" (#298 review) -- the
+  # same unparseable class, reached from the other side. The bootstrap Job has its own, more
+  # specific message for this and keeps it.
+  - it: an empty image repository is refused at render time
+    templates:
+      - templates/statefulset.yaml
+    set:
+      image.repository: ""
+    asserts:
+      - failedTemplate:
+          errorMessage: "etcd: an image block has an empty repository, which renders an unparseable reference (\":tag\"). Set the repository, or leave the whole image block at its chart default."

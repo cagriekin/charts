@@ -160,6 +160,7 @@ matching `prefix`.
 |-----|-------------|---------|
 | `replicaCount` | etcd members (keep odd for quorum) | `3` |
 | `image.repository` / `image.tag` | etcd image | `quay.io/coreos/etcd` / `v3.5.16` |
+| `image.digest` | digest pin; takes precedence over the tag. `image.tag: ""` with a digest is a valid digest-only reference, but clearing BOTH is refused at render time (it would deploy an implicit `:latest`) | pinned to the `v3.5.16` manifest list |
 | `clientPort` / `peerPort` | etcd ports | `2379` / `2380` |
 | `persistence.enabled` / `persistence.size` | data PVC | `true` / `2Gi` |
 | `resources` | requests/limits | `100m`/`128Mi` … `1`/`512Mi` |

@@ -61,3 +61,36 @@ app.kubernetes.io/component: etcd
 {{- end -}}
 {{- join "," $parts -}}
 {{- end -}}
+
+{{- /* Image reference for an image dict {repository, tag, digest?} -- in ONE place, because
+       this chart has TWO of them and the digest-only fix had to be made twice (#298 review:
+       "Fixing only the bootstrap Job's copy of this expression left the larger blast radius in
+       place"). A third copy is how the next one gets missed.
+
+       Both malformed shapes fail at RENDER time rather than at the kubelet, matching
+       pg/templates/_helpers.tpl's pg.image, which refuses exactly these two:
+
+         - an EMPTY REPOSITORY renders ":tag" or "@sha256:...", which is unparseable.
+
+         - NEITHER TAG NOR DIGEST renders a bare repository, i.e. an implicit :latest. Omitting
+           an empty tag is what makes a digest-only pin work, but it also turned
+           `tag: "" digest: ""` from a loud kubelet InvalidImageName into a silent floating tag
+           -- and values.yaml invites half of that ("Set to \"\" to pull by tag only" on the
+           digest). For the DCS a floating tag means a future etcd MAJOR landing on an existing
+           member's data directory, which it refuses to start on: all three pods down, no lease,
+           the release comes up with no primary. Failing the render is the chart's contract for
+           a dangerous input (see CLAUDE.md invariant 4). */ -}}
+{{- define "etcd.image" -}}
+{{- if not .repository -}}
+{{- fail "etcd: an image block has an empty repository, which renders an unparseable reference (\":tag\"). Set the repository, or leave the whole image block at its chart default." -}}
+{{- end -}}
+{{- if and (not .tag) (not .digest) -}}
+{{- fail (printf "etcd: image %q has neither a tag nor a digest, which would deploy an implicit :latest -- unpinned across pod restarts, so a future build silently replaces the one this release was tested with (for the etcd SERVER that is a new major landing on an existing member's data directory, which it refuses to start on; for rbac.bootstrapImage it is one agent build writing the etcd RBAC that another then authenticates against). Set image.tag, or image.digest alone (a digest is a complete pin on its own)." (.repository | toString)) -}}
+{{- end -}}
+{{- if .tag -}}
+{{- printf "%s:%s" .repository .tag -}}
+{{- else -}}
+{{- .repository -}}
+{{- end -}}
+{{- with .digest }}@{{ . }}{{- end -}}
+{{- end -}}

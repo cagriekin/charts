@@ -715,6 +715,22 @@
   have no DCS at all rather than an unauthenticated one. Both image lines now omit an empty tag,
   and `etcd/tests/unit/render_test.yaml` pins the digest-only render.
 
+  ...and omitting the empty tag traded a loud failure for a silent one, which the third pass
+  closes (#298 review, etcd 0.1.11). `tag: "" digest: ""` no longer renders a bare
+  `quay.io/coreos/etcd` -- an implicit `:latest`, unpinned across pod restarts, which for the DCS
+  means a future etcd MAJOR landing on an existing member's data directory that it refuses to
+  start on: all three pods down, no lease, no primary, and nothing said so at install time. The
+  previous bare-colon form at least failed as `InvalidImageName`. `etcd.image` is now the single
+  place both image lines render through (the two-copy shape is what made the first fix need a
+  second pass), and it refuses an empty repository and a tag-less, digest-less reference exactly
+  as `pg.image` does -- CLAUDE.md invariant 4, fail at render time rather than at the API server.
+  It matters most for `etcd.rbac.bootstrapImage`, whose shipped default already has
+  `digest: ""`: in a STANDALONE etcd install `pg.validateEtcdBootstrapImage` is not there to
+  force it to equal a `ha.image` that `pg.image` has already refused to leave unpinned, so this
+  chart is the only thing that can say no. `etcd/tests/unit/guards_test.yaml` pins both refusals
+  and `render_test.yaml` now pins the bootstrap Job's digest-only render too, which was the fix
+  that shipped first and had no render test at all.
+
 - **`ha.agent: null` in standalone mode gave a raw nil pointer instead of the named error (#298
   review).** The `ha.agent is required when ha.enabled=true` guard was added for exactly this,
   but scoped to `pg.agentMode == true` -- correct in itself, since standalone runs no agent --

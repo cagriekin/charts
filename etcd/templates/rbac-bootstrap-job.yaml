@@ -4,7 +4,7 @@
 {{- if not .Values.tls.clientCertAuth }}{{ fail "etcd: rbac.enabled requires tls.clientCertAuth=true (the CN is the authenticated user)" }}{{- end }}
 {{- if not .Values.rbac.adminSecret }}{{ fail "etcd: rbac.enabled requires rbac.adminSecret (a client cert whose CN is root)" }}{{- end }}
 {{- if not .Values.rbac.tenants }}{{ fail "etcd: rbac.enabled requires at least one rbac.tenants entry -- enabling auth with no tenant user would lock every CN-authenticated agent out of the keyspace" }}{{- end }}
-{{- $img := .Values.rbac.bootstrapImage -}}
+{{- $img := .Values.rbac.bootstrapImage | default dict -}}
 {{- if not $img.repository }}{{ fail "etcd: rbac.bootstrapImage.repository is required (the pg-ha-agent image; it runs `pg-ha-agent rbac-bootstrap`)" }}{{- end }}
 apiVersion: batch/v1
 kind: Job
@@ -48,16 +48,22 @@ spec:
           # The bundled etcd image is distroless (no shell -- it ships etcd + etcdctl
           # only), so the bootstrap runs in the pg-ha-agent image and drives the etcd
           # Auth API via the Go client (the same mTLS client the agent uses).
-          {{- /* The tag is OMITTED when empty, rather than emitted as a bare colon (#298
-                 review). pg's pg.haImage (via pg.image) supports a digest-only pin -- no tag
-                 at all -- and pg.validateEtcdBootstrapImage tells the operator to set THIS
-                 image to the same repository/tag/digest as ha.image. Following that with a
-                 digest-only pin rendered `repo:@sha256:...`, which the kubelet rejects as
-                 InvalidImageName: the Job never runs, etcd auth and the per-release tenants
-                 are never provisioned, every agent's etcd dial is unauthenticated, no node
-                 wins the lease, and the release comes up with no primary -- the outcome that
-                 guard exists to prevent. */}}
-          image: "{{ $img.repository }}{{ with $img.tag }}:{{ . }}{{ end }}{{ with $img.digest }}@{{ . }}{{ end }}"
+          {{- /* Through etcd.image, shared with templates/statefulset.yaml (#298 review). The
+                 tag is OMITTED when empty, rather than emitted as a bare colon: pg's
+                 pg.haImage (via pg.image) supports a digest-only pin -- no tag at all -- and
+                 pg.validateEtcdBootstrapImage tells the operator to set THIS image to the same
+                 repository/tag/digest as ha.image. Following that with a digest-only pin
+                 rendered `repo:@sha256:...`, which the kubelet rejects as InvalidImageName:
+                 the Job never runs, etcd auth and the per-release tenants are never
+                 provisioned, every agent's etcd dial is unauthenticated, no node wins the
+                 lease, and the release comes up with no primary -- the outcome that guard
+                 exists to prevent. The helper also refuses `tag: "" digest: ""`, which
+                 omitting an empty tag would otherwise render as a bare repository: an implicit
+                 :latest, so the Job writes the etcd RBAC from whatever agent build the tag
+                 currently resolves to while the database pods run the pinned one -- the
+                 mismatch pg.validateEtcdBootstrapImage exists to catch, and it cannot see it
+                 in a STANDALONE etcd install. */}}
+          image: {{ include "etcd.image" $img | quote }}
           imagePullPolicy: {{ $img.pullPolicy | default "IfNotPresent" }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}

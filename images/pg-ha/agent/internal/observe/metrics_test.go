@@ -134,17 +134,31 @@ func TestClearsRetractWhatADemotedPodPublished(t *testing.T) {
 	m.ClearSlots()
 	var b strings.Builder
 	m.write(&b)
+	// COUNTERS are exempt, read from the DECLARED type rather than guessed from the name
+	// (#298 review). The name predicate below is a substring match, so
+	// `pg_ha_agent_replication_slots_recycled_total` fell inside it -- and a counter must never
+	// be retracted: rate() handles a reset as a counter reset, so zeroing one on demotion loses
+	// the event the recycle alert exists to catch. The exemption is asserted positively by
+	// TestSlotRecycleCounterSurvivesTheGaugeClear.
+	//
+	// `# TYPE ... counter`, not `strings.HasSuffix(name, "_total")`: the suffix is a naming
+	// CONVENTION, and this test's whole job is to catch a gauge that stays latched. A gauge
+	// named against convention -- a `..._slots_total` alongside the existing
+	// `pg_ha_agent_replication_slots` is one rename away -- would exempt itself from the
+	// assertion silently, which is the "reads as coverage while proving nothing" shape. The
+	// exposition already states the type, so ask it.
+	counters := map[string]bool{}
+	for _, line := range strings.Split(b.String(), "\n") {
+		if f := strings.Fields(line); len(f) == 4 && f[0] == "#" && f[1] == "TYPE" && f[3] == "counter" {
+			counters[f[2]] = true
+		}
+	}
 	for _, line := range strings.Split(b.String(), "\n") {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		name, val, _ := strings.Cut(line, " ")
-		// COUNTERS are exempt, by name (#298 review). The predicate below is a substring
-		// match, so `pg_ha_agent_replication_slots_recycled_total` fell inside it -- and a
-		// counter must never be retracted: rate() handles a reset as a counter reset, so
-		// zeroing one on demotion loses the event the recycle alert exists to catch. The
-		// exemption is asserted positively by TestSlotRecycleCounterSurvivesTheGaugeClear.
-		if strings.HasSuffix(name, "_total") {
+		if counters[name] {
 			continue
 		}
 		if (strings.Contains(name, "replicas_") || strings.Contains(name, "replication_slot")) && val != "0" {
