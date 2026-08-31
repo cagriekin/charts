@@ -540,7 +540,9 @@
   help either, since it deliberately keeps any slot whose ordinal still has a live pod -- so the
   standby stayed out of the cluster, burning one preserved copy per attempt, until an operator
   dropped the slot by hand. Both paths now drop the dead reservation first, guarded on `NOT
-  active` so only a slot nothing holds is ever removed.
+  active` so only a slot nothing holds is ever removed -- and the primary's own create pass
+  counts an invalidated slot as ABSENT, so it actually reaches that recycle instead of
+  skipping the create because a (dead) slot by that name exists.
 
 - **The cross-cluster guard will still work after 2038 (#298 review, agent).**
   `pg_control_system()` exposes `system_identifier` as a signed `int8` -- PostgreSQL has no

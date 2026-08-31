@@ -281,7 +281,16 @@ func (p *Prober) SystemIdentifier(ctx context.Context, ci ConnInfo) (id uint64, 
 	// misrouted pod from a different cluster would no longer be refused as a
 	// clone/rewind source. Reinterpreting the signed value as uint64 reproduces
 	// pg_controldata's rendering for all inputs, so the two sides compare equal.
-	n, perr := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	//
+	// BOTH renderings are accepted, so neither half of the 64-bit range is fail-open: the
+	// unsigned form is tried first (it is what pg_controldata and any future unsigned-typed
+	// exposure print) and the signed form second. Every input either side can produce now
+	// parses to the same 64 bits the local identifier is compared against.
+	v := strings.TrimSpace(out)
+	if n, perr := strconv.ParseUint(v, 10, 64); perr == nil {
+		return n, true, nil
+	}
+	n, perr := strconv.ParseInt(v, 10, 64)
 	if perr != nil {
 		return 0, false, nil
 	}

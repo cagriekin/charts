@@ -3834,11 +3834,30 @@ func (a *agent) reconcileSlots(ctx context.Context, slots []pg.SlotState) ([]str
 			continue
 		}
 		name := slotPrefix + strconv.Itoa(ord)
-		if _, ok := have[name]; ok {
+		// An INVALIDATED slot counts as ABSENT here, or CreatePhysicalSlot's recycle branch
+		// is unreachable from this pass (#298 review). wal_status = 'lost' means PostgreSQL
+		// destroyed the reservation at max_slot_wal_keep_size, and such a slot can never be
+		// acquired again -- but it is a slot, so a bare presence check skipped the create and
+		// nothing else on the PRIMARY reclaimed it either: orphanSlot deliberately keeps any
+		// slot whose ordinal still has a live pod, precisely so a briefly disconnected child
+		// is not deprived of its slot. The dead reservation therefore stood forever, with
+		// pg_ha_agent_replication_slots_invalidated (and its alert) latched on a cluster the
+		// agent could have repaired in one statement.
+		//
+		// Only when NOT active, mirroring the SQL guard: an invalidated slot something still
+		// holds is left alone, and the drop inside CreatePhysicalSlot re-checks the predicate
+		// atomically anyway.
+		cur, present := have[name]
+		dead := present && cur.Invalidated() && !cur.Active
+		if present && !dead {
 			continue
 		}
 		if err := a.prober.CreatePhysicalSlot(ctx, self, name); err != nil {
 			a.log.Warn("create replication slot", "slot", name, "err", err)
+			continue
+		}
+		if dead {
+			a.log.Info("recycled an invalidated replication slot for a live standby", "slot", name)
 			continue
 		}
 		a.log.Info("created replication slot for an expected standby", "slot", name)

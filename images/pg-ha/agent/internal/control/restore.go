@@ -40,7 +40,7 @@ func (s *Server) featureGate(verb Verb, next http.HandlerFunc) http.HandlerFunc 
 		// the invariant (and the denied audit line + rejection counter that come with it)
 		// while keeping the deliberate 501-before-403 behaviour for a client that IS
 		// authorized and merely hit a release with the feature off.
-		if len(s.o.AllowedCNs) > 0 && !containsFold(s.o.AllowedCNs, identityFrom(r.Context()).CN) {
+		if !s.generallyAllowed(identityFrom(r.Context())) {
 			next(w, r)
 			return
 		}

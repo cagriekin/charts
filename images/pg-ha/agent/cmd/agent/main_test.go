@@ -2847,6 +2847,35 @@ func TestReconcileSlotsStillPreCreatesWithoutCascade(t *testing.T) {
 	}
 }
 
+// An INVALIDATED slot for a live standby must be recycled by the primary's create pass
+// (#298 review). It IS a slot, so a bare presence check skipped the create -- and nothing
+// else on the primary reclaims it, because orphanSlot deliberately keeps any slot whose
+// ordinal still has a live pod. The dead reservation stood forever with the invalidated
+// gauge and its alert latched, when one statement (drop, then create) repairs it.
+func TestReconcileSlotsRecyclesAnInvalidatedSlotForALiveStandby(t *testing.T) {
+	ex := &slotExec{}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	observed := []pg.SlotState{{Name: "pg_ha_slot_1", Active: false, WALStatus: "lost"}}
+	a.reconcileSlots(context.Background(), observed)
+	if len(ex.created) != 1 || ex.created[0] != "pg_ha_slot_1" {
+		t.Errorf("created = %v, want [pg_ha_slot_1] recycled", ex.created)
+	}
+}
+
+// ... but only when nothing holds it. An invalidated slot that is still active is left to
+// its holder; the drop predicate inside the create statement is the atomic backstop.
+func TestReconcileSlotsLeavesAnActiveInvalidatedSlotAlone(t *testing.T) {
+	ex := &slotExec{}
+	a := newSlotTestAgent(t, ex, config.MechanismNative)
+	a.cfg.NodeCount = 2
+	observed := []pg.SlotState{{Name: "pg_ha_slot_1", Active: true, WALStatus: "lost"}}
+	a.reconcileSlots(context.Background(), observed)
+	if len(ex.created) != 0 {
+		t.Errorf("created = %v, want none: the slot is held", ex.created)
+	}
+}
+
 func TestStandbyReclaimIsCascadeAware(t *testing.T) {
 	// Without cascade a standby cannot be anyone's upstream, so every agent-minted slot found
 	// locally is a leftover. With cascade on, its children's slots live here and must survive

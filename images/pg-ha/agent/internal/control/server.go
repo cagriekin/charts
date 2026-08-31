@@ -347,7 +347,7 @@ func (s *Server) authnMW(next http.Handler) http.Handler {
 // restore but not generally is refused by the general list -- and a bare "not on the
 // allowlist" would send the operator to edit the wrong one.
 func (s *Server) allowed(id Identity, verb Verb) (bool, string) {
-	if len(s.o.AllowedCNs) > 0 && !containsFold(s.o.AllowedCNs, id.CN) {
+	if !s.generallyAllowed(id) {
 		return false, "the client certificate CN is not on ha.agent.control.allowedClientCNs, which gates every control route"
 	}
 	if verb == VerbRestore {
@@ -358,6 +358,18 @@ func (s *Server) allowed(id Identity, verb Verb) (bool, string) {
 		}
 	}
 	return true, ""
+}
+
+// generallyAllowed is the GENERAL allowlist decision on its own: an empty list is no
+// general restriction, a non-empty one admits only the CNs on it.
+//
+// Factored out because featureGate has to make the same judgement from OUTSIDE guard
+// (#298 review) -- it answers 501 before guard's 403 for the restore routes, and must not
+// do that for a CN the general list refuses. Two copies of the predicate would drift the
+// moment either side's rule changes, and the drift would be a silent authorization hole
+// on the three most destructive routes.
+func (s *Server) generallyAllowed(id Identity) bool {
+	return len(s.o.AllowedCNs) == 0 || containsFold(s.o.AllowedCNs, id.CN)
 }
 
 func containsFold(list []string, v string) bool {

@@ -206,6 +206,31 @@ func TestSystemIdentifierAcceptsTheSignedRenderingOfAHighBitID(t *testing.T) {
 	}
 }
 
+// ...and the mirror image, which the ParseUint->ParseInt switch alone would have broken
+// (#298 review): the SAME high-bit identifier rendered UNSIGNED -- what pg_controldata prints,
+// and what any future unsigned-typed exposure would print -- must parse too. Fail either half of
+// the 64-bit range and ok comes back false, which assertSameCluster treats as "no opinion" and
+// waves through: invariant 9 stops refusing a misrouted pod from a different cluster.
+func TestSystemIdentifierAcceptsTheUnsignedRenderingOfAHighBitID(t *testing.T) {
+	const unsigned = "11572744073709551616" // > MaxInt64, the same bits as -6874000000000000000
+	const want = uint64(11572744073709551616)
+	p := proberWith(fakeExec{sysID: unsigned})
+	id, ok, err := p.SystemIdentifier(context.Background(), ConnInfo{Host: "pod-1"})
+	if err != nil || !ok {
+		t.Fatalf("an unsigned high-bit system_identifier must parse: ok=%v err=%v", ok, err)
+	}
+	if id != want {
+		t.Errorf("id = %d, want %d", id, want)
+	}
+	// Both renderings must land on the same 64 bits, or a peer and the local node disagree
+	// about being the same cluster depending only on which side reported the value.
+	ps := proberWith(fakeExec{sysID: "-6874000000000000000"})
+	signedID, _, _ := ps.SystemIdentifier(context.Background(), ConnInfo{Host: "pod-1"})
+	if signedID != id {
+		t.Errorf("the signed and unsigned renderings must agree: %d != %d", signedID, id)
+	}
+}
+
 func TestSystemIdentifierUnparseable(t *testing.T) {
 	p := proberWith(fakeExec{sysID: "not-a-number"})
 	if _, ok, err := p.SystemIdentifier(context.Background(), ConnInfo{Host: "x"}); ok || err != nil {
