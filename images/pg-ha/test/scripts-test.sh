@@ -39,19 +39,30 @@ fi
 # The password-bearing CREATE/ALTER USER go in on STDIN now (#298 security review), so the
 # SET and the CREATE share a heredoc rather than one -c string. Each heredoc opens with the
 # SET, so grep a few lines of context from the opener and assert both appear together.
-scram_block=$(grep -A3 'psql -U postgres -d postgres 2>/dev/null <<SQL' "${ROOT}/entrypoint.sh")
-if printf '%s' "${scram_block}" | grep -q "password_encryption='scram-sha-256'" \
-   && printf '%s' "${scram_block}" | grep -qE 'CREATE USER "\$\{repmgr_user_id\}"'; then
-  ok "entrypoint.sh creates the repmgr user with a SCRAM secret"
-else
-  bad "entrypoint.sh creates the repmgr user with a SCRAM secret"
-fi
-if printf '%s' "${scram_block}" | grep -q "password_encryption='scram-sha-256'" \
-   && printf '%s' "${scram_block}" | grep -qE 'CREATE USER "\$\{pg_user_id\}"'; then
-  ok "entrypoint.sh creates the postgres user with a SCRAM secret"
-else
-  bad "entrypoint.sh creates the postgres user with a SCRAM secret"
-fi
+# Each heredoc is extracted SEPARATELY (#298 review). A single `grep -A3` on the opener
+# concatenated BOTH heredocs, so the two facts under test -- "the SET is present" and "this
+# role's CREATE USER is present" -- could come from different blocks: deleting the SET from
+# only the repmgr heredoc left the assertion named for the repmgr user green, because the
+# postgres heredoc supplied it. Proven by mutation in both directions. The property that
+# matters is per-role (password_encryption is a SESSION setting), so the test has to be too.
+heredoc_containing() {
+  awk -v want="$1" '
+    /<<SQL/ { inb = 1; blk = ""; next }
+    inb && /^SQL$/ { if (index(blk, want)) printf "%s", blk; inb = 0; blk = ""; next }
+    inb { blk = blk $0 "\n" }
+  ' "${ROOT}/entrypoint.sh"
+}
+for _role_pair in 'repmgr:repmgr_user_id' 'postgres:pg_user_id'; do
+  _role="${_role_pair%%:*}"
+  _idvar="${_role_pair#*:}"
+  _blk=$(heredoc_containing "CREATE USER \"\${${_idvar}}\"")
+  if [ -n "${_blk}" ] && printf '%s' "${_blk}" | grep -q "password_encryption='scram-sha-256'"; then
+    ok "entrypoint.sh creates the ${_role} user with a SCRAM secret (SET in its OWN heredoc)"
+  else
+    bad "entrypoint.sh creates the ${_role} user with a SCRAM secret (SET in its OWN heredoc)" \
+      "the ${_role} heredoc must carry its own SET password_encryption; a session setting from the other heredoc does not apply to it"
+  fi
+done
 # The passwords must NOT be on a psql argv (#298 security review): a `-c "... PASSWORD ..."`
 # leaks them via /proc/<pid>/cmdline. Assert no CREATE/ALTER USER carries PASSWORD on a -c line.
 if grep -E 'psql .*-c .*(CREATE|ALTER) USER' "${ROOT}/entrypoint.sh" | grep -q 'PASSWORD'; then
@@ -252,7 +263,14 @@ fi
 # exec and not beating /healthz) and the directory must be discarded. That inference only holds
 # if the sentinel is written after the LAST thing the bootstrap does, so a half-bootstrapped
 # directory can never carry it.
-sentinel_line=$(grep -n 'pg-ha-bootstrap-complete' "${ROOT}/entrypoint.sh" | head -1 | cut -d: -f1)
+# Anchored to the WRITE, not to the literal anywhere (#298 review). The sentinel name appears
+# TWICE in entrypoint.sh -- the write here, and a READ in bootstrap_or_discard_torn -- and an
+# unanchored `grep | head -1` fell through to the read when the write was deleted. Both
+# assertions below then passed (the read is also below `last_step`) while nothing wrote a
+# sentinel at all. Proven by mutation: deleting the write left this suite green, and the
+# consequence is that the agent's discardTornInitdb -- marker present, sentinel absent -- wipes
+# a healthy freshly-bootstrapped PGDATA on the next boot.
+sentinel_line=$(grep -nE '^[[:space:]]*: > "\$PGDATA/\.pg-ha-bootstrap-complete"' "${ROOT}/entrypoint.sh" | head -1 | cut -d: -f1)
 if [ -z "$sentinel_line" ]; then
   bad "#288: bootstrap_initdb writes no completion sentinel (the agent cannot tell a torn bootstrap from a finished one)"
 else

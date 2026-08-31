@@ -628,6 +628,20 @@
 
 ### Testing
 
+- **Two more image-suite assertions were vacuous, both mutation-proven (#298 review).** The
+  completion-sentinel check searched for the sentinel's NAME anywhere in `entrypoint.sh`, and that
+  name appears twice -- the write in `bootstrap_initdb` and a read in `bootstrap_or_discard_torn`.
+  With the write deleted, `grep | head -1` fell through to the read, which is also below the
+  bootstrap's last step, so *both* assertions passed while nothing wrote a sentinel at all. The
+  consequence of the regression it was meant to catch: the agent's torn-bootstrap discard keys on
+  marker-present plus sentinel-absent, so it would wipe a healthy freshly-bootstrapped data
+  directory on the next boot. The grep is now anchored to the write itself. Separately, the SCRAM
+  check pulled three lines of context from *each* `psql` heredoc opener and concatenated them, so
+  "the SET is present" and "this role's CREATE USER is present" could come from different blocks:
+  removing `SET password_encryption` from only the repmgr heredoc left the assertion named for the
+  repmgr user green, because the postgres heredoc supplied it. `password_encryption` is a SESSION
+  setting, so the property is per-role and the test now extracts each heredoc separately.
+
 - **Two assertion helpers were silently vacuous, in all three charts' shell suites (#298
   review).** `assert_contains` / `assert_not_contains` passed the needle to `grep -q` without a
   `--` terminator, so any needle beginning with a dash was parsed as an OPTION: grep matched
