@@ -214,19 +214,40 @@ func (p *Prober) StandbyReceiveLSN(ctx context.Context, ci ConnInfo) (recv LSN, 
 // control file at the new timeline), but exposed once pg_rewind rejoin works (#178):
 // the rewound node streams the new timeline while its checkpoint timeline lags.
 //
-// min_recovery_end_timeline is the timeline of the furthest WAL the standby has
-// durably received/flushed during recovery; it advances as the standby replays the
-// timeline switch -- ahead of the checkpoint -- and, crucially, PERSISTS in the
-// control file after the upstream dies (unlike pg_stat_wal_receiver.received_tli, which
-// vanishes the instant the walreceiver disconnects -- i.e. exactly at the failover
-// moment when promotion is decided). So GREATEST gives the node's true current
-// timeline even mid-failover; whether it has all committed WAL is the separate
-// LSN/most-advanced-replica check, not this timeline-staleness gate. The recovery
-// timeline is NULL/0 outside recovery (COALESCE -> 0, GREATEST falls back to the
-// checkpoint timeline). Both are decimal (like pg_controldata, NOT the hex WAL-file
-// timeline), parsed base 10.
+// min_recovery_end_timeline PERSISTS in the control file after the upstream dies, which
+// pg_stat_wal_receiver.received_tli does not -- that row vanishes the instant the
+// walreceiver disconnects, i.e. exactly at the failover moment when promotion is decided.
+// That is why it is in here.
+//
+// It does NOT, however, advance when the standby replays the timeline switch, which an
+// earlier version of this comment claimed and the KinD control suite disproved (the first
+// live run of this code, 2026-08-31). On a demoted node that had followed a switchover and
+// was streaming the new timeline -- pg_stat_wal_receiver.received_tli = 3, and the primary
+// listing it as streaming -- BOTH control-file values still read 2, and both jumped to 3
+// only when a CHECKPOINT (restartpoint) was forced. So the two of them together still lag
+// by up to checkpoint_timeout (5 minutes on chart defaults), and the GREATEST bought
+// nothing in the very case the paragraph above says it exists for.
+//
+// received_tli is therefore the THIRD input, and it belongs in a GREATEST specifically
+// because a max can only ever RAISE the answer: when the walreceiver is gone the term is
+// NULL -> 0 and the two persistent sources decide, exactly as before. What it fixes is a
+// healthy streaming standby being reported on a stale timeline for minutes -- which made
+// /v1/cluster misreport a live member, and let Decide compute `newer != nil` against a node
+// that was in fact on the newer timeline (observed once as a RejoinForward on a node that
+// needed no rejoin). Whether the node holds all committed WAL is the separate
+// LSN/most-advanced-replica check, not this timeline-staleness gate -- so raising the
+// timeline here does not loosen the highwater guard, which compares positions.
+//
+// The recovery timeline is NULL/0 outside recovery (COALESCE -> 0, GREATEST falls back to
+// the checkpoint timeline). All three are decimal (like pg_controldata, NOT the hex
+// WAL-file timeline), parsed base 10. pg_stat_wal_receiver's rows are visible only to
+// superusers and pg_read_all_stats members; the agent connects as REPMGR_USER, which the
+// bootstrap creates WITH SUPERUSER.
 func (p *Prober) StandbyTimeline(ctx context.Context, ci ConnInfo) (tl Timeline, ok bool, err error) {
-	out, err := p.psql(ctx, ci, "SELECT GREATEST((SELECT timeline_id FROM pg_control_checkpoint()), COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0));")
+	out, err := p.psql(ctx, ci, "SELECT GREATEST("+
+		"(SELECT timeline_id FROM pg_control_checkpoint()), "+
+		"COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0), "+
+		"COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0));")
 	if err != nil {
 		return 0, false, err
 	}

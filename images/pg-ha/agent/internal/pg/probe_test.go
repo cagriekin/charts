@@ -98,28 +98,41 @@ func (e *sqlCaptureExec) Run(_ context.Context, _ []string, _ string, args ...st
 	return e.ret, nil
 }
 
-// StandbyTimeline must read the recovery-end timeline
-// (pg_control_recovery.min_recovery_end_timeline) GREATEST'd with the checkpoint
-// timeline -- a standby that has followed a new timeline by streaming but not yet
-// checkpointed reports the new timeline, and that signal PERSISTS in the control file
-// after the upstream dies (unlike pg_stat_wal_receiver, which vanishes at the failover
-// moment), so the #125 highwater guard does not reject a caught-up standby after a
-// pg_rewind rejoin (#178). Guards against reverting to the bare control-file read or
-// to the transient walreceiver field.
-func TestStandbyTimelineUsesRecoveryTimeline(t *testing.T) {
+// StandbyTimeline must GREATEST all THREE timeline sources.
+//
+// The two control-file sources persist after the upstream dies -- pg_stat_wal_receiver's row
+// vanishes the instant the walreceiver disconnects, i.e. exactly at the failover moment when
+// promotion is decided -- so neither may be dropped, or the #125 highwater guard rejects a
+// caught-up standby after a pg_rewind rejoin (#178).
+//
+// But they are not sufficient either, which the first live KinD run of this code disproved
+// (2026-08-31): on a demoted node streaming the new timeline after a switchover, BOTH read the
+// OLD timeline until a restartpoint, i.e. for up to checkpoint_timeout. received_tli is the
+// third input for that, and it is safe in a GREATEST precisely because a max can only raise the
+// answer -- when the row is gone the term COALESCEs to 0 and the persistent sources decide.
+//
+// This test pins all three plus the COALESCE on the transient one: dropping any source
+// reintroduces one of the two failures, and dropping the COALESCE makes the whole expression
+// NULL on a node with no walreceiver -- which is every primary.
+func TestStandbyTimelineGreatestsAllThreeSources(t *testing.T) {
 	e := &sqlCaptureExec{ret: "2"}
 	p := &Prober{Exec: e}
 	tl, ok, err := p.StandbyTimeline(context.Background(), ConnInfo{Host: "x"})
 	if err != nil || !ok || tl != 2 {
 		t.Fatalf("got tl=%d ok=%v err=%v, want 2", tl, ok, err)
 	}
-	for _, needle := range []string{"min_recovery_end_timeline", "pg_control_checkpoint", "GREATEST"} {
+	for _, needle := range []string{
+		"GREATEST",
+		"pg_control_checkpoint",
+		"min_recovery_end_timeline",
+		"received_tli",
+		// The transient source must be COALESCEd, or a primary (no walreceiver row) yields NULL
+		// and TimelineOK goes false for every primary in the cluster.
+		"COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0)",
+	} {
 		if !strings.Contains(e.lastSQL, needle) {
 			t.Errorf("StandbyTimeline query missing %q: %s", needle, e.lastSQL)
 		}
-	}
-	if strings.Contains(e.lastSQL, "pg_stat_wal_receiver") {
-		t.Errorf("StandbyTimeline must not depend on the transient pg_stat_wal_receiver: %s", e.lastSQL)
 	}
 }
 

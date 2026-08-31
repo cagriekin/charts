@@ -483,6 +483,25 @@
 
 ### Fixed
 
+- **A streaming standby is no longer reported on a stale timeline (#298, found by the KinD
+  suites).** `Prober.StandbyTimeline` took the GREATER of the control file's checkpoint timeline
+  and its `min_recovery_end_timeline`, on the stated premise that the latter "advances as the
+  standby replays the timeline switch -- ahead of the checkpoint". The first live run of this code
+  disproved that: after a controlled switchover the demoted node was healthy and streaming the
+  new timeline (`pg_stat_wal_receiver.received_tli = 3`, and the primary listing it as
+  `streaming`), while **both** control-file values still read 2 -- and both jumped to 3 only when
+  a restartpoint was forced. So the reported timeline lagged by up to `checkpoint_timeout`
+  (5 minutes on chart defaults).
+
+  Two things that cost: the control API's `/v1/cluster` misreported a live member's timeline for
+  minutes, and the reconcile decision computes "a peer is on a newer timeline" from this value --
+  observed once as a `RejoinForward` chosen against a node that was already on the newer timeline
+  and needed no rejoin, which is the needless-rewind hazard the classifier exists to avoid.
+  `received_tli` is now a third input to the same `GREATEST`, which is safe precisely because a
+  max can only raise the answer: when the walreceiver row is gone the term is 0 and the two
+  persistent sources decide, exactly as before. Whether a node holds all committed WAL remains
+  the separate LSN comparison, so this does not loosen the highwater guard.
+
 - **The bootstrap's role verification also requires the role to be able to log in (#298
   review, image).** `rolpassword IS NOT NULL` alone is not the property that matters: what the
   block is really asking is whether the agent can authenticate as the role, and a role holding a
