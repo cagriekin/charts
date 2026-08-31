@@ -220,10 +220,17 @@ SA_POD="${F3}-0"
 pod_ready() {
   kubectl get pod "$1" -n "$2" -o jsonpath='{.status.containerStatuses[?(@.name=="postgresql")].ready}' 2>/dev/null || echo ""
 }
-kubectl exec -n "${NS3}" "${SA_POD}" -c postgresql -- \
-  psql -U postgres -d postgres -c "ALTER SYSTEM SET ssl = off" >/dev/null 2>&1 || true
-kubectl exec -n "${NS3}" "${SA_POD}" -c postgresql -- \
-  psql -U postgres -d postgres -c "SELECT pg_reload_conf()" >/dev/null 2>&1 || true
+# As $POSTGRES_USER, not `postgres` (#298, found by the first live run). A standalone install's
+# superuser is whatever postgresql.username is -- `testuser` in this suite's values -- and the
+# role `postgres` does not exist at all. Both statements therefore failed with `role "postgres"
+# does not exist`, `|| true` swallowed it, ssl stayed ON, and the assertion below then failed
+# for a server that was behaving correctly. The failure is no longer swallowed: if the flip does
+# not happen there is nothing to assert, and saying so beats a red herring pointing at #335.
+if ! kubectl exec -n "${NS3}" "${SA_POD}" -c postgresql -- bash -c \
+     'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "ALTER SYSTEM SET ssl = off" \
+      && psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_reload_conf()"' >/dev/null 2>&1; then
+  fail "#335: could not turn ssl off to set up the test" "the plaintext-readiness assertion below would prove nothing"
+fi
 # periodSeconds 10 x failureThreshold 6 on chart defaults, so allow generously past 60s.
 went_notready=false; e=0
 while [[ ${e} -lt 150 ]]; do
@@ -232,10 +239,11 @@ while [[ ${e} -lt 150 ]]; do
 done
 assert_eq "#335: a server serving plaintext is taken out of the Services" "true" "${went_notready}"
 # ...and recovers on its own once TLS is back, so the gate cannot strand a repaired cluster.
+# Undone as $POSTGRES_USER for the same reason as the flip above (#298).
 kubectl exec -n "${NS3}" "${SA_POD}" -c postgresql -- \
-  psql -U postgres -d postgres -c "ALTER SYSTEM RESET ssl" >/dev/null 2>&1 || true
+  bash -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "ALTER SYSTEM RESET ssl"' >/dev/null 2>&1 || true
 kubectl exec -n "${NS3}" "${SA_POD}" -c postgresql -- \
-  psql -U postgres -d postgres -c "SELECT pg_reload_conf()" >/dev/null 2>&1 || true
+  bash -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_reload_conf()"' >/dev/null 2>&1 || true
 recovered=false; e=0
 while [[ ${e} -lt 120 ]]; do
   [[ "$(pod_ready "${SA_POD}" "${NS3}")" == "true" ]] && { recovered=true; break; }

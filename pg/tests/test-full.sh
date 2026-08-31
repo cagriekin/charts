@@ -167,10 +167,23 @@ assert_eq "exporter service port is 9116" "9116" "${exporter_port}"
 # pg_up=1 proves the exporter connected and ran a query as the pg_monitor role --
 # a plain '^pg_' match would still pass with pg_up 0 (auth failed). Grepping only
 # pg_up lines, then asserting none carry a " 0" value, confirms every target is up.
-exporter_svc="${FULLNAME}-postgres-exporter.${NAMESPACE}.svc.cluster.local"
-metrics_output=$(kubectl run "metrics-check-$(date +%s)" -n "${NAMESPACE}" --rm -i --restart=Never \
-  --image=busybox:1.37 -- wget -qO- "http://${exporter_svc}:9116/metrics" 2>/dev/null \
-  | grep '^pg_up' || echo "")
+# Scraped from a pod that is ALREADY running, over bash's /dev/tcp, rather than from a
+# throwaway `kubectl run --image=busybox` (#298, found by the first live run). That pod has to
+# pull an image the cluster may not have and may not be able to fetch; when it produced no
+# output the `2>/dev/null || echo ""` turned the reason into an empty string, so this assertion
+# failed against a perfectly healthy exporter -- and, worse, the `no pg_up 0` assertion below it
+# PASSED, because empty output trivially contains no " 0". One broken fetch, one red herring and
+# one vacuous pass. Verified by hand against this exact deployment: the exporter answers `pg_up 1`.
+exporter_svc="${FULLNAME}-postgres-exporter"
+scraper_pod=$(kubectl get pod -n "${NAMESPACE}" -l app.kubernetes.io/component=postgresql \
+  -o name 2>/dev/null | head -1 | sed 's|pod/||')
+metrics_output=$(kubectl exec -n "${NAMESPACE}" "${scraper_pod}" -c postgresql -- bash -c \
+  "exec 3<>/dev/tcp/${exporter_svc}/9116; printf 'GET /metrics HTTP/1.0\r\n\r\n' >&3; grep '^pg_up' <&3" 2>/dev/null || echo "")
+# An empty scrape means the FETCH failed, not that the exporter is unhealthy -- say which, or the
+# next assertion passes on nothing.
+if [ -z "${metrics_output}" ]; then
+  fail "exporter scrape returned nothing" "could not reach ${exporter_svc}:9116 from ${scraper_pod}; the pg_up assertions below would prove nothing"
+fi
 assert_contains "exporter returns pg_up metric" "${metrics_output}" "pg_up"
 assert_not_contains "exporter scrapes succeed as the monitoring user, no pg_up 0 (#28)" "${metrics_output}" " 0"
 
