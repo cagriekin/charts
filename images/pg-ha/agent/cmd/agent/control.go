@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/cagriekin/pg-ha-agent/internal/control"
@@ -156,14 +157,18 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 		// removed it. The marker then names an empty node, which handleReinitialize's own comment
 		// identifies as unrecoverable.
 		//
-		// Here the check IS effectively atomic, though NOT because of opMu -- runIntent does not
-		// take it. It runs in the reconcile loop's own select, i.e. the same goroutine as tick(),
-		// so no tick can interleave between this gate and the wipe and nothing can promote in
-		// between. That is also why reading a.lastMarker unsynchronised is safe here: observe()
-		// is its only writer and runs on this goroutine. The lease is read live; the marker is the
-		// loop's own last successful read (the handler already paid for a fresh one, and this asks
-		// the cheaper question of whether anything changed since). servingRW is atomic, and is the
-		// one field OnLost -- which does run elsewhere, under opMu -- can also touch.
+		// Here the check IS atomic against the promote it guards, for TWO independent reasons
+		// (#298 review, round 5 -- an earlier revision of this comment claimed runIntent does not
+		// take opMu, which is wrong: it takes it at the top of this function). First, runIntent
+		// runs in the reconcile loop's own select, i.e. the same goroutine as tick(), so no tick
+		// can interleave between this gate and the wipe and nothing can promote in between.
+		// Second, opMu is held for the whole call, which is what also excludes the OnLost fence.
+		// The goroutine argument is the one that matters here, and it is also why reading
+		// a.lastMarker unsynchronised is safe: observe() is its only writer and runs on this
+		// goroutine. The lease is read live; the marker is the loop's own last successful read
+		// (the handler already paid for a fresh one, and this asks the cheaper question of
+		// whether anything changed since). servingRW is atomic, and is the one field OnLost --
+		// which does run elsewhere, under opMu -- can also touch.
 		if a.dcs.IsLeader() {
 			return fmt.Errorf("refusing to discard %s: this node acquired the leader lease after the request was accepted, so it is now the cluster's primary (reinitialize is replica-only)", a.cfg.PGDATA)
 		}
@@ -224,6 +229,18 @@ func (a *agent) assertRestartRecoverySignal(ctx context.Context) error {
 	default:
 		a.log.Warn("control restart: primary-state data on a node that does not hold the lease; starting read-only (standby.signal) so it cannot become a second writer",
 			"node", a.cfg.PodName)
+	}
+	// SAY SO when a pgBackRest restore's recovery.signal is also present (#298 review). When
+	// both files exist PostgreSQL takes STANDBY mode -- standby.signal wins -- so the restore's
+	// recovery_target/--target-action=promote is not honoured and the node sits in recovery
+	// instead of coming up as a primary at the target. That is still the right answer here (a
+	// non-holder that promoted itself at the target would be a second writer, which is the whole
+	// point of this function), but it is the single most confusing shape an operator can hit on
+	// the documented restore-then-POST-/v1/restart path, so it must not be silent: the fix is to
+	// restart on the pod that holds the lease, which this function leaves untouched.
+	if _, serr := os.Stat(filepath.Join(a.cfg.PGDATA, "recovery.signal")); serr == nil {
+		a.log.Warn("control restart: recovery.signal is present, so this data directory came from a restore -- adding standby.signal makes PostgreSQL take STANDBY mode and the restore's recovery target will NOT promote. Restart on the pod that holds the leader lease if you meant to bring the restored data up read-write",
+			"node", a.cfg.PodName, "pgdata", a.cfg.PGDATA)
 	}
 	if err := process.SetRecoverySignal(a.cfg.PGDATA); err != nil {
 		return fmt.Errorf("control restart: assert standby.signal before starting: %w", err)

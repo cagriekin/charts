@@ -101,7 +101,9 @@ spec:
                slot gauges (the slot pass runs on the primary branches, and a demoted node
                retracts them), so max() picks the primary's view without a role label.
 
-               The FIRST alert below is the one that matters on chart defaults. The image
+               The invalidation outcome below is the one that matters on chart defaults --
+               though since the agent's invalidated-slot RECYCLE it is PGHAReplicationSlotRecycled
+               that reports it, not the gauge rule; see that rule's own comment. The image
                sets max_slot_wal_keep_size = 4GB at initdb (images/pg-ha/entrypoint.sh), so
                PostgreSQL does not let a slot fill the volume -- it INVALIDATES the slot
                instead (wal_status = 'lost'), and the standby behind it can then only recover

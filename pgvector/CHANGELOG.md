@@ -496,6 +496,16 @@
   The discrimination is now one helper, `agent.stopProvedDead`, shared by all four call sites so
   they cannot drift again. Anything that is NOT a deadline expiry is still never treated as proof.
 
+  The `ReleaseLease` and `Switchover` step-downs consult it too, for the latch only. They keep
+  ABANDONING the handoff on any demote error -- a SIGKILL'd postmaster skipped its shutdown
+  checkpoint, so promoting a peer now would drop WAL this node had written but not yet streamed,
+  while abandoning loses nothing and the node comes back on the next tick -- but a reaped kill
+  still proves the writer is gone, so `servingRW` is cleared instead of being left armed. Left
+  armed it was the same spurious fence: a `Fast`/SIGINT shutdown of a loaded primary routinely
+  outruns `renewDeadline` (10s on chart defaults), and a lease lapse before the next tick then ran
+  `OnLost`'s fence branch on a pod with nothing running, incrementing `pg_ha_agent_fences_total`
+  and paging `PGHAAgentFlapping`.
+
 - **`POST /v1/reinitialize` re-checks the replica-only gate inside the reconcile goroutine (#298
   review, agent).** `handleReinitialize` gates carefully -- a live DCS lease read, the durable
   marker, the snapshot role -- but every one of those runs on the HTTP goroutine BEFORE the intent
@@ -506,9 +516,10 @@
   `runIntent` then stopped and wiped the data directory of the cluster's **new primary**.
   `WipeDataDir`'s `postmaster.pid` interlock cannot help, because the demote immediately above
   removes it, and the highwater marker is left naming an empty node -- the unrecoverable outcome
-  the handler's own comment cites. `runIntent` holds `opMu`, so re-asserting it there is atomic
-  against the tick that promotes; the refusal precedes the stop, so a refused request touches
-  nothing.
+  the handler's own comment cites. `runIntent` runs in the reconcile loop's own `select` -- the
+  same goroutine as `tick()` -- and holds `opMu` for the whole call, so re-asserting the gate
+  there is atomic against both the tick that promotes and the `OnLost` fence; the refusal
+  precedes the stop, so a refused request touches nothing.
 
 - **The control-API restart asserts the on-disk role before starting the postmaster (#298 review,
   agent).** `sup.Start` is a bare `postgres -D PGDATA`: it neither creates nor removes

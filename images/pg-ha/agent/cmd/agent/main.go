@@ -1815,6 +1815,19 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			err := a.sup.Demote(dctx, false)
 			dcancel()
 			if err != nil {
+				// The handoff is still ABANDONED on any error -- a SIGKILL'd postmaster did
+				// not run its shutdown checkpoint, so WAL it had written but not yet streamed
+				// would be lost if a peer promoted now, and this node keeping the Lease and
+				// coming back on the next tick loses nothing. But when stopProvedDead says
+				// the child was killed AND REAPED, the read-write latch is provably wrong,
+				// and leaving it armed is the spurious-fence bug this PR fixes elsewhere: a
+				// lease lapse before the next tick would run OnLost's fence branch on a node
+				// with nothing running, incrementing pg_ha_agent_fences_total and paging
+				// PGHAAgentFlapping (#298 review).
+				if a.stopProvedDead(err) {
+					a.log.Warn("release lease: the postmaster did not exit before the demote deadline and was killed; it is reaped, so the read-write latch is cleared, but the Lease is kept until a clean step-down", "err", err)
+					a.clearServingRWForPlannedStepDown()
+				}
 				return err
 			}
 			a.clearServingRWForPlannedStepDown()
@@ -1828,6 +1841,13 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			rctx, cancel := context.WithTimeout(ctx, a.cfg.RenewDeadline)
 			defer cancel()
 			if err := a.sup.Stop(rctx, process.Immediate); err != nil {
+				// Same reading as the arm above (#298 review): a reaped SIGKILL is positive
+				// evidence the wedged writer is gone, so the latch must not stay armed even
+				// though the Lease is kept for a clean step-down.
+				if a.stopProvedDead(err) {
+					a.log.Warn("release lease: the wedged postmaster was killed and reaped, so the read-write latch is cleared", "err", err)
+					a.clearServingRWForPlannedStepDown()
+				}
 				return err
 			}
 			a.clearServingRWForPlannedStepDown()
@@ -1878,6 +1898,16 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 			err := a.sup.Demote(dctx, false)
 			dcancel()
 			if err != nil {
+				// Abandoned on any error, for the reason above -- a killed postmaster
+				// skipped its shutdown checkpoint, so promoting the target now would
+				// drop WAL this node had written but not yet streamed, while abandoning
+				// loses nothing. A REAPED kill still proves the writer is gone, though,
+				// so the latch is cleared rather than left to arm a spurious fence on
+				// the next lease lapse (#298 review).
+				if a.stopProvedDead(err) {
+					a.log.Warn("switchover: the postmaster did not exit before the demote deadline and was killed; it is reaped, so the read-write latch is cleared, but the handoff is abandoned and must be re-requested", "err", err)
+					a.clearServingRWForPlannedStepDown()
+				}
 				return err
 			}
 			// Same as ReleaseLease, and inside the guard for the same reason: only a

@@ -745,6 +745,49 @@ func TestActReleaseLeaseLeavesStandbyRunning(t *testing.T) {
 	}
 }
 
+// A step-down whose demote was killed AND REAPED still clears the read-write latch (#298
+// review). The handoff is deliberately abandoned -- a SIGKILL'd postmaster skipped its
+// shutdown checkpoint, so promoting a peer now would drop WAL this node had written but not
+// yet streamed -- but the writer is provably gone, and leaving servingRW armed is the
+// spurious-fence bug the rest of this change removes: a lease lapse before the next tick
+// would take OnLost's fence branch on a node with nothing running, incrementing
+// pg_ha_agent_fences_total and paging PGHAAgentFlapping. A Fast/SIGINT shutdown of a large
+// busy database routinely outruns renewDeadline (10s on chart defaults), so this is the
+// ordinary switchover of a loaded primary, not an exotic case.
+func TestActReleaseLeaseClearsTheLatchWhenTheKilledDemoteWasReaped(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		stopErr    error
+		deadOnStop bool
+		wantLatch  bool
+	}{
+		{"killed and reaped: the writer is provably gone", context.DeadlineExceeded, true, false},
+		// The wedged-PV arm: SIGKILL was undeliverable, the child is still supervised, so the
+		// latch MUST stay armed or the next lease loss skips the fence on the one node that
+		// needs it.
+		{"still supervised: no proof, keep the latch", fmt.Errorf("leaving it supervised: %w", context.DeadlineExceeded), false, true},
+		{"not a deadline expiry: never proof", errors.New("signal: operation not permitted"), false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pm := &fakePostmaster{running: true, stopErr: tc.stopErr, deadOnStop: tc.deadOnStop}
+			d := &fakeDCS{}
+			a := newTestAgent(t, pm, d)
+			a.servingRW.Store(true)
+			obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: true}, LocalProcessAlive: true}
+			if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.ReleaseLease}, obs); err == nil {
+				t.Fatal("a failed demote must still surface as an error: the handoff is abandoned")
+			}
+			if got := a.servingRW.Load(); got != tc.wantLatch {
+				t.Errorf("servingRW = %v, want %v", got, tc.wantLatch)
+			}
+			// The Lease is kept either way: releasing it is what a CLEAN step-down earns.
+			if d.released {
+				t.Error("the Lease must not be released when the demote did not complete cleanly")
+			}
+		})
+	}
+}
+
 // #298 review: a read-write observation that a demote OVERTOOK must be discarded. tick()
 // samples the role with observe() -- multi-second and network-bound -- and stores the derived
 // value outside opMu, while OnLost demotes under opMu and clears the latch. So a tick that saw a

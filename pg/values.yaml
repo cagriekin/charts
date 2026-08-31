@@ -653,7 +653,11 @@ ha:
         # only recover by a full re-clone, and (verified on PostgreSQL 18) invalidation nulls
         # restart_lsn so this very gauge collapses to zero at that moment. So this rule is
         # the EARLY WARNING and its threshold must sit BELOW 4GB to be reachable at all;
-        # PGHAReplicationSlotInvalidated is what catches the outcome. An earlier default of
+        # PGHAReplicationSlotRecycled is what catches the outcome on defaults (the agent
+        # drops and re-creates such a slot on the same tick, so the invalidated GAUGE is
+        # never up long enough for PGHAReplicationSlotInvalidated's `for: 5m` -- that rule
+        # is left for the slots the agent does not recycle: an ACTIVE one, an ordinal with
+        # no live pod, or any slot at all under cascadingReplication). An earlier default of
         # 16Gi could never fire (and also exceeded the default 10Gi data volume) -- an alert
         # that cannot fire reads as coverage while providing none. Raise this only if you
         # also raise max_slot_wal_keep_size via postgresql.configuration.
