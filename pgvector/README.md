@@ -251,7 +251,7 @@ When `ha.enabled` is true there are **no HA sidecars**:
 
 **PostgreSQL 18 is the default. PostgreSQL 17 is selectable.** With `ha.enabled` the server binaries come from the HA image (shared with the `pg` chart), so the major is decided by which HA image you run — `postgresql.image` has no effect on the running server. Since 2.0.0 (#290) the major is always **in** the tag — `2.0.0-pg18` / `2.0.0-pg17`, with no unsuffixed alias; both are multi-arch, attested and cosign-signed.
 
-Four values move together, and the chart refuses to render if the two majors disagree in either direction:
+These values move together, and the chart refuses to render if the two majors disagree in either direction:
 
 ```yaml
 postgresql:

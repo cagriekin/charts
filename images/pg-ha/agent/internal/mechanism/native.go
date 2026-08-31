@@ -720,18 +720,20 @@ func (n *Native) RejoinForceRewind(ctx context.Context, target Conn) (rerr error
 	if isRewindDivergence(out) {
 		return fmt.Errorf("%w: native: pg_rewind onto %s: %v: %s", ErrRewindDiverged, target.Host, err, strings.TrimSpace(out))
 	}
-	if isConnectionFailure(out) {
+	if isConnectionFailure(out) || isSourceRejection(out) {
 		// Transient: the caller retries next tick. Reporting ErrRewindDiverged here would
 		// trigger a needless full re-clone of a node whose history is probably fine (#178).
 		//
 		// Tagged ErrRewindUnreachable rather than left a plain error (#298 review). The
 		// classification was computed here and then thrown away -- only the message differed --
-		// so rejoinOnto counted a connection refusal toward rewindFailureLimit like any other
-		// non-divergence failure: three ticks (~15s on chart defaults) of "could not connect"
-		// against a target at max_connections, or with a rotated credential, escalated a
-		// healthy non-diverged standby to ReclonePreserving. See the sentinel's own comment for
-		// why escalating on THIS class converges on nothing.
-		return fmt.Errorf("%w: native: pg_rewind onto %s: could not connect (transient, not divergence): %w: %s",
+		// so rejoinOnto counted it toward rewindFailureLimit like any other non-divergence
+		// failure: three ticks (~15s on chart defaults) of a postmaster that was restarting, a
+		// pod name that had not propagated, a source at max_connections or a missing pg_hba
+		// entry escalated a healthy non-diverged standby to ReclonePreserving. Both classes --
+		// the transport never connected, or the source connected and then refused us -- are
+		// unreachability for this purpose: see the sentinel and isSourceRejection for why
+		// escalating on either converges on nothing.
+		return fmt.Errorf("%w: native: pg_rewind onto %s: could not obtain a usable connection to the source (not divergence): %w: %s",
 			ErrRewindUnreachable, target.Host, err, strings.TrimSpace(out))
 	}
 	// Anything else is NOT divergence either, and the DEFAULT matters more than either list.
@@ -832,6 +834,45 @@ func isConnectionFailure(out string) bool {
 		"network is unreachable", // ENETUNREACH: routing down, not divergence
 		"server closed the connection unexpectedly",
 		"terminating connection due to administrator command",
+	} {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSourceRejection reports that the SOURCE accepted the TCP connection and then refused the
+// session: the rewind never got to look at either history.
+//
+// Split from isConnectionFailure but treated identically by the caller (#298 review), because
+// the question that decides escalation is not "is this transient" -- it is "would
+// ReclonePreserving fix it". A re-clone dials THE SAME source with THE SAME credentials through
+// THE SAME pg_hba, so every rejection below refuses the pg_basebackup exactly as it refused the
+// rewind. Escalating buys a PGDATA rename, a failed base backup, and an unreaped
+// `.diverged.<ts>` copy on the PVC -- and still no rejoin.
+//
+// That is why permanence is not the criterion. `no pg_hba.conf entry` and a rotated credential
+// are permanent until an operator acts, and escalating on them is STILL pointless; whereas the
+// conditions the backstop legitimately converges are the ones on the TARGET side -- `target
+// server must be shut down cleanly`, `wal_log_hints`, `target server needs to exit backup mode`
+// -- because a re-clone replaces the local directory those describe. Those deliberately fall
+// through to the default branch and keep counting toward rewindFailureLimit.
+//
+// Retrying is visible, not silent: rejoinOnto returns the error every tick, so it increments
+// pg_ha_agent_reconcile_errors_total and logs the server's own words -- which names the fix
+// (raise max_connections, add the pg_hba entry, wait for the promote to finish) far better than
+// a multi-hour re-clone that cannot succeed.
+func isSourceRejection(out string) bool {
+	s := strings.ToLower(out)
+	for _, m := range []string{
+		"sorry, too many clients already",
+		"the database system is starting up",
+		"the database system is shutting down",
+		"the database system is in recovery mode",
+		"no pg_hba.conf entry",
+		"password authentication failed",
+		"authentication failed for user",
 	} {
 		if strings.Contains(s, m) {
 			return true

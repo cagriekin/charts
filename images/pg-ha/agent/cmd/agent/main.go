@@ -3161,8 +3161,10 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 			// converges on nothing, because ReclonePreserving dials the same target with the
 			// same credentials and fails the same way -- after renaming PGDATA aside and
 			// leaving an unreaped .diverged.<ts> copy behind. Counting it turned three ticks
-			// (~15s on chart defaults) of a target at max_connections, or a rotated
-			// credential, into a multi-hour base backup of a standby whose history was fine.
+			// (~15s on chart defaults) of a restarting target -- or one whose pod name had not
+			// propagated yet -- into a multi-hour base backup of a standby whose history was
+			// fine. (A target that ACCEPTS the connection and then rejects it -- too many
+			// clients, no pg_hba entry -- is not this class and still counts; see the sentinel.)
 			// The streak is left ALONE rather than reset: an unreachable tick is no evidence
 			// about a genuine local refusal that was already accumulating against this target.
 			return err

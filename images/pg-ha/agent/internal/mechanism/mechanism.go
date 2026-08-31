@@ -29,9 +29,23 @@ var ErrRewindDiverged = errors.New("mechanism: rewind diverged, reclone required
 // converges on NOTHING: ReclonePreserving connects to the same target with the same
 // credentials, so it cannot succeed where the rewind just failed to connect. All the
 // escalation buys is a PGDATA rename, a failed pg_basebackup, and an unreaped
-// `.diverged.<ts>` copy on the PVC -- for a target at max_connections, a rotated credential,
-// or a primary that is still starting up. Retrying is not a stall here: the node stays a
-// stopped standby and rejoins on the first tick that can reach the target.
+// `.diverged.<ts>` copy on the PVC -- for a target whose postmaster is restarting
+// (`connection refused`), a pod name that has not propagated yet, or a connect that times out.
+// Retrying is not a stall here: the node stays a stopped standby and rejoins on the first tick
+// that can reach the target.
+//
+// Covers BOTH ways a rewind can fail before it ever looks at a history (#298 review): the
+// transport never connected (isConnectionFailure -- `connection refused`, an unresolved pod
+// name, libpq's `timeout expired`), and the source accepted the connection and then refused
+// the session (isSourceRejection -- `sorry, too many clients already`, `no pg_hba.conf entry`,
+// `the database system is starting up`, a rotated credential).
+//
+// The criterion is "would a re-clone fix it", not "is it transient". A re-clone dials the same
+// source with the same credentials through the same pg_hba, so it fails identically -- which is
+// why even the PERMANENT rejections belong here. What stays outside, and keeps counting toward
+// the backstop, are the conditions on the TARGET side (`target server must be shut down
+// cleanly`, `wal_log_hints`, `needs to exit backup mode`), because replacing the local data
+// directory is exactly what resolves those.
 var ErrRewindUnreachable = errors.New("mechanism: rewind target unreachable, retry")
 
 // Conn is how to reach a peer PostgreSQL node for clone/follow/rejoin: the address parts a

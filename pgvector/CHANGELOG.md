@@ -556,15 +556,20 @@
   before either claim, the same way the initdb path already did. The node stays marked
   read-write, so the lost-leadership fence still demotes it.
 
-- **An unreachable rewind target no longer escalates to a full re-clone (#298 review, agent).**
-  `RejoinForceRewind` classified "could not connect" as transient and then discarded the
-  classification, so three consecutive ticks -- ~15s on chart defaults -- of a target at
-  `max_connections`, a rotated credential, or a primary still starting up escalated a healthy,
+- **A rewind that cannot get a usable connection to its source no longer escalates to a full
+  re-clone (#298 review, agent).** `RejoinForceRewind` classified the failure and then discarded
+  the classification, so three consecutive ticks -- ~15s on chart defaults -- escalated a healthy,
   non-diverged standby to `ReclonePreserving`: a multi-hour base backup plus an unreaped
-  `.diverged.<ts>` copy on the PVC. Unreachability is now a distinct sentinel that is exempt from
-  the backstop, because a re-clone dials the same target with the same credentials and cannot
-  succeed where the rewind just failed to connect. A genuinely local, permanent refusal still
-  escalates after its three ticks.
+  `.diverged.<ts>` copy on the PVC. Both ways a rewind can fail before it ever examines a history
+  are now exempt from that backstop: the transport never connected (`connection refused`, an
+  unresolved pod name, libpq's `timeout expired`), and the source accepted the connection then
+  refused the session (`sorry, too many clients already`, `the database system is starting up`, a
+  missing `pg_hba.conf` entry, a rotated credential). The criterion is whether a re-clone would
+  fix it, not whether the failure is transient -- a re-clone dials the same source with the same
+  credentials through the same `pg_hba`, so it fails identically, which is why even the permanent
+  rejections belong here. Refusals on the TARGET side (`target server must be shut down cleanly`,
+  `wal_log_hints`, `needs to exit backup mode`) still count toward the backstop, because replacing
+  the local data directory is exactly what resolves those.
 
 - **Four smaller agent fixes (#298 review).** A restart that could not prove the postmaster is
   dead now reports an error instead of `nil` -- on a wedged PV, `Stop` deliberately leaves the

@@ -1341,8 +1341,6 @@ func TestSlotsTickMutatesNothingWhenTheSlotListFails(t *testing.T) {
 	}
 }
 
-// newSlotTestAgent wires a real Prober over ex plus a fake apiserver holding pods 0 and 1,
-// so the live-pod-set half of the reconcile is exercised rather than stubbed.
 // #298 review: a promote that outlives the lease must not claim the routing. `pg_ctl -w
 // promote` is bounded only by PGCTLTIMEOUT (60s) while the default LeaseDuration is 15s, so on
 // the ordinary failover case -- a standby with a large unreplayed backlog -- the lease can lapse
@@ -1394,6 +1392,8 @@ func TestActPromoteDoesNotClaimRoutingAfterLosingTheLease(t *testing.T) {
 	}
 }
 
+// newSlotTestAgent wires a real Prober over ex plus a fake apiserver holding pods 0 and 1,
+// so the live-pod-set half of the reconcile is exercised rather than stubbed.
 func newSlotTestAgent(t *testing.T, ex *slotExec, mech string) *agent {
 	t.Helper()
 	cs := k8sfake.NewSimpleClientset(
@@ -3225,8 +3225,8 @@ func TestRejoinRewindBackstopResetsAfterASuccess(t *testing.T) {
 // #298 review: an UNREACHABLE target is exempt from the backstop entirely. Escalating on it
 // converges on nothing -- ReclonePreserving dials the same target with the same credentials, so
 // it fails where the rewind just failed to connect, after renaming PGDATA aside and leaving an
-// unreaped .diverged.<ts> copy on the PVC. Ten ticks of "could not connect" (a target at
-// max_connections, a rotated credential, a primary still starting up) must re-clone zero times.
+// unreaped .diverged.<ts> copy on the PVC. Ten ticks of "could not connect" (a postmaster
+// restarting, a pod name not yet propagated, a connect that times out) must re-clone zero times.
 func TestRejoinRewindBackstopExemptsAnUnreachableTarget(t *testing.T) {
 	unreachable := fmt.Errorf("%w: could not connect to server: Connection refused", mechanism.ErrRewindUnreachable)
 	errs := make([]error, 10)

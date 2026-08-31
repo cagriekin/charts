@@ -254,8 +254,65 @@ func TestNativeRejoinForceRewindTreatsLibpqTimeoutAsTransient(t *testing.T) {
 	if errors.Is(err, ErrRewindDiverged) {
 		t.Errorf("a libpq connect timeout must not be divergence, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "transient") {
-		t.Errorf("expected the transient wording for a connect timeout, got %v", err)
+	// Asserted on the SENTINEL, not on prose (#298 review): the sentinel is what rejoinOnto
+	// actually branches on, so pinning the wording pinned the wrong thing -- it broke when the
+	// message was corrected and would have stayed green if the tag were dropped.
+	if !errors.Is(err, ErrRewindUnreachable) {
+		t.Errorf("a libpq connect timeout must be ErrRewindUnreachable so it is exempt from the reclone backstop, got %v", err)
+	}
+}
+
+// #298 review, round 4: a source that ACCEPTS the connection and then refuses the session is
+// unreachable for this purpose too. The criterion is "would a re-clone fix it", not "is it
+// transient" -- a re-clone dials the same source with the same credentials through the same
+// pg_hba, so it fails identically, after renaming PGDATA aside and leaving an unreaped
+// .diverged.<ts> copy. Three ticks (~15s on chart defaults) of a source at max_connections used
+// to escalate a healthy, non-diverged standby to a multi-hour base backup that could not
+// succeed.
+func TestNativeRejoinForceRewindTreatsSourceRejectionsAsUnreachable(t *testing.T) {
+	for _, out := range []string{
+		"pg_rewind: error: FATAL:  sorry, too many clients already",
+		"pg_rewind: error: FATAL:  the database system is starting up",
+		"pg_rewind: error: FATAL:  the database system is shutting down",
+		"pg_rewind: error: no pg_hba.conf entry for host \"10.1.2.3\", user \"repmgr\"",
+		"pg_rewind: error: FATAL:  password authentication failed for user \"repmgr\"",
+	} {
+		fr := &fakeRunner{failOn: "--restore-target-wal", failOut: out}
+		n, _ := newTestNative(t, fr)
+		err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.h", User: "repmgr", DB: "repmgr"})
+		if err == nil {
+			t.Fatalf("expected an error for %q", out)
+		}
+		if errors.Is(err, ErrRewindDiverged) {
+			t.Errorf("a source-side rejection is not divergence: %q -> %v", out, err)
+		}
+		if !errors.Is(err, ErrRewindUnreachable) {
+			t.Errorf("a source-side rejection must be exempt from the reclone backstop: %q -> %v", out, err)
+		}
+	}
+}
+
+// ...while a TARGET-side refusal is exactly what the backstop is for: a re-clone replaces the
+// local data directory these describe, so it genuinely converges. These must NOT carry the
+// exemption, or a permanent local misconfiguration would retry forever.
+func TestNativeRejoinForceRewindKeepsTargetSideRefusalsInTheBackstop(t *testing.T) {
+	for _, out := range []string{
+		"pg_rewind: error: target server must be shut down cleanly",
+		"pg_rewind: error: target server needs to use either data checksums or \"wal_log_hints = on\"",
+		"pg_rewind: error: target server needs to exit backup mode",
+	} {
+		fr := &fakeRunner{failOn: "--restore-target-wal", failOut: out}
+		n, _ := newTestNative(t, fr)
+		err := n.RejoinForceRewind(context.Background(), Conn{Host: "pg-0.h", User: "repmgr", DB: "repmgr"})
+		if err == nil {
+			t.Fatalf("expected an error for %q", out)
+		}
+		if errors.Is(err, ErrRewindDiverged) {
+			t.Errorf("still not divergence -- the data directory must not be moved for this: %q -> %v", out, err)
+		}
+		if errors.Is(err, ErrRewindUnreachable) {
+			t.Errorf("a target-side refusal must keep counting toward the backstop, which a re-clone does resolve: %q -> %v", out, err)
+		}
 	}
 }
 

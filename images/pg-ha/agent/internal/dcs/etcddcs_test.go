@@ -214,9 +214,6 @@ func TestEtcdTLSConfigBuildsAMutualTLSConfig(t *testing.T) {
 	}
 }
 
-// A fresh EtcdDCS holds no leadership and names no leader. Leader() in particular must
-// return "" rather than panic on the un-stored atomic.Value -- observe() publishes into
-// it asynchronously, so the accessor is read before the first write on every boot.
 // #298 review: the revoke rule has two opposite failure modes and this branch shipped each of
 // them once. Revoking after a FAILED fence demote hands a peer immediate permission to promote
 // beside a postmaster that may still be read-write. Withholding the revoke from a session that
@@ -251,6 +248,9 @@ func TestShouldRevokeElectionKey(t *testing.T) {
 	}
 }
 
+// A fresh EtcdDCS holds no leadership and names no leader. Leader() in particular must
+// return "" rather than panic on the un-stored atomic.Value -- observe() publishes into
+// it asynchronously, so the accessor is read before the first write on every boot.
 func TestEtcdDCSAccessorsBeforeAnyElection(t *testing.T) {
 	e := &EtcdDCS{}
 	if e.IsLeader() {

@@ -274,8 +274,19 @@ func (k *K8sDCS) releaseLease(lock *resourcelock.LeaseLock, identity string, cb 
 	// logged this alarming warning about a Lease a peer had held all along, in the middle of
 	// the incident where the log is being read. Same reason etcd's releaseSession gates its
 	// veto on heldLeadership.
+	//
+	// "HELD" is not "handed off a LeaseDuration later" while this agent lives, and the warning
+	// says so rather than promising an expiry that will not happen (#298 review, round 4).
+	// client-go lets the RECORDED holder re-acquire without waiting out the expiry --
+	// tryAcquireOrRenew's "held and not yet expired" guard is skipped when the fetched record
+	// already names us -- so the next loop iteration (one RetryPeriod away, or one
+	// StepDownCooldown after a Release) wins this same Lease back. That is deliberate and
+	// matches the ReleaseLease action, which likewise returns BEFORE Release() when its Stop
+	// fails: never hand off without proof the writer is dead. The TTL handoff the margin buys
+	// happens when this agent EXITS -- the shutdown path -- or once a peer's acquire beats the
+	// re-contention.
 	if cb.SafeToRelease != nil && !cb.SafeToRelease() {
-		slog.Warn("not releasing the leader Lease: this node may still be a read-write primary (the fence demote did not complete). A peer will acquire it at TTL expiry instead, which preserves the takeover margin",
+		slog.Warn("not releasing the leader Lease: this node may still be a read-write primary (the fence demote did not complete). The Lease is left held -- while this agent runs it re-acquires it as the recorded holder, and a peer takes over only once this node stops renewing (TTL expiry), which preserves the takeover margin",
 			"identity", identity)
 		return
 	}
