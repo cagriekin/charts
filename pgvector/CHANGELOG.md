@@ -470,6 +470,73 @@
 
 ### Fixed
 
+- **`postgresql.pgHba` entries no longer invert their order across pod starts (#298 review,
+  standalone).** The postStart insert was made a single awk pass so the whole list lands in the
+  operator's declared order -- which fixed the order WITHIN one batch and left it broken ACROSS
+  starts. A rule the hook inserted earlier is itself a non-loopback `host` rule sitting above the
+  original anchor, so it BECOMES the anchor; and the insert only carried the entries `grep -qF`
+  found missing. So appending a rule to `postgresql.pgHba` in a later `helm upgrade` placed it
+  ABOVE every rule declared before it. pg_hba is first-match-wins, so
+  `["host all all 10.1.0.0/16 trust", "host all all 10.1.0.0/24 reject"]` -- with the reject
+  appended later -- ended up REJECTING the /24 range the operator had trusted: the exact
+  inversion the one-pass design was written to prevent, reached through a second `helm upgrade`.
+  The hook now strips every declared rule from the file first and re-inserts the full list at the
+  original anchor, so the block is idempotent and its order authoritative on every start
+  whatever it was before, and it is skipped entirely when the result is byte-identical. Agent
+  mode was never affected (`pgconf.AssemblePgHba` places the whole list itself, #144).
+
+- **The bundled etcd RBAC bootstrap Job accepted a digest-only image pin and rendered an invalid
+  reference (#298 review, etcd 0.1.9).** `pg.haImage` now delegates to `pg.image`, which supports
+  a tag-less digest pin, and `pg.validateEtcdBootstrapImage` tells the operator to set
+  `etcd.rbac.bootstrapImage` to the same repository/tag/digest as `ha.image`. Following that with
+  a digest-only pin rendered `cagriekin/pg-ha:@sha256:...` -- the Job's image line concatenated
+  `repository ":" tag` unconditionally -- which the kubelet rejects as `InvalidImageName`. The
+  Job then never runs, so etcd auth and the per-release tenants are never provisioned, every
+  agent's etcd dial is unauthenticated, no node wins the lease, and the release comes up with no
+  primary and no write-Service endpoint: precisely the outcome that guard exists to prevent. The
+  tag is now omitted when empty, matching `pg.image`.
+
+- **`ha.agent: null` in standalone mode gave a raw nil pointer instead of the named error (#298
+  review).** The `ha.agent is required when ha.enabled=true` guard was added for exactly this,
+  but scoped to `pg.agentMode == true` -- correct in itself, since standalone runs no agent --
+  while `statefulset.yaml`'s control-API validation dereferences `.Values.ha.agent.control`
+  unconditionally. So `--set ha.enabled=false --set ha.agent=null` died with
+  `nil pointer evaluating interface {}.control`, the message class that guard replaced, on the
+  other half of the mode axis. Both `control` and its `restore` sub-block now default to an
+  empty dict, which reads as "no control API" -- what standalone means. Agent mode still gets
+  the guard's named error first, so nothing there changes.
+
+- **The transient bootstrap postmaster is stopped when `pg_ctl -w start` times out
+  (`images/pg-ha/entrypoint.sh`, #298 review).** Both `stop` calls in `bootstrap_initdb` were
+  hardened against exiting under `set -e` with a daemonized postmaster still alive; the `start`
+  was the third call site and got neither guard. `pg_ctl -w start` daemonizes and then waits, and
+  it exits non-zero at `PGCTLTIMEOUT` (60s -- nothing in this image lowers it) with the
+  postmaster STILL RUNNING. Bare under `set -e` that left an orphan holding this script's stdout,
+  which in agent mode (where the script is a captured child) blocks `act()` with `opMu` held for
+  the whole `initdbBudget`, and which satisfies the chart's startupProbe -- `pg_isready` over the
+  unix socket -- while listening on no TCP address, retiring the startup grace for a cluster that
+  is not bootstrapped. It now escalates to an immediate stop and exits without the completion
+  sentinel, so the next start discards the directory and re-creates it.
+
+- **`bootstrap_initdb`'s repmgr role creation is paired with an `ALTER USER`, symmetrically with
+  the superuser's (`images/pg-ha/entrypoint.sh`, #298 review).** psql runs without
+  `ON_ERROR_STOP`, which is why the `POSTGRES_USER` block combines `CREATE USER` with an `ALTER
+  USER ... PASSWORD`: a CREATE that fails because the role already exists still lets the ALTER
+  set the password. The repmgr block had only the CREATE, so a pre-existing role would be left
+  with the wrong password (or none), the failure swallowed by the deliberate `|| true`, and the
+  `rolpassword IS NOT NULL` verification would then discard an otherwise-fine data directory
+  rather than repair it. Defence in depth -- the collision guard and the reserved-name check
+  cover the paths reachable today.
+
+- **`scripts/check-template-parity.sh` now also refuses a pgvector template that is a COPY
+  rather than a symlink (#298 review).** `diff -r` dereferences symlinks, so it compares content
+  -- which is the point, but it means a template replaced by a byte-identical regular file keeps
+  the gate green while being free to drift on the next edit, and pgvector has no KinD suites to
+  notice. `scripts/helm-unittest-charts.sh` added exactly this copy-vs-symlink check for
+  `pgvector/tests/unit`; the templates, where the whole inherited integration coverage lives,
+  had no equivalent.
+
+
 - **A demote that ended in a reaped SIGKILL is no longer read as "the writer may still be alive"
   (#298 review, agent).** `ChildPostmaster.Stop` returns `context.DeadlineExceeded` on TWO
   different arms: the one where the deadline expired, the SIGKILL landed and the child was
@@ -627,6 +694,12 @@
   owns the constant rather than assumed to fit, so the two cannot drift.
 
 ### Testing
+
+- **The pgHba upgrade test now runs the rendered hook instead of a copy of its logic (#298
+  review).** The regression test added alongside the fix above reimplemented the hook's two awk
+  passes inline, so editing the template could not fail it -- the same shape as the vacuous
+  assertions fixed elsewhere in this section. It now extracts the hook from `helm template` and
+  executes it, and refuses to assert anything if the extraction comes back empty.
 
 - **Two more image-suite assertions were vacuous, both mutation-proven (#298 review).** The
   completion-sentinel check searched for the sentinel's NAME anywhere in `entrypoint.sh`, and that

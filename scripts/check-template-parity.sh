@@ -21,6 +21,32 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# ...and that "cannot be introduced by editing" is only true while the entries really ARE
+# symlinks, which `diff -r` cannot tell you: it dereferences them, so a pgvector template
+# replaced by a COPY of identical content passes this gate and is then free to drift, silently,
+# with no KinD suite on the pgvector side to notice. scripts/helm-unittest-charts.sh added
+# exactly this copy-vs-symlink check for pgvector/tests/unit; the stakes are higher here.
+copies=""
+for f in "${ROOT}"/pgvector/templates/*; do
+  [ -e "${f}" ] || continue
+  base="$(basename "${f}")"
+  if [ -e "${ROOT}/pg/templates/${base}" ] && [ ! -L "${f}" ]; then
+    copies="${copies}"$'\n'"  pgvector/templates/${base}"
+  fi
+done
+if [ -n "${copies}" ]; then
+  cat >&2 <<EOF
+
+=== template-parity: FAILED ===
+These pgvector templates are COPIES of pg's file of the same name rather than symlinks:${copies}
+
+Content parity happens to hold right now, so \`diff -r\` says nothing -- but a copy can drift on
+the next edit and pgvector has no KinD suites to catch it. Replace each with a symlink:
+  ln -sf ../../pg/templates/<name> pgvector/templates/<name>
+EOF
+  exit 1
+fi
+
 if diff -r "${ROOT}/pg/templates" "${ROOT}/pgvector/templates"; then
   echo "=== template-parity: OK (pg/templates == pgvector/templates) ==="
   exit 0

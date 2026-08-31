@@ -219,7 +219,23 @@ EOF
     # own copy, which in postgres mode lands on container stdout and in initdb mode is
     # captured by the agent's CombinedOutput and re-emitted at Info level. Moving the
     # secrets off argv (#298) closed the smaller channel and left this one open.
-    pg_ctl -D "$PGDATA" -w start -o "-c listen_addresses='' -c log_statement=none -c log_min_error_statement=panic"
+    # GUARDED, for the same reason both `stop` calls at the end of this function are (#298
+    # review). `pg_ctl -w start` DAEMONIZES the postmaster and then waits for it to accept
+    # connections, and it exits non-zero on PGCTLTIMEOUT (60s -- nothing in this image lowers
+    # it) with that postmaster STILL RUNNING. Bare under `set -e` the script exits right there
+    # and leaves it orphaned, which is the hazard the two stop arms were hardened against and
+    # this third call site did not get: the orphan inherits this script's stdout, so in agent
+    # mode (where the script is a captured child, Cmd.Output) it holds that pipe open past EOF
+    # and blocks act() with opMu held until the whole initdbBudget expires -- and it satisfies
+    # the chart's startupProbe (`pg_isready` over the unix socket) while listening on no TCP
+    # address, so the startup grace is retired for a cluster that is not bootstrapped.
+    # Escalate to an immediate stop and exit WITHOUT the completion sentinel, so the next start
+    # discards this directory and re-creates it.
+    if ! pg_ctl -D "$PGDATA" -w start -o "-c listen_addresses='' -c log_statement=none -c log_min_error_statement=panic"; then
+        pg_ctl -D "$PGDATA" -m immediate -w stop || true
+        echo "FATAL: the transient bootstrap postmaster did not come up within PGCTLTIMEOUT; not marking the bootstrap complete, so this data directory will be discarded and re-created on the next start." >&2
+        exit 1
+    fi
 
     REPMGR_USER=${REPMGR_USER:-repmgr}
     REPMGR_PASSWORD=${REPMGR_PASSWORD:?REPMGR_PASSWORD is required}
@@ -281,6 +297,13 @@ SQL
     psql -U postgres -d postgres 2>/dev/null <<SQL || true
 SET password_encryption='scram-sha-256';
 CREATE USER "${repmgr_user_id}" WITH SUPERUSER PASSWORD '${repmgr_pw_sql}';
+-- Paired with the CREATE, symmetrically with the POSTGRES_USER block above and for the
+-- reason that block states: psql runs without ON_ERROR_STOP, so a CREATE that fails
+-- because the role already exists still lets the ALTER set the password. Without it a
+-- pre-existing REPMGR_USER is left with the wrong password (or none), the failure is
+-- swallowed by the deliberate `|| true`, and the rolpassword verification below then
+-- discards an otherwise-fine data directory instead of repairing it.
+ALTER USER "${repmgr_user_id}" WITH PASSWORD '${repmgr_pw_sql}';
 SQL
     psql -U postgres -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE \"${repmgr_db_id}\" TO \"${repmgr_user_id}\";" 2>/dev/null || true
     # The repmgr DATABASE and ROLE above are created under BOTH mechanisms, on purpose.

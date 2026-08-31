@@ -48,7 +48,16 @@ spec:
           # The bundled etcd image is distroless (no shell -- it ships etcd + etcdctl
           # only), so the bootstrap runs in the pg-ha-agent image and drives the etcd
           # Auth API via the Go client (the same mTLS client the agent uses).
-          image: "{{ $img.repository }}:{{ $img.tag }}{{ with $img.digest }}@{{ . }}{{ end }}"
+          {{- /* The tag is OMITTED when empty, rather than emitted as a bare colon (#298
+                 review). pg's pg.haImage (via pg.image) supports a digest-only pin -- no tag
+                 at all -- and pg.validateEtcdBootstrapImage tells the operator to set THIS
+                 image to the same repository/tag/digest as ha.image. Following that with a
+                 digest-only pin rendered `repo:@sha256:...`, which the kubelet rejects as
+                 InvalidImageName: the Job never runs, etcd auth and the per-release tenants
+                 are never provisioned, every agent's etcd dial is unauthenticated, no node
+                 wins the lease, and the release comes up with no primary -- the outcome that
+                 guard exists to prevent. */}}
+          image: "{{ $img.repository }}{{ with $img.tag }}:{{ . }}{{ end }}{{ with $img.digest }}@{{ . }}{{ end }}"
           imagePullPolicy: {{ $img.pullPolicy | default "IfNotPresent" }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}

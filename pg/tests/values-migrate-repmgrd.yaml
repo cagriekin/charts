@@ -17,7 +17,7 @@
 postgresql:
   image:
     repository: postgres
-    tag: 17.10-trixie
+    tag: 18.1-trixie
     pullPolicy: IfNotPresent
 
   # Two standbys, not one. The recreate has to adopt EVERY orphaned pod, and with a single

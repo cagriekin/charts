@@ -1482,6 +1482,73 @@ assert_eq "#298: the loopback host rules stay above the inserted entry" "yes" \
      && [ "${_lo6_line}" -lt "${_ins_line}" ] && echo yes || echo no)"
 rm -rf "${_hba_tmp}"
 
+# --- #298 review: the insert must keep the declared order ACROSS pod starts, not only within
+# one batch. A rule this hook inserted earlier IS a non-loopback host rule sitting above the
+# original anchor, so it becomes the anchor -- and a top-up insert (only the entries `grep -qF`
+# found missing) then put a rule appended in a later `helm upgrade` ABOVE the ones declared
+# before it. pg_hba is first-match-wins, so the newest entry silently outranked every earlier
+# one: declaring [trust /16, reject /24] and later appending the reject left the /24 range
+# REJECTED, the exact inversion the one-pass design exists to prevent.
+#
+# Behavioural, and it runs the RENDERED script rather than a copy of its logic (#298 review).
+# An earlier version of this test reimplemented the two awk passes inline, which meant editing
+# the template could not fail it -- the same "reads as coverage while proving nothing" shape the
+# grep-anchoring and helper fixes above were about. Extracting the hook from `helm template` and
+# executing it is what actually ties the assertion to what ships.
+_hba2=$(mktemp -d)
+# The hook block as the chart renders it, made runnable: HBA_FILE comes from the first argument
+# instead of a `psql -c "SHOW hba_file"` this test cannot perform.
+_hba_hook() {
+  local out="$1"; shift
+  local sets=() i=0 r
+  for r in "$@"; do sets+=(--set "postgresql.pgHba[${i}]=${r}"); i=$((i + 1)); done
+  {
+    echo 'HBA_FILE="$1"'
+    helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 \
+      "${sets[@]}" --show-only templates/statefulset.yaml 2>/dev/null \
+      | sed -n '/^ *PGCHART_INS=/,/^ *rm -f "\$PGCHART_INS"/p' | sed 's/^ *//'
+  } > "${out}"
+  # A silent extraction failure would make every assertion below vacuous.
+  if ! grep -q 'pgchart.ins' "${out}"; then
+    bad "#298: could not extract the rendered pgHba hook" "the assertions below would prove nothing"
+    return 1
+  fi
+  bash -n "${out}"
+}
+sed -n '/cat > "$PGDATA\/pg_hba.conf"/,/^EOF$/p' "${CHART_DIR}/../images/pg-ha/entrypoint.sh" \
+  | grep -vE '^cat |^EOF$|^[[:space:]]*cat ' > "${_hba2}/pg_hba.conf"
+if _hba_hook "${_hba2}/hook1.sh" 'host all all 10.1.0.0/16 trust' \
+   && _hba_hook "${_hba2}/hook2.sh" 'host all all 10.1.0.0/16 trust' 'host all all 10.1.0.0/24 reject'; then
+  bash "${_hba2}/hook1.sh" "${_hba2}/pg_hba.conf"
+  _hba_snap=$(cat "${_hba2}/pg_hba.conf")
+  # A restart with an unchanged list must be a no-op -- not "insert nothing", but "produce the
+  # same file": that is what makes re-emitting the whole block safe to do on every start.
+  bash "${_hba2}/hook1.sh" "${_hba2}/pg_hba.conf"
+  assert_eq "#298: re-running the pgHba insert with an unchanged list is idempotent" "yes" \
+    "$([ "${_hba_snap}" = "$(cat "${_hba2}/pg_hba.conf")" ] && echo yes || echo no)"
+  # Now the upgrade: the operator APPENDS a second rule after the first.
+  bash "${_hba2}/hook2.sh" "${_hba2}/pg_hba.conf"
+  _up_trust=$(grep -n "10.1.0.0/16 trust" "${_hba2}/pg_hba.conf" | head -1 | cut -d: -f1)
+  _up_reject=$(grep -n "10.1.0.0/24 reject" "${_hba2}/pg_hba.conf" | head -1 | cut -d: -f1)
+  assert_eq "#298: a rule appended in a later upgrade stays BELOW the earlier ones" "yes" \
+    "$([ -n "${_up_trust}" ] && [ -n "${_up_reject}" ] && [ "${_up_trust}" -lt "${_up_reject}" ] && echo yes || echo no)"
+  # ...and exactly once each: the strip pass must remove the previous copy, not leave a duplicate.
+  assert_eq "#298: the re-emitted block carries no duplicate of the earlier rule" "1" \
+    "$(grep -c "10.1.0.0/16 trust" "${_hba2}/pg_hba.conf")"
+  # ...still above the network catch-all, which the strip pass must not have moved.
+  _up_catchall=$(grep -n "0.0.0.0/0" "${_hba2}/pg_hba.conf" | head -1 | cut -d: -f1)
+  assert_eq "#298: the re-emitted block is still above the network catch-all" "yes" \
+    "$([ -n "${_up_catchall}" ] && [ "${_up_reject}" -lt "${_up_catchall}" ] && echo yes || echo no)"
+fi
+rm -rf "${_hba2}"
+
+# The render must no longer top up with `grep -qF` (that filter is what made the top-up
+# order-dependent), and must strip before it inserts.
+assert_not_contains "#298: the pgHba insert no longer tops up only the missing entries" \
+  "${hba_render}" 'grep -qF'
+assert_contains "#298: the pgHba insert strips the previously-inserted copies first" \
+  "${hba_render}" "pgchart.base"
+
 # postStart sed insert, covered by the "config standalone: pgHba entry in postStart" case.
 
 # Test: configuration disabled still renders setup-config, which strips a
