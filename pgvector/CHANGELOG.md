@@ -527,6 +527,21 @@
   and `render_test.yaml` now pins the bootstrap Job's digest-only render too, which was the fix
   that shipped first and had no render test at all.
 
+
+  ...and the printf that consolidation introduced dropped a shape the expression it replaced
+  handled (#298 review, etcd 0.1.12). `printf "%s:%s"` renders Go's `%!s(...)` error verb for a
+  NON-STRING tag, while the old `{{ with .tag }}:{{ . }}{{ end }}` printed any scalar --
+  and `values.schema.json` types no `image.tag` in either chart, so an unquoted YAML scalar is
+  reachable: `etcd.image.tag: 3.5`, `busyboxImage.tag: 1.37` or `pgpool.image.tag: 4.6` (the
+  spelling an operator reaches for) arrives as a float64 and rendered
+  `quay.io/coreos/etcd:%!s(float64=3.5)`. That is a render-CLEAN manifest the kubelet then
+  rejects as `InvalidImageName` -- exactly the failure both `etcd.image` and `pg.image` exist to
+  pull forward to render time, reached through the guard rather than around it. Both helpers now
+  `toString` the tag (and the repository), `etcd/tests/unit/render_test.yaml` pins the
+  non-string-tag render, and `pg/tests/test-template.sh` asserts no `%!s(` ever reaches an
+  `image:` line. `etcd/README.md` also now states the tag/digest rules on the
+  `rbac.bootstrapImage` row, not only on the server `image` one.
+
 - **`ha.agent: null` in standalone mode gave a raw nil pointer instead of the named error (#298
   review).** The `ha.agent is required when ha.enabled=true` guard was added for exactly this,
   but scoped to `pg.agentMode == true` -- correct in itself, since standalone runs no agent --

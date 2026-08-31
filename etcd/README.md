@@ -174,7 +174,7 @@ matching `prefix`.
 | `rbac.adminSecret` | admin client cert Secret (CN must be `root`) | `""` |
 | `rbac.healthCheckCN` | CN of the read-only health user; the server cert's CN must equal it | `etcd-healthcheck` |
 | `rbac.tenants` | per-tenant grants (`[{commonName, prefix}]`) | `[]` |
-| `rbac.bootstrapImage` | image running `pg-ha-agent rbac-bootstrap` (etcd image has no shell) | `cagriekin/pg-ha:2.0.0-pg18` |
+| `rbac.bootstrapImage` | image running `pg-ha-agent rbac-bootstrap` (etcd image has no shell). Same `repository`/`tag`/`digest` rules as `image` above, including the render-time refusal when both `tag` and `digest` are empty | `cagriekin/pg-ha:2.0.0-pg18` |
 | `rbac.resources` | bootstrap Job container resources | small requests/limits |
 | `networkPolicy.enabled` | ingress lockdown (needs a NP-enforcing CNI) | `true` |
 | `networkPolicy.allowedClients` | cross-namespace client allow-list for a shared etcd (`[{namespace, podSelector?}]`) | `[]` |

@@ -87,8 +87,15 @@ app.kubernetes.io/component: etcd
 {{- if and (not .tag) (not .digest) -}}
 {{- fail (printf "etcd: image %q has neither a tag nor a digest, which would deploy an implicit :latest -- unpinned across pod restarts, so a future build silently replaces the one this release was tested with (for the etcd SERVER that is a new major landing on an existing member's data directory, which it refuses to start on; for rbac.bootstrapImage it is one agent build writing the etcd RBAC that another then authenticates against). Set image.tag, or image.digest alone (a digest is a complete pin on its own)." (.repository | toString)) -}}
 {{- end -}}
+{{- /* toString on the tag, because %s on a NON-STRING renders Go's error verb rather than
+       the value (#298 review). The expression this helper replaced was `{{ with .tag }}:{{ . }}{{ end }}`,
+       which prints any scalar; values.schema.json does not type image.tag, so an unquoted
+       YAML scalar is reachable -- `--set image.tag=3` or `tag: 3.5` in a values file arrives
+       as int64/float64 and rendered `quay.io/coreos/etcd:%!s(float64=3.5)`, an InvalidImageName
+       at the kubelet: exactly the failure this helper exists to move to render time. The fail
+       message above already does this to .repository; the reference itself has to as well. */ -}}
 {{- if .tag -}}
-{{- printf "%s:%s" .repository .tag -}}
+{{- printf "%s:%s" (.repository | toString) (.tag | toString) -}}
 {{- else -}}
 {{- .repository -}}
 {{- end -}}

@@ -797,6 +797,25 @@ ha_img_default_out=$(helm template test-pg "${CHART_DIR}" --show-only templates/
 assert_contains "#298: the default HA image reference is unchanged by the delegation" \
   "${ha_img_default_out}" "cagriekin/pg-ha:"
 
+# #298 review: a NON-STRING tag must render as the tag, not as Go's %!s error verb. The printf
+# that replaced `{{ with .tag }}:{{ . }}{{ end }}` prints the value for a string and the error
+# verb for anything else, and values.schema.json types no image.tag -- so an unquoted YAML
+# scalar, which is how an operator writes `busyboxImage.tag: 1.37` or `pgpool.image.tag: 4.6`,
+# reached pg.image as a float64 and rendered `busybox:%!s(float64=1.37)`: a render-CLEAN
+# manifest that ImagePullBackOffs at the kubelet, which is precisely what the guards in
+# pg.image exist to pull forward to render time.
+#
+# --set-json, NOT --set: helm's strvals parser converts integers but leaves `1.37` a STRING, so
+# a plain `--set busyboxImage.tag=1.37` renders correctly even with the bug present -- the
+# assertion would read as coverage while proving nothing. --set-json types the value exactly as
+# a values FILE does, which is where an operator actually writes an unquoted tag.
+img_float_tag_out=$(helm template test-pg "${CHART_DIR}" \
+  --set-json 'busyboxImage={"repository":"busybox","tag":1.37,"digest":"","pullPolicy":"IfNotPresent"}' 2>&1 || true)
+assert_not_contains "#298: a non-string image tag never renders a Go format error" \
+  "${img_float_tag_out}" "%!s("
+assert_contains "#298: a non-string image tag renders as the tag" \
+  "${img_float_tag_out}" "busybox:1.37"
+
 # #320 review: postgresql.extraVolumes lands in the SAME pod volumes list, so a shared name is
 # a duplicate the API server rejects -- the same apply-time-only class as the chart-volume
 # collision, just from the other operator-controlled list.

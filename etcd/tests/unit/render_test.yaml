@@ -84,6 +84,23 @@ tests:
           path: spec.template.spec.containers[0].image
           value: cagriekin/pg-ha@sha256:1111111111111111111111111111111111111111111111111111111111111111
 
+  # A NON-STRING tag still renders as the tag, not as Go's %!s error verb (#298 review).
+  # values.schema.json does not type image.tag, so an unquoted YAML scalar reaches the helper as
+  # int64/float64, and `printf "%s:%s"` on one rendered
+  # `quay.io/coreos/etcd:%!s(float64=3.5)` -- a render-CLEAN manifest the kubelet then rejects
+  # as InvalidImageName, which is the failure etcd.image exists to move to render time. The
+  # expression it replaced (`{{ with .tag }}:{{ . }}{{ end }}`) printed any scalar, so this is
+  # the regression direction to pin.
+  - it: a non-string tag renders as the tag, not as a format-verb error
+    template: templates/statefulset.yaml
+    set:
+      image.tag: 3.5
+      image.digest: ""
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: quay.io/coreos/etcd:3.5
+
   - it: plaintext default uses httpGet readiness and tcpSocket liveness
     template: templates/statefulset.yaml
     asserts:

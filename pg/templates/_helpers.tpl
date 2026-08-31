@@ -159,8 +159,16 @@ annotation consumers -- #128.)
 {{- if and (not .tag) (not .digest) -}}
 {{- fail (printf "image %q has neither a tag nor a digest, which would deploy an implicit :latest -- unpinned across pod restarts, and on a StatefulSet with existing data a future :latest can be a different PostgreSQL major that refuses to start on it. Set a tag or a digest." (.repository | default "<empty repository>")) -}}
 {{- end -}}
+{{- /* toString on both halves, because %s on a NON-STRING renders Go's error verb instead of
+       the value (#298 review). values.schema.json does not type any image.tag, and an
+       unquoted YAML scalar is a tag an operator writes by accident: `busyboxImage.tag: 1.37`
+       or `pgpool.image.tag: 4.6` arrives as float64 and rendered
+       `busybox:%!s(float64=1.37)`, which the kubelet rejects as InvalidImageName -- a
+       render-clean manifest that ImagePullBackOffs, the outcome the guards above exist to
+       move to render time. The pre-#320 `{{ . }}` form printed any scalar correctly, so this
+       is a regression the printf introduced, not a pre-existing hole. */ -}}
 {{- if .tag -}}
-{{- printf "%s:%s" .repository .tag -}}
+{{- printf "%s:%s" (.repository | toString) (.tag | toString) -}}
 {{- else -}}
 {{- .repository -}}
 {{- end -}}
