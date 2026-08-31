@@ -674,6 +674,64 @@
 
 ### Fixed
 
+- **A demote that ended in a reaped SIGKILL is no longer read as "the writer may still be alive"
+  (#298 review, agent).** `ChildPostmaster.Stop` returns `context.DeadlineExceeded` on TWO
+  different arms: the one where the deadline expired, the SIGKILL landed and the child was
+  **reaped** (`p.clear()` has run -- the writer is provably gone), and the one where SIGKILL was
+  undeliverable to a process in uninterruptible sleep and the handle is deliberately kept
+  ("leaving it supervised"). `err != nil` cannot separate them, and only `RestartLocal` and the
+  control-API restart applied the test that can -- `errors.Is(err, context.DeadlineExceeded) &&
+  !sup.Running()`. The two paths that did not both refuse to release the lease on the strength of
+  it:
+
+  - The **lost-leadership fence**. A SIGQUIT'd primary with a large shutdown checkpoint routinely
+    outlives `renewDeadline` (10s on chart defaults), so on the ordinary apiserver-partition fence
+    the demote completed, the postmaster was killed and reaped, and the branch still kept
+    `servingRW` set. `SafeToRelease` then vetoed the release: the peer waited out the full
+    `leaseDuration` instead of taking an immediate handoff, and the log said "this node may still
+    be a read-write primary" about a pod with nothing running on it.
+  - The **planned shutdown** (SIGTERM). A Fast/SIGINT shutdown of a large busy database
+    legitimately outruns the 30s budget; the escalation killed and reaped it, and
+    `clearServingRWForPlannedStepDown` was skipped, so the K8s backend kept the Lease and every
+    peer paid a full `leaseDuration` of write outage -- exactly the outage the `dcsDone`
+    shutdown ordering exists to eliminate, defeated on the ordinary slow-checkpoint termination.
+    There is no next tick here to re-derive the latch.
+
+  The discrimination is now one helper, `agent.stopProvedDead`, shared by all four call sites so
+  they cannot drift again. Anything that is NOT a deadline expiry is still never treated as proof.
+
+- **`POST /v1/reinitialize` re-checks the replica-only gate inside the reconcile goroutine (#298
+  review, agent).** `handleReinitialize` gates carefully -- a live DCS lease read, the durable
+  marker, the snapshot role -- but every one of those runs on the HTTP goroutine BEFORE the intent
+  is queued, and the run loop's `select` may serve a tick first (the request also deliberately
+  stays queued after the caller's context expires, so the window is not bounded by the HTTP
+  timeout). The scenario is the ordinary failover: an operator reinitializes a healthy standby,
+  the primary dies in that window, this node wins the lease and the next tick promotes it -- and
+  `runIntent` then stopped and wiped the data directory of the cluster's **new primary**.
+  `WipeDataDir`'s `postmaster.pid` interlock cannot help, because the demote immediately above
+  removes it, and the highwater marker is left naming an empty node -- the unrecoverable outcome
+  the handler's own comment cites. `runIntent` holds `opMu`, so re-asserting it there is atomic
+  against the tick that promotes; the refusal precedes the stop, so a refused request touches
+  nothing.
+
+- **The control-API restart asserts the on-disk role before starting the postmaster (#298 review,
+  agent).** `sup.Start` is a bare `postgres -D PGDATA`: it neither creates nor removes
+  `standby.signal`, and this was the one start path that did not state the role it intended --
+  every start the reconcile loop performs goes through `StartLocal` (which asserts the signal for
+  standby-state data) or `StartRecovery` (which asserts it for a NON-HOLDER's primary-state data,
+  "so its true position is observable without risking a second writer"). A fenced ex-primary is
+  stopped with primary-state data, no `standby.signal` and no lease, and publishes role
+  `unknown`, so `handleIntent`'s force gate -- which only bites while the node holds the lease --
+  waved an unforced `POST /v1/restart` straight through and brought the node back READ-WRITE on
+  the old timeline beside the real primary, until the next tick's `DemoteFence`: a two-writer
+  window of up to one reconcile interval, reachable through the restore runbook's own hint ("POST
+  /v1/restart to bring it back"), and reachable again on a directory whose signal was lost inside
+  `RejoinForceRewind`'s window. The new assertion only ever ADDS the signal, never removes one:
+  removing it would be a new way to start a node read-write without the `#125` highwater guard,
+  so a lease holder's primary-state directory is left byte-identically alone, and an unreadable
+  control file pins the node read-only rather than guessing.
+
+
 - **`pg.haImage` resolves through `pg.image` instead of its own `printf` (#298 review).** It is the
   helper every HA workload's `image:` goes through -- the `postgresql` container, `repmgr-init`,
   the pgBackRest sidecar and bootstrap init container, the restore Job, the pgBackRest validation

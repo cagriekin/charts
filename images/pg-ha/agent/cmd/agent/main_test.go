@@ -3860,3 +3860,32 @@ func TestAssertPrimaryRoutingLeavesAnUnreachablePeerAlone(t *testing.T) {
 		t.Errorf("an unreachable peer's label was rewritten to %q", got)
 	}
 }
+
+// stopProvedDead separates Stop's two deadline outcomes (#298 review): the reaped SIGKILL
+// (p.clear() ran, so Running() is false) is positive evidence the writer is gone, while the
+// "leaving it supervised" arm -- SIGKILL undeliverable on a wedged PV -- is not. Both return a
+// context.DeadlineExceeded-wrapping error, so err != nil cannot tell them apart, and the fence
+// and shutdown paths used to read the first as "the demote did not complete": servingRW stayed
+// set, SafeToRelease vetoed the release, and a peer waited out the whole LeaseDuration.
+func TestStopProvedDead(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		err     error
+		running bool
+		want    bool
+	}{
+		{"clean stop", nil, false, true},
+		{"deadline hit, killed and reaped", context.DeadlineExceeded, false, true},
+		{"deadline hit, child still supervised", fmt.Errorf("leaving it supervised: %w", context.DeadlineExceeded), true, false},
+		{"some other failure", errors.New("signal: operation not permitted"), false, false},
+		// Not a deadline expiry, so it says nothing about the postmaster even with no child.
+		{"other failure, child gone", errors.New("boom"), false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &agent{sup: process.NewSupervisor(&fakePostmaster{running: tc.running})}
+			if got := a.stopProvedDead(tc.err); got != tc.want {
+				t.Errorf("stopProvedDead(%v) with running=%v = %v, want %v", tc.err, tc.running, got, tc.want)
+			}
+		})
+	}
+}

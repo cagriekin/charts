@@ -480,7 +480,18 @@ func (a *agent) run() {
 				a.log.Warn("lost leadership; demoting (fence)")
 				dctx, cancel := context.WithTimeout(context.Background(), a.cfg.RenewDeadline)
 				defer cancel()
-				if err := a.sup.Demote(dctx, true); err != nil {
+				derr := a.sup.Demote(dctx, true)
+				// stopProvedDead, not `derr != nil` (#298 review). Stop returns
+				// context.DeadlineExceeded on the arm where the deadline expired, the SIGKILL
+				// landed and the child was REAPED -- an outcome that proves there is no writer
+				// left. A SIGQUIT'd postmaster with a large shutdown checkpoint routinely
+				// outlives RenewDeadline (10s on chart defaults), so on the ordinary
+				// apiserver-partition fence this branch fired for a fence that had completed
+				// cleanly: servingRW stayed set, SafeToRelease vetoed the release, the peer
+				// waited out the full LeaseDuration instead of taking an immediate handoff, and
+				// the operator read "may still be a read-write primary" mid-incident about a
+				// node with nothing running on it.
+				if !a.stopProvedDead(derr) {
 					// KEEP the latch set (#298 review). Clearing it on a FAILED demote is the one
 					// direction tick()'s own rule forbids -- "cleared only on positive evidence",
 					// fail-safe is to demote on uncertainty -- and a failed Stop is precisely the
@@ -488,8 +499,11 @@ func (a *agent) run() {
 					// the next lease loss takes the "not read-write; no fence needed" branch and
 					// skips the fence on the one node that most needs it. The tick loop re-derives
 					// it from the observed role either way, so holding it costs nothing.
-					a.log.Error("fence demote failed; keeping this node marked read-write so a later lease loss still fences", "err", err)
+					a.log.Error("fence demote failed; keeping this node marked read-write so a later lease loss still fences", "err", derr)
 					return
+				}
+				if derr != nil {
+					a.log.Warn("fence: the postmaster did not exit before the deadline and was killed; it is reaped, so the fence is complete", "err", derr)
 				}
 				// Bump BEFORE the clear, for the reason clearServingRWForPlannedStepDown
 				// states: deriveServingRW's gate is a check-then-act pair, so the generation
@@ -518,7 +532,18 @@ func (a *agent) run() {
 			sctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			a.opMu.Lock()
 			derr := a.sup.Demote(sctx, false) // graceful (fast) on planned shutdown
-			if derr == nil {
+			// stopProvedDead, not `derr == nil` (#298 review). A Fast/SIGINT shutdown of a large
+			// busy database legitimately outruns the 30s budget, and Stop then SIGKILLs and REAPS
+			// it -- returning context.DeadlineExceeded for an outcome in which no writer survives.
+			// Reading that as "did not complete" left servingRW set, so SafeToRelease vetoed the
+			// release and the K8s backend kept the Lease: every peer then waited out the full
+			// LeaseDuration (15s on chart defaults) of write outage, which is exactly the outage
+			// the dcsDone ordering below exists to eliminate, defeated on the ordinary
+			// slow-checkpoint shutdown. There is no next tick here to re-derive the latch.
+			if a.stopProvedDead(derr) {
+				if derr != nil {
+					a.log.Warn("planned shutdown: the postmaster did not exit before the stop deadline and was killed; it is reaped, so the lease can be released immediately", "err", derr)
+				}
 				// A COMPLETED demote is positive evidence this node is no longer a writer, so
 				// disarm the fence latch here exactly as the switchover and ReleaseLease paths
 				// do (#298 review). Without it every planned termination of a read-write
@@ -1250,6 +1275,26 @@ func (a *agent) clearServingRWForPlannedStepDown() {
 	a.servingRW.Store(false)
 }
 
+// stopProvedDead reports whether a Demote/Stop error still amounts to positive evidence
+// that the postmaster is gone (#298 review).
+//
+// ChildPostmaster.Stop returns ctx.Err() -- context.DeadlineExceeded -- on the arm where the
+// deadline expired, SIGKILL was delivered AND the child was reaped: p.clear() has already run
+// there, so the writer is provably dead. It returns a wrapped ctx.Err() on the genuinely bad
+// arm (SIGKILL undeliverable to a process in uninterruptible sleep, "leaving it supervised"),
+// where the handle is deliberately kept. err != nil therefore cannot distinguish the two, and
+// Running() is what does -- exactly the test RestartLocal and the control-API restart already
+// apply. Shared so the fence and shutdown paths cannot drift from them again.
+//
+// Any error that is NOT a deadline expiry (a signal that could not be sent, a nil process) is
+// never treated as proof: those say nothing about whether the postmaster died.
+func (a *agent) stopProvedDead(err error) bool {
+	if err == nil {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded) && !a.sup.Running()
+}
+
 // deriveServingRW applies tick()'s observed role to the fence latch, discarding an observation
 // that a demote has overtaken.
 //
@@ -1923,7 +1968,9 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// is not fatal -- but the "left supervised" error wraps ctx.Err() too, which is why
 		// Running() is part of the test.
 		if serr != nil {
-			if !errors.Is(serr, context.DeadlineExceeded) || a.sup.Running() {
+			// stopProvedDead is this test, shared with the fence, the planned shutdown and the
+			// control-API restart so the four cannot drift (#298 review).
+			if !a.stopProvedDead(serr) {
 				return fmt.Errorf("restart local: could not prove the postmaster is dead, so not reporting a restart: %w", serr)
 			}
 			a.log.Warn("restart local: the postmaster did not exit before the stop deadline and was killed; starting it back up", "err", serr)

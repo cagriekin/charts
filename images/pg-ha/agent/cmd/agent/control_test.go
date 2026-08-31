@@ -142,8 +142,11 @@ func TestIntentBudgetScalesWithReconcileInterval(t *testing.T) {
 func newIntentAgent(t *testing.T, pm *fakePostmaster) *agent {
 	t.Helper()
 	return &agent{
-		cfg:     &config.Config{PGDATA: t.TempDir(), PodName: "pg-0"},
-		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		cfg: &config.Config{PGDATA: t.TempDir(), PodName: "pg-0"},
+		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// A non-leader DCS, because runIntent's destructive verbs re-check holdership under
+		// opMu (#298 review) -- see TestRunIntentReinitializeRefusesOnceThisNodeIsPrimary.
+		dcs:     &fakeDCS{},
 		sup:     process.NewSupervisor(pm),
 		metr:    observe.New(),
 		intents: make(chan intentRequest, 1),
@@ -634,5 +637,96 @@ func TestBackupAPIRestoreEnabledFollowsTheRenderedValue(t *testing.T) {
 	}
 	if !(backupAPI{a: &agent{cfg: &config.Config{ControlRestoreEnabled: true}}}).RestoreEnabled() {
 		t.Error("RestoreEnabled did not follow the config")
+	}
+}
+
+// Reinitialize RE-CHECKS the replica-only gate inside the reconcile goroutine (#298 review).
+// handleReinitialize's own checks all run on the HTTP goroutine before the intent is queued,
+// and the loop may serve a tick first -- so a standby that wins the lease and is promoted in
+// that window would otherwise have the cluster's new primary wiped out from under it.
+func TestRunIntentReinitializeRefusesOnceThisNodeIsPrimary(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*agent)
+		want  string
+	}{
+		{"holds the lease", func(a *agent) { a.dcs = &fakeDCS{leader: true} }, "acquired the leader lease"},
+		{"marked read-write", func(a *agent) { a.servingRW.Store(true) }, "marked read-write"},
+		{"marker names this pod", func(a *agent) {
+			a.lastMarker, a.lastMarkerOK = k8s.Marker{Present: true, Primary: "pg-0"}, true
+		}, "primary marker now records"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pm := &fakePostmaster{running: true}
+			a := newIntentAgent(t, pm)
+			for _, f := range []string{"PG_VERSION", "postgresql.conf"} {
+				if err := os.WriteFile(filepath.Join(a.cfg.PGDATA, f), []byte("x"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tc.setup(a)
+			err := a.runIntent(context.Background(), intentRequest{kind: control.IntentReinitialize})
+			if err == nil {
+				t.Fatal("reinitialize must be refused once this node may be the primary")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to mention %q", err, tc.want)
+			}
+			// And nothing may have been touched: the refusal precedes the stop and the wipe.
+			if pm.stopped {
+				t.Error("the postmaster must not be stopped by a refused reinitialize")
+			}
+			if !process.HasData(a.cfg.PGDATA) {
+				t.Error("the data directory must survive a refused reinitialize")
+			}
+		})
+	}
+}
+
+// The control-API restart asserts the on-disk role before starting (#298 review).
+// sup.Start is a bare `postgres -D PGDATA`, so without this a fenced ex-primary -- stopped,
+// primary-state data, no standby.signal, no lease -- came back READ-WRITE beside the real
+// primary until the next tick's DemoteFence.
+func TestRunIntentRestartPinsANonHolderReadOnly(t *testing.T) {
+	pm := &fakePostmaster{running: true}
+	a := newIntentAgent(t, pm)
+	a.pgControlDataBin = "/nonexistent/pg_controldata" // the unreadable-controldata arm
+	for _, f := range []string{"PG_VERSION", "postgresql.conf"} {
+		if err := os.WriteFile(filepath.Join(a.cfg.PGDATA, f), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.prober = pg.NewProber()
+	if err := a.runIntent(context.Background(), intentRequest{kind: control.IntentRestart}); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	if !pm.stopped || !pm.started {
+		t.Fatalf("stopped=%v started=%v, want both", pm.stopped, pm.started)
+	}
+	if _, err := os.Stat(filepath.Join(a.cfg.PGDATA, "standby.signal")); err != nil {
+		t.Errorf("standby.signal must exist before a non-holder is started: %v", err)
+	}
+}
+
+// ...and it never REMOVES a signal on the lease holder: that would be a new way to bring a
+// node up read-write, bypassing the guards act() applies (the #125 highwater check).
+func TestRunIntentRestartLeavesTheHoldersDirectoryAlone(t *testing.T) {
+	pm := &fakePostmaster{running: true}
+	a := newIntentAgent(t, pm)
+	a.dcs = &fakeDCS{leader: true}
+	a.pgControlDataBin = "/nonexistent/pg_controldata"
+	a.prober = pg.NewProber()
+	for _, f := range []string{"PG_VERSION", "postgresql.conf"} {
+		if err := os.WriteFile(filepath.Join(a.cfg.PGDATA, f), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.runIntent(context.Background(), intentRequest{kind: control.IntentRestart}); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	// The control file is unreadable here, which is the fail-safe arm: the holder still gets
+	// standby.signal rather than a read-write start on a role nothing could confirm.
+	if _, err := os.Stat(filepath.Join(a.cfg.PGDATA, "standby.signal")); err != nil {
+		t.Errorf("an unreadable control file must still pin the node read-only: %v", err)
 	}
 }

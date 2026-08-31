@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -96,11 +95,33 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 			// the restart must go on and bring it back up -- returning here would leave
 			// the node down for a wedge this deliberately escalated past. Any other
 			// failure, or a child still alive, is fatal to the operation.
-			if !errors.Is(err, context.DeadlineExceeded) || a.sup.Running() {
+			// stopProvedDead is that test, shared with the fence, the planned shutdown and
+			// RestartLocal so the four cannot drift (#298 review).
+			if !a.stopProvedDead(err) {
 				return fmt.Errorf("stop postgres: %w", err)
 			}
 			a.log.Warn("control: postmaster did not exit before the request deadline and was killed; starting it back up",
 				"deadline", req.deadline)
+		}
+		// ASSERT the on-disk role before starting (#298 review). sup.Start is a bare
+		// `postgres -D PGDATA`: it neither creates nor removes standby.signal, so this was
+		// the one path that started a postmaster in whatever role the directory happened to
+		// carry -- while every start the reconcile loop performs goes through StartLocal
+		// (which asserts the signal for standby-state data) or StartRecovery (which asserts
+		// it for a NON-HOLDER's primary-state data, "so its true position is observable
+		// without risking a second writer").
+		//
+		// The gap is reachable through the documented path, not by misuse. A fenced
+		// ex-primary is stopped with primary-state data and no standby.signal, does not hold
+		// the lease, and publishes Role "unknown" -- so handleIntent's force gate (which only
+		// bites while HoldsLeaseNow()) waves an unforced restart straight through, and the
+		// node came up READ-WRITE on the old timeline beside the real primary until the next
+		// tick's DemoteFence: a two-writer window of up to one reconcile interval. The
+		// restore runbook's own hint ("POST /v1/restart to bring it back") points at it, and
+		// the same shape is reachable on a directory whose signal was lost inside
+		// RejoinForceRewind's window.
+		if err := a.assertRestartRecoverySignal(parent); err != nil {
+			return err
 		}
 		if err := a.sup.Start(parent); err != nil {
 			return fmt.Errorf("start postgres: %w", err)
@@ -122,6 +143,36 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 		a.log.Warn("control: stopped postgres for a restore")
 		return nil
 	case control.IntentReinitialize:
+		// RE-ASSERT the replica-only gate here, in the reconcile goroutine (#298 review). handleReinitialize
+		// checks it carefully -- live lease read, durable marker, snapshot role -- but every one
+		// of those runs on the HTTP goroutine BEFORE Submit queues the intent, and the loop's
+		// select may serve a tick first. The request also deliberately stays queued after the
+		// caller's context expires, so the gap is not bounded by the HTTP timeout.
+		//
+		// The scenario is the ordinary failover: an operator reinitializes a healthy standby, the
+		// primary dies in that window, this node wins the lease and the next tick promotes it --
+		// then runIntent dequeues and wipes the data directory of the cluster's new primary.
+		// WipeDataDir's postmaster.pid interlock cannot help, because the Demote below has just
+		// removed it. The marker then names an empty node, which handleReinitialize's own comment
+		// identifies as unrecoverable.
+		//
+		// Here the check IS effectively atomic, though NOT because of opMu -- runIntent does not
+		// take it. It runs in the reconcile loop's own select, i.e. the same goroutine as tick(),
+		// so no tick can interleave between this gate and the wipe and nothing can promote in
+		// between. That is also why reading a.lastMarker unsynchronised is safe here: observe()
+		// is its only writer and runs on this goroutine. The lease is read live; the marker is the
+		// loop's own last successful read (the handler already paid for a fresh one, and this asks
+		// the cheaper question of whether anything changed since). servingRW is atomic, and is the
+		// one field OnLost -- which does run elsewhere, under opMu -- can also touch.
+		if a.dcs.IsLeader() {
+			return fmt.Errorf("refusing to discard %s: this node acquired the leader lease after the request was accepted, so it is now the cluster's primary (reinitialize is replica-only)", a.cfg.PGDATA)
+		}
+		if a.servingRW.Load() {
+			return fmt.Errorf("refusing to discard %s: this node is marked read-write, so a live primary may be serving from it (reinitialize is replica-only)", a.cfg.PGDATA)
+		}
+		if a.lastMarkerOK && a.lastMarker.Primary == a.cfg.PodName {
+			return fmt.Errorf("refusing to discard %s: the primary marker now records %s as the primary (reinitialize is replica-only)", a.cfg.PGDATA, a.cfg.PodName)
+		}
 		// Stop, then discard the data directory. The reconcile loop takes it from here:
 		// an empty PGDATA on a node that is not the chosen primary is exactly the
 		// BootstrapClone case, so the rebuild runs through the same path a brand-new
@@ -140,6 +191,44 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 	default:
 		return fmt.Errorf("unknown intent %v", kind)
 	}
+}
+
+// assertRestartRecoverySignal makes the on-disk role explicit before the control-API restart
+// starts the postmaster, mirroring act()'s StartLocal / StartRecovery arms (#298 review).
+//
+// It only ever ADDS standby.signal, never removes one. Asserting the file is what closes the
+// two-writer window described at the call site; REMOVING it would be a new way to bring a node
+// up read-write, and this path has none of the guards act() applies before it does that (the
+// #125 highwater check in particular). So a holder with primary-state data is left exactly as it
+// is -- byte-identical to the previous behaviour -- and every other shape is pinned read-only.
+//
+// Best-effort on an unreadable control file, in the SAFE direction: if pg_controldata cannot be
+// read the role is unknown, and a standby that merely waits for WAL is recoverable while a second
+// writer is not.
+func (a *agent) assertRestartRecoverySignal(ctx context.Context) error {
+	if !process.HasData(a.cfg.PGDATA) {
+		return nil // nothing to start in a role; the loop will bootstrap or clone
+	}
+	holdsLease := a.dcs.IsLeader()
+	cd, err := a.readControlData(ctx)
+	switch {
+	case err != nil:
+		a.log.Warn("control restart: could not read pg_controldata; starting read-only (standby.signal) rather than risk a second writer", "err", err)
+	case cd.InRecovery:
+		// standby-state data: assert what the control file already says, exactly as StartLocal
+		// does. InRecovery comes from pg_control, never from the file, so the two can disagree.
+	case holdsLease:
+		// primary-state data on the lease holder: act()'s StartLocal would clear the signal and
+		// come up read-write here, but only after unsafeToServe. Leave the directory untouched.
+		return nil
+	default:
+		a.log.Warn("control restart: primary-state data on a node that does not hold the lease; starting read-only (standby.signal) so it cannot become a second writer",
+			"node", a.cfg.PodName)
+	}
+	if err := process.SetRecoverySignal(a.cfg.PGDATA); err != nil {
+		return fmt.Errorf("control restart: assert standby.signal before starting: %w", err)
+	}
+	return nil
 }
 
 // dropRestoreRecord invalidates the restore-outcome record when this volume's contents
