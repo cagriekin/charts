@@ -1238,6 +1238,24 @@ assert_not_contains "#298: no audit-extension rule when audit is off" "${netpol_
 agent_null_out=$(helm template test-pg "${CHART_DIR}" --set ha.agent=null 2>&1 || true)
 assert_contains "#298: a nulled ha.agent fails with the guard message" "${agent_null_out}" "ha.agent is required when ha.enabled=true"
 assert_not_contains "#298: ...not with a raw nil-pointer" "${agent_null_out}" "nil pointer evaluating"
+# ...and the OTHER half of the mode axis: standalone runs no agent, so nulling the block must
+# RENDER, not fail. The guard above is agentMode-scoped by design, which is why every
+# ha.agent.* dereference outside an agentMode gate has to be nil-safe (#298 review). Nulling one
+# level deeper is the same class and must equally never surface a raw nil-pointer.
+for _null_path in "ha.agent" "ha.agent.control" "ha.agent.control.restore" "ha.agent.dcs" "ha.agent.monitoring"; do
+  _null_out=$(helm template test-pg "${CHART_DIR}" --set ha.enabled=false --set postgresql.replicaCount=0 \
+    --set "${_null_path}=null" 2>&1 || true)
+  assert_not_contains "#298: standalone with ${_null_path}=null renders (no raw nil-pointer)" \
+    "${_null_out}" "nil pointer evaluating"
+done
+# ...and in AGENT mode a nulled sub-block is "feature off", never a nil-pointer from whichever
+# template evaluates it first (rbac.yaml's pg.controlRestoreEnabled got there before
+# statefulset.yaml's named guards).
+for _null_path in "ha.agent.control" "ha.agent.control.restore"; do
+  _null_out=$(helm template test-pg "${CHART_DIR}" --set "${_null_path}=null" 2>&1 || true)
+  assert_not_contains "#298: agent mode with ${_null_path}=null renders (no raw nil-pointer)" \
+    "${_null_out}" "nil pointer evaluating"
+done
 
 # #147: the exporter NetworkPolicy now has an extraIngress escape hatch so a Prometheus
 # in another namespace can scrape 9116 (the default 9116 ingress is same-namespace only).
@@ -1508,12 +1526,21 @@ _hba_hook() {
       "${sets[@]}" --show-only templates/statefulset.yaml 2>/dev/null \
       | sed -n '/^ *PGCHART_INS=/,/^ *rm -f "\$PGCHART_INS"/p' | sed 's/^ *//'
   } > "${out}"
-  # A silent extraction failure would make every assertion below vacuous.
+  # A silent extraction failure would make every assertion below vacuous -- and the guard has to
+  # register a FAILURE, not merely return non-zero (#298 review). It called `bad`, which this
+  # suite does not define (helpers.sh has `fail`): bash printed "bad: command not found", the
+  # caller's `if _hba_hook && _hba_hook` swallowed the status, FAIL_COUNT stayed 0 and every
+  # assertion below was skipped with the suite still reporting green -- exactly the vacuous shape
+  # this guard was added to prevent. Same for a syntax error in the extracted block: `bash -n`'s
+  # bare status was the function's return value, so that too skipped silently.
   if ! grep -q 'pgchart.ins' "${out}"; then
-    bad "#298: could not extract the rendered pgHba hook" "the assertions below would prove nothing"
+    fail "#298: could not extract the rendered pgHba hook" "the assertions below would prove nothing"
     return 1
   fi
-  bash -n "${out}"
+  if ! bash -n "${out}"; then
+    fail "#298: the extracted pgHba hook is not valid bash" "the assertions below would prove nothing"
+    return 1
+  fi
 }
 sed -n '/cat > "$PGDATA\/pg_hba.conf"/,/^EOF$/p' "${CHART_DIR}/../images/pg-ha/entrypoint.sh" \
   | grep -vE '^cat |^EOF$|^[[:space:]]*cat ' > "${_hba2}/pg_hba.conf"
@@ -1540,13 +1567,43 @@ if _hba_hook "${_hba2}/hook1.sh" 'host all all 10.1.0.0/16 trust' \
   assert_eq "#298: the re-emitted block is still above the network catch-all" "yes" \
     "$([ -n "${_up_catchall}" ] && [ "${_up_reject}" -lt "${_up_catchall}" ] && echo yes || echo no)"
 fi
+# ...and a declared rule that COLLIDES with the file's only non-loopback host rule must not
+# delete the anchor (#298 review). Standalone runs the OFFICIAL postgres image, whose
+# docker-entrypoint appends `host all all all <method>` single-spaced -- the same shape an
+# operator writes -- so a strip pass that ran before the anchor was chosen removed it, the
+# insert then found nothing to anchor on, and NOT ONE of the entries was applied. The single
+# pass must land the whole list where the colliding rule was, still exactly once, and stay
+# idempotent across a restart.
+printf '%s\n' \
+  'local   all             all                                     trust' \
+  'host    all             all             127.0.0.1/32            scram-sha-256' \
+  'host    all             all             ::1/128                 scram-sha-256' \
+  'host all all all scram-sha-256' > "${_hba2}/pg_hba_official.conf"
+if _hba_hook "${_hba2}/hook3.sh" 'host all all 10.1.0.0/16 trust' 'host all all all scram-sha-256'; then
+  bash "${_hba2}/hook3.sh" "${_hba2}/pg_hba_official.conf" 2>/dev/null
+  assert_eq "#298: a declared rule colliding with the anchor still applies the whole list" "1" \
+    "$(grep -c "10.1.0.0/16 trust" "${_hba2}/pg_hba_official.conf")"
+  assert_eq "#298: ...and the colliding rule is not duplicated" "1" \
+    "$(grep -c "^host all all all scram-sha-256$" "${_hba2}/pg_hba_official.conf")"
+  _coll_trust=$(grep -n "10.1.0.0/16 trust" "${_hba2}/pg_hba_official.conf" | head -1 | cut -d: -f1)
+  _coll_all=$(grep -n "^host all all all scram-sha-256$" "${_hba2}/pg_hba_official.conf" | head -1 | cut -d: -f1)
+  assert_eq "#298: ...in the declared order, above the catch-all" "yes" \
+    "$([ -n "${_coll_trust}" ] && [ -n "${_coll_all}" ] && [ "${_coll_trust}" -lt "${_coll_all}" ] && echo yes || echo no)"
+  _coll_snap=$(cat "${_hba2}/pg_hba_official.conf")
+  bash "${_hba2}/hook3.sh" "${_hba2}/pg_hba_official.conf" 2>/dev/null
+  assert_eq "#298: ...and the collision case is idempotent too" "yes" \
+    "$([ "${_coll_snap}" = "$(cat "${_hba2}/pg_hba_official.conf")" ] && echo yes || echo no)"
+fi
 rm -rf "${_hba2}"
 
 # The render must no longer top up with `grep -qF` (that filter is what made the top-up
-# order-dependent), and must strip before it inserts.
+# order-dependent), and the strip must happen in the SAME awk pass as the insert -- a separate
+# pre-pass could delete the anchor itself (#298 review).
 assert_not_contains "#298: the pgHba insert no longer tops up only the missing entries" \
   "${hba_render}" 'grep -qF'
-assert_contains "#298: the pgHba insert strips the previously-inserted copies first" \
+assert_contains "#298: the pgHba insert strips the previously-inserted copies" \
+  "${hba_render}" "NR==FNR"
+assert_not_contains "#298: ...in the same awk pass, not a pre-pass that can drop the anchor" \
   "${hba_render}" "pgchart.base"
 
 # postStart sed insert, covered by the "config standalone: pgHba entry in postStart" case.

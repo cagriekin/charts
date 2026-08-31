@@ -480,10 +480,17 @@
   `["host all all 10.1.0.0/16 trust", "host all all 10.1.0.0/24 reject"]` -- with the reject
   appended later -- ended up REJECTING the /24 range the operator had trusted: the exact
   inversion the one-pass design was written to prevent, reached through a second `helm upgrade`.
-  The hook now strips every declared rule from the file first and re-inserts the full list at the
-  original anchor, so the block is idempotent and its order authoritative on every start
-  whatever it was before, and it is skipped entirely when the result is byte-identical. Agent
-  mode was never affected (`pgconf.AssemblePgHba` places the whole list itself, #144).
+  The hook now strips every declared rule and re-inserts the full list at the anchor, so the
+  block is idempotent and its order authoritative on every start whatever it was before, and it
+  is skipped entirely when the result is byte-identical. Strip and insert happen in ONE awk pass,
+  with the anchor chosen BEFORE the strip (#298 review): a separate strip pre-pass could delete
+  the anchor itself, because standalone runs the OFFICIAL postgres image, whose
+  docker-entrypoint appends the file's only non-loopback host rule as single-spaced
+  `host all all all <method>` -- the exact shape an operator writes. A `postgresql.pgHba` entry
+  byte-identical to it was stripped, the insert then found nothing to anchor on, and NOT ONE of
+  the entries was applied (the grep-filtered form it replaced at least applied the rest). The
+  declared list now simply lands where the colliding rule was. Agent mode was never affected
+  (`pgconf.AssemblePgHba` places the whole list itself, #144).
 
 - **The bundled etcd RBAC bootstrap Job accepted a digest-only image pin and rendered an invalid
   reference (#298 review, etcd 0.1.9).** `pg.haImage` now delegates to `pg.image`, which supports
@@ -510,9 +517,14 @@
   while `statefulset.yaml`'s control-API validation dereferences `.Values.ha.agent.control`
   unconditionally. So `--set ha.enabled=false --set ha.agent=null` died with
   `nil pointer evaluating interface {}.control`, the message class that guard replaced, on the
-  other half of the mode axis. Both `control` and its `restore` sub-block now default to an
-  empty dict, which reads as "no control API" -- what standalone means. Agent mode still gets
-  the guard's named error first, so nothing there changes.
+  other half of the mode axis. `control`, its `restore` sub-block, and every sub-block
+  dereferenced two levels deep (`control.tls`, `restore.admissionPolicy`) now default to an empty
+  dict, which reads as "nothing set" -- so standalone renders and agent mode gets the named
+  `fail` rather than a nil-pointer from one level further in (#298 review). `pg.controlRestoreEnabled`
+  got the same treatment: `rbac.yaml` evaluates it before `statefulset.yaml`'s guards can speak,
+  so `--set ha.agent.control=null` still died there with
+  `nil pointer evaluating interface {}.enabled`. Agent mode still gets the
+  `ha.agent is required` message first, so nothing there changes.
 
 - **The transient bootstrap postmaster is stopped when `pg_ctl -w start` times out
   (`images/pg-ha/entrypoint.sh`, #298 review).** Both `stop` calls in `bootstrap_initdb` were
@@ -708,6 +720,15 @@
   passes inline, so editing the template could not fail it -- the same shape as the vacuous
   assertions fixed elsewhere in this section. It now extracts the hook from `helm template` and
   executes it, and refuses to assert anything if the extraction comes back empty.
+
+  That refusal did not actually refuse (#298 review): it called `bad`, which this suite does not
+  define -- helpers.sh has `fail` -- so bash printed "bad: command not found", the caller's
+  `if _hba_hook && _hba_hook` swallowed the status, `FAIL_COUNT` stayed 0 and every assertion
+  below was SKIPPED with the suite still reporting green. A `bash -n` failure on the extracted
+  block skipped just as silently. Both now register a failure. Mutation-proven: emptying the
+  extraction turns the suite red instead of shrinking it. The case where a declared rule collides
+  with the anchor, and the standalone/agent-mode `--set ha.agent[.control[.restore]]=null`
+  renders, are covered too.
 
 - **Two more image-suite assertions were vacuous, both mutation-proven (#298 review).** The
   completion-sentinel check searched for the sentinel's NAME anywhere in `entrypoint.sh`, and that

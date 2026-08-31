@@ -1825,8 +1825,16 @@ true
        on THIS helper rather than on the value directly, so the grant and its guard cannot
        drift apart -- a Role that carries the escalation primitive without the policy that
        bounds it is the failure mode #279 exists to prevent. */ -}}
+{{- /* NIL-SAFE down the whole chain (#298 review). statefulset.yaml was made tolerant of an
+       absent control/restore block, but this helper -- which rbac.yaml evaluates before
+       statefulset.yaml's named guards can speak -- still dereferenced it straight, so
+       `--set ha.agent.control=null` (or `...control.restore=null`) died with
+       `nil pointer evaluating interface {}.enabled` from rbac.yaml. Nulling a sub-block means
+       "the feature is off", which is what an empty chain now evaluates to. The agentMode arm
+       stays FIRST so `ha.agent=null` still gets statefulset.yaml's `ha.agent is required`
+       message rather than a silent false. */ -}}
 {{- define "pg.controlRestoreEnabled" -}}
-{{- and (eq (include "pg.agentMode" .) "true") .Values.ha.agent.control.restore.enabled -}}
+{{- and (eq (include "pg.agentMode" .) "true") ((((.Values.ha.agent).control).restore).enabled) -}}
 {{- end -}}
 
 {{- /* Name of the ValidatingAdmissionPolicy (and its binding) that bounds the restore

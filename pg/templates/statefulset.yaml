@@ -90,13 +90,23 @@
 {{- /* And `restore` on its own, because two of its reads below are OUTSIDE the
        `if $control.enabled` block (restore requires control, and the guard that says so
        has to be able to read restore.enabled first), so an absent control block would
-       nil-deref there even with $control defaulted. */}}
+       nil-deref there even with $control defaulted.
+
+       Every SUB-block that is dereferenced two levels deep gets the same treatment (#298
+       review): defaulting only `control` and `restore` still left
+       `--set ha.agent.control.tls=null` and
+       `--set ha.agent.control.restore.admissionPolicy=null` dying with
+       `nil pointer evaluating interface {}.existingSecret` / `.enabled` -- the raw message
+       class this whole block exists to replace, reached by nulling one level further in.
+       An absent sub-block reads as "nothing set", so the named `fail` below fires instead. */}}
 {{- $restore := $control.restore | default dict }}
+{{- $controlTLS := $control.tls | default dict }}
+{{- $restoreAP := $restore.admissionPolicy | default dict }}
 {{- if $control.enabled }}
 {{- if ne (include "pg.agentMode" .) "true" }}
 {{- fail "ha.agent.control.enabled requires ha.enabled=true: the control API is served by the Go agent, and standalone mode runs no agent." }}
 {{- end }}
-{{- if not $control.tls.existingSecret }}
+{{- if not $controlTLS.existingSecret }}
 {{- fail "ha.agent.control.enabled requires ha.agent.control.tls.existingSecret (a Secret with keys tls.crt, tls.key, ca.crt). The control API is mTLS-only -- there is no token or plaintext mode -- so without client-CA material it would have no way to authenticate callers and the agent refuses to start." }}
 {{- end }}
 {{- if eq (int $control.port) 9200 }}
@@ -128,7 +138,7 @@
        primitive on a token that sits next to user-supplied SQL. Opting out stays possible
        -- a cluster below 1.30, a namespace-limited installer, a platform-managed policy --
        but it has to be said out loud in values, where it is reviewable. */}}
-{{- if and (not $restore.admissionPolicy.enabled) (not $restore.admissionPolicy.acknowledgeUnbounded) }}
+{{- if and (not $restoreAP.enabled) (not $restoreAP.acknowledgeUnbounded) }}
 {{- fail "ha.agent.control.restore.admissionPolicy.enabled=false leaves the restore feature's `create jobs` grant unbounded: RBAC cannot restrict create by resourceName, so anything holding the database pods' ServiceAccount token could create arbitrary Jobs in this namespace and name any ServiceAccount in them. Either leave admissionPolicy.enabled=true (it needs Kubernetes >= 1.30 and cluster-scoped create on ValidatingAdmissionPolicy), or set ha.agent.control.restore.admissionPolicy.acknowledgeUnbounded=true to accept that trade deliberately" }}
 {{- end }}
 {{- end }}
@@ -1082,12 +1092,25 @@ spec:
                                the rules declared before it. First-match-wins means the newest
                                entry then silently outranked every earlier one, which is the
                                exact inversion the one-pass design was written to prevent.
-                               Stripping every declared rule first and re-inserting the full
-                               list at the original anchor makes the block idempotent and the
-                               order authoritative on every start, whatever it was before.
-                               Line-equality is the same identity test the old `grep -qF` used;
-                               the entrypoint's own rules are column-aligned, so none of them
-                               can collide with a single-spaced operator rule.
+                               Stripping every declared rule and re-inserting the full list at
+                               the anchor makes the block idempotent and the order authoritative
+                               on every start, whatever it was before. Line-equality is the same
+                               identity test the old `grep -qF` used.
+
+                               ONE awk pass does the strip AND the insert, and the anchor is
+                               chosen BEFORE the strip (#298 review). A separate strip pass could
+                               delete the anchor itself: standalone mode runs the OFFICIAL
+                               postgres image, whose docker-entrypoint appends the file's only
+                               non-loopback host rule as single-spaced
+                               `host all all all <method>` -- the exact shape an operator writes
+                               -- so a postgresql.pgHba entry byte-identical to it was stripped,
+                               the second pass then found nothing to anchor on, and NONE of the
+                               entries were applied (the old grep-filtered form at least applied
+                               the rest). Selecting the anchor while that line is still present,
+                               and dropping it only via `!($0 in want)` after the block has been
+                               emitted in its place, keeps the collision case correct and
+                               idempotent: the declared list simply lands where the colliding
+                               rule was.
 
                                The agent path is unaffected -- pgconf.AssemblePgHba places the
                                whole list itself, in order, with loopback first (#144).
@@ -1104,22 +1127,21 @@ spec:
                         printf '%s\n' '{{ . }}' >> "$PGCHART_INS"
                         {{- end }}
                         if [ -s "$PGCHART_INS" ]; then
-                          awk 'NR==FNR { want[$0]; next } !($0 in want)' \
-                            "$PGCHART_INS" "$HBA_FILE" > "${HBA_FILE}.pgchart.base"
                           if awk -v insfile="$PGCHART_INS" '
+                                NR==FNR { want[$0]; next }
                                 !done && $1 ~ /^host(ssl|nossl)?$/ && $4 != "127.0.0.1/32" && $4 != "::1/128" {
                                   while ((getline l < insfile) > 0) print l
                                   close(insfile); done=1
                                 }
-                                { print }
-                                END { if (!done) exit 3 }' "${HBA_FILE}.pgchart.base" > "${HBA_FILE}.pgchart.tmp"; then
+                                !($0 in want) { print }
+                                END { if (!done) exit 3 }' "$PGCHART_INS" "$HBA_FILE" > "${HBA_FILE}.pgchart.tmp"; then
                             if [ "$(cat "${HBA_FILE}.pgchart.tmp")" != "$(cat "$HBA_FILE")" ]; then
                               cp "${HBA_FILE}.pgchart.tmp" "$HBA_FILE"
                             fi
                           else
                             echo "postStart: no non-loopback host rule in $HBA_FILE to anchor on; NOT applying the postgresql.pgHba entries" >&2
                           fi
-                          rm -f "${HBA_FILE}.pgchart.tmp" "${HBA_FILE}.pgchart.base"
+                          rm -f "${HBA_FILE}.pgchart.tmp"
                         fi
                         rm -f "$PGCHART_INS"
                         {{- end }}
@@ -1550,7 +1572,7 @@ spec:
 {{- if $control.enabled }}
         - name: agent-control-tls
           secret:
-            secretName: {{ $control.tls.existingSecret | quote }}
+            secretName: {{ $controlTLS.existingSecret | quote }}
             defaultMode: 0400
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
