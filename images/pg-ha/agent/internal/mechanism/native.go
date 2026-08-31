@@ -737,11 +737,13 @@ func (n *Native) RejoinForceRewind(ctx context.Context, target Conn) (rerr error
 			ErrRewindUnreachable, target.Host, err, strings.TrimSpace(out))
 	}
 	// Anything else is NOT divergence either, and the DEFAULT matters more than either list.
-	// Defaulting to ErrRewindDiverged would send every failure absent from the
-	// connection-failure whitelist -- rotated credentials ("password authentication failed"),
-	// a missing pg_hba entry, "the database system is starting up", "too many connections", a
-	// restore_command error -- through a PGDATA move and a re-clone of a node whose history is
-	// fine, inverting the contract #178 established (see this function's doc comment).
+	// Defaulting to ErrRewindDiverged would send every failure absent from the two lists above
+	// -- "target server must be shut down cleanly", a wal_log_hints/data-checksums complaint,
+	// "target server needs to exit backup mode", a restore_command error -- through a PGDATA
+	// move and a re-clone of a node whose history is fine, inverting the contract #178
+	// established (see this function's doc comment). Those examples are all TARGET-side, which
+	// is also why they are the ones that keep counting toward rewindFailureLimit: a re-clone
+	// replaces exactly the local data directory they describe, so escalating converges.
 	return fmt.Errorf("native: pg_rewind onto %s failed for a reason that is not divergence, so the data directory is left alone; retrying: %w: %s",
 		target.Host, err, strings.TrimSpace(out))
 }
@@ -815,9 +817,11 @@ func isRewindDivergence(out string) bool {
 // source", as opposed to "histories diverged beyond repair". Keeping these apart is what
 // stops a transient blip from escalating into a full re-clone (#178).
 //
-// This list does NOT decide whether to reclone -- isRewindDivergence does, and everything
-// unrecognised is retried rather than escalated. It exists for the message, which is the
-// accurate one for the common case and is what the caller logs.
+// This list does not decide whether to reclone IMMEDIATELY -- isRewindDivergence does, and
+// everything unrecognised is retried rather than escalated. It DOES, together with
+// isSourceRejection, decide the ErrRewindUnreachable tag, and rejoinOnto exempts that tag from
+// rewindFailureLimit -- so a match here also keeps the failure out of the re-clone backstop
+// entirely (#298 review). See the sentinel's doc comment for why that exemption is right.
 func isConnectionFailure(out string) bool {
 	s := strings.ToLower(out)
 	for _, m := range []string{

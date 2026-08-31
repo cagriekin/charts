@@ -745,6 +745,64 @@ func TestActReleaseLeaseLeavesStandbyRunning(t *testing.T) {
 	}
 }
 
+// #298 review: a read-write observation that a demote OVERTOOK must be discarded. tick()
+// samples the role with observe() -- multi-second and network-bound -- and stores the derived
+// value outside opMu, while OnLost demotes under opMu and clears the latch. So a tick that saw a
+// still-read-write postmaster could land its Store(true) after the fence had already cleared it.
+// That was benign while the latch only gated the fence; it stopped being benign once
+// SafeToRelease made it gate the LOCK RELEASE, where a stale true vetoes a release that was safe
+// -- the peer then waits out leaseDuration instead of milliseconds, and the operator reads "may
+// still be a read-write primary" about a fence that completed cleanly.
+func TestDeriveServingRWDiscardsAnObservationADemoteOvertook(t *testing.T) {
+	a := newTestAgent(t, &fakePostmaster{}, &fakeDCS{})
+	rwPrimary := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: true, InRecovery: false}, LocalProcessAlive: true}
+
+	// Baseline: no demote in flight, so the observation applies.
+	a.deriveServingRW(a.fenceGen.Load(), rwPrimary)
+	if !a.servingRW.Load() {
+		t.Fatal("a read-write primary must arm the latch when no demote intervened")
+	}
+
+	// Now the race: capture the generation as tick() does, let a demote complete, then apply.
+	gen := a.fenceGen.Load()
+	a.clearServingRWForPlannedStepDown() // stands in for OnLost's fence or a step-down
+	a.deriveServingRW(gen, rwPrimary)
+	if a.servingRW.Load() {
+		t.Error("a read-write sample taken BEFORE the demote must not resurrect the latch: SafeToRelease would then veto a release that was safe")
+	}
+
+	// The safe direction is never gated -- a demote racing a standby/dead-process observation
+	// must still be able to clear the latch, or the veto would outlive the writer.
+	a.servingRW.Store(true)
+	gen = a.fenceGen.Load()
+	a.clearServingRWForPlannedStepDown()
+	a.deriveServingRW(gen, reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: true, InRecovery: true}, LocalProcessAlive: true})
+	if a.servingRW.Load() {
+		t.Error("an observed STANDBY must clear the latch regardless of the generation")
+	}
+	a.servingRW.Store(true)
+	gen = a.fenceGen.Load()
+	a.clearServingRWForPlannedStepDown()
+	a.deriveServingRW(gen, reconcile.Observation{Local: reconcile.LocalState{HasData: true}, LocalProcessAlive: false})
+	if a.servingRW.Load() {
+		t.Error("a dead postmaster must clear the latch regardless of the generation")
+	}
+}
+
+// ...and the uncertainty case still HOLDS the latch: SQL unreachable while the process is alive
+// is the wedged-writer state, and neither arm of deriveServingRW may touch it.
+func TestDeriveServingRWHoldsTheLatchOnAnUnreachableProbe(t *testing.T) {
+	a := newTestAgent(t, &fakePostmaster{}, &fakeDCS{})
+	a.servingRW.Store(true)
+	a.deriveServingRW(a.fenceGen.Load(), reconcile.Observation{
+		Local:             reconcile.LocalState{HasData: true, Running: false},
+		LocalProcessAlive: true,
+	})
+	if !a.servingRW.Load() {
+		t.Error("an unreachable probe on a live postmaster must leave the latch armed (fail-safe: it may still be a writer)")
+	}
+}
+
 // #298 review: a PLANNED step-down must not read as a split-brain fence. dcs.OnLost fires for
 // a voluntary Release() too and gates only on servingRW, so a latch left set here counted an
 // IncFence() and logged "lost leadership; demoting (fence)" -- three switchovers in a

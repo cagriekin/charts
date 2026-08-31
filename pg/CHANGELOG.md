@@ -744,6 +744,18 @@
   the whole `initdb` on every restart. It is now checked with the credentials, before the first
   write to the volume.
 
+- **A read-write observation a demote overtook no longer resurrects the fence latch (#298
+  review, agent).** The reconcile tick samples the local role with a multi-second, network-bound
+  probe and then stores the derived value outside `opMu`, while the lost-leadership fence demotes
+  under `opMu` and clears it -- so a tick that had seen a still-read-write postmaster could land
+  its store *after* the fence, leaving the node marked a writer. That was harmless while the
+  latch only gated the fence itself (the next tick re-derives it), and stopped being harmless
+  once the same latch began gating the lock release: a stale value vetoes a release that was
+  safe, so the peer waits out `leaseDuration` instead of milliseconds and the operator reads "may
+  still be a read-write primary" about a fence that completed cleanly. Completed demotes now
+  carry a generation the derivation checks, and only the read-write direction is gated -- a
+  standby or a dead postmaster still clears the latch unconditionally.
+
 - **The leader lock is no longer freed when the fence demote failed (#298 review, both DCS
   backends).** Freeing it is what turns a step-down into a millisecond handoff instead of one at
   TTL expiry, and that is safe on exactly one condition: the demote `OnLost` just performed

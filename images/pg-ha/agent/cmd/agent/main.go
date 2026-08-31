@@ -261,6 +261,20 @@ type agent struct {
 	lastMarker   k8s.Marker
 	lastMarkerOK bool
 
+	// fenceGen counts COMPLETED demotes -- OnLost's fence and every planned step-down. It
+	// exists to sequence tick()'s servingRW derivation against them (#298 review).
+	//
+	// tick() samples the role with observe(), which is multi-second and network-bound, and
+	// then stores the derived value OUTSIDE opMu, while OnLost demotes under opMu and stores
+	// false. So a tick whose observe() saw a still-read-write postmaster could land its
+	// Store(true) AFTER the fence had already cleared the latch, resurrecting a stale "this
+	// node is a writer". That was benign while the latch only gated the fence itself (the next
+	// tick re-derives it); it stopped being benign once SafeToRelease made the latch gate the
+	// LOCK RELEASE too -- a spurious true vetoes a release that was safe, so the peer waits out
+	// leaseDuration instead of milliseconds and the operator reads "may still be a read-write
+	// primary" about a fence that completed cleanly.
+	fenceGen atomic.Uint64
+
 	// Server-TLS verification state (#335), same single-goroutine ownership as the latches
 	// above. tlsCheckedAt throttles the probe to tlsVerifyInterval rather than running it on
 	// every tick, and tlsInactiveLatched keeps the Error to the transition.
@@ -435,8 +449,19 @@ func (a *agent) run() {
 			// (#298 review). servingRW is the agent's own answer to "might a read-write
 			// postmaster still be up here": OnLost clears it only on a COMPLETED demote and
 			// deliberately keeps it set on a failed one, which is exactly the state in which
-			// an immediate handoff would let a peer promote beside a live writer. Holding the
-			// lock then costs the peer the LeaseDuration/TTL it would have waited anyway.
+			// an immediate handoff would let a peer promote beside a live writer.
+			//
+			// The cost of holding is NOT just "the LeaseDuration/TTL the peer would have waited
+			// anyway", and it is worth stating plainly: the hold lasts as long as this node
+			// cannot prove the writer is dead. On the K8s backend client-go lets the RECORDED
+			// holder re-acquire, so this node wins the same Lease back one retryPeriod later (2s
+			// on chart defaults, well inside the 15s leaseDuration) and resumes renewing; on etcd
+			// the orphaned key expires at TTL and this node's queued candidate -- lowest create
+			// revision -- wins it back. So a postmaster genuinely stuck in uninterruptible sleep
+			// keeps leadership until the PROCESS dies (tick clears the latch on
+			// !LocalProcessAlive) or an operator intervenes. That is the deliberate trade -- no
+			// second writer, at the price of no failover -- and the warning each backend logs
+			// plus pg_ha_agent_fences_total / the renew-failure counter are the operator's signal.
 			SafeToRelease: func() bool { return !a.servingRW.Load() },
 			OnLost: func() {
 				a.metr.SetLeader(false)
@@ -467,6 +492,7 @@ func (a *agent) run() {
 					return
 				}
 				a.servingRW.Store(false)
+				a.fenceGen.Add(1) // see the fenceGen field: invalidate an in-flight observation
 			},
 		})
 	}()
@@ -659,6 +685,9 @@ func (a *agent) boot(ctx context.Context) error {
 
 func (a *agent) tick(ctx context.Context) {
 	a.metr.Beat()
+	// Sampled BEFORE observe() so deriveServingRW can tell whether a demote completed while
+	// this tick was looking (#298 review; see the fenceGen field).
+	gen := a.fenceGen.Load()
 	obs := a.observe(ctx)
 	// Track read-write role for the OnLost fence (a standby needs no fence). This is
 	// the pure writer-state (NOT lease-gated: the lease flips to lost before OnLost
@@ -673,12 +702,7 @@ func (a *agent) tick(ctx context.Context) {
 	// that most needs it -- a second writer once it thaws. Fail-safe is to demote on
 	// uncertainty: hold the last known value until the probe answers again or the
 	// postmaster process is actually gone.
-	switch {
-	case obs.Local.Running:
-		a.servingRW.Store(!obs.Local.InRecovery)
-	case !obs.LocalProcessAlive:
-		a.servingRW.Store(false) // process gone: nothing left to fence
-	}
+	a.deriveServingRW(gen, obs)
 	// Verify server TLS from the postmaster itself while it is answering (#335). Gated on
 	// Running because `SHOW ssl` needs a connection: on a cloning or recovering node the probe
 	// would fail for a reason that has nothing to do with TLS, and the throttle would then
@@ -1215,6 +1239,30 @@ const standbyStallTicks = 36
 // that is still alive -- disarms the fence for the one node that most needs it.
 func (a *agent) clearServingRWForPlannedStepDown() {
 	a.servingRW.Store(false)
+	a.fenceGen.Add(1) // a completed demote: invalidate any read-write observation in flight
+}
+
+// deriveServingRW applies tick()'s observed role to the fence latch, discarding an observation
+// that a demote has overtaken.
+//
+// gen is fenceGen as it stood before observe() ran. Only the TRUE direction is gated: storing
+// false can never resurrect a writer, and the two safe-direction cases (a standby, a dead
+// process) must always be allowed through. A stale true is the only value that misleads both
+// consumers of this latch -- OnLost's fence decision and SafeToRelease's release veto.
+func (a *agent) deriveServingRW(gen uint64, obs reconcile.Observation) {
+	switch {
+	case obs.Local.Running:
+		rw := !obs.Local.InRecovery
+		if rw && a.fenceGen.Load() != gen {
+			// A demote completed while observe() was in flight, so this sample predates it.
+			// Leave the latch where the demote put it; the next tick re-derives from scratch.
+			a.log.Info("discarding a read-write observation a demote overtook: this node was demoted while the tick was observing")
+			return
+		}
+		a.servingRW.Store(rw)
+	case !obs.LocalProcessAlive:
+		a.servingRW.Store(false) // process gone: nothing left to fence
+	}
 }
 
 func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.Observation) error {
@@ -3163,8 +3211,12 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 			// leaving an unreaped .diverged.<ts> copy behind. Counting it turned three ticks
 			// (~15s on chart defaults) of a restarting target -- or one whose pod name had not
 			// propagated yet -- into a multi-hour base backup of a standby whose history was
-			// fine. (A target that ACCEPTS the connection and then rejects it -- too many
-			// clients, no pg_hba entry -- is not this class and still counts; see the sentinel.)
+			// fine. (A target that ACCEPTS the connection and then REFUSES the session -- too
+			// many clients, no pg_hba entry, a rotated credential -- is this class TOO, and is
+			// exempt for the same reason: ReclonePreserving dials the same source with the same
+			// credentials through the same pg_hba, so it is refused identically. See
+			// isSourceRejection. What still counts is a TARGET-side refusal, which a re-clone
+			// genuinely does resolve.)
 			// The streak is left ALONE rather than reset: an unreachable tick is no evidence
 			// about a genuine local refusal that was already accumulating against this target.
 			return err

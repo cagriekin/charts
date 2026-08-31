@@ -18,9 +18,11 @@ import (
 // proceed; the caller falls back to ReclonePreserving (the #175 data-safe path).
 var ErrRewindDiverged = errors.New("mechanism: rewind diverged, reclone required")
 
-// ErrRewindUnreachable is returned by RejoinForceRewind when pg_rewind could not CONNECT to
-// the target at all. It is a strictly narrower claim than "not divergence": the rewind never
-// examined this node's history, so nothing is known about it either way.
+// ErrRewindUnreachable is returned by RejoinForceRewind when pg_rewind could not obtain a
+// USABLE CONNECTION to its source: either the transport never connected, or the source accepted
+// the connection and then refused the session (the two classes are spelled out below). It is a
+// strictly narrower claim than "not divergence": the rewind never examined this node's history,
+// so nothing is known about it either way.
 //
 // The caller must not count it toward the re-clone backstop (#298 review). That backstop
 // exists for a refusal that is permanent AND local -- pg_rewind wanting a configuration the
