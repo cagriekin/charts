@@ -491,8 +491,11 @@ func (a *agent) run() {
 					a.log.Error("fence demote failed; keeping this node marked read-write so a later lease loss still fences", "err", err)
 					return
 				}
-				a.servingRW.Store(false)
+				// Bump BEFORE the clear, for the reason clearServingRWForPlannedStepDown
+				// states: deriveServingRW's gate is a check-then-act pair, so the generation
+				// must never become visible later than the false it announces.
 				a.fenceGen.Add(1) // see the fenceGen field: invalidate an in-flight observation
+				a.servingRW.Store(false)
 			},
 		})
 	}()
@@ -1238,8 +1241,13 @@ const standbyStallTicks = 36
 // tick() requires: clearing on anything weaker -- an unreachable SQL probe on a postmaster
 // that is still alive -- disarms the fence for the one node that most needs it.
 func (a *agent) clearServingRWForPlannedStepDown() {
-	a.servingRW.Store(false)
+	// Bumped BEFORE the clear, not after it (#298 review). deriveServingRW's gate is a
+	// check-then-act pair, so the generation has to be visible no LATER than the false it
+	// announces: with the bump second, a tick could pass its check (generation still old),
+	// have the clear land, and then store its stale true over it. Bumping first makes every
+	// interleaving end at false -- see the post-store re-check in deriveServingRW.
 	a.fenceGen.Add(1) // a completed demote: invalidate any read-write observation in flight
+	a.servingRW.Store(false)
 }
 
 // deriveServingRW applies tick()'s observed role to the fence latch, discarding an observation
@@ -1249,17 +1257,38 @@ func (a *agent) clearServingRWForPlannedStepDown() {
 // false can never resurrect a writer, and the two safe-direction cases (a standby, a dead
 // process) must always be allowed through. A stale true is the only value that misleads both
 // consumers of this latch -- OnLost's fence decision and SafeToRelease's release veto.
+//
+// The generation is checked TWICE, before and after the store (#298 review). One check ahead
+// of it is a check-then-act pair, not an atomic decision: OnLost runs on its own goroutine and
+// does not hold opMu at the moment it clears the latch, so a demote landing in the window
+// between the check and the store slipped through and the stale true stood until the NEXT tick
+// re-derived it -- a full reconcileInterval of SafeToRelease vetoing a release that was safe,
+// which is the whole failure this gate exists to prevent. Both demote sites bump fenceGen
+// before clearing servingRW, so a bump observed after the store means the false either has
+// landed or is about to, and re-asserting it here is correct in both orders.
 func (a *agent) deriveServingRW(gen uint64, obs reconcile.Observation) {
+	overtaken := func() bool {
+		if a.fenceGen.Load() == gen {
+			return false
+		}
+		// A demote completed while observe() was in flight, so this sample predates it. Leave
+		// the latch where the demote put it; the next tick re-derives from scratch.
+		a.log.Info("discarding a read-write observation a demote overtook: this node was demoted while the tick was observing")
+		return true
+	}
 	switch {
 	case obs.Local.Running:
-		rw := !obs.Local.InRecovery
-		if rw && a.fenceGen.Load() != gen {
-			// A demote completed while observe() was in flight, so this sample predates it.
-			// Leave the latch where the demote put it; the next tick re-derives from scratch.
-			a.log.Info("discarding a read-write observation a demote overtook: this node was demoted while the tick was observing")
+		if obs.Local.InRecovery {
+			a.servingRW.Store(false) // a standby: the safe direction is never gated
 			return
 		}
-		a.servingRW.Store(rw)
+		if overtaken() {
+			return
+		}
+		a.servingRW.Store(true)
+		if overtaken() {
+			a.servingRW.Store(false)
+		}
 	case !obs.LocalProcessAlive:
 		a.servingRW.Store(false) // process gone: nothing left to fence
 	}

@@ -573,7 +573,11 @@
   safe, so the peer waits out `leaseDuration` instead of milliseconds and the operator reads "may
   still be a read-write primary" about a fence that completed cleanly. Completed demotes now
   carry a generation the derivation checks, and only the read-write direction is gated -- a
-  standby or a dead postmaster still clears the latch unconditionally.
+  standby or a dead postmaster still clears the latch unconditionally. The generation is
+  checked on both sides of the store, and bumped *before* the latch is cleared, because one
+  check ahead of it is a check-then-act pair rather than an atomic decision: a demote landing
+  between the check and the store slipped through and the stale value stood for a full
+  reconcile interval.
 
 - **The leader lock is no longer freed when the fence demote failed (#298 review, both DCS
   backends).** Freeing it is what turns a step-down into a millisecond handoff instead of one at

@@ -789,6 +789,21 @@ func TestDeriveServingRWDiscardsAnObservationADemoteOvertook(t *testing.T) {
 	}
 }
 
+// NOTE on what is NOT tested here (#298 review). deriveServingRW re-checks the generation AFTER
+// its store, to catch a demote that lands in the window between the pre-store check and the store
+// itself. That window is a few instructions wide and there is no seam to drive it from a test:
+// passing a stale generation trips the FIRST check instead, and a background demote spinning
+// concurrently makes the generation move continuously, so "it moved by the time I sampled" can no
+// longer distinguish a demote that landed DURING the call from one that landed just after it --
+// any assertion built on that is a false positive waiting to happen.
+//
+// A 200,000-pair sequential stress loop does catch the pre-fix code (measured: first violation
+// around iteration 14k), but it misses entirely at 100k, so it is unreliable as a regression
+// test and costs ~8s under -race. The post-store re-check is therefore argued from the ordering
+// -- both demote sites bump fenceGen BEFORE clearing servingRW, so a bump observed after the
+// store means the false has landed or is about to -- and pinned only in the deterministic
+// demote-before-derive direction, above.
+
 // ...and the uncertainty case still HOLDS the latch: SQL unreachable while the process is alive
 // is the wedged-writer state, and neither arm of deriveServingRW may touch it.
 func TestDeriveServingRWHoldsTheLatchOnAnUnreachableProbe(t *testing.T) {
