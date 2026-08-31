@@ -558,3 +558,46 @@ func TestPreloadsLibraryReportsAReadFailure(t *testing.T) {
 		t.Fatal("an unreadable file must not be reported as `does not preload`")
 	}
 }
+
+// #298: the inherited upstream must be readable BEFORE RemoveRecoveryConfig strips it -- that is
+// what lets the repmgrd->2.0.0 roll carry a standby's upstream into the agent's own fragment
+// instead of leaving it with standby.signal and no primary_conninfo at all.
+func TestPrimaryConninfoValue(t *testing.T) {
+	dir := t.TempDir()
+	write := func(body string) string {
+		p := filepath.Join(dir, "auto.conf")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	got, err := PrimaryConninfoValue(write("primary_conninfo = 'host=pg-0 port=5432 user=repmgr'\n"))
+	if err != nil || got != "host=pg-0 port=5432 user=repmgr" {
+		t.Errorf("got %q err=%v", got, err)
+	}
+	// A commented assignment is not a setting.
+	got, _ = PrimaryConninfoValue(write("#primary_conninfo = 'host=ghost'\n"))
+	if got != "" {
+		t.Errorf("a commented line must not be read as the value, got %q", got)
+	}
+	// PostgreSQL takes the LAST assignment; so must this.
+	got, _ = PrimaryConninfoValue(write("primary_conninfo = 'host=old'\nprimary_conninfo = 'host=new'\n"))
+	if got != "host=new" {
+		t.Errorf("the last assignment must win, got %q", got)
+	}
+	// postgresql.conf doubles an embedded quote.
+	got, _ = PrimaryConninfoValue(write("primary_conninfo = 'host=pg-0 password=a''b'\n"))
+	if got != "host=pg-0 password=a'b" {
+		t.Errorf("embedded quote not un-doubled, got %q", got)
+	}
+	// A file with none, and a file that does not exist, are both "" with no error -- the
+	// caller treats "" as "nothing to carry forward", not as an error.
+	got, err = PrimaryConninfoValue(write("shared_buffers = '128MB'\n"))
+	if got != "" || err != nil {
+		t.Errorf("got %q err=%v", got, err)
+	}
+	got, err = PrimaryConninfoValue(filepath.Join(dir, "absent.conf"))
+	if got != "" || err != nil {
+		t.Errorf("a missing file must be empty with no error, got %q err=%v", got, err)
+	}
+}

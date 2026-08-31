@@ -283,6 +283,28 @@ func (n *Native) writeManagedConf(primaryConninfo string) error {
 	return n.ensureInclude()
 }
 
+// SeedManagedRecovery writes the managed fragment with an upstream inherited from somewhere
+// else -- today, a repmgr-managed primary_conninfo being migrated out of postgresql.auto.conf
+// (#298).
+//
+// Exported for that one caller, and deliberately not on the Mechanism interface: it exists to
+// carry a value the agent did not choose, which is a migration concern rather than a
+// mechanism operation. Writing it on a node that turns out to be a primary is harmless --
+// PostgreSQL ignores primary_conninfo without standby.signal, and this fragment is
+// role-independent by design (see writeManagedConf).
+// slotName is the upstream slot to keep using -- repmgr's own, carried over -- or "" for
+// slotless streaming. It must NOT be this agent's ordinal slot: that slot does not exist on a
+// still-repmgrd primary, and a walreceiver whose named slot is missing does not fall back to
+// slotless streaming, it fails with `replication slot "..." does not exist` and retries forever
+// (#298, observed live). Restoring n.SlotName is the job of the first real Follow, which creates
+// the slot on the upstream before pointing at it.
+func (n *Native) SeedManagedRecovery(primaryConninfo, slotName string) error {
+	saved := n.SlotName
+	n.SlotName = slotName
+	defer func() { n.SlotName = saved }()
+	return n.writeManagedConf(primaryConninfo)
+}
+
 // GenerateConfig writes the managed fragment idempotently.
 //
 // There is no repmgr.conf analogue: what that file carried (node_id, conninfo, failover

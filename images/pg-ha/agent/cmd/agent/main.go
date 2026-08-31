@@ -2716,9 +2716,90 @@ func (a *agent) migrateForeignRecoveryConfig() error {
 	// slots, no catalog, no timeline. The identity guarantees that DO matter -- refusing to
 	// follow or rewind onto a different cluster -- are enforced by assertSameCluster on the
 	// paths that move data, where a mismatch is possible.
+	// CARRIED FORWARD, not just deleted (#298, found by the first live run of the repmgrd->2.0.0
+	// roll). The paragraph above says "the effective upstream is preserved either way -- the agent
+	// derives it from the lease" -- and during this very migration that is false. Rolling a live
+	// failoverMode:repmgrd release, the StatefulSet replaces the highest ordinal first: that pod
+	// comes up as the ONLY agent in the cluster, while the real primary is still a 1.x pod running
+	// repmgrd and no agent at all. So no agent-held lease names a leader, Decide returns Wait
+	// ("standby but no known leader; keep the current upstream"), and nothing ever writes the
+	// fragment this function just declared authoritative. The node had `standby.signal` and no
+	// primary_conninfo at all -- PostgreSQL logged `specified neither "primary_conninfo" nor
+	// "restore_command"`, it never streamed, readiness never passed, and the rollout stopped
+	// there with the cluster half migrated. Observed as a 10s livelock: acquire the lease,
+	// refuse to promote on the #171 equal-timeline guard, release, wait, re-acquire.
+	//
+	// Reading the value first and seeding the agent's own fragment with it keeps the node
+	// streaming from wherever repmgr had pointed it, which is what "preserved either way" was
+	// supposed to mean. It is the same upstream, so this changes no topology; the first Follow
+	// the agent performs once the cluster is fully migrated overwrites the fragment properly.
+	inherited, ierr := pgconf.PrimaryConninfoValue(autoConf)
+	inheritedSlot, serr := pgconf.PrimarySlotNameValue(autoConf)
+	if serr != nil {
+		a.log.Warn("in-place migration (#292): could not read the inherited primary_slot_name", "path", autoConf, "err", serr)
+	}
+	if ierr != nil {
+		// Not fatal: the migration below is still the right thing to do, and a node that ends up
+		// without an upstream is recoverable by hand. Say so rather than failing the boot.
+		a.log.Warn("in-place migration (#292): could not read the inherited primary_conninfo; the upstream will not be carried forward",
+			"path", autoConf, "err", ierr)
+	}
 	removed, err := pgconf.RemoveRecoveryConfig(autoConf)
 	if err != nil {
 		return fmt.Errorf("in-place migration (#292): clear the repmgr recovery config from %s: %w", autoConf, err)
+	}
+	if inherited != "" {
+		// Narrow optional interface rather than a Mechanism method: carrying a value the agent
+		// did not choose is a migration concern, not a mechanism operation.
+		type recoverySeeder interface {
+			SeedManagedRecovery(primaryConninfo, slotName string) error
+		}
+		s, ok := a.mech.(recoverySeeder)
+		if !ok {
+			// Never silent: a mechanism that cannot seed leaves this node with standby.signal
+			// and no upstream, which is the deadlock this whole block exists to prevent.
+			a.log.Warn("in-place migration (#292): this mechanism cannot carry the inherited upstream forward; the node may come up as a standby with no primary_conninfo",
+				"upstream", inherited)
+		}
+		if ok {
+			// repmgr's OWN slot, not this agent's ordinal slot (#298, observed live). The
+			// agent's slot does not exist on a still-repmgrd primary, and a walreceiver whose
+			// named slot is missing does not fall back to slotless streaming -- it fails with
+			// `replication slot "pg_ha_slot_N" does not exist` on a loop, which is the same
+			// stalled rollout by a different route. repmgr_slot_N is already there and already
+			// reserving WAL for this node; the first real Follow switches to the agent's slot
+			// and creates it on the upstream first.
+			// PRE-CREATE this agent's own slot on the inherited upstream first (#298, observed
+			// live). Seeding repmgr's slot is not enough on its own: boot() runs GenerateConfig
+			// immediately after this, and writeManagedConf always writes n.SlotName alongside a
+			// non-empty conninfo -- so the fragment is rewritten to pg_ha_slot_N within
+			// milliseconds, and that slot does not exist on a still-repmgrd primary. A
+			// walreceiver whose named slot is missing does not fall back to slotless streaming;
+			// it fails with `replication slot "..." does not exist` forever, which is the same
+			// stalled rollout by a third route. Creating it here makes the fragment
+			// GenerateConfig is about to write valid, and it is the same call Follow would make
+			// before pointing at an upstream. Best-effort: if the upstream is unreachable the
+			// seeded repmgr slot still carries the node until a later Follow.
+			if h := upstreamHost(inherited); h != "" {
+				sctx, scancel := context.WithTimeout(context.Background(), 15*time.Second)
+				ci := pg.ConnInfo{Host: h, Port: 5432, User: a.cfg.RepmgrUser, DB: a.cfg.RepmgrDB, Password: a.cfg.RepmgrPassword}
+				if cerr := a.prober.CreatePhysicalSlot(sctx, ci, a.ownSlotName()); cerr != nil {
+					a.log.Warn("in-place migration (#292): could not pre-create this node's slot on the inherited upstream; it will be created by the first follow",
+						"upstream", h, "slot", a.ownSlotName(), "err", cerr)
+				} else {
+					a.log.Info("in-place migration (#292): pre-created this node's replication slot on the inherited upstream",
+						"upstream", h, "slot", a.ownSlotName())
+				}
+				scancel()
+			}
+			if serr := s.SeedManagedRecovery(inherited, inheritedSlot); serr != nil {
+				a.log.Warn("in-place migration (#292): could not seed the inherited upstream into the agent fragment",
+					"err", serr)
+			} else {
+				a.log.Info("in-place migration (#292): carried the inherited upstream into the agent's fragment so this node keeps streaming through the roll",
+					"upstream", inherited, "slot", inheritedSlot)
+			}
+		}
 	}
 	a.log.Info("in-place migration (#292): cleared the repmgr recovery config; the agent's own fragment is now authoritative",
 		"path", autoConf, "removed", strings.Join(removed, ","),
@@ -4231,6 +4312,26 @@ func (h *selfHealthTracker) stuck(shouldServe, running bool, now time.Time) bool
 // Pod-ordinal parsing itself was never repmgr-specific; since #298 it lives in
 // internal/podname, which both this file and reconcile use.
 const nodeIDBase = 1000
+
+// upstreamHost pulls the host out of a libpq conninfo string, unwrapping the single quotes
+// repmgr writes around it. "" when there is none (#298).
+func upstreamHost(conninfo string) string {
+	for _, tok := range strings.Fields(conninfo) {
+		if v, ok := strings.CutPrefix(tok, "host="); ok {
+			return strings.Trim(v, "'")
+		}
+	}
+	return ""
+}
+
+// ownSlotName is the slot this node streams through once the agent owns replication (#289).
+func (a *agent) ownSlotName() string {
+	ord, ok := podname.Ordinal(a.cfg.PodName)
+	if !ok {
+		return ""
+	}
+	return slotPrefix + strconv.Itoa(ord)
+}
 
 // slotPrefix names the agent's own physical replication slots (#289): slotPrefix +
 // pod ordinal, e.g. pg_ha_slot_1.

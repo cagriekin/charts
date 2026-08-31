@@ -483,6 +483,28 @@
 
 ### Fixed
 
+- **The in-place repmgrd -> 2.0.0 roll no longer deadlocks (#298, found by the first live run).**
+  Rolling a live `failoverMode: repmgrd` release stalled at the first replaced pod and never
+  recovered. The StatefulSet replaces the highest ordinal first, so that pod comes up as the only
+  agent in the cluster while the real primary is still a 1.x pod running repmgrd and holding no
+  lease -- and the migration step that clears repmgr's recovery config assumed "the effective
+  upstream is preserved either way, the agent derives it from the lease". With no agent-held
+  lease there is no leader to derive it from: the reconcile loop returned `Wait` ("standby but no
+  known leader"), nothing ever wrote the agent's own fragment, and the node was left with
+  `standby.signal` and no `primary_conninfo` at all. PostgreSQL logged `specified neither
+  "primary_conninfo" nor "restore_command"`, it never streamed, readiness never passed, the
+  rollout stopped with the cluster half-migrated, and the agent livelocked on a 10s cycle
+  (acquire the lease, refuse to promote on the equal-timeline guard, release, wait, re-acquire).
+
+  The migration now carries the inherited upstream forward into the agent's own fragment instead
+  of only deleting it, and pre-creates this node's replication slot on that upstream first --
+  because the fragment the agent writes names its own ordinal slot, which does not exist on a
+  still-repmgrd primary, and a walreceiver whose named slot is missing does not fall back to
+  slotless streaming (it fails with `replication slot "..." does not exist` on a loop, which is
+  the same stalled rollout by another route). Both steps are best-effort and loud on failure. The
+  KinD suite for this path now completes 42/43 where it previously timed out during the roll with
+  no result at all.
+
 - **A streaming standby is no longer reported on a stale timeline (#298, found by the KinD
   suites).** `Prober.StandbyTimeline` took the GREATER of the control file's checkpoint timeline
   and its `min_recovery_end_timeline`, on the stated premise that the latter "advances as the
