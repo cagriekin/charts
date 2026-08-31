@@ -204,12 +204,17 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 // It only ever ADDS standby.signal, never removes one. Asserting the file is what closes the
 // two-writer window described at the call site; REMOVING it would be a new way to bring a node
 // up read-write, and this path has none of the guards act() applies before it does that (the
-// #125 highwater check in particular). So a holder with primary-state data is left exactly as it
-// is -- byte-identical to the previous behaviour -- and every other shape is pinned read-only.
+// #125 highwater check in particular). So a holder with READABLE primary-state data is left
+// exactly as it is -- byte-identical to the previous behaviour -- and every other shape is
+// pinned read-only.
 //
 // Best-effort on an unreadable control file, in the SAFE direction: if pg_controldata cannot be
 // read the role is unknown, and a standby that merely waits for WAL is recoverable while a second
-// writer is not.
+// writer is not. That arm is checked FIRST, so it covers the lease holder too (#298 review): a
+// holder's directory can equally be standby-state data it has not promoted yet, and starting
+// THAT read-write is the recovery-state-without-signal shape boot() and StartLocal refuse. The
+// cost when the control file was merely transiently unreadable is one needless read-only start,
+// which the next tick corrects by promoting -- a timeline bump, not a second writer.
 func (a *agent) assertRestartRecoverySignal(ctx context.Context) error {
 	if !process.HasData(a.cfg.PGDATA) {
 		return nil // nothing to start in a role; the loop will bootstrap or clone

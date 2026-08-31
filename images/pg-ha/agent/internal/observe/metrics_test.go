@@ -139,9 +139,43 @@ func TestClearsRetractWhatADemotedPodPublished(t *testing.T) {
 			continue
 		}
 		name, val, _ := strings.Cut(line, " ")
+		// COUNTERS are exempt, by name (#298 review). The predicate below is a substring
+		// match, so `pg_ha_agent_replication_slots_recycled_total` fell inside it -- and a
+		// counter must never be retracted: rate() handles a reset as a counter reset, so
+		// zeroing one on demotion loses the event the recycle alert exists to catch. The
+		// exemption is asserted positively by TestSlotRecycleCounterSurvivesTheGaugeClear.
+		if strings.HasSuffix(name, "_total") {
+			continue
+		}
 		if (strings.Contains(name, "replicas_") || strings.Contains(name, "replication_slot")) && val != "0" {
 			t.Errorf("%s = %s after the clear: an alert aggregating with max() would stay latched", name, val)
 		}
+	}
+}
+
+// The recycle COUNTER must survive ClearSlots (#298 review). Its whole reason for existing is
+// that the recycle clears pg_ha_agent_replication_slots_invalidated in the same tick that
+// observes it, so PGHAReplicationSlotInvalidated's `for: 5m` can never elapse -- the counter is
+// the durable trace, and PGHAReplicationSlotRecycled rates it. Folding Recycled into SlotStats
+// (the obvious next refactor: it sits among the slot fields and is set from the same tick) would
+// have ClearSlots zero it on every demotion, and the alert would go quietly dead -- the exact
+// dead-alert failure this chart has now shipped twice.
+func TestSlotRecycleCounterSurvivesTheGaugeClear(t *testing.T) {
+	m := New()
+	m.SetSlots(SlotStats{Total: 4, Invalidated: 1})
+	m.IncSlotRecycled()
+	m.IncSlotRecycled()
+	m.ClearSlots()
+	var b strings.Builder
+	m.write(&b)
+	want := "pg_ha_agent_replication_slots_recycled_total 2"
+	if !strings.Contains(b.String(), want+"\n") {
+		t.Errorf("exposition does not carry %q after ClearSlots; a demoted pod must not retract a counter", want)
+	}
+	// ...and it is declared a counter, because rate() over a gauge is not a defined operation
+	// and the alert would silently never fire.
+	if !strings.Contains(b.String(), "# TYPE pg_ha_agent_replication_slots_recycled_total counter\n") {
+		t.Error("pg_ha_agent_replication_slots_recycled_total must be TYPEd counter: PGHAReplicationSlotRecycled rates it")
 	}
 }
 

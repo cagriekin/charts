@@ -505,11 +505,14 @@ func (a *agent) run() {
 				if derr != nil {
 					a.log.Warn("fence: the postmaster did not exit before the deadline and was killed; it is reaped, so the fence is complete", "err", derr)
 				}
-				// Bump BEFORE the clear, for the reason clearServingRWForPlannedStepDown
-				// states: deriveServingRW's gate is a check-then-act pair, so the generation
-				// must never become visible later than the false it announces.
-				a.fenceGen.Add(1) // see the fenceGen field: invalidate an in-flight observation
-				a.servingRW.Store(false)
+				// Through the shared helper, not a hand-inlined copy of its two lines (#298
+				// review). The bump-before-clear ordering it establishes is subtle and
+				// load-bearing (deriveServingRW's gate is a check-then-act pair, so the
+				// generation must never become visible later than the false it announces) --
+				// having it written out twice is exactly how one of the two ends up reordered
+				// by a later edit. This is a completed demote like the others; only the reason
+				// for it differs.
+				a.clearServingRWForPlannedStepDown()
 			},
 		})
 	}()
@@ -1250,8 +1253,9 @@ func (a *agent) observeStandbyStall(ctx context.Context, o *reconcile.Observatio
 // sized well past any plausible single-segment fetch rather than tight enough to be prompt.
 const standbyStallTicks = 36
 
-// clearServingRWForPlannedStepDown drops the read-write latch on a step-down this agent
-// performed DELIBERATELY and completed successfully.
+// clearServingRWForPlannedStepDown drops the read-write latch on a step-down whose demote or
+// stop is PROVEN to have ended with no writer left -- a planned one this agent performed, or
+// the lost-leadership fence.
 //
 // dcs.OnLost fires for a voluntary Release() too -- k8sdcs and etcddcs both invoke it
 // unconditionally, and only OnRenewFailure is filtered to involuntary loss -- and it gates
@@ -1262,9 +1266,12 @@ const standbyStallTicks = 36
 // whoever was reading it mid-incident that the node had been fenced when it had in fact
 // stepped down on request (#298 review).
 //
-// Call this ONLY where a demote or stop has just returned nil. That is the positive evidence
-// tick() requires: clearing on anything weaker -- an unreachable SQL probe on a postmaster
-// that is still alive -- disarms the fence for the one node that most needs it.
+// Call this ONLY where stopProvedDead accepts the demote's or stop's outcome -- nil, or the
+// deadline expiry whose SIGKILL was delivered AND reaped (#298 review; the precondition used to
+// read "has just returned nil", which the reaped-kill callers in act() legitimately do not
+// satisfy). That is the positive evidence tick() requires: clearing on anything weaker -- an
+// unreachable SQL probe on a postmaster that is still alive -- disarms the fence for the one
+// node that most needs it.
 func (a *agent) clearServingRWForPlannedStepDown() {
 	// Bumped BEFORE the clear, not after it (#298 review). deriveServingRW's gate is a
 	// check-then-act pair, so the generation has to be visible no LATER than the false it

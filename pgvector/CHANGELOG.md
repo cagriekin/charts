@@ -496,6 +496,14 @@
   primary and no write-Service endpoint: precisely the outcome that guard exists to prevent. The
   tag is now omitted when empty, matching `pg.image`.
 
+  The etcd SERVER image carried the same expression and the same bug, which the first pass left
+  behind (#298 review, etcd 0.1.10). `etcd.image.digest`'s own values comment offers it as the
+  pin that "takes precedence over the tag", so `--set etcd.image.tag=""` is a reference an
+  operator can reasonably ask for -- and it rendered `quay.io/coreos/etcd:@sha256:...`. That is
+  the larger blast radius of the two: all three etcd pods go `InvalidImageName`, so the agents
+  have no DCS at all rather than an unauthenticated one. Both image lines now omit an empty tag,
+  and `etcd/tests/unit/render_test.yaml` pins the digest-only render.
+
 - **`ha.agent: null` in standalone mode gave a raw nil pointer instead of the named error (#298
   review).** The `ha.agent is required when ha.enabled=true` guard was added for exactly this,
   but scoped to `pg.agentMode == true` -- correct in itself, since standalone runs no agent --

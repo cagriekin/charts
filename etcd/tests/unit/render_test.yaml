@@ -28,6 +28,7 @@ tests:
       - matchRegex:
           path: spec.template.spec.containers[0].image
           pattern: ^quay\.io/coreos/etcd:v3\.5\.16@sha256:[0-9a-f]{64}$
+
       - contains:
           path: spec.template.spec.containers[0].ports
           content:
@@ -43,6 +44,21 @@ tests:
             protocol: TCP
           any: true
 
+
+  # A DIGEST-ONLY pin renders no bare colon (#298 review). image.digest is documented as the
+  # pin that "takes precedence over the tag", so clearing the tag is a reference an operator can
+  # reasonably ask for -- and `repository ":" tag` emitted unconditionally gave
+  # `quay.io/coreos/etcd:@sha256:...`, which the kubelet rejects as InvalidImageName. All three
+  # etcd pods then never start, the agent loses its DCS, no node wins the lease and the release
+  # comes up with no primary. Same shape the RBAC-bootstrap Job was fixed for.
+  - it: a digest-only image pin renders no empty tag separator
+    template: templates/statefulset.yaml
+    set:
+      image.tag: ""
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].image
+          pattern: ^quay\.io/coreos/etcd@sha256:[0-9a-f]{64}$
   - it: plaintext default uses httpGet readiness and tcpSocket liveness
     template: templates/statefulset.yaml
     asserts:

@@ -460,8 +460,12 @@ ha:
         # bytes of WAL. 3Gi, deliberately below the image's max_slot_wal_keep_size = 4GB:
         # past that cap PostgreSQL invalidates the slot instead of filling the volume, the
         # standby behind it then needs a full re-clone, and this gauge collapses to zero at
-        # that moment -- so this is the early warning and PGHAReplicationSlotInvalidated
-        # catches the outcome. The agent reclaims its own slots every primary tick, so a
+        # that moment -- so this is the early warning and PGHAReplicationSlotRecycled
+        # catches the outcome on defaults (the agent drops and re-creates such a slot on the
+        # same tick, so the invalidated GAUGE is never up long enough for
+        # PGHAReplicationSlotInvalidated's `for: 5m` -- that rule is left for the slots the
+        # agent does not recycle: an ACTIVE one, an ordinal with no live pod, or any slot at
+        # all under cascadingReplication). The agent reclaims its own slots every primary tick, so a
         # sustained breach means a slot it does not own (an operator's, a logical slot, or
         # a legacy repmgr_slot_* still active mid-migration) or a long-down standby. See
         # the pg chart README.

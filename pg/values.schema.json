@@ -302,7 +302,7 @@
                     "slotRetainedWALBytes": {
                       "type": "integer",
                       "minimum": 1,
-                      "description": "Bytes of WAL retained by a single physical replication slot before PGHAReplicationSlotRetainingWAL fires (#289). Keep it BELOW max_slot_wal_keep_size (4GB in this image, hence the 3Gi default): past that cap PostgreSQL invalidates the slot rather than filling the volume, and invalidation nulls restart_lsn so this gauge collapses to zero -- PGHAReplicationSlotInvalidated catches that outcome, this is the early warning before it. A threshold above the cap renders an alert that can never fire. Typed and floored here because a string or 0 would do the same."
+                      "description": "Bytes of WAL retained by a single physical replication slot before PGHAReplicationSlotRetainingWAL fires (#289). Keep it BELOW max_slot_wal_keep_size (4GB in this image, hence the 3Gi default): past that cap PostgreSQL invalidates the slot rather than filling the volume, and invalidation nulls restart_lsn so this gauge collapses to zero -- PGHAReplicationSlotRecycled catches that outcome on chart defaults (the agent drops and re-creates such a slot on the same tick, so the invalidated GAUGE is never up long enough for PGHAReplicationSlotInvalidated's `for: 5m`, which is left for the slots the agent does not recycle: an ACTIVE one, an ordinal with no live pod, or any slot at all under cascadingReplication), this is the early warning before it. A threshold above the cap renders an alert that can never fire. Typed and floored here because a string or 0 would do the same."
                     }
                   }
                 }
@@ -658,7 +658,7 @@
                     "slotRetainedWALBytes": {
                       "type": "integer",
                       "minimum": 1,
-                      "description": "Bytes of WAL retained by a single physical replication slot before PGHAReplicationSlotRetainingWAL fires (#289). Keep it BELOW max_slot_wal_keep_size (4GB in this image, hence the 3Gi default): past that cap PostgreSQL invalidates the slot rather than filling the volume, and invalidation nulls restart_lsn so this gauge collapses to zero -- PGHAReplicationSlotInvalidated catches that outcome, this is the early warning before it. A threshold above the cap renders an alert that can never fire. Typed and floored here because a string or 0 would do the same."
+                      "description": "Bytes of WAL retained by a single physical replication slot before PGHAReplicationSlotRetainingWAL fires (#289). Keep it BELOW max_slot_wal_keep_size (4GB in this image, hence the 3Gi default): past that cap PostgreSQL invalidates the slot rather than filling the volume, and invalidation nulls restart_lsn so this gauge collapses to zero -- PGHAReplicationSlotRecycled catches that outcome on chart defaults (the agent drops and re-creates such a slot on the same tick, so the invalidated GAUGE is never up long enough for PGHAReplicationSlotInvalidated's `for: 5m`, which is left for the slots the agent does not recycle: an ACTIVE one, an ordinal with no live pod, or any slot at all under cascadingReplication), this is the early warning before it. A threshold above the cap renders an alert that can never fire. Typed and floored here because a string or 0 would do the same."
                     }
                   }
                 }

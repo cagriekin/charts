@@ -708,9 +708,14 @@ func TestRunIntentRestartPinsANonHolderReadOnly(t *testing.T) {
 	}
 }
 
-// ...and it never REMOVES a signal on the lease holder: that would be a new way to bring a
-// node up read-write, bypassing the guards act() applies (the #125 highwater check).
-func TestRunIntentRestartLeavesTheHoldersDirectoryAlone(t *testing.T) {
+// ...and it never REMOVES a signal, not even on the lease holder: that would be a new way to
+// bring a node up read-write, bypassing the guards act() applies (the #125 highwater check).
+//
+// Named for what it asserts (#298 review): with the control file unreadable the holder is pinned
+// READ-ONLY like anyone else, so the old name ("LeavesTheHoldersDirectoryAlone") described the
+// readable-primary-state case this test does not exercise. Leaving it alone is what happens once
+// pg_controldata answers, which is the switch case below the fail-safe arm.
+func TestRunIntentRestartPinsTheHolderReadOnlyOnAnUnreadableControlFile(t *testing.T) {
 	pm := &fakePostmaster{running: true}
 	a := newIntentAgent(t, pm)
 	a.dcs = &fakeDCS{leader: true}
