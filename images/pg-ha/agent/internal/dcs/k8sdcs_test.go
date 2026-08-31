@@ -161,27 +161,37 @@ func TestK8sDCSHoldsTheLeaseWhenTheFenceDidNotComplete(t *testing.T) {
 			case <-time.After(10 * time.Second):
 				t.Fatal("OnLost never fired")
 			}
-			// releaseLease runs immediately after OnLost returns, inside the same goroutine.
-			var holder string
-			for i := 0; i < 100; i++ {
+			holder := func() string {
 				l, err := cs.CoordinationV1().Leases("ns").Get(ctx, "pg-leader", metav1.GetOptions{})
 				if err != nil {
 					t.Fatal(err)
 				}
-				holder = ""
-				if l.Spec.HolderIdentity != nil {
-					holder = *l.Spec.HolderIdentity
+				if l.Spec.HolderIdentity == nil {
+					return ""
 				}
-				if (holder == "") == tc.wantEmpty {
-					break
+				return *l.Spec.HolderIdentity
+			}
+			// releaseLease runs immediately after OnLost returns, inside the same goroutine, so
+			// the HOLD case cannot be asserted from a single sample: "still pod-0" is also what
+			// the Lease looks like in the instant BEFORE releaseLease gets to run, so a poll that
+			// stops at the first matching read would pass whether the veto worked or not. Watch
+			// the whole settle window instead and fail the moment it empties. Both windows stay
+			// well inside the 10s step-down cooldown, so pod-0 cannot re-acquire and muddy this.
+			if tc.wantEmpty {
+				for i := 0; i < 100; i++ {
+					if holder() == "" {
+						return
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+				t.Errorf("a completed fence must free the Lease for an immediate handoff; holder is still %q", holder())
+				return
+			}
+			for i := 0; i < 40; i++ {
+				if h := holder(); h != "pod-0" {
+					t.Fatalf("an incomplete fence must leave the Lease held so the peer waits out the TTL; holder = %q", h)
 				}
 				time.Sleep(50 * time.Millisecond)
-			}
-			if tc.wantEmpty && holder != "" {
-				t.Errorf("a completed fence must free the Lease for an immediate handoff; holder is still %q", holder)
-			}
-			if !tc.wantEmpty && holder != "pod-0" {
-				t.Errorf("an incomplete fence must leave the Lease held so the peer waits out the TTL; holder = %q", holder)
 			}
 		})
 	}

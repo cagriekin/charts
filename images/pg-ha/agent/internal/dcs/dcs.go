@@ -48,6 +48,13 @@ type Callbacks struct {
 	// permission to promote beside it, with none of the LeaseDuration/TTL margin that
 	// expiry-based handoff would have left. So the backends ask before releasing.
 	//
+	// Consulted only for an iteration that actually HELD the lock. Both backends also unwind
+	// iterations this node spent as a follower -- a shutdown or Release landing while it was
+	// still trying to acquire -- and there is no lock of ours to hold in that case: K8sDCS
+	// finds a different HolderIdentity, and EtcdDCS's session key is a queued candidate whose
+	// survival fences nothing while blocking every peer behind it in the create-revision order
+	// (#298 review).
+	//
 	// Optional: nil means "always safe", which is the right default for a caller that does
 	// not fence (and keeps every existing test honest).
 	SafeToRelease func() bool

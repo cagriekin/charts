@@ -195,12 +195,13 @@ func TestEnsurePrimaryConninfoDBNameMissingFile(t *testing.T) {
 	}
 }
 
-// #298 review: `primary_conninfo = ''` is a SETTING ("do not stream"), not an empty slot to
+// #298 review: an EMPTY primary_conninfo -- the two-single-quote SQL literal -- is a SETTING
+// ("do not stream"), not an empty slot to
 // fill in. Appending dbname to it produced a non-empty conninfo carrying no host/port/user, so
 // libpq fell back to the local unix socket and the standby's walreceiver dialed its own
 // postmaster -- and changed=true made the Follow branch reload it. Reachable after boot, since
 // RemoveRecoveryConfig only runs as a one-time preflight: an operator pausing replication with
-// `ALTER SYSTEM SET primary_conninfo = ''` had it silently un-paused into a self-connect loop,
+// an ALTER SYSTEM setting it empty had it silently un-paused into a self-connect loop,
 // permanently (hasDBNameKeyword matched afterwards, so the line was never revisited).
 func TestAddDBNameToPrimaryConninfoLeavesAnEmptyValueAlone(t *testing.T) {
 	for _, conf := range []string{

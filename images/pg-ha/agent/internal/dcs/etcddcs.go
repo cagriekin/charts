@@ -179,7 +179,12 @@ func (e *EtcdDCS) runElection(ctx context.Context, identity string, cb Callbacks
 		}
 		return // etcd unreachable; retry next iteration (leadership unchanged)
 	}
-	defer e.releaseSession(sess, cb) // frees the lease+key on the way out (runs after OnLost)
+	// heldLeadership records whether this iteration ever WON, because that is what decides
+	// whether SafeToRelease has any say in the teardown below (#298 review). This defer runs
+	// on every exit from runElection, including the ones where this node never became leader
+	// -- a shutdown or Release that lands while Campaign is still queued behind a peer's key.
+	heldLeadership := false
+	defer func() { e.releaseSession(sess, cb, heldLeadership) }() // frees the lease+key on the way out (runs after OnLost)
 	el := concurrency.NewElection(sess, e.cfg.Prefix)
 
 	// Observe the current leader for followers (Leader()), independent of whether
@@ -196,6 +201,7 @@ func (e *EtcdDCS) runElection(ctx context.Context, identity string, cb Callbacks
 		return
 	}
 	e.isLeader.Store(true)
+	heldLeadership = true
 	e.leader.Store(identity)
 	if cb.OnAcquired != nil {
 		cb.OnAcquired(ctx)
@@ -235,7 +241,7 @@ func (e *EtcdDCS) runElection(ctx context.Context, identity string, cb Callbacks
 // session (etcd unreachable) the lease is already gone and the revoke just times out
 // (bounded), with TTL expiry as the backstop. Never on the critical demote path
 // (OnLost already ran), so it cannot delay a fence.
-func (e *EtcdDCS) releaseSession(sess *concurrency.Session, cb Callbacks) {
+func (e *EtcdDCS) releaseSession(sess *concurrency.Session, cb Callbacks, heldLeadership bool) {
 	sess.Orphan() // stop the keepalive refresh (Close would also revoke on the dead ctx)
 	// Orphan ALWAYS runs, the Revoke is conditional (#298 review). Orphaning only stops this
 	// process from refreshing the lease, so the key still expires on its own TTL -- that is the
@@ -244,7 +250,18 @@ func (e *EtcdDCS) releaseSession(sess *concurrency.Session, cb Callbacks) {
 	// the demote OnLost just performed completed. On the wedged-PV path it did not, OnLost kept
 	// this node marked read-write because a writer may still be up, and revoking would hand a
 	// peer immediate permission to promote beside it. Skipping the revoke leaves the full TTL.
-	if cb.SafeToRelease != nil && !cb.SafeToRelease() {
+	//
+	// Gated on heldLeadership, mirroring the holder check in K8sDCS's releaseLease (#298
+	// review, round 3). Without it the veto also fired on iterations where this node never
+	// won: this session's key is then a QUEUED CANDIDATE, not the lock, and keeping it alive
+	// fences nothing -- etcd's election orders candidates by create revision, so a ghost
+	// candidate with a low revision blocks every peer behind it from becoming leader until
+	// its TTL runs out. Concretely: a node whose read-write postmaster wedged (servingRW
+	// latched, per the fail-safe rule) is a follower after a peer takes over; if its agent is
+	// then rolled or SIGKILLed by the liveness probe, each shutdown left a candidate key
+	// standing for a full TTL and prolonged the very leaderlessness the holder was supposed
+	// to be shielding. A candidate has no lock to hold, so it always revokes.
+	if !shouldRevoke(heldLeadership, cb.SafeToRelease) {
 		slog.Warn("not revoking the etcd election lease: this node may still be a read-write primary (the fence demote did not complete). The key will expire on its TTL instead, which preserves the takeover margin",
 			"ttlSeconds", e.cfg.TTLSeconds)
 		return
@@ -252,6 +269,26 @@ func (e *EtcdDCS) releaseSession(sess *concurrency.Session, cb Callbacks) {
 	rc, rcancel := context.WithTimeout(context.Background(), e.retryPeriod())
 	_, _ = e.client.Revoke(rc, sess.Lease())
 	rcancel()
+}
+
+// shouldRevoke reports whether releaseSession may delete this session's election key
+// immediately, rather than leaving it to expire on its TTL.
+//
+// Extracted as a pure function so the rule is testable without a live etcd (#298 review): the
+// two ways to get it wrong are opposites, and both have been shipped once on this branch.
+// Revoking when the fence demote did NOT complete hands a peer immediate permission to promote
+// beside a postmaster that may still be read-write. Withholding the revoke from a session that
+// never won the election keeps a queued CANDIDATE key alive, which fences nothing -- etcd orders
+// candidates by create revision, so a ghost candidate with a low revision blocks every peer
+// behind it until its TTL runs out.
+func shouldRevoke(heldLeadership bool, safeToRelease func() bool) bool {
+	if !heldLeadership {
+		return true // a candidate holds no lock: nothing to protect, and staying blocks peers
+	}
+	if safeToRelease == nil {
+		return true // no fencing caller: the pre-SafeToRelease behaviour
+	}
+	return safeToRelease()
 }
 
 // observe updates the last-seen leader identity from the election until ctx ends.

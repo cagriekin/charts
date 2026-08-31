@@ -249,17 +249,6 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 // TTL, the pre-existing behaviour) rather than hanging the process. Guarded on still being
 // the holder so a lease already won by a peer is never stamped on.
 func (k *K8sDCS) releaseLease(lock *resourcelock.LeaseLock, identity string, cb Callbacks) {
-	// Ask first (#298 review). "Nothing can acquire until after the demote" -- the reason this
-	// release is safe here where client-go's ReleaseOnCancel was not -- holds only if the
-	// demote SUCCEEDED. On the wedged-PV path it does not: Demote returns an error, OnLost
-	// deliberately keeps servingRW set because a read-write postmaster may still be up, and
-	// emptying the Lease then lets a peer acquire and promote within RetryPeriod beside a live
-	// writer. Holding it instead costs a peer the LeaseDuration it would have waited anyway.
-	if cb.SafeToRelease != nil && !cb.SafeToRelease() {
-		slog.Warn("not releasing the leader Lease: this node may still be a read-write primary (the fence demote did not complete). A peer will acquire it at TTL expiry instead, which preserves the takeover margin",
-			"identity", identity)
-		return
-	}
 	budget := k.cfg.RenewDeadline
 	if budget <= 0 {
 		budget = 5 * time.Second
@@ -268,6 +257,26 @@ func (k *K8sDCS) releaseLease(lock *resourcelock.LeaseLock, identity string, cb 
 	defer cancel()
 	rec, _, err := lock.Get(ctx)
 	if err != nil || rec == nil || rec.HolderIdentity != identity {
+		return
+	}
+	// Ask before emptying it (#298 review). "Nothing can acquire until after the demote" --
+	// the reason this release is safe here where client-go's ReleaseOnCancel was not -- holds
+	// only if the demote SUCCEEDED. On the wedged-PV path it does not: Demote returns an
+	// error, OnLost deliberately keeps servingRW set because a read-write postmaster may still
+	// be up, and emptying the Lease then lets a peer acquire and promote within RetryPeriod
+	// beside a live writer. Holding it instead costs a peer the LeaseDuration it would have
+	// waited anyway.
+	//
+	// Consulted AFTER the holder check, not before it (#298 review, round 3). le.Run also
+	// returns for an iteration this node spent as a FOLLOWER -- a shutdown or Release landing
+	// while it was still trying to acquire -- and there is no Lease of ours to hold in that
+	// case. Asking first meant a node with a latched servingRW (the wedged-primary fail-safe)
+	// logged this alarming warning about a Lease a peer had held all along, in the middle of
+	// the incident where the log is being read. Same reason etcd's releaseSession gates its
+	// veto on heldLeadership.
+	if cb.SafeToRelease != nil && !cb.SafeToRelease() {
+		slog.Warn("not releasing the leader Lease: this node may still be a read-write primary (the fence demote did not complete). A peer will acquire it at TTL expiry instead, which preserves the takeover margin",
+			"identity", identity)
 		return
 	}
 	now := metav1.NewTime(time.Now())

@@ -217,6 +217,40 @@ func TestEtcdTLSConfigBuildsAMutualTLSConfig(t *testing.T) {
 // A fresh EtcdDCS holds no leadership and names no leader. Leader() in particular must
 // return "" rather than panic on the un-stored atomic.Value -- observe() publishes into
 // it asynchronously, so the accessor is read before the first write on every boot.
+// #298 review: the revoke rule has two opposite failure modes and this branch shipped each of
+// them once. Revoking after a FAILED fence demote hands a peer immediate permission to promote
+// beside a postmaster that may still be read-write. Withholding the revoke from a session that
+// never WON keeps a queued candidate key alive, which protects nothing and -- because etcd orders
+// candidates by create revision -- blocks every peer behind it until the TTL expires. Pure
+// function, so the rule is pinned without a live etcd.
+func TestShouldRevokeElectionKey(t *testing.T) {
+	safe := func() bool { return true }
+	unsafe := func() bool { return false }
+	for _, tc := range []struct {
+		name string
+		held bool
+		fn   func() bool
+		want bool
+	}{
+		{"held the lock, fence completed -> hand off now", true, safe, true},
+		{"held the lock, fence did NOT complete -> hold to TTL", true, unsafe, false},
+		// The regression: a follower that never won has no lock to hold. servingRW stays
+		// latched by design on a node whose primary wedged, so this is the state an agent roll
+		// or a liveness SIGKILL lands in -- and holding there prolongs the leaderlessness the
+		// veto exists to shield against.
+		{"never won, fence did NOT complete -> still revoke", false, unsafe, true},
+		{"never won, fence completed -> revoke", false, safe, true},
+		// A caller that does not fence (every backend consumer other than the agent, and the
+		// tests) gets the pre-SafeToRelease behaviour.
+		{"no callback, held the lock -> revoke", true, nil, true},
+		{"no callback, never won -> revoke", false, nil, true},
+	} {
+		if got := shouldRevoke(tc.held, tc.fn); got != tc.want {
+			t.Errorf("%s: shouldRevoke(held=%v) = %v, want %v", tc.name, tc.held, got, tc.want)
+		}
+	}
+}
+
 func TestEtcdDCSAccessorsBeforeAnyElection(t *testing.T) {
 	e := &EtcdDCS{}
 	if e.IsLeader() {

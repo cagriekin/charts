@@ -539,7 +539,12 @@
   writer, with none of the `LeaseDuration`/TTL margin an expiry-based handoff would have left.
   Both backends now ask the agent first (`Callbacks.SafeToRelease`): the Kubernetes backend skips
   emptying the Lease, and the etcd backend still orphans its session -- so the key expires on its
-  own TTL -- but skips the immediate revoke. A completed fence still hands off at once.
+  own TTL -- but skips the immediate revoke. A completed fence still hands off at once. The veto
+  applies only to an iteration that actually HELD the lock: `le.Run` and `runElection` both also
+  return for one this node spent as a follower, and there the etcd session key is a queued
+  candidate rather than the lock -- keeping it alive fences nothing and, because etcd orders
+  candidates by create revision, blocks every peer behind it from becoming leader until its TTL
+  runs out.
 
 - **A promote that outlives the lease no longer claims the write Service (#298 review, agent).**
   `pg_ctl -w promote` is bounded only by `PGCTLTIMEOUT` (60s) while the default `LeaseDuration`
@@ -572,10 +577,9 @@
   name, because scoping the guard alone changed nothing observable: the create then ran and
   PostgreSQL's own error is the very `replication slot "..." already exists` that
   `IsDuplicateSlot` treats as success, so a logical squatter stayed silent exactly as before.
-  And
-  a queued control intent floors its inherited request deadline, which was routinely already in
-  the past by the time the loop dequeued it -- making a graceful `/v1/node/restart` a zero-grace
-  SIGKILL of a read-write primary.
+  And a queued control intent floors its inherited request deadline, which was routinely
+  already in the past by the time the loop dequeued it -- making a graceful `/v1/node/restart`
+  a zero-grace SIGKILL of a read-write primary.
 
 - **`DELETE /v1/restore` can now actually wait out a slow-terminating Job (#298 review, agent).**
   Both callers passed the HTTP request context, which the control API had already capped at 60s,
