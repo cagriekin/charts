@@ -55,7 +55,13 @@ jobs:
               render_files=$(printf '%s\n' "$render_files" | grep -vxE 'pg/Chart\.yaml' || true)
             fi
           fi
-          if printf '%s\n' "$render_files" | grep -qE '^(pg/|images/pg-ha/|etcd/|\.github/workflows/pg-test\.yaml)'; then
+          # images/pg-extensions/ belongs here for the same reason images/pg-ha/ does: the
+          # chart points at that image via postgresql.extensions.image, and its install paths
+          # are a two-file contract with pg.extensionPrebuiltCopyCommand in _helpers.tpl. Its
+          # only other coverage is pg-ha-image-test.yaml, which is deliberately paths-filtered
+          # and feeds NO required check -- so a PR touching only that directory used to skip the
+          # whole matrix and self-pass pg-tests-passed with nothing blocking the drift.
+          if printf '%s\n' "$render_files" | grep -qE '^(pg/|images/pg-ha/|images/pg-extensions/|etcd/|\.github/workflows/pg-test\.yaml)'; then
             echo "pg=true" >> "$GITHUB_OUTPUT"
           else
             echo "pg=false" >> "$GITHUB_OUTPUT"

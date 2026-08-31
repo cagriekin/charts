@@ -78,6 +78,25 @@ func (k *K8sDCS) Leader() string {
 // leadership is lost; we re-contend in a loop so the agent keeps trying to lead.
 // OnStoppedLeading runs synchronously inside client-go before Run returns, so the
 // OnLost demote completes before any re-acquire — the fence-ordering guarantee.
+//
+// That guarantee is why ReleaseOnCancel is OFF and the Lease is emptied by releaseLease
+// below instead (#298 review). client-go's LeaderElector.Run is
+// `defer Callbacks.OnStoppedLeading(); ...; le.renew(ctx)`, and renew() ends with
+// `if ReleaseOnCancel { le.release() }` — so client-go's release runs BEFORE the deferred
+// OnStoppedLeading, i.e. before cb.OnLost() demotes, inverting the ordering this comment
+// claims. Two concrete failures, both closed by moving the release after Run returns:
+//
+//   - Involuntary loss on chart defaults (15s/10s/2s): connectivity to the apiserver drops,
+//     the renew loop gives up at RenewDeadline, and le.release() then issues a Lease Update
+//     on context.Background() with its OWN RenewDeadline budget — blocking the full 10s
+//     against the unreachable apiserver before OnLost even starts. A peer sees the Lease
+//     stale at LeaseDuration and promotes, so the demote begins ~5s after the peer is
+//     already promoting: the entire LeaseDuration−RenewDeadline safety margin, spent on a
+//     write that was going to fail anyway.
+//   - Voluntary Release: client-go empties the Lease, making it instantly acquirable, and
+//     only THEN demotes — a peer can win and start promoting while this node is still
+//     read-write. (The callers happen to demote first, but the backend must not depend on
+//     that.)
 func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 	lock := &resourcelock.LeaseLock{
 		LeaseMeta:  metav1.ObjectMeta{Name: k.cfg.LeaseName, Namespace: k.cfg.Namespace},
@@ -85,8 +104,9 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 		LockConfig: resourcelock.ResourceLockConfig{Identity: identity},
 	}
 	lec := leaderelection.LeaderElectionConfig{
-		Lock:            lock,
-		ReleaseOnCancel: true,
+		Lock: lock,
+		// See the ordering note on Run: releaseLease does this AFTER OnStoppedLeading.
+		ReleaseOnCancel: false,
 		LeaseDuration:   k.cfg.LeaseDuration,
 		RenewDeadline:   k.cfg.RenewDeadline,
 		RetryPeriod:     k.cfg.RetryPeriod,
@@ -196,6 +216,11 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 			return
 		}
 		le.Run(elerCtx) // blocks: acquire -> lead -> lose (or Release cancels), then returns
+		// Free the Lease now that OnStoppedLeading (and with it the OnLost demote) has
+		// returned. This is what makes a step-down or a shutdown hand off in milliseconds
+		// instead of at LeaseDuration expiry, and it is safe here in a way client-go's own
+		// ReleaseOnCancel was not, because nothing can acquire until after the demote.
+		k.releaseLease(lock, identity)
 		// cancel() FIRST, and clear the flag under the mutex: both halves pair with the
 		// OnStartedLeading guard above. cancel() marks this iteration's context dead
 		// (synchronously, including the child client-go handed the callback), so a
@@ -215,11 +240,41 @@ func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
 	}
 }
 
+// releaseLease empties the Lease if this identity still holds it, so a peer's next
+// acquire attempt succeeds immediately rather than waiting out LeaseDuration.
+//
+// Best-effort and bounded on its own context, deliberately NOT the election's: it runs on
+// the shutdown path too, where the agent's ctx is already cancelled, and a DCS that has
+// become unreachable must cost a bounded delay (after which the lease simply expires on
+// TTL, the pre-existing behaviour) rather than hanging the process. Guarded on still being
+// the holder so a lease already won by a peer is never stamped on.
+func (k *K8sDCS) releaseLease(lock *resourcelock.LeaseLock, identity string) {
+	budget := k.cfg.RenewDeadline
+	if budget <= 0 {
+		budget = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	rec, _, err := lock.Get(ctx)
+	if err != nil || rec == nil || rec.HolderIdentity != identity {
+		return
+	}
+	now := metav1.NewTime(time.Now())
+	rec.HolderIdentity = ""
+	rec.LeaseDurationSeconds = 1
+	rec.RenewTime = now
+	rec.AcquireTime = now
+	if err := lock.Update(ctx, *rec); err != nil {
+		slog.Warn("could not release the leader Lease; a peer will acquire it at TTL expiry instead", "err", err)
+	}
+}
+
 // Release voluntarily steps down: it cancels the current election so the Lease is
-// released (client-go ReleaseOnCancel), and suppresses re-contention for the
+// released (see releaseLease), and suppresses re-contention for the
 // step-down cooldown so a peer acquires the freed Lease instead of this node
 // immediately re-winning it. It is non-blocking; OnStoppedLeading (the synchronous
-// demote) runs in the Run goroutine as the election unwinds. Safe to call when not
+// demote) runs in the Run goroutine as the election unwinds, and the Lease is freed
+// after it. Safe to call when not
 // leading (it still arms the cooldown). Used by the self-health and stale-winner
 // step-down paths.
 func (k *K8sDCS) Release() {

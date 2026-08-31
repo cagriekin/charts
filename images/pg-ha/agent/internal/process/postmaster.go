@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/cagriekin/pg-ha-agent/internal/childenv"
 )
@@ -142,6 +143,10 @@ func (p *ChildPostmaster) Running() bool {
 	return alive && !p.done.Load()
 }
 
+// reapGrace bounds the wait for a SIGKILLed postmaster to be reaped, mirroring the
+// cmd.WaitDelay the exec runners use for the same reason.
+const reapGrace = 10 * time.Second
+
 func (p *ChildPostmaster) Stop(ctx context.Context, mode StopMode) error {
 	p.mu.Lock()
 	cmd, exited := p.cmd, p.exited
@@ -165,9 +170,26 @@ func (p *ChildPostmaster) Stop(ctx context.Context, mode StopMode) error {
 		// (a PID-table slot, no memory) until the container restarts. Acceptable: a
 		// SIGKILL fence is rare and bounded; a full PID-1 reaper is a known follow-up.
 		_ = cmd.Process.Kill()
-		<-exited // reap the killed postmaster (the direct child)
-		p.clear()
-		return ctx.Err()
+		// BOUNDED (#298 review). SIGKILL is undeliverable to a process in uninterruptible
+		// sleep, so when the PV backing PGDATA wedges (a hung iSCSI/NFS/CSI target) cmd.Wait()
+		// never returns and this was an unbounded block -- on the fence path, with opMu held by
+		// every caller (DemoteFence, ReleaseLease, Switchover, rejoinOnto, OnLost, runIntent).
+		// The reconcile goroutine stopped beating, /healthz went stale, and every subsequent
+		// fence, tick and control-API intent queued behind the same mutex. OSRunner sets
+		// cmd.WaitDelay for exactly this class of hazard; Stop was the one path without it.
+		//
+		// On timeout the supervision state is deliberately NOT cleared: the child is still
+		// (nominally) ours, exited is buffered so its Wait owner cannot block, and a later Stop
+		// re-signals and re-waits. The error is distinguishable, and callers already refuse to
+		// release the lease on a Stop error -- which is the correct reading of "we could not
+		// prove the postmaster is dead".
+		select {
+		case <-exited: // reaped the killed postmaster (the direct child)
+			p.clear()
+			return ctx.Err()
+		case <-time.After(reapGrace):
+			return fmt.Errorf("postmaster did not exit %s after SIGKILL (PGDATA I/O wedged?); leaving it supervised: %w", reapGrace, ctx.Err())
+		}
 	case <-exited:
 		p.clear()
 		return nil

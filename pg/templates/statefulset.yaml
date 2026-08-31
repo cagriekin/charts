@@ -926,8 +926,19 @@ spec:
                    `false | default true` would wrongly coerce to true and force a client cert
                    on an encrypt-only (no mutual-auth) etcd. */}}
             {{- $etcdCca := dig "tls" "clientCertAuth" true (.Values.etcd | default dict) }}
-            {{- if and $etcdTls $etcdCca (not (($etcd.tls).secretName)) }}
-            {{ fail "bundled etcd tls.enabled with clientCertAuth requires the agent's client cert: set ha.agent.dcs.etcd.tls.secretName to a Secret with tls.crt, tls.key, ca.crt" }}
+            {{- /* Gated on $etcdTls ALONE, not on clientCertAuth too (#298 review). The agent
+                   needs the CA for ANY TLS etcd, not just a mutual-auth one: with the three
+                   ETCD_TLS_* vars unset, EtcdConfig.tlsConfig() returns nil and clientv3 falls
+                   back to default transport credentials, verifying the etcd server cert against
+                   the CONTAINER'S SYSTEM ROOT STORE -- which does not hold the operator's (or
+                   cert-manager's) CA. So `etcd.tls.enabled=true` with `clientCertAuth=false`
+                   and no secretName rendered perfectly clean and every agent's dial failed with
+                   `x509: certificate signed by unknown authority`: no node ever wins the lease,
+                   the release comes up with no primary and no write-Service endpoint, and the
+                   only symptom is a TLS error in the agent log. $etcdCca survives in the
+                   message because it changes WHY the Secret is needed, not WHETHER. */}}
+            {{- if and $etcdTls (not (($etcd.tls).secretName)) }}
+            {{ fail (printf "bundled etcd tls.enabled requires the agent's etcd TLS material (clientCertAuth=%v): set ha.agent.dcs.etcd.tls.secretName to a Secret with tls.crt, tls.key, ca.crt -- the agent needs ca.crt to verify the etcd server certificate at all, and the client cert/key additionally when clientCertAuth is on" $etcdCca) }}
             {{- end }}
             {{- $endpoints = list (printf "%s://%s-etcd:%v" (ternary "https" "http" $etcdTls) .Release.Name ((.Values.etcd).clientPort | default 2379)) }}
             {{- end }}

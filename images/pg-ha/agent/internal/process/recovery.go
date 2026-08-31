@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/cagriekin/pg-ha-agent/internal/atomicfile"
 )
 
 // standbySignal is the PG12+ file that forces a server to start in standby
@@ -16,11 +18,20 @@ const standbySignal = "standby.signal"
 // start replays the local WAL to its true end and stays read-only until promoted.
 func SetRecoverySignal(dataDir string) error {
 	p := filepath.Join(dataDir, standbySignal)
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
+	// Through atomicfile, like Native.Follow's write of the same file (#298 review). A plain
+	// OpenFile+Close fsyncs neither the file nor PGDATA, and this is the ONE path whose whole
+	// purpose is "bring primary-state data up read-only without risking a second writer":
+	// StartRecovery creates the signal and immediately starts the postmaster, which then makes
+	// the CONTROL FILE durable on its own. On ext4 data=ordered the directory entry for
+	// standby.signal can still be sitting in the 5-second commit window, so a power loss there
+	// comes back with a durable control file saying "in archive recovery" and no signal file --
+	// exactly the recovery-state-without-signal shape that boot() and StartLocal must not start
+	// read-write. atomicfile's package doc calls out that two drifted implementations of this
+	// write were the defect it exists to fix; this was the third.
+	if err := atomicfile.WriteString(p, "", 0o600); err != nil {
 		return fmt.Errorf("create %s: %w", p, err)
 	}
-	return f.Close()
+	return nil
 }
 
 // ClearRecoverySignal removes standby.signal in dataDir if present, so the next

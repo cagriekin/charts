@@ -778,6 +778,93 @@ func TestActSwitchoverClearsServingRWAfterTheDemote(t *testing.T) {
 	}
 }
 
+// promoteTimeoutExec fails `pg_ctl promote` the way PGCTLTIMEOUT does -- non-zero exit,
+// "server did not promote in time" -- while the promotion itself carries on in the postmaster.
+type promoteTimeoutExec struct{}
+
+func (promoteTimeoutExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
+	if strings.Contains(strings.Join(args, " "), "promote") || strings.HasSuffix(name, "pg_ctl") {
+		return "pg_ctl: server did not promote in time", fmt.Errorf("exit status 1")
+	}
+	return "", nil
+}
+
+// #298 review: a non-zero `pg_ctl -w promote` is NOT proof this node did not become a writer.
+// pg_ctl gives up at PGCTLTIMEOUT (60s) on a standby with a large unreplayed backlog while the
+// promotion signal is already written and the postmaster finishes promoting anyway. Arming the
+// latch only on the success path left servingRW false on a node that was becoming read-write,
+// so the lease loss that followed took OnLost's "no fence needed" branch -- two primaries.
+func TestActPromoteArmsServingRWBeforeThePromoteCanTimeOut(t *testing.T) {
+	a := newSlotTestAgent(t, &slotExec{}, config.MechanismNative)
+	a.mech = mechanism.NewNative(a.cfg.PGDATA, "/usr/lib/postgresql/18/bin", "pw", "pg_ha_slot_0", "pg-0")
+	a.mech.(*mechanism.Native).Runner = promoteTimeoutExec{}
+	err := a.act(context.Background(), reconcile.Decision{Action: reconcile.Promote}, reconcile.Observation{
+		HoldLease: true,
+		Local:     reconcile.LocalState{HasData: true, Running: true, InRecovery: true},
+	})
+	if err == nil {
+		t.Fatal("the promote was supposed to report the pg_ctl timeout")
+	}
+	if !a.servingRW.Load() {
+		t.Fatal("servingRW must be armed BEFORE the promote: a pg_ctl timeout does not mean the node stayed read-only, and an unarmed latch skips the fence on a node that is becoming a writer")
+	}
+}
+
+// #298 review: Wait must not retract the slot gauges. Wait is what Decide returns when there is
+// no known leader -- a step-down cooldown, an apiserver or etcd partition -- and a standby
+// sitting on an inactive, WAL-pinning slot through one of those had all three slot alerts
+// resolved and their for: clocks (5m/15m/1h) restarted on EVERY tick, a blind window over the
+// disk-fill hazard #289 exists to catch, opened exactly when WAL accumulates.
+func TestActWaitKeepsTheSlotGaugesStanding(t *testing.T) {
+	a := newTestAgent(t, &fakePostmaster{}, &fakeDCS{})
+	a.metr.SetSlots(observe.SlotStats{Total: 3, Inactive: 1, MaxRetainedWALBytes: 4096})
+	a.metr.SetTopology(observe.TopologyStats{Streaming: 2, Expected: 2})
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.Wait}, reconcile.Observation{}); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	a.metr.Handler(time.Minute).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, "pg_ha_agent_replication_slot_max_retained_wal_bytes 4096") {
+		t.Errorf("Wait retracted the slot gauges, silencing the slot alerts for the whole partition:\n%s", body)
+	}
+	if !strings.Contains(body, "pg_ha_agent_replication_slots_inactive 1") {
+		t.Errorf("Wait retracted the inactive-slot gauge:\n%s", body)
+	}
+	// Topology IS still retracted: it is the PRIMARY's connection list, has no standby
+	// equivalent, and a stale one latched under max() is worse than none.
+	if !strings.Contains(body, "pg_ha_agent_replicas_expected 0") {
+		t.Errorf("Wait must still retract the topology gauges:\n%s", body)
+	}
+}
+
+// #298 review: StartLocal's standby arm ASSERTS standby.signal instead of trusting it. The
+// branch was asymmetric -- it cleared the file for primary-state data but never created it for
+// standby-state data -- and InRecovery comes from pg_controldata, not from the file. A control
+// file reading "in archive recovery" with the signal gone (the RejoinForceRewind window, an
+// unclean node reboot) was started READ-WRITE on the live primary's timeline.
+func TestActStartLocalAssertsStandbySignalForStandbyState(t *testing.T) {
+	pm := &fakePostmaster{}
+	a := newTestAgent(t, pm, &fakeDCS{})
+	sig := filepath.Join(a.cfg.PGDATA, "standby.signal")
+	if _, err := os.Stat(sig); !os.IsNotExist(err) {
+		t.Fatalf("the fixture must start without a signal file: %v", err)
+	}
+	obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: false, InRecovery: true}}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.StartLocal}, obs); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if _, err := os.Stat(sig); err != nil {
+		t.Fatalf("standby-state data was started with no standby.signal, i.e. read-write: %v", err)
+	}
+	if !pm.started {
+		t.Fatal("postmaster must be started")
+	}
+	if a.servingRW.Load() {
+		t.Fatal("a standby start must not arm servingRW")
+	}
+}
+
 func TestDesiredRoleLabels(t *testing.T) {
 	peers := []reconcile.PeerState{
 		{Name: "pg-1", Reachable: true, Role: pg.RoleStandby},  // -> standby (joins read-only Service)

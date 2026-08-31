@@ -98,3 +98,25 @@ func TestRehashMd5UserSkipsEmptyArgs(t *testing.T) {
 		}
 	}
 }
+
+// A SCRAM verifier must never survive into an error string: rehashManagedUsersOnce logs
+// that error verbatim, so anything left in it lands in the pod log (#298 review).
+func TestScrubSCRAMRedactsVerifiers(t *testing.T) {
+	// The shape PostgreSQL prints in the error CONTEXT of a failed dynamic ALTER USER.
+	in := `ERROR:  cannot execute ALTER ROLE in a read-only transaction
+CONTEXT:  SQL statement "ALTER USER pg WITH PASSWORD 'SCRAM-SHA-256$4096:c2FsdA==$c3RvcmVk:c2VydmVy'"`
+	out := scrubSCRAM(in)
+	if strings.Contains(out, "c3RvcmVk") || strings.Contains(out, "4096:") {
+		t.Errorf("verifier survived scrubbing: %q", out)
+	}
+	if !strings.Contains(out, "SCRAM-SHA-256$[redacted]") {
+		t.Errorf("expected a redaction marker, got %q", out)
+	}
+	// Everything that is not a verifier is diagnostic and must be preserved.
+	if !strings.Contains(out, "cannot execute ALTER ROLE in a read-only transaction") {
+		t.Errorf("scrubbing ate the diagnostic: %q", out)
+	}
+	if got := scrubSCRAM("psql: could not connect to server"); got != "psql: could not connect to server" {
+		t.Errorf("scrubbing altered output with no verifier: %q", got)
+	}
+}

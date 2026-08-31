@@ -411,49 +411,58 @@ func (a *agent) run() {
 
 	// Leadership: OnLost demotes synchronously (the fence-ordering guarantee)
 	// before the lock can be re-acquired by anyone.
-	go a.dcs.Run(ctx, a.cfg.PodName, dcs.Callbacks{
-		OnAcquired: func(context.Context) {
-			a.metr.SetLeader(true)
-			a.log.Info("acquired leadership")
-		},
-		// Involuntary loss only (never Release or shutdown): the chart's
-		// PGHAAgentLeaseRenewFailing alert rates this counter, and until it was wired
-		// here nothing incremented it, so the alert could never fire (#298 review).
-		OnRenewFailure: func() {
-			a.metr.IncRenewFailure()
-			a.log.Warn("lease lost involuntarily: renew/keepalive lapsed (DCS unreachable?)")
-		},
-		OnLost: func() {
-			a.metr.SetLeader(false)
-			a.opMu.Lock()
-			defer a.opMu.Unlock()
-			// Only a read-write primary needs fencing on lease loss (so a peer cannot
-			// promote into a second writer). A read-only standby is not a writer:
-			// shutting it down is needless churn and, during a repmgrd->agent rolling
-			// migration, would deadlock the roll (a standby-agent that holds the lease
-			// but refuses to promote against the still-repmgrd primary). Skip it.
-			if !a.servingRW.Load() {
-				a.log.Info("lost leadership while not read-write; no fence needed")
-				return
-			}
-			a.metr.IncFence()
-			a.log.Warn("lost leadership; demoting (fence)")
-			dctx, cancel := context.WithTimeout(context.Background(), a.cfg.RenewDeadline)
-			defer cancel()
-			if err := a.sup.Demote(dctx, true); err != nil {
-				// KEEP the latch set (#298 review). Clearing it on a FAILED demote is the one
-				// direction tick()'s own rule forbids -- "cleared only on positive evidence",
-				// fail-safe is to demote on uncertainty -- and a failed Stop is precisely the
-				// case where a read-write postmaster may still be up. With the latch cleared,
-				// the next lease loss takes the "not read-write; no fence needed" branch and
-				// skips the fence on the one node that most needs it. The tick loop re-derives
-				// it from the observed role either way, so holding it costs nothing.
-				a.log.Error("fence demote failed; keeping this node marked read-write so a later lease loss still fences", "err", err)
-				return
-			}
-			a.servingRW.Store(false)
-		},
-	})
+	//
+	// dcsDone closes when Run has finished unwinding, which is what actually frees the
+	// lease: the etcd backend revokes its session lease in a deferred releaseSession and
+	// the K8s backend empties the Lease after OnStoppedLeading. The shutdown path below
+	// waits on it before closing the client (#298 review).
+	dcsDone := make(chan struct{})
+	go func() {
+		defer close(dcsDone)
+		a.dcs.Run(ctx, a.cfg.PodName, dcs.Callbacks{
+			OnAcquired: func(context.Context) {
+				a.metr.SetLeader(true)
+				a.log.Info("acquired leadership")
+			},
+			// Involuntary loss only (never Release or shutdown): the chart's
+			// PGHAAgentLeaseRenewFailing alert rates this counter, and until it was wired
+			// here nothing incremented it, so the alert could never fire (#298 review).
+			OnRenewFailure: func() {
+				a.metr.IncRenewFailure()
+				a.log.Warn("lease lost involuntarily: renew/keepalive lapsed (DCS unreachable?)")
+			},
+			OnLost: func() {
+				a.metr.SetLeader(false)
+				a.opMu.Lock()
+				defer a.opMu.Unlock()
+				// Only a read-write primary needs fencing on lease loss (so a peer cannot
+				// promote into a second writer). A read-only standby is not a writer:
+				// shutting it down is needless churn and, during a repmgrd->agent rolling
+				// migration, would deadlock the roll (a standby-agent that holds the lease
+				// but refuses to promote against the still-repmgrd primary). Skip it.
+				if !a.servingRW.Load() {
+					a.log.Info("lost leadership while not read-write; no fence needed")
+					return
+				}
+				a.metr.IncFence()
+				a.log.Warn("lost leadership; demoting (fence)")
+				dctx, cancel := context.WithTimeout(context.Background(), a.cfg.RenewDeadline)
+				defer cancel()
+				if err := a.sup.Demote(dctx, true); err != nil {
+					// KEEP the latch set (#298 review). Clearing it on a FAILED demote is the one
+					// direction tick()'s own rule forbids -- "cleared only on positive evidence",
+					// fail-safe is to demote on uncertainty -- and a failed Stop is precisely the
+					// case where a read-write postmaster may still be up. With the latch cleared,
+					// the next lease loss takes the "not read-write; no fence needed" branch and
+					// skips the fence on the one node that most needs it. The tick loop re-derives
+					// it from the observed role either way, so holding it costs nothing.
+					a.log.Error("fence demote failed; keeping this node marked read-write so a later lease loss still fences", "err", err)
+					return
+				}
+				a.servingRW.Store(false)
+			},
+		})
+	}()
 
 	if err := a.boot(ctx); err != nil {
 		a.log.Error("boot", "err", err)
@@ -472,9 +481,39 @@ func (a *agent) run() {
 			// already cleared and no-ops.
 			sctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			a.opMu.Lock()
-			_ = a.sup.Demote(sctx, false) // graceful (fast) on planned shutdown
+			derr := a.sup.Demote(sctx, false) // graceful (fast) on planned shutdown
+			if derr == nil {
+				// A COMPLETED demote is positive evidence this node is no longer a writer, so
+				// disarm the fence latch here exactly as the switchover and ReleaseLease paths
+				// do (#298 review). Without it every planned termination of a read-write
+				// primary ran OnLost's fence branch on the way out: pg_ha_agent_fences_total
+				// incremented and the log said "lost leadership; demoting (fence)" for a node
+				// that had shut down cleanly, so a maintenance window with a couple of primary
+				// restarts paged PGHAAgentFlapping ("suggests instability"). It also removes the
+				// worse variant, where the queued OnLost won opMu and re-stopped the postmaster
+				// with Immediate/SIGQUIT instead of the intended Fast, forcing crash recovery on
+				// the next start.
+				a.clearServingRWForPlannedStepDown()
+			} else {
+				a.log.Warn("planned shutdown: demote did not complete; leaving this node marked read-write", "err", derr)
+			}
 			a.opMu.Unlock()
 			cancel()
+			// WAIT for the election goroutine to unwind before closing the client (#298
+			// review). Releasing the lease is the last thing Run does -- the etcd backend
+			// revokes its session lease in a deferred releaseSession, the K8s backend empties
+			// the Lease after OnStoppedLeading -- and Close() tearing the gRPC connection down
+			// underneath it made that revoke fail silently ("client connection is closing"), so
+			// the election key survived for the full session TTL. Every planned primary
+			// termination then cost a peer a full LeaseDuration (15s on chart defaults) of write
+			// outage instead of an immediate handoff. Bounded, because a shutdown must not hang
+			// on an unreachable DCS: past the grace we close anyway and the lease expires on TTL,
+			// which is exactly the old behaviour.
+			select {
+			case <-dcsDone:
+			case <-time.After(a.cfg.LeaseDuration):
+				a.log.Warn("shutdown: leader election did not unwind in time; releasing the lease is left to TTL expiry")
+			}
 			// Best-effort close of the DCS client (etcd holds a gRPC connection; the
 			// K8s backend has nothing to close).
 			if c, ok := a.dcs.(io.Closer); ok {
@@ -573,7 +612,7 @@ func (a *agent) boot(ctx context.Context) error {
 	// data is deferred to the reconcile loop, which starts it (StartLocal) only when
 	// this node holds the lease and passes the highwater guard -- otherwise a fenced
 	// ex-primary would come up read-write before the lease state is known and flap.
-	cd, err := pg.ReadControlData(ctx, pg.OSExec{}, a.pgControlDataBin, a.cfg.PGDATA)
+	cd, err := a.readControlData(ctx)
 	if err != nil {
 		a.log.Warn("boot: read pg_controldata; deferring start to reconcile", "err", err)
 		return nil
@@ -591,6 +630,19 @@ func (a *agent) boot(ctx context.Context) error {
 			a.log.Warn("boot: ensure dbname in primary_conninfo", "err", err)
 		} else if changed {
 			a.log.Info("boot: patched dbname into primary_conninfo")
+		}
+		// RE-ASSERT standby.signal before starting (#298 review). InRecovery is derived from
+		// pg_controldata ALONE, never from the presence of the file, so the two can disagree --
+		// and every disagreement was resolved in the unsafe direction here. RejoinForceRewind
+		// moves standby.signal aside for pg_rewind's crash-recovery step and restores it only
+		// via an in-process defer: a container kill / OOM / node reboot inside that window
+		// (pg_rewind legitimately runs for minutes) leaves a directory whose control file says
+		// "in archive recovery" with no signal file. This branch then started it read-write --
+		// crash recovery on the LIVE PRIMARY'S TIMELINE, before any lease or marker check had
+		// run, i.e. a second writer. Creating the file first is idempotent, costs one syscall,
+		// and makes the on-disk role the authority it is meant to be.
+		if err := process.SetRecoverySignal(a.cfg.PGDATA); err != nil {
+			return err
 		}
 		return a.sup.Start(ctx)
 	}
@@ -796,7 +848,7 @@ func (a *agent) observe(ctx context.Context) reconcile.Observation {
 	// to a stopped node (without this a fenced primary-state node has no timeline,
 	// is started read-write, and immediately fences -- the flap).
 	if !ls.Running && ls.HasData {
-		if cd, err := pg.ReadControlData(ctx, pg.OSExec{}, a.pgControlDataBin, a.cfg.PGDATA); err != nil {
+		if cd, err := a.readControlData(ctx); err != nil {
 			a.log.Warn("read pg_controldata", "err", err)
 		} else {
 			ls.Timeline, ls.TimelineOK = cd.Timeline, cd.TimelineOK
@@ -1200,7 +1252,17 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// #308's cache goes too: this node has stopped being primary, and
 		// synchronized_standby_slots is a primary-side reconcile.
 		a.lastSyncStandbySlots = nil
-	case reconcile.NoOp:
+	case reconcile.NoOp, reconcile.Wait:
+		// Wait rides with NoOp (#298 review). Both are "observe again, touch nothing" -- Wait is
+		// what Decide returns when there is no known leader, which the Follow-latch exemption
+		// above already calls routine ("the lease is briefly empty after ReleaseOnCancel") --
+		// and neither ends this node's slot holdings. Falling into the retract branch below
+		// zeroed pg_ha_agent_replication_slots_{inactive,invalidated,max_retained_wal_bytes} on
+		// EVERY Wait tick, so a standby sitting on an inactive, WAL-pinning slot through a
+		// step-down cooldown or an apiserver/etcd partition resolved all three slot alerts and
+		// restarted their `for:` clocks (5m/15m/1h) -- a blind window over the disk-fill hazard
+		// #289 exists to catch, opened precisely when WAL accumulation is most likely.
+		//
 		// Pause is NOT a demotion (#294 review). Decide returns NoOp for maintenance mode, and
 		// it must not reach the retract branch below: on a PAUSED PRIMARY, still serving and
 		// still holding slots, ClearSlots() every tick silences all three slot alerts and
@@ -1242,13 +1304,21 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// on chart defaults), and a concurrent dcs.OnLost fence blocks on opMu for the same
 		// span. Clone, the initdb path, RejoinForceRewind and ReclonePreserving are all
 		// wrapped for exactly this; Promote was the one that was not.
+		// Armed BEFORE the promote, not after it (#298 review). A non-nil error from
+		// `pg_ctl -w promote` is NOT proof this node did not become a writer: on a standby
+		// with a large unreplayed backlog pg_ctl gives up at PGCTLTIMEOUT (60s, nothing in
+		// this image lowers it) and exits non-zero while the promotion signal has already
+		// been written and the postmaster completes the promotion anyway. With the latch set
+		// only on the success path, that timeout returned with servingRW still false, so the
+		// lease loss that followed took OnLost's "not read-write; no fence needed" branch and
+		// skipped the demote on a node that was becoming a writer -- two primaries until the
+		// next tick. Pre-arming only ever makes OnLost demote a node that is becoming read-write
+		// (the fail-safe direction), which is exactly the reasoning StartLocal already applies.
+		a.servingRW.Store(true)
 		if err := a.beatDuring(func() error { return a.mech.Promote(ctx) }); err != nil {
 			return err
 		}
 		a.metr.IncPromotion()
-		// Now read-write: arm the OnLost fence immediately (before the next tick's
-		// observation), so a lease loss right after promoting still fences.
-		a.servingRW.Store(true)
 		// After promotion the node is read-write. Bound ALL the post-promote
 		// bookkeeping -- the slot pass, the WAL re-probe, and the marker + routing
 		// apiserver writes -- under the fence budget, sharing one context so the total
@@ -1328,7 +1398,25 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// expected standbys, and reclaim orphans a scale-down or a repmgr->native migration
 		// left pinning WAL. Bounded by the same fence-budget context -- a hung psql must not
 		// hold opMu past the soft-fence window -- and best-effort, resuming next tick.
-		staySlots, stayOwned, staySlotsRead := a.slotsTick(wctx)
+		//
+		// Under its OWN sub-budget, for the reason the Promote branch gives (#298 review):
+		// left on wctx a single slow query consumes the whole fence budget (5s on chart
+		// defaults) and the tick finishes WITHOUT advanceMarker and WITHOUT
+		// assertPrimaryRouting -- a write Service still pointing at the old pod. This branch
+		// carries MORE than Promote's on the same budget (a slot list, a pod LIST, up to
+		// NodeCount-1 creates each allowed 10s by Prober.Timeout, the drop pass, and #308's
+		// ALTER SYSTEM + reload), and it is the ONLY branch a restored primary ever takes --
+		// the documented scale-to-0 restore comes back through StartLocal -> StayPrimary and
+		// never through Promote, so its very first routing assertion happens here, on a tick
+		// whose slot pass has to create every peer slot from scratch.
+		var staySlots []pg.SlotState
+		var stayOwned []string
+		var staySlotsRead bool
+		func() {
+			sctx, scancel := context.WithTimeout(wctx, a.fenceBudget()/2)
+			defer scancel()
+			staySlots, stayOwned, staySlotsRead = a.slotsTick(sctx)
+		}()
 		// Keep the highwater marker at this primary's timeline (monotonic; written
 		// only when it advances, so steady-state ticks make no API write).
 		a.advanceMarker(wctx, obs.Local.Timeline, obs.Local.TimelineOK, obs.Marker)
@@ -1659,6 +1747,19 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 				// primary-state: clear any stray standby.signal so it opens read-write
 				// (crash recovery on the same timeline -- a resume, not a promotion).
 				if err := process.ClearRecoverySignal(a.cfg.PGDATA); err != nil {
+					return err
+				}
+			} else {
+				// standby-state: ASSERT standby.signal rather than trusting it to be there
+				// (#298 review). The branch was asymmetric -- it removed the file for
+				// primary-state data but never created it for standby-state data -- and
+				// InRecovery comes from pg_controldata, not from the file, so the two can
+				// disagree. A control file reading "in archive recovery" with the signal
+				// missing (the RejoinForceRewind window, a lost file after an unclean node
+				// reboot, a manual removal) was started READ-WRITE here, on the live
+				// primary's timeline. StartRecovery one branch below already does this;
+				// doing it here too makes both arms state what they intend on disk.
+				if err := process.SetRecoverySignal(a.cfg.PGDATA); err != nil {
 					return err
 				}
 			}
@@ -2159,7 +2260,7 @@ func (a *agent) discardTornClone(ctx context.Context) {
 		a.endClone()
 		return
 	}
-	if _, err := pg.ReadControlData(ctx, pg.OSExec{}, a.pgControlDataBin, a.cfg.PGDATA); err == nil {
+	if _, err := a.readControlData(ctx); err == nil {
 		// Complete cluster: the base backup finished and only a later step failed. Keep it and
 		// clear the marker so a later boot does not reconsider.
 		a.log.Info("the base backup completed; keeping the data directory (a later step failed, #288)")
@@ -2789,6 +2890,29 @@ func (a *agent) beatDuring(fn func() error) error {
 	return err
 }
 
+// controlDataTimeout bounds every pg_controldata exec, matching Prober's own default SQL
+// budget. pg_controldata reads a file, so it is normally instant -- but "reads a file" is
+// precisely why it is not free: on a degraded PV (a stuck EBS volume, an NFS server that
+// stopped answering) the read enters uninterruptible sleep and never returns.
+const controlDataTimeout = 10 * time.Second
+
+// readControlData runs pg_controldata under controlDataTimeout.
+//
+// Every caller passed act()'s ctx, which is the run loop's ROOT context and carries no
+// deadline (#298 review). ReadControlData adds no timeout of its own -- unlike Prober.psql,
+// which caps every SQL probe -- and OSExec's cmd.WaitDelay only takes effect AFTER the
+// context is cancelled, so with a deadline-less context nothing bounded the exec at all.
+// assertSameCluster is called from act()'s Follow branch and from rejoinOnto, both holding
+// opMu: a wedged PGDATA blocked the reconcile goroutine indefinitely, metr.Beat() stopped so
+// /healthz went stale, and dcs.OnLost -- which needs opMu to demote -- could never fence the
+// node. That is the exact starvation shape every apiserver and psql call in this file is
+// already bounded against.
+func (a *agent) readControlData(ctx context.Context) (pg.ControlInfo, error) {
+	cctx, cancel := context.WithTimeout(ctx, controlDataTimeout)
+	defer cancel()
+	return pg.ReadControlData(cctx, pg.OSExec{}, a.pgControlDataBin, a.cfg.PGDATA)
+}
+
 // assertSameCluster enforces invariant 9: never use a peer of a DIFFERENT
 // PostgreSQL cluster as a follow/rewind/reclone source (a stale or misrouted pod on
 // the shared headless Service, a leftover, or a DR-restored cluster with a fresh
@@ -2799,7 +2923,7 @@ func (a *agent) beatDuring(fn func() error) error {
 // walreceiver also reject a sysid mismatch -- so this only refuses on a CONFIRMED
 // mismatch, turning a cryptic downstream failure into a clear, actionable one.
 func (a *agent) assertSameCluster(ctx context.Context, peer string) error {
-	cd, err := pg.ReadControlData(ctx, pg.OSExec{}, a.pgControlDataBin, a.cfg.PGDATA)
+	cd, err := a.readControlData(ctx)
 	if err != nil || cd.SystemID == 0 {
 		return nil // no local cluster identity yet -> nothing to protect
 	}

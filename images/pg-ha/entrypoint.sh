@@ -197,7 +197,20 @@ EOF
     # exist: every standby was blocked until the primary registered in repmgr.nodes, which only
     # happens after the real start. Listening on no TCP address closes it entirely -- the local
     # psql calls below all use the unix socket.
-    pg_ctl -D "$PGDATA" -w start -o "-c listen_addresses=''"
+    # log_statement/log_min_error_statement are load-bearing, not tidiness (#298 review).
+    # pg_ctl is deliberately run without -l, so this transient postmaster inherits THIS
+    # script's stdout/stderr (see the stop at the end of the function), and PostgreSQL's
+    # defaults are logging_collector=off, log_destination=stderr,
+    # log_min_error_statement=error -- so any statement that raises ERROR is echoed back
+    # with a `STATEMENT:` line carrying the statement verbatim. On a DEFAULT install that is
+    # guaranteed, not hypothetical: postgresql.username is `postgres`, initdb has already
+    # created that bootstrap superuser, so `CREATE USER "postgres" ... PASSWORD '<secret>'`
+    # fails with "role already exists" and the server logs the cleartext password. The
+    # `2>/dev/null` on the psql calls below silences only the CLIENT; the server writes its
+    # own copy, which in postgres mode lands on container stdout and in initdb mode is
+    # captured by the agent's CombinedOutput and re-emitted at Info level. Moving the
+    # secrets off argv (#298) closed the smaller channel and left this one open.
+    pg_ctl -D "$PGDATA" -w start -o "-c listen_addresses='' -c log_statement=none -c log_min_error_statement=panic"
 
     REPMGR_USER=${REPMGR_USER:-repmgr}
     REPMGR_PASSWORD=${REPMGR_PASSWORD:?REPMGR_PASSWORD is required}

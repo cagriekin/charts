@@ -1921,6 +1921,32 @@ etcd_np_noport=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-a
   --set 'ha.agent.dcs.backend=etcd' --set 'ha.agent.dcs.etcd.endpoints={https://e1}' \
   --set networkPolicy.enabled=true --show-only templates/networkpolicy.yaml 2>&1)
 assert_contains "agent etcd NP: a portless endpoint defaults to 2379" "${etcd_np_noport}" "port: 2379"
+# #298 review: the bundled-etcd TLS guard is gated on tls.enabled ALONE. It used to also
+# require clientCertAuth, so an encrypt-only bundled etcd rendered clean with no ETCD_TLS_CA --
+# and clientv3 then verified the etcd server cert against the container's system root store,
+# which holds neither the chart's nor cert-manager's CA. Every dial failed with
+# `certificate signed by unknown authority`, no node won the lease, and the release came up
+# with no primary and no write-Service endpoint.
+etcd_tls_nocca_rc=0
+etcd_tls_nocca_out=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'ha.agent.dcs.backend=etcd' --set 'etcd.enabled=true' \
+  --set 'etcd.tls.enabled=true' --set 'etcd.tls.clientCertAuth=false' \
+  --set 'etcd.tls.existingSecret=byo-etcd-tls' \
+  --show-only templates/statefulset.yaml 2>&1) || etcd_tls_nocca_rc=$?
+assert_eq "agent etcd: bundled TLS without clientCertAuth still needs the agent's CA" \
+  "1" "$([ "${etcd_tls_nocca_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "agent etcd: the CA-only failure names the value to set" \
+  "${etcd_tls_nocca_out}" "ha.agent.dcs.etcd.tls.secretName"
+# ...and it renders once that Secret is named.
+etcd_tls_nocca_ok=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
+  --set 'ha.agent.dcs.backend=etcd' --set 'etcd.enabled=true' \
+  --set 'etcd.tls.enabled=true' --set 'etcd.tls.clientCertAuth=false' \
+  --set 'etcd.tls.existingSecret=byo-etcd-tls' \
+  --set 'ha.agent.dcs.etcd.tls.secretName=agent-etcd-tls' \
+  --show-only templates/statefulset.yaml 2>&1)
+assert_contains "agent etcd: encrypt-only bundled etcd renders with the agent CA mounted" \
+  "${etcd_tls_nocca_ok}" "ETCD_TLS_CA"
+
 etcd_noeps_rc=0
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-agent.yaml" \
   --set 'repmgr.agent.dcs.backend=etcd' --show-only templates/statefulset.yaml >/dev/null 2>&1 || etcd_noeps_rc=$?

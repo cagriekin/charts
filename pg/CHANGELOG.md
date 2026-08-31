@@ -744,6 +744,45 @@
   the whole `initdb` on every restart. It is now checked with the credentials, before the first
   write to the volume.
 
+- **Five ways a second writer could appear, closed (#298 review, agent).** (1) `boot()` and
+  `StartLocal`'s standby arm now *assert* `standby.signal` from the control-file state instead
+  of trusting the file to be there: `InRecovery` is derived from `pg_controldata` alone, so the
+  two can disagree -- most sharply inside `RejoinForceRewind`, which moves the signal aside for
+  `pg_rewind` (minutes, deliberately unbounded) and restores it only via an in-process `defer`,
+  so an OOM/eviction/node reboot in that window left "in archive recovery" with no signal file,
+  which was then started read-write on the live primary's timeline. (2) `SetRecoverySignal`
+  writes through `atomicfile` (fsync + directory fsync) like `Native.Follow` already did, so a
+  power loss cannot durably persist the control file while losing the signal. (3) `Promote` arms
+  the read-write latch *before* `pg_ctl -w promote` rather than after: a `PGCTLTIMEOUT` (60s)
+  exit is non-zero while the promotion still completes, and an unarmed latch made the next lease
+  loss take the "no fence needed" branch on a node that was becoming a writer. (4) The
+  Kubernetes DCS no longer uses client-go's `ReleaseOnCancel`, which empties the Lease *before*
+  the deferred `OnStoppedLeading` demote; the agent now frees the Lease itself after `Run`
+  unwinds, preserving the fence ordering while still handing off in milliseconds. (5) Planned
+  shutdown clears the latch on a completed demote and waits for the election to unwind before
+  closing the DCS client, so a clean termination is no longer counted and logged as a
+  split-brain fence, and etcd's lease revoke is no longer killed mid-flight (which cost a peer a
+  full `LeaseDuration` of write outage on every planned primary restart).
+
+- **Two credential leaks into logs, closed (#298 review, image + agent).** The transient
+  bootstrap postmaster ran without `-l`, so it inherited the entrypoint's stdout with
+  PostgreSQL's default `log_min_error_statement=error` -- and on a *default* install
+  `CREATE USER "postgres" ... PASSWORD '<secret>'` always fails ("role already exists") and the
+  server echoed a `STATEMENT:` line carrying the cleartext password to container stdout. It now
+  starts with `log_statement=none -c log_min_error_statement=panic`. Separately, psql prints the
+  error CONTEXT of a failed dynamic `ALTER USER ... PASSWORD`, which carries the SCRAM verifier;
+  the re-hash folded that combined output into an error the agent logs verbatim, so a node that
+  entered recovery mid-rehash wrote the superuser's or replication user's verifier into the pod
+  log. Verifiers are now redacted before the output reaches an error.
+
+- **`etcd.tls.enabled=true` with `clientCertAuth=false` no longer renders a cluster that can
+  never elect (#298 review).** The bundled-etcd guard also required `clientCertAuth`, so an
+  encrypt-only bundled etcd rendered clean with no `ETCD_TLS_CA` -- and clientv3 then verifies
+  the etcd server certificate against the container's system root store, which holds neither the
+  chart's nor cert-manager's CA. Every dial failed `x509: certificate signed by unknown
+  authority`, no node won the lease, and the release came up with no primary and no write-Service
+  endpoint. The guard is now keyed on `tls.enabled` alone and its message says why.
+
 - **The `databases`/`roles` and audit-extension hook Jobs are allowed through the
   NetworkPolicy (#298 review).** Both `psql` to 5432 over the write Service exactly like the
   monitoring-user Job, and both were the only client components with no ingress rule of their

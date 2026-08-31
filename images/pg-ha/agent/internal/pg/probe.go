@@ -493,9 +493,19 @@ func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name strin
 	if err := validSlotName(name); err != nil {
 		return err
 	}
+	// slot_type = 'physical' in the guard, matching PhysicalSlots and
+	// DropPhysicalSlotIfInactive (#298 review). Without it a LOGICAL slot squatting on the
+	// name suppressed the create silently: the statement returned zero rows with a nil error,
+	// so reconcileSlots logged "created replication slot for an expected standby" and re-ran
+	// the same no-op every tick forever, because PhysicalSlots -- which IS filtered -- never
+	// reported the name back into its `have` map. Meanwhile the standby whose
+	// primary_slot_name is that ordinal could not stream at all ("cannot use a logical
+	// replication slot for physical replication") and no layer of the agent said why. Scoped,
+	// the create runs and PostgreSQL's own "already exists" error surfaces the collision.
 	out, err := p.psql(ctx, ci, fmt.Sprintf(
 		"SELECT pg_create_physical_replication_slot('%s') "+
-			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '%s');", name, name))
+			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots "+
+			"WHERE slot_name = '%s' AND slot_type = 'physical');", name, name))
 	if err != nil && IsDuplicateSlot(out, err) {
 		return nil
 	}

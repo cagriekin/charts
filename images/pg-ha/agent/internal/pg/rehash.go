@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -34,9 +35,31 @@ func (OSExec) RunStdin(ctx context.Context, env []string, stdin, name string, ar
 	cmd.Stdin = strings.NewReader(stdin)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%s: %w: %s", name, err, scrubSCRAM(strings.TrimSpace(string(out))))
 	}
 	return nil
+}
+
+// scramVerifierRe matches a stored SCRAM-SHA-256 verifier as PostgreSQL prints it.
+var scramVerifierRe = regexp.MustCompile(`SCRAM-SHA-256\$[^\s'"]+`)
+
+// scrubSCRAM redacts SCRAM verifiers from psql's combined output before it is folded into
+// an error.
+//
+// The verifier is kept off argv and out of the SERVER log (see rehashSQL), and that was
+// assumed to be the whole exposure -- but PostgreSQL puts the full dynamic statement into
+// the error CONTEXT of any failure inside `EXECUTE format('ALTER USER %I WITH PASSWORD %L',
+// ...)`, and psql prints CONTEXT at default verbosity. rehashManagedUsersOnce logs this
+// error verbatim, so an ALTER that failed wrote the superuser's or replication user's
+// verifier straight into the pod log and thence to whatever ships logs -- the same leak the
+// #298 rewrite closed on the server side, reappearing on the client side. Reachable without
+// anything exotic: the re-hash runs against the local node and the role is ALTERed after the
+// EXISTS check, so a node that entered recovery in between fails with "cannot execute ALTER
+// ROLE in a read-only transaction" and leaks; a concurrently dropped or renamed role does
+// the same. A verifier is not the plaintext, but it is enough for an offline dictionary
+// attack, which is exactly why it is treated as a secret everywhere else in this file.
+func scrubSCRAM(s string) string {
+	return scramVerifierRe.ReplaceAllString(s, "SCRAM-SHA-256$[redacted]")
 }
 
 // rehashSQL re-hashes one managed user's password from md5 to scram-sha-256 when it
