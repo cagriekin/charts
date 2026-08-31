@@ -500,12 +500,25 @@ func (p *Prober) CreatePhysicalSlot(ctx context.Context, ci ConnInfo, name strin
 	// the same no-op every tick forever, because PhysicalSlots -- which IS filtered -- never
 	// reported the name back into its `have` map. Meanwhile the standby whose
 	// primary_slot_name is that ordinal could not stream at all ("cannot use a logical
-	// replication slot for physical replication") and no layer of the agent said why. Scoped,
-	// the create runs and PostgreSQL's own "already exists" error surfaces the collision.
+	// replication slot for physical replication") and no layer of the agent said why.
+	//
+	// The collision is RAISEd with a message of our OWN, not left to PostgreSQL's (#298
+	// review, round 2). Scoping the guard alone did not surface anything: the create then
+	// runs and pg_create_physical_replication_slot fails with the very phrase
+	// `replication slot "..." already exists`, which IsDuplicateSlot matches -- so the
+	// error was swallowed and this returned nil exactly as before, leaving the silent
+	// per-tick no-op the scoping was meant to end. A distinct message (deliberately
+	// WITHOUT the words "already exists") makes the squatter fatal while a genuine
+	// physical/physical race still raises PostgreSQL's own phrase and is still treated as
+	// success below -- which is the one case that IS success.
 	out, err := p.psql(ctx, ci, fmt.Sprintf(
-		"SELECT pg_create_physical_replication_slot('%s') "+
+		"DO $do$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots "+
+			"WHERE slot_name = '%[1]s' AND slot_type <> 'physical') THEN "+
+			"RAISE EXCEPTION 'replication slot %[1]s is not a physical slot, so it cannot be "+
+			"used for streaming replication: drop it or free the name'; END IF; END $do$; "+
+			"SELECT pg_create_physical_replication_slot('%[1]s') "+
 			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots "+
-			"WHERE slot_name = '%s' AND slot_type = 'physical');", name, name))
+			"WHERE slot_name = '%[1]s' AND slot_type = 'physical');", name))
 	if err != nil && IsDuplicateSlot(out, err) {
 		return nil
 	}

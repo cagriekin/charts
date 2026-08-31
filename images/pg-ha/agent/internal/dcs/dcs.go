@@ -36,4 +36,19 @@ type Callbacks struct {
 	// pg_ha_agent_renew_failures_total: the chart alerts on that counter's rate, and
 	// with nothing incrementing it the alert could never fire (#298 review). Optional.
 	OnRenewFailure func()
+	// SafeToRelease is consulted by the backend AFTER OnLost has returned and BEFORE it
+	// frees the lock, and a false answer means "hold it" (#298 review).
+	//
+	// Freeing the lock is what makes a step-down hand off in milliseconds instead of at TTL
+	// expiry, and that is safe on exactly one condition: the demote OnLost just performed
+	// actually completed. When it did not -- `Stop` cannot reach a postmaster in
+	// uninterruptible sleep on a wedged PV, so it returns an error and deliberately leaves
+	// the child supervised -- OnLost keeps this node marked read-write precisely because a
+	// writer may still be up. Handing the lock over in that state gives a peer immediate
+	// permission to promote beside it, with none of the LeaseDuration/TTL margin that
+	// expiry-based handoff would have left. So the backends ask before releasing.
+	//
+	// Optional: nil means "always safe", which is the right default for a caller that does
+	// not fence (and keeps every existing test honest).
+	SafeToRelease func() bool
 }

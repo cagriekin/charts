@@ -427,6 +427,34 @@ func TestCreatePhysicalSlotToleratesLosingACreateRace(t *testing.T) {
 	}
 }
 
+// #298 review, round 2: a NON-PHYSICAL slot squatting on the name must SURFACE, and the
+// statement therefore has to raise a message of its own. Scoping the WHERE NOT EXISTS guard
+// to slot_type='physical' alone was a no-op: the create then runs and PostgreSQL's error is
+// the very `replication slot "..." already exists` that IsDuplicateSlot treats as success,
+// so the collision was swallowed exactly as before -- reconcileSlots logged a create that
+// did nothing on every tick while the standby pointed at that ordinal could not stream.
+func TestCreatePhysicalSlotSurfacesANonPhysicalSquatter(t *testing.T) {
+	ex := &slotExec{}
+	p := &Prober{Exec: ex}
+	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err != nil {
+		t.Fatalf("CreatePhysicalSlot: %v", err)
+	}
+	sql := ex.sqls[0]
+	if !strings.Contains(sql, "slot_type <> 'physical'") || !strings.Contains(sql, "RAISE EXCEPTION") {
+		t.Errorf("the statement does not raise on a non-physical slot of the same name: %s", sql)
+	}
+	// The raised message must not carry the phrase IsDuplicateSlot swallows, or the guard
+	// would be silently undone again.
+	if strings.Contains(sql, "already exists") {
+		t.Errorf("the raised message must avoid the duplicate-slot phrase: %s", sql)
+	}
+	raised := `ERROR:  replication slot pg_ha_slot_1 is not a physical slot, so it cannot be used for streaming replication: drop it or free the name`
+	p = &Prober{Exec: &slotExec{out: raised, err: errors.New("exit status 1")}}
+	if err := p.CreatePhysicalSlot(context.Background(), ConnInfo{}, "pg_ha_slot_1"); err == nil {
+		t.Error("a non-physical slot on this name was reported as a successful create")
+	}
+}
+
 // It must NOT swallow an unrelated failure -- a connection error or a permission denial
 // has to surface, or a primary that cannot create slots at all would look healthy.
 func TestCreatePhysicalSlotPropagatesUnrelatedErrors(t *testing.T) {

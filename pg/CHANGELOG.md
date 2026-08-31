@@ -744,6 +744,18 @@
   the whole `initdb` on every restart. It is now checked with the credentials, before the first
   write to the volume.
 
+- **The leader lock is no longer freed when the fence demote failed (#298 review, both DCS
+  backends).** Freeing it is what turns a step-down into a millisecond handoff instead of one at
+  TTL expiry, and that is safe on exactly one condition: the demote `OnLost` just performed
+  completed. On the wedged-PV path it does not -- SIGKILL cannot reach a postmaster in
+  uninterruptible sleep, so `Stop` returns an error and deliberately leaves the child supervised,
+  and `OnLost` keeps the node marked read-write precisely because a writer may still be up.
+  Handing the lock over in that state gave a peer immediate permission to promote beside a live
+  writer, with none of the `LeaseDuration`/TTL margin an expiry-based handoff would have left.
+  Both backends now ask the agent first (`Callbacks.SafeToRelease`): the Kubernetes backend skips
+  emptying the Lease, and the etcd backend still orphans its session -- so the key expires on its
+  own TTL -- but skips the immediate revoke. A completed fence still hands off at once.
+
 - **A promote that outlives the lease no longer claims the write Service (#298 review, agent).**
   `pg_ctl -w promote` is bounded only by `PGCTLTIMEOUT` (60s) while the default `LeaseDuration`
   is 15s, so on the ordinary failover case -- a standby with a large unreplayed backlog -- the
@@ -770,7 +782,12 @@
   successful restart every tick while the database was down. A successful rejoin re-latches its
   upstream, without which the next re-homing tick skipped `releaseSlotOnFormerUpstream` and left
   an inactive slot pinning WAL on the rejoin target. `ensureSlotOnUpstream`'s existence guard is
-  scoped to `slot_type = 'physical'`, mirroring the same fix in `Prober.CreatePhysicalSlot`. And
+  scoped to `slot_type = 'physical'`, mirroring the same fix in `Prober.CreatePhysicalSlot` --
+  and both statements now `RAISE` a message of their own on a non-physical slot holding the
+  name, because scoping the guard alone changed nothing observable: the create then ran and
+  PostgreSQL's own error is the very `replication slot "..." already exists` that
+  `IsDuplicateSlot` treats as success, so a logical squatter stayed silent exactly as before.
+  And
   a queued control intent floors its inherited request deadline, which was routinely already in
   the past by the time the loop dequeued it -- making a graceful `/v1/node/restart` a zero-grace
   SIGKILL of a read-write primary.

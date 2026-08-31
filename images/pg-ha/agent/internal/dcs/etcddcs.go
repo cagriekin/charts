@@ -179,7 +179,7 @@ func (e *EtcdDCS) runElection(ctx context.Context, identity string, cb Callbacks
 		}
 		return // etcd unreachable; retry next iteration (leadership unchanged)
 	}
-	defer e.releaseSession(sess) // frees the lease+key on the way out (runs after OnLost)
+	defer e.releaseSession(sess, cb) // frees the lease+key on the way out (runs after OnLost)
 	el := concurrency.NewElection(sess, e.cfg.Prefix)
 
 	// Observe the current leader for followers (Leader()), independent of whether
@@ -235,8 +235,20 @@ func (e *EtcdDCS) runElection(ctx context.Context, identity string, cb Callbacks
 // session (etcd unreachable) the lease is already gone and the revoke just times out
 // (bounded), with TTL expiry as the backstop. Never on the critical demote path
 // (OnLost already ran), so it cannot delay a fence.
-func (e *EtcdDCS) releaseSession(sess *concurrency.Session) {
+func (e *EtcdDCS) releaseSession(sess *concurrency.Session, cb Callbacks) {
 	sess.Orphan() // stop the keepalive refresh (Close would also revoke on the dead ctx)
+	// Orphan ALWAYS runs, the Revoke is conditional (#298 review). Orphaning only stops this
+	// process from refreshing the lease, so the key still expires on its own TTL -- that is the
+	// margin. Revoking deletes the key NOW, which is what makes a step-down hand off in
+	// milliseconds, and it is safe on the same single condition K8sDCS's releaseLease states:
+	// the demote OnLost just performed completed. On the wedged-PV path it did not, OnLost kept
+	// this node marked read-write because a writer may still be up, and revoking would hand a
+	// peer immediate permission to promote beside it. Skipping the revoke leaves the full TTL.
+	if cb.SafeToRelease != nil && !cb.SafeToRelease() {
+		slog.Warn("not revoking the etcd election lease: this node may still be a read-write primary (the fence demote did not complete). The key will expire on its TTL instead, which preserves the takeover margin",
+			"ttlSeconds", e.cfg.TTLSeconds)
+		return
+	}
 	rc, rcancel := context.WithTimeout(context.Background(), e.retryPeriod())
 	_, _ = e.client.Revoke(rc, sess.Lease())
 	rcancel()

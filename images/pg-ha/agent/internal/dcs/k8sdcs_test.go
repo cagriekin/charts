@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -116,6 +117,74 @@ func TestK8sDCSReleaseHandsOff(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("peer did not take over after Release (a=%v b=%v)", a.IsLeader(), b.IsLeader())
+}
+
+// #298 review: the Lease is freed only when the agent says it is SAFE to free. Emptying it is
+// what turns a step-down into a millisecond handoff, and that is safe on one condition -- the
+// demote OnLost just ran actually completed. On the wedged-PV path it does not (SIGKILL cannot
+// reach a process in uninterruptible sleep, so Stop returns an error and leaves the child
+// supervised), OnLost keeps the node marked read-write because a writer may still be up, and an
+// immediate handoff would let a peer promote beside it with no margin at all. Holding the Lease
+// costs the peer only the LeaseDuration it would have waited anyway.
+func TestK8sDCSHoldsTheLeaseWhenTheFenceDidNotComplete(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		safe      bool
+		wantEmpty bool
+	}{
+		{"fence completed -> hand off now", true, true},
+		{"fence did not complete -> hold to TTL", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := fake.NewSimpleClientset()
+			d := NewK8sDCSWithClient(K8sConfig{
+				Namespace: "ns", LeaseName: "pg-leader",
+				LeaseDuration: 2 * time.Second, RenewDeadline: 1 * time.Second, RetryPeriod: 200 * time.Millisecond,
+				StepDownCooldown: 10 * time.Second,
+			}, cs)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			lost := make(chan struct{}, 1)
+			go d.Run(ctx, "pod-0", Callbacks{
+				OnLost:        func() { lost <- struct{}{} },
+				SafeToRelease: func() bool { return tc.safe },
+			})
+			for i := 0; !d.IsLeader() && i < 150; i++ {
+				time.Sleep(100 * time.Millisecond)
+			}
+			if !d.IsLeader() {
+				t.Fatal("never acquired leadership")
+			}
+			d.Release()
+			select {
+			case <-lost:
+			case <-time.After(10 * time.Second):
+				t.Fatal("OnLost never fired")
+			}
+			// releaseLease runs immediately after OnLost returns, inside the same goroutine.
+			var holder string
+			for i := 0; i < 100; i++ {
+				l, err := cs.CoordinationV1().Leases("ns").Get(ctx, "pg-leader", metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				holder = ""
+				if l.Spec.HolderIdentity != nil {
+					holder = *l.Spec.HolderIdentity
+				}
+				if (holder == "") == tc.wantEmpty {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if tc.wantEmpty && holder != "" {
+				t.Errorf("a completed fence must free the Lease for an immediate handoff; holder is still %q", holder)
+			}
+			if !tc.wantEmpty && holder != "pod-0" {
+				t.Errorf("an incomplete fence must leave the Lease held so the peer waits out the TTL; holder = %q", holder)
+			}
+		})
+	}
 }
 
 func TestK8sDCSStartsAsFollower(t *testing.T) {

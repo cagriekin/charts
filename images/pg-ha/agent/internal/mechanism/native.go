@@ -529,13 +529,25 @@ func (n *Native) ensureSlotOnUpstream(ctx context.Context, source Conn) error {
 	// SILENTLY: the statement returns zero rows with a nil error, so this reports success and
 	// Follow then writes primary_slot_name pointing at it. The walreceiver loops forever on
 	// "cannot use a logical replication slot for physical replication" and no layer of the
-	// agent says why. Scoped, the create actually runs and PostgreSQL's own "already exists"
-	// surfaces the collision (isDuplicateSlot only swallows a physical/physical race).
+	// agent says why.
+	//
+	// The collision is RAISEd with a message of our OWN, not left to PostgreSQL's (#298
+	// review, round 2). Scoping the guard alone surfaced nothing: the create then runs and
+	// pg_create_physical_replication_slot fails with the very phrase `replication slot "..."
+	// already exists`, which isDuplicateSlot matches -- so the error was swallowed below and
+	// this reported success exactly as before. A distinct message (deliberately WITHOUT the
+	// words "already exists") makes the squatter fatal, while a genuine physical/physical
+	// race still raises PostgreSQL's own phrase and stays success. Mirrors
+	// Prober.CreatePhysicalSlot.
 	sql := fmt.Sprintf(
-		"SELECT pg_create_physical_replication_slot('%s') "+
+		"DO $do$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots "+
+			"WHERE slot_name = '%[1]s' AND slot_type <> 'physical') THEN "+
+			"RAISE EXCEPTION 'replication slot %[1]s is not a physical slot, so it cannot be "+
+			"used for streaming replication: drop it or free the name'; END IF; END $do$; "+
+			"SELECT pg_create_physical_replication_slot('%[1]s') "+
 			"WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots "+
-			"WHERE slot_name = '%s' AND slot_type = 'physical');",
-		n.SlotName, n.SlotName)
+			"WHERE slot_name = '%[1]s' AND slot_type = 'physical');",
+		n.SlotName)
 	// --no-psqlrc, for the reason Prober.psql and RehashMd5User both pass it (#298 review):
 	// PSQLRC reaches this process through postgresql.extraEnv (childenv.Filtered strips only
 	// *PASSWORD*) and the agent writes into the postgres home, so ~/.psqlrc is reachable too.

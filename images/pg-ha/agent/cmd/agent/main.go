@@ -431,6 +431,13 @@ func (a *agent) run() {
 				a.metr.IncRenewFailure()
 				a.log.Warn("lease lost involuntarily: renew/keepalive lapsed (DCS unreachable?)")
 			},
+			// Consulted by the backend after OnLost returns, before it frees the lock
+			// (#298 review). servingRW is the agent's own answer to "might a read-write
+			// postmaster still be up here": OnLost clears it only on a COMPLETED demote and
+			// deliberately keeps it set on a failed one, which is exactly the state in which
+			// an immediate handoff would let a peer promote beside a live writer. Holding the
+			// lock then costs the peer the LeaseDuration/TTL it would have waited anyway.
+			SafeToRelease: func() bool { return !a.servingRW.Load() },
 			OnLost: func() {
 				a.metr.SetLeader(false)
 				a.opMu.Lock()

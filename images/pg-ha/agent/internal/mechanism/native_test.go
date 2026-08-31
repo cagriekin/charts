@@ -529,6 +529,44 @@ func TestNativeNoSlotNameStaysSlotless(t *testing.T) {
 	}
 }
 
+// #298 review, round 2: the slot-create statement must RAISE on a non-physical slot holding
+// the name, with a message of its own. Scoping the WHERE NOT EXISTS guard to
+// slot_type='physical' alone changed nothing observable: the create then runs and
+// PostgreSQL's error is the very `replication slot "..." already exists` that isDuplicateSlot
+// treats as success, so a logical squatter was still swallowed and Follow still wrote
+// primary_slot_name at a slot the walreceiver cannot use.
+func TestNativeSlotCreateRaisesOnANonPhysicalSquatter(t *testing.T) {
+	fr := &fakeRunner{}
+	n, _ := newTestNativeWithSlot(t, fr, "pg_ha_slot_1")
+	if err := n.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	var sql string
+	for _, c := range fr.calls {
+		joined := strings.Join(c.args, " ")
+		if strings.Contains(joined, "pg_create_physical_replication_slot") {
+			sql = joined
+			break
+		}
+	}
+	if sql == "" {
+		t.Fatal("no slot create was issued")
+	}
+	if !strings.Contains(sql, "slot_type <> 'physical'") || !strings.Contains(sql, "RAISE EXCEPTION") {
+		t.Errorf("the statement does not raise on a non-physical slot of the same name: %s", sql)
+	}
+	if strings.Contains(sql, "already exists") {
+		t.Errorf("the raised message must avoid the phrase isDuplicateSlot swallows: %s", sql)
+	}
+	// ...and the raised error really does reach the caller rather than being swallowed.
+	fr2 := &fakeRunner{failOn: "pg_create_physical_replication_slot",
+		failOut: "ERROR:  replication slot pg_ha_slot_1 is not a physical slot, so it cannot be used for streaming replication: drop it or free the name"}
+	n2, _ := newTestNativeWithSlot(t, fr2, "pg_ha_slot_1")
+	if err := n2.Clone(context.Background(), Conn{Host: "pg-0.hl", User: "repmgr", DB: "repmgr"}); err == nil {
+		t.Error("a non-physical slot on this name was reported as a successful create")
+	}
+}
+
 // A slot-create failure must abort the clone: proceeding without the slot silently
 // reintroduces the WAL gap the slot exists to prevent.
 func TestNativeCloneFailsWhenSlotCreateFails(t *testing.T) {
