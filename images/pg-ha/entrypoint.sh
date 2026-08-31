@@ -347,8 +347,22 @@ SQL
     # existence-only check then reports bootstrap_ok=yes -- sealing the completion sentinel over
     # a cluster the agent can never log in to. pg_roles.rolpassword always reads NULL, hence
     # pg_authid.
-    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_authid WHERE rolname = '${repmgr_user_lit}' AND rolpassword IS NOT NULL" 2>/dev/null | grep -q 1; then
-        echo "FATAL: bootstrap did not leave the ${REPMGR_USER} role with a password (a name PostgreSQL already owns -- anything starting with 'pg_' is reserved -- cannot be created as the replication role; pick a different ha.username / REPMGR_USER)." >&2
+    #
+    # ...and `rolcanlogin`, because a password alone does not mean the agent can connect (#298
+    # review). What this verification is really asking is "can the agent authenticate as this
+    # role", and LOGIN is half of that.
+    #
+    # NOT for the `pg_`-prefixed case: that one is already covered, and a review round claiming
+    # otherwise was wrong on the SQL. Tested against postgres:18-trixie -- `CREATE USER
+    # "pg_monitor"` fails with `role name "pg_monitor" is reserved`, and the paired ALTER fails
+    # too, with `Cannot alter reserved roles`, so rolpassword stays NULL and the arm below
+    # already fires. The case rolcanlogin adds is a PRE-EXISTING non-reserved role that someone
+    # created NOLOGIN (an operator, or an older bootstrap): `ALTER USER ... WITH PASSWORD` sets
+    # the password without granting LOGIN, so a password-only check would seal the completion
+    # sentinel over a role the agent still cannot log in as. Every role this function creates
+    # itself is `CREATE USER`, i.e. LOGIN, so the normal path pays nothing for the check.
+    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_authid WHERE rolname = '${repmgr_user_lit}' AND rolpassword IS NOT NULL AND rolcanlogin" 2>/dev/null | grep -q 1; then
+        echo "FATAL: bootstrap did not leave the ${REPMGR_USER} role able to log in with a password. A name PostgreSQL already owns cannot be used -- anything starting with 'pg_' is reserved, and those predefined roles cannot be given a password or a login -- and a role that already exists without login rights is not usable either; pick a different ha.username / REPMGR_USER." >&2
         bootstrap_ok=no
     fi
     if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '${repmgr_db_lit}'" 2>/dev/null | grep -q 1; then
@@ -359,8 +373,11 @@ SQL
     # password -- initdb ran with no --pwfile, so a swallowed CREATE/ALTER USER left it NULL
     # and every network login dead -- and the app database must exist. pg_authid, not
     # pg_roles: pg_roles.rolpassword always reads as NULL, even for superusers.
-    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_authid WHERE rolname = '${pg_user_lit}' AND rolpassword IS NOT NULL" 2>/dev/null | grep -q 1; then
-        echo "FATAL: bootstrap did not leave the ${POSTGRES_USER} role with a password." >&2
+    # rolcanlogin here too, for the reason the repmgr arm above states: a pre-existing NOLOGIN
+    # role would otherwise pass a password-only check while no application could authenticate
+    # as it (#298 review).
+    if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_authid WHERE rolname = '${pg_user_lit}' AND rolpassword IS NOT NULL AND rolcanlogin" 2>/dev/null | grep -q 1; then
+        echo "FATAL: bootstrap did not leave the ${POSTGRES_USER} role able to log in with a password." >&2
         bootstrap_ok=no
     fi
     if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname = '${pg_db_lit}'" 2>/dev/null | grep -q 1; then

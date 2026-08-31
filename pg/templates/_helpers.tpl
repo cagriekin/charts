@@ -1601,8 +1601,12 @@ to acknowledge, not the chart's to assume.
        around it. Same shape in reverse when only the bootstrap image is pinned. */ -}}
 {{- $haDigest := ($ha.digest | default "") | toString -}}
 {{- $bootDigest := ($boot.digest | default "") | toString -}}
-{{- $haRef := printf "%s:%s" ($ha.repository | default "") ($ha.tag | default "") -}}
-{{- $bootRef := printf "%s:%s" ($boot.repository | default "") ($boot.tag | default "") -}}
+{{- /* toString on every half, as pg.image and etcd.image now do (#298 review): values.schema.json
+       types no image.tag, so an unquoted YAML scalar (`tag: 2.0`) arrives as float64 and `%s`
+       renders Go's error verb -- the mismatch message this guard exists to hand the operator
+       then reads `cagriekin/pg-ha:%!s(float64=2)` and names neither key's real value. */ -}}
+{{- $haRef := printf "%s:%s" ($ha.repository | default "" | toString) ($ha.tag | default "" | toString) -}}
+{{- $bootRef := printf "%s:%s" ($boot.repository | default "" | toString) ($boot.tag | default "" | toString) -}}
 {{- if $haDigest -}}{{- $haRef = printf "%s@%s" $haRef $haDigest -}}{{- end -}}
 {{- if $bootDigest -}}{{- $bootRef = printf "%s@%s" $bootRef $bootDigest -}}{{- end -}}
 {{- if ne $haRef $bootRef -}}

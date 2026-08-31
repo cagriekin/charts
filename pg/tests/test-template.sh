@@ -5607,6 +5607,19 @@ ha_bad_rc=0
 helm template test-pg "${CHART_DIR}" --set ha.agent.leaseDuration=5s >/dev/null 2>&1 || ha_bad_rc=$?
 assert_gt "#298: the same triple is still rejected with ha.enabled=true" "${ha_bad_rc}" 0
 
+# #298 review: the etcd bootstrap-image MISMATCH MESSAGE must name the real values, not Go's
+# format verb. pg.image and etcd.image got `toString` on both halves of the reference;
+# pg.validateEtcdBootstrapImage builds its two comparison refs with its own printf and did not.
+# values.schema.json types no image.tag, so an unquoted YAML scalar arrives as float64 and the
+# remediation message -- whose whole job is to name the two keys that disagree -- read
+# `cagriekin/pg-ha:%!s(float64=2)`. --set-json, not --set: helm's strvals parser converts
+# integers but leaves a float a string, so a plain --set would pass with the bug present.
+etcd_boot_float=$(helm template test-pg "${CHART_DIR}" --set etcd.enabled=true \
+  --set-json 'ha={"enabled":true,"image":{"repository":"cagriekin/pg-ha","tag":2.0,"pullPolicy":"IfNotPresent","majorVersion":"18"}}' 2>&1 || true)
+assert_contains "#298: the etcd bootstrap-image mismatch still fires on a float tag" "${etcd_boot_float}" "must match ha.image"
+assert_not_contains "#298: ...and names the tag rather than a Go format verb" "${etcd_boot_float}" '%!s('
+assert_contains "#298: ...printing the float tag as written" "${etcd_boot_float}" "cagriekin/pg-ha:2)"
+
 # --- #298 review: a 1.x HA image pin cannot run chart 2.0.0 ---
 # The repmgr-init container passes only PG_MAJOR; a 1.x image's `entrypoint.sh init` runs
 # init-repmgr.sh, which hard-fails on the unset HEADLESS_SERVICE/REPMGR_PASSWORD, so every pod

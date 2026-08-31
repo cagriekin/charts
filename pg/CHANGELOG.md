@@ -674,6 +674,27 @@
 
 ### Fixed
 
+- **The bootstrap's role verification also requires the role to be able to log in (#298
+  review, image).** `rolpassword IS NOT NULL` alone is not the property that matters: what the
+  block is really asking is whether the agent can authenticate as the role. A pre-existing role
+  that someone created `NOLOGIN` -- an operator, or an older bootstrap -- takes the paired
+  `ALTER USER ... PASSWORD` (which sets a password without granting LOGIN) and then satisfied the
+  check, so the completion sentinel sealed the directory in over a role nothing could connect as.
+  Both arms now also require `rolcanlogin`; every role the bootstrap creates itself is a
+  `CREATE USER`, i.e. LOGIN, so the normal path is unaffected. Note this is *not* about a
+  `pg_`-prefixed `ha.username`: tested against `postgres:18-trixie`, both `CREATE USER
+  "pg_monitor"` and the paired `ALTER USER` are refused (`Cannot alter reserved roles`), so
+  `rolpassword` stays NULL and the password arm already caught that case.
+
+- **A non-string image tag no longer renders Go's error verb in the etcd bootstrap-image
+  mismatch message (#298 review).** `pg.image` and `etcd.image` were given `toString` on both
+  halves of their reference; `pg.validateEtcdBootstrapImage`, which builds the two references it
+  compares with its own `printf "%s:%s"`, was not. `values.schema.json` types no `image.tag`, so
+  an unquoted YAML scalar (`tag: 2.0`) arrives as a float64 -- and the guard's remediation
+  message, whose whole job is to name the two keys that disagree, read
+  `cagriekin/pg-ha:%!s(float64=2)` instead. The comparison itself was never wrong (both sides
+  render through the same expression), only the message an operator has to act on.
+
 - **`postgresql.pgHba` entries no longer invert their order across pod starts (#298 review,
   standalone).** The postStart insert was made a single awk pass so the whole list lands in the
   operator's declared order -- which fixed the order WITHIN one batch and left it broken ACROSS

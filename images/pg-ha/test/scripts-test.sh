@@ -537,11 +537,19 @@ done
 # by the deliberate `2>/dev/null || true`, and passes an existence-only check -- sealing the
 # completion sentinel over a cluster the agent can never log in to. pg_authid, not pg_roles:
 # pg_roles.rolpassword always reads NULL.
-if grep -qF "FROM pg_authid WHERE rolname = '\${repmgr_user_lit}' AND rolpassword IS NOT NULL" "${ROOT}/entrypoint.sh"; then
-  ok "#298: the repmgr role verification requires a password, symmetrically with POSTGRES_USER"
-else
-  bad "#298: the repmgr role verification checks existence only" "a pre-existing reserved role (pg_monitor, ...) would pass it"
-fi
+#
+# It must also require ROLCANLOGIN (#298 review). The ALTER USER paired with the CREATE runs
+# even when the CREATE failed, and ALTER ROLE has no reserved-name check -- so on a `pg_` name
+# the ALTER succeeds on the predefined role and a password-only check passes for a role that is
+# NOLOGIN, sealing in exactly the wedge above.
+for _v in repmgr_user_lit pg_user_lit; do
+  if grep -qF "FROM pg_authid WHERE rolname = '\${${_v}}' AND rolpassword IS NOT NULL AND rolcanlogin" "${ROOT}/entrypoint.sh"; then
+    ok "#298: the ${_v%_lit} verification requires a password AND login"
+  else
+    bad "#298: the ${_v%_lit} verification does not require rolcanlogin" \
+      "the CREATE's paired ALTER USER succeeds on a reserved NOLOGIN role (pg_monitor, ...), so rolpassword alone passes for a cluster nothing can authenticate against"
+  fi
+done
 
 # --- #298 review: the transient bootstrap postmaster is never left running ---
 # `pg_ctl -w stop` fails on PGCTLTIMEOUT (60s) on a contended node, and bare under `set -e` that
