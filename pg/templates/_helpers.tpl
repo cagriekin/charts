@@ -151,6 +151,20 @@ annotation consumers -- #128.)
        So: digest alone is a complete reference; tag alone is the ordinary case; both together
        is legal and means "resolve this digest, the tag is decoration"; neither is an error. */ -}}
 {{- define "pg.image" -}}
+{{- /* A non-string tag or digest is REFUSED, not coerced (#298 review). Two earlier rounds got
+       this wrong in opposite directions: `printf "%s:%s"` rendered Go's error verb
+       (`repo:%!s(float64=3.5)`), which at least failed loudly at the kubelet, and `| toString`
+       then made it silent and WRONG -- Go renders a float in canonical form, so `tag: 18.0`
+       becomes `repo:18` (a floating patch instead of the pin the operator wrote) and
+       `tag: 2.10` becomes `repo:2.1`, a different tag that may well exist. A render-clean
+       manifest deploying an image the values file never named is exactly the apply-time hazard
+       invariant 4 says to catch at render time, so fail here and say how to fix it. */ -}}
+{{- if and .tag (not (kindIs "string" .tag)) -}}
+{{- fail (printf "image tag %v for repository %v is a %s, not a string: YAML reads an unquoted 18.0 as a number and a tag is text, so it would render as \"18\" -- a different image, or none. Quote it: tag: \"%v\"." .tag .repository (kindOf .tag) .tag) -}}
+{{- end -}}
+{{- if and .digest (not (kindIs "string" .digest)) -}}
+{{- fail (printf "image digest %v for repository %v is a %s, not a string: quote it." .digest .repository (kindOf .digest)) -}}
+{{- end -}}
 {{- if not .repository -}}
 {{- /* An empty repository renders ":tag" or "@sha256:..." -- unparseable, the same
        InvalidImageName class as the empty-tag case below (#320 review). */ -}}
@@ -168,7 +182,7 @@ annotation consumers -- #128.)
        move to render time. The pre-#320 `{{ . }}` form printed any scalar correctly, so this
        is a regression the printf introduced, not a pre-existing hole. */ -}}
 {{- if .tag -}}
-{{- printf "%s:%s" (.repository | toString) (.tag | toString) -}}
+{{- printf "%s:%s" .repository .tag -}}
 {{- else -}}
 {{- .repository -}}
 {{- end -}}

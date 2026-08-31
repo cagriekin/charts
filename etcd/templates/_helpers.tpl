@@ -81,6 +81,21 @@ app.kubernetes.io/component: etcd
            the release comes up with no primary. Failing the render is the chart's contract for
            a dangerous input (see CLAUDE.md invariant 4). */ -}}
 {{- define "etcd.image" -}}
+{{- /* A non-string tag or digest is REFUSED, not coerced (#298 review). Two earlier rounds got
+       this wrong in opposite directions: `printf "%s:%s"` rendered Go's error verb
+       (`repo:%!s(float64=3.5)`), which at least failed loudly at the kubelet, and `| toString`
+       then made it silent and WRONG -- Go renders a float in canonical form, so `tag: 18.0`
+       becomes `repo:18` (a floating patch instead of the pin the operator wrote) and
+       `tag: 2.10` becomes `repo:2.1`, a different tag that may well exist. A render-clean
+       manifest deploying an image the values file never named is exactly the apply-time hazard
+       invariant 4 says to catch at render time, so fail here and say how to fix it. */ -}}
+{{- if and .tag (not (kindIs "string" .tag)) -}}
+{{- fail (printf "etcd: image tag %v for repository %v is a %s, not a string: YAML reads an unquoted 18.0 as a number and a tag is text, so it would render as \"18\" -- a different image, or none. Quote it: tag: \"%v\"." .tag .repository (kindOf .tag) .tag) -}}
+{{- end -}}
+{{- if and .digest (not (kindIs "string" .digest)) -}}
+{{- fail (printf "etcd: image digest %v for repository %v is a %s, not a string: quote it." .digest .repository (kindOf .digest)) -}}
+{{- end -}}
+
 {{- if not .repository -}}
 {{- fail "etcd: an image block has an empty repository, which renders an unparseable reference (\":tag\"). Set the repository, or leave the whole image block at its chart default." -}}
 {{- end -}}
@@ -95,7 +110,7 @@ app.kubernetes.io/component: etcd
        at the kubelet: exactly the failure this helper exists to move to render time. The fail
        message above already does this to .repository; the reference itself has to as well. */ -}}
 {{- if .tag -}}
-{{- printf "%s:%s" (.repository | toString) (.tag | toString) -}}
+{{- printf "%s:%s" .repository .tag -}}
 {{- else -}}
 {{- .repository -}}
 {{- end -}}

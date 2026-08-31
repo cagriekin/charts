@@ -2,7 +2,7 @@ apiVersion: v2
 name: etcd
 description: Minimal 3-node etcd cluster providing the quorum-based leadership store (DCS) for the pg/pgvector failover agent; bundled per release or run standalone as a shared store
 type: application
-version: 0.1.12
+version: 0.1.13
 appVersion: "3.5.16"
 home: https://github.com/cagriekin/charts/tree/master/etcd
 sources:

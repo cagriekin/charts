@@ -538,16 +538,22 @@ done
 # completion sentinel over a cluster the agent can never log in to. pg_authid, not pg_roles:
 # pg_roles.rolpassword always reads NULL.
 #
-# It must also require ROLCANLOGIN (#298 review). The ALTER USER paired with the CREATE runs
-# even when the CREATE failed, and ALTER ROLE has no reserved-name check -- so on a `pg_` name
-# the ALTER succeeds on the predefined role and a password-only check passes for a role that is
-# NOLOGIN, sealing in exactly the wedge above.
+# It must also require ROLCANLOGIN (#298 review), because the property the block is really
+# asking about is "can the agent AUTHENTICATE as this role", and a password is only half of
+# that. NOT for the `pg_`-prefixed case -- that one is the password arm's, and a review round
+# claiming ALTER ROLE has no reserved-name check was wrong on the SQL: verified against
+# postgres:18-trixie, `CREATE USER "pg_monitor"` is refused (`role name "pg_monitor" is
+# reserved`) and so is the paired `ALTER USER ... PASSWORD` (`Cannot alter reserved roles`), so
+# rolpassword stays NULL. rolcanlogin is defense in depth for any role that ends up WITH a
+# password and WITHOUT login: unreachable while bootstrap_initdb returns early on a non-empty
+# PGDATA (the only roles it can meet are initdb's own), and pinned here so the pair is not
+# quietly reduced back to a password-only check by a later edit.
 for _v in repmgr_user_lit pg_user_lit; do
   if grep -qF "FROM pg_authid WHERE rolname = '\${${_v}}' AND rolpassword IS NOT NULL AND rolcanlogin" "${ROOT}/entrypoint.sh"; then
     ok "#298: the ${_v%_lit} verification requires a password AND login"
   else
     bad "#298: the ${_v%_lit} verification does not require rolcanlogin" \
-      "the CREATE's paired ALTER USER succeeds on a reserved NOLOGIN role (pg_monitor, ...), so rolpassword alone passes for a cluster nothing can authenticate against"
+      "a password is only half of 'can the agent authenticate as this role'; a role left with a password and no LOGIN would pass and the completion sentinel would seal the directory in"
   fi
 done
 

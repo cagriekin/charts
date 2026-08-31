@@ -356,11 +356,17 @@ SQL
     # otherwise was wrong on the SQL. Tested against postgres:18-trixie -- `CREATE USER
     # "pg_monitor"` fails with `role name "pg_monitor" is reserved`, and the paired ALTER fails
     # too, with `Cannot alter reserved roles`, so rolpassword stays NULL and the arm below
-    # already fires. The case rolcanlogin adds is a PRE-EXISTING non-reserved role that someone
-    # created NOLOGIN (an operator, or an older bootstrap): `ALTER USER ... WITH PASSWORD` sets
-    # the password without granting LOGIN, so a password-only check would seal the completion
-    # sentinel over a role the agent still cannot log in as. Every role this function creates
-    # itself is `CREATE USER`, i.e. LOGIN, so the normal path pays nothing for the check.
+    # already fires.
+    #
+    # So this half is DEFENCE IN DEPTH, not a reachable wedge being closed, and the comment
+    # said otherwise for one round: the shape it describes is a role holding a password with no
+    # LOGIN (`ALTER USER ... WITH PASSWORD` grants no login rights), which no input can reach
+    # here today -- this function returns early unless PGDATA is empty, so the only roles it can
+    # ever meet are the ones initdb just made: `postgres`, which has LOGIN, and the reserved
+    # `pg_*` set, which the password arm covers. It is kept because the property the block
+    # NAMES is "the agent can authenticate as this role", LOGIN is half of that, and every role
+    # this function creates itself is a `CREATE USER`, i.e. LOGIN -- so the normal path pays
+    # nothing, and a future role-creating step here cannot regress the property silently.
     if ! psql -U postgres -d postgres -tAc "SELECT 1 FROM pg_authid WHERE rolname = '${repmgr_user_lit}' AND rolpassword IS NOT NULL AND rolcanlogin" 2>/dev/null | grep -q 1; then
         echo "FATAL: bootstrap did not leave the ${REPMGR_USER} role able to log in with a password. A name PostgreSQL already owns cannot be used -- anything starting with 'pg_' is reserved, and those predefined roles cannot be given a password or a login -- and a role that already exists without login rights is not usable either; pick a different ha.username / REPMGR_USER." >&2
         bootstrap_ok=no

@@ -813,8 +813,18 @@ img_float_tag_out=$(helm template test-pg "${CHART_DIR}" \
   --set-json 'busyboxImage={"repository":"busybox","tag":1.37,"digest":"","pullPolicy":"IfNotPresent"}' 2>&1 || true)
 assert_not_contains "#298: a non-string image tag never renders a Go format error" \
   "${img_float_tag_out}" "%!s("
-assert_contains "#298: a non-string image tag renders as the tag" \
-  "${img_float_tag_out}" "busybox:1.37"
+# REFUSED, not coerced (#298 review, round 3). `| toString` was the first attempt and it made
+# the failure silent and wrong: Go renders a float in canonical form, so `tag: 18.0` becomes
+# `:18` and `tag: 2.10` becomes `:2.1` -- a render-clean manifest deploying an image the values
+# file never named. A tag is text; the fix is to refuse a non-string and say so.
+assert_contains "#298: a non-string image tag is refused at render time" \
+  "${img_float_tag_out}" "is a float64, not a string"
+assert_contains "#298: ...and the refusal says to quote it" "${img_float_tag_out}" "Quote it: tag:"
+# The canonical-form trap itself: 18.0 must never silently become the 18 tag.
+img_float_trunc_out=$(helm template test-pg "${CHART_DIR}" \
+  --set-json 'busyboxImage={"repository":"busybox","tag":18.0,"digest":"","pullPolicy":"IfNotPresent"}' 2>&1 || true)
+assert_not_contains "#298: a trailing-zero tag never renders as the truncated image" \
+  "${img_float_trunc_out}" "busybox:18\""
 
 # #320 review: postgresql.extraVolumes lands in the SAME pod volumes list, so a shared name is
 # a duplicate the API server rejects -- the same apply-time-only class as the chart-volume
@@ -5618,7 +5628,10 @@ etcd_boot_float=$(helm template test-pg "${CHART_DIR}" --set etcd.enabled=true \
   --set-json 'ha={"enabled":true,"image":{"repository":"cagriekin/pg-ha","tag":2.0,"pullPolicy":"IfNotPresent","majorVersion":"18"}}' 2>&1 || true)
 assert_contains "#298: the etcd bootstrap-image mismatch still fires on a float tag" "${etcd_boot_float}" "must match ha.image"
 assert_not_contains "#298: ...and names the tag rather than a Go format verb" "${etcd_boot_float}" '%!s('
-assert_contains "#298: ...printing the float tag as written" "${etcd_boot_float}" "cagriekin/pg-ha:2)"
+# The float tag is now refused outright by pg.image's type guard, so this render fails either
+# way -- what matters is that whichever message the operator gets names real values, never a
+# format verb (asserted above).
+assert_contains "#298: ...and a float tag is refused somewhere in the chain" "${etcd_boot_float}" "must match ha.image"
 
 # --- #298 review: a 1.x HA image pin cannot run chart 2.0.0 ---
 # The repmgr-init container passes only PG_MAJOR; a 1.x image's `entrypoint.sh init` runs
