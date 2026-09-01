@@ -388,6 +388,12 @@ assert_eq "post: the write Service points at the primary (the agent took the upd
 # The query is the agent's own timeline expression, so the test waits on exactly what the guard
 # reads rather than on a proxy.
 marker_tl=$(kubectl get cm "${FULLNAME}-primary" -n "${NAMESPACE}" -o jsonpath='{.data.timeline}' 2>/dev/null || echo "")
+# Fail HERE if the marker is unreadable, rather than five minutes later (#298 review). An empty
+# marker_tl makes the readiness expression below false for every standby on every sample, so the
+# suite would spend its whole 300s budget and then report "no standby reached the marker
+# highwater" -- pointing at the standbys when the actual fault is a missing or unreadable
+# <fullname>-primary ConfigMap, which is itself a failure of the migration under test.
+assert_gt "post: the primary marker records a timeline (the highwater the guard compares against)" "${marker_tl:-0}" 0
 # STABLE for three consecutive samples, not merely true once (#298, found by the first live run).
 # The roll leaves the cluster settling: a standby that has just restarted reports the timeline
 # from its control file, which lags the marker until its first restartpoint, and it correctly

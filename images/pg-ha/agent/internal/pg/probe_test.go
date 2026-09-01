@@ -912,3 +912,43 @@ func TestEveryProberQueryDisablesTheStartupFile(t *testing.T) {
 		}
 	}
 }
+
+// RecoveryTimelines must split StandbyTimeline into its durable and streamed halves, and the
+// durable half must be the SAME expression the #125 highwater guard is left holding once the
+// walreceiver detaches -- checkpoint TLI *and* min_recovery_end_timeline (#298 review).
+//
+// Dropping min_recovery_end_timeline from the durable term is the specific regression this
+// pins: a standby that has already recorded the new timeline there is promotable, and measuring
+// it against the checkpoint TLI alone reports it as lagging, so ensureDurableTimeline forces a
+// full restartpoint on it every interval, forever.
+func TestRecoveryTimelinesSplitsDurableFromStreamed(t *testing.T) {
+	e := &sqlCaptureExec{ret: "2|3"}
+	p := &Prober{Exec: e}
+	durable, streamed, ok, err := p.RecoveryTimelines(context.Background(), ConnInfo{Host: "x"})
+	if err != nil || !ok || durable != 2 || streamed != 3 {
+		t.Fatalf("got durable=%d streamed=%d ok=%v err=%v, want 2/3", durable, streamed, ok, err)
+	}
+	if strings.Count(e.lastSQL, "min_recovery_end_timeline") != 2 {
+		t.Errorf("both terms must include min_recovery_end_timeline: %s", e.lastSQL)
+	}
+	if strings.Count(e.lastSQL, "received_tli") != 1 {
+		t.Errorf("only the streamed term may include received_tli: %s", e.lastSQL)
+	}
+	// The durable term is what the guard reads with no walreceiver, so it must never be
+	// greater than the streamed one -- SQL enforces that by construction (streamed GREATESTs
+	// the durable expression), and this pins the construction.
+	if !strings.Contains(e.lastSQL, "COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0)") {
+		t.Errorf("the transient source must be COALESCEd or a detached walreceiver NULLs the whole expression: %s", e.lastSQL)
+	}
+}
+
+// An unparseable or single-column answer is "unknown", never a zero timeline: a caller that
+// read 0 as durable would force a restartpoint on every tick.
+func TestRecoveryTimelinesRejectsAnUnparseableAnswer(t *testing.T) {
+	for _, ret := range []string{"", "2", "x|3", "2|y"} {
+		p := &Prober{Exec: &sqlCaptureExec{ret: ret}}
+		if _, _, ok, err := p.RecoveryTimelines(context.Background(), ConnInfo{Host: "x"}); ok || err != nil {
+			t.Errorf("%q: got ok=%v err=%v, want not-ok with no error", ret, ok, err)
+		}
+	}
+}

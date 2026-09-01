@@ -337,6 +337,43 @@ func (p *Prober) Restartpoint(ctx context.Context, ci ConnInfo) error {
 	return err
 }
 
+// RecoveryTimelines returns, in one round trip, the two halves of StandbyTimeline: the DURABLE
+// timeline this node would still report once its walreceiver detaches, and the full streamed
+// value including received_tli.
+//
+// durable is deliberately the SAME expression as StandbyTimeline MINUS the received_tli term
+// (#298 review), because that is precisely what the #125 highwater guard reads the moment the
+// upstream dies -- the moment promotion is decided. Comparing the streamed value against
+// pg_controldata's "Latest checkpoint's TimeLineID" alone, as the first cut of
+// ensureDurableTimeline did, ignores min_recovery_end_timeline: that field IS in the control
+// file, IS what the guard reads, and advances on any flush during recovery, well before the next
+// restartpoint. A standby that had already recorded the new timeline there therefore looked
+// stale, so a full restartpoint was forced -- every interval, forever, on a node that was
+// already promotable.
+//
+// Both terms come from the control file (pg_control_checkpoint / pg_control_recovery), so this
+// needs no pg_controldata exec: its caller only runs while the postmaster is answering. ok is
+// false when the node is unreachable or returns something unparseable.
+func (p *Prober) RecoveryTimelines(ctx context.Context, ci ConnInfo) (durable, streamed Timeline, ok bool, err error) {
+	const durableExpr = "GREATEST((SELECT timeline_id FROM pg_control_checkpoint()), " +
+		"COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0))"
+	out, err := p.psql(ctx, ci, "SELECT "+durableExpr+", "+
+		"GREATEST("+durableExpr+", COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0));")
+	if err != nil {
+		return 0, 0, false, err
+	}
+	d, s, found := strings.Cut(strings.TrimSpace(out), "|")
+	if !found {
+		return 0, 0, false, nil
+	}
+	dn, derr := strconv.ParseUint(strings.TrimSpace(d), 10, 32)
+	sn, serr := strconv.ParseUint(strings.TrimSpace(s), 10, 32)
+	if derr != nil || serr != nil {
+		return 0, 0, false, nil
+	}
+	return Timeline(dn), Timeline(sn), true, nil
+}
+
 // ReplicaRow is one row of the primary's view of its streaming standbys (#288).
 //
 // Both identity fields are returned RAW and unresolved: mapping either to a pod name needs

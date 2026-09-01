@@ -491,14 +491,15 @@
   walreceiver is attached, because it takes the greatest including `received_tli` -- and that term
   vanishes the instant the upstream dies, which is exactly when promotion is decided. The node
   then reads as below the marker highwater and refuses to promote.
-  
+
   On a freshly migrated cluster every standby is in that state at once, so deleting the primary
   produced `refuse to promote: timeline below recorded highwater (#125)` on all of them, the
   ex-primary restarted (its data directory is intact) and reclaimed the lease, and the cluster
   could not fail over at all until something forced a checkpoint by hand. The agent now forces a
-  restartpoint when a streaming standby's durable timeline lags, throttled to once a minute and
-  best-effort. The migration suite goes from a timeout mid-roll to 47/47, including a real
-  post-migration failover.
+  restartpoint when a streaming standby's durable timeline lags -- measured against the same
+  expression the guard reads, not the checkpoint timeline alone -- once every 15 seconds, backed
+  off to once a minute when a restartpoint does not move it, and best-effort. The migration
+  suite goes from a timeout mid-roll to 47/47, including a real post-migration failover.
 
 - **The in-place repmgrd -> 2.0.0 roll no longer deadlocks (#298, found by the first live run).**
   Rolling a live `failoverMode: repmgrd` release stalled at the first replaced pod and never

@@ -281,11 +281,13 @@ type agent struct {
 	tlsCheckedAt       time.Time
 	tlsInactiveLatched bool
 
-	// durableTLCheckedAt throttles the restartpoint that keeps a standby's control-file
-	// timeline current (#298). Same shape as tlsCheckedAt: the check costs a pg_controldata
-	// exec plus a SQL round trip, and the condition it repairs changes only when this node
-	// follows a new timeline.
-	durableTLCheckedAt time.Time
+	// durableTLNextAt throttles the restartpoint that keeps a standby's control-file timeline
+	// current (#298). Same shape as tlsCheckedAt, but stored as the NEXT due time rather than
+	// the last check, so a restartpoint that did not advance the timeline can back itself off
+	// (durableTLNoAdvanceInterval) without a second field. The condition it repairs changes
+	// only when this node follows a new timeline, and the steady-state check is one SQL round
+	// trip.
+	durableTLNextAt time.Time
 
 	// Control API (#276), present only when it is enabled. intents carries node-local
 	// operations from HTTP handlers to the reconcile goroutine (which owns the
@@ -3032,9 +3034,34 @@ const (
 // interval later: observed as a standby that acquired the lease, refused on the highwater guard,
 // and only became promotable 55s afterwards -- long enough that a failover window can close first
 // (it made the disk-loss stage of test-agent-failover skip seven assertions). Four ticks is
-// cheap: the check is one pg_controldata exec plus one SQL round trip, and it stops entirely once
-// the durable timeline has caught up.
+// cheap: the steady-state check is a single SQL round trip.
 const durableTLInterval = 15 * time.Second
+
+// durableTLNoAdvanceInterval backs the check off after a restartpoint that did NOT move the
+// durable timeline (#298 review).
+//
+// The no-op case is not free. PostgreSQL skips the restartpoint only when no NEWER checkpoint
+// record has been replayed; a standby working through a replay backlog behind a timeline switch
+// (or one held back by recovery_min_apply_delay) keeps replaying checkpoint records on the OLD
+// timeline, so every CHECKPOINT performs a real restartpoint -- a full flush of dirty shared
+// buffers -- while the durable timeline stays put because the switch itself has not been
+// replayed yet. At durableTLInterval that is a forced checkpoint every 15 seconds on a node
+// already saturated with replay I/O, for a repair that cannot land until replay catches up.
+// Retrying a minute apart still records the timeline long before checkpoint_timeout (5 minutes on
+// chart defaults) would have, which is the window this whole check exists to close.
+const durableTLNoAdvanceInterval = time.Minute
+
+// durableTLBudget bounds the WHOLE check, not each call inside it (#298 review).
+//
+// Every call here is individually capped by Prober.Timeout, but they are sequential: two reads
+// plus a CHECKPOINT is 30s of worst case inside a tick whose /healthz staleness threshold is
+// reconcileInterval*3 (15s on chart defaults). A tick that overruns it gets PID 1 -- and the
+// postmaster it supervises -- SIGKILLed by the kubelet, which is the starvation shape every other
+// blocking call in this file is bounded against. A CHECKPOINT is the one call here that is slow
+// while perfectly healthy (a restartpoint flushes dirty shared buffers), so this is a real
+// budget, not a theoretical one. Cutting psql short does not abort the server-side checkpoint; it
+// keeps running and the next interval's read sees the result.
+const durableTLBudget = 10 * time.Second
 
 // ensureDurableTimeline forces a restartpoint when this standby's DURABLE timeline lags the one
 // it is streaming (#298, found by the first live run of the repmgrd->2.0.0 migration).
@@ -3049,25 +3076,30 @@ const durableTLInterval = 15 * time.Second
 // over at all until something forced a checkpoint. Recording the timeline while the node is still
 // streaming is what closes the window.
 //
+// The comparison is against the timeline the GUARD would read once the walreceiver detaches --
+// GREATEST(checkpoint TLI, min_recovery_end_timeline) -- not against pg_controldata's checkpoint
+// TLI alone (#298 review). min_recovery_end_timeline lives in the same control file, is part of
+// the expression unsafeToServe reads, and advances on any flush during recovery, long before the
+// next restartpoint. Measuring against the checkpoint TLI alone therefore called a node stale
+// that was already promotable, and forced a full restartpoint on it every interval, forever.
+//
 // Best-effort and throttled: a failed checkpoint is not an incident, it just leaves the node in
 // the state it was already in, and the next tick past the interval tries again.
 func (a *agent) ensureDurableTimeline(ctx context.Context) {
-	if !a.durableTLCheckedAt.IsZero() && time.Since(a.durableTLCheckedAt) < durableTLInterval {
+	if !a.durableTLNextAt.IsZero() && time.Now().Before(a.durableTLNextAt) {
 		return
 	}
-	a.durableTLCheckedAt = time.Now()
-	cd, err := a.readControlData(ctx)
-	if err != nil || !cd.TimelineOK {
-		return
-	}
+	a.durableTLNextAt = time.Now().Add(durableTLInterval)
+	dctx, dcancel := context.WithTimeout(ctx, durableTLBudget)
+	defer dcancel()
 	self := a.selfConn()
-	reported, ok, rerr := a.prober.StandbyTimeline(ctx, self)
-	if rerr != nil || !ok || reported <= cd.Timeline {
+	durable, reported, ok, rerr := a.prober.RecoveryTimelines(dctx, self)
+	if rerr != nil || !ok || reported <= durable {
 		return
 	}
-	if cerr := a.prober.Restartpoint(ctx, self); cerr != nil {
+	if cerr := a.prober.Restartpoint(dctx, self); cerr != nil {
 		a.log.Warn("could not force a restartpoint to record the streamed timeline; this node may refuse to promote until one happens on its own",
-			"durableTimeline", cd.Timeline, "streamedTimeline", uint32(reported), "err", cerr)
+			"durableTimeline", uint32(durable), "streamedTimeline", uint32(reported), "err", cerr)
 		return
 	}
 	// RE-READ, do not assume (#298 review). A CHECKPOINT on a standby returning success is not
@@ -3078,19 +3110,22 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 	// exactly the case this function targets, so the no-op is the LIKELY outcome there -- and the
 	// earlier form logged "now: <streamed>" regardless, asserting a repair that had not happened
 	// while silently re-running the same no-op every interval.
-	after, aerr := a.readControlData(ctx)
-	if aerr != nil || !after.TimelineOK {
+	after, _, aok, aerr := a.prober.RecoveryTimelines(dctx, self)
+	if aerr != nil || !aok {
 		a.log.Warn("forced a restartpoint but could not re-read the control file to confirm the durable timeline advanced",
-			"was", cd.Timeline, "streamedTimeline", uint32(reported), "err", aerr)
+			"was", uint32(durable), "streamedTimeline", uint32(reported), "err", aerr)
 		return
 	}
-	if after.Timeline <= cd.Timeline {
+	if after <= durable {
+		// Back off rather than repeat this every interval: see durableTLNoAdvanceInterval. The
+		// node is not promotable yet, but hammering a restartpoint does not make it so.
+		a.durableTLNextAt = time.Now().Add(durableTLNoAdvanceInterval)
 		a.log.Warn("forced a restartpoint but the durable timeline did not advance (PostgreSQL skips a restartpoint until a newer checkpoint record is replayed); this node still refuses to promote on the highwater guard (#125) and will retry",
-			"durableTimeline", uint32(after.Timeline), "streamedTimeline", uint32(reported))
+			"durableTimeline", uint32(after), "streamedTimeline", uint32(reported), "retryIn", durableTLNoAdvanceInterval.String())
 		return
 	}
 	a.log.Info("forced a restartpoint so the control file records the timeline this standby is streaming (#298)",
-		"was", uint32(cd.Timeline), "now", uint32(after.Timeline))
+		"was", uint32(durable), "now", uint32(after))
 }
 
 // verifyTLSActive alarms when the operator asked for server TLS and the RUNNING postmaster is
