@@ -25,28 +25,12 @@ KUBE_VERSION="${KUBE_VERSION:-1.29.0}"
 # honest, the newer one is the only place the newest kinds get checked at all.
 KUBE_VERSION_MAX="${KUBE_VERSION_MAX:-1.30.0}"
 
-# Core/native kinds use kubeconform's bundled schemas (-schema-location default). Third-party CRD
-# kinds are NOT validated here, deliberately (#298).
-#
-# kubeconform ships schemas for Kubernetes' own kinds only, so a CRD's schema has to come from
-# somewhere else -- and fetching them at run time is what made this REQUIRED check fail for
-# reasons unrelated to the charts: kubeconform treats any non-404 HTTP status from a schema
-# location as a HARD ERROR rather than trying the next one, so one bad CDN response reddened the
-# build. Observed repeatedly as `received HTTP status 400` on the cert-manager Certificate schema,
-# red on one run and green on the next with no code change, and reproducing identically on master.
-# A remote location kept as a mere FALLBACK does not help: locations are tried in order for every
-# resource, so a kind that has to fall through -- ValidatingAdmissionPolicy at the older k8s
-# version, which no catalog carries -- still reaches the broken location and still errors.
-#
-# So there is no remote location, and the four CRD kinds these charts render are skipped
-# EXPLICITLY rather than incidentally. The cost: their spec fields go unchecked by this gate. The
-# gain: it is offline, deterministic, and a failure here always means something about the charts.
-# Those objects are still covered elsewhere -- helm-unittest asserts the rendered
-# ServiceMonitor/PrometheusRule, and pg/tests/test-template.sh asserts the alert expressions.
-#
-# A NEW CRD kind does not slip through silently: the per-profile "NOT validated" note below names
-# every skipped resource, so it surfaces the first time it renders.
-CRD_SKIP="Certificate,Issuer,ServiceMonitor,PrometheusRule"
+# Core/native kinds use kubeconform's bundled schemas (-schema-location default).
+# CRD kinds (ServiceMonitor, PrometheusRule, KEDA ScaledObject, cert-manager
+# Certificate, ...) are not built in; pull them from the community CRDs-catalog.
+# A CRD with no catalog entry is skipped (-ignore-missing-schemas) rather than
+# failing the gate, while every core kind and cataloged CRD is still validated.
+CRD_CATALOG="https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
 
 err_file="$(mktemp)"
 trap 'rm -f "${err_file}"' EXIT
@@ -103,16 +87,6 @@ for chart in "${charts[@]}"; do
     # Same for the skip tally: both versions skip the SAME resources, so summing inside the
     # loop double-counts them. Take the worst single version and add it once.
     profile_skips=0
-    # CRD coverage for THIS render. Groups served by `-schema-location default` are native and
-    # never need a vendored file; every other group in an apiVersion must resolve locally. Listed
-    # explicitly rather than matched on `*.k8s.io`, because plenty of CRDs live under that suffix
-    # too (Gateway API, snapshot.storage.k8s.io) and matching the suffix would wave them through
-    # as native -- a skip dressed up as coverage.
-    #
-    # The awk below pairs kind with apiVersion PER DOCUMENT and in either order: an earlier form
-    # carried `apiVersion` forward across `---` and printed it at the next `kind:`, so a manifest
-    # that puts `kind:` first took the PREVIOUS document's group -- a new CRD silently filed under
-    # a native group and skipped, the exact hole this check exists to close (#298 review).
     for kv in "${KUBE_VERSION}" "${KUBE_VERSION_MAX}"; do
       if ! out=$(printf '%s' "${rendered}" \
           | kubeconform \
@@ -120,7 +94,7 @@ for chart in "${charts[@]}"; do
               -ignore-missing-schemas \
               -kubernetes-version "${kv}" \
               -schema-location default \
-              -skip "${CRD_SKIP}" \
+              -schema-location "${CRD_CATALOG}" \
               -summary 2>&1); then
         rc=1
         profile_failed=1
@@ -140,7 +114,7 @@ for chart in "${charts[@]}"; do
         # printing `verdict`. Any profile with a skip and a failure at once hits it.
         printf '%s' "${rendered}" \
           | kubeconform -ignore-missing-schemas -kubernetes-version "${kv}" \
-              -schema-location default -skip "${CRD_SKIP}" -verbose 2>&1 \
+              -schema-location default -schema-location "${CRD_CATALOG}" -verbose 2>&1 \
           | awk '/skipped$/{print "        - " $3 " " $4}' | sort -u >&2 || true
         if [ "${skipped}" -gt "${profile_skips}" ]; then profile_skips=${skipped}; fi
       fi
