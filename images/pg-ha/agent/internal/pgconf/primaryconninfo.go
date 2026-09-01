@@ -9,10 +9,16 @@ import (
 	"github.com/cagriekin/pg-ha-agent/internal/atomicfile"
 )
 
-// conninfoPasswordRe matches one libpq `password=` keyword and its value, quoted or bare.
+// conninfoPasswordRe matches one libpq password-bearing keyword and its value, quoted or bare.
 // The quoted alternative comes first so a password containing whitespace is consumed whole
 // rather than truncated at the first space.
-var conninfoPasswordRe = regexp.MustCompile(`(?i)\bpassword[ \t]*=[ \t]*('(?:[^']|'')*'?|[^ \t]*)`)
+//
+// `sslpassword` is in the alternation, not just `password` (#298 review): it is libpq's own
+// keyword for the client key's passphrase, and `\bpassword` cannot match inside it (the `l`
+// before the `p` is a word character, so there is no boundary) -- so the earlier pattern
+// skipped it entirely and the migration log lines printed that credential verbatim. `passfile`
+// is deliberately NOT here: it names a path, not a secret.
+var conninfoPasswordRe = regexp.MustCompile(`(?i)\b(ssl)?password[ \t]*=[ \t]*('(?:[^']|'')*'?|[^ \t]*)`)
 
 // RedactConninfo replaces any password in a libpq conninfo with a marker, so the value can be
 // logged (#298 review).
@@ -26,7 +32,10 @@ var conninfoPasswordRe = regexp.MustCompile(`(?i)\bpassword[ \t]*=[ \t]*('(?:[^'
 // filed for. Redacting costs one regexp and keeps the rest of the string -- host, port, user,
 // application_name -- which is all the diagnostic value the log line ever had.
 func RedactConninfo(conninfo string) string {
-	return conninfoPasswordRe.ReplaceAllString(conninfo, "password=[redacted]")
+	// ${1} keeps the `ssl` prefix when that is the keyword matched, so the log still says WHICH
+	// credential was elided. Braced because `$1password` would parse as the group named
+	// "1password" and expand to "".
+	return conninfoPasswordRe.ReplaceAllString(conninfo, "${1}password=[redacted]")
 }
 
 // EnsurePrimaryConninfoDBName reads confPath (PGDATA/postgresql.auto.conf, where repmgr's

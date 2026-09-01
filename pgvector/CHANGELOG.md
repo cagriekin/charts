@@ -483,6 +483,41 @@
 
 ### Fixed
 
+- **The repmgr migration seeds its fragment before it talks to the upstream; three smaller
+  #298 review defects.**
+
+  - **A crash during the slot pre-create left the standby orphaned.** The in-place migration
+    stripped `primary_conninfo` from `postgresql.auto.conf`, then spent up to ~36 seconds
+    pre-creating this node's slot on the inherited upstream (three attempts plus backoff --
+    slowest precisely when that upstream is unreachable), and only then wrote the inherited
+    upstream into the agent's own fragment. For that whole window the data directory carried
+    `standby.signal` and no upstream anywhere, and an OOM-kill or node reboot inside it was
+    unrecoverable: the next boot's foreign-config detection finds nothing left to migrate,
+    returns early, and the pod comes up as a standby with no `primary_conninfo` -- the exact
+    stalled rollout the carry-forward was added to prevent. The fragment is now written first,
+    which reduces the window to one atomic rename and makes a crash cost a retry of an
+    idempotent migration instead of a hand-repaired standby.
+
+  - **The durable-timeline check could starve its own liveness.** It heartbeated before the
+    forced `CHECKPOINT` but after the control-file read that precedes it. With `verifyTLSActive`
+    bounded at 10 seconds in the same tick and that read bounded at another 10, a tick could go
+    20 seconds without a beat against a `/healthz` staleness threshold of 15 -- at which point
+    the kubelet SIGKILLs PID 1 and the postmaster it supervises. Reachable whenever the two
+    throttles coincide, which is every fourth check. The beat now also precedes the read, so it
+    covers the common early-return path (a caught-up standby has nothing to repair), which
+    previously beat not at all however long the read took.
+
+  - **`host = pg-0` in an inherited conninfo was not recognised.** The host was pulled out by
+    splitting on whitespace and matching a literal `host=` prefix, so libpq's equally legal
+    spaced form -- readily produced by a hand-run `ALTER SYSTEM SET primary_conninfo` -- yielded
+    no host, the slot pre-create was skipped, and the standby then looped on `replication slot
+    "pg_ha_slot_N" does not exist` because the generated config names it regardless.
+
+  - **`sslpassword=` was logged verbatim.** The migration's conninfo redaction matched
+    `password=` on a word boundary, which cannot match inside `sslpassword` -- libpq's keyword
+    for the client key's passphrase -- so that credential reached the pod log and every sink
+    downstream. `passfile=` stays readable: it names a path, not a secret.
+
 - **The durable-timeline repair backs off on failure, heartbeats, and no longer logs a
   credential (#298 review).** Three defects in the restartpoint check added above:
 

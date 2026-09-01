@@ -1415,12 +1415,20 @@ type slotExec struct {
 	// are one psql call and the drop is not transactional, so "the create failed" and "the slot
 	// may now be gone" are the same state.
 	createErr error
+	// beforeCreate, when set, runs at the instant a create is issued. It exists so a test can
+	// observe the ON-DISK state at that point rather than only the call log -- the repmgr
+	// migration has to have written its fragment BEFORE it starts talking to the upstream
+	// (#298 review), and nothing in `created` can show that.
+	beforeCreate func()
 }
 
 func (s *slotExec) Run(_ context.Context, _ []string, name string, args ...string) (string, error) {
 	joined := strings.Join(args, " ")
 	switch {
 	case name == "psql" && strings.Contains(joined, "pg_create_physical_replication_slot"):
+		if s.beforeCreate != nil {
+			s.beforeCreate()
+		}
 		s.created = append(s.created, slotArg(joined))
 		return "", s.createErr
 	case name == "psql" && strings.Contains(joined, "pg_drop_replication_slot"):
@@ -3161,6 +3169,19 @@ func TestMigrateForeignRecoveryConfigCarriesTheUpstreamForward(t *testing.T) {
 	// have panicked the moment the branch was reached.
 	a.cfg.PodName = "pgm-2"
 	slots := &slotExec{}
+	// ORDER, not just outcome (#298 review). RemoveRecoveryConfig has already stripped
+	// auto.conf by the time the pre-create runs, so between the two this PGDATA has
+	// standby.signal and no upstream anywhere -- and the pre-create is the slow half (three
+	// 15s attempts against an unreachable upstream). A crash in that window is unrecoverable:
+	// the next boot's ForeignRecoveryConfig finds nothing and returns early, leaving the
+	// orphaned standby this whole block exists to prevent. Seeding first shrinks the window to
+	// one atomic rename, and only the on-disk state at the moment of the create can prove it.
+	fragSeededBeforePrecreate := false
+	slots.beforeCreate = func() {
+		if b, err := os.ReadFile(filepath.Join(dir, "pg-ha-agent.conf")); err == nil {
+			fragSeededBeforePrecreate = strings.Contains(string(b), "host=pgm-0")
+		}
+	}
 	a.prober = &pg.Prober{Exec: slots, Timeout: time.Second}
 	auto := filepath.Join(dir, "postgresql.auto.conf")
 	if err := os.WriteFile(auto, []byte(
@@ -3212,6 +3233,9 @@ func TestMigrateForeignRecoveryConfigCarriesTheUpstreamForward(t *testing.T) {
 	// `replication slot "..." does not exist` -- the same stalled rollout by another route.
 	if len(slots.created) != 1 || slots.created[0] != "pg_ha_slot_2" {
 		t.Errorf("this node's slot was not pre-created on the inherited upstream: %v", slots.created)
+	}
+	if !fragSeededBeforePrecreate {
+		t.Error("the fragment must be seeded BEFORE the pre-create talks to the upstream: a crash during the retry budget would otherwise leave auto.conf stripped and no upstream anywhere, and the next boot would find nothing to migrate")
 	}
 }
 
@@ -4209,5 +4233,32 @@ func TestEnsureDurableTimelineBacksOffWhenTheConfirmationReadFails(t *testing.T)
 	}
 	if got := time.Until(a.durableTLNextAt); got <= durableTLInterval {
 		t.Errorf("next check due in %s, want the %s backoff", got, durableTLNoAdvanceInterval)
+	}
+}
+
+// upstreamHost has to survive every shape libpq accepts, not just the one repmgr writes
+// (#298 review). Missing the host skips the slot pre-create while GenerateConfig still names
+// pg_ha_slot_N, so the standby loops on `replication slot does not exist` -- the stalled
+// rollout the pre-create exists to prevent.
+func TestUpstreamHost(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"repmgr's shape", "user=repmgr host=pgm-0 port=5432", "pgm-0"},
+		{"quoted", "host='pgm-0.pgm-headless' port=5432", "pgm-0.pgm-headless"},
+		// libpq allows whitespace around the '='; a hand-run ALTER SYSTEM readily produces it,
+		// and a field split then yields the bare token `host` and no match at all.
+		{"spaces around =", "host = pgm-0 port = 5432", "pgm-0"},
+		{"spaces around = quoted", "host = 'pgm-0' port=5432", "pgm-0"},
+		// hostaddr is a different keyword and must not be mistaken for the host.
+		{"hostaddr only", "hostaddr=10.0.0.1 port=5432", ""},
+		{"hostaddr before host", "hostaddr=10.0.0.1 host=pgm-0", "pgm-0"},
+		{"none", "user=repmgr port=5432", ""},
+		{"empty", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := upstreamHost(c.in); got != c.want {
+				t.Errorf("upstreamHost(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
 	}
 }

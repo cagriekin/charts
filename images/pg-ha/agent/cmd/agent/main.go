@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -2799,6 +2800,28 @@ func (a *agent) migrateForeignRecoveryConfig(ctx context.Context) error {
 			a.log.Warn("in-place migration (#292): this mechanism cannot carry the inherited upstream forward; the node may come up as a standby with no primary_conninfo",
 				"upstream", pgconf.RedactConninfo(inherited))
 		} else {
+			// SEED FIRST, pre-create second (#298 review). RemoveRecoveryConfig has already
+			// stripped auto.conf, so from here until the fragment is written this PGDATA has
+			// standby.signal and NO upstream anywhere. The pre-create below is bounded but not
+			// instant -- slotPrecreateAttempts x 15s plus the backoffs, ~36s worst case against
+			// an unreachable upstream, which is exactly when it is slow -- and a crash in that
+			// window (OOM-kill, node reboot, the kubelet losing patience) is unrecoverable by
+			// this code path: the next boot's ForeignRecoveryConfig finds nothing, returns
+			// early, and the node comes up orphaned, which is the precise failure this whole
+			// block exists to prevent. Writing the fragment first shrinks that window to the
+			// single atomicfile rename; a crash between Remove and Seed now costs one retry of
+			// an idempotent migration instead of a hand-repaired standby.
+			//
+			// repmgr's OWN slot goes into the fragment, not this agent's ordinal slot: it is
+			// already there on the upstream and already reserving WAL for this node, so it is the
+			// correct value for the window before GenerateConfig runs.
+			if seerr := s.SeedManagedRecovery(inherited, inheritedSlot); seerr != nil {
+				a.log.Warn("in-place migration (#292): could not seed the inherited upstream into the agent fragment",
+					"err", seerr)
+			} else {
+				a.log.Info("in-place migration (#292): carried the inherited upstream into the agent's fragment so this node keeps streaming through the roll",
+					"upstream", pgconf.RedactConninfo(inherited), "slot", inheritedSlot)
+			}
 			// PRE-CREATE this agent's own slot on the inherited upstream (#298, observed live).
 			// Seeding repmgr's slot into the fragment is not enough on its own: boot() runs
 			// GenerateConfig immediately after this, and writeManagedConf always writes
@@ -2810,7 +2833,7 @@ func (a *agent) migrateForeignRecoveryConfig(ctx context.Context) error {
 			// GenerateConfig is about to write valid, and it is the same call Follow would make
 			// before pointing at an upstream.
 			//
-			// NOT best-effort, despite the seeding below (#298 review). GenerateConfig overwrites
+			// NOT best-effort, despite the seeding above (#298 review). GenerateConfig overwrites
 			// primary_slot_name unconditionally -- deliberately, because pg_rewind copies the
 			// source's fragment into this PGDATA and the source's slot must never be inherited --
 			// so the seeded repmgr_slot_N does NOT survive to act as a fallback: a failed
@@ -2849,16 +2872,6 @@ func (a *agent) migrateForeignRecoveryConfig(ctx context.Context) error {
 			} else {
 				a.log.Warn("in-place migration (#292): no host in the inherited upstream, or no parseable pod ordinal, so this node's slot cannot be pre-created",
 					"upstream", pgconf.RedactConninfo(inherited), "slot", slot)
-			}
-			// repmgr's OWN slot goes into the fragment, not this agent's ordinal slot: it is
-			// already there on the upstream and already reserving WAL for this node, so it is the
-			// correct value for the window before GenerateConfig runs.
-			if seerr := s.SeedManagedRecovery(inherited, inheritedSlot); seerr != nil {
-				a.log.Warn("in-place migration (#292): could not seed the inherited upstream into the agent fragment",
-					"err", seerr)
-			} else {
-				a.log.Info("in-place migration (#292): carried the inherited upstream into the agent's fragment so this node keeps streaming through the roll",
-					"upstream", pgconf.RedactConninfo(inherited), "slot", inheritedSlot)
 			}
 		}
 	}
@@ -3109,16 +3122,22 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 	dctx, dcancel := context.WithTimeout(ctx, durableTLBudget)
 	defer dcancel()
 	self := a.selfConn()
+	// BEAT BEFORE THE FIRST READ, not only before the CHECKPOINT (#298 review round 2). tick()
+	// heartbeats once, at its top, and /healthz goes stale at reconcileInterval*3 (15s on chart
+	// defaults) -- at which point the kubelet SIGKILLs PID 1 and the postmaster it supervises.
+	// verifyTLSActive, three lines up in the same tick, is bounded by Prober.Timeout (10s), and
+	// RecoveryTimelines below is bounded by the same 10s: beating only after that read left a
+	// 20s hole -- past the threshold -- reachable whenever the two throttles (60s and 15s)
+	// coincide, which is every fourth check, not a theoretical case. It also covers the early
+	// return below, which is the COMMON path (a caught-up standby has nothing to repair) and
+	// previously beat not at all no matter how long the read took.
+	a.metr.Beat()
 	durable, reported, ok, rerr := a.prober.RecoveryTimelines(dctx, self)
 	if rerr != nil || !ok || reported <= durable {
 		return
 	}
-	// BEAT before the CHECKPOINT (#298 review). tick() heartbeats once, at its top, and
-	// /healthz goes stale at reconcileInterval*3 (15s on chart defaults) -- at which point the
-	// kubelet SIGKILLs PID 1 and the postmaster it supervises. verifyTLSActive, three lines up
-	// in the same tick, already allows itself 15s, and this call adds up to durableTLBudget on
-	// top of it; the two throttles (60s and 15s) coincide every fourth check, so the sum is
-	// reached in normal operation, not just in theory. The same heartbeat-through-a-long-call
+	// And again before the CHECKPOINT, which is the one call here that is slow while perfectly
+	// healthy (a restartpoint flushes dirty shared buffers). Same heartbeat-through-a-long-call
 	// pattern the clone path uses.
 	a.metr.Beat()
 	if cerr := a.prober.Restartpoint(dctx, self); cerr != nil {
@@ -4510,15 +4529,30 @@ func (h *selfHealthTracker) stuck(shouldServe, running bool, now time.Time) bool
 // internal/podname, which both this file and reconcile use.
 const nodeIDBase = 1000
 
+// upstreamHostRe matches one libpq `host` keyword and its value, quoted or bare. The word
+// boundary keeps `hostaddr=` and any `..._host=` from matching, and the quoted alternative
+// comes first so a quoted value is taken whole.
+//
+// A regexp rather than strings.Fields + CutPrefix (#298 review): libpq allows whitespace
+// around the `=` (`host = pg-0`), which an operator's hand-run `ALTER SYSTEM SET
+// primary_conninfo` readily produces, and a field split then yields the bare token `host` and
+// no prefix match at all. The cost of missing the host is not cosmetic -- it skips the slot
+// pre-create while GenerateConfig still names pg_ha_slot_N, so the standby loops on
+// `replication slot does not exist`, which is the stalled rollout the pre-create exists to
+// prevent.
+var upstreamHostRe = regexp.MustCompile(`(?i)\bhost[ \t]*=[ \t]*(?:'([^']*)'|([^ \t]*))`)
+
 // upstreamHost pulls the host out of a libpq conninfo string, unwrapping the single quotes
 // repmgr writes around it. "" when there is none (#298).
 func upstreamHost(conninfo string) string {
-	for _, tok := range strings.Fields(conninfo) {
-		if v, ok := strings.CutPrefix(tok, "host="); ok {
-			return strings.Trim(v, "'")
-		}
+	m := upstreamHostRe.FindStringSubmatch(conninfo)
+	if m == nil {
+		return ""
 	}
-	return ""
+	if m[1] != "" {
+		return m[1]
+	}
+	return m[2]
 }
 
 // slotPrefix names the agent's own physical replication slots (#289): slotPrefix +

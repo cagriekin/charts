@@ -233,6 +233,14 @@ func TestRedactConninfo(t *testing.T) {
 		{"upper case", "PASSWORD=s3cr3t host=pg-0", "password=[redacted] host=pg-0"},
 		{"trailing", "host=pg-0 password=s3cr3t", "host=pg-0 password=[redacted]"},
 		{"none", "host=pg-0 port=5432 user=repmgr", "host=pg-0 port=5432 user=repmgr"},
+		// sslpassword is libpq's own keyword for the client key's passphrase, and `\bpassword`
+		// cannot match inside it -- the `l` before the `p` is a word character, so there is no
+		// boundary. Without an explicit alternative it was printed verbatim (#298 review).
+		{"sslpassword", "host=pg-0 sslpassword=s3cr3t", "host=pg-0 sslpassword=[redacted]"},
+		{"both", "sslpassword=a password=b", "sslpassword=[redacted] password=[redacted]"},
+		// passfile names a PATH, not a secret, and stays readable: it is the single most useful
+		// thing in this log line when the upstream refuses the connection.
+		{"passfile is not a password", "host=pg-0 passfile=/var/lib/postgresql/.pgpass", "host=pg-0 passfile=/var/lib/postgresql/.pgpass"},
 		// application_name=...password... must not be mangled: the keyword is matched on a word
 		// boundary, not as a substring.
 		{"lookalike keyword", "host=pg-0 application_name=passwordy", "host=pg-0 application_name=passwordy"},
