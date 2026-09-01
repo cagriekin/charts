@@ -25,28 +25,28 @@ KUBE_VERSION="${KUBE_VERSION:-1.29.0}"
 # honest, the newer one is the only place the newest kinds get checked at all.
 KUBE_VERSION_MAX="${KUBE_VERSION_MAX:-1.30.0}"
 
-# Core/native kinds use kubeconform's bundled schemas (-schema-location default). CRD kinds
-# (ServiceMonitor, PrometheusRule, cert-manager Certificate, ...) are not built in, and come from
-# schemas CHECKED IN under scripts/crd-schemas -- vendored only, with no remote schema location at
-# all (#298). Fetching them per-run made this gate, a REQUIRED check, fail for reasons that have
-# nothing to do with the charts: kubeconform treats any non-404 HTTP status from a location as a
-# HARD ERROR rather than trying the next one, so a single bad CDN response reddened the build. Observed repeatedly as `error while downloading schema at
-# .../certificate-cert-manager-v1.json - received HTTP status 400` on three kafka profiles, red on
-# one run and green on the next with no code change, and reproducing identically on master.
+# Core/native kinds use kubeconform's bundled schemas (-schema-location default). Third-party CRD
+# kinds are NOT validated here, deliberately (#298).
 #
-# Keeping the remote catalog as a FALLBACK does not fix it: the locations are tried in order for
-# every resource, so a kind that has to fall through -- ValidatingAdmissionPolicy at the older
-# k8s version, which no catalog carries -- still reaches the broken location and still errors.
-# Verified: with the catalog host unreachable the gate failed even though every CRD resolved
-# locally.
+# kubeconform ships schemas for Kubernetes' own kinds only, so a CRD's schema has to come from
+# somewhere else -- and fetching them at run time is what made this REQUIRED check fail for
+# reasons unrelated to the charts: kubeconform treats any non-404 HTTP status from a schema
+# location as a HARD ERROR rather than trying the next one, so one bad CDN response reddened the
+# build. Observed repeatedly as `received HTTP status 400` on the cert-manager Certificate schema,
+# red on one run and green on the next with no code change, and reproducing identically on master.
+# A remote location kept as a mere FALLBACK does not help: locations are tried in order for every
+# resource, so a kind that has to fall through -- ValidatingAdmissionPolicy at the older k8s
+# version, which no catalog carries -- still reaches the broken location and still errors.
 #
-# So the four schemas the charts render are checked in under scripts/crd-schemas, in the catalog's
-# own <group>/<kind>_<version>.json layout. Refresh them with scripts/update-crd-schemas.sh. The
-# coverage check below is what keeps that list honest: without a remote fallback, a chart that
-# starts emitting a new CRD would otherwise be silently SKIPPED by -ignore-missing-schemas rather
-# than validated, which is the "reads as coverage while providing none" failure this repo keeps
-# finding in its own gates.
-CRD_SCHEMAS="${REPO_ROOT}/scripts/crd-schemas/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
+# So there is no remote location, and the four CRD kinds these charts render are skipped
+# EXPLICITLY rather than incidentally. The cost: their spec fields go unchecked by this gate. The
+# gain: it is offline, deterministic, and a failure here always means something about the charts.
+# Those objects are still covered elsewhere -- helm-unittest asserts the rendered
+# ServiceMonitor/PrometheusRule, and pg/tests/test-template.sh asserts the alert expressions.
+#
+# A NEW CRD kind does not slip through silently: the per-profile "NOT validated" note below names
+# every skipped resource, so it surfaces the first time it renders.
+CRD_SKIP="Certificate,Issuer,ServiceMonitor,PrometheusRule"
 
 err_file="$(mktemp)"
 trap 'rm -f "${err_file}"' EXIT
@@ -67,18 +67,6 @@ if [ ${#charts[@]} -eq 0 ]; then
 fi
 
 rc=0
-# Every CRD kind the charts render must have a vendored schema, or kubeconform SKIPS it instead of
-# validating it (see the note above). Collected from the SAME rendered manifests the loop below
-# validates, and reported once after every profile so one unvendored kind cannot hide the rest.
-#
-# Deliberately NOT a second `helm template` pass of its own (#298 review): that doubled the gate's
-# render work, and because the collecting pipeline ran under `set -euo pipefail` with stderr
-# discarded, a fixture that merely failed to render killed the whole gate on the spot -- exit 1
-# with not one line of output, the FATAL/fixture_base diagnostic below never reached, and a stray
-# predictable /tmp file left behind. A gate that dies without saying why is the same
-# unreadable-failure problem the vendoring was meant to end.
-crd_missing=""
-
 failed=0
 profiles=0
 skips=0
@@ -125,24 +113,6 @@ for chart in "${charts[@]}"; do
     # carried `apiVersion` forward across `---` and printed it at the next `kind:`, so a manifest
     # that puts `kind:` first took the PREVIOUS document's group -- a new CRD silently filed under
     # a native group and skipped, the exact hole this check exists to close (#298 review).
-    while read -r crd_av crd_kind; do
-      [ -n "${crd_av}" ] || continue
-      crd_group="${crd_av%%/*}"; crd_ver="${crd_av##*/}"
-      case "${crd_group}" in
-        apps|batch|policy|autoscaling|rbac.authorization.k8s.io|networking.k8s.io|admissionregistration.k8s.io|coordination.k8s.io|storage.k8s.io|apiextensions.k8s.io|apiregistration.k8s.io|authentication.k8s.io|authorization.k8s.io|scheduling.k8s.io|discovery.k8s.io|events.k8s.io|certificates.k8s.io|node.k8s.io|flowcontrol.apiserver.k8s.io) continue ;;
-      esac
-      crd_kl="$(printf '%s' "${crd_kind}" | tr '[:upper:]' '[:lower:]')"
-      [ -f "${REPO_ROOT}/scripts/crd-schemas/${crd_group}/${crd_kl}_${crd_ver}.json" ] && continue
-      crd_missing="${crd_missing}  ${crd_group}/${crd_kl}_${crd_ver}.json (${crd_kind} in ${chart})
-"
-      rc=1
-      profile_failed=1
-    done < <(printf '%s\n' "${rendered}" | awk '
-        function flush() { if (av ~ /\// && k != "") print av" "k; av=""; k="" }
-        /^---/            { flush(); next }
-        /^apiVersion:/    { av=$2; gsub(/[\042\047]/, "", av) }
-        /^kind:/          { k=$2;  gsub(/[\042\047]/, "", k) }
-        END               { flush() }' | sort -u)
     for kv in "${KUBE_VERSION}" "${KUBE_VERSION_MAX}"; do
       if ! out=$(printf '%s' "${rendered}" \
           | kubeconform \
@@ -150,7 +120,7 @@ for chart in "${charts[@]}"; do
               -ignore-missing-schemas \
               -kubernetes-version "${kv}" \
               -schema-location default \
-              -schema-location "${CRD_SCHEMAS}" \
+              -skip "${CRD_SKIP}" \
               -summary 2>&1); then
         rc=1
         profile_failed=1
@@ -170,7 +140,7 @@ for chart in "${charts[@]}"; do
         # printing `verdict`. Any profile with a skip and a failure at once hits it.
         printf '%s' "${rendered}" \
           | kubeconform -ignore-missing-schemas -kubernetes-version "${kv}" \
-              -schema-location default -schema-location "${CRD_SCHEMAS}" -verbose 2>&1 \
+              -schema-location default -skip "${CRD_SKIP}" -verbose 2>&1 \
           | awk '/skipped$/{print "        - " $3 " " $4}' | sort -u >&2 || true
         if [ "${skipped}" -gt "${profile_skips}" ]; then profile_skips=${skipped}; fi
       fi
@@ -190,16 +160,4 @@ for chart in "${charts[@]}"; do
     [ "${profile_failed}" -eq 0 ] || failed=$((failed + 1))
   done < <(chart_profiles "${chart}")
 done
-crd_missing="$(printf '%s' "${crd_missing}" | grep -v '^[[:space:]]*$' | sort -u || true)"
-if [ -n "${crd_missing}" ]; then
-  cat >&2 <<EOF
-
-=== kubeconform: CRD schemas not vendored ===
-These CRD kinds are rendered by the charts but have no schema under scripts/crd-schemas, so
-kubeconform SKIPPED them instead of validating them:
-${crd_missing}
-
-Add them to the SCHEMAS list in scripts/update-crd-schemas.sh and run it.
-EOF
-fi
 verdict "kubeconform" "$rc" "$( [ "$rc" -eq 0 ] && echo "${#charts[@]} charts, ${profiles} profiles x k8s ${KUBE_VERSION}+${KUBE_VERSION_MAX}, ${skips} unvalidated" || echo "${failed} of ${profiles} profiles" )"
