@@ -21,7 +21,17 @@ source "${ROOT}/scripts/lib.sh"
 require_tool curl "https://curl.se/download.html"
 require_tool python3 "https://www.python.org/downloads/"
 DEST="${ROOT}/scripts/crd-schemas"
-CATALOG="https://raw.githubusercontent.com/datreeio/CRDs-catalog/main"
+# PINNED to a commit, not a branch (#298). The third path segment of a raw.githubusercontent.com
+# URL is a git ref, so `.../CRDs-catalog/main/...` fetched whatever the catalog's default branch
+# happened to hold that day: re-running this script could change the vendored schemas without any
+# change here, which is the opposite of what vendoring is for -- and a stricter upstream schema
+# can turn a previously-green required check red with nobody having touched the charts.
+#
+# This SHA is the commit the currently vendored files came from, verified by re-fetching each of
+# them from it and comparing hashes. Bumping it is a deliberate act: change the SHA, run this
+# script, and review the resulting diff to the schemas like any other vendored artifact.
+CATALOG_REF="866b2653a5334db9aed20ad74701e20fd464471b"
+CATALOG="https://raw.githubusercontent.com/datreeio/CRDs-catalog/${CATALOG_REF}"
 
 # Every CRD kind the charts render, in <group>/<kind>_<apiVersion> form. Do not derive this by
 # hand: scripts/kubeconform-charts.sh checks every rendered profile against this directory and
