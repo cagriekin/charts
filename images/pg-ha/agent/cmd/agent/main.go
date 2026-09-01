@@ -2744,16 +2744,32 @@ func (a *agent) migrateForeignRecoveryConfig() error {
 	// streaming from wherever repmgr had pointed it, which is what "preserved either way" was
 	// supposed to mean. It is the same upstream, so this changes no topology; the first Follow
 	// the agent performs once the cluster is fully migrated overwrites the fragment properly.
-	inherited, ierr := pgconf.PrimaryConninfoValue(autoConf)
-	inheritedSlot, serr := pgconf.PrimarySlotNameValue(autoConf)
-	if serr != nil {
-		a.log.Warn("in-place migration (#292): could not read the inherited primary_slot_name", "path", autoConf, "err", serr)
-	}
-	if ierr != nil {
-		// Not fatal: the migration below is still the right thing to do, and a node that ends up
-		// without an upstream is recoverable by hand. Say so rather than failing the boot.
-		a.log.Warn("in-place migration (#292): could not read the inherited primary_conninfo; the upstream will not be carried forward",
-			"path", autoConf, "err", ierr)
+	// ...but only for a node that is actually a STANDBY (#298 review). PostgreSQL does not strip
+	// primary_conninfo from postgresql.auto.conf on promotion, so an ex-standby that repmgr later
+	// promoted still carries a STALE one -- and the primary is the LAST pod the roll replaces. On
+	// that pod the carry-forward would seed a dead upstream into the fragment and, worse,
+	// pre-create pg_ha_slot_0 on a peer that is a standby by then: an inactive slot on a node
+	// whose reconcileSlots only runs while it is primary, i.e. a permanent WAL pin, which is the
+	// silent disk-fill #289 exists to stop. standby.signal is the authoritative local answer and
+	// costs one stat, so the preflight can ask it without the pg_controldata exec the comment
+	// above rules out.
+	inherited, inheritedSlot := "", ""
+	if !process.HasRecoverySignal(a.cfg.PGDATA) {
+		a.log.Info("in-place migration (#292): no standby.signal, so this data directory is a primary's; not carrying the stale repmgr upstream forward",
+			"path", autoConf)
+	} else {
+		var ierr, slerr error
+		inherited, ierr = pgconf.PrimaryConninfoValue(autoConf)
+		inheritedSlot, slerr = pgconf.PrimarySlotNameValue(autoConf)
+		if slerr != nil {
+			a.log.Warn("in-place migration (#292): could not read the inherited primary_slot_name", "path", autoConf, "err", slerr)
+		}
+		if ierr != nil {
+			// Not fatal: the migration below is still the right thing to do, and a node that ends
+			// up without an upstream is recoverable by hand. Say so rather than failing the boot.
+			a.log.Warn("in-place migration (#292): could not read the inherited primary_conninfo; the upstream will not be carried forward",
+				"path", autoConf, "err", ierr)
+		}
 	}
 	removed, err := pgconf.RemoveRecoveryConfig(autoConf)
 	if err != nil {
@@ -2765,47 +2781,63 @@ func (a *agent) migrateForeignRecoveryConfig() error {
 		type recoverySeeder interface {
 			SeedManagedRecovery(primaryConninfo, slotName string) error
 		}
-		s, ok := a.mech.(recoverySeeder)
-		if !ok {
+		if s, ok := a.mech.(recoverySeeder); !ok {
 			// Never silent: a mechanism that cannot seed leaves this node with standby.signal
 			// and no upstream, which is the deadlock this whole block exists to prevent.
 			a.log.Warn("in-place migration (#292): this mechanism cannot carry the inherited upstream forward; the node may come up as a standby with no primary_conninfo",
 				"upstream", inherited)
-		}
-		if ok {
-			// repmgr's OWN slot, not this agent's ordinal slot (#298, observed live). The
-			// agent's slot does not exist on a still-repmgrd primary, and a walreceiver whose
-			// named slot is missing does not fall back to slotless streaming -- it fails with
-			// `replication slot "pg_ha_slot_N" does not exist` on a loop, which is the same
-			// stalled rollout by a different route. repmgr_slot_N is already there and already
-			// reserving WAL for this node; the first real Follow switches to the agent's slot
-			// and creates it on the upstream first.
-			// PRE-CREATE this agent's own slot on the inherited upstream first (#298, observed
-			// live). Seeding repmgr's slot is not enough on its own: boot() runs GenerateConfig
-			// immediately after this, and writeManagedConf always writes n.SlotName alongside a
-			// non-empty conninfo -- so the fragment is rewritten to pg_ha_slot_N within
-			// milliseconds, and that slot does not exist on a still-repmgrd primary. A
-			// walreceiver whose named slot is missing does not fall back to slotless streaming;
-			// it fails with `replication slot "..." does not exist` forever, which is the same
-			// stalled rollout by a third route. Creating it here makes the fragment
+		} else {
+			// PRE-CREATE this agent's own slot on the inherited upstream (#298, observed live).
+			// Seeding repmgr's slot into the fragment is not enough on its own: boot() runs
+			// GenerateConfig immediately after this, and writeManagedConf always writes
+			// n.SlotName alongside a non-empty conninfo -- so the fragment is rewritten to
+			// pg_ha_slot_N within milliseconds, and that slot does not exist on a still-repmgrd
+			// primary. A walreceiver whose named slot is missing does not fall back to slotless
+			// streaming; it fails with `replication slot "..." does not exist` forever, which is
+			// the same stalled rollout by another route. Creating it here makes the fragment
 			// GenerateConfig is about to write valid, and it is the same call Follow would make
-			// before pointing at an upstream. Best-effort: if the upstream is unreachable the
-			// seeded repmgr slot still carries the node until a later Follow.
-			if h := upstreamHost(inherited); h != "" {
-				sctx, scancel := context.WithTimeout(context.Background(), 15*time.Second)
+			// before pointing at an upstream.
+			//
+			// NOT best-effort, despite the seeding below (#298 review). GenerateConfig overwrites
+			// primary_slot_name unconditionally -- deliberately, because pg_rewind copies the
+			// source's fragment into this PGDATA and the source's slot must never be inherited --
+			// so the seeded repmgr_slot_N does NOT survive to act as a fallback: a failed
+			// pre-create lands the node on a slot that does not exist, i.e. exactly the stalled
+			// rollout. Retried across the attempt budget, and loud at ERROR when it still fails,
+			// because nothing downstream repairs it until an agent-held lease names a leader.
+			slot := slotNameFor(a.cfg.PodName)
+			if h := upstreamHost(inherited); h != "" && slot != "" {
 				ci := pg.ConnInfo{Host: h, Port: 5432, User: a.cfg.RepmgrUser, DB: a.cfg.RepmgrDB, Password: a.cfg.RepmgrPassword}
-				if cerr := a.prober.CreatePhysicalSlot(sctx, ci, a.ownSlotName()); cerr != nil {
-					a.log.Warn("in-place migration (#292): could not pre-create this node's slot on the inherited upstream; it will be created by the first follow",
-						"upstream", h, "slot", a.ownSlotName(), "err", cerr)
-				} else {
-					a.log.Info("in-place migration (#292): pre-created this node's replication slot on the inherited upstream",
-						"upstream", h, "slot", a.ownSlotName())
+				var cerr error
+				for attempt := 1; attempt <= slotPrecreateAttempts; attempt++ {
+					sctx, scancel := context.WithTimeout(context.Background(), 15*time.Second)
+					cerr = a.prober.CreatePhysicalSlot(sctx, ci, slot)
+					scancel()
+					if cerr == nil {
+						a.log.Info("in-place migration (#292): pre-created this node's replication slot on the inherited upstream",
+							"upstream", h, "slot", slot, "attempt", attempt)
+						break
+					}
+					a.log.Warn("in-place migration (#292): could not pre-create this node's slot on the inherited upstream; retrying",
+						"upstream", h, "slot", slot, "attempt", attempt, "of", slotPrecreateAttempts, "err", cerr)
+					if attempt < slotPrecreateAttempts {
+						time.Sleep(slotPrecreateBackoff)
+					}
 				}
-				scancel()
+				if cerr != nil {
+					a.log.Error("in-place migration (#292): could not pre-create this node's slot on the inherited upstream; GenerateConfig will still name it, so this standby will loop on `replication slot does not exist` until a leader is elected -- create it on the upstream by hand to unblock the roll",
+						"upstream", h, "slot", slot, "err", cerr)
+				}
+			} else {
+				a.log.Warn("in-place migration (#292): no host in the inherited upstream, or no parseable pod ordinal, so this node's slot cannot be pre-created",
+					"upstream", inherited, "slot", slot)
 			}
-			if serr := s.SeedManagedRecovery(inherited, inheritedSlot); serr != nil {
+			// repmgr's OWN slot goes into the fragment, not this agent's ordinal slot: it is
+			// already there on the upstream and already reserving WAL for this node, so it is the
+			// correct value for the window before GenerateConfig runs.
+			if seerr := s.SeedManagedRecovery(inherited, inheritedSlot); seerr != nil {
 				a.log.Warn("in-place migration (#292): could not seed the inherited upstream into the agent fragment",
-					"err", serr)
+					"err", seerr)
 			} else {
 				a.log.Info("in-place migration (#292): carried the inherited upstream into the agent's fragment so this node keeps streaming through the roll",
 					"upstream", inherited, "slot", inheritedSlot)
@@ -2981,9 +3013,28 @@ func (a *agent) assertPreloadedLibsPresent() error {
 // the config and reloads, and to re-arm if someone turns `ssl` off underneath a running server.
 const tlsVerifyInterval = time.Minute
 
+// slotPrecreateAttempts/slotPrecreateBackoff bound the repmgr-migration slot pre-create (#298
+// review). Retried rather than one-shot because a failure is NOT self-healing: GenerateConfig
+// names the slot regardless, so the standby loops on `replication slot does not exist` until
+// somebody creates it. Bounded because this runs in the startup preflight, before leader
+// election, where an unbounded wait is its own outage.
+const (
+	slotPrecreateAttempts = 3
+	slotPrecreateBackoff  = 3 * time.Second
+)
+
 // durableTLInterval throttles the restartpoint check. Generous, because the condition it
 // repairs arises only when this node starts following a new timeline.
-const durableTLInterval = 60 * time.Second
+// 15s, not a minute (#298, found by re-running the failover suite). The stamp is taken BEFORE the
+// comparison -- deliberately, so a failing read cannot spin -- which means the FIRST tick after a
+// boot consumes the whole interval, and at that moment the node has usually not started streaming
+// the new timeline yet, so there is nothing to repair. The repair therefore landed one full
+// interval later: observed as a standby that acquired the lease, refused on the highwater guard,
+// and only became promotable 55s afterwards -- long enough that a failover window can close first
+// (it made the disk-loss stage of test-agent-failover skip seven assertions). Four ticks is
+// cheap: the check is one pg_controldata exec plus one SQL round trip, and it stops entirely once
+// the durable timeline has caught up.
+const durableTLInterval = 15 * time.Second
 
 // ensureDurableTimeline forces a restartpoint when this standby's DURABLE timeline lags the one
 // it is streaming (#298, found by the first live run of the repmgrd->2.0.0 migration).
@@ -3011,7 +3062,7 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 	}
 	self := a.selfConn()
 	reported, ok, rerr := a.prober.StandbyTimeline(ctx, self)
-	if rerr != nil || !ok || reported <= pg.Timeline(cd.Timeline) {
+	if rerr != nil || !ok || reported <= cd.Timeline {
 		return
 	}
 	if cerr := a.prober.Restartpoint(ctx, self); cerr != nil {
@@ -3019,8 +3070,27 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 			"durableTimeline", cd.Timeline, "streamedTimeline", uint32(reported), "err", cerr)
 		return
 	}
+	// RE-READ, do not assume (#298 review). A CHECKPOINT on a standby returning success is not
+	// proof the durable timeline moved: PostgreSQL SKIPS the restartpoint when no checkpoint
+	// record NEWER than the last one has been replayed yet ("skipping restartpoint, already
+	// performed at ..."), and the control file takes its timeline from that replayed record. A
+	// standby that is streaming a new timeline but has not yet replayed a checkpoint on it is
+	// exactly the case this function targets, so the no-op is the LIKELY outcome there -- and the
+	// earlier form logged "now: <streamed>" regardless, asserting a repair that had not happened
+	// while silently re-running the same no-op every interval.
+	after, aerr := a.readControlData(ctx)
+	if aerr != nil || !after.TimelineOK {
+		a.log.Warn("forced a restartpoint but could not re-read the control file to confirm the durable timeline advanced",
+			"was", cd.Timeline, "streamedTimeline", uint32(reported), "err", aerr)
+		return
+	}
+	if after.Timeline <= cd.Timeline {
+		a.log.Warn("forced a restartpoint but the durable timeline did not advance (PostgreSQL skips a restartpoint until a newer checkpoint record is replayed); this node still refuses to promote on the highwater guard (#125) and will retry",
+			"durableTimeline", uint32(after.Timeline), "streamedTimeline", uint32(reported))
+		return
+	}
 	a.log.Info("forced a restartpoint so the control file records the timeline this standby is streaming (#298)",
-		"was", cd.Timeline, "now", uint32(reported))
+		"was", uint32(cd.Timeline), "now", uint32(after.Timeline))
 }
 
 // verifyTLSActive alarms when the operator asked for server TLS and the RUNNING postmaster is
@@ -4375,15 +4445,6 @@ func upstreamHost(conninfo string) string {
 		}
 	}
 	return ""
-}
-
-// ownSlotName is the slot this node streams through once the agent owns replication (#289).
-func (a *agent) ownSlotName() string {
-	ord, ok := podname.Ordinal(a.cfg.PodName)
-	if !ok {
-		return ""
-	}
-	return slotPrefix + strconv.Itoa(ord)
 }
 
 // slotPrefix names the agent's own physical replication slots (#289): slotPrefix +

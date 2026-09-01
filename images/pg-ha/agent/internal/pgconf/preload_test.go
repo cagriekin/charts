@@ -601,3 +601,44 @@ func TestPrimaryConninfoValue(t *testing.T) {
 		t.Errorf("a missing file must be empty with no error, got %q err=%v", got, err)
 	}
 }
+
+// The reader must agree with ForeignRecoveryConfig/RemoveRecoveryConfig, which match
+// case-INSENSITIVELY and accept the `name value` form too (#298 review). A line one of them sees
+// and this one does not is detected, removed, and then not carried forward -- the orphaned
+// standby this reader exists to prevent.
+func TestPrimaryConninfoValueMatchesTheRemovalMatcher(t *testing.T) {
+	dir := t.TempDir()
+	write := func(body string) string {
+		p := filepath.Join(dir, "auto.conf")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	for _, tc := range []struct{ name, body, want string }{
+		{"upper case GUC name", "PRIMARY_CONNINFO = 'host=pg-0'\n", "host=pg-0"},
+		{"no equals sign", "primary_conninfo\t'host=pg-0'\n", "host=pg-0"},
+		{"inline comment holding an apostrophe", "primary_conninfo = 'host=pg-0' # don't touch\n", "host=pg-0"},
+		{"unquoted with an inline comment", "primary_conninfo = host=pg-0 # set by hand\n", "host=pg-0"},
+	} {
+		path := write(tc.body)
+		got, err := PrimaryConninfoValue(path)
+		if err != nil || got != tc.want {
+			t.Errorf("%s: got %q err=%v, want %q", tc.name, got, err, tc.want)
+		}
+		// Whatever the reader sees, the remover must see too, or the value is stripped
+		// without being carried forward.
+		found, ferr := ForeignRecoveryConfig(path)
+		if ferr != nil || len(found) == 0 {
+			t.Errorf("%s: ForeignRecoveryConfig must detect the same line, got %v err=%v", tc.name, found, ferr)
+		}
+	}
+}
+
+// A name that is not a recovery GUC is a programming error, not "unset": returning "" would be
+// indistinguishable from a file that genuinely has no upstream to carry forward.
+func TestRecoveryGUCValueRejectsAnUnknownGUC(t *testing.T) {
+	if _, err := recoveryGUCValue(filepath.Join(t.TempDir(), "auto.conf"), "shared_buffers"); err == nil {
+		t.Fatal("an unknown GUC must be an error, not an empty value")
+	}
+}

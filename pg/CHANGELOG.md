@@ -722,7 +722,12 @@
   because the fragment the agent writes names its own ordinal slot, which does not exist on a
   still-repmgrd primary, and a walreceiver whose named slot is missing does not fall back to
   slotless streaming (it fails with `replication slot "..." does not exist` on a loop, which is
-  the same stalled rollout by another route). Both steps are best-effort and loud on failure. The
+  the same stalled rollout by another route). The pre-create is retried and, if it still fails,
+  logged at ERROR naming the slot to create by hand -- it is not self-healing, because the
+  fragment the agent writes names that slot regardless. The carry-forward is skipped on a data
+  directory with no `standby.signal`: a node repmgr promoted keeps a stale `primary_conninfo` in
+  `postgresql.auto.conf`, and seeding it would point a primary at a dead upstream and strand an
+  inactive slot pinning WAL on a peer. The
   KinD suite for this path now completes 42/43 where it previously timed out during the roll with
   no result at all.
 

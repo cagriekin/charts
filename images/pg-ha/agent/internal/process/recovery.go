@@ -44,3 +44,13 @@ func ClearRecoverySignal(dataDir string) error {
 	}
 	return nil
 }
+
+// HasRecoverySignal reports whether dataDir currently carries standby.signal, i.e. whether the
+// next start comes up as a STANDBY.
+//
+// Cheap by design (one stat, no pg_controldata exec) because its caller is the startup preflight,
+// which runs before leader election and must not block on a subprocess (#298).
+func HasRecoverySignal(dataDir string) bool {
+	_, err := os.Stat(filepath.Join(dataDir, standbySignal))
+	return err == nil
+}

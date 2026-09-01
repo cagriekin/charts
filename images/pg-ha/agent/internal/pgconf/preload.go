@@ -326,6 +326,104 @@ func ForeignRecoveryConfig(confPath string) ([]string, error) {
 	return found, nil
 }
 
+// PrimaryConninfoValue returns the primary_conninfo currently set in confPath, unquoted, or
+// "" when the file has none (or does not exist).
+//
+// Read BEFORE RemoveRecoveryConfig strips it, so an in-place migration off repmgr can carry the
+// upstream forward into the agent's own fragment instead of orphaning the standby (#298, found
+// by the first live run of the repmgrd->2.0.0 roll). Commented lines are skipped and the LAST
+// assignment wins, matching PostgreSQL.
+func PrimaryConninfoValue(confPath string) (string, error) {
+	return recoveryGUCValue(confPath, "primary_conninfo")
+}
+
+// PrimarySlotNameValue returns the primary_slot_name currently set in confPath, unquoted, or ""
+// when there is none. Carried alongside PrimaryConninfoValue during the repmgr migration: the
+// slot it names (repmgr_slot_N) EXISTS on the still-repmgrd primary, while this agent's own
+// ordinal slot does not -- and a walreceiver pointed at a missing slot never streams (#298).
+func PrimarySlotNameValue(confPath string) (string, error) {
+	return recoveryGUCValue(confPath, "primary_slot_name")
+}
+
+// recoveryGUCValue reads one recovery GUC out of confPath.
+//
+// It matches with the SAME compiled matcher ForeignRecoveryConfig and RemoveRecoveryConfig use
+// (#298 review), not a fresh prefix test. The three have to agree exactly: detect, read and
+// remove all run over the same file in the same boot, and a line one of them sees while another
+// does not is the orphaned-standby bug the reader exists to prevent. An earlier cut here used a
+// case-SENSITIVE strings.HasPrefix, so `PRIMARY_CONNINFO = '...'` -- GUC names are
+// case-insensitive in PostgreSQL, and the matcher is (?i) accordingly -- was detected, removed,
+// and then read back as "": the upstream was silently not carried forward and the standby came
+// up with standby.signal and no primary_conninfo, which is precisely the failure mode this whole
+// path was added to close. The prefix test also accepted only the `name = value` form, while the
+// matcher (and postgresql.conf) also accept `name value`.
+func recoveryGUCValue(confPath, guc string) (string, error) {
+	re := (*regexp.Regexp)(nil)
+	for i, g := range recoveryGUCs {
+		if g == guc {
+			re = recoveryGUCRes[i]
+			break
+		}
+	}
+	if re == nil {
+		// Programming error, not input: the caller named something that is not a recovery GUC,
+		// so there is no matcher for it and returning "" would read as "not set".
+		return "", fmt.Errorf("recoveryGUCValue: %q is not one of %v", guc, recoveryGUCs)
+	}
+	data, err := os.ReadFile(confPath)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", confPath, err)
+	}
+	val := ""
+	for _, ln := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(strings.TrimLeft(ln, " \t"), "#") {
+			continue
+		}
+		m := re.FindString(ln)
+		if m == "" {
+			continue
+		}
+		// Everything past the matched `<name> =` (or `<name> `) is the value; the LAST
+		// assignment wins, matching PostgreSQL.
+		val = recoveryGUCRHS(strings.TrimSpace(ln[len(m):]))
+	}
+	return val, nil
+}
+
+// recoveryGUCRHS unquotes one postgresql.conf right-hand side.
+//
+// Scans for the closing quote rather than taking strings.LastIndex (#298 review): an inline
+// comment containing an apostrophe -- `primary_conninfo = 'host=pg-0' # don't touch` -- put the
+// last quote inside the comment, so the value came back as `host=pg-0' # don`. Doubled quotes
+// are postgresql.conf's own escape and are folded back to one.
+func recoveryGUCRHS(rhs string) string {
+	if strings.HasPrefix(rhs, "'") {
+		var b strings.Builder
+		for i := 1; i < len(rhs); i++ {
+			if rhs[i] != '\'' {
+				b.WriteByte(rhs[i])
+				continue
+			}
+			if i+1 < len(rhs) && rhs[i+1] == '\'' {
+				b.WriteByte('\'')
+				i++
+				continue
+			}
+			return b.String() // closing quote
+		}
+		// Unterminated: take what there is rather than handing back the opening quote.
+		return b.String()
+	}
+	// Unquoted values run to end of line or to an inline comment.
+	if i := strings.Index(rhs, "#"); i >= 0 {
+		rhs = rhs[:i]
+	}
+	return strings.TrimSpace(rhs)
+}
+
 // RemoveRecoveryConfig deletes every active primary_conninfo / primary_slot_name assignment from
 // confPath and reports which it removed. This is the migration half of ForeignRecoveryConfig
 // (#292): that function detects the state, this one clears it.
@@ -346,58 +444,6 @@ func ForeignRecoveryConfig(confPath string) ([]string, error) {
 // write. #308's EnsurePrimaryConninfoDBName edits the same file under the same rule.
 //
 // Idempotent: a second call on a cleared file reports nothing removed and rewrites nothing.
-// PrimaryConninfoValue returns the primary_conninfo currently set in confPath, unquoted, or
-// "" when the file has none (or does not exist).
-//
-// Read BEFORE RemoveRecoveryConfig strips it, so an in-place migration off repmgr can carry the
-// upstream forward into the agent's own fragment instead of orphaning the standby (#298, found
-// by the first live run of the repmgrd->2.0.0 roll). Commented lines are skipped and the LAST
-// assignment wins, matching PostgreSQL.
-// PrimarySlotNameValue returns the primary_slot_name currently set in confPath, unquoted, or ""
-// when there is none. Carried alongside PrimaryConninfoValue during the repmgr migration: the
-// slot it names (repmgr_slot_N) EXISTS on the still-repmgrd primary, while this agent's own
-// ordinal slot does not -- and a walreceiver pointed at a missing slot never streams (#298).
-func PrimarySlotNameValue(confPath string) (string, error) {
-	return recoveryGUCValue(confPath, "primary_slot_name")
-}
-
-// PrimaryConninfoValue returns the primary_conninfo currently set in confPath, unquoted, or
-// "" when the file has none (or does not exist).
-func PrimaryConninfoValue(confPath string) (string, error) {
-	return recoveryGUCValue(confPath, "primary_conninfo")
-}
-
-func recoveryGUCValue(confPath, guc string) (string, error) {
-	data, err := os.ReadFile(confPath)
-	if os.IsNotExist(err) {
-		return "", nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("read %s: %w", confPath, err)
-	}
-	val := ""
-	for _, ln := range strings.Split(string(data), "\n") {
-		t := strings.TrimLeft(ln, " \t")
-		if strings.HasPrefix(t, "#") || !strings.HasPrefix(t, guc) {
-			continue
-		}
-		_, rhs, ok := strings.Cut(t, "=")
-		if !ok {
-			continue
-		}
-		rhs = strings.TrimSpace(rhs)
-		if i := strings.Index(rhs, "'"); i >= 0 {
-			if j := strings.LastIndex(rhs, "'"); j > i {
-				// postgresql.conf doubles an embedded quote; undo that.
-				val = strings.ReplaceAll(rhs[i+1:j], "''", "'")
-				continue
-			}
-		}
-		val = rhs
-	}
-	return val, nil
-}
-
 func RemoveRecoveryConfig(confPath string) ([]string, error) {
 	data, err := os.ReadFile(confPath)
 	if os.IsNotExist(err) {

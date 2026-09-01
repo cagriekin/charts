@@ -40,7 +40,11 @@ for s in "${SCHEMAS[@]}"; do
   tmp="$(mktemp)"
   # Removed on any exit path, including Ctrl-C mid-download.
   trap 'rm -f "${tmp}"' EXIT
-  code="$(curl -sS -o "${tmp}" -w '%{http_code}' "${CATALOG}/${s}.json" || echo 000)"
+  # `|| true` rather than `|| echo 000`: curl's own -w already prints 000 on a failed transfer,
+  # so appending another made a network failure report `HTTP 000000` -- contradicting the note
+  # above, which promises `HTTP 000` is what a missing/failing curl looks like.
+  code="$(curl -sS -o "${tmp}" -w '%{http_code}' "${CATALOG}/${s}.json" || true)"
+  code="${code:-000}"
   if [ "${code}" != "200" ] || [ ! -s "${tmp}" ]; then
     echo "FAILED ${s}: HTTP ${code}" >&2
     rm -f "${tmp}"; rc=1; continue
