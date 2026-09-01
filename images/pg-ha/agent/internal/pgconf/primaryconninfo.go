@@ -3,10 +3,31 @@ package pgconf
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/cagriekin/pg-ha-agent/internal/atomicfile"
 )
+
+// conninfoPasswordRe matches one libpq `password=` keyword and its value, quoted or bare.
+// The quoted alternative comes first so a password containing whitespace is consumed whole
+// rather than truncated at the first space.
+var conninfoPasswordRe = regexp.MustCompile(`(?i)\bpassword[ \t]*=[ \t]*('(?:[^']|'')*'?|[^ \t]*)`)
+
+// RedactConninfo replaces any password in a libpq conninfo with a marker, so the value can be
+// logged (#298 review).
+//
+// The agent's OWN conninfo is passwordless by construction -- it authenticates through the
+// 0600 ~/.pgpass writePgpass lays down -- but the values this package reads out of
+// postgresql.auto.conf are not the agent's: they come from repmgr's clone/follow, or from an
+// operator's manual `ALTER SYSTEM SET primary_conninfo`, and libpq accepts `password=` there.
+// Logging one verbatim would put a replication credential in the pod log and in every log
+// sink downstream of it, which is the exact class of leak the repo's code-scanning alert was
+// filed for. Redacting costs one regexp and keeps the rest of the string -- host, port, user,
+// application_name -- which is all the diagnostic value the log line ever had.
+func RedactConninfo(conninfo string) string {
+	return conninfoPasswordRe.ReplaceAllString(conninfo, "password=[redacted]")
+}
 
 // EnsurePrimaryConninfoDBName reads confPath (PGDATA/postgresql.auto.conf, where repmgr's
 // own `standby clone`/`standby follow` CLI writes primary_conninfo), appends

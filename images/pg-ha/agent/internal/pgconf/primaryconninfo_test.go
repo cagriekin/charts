@@ -221,3 +221,27 @@ func TestAddDBNameToPrimaryConninfoLeavesAnEmptyValueAlone(t *testing.T) {
 		}
 	}
 }
+
+// #298 review: postgresql.auto.conf's primary_conninfo is not the agent's own passwordless
+// value -- repmgr's repmgr.conf conninfo carries `password=${REPMGR_PASSWORD}`, and an operator
+// can put one there by hand with ALTER SYSTEM -- so the migration's log lines must not print it.
+func TestRedactConninfo(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"bare", "host=pg-0 password=s3cr3t user=repmgr", "host=pg-0 password=[redacted] user=repmgr"},
+		{"quoted with a space", "host=pg-0 password='two words' user=repmgr", "host=pg-0 password=[redacted] user=repmgr"},
+		{"spaced keyword", "host=pg-0 password = s3cr3t", "host=pg-0 password=[redacted]"},
+		{"upper case", "PASSWORD=s3cr3t host=pg-0", "password=[redacted] host=pg-0"},
+		{"trailing", "host=pg-0 password=s3cr3t", "host=pg-0 password=[redacted]"},
+		{"none", "host=pg-0 port=5432 user=repmgr", "host=pg-0 port=5432 user=repmgr"},
+		// application_name=...password... must not be mangled: the keyword is matched on a word
+		// boundary, not as a substring.
+		{"lookalike keyword", "host=pg-0 application_name=passwordy", "host=pg-0 application_name=passwordy"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := RedactConninfo(c.in); got != c.want {
+				t.Errorf("RedactConninfo(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}

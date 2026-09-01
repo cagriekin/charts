@@ -687,6 +687,32 @@
 
 ### Fixed
 
+- **The durable-timeline repair backs off on failure, heartbeats, and no longer logs a
+  credential (#298 review).** Three defects in the restartpoint check added above:
+
+  - A restartpoint that ERRORED retried on the normal 15-second interval, while only one that
+    ran and did not move the timeline backed off to a minute. The commonest error is the
+    10-second budget expiring on a restartpoint that is genuinely slow -- a full flush of dirty
+    shared buffers on a standby saturated with replay I/O -- and cutting `psql` short does not
+    abort the server-side checkpoint, so the node took a fresh forced flush every 15 seconds
+    indefinitely: exactly the hammering the backoff was introduced to stop, reached by the one
+    path that skipped it. The confirmation read failing (usually because that same flush ate
+    the shared budget) had the same hole. Both now back off.
+  - The check blocked the reconcile tick for up to its whole budget with no `metr.Beat()`.
+    `tick` heartbeats once, at its top, and `/healthz` goes stale at `reconcileInterval * 3`
+    (15s on chart defaults), at which point the kubelet SIGKILLs PID 1 and the postmaster it
+    supervises. `verifyTLSActive` runs three lines earlier in the same tick and already allows
+    itself 15 seconds; the two throttles (60s and 15s) coincide every fourth check, so the sum
+    is reached in ordinary operation. It now beats before the checkpoint, the same way the
+    clone path does.
+  - The repmgr migration logged the inherited `primary_conninfo` verbatim in three places.
+    That value is not the agent's own passwordless conninfo -- it comes out of
+    `postgresql.auto.conf`, written by repmgr (whose `repmgr.conf` conninfo carries
+    `password=`) or by a hand-run `ALTER SYSTEM` -- so a replication credential could reach
+    the pod log and every sink downstream of it. It is redacted now. The slot pre-create also
+    takes the process context, so a shutdown during the retry budget exits instead of being
+    SIGKILLed.
+
 - **A standby now records the timeline it is streaming, so a migrated cluster can fail over
   (#298, found by the first live run).** The promotion guards read DURABLE state, but a standby's
   control-file timeline advances only at a restartpoint -- up to `checkpoint_timeout` later, five

@@ -426,7 +426,7 @@ func (a *agent) run() {
 	// Same placement, same reasoning: a data directory whose postgresql.auto.conf still carries
 	// recovery GUCs is one this agent cannot steer, and no amount of reconciling fixes it
 	// (#294 review).
-	if err := a.migrateForeignRecoveryConfig(); err != nil {
+	if err := a.migrateForeignRecoveryConfig(ctx); err != nil {
 		a.log.Error("recovery-config preflight", "err", err)
 		os.Exit(1)
 	}
@@ -2693,7 +2693,13 @@ const repmgrPreloadLib = "repmgr"
 // Stripping the lines instead would be worse: sequencing it against the catalog and the slots is
 // exactly what #292 is for, and a half-migration is harder to reason about than a pod that will
 // not start with a message naming the issue.
-func (a *agent) migrateForeignRecoveryConfig() error {
+//
+// ctx is the process context (SIGTERM/SIGINT), threaded in only so the bounded slot
+// pre-create below can abandon its retries on a shutdown (#298 review): this runs before
+// leader election with nothing else watching the signal, so without it a pod whose inherited
+// upstream is unreachable ignored `kubectl delete` for the whole attempt budget and was
+// SIGKILLed instead of exiting.
+func (a *agent) migrateForeignRecoveryConfig(ctx context.Context) error {
 	autoConf := filepath.Join(a.cfg.PGDATA, "postgresql.auto.conf")
 	found, err := pgconf.ForeignRecoveryConfig(autoConf)
 	if err != nil {
@@ -2786,8 +2792,12 @@ func (a *agent) migrateForeignRecoveryConfig() error {
 		if s, ok := a.mech.(recoverySeeder); !ok {
 			// Never silent: a mechanism that cannot seed leaves this node with standby.signal
 			// and no upstream, which is the deadlock this whole block exists to prevent.
+			// REDACTED (#298 review). This value is not the agent's own passwordless conninfo:
+			// it came out of postgresql.auto.conf, written by repmgr or by a hand-run ALTER
+			// SYSTEM, and libpq accepts `password=` there. Logging it verbatim puts a
+			// replication credential in the pod log.
 			a.log.Warn("in-place migration (#292): this mechanism cannot carry the inherited upstream forward; the node may come up as a standby with no primary_conninfo",
-				"upstream", inherited)
+				"upstream", pgconf.RedactConninfo(inherited))
 		} else {
 			// PRE-CREATE this agent's own slot on the inherited upstream (#298, observed live).
 			// Seeding repmgr's slot into the fragment is not enough on its own: boot() runs
@@ -2812,7 +2822,7 @@ func (a *agent) migrateForeignRecoveryConfig() error {
 				ci := pg.ConnInfo{Host: h, Port: 5432, User: a.cfg.RepmgrUser, DB: a.cfg.RepmgrDB, Password: a.cfg.RepmgrPassword}
 				var cerr error
 				for attempt := 1; attempt <= slotPrecreateAttempts; attempt++ {
-					sctx, scancel := context.WithTimeout(context.Background(), 15*time.Second)
+					sctx, scancel := context.WithTimeout(ctx, 15*time.Second)
 					cerr = a.prober.CreatePhysicalSlot(sctx, ci, slot)
 					scancel()
 					if cerr == nil {
@@ -2823,7 +2833,13 @@ func (a *agent) migrateForeignRecoveryConfig() error {
 					a.log.Warn("in-place migration (#292): could not pre-create this node's slot on the inherited upstream; retrying",
 						"upstream", h, "slot", slot, "attempt", attempt, "of", slotPrecreateAttempts, "err", cerr)
 					if attempt < slotPrecreateAttempts {
-						time.Sleep(slotPrecreateBackoff)
+						// Interruptible sleep: a shutdown must not have to wait out the backoff.
+						select {
+						case <-ctx.Done():
+							cerr = ctx.Err()
+							attempt = slotPrecreateAttempts // stop retrying; the ERROR below still fires
+						case <-time.After(slotPrecreateBackoff):
+						}
 					}
 				}
 				if cerr != nil {
@@ -2832,7 +2848,7 @@ func (a *agent) migrateForeignRecoveryConfig() error {
 				}
 			} else {
 				a.log.Warn("in-place migration (#292): no host in the inherited upstream, or no parseable pod ordinal, so this node's slot cannot be pre-created",
-					"upstream", inherited, "slot", slot)
+					"upstream", pgconf.RedactConninfo(inherited), "slot", slot)
 			}
 			// repmgr's OWN slot goes into the fragment, not this agent's ordinal slot: it is
 			// already there on the upstream and already reserving WAL for this node, so it is the
@@ -2842,7 +2858,7 @@ func (a *agent) migrateForeignRecoveryConfig() error {
 					"err", seerr)
 			} else {
 				a.log.Info("in-place migration (#292): carried the inherited upstream into the agent's fragment so this node keeps streaming through the roll",
-					"upstream", inherited, "slot", inheritedSlot)
+					"upstream", pgconf.RedactConninfo(inherited), "slot", inheritedSlot)
 			}
 		}
 	}
@@ -3097,9 +3113,26 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 	if rerr != nil || !ok || reported <= durable {
 		return
 	}
+	// BEAT before the CHECKPOINT (#298 review). tick() heartbeats once, at its top, and
+	// /healthz goes stale at reconcileInterval*3 (15s on chart defaults) -- at which point the
+	// kubelet SIGKILLs PID 1 and the postmaster it supervises. verifyTLSActive, three lines up
+	// in the same tick, already allows itself 15s, and this call adds up to durableTLBudget on
+	// top of it; the two throttles (60s and 15s) coincide every fourth check, so the sum is
+	// reached in normal operation, not just in theory. The same heartbeat-through-a-long-call
+	// pattern the clone path uses.
+	a.metr.Beat()
 	if cerr := a.prober.Restartpoint(dctx, self); cerr != nil {
+		// BACK OFF here too (#298 review). The commonest way this errors is the budget above
+		// expiring on a restartpoint that is genuinely slow -- a full flush of dirty shared
+		// buffers on a standby saturated with replay I/O -- and cutting psql short does not
+		// abort the server-side checkpoint. Returning on the normal interval therefore issued a
+		// FRESH CHECKPOINT every 15s at exactly the node this backoff exists to protect, which
+		// is the hammering durableTLNoAdvanceInterval was introduced to stop, reached by the
+		// other branch.
+		a.durableTLNextAt = time.Now().Add(durableTLNoAdvanceInterval)
 		a.log.Warn("could not force a restartpoint to record the streamed timeline; this node may refuse to promote until one happens on its own",
-			"durableTimeline", uint32(durable), "streamedTimeline", uint32(reported), "err", cerr)
+			"durableTimeline", uint32(durable), "streamedTimeline", uint32(reported),
+			"retryIn", durableTLNoAdvanceInterval.String(), "err", cerr)
 		return
 	}
 	// RE-READ, do not assume (#298 review). A CHECKPOINT on a standby returning success is not
@@ -3112,8 +3145,14 @@ func (a *agent) ensureDurableTimeline(ctx context.Context) {
 	// while silently re-running the same no-op every interval.
 	after, _, aok, aerr := a.prober.RecoveryTimelines(dctx, self)
 	if aerr != nil || !aok {
+		// Same backoff as the two branches around it: the restartpoint DID run, and the usual
+		// reason the confirmation read fails is that it ate the budget doing so. Retrying on the
+		// short interval would force another one before this node has any chance of replaying a
+		// newer checkpoint record, i.e. the no-op flush loop again.
+		a.durableTLNextAt = time.Now().Add(durableTLNoAdvanceInterval)
 		a.log.Warn("forced a restartpoint but could not re-read the control file to confirm the durable timeline advanced",
-			"was", uint32(durable), "streamedTimeline", uint32(reported), "err", aerr)
+			"was", uint32(durable), "streamedTimeline", uint32(reported),
+			"retryIn", durableTLNoAdvanceInterval.String(), "err", aerr)
 		return
 	}
 	if after <= durable {

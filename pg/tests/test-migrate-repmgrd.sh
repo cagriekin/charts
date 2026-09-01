@@ -402,8 +402,13 @@ assert_gt "post: the primary marker records a timeline (the highwater the guard 
 # still coming back -- and the ex-primary, whose PGDATA is intact, restarted in seconds and
 # reclaimed the Lease before any standby cleared its guard. Requiring the condition to hold across
 # three samples is what makes this stage test failover rather than a race.
+#
+# The loop is SKIPPED outright when the marker is unreadable (#298 review): `fail` records and
+# returns, it does not exit, so the guard above on its own did not actually stop the suite --
+# it recorded one failure and then still burned the full 300s reaching the same conclusion by
+# the slow route, which is the five-minute wait its own comment says it prevents.
 settled=0; waited=0
-while [ ${waited} -lt 300 ]; do
+while [ -n "${marker_tl}" ] && [ ${waited} -lt 300 ]; do
   ready_now=1
   for i in $(seq 0 $((NODES - 1))); do
     pod="${FULLNAME}-${i}"
