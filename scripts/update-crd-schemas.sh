@@ -8,15 +8,24 @@
 # and green on the next (#298).
 #
 # Run this when a chart starts emitting a new CRD kind, or to pick up an upstream schema change.
-# The layout mirrors the catalog's own <group>/<kind>_<version>.json so one template addresses
-# both the local copy and the remote fallback.
+# The layout mirrors the catalog's own <group>/<kind>_<version>.json, which is also the shape of
+# kubeconform's -schema-location template -- the local copies are the ONLY location that gate
+# consults, there is no remote fallback behind them.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib.sh
+source "${ROOT}/scripts/lib.sh"
+# Guarded up front, because both absences otherwise MISREPORT themselves: a missing curl reports
+# `HTTP 000` (reads as a network outage) and a missing python3 reports "response is not JSON"
+# (reads as a bad upstream schema), since the stderr that would name the real cause is discarded.
+require_tool curl "https://curl.se/download.html"
+require_tool python3 "https://www.python.org/downloads/"
 DEST="${ROOT}/scripts/crd-schemas"
 CATALOG="https://raw.githubusercontent.com/datreeio/CRDs-catalog/main"
 
-# Every CRD kind the charts render, in <group>/<kind>_<apiVersion> form. Derive the list with:
-#   helm template <chart> ... | grep -B1 '^kind:' | grep '^apiVersion: ' | sort -u
+# Every CRD kind the charts render, in <group>/<kind>_<apiVersion> form. Do not derive this by
+# hand: scripts/kubeconform-charts.sh checks every rendered profile against this directory and
+# FAILS naming the exact <group>/<kind>_<version>.json any chart needs and this list is missing.
 SCHEMAS=(
   "cert-manager.io/certificate_v1"
   "cert-manager.io/issuer_v1"
@@ -29,6 +38,8 @@ for s in "${SCHEMAS[@]}"; do
   out="${DEST}/${s}.json"
   mkdir -p "$(dirname "${out}")"
   tmp="$(mktemp)"
+  # Removed on any exit path, including Ctrl-C mid-download.
+  trap 'rm -f "${tmp}"' EXIT
   code="$(curl -sS -o "${tmp}" -w '%{http_code}' "${CATALOG}/${s}.json" || echo 000)"
   if [ "${code}" != "200" ] || [ ! -s "${tmp}" ]; then
     echo "FAILED ${s}: HTTP ${code}" >&2

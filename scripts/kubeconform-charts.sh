@@ -25,15 +25,12 @@ KUBE_VERSION="${KUBE_VERSION:-1.29.0}"
 # honest, the newer one is the only place the newest kinds get checked at all.
 KUBE_VERSION_MAX="${KUBE_VERSION_MAX:-1.30.0}"
 
-# Core/native kinds use kubeconform's bundled schemas (-schema-location default).
-# CRD kinds (ServiceMonitor, PrometheusRule, KEDA ScaledObject, cert-manager
-# Certificate, ...) are not built in; pull them from the community CRDs-catalog.
-# A CRD with no catalog entry is skipped (-ignore-missing-schemas) rather than
-# failing the gate, while every core kind and cataloged CRD is still validated.
-# VENDORED ONLY -- no remote schema location (#298). Fetching per-run made this gate, a REQUIRED
-# check, fail for reasons that have nothing to do with the charts: kubeconform treats any non-404
-# HTTP status from a location as a HARD ERROR rather than trying the next one, so a single bad CDN
-# response reddened the build. Observed repeatedly as `error while downloading schema at
+# Core/native kinds use kubeconform's bundled schemas (-schema-location default). CRD kinds
+# (ServiceMonitor, PrometheusRule, cert-manager Certificate, ...) are not built in, and come from
+# schemas CHECKED IN under scripts/crd-schemas -- vendored only, with no remote schema location at
+# all (#298). Fetching them per-run made this gate, a REQUIRED check, fail for reasons that have
+# nothing to do with the charts: kubeconform treats any non-404 HTTP status from a location as a
+# HARD ERROR rather than trying the next one, so a single bad CDN response reddened the build. Observed repeatedly as `error while downloading schema at
 # .../certificate-cert-manager-v1.json - received HTTP status 400` on three kafka profiles, red on
 # one run and green on the next with no code change, and reproducing identically on master.
 #
@@ -70,41 +67,17 @@ if [ ${#charts[@]} -eq 0 ]; then
 fi
 
 rc=0
-# Every CRD kind the charts render must have a vendored schema, or it is silently skipped rather
-# than validated (see the note above). Checked once, up front, against the same renders the loop
-# below validates -- a missing entry names itself and the fix.
+# Every CRD kind the charts render must have a vendored schema, or kubeconform SKIPS it instead of
+# validating it (see the note above). Collected from the SAME rendered manifests the loop below
+# validates, and reported once after every profile so one unvendored kind cannot hide the rest.
+#
+# Deliberately NOT a second `helm template` pass of its own (#298 review): that doubled the gate's
+# render work, and because the collecting pipeline ran under `set -euo pipefail` with stderr
+# discarded, a fixture that merely failed to render killed the whole gate on the spot -- exit 1
+# with not one line of output, the FATAL/fixture_base diagnostic below never reached, and a stray
+# predictable /tmp file left behind. A gate that dies without saying why is the same
+# unreadable-failure problem the vendoring was meant to end.
 crd_missing=""
-for _c in "${charts[@]}"; do
-  while read -r _label _vfiles; do
-    _args=()
-    for _v in ${_vfiles}; do _args+=(-f "${_v}"); done
-    helm template "${_c}" "${_c}" ${_args[@]+"${_args[@]}"} 2>/dev/null \
-      | awk '/^apiVersion:/{av=$2} /^kind:/{if (av ~ /\//) print av" "$2}' \
-      | sort -u \
-      | while read -r _av _kind; do
-          _group="${_av%%/*}"; _ver="${_av##*/}"
-          case "${_group}" in
-            apps|batch|policy|rbac.authorization.k8s.io|networking.k8s.io|admissionregistration.k8s.io|coordination.k8s.io|autoscaling|storage.k8s.io|apiextensions.k8s.io|scheduling.k8s.io|discovery.k8s.io|events.k8s.io|certificates.k8s.io|node.k8s.io|flowcontrol.apiserver.k8s.io) continue ;;
-          esac
-          _kl="$(printf '%s' "${_kind}" | tr '[:upper:]' '[:lower:]')"
-          [ -f "${REPO_ROOT}/scripts/crd-schemas/${_group}/${_kl}_${_ver}.json" ] \
-            || echo "  ${_group}/${_kl}_${_ver}.json (${_kind} in ${_c})"
-        done
-  done < <(chart_profiles "${_c}")
-done > /tmp/kc-crd-missing.$$ 2>/dev/null
-crd_missing="$(sort -u /tmp/kc-crd-missing.$$ 2>/dev/null || true)"; rm -f /tmp/kc-crd-missing.$$
-if [ -n "${crd_missing}" ]; then
-  cat >&2 <<EOF
-
-=== kubeconform: FAILED (CRD schemas not vendored) ===
-These CRD kinds are rendered by the charts but have no schema under scripts/crd-schemas, so
-kubeconform would SKIP them instead of validating them:
-${crd_missing}
-
-Add them to the SCHEMAS list in scripts/update-crd-schemas.sh and run it.
-EOF
-  exit 1
-fi
 
 failed=0
 profiles=0
@@ -142,6 +115,34 @@ for chart in "${charts[@]}"; do
     # Same for the skip tally: both versions skip the SAME resources, so summing inside the
     # loop double-counts them. Take the worst single version and add it once.
     profile_skips=0
+    # CRD coverage for THIS render. Groups served by `-schema-location default` are native and
+    # never need a vendored file; every other group in an apiVersion must resolve locally. Listed
+    # explicitly rather than matched on `*.k8s.io`, because plenty of CRDs live under that suffix
+    # too (Gateway API, snapshot.storage.k8s.io) and matching the suffix would wave them through
+    # as native -- a skip dressed up as coverage.
+    #
+    # The awk below pairs kind with apiVersion PER DOCUMENT and in either order: an earlier form
+    # carried `apiVersion` forward across `---` and printed it at the next `kind:`, so a manifest
+    # that puts `kind:` first took the PREVIOUS document's group -- a new CRD silently filed under
+    # a native group and skipped, the exact hole this check exists to close (#298 review).
+    while read -r crd_av crd_kind; do
+      [ -n "${crd_av}" ] || continue
+      crd_group="${crd_av%%/*}"; crd_ver="${crd_av##*/}"
+      case "${crd_group}" in
+        apps|batch|policy|autoscaling|rbac.authorization.k8s.io|networking.k8s.io|admissionregistration.k8s.io|coordination.k8s.io|storage.k8s.io|apiextensions.k8s.io|apiregistration.k8s.io|authentication.k8s.io|authorization.k8s.io|scheduling.k8s.io|discovery.k8s.io|events.k8s.io|certificates.k8s.io|node.k8s.io|flowcontrol.apiserver.k8s.io) continue ;;
+      esac
+      crd_kl="$(printf '%s' "${crd_kind}" | tr '[:upper:]' '[:lower:]')"
+      [ -f "${REPO_ROOT}/scripts/crd-schemas/${crd_group}/${crd_kl}_${crd_ver}.json" ] && continue
+      crd_missing="${crd_missing}  ${crd_group}/${crd_kl}_${crd_ver}.json (${crd_kind} in ${chart})
+"
+      rc=1
+      profile_failed=1
+    done < <(printf '%s\n' "${rendered}" | awk '
+        function flush() { if (av ~ /\// && k != "") print av" "k; av=""; k="" }
+        /^---/            { flush(); next }
+        /^apiVersion:/    { av=$2; gsub(/[\042\047]/, "", av) }
+        /^kind:/          { k=$2;  gsub(/[\042\047]/, "", k) }
+        END               { flush() }' | sort -u)
     for kv in "${KUBE_VERSION}" "${KUBE_VERSION_MAX}"; do
       if ! out=$(printf '%s' "${rendered}" \
           | kubeconform \
@@ -189,4 +190,16 @@ for chart in "${charts[@]}"; do
     [ "${profile_failed}" -eq 0 ] || failed=$((failed + 1))
   done < <(chart_profiles "${chart}")
 done
+crd_missing="$(printf '%s' "${crd_missing}" | grep -v '^[[:space:]]*$' | sort -u || true)"
+if [ -n "${crd_missing}" ]; then
+  cat >&2 <<EOF
+
+=== kubeconform: CRD schemas not vendored ===
+These CRD kinds are rendered by the charts but have no schema under scripts/crd-schemas, so
+kubeconform SKIPPED them instead of validating them:
+${crd_missing}
+
+Add them to the SCHEMAS list in scripts/update-crd-schemas.sh and run it.
+EOF
+fi
 verdict "kubeconform" "$rc" "$( [ "$rc" -eq 0 ] && echo "${#charts[@]} charts, ${profiles} profiles x k8s ${KUBE_VERSION}+${KUBE_VERSION_MAX}, ${skips} unvalidated" || echo "${failed} of ${profiles} profiles" )"
