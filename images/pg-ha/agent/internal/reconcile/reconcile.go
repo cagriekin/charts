@@ -343,10 +343,21 @@ func Decide(o Observation) Decision {
 		if p := primaryNamed(o, o.LeaderIdentity); p != nil {
 			return d(BootstrapClone, p.Name, "empty data; clone from the lease holder")
 		}
-		if p := anyReachablePrimary(o.Peers); p != nil {
-			return d(BootstrapClone, p.Name, "empty data; clone from the live primary")
+		// Fall back to ANY reachable primary only when there is no leader at all (#298
+		// review). While a leader exists but is not yet a reachable primary -- the standby
+		// that just won the lease and has not promoted -- a read-write node that is NOT the
+		// leader is the OLD primary, about to be DemoteFenced. Cloning from it latches it as
+		// the upstream and creates this node's slot there, and the fence's Immediate stop then
+		// kills the walsender mid-pg_basebackup: a torn multi-hour clone, or one that
+		// completes and comes up streaming the old timeline from a node fenced seconds later.
+		// The leader will be a reachable primary within a tick or two; waiting costs that and
+		// nothing else.
+		if o.LeaderIdentity == "" {
+			if p := anyReachablePrimary(o.Peers); p != nil {
+				return d(BootstrapClone, p.Name, "empty data, no leader known; clone from the live primary")
+			}
 		}
-		return d(Wait, "", "empty data, no reachable primary yet; wait (never initdb as a non-holder)")
+		return d(Wait, "", "empty data, no reachable primary to clone from yet; wait (never initdb as a non-holder)")
 
 	default: // has data, not running
 		if newer != nil {

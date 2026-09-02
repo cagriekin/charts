@@ -48,6 +48,14 @@ func TestDecide(t *testing.T) {
 		{"unreadable marker suspends everything (stopped holder)", Observation{MarkerUnreadable: true, HoldLease: true, Local: LocalState{HasData: true}}, NoOp, ""},
 		{"unreadable marker outranks a promotable standby", Observation{MarkerUnreadable: true, HoldLease: true, Local: LocalState{HasData: true, Running: true, InRecovery: true, Timeline: tl(5), TimelineOK: true, LSN: pg.LSN{Lo: 0x200}, LSNOK: true}}, NoOp, ""},
 
+		// #298 review: a non-holder with empty data clones from a non-leader primary ONLY when no
+		// leader is known. While a leader exists but is not yet a reachable primary, a read-write
+		// node that is not the leader is the OLD primary about to be fenced -- cloning from it
+		// tears the clone when the fence's Immediate stop kills the walsender.
+		{"non-holder + empty + leader is a standby, other primary reachable -> wait, not clone", Observation{HoldLease: false, Local: emptyData, LeaderIdentity: "pg-1",
+			Peers: []PeerState{standby("pg-1", 5, 5, 0x100), {Name: "pg-0", Reachable: true, Role: pg.RolePrimary, Timeline: tl(5), TimelineOK: true}}}, Wait, ""},
+		{"non-holder + empty + NO leader, a primary reachable -> clone from it", Observation{HoldLease: false, Local: emptyData, LeaderIdentity: "",
+			Peers: []PeerState{{Name: "pg-0", Reachable: true, Role: pg.RolePrimary, Timeline: tl(5), TimelineOK: true}}}, BootstrapClone, "pg-0"},
 		{"holder + empty + no peers -> initdb", Observation{HoldLease: true, Local: emptyData}, BootstrapInitdb, ""},
 		{"holder + empty + marker present (no primary named) -> wait/settle", Observation{HoldLease: true, Local: emptyData, Marker: MarkerState{Present: true, Timeline: tl(5)}}, Wait, ""},
 		// #186: empty data holding the lease while the marker names a DIFFERENT primary

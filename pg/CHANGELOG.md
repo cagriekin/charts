@@ -687,6 +687,24 @@
 
 ### Fixed
 
+- **Five holdership/precondition races closed on stale samples (#298 review).** `HoldLease` and
+  the control-API preconditions are sampled once at the top of a reconcile tick or on the HTTP
+  goroutine, and the work that acts on them runs seconds to minutes later:
+  - `Promote` now re-checks `dcs.IsLeader()` **before** promoting, not only after. A lease lost
+    during observe()'s probe phase has already had its `OnLost` (a no-op on a standby), so the
+    post-promote check alone left a read-write non-holder for a full reconcile interval beside the
+    peer that took the lease.
+  - `StartLocal`'s primary-state arm re-checks holdership before clearing `standby.signal` and
+    coming up read-write, for the same reason.
+  - `rejoinOnto` clears the read-write latch on a proven demote, like every other proven-stop
+    site: it can demote a read-write holder and then spend minutes rewinding, and a leftover latch
+    ran a spurious fence and vetoed the release.
+  - `IntentStop` (restore) re-asserts the pause at dequeue time; a restore that outlived its
+    client deadline could otherwise stop a resumed, serving primary hours later.
+  - A non-holder with empty data clones from a non-leader primary only when no leader is known;
+    while a standby that just won the lease has not yet promoted, the other read-write node is the
+    old primary about to be fenced, and cloning from it tears the clone.
+
 - **The repmgr migration seeds its fragment before it talks to the upstream; three smaller
   #298 review defects.**
 

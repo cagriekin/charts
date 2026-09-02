@@ -1467,6 +1467,18 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		// skipped the demote on a node that was becoming a writer -- two primaries until the
 		// next tick. Pre-arming only ever makes OnLost demote a node that is becoming read-write
 		// (the fail-safe direction), which is exactly the reasoning StartLocal already applies.
+		// Re-check holdership BEFORE promoting as well as after (#298 review). HoldLease was
+		// sampled at the top of observe(), which then spends seconds on peer probes, gossip
+		// and marker reads. If the lease lapsed in that window, OnLost has ALREADY run --
+		// opMu was free, and it saw servingRW=false on a standby and returned with "no fence
+		// needed". Promoting now would make this node a writer without the lease, and the
+		// post-promote check below would return nil "expecting OnLost", which will not fire
+		// again: the node stays read-write until the NEXT tick's DemoteFence, a full
+		// reconcileInterval beside whichever peer took the lease. One atomic read closes it.
+		if !a.dcs.IsLeader() {
+			a.log.Warn("lease lost between observe and promote; not promoting (#298)", "node", a.cfg.PodName)
+			return nil
+		}
 		a.servingRW.Store(true)
 		if err := a.beatDuring(func() error { return a.mech.Promote(ctx) }); err != nil {
 			return err
@@ -1946,6 +1958,17 @@ func (a *agent) act(ctx context.Context, dec reconcile.Decision, obs reconcile.O
 		if !obs.Local.Running && obs.Local.HasData {
 			primaryState := !obs.Local.InRecovery
 			if primaryState {
+				// Re-check holdership before coming up READ-WRITE (#298 review), for the
+				// reason the Promote branch gives: HoldLease is a sample from the top of
+				// observe(), and a lease lost during the probe phase has already had its
+				// OnLost -- a no-op on a stopped node -- so nothing later will fence what
+				// this arm is about to start. Decide only routes primary-state data here as
+				// the holder; if that stopped being true, let the next tick route it to
+				// RejoinForward/StartRecovery like any other non-holder.
+				if !a.dcs.IsLeader() {
+					a.log.Warn("lease lost between observe and start; not starting primary-state data read-write (#298)", "node", a.cfg.PodName)
+					return nil
+				}
 				// primary-state: clear any stray standby.signal so it opens read-write
 				// (crash recovery on the same timeline -- a resume, not a promotion).
 				if err := process.ClearRecoverySignal(a.cfg.PGDATA); err != nil {
@@ -3604,9 +3627,18 @@ func (a *agent) rejoinOnto(ctx context.Context, target string) error {
 	dctx, dcancel := context.WithTimeout(ctx, a.cfg.RenewDeadline)
 	derr := a.sup.Demote(dctx, true)
 	dcancel()
-	if derr != nil {
+	if !a.stopProvedDead(derr) {
 		return derr
 	}
+	// A proven stop clears the read-write latch here too (#298 review). This path can demote
+	// a READ-WRITE holder -- Decide's "primary holds lease but a peer is on a newer timeline"
+	// anomaly branch -- and then spend minutes in pg_rewind or a re-clone, or return with the
+	// node stopped on a transient rewind failure. With the latch left armed through all of
+	// that, a lease lapse ran OnLost's fence over nothing (a spurious pg_ha_agent_fences_total
+	// increment and a PGHAAgentFlapping page) and SafeToRelease vetoed the release, so a peer
+	// waited out the full LeaseDuration for a node that had been stopped for minutes. Same
+	// positive-evidence rule as every other proven-stop site.
+	a.clearServingRWForPlannedStepDown()
 	if err := a.beatDuring(func() error { return a.mech.RejoinForceRewind(ctx, a.peerMechConn(target)) }); err != nil {
 		// Escalate to a full re-clone ONLY on genuine divergence (#298 review).
 		// RejoinForceRewind already classifies its failures -- ErrRewindDiverged for

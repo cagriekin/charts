@@ -138,6 +138,19 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 		// leaves postmaster.pid behind, and that file is what stops the restore Job from
 		// writing over a directory something may still own. The caller must see the stop
 		// did not complete cleanly rather than have a Job created behind it.
+		// RE-ASSERT the pause at dequeue time (#298 review), exactly as IntentReinitialize
+		// re-asserts its replica-only gate and for the same reason: the handler checked it on
+		// the HTTP goroutine before Submit, and the intent deliberately outlives the caller's
+		// deadline. A restore requested while act() sat inside a multi-hour clone was
+		// accepted, timed out at the client with "no restore Job was created; retry", and
+		// the operator resumed the cluster -- then, hours later, this dequeued and gracefully
+		// stopped the now-serving primary for a restore nobody was still running. The loop's
+		// own last successful marker read is the cheapest honest answer here; if it says the
+		// cluster is not paused, the reconcile loop would restart the postmaster on its next
+		// tick anyway, so stopping it buys nothing but an outage.
+		if !a.lastMarkerOK || !a.lastMarker.Paused {
+			return fmt.Errorf("refusing to stop postgres for a restore: the cluster is no longer paused (the request outlived its pause); pause again and re-request")
+		}
 		if err := a.sup.Demote(stopCtx, false); err != nil {
 			return fmt.Errorf("stop postgres: %w", err)
 		}

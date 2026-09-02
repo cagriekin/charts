@@ -165,12 +165,27 @@ type fakeDCS struct {
 	released bool
 	// leader lets a test hold the lease. Default false, matching every pre-existing use.
 	leader bool
+	// leaderSeq, when set, answers successive IsLeader calls in order (the last value
+	// repeats), so a test can model the lease lapsing BETWEEN two checks -- e.g. held at
+	// the pre-promote check and gone at the post-promote one (#298 review).
+	leaderSeq   []bool
+	leaderCalls int
 }
 
 func (f *fakeDCS) Run(context.Context, string, dcs.Callbacks) {}
-func (f *fakeDCS) IsLeader() bool                             { return f.leader }
-func (f *fakeDCS) Leader() string                             { return "" }
-func (f *fakeDCS) Release()                                   { f.released = true }
+func (f *fakeDCS) IsLeader() bool {
+	if len(f.leaderSeq) > 0 {
+		i := f.leaderCalls
+		if i >= len(f.leaderSeq) {
+			i = len(f.leaderSeq) - 1
+		}
+		f.leaderCalls++
+		return f.leaderSeq[i]
+	}
+	return f.leader
+}
+func (f *fakeDCS) Leader() string { return "" }
+func (f *fakeDCS) Release()       { f.released = true }
 
 // scriptedExec backs BOTH mechanism.Runner (repmgr CLI) and pg.Exec (psql) -- the
 // signatures are identical -- so one fake drives the whole Follow act() path. It
@@ -650,7 +665,7 @@ func newTestAgent(t *testing.T, pm *fakePostmaster, d *fakeDCS) *agent {
 // so a lease loss during the resume window still fences (mirrors the Promote path).
 func TestActStartLocalArmsServingRWForPrimaryState(t *testing.T) {
 	pm := &fakePostmaster{}
-	a := newTestAgent(t, pm, &fakeDCS{})
+	a := newTestAgent(t, pm, &fakeDCS{leader: true}) // the arm re-checks holdership (#298 review)
 	obs := reconcile.Observation{Local: reconcile.LocalState{HasData: true, Running: false, InRecovery: false}}
 	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.StartLocal}, obs); err != nil {
 		t.Fatalf("act: %v", err)
@@ -1027,6 +1042,70 @@ func TestActStartLocalAssertsStandbySignalForStandbyState(t *testing.T) {
 	}
 	if a.servingRW.Load() {
 		t.Fatal("a standby start must not arm servingRW")
+	}
+}
+
+// #298 review: holdership is re-checked BEFORE promoting, not only after. HoldLease is a sample
+// from the top of observe(), which then spends seconds on probes; a lease lost in that window has
+// already had its OnLost -- a no-op on a standby -- so nothing later fences what Promote is about
+// to create. The post-promote check alone returned nil "expecting OnLost", which will not fire
+// again: a read-write non-holder for a full reconcileInterval beside whichever peer took the lease.
+func TestActPromoteRefusesWhenTheLeaseWasLostBeforeIt(t *testing.T) {
+	a := newSlotTestAgent(t, &slotExec{}, config.MechanismNative)
+	a.dcs = &fakeDCS{leader: false}
+	m := &rewindStubMech{}
+	a.mech = m
+	err := a.act(context.Background(), reconcile.Decision{Action: reconcile.Promote},
+		reconcile.Observation{HoldLease: true, Local: reconcile.LocalState{HasData: true, Running: true, InRecovery: true}})
+	if err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if a.servingRW.Load() {
+		t.Error("a node that no longer holds the lease must not arm the read-write latch")
+	}
+	rec := httptest.NewRecorder()
+	a.metr.Handler(time.Minute).ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	if !strings.Contains(rec.Body.String(), "pg_ha_agent_promotions_total 0\n") {
+		t.Error("a node that no longer holds the lease must not promote")
+	}
+	_ = m
+}
+
+// Same gap in StartLocal's primary-state arm, which clears standby.signal and starts read-write on
+// the same stale HoldLease sample (#298 review).
+func TestActStartLocalRefusesPrimaryStateWhenTheLeaseWasLost(t *testing.T) {
+	pm := &fakePostmaster{}
+	a := newTestAgent(t, pm, &fakeDCS{leader: false})
+	if err := os.WriteFile(filepath.Join(a.cfg.PGDATA, "standby.signal"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	obs := reconcile.Observation{HoldLease: true, Local: reconcile.LocalState{HasData: true, Running: false, InRecovery: false}}
+	if err := a.act(context.Background(), reconcile.Decision{Action: reconcile.StartLocal}, obs); err != nil {
+		t.Fatalf("act: %v", err)
+	}
+	if pm.started {
+		t.Error("primary-state data must not be started read-write by a node that lost the lease")
+	}
+	if _, err := os.Stat(filepath.Join(a.cfg.PGDATA, "standby.signal")); err != nil {
+		t.Error("standby.signal must be left in place when the start is refused")
+	}
+	if a.servingRW.Load() {
+		t.Error("the read-write latch must stay clear")
+	}
+}
+
+// #298 review: rejoinOnto can demote a READ-WRITE holder and then spend minutes rewinding; a
+// proven stop must clear the latch like every other proven-stop site, or a lease lapse in that
+// window runs the fence over nothing and SafeToRelease vetoes the release.
+func TestRejoinOntoClearsServingRWAfterAProvenDemote(t *testing.T) {
+	a := newFollowTestAgentWithPM(t, &scriptedExec{walRcv: ""}, &fakePostmaster{running: true})
+	a.mech = &rewindStubMech{}
+	a.servingRW.Store(true)
+	if err := a.rejoinOnto(context.Background(), "pg-1"); err != nil {
+		t.Fatalf("rejoin: %v", err)
+	}
+	if a.servingRW.Load() {
+		t.Error("a completed demote is proof this node is no longer a writer; the latch must be clear")
 	}
 }
 
@@ -1489,8 +1568,8 @@ func TestActPromoteDoesNotClaimRoutingAfterLosingTheLease(t *testing.T) {
 		},
 		base:   "pg",
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		dcs:    &fakeDCS{leader: false}, // the lease lapsed while pg_ctl was still promoting
-		mech:   &rewindStubMech{},       // Promote succeeds
+		dcs:    &fakeDCS{leaderSeq: []bool{true, false}}, // held at the pre-promote check, lapsed during pg_ctl promote
+		mech:   &rewindStubMech{},                        // Promote succeeds
 		prober: &pg.Prober{Exec: &slotExec{}, Timeout: time.Second},
 		sup:    process.NewSupervisor(&fakePostmaster{running: true}),
 		kube:   k8s.NewWithClient(cs, "ns"),
@@ -1541,6 +1620,7 @@ func newSlotTestAgent(t *testing.T, ex *slotExec, mech string) *agent {
 		},
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		kube:   k8s.NewWithClient(cs, "ns"),
+		dcs:    &fakeDCS{leader: true}, // slot tests act as the holder; a lease-loss case overrides this (#298 review)
 		prober: &pg.Prober{Exec: ex, Timeout: time.Second},
 		metr:   observe.New(),
 	}

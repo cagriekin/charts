@@ -170,10 +170,28 @@ func TestRunIntentRestartStopsAndStarts(t *testing.T) {
 	}
 }
 
+// #298 review: the pause is re-asserted at DEQUEUE time. The handler verified it before Submit,
+// but the intent outlives the caller's deadline -- a restore accepted while act() sat inside a
+// multi-hour clone, timed out at the client, and the operator resumed the cluster; hours later the
+// dequeued stop took down the serving primary for a restore nobody was still running.
+func TestRunIntentStopRefusesOnceTheClusterIsNoLongerPaused(t *testing.T) {
+	pm := &fakePostmaster{running: true}
+	a := newIntentAgent(t, pm)
+	a.lastMarkerOK, a.lastMarker.Paused = true, false
+	err := a.runIntent(context.Background(), intentRequest{kind: control.IntentStop})
+	if err == nil || !strings.Contains(err.Error(), "no longer paused") {
+		t.Fatalf("expected a refusal naming the lifted pause, got %v", err)
+	}
+	if pm.stopped {
+		t.Error("the postmaster must not be stopped when the pause is gone")
+	}
+}
+
 // The restore precondition: stop and stay stopped.
 func TestRunIntentStopLeavesPostgresDown(t *testing.T) {
 	pm := &fakePostmaster{running: true}
 	a := newIntentAgent(t, pm)
+	a.lastMarkerOK, a.lastMarker.Paused = true, true // the stop re-asserts the pause at dequeue (#298 review)
 	if err := a.runIntent(context.Background(), intentRequest{kind: control.IntentStop}); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
@@ -403,6 +421,7 @@ func TestDropRestoreRecordToleratesAMissingFile(t *testing.T) {
 func TestRunIntentStopIsBoundedByTheRequestDeadline(t *testing.T) {
 	pm := &fakePostmaster{running: true, stopErr: context.DeadlineExceeded}
 	a := newIntentAgent(t, pm)
+	a.lastMarkerOK, a.lastMarker.Paused = true, true // the stop re-asserts the pause at dequeue (#298 review)
 	req := intentRequest{kind: control.IntentStop, deadline: time.Now().Add(50 * time.Millisecond)}
 	err := a.runIntent(context.Background(), req)
 	if err == nil {
