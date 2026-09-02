@@ -144,11 +144,27 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 		// deadline. A restore requested while act() sat inside a multi-hour clone was
 		// accepted, timed out at the client with "no restore Job was created; retry", and
 		// the operator resumed the cluster -- then, hours later, this dequeued and gracefully
-		// stopped the now-serving primary for a restore nobody was still running. The loop's
-		// own last successful marker read is the cheapest honest answer here; if it says the
+		// stopped the now-serving primary for a restore nobody was still running. If the
 		// cluster is not paused, the reconcile loop would restart the postmaster on its next
 		// tick anyway, so stopping it buys nothing but an outage.
-		if !a.lastMarkerOK || !a.lastMarker.Paused {
+		//
+		// Read the marker FRESH here rather than trusting the loop's cached a.lastMarker
+		// (#339). a.lastMarker is only refreshed by observe() once per reconcile tick, but
+		// the documented runbook -- and the KinD suite -- pauses and IMMEDIATELY requests the
+		// restore: with no tick in between, a.lastMarker still reads unpaused and the stop is
+		// refused on a correctly-paused cluster, a race against ReconcileInterval that made
+		// POST /v1/restore intermittently 500. The handler already read the marker fresh
+		// before Submit; this second line of defense must be at least as current or it
+		// manufactures the very false negative it exists to prevent. observe() is the only
+		// writer of a.lastMarker (see below), so this reads into a local instead of touching
+		// it. A read error fails closed -- refuse rather than stop on an unconfirmed pause.
+		mctx, mcancel := context.WithTimeout(stopCtx, a.fenceBudget())
+		m, err := a.kube.ReadMarker(mctx, a.cfg.MarkerName)
+		mcancel()
+		if err != nil {
+			return fmt.Errorf("refusing to stop postgres for a restore: could not confirm the cluster is paused: %w", err)
+		}
+		if !m.Paused {
 			return fmt.Errorf("refusing to stop postgres for a restore: the cluster is no longer paused (the request outlived its pause); pause again and re-request")
 		}
 		if err := a.sup.Demote(stopCtx, false); err != nil {

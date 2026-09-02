@@ -142,11 +142,16 @@ func TestIntentBudgetScalesWithReconcileInterval(t *testing.T) {
 func newIntentAgent(t *testing.T, pm *fakePostmaster) *agent {
 	t.Helper()
 	return &agent{
-		cfg: &config.Config{PGDATA: t.TempDir(), PodName: "pg-0"},
+		cfg: &config.Config{PGDATA: t.TempDir(), PodName: "pg-0", MarkerName: "pg-primary"},
 		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		// A non-leader DCS, because runIntent's destructive verbs re-check holdership under
 		// opMu (#298 review) -- see TestRunIntentReinitializeRefusesOnceThisNodeIsPrimary.
-		dcs:     &fakeDCS{},
+		dcs: &fakeDCS{},
+		// A real k8s client over a fake clientset: IntentStop now re-reads the pause marker
+		// FRESH (#339), so it needs a working kube. An absent marker ConfigMap reads as
+		// Present:false / Paused:false, which is the correct "not paused" for tests that
+		// never create one.
+		kube:    k8s.NewWithClient(k8sfake.NewSimpleClientset(), "ns"),
 		sup:     process.NewSupervisor(pm),
 		metr:    observe.New(),
 		intents: make(chan intentRequest, 1),
@@ -177,7 +182,7 @@ func TestRunIntentRestartStopsAndStarts(t *testing.T) {
 func TestRunIntentStopRefusesOnceTheClusterIsNoLongerPaused(t *testing.T) {
 	pm := &fakePostmaster{running: true}
 	a := newIntentAgent(t, pm)
-	a.lastMarkerOK, a.lastMarker.Paused = true, false
+	// No paused marker written: the fresh re-read (#339) sees an unpaused cluster.
 	err := a.runIntent(context.Background(), intentRequest{kind: control.IntentStop})
 	if err == nil || !strings.Contains(err.Error(), "no longer paused") {
 		t.Fatalf("expected a refusal naming the lifted pause, got %v", err)
@@ -191,8 +196,16 @@ func TestRunIntentStopRefusesOnceTheClusterIsNoLongerPaused(t *testing.T) {
 func TestRunIntentStopLeavesPostgresDown(t *testing.T) {
 	pm := &fakePostmaster{running: true}
 	a := newIntentAgent(t, pm)
-	a.lastMarkerOK, a.lastMarker.Paused = true, true // the stop re-asserts the pause at dequeue (#298 review)
-	if err := a.runIntent(context.Background(), intentRequest{kind: control.IntentStop}); err != nil {
+	// The stop re-asserts the pause at dequeue with a FRESH read (#298 review, #339), so the
+	// paused state must live in the marker, not just a.lastMarker.
+	ctx := context.Background()
+	if err := a.kube.WriteMarker(ctx, a.cfg.MarkerName, "pg-0", 1); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+	if err := a.kube.SetPause(ctx, a.cfg.MarkerName, true, "dba"); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	if err := a.runIntent(ctx, intentRequest{kind: control.IntentStop}); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
 	if !pm.stopped {
@@ -200,6 +213,31 @@ func TestRunIntentStopLeavesPostgresDown(t *testing.T) {
 	}
 	if pm.started {
 		t.Error("stop must NOT start it again: the caller is about to restore over this data directory")
+	}
+}
+
+// #339 regression: the pause re-assertion must read the marker FRESH, not the reconcile
+// loop's cached a.lastMarker. The documented runbook pauses and IMMEDIATELY requests the
+// restore, so with no reconcile tick in between a.lastMarker still reads unpaused -- and the
+// stop was refused on a correctly-paused cluster, making POST /v1/restore intermittently 500.
+func TestRunIntentStopReadsThePauseFreshNotTheLoopCache(t *testing.T) {
+	pm := &fakePostmaster{running: true}
+	a := newIntentAgent(t, pm)
+	// The loop's cache is STALE: it last saw the cluster unpaused.
+	a.lastMarkerOK, a.lastMarker.Paused = true, false
+	// The operator has just paused it; the marker is fresh even though the loop has not ticked.
+	ctx := context.Background()
+	if err := a.kube.WriteMarker(ctx, a.cfg.MarkerName, "pg-0", 1); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+	if err := a.kube.SetPause(ctx, a.cfg.MarkerName, true, "dba"); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	if err := a.runIntent(ctx, intentRequest{kind: control.IntentStop}); err != nil {
+		t.Fatalf("stop must proceed on a freshly-paused cluster despite a stale loop cache: %v", err)
+	}
+	if !pm.stopped {
+		t.Error("postgres should be stopped when the fresh marker reports paused")
 	}
 }
 
@@ -421,7 +459,14 @@ func TestDropRestoreRecordToleratesAMissingFile(t *testing.T) {
 func TestRunIntentStopIsBoundedByTheRequestDeadline(t *testing.T) {
 	pm := &fakePostmaster{running: true, stopErr: context.DeadlineExceeded}
 	a := newIntentAgent(t, pm)
-	a.lastMarkerOK, a.lastMarker.Paused = true, true // the stop re-asserts the pause at dequeue (#298 review)
+	// The stop re-asserts the pause at dequeue with a FRESH read (#298 review, #339).
+	ctx := context.Background()
+	if err := a.kube.WriteMarker(ctx, a.cfg.MarkerName, "pg-0", 1); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+	if err := a.kube.SetPause(ctx, a.cfg.MarkerName, true, "dba"); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
 	req := intentRequest{kind: control.IntentStop, deadline: time.Now().Add(50 * time.Millisecond)}
 	err := a.runIntent(context.Background(), req)
 	if err == nil {

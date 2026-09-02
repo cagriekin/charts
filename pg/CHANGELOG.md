@@ -1,5 +1,21 @@
 # pg chart changelog
 
+## 2.0.1 - unreleased
+
+### Fixed
+
+- **`POST /v1/restore` no longer intermittently returns 500 on a just-paused cluster (#339).**
+  Before stopping the postmaster, the agent re-asserts the pause a second time inside the
+  reconcile goroutine (a restore intent deliberately outlives its caller, so a resumed cluster
+  must not be stopped hours later). That re-assert read the loop's CACHED marker
+  (`a.lastMarker`, refreshed only once per reconcile tick) instead of a fresh one -- but the
+  break-glass runbook, and the KinD suite, pause and then IMMEDIATELY request the restore. With
+  no tick in between, the cached marker still read unpaused, so the stop was refused with "the
+  cluster is no longer paused", surfacing to the operator as a 500 with no restore Job created.
+  It now re-reads the marker fresh, exactly as the HTTP handler already does before submitting
+  the intent, so the guard still catches a genuinely lifted pause without rejecting a correctly
+  paused one. Ships in the pg-ha image at 2.0.1.
+
 ## 2.0.0 - 2026-09-02
 
 The failover agent is now the only HA mechanism. repmgrd, the repmgr CLI mechanism and their
