@@ -142,7 +142,14 @@ func TestIntentBudgetScalesWithReconcileInterval(t *testing.T) {
 func newIntentAgent(t *testing.T, pm *fakePostmaster) *agent {
 	t.Helper()
 	return &agent{
-		cfg: &config.Config{PGDATA: t.TempDir(), PodName: "pg-0", MarkerName: "pg-primary"},
+		// Realistic lease timings so fenceBudget() (LeaseDuration-RenewDeadline, floored to
+		// RetryPeriod) is POSITIVE: IntentStop's fresh ReadMarker (#339) runs under that
+		// budget, and a zero here would hand it an already-expired context -- masked today
+		// only because the fake clientset ignores deadlines.
+		cfg: &config.Config{
+			PGDATA: t.TempDir(), PodName: "pg-0", MarkerName: "pg-primary",
+			LeaseDuration: 15 * time.Second, RenewDeadline: 10 * time.Second, RetryPeriod: 2 * time.Second,
+		},
 		log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		// A non-leader DCS, because runIntent's destructive verbs re-check holdership under
 		// opMu (#298 review) -- see TestRunIntentReinitializeRefusesOnceThisNodeIsPrimary.
