@@ -229,6 +229,10 @@ func TestRedactConninfo(t *testing.T) {
 	cases := []struct{ name, in, want string }{
 		{"bare", "host=pg-0 password=s3cr3t user=repmgr", "host=pg-0 password=[redacted] user=repmgr"},
 		{"quoted with a space", "host=pg-0 password='two words' user=repmgr", "host=pg-0 password=[redacted] user=repmgr"},
+		// libpq escapes a single quote inside a quoted value with a backslash (\'), not by
+		// doubling it. The whole password must be consumed to its real closing quote; an
+		// earlier pattern stopped at the escaped quote and leaked the tail (#298 review).
+		{"quoted with an escaped quote", `host=pg-0 password='se\'cret' user=repmgr`, "host=pg-0 password=[redacted] user=repmgr"},
 		{"spaced keyword", "host=pg-0 password = s3cr3t", "host=pg-0 password=[redacted]"},
 		{"upper case", "PASSWORD=s3cr3t host=pg-0", "password=[redacted] host=pg-0"},
 		{"trailing", "host=pg-0 password=s3cr3t", "host=pg-0 password=[redacted]"},

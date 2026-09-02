@@ -687,6 +687,14 @@
 
 ### Fixed
 
+- **The conninfo redaction now handles libpq'"'"'s backslash-escaped quote (#298 review).**
+  `RedactConninfo` matched a quoted value with the GUC `''` doubling rule, but the string it
+  receives is the inner libpq conninfo (the outer GUC quotes are already un-doubled by
+  `PrimaryConninfoValue`), and libpq escapes a quote inside a quoted value with `\'`, not `''`.
+  A `password='...\'...'` therefore matched only up to the escaped quote and printed the tail
+  verbatim -- the partial credential leak the redaction exists to prevent. The common unquoted
+  and spaced cases are unchanged.
+
 - **Five holdership/precondition races closed on stale samples (#298 review).** `HoldLease` and
   the control-API preconditions are sampled once at the top of a reconcile tick or on the HTTP
   goroutine, and the work that acts on them runs seconds to minutes later:

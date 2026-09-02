@@ -18,7 +18,14 @@ import (
 // before the `p` is a word character, so there is no boundary) -- so the earlier pattern
 // skipped it entirely and the migration log lines printed that credential verbatim. `passfile`
 // is deliberately NOT here: it names a path, not a secret.
-var conninfoPasswordRe = regexp.MustCompile(`(?i)\b(ssl)?password[ \t]*=[ \t]*('(?:[^']|'')*'?|[^ \t]*)`)
+//
+// The quoted value is consumed with libpq's OWN escaping rule -- a backslash escapes the next
+// character (`\'`, `\\`), not a doubled quote (#298 review). An earlier pattern treated
+// `\'` as an unescaped terminator, so for a password like `'se\'cret'` (which an operator's
+// hand-run `ALTER SYSTEM SET primary_conninfo` readily produces) it matched only `'se\'` and
+// left `cret'` in the log -- i.e. it leaked the tail of the very credential it exists to hide.
+// `\\.|[^'\\]` consumes an escaped pair whole, so the value runs to its real closing quote.
+var conninfoPasswordRe = regexp.MustCompile(`(?i)\b(ssl)?password[ \t]*=[ \t]*('(?:\\.|[^'\\])*'?|[^ \t]*)`)
 
 // RedactConninfo replaces any password in a libpq conninfo with a marker, so the value can be
 // logged (#298 review).
