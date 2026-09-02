@@ -63,26 +63,35 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 	kind := req.kind
 	// Only the stop is deadline-bounded. Start and Reload do not block on the child, and
 	// bounding them would add nothing but a way to fail.
-	stopCtx, cancelStop := parent, context.CancelFunc(func() {})
-	if !req.deadline.IsZero() {
-		// FLOORED, not used raw (#298 review). req.deadline is copied from the HTTP request
-		// context and the request deliberately stays queued after the caller gives up ("if
-		// ctx expires after the intent was accepted, the loop still performs it") -- so by
-		// the time the loop dequeues it, the deadline is routinely in the PAST. A past
-		// deadline makes context.WithDeadline return an already-cancelled context, and
-		// ChildPostmaster.Stop then takes its `case <-ctx.Done()` arm on the first select:
-		// SIGKILL immediately after the SIGINT, with zero grace. An operator POSTing
-		// /v1/node/restart while act() sits in a 60s pg_ctl promote therefore got a 504 and,
-		// a moment later, a SIGKILLed read-write primary forced into crash recovery -- on the
-		// restart they asked to be graceful. IntentStop likewise reported a failure nobody
-		// saw. The floor keeps the wedge bounded (which is all the deadline is for) while
-		// guaranteeing a real shutdown attempt.
+	// deriveStopCtx builds the graceful-shutdown window for a Demote.
+	//
+	// FLOORED, not used raw (#298 review). req.deadline is copied from the HTTP request
+	// context and the request deliberately stays queued after the caller gives up ("if
+	// ctx expires after the intent was accepted, the loop still performs it") -- so by
+	// the time the loop dequeues it, the deadline is routinely in the PAST. A past
+	// deadline makes context.WithDeadline return an already-cancelled context, and
+	// ChildPostmaster.Stop then takes its `case <-ctx.Done()` arm on the first select:
+	// SIGKILL immediately after the SIGINT, with zero grace. An operator POSTing
+	// /v1/node/restart while act() sits in a 60s pg_ctl promote therefore got a 504 and,
+	// a moment later, a SIGKILLed read-write primary forced into crash recovery -- on the
+	// restart they asked to be graceful. IntentStop likewise reported a failure nobody
+	// saw. The floor keeps the wedge bounded (which is all the deadline is for) while
+	// guaranteeing a real shutdown attempt.
+	//
+	// It is a closure, not a once-computed context, because IntentStop must re-derive it
+	// AFTER its fresh marker read (#339): the floor measures the graceful window from the
+	// moment the stop actually begins, so a slow apiserver read cannot eat into it.
+	deriveStopCtx := func() (context.Context, context.CancelFunc) {
+		if req.deadline.IsZero() {
+			return parent, func() {}
+		}
 		budget := time.Until(req.deadline)
 		if budget < minIntentStopBudget {
 			budget = minIntentStopBudget
 		}
-		stopCtx, cancelStop = context.WithTimeout(parent, budget)
+		return context.WithTimeout(parent, budget)
 	}
+	stopCtx, cancelStop := deriveStopCtx()
 	defer cancelStop()
 	switch kind {
 	case control.IntentReload:
@@ -158,7 +167,10 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 		// manufactures the very false negative it exists to prevent. observe() is the only
 		// writer of a.lastMarker (see below), so this reads into a local instead of touching
 		// it. A read error fails closed -- refuse rather than stop on an unconfirmed pause.
-		mctx, mcancel := context.WithTimeout(stopCtx, a.fenceBudget())
+		// Parented on `parent`, NOT stopCtx: the read gets its own bound (fenceBudget, the
+		// same budget observe() reads the marker under) and must not be truncated by a near
+		// stop deadline into a false "could not confirm" (#339 review).
+		mctx, mcancel := context.WithTimeout(parent, a.fenceBudget())
 		m, err := a.kube.ReadMarker(mctx, a.cfg.MarkerName)
 		mcancel()
 		if err != nil {
@@ -167,7 +179,11 @@ func (a *agent) runIntent(parent context.Context, req intentRequest) error {
 		if !m.Paused {
 			return fmt.Errorf("refusing to stop postgres for a restore: the cluster is no longer paused (the request outlived its pause); pause again and re-request")
 		}
-		if err := a.sup.Demote(stopCtx, false); err != nil {
+		// Derive the stop window AFTER the read so the read's latency cannot erode the
+		// minIntentStopBudget floor #298 guarantees (#339 review).
+		sctx, scancel := deriveStopCtx()
+		defer scancel()
+		if err := a.sup.Demote(sctx, false); err != nil {
 			return fmt.Errorf("stop postgres: %w", err)
 		}
 		a.log.Warn("control: stopped postgres for a restore")
