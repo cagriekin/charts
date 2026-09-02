@@ -2826,7 +2826,7 @@ func (a *agent) migrateForeignRecoveryConfig(ctx context.Context) error {
 			// SEED FIRST, pre-create second (#298 review). RemoveRecoveryConfig has already
 			// stripped auto.conf, so from here until the fragment is written this PGDATA has
 			// standby.signal and NO upstream anywhere. The pre-create below is bounded but not
-			// instant -- slotPrecreateAttempts x 15s plus the backoffs, ~36s worst case against
+			// instant -- slotPrecreateAttempts x 15s plus the backoffs, ~51s worst case against
 			// an unreachable upstream, which is exactly when it is slow -- and a crash in that
 			// window (OOM-kill, node reboot, the kubelet losing patience) is unrecoverable by
 			// this code path: the next boot's ForeignRecoveryConfig finds nothing, returns
