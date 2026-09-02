@@ -141,7 +141,11 @@ for chart in "${charts[@]}"; do
     # Vacuous-pass guard (#298 review): kubeconform validates what it is given, so an empty
     # render is "0 resources found ... Valid: 0" and exit ZERO. Require at least one resource,
     # so a chart or profile that renders nothing fails here instead of reporting a clean gate.
-    found=$(printf '%s' "${out}" | sed -nE 's/^Summary: ([0-9]+) resources found.*/\1/p' | head -1)
+    # `resources?` because kubeconform prints "1 resource found" (SINGULAR) for exactly one
+    # resource and "N resources found" for any other count -- a plural-only pattern left `found`
+    # empty on a one-resource profile and tripped the vacuous-pass FATAL below on a render that
+    # in fact validated a resource (#298 review).
+    found=$(printf '%s' "${out}" | sed -nE 's/^Summary: ([0-9]+) resources? found.*/\1/p' | head -1)
     if [ -z "${found}" ] || [ "${found}" -eq 0 ]; then
       echo "FATAL: kubeconform validated NO resources from ${chart} [${label}] (summary: ${found:-absent})." >&2
       echo "       A gate that examines nothing must fail, not pass. If this fixture is a LAYER" >&2
