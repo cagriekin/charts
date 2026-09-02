@@ -10,10 +10,18 @@ on:
   push:
     tags:
       - '[a-z]*-[0-9]*.[0-9]*.[0-9]*'
-      # Exclude the repmgr image tags (trixie-5.5.0-N): they match the chart
-      # glob above (the trailing [0-9]* consumes "-N") but are not chart releases
-      # -- they are handled by repmgr-image-publish.yaml.
+      # Exclude the HA image tags: they match the chart glob above but are not chart
+      # releases -- pg-ha-image-publish.yaml handles them.
+      #
+      #   trixie-5.5.0-N  -- the old scheme; the trailing [0-9]* consumes "-N"
+      #   pg-ha-X.Y.Z     -- the new scheme (#291). This one is NEW to the glob: the old
+      #                      image tags were pg-ha-<n> with no dots, so they never matched
+      #                      and only trixie-* needed excluding. Without this line, pushing
+      #                      pg-ha-2.0.0 fires BOTH workflows and this one resolves
+      #                      chart="pg-ha", failing with "Chart 'pg-ha' does not contain
+      #                      Chart.yaml" -- a red release run on every image publish.
       - '!trixie-*'
+      - '!pg-ha-*'
 
 concurrency:
   group: release-gh-pages

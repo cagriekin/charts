@@ -34,22 +34,71 @@ esac
 # unsuffixed image tag holds, so only this major resolves without a -pgNN suffix.
 DEFAULT_MAJOR="18"
 
-# Base repmgr tag as the chart ships it (same resolution the CI build step uses, so the
-# rewritten tag names an image that was actually built).
-BASE_TAG=$(awk '/^repmgr:/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' "$VALUES")
-[ -n "$BASE_TAG" ] || { echo "could not resolve repmgr image tag from ${VALUES}" >&2; exit 1; }
-BASE_TAG="${BASE_TAG%-pg[0-9]*}"   # tolerate a tree already switched to another major
-if [ "$MAJOR" = "$DEFAULT_MAJOR" ]; then
-  REPMGR_TAG="${BASE_TAG}"
-else
-  REPMGR_TAG="${BASE_TAG}-pg${MAJOR}"
-fi
+# The HA image coordinates as the chart ships them (same resolution the CI build step uses, so
+# the rewritten reference names an image that was actually built).
+#
+# Both accept EITHER block spelling: #291 renamed the block to `ha:` and keeps `repmgr:` working
+# as a values alias, so this tree can legitimately carry either. Anchoring on one is not a soft
+# failure -- the [ -n ] guards exit 1, which takes down every KinD leg before a suite runs.
+BASE_TAG=$(awk '/^(repmgr|ha):/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' "$VALUES")
+[ -n "$BASE_TAG" ] || { echo "could not resolve the HA image tag from ${VALUES} (looked for tag: under the ha:/repmgr: block)" >&2; exit 1; }
+
+# The REPOSITORY is read from the chart for the same reason as the tag (#291 review): #290
+# renames the image cagriekin/repmgr -> cagriekin/pg-ha in a two-step (publish, then bump the
+# pin), and every leftover scanner and render check below matches on the repository. Hardcoding
+# it meant step 2 ended in `FATAL: rendered StatefulSet does not use cagriekin/repmgr:...` --
+# a total KinD outage triggered by a one-line values bump, exactly the trap the tag alternation
+# was added to avoid.
+HA_REPO=$(awk '/^(repmgr|ha):/{r=1} r&&/^    repository:/{gsub(/"/,"",$2); print $2; exit}' "$VALUES")
+[ -n "$HA_REPO" ] || { echo "could not resolve the HA image repository from ${VALUES} (looked for repository: under the ha:/repmgr: block)" >&2; exit 1; }
+
+# Alternation for the leftover scanners: the two published names PLUS whatever the chart points
+# at now. The chart's own value has to be in here (#291 review): fixtures cross over one at a
+# time, so both published names must stay scannable -- but if ha.image.repository is ever
+# pointed at a private mirror or a fork, a hardcoded-only alternation matches NOTHING and the
+# scanners report "no leftovers" instead of failing. Silent green is the one outcome the
+# scanners exist to prevent, so the set is derived, not fixed.
+HA_REPO_RE="(cagriekin/repmgr|cagriekin/pg-ha|${HA_REPO})"
+
+# Two tag shapes are accepted, because #290 changed the scheme and the chart pin moves to it
+# only once the new image is actually published (the documented two-step: publish, then bump).
+# Handling both here means that bump needs no change to this script or to CI.
+#
+#   NEW (#290/#291):  <chart-version>-pg<major>   e.g. 2.0.0-pg18 -- substitute the major
+#   OLD:              trixie-<repmgr>-<n>[-pgNN]  unsuffixed meant the default major
+#
+# An earlier draft of this table said the new shape was `trixie-pg<major>-<n>`, which the case
+# arm below does NOT classify as new: it would fall to the legacy arm, where the `%-pg[0-9]*`
+# trim reduces it to bare `trixie` and CI would build `repo:trixie` / `repo:trixie-pg17`.
+# Nothing published uses that shape, so it was never live breakage -- but a table describing a
+# scheme the code rejects is exactly the desync the note below warns about.
+#
+# The new scheme is keyed on a LEADING
+# semver, which is what separates it from the old `trixie-<repmgr>-<n>[-pgNN]` -- both end in
+# -pg<digits>, so a trailing-suffix test would misclassify the legacy suffixed form. This
+# pattern is shared verbatim between .github/workflows/pg-test.yaml and
+# pg/tests/set-pg-major.sh: if they disagree, CI builds one major under the other's name and
+# every leg of the mismatched major passes while running the wrong server.
+case "$BASE_TAG" in
+  [0-9]*.[0-9]*.[0-9]*-pg[0-9]*)
+    # New scheme: rewrite the trailing major to the requested one.
+    REPMGR_TAG=$(printf '%s' "$BASE_TAG" | sed -E "s/-pg[0-9]+$/-pg${MAJOR}/")
+    ;;
+  *)
+    BASE_TAG="${BASE_TAG%-pg[0-9]*}"   # tolerate a tree already switched to another major
+    if [ "$MAJOR" = "$DEFAULT_MAJOR" ]; then
+      REPMGR_TAG="${BASE_TAG}"
+    else
+      REPMGR_TAG="${BASE_TAG}-pg${MAJOR}"
+    fi
+    ;;
+esac
 
 RENDER_SUITE="${SCRIPT_DIR}/test-template.sh"
 render_suite_before=$(cksum "$RENDER_SUITE")
 
 echo "=== set-pg-major: PostgreSQL ${MAJOR} ==="
-echo "  repmgr image tag : ${REPMGR_TAG}"
+echo "  HA image         : ${HA_REPO}:${REPMGR_TAG}"
 echo "  postgres image   : postgres:${PG_IMAGE_TAG}"
 
 grep -qxF "postgres:${PG_IMAGE_TAG}" "$BASE_IMAGES" || {
@@ -74,12 +123,12 @@ TARGETS=("$VALUES" "${FIXTURES[@]}" "${SUITES[@]}")
 # regression they guard ("... under PG18 + cagriekin/repmgr:trixie-5.5.0-11"), and
 # rewriting that history would make the comment claim something untrue.
 #
-# So are lines marked `set-pg-major: keep` -- a deliberate pin on an OLDER RELEASED image
-# (the migration suite's pre-agent "from" image, the TLS suite's repmgrd release). Those
-# tags are the test's subject, not an incidental reference: rewriting them to the chart's
-# own tag makes the migration suite upgrade an image to itself, silently deleting the
-# "adopt agent mode from a published image" coverage. See KEEP_PASS below for how a
-# non-default major, which has no older published image to migrate from, is handled.
+# Lines marked `set-pg-major: keep` are handled separately -- a deliberate pin on an OLDER
+# RELEASED image (today: test-migrate-native.sh's "from" image, the only one left in the tree).
+# Those tags are the test's SUBJECT, not an incidental reference: rewriting one to the chart's
+# own tag makes the migration suite upgrade an image to itself, silently deleting the "migrate
+# from a released 1.x cluster" coverage. They are normalized to <base>-pg<MAJOR> further down,
+# keeping the deliberate base and moving only the major suffix.
 KEEP_MARK='set-pg-major: keep'
 
 apply() {
@@ -106,12 +155,32 @@ apply "majorVersion" \
   '^([[:space:]]+)majorVersion: "[0-9]+"' \
   's/^([[:space:]]+)majorVersion: "[0-9]+"/\1majorVersion: "'"${MAJOR}"'"/'
 
-# repmgr image tags: repmgr.image.tag, etcd.bootstrapImage.tag, and the tags a few suites
+# HA image tags: repmgr.image.tag, etcd.bootstrapImage.tag, and the tags a few suites
 # pin inline (test-tls's repmgrd release, test-migrate-agent's "from" image -- which must
 # be the same major, or the migration would restart a PG17 PGDATA under a PG18 server).
-apply "repmgr image tag" \
-  'trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?' \
-  's/trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?/'"${REPMGR_TAG}"'/g'
+# Both tag schemes are matched in one alternation for the same reason the case statement
+# above accepts both: the chart pin crosses from cagriekin/repmgr:trixie-<repmgr>-<n> to
+# cagriekin/pg-ha:<chart-version>-pg<major> in a two-step (publish the image, then bump the
+# pin), and the fixtures cross over one at a time. A rule matching only the old shape would
+# hit `apply`'s FATAL the moment the last legacy tag left the tree -- and, worse, a rule
+# matching only the new shape would silently stop retargeting the fixtures still on the old
+# one, leaving a "PG17" leg running PG18 and reporting green.
+apply "HA image tag" \
+  '(trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?|[0-9]+\.[0-9]+\.[0-9]+-pg[0-9]+)' \
+  's/(trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?|[0-9]+\.[0-9]+\.[0-9]+-pg[0-9]+)/'"${REPMGR_TAG}"'/g'
+
+# HA image REPOSITORY. Eleven fixtures pin it explicitly, so the #290 rename is not a
+# one-line values bump unless they are retargeted too: the tag rule above would happily
+# rewrite them to <old-repo>:<new-scheme-tag> -- a coordinate that will never exist, since
+# cagriekin/repmgr is frozen at its last trixie- tag. The leftover scanner catches it, but
+# as a FATAL the operator then has to fix by hand; rewriting is the actual fix.
+# Uses HA_REPO_RE, not a hardcoded pair (#291 review): `apply` exits 1 when a rule matches
+# nothing, so a fork or mirror that has consistently retargeted values.yaml AND its fixtures
+# would otherwise hit "rule 'HA image repository' matched nothing" and take down every KinD
+# leg -- the same reason the scanners' alternation is derived rather than fixed.
+apply "HA image repository" \
+  "^([[:space:]]+)repository: ${HA_REPO_RE}[[:space:]]*\$" \
+  "s#^([[:space:]]+)repository: ${HA_REPO_RE}[[:space:]]*\$#\\1repository: ${HA_REPO}#"
 
 # postgres image tags (postgresql.image.tag + the TLS suite's client pod). Deliberately
 # broader than the tags in the tree today -- `postgres:17-trixie` (major-only) and the
@@ -121,40 +190,33 @@ apply "postgres image tag" \
   '[0-9]+(\.[0-9]+)?-(trixie|bookworm)' \
   's/[0-9]+(\.[0-9]+)?-(trixie|bookworm)/'"${PG_IMAGE_TAG}"'/g'
 
-# On the default major the keep-marked pins are left alone -- but a PREVIOUS non-default run
-# in this same tree will have rewritten them to a -pgNN tag, and this run skips them, so the
-# tree would be left half-switched with no other check looking at those lines. That only
-# happens when the tree is not a clean checkout, which is exactly when silence misleads.
-if [ "$MAJOR" = "$DEFAULT_MAJOR" ]; then
-  for f in "${TARGETS[@]}"; do
-    [ -f "$f" ] || continue
-    stale=$(grep "$KEEP_MARK" "$f" | grep -oE 'trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-pg[0-9]+' || true)
-    [ -z "$stale" ] && continue
-    echo "FATAL: $(basename "$f") has a '${KEEP_MARK}' pin left on ${stale} by an earlier non-default run" >&2
-    echo "       this tree is half-switched; restore it first: git checkout -- pg/values.yaml pg/tests" >&2
-    exit 1
-  done
-fi
-
-# A non-default major has no older PUBLISHED image to migrate from -- only the -pgNN build
-# CI just made exists -- so on those legs the keep-marked pins must move after all, or the
-# migration suite would start a PG18 server on a PG17 PGDATA and fail for the wrong reason.
-# Say so loudly: on this leg those suites no longer test "upgrade from an older release",
-# and the default-major leg is what preserves that coverage.
-if [ "$MAJOR" != "$DEFAULT_MAJOR" ]; then
-  keep_hits=0
-  for f in "${TARGETS[@]}"; do
-    [ -f "$f" ] || continue
-    n=$(grep -c "$KEEP_MARK" "$f" || true)
-    [ "$n" -gt 0 ] || continue
-    keep_hits=$((keep_hits + n))
-    sed -i -E "/${KEEP_MARK}/ s/trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+(-pg[0-9]+)?/${REPMGR_TAG}/g" "$f"
-    echo "  note: retargeted ${n} deliberate older-release pin(s) in $(basename "$f") to ${REPMGR_TAG}"
-  done
-  if [ "$keep_hits" -gt 0 ]; then
-    echo "  note: PG${MAJOR} has no older published image, so 'upgrade from an older release' is NOT covered on this leg (the PG${DEFAULT_MAJOR} legs cover it)"
-  fi
-fi
+# Keep-marked pins name a deliberate OLDER RELEASED image, and they are normalized to
+# <base>-pg<MAJOR> on EVERY major rather than being left alone or dragged to the chart's tag.
+#
+# Symmetric on purpose. Per-major publishing (#269) means every release from trixie-5.5.0-29
+# onward exists as -pg17 AND -pg18, so an older per-major image is available on both legs --
+# there is no major that needs special-casing for lack of one. The
+# old rule therefore destroyed the coverage it was protecting -- on a PG17 leg the migration
+# suite would have started from the freshly built repmgr-FREE image instead of a released
+# repmgr one, so its "install a 1.x cluster" phase was not a repmgr cluster at all.
+#
+# Normalizing keeps the BASE (the deliberate older release) and moves only the major suffix,
+# which is idempotent and round-trips cleanly, so no staleness FATAL is needed either. A
+# keep-marked pin on a base older than -29 would have no per-major build; there are none in the
+# tree, and one added later would fail its own suite loudly on the image pull.
+keep_hits=0
+for f in "${TARGETS[@]}"; do
+  [ -f "$f" ] || continue
+  n=$(grep -c "$KEEP_MARK" "$f" || true)
+  [ "$n" -gt 0 ] || continue
+  keep_hits=$((keep_hits + n))
+  # Both tag schemes, same alternation as every other rule here: the #290 pin move is a pending
+  # two-step, so a keep-marked pin can legitimately be on either shape. Matching only the legacy
+  # one would silently stop normalizing the moment the from-image moved -- and print
+  # "normalized" anyway, since keep_hits counts the LINE, not the substitution (#292 review).
+  sed -i -E "/${KEEP_MARK}/ s/(trixie-[0-9]+\.[0-9]+\.[0-9]+-[0-9]+|[0-9]+\.[0-9]+\.[0-9]+)(-pg[0-9]+)?/\1-pg${MAJOR}/g" "$f"
+done
+[ "$keep_hits" -gt 0 ] && echo "  deliberate older-release pins: ${keep_hits} normalized to -pg${MAJOR}"
 
 # Nothing may be left pointing at another major. The per-rule counters above only prove a
 # rule fired somewhere; these two checks prove no target still names a different image,
@@ -167,11 +229,11 @@ leftovers=""
 #    --image=...). Matched on the repository, so an unrecognised tag SHAPE cannot slip by.
 for f in "${SUITES[@]}"; do
   refs=$(grep -vE '^[[:space:]]*#' "$f" | grep -v "$KEEP_MARK" \
-    | grep -oE '(cagriekin/repmgr|postgres)[:=][A-Za-z0-9._-]+' || true)
+    | grep -oE "(${HA_REPO_RE}|postgres)[:=][A-Za-z0-9._-]+" || true)
   while IFS= read -r ref; do
     [ -n "$ref" ] || continue
     case "$ref" in
-      *"cagriekin/repmgr:${REPMGR_TAG}") continue ;;
+      *"${HA_REPO}:${REPMGR_TAG}") continue ;;
       *"postgres:${PG_IMAGE_TAG}") continue ;;
     esac
     leftovers="${leftovers}"$'\n'"  $(basename "$f"): ${ref}"
@@ -193,10 +255,10 @@ if command -v helm >/dev/null 2>&1; then
       # loop above.
       [ -n "$img" ] || continue
       case "$img" in
-        "cagriekin/repmgr:${REPMGR_TAG}"|"postgres:${PG_IMAGE_TAG}") continue ;;
+        "${HA_REPO}:${REPMGR_TAG}"|"postgres:${PG_IMAGE_TAG}") continue ;;
       esac
       leftovers="${leftovers}"$'\n'"  $(basename "$fx") renders: ${img}"
-    done <<<"$(grep -oE '(cagriekin/repmgr|postgres):[A-Za-z0-9._-]+' <<<"$out" | sort -u)"
+    done <<<"$(grep -oE "(${HA_REPO_RE}|postgres):[A-Za-z0-9._-]+" <<<"$out" | sort -u)"
   done
   [ -n "$skipped" ] && echo "  note: fixtures that do not render standalone were not image-checked:${skipped}"
 fi
@@ -219,8 +281,8 @@ fi
 # Prove the render followed, so a rule that matched the wrong thing cannot pass silently.
 if command -v helm >/dev/null 2>&1; then
   rendered=$(helm template verify "$CHART_DIR" --show-only templates/statefulset.yaml)
-  if ! grep -qF "cagriekin/repmgr:${REPMGR_TAG}" <<<"$rendered"; then
-    echo "FATAL: rendered StatefulSet does not use cagriekin/repmgr:${REPMGR_TAG}" >&2
+  if ! grep -qF "${HA_REPO}:${REPMGR_TAG}" <<<"$rendered"; then
+    echo "FATAL: rendered StatefulSet does not use ${HA_REPO}:${REPMGR_TAG}" >&2
     exit 1
   fi
   ext=$(helm template verify "$CHART_DIR" --set postgresql.extensions.enabled=true \
@@ -229,7 +291,7 @@ if command -v helm >/dev/null 2>&1; then
     echo "FATAL: rendered extension paths are not /usr/lib/postgresql/${MAJOR}/lib" >&2
     exit 1
   fi
-  echo "  verified: render uses cagriekin/repmgr:${REPMGR_TAG} and PG${MAJOR} extension paths"
+  echo "  verified: render uses ${HA_REPO}:${REPMGR_TAG} and PG${MAJOR} extension paths"
 else
   echo "  (helm not found: skipping the render verification)"
 fi

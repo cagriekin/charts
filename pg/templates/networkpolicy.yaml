@@ -1,3 +1,9 @@
+{{- /* Normalize FIRST (#291 review): this file reads .Values.ha transitively (pg.agentMode
+       and friends), and in a full `helm template` it only works by accident -- statefulset.yaml
+       sorts earlier and mutates .Values for every file after it. Rendering this template alone,
+       which helm-unittest does per-file, would read the raw ha: defaults and ignore the
+       repmgr.* alias entirely, so an alias-driven assertion here would pass vacuously. */ -}}
+{{- include "pg.normalizeValues" . -}}
 {{- if .Values.networkPolicy.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -56,6 +62,30 @@ default-deny CNI drops it and the helm hook fails the release.
               {{- include "pg.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: backup
 {{- end }}
+{{- if or .Values.postgresql.databases .Values.postgresql.roles }}
+{{- /*
+The #218 declarative databases/roles post-install/post-upgrade hook Job connects to
+5432 over the write Service, exactly like the monitoring-user Job above -- and was the
+one client component with no rule of its own (#298 review). Under
+networkPolicy.postgresql.allowExternal=false a default-deny CNI drops it, the Job spins
+its 60x5s pg_isready wait and exits non-zero, and helm install/upgrade FAILS on the hook,
+leaving the release in `failed` with no declared role or database created. The default
+allowExternal=true masked it behind the `podSelector: {}` rule below, which is why no
+suite caught it.
+*/}}
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: databases-roles
+{{- end }}
+{{- if .Values.postgresql.audit.enabled }}
+{{- /* Same shape, same failure: the #219 audit-extension hook Job psql's to the write
+       Service to CREATE EXTENSION pgaudit, and a failed hook fails the release. */}}
+        - podSelector:
+            matchLabels:
+              {{- include "pg.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: audit-extension
+{{- end }}
 {{- if .Values.networkPolicy.postgresql.allowExternal }}
         - podSelector: {}
 {{- end }}
@@ -106,26 +136,14 @@ apply time and silently restricted peer-shaped input to port 5432 (#136).
             matchLabels:
               {{- include "pg.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: postgresql
-{{- if .Values.pgpool.enabled }}
-{{- /*
-service-updater runs inside the postgresql pods and health-checks pgpool on
-its backend port (9999) every tick; NetworkPolicy matches the post-DNAT pod
-port, so without this egress rule the check times out and perpetually
-rollout-restarts the pgpool Deployment (#129).
-*/}}
-    - ports:
-        - port: {{ .Values.pgpool.service.port }}
-          protocol: TCP
-      to:
-        - podSelector:
-            matchLabels:
-              {{- include "pg.selectorLabels" . | nindent 14 }}
-              app.kubernetes.io/component: pgpool
-{{- end }}
+{{- /* No egress to pgpool: the postgresql pods do not connect to it. This rule existed
+       only for the service-updater's pgpool health check (#129), and that sidecar went
+       away with repmgrd (#286). Traffic flows the other way -- pgpool -> postgresql --
+       which the pgpool policy's egress and the ingress rule above already cover. */}}
 {{- /*
 443 covers HTTPS S3 endpoints and cloud API servers; 6443 covers the
-API server on kubeadm-style clusters (service-updater and lifecycle
-hooks run kubectl from these pods). NetworkPolicy matches the backend
+API server on kubeadm-style clusters (the agent's client-go and the
+lifecycle hooks reach it from these pods). NetworkPolicy matches the backend
 port after service translation, so the in-cluster kubernetes Service
 port 443 is not enough.
 */}}
@@ -143,13 +161,22 @@ port 443 is not enough.
 {{- end }}
 {{- if eq (include "pg.agentEtcdMode" .) "true" }}
 {{- /*
-The agent's etcd DCS client dials the (BYO/shared) etcd endpoints on the client
-port 2379. Endpoints are arbitrary external hosts, so this opens egress to 2379
-cluster-wide (the same unrestricted-port shape as the 443/6443 apiserver rule).
+The agent's etcd DCS client dials the etcd client port. Endpoints are arbitrary
+external hosts, so this opens egress to that port cluster-wide (the same
+unrestricted-port shape as the 443/6443 apiserver rule).
+
+The port is DERIVED, not the literal 2379 it used to be (#298 review). The bundled
+endpoint honours `etcd.clientPort` and a BYO endpoint carries its own port in the URL,
+so a non-default port left the agent's dial blocked by the CNI: no node ever wins the
+lease, the release comes up with no primary and no write-Service endpoint, and the only
+symptom is a connection timeout. pg.agentEtcdPorts reads the same two sources the
+StatefulSet builds ETCD_ENDPOINTS from, so the policy cannot disagree with what is dialed.
 */}}
     - ports:
-        - port: 2379
+{{- range (splitList "," (include "pg.agentEtcdPorts" .)) }}
+        - port: {{ . | int }}
           protocol: TCP
+{{- end }}
 {{- end }}
 {{- with .Values.networkPolicy.postgresql.extraEgress }}
     {{- toYaml . | nindent 4 }}

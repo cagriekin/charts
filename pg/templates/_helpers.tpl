@@ -19,7 +19,7 @@ clear hint instead of a confusing API rejection at apply / first scheduled run.
 Small default resources for the lightweight init containers (chown, cp, config-gen).
 Init containers without requests/limits make every pod Forbidden in ResourceQuota-
 enforced namespaces (#153). repmgr-init (the standby clone) is heavier and uses its own
-values-overridable repmgr.initContainerResources instead.
+values-overridable ha.initContainerResources instead.
 */}}
 {{- define "pg.initResources" -}}
 requests:
@@ -88,14 +88,33 @@ annotation consumers -- #128.)
 {{- end }}
 {{- end }}
 
-{{- /* repmgr image reference: repository:tag, with @digest appended when set so a
-       digest pin (supply-chain) overrides the mutable tag. */ -}}
-{{- define "pg.repmgrImage" -}}
-{{- printf "%s:%s" .Values.repmgr.image.repository .Values.repmgr.image.tag -}}
-{{- with .Values.repmgr.image.digest }}@{{ . }}{{- end -}}
+{{- /* HA image reference: repository:tag, with @digest appended when set so a digest pin
+       (supply-chain) overrides the mutable tag.
+       Named pg.haImage since #298's review; it was pg.repmgrImage, which had been a lie since
+       #290 renamed the image to cagriekin/pg-ha and #294 deleted repmgr from it -- the helper
+       resolves .Values.ha.image and always did. Renamed rather than left alone because this is
+       the one helper every workload's `image:` goes through, so a reader checking which image a
+       container runs met the wrong name first.
+
+       DELEGATES to pg.image rather than repeating its printf (#298 review). It had its own
+       `printf "%s:%s" repo tag` copy, which is precisely the code pg.image's own comment
+       documents as broken -- and being the helper EVERY HA workload's `image:` goes through
+       (postgresql, repmgr-init, the pgbackrest sidecar and bootstrap init, the restore Job,
+       the validation CronJob, and the CEL pin in the restore admission policy) made it the
+       worst place to carry the copy:
+         - `ha.image.tag: ` with no value -- what a values-file merge produces when someone
+           clears a key -- rendered `cagriekin/pg-ha:%!s(<nil>)`, a reference containerd
+           rejects as InvalidImageName, so every pod of the release fails to start;
+         - clearing the tag while keeping the documented `ha.image.digest` supply-chain pin
+           rendered `cagriekin/pg-ha:@sha256:...`, unparseable for the same reason.
+       pg.image refuses an empty repository, refuses "neither tag nor digest" (an implicit
+       :latest on a StatefulSet with existing data), and emits `repo@digest` for a
+       digest-only pin. Output is byte-identical for every input that worked before. */ -}}
+{{- define "pg.haImage" -}}
+{{- include "pg.image" .Values.ha.image -}}
 {{- end -}}
 
-{{- /* PG_MAJOR for every container that runs the repmgr image (#269). The image sets
+{{- /* PG_MAJOR for every container that runs the HA image (#269). The image sets
        this ENV itself from its build arg; declaring it here makes the CHART's claim
        authoritative instead, so a values file that asks for a major the image does not
        bundle fails loudly -- the entrypoint's require_pg_bindir and the agent's boot
@@ -104,9 +123,9 @@ annotation consumers -- #128.)
        unsuffixed PG18 tag) would run the wrong major silently. Repmgr mode only: in
        standalone mode the server is the official postgres image, which ignores it. */ -}}
 {{- define "pg.pgMajorEnv" -}}
-{{- if .Values.repmgr.enabled -}}
+{{- if .Values.ha.enabled -}}
 - name: PG_MAJOR
-  value: {{ required "repmgr.image.majorVersion is required" .Values.repmgr.image.majorVersion | quote }}
+  value: {{ required "ha.image.majorVersion is required" .Values.ha.image.majorVersion | quote }}
 {{- end -}}
 {{- end -}}
 
@@ -132,18 +151,40 @@ annotation consumers -- #128.)
        So: digest alone is a complete reference; tag alone is the ordinary case; both together
        is legal and means "resolve this digest, the tag is decoration"; neither is an error. */ -}}
 {{- define "pg.image" -}}
+{{- /* A non-string tag or digest is REFUSED, not coerced (#298 review). Two earlier rounds got
+       this wrong in opposite directions: `printf "%s:%s"` rendered Go's error verb
+       (`repo:%!s(float64=3.5)`), which at least failed loudly at the kubelet, and `| toString`
+       then made it silent and WRONG -- Go renders a float in canonical form, so `tag: 18.0`
+       becomes `repo:18` (a floating patch instead of the pin the operator wrote) and
+       `tag: 2.10` becomes `repo:2.1`, a different tag that may well exist. A render-clean
+       manifest deploying an image the values file never named is exactly the apply-time hazard
+       invariant 4 says to catch at render time, so fail here and say how to fix it. */ -}}
+{{- if and .tag (not (kindIs "string" .tag)) -}}
+{{- fail (printf "image tag %v for repository %v is a %s, not a string: an image tag is text, and an unquoted YAML scalar is a number -- `tag: 18.0` arrives here as 18 and `tag: 2.10` as 2.1, so the value printed above may ALREADY have lost digits, and rendering it would deploy a different image or none at all. Quote the tag you actually meant in the values file (tag: \"...\"); on the command line shell quotes are not enough (helm types `--set x.tag=18` as a number regardless) -- use --set-string." .tag (.repository | toString) (kindOf .tag)) -}}
+{{- end -}}
+{{- if and .digest (not (kindIs "string" .digest)) -}}
+{{- fail (printf "image digest %v for repository %v is a %s, not a string: quote it in the values file, or pass --set-string on the command line." .digest (.repository | toString) (kindOf .digest)) -}}
+{{- end -}}
 {{- if not .repository -}}
 {{- /* An empty repository renders ":tag" or "@sha256:..." -- unparseable, the same
        InvalidImageName class as the empty-tag case below (#320 review). */ -}}
 {{- fail "an image block has an empty repository, which renders an unparseable reference (\":tag\"). Set the repository, or leave the whole image block at its chart default." -}}
 {{- end -}}
 {{- if and (not .tag) (not .digest) -}}
-{{- fail (printf "image %q has neither a tag nor a digest, which would deploy an implicit :latest -- unpinned across pod restarts, and on a StatefulSet with existing data a future :latest can be a different PostgreSQL major that refuses to start on it. Set a tag or a digest." (.repository | default "<empty repository>")) -}}
+{{- fail (printf "image %q has neither a tag nor a digest, which would deploy an implicit :latest -- unpinned across pod restarts, and on a StatefulSet with existing data a future :latest can be a different PostgreSQL major that refuses to start on it. Set a tag or a digest." (.repository | default "<empty repository>" | toString)) -}}
 {{- end -}}
+{{- /* toString on the REPOSITORY, and only there: the tag and the digest are already known to
+       be strings (refused above), but %s on a non-string renders Go's error verb rather than
+       the value, and the repository is the one half no guard types -- `%s` on it would emit
+       `%!s(float64=1.37):tag`, a render-CLEAN manifest the kubelet then rejects as
+       InvalidImageName. Coerced rather than refused because, unlike a tag, a numeric
+       repository cannot silently name a DIFFERENT image that exists: the pre-#320
+       `{{ .repository }}` form printed it correctly and there is no canonical-form trap to
+       walk into. */ -}}
 {{- if .tag -}}
-{{- printf "%s:%s" .repository .tag -}}
+{{- printf "%s:%s" (.repository | toString) .tag -}}
 {{- else -}}
-{{- .repository -}}
+{{- .repository | toString -}}
 {{- end -}}
 {{- with .digest }}@{{ . }}{{- end -}}
 {{- end -}}
@@ -250,7 +291,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- /* Reserve the chart-internal identifiers UNCONDITIONALLY (even when repmgr / the
        monitoring user are currently disabled): a declared role colliding with one that a
        later `helm upgrade` enables would produce conflicting role management. */ -}}
-{{- $reserved := list "postgres" "template0" "template1" .Values.postgresql.username .Values.repmgr.username .Values.prometheusExporter.monitoringUser.username -}}
+{{- $reserved := list "postgres" "template0" "template1" .Values.postgresql.username .Values.ha.username .Values.prometheusExporter.monitoringUser.username -}}
 {{- /* Precompute the declared role names and the databases a grant may target (declared
        databases + the primary database) so memberOf/grant refs can be checked at render
        time -- they may reference an entry declared later in the list. */ -}}
@@ -306,40 +347,51 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
 {{- end -}}
 {{- end }}
 
-{{- /* True when the operator declared shared_preload_libraries in
-       postgresql.configuration (matched case-insensitively -- PostgreSQL GUC names are
-       case-insensitive, so a value under e.g. `Shared_Preload_Libraries` must still be
-       found or it would be silently dropped from the merge). */ -}}
-{{- define "pg.userSetSharedPreloadLibraries" -}}
-{{- range $k, $v := (.Values.postgresql.configuration | default dict) -}}
-  {{- if eq (lower ($k | toString)) "shared_preload_libraries" -}}true{{- end -}}
-{{- end -}}
-{{- end -}}
-
 {{- /* True when the chart -- not custom.conf -- owns shared_preload_libraries, i.e. the
        merged value is emitted from an authoritative conf.d file that sorts after
        custom.conf. That is the case whenever a library must be preserved across an
-       operator-declared value: repmgr (replication) and/or pgaudit (#219). In standalone
-       mode with audit off there is nothing to preserve, so the operator's value passes
-       through custom.conf untouched. */ -}}
+       operator-declared value. Since 2.0.0 that means pgaudit and nothing else (#219).
+       With audit off there is nothing to preserve, so the operator's value passes
+       through custom.conf untouched.
+       #298 review: the repmgr clause is GONE, not merely gated. It read
+       `ne mechanism "native"`, and mechanism can no longer be anything else at render
+       time -- `repmgr` survives in values.schema.json's enum ONLY so
+       pg.validateRemovedRepmgrdValues can reject it with a message naming the migration
+       instead of the schema failing first with a generic enum error. So the clause was
+       unreachable, and with it the whole repmgr-preload.conf block in
+       postgresql-configmap.yaml, whose guard was `and (not audit.enabled) (ownsPreload)`
+       -- which reduced to `not X and X`. Both deleted. Dead template branches in a
+       render-time-validated chart are worse than dead code: they read as coverage for a
+       mode that no longer exists, and the tests asserting the file is absent
+       (test-template.sh, audit_test.yaml) were passing vacuously.
+       pg.userSetSharedPreloadLibraries went with it (#298 review): that clause was its only
+       caller, so the helper was left defined and called by nothing -- the same "reads as
+       coverage for a mode that no longer exists" this paragraph argues against. */ -}}
 {{- define "pg.chartOwnsSharedPreloadLibraries" -}}
-{{- if or .Values.postgresql.audit.enabled (and .Values.repmgr.enabled (eq (include "pg.userSetSharedPreloadLibraries" .) "true")) -}}true{{- end -}}
+{{- if .Values.postgresql.audit.enabled -}}true{{- end -}}
 {{- end -}}
 
 {{- /* The authoritative shared_preload_libraries value. Rendered into a conf.d file that
        sorts after custom.conf under include_dir and therefore wins -- so it MUST
        reassemble the FULL list, not just the chart's own libraries.
-         - repmgr is kept whenever repmgr.enabled: replication and the repmgr GUCs depend
-           on the preload, and the repmgr image entrypoint writes
-           `shared_preload_libraries = 'repmgr'` into PGDATA/postgresql.conf, which any
-           conf.d value overrides. Dropping it disables failover (#262 review).
          - pgaudit is appended when audit.enabled (#219).
          - Libraries the operator declared in postgresql.configuration are merged in
            (comma-split, trimmed, de-duplicated) so the chart never silently drops a
            preload the operator asked for.
        Originally audit-only (pg.auditSharedPreloadLibraries); generalized because the
        audit-gated merge meant an operator-set value with audit OFF silently dropped
-       repmgr and broke HA failover. */ -}}
+       repmgr and broke HA failover -- back when repmgr existed.
+       #298 review: the `repmgr` prepend is DELETED, not gated. It was conditioned on
+       `ne mechanism "native"`, and no render can reach it: `repmgr` is accepted by
+       values.schema.json's enum only so pg.validateRemovedRepmgrdValues can reject it with
+       a message naming the migration. #288 had already narrowed it from `ha.enabled` to the
+       mechanism for the right reason -- these fragments load via conf.d's include_dir and
+       therefore OVERRIDE the entrypoint's own native gate, so a stray prepend would put
+       repmgr.so back on a cluster that has nothing to use it and, since #290 dropped the
+       package, could not start at all. With the mechanism axis gone the condition is simply
+       never true, so the line is removed rather than left to read as live protection.
+       A native release that still ASKS for repmgr is refused by
+       pg.validateNativePreloadRepmgr; that guard is the live one. */ -}}
 {{- define "pg.sharedPreloadLibraries" -}}
 {{- $libs := list -}}
 {{- $user := "" -}}
@@ -350,13 +402,12 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- $t := trim $l -}}
   {{- if and $t (not (has $t $libs)) -}}{{- $libs = append $libs $t -}}{{- end -}}
 {{- end -}}
-{{- if and .Values.repmgr.enabled (not (has "repmgr" $libs)) -}}{{- $libs = prepend $libs "repmgr" -}}{{- end -}}
 {{- if and .Values.postgresql.audit.enabled (not (has "pgaudit" $libs)) -}}{{- $libs = append $libs "pgaudit" -}}{{- end -}}
 {{- join "," $libs -}}
 {{- end -}}
 
 {{- /* #219: validate postgresql.audit. Guards: (g1) audit requires repmgr mode -- the
-       cagriekin/repmgr image bundles pgaudit; standalone uses the stock postgres image
+       cagriekin/pg-ha image bundles pgaudit; standalone uses the stock postgres image
        (no pgaudit) and a bare shared_preload_libraries=pgaudit would crash-loop the
        postmaster. (g2) log must be non-empty and every class in the allowlist (negatable
        with a leading -). (g3) role, if set, must be a valid identifier. Class + role
@@ -364,8 +415,8 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        GUC in pgaudit.conf. */ -}}
 {{- define "pg.validateAudit" -}}
 {{- if .Values.postgresql.audit.enabled -}}
-  {{- if not .Values.repmgr.enabled -}}
-    {{- fail "postgresql.audit.enabled requires repmgr.enabled=true: audit logging needs the cagriekin/repmgr image, which bundles pgaudit. Standalone mode uses the stock postgres image (no pgaudit) and would fail to start on shared_preload_libraries. To audit in standalone mode, build a postgresql.image that ships pgaudit." -}}
+  {{- if not .Values.ha.enabled -}}
+    {{- fail "postgresql.audit.enabled requires ha.enabled=true: audit logging needs the HA image (ha.image), which bundles pgaudit. Standalone mode uses the stock postgres image (no pgaudit) and would fail to start on shared_preload_libraries. To audit in standalone mode, build a postgresql.image that ships pgaudit." -}}
   {{- end -}}
   {{- $allowed := list "read" "write" "function" "role" "ddl" "misc" "misc_set" "all" -}}
   {{- $log := .Values.postgresql.audit.log | default "" | toString -}}
@@ -425,8 +476,8 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        needed for the standard multi-arch option syntax, e.g. `[arch=amd64,arm64]`).
        name is rendered as `pgchart-<name>-keyring.gpg` / `pgchart-<name>.list`, not the
        bare name, so it can never collide with a source the image itself already owns
-       (the repmgr image's own PGDG source is postgresql-keyring.gpg/postgresql.list,
-       images/repmgr/Dockerfile) -- duplicate *entries* within aptSources itself still
+       (the HA image's own PGDG source is postgresql-keyring.gpg/postgresql.list,
+       images/pg-ha/Dockerfile) -- duplicate *entries* within aptSources itself still
        fail, since that's always a typo, never intentional. Pointless (and therefore
        rejected) without postgresql.extensions.packages: aptSources' only consumer is
        the apt-get install step gated on packages being non-empty -- see
@@ -477,7 +528,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
       {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine: %q sets an apt option that weakens or disables signature verification (trusted=/allow-insecure=/allow-weak=/allow-downgrade-to-insecure=) -- this makes the curl/gpg key-verification step above decorative and installs unsigned or weakly-signed packages as root; sign the source properly with signed-by= instead" $name $substituted) -}}
     {{- end -}}
     {{- /* #320: a PGDG source here is always fatal, and the failure gives no hint why.
-           Both postgres:*-trixie and the repmgr image already configure
+           Both postgres:*-trixie and the HA image already configure
            apt.postgresql.org under their OWN keyring path, and this chart derives its
            keyring path from the entry name (pgchart-<name>-keyring.gpg) with no way to
            override it -- so apt sees two entries for the same repo with different
@@ -501,7 +552,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
            does not carry that suite at all. The dist is the token after the URL; require it
            to END in -pgdg. */ -}}
     {{- if regexMatch "(?i)://([^/ ]*@)?apt\\.postgresql\\.org([:/][^ ]*)? +[a-z0-9.]+-pgdg( |$)" $substituted -}}
-      {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine points at apt.postgresql.org (%q). Remove this entry: both the repmgr image and postgres:*-trixie already configure PGDG under their own keyring path, and adding a second entry for the same repo under this chart's keyring path makes apt reject the whole source list (\"E: Conflicting values set for option Signed-By regarding source http://apt.postgresql.org/pub/repos/apt/ ...\"), so the install fails before it starts. PGDG packages in postgresql.extensions.packages resolve from the image's own configuration -- aptSources is only for sources the images do NOT ship, e.g. repo.pigsty.io" $name $substituted) -}}
+      {{- fail (printf "postgresql.extensions.aptSources[%s].aptLine points at apt.postgresql.org (%q). Remove this entry: both the HA image and postgres:*-trixie already configure PGDG under their own keyring path, and adding a second entry for the same repo under this chart's keyring path makes apt reject the whole source list (\"E: Conflicting values set for option Signed-By regarding source http://apt.postgresql.org/pub/repos/apt/ ...\"), so the install fails before it starts. PGDG packages in postgresql.extensions.packages resolve from the image's own configuration -- aptSources is only for sources the images do NOT ship, e.g. repo.pigsty.io" $name $substituted) -}}
     {{- end -}}
     {{- $expectSignedBy := printf "signed-by=/usr/share/keyrings/pgchart-%s-keyring.gpg" $name -}}
     {{- if not (contains $expectSignedBy $substituted) -}}
@@ -526,7 +577,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        search order, and confirmed-empirically neither carries a RUNPATH/RPATH, so
        without both halves of this fix the copied dependency is simply never found.
        Explicit and values-driven, not an automatic `ldd`-and-copy-everything walk:
-       copy-base-ext (repmgr image) and copy-ext (postgresql.image) can be different
+       copy-base-ext (HA image) and copy-ext (postgresql.image) can be different
        image builds, so blindly copying a resolved dependency's transitive closure risks
        silently shadowing the RUNNING container's own libc/libstdc++/etc. with a build
        from the OTHER image -- an ABI hazard, not a convenience. The denylist below
@@ -537,7 +588,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        unvalidated *.so* glob copy, which this validator has no visibility into.
 
        Denylist is `ldd /usr/lib/postgresql/<major>/bin/postgres` (verified live against
-       the debian:trixie-based postgres/repmgr images this chart ships by default) plus
+       the debian:trixie-based postgres/pg-ha images this chart ships by default) plus
        libpq (the dependency of libpqwalreceiver.so, the exact #302 ABI hazard) -- i.e.
        the full set of libraries the postmaster itself resolves, not just the historical
        libc family (review: an earlier, narrower list missed libzstd/liblz4/libxml2/
@@ -605,7 +656,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        itself -- a strict superset of the old match, so safe unconditionally -- but is
        NOT what makes a multiarch-path dependency like libsodium.so.23 work; extraLibs
        (above) plus LD_LIBRARY_PATH is. noClobber selects copy-ext's `cp -n` (#302): it
-       must never overwrite a lib copy-base-ext already placed from the repmgr image.
+       must never overwrite a lib copy-base-ext already placed from the HA image.
        curl is pinned to https (review): keyUrl's own character allowlist already
        forces the scheme, but -L would otherwise still follow a same-origin
        https->http redirect and silently fetch the key in plaintext. */ -}}
@@ -730,7 +781,17 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
     {{- fail "postgresql.extensions.env/envFrom/extraVolumes/extraVolumeMounts are set but postgresql.extensions.packages is empty. They configure the apt-get step (a proxy, a mirror sources.list), and with no packages there is no apt-get step -- the init containers take the plain-copy path and your proxy/mount would be silently ignored. Add at least one package, or remove these values." -}}
   {{- end -}}
 {{- end -}}
-{{- $reserved := list "data" "pg-run" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib" "repmgr-config" "etcd-tls" "agent-control-tls" "pgbackrest" "pgbackrest-config" "pgbackrest-bootstrap-script" "service-updater-script" -}}
+{{- /* Only names a render actually emits belong here (#298). Reserving one the chart does not
+       use is not free caution -- it refuses an operator a name nothing can collide with, under
+       a fail message citing "a chart-managed volume" that does not exist. */ -}}
+{{- /* "pgbackrest" is deliberately ABSENT (#298 review): it is the idle sidecar CONTAINER's
+       name (statefulset.yaml), and Kubernetes keeps container and volume names in separate
+       namespaces -- no render emits a VOLUME by that name. Listing it refused an operator a
+       name that collides with nothing, under a message naming a chart volume that does not
+       exist, and did so asymmetrically: postgresql.extraVolumes accepts it, and
+       pg.validatePgbackrestPassthrough -- which enumerates volumes across all four pgbackrest
+       pod templates -- omits it too. */ -}}
+{{- $reserved := list "data" "pg-run" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib" "etcd-tls" "agent-control-tls" "pgbackrest-config" "pgbackrest-bootstrap-script" -}}
 {{- /* postgresql.extraVolumes lands in the SAME pod volumes list (#320 review), so a name
        shared with it is a duplicate the API server rejects ("volumes[n].name: Duplicate
        value") -- the same apply-time-only failure class as the chart-volume collision
@@ -828,14 +889,15 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        freeform string (no schema enum), so nothing else catches
        syncReplicationSlots=true paired with an older major before it reaches a running
        cluster; fail at render time instead. Scoped to agent mode, matching the
-       postgresql-configmap.yaml/statefulset.yaml render condition -- the value is
-       already a no-op outside agent mode (see repmgr.agent.cascadingReplication for the
-       same pattern), so it should not block an unrelated repmgrd-mode/older-major
-       install that merely left the value set from a prior config. */}}
+       postgresql-configmap.yaml/statefulset.yaml render condition. That scoping is
+       vestigial since 2.0.0 -- #286 made the agent the only failover path, so
+       pg.agentMode is true whenever ha.enabled is -- but it is kept because it still
+       distinguishes a standalone (ha.enabled: false) install, which renders none of
+       this and must not be blocked by a leftover value. */}}
 {{- define "pg.validateSyncReplicationSlotsMajor" -}}
-{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
+{{- if and (eq (include "pg.agentMode" .) "true") .Values.ha.agent.syncReplicationSlots }}
 {{- if lt (atoi (toString .Values.postgresql.majorVersion)) 17 }}
-{{- fail (printf "repmgr.agent.syncReplicationSlots requires PostgreSQL 17+ (synchronized_standby_slots and the sync_replication_slots worker were introduced in 17), but postgresql.majorVersion=%q. Set postgresql.majorVersion to \"17\" or \"18\", or set repmgr.agent.syncReplicationSlots to false." (toString .Values.postgresql.majorVersion)) }}
+{{- fail (printf "ha.agent.syncReplicationSlots requires PostgreSQL 17+ (synchronized_standby_slots and the sync_replication_slots worker were introduced in 17), but postgresql.majorVersion=%q. Set postgresql.majorVersion to \"17\" or \"18\", or set ha.agent.syncReplicationSlots to false." (toString .Values.postgresql.majorVersion)) }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -847,12 +909,133 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        forever, so every standby logs a repeating "wal_level" error. Same agent-mode
        scoping as pg.validateSyncReplicationSlotsMajor. */}}
 {{- define "pg.validateSyncReplicationSlotsWalLevel" -}}
-{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
+{{- if and (eq (include "pg.agentMode" .) "true") .Values.ha.agent.syncReplicationSlots }}
 {{- if ne (.Values.postgresql.walLevel | default "replica") "logical" }}
-{{- fail (printf "repmgr.agent.syncReplicationSlots requires postgresql.walLevel: logical (the sync_replication_slots worker it enables on every standby fails its own startup validation below that, and PostgreSQL restarts it forever, logging the failure on a fixed interval), but postgresql.walLevel=%q. Set postgresql.walLevel to \"logical\", or set repmgr.agent.syncReplicationSlots to false." (.Values.postgresql.walLevel | default "replica")) }}
+{{- fail (printf "ha.agent.syncReplicationSlots requires postgresql.walLevel: logical (the sync_replication_slots worker it enables on every standby fails its own startup validation below that, and PostgreSQL restarts it forever, logging the failure on a fixed interval), but postgresql.walLevel=%q. Set postgresql.walLevel to \"logical\", or set ha.agent.syncReplicationSlots to false." (.Values.postgresql.walLevel | default "replica")) }}
 {{- end }}
 {{- end }}
 {{- end }}
+
+{{- /* #293: refuse `repmgr` in shared_preload_libraries under the native mechanism.
+
+       A native cluster has no repmgr extension, so the library is dead weight -- but it is
+       not merely wasteful, it is a scheduled outage. The chart stopped emitting it under
+       native in #288, so the only way it still gets there is an operator-declared
+       postgresql.configuration.shared_preload_libraries; and because that value reaches
+       the postmaster through conf.d's include_dir, it OVERRIDES the entrypoint's native
+       gate and puts the library back on a cluster that has nothing to use it. Benign only
+       while the package is still in the image: the moment #290/#294 drop repmgr.so, every
+       pod of that release refuses to start with `could not access file "repmgr"`, all at
+       once -- and helm rollback does not fix it, because by then the line has been cloned
+       into every data directory.
+
+       This is the guard that makes the #290 image swap safe to perform blind, which is why
+       it is a render-time fail rather than a warning (invariant 4). The agent removes the
+       line from an EXISTING data directory under native and refuses to boot when a
+       requested module is genuinely absent; this stops it being requested in the first
+       place. */ -}}
+{{- define "pg.validateNativePreloadRepmgr" -}}
+{{- if and (eq (include "pg.agentMode" .) "true") (eq ((.Values.ha.agent).mechanism | default "native") "native") }}
+{{- /* Match the way PostgreSQL resolves an entry, not the literal string: `repmgr`,
+       `repmgr.so`, `$libdir/repmgr` and an absolute path to repmgr.so all load the same
+       library, because PostgreSQL supplies `$libdir/` and `.so` itself when they are
+       absent. Comparing the bare name only let `$libdir/repmgr` slip past this guard, the
+       agent's strip AND the agent's absent-module refusal simultaneously -- delivering
+       exactly the crash-loop all three exist to prevent (#293 review). The agent's
+       preloadEntryNames applies the same normalisation, and the two must stay in step. */ -}}
+{{- $found := false }}
+{{- range $l := splitList "," (include "pg.sharedPreloadLibraries" .) }}
+  {{- /* Also unwrap DOUBLE quotes: PostgreSQL parses the list with SplitDirectoriesString,
+         which strips them, so `"repmgr"` loads repmgr (verified against a real postmaster).
+         The agent's preloadEntryNames does the same. */ -}}
+  {{- $n := trimSuffix ".so" (base (trimSuffix "\"" (trimPrefix "\"" (trim $l)))) }}
+  {{- if eq $n "repmgr" }}{{- $found = true }}{{- end }}
+{{- end }}
+{{- if $found }}
+{{- $user := "" }}
+{{- range $k, $v := (.Values.postgresql.configuration | default dict) }}
+  {{- if eq (lower ($k | toString)) "shared_preload_libraries" }}{{- $user = $v | toString }}{{- end }}
+{{- end }}
+{{- fail (printf "postgresql.configuration.shared_preload_libraries includes \"repmgr\" (got %q) but ha.agent.mechanism is \"native\": a native cluster has no repmgr extension, and this value loads via conf.d's include_dir so it OVERRIDES the image's native gate and preloads repmgr.so anyway. That makes the cluster unstartable (\"could not access file \\\"repmgr\\\"\") as soon as the repmgr-free image ships (#290/#293), on every pod at once, and helm rollback cannot fix it because the line is cloned into each data directory. Fix: drop \"repmgr\" from the list -- the chart adds nothing to it any more, so if repmgr was the only entry, omit the key entirely. There is no mechanism to switch back to: #294 removed the repmgr one." $user) }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- /* The three chart-managed role names must be DISTINCT (#298). Each is created by a
+       different component that assumes it owns the name, and every collision is silent at
+       render and destructive at runtime:
+
+        - ha.username colliding: the entrypoint's `CREATE USER` fails as "role already
+          exists" -- swallowed like every statement in that block -- so the replication role
+          keeps the other password while the bootstrap reports success and seals in its
+          sentinel. The agent authenticates as that role, so the pod is Running/NotReady for
+          good, recoverable only by deleting the PVC.
+        - monitoringUser.username colliding: monitoring-user-job.yaml runs `ALTER ROLE ...
+          WITH LOGIN PASSWORD` unconditionally, overwriting a working superuser or
+          replication password minutes after install.
+
+       Asymmetric on purpose: postgresql.username MAY be "postgres" (initdb creates it),
+       while for the other two "already exists" IS the failure. */ -}}
+{{- define "pg.validateRoleNames" -}}
+{{- $pgUser := .Values.postgresql.username | default "postgres" -}}
+{{- $haUser := .Values.ha.username | default "repmgr" -}}
+{{- /* The ha.* checks are HA-mode only (#298 review), for the same reason
+       pg.validateLeaseTimings is: standalone (ha.enabled=false) renders no REPMGR_* env,
+       no entrypoint CREATE USER for the replication role and no agent, so a leftover
+       ha.username there configures nothing and must not block the install -- a 1.x
+       standalone release with postgresql.username=repmgr rendered fine and must keep
+       doing so across the 2.0.0 upgrade. */ -}}
+{{- if .Values.ha.enabled -}}
+{{- /* Validate what statefulset.yaml EMITS, not the default (#298 review): REPMGR_USER
+       and REPMGR_DB carry the RAW values, so an explicitly empty (or whitespace, or
+       null) ha.username slipped past the defaulted comparisons below, rendered clean,
+       and then config.Load refused the empty env on every pod at once --
+       CrashLoopBackOff after a clean render. Same validate-the-default-but-emit-raw
+       divergence pg.haAgentDuration closed for the lease timings (#291 review). */ -}}
+{{- if or (not .Values.ha.username) (eq (trim (.Values.ha.username | toString)) "") -}}
+{{- fail (printf "ha.username is %q: statefulset.yaml emits this raw value as REPMGR_USER, and the agent's config loader treats an empty value as missing, so every postgresql pod crash-loops after a clean render. Fix: set ha.username to a non-empty role name (default \"repmgr\"), or drop the override to use the default." (.Values.ha.username | toString)) -}}
+{{- end -}}
+{{- if or (not .Values.ha.database) (eq (trim (.Values.ha.database | toString)) "") -}}
+{{- fail (printf "ha.database is %q: statefulset.yaml emits this raw value as REPMGR_DB, and the agent's config loader treats an empty value as missing, so every postgresql pod crash-loops after a clean render. Fix: set ha.database to a non-empty database name (default \"repmgr\"), or drop the override to use the default." (.Values.ha.database | toString)) -}}
+{{- end -}}
+{{- if eq $haUser $pgUser -}}
+{{- fail (printf "ha.username and postgresql.username are both %q: the replication role must be a role of its own. The entrypoint creates the superuser first, so the second CREATE USER fails as \"role already exists\" and the replication role silently keeps the superuser's password -- the HA agent then cannot authenticate for probes or pg_basebackup and every pod stays Running/NotReady, recoverable only by deleting the PVC. Fix: set ha.username to a distinct name (default \"repmgr\")." $haUser) -}}
+{{- end -}}
+{{- if eq $haUser "postgres" -}}
+{{- fail (printf "ha.username is %q, which is initdb's bootstrap superuser and therefore always already exists: the entrypoint's CREATE USER for the replication role fails, the role keeps the superuser's password, and the HA agent can never authenticate with REPMGR_PASSWORD. Fix: set ha.username to a distinct name (default \"repmgr\")." $haUser) -}}
+{{- end -}}
+{{- end -}}
+{{- /* Gated exactly as monitoring-user-job.yaml is: no Job, no ALTER ROLE, no collision.
+       The ha.username comparison additionally requires ha.enabled -- standalone has no
+       replication role for the monitoring name to collide with. */ -}}
+{{- if and (.Values.prometheusExporter).enabled (((.Values.prometheusExporter).monitoringUser).enabled) -}}
+{{- $monUser := ((.Values.prometheusExporter).monitoringUser).username | default "" -}}
+{{- $haCollides := and .Values.ha.enabled (eq $monUser $haUser) -}}
+{{- if and $monUser (or (eq $monUser $pgUser) $haCollides (eq $monUser "postgres")) -}}
+{{- fail (printf "prometheusExporter.monitoringUser.username is %q, which collides with %s: the monitoring-user hook Job runs `ALTER ROLE ... WITH LOGIN PASSWORD` unconditionally, so it would OVERWRITE that role's password minutes after install -- breaking superuser auth cluster-wide, or streaming replication on every standby at once. Fix: give the monitoring role a distinct name (default \"monitoring\"), or set prometheusExporter.monitoringUser.enabled=false to let the exporter use the superuser." $monUser (ternary (printf "postgresql.username (%q)" $pgUser) (ternary (printf "ha.username (%q)" $haUser) "initdb's bootstrap superuser \"postgres\"" $haCollides) (eq $monUser $pgUser))) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* #298 security review: postgresql.pgHba entries are inserted verbatim into the
+       standalone postStart hook -- into single-quoted shell (printf '%s' '<rule>' and
+       grep -qF '<rule>') and then into pg_hba.conf. A single quote closes that quoting and
+       a newline breaks the YAML block scalar, so a malformed rule renders clean and then
+       crash-loops the container (the kubelet kills the pod on the failing postStart) or
+       silently mangles the file. values.schema.json also forbids the quote, but the schema
+       is advisory (additionalProperties is open); this fail is the authoritative guard, in
+       the fail-at-render-not-apply convention. A pg_hba line never legitimately needs
+       either character. */ -}}
+{{- define "pg.validatePgHba" -}}
+{{- range $i, $rule := .Values.postgresql.pgHba -}}
+{{- if not (kindIs "string" $rule) -}}
+{{- fail (printf "postgresql.pgHba[%d] must be a string (one pg_hba.conf line), got %s" $i (kindOf $rule)) -}}
+{{- end -}}
+{{- if or (contains "'" $rule) (contains "\n" $rule) -}}
+{{- fail (printf "postgresql.pgHba[%d]=%q contains a single quote or newline. These entries are inserted verbatim into a shell postStart hook and into pg_hba.conf; a quote or newline corrupts the hook (crash-looping the pod) or mangles the file. Fix: write each rule as one plain line, e.g. \"host all all 10.0.0.0/8 scram-sha-256\"." $i $rule) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 
 {{- /* #262: validate the postgresql.extraVolumes / extraVolumeMounts / extraEnv
        passthrough. These are spliced verbatim into the pod spec, so without guards a
@@ -881,22 +1064,40 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
              would silently win over the chart/Secret value -- pointing the postmaster at
              the wrong data directory or breaking auth cluster-wide. */ -}}
 {{- define "pg.validateExtraPassthrough" -}}
-{{- $chartVolumes := list "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib" "repmgr-config" "etcd-tls" "pg-run" "pgbackrest-config" "service-updater-script" -}}
+{{- /* EVERY volume the postgresql pod can carry, not just the ones a default render emits
+       (#298) -- and reserved UNCONDITIONALLY, like $chartEnv below, so a passthrough that
+       works today cannot start colliding once a later upgrade enables the feature that
+       contributes the volume. Keep in step with pg.validatePgbackrestPassthrough. */ -}}
+{{- $chartVolumes := list
+      "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib"
+      "etcd-tls" "agent-control-tls" "pg-run" "pgbackrest-config"
+      "pgbackrest-bootstrap-script" -}}
 {{- /* Env vars the chart sets on the postgresql container (see statefulset.yaml). Reserved
        UNCONDITIONALLY -- including the ones only a currently-disabled feature emits -- so a
        passthrough that works today cannot start silently shadowing a chart value after a
-       later `helm upgrade` enables that feature. */ -}}
+       later `helm upgrade` enables that feature.
+       PG_MAJOR and the CONTROL_* block were missing until #298's review. PG_MAJOR is the
+       worst of them: extraEnv is appended AFTER the chart's block, last-wins, so
+       `postgresql.extraEnv: [{name: PG_MAJOR, value: "17"}]` rendered clean and pointed both
+       the entrypoint's require_pg_bindir and the agent's boot-time bindir check at a
+       PostgreSQL the image does not bundle -- exactly the silent shadowing (g5) exists to
+       catch. */ -}}
 {{- $chartEnv := list
       "PGDATA" "POSTGRES_USER" "POSTGRES_PASSWORD" "POSTGRES_DB"
       "REPMGR_USER" "REPMGR_PASSWORD" "REPMGR_DB" "REPMGR_NODE_COUNT" "HEADLESS_SERVICE"
       "NAMESPACE" "PRIMARY_MARKER" "POD_NAME" "POD_SELECTOR" "POD_CIDR" "MASTER_SERVICE"
       "LEASE_NAME" "LEASE_DURATION" "RENEW_DEADLINE" "RETRY_PERIOD" "RECONCILE_INTERVAL"
-      "CASCADE_REPLICATION" "SYNC_REPLICATION_SLOTS" "POSTGRESQL_PGHBA" "TLS_REQUIRE_SSL" "TLS_CLIENT_CERT_AUTH"
-      "MONITORING_USER" "MIGRATE_LEGACY_MD5_USERS" "SPLIT_BRAIN_ACTION"
+      "CASCADE_REPLICATION" "SYNC_REPLICATION_SLOTS" "MECHANISM" "POSTGRESQL_PGHBA"
+      "TLS_ENABLED" "TLS_REQUIRE_SSL" "TLS_CLIENT_CERT_AUTH"
+      "MONITORING_USER" "MIGRATE_LEGACY_MD5_USERS"
+      "PG_MAJOR"
+      "CONTROL_ENABLED" "CONTROL_ADDR" "CONTROL_TLS_CERT" "CONTROL_TLS_KEY" "CONTROL_TLS_CA"
+      "CONTROL_ALLOWED_CNS" "CONTROL_RESTORE_ENABLED" "CONTROL_RESTORE_ALLOWED_CNS"
+      "CONTROL_RESTORE_CRONJOB" "CONTROL_RESTORE_JOB_NAME" "CONTROL_RESTORE_POD_ORDINAL"
+      "CONTROL_RESTORE_READ_POD_LOGS"
       "DCS_BACKEND" "ETCD_ENDPOINTS" "ETCD_PREFIX" "ETCD_TLS_CERT" "ETCD_TLS_KEY" "ETCD_TLS_CA"
       "PGBACKREST_ENABLED" "PGBACKREST_STANZA" "PGBACKREST_REPO1_CIPHER_PASS"
-      "PGBACKREST_REPO1_S3_KEY" "PGBACKREST_REPO1_S3_KEY_SECRET" "MONITORING_HISTORY_DAYS"
-      "LD_LIBRARY_PATH" -}}
+      "PGBACKREST_REPO1_S3_KEY" "PGBACKREST_REPO1_S3_KEY_SECRET" "LD_LIBRARY_PATH" -}}
 {{- /* g1: shape. `with` is not used -- an explicitly-set map must reach the check. */ -}}
 {{- range $key := list "extraVolumes" "extraVolumeMounts" "extraEnv" -}}
   {{- $val := index $.Values.postgresql $key -}}
@@ -968,8 +1169,8 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        API server or, for `data`, silently discarded in favour of the volumeClaimTemplate. */ -}}
 {{- $chartVolumes := list
       "data" "postgresql-config" "postgresql-tls" "ext-lib" "ext-share" "ext-extra-lib"
-      "repmgr-config" "etcd-tls" "agent-control-tls" "pg-run" "pgbackrest-config"
-      "pgbackrest-bootstrap-script" "service-updater-script"
+      "etcd-tls" "agent-control-tls" "pg-run" "pgbackrest-config"
+      "pgbackrest-bootstrap-script"
       "tmp" "work" "restore-script" "validate-script" -}}
 {{- /* The two other operator-controlled lists that reach the SAME pod volumes list. A name
        shared with either is a duplicate the API server rejects at apply time
@@ -1135,20 +1336,35 @@ decides (http 80, anything else 443).
 {{- end -}}
 {{- end }}
 
-{{- define "pg.preStop" -}}
-preStop:
-  exec:
-    command:
-      - /bin/bash
-      - -c
-      - |
-        # Stop cleanly and let repmgrd on a standby own the failover:
-        # its promote_command (repmgr standby promote) updates
-        # repmgr.nodes metadata, which a raw SQL-level promotion issued
-        # from this hook cannot do -- the promoted node would keep
-        # type='standby', and every repmgrd then exits on the stale
-        # metadata instead of converging.
-        pg_ctl stop -D "$PGDATA" -m fast -w -t 30
+{{- /*
+pg.agentEtcdPorts: the client ports the agent's etcd DCS actually dials, comma-joined and
+deduplicated, for the NetworkPolicy egress rule (#298 review).
+
+The rule used to hardcode 2379 while the endpoint the StatefulSet builds honours
+`etcd.clientPort` -- and a BYO endpoint carries its own port in the URL. Set either to
+anything else and every agent's etcd dial is dropped by the CNI: no node ever wins the
+lease, the cluster comes up with no primary and no write-Service endpoint, and the only
+symptom is a connection timeout in the agent log. Derive the ports from the same two
+sources the endpoints come from so the policy cannot disagree with what is dialed.
+*/ -}}
+{{- define "pg.agentEtcdPorts" -}}
+{{- $ports := list -}}
+{{- $etcd := (.Values.ha).agent | default dict -}}
+{{- $endpoints := (($etcd.dcs).etcd).endpoints | default list -}}
+{{- if $endpoints -}}
+{{- range $endpoints -}}
+{{- $hostport := regexReplaceAll "^[a-zA-Z][a-zA-Z0-9+.-]*://" . "" -}}
+{{- $hostport = splitList "/" $hostport | first -}}
+{{- if regexMatch ":[0-9]+$" $hostport -}}
+{{- $ports = append $ports (splitList ":" $hostport | last | int) -}}
+{{- else -}}
+{{- $ports = append $ports 2379 -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- $ports = append $ports ((.Values.etcd).clientPort | default 2379 | int) -}}
+{{- end -}}
+{{- uniq $ports | join "," -}}
 {{- end }}
 
 {{- define "pg.exporterPodSpec" -}}
@@ -1313,8 +1529,8 @@ volumes:
       # files are owned root:root; the exporter runs as a non-root UID with no fsGroup,
       # so the previous 0400 left ca.crt unreadable (sslmode=verify-* scrapes failed with
       # "permission denied", pg_up=0). The exporter verifies the server cert with ca.crt
-      # only -- it needs neither tls.crt nor the server private key tls.key, so they are
-      # no longer mounted.
+      # only -- it needs neither tls.crt nor the server private key tls.key, so neither is
+      # mounted.
       items:
         - key: ca.crt
           path: ca.crt
@@ -1322,27 +1538,299 @@ volumes:
 {{- end }}
 {{- end }}
 
-{{/*
-Failover mode (repmgrd default | agent). Fails fast on an unknown value.
-*/}}
-{{- define "pg.failoverMode" -}}
-{{- $m := .Values.repmgr.failoverMode | default "repmgrd" -}}
-{{- if not (or (eq $m "repmgrd") (eq $m "agent")) -}}
-{{- fail (printf "repmgr.failoverMode must be 'repmgrd' or 'agent', got %q" $m) -}}
+{{- /*
+pg.validateHaImageGeneration -- refuse a 1.x HA image pin on a 2.0.0 chart (#298 review).
+
+Chart 2.0.0 and the HA image are versioned together and are NOT interchangeable across the
+major. The chart's repmgr-init container now passes only PG_MAJOR, because 2.x's
+`entrypoint.sh init` reads only that; a 1.x image's init mode execs init-repmgr.sh, which begins
+with ${HEADLESS_SERVICE:?} and ${REPMGR_PASSWORD:?} and so exits non-zero on the unset-variable
+expansion. The result is Init:CrashLoopBackOff on every pod at once -- the whole cluster down,
+after an upgrade helm accepted silently.
+
+That combination is reachable rather than hypothetical: ha.image keeps honouring the repmgr.*
+alias, and the 2.0.0 CHANGELOG says the frozen cagriekin/repmgr pins keep resolving -- true of
+the REGISTRY, but not of this chart. Nothing cross-checked the artifact's generation against the
+chart's expectations, which is exactly the apply-time failure invariant 4 says to convert into a
+render-time one.
+
+Detected on the 1.x tag SCHEME, `trixie-<repmgr-version>-<n>`, the only shape ever published for
+those images and one that cannot collide with the current `<chart-version>-pg<major>` scheme.
+Deliberately narrow: a private mirror with arbitrary tags is not second-guessed (nothing
+distinguishes a mirrored 2.x tag from anything else), and a digest pin is not inspected either.
+This catches the mistake an upgrade actually makes -- carrying the old values file forward.
+*/ -}}
+{{- define "pg.validateHaImageGeneration" -}}
+{{- if .Values.ha.enabled -}}
+{{- $tag := (.Values.ha.image).tag | default "" | toString -}}
+{{- /* The REPOSITORY is checked as well as the tag (#298 review), because the commonest
+       half-carried pin sets only the repository. `repmgr.image: {repository: cagriekin/repmgr,
+       pullPolicy: Always}` -- an air-gapped mirror path, or any 1.x values file that never
+       pinned a tag -- merges through the alias into ha.image.repository while ha.image.tag
+       stays at the 2.0.0 default, and the render was CLEAN: every workload came out as
+       `cagriekin/repmgr:2.0.0-pg18`, a coordinate that has never existed and never will
+       (cagriekin/repmgr is frozen at its last trixie- tag), so every pod goes ImagePullBackOff
+       after an upgrade helm accepted. With the bundled etcd it was worse: the only error was
+       pg.validateEtcdBootstrapImage saying "set etcd.rbac.bootstrapImage to the same values as
+       ha.image", and following that remediation pinned BOTH workloads to the missing image.
+       Matched on the repository's last path segment so a mirror (registry.internal/foo/repmgr)
+       is caught too; the escape hatch is the same one the tag check offers -- retag. */ -}}
+{{- $repo := (.Values.ha.image).repository | default "" | toString -}}
+{{- if regexMatch "(^|/)repmgr$" $repo -}}
+{{- fail (printf "ha.image.repository=%q is the 1.x image (cagriekin/repmgr), and chart 2.0.0 cannot run it: the repmgr-init container passes only PG_MAJOR, while a 1.x image's `entrypoint.sh init` runs init-repmgr.sh and hard-fails on the unset HEADLESS_SERVICE and REPMGR_PASSWORD -- every pod would go Init:CrashLoopBackOff at once. That registry is also frozen at its last `trixie-` tag, so leaving the repository behind while ha.image.tag moves to the 2.x scheme renders %s:%s, an image that does not exist, and every pod goes ImagePullBackOff instead. Pin the 2.x HA image: ha.image.repository=cagriekin/pg-ha and ha.image.tag=<chart-version>-pg<major> (e.g. 2.0.0-pg18, matching ha.image.majorVersion), and move etcd.rbac.bootstrapImage to the same reference. If you are pinning a private mirror of the 2.x image, name it something other than `.../repmgr`." $repo $repo ($tag | default "<unset>")) -}}
 {{- end -}}
-{{- $m -}}
+{{- if hasPrefix "trixie-" $tag -}}
+{{- fail (printf "ha.image.tag=%q is a 1.x image tag (the `trixie-<repmgr-version>-<n>` scheme), and chart 2.0.0 cannot run it: the repmgr-init container passes only PG_MAJOR, while a 1.x image's `entrypoint.sh init` runs init-repmgr.sh and hard-fails on the unset HEADLESS_SERVICE and REPMGR_PASSWORD -- every pod would go Init:CrashLoopBackOff at once. Pin the 2.x HA image instead: ha.image.repository=cagriekin/pg-ha and ha.image.tag=<chart-version>-pg<major> (e.g. 2.0.0-pg18, matching ha.image.majorVersion), and move etcd.rbac.bootstrapImage to the same reference. If you are pinning a private mirror of the 2.x image, retag it without the `trixie-` prefix." $tag) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+pg.validateEtcdBootstrapImage -- the bundled etcd's RBAC-bootstrap Job runs `pg-ha-agent
+rbac-bootstrap`, so it must run the SAME image as the database pods. pg/values.yaml pins
+etcd.rbac.bootstrapImage to match ha.image and its comment says to keep them in lockstep --
+but nothing enforced it, so the next image bump would silently reintroduce the drift this
+change fixed by hand (#291 review). Verified drift: setting ha.image to
+cagriekin/pg-ha:2.0.0-pg18 rendered the database pods on the new image and the bootstrap Job
+still on cagriekin/repmgr:trixie-5.5.0-33 -- one agent build writing the etcd RBAC that a
+different build then authenticates against.
+
+Only checked when the bundled etcd is enabled: with an external etcd the Job never renders and
+a stale pin there is inert. A mismatch fails rather than auto-following, because silently
+overriding a subchart value the operator set is worse than naming the two keys that disagree --
+and a legitimate BYO case (an air-gapped mirror holding only one of the two) has to be theirs
+to acknowledge, not the chart's to assume.
+*/ -}}
+{{- define "pg.validateEtcdBootstrapImage" -}}
+{{- if (.Values.etcd).enabled -}}
+{{- $ha := .Values.ha.image | default dict -}}
+{{- $boot := ((.Values.etcd).rbac).bootstrapImage | default dict -}}
+{{- /* The DIGEST is part of the reference (#298 review). Both dicts carry one, pg.haImage
+       renders it, and etcd/templates/rbac-bootstrap-job.yaml renders it too -- so comparing
+       repository:tag alone let the exact supply-chain pin the digest exists for slip through:
+       ha.image.digest set and etcd.rbac.bootstrapImage.digest left empty renders CLEAN while
+       the database pods run the pinned build and the bootstrap Job runs whatever the mutable
+       tag currently resolves to. That is precisely "one agent build writing the etcd RBAC that
+       a different build then authenticates against", reached through the guard rather than
+       around it. Same shape in reverse when only the bootstrap image is pinned. */ -}}
+{{- $haDigest := ($ha.digest | default "") | toString -}}
+{{- $bootDigest := ($boot.digest | default "") | toString -}}
+{{- /* A NON-STRING tag or digest is refused HERE, before the comparison, not left to pg.image
+       (#298 review). This guard renders from statefulset.yaml line 34, ahead of every
+       pg.image call, so coercing the halves and comparing anyway made an unquoted
+       `ha.image.tag: 2.0` come out as the mismatch message printing `cagriekin/pg-ha:2` -- a
+       coordinate no values file ever wrote -- and instructing the operator to copy it onto
+       etcd.rbac.bootstrapImage. That is the same wrong-remediation trap
+       pg.validateHaImageGeneration was added for: the operator obeys, pins BOTH workloads to a
+       tag that was never theirs, and only then meets pg.image's type refusal. Name the real
+       defect first. Sorted key order out of `dict` keeps the message deterministic. */ -}}
+{{- range $imgKey, $imgVal := dict "ha.image.tag" $ha.tag "ha.image.digest" $ha.digest "etcd.rbac.bootstrapImage.tag" $boot.tag "etcd.rbac.bootstrapImage.digest" $boot.digest -}}
+{{- if and $imgVal (not (kindIs "string" $imgVal)) -}}
+{{- fail (printf "%s is %v, a %s and not a string: an image reference is text, and an unquoted YAML scalar is a number -- `2.0` arrives here as 2 and `2.10` as 2.1, so the value printed above may ALREADY have lost digits. Quote the value you actually meant (%s: \"...\"); on the command line shell quotes are not enough (helm types `--set %s=2` as a number regardless) -- use --set-string." $imgKey $imgVal (kindOf $imgVal) $imgKey $imgKey) -}}
+{{- end -}}
+{{- end -}}
+{{- /* Both halves are strings by here; `default ""` still covers an absent key. */ -}}
+{{- $haRef := printf "%s:%s" ($ha.repository | default "" | toString) ($ha.tag | default "") -}}
+{{- $bootRef := printf "%s:%s" ($boot.repository | default "" | toString) ($boot.tag | default "") -}}
+{{- if $haDigest -}}{{- $haRef = printf "%s@%s" $haRef $haDigest -}}{{- end -}}
+{{- if $bootDigest -}}{{- $bootRef = printf "%s@%s" $bootRef $bootDigest -}}{{- end -}}
+{{- if ne $haRef $bootRef -}}
+{{- fail (printf "etcd.rbac.bootstrapImage (%s) must match ha.image (%s): the bundled etcd's RBAC-bootstrap Job runs `pg-ha-agent rbac-bootstrap` from that image, so a mismatch has one agent build writing the etcd RBAC that a different build then authenticates against. Set etcd.rbac.bootstrapImage.repository, .tag AND .digest to the same values as ha.image.repository, .tag and .digest -- all three move together on every image bump, and the digest is part of this comparison (a digest pinned on one side and left empty on the other is a mismatch even when repository and tag are identical). If you genuinely need different images (an air-gapped mirror holding only one), use an external etcd instead: leave etcd.enabled=false and point ha.agent.dcs.etcd.endpoints at your own cluster." $bootRef $haRef) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+pg.durationMs -- a Go duration string as a number of milliseconds, or "" when the string is not
+a Go duration. Exists only for pg.validateLeaseTimings below.
+
+The grammar mirrors time.ParseDuration deliberately, because BOTH directions of divergence are
+bugs and this helper has now had one of each (#291 review):
+
+  - too permissive => the guard skips input the agent will reject, and the render-clean /
+    CrashLoopBackOff outcome the guard exists to prevent happens anyway. `lower` was here once,
+    which made "15S" and "1M30S" parse; Go's units are case-SENSITIVE, so both are errors.
+  - too strict => the guard rejects input the agent accepts, turning a working 1.x value into a
+    hard render failure on upgrade. ".5s" and "+15s" are valid Go durations and were refused.
+
+So: an optional leading sign (Go allows one, at the front only), then one or more
+<number><unit> pairs, where the number may omit either side of the decimal point (".5", "5.",
+"5.5", "5") and the unit is one of Go's, including both spellings of microseconds -- "us",
+U+00B5 "µs" and U+03BC "μs", all three of which time.ParseDuration takes.
+
+An empty string is NOT a duration ("" is an error in Go), and reporting "" for it is correct
+here -- but the caller must be careful not to have replaced it with a default first.
+*/ -}}
+{{- define "pg.durationMs" -}}
+{{- $d := . | toString | trim -}}
+{{- $num := "([0-9]+(\\.[0-9]*)?|\\.[0-9]+)" -}}
+{{- $unit := "(ns|us|µs|μs|ms|s|m|h)" -}}
+{{- $pair := printf "%s%s" $num $unit -}}
+{{- if regexMatch (printf "^[+-]?(%s)+$" $pair) $d -}}
+{{- $sign := 1.0 -}}
+{{- $body := $d -}}
+{{- if hasPrefix "-" $d -}}{{- $sign = -1.0 -}}{{- $body = trimPrefix "-" $d -}}
+{{- else if hasPrefix "+" $d -}}{{- $body = trimPrefix "+" $d -}}
+{{- end -}}
+{{- $total := 0.0 -}}
+{{- range $tok := regexFindAll $pair $body -1 -}}
+{{- $mult := 0.0 -}}
+{{- if hasSuffix "ms" $tok -}}{{- $mult = 1.0 -}}
+{{- else if hasSuffix "ns" $tok -}}{{- $mult = 0.000001 -}}
+{{- else if or (hasSuffix "us" $tok) (hasSuffix "µs" $tok) (hasSuffix "μs" $tok) -}}{{- $mult = 0.001 -}}
+{{- else if hasSuffix "h" $tok -}}{{- $mult = 3600000.0 -}}
+{{- else if hasSuffix "m" $tok -}}{{- $mult = 60000.0 -}}
+{{- else if hasSuffix "s" $tok -}}{{- $mult = 1000.0 -}}
+{{- end -}}
+{{- $n := regexFind (printf "^%s" $num) $tok -}}
+{{- /* float64 cannot cast "5." or ".5" -- Go's duration grammar allows either side of the
+       point to be omitted, so pad both ends before casting. Without this, "5.s" (a valid 5s)
+       cast to 0 and then failed the ORDERING check, which is a confusing error for a value
+       that is not actually wrong. */ -}}
+{{- if hasPrefix "." $n -}}{{- $n = printf "0%s" $n -}}{{- end -}}
+{{- if hasSuffix "." $n -}}{{- $n = printf "%s0" $n -}}{{- end -}}
+{{- $total = addf $total (mulf (float64 $n) $mult) -}}
+{{- end -}}
+{{- mulf $total $sign -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+pg.haAgentDuration -- the effective value of one ha.agent duration key, WITHOUT collapsing an
+explicitly-set empty string into the chart default. `$agent.x | default "15s"` does collapse it,
+which is how an empty leaseDuration used to be validated as 15s while statefulset.yaml emitted
+`value: ""` -- and Go rejects "", so config.Load fail-fasts and every pod CrashLoopBackOffs
+after a clean render (#291 review). hasKey is the distinction `default` cannot make.
+*/ -}}
+{{- define "pg.haAgentDuration" -}}
+{{- $agent := index . 0 -}}
+{{- $key := index . 1 -}}
+{{- if hasKey $agent $key -}}{{- index $agent $key | toString -}}{{- else -}}{{- index . 2 -}}{{- end -}}
+{{- end -}}
+
+{{- define "pg.validateLeaseTimings" -}}
+{{- /* HA mode only, matching pg.validateSyncReplicationSlots* (#298 review). Standalone
+       (ha.enabled=false) renders no agent at all -- no Lease, no leaderelection, no env
+       carrying these values -- so a leftover ha.agent.* timing there configures nothing and
+       must not block the install. It did: a 1.x values file switching to standalone while
+       still carrying `repmgr.agent.leaseDuration: 15` (a bare int -- inert and accepted on 1.x,
+       which had no such validator) failed the render outright, a hard upgrade blocker over a
+       key no rendered object reads. The sibling validators state this scoping rule explicitly;
+       this one simply predated it. */ -}}
+{{- if ne (include "pg.agentMode" .) "true" -}}
+{{- else -}}
+{{- $agent := .Values.ha.agent | default dict -}}
+{{- /* Every ha.agent key the agent parses with time.ParseDuration, not just the ordering
+       triple: config.Load treats them all the same way, so an unparseable reconcileInterval
+       refuses the boot exactly like an unparseable leaseDuration (#291 review). Defaults here
+       must match values.yaml. */ -}}
+{{- $durations := list
+      (list "leaseDuration"     (include "pg.haAgentDuration" (list $agent "leaseDuration"     "15s")))
+      (list "renewDeadline"     (include "pg.haAgentDuration" (list $agent "renewDeadline"     "10s")))
+      (list "retryPeriod"       (include "pg.haAgentDuration" (list $agent "retryPeriod"       "2s")))
+      (list "reconcileInterval" (include "pg.haAgentDuration" (list $agent "reconcileInterval" "5s"))) -}}
+{{- /* First: is each one a duration at all? A non-duration is a HARD failure, not a skip --
+       time.ParseDuration rejects `15`, `20 s`, `15S` and ``, so the agent would refuse to start
+       and every pod would CrashLoopBackOff after a clean render (#291 review). */ -}}
+{{- range $entry := $durations -}}
+{{- if eq (include "pg.durationMs" (index $entry 1)) "" -}}
+{{- fail (printf "ha.agent.%s is %q, which is not a Go duration: it needs a unit, no spaces, and lower-case units, e.g. \"15s\", \"500ms\", \"1m30s\". Note the units are case-SENSITIVE (\"15S\" is an error) and an empty value is not a duration either. The agent parses this with time.ParseDuration and refuses to start if it fails, so an unparseable value renders cleanly and then CrashLoopBackOffs every postgresql pod with no primary." (index $entry 0) (index $entry 1)) -}}
+{{- end -}}
+{{- end -}}
+{{- $ldRaw := index (index $durations 0) 1 -}}
+{{- $rdRaw := index (index $durations 1) 1 -}}
+{{- $rpRaw := index (index $durations 2) 1 -}}
+{{- $ld := float64 (include "pg.durationMs" $ldRaw) -}}
+{{- $rd := float64 (include "pg.durationMs" $rdRaw) -}}
+{{- $rp := float64 (include "pg.durationMs" $rpRaw) -}}
+{{- /* Ordering first, then client-go's JitterFactor bound -- the same precedence config.Load
+       uses, so a triple that breaks both gets the message for the commoner mistake (#298
+       review). The jitter bound is NOT implied by the ordering: leaderelection requires
+       renewDeadline > 1.2 * retryPeriod, so 15s/12s/10s passed this validator, rendered clean,
+       and then CrashLoopBackOffed every postgresql pod at once with no primary -- precisely the
+       class this guard exists to prevent, on the one inequality it did not carry. */ -}}
+{{- if not (and (gt $ld $rd) (gt $rd $rp)) -}}
+{{- fail (printf "ha.agent lease timings must satisfy leaseDuration > renewDeadline > retryPeriod, but got leaseDuration=%s renewDeadline=%s retryPeriod=%s. client-go's leader election requires it and the agent refuses to start otherwise, so this would render cleanly and then CrashLoopBackOff every postgresql pod at once with no primary. If these came from two different values files, check for a MIXTURE of the deprecated repmgr.agent.* spelling and the canonical ha.agent.* one: where a key is set under both names the repmgr.* value wins, so one timing can come from a 1.x file while the other two come from a newer -f, producing a triple neither file contains. Set all three under the same name (ha.agent.*), or delete the repmgr.agent.* copies." $ldRaw $rdRaw $rpRaw) -}}
+{{- else if le $rd (mulf $rp 1.2) -}}
+{{- fail (printf "ha.agent.renewDeadline is %s and ha.agent.retryPeriod is %s, but client-go's leader election requires renewDeadline > 1.2 x retryPeriod -- it reserves a jitter margin on every renewal attempt -- so the agent refuses to start even though the ordering above is satisfied. Raise renewDeadline above %s, or lower retryPeriod below %s (keeping leaseDuration > renewDeadline > retryPeriod)." $rdRaw $rpRaw (printf "%.0fms" (mulf $rp 1.2)) (printf "%.0fms" (divf $rd 1.2))) -}}
+{{- end -}}
+{{- /* The etcd backend adds a floor of its own: its lease TTL is whole seconds, so config.go
+       requires LEASE_DURATION >= 5s there. Same failure shape as above -- valid ordering, clean
+       render, refused boot -- so it belongs in the same guard (#291 review). */ -}}
+{{- if and (eq (($agent.dcs).backend | default "kubernetes") "etcd") (lt $ld 5000.0) -}}
+{{- fail (printf "ha.agent.leaseDuration is %s, but the etcd DCS backend requires at least 5s: its lease TTL is expressed in whole seconds, so the agent refuses to start below that (and would CrashLoopBackOff every pod after a clean render). Raise leaseDuration to 5s or more -- keeping leaseDuration > renewDeadline > retryPeriod -- or use ha.agent.dcs.backend: kubernetes." $ldRaw) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- /* The repmgrd failover path was removed in 2.0.0 (#286): the lease-based Go agent has
+       been the default since 1.0.0 and repmgrd was deprecated for one major cycle. The keys
+       that only ever configured repmgrd are gone, and a values file still carrying them
+       would otherwise deploy an agent cluster while its author believes repmgrd is running
+       -- silence here is the dangerous outcome, so fail at render time (invariant 4). */ -}}
+{{- define "pg.validateRemovedRepmgrdValues" -}}
+{{- /* Checked in BOTH namespaces, and that is the whole point (#291 review). Reading only
+       .Values.repmgr made every guard below silently skippable by taking the rename NOTES.txt
+       itself recommends: rename the top-level key to `ha:` on a 1.x file that still carries
+       `failoverMode: repmgrd`, and the render went clean -- handing the operator an agent
+       cluster while they believed repmgrd was running, straight into the immutable
+       podManagementPolicy trap this validator exists to warn about.
+
+       Reading only .Values.ha would be just as wrong in the other direction (it would miss
+       every un-renamed 1.x file), and the normalizer cannot help: it merges the alias INTO
+       .Values.ha, so a removed key arrives there indistinguishable from a canonical one --
+       which is fine here, because none of these keys exists under ha: in values.yaml, so any
+       presence in either namespace is operator input. The union is therefore exact, not
+       merely conservative. */ -}}
+{{- $alias := mergeOverwrite (deepCopy (.Values.ha | default dict)) (deepCopy (.Values.repmgr | default dict)) -}}
+{{- if hasKey $alias "failoverMode" -}}
+{{- $m := $alias.failoverMode | toString -}}
+{{- if eq $m "agent" -}}
+{{- fail "failoverMode (ha.failoverMode / repmgr.failoverMode) was removed in chart 2.0.0: the lease-based agent is now the only failover path, so `failoverMode: agent` no longer means anything. Delete this key -- nothing else changes for you, and the agent is still tuned under ha.agent.*." -}}
+{{- else -}}
+{{- fail (printf "failoverMode (ha.failoverMode / repmgr.failoverMode) was removed in chart 2.0.0 (got %q): repmgrd and its service-updater sidecar are gone, and the lease-based agent is now the only failover path. Deleting this key switches this release to the agent -- which also flips the StatefulSet's podManagementPolicy from OrderedReady to Parallel, and that field is IMMUTABLE. Read the 2.0.0 upgrade note in CHANGELOG.md before upgrading: the StatefulSet has to be recreated with `kubectl delete sts <name> --cascade=orphan`." $m) -}}
+{{- end -}}
+{{- end -}}
+{{- if hasKey $alias "serviceUpdater" -}}
+{{- fail "serviceUpdater.* (ha.serviceUpdater / repmgr.serviceUpdater) was removed in chart 2.0.0: the service-updater sidecar only existed to reconcile PGPool backends after a repmgrd failover, and the agent does that itself. Delete this key." -}}
+{{- end -}}
+{{- if hasKey $alias "monitoringHistoryDays" -}}
+{{- fail "monitoringHistoryDays (ha.monitoringHistoryDays / repmgr.monitoringHistoryDays) was removed in chart 2.0.0: it pruned repmgr.monitoring_history, which only repmgrd ever wrote. Delete this key." -}}
+{{- end -}}
+{{- if hasKey $alias "splitBrainDetection" -}}
+{{- fail "splitBrainDetection (ha.splitBrainDetection / repmgr.splitBrainDetection) was removed in chart 2.0.0: the log/fence distinction lived in the repmgrd service-updater's handle_split_brain(), which #286 deleted, so both values selected the same behaviour. Delete this key -- the protection it named still happens, unconditionally: the agent always demotes itself when it is read-write without holding the lease (a local pg_ctl operation; no pod-delete RBAC)." -}}
+{{- end -}}
+{{- if hasKey .Values.pgpool "autoFailback" -}}
+{{- fail "pgpool.autoFailback was removed in chart 2.0.0: it rendered PGPool's auto_failback, which only applied to the repmgrd failover flow. The agent fronts the Services and re-points them itself, so PGPool never fails a backend over. Delete this key." -}}
+{{- end -}}
+{{- /* #294: the repmgr MECHANISM is gone, not merely non-default. Rejected here rather than
+       by narrowing the values.schema.json enum, so the operator gets this message instead of
+       a generic "value must be one of [native]" -- helm validates the schema before rendering,
+       so a narrowed enum would win the race and say nothing useful. The key itself survives
+       (see values.yaml) precisely so a stale value fails loudly rather than being ignored. */ -}}
+{{- if eq ((.Values.ha.agent).mechanism | default "native") "repmgr" -}}
+{{- fail "ha.agent.mechanism: repmgr was removed in chart 2.0.0 (#294): the repmgr mechanism drove the repmgr CLI (standby clone/follow/promote, node rejoin) and depended on repmgr.nodes, and both are gone -- `native` is now the only implementation, and it is the default. Delete this key (or set it to \"native\"). A cluster created by a 1.x release is migrated in place on upgrade (#292): no re-clone, timeline and system identifier preserved. Read the 2.0.0 upgrade note in CHANGELOG.md and the README migration runbook before upgrading an existing HA cluster." -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
-pg.agentMode / pg.repmgrdMode render the string "true"/"false". Call sites gate
-with: {{- if eq (include "pg.agentMode" .) "true" }}
+pg.agentMode renders the string "true"/"false". Call sites gate with:
+  {{- if eq (include "pg.agentMode" .) "true" }}
+Since 2.0.0 the agent is the only failover path, so this is exactly "HA is enabled"
+(ha.enabled=false is the standalone, single-node, stock-postgres-image mode). The
+helper is kept rather than inlined so the ~20 call sites keep reading as a mode check.
 */}}
 {{- define "pg.agentMode" -}}
-{{- and .Values.repmgr.enabled (eq (include "pg.failoverMode" .) "agent") -}}
-{{- end -}}
-
-{{- define "pg.repmgrdMode" -}}
-{{- and .Values.repmgr.enabled (eq (include "pg.failoverMode" .) "repmgrd") -}}
+{{- /* Coerced to a canonical "true"/"false" rather than echoing the raw value (#298
+       review): call sites compare `eq ... "true"` while plain `if .Values.ha.enabled`
+       gates elsewhere use template truthiness. A non-bool truthy value (the classic
+       `ha.enabled: "false"` quoting accident, or `1`) split the two -- every `if`
+       branch fired while every agentMode gate did not, rendering a clean-looking
+       hybrid manifest with the agent command but none of its lease env, so every pod
+       CrashLoopBackOffed. The schema now types ha.enabled as boolean too; the
+       coercion keeps the helper safe even for renders that skip schema validation
+       (--set-string bypasses nothing here). */ -}}
+{{- if .Values.ha.enabled -}}true{{- else -}}false{{- end -}}
 {{- end -}}
 
 {{- /* The single condition under which postgresql-configmap.yaml renders a ConfigMap at
@@ -1350,7 +1838,7 @@ with: {{- if eq (include "pg.agentMode" .) "true" }}
        checksum annotation, the postgresql-config volume mount (twice, for postStart
        include_dir wiring on two different code paths), and the volume definition itself
        -- and duplicating the raw boolean expression at each site is exactly how the
-       postgresql.walLevel / repmgr.agent.syncReplicationSlots additions below ended up
+       postgresql.walLevel / ha.agent.syncReplicationSlots additions below ended up
        missed at first: the ConfigMap's own guard was updated but the volume MOUNT guard
        was not, so the rendered ConfigMap existed but was never attached to the pod (a
        live KinD suite run caught it -- wal_level and sync_replication_slots silently
@@ -1364,7 +1852,7 @@ with: {{- if eq (include "pg.agentMode" .) "true" }}
        of "true" and every `eq (include ...) "true"` call site would always be false.
        `if` properly coerces any type's truthiness and lets this emit a literal "true"
        or empty string, matching what those call sites actually compare against. */ -}}
-{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled (ne (.Values.postgresql.walLevel | default "replica") "replica") (and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots) -}}
+{{- if or .Values.postgresql.configuration .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.audit.enabled (ne (.Values.postgresql.walLevel | default "replica") "replica") (and (eq (include "pg.agentMode" .) "true") .Values.ha.agent.syncReplicationSlots) -}}
 true
 {{- end -}}
 {{- end -}}
@@ -1374,8 +1862,16 @@ true
        on THIS helper rather than on the value directly, so the grant and its guard cannot
        drift apart -- a Role that carries the escalation primitive without the policy that
        bounds it is the failure mode #279 exists to prevent. */ -}}
+{{- /* NIL-SAFE down the whole chain (#298 review). statefulset.yaml was made tolerant of an
+       absent control/restore block, but this helper -- which rbac.yaml evaluates before
+       statefulset.yaml's named guards can speak -- still dereferenced it straight, so
+       `--set ha.agent.control=null` (or `...control.restore=null`) died with
+       `nil pointer evaluating interface {}.enabled` from rbac.yaml. Nulling a sub-block means
+       "the feature is off", which is what an empty chain now evaluates to. The agentMode arm
+       stays FIRST so `ha.agent=null` still gets statefulset.yaml's `ha.agent is required`
+       message rather than a silent false. */ -}}
 {{- define "pg.controlRestoreEnabled" -}}
-{{- and .Values.repmgr.enabled (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.control.restore.enabled -}}
+{{- and (eq (include "pg.agentMode" .) "true") ((((.Values.ha.agent).control).restore).enabled) -}}
 {{- end -}}
 
 {{- /* Name of the ValidatingAdmissionPolicy (and its binding) that bounds the restore
@@ -1449,20 +1945,105 @@ true
 {{- $label := index $pair 0 -}}
 {{- $value := index $pair 1 | toString -}}
 {{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._:/@-]*$" $value) -}}
-{{- fail (printf "%s is %q, which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $label $value) -}}
+{{- fail (printf "%s is %q, which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $label $value) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
 
-{{- /* True in agent mode when the leadership backend is etcd (repmgr.agent.dcs.backend
+{{- /* True in agent mode when the leadership backend is etcd (ha.agent.dcs.backend
        == "etcd"), false otherwise. Nil-safe at every level so a partial overlay does
        not nil-pointer; defaults to the kubernetes backend. */ -}}
 {{- define "pg.agentEtcdMode" -}}
 {{- if eq (include "pg.agentMode" .) "true" -}}
-{{- $agent := .Values.repmgr.agent | default dict -}}
+{{- $agent := .Values.ha.agent | default dict -}}
 {{- $dcs := $agent.dcs | default dict -}}
 {{- eq ($dcs.backend | default "kubernetes") "etcd" -}}
 {{- else -}}
 false
 {{- end -}}
+{{- end -}}
+
+{{- /* #291: `ha.*` is the values namespace for everything HA; `repmgr.*` is its deprecated
+       alias. The chart reads ONE namespace internally -- .Values.ha -- and this normalizer is
+       what makes that true.
+
+       Additive on purpose, which is what keeps the rename a minor rather than a break: every
+       released 1.x values file still works. `repmgr.*` wins key-by-key (mergeOverwrite, not a
+       whole-block replacement) so an operator can adopt the new name for one setting without
+       restating the rest.
+
+       That direction is deliberate and easy to get backwards -- an earlier draft of this
+       comment did. The `ha:` side of the merge is where the CHART DEFAULTS live (values.yaml
+       ships the block under that name), so making `ha.*` win would let a default beat a value
+       the operator actually set: `repmgr.agent.mechanism: repmgr` would be silently ignored
+       rather than rejected. `repmgr.*` is only ever non-empty because someone wrote it, so it
+       is the operator's input and it wins. The consequence to state plainly, because it is
+       counter-intuitive: a file carrying BOTH spellings of one key gets the `repmgr.*` value,
+       so a half-finished migration keeps the OLD value until the old key is deleted.
+
+       Dropping the aliases is the break, and belongs to the major that also renames the image.
+
+       Implemented as ONE mutation of .Values rather than a coalescing accessor per key: there
+       are ~39 keys and 13 templates, and scattering `or .Values.ha.x .Values.ha.x` through
+       them is how half of them end up reading only one namespace. Templates call this on their
+       first line and then read .Values.ha.* with no further ceremony.
+
+       deepCopy before merging: mergeOverwrite mutates its first argument, and .Values.ha is
+       the operator's own map -- corrupting it would make the deprecation warning below report
+       the merged shape instead of what they actually wrote.
+
+       Idempotent, because Helm renders each file separately and several include this more than
+       once transitively. */ -}}
+{{- define "pg.normalizeValues" -}}
+{{- $ha := deepCopy (.Values.ha | default dict) -}}
+{{- /* THE ONE PLACE that must read .Values.repmgr -- a blanket rename swept this to
+       .Values.ha once, which made both operands identical and silently disabled every
+       alias. The probe caught it; this comment is here so it cannot happen twice. */ -}}
+{{- $alias := deepCopy (.Values.repmgr | default dict) -}}
+{{- /* #298 security review: the alias below overwrites ha.* key-by-key, even over --set.
+       For a handful of SECURITY keys that silent precedence is a downgrade -- a stale 1.x
+       repmgr.* value quietly winning over the ha.* an operator set (e.g. a leftover
+       repmgr.agent.control.restore.admissionPolicy.enabled:false defeating --set ha...enabled=
+       true, leaving the namespace-wide `create jobs` grant unbounded). Helm has already merged
+       the chart defaults into ha.* by the time any template runs, so "operator set ha.* too"
+       cannot be told apart from the default here -- which makes a "set under both, differing"
+       check unsound (the dangerous case sets ha.enabled=true, equal to the default). So the
+       rule is simpler and deterministic: these security keys may NOT be carried on the
+       deprecated repmgr.* alias at all; set them under ha.*. Checked before the merge, the only
+       place the raw alias tree is visible. The sentinel marks "absent". */ -}}
+{{- $sentinel := "__pgchart_unset__" -}}
+{{- include "pg.aliasSecurityKeyRefused" (dict "sentinel" $sentinel "a" (dig "agent" "podCidr" $sentinel $alias) "key" "podCidr") -}}
+{{- include "pg.aliasSecurityKeyRefused" (dict "sentinel" $sentinel "a" (dig "agent" "control" "allowedClientCNs" $sentinel $alias) "key" "control.allowedClientCNs") -}}
+{{- include "pg.aliasSecurityKeyRefused" (dict "sentinel" $sentinel "a" (dig "agent" "control" "restore" "allowedClientCNs" $sentinel $alias) "key" "control.restore.allowedClientCNs") -}}
+{{- include "pg.aliasSecurityKeyRefused" (dict "sentinel" $sentinel "a" (dig "agent" "control" "restore" "admissionPolicy" "enabled" $sentinel $alias) "key" "control.restore.admissionPolicy.enabled") -}}
+{{- include "pg.aliasSecurityKeyRefused" (dict "sentinel" $sentinel "a" (dig "agent" "control" "restore" "admissionPolicy" "acknowledgeUnbounded" $sentinel $alias) "key" "control.restore.admissionPolicy.acknowledgeUnbounded") -}}
+{{- $_ := set .Values "ha" (mergeOverwrite $ha $alias) -}}
+{{- end -}}
+
+{{- /* Refuse one security key on the deprecated repmgr.* alias (#298 security review). .a is
+       the value dug from the alias tree, .sentinel the "absent" marker, .key the dotted suffix
+       under agent.* for the message. Presence is checked type-safely: `ne .a .sentinel` is only
+       evaluated when .a is a string (Go templates do not short-circuit and cannot compare a
+       list/map against a string), and a non-string kind means dig returned a real value. */ -}}
+{{- define "pg.aliasSecurityKeyRefused" -}}
+{{- $present := false -}}
+{{- if ne (kindOf .a) "string" -}}{{- $present = true -}}{{- else if ne .a .sentinel -}}{{- $present = true -}}{{- end -}}
+{{- if $present -}}
+{{- fail (printf "repmgr.agent.%s is set via the deprecated repmgr.* alias. The alias overwrites ha.* key-by-key (even over --set), so a stale value here would silently override -- and downgrade -- this security control. Set it under ha.agent.%s instead and remove it from repmgr.*." .key .key) -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+pg.usesDeprecatedRepmgrValues -- true when the operator's values file still spells the HA
+block "repmgr:" rather than "ha:" (#291). Drives the deprecation notice in NOTES.txt.
+
+Reads .Values.repmgr on purpose, and it is safe to call at any point: pg.normalizeValues
+merges the alias INTO .Values.ha but never deletes .Values.repmgr, so the raw operator
+input survives normalization and stays distinguishable from the chart's own ha: defaults.
+Reading .Values.ha here would be useless in two ways at once -- it is always populated by
+values.yaml, and the merge has already folded the alias into it, so the answer would be
+"true" for every install. A blanket rename did exactly that once; hence this note.
+*/ -}}
+{{- define "pg.usesDeprecatedRepmgrValues" -}}
+{{- if .Values.repmgr -}}true{{- end -}}
 {{- end -}}

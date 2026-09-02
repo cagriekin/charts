@@ -32,30 +32,38 @@ postgresql:
       cpu: 1000m
       memory: 1Gi
 
-repmgr:
-  image:
-    repository: cagriekin/repmgr
-    tag: trixie-5.5.0-31
-    pullPolicy: IfNotPresent
-  enabled: true
-  failoverMode: agent
-
+# Security-relevant control keys (the allowlists) go under ha.* (the canonical name), not the
+# deprecated repmgr.* alias, which the chart refuses for these keys since it overwrites ha.*
+# even over --set (#298 security review). The merge combines both trees, so the rendered result
+# is identical to nesting everything under repmgr.
+ha:
   agent:
     control:
-      enabled: true
-      tls:
-        existingSecret: pg-control-restore-tls
       # allowedClientCNs gates EVERY control route, so a restore client has to be on it
       # too -- the two lists compose (this one is the door, restore's is an extra lock).
       allowedClientCNs:
         - ops-admin
         - dba-break-glass
       restore:
-        enabled: true
         # The restore-only list. ops-admin is deliberately absent, so the suite can prove
         # an identity cleared for pause/switchover still cannot overwrite the volume.
         allowedClientCNs:
           - dba-break-glass
+
+repmgr:
+  image:
+    repository: cagriekin/pg-ha
+    tag: 2.0.0-pg18
+    pullPolicy: IfNotPresent
+  enabled: true
+
+  agent:
+    control:
+      enabled: true
+      tls:
+        existingSecret: pg-control-restore-tls
+      restore:
+        enabled: true
   username: repmgr
   database: repmgr
   resources:

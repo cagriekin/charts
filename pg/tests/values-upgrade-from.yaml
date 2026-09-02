@@ -4,6 +4,11 @@ postgresql:
     tag: 18.1-trixie
     pullPolicy: IfNotPresent
 
+  # 1 (2 pods) so the upgrade to values-upgrade-to.yaml SCALES UP to 3. That scale-up is the
+  # point: it is the only coverage of adding a replica to a live agent-mode cluster, where a
+  # new pod is created concurrently with the rolling restart and can reach the Lease before it
+  # has registered in repmgr.nodes (#297). #286 briefly pinned this to 2 to keep CI honest
+  # while that bug was open; #297 fixed it and restored the scale-up.
   replicaCount: 1
 
   resources:
@@ -46,13 +51,12 @@ postgresql:
       additionalCommands: ""
 
 repmgr:
-  # This suite tests the legacy in-place component upgrade (repmgrd 2->3 + pgpool);
-  # the repmgrd->agent migration is covered by test-migrate-agent. Pin repmgrd so
-  # the 1.0.0 default flip does not turn this into an agent-mode upgrade.
-  failoverMode: repmgrd
+  # This suite tests the in-place component upgrade (2 -> 3 nodes + pgpool + exporter).
+  # #286 removed failoverMode entirely, so there is no repmgrd pin here any more and this
+  # runs agent mode -- which is the point: the scale-up race it covers is agent-specific.
   image:
-    repository: cagriekin/repmgr
-    tag: trixie-5.5.0-27
+    repository: cagriekin/pg-ha
+    tag: 2.0.0-pg18
     pullPolicy: IfNotPresent
 
   enabled: true
@@ -67,14 +71,6 @@ repmgr:
     limits:
       cpu: 500m
       memory: 512Mi
-
-  serviceUpdater:
-    resources:
-      requests:
-        cpu: 50m
-        memory: 64Mi
-      limits:
-        memory: 128Mi
 
 pgpool:
   enabled: false

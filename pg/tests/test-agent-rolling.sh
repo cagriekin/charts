@@ -27,6 +27,13 @@ begin_suite "Agent Rolling Restart (no-deadlock invariant, #186)"
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 helm uninstall "${RELEASE}" -n "${NAMESPACE}" 2>/dev/null || true
 kubectl delete pvc -n "${NAMESPACE}" --all --wait=false 2>/dev/null || true
+# Agent-created state is not chart-owned and survives helm uninstall: a stale primary
+# marker makes the next holder refuse initdb over fresh PVCs (#170's guard -- correct in
+# production, where empty data plus a marker means PVC loss, but a deadlock on a suite
+# rerun into a dirty namespace), and a stale lease parks leadership on a not-yet-recreated
+# identity for a lease term. Clear both alongside the PVCs (#298 review, observed live).
+kubectl delete configmap "${FULLNAME}-primary" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
+kubectl delete lease "${FULLNAME}-leader" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
 # podManagementPolicy is immutable; clear a leftover STS from a prior repmgrd run.
 kubectl delete statefulset "${FULLNAME}" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
 sleep 3
@@ -114,6 +121,76 @@ else
   skip "data survives the rolling restart (#186) (did not settle post-restart)"
   skip "new primary is writable after the rolling restart (#186) (did not settle post-restart)"
   skip "standby re-streams after the rolling restart (#186) (did not settle post-restart)"
+fi
+
+# --- #293: shared_preload_libraries = 'repmgr' must leave PGDATA under native ---
+#
+# That line is appended to PGDATA/postgresql.conf by the image entrypoint at initdb time and
+# cloned verbatim to every standby, so it outlives any chart change and any helm rollback. Once
+# the repmgr-free image ships (#290) a data directory still requesting repmgr.so is a postmaster
+# that refuses to start -- on every pod at once. The agent strips it on boot, before any start.
+#
+# Deliberately mechanism-split, which is the whole design (#293): only a native cluster can run
+# the repmgr-free image (#294 deletes mechanism.Repmgr), so only native nodes are cleaned, and a
+# node still on `mechanism: repmgr` must keep its preload -- removing it there would gamble with
+# the repmgr extension's own functions for no gain.
+PGDATA_CONF="/var/lib/postgresql/data/pgdata/postgresql.conf"
+# The last ACTIVE assignment is what the postmaster uses. initdb also ships a commented-out
+# `#shared_preload_libraries = ''`, which must never be counted (or stripped).
+active_preload() { # pod
+  kubectl exec -n "${NAMESPACE}" "$1" -c postgresql -- \
+    sh -c "grep -E '^[[:space:]]*shared_preload_libraries[[:space:]]*=' '${PGDATA_CONF}' | tail -1" 2>/dev/null || echo ""
+}
+# The `|| echo ""` above means a failed exec, a wrong path or a moved PGDATA_CONF all look
+# exactly like "the line is gone" -- so an assertion that the preload is ABSENT would pass
+# while testing nothing. Prove the read actually worked by requiring a line we know is in
+# that same file and that #293 must never touch (it is a non-goal in the issue).
+assert_conf_readable() { # name, pod
+  local sentinel
+  sentinel=$(kubectl exec -n "${NAMESPACE}" "$2" -c postgresql -- \
+    sh -c "grep -cE '^[[:space:]]*wal_log_hints' '${PGDATA_CONF}'" 2>/dev/null | tr -d '[:space:]' || echo "0")
+  assert_eq "$1" "1" "${sentinel}"
+}
+
+if [[ "${post_ok}" != "true" ]]; then
+  skip "#293: preload handling (did not settle post-restart)"
+else
+  # #298 review: was `elif chart_mechanism == native`, which is now always true (#294) -- the
+  # repmgr arm it guarded against no longer exists.
+  #
+  # A native install never wrote the line, so plant one to stand in for a data directory
+  # inherited from a 1.x cluster. `repmgr` alone, matching what the entrypoint actually wrote:
+  # the whole assignment must then be dropped, so the restarted postmaster is asking for
+  # nothing and cannot fail for an unrelated missing library.
+  kubectl exec -n "${NAMESPACE}" "${STANDBY}" -c postgresql -- \
+    sh -c "printf \"shared_preload_libraries = 'repmgr'\\n\" >> '${PGDATA_CONF}'"
+  planted=$(active_preload "${STANDBY}")
+  assert_contains "#293 native: preload planted for the test" "${planted}" "repmgr"
+
+  # shared_preload_libraries is a postmaster parameter, so only a restart applies the removal.
+  kubectl delete pod -n "${NAMESPACE}" "${STANDBY}" --wait=true --timeout=180s >/dev/null 2>&1 || true
+  wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 600
+
+  # Prove the file is still readable at this path BEFORE asserting an absence in it.
+  assert_conf_readable "#293 native: postgresql.conf is readable after the restart" "${STANDBY}"
+  stripped=$(active_preload "${STANDBY}")
+  assert_eq "#293 native: the repmgr assignment is gone from PGDATA" "" "$(echo "${stripped}" | tr -d '[:space:]')"
+  # And the RUNNING server agrees -- the file is the mechanism, this is the effect.
+  # Same trap on the SQL side: `|| echo ""` would make an unreachable server read as "does
+  # not preload repmgr". Assert the query actually ran first.
+  alive=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT 1" "testuser" "testdb" 2>/dev/null | tr -d '[:space:]' || echo "")
+  assert_eq "#293 native: the standby answers SQL after the strip" "1" "${alive}"
+  shown=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SHOW shared_preload_libraries" "testuser" "testdb" 2>/dev/null || echo "")
+  assert_not_contains "#293 native: the running standby does not preload repmgr" "${shown}" "repmgr"
+  # The strip must not have cost the node its replication: this is a PGDATA edit on a live
+  # standby, so a botched rewrite shows up here as a postmaster that will not start.
+  restream=""; s=0
+  while [[ ${s} -lt 120 ]]; do
+    restream=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT state FROM pg_stat_replication WHERE application_name='${STANDBY}'" "testuser" "testdb" 2>/dev/null || echo "")
+    [[ "${restream}" == "streaming" ]] && break
+    sleep 5; s=$((s + 5))
+  done
+  assert_eq "#293 native: the standby still streams after the strip" "streaming" "${restream}"
 fi
 
 # Cleanup.

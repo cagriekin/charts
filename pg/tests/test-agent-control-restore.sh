@@ -79,6 +79,13 @@ deploy_minio "${NAMESPACE}"
 
 helm uninstall "${RELEASE}" -n "${NAMESPACE}" 2>/dev/null || true
 kubectl delete pvc -n "${NAMESPACE}" --all --wait=false 2>/dev/null || true
+# Agent-created state is not chart-owned and survives helm uninstall: a stale primary
+# marker makes the next holder refuse initdb over fresh PVCs (#170's guard -- correct in
+# production, where empty data plus a marker means PVC loss, but a deadlock on a suite
+# rerun into a dirty namespace), and a stale lease parks leadership on a not-yet-recreated
+# identity for a lease term. Clear both alongside the PVCs (#298 review, observed live).
+kubectl delete configmap "${FULLNAME}-primary" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
+kubectl delete lease "${FULLNAME}-leader" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
 kubectl delete statefulset "${FULLNAME}" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
 kubectl delete job "${API_JOB}" -n "${NAMESPACE}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
 # The timeline-highwater marker is agent-created (not helm-managed), so it survives
@@ -213,7 +220,7 @@ assert_contains "VAP: hostNetwork is denied" \
 assert_contains "VAP: hostPID is denied" \
   "$(admit '.spec.template.spec.hostPID=true')" "hostNetwork, hostPID, hostIPC"
 assert_contains "VAP: another image is denied" \
-  "$(admit '.spec.template.spec.containers[0].image="attacker/img:1"')" "may only run this release's repmgr image"
+  "$(admit '.spec.template.spec.containers[0].image="attacker/img:1"')" "may only run this release's HA image"
 assert_contains "VAP: a second container is denied" \
   "$(admit '.spec.template.spec.containers += [{"name":"x","image":"busybox"}]')" "exactly one container"
 assert_contains "VAP: an init container is denied" \

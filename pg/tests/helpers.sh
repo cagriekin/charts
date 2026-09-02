@@ -61,14 +61,37 @@ assert_not_eq() {
   fi
 }
 
+# `grep -q --`, not `grep -q` (#298 review). Without the terminator a needle that begins with
+# a dash is parsed as an OPTION: grep exits 2 having matched nothing, so assert_contains reported
+# a spurious failure and -- far worse -- assert_not_contains reported a spurious PASS. Any
+# assertion of the form `- alert: X` (the natural way to test that a PrometheusRule rule is or is
+# not rendered) was silently vacuous. Regex semantics are deliberately preserved: existing
+# assertions rely on them, and `--` only stops option parsing.
 assert_contains() {
   local description="$1"
   local haystack="$2"
   local needle="$3"
-  if grep -q "${needle}" <<< "${haystack}"; then
+  if grep -q -- "${needle}" <<< "${haystack}"; then
     pass "${description}"
   else
     fail "${description}" "output does not contain '${needle}'"
+  fi
+}
+
+# Fixed-string variant, for needles that are literal YAML or PromQL rather than patterns
+# (#298 review). assert_contains is a REGEX match and stays that way -- existing assertions
+# depend on it -- but a PromQL needle like `rate(x{...}[15m]) > 0` contains `[15m]`, which BRE
+# reads as a character class matching one of `1`, `5`, `m`. It therefore does not match the very
+# text it was copied from, and the assertion fails for a reason that has nothing to do with the
+# render. Use this whenever the needle is text to be found verbatim.
+assert_contains_literal() {
+  local description="$1"
+  local haystack="$2"
+  local needle="$3"
+  if grep -qF -- "${needle}" <<< "${haystack}"; then
+    pass "${description}"
+  else
+    fail "${description}" "output does not contain (literal) '${needle}'"
   fi
 }
 
@@ -76,7 +99,7 @@ assert_not_contains() {
   local description="$1"
   local haystack="$2"
   local needle="$3"
-  if grep -q "${needle}" <<< "${haystack}"; then
+  if grep -q -- "${needle}" <<< "${haystack}"; then
     fail "${description}" "output should not contain '${needle}'"
   else
     pass "${description}"
@@ -242,4 +265,23 @@ print_summary() {
     return 1
   fi
   return 0
+}
+
+
+# discover_primary echoes the pod name that is currently NOT in recovery, or "" if none is
+# (#288). Under `repmgr.agent.mechanism: native` the initial primary is decided by the LEASE
+# RACE, not by ordinal: the lease holder is what runs initdb, and with podManagementPolicy
+# Parallel any pod can win it. Under repmgr, init-repmgr.sh hardcoded ordinal 0 as master, so
+# suites could assume pod-0 -- that assumption is a repmgr implementation detail and does not
+# hold on the native path.
+#
+# Usage: discover_primary <namespace> <fullname> <replica-count> [user] [db]
+discover_primary() {
+  local ns="$1" fullname="$2" count="$3" user="${4:-testuser}" db="${5:-testdb}"
+  local i rec
+  for i in $(seq 0 $((count - 1))); do
+    rec=$(pg_exec "${ns}" "${fullname}-${i}" "SELECT pg_is_in_recovery()" "${user}" "${db}" 2>/dev/null | tr -d '[:space:]')
+    if [ "${rec}" = "f" ]; then echo "${fullname}-${i}"; return 0; fi
+  done
+  echo ""
 }

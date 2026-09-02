@@ -82,16 +82,29 @@ postgresql:
 
   # Suspends the liveness and readiness probes until PostgreSQL first accepts
   # connections, so a slow start is not killed mid-startup by the liveness
-  # probe: the repmgr stale-primary guard's settle loop runs before postgres
-  # opens (up to ~147s if REPMGR_NODE_COUNT falls back to 10) and crash-recovery
-  # WAL replay can take longer still, both of which can exceed the ~130s
-  # liveness budget. failureThreshold x periodSeconds is the total startup
-  # budget (600s here); keep the steady-state livenessProbe window tight.
+  # probe: the agent has to acquire the lease and decide bootstrap-vs-clone before
+  # postgres opens at all, and crash-recovery WAL replay can take longer still, both
+  # of which can exceed the ~130s liveness budget. failureThreshold x periodSeconds is
+  # the total startup budget (1800s here); keep the steady-state livenessProbe window tight.
+  # THIS BUDGET BOUNDS A STANDBY'S FIRST CLONE. Since #288 the clone runs in the main container
+  # (the agent does it) rather than in a probe-free init container, so periodSeconds x
+  # failureThreshold is the wall-clock limit on a pg_basebackup of your existing database. Exceed
+  # it and the kubelet kills the container; the agent detects the torn copy on the next boot and
+  # re-clones from scratch, so it is a retry loop rather than a wedged pod -- but a base backup
+  # that cannot finish inside the budget will never finish, and each attempt re-provisions a
+  # WAL-retaining slot on the primary.
+  #
+  # failureThreshold is 180 (1800s) because the agent clones from THIS container: the budget
+  # has to cover a full pg_basebackup of your largest database, not just a postmaster start.
+  # 30 minutes covers an ordinary clone comfortably; it is NOT enough for a multi-terabyte one, so
+  # size it against your own base-backup time if that is you. Raising it costs only how long a
+  # genuinely stuck first boot stays unnoticed, since the steady-state livenessProbe below is
+  # what watches a running server.
   startupProbe:
     enabled: true
     periodSeconds: 10
     timeoutSeconds: 5
-    failureThreshold: 60
+    failureThreshold: 180
 
   affinity: {}
   # Hard topology spread for the postgresql pods (default none; the affinity above
@@ -170,8 +183,10 @@ postgresql:
   # extraVolumes are pod-level; extraVolumeMounts and extraEnv land on the postgresql
   # container. Validated at render time (see pg.validateExtraPassthrough): each must be
   # a LIST of objects, extraVolumes names may not collide with a chart-managed volume
-  # (data, postgresql-config, postgresql-tls, ext-lib, ext-share, repmgr-config,
-  # etcd-tls, pg-run, pgbackrest-config, service-updater-script), every
+  # (data, postgresql-config, postgresql-tls, ext-lib, ext-share, ext-extra-lib,
+  # etcd-tls, agent-control-tls, pg-run, pgbackrest-config, pgbackrest-bootstrap-script
+  # -- the list is reserved UNCONDITIONALLY, so a name that is free today cannot start
+  # colliding once a later upgrade enables the feature that mounts it), every
   # extraVolumeMounts entry must reference a declared extraVolumes entry, and extraEnv
   # may not reuse a chart-set env name (PGDATA, POSTGRES_*, REPMGR_*, ...) -- each of
   # those is a silent-shadowing or apply-time failure, so the chart fails the render.
@@ -181,9 +196,11 @@ postgresql:
   #   postgresql.configuration:
   #     shared_preload_libraries: pgsodium
   #     pgsodium.getkey_script: /etc/postgresql/pgsodium/getkey.sh
-  # In repmgr mode the chart merges `repmgr` into shared_preload_libraries for you (a
-  # bare value there would otherwise override the image's preload and silently disable
-  # failover), so declare only your own libraries.
+  # The chart merges nothing into shared_preload_libraries, so your value passes through as
+  # written -- declare exactly the libraries you want. Declaring `repmgr` is REJECTED at render
+  # time (#293): it loads via include_dir, so it would override the image's own gate and preload
+  # repmgr.so onto a cluster with no repmgr extension -- an every-pod crash-loop once the
+  # repmgr-free image ships (#290).
   extraVolumes: []
     # - name: pgsodium-key
     #   secret:
@@ -228,16 +245,18 @@ postgresql:
   # ISO 27001) that require a per-object record of who did what. Off by default:
   # audit.enabled=false renders manifests identically to a chart with no audit block.
   #
-  # Requires repmgr.enabled=true -- the cagriekin/repmgr image bundles the pgaudit
-  # extension. Standalone mode (repmgr.enabled=false) uses the stock postgres image,
+  # Requires ha.enabled=true -- the cagriekin/pg-ha image bundles the pgaudit
+  # extension. Standalone mode (ha.enabled=false) uses the stock postgres image,
   # which has no pgaudit, so audit + standalone fails a render guard (a bare
   # shared_preload_libraries=pgaudit would crash-loop the postmaster). To audit in
   # standalone mode, supply a postgresql.image that ships pgaudit.
   #
   # shared_preload_libraries is a postmaster parameter: enabling audit triggers a
-  # controlled rolling restart via the StatefulSet's config-checksum annotation. The
-  # chart keeps repmgr in shared_preload_libraries (replication depends on it) and adds
-  # pgaudit. pgaudit writes to the PostgreSQL server log (stderr -> `kubectl logs`);
+  # controlled rolling restart via the StatefulSet's config-checksum annotation. The chart
+  # preserves whatever you declare in postgresql.configuration.shared_preload_libraries and
+  # adds pgaudit. It adds nothing of its own: replication needs no preloaded library, and
+  # listing "repmgr" is a hard render failure -- the image ships no repmgr.so, so preloading
+  # it would make every pod unstartable (#293). pgaudit writes to the PostgreSQL server log (stderr -> `kubectl logs`);
   # tamper-evident retention is your platform's job -- ship the logs to Loki/ELK/
   # CloudWatch. Runtime `ALTER SYSTEM`/session GUC changes are NOT persisted; this
   # declarative config is the source of truth.
@@ -260,7 +279,7 @@ postgresql:
     # Empty disables object auditing (session logging via `log` still applies).
     role: ""
 
-  # When repmgr.enabled is true, re-hash any managed user (POSTGRES_USER,
+  # When ha.enabled is true, re-hash any managed user (POSTGRES_USER,
   # REPMGR_USER) whose stored password is still MD5 to SCRAM at pod startup.
   # Idempotent (no-op once everyone is SCRAM-hashed, and auto-skipped on
   # PG < 14 since md5->scram pg_hba auto-promotion only exists in PG14+).
@@ -443,7 +462,7 @@ postgresql:
     # plain-copy default path keeps using the shared, lighter pg.initResources). apt-get
     # update + install is a real package-manager run (repo metadata fetch + dependency
     # resolution + dpkg unpack), not a `cp`, so it gets its own, values-overridable
-    # budget -- same precedent as repmgr.initContainerResources for the standby-clone
+    # budget -- same precedent as ha.initContainerResources for the standby-clone
     # init container.
     installResources:
       requests:
@@ -455,42 +474,81 @@ postgresql:
 
   lifecycle:
     postStart:
+      # Extra SQL/shell run once per pod start, against the cluster's PRIMARY (the hook
+      # discovers it and exports PGHOST). BEST EFFORT, deliberately (#288 review): the hook
+      # waits up to 90s for a reachable primary and then gives up SILENTLY, because a
+      # non-zero postStart exit makes the kubelet kill the container -- a crash-loop is a
+      # worse answer than a skipped convenience command. Two consequences worth knowing:
+      #   - A pod whose PostgreSQL is not serving within that window skips its commands.
+      #     Reachable in practice on a fresh standby under ha.agent.mechanism: native,
+      #     where the first clone runs in this container and can outlast 90s.
+      #   - Kubernetes does not consider a container started until postStart returns, so
+      #     while the hook waits, the startup/liveness probes have not begun yet.
+      # Use it for idempotent setup only, and put anything load-bearing in a Job or in
+      # postgresql.initdbScripts instead of here.
       additionalCommands: ""
 
-repmgr:
+# ==========================================================================================
+# ha.*  --  everything HA: the failover agent, the image it runs in, replication identity.
+#
+# RENAMED from repmgr.* in 2.0.0 (#291). The old namespace named a component this chart no
+# longer installs -- the agent replaced repmgr, and the image no longer contains it.
+#
+# `repmgr.*` STILL WORKS. It is a deprecated alias for one major cycle: every key below is
+# merged key-by-key with anything you set under `repmgr:`, and where a key appears under BOTH
+# names the `repmgr:` one wins. That is not merely "the file's own order" -- it beats Helm's
+# precedence outright, including a --set, because by the time this chart runs Helm has already
+# collapsed defaults, every -f and every --set into one map, so the merge cannot tell your
+# value from the defaults you see below. Preferring `repmgr:` is the only rule that keeps a
+# released 1.x file working.
+#
+# The practical instruction, therefore: MOVE a key, never duplicate it. Delete the `repmgr:`
+# key in the same edit that adds its `ha:` replacement -- otherwise the old value stays in
+# effect and `--set ha....` looks like it did nothing. Renaming the whole block at once avoids
+# the question entirely. That is what makes this rename additive rather than a break; dropping
+# the aliases is the break, and it belongs to the next major.
+#
+# Keys that were REMOVED rather than renamed -- failoverMode, serviceUpdater.* and
+# monitoringHistoryDays -- are rejected at render time with a message naming the fix, not
+# silently ignored, and that check looks under BOTH names: renaming the block does not
+# smuggle a removed key past it.
+# ==========================================================================================
+ha:
   image:
-    repository: cagriekin/repmgr
-    tag: trixie-5.5.0-34
+    repository: cagriekin/pg-ha
+    tag: 2.0.0-pg18
     # Optional digest pin (e.g. "sha256:..."). When set it is appended as
     # repository:tag@digest, so the cosign-signed / provenance-attested image is
     # pinned at deploy time and a mutable-tag repush cannot silently change it.
     # Empty = pull by tag only. Refresh with: docker buildx imagetools inspect <ref>
     digest: ""
     pullPolicy: IfNotPresent
-    # PostgreSQL major version bundled in the repmgr image. The image ships
-    # exactly one PG major and always runs that server, so in repmgr mode the
+    # PostgreSQL major version bundled in the HA image. The image ships
+    # exactly one PG major and always runs that server, so in HA mode the
     # cluster runs this version regardless of postgresql.image. The chart fails
     # at render time unless postgresql.majorVersion matches this. Bump this and
-    # tag together when moving to a repmgr image built for a new PG major.
+    # tag together when moving to an HA image built for a new PG major.
     #
-    # The image is published per major (#269): the tag above (unsuffixed) is
-    # PostgreSQL 18, and <tag>-pg18 / <tag>-pg17 select one explicitly. To run
-    # PostgreSQL 17, set BOTH majorVersion values to "17" and tag to
-    # <tag>-pg17 -- see pg/README.md "Choosing the PostgreSQL major".
+    # The image is published per major (#269), with the major IN the tag:
+    # cagriekin/pg-ha:<version>-pg18 and :<version>-pg17. There is no unsuffixed
+    # "default major" alias -- a pin has to name the major it wants, and this
+    # value cross-checks it at render time. To run PostgreSQL 17, set BOTH majorVersion
+    # values to "17" and the tag to a <version>-pg17 tag -- see pg/README.md "Choosing the
+    # PostgreSQL major".
+    #
+    # cagriekin/repmgr is frozen at its last trixie- tag; 2.x builds are published only
+    # under cagriekin/pg-ha, so an image bump moves repository+tag here (and the two
+    # etcd.rbac.bootstrapImage keys below -- render-enforced) in one edit.
     majorVersion: "18"
 
+  # Enable HA: the lease-based Go agent runs as PID 1 and drives failover. false is
+  # standalone mode -- one stock-postgres pod, no replication, replicaCount must be 0.
+  # The repmgrd sidecar path was removed in 2.0.0 (#286); the agent, default since
+  # 1.0.0, is now the only failover path and failoverMode is rejected at render under either spelling.
   enabled: true
 
-  # Failover mode:
-  #   agent (default)   — the lease-based Go agent (PID 1) drives failover
-  #   repmgrd           — repmgrd sidecar + service-updater (the original path)
-  # Default since chart v1.0.0 (was repmgrd through 0.x). Pin failoverMode: repmgrd
-  # to stay on the legacy path for one major cycle (deprecated).
-  failoverMode: agent
-
-  # Lease-based agent (failoverMode: agent) tunables. Defaults suit a stable
-  # control plane; raise for managed clouds (e.g. 30s/20s/4s) so brief apiserver
-  # blips do not trip an unnecessary demote.
+  # Agent tunables. Defaults suit a stable control plane; raise for managed clouds
+  # (e.g. 30s/20s/4s) so brief apiserver blips do not trip an unnecessary demote.
   agent:
     leaseDuration: 15s
     renewDeadline: 10s
@@ -512,9 +570,38 @@ repmgr:
     #     be synced to a standby and survive the primary moving.
     # Requires postgresql.walLevel: logical. See README "Logical Replication".
     syncReplicationSlots: false
+
+    # Which replication mechanics the agent drives (#287). Policy does not live here: the
+    # Lease is the sole authority for who is primary, and the timeline/LSN election, fencing
+    # and Service routing are the same regardless. Only the mechanics differ.
+    #
+    #   native (default) -- drive PostgreSQL directly: pg_ctl promote, pg_basebackup,
+    #                       pg_rewind, primary_conninfo + standby.signal
+    #
+    # This is now the ONLY value (#294). The repmgr mechanism -- which shelled out to the
+    # repmgr CLI for clone/follow/promote/rejoin -- is gone, along with its dependency on
+    # repmgr.nodes. Setting `repmgr` here is rejected at render time with a message naming
+    # the migration; see the 2.0.0 entry in CHANGELOG.md.
+    #
+    # What native does: topology comes from pg_stat_replication, and the bootstrap is the
+    # agent's -- the lease holder initdbs, every other pod waits and then clones with
+    # pg_basebackup through its own pre-created slot (#289). It owns physical slot lifecycle,
+    # and since #294 both syncReplicationSlots and cascadingReplication work with it. A native
+    # cluster has no repmgr extension and no repmgr.nodes at all; the repmgr DATABASE and ROLE
+    # remain, because the agent authenticates as that role for replication (renaming them
+    # is #291).
+    #
+    # The key is kept rather than removed so a stale `repmgr` fails loudly instead of being
+    # silently ignored, and so the Mechanism seam stays addressable if a second
+    # implementation is ever wanted.
+    #
+    # An existing 1.x repmgr cluster IS migrated in place on `helm upgrade` (#292): the
+    # preload is stripped from PGDATA before the postmaster starts, no re-clone, timeline and
+    # system identifier preserved. See the 2.0.0 CHANGELOG and the README migration runbook.
+    mechanism: native
     # Leadership store (DCS). "kubernetes" (default) holds the leader Lease in the
     # apiserver. "etcd" holds it in etcd instead, so a Kubernetes control-plane
-    # outage no longer self-demotes the primary (only an etcd quorum loss does);
+    # outage does not self-demote the primary (only an etcd quorum loss does);
     # routing still needs the apiserver but only at failover time. With etcd,
     # leaseDuration must be >= 5s (the etcd lease TTL is whole seconds).
     dcs:
@@ -548,10 +635,40 @@ repmgr:
         scrapeTimeout: 10s
         additionalLabels: {}
       # Example alert rules over the agent metrics (no-leader, split-brain,
-      # renew-failure, reconcile-error, flapping, agent-down, paused-too-long).
+      # renew-failure, reconcile-error, flapping, agent-down, paused-too-long,
+      # marker-tamper, replicas-not-streaming, replication-slot retained WAL).
+      # The replicas-not-streaming rule is omitted when cascadingReplication is on:
+      # a cascaded child streams from a peer and never reaches this primary's
+      # pg_stat_replication, so the agent does not measure the expected count there
+      # and the rule could never fire.
       prometheusRule:
         enabled: false
         additionalLabels: {}
+        # #289: page when a single physical replication slot has held back more than this
+        # many bytes of WAL.
+        #
+        # 3Gi, and the number is not arbitrary: the image sets
+        # max_slot_wal_keep_size = 4GB at initdb, so PostgreSQL never lets a slot fill the
+        # volume -- past that cap it INVALIDATES the slot instead, the standby behind it can
+        # only recover by a full re-clone, and (verified on PostgreSQL 18) invalidation nulls
+        # restart_lsn so this very gauge collapses to zero at that moment. So this rule is
+        # the EARLY WARNING and its threshold must sit BELOW 4GB to be reachable at all;
+        # PGHAReplicationSlotRecycled is what catches the outcome on defaults (the agent
+        # drops and re-creates such a slot on the same tick, so the invalidated GAUGE is
+        # never up long enough for PGHAReplicationSlotInvalidated's `for: 5m` -- that rule
+        # is left for the slots the agent does not recycle: an ACTIVE one, an ordinal with
+        # no live pod, or any slot at all under cascadingReplication). An earlier default of
+        # 16Gi could never fire (and also exceeded the default 10Gi data volume) -- an alert
+        # that cannot fire reads as coverage while providing none. Raise this only if you
+        # also raise max_slot_wal_keep_size via postgresql.configuration.
+        #
+        # The agent reconciles its OWN slots away on every primary tick, so a sustained
+        # breach means a slot it does not own -- an operator's, a logical slot for a
+        # subscription, or a legacy repmgr_slot_* still held ACTIVE by a standby part-way
+        # through the #292 in-place migration -- or a standby that has been down long
+        # enough to fall far behind. Any of those needs a human; none of them clears on
+        # its own.
+        slotRetainedWALBytes: 3221225472
 
     # Authenticated control REST API (#276), agent mode only. OFF by default: with
     # control.enabled=false the chart renders exactly as it did before, and port 9200
@@ -695,15 +812,18 @@ repmgr:
         # transaction timestamp after scale-up, and lastRestore reports the outcome.
         readPodLogs: false
 
+  # Must be a role of its OWN -- distinct from postgresql.username and never "postgres"
+  # (#298 review). The entrypoint creates the superuser first, so a shared name makes this
+  # CREATE USER fail as "role already exists" and the replication role silently keeps the
+  # other password; the agent then cannot authenticate for probes or pg_basebackup. The
+  # chart refuses the collision at render time.
   username: repmgr
   database: repmgr
 
-  # Days of repmgr.monitoring_history to retain. repmgr 5.x has no conf-based retention,
-  # so the table is pruned once per day on the primary via `repmgr cluster cleanup
-  # --keep-history`. Only applies in failoverMode: repmgrd; agent mode runs no repmgrd
-  # and writes no monitoring_history.
-  monitoringHistoryDays: 7
-
+  # NOT CONSUMED by anything (#294 review). These sized the repmgrd sidecar, which #286
+  # deleted; `grep -r Values.ha.resources pg/templates/` is empty. Kept only so an existing
+  # values file does not fail on an unknown key -- raising them does nothing. The PostgreSQL
+  # container's own budget is postgresql.resources, and the agent runs inside it.
   resources:
     requests:
       cpu: 50m
@@ -712,9 +832,10 @@ repmgr:
       cpu: 500m
       memory: 512Mi
 
-  # Resources for the repmgr-init init container, which runs `repmgr standby clone`
-  # (a full pg_basebackup of the database) -- heavier than the other init containers,
-  # so it is overridable here (#153). Raise the limits for large databases.
+  # Resources for the init container. It does NOT clone -- the agent does that from the
+  # POSTGRESQL container (#288), so postgresql.resources and the startupProbe are what bound a
+  # large clone, not these. This container is down to permissions/directory
+  # prep, so the modest defaults below are ample (#153, #294).
   initContainerResources:
     requests:
       cpu: 100m
@@ -725,16 +846,6 @@ repmgr:
 
   terminationGracePeriodSeconds: 120
 
-  splitBrainDetection:
-    action: log
-
-  serviceUpdater:
-    resources:
-      requests:
-        cpu: 50m
-        memory: 64Mi
-      limits:
-        memory: 128Mi
 
 pgpool:
   enabled: false
@@ -788,7 +899,6 @@ pgpool:
         - ALL
 
   failOverOnBackendError: false
-  autoFailback: true
   allowClearTextFrontendAuth: false
 
   # PGPool TLS (#110). Off by default. `enabled` serves frontend TLS (clients->pgpool);
@@ -908,6 +1018,9 @@ prometheusExporter:
   # the existing secret must also carry a `monitoring-password` key.
   monitoringUser:
     enabled: true
+    # Distinct from postgresql.username and ha.username (#298 review): the hook Job runs
+    # `ALTER ROLE ... WITH LOGIN PASSWORD` unconditionally, so a shared name overwrites that
+    # role's password minutes after install. The chart refuses the collision at render time.
     username: monitoring
 
   podSecurityContext:
@@ -1092,7 +1205,7 @@ pgbackrest:
   # POSTGRESQL pod too (that is where the sidecar and the bootstrap init container live), so a
   # ConfigMap/Secret that does not exist yet now holds the DATABASE pods in ContainerCreating
   # on the next roll, not just the backups -- create it first, or mark the source
-  # `optional: true`. And when repmgr.agent.control.restore is enabled, the #279 admission
+  # `optional: true`. And when ha.agent.control.restore is enabled, the #279 admission
   # policy that bounds the agent's `create jobs` grant pins the restore Job's volume sources
   # and env valueFrom names: the chart folds these values into those pins automatically, but
   # only sources it can bind to a NAME (emptyDir, configMap, secret, persistentVolumeClaim,
@@ -1167,9 +1280,9 @@ pgbackrest:
 
   # CronJob runner: schedules backups via Kubernetes-native CronJobs. Each job
   # finds the current primary via the headless primary service endpoints
-  # (kept fresh by the service-updater sidecar) and execs into the pgbackrest
-  # sidecar to perform the backup. Failover is handled automatically because
-  # the primary is resolved at job-fire time.
+  # (repointed by the agent on every promotion) and
+  # execs into the pgbackrest sidecar to perform the backup. Failover is
+  # handled automatically because the primary is resolved at job-fire time.
   cronjob:
     image:
       repository: alpine/k8s
@@ -1283,7 +1396,7 @@ pgbackrest:
     # have confirmed every postgresql pod is gone.
     force: false
     # Ordinal of the replica whose PVC (data-<fullname>-<ordinal>) is restored into.
-    # Leave 0: replica 0 becomes the restored primary and repmgr re-clones the standbys.
+    # Leave 0: replica 0 becomes the restored primary and the agent re-clones the standbys.
     podOrdinal: 0
     # mode: job only -- appended to the Job name so a second attempt does not collide with
     # the completed first one (Jobs are immutable). Ignored in cronjob mode, where the name
@@ -1364,7 +1477,7 @@ networkPolicy:
     #       from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]
     extraIngress: []
     extraEgress: []
-  # The agent control API port (repmgr.agent.control.port, default 9201) gets NO
+  # The agent control API port (ha.agent.control.port, default 9201) gets NO
   # ingress rule of its own: this policy is an explicit allowlist, so the absence of a
   # rule IS deny-by-default -- unlike the 9200 metrics port, which admits every
   # same-namespace pod so scrapes work. Nothing can reach the control port until you
@@ -1382,17 +1495,29 @@ global:
   annotations: {}
 
 # Bundled etcd subchart (conditional dependency). Turn on ONLY for a self-contained
-# install that has no external etcd: set both repmgr.agent.dcs.backend=etcd AND
+# install that has no external etcd: set both ha.agent.dcs.backend=etcd AND
 # etcd.enabled=true; the agent then auto-targets the bundled <release>-etcd:2379
-# (leave repmgr.agent.dcs.etcd.endpoints empty). For several databases, prefer one
+# (leave ha.agent.dcs.etcd.endpoints empty). For several databases, prefer one
 # shared/BYO etcd (set endpoints, leave etcd.enabled=false). See the etcd subchart's
 # values for tuning (replicaCount, resources, persistence). Adds 3 stateful pods.
 etcd:
   enabled: false
-  # The bundled etcd's RBAC-bootstrap Job runs the pg-ha-agent (repmgr) image, so keep
-  # this in lockstep with repmgr.image.tag above; the subchart's own default can lag.
+  # The bundled etcd's RBAC-bootstrap Job runs the HA image, so keep this in lockstep with
+  # ha.image above; the subchart's own default can lag.
   # The subchart reads it at rbac.bootstrapImage -- a top-level etcd.bootstrapImage is
   # silently ignored, which left the Job on the subchart's older default (#269 review).
+  #
+  # The REPOSITORY is pinned here too, not just the tag (#291 review). Only the tag was
+  # overridden before, so it tracked ha.image.tag while the repository stayed on the
+  # subchart's default -- fine while both said cagriekin/repmgr, but the #290 rename makes
+  # that pair a coordinate that does not exist (cagriekin/repmgr is frozen at its last
+  # trixie- tag, and the new tag scheme only ever appears under cagriekin/pg-ha). It failed
+  # exactly this way in a simulated two-step: the etcd-TLS fixture rendered
+  # cagriekin/repmgr:2.0.0-pg17. Both halves move together or neither does.
+  # ENFORCED at render time since #291: pg.validateEtcdBootstrapImage fails the render when
+  # these two disagree with ha.image, so an image bump is a FOUR-key change:
+  # ha.image.repository/tag plus these two.
   rbac:
     bootstrapImage:
-      tag: trixie-5.5.0-34
+      repository: cagriekin/pg-ha
+      tag: 2.0.0-pg18

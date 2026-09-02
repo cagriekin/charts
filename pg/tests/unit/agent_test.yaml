@@ -75,8 +75,11 @@ tests:
             verbs:
               - get
               - update
-              - patch
           any: true
+      # The leases rule grants no "patch" (asserted by the exact contains above):
+      # client-go's LeaseLock renews with Get+Update only, so the verb was pure attack
+      # surface on the pod's token (#298 review). rules[*].verbs cannot be asserted
+      # patch-free wholesale -- routing legitimately patches Services.
       - notContains:
           path: rules[*].verbs
           content: delete

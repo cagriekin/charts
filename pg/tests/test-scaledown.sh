@@ -2,19 +2,19 @@
 set -euo pipefail
 
 # #139: scaling postgresql.replicaCount down must not leave permanent ghost rows in
-# repmgr.nodes. The primary now reconciles repmgr.nodes against the live ordinal range
-# and unregisters records for pods the StatefulSet no longer runs. This exercises the
-# repmgrd-mode path (service-updater on the master).
+# repmgr.nodes. The primary reconciles repmgr.nodes against the live ordinal range and
+# unregisters records for pods the StatefulSet no longer runs.
+#
+# The agent's own cleanupGhostNodes runs on the lease holder each tick,
+# bounded by REPMGR_NODE_COUNT (which the scale-down `helm upgrade` re-renders). Keeping
+# this suite is the point of the port -- it is the only end-to-end #139 regression, and
+# the Go unit tests cover ghostNodeIDs' arithmetic but not the live unregister.
 #
 # Determinism comes from WHICH node becomes the ghost, not from a fixed primary: the
 # StatefulSet trims the highest ordinal (pod-2) first, while it is still a standby, so
-# node 1002's row is type='standby' -- the case `repmgr standby unregister` handles.
-# The scale-down `helm upgrade` itself changes REPMGR_NODE_COUNT, which rolls the
-# surviving pods (this is also what makes the re-rendered ConfigMap's lower bound take
-# effect); under OrderedReady pod-0 rolls last and its clean preStop fails over to
-# pod-1, so the post-scale primary may be pod-1. The assertions therefore locate the
-# live primary with find_primary rather than assuming pod-0. The agent-mode path shares
-# the same repmgr primitive and is covered by the Go unit tests.
+# node 1002's row is type='standby' -- the case `repmgr standby unregister` handles. The
+# post-scale primary is whichever pod holds the lease, so the assertions locate it with
+# find_primary rather than assuming pod-0.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -29,6 +29,13 @@ begin_suite "Scale-down ghost-node cleanup (#139)"
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 helm uninstall "${RELEASE}" -n "${NAMESPACE}" 2>/dev/null || true
 kubectl delete pvc -n "${NAMESPACE}" --all --wait=false 2>/dev/null || true
+# Agent-created state is not chart-owned and survives helm uninstall: a stale primary
+# marker makes the next holder refuse initdb over fresh PVCs (#170's guard -- correct in
+# production, where empty data plus a marker means PVC loss, but a deadlock on a suite
+# rerun into a dirty namespace), and a stale lease parks leadership on a not-yet-recreated
+# identity for a lease term. Clear both alongside the PVCs (#298 review, observed live).
+kubectl delete configmap "${FULLNAME}-primary" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
+kubectl delete lease "${FULLNAME}-leader" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
 kubectl delete statefulset "${FULLNAME}" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
 sleep 3
 
@@ -41,8 +48,7 @@ helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
 
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 3 600
 
-# Find the primary (not in recovery) among the live ordinals and count a node_id in
-# repmgr.nodes there (the primary owns the table; the count replicates to standbys).
+# Find the primary (not in recovery) among the live ordinals.
 find_primary() {
   local max="$1" i rec
   for i in $(seq 0 "${max}"); do
@@ -51,8 +57,23 @@ find_primary() {
   done
   echo ""
 }
-node_count() { # node_count <primary-pod> <node_id>
-  pg_exec "${NAMESPACE}" "$1" "SELECT count(*) FROM repmgr.nodes WHERE node_id=$2" repmgr repmgr 2>/dev/null | xargs || echo ""
+# #288: the native equivalent of "is node N in the topology". There is no repmgr.nodes to
+# consult -- a native cluster has neither the extension nor the table -- so the question becomes
+# "is that pod streaming from the primary", which is the primary's own live connection list.
+# Ordinal 0 is the primary itself: it never appears in its own pg_stat_replication, so it counts
+# as present whenever it is the node answering.
+node_streaming() { # node_streaming <primary-pod> <ordinal>
+  local primary="$1" ord="$2"
+  if [[ "${primary}" == "${FULLNAME}-${ord}" ]]; then echo "1"; return 0; fi
+  pg_exec "${NAMESPACE}" "${primary}" \
+    "SELECT count(*) FROM pg_stat_replication WHERE state='streaming' AND (application_name='${FULLNAME}-${ord}' OR pid IN (SELECT active_pid FROM pg_replication_slots WHERE slot_name='pg_ha_slot_${ord}'))" \
+    repmgr repmgr 2>/dev/null | xargs || echo ""
+}
+
+# in_topology is node_streaming (#290): repmgr.nodes cannot exist -- the extension is never
+# created, and the package is not in the image.
+in_topology() { # in_topology <primary-pod> <ordinal>
+  node_streaming "$1" "$2"
 }
 
 # Precondition: all three nodes registered (so the scaled node 1002 exists first --
@@ -61,12 +82,25 @@ echo "  Waiting for all 3 nodes (1000,1001,1002) to register (up to 180s)..."
 pre=0; elapsed=0
 while [[ ${elapsed} -lt 180 ]]; do
   P=$(find_primary 2)
-  if [[ -n "${P}" && "$(node_count "${P}" 1000)" == "1" && "$(node_count "${P}" 1001)" == "1" && "$(node_count "${P}" 1002)" == "1" ]]; then
+  if [[ -n "${P}" && "$(in_topology "${P}" 0)" == "1" && "$(in_topology "${P}" 1)" == "1" && "$(in_topology "${P}" 2)" == "1" ]]; then
     pre=1; break
   fi
   sleep 5; elapsed=$((elapsed + 5))
 done
-assert_eq "all 3 nodes registered before scale-down (incl. node 1002)" "1" "${pre}"
+assert_eq "all 3 nodes in the topology before scale-down (incl. ordinal 2)" "1" "${pre}"
+
+# Capture the pre-scale primary and whether pg_ha_slot_2 actually exists on it (#288 review).
+# Under native the initial primary is decided by the LEASE RACE, not by ordinal, so pod-2 can be
+# the primary -- and the StatefulSet trims the top ordinal, i.e. the primary itself. A survivor
+# then promotes, and a newly promoted primary carries no physical slots from its standby life
+# (physical slots are not replicated), so pg_ha_slot_2 never exists on the node being polled and
+# every "the slot was reclaimed" assertion below passes VACUOUSLY. Record the evidence now so the
+# post-scale assertions can tell "reclaimed" apart from "never there".
+PRE_PRIMARY="${P:-$(find_primary 2)}"
+PRE_SLOT2=""
+PRE_SLOT2=$(pg_exec "${NAMESPACE}" "${PRE_PRIMARY}" \
+  "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
+echo "  pre-scale: primary=${PRE_PRIMARY} pg_ha_slot_2_present=${PRE_SLOT2:-?}"
 
 # Scale down to 2 instances (replicaCount=1 -> ordinals 0,1). The StatefulSet trims the
 # top ordinal, so pod-2 (a standby) is removed; its repmgr.nodes row (node_id 1002) is
@@ -79,25 +113,104 @@ helm upgrade "${RELEASE}" "${CHART_DIR}" \
 
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 300
 
-# The master's service-updater unregisters the ghost on its next tick; poll until gone.
+# The lease holder's agent unregisters the ghost on its next reconcile tick; poll until
+# gone. Agent mode is Parallel, so the surviving pods roll concurrently -- give the lease
+# time to settle before concluding the row survived.
 echo "  Waiting for the ghost node 1002 to be unregistered (up to 180s)..."
 gone=0; elapsed=0
 while [[ ${elapsed} -lt 180 ]]; do
   P=$(find_primary 1)
-  if [[ -n "${P}" && "$(node_count "${P}" 1002)" == "0" ]]; then gone=1; break; fi
+  if [[ -n "${P}" && "$(in_topology "${P}" 2)" == "0" ]]; then gone=1; break; fi
   sleep 10; elapsed=$((elapsed + 10))
 done
-assert_eq "ghost node 1002 unregistered after scale-down (#139)" "1" "${gone}"
+assert_eq "the departed ordinal 2 left the topology after scale-down (#139)" "1" "${gone}"
+
+# Wait for the SURVIVORS to re-converge before asserting on them (#294, live-run flake).
+# The loop above is not sufficient: under native, "ordinal 2 left the topology" is satisfied
+# on its very first poll, because the departed pod's pg_stat_replication row vanishes the
+# instant the pod dies -- it says nothing about whether a survivor is streaming yet. And this
+# scale-down is also a FAILOVER: the lease race consistently puts the primary on the trimmed
+# ordinal, so the same `helm upgrade` rolls both survivors in Parallel and the lease flaps
+# (observed: pod-0 -> pod-1 -> pod-0, converging after ~30s). Sampling inside that window made
+# the two assertions below fail on a cluster that then converged to exactly the asserted state.
+echo "  Waiting for the surviving standby to stream from the new primary (up to 180s)..."
+converged=0; elapsed=0
+while [[ ${elapsed} -lt 180 ]]; do
+  P=$(find_primary 1)
+  if [[ -n "${P}" ]]; then
+    st=$(pg_exec "${NAMESPACE}" "${P}" \
+      "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" repmgr repmgr 2>/dev/null | xargs || echo "")
+    [[ "${st}" == "1" ]] && { converged=1; break; }
+  fi
+  sleep 10; elapsed=$((elapsed + 10))
+done
+assert_eq "the surviving standby re-streams after the scale-down" "1" "${converged}"
 
 # The live nodes must NOT be unregistered (the discriminator is the ordinal, not
 # reachability -- a momentarily-down live node must never be treated as a ghost).
 P=$(find_primary 1)
-assert_eq "live node 1000 still registered" "1" "$(node_count "${P}" 1000)"
-assert_eq "live node 1001 still registered" "1" "$(node_count "${P}" 1001)"
+assert_eq "live ordinal 0 still in the topology" "1" "$(in_topology "${P}" 0)"
+assert_eq "live ordinal 1 still in the topology" "1" "$(in_topology "${P}" 1)"
 
 # The surviving cluster is still healthy: a single primary serves.
 serves=$(pg_exec "${NAMESPACE}" "${P}" "SELECT NOT pg_is_in_recovery()" repmgr repmgr 2>/dev/null || echo "")
 assert_eq "a primary still serves after scale-down + cleanup" "t" "${serves}"
+
+# Wait on the RECLAIM, not on the stream stopping (#288). in_topology reaching 0 only means
+# pod-2's row left pg_stat_replication, which happens the instant its stream drops -- seconds
+# before the primary's next slotsTick observes the shrunken pod set and drops pg_ha_slot_2.
+# Reading the slot counts straight after that loop raced the tick.
+# Only assert the reclaim when there was something to reclaim. An honest SKIP beats a green
+# assertion that never exercised the code path (#288 review).
+# skip() only records a skip, it does not return (helpers.sh), so the wait below has to be
+# inside the branch rather than after it (#288 review): with nothing to reclaim, "wait until
+# pg_ha_slot_2 is gone" is satisfied on its first poll and reports a reclaim that never
+# happened.
+if [ "${PRE_SLOT2}" = "1" ]; then
+  echo "  Waiting for the primary to reclaim pg_ha_slot_2 (up to 120s)..."
+  reclaimed=0; elapsed=0
+  while [[ ${elapsed} -lt 120 ]]; do
+    left=$(pg_exec "${NAMESPACE}" "${P}" \
+      "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
+    if [[ "${left}" == "0" ]]; then reclaimed=1; break; fi
+    sleep 5; elapsed=$((elapsed + 5))
+  done
+  assert_eq "#289/#288: the primary reclaimed the departed ordinal's slot" "1" "${reclaimed}"
+else
+  skip "#289/#288: slot reclaim not exercised (pg_ha_slot_2 was absent pre-scale; primary was ${PRE_PRIMARY}, so the trimmed ordinal owned no slot on it)"
+fi
+# The assertions below stand in BOTH cases: they are about the surviving cluster's steady
+# state, not about the reclaim, and the "live ordinal N still in the topology" assertions
+# above already waited for the survivor to be streaming -- which under native cannot happen
+# without its slot existing on the primary (primary_slot_name is part of primary_conninfo).
+agent_slots=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pg_ha_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
+# #288: the assertion inverts. Native owns its slots, so after scaling 3 -> 2 there must be
+# exactly one agent-minted slot -- ordinal 1, the surviving peer. The primary does not stream
+# from itself, and ordinal 2 is gone.
+assert_eq "#289/#288: native leaves exactly one agent slot for the surviving standby" "1" "${agent_slots}"
+ghost_agent=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pg_ha_slot_2'" repmgr repmgr 2>/dev/null | xargs || echo "")
+assert_eq "#289/#288: no agent slot left pinning WAL for the scaled-away ordinal 2" "0" "${ghost_agent}"
+ext=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_extension WHERE extname='repmgr'" repmgr repmgr 2>/dev/null | xargs || echo "")
+assert_eq "#288: a native cluster has no repmgr extension" "0" "${ext}"
+nodes_rel=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='repmgr' AND c.relname='nodes'" repmgr repmgr 2>/dev/null | xargs || echo "")
+assert_eq "#288: a native cluster has no repmgr.nodes relation" "0" "${nodes_rel}"
+# And the topology the agent publishes must agree with the surviving pod set.
+streaming=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" repmgr repmgr 2>/dev/null | xargs || echo "")
+assert_eq "#288: the primary sees exactly one streaming standby after the scale-down" "1" "${streaming}"
+
+# No physical slot may be left pinning WAL for a pod that does not exist; asserted above.
+# A LEGACY repmgr_slot_* left by a cluster that predates #294 must also be reclaimed -- that is
+# the one reader nodeIDBase still has (slotOrdinal's legacy branch). Asserted unconditionally now:
+# gating it on chart_mechanism made it dead, and the assertion is meaningful under native
+# precisely because such a slot can only arrive from a repmgr-created cluster.
+ghost_slot=$(pg_exec "${NAMESPACE}" "${P}" \
+  "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'repmgr_slot_%'" repmgr repmgr 2>/dev/null | xargs || echo "")
+assert_eq "#289/#294: no legacy repmgr_slot_* left pinning WAL after the scale-down" "0" "${ghost_slot}"
 
 # Cleanup.
 helm uninstall "${RELEASE}" -n "${NAMESPACE}" 2>/dev/null || true

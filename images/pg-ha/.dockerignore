@@ -1,0 +1,48 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+README.md
+*.md
+
+# Docker
+Dockerfile*
+.dockerignore
+
+# Development files
+.idea
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+
+# Local Go artifacts, mirroring agent/.gitignore (#333). A stray `go mod vendor` puts
+# thousands of files into the build context and, worse, makes a build LOOK hermetic while
+# the explicit GOFLAGS=-mod=readonly still resolves everything from the proxy. A crashed
+# `go test ./internal/process` leaves multi-megabyte core dumps behind the same way. Both
+# only cost cache invalidation and build time, but neither belongs in a build context.
+#
+# `core.*` alone would match only the context ROOT: .dockerignore patterns are anchored,
+# so the very dumps named above -- which land in agent/internal/process/ next to the test
+# that crashed -- would still be copied in. `**/core.*` is what actually excludes them.
+agent/vendor/
+core.*
+**/core.*
+# ...but never a Go SOURCE file that happens to be called core.go. The sibling
+# images/pg-ha/agent/.gitignore carries the same escape hatch for the same reason (#298
+# review): without it a future agent/internal/<pkg>/core.go compiles locally and under
+# `go test ./...`, but is silently absent from the build context, so the Docker build fails
+# at `go build` with an "undefined:" error naming a symbol that does exist on disk.
+!core.go
+!**/core.go
+
+# The image's own test scripts run from the checkout, never from inside the image.
+test/

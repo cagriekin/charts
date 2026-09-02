@@ -1,19 +1,18 @@
-# PostgreSQL with repmgr and PGPool-II
+# Highly-available PostgreSQL with PGPool-II
 
-PostgreSQL Helm chart with repmgr for automatic failover and replication management, optional PGPool-II for connection pooling and read/write splitting.
+PostgreSQL Helm chart with native streaming replication and a lease-based Go failover agent, optional PGPool-II for connection pooling and read/write splitting. (repmgr drove replication through 1.x; 2.0.0 replaced it with the agent and removed it from the image — see [Upgrading to 2.0.0](#upgrading-to-200-repmgrd-removed).)
 
 ## Features
 
-- PostgreSQL 18.1 with configurable version
-- Repmgr for automatic failover and replication management
-- Service-updater sidecar for automatic primary service selector updates after failover
+- PostgreSQL 18 with configurable major (18 or 17)
+- Lease-based HA agent (`pg-ha-agent`, PID 1 in the postgresql container) for automatic failover, replication management, and primary Service selector updates — no HA sidecars (the `repmgrd` and `service-updater` sidecars were removed in 2.0.0; the pgBackRest and metrics-exporter sidecars are unaffected)
 - Stale-primary protection: a crashed primary that restarts after a standby was promoted rejoins as a standby (via pg_rewind) instead of resuming read-write on a divergent timeline
-- Read-only `<fullname>-readonly` service targeting standby pods for read scaling (repmgr mode)
+- Read-only `<fullname>-readonly` service targeting standby pods for read scaling (HA mode)
 - Optional PGPool-II for connection pooling and read/write splitting
 - Support for existing secrets or auto-generated passwords
 - StatefulSet-based deployment with persistent storage
 - PostgreSQL configuration injection via ConfigMap (postgresql.conf overrides, pg_hba.conf entries)
-- PostStart lifecycle hooks with primary-aware execution in repmgr setups
+- PostStart lifecycle hooks with primary-aware execution in HA setups
 - Pod disruption budgets for safe node drains
 - Configurable update strategy, resource limits, probes, and affinity
 - Prometheus exporters for PostgreSQL and PGPool-II metrics with ServiceMonitor support
@@ -91,7 +90,7 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `busyboxImage.digest` | Optional digest pin (`sha256:...`), appended as `repository:tag@digest` | `""` |
 
 > **Pinning images by digest (#26).** Every image block — `postgresql.image`,
-> `repmgr.image`, `pgpool.image`, `pgpool.metrics.image`, `prometheusExporter.image`,
+> `ha.image`, `pgpool.image`, `pgpool.metrics.image`, `prometheusExporter.image`,
 > `busyboxImage`, `backup.mc.image`, and `pgbackrest.cronjob.image` — accepts an
 > optional `digest` (e.g. `sha256:…`). When set, the image is rendered as
 > `repository:tag@digest` so a mutable-tag repush cannot silently change what runs.
@@ -104,8 +103,8 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.image.repository` | PostgreSQL image repository | `postgres` |
 | `postgresql.image.tag` | PostgreSQL image tag | `18.1-trixie` |
 | `postgresql.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `postgresql.majorVersion` | PostgreSQL major version in `image.tag`; builds the extension paths (`/usr/lib/postgresql/<major>/lib`, `/usr/share/postgresql/<major>/extension`) when `extensions.enabled=true`. In repmgr mode the server runs from the repmgr image and follows `repmgr.image.majorVersion` regardless of `postgresql.image`; the chart fails to render if the two majors differ. Set both to `"17"` (with a `-pg17` repmgr tag) to run PostgreSQL 17 — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
-| `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1); values > 0 require `repmgr.enabled=true` | `1` |
+| `postgresql.majorVersion` | PostgreSQL major version in `image.tag`; builds the extension paths (`/usr/lib/postgresql/<major>/lib`, `/usr/share/postgresql/<major>/extension`) when `extensions.enabled=true`. With `ha.enabled` the server runs from the HA image and follows `ha.image.majorVersion` regardless of `postgresql.image`; the chart fails to render if the two majors differ. Set both to `"17"` (with a `-pg17` HA image tag) to run PostgreSQL 17 — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
+| `postgresql.replicaCount` | Number of PostgreSQL replicas (total instances = replicaCount + 1); values > 0 require `ha.enabled=true` | `1` |
 | `postgresql.database` | Database name | `postgres` |
 | `postgresql.username` | Database username | `postgres` |
 | `postgresql.resources.requests.cpu` | CPU request | `100m` |
@@ -139,7 +138,7 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.readinessProbe.periodSeconds` | Check interval | `10` |
 | `postgresql.readinessProbe.timeoutSeconds` | Timeout | `5` |
 | `postgresql.readinessProbe.failureThreshold` | Failure threshold | `6` |
-| `postgresql.startupProbe.enabled` | Enable startup probe (suspends liveness/readiness until PostgreSQL first accepts connections, so the repmgr stale-primary guard and crash recovery are not killed mid-startup) | `true` |
+| `postgresql.startupProbe.enabled` | Enable startup probe (suspends liveness/readiness until PostgreSQL first accepts connections, so first-boot recovery and WAL replay are not killed mid-startup) | `true` |
 | `postgresql.startupProbe.periodSeconds` | Check interval | `10` |
 | `postgresql.startupProbe.timeoutSeconds` | Timeout | `5` |
 | `postgresql.startupProbe.failureThreshold` | Failure threshold (`periodSeconds` x this = total startup budget, 600s) | `60` |
@@ -178,7 +177,7 @@ Runtime configuration can be injected without rebuilding images. Settings are wr
 | `postgresql.extensions.extraVolumeMounts` | Where `extraVolumes` land inside both extension init containers | `[]` |
 | `postgresql.extensions.extraLibs` | Exact absolute FILE paths (no trailing `/`) to additionally copy into a dedicated volume, for a package's own shared-library dependency Debian installs outside the Postgres extension dir (e.g. `libsodium.so.23`; see [Copying a package's own shared-library dependencies](#copying-a-packages-own-shared-library-dependencies-309)) | `[]` |
 | `postgresql.extensions.installResources` | Resources for the apt-get step (only rendered while `packages` is non-empty) | `100m/128Mi` req, `1/512Mi` limit |
-| `postgresql.audit.enabled` | Enable pgaudit audit logging (requires repmgr mode; see [Audit logging](#audit-logging-pgaudit)) | `false` |
+| `postgresql.audit.enabled` | Enable pgaudit audit logging (requires `ha.enabled`; see [Audit logging](#audit-logging-pgaudit)) | `false` |
 | `postgresql.audit.log` | pgaudit session classes: `read,write,function,role,ddl,misc,misc_set,all` (negate with `-`) | `"ddl, role, write"` |
 | `postgresql.audit.logCatalog` | Audit `pg_catalog` statements | `false` |
 | `postgresql.audit.logParameter` | Log statement parameter values (may contain PII/secrets) | `false` |
@@ -209,21 +208,21 @@ postgresql:
         psql -U postgres -d "$POSTGRES_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1
 ```
 
-When `repmgr.enabled` is true, `additionalCommands` automatically discover the current primary and execute against it, so DDL statements like `CREATE EXTENSION` work correctly regardless of which pod the hook runs on (including standbys after a failover).
+When `ha.enabled` is true, `additionalCommands` automatically discover the current primary and execute against it, so DDL statements like `CREATE EXTENSION` work correctly regardless of which pod the hook runs on (including standbys after a failover).
 
 ### Logical Replication (#308)
 
 Set `postgresql.walLevel: logical` for a logical-replication subscriber (`CREATE SUBSCRIPTION`, Debezium, or any other decoder on a replication slot). `logical` is a strict superset of `replica` and works regardless of `pgbackrest.enabled`/`archive_mode=on` — the two are unrelated concerns. `wal_level` is a postmaster parameter — the change rolls the pods via the existing configmap-checksum annotation, the same way any other `postgresql.configuration` change does.
 
-**Capacity.** Every physical standby consumes one `max_wal_senders` slot (and, in agent mode, one `max_replication_slots` entry — see `repmgr.agent.syncReplicationSlots` below); every logical subscriber consumes one more of each. The image's own initdb default is `max_wal_senders = 10` / `max_replication_slots = 10` (unaffected by `postgresql.walLevel`), which now flows through uncontested instead of being silently re-asserted by `pgbackrest-archive.conf` — so raise both via `postgresql.configuration` if `replicaCount` plus your logical subscriber count would otherwise exhaust the default.
+**Capacity.** Every physical standby consumes one `max_wal_senders` slot (and, in agent mode, one `max_replication_slots` entry — see `ha.agent.syncReplicationSlots` below); every logical subscriber consumes one more of each. The image's own initdb default is `max_wal_senders = 10` / `max_replication_slots = 10` (unaffected by `postgresql.walLevel`), which now flows through uncontested instead of being silently re-asserted by `pgbackrest-archive.conf` — so raise both via `postgresql.configuration` if `replicaCount` plus your logical subscriber count would otherwise exhaust the default.
 
 **This is the only place to set `wal_level`.** `pgbackrest.enabled` used to render a hardcoded `wal_level = replica` into its own `pgbackrest-archive.conf`, which sorts after `custom.conf` under `include_dir` and would silently win over a `postgresql.configuration.wal_level` you set yourself — that coupling is gone (`postgresql.walLevel` now has its own render block, independent of `pgbackrest.enabled`), but the chart still rejects `wal_level` in `postgresql.configuration` at render time and tells you to set `postgresql.walLevel` instead, so there is exactly one source of truth regardless of pgBackRest's state.
 
 A logical subscriber must connect to the **write Service** (`<fullname>:5432`), not Pgpool — Pgpool's query routing is built for physical replicas, not for holding a replication slot's connection open.
 
-**Surviving a failover: `repmgr.agent.syncReplicationSlots`.** A plain logical slot does not survive the primary moving — `synchronized_standby_slots` (PostgreSQL 17+) is what lets a **failover** slot (`CREATE SUBSCRIPTION ... WITH (failover = true)`) be synced to a standby so it's still there after a promote, but it names physical replication slots, and PostgreSQL 17+'s `sync_replication_slots` worker (the standby-side process that keeps the failover slot in sync) additionally requires `dbname` in `primary_conninfo`, which repmgr's own clone/follow machinery never sets.
+**Surviving a failover: `ha.agent.syncReplicationSlots`.** A plain logical slot does not survive the primary moving — `synchronized_standby_slots` (PostgreSQL 17+) is what lets a **failover** slot (`CREATE SUBSCRIPTION ... WITH (failover = true)`) be synced to a standby so it's still there after a promote, but it names physical replication slots, and PostgreSQL 17+'s `sync_replication_slots` worker (the standby-side process that keeps the failover slot in sync) additionally requires `dbname` in `primary_conninfo`, which repmgr's own clone/follow machinery never sets.
 
-The chart and agent (failover mode `agent` only) handle both automatically when `repmgr.agent.syncReplicationSlots: true`:
+The chart and agent (failover mode `agent` only) handle both automatically when `ha.agent.syncReplicationSlots: true`:
 
 - the agent patches `dbname` into `primary_conninfo` after every clone, follow, and rejoin (a no-op if it's already present, and harmless for physical-only replication either way — it ships unconditionally, not gated behind this value);
 - `sync_replication_slots = on` is set in `postgresql.conf` (inert on a primary; needed on any node that may run the slot-sync worker as a standby);
@@ -255,11 +254,11 @@ postgresql:
 
 Declaring `postgres` (or whatever `postgresql.database` is) under `postgresql.databases[]` works because the databases-roles hook Job's `CREATE DATABASE` is already conditional (`WHERE NOT EXISTS ... \gexec`) — it no-ops when the database already exists — and the extension/grant step then runs against that database by name regardless of whether the Job created it. This is preferable to `postgresql.lifecycle.postStart.additionalCommands` for this case: it's already regex-validated (no injection surface) and runs once via a proper Helm hook Job rather than raw shell on every pod boot.
 
-In repmgr mode, `shared_preload_libraries: pg_cron` is merged with `repmgr` (and `pgaudit`, if audit is on) automatically — declare only your own libraries, per [Mounting an extra file on every replica](#mounting-an-extra-file-on-every-replica) below.
+The chart merges nothing into `shared_preload_libraries` for HA any more (a native cluster has no repmgr extension), so your value passes through as written — except `pgaudit`, which is still merged when audit logging is on. Declaring `repmgr` yourself **fails the render** (#293). See [Mounting an extra file on every replica](#mounting-an-extra-file-on-every-replica) below.
 
 **Version pinning.** Append `=version` in apt syntax, e.g. `"postgresql-{major}-cron=1.6.4-1"`. `{major}` is substituted with `postgresql.majorVersion` at render time, so a package list survives a later major bump without editing (confirm the new major has a PGDG build of the same extension before bumping, though).
 
-**PGDG apt-source assumption.** `copy-base-ext` runs from the `cagriekin/repmgr` image, which configures the PGDG apt repository itself at build time — package installs there are reliable whenever repmgr mode is on. `copy-ext` runs from whatever `postgresql.image` you set (default: the official `postgres:18.1-trixie` Docker Hub image); this chart does not verify that image has PGDG configured. This matters most in **standalone mode** (`repmgr.enabled: false`), where `copy-ext` is your only extension source; in repmgr mode, `copy-base-ext` is a confirmed-good fallback even if `copy-ext`'s apt step comes up short.
+**PGDG apt-source assumption.** `copy-base-ext` runs from the HA image (`cagriekin/pg-ha`), which configures the PGDG apt repository itself at build time — package installs there are reliable whenever `ha.enabled` is on. `copy-ext` runs from whatever `postgresql.image` you set (default: the official `postgres:18.1-trixie` Docker Hub image); this chart does not verify that image has PGDG configured. This matters most in **standalone mode** (`ha.enabled: false`), where `copy-ext` is your only extension source; with `ha.enabled`, `copy-base-ext` is a confirmed-good fallback even if `copy-ext`'s apt step comes up short.
 
 **NetworkPolicy.** With `networkPolicy.enabled: true`, egress is closed by default except DNS, PostgreSQL, and 443/6443. `apt-get update`/`install` talks to `apt.postgresql.org` over **port 80** (plain HTTP; the apt source itself is signature-verified via a keyring already baked into the image, so this is not a TLS downgrade of package integrity). Add it via the existing egress hook:
 
@@ -280,7 +279,7 @@ This egress is needed on **every** pod (re)start, not just the first install: `e
 
 ### Installing packages from a non-PGDG apt source (#310)
 
-Several real-world extensions — `pgsodium`, `supabase_vault`, `pg_graphql`, `pg_net`, `supautils`, `wrappers`, `pgjwt`, `pgmq` — aren't PGDG-packaged at all; they're only available via [Pigsty's apt repo](https://repo.pigsty.io) (`repo.pigsty.io/apt/pgsql/<codename>`). `postgresql.extensions.aptSources` adds a source like that inside `copy-ext`/`copy-base-ext`'s own throwaway filesystem, before the `apt-get install` step above — so a package that isn't on PGDG installs the same way a PGDG one does, without needing it pre-baked into either image (including the `cagriekin/repmgr` image copy-base-ext runs from, which has no Pigsty source and isn't something a chart consumer builds).
+Several real-world extensions — `pgsodium`, `supabase_vault`, `pg_graphql`, `pg_net`, `supautils`, `wrappers`, `pgjwt`, `pgmq` — aren't PGDG-packaged at all; they're only available via [Pigsty's apt repo](https://repo.pigsty.io) (`repo.pigsty.io/apt/pgsql/<codename>`). `postgresql.extensions.aptSources` adds a source like that inside `copy-ext`/`copy-base-ext`'s own throwaway filesystem, before the `apt-get install` step above — so a package that isn't on PGDG installs the same way a PGDG one does, without needing it pre-baked into either image (including the `cagriekin/pg-ha` image copy-base-ext runs from, which has no Pigsty source and isn't something a chart consumer builds).
 
 `pgsodium`/`supabase_vault` also need `postgresql.extensions.extraLibs` (next section) to actually start — `aptSources` + `packages` alone gets the extension `.so` copied, but not its own runtime dependency, so read that section too before using this example for real.
 
@@ -298,11 +297,11 @@ postgresql:
       - "postgresql-{major}-vault"
 ```
 
-`trixie` above is the Debian codename the image actually ships (the official `postgres:18.1-trixie` image, by default) — unlike `{major}` in `packages`/`aptLine`, this isn't derived from any chart value, since the chart has no notion of "Debian codename" independent of the image tag; write the one your `postgresql.image`/`repmgr.image` actually use. `{major}` in `aptLine` still substitutes `postgresql.majorVersion`, same as in `packages`.
+`trixie` above is the Debian codename the image actually ships (the official `postgres:18.1-trixie` image, by default) — unlike `{major}` in `packages`/`aptLine`, this isn't derived from any chart value, since the chart has no notion of "Debian codename" independent of the image tag; write the one your `postgresql.image`/`ha.image` actually use. `{major}` in `aptLine` still substitutes `postgresql.majorVersion`, same as in `packages`.
 
-Each entry is dearmored to `/usr/share/keyrings/pgchart-<name>-keyring.gpg` and written to `/etc/apt/sources.list.d/pgchart-<name>.list` via `curl | gpg --dearmor` before `apt-get update` runs again — the `pgchart-` prefix means an entry can never collide with a source the image already owns (the `cagriekin/repmgr` image's own PGDG source is `postgresql-keyring.gpg`/`postgresql.list`); `name` must still be unique across your own `aptSources` entries, and both `keyUrl` and `aptLine` are restricted to a narrow character allowlist at render time (`pg.validateExtensionAptSources`), since both are interpolated into a shell command. An entry is rejected outright if `packages` is empty — `aptSources` exists only to make packages from that source installable, so it has nothing to do without at least one.
+Each entry is dearmored to `/usr/share/keyrings/pgchart-<name>-keyring.gpg` and written to `/etc/apt/sources.list.d/pgchart-<name>.list` via `curl | gpg --dearmor` before `apt-get update` runs again — the `pgchart-` prefix means an entry can never collide with a source the image already owns (the `cagriekin/pg-ha` image's own PGDG source is `postgresql-keyring.gpg`/`postgresql.list`); `name` must still be unique across your own `aptSources` entries, and both `keyUrl` and `aptLine` are restricted to a narrow character allowlist at render time (`pg.validateExtensionAptSources`), since both are interpolated into a shell command. An entry is rejected outright if `packages` is empty — `aptSources` exists only to make packages from that source installable, so it has nothing to do without at least one.
 
-`curl`/`gnupg`/`ca-certificates` are installed on demand (a no-op if already present, which the `cagriekin/repmgr` image already is) — only when at least one `aptSources` entry is set, so the default `packages`-only path incurs no extra apt-get calls. Pigsty serves over HTTPS (port 443), and the chart's default `networkPolicy` already opens 443/6443 with no destination restriction (S3 endpoints and cloud API servers need the same), so no `extraEgress` addition is needed for it — unlike `apt.postgresql.org`, which needs the port-80 addition above.
+`curl`/`gnupg`/`ca-certificates` are installed on demand (a no-op if already present, which the `cagriekin/pg-ha` image already is) — only when at least one `aptSources` entry is set, so the default `packages`-only path incurs no extra apt-get calls. Pigsty serves over HTTPS (port 443), and the chart's default `networkPolicy` already opens 443/6443 with no destination restriction (S3 endpoints and cloud API servers need the same), so no `extraEgress` addition is needed for it — unlike `apt.postgresql.org`, which needs the port-80 addition above.
 
 ### Taking the install off the pod-start path (#320)
 
@@ -426,7 +425,7 @@ This redirects the per-start install; it does not remove it. To take the install
 
 #### Don't declare a `pgdg` entry in `aptSources`
 
-It is always fatal, and it's now refused at render time. Both `postgres:*-trixie` and the `cagriekin/repmgr` image already configure `apt.postgresql.org` under their **own** keyring paths, and the chart derives its keyring path from the entry `name` (`/usr/share/keyrings/pgchart-<name>-keyring.gpg`) with no way to override it. apt sees two entries for the same repo with different `Signed-By` values and rejects the **entire** source list:
+It is always fatal, and it's now refused at render time. Both `postgres:*-trixie` and the `cagriekin/pg-ha` image already configure `apt.postgresql.org` under their **own** keyring paths, and the chart derives its keyring path from the entry `name` (`/usr/share/keyrings/pgchart-<name>-keyring.gpg`) with no way to override it. apt sees two entries for the same repo with different `Signed-By` values and rejects the **entire** source list:
 
 ```text
 E: Conflicting values set for option Signed-By regarding source http://apt.postgresql.org/pub/repos/apt/ trixie-pgdg
@@ -462,9 +461,9 @@ Copying the file alone is still not enough: `pgsodium.so` carries `libsodium.so.
 
 Gated specifically on `extraLibs`, not on bare `extensions.enabled`: `LD_LIBRARY_PATH` takes priority over the default loader directories for *every* symbol resolution in the process, not just this one dependency, so a release that doesn't use this feature gets no search-path change and no extra volume at all — byte-stable default render.
 
-`extraLibs` is deliberately **explicit, not automatic** — it does not walk `ldd` and copy every transitive dependency a package pulls in. `copy-base-ext` (the `cagriekin/repmgr` image) and `copy-ext` (`postgresql.image`) can be different image builds; silently auto-copying a resolved `libc`/`libssl`/etc. from one into the other risks shadowing the *running* container's own runtime with a build from a different image — an ABI hazard, not a convenience. Every library the postmaster itself links (confirmed live via `ldd postgres` against the shipped `postgres:*-trixie`/`cagriekin/repmgr` images — the full glibc/OpenSSL/Kerberos/LDAP/ICU/compression/audit set, not just `libc`) plus `libpq` (the dependency of `libpqwalreceiver.so`, the exact ABI hazard `#302` exists for) is refused at render time (`pg.validateExtraLibs`) for exactly that reason; `extraLibs` is for extension-specific dependencies like `libsodium.so.23`, never for a library the server already depends on. This is the *current* denylist for the images this chart ships by default, not an eternal guarantee — a future base-image bump could add a dependency it doesn't yet know about. An entry is rejected if `packages` is empty, same reasoning as `aptSources`; an entry whose basename doesn't look like a shared library (no `.so`/`.so.<N>` suffix) is rejected too, so a directory or unrelated file fails the render instead of crash-looping the pod; two entries copying to the same destination filename are also rejected, since which one wins would otherwise depend on `copy-base-ext`/`copy-ext` ordering.
+`extraLibs` is deliberately **explicit, not automatic** — it does not walk `ldd` and copy every transitive dependency a package pulls in. `copy-base-ext` (the `cagriekin/pg-ha` image) and `copy-ext` (`postgresql.image`) can be different image builds; silently auto-copying a resolved `libc`/`libssl`/etc. from one into the other risks shadowing the *running* container's own runtime with a build from a different image — an ABI hazard, not a convenience. Every library the postmaster itself links (confirmed live via `ldd postgres` against the shipped `postgres:*-trixie`/`cagriekin/pg-ha` images — the full glibc/OpenSSL/Kerberos/LDAP/ICU/compression/audit set, not just `libc`) plus `libpq` (the dependency of `libpqwalreceiver.so`, the exact ABI hazard `#302` exists for) is refused at render time (`pg.validateExtraLibs`) for exactly that reason; `extraLibs` is for extension-specific dependencies like `libsodium.so.23`, never for a library the server already depends on. This is the *current* denylist for the images this chart ships by default, not an eternal guarantee — a future base-image bump could add a dependency it doesn't yet know about. An entry is rejected if `packages` is empty, same reasoning as `aptSources`; an entry whose basename doesn't look like a shared library (no `.so`/`.so.<N>` suffix) is rejected too, so a directory or unrelated file fails the render instead of crash-looping the pod; two entries copying to the same destination filename are also rejected, since which one wins would otherwise depend on `copy-base-ext`/`copy-ext` ordering.
 
-`extraLibs` copies from **each image's own filesystem** — `copy-base-ext` copies from wherever the path resolves inside the `cagriekin/repmgr` image, `copy-ext` from wherever it resolves inside `postgresql.image`. Both must actually have the file at that path (both images are Debian trixie-based by default, so this is normally a non-issue); if they ever diverge in base OS/codename, a path that only exists in one image's build makes `copy-base-ext`'s `&&`-chained `cp` hard-fail the whole command.
+`extraLibs` copies from **each image's own filesystem** — `copy-base-ext` copies from wherever the path resolves inside the `cagriekin/pg-ha` image, `copy-ext` from wherever it resolves inside `postgresql.image`. Both must actually have the file at that path (both images are Debian trixie-based by default, so this is normally a non-issue); if they ever diverge in base OS/codename, a path that only exists in one image's build makes `copy-base-ext`'s `&&`-chained `cp` hard-fail the whole command.
 
 **Security note.** `keyUrl` is pinned to `https://` and the rendered `curl` call is pinned with `--proto '=https' --proto-redir '=https'`, so the key can never be fetched (or redirected to) over plaintext HTTP. There's no fingerprint pinning beyond that, though: the key is trusted purely on TLS to whatever host `keyUrl` names, and that host's maintainer scripts then run as root during `apt-get install`. Adding a non-PGDG source is a real trust-boundary expansion — from PGDG/Debian to any host an operator names — same as adding any apt source to any Debian system; there's no way around this that doesn't require re-hosting the key.
 
@@ -493,131 +492,266 @@ postgresql:
     pgsodium.getkey_script: /etc/postgresql/pgsodium/getkey.sh
 ```
 
-In repmgr mode the chart merges `repmgr` into `shared_preload_libraries` for you — declare only your own libraries. (A bare value in `configuration` is loaded via `include_dir` *after* the image's own `postgresql.conf`, so without that merge it would override the image's `shared_preload_libraries = 'repmgr'` and silently disable failover.)
+There is nothing to merge for HA — a native cluster has no repmgr extension — so your value passes through unchanged, and **declaring `repmgr` yourself now fails the render** (#293). That is deliberate: because the value loads via `include_dir`, it would override the image's own native gate and preload `repmgr.so` onto a cluster with nothing to use it, which becomes an every-pod crash-loop the moment the repmgr-free image ships. The message names the value and the fix. `$libdir/repmgr` and `repmgr.so` are rejected the same way — PostgreSQL resolves all three to the same library.
 
 `postgresql.extraEnv` does the same for environment variables and accepts both `value` and `valueFrom`.
 
 These three values are validated at render time, so a mistake fails `helm install`/`upgrade` with a clear message instead of at apply time or silently at runtime:
 
 - each must be a **list** of objects (a map is a common slip and would otherwise produce an opaque YAML parse error);
-- an `extraVolumes` name may not collide with a chart-managed volume (`data`, `postgresql-config`, `postgresql-tls`, `ext-lib`, `ext-share`, `ext-extra-lib`, `repmgr-config`, `etcd-tls`, `pg-run`, `pgbackrest-config`, `service-updater-script`) — a `data` collision is silently dropped in favour of the volumeClaimTemplate;
+- an `extraVolumes` name may not collide with a chart-managed volume (`data`, `postgresql-config`, `postgresql-tls`, `ext-lib`, `ext-share`, `ext-extra-lib`, `repmgr-config`, `etcd-tls`, `pg-run`, `pgbackrest-config`) — a `data` collision is silently dropped in favour of the volumeClaimTemplate;
 - every `extraVolumeMounts` entry must reference a declared `extraVolumes` entry (catches the `extraVolume:`/`extraVolumes:` typo, which the API server would otherwise reject only at apply time);
 - `extraEnv` may not reuse a chart-set env name (`PGDATA`, `POSTGRES_*`, `REPMGR_*`, …) — duplicate env names are last-wins at runtime, so an override would silently shadow the chart/Secret value.
 
-### Repmgr Parameters
+### HA Parameters
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `repmgr.enabled` | Enable repmgr | `true` |
-| `repmgr.image.repository` | Repmgr image repository | `cagriekin/repmgr` |
-| `repmgr.image.tag` | Repmgr image tag. Unsuffixed = the default major (18); `-pg18` / `-pg17` select one explicitly | `trixie-5.5.0-34` |
-| `repmgr.image.pullPolicy` | Image pull policy | `IfNotPresent` |
-| `repmgr.image.majorVersion` | PostgreSQL major bundled in the repmgr image. In repmgr mode the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `repmgr.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
-| `repmgr.username` | Repmgr database user | `repmgr` |
-| `repmgr.database` | Repmgr database name | `repmgr` |
-| `repmgr.monitoringHistoryDays` | Days of `repmgr.monitoring_history` to retain; pruned daily on the primary via `repmgr cluster cleanup` | `7` |
-| `repmgr.terminationGracePeriodSeconds` | Time allowed for graceful shutdown and failover | `120` |
-| `repmgr.resources.requests.cpu` | CPU request | `50m` |
-| `repmgr.resources.requests.memory` | Memory request | `128Mi` |
-| `repmgr.resources.limits.cpu` | CPU limit | `500m` |
-| `repmgr.resources.limits.memory` | Memory limit | `512Mi` |
-| `repmgr.splitBrainDetection.action` | Action on split-brain: `log` (alert only) or `fence` (terminate stale primary) | `log` |
-| `repmgr.serviceUpdater.resources.requests.cpu` | Service-updater CPU request | `50m` |
-| `repmgr.serviceUpdater.resources.requests.memory` | Service-updater memory request | `64Mi` |
-| `repmgr.serviceUpdater.resources.limits.memory` | Service-updater memory limit | `128Mi` |
-| `repmgr.initContainerResources` | Resources for the `repmgr-init` standby-clone init container (heavier than the shared init default; raise for large databases) | `requests: 100m/128Mi, limits: 1/1Gi` |
+| `ha.enabled` | Enable HA (the lease-based agent + replication). `false` is standalone: one stock-postgres pod, `replicaCount` must be `0` | `true` |
+| `ha.image.repository` | HA image repository — the PostgreSQL + failover-agent image. `cagriekin/pg-ha` since 2.0.0 (#290); `cagriekin/repmgr` stays published and frozen at its last `trixie-` tag so existing 1.x pins keep resolving | `cagriekin/pg-ha` |
+| `ha.image.tag` | HA image tag. The PostgreSQL major is in the tag (`-pg18` / `-pg17`, no unsuffixed alias since #290); move it together with both `majorVersion` values | `2.0.0-pg18` |
+| `ha.image.pullPolicy` | Image pull policy | `IfNotPresent` |
+| `ha.image.majorVersion` | PostgreSQL major bundled in the HA image. With `ha.enabled` the server always runs this major; `postgresql.majorVersion` must match or the chart fails to render. Move it together with `ha.image.tag` (`17` ⇄ `-pg17`) — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major). | `"18"` |
+| `ha.username` | PostgreSQL role the agent authenticates as for probes, `pg_basebackup`, and `primary_conninfo`. Still named `repmgr` for continuity: renaming it rewrites a live cluster's role, so it is out of scope for #291 | `repmgr` |
+| `ha.database` | Database the agent connects to for those probes. Named `repmgr` for the same continuity reason as `ha.username` | `repmgr` |
+| `ha.terminationGracePeriodSeconds` | Time allowed for graceful shutdown and failover | `120` |
+| `ha.resources.requests.cpu` | **Not consumed since #286.** The agent runs inside the `postgresql` container, so its CPU/memory come from `postgresql.resources`; these four keys are kept only so an existing values file still renders | `50m` |
+| `ha.resources.requests.memory` | **Not consumed since #286** — see above | `128Mi` |
+| `ha.resources.limits.cpu` | **Not consumed since #286** — see above | `500m` |
+| `ha.resources.limits.memory` | **Not consumed since #286** — see above. Size the database container with `postgresql.resources.limits.memory` instead | `512Mi` |
+| `ha.initContainerResources` | Resources for the `repmgr-init` init container. It **no longer clones** in 2.0.0 — the agent does that from the `postgresql` container (#288) — so it only runs `entrypoint.sh init`. A large first clone is bounded by `postgresql.resources` and `postgresql.startupProbe.failureThreshold`, not by this | `requests: 100m/128Mi, limits: 1/1Gi` |
 
-When repmgr is enabled, a preStop lifecycle hook stops PostgreSQL cleanly (`pg_ctl stop -m fast`) before pod termination. If the terminated pod was the primary, repmgrd on a standby detects the outage and promotes via its `promote_command`, which also updates repmgr metadata; the hook deliberately does not promote out-of-band, since a raw `pg_promote()` would leave repmgr.nodes stale and strand every repmgrd. The `terminationGracePeriodSeconds` controls how long Kubernetes waits for the shutdown to complete.
+There is **no preStop hook** in HA mode. The agent runs as PID 1 and owns SIGTERM: it releases
+the Lease first, then stops its PostgreSQL child. A preStop `pg_ctl stop` would race that
+supervisor and stop PostgreSQL before the Lease was released.
+`ha.terminationGracePeriodSeconds` controls how long Kubernetes waits for that shutdown.
 
-When repmgr is enabled, two sidecars run alongside PostgreSQL in each pod:
+When `ha.enabled` is true there are **no HA sidecars**: the `pg-ha-agent` binary is PID 1 in the
+`postgresql` container and does all of it — holds the Lease, decides promotion by timeline and
+LSN, drives PostgreSQL directly (`pg_ctl`, `pg_basebackup`, `pg_rewind`), patches the Service selector to the
+current primary, and maintains the `pg-role` label (`primary`/`standby`/`orphan`) that the
+`<fullname>-readonly` Service selects on. The repmgrd and service-updater sidecars that used to
+do this were removed in **2.0.0** (#286); see
+[Upgrading to 2.0.0](#upgrading-to-200-repmgrd-removed).
 
-- **repmgrd**: monitors replication and triggers automatic failover when the primary becomes unavailable. Has a preStop hook that runs `repmgr daemon stop` so the shutting-down node's daemon does not trigger a spurious failover during pod termination. (This stops the daemon only; the master's service-updater handles unregistering nodes that a scale-down removed — see [Scaling down](#scaling-down).)
-- **service-updater**: watches repmgr cluster state and patches the Kubernetes Service selector to point to the current primary, then restarts PGPool-II if enabled. Also maintains a `pg-role` label (`primary`/`standby`) on every postgresql pod each cycle, which the `<fullname>-readonly` service selects (`pg-role: standby`) to route read traffic to replicas; pods without the label (fresh, recreated or scaled-up) are excluded until labeled. Has a preStop hook that sleeps 5s to allow in-flight patches to complete. Includes a liveness probe that checks for a heartbeat file updated each loop iteration (fails if no update within 120s). Performs split-brain detection each cycle by querying all nodes for `pg_is_in_recovery()` -- if multiple primaries are found, takes the configured action (`log` or `fence`).
-
-**Split-brain detection**: In a 2-node cluster, network partitions can cause both nodes to believe they are the primary. The service-updater detects this by checking all nodes each monitoring cycle. With `action: log` (default), it logs a critical warning. With `action: fence`, it compares WAL LSN positions and terminates connections on the stale primary. For production deployments, use 3+ nodes to reduce split-brain risk.
+**Split-brain handling**: leadership is a Kubernetes Lease, so two pods cannot both hold it. If a
+pod finds itself read-write *without* the Lease — the window a partition can open — it records the
+condition and demotes itself, unconditionally. That is a local operation (`pg_ctl`), so the Role
+grants no pod-delete permission. (`ha.splitBrainDetection.action` once named a `log`/`fence` choice
+here and was removed in 2.0.0: the behaviours it selected between were already identical.) For
+production, 3+ nodes still reduce partition risk.
 
 ### Choosing the PostgreSQL major
 
-**PostgreSQL 18 is the default. PostgreSQL 17 is selectable.** In repmgr mode the server binaries come from the **repmgr image**, not from `postgresql.image` — so the major is decided by which repmgr image you run, and setting `postgresql.image` to another major has no effect on the running server. The image is published per major:
+**PostgreSQL 18 is the default. PostgreSQL 17 is selectable.** With `ha.enabled` the server binaries come from the **HA image** (`ha.image`), not from `postgresql.image` — so the major is decided by which HA image you run, and setting `postgresql.image` to another major has no effect on the running server. The image is published per major:
 
 | Tag | PostgreSQL | Use |
 |-----|------------|-----|
-| `trixie-<repmgr>-<n>` | 18 | The default. What every unsuffixed pin resolves to — unchanged by this feature |
-| `trixie-<repmgr>-<n>-pg18` | 18 | The same build, named explicitly |
-| `trixie-<repmgr>-<n>-pg17` | 17 | PostgreSQL 17 |
+| `cagriekin/pg-ha:<chart-version>-pg18` | 18 | The default |
+| `cagriekin/pg-ha:<chart-version>-pg17` | 17 | PostgreSQL 17 |
 
-All three are multi-arch (amd64/arm64), SBOM- and provenance-attested, and cosign-signed exactly like the unsuffixed tag.
+Both are multi-arch (amd64/arm64), SBOM- and provenance-attested, and cosign-signed.
 
-Three values move **together**; the chart refuses to render if the two majors disagree (in either direction), because a mismatch would silently run one major while building extension paths for another:
+The major is **in** the tag, and there is deliberately **no** unsuffixed "default major" alias: a
+pin always names the major it wants, and `ha.image.majorVersion` cross-checks it at render time.
+
+> **Tag scheme changed in 2.0.0 (#290).** The image contains no repmgr, so the tag stopped being
+> keyed on a repmgr version: `cagriekin/pg-ha:<chart-version>-pg<major>` replaces
+> `cagriekin/repmgr:trixie-<repmgr>-<n>[-pgNN]`, whose unsuffixed form meant 18. If you are
+> reading this from a 1.x release, that older scheme is what your chart pins.
+> `cagriekin/repmgr` stays published and frozen at its last tag, so existing digest pins keep
+> resolving — but it receives no further builds, including security updates.
+
+These values move **together**; the chart refuses to render if the two majors disagree (in either direction), because a mismatch would silently run one major while building extension paths for another:
 
 ```yaml
 postgresql:
   majorVersion: "17"
   image:
     tag: 17.10-trixie      # only used in standalone mode / for the extension copy
-repmgr:
+ha:
   image:
-    tag: trixie-5.5.0-34-pg17
+    tag: 2.0.0-pg17
     majorVersion: "17"
+# ONLY when the bundled etcd is enabled (etcd.enabled=true): its RBAC-bootstrap Job runs
+# `pg-ha-agent rbac-bootstrap` from the HA image, so pg.validateEtcdBootstrapImage FAILS THE
+# RENDER unless this reference matches ha.image exactly -- repository, tag AND digest. Moving
+# the major therefore touches this pin too; with an external etcd
+# (ha.agent.dcs.etcd.endpoints) the Job never renders and this block is unnecessary.
+etcd:
+  rbac:
+    bootstrapImage:
+      repository: cagriekin/pg-ha
+      tag: 2.0.0-pg17
 ```
 
-The chart checks the claim rather than trusting it: a `-pgNN` tag that disagrees with `repmgr.image.majorVersion` **fails the render**, and `PG_MAJOR` is passed to every container running the repmgr image — so if the majors are moved while the tag is left on the unsuffixed default (which carries no suffix to compare), the entrypoint and the agent refuse to start, naming both the requested and the bundled major. A wrong-major cluster is therefore a loud failure at install time, not a discovery months later.
+The chart checks the claim rather than trusting it: a `-pgNN` tag that disagrees with `ha.image.majorVersion` **fails the render**, and `PG_MAJOR` is passed to every container running the HA image — so if the majors are moved while the tag is left on a private-mirror tag that carries no `-pgNN` suffix to compare, the entrypoint and the agent refuse to start, naming both the requested and the bundled major. (There is no *published* unsuffixed tag since #290; a 1.x-shaped `trixie-` tag, or a repository still ending in `/repmgr`, is refused outright by `pg.validateHaImageGeneration`.) A wrong-major cluster is therefore a loud failure at install time, not a discovery months later.
 
-Standalone mode (`repmgr.enabled=false`) is unconstrained: there is no repmgr image in play, so `postgresql.image` alone decides the major.
+Standalone mode (`ha.enabled=false`) is unconstrained: there is no HA image in play, so `postgresql.image` alone decides the major.
 
 **This is a create-time choice, not an upgrade path.** The chart has no in-place major upgrade: changing the major of an existing cluster would start a new-major server on an old-major `PGDATA`, which refuses to boot. Moving an existing cluster between majors means a logical dump/restore into a fresh release.
 
 Reasons to pick 17 deliberately:
 
-- **repmgr upstream does not list 18.** repmgr's [install requirements](https://www.repmgr.org/docs/current/install-requirements.html) for 5.5.0 (2024-11-24, still the newest release) name PostgreSQL **13–17**. The image builds `postgresql-18-repmgr` from PGDG, and distro packagers do compile 5.5.0 against 18 — but the honest statement is that the PG18 default rests on **distro packaging rather than an upstream support claim**. If you need an upstream-sanctioned repmgr/PostgreSQL pairing, select 17.
+- **PostgreSQL 18 support is no longer gated on repmgr.** Through 1.x this list opened with a
+  caveat that repmgr 5.5.0 names PostgreSQL 13–17 in its install requirements, so 18 was
+  unlisted-but-working. 2.0.0 removed repmgr, so the caveat is gone with it: the agent uses only
+  PostgreSQL's own tooling.
 - **Extension availability varies by major** in PGDG, so a required extension can force a major.
 - **`pg_dump` output is not guaranteed to load into an older server** ([docs](https://www.postgresql.org/docs/18/app-pgdump.html)), so the major a cluster is created on constrains where its data can later go. If you may need to move data to an older-major server, choose deliberately now.
 - **PostgreSQL 17 is supported upstream until 2029-11-08**, so it is a long-lived choice, not a stopgap.
 
 Both majors run the **whole** live test suite in CI (failover, pgBackRest restore/bootstrap, TLS, pgpool, etcd DCS, migration), and each published image is started and checked before release — including that `pgaudit` loads, so [audit logging](#audit-logging-pgaudit) works on either major.
 
-### Failover modes: lease-based `agent` (default) and legacy `repmgrd`
+### Failover: the lease-based agent
 
-`repmgr.failoverMode` selects how failover is decided:
+A Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a Kubernetes
+`coordination.k8s.io/v1` Lease (`<fullname>-leader`) as the **sole authority** for which pod is
+primary, driving PostgreSQL directly (`pg_ctl promote`, `pg_basebackup`, `pg_rewind`).
 
-- **`agent`** (default since `1.0.0`): a Go agent (`pg-ha-agent`) runs as PID 1 in the postgresql container and holds a Kubernetes `coordination.k8s.io/v1` Lease (`<fullname>-leader`) as the **sole authority** for which pod is primary, driving repmgr as a pure mechanism (`failover=manual`, no repmgrd). The Lease replaces hand-rolled split-brain handling and removes the repmgrd startup race.
-- **`repmgrd`** (legacy, opt-in): the repmgrd + service-updater sidecars described above. Unchanged behavior; supported for one major cycle (deprecated). Pin `repmgr.failoverMode: repmgrd` to stay on it.
+What the Lease guarantees precisely: **two pods can never hold it at once**, so there is never
+more than one node the cluster considers primary. It does not instantly stop a node that has
+already lost it from serving writes. Under an asymmetric partition a former holder can stay
+read-write for the window between losing the Lease and noticing — bounded by `renewDeadline`,
+after which the agent demotes and fences itself (see the fencing note below). So the Lease
+removes the *ambiguity* that makes split-brain unrecoverable; the fence is what closes the
+write window.
+
+This is the only failover path. It has been the default since `1.0.0`; the legacy repmgrd +
+service-updater sidecars were removed in **2.0.0**, and `repmgr.failoverMode` is now rejected at
+render time — see [Upgrading to 2.0.0](#upgrading-to-200-repmgrd-removed).
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `repmgr.failoverMode` | `repmgrd` or `agent` | `repmgrd` |
-| `repmgr.agent.leaseDuration` | Lease TTL; a challenger cannot acquire until this elapses since the last renew | `15s` |
-| `repmgr.agent.renewDeadline` | Holder self-demotes if it cannot renew within this | `10s` |
-| `repmgr.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
-| `repmgr.agent.reconcileInterval` | Reconcile tick interval | `5s` |
-| `repmgr.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
-| `repmgr.agent.cascadingReplication` | Let a standby stream from another standby (a chain by pod ordinal toward the primary) to offload the primary's WAL senders. Default off; agent mode only; meaningful at `replicaCount >= 2` (3+ nodes). The agent only picks a verifiably-safe same-timeline upstream and re-homes to the leader if it fails/promotes, so failover is not delayed and a standby is never stranded. | `false` |
-| `repmgr.agent.syncReplicationSlots` | Reconcile `synchronized_standby_slots` to the live standby set on every primary tick, so a logical failover slot survives a promote. Default off; agent mode only; requires PostgreSQL 17+ and `postgresql.walLevel: logical` (#308; see [Logical Replication](#logical-replication-308)). | `false` |
+| `ha.agent.leaseDuration` | Lease TTL; a challenger cannot acquire until this elapses since the last renew | `15s` |
+| `ha.agent.renewDeadline` | Holder self-demotes if it cannot renew within this | `10s` |
+| `ha.agent.retryPeriod` | Lease acquire/renew retry interval | `2s` |
+| `ha.agent.reconcileInterval` | Reconcile tick interval | `5s` |
+| `ha.agent.podCidr` | Pod CIDR trusted in the agent's hardened SCRAM-only pg_hba (no `0.0.0.0/0 md5`); set to your cluster's pod CIDR if outside `10.0.0.0/8` | `10.0.0.0/8` |
+| `ha.agent.cascadingReplication` | Let a standby stream from another standby (a chain by pod ordinal toward the primary) to offload the primary's WAL senders. Default off; meaningful at `replicaCount >= 2` (3+ nodes). The agent only picks a verifiably-safe same-timeline upstream and re-homes to the leader if it fails/promotes, so failover is not delayed and a standby is never stranded. | `false` |
+| `ha.agent.syncReplicationSlots` | Reconcile `synchronized_standby_slots` to the live standby set on every primary tick, so a logical failover slot survives a promote. Default off; requires PostgreSQL 17+ and `postgresql.walLevel: logical` (#308; see [Logical Replication](#logical-replication-308)). | `false` |
+| `ha.agent.mechanism` | `native` — the agent drives `pg_ctl`/`pg_basebackup`/`pg_rewind` and writes `primary_conninfo`/`standby.signal` itself. The only accepted value: the `repmgr` mechanism was removed in 2.0.0 (#294) and is **rejected at render time**, so a stale pin fails loudly instead of being ignored. See [Replication Mechanics](#replication-mechanics-experimental-287) below. | `native` |
 
-Must satisfy `leaseDuration > renewDeadline > retryPeriod`. For managed clouds, widen them (e.g. `30s/20s/4s`) so a brief apiserver blip does not trip an unnecessary demote. Note: with the Kubernetes Lease backend, a control-plane outage longer than `renewDeadline` is itself a write outage (the healthy primary self-demotes on losing apiserver contact, and no standby can acquire until the control plane returns); this is the safe choice under an asymmetric partition.
+Must satisfy `leaseDuration > renewDeadline > retryPeriod` — **enforced at render time** since 2.0.0 (#291): client-go requires it and the agent refuses to start otherwise, so a violating triple used to render cleanly and then CrashLoopBackOff every pod at once. The realistic way to produce one is mixing the `repmgr.agent.*` alias with `ha.agent.*` across two values files — these three keys are cross-validated, so taking one from a legacy file and two from a newer `-f` yields a combination neither file contains. Set all three under the same name. A value that is not a Go duration (`15`, `20 s`) is rejected too, and the `etcd` DCS backend additionally requires `leaseDuration >= 5s` — its lease TTL is whole seconds. Units are case-sensitive (`15S` is an error), an empty value is rejected, and `reconcileInterval` is checked the same way even though it is not part of the ordering. Values Go accepts are accepted: `.5s`, `5.s`, `+15s`, `1m30s`, `2h45m`, `15µs`. For managed clouds, widen them (e.g. `30s/20s/4s`) so a brief apiserver blip does not trip an unnecessary demote. Note: with the Kubernetes Lease backend, a control-plane outage longer than `renewDeadline` is itself a write outage (the healthy primary self-demotes on losing apiserver contact, and no standby can acquire until the control plane returns); this is the safe choice under an asymmetric partition.
 
-In agent mode the agent also fronts the read/write split: `pgpool` (if enabled) points at the RW (`<fullname>`) and RO (`<fullname>-readonly`) Services with failover off, and the agent maintains the Service selector and `pg-role` labels itself (no repmgrd/service-updater sidecars). With `postgresql.replicaCount: 0` (primary-only) there are no standbys, so pgpool configures only the RW backend and runs as a single-backend router — the RO backend is omitted to avoid health-checking an endpointless Service (#207).
+The agent also fronts the read/write split: `pgpool` (if enabled) points at the RW (`<fullname>`) and RO (`<fullname>-readonly`) Services with failover off, and the agent maintains the Service selector and `pg-role` labels itself. With `postgresql.replicaCount: 0` (primary-only) there are no standbys, so pgpool configures only the RW backend and runs as a single-backend router — the RO backend is omitted to avoid health-checking an endpointless Service (#207).
 
-### Migrating an existing release to agent mode
+### Replication Mechanics (EXPERIMENTAL, #287)
 
-`podManagementPolicy` differs by mode (`OrderedReady` for repmgrd, `Parallel` for agent) and is **immutable** on an existing StatefulSet, so switching an existing release needs a one-time recreate (zero data loss — pods and PVCs are kept):
+`native` is the only replication mechanic as of 2.0.0 (#294), and the default. The agent drives PostgreSQL's own tools directly: `pg_ctl promote`, `pg_basebackup`, `pg_rewind`, and `primary_conninfo`/`standby.signal` written into an agent-owned config fragment inside `PGDATA`. Topology comes from `pg_stat_replication`, and the agent owns physical replication slot lifecycle.
+
+The `repmgr` mechanic — which shelled out to the repmgr CLI and depended on the `repmgr.nodes` table — is gone, along with repmgr itself ([upstream development had stalled](https://github.com/EnterpriseDB/repmgr)); the image no longer contains it (#290). `ha.agent.mechanism: repmgr` is rejected at render time rather than deleted, so a values file copied from 1.x fails with a message naming the migration. The `Mechanism` interface it was driven through (`images/pg-ha/agent/internal/mechanism`) remains, and the reconcile loop still imports only that interface, so a second implementation stays addressable.
+
+**An existing 1.x cluster is repmgr-shaped on disk, and `helm upgrade` migrates it in place — no re-clone (#292).** See [Migrating a live repmgr cluster to native](#migrating-a-live-repmgr-cluster-to-native-292) for the runbook, including how to verify each node and how to roll back.
+
+The Lease, the timeline/LSN election, fencing, and Service routing are unchanged from 1.x — policy was never mechanism-specific, which is what made the swap possible.
+
+**Bootstrap is the agent's, and the lease decides.** Under `repmgr`, the `repmgr-init` init container clones every standby before the Go agent runs. Under `native` it exits immediately: it has nothing to do, and the step it used to perform in the middle — polling `repmgr.nodes` until a primary registered itself — is what made native unusable with replicas, because nothing ever registers, so every standby burned the poll's ~240s timeout and sat in `Init:CrashLoopBackOff` forever.
+
+What replaces it:
+
+| Node | Fresh install under `native` |
+|---|---|
+| Lease holder | `initdb` (via `entrypoint.sh initdb`), then serves |
+| Everyone else | wait, then `pg_basebackup` from the holder through their own pre-created slot (#289) |
+
+Whether to `initdb` at all is a **cluster-wide** decision and the lease is the only thing that can make it happen exactly once. If each pod decided for itself, every one would create its own cluster with its own `system_identifier`, and `assertSameCluster` (invariant 9) would then refuse to rejoin any of them — pods `Running`, never `Ready`, each holding a database nothing else recognises. `reconcile.Decide` already encoded this: `BootstrapInitdb` only for the holder with empty data and no reachable primary, `BootstrapClone` for everyone else.
+
+**Topology comes from `pg_stat_replication`, not `repmgr.nodes`.** That table was a *cache* of self-reported metadata: nodes wrote their own rows, rows outlived the pods that wrote them (#139's ghosts), and it could disagree with both the lease and the observed positions. The primary's live connection list cannot go stale that way — a departed pod is simply absent, so there is no durable row to strand. A row is mapped back to a pod by `application_name` (native writes the pod name into `primary_conninfo`; repmgr writes `node_name`, the same string), falling back to the ordinal-named replication slot for any standby cloned before #288, which still dials with libpq's default `walreceiver`. Exported as `pg_ha_agent_replicas_streaming`, `..._replicas_expected` and `..._replicas_unidentified` — that last one matters, because without it an incomplete topology view would read as healthy.
+
+This is **observe-only**. Nothing in the promotion decision consumes it, deliberately: a standby's row vanishes the instant it disconnects, which is exactly the failover moment a promotion is being decided. Absence means "not streaming right now", never "this node does not exist".
+
+**A native cluster has no repmgr extension and no `repmgr.nodes` at all.** The repmgr *database* and *role* do remain — the agent authenticates as that role for every probe and for `pg_basebackup`, and `primary_conninfo` carries `dbname=repmgr`. Renaming them out of the repmgr namespace is #291. The pre-agent stale-primary guard (`entrypoint.sh`'s `primary_safety_guard`) is likewise skipped under `native`: it rejoins and re-clones through the repmgr CLI on the strength of a peer scan that has no notion of the lease, and under native the agent owns both, never starting the postmaster before deciding.
+
+**One recovery path an operator has to know about.** If a native cluster loses the PVC of the
+node its highwater marker names, `Decide` returns `Wait` — "empty data with a marker present;
+settle before initdb (#170)" — which under repmgr was unreachable, because the entrypoint had
+already `initdb`'d by then. Under native nothing else can create the cluster, so the node waits
+indefinitely rather than forking a divergent one. That is the safe answer, but it needs a human:
+delete the `<fullname>-primary` ConfigMap to let the holder bootstrap again, after confirming no
+surviving node holds newer data.
+
+Two things that were gaps while `native` was experimental, both closed:
+
+- **`cascadingReplication` works with `native` since #294.** Creation was never the gap: every slot-using native path (`Clone`, `Follow`, `RejoinForceRewind`) ensures this node's slot on whichever upstream it actually points at, so a cascading child self-provisions on its parent. The *reclaim* policy was the gap, and it is now cascade-aware on both sides — see the slot-ownership section below.
+- **An existing repmgr cluster migrates in place since #292** — `helm upgrade`, no re-clone, timeline and system identifier preserved. Runbook: [Migrating a live repmgr cluster to native](#migrating-a-live-repmgr-cluster-to-native-292).
+
+The `#297` scale-up-race protection is a good example of a repmgr-mode safety behaviour that needed no native equivalent: it refused to promote a node with no `repmgr.nodes` record, because repmgr resolved a follow target by `node_id` out of that table and an unregistered primary was one no survivor could follow. Native follows by conninfo — the lease holder's identity plus the headless FQDN — so a native primary is followable the moment it promotes. The gate and its `repmgr.nodes` read were **deleted** in 2.0.0 rather than carried forward inert: a promote guard that can never fire reads as protection while providing none.
+
+#### Replication slot ownership (#289)
+
+**The agent owns physical slot lifecycle** (1.x left it to repmgr, which minted `repmgr_slot_<node_id>` itself), because an unowned slot is the most dangerous loose end in the exit: an orphaned slot pins WAL on the primary forever and fills the data volume, and it raises no error at all until the disk is full.
+
+Slots are named `pg_ha_slot_<pod ordinal>` — ordinal-derived, so a pod restart reattaches to the same slot instead of stranding one and reserving a second, and prefixed so ownership is decidable. The agent creates and drops **only names it minted**; an operator's own slot, or a logical slot backing a subscription, is never touched.
+
+| Phase | Behavior |
+|-------|----------|
+| Before a clone | The slot is created on the upstream *first*, then `pg_basebackup --slot` streams through it — so no WAL gap can open between the base backup starting and the walreceiver attaching. `primary_slot_name` holds it for the ongoing stream. |
+| Every primary tick | The lease holder creates a slot for every **expected** peer ordinal (`replicaCount + 1`, not observed standbys — a slot must exist *before* its standby streams) and drops orphans. Dropping is decided from the **live pod set read from the Kubernetes API**, never from `REPMGR_NODE_COUNT` — that variable is baked into each pod at render time, so during a scale-up rollout a not-yet-rolled primary still holds the old count and would drop a brand-new standby's slot. A failed pod list skips the drop pass for that tick. |
+| On promote | Slot creation is sequenced **ahead of the routing switch**, so surviving standbys never race slot creation when they follow the new primary — but under its own sub-budget (half the fence budget), so a slow slot query cannot spend the promote's whole window and leave the cutover unfunded. |
+| Active slots | **Never dropped.** The `AND NOT active` predicate is in the SQL, so the guard is atomic with the drop; a read-then-decide would leave a window for a standby to reattach in between. Inactivity alone is never treated as evidence a consumer is gone — that is also what a routine restart looks like — which is why liveness is decided by pod existence, not by the slot's `active` flag. |
+| Paused | No slot mutation at all — `Decide` returns `NoOp` before any primary branch while `pg-ha/pause` is set. |
+
+Reclaimed as orphans: an agent-minted slot for a **departed** ordinal (no such pod exists), the primary's own slot (it does not stream from itself), and **any** legacy `repmgr_slot_*` — native never streams through one, so every one is dead weight the moment a cluster is on this mechanism, which is what stops a repmgr→native migration (#292) from leaving a permanent orphan behind every surviving node. What makes reclaiming a legacy slot safe is the atomic `AND NOT active` in the drop, not the pod set: a node still carrying its stream through a repmgr slot mid-migration holds it *active*, so the drop is refused until that stream has genuinely moved to its `pg_ha_slot_` replacement. An empty or failed pod list reclaims nothing but self and legacy slots, so a misread can never make every standby's slot look orphaned.
+
+**A demoted primary reclaims what it minted.** The slot pass also runs on the standby branch, because nothing else removed those slots: reconcile is primary-only, `pg_basebackup` and `pg_rewind` both exclude `pg_replslot`, and a plain follow touches nothing. So an ex-primary kept every `pg_ha_slot_*` it created — now inactive, since those standbys stream from the new primary — and **an inactive slot restricts WAL removal on a standby exactly as it does on a primary**, so its own `pg_wal` grew until `max_slot_wal_keep_size` invalidated them. It did not self-heal on a later re-promotion either: by then those ordinals have live pods again, so the primary-side pod-set test reads them as live peers' slots and leaves them.
+
+The standby policy depends on whether a standby can legitimately *be* an upstream, i.e. on `cascadingReplication`. With it **off**, a standby is never an upstream — its own slot lives on its upstream, not locally — so every agent-minted slot found locally is a leftover and there is no pod set to consult. With it **on** that premise is false: its children's slots live there, and reclaiming them every tick would delete exactly what cascading depends on (a child whose walreceiver is reconnecting is inactive for that instant, and `AND NOT active` would let the drop through). So the primary's own predicate is used instead, keeping any slot whose ordinal still has a live pod. `AND NOT active` is still what makes either safe. Listing slots on a standby needs a different reference LSN, since `pg_current_wal_lsn()` raises `recovery is in progress` there; the query branches on `pg_is_in_recovery()` and uses the last *received* LSN instead. Verified on a real streaming pair: a leftover slot on a live standby reports its reserved WAL, is reclaimed, and the standby keeps streaming — while an active slot on the primary is still refused.
+
+Slot creation is driven by the expected pod set but **skipped for ordinals with no live pod**, so the create pass agrees with the drop pass. Judging the two against different sources made them fight: after a `replicaCount` 2→1 scale-down the ordinal-0 primary still holds the old `REPMGR_NODE_COUNT` until the StatefulSet rolls it *last*, so it created a slot on one tick and reclaimed it on the next for the whole rollout. A pod that has been created but is still cloning is already in the live set, so its slot is still minted before it streams — and `Clone`, `Follow` and a rewind-based rejoin each ensure their own slot on the upstream, so even a tick of latency is covered.
+
+`ha.agent.cascadingReplication` works with `mechanism: native` since #294. Two changes made it safe. The primary no longer **pre-creates** a slot per live ordinal when cascading is on: a cascaded standby streams from a peer, so the slot minted on the primary would sit inactive forever and retain WAL until `max_slot_wal_keep_size` invalidated it — the exact failure slot ownership exists to prevent. Nothing is lost, because followers self-provision on their real upstream. And a standby no longer reclaims every agent-minted slot it finds, since its children's slots live there.
+
+A cascaded standby also **releases its own slot on the upstream it leaves**. This is not cosmetic: every standby's first clone comes from the primary (so it provisions its slot there), and cascading then re-homes it onto an intermediate — leaving an inactive, WAL-retaining slot on the primary that the primary's own deliberately-conservative reclaim will never touch. A live three-tier cluster accumulated one per cascaded node before this was added. The owner cleaning up after itself is the only fix that needs no cluster-wide view: the upstream cannot tell "my child moved" from "my child is restarting", which is exactly why its own policy has to stay conservative.
+
+One cost remains: a **demoted** primary running with cascading on keeps the slots it minted for peers that now stream from the new primary, because their pods are still live. Those go inactive and hold WAL on that node. It is bounded — the image sets `max_slot_wal_keep_size = 4GB` at initdb, so PostgreSQL invalidates such a slot rather than filling the volume, and `PGHAReplicationSlotInvalidated` reports it. Telling "this child is momentarily disconnected" from "this peer moved to another upstream" needs a cluster-wide view of who follows whom that no single node has, and holding bounded WAL beats dropping a slot a returning child still needs (that costs it a re-clone).
+
+**Alerting covers slots the agent does not own.** Everything above describes slot *ownership*. Slot *observation* is broader: the primary publishes the gauges for **every** physical slot it can see on every tick, including legacy `repmgr_slot_*` left behind by a 1.x cluster and any slot an operator or a logical subscription created. Those pin WAL in exactly the same silent way, and the agent deliberately does not reclaim them (see the reclaim rules above), so a sustained breach on one is yours to resolve with the query below rather than something the agent will clear.
+
+Slot state is exported on the agent's metrics endpoint as `pg_ha_agent_replication_slots`, `pg_ha_agent_replication_slots_inactive`, `pg_ha_agent_replication_slots_invalidated`, `pg_ha_agent_replication_slots_recycled_total`, and `pg_ha_agent_replication_slot_max_retained_wal_bytes`, with four rules under `ha.agent.monitoring.prometheusRule.enabled`:
+
+- `PGHAReplicationSlotRecycled` (warning, 5m) — **this is the one that fires on chart defaults.** PostgreSQL invalidated a slot for exceeding `max_slot_wal_keep_size` and the agent **dropped and re-created it** on the same tick, so the ordinal has a usable slot again. That repair is what lets the standby's own re-clone proceed instead of failing on a dead slot — but it repairs the *slot*, not the *standby*: **the standby behind it still needs a full re-clone**, because the WAL it was missing is gone either way. Watch that it comes back (see `PGHAReplicasNotStreaming`); if it does not, delete its PVC and let the agent re-clone it. The rule rates a **counter** rather than reading a gauge for a reason: the recycle clears `pg_ha_agent_replication_slots_invalidated` in the very tick that observes it, so the gauge rule below can never elapse its `for: 5m` for a slot the agent repairs.
+- `PGHAReplicationSlotInvalidated` (critical, 5m) — PostgreSQL has **killed** a slot's WAL reservation for exceeding `max_slot_wal_keep_size`, and the agent did **not** recycle it: the slot is still held by an active consumer, or its ordinal has no live pod (with `ha.agent.cascadingReplication` on, the primary pre-creates nothing and so recycles nothing either). The image sets `max_slot_wal_keep_size = 4GB` at initdb, so PostgreSQL never lets a slot fill the volume — it invalidates the slot instead, and the standby behind it can then only recover by a **full re-clone**. Verified against PostgreSQL 18: invalidation also nulls `restart_lsn`, so the retained-bytes gauge **collapses to zero at the exact moment the slot dies** — which is why retained-WAL alerting alone cannot see this outcome and it needs its own rule.
+- `PGHAReplicationSlotRetainingWAL` (critical, 15m) — a slot has held back more than `ha.agent.monitoring.prometheusRule.slotRetainedWALBytes` (default **3Gi**). This is the *early warning* before the invalidation above, so the threshold has to sit **below** the 4GB cap to be reachable at all. Raise it only if you also raise `max_slot_wal_keep_size` through `postgresql.configuration`.
+- `PGHAReplicationSlotInactive` (warning, 1h) — a slot has had no consumer for an hour. Expected briefly during a standby restart or re-clone; sustained means a standby is down, or a slot the agent does not own is orphaned and needs a human.
+
+To find a culprit by hand:
+
+```sql
+SELECT slot_name, active, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained
+FROM pg_replication_slots ORDER BY 3 DESC;
+```
+
+### Migrating a repmgrd release (chart 1.x) to 2.0.0
+
+`podManagementPolicy` was `OrderedReady` in repmgrd mode and is `Parallel` for the agent. The
+field is **immutable** on an existing StatefulSet, so a release that was pinned to
+`failoverMode: repmgrd` needs a one-time recreate (zero data loss — pods and PVCs are kept):
 
 ```bash
 # 1. Healthy cluster + a fresh backup first. GitOps: disable auto-sync for these steps.
 # 2. Orphan-delete the StatefulSet (keeps pods + PVCs running; Helm re-adopts them):
 kubectl delete statefulset <release>-pg -n <ns> --cascade=orphan
-# 3. Upgrade into agent mode (recreates the STS as Parallel, adopts the orphaned pods):
-helm upgrade <release> cagriekin/pg -n <ns> --set repmgr.failoverMode=agent  # + your -f values
+# 3. Remove every key 2.0.0 rejects -- `repmgr.failoverMode`, `repmgr.serviceUpdater.*`,
+#    `repmgr.monitoringHistoryDays`, `repmgr.splitBrainDetection.*`, `pgpool.autoFailback`.
+#    Any one left behind fails the render, not just the first (#298 review). Then upgrade;
+#    this recreates the STS as Parallel and adopts the orphaned pods:
+helm upgrade <release> cagriekin/pg -n <ns>   # + your -f values, minus the removed keys
 # 4. Verify:
 kubectl get lease <release>-pg-leader -n <ns> -o jsonpath='{.spec.holderIdentity}'  # == the primary pod
 kubectl get endpoints <release>-pg -n <ns>                                          # points at it
-# Rollback is symmetric: --set repmgr.failoverMode=repmgrd with the same --cascade=orphan recreate,
-# then optionally: kubectl delete lease <release>-pg-leader -n <ns>
 ```
+
+Rollback is to chart `1.x` with `repmgr.failoverMode: repmgrd` restored and the same
+`--cascade=orphan` recreate, then optionally `kubectl delete lease <release>-pg-leader -n <ns>`.
+
+If you were already on the default (agent) — which has been the default since `1.0.0` — there is
+**no recreate**: your StatefulSet is already `Parallel`. Just delete `repmgr.failoverMode: agent`
+from your values if you set it explicitly, since 2.0.0 rejects the key either way.
 
 GitOps/ArgoCD: the Lease, the primary-marker ConfigMap, and the write-Service `.spec.selector` are runtime-owned by the agent — `ignoreDifferences` on the Service selector and do not prune the Lease/marker, or auto-sync will fight the agent. Set `postgresql.existingSecret.enabled=true` (the `lookup`-based password generation returns nil under ArgoCD).
 
-### Maintenance mode (pause) — agent mode
+### Maintenance mode (pause)
 
 For planned work that would otherwise trigger an unwanted failover (a deliberate primary restart, a node drain, a PostgreSQL minor-version restart), put the agent in **maintenance mode**: it keeps renewing the Lease and serving, but suspends all automatic promote / demote / fence / self-health actions (it only observes). Toggle it with an annotation on the primary-marker ConfigMap:
 
@@ -630,7 +764,7 @@ kubectl annotate configmap <release>-pg-primary -n <ns> pg-ha/pause-
 
 While paused, `pg_ha_agent_is_paused` reads `1`. Pausing does not stop the cluster from serving — it only stops the agent from reacting to faults, so a genuine failure during the window will NOT fail over until you resume. In particular, if the primary itself wedges or dies while paused, the agent keeps renewing the Lease and the write Service keeps pointing at it; there is no automatic failover until you remove the annotation. (There is no split-brain risk: a real Lease loss still fences via the leader-election callback.) Keep maintenance windows short and watch the cluster while paused.
 
-### Controlled switchover (agent mode)
+### Controlled switchover
 
 To hand the primary role to a specific standby on purpose (e.g. to move the primary off a node you are about to drain), annotate the marker with the target pod:
 
@@ -642,7 +776,7 @@ The serving primary waits until that target is a **caught-up, same-timeline stan
 
 Caveats: this is a planned handoff layered on the lease election, not a fenced zero-RPO transaction — the directed target promotes deterministically on a two-pod cluster; with three or more pods the most-advanced standby wins the freed lease (usually but not necessarily the named target). For strict RPO=0 use synchronous replication (not enabled in this chart).
 
-### Control REST API (agent mode) — `repmgr.agent.control`
+### Control REST API (agent mode) — `ha.agent.control`
 
 The pause and switchover runbooks above are `kubectl annotate` calls: they work, they are
 the reference, and they need no extra machinery. What they cannot do is **check the
@@ -654,8 +788,7 @@ position, or *why* the agent is not doing what you expected.
 The optional control API closes both gaps. It is off by default:
 
 ```yaml
-repmgr:
-  failoverMode: agent
+ha:
   agent:
     control:
       enabled: true
@@ -786,7 +919,7 @@ clone lands, then `local.role` becomes `standby`. (`hasData` is reported only fo
 answering the request; it is absent for peers in `GET /v1/cluster`, because a cross-pod probe
 cannot observe another member's data directory.)
 
-#### API-driven PITR restore — `repmgr.agent.control.restore`
+#### API-driven PITR restore — `ha.agent.control.restore`
 
 `POST /v1/restore` triggers the chart's [pgBackRest restore Job](#point-in-time-recovery).
 It is a **separate opt-in from the rest of the API**, because it is the only part of the API
@@ -812,7 +945,7 @@ recover to an arbitrary timestamp during an incident with one call. The kubectl
 off and use the kubectl path, which needs none of the RBAC above.
 
 ```yaml
-repmgr:
+ha:
   agent:
     control:
       restore:
@@ -850,7 +983,7 @@ this release's ServiceAccount, and requires of every Job that subject creates:
 | no `hostNetwork` / `hostPID` / `hostIPC`, no explicit `nodeName`, and only this release's `priorityClassName` | escape to the node; placing the pod by hand instead of through the scheduler; and claiming a high-priority class so the scheduler **preempts this release's own postgresql pods** (referencing a PriorityClass needs no permission). `nodeSelector`/`tolerations` stay unpinned — inherited from `postgresql.*` so the restore can land where the volume attaches, and unlike priority they can only *restrict* placement |
 | the **pod's own labels**: only this release's restore labels plus the batch controller's | joining this release's Service endpoints. A restore pod labelled `component=postgresql` would be added to the write Service — with no readiness probe it is Ready at once — and would receive application traffic and its credentials |
 | no `manualSelector` | a caller-supplied Job selector and identity labels |
-| exactly one container, no init or ephemeral containers, running this release's repmgr image | what code enters the cluster on this token |
+| exactly one container, no init or ephemeral containers, running this release's HA image | what code enters the cluster on this token |
 | `command` == this release's restore entrypoint, no `args`, no `lifecycle` hooks | the image pin alone is weak — the postgresql container already runs this image against this volume. Without this, the Job is "run anything as the database's uid with the live PGDATA mounted", which destroys data with no privilege escalation at all. A `postStart` exec hook would sidestep a `command`-only pin |
 | this release's **pod and container `securityContext`** (`privileged`, `allowPrivilegeEscalation`, `runAsUser`, `runAsNonRoot`, added capabilities) | a root/privileged container with `CAP_SYS_ADMIN` — which reads every other pod's token off the kubelet and is *strictly more* than the token started with |
 | CPU and memory requests and limits present; `parallelism` and `completions` ≤ 1 | one permitted Job name as a repeatable way to fill the namespace quota and evict the database's own pods |
@@ -902,7 +1035,7 @@ cannot be separated by accident: **rendering the RBAC without the policy fails t
 unless you acknowledge the trade in values.
 
 ```yaml
-repmgr:
+ha:
   agent:
     control:
       restore:
@@ -1045,24 +1178,53 @@ Progress, honestly:
 
 ### Monitoring the agent (agent mode)
 
-The agent serves read-only Prometheus metrics on port `9200` (`pg_ha_agent_is_leader`, `_is_paused`, `_renew_failures_total`, `_promotions_total`, `_demotes_total`, `_fences_total`, `_reconcile_errors_total`, `_recovery_starts_total`). With the Prometheus Operator installed:
+The agent serves read-only Prometheus metrics on port `9200` (`pg_ha_agent_is_leader`, `_is_paused`, `_renew_failures_total`, `_promotions_total`, `_demotes_total`, `_fences_total`, `_reconcile_errors_total`, `_recovery_starts_total`, `_marker_tamper_suspected_total`, the `_replicas_*` topology gauges and the `_replication_slot*` gauges). With the Prometheus Operator installed:
 
 ```yaml
-repmgr:
+ha:
   agent:
     monitoring:
       serviceMonitor: { enabled: true }   # scrape the agent metrics off the headless Service
-      prometheusRule: { enabled: true }   # example alerts (no-leader, split-brain, renew-failure, flapping, agent-down, paused-too-long)
+      prometheusRule: { enabled: true }   # example alerts (no-leader, split-brain, renew-failure, flapping, agent-down, paused-too-long, marker-tamper, replicas-not-streaming, slot health)
 ```
 
 The bundled `PrometheusRule` covers leadership/fencing health only; row-level **replication lag** alerts come from the PostgreSQL exporter (`prometheusExporter.enabled`).
+
+Two of the rules are worth calling out, because what they catch is otherwise **silent** — the
+cluster keeps serving, every probe stays green, and nothing in the logs of a healthy pod says
+anything is wrong:
+
+- `PGHAAgentMarkerTamperSuspected` (critical, 5m) — an agent has judged the primary marker's
+  recorded timeline impossible: implausibly high, or unparseable. The marker is a ConfigMap any
+  namespace writer can forge and `unsafeToServe` trusts its timeline, so such a value trips that
+  guard on **every** node and **freezes automatic failover** cluster-wide. The agent keeps failing
+  closed (an untrusted highwater is not safe to serve on) and counts the tick; without this rule
+  the frozen failover surfaces for the first time when the primary dies and nothing takes over.
+  Compare the ConfigMap's timeline against `SELECT timeline_id FROM pg_control_checkpoint()` on the
+  primary — and review who can write ConfigMaps in that namespace, because a forged value is the
+  case this exists for.
+- `PGHAReplicasNotStreaming` (warning, 15m) — the primary sees fewer *identified* streaming
+  standbys than there are live peer pods. Redundancy is reduced (a failover has fewer candidates,
+  or none) and synchronous commit blocks if it is configured against a standby that is not there.
+  `pg_ha_agent_replicas_unidentified` is **subtracted** in the expression, because
+  `_replicas_streaming` includes it: a streaming connection that maps to no pod would otherwise
+  mask a genuinely missing replica one-for-one, silencing the alert at exactly the moment the
+  topology view stopped being trustworthy. 15m rides out a rolling restart. An apiserver blip
+  cannot fire it either — when the live-pod list fails, the agent leaves the gauges at their
+  previous values rather than publishing a zero.
+
+  **This rule is not rendered when `ha.agent.cascadingReplication` is on.** There a child streams
+  from a peer and never appears in this primary's `pg_stat_replication`, so the agent deliberately
+  does not measure the expected count, and the comparison could never be true. An alert that cannot
+  fire reads as coverage while providing none, so it is left out of the file rather than shipped
+  inert.
 
 ### Leadership backend: Kubernetes Lease (default) or etcd (agent mode)
 
 By default the leader Lease lives in the Kubernetes apiserver. A sustained control-plane outage longer than `renewDeadline` therefore causes a write outage by itself (the healthy primary self-demotes on losing apiserver contact, and no standby can acquire until the control plane returns). To decouple leadership from the control plane, point the agent at an existing **etcd** cluster:
 
 ```yaml
-repmgr:
+ha:
   agent:
     leaseDuration: 15s            # must be >= 5s for etcd (the lease TTL is whole seconds)
     dcs:
@@ -1080,7 +1242,7 @@ With etcd, a Kubernetes control-plane outage no longer demotes the primary — o
 
 Two ways to provide etcd:
 
-- **BYO/shared** (recommended, especially for several databases against one platform etcd): set `repmgr.agent.dcs.etcd.endpoints` as above and leave `etcd.enabled=false`.
+- **BYO/shared** (recommended, especially for several databases against one platform etcd): set `ha.agent.dcs.etcd.endpoints` as above and leave `etcd.enabled=false`.
 - **Bundled** (self-contained, for an install with no existing etcd): set `etcd.enabled=true` and leave `endpoints` empty — the chart deploys a 3-node etcd cluster (`<release>-etcd`) and points the agent at it automatically. Adds 3 stateful pods (`+~0.3 CPU / 0.4Gi` requested, small SSD PVCs). The bundled etcd runs plaintext within the pod network (isolate it with a NetworkPolicy; the leadership data is non-secret); tune it under the `etcd:` values key (`replicaCount`, `resources`, `persistence`, `topologySpreadConstraints`). For a TLS-secured store, use a BYO/shared etcd with `dcs.etcd.tls`.
 
 > Agent mode is opt-in and validated by the chart's live failover suite (graceful failover: a standby promotes, the write Service repoints, the ex-primary rejoins read-only). See `ENVIRONMENT.md` for the full injected-variable catalog.
@@ -1097,7 +1259,7 @@ level=INFO msg="reconcile decision" hold_lease=false action=Wait reason="... no 
 
 Some policies cannot be re-opened from the policy side. On Cilium, deny wins within a tier — so no allow rule admits the apiserver for one namespace — and reserved identities are compound (`reserved:host` and `reserved:kube-apiserver` sit on the same identity), so any topology that reaches the apiserver via a real node IP cannot admit apiserver traffic for one workload without admitting node traffic for it. What remains is an in-cluster TCP proxy.
 
-The agent therefore honours **`KUBECONFIG`** (repmgr image `trixie-5.5.0-34` or newer, pinned by this chart since 1.14.1). No new chart value is involved — set the variable and mount the file with the passthrough that already exists:
+The agent therefore honours **`KUBECONFIG`** (available since HA image `trixie-5.5.0-34`, so every 2.0.0 `cagriekin/pg-ha` tag has it). No new chart value is involved — set the variable and mount the file with the passthrough that already exists:
 
 ```yaml
 postgresql:
@@ -1144,7 +1306,7 @@ Notes:
 - A `KUBECONFIG` that is set but unreadable, malformed, or contextless is a **startup failure naming the file**, not a silent fall back to in-cluster — falling back would reproduce the exact hang this escapes, with a kubeconfig mounted and apparently in effect.
 - The boot log records which route was taken, so this is answerable without a debugger: `msg="starting pg-ha-agent" ... apiserver="kubeconfig /etc/apiserver-proxy/kubeconfig"` (or `apiserver=in-cluster`).
 - With `KUBECONFIG` unset — the default — behaviour is byte-identical to before: the in-cluster ServiceAccount plus `KUBERNETES_SERVICE_HOST`/`_PORT`. `~/.kube/config` is deliberately *not* consulted, so a stray file in the image or on a mounted home cannot silently redirect a production cluster.
-- The entrypoint's stale-primary guard (`#170`) shells out to `kubectl`, which honours `KUBECONFIG` natively, so it follows the same route with no extra wiring. It runs in the **postgresql** container (`entrypoint.sh` `postgres`/`agent` mode), which is where `postgresql.extraEnv`/`extraVolumeMounts` land; the `repmgr-init` init container makes no apiserver calls at all, so it needs none of this.
+- **Nothing else in the postgresql container talks to the apiserver.** Through 1.x the entrypoint had a stale-primary guard (`#170`) that shelled out to `kubectl`, so `KUBECONFIG` had to reach the shell too. 2.0.0 removed both: the guard is gone with repmgrd, and `kubectl` is deliberately **not installed** in the image (see the note in `images/pg-ha/Dockerfile`). The agent's own client-go is the only apiserver client in that container, so the route above is the whole story for it.
 - The pgBackRest **backup CronJob** is a separate apiserver client with a separate pod, and it
   is not covered by `postgresql.extraEnv` — it has its own passthrough, `pgbackrest.extraEnv`
   ([#323](#routing-the-backup-cronjobs-apiserver-traffic--pgbackrestextraenv-323)). A cluster
@@ -1227,7 +1389,7 @@ container live there. A ConfigMap or Secret that does not exist yet therefore ho
 **postgresql** pods in `ContainerCreating` on the next roll, not just the backups — create it
 before the upgrade, or mark the source `optional: true`.
 
-**With `repmgr.agent.control.restore` enabled**, the `#279` ValidatingAdmissionPolicy that
+**With `ha.agent.control.restore` enabled**, the `#279` ValidatingAdmissionPolicy that
 bounds the agent's `create jobs` grant pins the restore Job's volume sources and env
 `valueFrom` names. The chart folds these values into those pins automatically, so the
 agent-driven restore keeps working — but only sources it can bind to a *name* can be pinned
@@ -1281,7 +1443,6 @@ in its status.
 | `pgpool.clientIdleLimit` | Client idle timeout in seconds | `300` |
 | `pgpool.resetQueryList` | Queries to run when returning connection to pool | `ABORT; RESET ALL; DEALLOCATE ALL` |
 | `pgpool.failOverOnBackendError` | Trigger failover on backend errors | `false` |
-| `pgpool.autoFailback` | Automatically reattach recovered backends | `true` |
 | `pgpool.allowClearTextFrontendAuth` | Allow clear-text password authentication from clients | `false` |
 | `pgpool.admin.username` | PGPool-II admin (PCP) user, stored in the chart-managed Secret | `admin` |
 | `pgpool.admin.password` | PGPool-II admin (PCP) password, stored in the chart-managed Secret | `admin` |
@@ -1362,7 +1523,7 @@ When `postgresql.existingSecret.enabled` is `false`, a secret will be auto-gener
 - `username`: Base64 encoded value from `postgresql.username`
 - `password`: Random 32 character alphanumeric string
 - `database`: Base64 encoded value from `postgresql.database`
-- `repmgr-password`: Random 32 character alphanumeric string (when repmgr is enabled)
+- `repmgr-password`: Random 32 character alphanumeric string (when `ha.enabled` is true — the key keeps its 1.x name; see `ha.username`)
 
 ### Service Parameters
 
@@ -1490,7 +1651,7 @@ allowlist-validated — never arbitrary SQL):
 **Rules enforced at render time** (`helm` fails fast, before anything is applied, so a typo
 never reaches the cluster as a half-failed hook): names match `^[A-Za-z_][A-Za-z0-9_]*$`; no
 reserved/internal names (`postgres`, `repmgr`, the monitoring user, the primary user,
-`template0/1` — reserved unconditionally, even when repmgr/the exporter are disabled);
+`template0/1` — reserved unconditionally, even when HA/the exporter are disabled);
 unique; `owner` must be a declared role or the primary user; a grant's `database` must be a
 declared database or the primary database; `memberOf` targets must be a declared role or a
 built-in `pg_*` role; a grant with `objects` must also set `schema` (an object grant has no
@@ -1525,7 +1686,7 @@ psql -h localhost -U postgres -d postgres
 
 ### Read-Only Connection to Replicas
 
-When repmgr is enabled, a `<fullname>-readonly` service routes only to standby pods, selected via the `pg-role: standby` label. In repmgrd mode the service-updater sidecar maintains the label; in agent mode the agent does, with a 3-way classification (in-recovery -> `standby`; reachable-but-not-in-recovery -> `orphan`, kept OUT of the read pool so a divergent node never serves stale reads; unreachable -> left untouched):
+When `ha.enabled` is true, a `<fullname>-readonly` service routes only to standby pods, selected via the `pg-role: standby` label. The agent maintains the label, with a 3-way classification (in-recovery -> `standby`; reachable-but-not-in-recovery -> `orphan`, kept OUT of the read pool so a divergent node never serves stale reads; unreachable -> left untouched):
 
 ```bash
 kubectl port-forward svc/my-postgres-pg-readonly 5432:5432
@@ -1566,8 +1727,23 @@ PGPool Service (`<release>-pg-pgpool`) if used, and the headless pod FQDNs
 non-TLS connections. **`clientCertAuth`** additionally requires app users to present a
 client cert signed by `ca.crt`. The chart's internal service users (the `repmgr` user, the
 superuser, and the monitoring user) are **exempted** from the client-cert requirement, so
-the HA agent, repmgr, the exporter, and PGPool keep working; under `require` those
+the HA agent, the exporter, and PGPool keep working; under `require` those
 components reach the server over TLS via libpq's default negotiation.
+
+**TLS is verified against the running server, and fails closed (#335).** Every other signal
+an operator can read — the rendered ConfigMap, the mounted Secret, the values file — describes
+the configuration that was *rendered*, not the one the postmaster *loaded*, and a pod whose
+`postgresql.conf` never picked up the chart's `conf.d` include serves plaintext while all three
+still say TLS is on. So the readiness probe asks the server itself (`SHOW ssl`) and refuses
+readiness on a definitive `off`: the pod leaves the client-facing Services rather than serving
+anyone in the clear, a `RollingUpdate` stalls instead of rolling the whole cluster into that
+state, and replication is unaffected (the headless Service publishes not-ready addresses). In
+agent mode the agent additionally publishes `pg_ha_agent_tls_inactive` (a `0`/`1` gauge, always
+`0` when TLS was never requested) and logs the cause and the fix, so the condition is alertable
+rather than something you discover from a client error — `ha.agent.monitoring.prometheusRule`
+ships a `PGHAServerTLSInactive` rule for it. An unanswerable probe is treated as
+uncertainty, not as evidence of plaintext, so a transient blip cannot take the primary out of
+rotation.
 
 When `require` is on, the exporter and the PGPool backend must also speak TLS
 (`prometheusExporter.sslmode >= require`, `pgpool.tls.backendSslmode >= require`); under
@@ -1592,8 +1768,9 @@ Caveats:
 - **Replication stays plaintext** on the pod network — `require`/`clientCertAuth` never
   convert the `host replication` or loopback `pg_hba` rules (repmgr/agent replication
   conninfo carries no `sslmode`). This is a deliberate non-goal.
-- **`require`/`clientCertAuth` are agent-mode only** (`repmgr.failoverMode=agent`). In
-  repmgrd mode use `postgresql.tls.enabled` for optional server TLS; enforced TLS needs
+- **`require`/`clientCertAuth` require `ha.enabled=true`.** They depend on the
+  agent-assembled `pg_hba` (hostssl with no md5 fallback), and standalone mode runs the stock
+  postgres image's own `pg_hba`. For standalone use `postgresql.tls.enabled` for optional server TLS; enforced TLS needs
   agent mode (the render fails fast otherwise).
 - **Exporter `verify-full`:** the exporter scrapes each pod at its short headless name
   (`<release>-pg-<i>.<release>-pg-headless`), so `prometheusExporter.sslmode=verify-full`
@@ -1621,12 +1798,13 @@ postgresql:
 ```
 
 **What the chart does when enabled:** adds `pgaudit` to `shared_preload_libraries`
-(preserving `repmgr` and any libraries you set in `postgresql.configuration` —
+(preserving `repmgr` for the 1.x repmgr mechanism — native has no repmgr
+extension to preserve (#293) — and any libraries you set in `postgresql.configuration` —
 they are merged), renders the `pgaudit.*` GUCs into the postgresql ConfigMap, and
 creates the extension idempotently on the primary via a post-install/upgrade hook Job.
 
-- **Requires `repmgr.enabled: true`.** Audit logging needs the `cagriekin/repmgr` image,
-  which bundles the `pgaudit` extension. Standalone mode (`repmgr.enabled: false`) uses the
+- **Requires `ha.enabled: true`.** Audit logging needs the `cagriekin/pg-ha` image,
+  which bundles the `pgaudit` extension. Standalone mode (`ha.enabled: false`) uses the
   stock `postgres` image, which has no pgaudit, so a bare `shared_preload_libraries=pgaudit`
   would crash-loop the postmaster. The chart **fails fast** at render time in that case; to
   audit in standalone mode, supply a `postgresql.image` that ships pgaudit.
@@ -1649,32 +1827,45 @@ creates the extension idempotently on the primary via a post-install/upgrade hoo
 
 ## Replication Management
 
-Repmgr manages replication automatically. To check cluster status:
+The agent manages replication automatically. There is no `repmgr` CLI to consult any more
+(#290) — inspect the cluster through PostgreSQL itself and the Lease.
+
+Who is primary, authoritatively:
 
 ```bash
-kubectl exec -it my-postgres-pg-0 -- repmgr -f /etc/repmgr/repmgr.conf cluster show
+kubectl get lease my-postgres-pg-leader -o jsonpath='{.spec.holderIdentity}'
 ```
+
+Who is streaming, from the primary's own connection list:
+
+```bash
+kubectl exec -it my-postgres-pg-0 -- psql -U repmgr -d repmgr \
+  -c "SELECT application_name, state, sync_state, replay_lag FROM pg_stat_replication"
+```
+
+Replication slots and the WAL each is holding:
+
+```bash
+kubectl exec -it my-postgres-pg-0 -- psql -U repmgr -d repmgr \
+  -c "SELECT slot_name, active, wal_status, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained FROM pg_replication_slots"
+```
+
+The agent also exports this as metrics — `pg_ha_agent_replicas_streaming`,
+`pg_ha_agent_replicas_expected`, `pg_ha_agent_replication_slots` and the slot-WAL gauges — with
+shipped PrometheusRules, which is the better place to watch it from than a shell.
 
 ### Scaling down
 
-Scaling `postgresql.replicaCount` **down** removes the highest-ordinal pods. The
-primary now **automatically unregisters** the removed nodes from `repmgr.nodes` (#139),
-so `repmgr cluster show` no longer reports them as permanently failed and failover
-elections do not retry the gone DNS names. The primary reconciles `repmgr.nodes` against
-the live ordinal range on each tick (agent mode: the lease-holding primary; repmgrd
-mode: the master's service-updater), keyed on the ordinal (node id = `ordinal + 1000`),
-never on reachability — so a momentarily-down *live* node is never unregistered. Cleanup
-typically completes within a minute of the rolled pods settling; verify with:
+Scaling `postgresql.replicaCount` **down** removes the highest-ordinal pods. There is no
+`repmgr.nodes` registry to strand rows in; what a scale-down leaves behind is a **replication
+slot**, and the primary reclaims the departed ordinal's slot once its pod is gone (#289). The
+discriminator is the ordinal, never reachability, so a momentarily-down *live* node never has its
+slot dropped. Verify with the slot query above — no slot should remain for a removed ordinal.
 
-```bash
-kubectl exec -it my-postgres-pg-0 -- repmgr -f /etc/repmgr/repmgr.conf cluster show
-```
-
-> The removed pods' PVCs are retained (StatefulSet does not delete them); reclaim them
-> manually if desired. If the node being removed is the *current primary* (possible when
-> a prior failover left the primary on a high ordinal), `repmgr standby unregister`
-> refuses to drop a primary row — unregister it by hand after the cluster settles:
-> `kubectl exec -it my-postgres-pg-0 -- repmgr -f /etc/repmgr/repmgr.conf standby unregister --node-id=$((N + 1000))`.
+> The removed pods' PVCs are retained (StatefulSet does not delete them); reclaim them manually
+> if desired. If the node being removed is the *current primary* (possible when a prior failover
+> left the primary on a high ordinal), the StatefulSet still removes it and the remaining nodes
+> elect a new primary through the Lease — no manual unregistration step exists or is needed.
 
 ## PGPool-II Connection Pooling and Load Balancing
 
@@ -1760,12 +1951,12 @@ Use a storage class with `volumeBindingMode: WaitForFirstConsumer`. It delays PV
 
 Cloud block volumes (EBS, GCE PD, Azure Disk) are zonal, which pins each instance to its volume's zone permanently:
 
-- After a zone outage, pods from that zone cannot reschedule elsewhere; availability relies on repmgr promoting a standby in a surviving zone.
+- After a zone outage, pods from that zone cannot reschedule elsewhere; availability relies on the agent promoting a standby in a surviving zone.
 - Deleting a pod never moves it to another zone. To relocate a standby, delete its PVC together with the pod; the recreated pod provisions a new volume in its new zone and re-clones from the primary.
 
 ### Routing Reads Across Zones
 
-With repmgr enabled, the `<fullname>-readonly` service (see [Read-Only Connection to Replicas](#read-only-connection-to-replicas)) selects all standby pods, so read traffic is distributed across the standbys in every zone. Cross-zone traffic charges apply unless topology-aware routing is configured cluster-side; the chart does not set topology annotations on the service.
+With `ha.enabled`, the `<fullname>-readonly` service (see [Read-Only Connection to Replicas](#read-only-connection-to-replicas)) selects all standby pods, so read traffic is distributed across the standbys in every zone. Cross-zone traffic charges apply unless topology-aware routing is configured cluster-side; the chart does not set topology annotations on the service.
 
 ## Prometheus Exporter
 
@@ -1982,7 +2173,7 @@ directly there (`mc ls s3/pg-backups/backups/`), and delete them manually once o
 
 pgBackRest provides WAL-based incremental backups for point-in-time recovery. When enabled, WAL segments are continuously archived from the primary to S3, and scheduled full/differential backups run automatically. This allows restoring the database to any point in time within the retention window.
 
-Requires `repmgr.enabled: true` (pgBackRest is installed in the repmgr image).
+Requires `ha.enabled: true` (pgBackRest is installed in the HA image).
 
 ### Enable pgBackRest
 
@@ -2004,7 +2195,7 @@ helm install my-postgres cagriekin/pg \
 - **WAL archiving**: The primary continuously archives WAL segments to S3 via `archive_command`. Standbys do not archive (PostgreSQL default with `archive_mode = on`).
 - **Full backups**: Weekly (default Sunday 1am) via a CronJob that execs into the pgbackrest sidecar on the current primary.
 - **Differential backups**: Daily (default Mon-Sat 1am) via a separate CronJob. Only changed blocks since the last full backup are stored.
-- **Failover**: After repmgr promotes a standby, the new primary starts archiving WAL and running backups automatically.
+- **Failover**: After the agent promotes a standby, the new primary starts archiving WAL and running backups automatically.
 - **Verification**: After each backup, `pgbackrest info` confirms the backup was recorded in the repository.
 
 ### pgBackRest Parameters
@@ -2083,7 +2274,7 @@ Without this, losing replica 0's PVC is quietly the worst kind of outage. The po
 the entrypoint finds an empty data directory, and it **`initdb`s a brand new empty cluster** —
 your backups are safe in S3, but the live database is empty and nothing has failed loudly.
 
-`pgbackrest.bootstrap.enabled=true` adds an init container that runs before `repmgr-init` and
+`pgbackrest.bootstrap.enabled=true` adds an init container that runs before `repmgr-init` (the clone init container keeps its 1.x name; renaming it is a pod-spec change with no benefit) and
 seeds an *empty* PGDATA from this release's own repository. PostgreSQL then replays the archived
 WAL on startup and promotes, so a lost volume self-heals with no operator action:
 
@@ -2103,7 +2294,7 @@ pgbackrest:
 | Empty, repository **unreachable** | **Fails loudly** and the pod stays in `Init` |
 | Already initialized | Nothing — refuses to touch it, whatever the marker says |
 | Partially restored (aborted attempt) | Resumes the restore (`--delta`) |
-| Any replica other than 0 | Nothing — standbys are cloned from the primary by repmgr |
+| Any replica other than 0 | Nothing — standbys are cloned from the primary by the agent (`pg_basebackup`) |
 
 That third row is deliberate: if the repository cannot be reached, the state of the backups is
 *unknown*, and initializing an empty cluster then would destroy a database that is probably
@@ -2250,8 +2441,8 @@ report or prune it; and Jobs are immutable, so a second attempt needs
 **Standbys rebuild themselves — no extra step.** A PITR restore leaves the restored primary
 on a *new* timeline, while each standby's PVC still holds pre-restore data on the old one. On
 scale-up the standby's init container detects exactly that (`Timeline mismatch (local: 1,
-primary: 2), re-cloning...`) and re-clones from the restored primary via `repmgr standby
-clone` (`pg_basebackup`), then resumes streaming on the new timeline. No PVC deletion, no
+primary: 2), re-cloning...`) and re-clones from the restored primary with
+`pg_basebackup`, then resumes streaming on the new timeline. No PVC deletion, no
 operator action. This is verified end to end by `make -C pg test-pgbackrest-restore-ha`,
 which restores a primary out from under a live standby and asserts the pair comes back
 streaming.
@@ -2274,7 +2465,7 @@ gone, then set `pgbackrest.restore.force=true`.
 
 #### Agent mode: clear the stale leadership state before scaling up
 
-In agent mode (`repmgr.failoverMode: agent`) the Lease and the highwater-marker
+The Lease and the highwater-marker
 ConfigMap survive the scale-to-0 but now describe the *pre-restore* cluster. Before
 scaling back up, delete both so the restored data re-elects cleanly:
 
@@ -2338,20 +2529,18 @@ make test-template
 
 # Create cluster, then run individual suites
 make cluster-create
-make test-minimal           # standalone postgres, no repmgr
-make test-repmgr-failover   # repmgrd: primary + replica, then kill primary -> promote
-make test-repmgr-chaos      # repmgrd: chaos restart regression
-make test-full              # repmgr + pgpool + prometheus exporter
+make test-minimal           # standalone postgres, no HA
+make test-full              # HA + pgpool + prometheus exporter
 make test-upgrade           # upgrade path with data persistence
-make test-agent             # lease-based agent: install + failover (AGENT_COLDBOOT=1 adds cold boot)
+make test-agent             # lease-based agent: install + failover + cold boot (full-cluster restart)
 make test-agent-etcd        # agent with the bundled etcd DCS backend
-make test-migrate-agent     # repmgrd -> agent --cascade=orphan migration
+make test-scaledown         # #139 ghost-node cleanup after a replicaCount scale-down
 make cluster-delete
 
 # Run the core cluster suites in parallel
 make -j4 test-cluster
 
-# Confirm the legacy repmgrd render has not drifted vs a baseline ref
+# Confirm the default render has not drifted vs a baseline ref
 make byte-stable REF=origin/master
 ```
 
@@ -2359,11 +2548,13 @@ make byte-stable REF=origin/master
 
 ### Recovery Time Objective (RTO)
 
-With repmgr enabled, automatic failover completes in approximately 30-60 seconds:
+With `ha.enabled`, automatic failover completes in approximately 30-60 seconds:
 
-1. **Detection** (~10-30s): repmgrd detects primary unavailability based on `health_check_interval` and `reconnect_attempts` in the repmgr configuration.
-2. **Promotion** (~5-10s): repmgrd promotes the highest-priority standby via its `promote_command` (`repmgr standby promote`).
-3. **Service update** (~5-15s): service-updater detects the new primary and patches the Kubernetes Service selector. PGPool-II is restarted if enabled.
+1. **Detection** (~`leaseDuration`, default 15s): the dead primary stops renewing the Lease, so no challenger can acquire it until the TTL elapses.
+2. **Election + promotion** (~5-10s): a standby acquires the Lease, compares timelines and LSNs across the reachable candidates, and the most-advanced one promotes.
+3. **Service update** (~1 reconcile tick, default 5s): the new leader patches the write-Service selector to itself and re-labels the pods for the readonly Service.
+
+Tightening `ha.agent.leaseDuration` shortens detection at the cost of tolerating less apiserver latency; see the agent tunables above.
 
 The `terminationGracePeriodSeconds` (default 120s) controls the maximum time allowed for graceful failover during planned drains (e.g., node upgrades).
 
@@ -2378,27 +2569,23 @@ The `terminationGracePeriodSeconds` (default 120s) controls the maximum time all
 
 ## Recovery Runbooks
 
-> The runbooks below describe **repmgrd mode** (the legacy, opt-in path). In **agent mode** (the default since 1.0.0)
-> (`repmgr.failoverMode: agent`) failover is driven by the Kubernetes Lease, not
-> repmgrd/service-updater: a primary failure is handled automatically (a standby
-> wins the Lease and promotes; the agent repoints the Service selector), and
-> split-brain is prevented at the source (a node serves read-write only while it
-> holds the Lease), so the Split-Brain Recovery runbook does not apply. For
-> agent-mode operations see [Maintenance mode](#maintenance-mode-pause--agent-mode),
-> [Controlled switchover](#controlled-switchover-agent-mode), and the agent-mode
-> notes in [Point-in-Time Recovery](#point-in-time-recovery).
+> Failover is driven by the Kubernetes Lease. A primary failure is handled automatically (a
+> standby wins the Lease and promotes; the agent repoints the Service selector), and split-brain
+> is prevented at the source — a node serves read-write only while it holds the Lease. See also
+> [Maintenance mode](#maintenance-mode-pause), [Controlled switchover](#controlled-switchover),
+> and [Point-in-Time Recovery](#point-in-time-recovery).
 
 ### Primary Failure (Automatic Failover)
 
-No action required if repmgr is enabled. The sequence is:
-1. repmgrd detects primary failure
-2. Standby is promoted automatically
-3. service-updater patches the Kubernetes Service
-4. PGPool-II restarts to pick up the new backend topology
+No action required if `ha.enabled` is true. The sequence is:
+1. The failed primary stops renewing the Lease; it expires after `leaseDuration`
+2. A standby acquires the Lease and promotes (most-advanced timeline/LSN wins)
+3. The new leader patches the write-Service selector and re-labels the pods
 
 Verify with:
 ```bash
-kubectl exec -n <namespace> <pod> -c postgresql -- repmgr cluster show
+kubectl get lease <release>-pg-leader -n <namespace> -o jsonpath='{.spec.holderIdentity}'
+kubectl exec -n <namespace> <pod> -c postgresql -- psql -U repmgr -d repmgr -c "SELECT application_name, state FROM pg_stat_replication"
 ```
 
 ### Rejoin Failed Primary as Standby
@@ -2407,7 +2594,7 @@ After a failover, the old primary must rejoin as a standby:
 ```bash
 kubectl delete pod <old-primary-pod> -n <namespace>
 ```
-The StatefulSet recreates the pod, and the repmgr entrypoint automatically registers it as a standby and clones from the new primary.
+The StatefulSet recreates the pod, and its agent clones from the current primary and follows it.
 
 ### Restore from pg_dump Backup
 
@@ -2423,24 +2610,16 @@ Enable `pgbackrest.restore.enabled` and use the chart's restore Job — see
 `kubectl create job --from=cronjob/<fullname>-pgbackrest-restore` → scale up), the
 point-in-time target values, and the agent-mode leadership cleanup.
 
-### Split-Brain Recovery
+### Split-Brain
 
-If split-brain is detected (multiple primaries logged by service-updater):
+There is no split-brain recovery runbook, because leadership is a Kubernetes Lease and two pods
+cannot hold it at once. If a pod ever finds itself read-write without the Lease — the window an
+asymmetric partition can open — the agent records the condition and demotes itself. That is a
+local (`pg_ctl`) operation that needs no manual step.
 
-1. Identify which node has the most recent data:
+Confirm which pod legitimately holds leadership with:
 ```bash
-kubectl exec -n <namespace> <pod-0> -c postgresql -- psql -U postgres -c "SELECT pg_current_wal_lsn();"
-kubectl exec -n <namespace> <pod-1> -c postgresql -- psql -U postgres -c "SELECT pg_current_wal_lsn();"
-```
-
-2. Stop the stale primary (lower LSN):
-```bash
-kubectl exec -n <namespace> <stale-pod> -c postgresql -- pg_ctl stop -D /var/lib/postgresql/data/pgdata -m fast
-```
-
-3. Delete the stale pod to let it rejoin as standby:
-```bash
-kubectl delete pod <stale-pod> -n <namespace>
+kubectl get lease <release>-pg-leader -n <namespace> -o jsonpath='{.spec.holderIdentity}'
 ```
 
 ### Complete Cluster Rebuild
@@ -2458,12 +2637,12 @@ Then restore from the latest backup using one of the methods above.
 | Symptom | Likely Cause | Resolution |
 |---------|-------------|------------|
 | Replication lag increasing | Slow network or standby under load | Check `pg_stat_replication` on primary. Consider increasing `wal_sender_timeout`. |
-| Failover not triggering | repmgrd not detecting failure | Check repmgrd logs. Verify `health_check_interval` and `reconnect_attempts`. |
-| Service not updating after failover | service-updater stuck or crashed | Check service-updater logs. Liveness probe should restart it if stuck. |
-| PGPool returning errors after failover | PGPool not restarted | service-updater should restart PGPool. Check service-updater logs. Manual restart: `kubectl rollout restart deployment <fullname>-pgpool` |
+| Failover not triggering | Agent paused, or no standby can acquire the Lease | Check `pg_ha_agent_is_paused` and remove the `pg-ha/pause` annotation if set. Otherwise check the agent logs (`kubectl logs <pod> -c postgresql`) and that the apiserver is reachable. |
+| Service not updating after failover | Agent cannot patch the Service | Check the agent logs on the Lease holder and the Role's `services` get/patch grant. |
+| PGPool returning errors after failover | Stale pooled connections to the old primary | The agent repoints the Services; pgpool has failover disabled by design. Restart it if connections are wedged: `kubectl rollout restart deployment <fullname>-pgpool` |
 | WAL archiving failing (pgBackRest) | S3 credentials or connectivity | Check the `pgbackrest` sidecar logs on the primary pod and the `<fullname>-pgbackrest-full`/`-diff` CronJob pod logs. Verify S3 endpoint and credentials. |
 | Backup job hanging | S3 unreachable | `activeDeadlineSeconds` (default 3600s) will terminate the job. Check S3 connectivity. |
-| Split-brain detected in logs | Network partition | Follow the split-brain recovery runbook above. |
+| Split-brain detected in logs | Network partition | The agent demotes (or fences) the leaseless node itself. See [Split-Brain](#split-brain). |
 
 ## Upgrade and migration
 
@@ -2473,9 +2652,14 @@ Each chart is tagged `<chart>-<version>` (e.g. `pg-1.1.0`); `pg` and `pgvector` 
 
 ### Compatibility matrix
 
-| `pg` / `pgvector` | repmgr image | PostgreSQL | Kubernetes |
-|-------------------|--------------|-----------|-----------|
-| 1.17.0 *(current)* | `trixie-5.5.0-34` (`-pg18` / `-pg17`) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+The HA image changed name and tag scheme in 2.0.0 (#290): `cagriekin/pg-ha:<chart-version>-pg<major>`
+replaces `cagriekin/repmgr:trixie-<repmgr>-<n>`. Rows at 1.x keep the old scheme, and
+`cagriekin/repmgr` stays published and frozen at its last tag so existing 1.x pins keep resolving.
+
+| `pg` / `pgvector` | HA image | PostgreSQL | Kubernetes |
+|-------------------|----------|-----------|-----------|
+| 2.0.0 *(current)* | `cagriekin/pg-ha:2.0.0-pg18` / `:2.0.0-pg17` | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
+| 1.17.0 | `trixie-5.5.0-34` (`-pg18` / `-pg17`) | 18.x (default) or 17.x — see [Choosing the PostgreSQL major](#choosing-the-postgresql-major) | ≥ 1.21 (PDB `policy/v1`); ≥ 1.27 for the agent-mode PDB `unhealthyPodEvictionPolicy` |
 | 1.13.1 – 1.14.0 | `trixie-5.5.0-32` | 18.x (default) or 17.x | as above |
 | 1.11.0 – 1.13.0 | `trixie-5.5.0-31` | 18.x (default) or 17.x | as above |
 | 1.10.1 – 1.10.2 | `trixie-5.5.0-30` | 18.x (default) or 17.x | as above |
@@ -2487,7 +2671,7 @@ Each chart is tagged `<chart>-<version>` (e.g. `pg-1.1.0`); `pg` and `pgvector` 
 | 1.0.0 – 1.1.8 | `trixie-5.5.0-16` … `-24` | 18.x | as above |
 | 0.5.88 / 0.6.90 *(last 0.x)* | `trixie-5.5.0-15` | 18.x | ≥ 1.21 (PDB `policy/v1`) |
 
-Extras: agent monitoring (`repmgr.agent.monitoring.*`) needs the Prometheus Operator CRDs; the etcd backend (`repmgr.agent.dcs.backend: etcd`) needs an etcd ≥ 3.5 (BYO/shared) or the bundled etcd subchart (`etcd.enabled=true`).
+Extras: agent monitoring (`ha.agent.monitoring.*`) needs the Prometheus Operator CRDs; the etcd backend (`ha.agent.dcs.backend: etcd`) needs an etcd ≥ 3.5 (BYO/shared) or the bundled etcd subchart (`etcd.enabled=true`).
 
 ### Routine upgrade (within 1.x)
 
@@ -2498,15 +2682,336 @@ helm upgrade my-postgres cagriekin/pg   # add -f your-values.yaml
 
 Within the 1.x line the default is agent mode, and successive releases (e.g. `1.0.0` → `1.14.1`) are backward-compatible: `helm upgrade` rolls the pods once for the new image (`trixie-5.5.0-34` at 1.14.1) and the agent re-establishes leadership with no manual step. **Read every `Migrating from X.Y.Z` entry in [`CHANGELOG.md`](CHANGELOG.md) between your current version and the target** — some releases (credential, `pg_hba`, or image changes) carry one-time steps. The CHANGELOG keeps an unbroken trail back through the 0.x line.
 
-### Crossing the 0.x → 1.x boundary (agent mode is now the default)
+### Upgrading to 2.0.0 (repmgrd removed)
 
-This applies only when upgrading **from a 0.x release**. Since `1.0.0` the default `failoverMode` is `agent` (it was `repmgrd` through 0.x). Three consumer-visible changes land at the boundary:
+**2.0.0 removes the legacy `failoverMode: repmgrd` path** — the repmgrd sidecar, the
+service-updater sidecar, and their values (#286). The lease-based agent, default since `1.0.0`,
+is now the only failover path.
 
-1. **Immutable `podManagementPolicy`.** Agent mode uses `Parallel` (repmgrd used `OrderedReady`), which cannot be changed in place. Adopting agent mode on an existing repmgrd install needs a one-time `kubectl delete statefulset <release>-pg --cascade=orphan` + `helm upgrade` recreate — full runbook and GitOps caveats in **[Migrating an existing release to agent mode](#migrating-an-existing-release-to-agent-mode)**.
-2. **Hardened `pg_hba`.** Agent mode assembles a pod-CIDR + SCRAM `pg_hba.conf` with no implicit `0.0.0.0/0 md5` catch-all. If you relied on the broad md5 rule, add explicit `postgresql.pgHba` rules **before** switching.
-3. **PDB default.** The postgresql PodDisruptionBudget defaults to `maxUnavailable: 1` + `unhealthyPodEvictionPolicy: AlwaysAllow` (was `minAvailable: 1`) — equivalent on a 2-pod cluster, strictly better for drains/upgrades on k8s ≥ 1.27.
+**If you were on the default (agent):** delete `repmgr.failoverMode: agent` from your values if
+you set it explicitly, and upgrade normally. No StatefulSet recreate, no behaviour change.
 
-To defer the move, pin `repmgr.failoverMode: repmgrd`: the legacy path stays supported for one major cycle (then deprecation per the policy below) and that upgrade needs no recreate.
+**If you pinned `failoverMode: repmgrd`:** follow
+[Migrating a repmgrd release (chart 1.x) to 2.0.0](#migrating-a-repmgrd-release-chart-1x-to-200).
+`podManagementPolicy` goes `OrderedReady` → `Parallel` and is immutable, so it needs a one-time
+`--cascade=orphan` recreate. Two further behaviour changes land with it:
+
+- **Hardened `pg_hba`.** The agent assembles a pod-CIDR + SCRAM `pg_hba.conf` with no implicit
+  `0.0.0.0/0 md5` catch-all. If you relied on the broad md5 rule, add explicit
+  `postgresql.pgHba` rules **before** upgrading.
+- **No `PrimaryChanged` Events.** The agent records failover decisions in a structured audit log
+  on the pod instead, and the Role no longer requests the `events` create grant.
+
+#### Renamed values: `repmgr.*` → `ha.*` (#291)
+
+The top-level `repmgr:` block is now `ha:`. Nothing nested changed — only the block's own name:
+
+```yaml
+# 1.x                              # 2.0.0
+repmgr:                            ha:
+  enabled: true                      enabled: true
+  username: repmgr                   username: repmgr
+  agent:                             agent:
+    mechanism: native                  mechanism: native
+```
+
+**Almost nothing is required of you in 2.0.0.** Every `repmgr.*` key except the five security
+keys below still works: `pg.normalizeValues` merges the `repmgr:` block over the `ha:` defaults
+key by key, so an untouched 1.x values file installs unchanged and
+`--set repmgr.agent.leaseDuration=20s` still lands. Both spellings are schema-validated, so a
+typo or a bad enum still fails the render either way, and keys that were *removed* rather than
+renamed fail under either name. `helm upgrade` prints a notice when it sees the old block.
+
+The exception (#298 security review): `repmgr.agent.podCidr`,
+`repmgr.agent.control.allowedClientCNs`, `repmgr.agent.control.restore.allowedClientCNs`,
+`repmgr.agent.control.restore.admissionPolicy.enabled` and
+`repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded` **fail the render under the
+old spelling** -- the alias wins key-by-key even over `--set`, so a stale alias value would
+silently override (and downgrade) a security control; refusing it is the only safe answer.
+Move these five to `ha.agent.*` before upgrading. `podCidr` is the one most 1.x files carry: it
+is a required customization on CNIs outside `10.0.0.0/8` (Calico's default range among them),
+so a file that sets it does need that one edit for 2.0.0.
+
+#### The one rule that will surprise you: `repmgr.*` wins, from any source
+
+Where the same key is set under **both** spellings, the `repmgr.*` value wins — and it wins over
+Helm's own precedence order, not within it. By the time the chart runs, Helm has already
+collapsed chart defaults, every `-f` and every `--set` into one map, so the merge cannot tell an
+operator's value from a chart default. It only sees two spellings and always prefers the
+deprecated one, because that is the only rule that keeps a released 1.x file working — the `ha.*`
+side is where the chart's own defaults live, so preferring it would let a default silently beat a
+value you set.
+
+The consequence, spelled out because it is genuinely counter-intuitive:
+
+```bash
+# legacy.yaml still has  repmgr.agent.leaseDuration: 15s
+helm upgrade r cagriekin/pg -f legacy.yaml --set ha.agent.leaseDuration=30s   # renders 15s, NOT 30s
+```
+
+A `--set`, which Helm normally gives the highest precedence of all, is discarded here. The same
+applies to a later `-f` — order does not matter, the old spelling wins either way. This cannot be
+caught at render time: detecting it needs to know which of the two values you actually supplied,
+and Helm exposes no provenance to a template, so a chart-side `fail` would either fire on every
+legitimate alias use or not at all.
+
+**So migrate a key by *moving* it, never by adding the new spelling alongside the old one.**
+Delete each `repmgr.*` key in the same edit that adds its `ha.*` replacement, and the surprise
+cannot arise. Renaming the whole block at once — the fastest route, below — sidesteps it entirely.
+
+The alias exists so this rename is not a second breaking change stacked on 2.0.0's real one.
+**It is removed in the next major** — rename the block before then:
+
+```bash
+helm get values -o yaml -n <namespace> <release> > values.yaml   # -o yaml is not optional
+# change the top-level "repmgr:" key to "ha:"; leave everything under it alone
+```
+
+`-o yaml` matters: the default output prefixes a `USER-SUPPLIED VALUES:` line, and the schema
+deliberately leaves `additionalProperties` open, so that stray top-level key is accepted in
+silence rather than rejected.
+
+Why rename at all: after #290 the image contains no repmgr — no binary, no extension, no
+`repmgr.conf` — and the agent replicates through `pg_stat_replication` and its own slots. A block
+named `repmgr` sized the resources of, and configured the credentials for, something that is not
+installed. Three keys keep the word legitimately, because they name real PostgreSQL objects the
+agent still authenticates as rather than the tool: `ha.username`, `ha.database`, and the
+`repmgr-password` Secret key. Renaming those touches live clusters' credentials and roles, so it
+is deliberately not part of this change.
+
+**Removed values** — each is rejected at render time with a message naming the fix, so a stale
+values file fails the upgrade rather than silently deploying something else:
+
+| Removed | Why | Action |
+|---------|-----|--------|
+| `repmgr.failoverMode` | Only one failover path remains | Delete the key |
+| `repmgr.serviceUpdater.*` | The sidecar it sized is gone | Delete the key |
+| `repmgr.monitoringHistoryDays` | Pruned `repmgr.monitoring_history`, which only repmgrd wrote | Delete the key |
+| `repmgr.splitBrainDetection.*` | The `log`/`fence` choice lived in the service-updater's `handle_split_brain()`; the agent always demotes when read-write without the lease, so both values did the same thing | Delete the key |
+| `pgpool.autoFailback` | Rendered PGPool's `auto_failback`, which only applied to the repmgrd failover flow | Delete the key |
+
+### Migrating a live repmgr cluster to native (#292)
+
+Every cluster any 1.x release created is repmgr-shaped on disk. `helm upgrade` to 2.0.0 migrates
+it **in place**: no re-clone, no switchover, timeline and system identifier preserved. That
+matters at size — a re-clone of a multi-terabyte cluster is hours of degraded HA and a real RPO
+window, so "it converges eventually" is not the same thing as "it migrated".
+
+#### What is actually on disk, and what happens to it
+
+| State a 1.x cluster carries | What 2.0.0 does |
+|---|---|
+| `shared_preload_libraries = 'repmgr'` **inside PGDATA** | Stripped on first boot, before the postmaster starts (#293). This one is load-bearing: the 2.0.0 image has no `repmgr.so`, and the line lives in the data directory, so without the strip every pod crash-loops at once and `helm rollback` does **not** recover it |
+| `primary_conninfo` / `primary_slot_name` in `postgresql.auto.conf` | Removed, so the agent's own `conf.d` fragment becomes authoritative. `auto.conf` is read *after* every include, so leaving it would outrank the agent |
+| active `repmgr_slot_<node_id>` slots pinning WAL | Left alone while still streaming; dropped only once that standby has provably attached to its `pg_ha_slot_<ordinal>` replacement. The drop carries `AND NOT active`, so a slot still carrying a stream cannot be dropped — that is what makes it safe rather than merely ordered |
+| `repmgr` database, role, extension, `repmgr.nodes` rows | **Left in place.** The agent authenticates as that role, and dropping the rest is irreversible — see [Cleaning up the repmgr catalog](#cleaning-up-the-repmgr-catalog-opt-in) below |
+| `/etc/repmgr/repmgr.conf`, the `repmgr` OS user | Gone with the image. Nothing reads them; no data is deleted as part of an upgrade |
+
+#### Preconditions
+
+Refuse to start on a degraded cluster — that is the one situation where a mistake is not
+recoverable. Check all three:
+
+```bash
+NS=<namespace>; REL=<release>; FULLNAME=<fullname>   # usually <release>-pg
+
+# 1. Every pod Ready (agent readiness is replication-aware, so Ready implies streaming)
+kubectl get pods -n "$NS" -l app.kubernetes.io/component=postgresql
+
+# 2. One primary, and it is the lease holder. Capture it -- the primary is NOT ordinal-bound
+#    (the initial one is decided by the lease race, and any failover moves it), so every command
+#    below that must run "on the primary" uses this variable rather than -0.
+PRIMARY=$(kubectl get lease -n "$NS" "$FULLNAME-leader" -o jsonpath='{.spec.holderIdentity}')
+echo "primary: $PRIMARY"
+
+# 3. Every standby streaming, and no slot already orphaned -- on the PRIMARY, since that is
+#    where pg_stat_replication and the primary's slots live. Run this against a standby by
+#    mistake and both queries come back empty, which reads like "nothing wrong".
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- \
+  psql -U repmgr -d repmgr -Atc \
+  "SELECT application_name, state FROM pg_stat_replication ORDER BY 1"
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- \
+  psql -U repmgr -d repmgr -Atc \
+  "SELECT slot_name, active FROM pg_replication_slots ORDER BY 1"
+```
+
+Take a backup first regardless. If pgBackRest is enabled, confirm a recent full backup exists
+rather than assuming it.
+
+#### The upgrade
+
+```bash
+helm upgrade "$REL" cagriekin/pg -n "$NS" -f your-values.yaml --wait --timeout 20m
+```
+
+Nothing else is required — no `--cascade=orphan` recreate (that was the repmgrd→agent migration,
+a different and now-removed path), and no mechanism flag: `native` is the only mechanism in 2.0.0.
+The StatefulSet rolls highest ordinal first, which is standbys-before-primary already.
+
+If your values file still spells the block `repmgr:`, it keeps working — see
+[Renamed values](#renamed-values-repmgr--ha-291). Rename it in a **separate** commit from this
+upgrade, not the same one: if something does go wrong you want one variable changed, not two.
+
+#### Verifying each node migrated
+
+```bash
+# pg_controldata is not on PATH -- the image keeps the server binaries in the versioned bindir.
+PGMAJOR=18   # or 17, matching ha.image.majorVersion
+CTL="/usr/lib/postgresql/$PGMAJOR/bin/pg_controldata"
+
+for i in 0 1 2; do
+  POD="$FULLNAME-$i"; echo "== $POD"
+  # the system identifier must be what it was before the upgrade -- that is what proves no
+  # re-initdb. Do NOT expect the TIMELINE to be unchanged: the rollout replaces the primary's
+  # pod too, so the lease moves and whoever takes it promotes, which advances the timeline by
+  # design. What matters is that no node is left BEHIND on an older one, checked further down.
+  kubectl exec -n "$NS" "$POD" -c postgresql -- "$CTL" /var/lib/postgresql/data/pgdata \
+    | grep -E "system identifier|Latest checkpoint.s TimeLineID"
+  # the preload must be gone from PGDATA, not merely from the running config
+  kubectl exec -n "$NS" "$POD" -c postgresql -- \
+    grep -c "shared_preload_libraries.*repmgr" /var/lib/postgresql/data/pgdata/postgresql.conf || echo "0 (good)"
+  # a re-clone or a rewind would have left this behind
+  kubectl exec -n "$NS" "$POD" -c postgresql -- \
+    sh -c 'ls -d /var/lib/postgresql/data/pgdata.diverged.* 2>/dev/null | wc -l'
+done
+
+# Nobody stranded: every standby must be following the primary's timeline. GREATEST of the three
+# sources, because each one lags in a different situation -- the control file is as of the last
+# CHECKPOINT (a just-switched standby still shows the old timeline), and a just-promoted primary
+# has only REQUESTED its checkpoint.
+TLQ="SELECT GREATEST((SELECT timeline_id FROM pg_control_checkpoint()),
+                     COALESCE((SELECT min_recovery_end_timeline FROM pg_control_recovery()), 0),
+                     COALESCE((SELECT received_tli FROM pg_stat_wal_receiver), 0))"
+PRIMARY=$(kubectl get lease -n "$NS" "$FULLNAME-leader" -o jsonpath='{.spec.holderIdentity}')
+for i in 0 1 2; do
+  POD="$FULLNAME-$i"
+  echo "$POD tl=$(kubectl exec -n "$NS" "$POD" -c postgresql -- psql -U repmgr -d repmgr -Atc "$TLQ")"
+done   # all three must print the same number
+
+# Slots -- on EVERY node, not only the primary. Legacy repmgr_slot_* only ever existed on the
+# 1.x primary, and the rollout usually moves the primary elsewhere, so checking the current
+# primary alone would miss residue left on the DEMOTED node's own volume.
+# Branch on pg_is_in_recovery(): pg_current_wal_lsn() raises "recovery is in progress" on a
+# standby, so an unbranched query returns nothing but an error on the two nodes this loop most
+# needs to check -- a demoted ex-primary is exactly where legacy residue would sit. On a standby
+# the last RECEIVED LSN is the right reference instead.
+for i in 0 1 2; do
+  POD="$FULLNAME-$i"; echo "== $POD"
+  kubectl exec -n "$NS" "$POD" -c postgresql -- psql -U repmgr -d repmgr -Atc "
+    SELECT slot_name, active,
+           pg_size_pretty(pg_wal_lsn_diff(
+             CASE WHEN pg_is_in_recovery()
+                  THEN pg_last_wal_receive_lsn()
+                  ELSE pg_current_wal_lsn() END,
+             restart_lsn)) AS retained
+      FROM pg_replication_slots ORDER BY 1"
+done
+```
+
+A surviving `repmgr_slot_*` is the one result that needs action rather than patience: it means
+some standby never attached to its native slot. It is retained WAL growing on the primary's
+volume, and it raises no error until the disk fills. The
+`PGHAReplicationSlotInactive` alert covers it if you run the PrometheusRule.
+
+To hold the cluster steady while you inspect a node, use the pause marker. It is a
+**cluster-wide** switch on the marker ConfigMap, not a per-pod one, and it suspends automatic
+promote/demote/fence/self-health while the Lease keeps being renewed — so a node you are staring
+at will not be failed over underneath you:
+
+```bash
+kubectl annotate configmap -n "$NS" "$FULLNAME-primary" pg-ha/pause=true --overwrite
+# ...and to resume
+kubectl annotate configmap -n "$NS" "$FULLNAME-primary" pg-ha/pause- --overwrite
+```
+
+Pausing does not stop the StatefulSet rollout — it stops failover *decisions*. To hold the roll
+itself, use `kubectl rollout pause statefulset "$FULLNAME" -n "$NS"` and resume when satisfied.
+
+#### Rolling back
+
+The cluster stays repmgr-shaped until you run the opt-in cleanup below — that is deliberate, and
+it is what makes rollback possible. Once the cleanup has dropped the extension, rollback is no
+longer available; that is the reason the cleanup is a separate step.
+
+**Pass `--force-conflicts`.** A plain `helm rollback` fails on an agent-mode release:
+
+```
+Rollback failed: conflict occurred while applying object .../Service:
+  conflict with "pg-ha-agent" using v1: .spec.selector
+```
+
+The agent owns `Service.spec.selector` — it patches the selector to point at the current primary
+— and Helm 4 applies server-side, so Helm and the agent contend for that field. `--force-conflicts`
+tells the API server to hand the field back to Helm; the agent re-patches it on its next tick.
+Do **not** reach for `--force` / `--force-replace`: it is deprecated, it is rejected outright
+alongside server-side apply ("cannot use server-side apply and force replace together"), and
+replacement of a StatefulSet is not something you want mid-incident. This applies to any
+`helm rollback` of an agent-mode release, not only this migration.
+
+```bash
+helm rollback "$REL" -n "$NS" --force-conflicts --wait --timeout 12m
+# or, to a specific version: helm upgrade "$REL" cagriekin/pg --version 1.17.0 \
+#   -n "$NS" -f your-values.yaml --force-conflicts --wait --timeout 12m
+```
+
+**You do not need to restore `shared_preload_libraries`.** An earlier draft of this runbook told
+you to re-add `repmgr` with `ALTER SYSTEM` before rolling back. That was wrong twice over, and
+both halves are worth knowing:
+
+- It would not have stuck. `ALTER SYSTEM` writes `postgresql.auto.conf`, which is inside PGDATA,
+  and 2.0.0's agent strips repmgr from **both** `postgresql.conf` and `postgresql.auto.conf` on
+  every boot before the postmaster starts. Any restart of a still-2.0.0 pod in between — a
+  liveness restart, an eviction, an aborted rollback — silently reverted it.
+- It was not needed. Verified by rolling a migrated 3-node cluster back to 1.17.0 with the
+  preload absent: all three pods came up Ready, one primary with both standbys streaming, data
+  intact, `repmgr.nodes` queryable, and `repmgr cluster show` listing all three nodes with the
+  right roles. `shared_preload_libraries = 'repmgr'` was only ever required by **repmgrd**, the
+  daemon removed in 2.0.0 (#286); the extension's SQL and the repmgr CLI do not need it.
+
+After the rollback, confirm the cluster is on the old chart and healthy:
+
+```bash
+helm list -n "$NS"     # chart should read pg-1.x
+kubectl get pods -n "$NS" -l app.kubernetes.io/component=postgresql
+PRIMARY=$(kubectl get lease -n "$NS" "$FULLNAME-leader" -o jsonpath='{.spec.holderIdentity}')
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- psql -U repmgr -d repmgr -Atc \
+  "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'"
+```
+
+#### Cleaning up the repmgr catalog (opt-in)
+
+**Never run this as part of the upgrade.** `DROP EXTENSION` / `DROP DATABASE` is irreversible and
+it is what closes off rollback. Run it only after the cluster has been healthy on native long
+enough that you are satisfied — days, not minutes.
+
+Keep the **role**: the agent authenticates as `repmgr` for every probe and for `pg_basebackup`,
+and `primary_conninfo` carries `dbname=repmgr`. Renaming those is out of scope for 2.0.0 (it
+rewrites a live cluster's credentials). So the cleanup is the extension and its rows only:
+
+```bash
+# On the PRIMARY only -- it replicates to the standbys. Resolve it from the lease; the primary
+# is not ordinal-bound, and running a DROP against a standby fails rather than doing nothing.
+PRIMARY=$(kubectl get lease -n "$NS" "$FULLNAME-leader" -o jsonpath='{.spec.holderIdentity}')
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- psql -U repmgr -d repmgr -c '
+  DROP EXTENSION IF EXISTS repmgr CASCADE;
+'
+```
+
+That drops `repmgr.nodes`, `repmgr.monitoring_history` and the rest of the schema. Verify:
+
+```bash
+kubectl exec -n "$NS" "$PRIMARY" -c postgresql -- psql -U repmgr -d repmgr -Atc \
+  "SELECT count(*) FROM pg_extension WHERE extname='repmgr'"    # expect 0
+```
+
+Do **not** `DROP DATABASE repmgr` or `DROP ROLE repmgr`: both are live dependencies of the agent.
+
+### Crossing the 0.x → 1.x boundary
+
+Coming from a 0.x release, the `podManagementPolicy` and `pg_hba` notes above apply, plus:
+the postgresql PodDisruptionBudget defaults to `maxUnavailable: 1` +
+`unhealthyPodEvictionPolicy: AlwaysAllow` (was `minAvailable: 1`) — equivalent on a 2-pod
+cluster, strictly better for drains/upgrades on k8s ≥ 1.27.
 
 ## Troubleshooting PGPool
 
@@ -2528,7 +3033,7 @@ psql -h localhost -p 5432 -U postgres -d postgres -c "SELECT 1"
 
 If only the PGPool-II path fails, check backend status and logs below. If both fail, troubleshoot PostgreSQL itself first (see the recovery runbooks above).
 
-Check that the Services have endpoints (`my-postgres-pg-readonly` exists when repmgr is enabled):
+Check that the Services have endpoints (`my-postgres-pg-readonly` exists when `ha.enabled` is true):
 
 ```bash
 kubectl get endpoints my-postgres-pg my-postgres-pg-pgpool my-postgres-pg-readonly
@@ -2536,7 +3041,7 @@ kubectl get endpoints my-postgres-pg my-postgres-pg-pgpool my-postgres-pg-readon
 
 The PGPool-II readiness probe runs `SELECT 1` through port 9999 rather than a TCP check, so PGPool-II pods turn unready and drop out of the Service whenever they cannot serve queries from at least one backend. Empty `my-postgres-pg-pgpool` endpoints therefore usually point at a backend or authentication problem, not at the Service. Restarts of the pgpool Deployment pods have the same root cause: the liveness probe runs the same query and restarts a wedged PGPool-II after about 60 seconds.
 
-If reads through the `my-postgres-pg-readonly` Service do not reach standbys, the problem is the `pg-role` labels rather than PGPool-II: the Service selects `pg-role: standby`, which the service-updater (repmgrd mode) or the agent (agent mode) re-applies every cycle, and pods stay absent from its endpoints until labeled (fresh installs, recreated or scaled-up pods).
+If reads through the `my-postgres-pg-readonly` Service do not reach standbys, the problem is the `pg-role` labels rather than PGPool-II: the Service selects `pg-role: standby`, which the agent re-applies every reconcile tick, and pods stay absent from its endpoints until labeled (fresh installs, recreated or scaled-up pods).
 
 ### Checking Backend Status
 
@@ -2562,36 +3067,41 @@ Node IDs follow the StatefulSet ordinals: node 0 is `my-postgres-pg-0`, node 1 i
 | Column | Meaning |
 |--------|---------|
 | `status` | `up`: attached, receives traffic. `waiting`: attached, no connection established yet. `down`: detached after `pgpool.healthCheck.maxRetries` consecutive health check failures; no traffic is routed to it. |
-| `role` | `primary` or `standby` as detected by the streaming replication check. If this disagrees with `repmgr cluster show`, restart PGPool-II. |
+| `role` | `primary` or `standby` as detected by the streaming replication check. If this disagrees with the Lease holder, restart PGPool-II. |
 | `replication_delay` | Standby lag in bytes. |
 | `select_cnt` | SELECT queries routed to the node; confirms load balancing is working. |
 
-A recovered backend is reattached automatically when `pgpool.autoFailback` is `true` (default). Otherwise reattach it with `pcp_attach_node -h localhost -p 9898 -U admin <node-id>` or restart the Deployment.
+PGPool-II has failover disabled by design (the agent owns it and re-points the Services), so backends are not detached on a primary change. If a backend is stuck detached, reattach it with `pcp_attach_node -h localhost -p 9898 -U admin <node-id>` or restart the Deployment.
 
 ### Recovering After Failover
 
-With repmgr enabled the chart automates PGPool-II recovery:
+With `ha.enabled`, PGPool-II needs no failover handling of its own:
 
-1. The service-updater sidecar repoints the primary Service selector to the new primary pod.
-2. On a primary change it runs `kubectl rollout restart deployment my-postgres-pg-pgpool`, so PGPool-II restarts with a fresh backend status file and rediscovers the topology.
-3. The same sidecar probes PGPool-II through its Service every 30 seconds and forces a rollout restart after 3 consecutive failures.
-4. Independently, the PGPool-II liveness probe restarts any instance that cannot serve queries for about 60 seconds.
+1. The agent on the new leader repoints the RW (`<fullname>`) and RO (`<fullname>-readonly`) Service selectors.
+2. PGPool-II points at those Services, not at pod IPs, so it follows the change without reconfiguration — which is why all backends are flagged `DISALLOW_TO_FAILOVER`.
+3. The PGPool-II liveness probe restarts any instance that cannot serve queries for about 60 seconds.
 
-If clients still reach a stale topology (for example writes failing with read-only errors), apply the manual equivalent:
+If clients still reach a stale topology (for example writes failing with read-only errors) — usually
+pooled connections held open to the old primary — restart the Deployment:
 
 ```bash
 kubectl rollout restart deployment my-postgres-pg-pgpool
 ```
 
-Failover history is recorded as Kubernetes Events: on every primary change the service-updater emits a `PrimaryChanged` Event attached to the primary Service, and its container logs on the PostgreSQL pods carry the same transition:
+Failover history lives in the agent's structured audit log on the PostgreSQL pods (the
+`PrimaryChanged` core/v1 Events that the service-updater used to emit went away with it in 2.0.0):
 
 ```bash
-kubectl get events --field-selector reason=PrimaryChanged
+# Every PostgreSQL pod, not just ordinal 0: the transitions that matter are written by whichever
+# agent made them, so the promote is in the NEW primary's log and the demote in the old one's.
+# Reading pod-0 alone shows one side of a failover, and none of it if pod-0 was not involved.
+kubectl logs -l app.kubernetes.io/component=postgresql -c postgresql --prefix --tail=-1 \
+  | grep -i 'promote\|demote\|lease'
 kubectl describe service my-postgres-pg
-kubectl logs my-postgres-pg-0 -c service-updater | grep "Master change"
 ```
 
-Events are pruned by the cluster's event TTL (one hour by default), so the service-updater logs are the longer-lived record.
+Unlike Events — pruned by the cluster's event TTL, one hour by default — the log lives as long as
+the pod, and `pg_ha_agent_*` metrics carry the same transitions for longer retention.
 
 ### Logs
 
@@ -2606,6 +3116,6 @@ Verbosity is controlled by the `pgpool.logging.*` values: `logConnections` (defa
 | Message | Meaning |
 |---------|---------|
 | `failed to connect to PostgreSQL server` / `health check retrying` | A backend is unreachable. The node is marked `down` after `pgpool.healthCheck.maxRetries` retries (default 10, every 3 seconds). |
-| `degenerate backend request ... is canceled because failover is disallowed` | Expected. All backends are flagged `DISALLOW_TO_FAILOVER` (or `ALWAYS_PRIMARY` without repmgr): repmgr owns failover, and the service-updater restarts PGPool-II afterwards instead of letting it detach nodes itself. |
+| `degenerate backend request ... is canceled because failover is disallowed` | Expected. Both backends are flagged `DISALLOW_TO_FAILOVER`, and the RW backend also `ALWAYS_PRIMARY`: the agent owns failover and re-points the Services, so PGPool-II must not detach nodes itself. |
 | `all backend nodes are down` | No backend is reachable and clients are rejected. The liveness probe restarts PGPool-II, which retries discovery; if the message persists, check the PostgreSQL pods. |
 | `authentication failed` / `password mismatch` | Remote clients authenticate with md5 against `pool_passwd`, which contains only the chart's PostgreSQL user. Other database users cannot authenticate through PGPool-II while `pgpool.allowClearTextFrontendAuth` is `false` (default); either connect them directly to PostgreSQL or set it to `true` so PGPool-II can request their password in clear text and forward it to the backend. |

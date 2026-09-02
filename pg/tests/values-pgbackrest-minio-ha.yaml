@@ -36,11 +36,10 @@ postgresql:
 
 repmgr:
   image:
-    repository: cagriekin/repmgr
-    tag: trixie-5.5.0-27
+    repository: cagriekin/pg-ha
+    tag: 2.0.0-pg18
     pullPolicy: IfNotPresent
   enabled: true
-  failoverMode: repmgrd
   username: repmgr
   database: repmgr
   resources:

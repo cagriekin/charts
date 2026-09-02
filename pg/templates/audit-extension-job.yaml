@@ -3,7 +3,7 @@
        object-level auditing (the pgaudit.role GUC) and the DDL event triggers need the
        extension installed. This post-install/upgrade hook Job creates it idempotently on
        the primary (it replicates to standbys), in the primary database. The extension's
-       control file ships in the repmgr image regardless of the preload, so this does not
+       control file ships in the HA image regardless of the preload, so this does not
        depend on the config-change rolling restart having completed. For object auditing in
        OTHER databases, add `pgaudit` to that database's postgresql.databases[].extensions. */}}
 apiVersion: batch/v1

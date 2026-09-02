@@ -1,3 +1,4 @@
+{{- include "pg.normalizeValues" . -}}
 {{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
 apiVersion: v1
 kind: ConfigMap
@@ -11,8 +12,10 @@ metadata:
     {{- . | nindent 4 }}
   {{- end }}
 data:
-{{- /* When the chart owns shared_preload_libraries (repmgr and/or pgaudit must be
-       preserved), the merged value is emitted from an authoritative file below that sorts
+{{- /* When the chart owns shared_preload_libraries (pgaudit must be preserved -- the
+       repmgr prepend went with the mechanism in #294, and #293's
+       pg.validateNativePreloadRepmgr now REFUSES any render that asks for it), the merged
+       value is emitted from an authoritative file below that sorts
        after custom.conf under conf.d's include_dir; emitting it here too would be a dead
        duplicate that file overrides, so skip it. Matched case-insensitively -- PostgreSQL
        GUC names are case-insensitive, and the merge helper reads the key the same way, so
@@ -32,25 +35,13 @@ data:
     {{ $key }} = '{{ index $.Values.postgresql.configuration $key | toString | replace "'" "''" }}'
     {{- end }}
 {{- end }}
-{{- if and (not .Values.postgresql.audit.enabled) (eq (include "pg.chartOwnsSharedPreloadLibraries" .) "true") }}
-  # repmgr mode with an operator-declared shared_preload_libraries. custom.conf is loaded
-  # via conf.d's include_dir at the END of PGDATA/postgresql.conf, so a bare operator value
-  # there would override the repmgr image entrypoint's `shared_preload_libraries = 'repmgr'`
-  # and start the postmaster WITHOUT the repmgr library -- replication and the repmgr GUCs
-  # lose their functions and failover silently stops working (#262 review). This file sorts
-  # after custom.conf, so its merged value (repmgr + the operator's libraries) wins.
-  # shared_preload_libraries is a postmaster parameter: a change here rolls the pods via the
-  # StatefulSet's checksum/postgresql-config annotation.
-  repmgr-preload.conf: |
-    shared_preload_libraries = '{{ include "pg.sharedPreloadLibraries" . }}'
-{{- end }}
 {{- if .Values.pgbackrest.enabled }}
   # Required for pgbackrest WAL archiving. archive_mode is a postmaster
   # parameter so it only takes effect after a postgres restart, which the
   # configmap checksum annotation on the StatefulSet triggers.
   #
   # max_wal_senders is deliberately NOT set here: it used to be hardcoded to the same
-  # value images/repmgr/entrypoint.sh already sets at initdb, which meant this file
+  # value images/pg-ha/entrypoint.sh already sets at initdb, which meant this file
   # clobbered any larger postgresql.configuration.max_wal_senders for no reason
   # (nothing else needs it re-asserted). Removed; the value now simply flows from
   # postgresql.configuration (via custom.conf) or the initdb default, uncontested.
@@ -70,7 +61,7 @@ data:
   # configured; wal_level and archive_mode are unrelated concerns that a prior
   # revision of this file wrongly coupled. Only rendered when non-default, so the
   # default render (and this ConfigMap's existence at all, for installs that touch
-  # nothing else here) stays byte-stable -- images/repmgr/entrypoint.sh's own
+  # nothing else here) stays byte-stable -- images/pg-ha/entrypoint.sh's own
   # initdb-time default already sets this GUC to the same default, so there is
   # nothing to add when the value is left unchanged. This file sorts after custom.conf and
   # pgbackrest-archive.conf under conf.d's include_dir either way, so it would win
@@ -96,7 +87,10 @@ data:
   # ConfigMap's checksum, which the StatefulSet's checksum/postgresql-config annotation
   # turns into a controlled rolling restart. This file sorts after custom.conf under
   # conf.d's include_dir, so its shared_preload_libraries is authoritative; the helper
-  # keeps repmgr (replication) and any operator-declared libraries and adds pgaudit.
+  # keeps any operator-declared libraries and adds pgaudit. It adds nothing else: the
+  # `repmgr` prepend was deleted in #294 with the mechanism, and asking for repmgr here is
+  # now a hard render failure (pg.validateNativePreloadRepmgr) because this image ships no
+  # repmgr.so -- a preload of it would make every pod unstartable.
   pgaudit.conf: |
     shared_preload_libraries = '{{ include "pg.sharedPreloadLibraries" . }}'
     pgaudit.log = '{{ .Values.postgresql.audit.log | toString | replace "'" "''" }}'
@@ -107,7 +101,7 @@ data:
     pgaudit.role = '{{ .Values.postgresql.audit.role | toString | replace "'" "''" }}'
 {{- end }}
 {{- end }}
-{{- if and (eq (include "pg.agentMode" .) "true") .Values.repmgr.agent.syncReplicationSlots }}
+{{- if and (eq (include "pg.agentMode" .) "true") .Values.ha.agent.syncReplicationSlots }}
   # Logical failover slot sync (#308), PostgreSQL 17+. sync_replication_slots is a plain
   # boolean, not topology-dependent (unlike synchronized_standby_slots below, which the
   # agent reconciles per-tick on the primary via ALTER SYSTEM as the standby set changes),

@@ -137,6 +137,13 @@ jobs:
     steps:
       - name: Aggregate result
         run: |
+          # `changes` must have SUCCEEDED before its output can mean "untouched" -- an
+          # unfinished job has empty outputs and would pass this gate having run nothing.
+          # See pg-test.yaml for the full reasoning (#298).
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "redis gate FAILED: the changes job did not succeed (result=${{ needs.changes.result }}), so relevance is unknown"
+            exit 1
+          fi
           if [ "${{ needs.changes.outputs.redis }}" != "true" ]; then
             echo "redis unchanged — gate passes (no-op)"; exit 0
           fi

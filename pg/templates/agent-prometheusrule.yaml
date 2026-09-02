@@ -1,4 +1,5 @@
-{{- if and (eq (include "pg.agentMode" .) "true") (dig "prometheusRule" "enabled" false (.Values.repmgr.agent.monitoring | default dict)) }}
+{{- include "pg.normalizeValues" . -}}
+{{- if and (eq (include "pg.agentMode" .) "true") (dig "prometheusRule" "enabled" false (.Values.ha.agent.monitoring | default dict)) }}
 {{- /*
 Alert rules over the pg-ha-agent's metrics (scraped by the agent
 ServiceMonitor). Scoped to this release by namespace + the headless Service label
@@ -14,7 +15,7 @@ metadata:
   name: {{ include "pg.fullname" . }}-agent
   labels:
     {{- include "pg.labels" . | nindent 4 }}
-    {{- with .Values.repmgr.agent.monitoring.prometheusRule.additionalLabels }}
+    {{- with .Values.ha.agent.monitoring.prometheusRule.additionalLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
   {{- with (include "pg.annotations" .) }}
@@ -73,6 +74,130 @@ spec:
           annotations:
             summary: "pg-ha-agent fencing repeatedly ({{ include "pg.fullname" . }})"
             description: "More than 2 fences in 15m suggests instability (intermittent apiserver/node slowness or a flapping primary)."
+        {{- /* #298 security review. The primary marker is a ConfigMap any namespace writer
+               can forge, and unsafeToServe trusts its recorded timeline: an implausibly high
+               or unparseable highwater trips that guard on EVERY node and freezes automatic
+               promotion cluster-wide. The agent keeps failing closed there -- an untrusted
+               highwater is not safe to serve on -- and counts the tick, which is the ONLY
+               evidence the state exists. Nothing else changes: the primary keeps serving reads
+               and writes, every probe stays green, and the frozen failover surfaces for the
+               first time when the primary dies and no standby takes over. That is precisely
+               the shape that needs a page rather than a gauge nobody is watching.
+
+               The counter advances once per tick while the condition holds and simply stops
+               when the marker is corrected (it is re-read every tick), so a sustained rate is
+               the signal and no clearing logic is needed. */}}
+        - alert: PGHAAgentMarkerTamperSuspected
+          expr: rate(pg_ha_agent_marker_tamper_suspected_total{ {{ $m }} }[5m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "pg-ha-agent primary marker looks forged or corrupt ({{ include "pg.fullname" . }})"
+            description: "An agent has judged the primary marker's recorded timeline impossible (implausibly high, or unparseable) on every tick for 5m. AUTOMATIC FAILOVER IS FROZEN while this holds: the cluster keeps serving, but no standby will be promoted if the primary dies. Inspect the marker with: kubectl get configmap {{ include "pg.fullname" . }}-primary -o yaml; and compare its timeline against the real one: kubectl exec <primary-pod> -c postgresql -- psql -U postgres -tAc 'SELECT timeline_id FROM pg_control_checkpoint()'. The agent rewrites the marker itself once a node legitimately serves, so correcting the ConfigMap clears this -- but review who can write ConfigMaps in this namespace first, because a forged value is the case this alert exists for."
+        {{- /* #289: the slot alerts. A neglected physical replication slot fails silently
+               in one of two ways, and nothing else in the stack reports either.
+               Scoped to the primary implicitly: only the lease holder publishes non-zero
+               slot gauges (the slot pass runs on the primary branches, and a demoted node
+               retracts them), so max() picks the primary's view without a role label.
+
+               The invalidation outcome below is the one that matters on chart defaults --
+               though since the agent's invalidated-slot RECYCLE it is PGHAReplicationSlotRecycled
+               that reports it, not the gauge rule; see that rule's own comment. The image
+               sets max_slot_wal_keep_size = 4GB at initdb (images/pg-ha/entrypoint.sh), so
+               PostgreSQL does not let a slot fill the volume -- it INVALIDATES the slot
+               instead (wal_status = 'lost'), and the standby behind it can then only recover
+               by a full re-clone. Verified against PostgreSQL 18: invalidation also nulls
+               restart_lsn, so the retained-bytes gauge COLLAPSES TO ZERO at the exact moment
+               the slot dies. Retained-WAL alerting is therefore blind to the outcome it was
+               supposed to catch, which is why the invalidated count gets its own rule.
+
+               The retained-WAL rule is the EARLY WARNING ahead of that, so its threshold
+               has to sit below max_slot_wal_keep_size to be reachable at all -- 3Gi against
+               the 4GB cap. It was 16Gi, which no slot could ever reach and which also
+               exceeded the default 10Gi data volume: an alert that cannot fire reads as
+               coverage while providing none. */}}
+        - alert: PGHAReplicationSlotInvalidated
+          expr: max(pg_ha_agent_replication_slots_invalidated{ {{ $m }} }) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "A replication slot was invalidated ({{ include "pg.fullname" . }})"
+            description: "PostgreSQL dropped a physical replication slot's WAL reservation because it exceeded max_slot_wal_keep_size (4GB in this image). The WAL the standby behind it needs is gone, so that standby cannot resume streaming and requires a full re-clone -- delete its PVC and let the agent re-clone it, or trigger a rejoin. Identify it with: SELECT slot_name, active, wal_status, restart_lsn FROM pg_replication_slots WHERE wal_status = 'lost'; -- note the retained-WAL gauge reads ZERO for these, because invalidation nulls restart_lsn."
+        {{- /* #298 review. The gauge above cannot catch a slot the AGENT repairs: since the
+               invalidated-slot recycle, slotsTick observes wal_status='lost' and drops+recreates
+               the slot in the SAME tick, so the gauge is 1 for at most one scrape and 0 after --
+               `for: 5m` never elapses. The rule above still earns its place (an ACTIVE invalidated
+               slot, or one whose ordinal has no live pod, is never recycled), but the commonest
+               case had silently stopped being alertable. That is the dead-alert failure this file
+               has shipped twice already, so it gets a counter and a rate rather than a gauge.
+
+               Recycling restores the SLOT, not the STANDBY: the WAL that standby needed is gone
+               either way and it still requires a full re-clone. So this is a real page, not an
+               informational one -- what the recycle bought is that the ordinal has a usable slot
+               again, so the agent's own re-clone can proceed instead of failing on a dead slot.
+
+               rate() over the counter, for the reason the marker-tamper rule gives: the event is
+               a transition, the counter simply stops advancing once the standby is healthy again,
+               and no clearing logic is needed. */}}
+        - alert: PGHAReplicationSlotRecycled
+          expr: rate(pg_ha_agent_replication_slots_recycled_total{ {{ $m }} }[15m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "A replication slot was invalidated and recycled ({{ include "pg.fullname" . }})"
+            description: "PostgreSQL invalidated a physical replication slot for exceeding max_slot_wal_keep_size (4GB in this image) and the agent dropped and re-created it so the ordinal has a usable slot again. THE STANDBY BEHIND IT STILL NEEDS A FULL RE-CLONE: the WAL it was missing is gone regardless, and the recycle only removes the dead slot that would have made the re-clone itself fail. Watch that the standby comes back -- see PGHAReplicasNotStreaming -- and if it does not, delete its PVC and let the agent re-clone it. This alert exists because the recycle clears pg_ha_agent_replication_slots_invalidated in the same tick that observes it, so PGHAReplicationSlotInvalidated cannot fire for a slot the agent repairs."
+        - alert: PGHAReplicationSlotRetainingWAL
+          expr: max(pg_ha_agent_replication_slot_max_retained_wal_bytes{ {{ $m }} }) > {{ int64 (dig "prometheusRule" "slotRetainedWALBytes" 3221225472 (.Values.ha.agent.monitoring | default dict)) }}
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: "A replication slot is retaining too much WAL ({{ include "pg.fullname" . }})"
+            description: "Some physical replication slot has held back more than {{ int64 (dig "prometheusRule" "slotRetainedWALBytes" 3221225472 (.Values.ha.agent.monitoring | default dict)) }} bytes of WAL for 15m. This is the early warning before max_slot_wal_keep_size (4GB) is reached: past that PostgreSQL invalidates the slot, this gauge drops back to zero, and the standby behind it needs a full re-clone. Find it with: SELECT slot_name, active, wal_status, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots ORDER BY 4 DESC; -- then reattach its consumer, or drop the slot if that consumer is gone for good (pg_drop_replication_slot)."
+        - alert: PGHAReplicationSlotInactive
+          expr: max(pg_ha_agent_replication_slots_inactive{ {{ $m }} }) > 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "A replication slot has no consumer ({{ include "pg.fullname" . }})"
+            description: "At least one physical replication slot has been reserving WAL with no active consumer for 1h. Slots that have reserved nothing yet (a slot minted ahead of its standby) are not counted, so this really is accumulation. Expected briefly while a standby restarts or re-clones; sustained means a standby is down or the slot is orphaned. The agent reclaims slots it owns automatically, so a persistent one is an operator-created slot, or a standby that needs attention."
+{{- if not .Values.ha.agent.cascadingReplication }}
+        {{- /* #288 topology. Rendered ONLY in a star topology, deliberately: under
+               cascadingReplication a child streams from a PEER and never appears in this
+               primary's pg_stat_replication, so topologyTick publishes replicas_expected as 0
+               there. The comparison below would then read `N < 0` -- never true. An alert that
+               cannot fire is not a weak alert, it is a dead one that reads as coverage while
+               providing none, which is the failure #289 and #298 each shipped once. Better
+               absent from the rule file than inert inside it (same reasoning as #335's
+               TLS alert).
+
+               max() on both sides for the reason the slot alerts use it: only the primary
+               publishes non-zero topology gauges (a demoted node calls ClearTopology), so max
+               picks the primary's view without needing a role label. min() would take a
+               standby's 0 and fire forever.
+
+               unidentified is SUBTRACTED because replicas_streaming INCLUDES it: a streaming
+               row that resolves to no pod -- by neither application_name nor slot ordinal --
+               would otherwise mask a genuinely missing replica one-for-one, silencing this
+               alert at exactly the moment the topology view stopped being trustworthy.
+
+               15m because a rolling restart legitimately parks a pod off-stream for a while;
+               the agent logs the same gap only on CHANGE for the same reason. An apiserver
+               blip cannot fire this either: when the live-pod LIST fails, topologyTick leaves
+               the gauges at their previous values rather than publishing a zero. */}}
+        - alert: PGHAReplicasNotStreaming
+          expr: (max(pg_ha_agent_replicas_streaming{ {{ $m }} }) - max(pg_ha_agent_replicas_unidentified{ {{ $m }} })) < max(pg_ha_agent_replicas_expected{ {{ $m }} })
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Fewer standbys are streaming than this cluster has pods ({{ include "pg.fullname" . }})"
+            description: "For 15m the primary has seen fewer identified streaming standbys than there are live peer pods. Redundancy is reduced -- a failover now has fewer candidates, or none -- and synchronous commit will block if synchronous replication is configured against a standby that is not there. Expected briefly during a rolling restart or while a standby re-clones; sustained means a standby is down, wedged, or was invalidated behind a lost replication slot (see PGHAReplicationSlotInvalidated). Check with: kubectl exec <primary-pod> -c postgresql -- psql -U postgres -c 'SELECT application_name, client_addr, state, sync_state FROM pg_stat_replication'; then read the agent log on whichever pod is missing from that list."
+{{- end }}
         - alert: PGHAAgentPausedTooLong
           expr: max(pg_ha_agent_is_paused{ {{ $m }} }) == 1
           for: 1h
@@ -81,4 +206,18 @@ spec:
           annotations:
             summary: "pg-ha-agent left in maintenance mode ({{ include "pg.fullname" . }})"
             description: "Maintenance mode (pg-ha/pause) has been active for 1h -- automatic failover is suspended. Resume with: kubectl annotate configmap {{ include "pg.fullname" . }}-primary pg-ha/pause-"
+{{- if .Values.postgresql.tls.enabled }}
+        {{- /* #335: only rendered where TLS was actually requested. The gauge is 0 on a
+               release without TLS, so the alert would be inert there anyway -- but an
+               inert alert in a rule file is a thing an operator has to reason about, and
+               this one's whole purpose is to remove exactly that kind of noise. */}}
+        - alert: PGHAServerTLSInactive
+          expr: max(pg_ha_agent_tls_inactive{ {{ $m }} }) == 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "PostgreSQL is serving plaintext although TLS is enabled ({{ include "pg.fullname" . }})"
+            description: "postgresql.tls.enabled is set, but the running postmaster reports ssl = off, so clients are connecting in the clear -- while the rendered ConfigMap, the mounted Secret and the values file all still say TLS is on (#335). The pod is failing its readiness probe, so it serves no client traffic until this clears. Check with: kubectl exec <pod> -c postgresql -- psql -U postgres -tAc 'SHOW ssl'; then confirm PGDATA/postgresql.conf ends with include_dir = '/etc/postgresql/conf.d' (SHOW config_file gives the path) and that nothing in postgresql.configuration or ALTER SYSTEM sets ssl. ssl is a sighup parameter, so a reload is enough once the config is right."
+{{- end }}
 {{- end }}

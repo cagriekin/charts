@@ -30,37 +30,62 @@ for pod in "${POD_0}" "${POD_1}" "${POD_2}"; do
   assert_eq "pod ${pod} is Running" "Running" "${pod_phase}"
 done
 
-# Test: primary identification
-is_primary=$(pg_exec "${NAMESPACE}" "${POD_0}" "SELECT NOT pg_is_in_recovery()" "testuser" "testdb")
-assert_eq "pod-0 is primary" "t" "${is_primary}"
+# Test: exactly one primary, and the other two are replicas.
+#
+# DISCOVERED, not assumed to be pod-0 (#290 review). Agent mode renders
+# podManagementPolicy: Parallel and the initial primary is whoever wins the lease race, so
+# asserting pod-0 flaked whenever pod-1 or pod-2 won. Everything below writes through
+# ${PRIMARY} for the same reason -- a write to a standby fails read-only.
+PRIMARY=$(discover_primary "${NAMESPACE}" "${FULLNAME}" 3 testuser testdb)
+# NOT assert_not_eq with a literal "": that helper fails when EITHER operand is empty (#279,
+# so a vacuous uniqueness check cannot pass silently), which made this fail on every run.
+if [ -z "${PRIMARY}" ]; then
+  fail "a primary is discoverable" "discover_primary returned nothing"
+  end_suite
+  print_summary
+  exit 1
+fi
+pass "a primary is discoverable (${PRIMARY})"
 
-for pod in "${POD_1}" "${POD_2}"; do
+replicas=0
+for pod in "${POD_0}" "${POD_1}" "${POD_2}"; do
+  [ "${pod}" = "${PRIMARY}" ] && continue
   is_replica=$(pg_exec "${NAMESPACE}" "${pod}" "SELECT pg_is_in_recovery()" "testuser" "testdb")
   assert_eq "${pod} is replica" "t" "${is_replica}"
+  [ "${is_replica}" = "t" ] && replicas=$((replicas + 1))
 done
+assert_eq "exactly two replicas alongside the primary" "2" "${replicas}"
 
 # Test: replication across all nodes
 REPL_VALUE="full-replicated-$(date +%s)"
-pg_exec "${NAMESPACE}" "${POD_0}" "CREATE TABLE IF NOT EXISTS full_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
-pg_exec "${NAMESPACE}" "${POD_0}" "INSERT INTO full_test (value) VALUES ('${REPL_VALUE}')" "testuser" "testdb"
+pg_exec "${NAMESPACE}" "${PRIMARY}" "CREATE TABLE IF NOT EXISTS full_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
+pg_exec "${NAMESPACE}" "${PRIMARY}" "INSERT INTO full_test (value) VALUES ('${REPL_VALUE}')" "testuser" "testdb"
 
 sleep 3
 
-for pod in "${POD_1}" "${POD_2}"; do
+for pod in "${POD_0}" "${POD_1}" "${POD_2}"; do
+  [ "${pod}" = "${PRIMARY}" ] && continue
   val=$(pg_exec "${NAMESPACE}" "${pod}" "SELECT value FROM full_test WHERE value='${REPL_VALUE}'" "testuser" "testdb")
   assert_eq "data replicated to ${pod}" "${REPL_VALUE}" "${val}"
 done
 
-# Test: repmgr sees all 3 nodes (retry -- node registration may lag pod readiness)
-node_count="0"
+# Test: the primary sees both standbys streaming (retry -- attachment lags pod readiness).
+#
+# This read repmgr.nodes until #290. That table can no longer exist: #288 stopped creating the
+# extension under native, #294 made native the only mechanism, and #290 removed the package
+# from the image entirely -- so the assertion was heading for a guaranteed failure the moment
+# the chart's image tag was bumped. pg_stat_replication is the equivalent and a stronger one:
+# a repmgr.nodes row proved only that a node had registered, whereas this proves it is actually
+# replicating.
+streaming="0"
 for i in $(seq 1 12); do
-  node_count=$(pg_exec "${NAMESPACE}" "${POD_0}" "SELECT count(*) FROM repmgr.nodes" "repmgr" "repmgr")
-  if [[ "${node_count}" == "3" ]]; then
+  streaming=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT count(*) FROM pg_stat_replication WHERE state='streaming'" "repmgr" "repmgr" 2>/dev/null | xargs || echo "0")
+  if [[ "${streaming}" == "2" ]]; then
     break
   fi
   sleep 5
 done
-assert_eq "repmgr sees 3 nodes" "3" "${node_count}"
+assert_eq "the primary sees both standbys streaming" "2" "${streaming}"
 
 # --- PGPool tests ---
 echo ""
@@ -82,15 +107,15 @@ PG_PASSWORD=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}" -o jsonpath='{.
 
 # Test: connect through pgpool
 pgpool_svc="${FULLNAME}-pgpool.${NAMESPACE}.svc.cluster.local"
-pgpool_result=$(kubectl exec -n "${NAMESPACE}" "${POD_0}" -c postgresql -- \
+pgpool_result=$(kubectl exec -n "${NAMESPACE}" "${PRIMARY}" -c postgresql -- \
   bash -c "PGPASSWORD='${PG_PASSWORD}' psql -h '${pgpool_svc}' -p 9999 -U testuser -d testdb -t -A -c 'SELECT 1'" 2>/dev/null)
 assert_eq "can query through pgpool" "1" "${pgpool_result}"
 
 # Test: write through pgpool reaches primary
 PGPOOL_VALUE="via-pgpool-$(date +%s)"
-kubectl exec -n "${NAMESPACE}" "${POD_0}" -c postgresql -- \
+kubectl exec -n "${NAMESPACE}" "${PRIMARY}" -c postgresql -- \
   bash -c "PGPASSWORD='${PG_PASSWORD}' psql -h '${pgpool_svc}' -p 9999 -U testuser -d testdb -c \"INSERT INTO full_test (value) VALUES ('${PGPOOL_VALUE}')\"" 2>/dev/null
-pgpool_write_val=$(pg_exec "${NAMESPACE}" "${POD_0}" "SELECT value FROM full_test WHERE value='${PGPOOL_VALUE}'" "testuser" "testdb")
+pgpool_write_val=$(pg_exec "${NAMESPACE}" "${PRIMARY}" "SELECT value FROM full_test WHERE value='${PGPOOL_VALUE}'" "testuser" "testdb")
 assert_eq "write through pgpool persisted on primary" "${PGPOOL_VALUE}" "${pgpool_write_val}"
 
 # Test: pgpool metrics sidecar
@@ -106,8 +131,13 @@ assert_eq "pgpool PCP port not exposed on Service by default (#118)" "" "${pcp_p
 # Test: PCP admin auth works end-to-end (#130). pcp.conf must hash the admin
 # password as md5; under the old sha256 every pcp_* command failed auth. pgpool's
 # pcp tools take the password from a .pcppass file (PCPPASSFILE), not PCPPASSWORD,
-# so feed it that way and assert pcp_node_count returns the backend count (3)
-# rather than an auth error. The trailing `|| pcp_count=auth-failed` keeps an auth
+# so feed it that way and assert pcp_node_count returns the backend count rather
+# than an auth error.
+#
+# The count is 2, not one-per-pod: the agent fronts the read/write split, so pgpool's
+# backends are the RW Service (<fullname>, ALWAYS_PRIMARY) and the RO Service
+# (<fullname>-readonly) -- two regardless of replicaCount. It was 3 here while this
+# fixture pinned failoverMode: repmgrd, which listed one backend per pod (#286). The trailing `|| pcp_count=auth-failed` keeps an auth
 # failure a clean assertion FAIL instead of a set -e abort of the whole suite.
 pcp_user=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-pgpool-admin" -o jsonpath='{.data.username}' | base64 -d)
 pcp_pw=$(kubectl get secret -n "${NAMESPACE}" "${FULLNAME}-pgpool-admin" -o jsonpath='{.data.password}' | base64 -d)
@@ -116,7 +146,7 @@ pcp_count=$(kubectl exec -n "${NAMESPACE}" "${pgpool_pod}" -c pgpool -- sh -c "
   chmod 600 /tmp/.pcppass
   PCPPASSFILE=/tmp/.pcppass pcp_node_count -h localhost -p 9898 -U '${pcp_user}' -w
 " 2>/dev/null | tail -1 | tr -d '[:space:]') || pcp_count="auth-failed"
-assert_eq "pcp_node_count authenticates and returns backend count (#130)" "3" "${pcp_count}"
+assert_eq "pcp_node_count authenticates and returns backend count (#130)" "2" "${pcp_count}"
 
 # --- Prometheus exporter tests ---
 echo ""
@@ -137,10 +167,23 @@ assert_eq "exporter service port is 9116" "9116" "${exporter_port}"
 # pg_up=1 proves the exporter connected and ran a query as the pg_monitor role --
 # a plain '^pg_' match would still pass with pg_up 0 (auth failed). Grepping only
 # pg_up lines, then asserting none carry a " 0" value, confirms every target is up.
-exporter_svc="${FULLNAME}-postgres-exporter.${NAMESPACE}.svc.cluster.local"
-metrics_output=$(kubectl run "metrics-check-$(date +%s)" -n "${NAMESPACE}" --rm -i --restart=Never \
-  --image=busybox:1.37 -- wget -qO- "http://${exporter_svc}:9116/metrics" 2>/dev/null \
-  | grep '^pg_up' || echo "")
+# Scraped from a pod that is ALREADY running, over bash's /dev/tcp, rather than from a
+# throwaway `kubectl run --image=busybox` (#298, found by the first live run). That pod has to
+# pull an image the cluster may not have and may not be able to fetch; when it produced no
+# output the `2>/dev/null || echo ""` turned the reason into an empty string, so this assertion
+# failed against a perfectly healthy exporter -- and, worse, the `no pg_up 0` assertion below it
+# PASSED, because empty output trivially contains no " 0". One broken fetch, one red herring and
+# one vacuous pass. Verified by hand against this exact deployment: the exporter answers `pg_up 1`.
+exporter_svc="${FULLNAME}-postgres-exporter"
+scraper_pod=$(kubectl get pod -n "${NAMESPACE}" -l app.kubernetes.io/component=postgresql \
+  -o name 2>/dev/null | head -1 | sed 's|pod/||')
+metrics_output=$(kubectl exec -n "${NAMESPACE}" "${scraper_pod}" -c postgresql -- bash -c \
+  "exec 3<>/dev/tcp/${exporter_svc}/9116; printf 'GET /metrics HTTP/1.0\r\n\r\n' >&3; grep '^pg_up' <&3" 2>/dev/null || echo "")
+# An empty scrape means the FETCH failed, not that the exporter is unhealthy -- say which, or the
+# next assertion passes on nothing.
+if [ -z "${metrics_output}" ]; then
+  fail "exporter scrape returned nothing" "could not reach ${exporter_svc}:9116 from ${scraper_pod}; the pg_up assertions below would prove nothing"
+fi
 assert_contains "exporter returns pg_up metric" "${metrics_output}" "pg_up"
 assert_not_contains "exporter scrapes succeed as the monitoring user, no pg_up 0 (#28)" "${metrics_output}" " 0"
 

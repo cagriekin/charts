@@ -7,6 +7,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
+# shellcheck source=scripts/lib.sh
+source "${REPO_ROOT}/scripts/lib.sh"
+
+require_tool kube-linter "https://github.com/stackrox/kube-linter/releases (CI pins v0.7.1)"
 
 CONFIG="${REPO_ROOT}/.kube-linter.yaml"
 
@@ -26,10 +30,51 @@ if [ ${#charts[@]} -eq 0 ]; then
 fi
 
 rc=0
+failed=0
+profiles=0
 for chart in "${charts[@]}"; do
-  echo "==> kube-linter: ${chart}"
-  if ! kube-linter lint "${chart}" --config "${CONFIG}"; then
-    rc=1
-  fi
+  while read -r label vfiles; do
+    # Expanded below as ${args[@]+"${args[@]}"}, not "${args[@]}": bash only stopped
+    # treating an empty array as UNSET in 4.4, and the `defaults` profile always has zero
+    # entries -- so under `set -u` on macOS's system bash 3.2 this gate aborted on its very
+    # first profile with `args[@]: unbound variable`, which reads as a chart failure rather
+    # than a shell-version problem (#298 review). These scripts are documented as runnable
+    # locally.
+    args=()
+    for v in ${vfiles}; do args+=(-f "${v}"); done
+    echo "==> kube-linter: ${chart} [${label}]"
+    profiles=$((profiles + 1))
+    # Rendered through helm and piped in, not `kube-linter lint <chart-dir>` (#298 review).
+    # kube-linter has no values flag, so directory mode can only ever see the DEFAULT render --
+    # which meant every optional container (pgpool, the exporter, pgBackRest's five, the restore
+    # workload, the hook Jobs) went unchecked by the very gate that enforces "every container has
+    # requests and limits, every long-running container has probes". Those are exactly the
+    # containers most likely to be missing them, because they are the ones a reviewer sees least.
+    # Per-object `ignore-check.kube-linter.io/*` waivers are annotations, so they travel in the
+    # rendered manifest and keep working identically.
+    out=""
+    # PER-PROFILE, not per check (#298): `failed` is printed against `profiles`, and a
+    # profile that both fails the lint and renders nothing would count twice. Latch, add one.
+    profile_failed=0
+    if ! out=$( { helm template "${chart}" "${chart}" ${args[@]+"${args[@]}"} \
+        | kube-linter lint - --config "${CONFIG}"; } 2>&1 ); then
+      rc=1
+      profile_failed=1
+    fi
+    printf '%s\n' "${out}"
+    # A VACUOUS PASS is the failure mode that matters here. kube-linter prints
+    # "Warning: no valid objects found." and exits ZERO on empty input, so a profile that renders
+    # nothing reports a clean policy gate while examining not one container. Found live: a
+    # throwaway chart whose container had no resources and no probes passed this gate, while the
+    # same manifest piped to `kube-linter lint -` produced all four violations.
+    if printf '%s' "${out}" | grep -q "no valid objects found"; then
+      echo "FATAL: kube-linter examined NO objects from ${chart} [${label}]." >&2
+      echo "       A gate that examines nothing must fail, not pass. If this fixture is a LAYER" >&2
+      echo "       over another, declare its base in fixture_base() in scripts/lib.sh." >&2
+      rc=1
+      profile_failed=1
+    fi
+    [ "${profile_failed}" -eq 0 ] || failed=$((failed + 1))
+  done < <(chart_profiles "${chart}")
 done
-exit "$rc"
+verdict "kube-linter" "$rc" "$( [ "$rc" -eq 0 ] && echo "${#charts[@]} charts, ${profiles} profiles" || echo "${failed} of ${profiles} profiles" )"

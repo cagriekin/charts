@@ -113,19 +113,32 @@ if [[ "${promoted}" == "true" ]]; then
     done
     assert_eq "#181: rejoined standby is actively streaming (pg_stat_replication)" "streaming" "${stream_state}"
 
-    # #182 regression: a healthy, already-streaming standby must NOT re-run repmgr
-    # standby follow every reconcile tick. Sample several steady-state ticks of the
-    # rejoined standby's agent log (the agent is PID 1 of the postgresql container)
-    # and assert no `act action=Follow` failure surfaced -- the follow is skipped or
-    # latched after attach, never re-forked + logged ERROR each tick.
-    sleep 20
-    follow_errs=$(kubectl logs "${PRIMARY}" -c postgresql -n "${NAMESPACE}" --since=25s 2>/dev/null | grep "repmgr standby follow:" || echo "")
-    assert_not_contains "#182: steady-state standby does not re-run/err on repmgr standby follow" "${follow_errs}" "repmgr standby follow:"
+    # #182 regression: a healthy, already-streaming standby must NOT be re-followed every
+    # reconcile tick. Asserted on REPLICATION STATE, not on log text (#298 review): this
+    # grepped the agent log for "repmgr standby follow:", a string that exists only in Go
+    # comments and is emitted by nothing, so it could never match and the check passed
+    # vacuously -- exactly the regression class it was written to catch went unguarded, and
+    # the native mechanism has no such CLI line to look for in the first place.
+    #
+    # backend_start is the right observable and is mechanism-independent: a re-follow
+    # rewrites primary_conninfo and reloads, which makes the standby's walreceiver
+    # reconnect, which gives the primary a NEW walsender backend and therefore a new
+    # backend_start. Steady state must hold it constant across several ticks.
+    bs_before=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT backend_start FROM pg_stat_replication WHERE application_name='${PRIMARY}'" "testuser" "testdb" 2>/dev/null || echo "")
+    # Non-empty first, so this assertion can never go vacuous the way the old one did.
+    # Spelled as an explicit -n test, NOT assert_not_eq "" ...: the helper rejects an empty
+    # operand by design (#279's anti-vacuity guard), so that form fails whatever the value is.
+    assert_eq "#182: the standby's walsender row is observable (guards against a vacuous check)" \
+      "yes" "$([ -n "${bs_before}" ] && echo yes || echo no)"
+    sleep 25
+    bs_after=$(pg_exec "${NAMESPACE}" "${STANDBY}" "SELECT backend_start FROM pg_stat_replication WHERE application_name='${PRIMARY}'" "testuser" "testdb" 2>/dev/null || echo "")
+    assert_eq "#182: steady-state standby is not re-followed each tick (walsender backend_start unchanged over ~5 ticks)" "${bs_before}" "${bs_after}"
   else
     skip "demoted ex-primary rejects writes (soft fence) (rejoin did not complete)"
     skip "rejoined standby caught up post-failover data (rejoin did not complete)"
     skip "#181: rejoined standby is actively streaming (rejoin did not complete)"
-    skip "#182: steady-state standby does not re-run/err on repmgr standby follow (rejoin did not complete)"
+    skip "#182: the standby's walsender row is observable (rejoin did not complete)"
+    skip "#182: steady-state standby is not re-followed each tick (rejoin did not complete)"
   fi
 else
   skip "ex-primary rejoins as a standby (in recovery) (failover did not complete)"
@@ -133,18 +146,17 @@ else
   skip "demoted ex-primary rejects writes (soft fence) (failover did not complete)"
   skip "rejoined standby caught up post-failover data (failover did not complete)"
   skip "#181: rejoined standby is actively streaming (failover did not complete)"
-  skip "#182: steady-state standby does not re-run/err on repmgr standby follow (failover did not complete)"
+  skip "#182: the standby's walsender row is observable (failover did not complete)"
+  skip "#182: steady-state standby is not re-followed each tick (failover did not complete)"
 fi
 
 # --- cold boot: full-cluster restart. Both pods come up at once (Parallel); the
 # cluster must re-elect a single primary with data intact. This exercises the
 # recovery-mode path (a former primary comes up read-only via standby.signal so the
 # lease holder can rank it) and promote-from-recovery, plus the marker highwater.
-# Opt-in (AGENT_COLDBOOT=1): promote-from-recovery has a not-yet-live-validated
-# repmgr-catalog interaction (a former primary brought up in recovery mode is still
-# type=primary in repmgr.nodes), so it is off by default to keep CI green until
-# verified. The graceful-failover path above is the validated core. ---
-if [[ "${AGENT_COLDBOOT:-0}" == "1" && "${promoted}" == "true" && "${rejoined}" == "true" ]]; then
+# Runs unconditionally: a full-cluster restart is core HA behaviour, and the stage must be
+# the same locally as in CI (#298). ---
+if [[ "${promoted}" == "true" && "${rejoined}" == "true" ]]; then
   echo "  Cold boot: deleting BOTH pods (full-cluster restart)..."
   kubectl delete pod "${PRIMARY}" "${STANDBY}" -n "${NAMESPACE}" --grace-period=10 --wait=false 2>/dev/null || true
   wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 600
@@ -183,11 +195,20 @@ else
 fi
 
 # --- disk loss on pod-0 while the lease sits elsewhere: the pod must CLONE itself back.
-# init-repmgr.sh used to derive its role from the ordinal alone, so an empty PGDATA on
-# ordinal 0 was reported as "First boot, postgres mode will initialize the database" and the
-# clone was skipped -- and entrypoint.sh's primary_safety_guard then (correctly) refused to
-# initdb next to an active primary, so the pod sat in CrashLoopBackOff with no automatic way
-# out. Ordinal > 0 recovered from the identical loss, purely by name.
+# Arrived here with the master merge (#325, a 1.x fix). The BEHAVIOUR it asserts is still
+# required on this line, which is why the stage is kept -- but the cause it originally
+# described is gone, so the explanation is restated rather than left pointing at a deleted
+# file.
+#
+# In 1.x the bug was in init-repmgr.sh: it derived its role from the ordinal alone, so an empty
+# PGDATA on ordinal 0 was reported as "First boot, postgres mode will initialize the database"
+# and the clone was skipped -- then entrypoint.sh's primary_safety_guard (correctly) refused to
+# initdb next to an active primary, leaving the pod in CrashLoopBackOff with no way out, while
+# ordinal > 0 recovered from the identical loss purely by name. Both that script and that guard
+# are deleted here (#290); the agent owns bootstrap and cloning now (BootstrapClone), and it
+# decides by LEASE HOLDERSHIP rather than by ordinal, which is what should make ordinal 0
+# unexceptional. This stage is what proves that, so it is mechanism-agnostic on purpose: it
+# empties PGDATA, waits, and requires the pod back as a streaming standby.
 #
 # The data directory is emptied in place rather than by deleting the PVC: a `kubectl delete
 # pvc` on a volume a pod still uses only marks it Terminating, and the StatefulSet's
@@ -240,7 +261,9 @@ if [[ "${holder}" == "${POD1}" ]]; then
   for _ in $(seq 1 84); do
     uid=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo "")
     if [[ -n "${uid}" && "${uid}" != "${old_uid}" ]]; then
-      ready=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "")
+      # By NAME, not index (#298 review): a probe-less sidecar reports ready=true, so an index
+      # that lands on one turns this convergence wait into an immediate pass.
+      ready=$(kubectl get pod "${POD0}" -n "${NAMESPACE}" -o jsonpath='{.status.containerStatuses[?(@.name=="postgresql")].ready}' 2>/dev/null || echo "")
       if [[ "${ready}" == "true" ]]; then
         recovered=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT pg_is_in_recovery()" "testuser" "testdb" 2>/dev/null || echo "")
         [[ "${recovered}" == "t" ]] && break
@@ -250,18 +273,15 @@ if [[ "${holder}" == "${POD1}" ]]; then
   done
   assert_eq "${POD0} comes back as a standby after losing its data directory" "t" "${recovered}"
 
-  # The regression assertion: ordinal 0 must have taken the CLONE path, not "first boot".
-  # Without it the stage could pass on a pod whose disk was never actually lost.
-  #
-  # Match the line both new branches share. "cloning as a standby" is only logged by the
-  # find_current_primary branch; when the primary is not visible in that one scan window
-  # the any_peer_reachable branch runs instead and logs "waiting for one instead of
-  # initializing a divergent cluster". Pod-0 recovers correctly either way, so asserting
-  # on the first string alone fails whenever the second branch -- the one that exists for
-  # exactly that race -- is the one taken.
-  init_log=$(kubectl logs "${POD0}" -n "${NAMESPACE}" -c repmgr-init 2>/dev/null || echo "")
-  assert_contains "${POD0}'s init cloned instead of claiming a first boot" "${init_log}" "Empty data directory"
-  assert_not_contains "${POD0}'s init did not call an empty ordinal-0 disk a first boot" "${init_log}" "First boot"
+  # The regression assertions: ordinal 0 must have taken the CLONE path, not initdb'd a
+  # divergent cluster. Without them the stage could pass on a pod whose disk was never
+  # actually lost. The entrypoint does not clone -- it logs the deferral and hands the empty
+  # directory to the agent, whose reconcile loop decides BootstrapClone
+  # (never BootstrapInitdb: an empty non-holder is not a first boot). Assert both halves:
+  # the entrypoint saw a genuinely empty directory, and the agent never chose initdb.
+  init_log=$(kubectl logs "${POD0}" -n "${NAMESPACE}" -c postgresql 2>/dev/null || echo "")
+  assert_contains "${POD0}'s entrypoint deferred the empty directory to the agent (#288)" "${init_log}" "empty data directory; deferring to the agent"
+  assert_not_contains "${POD0}'s agent never initdb'd the recreated ordinal-0 disk" "${init_log}" "action=BootstrapInitdb"
 
   streaming=$(pg_exec "${NAMESPACE}" "${POD0}" "SELECT status FROM pg_stat_wal_receiver" "testuser" "testdb" 2>/dev/null || echo "")
   assert_eq "${POD0} is receiving WAL from the primary" "streaming" "${streaming}"
@@ -275,8 +295,8 @@ if [[ "${holder}" == "${POD1}" ]]; then
 else
   for t in "${POD0}'s data directory is really empty before the restart" \
            "${POD0} comes back as a standby after losing its data directory" \
-           "${POD0}'s init cloned instead of claiming a first boot" \
-           "${POD0}'s init did not call an empty ordinal-0 disk a first boot" \
+           "${POD0}'s entrypoint deferred the empty directory to the agent (#288)" \
+           "${POD0}'s agent never initdb'd the recreated ordinal-0 disk" \
            "${POD0} is receiving WAL from the primary" \
            "${POD0} carries data only the surviving primary had (it cloned, not initdb'd)" \
            "the lease stayed with ${POD1} throughout"; do

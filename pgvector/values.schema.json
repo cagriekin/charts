@@ -11,25 +11,66 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["name"],
+            "required": [
+              "name"
+            ],
             "properties": {
-              "name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-              "login": { "type": "boolean" },
+              "name": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+              },
+              "login": {
+                "type": "boolean"
+              },
               "passwordSecret": {
                 "type": "object",
-                "properties": { "name": { "type": "string" }, "key": { "type": "string" } }
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "key": {
+                    "type": "string"
+                  }
+                }
               },
-              "memberOf": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" } },
+              "memberOf": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                }
+              },
               "grants": {
                 "type": "array",
                 "items": {
                   "type": "object",
-                  "required": ["database", "privileges"],
+                  "required": [
+                    "database",
+                    "privileges"
+                  ],
                   "properties": {
-                    "database": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-                    "schema": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-                    "objects": { "enum": ["", "ALL_TABLES", "ALL_SEQUENCES"] },
-                    "privileges": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+                    "database": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                    },
+                    "schema": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+                    },
+                    "objects": {
+                      "enum": [
+                        "",
+                        "ALL_TABLES",
+                        "ALL_SEQUENCES"
+                      ]
+                    },
+                    "privileges": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "minItems": 1
+                    }
                   }
                 }
               }
@@ -40,76 +81,241 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["name"],
+            "required": [
+              "name"
+            ],
             "properties": {
-              "name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-              "owner": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-              "extensions": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$" } }
+              "name": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+              },
+              "owner": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+              },
+              "extensions": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_-]*$"
+                }
+              }
             }
           }
         },
         "extensions": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean" },
-            "packages": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9+.~:=_-]*(\\{major\\}[A-Za-z0-9+.~:=_-]*)*$" }, "description": "Debian/PGDG package names (optionally =version-pinned), apt-get installed into copy-ext/copy-base-ext before the extension-file copy (#303). {major} is substituted with postgresql.majorVersion." },
+            "enabled": {
+              "type": "boolean"
+            },
+            "packages": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9+.~:=_-]*(\\{major\\}[A-Za-z0-9+.~:=_-]*)*$"
+              },
+              "description": "Debian/PGDG package names (optionally =version-pinned), apt-get installed into copy-ext/copy-base-ext before the extension-file copy (#303). {major} is substituted with postgresql.majorVersion."
+            },
             "aptSources": {
               "type": "array",
               "items": {
                 "type": "object",
-                "required": ["name", "keyUrl", "aptLine"],
+                "required": [
+                  "name",
+                  "keyUrl",
+                  "aptLine"
+                ],
                 "properties": {
-                  "name": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" },
-                  "keyUrl": { "type": "string", "pattern": "^https://[A-Za-z0-9._~:/?#%&=-]+$" },
-                  "aptLine": { "type": "string", "pattern": "^[A-Za-z0-9 ./:=,_+~%\\[\\]{}@-]+$" }
+                  "name": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]+$"
+                  },
+                  "keyUrl": {
+                    "type": "string",
+                    "pattern": "^https://[A-Za-z0-9._~:/?#%&=-]+$"
+                  },
+                  "aptLine": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9 ./:=,_+~%\\[\\]{}@-]+$"
+                  }
                 }
               },
               "description": "Non-PGDG apt sources (e.g. Pigsty) to add before installing packages (#310), for extensions PGDG doesn't package. {major} is substituted into aptLine. Requires packages to be non-empty."
             },
-            "extraLibs": { "type": "array", "items": { "type": "string", "pattern": "^/[A-Za-z0-9._/+-]*[A-Za-z0-9._+-]$" }, "description": "Exact absolute FILE paths (no trailing /) to additionally copy into a dedicated volume (#309), for a transitive shared-library dependency Debian places outside /usr/lib/postgresql/<major>/lib (e.g. libsodium.so.23). Pair with LD_LIBRARY_PATH, set automatically when extraLibs is non-empty. Requires packages to be non-empty; core runtime libraries the server itself links are refused." },
-            "env": { "type": "array", "items": { "type": "object" }, "description": "core-v1 EnvVar list for the copy-ext/copy-base-ext init containers (#320) -- chiefly http_proxy, so an install under a default-deny egress policy can go through an in-cell apt mirror instead of permanently allowing apt.postgresql.org/repo.pigsty.io/deb.debian.org. Rendered on the init containers only, never the postgresql container, and only while packages is non-empty (the plain-copy path runs no apt). Requires extensions.enabled and a non-empty packages -- see pg.validateExtensionInitOverrides." },
-            "envFrom": { "type": "array", "items": { "type": "object" }, "description": "core-v1 EnvFromSource list for the same two init containers (#320), for proxy settings shared by every release in a namespace. Same requirements as env." },
-            "extraVolumes": { "type": "array", "items": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" } } }, "description": "core-v1 Volume list added to the pod for the extension init containers (#320) -- for what env cannot express: an /etc/apt/apt.conf.d snippet or a replacement sources.list, since aptSources only APPENDS source files and cannot rewrite the base sources the images ship. Reusing one of the chart's own volume names is refused at render time (a collision REPLACES the chart's volume rather than merging). Same requirements as env." },
-            "extraVolumeMounts": { "type": "array", "items": { "type": "object", "required": ["name", "mountPath"], "properties": { "name": { "type": "string" }, "mountPath": { "type": "string" } } }, "description": "core-v1 VolumeMount list applied to both extension init containers (#320). Every entry must name a volume declared in extraVolumes (an absent volume is rejected by the kubelet at apply time, not by helm), and must not mount over /ext-lib, /ext-share or /ext-extra-lib -- the trees the install step copies into. Same requirements as env." },
-            "image": { "type": "object", "properties": { "repository": { "type": "string" }, "tag": { "type": "string" }, "digest": { "type": "string" }, "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] } }, "description": "Prebuilt extension image (#320) -- packages resolved once at build time, so pods do a plain cp with no apt and no egress at pod start, and the copy container stays unprivileged. Mutually exclusive with packages and aptSources; requires a tag or digest. See the pg chart README." }
+            "extraLibs": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^/[A-Za-z0-9._/+-]*[A-Za-z0-9._+-]$"
+              },
+              "description": "Exact absolute FILE paths (no trailing /) to additionally copy into a dedicated volume (#309), for a transitive shared-library dependency Debian places outside /usr/lib/postgresql/<major>/lib (e.g. libsodium.so.23). Pair with LD_LIBRARY_PATH, set automatically when extraLibs is non-empty. Requires packages to be non-empty; core runtime libraries the server itself links are refused."
+            },
+            "env": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              },
+              "description": "core-v1 EnvVar list for the copy-ext/copy-base-ext init containers (#320) -- chiefly http_proxy, so an install under a default-deny egress policy can go through an in-cell apt mirror instead of permanently allowing apt.postgresql.org/repo.pigsty.io/deb.debian.org. Rendered on the init containers only, never the postgresql container, and only while packages is non-empty (the plain-copy path runs no apt). Requires extensions.enabled and a non-empty packages -- see pg.validateExtensionInitOverrides."
+            },
+            "envFrom": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              },
+              "description": "core-v1 EnvFromSource list for the same two init containers (#320), for proxy settings shared by every release in a namespace. Same requirements as env."
+            },
+            "extraVolumes": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                }
+              },
+              "description": "core-v1 Volume list added to the pod for the extension init containers (#320) -- for what env cannot express: an /etc/apt/apt.conf.d snippet or a replacement sources.list, since aptSources only APPENDS source files and cannot rewrite the base sources the images ship. Reusing one of the chart's own volume names is refused at render time (a collision REPLACES the chart's volume rather than merging). Same requirements as env."
+            },
+            "extraVolumeMounts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "mountPath"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "mountPath": {
+                    "type": "string"
+                  }
+                }
+              },
+              "description": "core-v1 VolumeMount list applied to both extension init containers (#320). Every entry must name a volume declared in extraVolumes (an absent volume is rejected by the kubelet at apply time, not by helm), and must not mount over /ext-lib, /ext-share or /ext-extra-lib -- the trees the install step copies into. Same requirements as env."
+            },
+            "image": {
+              "type": "object",
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": "string"
+                },
+                "digest": {
+                  "type": "string"
+                },
+                "pullPolicy": {
+                  "enum": [
+                    "Always",
+                    "IfNotPresent",
+                    "Never"
+                  ]
+                }
+              },
+              "description": "Prebuilt extension image (#320) -- packages resolved once at build time, so pods do a plain cp with no apt and no egress at pod start, and the copy container stays unprivileged. Mutually exclusive with packages and aptSources; requires a tag or digest. See the pg chart README."
+            }
           }
         },
         "audit": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean" },
-            "log": { "type": "string", "description": "Comma-separated pgaudit classes (read, write, function, role, ddl, misc, misc_set, all), optionally prefixed with - to subtract. Allowlist enforced by the pg.validateAudit template, not this schema." },
-            "logCatalog": { "type": "boolean" },
-            "logParameter": { "type": "boolean" },
-            "logRelation": { "type": "boolean" },
-            "role": { "type": "string", "description": "Optional pgaudit.role for object-level auditing. Empty disables object auditing." }
+            "enabled": {
+              "type": "boolean"
+            },
+            "log": {
+              "type": "string",
+              "description": "Comma-separated pgaudit classes (read, write, function, role, ddl, misc, misc_set, all), optionally prefixed with - to subtract. Allowlist enforced by the pg.validateAudit template, not this schema."
+            },
+            "logCatalog": {
+              "type": "boolean"
+            },
+            "logParameter": {
+              "type": "boolean"
+            },
+            "logRelation": {
+              "type": "boolean"
+            },
+            "role": {
+              "type": "string",
+              "description": "Optional pgaudit.role for object-level auditing. Empty disables object auditing."
+            }
           }
         },
         "walLevel": {
-          "enum": ["replica", "logical"],
+          "enum": [
+            "replica",
+            "logical"
+          ],
           "description": "replica (default) or logical, for a logical-replication subscriber (#308). The only place to set wal_level -- setting it in postgresql.configuration instead is rejected at render time."
+        },
+        "pgHba": {
+          "type": "array",
+          "description": "Extra pg_hba.conf lines inserted above the network catch-alls. Each entry is one line; a single quote or newline is rejected (it is interpolated into a shell postStart hook and pg_hba.conf).",
+          "items": {
+            "type": "string",
+            "pattern": "^[^'\r\n]*$"
+          }
         }
       }
     },
     "repmgr": {
       "type": "object",
       "properties": {
-        "failoverMode": {
-          "enum": ["repmgrd", "agent"],
-          "description": "repmgrd (default) or the lease-based Go agent."
+        "enabled": {
+          "type": "boolean",
+          "description": "HA on/off is load-bearing for ~20 template gates, and a non-boolean truthy value (the classic quoted \"false\", or 1) used to render a hybrid manifest: `if` gates fired while `eq (include \"pg.agentMode\" .) \"true\"` gates did not, dropping the agent's lease env after a clean render (#298 review). Typed here so the accident fails at render time."
         },
         "agent": {
           "type": "object",
           "properties": {
+            "cascadingReplication": {
+              "type": "boolean",
+              "description": "Let a standby follow another standby instead of the primary, to offload the primary's WAL senders (#29/#294). Typed here as well as documented because it is a plain boolean gate read straight into Go-template truthiness: a quoted `\"false\"` (or a --set-string) is a non-empty string, so it renders the cascading branch in the StatefulSet AND drops the PGHAReplicasNotStreaming alert, which is omitted under cascading because replicas_expected is 0 there. Its sibling syncReplicationSlots was typed and this was not (#298 review)."
+            },
             "syncReplicationSlots": {
               "type": "boolean",
               "description": "Reconcile synchronized_standby_slots to the live standby set on every primary tick (#308). Agent mode + PostgreSQL 17+ only; also requires postgresql.walLevel: logical (enforced at render time)."
+            },
+            "mechanism": {
+              "enum": [
+                "repmgr",
+                "native"
+              ],
+              "description": "Replication mechanics the agent drives. native (the default, and since #294 the only implementation) drives PostgreSQL directly: pg_ctl promote, pg_basebackup, pg_rewind, primary_conninfo + standby.signal. It takes topology from pg_stat_replication, owns replication slot lifecycle (#289), and supports syncReplicationSlots and cascadingReplication (#294). The repmgr mechanism and its CLI dependency were removed in 2.0.0; repmgr is still accepted by this enum ONLY so the render-time validator can reject it with a message naming the migration, rather than this schema failing first with a generic enum error. An existing 1.x repmgr cluster is migrated in place on upgrade (#292) -- see the 2.0.0 CHANGELOG and the README migration runbook."
+            },
+            "monitoring": {
+              "type": "object",
+              "properties": {
+                "prometheusRule": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "slotRetainedWALBytes": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "description": "Bytes of WAL retained by a single physical replication slot before PGHAReplicationSlotRetainingWAL fires (#289). Keep it BELOW max_slot_wal_keep_size (4GB in this image, hence the 3Gi default): past that cap PostgreSQL invalidates the slot instead, and invalidation nulls restart_lsn so this gauge collapses to zero -- a threshold above the cap can never fire. Typed and floored because a string or 0 would do the same."
+                    }
+                  }
+                }
+              }
             },
             "dcs": {
               "type": "object",
               "properties": {
                 "backend": {
-                  "enum": ["kubernetes", "etcd"],
+                  "enum": [
+                    "kubernetes",
+                    "etcd"
+                  ],
                   "description": "Leadership store: the Kubernetes Lease API (default) or etcd."
                 }
               }
@@ -118,7 +324,9 @@
               "type": "object",
               "description": "Authenticated control REST API (#276). Dependent rules -- enabled requires tls.existingSecret, restore.enabled requires a non-empty restore.allowedClientCNs -- are template guards, not schema if/then, because helm 3.x does not honor if/then.",
               "properties": {
-                "enabled": { "type": "boolean" },
+                "enabled": {
+                  "type": "boolean"
+                },
                 "port": {
                   "type": "integer",
                   "minimum": 1,
@@ -134,22 +342,35 @@
                     }
                   }
                 },
-                "allowedClientCNs": { "type": "array", "items": { "type": "string" } },
+                "allowedClientCNs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
                 "restore": {
                   "type": "object",
                   "properties": {
-                    "enabled": { "type": "boolean" },
+                    "enabled": {
+                      "type": "boolean"
+                    },
                     "allowedClientCNs": {
                       "type": "array",
-                      "items": { "type": "string" },
+                      "items": {
+                        "type": "string"
+                      },
                       "description": "Restore-specific authz verb. An empty list denies every client."
                     },
-                    "readPodLogs": { "type": "boolean" },
+                    "readPodLogs": {
+                      "type": "boolean"
+                    },
                     "admissionPolicy": {
                       "type": "object",
                       "description": "ValidatingAdmissionPolicy bounding the restore feature's `create jobs` grant by content (#279). Requires Kubernetes >= 1.30 and cluster-scoped create on admissionregistration.k8s.io. Disabling it requires acknowledgeUnbounded=true -- a template guard, not schema if/then.",
                       "properties": {
-                        "enabled": { "type": "boolean" },
+                        "enabled": {
+                          "type": "boolean"
+                        },
                         "acknowledgeUnbounded": {
                           "type": "boolean",
                           "description": "Accept the unbounded namespace-wide job-create grant when the policy is disabled."
@@ -161,30 +382,31 @@
               }
             }
           }
-        },
-        "splitBrainDetection": {
-          "type": "object",
-          "properties": {
-            "action": {
-              "enum": ["log", "fence"]
-            }
-          }
         }
-      }
+      },
+      "description": "DEPRECATED alias for ha.* (#291). Structurally IDENTICAL to ha on purpose: the issue requires both spellings to validate during the alias window, so making this permissive would silently drop enum and type checking for every key an existing values file still spells the old way. Keys under it are merged over the ha.* defaults key by key. Generated from the ha shape -- keep them identical; test-template.sh asserts it."
     },
     "pgpool": {
       "type": "object",
       "properties": {
         "command": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Override the pgpool container startup command. Empty uses the chart default (ipcrm -a reap + exec pgpool)."
         },
         "tls": {
           "type": "object",
           "properties": {
             "backendSslmode": {
-              "enum": ["disable", "prefer", "require", "verify-ca", "verify-full"],
+              "enum": [
+                "disable",
+                "prefer",
+                "require",
+                "verify-ca",
+                "verify-full"
+              ],
               "description": "libpq sslmode for pgpool -> postgres backend connections. Must be >= require when postgresql.tls.require is true."
             }
           }
@@ -195,7 +417,12 @@
       "type": "object",
       "properties": {
         "sslmode": {
-          "enum": ["disable", "require", "verify-ca", "verify-full"],
+          "enum": [
+            "disable",
+            "require",
+            "verify-ca",
+            "verify-full"
+          ],
           "description": "libpq sslmode for the exporter -> postgres connection. Must be >= require when postgresql.tls.require is true."
         }
       }
@@ -207,8 +434,14 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["name"],
-            "properties": { "name": { "type": "string" } }
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              }
+            }
           },
           "description": "core-v1 EnvVar list added to every pgbackrest container (#323) -- chiefly KUBECONFIG, to route the backup CronJob's apiserver traffic through an in-cluster proxy on a cluster whose egress policy denies the apiserver. May not reuse a chart-set name. See the pg chart README."
         },
@@ -216,8 +449,14 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["name"],
-            "properties": { "name": { "type": "string" } }
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              }
+            }
           },
           "description": "core-v1 Volume list added to the pod of every pgbackrest workload (#323). Names may not collide with a chart volume in any of them."
         },
@@ -225,8 +464,18 @@
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["name", "mountPath"],
-            "properties": { "name": { "type": "string" }, "mountPath": { "type": "string" } }
+            "required": [
+              "name",
+              "mountPath"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "mountPath": {
+                "type": "string"
+              }
+            }
           },
           "description": "core-v1 VolumeMount list added to every pgbackrest container (#323); each entry must reference a pgbackrest.extraVolumes entry."
         },
@@ -234,11 +483,17 @@
           "type": "object",
           "properties": {
             "keyType": {
-              "enum": ["shared", "auto"],
+              "enum": [
+                "shared",
+                "auto"
+              ],
               "description": "shared = static keys from existingSecret; auto = cloud workload identity / instance credential chain."
             },
             "uriStyle": {
-              "enum": ["host", "path"],
+              "enum": [
+                "host",
+                "path"
+              ],
               "description": "S3 addressing: host (AWS virtual-host style, default) or path (most non-AWS stores)."
             }
           }
@@ -247,7 +502,10 @@
           "type": "object",
           "properties": {
             "cipherType": {
-              "enum": ["aes-256-cbc", "none"],
+              "enum": [
+                "aes-256-cbc",
+                "none"
+              ],
               "description": "pgBackRest repo1-cipher-type when repoEncryption.enabled."
             }
           }
@@ -255,54 +513,230 @@
         "validation": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean" },
-            "schedule": { "type": "string" },
+            "enabled": {
+              "type": "boolean"
+            },
+            "schedule": {
+              "type": "string"
+            },
             "targetType": {
-              "enum": ["", "time", "xid", "name", "lsn"],
+              "enum": [
+                "",
+                "time",
+                "xid",
+                "name",
+                "lsn"
+              ],
               "description": "PITR target type (pgbackrest --type); empty restores the latest backup + replays all WAL. validation.target is required when set."
             },
-            "target": { "type": "string" },
-            "recoveryTimeout": { "type": "integer" },
-            "workdirSizeLimit": { "type": "string" },
-            "activeDeadlineSeconds": { "type": "integer" },
-            "backoffLimit": { "type": "integer" }
+            "target": {
+              "type": "string"
+            },
+            "recoveryTimeout": {
+              "type": "integer"
+            },
+            "workdirSizeLimit": {
+              "type": "string"
+            },
+            "activeDeadlineSeconds": {
+              "type": "integer"
+            },
+            "backoffLimit": {
+              "type": "integer"
+            }
           }
         },
         "bootstrap": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean" },
+            "enabled": {
+              "type": "boolean"
+            },
             "targetType": {
-              "enum": ["", "time", "xid", "name", "lsn"],
+              "enum": [
+                "",
+                "time",
+                "xid",
+                "name",
+                "lsn"
+              ],
               "description": "PITR target type (pgbackrest --type) applied when bootstrapping an empty PGDATA; empty restores the latest backup + replays all WAL. bootstrap.target is required when set."
             },
-            "target": { "type": "string" },
-            "backupSet": { "type": "string" }
+            "target": {
+              "type": "string"
+            },
+            "backupSet": {
+              "type": "string"
+            }
           }
         },
         "restore": {
           "type": "object",
           "properties": {
-            "enabled": { "type": "boolean" },
+            "enabled": {
+              "type": "boolean"
+            },
             "mode": {
-              "enum": ["cronjob", "job"],
+              "enum": [
+                "cronjob",
+                "job"
+              ],
               "description": "cronjob = suspended CronJob to clone with `kubectl create job --from`; job = bare Job to render on demand with `helm template -s`."
             },
             "targetType": {
-              "enum": ["", "time", "xid", "name", "lsn"],
+              "enum": [
+                "",
+                "time",
+                "xid",
+                "name",
+                "lsn"
+              ],
               "description": "PITR target type (pgbackrest --type); empty restores the latest backup + replays all WAL. restore.target is required when set."
             },
-            "target": { "type": "string" },
-            "backupSet": { "type": "string" },
-            "force": { "type": "boolean" },
-            "podOrdinal": { "type": "integer", "minimum": 0 },
+            "target": {
+              "type": "string"
+            },
+            "backupSet": {
+              "type": "string"
+            },
+            "force": {
+              "type": "boolean"
+            },
+            "podOrdinal": {
+              "type": "integer",
+              "minimum": 0
+            },
             "nameSuffix": {
               "type": "string",
               "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
               "description": "Appended to the Job name (mode: job), so it must be a valid DNS-1123 label segment; empty = no suffix."
             },
-            "activeDeadlineSeconds": { "type": "integer" },
-            "backoffLimit": { "type": "integer" }
+            "activeDeadlineSeconds": {
+              "type": "integer"
+            },
+            "backoffLimit": {
+              "type": "integer"
+            }
+          }
+        }
+      }
+    },
+    "ha": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "HA on/off is load-bearing for ~20 template gates, and a non-boolean truthy value (the classic quoted \"false\", or 1) used to render a hybrid manifest: `if` gates fired while `eq (include \"pg.agentMode\" .) \"true\"` gates did not, dropping the agent's lease env after a clean render (#298 review). Typed here so the accident fails at render time."
+        },
+        "agent": {
+          "type": "object",
+          "properties": {
+            "cascadingReplication": {
+              "type": "boolean",
+              "description": "Let a standby follow another standby instead of the primary, to offload the primary's WAL senders (#29/#294). Typed here as well as documented because it is a plain boolean gate read straight into Go-template truthiness: a quoted `\"false\"` (or a --set-string) is a non-empty string, so it renders the cascading branch in the StatefulSet AND drops the PGHAReplicasNotStreaming alert, which is omitted under cascading because replicas_expected is 0 there. Its sibling syncReplicationSlots was typed and this was not (#298 review)."
+            },
+            "syncReplicationSlots": {
+              "type": "boolean",
+              "description": "Reconcile synchronized_standby_slots to the live standby set on every primary tick (#308). Agent mode + PostgreSQL 17+ only; also requires postgresql.walLevel: logical (enforced at render time)."
+            },
+            "mechanism": {
+              "enum": [
+                "repmgr",
+                "native"
+              ],
+              "description": "Replication mechanics the agent drives. native (the default, and since #294 the only implementation) drives PostgreSQL directly: pg_ctl promote, pg_basebackup, pg_rewind, primary_conninfo + standby.signal. It takes topology from pg_stat_replication, owns replication slot lifecycle (#289), and supports syncReplicationSlots and cascadingReplication (#294). The repmgr mechanism and its CLI dependency were removed in 2.0.0; repmgr is still accepted by this enum ONLY so the render-time validator can reject it with a message naming the migration, rather than this schema failing first with a generic enum error. An existing 1.x repmgr cluster is migrated in place on upgrade (#292) -- see the 2.0.0 CHANGELOG and the README migration runbook."
+            },
+            "monitoring": {
+              "type": "object",
+              "properties": {
+                "prometheusRule": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "slotRetainedWALBytes": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "description": "Bytes of WAL retained by a single physical replication slot before PGHAReplicationSlotRetainingWAL fires (#289). Keep it BELOW max_slot_wal_keep_size (4GB in this image, hence the 3Gi default): past that cap PostgreSQL invalidates the slot instead, and invalidation nulls restart_lsn so this gauge collapses to zero -- a threshold above the cap can never fire. Typed and floored because a string or 0 would do the same."
+                    }
+                  }
+                }
+              }
+            },
+            "dcs": {
+              "type": "object",
+              "properties": {
+                "backend": {
+                  "enum": [
+                    "kubernetes",
+                    "etcd"
+                  ],
+                  "description": "Leadership store: the Kubernetes Lease API (default) or etcd."
+                }
+              }
+            },
+            "control": {
+              "type": "object",
+              "description": "Authenticated control REST API (#276). Dependent rules -- enabled requires tls.existingSecret, restore.enabled requires a non-empty restore.allowedClientCNs -- are template guards, not schema if/then, because helm 3.x does not honor if/then.",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "port": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 65535,
+                  "description": "Control-only listener; must not be the 9200 metrics port (a render guard enforces that)."
+                },
+                "tls": {
+                  "type": "object",
+                  "properties": {
+                    "existingSecret": {
+                      "type": "string",
+                      "description": "Secret with tls.crt, tls.key and ca.crt. Required when control is enabled: mTLS is the only authentication mode."
+                    }
+                  }
+                },
+                "allowedClientCNs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "restore": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "allowedClientCNs": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Restore-specific authz verb. An empty list denies every client."
+                    },
+                    "readPodLogs": {
+                      "type": "boolean"
+                    },
+                    "admissionPolicy": {
+                      "type": "object",
+                      "description": "ValidatingAdmissionPolicy bounding the restore feature's `create jobs` grant by content (#279). Requires Kubernetes >= 1.30 and cluster-scoped create on admissionregistration.k8s.io. Disabling it requires acknowledgeUnbounded=true -- a template guard, not schema if/then.",
+                      "properties": {
+                        "enabled": {
+                          "type": "boolean"
+                        },
+                        "acknowledgeUnbounded": {
+                          "type": "boolean",
+                          "description": "Accept the unbounded namespace-wide job-create grant when the policy is disabled."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }

@@ -40,14 +40,25 @@ postgresql:
   podDisruptionBudget:
     enabled: false
 
+# Security-relevant control keys go under ha.* (the canonical name), not the deprecated
+# repmgr.* alias: the chart refuses that alias for these keys since the alias overwrites ha.*
+# even over --set (#298 security review). The merge combines both trees, so the rendered
+# result is identical to nesting everything under repmgr.
+ha:
+  agent:
+    control:
+      # Only this CN may call the API, so the suite can prove an unlisted identity is
+      # refused with a certificate the same CA signed.
+      allowedClientCNs:
+        - ops-admin
+
 repmgr:
   image:
-    repository: cagriekin/repmgr
-    tag: trixie-5.5.0-31
+    repository: cagriekin/pg-ha
+    tag: 2.0.0-pg18
     pullPolicy: IfNotPresent
 
   enabled: true
-  failoverMode: agent
 
   username: repmgr
   database: repmgr
@@ -59,10 +70,6 @@ repmgr:
       enabled: true
       tls:
         existingSecret: pg-agent-control-tls
-      # Only this CN may call the API, so the suite can prove an unlisted identity is
-      # refused with a certificate the same CA signed.
-      allowedClientCNs:
-        - ops-admin
 
   resources:
     requests:

@@ -1,0 +1,48 @@
+# pgvector-SCOPED, not a mirror of pg's suite (#298). pgvector's templates are symlinks into
+# pg's and byte-identical by gate, so pg's suite already covers the shared logic; what belongs
+# here is chart-SPECIFIC -- pgvector's defaults, its image, and the shared validators firing
+# under pgvector's values+schema. The name keeps it from reading as a mirror, and
+# scripts/helm-unittest-charts.sh enforces the rule: same-named means SYMLINK, never a copy.
+suite: pgvector structural render
+release:
+  name: test-pgv
+tests:
+  # pgvector defaults to agent HA (repmgr.enabled, replicaCount 1) -- the symlinked pg
+  # templates must render under pgvector values. Since #286 the agent is the only mode.
+  - it: default statefulset is agent-mode HA (2 replicas, Parallel, agent entrypoint)
+    template: templates/statefulset.yaml
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - equal:
+          path: spec.replicas
+          value: 2
+      - equal:
+          path: spec.podManagementPolicy
+          value: Parallel
+      - equal:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].command
+          value:
+            - /usr/local/bin/entrypoint.sh
+            - agent
+      - notExists:
+          path: spec.template.spec.containers[?(@.name=="repmgrd")]
+
+  - it: default renders a Secret
+    template: templates/secret.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: Secret
+
+  - it: default renders a primary Service selecting <release>-0
+    template: templates/service.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: Service
+      - equal:
+          path: spec.selector["statefulset.kubernetes.io/pod-name"]
+          value: test-pgv-pgvector-0

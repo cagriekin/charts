@@ -1,8 +1,8 @@
 apiVersion: v2
 name: pgvector
-description: PostgreSQL with the pgvector extension for vector search, plus repmgr replication, agent failover (Kubernetes Lease or etcd-quorum DCS), optional PgPool-II, S3 backups, TLS, and metrics
+description: PostgreSQL with the pgvector extension for vector search, plus streaming replication, agent failover (Kubernetes Lease or etcd-quorum DCS), optional PgPool-II, S3 backups, TLS, and metrics
 type: application
-version: 1.17.0
+version: 2.0.0
 appVersion: "18"
 home: https://github.com/cagriekin/charts/tree/master/pgvector
 icon: https://wiki.postgresql.org/images/a/a4/PostgreSQL_logo.3colors.svg
@@ -27,6 +27,6 @@ dependencies:
     version: 0.1.0
     repository: file://../common
   - name: etcd
-    version: 0.1.5
+    version: 0.1.14
     repository: file://../etcd
     condition: etcd.enabled

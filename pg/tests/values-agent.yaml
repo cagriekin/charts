@@ -44,23 +44,19 @@ postgresql:
     postStart:
       additionalCommands: ""
 
-repmgr:
-  # No image pin on purpose. This suite exercises the image's own bootstrap shell
-  # (init-repmgr.sh / entrypoint.sh), which only makes sense against the image CI built
-  # from source, so inherit the tag from pg/values.yaml rather than naming one here.
-  #
-  # The pin was redundant rather than harmful: pg/tests/set-pg-major.sh globs every
-  # pg/tests/values-*.yaml and rewrites the repmgr tag from pg/values.yaml before each
-  # suite leg runs, so CI resolved the freshly-built tag whatever this file said. Dropping
-  # it removes a value that had to be hand-bumped to stay honest.
-  #
-  # Local runs that skip set-pg-major.sh now resolve pg/values.yaml's tag, which is a
-  # PUBLISHED image -- so a stage testing an unreleased image-shell change fails locally
-  # until that tag is published. Run set-pg-major.sh (or build and pin by hand) to
-  # exercise those against a locally built image.
-
+# Spelled `ha:` on purpose (#291), while every other fixture stays on the deprecated
+# `repmgr:` alias. This fixture feeds nine KinD suites, so the split gives the canonical
+# name real cluster coverage and leaves the alias exercised everywhere else -- otherwise the
+# name operators are told to migrate to would be the only one no live suite ever renders.
+ha:
+  # NO image pin (#293). This fixture used to pin trixie-5.5.0-27, six releases behind the
+  # chart default. CI is unaffected -- set-pg-major.sh rewrites every fixture's repmgr tag to
+  # the chart's own before any suite runs, so CI always tested the freshly built image -- but
+  # a LOCAL run does not go through that script, so `make -C pg test-agent-rolling` silently
+  # pulled a stale RELEASED image and asserted agent behaviour against last quarter's agent.
+  # That is exactly how this suite's #293 assertions would have passed while testing nothing.
+  # Inheriting the chart default keeps the local and CI subject the same image.
   enabled: true
-  failoverMode: agent
 
   username: repmgr
   database: repmgr

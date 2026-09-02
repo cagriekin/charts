@@ -1,14 +1,13 @@
-{{- if .Values.repmgr.enabled }}
+{{- include "pg.normalizeValues" . -}}
+{{- if .Values.ha.enabled }}
 {{- /* Service selectors are equality-only, so "every pod except the primary"
        cannot be expressed against pod-name. Instead a pg-role label
        (primary/standby) is maintained on all postgresql pods each reconciliation
-       tick -- by the pg-ha-agent in agent mode (the default) or by the
-       service-updater sidecar in repmgrd mode -- and this Service selects the
-       standby role. Pods carry no pg-role label until one is applied (fresh
-       installs, upgrades from older chart versions, scale-ups), so they are
-       simply absent from the endpoints until labeled -- the primary can never
-       be selected by accident. Repmgr-only: standalone installs run a single
-       pod with no standbys. */}}
+       tick by the pg-ha-agent, and this Service selects the standby role. Pods
+       carry no pg-role label until one is applied (fresh installs, upgrades from
+       older chart versions, scale-ups), so they are simply absent from the
+       endpoints until labeled -- the primary can never be selected by accident.
+       HA-only: standalone installs run a single pod with no standbys. */}}
 apiVersion: v1
 kind: Service
 metadata:

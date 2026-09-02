@@ -52,10 +52,9 @@ postgresql:
       additionalCommands: ""
 
 repmgr:
-  failoverMode: repmgrd
   image:
-    repository: cagriekin/repmgr
-    tag: trixie-5.5.0-27
+    repository: cagriekin/pg-ha
+    tag: 2.0.0-pg18
     pullPolicy: IfNotPresent
 
   enabled: true
@@ -70,14 +69,6 @@ repmgr:
     limits:
       cpu: 500m
       memory: 512Mi
-
-  serviceUpdater:
-    resources:
-      requests:
-        cpu: 50m
-        memory: 64Mi
-      limits:
-        memory: 128Mi
 
 pgpool:
   enabled: true
@@ -109,7 +100,6 @@ pgpool:
     retryDelay: 3
 
   failOverOnBackendError: false
-  autoFailback: true
 
   logging:
     logConnections: true

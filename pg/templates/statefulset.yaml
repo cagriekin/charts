@@ -1,5 +1,18 @@
+{{- include "pg.normalizeValues" . -}}
+{{- /* An overlay that nulls the whole agent block must fail with THIS message rather than a
+       raw nil-pointer, and the check therefore has to precede the WHOLE validator chain
+       (#298 review). It used to sit beside the env block it was written for, ~800 lines
+       below, which made it unreachable: pg.validateSyncReplicationSlotsMajor already reads
+       .Values.ha.agent.syncReplicationSlots, so `--set ha.agent=null` died at line 18 with
+       `nil pointer evaluating interface {}.syncReplicationSlots` -- exactly the message the
+       guard exists to replace. */}}
+{{- if eq (include "pg.agentMode" .) "true" }}
+{{- $_ := required "ha.agent is required when ha.enabled=true" .Values.ha.agent }}
+{{- end }}
 {{- include "pg.validateResourceNames" . }}
 {{- include "pg.validateAudit" . }}
+{{- include "pg.validateRoleNames" . }}
+{{- include "pg.validatePgHba" . }}
 {{- include "pg.validateExtraPassthrough" . }}
 {{- include "pg.validatePgbackrestPassthrough" . }}
 {{- include "pg.validateExtensionPackages" . }}
@@ -14,8 +27,13 @@
 {{- include "pg.validateWalLevel" . }}
 {{- include "pg.validateSyncReplicationSlotsMajor" . }}
 {{- include "pg.validateSyncReplicationSlotsWalLevel" . }}
-{{- if and (not .Values.repmgr.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
-{{- fail "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr" }}
+{{- include "pg.validateNativePreloadRepmgr" . }}
+{{- include "pg.validateRemovedRepmgrdValues" . }}
+{{- include "pg.validateLeaseTimings" . }}
+{{- include "pg.validateHaImageGeneration" . }}
+{{- include "pg.validateEtcdBootstrapImage" . }}
+{{- if and (not .Values.ha.enabled) (gt (int .Values.postgresql.replicaCount) 0) }}
+{{- fail "postgresql.replicaCount > 0 requires ha.enabled=true: with HA disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode, or ha.enabled=true" }}
 {{- end }}
 {{- /* Client TLS validation (#110) */}}
 {{- if .Values.postgresql.tls.enabled }}
@@ -24,12 +42,14 @@
 {{- if and (or .Values.postgresql.tls.require .Values.postgresql.tls.clientCertAuth) (not .Values.postgresql.tls.enabled) }}
 {{- fail "postgresql.tls.require / clientCertAuth require postgresql.tls.enabled" }}
 {{- end }}
-{{- /* require/mTLS are enforced via the agent-assembled pg_hba (hostssl). In repmgrd
-       mode pg_hba carries an md5-fallback line that would bypass a hostssl rule, so
-       enforced TLS is unsafe there -- server TLS (ssl=on) still works; clients can opt
-       in with sslmode=require, or add explicit hostssl rules via postgresql.pgHba. */}}
+{{- /* require/mTLS are enforced via the agent-assembled pg_hba (hostssl), and only the
+       agent authors pg_hba. Standalone mode (ha.enabled=false) runs the stock postgres
+       image with its own pg_hba, which carries an md5-fallback line that would bypass a
+       hostssl rule -- so enforced TLS is unsafe there. Server TLS (ssl=on) still works;
+       clients can opt in with sslmode=require, or add explicit hostssl rules via
+       postgresql.pgHba. */}}
 {{- if and (or .Values.postgresql.tls.require .Values.postgresql.tls.clientCertAuth) (ne (include "pg.agentMode" .) "true") }}
-{{- fail "postgresql.tls.require / clientCertAuth are supported only in agent mode (repmgr.failoverMode=agent). In repmgrd mode use postgresql.tls.enabled for optional server TLS; enforced TLS needs agent mode." }}
+{{- fail "postgresql.tls.require / clientCertAuth require ha.enabled=true: enforced TLS depends on the agent-assembled pg_hba (hostssl with no md5 fallback), and standalone mode runs the stock postgres image's own pg_hba. For standalone, use postgresql.tls.enabled for optional server TLS and have clients set sslmode=require." }}
 {{- end }}
 {{- /* Cross-component sslmode consistency: when the server requires TLS, the exporter
        must also use TLS or its scrapes are rejected by hostssl. clientCertAuth forces
@@ -56,36 +76,61 @@
        an unauthenticated mutating port), and discovering that from a CrashLoopBackOff
        is a much worse experience than a failed `helm upgrade`. Mirrors the
        postgresql.tls.existingSecret guard above. */}}
-{{- $control := .Values.repmgr.agent.control }}
+{{- /* NIL-SAFE, because this line runs in STANDALONE mode too (#298 review). The
+       `ha.agent is required` guard near the top of this file is scoped to
+       `pg.agentMode == true`, deliberately -- standalone runs no agent, so requiring the
+       whole block there would be wrong -- but this dereference is unconditional, so
+       `--set ha.enabled=false --set ha.agent=null` (a plausible standalone values file,
+       given values.yaml documents standalone as running no agent) died here with a raw
+       `nil pointer evaluating interface {}.control`: exactly the message class that guard
+       was added to replace, on the other half of the mode axis. An absent block reads as
+       "no control API", which is what standalone means; agent mode still gets the guard's
+       named error before reaching this line. */}}
+{{- $control := (.Values.ha.agent | default dict).control | default dict }}
+{{- /* And `restore` on its own, because two of its reads below are OUTSIDE the
+       `if $control.enabled` block (restore requires control, and the guard that says so
+       has to be able to read restore.enabled first), so an absent control block would
+       nil-deref there even with $control defaulted.
+
+       Every SUB-block that is dereferenced two levels deep gets the same treatment (#298
+       review): defaulting only `control` and `restore` still left
+       `--set ha.agent.control.tls=null` and
+       `--set ha.agent.control.restore.admissionPolicy=null` dying with
+       `nil pointer evaluating interface {}.existingSecret` / `.enabled` -- the raw message
+       class this whole block exists to replace, reached by nulling one level further in.
+       An absent sub-block reads as "nothing set", so the named `fail` below fires instead. */}}
+{{- $restore := $control.restore | default dict }}
+{{- $controlTLS := $control.tls | default dict }}
+{{- $restoreAP := $restore.admissionPolicy | default dict }}
 {{- if $control.enabled }}
 {{- if ne (include "pg.agentMode" .) "true" }}
-{{- fail "repmgr.agent.control.enabled requires agent mode (repmgr.failoverMode=agent): the control API is served by the Go agent, and repmgrd mode runs no agent. In repmgrd mode use the kubectl runbooks in the README instead." }}
+{{- fail "ha.agent.control.enabled requires ha.enabled=true: the control API is served by the Go agent, and standalone mode runs no agent." }}
 {{- end }}
-{{- if not $control.tls.existingSecret }}
-{{- fail "repmgr.agent.control.enabled requires repmgr.agent.control.tls.existingSecret (a Secret with keys tls.crt, tls.key, ca.crt). The control API is mTLS-only -- there is no token or plaintext mode -- so without client-CA material it would have no way to authenticate callers and the agent refuses to start." }}
+{{- if not $controlTLS.existingSecret }}
+{{- fail "ha.agent.control.enabled requires ha.agent.control.tls.existingSecret (a Secret with keys tls.crt, tls.key, ca.crt). The control API is mTLS-only -- there is no token or plaintext mode -- so without client-CA material it would have no way to authenticate callers and the agent refuses to start." }}
 {{- end }}
 {{- if eq (int $control.port) 9200 }}
-{{- fail "repmgr.agent.control.port must not be 9200: that is the agent's read-only metrics/probe port, and keeping the two apart is what lets a NetworkPolicy admit Prometheus to 9200 without admitting anything to the mutating control surface." }}
+{{- fail "ha.agent.control.port must not be 9200: that is the agent's read-only metrics/probe port, and keeping the two apart is what lets a NetworkPolicy admit Prometheus to 9200 without admitting anything to the mutating control surface." }}
 {{- end }}
 {{- if eq (int $control.port) 5432 }}
-{{- fail "repmgr.agent.control.port must not be 5432 (the PostgreSQL port)" }}
+{{- fail "ha.agent.control.port must not be 5432 (the PostgreSQL port)" }}
 {{- end }}
 {{- end }}
-{{- if $control.restore.enabled }}
+{{- if $restore.enabled }}
 {{- if not $control.enabled }}
-{{- fail "repmgr.agent.control.restore.enabled requires repmgr.agent.control.enabled" }}
+{{- fail "ha.agent.control.restore.enabled requires ha.agent.control.enabled" }}
 {{- end }}
 {{- if not .Values.pgbackrest.enabled }}
-{{- fail "repmgr.agent.control.restore.enabled requires pgbackrest.enabled (there is no repository to restore from)" }}
+{{- fail "ha.agent.control.restore.enabled requires pgbackrest.enabled (there is no repository to restore from)" }}
 {{- end }}
 {{- if not .Values.pgbackrest.restore.enabled }}
-{{- fail "repmgr.agent.control.restore.enabled requires pgbackrest.restore.enabled: the API triggers the chart's restore Job rather than constructing one, so the release must render it" }}
+{{- fail "ha.agent.control.restore.enabled requires pgbackrest.restore.enabled: the API triggers the chart's restore Job rather than constructing one, so the release must render it" }}
 {{- end }}
 {{- if ne .Values.pgbackrest.restore.mode "cronjob" }}
-{{- fail "repmgr.agent.control.restore.enabled requires pgbackrest.restore.mode=cronjob: the agent clones the suspended CronJob's jobTemplate (exactly as `kubectl create job --from=cronjob/...` does), so in mode=job there is nothing to clone" }}
+{{- fail "ha.agent.control.restore.enabled requires pgbackrest.restore.mode=cronjob: the agent clones the suspended CronJob's jobTemplate (exactly as `kubectl create job --from=cronjob/...` does), so in mode=job there is nothing to clone" }}
 {{- end }}
-{{- if not $control.restore.allowedClientCNs }}
-{{- fail "repmgr.agent.control.restore.enabled requires a non-empty repmgr.agent.control.restore.allowedClientCNs: restore is a separate authz verb from pause/switchover, and an empty allowlist denies every client -- name the certificate CNs permitted to overwrite the data directory" }}
+{{- if not $restore.allowedClientCNs }}
+{{- fail "ha.agent.control.restore.enabled requires a non-empty ha.agent.control.restore.allowedClientCNs: restore is a separate authz verb from pause/switchover, and an empty allowlist denies every client -- name the certificate CNs permitted to overwrite the data directory" }}
 {{- end }}
 {{- /* The grant and its bound render together or not at all (#279). Refusing here rather
        than warning is the point: `create jobs` cannot be resourceName-scoped, so a Role
@@ -93,17 +138,17 @@
        primitive on a token that sits next to user-supplied SQL. Opting out stays possible
        -- a cluster below 1.30, a namespace-limited installer, a platform-managed policy --
        but it has to be said out loud in values, where it is reviewable. */}}
-{{- if and (not $control.restore.admissionPolicy.enabled) (not $control.restore.admissionPolicy.acknowledgeUnbounded) }}
-{{- fail "repmgr.agent.control.restore.admissionPolicy.enabled=false leaves the restore feature's `create jobs` grant unbounded: RBAC cannot restrict create by resourceName, so anything holding the database pods' ServiceAccount token could create arbitrary Jobs in this namespace and name any ServiceAccount in them. Either leave admissionPolicy.enabled=true (it needs Kubernetes >= 1.30 and cluster-scoped create on ValidatingAdmissionPolicy), or set repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded=true to accept that trade deliberately" }}
+{{- if and (not $restoreAP.enabled) (not $restoreAP.acknowledgeUnbounded) }}
+{{- fail "ha.agent.control.restore.admissionPolicy.enabled=false leaves the restore feature's `create jobs` grant unbounded: RBAC cannot restrict create by resourceName, so anything holding the database pods' ServiceAccount token could create arbitrary Jobs in this namespace and name any ServiceAccount in them. Either leave admissionPolicy.enabled=true (it needs Kubernetes >= 1.30 and cluster-scoped create on ValidatingAdmissionPolicy), or set ha.agent.control.restore.admissionPolicy.acknowledgeUnbounded=true to accept that trade deliberately" }}
 {{- end }}
 {{- end }}
-{{- if and $control.restore.readPodLogs (not $control.restore.enabled) }}
-{{- fail "repmgr.agent.control.restore.readPodLogs requires repmgr.agent.control.restore.enabled (it only affects reading a restore Job's log)" }}
+{{- if and $restore.readPodLogs (not $restore.enabled) }}
+{{- fail "ha.agent.control.restore.readPodLogs requires ha.agent.control.restore.enabled (it only affects reading a restore Job's log)" }}
 {{- end }}
-{{- if .Values.repmgr.enabled }}
-{{- $repmgrMajor := required "repmgr.image.majorVersion is required (the PostgreSQL major bundled in the repmgr image)" .Values.repmgr.image.majorVersion }}
-{{- if ne (toString .Values.postgresql.majorVersion) (toString $repmgrMajor) }}
-{{- fail (printf "postgresql.majorVersion=%q does not match repmgr.image.majorVersion=%q. In repmgr mode the PostgreSQL server runs from the repmgr image (%s), which bundles only PostgreSQL %s and always runs that server regardless of postgresql.image; a mismatch crash-loops the extension init container or silently runs the wrong major. Set postgresql.majorVersion=%q (with a matching postgresql.image), or point repmgr.image at an image built for PostgreSQL %s and set repmgr.image.majorVersion to match" (toString .Values.postgresql.majorVersion) (toString $repmgrMajor) .Values.repmgr.image.repository (toString $repmgrMajor) (toString $repmgrMajor) (toString .Values.postgresql.majorVersion)) }}
+{{- if .Values.ha.enabled }}
+{{- $haMajor := required "ha.image.majorVersion is required (the PostgreSQL major bundled in the HA image)" .Values.ha.image.majorVersion }}
+{{- if ne (toString .Values.postgresql.majorVersion) (toString $haMajor) }}
+{{- fail (printf "postgresql.majorVersion=%q does not match ha.image.majorVersion=%q. With ha.enabled the PostgreSQL server runs from the HA image (%s), which bundles only PostgreSQL %s and always runs that server regardless of postgresql.image; a mismatch crash-loops the extension init container or silently runs the wrong major. Set postgresql.majorVersion=%q (with a matching postgresql.image), or point ha.image at an image built for PostgreSQL %s and set ha.image.majorVersion to match" (toString .Values.postgresql.majorVersion) (toString $haMajor) .Values.ha.image.repository (toString $haMajor) (toString $haMajor) (toString .Values.postgresql.majorVersion)) }}
 {{- end }}
 {{- /* The two majorVersion values above are hand-typed claims; the image TAG is what
        actually decides the major (#269). The published per-major tags carry a -pgNN
@@ -113,16 +158,16 @@
        with extensions off, a silently wrong major. An unsuffixed tag carries no major to
        compare, which is why the container also gets PG_MAJOR from majorVersion: the
        entrypoint and agent then refuse to start an image that lacks that major. */}}
-{{- $tagMajor := regexFind "-pg[0-9]+$" (toString .Values.repmgr.image.tag) }}
+{{- $tagMajor := regexFind "-pg[0-9]+$" (toString .Values.ha.image.tag) }}
 {{- if $tagMajor }}
 {{- $tagMajor = trimPrefix "-pg" $tagMajor }}
-{{- if ne $tagMajor (toString $repmgrMajor) }}
-{{- fail (printf "repmgr.image.tag=%q is built for PostgreSQL %s, but repmgr.image.majorVersion=%q. The tag decides which major actually runs, so these must agree: set repmgr.image.majorVersion=%q and postgresql.majorVersion=%q, or change the tag suffix to -pg%s" (toString .Values.repmgr.image.tag) $tagMajor (toString $repmgrMajor) $tagMajor $tagMajor (toString $repmgrMajor)) }}
+{{- if ne $tagMajor (toString $haMajor) }}
+{{- fail (printf "ha.image.tag=%q is built for PostgreSQL %s, but ha.image.majorVersion=%q. The tag decides which major actually runs, so these must agree: set ha.image.majorVersion=%q and postgresql.majorVersion=%q, or change the tag suffix to -pg%s" (toString .Values.ha.image.tag) $tagMajor (toString $haMajor) $tagMajor $tagMajor (toString $haMajor)) }}
 {{- end }}
 {{- end }}
 {{- end }}
-{{- if and .Values.pgbackrest.enabled (not .Values.repmgr.enabled) }}
-{{- fail "pgbackrest.enabled requires repmgr.enabled=true: the pgbackrest binary and the archive_command run inside the postgresql container, which in standalone mode is the official postgres image without pgbackrest. WAL archiving would fail on every segment (unbounded WAL growth) and backups would time out. Enable repmgr, or disable pgbackrest" }}
+{{- if and .Values.pgbackrest.enabled (not .Values.ha.enabled) }}
+{{- fail "pgbackrest.enabled requires ha.enabled=true: the pgbackrest binary and the archive_command run inside the postgresql container, which in standalone mode is the official postgres image without pgbackrest. WAL archiving would fail on every segment (unbounded WAL growth) and backups would time out. Set ha.enabled=true, or disable pgbackrest" }}
 {{- end }}
 {{- /* Bootstrap-from-backup (#266) prerequisites. Fail fast rather than rendering an init
        container that could never work. */}}
@@ -141,10 +186,10 @@
        contradictory inputs that would silently orphan them (fail-fast). */}}
 {{- if (.Values.etcd).enabled }}
 {{- if ne (include "pg.agentEtcdMode" .) "true" }}
-{{- fail "etcd.enabled=true deploys a bundled etcd cluster, but the agent etcd backend is not active (it would be left unused). Set repmgr.failoverMode=agent and repmgr.agent.dcs.backend=etcd, or set etcd.enabled=false" }}
+{{- fail "etcd.enabled=true deploys a bundled etcd cluster, but the agent etcd backend is not active (it would be left unused). Set ha.enabled=true and ha.agent.dcs.backend=etcd, or set etcd.enabled=false" }}
 {{- end }}
-{{- if (.Values.repmgr.agent.dcs.etcd).endpoints }}
-{{- fail "etcd.enabled=true (bundled etcd) and repmgr.agent.dcs.etcd.endpoints (external etcd) are both set; the agent would target the external endpoints and leave the bundled cluster unused. Pick one: enable the bundle OR set endpoints" }}
+{{- if (.Values.ha.agent.dcs.etcd).endpoints }}
+{{- fail "etcd.enabled=true (bundled etcd) and ha.agent.dcs.etcd.endpoints (external etcd) are both set; the agent would target the external endpoints and leave the bundled cluster unused. Pick one: enable the bundle OR set endpoints" }}
 {{- end }}
 {{- end }}
 apiVersion: apps/v1
@@ -154,8 +199,22 @@ metadata:
   labels:
     {{- include "pg.labels" . | nindent 4 }}
     app.kubernetes.io/component: postgresql
-  {{- if or .Values.global.annotations .Values.postgresql.annotations }}
+  {{- /* The kube-linter probe waiver is GATED on pgbackrest.enabled (#298 review), not
+         unconditional. kube-linter waives per OBJECT, not per container, so an unconditional
+         annotation here would also stop the gate from ever noticing that the `postgresql`
+         container had lost its liveness/readiness probes -- the one container in this pod where
+         those probes are load-bearing. Gating it means every profile that does not enable
+         pgbackrest (including the default render) keeps full enforcement on this StatefulSet,
+         and only the pgbackrest-enabled renders carry the waiver. The waived container is an
+         idle `exec sleep infinity` holder: the CronJobs `kubectl exec` into it, nothing serves
+         from it, and there is no state a probe could observe -- if it dies the kubelet restarts
+         it. Widening the gate past the DEFAULT render is what surfaced this at all. */ -}}
+  {{- if or .Values.global.annotations .Values.postgresql.annotations .Values.pgbackrest.enabled }}
   annotations:
+    {{- if .Values.pgbackrest.enabled }}
+    ignore-check.kube-linter.io/no-liveness-probe: "the pgbackrest sidecar is an idle `sleep infinity` holder the CronJobs exec into"
+    ignore-check.kube-linter.io/no-readiness-probe: "the pgbackrest sidecar is an idle `sleep infinity` holder the CronJobs exec into"
+    {{- end }}
     {{- with .Values.global.annotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -165,19 +224,18 @@ metadata:
   {{- end }}
 spec:
   serviceName: {{ include "pg.fullname" . }}-headless
-  # OrderedReady is REQUIRED by the #125 stale-resurrection guard: on a
-  # full-cluster restart pods must come up lowest-ordinal-first, one at a time,
-  # so a stale lowest-ordinal pod boots ALONE and the guard/service-updater can
-  # refuse to serve it until a newer-timeline peer is up. Parallel would let a
-  # stale and the real primary race and silently defeat the guard. Pinned
-  # explicitly (not left to the API default) so it cannot be changed silently.
+  # Pinned explicitly (not left to the API default) so it cannot change silently.
+  # podManagementPolicy is IMMUTABLE: changing it needs the StatefulSet recreated
+  # (`kubectl delete sts --cascade=orphan`), which is why the 2.0.0 upgrade note calls
+  # this out for anyone coming from failoverMode: repmgrd (#286).
   {{- if eq (include "pg.agentMode" .) "true" }}
-  # agent mode: Parallel — all pods are present at a cold boot, so the lease winner
-  # compares timelines across the complete candidate set and the highest-timeline
-  # survivor is chosen before any node promotes (immutable; switching needs an STS
-  # recreate, see the migration guide).
+  # HA: Parallel — all pods are present at a cold boot, so the lease winner compares
+  # timelines across the complete candidate set and the highest-timeline survivor is
+  # chosen before any node promotes.
   podManagementPolicy: Parallel
   {{- else }}
+  # Standalone: a single pod (replicaCount must be 0), so ordering is moot; OrderedReady
+  # keeps the rollout one-at-a-time and matches the pre-2.0.0 default for this mode.
   podManagementPolicy: OrderedReady
   {{- end }}
   replicas: {{ add .Values.postgresql.replicaCount 1 }}
@@ -215,23 +273,20 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if not .Values.repmgr.enabled }}
-      # Standalone (no repmgr): the agent/service-updater that need the API token are
-      # not present, so don't mount one (#166). In repmgr mode the token is required.
+      {{- if not .Values.ha.enabled }}
+      # Standalone (ha.enabled=false): the agent that needs the API token is not
+      # present, so don't mount one (#166). In HA mode the agent needs it.
       automountServiceAccountToken: false
       {{- end }}
-      {{- if .Values.repmgr.enabled }}
-      terminationGracePeriodSeconds: {{ .Values.repmgr.terminationGracePeriodSeconds | default 120 }}
+      {{- if .Values.ha.enabled }}
+      terminationGracePeriodSeconds: {{ .Values.ha.terminationGracePeriodSeconds | default 120 }}
       {{- end }}
       securityContext:
         {{- toYaml .Values.postgresql.podSecurityContext | nindent 8 }}
-      {{- if .Values.repmgr.enabled }}
-      {{- if eq (include "pg.repmgrdMode" .) "true" }}
-      {{- /* repmgrd mode signals postgres cross-container (the failover test);
-             the agent is PID 1 in the postgresql container and owns its child,
-             so it is not needed in agent mode. */}}
-      shareProcessNamespace: true
-      {{- end }}
+      {{- if .Values.ha.enabled }}
+      {{- /* No shareProcessNamespace: it existed so repmgrd could signal postgres across
+             containers. The agent is PID 1 in the postgresql container and owns its child
+             directly, so the pods no longer share a PID namespace (#286). */}}
       serviceAccountName: {{ include "pg.fullname" . }}-repmgr
       {{- end }}
       {{- with .Values.postgresql.priorityClassName }}
@@ -306,8 +361,8 @@ spec:
         # It refuses to touch an already-initialized directory (see bootstrap.sh), which is
         # what makes it safe to leave enabled across ordinary restarts and rollouts.
         - name: pgbackrest-bootstrap
-          image: "{{ include "pg.repmgrImage" . }}"
-          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          image: "{{ include "pg.haImage" . }}"
+          imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           command: ["/bin/bash", "/scripts/bootstrap.sh"]
@@ -377,25 +432,25 @@ spec:
             {{- toYaml . | nindent 12 }}
 {{- end }}
 {{- end }}
-{{- if and .Values.postgresql.extensions.enabled .Values.repmgr.enabled }}
+{{- if and .Values.postgresql.extensions.enabled .Values.ha.enabled }}
 {{- $pgMajor := required "postgresql.majorVersion is required when postgresql.extensions.enabled is true" .Values.postgresql.majorVersion }}
 {{- $pkgs := list }}
 {{- range $p := (.Values.postgresql.extensions.packages | default list) }}
 {{- $pkgs = append $pkgs ($p | toString | replace "{major}" ($pgMajor | toString)) }}
 {{- end }}
         - name: copy-base-ext
-          image: "{{ include "pg.repmgrImage" . }}"
-          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          image: "{{ include "pg.haImage" . }}"
+          imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
 {{- if $pkgs }}
           # #303: apt-get install into THIS container's own filesystem before the copy
           # below -- neither ext-lib nor ext-share is mounted at the real
           # /usr/lib(share)/postgresql/{{ $pgMajor }}/... paths here (only the main
           # postgresql container mounts them there), so dpkg unpacks straight into
           # this image's normal extension directories and the unmodified cp then
-          # picks up both the repmgr image's original extensions and anything just
-          # installed. The repmgr image configures the PGDG apt repo at build time
-          # (images/repmgr/Dockerfile), so this is the reliable install path in
-          # repmgr mode.
+          # picks up both the HA image's original extensions and anything just
+          # installed. The HA image configures the PGDG apt repo at build time
+          # (images/pg-ha/Dockerfile), so this is the reliable install path in
+          # HA mode.
           #
           # Pin postgresql-{{ $pgMajor }} to whatever's already installed before naming any
           # extension package on the same apt-get install line (review, #303): an
@@ -501,8 +556,8 @@ spec:
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
 {{- if $pkgs }}
           # #303: apt-get install before the copy below, same reasoning as
-          # copy-base-ext. Still -n (no-clobber, #302) on the copy: in repmgr mode
-          # copy-base-ext already populated ext-lib/ext-share from the repmgr image,
+          # copy-base-ext. Still -n (no-clobber, #302) on the copy: in HA mode
+          # copy-base-ext already populated ext-lib/ext-share from the HA image,
           # which is what actually runs the server, so this container's job (with or
           # without packages) is to ADD what's missing, never overwrite a core lib
           # with this image's build. PGDG apt-source availability in
@@ -535,8 +590,8 @@ spec:
                 - SETFCAP
                 - MKNOD
 {{- else }}
-          # -n (no-clobber, #302): copy-base-ext (when repmgr is enabled) already
-          # populated ext-lib/ext-share from the repmgr image, which is what actually
+          # -n (no-clobber, #302): copy-base-ext (when ha.enabled) already
+          # populated ext-lib/ext-share from the HA image, which is what actually
           # runs the server. This container only ADDS what's missing (e.g. vector.so)
           # -- it must never overwrite a core lib (e.g. libpqwalreceiver.so) with this
           # image's build. The two images can drift to different postgres point
@@ -631,68 +686,26 @@ spec:
                    package-manager run -- which is the entire point of the prebuilt path. */}}
             {{- include "pg.initResources" . | nindent 12 }}
 {{- end }}
-{{- if .Values.repmgr.enabled }}
+{{- if .Values.ha.enabled }}
         - name: repmgr-init
-          image: "{{ include "pg.repmgrImage" . }}"
-          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          image: "{{ include "pg.haImage" . }}"
+          imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
           command: ["/usr/local/bin/entrypoint.sh", "init"]
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
           env:
 {{- with (include "pg.pgMajorEnv" .) }}{{ . | nindent 12 }}{{- end }}
-            - name: PGDATA
-              value: /var/lib/postgresql/data/pgdata
-            - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretUsernameKey" . }}
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretPasswordKey" . }}
-            - name: POSTGRES_DB
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretDatabaseKey" . }}
-            - name: REPMGR_USER
-              value: {{ .Values.repmgr.username | quote }}
-            - name: REPMGR_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretRepmgrPasswordKey" . }}
-            - name: REPMGR_DB
-              value: {{ .Values.repmgr.database | quote }}
-            - name: HEADLESS_SERVICE
-              value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
-            - name: REPMGR_NODE_COUNT
-              value: {{ add .Values.postgresql.replicaCount 1 | quote }}
-{{- if eq (include "pg.agentMode" .) "true" }}
-            {{- /* #308: the agent's own repmgr.conf (regenerated every boot, see
-                   images/repmgr/agent/cmd/agent's boot()) has always used
-                   use_replication_slots=1 for standbys -- this predates #308. The
-                   initial clone below, run from THIS init container's repmgr.conf, did
-                   not, so a fresh standby's first-ever streaming connection carried no
-                   physical slot until an unrelated later repmgr operation happened to
-                   create one. #308's synchronized_standby_slots reconciliation is the
-                   first thing that depends on that slot existing reliably from the
-                   start, so align the initial clone with the agent's own default.
-                   repmgrd mode is deliberately untouched (retention there is
-                   wal_keep_size-based, not slot-based -- introducing slots there is an
-                   unrelated, unreviewed behavior change). */}}
-            - name: USE_REPLICATION_SLOTS
-              value: "1"
-{{- end }}
+            {{- /* The reduced `init` mode reads NOTHING but PG_MAJOR (#290): it stats a binary
+                   and exits. The credentials, headless service and node count a cloning init
+                   container needed are removed rather than left inert -- mounting the
+                   release Secret into a container that cannot use it is needless credential
+                   surface, and USE_REPLICATION_SLOTS in particular is now read by nothing in
+                   the image at all. PG_MAJOR arrives via pg.pgMajorEnv above. */}}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
-            - name: repmgr-config
-              mountPath: /etc/repmgr
           resources:
-            {{- toYaml .Values.repmgr.initContainerResources | nindent 12 }}
+            {{- toYaml .Values.ha.initContainerResources | nindent 12 }}
 {{- end }}
         - name: setup-config
           image: {{ include "pg.image" .Values.busyboxImage | quote }}
@@ -718,7 +731,7 @@ spec:
               fi
 {{- end }}
 {{- if not .Values.pgbackrest.enabled }}
-              # pgbackrest disabled: the repmgr image entrypoint persisted
+              # pgbackrest disabled: the HA image entrypoint persisted
               # archive_mode=on + a pgbackrest archive_command into PGDATA's
               # postgresql.conf at initdb (#132). With the pgbackrest config and
               # S3 credentials now gone, every archive_command fails and WAL is
@@ -739,19 +752,14 @@ spec:
             {{- include "pg.initResources" . | nindent 12 }}
       containers:
         - name: postgresql
-{{- if .Values.repmgr.enabled }}
-          image: "{{ include "pg.repmgrImage" . }}"
-          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
-          # The image entrypoint runs a stale-primary guard before starting
-          # read-write: on a container-only restart (which does not re-run the
-          # init container) it detects a peer promoted to a newer timeline and
-          # rejoins this node as a standby via pg_rewind instead of resuming as
-          # a second primary. See repmgr-docker entrypoint.sh.
-          {{- if eq (include "pg.agentMode" .) "true" }}
+{{- if .Values.ha.enabled }}
+          image: "{{ include "pg.haImage" . }}"
+          imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
+          # Always agent mode. pg.agentMode IS ha.enabled and this block already sits inside
+          # `if .Values.ha.enabled`, so a `postgres` alternative here would be unreachable
+          # (#290). The image still has a `postgres` mode for direct, non-chart use, and the
+          # stale-primary rejoin belongs to the agent's reconcile loop, where it can be fenced.
           command: ["/usr/local/bin/entrypoint.sh", "agent"]
-          {{- else }}
-          command: ["/usr/local/bin/entrypoint.sh", "postgres"]
-          {{- end }}
 {{- else }}
           image: {{ include "pg.image" .Values.postgresql.image | quote }}
           imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
@@ -819,16 +827,16 @@ spec:
             - name: LD_LIBRARY_PATH
               value: /usr/lib/postgresql/{{ $pgMajor }}/extra-lib
 {{- end }}
-{{- if .Values.repmgr.enabled }}
+{{- if .Values.ha.enabled }}
             - name: REPMGR_USER
-              value: {{ .Values.repmgr.username | quote }}
+              value: {{ .Values.ha.username | quote }}
             - name: REPMGR_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "pg.secretName" . }}
                   key: {{ include "pg.secretRepmgrPasswordKey" . }}
             - name: REPMGR_DB
-              value: {{ .Values.repmgr.database | quote }}
+              value: {{ .Values.ha.database | quote }}
             - name: HEADLESS_SERVICE
               value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
             - name: REPMGR_NODE_COUNT
@@ -844,31 +852,36 @@ spec:
             - name: PRIMARY_MARKER
               value: {{ printf "%s-primary" (include "pg.fullname" .) | quote }}
 {{- if eq (include "pg.agentMode" .) "true" }}
-            {{- /* fail fast with a clear message if an overlay nulls out the agent
-                   block, rather than a raw nil-pointer on .leaseDuration below */}}
-            {{- $_ := required "repmgr.agent is required when repmgr.failoverMode=agent" .Values.repmgr.agent }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
             - name: LEASE_NAME
               value: {{ printf "%s-leader" (include "pg.fullname" .) | quote }}
+            {{- /* Rendered through pg.haAgentDuration -- the SAME helper the
+                   pg.validateLeaseTimings guard reads -- so the emitted value can never
+                   diverge from the validated one (#298 review): `--set
+                   ha.agent.leaseDuration=null` DELETES the key, the validator then
+                   checks the default, but the raw `.Values` render emitted `value: ""`,
+                   which config.Load refuses -- every pod CrashLoopBackOffed after a
+                   clean render, the exact failure class the #291 validator exists to
+                   prevent. Defaults must match values.yaml. */}}
             - name: LEASE_DURATION
-              value: {{ .Values.repmgr.agent.leaseDuration | quote }}
+              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "leaseDuration" "15s") | quote }}
             - name: RENEW_DEADLINE
-              value: {{ .Values.repmgr.agent.renewDeadline | quote }}
+              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "renewDeadline" "10s") | quote }}
             - name: RETRY_PERIOD
-              value: {{ .Values.repmgr.agent.retryPeriod | quote }}
+              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "retryPeriod" "2s") | quote }}
             - name: RECONCILE_INTERVAL
-              value: {{ .Values.repmgr.agent.reconcileInterval | quote }}
-{{- if .Values.repmgr.agent.cascadingReplication }}
+              value: {{ include "pg.haAgentDuration" (list .Values.ha.agent "reconcileInterval" "5s") | quote }}
+{{- if .Values.ha.agent.cascadingReplication }}
             {{- /* Cascading replication (#29): a standby may follow another standby to
                    offload the primary's WAL senders. The agent picks a safe upstream and
                    falls back to the primary, so a failed upstream never strands a node. */}}
             - name: CASCADE_REPLICATION
               value: "true"
 {{- end }}
-{{- if .Values.repmgr.agent.syncReplicationSlots }}
+{{- if .Values.ha.agent.syncReplicationSlots }}
             {{- /* Logical failover slot sync (#308): the primary reconciles
                    synchronized_standby_slots to its current standby's physical slot(s)
                    on every tick. Requires postgresql.walLevel: logical -- enforced by
@@ -878,6 +891,13 @@ spec:
             - name: SYNC_REPLICATION_SLOTS
               value: "true"
 {{- end }}
+            {{- /* Which replication mechanics the agent drives (#287). ALWAYS emitted, never
+                   omitted at the default: an image predating #294 falls back to repmgr when
+                   MECHANISM is absent, so a chart that leaves it out would run the removed
+                   mechanism on a not-yet-updated image. `native` is the only accepted value;
+                   `repmgr` is rejected by pg.validateRemovedRepmgrdValues. */}}
+            - name: MECHANISM
+              value: {{ (.Values.ha.agent).mechanism | default "native" | quote }}
             - name: MASTER_SERVICE
               value: {{ include "pg.fullname" . | quote }}
             - name: POD_SELECTOR
@@ -886,7 +906,7 @@ spec:
                    pg_hba trusting POD_CIDR (no legacy 0.0.0.0/0 md5), with the user's
                    postgresql.pgHba inserted above the network catch-alls. */}}
             - name: POD_CIDR
-              value: {{ required "repmgr.agent.podCidr is required in agent mode (the pod network trusted by the hardened pg_hba)" .Values.repmgr.agent.podCidr | quote }}
+              value: {{ required "ha.agent.podCidr is required in agent mode (the pod network trusted by the hardened pg_hba)" .Values.ha.agent.podCidr | quote }}
 {{- with .Values.postgresql.pgHba }}
             - name: POSTGRESQL_PGHBA
               value: {{ join "\n" . | quote }}
@@ -895,6 +915,14 @@ spec:
             {{- /* Client TLS pg_hba (#110): the agent emits hostssl on the pod CIDR
                    when require/clientCertAuth, exempting the internal service users
                    (repmgr/postgres/monitoring) from the client-cert requirement. */}}
+            {{- /* TLS_ENABLED carries the INTENT, which the agent cannot infer from the two
+                   variables below: `require` defaults to false, so an absent TLS_REQUIRE_SSL and
+                   a deliberate `require: false` are the same value. The agent needs the intent
+                   to run its #335 check -- verify from the postmaster (`SHOW ssl`) that the
+                   server really is speaking TLS, because every other signal an operator can
+                   read describes the config that was rendered, not the one that was loaded. */}}
+            - name: TLS_ENABLED
+              value: "true"
             - name: TLS_REQUIRE_SSL
               value: {{ .Values.postgresql.tls.require | quote }}
             - name: TLS_CLIENT_CERT_AUTH
@@ -909,9 +937,9 @@ spec:
             - name: MIGRATE_LEGACY_MD5_USERS
               value: {{ .Values.postgresql.migrateLegacyMd5Users | quote }}
             - name: DCS_BACKEND
-              value: {{ (.Values.repmgr.agent.dcs).backend | default "kubernetes" | quote }}
+              value: {{ (.Values.ha.agent.dcs).backend | default "kubernetes" | quote }}
 {{- if eq (include "pg.agentEtcdMode" .) "true" }}
-            {{- $etcd := required "repmgr.agent.dcs.etcd is required when dcs.backend=etcd" .Values.repmgr.agent.dcs.etcd }}
+            {{- $etcd := required "ha.agent.dcs.etcd is required when dcs.backend=etcd" .Values.ha.agent.dcs.etcd }}
             {{- $endpoints := $etcd.endpoints }}
             {{- /* No explicit endpoints + the bundled etcd subchart enabled: target the
                    bundled cluster's client Service (<release>-etcd:<clientPort>). The
@@ -923,12 +951,23 @@ spec:
                    `false | default true` would wrongly coerce to true and force a client cert
                    on an encrypt-only (no mutual-auth) etcd. */}}
             {{- $etcdCca := dig "tls" "clientCertAuth" true (.Values.etcd | default dict) }}
-            {{- if and $etcdTls $etcdCca (not (($etcd.tls).secretName)) }}
-            {{ fail "bundled etcd tls.enabled with clientCertAuth requires the agent's client cert: set repmgr.agent.dcs.etcd.tls.secretName to a Secret with tls.crt, tls.key, ca.crt" }}
+            {{- /* Gated on $etcdTls ALONE, not on clientCertAuth too (#298 review). The agent
+                   needs the CA for ANY TLS etcd, not just a mutual-auth one: with the three
+                   ETCD_TLS_* vars unset, EtcdConfig.tlsConfig() returns nil and clientv3 falls
+                   back to default transport credentials, verifying the etcd server cert against
+                   the CONTAINER'S SYSTEM ROOT STORE -- which does not hold the operator's (or
+                   cert-manager's) CA. So `etcd.tls.enabled=true` with `clientCertAuth=false`
+                   and no secretName rendered perfectly clean and every agent's dial failed with
+                   `x509: certificate signed by unknown authority`: no node ever wins the lease,
+                   the release comes up with no primary and no write-Service endpoint, and the
+                   only symptom is a TLS error in the agent log. $etcdCca survives in the
+                   message because it changes WHY the Secret is needed, not WHETHER. */}}
+            {{- if and $etcdTls (not (($etcd.tls).secretName)) }}
+            {{ fail (printf "bundled etcd tls.enabled requires the agent's etcd TLS material (clientCertAuth=%v): set ha.agent.dcs.etcd.tls.secretName to a Secret with tls.crt, tls.key, ca.crt -- the agent needs ca.crt to verify the etcd server certificate at all, and the client cert/key additionally when clientCertAuth is on" $etcdCca) }}
             {{- end }}
             {{- $endpoints = list (printf "%s://%s-etcd:%v" (ternary "https" "http" $etcdTls) .Release.Name ((.Values.etcd).clientPort | default 2379)) }}
             {{- end }}
-            {{- if not $endpoints }}{{ fail "etcd backend needs endpoints: set repmgr.agent.dcs.etcd.endpoints for a BYO/shared etcd, or enable the bundled etcd with etcd.enabled=true" }}{{ end }}
+            {{- if not $endpoints }}{{ fail "etcd backend needs endpoints: set ha.agent.dcs.etcd.endpoints for a BYO/shared etcd, or enable the bundled etcd with etcd.enabled=true" }}{{ end }}
             - name: ETCD_ENDPOINTS
               value: {{ $endpoints | join "," | quote }}
             - name: ETCD_PREFIX
@@ -942,8 +981,6 @@ spec:
               value: /etc/etcd-tls/ca.crt
 {{- end }}
 {{- end }}
-            - name: SPLIT_BRAIN_ACTION
-              value: {{ .Values.repmgr.splitBrainDetection.action | quote }}
 {{- if $control.enabled }}
             {{- /* Control API (#276). The agent validates all of this at boot and
                    refuses to start if the mTLS material is incomplete -- the render
@@ -962,11 +999,11 @@ spec:
             - name: CONTROL_ALLOWED_CNS
               value: {{ join "," . | quote }}
 {{- end }}
-{{- if $control.restore.enabled }}
+{{- if $restore.enabled }}
             - name: CONTROL_RESTORE_ENABLED
               value: "true"
             - name: CONTROL_RESTORE_ALLOWED_CNS
-              value: {{ join "," $control.restore.allowedClientCNs | quote }}
+              value: {{ join "," $restore.allowedClientCNs | quote }}
             {{- /* The CronJob the agent clones, and the deterministic Job name it
                    creates -- deterministic so the RBAC get/delete grants can be scoped
                    to exactly that one object by resourceName. */}}
@@ -978,7 +1015,7 @@ spec:
                    in values, and an HTTP body may only echo it back. */}}
             - name: CONTROL_RESTORE_POD_ORDINAL
               value: {{ .Values.pgbackrest.restore.podOrdinal | quote }}
-{{- if $control.restore.readPodLogs }}
+{{- if $restore.readPodLogs }}
             - name: CONTROL_RESTORE_READ_POD_LOGS
               value: "true"
 {{- end }}
@@ -1014,7 +1051,7 @@ spec:
 {{- with .Values.postgresql.extraEnv }}
             {{- toYaml . | nindent 12 }}
 {{- end }}
-{{- if not .Values.repmgr.enabled }}
+{{- if not .Values.ha.enabled }}
           lifecycle:
             postStart:
               exec:
@@ -1032,11 +1069,81 @@ spec:
                         {{- end }}
                         {{- if .Values.postgresql.pgHba }}
                         HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
+                        {{- /* Insert the operator's rules as ONE ordered block, anchored on the
+                               first NON-LOOPBACK host rule (#298).
+
+                               pg_hba is first-match-wins, which fixes all three properties here:
+                                - BEFORE the network catch-alls, or the rule is never consulted;
+                                - AFTER initdb's `local ... trust` and its `127.0.0.1/32` /
+                                  `::1/128` host rules, or a catch-all that also matches loopback
+                                  (`host all all all reject`) beats them and breaks in-pod TCP
+                                  clients -- `kubectl port-forward` + psql among them;
+                                - in the operator's own order, so a `trust` written before a
+                                  `reject` still wins. One pass, not one per entry: per-entry
+                                  passes re-anchor on the previous insert and reverse the list.
+
+                               RE-EMITTED WHOLE, not topped up with the missing entries (#298
+                               review). One pass fixes the order WITHIN a batch; it does not fix
+                               the order ACROSS pod starts, because a rule this hook inserted
+                               earlier is itself a non-loopback `host` rule sitting above the
+                               original anchor -- so it BECOMES the anchor, and a rule appended
+                               to postgresql.pgHba in a later `helm upgrade` (the only one a
+                               top-up would carry, the rest being already present) landed ABOVE
+                               the rules declared before it. First-match-wins means the newest
+                               entry then silently outranked every earlier one, which is the
+                               exact inversion the one-pass design was written to prevent.
+                               Stripping every declared rule and re-inserting the full list at
+                               the anchor makes the block idempotent and the order authoritative
+                               on every start, whatever it was before. Line-equality is the same
+                               identity test the old `grep -qF` used.
+
+                               ONE awk pass does the strip AND the insert, and the anchor is
+                               chosen BEFORE the strip (#298 review). A separate strip pass could
+                               delete the anchor itself: standalone mode runs the OFFICIAL
+                               postgres image, whose docker-entrypoint appends the file's only
+                               non-loopback host rule as single-spaced
+                               `host all all all <method>` -- the exact shape an operator writes
+                               -- so a postgresql.pgHba entry byte-identical to it was stripped,
+                               the second pass then found nothing to anchor on, and NONE of the
+                               entries were applied (the old grep-filtered form at least applied
+                               the rest). Selecting the anchor while that line is still present,
+                               and dropping it only via `!($0 in want)` after the block has been
+                               emitted in its place, keeps the collision case correct and
+                               idempotent: the declared list simply lands where the colliding
+                               rule was.
+
+                               The agent path is unaffected -- pgconf.AssemblePgHba places the
+                               whole list itself, in order, with loopback first (#144).
+
+                               cp onto the existing file, not mv: mv replaces the inode and the
+                               file would inherit the redirect's 0644 instead of initdb's 0600.
+                               Skipped entirely when the result is byte-identical, so a steady
+                               state start neither rewrites the file nor churns its mtime.
+                               A loud message rather than a silent skip if there is no host rule
+                               to anchor on. */}}
+                        PGCHART_INS="${HBA_FILE}.pgchart.ins"
+                        : > "$PGCHART_INS"
                         {{- range .Values.postgresql.pgHba }}
-                        if ! grep -qF '{{ . }}' "$HBA_FILE"; then
-                          sed -i '/host all all all scram-sha-256/i {{ . }}' "$HBA_FILE"
-                        fi
+                        printf '%s\n' '{{ . }}' >> "$PGCHART_INS"
                         {{- end }}
+                        if [ -s "$PGCHART_INS" ]; then
+                          if awk -v insfile="$PGCHART_INS" '
+                                NR==FNR { want[$0]; next }
+                                !done && $1 ~ /^host(ssl|nossl)?$/ && $4 != "127.0.0.1/32" && $4 != "::1/128" {
+                                  while ((getline l < insfile) > 0) print l
+                                  close(insfile); done=1
+                                }
+                                !($0 in want) { print }
+                                END { if (!done) exit 3 }' "$PGCHART_INS" "$HBA_FILE" > "${HBA_FILE}.pgchart.tmp"; then
+                            if [ "$(cat "${HBA_FILE}.pgchart.tmp")" != "$(cat "$HBA_FILE")" ]; then
+                              cp "${HBA_FILE}.pgchart.tmp" "$HBA_FILE"
+                            fi
+                          else
+                            echo "postStart: no non-loopback host rule in $HBA_FILE to anchor on; NOT applying the postgresql.pgHba entries" >&2
+                          fi
+                          rm -f "${HBA_FILE}.pgchart.tmp"
+                        fi
+                        rm -f "$PGCHART_INS"
                         {{- end }}
                         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
@@ -1048,19 +1155,24 @@ spec:
                     done
 {{- else }}
           lifecycle:
-{{- /* In agent mode the agent is PID 1 and owns SIGTERM shutdown (release the
-       Lease, then stop its postgres child). A preStop pg_ctl stop would race the
-       supervisor and stop postgres before the Lease is released, so the
-       repmgrd-tuned preStop is gated to repmgrd mode. */}}
-{{- if eq (include "pg.repmgrdMode" .) "true" }}
-{{- include "pg.preStop" . | nindent 12 }}
-{{- end }}
+{{- /* No preStop hook: the agent is PID 1 and owns SIGTERM shutdown (release the Lease,
+       then stop its postgres child). A preStop `pg_ctl stop` would race the supervisor and
+       stop postgres before the Lease is released. The repmgrd-tuned preStop that used to
+       render here went away with repmgrd itself (#286). */}}
             postStart:
               exec:
                 command:
                   - /bin/bash
                   - -c
                   - |
+{{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
+                    {{- /* Empty, not 0: the primary-wait budget is a wall-clock DEADLINE armed
+                           on the first no-primary iteration (#298 review), so it must not start
+                           counting while the outer loop is still waiting for pg_isready --
+                           doing so would burn the whole budget before postgres even opens and
+                           skip the operator's commands on every cold boot. */}}
+                    primary_wait_deadline=""
+{{- end }}
                     for i in {1..90}; do
                       if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then
                         {{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
@@ -1069,138 +1181,11 @@ spec:
                           echo "include_dir = '/etc/postgresql/conf.d'" >> "$CONF"
                         fi
                         {{- end }}
-                        {{- /* md5/SCRAM pg_hba compat + the md5->scram re-hash + user pgHba are
-                               authored by the agent in agent mode (single author, #199): the agent
-                               writes the md5-first compat pg_hba on every node and re-hashes managed
-                               users on promotion/boot-primary. These postStart patches therefore run
-                               only in repmgrd mode, where the image writes the legacy pg_hba and no
-                               agent owns the file. */}}
-                        {{- if eq (include "pg.repmgrdMode" .) "true" }}
-                        # PG18 + repmgr MD5/SCRAM auth deadlock fix: the cagriekin/repmgr image
-                        # entrypoint creates managed users (pgvector, repmgr) with MD5-hashed
-                        # passwords while only writing `scram-sha-256` rules into pg_hba.conf,
-                        # so every network auth attempt fails with "User <X> does not have a
-                        # valid SCRAM secret" and traps the StatefulSet in CrashLoopBackOff.
-                        #
-                        # We patch pg_hba.conf to insert an `md5` line ABOVE every existing
-                        # `scram-sha-256` line. pg_hba.conf is matched top-down with no
-                        # fall-through on auth failure, so the md5 rule must come first to
-                        # catch legacy MD5-hashed users (managed and custom, e.g. created via
-                        # additionalCommands). On PG14+ the server auto-promotes md5 method
-                        # to SCRAM when the stored password is SCRAM, so SCRAM-hashed users
-                        # still authenticate via SCRAM wire protocol — same security, more
-                        # compat. Marker comment makes the rewrite idempotent.
-                        #
-                        # Optionally re-hash managed users (POSTGRES_USER, REPMGR_USER) from
-                        # MD5 to SCRAM so we converge on the modern hash. Gated by
-                        # postgresql.migrateLegacyMd5Users (default true). When false, only
-                        # the pg_hba fix runs and existing MD5 hashes are preserved; legacy
-                        # users keep authenticating via the md5 rule above. The migration
-                        # block itself is idempotent (gated on rolpassword LIKE 'md5%').
-                        #
-                        # TODO: drop the md5 line and the migrate flag once the chart's
-                        # minimum PG is the first release without MD5 password storage.
-                        HBA_FILE=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tA -c "SHOW hba_file" 2>/dev/null)
-                        HBA_SENTINEL="# cagriekin-charts: md5 fallback applied (md5-first)"
-                        if [ -n "$HBA_FILE" ] && [ -f "$HBA_FILE" ] && ! grep -qF "$HBA_SENTINEL" "$HBA_FILE"; then
-                          HBA_TMP="${HBA_FILE}.cagriekin.tmp"
-                          awk '/^[[:space:]]*host(ssl|nossl)?[[:space:]]+(all|replication)[[:space:]]+.*[[:space:]]+scram-sha-256[[:space:]]*$/ { m=$0; sub(/scram-sha-256[[:space:]]*$/, "md5", m); print m } {print}' "$HBA_FILE" > "$HBA_TMP"
-                          printf '\n%s\n' "$HBA_SENTINEL" >> "$HBA_TMP"
-                          cp "$HBA_TMP" "$HBA_FILE"
-                          rm -f "$HBA_TMP"
-                        fi
-                        {{- if .Values.postgresql.migrateLegacyMd5Users }}
-                        # 0.6.58 used `psql -c "DO \$\$ ... :'u' ... \$\$;"`. Two
-                        # broken assumptions: (a) psql does NOT perform :'var'
-                        # substitution inside `-c` (docs: "no psql-specific
-                        # features"); (b) even if it did, substitution is also
-                        # skipped inside dollar-quoted constants. The server saw
-                        # `:'u'` literal, raised `syntax error at or near ":"`,
-                        # and the rehash silently never ran. Connectivity kept
-                        # working because the md5-fallback line in pg_hba.conf
-                        # masked the failure.
-                        #
-                        # Fix: feed SQL via stdin (psql MainLoop, where :'var'
-                        # IS substituted) and hoist user/pass into per-session
-                        # GUCs read back inside the DO block via current_setting().
-                        # GUC names use `tgt_user`/`tgt_pass` — `user` would
-                        # collide with the SQL reserved keyword.
-                        #
-                        # User/pass are read from the environment with \getenv (as
-                        # the monitoring-user job does), NOT passed via `-v`. A `-v`
-                        # value containing a single quote breaks psql's :'var'
-                        # quoting -- e.g. pass `a'b` rendered an unterminated literal
-                        # and the rehash silently no-op'd for that user (#211). The
-                        # md5 pg_hba fallback masks the failure, so connectivity is
-                        # kept but the scram migration never converges. randAlphaNum
-                        # never emits `'`, so only existingSecret passwords hit it.
-                        # \getenv is client-side (psql >= 16, image is PG 18), so the
-                        # PG < 14 server guard below is unaffected.
-                        fix_user_auth() {
-                          local target_user="$1"
-                          local target_pass="$2"
-                          [ -z "$target_user" ] && return 0
-                          [ -z "$target_pass" ] && return 0
-                          local sql="
-                            \\getenv tgt_user FIX_TGT_USER
-                            \\getenv tgt_pass FIX_TGT_PASS
-                            SET myvars.tgt_user = :'tgt_user';
-                            SET myvars.tgt_pass = :'tgt_pass';
-                            DO \$\$
-                            DECLARE
-                              v_user TEXT := current_setting('myvars.tgt_user');
-                              v_pass TEXT := current_setting('myvars.tgt_pass');
-                            BEGIN
-                              IF current_setting('server_version_num')::int < 140000 THEN
-                                RAISE NOTICE 'Skipping md5->scram migration on PG < 14 (no md5->scram auto-promotion in pg_hba)';
-                                RETURN;
-                              END IF;
-                              IF EXISTS (
-                                SELECT 1 FROM pg_authid
-                                WHERE rolname = v_user AND rolpassword LIKE 'md5%'
-                              ) THEN
-                                SET LOCAL password_encryption = 'scram-sha-256';
-                                EXECUTE format('ALTER USER %I WITH PASSWORD %L', v_user, v_pass);
-                              END IF;
-                            END
-                            \$\$;"
-                          if ! FIX_TGT_USER="$target_user" FIX_TGT_PASS="$target_pass" \
-                            psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-                            -v ON_ERROR_STOP=1 \
-                            --no-psqlrc <<<"$sql"; then
-                            echo "fix_user_auth: md5->scram rehash failed for ${target_user} (psql returned non-zero, see error above)" >&2
-                          fi
-                        }
-                        fix_user_auth "$POSTGRES_USER" "$POSTGRES_PASSWORD"
-                        fix_user_auth "$REPMGR_USER" "$REPMGR_PASSWORD"
-                        {{- end }}
-                        {{- if .Values.postgresql.pgHba }}
-                        HBA_FILE_USER=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SHOW hba_file" | xargs)
-                        # pg_hba.conf is first-match-wins. The repmgr image writes broad
-                        # 10.0.0.0/8 and 0.0.0.0/0 catch-alls, so user entries appended at
-                        # EOF (the previous behavior) could never match an IPv4 host (#144).
-                        # Insert them above the first non-loopback host rule -- below the
-                        # local/loopback trust rules, above every network auth rule -- so
-                        # user trust/reject/scram overrides actually take effect. Idempotent
-                        # via the sentinel; order among entries is preserved.
-                        HBA_USER_SENTINEL="# cagriekin-charts: user pgHba entries (above network auth rules)"
-                        if [ -n "$HBA_FILE_USER" ] && [ -f "$HBA_FILE_USER" ] && ! grep -qF "$HBA_USER_SENTINEL" "$HBA_FILE_USER"; then
-                          HBA_USER_TMP="${HBA_FILE_USER}.cagriekin-user.tmp"
-                          awk -v ins=0 '
-                            !ins && $1 == "host" && $4 != "127.0.0.1/32" && $4 != "::1/128" {
-                              print "# cagriekin-charts: user pgHba entries (above network auth rules)"
-                              {{- range .Values.postgresql.pgHba }}
-                              print "{{ . }}"
-                              {{- end }}
-                              ins=1
-                            }
-                            { print }
-                          ' "$HBA_FILE_USER" > "$HBA_USER_TMP"
-                          cp "$HBA_USER_TMP" "$HBA_FILE_USER"
-                          rm -f "$HBA_USER_TMP"
-                        fi
-                        {{- end }}
-                        {{- end }}
+                        {{- /* md5/SCRAM pg_hba compat, the md5->scram re-hash and the user
+                               pgHba entries are all authored by the agent (single author, #199):
+                               it writes the md5-first compat pg_hba on every node and re-hashes
+                               managed users on promotion/boot-primary. The postStart patches that
+                               used to do this for repmgrd mode went with repmgrd (#286). */}}
                         psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT pg_reload_conf();" > /dev/null 2>&1
                         {{- if .Values.postgresql.lifecycle.postStart.additionalCommands }}
                         HEADLESS="{{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local"
@@ -1210,10 +1195,19 @@ spec:
                         # non-loopback connection, so without PGPASSWORD both the
                         # discovery psql and the user psql fail auth and silently no-op.
                         export PGPASSWORD="$POSTGRES_PASSWORD"
+                        {{- /* Bound every probe (#288 review, round 4). Without a connect
+                               timeout, a peer whose IP routes but does not answer -- a NotReady
+                               node, a NetworkPolicy drop -- blocks psql for the kernel's TCP
+                               timeout (~130s), and the retry budget below counts ITERATIONS, so
+                               20 of those is minutes of the container being held out of Started
+                               (probes have not begun, the pod is in no Service, and Kubernetes
+                               applies no timeout of its own to an exec lifecycle hook). Scoped
+                               to the discovery probe rather than exported, so a user's own
+                               additionalCommands keep libpq's defaults. */}}
                         {{- /* StatefulSet runs replicaCount + 1 pods, ordinals 0..replicaCount */}}
                         for n in $(seq 0 {{ int .Values.postgresql.replicaCount }}); do
                           H="{{ include "pg.fullname" . }}-${n}.${HEADLESS}"
-                          if psql -h "$H" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | grep -q 'f'; then
+                          if PGCONNECT_TIMEOUT=3 psql -h "$H" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c "SELECT pg_is_in_recovery();" 2>/dev/null | grep -q 'f'; then
                             PRIMARY_HOST="$H"
                             break
                           fi
@@ -1224,6 +1218,47 @@ spec:
                           # split onto its own line by nindent, leaving it unexported.
                           export PGHOST="$PRIMARY_HOST"
                           {{- .Values.postgresql.lifecycle.postStart.additionalCommands | nindent 26 }}
+                        else
+                          # Keep WAITING instead of breaking (#288 review). pg_isready has no -h,
+                          # so it is satisfied by a unix socket -- including the socket-only
+                          # postmaster bootstrap_initdb runs while CREATING the cluster, which no
+                          # pod is reachable over TCP during. Breaking here skipped the user's
+                          # additionalCommands SILENTLY, with no error and no retry, on every
+                          # fresh install (under the default repmgr mechanism too, since
+                          # bootstrap_initdb is shared). It also covers the pre-existing case
+                          # where no peer has promoted yet. The loop is bounded at 90s, and the
+                          # steps above it are idempotent, so retrying costs nothing.
+                          #
+                          # Exhausting the budget still skips the commands silently, and that is
+                          # deliberate (#288 review, round 2): a non-zero postStart exit makes
+                          # the kubelet KILL the container, so failing loudly here turns a
+                          # skipped convenience command into a crash-loop.
+                          #
+                          # But the WAIT FOR A PRIMARY gets its own, much smaller budget (#288
+                          # review, round 3), because Kubernetes does not consider a container
+                          # started until postStart returns: while this loop spins, the
+                          # startup/liveness/readiness probes have not begun and the pod is in
+                          # no Service. Spending the full 90s here delayed readiness by 90s on
+                          # every cold boot -- and on pgvector, whose default additionalCommands
+                          # is CREATE EXTENSION vector, that is the default path. 20s covers the
+                          # fresh-install window this retry was added for (bootstrap_initdb's
+                          # socket-only postmaster lasts seconds) without holding a pod out of
+                          # its Service while no peer has promoted yet.
+                          {{- /* A WALL-CLOCK deadline, not an iteration count (#298 review).
+                                 The 20 here was 20 iterations, and each iteration probes every
+                                 peer with PGCONNECT_TIMEOUT=3 -- so on a cold boot where peers
+                                 black-hole rather than refuse (NotReady node, NetworkPolicy
+                                 drop) a 4-pod cluster spent 20 x (4x3s + 1s) ~= 260s here, not
+                                 the 20s this comment and pg/values.yaml both promise, with the
+                                 container held out of Started the whole time. SECONDS is bash's
+                                 own monotonic counter, so the budget is now the documented one
+                                 however slow an individual probe round turns out to be. */}}
+                          : "${primary_wait_deadline:=$((SECONDS + 20))}"
+                          if [ "$SECONDS" -ge "$primary_wait_deadline" ]; then
+                            break
+                          fi
+                          sleep 1
+                          continue
                         fi
                         {{- end }}
                         break
@@ -1232,10 +1267,15 @@ spec:
                     done
 {{- end }}
 {{- if .Values.postgresql.startupProbe.enabled }}
-          # Holds off liveness/readiness until postgres first accepts
-          # connections, so the repmgr stale-primary guard's settle loop and
-          # crash-recovery WAL replay cannot be killed mid-startup by the
-          # liveness probe (#172). Steady-state liveness stays tight below.
+          # Holds off liveness/readiness until postgres first accepts connections, so a
+          # slow first start cannot be killed mid-flight by the liveness probe (#172).
+          # THIS BUDGET (periodSeconds x failureThreshold) BOUNDS A STANDBY'S FIRST CLONE:
+          # since #288 the agent runs pg_basebackup from THIS container, not from a
+          # probe-free init container, so lowering the threshold caps how long a clone of
+          # your existing database may take. Exceed it and the kubelet kills the container
+          # and the clone restarts from scratch. See postgresql.startupProbe in values.yaml
+          # before tuning it. (The repmgr stale-primary settle loop this comment used to
+          # cite went away with the repmgr helpers.) Steady-state liveness stays tight below.
           startupProbe:
             exec:
               command:
@@ -1289,6 +1329,27 @@ spec:
                 - -c
                 - |
                   pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 || exit 1
+                  {{- if .Values.postgresql.tls.enabled }}
+                  {{- /* Fail closed when requested server TLS is not actually on (#335).
+                         `SHOW ssl` is the only signal that reports what the postmaster
+                         LOADED; the ConfigMap, the mounted Secret and the values file all
+                         describe what was rendered, and #335 is exactly the case where the
+                         two disagree in silence -- the release goes Ready, the certificate
+                         is mounted, and the server accepts only plaintext.
+                         A NotReady pod leaves the client-facing Services, so nothing keeps
+                         talking plaintext to it, while the headless Service
+                         (publishNotReadyAddresses) keeps replication and the agent's peer
+                         probes working -- and a RollingUpdate stalls here rather than
+                         rolling the whole cluster into the broken state.
+                         Only a DEFINITIVE "off" fails. An empty answer is a psql that did
+                         not run, which is uncertainty rather than evidence of plaintext;
+                         failing on it would turn a transient blip into a write outage. The
+                         agent alarms on that case separately (pg_ha_agent_tls_inactive). */}}
+                  if [ "$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SHOW ssl" 2>/dev/null)" = "off" ]; then
+                    echo "postgresql.tls.enabled is set but this server reports ssl=off: refusing readiness rather than serving clients in plaintext (#335)" >&2
+                    exit 1
+                  fi
+{{- end }}
                   rec=$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()" 2>/dev/null)
                   if [ "$rec" = "f" ]; then exit 0; fi
                   if [ "$rec" = "t" ]; then
@@ -1301,7 +1362,30 @@ spec:
               command:
                 - /bin/bash
                 - -c
-                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+                - |
+                  pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 || exit 1
+                  {{- if .Values.postgresql.tls.enabled }}
+                  {{- /* Fail closed when requested server TLS is not actually on (#335).
+                         `SHOW ssl` is the only signal that reports what the postmaster
+                         LOADED; the ConfigMap, the mounted Secret and the values file all
+                         describe what was rendered, and #335 is exactly the case where the
+                         two disagree in silence -- the release goes Ready, the certificate
+                         is mounted, and the server accepts only plaintext.
+                         A NotReady pod leaves the client-facing Services, so nothing keeps
+                         talking plaintext to it, while the headless Service
+                         (publishNotReadyAddresses) keeps replication and the agent's peer
+                         probes working -- and a RollingUpdate stalls here rather than
+                         rolling the whole cluster into the broken state.
+                         Only a DEFINITIVE "off" fails. An empty answer is a psql that did
+                         not run, which is uncertainty rather than evidence of plaintext;
+                         failing on it would turn a transient blip into a write outage. The
+                         agent alarms on that case separately (pg_ha_agent_tls_inactive). */}}
+                  if [ "$(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SHOW ssl" 2>/dev/null)" = "off" ]; then
+                    echo "postgresql.tls.enabled is set but this server reports ssl=off: refusing readiness rather than serving clients in plaintext (#335)" >&2
+                    exit 1
+                  fi
+{{- end }}
+                  exit 0
 {{- end }}
             initialDelaySeconds: {{ .Values.postgresql.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.postgresql.readinessProbe.periodSeconds }}
@@ -1352,11 +1436,7 @@ spec:
             - name: pg-run
               mountPath: /var/run/postgresql
 {{- end }}
-{{- if .Values.repmgr.enabled }}
-            - name: repmgr-config
-              mountPath: /etc/repmgr
-{{- end }}
-{{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.repmgr.agent.dcs.etcd).tls).secretName) }}
+{{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.ha.agent.dcs.etcd).tls).secretName) }}
             - name: etcd-tls
               mountPath: /etc/etcd-tls
               readOnly: true
@@ -1372,194 +1452,6 @@ spec:
 {{- with .Values.postgresql.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
 {{- end }}
-{{- if eq (include "pg.repmgrdMode" .) "true" }}
-        - name: repmgrd
-          image: "{{ include "pg.repmgrImage" . }}"
-          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
-          # Workaround: cagriekin/repmgr <= trixie-5.5.0-7 calls
-          # `standby register --force` without --upstream-node-id, leaving the
-          # row on the primary with type='' on PG18 + repmgr 5.5.0 and crashing
-          # the standby. Pre-register here with an explicit upstream node_id,
-          # then exec the image entrypoint (its own register --force becomes a
-          # no-op UPDATE). Drop once the image ships the fix upstream.
-          # Tracking: github.com/cagriekin/repmgr-docker, repmgrd-entrypoint.sh:45.
-          command:
-            - /bin/bash
-            - -c
-            - |
-              ORDINAL="${HOSTNAME##*-}"
-              for _ in $(seq 1 120); do pg_isready -h 127.0.0.1 > /dev/null 2>&1 && break; sleep 2; done
-              IN_RECOVERY=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h 127.0.0.1 -U "${REPMGR_USER}" -d "${REPMGR_DB}" -tA -c "SELECT pg_is_in_recovery();" 2>/dev/null || true)
-              if [ "$IN_RECOVERY" = "f" ]; then
-                echo "pre-register: primary register --force"
-                repmgr -f /etc/repmgr/repmgr.conf primary register --force || true
-              elif [ "$IN_RECOVERY" = "t" ]; then
-                BASE="${HOSTNAME%-*}"
-                PNID=""
-                for _ in $(seq 1 60); do
-                  for i in $(seq 0 {{ int .Values.postgresql.replicaCount }}); do
-                    [ "$i" = "$ORDINAL" ] && continue
-                    P="${BASE}-${i}.${HEADLESS_SERVICE}"
-                    PGPASSWORD="${REPMGR_PASSWORD}" pg_isready -h "$P" -U "${REPMGR_USER}" -d "${REPMGR_DB}" > /dev/null 2>&1 || continue
-                    PNID=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h "$P" -U "${REPMGR_USER}" -d "${REPMGR_DB}" -tA \
-                      -c "SELECT node_id FROM repmgr.nodes WHERE type='primary' AND active=true LIMIT 1;" 2>/dev/null || true)
-                    [ -n "$PNID" ] && break 2
-                  done
-                  sleep 2
-                done
-                if [ -n "$PNID" ]; then
-                  echo "pre-register: standby register --upstream-node-id=${PNID}"
-                  repmgr -f /etc/repmgr/repmgr.conf standby register --upstream-node-id="${PNID}" --force || true
-                  # Read node_id from the generated repmgr.conf instead of
-                  # re-deriving the image's ordinal+1000 convention here.
-                  LOCAL_NID=$(awk -F= '$1=="node_id"{print $2; exit}' /etc/repmgr/repmgr.conf)
-                  if [ -z "$LOCAL_NID" ]; then
-                    echo "pre-register: no node_id in /etc/repmgr/repmgr.conf, skipping type backfill" >&2
-                  else
-                    # Defensive: some PG18 + repmgr image combos land the row
-                    # with type=''. WHERE clause makes this a no-op on rows
-                    # that are already correctly typed.
-                    PGPASSWORD="${REPMGR_PASSWORD}" psql -h "$P" -U "${REPMGR_USER}" -d "${REPMGR_DB}" \
-                      -v ON_ERROR_STOP=1 --no-psqlrc -c "
-                        UPDATE repmgr.nodes SET type='standby'
-                         WHERE node_id=${LOCAL_NID} AND (type IS NULL OR type='');
-                      " || echo "pre-register: type-backfill UPDATE failed (ignored)" >&2
-                  fi
-                fi
-              fi
-              # repmgr 5.x has no conf-based retention for monitoring_history
-              # (the image's monitoring_history_keep conf line is ignored as
-              # an unknown parameter), so the table grows forever. Prune it
-              # once per day on the primary via `repmgr cluster cleanup`.
-              # Failures only log a warning: the loop must never take down
-              # repmgrd (pid 1 via the exec below).
-              (
-                while true; do
-                  sleep 86400
-                  IN_RECOVERY=$(PGPASSWORD="${REPMGR_PASSWORD}" psql -h 127.0.0.1 -U "${REPMGR_USER}" -d "${REPMGR_DB}" -tA -c "SELECT pg_is_in_recovery();" 2>/dev/null || true)
-                  [ "$IN_RECOVERY" = "f" ] || continue
-                  if ! repmgr -f /etc/repmgr/repmgr.conf cluster cleanup --keep-history="${MONITORING_HISTORY_DAYS}"; then
-                    echo "monitoring-history-cleanup: repmgr cluster cleanup failed, retrying in 24h" >&2
-                  fi
-                done
-              ) &
-              exec repmgrd -f /etc/repmgr/repmgr.conf --daemonize=no
-          securityContext:
-            {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
-          env:
-{{- with (include "pg.pgMajorEnv" .) }}{{ . | nindent 12 }}{{- end }}
-            - name: PGDATA
-              value: /var/lib/postgresql/data/pgdata
-            - name: REPMGR_USER
-              value: {{ .Values.repmgr.username | quote }}
-            - name: REPMGR_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretRepmgrPasswordKey" . }}
-            - name: REPMGR_DB
-              value: {{ .Values.repmgr.database | quote }}
-            - name: HEADLESS_SERVICE
-              value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
-            - name: REPMGR_NODE_COUNT
-              value: {{ add .Values.postgresql.replicaCount 1 | quote }}
-            - name: MONITORING_HISTORY_DAYS
-              value: {{ int (required "repmgr.monitoringHistoryDays is required when repmgr.enabled=true" .Values.repmgr.monitoringHistoryDays) | quote }}
-          lifecycle:
-            preStop:
-              exec:
-                command:
-                  - /bin/bash
-                  - -c
-                  - |
-                    repmgr daemon stop 2>/dev/null || true
-          resources:
-            {{- toYaml .Values.repmgr.resources | nindent 12 }}
-          volumeMounts:
-            - name: data
-              mountPath: /var/lib/postgresql/data
-            - name: repmgr-config
-              mountPath: /etc/repmgr
-        - name: service-updater
-          image: "{{ include "pg.repmgrImage" . }}"
-          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
-          command: ["/bin/bash", "/scripts/service-updater.sh"]
-          securityContext:
-            {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
-          env:
-            - name: NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-            - name: MASTER_SERVICE
-              value: {{ include "pg.fullname" . | quote }}
-            - name: PRIMARY_MARKER
-              value: {{ printf "%s-primary" (include "pg.fullname" .) | quote }}
-            - name: HEADLESS_SERVICE
-              value: {{ printf "%s-headless.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
-            - name: REPMGR_USER
-              value: {{ .Values.repmgr.username | quote }}
-            - name: REPMGR_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretRepmgrPasswordKey" . }}
-            - name: REPMGR_DB
-              value: {{ .Values.repmgr.database | quote }}
-            - name: SPLIT_BRAIN_ACTION
-              value: {{ .Values.repmgr.splitBrainDetection.action | quote }}
-{{- if .Values.pgpool.enabled }}
-            - name: PGPOOL_DEPLOYMENT
-              value: {{ printf "%s-pgpool" (include "pg.fullname" .) | quote }}
-            - name: PGPOOL_SERVICE
-              value: {{ printf "%s-pgpool.%s.svc.cluster.local" (include "pg.fullname" .) .Release.Namespace | quote }}
-            - name: PGPOOL_PORT
-              value: "{{ .Values.pgpool.service.port }}"
-            - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretUsernameKey" . }}
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretPasswordKey" . }}
-            - name: POSTGRES_DB
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "pg.secretName" . }}
-                  key: {{ include "pg.secretDatabaseKey" . }}
-{{- end }}
-          livenessProbe:
-            exec:
-              command:
-                - /bin/bash
-                - -c
-                - |
-                  [ -f /tmp/service-updater-alive ] && [ $(( $(date +%s) - $(cat /tmp/service-updater-alive) )) -lt 120 ]
-            initialDelaySeconds: 60
-            periodSeconds: 30
-            failureThreshold: 3
-            timeoutSeconds: 5
-          lifecycle:
-            preStop:
-              exec:
-                command:
-                  - /bin/bash
-                  - -c
-                  - sleep 5
-          volumeMounts:
-            - name: service-updater-script
-              mountPath: /scripts
-            # repmgr.conf (written by the init container) so the master's
-            # service-updater can run `repmgr standby unregister` for ghost nodes (#139).
-            - name: repmgr-config
-              mountPath: /etc/repmgr
-              readOnly: true
-          resources:
-            {{- toYaml .Values.repmgr.serviceUpdater.resources | nindent 12 }}
-{{- end }}
 {{- if .Values.pgbackrest.enabled }}
         # Idle sidecar: holds the pgbackrest binary, config and S3 credentials
         # alongside PGDATA on every pg pod. The pgbackrest CronJobs find the
@@ -1567,8 +1459,8 @@ spec:
         # into this container to perform the actual backup. Scheduling lives
         # in the CronJobs, not here.
         - name: pgbackrest
-          image: "{{ include "pg.repmgrImage" . }}"
-          imagePullPolicy: {{ .Values.repmgr.image.pullPolicy }}
+          image: "{{ include "pg.haImage" . }}"
+          imagePullPolicy: {{ .Values.ha.image.pullPolicy }}
           command: ["/bin/bash", "-c", "exec sleep infinity"]
           securityContext:
             {{- toYaml .Values.postgresql.containerSecurityContext | nindent 12 }}
@@ -1616,7 +1508,15 @@ spec:
           resources:
             {{- toYaml .Values.pgbackrest.resources | nindent 12 }}
 {{- end }}
-{{- if or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.repmgr.enabled .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.extraVolumes (not .Values.postgresql.persistence.enabled) (eq (include "pg.postgresqlConfigRenders" .) "true") }}
+{{- /* The disjuncts are the conditions that actually CONTRIBUTE a volume (#298 review).
+       `.Values.ha.enabled` used to stand in for agent mode, but the only volume it ever
+       gated by itself was repmgr-config, which this release deletes -- so on the chart
+       DEFAULT (ha on, persistence on, everything else off) this emitted a `volumes:` key
+       with no items, i.e. `volumes: null` in the pod spec. The two agent-mode volumes that
+       really exist are named explicitly instead, so the key appears exactly when there is
+       something to put under it and cannot silently lose one either. */}}
+{{- $needsVolumes := or .Values.postgresql.configuration .Values.postgresql.extensions.enabled .Values.pgbackrest.enabled .Values.postgresql.tls.enabled .Values.postgresql.extraVolumes (not .Values.postgresql.persistence.enabled) (eq (include "pg.postgresqlConfigRenders" .) "true") (and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.ha.agent.dcs.etcd).tls).secretName)) $control.enabled -}}
+{{- if $needsVolumes }}
       volumes:
 {{- if eq (include "pg.postgresqlConfigRenders" .) "true" }}
         - name: postgresql-config
@@ -1663,28 +1563,17 @@ spec:
             sizeLimit: 1Gi
 {{- end }}
 {{- end }}
-{{- if .Values.repmgr.enabled }}
-        - name: repmgr-config
-          emptyDir:
-            sizeLimit: 16Mi
-{{- end }}
-{{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.repmgr.agent.dcs.etcd).tls).secretName) }}
+{{- if and (eq (include "pg.agentEtcdMode" .) "true") (((.Values.ha.agent.dcs.etcd).tls).secretName) }}
         - name: etcd-tls
           secret:
-            secretName: {{ .Values.repmgr.agent.dcs.etcd.tls.secretName | quote }}
+            secretName: {{ .Values.ha.agent.dcs.etcd.tls.secretName | quote }}
             defaultMode: 0400
 {{- end }}
 {{- if $control.enabled }}
         - name: agent-control-tls
           secret:
-            secretName: {{ $control.tls.existingSecret | quote }}
+            secretName: {{ $controlTLS.existingSecret | quote }}
             defaultMode: 0400
-{{- end }}
-{{- if eq (include "pg.repmgrdMode" .) "true" }}
-        - name: service-updater-script
-          configMap:
-            name: {{ include "pg.fullname" . }}-service-updater
-            defaultMode: 0755
 {{- end }}
 {{- if .Values.pgbackrest.enabled }}
         - name: pg-run

@@ -1,0 +1,335 @@
+package pgconf
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestAssemblePgHbaIsHardened(t *testing.T) {
+	out := AssemblePgHba(PgHbaOptions{
+		ReplicationUser: "repmgr",
+		PeerCIDR:        "10.0.0.0/8",
+		ExtraRules:      []string{"host all readonly 10.0.0.0/8 scram-sha-256"},
+	})
+	if strings.Contains(out, "0.0.0.0/0") {
+		t.Errorf("must not contain the 0.0.0.0/0 catch-all:\n%s", out)
+	}
+	if strings.Contains(out, "md5") {
+		t.Errorf("must be SCRAM-only, found md5:\n%s", out)
+	}
+	if !strings.Contains(out, "host        replication   repmgr        10.0.0.0/8        scram-sha-256") {
+		t.Errorf("missing replication rule:\n%s", out)
+	}
+	// User rule must appear ABOVE the network catch-all (#144 ordering).
+	userIdx := strings.Index(out, "readonly")
+	catchIdx := strings.Index(out, "host        all           all        10.0.0.0/8")
+	if userIdx < 0 || catchIdx < 0 || userIdx > catchIdx {
+		t.Errorf("user rule must precede the network catch-all (user=%d catch=%d):\n%s", userIdx, catchIdx, out)
+	}
+}
+
+func TestAssemblePgHbaRequireSSL(t *testing.T) {
+	out := AssemblePgHba(PgHbaOptions{
+		ReplicationUser: "repmgr",
+		PeerCIDR:        "10.0.0.0/8",
+		RequireSSL:      true,
+	})
+	// The peer-CIDR client rule is hostssl (reject non-TLS).
+	if !strings.Contains(out, "hostssl     all           all        10.0.0.0/8        scram-sha-256") {
+		t.Errorf("require: peer-CIDR client rule must be hostssl:\n%s", out)
+	}
+	// Loopback and replication stay plain `host` (never hostssl) -- replication is plaintext (#110).
+	if !strings.Contains(out, "host        all           all        127.0.0.1/32") {
+		t.Errorf("require: loopback must stay plain host:\n%s", out)
+	}
+	if !strings.Contains(out, "host        replication   repmgr        10.0.0.0/8        scram-sha-256") {
+		t.Errorf("require: replication rule must stay plain host:\n%s", out)
+	}
+	if strings.Contains(out, "clientcert") {
+		t.Errorf("require without mTLS must not add clientcert:\n%s", out)
+	}
+}
+
+func TestAssemblePgHbaClientCertAuthExemptsInternalUsers(t *testing.T) {
+	out := AssemblePgHba(PgHbaOptions{
+		ReplicationUser: "repmgr",
+		PeerCIDR:        "10.0.0.0/8",
+		RequireSSL:      true,
+		ClientCertAuth:  true,
+		PostgresUser:    "postgres",
+		MonitoringUser:  "monitoring",
+	})
+	// Internal users get hostssl WITHOUT clientcert (password over TLS).
+	for _, u := range []string{"repmgr", "postgres", "monitoring"} {
+		line := "hostssl     all           " + u + "        10.0.0.0/8        scram-sha-256"
+		if !strings.Contains(out, line) {
+			t.Errorf("mTLS: internal user %q must be exempt from clientcert:\n%s", u, out)
+		}
+	}
+	// The app catch-all requires a client cert.
+	if !strings.Contains(out, "hostssl     all           all        10.0.0.0/8        scram-sha-256 clientcert=verify-ca") {
+		t.Errorf("mTLS: app catch-all must require clientcert=verify-ca:\n%s", out)
+	}
+	// Exemptions must appear ABOVE the clientcert catch-all (first match wins in pg_hba).
+	exIdx := strings.Index(out, "hostssl     all           postgres")
+	catchIdx := strings.Index(out, "clientcert=verify-ca")
+	if exIdx < 0 || catchIdx < 0 || exIdx > catchIdx {
+		t.Errorf("exemptions must precede the clientcert catch-all (ex=%d catch=%d):\n%s", exIdx, catchIdx, out)
+	}
+	// Replication stays plaintext even under mTLS.
+	if !strings.Contains(out, "host        replication   repmgr        10.0.0.0/8        scram-sha-256") {
+		t.Errorf("mTLS: replication rule must stay plain host:\n%s", out)
+	}
+}
+
+func TestAssemblePgHbaClientCertAuthSkipsEmptyMonitoringUser(t *testing.T) {
+	out := AssemblePgHba(PgHbaOptions{
+		ReplicationUser: "repmgr",
+		PeerCIDR:        "10.0.0.0/8",
+		ClientCertAuth:  true,
+		PostgresUser:    "postgres",
+		// MonitoringUser empty -> no monitoring exemption rule emitted.
+	})
+	if strings.Contains(out, "monitoring") {
+		t.Errorf("empty MonitoringUser must not emit a monitoring exemption:\n%s", out)
+	}
+	if !strings.Contains(out, "clientcert=verify-ca") {
+		t.Errorf("mTLS catch-all must still require clientcert:\n%s", out)
+	}
+}
+
+func TestAssemblePgHbaDefaultUnchangedByTLSFields(t *testing.T) {
+	// TLS off (zero-value options): byte-identical to the pre-#110 hardened default.
+	out := AssemblePgHba(PgHbaOptions{ReplicationUser: "repmgr", PeerCIDR: "10.0.0.0/8"})
+	if !strings.Contains(out, "host        all           all        10.0.0.0/8        scram-sha-256") {
+		t.Errorf("default must keep the plain host catch-all:\n%s", out)
+	}
+	if strings.Contains(out, "hostssl") || strings.Contains(out, "clientcert") {
+		t.Errorf("TLS off must not emit hostssl/clientcert:\n%s", out)
+	}
+}
+
+func TestAssemblePgHbaClientCertAuthOnlyForcesHostssl(t *testing.T) {
+	// clientCertAuth WITHOUT require (require=false): the switch checks ClientCertAuth
+	// first, so it still emits the full mTLS rule set -- there is NO plaintext host
+	// catch-all. This is the combination behind the cross-component guard fix (the
+	// exporter/pgpool sslmode guards must fire on clientCertAuth, not just require).
+	out := AssemblePgHba(PgHbaOptions{
+		ReplicationUser: "repmgr",
+		PeerCIDR:        "10.0.0.0/8",
+		ClientCertAuth:  true,
+		RequireSSL:      false, // explicitly off
+		PostgresUser:    "postgres",
+		MonitoringUser:  "monitoring",
+	})
+	if !strings.Contains(out, "hostssl     all           all        10.0.0.0/8        scram-sha-256 clientcert=verify-ca") {
+		t.Errorf("clientCertAuth alone must emit the clientcert catch-all:\n%s", out)
+	}
+	// No plaintext peer-CIDR catch-all may survive (else non-TLS clients slip through).
+	if strings.Contains(out, "host        all           all        10.0.0.0/8") {
+		t.Errorf("clientCertAuth must not leave a plaintext host catch-all:\n%s", out)
+	}
+}
+
+func TestAssemblePgHbaRequireAndClientCertAuthMatchesClientCertOnly(t *testing.T) {
+	// require=true is subsumed by clientCertAuth=true: the rule set is identical whether
+	// require is also set, so the two flags never produce conflicting/duplicate rules.
+	base := PgHbaOptions{ReplicationUser: "repmgr", PeerCIDR: "10.0.0.0/8", ClientCertAuth: true, PostgresUser: "postgres"}
+	withReq := base
+	withReq.RequireSSL = true
+	if AssemblePgHba(base) != AssemblePgHba(withReq) {
+		t.Errorf("require+clientCertAuth must equal clientCertAuth-only:\n--- cca ---\n%s\n--- cca+req ---\n%s", AssemblePgHba(base), AssemblePgHba(withReq))
+	}
+}
+
+func TestAssemblePgHbaEmptyPostgresUserMTLS(t *testing.T) {
+	// Empty PostgresUser -> no postgres exemption line and no malformed empty-user rule;
+	// the repmgr exemption and the clientcert catch-all are still emitted.
+	out := AssemblePgHba(PgHbaOptions{
+		ReplicationUser: "repmgr",
+		PeerCIDR:        "10.0.0.0/8",
+		ClientCertAuth:  true,
+		// PostgresUser + MonitoringUser empty
+	})
+	if !strings.Contains(out, "hostssl     all           repmgr        10.0.0.0/8        scram-sha-256") {
+		t.Errorf("repmgr exemption must still be present:\n%s", out)
+	}
+	if !strings.Contains(out, "clientcert=verify-ca") {
+		t.Errorf("clientcert catch-all must still be present:\n%s", out)
+	}
+	// A double-space gap (empty username spliced into the format) would be a malformed rule.
+	if strings.Contains(out, "hostssl     all                     10.0.0.0/8") {
+		t.Errorf("empty PostgresUser must not splice a blank-username rule:\n%s", out)
+	}
+}
+
+func TestAssemblePgHbaMD5FallbackLayersMd5AboveScram(t *testing.T) {
+	out := AssemblePgHba(PgHbaOptions{
+		ReplicationUser: "repmgr",
+		PeerCIDR:        "10.0.0.0/8",
+		MD5Fallback:     true,
+	})
+	// An md5 line is laid above each generated scram rule -- loopback x2, replication,
+	// and the peer-CIDR catch-all -- so md5-stored passwords still authenticate (#199).
+	if n := strings.Count(out, "md5\n"); n != 4 {
+		t.Errorf("expected 4 md5 lines (loopback x2 + replication + catch-all), got %d:\n%s", n, out)
+	}
+	// Each md5 line sits ABOVE its scram twin (pg_hba is first-match-wins).
+	if i, j := strings.Index(out, "10.0.0.0/8        md5"), strings.Index(out, "10.0.0.0/8        scram-sha-256"); i < 0 || j < 0 || i > j {
+		t.Errorf("md5 must precede its scram twin (md5=%d scram=%d):\n%s", i, j, out)
+	}
+	// The hardening invariants are unchanged: local trust kept, no 0.0.0.0/0.
+	if !strings.Contains(out, "local       all           all                              trust") {
+		t.Errorf("local trust line missing:\n%s", out)
+	}
+	if strings.Contains(out, "0.0.0.0/0") {
+		t.Errorf("must not reintroduce the 0.0.0.0/0 catch-all:\n%s", out)
+	}
+}
+
+func TestAssemblePgHbaMD5FallbackMTLSNeverBypassesClientCert(t *testing.T) {
+	out := AssemblePgHba(PgHbaOptions{
+		ReplicationUser: "repmgr",
+		PeerCIDR:        "10.0.0.0/8",
+		ClientCertAuth:  true,
+		PostgresUser:    "postgres",
+		MonitoringUser:  "monitoring",
+		MD5Fallback:     true,
+	})
+	// Internal-user exemptions get an md5 twin (they auth by password over TLS).
+	if !strings.Contains(out, "hostssl     all           repmgr        10.0.0.0/8        md5") {
+		t.Errorf("mTLS+md5: repmgr exemption must get an md5 twin:\n%s", out)
+	}
+	// The app catch-all keeps clientcert and is NEVER md5-fallback'd, so app users
+	// cannot skip the client cert via md5 password auth (#199).
+	if !strings.Contains(out, "hostssl     all           all        10.0.0.0/8        scram-sha-256 clientcert=verify-ca") {
+		t.Errorf("mTLS: app catch-all must require clientcert:\n%s", out)
+	}
+	if strings.Contains(out, "hostssl     all           all        10.0.0.0/8        md5") {
+		t.Errorf("mTLS+md5: app catch-all must NOT have an md5 bypass twin:\n%s", out)
+	}
+}
+
+func TestAssemblePgHbaMD5FallbackLeavesExtraRules(t *testing.T) {
+	out := AssemblePgHba(PgHbaOptions{
+		ReplicationUser: "repmgr",
+		PeerCIDR:        "10.0.0.0/8",
+		ExtraRules:      []string{"host all readonly 10.0.0.0/8 scram-sha-256"},
+		MD5Fallback:     true,
+	})
+	// User ExtraRules are verbatim -- no md5 twin (the former chart awk only matched
+	// the chart's own all/replication rules, never user rules).
+	if strings.Contains(out, "host all readonly 10.0.0.0/8 md5") {
+		t.Errorf("ExtraRules must not be md5-fallback'd:\n%s", out)
+	}
+	if !strings.Contains(out, "host all readonly 10.0.0.0/8 scram-sha-256") {
+		t.Errorf("ExtraRule must be present verbatim:\n%s", out)
+	}
+}
+
+func TestEnsureConfdIncludeIdempotentToggle(t *testing.T) {
+	dir := t.TempDir()
+	conf := filepath.Join(dir, "postgresql.conf")
+	if err := os.WriteFile(conf, []byte("shared_buffers = '128MB'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inc := "/etc/postgresql/conf.d"
+	managed := "include_dir = '/etc/postgresql/conf.d'"
+
+	// Enable twice: line present exactly once (idempotent).
+	for i := 0; i < 2; i++ {
+		if err := EnsureConfdInclude(conf, inc, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, _ := os.ReadFile(conf)
+	if n := strings.Count(string(b), managed); n != 1 {
+		t.Errorf("managed include count = %d, want 1:\n%s", n, b)
+	}
+	if !strings.Contains(string(b), "shared_buffers") {
+		t.Errorf("existing config must be preserved:\n%s", b)
+	}
+
+	// Disable: line removed.
+	if err := EnsureConfdInclude(conf, inc, false); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = os.ReadFile(conf)
+	if strings.Contains(string(b), managed) {
+		t.Errorf("managed include should be removed when disabled:\n%s", b)
+	}
+}
+
+// WritePgHba is ATOMIC for the same reason EnsureConfdInclude and native.ensureInclude
+// are (#298 review): a truncated pg_hba.conf is not a degraded config but a postmaster
+// that refuses to start ("could not load pg_hba.conf"), and this file is rewritten on
+// the boot path immediately before sup.Start -- so a crash or ENOSPC mid-write would
+// leave the pod unable to come up on the very config it was repairing.
+func TestWritePgHbaIsAtomicAndPrivate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pg_hba.conf")
+	if err := WritePgHba(path, "host all all 10.0.0.0/8 scram-sha-256\n"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "host all all 10.0.0.0/8 scram-sha-256\n" {
+		t.Errorf("content = %q", b)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// pg_hba.conf describes who may authenticate how; PostgreSQL itself refuses a
+	// group- or world-readable one in some configurations, and it is not ours to widen.
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Errorf("mode = %04o, want 0600", perm)
+	}
+	// No temporary file survives the write -- a leftover would accumulate on the PVC
+	// once per boot.
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 1 {
+		names := make([]string, 0, len(ents))
+		for _, e := range ents {
+			names = append(names, e.Name())
+		}
+		t.Errorf("directory holds %v, want only pg_hba.conf", names)
+	}
+}
+
+// Rewritten on EVERY boot, so it has to replace the previous content wholesale rather
+// than append or merge: a stale rule left behind is an authentication path nobody
+// intended.
+func TestWritePgHbaReplacesPreviousContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pg_hba.conf")
+	if err := WritePgHba(path, "host all olduser 0.0.0.0/0 trust\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := WritePgHba(path, "host all all 10.0.0.0/8 scram-sha-256\n"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	if strings.Contains(string(b), "olduser") || strings.Contains(string(b), "trust") {
+		t.Errorf("the previous rules survived the rewrite: %q", b)
+	}
+}
+
+// The error names the file, because the caller logs it on the boot path where the pod
+// is about to fail its first start and the operator has nothing else to go on.
+func TestWritePgHbaErrorNamesTheFile(t *testing.T) {
+	// A path whose parent does not exist: the same class as a wrong PGDATA mount.
+	err := WritePgHba(filepath.Join(t.TempDir(), "no-such-dir", "pg_hba.conf"), "x\n")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "pg_hba.conf") {
+		t.Errorf("error should name the file: %v", err)
+	}
+}

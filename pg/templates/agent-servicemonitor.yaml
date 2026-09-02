@@ -1,4 +1,5 @@
-{{- if and (eq (include "pg.agentMode" .) "true") (dig "serviceMonitor" "enabled" false (.Values.repmgr.agent.monitoring | default dict)) }}
+{{- include "pg.normalizeValues" . -}}
+{{- if and (eq (include "pg.agentMode" .) "true") (dig "serviceMonitor" "enabled" false (.Values.ha.agent.monitoring | default dict)) }}
 {{- /*
 Scrapes the pg-ha-agent's read-only metrics (port 9200, /metrics) off the
 per-pod headless Service endpoints. The selector is scoped to the postgresql
@@ -11,7 +12,7 @@ metadata:
   name: {{ include "pg.fullname" . }}-agent
   labels:
     {{- include "pg.labels" . | nindent 4 }}
-    {{- with .Values.repmgr.agent.monitoring.serviceMonitor.additionalLabels }}
+    {{- with .Values.ha.agent.monitoring.serviceMonitor.additionalLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
   {{- with (include "pg.annotations" .) }}
@@ -29,6 +30,6 @@ spec:
   endpoints:
     - port: agent-metrics
       path: /metrics
-      interval: {{ .Values.repmgr.agent.monitoring.serviceMonitor.interval }}
-      scrapeTimeout: {{ .Values.repmgr.agent.monitoring.serviceMonitor.scrapeTimeout }}
+      interval: {{ .Values.ha.agent.monitoring.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.ha.agent.monitoring.serviceMonitor.scrapeTimeout }}
 {{- end }}

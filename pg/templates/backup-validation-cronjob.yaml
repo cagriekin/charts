@@ -42,7 +42,7 @@ spec:
           # postgres image (postgresql.image), whose postgres user is uid 999 -- so
           # it reuses the backup writer's securityContext (uid 999) plus fsGroup 999
           # (on backup.podSecurityContext) so initdb can write the emptyDir PGDATA.
-          # Running as 101 (the repmgr image's uid) fails: 101 has no passwd entry
+          # Running as 101 (the HA image's uid) fails: 101 has no passwd entry
           # in the official image and initdb aborts.
           securityContext:
             {{- toYaml .Values.backup.podSecurityContext | nindent 12 }}

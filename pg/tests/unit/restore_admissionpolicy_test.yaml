@@ -168,7 +168,7 @@ tests:
           pattern: "ephemeralContainers"
       - matchRegex:
           path: spec.validations[8].expression
-          pattern: "c\\.image == 'cagriekin/repmgr:trixie-5\\.5\\.0-31'"
+          pattern: "c\\.image == 'cagriekin/pg-ha:2\\.0\\.0-pg18'"
 
   # The pod's OWN labels, which validation #2 (the Job object's label) says nothing about.
   # A restore pod carrying component=postgresql joins the write Service's endpoints, and a
@@ -451,7 +451,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "a pgbackrest Secret name (pgbackrest.existingSecret.name / pgbackrest.repoEncryption.existingSecret.name) is \"dba's-key\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "a pgbackrest Secret name (pgbackrest.existingSecret.name / pgbackrest.repoEncryption.existingSecret.name) is \"dba's-key\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   # priorityClassName is pinned, and it is deliberately NOT lumped in with
   # nodeSelector/tolerations: those can only restrict where a pod runs, while a priority class
@@ -529,7 +529,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "postgresql.podSecurityContext.seccompProfile.type is \"x' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "postgresql.podSecurityContext.seccompProfile.type is \"x' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   - it: a crafted container seccomp profile type cannot turn its pin into a tautology
     values:
@@ -540,7 +540,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "postgresql.containerSecurityContext.seccompProfile.type is \"x' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "postgresql.containerSecurityContext.seccompProfile.type is \"x' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   - it: a crafted added capability cannot turn its pin into a tautology
     values:
@@ -552,7 +552,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "a postgresql.containerSecurityContext.capabilities.add entry is \"SYS_ADMIN' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "a postgresql.containerSecurityContext.capabilities.add entry is \"SYS_ADMIN' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   - it: a crafted priority class name cannot turn its pin into a tautology
     values:
@@ -563,19 +563,19 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "pgbackrest.cronjob.priorityClassName is \"p' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with repmgr.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "pgbackrest.cronjob.priorityClassName is \"p' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   # --- the grant and the bound cannot be separated ---
   - it: disabling the policy without acknowledging the trade fails the render
     values:
       - ../values-agent-control-restore.yaml
     set:
-      repmgr.agent.control.restore.admissionPolicy.enabled: false
+      ha.agent.control.restore.admissionPolicy.enabled: false
     templates:
       - templates/statefulset.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "repmgr.agent.control.restore.admissionPolicy.enabled=false leaves the restore feature's `create jobs` grant unbounded: RBAC cannot restrict create by resourceName, so anything holding the database pods' ServiceAccount token could create arbitrary Jobs in this namespace and name any ServiceAccount in them. Either leave admissionPolicy.enabled=true (it needs Kubernetes >= 1.30 and cluster-scoped create on ValidatingAdmissionPolicy), or set repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded=true to accept that trade deliberately"
+          errorMessage: "ha.agent.control.restore.admissionPolicy.enabled=false leaves the restore feature's `create jobs` grant unbounded: RBAC cannot restrict create by resourceName, so anything holding the database pods' ServiceAccount token could create arbitrary Jobs in this namespace and name any ServiceAccount in them. Either leave admissionPolicy.enabled=true (it needs Kubernetes >= 1.30 and cluster-scoped create on ValidatingAdmissionPolicy), or set ha.agent.control.restore.admissionPolicy.acknowledgeUnbounded=true to accept that trade deliberately"
 
   # The opt-out is honoured -- a cluster below 1.30, a namespace-limited installer, or a
   # platform-managed policy are all real -- it just has to be stated in values.
@@ -583,8 +583,8 @@ tests:
     values:
       - ../values-agent-control-restore.yaml
     set:
-      repmgr.agent.control.restore.admissionPolicy.enabled: false
-      repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
+      ha.agent.control.restore.admissionPolicy.enabled: false
+      ha.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
     templates:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
@@ -595,8 +595,8 @@ tests:
     values:
       - ../values-agent-control-restore.yaml
     set:
-      repmgr.agent.control.restore.admissionPolicy.enabled: false
-      repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
+      ha.agent.control.restore.admissionPolicy.enabled: false
+      ha.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
     templates:
       - templates/rbac.yaml
     documentIndex: 1

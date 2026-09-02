@@ -4,6 +4,6 @@ dependencies:
   version: 0.1.0
 - name: etcd
   repository: file://../etcd
-  version: 0.1.5
-digest: sha256:ab9a160a043847f40130d5d554ec1ac6a6272e2e3895e5265de93b9ef15c7913
-generated: "2026-06-21T00:14:27.15723981+02:00"
+  version: 0.1.14
+digest: sha256:d83cf545831fbecf1640471c3f650a8862b637be597bb7840fea224e4e2c52a3
+generated: "2026-08-31T16:28:52.136418389+02:00"

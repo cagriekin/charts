@@ -160,6 +160,7 @@ matching `prefix`.
 |-----|-------------|---------|
 | `replicaCount` | etcd members (keep odd for quorum) | `3` |
 | `image.repository` / `image.tag` | etcd image | `quay.io/coreos/etcd` / `v3.5.16` |
+| `image.digest` | digest pin; takes precedence over the tag. `image.tag: ""` with a digest is a valid digest-only reference, but clearing BOTH is refused at render time (it would deploy an implicit `:latest`) | pinned to the `v3.5.16` manifest list |
 | `clientPort` / `peerPort` | etcd ports | `2379` / `2380` |
 | `persistence.enabled` / `persistence.size` | data PVC | `true` / `2Gi` |
 | `resources` | requests/limits | `100m`/`128Mi` … `1`/`512Mi` |
@@ -173,7 +174,7 @@ matching `prefix`.
 | `rbac.adminSecret` | admin client cert Secret (CN must be `root`) | `""` |
 | `rbac.healthCheckCN` | CN of the read-only health user; the server cert's CN must equal it | `etcd-healthcheck` |
 | `rbac.tenants` | per-tenant grants (`[{commonName, prefix}]`) | `[]` |
-| `rbac.bootstrapImage` | image running `pg-ha-agent rbac-bootstrap` (etcd image has no shell) | `cagriekin/repmgr:trixie-5.5.0-24` |
+| `rbac.bootstrapImage` | image running `pg-ha-agent rbac-bootstrap` (etcd image has no shell). Same `repository`/`tag`/`digest` rules as `image` above, including the render-time refusal when both `tag` and `digest` are empty | `cagriekin/pg-ha:2.0.0-pg18` |
 | `rbac.resources` | bootstrap Job container resources | small requests/limits |
 | `networkPolicy.enabled` | ingress lockdown (needs a NP-enforcing CNI) | `true` |
 | `networkPolicy.allowedClients` | cross-namespace client allow-list for a shared etcd (`[{namespace, podSelector?}]`) | `[]` |

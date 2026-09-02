@@ -1,0 +1,253 @@
+# pgvector-SCOPED, not a mirror of pg's suite (#298). pgvector's templates are symlinks into
+# pg's and byte-identical by gate, so pg's suite already covers the shared logic; what belongs
+# here is chart-SPECIFIC -- pgvector's defaults, its image, and the shared validators firing
+# under pgvector's values+schema. The name keeps it from reading as a mirror, and
+# scripts/helm-unittest-charts.sh enforces the rule: same-named means SYMLINK, never a copy.
+suite: pgvector fail-fast guards
+templates:
+  - templates/statefulset.yaml
+release:
+  name: test-pgv
+tests:
+  # The fail-fast guards live in the symlinked pg templates; confirm they still fire
+  # when rendered with pgvector's own values + schema.
+  - it: standalone with replicas > 0 fails fast
+    set:
+      repmgr.enabled: false
+      postgresql.replicaCount: 1
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgresql.replicaCount > 0 requires ha.enabled=true: with HA disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode, or ha.enabled=true"
+
+  # #286: repmgrd is gone from pgvector too (the templates are symlinks into pg, so the
+  # guard is literally the same code); the removed key must fail rather than be ignored.
+  - it: repmgr.failoverMode is rejected as a removed key
+    set:
+      repmgr.failoverMode: repmgrd
+    asserts:
+      - failedTemplate:
+          errorPattern: 'failoverMode \(ha\.failoverMode / repmgr\.failoverMode\) was removed in chart 2\.0\.0'
+
+  - it: a 1.x trixie-* HA image tag is rejected
+    set:
+      ha.image.tag: trixie-5.5.0-33
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is a 1\.x image tag .*chart 2\.0\.0 cannot run it'
+
+  - it: renewDeadline <= 1.2x retryPeriod is rejected (client-go jitter bound)
+    set:
+      ha.agent.renewDeadline: 12s
+      ha.agent.retryPeriod: 10s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'requires renewDeadline > 1\.2 x retryPeriod'
+
+  - it: repmgr.splitBrainDetection is rejected as a removed key
+    set:
+      repmgr.splitBrainDetection.action: fence
+    asserts:
+      - failedTemplate:
+          errorPattern: 'splitBrainDetection \(ha\.splitBrainDetection / repmgr\.splitBrainDetection\) was removed in chart 2\.0\.0'
+
+  - it: standalone with replicaCount 0 renders
+    set:
+      repmgr.enabled: false
+      postgresql.replicaCount: 0
+    asserts:
+      - isKind:
+          of: StatefulSet
+      - notFailedTemplate: {}
+
+  # #308: wal_level has exactly one authoritative source (postgresql.walLevel); setting it
+  # via postgresql.configuration is rejected, confirmed with pgvector's own values+schema.
+  - it: postgresql.configuration.wal_level is rejected
+    set:
+      postgresql.configuration.wal_level: logical
+    asserts:
+      - failedTemplate:
+          errorPattern: "postgresql.walLevel"
+
+  - it: bogus postgresql.walLevel is rejected by the values schema
+    set:
+      postgresql.walLevel: bogus
+    asserts:
+      - failedTemplate:
+          errorPattern: "at '/postgresql/walLevel': value must be one of"
+
+  # #308: synchronized_standby_slots / sync_replication_slots do not exist before
+  # PostgreSQL 17; agent mode is pgvector's default, so this fires without extra overrides.
+  - it: syncReplicationSlots on PostgreSQL 16 is rejected
+    set:
+      repmgr.agent.syncReplicationSlots: true
+      postgresql.majorVersion: "16"
+      repmgr.image.majorVersion: "16"
+      repmgr.image.tag: trixie-5.5.0-31-pg16
+    asserts:
+      - failedTemplate:
+          errorPattern: "requires PostgreSQL 17\\+"
+
+  # sync_replication_slots is not a harmless no-op below wal_level=logical -- the worker
+  # it starts on every standby fails its own startup validation and respawns forever.
+  - it: syncReplicationSlots without walLevel=logical is rejected
+    set:
+      repmgr.agent.syncReplicationSlots: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "requires postgresql.walLevel: logical"
+
+  # aptSources only exists to make a packages entry installable (#310) -- pointless,
+  # and rejected, without one.
+  - it: extensions.aptSources without packages is rejected
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.aptSources:
+        - name: pigsty
+          keyUrl: https://repo.pigsty.io/key
+          aptLine: "deb https://repo.pigsty.io/apt/pgsql/trixie trixie main"
+    asserts:
+      - failedTemplate:
+          errorPattern: "aptSources is set but postgresql.extensions.packages is empty"
+
+  # extraLibs' copy step only runs alongside the packages apt-get install (#309) --
+  # pointless, and rejected, without one.
+  - it: extensions.extraLibs without packages is rejected
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.extraLibs:
+        - /usr/lib/x86_64-linux-gnu/libsodium.so.23
+    asserts:
+      - failedTemplate:
+          errorPattern: "extraLibs is set but neither postgresql.extensions.packages nor postgresql.extensions.image.repository is"
+
+  # copy-base-ext/copy-ext can be different image builds -- auto-shadowing the running
+  # container's own C runtime with a build from the other image is an ABI hazard.
+  - it: a core runtime library in extraLibs is refused
+    set:
+      postgresql.extensions.enabled: true
+      postgresql.extensions.packages:
+        - "postgresql-{major}-pgsodium"
+      postgresql.extensions.extraLibs:
+        - /usr/lib/x86_64-linux-gnu/libc.so.6
+    asserts:
+      - failedTemplate:
+          errorPattern: "refusing .* copying a library the postgres server itself links"
+  # #287: experimental native HA mechanism selector, rendered with pgvector's own
+  # values + schema (the template is the same symlinked file as pg's, but the schema
+  # enum was added separately to pgvector/values.schema.json -- confirm it's really
+  # there, not just copy-pasted into pg's).
+  - it: mechanism native renders the MECHANISM env
+    set:
+      repmgr.agent.mechanism: native
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].env
+          content:
+            name: MECHANISM
+            value: "native"
+          any: true
+
+  - it: bogus mechanism value is rejected by the schema
+    set:
+      repmgr.agent.mechanism: patroni
+    asserts:
+      - failedTemplate: {}
+
+  # --- #293: repmgr must never be preloaded under the native mechanism ---
+  # shared_preload_libraries is persisted INSIDE the data directory by the image entrypoint
+  # and cloned to every standby, so once the repmgr-free image ships (#290) a cluster still
+  # asking for repmgr.so crash-loops every pod at once -- and helm rollback cannot fix it,
+  # because the line is in PGDATA, not the release. An operator-declared value is the one
+  # remaining path: it loads via conf.d's include_dir and OVERRIDES the image's native gate.
+  - it: an operator-preloaded repmgr under mechanism native is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.agent.mechanism: native
+      postgresql.configuration.shared_preload_libraries: repmgr,pgsodium
+    asserts:
+      - failedTemplate:
+          errorPattern: 'includes "repmgr" \(got "repmgr,pgsodium"\)'
+
+  # The positive (renders fine) cases live in pg's suite and in pg/tests/test-template.sh, for
+  # the single-template include reason noted above.
+
+  # #291 review: client-go needs leaseDuration > renewDeadline > retryPeriod, and until 2.0.0
+  # nothing checked it at render time -- so an alias mixture across two values files could
+  # render clean and then CrashLoopBackOff every pod at once.
+  - it: a lease triple that violates the client-go ordering fails fast
+    set:
+      ha.agent.leaseDuration: 15s
+      ha.agent.renewDeadline: 20s
+      ha.agent.retryPeriod: 4s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'leaseDuration > renewDeadline > retryPeriod'
+
+  # Equal is not greater -- the boundary case client-go also rejects.
+  - it: equal leaseDuration and renewDeadline fails fast
+    set:
+      ha.agent.leaseDuration: 10s
+      ha.agent.renewDeadline: 10s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'leaseDuration > renewDeadline > retryPeriod'
+
+  # #291 review: skipping validation on an unparseable duration was the original bug -- Go's
+  # time.ParseDuration rejects a unit-less value, so the agent refuses to start and every pod
+  # CrashLoopBackOffs after a clean render.
+  - it: a leaseDuration with no unit fails fast
+    set:
+      ha.agent.leaseDuration: "15"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # The etcd lease TTL is whole seconds, so config.go imposes a 5s floor the ordering check
+  # alone does not catch.
+  - it: an etcd DCS lease below the 5s floor fails fast
+    set:
+      etcd.enabled: true
+      ha.agent.dcs.backend: etcd
+      ha.agent.leaseDuration: 3s
+      ha.agent.renewDeadline: 2s
+      ha.agent.retryPeriod: 1s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'requires at least 5s'
+
+  # #291 review: Go's duration units are case-SENSITIVE, and a `lower` in the parser used to
+  # let "15S" through -- clean render, then time.ParseDuration fails and every pod dies.
+  - it: an upper-case duration unit fails fast
+    set:
+      ha.agent.leaseDuration: "15S"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # `| default "15s"` validated the default while the StatefulSet emitted the empty string.
+  - it: an explicitly empty duration fails fast
+    set:
+      ha.agent.renewDeadline: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # reconcileInterval is parsed by the same config.Load helper but is not in the ordering check.
+  - it: an unparseable reconcileInterval fails fast
+    set:
+      ha.agent.reconcileInterval: "15"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # The bundled etcd's RBAC-bootstrap Job runs the agent binary, so its image must track
+  # ha.image or one build writes the RBAC another build authenticates against.
+  - it: an etcd bootstrapImage drifting from ha.image fails fast
+    set:
+      etcd.enabled: true
+      ha.agent.dcs.backend: etcd
+      ha.image.tag: 2.1.0-pg18
+    asserts:
+      - failedTemplate:
+          errorPattern: 'must match ha.image'

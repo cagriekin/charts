@@ -3,22 +3,100 @@ release:
   name: test-pg
 tests:
   # --- Scenario 9: schema enum guards ---
-  - it: invalid failoverMode is rejected
-    templates:
-      - templates/statefulset.yaml
-    set:
-      repmgr.failoverMode: bogus
-    asserts:
-      - failedTemplate: {}
-
   - it: invalid agent dcs backend is rejected
     templates:
       - templates/statefulset.yaml
     set:
-      repmgr.failoverMode: agent
       repmgr.agent.dcs.backend: zookeeper
     asserts:
       - failedTemplate: {}
+
+  # --- #286: the removed repmgrd keys fail the render rather than being ignored ---
+  - it: repmgr.failoverMode=repmgrd is rejected and warns about the immutable field
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.failoverMode: repmgrd
+    asserts:
+      - failedTemplate:
+          errorPattern: 'failoverMode \(ha\.failoverMode / repmgr\.failoverMode\) was removed in chart 2\.0\.0.*IMMUTABLE'
+
+  - it: repmgr.failoverMode=agent is rejected as a no-op key
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.failoverMode: agent
+    asserts:
+      - failedTemplate:
+          errorPattern: 'failoverMode \(ha\.failoverMode / repmgr\.failoverMode\) was removed in chart 2\.0\.0'
+
+  - it: repmgr.serviceUpdater is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.serviceUpdater.resources.requests.cpu: 50m
+    asserts:
+      - failedTemplate:
+          errorPattern: 'serviceUpdater\.\* \(ha\.serviceUpdater / repmgr\.serviceUpdater\) was removed in chart 2\.0\.0'
+
+  - it: repmgr.monitoringHistoryDays is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.monitoringHistoryDays: 7
+    asserts:
+      - failedTemplate:
+          errorPattern: 'monitoringHistoryDays \(ha\.monitoringHistoryDays / repmgr\.monitoringHistoryDays\) was removed in chart 2\.0\.0'
+
+  - it: repmgr.splitBrainDetection is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.splitBrainDetection.action: fence
+    asserts:
+      - failedTemplate:
+          errorPattern: 'splitBrainDetection \(ha\.splitBrainDetection / repmgr\.splitBrainDetection\) was removed in chart 2\.0\.0'
+
+  - it: renewDeadline <= 1.2x retryPeriod is rejected (client-go jitter bound)
+    templates:
+      - templates/statefulset.yaml
+    set:
+      ha.agent.renewDeadline: 12s
+      ha.agent.retryPeriod: 10s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'requires renewDeadline > 1\.2 x retryPeriod'
+
+  - it: standalone is not blocked by a leftover lease timing
+    templates:
+      - templates/statefulset.yaml
+    set:
+      ha.enabled: false
+      postgresql.replicaCount: 0
+      ha.agent.leaseDuration: 5s
+      ha.agent.renewDeadline: 10s
+      ha.agent.retryPeriod: 2s
+    asserts:
+      - hasDocuments:
+          count: 1
+
+  - it: a 1.x trixie-* HA image tag is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      ha.image.tag: trixie-5.5.0-33
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is a 1\.x image tag .*chart 2\.0\.0 cannot run it'
+
+  - it: pgpool.autoFailback is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      pgpool.autoFailback: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "pgpool.autoFailback was removed in chart 2.0.0"
 
   # --- Scenario 10: standalone replica guard ---
   - it: standalone with replicas > 0 fails fast
@@ -29,7 +107,7 @@ tests:
       postgresql.replicaCount: 1
     asserts:
       - failedTemplate:
-          errorMessage: "postgresql.replicaCount > 0 requires repmgr.enabled=true: with repmgr disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode or enable repmgr"
+          errorMessage: "postgresql.replicaCount > 0 requires ha.enabled=true: with HA disabled the chart would run replicaCount+1 independent PostgreSQL instances with no replication between them. Set postgresql.replicaCount=0 for standalone mode, or ha.enabled=true"
 
   - it: standalone with replicaCount 0 renders
     templates:
@@ -52,7 +130,7 @@ tests:
       postgresql.replicaCount: 0
     asserts:
       - failedTemplate:
-          errorMessage: "pgbackrest.enabled requires repmgr.enabled=true: the pgbackrest binary and the archive_command run inside the postgresql container, which in standalone mode is the official postgres image without pgbackrest. WAL archiving would fail on every segment (unbounded WAL growth) and backups would time out. Enable repmgr, or disable pgbackrest"
+          errorMessage: "pgbackrest.enabled requires ha.enabled=true: the pgbackrest binary and the archive_command run inside the postgresql container, which in standalone mode is the official postgres image without pgbackrest. WAL archiving would fail on every segment (unbounded WAL growth) and backups would time out. Set ha.enabled=true, or disable pgbackrest"
 
   # --- Scenario 12: pgbackrest S3 secret name is required on every ref (#213) ---
   - it: empty pgbackrest.existingSecret.name with keyType=shared fails render
@@ -113,16 +191,20 @@ tests:
           emptyDir: {}
     asserts:
       - failedTemplate:
-          errorMessage: 'postgresql.extraVolumes[0]: "data" is a chart-managed volume name and may not be reused (reserved: data, postgresql-config, postgresql-tls, ext-lib, ext-share, ext-extra-lib, repmgr-config, etcd-tls, pg-run, pgbackrest-config, service-updater-script). With persistence enabled a "data" volume is silently discarded in favour of the volumeClaimTemplate; with persistence disabled the duplicate name is rejected by the API server. Pick a distinct name.'
+          errorMessage: 'postgresql.extraVolumes[0]: "data" is a chart-managed volume name and may not be reused (reserved: data, postgresql-config, postgresql-tls, ext-lib, ext-share, ext-extra-lib, etcd-tls, agent-control-tls, pg-run, pgbackrest-config, pgbackrest-bootstrap-script). With persistence enabled a "data" volume is silently discarded in favour of the volumeClaimTemplate; with persistence disabled the duplicate name is rejected by the API server. Pick a distinct name.'
 
-  - it: extraVolumes colliding with an internal volume (repmgr-config) fails render
+  # postgresql-config, not repmgr-config (#298 review): the repmgr-config volume went with
+  # repmgrd, so reserving its name refused an operator a name no render can collide with.
+  # The guard still has to cover a NON-data internal volume, hence a name the chart really
+  # does mount.
+  - it: extraVolumes colliding with an internal volume (postgresql-config) fails render
     templates:
       - templates/statefulset.yaml
     values:
       - ../values-minimal.yaml
     set:
       postgresql.extraVolumes:
-        - name: repmgr-config
+        - name: postgresql-config
           emptyDir: {}
     asserts:
       - failedTemplate: {}
@@ -836,3 +918,165 @@ tests:
           mountPath: /shared
     asserts:
       - failedTemplate: {}
+
+  # --- #293: repmgr must never be preloaded under the native mechanism ---
+  # shared_preload_libraries is persisted INSIDE the data directory by the image entrypoint
+  # and cloned to every standby, so once the repmgr-free image ships (#290) a cluster still
+  # asking for repmgr.so crash-loops every pod at once -- and helm rollback cannot fix it,
+  # because the line is in PGDATA, not the release. #288 stopped the chart emitting it under
+  # native; this guard closes the one remaining path, an operator-declared value, which loads
+  # via conf.d's include_dir and therefore OVERRIDES the image's own native gate.
+  - it: an operator-preloaded repmgr under mechanism native is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.agent.mechanism: native
+      postgresql.configuration.shared_preload_libraries: repmgr,pgsodium
+    asserts:
+      - failedTemplate:
+          errorPattern: 'includes "repmgr" \(got "repmgr,pgsodium"\)'
+
+  # The "legitimate under the repmgr mechanism" counterpart went with the mechanism (#294):
+  # there is no configuration in which the chart preloads repmgr, so asking for it is always
+  # the #290 hazard the guard exists for.
+  - it: an operator list without repmgr still renders
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.configuration.shared_preload_libraries: pgsodium
+    asserts:
+      - hasDocuments:
+          count: 1
+
+  # #294: the removed mechanism is refused by name, with a message that says it was REMOVED
+  # rather than mistyped -- values.schema.json still accepts the value so this speaks first.
+  - it: mechanism repmgr is rejected with a message naming the migration
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.agent.mechanism: repmgr
+    asserts:
+      - failedTemplate:
+          errorPattern: 'was removed in chart 2\.0\.0 \(#294\)'
+
+  # #291 review: client-go needs leaseDuration > renewDeadline > retryPeriod, and until 2.0.0
+  # nothing checked it at render time -- so an alias mixture across two values files could
+  # render clean and then CrashLoopBackOff every pod at once.
+  - it: a lease triple that violates the client-go ordering fails fast
+    set:
+      ha.agent.leaseDuration: 15s
+      ha.agent.renewDeadline: 20s
+      ha.agent.retryPeriod: 4s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'leaseDuration > renewDeadline > retryPeriod'
+
+  # Equal is not greater -- the boundary case client-go also rejects.
+  - it: equal leaseDuration and renewDeadline fails fast
+    set:
+      ha.agent.leaseDuration: 10s
+      ha.agent.renewDeadline: 10s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'leaseDuration > renewDeadline > retryPeriod'
+
+  # #291 review: skipping validation on an unparseable duration was the original bug -- Go's
+  # time.ParseDuration rejects a unit-less value, so the agent refuses to start and every pod
+  # CrashLoopBackOffs after a clean render.
+  - it: a leaseDuration with no unit fails fast
+    set:
+      ha.agent.leaseDuration: "15"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # The etcd lease TTL is whole seconds, so config.go imposes a 5s floor the ordering check
+  # alone does not catch.
+  - it: an etcd DCS lease below the 5s floor fails fast
+    set:
+      etcd.enabled: true
+      ha.agent.dcs.backend: etcd
+      ha.agent.leaseDuration: 3s
+      ha.agent.renewDeadline: 2s
+      ha.agent.retryPeriod: 1s
+    asserts:
+      - failedTemplate:
+          errorPattern: 'requires at least 5s'
+
+  # #291 review: Go's duration units are case-SENSITIVE, and a `lower` in the parser used to
+  # let "15S" through -- clean render, then time.ParseDuration fails and every pod dies.
+  - it: an upper-case duration unit fails fast
+    set:
+      ha.agent.leaseDuration: "15S"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # `| default "15s"` validated the default while the StatefulSet emitted the empty string.
+  - it: an explicitly empty duration fails fast
+    set:
+      ha.agent.renewDeadline: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # reconcileInterval is parsed by the same config.Load helper but is not in the ordering check.
+  - it: an unparseable reconcileInterval fails fast
+    set:
+      ha.agent.reconcileInterval: "15"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'is not a Go duration'
+
+  # The bundled etcd's RBAC-bootstrap Job runs the agent binary, so its image must track
+  # ha.image or one build writes the RBAC another build authenticates against.
+  - it: an etcd bootstrapImage drifting from ha.image fails fast
+    set:
+      etcd.enabled: true
+      ha.agent.dcs.backend: etcd
+      ha.image.tag: 2.1.0-pg18
+    asserts:
+      - failedTemplate:
+          errorPattern: 'must match ha.image'
+
+  # --- #298 security review: new fail-fast guards ---
+  # postgresql.pgHba entries are inserted verbatim into a shell postStart hook and pg_hba.conf;
+  # a single quote or newline corrupts the hook or mangles the file. Rejected at render time
+  # (the schema forbids the quote too; pg.validatePgHba is the authoritative backstop).
+  - it: a postgresql.pgHba entry with a single quote is rejected
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.pgHba:
+        - "host all all 10.0.0.0/8 scram-sha-256' -- x"
+    asserts:
+      - failedTemplate: {}
+
+  # Security keys may not be carried on the deprecated repmgr.* alias: it overwrites ha.*
+  # even over --set, so a stale value would silently downgrade the control.
+  - it: podCidr via the repmgr.* alias is refused
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.agent.podCidr: 10.0.0.0/8
+    asserts:
+      - failedTemplate:
+          errorPattern: 'repmgr\.agent\.podCidr is set via the deprecated repmgr\.\* alias'
+
+  - it: control.restore.admissionPolicy.enabled via the repmgr.* alias is refused
+    templates:
+      - templates/statefulset.yaml
+    set:
+      repmgr.agent.control.restore.admissionPolicy.enabled: false
+    asserts:
+      - failedTemplate:
+          errorPattern: 'set via the deprecated repmgr\.\* alias'
+
+  # The same key under ha.* renders (the canonical path).
+  - it: podCidr under ha.* renders
+    templates:
+      - templates/statefulset.yaml
+    set:
+      ha.agent.podCidr: 10.0.0.0/8
+    asserts:
+      - notFailedTemplate: {}

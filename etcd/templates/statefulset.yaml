@@ -63,7 +63,19 @@ spec:
         {{- end }}
       containers:
         - name: etcd
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}{{ with .Values.image.digest }}@{{ . }}{{ end }}"
+          {{- /* Through etcd.image, which is also what templates/rbac-bootstrap-job.yaml
+                 renders (#298 review). The SERVER image carries the same digest-only shape:
+                 its values comment offers the digest as the pin that "takes precedence over
+                 the tag", so `--set image.tag=""` with the shipped digest is a reference an
+                 operator can reasonably ask for -- and the unconditional `repository ":" tag`
+                 rendered `quay.io/coreos/etcd:@sha256:...`, which the kubelet rejects as
+                 InvalidImageName. All three etcd pods then never start, so the agent's DCS is
+                 gone, no node wins the lease and the release comes up with no primary. Fixing
+                 only the bootstrap Job's copy of this expression left the larger blast radius
+                 in place -- hence one helper rather than two copies, which also refuses the
+                 `tag: "" digest: ""` pair that omitting an empty tag would otherwise turn into
+                 a silent implicit :latest. */}}
+          image: {{ include "etcd.image" .Values.image | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}

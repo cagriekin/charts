@@ -1,4 +1,5 @@
-{{- if .Values.repmgr.enabled }}
+{{- include "pg.normalizeValues" . -}}
+{{- if .Values.ha.enabled }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -35,12 +36,13 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["list"]
-  {{- /* get/patch (pg-role labeling for the readonly Service) and, only in repmgrd
-         fence mode, delete (split-brain fencing by the service-updater) are scoped
-         to the chart's own StatefulSet pods <fullname>-0..N, so a leaked SA token
-         cannot patch or delete arbitrary namespace pods. delete is withheld unless
-         splitBrainDetection.action=fence (#154); agent mode never gets it -- the
-         agent soft-fences locally via pg_ctl and never deletes a pod. */}}
+  {{- /* get/patch (pg-role labeling for the readonly Service) are scoped to the chart's
+         own StatefulSet pods <fullname>-0..N, so a leaked SA token cannot patch
+         arbitrary namespace pods. There is deliberately no `delete`: it was only ever
+         granted to the repmgrd-mode service-updater for split-brain fencing (#154), and
+         with repmgrd gone (#286) nothing in the chart deletes a pod -- the agent
+         soft-fences locally via pg_ctl. (ha.splitBrainDetection, which once named a
+         log/fence choice here, was removed in 2.0.0 -- the demote is unconditional.) */}}
   - apiGroups: [""]
     resources: ["pods"]
     resourceNames:
@@ -50,9 +52,6 @@ rules:
     verbs:
       - "get"
       - "patch"
-      {{- if and (eq (include "pg.repmgrdMode" .) "true") (eq .Values.repmgr.splitBrainDetection.action "fence") }}
-      - "delete"
-      {{- end }}
 {{- if eq (include "pg.agentMode" .) "true" }}
   # Durable primary marker (<fullname>-primary): the agent records the highest
   # timeline here (#125) via Get -> Create-if-absent -> Update. get/update are
@@ -84,7 +83,7 @@ rules:
   # release's image running this release's restore command, its security contexts, volumes
   # and Secrets, and a single pod. It renders under the same pg.controlRestoreEnabled
   # condition as this grant, and dropping it requires setting
-  # repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded=true, which the
+  # ha.agent.control.restore.admissionPolicy.acknowledgeUnbounded=true, which the
   # render otherwise refuses.
   #
   # So this rule CAN still exist without that policy -- deliberately, for clusters below
@@ -95,9 +94,9 @@ rules:
   # do not infer it from the presence of this rule.
   #
   # Narrowing it further: the grant is rendered ONLY under
-  # repmgr.agent.control.restore.enabled (default false, so a normal install's Role is
+  # ha.agent.control.restore.enabled (default false, so a normal install's Role is
   # unchanged), the API additionally requires a client certificate whose CN is on
-  # repmgr.agent.control.restore.allowedClientCNs, and the Job the agent creates is a
+  # ha.agent.control.restore.allowedClientCNs, and the Job the agent creates is a
   # verbatim clone of the CronJob below rather than a spec it composes. The equivalent
   # kubectl path (`kubectl create job --from=cronjob/...`) needs none of this.
   #
@@ -115,7 +114,7 @@ rules:
     resources: ["jobs"]
     resourceNames: ["{{ include "pg.fullname" . }}-pgbackrest-restore-api"]
     verbs: ["get", "delete"]
-{{- if .Values.repmgr.agent.control.restore.readPodLogs }}
+{{- if .Values.ha.agent.control.restore.readPodLogs }}
   # Live file-copy progress by tailing the restore pod's log. The Job's pod name is
   # generated, so this cannot be resourceName-scoped either: it grants log read for
   # EVERY pod in the namespace, and logs are where other workloads leak secrets. Off
@@ -128,39 +127,20 @@ rules:
 {{- end }}
 {{- if ne (include "pg.agentEtcdMode" .) "true" }}
   # Lease <fullname>-leader is the sole leadership authority (client-go
-  # leaderelection): get/update/patch scoped to that name, create unscoped. With the
-  # etcd DCS backend leadership lives in etcd, not the apiserver, so this grant is
-  # dropped (least privilege); routing still uses the services/pods grants above.
+  # leaderelection): get/update scoped to that name, create unscoped. No "patch":
+  # client-go's LeaseLock renews/adopts with Get+Update only, so the verb was pure
+  # attack surface on the token mounted beside a PostgreSQL that runs user SQL
+  # (#298 review). With the etcd DCS backend leadership lives in etcd, not the
+  # apiserver, so this grant is dropped (least privilege); routing still uses the
+  # services/pods grants above.
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     resourceNames: ["{{ include "pg.fullname" . }}-leader"]
-    verbs: ["get", "update", "patch"]
+    verbs: ["get", "update"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["create"]
 {{- end }}
-{{- else }}
-  # core/v1 Events emitted by service-updater on primary failover.
-  # resourceNames cannot restrict create: the object name is not known at
-  # authorization time. Agent mode does not emit Events, so this is repmgrd-only.
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create"]
-  # Durable primary marker (<fullname>-primary): the service-updater records the
-  # highest-timeline primary here so a node booting first under OrderedReady can
-  # tell it is stale (#125). create cannot be resourceName-scoped; the chart only
-  # ever touches the one marker name.
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "create", "patch"]
-{{- end }}
-{{- if and .Values.pgpool.enabled (eq (include "pg.repmgrdMode" .) "true") }}
-  {{- /* repmgrd mode restarts pgpool on failover; the agent fronts the Services
-         instead, so this grant is dropped in agent mode. */}}
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    resourceNames: ["{{ include "pg.fullname" . }}-pgpool"]
-    verbs: ["get", "patch"]
 {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

@@ -51,6 +51,13 @@ assert_eq "test certs generated (CA + server + client)" "ok" "${certs_ok}"
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 helm uninstall "${RELEASE}" -n "${NAMESPACE}" 2>/dev/null || true
 kubectl delete pvc -n "${NAMESPACE}" --all --wait=false 2>/dev/null || true
+# Agent-created state is not chart-owned and survives helm uninstall: a stale primary
+# marker makes the next holder refuse initdb over fresh PVCs (#170's guard -- correct in
+# production, where empty data plus a marker means PVC loss, but a deadlock on a suite
+# rerun into a dirty namespace), and a stale lease parks leadership on a not-yet-recreated
+# identity for a lease term. Clear both alongside the PVCs (#298 review, observed live).
+kubectl delete configmap "${FULLNAME}-primary" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
+kubectl delete lease "${FULLNAME}-leader" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
 kubectl delete configmap "${FULLNAME}-primary" -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || true
 for s in postgresql-tls pgpool-tls pgpool-backend-tls client-tls; do
   kubectl delete secret "${s}" -n "${NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
@@ -178,28 +185,6 @@ if [[ "${promoted}" == "true" ]]; then
 fi
 
 # ======================================================================
-# repmgrd mode: optional server TLS (ssl=on). require/mTLS is render-guarded
-# off in repmgrd; this proves the server-TLS conf.d path works there too.
-# ======================================================================
-RELEASE2="pgtlsr"; NS2="${NAMESPACE}-repmgrd"
-F2=$(resolve_fullname "${RELEASE2}" "${CHART_DIR}" "${SCRIPT_DIR}/values-agent.yaml")
-kubectl create namespace "${NS2}" --dry-run=client -o yaml | kubectl apply -f -
-kubectl delete secret postgresql-tls -n "${NS2}" --ignore-not-found >/dev/null 2>&1 || true
-kubectl create secret generic postgresql-tls -n "${NS2}" \
-  --from-file=tls.crt="${CERTDIR}/server.crt" --from-file=tls.key="${CERTDIR}/server.key" \
-  --from-file=ca.crt="${CERTDIR}/ca.crt" >/dev/null
-helm upgrade --install "${RELEASE2}" "${CHART_DIR}" -n "${NS2}" \
-  -f "${SCRIPT_DIR}/values-agent.yaml" \
-  --set repmgr.failoverMode=repmgrd \
-  --set repmgr.image.tag=trixie-5.5.0-26 `# set-pg-major: keep (repmgrd on an older released image)` \
-  --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=postgresql-tls \
-  --wait --timeout 10m
-wait_for_pods_ready "${NS2}" "app.kubernetes.io/component=postgresql" 2 600
-ssl_r=$(pg_exec "${NS2}" "${F2}-0" "SHOW ssl" "testuser" "testdb" 2>/dev/null || echo "")
-[ "${ssl_r}" != "on" ] && ssl_r=$(pg_exec "${NS2}" "${F2}-1" "SHOW ssl" "testuser" "testdb" 2>/dev/null || echo "")
-assert_eq "#110 repmgrd: optional server TLS works (ssl = on)" "on" "${ssl_r}"
-
-# ======================================================================
 # Standalone (repmgr off, replicaCount 0): server TLS over the conf.d include with NO
 # repmgr/agent. Exercises the volumes:/annotations: gate fix live -- the cert volume must
 # render alongside its mount and the single postgres pod must start with ssl=on.
@@ -219,6 +204,52 @@ helm upgrade --install "${RELEASE3}" "${CHART_DIR}" -n "${NS3}" \
 wait_for_pods_ready "${NS3}" "app.kubernetes.io/component=postgresql" 1 300
 ssl_s=$(pg_exec "${NS3}" "${F3}-0" "SHOW ssl" "testuser" "testdb" 2>/dev/null || echo "")
 assert_eq "#110 standalone: server TLS works with no repmgr (ssl = on)" "on" "${ssl_s}"
+
+# ======================================================================
+# #335: a server that stops speaking TLS must stop serving clients.
+# ======================================================================
+# The reported failure was silent -- Ready pod, mounted certificate, `ssl = off`. The remedy
+# is a readiness probe that asks the server itself, so this drives the server to the broken
+# state and asserts the pod actually leaves the Services. Run here, on the STANDALONE release:
+# it is a single pod with no replication and no `require`, so turning ssl off cannot wedge a
+# cluster mid-suite the way it would on the HA pair above (there, `require` renders hostssl
+# rules that would reject the standby's own replication connection). ALTER SYSTEM + reload,
+# not an image or values change, because `ssl` is a sighup parameter -- no restart, and the
+# same one-line undo puts it back.
+SA_POD="${F3}-0"
+pod_ready() {
+  kubectl get pod "$1" -n "$2" -o jsonpath='{.status.containerStatuses[?(@.name=="postgresql")].ready}' 2>/dev/null || echo ""
+}
+# As $POSTGRES_USER, not `postgres` (#298, found by the first live run). A standalone install's
+# superuser is whatever postgresql.username is -- `testuser` in this suite's values -- and the
+# role `postgres` does not exist at all. Both statements therefore failed with `role "postgres"
+# does not exist`, `|| true` swallowed it, ssl stayed ON, and the assertion below then failed
+# for a server that was behaving correctly. The failure is no longer swallowed: if the flip does
+# not happen there is nothing to assert, and saying so beats a red herring pointing at #335.
+if ! kubectl exec -n "${NS3}" "${SA_POD}" -c postgresql -- bash -c \
+     'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "ALTER SYSTEM SET ssl = off" \
+      && psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_reload_conf()"' >/dev/null 2>&1; then
+  fail "#335: could not turn ssl off to set up the test" "the plaintext-readiness assertion below would prove nothing"
+fi
+# periodSeconds 10 x failureThreshold 6 on chart defaults, so allow generously past 60s.
+went_notready=false; e=0
+while [[ ${e} -lt 150 ]]; do
+  [[ "$(pod_ready "${SA_POD}" "${NS3}")" == "false" ]] && { went_notready=true; break; }
+  sleep 5; e=$((e + 5))
+done
+assert_eq "#335: a server serving plaintext is taken out of the Services" "true" "${went_notready}"
+# ...and recovers on its own once TLS is back, so the gate cannot strand a repaired cluster.
+# Undone as $POSTGRES_USER for the same reason as the flip above (#298).
+kubectl exec -n "${NS3}" "${SA_POD}" -c postgresql -- \
+  bash -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "ALTER SYSTEM RESET ssl"' >/dev/null 2>&1 || true
+kubectl exec -n "${NS3}" "${SA_POD}" -c postgresql -- \
+  bash -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_reload_conf()"' >/dev/null 2>&1 || true
+recovered=false; e=0
+while [[ ${e} -lt 120 ]]; do
+  [[ "$(pod_ready "${SA_POD}" "${NS3}")" == "true" ]] && { recovered=true; break; }
+  sleep 5; e=$((e + 5))
+done
+assert_eq "#335: readiness returns once the server speaks TLS again" "true" "${recovered}"
 
 # Coverage boundary (logged, not silently skipped): pgpool.tls.backendClientCert is
 # render-verified (PGSSLCERT/PGSSLKEY env + staged cert) but not exercised end-to-end

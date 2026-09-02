@@ -1,9 +1,10 @@
+{{- include "pg.normalizeValues" . -}}
 {{- $primaryPod := printf "%s-0" (include "pg.fullname" .) }}
-{{- if .Values.repmgr.enabled }}
-{{- /* Preserve the live primary selector across upgrades: the service-updater
-       sidecar repoints pod-name after failover, and re-rendering the
-       hardcoded pod-0 would route writes to a read-only standby until the
-       next updater tick -- and under helm v4 server-side apply fails the
+{{- if .Values.ha.enabled }}
+{{- /* Preserve the live primary selector across upgrades: the agent repoints
+       pod-name after failover, and re-rendering the hardcoded pod-0 would
+       route writes to a read-only standby until the next reconcile tick
+       -- and under helm v4 server-side apply fails the
        upgrade outright with a field-manager conflict on .spec.selector.
        lookup returns nothing under helm template/--dry-run, where the
        pod-0 bootstrap default applies (same caveat as secret.yaml). */}}

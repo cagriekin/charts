@@ -18,10 +18,19 @@ begin_suite "Special-character credentials (existingSecret, pgpool + exporter)"
 
 kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
 
+# monitoring-password is part of the BYO secret, not an afterthought (#298, found by the first
+# live run). prometheusExporter is enabled in this fixture, and postgresql.existingSecret's
+# monitoringPasswordKey DEFAULTS to `monitoring-password` -- so the helper's `required` guard is
+# satisfied by the default and the render is clean, while the exporter's init container then asks
+# this Secret for a key it does not have. That fails at APPLY time
+# (Init:CreateContainerConfigError), so `helm --wait` sat for its full timeout and the suite died
+# before its first assertion. It gets the special-character password too, which is the point of
+# the suite: the monitoring credential goes through the same substitution as the others.
 kubectl create secret generic pg-special-creds -n "${NAMESPACE}" \
   --from-literal=username=testuser \
   --from-literal=password="${SPECIAL_PASSWORD}" \
   --from-literal=database=testdb \
+  --from-literal=monitoring-password="${SPECIAL_PASSWORD}" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
@@ -53,10 +62,17 @@ assert_eq "query through pgpool with special-char password" "1" "${via_pgpool}"
 
 # Exporter scrape: validates the percent-encoded DSN file and the
 # quote-doubled postgres_exporter.yml
-exporter_svc="${FULLNAME}-postgres-exporter.${NAMESPACE}.svc.cluster.local"
-pg_up=$(kubectl run "special-metrics-$(date +%s)" -n "${NAMESPACE}" --rm -i --restart=Never \
-  --image=busybox:1.37 -- wget -qO- "http://${exporter_svc}:9116/metrics" 2>/dev/null \
-  | grep '^pg_up' || echo "")
+# Scraped from the already-running pod over bash's /dev/tcp, not from a throwaway
+# `kubectl run --image=busybox` (#298, found by the first live run; same fix as test-full.sh).
+# That pod needs an image the cluster may not be able to pull, and the `2>/dev/null || echo ""`
+# turned a failed fetch into an empty string -- indistinguishable here from an exporter that
+# cannot authenticate, which is exactly what this suite is trying to detect.
+exporter_svc="${FULLNAME}-postgres-exporter"
+pg_up=$(kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- bash -c \
+  "exec 3<>/dev/tcp/${exporter_svc}/9116; printf 'GET /metrics HTTP/1.0\r\n\r\n' >&3; grep '^pg_up' <&3" 2>/dev/null || echo "")
+if [ -z "${pg_up}" ]; then
+  fail "exporter scrape returned nothing" "could not reach ${exporter_svc}:9116 from ${POD}; the assertion below would prove nothing"
+fi
 assert_contains "exporter connects with encoded DSN (pg_up 1)" "${pg_up}" "pg_up 1"
 
 end_suite

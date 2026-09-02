@@ -9,19 +9,60 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
+# shellcheck source=scripts/lib.sh
+source "${REPO_ROOT}/scripts/lib.sh"
+
+require_tool helm "https://helm.sh/docs/intro/install/"
+# The plugin, not a binary: `command -v` cannot see it, so ask helm.
+if ! helm plugin list 2>/dev/null | awk '{print $1}' | grep -qx unittest; then
+  echo "FATAL: the helm-unittest plugin is not installed, so this gate did NOT run." >&2
+  echo "       install: helm plugin install https://github.com/helm-unittest/helm-unittest" >&2
+  echo "       Treat this as a FAILED gate, not a passed one." >&2
+  exit 127
+fi
+
+# pgvector's unit tests must never be a COPY of a pg one under the same name (#298 review).
+# pg/templates and pgvector/templates are byte-identical (enforced by
+# scripts/check-template-parity.sh, run from lint.yaml) and pgvector's are symlinks INTO
+# pg's, so pg's suite already covers every line of shared template logic. A same-named copy in
+# pgvector reads as a mirror while being free to drift, and nothing noticed that guards_test.yaml
+# there held a reworded subset of pg's cases -- 24 of 76. So: share it by SYMLINK, or give it a
+# pgvector-scoped name. Never a same-named copy.
+if [ -d pgvector/tests/unit ] && [ -d pg/tests/unit ]; then
+  for f in pgvector/tests/unit/*_test.yaml; do
+    [ -e "${f}" ] || continue
+    base="$(basename "${f}")"
+    if [ -e "pg/tests/unit/${base}" ] && [ ! -L "${f}" ]; then
+      echo "FATAL: pgvector/tests/unit/${base} is a COPY of pg's file of the same name." >&2
+      echo "       Symlink it (ln -sf ../../../pg/tests/unit/${base} ${f}) if the cases are shared," >&2
+      echo "       or rename it to pgvector_${base} if they are pgvector-specific." >&2
+      exit 1
+    fi
+  done
+fi
 
 rc=0
 ran=0
+charts=0
+failed=0
 for chart_yaml in */Chart.yaml; do
   dir="$(dirname "$chart_yaml")"
   if compgen -G "${dir}/tests/unit/*_test.yaml" >/dev/null; then
     echo "==> helm unittest: ${dir}"
     ran=1
-    helm unittest -f 'tests/unit/*_test.yaml' "${dir}" || rc=1
+    charts=$((charts + 1))
+    if ! helm unittest -f 'tests/unit/*_test.yaml' "${dir}"; then
+      rc=1
+      failed=$((failed + 1))
+    fi
   fi
 done
 
+# No suites found is a FAILURE, not a quiet note (#298 review). This gate exists to run tests;
+# "there were none" means the glob or the layout moved, and reporting success would mean the
+# gate passes loudest exactly when it has stopped testing anything.
 if [ "$ran" -eq 0 ]; then
-  echo "No tests/unit/*_test.yaml suites found" >&2
+  echo "FATAL: no tests/unit/*_test.yaml suites found -- this gate tested NOTHING." >&2
+  rc=1
 fi
-exit "$rc"
+verdict "helm-unittest" "$rc" "$( [ "$rc" -eq 0 ] && echo "${charts} charts" || echo "${failed} of ${charts} charts" )"

@@ -1,3 +1,4 @@
+{{- include "pg.normalizeValues" . -}}
 {{- if .Values.pgpool.enabled }}
 apiVersion: v1
 kind: ConfigMap
@@ -47,15 +48,16 @@ data:
     backend_flag1 = 'DISALLOW_TO_FAILOVER'
     backend_application_name1 = 'readonly'
 {{- end }}
-{{- else if .Values.repmgr.enabled }}
-    {{- range $i := until (int (add .Values.postgresql.replicaCount 1)) }}
-    backend_hostname{{ $i }} = '{{ include "pg.fullname" $ }}-{{ $i }}.{{ include "pg.fullname" $ }}-headless.{{ $.Release.Namespace }}.svc.cluster.local'
-    backend_port{{ $i }} = 5432
-    backend_weight{{ $i }} = 1
-    backend_flag{{ $i }} = 'DISALLOW_TO_FAILOVER'
-    backend_application_name{{ $i }} = 'node{{ $i }}'
-
-    {{- end }}
+{{- /* There is no HA arm between these two any more (#298 review). One rendered a
+       backend_hostname{0..N} list against the per-pod headless DNS -- the repmgrd layout, where
+       pgpool tracked every node because repmgrd moved the primary role between them. It was
+       guarded by `else if .Values.ha.enabled`, and pg.agentMode is now DEFINED as
+       .Values.ha.enabled, so the `if` above consumed every ha.enabled render and that arm could
+       never be taken. Deleted rather than left in place, for the reason the
+       PGHAReplicasNotStreaming comment gives and pg.chartOwnsSharedPreloadLibraries acted on: a
+       branch that cannot render reads as coverage, and is what a maintainer asked to "change the
+       HA pgpool backends" would edit -- to no effect anywhere. The agent fronts the RW/RO
+       Services, so the two-backend layout above IS the HA layout; the else below is standalone. */}}
 {{- else }}
     backend_hostname0 = '{{ include "pg.fullname" . }}-0.{{ include "pg.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local'
     backend_port0 = 5432
@@ -123,7 +125,7 @@ data:
 
     backend_clustering_mode = 'streaming_replication'
 
-{{- if .Values.repmgr.enabled }}
+{{- if .Values.ha.enabled }}
     sr_check_period = 10
     detach_false_primary = off
 {{- else }}
@@ -147,10 +149,6 @@ data:
     failover_command = ''
     failback_command = ''
     fail_over_on_backend_error = {{ if .Values.pgpool.failOverOnBackendError }}on{{ else }}off{{ end }}
-{{- if eq (include "pg.repmgrdMode" .) "true" }}
-    auto_failback = {{ if .Values.pgpool.autoFailback }}on{{ else }}off{{ end }}
-    auto_failback_interval = 30
-{{- end }}
 
     recovery_user = '__POSTGRES_USER__'
     recovery_password = ''

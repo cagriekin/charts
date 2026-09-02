@@ -27,7 +27,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "repmgr.agent.control.restore needs admissionregistration.k8s.io/v1 for the ValidatingAdmissionPolicy that bounds its `create jobs` grant, and this cluster does not expose it -- it is GA from Kubernetes 1.30 (this cluster reports v1.29.0), and can also be disabled by --runtime-config (#279). Upgrade or enable the API, or set repmgr.agent.control.restore.admissionPolicy.enabled=false together with acknowledgeUnbounded=true to run the feature with an unbounded grant deliberately"
+          errorMessage: "ha.agent.control.restore needs admissionregistration.k8s.io/v1 for the ValidatingAdmissionPolicy that bounds its `create jobs` grant, and this cluster does not expose it -- it is GA from Kubernetes 1.30 (this cluster reports v1.29.0), and can also be disabled by --runtime-config (#279). Upgrade or enable the API, or set ha.agent.control.restore.admissionPolicy.enabled=false together with acknowledgeUnbounded=true to run the feature with an unbounded grant deliberately"
 
   # ...and acknowledging the trade is what lets such a cluster run the feature at all. This is
   # the documented path for a pre-1.30 cluster and for a namespace-limited installer.
@@ -35,8 +35,8 @@ tests:
     values:
       - ../values-agent-control-restore.yaml
     set:
-      repmgr.agent.control.restore.admissionPolicy.enabled: false
-      repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
+      ha.agent.control.restore.admissionPolicy.enabled: false
+      ha.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
     templates:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
@@ -49,8 +49,8 @@ tests:
     values:
       - ../values-agent-control-restore.yaml
     set:
-      repmgr.agent.control.restore.admissionPolicy.enabled: false
-      repmgr.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
+      ha.agent.control.restore.admissionPolicy.enabled: false
+      ha.agent.control.restore.admissionPolicy.acknowledgeUnbounded: true
     templates:
       - templates/rbac.yaml
     documentIndex: 1

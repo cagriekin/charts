@@ -1,0 +1,323 @@
+package dcs
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/leaderelection"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
+
+	"github.com/cagriekin/pg-ha-agent/internal/kubecfg"
+)
+
+// K8sConfig parameterizes the Lease-backed lock. The timings map directly to
+// client-go leaderelection; cloud presets widen them (see plan E4).
+type K8sConfig struct {
+	Namespace     string
+	LeaseName     string
+	LeaseDuration time.Duration
+	RenewDeadline time.Duration
+	RetryPeriod   time.Duration
+	// StepDownCooldown is how long a node suppresses re-contention after a
+	// voluntary Release, so a peer wins the freed lease instead of the stepping-down
+	// node immediately re-acquiring it. Defaults to 3*RetryPeriod when zero.
+	StepDownCooldown time.Duration
+}
+
+// K8sDCS implements DCS against a coordination.k8s.io/v1 Lease via client-go
+// leaderelection. It never hand-rolls the lock — leaderelection provides the
+// atomic acquire/renew (resourceVersion CAS) and TTL semantics.
+type K8sDCS struct {
+	cfg      K8sConfig
+	client   kubernetes.Interface
+	isLeader atomic.Bool
+	leader   atomic.Value // string
+
+	mu            sync.Mutex
+	stepDown      context.CancelFunc // cancels the current election iteration (set while contending/leading)
+	cooldownUntil time.Time          // suppress re-contention until this time (set by Release)
+}
+
+// NewK8sDCS builds a K8sDCS from the resolved apiserver config -- KUBECONFIG when
+// set, the in-cluster ServiceAccount otherwise. The Lease lock has to travel the
+// same route as the mutation client: reaching one but not the other elects a leader
+// that cannot publish, or publishes without holding the lease (#317).
+func NewK8sDCS(cfg K8sConfig) (*K8sDCS, error) {
+	rc, err := kubecfg.RESTConfig()
+	if err != nil {
+		return nil, err
+	}
+	cs, err := kubernetes.NewForConfig(rc)
+	if err != nil {
+		return nil, fmt.Errorf("kubernetes client: %w", err)
+	}
+	return NewK8sDCSWithClient(cfg, cs), nil
+}
+
+// NewK8sDCSWithClient builds a K8sDCS with an injected clientset (for tests).
+func NewK8sDCSWithClient(cfg K8sConfig, client kubernetes.Interface) *K8sDCS {
+	k := &K8sDCS{cfg: cfg, client: client}
+	k.leader.Store("")
+	return k
+}
+
+func (k *K8sDCS) IsLeader() bool { return k.isLeader.Load() }
+
+func (k *K8sDCS) Leader() string {
+	s, _ := k.leader.Load().(string)
+	return s
+}
+
+// Run drives leadership until ctx is cancelled. leaderelection.Run returns when
+// leadership is lost; we re-contend in a loop so the agent keeps trying to lead.
+// OnStoppedLeading runs synchronously inside client-go before Run returns, so the
+// OnLost demote completes before any re-acquire — the fence-ordering guarantee.
+//
+// That guarantee is why ReleaseOnCancel is OFF and the Lease is emptied by releaseLease
+// below instead (#298 review). client-go's LeaderElector.Run is
+// `defer Callbacks.OnStoppedLeading(); ...; le.renew(ctx)`, and renew() ends with
+// `if ReleaseOnCancel { le.release() }` — so client-go's release runs BEFORE the deferred
+// OnStoppedLeading, i.e. before cb.OnLost() demotes, inverting the ordering this comment
+// claims. Two concrete failures, both closed by moving the release after Run returns:
+//
+//   - Involuntary loss on chart defaults (15s/10s/2s): connectivity to the apiserver drops,
+//     the renew loop gives up at RenewDeadline, and le.release() then issues a Lease Update
+//     on context.Background() with its OWN RenewDeadline budget — blocking the full 10s
+//     against the unreachable apiserver before OnLost even starts. A peer sees the Lease
+//     stale at LeaseDuration and promotes, so the demote begins ~5s after the peer is
+//     already promoting: the entire LeaseDuration−RenewDeadline safety margin, spent on a
+//     write that was going to fail anyway.
+//   - Voluntary Release: client-go empties the Lease, making it instantly acquirable, and
+//     only THEN demotes — a peer can win and start promoting while this node is still
+//     read-write. (The callers happen to demote first, but the backend must not depend on
+//     that.)
+func (k *K8sDCS) Run(ctx context.Context, identity string, cb Callbacks) {
+	lock := &resourcelock.LeaseLock{
+		LeaseMeta:  metav1.ObjectMeta{Name: k.cfg.LeaseName, Namespace: k.cfg.Namespace},
+		Client:     k.client.CoordinationV1(),
+		LockConfig: resourcelock.ResourceLockConfig{Identity: identity},
+	}
+	lec := leaderelection.LeaderElectionConfig{
+		Lock: lock,
+		// See the ordering note on Run: releaseLease does this AFTER OnStoppedLeading.
+		ReleaseOnCancel: false,
+		LeaseDuration:   k.cfg.LeaseDuration,
+		RenewDeadline:   k.cfg.RenewDeadline,
+		RetryPeriod:     k.cfg.RetryPeriod,
+		Callbacks: leaderelection.LeaderCallbacks{
+			OnStartedLeading: func(c context.Context) {
+				// client-go runs THIS callback on its own goroutine (`go
+				// OnStartedLeading(ctx)` in LeaderElector.Run) while OnStoppedLeading is a
+				// plain defer, so the two stores are unordered: a Release that cancels the
+				// election before this goroutine is scheduled lets it land AFTER the loop
+				// below has already stored false and client-go has emptied the Lease --
+				// latching isLeader true on a node that holds nothing. observe() feeds
+				// IsLeader() straight into Observation.HoldLease, so the node would then
+				// take a holder branch (Promote, read-write StartLocal) against a peer that
+				// genuinely holds the Lease. Gate on the iteration's own context under the
+				// same mutex the loop takes when it clears the flag: cancel() propagates to
+				// this child synchronously, so the callback either wins the lock first (and
+				// the loop's store(false) follows it) or sees c already cancelled.
+				k.mu.Lock()
+				live := c.Err() == nil
+				if live {
+					k.isLeader.Store(true)
+				}
+				k.mu.Unlock()
+				if !live {
+					return
+				}
+				if cb.OnAcquired != nil {
+					cb.OnAcquired(c)
+				}
+			},
+			OnStoppedLeading: func() {
+				k.isLeader.Store(false)
+				// Involuntary loss means client-go could not renew within RenewDeadline.
+				// The two voluntary exits are distinguishable without new state: Release
+				// arms the step-down cooldown BEFORE cancelling the election, and a
+				// shutdown cancels the outer ctx (#298 review).
+				if cb.OnRenewFailure != nil && ctx.Err() == nil {
+					k.mu.Lock()
+					voluntary := time.Now().Before(k.cooldownUntil)
+					k.mu.Unlock()
+					if !voluntary {
+						cb.OnRenewFailure()
+					}
+				}
+				// No longer leader, so stop naming ourselves as the holder. OnNewLeader is
+				// the only other writer of k.leader, and no elector runs during the
+				// step-down cooldown -- so without this a released node kept reporting
+				// ITSELF from Leader() for the whole cooldown (~3x retryPeriod on
+				// defaults, and until the apiserver returns after an involuntary loss).
+				// That value is not inert: observe() feeds it to Observation.LeaderIdentity,
+				// where validPeerName accepts it (it IS a cluster pod name), so Decide's
+				// standby branch returns Follow(self) instead of taking the
+				// LeaderIdentity=="" -> Wait branch that exists for exactly this. The
+				// ex-primary then releases its slot on the REAL primary and repoints
+				// primary_conninfo at itself until a later tick corrects it. Cleared with a
+				// CAS so a successor OnNewLeader already observed is preserved -- the same
+				// shape (and now genuinely symmetric with) EtcdDCS's clear in etcddcs.go.
+				k.leader.CompareAndSwap(identity, "")
+				if cb.OnLost != nil {
+					cb.OnLost() // synchronous: must finish demoting before we re-contend
+				}
+			},
+			OnNewLeader: func(id string) { k.leader.Store(id) },
+		},
+	}
+
+	for ctx.Err() == nil {
+		// A per-iteration context so Release can cancel just this election (releasing
+		// the lease via ReleaseOnCancel) without tearing down the agent.
+		//
+		// Installed BEFORE the cooldown is consulted, not after (#298 review). The old
+		// order left a window in which a step-down was silently dropped: the loop read
+		// cooldownUntil (still zero), and a Release arriving before stepDown was assigned
+		// armed the cooldown but found `cancel == nil` and cancelled nothing -- so this node
+		// walked straight into le.Run and could re-win the very Lease it was handing over,
+		// with the cooldown it had just armed already read and discarded. Assigning first
+		// means every Release either cancels a live election or lands in the one remaining
+		// gap (between clearing stepDown and the next iteration's assignment), which the
+		// re-read below covers.
+		elerCtx, cancel := context.WithCancel(ctx)
+		k.mu.Lock()
+		k.stepDown = cancel
+		until := k.cooldownUntil
+		k.mu.Unlock()
+		// Respect a step-down cooldown so a peer wins a just-released lease before
+		// this node re-contends. A Release DURING this wait cancels elerCtx, so le.Run
+		// returns at once and the next iteration re-reads the newly armed cooldown.
+		if d := time.Until(until); d > 0 {
+			select {
+			case <-ctx.Done():
+				cancel()
+				return
+			case <-time.After(d):
+			}
+		}
+
+		le, err := leaderelection.NewLeaderElector(lec)
+		if err != nil {
+			cancel()
+			// Nothing to retry (the elector is only rejected for invalid config), but
+			// never exit silently: this goroutine is fire-and-forget, so a silent return
+			// left a healthy-looking agent that ticks forever yet never contends for
+			// leadership, with no line anywhere naming the cause (#298 review).
+			// config.Load pre-validates the client-go bounds (including the 1.2x jitter
+			// rule), so reaching this is a should-never-happen.
+			slog.Error("leader election disabled: client-go rejected the election config", "err", err)
+			return
+		}
+		le.Run(elerCtx) // blocks: acquire -> lead -> lose (or Release cancels), then returns
+		// Free the Lease now that OnStoppedLeading (and with it the OnLost demote) has
+		// returned. This is what makes a step-down or a shutdown hand off in milliseconds
+		// instead of at LeaseDuration expiry, and it is safe here in a way client-go's own
+		// ReleaseOnCancel was not, because nothing can acquire until after the demote.
+		k.releaseLease(lock, identity, cb)
+		// cancel() FIRST, and clear the flag under the mutex: both halves pair with the
+		// OnStartedLeading guard above. cancel() marks this iteration's context dead
+		// (synchronously, including the child client-go handed the callback), so a
+		// still-unscheduled OnStartedLeading can no longer set the flag; taking mu around
+		// the store makes the two mutually exclusive rather than merely unlikely.
+		cancel()
+		k.mu.Lock()
+		k.stepDown = nil
+		k.isLeader.Store(false)
+		k.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(k.cfg.RetryPeriod):
+		}
+	}
+}
+
+// releaseLease empties the Lease if this identity still holds it, so a peer's next
+// acquire attempt succeeds immediately rather than waiting out LeaseDuration.
+//
+// Best-effort and bounded on its own context, deliberately NOT the election's: it runs on
+// the shutdown path too, where the agent's ctx is already cancelled, and a DCS that has
+// become unreachable must cost a bounded delay (after which the lease simply expires on
+// TTL, the pre-existing behaviour) rather than hanging the process. Guarded on still being
+// the holder so a lease already won by a peer is never stamped on.
+func (k *K8sDCS) releaseLease(lock *resourcelock.LeaseLock, identity string, cb Callbacks) {
+	budget := k.cfg.RenewDeadline
+	if budget <= 0 {
+		budget = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	rec, _, err := lock.Get(ctx)
+	if err != nil || rec == nil || rec.HolderIdentity != identity {
+		return
+	}
+	// Ask before emptying it (#298 review). "Nothing can acquire until after the demote" --
+	// the reason this release is safe here where client-go's ReleaseOnCancel was not -- holds
+	// only if the demote SUCCEEDED. On the wedged-PV path it does not: Demote returns an
+	// error, OnLost deliberately keeps servingRW set because a read-write postmaster may still
+	// be up, and emptying the Lease then lets a peer acquire and promote within RetryPeriod
+	// beside a live writer. Holding it instead costs a peer the LeaseDuration it would have
+	// waited anyway.
+	//
+	// Consulted AFTER the holder check, not before it (#298 review, round 3). le.Run also
+	// returns for an iteration this node spent as a FOLLOWER -- a shutdown or Release landing
+	// while it was still trying to acquire -- and there is no Lease of ours to hold in that
+	// case. Asking first meant a node with a latched servingRW (the wedged-primary fail-safe)
+	// logged this alarming warning about a Lease a peer had held all along, in the middle of
+	// the incident where the log is being read. Same reason etcd's releaseSession gates its
+	// veto on heldLeadership.
+	//
+	// "HELD" is not "handed off a LeaseDuration later" while this agent lives, and the warning
+	// says so rather than promising an expiry that will not happen (#298 review, round 4).
+	// client-go lets the RECORDED holder re-acquire without waiting out the expiry --
+	// tryAcquireOrRenew's "held and not yet expired" guard is skipped when the fetched record
+	// already names us -- so the next loop iteration (one RetryPeriod away, or one
+	// StepDownCooldown after a Release) wins this same Lease back. That is deliberate and
+	// matches the ReleaseLease action, which likewise returns BEFORE Release() when its Stop
+	// fails: never hand off without proof the writer is dead. The TTL handoff the margin buys
+	// happens when this agent EXITS -- the shutdown path -- or once a peer's acquire beats the
+	// re-contention.
+	if cb.SafeToRelease != nil && !cb.SafeToRelease() {
+		slog.Warn("not releasing the leader Lease: this node may still be a read-write primary (the fence demote did not complete). The Lease is left held -- while this agent runs it re-acquires it as the recorded holder, and a peer takes over only once this node stops renewing (TTL expiry), which preserves the takeover margin",
+			"identity", identity)
+		return
+	}
+	now := metav1.NewTime(time.Now())
+	rec.HolderIdentity = ""
+	rec.LeaseDurationSeconds = 1
+	rec.RenewTime = now
+	rec.AcquireTime = now
+	if err := lock.Update(ctx, *rec); err != nil {
+		slog.Warn("could not release the leader Lease; a peer will acquire it at TTL expiry instead", "err", err)
+	}
+}
+
+// Release voluntarily steps down: it cancels the current election so the Lease is
+// released (see releaseLease), and suppresses re-contention for the
+// step-down cooldown so a peer acquires the freed Lease instead of this node
+// immediately re-winning it. It is non-blocking; OnStoppedLeading (the synchronous
+// demote) runs in the Run goroutine as the election unwinds, and the Lease is freed
+// after it. Safe to call when not
+// leading (it still arms the cooldown). Used by the self-health and stale-winner
+// step-down paths.
+func (k *K8sDCS) Release() {
+	cd := k.cfg.StepDownCooldown
+	if cd <= 0 {
+		cd = 3 * k.cfg.RetryPeriod
+	}
+	k.mu.Lock()
+	k.cooldownUntil = time.Now().Add(cd)
+	cancel := k.stepDown
+	k.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}

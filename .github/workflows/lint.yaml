@@ -82,6 +82,14 @@ jobs:
         if: steps.detect.outputs.run == 'true'
         run: bash scripts/check-vendored-subcharts.sh
 
+      # pg/templates == pgvector/templates (#298 review). Two scripts already justify
+      # rendering pgvector at defaults only by calling this diff "a gate"; until now it was
+      # only a manual step in CLAUDE.md. pgvector has no KinD suites, so the invariant is
+      # what its whole integration coverage rests on.
+      - name: Verify pg/pgvector template parity
+        if: steps.detect.outputs.run == 'true'
+        run: bash scripts/check-template-parity.sh
+
       # Validate rendered manifests against real Kubernetes + CRD OpenAPI schemas (#193).
       - name: Validate rendered manifests (kubeconform)
         if: steps.detect.outputs.run == 'true'

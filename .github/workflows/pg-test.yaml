@@ -55,7 +55,13 @@ jobs:
               render_files=$(printf '%s\n' "$render_files" | grep -vxE 'pg/Chart\.yaml' || true)
             fi
           fi
-          if printf '%s\n' "$render_files" | grep -qE '^(pg/|images/repmgr/|etcd/|\.github/workflows/pg-test\.yaml)'; then
+          # images/pg-extensions/ belongs here for the same reason images/pg-ha/ does: the
+          # chart points at that image via postgresql.extensions.image, and its install paths
+          # are a two-file contract with pg.extensionPrebuiltCopyCommand in _helpers.tpl. Its
+          # only other coverage is pg-ha-image-test.yaml, which is deliberately paths-filtered
+          # and feeds NO required check -- so a PR touching only that directory used to skip the
+          # whole matrix and self-pass pg-tests-passed with nothing blocking the drift.
+          if printf '%s\n' "$render_files" | grep -qE '^(pg/|images/pg-ha/|images/pg-extensions/|etcd/|\.github/workflows/pg-test\.yaml)'; then
             echo "pg=true" >> "$GITHUB_OUTPUT"
           else
             echo "pg=false" >> "$GITHUB_OUTPUT"
@@ -74,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     # Two apt-heavy image builds (one per major, separate cache scopes so each is cold on
     # its first run), two docker saves and three artifact uploads. A timeout here cancels
-    # the job, which skips all 46 suite legs and fails the required gate with no test
+    # the job, which skips all 50 suite legs and fails the required gate with no test
     # signal at all, so it is sized for the cold case rather than the cached one.
     timeout-minutes: 50
     steps:
@@ -118,7 +124,7 @@ jobs:
             docker save "$image" -o "/tmp/base-images/${safe}.tar"
           done
 
-      # The repmgr image is built from source (images/repmgr) so an image change
+      # The repmgr image is built from source (images/pg-ha) so an image change
       # ships and is tested with the chart in one PR. The tag is read from
       # pg/values.yaml so the loaded image satisfies the chart's IfNotPresent pull
       # policy. buildx + the gha cache keeps the apt-heavy build off the critical
@@ -132,28 +138,59 @@ jobs:
       - name: Build repmgr images from source (one per PG major)
         run: |
           set -euo pipefail
-          tag=$(awk '/^repmgr:/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
-          if [ -z "$tag" ]; then echo "could not resolve repmgr image tag from pg/values.yaml" >&2; exit 1; fi
-          # Normalise away a -pgNN suffix, exactly as pg/tests/set-pg-major.sh does when it
-          # rewrites the fixtures. Without this a tree whose chart tag is already suffixed
-          # (someone testing PG17 locally, or a future default flip) would build the PG18
-          # image as "...-pg17" while the switch script points the PG17 fixtures at that
-          # same name -- every PG17 leg would run PostgreSQL 18 and pass.
-          base=${tag%-pg[0-9]*}
-          if [ "$base" != "$tag" ]; then
-            echo "::notice title=pg-major::chart tag ${tag} is major-suffixed; using base ${base} for the per-major builds"
-            tag="$base"
-          fi
+          # Matches BOTH block spellings, same as pg/tests/set-pg-major.sh: #291 renamed the
+          # block to `ha:` and keeps `repmgr:` as a values alias, so the tree can carry either.
+          # Anchoring on one is a hard CI outage, not a soft miss -- the -z guards below exit 1
+          # and every leg of both majors dies before a single suite runs.
+          tag=$(awk '/^(repmgr|ha):/{r=1} r&&/^    tag:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
+          if [ -z "$tag" ]; then echo "could not resolve the HA image tag from pg/values.yaml (looked for tag: under the ha:/repmgr: block)" >&2; exit 1; fi
+          # The image REPOSITORY comes from the chart too, so this keeps building whatever the
+          # chart points at across the #290 rename (cagriekin/repmgr -> cagriekin/pg-ha).
+          repo=$(awk '/^(repmgr|ha):/{r=1} r&&/^    repository:/{gsub(/"/,"",$2); print $2; exit}' pg/values.yaml)
+          if [ -z "$repo" ]; then echo "could not resolve the HA image repository from pg/values.yaml (looked for repository: under the ha:/repmgr: block)" >&2; exit 1; fi
+          # Two tag shapes, exactly as pg/tests/set-pg-major.sh accepts (#290): the chart pin
+          # moves to the new scheme only after the new image is published, so both must work or
+          # that bump breaks CI silently.
+          #
+          #   NEW: <chart-version>-pg<major>   e.g. 2.0.0-pg18 -- substitute the major
+          #   OLD: trixie-<repmgr>-<n>         unsuffixed is PG18, others take -pgNN
+          # (This table said `trixie-pg<major>-<n>` for NEW until #291 review; the classifier
+          #  below keys on a LEADING semver and would have sent that shape to the legacy arm.)
+          #
+          # Getting this wrong is quiet, not loud: building the PG18 image under a "-pg17" name
+          # while set-pg-major points the PG17 fixtures at that name makes every PG17 leg run
+          # PostgreSQL 18 and pass.
+          # Shape `<chart-version>-pg<major>` (e.g. 2.0.0-pg18), keyed on a LEADING semver --
+          # both it and the old trixie-<repmgr>-<n>-pgNN end in -pg<digits>, so a trailing test
+          # would misclassify the legacy suffixed form. Shared verbatim with
+          # pg/tests/set-pg-major.sh; if the two disagree, CI builds one major under the other's
+          # name and every leg of the mismatched major passes while running the wrong server.
+          case "$tag" in
+            [0-9]*.[0-9]*.[0-9]*-pg[0-9]*) scheme=major-in-tag ;;
+            *) scheme=legacy
+               base=${tag%-pg[0-9]*}
+               if [ "$base" != "$tag" ]; then
+                 echo "::notice title=pg-major::chart tag ${tag} is major-suffixed; using base ${base} for the per-major builds"
+                 tag="$base"
+               fi ;;
+          esac
+          echo "::notice title=pg-major::tag scheme=${scheme} repo=${repo} base=${tag}"
           for major in 18 17; do
-            if [ "$major" = "18" ]; then ref="cagriekin/repmgr:${tag}"; else ref="cagriekin/repmgr:${tag}-pg${major}"; fi
-            echo "Building ${ref} (PG_MAJOR=${major}) from images/repmgr"
+            if [ "$scheme" = "major-in-tag" ]; then
+              ref="${repo}:$(printf '%s' "$tag" | sed -E "s/-pg[0-9]+$/-pg${major}/")"
+            elif [ "$major" = "18" ]; then
+              ref="${repo}:${tag}"
+            else
+              ref="${repo}:${tag}-pg${major}"
+            fi
+            echo "Building ${ref} (PG_MAJOR=${major}) from images/pg-ha"
             docker buildx build --load \
               --build-arg "PG_MAJOR=${major}" \
-              --cache-from type=gha,scope=repmgr-image-pg${major} \
-              --cache-to type=gha,mode=max,scope=repmgr-image-pg${major} \
-              -t "$ref" images/repmgr
+              --cache-from type=gha,scope=pg-ha-image-pg${major} \
+              --cache-to type=gha,mode=max,scope=pg-ha-image-pg${major} \
+              -t "$ref" images/pg-ha
             # Own artifact per major (~190MB each): a suite leg needs exactly one, and
-            # with 46 legs bundling both would download a spare 190MB 46 times.
+            # with 50 legs bundling both would download a spare 190MB 50 times.
             mkdir -p "/tmp/kind-images-pg${major}"
             docker save "$ref" -o "/tmp/kind-images-pg${major}/repmgr.tar"
           done
@@ -210,18 +247,25 @@ jobs:
     needs: [changes, build]
     if: needs.changes.outputs.pg == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Per-leg, because migrate-native is in a different class: it installs a RELEASED chart,
+    # upgrades in place, then rolls the StatefulSet a second time to prove idempotence, and the
+    # run step below retries the whole suite once on failure. 30 minutes cannot hold that, and a
+    # timeout kills the required check with no diagnosis (#292 review).
+    timeout-minutes: ${{ matrix.timeout_minutes || 30 }}
     strategy:
       fail-fast: false
       matrix:
         pg_major: ["18", "17"]
+        # #294: the mechanism axis is GONE. It existed for the repmgr-to-native transition
+        # (#288/#295) and carried 11 exclusions to keep the fan-out honest; native is now the
+        # only mechanism, so 25 suites x 2 majors = 50 legs with no exclusions at all. Anything
+        # that reads as mechanism-conditional below is a leftover and should be deleted, not
+        # re-gated.
         suite:
           - minimal
-          - repmgr-failover
           - agent
           - agent-control
           - agent-control-restore
-          - repmgr-chaos
           - full
           - upgrade
           - agent-etcd
@@ -238,10 +282,28 @@ jobs:
           - pgbackrest-restore-ha
           - pgbackrest-bootstrap
           - databases-roles
-          - migrate-agent
           - scaledown
+          # #298 review: both of these existed in pg/Makefile and in no matrix leg, so they ran
+          # only when somebody remembered to. special-chars is the pointed one -- it covers
+          # identifiers and passwords with characters that break SQL, which is exactly the class
+          # of bug #298 found in bootstrap_initdb (an uppercase POSTGRES_USER made the bootstrap
+          # unpassable), and the suite that would have caught it was not wired in.
+          - config
+          - special-chars
+          # #292: starts from the released 1.x chart + an older released image, so unlike every
+          # other leg it is not hermetic against the local tree. It is in the matrix anyway
+          # because the in-place migration is the one path every existing consumer takes, and
+          # a suite that only runs by hand is a suite that rots.
+          - migrate-native
+          # #298 review: the failoverMode:repmgrd -> 2.0.0 upgrade, which is the only path in
+          # this release that recreates a live StatefulSet (--cascade=orphan) and the one every
+          # remaining repmgrd consumer must follow. It had no coverage at all -- migrate-native
+          # covers agent->agent and says so in its own comments. Same class as migrate-native:
+          # not hermetic (pulls a released chart + image) and long, so it gets the same budget.
+          - migrate-repmgrd
         include:
-          - { suite: agent, coldboot: "1" }
+          - { suite: migrate-native, timeout_minutes: 50, no_retry: "1" }
+          - { suite: migrate-repmgrd, timeout_minutes: 50, no_retry: "1" }
     steps:
       - name: Free up runner disk space
         run: |
@@ -285,6 +347,45 @@ jobs:
             kind load image-archive "$tarball" --name pg-test
           done
 
+      # The two migration suites alone start from an older RELEASED image, and it is deliberately NOT in
+      # pg/tests/ci-base-images.txt: that list is bundled into every leg, so adding a ~200MB
+      # image there would ship it to every leg to serve two suites -- the same waste the per-major
+      # image bundles exist to avoid. Pull it here, on the runner, once, and kind-load it: with
+      # pullPolicy IfNotPresent the alternative is each of the 3 kind workers pulling it
+      # anonymously from Docker Hub mid-suite, which is both slower and rate-limitable (#292
+      # review). The tag is derived exactly as the suite derives it, so the two cannot drift.
+      - name: Pre-load the released from-image (migration suites only)
+        if: matrix.suite == 'migrate-native' || matrix.suite == 'migrate-repmgrd'
+        run: |
+          set -euo pipefail
+          # `|| true` is load-bearing: under `set -euo pipefail` a grep that matches nothing
+          # makes the whole pipeline (and therefore the assignment) exit 1, so `set -e` killed
+          # the step BEFORE the guard below could print its message -- the one case it was
+          # written for, e.g. someone renaming FROM_IMAGE_BASE in the suite (#298 review).
+          base=$(grep -oE 'FROM_IMAGE_BASE:-[^}]+' "pg/tests/test-${{ matrix.suite }}.sh" | head -1 \
+            | sed 's/^FROM_IMAGE_BASE:-//' || true)
+          [ -n "$base" ] || { echo "could not resolve FROM_IMAGE_BASE from the suite" >&2; exit 1; }
+          ref="cagriekin/repmgr:${base%-pg[0-9]*}-pg${{ matrix.pg_major }}"
+          echo "pre-loading $ref"
+          # Retried, because this is the ONLY image in the required path that is not delivered
+          # by download-artifact, and these two legs carry no_retry: "1" (#298 review). A
+          # GitHub-hosted runner shares its egress IP, so an anonymous Docker Hub pull can come
+          # back TOOMANYREQUESTS -- and an unretried failure here reds `pg-tests-passed` on a PR
+          # that changed nothing related. Three attempts with backoff; if they all fail we still
+          # let the leg proceed, since pullPolicy IfNotPresent means the kind workers will try
+          # the pull themselves and the suite fails with its own diagnosis rather than this one.
+          pulled=""
+          for attempt in 1 2 3; do
+            if docker pull "$ref"; then pulled=1; break; fi
+            echo "docker pull $ref failed (attempt $attempt); retrying"
+            sleep $((attempt * 15))
+          done
+          if [ -n "$pulled" ]; then
+            kind load docker-image "$ref" --name pg-test
+          else
+            echo "::warning::could not pre-load $ref; the kind workers will pull it in-cluster"
+          fi
+
       # Point the chart defaults and every fixture at this leg's major (#269). Both
       # majors' images are already loaded, so this only decides which one the suite
       # deploys. The script fails if any rewrite rule matches nothing, so a leg cannot
@@ -292,18 +393,21 @@ jobs:
       - name: Target PostgreSQL ${{ matrix.pg_major }}
         run: bash pg/tests/set-pg-major.sh "${{ matrix.pg_major }}"
 
-      # Run the suite; on a transient failure, drop the suite's namespaces for a
-      # clean slate and retry once. The suites are idempotent (each uninstalls +
-      # recreates its release), so a single retry absorbs the timing/transient
-      # flakes a contended runner produces without re-running the whole job.
       - name: Run ${{ matrix.suite }} suite (pg${{ matrix.pg_major }})
         env:
-          AGENT_COLDBOOT: ${{ matrix.coldboot }}
+          NO_RETRY: ${{ matrix.no_retry }}
         run: |
           set +e
           run() { make -C pg test-${{ matrix.suite }}; }
           run; rc=$?
-          if [ "$rc" -ne 0 ]; then
+          # NO_RETRY legs opt out of the second attempt (#292 review): timeout-minutes is a JOB
+          # budget, so a retry halves what each attempt gets. migrate-native is the longest
+          # suite in the matrix and would end up with LESS per attempt than every shorter leg,
+          # killed mid-run with no diagnosis -- the exact outcome the per-leg budget exists to
+          # avoid. Its own convergence waits already absorb the churn a retry was papering over.
+          if [ "$rc" -ne 0 ] && [ -n "${NO_RETRY:-}" ]; then
+            echo "::notice title=no-retry::test-${{ matrix.suite }} (pg${{ matrix.pg_major }}) failed (rc=${rc}); this leg does not retry"
+          elif [ "$rc" -ne 0 ]; then
             echo "::warning title=suite-retry::test-${{ matrix.suite }} (pg${{ matrix.pg_major }}) failed (rc=${rc}); cleaning namespaces and retrying once"
             kubectl get ns -o name 2>/dev/null | sed 's#namespace/##' | grep '^pg-test' \
               | xargs -r -I{} kubectl delete ns {} --ignore-not-found --wait=true --timeout=180s || true
@@ -343,6 +447,15 @@ jobs:
     steps:
       - name: Aggregate result
         run: |
+          # The no-op arm requires `changes` to have SUCCEEDED (#298). `if: always()` runs this
+          # gate even when `changes` failed or was cancelled, and an unfinished job has EMPTY
+          # outputs -- so `!= "true"` held and the required check went GREEN having examined
+          # nothing. That is worse than never reporting: a missing check blocks the merge,
+          # this one waved it through. (Same guard in kafka-test.yaml and redis-test.yaml.)
+          if [ "${{ needs.changes.result }}" != "success" ]; then
+            echo "pg gate FAILED: the changes job did not succeed (result=${{ needs.changes.result }}), so relevance is unknown"
+            exit 1
+          fi
           if [ "${{ needs.changes.outputs.pg }}" != "true" ]; then
             echo "pg unchanged — gate passes (no-op)"; exit 0
           fi
