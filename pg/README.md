@@ -989,7 +989,8 @@ this release's ServiceAccount, and requires of every Job that subject creates:
 | CPU and memory requests and limits present; `parallelism` and `completions` ≤ 1 | one permitted Job name as a repeatable way to fill the namespace quota and evict the database's own pods |
 | volumes limited to the three the restore template renders (`emptyDir`, ConfigMap `<release>-pg-pgbackrest`, PVC `data-<release>-pg-<podOrdinal>`) | with the token gone this is the one that matters most: arbitrary Secret mounts, `hostPath`, and projected service-account tokens all fall out as denials |
 | no `envFrom`; `valueFrom` limited to the downward API and this release's own Secrets | the same bound for env — a key from any other Secret or ConfigMap |
-| `FORCE` == the literal `pgbackrest.restore.force` renders — present, not duplicated, not sourced from `valueFrom` | `pgbackrest restore --force`, the bypass of the `postmaster.pid` interlock. Without this pin, "restore this release to a point of your choosing" becomes "restore over a **running** primary at any moment"; with it, the bypass stays a reviewable values change (#283) |
+| `FORCE` == the literal `pgbackrest.restore.force` renders — present, not duplicated, not sourced from `valueFrom` | `pgbackrest restore --force`, the bypass of the `postmaster.pid` interlock. Without this pin, "restore this release to a point of your choosing" becomes "restore over a **running** primary at any moment"; with it, the bypass is a reviewable values change (#283) |
+| env **names** limited to what the restore `jobTemplate` renders; `PGDATA` and the pgbackrest log/lock paths pinned by value; the credential and requester entries must stay `valueFrom` | the route around the `FORCE` pin: pgbackrest reads any `PGBACKREST_<OPTION>` from the environment, so an unlisted `PGBACKREST_FORCE=y` is `--force` under another name, `PGBACKREST_REPO1_S3_ENDPOINT` is a restore from someone else's repository, and `BASH_ENV`/`LD_PRELOAD` are code execution before the pinned command's first line. A free `PGDATA` would aim the shell interlock at a directory that does not exist (#283) |
 
 The security contexts, resources and command are pinned to **what this release's own values
 render**, not to a fixed hardened profile: change `postgresql.containerSecurityContext` and
@@ -1013,18 +1014,26 @@ cluster:
   certificate to the control API. `allowedClientCNs` guards the API; it cannot guard
   `create jobs`. Choosing the point *is* the operation being exposed, so admission has
   nothing left to reject there. The parameters split three ways: `TARGET_TYPE`/`TARGET`/
-  `BACKUP_SET` are inherent to the feature and stay free; `FORCE` is an **interlock bypass**,
-  not a recovery-point choice, and is pinned to `pgbackrest.restore.force` (#283); everything
-  else was already pinned. Because `FORCE` is pinned, pgBackRest's refusal to restore while
-  `postmaster.pid` exists is *enforced*, not assumed: a token-holder's restore still needs the
-  StatefulSet already scaled to 0 — an operator-initiated maintenance state — and cannot be
-  aimed at a running database.
-- **The command pin is not a sandbox.** Bash reads `$BASH_ENV`, and an actor who already runs
-  code in the postgresql container can write a file into PGDATA — which this Job mounts. So
-  code execution inside the restore container is reachable. What it reaches is uid 101 with no
-  token and only this release's volumes: the privileges already held, which is the bar this
-  policy is written to. The image, security-context, volume and env pins are what hold that
-  bar — not the command pin alone.
+  `BACKUP_SET` (and the stanza name, which selects within this release's own repository) are
+  inherent to the feature and stay free; `FORCE` is an **interlock bypass**, not a
+  recovery-point choice, and is pinned to `pgbackrest.restore.force`; and every other env
+  name is denied outright, because pgbackrest would read `PGBACKREST_FORCE` from the
+  environment just as happily (#283). What that buys is precise: pgBackRest's refusal to
+  restore while `postmaster.pid` exists can no longer be switched off through the job-create
+  grant, so a token-holder's restore needs the StatefulSet already scaled to 0 — an
+  operator-initiated maintenance state — **or** code execution inside the pinned container
+  (next bullet). It raises the bypass to a reviewable values change; it is not a proof that
+  `--force` is unreachable.
+- **The command pin is not a sandbox.** The env allowlist closes the environment route
+  (`BASH_ENV`, `LD_PRELOAD` and every other unlisted name are denied), but `restore.sh` still
+  runs pgbackrest against the mounted PGDATA with the free recovery-point parameters, and an
+  actor who already runs code in the postgresql container can shape what that volume
+  contains. So code execution inside the restore container should be assumed reachable — and
+  from there `--force` is a shell command away, which is why the previous bullet says "raises
+  the bar" and not "enforces". What it reaches is uid 101 with no token and only this
+  release's volumes: the privileges already held, which is the bar this policy is written to.
+  The image, security-context, volume and env pins are what hold that bar — not the command
+  pin alone.
 - **It is not a check that the Job matches the release in full.** CEL sees only the admission
   request, so the verbatim-`jobTemplate` clone remains what guarantees the rest. This is
   defence in depth on top of that.

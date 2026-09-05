@@ -219,6 +219,29 @@ assert_contains "VAP #283: FORCE sourced from the downward API is denied" \
 assert_contains "VAP #283: removing FORCE is denied" \
   "$(admit '.spec.template.spec.containers[0].env |= map(select(.name!="FORCE"))')" \
   "${force_msg}"
+# The route AROUND the pin (#283 review): pgbackrest reads any PGBACKREST_<OPTION> from the
+# environment, so the rendered FORCE=false plus an extra PGBACKREST_FORCE=y is --force under
+# another name; PGDATA=/tmp/x aims the shell interlock at a directory that does not exist;
+# BASH_ENV is code execution before the pinned command's first line; and a LITERAL
+# PGBACKREST_REPO1_S3_KEY is an attacker-supplied credential that the valueFrom rule never
+# inspects. Rule 18 denies each of them by name or by tier.
+allow_msg="may carry only the env its jobTemplate renders"
+assert_contains "VAP #283: PGBACKREST_FORCE=y (--force under another name) is denied" \
+  "$(admit '.spec.template.spec.containers[0].env += [{"name":"PGBACKREST_FORCE","value":"y"}]')" \
+  "${allow_msg}"
+assert_contains "VAP #283: BASH_ENV is denied" \
+  "$(admit '.spec.template.spec.containers[0].env += [{"name":"BASH_ENV","value":"/var/lib/postgresql/data/x"}]')" \
+  "${allow_msg}"
+assert_contains "VAP #283: a redirected PGDATA is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="PGDATA" then .value="/tmp/x" else . end)')" \
+  "${allow_msg}"
+assert_contains "VAP #283: a literal S3 credential is denied (must stay valueFrom)" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="PGBACKREST_REPO1_S3_KEY" then {name:"PGBACKREST_REPO1_S3_KEY",value:"AKIA-attacker"} else . end)')" \
+  "${allow_msg}"
+# ...and the one name the agent adds itself (readPodLogs) is admitted, or toggling log
+# reading would deny the agent's own Job.
+assert_eq "VAP #283: the agent's PGBACKREST_LOG_LEVEL_CONSOLE is admitted" "allowed" \
+  "$(admit '.spec.template.spec.containers[0].env += [{"name":"PGBACKREST_LOG_LEVEL_CONSOLE","value":"detail"}]')"
 # The recovery point is NOT pinned -- the API overrides these on every request, so a policy
 # that denied them would deny every API-driven restore. Assert the boundary from this side too.
 assert_eq "VAP #283: a different BACKUP_SET is admitted (the recovery point is the feature)" "allowed" \

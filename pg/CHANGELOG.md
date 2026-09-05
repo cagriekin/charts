@@ -4,18 +4,26 @@
 
 ### Fixed
 
-- **The restore admission policy now pins `FORCE` (#283).** The #279 policy bounds what the
-  restore Job *is* and deliberately left its parameters free, on the reasoning that choosing the
-  recovery point is the feature. That is right for `TARGET_TYPE`/`TARGET`/`BACKUP_SET` and wrong
-  for `FORCE`: it is `pgbackrest restore --force`, the bypass of the `postmaster.pid` interlock
-  that the 1.10.0 notes relied on when they said a token-holder's restore "still needs the
-  StatefulSet already scaled to 0". With `FORCE` unpinned that was assumed, not enforced -- anyone
-  holding the job-create grant could restore over a running primary at any moment. Rule 17 now
-  requires `FORCE` to be present, a literal (rule 16 admits `fieldRef`, and the Job creator
-  controls the annotations one could read), pinned on every occurrence (env is last-wins on
-  duplicates), and equal to what `pgbackrest.restore.force` renders -- so an operator who sets
-  it `true` for a stale pid file still gets a working Job, and the bypass stays a reviewable
-  values change. The recovery-point parameters stay free; the API overrides them by design.
+- **The restore admission policy now pins `FORCE` and allowlists env names (#283).** The
+  #279 policy bounds what the restore Job *is* and deliberately left its parameters free, on
+  the reasoning that choosing the recovery point is the feature. That is right for
+  `TARGET_TYPE`/`TARGET`/`BACKUP_SET` and wrong for `FORCE`: it is `pgbackrest restore
+  --force`, the bypass of the `postmaster.pid` interlock the 1.10.0 notes relied on when they
+  said a token-holder's restore "still needs the StatefulSet already scaled to 0". With
+  `FORCE` free that was assumed, not enforced -- anyone holding the job-create grant could
+  restore over a running primary at any moment. Two new rules: `FORCE` must be present, a
+  literal, pinned on every occurrence, and equal to what `pgbackrest.restore.force` renders
+  (so an operator who sets it `true` for a stale pid file still gets a working Job); and env
+  *names* are an allowlist of exactly what the restore `jobTemplate` renders, with `PGDATA`
+  and the pgbackrest log/lock paths pinned by value and the credential/requester entries
+  required to stay `valueFrom`. The allowlist is what makes the pin mean anything --
+  pgbackrest reads any `PGBACKREST_<OPTION>` from the environment, so an unlisted
+  `PGBACKREST_FORCE=y` would have been `--force` under another name, `PGBACKREST_REPO1_S3_*`
+  a restore from someone else's repository, and `BASH_ENV` code execution before the pinned
+  command ran. The recovery-point parameters and the stanza stay free; the API overrides the
+  former by design and the latter only selects within this release's own repository. This
+  raises the bypass to a reviewable values change; it is not a proof that `--force` is
+  unreachable from inside the container, and the README says so.
 
 ## 2.0.1 - 2026-09-02
 

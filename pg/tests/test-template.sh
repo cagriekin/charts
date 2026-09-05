@@ -5053,6 +5053,65 @@ assert_not_contains "#283 force=true: nothing still pins 'false'" "${ctl_vap_for
 for free in TARGET_TYPE TARGET BACKUP_SET PGBACKREST_LOG_LEVEL_CONSOLE; do
   assert_not_contains "#283: ${free} is not pinned (the API overrides it)" "${ctl_vap}" "e.name == '${free}'"
 done
+# --- #283 review: the env-name allowlist (rule 18) ---
+# The FORCE pin means nothing on its own: pgbackrest reads any PGBACKREST_<OPTION> from the
+# environment, so FORCE=false plus an unlisted PGBACKREST_FORCE=y is --force under another
+# name. Rule 18 allowlists env NAMES to what the jobTemplate renders. This is the drift pair
+# that matters most: a new env added to pgbackrest-restore-job.yaml without a matching
+# allowlist entry would make every API-driven restore fail admission.
+allowlist() { grep -o "e.name in \['[^]]*'\]" <<< "$1" | head -1 | sed "s/e.name in \[//; s/\]//; s/'//g" | tr ',' '\n' | sort; }
+cj_env_names() { grep -o '^ *- name: [A-Z_0-9]*$' <<< "$1" | sed 's/.*- name: //' | sort; }
+vap_allow=$(allowlist "${ctl_vap}")
+cj_names=$(cj_env_names "${ctl_vap_cj}")
+assert_eq "#283 drift: every env the Job renders is on the allowlist" "" "$(comm -13 <(echo "${vap_allow}") <(echo "${cj_names}"))"
+# The one name the allowlist carries that the CronJob does not is the agent's own addition
+# under readPodLogs (restoreEnvOverrides). Anything else here is an allowlist entry with no
+# render behind it -- an unnecessary hole.
+assert_eq "#283 drift: the allowlist has exactly one entry the Job does not render (the agent's log level)" \
+  "PGBACKREST_LOG_LEVEL_CONSOLE" "$(comm -23 <(echo "${vap_allow}") <(echo "${cj_names}"))"
+# The constants are pinned by VALUE and compared against the Job's own render.
+for pinned_name in PGDATA PGBACKREST_LOG_PATH PGBACKREST_LOCK_PATH; do
+  drift "pinned ${pinned_name} is the one the Job renders (#283)" \
+    "$(rendered_env "${pinned_name}")" \
+    "$(grep "e.name != '${pinned_name}' || " <<< "${ctl_vap}" | head -1 | sed "s/.*e.value == '//; s/'.*$//")"
+done
+# The credential and requester entries render as valueFrom and must STAY valueFrom: rule 16
+# inspects only entries that have one, so a literal under the same name is invisible to it.
+# (ctl_restore_args is keyType=auto, so the requester is the only valueFrom entry here.)
+assert_contains_literal "#283: the valueFrom-only tier is enforced" "${ctl_vap}" \
+  "(!(e.name in ['RESTORE_REQUESTED_BY']) || has(e.valueFrom))"
+ctl_vap_shared=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set pgbackrest.s3.keyType=shared --set pgbackrest.existingSecret.name=s3-backup-creds \
+  --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains_literal "#283 keyType=shared: the S3 credentials are allowed, valueFrom-only" "${ctl_vap_shared}" \
+  "(!(e.name in ['RESTORE_REQUESTED_BY','PGBACKREST_REPO1_S3_KEY','PGBACKREST_REPO1_S3_KEY_SECRET']) || has(e.valueFrom))"
+for bad in PGBACKREST_FORCE BASH_ENV LD_PRELOAD PGBACKREST_REPO1_S3_ENDPOINT; do
+  assert_not_contains "#283: ${bad} is not on the allowlist" "${ctl_vap}" "'${bad}'"
+done
+assert_contains "#283: the denial names the route it closes" "${ctl_vap}" \
+  'PGBACKREST_FORCE would bypass the postmaster.pid interlock'
+# The allowlist follows the jobTemplate's own conditionals -- keyless S3 drops the two
+# credential names, an encrypted repo adds its passphrase -- and pgbackrest.extraEnv joins
+# by name in the tier its shape puts it in (literal free, valueFrom must stay valueFrom).
+ctl_vap_auto_enc=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set pgbackrest.s3.keyType=auto --set pgbackrest.repoEncryption.enabled=true \
+  --set pgbackrest.repoEncryption.existingSecret.name=cph --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_not_contains "#283 keyType=auto: no S3 credential names on the allowlist" "${ctl_vap_auto_enc}" "PGBACKREST_REPO1_S3_KEY"
+assert_contains_literal "#283 repoEncryption: the passphrase is allowed, valueFrom-only" "${ctl_vap_auto_enc}" \
+  "(!(e.name in ['RESTORE_REQUESTED_BY','PGBACKREST_REPO1_CIPHER_PASS']) || has(e.valueFrom))"
+ctl_vap_xenv=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraEnv=[{"name":"HTTPS_PROXY","value":"http://p:3128"},{"name":"CA_PEM","valueFrom":{"secretKeyRef":{"name":"ca","key":"pem"}}}]' \
+  --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains_literal "#283 extraEnv: a literal joins the free tier" "${ctl_vap_xenv}" "'PGBACKREST_LOG_LEVEL_CONSOLE','HTTPS_PROXY','RESTORE_REQUESTED_BY'"
+assert_contains_literal "#283 extraEnv: a valueFrom entry joins the valueFrom-only tier" "${ctl_vap_xenv}" "'RESTORE_REQUESTED_BY','CA_PEM']) || has(e.valueFrom)"
+# An extraEnv NAME is operator input that lands in a CEL literal, so it goes through
+# pg.validateCelLiterals like every other one.
+ctl_vap_xenv_rc=0
+helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json "pgbackrest.extraEnv=[{\"name\":\"X' || true || '\",\"value\":\"1\"}]" >/dev/null 2>&1 || ctl_vap_xenv_rc=$?
+assert_eq "#283 extraEnv: a name that would break CEL fails the render" "1" \
+  "$([ "${ctl_vap_xenv_rc}" -ne 0 ] && echo 1 || echo 0)"
+
 # A non-boolean cannot reach the CEL literal: the schema types the key, so an injection
 # attempt is rejected before the template runs.
 ctl_vap_inj_rc=0

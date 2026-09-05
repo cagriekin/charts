@@ -398,7 +398,7 @@ tests:
     asserts:
       - lengthEqual:
           path: spec.validations
-          count: 17
+          count: 18
       - equal:
           path: spec.validations[16].expression
           value: "variables.pod.containers.all(c, has(c.env) && c.env.exists(e, e.name == 'FORCE') && c.env.all(e, e.name != 'FORCE' || (!has(e.valueFrom) && has(e.value) && e.value == 'false')))"
@@ -443,6 +443,79 @@ tests:
       - notMatchRegex:
           path: spec.validations[16].expression
           pattern: "e\\.name == '(TARGET_TYPE|TARGET|BACKUP_SET|PGBACKREST_LOG_LEVEL_CONSOLE)'"
+
+  # Rule 18: the FORCE pin is only as good as the env-name allowlist around it, because
+  # pgbackrest reads PGBACKREST_FORCE from the environment just as happily.
+  - it: env names are an allowlist with the chart constants pinned and credentials kept valueFrom
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - lengthEqual:
+          path: spec.validations
+          count: 18
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "e\\.name in \\['PGBACKREST_LOCK_PATH','PGBACKREST_LOG_PATH','PGDATA','PGBACKREST_STANZA','TARGET_TYPE','TARGET','BACKUP_SET','FORCE','PGBACKREST_LOG_LEVEL_CONSOLE','RESTORE_REQUESTED_BY','PGBACKREST_REPO1_S3_KEY','PGBACKREST_REPO1_S3_KEY_SECRET'\\]"
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "\\(!\\(e\\.name in \\['RESTORE_REQUESTED_BY','PGBACKREST_REPO1_S3_KEY','PGBACKREST_REPO1_S3_KEY_SECRET'\\]\\) \\|\\| has\\(e\\.valueFrom\\)\\)"
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "e\\.name != 'PGDATA' \\|\\| \\(!has\\(e\\.valueFrom\\) && has\\(e\\.value\\) && e\\.value == '/var/lib/postgresql/data/pgdata'\\)"
+      - matchRegex:
+          path: spec.validations[17].message
+          pattern: "PGBACKREST_FORCE would bypass the postmaster\\.pid interlock.*BASH_ENV"
+      - equal:
+          path: spec.validations[17].reason
+          value: Forbidden
+
+  # The allowlist follows the jobTemplate: with no shared key there is no S3 credential env
+  # to allow, and an encrypted repo adds its passphrase (as valueFrom-only).
+  - it: the env allowlist follows the credentials the jobTemplate renders
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.s3.keyType: auto
+      pgbackrest.repoEncryption.enabled: true
+      pgbackrest.repoEncryption.existingSecret.name: pgbr-cipher
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - notMatchRegex:
+          path: spec.validations[17].expression
+          pattern: "PGBACKREST_REPO1_S3_KEY"
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "e\\.name in \\['RESTORE_REQUESTED_BY','PGBACKREST_REPO1_CIPHER_PASS'\\]\\) \\|\\| has\\(e\\.valueFrom\\)"
+
+  # Operator-declared extraEnv is admitted by name: a literal stays free, a valueFrom entry
+  # must stay valueFrom.
+  - it: pgbackrest.extraEnv names join the allowlist in their own tier
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.extraEnv:
+        - name: HTTPS_PROXY
+          value: http://proxy:3128
+        - name: CA_PEM
+          valueFrom:
+            secretKeyRef:
+              name: ca
+              key: pem
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "'PGBACKREST_LOG_LEVEL_CONSOLE','HTTPS_PROXY','RESTORE_REQUESTED_BY'"
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "'PGBACKREST_REPO1_S3_KEY_SECRET','CA_PEM'\\]\\) \\|\\| has\\(e\\.valueFrom\\)"
 
   # --- the binding ---
   #
