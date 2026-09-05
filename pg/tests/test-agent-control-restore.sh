@@ -199,6 +199,30 @@ assert_eq "VAP: a Job created by a human is untouched" "allowed" "$(admit "${unr
 assert_contains "VAP: naming another ServiceAccount is denied" \
   "$(admit '.spec.template.spec.serviceAccountName="privileged-sa"')" \
   "may only create Jobs running as ServiceAccount"
+
+# #283: FORCE is `pgbackrest restore --force`, the bypass of the postmaster.pid interlock --
+# the one thing that makes a token-holder's restore need the StatefulSet already at 0 rather
+# than working against a running primary. The pin has three closures and each gets its own
+# denial here, because each is a distinct way to smuggle the flag past a naive value check:
+# flip the literal, append a second last-wins entry, source it from an annotation the Job
+# creator controls, or drop it and let the script's default decide.
+force_msg="must carry FORCE=false as a literal"
+assert_contains "VAP #283: flipping FORCE to true is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="FORCE" then .value="true" else . end)')" \
+  "${force_msg}"
+assert_contains "VAP #283: a second, last-wins FORCE entry is denied" \
+  "$(admit '.spec.template.spec.containers[0].env += [{"name":"FORCE","value":"true"}]')" \
+  "${force_msg}"
+assert_contains "VAP #283: FORCE sourced from the downward API is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="FORCE" then {name:"FORCE",valueFrom:{fieldRef:{fieldPath:"metadata.name"}}} else . end)')" \
+  "${force_msg}"
+assert_contains "VAP #283: removing FORCE is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(select(.name!="FORCE"))')" \
+  "${force_msg}"
+# The recovery point is NOT pinned -- the API overrides these on every request, so a policy
+# that denied them would deny every API-driven restore. Assert the boundary from this side too.
+assert_eq "VAP #283: a different BACKUP_SET is admitted (the recovery point is the feature)" "allowed" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="BACKUP_SET" then .value="20260101-000000F" else . end)')"
 # ...and why it would not help even if it were not: no token is mounted.
 assert_contains "VAP: mounting the ServiceAccount token is denied" \
   "$(admit '.spec.template.spec.automountServiceAccountToken=true')" \

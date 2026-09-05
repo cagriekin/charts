@@ -989,6 +989,7 @@ this release's ServiceAccount, and requires of every Job that subject creates:
 | CPU and memory requests and limits present; `parallelism` and `completions` ≤ 1 | one permitted Job name as a repeatable way to fill the namespace quota and evict the database's own pods |
 | volumes limited to the three the restore template renders (`emptyDir`, ConfigMap `<release>-pg-pgbackrest`, PVC `data-<release>-pg-<podOrdinal>`) | with the token gone this is the one that matters most: arbitrary Secret mounts, `hostPath`, and projected service-account tokens all fall out as denials |
 | no `envFrom`; `valueFrom` limited to the downward API and this release's own Secrets | the same bound for env — a key from any other Secret or ConfigMap |
+| `FORCE` == the literal `pgbackrest.restore.force` renders — present, not duplicated, not sourced from `valueFrom` | `pgbackrest restore --force`, the bypass of the `postmaster.pid` interlock. Without this pin, "restore this release to a point of your choosing" becomes "restore over a **running** primary at any moment"; with it, the bypass stays a reviewable values change (#283) |
 
 The security contexts, resources and command are pinned to **what this release's own values
 render**, not to a fixed hardened profile: change `postgresql.containerSecurityContext` and
@@ -1006,13 +1007,18 @@ namespace would be worse than the hole it closes.
 Be clear-eyed about the residual, because it decides whether this feature belongs on your
 cluster:
 
-- **The restore parameters are not bounded, and cannot be.** Anything holding the token can
-  still create the one permitted Job with its own `TARGET`, `BACKUP_SET` and `FORCE` — a real
-  restore of this release, over the live PGDATA, without presenting a client certificate to
-  the control API. `allowedClientCNs` guards the API; it cannot guard `create jobs`. A
-  restore over the live data directory *is* the operation being exposed, so admission has
-  nothing left to reject. pgBackRest still refuses to restore while `postmaster.pid` exists,
-  which in practice means this needs the StatefulSet already scaled to 0.
+- **The recovery point is not bounded, and cannot be.** Anything holding the token can
+  still create the one permitted Job with its own `TARGET_TYPE`, `TARGET` and `BACKUP_SET` — a
+  real restore of this release, to a point of their choosing, without presenting a client
+  certificate to the control API. `allowedClientCNs` guards the API; it cannot guard
+  `create jobs`. Choosing the point *is* the operation being exposed, so admission has
+  nothing left to reject there. The parameters split three ways: `TARGET_TYPE`/`TARGET`/
+  `BACKUP_SET` are inherent to the feature and stay free; `FORCE` is an **interlock bypass**,
+  not a recovery-point choice, and is pinned to `pgbackrest.restore.force` (#283); everything
+  else was already pinned. Because `FORCE` is pinned, pgBackRest's refusal to restore while
+  `postmaster.pid` exists is *enforced*, not assumed: a token-holder's restore still needs the
+  StatefulSet already scaled to 0 — an operator-initiated maintenance state — and cannot be
+  aimed at a running database.
 - **The command pin is not a sandbox.** Bash reads `$BASH_ENV`, and an actor who already runs
   code in the postgresql container can write a file into PGDATA — which this Job mounts. So
   code execution inside the restore container is reachable. What it reaches is uid 101 with no
@@ -1092,9 +1098,11 @@ What it does and does not control:
   only *confirm* it (409 on mismatch). The request must also be addressed to the pod that
   owns that volume.
 - The API **never sets pgBackRest's `--force`**, which bypasses the `postmaster.pid`
-  interlock — the last guard against restoring over a live volume. If you genuinely need
-  the stale-pid bypass, set `pgbackrest.restore.force=true` in values, where it is
-  reviewable.
+  interlock — the last guard against restoring over a live volume — and with
+  `admissionPolicy` on, the API server denies any Job that sets, duplicates, or
+  `valueFrom`-sources it (#283). If you genuinely need the stale-pid bypass, set
+  `pgbackrest.restore.force=true` in values, where it is reviewable; the pin follows the
+  rendered value.
 - Destructive by declaration: `force: true` and `confirm: "<statefulset name>"` are both
   required, and the cluster must already be **paused** — an active reconcile loop would
   restart the postmaster the restore needs stopped. (The exact confirm value is whatever

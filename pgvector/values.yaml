@@ -1105,6 +1105,9 @@ pgbackrest:
     # refuses to restore over what may be a running cluster, which is the safety interlock
     # that lets this Job run with no Kubernetes API access at all. Leave false unless you
     # have confirmed every postgresql pod is gone.
+    # With ha.agent.control.restore.admissionPolicy on, the API server pins the Job's FORCE
+    # env to whatever this renders, so the bypass can only be enabled here -- never by a
+    # token-holder hand-crafting the Job (#283).
     force: false
     # Ordinal of the replica whose PVC (data-<fullname>-<ordinal>) is restored into.
     # Leave 0: replica 0 becomes the restored primary and the agent re-clones the standbys.

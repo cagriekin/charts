@@ -1,5 +1,22 @@
 # pg chart changelog
 
+## 2.0.2 - 2026-09-06
+
+### Fixed
+
+- **The restore admission policy now pins `FORCE` (#283).** The #279 policy bounds what the
+  restore Job *is* and deliberately left its parameters free, on the reasoning that choosing the
+  recovery point is the feature. That is right for `TARGET_TYPE`/`TARGET`/`BACKUP_SET` and wrong
+  for `FORCE`: it is `pgbackrest restore --force`, the bypass of the `postmaster.pid` interlock
+  that the 1.10.0 notes relied on when they said a token-holder's restore "still needs the
+  StatefulSet already scaled to 0". With `FORCE` unpinned that was assumed, not enforced -- anyone
+  holding the job-create grant could restore over a running primary at any moment. Rule 17 now
+  requires `FORCE` to be present, a literal (rule 16 admits `fieldRef`, and the Job creator
+  controls the annotations one could read), pinned on every occurrence (env is last-wins on
+  duplicates), and equal to what `pgbackrest.restore.force` renders -- so an operator who sets
+  it `true` for a stale pid file still gets a working Job, and the bypass stays a reviewable
+  values change. The recovery-point parameters stay free; the API overrides them by design.
+
 ## 2.0.1 - 2026-09-02
 
 ### Fixed

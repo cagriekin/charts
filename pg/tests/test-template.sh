@@ -5024,6 +5024,43 @@ assert_contains "#279 keyType=auto: only the downward API is permitted" "${ctl_v
 assert_not_contains "#279 keyType=auto: configMapKeyRef is not admitted by a bare negation" \
   "${ctl_vap}" '!has(e.valueFrom.secretKeyRef)'
 
+# --- #283: FORCE is pinned; the recovery-point parameters are not ---
+# FORCE is `pgbackrest restore --force`, the bypass of the postmaster.pid interlock. Rule 16
+# admits any literal env, so without a pin a token-holder could restore over a RUNNING
+# primary. The pin follows the rendered value (an operator who sets force=true for a stale
+# pid file must not be denied their own Job), so it is a drift pair like the others -- and
+# the FORCE entry spans two lines (`- name:` / `value:`), so `rendered()` cannot read it.
+rendered_env() { awk -v n="$1" '$0 ~ "- name: "n"$" {getline; sub(/^ *value: ["'\'']?/, ""); sub(/["'\'']$/, ""); print; exit}' <<< "${ctl_vap_cj}"; }
+drift "pinned FORCE is the one the Job renders (#283)" \
+  "$(rendered_env FORCE)" "$(pinned 'e.value')"
+assert_eq "#283: the default pin is false" "false" "$(pinned 'e.value')"
+# The three closures are each load-bearing (see the rule's comment): presence, every
+# occurrence (env is last-wins on duplicates), and literal-only (rule 16 admits fieldRef,
+# and the Job creator controls the annotations a fieldRef could read).
+assert_contains_literal "#283: FORCE must be present" "${ctl_vap}" "c.env.exists(e, e.name == 'FORCE')"
+assert_contains_literal "#283: every FORCE entry is pinned, not just the first" "${ctl_vap}" "c.env.all(e, e.name != 'FORCE' ||"
+assert_contains_literal "#283: FORCE must be a literal, not valueFrom" "${ctl_vap}" "!has(e.valueFrom) && has(e.value) && e.value =="
+assert_contains "#283: the denial names the fix" "${ctl_vap}" 'change pgbackrest.restore.force in values instead (#283)'
+# The pin moves with values: force=true renders FORCE="true" on the CronJob and 'true' in
+# the policy, so the chart never denies its own Job.
+ctl_vap_force=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set pgbackrest.restore.force=true 2>&1)
+assert_contains_literal "#283 force=true: the policy pins 'true'" "${ctl_vap_force}" "e.value == 'true'"
+assert_contains "#283 force=true: the CronJob renders the same value" "${ctl_vap_force}" 'value: "true"'
+assert_not_contains "#283 force=true: nothing still pins 'false'" "${ctl_vap_force}" "e.value == 'false'"
+# The recovery point stays FREE. The API overrides exactly these on every request
+# (restoreEnvOverrides), so pinning any of them would deny every API-driven restore.
+for free in TARGET_TYPE TARGET BACKUP_SET PGBACKREST_LOG_LEVEL_CONSOLE; do
+  assert_not_contains "#283: ${free} is not pinned (the API overrides it)" "${ctl_vap}" "e.name == '${free}'"
+done
+# A non-boolean cannot reach the CEL literal: the schema types the key, so an injection
+# attempt is rejected before the template runs.
+ctl_vap_inj_rc=0
+helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-string "pgbackrest.restore.force=' || true || '" >/dev/null 2>&1 || ctl_vap_inj_rc=$?
+assert_eq "#283: a non-boolean force fails the schema before it can reach CEL" "1" \
+  "$([ "${ctl_vap_inj_rc}" -ne 0 ] && echo 1 || echo 0)"
+
 # The >= 1.30 requirement is enforced by asking whether admissionregistration.k8s.io/v1
 # EXISTS, not by comparing .Capabilities.KubeVersion: with no cluster that reports the HELM
 # CLIENT's version (helm 3.14 says v1.29), so a semver floor fails every `helm template` run

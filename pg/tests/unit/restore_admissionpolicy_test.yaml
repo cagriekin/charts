@@ -384,6 +384,66 @@ tests:
           path: spec.validations[15].expression
           pattern: "secretKeyRef\\.name in"
 
+  # --- #283: FORCE is pinned; the recovery point is not ---
+  #
+  # FORCE is `pgbackrest restore --force`, the bypass of the postmaster.pid interlock. Rule 16
+  # admits any literal env, so without this a token-holder could restore over a RUNNING
+  # primary. Appended as rule 17 so every index above stays put.
+  - it: FORCE is pinned to the rendered default as a present, literal, every-occurrence value
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - lengthEqual:
+          path: spec.validations
+          count: 17
+      - equal:
+          path: spec.validations[16].expression
+          value: "variables.pod.containers.all(c, has(c.env) && c.env.exists(e, e.name == 'FORCE') && c.env.all(e, e.name != 'FORCE' || (!has(e.valueFrom) && has(e.value) && e.value == 'false')))"
+      - equal:
+          path: spec.validations[16].reason
+          value: Forbidden
+      - matchRegex:
+          path: spec.validations[16].message
+          pattern: "FORCE=false as a literal.*postmaster\\.pid.*change pgbackrest\\.restore\\.force in values instead \\(#283\\)"
+
+  # The pin follows values: an operator who set force=true for a stale pid file must not be
+  # denied their own Job. A chart that denied its own restore would be worse than no policy.
+  - it: FORCE pin moves with pgbackrest.restore.force
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.restore.force: true
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[16].expression
+          pattern: "e\\.value == 'true'"
+      - notMatchRegex:
+          path: spec.validations[16].expression
+          pattern: "'false'"
+
+  # The recovery point stays free: the API overrides these on every request, so pinning
+  # them would deny every API-driven restore.
+  - it: the recovery-point parameters are not pinned
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      # Rules 16 and 17 are the only ones that inspect env entries.
+      - notMatchRegex:
+          path: spec.validations[15].expression
+          pattern: "e\\.name == '(TARGET_TYPE|TARGET|BACKUP_SET|PGBACKREST_LOG_LEVEL_CONSOLE)'"
+      - notMatchRegex:
+          path: spec.validations[16].expression
+          pattern: "e\\.name == '(TARGET_TYPE|TARGET|BACKUP_SET|PGBACKREST_LOG_LEVEL_CONSOLE)'"
+
   # --- the binding ---
   #
   # Scoped to the release namespace by the label the API SERVER sets on every namespace, so
