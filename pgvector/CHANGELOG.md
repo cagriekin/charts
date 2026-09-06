@@ -16,8 +16,9 @@
   agent sets it on the API-driven restore Job under `readPodLogs`, and the admission policy
   now pins every declared literal by value -- so an operator-declared copy would deny every
   API restore the moment log reading was on. Declaring it fails the render, in every
-  configuration, with the message naming the agent. Remove the entry; pgbackrest's
-  `log-level-console` belongs in `pgbackrest.config` if you need it elsewhere.
+  configuration, with the message naming the agent. Remove the entry; there is no other
+  passthrough for that option while the admission policy is on (a `conf.d` fragment is the
+  general route, and this release refuses it under the policy for the reason above).
 
 ### Fixed
 

@@ -1011,6 +1011,18 @@ tests:
           path: spec.validations[6].expression
           pattern: "!has\\(object\\.metadata\\.finalizers\\) && \\(!has\\(object\\.spec\\.template\\.metadata\\) \\|\\| !has\\(object\\.spec\\.template\\.metadata\\.finalizers\\)\\)"
 
+  - it: a Localhost profile without a localhostProfile fails the render
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.seccompProfile:
+        type: Localhost
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "postgresql.containerSecurityContext.seccompProfile has type Localhost but no localhostProfile"
+
   # --- the binding ---
   #
   # Scoped to the release namespace by the label the API SERVER sets on every namespace, so

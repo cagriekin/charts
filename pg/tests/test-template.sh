@@ -5155,6 +5155,10 @@ ctl_vap_notype=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" -
   --set-json 'postgresql.podSecurityContext.appArmorProfile={"localhostProfile":"p"}' 2>&1) && ctl_vap_notype_rc=0 || ctl_vap_notype_rc=$?
 assert_eq "#283 hardening: a profile without a type fails the render" "1" "$([ "${ctl_vap_notype_rc}" -ne 0 ] && echo 1 || echo 0)"
 assert_contains "#283 hardening: ...naming the profile" "${ctl_vap_notype}" 'postgresql.podSecurityContext.appArmorProfile is set without a type'
+ctl_vap_lh=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.containerSecurityContext.seccompProfile={"type":"Localhost"}' 2>&1) && ctl_vap_lh_rc=0 || ctl_vap_lh_rc=$?
+assert_eq "#283 hardening: Localhost without a localhostProfile fails the render" "1" "$([ "${ctl_vap_lh_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283 hardening: ...by name" "${ctl_vap_lh}" 'postgresql.containerSecurityContext.seccompProfile has type Localhost but no localhostProfile'
 ctl_vap_sgscalar=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
   --set-json 'postgresql.podSecurityContext.supplementalGroups=103' 2>&1) && ctl_vap_sgscalar_rc=0 || ctl_vap_sgscalar_rc=$?
 assert_eq "#283 hardening: a scalar supplementalGroups fails the render" "1" "$([ "${ctl_vap_sgscalar_rc}" -ne 0 ] && echo 1 || echo 0)"
