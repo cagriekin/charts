@@ -221,7 +221,7 @@ assert_contains "VAP #283: FORCE sourced from the downward API is denied" \
 assert_contains "VAP #283: removing FORCE is denied" \
   "$(admit '.spec.template.spec.containers[0].env |= map(select(.name!="FORCE"))')" \
   "${force_msg}"
-# The route AROUND the pin (#283 review): pgbackrest reads any PGBACKREST_<OPTION> from the
+# The route AROUND the pin (#283): pgbackrest reads any PGBACKREST_<OPTION> from the
 # environment, so the rendered FORCE=false plus an extra PGBACKREST_FORCE=y is --force under
 # another name; PGDATA=/tmp/x aims the shell interlock at a directory that does not exist;
 # BASH_ENV is code execution before the pinned command's first line; and a LITERAL
@@ -262,7 +262,7 @@ assert_contains "VAP #283: a livenessProbe exec is denied (a second command)" \
 assert_contains "VAP #283: a literal S3 credential is denied (must stay valueFrom)" \
   "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="PGBACKREST_REPO1_S3_KEY" then {name:"PGBACKREST_REPO1_S3_KEY",value:"AKIA-attacker"} else . end)')" \
   "${allow_msg}"
-# The route around BOTH env rules (#283 review): the set of volume sources is closed, but
+# The route around BOTH env rules (#283): the set of volume sources is closed, but
 # the permitted data PVC mounted at /scripts is the pinned command running whatever the
 # caller wrote into PGDATA earlier; at /etc/pgbackrest/conf.d it is every pgbackrest option
 # the env allowlist keeps out. And a hostAliases entry redirects the S3 endpoint with no env

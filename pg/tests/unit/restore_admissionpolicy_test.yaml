@@ -341,7 +341,7 @@ tests:
       - matchRegex:
           path: spec.validations[15].expression
           # Pinned by (name, key), not name alone: another key of the same Secret is not the
-          # release's to read (#283 review round 4).
+          # release's to read (#283).
           pattern: "has\\(e\\.valueFrom\\.secretKeyRef\\) && \\(\\(e\\.valueFrom\\.secretKeyRef\\.name == 's3-backup-creds' && e\\.valueFrom\\.secretKeyRef\\.key == 'access-key-id'\\) \\|\\| \\(e\\.valueFrom\\.secretKeyRef\\.name == 's3-backup-creds' && e\\.valueFrom\\.secretKeyRef\\.key == 'secret-access-key'\\)\\)"
       - matchRegex:
           path: spec.validations[15].expression
@@ -555,7 +555,7 @@ tests:
           path: spec.validations[17].expression
           pattern: "\\(e\\.name != 'CA_PEM' \\|\\| \\(has\\(e\\.valueFrom\\) && has\\(e\\.valueFrom\\.secretKeyRef\\) && e\\.valueFrom\\.secretKeyRef\\.name == 'ca' && e\\.valueFrom\\.secretKeyRef\\.key == 'pem'\\)\\)"
 
-  # Rule 5 grew the resolver pins (#283 review): hostAliases / dnsConfig / a non-default
+  # Rule 5 grew the resolver pins (#283): hostAliases / dnsConfig / a non-default
   # dnsPolicy redirect the S3 endpoint just as PGBACKREST_REPO1_S3_ENDPOINT would.
   - it: hostAliases, dnsConfig and a non-ClusterFirst dnsPolicy are denied
     values:
@@ -627,7 +627,7 @@ tests:
           pattern: "\\(m\\.mountPath == \"/tmp/scratch\" && !has\\(m\\.subPath\\) && has\\(v\\.emptyDir\\)\\)"
 
   # A leading underscore is a legal Kubernetes env name and must not become a render
-  # regression now that extraEnv names are CEL literals (#283 review).
+  # regression now that extraEnv names are CEL literals (#283).
   - it: an extraEnv name with a leading underscore renders
     values:
       - ../values-agent-control-restore.yaml
@@ -674,7 +674,7 @@ tests:
 
   # Rules 11/12 pin the WHOLE hardening surface the chart renders, not a subset: AppArmor,
   # SELinux and procMount are the unpinned twins of seccomp, and capabilities.drop the twin
-  # of add (#283 review).
+  # of add (#283).
   - it: AppArmor, SELinux, procMount and capabilities.drop are pinned with seccomp
     values:
       - ../values-agent-control-restore.yaml
@@ -724,7 +724,7 @@ tests:
 
   # Rule 19 pins the data mount to THIS release's claim, not to "some admitted PVC": with an
   # operator-declared extraVolumes PVC in the release, the restore could otherwise be aimed
-  # at that claim instead (#283 review).
+  # at that claim instead (#283).
   - it: the data mount is bound to the restore PVC by claimName
     values:
       - ../values-agent-control-restore.yaml
@@ -752,7 +752,7 @@ tests:
 
   # The free env tier (recovery point, stanza, log level) must be LITERAL: rule 16 admits the
   # release's own Secrets by (name, key), but TARGET sourced from one would still land in the
-  # status file on the data PVC (#283 review round 4).
+  # status file on the data PVC (#283).
   - it: the free env tier may not be valueFrom
     values:
       - ../values-agent-control-restore.yaml
@@ -798,7 +798,7 @@ tests:
 
   # `capabilities.add: []` and `supplementalGroups: []` are omitempty -- the apiserver drops
   # them -- so their pin must be the ABSENT form, not `== ['']` (which nothing can satisfy and
-  # which denied the release's own Job) (#283 review round 5).
+  # which denied the release's own Job) (#283).
   - it: empty capabilities.add and supplementalGroups pin as absent, not as an empty match
     values:
       - ../values-agent-control-restore.yaml
@@ -833,7 +833,7 @@ tests:
           path: spec.validations[10].expression
           pattern: "c\\.securityContext\\.runAsUser == 1000670000\\)"
 
-  # The hardening pins FOLLOW the values (#283 review round 6): an SELinux operator's
+  # The hardening pins FOLLOW the values (#283): an SELinux operator's
   # seLinuxOptions, a baseline's explicit appArmorProfile or procMount land on the Job verbatim,
   # and an unconditional !has() would deny the release's own restore.
   - it: hardening fields set in values are pinned or freed, never denied
@@ -882,7 +882,7 @@ tests:
           errorPattern: "a postgresql.podSecurityContext.supplementalGroups entry is \"103' \\|\\| true \\|\\| '\", which cannot be embedded"
 
   # seLinuxOptions set: type/user/role pinned (spc_t is the super-privileged domain), level free
-  # -- and a Localhost profile is pinned on the profile name too (#283 review round 7).
+  # -- and a Localhost profile is pinned on the profile name too (#283).
   - it: a set seLinuxOptions pins type and a Localhost profile pins its name
     values:
       - ../values-agent-control-restore.yaml
@@ -945,9 +945,8 @@ tests:
       - failedTemplate:
           errorPattern: "postgresql.podSecurityContext.supplementalGroups must be a list of group ids, got 103"
 
-  # `seLinuxOptions: {}` is an empty map -- falsy to Go templates, PRESENT to has() (a non-nil
-  # pointer the apiserver keeps). The pin must match what the Job renders, not deny it (#283
-  # review round 8).
+  # `seLinuxOptions: {}` is falsy to Go templates but present to has(); the pin must match
+  # what the Job renders (#283).
   - it: an empty seLinuxOptions map is pinned as present-and-empty, not absent
     values:
       - ../values-agent-control-restore.yaml

@@ -1910,19 +1910,14 @@ true
        "present and equal" when the release's values set the field, "absent" when they do
        not -- which is precisely the shape the rendered Job has, so the policy can never
        deny the release's own restore. Args: (list <CEL path> <values dict> <key>). */ -}}
-{{- /* pg.celProfilePin: the pin for a seccompProfile / appArmorProfile map at <path> (#283
-       review round 7). Absent when the values leave it unset; on .type when set, and on
-       .localhostProfile too when the type is Localhost -- a named profile is only as strong as
-       the one the caller can swap in. A profile set without a type is a render failure: the
-       apiserver would reject the release's own Job for it anyway, and silently dropping the
-       pin is the one outcome a security control may not have. Args: path, map, label. */ -}}
+{{- /* pg.celProfilePin: seccompProfile / appArmorProfile at <path> (#283). Absent when unset;
+       pinned on .type when set, plus .localhostProfile under Localhost. A profile without a
+       type fails the render (the apiserver rejects it anyway). Args: path, map, label. */ -}}
 {{- define "pg.celProfilePin" -}}
 {{- $path := index . 0 -}}
 {{- $p := index . 1 -}}
 {{- $label := index . 2 -}}
-{{- /* kindIs "map", not truthiness (#283 review round 8): `seccompProfile: {}` is an empty map,
-       which Go templates treat as false -- but the Job renders it and the apiserver keeps it
-       (a non-nil pointer), so it is PRESENT to has(). Only an absent key means absent. */ -}}
+{{- /* kindIs "map", not truthiness: `{}` is falsy to Go templates but present to has(). */ -}}
 {{- if not (kindIs "map" $p) -}}
 !has({{ $path }})
 {{- else if not $p.type -}}
@@ -1934,20 +1929,18 @@ true
 {{- end -}}
 {{- end -}}
 
-{{- /* pg.celSELinuxPin: seLinuxOptions at <path>. Absent when unset; when set, .type/.user/.role
-       are pinned exactly (they are the escalation-relevant fields -- spc_t is the
-       super-privileged domain) and .level is left free (an MCS level carries a comma, which the
-       CEL literal charset refuses, and it cannot widen a domain). Args: path, map. */ -}}
+{{- /* pg.celSELinuxPin: seLinuxOptions at <path>. Absent when unset; type/user/role pinned when
+       set (spc_t is the super-privileged domain), level free (it cannot widen a domain and
+       carries a comma). Args: path, map. */ -}}
 {{- define "pg.celSELinuxPin" -}}
 {{- $path := index . 0 -}}
 {{- $o := index . 1 -}}
-{{- /* kindIs "map", not truthiness: `seLinuxOptions: {}` is present to has() (see celProfilePin). */ -}}
 {{- if not (kindIs "map" $o) -}}
 !has({{ $path }})
 {{- else -}}
 {{- $pins := list (printf "has(%s)" $path) -}}
 {{- range $f := list "type" "user" "role" -}}
-{{- /* Truthiness here is right: an empty string is omitempty on the object, so it is absent. */ -}}
+{{- /* An empty string is omitempty on the object, so absent. */ -}}
 {{- if index $o $f -}}
 {{- $pins = append $pins (printf "has(%s.%s) && %s.%s == '%s'" $path $f $path $f (index $o $f | toString)) -}}
 {{- else -}}
@@ -1967,9 +1960,7 @@ true
 {{- if kindIs "string" $v -}}
 (has({{ $path }}) && {{ $path }} == '{{ $v }}')
 {{- else if and (kindIs "float64" $v) (eq (float64 (int64 $v)) $v) -}}
-{{- /* helm parses every number as float64 and prints large ones in scientific notation
-       (runAsUser: 1000670000 -> 1.00067e+09). CEL would still compare it equal, but a
-       security pin should read exactly, and above 2^53 the float loses the value. */ -}}
+{{- /* helm's float64 prints 1000670000 as 1.00067e+09; a pin should read exactly. */ -}}
 (has({{ $path }}) && {{ $path }} == {{ printf "%d" (int64 $v) }})
 {{- else -}}
 (has({{ $path }}) && {{ $path }} == {{ $v }})
@@ -1998,11 +1989,8 @@ true
 {{- range $pair := . -}}
 {{- $label := index $pair 0 -}}
 {{- $value := index $pair 1 | toString -}}
-{{- /* One character class, one or more times (#283 review). It used to require an alphanumeric
-       FIRST character, which rejected legal input for no safety gain: a Kubernetes env name
-       may begin with `_` (`_JAVA_OPTIONS`), a mountPath begins with `/`, a JVM flag begins
-       with `-`, and none of them is any less safe at the start of a single-quoted CEL string
-       than in the middle of one. The `+` is what rejects the empty string. */ -}}
+{{- /* One class, one or more times (#283): a leading `_`, `/` or `-` is legal input and no
+       less safe at the start of a CEL literal than in the middle. */ -}}
 {{- if not (regexMatch "^[A-Za-z0-9._:/@-]+$" $value) -}}
 {{- fail (printf "%s is %q, which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9._:/@-]+$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $label $value) -}}
 {{- end -}}

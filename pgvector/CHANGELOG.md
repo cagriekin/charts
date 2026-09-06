@@ -4,65 +4,33 @@
 
 ### Changed
 
-- **A `pgbackrest.extraVolumeMounts` path at or under `/etc/pgbackrest/conf.d` is refused at
-  render time when the restore admission policy is enabled (#283).** Both values
-  together were a hole in the restore admission policy: the pods' ServiceAccount holds
-  `create configmaps`, so a fragment directory sourced from a ConfigMap that does not exist
-  yet let a holder of the job-create grant inject pgbackrest options (`repo1-host-cmd` is code
-  execution) into the otherwise-pinned restore Job. Without `control.restore`, the #323
-  passthrough there is unchanged. If you run both, move the fragments out of `conf.d` before
-  upgrading; the render names the mount and the fix.
-- **`PGBACKREST_LOG_LEVEL_CONSOLE` is a reserved `pgbackrest.extraEnv` name (#283).** The HA
-  agent sets it on the API-driven restore Job under `readPodLogs`, and the admission policy
-  now pins every declared literal by value -- so an operator-declared copy would deny every
-  API restore the moment log reading was on. Declaring it fails the render, in every
-  configuration, with the message naming the agent. Remove the entry; there is no other
-  passthrough for that option while the admission policy is on (a `conf.d` fragment is the
-  general route, and this release refuses it under the policy for the reason above).
+- **Two values that rendered on 2.0.1 now fail the render (#283).** `pgbackrest.extraEnv` may
+  not name `PGBACKREST_LOG_LEVEL_CONSOLE` (the agent sets it on the API-driven restore Job, and
+  the admission policy now pins every declared literal by value). And while the restore
+  admission policy is enabled, a `pgbackrest.extraVolumeMounts` path at or under
+  `/etc/pgbackrest/conf.d` is refused: the pods' ServiceAccount can create a ConfigMap that
+  does not exist yet, which would be pgbackrest option injection into the pinned Job. Remove
+  the env entry; move fragments out of `conf.d`. Both messages name the fix.
 
 ### Fixed
 
-- **The restore admission policy now pins `FORCE` and allowlists env names (#283).** The
-  #279 policy bounds what the restore Job *is* and deliberately left its parameters free, on
-  the reasoning that choosing the recovery point is the feature. That is right for
-  `TARGET_TYPE`/`TARGET`/`BACKUP_SET` and wrong for `FORCE`: it is `pgbackrest restore
-  --force`, the bypass of the `postmaster.pid` interlock the 1.10.0 notes relied on when they
-  said a token-holder's restore "still needs the StatefulSet already scaled to 0". With
-  `FORCE` free that was assumed, not enforced -- anyone holding the job-create grant could
-  restore over a running primary at any moment. Two new rules: `FORCE` must be present, a
-  literal, pinned on every occurrence, and equal to what `pgbackrest.restore.force` renders
-  (so an operator who sets it `true` for a stale pid file still gets a working Job); and env
-  *names* are an allowlist of exactly what the restore `jobTemplate` renders, with `PGDATA`
-  and the pgbackrest log/lock paths pinned by value and the credential/requester entries
-  required to stay `valueFrom` and every literal `pgbackrest.extraEnv` pinned to its declared
-  value (an empty value as absent-or-empty); every mount bound to its rendered path, `subPath`
-  and source, the data mount to this release's PVC by name, and `/scripts` to exactly the
-  `restore.sh` key (the same ConfigMap carries `validate.sh`, which `rm -rf`s PGDATA and
-  restores with no interlock); pod-template annotations limited to the agent's requester
-  stamp; the rest of the rendered security context pinned alongside seccomp and following the
-  values like every other pin -- `fsGroup`, `runAsGroup`, `capabilities.drop`, `procMount`
-  exact; `appArmorProfile`/`seccompProfile` on `type` (and `localhostProfile`);
-  `seLinuxOptions` on `type`/`user`/`role`; `sysctls`/`supplementalGroups` absent when unset; `hostAliases`/`dnsConfig`/a non-default `dnsPolicy` denied (a
-  resolver redirect of the S3 endpoint is a source redirect without any env); probes denied alongside lifecycle hooks (a probe exec is a second command); finalizers denied on the Job and its pod template (the agent has no `patch`, so one finalizer would wedge the only permitted Job name for good); `valueFrom`
-  Secrets and ConfigMaps pinned by name *and* key and the free env names required to be
-  literals (`TARGET` sourced from a Secret would land in the status file on the data PVC); and
-  a `pgbackrest.extraVolumeMounts` path at or under `/etc/pgbackrest/conf.d` (pgbackrest's
-  config-include-path) refused at render time while the admission policy is enabled,
-  because the pods' ServiceAccount can create a ConfigMap that does not exist yet. Operator values
-  (`extraEnv` values, `extraVolumeMounts` paths) are emitted as JSON string literals, so no
-  charset restriction applies to them. The two render-time changes that reject a
-  previously-working release are the ones under Changed above; the policy also now fails the
-  render, by name, on three shapes the apiserver would reject anyway (a security profile
-  without a `type`, `Localhost` without a `localhostProfile`, a scalar `supplementalGroups`).
-  The env allowlist is what
-  makes the `FORCE` pin mean anything --
-  pgbackrest reads any `PGBACKREST_<OPTION>` from the environment, so an unlisted
-  `PGBACKREST_FORCE=y` would have been `--force` under another name, `PGBACKREST_REPO1_S3_*`
-  a restore from someone else's repository, and `BASH_ENV` code execution before the pinned
-  command ran. The recovery-point parameters and the stanza stay free; the API overrides the
-  former by design and the latter only selects within this release's own repository. This
-  raises the bypass to a reviewable values change; it is not a proof that `--force` is
-  unreachable from inside the container, and the README says so.
+- **The restore admission policy now bounds the restore Job's parameters, not only its shape
+  (#283).** The #279 policy left every env value free, on the reasoning that choosing the
+  recovery point is the feature. That is right for `TARGET_TYPE`/`TARGET`/`BACKUP_SET` and wrong
+  for `FORCE` -- `pgbackrest restore --force`, the bypass of the `postmaster.pid` interlock the
+  1.10.0 notes relied on for "still needs the StatefulSet scaled to 0". Now pinned, following
+  the values like every other pin: `FORCE` present, literal, on every occurrence, equal to
+  `pgbackrest.restore.force`; env names an allowlist of what the jobTemplate renders (pgbackrest
+  reads any `PGBACKREST_<OPTION>` from the environment, so `PGBACKREST_FORCE` was `--force`
+  under another name), literals by value, `valueFrom` entries by their rendered source and
+  Secret key; every mount by path, subPath and source, `/scripts` projecting exactly
+  `restore.sh` (the same ConfigMap carries `validate.sh`, which `rm -rf`s PGDATA); no probes,
+  finalizers, `hostAliases`/`dnsConfig`, extra pod annotations, `volumeDevices` or `ports`;
+  the full rendered security context including AppArmor, SELinux, `procMount`,
+  `capabilities.drop` and `supplementalGroups`. Operator values are emitted as JSON CEL
+  literals, so no charset applies to them. This raises `--force` to a reviewable values change;
+  it is not a proof the interlock is unreachable -- the modeled attacker owns `postmaster.pid`
+  and the README says so.
 
 ## 2.0.1 - 2026-09-02
 

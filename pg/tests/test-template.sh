@@ -5061,7 +5061,7 @@ assert_not_contains "#283 force=true: nothing still pins 'false'" "${ctl_vap_for
 for free in TARGET_TYPE TARGET BACKUP_SET PGBACKREST_LOG_LEVEL_CONSOLE; do
   assert_not_contains "#283: ${free} is not pinned (the API overrides it)" "${ctl_vap}" "e.name == '${free}'"
 done
-# --- #283 review: the env-name allowlist (rule 18) ---
+# --- #283: the env-name allowlist (rule 18) ---
 # The FORCE pin means nothing on its own: pgbackrest reads any PGBACKREST_<OPTION> from the
 # environment, so FORCE=false plus an unlisted PGBACKREST_FORCE=y is --force under another
 # name. Rule 18 allowlists env NAMES to what the jobTemplate renders. This is the drift pair
@@ -5093,7 +5093,7 @@ env_drift "shared+encrypted+extraEnv" \
   "$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true "${ctl_shared_enc_args[@]}" --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)" \
   "$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true "${ctl_shared_enc_args[@]}" --show-only templates/pgbackrest-restore-job.yaml 2>&1)"
 
-# --- #283 review: mounts (rule 19) and resolver (rule 5) ---
+# --- #283: mounts (rule 19) and resolver (rule 5) ---
 # Rule 15 closes the set of volume SOURCES but says nothing about where each is mounted; the
 # permitted data PVC mounted at /scripts is the pinned command running caller-written bytes.
 # Each chart mount is bound to (path, subPath, source kind), and the drift pair below reads
@@ -5120,7 +5120,7 @@ assert_contains_literal "#283 annotations: only the agent's requester stamp is a
 assert_contains_literal "#283 hardening: AppArmor, SELinux and procMount are pinned absent on the container when unset" "${ctl_vap}" \
   "!has(c.securityContext.appArmorProfile) && !has(c.securityContext.seLinuxOptions) && !has(c.securityContext.procMount)"
 # ...and FOLLOW the values when set: the Job renders the security contexts verbatim, so an
-# unconditional !has() would deny an SELinux operator's own restore (#283 review round 6).
+# unconditional !has() would deny an SELinux operator's own restore (#283).
 ctl_vap_hard=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
   --set-json 'postgresql.containerSecurityContext={"runAsUser":101,"seLinuxOptions":{"level":"s0:c123,c456"},"appArmorProfile":{"type":"RuntimeDefault"},"procMount":"Default"}' \
   --set-json 'postgresql.podSecurityContext={"fsGroup":103,"supplementalGroups":[103,1000670000],"appArmorProfile":{"type":"RuntimeDefault"}}' \
@@ -5249,7 +5249,7 @@ assert_contains "#283 mounts: ...naming the mount" "${ctl_vap_dangling}" 'pgback
 # Resolver pins: a hostAliases entry redirects the S3 endpoint as surely as an env var would.
 assert_contains_literal "#283 resolver: hostAliases, dnsConfig and a non-default dnsPolicy are denied" "${ctl_vap}" \
   "!has(variables.pod.hostAliases) && !has(variables.pod.dnsConfig) && (!has(variables.pod.dnsPolicy) || variables.pod.dnsPolicy == 'ClusterFirst')"
-# A leading underscore is a legal env name and must still render (#283 review).
+# A leading underscore is a legal env name and must still render (#283).
 ctl_vap_uscore_rc=0
 helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
   --set-json 'pgbackrest.extraEnv=[{"name":"_JAVA_OPTIONS","value":"-Xmx1g"}]' >/dev/null 2>&1 || ctl_vap_uscore_rc=$?
@@ -5369,7 +5369,7 @@ ctl_vap_shared=$(helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
   --set pgbackrest.s3.keyType=shared --set pgbackrest.existingSecret.name=s3creds \
   --set pgbackrest.repoEncryption.enabled=true --set pgbackrest.repoEncryption.existingSecret.name=cipher \
   --set pgbackrest.restore.enabled=true --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
-# By (name, key), not name alone (#283 review): another key of the same Secret is not the
+# By (name, key), not name alone (#283): another key of the same Secret is not the
 # release's to read.
 assert_contains "#279 shared keys: only this release's own Secrets are reachable" "${ctl_vap_shared}" \
   "e.valueFrom.secretKeyRef.name == 's3creds' && e.valueFrom.secretKeyRef.key == 'access-key-id'"
