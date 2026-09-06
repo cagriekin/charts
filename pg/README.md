@@ -991,7 +991,7 @@ this release's ServiceAccount, and requires of every Job that subject creates:
 | no `envFrom`; `valueFrom` limited to the downward API and this release's own Secrets | the same bound for env — a key from any other Secret or ConfigMap |
 | `FORCE` == the literal `pgbackrest.restore.force` renders — present, not duplicated, not sourced from `valueFrom` | `pgbackrest restore --force`, the bypass of the `postmaster.pid` interlock. Without this pin, "restore this release to a point of your choosing" becomes "restore over a **running** primary at any moment"; with it, the bypass is a reviewable values change (#283) |
 | no `hostAliases`, no `dnsConfig`, `dnsPolicy` left at `ClusterFirst` | redirecting the S3 endpoint named in the mounted `pgbackrest.conf` by resolver instead of by env — with `pgbackrest.s3.verifyTls: false` (a supported MinIO/Ceph configuration) that is a restore from the caller's bucket into the live PGDATA (#283) |
-| every `volumeMount` bound to its rendered `(mountPath, subPath, source kind)`; the two ConfigMap paths pinned to this release's pgbackrest ConfigMap; no `subPathExpr` | the permitted data PVC mounted at `/scripts` is the pinned command running bytes the caller wrote into PGDATA earlier; mounted at `/etc/pgbackrest/conf.d` it supplies every pgbackrest option the env allowlist keeps out (#283) |
+| every `volumeMount` bound to its rendered `(mountPath, subPath, source)`; the data mount to this release's PVC by `claimName`; the two ConfigMap paths to this release's pgbackrest ConfigMap, `/scripts` projecting exactly `restore.sh`; no `subPathExpr` | the permitted data PVC mounted at `/scripts` is the pinned command running bytes the caller wrote into PGDATA earlier; mounted at `/etc/pgbackrest/conf.d` it supplies every pgbackrest option the env allowlist keeps out; and the same ConfigMap's `validate.sh` projected as `restore.sh` would `rm -rf` the live PGDATA and restore with no interlock (#283) |
 | pod and container **hardening fields absent** as rendered: no `appArmorProfile`, `seLinuxOptions`, `procMount`; `capabilities.drop` as rendered; pod-template **annotations** limited to the agent's `pg-ha/requested-by` | the unpinned twins of the seccomp pin — `appArmorProfile: Unconfined` (or its legacy annotation spelling) strips the runtime's default profile on any AppArmor node, `seLinuxOptions` requests a type or level on SELinux nodes (#283) |
 | env **names** limited to what the restore `jobTemplate` renders; `PGDATA`, the pgbackrest log/lock paths **and every literal `pgbackrest.extraEnv` value** pinned; the credential and requester entries must stay `valueFrom` | the route around the `FORCE` pin: pgbackrest reads any `PGBACKREST_<OPTION>` from the environment, so an unlisted `PGBACKREST_FORCE=y` is `--force` under another name, `PGBACKREST_REPO1_S3_ENDPOINT` is a restore from someone else's repository, and `BASH_ENV`/`LD_PRELOAD` are code execution before the pinned command's first line. A free `PGDATA` would aim the shell interlock at a directory that does not exist (#283) |
 
@@ -1044,14 +1044,13 @@ cluster:
 - **It is not a check that the Job matches the release in full.** CEL sees only the admission
   request, so the verbatim-`jobTemplate` clone remains what guarantees the rest. This is
   defence in depth on top of that.
-- **The pinned ConfigMap's `items` and an absent `extraVolumes` ConfigMap are the caller's.**
-  A Job may remap which key of this release's pgbackrest ConfigMap lands at
-  `/scripts/restore.sh` (breakage, not injection — the token cannot update that ConfigMap),
-  and the pods' ServiceAccount holds an unscoped `create configmaps`, so if a
-  `pgbackrest.extraVolumes` ConfigMap does not exist yet, a token-holder can create it with
-  content of their choosing and have it mounted at the path you pinned. Create the ConfigMaps
-  you reference before enabling the feature, and keep their mount paths out of
-  `/etc/pgbackrest/conf.d`.
+- **An absent `extraVolumes` ConfigMap is the caller's.** The pods' ServiceAccount holds an
+  unscoped `create configmaps`, so if a `pgbackrest.extraVolumes` ConfigMap does not exist
+  yet, a token-holder can create it with content of their choosing and have it mounted at the
+  path you pinned. Create the ConfigMaps you reference before enabling the feature, and keep
+  their mount paths out of `/etc/pgbackrest/conf.d`. (The release's own pgbackrest ConfigMap
+  is not remappable: `/scripts` must project exactly the `restore.sh` key, because the same
+  ConfigMap carries `validate.sh`, which begins with `rm -rf "$PGDATA"`.)
 - **It fails closed against mutating webhooks.** The env-name and mount allowlists deny the
   restore Job if a namespace webhook injects an env var or a mount into it (proxy and APM
   injectors do exactly that), the same way the pod-label allowlist already does. Exclude the

@@ -17,17 +17,18 @@
   *names* are an allowlist of exactly what the restore `jobTemplate` renders, with `PGDATA`
   and the pgbackrest log/lock paths pinned by value and the credential/requester entries
   required to stay `valueFrom` and every literal `pgbackrest.extraEnv` pinned to its declared
-  value; every mount bound to its rendered path, `subPath` and source (the permitted data PVC
-  mounted at `/scripts` would be the pinned command running caller-written bytes); pod-template
-  annotations limited to the agent's requester stamp and `appArmorProfile`/`seLinuxOptions`/
-  `procMount` pinned absent alongside seccomp; and `hostAliases`/`dnsConfig`/a non-default
-  `dnsPolicy` denied (a resolver redirect of the S3 endpoint is a source redirect without any
-  env). With the policy enabled, `pgbackrest.extraEnv` names and values and
-  `pgbackrest.extraVolumeMounts` paths now pass through the same CEL-literal charset check as
-  every other interpolated pin (`^[A-Za-z0-9._:/@-]+$`); a value outside it --
-  a proxy URL with a query string, a path with a space -- fails the render with the existing
-  `admissionPolicy.enabled=false` + `acknowledgeUnbounded=true` escape hatch. The env
-  allowlist is what makes the `FORCE` pin mean anything --
+  value (an empty value as absent-or-empty); every mount bound to its rendered path, `subPath`
+  and source, the data mount to this release's PVC by name, and `/scripts` to exactly the
+  `restore.sh` key (the same ConfigMap carries `validate.sh`, which `rm -rf`s PGDATA and
+  restores with no interlock); pod-template annotations limited to the agent's requester
+  stamp; the rest of the rendered security context -- `fsGroup`, `runAsGroup`,
+  `capabilities.drop`, and `appArmorProfile`/`seLinuxOptions`/`procMount`/`sysctls` absent --
+  pinned alongside seccomp; and `hostAliases`/`dnsConfig`/a non-default `dnsPolicy` denied (a
+  resolver redirect of the S3 endpoint is a source redirect without any env). Operator values
+  (`extraEnv` values, `extraVolumeMounts` paths) are emitted as JSON string literals, so
+  anything that rendered on 2.0.1 still renders; `PGBACKREST_LOG_LEVEL_CONSOLE` joins the
+  reserved `pgbackrest.extraEnv` names because the agent sets it. The env allowlist is what
+  makes the `FORCE` pin mean anything --
   pgbackrest reads any `PGBACKREST_<OPTION>` from the environment, so an unlisted
   `PGBACKREST_FORCE=y` would have been `--force` under another name, `PGBACKREST_REPO1_S3_*`
   a restore from someone else's repository, and `BASH_ENV` code execution before the pinned

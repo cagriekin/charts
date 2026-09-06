@@ -439,6 +439,10 @@ tests:
     documentIndex: 0
     asserts:
       # Rules 16, 17 and 18 are the ones that inspect env entries; 18 pins by `e.name != X ||`.
+      # (Indices hold while the fixture renders resources -- rule 13 is conditional on them.)
+      - lengthEqual:
+          path: spec.validations
+          count: 20
       - notMatchRegex:
           path: spec.validations[15].expression
           pattern: "e\\.name (==|!=) '(TARGET_TYPE|TARGET|BACKUP_SET|PGBACKREST_LOG_LEVEL_CONSOLE)'"
@@ -466,6 +470,27 @@ tests:
       - matchRegex:
           path: spec.validations[17].expression
           pattern: "e\\.name in \\['PGBACKREST_LOCK_PATH','PGBACKREST_LOG_PATH','PGDATA','PGBACKREST_STANZA','TARGET_TYPE','TARGET','BACKUP_SET','FORCE','PGBACKREST_LOG_LEVEL_CONSOLE','RESTORE_REQUESTED_BY','PGBACKREST_REPO1_S3_KEY','PGBACKREST_REPO1_S3_KEY_SECRET'\\]"
+
+  # The KinD overlay's literal extraEnv: a value is pinned as a JSON (double-quoted) CEL
+  # literal, an EMPTY value as "absent or empty" -- EnvVar.Value is omitempty, so has(e.value)
+  # is false for the release's own `value: ""` and a pin requiring it would deny the own Job.
+  - it: the passthrough overlay pins a literal by value and an empty literal as absent-or-empty
+    values:
+      - ../values-agent-control-restore.yaml
+      - ../values-agent-control-restore-passthrough.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "\\(e\\.name != 'PGBACKREST_LOG_LEVEL_FILE' \\|\\| \\(!has\\(e\\.valueFrom\\) && has\\(e\\.value\\) && e\\.value == \"detail\"\\)\\)"
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "\\(e\\.name != 'RESTORE_SUITE_MARKER' \\|\\| \\(!has\\(e\\.valueFrom\\) && \\(!has\\(e\\.value\\) \\|\\| e\\.value == ''\\)\\)\\)"
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "\\(m\\.mountPath == \"/tmp/scratch\" && !has\\(m\\.subPath\\) && has\\(v\\.emptyDir\\)\\)"
       - matchRegex:
           path: spec.validations[17].expression
           pattern: "\\(!\\(e\\.name in \\['RESTORE_REQUESTED_BY','PGBACKREST_REPO1_S3_KEY','PGBACKREST_REPO1_S3_KEY_SECRET'\\]\\) \\|\\| has\\(e\\.valueFrom\\)\\)"
@@ -520,7 +545,7 @@ tests:
     asserts:
       - matchRegex:
           path: spec.validations[17].expression
-          pattern: "\\(e\\.name != 'HTTPS_PROXY' \\|\\| \\(!has\\(e\\.valueFrom\\) && has\\(e\\.value\\) && e\\.value == 'http://proxy:3128'\\)\\)"
+          pattern: "\\(e\\.name != 'HTTPS_PROXY' \\|\\| \\(!has\\(e\\.valueFrom\\) && has\\(e\\.value\\) && e\\.value == \"http://proxy:3128\"\\)\\)"
       - matchRegex:
           path: spec.validations[17].expression
           pattern: "'PGBACKREST_REPO1_S3_KEY_SECRET','CA_PEM'\\]\\) \\|\\| has\\(e\\.valueFrom\\)"
@@ -555,10 +580,12 @@ tests:
           pattern: "\\(m\\.mountPath == '/var/lib/postgresql/data' && !has\\(m\\.subPath\\) && has\\(v\\.persistentVolumeClaim\\) && v\\.persistentVolumeClaim\\.claimName == 'data-test-pg-0'\\)"
       - matchRegex:
           path: spec.validations[18].expression
-          pattern: "\\(m\\.mountPath == '/etc/pgbackrest/pgbackrest\\.conf' && has\\(m\\.subPath\\) && m\\.subPath == 'pgbackrest\\.conf' && has\\(v\\.configMap\\) && v\\.configMap\\.name == 'test-pg-pgbackrest'\\)"
+          pattern: "\\(m\\.mountPath == '/etc/pgbackrest/pgbackrest\\.conf' && has\\(m\\.subPath\\) && m\\.subPath == 'pgbackrest\\.conf' && has\\(v\\.configMap\\) && v\\.configMap\\.name == 'test-pg-pgbackrest' && !has\\(v\\.configMap\\.items\\)\\)"
+      # The same ConfigMap carries validate.sh, which rm -rf's PGDATA and restores with no
+      # interlock -- so /scripts must project exactly the restore.sh key.
       - matchRegex:
           path: spec.validations[18].expression
-          pattern: "\\(m\\.mountPath == '/scripts' && !has\\(m\\.subPath\\) && has\\(v\\.configMap\\) && v\\.configMap\\.name == 'test-pg-pgbackrest'\\)"
+          pattern: "\\(m\\.mountPath == '/scripts' && !has\\(m\\.subPath\\) && has\\(v\\.configMap\\) && v\\.configMap\\.name == 'test-pg-pgbackrest' && has\\(v\\.configMap\\.items\\) && size\\(v\\.configMap\\.items\\) == 1 && v\\.configMap\\.items\\.all\\(i, i\\.key == 'restore\\.sh' && \\(!has\\(i\\.path\\) \\|\\| i\\.path == 'restore\\.sh'\\)\\)\\)"
       - matchRegex:
           path: spec.validations[18].expression
           pattern: "\\(m\\.mountPath == '/work' && !has\\(m\\.subPath\\) && has\\(v\\.emptyDir\\)\\)"
@@ -589,10 +616,10 @@ tests:
     asserts:
       - matchRegex:
           path: spec.validations[18].expression
-          pattern: "\\(m\\.mountPath == '/etc/ssl/s3' && has\\(m\\.subPath\\) && m\\.subPath == 'ca\\.pem' && has\\(v\\.secret\\) && v\\.secret\\.secretName == 's3-ca'\\)"
+          pattern: "\\(m\\.mountPath == \"/etc/ssl/s3\" && has\\(m\\.subPath\\) && m\\.subPath == \"ca\\.pem\" && has\\(v\\.secret\\) && v\\.secret\\.secretName == 's3-ca'\\)"
       - matchRegex:
           path: spec.validations[18].expression
-          pattern: "\\(m\\.mountPath == '/tmp/scratch' && !has\\(m\\.subPath\\) && has\\(v\\.emptyDir\\)\\)"
+          pattern: "\\(m\\.mountPath == \"/tmp/scratch\" && !has\\(m\\.subPath\\) && has\\(v\\.emptyDir\\)\\)"
 
   # A leading underscore is a legal Kubernetes env name and must not become a render
   # regression now that extraEnv names are CEL literals (#283 review).
@@ -611,20 +638,34 @@ tests:
           path: spec.validations[17].expression
           pattern: "'_JAVA_OPTIONS'"
 
-  # An extraEnv value that cannot be single-quoted into CEL fails the render, with the
-  # standard escape hatch, rather than rendering a pin that is a tautology.
-  - it: an extraEnv value the CEL literal validator rejects fails the render
+  # An extraEnv value is emitted as a JSON string literal, so any value that rendered on
+  # 2.0.1 still renders -- NO_PROXY is comma-separated by definition, PGOPTIONS carries `=`
+  # and spaces -- and a quote inside it is escaped, never a tautology.
+  - it: extraEnv values with commas, spaces, quotes and query strings render as JSON literals
     values:
       - ../values-agent-control-restore.yaml
     set:
       pgbackrest.extraEnv:
-        - name: HTTPS_PROXY
-          value: "http://p:3128/?x=1"
+        - name: NO_PROXY
+          value: "10.0.0.0/8,localhost"
+        - name: PGOPTIONS
+          value: "-c statement_timeout=0"
+        - name: QUOTED
+          value: "a'b\"c"
     templates:
       - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
     asserts:
-      - failedTemplate:
-          errorPattern: "the pgbackrest.extraEnv value of HTTPS_PROXY is \"http://p:3128/\\?x=1\", which cannot be embedded"
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "e\\.value == \"10\\.0\\.0\\.0/8,localhost\""
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "e\\.value == \"-c statement_timeout=0\""
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "e\\.value == \"a'b\\\\\"c\""
+
 
   # Rules 11/12 pin the WHOLE hardening surface the chart renders, not a subset: AppArmor,
   # SELinux and procMount are the unpinned twins of seccomp, and capabilities.drop the twin
@@ -645,6 +686,20 @@ tests:
       - matchRegex:
           path: spec.validations[11].expression
           pattern: "!has\\(variables\\.pod\\.securityContext\\.appArmorProfile\\) && !has\\(variables\\.pod\\.securityContext\\.seLinuxOptions\\)"
+      # ...and the rest of what the chart renders: fsGroup/runAsGroup by value, the list
+      # fields the values do not set pinned absent.
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "variables\\.pod\\.securityContext\\.fsGroup == 103"
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "!has\\(variables\\.pod\\.securityContext\\.sysctls\\) && !has\\(variables\\.pod\\.securityContext\\.supplementalGroups\\) && !has\\(variables\\.pod\\.securityContext\\.fsGroupChangePolicy\\)"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.runAsGroup == 103"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "!has\\(c\\.securityContext\\.readOnlyRootFilesystem\\)"
 
   # Rule 20: pod-template annotations are an allowlist, because the legacy AppArmor
   # annotation selects a profile as surely as the field does.
@@ -677,6 +732,18 @@ tests:
       - matchRegex:
           path: spec.validations[18].expression
           pattern: "m\\.mountPath == '/var/lib/postgresql/data' && !has\\(m\\.subPath\\) && has\\(v\\.persistentVolumeClaim\\) && v\\.persistentVolumeClaim\\.claimName == 'data-test-pg-2'"
+
+  - it: a capabilities.drop entry that would break CEL fails the render
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.capabilities.drop:
+        - "ALL' || true || '"
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "a postgresql.containerSecurityContext.capabilities.drop entry is \"ALL' \\|\\| true \\|\\| '\", which cannot be embedded"
 
   # --- the binding ---
   #

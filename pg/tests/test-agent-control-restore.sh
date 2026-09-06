@@ -103,8 +103,10 @@ kubectl create secret generic "${TLS_SECRET}" -n "${NAMESPACE}" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 echo "Installing pg chart (agent mode, control API + restore triggering)..."
+# The passthrough overlay is what makes the baseline `admit '.'` below a positive test of the
+# policy's extraEnv (literal + empty) and extraVolumeMounts tiers on a real apiserver (#283).
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" -n "${NAMESPACE}" \
-  -f "${VALUES}" --wait --timeout 10m
+  -f "${VALUES}" -f "${SCRIPT_DIR}/values-agent-control-restore-passthrough.yaml" --wait --timeout 10m
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 900
 
 # --- the granted RBAC is exactly what was documented, no wider ---
@@ -272,9 +274,24 @@ assert_contains "VAP #283: the AppArmor annotation spelling is denied" \
 assert_contains "VAP #283: removing capabilities.drop is denied" \
   "$(admit 'del(.spec.template.spec.containers[0].securityContext.capabilities.drop)')" \
   "this release's container security context"
-# An operator-declared literal extraEnv is pinned by value, not merely allowed by name. The
-# fixture declares none, so assert the shape the other way: a literal under a name the
-# jobTemplate renders as valueFrom is the same tier violation and is denied above.
+# The fixture declares a literal extraEnv, an EMPTY one and an extra mount, so the baseline
+# `admit '.'` above is the positive case for all three tiers on a real apiserver. The literal
+# is pinned by VALUE: the names an operator adds are exactly the ones whose value is the attack.
+assert_contains "VAP #283: a changed extraEnv literal is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="PGBACKREST_LOG_LEVEL_FILE" then .value="off" else . end)')" \
+  "${allow_msg}"
+assert_contains "VAP #283: giving the empty extraEnv a value is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="RESTORE_SUITE_MARKER" then .value="x" else . end)')" \
+  "${allow_msg}"
+# The permitted ConfigMap also carries validate.sh, which begins with rm -rf "$PGDATA" and
+# then restores with no interlock at all -- projecting it as restore.sh would be a
+# destroy-and-restore primitive under the pinned command, with no FORCE and no code execution.
+assert_contains "VAP #283: projecting validate.sh as restore.sh is denied" \
+  "$(admit '.spec.template.spec.volumes |= map(if .name=="restore-script" then .configMap.items=[{key:"validate.sh",path:"restore.sh"}] else . end)')" \
+  "${mount_msg}"
+assert_contains "VAP #283: dropping the items pin on /scripts is denied" \
+  "$(admit '.spec.template.spec.volumes |= map(if .name=="restore-script" then del(.configMap.items) else . end)')" \
+  "${mount_msg}"
 # ...and the one name the agent adds itself (readPodLogs) is admitted, or toggling log
 # reading would deny the agent's own Job.
 assert_eq "VAP #283: the agent's PGBACKREST_LOG_LEVEL_CONSOLE is admitted" "allowed" \

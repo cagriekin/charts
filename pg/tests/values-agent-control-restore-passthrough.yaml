@@ -1,0 +1,21 @@
+# Layered on values-agent-control-restore.yaml by the KinD suite and one unit case (#283
+# review): pgbackrest passthrough the admission policy has to ADMIT on the release's own Job.
+# A separate file, not part of the base fixture, because test-template.sh layers
+# values-pgbackrest-extra.yaml over the base and a list in the base would replace its
+# extraEnv/extraVolumes wholesale.
+#
+# A literal extraEnv (pinned by value), an EMPTY one (core/v1.EnvVar.Value is omitempty, so
+# the apiserver drops it and the pin must tolerate absence), and an extra mount bound to its
+# extraVolumes source. All harmless to the restore itself.
+pgbackrest:
+  extraEnv:
+    - name: PGBACKREST_LOG_LEVEL_FILE
+      value: detail
+    - name: RESTORE_SUITE_MARKER
+      value: ""
+  extraVolumes:
+    - name: scratch
+      emptyDir: {}
+  extraVolumeMounts:
+    - name: scratch
+      mountPath: /tmp/scratch
