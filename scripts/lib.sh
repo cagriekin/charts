@@ -85,6 +85,9 @@ fixture_base() {
     # #323's passthrough fixture sets pgbackrest.extraEnv/extraVolumes without enabling
     # pgbackrest; standalone it hits the "set but pgbackrest.enabled is false" validator.
     pg/values-pgbackrest-extra.yaml) echo "${chart}/tests/values-pgbackrest.yaml" ;;
+    # #283's admission-policy passthrough overlay: the same validator, layered on the KinD
+    # restore fixture by test-agent-control-restore.sh.
+    pg/values-agent-control-restore-passthrough.yaml) echo "${chart}/tests/values-agent-control-restore.yaml" ;;
     *) echo "" ;;
   esac
 }
