@@ -5206,7 +5206,9 @@ ctl_vap_inj=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --se
   --set-string "pgbackrest.restore.force=' || true || '" 2>&1) && ctl_vap_inj_rc=0 || ctl_vap_inj_rc=$?
 assert_eq "#283: a non-boolean force fails the schema before it can reach CEL" "1" \
   "$([ "${ctl_vap_inj_rc}" -ne 0 ] && echo 1 || echo 0)"
-assert_contains "#283: ...and it is the schema that rejects it" "${ctl_vap_inj}" "pgbackrest/restore/force.*boolean"
+# helm 3 says `pgbackrest.restore.force: Invalid type. Expected: boolean`, helm 4 says
+# `at '/pgbackrest/restore/force': got string, want boolean` -- match what both share.
+assert_contains "#283: ...and it is the schema that rejects it" "${ctl_vap_inj}" "restore.force.*boolean"
 
 # The >= 1.30 requirement is enforced by asking whether admissionregistration.k8s.io/v1
 # EXISTS, not by comparing .Capabilities.KubeVersion: with no cluster that reports the HELM
