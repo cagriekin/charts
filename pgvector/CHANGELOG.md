@@ -1,6 +1,6 @@
 # pgvector chart changelog
 
-## 2.1.0 - 2026-09-06
+## 2.0.2 - 2026-09-06
 
 ### Changed
 
