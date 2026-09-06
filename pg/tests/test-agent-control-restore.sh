@@ -277,8 +277,10 @@ assert_contains "VAP #283: an Unconfined AppArmor profile is denied" \
 assert_contains "VAP #283: the AppArmor annotation spelling is denied" \
   "$(admit '.spec.template.metadata.annotations = {"container.apparmor.security.beta.kubernetes.io/pgbackrest-restore":"unconfined"}')" \
   "may carry only the pod annotation pg-ha/requested-by"
+# The apiserver's own validation requires hostUsers=false for Unmasked (user namespaces), so
+# the mutation sets both -- otherwise the request never reaches admission.
 assert_contains "VAP #283: flipping procMount to Unmasked is denied" \
-  "$(admit '.spec.template.spec.containers[0].securityContext.procMount = "Unmasked"')" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.procMount = "Unmasked" | .spec.template.spec.hostUsers = false')" \
   "this release's container security context"
 assert_contains "VAP #283: changing supplementalGroups is denied" \
   "$(admit '.spec.template.spec.securityContext.supplementalGroups = [0]')" \
