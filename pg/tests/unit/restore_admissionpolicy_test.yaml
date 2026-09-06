@@ -799,7 +799,9 @@ tests:
   - it: empty capabilities.add and supplementalGroups pin as absent, not as an empty match
     values:
       - ../values-agent-control-restore.yaml
-      - ../values-agent-control-restore-passthrough.yaml
+    set:
+      postgresql.containerSecurityContext.capabilities.add: []
+      postgresql.podSecurityContext.supplementalGroups: []
     templates:
       - templates/agent-restore-admissionpolicy.yaml
     documentIndex: 0
@@ -827,6 +829,54 @@ tests:
       - matchRegex:
           path: spec.validations[10].expression
           pattern: "c\\.securityContext\\.runAsUser == 1000670000\\)"
+
+  # The hardening pins FOLLOW the values (#283 review round 6): an SELinux operator's
+  # seLinuxOptions, a baseline's explicit appArmorProfile or procMount land on the Job verbatim,
+  # and an unconditional !has() would deny the release's own restore.
+  - it: hardening fields set in values are pinned or freed, never denied
+    values:
+      - ../values-agent-control-restore.yaml
+      - ../values-agent-control-restore-passthrough.yaml
+    set:
+      postgresql.containerSecurityContext.seLinuxOptions:
+        level: "s0:c123,c456"
+      postgresql.containerSecurityContext.appArmorProfile:
+        type: RuntimeDefault
+      postgresql.podSecurityContext.appArmorProfile:
+        type: RuntimeDefault
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - notMatchRegex:
+          path: spec.validations[10].expression
+          pattern: "!has\\(c\\.securityContext\\.(seLinuxOptions|appArmorProfile|procMount)\\)"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.appArmorProfile\\.type == 'RuntimeDefault'\\)"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.procMount == 'Default'\\)"
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "variables\\.pod\\.securityContext\\.appArmorProfile\\.type == 'RuntimeDefault'\\)"
+      # A gid past 1e6 renders as an exact integer, and the list stays homogeneous (the k8s
+      # CEL environment rejects [103, 1e+06] at compile time -- an apply-time failure).
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "variables\\.pod\\.securityContext\\.supplementalGroups == \\[103, 1000670000\\]"
+
+  - it: a non-numeric supplementalGroups entry fails the render
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.podSecurityContext.supplementalGroups:
+        - "103' || true || '"
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "a postgresql.podSecurityContext.supplementalGroups entry is \"103' \\|\\| true \\|\\| '\", which cannot be embedded"
 
   # --- the binding ---
   #

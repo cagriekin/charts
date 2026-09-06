@@ -7,14 +7,16 @@
 # A literal extraEnv (pinned by value), an EMPTY one (core/v1.EnvVar.Value is omitempty, so
 # the apiserver drops it and the pin must tolerate absence), and an extra mount bound to its
 # extraVolumes source. All harmless to the restore itself.
-# The two omitempty spellings that once rendered a pin the apiserver could never satisfy
-# (`== ['']`, and an exact supplementalGroups match on a list the server drops).
+# The omitempty spelling that once rendered a pin the apiserver could never satisfy
+# (`add: [] -> == ['']`), a hardening field the pins must FOLLOW rather than deny (procMount),
+# and a supplementalGroups list with a gid past 1e6 (helm's %v would print 1.00067e+09).
 postgresql:
   containerSecurityContext:
     capabilities:
       add: []
+    procMount: Default
   podSecurityContext:
-    supplementalGroups: []
+    supplementalGroups: [103, 1000670000]
 pgbackrest:
   extraEnv:
     - name: PGBACKREST_LOG_LEVEL_FILE

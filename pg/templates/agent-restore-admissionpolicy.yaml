@@ -362,12 +362,21 @@
 {{- /* AppArmor, SELinux and procMount are the unpinned twins of the seccomp pin below (#283
        review): appArmorProfile.type=Unconfined strips the runtime's default profile on any
        AppArmor node (Debian -- the HA image's own base), seLinuxOptions requests a type or
-       level on SELinux nodes, procMount=Unmasked exposes /proc. The chart renders none of
-       them, so absence is the pin and it costs nothing. Rule 20 closes the legacy
-       container.apparmor.security.beta.kubernetes.io/<container> annotation spelling. */}}
-{{- $hardeningPins := list
-      "!has(c.securityContext.appArmorProfile)" "!has(c.securityContext.seLinuxOptions)" "!has(c.securityContext.procMount)"
-      "!has(c.volumeDevices)" "!has(c.ports)" }}
+       level on SELinux nodes, procMount=Unmasked exposes /proc. Rule 20 closes the legacy
+       container.apparmor.security.beta.kubernetes.io/<container> annotation spelling.
+
+       They FOLLOW THE VALUES like every other pin (#283 review round 6): the Job renders
+       postgresql.containerSecurityContext verbatim, so an SELinux operator's seLinuxOptions or
+       a hardening baseline's explicit appArmorProfile lands on the Job, and an unconditional
+       !has() would deny the release's own restore. Absent when the values leave them unset
+       (the default, which is where the attack lives); appArmorProfile pinned on .type like
+       seccomp; procMount pinned exactly; seLinuxOptions free when set (its level carries a
+       comma the CEL charset refuses, and pinning it buys nothing an operator who set it needs). */}}
+{{- $hardeningPins := list "!has(c.volumeDevices)" "!has(c.ports)" }}
+{{- if not $csc.appArmorProfile }}{{- $hardeningPins = append $hardeningPins "!has(c.securityContext.appArmorProfile)" }}
+{{- else if $csc.appArmorProfile.type }}{{- $hardeningPins = append $hardeningPins (printf "(has(c.securityContext.appArmorProfile) && has(c.securityContext.appArmorProfile.type) && c.securityContext.appArmorProfile.type == '%s')" $csc.appArmorProfile.type) }}{{- end }}
+{{- if not $csc.seLinuxOptions }}{{- $hardeningPins = append $hardeningPins "!has(c.securityContext.seLinuxOptions)" }}{{- end }}
+{{- $hardeningPins = append $hardeningPins (include "pg.celScalarPin" (list "c.securityContext.procMount" $csc "procMount")) }}
 {{- $cscPins := concat (list
       (include "pg.celScalarPin" (list "c.securityContext.privileged" $csc "privileged"))
       (include "pg.celScalarPin" (list "c.securityContext.allowPrivilegeEscalation" $csc "allowPrivilegeEscalation"))
@@ -381,6 +390,9 @@
        a list-of-objects pin for sysctls is not worth the drift risk against a value the
        operator deliberately chose. */}}
 {{- $pscAbsent := list }}
+{{- if not $psc.appArmorProfile }}{{- $pscAbsent = append $pscAbsent "!has(variables.pod.securityContext.appArmorProfile)" }}
+{{- else if $psc.appArmorProfile.type }}{{- $pscAbsent = append $pscAbsent (printf "(has(variables.pod.securityContext.appArmorProfile) && has(variables.pod.securityContext.appArmorProfile.type) && variables.pod.securityContext.appArmorProfile.type == '%s')" $psc.appArmorProfile.type) }}{{- end }}
+{{- if not $psc.seLinuxOptions }}{{- $pscAbsent = append $pscAbsent "!has(variables.pod.securityContext.seLinuxOptions)" }}{{- end }}
 {{- range $f := list "sysctls" "supplementalGroups" "fsGroupChangePolicy" }}
 {{- /* Emptiness, not hasKey: `supplementalGroups: []` and `sysctls: []` are omitempty and
        vanish at the apiserver, so absent is the right pin for them too (#283 review round 5). */}}
@@ -389,7 +401,10 @@
 {{- /* supplementalGroups is a flat int list, so when the values DO set it, it is pinned by
        exact equality like capabilities.drop (#283 review round 4); sysctls stays free when set. */}}
 {{- with $psc.supplementalGroups }}
-{{- $g := list }}{{- range . }}{{- $g = append $g (toString .) }}{{- end }}
+{{- /* Integral float64 printed as %d (helm's `%v` goes scientific at 1e6, and the k8s CEL
+       environment forbids a heterogeneous [103, 1e+06] literal -- an apply-time compile
+       error); anything else is registered as a literal below so it fails the render. */}}
+{{- $g := list }}{{- range . }}{{- if and (kindIs "float64" .) (eq (float64 (int64 .)) .) }}{{- $g = append $g (printf "%d" (int64 .)) }}{{- else }}{{- $g = append $g (toString .) }}{{- end }}{{- end }}
 {{- $pscAbsent = append $pscAbsent (printf "(has(variables.pod.securityContext.supplementalGroups) && variables.pod.securityContext.supplementalGroups == [%s])" (join ", " $g)) }}
 {{- end }}
 {{- /* When the values set NOTHING, the rule is "no securityContext, OR one that sets none of
@@ -410,8 +425,7 @@
       (include "pg.celScalarPin" (list "variables.pod.securityContext.runAsGroup" $psc "runAsGroup"))
       (include "pg.celScalarPin" (list "variables.pod.securityContext.fsGroup" $psc "fsGroup"))
       (include "pg.celScalarPin" (list "variables.pod.securityContext.runAsNonRoot" $psc "runAsNonRoot"))
-      $pscSeccomp
-      "!has(variables.pod.securityContext.appArmorProfile)" "!has(variables.pod.securityContext.seLinuxOptions)") $pscAbsent }}
+      $pscSeccomp) $pscAbsent }}
 {{- $pscRule := "" }}
 {{- if $psc }}
 {{- $pscRule = printf "has(variables.pod.securityContext) && %s" (join " && " $pscPins) }}
@@ -484,6 +498,12 @@
 {{- range $f := list "runAsUser" "runAsGroup" "fsGroup" "runAsNonRoot" }}
 {{- if and (hasKey $psc $f) (kindIs "string" (index $psc $f)) }}{{- $literals = append $literals (list (printf "postgresql.podSecurityContext.%s" $f) (index $psc $f)) }}{{- end }}
 {{- end }}
+{{- range $sg := ($psc.supplementalGroups | default list) }}
+{{- if not (kindIs "float64" $sg) }}{{- $literals = append $literals (list "a postgresql.podSecurityContext.supplementalGroups entry" $sg) }}{{- end }}
+{{- end }}
+{{- with $csc.procMount }}{{- $literals = append $literals (list "postgresql.containerSecurityContext.procMount" .) }}{{- end }}
+{{- with $csc.appArmorProfile }}{{- with .type }}{{- $literals = append $literals (list "postgresql.containerSecurityContext.appArmorProfile.type" .) }}{{- end }}{{- end }}
+{{- with $psc.appArmorProfile }}{{- with .type }}{{- $literals = append $literals (list "postgresql.podSecurityContext.appArmorProfile.type" .) }}{{- end }}{{- end }}
 {{- /* extraEnv VALUES and extraVolumeMounts paths are emitted with toJson (see $extraEnvPinned),
        so they need no charset registration; the names above do, because they sit inside the
        single-quoted `e.name in [...]` list. */}}

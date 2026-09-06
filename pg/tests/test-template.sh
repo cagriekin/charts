@@ -5117,8 +5117,24 @@ assert_contains_literal "#283 mounts: the data mount is bound to the restore PVC
 assert_contains_literal "#283 annotations: only the agent's requester stamp is admitted" "${ctl_vap}" \
   "object.spec.template.metadata.annotations.all(k, k in ['pg-ha/requested-by'])"
 # AppArmor/SELinux/procMount are the unpinned twins of seccomp; capabilities.drop of add.
-assert_contains_literal "#283 hardening: AppArmor, SELinux and procMount are pinned absent on the container" "${ctl_vap}" \
+assert_contains_literal "#283 hardening: AppArmor, SELinux and procMount are pinned absent on the container when unset" "${ctl_vap}" \
   "!has(c.securityContext.appArmorProfile) && !has(c.securityContext.seLinuxOptions) && !has(c.securityContext.procMount)"
+# ...and FOLLOW the values when set: the Job renders the security contexts verbatim, so an
+# unconditional !has() would deny an SELinux operator's own restore (#283 review round 6).
+ctl_vap_hard=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.containerSecurityContext={"runAsUser":101,"seLinuxOptions":{"level":"s0:c123,c456"},"appArmorProfile":{"type":"RuntimeDefault"},"procMount":"Default"}' \
+  --set-json 'postgresql.podSecurityContext={"fsGroup":103,"supplementalGroups":[103,1000670000],"appArmorProfile":{"type":"RuntimeDefault"}}' \
+  --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_not_contains "#283 hardening: a set seLinuxOptions is not pinned absent" "${ctl_vap_hard}" '!has(c.securityContext.seLinuxOptions)'
+assert_contains_literal "#283 hardening: a set appArmorProfile is pinned on its type" "${ctl_vap_hard}" "c.securityContext.appArmorProfile.type == 'RuntimeDefault')"
+assert_contains_literal "#283 hardening: ...on the pod too" "${ctl_vap_hard}" "variables.pod.securityContext.appArmorProfile.type == 'RuntimeDefault')"
+assert_contains_literal "#283 hardening: a set procMount is pinned exactly" "${ctl_vap_hard}" "c.securityContext.procMount == 'Default')"
+assert_contains_literal "#283 hardening: supplementalGroups render as exact, homogeneous integers" "${ctl_vap_hard}" \
+  "variables.pod.securityContext.supplementalGroups == [103, 1000670000])"
+ctl_vap_sg_inj=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json "postgresql.podSecurityContext.supplementalGroups=[\"103' || true || '\"]" 2>&1) && ctl_vap_sg_inj_rc=0 || ctl_vap_sg_inj_rc=$?
+assert_eq "#283 hardening: a non-numeric supplementalGroups entry fails the render" "1" "$([ "${ctl_vap_sg_inj_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283 hardening: ...through pg.validateCelLiterals" "${ctl_vap_sg_inj}" 'supplementalGroups entry is .* which cannot be embedded'
 assert_contains_literal "#283 hardening: ...and on the pod" "${ctl_vap}" \
   "!has(variables.pod.securityContext.appArmorProfile) && !has(variables.pod.securityContext.seLinuxOptions)"
 assert_contains_literal "#283 hardening: capabilities.drop is pinned to the rendered list" "${ctl_vap}" \
@@ -5254,7 +5270,7 @@ assert_contains_literal "#283 extraEnv: an empty value is pinned as absent-or-em
 ctl_vap_xenv_res=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
   --set-json 'pgbackrest.extraEnv=[{"name":"PGBACKREST_LOG_LEVEL_CONSOLE","value":"off"}]' 2>&1) && ctl_vap_xenv_res_rc=0 || ctl_vap_xenv_res_rc=$?
 assert_eq "#283 extraEnv: the agent-owned PGBACKREST_LOG_LEVEL_CONSOLE is reserved" "1" "$([ "${ctl_vap_xenv_res_rc}" -ne 0 ] && echo 1 || echo 0)"
-assert_contains "#283 extraEnv: ...by pg.validatePgbackrestPassthrough" "${ctl_vap_xenv_res}" 'PGBACKREST_LOG_LEVEL_CONSOLE" is set by the chart'
+assert_contains "#283 extraEnv: ...by pg.validatePgbackrestPassthrough" "${ctl_vap_xenv_res}" 'PGBACKREST_LOG_LEVEL_CONSOLE" is set by the chart or the HA agent'
 assert_contains_literal "#283 extraEnv: a valueFrom entry joins the valueFrom-only tier" "${ctl_vap_xenv}" "'RESTORE_REQUESTED_BY','CA_PEM']) || has(e.valueFrom)"
 # An extraEnv NAME is operator input that lands in a CEL literal, so it goes through
 # pg.validateCelLiterals like every other one.

@@ -1277,7 +1277,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- $n := ($e.name | default "") | toString -}}
   {{- if not $n -}}{{- fail (printf "pgbackrest.extraEnv[%d]: name is required" $i) -}}{{- end -}}
   {{- if has $n $chartEnv -}}
-    {{- fail (printf "pgbackrest.extraEnv[%d]: %q is set by the chart on one or more of the pgbackrest containers and may not be overridden -- a duplicate env name is last-wins at runtime, so this would silently shadow the chart/Secret value (e.g. pointing a restore at the wrong stanza, or a backup at the wrong repository credentials). Use the chart's own value for this setting instead." $i $n) -}}
+    {{- fail (printf "pgbackrest.extraEnv[%d]: %q is set by the chart or the HA agent on one or more of the pgbackrest containers and may not be overridden -- a duplicate env name is last-wins at runtime, so this would silently shadow the chart/Secret value (e.g. pointing a restore at the wrong stanza, or a backup at the wrong repository credentials). Use the chart's own value for this setting instead." $i $n) -}}
   {{- end -}}
   {{- if has $n $envNames -}}{{- fail (printf "pgbackrest.extraEnv[%d]: duplicate env name %q" $i $n) -}}{{- end -}}
   {{- $envNames = append $envNames $n -}}

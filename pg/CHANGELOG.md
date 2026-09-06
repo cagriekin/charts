@@ -12,6 +12,12 @@
   execution) into the otherwise-pinned restore Job. Without `control.restore`, the #323
   passthrough there is unchanged. If you run both, move the fragments out of `conf.d` before
   upgrading; the render names the mount and the fix.
+- **`PGBACKREST_LOG_LEVEL_CONSOLE` is a reserved `pgbackrest.extraEnv` name (#283).** The HA
+  agent sets it on the API-driven restore Job under `readPodLogs`, and the admission policy
+  now pins every declared literal by value -- so an operator-declared copy would deny every
+  API restore the moment log reading was on. Declaring it fails the render, in every
+  configuration, with the message naming the agent. Remove the entry; pgbackrest's
+  `log-level-console` belongs in `pgbackrest.config` if you need it elsewhere.
 
 ### Fixed
 
@@ -41,9 +47,9 @@
   a `pgbackrest.extraVolumeMounts` path at or under `/etc/pgbackrest/conf.d` (pgbackrest's
   config-include-path) refused at render time while `ha.agent.control.restore` is enabled,
   because the pods' ServiceAccount can create a ConfigMap that does not exist yet. Operator values
-  (`extraEnv` values, `extraVolumeMounts` paths) are emitted as JSON string literals, so
-  anything that rendered on 2.0.1 still renders; `PGBACKREST_LOG_LEVEL_CONSOLE` joins the
-  reserved `pgbackrest.extraEnv` names because the agent sets it. The env allowlist is what
+  (`extraEnv` values, `extraVolumeMounts` paths) are emitted as JSON string literals, so no
+  charset restriction applies to them; the two render-time changes are the ones under Changed
+  above. The env allowlist is what
   makes the `FORCE` pin mean anything --
   pgbackrest reads any `PGBACKREST_<OPTION>` from the environment, so an unlisted
   `PGBACKREST_FORCE=y` would have been `--force` under another name, `PGBACKREST_REPO1_S3_*`
