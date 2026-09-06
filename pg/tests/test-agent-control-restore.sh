@@ -243,6 +243,16 @@ assert_contains "VAP #283: TARGET sourced from a Secret is denied (the free tier
 assert_contains "VAP #283: another key of the release's own Secret is denied" \
   "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="PGBACKREST_REPO1_S3_KEY" then .valueFrom.secretKeyRef.key="other" else . end)')" \
   "may reference only the downward API"
+# A finalizer the agent can never remove (no patch) would wedge the one permitted Job name.
+assert_contains "VAP #283: a Job finalizer is denied" \
+  "$(admit '.metadata.finalizers = ["example.com/hold"]')" \
+  "may not carry finalizers"
+assert_contains "VAP #283: a pod-template finalizer is denied" \
+  "$(admit '.spec.template.metadata.finalizers = ["example.com/hold"]')" \
+  "may not carry finalizers"
+assert_contains "VAP #283: terminationMessagePath is denied" \
+  "$(admit '.spec.template.spec.containers[0].terminationMessagePath = "/scripts/restore.sh"')" \
+  "this release's container security context"
 assert_contains "VAP #283: re-sourcing RESTORE_REQUESTED_BY from a Secret is denied" \
   "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="RESTORE_REQUESTED_BY" then {name:"RESTORE_REQUESTED_BY",valueFrom:{secretKeyRef:{name:"s3-backup-creds",key:"access-key-id"}}} else . end)')" \
   "${allow_msg}"

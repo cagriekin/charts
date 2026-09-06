@@ -982,9 +982,9 @@ this release's ServiceAccount, and requires of every Job that subject creates:
 | `automountServiceAccountToken: false`, stated explicitly (absent is a denial) | makes naming a ServiceAccount moot: the pod gets no token |
 | no `hostNetwork` / `hostPID` / `hostIPC`, no explicit `nodeName`, and only this release's `priorityClassName` | escape to the node; placing the pod by hand instead of through the scheduler; and claiming a high-priority class so the scheduler **preempts this release's own postgresql pods** (referencing a PriorityClass needs no permission). `nodeSelector`/`tolerations` stay unpinned — inherited from `postgresql.*` so the restore can land where the volume attaches, and unlike priority they can only *restrict* placement |
 | the **pod's own labels**: only this release's restore labels plus the batch controller's | joining this release's Service endpoints. A restore pod labelled `component=postgresql` would be added to the write Service — with no readiness probe it is Ready at once — and would receive application traffic and its credentials |
-| no `manualSelector` | a caller-supplied Job selector and identity labels |
+| no `manualSelector`, no finalizers on the Job or its pod template | a caller-supplied Job selector and identity labels; and a Job the agent could never delete — the SA has no `patch`, so one finalizer would wedge the only permitted Job name and kill the break-glass path for good |
 | exactly one container, no init or ephemeral containers, running this release's HA image | what code enters the cluster on this token |
-| `command` == this release's restore entrypoint, no `args`, no `lifecycle` hooks, no probes | the image pin alone is weak — the postgresql container already runs this image against this volume. Without this, the Job is "run anything as the database's uid with the live PGDATA mounted", which destroys data with no privilege escalation at all. A `postStart` exec hook would sidestep a `command`-only pin |
+| `command` == this release's restore entrypoint, no `args`, no `lifecycle` hooks, no probes, no `terminationMessagePath` | the image pin alone is weak — the postgresql container already runs this image against this volume. Without this, the Job is "run anything as the database's uid with the live PGDATA mounted", which destroys data with no privilege escalation at all. A `postStart` exec hook would sidestep a `command`-only pin |
 | this release's **pod and container `securityContext`** (`privileged`, `allowPrivilegeEscalation`, `runAsUser`, `runAsNonRoot`, added capabilities) | a root/privileged container with `CAP_SYS_ADMIN` — which reads every other pod's token off the kubelet and is *strictly more* than the token started with |
 | CPU and memory requests and limits present; `parallelism` and `completions` ≤ 1 | one permitted Job name as a repeatable way to fill the namespace quota and evict the database's own pods |
 | volumes limited to the three the restore template renders (`emptyDir`, ConfigMap `<release>-pg-pgbackrest`, PVC `data-<release>-pg-<podOrdinal>`) | with the token gone this is the one that matters most: arbitrary Secret mounts, `hostPath`, and projected service-account tokens all fall out as denials |
@@ -1044,10 +1044,11 @@ cluster:
 - **It is not a check that the Job matches the release in full.** CEL sees only the admission
   request, so the verbatim-`jobTemplate` clone remains what guarantees the rest. This is
   defence in depth on top of that.
-- **An absent `extraVolumes` ConfigMap is the caller's.** The pods' ServiceAccount holds an
-  unscoped `create configmaps`, so if a `pgbackrest.extraVolumes` ConfigMap does not exist
-  yet, a token-holder can create it with content of their choosing and have it mounted at the
-  path you pinned. Create the ConfigMaps you reference before enabling the feature; a mount
+- **An absent ConfigMap you reference is the caller's.** The pods' ServiceAccount holds an
+  unscoped `create configmaps`, so if a ConfigMap named by `pgbackrest.extraVolumes` or by a
+  `pgbackrest.extraEnv` `configMapKeyRef` does not exist yet, a token-holder can create it with
+  content of their choosing — mounted at the path you pinned, or read into the env name you
+  declared. Create the ConfigMaps you reference before enabling the feature; a mount
   at or under `/etc/pgbackrest/conf.d` (pgbackrest's config-include-path) is refused at
   render time while this policy is enabled, for the same reason — without it (and so without
   the bounded grant) the #323 passthrough there is unaffected. (The release's own pgbackrest ConfigMap

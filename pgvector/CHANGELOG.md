@@ -42,7 +42,7 @@
   values like every other pin -- `fsGroup`, `runAsGroup`, `capabilities.drop`, `procMount`
   exact; `appArmorProfile`/`seccompProfile` on `type` (and `localhostProfile`);
   `seLinuxOptions` on `type`/`user`/`role`; `sysctls`/`supplementalGroups` absent when unset; `hostAliases`/`dnsConfig`/a non-default `dnsPolicy` denied (a
-  resolver redirect of the S3 endpoint is a source redirect without any env); probes denied alongside lifecycle hooks (a probe exec is a second command); `valueFrom`
+  resolver redirect of the S3 endpoint is a source redirect without any env); probes denied alongside lifecycle hooks (a probe exec is a second command); finalizers denied on the Job and its pod template (the agent has no `patch`, so one finalizer would wedge the only permitted Job name for good); `valueFrom`
   Secrets and ConfigMaps pinned by name *and* key and the free env names required to be
   literals (`TARGET` sourced from a Secret would land in the status file on the data PVC); and
   a `pgbackrest.extraVolumeMounts` path at or under `/etc/pgbackrest/conf.d` (pgbackrest's

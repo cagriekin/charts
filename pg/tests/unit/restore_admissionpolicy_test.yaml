@@ -920,7 +920,7 @@ tests:
     asserts:
       - matchRegex:
           path: spec.validations[10].expression
-          pattern: "^variables\\.pod\\.containers\\.all\\(c, !has\\(c\\.volumeDevices\\) && !has\\(c\\.ports\\) && \\(!has\\(c\\.securityContext\\) \\|\\| \\("
+          pattern: "^variables\\.pod\\.containers\\.all\\(c, !has\\(c\\.volumeDevices\\) && !has\\(c\\.ports\\) && !has\\(c\\.terminationMessagePath\\) && \\(!has\\(c\\.securityContext\\) \\|\\| \\("
 
   - it: a profile set without a type fails the render
     values:
@@ -998,6 +998,18 @@ tests:
       - matchRegex:
           path: spec.validations[10].expression
           pattern: "has\\(c\\.securityContext\\.seLinuxOptions\\) && !has\\(c\\.securityContext\\.seLinuxOptions\\.type\\)"
+
+  # A finalizer would wedge the one permitted Job name forever (the SA has no patch).
+  - it: finalizers are denied on the Job and its pod template
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[6].expression
+          pattern: "!has\\(object\\.metadata\\.finalizers\\) && \\(!has\\(object\\.spec\\.template\\.metadata\\) \\|\\| !has\\(object\\.spec\\.template\\.metadata\\.finalizers\\)\\)"
 
   # --- the binding ---
   #

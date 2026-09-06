@@ -428,9 +428,9 @@
        would error. */}}
 {{- $cscRule := "" }}
 {{- if $csc }}
-{{- $cscRule = printf "variables.pod.containers.all(c, !has(c.volumeDevices) && !has(c.ports) && has(c.securityContext) && %s)" (join " && " $cscPins) }}
+{{- $cscRule = printf "variables.pod.containers.all(c, !has(c.volumeDevices) && !has(c.ports) && !has(c.terminationMessagePath) && has(c.securityContext) && %s)" (join " && " $cscPins) }}
 {{- else }}
-{{- $cscRule = printf "variables.pod.containers.all(c, !has(c.volumeDevices) && !has(c.ports) && (!has(c.securityContext) || (%s)))" (join " && " $cscPins) }}
+{{- $cscRule = printf "variables.pod.containers.all(c, !has(c.volumeDevices) && !has(c.ports) && !has(c.terminationMessagePath) && (!has(c.securityContext) || (%s)))" (join " && " $cscPins) }}
 {{- end }}
 {{- $pscPins := concat (list
       (include "pg.celScalarPin" (list "variables.pod.securityContext.runAsUser" $psc "runAsUser"))
@@ -667,9 +667,12 @@ spec:
     #    container, so nothing new is reachable); sysctls and
     #    fsGroupChangePolicy ONLY when the values set them (pinned absent otherwise, see
     #    $pscAbsent; supplementalGroups is pinned exactly either way); imagePullSecrets,
-    #    runtimeClassName, schedulerName, hostname/subdomain, workingDir, mountPropagation
-    #    and terminationMessagePath (none reaches past the pinned image, command and
-    #    volumes). volumeDevices and container ports are denied (rule 11) -- neither is
+    #    runtimeClassName, schedulerName, hostname/subdomain, workingDir and mountPropagation
+    #    (none can introduce caller-chosen code or reach a Secret; Bidirectional propagation
+    #    needs privileged, which rule 11 pins absent). terminationMessagePath is DENIED (#283
+    #    review round 10): pointed at /scripts/restore.sh it makes the kubelet bind an empty
+    #    host file over the pinned script -- not code the caller chose, but not the command
+    #    either, and the chart never sets it. volumeDevices and container ports are denied (rule 11) -- neither is
     #    exploitable, both are one clause.
     - expression: "(!has(variables.pod.hostNetwork) || variables.pod.hostNetwork == false) && (!has(variables.pod.hostPID) || variables.pod.hostPID == false) && (!has(variables.pod.hostIPC) || variables.pod.hostIPC == false) && !has(variables.pod.nodeName) && {{ $pcnPin }} && !has(variables.pod.hostAliases) && !has(variables.pod.dnsConfig) && (!has(variables.pod.dnsPolicy) || variables.pod.dnsPolicy == 'ClusterFirst')"
       message: "hostNetwork, hostPID, hostIPC, an explicit nodeName, any priorityClassName other than this release's, hostAliases, dnsConfig and any dnsPolicy other than ClusterFirst are not permitted on the pg agent's Jobs -- the last three would let the caller redirect the S3 endpoint the restore reads from (#283)"
@@ -690,8 +693,16 @@ spec:
     #    template labels, and #6 pins those, so a manual selector cannot be aimed at this
     #    release's postgresql pods even without this rule. What it removes is the case where
     #    a Job's identity labels are caller-supplied rather than server-assigned.
-    - expression: "!has(object.spec.manualSelector) || object.spec.manualSelector == false"
-      message: "the pg agent's Jobs may not set manualSelector: the API server must generate the Job's pod selector and identity labels"
+    #
+    #    Finalizers ride here too (#283 review round 10): the SA holds get/delete on the pinned
+    #    Job name but no patch/update, so a Job created once with metadata.finalizers can never
+    #    be deleted by the agent -- POST /v1/restore then fails forever at "already exists" and
+    #    DELETE at waitForJobDeleted. "create on that single object" (rule 1) is untrue when the
+    #    object can be made a permanent tombstone. Pod-template finalizers propagate to the pod
+    #    (an undeletable Pod per restore); denied for the same reason. Neither `kubectl create
+    #    job --from` nor CloneCronJobToJob sets either, so the release's own Job is unaffected.
+    - expression: "(!has(object.spec.manualSelector) || object.spec.manualSelector == false) && !has(object.metadata.finalizers) && (!has(object.spec.template.metadata) || !has(object.spec.template.metadata.finalizers))"
+      message: "the pg agent's Jobs may not set manualSelector (the API server must generate the Job's pod selector and identity labels) and may not carry finalizers on the Job or its pod template -- the agent cannot remove one, so it would wedge the only permitted Job name forever (#283)"
       reason: Forbidden
     # 8+9. One container, running the release's own image. The agent already refuses to
     #    clone a jobTemplate with anything other than exactly one container (it will not

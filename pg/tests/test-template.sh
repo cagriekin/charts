@@ -5071,7 +5071,7 @@ allowlist() { grep -o "e.name in \['[^]]*'\]" <<< "$1" | head -1 | sed "s/e.name
 # Env names, from the CronJob's env block only (volumes and mounts carry `- name:` too, so
 # stop at the first `volumeMounts:`). Charset is what validateCelLiterals admits, not just
 # upper-case, so a lower-case or dotted extraEnv name cannot slip past the drift check.
-cj_env_names() { awk '/^ *env:$/{f=1;next} /volumeMounts:/{f=0} f && /^ *- name: [A-Za-z_.0-9-]+$/{sub(/.*- name: /, ""); print}' <<< "$1" | sort; }
+cj_env_names() { awk '/^ *env:$/{f=1;next} /volumeMounts:/{f=0} f && /^ *- name: [A-Za-z0-9._:\/@-]+$/{sub(/.*- name: /, ""); print}' <<< "$1" | sort; }
 # The drift pair, as a function so it runs over every configuration the jobTemplate branches
 # on -- a new env added under `if repoEncryption.enabled` would otherwise be caught by no
 # render but the hand-written string assertions.
@@ -5146,7 +5146,11 @@ assert_contains_literal "#283 hardening: a Localhost profile pins its name" "${c
 ctl_vap_nullcsc=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
   --set-json 'postgresql.containerSecurityContext=null' --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
 assert_contains_literal "#283 hardening: volumeDevices/ports hold with no container securityContext" "${ctl_vap_nullcsc}" \
-  "variables.pod.containers.all(c, !has(c.volumeDevices) && !has(c.ports) && (!has(c.securityContext) || ("
+  "variables.pod.containers.all(c, !has(c.volumeDevices) && !has(c.ports) && !has(c.terminationMessagePath) && (!has(c.securityContext) || ("
+# A finalizer on the Job (or its pod template) is a permanent tombstone on the one permitted
+# name: the SA has no patch, so the agent could never remove it.
+assert_contains_literal "#283: finalizers are denied on the Job and its pod template" "${ctl_vap}" \
+  "!has(object.metadata.finalizers) && (!has(object.spec.template.metadata) || !has(object.spec.template.metadata.finalizers))"
 ctl_vap_notype=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
   --set-json 'postgresql.podSecurityContext.appArmorProfile={"localhostProfile":"p"}' 2>&1) && ctl_vap_notype_rc=0 || ctl_vap_notype_rc=$?
 assert_eq "#283 hardening: a profile without a type fails the render" "1" "$([ "${ctl_vap_notype_rc}" -ne 0 ] && echo 1 || echo 0)"
