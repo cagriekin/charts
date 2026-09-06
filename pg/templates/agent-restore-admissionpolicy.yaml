@@ -152,7 +152,11 @@
        mount is refused while control.restore is enabled; without the grant the risk is not
        there and #323's behaviour is untouched. */}}
 {{- $mp := $m.mountPath | toString }}
-{{- if or (eq (trimSuffix "/" $mp) "/etc/pgbackrest/conf.d") (hasPrefix "/etc/pgbackrest/conf.d/" $mp) }}
+{{- /* Compared NORMALISED (collapsed slashes, no trailing slash), for the reason the passthrough
+       validator gives: runc resolves //etc/pgbackrest//conf.d to the same directory. The pin
+       below still uses the raw string, because that is what the jobTemplate renders. */}}
+{{- $mpNorm := regexReplaceAll "/+" $mp "/" | trimSuffix "/" }}
+{{- if or (eq $mpNorm "/etc/pgbackrest/conf.d") (hasPrefix "/etc/pgbackrest/conf.d/" $mpNorm) }}
 {{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath %q is at or under /etc/pgbackrest/conf.d, pgbackrest's config-include-path, and ha.agent.control.restore is enabled (#283). The pods' ServiceAccount can create ConfigMaps, so a fragment directory sourced from a ConfigMap that does not exist yet would let a token holder inject pgbackrest options (repo1-host-cmd is code execution) into the restore Job the admission policy otherwise pins. Move the fragment out of conf.d, or run the restore API without control.restore" $i $mn $mp) }}
 {{- end }}
 {{- $pin := dict "path" $mp "subPath" (($m.subPath | default "") | toString) "kind" "" "field" "" "value" "" }}
@@ -323,7 +327,11 @@
 {{- $psc := .Values.postgresql.podSecurityContext | default dict }}
 {{- $caps := $csc.capabilities | default dict }}
 {{- $addPin := "(!has(c.securityContext.capabilities) || !has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0)" }}
-{{- if hasKey $caps "add" }}
+{{- /* On the VALUE, not hasKey (#283 review round 5): `capabilities.add: []` is a common PSS
+       spelling, and Capabilities.Add is omitempty, so the apiserver drops the empty list --
+       `== ['']` would then deny the release's own Job. The no-key branch above is already the
+       right pin for an empty list. */}}
+{{- if $caps.add }}
 {{- $addPin = printf "(has(c.securityContext.capabilities) && has(c.securityContext.capabilities.add) && c.securityContext.capabilities.add == ['%s'])" (join "','" $caps.add) }}
 {{- end }}
 {{- /* seccompProfile is pinned too, and it is not belt-and-braces. The command pin does not
@@ -348,7 +356,7 @@
        back. Weak on its own (uid 101 + no_new_privs leaves the effective set empty), pinned
        because "this release's security context" should mean the whole of it. */}}
 {{- $dropPin := "(!has(c.securityContext.capabilities) || !has(c.securityContext.capabilities.drop) || size(c.securityContext.capabilities.drop) == 0)" }}
-{{- if hasKey $caps "drop" }}
+{{- if $caps.drop }}
 {{- $dropPin = printf "(has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && c.securityContext.capabilities.drop == ['%s'])" (join "','" $caps.drop) }}
 {{- end }}
 {{- /* AppArmor, SELinux and procMount are the unpinned twins of the seccomp pin below (#283
@@ -374,7 +382,9 @@
        operator deliberately chose. */}}
 {{- $pscAbsent := list }}
 {{- range $f := list "sysctls" "supplementalGroups" "fsGroupChangePolicy" }}
-{{- if not (hasKey $psc $f) }}{{- $pscAbsent = append $pscAbsent (printf "!has(variables.pod.securityContext.%s)" $f) }}{{- end }}
+{{- /* Emptiness, not hasKey: `supplementalGroups: []` and `sysctls: []` are omitempty and
+       vanish at the apiserver, so absent is the right pin for them too (#283 review round 5). */}}
+{{- if not (index $psc $f) }}{{- $pscAbsent = append $pscAbsent (printf "!has(variables.pod.securityContext.%s)" $f) }}{{- end }}
 {{- end }}
 {{- /* supplementalGroups is a flat int list, so when the values DO set it, it is pinned by
        exact equality like capabilities.drop (#283 review round 4); sysctls stays free when set. */}}

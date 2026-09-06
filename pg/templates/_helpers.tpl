@@ -1918,6 +1918,11 @@ true
 {{- $v := index $src $key -}}
 {{- if kindIs "string" $v -}}
 (has({{ $path }}) && {{ $path }} == '{{ $v }}')
+{{- else if and (kindIs "float64" $v) (eq (float64 (int64 $v)) $v) -}}
+{{- /* helm parses every number as float64 and prints large ones in scientific notation
+       (runAsUser: 1000670000 -> 1.00067e+09). CEL would still compare it equal, but a
+       security pin should read exactly, and above 2^53 the float loses the value. */ -}}
+(has({{ $path }}) && {{ $path }} == {{ printf "%d" (int64 $v) }})
 {{- else -}}
 (has({{ $path }}) && {{ $path }} == {{ $v }})
 {{- end -}}

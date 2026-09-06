@@ -7,6 +7,14 @@
 # A literal extraEnv (pinned by value), an EMPTY one (core/v1.EnvVar.Value is omitempty, so
 # the apiserver drops it and the pin must tolerate absence), and an extra mount bound to its
 # extraVolumes source. All harmless to the restore itself.
+# The two omitempty spellings that once rendered a pin the apiserver could never satisfy
+# (`== ['']`, and an exact supplementalGroups match on a list the server drops).
+postgresql:
+  containerSecurityContext:
+    capabilities:
+      add: []
+  podSecurityContext:
+    supplementalGroups: []
 pgbackrest:
   extraEnv:
     - name: PGBACKREST_LOG_LEVEL_FILE

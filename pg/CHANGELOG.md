@@ -2,6 +2,17 @@
 
 ## 2.0.2 - 2026-09-06
 
+### Changed
+
+- **A `pgbackrest.extraVolumeMounts` path at or under `/etc/pgbackrest/conf.d` is refused at
+  render time when `ha.agent.control.restore.enabled` is also set (#283).** Both values
+  together were a hole in the restore admission policy: the pods' ServiceAccount holds
+  `create configmaps`, so a fragment directory sourced from a ConfigMap that does not exist
+  yet let a holder of the job-create grant inject pgbackrest options (`repo1-host-cmd` is code
+  execution) into the otherwise-pinned restore Job. Without `control.restore`, the #323
+  passthrough there is unchanged. If you run both, move the fragments out of `conf.d` before
+  upgrading; the render names the mount and the fix.
+
 ### Fixed
 
 - **The restore admission policy now pins `FORCE` and allowlists env names (#283).** The

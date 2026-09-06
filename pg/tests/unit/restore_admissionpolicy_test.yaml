@@ -793,6 +793,41 @@ tests:
       - failedTemplate:
           errorPattern: "postgresql.containerSecurityContext.runAsNonRoot is \"x' \\|\\| true \\|\\| '\", which cannot be embedded"
 
+  # `capabilities.add: []` and `supplementalGroups: []` are omitempty -- the apiserver drops
+  # them -- so their pin must be the ABSENT form, not `== ['']` (which nothing can satisfy and
+  # which denied the release's own Job) (#283 review round 5).
+  - it: empty capabilities.add and supplementalGroups pin as absent, not as an empty match
+    values:
+      - ../values-agent-control-restore.yaml
+      - ../values-agent-control-restore-passthrough.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "\\(!has\\(c\\.securityContext\\.capabilities\\) \\|\\| !has\\(c\\.securityContext\\.capabilities\\.add\\) \\|\\| size\\(c\\.securityContext\\.capabilities\\.add\\) == 0\\)"
+      - notMatchRegex:
+          path: spec.validations[10].expression
+          pattern: "add == \\[''\\]"
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "!has\\(variables\\.pod\\.securityContext\\.supplementalGroups\\)"
+
+  # A large uid renders as an integer, not helm's 1.00067e+09 float spelling.
+  - it: a large runAsUser pins as an exact integer
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.runAsUser: 1000670000
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.runAsUser == 1000670000\\)"
+
   # --- the binding ---
   #
   # Scoped to the release namespace by the label the API SERVER sets on every namespace, so

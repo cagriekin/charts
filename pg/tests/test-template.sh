@@ -5139,6 +5139,23 @@ ctl_confd=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set 
   --set-json 'pgbackrest.extraVolumeMounts=[{"name":"c","mountPath":"/etc/pgbackrest/conf.d"}]' 2>&1) && ctl_confd_rc=0 || ctl_confd_rc=$?
 assert_eq "#283: an extraVolumeMount over /etc/pgbackrest/conf.d fails the render" "1" "$([ "${ctl_confd_rc}" -ne 0 ] && echo 1 || echo 0)"
 assert_contains "#283: ...naming the path and the grant" "${ctl_confd}" 'is at or under /etc/pgbackrest/conf.d.*ha.agent.control.restore is enabled'
+# Compared normalised: runc resolves a doubled separator to the same directory.
+ctl_confd2_rc=0
+helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraVolumes=[{"name":"c","configMap":{"name":"o"}}]' \
+  --set-json 'pgbackrest.extraVolumeMounts=[{"name":"c","mountPath":"/etc/pgbackrest//conf.d/"}]' >/dev/null 2>&1 || ctl_confd2_rc=$?
+assert_eq "#283: ...also with a doubled separator" "1" "$([ "${ctl_confd2_rc}" -ne 0 ] && echo 1 || echo 0)"
+# The omitempty spellings: `add: []` and `supplementalGroups: []` vanish at the apiserver, so
+# their pin must be the absent form -- `== ['']` denied the release's own Job.
+ctl_vap_empties=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.containerSecurityContext.capabilities={"drop":["ALL"],"add":[]}' \
+  --set-json 'postgresql.podSecurityContext.supplementalGroups=[]' --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_not_contains "#283: capabilities.add: [] never pins an empty-string capability" "${ctl_vap_empties}" "add == \[''\]"
+assert_contains_literal "#283: capabilities.add: [] pins as absent-or-empty" "${ctl_vap_empties}" "|| size(c.securityContext.capabilities.add) == 0)"
+assert_contains_literal "#283: supplementalGroups: [] pins as absent" "${ctl_vap_empties}" "!has(variables.pod.securityContext.supplementalGroups)"
+assert_contains_literal "#283: a large runAsUser pins as an exact integer" \
+  "$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true --set postgresql.containerSecurityContext.runAsUser=1000670000 --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)" \
+  "c.securityContext.runAsUser == 1000670000)"
 ctl_confd_off_rc=0
 helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
   --set-json 'pgbackrest.extraVolumes=[{"name":"c","configMap":{"name":"o"}}]' \

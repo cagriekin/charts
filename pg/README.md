@@ -1056,8 +1056,10 @@ cluster:
 - **It fails closed against mutating webhooks.** The env-name and mount allowlists deny the
   restore Job if a namespace webhook injects an env var or a mount into it (proxy and APM
   injectors do exactly that), the same way the pod-label allowlist already does. Exclude the
-  restore Job from such injectors, or declare what they add in `pgbackrest.extraEnv` /
-  `extraVolumeMounts` so the allowlist carries it.
+  restore Job from such injectors — that is the reliable remedy. Declaring the injected entry
+  in `pgbackrest.extraEnv` / `extraVolumeMounts` only works if the injector's value matches
+  the declared one byte-for-byte and the injector does not append a second copy (a literal is
+  pinned by value, and a duplicate name is denied).
 
 So the policy turns "namespace-wide privilege escalation from a SQL injection" into "an
 unauthenticated trigger for this release's own restore". That is a large reduction and the
@@ -1453,7 +1455,10 @@ run-time only:
   the pod sticks in `CreateContainerError`) and `/etc/pgbackrest/pgbackrest.conf` (a file). At
   or above only for `/work`, `/tmp` and `/var/run/postgresql`, which are writable `emptyDir`s —
   nesting inside them is the normal case, so `/tmp/kube` is fine. So is a sibling such as
-  `/etc/pgbackrest/conf.d`, and `mountPath: /` is refused by name.
+  `/etc/pgbackrest/conf.d` — **unless `ha.agent.control.restore` is enabled**, in which case a
+  mount at or under `conf.d` is refused at render time (see the admission-policy residuals:
+  the pods' ServiceAccount can create a ConfigMap that does not exist yet). `mountPath: /` is
+  refused by name.
 - `extraEnv` may not reuse a name the chart sets on any of the containers (`PGBACKREST_*`,
   `STANZA`, `TARGET`, `HOME`, …), including names only a currently-disabled feature emits — so
   a passthrough that works today cannot start silently shadowing a chart value after a later
