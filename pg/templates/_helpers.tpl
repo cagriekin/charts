@@ -1947,7 +1947,8 @@ true
 {{- else -}}
 {{- $pins := list (printf "has(%s)" $path) -}}
 {{- range $f := list "type" "user" "role" -}}
-{{- if hasKey $o $f -}}
+{{- /* Truthiness here is right: an empty string is omitempty on the object, so it is absent. */ -}}
+{{- if index $o $f -}}
 {{- $pins = append $pins (printf "has(%s.%s) && %s.%s == '%s'" $path $f $path $f (index $o $f | toString)) -}}
 {{- else -}}
 {{- $pins = append $pins (printf "!has(%s.%s)" $path $f) -}}

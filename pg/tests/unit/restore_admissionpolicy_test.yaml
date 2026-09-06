@@ -210,7 +210,7 @@ tests:
     asserts:
       - equal:
           path: spec.validations[9].expression
-          value: "variables.pod.containers.all(c, has(c.command) && c.command == ['/bin/bash', '/scripts/restore.sh'] && !has(c.args) && !has(c.lifecycle))"
+          value: "variables.pod.containers.all(c, has(c.command) && c.command == ['/bin/bash', '/scripts/restore.sh'] && !has(c.args) && !has(c.lifecycle) && !has(c.livenessProbe) && !has(c.readinessProbe) && !has(c.startupProbe))"
 
   # Security contexts are pinned to what THIS RELEASE renders, not to a fixed profile: the
   # default values set allowPrivilegeEscalation and runAsUser but not privileged, so the
@@ -495,7 +495,10 @@ tests:
           pattern: "\\(m\\.mountPath == \"/tmp/scratch\" && !has\\(m\\.subPath\\) && has\\(v\\.emptyDir\\)\\)"
       - matchRegex:
           path: spec.validations[17].expression
-          pattern: "\\(!\\(e\\.name in \\['RESTORE_REQUESTED_BY','PGBACKREST_REPO1_S3_KEY','PGBACKREST_REPO1_S3_KEY_SECRET'\\]\\) \\|\\| has\\(e\\.valueFrom\\)\\)"
+          pattern: "\\(e\\.name != 'PGBACKREST_REPO1_S3_KEY' \\|\\| \\(has\\(e\\.valueFrom\\) && has\\(e\\.valueFrom\\.secretKeyRef\\) && e\\.valueFrom\\.secretKeyRef\\.name == 's3-backup-creds' && e\\.valueFrom\\.secretKeyRef\\.key == 'access-key-id'\\)\\)"
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "\\(e\\.name != 'RESTORE_REQUESTED_BY' \\|\\| \\(has\\(e\\.valueFrom\\) && has\\(e\\.valueFrom\\.fieldRef\\) && e\\.valueFrom\\.fieldRef\\.fieldPath == \"metadata\\.annotations\\['pg-ha/requested-by'\\]\"\\)\\)"
       - matchRegex:
           path: spec.validations[17].expression
           pattern: "e\\.name != 'PGDATA' \\|\\| \\(!has\\(e\\.valueFrom\\) && has\\(e\\.value\\) && e\\.value == '/var/lib/postgresql/data/pgdata'\\)"
@@ -524,7 +527,7 @@ tests:
           pattern: "PGBACKREST_REPO1_S3_KEY"
       - matchRegex:
           path: spec.validations[17].expression
-          pattern: "e\\.name in \\['RESTORE_REQUESTED_BY','PGBACKREST_REPO1_CIPHER_PASS'\\]\\) \\|\\| has\\(e\\.valueFrom\\)"
+          pattern: "\\(e\\.name != 'PGBACKREST_REPO1_CIPHER_PASS' \\|\\| \\(has\\(e\\.valueFrom\\) && has\\(e\\.valueFrom\\.secretKeyRef\\) && e\\.valueFrom\\.secretKeyRef\\.name == 'pgbr-cipher' && e\\.valueFrom\\.secretKeyRef\\.key == 'cipher-pass'\\)\\)"
 
   # Operator-declared extraEnv is admitted by name: a literal is pinned by VALUE (the names an
   # operator declares -- a proxy, a storage host -- are exactly the ones whose value is the
@@ -550,7 +553,7 @@ tests:
           pattern: "\\(e\\.name != 'HTTPS_PROXY' \\|\\| \\(!has\\(e\\.valueFrom\\) && has\\(e\\.value\\) && e\\.value == \"http://proxy:3128\"\\)\\)"
       - matchRegex:
           path: spec.validations[17].expression
-          pattern: "'PGBACKREST_REPO1_S3_KEY_SECRET','CA_PEM'\\]\\) \\|\\| has\\(e\\.valueFrom\\)"
+          pattern: "\\(e\\.name != 'CA_PEM' \\|\\| \\(has\\(e\\.valueFrom\\) && has\\(e\\.valueFrom\\.secretKeyRef\\) && e\\.valueFrom\\.secretKeyRef\\.name == 'ca' && e\\.valueFrom\\.secretKeyRef\\.key == 'pem'\\)\\)"
 
   # Rule 5 grew the resolver pins (#283 review): hostAliases / dnsConfig / a non-default
   # dnsPolicy redirect the S3 endpoint just as PGBACKREST_REPO1_S3_ENDPOINT would.
@@ -979,6 +982,22 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "postgresql.podSecurityContext.appArmorProfile is set without a type"
+
+  # An empty SELinux field is omitempty on the object, so it must pin as absent, not as ''.
+  - it: an empty seLinuxOptions.type pins as absent
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.seLinuxOptions:
+        type: ""
+        level: "s0:c1,c2"
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "has\\(c\\.securityContext\\.seLinuxOptions\\) && !has\\(c\\.securityContext\\.seLinuxOptions\\.type\\)"
 
   # --- the binding ---
   #

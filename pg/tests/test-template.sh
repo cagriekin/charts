@@ -5185,7 +5185,7 @@ ctl_confd=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set 
   --set-json 'pgbackrest.extraVolumes=[{"name":"c","configMap":{"name":"o"}}]' \
   --set-json 'pgbackrest.extraVolumeMounts=[{"name":"c","mountPath":"/etc/pgbackrest/conf.d"}]' 2>&1) && ctl_confd_rc=0 || ctl_confd_rc=$?
 assert_eq "#283: an extraVolumeMount over /etc/pgbackrest/conf.d fails the render" "1" "$([ "${ctl_confd_rc}" -ne 0 ] && echo 1 || echo 0)"
-assert_contains "#283: ...naming the path and the grant" "${ctl_confd}" 'is at or under /etc/pgbackrest/conf.d.*ha.agent.control.restore is enabled'
+assert_contains "#283: ...naming the path and the gate" "${ctl_confd}" 'is at or under /etc/pgbackrest/conf.d.*restore admission policy is enabled'
 # Compared normalised: runc resolves a doubled separator to the same directory.
 ctl_confd2_rc=0
 helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
@@ -5256,12 +5256,12 @@ done
 # inspects only entries that have one, so a literal under the same name is invisible to it.
 # (ctl_restore_args is keyType=auto, so the requester is the only valueFrom entry here.)
 assert_contains_literal "#283: the valueFrom-only tier is enforced" "${ctl_vap}" \
-  "(!(e.name in ['RESTORE_REQUESTED_BY']) || has(e.valueFrom))"
+  "(e.name != 'RESTORE_REQUESTED_BY' || (has(e.valueFrom) && has(e.valueFrom.fieldRef) && e.valueFrom.fieldRef.fieldPath == \"metadata.annotations['pg-ha/requested-by']\"))"
 ctl_vap_shared=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
   --set pgbackrest.s3.keyType=shared --set pgbackrest.existingSecret.name=s3-backup-creds \
   --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
 assert_contains_literal "#283 keyType=shared: the S3 credentials are allowed, valueFrom-only" "${ctl_vap_shared}" \
-  "(!(e.name in ['RESTORE_REQUESTED_BY','PGBACKREST_REPO1_S3_KEY','PGBACKREST_REPO1_S3_KEY_SECRET']) || has(e.valueFrom))"
+  "(e.name != 'PGBACKREST_REPO1_S3_KEY' || (has(e.valueFrom) && has(e.valueFrom.secretKeyRef) && e.valueFrom.secretKeyRef.name == 's3-backup-creds' && e.valueFrom.secretKeyRef.key == 'access-key-id'))"
 for bad in PGBACKREST_FORCE BASH_ENV LD_PRELOAD PGBACKREST_REPO1_S3_ENDPOINT; do
   assert_not_contains "#283: ${bad} is not on the allowlist" "${ctl_vap}" "'${bad}'"
 done
@@ -5275,7 +5275,7 @@ ctl_vap_auto_enc=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}"
   --set pgbackrest.repoEncryption.existingSecret.name=cph --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
 assert_not_contains "#283 keyType=auto: no S3 credential names on the allowlist" "${ctl_vap_auto_enc}" "PGBACKREST_REPO1_S3_KEY"
 assert_contains_literal "#283 repoEncryption: the passphrase is allowed, valueFrom-only" "${ctl_vap_auto_enc}" \
-  "(!(e.name in ['RESTORE_REQUESTED_BY','PGBACKREST_REPO1_CIPHER_PASS']) || has(e.valueFrom))"
+  "(e.name != 'PGBACKREST_REPO1_CIPHER_PASS' || (has(e.valueFrom) && has(e.valueFrom.secretKeyRef) && e.valueFrom.secretKeyRef.name == 'cph' && e.valueFrom.secretKeyRef.key == 'cipher-pass'))"
 ctl_vap_xenv=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
   --set-json 'pgbackrest.extraEnv=[{"name":"HTTPS_PROXY","value":"http://p:3128"},{"name":"CA_PEM","valueFrom":{"secretKeyRef":{"name":"ca","key":"pem"}}}]' \
   --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
@@ -5302,7 +5302,11 @@ ctl_vap_xenv_res=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}"
   --set-json 'pgbackrest.extraEnv=[{"name":"PGBACKREST_LOG_LEVEL_CONSOLE","value":"off"}]' 2>&1) && ctl_vap_xenv_res_rc=0 || ctl_vap_xenv_res_rc=$?
 assert_eq "#283 extraEnv: the agent-owned PGBACKREST_LOG_LEVEL_CONSOLE is reserved" "1" "$([ "${ctl_vap_xenv_res_rc}" -ne 0 ] && echo 1 || echo 0)"
 assert_contains "#283 extraEnv: ...by pg.validatePgbackrestPassthrough" "${ctl_vap_xenv_res}" 'PGBACKREST_LOG_LEVEL_CONSOLE" is set by the chart or the HA agent'
-assert_contains_literal "#283 extraEnv: a valueFrom entry joins the valueFrom-only tier" "${ctl_vap_xenv}" "'RESTORE_REQUESTED_BY','CA_PEM']) || has(e.valueFrom)"
+assert_contains_literal "#283 extraEnv: a valueFrom entry is bound to its own source" "${ctl_vap_xenv}" \
+  "(e.name != 'CA_PEM' || (has(e.valueFrom) && has(e.valueFrom.secretKeyRef) && e.valueFrom.secretKeyRef.name == 'ca' && e.valueFrom.secretKeyRef.key == 'pem'))"
+# Probes are the lifecycle hole one field over: a livenessProbe exec is a second command.
+assert_contains_literal "#283: probes are denied with lifecycle hooks" "${ctl_vap}" \
+  "!has(c.args) && !has(c.lifecycle) && !has(c.livenessProbe) && !has(c.readinessProbe) && !has(c.startupProbe))"
 # An extraEnv NAME is operator input that lands in a CEL literal, so it goes through
 # pg.validateCelLiterals like every other one.
 ctl_vap_xenv_bad=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \

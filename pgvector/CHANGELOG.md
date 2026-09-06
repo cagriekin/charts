@@ -5,7 +5,7 @@
 ### Changed
 
 - **A `pgbackrest.extraVolumeMounts` path at or under `/etc/pgbackrest/conf.d` is refused at
-  render time when `ha.agent.control.restore.enabled` is also set (#283).** Both values
+  render time when the restore admission policy is enabled (#283).** Both values
   together were a hole in the restore admission policy: the pods' ServiceAccount holds
   `create configmaps`, so a fragment directory sourced from a ConfigMap that does not exist
   yet let a holder of the job-create grant inject pgbackrest options (`repo1-host-cmd` is code
@@ -42,11 +42,11 @@
   values like every other pin -- `fsGroup`, `runAsGroup`, `capabilities.drop`, `procMount`
   exact; `appArmorProfile`/`seccompProfile` on `type` (and `localhostProfile`);
   `seLinuxOptions` on `type`/`user`/`role`; `sysctls`/`supplementalGroups` absent when unset; `hostAliases`/`dnsConfig`/a non-default `dnsPolicy` denied (a
-  resolver redirect of the S3 endpoint is a source redirect without any env); `valueFrom`
+  resolver redirect of the S3 endpoint is a source redirect without any env); probes denied alongside lifecycle hooks (a probe exec is a second command); `valueFrom`
   Secrets and ConfigMaps pinned by name *and* key and the free env names required to be
   literals (`TARGET` sourced from a Secret would land in the status file on the data PVC); and
   a `pgbackrest.extraVolumeMounts` path at or under `/etc/pgbackrest/conf.d` (pgbackrest's
-  config-include-path) refused at render time while `ha.agent.control.restore` is enabled,
+  config-include-path) refused at render time while the admission policy is enabled,
   because the pods' ServiceAccount can create a ConfigMap that does not exist yet. Operator values
   (`extraEnv` values, `extraVolumeMounts` paths) are emitted as JSON string literals, so no
   charset restriction applies to them; the two render-time changes are the ones under Changed
