@@ -990,6 +990,8 @@ this release's ServiceAccount, and requires of every Job that subject creates:
 | volumes limited to the three the restore template renders (`emptyDir`, ConfigMap `<release>-pg-pgbackrest`, PVC `data-<release>-pg-<podOrdinal>`) | with the token gone this is the one that matters most: arbitrary Secret mounts, `hostPath`, and projected service-account tokens all fall out as denials |
 | no `envFrom`; `valueFrom` limited to the downward API and this release's own Secrets | the same bound for env — a key from any other Secret or ConfigMap |
 | `FORCE` == the literal `pgbackrest.restore.force` renders — present, not duplicated, not sourced from `valueFrom` | `pgbackrest restore --force`, the bypass of the `postmaster.pid` interlock. Without this pin, "restore this release to a point of your choosing" becomes "restore over a **running** primary at any moment"; with it, the bypass is a reviewable values change (#283) |
+| no `hostAliases`, no `dnsConfig`, `dnsPolicy` left at `ClusterFirst` | redirecting the S3 endpoint named in the mounted `pgbackrest.conf` by resolver instead of by env — with `pgbackrest.s3.verifyTls: false` (a supported MinIO/Ceph configuration) that is a restore from the caller's bucket into the live PGDATA (#283) |
+| every `volumeMount` bound to its rendered `(mountPath, subPath, source kind)`; the two ConfigMap paths pinned to this release's pgbackrest ConfigMap; no `subPathExpr` | the permitted data PVC mounted at `/scripts` is the pinned command running bytes the caller wrote into PGDATA earlier; mounted at `/etc/pgbackrest/conf.d` it supplies every pgbackrest option the env allowlist keeps out (#283) |
 | env **names** limited to what the restore `jobTemplate` renders; `PGDATA` and the pgbackrest log/lock paths pinned by value; the credential and requester entries must stay `valueFrom` | the route around the `FORCE` pin: pgbackrest reads any `PGBACKREST_<OPTION>` from the environment, so an unlisted `PGBACKREST_FORCE=y` is `--force` under another name, `PGBACKREST_REPO1_S3_ENDPOINT` is a restore from someone else's repository, and `BASH_ENV`/`LD_PRELOAD` are code execution before the pinned command's first line. A free `PGDATA` would aim the shell interlock at a directory that does not exist (#283) |
 
 The security contexts, resources and command are pinned to **what this release's own values
@@ -1022,8 +1024,10 @@ cluster:
   restore while `postmaster.pid` exists can no longer be switched off through the job-create
   grant, so a token-holder's restore needs the StatefulSet already scaled to 0 — an
   operator-initiated maintenance state — **or** code execution inside the pinned container
-  (next bullet). It raises the bypass to a reviewable values change; it is not a proof that
-  `--force` is unreachable.
+  (next bullet) — **or** the starting point this whole policy assumes: code execution as the
+  postgres user in the postgresql container, which owns `postmaster.pid` and can simply
+  delete it (the interlock on both sides is a file-existence test). It raises the bypass to
+  a reviewable values change; it is not a proof that `--force` is unreachable.
 - **The command pin is not a sandbox.** The env allowlist closes the environment route
   (`BASH_ENV`, `LD_PRELOAD` and every other unlisted name are denied), but `restore.sh` still
   runs pgbackrest against the mounted PGDATA with the free recovery-point parameters, and an
@@ -1037,6 +1041,11 @@ cluster:
 - **It is not a check that the Job matches the release in full.** CEL sees only the admission
   request, so the verbatim-`jobTemplate` clone remains what guarantees the rest. This is
   defence in depth on top of that.
+- **It fails closed against mutating webhooks.** The env-name and mount allowlists deny the
+  restore Job if a namespace webhook injects an env var or a mount into it (proxy and APM
+  injectors do exactly that), the same way the pod-label allowlist already does. Exclude the
+  restore Job from such injectors, or declare what they add in `pgbackrest.extraEnv` /
+  `extraVolumeMounts` so the allowlist carries it.
 
 So the policy turns "namespace-wide privilege escalation from a SQL injection" into "an
 unauthenticated trigger for this release's own restore". That is a large reduction and the

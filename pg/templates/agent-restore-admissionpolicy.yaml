@@ -122,6 +122,35 @@
 {{- fail (printf "pgbackrest.extraVolumes[%d] (%s) is a volume source this chart cannot pin in the restore admission policy (#279/#323): only emptyDir, configMap, secret and persistentVolumeClaim carry a name the policy can bind to, and admitting an unpinned source would let the agent's Jobs mount anything of that type. The restore Job would be denied at admission the moment the agent tried to create it. Use one of those four sources, or -- if you need this one -- disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $i $vn) }}
 {{- end }}
 {{- end }}
+{{- /* Mount pins (rule 19, #283 review). Rule 15 closes the set of volume SOURCES; on its own
+       that is not enough, because it does not say where each source may be mounted. The
+       permitted data PVC mounted at /scripts replaces the pinned command's body with bytes
+       the caller wrote into PGDATA earlier (the threat model here is code execution in the
+       postgresql container, which owns that volume); mounted at /etc/pgbackrest/conf.d it
+       supplies every pgbackrest option rule 18 keeps out of the env. So each mount is bound
+       to (mountPath, subPath, source kind) exactly as the jobTemplate renders it. For
+       pgbackrest.extraVolumeMounts the source is the pgbackrest.extraVolumes entry of the same
+       name; a mount that names no such volume is already a render failure in
+       pg.validatePgbackrestPassthrough, and the fail below only guards this file's own
+       assumption should that validator ever be relaxed. */}}
+{{- $extraMountPins := list }}
+{{- range $i, $m := (.Values.pgbackrest.extraVolumeMounts | default list) }}
+{{- $mn := $m.name | toString }}
+{{- $src := dict }}
+{{- range $v := ($.Values.pgbackrest.extraVolumes | default list) }}
+{{- if eq ($v.name | toString) $mn }}{{- $src = $v }}{{- end }}
+{{- end }}
+{{- if not $src }}
+{{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s) names no pgbackrest.extraVolumes entry, so the restore admission policy cannot bind its mountPath to a source (#283): the Job would be rejected by the API server for the dangling volume name regardless. Declare a pgbackrest.extraVolumes entry named %q, or remove the mount." $i $mn $mn) }}
+{{- end }}
+{{- $pin := dict "path" ($m.mountPath | toString) "subPath" (($m.subPath | default "") | toString) "kind" "" "field" "" "value" "" }}
+{{- if hasKey $src "emptyDir" }}{{- $_ := set $pin "kind" "emptyDir" }}
+{{- else if hasKey $src "configMap" }}{{- $_ := set $pin "kind" "configMap" }}{{- $_ := set $pin "field" "name" }}{{- $_ := set $pin "value" ($src.configMap.name | toString) }}
+{{- else if hasKey $src "secret" }}{{- $_ := set $pin "kind" "secret" }}{{- $_ := set $pin "field" "secretName" }}{{- $_ := set $pin "value" ($src.secret.secretName | toString) }}
+{{- else if hasKey $src "persistentVolumeClaim" }}{{- $_ := set $pin "kind" "persistentVolumeClaim" }}{{- $_ := set $pin "field" "claimName" }}{{- $_ := set $pin "value" ($src.persistentVolumeClaim.claimName | toString) }}
+{{- end }}
+{{- $extraMountPins = append $extraMountPins $pin }}
+{{- end }}
 {{- /* The env NAME allowlist (rule 18, #283 review). Rule 16 bounds where a valueFrom may
        read from and rule 17 pins FORCE, but neither says anything about which literal env
        entries may exist -- and pgbackrest reads any PGBACKREST_<OPTION> from the environment
@@ -247,12 +276,12 @@
 {{- $addPin = printf "(has(c.securityContext.capabilities) && has(c.securityContext.capabilities.add) && c.securityContext.capabilities.add == ['%s'])" (join "','" $caps.add) }}
 {{- end }}
 {{- /* seccompProfile is pinned too, and it is not belt-and-braces. The command pin does not
-       make code execution in the restore container impossible: the container reads
-       $BASH_ENV, and an actor who already has code execution in the postgresql container can
-       write a file into PGDATA -- which this Job mounts -- and point BASH_ENV at it. What
-       that buys is uid 101 with no token and only this release's volumes, i.e. exactly the
-       privileges already held, which is the stated bar. Relaxing seccomp to Unconfined would
-       be a real step past it, so the profile is pinned to the release's own. Nested, hence
+       make code execution in the restore container impossible: rules 18 and 19 close the
+       env (BASH_ENV) and mount (the data PVC over /scripts) routes, but restore.sh still runs
+       pgbackrest against a volume the modeled attacker already writes to, so assume it is
+       reachable. What that buys is uid 101 with no token and only this release's volumes,
+       i.e. exactly the privileges already held, which is the stated bar. Relaxing seccomp
+       to Unconfined would be a real step past it, so the profile is pinned. Nested, hence
        written out rather than going through pg.celScalarPin: has() on a leaf whose parent is
        absent is an evaluation ERROR, not false. */}}
 {{- $cscSeccomp := "!has(c.securityContext.seccompProfile)" }}
@@ -342,6 +371,10 @@
 {{- end }}
 {{- range $n := $extraEnvNames }}
 {{- $literals = append $literals (list "a pgbackrest.extraEnv name" $n) }}
+{{- end }}
+{{- range $p := $extraMountPins }}
+{{- $literals = append $literals (list "a pgbackrest.extraVolumeMounts mountPath" $p.path) }}
+{{- with $p.subPath }}{{- $literals = append $literals (list "a pgbackrest.extraVolumeMounts subPath" .) }}{{- end }}
 {{- end }}
 {{- range $p := $extraVolPins }}
 {{- $literals = append $literals (list (printf "a pgbackrest.extraVolumes %s name" $p.kind) $p.value) }}
@@ -454,8 +487,27 @@ spec:
     #    NOT pinned -- they are inherited from postgresql.nodeSelector/tolerations so the
     #    restore can land where the data volume attaches, and unlike priority they can only
     #    ever RESTRICT where the pod runs.
-    - expression: "(!has(variables.pod.hostNetwork) || variables.pod.hostNetwork == false) && (!has(variables.pod.hostPID) || variables.pod.hostPID == false) && (!has(variables.pod.hostIPC) || variables.pod.hostIPC == false) && !has(variables.pod.nodeName) && {{ $pcnPin }}"
-      message: "hostNetwork, hostPID, hostIPC, an explicit nodeName and any priorityClassName other than this release's are not permitted on the pg agent's Jobs"
+    #
+    #    hostAliases, dnsConfig and a non-default dnsPolicy are denied too (#283 review). The
+    #    restore's SOURCE is the S3 endpoint named in the mounted pgbackrest.conf; rule 18
+    #    keeps PGBACKREST_REPO1_S3_ENDPOINT out of the env, but a hostAliases entry (or a
+    #    caller-supplied resolver) points that same hostname wherever the caller likes, and
+    #    with pgbackrest.s3.verifyTls=false -- a documented, supported configuration for
+    #    MinIO/Ceph gateways -- nothing then stands between the caller's bucket and the live
+    #    PGDATA. dnsPolicy is compared against ClusterFirst rather than required absent
+    #    because the apiserver DEFAULTS it onto every pod template before admission sees it.
+    #
+    #    Fields deliberately left FREE, so the next reader does not have to rediscover why:
+    #    nodeSelector/tolerations/affinity (above); restartPolicy, backoffLimit,
+    #    activeDeadlineSeconds, ttlSecondsAfterFinished (retry and lifetime of a Job that
+    #    rules 1 and 14 already cap at one name and one pod); readOnly on a mount (can only
+    #    take write access away); emptyDir medium/sizeLimit (rule 13 bounds the pod's own
+    #    resources, and an emptyDir is scratch space in the pod's own cgroup); fsGroup and
+    #    runAsGroup (the chart renders both as 103; changing them costs the kubelet a
+    #    recursive chown of the data PVC on mount, a slow-down rather than a widening --
+    #    revisit if that ever stops being true).
+    - expression: "(!has(variables.pod.hostNetwork) || variables.pod.hostNetwork == false) && (!has(variables.pod.hostPID) || variables.pod.hostPID == false) && (!has(variables.pod.hostIPC) || variables.pod.hostIPC == false) && !has(variables.pod.nodeName) && {{ $pcnPin }} && !has(variables.pod.hostAliases) && !has(variables.pod.dnsConfig) && (!has(variables.pod.dnsPolicy) || variables.pod.dnsPolicy == 'ClusterFirst')"
+      message: "hostNetwork, hostPID, hostIPC, an explicit nodeName, any priorityClassName other than this release's, hostAliases, dnsConfig and any dnsPolicy other than ClusterFirst are not permitted on the pg agent's Jobs -- the last three would let the caller redirect the S3 endpoint the restore reads from (#283)"
       reason: Forbidden
     # 6. The pod's OWN labels: an allowlist of keys (this release's restore pod labels plus
     #    the batch controller's own), with the release's values pinned. A key allowlist
@@ -537,8 +589,11 @@ spec:
     #    outside this release -- so the sources are pinned to exactly the three the restore
     #    template renders. hostPath, projected service-account tokens, arbitrary Secrets
     #    and arbitrary PVCs all fall out of this as denials rather than needing a rule each.
-    #    volumeMounts (paths, subPath) are not pinned: with the command fixed and the set of
-    #    volumes closed, remapping a mount can only break the restore, not widen it.
+    #    This rule is an all() over the volumes PRESENT -- it does not say where they may be
+    #    mounted, and it does not require the chart's own three to exist. Rule 19 carries the
+    #    mount side (#283 review): the permitted data PVC mounted at /scripts is the pinned
+    #    command running caller-written bytes, so "remapping a mount can only break the
+    #    restore" was wrong and is not claimed here any more.
     - expression: >-
         !has(variables.pod.volumes) || variables.pod.volumes.all(v,
         has(v.emptyDir)
@@ -599,6 +654,28 @@ spec:
         (!(e.name in ['{{ join "','" $envValueFrom }}']) || has(e.valueFrom)){{ range $k := (keys $envPinned | sortAlpha) }} &&
         (e.name != '{{ $k }}' || (!has(e.valueFrom) && has(e.value) && e.value == '{{ index $envPinned $k }}')){{ end }}))
       message: "the pg agent's restore Job may carry only the env its jobTemplate renders ({{ join ", " $envAllowed }}); {{ join ", " (keys $envPinned | sortAlpha) }} must be the rendered literals and {{ join ", " $envValueFrom }} must stay valueFrom -- pgbackrest reads any PGBACKREST_<OPTION> from the environment (PGBACKREST_FORCE would bypass the postmaster.pid interlock, PGBACKREST_REPO1_* would redirect the restore's source) and bash reads BASH_ENV, so an unlisted name is not an option, it is a bypass (#283)"
+      reason: Forbidden
+    # 19. Every mount is bound to its rendered (mountPath, subPath, source kind) -- see the
+    #    comment on $extraMountPins above for the two attacks this closes (the data PVC over
+    #    /scripts, or over /etc/pgbackrest/conf.d). The volume is looked up by name from the
+    #    mount, so a mount may not claim a path with a source of another kind; the two
+    #    configMap paths are additionally pinned to this release's pgbackrest ConfigMap, so
+    #    an operator-declared extraVolumes ConfigMap cannot be swapped in as the script
+    #    source either. subPathExpr is denied everywhere -- the chart never renders it, and it
+    #    resolves env into the path. A mount that omits one of the chart's own entries is not
+    #    denied: without /scripts the pinned command has nothing to run, without the config
+    #    pgbackrest has no stanza -- a broken Job, not a wider one.
+    - expression: >-
+        variables.pod.containers.all(c, !has(c.volumeMounts) || c.volumeMounts.all(m,
+        !has(m.subPathExpr) && has(variables.pod.volumes) && variables.pod.volumes.exists(v, v.name == m.name && (
+        (m.mountPath == '/var/lib/postgresql/data' && !has(m.subPath) && has(v.persistentVolumeClaim))
+        || (m.mountPath == '/etc/pgbackrest/pgbackrest.conf' && has(m.subPath) && m.subPath == 'pgbackrest.conf' && has(v.configMap) && v.configMap.name == '{{ $fullname }}-pgbackrest')
+        || (m.mountPath == '/scripts' && !has(m.subPath) && has(v.configMap) && v.configMap.name == '{{ $fullname }}-pgbackrest')
+        || (m.mountPath == '/work' && !has(m.subPath) && has(v.emptyDir))
+{{- range $p := $extraMountPins }}
+        || (m.mountPath == '{{ $p.path }}' && {{ if $p.subPath }}has(m.subPath) && m.subPath == '{{ $p.subPath }}'{{ else }}!has(m.subPath){{ end }} && has(v.{{ $p.kind }}){{ if $p.field }} && v.{{ $p.kind }}.{{ $p.field }} == '{{ $p.value }}'{{ end }})
+{{- end }}))))
+      message: "the pg agent's restore Job may mount only what its jobTemplate mounts, each at its rendered path from its rendered source: the data PVC at /var/lib/postgresql/data, configMap {{ $fullname }}-pgbackrest at /etc/pgbackrest/pgbackrest.conf (subPath pgbackrest.conf) and at /scripts, an emptyDir at /work{{ with $extraMountPins }}, plus this release's pgbackrest.extraVolumeMounts ({{ range $i, $p := . }}{{ if $i }}, {{ end }}{{ $p.path }}{{ end }}){{ end }}; no subPathExpr -- the permitted data PVC mounted over /scripts or /etc/pgbackrest/conf.d would run the caller's bytes, or the caller's pgbackrest options, under the pinned command (#283)"
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

@@ -5060,15 +5060,70 @@ done
 # that matters most: a new env added to pgbackrest-restore-job.yaml without a matching
 # allowlist entry would make every API-driven restore fail admission.
 allowlist() { grep -o "e.name in \['[^]]*'\]" <<< "$1" | head -1 | sed "s/e.name in \[//; s/\]//; s/'//g" | tr ',' '\n' | sort; }
-cj_env_names() { grep -o '^ *- name: [A-Z_0-9]*$' <<< "$1" | sed 's/.*- name: //' | sort; }
-vap_allow=$(allowlist "${ctl_vap}")
-cj_names=$(cj_env_names "${ctl_vap_cj}")
-assert_eq "#283 drift: every env the Job renders is on the allowlist" "" "$(comm -13 <(echo "${vap_allow}") <(echo "${cj_names}"))"
-# The one name the allowlist carries that the CronJob does not is the agent's own addition
-# under readPodLogs (restoreEnvOverrides). Anything else here is an allowlist entry with no
-# render behind it -- an unnecessary hole.
-assert_eq "#283 drift: the allowlist has exactly one entry the Job does not render (the agent's log level)" \
-  "PGBACKREST_LOG_LEVEL_CONSOLE" "$(comm -23 <(echo "${vap_allow}") <(echo "${cj_names}"))"
+# Env names, from the CronJob's env block only (volumes and mounts carry `- name:` too, so
+# stop at the first `volumeMounts:`). Charset is what validateCelLiterals admits, not just
+# upper-case, so a lower-case or dotted extraEnv name cannot slip past the drift check.
+cj_env_names() { awk '/^ *env:$/{f=1;next} /volumeMounts:/{f=0} f && /^ *- name: [A-Za-z_.0-9-]+$/{sub(/.*- name: /, ""); print}' <<< "$1" | sort; }
+# The drift pair, as a function so it runs over every configuration the jobTemplate branches
+# on -- a new env added under `if repoEncryption.enabled` would otherwise be caught by no
+# render but the hand-written string assertions.
+env_drift() { # env_drift <label> <policy render> <cronjob render>
+  local label="$1" pol="$2" cj="$3" allow names
+  allow=$(allowlist "${pol}"); names=$(cj_env_names "${cj}")
+  assert_eq "#283 drift (${label}): every env the Job renders is on the allowlist" "" "$(comm -13 <(echo "${allow}") <(echo "${names}"))"
+  # The one name the allowlist carries that the CronJob does not is the agent's own addition
+  # under readPodLogs (restoreEnvOverrides). Anything else is an allowlist entry with no
+  # render behind it -- an unnecessary hole.
+  assert_eq "#283 drift (${label}): the allowlist has exactly one entry the Job does not render (the agent's log level)" \
+    "PGBACKREST_LOG_LEVEL_CONSOLE" "$(comm -23 <(echo "${allow}") <(echo "${names}"))"
+}
+env_drift "keyType=auto" "${ctl_vap}" "${ctl_vap_cj}"
+ctl_shared_enc_args=(--set pgbackrest.s3.keyType=shared --set pgbackrest.existingSecret.name=s3-backup-creds
+  --set pgbackrest.repoEncryption.enabled=true --set pgbackrest.repoEncryption.existingSecret.name=cph
+  --set-json 'pgbackrest.extraEnv=[{"name":"https_proxy","value":"http://p:3128"},{"name":"CA_PEM","valueFrom":{"secretKeyRef":{"name":"ca","key":"pem"}}}]')
+env_drift "shared+encrypted+extraEnv" \
+  "$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true "${ctl_shared_enc_args[@]}" --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)" \
+  "$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true "${ctl_shared_enc_args[@]}" --show-only templates/pgbackrest-restore-job.yaml 2>&1)"
+
+# --- #283 review: mounts (rule 19) and resolver (rule 5) ---
+# Rule 15 closes the set of volume SOURCES but says nothing about where each is mounted; the
+# permitted data PVC mounted at /scripts is the pinned command running caller-written bytes.
+# Each chart mount is bound to (path, subPath, source kind), and the drift pair below reads
+# the paths back from the CronJob so a new mount there cannot be missed here.
+cj_mount_paths() { awk '/volumeMounts:/{f=1;next} /^ *volumes:/{f=0} f && /mountPath:/{sub(/.*mountPath: /, ""); print}' <<< "$1" | sort; }
+vap_mount_paths() { grep -o "m.mountPath == '[^']*'" <<< "$1" | sed "s/.*== '//; s/'$//" | sort -u; }
+assert_eq "#283 drift: the mount pins are exactly the paths the Job mounts" \
+  "$(cj_mount_paths "${ctl_vap_cj}")" "$(vap_mount_paths "${ctl_vap}")"
+assert_contains_literal "#283 mounts: the data PVC is bound to PGDATA's parent, no subPath" "${ctl_vap}" \
+  "(m.mountPath == '/var/lib/postgresql/data' && !has(m.subPath) && has(v.persistentVolumeClaim))"
+assert_contains_literal "#283 mounts: /scripts is bound to this release's pgbackrest ConfigMap" "${ctl_vap}" \
+  "(m.mountPath == '/scripts' && !has(m.subPath) && has(v.configMap) && v.configMap.name == 'test-pg-pgbackrest')"
+assert_contains_literal "#283 mounts: the config file is bound to its subPath" "${ctl_vap}" \
+  "m.subPath == 'pgbackrest.conf' && has(v.configMap) && v.configMap.name == 'test-pg-pgbackrest')"
+assert_contains_literal "#283 mounts: subPathExpr is denied everywhere" "${ctl_vap}" "!has(m.subPathExpr) &&"
+assert_contains_literal "#283 mounts: the volume is looked up by the mount's name" "${ctl_vap}" "variables.pod.volumes.exists(v, v.name == m.name &&"
+# extraVolumeMounts bind to the extraVolumes entry of the same name; a dangling one is a
+# render failure with a message that names it.
+ctl_vap_xmount=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraVolumes=[{"name":"ca","secret":{"secretName":"s3-ca"}}]' \
+  --set-json 'pgbackrest.extraVolumeMounts=[{"name":"ca","mountPath":"/etc/ssl/s3","subPath":"ca.pem","readOnly":true}]' \
+  --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains_literal "#283 mounts: an extraVolumeMount is bound to its extraVolume's source" "${ctl_vap_xmount}" \
+  "(m.mountPath == '/etc/ssl/s3' && has(m.subPath) && m.subPath == 'ca.pem' && has(v.secret) && v.secret.secretName == 's3-ca')"
+ctl_vap_dangling=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraVolumeMounts=[{"name":"nowhere","mountPath":"/etc/ssl/s3"}]' 2>&1) && ctl_vap_dangling_rc=0 || ctl_vap_dangling_rc=$?
+assert_eq "#283 mounts: a dangling extraVolumeMount fails the render" "1" "$([ "${ctl_vap_dangling_rc}" -ne 0 ] && echo 1 || echo 0)"
+# pg.validatePgbackrestPassthrough gets there first (its message); the policy's own fail is
+# the belt-and-braces behind it.
+assert_contains "#283 mounts: ...naming the mount" "${ctl_vap_dangling}" 'pgbackrest.extraVolumeMounts\[0\]: no pgbackrest.extraVolumes entry named "nowhere"'
+# Resolver pins: a hostAliases entry redirects the S3 endpoint as surely as an env var would.
+assert_contains_literal "#283 resolver: hostAliases, dnsConfig and a non-default dnsPolicy are denied" "${ctl_vap}" \
+  "!has(variables.pod.hostAliases) && !has(variables.pod.dnsConfig) && (!has(variables.pod.dnsPolicy) || variables.pod.dnsPolicy == 'ClusterFirst')"
+# A leading underscore is a legal env name and must still render (#283 review).
+ctl_vap_uscore_rc=0
+helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraEnv=[{"name":"_JAVA_OPTIONS","value":"-Xmx1g"}]' >/dev/null 2>&1 || ctl_vap_uscore_rc=$?
+assert_eq "#283: an extraEnv name with a leading underscore renders" "0" "${ctl_vap_uscore_rc}"
 # The constants are pinned by VALUE and compared against the Job's own render.
 for pinned_name in PGDATA PGBACKREST_LOG_PATH PGBACKREST_LOCK_PATH; do
   drift "pinned ${pinned_name} is the one the Job renders (#283)" \
@@ -5106,19 +5161,21 @@ assert_contains_literal "#283 extraEnv: a literal joins the free tier" "${ctl_va
 assert_contains_literal "#283 extraEnv: a valueFrom entry joins the valueFrom-only tier" "${ctl_vap_xenv}" "'RESTORE_REQUESTED_BY','CA_PEM']) || has(e.valueFrom)"
 # An extraEnv NAME is operator input that lands in a CEL literal, so it goes through
 # pg.validateCelLiterals like every other one.
-ctl_vap_xenv_rc=0
-helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
-  --set-json "pgbackrest.extraEnv=[{\"name\":\"X' || true || '\",\"value\":\"1\"}]" >/dev/null 2>&1 || ctl_vap_xenv_rc=$?
+ctl_vap_xenv_bad=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json "pgbackrest.extraEnv=[{\"name\":\"X' || true || '\",\"value\":\"1\"}]" 2>&1) && ctl_vap_xenv_rc=0 || ctl_vap_xenv_rc=$?
 assert_eq "#283 extraEnv: a name that would break CEL fails the render" "1" \
   "$([ "${ctl_vap_xenv_rc}" -ne 0 ] && echo 1 || echo 0)"
+# ...for THAT reason, not some unrelated render error.
+assert_contains "#283 extraEnv: ...through pg.validateCelLiterals" "${ctl_vap_xenv_bad}" \
+  'a pgbackrest.extraEnv name is .* which cannot be embedded in the restore admission policy'
 
 # A non-boolean cannot reach the CEL literal: the schema types the key, so an injection
 # attempt is rejected before the template runs.
-ctl_vap_inj_rc=0
-helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
-  --set-string "pgbackrest.restore.force=' || true || '" >/dev/null 2>&1 || ctl_vap_inj_rc=$?
+ctl_vap_inj=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-string "pgbackrest.restore.force=' || true || '" 2>&1) && ctl_vap_inj_rc=0 || ctl_vap_inj_rc=$?
 assert_eq "#283: a non-boolean force fails the schema before it can reach CEL" "1" \
   "$([ "${ctl_vap_inj_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283: ...and it is the schema that rejects it" "${ctl_vap_inj}" "pgbackrest/restore/force.*boolean"
 
 # The >= 1.30 requirement is enforced by asking whether admissionregistration.k8s.io/v1
 # EXISTS, not by comparing .Capabilities.KubeVersion: with no cluster that reports the HELM

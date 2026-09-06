@@ -396,9 +396,11 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     documentIndex: 0
     asserts:
+      # Indices below hold while the fixture renders resources (rule 13 is conditional on
+      # them); values-agent-control-restore.yaml does.
       - lengthEqual:
           path: spec.validations
-          count: 18
+          count: 19
       - equal:
           path: spec.validations[16].expression
           value: "variables.pod.containers.all(c, has(c.env) && c.env.exists(e, e.name == 'FORCE') && c.env.all(e, e.name != 'FORCE' || (!has(e.valueFrom) && has(e.value) && e.value == 'false')))"
@@ -453,9 +455,11 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     documentIndex: 0
     asserts:
+      # Indices below hold while the fixture renders resources (rule 13 is conditional on
+      # them); values-agent-control-restore.yaml does.
       - lengthEqual:
           path: spec.validations
-          count: 18
+          count: 19
       - matchRegex:
           path: spec.validations[17].expression
           pattern: "e\\.name in \\['PGBACKREST_LOCK_PATH','PGBACKREST_LOG_PATH','PGDATA','PGBACKREST_STANZA','TARGET_TYPE','TARGET','BACKUP_SET','FORCE','PGBACKREST_LOG_LEVEL_CONSOLE','RESTORE_REQUESTED_BY','PGBACKREST_REPO1_S3_KEY','PGBACKREST_REPO1_S3_KEY_SECRET'\\]"
@@ -516,6 +520,92 @@ tests:
       - matchRegex:
           path: spec.validations[17].expression
           pattern: "'PGBACKREST_REPO1_S3_KEY_SECRET','CA_PEM'\\]\\) \\|\\| has\\(e\\.valueFrom\\)"
+
+  # Rule 5 grew the resolver pins (#283 review): hostAliases / dnsConfig / a non-default
+  # dnsPolicy redirect the S3 endpoint just as PGBACKREST_REPO1_S3_ENDPOINT would.
+  - it: hostAliases, dnsConfig and a non-ClusterFirst dnsPolicy are denied
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[4].expression
+          pattern: "!has\\(variables\\.pod\\.hostAliases\\) && !has\\(variables\\.pod\\.dnsConfig\\) && \\(!has\\(variables\\.pod\\.dnsPolicy\\) \\|\\| variables\\.pod\\.dnsPolicy == 'ClusterFirst'\\)"
+
+  # Rule 19: each mount bound to its rendered (path, subPath, source). The permitted data PVC
+  # mounted at /scripts would otherwise be the pinned command running caller-written bytes.
+  - it: every mount is bound to its rendered path and source kind
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "!has\\(m\\.subPathExpr\\) && has\\(variables\\.pod\\.volumes\\) && variables\\.pod\\.volumes\\.exists\\(v, v\\.name == m\\.name && \\("
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "\\(m\\.mountPath == '/var/lib/postgresql/data' && !has\\(m\\.subPath\\) && has\\(v\\.persistentVolumeClaim\\)\\)"
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "\\(m\\.mountPath == '/etc/pgbackrest/pgbackrest\\.conf' && has\\(m\\.subPath\\) && m\\.subPath == 'pgbackrest\\.conf' && has\\(v\\.configMap\\) && v\\.configMap\\.name == 'test-pg-pgbackrest'\\)"
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "\\(m\\.mountPath == '/scripts' && !has\\(m\\.subPath\\) && has\\(v\\.configMap\\) && v\\.configMap\\.name == 'test-pg-pgbackrest'\\)"
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "\\(m\\.mountPath == '/work' && !has\\(m\\.subPath\\) && has\\(v\\.emptyDir\\)\\)"
+      - equal:
+          path: spec.validations[18].reason
+          value: Forbidden
+
+  - it: pgbackrest.extraVolumeMounts are bound to their extraVolumes source
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.extraVolumes:
+        - name: ca
+          secret:
+            secretName: s3-ca
+        - name: scratch
+          emptyDir: {}
+      pgbackrest.extraVolumeMounts:
+        - name: ca
+          mountPath: /etc/ssl/s3
+          subPath: ca.pem
+          readOnly: true
+        - name: scratch
+          mountPath: /tmp/scratch
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "\\(m\\.mountPath == '/etc/ssl/s3' && has\\(m\\.subPath\\) && m\\.subPath == 'ca\\.pem' && has\\(v\\.secret\\) && v\\.secret\\.secretName == 's3-ca'\\)"
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "\\(m\\.mountPath == '/tmp/scratch' && !has\\(m\\.subPath\\) && has\\(v\\.emptyDir\\)\\)"
+
+  # A leading underscore is a legal Kubernetes env name and must not become a render
+  # regression now that extraEnv names are CEL literals (#283 review).
+  - it: an extraEnv name with a leading underscore renders
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.extraEnv:
+        - name: _JAVA_OPTIONS
+          value: "-Xmx1g"
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "'_JAVA_OPTIONS'"
 
   # --- the binding ---
   #
@@ -584,7 +674,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "a pgbackrest Secret name (pgbackrest.existingSecret.name / pgbackrest.repoEncryption.existingSecret.name) is \"dba's-key\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "a pgbackrest Secret name (pgbackrest.existingSecret.name / pgbackrest.repoEncryption.existingSecret.name) is \"dba's-key\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9_/][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   # priorityClassName is pinned, and it is deliberately NOT lumped in with
   # nodeSelector/tolerations: those can only restrict where a pod runs, while a priority class
@@ -662,7 +752,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "postgresql.podSecurityContext.seccompProfile.type is \"x' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "postgresql.podSecurityContext.seccompProfile.type is \"x' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9_/][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   - it: a crafted container seccomp profile type cannot turn its pin into a tautology
     values:
@@ -673,7 +763,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "postgresql.containerSecurityContext.seccompProfile.type is \"x' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "postgresql.containerSecurityContext.seccompProfile.type is \"x' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9_/][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   - it: a crafted added capability cannot turn its pin into a tautology
     values:
@@ -685,7 +775,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "a postgresql.containerSecurityContext.capabilities.add entry is \"SYS_ADMIN' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "a postgresql.containerSecurityContext.capabilities.add entry is \"SYS_ADMIN' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9_/][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   - it: a crafted priority class name cannot turn its pin into a tautology
     values:
@@ -696,7 +786,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "pgbackrest.cronjob.priorityClassName is \"p' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "pgbackrest.cronjob.priorityClassName is \"p' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9_/][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   # --- the grant and the bound cannot be separated ---
   - it: disabling the policy without acknowledging the trade fails the render

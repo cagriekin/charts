@@ -238,6 +238,27 @@ assert_contains "VAP #283: a redirected PGDATA is denied" \
 assert_contains "VAP #283: a literal S3 credential is denied (must stay valueFrom)" \
   "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="PGBACKREST_REPO1_S3_KEY" then {name:"PGBACKREST_REPO1_S3_KEY",value:"AKIA-attacker"} else . end)')" \
   "${allow_msg}"
+# The route around BOTH env rules (#283 review): the set of volume sources is closed, but
+# the permitted data PVC mounted at /scripts is the pinned command running whatever the
+# caller wrote into PGDATA earlier; at /etc/pgbackrest/conf.d it is every pgbackrest option
+# the env allowlist keeps out. And a hostAliases entry redirects the S3 endpoint with no env
+# at all. Rule 19 and the widened rule 5 deny each at the apiserver.
+mount_msg="may mount only what its jobTemplate mounts"
+assert_contains "VAP #283: the data PVC mounted over /scripts is denied" \
+  "$(admit '.spec.template.spec.containers[0].volumeMounts |= map(if .name=="restore-script" then {name:"data",mountPath:"/scripts"} else . end)')" \
+  "${mount_msg}"
+assert_contains "VAP #283: the data PVC mounted over pgbackrest conf.d is denied" \
+  "$(admit '.spec.template.spec.containers[0].volumeMounts += [{name:"data",mountPath:"/etc/pgbackrest/conf.d"}]')" \
+  "${mount_msg}"
+assert_contains "VAP #283: subPathExpr is denied" \
+  "$(admit '.spec.template.spec.containers[0].volumeMounts |= map(if .name=="data" then . + {subPathExpr:"$(PGDATA)"} else . end)')" \
+  "${mount_msg}"
+assert_contains "VAP #283: hostAliases is denied" \
+  "$(admit '.spec.template.spec.hostAliases = [{ip:"10.0.0.9",hostnames:["minio.'"${NAMESPACE}"'.svc.cluster.local"]}]')" \
+  "hostAliases, dnsConfig and any dnsPolicy other than ClusterFirst are not permitted"
+assert_contains "VAP #283: dnsConfig is denied" \
+  "$(admit '.spec.template.spec.dnsConfig = {nameservers:["10.0.0.9"]}')" \
+  "hostAliases, dnsConfig and any dnsPolicy other than ClusterFirst are not permitted"
 # ...and the one name the agent adds itself (readPodLogs) is admitted, or toggling log
 # reading would deny the agent's own Job.
 assert_eq "VAP #283: the agent's PGBACKREST_LOG_LEVEL_CONSOLE is admitted" "allowed" \

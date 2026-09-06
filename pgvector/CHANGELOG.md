@@ -16,7 +16,11 @@
   (so an operator who sets it `true` for a stale pid file still gets a working Job); and env
   *names* are an allowlist of exactly what the restore `jobTemplate` renders, with `PGDATA`
   and the pgbackrest log/lock paths pinned by value and the credential/requester entries
-  required to stay `valueFrom`. The allowlist is what makes the pin mean anything --
+  required to stay `valueFrom`; every mount bound to its rendered path, `subPath` and source
+  kind (the permitted data PVC mounted at `/scripts` would be the pinned command running
+  caller-written bytes); and `hostAliases`/`dnsConfig`/a non-default `dnsPolicy` denied (a
+  resolver redirect of the S3 endpoint is a source redirect without any env). The env
+  allowlist is what makes the `FORCE` pin mean anything --
   pgbackrest reads any `PGBACKREST_<OPTION>` from the environment, so an unlisted
   `PGBACKREST_FORCE=y` would have been `--force` under another name, `PGBACKREST_REPO1_S3_*`
   a restore from someone else's repository, and `BASH_ENV` code execution before the pinned
