@@ -5135,6 +5135,26 @@ ctl_vap_sg_inj=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" -
   --set-json "postgresql.podSecurityContext.supplementalGroups=[\"103' || true || '\"]" 2>&1) && ctl_vap_sg_inj_rc=0 || ctl_vap_sg_inj_rc=$?
 assert_eq "#283 hardening: a non-numeric supplementalGroups entry fails the render" "1" "$([ "${ctl_vap_sg_inj_rc}" -ne 0 ] && echo 1 || echo 0)"
 assert_contains "#283 hardening: ...through pg.validateCelLiterals" "${ctl_vap_sg_inj}" 'supplementalGroups entry is .* which cannot be embedded'
+# A set seLinuxOptions pins type/user/role (level free); a Localhost profile pins its name;
+# a profile without a type and a scalar supplementalGroups are NAMED render failures.
+ctl_vap_selinux=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.containerSecurityContext={"runAsUser":101,"seLinuxOptions":{"type":"container_t","level":"s0:c1,c2"},"seccompProfile":{"type":"Localhost","localhostProfile":"p.json"}}' \
+  --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains_literal "#283 hardening: a set seLinuxOptions pins its type" "${ctl_vap_selinux}" "c.securityContext.seLinuxOptions.type == 'container_t' && !has(c.securityContext.seLinuxOptions.user) && !has(c.securityContext.seLinuxOptions.role))"
+assert_not_contains "#283 hardening: ...and leaves the MCS level free" "${ctl_vap_selinux}" 'seLinuxOptions.level'
+assert_contains_literal "#283 hardening: a Localhost profile pins its name" "${ctl_vap_selinux}" "c.securityContext.seccompProfile.localhostProfile == 'p.json')"
+ctl_vap_nullcsc=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.containerSecurityContext=null' --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains_literal "#283 hardening: volumeDevices/ports hold with no container securityContext" "${ctl_vap_nullcsc}" \
+  "variables.pod.containers.all(c, !has(c.volumeDevices) && !has(c.ports) && (!has(c.securityContext) || ("
+ctl_vap_notype=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.podSecurityContext.appArmorProfile={"localhostProfile":"p"}' 2>&1) && ctl_vap_notype_rc=0 || ctl_vap_notype_rc=$?
+assert_eq "#283 hardening: a profile without a type fails the render" "1" "$([ "${ctl_vap_notype_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283 hardening: ...naming the profile" "${ctl_vap_notype}" 'postgresql.podSecurityContext.appArmorProfile is set without a type'
+ctl_vap_sgscalar=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.podSecurityContext.supplementalGroups=103' 2>&1) && ctl_vap_sgscalar_rc=0 || ctl_vap_sgscalar_rc=$?
+assert_eq "#283 hardening: a scalar supplementalGroups fails the render" "1" "$([ "${ctl_vap_sgscalar_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283 hardening: ...with a named message, not a Go range error" "${ctl_vap_sgscalar}" 'supplementalGroups must be a list of group ids, got 103'
 assert_contains_literal "#283 hardening: ...and on the pod" "${ctl_vap}" \
   "!has(variables.pod.securityContext.appArmorProfile) && !has(variables.pod.securityContext.seLinuxOptions)"
 assert_contains_literal "#283 hardening: capabilities.drop is pinned to the rendered list" "${ctl_vap}" \

@@ -878,6 +878,70 @@ tests:
       - failedTemplate:
           errorPattern: "a postgresql.podSecurityContext.supplementalGroups entry is \"103' \\|\\| true \\|\\| '\", which cannot be embedded"
 
+  # seLinuxOptions set: type/user/role pinned (spc_t is the super-privileged domain), level free
+  # -- and a Localhost profile is pinned on the profile name too (#283 review round 7).
+  - it: a set seLinuxOptions pins type and a Localhost profile pins its name
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.seLinuxOptions:
+        type: container_t
+        level: "s0:c123,c456"
+      postgresql.containerSecurityContext.seccompProfile:
+        type: Localhost
+        localhostProfile: profiles/deny-write.json
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "\\(has\\(c\\.securityContext\\.seLinuxOptions\\) && has\\(c\\.securityContext\\.seLinuxOptions\\.type\\) && c\\.securityContext\\.seLinuxOptions\\.type == 'container_t' && !has\\(c\\.securityContext\\.seLinuxOptions\\.user\\) && !has\\(c\\.securityContext\\.seLinuxOptions\\.role\\)\\)"
+      - notMatchRegex:
+          path: spec.validations[10].expression
+          pattern: "seLinuxOptions\\.level"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.seccompProfile\\.type == 'Localhost' && has\\(c\\.securityContext\\.seccompProfile\\.localhostProfile\\) && c\\.securityContext\\.seccompProfile\\.localhostProfile == 'profiles/deny-write\\.json'\\)"
+
+  # volumeDevices/ports sit OUTSIDE the `!has(c.securityContext) ||` disjunction, so they hold
+  # for a release that renders no container securityContext at all.
+  - it: volumeDevices and ports are denied even with no container securityContext
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext: null
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "^variables\\.pod\\.containers\\.all\\(c, !has\\(c\\.volumeDevices\\) && !has\\(c\\.ports\\) && \\(!has\\(c\\.securityContext\\) \\|\\| \\("
+
+  - it: a profile set without a type fails the render
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.appArmorProfile:
+        localhostProfile: p
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "postgresql.containerSecurityContext.appArmorProfile is set without a type"
+
+  - it: a scalar supplementalGroups fails the render with a named message
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.podSecurityContext.supplementalGroups: 103
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "postgresql.podSecurityContext.supplementalGroups must be a list of group ids, got 103"
+
   # --- the binding ---
   #
   # Scoped to the release namespace by the label the API SERVER sets on every namespace, so

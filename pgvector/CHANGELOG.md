@@ -38,9 +38,10 @@
   and source, the data mount to this release's PVC by name, and `/scripts` to exactly the
   `restore.sh` key (the same ConfigMap carries `validate.sh`, which `rm -rf`s PGDATA and
   restores with no interlock); pod-template annotations limited to the agent's requester
-  stamp; the rest of the rendered security context -- `fsGroup`, `runAsGroup`,
-  `capabilities.drop`, and `appArmorProfile`/`seLinuxOptions`/`procMount`/`sysctls` absent --
-  pinned alongside seccomp; `hostAliases`/`dnsConfig`/a non-default `dnsPolicy` denied (a
+  stamp; the rest of the rendered security context pinned alongside seccomp and following the
+  values like every other pin -- `fsGroup`, `runAsGroup`, `capabilities.drop`, `procMount`
+  exact; `appArmorProfile`/`seccompProfile` on `type` (and `localhostProfile`);
+  `seLinuxOptions` on `type`/`user`/`role`; `sysctls`/`supplementalGroups` absent when unset; `hostAliases`/`dnsConfig`/a non-default `dnsPolicy` denied (a
   resolver redirect of the S3 endpoint is a source redirect without any env); `valueFrom`
   Secrets and ConfigMaps pinned by name *and* key and the free env names required to be
   literals (`TARGET` sourced from a Secret would land in the status file on the data PVC); and

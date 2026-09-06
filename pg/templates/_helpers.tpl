@@ -1910,6 +1910,49 @@ true
        "present and equal" when the release's values set the field, "absent" when they do
        not -- which is precisely the shape the rendered Job has, so the policy can never
        deny the release's own restore. Args: (list <CEL path> <values dict> <key>). */ -}}
+{{- /* pg.celProfilePin: the pin for a seccompProfile / appArmorProfile map at <path> (#283
+       review round 7). Absent when the values leave it unset; on .type when set, and on
+       .localhostProfile too when the type is Localhost -- a named profile is only as strong as
+       the one the caller can swap in. A profile set without a type is a render failure: the
+       apiserver would reject the release's own Job for it anyway, and silently dropping the
+       pin is the one outcome a security control may not have. Args: path, map, label. */ -}}
+{{- define "pg.celProfilePin" -}}
+{{- $path := index . 0 -}}
+{{- $p := index . 1 -}}
+{{- $label := index . 2 -}}
+{{- if not $p -}}
+!has({{ $path }})
+{{- else if not $p.type -}}
+{{- fail (printf "%s is set without a type (%v). Kubernetes requires .type on a security profile, so the release's own restore Job would be rejected -- and the admission policy cannot pin a profile it cannot name. Set type (RuntimeDefault, Localhost, Unconfined), or remove the block." $label $p) -}}
+{{- else if and (eq (toString $p.type) "Localhost") (not $p.localhostProfile) -}}
+{{- fail (printf "%s has type Localhost but no localhostProfile. Kubernetes requires one, and the admission policy pins it so the caller cannot swap in a more permissive named profile. Set localhostProfile, or use RuntimeDefault." $label) -}}
+{{- else -}}
+(has({{ $path }}) && has({{ $path }}.type) && {{ $path }}.type == '{{ $p.type }}'{{ if eq (toString $p.type) "Localhost" }} && has({{ $path }}.localhostProfile) && {{ $path }}.localhostProfile == '{{ $p.localhostProfile }}'{{ end }})
+{{- end -}}
+{{- end -}}
+
+{{- /* pg.celSELinuxPin: seLinuxOptions at <path>. Absent when unset; when set, .type/.user/.role
+       are pinned exactly (they are the escalation-relevant fields -- spc_t is the
+       super-privileged domain) and .level is left free (an MCS level carries a comma, which the
+       CEL literal charset refuses, and it cannot widen a domain). Args: path, map. */ -}}
+{{- define "pg.celSELinuxPin" -}}
+{{- $path := index . 0 -}}
+{{- $o := index . 1 -}}
+{{- if not $o -}}
+!has({{ $path }})
+{{- else -}}
+{{- $pins := list (printf "has(%s)" $path) -}}
+{{- range $f := list "type" "user" "role" -}}
+{{- if hasKey $o $f -}}
+{{- $pins = append $pins (printf "has(%s.%s) && %s.%s == '%s'" $path $f $path $f (index $o $f | toString)) -}}
+{{- else -}}
+{{- $pins = append $pins (printf "!has(%s.%s)" $path $f) -}}
+{{- end -}}
+{{- end -}}
+({{ join " && " $pins }})
+{{- end -}}
+{{- end -}}
+
 {{- define "pg.celScalarPin" -}}
 {{- $path := index . 0 -}}
 {{- $src := index . 1 -}}
