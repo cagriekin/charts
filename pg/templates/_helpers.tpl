@@ -1944,12 +1944,13 @@ true
 {{- range $pair := . -}}
 {{- $label := index $pair 0 -}}
 {{- $value := index $pair 1 | toString -}}
-{{- /* The first-character class admits `_` and `/` as well (#283 review): a Kubernetes env
-       name may begin with `_` (`_JAVA_OPTIONS`) and a mountPath begins with `/`, and neither
-       is any less safe inside a single-quoted CEL string than it is in the middle of one.
-       The first-character class exists to reject the empty string, not to be stricter. */ -}}
-{{- if not (regexMatch "^[A-Za-z0-9_/][A-Za-z0-9._:/@-]*$" $value) -}}
-{{- fail (printf "%s is %q, which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9_/][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $label $value) -}}
+{{- /* One character class, one or more times (#283 review). It used to require an alphanumeric
+       FIRST character, which rejected legal input for no safety gain: a Kubernetes env name
+       may begin with `_` (`_JAVA_OPTIONS`), a mountPath begins with `/`, a JVM flag begins
+       with `-`, and none of them is any less safe at the start of a single-quoted CEL string
+       than in the middle of one. The `+` is what rejects the empty string. */ -}}
+{{- if not (regexMatch "^[A-Za-z0-9._:/@-]+$" $value) -}}
+{{- fail (printf "%s is %q, which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9._:/@-]+$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $label $value) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

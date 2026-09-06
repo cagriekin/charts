@@ -5046,7 +5046,10 @@ assert_contains "#283: the denial names the fix" "${ctl_vap}" 'change pgbackrest
 ctl_vap_force=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
   --set pgbackrest.restore.force=true 2>&1)
 assert_contains_literal "#283 force=true: the policy pins 'true'" "${ctl_vap_force}" "e.value == 'true'"
-assert_contains "#283 force=true: the CronJob renders the same value" "${ctl_vap_force}" 'value: "true"'
+ctl_vap_force_cj=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set pgbackrest.restore.force=true --show-only templates/pgbackrest-restore-job.yaml 2>&1)
+assert_eq "#283 force=true: the CronJob renders the same value" "true" \
+  "$(awk '$0 ~ "- name: FORCE$" {getline; sub(/^ *value: ["'\'']?/, ""); sub(/["'\'']$/, ""); print; exit}' <<< "${ctl_vap_force_cj}")"
 assert_not_contains "#283 force=true: nothing still pins 'false'" "${ctl_vap_force}" "e.value == 'false'"
 # The recovery point stays FREE. The API overrides exactly these on every request
 # (restoreEnvOverrides), so pinning any of them would deny every API-driven restore.
@@ -5094,8 +5097,28 @@ cj_mount_paths() { awk '/volumeMounts:/{f=1;next} /^ *volumes:/{f=0} f && /mount
 vap_mount_paths() { grep -o "m.mountPath == '[^']*'" <<< "$1" | sed "s/.*== '//; s/'$//" | sort -u; }
 assert_eq "#283 drift: the mount pins are exactly the paths the Job mounts" \
   "$(cj_mount_paths "${ctl_vap_cj}")" "$(vap_mount_paths "${ctl_vap}")"
+ctl_xmount_args=(--set-json 'pgbackrest.extraVolumes=[{"name":"ca","secret":{"secretName":"s3-ca"}},{"name":"scratch","emptyDir":{}}]'
+  --set-json 'pgbackrest.extraVolumeMounts=[{"name":"ca","mountPath":"/etc/ssl/s3","subPath":"ca.pem","readOnly":true},{"name":"scratch","mountPath":"/tmp/scratch"}]')
+assert_eq "#283 drift (extraVolumeMounts): the mount pins are exactly the paths the Job mounts" \
+  "$(cj_mount_paths "$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true "${ctl_xmount_args[@]}" --show-only templates/pgbackrest-restore-job.yaml 2>&1)")" \
+  "$(vap_mount_paths "$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true "${ctl_xmount_args[@]}" --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)")"
+# The data mount is bound to THIS release's claim, not "some admitted PVC" -- with an
+# operator-declared extraVolumes PVC the restore could otherwise be aimed at that claim.
+assert_contains_literal "#283 mounts: the data mount is bound to the restore PVC by claimName" "${ctl_vap}" \
+  "has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'data-test-pg-0')"
+# Pod-template annotations are an allowlist: the legacy AppArmor annotation selects a
+# profile as surely as the securityContext field does.
+assert_contains_literal "#283 annotations: only the agent's requester stamp is admitted" "${ctl_vap}" \
+  "object.spec.template.metadata.annotations.all(k, k in ['pg-ha/requested-by'])"
+# AppArmor/SELinux/procMount are the unpinned twins of seccomp; capabilities.drop of add.
+assert_contains_literal "#283 hardening: AppArmor, SELinux and procMount are pinned absent on the container" "${ctl_vap}" \
+  "!has(c.securityContext.appArmorProfile) && !has(c.securityContext.seLinuxOptions) && !has(c.securityContext.procMount)"
+assert_contains_literal "#283 hardening: ...and on the pod" "${ctl_vap}" \
+  "!has(variables.pod.securityContext.appArmorProfile) && !has(variables.pod.securityContext.seLinuxOptions)"
+assert_contains_literal "#283 hardening: capabilities.drop is pinned to the rendered list" "${ctl_vap}" \
+  "c.securityContext.capabilities.drop == ['ALL']"
 assert_contains_literal "#283 mounts: the data PVC is bound to PGDATA's parent, no subPath" "${ctl_vap}" \
-  "(m.mountPath == '/var/lib/postgresql/data' && !has(m.subPath) && has(v.persistentVolumeClaim))"
+  "(m.mountPath == '/var/lib/postgresql/data' && !has(m.subPath) && has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'data-test-pg-0')"
 assert_contains_literal "#283 mounts: /scripts is bound to this release's pgbackrest ConfigMap" "${ctl_vap}" \
   "(m.mountPath == '/scripts' && !has(m.subPath) && has(v.configMap) && v.configMap.name == 'test-pg-pgbackrest')"
 assert_contains_literal "#283 mounts: the config file is bound to its subPath" "${ctl_vap}" \
@@ -5157,7 +5180,15 @@ assert_contains_literal "#283 repoEncryption: the passphrase is allowed, valueFr
 ctl_vap_xenv=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
   --set-json 'pgbackrest.extraEnv=[{"name":"HTTPS_PROXY","value":"http://p:3128"},{"name":"CA_PEM","valueFrom":{"secretKeyRef":{"name":"ca","key":"pem"}}}]' \
   --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
-assert_contains_literal "#283 extraEnv: a literal joins the free tier" "${ctl_vap_xenv}" "'PGBACKREST_LOG_LEVEL_CONSOLE','HTTPS_PROXY','RESTORE_REQUESTED_BY'"
+# A literal extraEnv is pinned by VALUE: the names an operator declares (a proxy, a storage
+# host) are exactly the ones whose value is the attack, so name-only would hand the caller
+# the listed spelling of what the allowlist denies in the unlisted one.
+assert_contains_literal "#283 extraEnv: a literal is pinned by value" "${ctl_vap_xenv}" \
+  "(e.name != 'HTTPS_PROXY' || (!has(e.valueFrom) && has(e.value) && e.value == 'http://p:3128'))"
+ctl_vap_xenv_val=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraEnv=[{"name":"HTTPS_PROXY","value":"http://p:3128/?x=1"}]' 2>&1) && ctl_vap_xenv_val_rc=0 || ctl_vap_xenv_val_rc=$?
+assert_eq "#283 extraEnv: a value that cannot be a CEL literal fails the render" "1" "$([ "${ctl_vap_xenv_val_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283 extraEnv: ...naming the entry" "${ctl_vap_xenv_val}" 'the pgbackrest.extraEnv value of HTTPS_PROXY is .* which cannot be embedded'
 assert_contains_literal "#283 extraEnv: a valueFrom entry joins the valueFrom-only tier" "${ctl_vap_xenv}" "'RESTORE_REQUESTED_BY','CA_PEM']) || has(e.valueFrom)"
 # An extraEnv NAME is operator input that lands in a CEL literal, so it goes through
 # pg.validateCelLiterals like every other one.

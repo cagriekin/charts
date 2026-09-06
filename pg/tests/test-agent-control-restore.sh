@@ -259,6 +259,22 @@ assert_contains "VAP #283: hostAliases is denied" \
 assert_contains "VAP #283: dnsConfig is denied" \
   "$(admit '.spec.template.spec.dnsConfig = {nameservers:["10.0.0.9"]}')" \
   "hostAliases, dnsConfig and any dnsPolicy other than ClusterFirst are not permitted"
+assert_contains "VAP #283: a non-default dnsPolicy is denied" \
+  "$(admit '.spec.template.spec.dnsPolicy = "None" | .spec.template.spec.dnsConfig = {nameservers:["10.0.0.9"]}')" \
+  "hostAliases, dnsConfig and any dnsPolicy other than ClusterFirst are not permitted"
+# The hardening twins of the seccomp pin, and the annotation spelling of AppArmor.
+assert_contains "VAP #283: an Unconfined AppArmor profile is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.appArmorProfile = {type:"Unconfined"}')" \
+  "this release's container security context"
+assert_contains "VAP #283: the AppArmor annotation spelling is denied" \
+  "$(admit '.spec.template.metadata.annotations = {"container.apparmor.security.beta.kubernetes.io/pgbackrest-restore":"unconfined"}')" \
+  "may carry only the pod annotation pg-ha/requested-by"
+assert_contains "VAP #283: removing capabilities.drop is denied" \
+  "$(admit 'del(.spec.template.spec.containers[0].securityContext.capabilities.drop)')" \
+  "this release's container security context"
+# An operator-declared literal extraEnv is pinned by value, not merely allowed by name. The
+# fixture declares none, so assert the shape the other way: a literal under a name the
+# jobTemplate renders as valueFrom is the same tier violation and is denied above.
 # ...and the one name the agent adds itself (readPodLogs) is admitted, or toggling log
 # reading would deny the agent's own Job.
 assert_eq "VAP #283: the agent's PGBACKREST_LOG_LEVEL_CONSOLE is admitted" "allowed" \

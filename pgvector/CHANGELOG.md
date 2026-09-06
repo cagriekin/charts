@@ -16,10 +16,17 @@
   (so an operator who sets it `true` for a stale pid file still gets a working Job); and env
   *names* are an allowlist of exactly what the restore `jobTemplate` renders, with `PGDATA`
   and the pgbackrest log/lock paths pinned by value and the credential/requester entries
-  required to stay `valueFrom`; every mount bound to its rendered path, `subPath` and source
-  kind (the permitted data PVC mounted at `/scripts` would be the pinned command running
-  caller-written bytes); and `hostAliases`/`dnsConfig`/a non-default `dnsPolicy` denied (a
-  resolver redirect of the S3 endpoint is a source redirect without any env). The env
+  required to stay `valueFrom` and every literal `pgbackrest.extraEnv` pinned to its declared
+  value; every mount bound to its rendered path, `subPath` and source (the permitted data PVC
+  mounted at `/scripts` would be the pinned command running caller-written bytes); pod-template
+  annotations limited to the agent's requester stamp and `appArmorProfile`/`seLinuxOptions`/
+  `procMount` pinned absent alongside seccomp; and `hostAliases`/`dnsConfig`/a non-default
+  `dnsPolicy` denied (a resolver redirect of the S3 endpoint is a source redirect without any
+  env). With the policy enabled, `pgbackrest.extraEnv` names and values and
+  `pgbackrest.extraVolumeMounts` paths now pass through the same CEL-literal charset check as
+  every other interpolated pin (`^[A-Za-z0-9._:/@-]+$`); a value outside it --
+  a proxy URL with a query string, a path with a space -- fails the render with the existing
+  `admissionPolicy.enabled=false` + `acknowledgeUnbounded=true` escape hatch. The env
   allowlist is what makes the `FORCE` pin mean anything --
   pgbackrest reads any `PGBACKREST_<OPTION>` from the environment, so an unlisted
   `PGBACKREST_FORCE=y` would have been `--force` under another name, `PGBACKREST_REPO1_S3_*`

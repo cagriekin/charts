@@ -164,15 +164,16 @@
 
        Three tiers, mirroring pgbackrest-restore-job.yaml entry by entry (the drift test in
        tests/test-template.sh compares the two renders, so a new env there fails here):
-         - $envPinned:    chart constants, pinned by value. PGDATA is what the shell
+         - $envPinned:    pinned by value. The chart constants -- PGDATA is what the shell
                           interlock tests (`-f "$PGDATA/postmaster.pid"`), so a free PGDATA
-                          would point that check at a directory that does not exist.
+                          would point that check at a directory that does not exist -- and
+                          every LITERAL pgbackrest.extraEnv entry (see the loop below for why
+                          an operator-declared name must not come with a caller-chosen value).
          - $envFree:      name allowed, value free. The recovery point (the API overrides
                           TARGET_TYPE/TARGET/BACKUP_SET), the stanza (the repository itself
                           comes from the pinned ConfigMap volume, so another stanza name only
                           selects within this release's own repo), FORCE (rule 17 owns its
-                          value), the console log level the agent adds under readPodLogs, and
-                          operator-declared literal extraEnv.
+                          value), and the console log level the agent adds under readPodLogs.
          - $envValueFrom: must STAY valueFrom. The credentials and the requester come from a
                           Secret or the downward API; a literal under the same name would be
                           an attacker-supplied credential that rule 16 never sees (it only
@@ -207,7 +208,16 @@
 {{- fail (printf "pgbackrest.extraEnv[%d] (%s) uses an env valueFrom source the restore admission policy cannot pin (#279/#323): only fieldRef, secretKeyRef and configMapKeyRef can be bound to a name there, so this Job would be denied at admission the moment the agent tried to create it. Use one of those three, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $i $en) }}
 {{- end }}
 {{- else }}
-{{- $envFree = append $envFree $en }}
+{{- /* A LITERAL extraEnv is pinned by value, not merely allowed by name (#283 review). Nothing
+       legitimately rewrites it at Job-creation time -- restoreEnvOverrides touches only the
+       recovery point and the log level, and `kubectl create job --from` copies the
+       jobTemplate verbatim -- while the names an operator declares here are exactly the ones
+       whose VALUE is the attack: PGBACKREST_REPO1_STORAGE_HOST is a source redirect,
+       LD_LIBRARY_PATH/PATH are code execution. Allowing the name and freeing the value would
+       hand the caller the listed spelling of what rule 18 denies in the unlisted one. The
+       value goes through pg.validateCelLiterals like every other interpolated literal; one
+       that cannot be single-quoted into CEL fails the render with the usual escape hatch. */}}
+{{- $_ := set $envPinned $en (($e.value | default "") | toString) }}
 {{- end }}
 {{- end }}
 {{- $envAllowed := concat (keys $envPinned | sortAlpha) $envFree $envValueFrom }}
@@ -292,12 +302,28 @@
 {{- if and $psc.seccompProfile $psc.seccompProfile.type }}
 {{- $pscSeccomp = printf "(has(variables.pod.securityContext.seccompProfile) && has(variables.pod.securityContext.seccompProfile.type) && variables.pod.securityContext.seccompProfile.type == '%s')" $psc.seccompProfile.type }}
 {{- end }}
-{{- $cscPins := list
+{{- /* capabilities.drop, same shape as add (#283 review): the chart renders drop: [ALL] when
+       the values say so, and a caller who removes it gets the runtime's default bounding set
+       back. Weak on its own (uid 101 + no_new_privs leaves the effective set empty), pinned
+       because "this release's security context" should mean the whole of it. */}}
+{{- $dropPin := "(!has(c.securityContext.capabilities) || !has(c.securityContext.capabilities.drop) || size(c.securityContext.capabilities.drop) == 0)" }}
+{{- if hasKey $caps "drop" }}
+{{- $dropPin = printf "(has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && c.securityContext.capabilities.drop == ['%s'])" (join "','" $caps.drop) }}
+{{- end }}
+{{- /* AppArmor, SELinux and procMount are the unpinned twins of the seccomp pin below (#283
+       review): appArmorProfile.type=Unconfined strips the runtime's default profile on any
+       AppArmor node (Debian -- the HA image's own base), seLinuxOptions requests a type or
+       level on SELinux nodes, procMount=Unmasked exposes /proc. The chart renders none of
+       them, so absence is the pin and it costs nothing. Rule 20 closes the legacy
+       container.apparmor.security.beta.kubernetes.io/<container> annotation spelling. */}}
+{{- $hardeningPins := list
+      "!has(c.securityContext.appArmorProfile)" "!has(c.securityContext.seLinuxOptions)" "!has(c.securityContext.procMount)" }}
+{{- $cscPins := concat (list
       (include "pg.celScalarPin" (list "c.securityContext.privileged" $csc "privileged"))
       (include "pg.celScalarPin" (list "c.securityContext.allowPrivilegeEscalation" $csc "allowPrivilegeEscalation"))
       (include "pg.celScalarPin" (list "c.securityContext.runAsUser" $csc "runAsUser"))
       (include "pg.celScalarPin" (list "c.securityContext.runAsNonRoot" $csc "runAsNonRoot"))
-      $addPin $cscSeccomp }}
+      $addPin $dropPin $cscSeccomp) $hardeningPins }}
 {{- /* When the values set NOTHING, the rule is "no securityContext, OR one that sets none of
        the fields pinned above" -- not a bare !has(). `postgresql.containerSecurityContext:
        {}` renders `securityContext: {}` on the Job, which is PRESENT as far as has() is
@@ -314,7 +340,8 @@
 {{- $pscPins := list
       (include "pg.celScalarPin" (list "variables.pod.securityContext.runAsUser" $psc "runAsUser"))
       (include "pg.celScalarPin" (list "variables.pod.securityContext.runAsNonRoot" $psc "runAsNonRoot"))
-      $pscSeccomp }}
+      $pscSeccomp
+      "!has(variables.pod.securityContext.appArmorProfile)" "!has(variables.pod.securityContext.seLinuxOptions)" }}
 {{- $pscRule := "" }}
 {{- if $psc }}
 {{- $pscRule = printf "has(variables.pod.securityContext) && %s" (join " && " $pscPins) }}
@@ -371,6 +398,9 @@
 {{- end }}
 {{- range $n := $extraEnvNames }}
 {{- $literals = append $literals (list "a pgbackrest.extraEnv name" $n) }}
+{{- /* An empty value is a legitimate way to unset a variable and '' is a safe CEL literal, so
+       only a non-empty value goes through the charset check. */}}
+{{- if and (hasKey $envPinned $n) (index $envPinned $n) }}{{- $literals = append $literals (list (printf "the pgbackrest.extraEnv value of %s" $n) (index $envPinned $n)) }}{{- end }}
 {{- end }}
 {{- range $p := $extraMountPins }}
 {{- $literals = append $literals (list "a pgbackrest.extraVolumeMounts mountPath" $p.path) }}
@@ -668,7 +698,7 @@ spec:
     - expression: >-
         variables.pod.containers.all(c, !has(c.volumeMounts) || c.volumeMounts.all(m,
         !has(m.subPathExpr) && has(variables.pod.volumes) && variables.pod.volumes.exists(v, v.name == m.name && (
-        (m.mountPath == '/var/lib/postgresql/data' && !has(m.subPath) && has(v.persistentVolumeClaim))
+        (m.mountPath == '/var/lib/postgresql/data' && !has(m.subPath) && has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'data-{{ $fullname }}-{{ .Values.pgbackrest.restore.podOrdinal }}')
         || (m.mountPath == '/etc/pgbackrest/pgbackrest.conf' && has(m.subPath) && m.subPath == 'pgbackrest.conf' && has(v.configMap) && v.configMap.name == '{{ $fullname }}-pgbackrest')
         || (m.mountPath == '/scripts' && !has(m.subPath) && has(v.configMap) && v.configMap.name == '{{ $fullname }}-pgbackrest')
         || (m.mountPath == '/work' && !has(m.subPath) && has(v.emptyDir))
@@ -676,6 +706,20 @@ spec:
         || (m.mountPath == '{{ $p.path }}' && {{ if $p.subPath }}has(m.subPath) && m.subPath == '{{ $p.subPath }}'{{ else }}!has(m.subPath){{ end }} && has(v.{{ $p.kind }}){{ if $p.field }} && v.{{ $p.kind }}.{{ $p.field }} == '{{ $p.value }}'{{ end }})
 {{- end }}))))
       message: "the pg agent's restore Job may mount only what its jobTemplate mounts, each at its rendered path from its rendered source: the data PVC at /var/lib/postgresql/data, configMap {{ $fullname }}-pgbackrest at /etc/pgbackrest/pgbackrest.conf (subPath pgbackrest.conf) and at /scripts, an emptyDir at /work{{ with $extraMountPins }}, plus this release's pgbackrest.extraVolumeMounts ({{ range $i, $p := . }}{{ if $i }}, {{ end }}{{ $p.path }}{{ end }}){{ end }}; no subPathExpr -- the permitted data PVC mounted over /scripts or /etc/pgbackrest/conf.d would run the caller's bytes, or the caller's pgbackrest options, under the pinned command (#283)"
+      reason: Forbidden
+    # 20. Pod-template ANNOTATIONS are an allowlist, like the labels in rule 6 (#283 review).
+    #    The jobTemplate renders none; the agent stamps pg-ha/requested-by (the requester,
+    #    read back through the downward API into RESTORE_REQUESTED_BY). Everything else is
+    #    denied because annotations are not inert: the legacy
+    #    container.apparmor.security.beta.kubernetes.io/<container> key still selects a
+    #    profile on 1.30+ and is the annotation spelling of the appArmorProfile field rule 11
+    #    pins absent -- and since the key carries the container name, only an allowlist can
+    #    close it. The Job's own metadata.annotations are not bounded: the agent copies the
+    #    CronJob's onto the Job, and nothing reads a Job annotation at run time.
+    - expression: >-
+        !has(object.spec.template.metadata) || !has(object.spec.template.metadata.annotations) ||
+        object.spec.template.metadata.annotations.all(k, k in ['pg-ha/requested-by'])
+      message: "the pg agent's restore Job may carry only the pod annotation pg-ha/requested-by -- the jobTemplate renders none, and an AppArmor profile is selectable through an annotation as well as through securityContext (#283)"
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

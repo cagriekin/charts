@@ -992,7 +992,8 @@ this release's ServiceAccount, and requires of every Job that subject creates:
 | `FORCE` == the literal `pgbackrest.restore.force` renders — present, not duplicated, not sourced from `valueFrom` | `pgbackrest restore --force`, the bypass of the `postmaster.pid` interlock. Without this pin, "restore this release to a point of your choosing" becomes "restore over a **running** primary at any moment"; with it, the bypass is a reviewable values change (#283) |
 | no `hostAliases`, no `dnsConfig`, `dnsPolicy` left at `ClusterFirst` | redirecting the S3 endpoint named in the mounted `pgbackrest.conf` by resolver instead of by env — with `pgbackrest.s3.verifyTls: false` (a supported MinIO/Ceph configuration) that is a restore from the caller's bucket into the live PGDATA (#283) |
 | every `volumeMount` bound to its rendered `(mountPath, subPath, source kind)`; the two ConfigMap paths pinned to this release's pgbackrest ConfigMap; no `subPathExpr` | the permitted data PVC mounted at `/scripts` is the pinned command running bytes the caller wrote into PGDATA earlier; mounted at `/etc/pgbackrest/conf.d` it supplies every pgbackrest option the env allowlist keeps out (#283) |
-| env **names** limited to what the restore `jobTemplate` renders; `PGDATA` and the pgbackrest log/lock paths pinned by value; the credential and requester entries must stay `valueFrom` | the route around the `FORCE` pin: pgbackrest reads any `PGBACKREST_<OPTION>` from the environment, so an unlisted `PGBACKREST_FORCE=y` is `--force` under another name, `PGBACKREST_REPO1_S3_ENDPOINT` is a restore from someone else's repository, and `BASH_ENV`/`LD_PRELOAD` are code execution before the pinned command's first line. A free `PGDATA` would aim the shell interlock at a directory that does not exist (#283) |
+| pod and container **hardening fields absent** as rendered: no `appArmorProfile`, `seLinuxOptions`, `procMount`; `capabilities.drop` as rendered; pod-template **annotations** limited to the agent's `pg-ha/requested-by` | the unpinned twins of the seccomp pin — `appArmorProfile: Unconfined` (or its legacy annotation spelling) strips the runtime's default profile on any AppArmor node, `seLinuxOptions` requests a type or level on SELinux nodes (#283) |
+| env **names** limited to what the restore `jobTemplate` renders; `PGDATA`, the pgbackrest log/lock paths **and every literal `pgbackrest.extraEnv` value** pinned; the credential and requester entries must stay `valueFrom` | the route around the `FORCE` pin: pgbackrest reads any `PGBACKREST_<OPTION>` from the environment, so an unlisted `PGBACKREST_FORCE=y` is `--force` under another name, `PGBACKREST_REPO1_S3_ENDPOINT` is a restore from someone else's repository, and `BASH_ENV`/`LD_PRELOAD` are code execution before the pinned command's first line. A free `PGDATA` would aim the shell interlock at a directory that does not exist (#283) |
 
 The security contexts, resources and command are pinned to **what this release's own values
 render**, not to a fixed hardened profile: change `postgresql.containerSecurityContext` and
@@ -1018,9 +1019,11 @@ cluster:
   nothing left to reject there. The parameters split three ways: `TARGET_TYPE`/`TARGET`/
   `BACKUP_SET` (and the stanza name, which selects within this release's own repository) are
   inherent to the feature and stay free; `FORCE` is an **interlock bypass**, not a
-  recovery-point choice, and is pinned to `pgbackrest.restore.force`; and every other env
-  name is denied outright, because pgbackrest would read `PGBACKREST_FORCE` from the
-  environment just as happily (#283). What that buys is precise: pgBackRest's refusal to
+  recovery-point choice, and is pinned to `pgbackrest.restore.force`; every other env name
+  is denied outright, because pgbackrest would read `PGBACKREST_FORCE` from the environment
+  just as happily; and a literal `pgbackrest.extraEnv` you declare is pinned to the value you
+  declared, because the names an operator adds (a proxy, a storage host) are exactly the ones
+  whose *value* would be the attack (#283). What that buys is precise: pgBackRest's refusal to
   restore while `postmaster.pid` exists can no longer be switched off through the job-create
   grant, so a token-holder's restore needs the StatefulSet already scaled to 0 — an
   operator-initiated maintenance state — **or** code execution inside the pinned container
@@ -1041,6 +1044,14 @@ cluster:
 - **It is not a check that the Job matches the release in full.** CEL sees only the admission
   request, so the verbatim-`jobTemplate` clone remains what guarantees the rest. This is
   defence in depth on top of that.
+- **The pinned ConfigMap's `items` and an absent `extraVolumes` ConfigMap are the caller's.**
+  A Job may remap which key of this release's pgbackrest ConfigMap lands at
+  `/scripts/restore.sh` (breakage, not injection — the token cannot update that ConfigMap),
+  and the pods' ServiceAccount holds an unscoped `create configmaps`, so if a
+  `pgbackrest.extraVolumes` ConfigMap does not exist yet, a token-holder can create it with
+  content of their choosing and have it mounted at the path you pinned. Create the ConfigMaps
+  you reference before enabling the feature, and keep their mount paths out of
+  `/etc/pgbackrest/conf.d`.
 - **It fails closed against mutating webhooks.** The env-name and mount allowlists deny the
   restore Job if a namespace webhook injects an env var or a mount into it (proxy and APM
   injectors do exactly that), the same way the pod-label allowlist already does. Exclude the
