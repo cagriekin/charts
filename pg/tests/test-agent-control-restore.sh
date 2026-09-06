@@ -282,6 +282,9 @@ assert_contains "VAP #283: the AppArmor annotation spelling is denied" \
 assert_contains "VAP #283: flipping procMount to Unmasked is denied" \
   "$(admit '.spec.template.spec.containers[0].securityContext.procMount = "Unmasked" | .spec.template.spec.hostUsers = false')" \
   "this release's container security context"
+assert_contains "VAP #283: adding seLinuxOptions is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.seLinuxOptions = {type:"spc_t"}')" \
+  "this release's container security context"
 assert_contains "VAP #283: changing supplementalGroups is denied" \
   "$(admit '.spec.template.spec.securityContext.supplementalGroups = [0]')" \
   "this release's pod security context"

@@ -942,6 +942,44 @@ tests:
       - failedTemplate:
           errorPattern: "postgresql.podSecurityContext.supplementalGroups must be a list of group ids, got 103"
 
+  # `seLinuxOptions: {}` is an empty map -- falsy to Go templates, PRESENT to has() (a non-nil
+  # pointer the apiserver keeps). The pin must match what the Job renders, not deny it (#283
+  # review round 8).
+  - it: an empty seLinuxOptions map is pinned as present-and-empty, not absent
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.seLinuxOptions: {}
+      postgresql.podSecurityContext.seLinuxOptions: {}
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "\\(has\\(c\\.securityContext\\.seLinuxOptions\\) && !has\\(c\\.securityContext\\.seLinuxOptions\\.type\\) && !has\\(c\\.securityContext\\.seLinuxOptions\\.user\\) && !has\\(c\\.securityContext\\.seLinuxOptions\\.role\\)\\)"
+      - notMatchRegex:
+          path: spec.validations[10].expression
+          pattern: "!has\\(c\\.securityContext\\.seLinuxOptions\\)"
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "\\(has\\(variables\\.pod\\.securityContext\\.seLinuxOptions\\) && !has\\(variables\\.pod\\.securityContext\\.seLinuxOptions\\.type\\)"
+
+  # ...and an empty profile map is a NAMED render failure (the apiserver rejects a profile with
+  # no type anyway), never a silently dropped pin.
+  # (appArmorProfile, which the fixture leaves unset -- a `set:` of {} on the fixture's
+  # seccompProfile would map-merge onto its type and change nothing.)
+  - it: an empty profile map fails the render by name
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.podSecurityContext.appArmorProfile: {}
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "postgresql.podSecurityContext.appArmorProfile is set without a type"
+
   # --- the binding ---
   #
   # Scoped to the release namespace by the label the API SERVER sets on every namespace, so

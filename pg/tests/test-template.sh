@@ -5155,6 +5155,17 @@ ctl_vap_sgscalar=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}"
   --set-json 'postgresql.podSecurityContext.supplementalGroups=103' 2>&1) && ctl_vap_sgscalar_rc=0 || ctl_vap_sgscalar_rc=$?
 assert_eq "#283 hardening: a scalar supplementalGroups fails the render" "1" "$([ "${ctl_vap_sgscalar_rc}" -ne 0 ] && echo 1 || echo 0)"
 assert_contains "#283 hardening: ...with a named message, not a Go range error" "${ctl_vap_sgscalar}" 'supplementalGroups must be a list of group ids, got 103'
+# `seLinuxOptions: {}` is falsy to Go templates but PRESENT to has(): the pin must match the
+# rendered empty map, not deny it; an empty profile map is a named render failure.
+ctl_vap_emptymap=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.containerSecurityContext.seLinuxOptions={}' --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains_literal "#283 hardening: seLinuxOptions: {} is pinned present-and-empty" "${ctl_vap_emptymap}" \
+  "(has(c.securityContext.seLinuxOptions) && !has(c.securityContext.seLinuxOptions.type) && !has(c.securityContext.seLinuxOptions.user) && !has(c.securityContext.seLinuxOptions.role))"
+assert_not_contains "#283 hardening: ...not absent" "${ctl_vap_emptymap}" '!has(c.securityContext.seLinuxOptions)'
+ctl_vap_emptyprof=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.containerSecurityContext.appArmorProfile={}' 2>&1) && ctl_vap_emptyprof_rc=0 || ctl_vap_emptyprof_rc=$?
+assert_eq "#283 hardening: an empty profile map fails the render" "1" "$([ "${ctl_vap_emptyprof_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283 hardening: ...by name" "${ctl_vap_emptyprof}" 'postgresql.containerSecurityContext.appArmorProfile is set without a type'
 assert_contains_literal "#283 hardening: ...and on the pod" "${ctl_vap}" \
   "!has(variables.pod.securityContext.appArmorProfile) && !has(variables.pod.securityContext.seLinuxOptions)"
 assert_contains_literal "#283 hardening: capabilities.drop is pinned to the rendered list" "${ctl_vap}" \

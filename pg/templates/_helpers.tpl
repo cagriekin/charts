@@ -1920,7 +1920,10 @@ true
 {{- $path := index . 0 -}}
 {{- $p := index . 1 -}}
 {{- $label := index . 2 -}}
-{{- if not $p -}}
+{{- /* kindIs "map", not truthiness (#283 review round 8): `seccompProfile: {}` is an empty map,
+       which Go templates treat as false -- but the Job renders it and the apiserver keeps it
+       (a non-nil pointer), so it is PRESENT to has(). Only an absent key means absent. */ -}}
+{{- if not (kindIs "map" $p) -}}
 !has({{ $path }})
 {{- else if not $p.type -}}
 {{- fail (printf "%s is set without a type (%v). Kubernetes requires .type on a security profile, so the release's own restore Job would be rejected -- and the admission policy cannot pin a profile it cannot name. Set type (RuntimeDefault, Localhost, Unconfined), or remove the block." $label $p) -}}
@@ -1938,7 +1941,8 @@ true
 {{- define "pg.celSELinuxPin" -}}
 {{- $path := index . 0 -}}
 {{- $o := index . 1 -}}
-{{- if not $o -}}
+{{- /* kindIs "map", not truthiness: `seLinuxOptions: {}` is present to has() (see celProfilePin). */ -}}
+{{- if not (kindIs "map" $o) -}}
 !has({{ $path }})
 {{- else -}}
 {{- $pins := list (printf "has(%s)" $path) -}}
