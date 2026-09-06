@@ -237,6 +237,12 @@ assert_contains "VAP #283: BASH_ENV is denied" \
 assert_contains "VAP #283: a redirected PGDATA is denied" \
   "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="PGDATA" then .value="/tmp/x" else . end)')" \
   "${allow_msg}"
+assert_contains "VAP #283: TARGET sourced from a Secret is denied (the free tier must be literal)" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="TARGET" then {name:"TARGET",valueFrom:{secretKeyRef:{name:"s3-backup-creds",key:"access-key-id"}}} else . end)')" \
+  "${allow_msg}"
+assert_contains "VAP #283: another key of the release's own Secret is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="PGBACKREST_REPO1_S3_KEY" then .valueFrom.secretKeyRef.key="other" else . end)')" \
+  "may reference only the downward API"
 assert_contains "VAP #283: a literal S3 credential is denied (must stay valueFrom)" \
   "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="PGBACKREST_REPO1_S3_KEY" then {name:"PGBACKREST_REPO1_S3_KEY",value:"AKIA-attacker"} else . end)')" \
   "${allow_msg}"

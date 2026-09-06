@@ -988,7 +988,7 @@ this release's ServiceAccount, and requires of every Job that subject creates:
 | this release's **pod and container `securityContext`** (`privileged`, `allowPrivilegeEscalation`, `runAsUser`, `runAsNonRoot`, added capabilities) | a root/privileged container with `CAP_SYS_ADMIN` — which reads every other pod's token off the kubelet and is *strictly more* than the token started with |
 | CPU and memory requests and limits present; `parallelism` and `completions` ≤ 1 | one permitted Job name as a repeatable way to fill the namespace quota and evict the database's own pods |
 | volumes limited to the three the restore template renders (`emptyDir`, ConfigMap `<release>-pg-pgbackrest`, PVC `data-<release>-pg-<podOrdinal>`) | with the token gone this is the one that matters most: arbitrary Secret mounts, `hostPath`, and projected service-account tokens all fall out as denials |
-| no `envFrom`; `valueFrom` limited to the downward API and this release's own Secrets | the same bound for env — a key from any other Secret or ConfigMap |
+| no `envFrom`; `valueFrom` limited to the downward API and this release's own Secret **keys** (name *and* key, as rendered); the free env names (recovery point, stanza) must be literals | the same bound for env — a key from any other Secret or ConfigMap, another key of the release's own Secret, or `TARGET` sourced from one (restore.sh writes the target into the status file on the data PVC) |
 | `FORCE` == the literal `pgbackrest.restore.force` renders — present, not duplicated, not sourced from `valueFrom` | `pgbackrest restore --force`, the bypass of the `postmaster.pid` interlock. Without this pin, "restore this release to a point of your choosing" becomes "restore over a **running** primary at any moment"; with it, the bypass is a reviewable values change (#283) |
 | no `hostAliases`, no `dnsConfig`, `dnsPolicy` left at `ClusterFirst` | redirecting the S3 endpoint named in the mounted `pgbackrest.conf` by resolver instead of by env — with `pgbackrest.s3.verifyTls: false` (a supported MinIO/Ceph configuration) that is a restore from the caller's bucket into the live PGDATA (#283) |
 | every `volumeMount` bound to its rendered `(mountPath, subPath, source)`; the data mount to this release's PVC by `claimName`; the two ConfigMap paths to this release's pgbackrest ConfigMap, `/scripts` projecting exactly `restore.sh`; no `subPathExpr` | the permitted data PVC mounted at `/scripts` is the pinned command running bytes the caller wrote into PGDATA earlier; mounted at `/etc/pgbackrest/conf.d` it supplies every pgbackrest option the env allowlist keeps out; and the same ConfigMap's `validate.sh` projected as `restore.sh` would `rm -rf` the live PGDATA and restore with no interlock (#283) |
@@ -1047,8 +1047,10 @@ cluster:
 - **An absent `extraVolumes` ConfigMap is the caller's.** The pods' ServiceAccount holds an
   unscoped `create configmaps`, so if a `pgbackrest.extraVolumes` ConfigMap does not exist
   yet, a token-holder can create it with content of their choosing and have it mounted at the
-  path you pinned. Create the ConfigMaps you reference before enabling the feature, and keep
-  their mount paths out of `/etc/pgbackrest/conf.d`. (The release's own pgbackrest ConfigMap
+  path you pinned. Create the ConfigMaps you reference before enabling the feature; a mount
+  at or under `/etc/pgbackrest/conf.d` (pgbackrest's config-include-path) is refused at
+  render time while this feature is on, for the same reason — without the job-create grant
+  the #323 passthrough there is unaffected. (The release's own pgbackrest ConfigMap
   is not remappable: `/scripts` must project exactly the `restore.sh` key, because the same
   ConfigMap carries `validate.sh`, which begins with `rm -rf "$PGDATA"`.)
 - **It fails closed against mutating webhooks.** The env-name and mount allowlists deny the

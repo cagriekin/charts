@@ -23,8 +23,13 @@
   restores with no interlock); pod-template annotations limited to the agent's requester
   stamp; the rest of the rendered security context -- `fsGroup`, `runAsGroup`,
   `capabilities.drop`, and `appArmorProfile`/`seLinuxOptions`/`procMount`/`sysctls` absent --
-  pinned alongside seccomp; and `hostAliases`/`dnsConfig`/a non-default `dnsPolicy` denied (a
-  resolver redirect of the S3 endpoint is a source redirect without any env). Operator values
+  pinned alongside seccomp; `hostAliases`/`dnsConfig`/a non-default `dnsPolicy` denied (a
+  resolver redirect of the S3 endpoint is a source redirect without any env); `valueFrom`
+  Secrets and ConfigMaps pinned by name *and* key and the free env names required to be
+  literals (`TARGET` sourced from a Secret would land in the status file on the data PVC); and
+  a `pgbackrest.extraVolumeMounts` path at or under `/etc/pgbackrest/conf.d` (pgbackrest's
+  config-include-path) refused at render time while `ha.agent.control.restore` is enabled,
+  because the pods' ServiceAccount can create a ConfigMap that does not exist yet. Operator values
   (`extraEnv` values, `extraVolumeMounts` paths) are emitted as JSON string literals, so
   anything that rendered on 2.0.1 still renders; `PGBACKREST_LOG_LEVEL_CONSOLE` joins the
   reserved `pgbackrest.extraEnv` names because the agent sets it. The env allowlist is what

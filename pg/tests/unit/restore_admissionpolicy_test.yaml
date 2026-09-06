@@ -340,7 +340,9 @@ tests:
     asserts:
       - matchRegex:
           path: spec.validations[15].expression
-          pattern: "e\\.valueFrom\\.secretKeyRef\\.name in \\['s3-backup-creds'\\]"
+          # Pinned by (name, key), not name alone: another key of the same Secret is not the
+          # release's to read (#283 review round 4).
+          pattern: "has\\(e\\.valueFrom\\.secretKeyRef\\) && \\(\\(e\\.valueFrom\\.secretKeyRef\\.name == 's3-backup-creds' && e\\.valueFrom\\.secretKeyRef\\.key == 'access-key-id'\\) \\|\\| \\(e\\.valueFrom\\.secretKeyRef\\.name == 's3-backup-creds' && e\\.valueFrom\\.secretKeyRef\\.key == 'secret-access-key'\\)\\)"
       - matchRegex:
           path: spec.validations[15].expression
           pattern: "!has\\(c\\.envFrom\\)"
@@ -359,7 +361,7 @@ tests:
     asserts:
       - matchRegex:
           path: spec.validations[15].expression
-          pattern: "in \\['s3-backup-creds','pgbr-cipher'\\]"
+          pattern: "\\(e\\.valueFrom\\.secretKeyRef\\.name == 'pgbr-cipher' && e\\.valueFrom\\.secretKeyRef\\.key == 'cipher-pass'\\)"
 
   # Workload identity (keyType=auto) means the release reads no Secret at all. The rule must
   # stay an ALLOWLIST of sources -- fieldRef only -- and NOT degrade into "no secretKeyRef",
@@ -382,7 +384,7 @@ tests:
           pattern: "!has\\(e\\.valueFrom\\.secretKeyRef\\)"
       - notMatchRegex:
           path: spec.validations[15].expression
-          pattern: "secretKeyRef\\.name in"
+          pattern: "secretKeyRef\\.name =="
 
   # --- #283: FORCE is pinned; the recovery point is not ---
   #
@@ -744,6 +746,52 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "a postgresql.containerSecurityContext.capabilities.drop entry is \"ALL' \\|\\| true \\|\\| '\", which cannot be embedded"
+
+  # The free env tier (recovery point, stanza, log level) must be LITERAL: rule 16 admits the
+  # release's own Secrets by (name, key), but TARGET sourced from one would still land in the
+  # status file on the data PVC (#283 review round 4).
+  - it: the free env tier may not be valueFrom
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "\\(!\\(e\\.name in \\['PGBACKREST_STANZA','TARGET_TYPE','TARGET','BACKUP_SET','FORCE','PGBACKREST_LOG_LEVEL_CONSOLE'\\]\\) \\|\\| !has\\(e\\.valueFrom\\)\\)"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "!has\\(c\\.volumeDevices\\) && !has\\(c\\.ports\\)"
+
+  - it: supplementalGroups set in values is pinned exactly
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.podSecurityContext.supplementalGroups: [200, 300]
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "variables\\.pod\\.securityContext\\.supplementalGroups == \\[200, 300\\]"
+      - notMatchRegex:
+          path: spec.validations[11].expression
+          pattern: "!has\\(variables\\.pod\\.securityContext\\.supplementalGroups\\)"
+
+  # The security contexts are untyped by the schema, so a string where a bool belongs must
+  # fail the render rather than render `== 'x' || true || ''` -- a tautology.
+  - it: a string in a scalar security-context pin fails the render
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.runAsNonRoot: "x' || true || '"
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "postgresql.containerSecurityContext.runAsNonRoot is \"x' \\|\\| true \\|\\| '\", which cannot be embedded"
 
   # --- the binding ---
   #

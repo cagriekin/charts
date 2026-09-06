@@ -143,7 +143,19 @@
 {{- if not $src }}
 {{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s) names no pgbackrest.extraVolumes entry, so the restore admission policy cannot bind its mountPath to a source (#283): the Job would be rejected by the API server for the dangling volume name regardless. Declare a pgbackrest.extraVolumes entry named %q, or remove the mount." $i $mn $mn) }}
 {{- end }}
-{{- $pin := dict "path" ($m.mountPath | toString) "subPath" (($m.subPath | default "") | toString) "kind" "" "field" "" "value" "" }}
+{{- /* /etc/pgbackrest/conf.d is pgbackrest's config-include-path, and #323 admits a passthrough
+       mount there on purpose (operator-managed option fragments). With THIS grant in play it is
+       different (#283 review round 4): the pods' ServiceAccount holds `create configmaps`, so if
+       the named ConfigMap does not exist yet -- a typo, GitOps ordering -- a token holder
+       creates it and gets arbitrary pgbackrest options under the pinned command
+       (repo1-host-cmd is code execution). Nothing at render time can check existence, so the
+       mount is refused while control.restore is enabled; without the grant the risk is not
+       there and #323's behaviour is untouched. */}}
+{{- $mp := $m.mountPath | toString }}
+{{- if or (eq (trimSuffix "/" $mp) "/etc/pgbackrest/conf.d") (hasPrefix "/etc/pgbackrest/conf.d/" $mp) }}
+{{- fail (printf "pgbackrest.extraVolumeMounts[%d] (%s): mountPath %q is at or under /etc/pgbackrest/conf.d, pgbackrest's config-include-path, and ha.agent.control.restore is enabled (#283). The pods' ServiceAccount can create ConfigMaps, so a fragment directory sourced from a ConfigMap that does not exist yet would let a token holder inject pgbackrest options (repo1-host-cmd is code execution) into the restore Job the admission policy otherwise pins. Move the fragment out of conf.d, or run the restore API without control.restore" $i $mn $mp) }}
+{{- end }}
+{{- $pin := dict "path" $mp "subPath" (($m.subPath | default "") | toString) "kind" "" "field" "" "value" "" }}
 {{- if hasKey $src "emptyDir" }}{{- $_ := set $pin "kind" "emptyDir" }}
 {{- else if hasKey $src "configMap" }}{{- $_ := set $pin "kind" "configMap" }}{{- $_ := set $pin "field" "name" }}{{- $_ := set $pin "value" ($src.configMap.name | toString) }}
 {{- else if hasKey $src "secret" }}{{- $_ := set $pin "kind" "secret" }}{{- $_ := set $pin "field" "secretName" }}{{- $_ := set $pin "value" ($src.secret.secretName | toString) }}
@@ -192,6 +204,19 @@
 {{- if eq .Values.pgbackrest.s3.keyType "shared" }}
 {{- $envValueFrom = concat $envValueFrom (list "PGBACKREST_REPO1_S3_KEY" "PGBACKREST_REPO1_S3_KEY_SECRET") }}
 {{- end }}
+{{- /* (name, key) pairs, not names alone (#283 review round 4): rule 16 admitting a Secret by
+       NAME lets a caller read any OTHER key of that Secret into a free env such as TARGET --
+       and restore.sh writes target= into the status file on the data PVC, which the modeled
+       attacker reads. Every key is known at render time, so it is pinned with the name. */}}
+{{- $secretKeyPins := list }}
+{{- if eq .Values.pgbackrest.s3.keyType "shared" }}
+{{- $secretKeyPins = append $secretKeyPins (dict "name" (include "pg.pgbackrestS3SecretName" .) "key" (.Values.pgbackrest.existingSecret.accessKeyIdKey | toString)) }}
+{{- $secretKeyPins = append $secretKeyPins (dict "name" (include "pg.pgbackrestS3SecretName" .) "key" (.Values.pgbackrest.existingSecret.secretAccessKeyKey | toString)) }}
+{{- end }}
+{{- if .Values.pgbackrest.repoEncryption.enabled }}
+{{- $secretKeyPins = append $secretKeyPins (dict "name" (.Values.pgbackrest.repoEncryption.existingSecret.name | toString) "key" (.Values.pgbackrest.repoEncryption.existingSecret.passphraseKey | toString)) }}
+{{- end }}
+{{- $cmKeyPins := list }}
 {{- $extraSecretRefs := list }}
 {{- $extraCmRefs := list }}
 {{- $extraEnvNames := list }}
@@ -211,8 +236,10 @@
 {{- $envValueFrom = append $envValueFrom $en }}
 {{- if hasKey . "secretKeyRef" }}
 {{- $extraSecretRefs = append $extraSecretRefs (.secretKeyRef.name | toString) }}
+{{- $secretKeyPins = append $secretKeyPins (dict "name" (.secretKeyRef.name | toString) "key" (.secretKeyRef.key | toString)) }}
 {{- else if hasKey . "configMapKeyRef" }}
 {{- $extraCmRefs = append $extraCmRefs (.configMapKeyRef.name | toString) }}
+{{- $cmKeyPins = append $cmKeyPins (dict "name" (.configMapKeyRef.name | toString) "key" (.configMapKeyRef.key | toString)) }}
 {{- else if not (hasKey . "fieldRef") }}
 {{- fail (printf "pgbackrest.extraEnv[%d] (%s) uses an env valueFrom source the restore admission policy cannot pin (#279/#323): only fieldRef, secretKeyRef and configMapKeyRef can be bound to a name there, so this Job would be denied at admission the moment the agent tried to create it. Use one of those three, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $i $en) }}
 {{- end }}
@@ -243,13 +270,18 @@
        cloud-workload-identity install uses. */}}
 {{- $allSecretRefs := concat $secretRefs $extraSecretRefs }}
 {{- $valueFromRule := "has(e.valueFrom.fieldRef)" }}
-{{- if $allSecretRefs }}
-{{- $valueFromRule = printf "%s || (has(e.valueFrom.secretKeyRef) && e.valueFrom.secretKeyRef.name in ['%s'])" $valueFromRule (join "','" $allSecretRefs) }}
+{{- if $secretKeyPins }}
+{{- $pairs := list }}
+{{- range $p := $secretKeyPins }}{{- $pairs = append $pairs (printf "(e.valueFrom.secretKeyRef.name == '%s' && e.valueFrom.secretKeyRef.key == '%s')" $p.name $p.key) }}{{- end }}
+{{- $valueFromRule = printf "%s || (has(e.valueFrom.secretKeyRef) && (%s))" $valueFromRule (join " || " $pairs) }}
 {{- end }}
 {{- /* configMapKeyRef stays denied unless the release itself declared one through
-       pgbackrest.extraEnv (#323) -- named, so an arbitrary ConfigMap is still out. */}}
-{{- if $extraCmRefs }}
-{{- $valueFromRule = printf "%s || (has(e.valueFrom.configMapKeyRef) && e.valueFrom.configMapKeyRef.name in ['%s'])" $valueFromRule (join "','" $extraCmRefs) }}
+       pgbackrest.extraEnv (#323) -- named AND keyed, so an arbitrary ConfigMap (or another key
+       of the declared one) is still out. */}}
+{{- if $cmKeyPins }}
+{{- $pairs := list }}
+{{- range $p := $cmKeyPins }}{{- $pairs = append $pairs (printf "(e.valueFrom.configMapKeyRef.name == '%s' && e.valueFrom.configMapKeyRef.key == '%s')" $p.name $p.key) }}{{- end }}
+{{- $valueFromRule = printf "%s || (has(e.valueFrom.configMapKeyRef) && (%s))" $valueFromRule (join " || " $pairs) }}
 {{- end }}
 {{- /* The pod-template labels the restore Job renders, read back from the same helper the
        Job template uses so the two cannot drift. Pinning these is not cosmetic: the
@@ -326,7 +358,8 @@
        them, so absence is the pin and it costs nothing. Rule 20 closes the legacy
        container.apparmor.security.beta.kubernetes.io/<container> annotation spelling. */}}
 {{- $hardeningPins := list
-      "!has(c.securityContext.appArmorProfile)" "!has(c.securityContext.seLinuxOptions)" "!has(c.securityContext.procMount)" }}
+      "!has(c.securityContext.appArmorProfile)" "!has(c.securityContext.seLinuxOptions)" "!has(c.securityContext.procMount)"
+      "!has(c.volumeDevices)" "!has(c.ports)" }}
 {{- $cscPins := concat (list
       (include "pg.celScalarPin" (list "c.securityContext.privileged" $csc "privileged"))
       (include "pg.celScalarPin" (list "c.securityContext.allowPrivilegeEscalation" $csc "allowPrivilegeEscalation"))
@@ -342,6 +375,12 @@
 {{- $pscAbsent := list }}
 {{- range $f := list "sysctls" "supplementalGroups" "fsGroupChangePolicy" }}
 {{- if not (hasKey $psc $f) }}{{- $pscAbsent = append $pscAbsent (printf "!has(variables.pod.securityContext.%s)" $f) }}{{- end }}
+{{- end }}
+{{- /* supplementalGroups is a flat int list, so when the values DO set it, it is pinned by
+       exact equality like capabilities.drop (#283 review round 4); sysctls stays free when set. */}}
+{{- with $psc.supplementalGroups }}
+{{- $g := list }}{{- range . }}{{- $g = append $g (toString .) }}{{- end }}
+{{- $pscAbsent = append $pscAbsent (printf "(has(variables.pod.securityContext.supplementalGroups) && variables.pod.securityContext.supplementalGroups == [%s])" (join ", " $g)) }}
 {{- end }}
 {{- /* When the values set NOTHING, the rule is "no securityContext, OR one that sets none of
        the fields pinned above" -- not a bare !has(). `postgresql.containerSecurityContext:
@@ -419,6 +458,21 @@
 {{- end }}
 {{- range $n := $extraEnvNames }}
 {{- $literals = append $literals (list "a pgbackrest.extraEnv name" $n) }}
+{{- end }}
+{{- range $p := $secretKeyPins }}
+{{- $literals = append $literals (list (printf "the key read from Secret %s" $p.name) $p.key) }}
+{{- end }}
+{{- range $p := $cmKeyPins }}
+{{- $literals = append $literals (list (printf "the key read from ConfigMap %s" $p.name) $p.key) }}
+{{- end }}
+{{- /* pg.celScalarPin's string branch is the one other single-quoted interpolation (#283 review
+       round 4): postgresql.podSecurityContext/containerSecurityContext are untyped by the
+       schema, so a string where a bool or int belongs would otherwise render a tautology. */}}
+{{- range $f := list "privileged" "allowPrivilegeEscalation" "runAsUser" "runAsGroup" "runAsNonRoot" "readOnlyRootFilesystem" }}
+{{- if and (hasKey $csc $f) (kindIs "string" (index $csc $f)) }}{{- $literals = append $literals (list (printf "postgresql.containerSecurityContext.%s" $f) (index $csc $f)) }}{{- end }}
+{{- end }}
+{{- range $f := list "runAsUser" "runAsGroup" "fsGroup" "runAsNonRoot" }}
+{{- if and (hasKey $psc $f) (kindIs "string" (index $psc $f)) }}{{- $literals = append $literals (list (printf "postgresql.podSecurityContext.%s" $f) (index $psc $f)) }}{{- end }}
 {{- end }}
 {{- /* extraEnv VALUES and extraVolumeMounts paths are emitted with toJson (see $extraEnvPinned),
        so they need no charset registration; the names above do, because they sit inside the
@@ -556,9 +610,13 @@ spec:
     #    activeDeadlineSeconds, ttlSecondsAfterFinished (retry and lifetime of a Job that
     #    rules 1 and 14 already cap at one name and one pod); readOnly on a mount (can only
     #    take write access away); emptyDir medium/sizeLimit (rule 13 bounds the pod's own
-    #    resources, and an emptyDir is scratch space in the pod's own cgroup); sysctls,
-    #    supplementalGroups and fsGroupChangePolicy ONLY when the values set them (pinned
-    #    absent otherwise, see $pscAbsent).
+    #    resources, and an emptyDir is scratch space in the pod's own cgroup); sysctls and
+    #    fsGroupChangePolicy ONLY when the values set them (pinned absent otherwise, see
+    #    $pscAbsent; supplementalGroups is pinned exactly either way); imagePullSecrets,
+    #    runtimeClassName, schedulerName, hostname/subdomain, workingDir, mountPropagation
+    #    and terminationMessagePath (none reaches past the pinned image, command and
+    #    volumes). volumeDevices and container ports are denied (rule 11) -- neither is
+    #    exploitable, both are one clause.
     - expression: "(!has(variables.pod.hostNetwork) || variables.pod.hostNetwork == false) && (!has(variables.pod.hostPID) || variables.pod.hostPID == false) && (!has(variables.pod.hostIPC) || variables.pod.hostIPC == false) && !has(variables.pod.nodeName) && {{ $pcnPin }} && !has(variables.pod.hostAliases) && !has(variables.pod.dnsConfig) && (!has(variables.pod.dnsPolicy) || variables.pod.dnsPolicy == 'ClusterFirst')"
       message: "hostNetwork, hostPID, hostIPC, an explicit nodeName, any priorityClassName other than this release's, hostAliases, dnsConfig and any dnsPolicy other than ClusterFirst are not permitted on the pg agent's Jobs -- the last three would let the caller redirect the S3 endpoint the restore reads from (#283)"
       reason: Forbidden
@@ -700,14 +758,20 @@ spec:
     #    before the pinned command's first line. See the tier comment on $envPinned above for
     #    why each name sits where it does; the entries that render as valueFrom must stay
     #    valueFrom, because rule 16 only inspects entries that have one, so a literal under
-    #    the same name would be an attacker-supplied credential nothing else looks at.
+    #    the same name would be an attacker-supplied credential nothing else looks at. And
+    #    the FREE tier must be literal (#283 review round 4): rule 16 admits this release's own
+    #    Secrets by (name, key), but a free name such as TARGET sourced from a Secret would still
+    #    be a read of whatever the caller can name -- restore.sh writes target= into the status
+    #    file on the data PVC. The agent and `kubectl create job --from` render every one of
+    #    these as a literal, so the pin costs nothing.
     - expression: >-
         variables.pod.containers.all(c, !has(c.env) || c.env.all(e,
         e.name in ['{{ join "','" $envAllowed }}'] &&
-        (!(e.name in ['{{ join "','" $envValueFrom }}']) || has(e.valueFrom)){{ range $k := (keys $envPinned | sortAlpha) }} &&
+        (!(e.name in ['{{ join "','" $envValueFrom }}']) || has(e.valueFrom)) &&
+        (!(e.name in ['{{ join "','" $envFree }}']) || !has(e.valueFrom)){{ range $k := (keys $envPinned | sortAlpha) }} &&
         (e.name != '{{ $k }}' || (!has(e.valueFrom) && has(e.value) && e.value == '{{ index $envPinned $k }}')){{ end }}{{ range $k := (keys $extraEnvPinned | sortAlpha) }} &&
         (e.name != '{{ $k }}' || (!has(e.valueFrom) && {{ with index $extraEnvPinned $k }}has(e.value) && e.value == {{ . | toJson }}{{ else }}(!has(e.value) || e.value == ''){{ end }})){{ end }}))
-      message: "the pg agent's restore Job may carry only the env its jobTemplate renders ({{ join ", " $envAllowed }}); {{ join ", " (concat (keys $envPinned | sortAlpha) (keys $extraEnvPinned | sortAlpha)) }} must be the rendered literals and {{ join ", " $envValueFrom }} must stay valueFrom -- pgbackrest reads any PGBACKREST_<OPTION> from the environment (PGBACKREST_FORCE would bypass the postmaster.pid interlock, PGBACKREST_REPO1_* would redirect the restore's source) and bash reads BASH_ENV, so an unlisted name is not an option, it is a bypass (#283)"
+      message: "the pg agent's restore Job may carry only the env its jobTemplate renders ({{ join ", " $envAllowed }}); {{ join ", " (concat (keys $envPinned | sortAlpha) (keys $extraEnvPinned | sortAlpha)) }} must be the rendered literals and {{ join ", " $envValueFrom }} must stay valueFrom and {{ join ", " $envFree }} must be literals -- pgbackrest reads any PGBACKREST_<OPTION> from the environment (PGBACKREST_FORCE would bypass the postmaster.pid interlock, PGBACKREST_REPO1_* would redirect the restore's source) and bash reads BASH_ENV, so an unlisted name is not an option, it is a bypass (#283)"
       reason: Forbidden
     # 19. Every mount is bound to its rendered (mountPath, subPath, source kind) -- see the
     #    comment on $extraMountPins above for the two attacks this closes (the data PVC over
@@ -735,7 +799,7 @@ spec:
 {{- range $p := $extraMountPins }}
         || (m.mountPath == {{ $p.path | toJson }} && {{ if $p.subPath }}has(m.subPath) && m.subPath == {{ $p.subPath | toJson }}{{ else }}!has(m.subPath){{ end }} && has(v.{{ $p.kind }}){{ if $p.field }} && v.{{ $p.kind }}.{{ $p.field }} == '{{ $p.value }}'{{ end }})
 {{- end }}))))
-      message: "the pg agent's restore Job may mount only what its jobTemplate mounts, each at its rendered path from its rendered source: the data PVC at /var/lib/postgresql/data, configMap {{ $fullname }}-pgbackrest at /etc/pgbackrest/pgbackrest.conf (subPath pgbackrest.conf) and at /scripts, an emptyDir at /work{{ with $extraMountPins }}, plus this release's pgbackrest.extraVolumeMounts ({{ range $i, $p := . }}{{ if $i }}, {{ end }}{{ $p.path }}{{ end }}){{ end }}; /scripts projecting exactly the restore.sh key; no subPathExpr -- the permitted data PVC mounted over /scripts or /etc/pgbackrest/conf.d would run the caller's bytes, or the caller's pgbackrest options, under the pinned command, and projecting validate.sh as restore.sh would rm -rf the live PGDATA (#283)"
+      message: "the pg agent's restore Job may mount only what its jobTemplate mounts, each at its rendered path from its rendered source: the data PVC at /var/lib/postgresql/data, configMap {{ $fullname }}-pgbackrest at /etc/pgbackrest/pgbackrest.conf (subPath pgbackrest.conf) and at /scripts, an emptyDir at /work{{ with $extraMountPins }}, plus this release's pgbackrest.extraVolumeMounts ({{ range $i, $p := . }}{{ if $i }}, {{ end }}{{ $p.path | toJson | trimAll "\"" }}{{ end }}){{ end }}; /scripts projecting exactly the restore.sh key; no subPathExpr -- the permitted data PVC mounted over /scripts or /etc/pgbackrest/conf.d would run the caller's bytes, or the caller's pgbackrest options, under the pinned command, and projecting validate.sh as restore.sh would rm -rf the live PGDATA (#283)"
       reason: Forbidden
     # 20. Pod-template ANNOTATIONS are an allowlist, like the labels in rule 6 (#283 review).
     #    The jobTemplate renders none; the agent stamps pg-ha/requested-by (the requester,

@@ -5031,15 +5031,20 @@ assert_not_contains "#279 keyType=auto: configMapKeyRef is not admitted by a bar
 # pid file must not be denied their own Job), so it is a drift pair like the others -- and
 # the FORCE entry spans two lines (`- name:` / `value:`), so `rendered()` cannot read it.
 rendered_env() { awk -v n="$1" '$0 ~ "- name: "n"$" {getline; sub(/^ *value: ["'\'']?/, ""); sub(/["'\'']$/, ""); print; exit}' <<< "${ctl_vap_cj}"; }
+# Anchored to rule 17's own clause: `pinned 'e.value'` would take the first e.value pin in
+# file order, which is rule 18's PGDATA the moment the rules are reordered.
+pinned_force() { grep "e.name != 'FORCE' || " <<< "${ctl_vap}" | head -1 | sed "s/.*e.value == '//; s/'.*$//"; }
 drift "pinned FORCE is the one the Job renders (#283)" \
-  "$(rendered_env FORCE)" "$(pinned 'e.value')"
-assert_eq "#283: the default pin is false" "false" "$(pinned 'e.value')"
+  "$(rendered_env FORCE)" "$(pinned_force)"
+assert_eq "#283: the default pin is false" "false" "$(pinned_force)"
 # The three closures are each load-bearing (see the rule's comment): presence, every
 # occurrence (env is last-wins on duplicates), and literal-only (rule 16 admits fieldRef,
 # and the Job creator controls the annotations a fieldRef could read).
 assert_contains_literal "#283: FORCE must be present" "${ctl_vap}" "c.env.exists(e, e.name == 'FORCE')"
 assert_contains_literal "#283: every FORCE entry is pinned, not just the first" "${ctl_vap}" "c.env.all(e, e.name != 'FORCE' ||"
-assert_contains_literal "#283: FORCE must be a literal, not valueFrom" "${ctl_vap}" "!has(e.valueFrom) && has(e.value) && e.value =="
+assert_contains_literal "#283: FORCE must be a literal, not valueFrom" "${ctl_vap}" \
+  "e.name != 'FORCE' || (!has(e.valueFrom) && has(e.value) && e.value =="
+
 assert_contains "#283: the denial names the fix" "${ctl_vap}" 'change pgbackrest.restore.force in values instead (#283)'
 # The pin moves with values: force=true renders FORCE="true" on the CronJob and 'true' in
 # the policy, so the chart never denies its own Job.
@@ -5118,7 +5123,27 @@ assert_contains_literal "#283 hardening: ...and on the pod" "${ctl_vap}" \
   "!has(variables.pod.securityContext.appArmorProfile) && !has(variables.pod.securityContext.seLinuxOptions)"
 assert_contains_literal "#283 hardening: capabilities.drop is pinned to the rendered list" "${ctl_vap}" \
   "c.securityContext.capabilities.drop == ['ALL']"
-assert_contains_literal "#283 hardening: fsGroup and runAsGroup are pinned by value" "${ctl_vap}" "variables.pod.securityContext.fsGroup == 103"
+assert_contains_literal "#283 hardening: fsGroup is pinned by value" "${ctl_vap}" "variables.pod.securityContext.fsGroup == 103"
+assert_contains_literal "#283 hardening: runAsGroup is pinned by value" "${ctl_vap}" "c.securityContext.runAsGroup == 103"
+assert_contains_literal "#283 hardening: volumeDevices and ports are denied" "${ctl_vap}" "!has(c.volumeDevices) && !has(c.ports)"
+# The free env tier must be literal: TARGET from a Secret would land in the status file on
+# the data PVC, readable from the postgresql container.
+assert_contains_literal "#283: the free env tier may not be valueFrom" "${ctl_vap}" \
+  "(!(e.name in ['PGBACKREST_STANZA','TARGET_TYPE','TARGET','BACKUP_SET','FORCE','PGBACKREST_LOG_LEVEL_CONSOLE']) || !has(e.valueFrom))"
+# /etc/pgbackrest/conf.d is pgbackrest's config-include-path. #323 admits a passthrough mount
+# there (asserted below as a "good" path) -- but with the job-create grant in play the pods'
+# SA can CREATE a not-yet-existing ConfigMap, so the policy template refuses it while
+# control.restore is enabled, and only then.
+ctl_confd=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraVolumes=[{"name":"c","configMap":{"name":"o"}}]' \
+  --set-json 'pgbackrest.extraVolumeMounts=[{"name":"c","mountPath":"/etc/pgbackrest/conf.d"}]' 2>&1) && ctl_confd_rc=0 || ctl_confd_rc=$?
+assert_eq "#283: an extraVolumeMount over /etc/pgbackrest/conf.d fails the render" "1" "$([ "${ctl_confd_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283: ...naming the path and the grant" "${ctl_confd}" 'is at or under /etc/pgbackrest/conf.d.*ha.agent.control.restore is enabled'
+ctl_confd_off_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set-json 'pgbackrest.extraVolumes=[{"name":"c","configMap":{"name":"o"}}]' \
+  --set-json 'pgbackrest.extraVolumeMounts=[{"name":"c","mountPath":"/etc/pgbackrest/conf.d"}]' >/dev/null 2>&1 || ctl_confd_off_rc=$?
+assert_eq "#283: ...and still renders without the control-API restore (#323's passthrough is intact)" "0" "${ctl_confd_off_rc}"
 assert_contains_literal "#283 hardening: unset pod list fields are pinned absent" "${ctl_vap}" \
   "!has(variables.pod.securityContext.sysctls) && !has(variables.pod.securityContext.supplementalGroups) && !has(variables.pod.securityContext.fsGroupChangePolicy)"
 ctl_vap_drop_inj=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
@@ -5268,8 +5293,12 @@ ctl_vap_shared=$(helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
   --set pgbackrest.s3.keyType=shared --set pgbackrest.existingSecret.name=s3creds \
   --set pgbackrest.repoEncryption.enabled=true --set pgbackrest.repoEncryption.existingSecret.name=cipher \
   --set pgbackrest.restore.enabled=true --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+# By (name, key), not name alone (#283 review): another key of the same Secret is not the
+# release's to read.
 assert_contains "#279 shared keys: only this release's own Secrets are reachable" "${ctl_vap_shared}" \
-  "in \['s3creds','cipher'\]"
+  "e.valueFrom.secretKeyRef.name == 's3creds' && e.valueFrom.secretKeyRef.key == 'access-key-id'"
+assert_contains "#279 shared keys: ...and only their rendered keys" "${ctl_vap_shared}" \
+  "e.valueFrom.secretKeyRef.name == 'cipher' && e.valueFrom.secretKeyRef.key == 'cipher-pass'"
 
 # --- NetworkPolicy: deny-by-default on the control port ---
 
@@ -5440,6 +5469,8 @@ pb_pol_res=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
 assert_contains "#323/#279: the volume pin names the extra configMap" "${pb_pol_res}" \
   "v.configMap.name == 'apiserver-proxy-kubeconfig'"
+assert_contains "#323/#279: the env pin names the extra Secret AND its key" "${pb_pol_res}" \
+  "e.valueFrom.secretKeyRef.name == 'apiserver-proxy-token' && e.valueFrom.secretKeyRef.key == 'token'"
 assert_contains "#323/#279: the env pin names the extra Secret" "${pb_pol_res}" \
   "apiserver-proxy-token"
 # A secret volume and a configMapKeyRef are pinned by their own names too -- configMapKeyRef is
@@ -5454,8 +5485,8 @@ assert_contains "#323/#279: a secret volume is pinned by secretName" "${pb_pol2_
   "v.secret.secretName == 'proxy-ca'"
 # Brackets escaped: assert_contains is grep, so an unescaped [...] is a character class that
 # would match a single character and pass for the wrong reason.
-assert_contains "#323/#279: a declared configMapKeyRef is admitted by name" "${pb_pol2_res}" \
-  "e.valueFrom.configMapKeyRef.name in \\['proxy-cm'\\]"
+assert_contains "#323/#279: a declared configMapKeyRef is admitted by name AND key" "${pb_pol2_res}" \
+  "e.valueFrom.configMapKeyRef.name == 'proxy-cm' && e.valueFrom.configMapKeyRef.key == '"
 # A source the policy cannot bind to a name is a RENDER failure, not a silent widening
 # (admitting has(v.projected) would readmit arbitrary Secrets) and not a silent breakage.
 pb_pol_unpinnable_rc=0
