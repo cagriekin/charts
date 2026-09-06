@@ -210,7 +210,7 @@ tests:
     asserts:
       - equal:
           path: spec.validations[9].expression
-          value: "variables.pod.containers.all(c, has(c.command) && c.command == ['/bin/bash', '/scripts/restore.sh'] && !has(c.args) && !has(c.lifecycle))"
+          value: "variables.pod.containers.all(c, has(c.command) && c.command == ['/bin/bash', '/scripts/restore.sh'] && !has(c.args) && !has(c.lifecycle) && !has(c.livenessProbe) && !has(c.readinessProbe) && !has(c.startupProbe))"
 
   # Security contexts are pinned to what THIS RELEASE renders, not to a fixed profile: the
   # default values set allowPrivilegeEscalation and runAsUser but not privileged, so the
@@ -340,7 +340,9 @@ tests:
     asserts:
       - matchRegex:
           path: spec.validations[15].expression
-          pattern: "e\\.valueFrom\\.secretKeyRef\\.name in \\['s3-backup-creds'\\]"
+          # Pinned by (name, key), not name alone: another key of the same Secret is not the
+          # release's to read (#283).
+          pattern: "has\\(e\\.valueFrom\\.secretKeyRef\\) && \\(\\(e\\.valueFrom\\.secretKeyRef\\.name == 's3-backup-creds' && e\\.valueFrom\\.secretKeyRef\\.key == 'access-key-id'\\) \\|\\| \\(e\\.valueFrom\\.secretKeyRef\\.name == 's3-backup-creds' && e\\.valueFrom\\.secretKeyRef\\.key == 'secret-access-key'\\)\\)"
       - matchRegex:
           path: spec.validations[15].expression
           pattern: "!has\\(c\\.envFrom\\)"
@@ -359,7 +361,7 @@ tests:
     asserts:
       - matchRegex:
           path: spec.validations[15].expression
-          pattern: "in \\['s3-backup-creds','pgbr-cipher'\\]"
+          pattern: "\\(e\\.valueFrom\\.secretKeyRef\\.name == 'pgbr-cipher' && e\\.valueFrom\\.secretKeyRef\\.key == 'cipher-pass'\\)"
 
   # Workload identity (keyType=auto) means the release reads no Secret at all. The rule must
   # stay an ALLOWLIST of sources -- fieldRef only -- and NOT degrade into "no secretKeyRef",
@@ -382,7 +384,643 @@ tests:
           pattern: "!has\\(e\\.valueFrom\\.secretKeyRef\\)"
       - notMatchRegex:
           path: spec.validations[15].expression
-          pattern: "secretKeyRef\\.name in"
+          pattern: "secretKeyRef\\.name =="
+
+  # --- #283: FORCE is pinned; the recovery point is not ---
+  #
+  # FORCE is `pgbackrest restore --force`, the bypass of the postmaster.pid interlock. Rule 16
+  # admits any literal env, so without this a token-holder could restore over a RUNNING
+  # primary. Appended as rule 17 so every index above stays put.
+  - it: FORCE is pinned to the rendered default as a present, literal, every-occurrence value
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      # Indices below hold while the fixture renders resources (rule 13 is conditional on
+      # them); values-agent-control-restore.yaml does.
+      - lengthEqual:
+          path: spec.validations
+          count: 20
+      - equal:
+          path: spec.validations[16].expression
+          value: "variables.pod.containers.all(c, has(c.env) && c.env.exists(e, e.name == 'FORCE') && c.env.all(e, e.name != 'FORCE' || (!has(e.valueFrom) && has(e.value) && e.value == 'false')))"
+      - equal:
+          path: spec.validations[16].reason
+          value: Forbidden
+      - matchRegex:
+          path: spec.validations[16].message
+          pattern: "FORCE=false as a literal.*postmaster\\.pid.*change pgbackrest\\.restore\\.force in values instead \\(#283\\)"
+
+  # The pin follows values: an operator who set force=true for a stale pid file must not be
+  # denied their own Job. A chart that denied its own restore would be worse than no policy.
+  - it: FORCE pin moves with pgbackrest.restore.force
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.restore.force: true
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[16].expression
+          pattern: "e\\.value == 'true'"
+      - notMatchRegex:
+          path: spec.validations[16].expression
+          pattern: "'false'"
+
+  # The recovery point stays free: the API overrides these on every request, so pinning
+  # them would deny every API-driven restore.
+  - it: the recovery-point parameters are not pinned
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      # Rules 16, 17 and 18 are the ones that inspect env entries; 18 pins by `e.name != X ||`.
+      # (Indices hold while the fixture renders resources -- rule 13 is conditional on them.)
+      - lengthEqual:
+          path: spec.validations
+          count: 20
+      - notMatchRegex:
+          path: spec.validations[15].expression
+          pattern: "e\\.name (==|!=) '(TARGET_TYPE|TARGET|BACKUP_SET|PGBACKREST_LOG_LEVEL_CONSOLE)'"
+      - notMatchRegex:
+          path: spec.validations[16].expression
+          pattern: "e\\.name (==|!=) '(TARGET_TYPE|TARGET|BACKUP_SET|PGBACKREST_LOG_LEVEL_CONSOLE)'"
+      - notMatchRegex:
+          path: spec.validations[17].expression
+          pattern: "e\\.name (==|!=) '(TARGET_TYPE|TARGET|BACKUP_SET|PGBACKREST_LOG_LEVEL_CONSOLE)'"
+
+  # Rule 18: the FORCE pin is only as good as the env-name allowlist around it, because
+  # pgbackrest reads PGBACKREST_FORCE from the environment just as happily.
+  - it: env names are an allowlist with the chart constants pinned and credentials kept valueFrom
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      # Indices below hold while the fixture renders resources (rule 13 is conditional on
+      # them); values-agent-control-restore.yaml does.
+      - lengthEqual:
+          path: spec.validations
+          count: 20
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "e\\.name in \\['PGBACKREST_LOCK_PATH','PGBACKREST_LOG_PATH','PGDATA','PGBACKREST_STANZA','TARGET_TYPE','TARGET','BACKUP_SET','FORCE','PGBACKREST_LOG_LEVEL_CONSOLE','RESTORE_REQUESTED_BY','PGBACKREST_REPO1_S3_KEY','PGBACKREST_REPO1_S3_KEY_SECRET'\\]"
+
+  # The KinD overlay's literal extraEnv: a value is pinned as a JSON (double-quoted) CEL
+  # literal, an EMPTY value as "absent or empty" -- EnvVar.Value is omitempty, so has(e.value)
+  # is false for the release's own `value: ""` and a pin requiring it would deny the own Job.
+  - it: the passthrough overlay pins a literal by value and an empty literal as absent-or-empty
+    values:
+      - ../values-agent-control-restore.yaml
+      - ../values-agent-control-restore-passthrough.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "\\(e\\.name != 'PGBACKREST_LOG_LEVEL_FILE' \\|\\| \\(!has\\(e\\.valueFrom\\) && has\\(e\\.value\\) && e\\.value == \"detail\"\\)\\)"
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "\\(e\\.name != 'RESTORE_SUITE_MARKER' \\|\\| \\(!has\\(e\\.valueFrom\\) && \\(!has\\(e\\.value\\) \\|\\| e\\.value == ''\\)\\)\\)"
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "\\(m\\.mountPath == \"/tmp/scratch\" && !has\\(m\\.subPath\\) && has\\(v\\.emptyDir\\)\\)"
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "\\(e\\.name != 'PGBACKREST_REPO1_S3_KEY' \\|\\| \\(has\\(e\\.valueFrom\\) && has\\(e\\.valueFrom\\.secretKeyRef\\) && e\\.valueFrom\\.secretKeyRef\\.name == 's3-backup-creds' && e\\.valueFrom\\.secretKeyRef\\.key == 'access-key-id'\\)\\)"
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "\\(e\\.name != 'RESTORE_REQUESTED_BY' \\|\\| \\(has\\(e\\.valueFrom\\) && has\\(e\\.valueFrom\\.fieldRef\\) && e\\.valueFrom\\.fieldRef\\.fieldPath == \"metadata\\.annotations\\['pg-ha/requested-by'\\]\"\\)\\)"
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "e\\.name != 'PGDATA' \\|\\| \\(!has\\(e\\.valueFrom\\) && has\\(e\\.value\\) && e\\.value == '/var/lib/postgresql/data/pgdata'\\)"
+      - matchRegex:
+          path: spec.validations[17].message
+          pattern: "PGBACKREST_FORCE would bypass the postmaster\\.pid interlock.*BASH_ENV"
+      - equal:
+          path: spec.validations[17].reason
+          value: Forbidden
+
+  # The allowlist follows the jobTemplate: with no shared key there is no S3 credential env
+  # to allow, and an encrypted repo adds its passphrase (as valueFrom-only).
+  - it: the env allowlist follows the credentials the jobTemplate renders
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.s3.keyType: auto
+      pgbackrest.repoEncryption.enabled: true
+      pgbackrest.repoEncryption.existingSecret.name: pgbr-cipher
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - notMatchRegex:
+          path: spec.validations[17].expression
+          pattern: "PGBACKREST_REPO1_S3_KEY"
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "\\(e\\.name != 'PGBACKREST_REPO1_CIPHER_PASS' \\|\\| \\(has\\(e\\.valueFrom\\) && has\\(e\\.valueFrom\\.secretKeyRef\\) && e\\.valueFrom\\.secretKeyRef\\.name == 'pgbr-cipher' && e\\.valueFrom\\.secretKeyRef\\.key == 'cipher-pass'\\)\\)"
+
+  # Operator-declared extraEnv is admitted by name: a literal is pinned by VALUE (the names an
+  # operator declares -- a proxy, a storage host -- are exactly the ones whose value is the
+  # attack), a valueFrom entry must stay valueFrom.
+  - it: pgbackrest.extraEnv names join the allowlist in their own tier
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.extraEnv:
+        - name: HTTPS_PROXY
+          value: http://proxy:3128
+        - name: CA_PEM
+          valueFrom:
+            secretKeyRef:
+              name: ca
+              key: pem
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "\\(e\\.name != 'HTTPS_PROXY' \\|\\| \\(!has\\(e\\.valueFrom\\) && has\\(e\\.value\\) && e\\.value == \"http://proxy:3128\"\\)\\)"
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "\\(e\\.name != 'CA_PEM' \\|\\| \\(has\\(e\\.valueFrom\\) && has\\(e\\.valueFrom\\.secretKeyRef\\) && e\\.valueFrom\\.secretKeyRef\\.name == 'ca' && e\\.valueFrom\\.secretKeyRef\\.key == 'pem'\\)\\)"
+
+  # Rule 5 grew the resolver pins (#283): hostAliases / dnsConfig / a non-default
+  # dnsPolicy redirect the S3 endpoint just as PGBACKREST_REPO1_S3_ENDPOINT would.
+  - it: hostAliases, dnsConfig and a non-ClusterFirst dnsPolicy are denied
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[4].expression
+          pattern: "!has\\(variables\\.pod\\.hostAliases\\) && !has\\(variables\\.pod\\.dnsConfig\\) && \\(!has\\(variables\\.pod\\.dnsPolicy\\) \\|\\| variables\\.pod\\.dnsPolicy == 'ClusterFirst'\\)"
+
+  # Rule 19: each mount bound to its rendered (path, subPath, source). The permitted data PVC
+  # mounted at /scripts would otherwise be the pinned command running caller-written bytes.
+  - it: every mount is bound to its rendered path and source kind
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "!has\\(m\\.subPathExpr\\) && has\\(variables\\.pod\\.volumes\\) && variables\\.pod\\.volumes\\.exists\\(v, v\\.name == m\\.name && \\("
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "\\(m\\.mountPath == '/var/lib/postgresql/data' && !has\\(m\\.subPath\\) && has\\(v\\.persistentVolumeClaim\\) && v\\.persistentVolumeClaim\\.claimName == 'data-test-pg-0'\\)"
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "\\(m\\.mountPath == '/etc/pgbackrest/pgbackrest\\.conf' && has\\(m\\.subPath\\) && m\\.subPath == 'pgbackrest\\.conf' && has\\(v\\.configMap\\) && v\\.configMap\\.name == 'test-pg-pgbackrest' && !has\\(v\\.configMap\\.items\\)\\)"
+      # The same ConfigMap carries validate.sh, which rm -rf's PGDATA and restores with no
+      # interlock -- so /scripts must project exactly the restore.sh key.
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "\\(m\\.mountPath == '/scripts' && !has\\(m\\.subPath\\) && has\\(v\\.configMap\\) && v\\.configMap\\.name == 'test-pg-pgbackrest' && has\\(v\\.configMap\\.items\\) && size\\(v\\.configMap\\.items\\) == 1 && v\\.configMap\\.items\\.all\\(i, i\\.key == 'restore\\.sh' && \\(!has\\(i\\.path\\) \\|\\| i\\.path == 'restore\\.sh'\\)\\)\\)"
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "\\(m\\.mountPath == '/work' && !has\\(m\\.subPath\\) && has\\(v\\.emptyDir\\)\\)"
+      - equal:
+          path: spec.validations[18].reason
+          value: Forbidden
+
+  - it: pgbackrest.extraVolumeMounts are bound to their extraVolumes source
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.extraVolumes:
+        - name: ca
+          secret:
+            secretName: s3-ca
+        - name: scratch
+          emptyDir: {}
+      pgbackrest.extraVolumeMounts:
+        - name: ca
+          mountPath: /etc/ssl/s3
+          subPath: ca.pem
+          readOnly: true
+        - name: scratch
+          mountPath: /tmp/scratch
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "\\(m\\.mountPath == \"/etc/ssl/s3\" && has\\(m\\.subPath\\) && m\\.subPath == \"ca\\.pem\" && has\\(v\\.secret\\) && v\\.secret\\.secretName == 's3-ca'\\)"
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "\\(m\\.mountPath == \"/tmp/scratch\" && !has\\(m\\.subPath\\) && has\\(v\\.emptyDir\\)\\)"
+
+  # A leading underscore is a legal Kubernetes env name and must not become a render
+  # regression now that extraEnv names are CEL literals (#283).
+  - it: an extraEnv name with a leading underscore renders
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.extraEnv:
+        - name: _JAVA_OPTIONS
+          value: "-Xmx1g"
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "'_JAVA_OPTIONS'"
+
+  # An extraEnv value is emitted as a JSON string literal, so any value that rendered on
+  # 2.0.1 still renders -- NO_PROXY is comma-separated by definition, PGOPTIONS carries `=`
+  # and spaces -- and a quote inside it is escaped, never a tautology.
+  - it: extraEnv values with commas, spaces, quotes and query strings render as JSON literals
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.extraEnv:
+        - name: NO_PROXY
+          value: "10.0.0.0/8,localhost"
+        - name: PGOPTIONS
+          value: "-c statement_timeout=0"
+        - name: QUOTED
+          value: "a'b\"c"
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "e\\.value == \"10\\.0\\.0\\.0/8,localhost\""
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "e\\.value == \"-c statement_timeout=0\""
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "e\\.value == \"a'b\\\\\"c\""
+
+
+  # Rules 11/12 pin the WHOLE hardening surface the chart renders, not a subset: AppArmor,
+  # SELinux and procMount are the unpinned twins of seccomp, and capabilities.drop the twin
+  # of add (#283).
+  - it: AppArmor, SELinux, procMount and capabilities.drop are pinned with seccomp
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.capabilities\\.drop == \\['ALL'\\]"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "!has\\(c\\.securityContext\\.appArmorProfile\\) && !has\\(c\\.securityContext\\.seLinuxOptions\\) && !has\\(c\\.securityContext\\.procMount\\)"
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "!has\\(variables\\.pod\\.securityContext\\.appArmorProfile\\) && !has\\(variables\\.pod\\.securityContext\\.seLinuxOptions\\)"
+      # ...and the rest of what the chart renders: fsGroup/runAsGroup by value, the list
+      # fields the values do not set pinned absent.
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "variables\\.pod\\.securityContext\\.fsGroup == 103"
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "!has\\(variables\\.pod\\.securityContext\\.sysctls\\) && !has\\(variables\\.pod\\.securityContext\\.supplementalGroups\\) && !has\\(variables\\.pod\\.securityContext\\.fsGroupChangePolicy\\)"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.runAsGroup == 103"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "!has\\(c\\.securityContext\\.readOnlyRootFilesystem\\)"
+
+  # Rule 20: pod-template annotations are an allowlist, because the legacy AppArmor
+  # annotation selects a profile as surely as the field does.
+  - it: pod-template annotations are limited to the agent's requester stamp
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - equal:
+          path: spec.validations[19].expression
+          value: "!has(object.spec.template.metadata) || !has(object.spec.template.metadata.annotations) || object.spec.template.metadata.annotations.all(k, k in ['pg-ha/requested-by'])"
+      - equal:
+          path: spec.validations[19].reason
+          value: Forbidden
+
+  # Rule 19 pins the data mount to THIS release's claim, not to "some admitted PVC": with an
+  # operator-declared extraVolumes PVC in the release, the restore could otherwise be aimed
+  # at that claim instead (#283).
+  - it: the data mount is bound to the restore PVC by claimName
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      pgbackrest.restore.podOrdinal: 2
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[18].expression
+          pattern: "m\\.mountPath == '/var/lib/postgresql/data' && !has\\(m\\.subPath\\) && has\\(v\\.persistentVolumeClaim\\) && v\\.persistentVolumeClaim\\.claimName == 'data-test-pg-2'"
+
+  - it: a capabilities.drop entry that would break CEL fails the render
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.capabilities.drop:
+        - "ALL' || true || '"
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "a postgresql.containerSecurityContext.capabilities.drop entry is \"ALL' \\|\\| true \\|\\| '\", which cannot be embedded"
+
+  # The free env tier (recovery point, stanza, log level) must be LITERAL: rule 16 admits the
+  # release's own Secrets by (name, key), but TARGET sourced from one would still land in the
+  # status file on the data PVC (#283).
+  - it: the free env tier may not be valueFrom
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[17].expression
+          pattern: "\\(!\\(e\\.name in \\['PGBACKREST_STANZA','TARGET_TYPE','TARGET','BACKUP_SET','FORCE','PGBACKREST_LOG_LEVEL_CONSOLE'\\]\\) \\|\\| !has\\(e\\.valueFrom\\)\\)"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "!has\\(c\\.volumeDevices\\) && !has\\(c\\.ports\\)"
+
+  - it: supplementalGroups set in values is pinned exactly
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.podSecurityContext.supplementalGroups: [200, 300]
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "variables\\.pod\\.securityContext\\.supplementalGroups == \\[200, 300\\]"
+      - notMatchRegex:
+          path: spec.validations[11].expression
+          pattern: "!has\\(variables\\.pod\\.securityContext\\.supplementalGroups\\)"
+
+  # The security contexts are untyped by the schema, so a string where a bool belongs must
+  # fail the render rather than render `== 'x' || true || ''` -- a tautology.
+  - it: a string in a scalar security-context pin fails the render
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.runAsNonRoot: "x' || true || '"
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "postgresql.containerSecurityContext.runAsNonRoot is \"x' \\|\\| true \\|\\| '\", which cannot be embedded"
+
+  # `capabilities.add: []` and `supplementalGroups: []` are omitempty -- the apiserver drops
+  # them -- so their pin must be the ABSENT form, not `== ['']` (which nothing can satisfy and
+  # which denied the release's own Job) (#283).
+  - it: empty capabilities.add and supplementalGroups pin as absent, not as an empty match
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.capabilities.add: []
+      postgresql.podSecurityContext.supplementalGroups: []
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "\\(!has\\(c\\.securityContext\\.capabilities\\) \\|\\| !has\\(c\\.securityContext\\.capabilities\\.add\\) \\|\\| size\\(c\\.securityContext\\.capabilities\\.add\\) == 0\\)"
+      - notMatchRegex:
+          path: spec.validations[10].expression
+          pattern: "add == \\[''\\]"
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "!has\\(variables\\.pod\\.securityContext\\.supplementalGroups\\)"
+
+  # A large uid renders as an integer, not helm's 1.00067e+09 float spelling.
+  - it: a large runAsUser pins as an exact integer
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.runAsUser: 1000670000
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.runAsUser == 1000670000\\)"
+
+  # The hardening pins FOLLOW the values (#283): an SELinux operator's
+  # seLinuxOptions, a baseline's explicit appArmorProfile or procMount land on the Job verbatim,
+  # and an unconditional !has() would deny the release's own restore.
+  - it: hardening fields set in values are pinned or freed, never denied
+    values:
+      - ../values-agent-control-restore.yaml
+      - ../values-agent-control-restore-passthrough.yaml
+    set:
+      postgresql.containerSecurityContext.seLinuxOptions:
+        level: "s0:c123,c456"
+      postgresql.containerSecurityContext.appArmorProfile:
+        type: RuntimeDefault
+      postgresql.podSecurityContext.appArmorProfile:
+        type: RuntimeDefault
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - notMatchRegex:
+          path: spec.validations[10].expression
+          pattern: "!has\\(c\\.securityContext\\.(seLinuxOptions|appArmorProfile|procMount)\\)"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.appArmorProfile\\.type == 'RuntimeDefault'\\)"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.procMount == 'Default'\\)"
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "variables\\.pod\\.securityContext\\.appArmorProfile\\.type == 'RuntimeDefault'\\)"
+      # A gid past 1e6 renders as an exact integer, and the list stays homogeneous (the k8s
+      # CEL environment rejects [103, 1e+06] at compile time -- an apply-time failure).
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "variables\\.pod\\.securityContext\\.supplementalGroups == \\[103, 1000670000\\]"
+
+  - it: a non-numeric supplementalGroups entry fails the render
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.podSecurityContext.supplementalGroups:
+        - "103' || true || '"
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "a postgresql.podSecurityContext.supplementalGroups entry is \"103' \\|\\| true \\|\\| '\", which cannot be embedded"
+
+  # seLinuxOptions set: type/user/role pinned (spc_t is the super-privileged domain), level free
+  # -- and a Localhost profile is pinned on the profile name too (#283).
+  - it: a set seLinuxOptions pins type and a Localhost profile pins its name
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.seLinuxOptions:
+        type: container_t
+        level: "s0:c123,c456"
+      postgresql.containerSecurityContext.seccompProfile:
+        type: Localhost
+        localhostProfile: profiles/deny-write.json
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "\\(has\\(c\\.securityContext\\.seLinuxOptions\\) && has\\(c\\.securityContext\\.seLinuxOptions\\.type\\) && c\\.securityContext\\.seLinuxOptions\\.type == 'container_t' && !has\\(c\\.securityContext\\.seLinuxOptions\\.user\\) && !has\\(c\\.securityContext\\.seLinuxOptions\\.role\\)\\)"
+      - notMatchRegex:
+          path: spec.validations[10].expression
+          pattern: "seLinuxOptions\\.level"
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "c\\.securityContext\\.seccompProfile\\.type == 'Localhost' && has\\(c\\.securityContext\\.seccompProfile\\.localhostProfile\\) && c\\.securityContext\\.seccompProfile\\.localhostProfile == 'profiles/deny-write\\.json'\\)"
+
+  # volumeDevices/ports sit OUTSIDE the `!has(c.securityContext) ||` disjunction, so they hold
+  # for a release that renders no container securityContext at all.
+  - it: volumeDevices and ports are denied even with no container securityContext
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext: null
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "^variables\\.pod\\.containers\\.all\\(c, !has\\(c\\.volumeDevices\\) && !has\\(c\\.ports\\) && \\(!has\\(c\\.terminationMessagePath\\) \\|\\| c\\.terminationMessagePath == '/dev/termination-log'\\) && \\(!has\\(c\\.securityContext\\) \\|\\| \\("
+
+  - it: a profile set without a type fails the render
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.appArmorProfile:
+        localhostProfile: p
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "postgresql.containerSecurityContext.appArmorProfile is set without a type"
+
+  - it: a scalar supplementalGroups fails the render with a named message
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.podSecurityContext.supplementalGroups: 103
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "postgresql.podSecurityContext.supplementalGroups must be a list of group ids, got 103"
+
+  # `seLinuxOptions: {}` is falsy to Go templates but present to has(); the pin must match
+  # what the Job renders (#283).
+  - it: an empty seLinuxOptions map is pinned as present-and-empty, not absent
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.seLinuxOptions: {}
+      postgresql.podSecurityContext.seLinuxOptions: {}
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "\\(has\\(c\\.securityContext\\.seLinuxOptions\\) && !has\\(c\\.securityContext\\.seLinuxOptions\\.type\\) && !has\\(c\\.securityContext\\.seLinuxOptions\\.user\\) && !has\\(c\\.securityContext\\.seLinuxOptions\\.role\\)\\)"
+      - notMatchRegex:
+          path: spec.validations[10].expression
+          pattern: "!has\\(c\\.securityContext\\.seLinuxOptions\\)"
+      - matchRegex:
+          path: spec.validations[11].expression
+          pattern: "\\(has\\(variables\\.pod\\.securityContext\\.seLinuxOptions\\) && !has\\(variables\\.pod\\.securityContext\\.seLinuxOptions\\.type\\)"
+
+  # ...and an empty profile map is a NAMED render failure (the apiserver rejects a profile with
+  # no type anyway), never a silently dropped pin.
+  # (appArmorProfile, which the fixture leaves unset -- a `set:` of {} on the fixture's
+  # seccompProfile would map-merge onto its type and change nothing.)
+  - it: an empty profile map fails the render by name
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.podSecurityContext.appArmorProfile: {}
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "postgresql.podSecurityContext.appArmorProfile is set without a type"
+
+  # An empty SELinux field is omitempty on the object, so it must pin as absent, not as ''.
+  - it: an empty seLinuxOptions.type pins as absent
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.seLinuxOptions:
+        type: ""
+        level: "s0:c1,c2"
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[10].expression
+          pattern: "has\\(c\\.securityContext\\.seLinuxOptions\\) && !has\\(c\\.securityContext\\.seLinuxOptions\\.type\\)"
+
+  # A finalizer would wedge the one permitted Job name forever (the SA has no patch).
+  - it: finalizers are denied on the Job and its pod template
+    values:
+      - ../values-agent-control-restore.yaml
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    documentIndex: 0
+    asserts:
+      - matchRegex:
+          path: spec.validations[6].expression
+          pattern: "!has\\(object\\.metadata\\.finalizers\\) && \\(!has\\(object\\.spec\\.template\\.metadata\\) \\|\\| !has\\(object\\.spec\\.template\\.metadata\\.finalizers\\)\\)"
+
+  - it: a Localhost profile without a localhostProfile fails the render
+    values:
+      - ../values-agent-control-restore.yaml
+    set:
+      postgresql.containerSecurityContext.seccompProfile:
+        type: Localhost
+    templates:
+      - templates/agent-restore-admissionpolicy.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "postgresql.containerSecurityContext.seccompProfile has type Localhost but no localhostProfile"
 
   # --- the binding ---
   #
@@ -451,7 +1089,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "a pgbackrest Secret name (pgbackrest.existingSecret.name / pgbackrest.repoEncryption.existingSecret.name) is \"dba's-key\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "a pgbackrest Secret name (pgbackrest.existingSecret.name / pgbackrest.repoEncryption.existingSecret.name) is \"dba's-key\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9._:/@-]+$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   # priorityClassName is pinned, and it is deliberately NOT lumped in with
   # nodeSelector/tolerations: those can only restrict where a pod runs, while a priority class
@@ -529,7 +1167,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "postgresql.podSecurityContext.seccompProfile.type is \"x' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "postgresql.podSecurityContext.seccompProfile.type is \"x' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9._:/@-]+$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   - it: a crafted container seccomp profile type cannot turn its pin into a tautology
     values:
@@ -540,7 +1178,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "postgresql.containerSecurityContext.seccompProfile.type is \"x' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "postgresql.containerSecurityContext.seccompProfile.type is \"x' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9._:/@-]+$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   - it: a crafted added capability cannot turn its pin into a tautology
     values:
@@ -552,7 +1190,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "a postgresql.containerSecurityContext.capabilities.add entry is \"SYS_ADMIN' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "a postgresql.containerSecurityContext.capabilities.add entry is \"SYS_ADMIN' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9._:/@-]+$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   - it: a crafted priority class name cannot turn its pin into a tautology
     values:
@@ -563,7 +1201,7 @@ tests:
       - templates/agent-restore-admissionpolicy.yaml
     asserts:
       - failedTemplate:
-          errorMessage: "pgbackrest.cronjob.priorityClassName is \"p' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
+          errorMessage: "pgbackrest.cronjob.priorityClassName is \"p' || true || '\", which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9._:/@-]+$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true"
 
   # --- the grant and the bound cannot be separated ---
   - it: disabling the policy without acknowledging the trade fails the render

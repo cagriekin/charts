@@ -1269,6 +1269,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
       "PGBACKREST_STANZA" "PGDATA" "PGBACKREST_PG1_PATH"
       "PGBACKREST_LOG_PATH" "PGBACKREST_LOCK_PATH"
       "TARGET_TYPE" "TARGET" "BACKUP_SET" "FORCE" "RESTORE_REQUESTED_BY"
+      "PGBACKREST_LOG_LEVEL_CONSOLE"
       "RECOVERY_TIMEOUT" "POSTGRES_USER" "POSTGRES_DB"
       "PGBACKREST_REPO1_CIPHER_PASS" "PGBACKREST_REPO1_S3_KEY" "PGBACKREST_REPO1_S3_KEY_SECRET" -}}
 {{- $envNames := list -}}
@@ -1276,7 +1277,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
   {{- $n := ($e.name | default "") | toString -}}
   {{- if not $n -}}{{- fail (printf "pgbackrest.extraEnv[%d]: name is required" $i) -}}{{- end -}}
   {{- if has $n $chartEnv -}}
-    {{- fail (printf "pgbackrest.extraEnv[%d]: %q is set by the chart on one or more of the pgbackrest containers and may not be overridden -- a duplicate env name is last-wins at runtime, so this would silently shadow the chart/Secret value (e.g. pointing a restore at the wrong stanza, or a backup at the wrong repository credentials). Use the chart's own value for this setting instead." $i $n) -}}
+    {{- fail (printf "pgbackrest.extraEnv[%d]: %q is set by the chart or the HA agent on one or more of the pgbackrest containers and may not be overridden -- a duplicate env name is last-wins at runtime, so this would silently shadow the chart/Secret value (e.g. pointing a restore at the wrong stanza, or a backup at the wrong repository credentials). Use the chart's own value for this setting instead." $i $n) -}}
   {{- end -}}
   {{- if has $n $envNames -}}{{- fail (printf "pgbackrest.extraEnv[%d]: duplicate env name %q" $i $n) -}}{{- end -}}
   {{- $envNames = append $envNames $n -}}
@@ -1909,6 +1910,47 @@ true
        "present and equal" when the release's values set the field, "absent" when they do
        not -- which is precisely the shape the rendered Job has, so the policy can never
        deny the release's own restore. Args: (list <CEL path> <values dict> <key>). */ -}}
+{{- /* pg.celProfilePin: seccompProfile / appArmorProfile at <path> (#283). Absent when unset;
+       pinned on .type when set, plus .localhostProfile under Localhost. A profile without a
+       type fails the render (the apiserver rejects it anyway). Args: path, map, label. */ -}}
+{{- define "pg.celProfilePin" -}}
+{{- $path := index . 0 -}}
+{{- $p := index . 1 -}}
+{{- $label := index . 2 -}}
+{{- /* kindIs "map", not truthiness: `{}` is falsy to Go templates but present to has(). */ -}}
+{{- if not (kindIs "map" $p) -}}
+!has({{ $path }})
+{{- else if not $p.type -}}
+{{- fail (printf "%s is set without a type (%v). Kubernetes requires .type on a security profile, so the release's own restore Job would be rejected -- and the admission policy cannot pin a profile it cannot name. Set type (RuntimeDefault, Localhost, Unconfined), or remove the block." $label $p) -}}
+{{- else if and (eq (toString $p.type) "Localhost") (not $p.localhostProfile) -}}
+{{- fail (printf "%s has type Localhost but no localhostProfile. Kubernetes requires one, and the admission policy pins it so the caller cannot swap in a more permissive named profile. Set localhostProfile, or use RuntimeDefault." $label) -}}
+{{- else -}}
+(has({{ $path }}) && has({{ $path }}.type) && {{ $path }}.type == '{{ $p.type }}'{{ if eq (toString $p.type) "Localhost" }} && has({{ $path }}.localhostProfile) && {{ $path }}.localhostProfile == '{{ $p.localhostProfile }}'{{ end }})
+{{- end -}}
+{{- end -}}
+
+{{- /* pg.celSELinuxPin: seLinuxOptions at <path>. Absent when unset; type/user/role pinned when
+       set (spc_t is the super-privileged domain), level free (it cannot widen a domain and
+       carries a comma). Args: path, map. */ -}}
+{{- define "pg.celSELinuxPin" -}}
+{{- $path := index . 0 -}}
+{{- $o := index . 1 -}}
+{{- if not (kindIs "map" $o) -}}
+!has({{ $path }})
+{{- else -}}
+{{- $pins := list (printf "has(%s)" $path) -}}
+{{- range $f := list "type" "user" "role" -}}
+{{- /* An empty string is omitempty on the object, so absent. */ -}}
+{{- if index $o $f -}}
+{{- $pins = append $pins (printf "has(%s.%s) && %s.%s == '%s'" $path $f $path $f (index $o $f | toString)) -}}
+{{- else -}}
+{{- $pins = append $pins (printf "!has(%s.%s)" $path $f) -}}
+{{- end -}}
+{{- end -}}
+({{ join " && " $pins }})
+{{- end -}}
+{{- end -}}
+
 {{- define "pg.celScalarPin" -}}
 {{- $path := index . 0 -}}
 {{- $src := index . 1 -}}
@@ -1917,6 +1959,9 @@ true
 {{- $v := index $src $key -}}
 {{- if kindIs "string" $v -}}
 (has({{ $path }}) && {{ $path }} == '{{ $v }}')
+{{- else if and (kindIs "float64" $v) (eq (float64 (int64 $v)) $v) -}}
+{{- /* helm's float64 prints 1000670000 as 1.00067e+09; a pin should read exactly. */ -}}
+(has({{ $path }}) && {{ $path }} == {{ printf "%d" (int64 $v) }})
 {{- else -}}
 (has({{ $path }}) && {{ $path }} == {{ $v }})
 {{- end -}}
@@ -1944,8 +1989,10 @@ true
 {{- range $pair := . -}}
 {{- $label := index $pair 0 -}}
 {{- $value := index $pair 1 | toString -}}
-{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._:/@-]*$" $value) -}}
-{{- fail (printf "%s is %q, which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $label $value) -}}
+{{- /* One class, one or more times (#283): a leading `_`, `/` or `-` is legal input and no
+       less safe at the start of a CEL literal than in the middle. */ -}}
+{{- if not (regexMatch "^[A-Za-z0-9._:/@-]+$" $value) -}}
+{{- fail (printf "%s is %q, which cannot be embedded in the restore admission policy's CEL expressions (#279): it must match ^[A-Za-z0-9._:/@-]+$ (alphanumerics and . _ - / : @). Quotes, whitespace and backslashes would either break the policy at apply time or silently turn a validation into a tautology. Fix the value, or disable the policy deliberately with ha.agent.control.restore.admissionPolicy.enabled=false plus acknowledgeUnbounded=true" $label $value) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

@@ -749,7 +749,7 @@ tests:
           value: elsewhere
     asserts:
       - failedTemplate:
-          errorMessage: 'pgbackrest.extraEnv[0]: "PGBACKREST_STANZA" is set by the chart on one or more of the pgbackrest containers and may not be overridden -- a duplicate env name is last-wins at runtime, so this would silently shadow the chart/Secret value (e.g. pointing a restore at the wrong stanza, or a backup at the wrong repository credentials). Use the chart''s own value for this setting instead.'
+          errorMessage: 'pgbackrest.extraEnv[0]: "PGBACKREST_STANZA" is set by the chart or the HA agent on one or more of the pgbackrest containers and may not be overridden -- a duplicate env name is last-wins at runtime, so this would silently shadow the chart/Secret value (e.g. pointing a restore at the wrong stanza, or a backup at the wrong repository credentials). Use the chart''s own value for this setting instead.'
 
   # Reserved even though only the backup CronJob sets it, and only that one pod would break --
   # the operator setting it has no reason to be thinking about that pod.

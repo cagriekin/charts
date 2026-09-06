@@ -1,5 +1,37 @@
 # pgvector chart changelog
 
+## 2.0.2 - 2026-09-06
+
+### Changed
+
+- **Two values that rendered on 2.0.1 now fail the render (#283).** `pgbackrest.extraEnv` may
+  not name `PGBACKREST_LOG_LEVEL_CONSOLE` (the agent sets it on the API-driven restore Job, and
+  the admission policy now pins every declared literal by value). And while the restore
+  admission policy is enabled, a `pgbackrest.extraVolumeMounts` path at or under
+  `/etc/pgbackrest/conf.d` is refused: the pods' ServiceAccount can create a ConfigMap that
+  does not exist yet, which would be pgbackrest option injection into the pinned Job. Remove
+  the env entry; move fragments out of `conf.d`. Both messages name the fix.
+
+### Fixed
+
+- **The restore admission policy now bounds the restore Job's parameters, not only its shape
+  (#283).** The #279 policy left every env value free, on the reasoning that choosing the
+  recovery point is the feature. That is right for `TARGET_TYPE`/`TARGET`/`BACKUP_SET` and wrong
+  for `FORCE` -- `pgbackrest restore --force`, the bypass of the `postmaster.pid` interlock the
+  1.10.0 notes relied on for "still needs the StatefulSet scaled to 0". Now pinned, following
+  the values like every other pin: `FORCE` present, literal, on every occurrence, equal to
+  `pgbackrest.restore.force`; env names an allowlist of what the jobTemplate renders (pgbackrest
+  reads any `PGBACKREST_<OPTION>` from the environment, so `PGBACKREST_FORCE` was `--force`
+  under another name), literals by value, `valueFrom` entries by their rendered source and
+  Secret key; every mount by path, subPath and source, `/scripts` projecting exactly
+  `restore.sh` (the same ConfigMap carries `validate.sh`, which `rm -rf`s PGDATA); no probes,
+  finalizers, `hostAliases`/`dnsConfig`, extra pod annotations, `volumeDevices` or `ports`;
+  the full rendered security context including AppArmor, SELinux, `procMount`,
+  `capabilities.drop` and `supplementalGroups`. Operator values are emitted as JSON CEL
+  literals, so no charset applies to them. This raises `--force` to a reviewable values change;
+  it is not a proof the interlock is unreachable -- the modeled attacker owns `postmaster.pid`
+  and the README says so.
+
 ## 2.0.1 - 2026-09-02
 
 ### Fixed

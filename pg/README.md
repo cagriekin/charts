@@ -982,13 +982,18 @@ this release's ServiceAccount, and requires of every Job that subject creates:
 | `automountServiceAccountToken: false`, stated explicitly (absent is a denial) | makes naming a ServiceAccount moot: the pod gets no token |
 | no `hostNetwork` / `hostPID` / `hostIPC`, no explicit `nodeName`, and only this release's `priorityClassName` | escape to the node; placing the pod by hand instead of through the scheduler; and claiming a high-priority class so the scheduler **preempts this release's own postgresql pods** (referencing a PriorityClass needs no permission). `nodeSelector`/`tolerations` stay unpinned — inherited from `postgresql.*` so the restore can land where the volume attaches, and unlike priority they can only *restrict* placement |
 | the **pod's own labels**: only this release's restore labels plus the batch controller's | joining this release's Service endpoints. A restore pod labelled `component=postgresql` would be added to the write Service — with no readiness probe it is Ready at once — and would receive application traffic and its credentials |
-| no `manualSelector` | a caller-supplied Job selector and identity labels |
+| no `manualSelector`, no finalizers on the Job or its pod template | a caller-supplied Job selector and identity labels; and a Job the agent could never delete — the SA has no `patch`, so one finalizer would wedge the only permitted Job name and kill the break-glass path for good |
 | exactly one container, no init or ephemeral containers, running this release's HA image | what code enters the cluster on this token |
-| `command` == this release's restore entrypoint, no `args`, no `lifecycle` hooks | the image pin alone is weak — the postgresql container already runs this image against this volume. Without this, the Job is "run anything as the database's uid with the live PGDATA mounted", which destroys data with no privilege escalation at all. A `postStart` exec hook would sidestep a `command`-only pin |
+| `command` == this release's restore entrypoint, no `args`, no `lifecycle` hooks, no probes, `terminationMessagePath` left at the apiserver default | the image pin alone is weak — the postgresql container already runs this image against this volume. Without this, the Job is "run anything as the database's uid with the live PGDATA mounted", which destroys data with no privilege escalation at all. A `postStart` exec hook would sidestep a `command`-only pin |
 | this release's **pod and container `securityContext`** (`privileged`, `allowPrivilegeEscalation`, `runAsUser`, `runAsNonRoot`, added capabilities) | a root/privileged container with `CAP_SYS_ADMIN` — which reads every other pod's token off the kubelet and is *strictly more* than the token started with |
 | CPU and memory requests and limits present; `parallelism` and `completions` ≤ 1 | one permitted Job name as a repeatable way to fill the namespace quota and evict the database's own pods |
 | volumes limited to the three the restore template renders (`emptyDir`, ConfigMap `<release>-pg-pgbackrest`, PVC `data-<release>-pg-<podOrdinal>`) | with the token gone this is the one that matters most: arbitrary Secret mounts, `hostPath`, and projected service-account tokens all fall out as denials |
-| no `envFrom`; `valueFrom` limited to the downward API and this release's own Secrets | the same bound for env — a key from any other Secret or ConfigMap |
+| no `envFrom`; `valueFrom` limited to the downward API and this release's own Secret **keys** (name *and* key, as rendered), each `valueFrom` name bound to the one source the jobTemplate gives it; the free env names (recovery point, stanza) must be literals | the same bound for env — a key from any other Secret or ConfigMap, another key of the release's own Secret, or `TARGET` sourced from one (restore.sh writes the target into the status file on the data PVC) |
+| `FORCE` == the literal `pgbackrest.restore.force` renders — present, pinned on every occurrence, not sourced from `valueFrom` | `pgbackrest restore --force`, the bypass of the `postmaster.pid` interlock. Without this pin, "restore this release to a point of your choosing" becomes "restore over a **running** primary at any moment"; with it, the bypass is a reviewable values change (#283) |
+| no `hostAliases`, no `dnsConfig`, `dnsPolicy` left at `ClusterFirst` | redirecting the S3 endpoint named in the mounted `pgbackrest.conf` by resolver instead of by env — with `pgbackrest.s3.verifyTls: false` (a supported MinIO/Ceph configuration) that is a restore from the caller's bucket into the live PGDATA (#283) |
+| every `volumeMount` bound to its rendered `(mountPath, subPath, source)`; the data mount to this release's PVC by `claimName`; the two ConfigMap paths to this release's pgbackrest ConfigMap, `/scripts` projecting exactly `restore.sh`; no `subPathExpr` | the permitted data PVC mounted at `/scripts` is the pinned command running bytes the caller wrote into PGDATA earlier; mounted at `/etc/pgbackrest/conf.d` it supplies every pgbackrest option the env allowlist keeps out; and the same ConfigMap's `validate.sh` projected as `restore.sh` would `rm -rf` the live PGDATA and restore with no interlock (#283) |
+| pod and container **hardening fields as rendered**: `appArmorProfile`/`seccompProfile` absent or pinned on `type` (and `localhostProfile`), `seLinuxOptions` absent or pinned on `type`/`user`/`role` (`level` free), `procMount` and `capabilities.drop` exact; no `volumeDevices` or `ports`; pod-template **annotations** limited to the agent's `pg-ha/requested-by` | the unpinned twins of the seccomp pin — `appArmorProfile: Unconfined` (or its legacy annotation spelling) strips the runtime's default profile on any AppArmor node, `seLinuxOptions` requests a type or level on SELinux nodes (#283) |
+| env **names** limited to what the restore `jobTemplate` renders; `PGDATA`, the pgbackrest log/lock paths **and every literal `pgbackrest.extraEnv` value** pinned; the credential and requester entries must stay `valueFrom` | the route around the `FORCE` pin: pgbackrest reads any `PGBACKREST_<OPTION>` from the environment, so an unlisted `PGBACKREST_FORCE=y` is `--force` under another name, `PGBACKREST_REPO1_S3_ENDPOINT` is a restore from someone else's repository, and `BASH_ENV`/`LD_PRELOAD` are code execution before the pinned command's first line. A free `PGDATA` would aim the shell interlock at a directory that does not exist (#283) |
 
 The security contexts, resources and command are pinned to **what this release's own values
 render**, not to a fixed hardened profile: change `postgresql.containerSecurityContext` and
@@ -1006,22 +1011,56 @@ namespace would be worse than the hole it closes.
 Be clear-eyed about the residual, because it decides whether this feature belongs on your
 cluster:
 
-- **The restore parameters are not bounded, and cannot be.** Anything holding the token can
-  still create the one permitted Job with its own `TARGET`, `BACKUP_SET` and `FORCE` — a real
-  restore of this release, over the live PGDATA, without presenting a client certificate to
-  the control API. `allowedClientCNs` guards the API; it cannot guard `create jobs`. A
-  restore over the live data directory *is* the operation being exposed, so admission has
-  nothing left to reject. pgBackRest still refuses to restore while `postmaster.pid` exists,
-  which in practice means this needs the StatefulSet already scaled to 0.
-- **The command pin is not a sandbox.** Bash reads `$BASH_ENV`, and an actor who already runs
-  code in the postgresql container can write a file into PGDATA — which this Job mounts. So
-  code execution inside the restore container is reachable. What it reaches is uid 101 with no
-  token and only this release's volumes: the privileges already held, which is the bar this
-  policy is written to. The image, security-context, volume and env pins are what hold that
-  bar — not the command pin alone.
+- **The recovery point is not bounded, and cannot be.** Anything holding the token can
+  still create the one permitted Job with its own `TARGET_TYPE`, `TARGET` and `BACKUP_SET` — a
+  real restore of this release, to a point of their choosing, without presenting a client
+  certificate to the control API. `allowedClientCNs` guards the API; it cannot guard
+  `create jobs`. Choosing the point *is* the operation being exposed, so admission has
+  nothing left to reject there. The parameters split three ways: `TARGET_TYPE`/`TARGET`/
+  `BACKUP_SET` (and the stanza name, which selects within this release's own repository) are
+  inherent to the feature and stay free; `FORCE` is an **interlock bypass**, not a
+  recovery-point choice, and is pinned to `pgbackrest.restore.force`; every other env name
+  is denied outright, because pgbackrest would read `PGBACKREST_FORCE` from the environment
+  just as happily; and a literal `pgbackrest.extraEnv` you declare is pinned to the value you
+  declared, because the names an operator adds (a proxy, a storage host) are exactly the ones
+  whose *value* would be the attack (#283). What that buys is precise: pgBackRest's refusal to
+  restore while `postmaster.pid` exists can no longer be switched off through the job-create
+  grant, so a token-holder's restore needs the StatefulSet already scaled to 0 — an
+  operator-initiated maintenance state — **or** code execution inside the pinned container
+  (next bullet) — **or** the starting point this whole policy assumes: code execution as the
+  postgres user in the postgresql container, which owns `postmaster.pid` and can simply
+  delete it (the interlock on both sides is a file-existence test). It raises the bypass to
+  a reviewable values change; it is not a proof that `--force` is unreachable.
+- **The command pin is not a sandbox.** The env allowlist closes the environment route
+  (`BASH_ENV`, `LD_PRELOAD` and every other unlisted name are denied), but `restore.sh` still
+  runs pgbackrest against the mounted PGDATA with the free recovery-point parameters, and an
+  actor who already runs code in the postgresql container can shape what that volume
+  contains. So code execution inside the restore container should be assumed reachable — and
+  from there `--force` is a shell command away, which is why the previous bullet says "raises
+  the bar" and not "enforces". What it reaches is uid 101 with no token and only this
+  release's volumes: the privileges already held, which is the bar this policy is written to.
+  The image, security-context, volume and env pins are what hold that bar — not the command
+  pin alone.
 - **It is not a check that the Job matches the release in full.** CEL sees only the admission
   request, so the verbatim-`jobTemplate` clone remains what guarantees the rest. This is
   defence in depth on top of that.
+- **An absent ConfigMap you reference is the caller's.** The pods' ServiceAccount holds an
+  unscoped `create configmaps`, so if a ConfigMap named by `pgbackrest.extraVolumes` or by a
+  `pgbackrest.extraEnv` `configMapKeyRef` does not exist yet, a token-holder can create it with
+  content of their choosing — mounted at the path you pinned, or read into the env name you
+  declared. Create the ConfigMaps you reference before enabling the feature; a mount
+  at or under `/etc/pgbackrest/conf.d` (pgbackrest's config-include-path) is refused at
+  render time while this policy is enabled, for the same reason — without it (and so without
+  the bounded grant) the #323 passthrough there is unaffected. (The release's own pgbackrest ConfigMap
+  is not remappable: `/scripts` must project exactly the `restore.sh` key, because the same
+  ConfigMap carries `validate.sh`, which begins with `rm -rf "$PGDATA"`.)
+- **It fails closed against mutating webhooks.** The env-name and mount allowlists deny the
+  restore Job if a namespace webhook injects an env var or a mount into it (proxy and APM
+  injectors do exactly that), the same way the pod-label allowlist already does. Exclude the
+  restore Job from such injectors — that is the reliable remedy. Declaring the injected entry
+  in `pgbackrest.extraEnv` / `extraVolumeMounts` only works if the injector's value matches
+  the declared one byte-for-byte and the injector does not append a second copy (a literal is
+  pinned by value, and a duplicate name is denied).
 
 So the policy turns "namespace-wide privilege escalation from a SQL injection" into "an
 unauthenticated trigger for this release's own restore". That is a large reduction and the
@@ -1092,9 +1131,11 @@ What it does and does not control:
   only *confirm* it (409 on mismatch). The request must also be addressed to the pod that
   owns that volume.
 - The API **never sets pgBackRest's `--force`**, which bypasses the `postmaster.pid`
-  interlock — the last guard against restoring over a live volume. If you genuinely need
-  the stale-pid bypass, set `pgbackrest.restore.force=true` in values, where it is
-  reviewable.
+  interlock — the last guard against restoring over a live volume — and with
+  `admissionPolicy` on, the API server denies any Job that sets, duplicates, or
+  `valueFrom`-sources it (#283). If you genuinely need the stale-pid bypass, set
+  `pgbackrest.restore.force=true` in values, where it is reviewable; the pin follows the
+  rendered value.
 - Destructive by declaration: `force: true` and `confirm: "<statefulset name>"` are both
   required, and the cluster must already be **paused** — an active reconcile loop would
   restart the postmaster the restore needs stopped. (The exact confirm value is whatever
@@ -1415,7 +1456,10 @@ run-time only:
   the pod sticks in `CreateContainerError`) and `/etc/pgbackrest/pgbackrest.conf` (a file). At
   or above only for `/work`, `/tmp` and `/var/run/postgresql`, which are writable `emptyDir`s —
   nesting inside them is the normal case, so `/tmp/kube` is fine. So is a sibling such as
-  `/etc/pgbackrest/conf.d`, and `mountPath: /` is refused by name.
+  `/etc/pgbackrest/conf.d` — **unless the restore admission policy is enabled**, in which case a
+  mount at or under `conf.d` is refused at render time (see the admission-policy residuals:
+  the pods' ServiceAccount can create a ConfigMap that does not exist yet). `mountPath: /` is
+  refused by name.
 - `extraEnv` may not reuse a name the chart sets on any of the containers (`PGBACKREST_*`,
   `STANZA`, `TARGET`, `HOME`, …), including names only a currently-disabled feature emits — so
   a passthrough that works today cannot start silently shadowing a chart value after a later

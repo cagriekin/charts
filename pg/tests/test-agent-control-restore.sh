@@ -103,8 +103,10 @@ kubectl create secret generic "${TLS_SECRET}" -n "${NAMESPACE}" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 echo "Installing pg chart (agent mode, control API + restore triggering)..."
+# The passthrough overlay is what makes the baseline `admit '.'` below a positive test of the
+# policy's extraEnv (literal + empty) and extraVolumeMounts tiers on a real apiserver (#283).
 helm upgrade --install "${RELEASE}" "${CHART_DIR}" -n "${NAMESPACE}" \
-  -f "${VALUES}" --wait --timeout 10m
+  -f "${VALUES}" -f "${SCRIPT_DIR}/values-agent-control-restore-passthrough.yaml" --wait --timeout 10m
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 1 900
 
 # --- the granted RBAC is exactly what was documented, no wider ---
@@ -199,6 +201,138 @@ assert_eq "VAP: a Job created by a human is untouched" "allowed" "$(admit "${unr
 assert_contains "VAP: naming another ServiceAccount is denied" \
   "$(admit '.spec.template.spec.serviceAccountName="privileged-sa"')" \
   "may only create Jobs running as ServiceAccount"
+
+# #283: FORCE is `pgbackrest restore --force`, the bypass of the postmaster.pid interlock --
+# the one thing that makes a token-holder's restore need the StatefulSet already at 0 rather
+# than working against a running primary. The pin has three closures and each gets its own
+# denial here, because each is a distinct way to smuggle the flag past a naive value check:
+# flip the literal, append a second last-wins entry, source it from an annotation the Job
+# creator controls, or drop it and let the script's default decide.
+force_msg="must carry FORCE=false as a literal"
+assert_contains "VAP #283: flipping FORCE to true is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="FORCE" then .value="true" else . end)')" \
+  "${force_msg}"
+assert_contains "VAP #283: a second, last-wins FORCE entry is denied" \
+  "$(admit '.spec.template.spec.containers[0].env += [{"name":"FORCE","value":"true"}]')" \
+  "${force_msg}"
+assert_contains "VAP #283: FORCE sourced from the downward API is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="FORCE" then {name:"FORCE",valueFrom:{fieldRef:{fieldPath:"metadata.name"}}} else . end)')" \
+  "${force_msg}"
+assert_contains "VAP #283: removing FORCE is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(select(.name!="FORCE"))')" \
+  "${force_msg}"
+# The route AROUND the pin (#283): pgbackrest reads any PGBACKREST_<OPTION> from the
+# environment, so the rendered FORCE=false plus an extra PGBACKREST_FORCE=y is --force under
+# another name; PGDATA=/tmp/x aims the shell interlock at a directory that does not exist;
+# BASH_ENV is code execution before the pinned command's first line; and a LITERAL
+# PGBACKREST_REPO1_S3_KEY is an attacker-supplied credential that the valueFrom rule never
+# inspects. Rule 18 denies each of them by name or by tier.
+allow_msg="may carry only the env its jobTemplate renders"
+assert_contains "VAP #283: PGBACKREST_FORCE=y (--force under another name) is denied" \
+  "$(admit '.spec.template.spec.containers[0].env += [{"name":"PGBACKREST_FORCE","value":"y"}]')" \
+  "${allow_msg}"
+assert_contains "VAP #283: BASH_ENV is denied" \
+  "$(admit '.spec.template.spec.containers[0].env += [{"name":"BASH_ENV","value":"/var/lib/postgresql/data/x"}]')" \
+  "${allow_msg}"
+assert_contains "VAP #283: a redirected PGDATA is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="PGDATA" then .value="/tmp/x" else . end)')" \
+  "${allow_msg}"
+assert_contains "VAP #283: TARGET sourced from a Secret is denied (the free tier must be literal)" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="TARGET" then {name:"TARGET",valueFrom:{secretKeyRef:{name:"s3-backup-creds",key:"access-key-id"}}} else . end)')" \
+  "${allow_msg}"
+assert_contains "VAP #283: another key of the release's own Secret is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="PGBACKREST_REPO1_S3_KEY" then .valueFrom.secretKeyRef.key="other" else . end)')" \
+  "may reference only the downward API"
+# A finalizer the agent can never remove (no patch) would wedge the one permitted Job name.
+assert_contains "VAP #283: a Job finalizer is denied" \
+  "$(admit '.metadata.finalizers = ["example.com/hold"]')" \
+  "may not carry finalizers"
+assert_contains "VAP #283: a pod-template finalizer is denied" \
+  "$(admit '.spec.template.metadata.finalizers = ["example.com/hold"]')" \
+  "may not carry finalizers"
+assert_contains "VAP #283: terminationMessagePath is denied" \
+  "$(admit '.spec.template.spec.containers[0].terminationMessagePath = "/scripts/restore.sh"')" \
+  "this release's container security context"
+assert_contains "VAP #283: re-sourcing RESTORE_REQUESTED_BY from a Secret is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="RESTORE_REQUESTED_BY" then {name:"RESTORE_REQUESTED_BY",valueFrom:{secretKeyRef:{name:"s3-backup-creds",key:"access-key-id"}}} else . end)')" \
+  "${allow_msg}"
+assert_contains "VAP #283: a livenessProbe exec is denied (a second command)" \
+  "$(admit '.spec.template.spec.containers[0].livenessProbe = {exec:{command:["/bin/sh","-c","pgbackrest restore --force"]}}')" \
+  "no lifecycle hooks and no probes"
+assert_contains "VAP #283: a literal S3 credential is denied (must stay valueFrom)" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="PGBACKREST_REPO1_S3_KEY" then {name:"PGBACKREST_REPO1_S3_KEY",value:"AKIA-attacker"} else . end)')" \
+  "${allow_msg}"
+# The route around BOTH env rules (#283): the set of volume sources is closed, but
+# the permitted data PVC mounted at /scripts is the pinned command running whatever the
+# caller wrote into PGDATA earlier; at /etc/pgbackrest/conf.d it is every pgbackrest option
+# the env allowlist keeps out. And a hostAliases entry redirects the S3 endpoint with no env
+# at all. Rule 19 and the widened rule 5 deny each at the apiserver.
+mount_msg="may mount only what its jobTemplate mounts"
+assert_contains "VAP #283: the data PVC mounted over /scripts is denied" \
+  "$(admit '.spec.template.spec.containers[0].volumeMounts |= map(if .name=="restore-script" then {name:"data",mountPath:"/scripts"} else . end)')" \
+  "${mount_msg}"
+assert_contains "VAP #283: the data PVC mounted over pgbackrest conf.d is denied" \
+  "$(admit '.spec.template.spec.containers[0].volumeMounts += [{name:"data",mountPath:"/etc/pgbackrest/conf.d"}]')" \
+  "${mount_msg}"
+assert_contains "VAP #283: subPathExpr is denied" \
+  "$(admit '.spec.template.spec.containers[0].volumeMounts |= map(if .name=="data" then . + {subPathExpr:"$(PGDATA)"} else . end)')" \
+  "${mount_msg}"
+assert_contains "VAP #283: hostAliases is denied" \
+  "$(admit '.spec.template.spec.hostAliases = [{ip:"10.0.0.9",hostnames:["minio.'"${NAMESPACE}"'.svc.cluster.local"]}]')" \
+  "hostAliases, dnsConfig and any dnsPolicy other than ClusterFirst are not permitted"
+assert_contains "VAP #283: dnsConfig is denied" \
+  "$(admit '.spec.template.spec.dnsConfig = {nameservers:["10.0.0.9"]}')" \
+  "hostAliases, dnsConfig and any dnsPolicy other than ClusterFirst are not permitted"
+assert_contains "VAP #283: a non-default dnsPolicy is denied" \
+  "$(admit '.spec.template.spec.dnsPolicy = "None" | .spec.template.spec.dnsConfig = {nameservers:["10.0.0.9"]}')" \
+  "hostAliases, dnsConfig and any dnsPolicy other than ClusterFirst are not permitted"
+# The hardening twins of the seccomp pin, and the annotation spelling of AppArmor.
+assert_contains "VAP #283: an Unconfined AppArmor profile is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.appArmorProfile = {type:"Unconfined"}')" \
+  "this release's container security context"
+assert_contains "VAP #283: the AppArmor annotation spelling is denied" \
+  "$(admit '.spec.template.metadata.annotations = {"container.apparmor.security.beta.kubernetes.io/pgbackrest-restore":"unconfined"}')" \
+  "may carry only the pod annotation pg-ha/requested-by"
+# The apiserver's own validation requires hostUsers=false for Unmasked (user namespaces), so
+# the mutation sets both -- otherwise the request never reaches admission.
+assert_contains "VAP #283: flipping procMount to Unmasked is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.procMount = "Unmasked" | .spec.template.spec.hostUsers = false')" \
+  "this release's container security context"
+assert_contains "VAP #283: adding seLinuxOptions is denied" \
+  "$(admit '.spec.template.spec.containers[0].securityContext.seLinuxOptions = {type:"spc_t"}')" \
+  "this release's container security context"
+assert_contains "VAP #283: changing supplementalGroups is denied" \
+  "$(admit '.spec.template.spec.securityContext.supplementalGroups = [0]')" \
+  "this release's pod security context"
+assert_contains "VAP #283: removing capabilities.drop is denied" \
+  "$(admit 'del(.spec.template.spec.containers[0].securityContext.capabilities.drop)')" \
+  "this release's container security context"
+# The fixture declares a literal extraEnv, an EMPTY one and an extra mount, so the baseline
+# `admit '.'` above is the positive case for all three tiers on a real apiserver. The literal
+# is pinned by VALUE: the names an operator adds are exactly the ones whose value is the attack.
+assert_contains "VAP #283: a changed extraEnv literal is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="PGBACKREST_LOG_LEVEL_FILE" then .value="off" else . end)')" \
+  "${allow_msg}"
+assert_contains "VAP #283: giving the empty extraEnv a value is denied" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="RESTORE_SUITE_MARKER" then .value="x" else . end)')" \
+  "${allow_msg}"
+# The permitted ConfigMap also carries validate.sh, which begins with rm -rf "$PGDATA" and
+# then restores with no interlock at all -- projecting it as restore.sh would be a
+# destroy-and-restore primitive under the pinned command, with no FORCE and no code execution.
+assert_contains "VAP #283: projecting validate.sh as restore.sh is denied" \
+  "$(admit '.spec.template.spec.volumes |= map(if .name=="restore-script" then .configMap.items=[{key:"validate.sh",path:"restore.sh"}] else . end)')" \
+  "${mount_msg}"
+assert_contains "VAP #283: dropping the items pin on /scripts is denied" \
+  "$(admit '.spec.template.spec.volumes |= map(if .name=="restore-script" then del(.configMap.items) else . end)')" \
+  "${mount_msg}"
+# ...and the one name the agent adds itself (readPodLogs) is admitted, or toggling log
+# reading would deny the agent's own Job.
+assert_eq "VAP #283: the agent's PGBACKREST_LOG_LEVEL_CONSOLE is admitted" "allowed" \
+  "$(admit '.spec.template.spec.containers[0].env += [{"name":"PGBACKREST_LOG_LEVEL_CONSOLE","value":"detail"}]')"
+# The recovery point is NOT pinned -- the API overrides these on every request, so a policy
+# that denied them would deny every API-driven restore. Assert the boundary from this side too.
+assert_eq "VAP #283: a different BACKUP_SET is admitted (the recovery point is the feature)" "allowed" \
+  "$(admit '.spec.template.spec.containers[0].env |= map(if .name=="BACKUP_SET" then .value="20260101-000000F" else . end)')"
 # ...and why it would not help even if it were not: no token is mounted.
 assert_contains "VAP: mounting the ServiceAccount token is denied" \
   "$(admit '.spec.template.spec.automountServiceAccountToken=true')" \

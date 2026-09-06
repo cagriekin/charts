@@ -600,7 +600,8 @@
               "type": "string"
             },
             "force": {
-              "type": "boolean"
+              "type": "boolean",
+              "description": "pgbackrest restore --force (bypass the postmaster.pid interlock). Also pinned by the restore admission policy (#283), so it can be changed only here."
             },
             "podOrdinal": {
               "type": "integer",

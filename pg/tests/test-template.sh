@@ -5024,6 +5024,317 @@ assert_contains "#279 keyType=auto: only the downward API is permitted" "${ctl_v
 assert_not_contains "#279 keyType=auto: configMapKeyRef is not admitted by a bare negation" \
   "${ctl_vap}" '!has(e.valueFrom.secretKeyRef)'
 
+# --- #283: FORCE is pinned; the recovery-point parameters are not ---
+# FORCE is `pgbackrest restore --force`, the bypass of the postmaster.pid interlock. Rule 16
+# admits any literal env, so without a pin a token-holder could restore over a RUNNING
+# primary. The pin follows the rendered value (an operator who sets force=true for a stale
+# pid file must not be denied their own Job), so it is a drift pair like the others -- and
+# the FORCE entry spans two lines (`- name:` / `value:`), so `rendered()` cannot read it.
+rendered_env() { awk -v n="$1" '$0 ~ "- name: "n"$" {getline; sub(/^ *value: ["'\'']?/, ""); sub(/["'\'']$/, ""); print; exit}' <<< "${ctl_vap_cj}"; }
+# Anchored to rule 17's own clause: `pinned 'e.value'` would take the first e.value pin in
+# file order, which is rule 18's PGDATA the moment the rules are reordered.
+pinned_force() { grep "e.name != 'FORCE' || " <<< "${ctl_vap}" | head -1 | sed "s/.*e.value == '//; s/'.*$//"; }
+drift "pinned FORCE is the one the Job renders (#283)" \
+  "$(rendered_env FORCE)" "$(pinned_force)"
+assert_eq "#283: the default pin is false" "false" "$(pinned_force)"
+# The three closures are each load-bearing (see the rule's comment): presence, every
+# occurrence (env is last-wins on duplicates), and literal-only (rule 16 admits fieldRef,
+# and the Job creator controls the annotations a fieldRef could read).
+assert_contains_literal "#283: FORCE must be present" "${ctl_vap}" "c.env.exists(e, e.name == 'FORCE')"
+assert_contains_literal "#283: every FORCE entry is pinned, not just the first" "${ctl_vap}" "c.env.all(e, e.name != 'FORCE' ||"
+assert_contains_literal "#283: FORCE must be a literal, not valueFrom" "${ctl_vap}" \
+  "e.name != 'FORCE' || (!has(e.valueFrom) && has(e.value) && e.value =="
+
+assert_contains "#283: the denial names the fix" "${ctl_vap}" 'change pgbackrest.restore.force in values instead (#283)'
+# The pin moves with values: force=true renders FORCE="true" on the CronJob and 'true' in
+# the policy, so the chart never denies its own Job.
+ctl_vap_force=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set pgbackrest.restore.force=true 2>&1)
+assert_contains_literal "#283 force=true: the policy pins 'true'" "${ctl_vap_force}" "e.value == 'true'"
+ctl_vap_force_cj=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set pgbackrest.restore.force=true --show-only templates/pgbackrest-restore-job.yaml 2>&1)
+assert_eq "#283 force=true: the CronJob renders the same value" "true" \
+  "$(awk '$0 ~ "- name: FORCE$" {getline; sub(/^ *value: ["'\'']?/, ""); sub(/["'\'']$/, ""); print; exit}' <<< "${ctl_vap_force_cj}")"
+assert_not_contains "#283 force=true: nothing still pins 'false'" "${ctl_vap_force}" "e.value == 'false'"
+# The recovery point stays FREE. The API overrides exactly these on every request
+# (restoreEnvOverrides), so pinning any of them would deny every API-driven restore.
+for free in TARGET_TYPE TARGET BACKUP_SET PGBACKREST_LOG_LEVEL_CONSOLE; do
+  assert_not_contains "#283: ${free} is not pinned (the API overrides it)" "${ctl_vap}" "e.name == '${free}'"
+done
+# --- #283: the env-name allowlist (rule 18) ---
+# The FORCE pin means nothing on its own: pgbackrest reads any PGBACKREST_<OPTION> from the
+# environment, so FORCE=false plus an unlisted PGBACKREST_FORCE=y is --force under another
+# name. Rule 18 allowlists env NAMES to what the jobTemplate renders. This is the drift pair
+# that matters most: a new env added to pgbackrest-restore-job.yaml without a matching
+# allowlist entry would make every API-driven restore fail admission.
+allowlist() { grep -o "e.name in \['[^]]*'\]" <<< "$1" | head -1 | sed "s/e.name in \[//; s/\]//; s/'//g" | tr ',' '\n' | sort; }
+# Env names, from the CronJob's env block only (volumes and mounts carry `- name:` too, so
+# stop at the first `volumeMounts:`). Charset is what validateCelLiterals admits, not just
+# upper-case, so a lower-case or dotted extraEnv name cannot slip past the drift check.
+cj_env_names() { awk '/^ *env:$/{f=1;next} /volumeMounts:/{f=0} f && /^ *- name: [A-Za-z0-9._:\/@-]+$/{sub(/.*- name: /, ""); print}' <<< "$1" | sort; }
+# The drift pair, as a function so it runs over every configuration the jobTemplate branches
+# on -- a new env added under `if repoEncryption.enabled` would otherwise be caught by no
+# render but the hand-written string assertions.
+env_drift() { # env_drift <label> <policy render> <cronjob render>
+  local label="$1" pol="$2" cj="$3" allow names
+  allow=$(allowlist "${pol}"); names=$(cj_env_names "${cj}")
+  assert_eq "#283 drift (${label}): every env the Job renders is on the allowlist" "" "$(comm -13 <(echo "${allow}") <(echo "${names}"))"
+  # The one name the allowlist carries that the CronJob does not is the agent's own addition
+  # under readPodLogs (restoreEnvOverrides). Anything else is an allowlist entry with no
+  # render behind it -- an unnecessary hole.
+  assert_eq "#283 drift (${label}): the allowlist has exactly one entry the Job does not render (the agent's log level)" \
+    "PGBACKREST_LOG_LEVEL_CONSOLE" "$(comm -23 <(echo "${allow}") <(echo "${names}"))"
+}
+env_drift "keyType=auto" "${ctl_vap}" "${ctl_vap_cj}"
+ctl_shared_enc_args=(--set pgbackrest.s3.keyType=shared --set pgbackrest.existingSecret.name=s3-backup-creds
+  --set pgbackrest.repoEncryption.enabled=true --set pgbackrest.repoEncryption.existingSecret.name=cph
+  --set-json 'pgbackrest.extraEnv=[{"name":"https_proxy","value":"http://p:3128"},{"name":"CA_PEM","valueFrom":{"secretKeyRef":{"name":"ca","key":"pem"}}}]')
+env_drift "shared+encrypted+extraEnv" \
+  "$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true "${ctl_shared_enc_args[@]}" --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)" \
+  "$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true "${ctl_shared_enc_args[@]}" --show-only templates/pgbackrest-restore-job.yaml 2>&1)"
+
+# --- #283: mounts (rule 19) and resolver (rule 5) ---
+# Rule 15 closes the set of volume SOURCES but says nothing about where each is mounted; the
+# permitted data PVC mounted at /scripts is the pinned command running caller-written bytes.
+# Each chart mount is bound to (path, subPath, source kind), and the drift pair below reads
+# the paths back from the CronJob so a new mount there cannot be missed here.
+cj_mount_paths() { awk '/volumeMounts:/{f=1;next} /^ *volumes:/{f=0} f && /mountPath:/{sub(/.*mountPath: /, ""); print}' <<< "$1" | sort; }
+# Chart paths are single-quoted CEL literals, operator paths JSON (double-quoted) ones.
+vap_mount_paths() { grep -oE "m.mountPath == ['\"][^'\"]*['\"]" <<< "$1" | sed -E "s/.*== ['\"]//; s/['\"]$//" | sort -u; }
+assert_eq "#283 drift: the mount pins are exactly the paths the Job mounts" \
+  "$(cj_mount_paths "${ctl_vap_cj}")" "$(vap_mount_paths "${ctl_vap}")"
+ctl_xmount_args=(--set-json 'pgbackrest.extraVolumes=[{"name":"ca","secret":{"secretName":"s3-ca"}},{"name":"scratch","emptyDir":{}}]'
+  --set-json 'pgbackrest.extraVolumeMounts=[{"name":"ca","mountPath":"/etc/ssl/s3","subPath":"ca.pem","readOnly":true},{"name":"scratch","mountPath":"/tmp/scratch"}]')
+assert_eq "#283 drift (extraVolumeMounts): the mount pins are exactly the paths the Job mounts" \
+  "$(cj_mount_paths "$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true "${ctl_xmount_args[@]}" --show-only templates/pgbackrest-restore-job.yaml 2>&1)")" \
+  "$(vap_mount_paths "$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true "${ctl_xmount_args[@]}" --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)")"
+# The data mount is bound to THIS release's claim, not "some admitted PVC" -- with an
+# operator-declared extraVolumes PVC the restore could otherwise be aimed at that claim.
+assert_contains_literal "#283 mounts: the data mount is bound to the restore PVC by claimName" "${ctl_vap}" \
+  "has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'data-test-pg-0')"
+# Pod-template annotations are an allowlist: the legacy AppArmor annotation selects a
+# profile as surely as the securityContext field does.
+assert_contains_literal "#283 annotations: only the agent's requester stamp is admitted" "${ctl_vap}" \
+  "object.spec.template.metadata.annotations.all(k, k in ['pg-ha/requested-by'])"
+# AppArmor/SELinux/procMount are the unpinned twins of seccomp; capabilities.drop of add.
+assert_contains_literal "#283 hardening: AppArmor, SELinux and procMount are pinned absent on the container when unset" "${ctl_vap}" \
+  "!has(c.securityContext.appArmorProfile) && !has(c.securityContext.seLinuxOptions) && !has(c.securityContext.procMount)"
+# ...and FOLLOW the values when set: the Job renders the security contexts verbatim, so an
+# unconditional !has() would deny an SELinux operator's own restore (#283).
+ctl_vap_hard=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.containerSecurityContext={"runAsUser":101,"seLinuxOptions":{"level":"s0:c123,c456"},"appArmorProfile":{"type":"RuntimeDefault"},"procMount":"Default"}' \
+  --set-json 'postgresql.podSecurityContext={"fsGroup":103,"supplementalGroups":[103,1000670000],"appArmorProfile":{"type":"RuntimeDefault"}}' \
+  --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_not_contains "#283 hardening: a set seLinuxOptions is not pinned absent" "${ctl_vap_hard}" '!has(c.securityContext.seLinuxOptions)'
+assert_contains_literal "#283 hardening: a set appArmorProfile is pinned on its type" "${ctl_vap_hard}" "c.securityContext.appArmorProfile.type == 'RuntimeDefault')"
+assert_contains_literal "#283 hardening: ...on the pod too" "${ctl_vap_hard}" "variables.pod.securityContext.appArmorProfile.type == 'RuntimeDefault')"
+assert_contains_literal "#283 hardening: a set procMount is pinned exactly" "${ctl_vap_hard}" "c.securityContext.procMount == 'Default')"
+assert_contains_literal "#283 hardening: supplementalGroups render as exact, homogeneous integers" "${ctl_vap_hard}" \
+  "variables.pod.securityContext.supplementalGroups == [103, 1000670000])"
+ctl_vap_sg_inj=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json "postgresql.podSecurityContext.supplementalGroups=[\"103' || true || '\"]" 2>&1) && ctl_vap_sg_inj_rc=0 || ctl_vap_sg_inj_rc=$?
+assert_eq "#283 hardening: a non-numeric supplementalGroups entry fails the render" "1" "$([ "${ctl_vap_sg_inj_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283 hardening: ...through pg.validateCelLiterals" "${ctl_vap_sg_inj}" 'supplementalGroups entry is .* which cannot be embedded'
+# A set seLinuxOptions pins type/user/role (level free); a Localhost profile pins its name;
+# a profile without a type and a scalar supplementalGroups are NAMED render failures.
+ctl_vap_selinux=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.containerSecurityContext={"runAsUser":101,"seLinuxOptions":{"type":"container_t","level":"s0:c1,c2"},"seccompProfile":{"type":"Localhost","localhostProfile":"p.json"}}' \
+  --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains_literal "#283 hardening: a set seLinuxOptions pins its type" "${ctl_vap_selinux}" "c.securityContext.seLinuxOptions.type == 'container_t' && !has(c.securityContext.seLinuxOptions.user) && !has(c.securityContext.seLinuxOptions.role))"
+assert_not_contains "#283 hardening: ...and leaves the MCS level free" "${ctl_vap_selinux}" 'seLinuxOptions.level'
+assert_contains_literal "#283 hardening: a Localhost profile pins its name" "${ctl_vap_selinux}" "c.securityContext.seccompProfile.localhostProfile == 'p.json')"
+ctl_vap_nullcsc=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.containerSecurityContext=null' --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains_literal "#283 hardening: volumeDevices/ports hold with no container securityContext" "${ctl_vap_nullcsc}" \
+  "variables.pod.containers.all(c, !has(c.volumeDevices) && !has(c.ports) && (!has(c.terminationMessagePath) || c.terminationMessagePath == '/dev/termination-log') && (!has(c.securityContext) || ("
+# A finalizer on the Job (or its pod template) is a permanent tombstone on the one permitted
+# name: the SA has no patch, so the agent could never remove it.
+assert_contains_literal "#283: finalizers are denied on the Job and its pod template" "${ctl_vap}" \
+  "!has(object.metadata.finalizers) && (!has(object.spec.template.metadata) || !has(object.spec.template.metadata.finalizers))"
+ctl_vap_notype=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.podSecurityContext.appArmorProfile={"localhostProfile":"p"}' 2>&1) && ctl_vap_notype_rc=0 || ctl_vap_notype_rc=$?
+assert_eq "#283 hardening: a profile without a type fails the render" "1" "$([ "${ctl_vap_notype_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283 hardening: ...naming the profile" "${ctl_vap_notype}" 'postgresql.podSecurityContext.appArmorProfile is set without a type'
+ctl_vap_lh=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.containerSecurityContext.seccompProfile={"type":"Localhost"}' 2>&1) && ctl_vap_lh_rc=0 || ctl_vap_lh_rc=$?
+assert_eq "#283 hardening: Localhost without a localhostProfile fails the render" "1" "$([ "${ctl_vap_lh_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283 hardening: ...by name" "${ctl_vap_lh}" 'postgresql.containerSecurityContext.seccompProfile has type Localhost but no localhostProfile'
+ctl_vap_sgscalar=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.podSecurityContext.supplementalGroups=103' 2>&1) && ctl_vap_sgscalar_rc=0 || ctl_vap_sgscalar_rc=$?
+assert_eq "#283 hardening: a scalar supplementalGroups fails the render" "1" "$([ "${ctl_vap_sgscalar_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283 hardening: ...with a named message, not a Go range error" "${ctl_vap_sgscalar}" 'supplementalGroups must be a list of group ids, got 103'
+# `seLinuxOptions: {}` is falsy to Go templates but PRESENT to has(): the pin must match the
+# rendered empty map, not deny it; an empty profile map is a named render failure.
+ctl_vap_emptymap=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.containerSecurityContext.seLinuxOptions={}' --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains_literal "#283 hardening: seLinuxOptions: {} is pinned present-and-empty" "${ctl_vap_emptymap}" \
+  "(has(c.securityContext.seLinuxOptions) && !has(c.securityContext.seLinuxOptions.type) && !has(c.securityContext.seLinuxOptions.user) && !has(c.securityContext.seLinuxOptions.role))"
+assert_not_contains "#283 hardening: ...not absent" "${ctl_vap_emptymap}" '!has(c.securityContext.seLinuxOptions)'
+ctl_vap_emptyprof=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.containerSecurityContext.appArmorProfile={}' 2>&1) && ctl_vap_emptyprof_rc=0 || ctl_vap_emptyprof_rc=$?
+assert_eq "#283 hardening: an empty profile map fails the render" "1" "$([ "${ctl_vap_emptyprof_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283 hardening: ...by name" "${ctl_vap_emptyprof}" 'postgresql.containerSecurityContext.appArmorProfile is set without a type'
+assert_contains_literal "#283 hardening: ...and on the pod" "${ctl_vap}" \
+  "!has(variables.pod.securityContext.appArmorProfile) && !has(variables.pod.securityContext.seLinuxOptions)"
+assert_contains_literal "#283 hardening: capabilities.drop is pinned to the rendered list" "${ctl_vap}" \
+  "c.securityContext.capabilities.drop == ['ALL']"
+assert_contains_literal "#283 hardening: fsGroup is pinned by value" "${ctl_vap}" "variables.pod.securityContext.fsGroup == 103"
+assert_contains_literal "#283 hardening: runAsGroup is pinned by value" "${ctl_vap}" "c.securityContext.runAsGroup == 103"
+assert_contains_literal "#283 hardening: volumeDevices and ports are denied" "${ctl_vap}" "!has(c.volumeDevices) && !has(c.ports)"
+# The free env tier must be literal: TARGET from a Secret would land in the status file on
+# the data PVC, readable from the postgresql container.
+assert_contains_literal "#283: the free env tier may not be valueFrom" "${ctl_vap}" \
+  "(!(e.name in ['PGBACKREST_STANZA','TARGET_TYPE','TARGET','BACKUP_SET','FORCE','PGBACKREST_LOG_LEVEL_CONSOLE']) || !has(e.valueFrom))"
+# /etc/pgbackrest/conf.d is pgbackrest's config-include-path. #323 admits a passthrough mount
+# there (asserted below as a "good" path) -- but with the job-create grant in play the pods'
+# SA can CREATE a not-yet-existing ConfigMap, so the policy template refuses it while
+# control.restore is enabled, and only then.
+ctl_confd=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraVolumes=[{"name":"c","configMap":{"name":"o"}}]' \
+  --set-json 'pgbackrest.extraVolumeMounts=[{"name":"c","mountPath":"/etc/pgbackrest/conf.d"}]' 2>&1) && ctl_confd_rc=0 || ctl_confd_rc=$?
+assert_eq "#283: an extraVolumeMount over /etc/pgbackrest/conf.d fails the render" "1" "$([ "${ctl_confd_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283: ...naming the path and the gate" "${ctl_confd}" 'is at or under /etc/pgbackrest/conf.d.*restore admission policy is enabled'
+# Compared normalised: runc resolves a doubled separator to the same directory.
+ctl_confd2_rc=0
+helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraVolumes=[{"name":"c","configMap":{"name":"o"}}]' \
+  --set-json 'pgbackrest.extraVolumeMounts=[{"name":"c","mountPath":"/etc/pgbackrest//conf.d/"}]' >/dev/null 2>&1 || ctl_confd2_rc=$?
+assert_eq "#283: ...also with a doubled separator" "1" "$([ "${ctl_confd2_rc}" -ne 0 ] && echo 1 || echo 0)"
+# The omitempty spellings: `add: []` and `supplementalGroups: []` vanish at the apiserver, so
+# their pin must be the absent form -- `== ['']` denied the release's own Job.
+ctl_vap_empties=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'postgresql.containerSecurityContext.capabilities={"drop":["ALL"],"add":[]}' \
+  --set-json 'postgresql.podSecurityContext.supplementalGroups=[]' --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_not_contains "#283: capabilities.add: [] never pins an empty-string capability" "${ctl_vap_empties}" "add == \[''\]"
+assert_contains_literal "#283: capabilities.add: [] pins as absent-or-empty" "${ctl_vap_empties}" "|| size(c.securityContext.capabilities.add) == 0)"
+assert_contains_literal "#283: supplementalGroups: [] pins as absent" "${ctl_vap_empties}" "!has(variables.pod.securityContext.supplementalGroups)"
+assert_contains_literal "#283: a large runAsUser pins as an exact integer" \
+  "$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true --set postgresql.containerSecurityContext.runAsUser=1000670000 --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)" \
+  "c.securityContext.runAsUser == 1000670000)"
+ctl_confd_off_rc=0
+helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set-json 'pgbackrest.extraVolumes=[{"name":"c","configMap":{"name":"o"}}]' \
+  --set-json 'pgbackrest.extraVolumeMounts=[{"name":"c","mountPath":"/etc/pgbackrest/conf.d"}]' >/dev/null 2>&1 || ctl_confd_off_rc=$?
+assert_eq "#283: ...and still renders without the control-API restore (#323's passthrough is intact)" "0" "${ctl_confd_off_rc}"
+assert_contains_literal "#283 hardening: unset pod list fields are pinned absent" "${ctl_vap}" \
+  "!has(variables.pod.securityContext.sysctls) && !has(variables.pod.securityContext.supplementalGroups) && !has(variables.pod.securityContext.fsGroupChangePolicy)"
+ctl_vap_drop_inj=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json "postgresql.containerSecurityContext.capabilities.drop=[\"ALL' || true || '\"]" 2>&1) && ctl_vap_drop_inj_rc=0 || ctl_vap_drop_inj_rc=$?
+assert_eq "#283 hardening: a capabilities.drop entry that would break CEL fails the render" "1" "$([ "${ctl_vap_drop_inj_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283 hardening: ...through pg.validateCelLiterals" "${ctl_vap_drop_inj}" 'capabilities.drop entry is .* which cannot be embedded'
+assert_contains_literal "#283 mounts: the data PVC is bound to PGDATA's parent, no subPath" "${ctl_vap}" \
+  "(m.mountPath == '/var/lib/postgresql/data' && !has(m.subPath) && has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName == 'data-test-pg-0')"
+# The same ConfigMap carries validate.sh (rm -rf "$PGDATA", then a restore with no interlock):
+# /scripts must project exactly the restore.sh key, the config mount the whole ConfigMap.
+assert_contains_literal "#283 mounts: /scripts is bound to this release's pgbackrest ConfigMap, restore.sh only" "${ctl_vap}" \
+  "(m.mountPath == '/scripts' && !has(m.subPath) && has(v.configMap) && v.configMap.name == 'test-pg-pgbackrest' && has(v.configMap.items) && size(v.configMap.items) == 1 && v.configMap.items.all(i, i.key == 'restore.sh' && (!has(i.path) || i.path == 'restore.sh')))"
+assert_contains_literal "#283 mounts: the config file is bound to its subPath, no items" "${ctl_vap}" \
+  "m.subPath == 'pgbackrest.conf' && has(v.configMap) && v.configMap.name == 'test-pg-pgbackrest' && !has(v.configMap.items))"
+assert_contains_literal "#283 mounts: subPathExpr is denied everywhere" "${ctl_vap}" "!has(m.subPathExpr) &&"
+assert_contains_literal "#283 mounts: the volume is looked up by the mount's name" "${ctl_vap}" "variables.pod.volumes.exists(v, v.name == m.name &&"
+# extraVolumeMounts bind to the extraVolumes entry of the same name; a dangling one is a
+# render failure with a message that names it.
+ctl_vap_xmount=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraVolumes=[{"name":"ca","secret":{"secretName":"s3-ca"}}]' \
+  --set-json 'pgbackrest.extraVolumeMounts=[{"name":"ca","mountPath":"/etc/ssl/s3","subPath":"ca.pem","readOnly":true}]' \
+  --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains_literal "#283 mounts: an extraVolumeMount is bound to its extraVolume's source" "${ctl_vap_xmount}" \
+  "(m.mountPath == \"/etc/ssl/s3\" && has(m.subPath) && m.subPath == \"ca.pem\" && has(v.secret) && v.secret.secretName == 's3-ca')"
+ctl_vap_dangling=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraVolumeMounts=[{"name":"nowhere","mountPath":"/etc/ssl/s3"}]' 2>&1) && ctl_vap_dangling_rc=0 || ctl_vap_dangling_rc=$?
+assert_eq "#283 mounts: a dangling extraVolumeMount fails the render" "1" "$([ "${ctl_vap_dangling_rc}" -ne 0 ] && echo 1 || echo 0)"
+# pg.validatePgbackrestPassthrough gets there first (its message); the policy's own fail is
+# the belt-and-braces behind it.
+assert_contains "#283 mounts: ...naming the mount" "${ctl_vap_dangling}" 'pgbackrest.extraVolumeMounts\[0\]: no pgbackrest.extraVolumes entry named "nowhere"'
+# Resolver pins: a hostAliases entry redirects the S3 endpoint as surely as an env var would.
+assert_contains_literal "#283 resolver: hostAliases, dnsConfig and a non-default dnsPolicy are denied" "${ctl_vap}" \
+  "!has(variables.pod.hostAliases) && !has(variables.pod.dnsConfig) && (!has(variables.pod.dnsPolicy) || variables.pod.dnsPolicy == 'ClusterFirst')"
+# A leading underscore is a legal env name and must still render (#283).
+ctl_vap_uscore_rc=0
+helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraEnv=[{"name":"_JAVA_OPTIONS","value":"-Xmx1g"}]' >/dev/null 2>&1 || ctl_vap_uscore_rc=$?
+assert_eq "#283: an extraEnv name with a leading underscore renders" "0" "${ctl_vap_uscore_rc}"
+# The constants are pinned by VALUE and compared against the Job's own render.
+for pinned_name in PGDATA PGBACKREST_LOG_PATH PGBACKREST_LOCK_PATH; do
+  drift "pinned ${pinned_name} is the one the Job renders (#283)" \
+    "$(rendered_env "${pinned_name}")" \
+    "$(grep "e.name != '${pinned_name}' || " <<< "${ctl_vap}" | head -1 | sed "s/.*e.value == '//; s/'.*$//")"
+done
+# The credential and requester entries render as valueFrom and must STAY valueFrom: rule 16
+# inspects only entries that have one, so a literal under the same name is invisible to it.
+# (ctl_restore_args is keyType=auto, so the requester is the only valueFrom entry here.)
+assert_contains_literal "#283: the valueFrom-only tier is enforced" "${ctl_vap}" \
+  "(e.name != 'RESTORE_REQUESTED_BY' || (has(e.valueFrom) && has(e.valueFrom.fieldRef) && e.valueFrom.fieldRef.fieldPath == \"metadata.annotations['pg-ha/requested-by']\"))"
+ctl_vap_shared=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set pgbackrest.s3.keyType=shared --set pgbackrest.existingSecret.name=s3-backup-creds \
+  --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains_literal "#283 keyType=shared: the S3 credentials are allowed, valueFrom-only" "${ctl_vap_shared}" \
+  "(e.name != 'PGBACKREST_REPO1_S3_KEY' || (has(e.valueFrom) && has(e.valueFrom.secretKeyRef) && e.valueFrom.secretKeyRef.name == 's3-backup-creds' && e.valueFrom.secretKeyRef.key == 'access-key-id'))"
+for bad in PGBACKREST_FORCE BASH_ENV LD_PRELOAD PGBACKREST_REPO1_S3_ENDPOINT; do
+  assert_not_contains "#283: ${bad} is not on the allowlist" "${ctl_vap}" "'${bad}'"
+done
+assert_contains "#283: the denial names the route it closes" "${ctl_vap}" \
+  'PGBACKREST_FORCE would bypass the postmaster.pid interlock'
+# The allowlist follows the jobTemplate's own conditionals -- keyless S3 drops the two
+# credential names, an encrypted repo adds its passphrase -- and pgbackrest.extraEnv joins
+# by name in the tier its shape puts it in (literal free, valueFrom must stay valueFrom).
+ctl_vap_auto_enc=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set pgbackrest.s3.keyType=auto --set pgbackrest.repoEncryption.enabled=true \
+  --set pgbackrest.repoEncryption.existingSecret.name=cph --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_not_contains "#283 keyType=auto: no S3 credential names on the allowlist" "${ctl_vap_auto_enc}" "PGBACKREST_REPO1_S3_KEY"
+assert_contains_literal "#283 repoEncryption: the passphrase is allowed, valueFrom-only" "${ctl_vap_auto_enc}" \
+  "(e.name != 'PGBACKREST_REPO1_CIPHER_PASS' || (has(e.valueFrom) && has(e.valueFrom.secretKeyRef) && e.valueFrom.secretKeyRef.name == 'cph' && e.valueFrom.secretKeyRef.key == 'cipher-pass'))"
+ctl_vap_xenv=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraEnv=[{"name":"HTTPS_PROXY","value":"http://p:3128"},{"name":"CA_PEM","valueFrom":{"secretKeyRef":{"name":"ca","key":"pem"}}}]' \
+  --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+# A literal extraEnv is pinned by VALUE: the names an operator declares (a proxy, a storage
+# host) are exactly the ones whose value is the attack, so name-only would hand the caller
+# the listed spelling of what the allowlist denies in the unlisted one.
+assert_contains_literal "#283 extraEnv: a literal is pinned by value (as a JSON CEL literal)" "${ctl_vap_xenv}" \
+  "(e.name != 'HTTPS_PROXY' || (!has(e.valueFrom) && has(e.value) && e.value == \"http://p:3128\"))"
+# Values are JSON-quoted, so anything that rendered on 2.0.1 still renders: NO_PROXY is
+# comma-separated by definition, PGOPTIONS carries `=` and spaces. And an EMPTY value is
+# pinned as "absent or empty" -- EnvVar.Value is omitempty, so the apiserver drops it and a
+# pin that required has(e.value) would deny the release's own Job.
+ctl_vap_xenv_val=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraEnv=[{"name":"NO_PROXY","value":"10.0.0.0/8,localhost"},{"name":"PGOPTIONS","value":"-c statement_timeout=0"},{"name":"EMPTY","value":""}]' \
+  --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+assert_contains_literal "#283 extraEnv: a comma-separated value renders (no charset regression vs 2.0.1)" "${ctl_vap_xenv_val}" \
+  "e.value == \"10.0.0.0/8,localhost\""
+assert_contains_literal "#283 extraEnv: a value with spaces and = renders" "${ctl_vap_xenv_val}" "e.value == \"-c statement_timeout=0\""
+assert_contains_literal "#283 extraEnv: an empty value is pinned as absent-or-empty" "${ctl_vap_xenv_val}" \
+  "(e.name != 'EMPTY' || (!has(e.valueFrom) && (!has(e.value) || e.value == '')))"
+# The agent rewrites PGBACKREST_LOG_LEVEL_CONSOLE under readPodLogs, so an operator may not
+# declare it: pinned by value it would deny every API restore the moment log reading is on.
+ctl_vap_xenv_res=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json 'pgbackrest.extraEnv=[{"name":"PGBACKREST_LOG_LEVEL_CONSOLE","value":"off"}]' 2>&1) && ctl_vap_xenv_res_rc=0 || ctl_vap_xenv_res_rc=$?
+assert_eq "#283 extraEnv: the agent-owned PGBACKREST_LOG_LEVEL_CONSOLE is reserved" "1" "$([ "${ctl_vap_xenv_res_rc}" -ne 0 ] && echo 1 || echo 0)"
+assert_contains "#283 extraEnv: ...by pg.validatePgbackrestPassthrough" "${ctl_vap_xenv_res}" 'PGBACKREST_LOG_LEVEL_CONSOLE" is set by the chart or the HA agent'
+assert_contains_literal "#283 extraEnv: a valueFrom entry is bound to its own source" "${ctl_vap_xenv}" \
+  "(e.name != 'CA_PEM' || (has(e.valueFrom) && has(e.valueFrom.secretKeyRef) && e.valueFrom.secretKeyRef.name == 'ca' && e.valueFrom.secretKeyRef.key == 'pem'))"
+# Probes are the lifecycle hole one field over: a livenessProbe exec is a second command.
+assert_contains_literal "#283: probes are denied with lifecycle hooks" "${ctl_vap}" \
+  "!has(c.args) && !has(c.lifecycle) && !has(c.livenessProbe) && !has(c.readinessProbe) && !has(c.startupProbe))"
+# An extraEnv NAME is operator input that lands in a CEL literal, so it goes through
+# pg.validateCelLiterals like every other one.
+ctl_vap_xenv_bad=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-json "pgbackrest.extraEnv=[{\"name\":\"X' || true || '\",\"value\":\"1\"}]" 2>&1) && ctl_vap_xenv_rc=0 || ctl_vap_xenv_rc=$?
+assert_eq "#283 extraEnv: a name that would break CEL fails the render" "1" \
+  "$([ "${ctl_vap_xenv_rc}" -ne 0 ] && echo 1 || echo 0)"
+# ...for THAT reason, not some unrelated render error.
+assert_contains "#283 extraEnv: ...through pg.validateCelLiterals" "${ctl_vap_xenv_bad}" \
+  'a pgbackrest.extraEnv name is .* which cannot be embedded in the restore admission policy'
+
+# A non-boolean cannot reach the CEL literal: the schema types the key, so an injection
+# attempt is rejected before the template runs.
+ctl_vap_inj=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
+  --set-string "pgbackrest.restore.force=' || true || '" 2>&1) && ctl_vap_inj_rc=0 || ctl_vap_inj_rc=$?
+assert_eq "#283: a non-boolean force fails the schema before it can reach CEL" "1" \
+  "$([ "${ctl_vap_inj_rc}" -ne 0 ] && echo 1 || echo 0)"
+# helm 3 says `pgbackrest.restore.force: Invalid type. Expected: boolean`, helm 4 says
+# `at '/pgbackrest/restore/force': got string, want boolean` -- match what both share.
+assert_contains "#283: ...and it is the schema that rejects it" "${ctl_vap_inj}" "restore.force.*boolean"
+
 # The >= 1.30 requirement is enforced by asking whether admissionregistration.k8s.io/v1
 # EXISTS, not by comparing .Capabilities.KubeVersion: with no cluster that reports the HELM
 # CLIENT's version (helm 3.14 says v1.29), so a semver floor fails every `helm template` run
@@ -5058,8 +5369,12 @@ ctl_vap_shared=$(helm template test-pg "${CHART_DIR}" "${ctl_base[@]}" \
   --set pgbackrest.s3.keyType=shared --set pgbackrest.existingSecret.name=s3creds \
   --set pgbackrest.repoEncryption.enabled=true --set pgbackrest.repoEncryption.existingSecret.name=cipher \
   --set pgbackrest.restore.enabled=true --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
+# By (name, key), not name alone (#283): another key of the same Secret is not the
+# release's to read.
 assert_contains "#279 shared keys: only this release's own Secrets are reachable" "${ctl_vap_shared}" \
-  "in \['s3creds','cipher'\]"
+  "e.valueFrom.secretKeyRef.name == 's3creds' && e.valueFrom.secretKeyRef.key == 'access-key-id'"
+assert_contains "#279 shared keys: ...and only their rendered keys" "${ctl_vap_shared}" \
+  "e.valueFrom.secretKeyRef.name == 'cipher' && e.valueFrom.secretKeyRef.key == 'cipher-pass'"
 
 # --- NetworkPolicy: deny-by-default on the control port ---
 
@@ -5230,6 +5545,8 @@ pb_pol_res=$(helm template test-pg "${CHART_DIR}" \
   --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
 assert_contains "#323/#279: the volume pin names the extra configMap" "${pb_pol_res}" \
   "v.configMap.name == 'apiserver-proxy-kubeconfig'"
+assert_contains "#323/#279: the env pin names the extra Secret AND its key" "${pb_pol_res}" \
+  "e.valueFrom.secretKeyRef.name == 'apiserver-proxy-token' && e.valueFrom.secretKeyRef.key == 'token'"
 assert_contains "#323/#279: the env pin names the extra Secret" "${pb_pol_res}" \
   "apiserver-proxy-token"
 # A secret volume and a configMapKeyRef are pinned by their own names too -- configMapKeyRef is
@@ -5244,8 +5561,8 @@ assert_contains "#323/#279: a secret volume is pinned by secretName" "${pb_pol2_
   "v.secret.secretName == 'proxy-ca'"
 # Brackets escaped: assert_contains is grep, so an unescaped [...] is a character class that
 # would match a single character and pass for the wrong reason.
-assert_contains "#323/#279: a declared configMapKeyRef is admitted by name" "${pb_pol2_res}" \
-  "e.valueFrom.configMapKeyRef.name in \\['proxy-cm'\\]"
+assert_contains "#323/#279: a declared configMapKeyRef is admitted by name AND key" "${pb_pol2_res}" \
+  "e.valueFrom.configMapKeyRef.name == 'proxy-cm' && e.valueFrom.configMapKeyRef.key == '"
 # A source the policy cannot bind to a name is a RENDER failure, not a silent widening
 # (admitting has(v.projected) would readmit arbitrary Secrets) and not a silent breakage.
 pb_pol_unpinnable_rc=0
