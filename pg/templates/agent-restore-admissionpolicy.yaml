@@ -428,9 +428,9 @@
        would error. */}}
 {{- $cscRule := "" }}
 {{- if $csc }}
-{{- $cscRule = printf "variables.pod.containers.all(c, !has(c.volumeDevices) && !has(c.ports) && !has(c.terminationMessagePath) && has(c.securityContext) && %s)" (join " && " $cscPins) }}
+{{- $cscRule = printf "variables.pod.containers.all(c, !has(c.volumeDevices) && !has(c.ports) && (!has(c.terminationMessagePath) || c.terminationMessagePath == '/dev/termination-log') && has(c.securityContext) && %s)" (join " && " $cscPins) }}
 {{- else }}
-{{- $cscRule = printf "variables.pod.containers.all(c, !has(c.volumeDevices) && !has(c.ports) && !has(c.terminationMessagePath) && (!has(c.securityContext) || (%s)))" (join " && " $cscPins) }}
+{{- $cscRule = printf "variables.pod.containers.all(c, !has(c.volumeDevices) && !has(c.ports) && (!has(c.terminationMessagePath) || c.terminationMessagePath == '/dev/termination-log') && (!has(c.securityContext) || (%s)))" (join " && " $cscPins) }}
 {{- end }}
 {{- $pscPins := concat (list
       (include "pg.celScalarPin" (list "variables.pod.securityContext.runAsUser" $psc "runAsUser"))
@@ -672,7 +672,9 @@ spec:
     #    needs privileged, which rule 11 pins absent). terminationMessagePath is DENIED (#283
     #    review round 10): pointed at /scripts/restore.sh it makes the kubelet bind an empty
     #    host file over the pinned script -- not code the caller chose, but not the command
-    #    either, and the chart never sets it. volumeDevices and container ports are denied (rule 11) -- neither is
+    #    either. Pinned to /dev/termination-log rather than absent, because the apiserver
+    #    DEFAULTS it onto every container before admission sees the object (KinD round 15
+    #    caught a bare !has() denying the release's own Job). volumeDevices and container ports are denied (rule 11) -- neither is
     #    exploitable, both are one clause.
     - expression: "(!has(variables.pod.hostNetwork) || variables.pod.hostNetwork == false) && (!has(variables.pod.hostPID) || variables.pod.hostPID == false) && (!has(variables.pod.hostIPC) || variables.pod.hostIPC == false) && !has(variables.pod.nodeName) && {{ $pcnPin }} && !has(variables.pod.hostAliases) && !has(variables.pod.dnsConfig) && (!has(variables.pod.dnsPolicy) || variables.pod.dnsPolicy == 'ClusterFirst')"
       message: "hostNetwork, hostPID, hostIPC, an explicit nodeName, any priorityClassName other than this release's, hostAliases, dnsConfig and any dnsPolicy other than ClusterFirst are not permitted on the pg agent's Jobs -- the last three would let the caller redirect the S3 endpoint the restore reads from (#283)"

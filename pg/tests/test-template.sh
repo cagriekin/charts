@@ -5146,7 +5146,7 @@ assert_contains_literal "#283 hardening: a Localhost profile pins its name" "${c
 ctl_vap_nullcsc=$(helm template test-pg "${CHART_DIR}" "${ctl_restore_args[@]}" --set pgbackrest.restore.enabled=true \
   --set-json 'postgresql.containerSecurityContext=null' --show-only templates/agent-restore-admissionpolicy.yaml 2>&1)
 assert_contains_literal "#283 hardening: volumeDevices/ports hold with no container securityContext" "${ctl_vap_nullcsc}" \
-  "variables.pod.containers.all(c, !has(c.volumeDevices) && !has(c.ports) && !has(c.terminationMessagePath) && (!has(c.securityContext) || ("
+  "variables.pod.containers.all(c, !has(c.volumeDevices) && !has(c.ports) && (!has(c.terminationMessagePath) || c.terminationMessagePath == '/dev/termination-log') && (!has(c.securityContext) || ("
 # A finalizer on the Job (or its pod template) is a permanent tombstone on the one permitted
 # name: the SA has no patch, so the agent could never remove it.
 assert_contains_literal "#283: finalizers are denied on the Job and its pod template" "${ctl_vap}" \

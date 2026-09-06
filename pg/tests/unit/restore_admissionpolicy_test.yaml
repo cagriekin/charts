@@ -920,7 +920,7 @@ tests:
     asserts:
       - matchRegex:
           path: spec.validations[10].expression
-          pattern: "^variables\\.pod\\.containers\\.all\\(c, !has\\(c\\.volumeDevices\\) && !has\\(c\\.ports\\) && !has\\(c\\.terminationMessagePath\\) && \\(!has\\(c\\.securityContext\\) \\|\\| \\("
+          pattern: "^variables\\.pod\\.containers\\.all\\(c, !has\\(c\\.volumeDevices\\) && !has\\(c\\.ports\\) && \\(!has\\(c\\.terminationMessagePath\\) \\|\\| c\\.terminationMessagePath == '/dev/termination-log'\\) && \\(!has\\(c\\.securityContext\\) \\|\\| \\("
 
   - it: a profile set without a type fails the render
     values:
