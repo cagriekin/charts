@@ -49,8 +49,11 @@
   config-include-path) refused at render time while the admission policy is enabled,
   because the pods' ServiceAccount can create a ConfigMap that does not exist yet. Operator values
   (`extraEnv` values, `extraVolumeMounts` paths) are emitted as JSON string literals, so no
-  charset restriction applies to them; the two render-time changes are the ones under Changed
-  above. The env allowlist is what
+  charset restriction applies to them. The two render-time changes that reject a
+  previously-working release are the ones under Changed above; the policy also now fails the
+  render, by name, on three shapes the apiserver would reject anyway (a security profile
+  without a `type`, `Localhost` without a `localhostProfile`, a scalar `supplementalGroups`).
+  The env allowlist is what
   makes the `FORCE` pin mean anything --
   pgbackrest reads any `PGBACKREST_<OPTION>` from the environment, so an unlisted
   `PGBACKREST_FORCE=y` would have been `--force` under another name, `PGBACKREST_REPO1_S3_*`
