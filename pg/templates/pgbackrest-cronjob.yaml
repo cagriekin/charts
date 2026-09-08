@@ -68,6 +68,15 @@ spec:
                   # the actionable error below instead of aborting with a bare trace.
                   # Sorted so selection is deterministic across runs and independent of
                   # EndpointSlice list order (matters only in the rare multi-endpoint case).
+{{- if $root.Values.pgbackrest.info.enabled }}
+                  # The #343 record needs jq (alpine/k8s ships it). Check before the backup, so
+                  # a custom pgbackrest.cronjob.image without it fails here with the fix named
+                  # rather than after a successful backup it then reports as failed.
+                  command -v jq >/dev/null 2>&1 || {
+                    echo "ERROR: jq is not in the CronJob image but pgbackrest.info.enabled=true needs it to record the repository state; use an image that has jq (the default alpine/k8s does) or set pgbackrest.info.enabled=false" >&2
+                    exit 1
+                  }
+{{- end }}
                   CANDIDATES=$(kubectl -n "$NAMESPACE" get endpointslices \
                     -l "kubernetes.io/service-name=$PRIMARY_SVC" \
                     -o jsonpath='{.items[*].endpoints[?(@.conditions.ready==true)].targetRef.name}' \
@@ -140,9 +149,51 @@ spec:
                   kubectl -n "$NAMESPACE" exec "$PRIMARY" -c pgbackrest -- \
                     pgbackrest --stanza="$STANZA" --type="$BACKUP_TYPE" backup
 
-                  echo "$BACKUP_TYPE backup completed. Repository state:"
+                  echo "$BACKUP_TYPE backup completed."
+{{- if $root.Values.pgbackrest.info.enabled }}
+
+                  # Record the repository state where a controller can read it without
+                  # pgbackrest credentials or a control-API certificate (#343). `info` reads
+                  # the REPOSITORY, not the node, so any pod would answer the same -- it runs
+                  # in the sidecar that just backed up only because this is the one moment
+                  # that knows a backup completed. Console logging off so nothing interleaves
+                  # with the JSON; the sed drops anything pgBackRest prints to stdout BEFORE
+                  # logging is configured (an unknown PGBACKREST_* option arriving through
+                  # pgbackrest.extraEnv earns a WARN there); jq -e requires one valid document
+                  # (empty input is exit 4, not an empty record), so a non-JSON answer fails
+                  # here and the previous record stays intact. Files live under $HOME: that is
+                  # the /tmp emptyDir here, and it lets the template test point it elsewhere.
+                  kubectl -n "$NAMESPACE" exec "$PRIMARY" -c pgbackrest -- \
+                    pgbackrest --stanza="$STANZA" --output=json --log-level-console=off info \
+                    | sed -n '/^[[{]/,$p' | jq -ce . > "$HOME/info.json"
+                  # The exit status is NOT the verdict: `pgbackrest info` exits 0 on a
+                  # repository it cannot read (status "missing stanza data", code 3) and
+                  # `verify` prints "completed successfully" on the same repository; only the
+                  # JSON's status.code tells. Record first, whatever the code, so an unreadable
+                  # repository stays distinguishable from an empty one -- then fail the Job on
+                  # a non-zero code, so whatever alerts on a failed backup alerts on this too.
+                  # The document is an ARRAY of stanzas (one here, --stanza filters), each with its
+                  # own status; select ours by name rather than trusting the position.
+                  INFO_STANZA='first(.[] | select(.name == $s))'
+                  INFO_CODE=$(jq -r --arg s "$STANZA" "($INFO_STANZA | .status.code) // \"absent\"" "$HOME/info.json")
+                  jq -n --arg type "$BACKUP_TYPE" --arg stanza "$STANZA" --arg primary "$PRIMARY" \
+                    --arg code "$INFO_CODE" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                    --rawfile info "$HOME/info.json" \
+                    '{ metadata: { annotations: {
+                         "pg-ha/recorded-at": $at, "pg-ha/backup-type": $type, "pg-ha/stanza": $stanza,
+                         "pg-ha/primary": $primary, "pg-ha/status-code": $code } },
+                       data: { "info.json": ($info | rtrimstr("\n")) } }' > "$HOME/info-patch.json"
+                  kubectl -n "$NAMESPACE" patch configmap "$INFO_CONFIGMAP" --type merge --patch-file "$HOME/info-patch.json"
+                  echo "Recorded repository state in configmap/$INFO_CONFIGMAP: $(jq -r --arg s "$STANZA" "$INFO_STANZA"' | "status=\(.status.code) (\(.status.message)) backups=\(.backup | length) latest=\(.backup[-1].label // "none") repo-size=\(.backup[-1].info.repository.size // 0)"' "$HOME/info.json")"
+                  if [ "$INFO_CODE" != "0" ]; then
+                    echo "ERROR: pgbackrest info reports status.code=$INFO_CODE ($(jq -r --arg s "$STANZA" "($INFO_STANZA | .status.message) // \"stanza not in the document\"" "$HOME/info.json")) for stanza $STANZA -- the repository is not restorable even though the backup command exited 0" >&2
+                    exit 1
+                  fi
+{{- else }}
+                  echo "Repository state:"
                   kubectl -n "$NAMESPACE" exec "$PRIMARY" -c pgbackrest -- \
                     pgbackrest --stanza="$STANZA" info
+{{- end }}
               env:
                 - name: NAMESPACE
                   valueFrom:
@@ -154,6 +205,10 @@ spec:
                   value: {{ $root.Values.pgbackrest.stanza | quote }}
                 - name: BACKUP_TYPE
                   value: {{ $type | quote }}
+{{- if $root.Values.pgbackrest.info.enabled }}
+                - name: INFO_CONFIGMAP
+                  value: {{ printf "%s-pgbackrest-info" (include "pg.fullname" $root) | quote }}
+{{- end }}
                 # kubectl writes its discovery/http cache under $HOME; point it at the
                 # writable /tmp emptyDir so the read-only root filesystem is enough (#117).
                 - name: HOME

@@ -1,5 +1,21 @@
 # pg chart changelog
 
+## 2.1.0 - 2026-09-08
+
+### Added
+
+- **The backup CronJob records the repository state (#343).** After every successful backup it
+  patches `pgbackrest info --output=json` verbatim into `configmap/<fullname>-pgbackrest-info`
+  (data key `info.json`, plus `pg-ha/recorded-at`, `pg-ha/backup-type`, `pg-ha/stanza`,
+  `pg-ha/primary` and `pg-ha/status-code` annotations), so a controller can read backup sets,
+  sizes and the PITR floor with no pgBackRest credentials, exec grant or control-API
+  certificate. The verdict is the JSON's `status.code`, not the exit status — `pgbackrest info`
+  exits 0 on a repository it cannot read — and a non-zero code now fails the backup Job, where
+  the old trailing human-format `info` passed silently. The ConfigMap is rendered empty so the
+  pgbackrest ServiceAccount needs only `get`/`patch` on that one name; `helm upgrade --force`
+  empties the record until the next backup. Opt out with `pgbackrest.info.enabled=false`.
+  `INFO_CONFIGMAP` joins the names `pgbackrest.extraEnv` may not reuse.
+
 ## 2.0.2 - 2026-09-06
 
 ### Changed

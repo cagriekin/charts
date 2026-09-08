@@ -1,0 +1,108 @@
+suite: pgbackrest info record (#343)
+templates:
+  - templates/pgbackrest-info-configmap.yaml
+  - templates/pgbackrest-rbac.yaml
+  - templates/pgbackrest-cronjob.yaml
+tests:
+  - it: renders the info ConfigMap empty, for the CronJob to fill
+    values:
+      - ../values-pgbackrest.yaml
+    template: templates/pgbackrest-info-configmap.yaml
+    asserts:
+      - isKind:
+          of: ConfigMap
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-pg-pgbackrest-info
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: pgbackrest
+      # No data: the record is the CronJob's; Helm must never carry a `data` it would
+      # then reset on upgrade.
+      - notExists:
+          path: data
+
+  - it: grants the pgbackrest SA get/patch on that one ConfigMap and nothing wider
+    values:
+      - ../values-pgbackrest.yaml
+    template: templates/pgbackrest-rbac.yaml
+    documentIndex: 1
+    asserts:
+      - isKind:
+          of: Role
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            resourceNames: ["RELEASE-NAME-pg-pgbackrest-info"]
+            verbs: ["get", "patch"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["create"]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            verbs: ["get", "update"]
+
+  - it: the backup CronJob names the ConfigMap and keys on status.code
+    values:
+      - ../values-pgbackrest.yaml
+    template: templates/pgbackrest-cronjob.yaml
+    documentIndex: 0
+    asserts:
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].env
+          content:
+            name: INFO_CONFIGMAP
+            value: RELEASE-NAME-pg-pgbackrest-info
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args[0]
+          pattern: "--output=json --log-level-console=off info"
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args[0]
+          pattern: "INFO_STANZA='first\\(\\.\\[\\] \\| select\\(\\.name == \\$s\\)\\)'"
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args[0]
+          pattern: 'patch configmap "\$INFO_CONFIGMAP" --type merge'
+      # The record is written BEFORE the verdict, so an unreadable repository is recorded
+      # as such rather than leaving the previous record in place.
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args[0]
+          pattern: '(?s)patch configmap "\$INFO_CONFIGMAP".*if \[ "\$INFO_CODE" != "0" \]; then.*exit 1'
+
+  - it: info.enabled=false renders neither the ConfigMap nor the grant nor the capture
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.info.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+        template: templates/pgbackrest-info-configmap.yaml
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["configmaps"]
+            resourceNames: ["RELEASE-NAME-pg-pgbackrest-info"]
+            verbs: ["get", "patch"]
+        template: templates/pgbackrest-rbac.yaml
+        documentIndex: 1
+      - notMatchRegex:
+          path: spec.jobTemplate.spec.template.spec.containers[0].args[0]
+          pattern: "output=json"
+        template: templates/pgbackrest-cronjob.yaml
+        documentIndex: 0
+      - notContains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].env
+          content:
+            name: INFO_CONFIGMAP
+            value: RELEASE-NAME-pg-pgbackrest-info
+        template: templates/pgbackrest-cronjob.yaml
+        documentIndex: 0

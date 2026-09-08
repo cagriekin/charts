@@ -951,6 +951,7 @@ helm install my-pgvector cagriekin/pgvector \
 | `pgbackrest.cronjob.resources.limits.memory` | CronJob memory limit | `128Mi` |
 | `pgbackrest.cronjob.podSecurityContext` | Pod securityContext for the pgBackRest CronJob | `runAsNonRoot: true`, `runAsUser: 65534`, `seccompProfile: RuntimeDefault` |
 | `pgbackrest.cronjob.containerSecurityContext` | Container securityContext for the pgBackRest CronJob | `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` |
+| `pgbackrest.info.enabled` | Record `pgbackrest info --output=json` in `configmap/<fullname>-pgbackrest-info` after every successful backup and fail the Job on a non-zero `status.code` (#343). See the [pg chart README](../pg/README.md#check-backup-status) | `true` |
 | `pgbackrest.validation.enabled` | Enable the automated PITR restore-validation CronJob (#38) — restores the repo into a throwaway PostgreSQL, replays WAL, validates, exits. See the [pg chart README](../pg/README.md#automated-pitr-restore-validation-38) | `false` |
 | `pgbackrest.validation.schedule` | Cron schedule for the validation job | `` `0 4 * * 0` `` |
 | `pgbackrest.validation.targetType` | PITR target type (`pgbackrest --type`): `""` (latest) \| `time` \| `xid` \| `name` \| `lsn`; `target` required when set | `""` |

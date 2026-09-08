@@ -1265,7 +1265,7 @@ GRANT {{ $privs }} ON DATABASE "{{ $g.database }}" TO "{{ $role }}"
        (repoEncryption, s3.keyType=shared) -- so a passthrough that works today cannot start
        silently shadowing a chart value after a later `helm upgrade` enables that feature. */ -}}
 {{- $chartEnv := list
-      "NAMESPACE" "PRIMARY_SVC" "STANZA" "BACKUP_TYPE" "HOME"
+      "NAMESPACE" "PRIMARY_SVC" "STANZA" "BACKUP_TYPE" "INFO_CONFIGMAP" "HOME"
       "PGBACKREST_STANZA" "PGDATA" "PGBACKREST_PG1_PATH"
       "PGBACKREST_LOG_PATH" "PGBACKREST_LOCK_PATH"
       "TARGET_TYPE" "TARGET" "BACKUP_SET" "FORCE" "RESTORE_REQUESTED_BY"

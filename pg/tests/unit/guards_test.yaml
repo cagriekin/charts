@@ -738,6 +738,19 @@ tests:
       - failedTemplate:
           errorMessage: "pgbackrest.extraEnv/extraVolumes/extraVolumeMounts are set but pgbackrest.enabled is false, so none of the pgbackrest containers they configure is rendered and nothing would use them. Set pgbackrest.enabled=true, or remove these values."
 
+  - it: pgbackrest.extraEnv reusing the #343 record name (INFO_CONFIGMAP) fails render
+    templates:
+      - templates/statefulset.yaml
+    values:
+      - ../values-pgbackrest.yaml
+    set:
+      pgbackrest.extraEnv:
+        - name: INFO_CONFIGMAP
+          value: elsewhere
+    asserts:
+      - failedTemplate:
+          errorPattern: 'pgbackrest.extraEnv\[0\]: "INFO_CONFIGMAP" is set by the chart or the HA agent'
+
   - it: pgbackrest.extraEnv reusing a chart-set name (PGBACKREST_STANZA) fails render
     templates:
       - templates/statefulset.yaml

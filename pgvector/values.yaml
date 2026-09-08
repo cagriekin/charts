@@ -978,6 +978,11 @@ pgbackrest:
     full: "0 1 * * 0"
     diff: "0 1 * * 1-6"
 
+  # Record `pgbackrest info --output=json` into configmap/<fullname>-pgbackrest-info after
+  # every successful backup (#343); the Job fails on a non-zero status.code. See pg/values.yaml.
+  info:
+    enabled: true
+
   # Sidecar container: keeps pgbackrest binary, config and credentials available
   # on every pg pod. CronJobs locate the current primary and `kubectl exec` into
   # this container to run the backup. The sidecar itself just sleeps.
