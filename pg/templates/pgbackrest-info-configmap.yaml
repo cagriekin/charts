@@ -1,0 +1,25 @@
+{{- if and .Values.pgbackrest.enabled .Values.pgbackrest.info.enabled }}
+# Backup-state record (#343). The backup CronJob patches `pgbackrest info --output=json`
+# into this ConfigMap after every successful backup (data key `info.json`, plus
+# pg-ha/recorded-at, pg-ha/backup-type, pg-ha/stanza, pg-ha/primary and pg-ha/status-code
+# annotations), so a controller can read backup sets, sizes and the PITR floor without
+# pgbackrest credentials or a control-API certificate.
+#
+# Rendered EMPTY by the chart, on purpose. The writer is the pgbackrest ServiceAccount,
+# which can exec into the database pods (#134): letting it create the ConfigMap would need
+# an unscopable `create configmaps` grant, while patching one the chart already rendered
+# needs only get/patch on this name (pgbackrest-rbac.yaml). Helm's three-way merge leaves
+# `data` and the runner's annotations alone on upgrade because no manifest carries them;
+# `helm upgrade --force` resets the record until the next backup.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pg.fullname" . }}-pgbackrest-info
+  labels:
+    {{- include "pg.labels" . | nindent 4 }}
+    app.kubernetes.io/component: pgbackrest
+  {{- with (include "pg.annotations" .) }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+{{- end }}

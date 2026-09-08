@@ -2240,7 +2240,7 @@ helm install my-postgres cagriekin/pg \
 - **Full backups**: Weekly (default Sunday 1am) via a CronJob that execs into the pgbackrest sidecar on the current primary.
 - **Differential backups**: Daily (default Mon-Sat 1am) via a separate CronJob. Only changed blocks since the last full backup are stored.
 - **Failover**: After the agent promotes a standby, the new primary starts archiving WAL and running backups automatically.
-- **Verification**: After each backup, `pgbackrest info` confirms the backup was recorded in the repository.
+- **Record**: After each backup, the CronJob writes `pgbackrest info --output=json` into `configmap/<fullname>-pgbackrest-info` and fails the Job if the JSON says the repository is unreadable — see [Check Backup Status](#check-backup-status) (#343).
 
 ### pgBackRest Parameters
 
@@ -2285,6 +2285,7 @@ helm install my-postgres cagriekin/pg \
 | `pgbackrest.cronjob.resources.limits.memory` | CronJob memory limit | `128Mi` |
 | `pgbackrest.cronjob.podSecurityContext` | Pod securityContext for the pgBackRest CronJob | `runAsNonRoot: true`, `runAsUser: 65534`, `seccompProfile: RuntimeDefault` |
 | `pgbackrest.cronjob.containerSecurityContext` | Container securityContext for the pgBackRest CronJob | `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` |
+| `pgbackrest.info.enabled` | Record `pgbackrest info --output=json` in `configmap/<fullname>-pgbackrest-info` after every successful backup, and fail the backup Job when its `status.code` is non-zero ([#343](#check-backup-status)); grants the pgbackrest SA `get`/`patch` on that one ConfigMap | `true` |
 | `pgbackrest.validation.enabled` | Enable the automated PITR restore-validation CronJob (#38) — restores the repo into a throwaway PostgreSQL, replays WAL, validates, exits | `false` |
 | `pgbackrest.validation.schedule` | Cron schedule for the validation job | `` `0 4 * * 0` `` |
 | `pgbackrest.validation.targetType` | PITR target type (`pgbackrest --type`): `""` (latest) \| `time` \| `xid` \| `name` \| `lsn`. `target` is required when set | `""` |
@@ -2405,8 +2406,46 @@ postgresql:
 
 ### Check Backup Status
 
+After every successful backup the CronJob records `pgbackrest info --output=json` in
+`configmap/<fullname>-pgbackrest-info` (#343), so a controller or dashboard can read the backup
+sets, their sizes and the PITR floor without pgBackRest credentials, a `kubectl exec` grant or a
+control-API certificate:
+
 ```bash
-kubectl exec -it my-postgres-pg-0 -- pgbackrest --stanza=db info
+# The document, verbatim from pgBackRest.
+kubectl get configmap my-postgres-pg-pgbackrest-info -o jsonpath='{.data.info\.json}' | jq .
+# The essentials without parsing it.
+kubectl get configmap my-postgres-pg-pgbackrest-info \
+  -o go-template='{{index .metadata.annotations "pg-ha/recorded-at"}} {{index .metadata.annotations "pg-ha/backup-type"}} status={{index .metadata.annotations "pg-ha/status-code"}}{{"\n"}}'
+```
+
+- `data."info.json"` is pgBackRest's own JSON, unmodelled — its schema is the contract, same as
+  `GET /v1/backups`. Note it is an **array of stanzas** (one entry, `.[0]` or
+  `.[] | select(.name == "db")`), each carrying its own `backup[]`, `archive[]` and `status`.
+  Annotations: `pg-ha/recorded-at` (RFC 3339 UTC), `pg-ha/backup-type`
+  (`full`/`diff`), `pg-ha/stanza`, `pg-ha/primary` (the pod the backup ran on),
+  `pg-ha/status-code`.
+- **Trust `status.code`, never an exit status.** `pgbackrest info` exits 0 on a repository it
+  cannot read (`status: error (missing stanza data)`, `code: 3`, `backup: []`), and `verify`
+  prints `completed successfully` on the same repository. The CronJob records the document
+  whatever the code — an unreadable repository must stay distinguishable from an empty one —
+  and then **fails the Job** on a non-zero code, so whatever alerts on a failed backup alerts on
+  this too.
+- `info.size` is the **database** size; `info.repository.size` is what the backup **occupies**
+  in the repository (compressed). They differ by ~8× on an empty database; a "backup size"
+  shown to a human is the repository one.
+- The record is refreshed only when a backup completes. A `recorded-at` older than the schedule
+  means backups have stopped; look at the CronJob's Jobs. The ConfigMap is rendered empty by the
+  chart and stays empty until the first backup; `helm upgrade --force` empties it again.
+- `pgbackrest info` reads the **repository**, not the node — any pod answers the same. It is
+  recorded from the backup CronJob because that is the one moment that knows a backup just
+  completed, not because the primary's answer is more correct. For an on-demand, authenticated
+  read use `GET /v1/backups` on the [control API](#control-rest-api-agent-mode--haagentcontrol).
+- Opt out with `pgbackrest.info.enabled=false`; the Job then prints the human `pgbackrest info`
+  to its log as before. A one-off read still works from any pod:
+
+```bash
+kubectl exec -it my-postgres-pg-0 -c pgbackrest -- pgbackrest --stanza=db info
 ```
 
 ### Point-in-Time Recovery

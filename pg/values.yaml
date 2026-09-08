@@ -1267,6 +1267,17 @@ pgbackrest:
     full: "0 1 * * 0"
     diff: "0 1 * * 1-6"
 
+  # Record `pgbackrest info --output=json` in configmap/<fullname>-pgbackrest-info after every
+  # successful backup (#343): data key info.json plus pg-ha/recorded-at, backup-type, stanza,
+  # primary and status-code annotations, readable by a controller with no pgbackrest
+  # credentials or control-API certificate (GET /v1/backups stays the authenticated read).
+  # The verdict is the JSON's status.code -- `pgbackrest info` exits 0 on a repository it
+  # cannot read -- and a non-zero code also fails the backup Job. Costs the pgbackrest
+  # ServiceAccount get/patch on that one ConfigMap; `helm upgrade --force` empties the record
+  # until the next backup.
+  info:
+    enabled: true
+
   # Sidecar container: keeps pgbackrest binary, config and credentials available
   # on every pg pod. CronJobs locate the current primary and `kubectl exec` into
   # this container to run the backup. The sidecar itself just sleeps.

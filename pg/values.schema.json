@@ -510,6 +510,15 @@
             }
           }
         },
+        "info": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Record pgbackrest info --output=json into configmap/<fullname>-pgbackrest-info after every successful backup (#343)"
+            }
+          }
+        },
         "validation": {
           "type": "object",
           "properties": {

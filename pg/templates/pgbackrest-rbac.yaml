@@ -53,6 +53,16 @@ rules:
       - {{ printf "%s-%d" (include "pg.fullname" $) $i | quote }}
       {{- end }}
     verbs: ["create"]
+{{- if .Values.pgbackrest.info.enabled }}
+  # Record `pgbackrest info --output=json` after each backup (#343). The ConfigMap is
+  # rendered by the chart (pgbackrest-info-configmap.yaml) precisely so this SA -- which
+  # can exec into the database pods -- needs only get/patch on that one name, never the
+  # unscopable `create configmaps`.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["{{ include "pg.fullname" . }}-pgbackrest-info"]
+    verbs: ["get", "patch"]
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

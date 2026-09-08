@@ -3009,6 +3009,107 @@ assert_contains "#155: pgbackrest CronJob no privilege escalation" "${pgbackrest
 assert_contains "pgbackrest: full CronJob carries full schedule" "${pgbackrest_cron}" 'schedule: "0 1 \* \* 0"'
 assert_contains "pgbackrest: diff CronJob carries diff schedule" "${pgbackrest_cron}" 'schedule: "0 1 \* \* 1-6"'
 
+# #343: after a successful backup the CronJob records `pgbackrest info --output=json` in
+# configmap/<fullname>-pgbackrest-info, keyed on the JSON's status.code (the exit status
+# lies: `info` exits 0 on a repository it cannot read). Render-level assertions first.
+assert_contains "#343: CronJob names the info ConfigMap" "${pgbackrest_cron}" 'name: INFO_CONFIGMAP'
+assert_contains "#343: CronJob env points at <fullname>-pgbackrest-info" "${pgbackrest_cron}" 'value: "test-pg-pgbackrest-info"'
+assert_contains_literal "#343: info is read as JSON with console logging off" "${pgbackrest_cron}" '--output=json --log-level-console=off info'
+assert_contains_literal "#343: verdict is the JSON status.code of OUR stanza" "${pgbackrest_cron}" "INFO_STANZA='first(.[] | select(.name == \$s))'"
+assert_contains_literal "#343: ... read with jq" "${pgbackrest_cron}" 'INFO_CODE=$(jq -r --arg s "$STANZA" "($INFO_STANZA | .status.code) // \"absent\"" "$HOME/info.json")'
+assert_contains_literal "#343: jq is checked before the backup runs" "${pgbackrest_cron}" 'command -v jq >/dev/null 2>&1 || {'
+assert_not_contains "#343: the record never touches a hard-coded /tmp (the test redirects HOME)" "${pgbackrest_cron}" "/tmp/info"
+assert_contains_literal "#343: record is written with a scoped patch" "${pgbackrest_cron}" 'patch configmap "$INFO_CONFIGMAP" --type merge'
+assert_not_contains "#343: info capture is not masked" "${pgbackrest_cron}" "info || true"
+assert_not_contains "#343: patch is not masked" "${pgbackrest_cron}" 'patch-file "$HOME/info-patch.json" || true'
+pgbackrest_info_cm=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/pgbackrest-info-configmap.yaml 2>&1)
+assert_contains "#343: info ConfigMap renders" "${pgbackrest_info_cm}" "name: test-pg-pgbackrest-info"
+assert_not_contains "#343: info ConfigMap renders without data (the CronJob owns it)" "${pgbackrest_info_cm}" "^data:"
+pgbackrest_rbac=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/pgbackrest-rbac.yaml 2>&1)
+assert_contains "#343: pgbackrest Role may patch the info ConfigMap" "${pgbackrest_rbac}" 'resourceNames: \["test-pg-pgbackrest-info"\]'
+assert_contains_literal "#343: ... with get/patch only" "${pgbackrest_rbac}" 'verbs: ["get", "patch"]'
+pgbackrest_cm_rules=$(grep -A2 'resources: \["configmaps"\]' <<< "${pgbackrest_rbac}")
+assert_not_contains "#343: pgbackrest Role never gets create on configmaps (unscopable)" "${pgbackrest_cm_rules}" "create"
+assert_not_contains "#343: pgbackrest Role never gets update on configmaps" "${pgbackrest_cm_rules}" "update"
+pgbackrest_noinfo=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --set pgbackrest.info.enabled=false 2>&1)
+assert_not_contains "#343: info.enabled=false drops the ConfigMap" "${pgbackrest_noinfo}" "pgbackrest-info"
+assert_not_contains "#343: info.enabled=false drops the JSON capture" "${pgbackrest_noinfo}" "output=json"
+assert_contains "#343: info.enabled=false keeps the human info print" "${pgbackrest_noinfo}" 'pgbackrest --stanza="\$STANZA" info$'
+pgbackrest_infoenv=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" \
+  --set 'pgbackrest.extraEnv[0].name=INFO_CONFIGMAP' --set 'pgbackrest.extraEnv[0].value=x' 2>&1) && infoenv_rc=0 || infoenv_rc=$?
+assert_eq "#343: extraEnv may not shadow INFO_CONFIGMAP" "1" "${infoenv_rc}"
+assert_contains "#343: ... and the error names it" "${pgbackrest_infoenv}" "INFO_CONFIGMAP"
+
+# Run the rendered script against a kubectl shim: the only layer that can reach the
+# "backup exited 0 but the repository is unreadable" path (a MinIO repository broken enough
+# for status.code 3 fails stanza-create first, so KinD never gets there). The shim answers
+# the EndpointSlice lookup, the pg_is_in_recovery probe, stanza-create, backup and info from
+# canned output and captures the patch body.
+pgbr_shim_dir=$(mktemp -d)
+awk '/^                - \|$/{f=1;next} /^              env:$/{exit} f{sub(/^                  /,""); print}' \
+  <<< "${pgbackrest_cron}" > "${pgbr_shim_dir}/backup.sh"
+cat > "${pgbr_shim_dir}/kubectl" <<'SHIM'
+#!/bin/bash
+printf '%s\n' "$*" >> "${SHIM_LOG}"
+case "$*" in
+  *"get endpointslices"*) echo "test-pg-0" ;;
+  *"pg_is_in_recovery"*)  echo "f" ;;
+  *"stanza-create")       ;;
+  *"--output=json"*)      cat "${SHIM_INFO}" ;;
+  *" backup")             echo "backup ok" ;;
+  *"patch configmap"*)    a="$*"; cp "${a##*--patch-file }" "${SHIM_PATCH}" ;;
+  *) echo "shim: unexpected kubectl $*" >&2; exit 99 ;;
+esac
+SHIM
+chmod +x "${pgbr_shim_dir}/kubectl"
+pgbr_run() { # pgbr_run <info-file> -> sets pgbr_rc, pgbr_out; leaves the patch in $pgbr_shim_dir/patch.json
+  rm -f "${pgbr_shim_dir}/patch.json" "${pgbr_shim_dir}/log"
+  pgbr_out=$(PATH="${pgbr_shim_dir}:${PATH}" SHIM_LOG="${pgbr_shim_dir}/log" SHIM_INFO="$1" SHIM_PATCH="${pgbr_shim_dir}/patch.json" \
+    NAMESPACE=ns PRIMARY_SVC=test-pg STANZA=db BACKUP_TYPE=full INFO_CONFIGMAP=test-pg-pgbackrest-info HOME="${pgbr_shim_dir}" \
+    bash -eu -o pipefail "${pgbr_shim_dir}/backup.sh" 2>&1) && pgbr_rc=0 || pgbr_rc=$?
+}
+# Shape as pgBackRest 2.59 emits it: an ARRAY of stanzas (the issue's paste dropped the wrapper).
+pgbr_ok='[{"name":"db","backup":[{"label":"20260908-143406F","type":"full","error":false,"prior":null,"timestamp":{"start":1788878046,"stop":1788878049},"info":{"size":23200780,"repository":{"size":2996380,"delta":2996380}},"archive":{"start":"000000010000000000000002","stop":"000000010000000000000002"},"lsn":{"start":"0/2000028","stop":"0/2000120"}}],"archive":[{"id":"17-1","min":"000000010000000000000001","max":"000000010000000000000002"}],"status":{"code":0,"message":"ok"}}]'
+# A pre-logging WARN (an unknown PGBACKREST_* option from pgbackrest.extraEnv) lands on stdout
+# ahead of the document; the script must skip it.
+printf 'P00   WARN: environment contains invalid option '"'"'foo'"'"'\n%s\n' "${pgbr_ok}" > "${pgbr_shim_dir}/info-ok.json"
+pgbr_run "${pgbr_shim_dir}/info-ok.json"
+assert_eq "#343 shim: healthy repository -> Job exits 0" "0" "${pgbr_rc}"
+assert_eq "#343 shim: the pre-logging WARN line is stripped and the document recorded verbatim" \
+  "$(jq -c . <<< "${pgbr_ok}")" "$(jq -r '.data["info.json"]' "${pgbr_shim_dir}/patch.json" | jq -c .)"
+assert_eq "#343 shim: status-code annotation" "0" "$(jq -r '.metadata.annotations["pg-ha/status-code"]' "${pgbr_shim_dir}/patch.json")"
+assert_eq "#343 shim: backup-type annotation" "full" "$(jq -r '.metadata.annotations["pg-ha/backup-type"]' "${pgbr_shim_dir}/patch.json")"
+assert_eq "#343 shim: primary annotation" "test-pg-0" "$(jq -r '.metadata.annotations["pg-ha/primary"]' "${pgbr_shim_dir}/patch.json")"
+assert_contains "#343 shim: recorded-at is RFC3339 UTC" "$(jq -r '.metadata.annotations["pg-ha/recorded-at"]' "${pgbr_shim_dir}/patch.json")" '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$'
+assert_contains "#343 shim: log carries the one-line summary" "${pgbr_out}" "status=0 (ok) backups=1 latest=20260908-143406F repo-size=2996380"
+assert_eq "#343 shim: info is read exactly once (one S3 round-trip)" "1" "$(grep -c -- '--output=json' "${pgbr_shim_dir}/log")"
+# No jq in the image: fail before the backup, naming the fix, with no kubectl call made.
+mkdir -p "${pgbr_shim_dir}/nojq"; for b in bash sed date grep tr sort sleep cat cp; do ln -sf "$(command -v $b)" "${pgbr_shim_dir}/nojq/$b"; done
+ln -sf "${pgbr_shim_dir}/kubectl" "${pgbr_shim_dir}/nojq/kubectl"; rm -f "${pgbr_shim_dir}/log"
+pgbr_nojq_out=$(PATH="${pgbr_shim_dir}/nojq" SHIM_LOG="${pgbr_shim_dir}/log" NAMESPACE=ns PRIMARY_SVC=test-pg STANZA=db BACKUP_TYPE=full \
+  INFO_CONFIGMAP=test-pg-pgbackrest-info HOME="${pgbr_shim_dir}" bash -eu -o pipefail "${pgbr_shim_dir}/backup.sh" 2>&1) && pgbr_nojq_rc=0 || pgbr_nojq_rc=$?
+assert_eq "#343 shim: an image without jq fails the Job" "1" "${pgbr_nojq_rc}"
+assert_contains "#343 shim: ... naming the fix" "${pgbr_nojq_out}" "set pgbackrest.info.enabled=false"
+assert_eq "#343 shim: ... before any kubectl call (no backup was taken)" "absent" "$([ -f "${pgbr_shim_dir}/log" ] && echo present || echo absent)"
+# The issue's measured case: objects behind delete markers -> `info` exits 0, JSON says code 3.
+printf '%s\n' '[{"name":"db","backup":[],"archive":[],"status":{"code":3,"message":"missing stanza data"}}]' > "${pgbr_shim_dir}/info-bad.json"
+pgbr_run "${pgbr_shim_dir}/info-bad.json"
+assert_eq "#343 shim: unreadable repository -> Job FAILS despite info exiting 0" "1" "${pgbr_rc}"
+assert_eq "#343 shim: ... but the record is written first (unreadable != empty)" "3" "$(jq -r '.metadata.annotations["pg-ha/status-code"]' "${pgbr_shim_dir}/patch.json")"
+assert_contains "#343 shim: ... and the error names the code and message" "${pgbr_out}" "status.code=3 (missing stanza data)"
+# Our stanza missing from the document: the code is unknowable, so fail -- but record it.
+printf '%s\n' '[{"name":"other","backup":[],"archive":[],"status":{"code":0,"message":"ok"}}]' > "${pgbr_shim_dir}/info-other.json"
+pgbr_run "${pgbr_shim_dir}/info-other.json"
+assert_eq "#343 shim: a document without our stanza fails the Job" "1" "${pgbr_rc}"
+assert_eq "#343 shim: ... recording status-code=absent" "absent" "$(jq -r '.metadata.annotations["pg-ha/status-code"]' "${pgbr_shim_dir}/patch.json")"
+assert_contains "#343 shim: ... and saying so" "${pgbr_out}" "stanza not in the document"
+# No JSON at all (pgbackrest died before printing): fail, and record nothing.
+printf 'P00  ERROR: [041]: unable to connect\n' > "${pgbr_shim_dir}/info-none.json"
+pgbr_run "${pgbr_shim_dir}/info-none.json"
+assert_not_eq "#343 shim: non-JSON info output fails the Job" "0" "${pgbr_rc}"
+assert_eq "#343 shim: ... without writing a record" "absent" "$([ -f "${pgbr_shim_dir}/patch.json" ] && echo present || echo absent)"
+rm -rf "${pgbr_shim_dir}"
+
 # pgBackRest: RBAC for CronJob exec access.
 pgbackrest_rbac=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --show-only templates/pgbackrest-rbac.yaml 2>&1)
 assert_contains "pgbackrest rbac: ServiceAccount renders" "${pgbackrest_rbac}" "kind: ServiceAccount"
@@ -3021,9 +3122,10 @@ assert_contains "pgbackrest rbac: endpointslices list verb (#121)" "${pgbackrest
 # Role lets a leaked SA token exec into every pod in the namespace). Both pod
 # rules (pods, pods/exec) carry resourceNames. The EndpointSlice list (#121)
 # cannot be resourceName-scoped (slice names are auto-generated) and reads only
-# EndpointSlice metadata, so it is excluded from this count.
+# EndpointSlice metadata, so it is excluded from this count. The third is the #343 info
+# ConfigMap rule, scoped to its one name for the same reason.
 pgbackrest_rn_count=$(printf '%s\n' "${pgbackrest_rbac}" | grep -c 'resourceNames:')
-assert_eq "pgbackrest rbac: pods+pods/exec resourceName-scoped (#134)" "2" "${pgbackrest_rn_count}"
+assert_eq "pgbackrest rbac: pods+pods/exec+info configmap resourceName-scoped (#134, #343)" "3" "${pgbackrest_rn_count}"
 assert_contains "pgbackrest rbac: scoped to pod test-pg-0 (#134)" "${pgbackrest_rbac}" "\"test-pg-0\""
 assert_contains "pgbackrest rbac: scoped to pod test-pg-1 (#134)" "${pgbackrest_rbac}" "\"test-pg-1\""
 pgbackrest_rbac_n=$(helm template test-pg "${CHART_DIR}" -f "${SCRIPT_DIR}/values-pgbackrest.yaml" --set postgresql.replicaCount=2 --show-only templates/pgbackrest-rbac.yaml 2>&1)
