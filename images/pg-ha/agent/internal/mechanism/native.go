@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cagriekin/pg-ha-agent/internal/atomicfile"
+	"github.com/cagriekin/pg-ha-agent/internal/process"
 )
 
 // Native drives PostgreSQL's own tools as the HA mechanism instead of the repmgr CLI
@@ -673,6 +674,18 @@ func (n *Native) RejoinForceRewind(ctx context.Context, target Conn) (rerr error
 	}
 	if target.Host == "" {
 		return fmt.Errorf("native: rewind needs target.Host")
+	}
+	// A provably stale postmaster.pid has to go BEFORE pg_rewind for the same reason
+	// ChildPostmaster.Start clears one (#346): pg_rewind finishes this node's crash
+	// recovery with `postgres --single`, and single-user mode applies the postmaster's
+	// kill(pid, 0) stale-lock check, which a recycled agent-thread TID defeats after a hard
+	// power-off. The resulting "lock file already exists" is neither divergence nor a
+	// connection failure, so rejoinOnto would count three plain failures and escalate to
+	// ReclonePreserving -- a full base backup, plus an unreaped .diverged copy, for a file
+	// the namespace scan proves stale. The scan's keep conditions (any live postgres in
+	// the namespace) are unchanged here; the caller has already demoted this node.
+	if err := process.ClearStalePostmasterPid(n.DataDir); err != nil {
+		return fmt.Errorf("native: rewind: %w", err)
 	}
 	// standby.signal has to come OUT before pg_rewind runs, or the cheap rewind path is dead
 	// for every standby-originated rejoin (#298 review).

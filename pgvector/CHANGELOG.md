@@ -14,9 +14,16 @@
   file when it is provably stale: the agent spawned no postmaster in this incarnation and
   no process named `postgres` exists in the PID namespace (thread IDs do not appear in a
   `/proc` scan, and any surviving backend of a killed postmaster does -- and keeps the
-  file). The same thread/process confusion is fixed in the reinitialize wipe's liveness
-  guard, which could refuse a legitimate replica rebuild with "PID N is still running"
-  when N was an agent thread. Ships in the pg-ha image at 2.0.2.
+  file). The clear also runs before pg_rewind on the rejoin path, whose `postgres
+  --single` crash-recovery step applies the same defeated stale-lock check -- without it a
+  hard-powered-off ex-primary paid three failed rewinds and a full re-clone for a provably
+  stale file. Unreaped postgres zombies (this PID-1 agent has no reaper) do not count as
+  alive, so one SIGKILL fence cannot disarm the clear for the rest of the incarnation. The
+  same thread/process confusion is fixed in the reinitialize wipe's liveness guard, which
+  could refuse a legitimate replica rebuild with "PID N is still running" when N was an
+  agent thread -- and that guard now also refuses while any live postgres process survives
+  in the namespace, even when the recorded PID is dead. Ships in the pg-ha image at
+  2.0.2.
 
 ## 2.1.1 - 2026-09-18
 

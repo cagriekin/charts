@@ -125,10 +125,21 @@ func TestWipeDataDirRefusesFile(t *testing.T) {
 	}
 }
 
+// setWipeProcRoot points the wipe path's namespace scan at a fake /proc for the test.
+// Needed by every test that exercises a STALE pid file: the machine running the tests may
+// itself host a live postgres, which the real /proc scan would (correctly) refuse on.
+func setWipeProcRoot(t *testing.T, root string) {
+	t.Helper()
+	old := wipeProcRoot
+	wipeProcRoot = root
+	t.Cleanup(func() { wipeProcRoot = old })
+}
+
 // A crashed or OOM-killed postmaster leaves its pid file behind -- only a clean shutdown
 // removes it -- so that is exactly the state a replica worth reinitializing is in. Refusing
 // on the file's mere presence made the feature fail for its own main use case.
 func TestWipeDataDirTolieratesAStalePidFile(t *testing.T) {
+	setWipeProcRoot(t, fakeProc(t, map[int]string{1: "pg-ha-agent"}))
 	dir := initDataDir(t)
 	// A PID that cannot be running: pid 0 is never a user process, so use a very high one
 	// that is free. Verify it is genuinely absent before relying on it.
@@ -145,6 +156,55 @@ func TestWipeDataDirTolieratesAStalePidFile(t *testing.T) {
 	}
 	if HasData(dir) {
 		t.Error("the directory should have been emptied")
+	}
+}
+
+// The recorded PID being dead is not the whole proof (#346 review): a SIGKILLed postmaster
+// cannot reap its backends, and a surviving backend -- comm `postgres`, still attached to
+// the shared memory and files -- must block the wipe even though the pid file names only
+// its dead parent.
+func TestWipeDataDirRefusesWhileABackendSurvives(t *testing.T) {
+	setWipeProcRoot(t, fakeProc(t, map[int]string{1: "pg-ha-agent", 77: "postgres"}))
+	dir := initDataDir(t)
+	stale := 4194303
+	for processAlive(stale) {
+		stale--
+	}
+	if err := os.WriteFile(filepath.Join(dir, "postmaster.pid"),
+		[]byte(fmt.Sprintf("%d\n", stale)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := WipeDataDir(dir)
+	if err == nil {
+		t.Fatal("a live postgres process in the namespace must block the wipe even with a dead recorded PID")
+	}
+	if !strings.Contains(err.Error(), "live postgres process") {
+		t.Errorf("error should name the surviving process: %v", err)
+	}
+	if !HasData(dir) {
+		t.Error("nothing may have been removed")
+	}
+}
+
+// On this destructive path a failed scan is a refusal, not fail-open: "could not look" is
+// not permission to delete a database (the opposite policy from clearStalePostmasterPid,
+// whose kept file postgres re-arbitrates).
+func TestWipeDataDirRefusesWhenTheScanFails(t *testing.T) {
+	setWipeProcRoot(t, filepath.Join(t.TempDir(), "absent"))
+	dir := initDataDir(t)
+	stale := 4194303
+	for processAlive(stale) {
+		stale--
+	}
+	if err := os.WriteFile(filepath.Join(dir, "postmaster.pid"),
+		[]byte(fmt.Sprintf("%d\n", stale)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := WipeDataDir(dir); err == nil {
+		t.Fatal("a failed process scan must refuse the wipe")
+	}
+	if !HasData(dir) {
+		t.Error("nothing may have been removed")
 	}
 }
 

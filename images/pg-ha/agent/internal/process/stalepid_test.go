@@ -2,10 +2,14 @@ package process
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 // fakeProc builds a /proc lookalike: one numeric directory per (pid, comm) pair, plus a
@@ -50,6 +54,76 @@ func TestPostgresProcessExists(t *testing.T) {
 
 	if _, err := postgresProcessExists(filepath.Join(t.TempDir(), "absent")); err == nil {
 		t.Error("unreadable procRoot must be an error, not \"nothing there\"")
+	}
+}
+
+// A postgres ZOMBIE must not veto the removal: this PID-1 agent has no reaper, so a
+// reparented zombie (e.g. an uncleanly-died pg_ctl bootstrap postmaster) would otherwise
+// disarm the stale-pid removal for the rest of the incarnation (#346 review).
+func TestPostgresProcessExistsSkipsZombies(t *testing.T) {
+	root := fakeProc(t, map[int]string{1: "pg-ha-agent", 42: "postgres"})
+	if err := os.WriteFile(filepath.Join(root, "42", "status"), []byte("Name:\tpostgres\nState:\tZ (zombie)\nTgid:\t42\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := postgresProcessExists(root); err != nil || got {
+		t.Errorf("zombie postgres: got (%v, %v), want (false, nil)", got, err)
+	}
+	// The same entry in a live state still blocks -- that is the reparented-backend guard.
+	if err := os.WriteFile(filepath.Join(root, "42", "status"), []byte("Name:\tpostgres\nState:\tS (sleeping)\nTgid:\t42\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := postgresProcessExists(root); err != nil || !got {
+		t.Errorf("live postgres with status: got (%v, %v), want (true, nil)", got, err)
+	}
+}
+
+// A stat failure on postmaster.pid is "could not look", the same state as a failed /proc
+// scan, and takes the same policy: leave the file for postgres's own stale-lock check and
+// do NOT fail Start -- a transient EIO/ESTALE on a recovering PV must not pin StartLocal.
+func TestClearStalePostmasterPidStatErrorDoesNotBlockStart(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not bind root")
+	}
+	agentOnly := fakeProc(t, map[int]string{1: "pg-ha-agent"})
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "postmaster.pid"), []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	if err := clearStalePostmasterPid(dir, agentOnly); err != nil {
+		t.Fatalf("a stat failure must not block the start: %v", err)
+	}
+}
+
+// A zombie leader (Tgid == pid, State Z) owns nothing and must not block a wipe: only a
+// container restart reaps it here (no PID-1 reaper), so "alive" would mean "refuse until
+// restart" (#346 review).
+func TestProcessAliveTreatsZombieAsDead(t *testing.T) {
+	cmd := exec.Command("true")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Wait() }()
+	pid := cmd.Process.Pid
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+		if err == nil && strings.Contains(string(b), "State:\tZ") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Skipf("child %d did not become a zombie in time", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if processAlive(pid) {
+		t.Errorf("zombie pid %d reported alive; a zombie owns no data directory", pid)
 	}
 }
 

@@ -71,6 +71,11 @@ func WipeDataDir(dir string) error {
 	return nil
 }
 
+// wipeProcRoot is /proc in production. A variable only as a test seam: the machine running
+// the unit tests may itself host a live postgres, which would otherwise flip every
+// stale-pid-file wipe test to a refusal.
+var wipeProcRoot = "/proc"
+
 // checkNoLivePostmaster refuses when $PGDATA/postmaster.pid names a process that is still
 // alive, and tolerates (does not remove -- the wipe that follows deletes it with everything
 // else) a pid file whose process is gone.
@@ -97,35 +102,70 @@ func checkNoLivePostmaster(dir string) error {
 	if processAlive(pid) {
 		return fmt.Errorf("refusing to wipe %q: postmaster.pid names PID %d, which is still running", dir, pid)
 	}
+	// A dead recorded PID does not prove nothing owns the data (#346 review): a SIGKILLed
+	// postmaster is denied the chance to reap its backends, so they can survive it --
+	// still attached to the shared memory and data files this wipe is about to delete --
+	// while the pid file names only their dead parent. The namespace scan the stale-pid
+	// removal uses (stalepid.go) sees them; apply it here too. Unlike that removal, a
+	// failed scan is a REFUSAL: this path deletes a database, so "could not look" is not
+	// permission (clearStalePostmasterPid may fail open because its kept file is
+	// re-arbitrated by postgres; nothing re-arbitrates a wipe).
+	alive, aerr := postgresProcessExists(wipeProcRoot)
+	if aerr != nil {
+		return fmt.Errorf("refusing to wipe %q: postmaster.pid exists and the postgres process scan failed (%v), so it cannot be shown to be stale", dir, aerr)
+	}
+	if alive {
+		return fmt.Errorf("refusing to wipe %q: postmaster.pid's recorded PID %d is gone, but a live postgres process still exists in this PID namespace (a surviving backend of a killed postmaster?)", dir, pid)
+	}
 	return nil
 }
 
 // processAlive reports whether pid names a live PROCESS in this PID namespace. Signal 0
-// performs the permission and existence checks without delivering anything; an EPERM means
-// the process exists but belongs to another user, which still counts as alive.
+// performs the permission and existence checks without delivering anything; an EPERM
+// establishes existence only -- the /proc proof below still runs, because a bare thread
+// TID of ANOTHER user's process also yields EPERM (#346 review) and /proc/<pid>/status
+// is world-readable, so the proof is available even when the signal is not permitted.
 //
 // Existence alone is not enough (#346): on Linux kill(tid, 0) also succeeds for a bare
 // THREAD id, and after a container restart the agent (PID 1) owns low TIDs that collide
 // with the PID a previous incarnation's postmaster.pid recorded -- the wipe then refuses
 // forever on "PID N is still running" when N is one of the agent's own goroutine threads.
 // A real process is its thread-group leader (Tgid == pid in /proc/<pid>/status); a bare
-// thread is not something that can own a data directory. An unreadable status still counts
-// as alive: unable to prove it is a mere thread is not permission to proceed.
+// thread is not something that can own a data directory -- and neither is a zombie
+// (State Z): it is dead-in-waiting with no files, locks or shared memory, and this
+// reaper-less PID-1 agent keeps reparented zombies for the whole incarnation (see Stop
+// in postmaster.go), so counting one alive would block the wipe until a container
+// restart. An unreadable or unparsable status still counts as alive: unable to prove it
+// is a mere thread (or a zombie) is not permission to proceed.
 func processAlive(pid int) bool {
-	if err := syscall.Kill(pid, 0); err != nil {
-		return errors.Is(err, syscall.EPERM)
+	if err := syscall.Kill(pid, 0); err != nil && !errors.Is(err, syscall.EPERM) {
+		return false // ESRCH: no process or thread has this id at all
 	}
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid)) //nolint:gosec // fixed path, numeric pid
 	if err != nil {
-		return true // exists per kill(0); cannot show it is only a thread
+		// The id can vanish between kill(0) and this read -- a retiring runtime thread
+		// is exactly the #346 shape -- so re-check before blaming the pid: gone is
+		// gone; still signalable with an unreadable status stays alive (fail closed).
+		kerr := syscall.Kill(pid, 0)
+		return kerr == nil || errors.Is(kerr, syscall.EPERM)
 	}
+	tgid := -1
+	zombie := false
 	for _, line := range strings.Split(string(b), "\n") {
 		if v, ok := strings.CutPrefix(line, "Tgid:"); ok {
-			tgid, aerr := strconv.Atoi(strings.TrimSpace(v))
-			return aerr != nil || tgid == pid
+			n, aerr := strconv.Atoi(strings.TrimSpace(v))
+			if aerr != nil {
+				return true // unparsable: cannot prove it is a mere thread
+			}
+			tgid = n
+		} else if v, ok := strings.CutPrefix(line, "State:"); ok {
+			zombie = strings.HasPrefix(strings.TrimSpace(v), "Z")
 		}
 	}
-	return true
+	if tgid == -1 {
+		return true // no Tgid line: cannot prove it is a mere thread
+	}
+	return tgid == pid && !zombie
 }
 
 // ControlFileMissing reports whether PGDATA has no global/pg_control at all (#288).
