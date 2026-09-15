@@ -100,15 +100,32 @@ func checkNoLivePostmaster(dir string) error {
 	return nil
 }
 
-// processAlive reports whether pid exists in this PID namespace. Signal 0 performs the
-// permission and existence checks without delivering anything; an EPERM means the process
-// exists but belongs to another user, which still counts as alive.
+// processAlive reports whether pid names a live PROCESS in this PID namespace. Signal 0
+// performs the permission and existence checks without delivering anything; an EPERM means
+// the process exists but belongs to another user, which still counts as alive.
+//
+// Existence alone is not enough (#346): on Linux kill(tid, 0) also succeeds for a bare
+// THREAD id, and after a container restart the agent (PID 1) owns low TIDs that collide
+// with the PID a previous incarnation's postmaster.pid recorded -- the wipe then refuses
+// forever on "PID N is still running" when N is one of the agent's own goroutine threads.
+// A real process is its thread-group leader (Tgid == pid in /proc/<pid>/status); a bare
+// thread is not something that can own a data directory. An unreadable status still counts
+// as alive: unable to prove it is a mere thread is not permission to proceed.
 func processAlive(pid int) bool {
-	err := syscall.Kill(pid, 0)
-	if err == nil {
-		return true
+	if err := syscall.Kill(pid, 0); err != nil {
+		return errors.Is(err, syscall.EPERM)
 	}
-	return errors.Is(err, syscall.EPERM)
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid)) //nolint:gosec // fixed path, numeric pid
+	if err != nil {
+		return true // exists per kill(0); cannot show it is only a thread
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "Tgid:"); ok {
+			tgid, aerr := strconv.Atoi(strings.TrimSpace(v))
+			return aerr != nil || tgid == pid
+		}
+	}
+	return true
 }
 
 // ControlFileMissing reports whether PGDATA has no global/pg_control at all (#288).

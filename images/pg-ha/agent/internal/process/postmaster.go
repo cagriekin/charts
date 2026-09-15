@@ -48,6 +48,7 @@ func HasData(dataDir string) bool {
 type ChildPostmaster struct {
 	PostgresBin string
 	DataDir     string
+	procRoot    string // /proc; injectable so the stale-pid tests control the scan (#346)
 
 	mu     sync.Mutex
 	cmd    *exec.Cmd
@@ -57,7 +58,7 @@ type ChildPostmaster struct {
 
 // NewChildPostmaster builds a ChildPostmaster (PostgresBin e.g. /usr/lib/postgresql/18/bin/postgres).
 func NewChildPostmaster(postgresBin, dataDir string) *ChildPostmaster {
-	return &ChildPostmaster{PostgresBin: postgresBin, DataDir: dataDir}
+	return &ChildPostmaster{PostgresBin: postgresBin, DataDir: dataDir, procRoot: "/proc"}
 }
 
 func (p *ChildPostmaster) Start(_ context.Context) error {
@@ -94,6 +95,14 @@ func (p *ChildPostmaster) Start(_ context.Context) error {
 		default:
 		}
 		p.cmd, p.exited = nil, nil // exited on its own; fall through to a fresh start
+	}
+	// Fresh start: any postmaster this agent spawned is reaped (p.cmd == nil here), so a
+	// postmaster.pid that no postgres process backs is a leftover from a previous container
+	// incarnation -- and postgres itself cannot tell, because its kill(pid, 0) stale-lock
+	// check also matches a bare thread TID of this agent (#346). Clear it, or the lease
+	// holder loops on "lock file \"postmaster.pid\" already exists" forever.
+	if err := clearStalePostmasterPid(p.DataDir, p.procRoot); err != nil {
+		return err
 	}
 	cmd := exec.Command(p.PostgresBin, "-D", p.DataDir)
 	// Strip the agent's credential env from the postmaster (#298 security review):

@@ -1,5 +1,23 @@
 # pg chart changelog
 
+## 2.1.2 - unreleased
+
+### Fixed
+
+- **A stale `postmaster.pid` no longer blocks `StartLocal` forever after a hard power-off
+  (#346).** PostgreSQL's own stale-lock check is `kill(pid, 0)`, and on Linux that also
+  succeeds for a bare thread ID -- after a node power-off the container restarts with the
+  agent as PID 1, and one of its Go runtime threads can land on the very TID the previous
+  incarnation's postmaster recorded, so postgres refused to start ("lock file
+  \"postmaster.pid\" already exists") on every reconcile tick, leaving the lease holder
+  down and its standbys unable to follow. Before a fresh start the agent now removes the
+  file when it is provably stale: the agent spawned no postmaster in this incarnation and
+  no process named `postgres` exists in the PID namespace (thread IDs do not appear in a
+  `/proc` scan, and any surviving backend of a killed postmaster does -- and keeps the
+  file). The same thread/process confusion is fixed in the reinitialize wipe's liveness
+  guard, which could refuse a legitimate replica rebuild with "PID N is still running"
+  when N was an agent thread. Ships in the pg-ha image at 2.0.2.
+
 ## 2.1.1 - 2026-09-18
 
 ### Fixed
