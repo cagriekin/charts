@@ -49,7 +49,7 @@ spec:
     spec:
       containers:
         - name: minio
-          image: minio/minio:RELEASE.2025-02-18T16-25-55Z
+          image: quay.io/minio/minio:RELEASE.2025-02-18T16-25-55Z
           args: ["server", "/data"]
           env:
             - name: MINIO_ROOT_USER
@@ -80,7 +80,7 @@ MINIO_MANIFEST
 wait_for_deployment_ready "${NAMESPACE}" "minio" 120
 
 echo "Creating S3 bucket..."
-kubectl run mc-setup -n "${NAMESPACE}" --restart=Never --image=minio/mc:RELEASE.2024-11-21T17-21-54Z \
+kubectl run mc-setup -n "${NAMESPACE}" --restart=Never --image=quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z \
   --command -- sh -c "
     mc alias set s3 http://minio:9000 minioadmin '${S3_SECRET}' &&
     mc mb s3/pg-backups || true
@@ -150,7 +150,7 @@ echo "Verifying backup exists in S3..."
 # Filter to the canonical backup_<ts>.dump JSON line (rejecting any *.tmp stage) so both
 # the existence and the #230 size assertion below measure the PUBLISHED dump, never a
 # leftover stage or an unrelated object that happened to sort first.
-kubectl run mc-check -n "${NAMESPACE}" --restart=Never --image=minio/mc:RELEASE.2024-11-21T17-21-54Z \
+kubectl run mc-check -n "${NAMESPACE}" --restart=Never --image=quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z \
   --command -- sh -c "
     mc alias set s3 http://minio:9000 minioadmin '${S3_SECRET}' &&
     mc ls s3/pg-backups/backups/${FULLNAME}/ --json
@@ -183,7 +183,7 @@ table_exists=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT count(*) FROM information
 assert_eq "table dropped successfully" "0" "${table_exists}"
 
 echo "Restoring from backup..."
-kubectl run mc-fetch -n "${NAMESPACE}" --restart=Never --image=minio/mc:RELEASE.2024-11-21T17-21-54Z \
+kubectl run mc-fetch -n "${NAMESPACE}" --restart=Never --image=quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z \
   --command -- sh -c "sleep 300"
 kubectl wait --for=condition=Ready pod/mc-fetch -n "${NAMESPACE}" --timeout=120s
 kubectl exec -n "${NAMESPACE}" mc-fetch -- mc alias set s3 http://minio:9000 minioadmin "${S3_SECRET}"

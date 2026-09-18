@@ -862,7 +862,9 @@ backup:
     secretAccessKeyKey: secret-access-key
   mc:
     image:
-      repository: minio/mc
+      # quay.io, not Docker Hub: the minio/* repositories were pulled from Docker Hub and
+      # the same tags remain published on quay.io/minio (#348).
+      repository: quay.io/minio/mc
       tag: RELEASE.2024-11-21T17-21-54Z
       digest: ""
       pullPolicy: IfNotPresent
