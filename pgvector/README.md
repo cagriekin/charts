@@ -841,7 +841,7 @@ kubectl create job --from=cronjob/my-pgvector-backup manual-backup
 | `backup.existingSecret.name` | Secret containing S3 credentials | `""` |
 | `backup.existingSecret.accessKeyIdKey` | Key for access key ID in secret | `access-key-id` |
 | `backup.existingSecret.secretAccessKeyKey` | Key for secret access key in secret | `secret-access-key` |
-| `backup.mc.image.repository` | MinIO client image for the mc-installer init container | `minio/mc` |
+| `backup.mc.image.repository` | MinIO client image for the mc-installer init container (quay.io — the Docker Hub `minio/*` repositories are gone, #348) | `quay.io/minio/mc` |
 | `backup.mc.image.tag` | MinIO client image tag | `RELEASE.2024-11-21T17-21-54Z` |
 | `backup.mc.image.pullPolicy` | MinIO client image pull policy | `IfNotPresent` |
 | `backup.podSecurityContext` | Backup pod security context | `runAsNonRoot: true`, `seccompProfile: RuntimeDefault` |

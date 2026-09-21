@@ -1,5 +1,14 @@
 # pgvector chart changelog
 
+## 2.1.1 - 2026-09-18
+
+### Fixed
+
+- **`backup.mc.image.repository` defaults to `quay.io/minio/mc` (#348).** Docker Hub no longer
+  serves the `minio/*` repositories, so a `backup.enabled` release whose nodes had not cached
+  the tag went ImagePullBackOff on the mc-installer init container. The tag is unchanged; set
+  the old value back if you mirror Docker Hub. The KinD suites' MinIO moved with it.
+
 ## 2.1.0 - 2026-09-08
 
 ### Added

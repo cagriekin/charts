@@ -209,7 +209,7 @@ spec:
     spec:
       containers:
         - name: minio
-          image: minio/minio:RELEASE.2025-02-18T16-25-55Z
+          image: quay.io/minio/minio:RELEASE.2025-02-18T16-25-55Z
           args: ["server", "/data", "--certs-dir", "/certs"]
           env:
             - { name: MINIO_ROOT_USER, value: minioadmin }
@@ -236,7 +236,7 @@ MINIO
 
   echo "Creating bucket ${bucket}..."
   kubectl delete pod mc-setup -n "${namespace}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
-  kubectl run mc-setup -n "${namespace}" --restart=Never --image=minio/mc:RELEASE.2024-11-21T17-21-54Z \
+  kubectl run mc-setup -n "${namespace}" --restart=Never --image=quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z \
     --command -- sh -c "mc --insecure alias set s3 https://minio:443 minioadmin minioadmin && mc --insecure mb s3/${bucket} || true"
   kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/mc-setup -n "${namespace}" --timeout=120s
   kubectl delete pod mc-setup -n "${namespace}" --wait=false
