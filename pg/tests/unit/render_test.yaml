@@ -362,3 +362,20 @@ tests:
       - equal:
           path: spec.template.spec.containers[?(@.name=="postgresql")].livenessProbe.httpGet.path
           value: /healthz
+
+  - it: standalone mode probes loopback too (the stock image's init-time server is socket-only, #350)
+    values:
+      - ../values-minimal.yaml
+    template: templates/statefulset.yaml
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].startupProbe.exec.command[2]
+          pattern: '^pg_isready -h 127\.0\.0\.1 '
+      - matchRegex:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].readinessProbe.exec.command[2]
+          pattern: '^pg_isready -h 127\.0\.0\.1 '
+      # Standalone liveness only runs after the startup probe succeeded, when no transient
+      # exists, so it keeps the socket shape.
+      - matchRegex:
+          path: spec.template.spec.containers[?(@.name=="postgresql")].livenessProbe.exec.command[2]
+          pattern: '^pg_isready -U '

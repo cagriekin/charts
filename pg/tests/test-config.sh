@@ -26,16 +26,15 @@ POD="${FULLNAME}-0"
 pod_phase=$(kubectl get pod -n "${NAMESPACE}" "${POD}" -o jsonpath='{.status.phase}')
 assert_eq "pod ${POD} is Running" "Running" "${pod_phase}"
 
-# #350: Ready must mean the REAL postmaster. The bootstrap's socket-only transient postmaster
-# used to satisfy the probes, so `helm --wait` could return while the cluster was still being
-# created -- the pg_hba assertion below then read the bootstrap file. With the probes on
-# loopback, Ready implies the bootstrap finished (its completion sentinel is written after the
-# transient is stopped) and that loopback answers. Checked at the first moment Ready is seen.
-bootstrap_done=$(kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- sh -c 'test -f "$PGDATA/.pg-ha-bootstrap-complete" && echo yes || echo no' 2>/dev/null)
-assert_eq "#350: Ready implies the bootstrap sentinel is present" "yes" "${bootstrap_done}"
+# #350: Ready must mean the REAL postmaster. The stock image's init-time server is socket-only
+# and used to satisfy the probes, so `helm --wait` could return while the database was still
+# being created -- the pg_hba assertion below then read the init-time file. With the probes on
+# loopback, Ready implies loopback answers. Checked at the first moment Ready is seen.
 loopback_rc=0
 kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- sh -c 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1 || loopback_rc=$?
 assert_eq "#350: Ready implies the real postmaster answers on loopback" "0" "${loopback_rc}"
+
+probe_lab_350 "${NAMESPACE}" "${POD}"
 
 # Test: configuration parameters are applied
 work_mem=$(pg_exec "${NAMESPACE}" "${POD}" "SHOW work_mem" "testuser" "testdb")
