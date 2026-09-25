@@ -316,13 +316,11 @@ probe_lab_350() {
   lab_readiness=$(kubectl get pod -n "${ns}" "${pod}" -o jsonpath='{.spec.containers[?(@.name=="postgresql")].readinessProbe.exec.command[2]}')
   assert_contains "#350 lab: the live startup command asks loopback" "${lab_startup}" "pg_isready -h 127.0.0.1"
   assert_contains "#350 lab: the live readiness command asks loopback first" "${lab_readiness}" "pg_isready -h 127.0.0.1"
-  # Same uid/gid as the pod: the HA image's postgres is 101, the stock image's 999, and initdb
-  # refuses a uid the image has no passwd entry for.
-  lab_uid=$(kubectl get pod -n "${ns}" "${pod}" -o jsonpath='{.spec.containers[?(@.name=="postgresql")].securityContext.runAsUser}')
-  lab_gid=$(kubectl get pod -n "${ns}" "${pod}" -o jsonpath='{.spec.containers[?(@.name=="postgresql")].securityContext.runAsGroup}')
-  lab_overrides=$(jq -cn --arg img "${lab_image}" --arg st "${lab_startup}" --arg rd "${lab_readiness}" --argjson uid "${lab_uid:-999}" --argjson gid "${lab_gid:-${lab_uid:-999}}" '{
+  # The container starts as root and the script runs as the image's own `postgres` user via
+  # runuser: initdb refuses root, and it also refuses a uid the image has no passwd entry for
+  # (the chart's default 101 has none in the stock image, whose postgres is 999).
+  lab_overrides=$(jq -cn --arg img "${lab_image}" --arg st "${lab_startup}" --arg rd "${lab_readiness}" '{
     spec: {
-      securityContext: {runAsUser: $uid, runAsGroup: $gid, fsGroup: $gid, runAsNonRoot: true},
       restartPolicy: "Never",
       containers: [{
         name: "lab", image: $img, command: ["sleep", "900"],
@@ -333,7 +331,11 @@ probe_lab_350() {
     }}')
   kubectl delete pod probe-lab-350 -n "${ns}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
   kubectl run probe-lab-350 -n "${ns}" --image="${lab_image}" --restart=Never --overrides="${lab_overrides}" >/dev/null
-  kubectl wait --for=condition=Ready pod/probe-lab-350 -n "${ns}" --timeout=180s >/dev/null
+  if ! kubectl wait --for=condition=Ready pod/probe-lab-350 -n "${ns}" --timeout=180s >/dev/null 2>&1; then
+    echo "  probe lab pod did not become Ready (image=${lab_image}):"
+    kubectl get pod -n "${ns}" probe-lab-350 -o wide 2>&1 | tail -1
+    kubectl describe pod -n "${ns}" probe-lab-350 2>&1 | sed -n '/^Events:/,$p' | tail -8
+  fi
   # The lab script is a plain heredoc (no nested quoting) so a developer can dry-run the
   # same text against an image with `docker run --entrypoint bash <img> -s`.
   local lab_script
@@ -354,7 +356,7 @@ probe startup-vs-loopback "$STARTUP_CMD"
 probe readiness-vs-loopback "$READINESS_CMD"
 pg_ctl -D "$PGDATA" -w -m fast stop >/dev/null 2>&1
 LAB
-  lab_out=$(kubectl exec -i -n "${ns}" probe-lab-350 -- bash -s <<< "${lab_script}" 2>&1)
+  lab_out=$(kubectl exec -i -n "${ns}" probe-lab-350 -- runuser -u postgres -- bash -s <<< "${lab_script}" 2>&1)
   kubectl delete pod probe-lab-350 -n "${ns}" --wait=false >/dev/null 2>&1 || true
   lab_result() { printf '%s\n' "${lab_out}" | grep -E "^$1=" | head -1 | cut -d= -f2; }
   assert_eq "#350 lab: a bare pg_isready (the old probe shape) IS satisfied by a socket-only postmaster" "pass" "$(lab_result bare-pg_isready-vs-transient)"
