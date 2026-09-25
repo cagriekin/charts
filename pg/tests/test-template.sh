@@ -1896,6 +1896,7 @@ assert_contains "#170: postgresql container gets NAMESPACE" "${pg_cont}" "name: 
 assert_contains "#172: postgresql container has a startupProbe" "${pg_cont}" "startupProbe:"
 startup_block=$(printf '%s\n' "${pg_cont}" | awk '/startupProbe:/{f=1; next} f && /Probe:/{exit} f{print}')
 assert_contains "#172: startupProbe probes pg_isready" "${startup_block}" "pg_isready"
+assert_contains "#350: startupProbe asks loopback TCP, which the bootstrap's transient postmaster never opens" "${startup_block}" 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
 # the startup budget (periodSeconds x failureThreshold) must comfortably cover
 # the worst-case guard latency plus crash recovery
 startup_period=$(printf '%s\n' "${startup_block}" | awk '/periodSeconds:/{print $2; exit}')
@@ -1968,6 +1969,37 @@ assert_contains "agent #186: standby readiness gated on streaming" "${agent_pg_c
 assert_not_contains "standalone #186: readiness stays bare pg_isready (no wal_receiver check)" "${standalone_sts_hba}" "SELECT status FROM pg_stat_wal_receiver"
 # startupProbe (#172) kept in agent mode
 assert_contains "agent #172: startupProbe kept" "${agent_pg_cont}" "startupProbe:"
+
+# #350: the bootstrap's transient postmaster listens on no TCP address, so loopback is the one
+# thing a probe can ask that only the real postmaster answers. Every pg_isready inside the
+# startup and readiness probes carries it; the readiness psql checks stay on the socket (local
+# trust, no password); liveness and the postStart wait loop are unchanged.
+probe_pg_isready() { # probe_pg_isready <container render> <probe key> -> the pg_isready lines of that probe
+  printf '%s\n' "$1" | awk -v k="$2" '$0 ~ k"Probe:"{f=1; next} f && /Probe:|^          [a-z]+:$/{exit} f' | grep -E '^ *(- )?pg_isready '
+}
+for mode_name in agent standalone; do
+  if [ "${mode_name}" = agent ]; then cont="${agent_pg_cont}"; else cont="${standalone_sts_hba}"; fi
+  assert_eq "#350 ${mode_name}: every startupProbe pg_isready asks 127.0.0.1" \
+    "$(probe_pg_isready "${cont}" startup | grep -c .)" "$(probe_pg_isready "${cont}" startup | grep -c -- '-h 127.0.0.1')"
+  assert_eq "#350 ${mode_name}: every readinessProbe pg_isready asks 127.0.0.1" \
+    "$(probe_pg_isready "${cont}" readiness | grep -c .)" "$(probe_pg_isready "${cont}" readiness | grep -c -- '-h 127.0.0.1')"
+  assert_not_eq "#350 ${mode_name}: ... and there is at least one" "0" "$(probe_pg_isready "${cont}" readiness | grep -c .)"
+done
+readiness_block=$(printf '%s\n' "${agent_pg_cont}" | awk '/readinessProbe:/{f=1; next} f && /^          [a-z]+:$/{exit} f')
+assert_not_contains "#350: the readiness psql checks stay on the unix socket (local trust)" "${readiness_block}" 'psql -h'
+assert_contains "#350: ... and still ask the recovery role there" "${readiness_block}" 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT pg_is_in_recovery()"'
+assert_contains "#350: standalone liveness pg_isready is unchanged (it only runs after startup succeeded)" "$(probe_pg_isready "${standalone_sts_hba}" liveness)" '^ *- pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"$'
+assert_contains "#350: the postStart wait loop still waits on the socket (it must see the transient too)" "${agent_pg_cont}" 'if pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" > /dev/null 2>&1; then'
+# The guard: a listen_addresses without loopback would render a pod that is never Ready.
+la_bad=$(helm template test-pg "${CHART_DIR}" --set-string postgresql.configuration.listen_addresses=10.0.0.5 2>&1) && la_bad_rc=0 || la_bad_rc=$?
+assert_eq "#350: listen_addresses without loopback fails the render" "1" "${la_bad_rc}"
+assert_contains "#350: ... naming the probes and the fix" "${la_bad}" "does not include loopback.*127.0.0.1"
+for la in '*' 'localhost' 'LOCALHOST' '0.0.0.0' '::1' '127.0.0.1, 10.0.0.5'; do
+  printf 'postgresql:\n  configuration:\n    listen_addresses: "%s"\n' "${la}" > "${CHART_DIR}/../.la-350.yaml"
+  la_ok=$(helm template test-pg "${CHART_DIR}" -f "${CHART_DIR}/../.la-350.yaml" --show-only templates/postgresql-configmap.yaml 2>&1) && la_ok_rc=0 || la_ok_rc=$?
+  rm -f "${CHART_DIR}/../.la-350.yaml"
+  assert_eq "#350: listen_addresses \"${la}\" keeps loopback and renders" "0" "${la_ok_rc}"
+done
 # the agent owns SIGTERM shutdown, so the repmgrd-tuned preStop pg_ctl stop is
 # gated off in agent mode (a competing stop would race the supervisor)
 assert_not_contains "agent: no preStop pg_ctl stop (agent owns SIGTERM)" "${agent_pg_cont}" "pg_ctl stop"
@@ -4375,7 +4407,7 @@ tls_sa_ready=$(helm template test-pg "${CHART_DIR}" \
   --set postgresql.tls.enabled=true --set postgresql.tls.existingSecret=pg-tls \
   --show-only templates/statefulset.yaml 2>&1)
 assert_contains "#335 standalone: readiness asserts ssl" "${tls_sa_ready}" "SHOW ssl"
-assert_contains "#335 standalone: readiness still checks pg_isready first" "${tls_sa_ready}" 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 || exit 1'
+assert_contains "#335 standalone: readiness still checks pg_isready first" "${tls_sa_ready}" 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" >/dev/null 2>&1 || exit 1'
 sa_notls=$(helm template test-pg "${CHART_DIR}" \
   --set ha.enabled=false --set postgresql.replicaCount=0 \
   --show-only templates/statefulset.yaml 2>&1)

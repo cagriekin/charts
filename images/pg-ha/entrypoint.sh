@@ -417,10 +417,10 @@ SQL
     # killed between the postmaster start above and the role/database creation -- and that
     # half-bootstrapped state is unrecoverable: bootstrap_initdb no-ops on it forever
     # (PG_VERSION exists), while the agent can never authenticate as REPMGR_USER, so the pod
-    # comes up Running/NotReady until someone deletes the PVC. The kill is reachable because
-    # `pg_ctl start` above satisfies the chart's startupProbe (`pg_isready` with no -h is
-    # answered over the unix socket), which retires the startup grace and arms the liveness
-    # probe while the agent is still inside this exec and not beating /healthz.
+    # comes up Running/NotReady until someone deletes the PVC. The kill stays reachable --
+    # OOM, eviction, a node reboot -- even though the chart's startupProbe no longer counts
+    # the transient postmaster (it probes loopback TCP, which listen_addresses='' never
+    # opens, #350) and the agent keeps /healthz beating across this exec (beatDuring).
     #
     # The agent pairs this with its own in-progress marker beside PGDATA: marker present and
     # this file absent = torn, discard and start over. Written after the stop so it can never

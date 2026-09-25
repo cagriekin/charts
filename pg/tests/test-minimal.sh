@@ -30,6 +30,15 @@ assert_eq "pod ${POD} is Running" "Running" "${pod_phase}"
 ready=$(kubectl get pod -n "${NAMESPACE}" "${POD}" -o jsonpath='{.status.containerStatuses[?(@.name=="postgresql")].ready}')
 assert_eq "postgresql container is ready" "true" "${ready}"
 
+# #350: standalone mode runs the stock image, whose entrypoint also serves a socket-only
+# temporary server during first init; Ready must mean the real server, i.e. loopback answers,
+# and the rendered readiness probe is the one asking it.
+loopback_rc=0
+kubectl exec -n "${NAMESPACE}" "${POD}" -c postgresql -- sh -c 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1 || loopback_rc=$?
+assert_eq "#350: Ready implies the real postmaster answers on loopback" "0" "${loopback_rc}"
+readiness_cmd=$(kubectl get pod -n "${NAMESPACE}" "${POD}" -o jsonpath='{.spec.containers[?(@.name=="postgresql")].readinessProbe.exec.command[2]}')
+assert_contains "#350: the readiness probe asks loopback" "${readiness_cmd}" "pg_isready -h 127.0.0.1"
+
 # Test: can connect and run a query
 result=$(pg_exec "${NAMESPACE}" "${POD}" "SELECT 1" "testuser" "testdb")
 assert_eq "can execute SELECT 1" "1" "${result}"

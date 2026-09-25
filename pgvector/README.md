@@ -153,10 +153,10 @@ SELECT * FROM items ORDER BY embedding <-> '[1,2,3,...]' LIMIT 5;
 | `postgresql.readinessProbe.periodSeconds` | Check interval | `10` |
 | `postgresql.readinessProbe.timeoutSeconds` | Timeout | `5` |
 | `postgresql.readinessProbe.failureThreshold` | Failure threshold | `6` |
-| `postgresql.startupProbe.enabled` | Enable startup probe (suspends liveness/readiness until PostgreSQL first accepts connections, so first-boot recovery and WAL replay are not killed mid-startup) | `true` |
+| `postgresql.startupProbe.enabled` | Enable startup probe (suspends liveness/readiness until PostgreSQL first accepts connections **over loopback TCP** — the bootstrap's socket-only transient postmaster no longer counts, #350 — so first-boot recovery and WAL replay cannot be killed by the liveness probe) | `true` |
 | `postgresql.startupProbe.periodSeconds` | Check interval | `10` |
 | `postgresql.startupProbe.timeoutSeconds` | Timeout | `5` |
-| `postgresql.startupProbe.failureThreshold` | Failure threshold (`periodSeconds` x this = total startup budget, 600s) | `60` |
+| `postgresql.startupProbe.failureThreshold` | Failure threshold (`periodSeconds` x this = total startup budget, 1800s; it also bounds a standby's first clone, #288) | `180` |
 
 ### Pod Disruption Budgets
 

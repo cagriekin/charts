@@ -138,10 +138,16 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 | `postgresql.readinessProbe.periodSeconds` | Check interval | `10` |
 | `postgresql.readinessProbe.timeoutSeconds` | Timeout | `5` |
 | `postgresql.readinessProbe.failureThreshold` | Failure threshold | `6` |
-| `postgresql.startupProbe.enabled` | Enable startup probe (suspends liveness/readiness until PostgreSQL first accepts connections, so first-boot recovery and WAL replay are not killed mid-startup) | `true` |
+| `postgresql.startupProbe.enabled` | Enable startup probe (suspends liveness/readiness until PostgreSQL first accepts connections **over loopback TCP** — the bootstrap's socket-only transient postmaster no longer counts, #350 — so first-boot recovery and WAL replay cannot be killed by the liveness probe) | `true` |
 | `postgresql.startupProbe.periodSeconds` | Check interval | `10` |
 | `postgresql.startupProbe.timeoutSeconds` | Timeout | `5` |
-| `postgresql.startupProbe.failureThreshold` | Failure threshold (`periodSeconds` x this = total startup budget, 600s) | `60` |
+| `postgresql.startupProbe.failureThreshold` | Failure threshold (`periodSeconds` x this = total startup budget, 1800s; it also bounds a standby's first clone, #288) | `180` |
+
+The startup and readiness probes ask `pg_isready` over `127.0.0.1` (#350): loopback is the one
+address the bootstrap's transient postmaster and the stock image's init-time server never open,
+so Ready and the end of the startup grace mean the real postmaster. `listen_addresses` must
+therefore keep loopback; a `postgresql.configuration.listen_addresses` without `*`, `localhost`
+or `127.0.0.1` fails the render (the HA agent connects to its own postmaster there too).
 
 ### Pod Disruption Budgets
 
