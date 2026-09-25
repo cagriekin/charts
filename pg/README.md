@@ -91,7 +91,7 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 
 > **Pinning images by digest (#26).** Every image block — `postgresql.image`,
 > `ha.image`, `pgpool.image`, `pgpool.metrics.image`, `prometheusExporter.image`,
-> `busyboxImage`, `backup.mc.image`, and `pgbackrest.cronjob.image` — accepts an
+> `busyboxImage`, `backup.rclone.image`, and `pgbackrest.cronjob.image` — accepts an
 > optional `digest` (e.g. `sha256:…`). When set, the image is rendered as
 > `repository:tag@digest` so a mutable-tag repush cannot silently change what runs.
 > Empty (default) pulls by tag.
@@ -2141,7 +2141,7 @@ Set `prometheusExporter.prometheusRule.enabled: true` to ship a `PrometheusRule`
 
 ## Backup
 
-Automated database backups can be enabled to run `pg_dump` on a schedule and upload compressed dumps to S3-compatible storage (AWS S3, MinIO, Wasabi, etc.). The backup job connects to the primary via the main service, so it works correctly with repmgr failover. After upload, the backup is verified by downloading and running `pg_restore --list` to confirm it is a valid custom-format dump.
+Automated database backups can be enabled to run `pg_dump` on a schedule and upload compressed dumps to S3-compatible storage (AWS S3, MinIO, Wasabi, etc.). The backup job connects to the primary via the main service, so it works correctly with failover. After upload, the backup is verified by streaming it back through `pg_restore --list` to confirm it is a valid custom-format dump. The S3 side is [rclone](https://rclone.org/s3/), copied out of `backup.rclone.image` into the postgres container, with the credentials handed to it through its environment, never argv (#167, #221, #353). Amazon S3 needs `backup.s3.provider=AWS` and `backup.s3.region`.
 
 ### Enable Backup
 
@@ -2175,9 +2175,11 @@ kubectl create job --from=cronjob/my-postgres-pg-backup manual-backup
 | `backup.existingSecret.name` | Secret containing S3 credentials | `""` |
 | `backup.existingSecret.accessKeyIdKey` | Key for access key ID in secret | `access-key-id` |
 | `backup.existingSecret.secretAccessKeyKey` | Key for secret access key in secret | `secret-access-key` |
-| `backup.mc.image.repository` | MinIO client image for the mc-installer init container (quay.io — the Docker Hub `minio/*` repositories are gone, #348) | `quay.io/minio/mc` |
-| `backup.mc.image.tag` | MinIO client image tag | `RELEASE.2024-11-21T17-21-54Z` |
-| `backup.mc.image.pullPolicy` | MinIO client image pull policy | `IfNotPresent` |
+| `backup.s3.provider` | rclone S3 provider name (#353): `Other` for MinIO/Ceph/Wasabi-style endpoints, `AWS` for Amazon S3 (then set `region`, which rclone does not auto-detect) | `Other` |
+| `backup.s3.region` | S3 region, required with `provider: AWS` | `""` |
+| `backup.rclone.image.repository` | rclone image; the Jobs copy the `rclone` binary and its CA bundle out of it (#353). `backup.mc.*` was removed and fails the render | `rclone/rclone` |
+| `backup.rclone.image.tag` | rclone image tag | `1.71.2` |
+| `backup.rclone.image.pullPolicy` | rclone image pull policy | `IfNotPresent` |
 | `backup.podSecurityContext` | Backup pod security context | `runAsNonRoot: true`, `seccompProfile: RuntimeDefault` |
 | `backup.containerSecurityContext` | Backup container security context | `runAsUser: 999`, `runAsGroup: 999`, no privilege escalation, all capabilities dropped |
 | `backup.activeDeadlineSeconds` | Job timeout in seconds | `3600` |
@@ -2203,15 +2205,15 @@ release's own backups, then restore the chosen one (replace `<release>-pg` with
 your release's fullname):
 
 ```bash
-mc ls s3/pg-backups/backups/<release>-pg/
-mc cp s3/pg-backups/backups/<release>-pg/backup_20250101_020000.dump /tmp/backup.dump
+rclone lsf s3:pg-backups/backups/<release>-pg/
+rclone copyto s3:pg-backups/backups/<release>-pg/backup_20250101_020000.dump /tmp/backup.dump
 pg_restore -h localhost -U postgres -d postgres /tmp/backup.dump
 ```
 
 Dumps taken before the per-release-path change live at the **old flat path**
 `s3/<bucket>/<prefix>/backup_*.dump` (no `<release-fullname>/` segment). They are not
 migrated and are no longer covered by automatic retention, so list and restore them
-directly there (`mc ls s3/pg-backups/backups/`), and delete them manually once obsolete.
+directly there (`rclone lsf s3:pg-backups/backups/`), and delete them manually once obsolete.
 
 ## pgBackRest (PITR)
 
@@ -2682,7 +2684,7 @@ The StatefulSet recreates the pod, and its agent clones from the current primary
 ### Restore from pg_dump Backup
 
 ```bash
-mc cp s3/<bucket>/<prefix>/backup_<timestamp>.dump /tmp/backup.dump
+rclone copyto s3:<bucket>/<prefix>/<release-fullname>/backup_<timestamp>.dump /tmp/backup.dump
 pg_restore -h <host> -U <user> -d <database> --clean --if-exists /tmp/backup.dump
 ```
 

@@ -1,0 +1,104 @@
+suite: pg_dump backup Jobs use rclone (#353)
+templates:
+  - templates/backup-cronjob.yaml
+  - templates/backup-validation-cronjob.yaml
+  - templates/statefulset.yaml
+tests:
+  - it: the backup CronJob copies rclone and its CA bundle out of backup.rclone.image, non-root
+    set:
+      backup.enabled: true
+      backup.s3.endpoint: https://s3.example
+      backup.s3.bucket: b
+      backup.existingSecret.name: s
+    template: templates/backup-cronjob.yaml
+    asserts:
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.initContainers[0].name
+          value: rclone-installer
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.initContainers[0].image
+          value: rclone/rclone:1.71.2
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.initContainers[0].securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.initContainers[0].securityContext.runAsUser
+          value: 999
+      - matchRegex:
+          path: spec.jobTemplate.spec.template.spec.initContainers[0].command[2]
+          pattern: "cp /usr/local/bin/rclone /tools/rclone .* cp /etc/ssl/certs/ca-certificates.crt /tools/ca-bundle.crt"
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].env
+          content:
+            name: S3_PROVIDER
+            value: Other
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].env
+          content:
+            name: S3_REGION
+            value: ""
+
+  - it: the validation CronJob does the same
+    set:
+      backup.enabled: true
+      backup.validation.enabled: true
+      backup.s3.endpoint: https://s3.example
+      backup.s3.bucket: b
+      backup.existingSecret.name: s
+    template: templates/backup-validation-cronjob.yaml
+    asserts:
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.initContainers[0].name
+          value: rclone-installer
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.initContainers[0].securityContext.runAsNonRoot
+          value: true
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].env
+          content:
+            name: S3_PROVIDER
+            value: Other
+
+  - it: backup.s3.provider and region reach both Jobs
+    set:
+      backup.enabled: true
+      backup.validation.enabled: true
+      backup.s3.endpoint: https://s3.eu-central-1.amazonaws.com
+      backup.s3.bucket: b
+      backup.s3.provider: AWS
+      backup.s3.region: eu-central-1
+      backup.existingSecret.name: s
+    asserts:
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].env
+          content:
+            name: S3_PROVIDER
+            value: AWS
+        template: templates/backup-cronjob.yaml
+      - contains:
+          path: spec.jobTemplate.spec.template.spec.containers[0].env
+          content:
+            name: S3_REGION
+            value: eu-central-1
+        template: templates/backup-validation-cronjob.yaml
+
+  - it: backup.rclone.image is digest-pinnable and tag-typed like every image block (#26)
+    set:
+      backup.enabled: true
+      backup.s3.endpoint: https://s3.example
+      backup.s3.bucket: b
+      backup.existingSecret.name: s
+      backup.rclone.image.digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    template: templates/backup-cronjob.yaml
+    asserts:
+      - equal:
+          path: spec.jobTemplate.spec.template.spec.initContainers[0].image
+          value: rclone/rclone:1.71.2@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+  - it: a values file that still sets backup.mc fails the render and names the new key
+    set:
+      backup.mc.image.repository: quay.io/minio/mc
+    template: templates/statefulset.yaml
+    asserts:
+      - failedTemplate:
+          errorPattern: "backup.mc was removed in chart 2.2.0.*backup.rclone.image"

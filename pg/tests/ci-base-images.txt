@@ -15,8 +15,9 @@ quay.io/prometheuscommunity/postgres-exporter:v0.19.1
 quay.io/coreos/etcd:v3.5.16
 busybox:1.37
 busybox:1.35
-# MinIO for the backup/pgbackrest suites and the chart's own mc default. quay.io, not Docker
-# Hub: the minio/* repositories were pulled from Docker Hub (#348); warming them here also
-# keeps the six suites that deploy MinIO from depending on a live quay pull per leg.
-quay.io/minio/minio:RELEASE.2025-02-18T16-25-55Z
-quay.io/minio/mc:RELEASE.2024-11-21T17-21-54Z
+# The S3 server the backup/pgbackrest suites deploy, and the chart's own backup client
+# (#353). MinIO withdrew minio/* from Docker Hub (#348) and quay.io; bitnamilegacy is a
+# frozen mirror of the server, and rclone replaced the mc client in the chart. Warming them
+# here keeps the seven suites that need an S3 server from depending on a live pull per leg.
+bitnamilegacy/minio:2025.7.23-debian-12-r5
+rclone/rclone:1.71.2

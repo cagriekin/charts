@@ -1769,6 +1769,17 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
        that only ever configured repmgrd are gone, and a values file still carrying them
        would otherwise deploy an agent cluster while its author believes repmgrd is running
        -- silence here is the dangerous outcome, so fail at render time (invariant 4). */ -}}
+{{- define "pg.validateRemovedBackupMc" -}}
+{{- /* backup.mc.* was the MinIO client image for the pg_dump backup Jobs. MinIO withdrew
+       its images from Docker Hub and quay.io and took dl.min.io down, so no value under this
+       key can pull; the Jobs use rclone since 2.2.0 (#353). Any presence is operator input
+       (values.yaml no longer carries the key), so it fails rather than being ignored --
+       a pinned mc image that silently stopped mattering is the kind of drift g5 exists to catch. */ -}}
+{{- if hasKey (.Values.backup | default dict) "mc" -}}
+{{- fail "backup.mc was removed in chart 2.2.0: the pg_dump backup and validation Jobs now use rclone (#353) -- MinIO withdrew its `mc` images from every public registry, so no backup.mc.image could pull. Delete the backup.mc block; to pin the client image set backup.rclone.image.{repository,tag,digest,pullPolicy} instead (default rclone/rclone). If the endpoint is Amazon S3, also set backup.s3.provider=AWS and backup.s3.region." -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "pg.validateRemovedRepmgrdValues" -}}
 {{- /* Checked in BOTH namespaces, and that is the whole point (#291 review). Reading only
        .Values.repmgr made every guard below silently skippable by taking the rename NOTES.txt

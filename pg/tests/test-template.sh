@@ -1189,11 +1189,105 @@ assert_contains "#26: postgresql image digest-pinnable" "${img_pin}" '@sha256:pp
 assert_contains "#26: pgpool image digest-pinnable" "${img_pin}" '@sha256:ggg"'
 assert_contains "#26: pgpool-exporter image digest-pinnable" "${img_pin}" '@sha256:mmm"'
 assert_contains "#26: prometheus-exporter image digest-pinnable" "${img_pin}" '@sha256:eee"'
-img_pin_bk=$(helm template test-pg "${CHART_DIR}" --set backup.enabled=true --set backup.s3.endpoint=https://e --set backup.s3.bucket=b --set backup.existingSecret.name=s --set backup.mc.image.digest=sha256:ccc --set pgbackrest.enabled=true --set pgbackrest.s3.endpoint=https://e --set pgbackrest.s3.bucket=b --set pgbackrest.existingSecret.name=s3 --set pgbackrest.cronjob.image.digest=sha256:kkk 2>&1)
-assert_contains "#26: backup mc image digest-pinnable" "${img_pin_bk}" '@sha256:ccc"'
+img_pin_bk=$(helm template test-pg "${CHART_DIR}" --set backup.enabled=true --set backup.s3.endpoint=https://e --set backup.s3.bucket=b --set backup.existingSecret.name=s --set backup.rclone.image.digest=sha256:ccc --set pgbackrest.enabled=true --set pgbackrest.s3.endpoint=https://e --set pgbackrest.s3.bucket=b --set pgbackrest.existingSecret.name=s3 --set pgbackrest.cronjob.image.digest=sha256:kkk 2>&1)
+assert_contains "#26: backup rclone image digest-pinnable" "${img_pin_bk}" '@sha256:ccc"'
 assert_contains "#26: pgbackrest cronjob image digest-pinnable" "${img_pin_bk}" '@sha256:kkk"'
 # default: no @sha256 in any image ref
 assert_not_contains "#26: no digest in image refs by default" "$(helm template test-pg "${CHART_DIR}" --set pgpool.enabled=true --set prometheusExporter.enabled=true 2>&1 | grep '          image:')" "@sha256"
+
+# #353: the pg_dump backup path drives S3 through rclone (MinIO withdrew mc from every public
+# registry). Render-level: the installer, the environment-defined remote, and the guard.
+bk_args=(--set backup.enabled=true --set backup.s3.endpoint=https://s3.example --set backup.s3.bucket=b --set backup.existingSecret.name=s --set backup.validation.enabled=true)
+bk_all=$(helm template test-pg "${CHART_DIR}" "${bk_args[@]}" 2>&1)
+assert_contains "#353: both Jobs install rclone" "${bk_all}" "name: rclone-installer"
+assert_eq "#353: ... one installer per Job" "2" "$(grep -c "name: rclone-installer" <<< "${bk_all}")"
+assert_contains "#353: installer copies the binary and the CA bundle" "${bk_all}" 'cp /usr/local/bin/rclone /tools/rclone && chmod 0755 /tools/rclone && cp /etc/ssl/certs/ca-certificates.crt /tools/ca-bundle.crt'
+bk_jobs=$(helm template test-pg "${CHART_DIR}" "${bk_args[@]}" --show-only templates/backup-cronjob.yaml --show-only templates/backup-validation-cronjob.yaml 2>&1)
+assert_not_contains "#353: no backup container runs as root any more" "${bk_jobs}" "runAsUser: 0"
+assert_not_contains "#353: no mc left in the rendered Jobs" "${bk_all}" 'mc alias\|mc pipe\|mc ls\|mc cat\|mc mv\|mc rm\|mc find\|/usr/bin/mc\|MC_CONFIG_DIR\|mc-installer'
+assert_contains_literal "#353: credentials reach rclone through its environment, not argv" "${bk_all}" 'export RCLONE_CONFIG_S3_SECRET_ACCESS_KEY="$S3_SECRET_KEY"'
+assert_contains_literal "#353: the Job never needs CreateBucket" "${bk_all}" 'export RCLONE_CONFIG_S3_NO_CHECK_BUCKET=true'
+assert_contains_literal "#353: no rclone config file is read or written" "${bk_all}" 'export RCLONE_CONFIG=/dev/null'
+assert_contains_literal "#353: upload streams into the stage" "${bk_all}" '| rclone rcat "s3:${S3_TMP}"'
+assert_contains_literal "#353: publish is a server-side moveto" "${bk_all}" 'rclone moveto "s3:${S3_TMP}" "s3:${S3_PATH}"'
+assert_contains_literal "#353: the EXIT trap removes the stage" "${bk_all}" "trap 'rclone deletefile \"s3:\${S3_TMP}\" >/dev/null 2>&1 || true' EXIT"
+bk_cm=$(helm template test-pg "${CHART_DIR}" "${bk_args[@]}" --show-only templates/backup-configmap.yaml 2>&1)
+assert_eq "#353: the guard count, retention and the sweep all stop at the release directory" "3" "$(sed -n '/backup.sh: |/,/validate.sh: |/p' <<< "${bk_cm}" | grep -c 'rclone .*--max-depth 1')"
+assert_contains_literal "#353: validation downloads with copyto" "${bk_all}" 'rclone copyto "s3:${S3_DIR}/${LATEST}" "${WORK}/latest.dump"'
+assert_contains "#353: provider defaults to Other" "${bk_all}" 'value: "Other"'
+bk_aws=$(helm template test-pg "${CHART_DIR}" "${bk_args[@]}" --set backup.s3.provider=AWS --set backup.s3.region=eu-central-1 2>&1)
+assert_contains "#353: provider/region flow into the Jobs" "${bk_aws}" 'value: "eu-central-1"'
+bk_mc=$(helm template test-pg "${CHART_DIR}" --set backup.mc.image.tag=x 2>&1) && bk_mc_rc=0 || bk_mc_rc=$?
+assert_eq "#353: backup.mc fails the render" "1" "${bk_mc_rc}"
+assert_contains "#353: ... naming backup.rclone.image" "${bk_mc}" "backup.mc was removed in chart 2.2.0.*backup.rclone.image"
+
+# backup.sh behaviour against shims (pg_dump, pg_restore, rclone replaced by scripts that
+# record their argv and keep an object "store" on disk). The only layer that can drive the
+# stage -> verify -> publish -> retention sequence and its failure arms without S3.
+bk_dir=$(mktemp -d); TMP_SCRATCH+=("${bk_dir}")
+helm template test-pg "${CHART_DIR}" "${bk_args[@]}" --show-only templates/backup-configmap.yaml 2>&1 \
+  | awk '/^  backup.sh: \|$/{f=1;next} /^  validate.sh: \|$/{f=0} f{sub(/^    /,""); print}' > "${bk_dir}/backup.sh"
+mkdir -p "${bk_dir}/bin" "${bk_dir}/store"
+cat > "${bk_dir}/bin/pg_dump" <<'SHIM'
+#!/bin/bash
+[ -n "${SHIM_DUMP_FAIL:-}" ] && { echo "pg_dump: boom" >&2; exit 1; }
+head -c 200000 /dev/zero
+SHIM
+cat > "${bk_dir}/bin/pg_restore" <<'SHIM'
+#!/bin/bash
+# --list reads the header only: stop after 10 bytes so the producer sees SIGPIPE (#230).
+head -c 10 >/dev/null; exit 0
+SHIM
+cat > "${bk_dir}/bin/rclone" <<'SHIM'
+#!/bin/bash
+# argv is logged verbatim: an assertion below proves the secret never appears in it.
+printf '%s\n' "$*" >> "${SHIM_LOG}"
+printf '%s\n' "${RCLONE_CONFIG_S3_SECRET_ACCESS_KEY:-unset}" > "${SHIM_ENVSEEN}"
+obj() { printf '%s' "${SHIM_STORE}/$(printf '%s' "${1#s3:}" | tr '/' '_')"; }
+case "$1" in
+  rcat)       cat > "$(obj "$2")" ;;
+  lsjson)     f=$(obj "$2"); if [ -f "$f" ]; then printf '[\n{"Path":"x","Name":"x","Size":%s}\n]\n' "$(stat -c %s "$f")"; else echo '[]'; fi ;;
+  cat)        cat "$(obj "$2")" ;;
+  moveto)     if [ -n "${SHIM_MOVETO_FAIL:-}" ]; then cp "$(obj "$2")" "$(obj "$3")"; exit 1; fi; mv "$(obj "$2")" "$(obj "$3")" ;;
+  deletefile) rm -f "$(obj "$2")" ;;
+  lsf)        ls "${SHIM_STORE}" | sed 's/.*_backup_/backup_/' ;;
+  delete)     ;;
+  *) echo "shim: unexpected rclone $*" >&2; exit 99 ;;
+esac
+SHIM
+printf '#!/bin/bash\necho pod-0\n' > "${bk_dir}/bin/hostname"   # not on every dev box; the postgres image has it
+chmod +x "${bk_dir}"/bin/*
+# The script is exec'd through a one-line python wrapper that restores SIGPIPE's DEFAULT
+# disposition: the GitHub Actions runner ignores SIGPIPE and every child inherits that
+# (bash cannot re-enable a signal it started with ignored), so under CI the producer of
+# the #230 integrity pipe dies with EPIPE (exit 1) instead of the 141 the script tolerates.
+# A Job pod starts with the default disposition, which is what this run has to model.
+bk_run() { # bk_run [ENV=val ...] -> bk_rc, bk_out; store + log reset
+  rm -rf "${bk_dir}/store" "${bk_dir}/log"; mkdir -p "${bk_dir}/store"
+  bk_out=$(env "$@" PATH="${bk_dir}/bin:${PATH}" SHIM_LOG="${bk_dir}/log" SHIM_STORE="${bk_dir}/store" SHIM_ENVSEEN="${bk_dir}/envseen" \
+    POSTGRES_HOST=h POSTGRES_USER=u POSTGRES_PASSWORD=p POSTGRES_DB=d S3_ENDPOINT=https://s3.example S3_BUCKET=b S3_PREFIX=backups/ \
+    S3_ACCESS_KEY=AKIA 'S3_SECRET_KEY=se/cr+et' RETENTION_DAYS=7 \
+    python3 -c 'import os,signal,sys; signal.signal(signal.SIGPIPE, signal.SIG_DFL); os.execvp("bash", ["bash", sys.argv[1]])' \
+    "${bk_dir}/backup.sh" 2>&1) && bk_rc=0 || bk_rc=$?
+}
+bk_run
+assert_eq "#353 shim: the happy path exits 0" "0" "${bk_rc}"
+assert_eq "#353 shim: rclone verbs run in order: stage, verify, read, publish, guard, retention, sweep" \
+  "rcat lsjson cat moveto lsf delete delete deletefile" "$(awk '{print $1}' "${bk_dir}/log" | tr '\n' ' ' | sed 's/ $//')"
+assert_eq "#353 shim: exactly one object remains, the canonical dump" "1" "$(ls "${bk_dir}/store" | grep -c '^b_backups_test-pg_backup_[0-9_]*\.dump$')"
+assert_eq "#353 shim: no stage object survives" "0" "$(ls "${bk_dir}/store" | grep -c '\.tmp$')"
+assert_contains "#353 shim: the trailing-slash prefix does not produce an empty path segment" "$(cat "${bk_dir}/log")" 'rcat s3:b/backups/test-pg/backup_'
+assert_eq "#353 shim: the secret reached rclone through the environment" "se/cr+et" "$(cat "${bk_dir}/envseen")"
+assert_not_contains "#353 shim: ... and never through argv" "$(cat "${bk_dir}/log")" "se/cr+et"
+assert_contains "#353 shim: the SIGPIPE-killed producer is tolerated (#230)" "${bk_out}" "Backup integrity verified"
+assert_contains "#353 shim: retention runs only after a recent dump is seen" "${bk_out}" "Found 1 recent backup(s)"
+bk_run SHIM_DUMP_FAIL=1
+assert_not_eq "#353 shim: a failed pg_dump fails the Job" "0" "${bk_rc}"
+assert_eq "#353 shim: ... and nothing is published" "0" "$(ls "${bk_dir}/store" | grep -c '\.dump$')"
+assert_contains "#353 shim: ... the EXIT trap removed the stage" "$(tail -1 "${bk_dir}/log")" "^deletefile s3:b/backups/test-pg/backup_.*\.tmp$"
+bk_run SHIM_MOVETO_FAIL=1
+assert_eq "#353 shim: a moveto error with the canonical present is a warning, not a failure" "0" "${bk_rc}"
+assert_contains "#353 shim: ... and says so" "${bk_out}" "WARN: rclone moveto reported an error but the canonical dump is present"
 
 # Test: pgpool deployment has pod securityContext
 assert_contains "full: pgpool has runAsNonRoot" "${full}" "runAsNonRoot: true"
@@ -2433,9 +2527,9 @@ assert_contains "#119: backup verify is streamed to pg_restore" "${backup_config
 assert_not_contains "#119: backup verify does not buffer the dump to /tmp" "${backup_configmap}" "verify_backup.dump"
 # #230: the integrity check must inspect BOTH ends of the pipe via PIPESTATUS, not rely
 # on pipefail. pg_restore --list closes the stream after the TOC, so on any dump > the
-# ~64 KB pipe buffer mc cat is SIGPIPE-killed (141) and bare pipefail would abort the Job
+# ~64 KB pipe buffer rclone cat is SIGPIPE-killed (141) and bare pipefail would abort the Job
 # before publishing. The fix disables errexit+pipefail around the pipe so it can require
-# pg_restore success while tolerating ONLY mc cat's SIGPIPE -- a real mc cat read error
+# pg_restore success while tolerating ONLY rclone cat's SIGPIPE -- a real rclone cat read error
 # stays fatal -- and so the diagnostics run instead of being skipped by set -e at the pipe.
 # Needles are regex-safe (assert_contains greps as BRE): escaped brackets, no ${ }.
 assert_contains "#230: integrity check snapshots both pipe statuses via PIPESTATUS" "${backup_configmap}" 'PIPESTATUS\[@\]'
@@ -2445,24 +2539,23 @@ assert_contains "#230: errexit+pipefail disabled around the integrity pipe" "${b
 assert_contains "#230: errexit+pipefail restored after the integrity pipe" "${backup_configmap}" "set -e -o pipefail"
 # The consumer (pg_restore) must succeed...
 assert_contains "#230: pg_restore (consumer) failure is fatal" "${backup_configmap}" "rc_restore"
-# ...and a non-SIGPIPE mc cat (producer) failure stays fatal -- only 141 is tolerated.
-assert_contains "#230: only mc cat SIGPIPE (141) is tolerated, other producer failures fatal" "${backup_configmap}" "ne 141"
+# ...and a non-SIGPIPE rclone cat (producer) failure stays fatal -- only 141 is tolerated.
+assert_contains "#230: only rclone cat SIGPIPE (141) is tolerated, other producer failures fatal" "${backup_configmap}" "ne 141"
 # #143: dumps are namespaced per release and retention is scoped to this release's
 # own dump objects, so a shared bucket/prefix can never delete another release's backups.
 # needles are regex-safe (assert_contains greps as a regex): avoid the *. in backup_*.dump
 assert_contains "backup #143: dump path namespaced per release (fullname)" "${backup_configmap}" 'S3_DIR="${S3_BUCKET}/${S3_PREFIX%/}/test-pg"'
-assert_contains "backup #143: find calls scoped to the release subpath + name filter" "${backup_configmap}" 'mc find "s3/${S3_DIR}/" --name '"'"'backup_'
-assert_not_contains "backup #143: retention not run over the bare shared prefix" "${backup_configmap}" 'mc find "s3/${S3_BUCKET}/${S3_PREFIX}/" --older-than'
-# #167 + #221: S3 credentials must not appear in mc argv (/proc/<pid>/cmdline),
-# AND must not be percent-encoded into an MC_HOST URL -- mc signs SigV4 with the
-# encoded secret, so a key containing '/' or '+' (common in real AWS keys) fails
-# with a signature mismatch (#221). Credentials are imported from a 0600 JSON doc
-# instead, which feeds the RAW secret to the signer.
-assert_not_contains "backup #167: no mc alias set with the endpoint in argv" "${backup_configmap}" 'mc alias set s3 "$S3_ENDPOINT"'
-assert_not_contains "backup #221: credentials NOT percent-encoded into an MC_HOST URL" "${backup_configmap}" "export MC_HOST_s3="
-assert_contains "backup #221: credentials imported from a JSON doc" "${backup_configmap}" 'mc alias import s3 "$ALIAS_FILE"'
-assert_contains "backup #221: alias doc carries url/accessKey/secretKey" "${backup_configmap}" '"url":"%s","accessKey":"%s","secretKey":"%s"'
-assert_contains "backup #221: alias doc written with a restrictive umask (0600 contract)" "${backup_configmap}" "umask 077"
+assert_contains "backup #143: listing/deletion scoped to the release subpath + name filter" "${backup_configmap}" 'rclone delete "s3:${S3_DIR}/" --max-depth 1 --include '"'"'backup_'
+assert_not_contains "backup #143: retention not run over the bare shared prefix" "${backup_configmap}" 'rclone delete "s3:${S3_BUCKET}/${S3_PREFIX}/"'
+# #167 + #221 + #353: S3 credentials must not appear in argv (/proc/<pid>/cmdline) and
+# must reach the SigV4 signer RAW -- a percent-encoded secret (the #221 bug for keys with
+# '/' or '+') fails every upload with a signature mismatch. rclone takes the remote from
+# RCLONE_CONFIG_S3_* environment variables, exported straight from the Secret-backed env.
+assert_contains_literal "backup #221: the secret is exported raw into rclone's environment" "${backup_configmap}" 'export RCLONE_CONFIG_S3_SECRET_ACCESS_KEY="$S3_SECRET_KEY"'
+assert_contains_literal "backup #221: ... and the access key with it" "${backup_configmap}" 'export RCLONE_CONFIG_S3_ACCESS_KEY_ID="$S3_ACCESS_KEY"'
+assert_not_contains "backup #167: the secret never appears in an rclone argv" "${backup_configmap}" 'rclone .*S3_SECRET_KEY'
+assert_not_contains "backup #221: the secret is never percent-encoded" "${backup_configmap}" 'urlencode\|json_escape\|MC_HOST'
+assert_contains_literal "backup #353: no rclone config file is read or written" "${backup_configmap}" 'export RCLONE_CONFIG=/dev/null'
 # The block above renders validation disabled, so it only exercises backup.sh.
 # validate.sh shares the credential path and must not silently regress to the
 # MC_HOST URL -- render it and assert the same contract over just that script.
@@ -2474,30 +2567,15 @@ backup_val_configmap=$(helm template test-pg "${CHART_DIR}" \
   --set backup.existingSecret.name=test-secret \
   --show-only templates/backup-configmap.yaml 2>&1)
 validate_sh=$(printf '%s\n' "${backup_val_configmap}" | sed -n '/validate.sh: |/,$p')
-assert_not_contains "validate #221: credentials NOT percent-encoded into an MC_HOST URL" "${validate_sh}" "export MC_HOST_s3="
-assert_contains "validate #221: credentials imported from a JSON doc" "${validate_sh}" 'mc alias import s3 "$ALIAS_FILE"'
-assert_contains "validate #221: alias doc written with a restrictive umask (0600 contract)" "${validate_sh}" "umask 077"
-# #221: json_escape is the load-bearing credential path -- it must leave the chars
-# urlencode mangled ('/', '+', ':', '@', '=') UNTOUCHED (so SigV4 sees the raw
-# secret) and escape only JSON metacharacters. Extract the function from the
-# rendered script and run it against adversarial keys.
-json_escape_fn=$(printf '%s\n' "${backup_configmap}" | awk '/json_escape\(\) \{/{f=1} f{print} f&&/^    \}$/{exit}' | sed 's/^    //')
-if [ -n "${json_escape_fn}" ]; then
-  json_escape_out=$(bash -c "${json_escape_fn}
-json_escape 'a/b+c:d@e=f'")
-  assert_eq "backup #221: json_escape leaves /,+,:,@,= untouched (was percent-encoded, broke SigV4)" 'a/b+c:d@e=f' "${json_escape_out}"
-  json_escape_bs=$(bash -c "${json_escape_fn}"'
-json_escape "$(printf '"'"'a\\b'"'"')"')
-  assert_eq "backup #221: json_escape escapes a backslash for valid JSON" 'a\\b' "${json_escape_bs}"
-else
-  fail "backup #221: json_escape function extractable from the rendered script" "could not extract json_escape()"
-fi
-# #159: stage the dump to a .tmp object and publish (mc mv) to the canonical name only
+assert_contains_literal "validate #221: the secret is exported raw into rclone's environment" "${validate_sh}" 'export RCLONE_CONFIG_S3_SECRET_ACCESS_KEY="$S3_SECRET_KEY"'
+assert_not_contains "validate #167: the secret never appears in an rclone argv" "${validate_sh}" 'rclone .*S3_SECRET_KEY'
+assert_not_contains "validate #221: the secret is never percent-encoded" "${validate_sh}" 'urlencode\|json_escape\|MC_HOST'
+# #159: stage the dump to a .tmp object and publish (rclone moveto) to the canonical name only
 # after integrity verification, so a truncated dump never sits at backup_<ts>.dump.
-assert_contains "backup #159: pg_dump streams to the staging object" "${backup_configmap}" 'mc pipe "s3/${S3_TMP}"'
-assert_contains "backup #159: verified dump published with mc mv" "${backup_configmap}" 'mc mv "s3/${S3_TMP}" "s3/${S3_PATH}"'
-assert_contains "backup #159: staging removed on failure (EXIT trap)" "${backup_configmap}" 'mc rm "s3/${S3_TMP}"'
-assert_not_contains "backup #159: pg_dump no longer streams directly to the canonical name" "${backup_configmap}" 'pg_dump -Fc -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" | mc pipe "s3/${S3_PATH}"'
+assert_contains "backup #159: pg_dump streams to the staging object" "${backup_configmap}" 'rclone rcat "s3:${S3_TMP}"'
+assert_contains "backup #159: verified dump published with rclone moveto" "${backup_configmap}" 'rclone moveto "s3:${S3_TMP}" "s3:${S3_PATH}"'
+assert_contains "backup #159: staging removed on failure (EXIT trap)" "${backup_configmap}" 'rclone deletefile "s3:${S3_TMP}"'
+assert_not_contains "backup #159: pg_dump no longer streams directly to the canonical name" "${backup_configmap}" 'pg_dump -Fc -h "$POSTGRES_HOST" -U "$POSTGRES_USER" -d "$POSTGRES_DB" | rclone rcat "s3:${S3_PATH}"'
 
 assert_contains "backup: pod has runAsNonRoot" "${backup_cronjob}" "runAsNonRoot: true"
 assert_contains "backup: container has allowPrivilegeEscalation false" "${backup_cronjob}" "allowPrivilegeEscalation: false"
@@ -3622,13 +3700,13 @@ guard_configmap=$(helm template test-pg "${CHART_DIR}" \
   --set backup.s3.bucket=test \
   --set backup.existingSecret.name=test-secret \
   --show-only templates/backup-configmap.yaml 2>&1)
-assert_contains "backup guard: --newer-than check present (scoped to the release subpath, #143)" "${guard_configmap}" 'mc find "s3/${S3_DIR}/" --name '"'"'backup_'
+assert_contains "backup guard: --max-age check present (scoped to the release subpath, #143)" "${guard_configmap}" 'rclone lsf "s3:${S3_DIR}/" --files-only --max-depth 1 --include '"'"'backup_'
 assert_contains "backup guard: aborts when no recent backup found" "${guard_configmap}" "aborting retention cleanup"
 assert_contains "backup guard: error message goes to stderr" "${guard_configmap}" 'ERROR: No backup newer than ${RETENTION_DAYS} days'
 
 # Test: the guard runs before the retention deletion in the script
-guard_line=$(printf '%s\n' "${guard_configmap}" | grep -n -- '--newer-than' | head -1 | cut -d: -f1)
-delete_line=$(printf '%s\n' "${guard_configmap}" | grep -n -- '--older-than' | head -1 | cut -d: -f1)
+guard_line=$(printf '%s\n' "${guard_configmap}" | grep -n -- '--max-age' | head -1 | cut -d: -f1)
+delete_line=$(printf '%s\n' "${guard_configmap}" | grep -n -- 'rclone delete "s3' | head -1 | cut -d: -f1)
 guard_before_delete="false"
 if [ -n "${guard_line}" ] && [ -n "${delete_line}" ] && [ "${guard_line}" -lt "${delete_line}" ]; then
   guard_before_delete="true"
@@ -4009,7 +4087,7 @@ pgv_backup=$(helm template test-pgv "${PGVECTOR_DIR}" \
   --set backup.existingSecret.name=creds \
   --show-only templates/backup-cronjob.yaml 2>&1) || pgv_backup_rc=$?
 assert_eq "pgvector #126: renders with backup enabled" "0" "${pgv_backup_rc}"
-assert_contains "pgvector #126: backup mc image present" "${pgv_backup}" "minio/mc:"
+assert_contains "pgvector #126: backup rclone image present" "${pgv_backup}" "rclone/rclone:"
 assert_contains "pgvector #126: backup container securityContext populated" "${pgv_backup}" "runAsUser: 999"
 assert_not_contains "pgvector #126: no null securityContext" "${pgv_backup}" "securityContext: null"
 # #31 parity: the backup-validation CronJob is a separate template; without the

@@ -41,20 +41,24 @@ spec:
           securityContext:
             {{- toYaml .Values.backup.podSecurityContext | nindent 12 }}
           initContainers:
-            - name: mc-installer
-              image: {{ include "pg.image" .Values.backup.mc.image | quote }}
-              imagePullPolicy: {{ .Values.backup.mc.image.pullPolicy }}
-              # /usr/bin/mc in the minio/mc image is mode 0711, readable only
-              # by root, so the copy must run as root; the backup container
-              # stays non-root
+            # The backup container runs the official postgres image, which ships neither an
+            # S3 client nor a CA bundle: copy rclone and its bundle out of the rclone image
+            # into the shared /tools emptyDir (#353). rclone replaced the MinIO client after
+            # MinIO withdrew its images from every public registry. The binary is
+            # world-readable, so this runs non-root (the mc image needed root for its 0711 mc).
+            - name: rclone-installer
+              image: {{ include "pg.image" .Values.backup.rclone.image | quote }}
+              imagePullPolicy: {{ .Values.backup.rclone.image.pullPolicy }}
               securityContext:
-                runAsUser: 0
-                runAsNonRoot: false
+                runAsNonRoot: true
+                runAsUser: 999
+                runAsGroup: 999
+                readOnlyRootFilesystem: true
                 allowPrivilegeEscalation: false
                 capabilities:
                   drop:
                     - ALL
-              command: ["/bin/sh", "-c", "cp /usr/bin/mc /tools/mc && chmod 0755 /tools/mc && cp /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /tools/ca-bundle.crt"]
+              command: ["/bin/sh", "-c", "cp /usr/local/bin/rclone /tools/rclone && chmod 0755 /tools/rclone && cp /etc/ssl/certs/ca-certificates.crt /tools/ca-bundle.crt"]
               resources:
                 {{- include "pg.initResources" . | nindent 16 }}
               volumeMounts:
@@ -91,6 +95,10 @@ spec:
                   value: {{ required "backup.s3.bucket is required when backup is enabled" .Values.backup.s3.bucket | quote }}
                 - name: S3_PREFIX
                   value: {{ .Values.backup.s3.prefix | quote }}
+                - name: S3_PROVIDER
+                  value: {{ .Values.backup.s3.provider | quote }}
+                - name: S3_REGION
+                  value: {{ .Values.backup.s3.region | quote }}
                 - name: S3_ACCESS_KEY
                   valueFrom:
                     secretKeyRef:
@@ -121,7 +129,7 @@ spec:
               emptyDir:
                 sizeLimit: 128Mi
             # writable scratch for the read-only-rootfs backup container
-            # (MC_CONFIG_DIR=/tmp/.mc and any tooling temp). #117
+            # (RCLONE_CACHE_DIR=/tmp/.rclone and any tooling temp). #117
             - name: tmp
               emptyDir:
                 sizeLimit: 64Mi
