@@ -29,14 +29,23 @@ helm upgrade --install "${RELEASE}" "${CHART_DIR}" \
 
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 2 600
 
-POD_0="${FULLNAME_FROM}-0"
-result=$(pg_exec "${NAMESPACE}" "${POD_0}" "SELECT 1" "testuser" "testdb")
+# Write through the PRIMARY, wherever it landed (#351). Under podManagementPolicy: Parallel
+# both pods start in the same second and the lease goes to whichever agent asks first --
+# nothing in the chart or the agent prefers ordinal 0 -- so a write aimed at pod 0 lands on
+# a standby ("cannot execute CREATE TABLE in a read-only transaction") whenever pod 1 won.
+PRE_PRIMARY=$(discover_primary "${NAMESPACE}" "${FULLNAME_FROM}" 2 testuser testdb)
+if [ -z "${PRE_PRIMARY}" ]; then
+  fail "install: a primary is discoverable" "discover_primary returned nothing"
+  end_suite; print_summary; exit 1
+fi
+pass "install: a primary is discoverable (${PRE_PRIMARY})"
+result=$(pg_exec "${NAMESPACE}" "${PRE_PRIMARY}" "SELECT 1" "testuser" "testdb")
 assert_eq "repmgr install works" "1" "${result}"
 
 # Write data before upgrade
 UPGRADE_VALUE="pre-upgrade-$(date +%s)"
-pg_exec "${NAMESPACE}" "${POD_0}" "CREATE TABLE IF NOT EXISTS upgrade_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
-pg_exec "${NAMESPACE}" "${POD_0}" "INSERT INTO upgrade_test (value) VALUES ('${UPGRADE_VALUE}')" "testuser" "testdb"
+pg_exec "${NAMESPACE}" "${PRE_PRIMARY}" "CREATE TABLE IF NOT EXISTS upgrade_test (id serial PRIMARY KEY, value text)" "testuser" "testdb"
+pg_exec "${NAMESPACE}" "${PRE_PRIMARY}" "INSERT INTO upgrade_test (value) VALUES ('${UPGRADE_VALUE}')" "testuser" "testdb"
 
 # Step 2: Upgrade to full (3 replicas + pgpool + exporter, same persistence)
 echo ""
@@ -46,6 +55,8 @@ helm upgrade "${RELEASE}" "${CHART_DIR}" \
   -f "${SCRIPT_DIR}/values-upgrade-to.yaml" \
   --wait --timeout 10m
 
+# Read back from pod 0 whichever role it holds: the row was written before the upgrade and
+# the streaming assertions below run first, so a standby has it too.
 POD_0="${FULLNAME_TO}-0"
 
 wait_for_pods_ready "${NAMESPACE}" "app.kubernetes.io/component=postgresql" 3 600
