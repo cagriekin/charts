@@ -302,6 +302,7 @@ discover_primary() {
 # --- #350 probe lab ---
 probe_lab_350() {
   local ns="$1" pod="$2"
+  local lab_image lab_startup lab_readiness lab_overrides lab_out
   # --- #350 probe lab: the mechanism, not the rendered text ---------------------------------
   # Run the pod's ACTUAL startup and readiness commands (read back from the live pod spec) inside
   # a throwaway pod of the same image, first against a socket-only postmaster started exactly the
@@ -358,10 +359,12 @@ pg_ctl -D "$PGDATA" -w -m fast stop >/dev/null 2>&1
 LAB
   lab_out=$(kubectl exec -i -n "${ns}" probe-lab-350 -- runuser -u postgres -- bash -s <<< "${lab_script}" 2>&1)
   kubectl delete pod probe-lab-350 -n "${ns}" --wait=false >/dev/null 2>&1 || true
-  lab_result() { printf '%s\n' "${lab_out}" | grep -E "^$1=" | head -1 | cut -d= -f2; }
-  assert_eq "#350 lab: a bare pg_isready (the old probe shape) IS satisfied by a socket-only postmaster" "pass" "$(lab_result bare-pg_isready-vs-transient)"
-  assert_eq "#350 lab: the startup probe is NOT satisfied by a socket-only postmaster" "fail" "$(lab_result startup-vs-transient)"
-  assert_eq "#350 lab: the readiness probe is NOT satisfied by a socket-only postmaster" "fail" "$(lab_result readiness-vs-transient)"
-  assert_eq "#350 lab: the startup probe passes once loopback listens" "pass" "$(lab_result startup-vs-loopback)"
-  assert_eq "#350 lab: the readiness probe passes on a loopback-listening primary" "pass" "$(lab_result readiness-vs-loopback)"
+  local r
+  r() { printf '%s\n' "${lab_out}" | grep -E "^$1=" | head -1 | cut -d= -f2; }
+  assert_eq "#350 lab: a bare pg_isready (the old probe shape) IS satisfied by a socket-only postmaster" "pass" "$(r bare-pg_isready-vs-transient)"
+  assert_eq "#350 lab: the startup probe is NOT satisfied by a socket-only postmaster" "fail" "$(r startup-vs-transient)"
+  assert_eq "#350 lab: the readiness probe is NOT satisfied by a socket-only postmaster" "fail" "$(r readiness-vs-transient)"
+  assert_eq "#350 lab: the startup probe passes once loopback listens" "pass" "$(r startup-vs-loopback)"
+  assert_eq "#350 lab: the readiness probe passes on a loopback-listening primary" "pass" "$(r readiness-vs-loopback)"
+  unset -f r
 }

@@ -1993,13 +1993,21 @@ assert_contains "#350: the postStart wait loop still waits on the socket (it mus
 # The guard: a listen_addresses without loopback would render a pod that is never Ready.
 la_bad=$(helm template test-pg "${CHART_DIR}" --set-string postgresql.configuration.listen_addresses=10.0.0.5 2>&1) && la_bad_rc=0 || la_bad_rc=$?
 assert_eq "#350: listen_addresses without loopback fails the render" "1" "${la_bad_rc}"
-assert_contains "#350: ... naming the probes and the fix" "${la_bad}" "does not include loopback.*127.0.0.1"
-for la in '*' 'localhost' 'LOCALHOST' '0.0.0.0' '::1' '127.0.0.1, 10.0.0.5'; do
-  printf 'postgresql:\n  configuration:\n    listen_addresses: "%s"\n' "${la}" > "${CHART_DIR}/../.la-350.yaml"
-  la_ok=$(helm template test-pg "${CHART_DIR}" -f "${CHART_DIR}/../.la-350.yaml" --show-only templates/postgresql-configmap.yaml 2>&1) && la_ok_rc=0 || la_ok_rc=$?
-  rm -f "${CHART_DIR}/../.la-350.yaml"
+assert_contains "#350: ... naming the probes and the fix" "${la_bad}" "does not include IPv4 loopback.*127.0.0.1"
+la_dir=$(mktemp -d)  # rm'd below: TMP_SCRATCH and its EXIT trap are only declared further down
+for la in '*' 'localhost' 'LOCALHOST' '0.0.0.0' '127.0.0.1, 10.0.0.5'; do
+  printf 'postgresql:\n  configuration:\n    listen_addresses: "%s"\n' "${la}" > "${la_dir}/la.yaml"
+  la_ok=$(helm template test-pg "${CHART_DIR}" -f "${la_dir}/la.yaml" --show-only templates/postgresql-configmap.yaml 2>&1) && la_ok_rc=0 || la_ok_rc=$?
   assert_eq "#350: listen_addresses \"${la}\" keeps loopback and renders" "0" "${la_ok_rc}"
 done
+# PostgreSQL binds AF_INET6 with IPV6_V6ONLY: an IPv6-only list never answers 127.0.0.1.
+for la in '::1' '::, 10.0.0.5'; do
+  printf 'postgresql:\n  configuration:\n    listen_addresses: "%s"\n' "${la}" > "${la_dir}/la.yaml"
+  la_v6=$(helm template test-pg "${CHART_DIR}" -f "${la_dir}/la.yaml" --show-only templates/postgresql-configmap.yaml 2>&1) && la_v6_rc=0 || la_v6_rc=$?
+  assert_eq "#350: IPv6-only listen_addresses \"${la}\" fails the render" "1" "${la_v6_rc}"
+  assert_contains "#350: ... naming the IPv6 trap" "${la_v6}" "does not include IPv4 loopback"
+done
+rm -rf "${la_dir}"
 # the agent owns SIGTERM shutdown, so the repmgrd-tuned preStop pg_ctl stop is
 # gated off in agent mode (a competing stop would race the supervisor)
 assert_not_contains "agent: no preStop pg_ctl stop (agent owns SIGTERM)" "${agent_pg_cont}" "pg_ctl stop"

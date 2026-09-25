@@ -2347,9 +2347,10 @@ func (a *agent) discardFreshDataDir() error {
 	// between that start and its matching stop, WaitDelay kills entrypoint.sh but NOT the
 	// detached postmaster -- and then WipeDataDir refuses on the live postmaster.pid, returning
 	// "delete the PVC to recover" while every later sup.Start fails on "postmaster.pid already
-	// exists". The pod wedges Running/NotReady for good: the startupProbe's `pg_isready` over
-	// the unix socket is SATISFIED by the orphan, so the startup grace stops protecting, while
-	// selfConn() dials 127.0.0.1 and can never reach a socket-only postmaster.
+	// exists". The pod wedges Running/NotReady for good: the orphan answers only the unix
+	// socket, so the chart's loopback startupProbe (#350) never passes and the kubelet restarts
+	// the container after the startup budget, while selfConn() dials 127.0.0.1 and can never
+	// reach a socket-only postmaster either.
 	//
 	// Best-effort and on its OWN context: the usual trigger for this path is the parent budget
 	// having already expired, so reusing it would make the stop a guaranteed no-op.

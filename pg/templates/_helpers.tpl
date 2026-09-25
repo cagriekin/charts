@@ -1774,16 +1774,19 @@ after a clean render (#291 review). hasKey is the distinction `default` cannot m
        postgresql.conf the bootstrap wrote, so it can override listen_addresses='*'. Loopback
        must stay in it: the startup and readiness probes ask pg_isready over 127.0.0.1 (#350)
        and the agent's own self-connection dials 127.0.0.1:5432 -- a list without it renders a
-       pod that is never Ready and an agent that cannot see its own postmaster. Case-insensitive
-       key match, like the shared_preload_libraries scan above. */ -}}
+       pod that is never Ready and an agent that cannot see its own postmaster. IPv4 loopback
+       specifically: PostgreSQL binds AF_INET6 sockets with IPV6_V6ONLY, so '::' or '::1'
+       alone never answers 127.0.0.1 and must fail here too ('localhost' resolves to both
+       families; '0.0.0.0' is IPv4-any). Case-insensitive key match, like the
+       shared_preload_libraries scan above. */ -}}
 {{- range $k, $v := (.Values.postgresql.configuration | default dict) -}}
 {{- if eq (lower ($k | toString)) "listen_addresses" -}}
 {{- $ok := false -}}
 {{- range $addr := splitList "," ($v | toString) -}}
-{{- if has (lower (trim $addr)) (list "*" "0.0.0.0" "::" "::1" "localhost" "127.0.0.1") -}}{{- $ok = true -}}{{- end -}}
+{{- if has (lower (trim $addr)) (list "*" "0.0.0.0" "localhost" "127.0.0.1") -}}{{- $ok = true -}}{{- end -}}
 {{- end -}}
 {{- if not $ok -}}
-{{- fail (printf "postgresql.configuration.listen_addresses=%q does not include loopback: the startup and readiness probes check pg_isready over 127.0.0.1 (#350) and the HA agent connects to its own postmaster there, so this pod would never become Ready. Add '*' or '127.0.0.1' to the list (e.g. \"127.0.0.1, %s\"), or drop the key -- the chart already sets listen_addresses = '*'." ($v | toString) ($v | toString)) -}}
+{{- fail (printf "postgresql.configuration.listen_addresses=%q does not include IPv4 loopback: the startup and readiness probes check pg_isready over 127.0.0.1 (#350) and the HA agent connects to its own postmaster there, so this pod would never become Ready (an IPv6-only '::' or '::1' does not answer 127.0.0.1). Add '*' or '127.0.0.1' to the list (e.g. \"127.0.0.1, %s\"), or drop the key -- the chart already sets listen_addresses = '*'." ($v | toString) ($v | toString)) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

@@ -146,8 +146,10 @@ rendering pipelines that never talk to the cluster (e.g. ArgoCD) must use
 The startup and readiness probes ask `pg_isready` over `127.0.0.1` (#350): loopback is the one
 address the bootstrap's transient postmaster and the stock image's init-time server never open,
 so Ready and the end of the startup grace mean the real postmaster. `listen_addresses` must
-therefore keep loopback; a `postgresql.configuration.listen_addresses` without `*`, `localhost`
-or `127.0.0.1` fails the render (the HA agent connects to its own postmaster there too).
+therefore keep IPv4 loopback; a `postgresql.configuration.listen_addresses` without `*`,
+`0.0.0.0`, `localhost` or `127.0.0.1` fails the render (the HA agent connects to its own
+postmaster there too). An IPv6-only `::`/`::1` does not count: PostgreSQL binds it
+`IPV6_V6ONLY`, so it never answers `127.0.0.1`.
 
 ### Pod Disruption Budgets
 

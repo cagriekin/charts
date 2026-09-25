@@ -745,16 +745,27 @@ tests:
       postgresql.configuration.Listen_Addresses: "10.0.0.5"
     asserts:
       - failedTemplate:
-          errorPattern: 'does not include loopback'
+          errorPattern: 'does not include IPv4 loopback'
 
   - it: postgresql.configuration.listen_addresses keeps rendering when loopback is in the list (#350)
     templates:
       - templates/statefulset.yaml
     set:
-      postgresql.configuration.listen_addresses: "10.0.0.5, ::1"
+      postgresql.configuration.listen_addresses: "10.0.0.5, 127.0.0.1"
     asserts:
       - isKind:
           of: StatefulSet
+
+  # PostgreSQL binds AF_INET6 with IPV6_V6ONLY, so an IPv6-only loopback never answers the
+  # probes' 127.0.0.1.
+  - it: postgresql.configuration.listen_addresses with only IPv6 loopback fails render (#350)
+    templates:
+      - templates/statefulset.yaml
+    set:
+      postgresql.configuration.listen_addresses: "::1, 10.0.0.5"
+    asserts:
+      - failedTemplate:
+          errorPattern: 'does not include IPv4 loopback'
 
   - it: postgresql.configuration.listen_addresses without loopback fails render (#350)
     templates:
@@ -763,7 +774,7 @@ tests:
       postgresql.configuration.listen_addresses: "10.0.0.5"
     asserts:
       - failedTemplate:
-          errorPattern: 'listen_addresses="10.0.0.5" does not include loopback.*127.0.0.1'
+          errorPattern: 'listen_addresses="10.0.0.5" does not include IPv4 loopback.*127.0.0.1'
 
   - it: pgbackrest.extraEnv reusing the #343 record name (INFO_CONFIGMAP) fails render
     templates:

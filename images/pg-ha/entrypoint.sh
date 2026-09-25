@@ -226,9 +226,9 @@ EOF
     # and leaves it orphaned, which is the hazard the two stop arms were hardened against and
     # this third call site did not get: the orphan inherits this script's stdout, so in agent
     # mode (where the script is a captured child, Cmd.Output) it holds that pipe open past EOF
-    # and blocks act() with opMu held until the whole initdbBudget expires -- and it satisfies
-    # the chart's startupProbe (`pg_isready` over the unix socket) while listening on no TCP
-    # address, so the startup grace is retired for a cluster that is not bootstrapped.
+    # and blocks act() with opMu held until the whole initdbBudget expires, while the pod sits
+    # NotReady: the orphan listens on no TCP address, so the chart's loopback probes (#350)
+    # never count it, and the cluster it fronts is not bootstrapped anyway.
     # Escalate to an immediate stop and exit WITHOUT the completion sentinel, so the next start
     # discards this directory and re-creates it.
     if ! pg_ctl -D "$PGDATA" -w start -o "-c listen_addresses='' -c log_statement=none -c log_min_error_statement=panic"; then
