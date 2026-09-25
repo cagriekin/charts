@@ -1257,11 +1257,18 @@ esac
 SHIM
 printf '#!/bin/bash\necho pod-0\n' > "${bk_dir}/bin/hostname"   # not on every dev box; the postgres image has it
 chmod +x "${bk_dir}"/bin/*
+# The script is exec'd through a one-line python wrapper that restores SIGPIPE's DEFAULT
+# disposition: the GitHub Actions runner ignores SIGPIPE and every child inherits that
+# (bash cannot re-enable a signal it started with ignored), so under CI the producer of
+# the #230 integrity pipe dies with EPIPE (exit 1) instead of the 141 the script tolerates.
+# A Job pod starts with the default disposition, which is what this run has to model.
 bk_run() { # bk_run [ENV=val ...] -> bk_rc, bk_out; store + log reset
   rm -rf "${bk_dir}/store" "${bk_dir}/log"; mkdir -p "${bk_dir}/store"
   bk_out=$(env "$@" PATH="${bk_dir}/bin:${PATH}" SHIM_LOG="${bk_dir}/log" SHIM_STORE="${bk_dir}/store" SHIM_ENVSEEN="${bk_dir}/envseen" \
     POSTGRES_HOST=h POSTGRES_USER=u POSTGRES_PASSWORD=p POSTGRES_DB=d S3_ENDPOINT=https://s3.example S3_BUCKET=b S3_PREFIX=backups/ \
-    S3_ACCESS_KEY=AKIA 'S3_SECRET_KEY=se/cr+et' RETENTION_DAYS=7 bash "${bk_dir}/backup.sh" 2>&1) && bk_rc=0 || bk_rc=$?
+    S3_ACCESS_KEY=AKIA 'S3_SECRET_KEY=se/cr+et' RETENTION_DAYS=7 \
+    python3 -c 'import os,signal,sys; signal.signal(signal.SIGPIPE, signal.SIG_DFL); os.execvp("bash", ["bash", sys.argv[1]])' \
+    "${bk_dir}/backup.sh" 2>&1) && bk_rc=0 || bk_rc=$?
 }
 bk_run
 assert_eq "#353 shim: the happy path exits 0" "0" "${bk_rc}"
